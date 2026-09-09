@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Contributing guide
+    url: https://github.com/meow-rs/meow-rs/blob/main/CONTRIBUTING.md
+    about: Project scope (client-only), mihomo-mainline policy, test bar, and ADRs. Read before requesting a feature.
+  - name: mihomo documentation
+    url: https://wiki.metacubex.one/
+    about: meow-rs follows mihomo's config schema. Check here for the upstream reference for a config key.

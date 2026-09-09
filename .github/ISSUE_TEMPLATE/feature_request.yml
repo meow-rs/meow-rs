@@ -1,0 +1,44 @@
+name: Feature request
+description: Propose a new client-side feature, proxy type, rule type, or config option
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please read [CONTRIBUTING.md](https://github.com/meow-rs/meow-rs/blob/main/CONTRIBUTING.md) first. Two things it asks of every feature request:
+
+        - meow-rs is a **client-only** kernel. Requests for server-mode features (running meow-rs as a Trojan/VLESS/Hysteria2/… server, user or quota management) will be closed.
+        - New features and config keys should follow **mihomo mainline**. Please link the upstream implementation or docs.
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope
+      options:
+        - label: This is a client-side feature (it changes how meow-rs dials, routes, or accepts local/LAN traffic), not a server-side one.
+          required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / use case
+      description: What are you trying to do that meow-rs cannot do today?
+    validations:
+      required: true
+  - type: input
+    id: upstream
+    attributes:
+      label: mihomo reference
+      description: Link to the mihomo mainline code, docs, or wiki page for this feature. If mihomo does not have it, say so and explain why meow-rs should diverge.
+      placeholder: https://wiki.metacubex.one/config/... or https://github.com/MetaCubeX/mihomo/blob/...
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Proposed config
+      description: The `config.yaml` snippet as it would look, using mihomo's keys and formats.
+      render: yaml
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Existing meow-rs features or workarounds you tried, and why they are not enough.

@@ -1,0 +1,67 @@
+name: Bug report
+description: Something in meow-rs behaves incorrectly
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Before filing, please check that this is a **client-side** issue: meow-rs is a client-only kernel and does not run as a proxy server. See [CONTRIBUTING.md](https://github.com/meow-rs/meow-rs/blob/main/CONTRIBUTING.md).
+  - type: input
+    id: version
+    attributes:
+      label: meow-rs version
+      description: Output of `meow --version`. Official release binaries are built with the `full` feature set; say so if you built from source with different features.
+      placeholder: meow 0.21.2
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      description: OS, architecture, and how meow-rs runs (CLI, systemd, Android/iOS embedding, tproxy gateway, TUN).
+      placeholder: Linux aarch64 (Raspberry Pi), systemd, tproxy gateway
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Minimal config
+      description: The smallest `config.yaml` that reproduces the problem. **Redact servers, passwords, UUIDs, and subscription URLs.**
+      render: yaml
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Start `meow -f config.yaml`
+        2. `curl -x socks5h://127.0.0.1:7890 https://example.com`
+        3. …
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour
+      description: "Include logs at `log-level: debug` if relevant."
+      render: text
+    validations:
+      required: true
+  - type: dropdown
+    id: mihomo
+    attributes:
+      label: Does the same config work in mihomo?
+      description: meow-rs targets config compatibility with mihomo. Knowing whether upstream behaves differently helps classify the bug (see ADR-0002).
+      options:
+        - "Yes, mihomo works with the same config"
+        - "No, mihomo has the same problem"
+        - "Not tested"
+    validations:
+      required: true
