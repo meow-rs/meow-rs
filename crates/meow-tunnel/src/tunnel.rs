@@ -9,7 +9,7 @@ use parking_lot::{Mutex, RwLock};
 use smol_str::SmolStr;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use tracing::{debug, info, warn};
 
 /// Bundled rules + domain index + proxies map, swapped as one `Arc` on
@@ -445,6 +445,20 @@ impl Tunnel {
         &self.inner
     }
 
+    /// Weak handle to the inner state — long-lived background loops
+    /// (subscription refresh, geodata auto-update) capture this and
+    /// upgrade per tick so dropping every `Tunnel` handle actually stops
+    /// them (same contract the health-check loops and NAT sweeper use,
+    /// issue #514).
+    pub fn weak_inner(&self) -> Weak<TunnelInner> {
+        Arc::downgrade(&self.inner)
+    }
+
+    /// Rebuild a `Tunnel` handle from an upgraded [`Self::weak_inner`].
+    pub fn from_inner(inner: Arc<TunnelInner>) -> Self {
+        Self { inner }
+    }
+
     pub fn set_mode(&self, mode: TunnelMode) {
         *self.inner.mode.write() = mode;
         info!("Tunnel mode set to {}", mode);
@@ -586,7 +600,7 @@ impl Tunnel {
     /// `meow_config::extract_health_check_specs`; call on every config
     /// commit — startup, `PUT /configs`, section mutations, subscription
     /// refresh.
-    pub fn reconcile_health_checks(&self, specs: Vec<meow_common::HealthCheckSpec>) {
+    pub fn reconcile_health_checks(&self, specs: &[meow_common::HealthCheckSpec]) {
         self.inner
             .health_checks
             .lock()

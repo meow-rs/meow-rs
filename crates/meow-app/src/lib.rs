@@ -1,7 +1,7 @@
 //! CLI and service helpers for the meow-rs proxy kernel.
 //!
 //! Library surface used by the `meow` binary: systemd unit generation,
-//! geodata fetch, health checks, and subscription refresh. The binary wires
+//! geodata fetch, and subscription refresh. The binary wires
 //! configuration, the tunnel, listeners, DNS, and the REST API together.
 
 pub mod geodata_fetch;

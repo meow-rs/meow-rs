@@ -38,10 +38,14 @@ const FLOW_QUEUE: usize = 64;
 /// a `Sink` and cannot be cloned into per-flow tasks).
 const REPLY_QUEUE: usize = 512;
 
-/// One `read_packet` call with its own buffer, so the future can be pinned
-/// across `select!` iterations without borrowing the pump's state —
-/// dropping a mid-flight read is how a cancelled select arm desynced
-/// stream-framed UDP conns like Trojan (issue #514).
+/// Per-datagram read for the pinned `select!` future. Each read owns its
+/// buffer because a `&mut buf` borrow cannot coexist with `read.set(..)`
+/// on the same pinned future — the cost is one 64 KiB alloc+memset per
+/// datagram (bounded by `REPLY_QUEUE` depth), the price of keeping the
+/// read future alive across select iterations so cancellation only ever
+/// happens on real flow teardown — dropping a mid-flight read is how a
+/// cancelled select arm desynced stream-framed UDP conns like Trojan
+/// (issue #514).
 async fn read_one(
     conn: &dyn meow_common::ProxyPacketConn,
 ) -> meow_common::Result<(Vec<u8>, std::net::SocketAddr)> {

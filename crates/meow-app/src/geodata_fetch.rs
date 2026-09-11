@@ -156,6 +156,10 @@ pub async fn run_on_startup(
 /// mappings change infrequently and skipping the rebuild keeps the
 /// parser-built `CountryIndex` alive without churn. Operators who need to
 /// update GeoIP should replace `Country.mmdb` on disk and restart.
+///
+/// The tunnel is captured weakly (issue #514): an embedder that drops
+/// every `Tunnel` handle stops this loop at the next tick instead of
+/// pinning `TunnelInner` forever.
 pub async fn auto_update_loop(
     geo: GeoDataConfig,
     tunnel: Tunnel,
@@ -165,6 +169,9 @@ pub async fn auto_update_loop(
     let interval = std::time::Duration::from_secs(geo.auto_update_interval as u64 * 3600);
     let mut ticker = tokio::time::interval(interval);
     ticker.tick().await; // skip the immediate first tick
+
+    let weak = tunnel.weak_inner();
+    drop(tunnel);
 
     let asn_target = geo
         .asn_path
@@ -177,6 +184,12 @@ pub async fn auto_update_loop(
 
     loop {
         ticker.tick().await;
+
+        let Some(inner) = weak.upgrade() else {
+            info!("tunnel dropped; stopping geodata auto-update loop");
+            return;
+        };
+        let tunnel = Tunnel::from_inner(inner);
 
         let mut any_updated = false;
 

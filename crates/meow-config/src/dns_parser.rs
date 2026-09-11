@@ -317,6 +317,21 @@ fn parse_nameserver_urls(servers: &[String]) -> Result<Vec<NameServerUrl>, anyho
     parse_nameserver_entries(servers).map(|v| v.into_iter().map(|e| e.url).collect())
 }
 
+/// `true` when the raw `dns.nameserver-policy` section contains at least
+/// one `rule-set:` key (matching the case-insensitive + trimmed expansion
+/// the policy builder applies). Used by reload paths to decide
+/// whether the resolver build must load the candidate's rule-providers
+/// rather than a possibly-stale live registry (issue #514).
+pub fn dns_needs_rule_providers(raw: &crate::raw::RawConfig) -> bool {
+    raw.dns
+        .as_ref()
+        .and_then(|d| d.nameserver_policy.as_ref())
+        .is_some_and(|m| {
+            m.keys()
+                .any(|k| k.trim().to_ascii_lowercase().starts_with("rule-set:"))
+        })
+}
+
 /// Build a `NameserverPolicy` from the raw YAML map.
 ///
 /// `geosite:` patterns are compiled into matchers when a geosite DB is loaded.

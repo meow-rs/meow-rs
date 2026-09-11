@@ -813,7 +813,7 @@ async fn run(
     // Spawn periodic health checks for fallback / url-test proxy groups.
     // The supervisor lives on the tunnel so config reloads can reconcile
     // the task set (issue #514).
-    tunnel.reconcile_health_checks(meow_config::extract_health_check_specs(
+    tunnel.reconcile_health_checks(&meow_config::extract_health_check_specs(
         config.raw.proxy_groups.as_deref().unwrap_or(&[]),
     ));
 
@@ -868,8 +868,10 @@ async fn run(
         let raw_config = Arc::clone(&raw_config);
         let tunnel = tunnel.clone();
         let config_path = config_path.clone();
+        let dns_server = Arc::clone(&dns_server_handle);
         tokio::spawn(async move {
-            meow_app::subscription_refresh::run_loop(raw_config, tunnel, config_path).await;
+            meow_app::subscription_refresh::run_loop(raw_config, tunnel, config_path, dns_server)
+                .await;
         });
     }
 

@@ -401,10 +401,18 @@ pub(super) fn spawn_relay(stream: Box<dyn Stream>, dp: DataPhase) -> Box<dyn Str
         wr, proxy_rd, aead, write_ctr, pre_write, united_key, use_aes,
     ));
 
-    Box::new(crate::tasked_duplex::TaskedDuplex::new(
-        client,
-        [read_task.abort_handle(), write_task.abort_handle()],
-    ))
+    let aborts = [read_task.abort_handle(), write_task.abort_handle()];
+
+    // Same supervisor as the vmess relay: when the read side ends —
+    // upstream close, decode failure — the exchange is over; stop the
+    // write side instead of leaving it pumping into a dead transport
+    // until the client endpoint drops (issue #514 review).
+    tokio::spawn(async move {
+        let _ = read_task.await;
+        write_task.abort();
+    });
+
+    Box::new(crate::tasked_duplex::TaskedDuplex::new(client, aborts))
 }
 
 /// Read records from `rd`, decrypt, and forward plaintext to `proxy_wr`.

@@ -3399,3 +3399,147 @@ async fn put_configs_swaps_running_dns_resolver() {
         "restore PUT must succeed so the host-resolver hook is cleared"
     );
 }
+
+/// Issue #514 review: a `dns.listen` change whose new socket FAILS to bind
+/// must keep the old listener alive — the config is already committed, and
+/// dropping the only working DNS server would silently break resolution
+/// until the next dns-changing PUT.
+#[tokio::test]
+async fn put_configs_dns_rebind_failure_keeps_old_listener() {
+    use base64::Engine as _;
+    let state = test_state(RawConfig {
+        rules: Some(vec!["MATCH,DIRECT".into()]),
+        ..Default::default()
+    });
+    let put = |yaml: &str| {
+        let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+        create_router(Arc::clone(&state)).oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+    };
+
+    // First PUT: bind a standalone DNS listener on a free port.
+    let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let port_a = sock.local_addr().unwrap().port();
+    drop(sock);
+    let yaml_a = format!(
+        "mode: rule\ndns:\n  enable: true\n  listen: 127.0.0.1:{port_a}\n  nameserver:\n    - 127.0.0.1\nrules:\n  - MATCH,DIRECT\n"
+    );
+    assert_eq!(put(&yaml_a).await.unwrap().status(), StatusCode::NO_CONTENT);
+    assert!(
+        state
+            .dns_server
+            .read()
+            .as_ref()
+            .is_some_and(|h| h.listen.port() == port_a && !h.task.is_finished()),
+        "first PUT must leave a live listener on port {port_a}"
+    );
+
+    // Occupy a second port so the next PUT's bind fails with EADDRINUSE.
+    let blocker = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let port_b = blocker.local_addr().unwrap().port();
+    let yaml_b = format!(
+        "mode: rule\ndns:\n  enable: true\n  listen: 127.0.0.1:{port_b}\n  nameserver:\n    - 127.0.0.1\nrules:\n  - MATCH,DIRECT\n"
+    );
+    // The PUT itself still commits the config (204) — the listener simply
+    // keeps the old socket rather than dying with nothing bound.
+    assert_eq!(put(&yaml_b).await.unwrap().status(), StatusCode::NO_CONTENT);
+    let guard = state.dns_server.read();
+    let h = guard
+        .as_ref()
+        .expect("listener handle must survive a failed rebind");
+    assert_eq!(
+        h.listen.port(),
+        port_a,
+        "failed rebind must keep the old socket"
+    );
+    assert!(!h.task.is_finished(), "old listener task must stay alive");
+    drop(guard);
+    drop(blocker);
+}
+
+/// Issue #514 review: `nameserver-policy` `rule-set:` keys must resolve
+/// against the CANDIDATE's `rule-providers:` — a PUT that adds a provider
+/// and references it in the same payload is valid (startup accepts it), so
+/// it must not 400 against the startup-frozen provider registry.
+#[tokio::test]
+async fn put_configs_rule_set_policy_uses_candidate_providers() {
+    use base64::Engine as _;
+    let state = test_state(RawConfig {
+        rules: Some(vec!["MATCH,DIRECT".into()]),
+        ..Default::default()
+    });
+    let put = |yaml: &str| {
+        let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+        create_router(Arc::clone(&state)).oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+    };
+
+    let yaml = concat!(
+        "mode: rule\n",
+        "dns:\n",
+        "  enable: true\n",
+        "  nameserver:\n",
+        "    - 127.0.0.1\n",
+        "  nameserver-policy:\n",
+        "    rule-set:doms: 127.0.0.1\n",
+        "rule-providers:\n",
+        "  doms:\n",
+        "    type: inline\n",
+        "    behavior: domain\n",
+        "    payload:\n",
+        "      - '+.example.com'\n",
+        "rules:\n",
+        "  - MATCH,DIRECT\n",
+    );
+    assert_eq!(
+        put(yaml).await.unwrap().status(),
+        StatusCode::NO_CONTENT,
+        "rule-set: policy referencing a provider declared in the same PUT must be accepted"
+    );
+
+    // Same policy key with NO matching provider in the candidate → 400,
+    // proving resolution ran against the candidate's declarations rather
+    // than any pre-existing registry.
+    let yaml_missing = concat!(
+        "mode: rule\n",
+        "dns:\n",
+        "  enable: true\n",
+        "  nameserver:\n",
+        "    - 127.0.0.1\n",
+        "  nameserver-policy:\n",
+        "    rule-set:gone: 127.0.0.1\n",
+        "rules:\n",
+        "  - MATCH,DIRECT\n",
+    );
+    let resp = put(yaml_missing).await.unwrap();
+    let status = resp.status();
+    let body = String::from_utf8(
+        axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    eprintln!("missing-provider PUT status={status} body={body}");
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "rule-set: policy referencing a provider absent from the candidate must be rejected"
+    );
+}

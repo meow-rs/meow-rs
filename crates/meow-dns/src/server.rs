@@ -523,6 +523,10 @@ impl BoundDnsServer {
     /// instead of hand-rolling their own — e.g. the TUN loopback DNS servers
     /// on Windows, which must bind `127.0.0.1:53`/`[::1]:53` *before* the OS
     /// resolver is repointed at them.
+    /// The resolver is captured as a fixed `Arc` — it does NOT track a later
+    /// `Tunnel::set_resolver` generation swap. Callers that must follow
+    /// runtime DNS reloads should use [`BoundDnsServer::from_slot`] instead
+    /// (issue #514).
     pub fn from_socket(socket: UdpSocket, resolver: Arc<Resolver>) -> Self {
         Self {
             resolver: Arc::new(parking_lot::RwLock::new(resolver)),

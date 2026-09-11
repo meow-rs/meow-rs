@@ -1087,7 +1087,7 @@ async fn apply_raw_to_tunnel(
     // against the freshly rebuilt proxy registry so circular
     // `proxy-server-nameserver` detection sees current names; a parse
     // failure rejects the whole mutation before anything is published.
-    let dns = reconcile_dns_config(state, &raw, &proxies).await?;
+    let dns = reconcile_dns_config(&state.raw_config, &raw, &state.config_path, &proxies).await?;
     state.tunnel.update_routing(proxies, rules);
     Ok(dns)
 }
@@ -1120,10 +1120,10 @@ fn dns_uses_runtime_refs(raw: &RawConfig) -> bool {
         || urls_tagged(&dns.default_nameserver)
         || urls_tagged(&dns.proxy_server_nameserver)
         || dns.nameserver_policy.as_ref().is_some_and(|m| {
-            m.iter().any(|(k, v)| {
-                k.starts_with("rule-set:") || v.as_urls().iter().any(|u| u.contains('#'))
-            })
+            m.iter()
+                .any(|(_k, v)| v.as_urls().iter().any(|u| u.contains('#')))
         })
+        || meow_config::dns_parser::dns_needs_rule_providers(raw)
 }
 
 /// `true` when two raw configs carry identical DNS-relevant inputs —
@@ -1149,27 +1149,28 @@ fn dns_inputs_equal(a: &RawConfig, b: &RawConfig) -> bool {
         && v(&a.rule_providers) == v(&b.rule_providers)
 }
 
-/// When the candidate's DNS-relevant inputs differ from the live config's,
-/// parse the new `dns:` section into a runnable [`meow_config::DnsConfig`]
-/// for `swap_config_and_reconcile_tun` to publish. `None` means unchanged —
-/// the running resolver stays. `Err` rejects the whole mutation (issue
+/// Decide whether `candidate` requires a DNS rebuild, and if so parse it.
+/// `raw_config` must still hold the PRE-commit raw when this runs — the
+/// comparison is old-vs-candidate. Shared by the API commit paths and the
+/// subscription refresh loop (issue #514). `None` means unchanged — the
+/// running resolver stays. `Err` rejects the whole mutation (issue
 /// #514): a broken dns section must fail the PUT, not silently persist
 /// while the process keeps resolving through the old resolver.
-async fn reconcile_dns_config(
-    state: &AppState,
+pub async fn reconcile_dns_config(
+    raw_config: &RwLock<RawConfig>,
     candidate: &RawConfig,
+    config_path: &str,
     proxies: &std::collections::HashMap<smol_str::SmolStr, Arc<dyn meow_common::Proxy>>,
 ) -> Result<Option<meow_config::DnsConfig>, (StatusCode, String)> {
     let unchanged = {
-        let old = state.raw_config.read();
+        let old = raw_config.read();
         dns_inputs_equal(&old, candidate)
     };
     if unchanged {
         return Ok(None);
     }
-    let rule_providers = state.rule_providers.read().clone();
-    let cache_dir = meow_config::resource_cache_dir_for_config_path(&state.config_path);
-    meow_config::parse_dns_from_raw(candidate, Some(&cache_dir), proxies, &rule_providers)
+    let cache_dir = meow_config::resource_cache_dir_for_config_path(config_path);
+    meow_config::parse_dns_from_raw(candidate, Some(&cache_dir), proxies)
         .await
         .map(Some)
         .map_err(|e| {
@@ -1185,8 +1186,12 @@ async fn reconcile_dns_config(
 /// server (in-place resolver swap when the listen addr is unchanged,
 /// rebind otherwise), and re-install the process-wide host-resolver hook
 /// under the same policy startup uses (issue #514).
-async fn publish_dns(state: &AppState, dns: meow_config::DnsConfig) {
-    state.tunnel.set_resolver(Arc::clone(&dns.resolver));
+pub async fn publish_dns(
+    tunnel: &Tunnel,
+    dns_server: &RwLock<Option<DnsServerHandle>>,
+    dns: meow_config::DnsConfig,
+) {
+    tunnel.set_resolver(Arc::clone(&dns.resolver));
 
     // Same host-resolver policy as `main.rs` startup: installed whenever
     // DNS is enabled, unconditionally on VPN platforms where it is the
@@ -1207,7 +1212,7 @@ async fn publish_dns(state: &AppState, dns: meow_config::DnsConfig) {
     // keep-decision and the swap: `keep` also requires a live serve task —
     // swapping the slot of a dead one would leave no listener.
     {
-        let guard = state.dns_server.read();
+        let guard = dns_server.read();
         if let Some(h) = guard.as_ref() {
             if dns.enabled && dns.listen_addr == Some(h.listen) && !h.task.is_finished() {
                 // Same listen addr: swap the resolver in place — the bound
@@ -1242,22 +1247,53 @@ async fn publish_dns(state: &AppState, dns: meow_config::DnsConfig) {
     } else {
         None
     };
-    let old = state.dns_server.write().take();
-    if let Some(old) = old {
-        old.task.abort();
-        let _ = old.task.await;
-    }
-    if let Some((bound, slot)) = new_bound {
-        let task = tokio::spawn(async move {
-            if let Err(e) = bound.run().await {
-                warn!("DNS server error: {e}");
+    match new_bound {
+        Some((bound, slot)) => {
+            // New socket bound — safe to tear the old listener down.
+            let old = dns_server.write().take();
+            if let Some(old) = old {
+                old.task.abort();
+                let _ = old.task.await;
             }
-        });
-        *state.dns_server.write() = Some(DnsServerHandle {
-            listen: dns.listen_addr.unwrap(),
-            task,
-            resolver_slot: slot,
-        });
+            let task = tokio::spawn(async move {
+                if let Err(e) = bound.run().await {
+                    warn!("DNS server error: {e}");
+                }
+            });
+            *dns_server.write() = Some(DnsServerHandle {
+                listen: dns.listen_addr.unwrap(),
+                task,
+                resolver_slot: slot,
+            });
+        }
+        None => {
+            // No new listener. Two sub-cases: the config turned the server
+            // OFF (`!dns.enabled || listen_addr: None`) — tear the old one
+            // down — or a rebind FAILED while the config still wants one —
+            // keep the old listener alive (a live-but-stale listener beats
+            // none; the config is already committed). All parking_lot guard
+            // work stays inside the block — only the Send-able handle
+            // escapes, so the abort/await below keeps this future Send.
+            let old = {
+                let mut guard = dns_server.write();
+                let wanted = dns.enabled && dns.listen_addr.is_some();
+                match guard.take() {
+                    Some(old) if wanted && !old.task.is_finished() => {
+                        warn!(
+                            "dns.listen rebind failed; keeping existing listener on {}",
+                            old.listen
+                        );
+                        *guard = Some(old);
+                        None
+                    }
+                    other => other,
+                }
+            };
+            if let Some(old) = old {
+                old.task.abort();
+                let _ = old.task.await;
+            }
+        }
     }
 }
 
@@ -2009,13 +2045,13 @@ async fn swap_config_and_reconcile_tun(
     {
         let groups = state.raw_config.read().proxy_groups.clone();
         let specs = meow_config::extract_health_check_specs(groups.as_deref().unwrap_or(&[]));
-        state.tunnel.reconcile_health_checks(specs);
+        state.tunnel.reconcile_health_checks(&specs);
     }
 
     // Publish the rebuilt DNS runtime — independent of TUN transitions, so
     // it must run before the equal-state early return (issue #514).
     if let Some(dns) = dns {
-        publish_dns(state, dns).await;
+        publish_dns(&state.tunnel, &state.dns_server, dns).await;
     }
 
     if old_enable == new_enable {
@@ -2164,17 +2200,20 @@ async fn put_configs(
     // failing here rejects the PUT before `reload_routing` publishes
     // anything (under `force` a broken dns section degrades to warn + keep
     // the old resolver, matching how force tolerates proxy errors).
-    let dns = match reconcile_dns_config(&state, &raw_config, &proxies).await {
-        Ok(d) => d,
-        Err((status, msg)) => {
-            if force {
-                tracing::error!("config reload forced despite dns rebuild error: {msg}");
-                None
-            } else {
-                return (status, Json(serde_json::json!({"message": msg}))).into_response();
+    let dns =
+        match reconcile_dns_config(&state.raw_config, &raw_config, &state.config_path, &proxies)
+            .await
+        {
+            Ok(d) => d,
+            Err((status, msg)) => {
+                if force {
+                    tracing::error!("config reload forced despite dns rebuild error: {msg}");
+                    None
+                } else {
+                    return (status, Json(serde_json::json!({"message": msg}))).into_response();
+                }
             }
-        }
-    };
+        };
 
     // Prepare routing before the synchronous admission/cancellation boundary.
     // No old-policy setup can register after this cold reload completes.

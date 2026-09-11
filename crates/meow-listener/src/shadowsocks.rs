@@ -518,13 +518,22 @@ where
         if flow.dead.load(std::sync::atomic::Ordering::Relaxed) {
             flows.remove(&key);
         } else {
-            flow.conn
-                .write_packet(payload, &dst_addr)
-                .await
-                .map_err(|e| format!("udp write {dst_addr}: {e}"))?;
-            flow.last_activity_ms
-                .store(monotonic_ms() as Uint, std::sync::atomic::Ordering::Relaxed);
-            return Ok(true);
+            match flow.conn.write_packet(payload, &dst_addr).await {
+                Ok(_n) => {
+                    flow.last_activity_ms
+                        .store(monotonic_ms() as Uint, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(true);
+                }
+                Err(e) => {
+                    // A failed write leaves the flow half-dead — the reply
+                    // task's read may still block indefinitely, so every
+                    // later datagram on this key would keep erroring. Evict
+                    // now so the next packet redials (mirrors the SOCKS5
+                    // path, issue #514 review).
+                    flows.remove(&key);
+                    return Err(format!("udp write {dst_addr}: {e}"));
+                }
+            }
         }
     }
 

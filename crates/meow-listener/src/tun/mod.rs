@@ -645,11 +645,18 @@ impl TunListener {
                 // (core panicked/exited without signalling — nothing left to
                 // wait on either way).
                 Ok(_) => {}
-                Err(_) => warn!(
-                    "tun '{}': previous lwIP core still tearing down after {:?}; \
-                     proceeding risks two live cores sharing pcb globals",
-                    self.name, PREVIOUS_CORE_TEARDOWN_WAIT
-                ),
+                // A still-living predecessor owns the process-global pcb
+                // lists `NetStack::new` is about to overwrite — proceeding
+                // is a data race on C state, not a recoverable wait. Fail
+                // the listener; the caller rolls `tun.enable` back.
+                Err(_) => {
+                    return Err(io::Error::other(format!(
+                        "previous lwIP core did not finish teardown within \
+                         {PREVIOUS_CORE_TEARDOWN_WAIT:?}; refusing to build \
+                         a second stack over live pcb globals"
+                    ))
+                    .into());
+                }
             }
         }
         let (stack, mut tcp_listener, udp_socket) =

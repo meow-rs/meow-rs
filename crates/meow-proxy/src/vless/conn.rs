@@ -350,9 +350,9 @@ pub struct VlessPacketConn {
 
 /// Cancel-safe UDP reader.  The response header, the per-datagram length
 /// prefix and the payload all persist their read progress across dropped
-/// `read_packet` futures — the TUN pump recreates its read inside
-/// `select!`, and a lost half-read would desynchronise the UDP-over-TCP
-/// framing forever.
+/// `read_packet` futures — a lost half-read would desynchronise the
+/// UDP-over-TCP framing forever (callers may still cancel a read by
+/// dropping the future, e.g. task abort).
 struct VlessUdpReader {
     stream: tokio::io::ReadHalf<Box<dyn Stream>>,
     /// VLESS response header `[version][addon_length]`; `hdr_pos < 2`

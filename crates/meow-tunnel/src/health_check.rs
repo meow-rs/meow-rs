@@ -25,7 +25,7 @@ pub struct HealthCheckSupervisor {
 }
 
 impl HealthCheckSupervisor {
-    pub fn reconcile(&mut self, inner: &Arc<TunnelInner>, specs: Vec<HealthCheckSpec>) {
+    pub fn reconcile(&mut self, inner: &Arc<TunnelInner>, specs: &[HealthCheckSpec]) {
         let wanted: HashMap<&str, &HealthCheckSpec> =
             specs.iter().map(|s| (s.group_name.as_str(), s)).collect();
 
@@ -40,16 +40,22 @@ impl HealthCheckSupervisor {
             keep
         });
 
-        for spec in specs {
+        // Spawn from `wanted` (last-wins), not `specs` — a caller that
+        // passes conflicting duplicate names would otherwise store the
+        // first spec while `wanted` compares against the last, churning
+        // the task on every reconcile.
+        for spec in wanted.values() {
             if self.tasks.contains_key(spec.group_name.as_str()) {
                 continue;
             }
+            let spec = (*spec).clone();
             let task = tokio::spawn(run_health_check_loop(Arc::downgrade(inner), spec.clone()));
             self.tasks.insert(spec.group_name.clone(), (spec, task));
         }
     }
 
-    /// Number of live check tasks — test/diagnostic surface.
+    /// Number of tracked tasks — includes dead-but-unreaped entries that
+    /// the next `reconcile` will replace (test/diagnostic surface).
     pub fn task_count(&self) -> usize {
         self.tasks.len()
     }
@@ -60,7 +66,10 @@ fn should_probe(lazy: bool, generation: u64, last_probed_generation: u64) -> boo
 }
 
 async fn run_health_check_loop(inner: Weak<TunnelInner>, spec: HealthCheckSpec) {
-    let mut ticker = tokio::time::interval(Duration::from_secs(spec.interval_secs));
+    // `interval(Duration::ZERO)` panics — extract clamps 0→300, but a
+    // spec constructed directly (embedders) must not kill the task.
+    let interval_secs = spec.interval_secs.max(1);
+    let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
     // `Delay` (not tokio's default `Burst`) so a probe that outlives a short
     // `interval` schedules the next tick a full interval from *now* instead
     // of firing a back-to-back burst of catch-up probes. For the common
@@ -197,7 +206,7 @@ mod tests {
         // Add a group → task spawned.
         sup.reconcile(
             tunnel.inner(),
-            extract_specs(&[raw_group("a", "url-test", Some(3600))]),
+            &extract_specs(&[raw_group("a", "url-test", Some(3600))]),
         );
         assert_eq!(sup.task_count(), 1);
         let first = sup.tasks["a"].1.id();
@@ -205,7 +214,7 @@ mod tests {
         // Identical spec → no churn.
         sup.reconcile(
             tunnel.inner(),
-            extract_specs(&[raw_group("a", "url-test", Some(3600))]),
+            &extract_specs(&[raw_group("a", "url-test", Some(3600))]),
         );
         assert_eq!(sup.task_count(), 1);
         assert_eq!(sup.tasks["a"].1.id(), first, "same spec keeps task");
@@ -213,7 +222,7 @@ mod tests {
         // Changed interval → respawn (new task identity).
         sup.reconcile(
             tunnel.inner(),
-            extract_specs(&[raw_group("a", "url-test", Some(60))]),
+            &extract_specs(&[raw_group("a", "url-test", Some(60))]),
         );
         assert_eq!(sup.task_count(), 1);
         assert_ne!(sup.tasks["a"].1.id(), first, "changed spec respawns");
@@ -221,20 +230,20 @@ mod tests {
         // Type change to non-probing → task removed.
         sup.reconcile(
             tunnel.inner(),
-            extract_specs(&[raw_group("a", "select", None)]),
+            &extract_specs(&[raw_group("a", "select", None)]),
         );
         assert_eq!(sup.task_count(), 0, "non-checkable group aborts task");
 
         // Removed entirely → abort.
         sup.reconcile(
             tunnel.inner(),
-            extract_specs(&[
+            &extract_specs(&[
                 raw_group("a", "url-test", None),
                 raw_group("b", "fallback", None),
             ]),
         );
         assert_eq!(sup.task_count(), 2);
-        sup.reconcile(tunnel.inner(), extract_specs(&[]));
+        sup.reconcile(tunnel.inner(), &extract_specs(&[]));
         assert_eq!(sup.task_count(), 0, "empty group set aborts all tasks");
     }
 
@@ -245,7 +254,7 @@ mod tests {
         let mut sup = HealthCheckSupervisor::default();
         sup.reconcile(
             tunnel.inner(),
-            extract_specs(&[raw_group("a", "url-test", Some(3600))]),
+            &extract_specs(&[raw_group("a", "url-test", Some(3600))]),
         );
         assert_eq!(sup.task_count(), 1);
         let first = sup.tasks["a"].1.id();
@@ -256,7 +265,7 @@ mod tests {
         until(Duration::from_secs(5), || sup.tasks["a"].1.is_finished()).await;
         sup.reconcile(
             tunnel.inner(),
-            extract_specs(&[raw_group("a", "url-test", Some(3600))]),
+            &extract_specs(&[raw_group("a", "url-test", Some(3600))]),
         );
         assert_eq!(sup.task_count(), 1, "dead task is reaped and respawned");
         assert_ne!(
@@ -280,13 +289,28 @@ mod tests {
             raw_group("a", "url-test", Some(3600)),
             raw_group("a", "url-test", Some(60)),
         ];
-        sup.reconcile(tunnel.inner(), extract_specs(&groups));
+        sup.reconcile(tunnel.inner(), &extract_specs(&groups));
         assert_eq!(sup.task_count(), 1);
         assert_eq!(sup.tasks["a"].0.interval_secs, 60, "last spec wins");
         let first = sup.tasks["a"].1.id();
         // Reconciling the same duplicate set must not respawn.
-        sup.reconcile(tunnel.inner(), extract_specs(&groups));
+        sup.reconcile(tunnel.inner(), &extract_specs(&groups));
         assert_eq!(sup.tasks["a"].1.id(), first, "no churn on duplicates");
+    }
+
+    /// A checkable declaration shadowed by a same-named non-checkable one
+    /// emits no spec — the builder's last-wins applies across types too,
+    /// so the select group that actually got built must not be probed.
+    #[test]
+    fn extract_skips_checkable_shadowed_by_select() {
+        let groups = [
+            raw_group("a", "url-test", Some(60)),
+            raw_group("a", "select", None),
+        ];
+        assert!(
+            extract_specs(&groups).is_empty(),
+            "last declaration is select — no health check"
+        );
     }
 
     /// Probe tasks exit on their own once the tunnel is dropped — a
@@ -298,7 +322,7 @@ mod tests {
         let mut sup = HealthCheckSupervisor::default();
         sup.reconcile(
             tunnel.inner(),
-            extract_specs(&[raw_group("a", "url-test", Some(1))]),
+            &extract_specs(&[raw_group("a", "url-test", Some(1))]),
         );
         let handle = sup.tasks.remove("a").unwrap().1;
         drop(tunnel);

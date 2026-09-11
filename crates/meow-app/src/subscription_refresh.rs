@@ -8,19 +8,37 @@ use meow_config::raw::RawConfig;
 use meow_tunnel::Tunnel;
 use parking_lot::RwLock;
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// Poll subscriptions in `raw_config` every 60s; for each subscription whose
 /// `interval` has elapsed (or which has never been fetched), download the
 /// remote config, replace proxies/groups/rules, rebuild the tunnel, and
 /// persist back to `config_path`. Runs forever; spawn as a background task.
-pub async fn run_loop(raw_config: Arc<RwLock<RawConfig>>, tunnel: Tunnel, config_path: String) {
+///
+/// The loop captures the tunnel weakly (issue #514): an embedder that drops
+/// every `Tunnel` handle stops this loop instead of leaving it mutating a
+/// dead tunnel's route table forever.
+pub async fn run_loop(
+    raw_config: Arc<RwLock<RawConfig>>,
+    tunnel: Tunnel,
+    config_path: String,
+    dns_server: Arc<RwLock<Option<meow_api::routes::DnsServerHandle>>>,
+) {
     // Same provider-cache directory `load_config` used at startup — trusted
     // rebuilds of the daemon's own config must keep resolving relative
     // rule-provider paths the same way, not hard-fail with `cache_dir: None`
     // (issue #429 follow-up).
     let cache_dir = meow_config::resource_cache_dir_for_config_path(&config_path);
+    let weak = tunnel.weak_inner();
+    drop(tunnel);
     loop {
+        // Pin the tunnel for one pass only — between passes it may be
+        // dropped, in which case this loop exits.
+        let Some(inner) = weak.upgrade() else {
+            info!("tunnel dropped; stopping subscription refresh loop");
+            return;
+        };
+        let tunnel = Tunnel::from_inner(inner);
         let subs_to_refresh: Vec<(String, String)> = {
             let raw = raw_config.read();
             let now = std::time::SystemTime::now()
@@ -94,15 +112,37 @@ pub async fn run_loop(raw_config: Arc<RwLock<RawConfig>>, tunnel: Tunnel, config
 
                     match rebuild {
                         Ok(Ok((new_proxies, new_rules))) => {
+                            // A swapped proxy set changes the objects a
+                            // `#name` nameserver or `rule-set:` policy key
+                            // references — reconcile BEFORE the raw write so
+                            // the old-vs-candidate comparison still sees the
+                            // previous raw (issue #514 review).
+                            let dns = meow_api::routes::reconcile_dns_config(
+                                &raw_config,
+                                &candidate,
+                                &config_path,
+                                &new_proxies,
+                            )
+                            .await;
+
                             tunnel.update_routing(new_proxies, new_rules);
                             // Commit raw + routing together inside the lane:
                             // the on-disk/dashboard view and the running
                             // router can no longer diverge on failure.
                             *raw_config.write() = candidate.clone();
+                            match dns {
+                                Ok(Some(dns)) => {
+                                    meow_api::routes::publish_dns(&tunnel, &dns_server, dns).await;
+                                }
+                                Ok(None) => {}
+                                Err((_status, msg)) => warn!(
+                                    "subscription '{name}' committed; dns republish skipped: {msg}"
+                                ),
+                            }
                             // Health-check tasks follow the new group set
                             // (issue #514).
                             tunnel.reconcile_health_checks(
-                                meow_config::extract_health_check_specs(
+                                &meow_config::extract_health_check_specs(
                                     candidate.proxy_groups.as_deref().unwrap_or(&[]),
                                 ),
                             );
@@ -125,16 +165,30 @@ pub async fn run_loop(raw_config: Arc<RwLock<RawConfig>>, tunnel: Tunnel, config
                                 sub.last_updated = Some(now);
                             }
                         }
-                        Err(e) => error!(
-                            "Failed to join rebuild task after refreshing '{}': {}",
-                            name, e
-                        ),
+                        Err(e) => {
+                            error!(
+                                "Failed to join rebuild task after refreshing '{}': {}",
+                                name, e
+                            );
+                            // Same stamping as the rebuild-error arm — a
+                            // panicking task shouldn't re-download every
+                            // 60 s either.
+                            let mut live = raw_config.write();
+                            if let Some(sub) = live
+                                .subscriptions
+                                .as_mut()
+                                .and_then(|subs| subs.iter_mut().find(|s| s.name == name))
+                            {
+                                sub.last_updated = Some(now);
+                            }
+                        }
                     }
                 }
                 Err(e) => error!("Failed to refresh subscription '{}': {}", name, e),
             }
         }
 
+        drop(tunnel);
         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
     }
 }

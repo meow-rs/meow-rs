@@ -560,22 +560,42 @@ pub fn rebuild_from_raw_with_cache_dir(
 /// builder scans). Used by `PUT /configs` DNS hot reload (issue #514);
 /// `proxy_registry` should be the freshly rebuilt map so
 /// `proxy-server-nameserver` circular-detection sees current names.
+///
+/// `rule-set:` nameserver-policy keys resolve against the CANDIDATE's own
+/// `rule-providers:` declarations — loaded here on demand — never a live
+/// registry snapshot: a PUT that adds a provider and references it in the
+/// same payload must succeed, and a PUT removing one must not let the old
+/// matcher zombie-bind (issue #514 review).
 pub async fn parse_dns_from_raw(
     raw: &raw::RawConfig,
     cache_dir: Option<&Path>,
     proxy_registry: &HashMap<SmolStr, Arc<dyn Proxy>>,
-    rule_providers: &HashMap<String, Arc<rule_provider::RuleProvider>>,
 ) -> Result<DnsConfig, anyhow::Error> {
     let geo = geodata::parse_geodata(raw.geodata.as_ref())?;
     let payloads = rule_provider::PrefetchedPayloads::default();
     let ctx = build_parser_context_from_raw(raw, &payloads)?;
+    let rule_providers = if dns_parser::dns_needs_rule_providers(raw) {
+        let download_proxy =
+            internal_http::first_named_proxy(raw.proxies.as_deref(), proxy_registry);
+        load_rule_providers_async(
+            raw.rule_providers.clone().unwrap_or_default(),
+            cache_dir.map(Path::to_path_buf),
+            ctx.clone(),
+            download_proxy,
+            proxy_registry.clone(),
+            Arc::new(payloads),
+        )
+        .await?
+    } else {
+        HashMap::new()
+    };
     dns_parser::parse_dns(
         raw,
         geo.mmdb_path.as_deref(),
         cache_dir,
         proxy_registry,
         ctx.geosite,
-        rule_providers,
+        &rule_providers,
     )
     .await
 }
@@ -3765,18 +3785,26 @@ rule-providers:
 
 /// `fallback` / `url-test` proxy groups get periodic health checks —
 /// extract their probe specs from the raw group list (issue #514). Last
-/// duplicate name wins, matching how `load_config` resolves duplicates.
+/// duplicate name wins, matching how `load_config` resolves duplicates —
+/// including a checkable declaration followed by a same-named
+/// non-checkable one, which must NOT emit a spec.
 pub fn extract_health_check_specs(
     raw_groups: &[raw::RawProxyGroup],
 ) -> Vec<meow_common::HealthCheckSpec> {
     const DEFAULT_URL: &str = "http://www.gstatic.com/generate_204";
     const DEFAULT_INTERVAL_SECS: u64 = 300;
-    let mut specs: Vec<meow_common::HealthCheckSpec> = Vec::new();
+    // First pass: resolve duplicate names against every declaration
+    // (load_config's builder is last-wins on the name regardless of type).
+    let mut last: Vec<&raw::RawProxyGroup> = Vec::new();
     for g in raw_groups {
-        if !matches!(g.group_type.as_str(), "fallback" | "url-test") {
-            continue;
+        match last.iter_mut().find(|prev| prev.name == g.name) {
+            Some(prev) => *prev = g,
+            None => last.push(g),
         }
-        let spec = meow_common::HealthCheckSpec {
+    }
+    last.iter()
+        .filter(|g| matches!(g.group_type.as_str(), "fallback" | "url-test"))
+        .map(|g| meow_common::HealthCheckSpec {
             group_name: g.name.clone(),
             url: g.url.as_deref().unwrap_or(DEFAULT_URL).to_string(),
             interval_secs: g
@@ -3784,11 +3812,6 @@ pub fn extract_health_check_specs(
                 .filter(|interval| *interval > 0)
                 .unwrap_or(DEFAULT_INTERVAL_SECS),
             lazy: g.lazy.unwrap_or(false),
-        };
-        match specs.iter_mut().find(|s| s.group_name == g.name) {
-            Some(existing) => *existing = spec,
-            None => specs.push(spec),
-        }
-    }
-    specs
+        })
+        .collect()
 }
