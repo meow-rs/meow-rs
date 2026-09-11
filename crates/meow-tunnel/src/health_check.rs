@@ -121,6 +121,10 @@ async fn run_health_check_loop(inner: Weak<TunnelInner>, spec: HealthCheckSpec) 
             .into_iter()
             .filter_map(|n| proxies.get(n.as_str()).cloned().map(|p| (n, p)))
             .collect();
+        // `expected-status` narrows the acceptance set — a periodic probe
+        // must use the same set the group's set-triggered probes use,
+        // otherwise the two can disagree on member health (issue #514).
+        let expected_status = group.expected_status().filter(|s| !s.is_empty());
         drop(route);
 
         let mut alive_count = 0u32;
@@ -128,7 +132,7 @@ async fn run_health_check_loop(inner: Weak<TunnelInner>, spec: HealthCheckSpec) 
         for (name, delay) in meow_proxy::health::probe_many_bounded(
             members,
             &spec.url,
-            None,
+            expected_status,
             PROBE_TIMEOUT,
             meow_proxy::health::PROVIDER_HEALTHCHECK_CONCURRENCY,
         )

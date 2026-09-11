@@ -848,6 +848,8 @@ async fn run(
             .collect();
         for provider in providers_snap {
             let interval_secs = provider.interval;
+            let provider_name = provider.name.clone();
+            let registry = Arc::clone(&rule_providers);
             tokio::spawn(async move {
                 let ctx = meow_rules::ParserContext::empty();
                 let mut ticker =
@@ -855,6 +857,13 @@ async fn run(
                 ticker.tick().await; // skip the immediate first tick
                 loop {
                     ticker.tick().await;
+                    // Resolve by name each tick — config reloads swap the
+                    // provider objects under the registry, and refreshing a
+                    // detached startup-era Arc would never reach the live
+                    // matchers (issue #514 review).
+                    let Some(provider) = registry.read().get(&provider_name).cloned() else {
+                        continue;
+                    };
                     if let Err(e) = provider.refresh(&ctx).await {
                         error!(provider = %provider.name, "background refresh failed: {:#}", e);
                     }
@@ -869,9 +878,16 @@ async fn run(
         let tunnel = tunnel.clone();
         let config_path = config_path.clone();
         let dns_server = Arc::clone(&dns_server_handle);
+        let rule_providers = Arc::clone(&rule_providers);
         tokio::spawn(async move {
-            meow_app::subscription_refresh::run_loop(raw_config, tunnel, config_path, dns_server)
-                .await;
+            meow_app::subscription_refresh::run_loop(
+                raw_config,
+                tunnel,
+                config_path,
+                dns_server,
+                rule_providers,
+            )
+            .await;
         });
     }
 

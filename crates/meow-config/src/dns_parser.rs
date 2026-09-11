@@ -327,8 +327,12 @@ pub fn dns_needs_rule_providers(raw: &crate::raw::RawConfig) -> bool {
         .as_ref()
         .and_then(|d| d.nameserver_policy.as_ref())
         .is_some_and(|m| {
+            // Expand per segment like `build_nameserver_policy` — a mixed
+            // key (`"+.corp.example,rule-set:x"`) puts the prefix on a
+            // non-leading segment the whole-key check would miss.
             m.keys()
-                .any(|k| k.trim().to_ascii_lowercase().starts_with("rule-set:"))
+                .flat_map(|k| expand_policy_keys(k))
+                .any(|ek| ek.to_ascii_lowercase().starts_with("rule-set:"))
         })
 }
 
@@ -460,7 +464,7 @@ enum PolicyPattern {
     Matcher(NameserverPolicyMatcher),
 }
 
-fn expand_policy_keys(key: &str) -> Vec<String> {
+pub(crate) fn expand_policy_keys(key: &str) -> Vec<String> {
     let key = key.trim();
     let lower = key.to_ascii_lowercase();
     if lower.starts_with("geosite:") {

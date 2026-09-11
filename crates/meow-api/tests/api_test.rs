@@ -3513,6 +3513,40 @@ async fn put_configs_rule_set_policy_uses_candidate_providers() {
         "rule-set: policy referencing a provider declared in the same PUT must be accepted"
     );
 
+    // The loaded providers are swapped into the live registry — otherwise
+    // `PUT /providers/rules/{name}` and name-resolved refresh loops would
+    // operate on orphaned startup-era objects (issue #514 review).
+    assert!(
+        state.rule_providers.read().contains_key("doms"),
+        "commit must publish the loaded provider into the live registry"
+    );
+
+    // A MIXED key — the `rule-set:` prefix on a non-leading
+    // comma-separated segment must still trigger provider loading
+    // (`"+.corp.example,rule-set:doms"`).
+    let yaml_mixed = concat!(
+        "mode: rule\n",
+        "dns:\n",
+        "  enable: true\n",
+        "  nameserver:\n",
+        "    - 127.0.0.1\n",
+        "  nameserver-policy:\n",
+        "    '+.corp.example,rule-set:doms': 127.0.0.1\n",
+        "rule-providers:\n",
+        "  doms:\n",
+        "    type: inline\n",
+        "    behavior: domain\n",
+        "    payload:\n",
+        "      - '+.example.com'\n",
+        "rules:\n",
+        "  - MATCH,DIRECT\n",
+    );
+    assert_eq!(
+        put(yaml_mixed).await.unwrap().status(),
+        StatusCode::NO_CONTENT,
+        "mixed key with a non-leading rule-set: segment must load providers too"
+    );
+
     // Same policy key with NO matching provider in the candidate → 400,
     // proving resolution ran against the candidate's declarations rather
     // than any pre-existing registry.
@@ -3527,18 +3561,8 @@ async fn put_configs_rule_set_policy_uses_candidate_providers() {
         "rules:\n",
         "  - MATCH,DIRECT\n",
     );
-    let resp = put(yaml_missing).await.unwrap();
-    let status = resp.status();
-    let body = String::from_utf8(
-        axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap()
-            .to_vec(),
-    )
-    .unwrap();
-    eprintln!("missing-provider PUT status={status} body={body}");
     assert_eq!(
-        status,
+        put(yaml_missing).await.unwrap().status(),
         StatusCode::BAD_REQUEST,
         "rule-set: policy referencing a provider absent from the candidate must be rejected"
     );

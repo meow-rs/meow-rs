@@ -52,6 +52,10 @@ async fn read_one(
     let mut buf = vec![0u8; DATAGRAM_BUF];
     let (n, from) = conn.read_packet(&mut buf).await?;
     buf.truncate(n);
+    // Release the spare 64 KiB capacity before the buffer sits in the
+    // reply queue — otherwise every queued reply pins a full datagram
+    // buffer (≤512 × 64 KiB worst case) (issue #514 review).
+    buf.shrink_to_fit();
     Ok((buf, from))
 }
 /// Sweep dead flow-table entries every this many datagrams.

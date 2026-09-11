@@ -693,6 +693,17 @@ async fn update_configs(
     // /configs, whose candidate swap would clobber the patched fields
     // (issue #514).
     let _mutation = CONFIG_MUTATION.lock().await;
+    // Apply the fallible side first — committing mode before a failed
+    // log-level reload would partially apply the PATCH (issue #514).
+    if let Some(level) = body.log_level.as_deref() {
+        if let Err(e) = crate::log_stream::reload_log_level(level) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"message": e})),
+            )
+                .into_response();
+        }
+    }
     let mut raw = state.raw_config.write();
     if let Some(Ok(parsed_mode)) = mode {
         state.tunnel.set_mode(parsed_mode);
@@ -700,13 +711,6 @@ async fn update_configs(
         info!("Mode changed to {}", parsed_mode);
     }
     if let Some(level) = body.log_level {
-        if let Err(e) = crate::log_stream::reload_log_level(&level) {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"message": e})),
-            )
-                .into_response();
-        }
         raw.log_level = Some(level);
     }
     StatusCode::NO_CONTENT.into_response()
@@ -1087,7 +1091,14 @@ async fn apply_raw_to_tunnel(
     // against the freshly rebuilt proxy registry so circular
     // `proxy-server-nameserver` detection sees current names; a parse
     // failure rejects the whole mutation before anything is published.
-    let dns = reconcile_dns_config(&state.raw_config, &raw, &state.config_path, &proxies).await?;
+    let dns = reconcile_dns_config(
+        &state.raw_config,
+        &raw,
+        &state.config_path,
+        &proxies,
+        &state.rule_providers,
+    )
+    .await?;
     state.tunnel.update_routing(proxies, rules);
     Ok(dns)
 }
@@ -1134,19 +1145,28 @@ fn dns_uses_runtime_refs(raw: &RawConfig) -> bool {
 /// `rule-set:` policy keys), those sections join the comparison — the
 /// resolver snapshots them at build time.
 fn dns_inputs_equal(a: &RawConfig, b: &RawConfig) -> bool {
-    fn v<T: serde::Serialize>(t: &T) -> serde_json::Value {
-        serde_json::to_value(t).unwrap_or(serde_json::Value::Null)
+    // Serialization failure is fail-safe — treat the sections as changed
+    // so a rebuild is attempted (its parse error is then visible) instead
+    // of silently skipping on a collapsed `Null == Null` comparison.
+    fn eq<T: serde::Serialize>(x: &T, y: &T, what: &str) -> bool {
+        match (serde_json::to_value(x), serde_json::to_value(y)) {
+            (Ok(vx), Ok(vy)) => vx == vy,
+            _ => {
+                warn!("dns_inputs_equal: failed to serialize {what}; treating as changed");
+                false
+            }
+        }
     }
-    let base = v(&a.dns) == v(&b.dns)
-        && v(&a.hosts) == v(&b.hosts)
+    let base = eq(&a.dns, &b.dns, "dns")
+        && eq(&a.hosts, &b.hosts, "hosts")
         && a.ipv6 == b.ipv6
-        && v(&a.geodata) == v(&b.geodata);
+        && eq(&a.geodata, &b.geodata, "geodata");
     if !base || !(dns_uses_runtime_refs(a) || dns_uses_runtime_refs(b)) {
         return base;
     }
-    v(&a.proxies) == v(&b.proxies)
-        && v(&a.proxy_groups) == v(&b.proxy_groups)
-        && v(&a.rule_providers) == v(&b.rule_providers)
+    eq(&a.proxies, &b.proxies, "proxies")
+        && eq(&a.proxy_groups, &b.proxy_groups, "proxy_groups")
+        && eq(&a.rule_providers, &b.rule_providers, "rule_providers")
 }
 
 /// Decide whether `candidate` requires a DNS rebuild, and if so parse it.
@@ -1156,11 +1176,16 @@ fn dns_inputs_equal(a: &RawConfig, b: &RawConfig) -> bool {
 /// running resolver stays. `Err` rejects the whole mutation (issue
 /// #514): a broken dns section must fail the PUT, not silently persist
 /// while the process keeps resolving through the old resolver.
+/// `rule_providers` is the live registry the policy matchers' provider
+/// objects are written into on success — pass `state.rule_providers` (or
+/// the equivalent shared registry) so `PUT /providers/rules/{name}` and
+/// name-resolved refresh loops reach the live generation (issue #514).
 pub async fn reconcile_dns_config(
     raw_config: &RwLock<RawConfig>,
     candidate: &RawConfig,
     config_path: &str,
     proxies: &std::collections::HashMap<smol_str::SmolStr, Arc<dyn meow_common::Proxy>>,
+    rule_providers: &RwLock<HashMap<String, Arc<meow_config::rule_provider::RuleProvider>>>,
 ) -> Result<Option<meow_config::DnsConfig>, (StatusCode, String)> {
     let unchanged = {
         let old = raw_config.read();
@@ -1170,7 +1195,7 @@ pub async fn reconcile_dns_config(
         return Ok(None);
     }
     let cache_dir = meow_config::resource_cache_dir_for_config_path(config_path);
-    meow_config::parse_dns_from_raw(candidate, Some(&cache_dir), proxies)
+    meow_config::parse_dns_from_raw(candidate, Some(&cache_dir), proxies, Some(rule_providers))
         .await
         .map(Some)
         .map_err(|e| {
@@ -1283,6 +1308,12 @@ pub async fn publish_dns(
                             "dns.listen rebind failed; keeping existing listener on {}",
                             old.listen
                         );
+                        // The socket stays, but the resolver generation
+                        // must still follow — `tunnel.set_resolver` already
+                        // swapped routing; leaving the kept listener on its
+                        // old slot would serve a stale generation
+                        // (issue #514 review).
+                        *old.resolver_slot.write() = Arc::clone(&dns.resolver);
                         *guard = Some(old);
                         None
                     }
@@ -2050,18 +2081,53 @@ async fn swap_config_and_reconcile_tun(
 
     // Publish the rebuilt DNS runtime — independent of TUN transitions, so
     // it must run before the equal-state early return (issue #514).
+    // Snapshot the fake-IP inputs the running TUN listener captured at
+    // build time — a resolver generation swap can change them.
+    let old_fake_ip = dns.is_some().then(|| {
+        let r = state.tunnel.resolver();
+        (r.fake_ip_v4_net(), r.fake_ip_v4_gateway())
+    });
     if let Some(dns) = dns {
         publish_dns(&state.tunnel, &state.dns_server, dns).await;
     }
+    // The TUN listener snapshots `fake_ip_v4_net`/`fake_ip_v4_gateway`/
+    // DnsGuard when the stack is built; after a resolver swap those are
+    // stale — restart the listener so fake-ip-range/enhanced-mode changes
+    // take effect instead of blackholing the new pool (issue #514).
+    let fake_ip_changed = old_fake_ip.is_some_and(|(net, gw)| {
+        let r = state.tunnel.resolver();
+        r.fake_ip_v4_net() != net || r.fake_ip_v4_gateway() != gw
+    });
 
     if old_enable == new_enable {
+        if old_enable && fake_ip_changed && state.tunnel.has_tun() {
+            // on → on with changed fake-IP inputs: restart the listener.
+            state.tunnel.stop_tun().await;
+            let raw = state.raw_config.read().clone();
+            match spawn_tun_from_raw(&state.tunnel, &raw).await {
+                Ok(Some(handle)) => {
+                    state.tunnel.set_tun_handle(handle).await;
+                    info!("TUN listener restarted via config reload (fake-IP inputs changed)");
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    warn!(
+                        "TUN listener failed to restart after dns reload: {e} (config rolled back)"
+                    );
+                    if let Some(ref mut tun) = state.raw_config.write().tun {
+                        tun.enable = false;
+                    }
+                }
+            }
+        }
         return;
     }
     if let Some(snapshot) = snapshot {
         // off → on. Defensive: if a handle somehow outlives a raw config
         // that already says `enable: false`, stop it first — the new
         // listener must never build a second lwIP core over a live one
-        // (its PREVIOUS_CORE gate would stall 10 s then proceed anyway).
+        // (its PREVIOUS_CORE gate hard-fails the spawn after a 10 s
+        // teardown timeout rather than stack two generations).
         state.tunnel.stop_tun().await;
         match spawn_tun_from_raw(&state.tunnel, &snapshot).await {
             Ok(Some(handle)) => {
@@ -2200,20 +2266,25 @@ async fn put_configs(
     // failing here rejects the PUT before `reload_routing` publishes
     // anything (under `force` a broken dns section degrades to warn + keep
     // the old resolver, matching how force tolerates proxy errors).
-    let dns =
-        match reconcile_dns_config(&state.raw_config, &raw_config, &state.config_path, &proxies)
-            .await
-        {
-            Ok(d) => d,
-            Err((status, msg)) => {
-                if force {
-                    tracing::error!("config reload forced despite dns rebuild error: {msg}");
-                    None
-                } else {
-                    return (status, Json(serde_json::json!({"message": msg}))).into_response();
-                }
+    let dns = match reconcile_dns_config(
+        &state.raw_config,
+        &raw_config,
+        &state.config_path,
+        &proxies,
+        &state.rule_providers,
+    )
+    .await
+    {
+        Ok(d) => d,
+        Err((status, msg)) => {
+            if force {
+                tracing::error!("config reload forced despite dns rebuild error: {msg}");
+                None
+            } else {
+                return (status, Json(serde_json::json!({"message": msg}))).into_response();
             }
-        };
+        }
+    };
 
     // Prepare routing before the synchronous admission/cancellation boundary.
     // No old-policy setup can register after this cold reload completes.

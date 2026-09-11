@@ -23,6 +23,9 @@ pub async fn run_loop(
     tunnel: Tunnel,
     config_path: String,
     dns_server: Arc<RwLock<Option<meow_api::routes::DnsServerHandle>>>,
+    rule_providers: Arc<
+        RwLock<std::collections::HashMap<String, Arc<meow_config::rule_provider::RuleProvider>>>,
+    >,
 ) {
     // Same provider-cache directory `load_config` used at startup — trusted
     // rebuilds of the daemon's own config must keep resolving relative
@@ -122,6 +125,7 @@ pub async fn run_loop(
                                 &candidate,
                                 &config_path,
                                 &new_proxies,
+                                &rule_providers,
                             )
                             .await;
 
@@ -130,15 +134,19 @@ pub async fn run_loop(
                             // the on-disk/dashboard view and the running
                             // router can no longer diverge on failure.
                             *raw_config.write() = candidate.clone();
-                            match dns {
+                            let dns_ok = match dns {
                                 Ok(Some(dns)) => {
                                     meow_api::routes::publish_dns(&tunnel, &dns_server, dns).await;
+                                    true
                                 }
-                                Ok(None) => {}
-                                Err((_status, msg)) => warn!(
-                                    "subscription '{name}' committed; dns republish skipped: {msg}"
-                                ),
-                            }
+                                Ok(None) => true,
+                                Err((_status, msg)) => {
+                                    warn!(
+                                        "subscription '{name}' committed; dns republish skipped: {msg}"
+                                    );
+                                    false
+                                }
+                            };
                             // Health-check tasks follow the new group set
                             // (issue #514).
                             tunnel.reconcile_health_checks(
@@ -147,8 +155,23 @@ pub async fn run_loop(
                                 ),
                             );
                             info!("Subscription '{}' refreshed successfully", name);
-                            let _ =
-                                meow_config::save_raw_config_async(&config_path, &candidate).await;
+                            if dns_ok {
+                                let _ =
+                                    meow_config::save_raw_config_async(&config_path, &candidate)
+                                        .await;
+                            } else {
+                                // The committed dns section failed to
+                                // build — persisting it would leave a file
+                                // the next cold start cannot parse
+                                // (`parse_dns` is a hard error in
+                                // build_config). Keep the runtime commit;
+                                // skip the save (issue #514 review).
+                                warn!(
+                                    "subscription '{name}': dns rebuild failed; \
+                                     NOT persisting — the file would fail to load \
+                                     on next start"
+                                );
+                            }
                         }
                         Ok(Err(e)) => {
                             error!("Failed to rebuild after refreshing '{}': {}", name, e);

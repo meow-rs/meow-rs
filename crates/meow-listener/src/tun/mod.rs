@@ -805,10 +805,19 @@ impl TunListener {
         // never runs, but `TaskGroup::drop` still requests the aborts and
         // the `core_done` gate above serializes the next generation once
         // the reaping completes.
+        //
+        // A pump arm that won the select! already consumed that handle's
+        // output — re-polling a consumed JoinHandle panics
+        // ("JoinHandle polled after completion"), so only await a pump
+        // that is still running. abort() on a finished task is a no-op.
         pump_in.abort();
         pump_out.abort();
-        let _ = pump_in.await;
-        let _ = pump_out.await;
+        if !pump_in.is_finished() {
+            let _ = pump_in.await;
+        }
+        if !pump_out.is_finished() {
+            let _ = pump_out.await;
+        }
         tasks.shutdown().await;
         drop(tcp_listener);
         result
