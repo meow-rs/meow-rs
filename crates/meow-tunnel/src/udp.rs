@@ -137,7 +137,7 @@ pub async fn handle_udp(
     // address for its NAT key and outbound packet API, including after a
     // fake-IP was rewritten back to a hostname under domain-only rules.
     if metadata.dst_ip.is_none() && !metadata.host.is_empty() {
-        metadata.dst_ip = tunnel.resolver.resolve_ip_real(&metadata.host).await;
+        metadata.dst_ip = tunnel.resolver().resolve_ip_real(&metadata.host).await;
     }
 
     // Build destination SocketAddr for the NAT key.

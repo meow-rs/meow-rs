@@ -39,6 +39,7 @@ time = { workspace = true }
 base64 = "0.22"
 prometheus-client = "0.22"
 hickory-proto = { workspace = true }
+smol_str = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
@@ -51,7 +52,6 @@ http-body-util = "0.1"
 tempfile = "3"
 async-trait = { workspace = true }
 smallvec = { workspace = true }
-smol_str = { workspace = true }
 tokio-tungstenite = { workspace = true }
 
 [lints]

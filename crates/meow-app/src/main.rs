@@ -761,9 +761,6 @@ async fn run(
     // Rule providers in shared state for runtime refresh and API exposure.
     let rule_providers = Arc::new(RwLock::new(config.rule_providers));
 
-    // Keep a resolver clone for the auto-update task before it moves into the tunnel.
-    let resolver = Arc::clone(&config.dns.resolver);
-
     // Install the configured resolver as the global host-resolver hook used
     // by `meow_common::connect_tcp_host` / `resolve_host`, so a proxy node's
     // own server hostname is resolved by the DNS in the config — matching
@@ -812,22 +809,26 @@ async fn run(
     tunnel.spawn_background_tasks();
 
     // Spawn periodic health checks for fallback / url-test proxy groups.
-    {
-        let raw_groups = config.raw.proxy_groups.as_deref().unwrap_or(&[]);
-        let specs = meow_app::health_check::extract_specs(raw_groups);
-        if !specs.is_empty() {
-            info!("Starting health checks for {} group(s)", specs.len());
-            meow_app::health_check::spawn_health_checks(&tunnel, specs);
-        }
-    }
+    // The supervisor lives on the tunnel so config reloads can reconcile
+    // the task set (issue #514).
+    tunnel.reconcile_health_checks(config.raw.proxy_groups.as_deref().unwrap_or(&[]));
 
-    // Start DNS server if configured
+    // Start DNS server if configured. The handle is shared with the API
+    // layer so `PUT /configs` can hot-swap the resolver or rebind on a
+    // `dns.listen` change (issue #514).
+    let dns_server_handle = Arc::new(parking_lot::RwLock::new(None));
     if let Some(listen_addr) = config.dns.listen_addr {
         let dns_server = DnsServer::new(Arc::clone(&config.dns.resolver), listen_addr);
-        tokio::spawn(async move {
+        let slot = dns_server.resolver_slot();
+        let task = tokio::spawn(async move {
             if let Err(e) = dns_server.run().await {
                 error!("DNS server error: {}", e);
             }
+        });
+        *dns_server_handle.write() = Some(meow_api::routes::DnsServerHandle {
+            listen: listen_addr,
+            task,
+            resolver_slot: slot,
         });
     }
 
@@ -875,13 +876,9 @@ async fn run(
         let geodata = config.geodata.clone();
         let tunnel = tunnel.clone();
         let raw_config = Arc::clone(&raw_config);
-        let resolver = Arc::clone(&resolver);
         let cache_dir = meow_config::resource_cache_dir_for_config_path(&config_path);
         tokio::spawn(async move {
-            meow_app::geodata_fetch::run_on_startup(
-                geodata, tunnel, raw_config, resolver, cache_dir,
-            )
-            .await;
+            meow_app::geodata_fetch::run_on_startup(geodata, tunnel, raw_config, cache_dir).await;
         });
     }
 
@@ -890,13 +887,9 @@ async fn run(
         let geodata = config.geodata.clone();
         let tunnel = tunnel.clone();
         let raw_config = Arc::clone(&raw_config);
-        let resolver = Arc::clone(&resolver);
         let cache_dir = meow_config::resource_cache_dir_for_config_path(&config_path);
         tokio::spawn(async move {
-            meow_app::geodata_fetch::auto_update_loop(
-                geodata, tunnel, raw_config, resolver, cache_dir,
-            )
-            .await;
+            meow_app::geodata_fetch::auto_update_loop(geodata, tunnel, raw_config, cache_dir).await;
         });
     }
 
@@ -1086,6 +1079,7 @@ async fn run(
             Arc::clone(&rule_providers),
             named_listeners.clone(),
             config.api.external_ui.clone(),
+            Arc::clone(&dns_server_handle),
         );
         tokio::spawn(async move {
             if let Err(e) = api_server.run().await {
@@ -1118,8 +1112,13 @@ async fn run(
             // notifier sends `TunReady::Failed` immediately — no timeout
             // wait.  Only a genuinely stuck setup hits the timeout.
             match tokio::time::timeout(meow_api::TUN_STARTUP_TIMEOUT, ready_rx).await {
-                Ok(Ok(meow_listener::TunReady::Ready)) => {
-                    tunnel.set_tun_handle(handle).await;
+                Ok(Ok(meow_listener::TunReady::Ready(core_done))) => {
+                    tunnel
+                        .set_tun_handle(meow_tunnel::TunHandle {
+                            task: handle,
+                            core_done: Some(core_done),
+                        })
+                        .await;
                 }
                 Ok(Ok(meow_listener::TunReady::Failed(msg))) => {
                     if msg.contains("wintun.dll") {

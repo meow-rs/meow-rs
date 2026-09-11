@@ -5,7 +5,7 @@ use crate::udp::{self, NatTable};
 use meow_common::{Metadata, Network, Proxy, ProxyAdapter, Rule, TunnelMode};
 use meow_dns::Resolver;
 use meow_proxy::DirectAdapter;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use smol_str::SmolStr;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -65,10 +65,15 @@ pub struct TunnelInner {
     /// wholesale on config reload. Readers clone the `Arc` and drop the
     /// guard immediately; never hold the guard across an `.await`.
     pub route: RwLock<Arc<RouteTable>>,
-    pub resolver: Arc<Resolver>,
+    /// Hot-swappable resolver slot (issue #514): `PUT /configs` rebuilds
+    /// the DNS resolver and publishes it via `Tunnel::set_resolver`.
+    /// Components that cloned the `Arc` for a long-lived task keep the old
+    /// generation until their next `resolver()` call.
+    resolver: RwLock<Arc<Resolver>>,
     /// Fallback DIRECT adapter used when no user-defined rule matches or
     /// when Direct/Global mode bypasses the proxies map. Pre-built with the
-    /// internal resolver so hostname dials avoid the OS resolver.
+    /// internal resolver so hostname dials avoid the OS resolver; its
+    /// resolver slot is swapped alongside `resolver` on reload.
     pub direct: Arc<DirectAdapter>,
     pub nat_table: NatTable,
     pub stats: Arc<Statistics>,
@@ -86,7 +91,43 @@ pub struct TunnelInner {
     pub needs_process_lookup: AtomicBool,
     /// Handle to the running TUN listener (if any). Abort + await it to
     /// stop TUN. Stored so `put_configs` can start/stop TUN at runtime.
-    pub tun_handle: RwLock<Option<tokio::task::JoinHandle<()>>>,
+    pub tun_handle: RwLock<Option<TunHandle>>,
+    /// Health-check task set keyed by group name; reconciled on every
+    /// config commit so checks appear/disappear/respawn with the config
+    /// (issue #514).
+    pub health_checks: Mutex<crate::health_check::HealthCheckSupervisor>,
+}
+
+/// A running TUN listener: the task plus the signal resolving once its
+/// lwIP core has fully torn down.
+///
+/// The lwIP contract allows only one live stack generation per process;
+/// the core finishes teardown only after every stack handle — including
+/// the split halves inside the device pumps — is dropped. Since an aborted
+/// parent task cannot await that reaping, `stop_tun`/`set_tun_handle`
+/// additionally await `core_done` so a successor generation cannot overlap
+/// a core still tearing down (issue #514).
+pub struct TunHandle {
+    /// The listener task — abort + await it to stop.
+    pub task: tokio::task::JoinHandle<()>,
+    /// Flips `true` once this generation's lwIP core finished teardown.
+    /// `None` for non-lwIP/test handles that have no core to await.
+    pub core_done: Option<tokio::sync::watch::Receiver<bool>>,
+}
+
+/// Upper bound on waiting for a torn-down lwIP core. Teardown is a
+/// synchronous pcb sweep — far under a second — so this only bounds a
+/// wedged core; proceeding past it logs loudly rather than hanging the
+/// config-mutation lane forever.
+const TUN_TEARDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Await a generation's `core_done` with the wedge bound. `RecvError`
+/// (sender dropped without signalling) means the core is already gone.
+async fn await_core_done(mut rx: tokio::sync::watch::Receiver<bool>) {
+    match tokio::time::timeout(TUN_TEARDOWN_WAIT, rx.wait_for(|done| *done)).await {
+        Ok(Ok(_)) | Ok(Err(_)) => {}
+        Err(_) => warn!("timed out waiting for lwIP core teardown; continuing"),
+    }
 }
 
 impl TunnelInner {
@@ -94,6 +135,12 @@ impl TunnelInner {
     /// The returned `Arc` is safe to hold across `.await` points.
     pub fn route(&self) -> Arc<RouteTable> {
         Arc::clone(&self.route.read())
+    }
+
+    /// Snapshot the current resolver generation: one short read lock +
+    /// `Arc` clone. Always reflects the latest `Tunnel::set_resolver`.
+    pub fn resolver(&self) -> Arc<Resolver> {
+        Arc::clone(&self.resolver.read())
     }
 
     /// Rewrite a fake-IP destination back to its real hostname before rule
@@ -110,18 +157,19 @@ impl TunnelInner {
         let Some(ip) = metadata.dst_ip else {
             return;
         };
-        if !self.resolver.is_fake_ip(ip) {
+        let resolver = self.resolver();
+        if !resolver.is_fake_ip(ip) {
             // Outside fake-IP mode — also fold in a snooping-cache hostname
             // if metadata.host is currently empty. Preserves the upstream
             // `DNSMapping` mode contract used by the tproxy listener.
             if metadata.host.is_empty() {
-                if let Some(host) = self.resolver.reverse_lookup(ip) {
+                if let Some(host) = resolver.reverse_lookup(ip) {
                     metadata.host = host;
                 }
             }
             return;
         }
-        if let Some(host) = self.resolver.reverse_lookup(ip) {
+        if let Some(host) = resolver.reverse_lookup(ip) {
             debug!("pre_handle_metadata: fake-ip {} → {}", ip, host);
             metadata.host = host;
             metadata.dst_ip = None;
@@ -147,7 +195,7 @@ impl TunnelInner {
         if metadata.host.is_empty() || metadata.dst_ip.is_some() {
             return;
         }
-        if let Some(real_ip) = self.resolver.resolve_ip_real(&metadata.host).await {
+        if let Some(real_ip) = self.resolver().resolve_ip_real(&metadata.host).await {
             debug!("pre_resolve: {} -> {}", metadata.host, real_ip);
             metadata.dst_ip = Some(real_ip);
         }
@@ -251,7 +299,7 @@ impl TunnelInner {
                 if needs_ip {
                     // `needs_ip` already encodes the `pre_resolve` guards:
                     // host present, dst_ip absent.
-                    if let Some(real_ip) = self.resolver.resolve_ip_real(&metadata.host).await {
+                    if let Some(real_ip) = self.resolver().resolve_ip_real(&metadata.host).await {
                         debug!("lazy resolve: {} -> {}", metadata.host, real_ip);
                         metadata.dst_ip = Some(real_ip);
                     }
@@ -369,11 +417,12 @@ impl Tunnel {
             inner: Arc::new(TunnelInner {
                 mode: RwLock::new(TunnelMode::Rule),
                 route: RwLock::new(Arc::new(RouteTable::empty())),
-                resolver,
+                resolver: RwLock::new(resolver),
                 direct,
                 nat_table: udp::new_nat_table(),
                 stats: Arc::new(Statistics::new()),
                 tcp_generation: RwLock::new(0),
+                health_checks: Mutex::new(crate::health_check::HealthCheckSupervisor::default()),
                 needs_ip_resolution: AtomicBool::new(false),
                 needs_process_lookup: AtomicBool::new(false),
                 tun_handle: RwLock::new(None),
@@ -504,8 +553,34 @@ impl Tunnel {
         &self.inner.stats
     }
 
-    pub fn resolver(&self) -> &Arc<Resolver> {
-        &self.inner.resolver
+    /// Snapshot the current resolver generation (one short read lock +
+    /// `Arc` clone). Reflects the latest [`Self::set_resolver`] — callers
+    /// holding the returned `Arc` keep that generation; the next call picks
+    /// up any swap.
+    pub fn resolver(&self) -> Arc<Resolver> {
+        self.inner.resolver()
+    }
+
+    /// Reconcile health-check tasks with a committed config's proxy-group
+    /// section (issue #514): new fallback/url-test groups get a task,
+    /// removed groups are aborted, changed specs are respawned, dead tasks
+    /// are restarted. Call on every config commit — startup, `PUT
+    /// /configs`, section mutations, subscription refresh.
+    pub fn reconcile_health_checks(&self, raw_groups: &[meow_config::raw::RawProxyGroup]) {
+        let specs = crate::health_check::extract_specs(raw_groups);
+        self.inner.health_checks.lock().reconcile(self, specs);
+    }
+
+    /// Publish a rebuilt DNS resolver (issue #514): routing lookups
+    /// (fake-IP checks, pre-resolve, lazy resolve), the built-in DIRECT
+    /// adapter's hostname resolution, and any component taking
+    /// `resolver()` snapshots all pick up the new generation. Previously
+    /// the resolver was fixed at `Tunnel::new`, so `PUT /configs`
+    /// persisted a new `dns:` section while the process kept resolving
+    /// through the old one.
+    pub fn set_resolver(&self, resolver: Arc<Resolver>) {
+        *self.inner.resolver.write() = Arc::clone(&resolver);
+        self.inner.direct.set_resolver(resolver);
     }
 
     /// Snapshot of the current route table (rules + domain index + proxies).
@@ -533,30 +608,40 @@ impl Tunnel {
     }
 
     /// Store a running TUN listener handle. If a previous TUN listener was
-    /// running, it is aborted and awaited before the new handle is used.
-    pub async fn set_tun_handle(&self, handle: tokio::task::JoinHandle<()>) {
+    /// running, it is aborted and awaited — including its lwIP core's
+    /// teardown — before this returns (issue #514).
+    pub async fn set_tun_handle(&self, handle: TunHandle) {
         let prev = self.inner.tun_handle.write().replace(handle);
         // parking_lot RwLock write guard is dropped here — safe to .await
-        if let Some(prev) = prev {
-            prev.abort();
+        if let Some(TunHandle { task, core_done }) = prev {
+            task.abort();
             // Await the parent: dropping its future drops the TaskGroup,
             // which requests abort of the child tasks holding the device.
-            // The runtime completes those aborts asynchronously shortly
-            // after, so the old device is released promptly — though not
-            // strictly before this returns.
-            let _ = prev.await;
+            // The runtime reaps those tasks asynchronously — the lwIP core
+            // only finishes teardown once their stack halves drop, so
+            // await `core_done` too: this returns only once the previous
+            // generation is truly gone.
+            let _ = task.await;
+            if let Some(done) = core_done {
+                await_core_done(done).await;
+            }
             info!("abandoned previous TUN listener");
         }
         info!("TUN listener handle stored");
     }
 
-    /// Abort the running TUN listener, if any, and wait for teardown.
+    /// Abort the running TUN listener, if any, and wait for teardown —
+    /// including the lwIP core's `core_done`, so a successor
+    /// `NetStack::new` can never overlap this generation (issue #514).
     pub async fn stop_tun(&self) {
         let handle = self.inner.tun_handle.write().take();
         // parking_lot RwLock write guard is dropped here — safe to .await
-        if let Some(handle) = handle {
-            handle.abort();
-            let _ = handle.await;
+        if let Some(TunHandle { task, core_done }) = handle {
+            task.abort();
+            let _ = task.await;
+            if let Some(done) = core_done {
+                await_core_done(done).await;
+            }
             info!("TUN listener stopped");
         }
     }
@@ -570,7 +655,7 @@ impl Tunnel {
             .tun_handle
             .read()
             .as_ref()
-            .is_some_and(|h| !h.is_finished())
+            .is_some_and(|h| !h.task.is_finished())
     }
 }
 
@@ -696,13 +781,20 @@ mod tests {
         }
     }
 
+    fn task_handle(task: tokio::task::JoinHandle<()>) -> TunHandle {
+        TunHandle {
+            task,
+            core_done: None,
+        }
+    }
+
     #[tokio::test]
     async fn tun_handle_lifecycle() {
         let tunnel = test_tunnel();
         assert!(!tunnel.has_tun());
 
         tunnel
-            .set_tun_handle(tokio::spawn(std::future::pending::<()>()))
+            .set_tun_handle(task_handle(tokio::spawn(std::future::pending::<()>())))
             .await;
         assert!(tunnel.has_tun());
 
@@ -728,10 +820,10 @@ mod tests {
         // Make sure the first task is actually running (its drop guard is
         // constructed) before it gets replaced.
         started_rx.await.unwrap();
-        tunnel.set_tun_handle(first).await;
+        tunnel.set_tun_handle(task_handle(first)).await;
 
         tunnel
-            .set_tun_handle(tokio::spawn(std::future::pending::<()>()))
+            .set_tun_handle(task_handle(tokio::spawn(std::future::pending::<()>())))
             .await;
         // set_tun_handle awaited the first task, so its drop guard has
         // already fired by the time it returns.
@@ -741,15 +833,55 @@ mod tests {
         tunnel.stop_tun().await;
     }
 
+    /// Issue #514: `stop_tun` must not return before the generation's
+    /// `core_done` signal fires — the next `NetStack::new` depends on the
+    /// previous core being fully torn down.
+    #[tokio::test]
+    async fn stop_tun_awaits_core_done() {
+        let tunnel = test_tunnel();
+
+        let (done_tx, done_rx) = tokio::sync::watch::channel(false);
+        let (task_started_tx, task_started_rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            let _ = task_started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        task_started_rx.await.unwrap();
+        tunnel
+            .set_tun_handle(TunHandle {
+                task,
+                core_done: Some(done_rx),
+            })
+            .await;
+
+        // Stop in a task so we can observe it pending on core_done.
+        let stop = tokio::spawn({
+            let tunnel = tunnel.clone();
+            async move { tunnel.stop_tun().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !stop.is_finished(),
+            "stop_tun must wait on core_done, not just the parent task"
+        );
+
+        done_tx.send(true).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), stop)
+            .await
+            .expect("stop_tun must return once core_done fires")
+            .unwrap();
+        assert!(!tunnel.has_tun());
+    }
+
     #[tokio::test]
     async fn has_tun_reports_dead_listener_as_stopped() {
         let tunnel = test_tunnel();
 
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         tunnel
-            .set_tun_handle(tokio::spawn(async move {
+            .set_tun_handle(task_handle(tokio::spawn(async move {
                 let _ = rx.await;
-            }))
+            })))
             .await;
         assert!(tunnel.has_tun());
 

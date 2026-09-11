@@ -1,4 +1,5 @@
-use meow_tunnel::Tunnel;
+use crate::Tunnel;
+use std::collections::HashMap;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -6,6 +7,7 @@ const DEFAULT_URL: &str = "http://www.gstatic.com/generate_204";
 const DEFAULT_INTERVAL_SECS: u64 = 300;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[derive(Clone, PartialEq, Eq)]
 pub struct HealthCheckSpec {
     pub group_name: String,
     pub url: String,
@@ -29,12 +31,47 @@ pub fn extract_specs(raw_groups: &[meow_config::raw::RawProxyGroup]) -> Vec<Heal
         .collect()
 }
 
-pub fn spawn_health_checks(tunnel: &Tunnel, specs: Vec<HealthCheckSpec>) {
-    for spec in specs {
-        let tunnel = tunnel.clone();
-        tokio::spawn(async move {
-            run_health_check_loop(tunnel, spec).await;
+/// Owns the set of running health-check tasks, keyed by group name.
+/// `reconcile` is called on every config commit (startup, `PUT /configs`,
+/// section mutations, subscription refresh): new groups get a task, removed
+/// or no-longer-probing groups are aborted, changed specs (url / interval /
+/// lazy) are respawned, and a task that died on its own is restarted —
+/// previously checks were spawned once at startup and a reload could leave
+/// stale tasks running or new groups unprobed (issue #514).
+#[derive(Default)]
+pub struct HealthCheckSupervisor {
+    tasks: HashMap<String, (HealthCheckSpec, tokio::task::JoinHandle<()>)>,
+}
+
+impl HealthCheckSupervisor {
+    pub fn reconcile(&mut self, tunnel: &Tunnel, specs: Vec<HealthCheckSpec>) {
+        let wanted: HashMap<&str, &HealthCheckSpec> =
+            specs.iter().map(|s| (s.group_name.as_str(), s)).collect();
+
+        // Abort tasks for removed groups, changed specs, and reap dead
+        // tasks so a crashed probe loop self-heals on the next reconcile.
+        self.tasks.retain(|name, (spec, task)| {
+            let keep =
+                matches!(wanted.get(name.as_str()), Some(s) if *s == spec) && !task.is_finished();
+            if !keep {
+                task.abort();
+            }
+            keep
         });
+
+        for spec in specs {
+            if self.tasks.contains_key(spec.group_name.as_str()) {
+                continue;
+            }
+            let tunnel = tunnel.clone();
+            let task = tokio::spawn(run_health_check_loop(tunnel, spec.clone()));
+            self.tasks.insert(spec.group_name.clone(), (spec, task));
+        }
+    }
+
+    /// Number of live check tasks — test/diagnostic surface.
+    pub fn task_count(&self) -> usize {
+        self.tasks.len()
     }
 }
 
@@ -129,6 +166,104 @@ async fn run_health_check_loop(tunnel: Tunnel, spec: HealthCheckSpec) {
 mod tests {
     use super::*;
     use meow_common::{Metadata, Proxy, ProxyAdapter};
+
+    fn stub_tunnel() -> Tunnel {
+        let resolver = std::sync::Arc::new(meow_dns::Resolver::new(
+            vec![],
+            vec![],
+            meow_common::DnsMode::Normal,
+            meow_trie::DomainTrie::new(),
+            true,
+            false,
+        ));
+        Tunnel::new(resolver)
+    }
+
+    fn raw_group(
+        name: &str,
+        group_type: &str,
+        interval: Option<u64>,
+    ) -> meow_config::raw::RawProxyGroup {
+        meow_config::raw::RawProxyGroup {
+            name: name.into(),
+            group_type: group_type.into(),
+            interval,
+            ..Default::default()
+        }
+    }
+
+    /// Issue #514: the supervisor must spawn for added groups, abort for
+    /// removed ones, respawn on spec change, and restart dead tasks —
+    /// previously checks were startup-only.
+    #[tokio::test]
+    async fn reconcile_adds_removes_and_respawns_specs() {
+        let tunnel = stub_tunnel();
+        let mut sup = HealthCheckSupervisor::default();
+
+        // Add a group → task spawned.
+        sup.reconcile(
+            &tunnel,
+            extract_specs(&[raw_group("a", "url-test", Some(3600))]),
+        );
+        assert_eq!(sup.task_count(), 1);
+        let first = sup.tasks["a"].1.id();
+
+        // Identical spec → no churn.
+        sup.reconcile(
+            &tunnel,
+            extract_specs(&[raw_group("a", "url-test", Some(3600))]),
+        );
+        assert_eq!(sup.task_count(), 1);
+        assert_eq!(sup.tasks["a"].1.id(), first, "same spec keeps task");
+
+        // Changed interval → respawn (new task identity).
+        sup.reconcile(
+            &tunnel,
+            extract_specs(&[raw_group("a", "url-test", Some(60))]),
+        );
+        assert_eq!(sup.task_count(), 1);
+        assert_ne!(sup.tasks["a"].1.id(), first, "changed spec respawns");
+
+        // Type change to non-probing → task removed.
+        sup.reconcile(&tunnel, extract_specs(&[raw_group("a", "select", None)]));
+        assert_eq!(sup.task_count(), 0, "non-checkable group aborts task");
+
+        // Removed entirely → abort.
+        sup.reconcile(
+            &tunnel,
+            extract_specs(&[
+                raw_group("a", "url-test", None),
+                raw_group("b", "fallback", None),
+            ]),
+        );
+        assert_eq!(sup.task_count(), 2);
+        sup.reconcile(&tunnel, extract_specs(&[]));
+        assert_eq!(sup.task_count(), 0, "empty group set aborts all tasks");
+    }
+
+    /// A task that died on its own is restarted at the next reconcile.
+    #[tokio::test]
+    async fn reconcile_restarts_dead_tasks() {
+        let tunnel = stub_tunnel();
+        let mut sup = HealthCheckSupervisor::default();
+        sup.reconcile(
+            &tunnel,
+            extract_specs(&[raw_group("a", "url-test", Some(3600))]),
+        );
+        assert_eq!(sup.task_count(), 1);
+        // Simulate a crashed loop.
+        sup.tasks["a"].1.abort();
+        tokio::task::yield_now().await;
+        sup.reconcile(
+            &tunnel,
+            extract_specs(&[raw_group("a", "url-test", Some(3600))]),
+        );
+        assert_eq!(sup.task_count(), 1, "dead task is reaped and respawned");
+        assert!(
+            !sup.tasks["a"].1.is_finished(),
+            "replacement task must be running"
+        );
+    }
 
     #[test]
     fn zero_interval_uses_safe_default() {

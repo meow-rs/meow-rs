@@ -17,7 +17,6 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -77,7 +76,7 @@ pub(super) async fn run_udp(
 
     while let Some((data, src, dst)) = read_half.next().await {
         if dns_hijack && dst.port() == 53 {
-            let resolver = Arc::clone(tunnel.resolver());
+            let resolver = tunnel.resolver();
             let reply_tx = reply_tx.clone();
             debug!(
                 "tun dns-hijack: recv {} bytes from {src} to {dst} | {}",
@@ -185,7 +184,7 @@ async fn relay_flow(
     // demand — including after a fake-IP was rewritten back to a hostname.
     inner.pre_resolve(&mut metadata).await;
     if metadata.dst_ip.is_none() && !metadata.host.is_empty() {
-        metadata.dst_ip = inner.resolver.resolve_ip_real(&metadata.host).await;
+        metadata.dst_ip = inner.resolver().resolve_ip_real(&metadata.host).await;
     }
     let Some(dst_ip) = metadata.dst_ip else {
         return Err(format!(

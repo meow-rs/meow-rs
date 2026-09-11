@@ -544,6 +544,33 @@ pub fn rebuild_from_raw_with_cache_dir(
     rebuild_from_raw_impl(raw, cache_dir, resolver, &HashMap::new(), None, None, None)
 }
 
+/// Parse a raw config's `dns:` section into a runnable [`DnsConfig`] with
+/// the same geodata context startup uses — `raw.geodata` path overrides,
+/// MMDB/geosite loads keyed on the config's own geo references (incl.
+/// `nameserver-policy` / `fallback-filter` entries, which the context
+/// builder scans). Used by `PUT /configs` DNS hot reload (issue #514);
+/// `proxy_registry` should be the freshly rebuilt map so
+/// `proxy-server-nameserver` circular-detection sees current names.
+pub async fn parse_dns_from_raw(
+    raw: &raw::RawConfig,
+    cache_dir: Option<&Path>,
+    proxy_registry: &HashMap<SmolStr, Arc<dyn Proxy>>,
+    rule_providers: &HashMap<String, Arc<rule_provider::RuleProvider>>,
+) -> Result<DnsConfig, anyhow::Error> {
+    let geo = geodata::parse_geodata(raw.geodata.as_ref())?;
+    let payloads = rule_provider::PrefetchedPayloads::default();
+    let ctx = build_parser_context_from_raw(raw, &payloads)?;
+    dns_parser::parse_dns(
+        raw,
+        geo.mmdb_path.as_deref(),
+        cache_dir,
+        proxy_registry,
+        ctx.geosite,
+        rule_providers,
+    )
+    .await
+}
+
 /// Apply per-outbound `dialer-proxy` in place (issue #210).
 ///
 /// For every proxy that declares `dialer-proxy: <name>`, its registry entry is

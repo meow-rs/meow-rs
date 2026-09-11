@@ -14,6 +14,8 @@ pub mod mux;
 pub mod reject;
 pub mod socks5_adapter;
 pub mod stream_conn;
+#[cfg(any(feature = "vmess", feature = "vless-encryption"))]
+pub(crate) mod tasked_duplex;
 pub mod transport_chain;
 
 #[cfg(feature = "ech-tls-tunnel")]

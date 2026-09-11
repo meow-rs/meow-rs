@@ -14,7 +14,9 @@ pub struct DirectAdapter {
     /// hostnames via this resolver instead of the OS resolver — this is
     /// important when meow-rs *is* the system DNS, because routing a direct
     /// DNS query back through the OS would loop the query back into meow-rs.
-    resolver: Option<Arc<Resolver>>,
+    /// Behind a slot so `Tunnel::set_resolver` can hot-swap the generation
+    /// on `PUT /configs` without rebuilding the adapter (issue #514).
+    resolver: Option<parking_lot::RwLock<Arc<Resolver>>>,
     /// Wall-clock bound on `TcpStream::connect`. iOS / macOS scoped-routing
     /// and reachability-cache transients can leave a `connect()` hanging
     /// indefinitely against a destination whose route is in flux (Wi-Fi
@@ -43,8 +45,17 @@ impl DirectAdapter {
     }
 
     pub fn with_resolver(mut self, resolver: Arc<Resolver>) -> Self {
-        self.resolver = Some(resolver);
+        self.resolver = Some(parking_lot::RwLock::new(resolver));
         self
+    }
+
+    /// Hot-swap the resolver generation (issue #514). No-op when the
+    /// adapter was built without one — a `None` slot means the adapter
+    /// deliberately uses the OS resolver, which a reload must not change.
+    pub fn set_resolver(&self, resolver: Arc<Resolver>) {
+        if let Some(slot) = &self.resolver {
+            *slot.write() = resolver;
+        }
     }
 
     /// Bound `TcpStream::connect` on `dial_tcp`. Returns `MeowError::Io`
@@ -84,6 +95,7 @@ impl DirectAdapter {
         //    standalone usage).
         if !metadata.host.is_empty() {
             if let Some(resolver) = &self.resolver {
+                let resolver = Arc::clone(&resolver.read());
                 return match resolver.resolve_ips(&metadata.host).await {
                     Some(ips) if !ips.is_empty() => Ok(ips
                         .into_iter()

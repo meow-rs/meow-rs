@@ -10,7 +10,6 @@ use meow_common::adapter::Proxy;
 use meow_config::geodata::download_and_replace;
 use meow_config::raw::RawConfig;
 use meow_config::GeoDataConfig;
-use meow_dns::resolver::Resolver;
 use meow_tunnel::Tunnel;
 use parking_lot::RwLock;
 use std::path::PathBuf;
@@ -97,7 +96,6 @@ pub async fn run_on_startup(
     geo: GeoDataConfig,
     tunnel: Tunnel,
     raw_config: Arc<RwLock<RawConfig>>,
-    resolver: Arc<Resolver>,
     cache_dir: PathBuf,
 ) {
     let targets = compute_targets(&geo);
@@ -115,8 +113,10 @@ pub async fn run_on_startup(
     }
 
     let raw = raw_config.read().clone();
+    // Take the *current* resolver generation — a config reload may have
+    // swapped it since this task was spawned (issue #514).
+    let resolver = tunnel.resolver();
     let rebuild = tokio::task::spawn_blocking({
-        let resolver = Arc::clone(&resolver);
         let cache_dir = cache_dir.clone();
         move || {
             meow_config::rebuild_from_raw_with_resolver(
@@ -156,7 +156,6 @@ pub async fn auto_update_loop(
     geo: GeoDataConfig,
     tunnel: Tunnel,
     raw_config: Arc<RwLock<RawConfig>>,
-    resolver: Arc<Resolver>,
     cache_dir: PathBuf,
 ) {
     let interval = std::time::Duration::from_secs(geo.auto_update_interval as u64 * 3600);
@@ -206,8 +205,10 @@ pub async fn auto_update_loop(
         }
 
         let raw = raw_config.read().clone();
+        // Fresh generation per cycle — `PUT /configs` may have swapped the
+        // resolver between ticks (issue #514).
+        let resolver = tunnel.resolver();
         let rebuild = tokio::task::spawn_blocking({
-            let resolver = Arc::clone(&resolver);
             let cache_dir = cache_dir.clone();
             move || {
                 meow_config::rebuild_from_raw_with_resolver(

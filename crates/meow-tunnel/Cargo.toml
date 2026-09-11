@@ -13,6 +13,7 @@ meow-common = { workspace = true }
 meow-dns = { workspace = true, default-features = false }
 meow-rules = { workspace = true }
 meow-proxy = { workspace = true, default-features = false }
+meow-config = { workspace = true, default-features = false }
 meow-trie = { workspace = true }
 ipnet = { workspace = true }
 iprange = { workspace = true }

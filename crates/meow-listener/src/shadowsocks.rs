@@ -491,7 +491,7 @@ where
     inner.pre_handle_metadata(&mut metadata);
     inner.pre_resolve(&mut metadata).await;
     if metadata.dst_ip.is_none() && !metadata.host.is_empty() {
-        metadata.dst_ip = inner.resolver.resolve_ip_real(&metadata.host).await;
+        metadata.dst_ip = inner.resolver().resolve_ip_real(&metadata.host).await;
     }
     let Some(dst_ip) = metadata.dst_ip else {
         return Err(format!(

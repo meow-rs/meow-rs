@@ -358,9 +358,33 @@ async fn read_socks5_addr<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<Soc
 /// `write_packet` can run concurrently from `&self`.  Each half is guarded
 /// by its own `Mutex` because the trait exposes only `&self`, but in
 /// practice the tunnel calls each direction from a dedicated task.
+///
+/// `read_packet` consumes frame bytes incrementally. If its future is
+/// dropped mid-frame (timeout, session teardown), the consumed bytes are
+/// gone and the next read would resume mid-frame — silently desyncing every
+/// subsequent packet (issue #514). Any such incomplete read poisons the
+/// conn: later reads fail fast so the tunnel tears the session down and
+/// re-dials instead of parsing garbage.
 pub struct TrojanPacketConn {
     reader: Mutex<ReadHalf<Box<dyn TransportStream>>>,
     writer: Mutex<WriteHalf<Box<dyn TransportStream>>>,
+    poisoned: std::sync::atomic::AtomicBool,
+}
+
+/// Drop guard: poisons the conn unless the read completed a full frame.
+/// Runs on early `?` returns AND on future cancellation while the reader
+/// mutex is held.
+struct PoisonOnIncomplete<'a> {
+    flag: &'a std::sync::atomic::AtomicBool,
+    complete: bool,
+}
+
+impl Drop for PoisonOnIncomplete<'_> {
+    fn drop(&mut self) {
+        if !self.complete {
+            self.flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
 }
 
 impl TrojanPacketConn {
@@ -369,6 +393,7 @@ impl TrojanPacketConn {
         Self {
             reader: Mutex::new(r),
             writer: Mutex::new(w),
+            poisoned: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -376,7 +401,16 @@ impl TrojanPacketConn {
 #[async_trait]
 impl ProxyPacketConn for TrojanPacketConn {
     async fn read_packet(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr)> {
+        if self.poisoned.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(MeowError::Proxy(
+                "trojan udp: connection desynced by an earlier incomplete read".into(),
+            ));
+        }
         let mut reader = self.reader.lock().await;
+        let mut guard = PoisonOnIncomplete {
+            flag: &self.poisoned,
+            complete: false,
+        };
 
         let addr = read_socks5_addr(&mut *reader).await?;
 
@@ -408,6 +442,7 @@ impl ProxyPacketConn for TrojanPacketConn {
             let mut sink = vec![0u8; length - to_copy];
             reader.read_exact(&mut sink).await.map_err(MeowError::Io)?;
         }
+        guard.complete = true;
         Ok((to_copy, addr))
     }
 
@@ -555,6 +590,88 @@ mod tests {
             let (n, addr) = conn.read_packet(&mut buf).await.unwrap();
             assert_eq!(addr, src);
             assert_eq!(&buf[..n], *expect, "frame mismatch / dropped frame");
+        }
+    }
+
+    /// Issue #514: cancelling `read_packet` mid-frame consumes an unknown
+    /// number of bytes — resuming would parse payload bytes as a header.
+    /// The conn must poison itself so the tunnel re-dials instead.
+    #[tokio::test]
+    async fn cancelled_read_poisons_packet_conn() {
+        use tokio::io::AsyncWriteExt;
+        let (client, mut server) = tokio::io::duplex(64 * 1024);
+        let conn = TrojanPacketConn::new(Box::new(client));
+        let mut buf = [0u8; 2048];
+
+        // Peer sends a partial header then stalls: ATYP + one address byte.
+        server.write_all(&[ATYP_IPV4, 9, 9]).await.unwrap();
+        let cancelled = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            conn.read_packet(&mut buf),
+        )
+        .await;
+        assert!(cancelled.is_err(), "read must have timed out mid-header");
+
+        // The peer then completes the frame — but the conn must not try to
+        // resume mid-stream.
+        server
+            .write_all(&[9, 9, 0x01, 0xbb, 0, 1, b'\r', b'\n', b'x'])
+            .await
+            .unwrap();
+        let err = conn.read_packet(&mut buf).await.unwrap_err();
+        assert!(
+            err.to_string().contains("desynced"),
+            "expected desync error after cancelled read, got {err:?}"
+        );
+    }
+
+    /// The same poison must fire on a parse error after bytes were consumed
+    /// (bad CRLF) — not only on future cancellation.
+    #[tokio::test]
+    async fn errored_read_poisons_packet_conn() {
+        use tokio::io::AsyncWriteExt;
+        let (client, mut server) = tokio::io::duplex(64 * 1024);
+        let conn = TrojanPacketConn::new(Box::new(client));
+        let mut buf = [0u8; 2048];
+
+        // Valid addr + length, then a wrong CRLF marker.
+        let mut wire = Vec::new();
+        encode_socks5_addr_socket(&mut wire, &"9.9.9.9:443".parse().unwrap());
+        wire.extend_from_slice(&1u16.to_be_bytes());
+        wire.extend_from_slice(b"XX");
+        wire.extend_from_slice(b"z");
+        server.write_all(&wire).await.unwrap();
+
+        let err = conn.read_packet(&mut buf).await.unwrap_err();
+        assert!(err.to_string().contains("CRLF"), "got {err:?}");
+
+        let err = conn.read_packet(&mut buf).await.unwrap_err();
+        assert!(
+            err.to_string().contains("desynced"),
+            "second read must fail fast on poisoned conn, got {err:?}"
+        );
+    }
+
+    /// Happy-path guard: a completed frame read must not poison the conn.
+    #[tokio::test]
+    async fn completed_read_leaves_conn_usable() {
+        use tokio::io::AsyncWriteExt;
+        let (client, mut server) = tokio::io::duplex(64 * 1024);
+        let conn = TrojanPacketConn::new(Box::new(client));
+        let mut buf = [0u8; 2048];
+        let src: SocketAddr = "9.9.9.9:443".parse().unwrap();
+
+        for i in 0u8..2 {
+            let payload = [i, i, i];
+            let mut wire = Vec::new();
+            encode_socks5_addr_socket(&mut wire, &src);
+            wire.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+            wire.extend_from_slice(b"\r\n");
+            wire.extend_from_slice(&payload);
+            server.write_all(&wire).await.unwrap();
+            let (n, addr) = conn.read_packet(&mut buf).await.unwrap();
+            assert_eq!(addr, src);
+            assert_eq!(&buf[..n], &payload);
         }
     }
 

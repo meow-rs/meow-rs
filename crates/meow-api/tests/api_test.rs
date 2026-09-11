@@ -64,6 +64,7 @@ fn test_state(raw: RawConfig) -> Arc<AppState> {
         listeners: vec![],
         external_ui: None,
         traffic_feed: Default::default(),
+        dns_server: Default::default(),
     })
 }
 
@@ -100,6 +101,7 @@ fn test_state_with_route(raw: RawConfig, named: Vec<(&str, Arc<dyn Proxy>)>) -> 
         listeners: vec![],
         external_ui: None,
         traffic_feed: Default::default(),
+        dns_server: Default::default(),
     })
 }
 
@@ -138,6 +140,7 @@ fn test_state_with_secret(secret: &str) -> Arc<AppState> {
         listeners: vec![],
         external_ui: None,
         traffic_feed: Default::default(),
+        dns_server: Default::default(),
     })
 }
 
@@ -221,6 +224,7 @@ async fn external_ui_serves_static_directory() {
         listeners: vec![],
         external_ui: Some(dir.path().to_path_buf()),
         traffic_feed: Default::default(),
+        dns_server: Default::default(),
     });
     let app = create_router(state);
 
@@ -1859,6 +1863,7 @@ mod delay_support {
             listeners: vec![],
             external_ui: None,
             traffic_feed: Default::default(),
+            dns_server: Default::default(),
         })
     }
 
@@ -1914,6 +1919,7 @@ mod delay_support {
             listeners: vec![],
             external_ui: None,
             traffic_feed: Default::default(),
+            dns_server: Default::default(),
         })
     }
 }
@@ -2814,6 +2820,7 @@ fn test_state_with_hosts_entry() -> Arc<AppState> {
         listeners: vec![],
         external_ui: None,
         traffic_feed: Default::default(),
+        dns_server: Default::default(),
     })
 }
 
@@ -3296,4 +3303,69 @@ async fn cold_reload_rejects_tcp_setup_waiting_for_dns() {
     })
     .await
     .expect("DNS-delayed setup escaped cold reload or admission did not recover");
+}
+
+/// Issue #514: `PUT /configs` must swap the running DNS resolver, not just
+/// persist the new `dns:` section. Before the fix the resolver was fixed at
+/// `Tunnel::new`, so the tunnel, the built-in DIRECT adapter, and the
+/// host-resolver hook all kept the startup generation forever.
+#[tokio::test]
+async fn put_configs_swaps_running_dns_resolver() {
+    use base64::Engine as _;
+    let state = test_state(RawConfig {
+        rules: Some(vec!["MATCH,DIRECT".into()]),
+        ..Default::default()
+    });
+    let old_resolver = state.tunnel.resolver();
+    assert!(
+        old_resolver.fake_ip_v4_net().is_none(),
+        "stub resolver has no fake-ip pool"
+    );
+
+    // New config: dns enabled + fake-ip mode — the dns section differs.
+    let payload = base64::engine::general_purpose::STANDARD.encode(
+        "mode: rule\ndns:\n  enable: true\n  enhanced-mode: fake-ip\n  nameserver:\n    - 127.0.0.1\nrules:\n  - MATCH,DIRECT\n",
+    );
+    let response = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let new_resolver = state.tunnel.resolver();
+    assert!(
+        !std::sync::Arc::ptr_eq(&new_resolver, &old_resolver),
+        "resolver generation must be swapped"
+    );
+    assert!(
+        new_resolver.fake_ip_v4_net().is_some(),
+        "new resolver must have a fake-ip pool"
+    );
+
+    // Restore a dns-free config so the process-global host-resolver hook
+    // installed above does not leak into other tests in this binary.
+    let restore =
+        base64::engine::general_purpose::STANDARD.encode("mode: rule\nrules:\n  - MATCH,DIRECT\n");
+    let _ = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": restore}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 }

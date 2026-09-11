@@ -50,33 +50,41 @@ pub async fn run_loop(raw_config: Arc<RwLock<RawConfig>>, tunnel: Tunnel, config
                         .as_secs() as i64;
 
                     // Pre-resolve any DNS-sourced ECH configs before taking the
-                    // sync write lock — preresolve_ech is async, must not be
-                    // held across `parking_lot::RwLock`.
+                    // mutation lane — preresolve_ech is async network I/O and
+                    // must not serialize other config commits.
                     meow_config::ech_dns::preresolve_ech(&mut fetched.proxies).await;
 
-                    let snapshot = {
-                        let mut raw = raw_config.write();
+                    // Issue #514: the commit runs inside the same
+                    // `CONFIG_MUTATION` lane every API mutation uses, and
+                    // builds the candidate on a CLONE — `raw_config` is only
+                    // written after the rebuild succeeds. Previously the
+                    // fetched payload was written into the live raw config
+                    // first, so a failed rebuild left `GET /configs` and the
+                    // next cold start carrying a rejected config while the
+                    // running routing stayed old.
+                    let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
+                    let candidate = {
+                        let mut c = raw_config.read().clone();
 
-                        if let Some(ref mut subs) = raw.subscriptions {
+                        if let Some(ref mut subs) = c.subscriptions {
                             if let Some(sub) = subs.iter_mut().find(|s| s.name == name) {
                                 sub.last_updated = Some(now);
                             }
                         }
 
-                        raw.proxies = Some(fetched.proxies);
-                        raw.proxy_groups = Some(fetched.proxy_groups);
-                        raw.rules = Some(fetched.rules);
-
-                        raw.clone()
+                        c.proxies = Some(fetched.proxies);
+                        c.proxy_groups = Some(fetched.proxy_groups);
+                        c.rules = Some(fetched.rules);
+                        c
                     };
 
-                    let resolver = Arc::clone(tunnel.resolver());
+                    let resolver = tunnel.resolver();
                     let rebuild = tokio::task::spawn_blocking({
-                        let snapshot = snapshot.clone();
+                        let candidate = candidate.clone();
                         let cache_dir = cache_dir.clone();
                         move || {
                             meow_config::rebuild_from_raw_with_resolver(
-                                &snapshot,
+                                &candidate,
                                 Some(resolver),
                                 Some(cache_dir.as_path()),
                             )
@@ -87,9 +95,18 @@ pub async fn run_loop(raw_config: Arc<RwLock<RawConfig>>, tunnel: Tunnel, config
                     match rebuild {
                         Ok(Ok((new_proxies, new_rules))) => {
                             tunnel.update_routing(new_proxies, new_rules);
+                            // Commit raw + routing together inside the lane:
+                            // the on-disk/dashboard view and the running
+                            // router can no longer diverge on failure.
+                            *raw_config.write() = candidate.clone();
+                            // Health-check tasks follow the new group set
+                            // (issue #514).
+                            tunnel.reconcile_health_checks(
+                                candidate.proxy_groups.as_deref().unwrap_or(&[]),
+                            );
                             info!("Subscription '{}' refreshed successfully", name);
                             let _ =
-                                meow_config::save_raw_config_async(&config_path, &snapshot).await;
+                                meow_config::save_raw_config_async(&config_path, &candidate).await;
                         }
                         Ok(Err(e)) => {
                             error!("Failed to rebuild after refreshing '{}': {}", name, e);

@@ -5,7 +5,6 @@
 //! configuration, the tunnel, listeners, DNS, and the REST API together.
 
 pub mod geodata_fetch;
-pub mod health_check;
 pub mod subscription_refresh;
 
 /// Generate a systemd unit file for the meow service.
