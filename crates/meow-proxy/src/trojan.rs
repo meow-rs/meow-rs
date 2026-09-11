@@ -407,6 +407,14 @@ impl ProxyPacketConn for TrojanPacketConn {
             ));
         }
         let mut reader = self.reader.lock().await;
+        // Re-check after the lock: a read parked here while another was
+        // cancelled mid-frame passed the outer check before the store
+        // landed (issue #514 review).
+        if self.poisoned.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(MeowError::Proxy(
+                "trojan udp: connection desynced by an earlier incomplete read".into(),
+            ));
+        }
         let mut guard = PoisonOnIncomplete {
             flag: &self.poisoned,
             complete: false,

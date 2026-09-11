@@ -207,7 +207,10 @@ async fn handle_client_datagram(
     // Fast path: existing *live* session for this destination. A session
     // whose reply task exited is one-way — writes would go out on a conn
     // that can never deliver a reply, so evict it and re-dial below
-    // (issue #514).
+    // (issue #514). The check→write window is inherent: if the reply task
+    // dies in between, this datagram is written into a conn that can't
+    // answer — bounded to one packet, the next datagram redials (UDP
+    // semantics tolerate the loss).
     if nat
         .get(&dst_addr)
         .is_some_and(|s| s.dead.load(Ordering::Relaxed))
@@ -215,11 +218,12 @@ async fn handle_client_datagram(
         nat.remove(&dst_addr);
     }
     if let Some(session) = nat.get(&dst_addr) {
-        session
-            .conn
-            .write_packet(payload, &dst_addr)
-            .await
-            .map_err(|e| format!("udp write {dst_addr}: {e}"))?;
+        // A write error also means this conn is unusable — remove so the
+        // next datagram redials rather than retrying a dead transport.
+        if let Err(e) = session.conn.write_packet(payload, &dst_addr).await {
+            nat.remove(&dst_addr);
+            return Err(format!("udp write {dst_addr}: {e}"));
+        }
         session.last_activity_ms.store(
             monotonic_ms() as meow_common::atomic::Uint,
             Ordering::Relaxed,

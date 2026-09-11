@@ -112,10 +112,14 @@ pub async fn run_on_startup(
         return;
     }
 
+    // Serialize against config commits and rebuild from the raw committed
+    // *inside* the lane — otherwise a download finishing after a PUT could
+    // revert rules to a set built from the pre-PUT config (issue #514).
+    let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
     let raw = raw_config.read().clone();
-    // Take the *current* resolver generation — a config reload may have
-    // swapped it since this task was spawned (issue #514).
-    let resolver = tunnel.resolver();
+    // Share the tunnel's resolver slot so the rebuilt DIRECT adapter
+    // tracks later `set_resolver` swaps (issue #514).
+    let resolver = tunnel.resolver_slot();
     let rebuild = tokio::task::spawn_blocking({
         let cache_dir = cache_dir.clone();
         move || {
@@ -204,10 +208,14 @@ pub async fn auto_update_loop(
             continue;
         }
 
+        // Serialize against config commits and rebuild from the raw
+        // committed *inside* the lane — otherwise this rebuild could
+        // revert rules committed by a concurrent PUT (issue #514).
+        let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
         let raw = raw_config.read().clone();
-        // Fresh generation per cycle — `PUT /configs` may have swapped the
-        // resolver between ticks (issue #514).
-        let resolver = tunnel.resolver();
+        // Share the tunnel's resolver slot so the rebuilt DIRECT adapter
+        // tracks later `set_resolver` swaps (issue #514).
+        let resolver = tunnel.resolver_slot();
         let rebuild = tokio::task::spawn_blocking({
             let cache_dir = cache_dir.clone();
             move || {

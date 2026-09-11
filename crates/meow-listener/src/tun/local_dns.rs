@@ -24,8 +24,7 @@
 use std::io;
 use std::sync::Arc;
 
-use meow_dns::server::BoundDnsServer;
-use meow_dns::Resolver;
+use meow_dns::server::{BoundDnsServer, ResolverSlot};
 use tokio::net::UdpSocket;
 use tracing::info;
 
@@ -51,10 +50,15 @@ pub async fn bind() -> io::Result<Sockets> {
 }
 
 /// Serve DNS on the pre-bound sockets until both serve loops end.
-pub async fn run(sockets: Sockets, resolver: Arc<Resolver>) {
+///
+/// `resolver` is the tunnel's shared [`ResolverSlot`], so `PUT /configs`
+/// resolver swaps reach these servers without restarting the TUN
+/// listener — the OS resolver is pointed at these sockets on Windows, so
+/// a stale generation here would strand system DNS (issue #514).
+pub async fn run(sockets: Sockets, resolver: ResolverSlot) {
     let Sockets { v4, v6 } = sockets;
     info!("tun local-dns: serving on 127.0.0.1:53 and [::1]:53");
-    let v4 = BoundDnsServer::from_socket(v4, Arc::clone(&resolver)).run();
-    let v6 = BoundDnsServer::from_socket(v6, resolver).run();
+    let v4 = BoundDnsServer::from_slot(v4, Arc::clone(&resolver)).run();
+    let v6 = BoundDnsServer::from_slot(v6, resolver).run();
     let _ = tokio::join!(v4, v6);
 }

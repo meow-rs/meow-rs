@@ -37,6 +37,19 @@ const FLOW_QUEUE: usize = 64;
 /// Queue feeding the single stack-writer task (the netstack write half is
 /// a `Sink` and cannot be cloned into per-flow tasks).
 const REPLY_QUEUE: usize = 512;
+
+/// One `read_packet` call with its own buffer, so the future can be pinned
+/// across `select!` iterations without borrowing the pump's state —
+/// dropping a mid-flight read is how a cancelled select arm desynced
+/// stream-framed UDP conns like Trojan (issue #514).
+async fn read_one(
+    conn: &dyn meow_common::ProxyPacketConn,
+) -> meow_common::Result<(Vec<u8>, std::net::SocketAddr)> {
+    let mut buf = vec![0u8; DATAGRAM_BUF];
+    let (n, from) = conn.read_packet(&mut buf).await?;
+    buf.truncate(n);
+    Ok((buf, from))
+}
 /// Sweep dead flow-table entries every this many datagrams.
 const SWEEP_INTERVAL: u32 = 256;
 
@@ -218,15 +231,15 @@ async fn relay_flow(
     // reader loop), downstream packets, and the idle deadline. Reply
     // source addresses are not rewritten: the tun flow is locked to one
     // (src, dst) tuple, so every reply is delivered as coming from `dst`.
-    // A downstream read cancelled by another branch may drop the current
-    // datagram: the property holds for VlessUdpReader / MuxPacketConn
-    // (which persist progress), but `relay_flow` is generic over
-    // `Box<dyn ProxyPacketConn>` and Direct / Shadowsocks / Trojan UDP
-    // conns do not carry that invariant.  This is acceptable under UDP
-    // delivery semantics.
-    let mut buf = vec![0u8; DATAGRAM_BUF];
+    //
+    // The read future is pinned across select! iterations: rebuilding it
+    // per loop turn would drop an in-flight packet read on every write/idle
+    // interleave, which for Trojan cancels a partially consumed stream
+    // frame and poisons the conn (issue #514). Each read owns its buffer
+    // so the future can persist while `buf`-less arms run.
     let idle = sleep(udp_timeout);
     tokio::pin!(idle);
+    let mut read = std::pin::pin!(read_one(&*conn));
     let result = loop {
         tokio::select! {
             () = &mut idle => break Ok(()), // idle-timeout eviction
@@ -239,9 +252,10 @@ async fn relay_flow(
                 }
                 None => break Ok(()), // reader loop gone — listener shutdown
             },
-            received = conn.read_packet(&mut buf) => match received {
-                Ok((n, _from)) => {
-                    if reply_tx.send((buf[..n].to_vec(), dst, src)).await.is_err() {
+            received = &mut read => match received {
+                Ok((data, _from)) => {
+                    read.set(read_one(&*conn));
+                    if reply_tx.send((data, dst, src)).await.is_err() {
                         break Ok(()); // stack writer gone — listener shutdown
                     }
                     idle.as_mut().reset(Instant::now() + udp_timeout);

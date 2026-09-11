@@ -78,7 +78,7 @@ pub async fn run_loop(raw_config: Arc<RwLock<RawConfig>>, tunnel: Tunnel, config
                         c
                     };
 
-                    let resolver = tunnel.resolver();
+                    let resolver = tunnel.resolver_slot();
                     let rebuild = tokio::task::spawn_blocking({
                         let candidate = candidate.clone();
                         let cache_dir = cache_dir.clone();
@@ -102,7 +102,9 @@ pub async fn run_loop(raw_config: Arc<RwLock<RawConfig>>, tunnel: Tunnel, config
                             // Health-check tasks follow the new group set
                             // (issue #514).
                             tunnel.reconcile_health_checks(
-                                candidate.proxy_groups.as_deref().unwrap_or(&[]),
+                                meow_config::extract_health_check_specs(
+                                    candidate.proxy_groups.as_deref().unwrap_or(&[]),
+                                ),
                             );
                             info!("Subscription '{}' refreshed successfully", name);
                             let _ =
@@ -110,6 +112,18 @@ pub async fn run_loop(raw_config: Arc<RwLock<RawConfig>>, tunnel: Tunnel, config
                         }
                         Ok(Err(e)) => {
                             error!("Failed to rebuild after refreshing '{}': {}", name, e);
+                            // Still stamp `last_updated` on the live raw —
+                            // without it the next 60 s pass re-downloads and
+                            // re-fails forever instead of honoring
+                            // `interval` (issue #514 review).
+                            let mut live = raw_config.write();
+                            if let Some(sub) = live
+                                .subscriptions
+                                .as_mut()
+                                .and_then(|subs| subs.iter_mut().find(|s| s.name == name))
+                            {
+                                sub.last_updated = Some(now);
+                            }
                         }
                         Err(e) => error!(
                             "Failed to join rebuild task after refreshing '{}': {}",

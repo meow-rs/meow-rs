@@ -18,5 +18,5 @@ pub use host_resolver_hook::ResolverHostHook;
 pub use resolver::{
     BootstrapError, FallbackFilter, HostEntry, NameserverPolicy, PolicyEntry, Resolver,
 };
-pub use server::{BoundDnsServer, DnsServer, ResolverSlot};
+pub use server::{new_resolver_slot, BoundDnsServer, DnsServer, ResolverSlot};
 pub use upstream::{HostOrIp, NameServerEntry, NameServerParseError, NameServerUrl};

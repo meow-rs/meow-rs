@@ -803,7 +803,9 @@ async fn run(
     }
 
     // Create the tunnel (core routing engine)
-    let tunnel = Tunnel::new(Arc::clone(&config.dns.resolver));
+    // Share the DNS config's resolver slot so runtime `set_resolver` swaps
+    // reach the map's DIRECT adapters built from this slot (issue #514).
+    let tunnel = Tunnel::new_with_slot(Arc::clone(&config.dns.resolver_slot));
     tunnel.set_mode(config.general.mode);
     tunnel.update_routing(config.proxies, config.rules);
     tunnel.spawn_background_tasks();
@@ -811,7 +813,9 @@ async fn run(
     // Spawn periodic health checks for fallback / url-test proxy groups.
     // The supervisor lives on the tunnel so config reloads can reconcile
     // the task set (issue #514).
-    tunnel.reconcile_health_checks(config.raw.proxy_groups.as_deref().unwrap_or(&[]));
+    tunnel.reconcile_health_checks(meow_config::extract_health_check_specs(
+        config.raw.proxy_groups.as_deref().unwrap_or(&[]),
+    ));
 
     // Start DNS server if configured. The handle is shared with the API
     // layer so `PUT /configs` can hot-swap the resolver or rebind on a

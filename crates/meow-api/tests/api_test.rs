@@ -3351,11 +3351,36 @@ async fn put_configs_swaps_running_dns_resolver() {
         "new resolver must have a fake-ip pool"
     );
 
+    // The route map's DIRECT adapter must track the swap too — it shares
+    // the tunnel's resolver slot, so a hostname dial allocates a fake-IP
+    // entry in the *new* generation's pool (the dial itself fails: the
+    // allocated 198.18.x.x address is unroutable).
+    let direct = state
+        .tunnel
+        .route_snapshot()
+        .proxies
+        .get("DIRECT")
+        .cloned()
+        .expect("map has DIRECT");
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        direct.dial_tcp(&meow_common::Metadata {
+            host: "probe.invalid".into(),
+            dst_port: 80,
+            ..Default::default()
+        }),
+    )
+    .await;
+    assert!(
+        new_resolver.fake_ip_active_for("probe.invalid"),
+        "map DIRECT must resolve through the hot-swapped resolver generation"
+    );
+
     // Restore a dns-free config so the process-global host-resolver hook
     // installed above does not leak into other tests in this binary.
     let restore =
         base64::engine::general_purpose::STANDARD.encode("mode: rule\nrules:\n  - MATCH,DIRECT\n");
-    let _ = create_router(Arc::clone(&state))
+    let restore_resp = create_router(Arc::clone(&state))
         .oneshot(
             Request::builder()
                 .method("PUT")
@@ -3368,4 +3393,9 @@ async fn put_configs_swaps_running_dns_resolver() {
         )
         .await
         .unwrap();
+    assert_eq!(
+        restore_resp.status(),
+        StatusCode::NO_CONTENT,
+        "restore PUT must succeed so the host-resolver hook is cleared"
+    );
 }

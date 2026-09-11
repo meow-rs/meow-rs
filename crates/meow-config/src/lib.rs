@@ -107,6 +107,10 @@ pub fn effective_ipv6(raw_ipv6: Option<bool>) -> bool {
 
 pub struct DnsConfig {
     pub resolver: Arc<Resolver>,
+    /// Shared slot wrapping `resolver` — the tunnel shares it and every
+    /// `rebuild_from_raw_*` receives it, so the built-in DIRECT adapter
+    /// tracks `set_resolver` swaps (issue #514).
+    pub resolver_slot: meow_dns::ResolverSlot,
     pub listen_addr: Option<SocketAddr>,
     /// `dns.enable` from the config. False means `resolver` is the stub
     /// built for `DirectAdapter` (a single hard-coded upstream), not the
@@ -496,6 +500,11 @@ pub fn rebuild_from_raw(raw: &raw::RawConfig) -> Result<RebuildResult, anyhow::E
 /// Rebuild proxies/rules and inject `resolver` into the built-in DIRECT
 /// adapter so it avoids the OS resolver when dialing hostnames.
 ///
+/// `resolver` is the tunnel's shared [`meow_dns::ResolverSlot`] — the
+/// built `DIRECT` keeps reading the *live* generation, so a later
+/// `Tunnel::set_resolver` swap reaches it (issue #514). Pass
+/// `Some(meow_dns::new_resolver_slot(r))` for a private, fixed generation.
+///
 /// `cache_dir` should be the same provider-cache directory the config was
 /// originally loaded with (see [`resource_cache_dir_for_config_path`]) —
 /// this is a *trusted* rebuild of the daemon's own running config, not an
@@ -504,7 +513,7 @@ pub fn rebuild_from_raw(raw: &raw::RawConfig) -> Result<RebuildResult, anyhow::E
 /// (issue #429 follow-up).
 pub fn rebuild_from_raw_with_resolver(
     raw: &raw::RawConfig,
-    resolver: Option<Arc<Resolver>>,
+    resolver: Option<meow_dns::ResolverSlot>,
     cache_dir: Option<&Path>,
 ) -> Result<RebuildResult, anyhow::Error> {
     rebuild_from_raw_impl(raw, cache_dir, resolver, &HashMap::new(), None, None, None)
@@ -517,7 +526,7 @@ pub fn rebuild_from_raw_with_resolver(
 /// startup provider-cache directory rather than `None`.
 pub fn rebuild_from_raw_runtime(
     raw: &raw::RawConfig,
-    resolver: Option<Arc<Resolver>>,
+    resolver: Option<meow_dns::ResolverSlot>,
     providers: &HashMap<String, Arc<ProxyProvider>>,
     cache_dir: Option<&Path>,
 ) -> Result<RebuildResult, anyhow::Error> {
@@ -535,11 +544,11 @@ pub fn rebuild_from_raw_runtime(
 
 /// Same as [`rebuild_from_raw`] but accepts a `cache_dir` used to resolve
 /// relative rule-provider paths and to cache fetched HTTP payloads, and an
-/// optional DNS `resolver` injected into the built-in DIRECT adapter.
+/// optional DNS `resolver` slot injected into the built-in DIRECT adapter.
 pub fn rebuild_from_raw_with_cache_dir(
     raw: &raw::RawConfig,
     cache_dir: Option<&Path>,
-    resolver: Option<Arc<Resolver>>,
+    resolver: Option<meow_dns::ResolverSlot>,
 ) -> Result<RebuildResult, anyhow::Error> {
     rebuild_from_raw_impl(raw, cache_dir, resolver, &HashMap::new(), None, None, None)
 }
@@ -914,7 +923,7 @@ fn primary_global_target<'a>(
 fn rebuild_from_raw_impl(
     raw: &raw::RawConfig,
     cache_dir: Option<&Path>,
-    resolver: Option<Arc<Resolver>>,
+    resolver: Option<meow_dns::ResolverSlot>,
     providers: &HashMap<String, Arc<ProxyProvider>>,
     selector_store: Option<&Arc<meow_proxy::SelectorStore>>,
     shared_ctx: Option<&meow_rules::ParserContext>,
@@ -930,8 +939,8 @@ fn rebuild_from_raw_impl(
     if let Some(mark) = raw.routing_mark {
         direct = direct.with_routing_mark(mark);
     }
-    if let Some(resolver) = resolver {
-        direct = direct.with_resolver(resolver);
+    if let Some(slot) = resolver {
+        direct = direct.with_resolver_slot(slot);
     }
     if let Some(secs) = raw.tcp_connect_timeout {
         direct = direct.with_connect_timeout(std::time::Duration::from_secs(secs));
@@ -1265,7 +1274,7 @@ async fn prefetch_rule_provider_payloads_async(
 async fn rebuild_from_raw_impl_async(
     raw: raw::RawConfig,
     cache_dir: Option<PathBuf>,
-    resolver: Option<Arc<Resolver>>,
+    resolver: Option<meow_dns::ResolverSlot>,
     providers: HashMap<String, Arc<ProxyProvider>>,
     selector_store: Option<Arc<meow_proxy::SelectorStore>>,
     ctx: meow_rules::ParserContext,
@@ -2250,7 +2259,7 @@ async fn build_config(
     let (proxies, rules) = rebuild_from_raw_impl_async(
         raw.clone(),
         cache_dir_buf.clone(),
-        Some(Arc::clone(&dns_config.resolver)),
+        Some(Arc::clone(&dns_config.resolver_slot)),
         proxy_providers.clone(),
         selector_store.clone(),
         ctx.clone(),
@@ -3752,4 +3761,34 @@ rule-providers:
         };
         assert!(err.to_string().contains("escapes"), "unexpected: {err}");
     }
+}
+
+/// `fallback` / `url-test` proxy groups get periodic health checks —
+/// extract their probe specs from the raw group list (issue #514). Last
+/// duplicate name wins, matching how `load_config` resolves duplicates.
+pub fn extract_health_check_specs(
+    raw_groups: &[raw::RawProxyGroup],
+) -> Vec<meow_common::HealthCheckSpec> {
+    const DEFAULT_URL: &str = "http://www.gstatic.com/generate_204";
+    const DEFAULT_INTERVAL_SECS: u64 = 300;
+    let mut specs: Vec<meow_common::HealthCheckSpec> = Vec::new();
+    for g in raw_groups {
+        if !matches!(g.group_type.as_str(), "fallback" | "url-test") {
+            continue;
+        }
+        let spec = meow_common::HealthCheckSpec {
+            group_name: g.name.clone(),
+            url: g.url.as_deref().unwrap_or(DEFAULT_URL).to_string(),
+            interval_secs: g
+                .interval
+                .filter(|interval| *interval > 0)
+                .unwrap_or(DEFAULT_INTERVAL_SECS),
+            lazy: g.lazy.unwrap_or(false),
+        };
+        match specs.iter_mut().find(|s| s.group_name == g.name) {
+            Some(existing) => *existing = spec,
+            None => specs.push(spec),
+        }
+    }
+    specs
 }

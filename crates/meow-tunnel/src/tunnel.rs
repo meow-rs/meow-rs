@@ -66,10 +66,10 @@ pub struct TunnelInner {
     /// guard immediately; never hold the guard across an `.await`.
     pub route: RwLock<Arc<RouteTable>>,
     /// Hot-swappable resolver slot (issue #514): `PUT /configs` rebuilds
-    /// the DNS resolver and publishes it via `Tunnel::set_resolver`.
-    /// Components that cloned the `Arc` for a long-lived task keep the old
-    /// generation until their next `resolver()` call.
-    resolver: RwLock<Arc<Resolver>>,
+    /// the DNS resolver and publishes it via `Tunnel::set_resolver`. The
+    /// slot is shared with `direct` and handed to runtime route rebuilds,
+    /// so the map's `DIRECT` adapter tracks the same generation.
+    resolver: meow_dns::ResolverSlot,
     /// Fallback DIRECT adapter used when no user-defined rule matches or
     /// when Direct/Global mode bypasses the proxies map. Pre-built with the
     /// internal resolver so hostname dials avoid the OS resolver; its
@@ -411,13 +411,24 @@ pub struct Tunnel {
 }
 
 impl Tunnel {
+    /// New tunnel with a private resolver slot — `set_resolver` swaps are
+    /// visible to `inner.direct`, but adapters rebuilt with a different
+    /// slot are not. Production uses [`Self::new_with_slot`] so the slot
+    /// is also shared into every runtime route rebuild (issue #514).
     pub fn new(resolver: Arc<Resolver>) -> Self {
-        let direct = Arc::new(DirectAdapter::new().with_resolver(Arc::clone(&resolver)));
+        Self::new_with_slot(meow_dns::new_resolver_slot(resolver))
+    }
+
+    /// New tunnel sharing `resolver_slot` — the same slot must be passed
+    /// to `rebuild_from_raw_*` so the map's `DIRECT` adapter and
+    /// `inner.direct` observe `set_resolver` swaps identically.
+    pub fn new_with_slot(resolver: meow_dns::ResolverSlot) -> Self {
+        let direct = Arc::new(DirectAdapter::new().with_resolver_slot(Arc::clone(&resolver)));
         Self {
             inner: Arc::new(TunnelInner {
                 mode: RwLock::new(TunnelMode::Rule),
                 route: RwLock::new(Arc::new(RouteTable::empty())),
-                resolver: RwLock::new(resolver),
+                resolver,
                 direct,
                 nat_table: udp::new_nat_table(),
                 stats: Arc::new(Statistics::new()),
@@ -561,14 +572,25 @@ impl Tunnel {
         self.inner.resolver()
     }
 
+    /// The shared resolver slot. Pass clones to `rebuild_from_raw_*` and
+    /// the TUN loopback DNS so every consumer — including each rebuilt
+    /// `DIRECT` adapter — tracks `set_resolver` swaps (issue #514).
+    pub fn resolver_slot(&self) -> meow_dns::ResolverSlot {
+        Arc::clone(&self.inner.resolver)
+    }
+
     /// Reconcile health-check tasks with a committed config's proxy-group
-    /// section (issue #514): new fallback/url-test groups get a task,
+    /// specs (issue #514): new fallback/url-test groups get a task,
     /// removed groups are aborted, changed specs are respawned, dead tasks
-    /// are restarted. Call on every config commit — startup, `PUT
-    /// /configs`, section mutations, subscription refresh.
-    pub fn reconcile_health_checks(&self, raw_groups: &[meow_config::raw::RawProxyGroup]) {
-        let specs = crate::health_check::extract_specs(raw_groups);
-        self.inner.health_checks.lock().reconcile(self, specs);
+    /// are restarted. Specs come from
+    /// `meow_config::extract_health_check_specs`; call on every config
+    /// commit — startup, `PUT /configs`, section mutations, subscription
+    /// refresh.
+    pub fn reconcile_health_checks(&self, specs: Vec<meow_common::HealthCheckSpec>) {
+        self.inner
+            .health_checks
+            .lock()
+            .reconcile(&self.inner, specs);
     }
 
     /// Publish a rebuilt DNS resolver (issue #514): routing lookups
@@ -579,8 +601,9 @@ impl Tunnel {
     /// persisted a new `dns:` section while the process kept resolving
     /// through the old one.
     pub fn set_resolver(&self, resolver: Arc<Resolver>) {
-        *self.inner.resolver.write() = Arc::clone(&resolver);
-        self.inner.direct.set_resolver(resolver);
+        // One write updates the routing snapshot, `inner.direct`, and every
+        // rebuilt `DIRECT` — they all share this slot.
+        *self.inner.resolver.write() = resolver;
     }
 
     /// Snapshot of the current route table (rules + domain index + proxies).

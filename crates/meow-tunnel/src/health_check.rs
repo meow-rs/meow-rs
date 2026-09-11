@@ -1,35 +1,11 @@
-use crate::Tunnel;
+use crate::tunnel::TunnelInner;
+use meow_common::HealthCheckSpec;
 use std::collections::HashMap;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
-const DEFAULT_URL: &str = "http://www.gstatic.com/generate_204";
-const DEFAULT_INTERVAL_SECS: u64 = 300;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
-
-#[derive(Clone, PartialEq, Eq)]
-pub struct HealthCheckSpec {
-    pub group_name: String,
-    pub url: String,
-    pub interval_secs: u64,
-    pub lazy: bool,
-}
-
-pub fn extract_specs(raw_groups: &[meow_config::raw::RawProxyGroup]) -> Vec<HealthCheckSpec> {
-    raw_groups
-        .iter()
-        .filter(|g| matches!(g.group_type.as_str(), "fallback" | "url-test"))
-        .map(|g| HealthCheckSpec {
-            group_name: g.name.clone(),
-            url: g.url.as_deref().unwrap_or(DEFAULT_URL).to_string(),
-            interval_secs: g
-                .interval
-                .filter(|interval| *interval > 0)
-                .unwrap_or(DEFAULT_INTERVAL_SECS),
-            lazy: g.lazy.unwrap_or(false),
-        })
-        .collect()
-}
 
 /// Owns the set of running health-check tasks, keyed by group name.
 /// `reconcile` is called on every config commit (startup, `PUT /configs`,
@@ -38,13 +14,18 @@ pub fn extract_specs(raw_groups: &[meow_config::raw::RawProxyGroup]) -> Vec<Heal
 /// lazy) are respawned, and a task that died on its own is restarted —
 /// previously checks were spawned once at startup and a reload could leave
 /// stale tasks running or new groups unprobed (issue #514).
+///
+/// Tasks hold a `Weak<TunnelInner>` and exit when it can't be upgraded —
+/// the same pattern the NAT sweeper uses — so an embedder dropping the
+/// last `Tunnel` doesn't leave probes running (and pinning inner state)
+/// forever.
 #[derive(Default)]
 pub struct HealthCheckSupervisor {
     tasks: HashMap<String, (HealthCheckSpec, tokio::task::JoinHandle<()>)>,
 }
 
 impl HealthCheckSupervisor {
-    pub fn reconcile(&mut self, tunnel: &Tunnel, specs: Vec<HealthCheckSpec>) {
+    pub fn reconcile(&mut self, inner: &Arc<TunnelInner>, specs: Vec<HealthCheckSpec>) {
         let wanted: HashMap<&str, &HealthCheckSpec> =
             specs.iter().map(|s| (s.group_name.as_str(), s)).collect();
 
@@ -63,8 +44,7 @@ impl HealthCheckSupervisor {
             if self.tasks.contains_key(spec.group_name.as_str()) {
                 continue;
             }
-            let tunnel = tunnel.clone();
-            let task = tokio::spawn(run_health_check_loop(tunnel, spec.clone()));
+            let task = tokio::spawn(run_health_check_loop(Arc::downgrade(inner), spec.clone()));
             self.tasks.insert(spec.group_name.clone(), (spec, task));
         }
     }
@@ -79,7 +59,7 @@ fn should_probe(lazy: bool, generation: u64, last_probed_generation: u64) -> boo
     !lazy || (generation != 0 && generation != last_probed_generation)
 }
 
-async fn run_health_check_loop(tunnel: Tunnel, spec: HealthCheckSpec) {
+async fn run_health_check_loop(inner: Weak<TunnelInner>, spec: HealthCheckSpec) {
     let mut ticker = tokio::time::interval(Duration::from_secs(spec.interval_secs));
     // `Delay` (not tokio's default `Burst`) so a probe that outlives a short
     // `interval` schedules the next tick a full interval from *now* instead
@@ -97,7 +77,17 @@ async fn run_health_check_loop(tunnel: Tunnel, spec: HealthCheckSpec) {
     loop {
         ticker.tick().await;
 
-        let route = tunnel.route_snapshot();
+        // Weak capture: a tunnel that no external handle pins means the
+        // embedder dropped it — stop probing instead of keeping
+        // `TunnelInner` alive forever through this task (issue #514).
+        let Some(inner) = inner.upgrade() else {
+            debug!(
+                "health-check: tunnel dropped, stopping '{}'",
+                spec.group_name
+            );
+            return;
+        };
+        let route = inner.route();
         let proxies = &route.proxies;
         let Some(group) = proxies.get(spec.group_name.as_str()).cloned() else {
             debug!(
@@ -165,7 +155,11 @@ async fn run_health_check_loop(tunnel: Tunnel, spec: HealthCheckSpec) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Tunnel;
     use meow_common::{Metadata, Proxy, ProxyAdapter};
+    use meow_config::extract_health_check_specs as extract_specs;
+
+    const DEFAULT_INTERVAL_SECS: u64 = 300;
 
     fn stub_tunnel() -> Tunnel {
         let resolver = std::sync::Arc::new(meow_dns::Resolver::new(
@@ -202,7 +196,7 @@ mod tests {
 
         // Add a group → task spawned.
         sup.reconcile(
-            &tunnel,
+            tunnel.inner(),
             extract_specs(&[raw_group("a", "url-test", Some(3600))]),
         );
         assert_eq!(sup.task_count(), 1);
@@ -210,7 +204,7 @@ mod tests {
 
         // Identical spec → no churn.
         sup.reconcile(
-            &tunnel,
+            tunnel.inner(),
             extract_specs(&[raw_group("a", "url-test", Some(3600))]),
         );
         assert_eq!(sup.task_count(), 1);
@@ -218,26 +212,29 @@ mod tests {
 
         // Changed interval → respawn (new task identity).
         sup.reconcile(
-            &tunnel,
+            tunnel.inner(),
             extract_specs(&[raw_group("a", "url-test", Some(60))]),
         );
         assert_eq!(sup.task_count(), 1);
         assert_ne!(sup.tasks["a"].1.id(), first, "changed spec respawns");
 
         // Type change to non-probing → task removed.
-        sup.reconcile(&tunnel, extract_specs(&[raw_group("a", "select", None)]));
+        sup.reconcile(
+            tunnel.inner(),
+            extract_specs(&[raw_group("a", "select", None)]),
+        );
         assert_eq!(sup.task_count(), 0, "non-checkable group aborts task");
 
         // Removed entirely → abort.
         sup.reconcile(
-            &tunnel,
+            tunnel.inner(),
             extract_specs(&[
                 raw_group("a", "url-test", None),
                 raw_group("b", "fallback", None),
             ]),
         );
         assert_eq!(sup.task_count(), 2);
-        sup.reconcile(&tunnel, extract_specs(&[]));
+        sup.reconcile(tunnel.inner(), extract_specs(&[]));
         assert_eq!(sup.task_count(), 0, "empty group set aborts all tasks");
     }
 
@@ -247,22 +244,67 @@ mod tests {
         let tunnel = stub_tunnel();
         let mut sup = HealthCheckSupervisor::default();
         sup.reconcile(
-            &tunnel,
+            tunnel.inner(),
             extract_specs(&[raw_group("a", "url-test", Some(3600))]),
         );
         assert_eq!(sup.task_count(), 1);
-        // Simulate a crashed loop.
+        let first = sup.tasks["a"].1.id();
+        // Simulate a crashed loop — abort only schedules cancellation, so
+        // poll `is_finished` to a deadline instead of assuming one yield
+        // is enough.
         sup.tasks["a"].1.abort();
-        tokio::task::yield_now().await;
+        until(Duration::from_secs(5), || sup.tasks["a"].1.is_finished()).await;
         sup.reconcile(
-            &tunnel,
+            tunnel.inner(),
             extract_specs(&[raw_group("a", "url-test", Some(3600))]),
         );
         assert_eq!(sup.task_count(), 1, "dead task is reaped and respawned");
+        assert_ne!(
+            sup.tasks["a"].1.id(),
+            first,
+            "replacement must be a new task"
+        );
         assert!(
             !sup.tasks["a"].1.is_finished(),
             "replacement task must be running"
         );
+    }
+
+    /// Duplicate group names: last spec wins, matching config build — a
+    /// duplicate must not churn the task on every reconcile.
+    #[tokio::test]
+    async fn reconcile_dedups_duplicate_names_last_wins() {
+        let tunnel = stub_tunnel();
+        let mut sup = HealthCheckSupervisor::default();
+        let groups = [
+            raw_group("a", "url-test", Some(3600)),
+            raw_group("a", "url-test", Some(60)),
+        ];
+        sup.reconcile(tunnel.inner(), extract_specs(&groups));
+        assert_eq!(sup.task_count(), 1);
+        assert_eq!(sup.tasks["a"].0.interval_secs, 60, "last spec wins");
+        let first = sup.tasks["a"].1.id();
+        // Reconciling the same duplicate set must not respawn.
+        sup.reconcile(tunnel.inner(), extract_specs(&groups));
+        assert_eq!(sup.tasks["a"].1.id(), first, "no churn on duplicates");
+    }
+
+    /// Probe tasks exit on their own once the tunnel is dropped — a
+    /// `Weak` capture means an embedder that drops the last `Tunnel`
+    /// doesn't leave check loops running forever (issue #514 review).
+    #[tokio::test(start_paused = true)]
+    async fn health_task_exits_when_tunnel_dropped() {
+        let tunnel = stub_tunnel();
+        let mut sup = HealthCheckSupervisor::default();
+        sup.reconcile(
+            tunnel.inner(),
+            extract_specs(&[raw_group("a", "url-test", Some(1))]),
+        );
+        let handle = sup.tasks.remove("a").unwrap().1;
+        drop(tunnel);
+        // The loop exits at the next tick when `upgrade` fails.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(handle.is_finished(), "task exits after tunnel drop");
     }
 
     #[test]
@@ -502,7 +544,7 @@ mod tests {
             interval_secs: 1,
             lazy: true,
         };
-        let task = tokio::spawn(run_health_check_loop(tunnel.clone(), spec));
+        let task = tokio::spawn(run_health_check_loop(Arc::downgrade(tunnel.inner()), spec));
 
         // Before the first interval elapses the loop has only consumed the
         // immediate first tick — an unused lazy group must not probe.
@@ -583,7 +625,7 @@ mod tests {
             interval_secs: 1,
             lazy: false,
         };
-        let task = tokio::spawn(run_health_check_loop(tunnel, spec));
+        let task = tokio::spawn(run_health_check_loop(Arc::downgrade(tunnel.inner()), spec));
 
         // Non-lazy: the first tick completes immediately and probes even
         // though the group has never been used.

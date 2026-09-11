@@ -630,7 +630,11 @@ impl TunListener {
         // `core_done` signal instead of trusting task ordering.
         let t_stack = Instant::now();
         let mut prev_slot = PREVIOUS_CORE.lock().await;
-        if let Some(mut prev_done) = prev_slot.take() {
+        // Clone, not take: if this task is dropped mid-wait (startup
+        // timeout, `NetStack::new` error via `?`), the slot must keep the
+        // barrier so the next generation still gates on this core's
+        // teardown rather than building a second stack over a live one.
+        if let Some(mut prev_done) = prev_slot.clone() {
             match timeout(
                 PREVIOUS_CORE_TEARDOWN_WAIT,
                 prev_done.wait_for(|done| *done),
@@ -668,7 +672,7 @@ impl TunListener {
         // pipeline as the TUN dns-hijack path, returning fake IPs.
         #[cfg(target_os = "windows")]
         if let Some(sockets) = local_dns_sockets {
-            let resolver = self.tunnel.resolver();
+            let resolver = self.tunnel.resolver_slot();
             tasks.spawn(async move {
                 local_dns::run(sockets, resolver).await;
             });

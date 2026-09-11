@@ -31,6 +31,14 @@ const OPT_RECORD: &[u8] = &[
 /// rebind, no in-flight query disruption (issue #514).
 pub type ResolverSlot = Arc<parking_lot::RwLock<Arc<Resolver>>>;
 
+/// Build a fresh slot holding `resolver`. Every component that should
+/// observe resolver hot-swaps (DNS servers, the built-in DIRECT adapter,
+/// the TUN loopback DNS) must share the *same* slot — pass clones of the
+/// returned `Arc`, not freshly wrapped copies of the resolver.
+pub fn new_resolver_slot(resolver: Arc<Resolver>) -> ResolverSlot {
+    Arc::new(parking_lot::RwLock::new(resolver))
+}
+
 /// Simple DNS server that handles queries by forwarding to our resolver.
 pub struct DnsServer {
     resolver: ResolverSlot,
@@ -49,10 +57,6 @@ impl DnsServer {
     /// and write the rebuilt resolver into it on config reload (issue #514).
     pub fn resolver_slot(&self) -> ResolverSlot {
         Arc::clone(&self.resolver)
-    }
-
-    pub fn listen_addr(&self) -> SocketAddr {
-        self.listen_addr
     }
 
     /// Bind the listen socket eagerly and return a [`BoundDnsServer`] ready to

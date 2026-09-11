@@ -41,8 +41,10 @@ pub async fn parse_dns(
                 use_hosts,
                 crate::effective_ipv6(raw.ipv6),
             );
+            let resolver = Arc::new(resolver);
             return Ok(DnsConfig {
-                resolver: Arc::new(resolver),
+                resolver_slot: meow_dns::new_resolver_slot(Arc::clone(&resolver)),
+                resolver,
                 listen_addr: None,
                 enabled: false,
                 proxy_resolver: None,
@@ -173,8 +175,10 @@ pub async fn parse_dns(
         install_fakeip(&mut resolver, dns, cache_dir).await?;
     }
 
+    let resolver = Arc::new(resolver);
     Ok(DnsConfig {
-        resolver: Arc::new(resolver),
+        resolver_slot: meow_dns::new_resolver_slot(Arc::clone(&resolver)),
+        resolver,
         listen_addr,
         enabled: true,
         proxy_resolver,
