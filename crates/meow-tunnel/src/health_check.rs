@@ -172,8 +172,6 @@ mod tests {
     use meow_common::{Metadata, Proxy, ProxyAdapter};
     use meow_config::extract_health_check_specs as extract_specs;
 
-    const DEFAULT_INTERVAL_SECS: u64 = 300;
-
     fn stub_tunnel() -> Tunnel {
         let resolver = std::sync::Arc::new(meow_dns::Resolver::new(
             vec![],
@@ -249,6 +247,30 @@ mod tests {
         assert_eq!(sup.task_count(), 2);
         sup.reconcile(tunnel.inner(), &extract_specs(&[]));
         assert_eq!(sup.task_count(), 0, "empty group set aborts all tasks");
+    }
+
+    /// Upstream `HealthCheck.auto()` is `interval != 0`: an explicit
+    /// `interval: 0` must disable periodic checks — no spec is emitted and
+    /// a previously-running task is removed by reconcile.
+    #[tokio::test]
+    async fn interval_zero_disables_periodic_checks() {
+        let tunnel = stub_tunnel();
+        let mut sup = HealthCheckSupervisor::default();
+        sup.reconcile(
+            tunnel.inner(),
+            &extract_specs(&[raw_group("a", "url-test", Some(3600))]),
+        );
+        assert_eq!(sup.task_count(), 1);
+
+        assert!(
+            extract_specs(&[raw_group("a", "url-test", Some(0))]).is_empty(),
+            "interval: 0 must not emit a probe spec"
+        );
+        sup.reconcile(
+            tunnel.inner(),
+            &extract_specs(&[raw_group("a", "url-test", Some(0))]),
+        );
+        assert_eq!(sup.task_count(), 0, "interval 0 removes the task");
     }
 
     /// A task that died on its own is restarted at the next reconcile.
@@ -333,18 +355,6 @@ mod tests {
         // The loop exits at the next tick when `upgrade` fails.
         tokio::time::sleep(Duration::from_secs(2)).await;
         assert!(handle.is_finished(), "task exits after tunnel drop");
-    }
-
-    #[test]
-    fn zero_interval_uses_safe_default() {
-        let group = meow_config::raw::RawProxyGroup {
-            name: "auto".into(),
-            group_type: "url-test".into(),
-            interval: Some(0),
-            ..Default::default()
-        };
-        let specs = extract_specs(&[group]);
-        assert_eq!(specs[0].interval_secs, DEFAULT_INTERVAL_SECS);
     }
 
     #[test]

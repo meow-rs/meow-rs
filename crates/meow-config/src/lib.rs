@@ -3804,7 +3804,7 @@ rule-providers:
 pub fn extract_health_check_specs(
     raw_groups: &[raw::RawProxyGroup],
 ) -> Vec<meow_common::HealthCheckSpec> {
-    const DEFAULT_URL: &str = "http://www.gstatic.com/generate_204";
+    const DEFAULT_URL: &str = "https://www.gstatic.com/generate_204";
     const DEFAULT_INTERVAL_SECS: u64 = 300;
     // First pass: resolve duplicate names against every declaration
     // (load_config's builder is last-wins on the name regardless of type).
@@ -3817,14 +3817,22 @@ pub fn extract_health_check_specs(
     }
     last.iter()
         .filter(|g| matches!(g.group_type.as_str(), "fallback" | "url-test"))
-        .map(|g| meow_common::HealthCheckSpec {
-            group_name: g.name.clone(),
-            url: g.url.as_deref().unwrap_or(DEFAULT_URL).to_string(),
-            interval_secs: g
-                .interval
-                .filter(|interval| *interval > 0)
-                .unwrap_or(DEFAULT_INTERVAL_SECS),
-            lazy: g.lazy.unwrap_or(false),
+        .filter_map(|g| {
+            // Upstream `HealthCheck.auto()` is `interval != 0`: an explicit
+            // `interval: 0` DISABLES periodic checks (manual/on-demand
+            // probes still work). Emitting no spec here also makes
+            // reconcile remove a previously-running task.
+            let interval_secs = match g.interval {
+                Some(0) => return None,
+                Some(i) => i,
+                None => DEFAULT_INTERVAL_SECS,
+            };
+            Some(meow_common::HealthCheckSpec {
+                group_name: g.name.clone(),
+                url: g.url.as_deref().unwrap_or(DEFAULT_URL).to_string(),
+                interval_secs,
+                lazy: g.lazy.unwrap_or(false),
+            })
         })
         .collect()
 }

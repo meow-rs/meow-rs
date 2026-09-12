@@ -62,20 +62,6 @@ impl DirectAdapter {
         self
     }
 
-    /// Hot-swap the resolver generation (issue #514). No-op when the
-    /// adapter was built without one — a `None` slot means the adapter
-    /// deliberately uses the OS resolver, which a reload must not change.
-    ///
-    /// Adapters sharing the tunnel's slot (built via
-    /// [`Self::with_resolver_slot`]) are already updated by
-    /// `Tunnel::set_resolver` — calling this on them writes the same slot
-    /// twice; it exists for adapters built with their own slot.
-    pub fn set_resolver(&self, resolver: Arc<Resolver>) {
-        if let Some(slot) = &self.resolver {
-            *slot.write() = resolver;
-        }
-    }
-
     /// Bound `TcpStream::connect` on `dial_tcp`. Returns `MeowError::Io`
     /// with `ErrorKind::TimedOut` if the connect exceeds `timeout`. See
     /// the `connect_timeout` field doc for the motivating failure mode

@@ -1139,34 +1139,21 @@ fn dns_uses_runtime_refs(raw: &RawConfig) -> bool {
 
 /// `true` when two raw configs carry identical DNS-relevant inputs —
 /// `dns:` plus `hosts:`, `ipv6`, and `geodata`, which all feed the
-/// resolver build. Compared as JSON values so section order/formatting
-/// differences don't trigger a spurious resolver rebuild. When a `dns:`
-/// section references proxies/rule-providers (`#name` nameserver tags,
-/// `rule-set:` policy keys), those sections join the comparison — the
-/// resolver snapshots them at build time.
+/// resolver build. Compared structurally (the `Raw*` types derive
+/// `PartialEq`; map sections are order-insensitive, list sections keep
+/// list order — same semantics the JSON comparison had, without building
+/// a DOM per commit). When a `dns:` section references
+/// proxies/rule-providers (`#name` nameserver tags, `rule-set:` policy
+/// keys), those sections join the comparison — the resolver snapshots
+/// them at build time.
 fn dns_inputs_equal(a: &RawConfig, b: &RawConfig) -> bool {
-    // Serialization failure is fail-safe — treat the sections as changed
-    // so a rebuild is attempted (its parse error is then visible) instead
-    // of silently skipping on a collapsed `Null == Null` comparison.
-    fn eq<T: serde::Serialize>(x: &T, y: &T, what: &str) -> bool {
-        match (serde_json::to_value(x), serde_json::to_value(y)) {
-            (Ok(vx), Ok(vy)) => vx == vy,
-            _ => {
-                warn!("dns_inputs_equal: failed to serialize {what}; treating as changed");
-                false
-            }
-        }
-    }
-    let base = eq(&a.dns, &b.dns, "dns")
-        && eq(&a.hosts, &b.hosts, "hosts")
-        && a.ipv6 == b.ipv6
-        && eq(&a.geodata, &b.geodata, "geodata");
+    let base = a.dns == b.dns && a.hosts == b.hosts && a.ipv6 == b.ipv6 && a.geodata == b.geodata;
     if !base || !(dns_uses_runtime_refs(a) || dns_uses_runtime_refs(b)) {
         return base;
     }
-    eq(&a.proxies, &b.proxies, "proxies")
-        && eq(&a.proxy_groups, &b.proxy_groups, "proxy_groups")
-        && eq(&a.rule_providers, &b.rule_providers, "rule_providers")
+    a.proxies == b.proxies
+        && a.proxy_groups == b.proxy_groups
+        && a.rule_providers == b.rule_providers
 }
 
 /// Decide whether `candidate` requires a DNS rebuild, and if so parse it.
@@ -1946,8 +1933,10 @@ async fn get_group_delay(
 
 // ── Config reload (M1.G-10) ──────────────────────────────────────────
 // upstream: hub/server.go::patchConfig
-// Class B per ADR-0002: payload must be base64 (upstream inconsistent); YAML parse errors
-// always return 400 even with force=true; NOT upstream silent broken-config apply.
+// Class B per ADR-0002: payload must be base64 — a deliberate divergence
+// from upstream, which consistently takes raw YAML bytes in `payload`;
+// YAML parse errors always return 400 even with force=true; NOT upstream
+// silent broken-config apply.
 
 /// Spawn a TUN listener from a raw config and wait for device readiness.
 /// Returns `Ok(Some(handle))` on success — the [`TunHandle`] carries the
@@ -2062,22 +2051,24 @@ async fn swap_config_and_reconcile_tun(
     // Snapshot the candidate (only on an off→on transition, before it is
     // moved into the lock) so the parking_lot write guard — which is
     // !Send — is dropped before the first .await below.
-    let (old_enable, snapshot) = {
+    let (old_enable, snapshot, specs) = {
         let mut guard = state.raw_config.write();
         let old = guard.tun.as_ref().is_some_and(|t| t.enable);
         let snapshot = (new_enable && !old).then(|| candidate.clone());
+        // Extract health-check specs straight from the candidate before it
+        // is moved into the lock — no second read of `raw_config` and no
+        // deep clone of the group section (issue #514 review).
+        let specs = meow_config::extract_health_check_specs(
+            candidate.proxy_groups.as_deref().unwrap_or(&[]),
+        );
         *guard = candidate;
-        (old, snapshot)
+        (old, snapshot, specs)
     };
 
     // Reconcile health-check tasks with the committed proxy-group section
     // — groups added get a check, removed abort, changed specs respawn
     // (issue #514). Sync; spawns under the lane lock are cheap.
-    {
-        let groups = state.raw_config.read().proxy_groups.clone();
-        let specs = meow_config::extract_health_check_specs(groups.as_deref().unwrap_or(&[]));
-        state.tunnel.reconcile_health_checks(&specs);
-    }
+    state.tunnel.reconcile_health_checks(&specs);
 
     // Publish the rebuilt DNS runtime — independent of TUN transitions, so
     // it must run before the equal-state early return (issue #514).
@@ -2135,8 +2126,14 @@ async fn swap_config_and_reconcile_tun(
                 info!("TUN listener started via config reload");
             }
             Ok(None) => {
-                // enable=true but spawn returned no handle — should not
-                // happen for this transition, but treat as success.
+                // Unreachable today — `spawn_tun_from_raw` only yields
+                // `Ok(None)` when `tun.enable` is false and this arm only
+                // runs for off→on. Roll back like the `Err` arm rather
+                // than persist `enable: true` with nothing running.
+                warn!("TUN listener spawn returned no handle on off→on (config rolled back)");
+                if let Some(ref mut tun) = state.raw_config.write().tun {
+                    tun.enable = false;
+                }
             }
             Err(e) => {
                 // TUN failed to start — roll back tun.enable to false so

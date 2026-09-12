@@ -155,6 +155,11 @@ pub async fn run_loop(
                                 ),
                             );
                             info!("Subscription '{}' refreshed successfully", name);
+                            // The commit is done — release the mutation
+                            // lane before the async disk write so file I/O
+                            // does not serialize concurrent config commits
+                            // (issue #514 review).
+                            drop(_lane);
                             if dns_ok {
                                 let _ =
                                     meow_config::save_raw_config_async(&config_path, &candidate)

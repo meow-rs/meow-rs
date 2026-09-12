@@ -90,7 +90,7 @@ where
 /// Fields `geodata-mode`, `geodata-loader`, and `geoip-matcher` exist in
 /// upstream Go mihomo but are not meaningful here. They are accepted and
 /// produce a `warn!` (Class B per ADR-0002, forward-compat).
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct RawGeoDataConfig {
     /// Explicit path to GeoIP Country MMDB. Skips discovery chain when set.
@@ -114,7 +114,7 @@ pub struct RawGeoDataConfig {
 }
 
 /// `geodata.url.*` — download URL overrides.
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct RawGeoDataUrls {
     pub mmdb: Option<String>,
@@ -189,7 +189,7 @@ pub struct RawConfig {
 }
 
 /// A `hosts:` map value: one IP/domain alias or a list of IP addresses.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(untagged)]
 pub enum HostsValue {
     One(String),
@@ -306,7 +306,7 @@ pub struct RawSimpleObfs {
     pub mode: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub struct RawDns {
     pub enable: Option<bool>,
@@ -341,7 +341,7 @@ pub struct RawDns {
 }
 
 /// A nameserver-policy value: either a single URL string or a list of URLs.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(untagged)]
 pub enum RawNspValue {
     One(String),
@@ -358,7 +358,7 @@ impl RawNspValue {
 }
 
 /// `fallback-filter` YAML block.
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct RawFallbackFilter {
     pub geoip: Option<bool>,
@@ -367,7 +367,7 @@ pub struct RawFallbackFilter {
     pub domain: Option<Vec<String>>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct RawProxyGroup {
     pub name: String,
@@ -446,7 +446,7 @@ pub struct RawHealthCheck {
 ///
 /// `interval` is accepted for upstream-config compatibility but is currently
 /// ignored — providers are loaded exactly once at startup.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub struct RawRuleProvider {
     #[serde(rename = "type")]

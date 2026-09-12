@@ -2538,7 +2538,7 @@ fn parse_proxy_group_inner(
                     config
                         .url
                         .clone()
-                        .unwrap_or_else(|| "http://www.gstatic.com/generate_204".to_string()),
+                        .unwrap_or_else(|| "https://www.gstatic.com/generate_204".to_string()),
                     config.expected_status.clone().unwrap_or_default(),
                     selector_store.cloned(),
                 );
@@ -2550,7 +2550,7 @@ fn parse_proxy_group_inner(
                     config
                         .url
                         .clone()
-                        .unwrap_or_else(|| "http://www.gstatic.com/generate_204".to_string()),
+                        .unwrap_or_else(|| "https://www.gstatic.com/generate_204".to_string()),
                     config.expected_status.clone().unwrap_or_default(),
                     selector_store.cloned(),
                 );
