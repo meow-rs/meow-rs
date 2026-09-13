@@ -91,7 +91,7 @@ pub struct AppState {
 
 /// The API server owns one raw/runtime configuration, so all mutation
 /// endpoints share one commit lane. Reads remain independent.
-static CONFIG_MUTATION: Mutex<()> = Mutex::const_new(());
+pub static CONFIG_MUTATION: Mutex<()> = Mutex::const_new(());
 
 impl AppState {
     fn auth_required(&self) -> bool {
@@ -666,7 +666,22 @@ async fn update_configs(
         }
     }
 
-    // Both valid — apply atomically.
+    // Both valid — apply atomically. Enter the shared mutation lane first:
+    // a bare `raw_config.write()` here would race a concurrent PUT
+    // /configs, whose candidate swap would clobber the patched fields
+    // (issue #514).
+    let _mutation = CONFIG_MUTATION.lock().await;
+    // Apply the fallible side first — committing mode before a failed
+    // log-level reload would partially apply the PATCH (issue #514).
+    if let Some(level) = body.log_level.as_deref() {
+        if let Err(e) = crate::log_stream::reload_log_level(level) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"message": e})),
+            )
+                .into_response();
+        }
+    }
     let mut raw = state.raw_config.write();
     if let Some(Ok(parsed_mode)) = mode {
         state.tunnel.set_mode(parsed_mode);
@@ -674,13 +689,6 @@ async fn update_configs(
         info!("Mode changed to {}", parsed_mode);
     }
     if let Some(level) = body.log_level {
-        if let Err(e) = crate::log_stream::reload_log_level(&level) {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"message": e})),
-            )
-                .into_response();
-        }
         raw.log_level = Some(level);
     }
     StatusCode::NO_CONTENT.into_response()
@@ -1803,15 +1811,26 @@ async fn swap_config_and_reconcile_tun(state: &AppState, candidate: RawConfig) {
         return;
     }
     if let Some(snapshot) = snapshot {
-        // off → on
+        // off → on. Defensive: if a handle somehow outlives a raw config
+        // that already says `enable: false`, stop it first — the new
+        // listener must never build a second lwIP core over a live one
+        // (its PREVIOUS_CORE gate hard-fails the spawn after a 10 s
+        // teardown timeout rather than stack two generations).
+        state.tunnel.stop_tun().await;
         match spawn_tun_from_raw(&state.tunnel, &snapshot).await {
             Ok(Some(handle)) => {
                 state.tunnel.set_tun_handle(handle).await;
                 info!("TUN listener started via config reload");
             }
             Ok(None) => {
-                // enable=true but spawn returned no handle — should not
-                // happen for this transition, but treat as success.
+                // Unreachable today — `spawn_tun_from_raw` only yields
+                // `Ok(None)` when `tun.enable` is false and this arm only
+                // runs for off→on. Roll back like the `Err` arm rather
+                // than persist `enable: true` with nothing running.
+                warn!("TUN listener spawn returned no handle on off→on (config rolled back)");
+                if let Some(ref mut tun) = state.raw_config.write().tun {
+                    tun.enable = false;
+                }
             }
             Err(e) => {
                 // TUN failed to start — roll back tun.enable to false so

@@ -112,7 +112,13 @@ pub async fn run_on_startup(
         return;
     }
 
+    // Serialize against config commits and rebuild from the raw committed
+    // *inside* the lane — otherwise a download finishing after a PUT could
+    // revert rules to a set built from the pre-PUT config (issue #514).
+    let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
     let raw = raw_config.read().clone();
+    // Share the tunnel's resolver slot so the rebuilt DIRECT adapter
+    // tracks later `set_resolver` swaps (issue #514).
     let resolver = tunnel.resolver_slot();
     let rebuild = tokio::task::spawn_blocking({
         let cache_dir = cache_dir.clone();
@@ -150,6 +156,10 @@ pub async fn run_on_startup(
 /// mappings change infrequently and skipping the rebuild keeps the
 /// parser-built `CountryIndex` alive without churn. Operators who need to
 /// update GeoIP should replace `Country.mmdb` on disk and restart.
+///
+/// The tunnel is captured weakly (issue #514): an embedder that drops
+/// every `Tunnel` handle stops this loop at the next tick instead of
+/// pinning `TunnelInner` forever.
 pub async fn auto_update_loop(
     geo: GeoDataConfig,
     tunnel: Tunnel,
@@ -159,6 +169,9 @@ pub async fn auto_update_loop(
     let interval = std::time::Duration::from_secs(geo.auto_update_interval as u64 * 3600);
     let mut ticker = tokio::time::interval(interval);
     ticker.tick().await; // skip the immediate first tick
+
+    let weak = tunnel.weak_inner();
+    drop(tunnel);
 
     let asn_target = geo
         .asn_path
@@ -171,6 +184,12 @@ pub async fn auto_update_loop(
 
     loop {
         ticker.tick().await;
+
+        let Some(inner) = weak.upgrade() else {
+            info!("tunnel dropped; stopping geodata auto-update loop");
+            return;
+        };
+        let tunnel = Tunnel::from_inner(inner);
 
         let mut any_updated = false;
 
@@ -202,7 +221,13 @@ pub async fn auto_update_loop(
             continue;
         }
 
+        // Serialize against config commits and rebuild from the raw
+        // committed *inside* the lane — otherwise this rebuild could
+        // revert rules committed by a concurrent PUT (issue #514).
+        let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
         let raw = raw_config.read().clone();
+        // Share the tunnel's resolver slot so the rebuilt DIRECT adapter
+        // tracks later `set_resolver` swaps (issue #514).
         let resolver = tunnel.resolver_slot();
         let rebuild = tokio::task::spawn_blocking({
             let cache_dir = cache_dir.clone();
