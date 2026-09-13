@@ -63,6 +63,7 @@ meow-dns = { workspace = true }
 meow-trie = { workspace = true }
 ipnet = { workspace = true }
 shadowsocks = { workspace = true }
+async-trait = { workspace = true }
 
 [[test]]
 name = "ss_listener_integration"

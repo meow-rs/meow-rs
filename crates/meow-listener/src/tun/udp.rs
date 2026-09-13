@@ -37,6 +37,7 @@ const FLOW_QUEUE: usize = 64;
 /// Queue feeding the single stack-writer task (the netstack write half is
 /// a `Sink` and cannot be cloned into per-flow tasks).
 const REPLY_QUEUE: usize = 512;
+
 /// Sweep dead flow-table entries every this many datagrams.
 const SWEEP_INTERVAL: u32 = 256;
 
@@ -210,21 +211,41 @@ async fn relay_flow(
         proxy.name()
     );
 
-    let conn = with_dial_timeout(proxy.name(), proxy.dial_udp(&metadata))
-        .await
-        .map_err(|e| format!("dial_udp via {}: {e}", proxy.name()))?;
+    let conn: std::sync::Arc<dyn meow_common::ProxyPacketConn> = std::sync::Arc::from(
+        with_dial_timeout(proxy.name(), proxy.dial_udp(&metadata))
+            .await
+            .map_err(|e| format!("dial_udp via {}: {e}", proxy.name()))?,
+    );
 
-    // Single-task pump: select over upstream datagrams (queued by the
-    // reader loop), downstream packets, and the idle deadline. Reply
-    // source addresses are not rewritten: the tun flow is locked to one
-    // (src, dst) tuple, so every reply is delivered as coming from `dst`.
-    // A downstream read cancelled by another branch may drop the current
-    // datagram: the property holds for VlessUdpReader / MuxPacketConn
-    // (which persist progress), but `relay_flow` is generic over
-    // `Box<dyn ProxyPacketConn>` and Direct / Shadowsocks / Trojan UDP
-    // conns do not carry that invariant.  This is acceptable under UDP
-    // delivery semantics.
-    let mut buf = vec![0u8; DATAGRAM_BUF];
+    // Upstream replies are pumped by a dedicated reader task holding one
+    // persistent buffer: reads are never cancelled, so a stream-framed
+    // conn (e.g. Trojan UoT) cannot lose a partially consumed frame to a
+    // dropped mid-flight read (issue #514). Each reply is copied out and
+    // forwarded through `up_rx` so the select loop below sees downstream
+    // traffic for its idle deadline — the same per-datagram `to_vec`
+    // profile the pre-#514 pump had.
+    let (up_tx, mut up_rx) = mpsc::channel::<Vec<u8>>(FLOW_QUEUE);
+    let mut reply_task = tokio::spawn({
+        let conn = std::sync::Arc::clone(&conn);
+        async move {
+            let mut rbuf = vec![0u8; DATAGRAM_BUF];
+            loop {
+                match conn.read_packet(&mut rbuf).await {
+                    Ok((n, _from)) => {
+                        if up_tx.send(rbuf[..n].to_vec()).await.is_err() {
+                            return Ok(()); // flow gone
+                        }
+                    }
+                    Err(e) => return Err(format!("downstream read: {e}")),
+                }
+            }
+        }
+    });
+
+    // Select over client datagrams (queued by the reader loop), upstream
+    // replies, and the idle deadline. Reply source addresses are not
+    // rewritten: the tun flow is locked to one (src, dst) tuple, so every
+    // reply is delivered as coming from `dst`.
     let idle = sleep(udp_timeout);
     tokio::pin!(idle);
     let result = loop {
@@ -239,18 +260,25 @@ async fn relay_flow(
                 }
                 None => break Ok(()), // reader loop gone — listener shutdown
             },
-            received = conn.read_packet(&mut buf) => match received {
-                Ok((n, _from)) => {
-                    if reply_tx.send((buf[..n].to_vec(), dst, src)).await.is_err() {
+            received = up_rx.recv() => match received {
+                Some(data) => {
+                    if reply_tx.send((data, dst, src)).await.is_err() {
                         break Ok(()); // stack writer gone — listener shutdown
                     }
                     idle.as_mut().reset(Instant::now() + udp_timeout);
                 }
-                Err(e) => break Err(format!("downstream read: {e}")),
+                // The reader task exited — it owns the only `up_tx`. The
+                // borrow-await keeps the handle usable for the abort below.
+                None => break Err(match (&mut reply_task).await {
+                    Ok(Err(e)) => e,
+                    Ok(Ok(())) => "downstream reader exited".into(),
+                    Err(e) => format!("downstream reader task: {e}"),
+                }),
             },
         }
     };
 
+    reply_task.abort();
     let _ = conn.close();
     result
 }

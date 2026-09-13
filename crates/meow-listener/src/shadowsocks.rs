@@ -357,6 +357,11 @@ const UDP_NAT_SWEEP: Duration = Duration::from_secs(30);
 struct UdpFlow {
     conn: Arc<dyn ProxyPacketConn>,
     last_activity_ms: Arc<AtomicU>,
+    /// Set by the reply task when it exits (upstream read error or
+    /// client-relay write failure) — the fast path must evict the flow so
+    /// the next datagram redials instead of writing into a conn that can
+    /// never answer (issue #514, same class as the SOCKS5-UDP fix).
+    dead: Arc<std::sync::atomic::AtomicBool>,
     /// Reply task (server→client); aborted when the flow is evicted.
     reply_task: AbortHandle,
 }
@@ -427,6 +432,11 @@ async fn run_udp_relay<S>(
             _ = sweeper.tick() => {
                 let now = monotonic_ms() as Uint;
                 flows.retain(|_, f| {
+                    // Dead reply task → the conn can never answer; evict so
+                    // the next datagram redials (issue #514).
+                    if f.dead.load(std::sync::atomic::Ordering::Relaxed) {
+                        return false;
+                    }
                     let last = f.last_activity_ms.load(std::sync::atomic::Ordering::Relaxed);
                     #[allow(
                         clippy::useless_conversion,
@@ -502,15 +512,29 @@ where
     let dst_addr = SocketAddr::new(dst_ip, metadata.dst_port);
     let key = (peer, dst_addr);
 
-    // Fast path: existing flow.
+    // Fast path: existing flow. A dead reply task means the conn can never
+    // answer — evict and fall through to a fresh dial (issue #514).
     if let Some(flow) = flows.get(&key) {
-        flow.conn
-            .write_packet(payload, &dst_addr)
-            .await
-            .map_err(|e| format!("udp write {dst_addr}: {e}"))?;
-        flow.last_activity_ms
-            .store(monotonic_ms() as Uint, std::sync::atomic::Ordering::Relaxed);
-        return Ok(true);
+        if flow.dead.load(std::sync::atomic::Ordering::Relaxed) {
+            flows.remove(&key);
+        } else {
+            match flow.conn.write_packet(payload, &dst_addr).await {
+                Ok(_n) => {
+                    flow.last_activity_ms
+                        .store(monotonic_ms() as Uint, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(true);
+                }
+                Err(e) => {
+                    // A failed write leaves the flow half-dead — the reply
+                    // task's read may still block indefinitely, so every
+                    // later datagram on this key would keep erroring. Evict
+                    // now so the next packet redials (mirrors the SOCKS5
+                    // path, issue #514 review).
+                    flows.remove(&key);
+                    return Err(format!("udp write {dst_addr}: {e}"));
+                }
+            }
+        }
     }
 
     // Flow-table cap: a new flow costs a 64 KiB reply buffer, a task, and an
@@ -538,10 +562,12 @@ where
         .map_err(|e| format!("udp initial write {dst_addr}: {e}"))?;
 
     let last_activity_ms = Arc::new(AtomicU::new(monotonic_ms() as Uint));
+    let dead = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let reply_task = {
         let sock = Arc::clone(sock);
         let conn = Arc::clone(&conn);
         let last_activity_ms = Arc::clone(&last_activity_ms);
+        let dead = Arc::clone(&dead);
         // Echo back the original target Address (domain or IP) so the SS
         // client can correlate replies by the same address type it sent.
         let reply_addr = target.clone();
@@ -554,6 +580,7 @@ where
                 last_activity_ms
                     .store(monotonic_ms() as Uint, std::sync::atomic::Ordering::Relaxed);
             }
+            dead.store(true, std::sync::atomic::Ordering::Relaxed);
         })
         .abort_handle()
     };
@@ -563,6 +590,7 @@ where
         UdpFlow {
             conn,
             last_activity_ms,
+            dead,
             reply_task,
         },
     );

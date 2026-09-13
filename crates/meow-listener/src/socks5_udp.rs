@@ -43,6 +43,10 @@ const NAT_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 struct Session {
     conn: Arc<dyn ProxyPacketConn>,
     last_activity_ms: Arc<AtomicU>,
+    /// Set by the reply task when it exits: the session can no longer
+    /// deliver server→client traffic, so it is one-way and must be re-dialed
+    /// rather than kept (issue #514).
+    dead: Arc<std::sync::atomic::AtomicBool>,
     /// Reply task (server→client); aborted when the session is dropped.
     reply_task: tokio::task::AbortHandle,
 }
@@ -130,6 +134,11 @@ pub async fn handle_udp_associate(
             _ = sweeper.tick() => {
                 let idle_ms = meow_tunnel::udp::DEFAULT_UDP_IDLE.as_millis() as u64;
                 nat.retain(|_, session| {
+                    // A dead session (reply task exited) is one-way — evict
+                    // promptly instead of waiting for its next datagram.
+                    if session.dead.load(Ordering::Relaxed) {
+                        return false;
+                    }
                     let now = monotonic_ms() as meow_common::atomic::Uint;
                     let last = session.last_activity_ms.load(Ordering::Relaxed);
                     #[allow(
@@ -195,13 +204,26 @@ async fn handle_client_datagram(
     let dst_addr = SocketAddr::new(dst_ip, metadata.dst_port);
     let payload = &datagram[data_off..];
 
-    // Fast path: existing session for this destination.
+    // Fast path: existing *live* session for this destination. A session
+    // whose reply task exited is one-way — writes would go out on a conn
+    // that can never deliver a reply, so evict it and re-dial below
+    // (issue #514). The check→write window is inherent: if the reply task
+    // dies in between, this datagram is written into a conn that can't
+    // answer — bounded to one packet, the next datagram redials (UDP
+    // semantics tolerate the loss).
+    if nat
+        .get(&dst_addr)
+        .is_some_and(|s| s.dead.load(Ordering::Relaxed))
+    {
+        nat.remove(&dst_addr);
+    }
     if let Some(session) = nat.get(&dst_addr) {
-        session
-            .conn
-            .write_packet(payload, &dst_addr)
-            .await
-            .map_err(|e| format!("udp write {dst_addr}: {e}"))?;
+        // A write error also means this conn is unusable — remove so the
+        // next datagram redials rather than retrying a dead transport.
+        if let Err(e) = session.conn.write_packet(payload, &dst_addr).await {
+            nat.remove(&dst_addr);
+            return Err(format!("udp write {dst_addr}: {e}"));
+        }
         session.last_activity_ms.store(
             monotonic_ms() as meow_common::atomic::Uint,
             Ordering::Relaxed,
@@ -230,10 +252,12 @@ async fn handle_client_datagram(
     // Reply task: server→client. Wraps each datagram in the SOCKS5 UDP header
     // and sends it back to the client's UDP source address.
     let last_activity_ms = Arc::new(AtomicU::new(monotonic_ms() as meow_common::atomic::Uint));
+    let dead = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let reply_task = {
         let relay = Arc::clone(relay);
         let conn = Arc::clone(&conn);
         let last_activity_ms = Arc::clone(&last_activity_ms);
+        let dead = Arc::clone(&dead);
         tokio::spawn(async move {
             let mut rbuf = vec![0u8; 65535];
             while let Ok((m, src)) = conn.read_packet(&mut rbuf).await {
@@ -248,6 +272,11 @@ async fn handle_client_datagram(
                     Ordering::Relaxed,
                 );
             }
+            // The upstream conn errored or closed: mark the session dead so
+            // the next datagram to `dst_addr` re-dials instead of writing
+            // into a conn that can never answer (issue #514).
+            dead.store(true, Ordering::Relaxed);
+            debug!("SOCKS5 UDP session to {dst_addr}: reply task exited; next datagram re-dials");
         })
         .abort_handle()
     };
@@ -257,6 +286,7 @@ async fn handle_client_datagram(
         Session {
             conn,
             last_activity_ms,
+            dead,
             reply_task,
         },
     );
@@ -352,6 +382,153 @@ fn encode_udp_header(out: &mut SmallVec<[u8; 1500]>, addr: &SocketAddr) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Mock `Proxy` counting `dial_udp` calls; each dial yields a conn whose
+    /// reads fail immediately so its reply task exits right away.
+    struct FlakyUdpProxy {
+        dials: std::sync::atomic::AtomicUsize,
+        health: meow_common::ProxyHealth,
+    }
+
+    struct DeadReadConn;
+
+    #[async_trait::async_trait]
+    impl meow_common::ProxyPacketConn for DeadReadConn {
+        async fn read_packet(&self, _buf: &mut [u8]) -> meow_common::Result<(usize, SocketAddr)> {
+            Err(meow_common::MeowError::Proxy("upstream closed".into()))
+        }
+        async fn write_packet(&self, buf: &[u8], _addr: &SocketAddr) -> meow_common::Result<usize> {
+            Ok(buf.len())
+        }
+        fn local_addr(&self) -> meow_common::Result<SocketAddr> {
+            Ok("127.0.0.1:0".parse().unwrap())
+        }
+        fn close(&self) -> meow_common::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl meow_common::ProxyAdapter for FlakyUdpProxy {
+        fn name(&self) -> &str {
+            "flaky-udp"
+        }
+        fn adapter_type(&self) -> meow_common::AdapterType {
+            meow_common::AdapterType::Direct
+        }
+        fn addr(&self) -> &str {
+            ""
+        }
+        fn support_udp(&self) -> bool {
+            true
+        }
+        async fn dial_tcp(
+            &self,
+            _metadata: &Metadata,
+        ) -> meow_common::Result<Box<dyn meow_common::ProxyConn>> {
+            Err(meow_common::MeowError::NotSupported("no tcp".into()))
+        }
+        async fn dial_udp(
+            &self,
+            _metadata: &Metadata,
+        ) -> meow_common::Result<Box<dyn ProxyPacketConn>> {
+            self.dials.fetch_add(1, Ordering::Relaxed);
+            Ok(Box::new(DeadReadConn))
+        }
+        fn health(&self) -> &meow_common::ProxyHealth {
+            &self.health
+        }
+    }
+
+    impl meow_common::Proxy for FlakyUdpProxy {
+        fn alive(&self) -> bool {
+            true
+        }
+        fn alive_for_url(&self, _url: &str) -> bool {
+            true
+        }
+        fn last_delay(&self) -> u16 {
+            0
+        }
+        fn last_delay_for_url(&self, _url: &str) -> u16 {
+            0
+        }
+        fn delay_history(&self) -> Vec<meow_common::DelayHistory> {
+            Vec::new()
+        }
+    }
+
+    /// Issue #514: when the reply task dies (upstream read failure) the
+    /// session stays in the NAT map today, so further datagrams write into a
+    /// conn that can never answer. It must be evicted and re-dialed.
+    #[tokio::test]
+    async fn dead_reply_task_session_is_evicted_and_redialed() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let proxy = Arc::new(FlakyUdpProxy {
+                dials: std::sync::atomic::AtomicUsize::new(0),
+                health: meow_common::ProxyHealth::new(),
+            });
+            let resolver = std::sync::Arc::new(meow_dns::Resolver::new(
+                vec![],
+                vec![],
+                meow_common::DnsMode::Normal,
+                meow_trie::DomainTrie::new(),
+                false,
+                true,
+            ));
+            let tunnel = meow_tunnel::Tunnel::new(resolver);
+            let mut proxies = meow_config::rebuild_from_raw(&Default::default())
+                .unwrap()
+                .0;
+            proxies.insert(
+                "flaky-udp".into(),
+                Arc::clone(&proxy) as Arc<dyn meow_common::Proxy>,
+            );
+            tunnel.update_proxies(proxies);
+            tunnel.update_rules(vec![Box::new(meow_rules::final_rule::FinalRule::new(
+                "flaky-udp",
+            ))]);
+
+            let relay = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let mut nat: HashMap<SocketAddr, Session> = HashMap::new();
+            let client: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+            let inbound = Metadata::default();
+            let dst: SocketAddr = "1.2.3.4:443".parse().unwrap();
+            let mut packet: SmallVec<[u8; 1500]> = SmallVec::new();
+            encode_udp_header(&mut packet, &dst);
+            packet.extend_from_slice(b"payload");
+
+            handle_client_datagram(&tunnel, &relay, &mut nat, &packet, client, &inbound)
+                .await
+                .unwrap();
+            assert_eq!(proxy.dials.load(Ordering::Relaxed), 1);
+            assert!(nat.contains_key(&dst));
+
+            // The reply task observes the read error and marks the session.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            while !nat.get(&dst).unwrap().dead.load(Ordering::Relaxed) {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "dead flag never set"
+                );
+                tokio::task::yield_now().await;
+            }
+
+            // The next datagram to the same destination must re-dial rather
+            // than write into the dead conn.
+            handle_client_datagram(&tunnel, &relay, &mut nat, &packet, client, &inbound)
+                .await
+                .unwrap();
+            assert_eq!(
+                proxy.dials.load(Ordering::Relaxed),
+                2,
+                "datagram to a dead session must re-dial"
+            );
+            assert!(nat.contains_key(&dst));
+        })
+        .await
+        .expect("session re-dial timed out");
+    }
 
     #[tokio::test]
     async fn udp_port_53_obeys_reject_rule() {

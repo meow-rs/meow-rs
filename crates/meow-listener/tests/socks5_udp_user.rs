@@ -115,10 +115,22 @@ async fn check_policy(authenticate: bool) {
     } else {
         ("MATCH", "DIRECT")
     };
-    assert_eq!(
-        tunnel.statistics().rule_match.snapshot(),
-        vec![(expected, 2)]
-    );
+    let snapshot = tunnel.statistics().rule_match.snapshot();
+    if authenticate {
+        // Issue #514: REJECT's packet conn fails reads immediately, so its
+        // reply task marks the session dead and the next datagram to the
+        // same destination is evicted, re-matched against the rules, and
+        // re-dialed — each rejected datagram therefore records a match
+        // (2..=4 depending on when the reply tasks were scheduled), instead
+        // of the session pinning the association forever.
+        assert!(
+            snapshot.iter().all(|(k, _)| *k == expected)
+                && snapshot.iter().map(|(_, c)| c).sum::<u64>() >= 2,
+            "unexpected rule-match snapshot: {snapshot:?}"
+        );
+    } else {
+        assert_eq!(snapshot, vec![(expected, 2)]);
+    }
 }
 
 #[tokio::test]
