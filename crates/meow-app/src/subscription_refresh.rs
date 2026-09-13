@@ -8,7 +8,7 @@ use meow_config::raw::RawConfig;
 use meow_tunnel::Tunnel;
 use parking_lot::RwLock;
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// Poll subscriptions in `raw_config` every 60s; for each subscription whose
 /// `interval` has elapsed (or which has never been fetched), download the
@@ -18,7 +18,15 @@ use tracing::{error, info};
 /// The loop captures the tunnel weakly (issue #514): an embedder that drops
 /// every `Tunnel` handle stops this loop instead of leaving it mutating a
 /// dead tunnel's route table forever.
-pub async fn run_loop(raw_config: Arc<RwLock<RawConfig>>, tunnel: Tunnel, config_path: String) {
+pub async fn run_loop(
+    raw_config: Arc<RwLock<RawConfig>>,
+    tunnel: Tunnel,
+    config_path: String,
+    dns_server: Arc<RwLock<Option<meow_api::routes::DnsServerHandle>>>,
+    rule_providers: Arc<
+        RwLock<std::collections::HashMap<String, Arc<meow_config::rule_provider::RuleProvider>>>,
+    >,
+) {
     // Same provider-cache directory `load_config` used at startup — trusted
     // rebuilds of the daemon's own config must keep resolving relative
     // rule-provider paths the same way, not hard-fail with `cache_dir: None`
@@ -107,11 +115,38 @@ pub async fn run_loop(raw_config: Arc<RwLock<RawConfig>>, tunnel: Tunnel, config
 
                     match rebuild {
                         Ok(Ok((new_proxies, new_rules))) => {
+                            // A swapped proxy set changes the objects a
+                            // `#name` nameserver or `rule-set:` policy key
+                            // references — reconcile BEFORE the raw write so
+                            // the old-vs-candidate comparison still sees the
+                            // previous raw (issue #514 review).
+                            let dns = meow_api::routes::reconcile_dns_config(
+                                &raw_config,
+                                &candidate,
+                                &config_path,
+                                &new_proxies,
+                                &rule_providers,
+                            )
+                            .await;
+
                             tunnel.update_routing(new_proxies, new_rules);
                             // Commit raw + routing together inside the lane:
                             // the on-disk/dashboard view and the running
                             // router can no longer diverge on failure.
                             *raw_config.write() = candidate.clone();
+                            let dns_ok = match dns {
+                                Ok(Some(dns)) => {
+                                    meow_api::routes::publish_dns(&tunnel, &dns_server, dns).await;
+                                    true
+                                }
+                                Ok(None) => true,
+                                Err((_status, msg)) => {
+                                    warn!(
+                                        "subscription '{name}' committed; dns republish skipped: {msg}"
+                                    );
+                                    false
+                                }
+                            };
                             // Health-check tasks follow the new group set
                             // (issue #514).
                             tunnel.reconcile_health_checks(
@@ -125,8 +160,23 @@ pub async fn run_loop(raw_config: Arc<RwLock<RawConfig>>, tunnel: Tunnel, config
                             // does not serialize concurrent config commits
                             // (issue #514 review).
                             drop(_lane);
-                            let _ =
-                                meow_config::save_raw_config_async(&config_path, &candidate).await;
+                            if dns_ok {
+                                let _ =
+                                    meow_config::save_raw_config_async(&config_path, &candidate)
+                                        .await;
+                            } else {
+                                // The committed dns section failed to
+                                // build — persisting it would leave a file
+                                // the next cold start cannot parse
+                                // (`parse_dns` is a hard error in
+                                // build_config). Keep the runtime commit;
+                                // skip the save (issue #514 review).
+                                warn!(
+                                    "subscription '{name}': dns rebuild failed; \
+                                     NOT persisting — the file would fail to load \
+                                     on next start"
+                                );
+                            }
                         }
                         Ok(Err(e)) => {
                             error!("Failed to rebuild after refreshing '{}': {}", name, e);

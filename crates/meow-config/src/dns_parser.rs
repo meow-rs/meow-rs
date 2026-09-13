@@ -317,6 +317,25 @@ fn parse_nameserver_urls(servers: &[String]) -> Result<Vec<NameServerUrl>, anyho
     parse_nameserver_entries(servers).map(|v| v.into_iter().map(|e| e.url).collect())
 }
 
+/// `true` when the raw `dns.nameserver-policy` section contains at least
+/// one `rule-set:` key (matching the case-insensitive + trimmed expansion
+/// the policy builder applies). Used by reload paths to decide
+/// whether the resolver build must load the candidate's rule-providers
+/// rather than a possibly-stale live registry (issue #514).
+pub fn dns_needs_rule_providers(raw: &crate::raw::RawConfig) -> bool {
+    raw.dns
+        .as_ref()
+        .and_then(|d| d.nameserver_policy.as_ref())
+        .is_some_and(|m| {
+            // Expand per segment like `build_nameserver_policy` — a mixed
+            // key (`"+.corp.example,rule-set:x"`) puts the prefix on a
+            // non-leading segment the whole-key check would miss.
+            m.keys()
+                .flat_map(|k| expand_policy_keys(k))
+                .any(|ek| ek.to_ascii_lowercase().starts_with("rule-set:"))
+        })
+}
+
 /// Build a `NameserverPolicy` from the raw YAML map.
 ///
 /// `geosite:` patterns are compiled into matchers when a geosite DB is loaded.
@@ -445,7 +464,7 @@ enum PolicyPattern {
     Matcher(NameserverPolicyMatcher),
 }
 
-fn expand_policy_keys(key: &str) -> Vec<String> {
+pub(crate) fn expand_policy_keys(key: &str) -> Vec<String> {
     let key = key.trim();
     let lower = key.to_ascii_lowercase();
     if lower.starts_with("geosite:") {

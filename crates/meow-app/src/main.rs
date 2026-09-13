@@ -817,13 +817,22 @@ async fn run(
         config.raw.proxy_groups.as_deref().unwrap_or(&[]),
     ));
 
-    // Start DNS server if configured
+    // Start DNS server if configured. The handle is shared with the API
+    // layer so `PUT /configs` can hot-swap the resolver or rebind on a
+    // `dns.listen` change (issue #514).
+    let dns_server_handle = Arc::new(parking_lot::RwLock::new(None));
     if let Some(listen_addr) = config.dns.listen_addr {
         let dns_server = DnsServer::new(Arc::clone(&config.dns.resolver), listen_addr);
-        tokio::spawn(async move {
+        let slot = dns_server.resolver_slot();
+        let task = tokio::spawn(async move {
             if let Err(e) = dns_server.run().await {
                 error!("DNS server error: {}", e);
             }
+        });
+        *dns_server_handle.write() = Some(meow_api::routes::DnsServerHandle {
+            listen: listen_addr,
+            task,
+            resolver_slot: slot,
         });
     }
 
@@ -839,6 +848,8 @@ async fn run(
             .collect();
         for provider in providers_snap {
             let interval_secs = provider.interval;
+            let provider_name = provider.name.clone();
+            let registry = Arc::clone(&rule_providers);
             tokio::spawn(async move {
                 let ctx = meow_rules::ParserContext::empty();
                 let mut ticker =
@@ -846,6 +857,13 @@ async fn run(
                 ticker.tick().await; // skip the immediate first tick
                 loop {
                     ticker.tick().await;
+                    // Resolve by name each tick — config reloads swap the
+                    // provider objects under the registry, and refreshing a
+                    // detached startup-era Arc would never reach the live
+                    // matchers (issue #514 review).
+                    let Some(provider) = registry.read().get(&provider_name).cloned() else {
+                        continue;
+                    };
                     if let Err(e) = provider.refresh(&ctx).await {
                         error!(provider = %provider.name, "background refresh failed: {:#}", e);
                     }
@@ -859,8 +877,17 @@ async fn run(
         let raw_config = Arc::clone(&raw_config);
         let tunnel = tunnel.clone();
         let config_path = config_path.clone();
+        let dns_server = Arc::clone(&dns_server_handle);
+        let rule_providers = Arc::clone(&rule_providers);
         tokio::spawn(async move {
-            meow_app::subscription_refresh::run_loop(raw_config, tunnel, config_path).await;
+            meow_app::subscription_refresh::run_loop(
+                raw_config,
+                tunnel,
+                config_path,
+                dns_server,
+                rule_providers,
+            )
+            .await;
         });
     }
 
@@ -1074,6 +1101,7 @@ async fn run(
             Arc::clone(&rule_providers),
             named_listeners.clone(),
             config.api.external_ui.clone(),
+            Arc::clone(&dns_server_handle),
         );
         tokio::spawn(async move {
             if let Err(e) = api_server.run().await {

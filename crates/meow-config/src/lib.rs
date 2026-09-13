@@ -553,6 +553,64 @@ pub fn rebuild_from_raw_with_cache_dir(
     rebuild_from_raw_impl(raw, cache_dir, resolver, &HashMap::new(), None, None, None)
 }
 
+/// Parse a raw config's `dns:` section into a runnable [`DnsConfig`] with
+/// the same geodata context startup uses — `raw.geodata` path overrides,
+/// MMDB/geosite loads keyed on the config's own geo references (incl.
+/// `nameserver-policy` / `fallback-filter` entries, which the context
+/// builder scans). Used by `PUT /configs` DNS hot reload (issue #514);
+/// `proxy_registry` should be the freshly rebuilt map so
+/// `proxy-server-nameserver` circular-detection sees current names.
+///
+/// `rule-set:` nameserver-policy keys resolve against the CANDIDATE's own
+/// `rule-providers:` declarations — loaded here on demand — never a live
+/// registry snapshot: a PUT that adds a provider and references it in the
+/// same payload must succeed, and a PUT removing one must not let the old
+/// matcher zombie-bind (issue #514 review).
+///
+/// When providers were loaded, `registry` (if given) is swapped to the
+/// freshly loaded set on success — the policy matchers capture the same
+/// `Arc<RuleProvider>` objects, so `PUT /providers/rules/{name}` and
+/// name-resolved refresh loops keep reaching the live generation instead
+/// of orphaned startup-era objects (issue #514 review).
+pub async fn parse_dns_from_raw(
+    raw: &raw::RawConfig,
+    cache_dir: Option<&Path>,
+    proxy_registry: &HashMap<SmolStr, Arc<dyn Proxy>>,
+    registry: Option<&parking_lot::RwLock<HashMap<String, Arc<rule_provider::RuleProvider>>>>,
+) -> Result<DnsConfig, anyhow::Error> {
+    let geo = geodata::parse_geodata(raw.geodata.as_ref())?;
+    let payloads = rule_provider::PrefetchedPayloads::default();
+    let ctx = build_parser_context_from_raw(raw, &payloads)?;
+    let rule_providers = if dns_parser::dns_needs_rule_providers(raw) {
+        Some(
+            load_rule_providers_async(
+                raw.rule_providers.clone().unwrap_or_default(),
+                cache_dir.map(Path::to_path_buf),
+                ctx.clone(),
+                internal_http::first_named_proxy(raw.proxies.as_deref(), proxy_registry),
+                proxy_registry.clone(),
+                Arc::new(payloads),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let dns = dns_parser::parse_dns(
+        raw,
+        geo.mmdb_path.as_deref(),
+        cache_dir,
+        proxy_registry,
+        ctx.geosite,
+        rule_providers.as_ref().unwrap_or(&HashMap::new()),
+    )
+    .await?;
+    if let (Some(registry), Some(loaded)) = (registry, rule_providers) {
+        *registry.write() = loaded;
+    }
+    Ok(dns)
+}
+
 /// Apply per-outbound `dialer-proxy` in place (issue #210).
 ///
 /// For every proxy that declares `dialer-proxy: <name>`, its registry entry is
@@ -1654,9 +1712,13 @@ fn dns_policy_uses_geosite(raw: &raw::RawConfig) -> bool {
         .as_ref()
         .and_then(|dns| dns.nameserver_policy.as_ref())
         .is_some_and(|policy| {
+            // Expand per segment like the policy builder — a mixed key
+            // (`"+.a,geosite:cn"`) puts the prefix on a non-leading segment
+            // the whole-key check would miss (issue #514 review).
             policy
                 .keys()
-                .any(|key| key.trim().to_ascii_lowercase().starts_with("geosite:"))
+                .flat_map(|key| dns_parser::expand_policy_keys(key))
+                .any(|ek| ek.to_ascii_lowercase().starts_with("geosite:"))
         })
 }
 
@@ -1671,21 +1733,19 @@ fn collect_dns_policy_geosite_categories(
     else {
         return out;
     };
-    for key in policy.keys() {
-        let trimmed = key.trim();
-        if !trimmed.to_ascii_lowercase().starts_with("geosite:") {
+    for expanded in policy
+        .keys()
+        .flat_map(|key| dns_parser::expand_policy_keys(key))
+    {
+        let lower = expanded.to_ascii_lowercase();
+        let Some(rest) = lower.strip_prefix("geosite:") else {
             continue;
-        }
-        for category in trimmed["geosite:".len()..].split(',') {
-            let category = category
-                .trim()
-                .split('@')
-                .next()
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            if !category.is_empty() {
-                out.insert(category);
-            }
+        };
+        // `expand_policy_keys` already produced one `geosite:<cat>` per
+        // segment; the `@attr` suffix still needs stripping.
+        let category = rest.split('@').next().unwrap_or("").trim();
+        if !category.is_empty() {
+            out.insert(category.to_string());
         }
     }
     out

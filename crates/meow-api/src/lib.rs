@@ -71,6 +71,9 @@ pub struct ApiServer {
     rule_providers: Arc<RwLock<HashMap<String, Arc<RuleProvider>>>>,
     listeners: Vec<NamedListener>,
     external_ui: Option<PathBuf>,
+    /// Shared handle the embedder fills once the standalone DNS server is
+    /// spawned; `PUT /configs` rebinds or hot-swaps it (issue #514).
+    dns_server: Arc<RwLock<Option<routes::DnsServerHandle>>>,
 }
 
 impl ApiServer {
@@ -86,6 +89,7 @@ impl ApiServer {
         rule_providers: Arc<RwLock<HashMap<String, Arc<RuleProvider>>>>,
         listeners: Vec<NamedListener>,
         external_ui: Option<PathBuf>,
+        dns_server: Arc<RwLock<Option<routes::DnsServerHandle>>>,
     ) -> Self {
         Self {
             tunnel,
@@ -98,6 +102,7 @@ impl ApiServer {
             rule_providers,
             listeners,
             external_ui,
+            dns_server,
         }
     }
 
@@ -114,6 +119,7 @@ impl ApiServer {
             external_ui: self.resolve_external_ui(),
             config_mutation_lock: tokio::sync::Mutex::new(()),
             traffic_feed: Default::default(),
+            dns_server: Arc::clone(&self.dns_server),
         });
 
         let app = routes::create_router(state);
