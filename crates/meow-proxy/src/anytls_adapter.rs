@@ -129,8 +129,11 @@ impl ProxyAdapter for AnytlsAdapter {
     ///
     /// Mirrors mihomo `adapter/outbound/anytls.go: ListenPacketContext`: a
     /// plain proxy stream to the magic destination, then sing-box's `uot`
-    /// framing on top of it. The uot request is written lazily together with
-    /// the first datagram, exactly as upstream's `uot.NewLazyConn` does.
+    /// framing on top of it. The uot request is flushed on the open path,
+    /// ahead of the SYNACK wait — sing-box's inbound reads the request before
+    /// it reports handshake success, so sending it lazily with the first
+    /// datagram (upstream's `uot.NewLazyConn` shape) deadlocks against
+    /// sing-box (issue #535).
     async fn dial_udp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
         if !self.udp {
             return Err(MeowError::NotSupported(
@@ -139,14 +142,13 @@ impl ProxyAdapter for AnytlsAdapter {
         }
         let (stream, session) = self
             .client
-            .create_proxy_stream((UDP_OVER_TCP_MAGIC_ADDR.to_string(), 0))
+            .create_proxy_stream_with_payload(
+                (UDP_OVER_TCP_MAGIC_ADDR.to_string(), 0),
+                Some(Bytes::from(encode_uot_request(metadata))),
+            )
             .await
             .map_err(|e| MeowError::Proxy(format!("anytls udp dial: {e}")))?;
-        Ok(Box::new(AnytlsPacketConn::new(
-            stream,
-            session,
-            encode_uot_request(metadata),
-        )))
+        Ok(Box::new(AnytlsPacketConn::new(stream, session)))
     }
 
     fn health(&self) -> &ProxyHealth {
@@ -443,23 +445,20 @@ async fn read_uot_addr(reader: &mut StreamReader) -> Result<SocketAddr> {
 ///
 /// Each datagram becomes exactly one anytls data frame, so the framing the
 /// server reassembles never interleaves with another task's packet. Reads
-/// borrow the stream's own reader mutex; writes are serialized by the
-/// `pending_request` mutex, which doubles as the lazy-request slot.
+/// borrow the stream's own reader mutex. The uot request is already on the
+/// wire — `dial_udp` sends it on the open path (issue #535) — so writes are
+/// plain per-datagram frames.
 struct AnytlsPacketConn {
     stream: Arc<AnytlsStream>,
     // See `AnytlsConn::_session`.
     _session: Arc<Session>,
-    /// uot request, sent coalesced with the first datagram (upstream
-    /// `uot.NewLazyConn`); `None` once it has gone out.
-    pending_request: tokio::sync::Mutex<Option<Vec<u8>>>,
 }
 
 impl AnytlsPacketConn {
-    fn new(stream: Arc<AnytlsStream>, session: Arc<Session>, request: Vec<u8>) -> Self {
+    fn new(stream: Arc<AnytlsStream>, session: Arc<Session>) -> Self {
         Self {
             stream,
             _session: session,
-            pending_request: tokio::sync::Mutex::new(Some(request)),
         }
     }
 
@@ -502,13 +501,7 @@ impl ProxyPacketConn for AnytlsPacketConn {
     }
 
     async fn write_packet(&self, buf: &[u8], addr: &SocketAddr) -> Result<usize> {
-        let mut pending = self.pending_request.lock().await;
-
-        let request_len = pending.as_ref().map_or(0, Vec::len);
-        let mut frame = Vec::with_capacity(request_len + 21 + buf.len());
-        if let Some(request) = pending.as_ref() {
-            frame.extend_from_slice(request);
-        }
+        let mut frame = Vec::with_capacity(21 + buf.len());
         encode_uot_addr(&mut frame, addr);
         let Ok(length) = u16::try_from(buf.len()) else {
             return Err(MeowError::Proxy(format!(
@@ -532,7 +525,6 @@ impl ProxyPacketConn for AnytlsPacketConn {
             .send_data(Bytes::from(frame))
             .await
             .map_err(|_| MeowError::Proxy("anytls udp write: session writer closed".to_string()))?;
-        *pending = None;
         Ok(buf.len())
     }
 
@@ -776,20 +768,28 @@ mod tests {
         let (stream, _) = session.open_stream().await.unwrap();
         let id = stream.id();
         assert_eq!(wire_frame(&mut peer).await.0, Command::Syn);
-        let conn = AnytlsPacketConn::new(stream, Arc::clone(&session), vec![0xaa]);
+        let conn = AnytlsPacketConn::new(stream, Arc::clone(&session));
         let destination: SocketAddr = "192.0.2.2:53".parse().unwrap();
 
         assert_eq!(conn.write_packet(b"udp", &destination).await.unwrap(), 3);
         drop(conn);
         let (cmd, stream_id, data) = wire_frame(&mut peer).await;
         assert_eq!((cmd, stream_id), (Command::Push, id));
-        assert_eq!(data[0], 0xaa, "the lazy UoT request must be coalesced");
+        // One datagram is one frame: uot addr + u16 length + payload, with no
+        // request prefix — in production the request was already flushed by
+        // `create_proxy_stream_with_payload` before the SYNACK wait
+        // (issue #535); this harness builds the conn directly so no request
+        // exists on the wire here at all.
+        assert_eq!(
+            data,
+            [UOT_ATYP_IPV4, 192, 0, 2, 2, 0, 53, 0, 3, b'u', b'd', b'p']
+        );
         assert_eq!(wire_frame(&mut peer).await, (Command::Fin, id, vec![]));
         session.close().await.unwrap();
     }
 
     #[tokio::test]
-    async fn udp_cancelled_admission_preserves_lazy_request_and_close_order() {
+    async fn udp_cancelled_admission_preserves_close_order() {
         let (session, mut peer) = test_session().await;
         let (stream, _) = session.open_stream().await.unwrap();
         let id = stream.id();
@@ -798,12 +798,11 @@ mod tests {
         for _ in 0..64 {
             stream.send_data(Bytes::from(vec![42; 512])).await.unwrap();
         }
-        let conn = AnytlsPacketConn::new(stream, Arc::clone(&session), vec![0xaa]);
+        let conn = AnytlsPacketConn::new(stream, Arc::clone(&session));
         let destination: SocketAddr = "192.0.2.2:53".parse().unwrap();
         let mut write = Box::pin(conn.write_packet(b"cancelled", &destination));
         assert!(futures::poll!(&mut write).is_pending());
         drop(write);
-        assert_eq!(*conn.pending_request.try_lock().unwrap(), Some(vec![0xaa]));
 
         let mut write = Box::pin(conn.write_packet(b"closed", &destination));
         assert!(futures::poll!(&mut write).is_pending());

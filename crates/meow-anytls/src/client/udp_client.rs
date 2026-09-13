@@ -38,36 +38,22 @@ impl Client {
             target_addr
         );
 
-        // Step 1: Create a stream to the magic address
+        // Step 1: Create a stream to the magic address, flushing the initial
+        // request (isConnect + target address) before the SYNACK wait — a
+        // sing-box inbound reads the request before it SYNACKs, so sending it
+        // after the stream is returned deadlocks (meow-rs issue #535).
+        let initial_request = encode_initial_request(target_addr)?;
         let magic_destination = (UDP_OVER_TCP_MAGIC_ADDR.to_string(), 0);
-        let (stream, _session) = self.create_proxy_stream(magic_destination).await?;
+        let (stream, _session) = self
+            .create_proxy_stream_with_payload(magic_destination, Some(initial_request))
+            .await?;
 
         tracing::debug!(
             "[UDP Client] Created stream {} for UDP over TCP",
             stream.id()
         );
 
-        // Step 2: Send initial request (isConnect + target address)
-        let initial_request = encode_initial_request(target_addr)?;
-
-        tracing::debug!(
-            "[UDP Client] Sending initial request ({} bytes) for stream {}",
-            initial_request.len(),
-            stream.id()
-        );
-
-        // Send the initial request
-        stream
-            .send_data(initial_request)
-            .await
-            .map_err(|e| AnyTlsError::Protocol(format!("Failed to send initial request: {}", e)))?;
-
-        tracing::debug!(
-            "[UDP Client] Initial request sent to stream {}",
-            stream.id()
-        );
-
-        // Step 3: Create local UDP socket via the socket-protect helper so a
+        // Step 2: Create local UDP socket via the socket-protect helper so a
         // host VPN (Android) can call `VpnService.protect(fd)` before the
         // bind — otherwise relayed datagrams loop back into the same VPN.
         // Off-Android the helper degrades to `UdpSocket::bind`.
@@ -81,7 +67,7 @@ impl Client {
         let bound_addr = local_udp.local_addr()?;
         tracing::debug!("[UDP Client] Local UDP socket bound to {}", bound_addr);
 
-        // Step 4: Start bidirectional forwarding
+        // Step 3: Start bidirectional forwarding
         let stream_clone = stream.clone();
 
         tokio::spawn(async move {

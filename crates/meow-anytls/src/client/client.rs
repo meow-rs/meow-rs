@@ -6,6 +6,7 @@ use crate::session::{Session, SessionHeartbeatConfig};
 use crate::util::{
     AnyTlsError, Result, TlsConnect, configure_tcp_stream, hash_password, send_authentication,
 };
+use bytes::Bytes;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use tokio::time::Duration;
@@ -73,6 +74,25 @@ impl Client {
         &self,
         destination: (String, u16),
     ) -> Result<(Arc<crate::session::Stream>, Arc<crate::session::Session>)> {
+        self.create_proxy_stream_with_payload(destination, None)
+            .await
+    }
+
+    /// Create a new stream like [`Client::create_proxy_stream`], but write
+    /// `payload` to the wire right after the destination address, **before**
+    /// waiting for SYNACK.
+    ///
+    /// Required for udp-over-tcp: sing-box's anytls inbound reads the UoT
+    /// request inside `RouteConnectionEx` and only reports handshake success
+    /// (SYNACK) once it has it, so a client that returns the stream first and
+    /// writes the request later deadlocks — client waits SYNACK, server waits
+    /// request (meow-rs issue #535). Servers that SYNACK unconditionally are
+    /// unaffected either way.
+    pub async fn create_proxy_stream_with_payload(
+        &self,
+        destination: (String, u16),
+        payload: Option<Bytes>,
+    ) -> Result<(Arc<crate::session::Stream>, Arc<crate::session::Session>)> {
         tracing::debug!(
             "[Client] create_proxy_stream: {}:{}",
             destination.0,
@@ -133,7 +153,6 @@ impl Client {
         // Use session's write_data_frame to send the address bytes
         // This avoids the need to unwrap Arc<Stream> which fails when multiple references exist
         let stream_id = stream.id();
-        use bytes::Bytes;
         tracing::debug!(
             "[Client] Writing destination address ({} bytes) to stream {}",
             addr_bytes.len(),
@@ -154,6 +173,20 @@ impl Client {
             "[Client] Successfully wrote destination address to stream {}",
             stream_id
         );
+
+        // Eager payload (e.g. the udp-over-tcp request) goes out in its own
+        // frame, still ahead of the SYNACK wait — same byte order on the
+        // wire as the reference client's lazy first write.
+        if let Some(payload) = payload
+            && !payload.is_empty()
+        {
+            tracing::debug!(
+                "[Client] Writing {} eager payload bytes to stream {}",
+                payload.len(),
+                stream_id
+            );
+            session.write_data_frame(stream_id, payload).await?;
+        }
         tracing::debug!(
             "[Client] Waiting for SYNACK from server for stream {}...",
             stream_id

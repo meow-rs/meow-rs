@@ -10,7 +10,9 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use anytls_rs::client::UDP_OVER_TCP_MAGIC_ADDR;
 use anytls_rs::padding::PaddingFactory;
+use anytls_rs::protocol::Command;
 use anytls_rs::server::Server as AnytlsServer;
 use meow_common::{Metadata, Network, ProxyAdapter};
 use meow_proxy::AnytlsAdapter;
@@ -711,4 +713,308 @@ async fn anytls_auth_record_arrives_in_single_tls_record() {
     // Best-effort cleanup; the tasks are likely already settled.
     server_h.abort();
     dial_h.abort();
+}
+
+// ─── Regression: UoT request must precede the SYNACK wait (#535) ──────────
+//
+// sing-box's anytls inbound sequences a UoT stream as: read destination →
+// see the magic address → `uot.ReadRequest(conn)` blocks on the wire →
+// `RoutePacketConnectionEx` → `N.HandshakeSuccess` → SYNACK. A client that
+// returns the stream from `dial_udp` and writes the UoT request lazily with
+// the first datagram deadlocks against it: client waits SYNACK, server
+// waits request. The vendored `anytls_rs::server::Server` SYNACKs
+// unconditionally right after the destination (handler.rs), so the tests
+// above cannot pin this ordering. The fake below speaks just enough AnyTLS
+// — TLS, auth, the frame layer — to reproduce sing-box's ordering: it
+// withholds SYNACK until the UoT request has been consumed, then echoes
+// datagrams back.
+
+/// Bytes consumed by a SOCKS5-family `ATYP+ADDR+PORT` at the front of
+/// `buf`; `None` while more bytes are needed.
+fn socks5_addr_len(buf: &[u8]) -> Option<usize> {
+    let need = match *buf.first()? {
+        0x01 => 1 + 4 + 2,
+        0x03 => 2 + usize::from(*buf.get(1)?) + 2,
+        0x04 => 1 + 16 + 2,
+        other => panic!("fake anytls server: bad socks5 atyp {other:#x}"),
+    };
+    (buf.len() >= need).then_some(need)
+}
+
+/// Same shape for a uot-family `ATYP+ADDR+PORT` (0x00/0x01/0x02).
+fn uot_addr_len(buf: &[u8]) -> Option<usize> {
+    let need = match *buf.first()? {
+        0x00 => 1 + 4 + 2,
+        0x02 => 2 + usize::from(*buf.get(1)?) + 2,
+        0x01 => 1 + 16 + 2,
+        other => panic!("fake anytls server: bad uot atyp {other:#x}"),
+    };
+    (buf.len() >= need).then_some(need)
+}
+
+/// Bytes consumed by a complete uot datagram (`addr + u16 len + payload`).
+fn uot_datagram_len(buf: &[u8]) -> Option<usize> {
+    let addr_len = uot_addr_len(buf)?;
+    let payload = u16::from_be_bytes([*buf.get(addr_len)?, *buf.get(addr_len + 1)?]) as usize;
+    (buf.len() >= addr_len + 2 + payload).then_some(addr_len + 2 + payload)
+}
+
+/// Whether a parsed SOCKS5-family `addr+port` slice names the UoT magic
+/// destination (`sp.v2.udp-over-tcp.arpa`, domain form).
+fn is_uot_magic(socks5_addr: &[u8]) -> bool {
+    let magic = UDP_OVER_TCP_MAGIC_ADDR.as_bytes();
+    socks5_addr.len() == magic.len() + 4
+        && socks5_addr[0] == 0x03
+        && usize::from(socks5_addr[1]) == magic.len()
+        && socks5_addr[2..2 + magic.len()] == *magic
+}
+
+async fn write_anytls_frame<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    cmd: Command,
+    stream_id: u32,
+    data: &[u8],
+) -> std::io::Result<()> {
+    let mut frame = Vec::with_capacity(7 + data.len());
+    frame.push(u8::from(cmd));
+    frame.extend_from_slice(&stream_id.to_be_bytes());
+    frame.extend_from_slice(&(data.len() as u16).to_be_bytes());
+    frame.extend_from_slice(data);
+    writer.write_all(&frame).await?;
+    writer.flush().await
+}
+
+/// Per-stream reassembly state for the fake server. PSH payloads are
+/// appended to `buf` and consumed element by element — AnyTLS padding may
+/// split a frame across TLS records, and the client may coalesce writes,
+/// so framing must be rebuilt from the byte stream.
+#[derive(Default)]
+struct FakeUotStream {
+    buf: Vec<u8>,
+    stage: FakeUotStage,
+}
+
+#[derive(Default)]
+enum FakeUotStage {
+    /// Waiting for the SOCKS5 destination that follows SYN.
+    #[default]
+    Dst,
+    /// UoT stream: holding SYNACK until the request arrives (sing-box order).
+    Request,
+    /// UoT relay: parse and echo whole datagrams.
+    Relay,
+    /// Non-UoT stream: SYNACK already sent; payload is drained and dropped.
+    Dead,
+}
+
+/// One accepted connection of the fake server: authenticate, then serve
+/// frames until EOF.
+async fn run_singbox_uot_session(
+    tls: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+) -> std::io::Result<()> {
+    let (mut reader, mut writer) = tokio::io::split(tls);
+
+    // Auth record: SHA256(password) + u16be padding0_len + padding0. Read
+    // and discard — ordering, not auth, is what this fake pins.
+    let mut auth = [0u8; 34];
+    reader.read_exact(&mut auth).await?;
+    let mut padding = vec![0u8; u16::from_be_bytes([auth[32], auth[33]]) as usize];
+    reader.read_exact(&mut padding).await?;
+
+    let mut streams = std::collections::HashMap::<u32, FakeUotStream>::new();
+    loop {
+        let mut header = [0u8; 7];
+        reader.read_exact(&mut header).await?;
+        let cmd = Command::from(header[0]);
+        let stream_id = u32::from_be_bytes(header[1..5].try_into().unwrap());
+        let mut data = vec![0u8; u16::from_be_bytes([header[5], header[6]]) as usize];
+        reader.read_exact(&mut data).await?;
+
+        match cmd {
+            Command::Syn => {
+                streams.insert(stream_id, FakeUotStream::default());
+            }
+            Command::Fin => {
+                streams.remove(&stream_id);
+            }
+            Command::HeartRequest => {
+                write_anytls_frame(&mut writer, Command::HeartResponse, stream_id, &[]).await?;
+            }
+            Command::Push => {
+                let Some(stream) = streams.get_mut(&stream_id) else {
+                    continue;
+                };
+                stream.buf.extend_from_slice(&data);
+                loop {
+                    match stream.stage {
+                        FakeUotStage::Dst => {
+                            let Some(n) = socks5_addr_len(&stream.buf) else {
+                                break;
+                            };
+                            let uot = is_uot_magic(&stream.buf[..n]);
+                            stream.buf.drain(..n);
+                            if uot {
+                                stream.stage = FakeUotStage::Request;
+                            } else {
+                                // Non-UoT destination: SYNACK immediately,
+                                // the vendored server's unconditional shape.
+                                write_anytls_frame(&mut writer, Command::SynAck, stream_id, &[])
+                                    .await?;
+                                stream.stage = FakeUotStage::Dead;
+                            }
+                        }
+                        FakeUotStage::Request => {
+                            // UoT request: isConnect (1) + SOCKS5 addr+port.
+                            // `dial_udp` only ever sends Bind (isConnect=0),
+                            // so the byte is skipped without validation.
+                            if stream.buf.is_empty() {
+                                break;
+                            }
+                            let Some(n) = socks5_addr_len(&stream.buf[1..]) else {
+                                break;
+                            };
+                            stream.buf.drain(..1 + n);
+                            // sing-box order: the request must be on the wire
+                            // before handshake success is reported.
+                            write_anytls_frame(&mut writer, Command::SynAck, stream_id, &[])
+                                .await?;
+                            stream.stage = FakeUotStage::Relay;
+                        }
+                        FakeUotStage::Relay => {
+                            let Some(n) = uot_datagram_len(&stream.buf) else {
+                                break;
+                            };
+                            // Echo: the datagram's own uot addr becomes the
+                            // reply's source address.
+                            let datagram = stream.buf[..n].to_vec();
+                            stream.buf.drain(..n);
+                            write_anytls_frame(&mut writer, Command::Push, stream_id, &datagram)
+                                .await?;
+                        }
+                        FakeUotStage::Dead => {
+                            stream.buf.clear();
+                            break;
+                        }
+                    }
+                }
+            }
+            // Settings, ServerSettings-side commands, Waste padding, alerts:
+            // none need a response for this fake.
+            _ => {}
+        }
+    }
+}
+
+/// Start the sing-box-ordered fake AnyTLS server; returns its bound addr.
+async fn start_singbox_uot_server(
+    cert_der: rustls::pki_types::CertificateDer<'static>,
+    key_der: rustls::pki_types::PrivateKeyDer<'static>,
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let tls_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der], key_der)
+        .unwrap();
+    let acceptor = Arc::new(tokio_rustls::TlsAcceptor::from(Arc::new(tls_config)));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let h = tokio::spawn(async move {
+        while let Ok((tcp, _)) = listener.accept().await {
+            let acceptor = Arc::clone(&acceptor);
+            tokio::spawn(async move {
+                if let Ok(tls) = acceptor.accept(tcp).await {
+                    let _ = run_singbox_uot_session(tls).await;
+                }
+            });
+        }
+    });
+    (addr, h)
+}
+
+/// Regression for issue #535: `dial_udp` must put the UoT request on the
+/// wire before it waits for SYNACK. Under the old lazy-request shape the
+/// server below withholds SYNACK forever (its UoT-request read never
+/// completes), the dial stalls until the outer deadline, and this test
+/// fails at the 5-second timeout — the exact deadlock sing-box produced.
+#[tokio::test]
+async fn anytls_udp_survives_singbox_synack_after_uot_request_ordering() {
+    install_crypto_provider();
+
+    let (cert, key) = self_signed_cert();
+    let (server_addr, _server_h) = start_singbox_uot_server(cert, key).await;
+    let adapter = AnytlsAdapter::new(
+        "test-anytls-udp-singbox",
+        &server_addr.ip().to_string(),
+        server_addr.port(),
+        PASSWORD,
+        Some("localhost"),
+        true,
+        true,
+    )
+    .expect("adapter must build");
+
+    // Arbitrary UDP destination; the fake echoes datagrams itself.
+    let target: SocketAddr = "192.0.2.1:5353".parse().unwrap();
+    let conn = timeout(
+        Duration::from_secs(5),
+        adapter.dial_udp(&udp_metadata(target)),
+    )
+    .await
+    .expect("dial_udp deadlocks while SYNACK is gated on the uot request")
+    .expect("dial_udp must succeed against sing-box-ordered SYNACK");
+
+    timeout(T, conn.write_packet(b"ping", &target))
+        .await
+        .expect("write_packet must not stall")
+        .expect("write_packet must succeed");
+    let mut buf = [0u8; 64];
+    let (n, from) = timeout(T, conn.read_packet(&mut buf))
+        .await
+        .expect("read_packet must not stall")
+        .expect("read_packet must succeed");
+    assert_eq!(&buf[..n], b"ping", "echoed payload must match");
+    assert_eq!(from, target, "reply must carry the datagram's uot source");
+}
+
+/// Companion to the UoT-ordering regression: the same sing-box-ordered
+/// fake must still SYNACK a *non*-UoT destination right after the address,
+/// which is the unconditional shape the vendored server (and sing-box for
+/// regular streams) produces. Covers the fake's `Dead` stage — payload is
+/// drained, not echoed — and pins that `dial_tcp` was untouched by the
+/// eager-payload open path.
+#[tokio::test]
+async fn anytls_tcp_gets_immediate_synack_from_singbox_ordered_fake() {
+    install_crypto_provider();
+
+    let (cert, key) = self_signed_cert();
+    let (server_addr, _server_h) = start_singbox_uot_server(cert, key).await;
+    let adapter = AnytlsAdapter::new(
+        "test-anytls-tcp-singbox",
+        &server_addr.ip().to_string(),
+        server_addr.port(),
+        PASSWORD,
+        Some("localhost"),
+        true,
+        true,
+    )
+    .expect("adapter must build");
+
+    let metadata = Metadata {
+        network: Network::Tcp,
+        host: smol_str::SmolStr::from("192.0.2.2"),
+        dst_ip: Some("192.0.2.2".parse().unwrap()),
+        dst_port: 443,
+        ..Default::default()
+    };
+    let mut conn = timeout(T, adapter.dial_tcp(&metadata))
+        .await
+        .expect("dial_tcp must not stall on a non-uot destination")
+        .expect("dial_tcp must succeed — synack follows the dst immediately");
+
+    // The fake drains non-uot payload (Dead stage); write reaches the wire
+    // but nothing is echoed, so only the write side is asserted.
+    timeout(T, conn.write_all(b"GET / HTTP/1.0\r\n\r\n"))
+        .await
+        .expect("tcp write must not stall")
+        .expect("tcp write must succeed");
+    conn.flush().await.unwrap();
 }

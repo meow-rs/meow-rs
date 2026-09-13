@@ -78,6 +78,16 @@ the canonical, in-repo source a release is cut from.
   first member is now the final valid `MATCH` target, falling back to the first
   declared group or leaf proxy. Explicit user-defined `GLOBAL` groups remain
   unchanged.
+- **AnyTLS UDP no longer deadlocks against sing-box/mihomo inbounds**
+  (#535). sing-box reads the udp-over-tcp request before reporting handshake
+  success, so the stream SYNACK is gated on the request arriving — while the
+  client waited for SYNACK first and only sent the request lazily with the
+  first datagram, leaving both sides waiting until the dial timed out. The
+  UoT request is now flushed on the stream-open path, ahead of the SYNACK
+  wait (`Client::create_proxy_stream_with_payload`); ordinary TCP streams
+  and the vendored server's unconditional-SYNACK shape are unchanged. The
+  same ordering fix was applied to the vendored `Client::create_udp_proxy`
+  for consistency.
 
 - **`merge_family` no longer revives an expired sibling family.** When a new
   A answer merged into an entry whose AAAA had already expired, the old code
