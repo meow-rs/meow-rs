@@ -83,42 +83,83 @@ const TUN_FIRST_READ: usize = 256;
 
 use route::RouteGuard;
 
+/// Process-global serialization point for lwIP generations (issue #514).
+/// `NetStack::new` must not run while a previous core is still tearing
+/// down — aborted pump tasks are reaped asynchronously, so the core's
+/// `core_done` signal is the only reliable barrier. The mutex is held
+/// across the (synchronous) stack build so two listeners can never
+/// interleave through the gate.
+static PREVIOUS_CORE: tokio::sync::Mutex<Option<tokio::sync::watch::Receiver<bool>>> =
+    tokio::sync::Mutex::const_new(None);
+
+/// Upper bound on waiting for a previous lwIP core's teardown. Teardown is
+/// a synchronous pcb sweep — well under a second — so this only bounds a
+/// wedged-core scenario; proceeding past it logs loudly because two live
+/// cores risk corrupting lwIP's process-global pcb lists.
+const PREVIOUS_CORE_TEARDOWN_WAIT: Duration = Duration::from_secs(10);
+
 /// Tracks all child `JoinHandle`s spawned by a TUN listener. On drop,
 /// aborts every tracked task — this guarantees the TUN device and all its
 /// resources are fully released even when the parent task is externally
-/// aborted.
+/// aborted. `shutdown()` additionally awaits the owned children so a
+/// natural exit leaves nothing still touching the old stack's channels.
 struct TaskGroup {
-    aborts: Vec<tokio::task::AbortHandle>,
+    /// Children this group can join (uniform `()` output): per-flow TCP
+    /// handlers, the UDP dispatcher, the Windows local-DNS task.
+    owned: Vec<tokio::task::JoinHandle<()>>,
+    /// Abort handles for tasks whose `JoinHandle` is awaited elsewhere —
+    /// the device↔stack pumps are polled inside `run_inner`'s select loop.
+    tracked: Vec<tokio::task::AbortHandle>,
 }
 
 impl TaskGroup {
     fn new() -> Self {
-        Self { aborts: Vec::new() }
+        Self {
+            owned: Vec::new(),
+            tracked: Vec::new(),
+        }
     }
 
-    /// Track a `JoinHandle<T>` by recording its `AbortHandle`. Type-erased
-    /// via `AbortHandle` so heterogeneous task return types (e.g. `()`,
-    /// `io::Result<()>`) coexist in the same collection.
-    ///
-    /// Reaps finished tasks first: an `AbortHandle` keeps its task's
-    /// allocation alive, so without the `retain` the group would grow
-    /// unboundedly with every accepted TCP flow.
+    /// Track a `JoinHandle<T>` by recording its `AbortHandle`. Used for
+    /// tasks whose join is owned by `run_inner` itself (the pumps).
     fn push<T>(&mut self, h: &tokio::task::JoinHandle<T>) {
-        self.aborts.retain(|a| !a.is_finished());
-        self.aborts.push(h.abort_handle());
+        self.tracked.retain(|a| !a.is_finished());
+        self.tracked.push(h.abort_handle());
     }
 
-    /// Spawn a future and automatically track its handle.
+    /// Spawn a future and automatically track its handle. Reaps finished
+    /// tasks first so the group does not grow unboundedly with every
+    /// accepted TCP flow.
     fn spawn(&mut self, f: impl std::future::Future<Output = ()> + Send + 'static) {
-        let h = tokio::spawn(f);
-        self.push(&h);
+        self.owned.retain(|h| !h.is_finished());
+        self.owned.push(tokio::spawn(f));
+    }
+
+    /// Abort every tracked child, then await the owned set (issue #514):
+    /// `run_inner` returns only when no child can still hold a stack
+    /// handle — the lwIP core's `core_done` (which the next generation
+    /// gates on) only fires after all those handles are gone.
+    async fn shutdown(&mut self) {
+        for a in &self.tracked {
+            a.abort();
+        }
+        for h in &self.owned {
+            h.abort();
+        }
+        for h in self.owned.drain(..) {
+            let _ = h.await;
+        }
+        self.tracked.clear();
     }
 }
 
 impl Drop for TaskGroup {
     fn drop(&mut self) {
-        for a in &self.aborts {
+        for a in &self.tracked {
             a.abort();
+        }
+        for h in &self.owned {
+            h.abort();
         }
     }
 }
@@ -167,8 +208,11 @@ pub enum TunRouteScope {
 /// Allows callers to distinguish immediate setup failure from a timeout
 /// without waiting for the full `TUN_STARTUP_TIMEOUT`.
 pub enum TunReady {
-    /// Device + stack + child tasks are fully initialized.
-    Ready,
+    /// Device + stack + child tasks are fully initialized. The payload is
+    /// the lwIP core's done signal — it flips `true` once that generation's
+    /// teardown fully completes, which the owner must await before
+    /// permitting a successor stack (issue #514).
+    Ready(tokio::sync::watch::Receiver<bool>),
     /// Setup failed before reaching the accept loop.  The String carries
     /// the underlying error message so callers can surface it directly.
     Failed(String),
@@ -191,10 +235,11 @@ impl ReadyNotifier {
         Self { tx: Some(tx) }
     }
 
-    /// Consume the notifier and send `TunReady::Ready`.
-    fn ready(mut self) {
+    /// Consume the notifier and send `TunReady::Ready` carrying the lwIP
+    /// core's done signal.
+    fn ready(mut self, core_done: tokio::sync::watch::Receiver<bool>) {
         if let Some(tx) = self.tx.take() {
-            let _ = tx.send(TunReady::Ready);
+            let _ = tx.send(TunReady::Ready(core_done));
         } else {
             tracing::warn!("ReadyNotifier::ready called but tx was already None");
         }
@@ -577,9 +622,51 @@ impl TunListener {
         // lwIP answers ICMP echo itself. The core task is spawned inside
         // `NetStack::new` (one live stack per process — await `core_done`
         // before building a successor, e.g. on config reload).
+        //
+        // Issue #514: the previous generation's teardown finishes only
+        // after every stack handle — including the split halves held by the
+        // device pumps — is dropped. An aborted parent task cannot await
+        // that reaping, so gate construction on the previous core's
+        // `core_done` signal instead of trusting task ordering.
         let t_stack = Instant::now();
+        let mut prev_slot = PREVIOUS_CORE.lock().await;
+        // Clone, not take: if this task is dropped mid-wait (startup
+        // timeout, `NetStack::new` error via `?`), the slot must keep the
+        // barrier so the next generation still gates on this core's
+        // teardown rather than building a second stack over a live one.
+        if let Some(mut prev_done) = prev_slot.clone() {
+            match timeout(
+                PREVIOUS_CORE_TEARDOWN_WAIT,
+                prev_done.wait_for(|done| *done),
+            )
+            .await
+            {
+                // Teardown signalled, or the core's sender vanished entirely
+                // (core panicked/exited without signalling — nothing left to
+                // wait on either way).
+                Ok(_) => {}
+                // A still-living predecessor owns the process-global pcb
+                // lists `NetStack::new` is about to overwrite — proceeding
+                // is a data race on C state, not a recoverable wait. Fail
+                // the listener; the caller rolls `tun.enable` back.
+                Err(_) => {
+                    return Err(io::Error::other(format!(
+                        "previous lwIP core did not finish teardown within \
+                         {PREVIOUS_CORE_TEARDOWN_WAIT:?}; refusing to build \
+                         a second stack over live pcb globals"
+                    ))
+                    .into());
+                }
+            }
+        }
         let (stack, mut tcp_listener, udp_socket) =
             lwip::NetStack::new().map_err(|e| io::Error::other(format!("lwIP netstack: {e}")))?;
+        // Publish this generation's done signal so the next stack build
+        // gates on it — including the case where this listener is aborted
+        // before readiness fires.
+        let core_done = stack.core_done();
+        *prev_slot = Some(core_done.clone());
+        drop(prev_slot);
 
         let stack_ms = t_stack.elapsed().as_secs_f64() * 1000.0;
         info!("lwIP netstack built in {stack_ms:.0}ms");
@@ -629,10 +716,12 @@ impl TunListener {
         );
 
         // Signal readiness: device, stack, and child tasks are all up.
-        // An `Err` return from this function sends `TunReady::Failed`
-        // (with the real error) from `run` instead.
+        // The payload hands the owner the lwIP core's done signal so a
+        // later `stop_tun` can await real teardown (issue #514). An `Err`
+        // return from this function sends `TunReady::Failed` (with the
+        // real error) from `run` instead.
         if let Some(notifier) = notifier.take() {
-            notifier.ready();
+            notifier.ready(core_done.clone());
             debug!("TUN listener '{}' readiness signalled", self.name);
         }
 
@@ -644,7 +733,7 @@ impl TunListener {
         };
         let warned_saturated = Arc::new(AtomicBool::new(false));
 
-        loop {
+        let result = loop {
             tokio::select! {
                 accepted = tcp_listener.next() => match accepted {
                     Some((stream, src, dst)) => {
@@ -698,16 +787,40 @@ impl TunListener {
                             handle_tcp_flow(tunnel, stream, prefix, src, dst, &name).await;
                         });
                     }
-                    None => return Err("netstack TCP listener closed".into()),
+                    None => break Err("netstack TCP listener closed".into()),
                 },
                 joined = &mut pump_in => {
-                    return Err(pump_error("device→stack", joined).into());
+                    break Err(pump_error("device→stack", joined).into());
                 }
                 joined = &mut pump_out => {
-                    return Err(pump_error("stack→device", joined).into());
+                    break Err(pump_error("stack→device", joined).into());
                 }
             }
+        };
+
+        // Ordered teardown (issue #514): the lwIP core begins teardown only
+        // once every stack handle is dropped — the pumps hold the split
+        // halves and children hold the UDP socket — so abort and JOIN them
+        // before returning. When this future is aborted mid-loop the tail
+        // never runs, but `TaskGroup::drop` still requests the aborts and
+        // the `core_done` gate above serializes the next generation once
+        // the reaping completes.
+        //
+        // A pump arm that won the select! already consumed that handle's
+        // output — re-polling a consumed JoinHandle panics
+        // ("JoinHandle polled after completion"), so only await a pump
+        // that is still running. abort() on a finished task is a no-op.
+        pump_in.abort();
+        pump_out.abort();
+        if !pump_in.is_finished() {
+            let _ = pump_in.await;
         }
+        if !pump_out.is_finished() {
+            let _ = pump_out.await;
+        }
+        tasks.shutdown().await;
+        drop(tcp_listener);
+        result
     }
 }
 

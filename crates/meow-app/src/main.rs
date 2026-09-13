@@ -1109,8 +1109,13 @@ async fn run(
             // notifier sends `TunReady::Failed` immediately — no timeout
             // wait.  Only a genuinely stuck setup hits the timeout.
             match tokio::time::timeout(meow_api::TUN_STARTUP_TIMEOUT, ready_rx).await {
-                Ok(Ok(meow_listener::TunReady::Ready)) => {
-                    tunnel.set_tun_handle(handle).await;
+                Ok(Ok(meow_listener::TunReady::Ready(core_done))) => {
+                    tunnel
+                        .set_tun_handle(meow_tunnel::TunHandle {
+                            task: handle,
+                            core_done: Some(core_done),
+                        })
+                        .await;
                 }
                 Ok(Ok(meow_listener::TunReady::Failed(msg))) => {
                     if msg.contains("wintun.dll") {

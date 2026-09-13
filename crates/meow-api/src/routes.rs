@@ -1687,14 +1687,16 @@ async fn get_group_delay(
 // always return 400 even with force=true; NOT upstream silent broken-config apply.
 
 /// Spawn a TUN listener from a raw config and wait for device readiness.
-/// Returns `Ok(Some(handle))` on success, `Ok(None)` when `tun.enable` is
-/// false or the feature is not compiled in, or `Err(msg)` when startup fails
+/// Returns `Ok(Some(handle))` on success — the [`meow_tunnel::TunHandle`]
+/// carries the lwIP core's done signal so `stop_tun` can await real
+/// teardown (issue #514) — `Ok(None)` when `tun.enable` is false or the
+/// feature is not compiled in, or `Err(msg)` when startup fails
 /// (permission denied, device-name conflict, timeout, etc.).
 #[cfg(feature = "listener-tun")]
 async fn spawn_tun_from_raw(
     tunnel: &Tunnel,
     raw: &RawConfig,
-) -> Result<Option<tokio::task::JoinHandle<()>>, String> {
+) -> Result<Option<meow_tunnel::TunHandle>, String> {
     let tun_cfg = match meow_config::parse_tun_config(raw.tun.as_ref(), raw.max_connections) {
         Ok(c) => c,
         Err(e) => {
@@ -1723,8 +1725,8 @@ async fn spawn_tun_from_raw(
     // device creation fails (e.g. os error 5 / permission denied). The
     // timeout guards against a genuinely stuck startup path; immediate
     // failures are reported through `TunReady::Failed` without delay.
-    match tokio::time::timeout(crate::TUN_STARTUP_TIMEOUT, ready_rx).await {
-        Ok(Ok(meow_listener::TunReady::Ready)) => {}
+    let core_done = match tokio::time::timeout(crate::TUN_STARTUP_TIMEOUT, ready_rx).await {
+        Ok(Ok(meow_listener::TunReady::Ready(core_done))) => core_done,
         Ok(Ok(meow_listener::TunReady::Failed(msg))) => {
             tracing::error!(
                 "TUN listener failed to start: {msg} \
@@ -1748,16 +1750,19 @@ async fn spawn_tun_from_raw(
             handle.abort();
             return Err(msg);
         }
-    }
+    };
 
-    Ok(Some(handle))
+    Ok(Some(meow_tunnel::TunHandle {
+        task: handle,
+        core_done: Some(core_done),
+    }))
 }
 
 #[cfg(not(feature = "listener-tun"))]
 async fn spawn_tun_from_raw(
     _tunnel: &Tunnel,
     raw: &RawConfig,
-) -> Result<Option<tokio::task::JoinHandle<()>>, String> {
+) -> Result<Option<meow_tunnel::TunHandle>, String> {
     if raw.tun.as_ref().is_some_and(|t| t.enable) {
         // Err (not Ok(None)) so the off→on reconcile path rolls
         // `tun.enable` back — otherwise the stored config would claim TUN
