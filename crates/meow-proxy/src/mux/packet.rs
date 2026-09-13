@@ -76,7 +76,8 @@ impl MuxPacketConn {
 }
 
 /// Cancel-safe datagram reader.  Length and payload progress survive a
-/// dropped `read_packet` future (the TUN pump recreates it inside select!).
+/// dropped `read_packet` future (callers may cancel a read by dropping
+/// the future, e.g. on task abort).
 struct PacketReader {
     stream: tokio::io::ReadHalf<MuxStream>,
     len: [u8; 2],

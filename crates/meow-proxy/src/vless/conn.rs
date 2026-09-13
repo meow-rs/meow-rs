@@ -343,16 +343,23 @@ impl ProxyConn for VlessConn {}
 /// drives the two directions from separate tasks; with a single stream-wide
 /// lock any flow needing interleaved sends while a recv is pending (QUIC,
 /// WireGuard, games) stalled after the first packet.
+///
+/// The read side cannot desync: `VlessUdpReader` owns its progress. The
+/// write side can — a `write_packet` future dropped mid-`write_all` has a
+/// frame prefix on the wire and the peer parses the next frame's header as
+/// payload — so an incomplete write poisons the conn and every later op
+/// fails fast (issue #514).
 pub struct VlessPacketConn {
     reader: tokio::sync::Mutex<VlessUdpReader>,
     writer: tokio::sync::Mutex<tokio::io::WriteHalf<Box<dyn Stream>>>,
+    poisoned: std::sync::atomic::AtomicBool,
 }
 
 /// Cancel-safe UDP reader.  The response header, the per-datagram length
 /// prefix and the payload all persist their read progress across dropped
-/// `read_packet` futures — the TUN pump recreates its read inside
-/// `select!`, and a lost half-read would desynchronise the UDP-over-TCP
-/// framing forever.
+/// `read_packet` futures — a lost half-read would desynchronise the
+/// UDP-over-TCP framing forever (callers may still cancel a read by
+/// dropping the future, e.g. task abort).
 struct VlessUdpReader {
     stream: tokio::io::ReadHalf<Box<dyn Stream>>,
     /// VLESS response header `[version][addon_length]`; `hdr_pos < 2`
@@ -527,6 +534,7 @@ impl VlessPacketConn {
         Ok(Self {
             reader: tokio::sync::Mutex::new(VlessUdpReader::new(reader)),
             writer: tokio::sync::Mutex::new(writer),
+            poisoned: std::sync::atomic::AtomicBool::new(false),
         })
     }
 }
@@ -535,11 +543,19 @@ impl VlessPacketConn {
 impl ProxyPacketConn for VlessPacketConn {
     /// Write a UDP packet as `u16_be(len) + data`.
     async fn write_packet(&self, buf: &[u8], _addr: &std::net::SocketAddr) -> Result<usize> {
+        crate::check_not_desynced(&self.poisoned)?;
         let mut writer = self.writer.lock().await;
+        // Re-check after the lock: a write parked behind one cancelled
+        // mid-frame must not append after the torn frame.
+        crate::check_not_desynced(&self.poisoned)?;
         let mut frame = BytesMut::with_capacity(2 + buf.len());
         frame.put_u16(buf.len() as u16);
         frame.put_slice(buf);
+        let mut guard = crate::PoisonOnIncomplete::new(&self.poisoned);
         writer.write_all(&frame).await.map_err(MeowError::Io)?;
+        // Fully buffered once `write_all` returns; a cancelled `flush`
+        // cannot tear framing, so it runs unguarded.
+        guard.complete = true;
         writer.flush().await.map_err(MeowError::Io)?;
         Ok(buf.len())
     }
@@ -549,6 +565,10 @@ impl ProxyPacketConn for VlessPacketConn {
     /// with the first reply datagram).  All progress is persistent, so a
     /// cancelled future resumes from where it stopped.
     async fn read_packet(&self, buf: &mut [u8]) -> Result<(usize, std::net::SocketAddr)> {
+        // No post-lock re-check needed: this reader never loses bytes, so
+        // the poison can only come from the write side — and a conn with a
+        // torn uplink is dead regardless of what the peer still sends.
+        crate::check_not_desynced(&self.poisoned)?;
         let mut reader = self.reader.lock().await;
         reader.read_packet(buf).await
     }
@@ -1263,5 +1283,51 @@ mod tests {
         let mut buf = [0u8; 16];
         assert!(conn.read_packet(&mut buf).await.is_err());
         server_task.await.unwrap();
+    }
+
+    /// Issue #514 review: the resumable reader makes cancelled READS safe,
+    /// but a `write_packet` future dropped mid-`write_all` has already put
+    /// a frame prefix on the wire — the peer parses the next frame's header
+    /// as payload. The write path poisons the conn so every later op fails
+    /// fast instead of feeding a desynced stream.
+    #[tokio::test]
+    async fn udp_cancelled_write_poisons_conn() {
+        let (client, mut server) = duplex(1024);
+        let server_task = tokio::spawn(async move {
+            // Consume the request header, then never read again so the
+            // next datagram write pends mid-frame.
+            let mut request = vec![0u8; 26];
+            server.read_exact(&mut request).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        });
+        let conn = VlessPacketConn::new(
+            Box::new(client),
+            &TEST_UUID,
+            53,
+            &VlessAddr::Ipv4([8, 8, 8, 8]),
+        )
+        .await
+        .unwrap();
+        let dst: std::net::SocketAddr = "9.9.9.9:53".parse().unwrap();
+
+        let cancelled = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            conn.write_packet(&[0xAA; 4096], &dst),
+        )
+        .await;
+        assert!(cancelled.is_err(), "write must have timed out mid-frame");
+
+        let err = conn.write_packet(b"x", &dst).await.unwrap_err();
+        assert!(
+            err.to_string().contains("desynced"),
+            "write after a cancelled write must fail fast, got {err:?}"
+        );
+        let mut buf = [0u8; 64];
+        let err = conn.read_packet(&mut buf).await.unwrap_err();
+        assert!(
+            err.to_string().contains("desynced"),
+            "read on a write-poisoned conn must fail fast, got {err:?}"
+        );
+        server_task.abort();
     }
 }

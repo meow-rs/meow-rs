@@ -361,6 +361,12 @@ pub(super) struct DataPhase {
 }
 
 /// Spawn the bidirectional record relay and return the plaintext duplex half.
+///
+/// The returned stream owns both relay tasks: dropping it aborts them, which
+/// is the bounded cleanup path when the upstream transport stays silent (no
+/// data, FIN, or RST — issue #514). A write-side `shutdown()` alone only
+/// half-closes; the read direction keeps delivering records until the peer
+/// ends them.
 pub(super) fn spawn_relay(stream: Box<dyn Stream>, dp: DataPhase) -> Box<dyn Stream> {
     let (client, proxy) = duplex(RELAY_BUF);
     let (rd, wr) = tokio::io::split(stream);
@@ -380,7 +386,7 @@ pub(super) fn spawn_relay(stream: Box<dyn Stream>, dp: DataPhase) -> Box<dyn Str
     } = dp;
 
     let read_key = united_key.clone();
-    tokio::spawn(read_loop(
+    let read_task = tokio::spawn(read_loop(
         rd,
         proxy_wr,
         peer_aead,
@@ -391,11 +397,22 @@ pub(super) fn spawn_relay(stream: Box<dyn Stream>, dp: DataPhase) -> Box<dyn Str
         use_aes,
         reset_cache,
     ));
-    tokio::spawn(write_loop(
+    let write_task = tokio::spawn(write_loop(
         wr, proxy_rd, aead, write_ctr, pre_write, united_key, use_aes,
     ));
 
-    Box::new(client)
+    let aborts = [read_task.abort_handle(), write_task.abort_handle()];
+
+    // Same supervisor as the vmess relay: when the read side ends —
+    // upstream close, decode failure — the exchange is over; stop the
+    // write side instead of leaving it pumping into a dead transport
+    // until the client endpoint drops (issue #514 review).
+    tokio::spawn(async move {
+        let _ = read_task.await;
+        write_task.abort();
+    });
+
+    Box::new(crate::tasked_duplex::TaskedDuplex::new(client, aborts))
 }
 
 /// Read records from `rd`, decrypt, and forward plaintext to `proxy_wr`.

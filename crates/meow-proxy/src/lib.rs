@@ -14,6 +14,8 @@ pub mod mux;
 pub mod reject;
 pub mod socks5_adapter;
 pub mod stream_conn;
+#[cfg(any(feature = "vmess", feature = "vless-encryption"))]
+pub(crate) mod tasked_duplex;
 pub mod transport_chain;
 
 #[cfg(feature = "ech-tls-tunnel")]
@@ -76,6 +78,56 @@ pub use vless_adapter::{VlessAdapter, VlessFlow};
 pub use vless::encryption::{parse_client_encryption, ClientInstance as VlessEncryptionClient};
 #[cfg(feature = "vmess")]
 pub use vmess::VmessAdapter;
+
+// ─── Stream-desync poison ────────────────────────────────────────────────────
+
+/// Drop guard shared by stream-framed UDP packet conns (trojan, vless).
+/// Unless `complete` is set, dropping the guard — via an early `?` return
+/// OR the future being cancelled mid-frame — marks the conn desynced:
+/// consumed read bytes cannot be un-read and a partially written frame
+/// leaves the peer parsing garbage, so either way the only safe recovery
+/// is to fail fast and let the tunnel tear the session down and re-dial
+/// (issue #514).
+#[cfg(any(feature = "trojan", feature = "vless"))]
+pub(crate) struct PoisonOnIncomplete<'a> {
+    flag: &'a std::sync::atomic::AtomicBool,
+    pub(crate) complete: bool,
+}
+
+#[cfg(any(feature = "trojan", feature = "vless"))]
+impl<'a> PoisonOnIncomplete<'a> {
+    pub(crate) fn new(flag: &'a std::sync::atomic::AtomicBool) -> Self {
+        Self {
+            flag,
+            complete: false,
+        }
+    }
+}
+
+#[cfg(any(feature = "trojan", feature = "vless"))]
+impl Drop for PoisonOnIncomplete<'_> {
+    fn drop(&mut self) {
+        if !self.complete {
+            self.flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// Fail-fast check shared by the stream-framed packet conns. Called at
+/// every `read_packet`/`write_packet` entry AND again after acquiring the
+/// direction lock — an operation parked behind one that was cancelled
+/// mid-frame passed the outer check before the poison store landed.
+#[cfg(any(feature = "trojan", feature = "vless"))]
+pub(crate) fn check_not_desynced(
+    flag: &std::sync::atomic::AtomicBool,
+) -> Result<(), meow_common::MeowError> {
+    if flag.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(meow_common::MeowError::Proxy(
+            "udp-over-tcp: connection desynced by an earlier incomplete frame".into(),
+        ));
+    }
+    Ok(())
+}
 
 // ─── Error bridge ────────────────────────────────────────────────────────────
 
