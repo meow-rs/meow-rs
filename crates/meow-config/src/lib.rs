@@ -3735,3 +3735,44 @@ rule-providers:
         assert!(err.to_string().contains("escapes"), "unexpected: {err}");
     }
 }
+
+/// `fallback` / `url-test` proxy groups get periodic health checks —
+/// extract their probe specs from the raw group list (issue #514). Last
+/// duplicate name wins, matching how `load_config` resolves duplicates —
+/// including a checkable declaration followed by a same-named
+/// non-checkable one, which must NOT emit a spec.
+pub fn extract_health_check_specs(
+    raw_groups: &[raw::RawProxyGroup],
+) -> Vec<meow_common::HealthCheckSpec> {
+    const DEFAULT_URL: &str = "https://www.gstatic.com/generate_204";
+    const DEFAULT_INTERVAL_SECS: u64 = 300;
+    // First pass: resolve duplicate names against every declaration
+    // (load_config's builder is last-wins on the name regardless of type).
+    let mut last: Vec<&raw::RawProxyGroup> = Vec::new();
+    for g in raw_groups {
+        match last.iter_mut().find(|prev| prev.name == g.name) {
+            Some(prev) => *prev = g,
+            None => last.push(g),
+        }
+    }
+    last.iter()
+        .filter(|g| matches!(g.group_type.as_str(), "fallback" | "url-test"))
+        .filter_map(|g| {
+            // Upstream `HealthCheck.auto()` is `interval != 0`: an explicit
+            // `interval: 0` DISABLES periodic checks (manual/on-demand
+            // probes still work). Emitting no spec here also makes
+            // reconcile remove a previously-running task.
+            let interval_secs = match g.interval {
+                Some(0) => return None,
+                Some(i) => i,
+                None => DEFAULT_INTERVAL_SECS,
+            };
+            Some(meow_common::HealthCheckSpec {
+                group_name: g.name.clone(),
+                url: g.url.as_deref().unwrap_or(DEFAULT_URL).to_string(),
+                interval_secs,
+                lazy: g.lazy.unwrap_or(false),
+            })
+        })
+        .collect()
+}

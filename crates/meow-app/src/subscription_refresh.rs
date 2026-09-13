@@ -112,6 +112,13 @@ pub async fn run_loop(raw_config: Arc<RwLock<RawConfig>>, tunnel: Tunnel, config
                             // the on-disk/dashboard view and the running
                             // router can no longer diverge on failure.
                             *raw_config.write() = candidate.clone();
+                            // Health-check tasks follow the new group set
+                            // (issue #514).
+                            tunnel.reconcile_health_checks(
+                                &meow_config::extract_health_check_specs(
+                                    candidate.proxy_groups.as_deref().unwrap_or(&[]),
+                                ),
+                            );
                             info!("Subscription '{}' refreshed successfully", name);
                             // The commit is done — release the mutation
                             // lane before the async disk write so file I/O

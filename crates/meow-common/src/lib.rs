@@ -49,3 +49,6 @@ pub use socket_protect::{
     clear_socket_protector, set_socket_protector, socket_protector, SocketProtector,
 };
 pub use tunnel_mode::TunnelMode;
+
+pub mod health_check;
+pub use health_check::HealthCheckSpec;

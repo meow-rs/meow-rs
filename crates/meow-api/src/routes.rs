@@ -1799,13 +1799,24 @@ async fn swap_config_and_reconcile_tun(state: &AppState, candidate: RawConfig) {
     // Snapshot the candidate (only on an off→on transition, before it is
     // moved into the lock) so the parking_lot write guard — which is
     // !Send — is dropped before the first .await below.
-    let (old_enable, snapshot) = {
+    let (old_enable, snapshot, specs) = {
         let mut guard = state.raw_config.write();
         let old = guard.tun.as_ref().is_some_and(|t| t.enable);
         let snapshot = (new_enable && !old).then(|| candidate.clone());
+        // Extract health-check specs straight from the candidate before it
+        // is moved into the lock — no second read of `raw_config` and no
+        // deep clone of the group section (issue #514 review).
+        let specs = meow_config::extract_health_check_specs(
+            candidate.proxy_groups.as_deref().unwrap_or(&[]),
+        );
         *guard = candidate;
-        (old, snapshot)
+        (old, snapshot, specs)
     };
+
+    // Reconcile health-check tasks with the committed proxy-group section
+    // — groups added get a check, removed abort, changed specs respawn
+    // (issue #514). Sync; spawns under the lane lock are cheap.
+    state.tunnel.reconcile_health_checks(&specs);
 
     if old_enable == new_enable {
         return;

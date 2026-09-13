@@ -811,14 +811,11 @@ async fn run(
     tunnel.spawn_background_tasks();
 
     // Spawn periodic health checks for fallback / url-test proxy groups.
-    {
-        let raw_groups = config.raw.proxy_groups.as_deref().unwrap_or(&[]);
-        let specs = meow_app::health_check::extract_specs(raw_groups);
-        if !specs.is_empty() {
-            info!("Starting health checks for {} group(s)", specs.len());
-            meow_app::health_check::spawn_health_checks(&tunnel, specs);
-        }
-    }
+    // The supervisor lives on the tunnel so config reloads can reconcile
+    // the task set (issue #514).
+    tunnel.reconcile_health_checks(&meow_config::extract_health_check_specs(
+        config.raw.proxy_groups.as_deref().unwrap_or(&[]),
+    ));
 
     // Start DNS server if configured
     if let Some(listen_addr) = config.dns.listen_addr {

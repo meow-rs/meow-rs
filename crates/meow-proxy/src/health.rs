@@ -419,10 +419,10 @@ mod tests {
         // (input, https, host, port, path)
         let accepted: &[(&str, bool, &str, u16, &str)] = &[
             (
-                "http://www.gstatic.com/generate_204",
-                false,
+                "https://www.gstatic.com/generate_204",
+                true,
                 "www.gstatic.com",
-                80,
+                443,
                 "/generate_204",
             ),
             (

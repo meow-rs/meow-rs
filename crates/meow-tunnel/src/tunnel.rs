@@ -5,7 +5,7 @@ use crate::udp::{self, NatTable};
 use meow_common::{Metadata, Network, Proxy, ProxyAdapter, Rule, TunnelMode};
 use meow_dns::Resolver;
 use meow_proxy::DirectAdapter;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use smol_str::SmolStr;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -92,6 +92,10 @@ pub struct TunnelInner {
     /// Handle to the running TUN listener (if any). Abort + await it to
     /// stop TUN. Stored so `put_configs` can start/stop TUN at runtime.
     pub tun_handle: RwLock<Option<TunHandle>>,
+    /// Health-check task set keyed by group name; reconciled on every
+    /// config commit so checks appear/disappear/respawn with the config
+    /// (issue #514).
+    pub health_checks: Mutex<crate::health_check::HealthCheckSupervisor>,
 }
 
 /// A running TUN listener: the task plus the signal resolving once its
@@ -429,6 +433,7 @@ impl Tunnel {
                 nat_table: udp::new_nat_table(),
                 stats: Arc::new(Statistics::new()),
                 tcp_generation: RwLock::new(0),
+                health_checks: Mutex::new(crate::health_check::HealthCheckSupervisor::default()),
                 needs_ip_resolution: AtomicBool::new(false),
                 needs_process_lookup: AtomicBool::new(false),
                 tun_handle: RwLock::new(None),
@@ -586,6 +591,20 @@ impl Tunnel {
     /// `DIRECT` adapter — tracks `set_resolver` swaps (issue #514).
     pub fn resolver_slot(&self) -> meow_dns::ResolverSlot {
         Arc::clone(&self.inner.resolver)
+    }
+
+    /// Reconcile health-check tasks with a committed config's proxy-group
+    /// specs (issue #514): new fallback/url-test groups get a task,
+    /// removed groups are aborted, changed specs are respawned, dead tasks
+    /// are restarted. Specs come from
+    /// `meow_config::extract_health_check_specs`; call on every config
+    /// commit — startup, `PUT /configs`, section mutations, subscription
+    /// refresh.
+    pub fn reconcile_health_checks(&self, specs: &[meow_common::HealthCheckSpec]) {
+        self.inner
+            .health_checks
+            .lock()
+            .reconcile(&self.inner, specs);
     }
 
     /// Publish a rebuilt DNS resolver (issue #514): routing lookups
