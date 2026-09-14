@@ -402,20 +402,46 @@ pub(super) fn spawn_relay(stream: Box<dyn Stream>, dp: DataPhase) -> Box<dyn Str
     ));
 
     let aborts = [read_task.abort_handle(), write_task.abort_handle()];
+    let write_abort = write_task.abort_handle();
 
-    // Same supervisor as the vmess relay: when the read side ends —
-    // upstream close, decode failure — the exchange is over; stop the
-    // write side instead of leaving it pumping into a dead transport
-    // until the client endpoint drops (issue #514 review).
+    // Same supervisor contract as the vmess relay: when the read side ends
+    // on a FATAL path — decode failure, transport error — the exchange is
+    // over; stop the write side instead of leaving it pumping into a dead
+    // transport until the client endpoint drops (issue #514 review). A
+    // clean EOF — peer FIN exactly between records — only half-closes the
+    // exchange: the client may still be uploading, so the write side keeps
+    // running until the caller half-closes or drops the endpoint (issue
+    // #514 review follow-up). If the endpoint is dropped first,
+    // `TaskedDuplex` aborts both tasks and this supervisor resolves.
     tokio::spawn(async move {
-        let _ = read_task.await;
-        write_task.abort();
+        let clean_eof = match read_task.await {
+            Ok(clean) => clean,
+            Err(e) => {
+                if e.is_panic() {
+                    tracing::error!("vless encryption: read task panicked: {e}");
+                }
+                false
+            }
+        };
+        if !clean_eof {
+            write_abort.abort();
+        }
     });
 
-    Box::new(crate::tasked_duplex::TaskedDuplex::new(client, aborts))
+    Box::new(crate::tasked_duplex::TaskedDuplex::new(
+        client, aborts, write_task,
+    ))
 }
 
 /// Read records from `rd`, decrypt, and forward plaintext to `proxy_wr`.
+///
+/// Returns `true` when the exchange ended on a clean EOF — the peer sent
+/// FIN exactly on a record boundary — so the write direction is still
+/// legitimate (TCP half-close: the peer stopped sending but may keep
+/// receiving). Returns `false` on every fatal path — handshake failure,
+/// truncated record, decode error, or the client endpoint gone — where
+/// the supervisor must stop the write side too (issue #514 review
+/// follow-up).
 #[allow(clippy::too_many_arguments)]
 async fn read_loop(
     mut rd: ReadHalf<Box<dyn Stream>>,
@@ -427,7 +453,7 @@ async fn read_loop(
     united_key: Vec<u8>,
     use_aes: bool,
     reset_cache: Option<Arc<Mutex<TicketCache>>>,
-) {
+) -> bool {
     // A 0-RTT rejection surfaces as a decode failure on the very first record
     // (the server sends deliberate noise). Until one record decodes cleanly,
     // treat an early failure as "ticket rejected" and drop it so the next dial
@@ -446,7 +472,8 @@ async fn read_loop(
         None => {
             let mut sr = [0u8; 16];
             if rd.read_exact(&mut sr).await.is_err() {
-                return;
+                let _ = proxy_wr.shutdown().await;
+                return false;
             }
             if xor {
                 read_ctr = Some(new_ctr(&united_key, &sr));
@@ -459,14 +486,29 @@ async fn read_loop(
     if peer_padding_len > 0 {
         let mut pad = vec![0u8; peer_padding_len];
         if rd.read_exact(&mut pad).await.is_err() || peer_aead.open(&pad).is_err() {
-            return;
+            let _ = proxy_wr.shutdown().await;
+            return false;
         }
     }
 
+    let mut clean_eof = false;
     loop {
+        // Two-phase header read: a bare `read` returning 0 means FIN at a
+        // record boundary — the clean half-close. `read_exact` alone cannot
+        // tell that apart from a mid-record truncation (both surface as
+        // UnexpectedEof), and truncation is fatal.
         let mut hdr = [0u8; 5];
-        if rd.read_exact(&mut hdr).await.is_err() {
-            break;
+        match rd.read(&mut hdr).await {
+            Ok(0) => {
+                clean_eof = true;
+                break;
+            }
+            Ok(n) => {
+                if rd.read_exact(&mut hdr[n..]).await.is_err() {
+                    break;
+                }
+            }
+            Err(_) => break,
         }
         if let Some(ctr) = read_ctr.as_mut() {
             ctr.apply_keystream(&mut hdr);
@@ -502,6 +544,7 @@ async fn read_loop(
         }
     }
     let _ = proxy_wr.shutdown().await;
+    clean_eof
 }
 
 /// Read plaintext from `proxy_rd`, record-frame + encrypt, and write to `wr`.

@@ -32,6 +32,12 @@ pub fn spawn_vmess_relay(
     // server commonly waits for request data before sending its response
     // header, so awaiting the header before forwarding the request would
     // deadlock every request/response protocol.
+    //
+    // Returns `true` when the exchange ended on a clean EOF (peer FIN at a
+    // record boundary / terminator record) — the write direction may still
+    // have data in flight, so the supervisor leaves it running. `false`
+    // marks a fatal end (handshake failure, decode error, transport error,
+    // or the client endpoint gone), where the write side is stopped too.
     let read_task = tokio::spawn(async move {
         let (resp_body_key, resp_body_iv) = response_body_keys(&req_key, &req_iv);
         if let Err(e) =
@@ -39,30 +45,37 @@ pub fn spawn_vmess_relay(
         {
             tracing::warn!("vmess: response header decode failed: {e}");
             let _ = proxy_wr.shutdown().await;
-            return;
+            return false;
         }
 
-        loop {
+        let clean_eof = loop {
             match read_cipher.read_record(&mut rd).await {
                 Ok(plaintext) => {
                     if proxy_wr.write_all(&plaintext).await.is_err() {
-                        break;
+                        break false;
                     }
                 }
                 // UnexpectedEof is the ordinary close path (peer FIN or a
-                // zero-length terminator record) — not worth a warn. The
-                // rest covers decrypt failures and nonce-budget
-                // exhaustion (issue #513), which otherwise look like an
-                // unexplained ~1 GiB disconnect.
+                // zero-length terminator record) — not worth a warn.
+                // `read_record` cannot tell those apart from a FIN landing
+                // mid-record (its `read_exact` calls surface the same
+                // kind), so truncation is classified clean too: the peer
+                // is gone either way and the write side stays up only
+                // until the caller half-closes or drops, bounded by the
+                // relay linger. The rest covers decrypt failures and
+                // nonce-budget exhaustion (issue #513), which otherwise
+                // look like an unexplained ~1 GiB disconnect.
                 Err(e) => {
                     if e.kind() != std::io::ErrorKind::UnexpectedEof {
                         tracing::warn!("vmess: read side closed: {e}");
+                        break false;
                     }
-                    break;
+                    break true;
                 }
             }
-        }
+        };
         let _ = proxy_wr.shutdown().await;
+        clean_eof
     });
 
     // Downstream: proxy_rd → encrypt → stream
@@ -84,17 +97,32 @@ pub fn spawn_vmess_relay(
     });
 
     let aborts = [read_task.abort_handle(), write_task.abort_handle()];
+    let write_abort = write_task.abort_handle();
 
-    // When the read side ends — upstream close, decode failure, or nonce
-    // budget — the exchange is over: stop the write side too. If the client
-    // endpoint is dropped first, `TaskedDuplex` aborts both tasks and this
-    // supervisor resolves immediately.
+    // When the read side ends on a FATAL path — decode failure, transport
+    // error, nonce budget — the exchange is over: stop the write side too.
+    // A clean EOF (peer FIN at a record boundary) only half-closes the
+    // exchange: the client may still be uploading, so the write side keeps
+    // running until the caller half-closes or drops the endpoint (issue
+    // #514 review follow-up). If the client endpoint is dropped first,
+    // `TaskedDuplex` aborts both tasks and this supervisor resolves
+    // immediately.
     tokio::spawn(async move {
-        let _ = read_task.await;
-        write_task.abort();
+        let clean_eof = match read_task.await {
+            Ok(clean) => clean,
+            Err(e) => {
+                if e.is_panic() {
+                    tracing::error!("vmess: read task panicked: {e}");
+                }
+                false
+            }
+        };
+        if !clean_eof {
+            write_abort.abort();
+        }
     });
 
-    TaskedDuplex::new(client, aborts)
+    TaskedDuplex::new(client, aborts, write_task)
 }
 
 #[cfg(test)]
@@ -255,5 +283,62 @@ mod tests {
             .expect("read side must stay open after write half-close")
             .unwrap();
         assert_eq!(&out, payload);
+    }
+
+    /// Issue #514 review follow-up: the reverse half-close — when the
+    /// server sends FIN at a record boundary (clean EOF on the read side),
+    /// the write direction must stay alive: a client still uploading must
+    /// keep reaching the server instead of having its writer task aborted
+    /// with the read loop.
+    #[tokio::test]
+    async fn upstream_half_close_keeps_write_side_open() {
+        let req_key = [0x11; 16];
+        let req_iv = [0x22; 16];
+        let resp_v = 0x5a;
+        let (transport, mut server) = tokio::io::duplex(4096);
+        let mut app = spawn_vmess_relay(
+            Box::new(transport),
+            BodyCipher::new(Security::None, &req_key, &req_iv, resp_v),
+            BodyCipher::new(Security::None, &req_key, &req_iv, resp_v),
+            req_key,
+            req_iv,
+            resp_v,
+        );
+
+        // Server answers the response header, then half-closes its send
+        // direction while continuing to read uploads.
+        server
+            .write_all(&seal_response_header(&req_key, &req_iv, resp_v))
+            .await
+            .unwrap();
+        server.shutdown().await.unwrap();
+
+        // The client observes EOF on its read direction.
+        let mut sink = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            app.read_to_end(&mut sink),
+        )
+        .await
+        .expect("client read side must observe the server FIN")
+        .unwrap();
+
+        // Give the supervisor a scheduling slice: under the buggy version
+        // it aborts the write task as soon as the read loop ends.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // A post-FIN upload must still reach the server.
+        app.write_all(b"post-fin upload").await.unwrap();
+        let mut len = [0u8; 2];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            server.read_exact(&mut len),
+        )
+        .await
+        .expect("write side must stay open after upstream half-close")
+        .unwrap();
+        let mut rec = vec![0u8; u16::from_be_bytes(len) as usize];
+        server.read_exact(&mut rec).await.unwrap();
+        assert_eq!(&rec, b"post-fin upload");
     }
 }

@@ -572,11 +572,16 @@ pub fn rebuild_from_raw_with_cache_dir(
 /// `Arc<RuleProvider>` objects, so `PUT /providers/rules/{name}` and
 /// name-resolved refresh loops keep reaching the live generation instead
 /// of orphaned startup-era objects (issue #514 review).
+/// `prior_resolver` is the resolver generation being replaced — reload
+/// paths pass the tunnel's live resolver so the rebuilt one can inherit
+/// the fake-IP pool when the range and store kind are unchanged (issue
+/// #514 review follow-up). `None` on cold start.
 pub async fn parse_dns_from_raw(
     raw: &raw::RawConfig,
     cache_dir: Option<&Path>,
     proxy_registry: &HashMap<SmolStr, Arc<dyn Proxy>>,
     registry: Option<&parking_lot::RwLock<HashMap<String, Arc<rule_provider::RuleProvider>>>>,
+    prior_resolver: Option<&meow_dns::Resolver>,
 ) -> Result<DnsConfig, anyhow::Error> {
     let geo = geodata::parse_geodata(raw.geodata.as_ref())?;
     let payloads = rule_provider::PrefetchedPayloads::default();
@@ -603,6 +608,7 @@ pub async fn parse_dns_from_raw(
         proxy_registry,
         ctx.geosite,
         rule_providers.as_ref().unwrap_or(&HashMap::new()),
+        prior_resolver,
     )
     .await?;
     if let (Some(registry), Some(loaded)) = (registry, rule_providers) {
@@ -2286,6 +2292,7 @@ async fn build_config(
         &proxies,
         ctx.geosite.clone(),
         &rule_providers,
+        None,
     )
     .await?;
 

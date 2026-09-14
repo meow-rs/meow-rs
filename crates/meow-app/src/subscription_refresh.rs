@@ -126,6 +126,7 @@ pub async fn run_loop(
                                 &config_path,
                                 &new_proxies,
                                 &rule_providers,
+                                Some(tunnel.resolver()),
                             )
                             .await;
 

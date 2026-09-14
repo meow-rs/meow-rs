@@ -20,6 +20,10 @@ use tracing::warn;
 /// `enhanced-mode: fake-ip` is set but `fake-ip-range` is omitted.
 const DEFAULT_FAKE_IP_RANGE_V4: &str = "198.18.0.1/16";
 
+/// `prior` is the resolver generation being replaced (config reload); its
+/// fake-IP pool is carried over when the configured range and store kind
+/// are unchanged, so clients holding earlier `host → fake-ip` answers keep
+/// a valid reverse mapping. Pass `None` on cold start.
 pub async fn parse_dns(
     raw: &RawConfig,
     mmdb_path: Option<&std::path::Path>,
@@ -27,6 +31,7 @@ pub async fn parse_dns(
     proxy_registry: &HashMap<smol_str::SmolStr, Arc<dyn meow_common::Proxy>>,
     geosite: Option<Arc<meow_rules::geosite::GeositeDB>>,
     rule_providers: &HashMap<String, Arc<RuleProvider>>,
+    prior: Option<&Resolver>,
 ) -> Result<DnsConfig, anyhow::Error> {
     let dns = match &raw.dns {
         Some(dns) if dns.enable.unwrap_or(false) => dns,
@@ -172,7 +177,7 @@ pub async fn parse_dns(
     // silently fall back to the upstream resolver, which is a user-surprising
     // privacy regression.
     if mode == DnsMode::FakeIp {
-        install_fakeip(&mut resolver, dns, cache_dir).await?;
+        install_fakeip(&mut resolver, dns, cache_dir, prior).await?;
     }
 
     let resolver = Arc::new(resolver);
@@ -189,6 +194,7 @@ async fn install_fakeip(
     resolver: &mut Resolver,
     dns: &crate::raw::RawDns,
     cache_dir: Option<&std::path::Path>,
+    prior: Option<&Resolver>,
 ) -> Result<(), anyhow::Error> {
     let range_str = dns
         .fake_ip_range
@@ -199,33 +205,50 @@ async fn install_fakeip(
         .map_err(|e| anyhow::anyhow!("dns.fake-ip-range '{range_str}' is not a valid CIDR: {e}"))?;
 
     let persist = dns.store_fake_ip.unwrap_or(false);
-    let store_path = |suffix: &str| -> std::path::PathBuf {
-        let base = cache_dir.map_or_else(
-            || std::path::PathBuf::from("."),
-            std::path::Path::to_path_buf,
-        );
-        base.join(format!("fakeip-{suffix}.json"))
-    };
 
-    let store: Arc<dyn Store> = if persist {
-        let path = store_path(match &prefix {
-            ipnet::IpNet::V4(_) => "v4",
-            ipnet::IpNet::V6(_) => "v6",
-        });
-        let p = FileStore::open_async(path.clone()).await.map_err(|e| {
-            let disp = path.display();
-            anyhow::anyhow!("cannot open fakeip store {disp}: {e}")
-        })?;
-        Arc::new(p)
-    } else {
-        // Capacity bounded by prefix size, but cap at a sensible upper bound
-        // so a /8 doesn't allocate 16M cache slots up front.
-        Arc::new(MemoryStore::new(1 << 20))
-    };
+    // Carry the live pool into the rebuilt resolver when the range and the
+    // store kind are unchanged. The pool's store IS the fake-IP state: a
+    // fresh MemoryStore strands clients still holding `host → fake-ip`
+    // answers and resets the allocation cursor, which then reissues the
+    // same addresses to other hosts — `pre_handle_metadata` would
+    // reverse-map in-flight connections to the wrong target (issue #514
+    // review follow-up). Reuse also keeps `store-fake-ip` reloads on ONE
+    // FileStore instead of running two persist writers over the same file.
+    let pool = match prior
+        .and_then(|r| r.fakeip_pool_over(prefix))
+        .filter(|p| p.is_persistent() == persist)
+    {
+        Some(pool) => pool,
+        None => {
+            let store_path = |suffix: &str| -> std::path::PathBuf {
+                let base = cache_dir.map_or_else(
+                    || std::path::PathBuf::from("."),
+                    std::path::Path::to_path_buf,
+                );
+                base.join(format!("fakeip-{suffix}.json"))
+            };
 
-    let pool =
-        Pool::new(prefix, store).map_err(|e| anyhow::anyhow!("cannot build fakeip pool: {e}"))?;
-    let pool = Arc::new(pool);
+            let store: Arc<dyn Store> = if persist {
+                let path = store_path(match &prefix {
+                    ipnet::IpNet::V4(_) => "v4",
+                    ipnet::IpNet::V6(_) => "v6",
+                });
+                let p = FileStore::open_async(path.clone()).await.map_err(|e| {
+                    let disp = path.display();
+                    anyhow::anyhow!("cannot open fakeip store {disp}: {e}")
+                })?;
+                Arc::new(p)
+            } else {
+                // Capacity bounded by prefix size, but cap at a sensible upper bound
+                // so a /8 doesn't allocate 16M cache slots up front.
+                Arc::new(MemoryStore::new(1 << 20))
+            };
+
+            let pool = Pool::new(prefix, store)
+                .map_err(|e| anyhow::anyhow!("cannot build fakeip pool: {e}"))?;
+            Arc::new(pool)
+        }
+    };
 
     match &prefix {
         ipnet::IpNet::V4(_) => resolver.set_fakeip_v4(pool),
@@ -931,9 +954,17 @@ mod tests {
             "dns:\n  enable: true\n  nameserver:\n    - 1.1.1.1\n  proxy-server-nameserver:\n    - 223.5.5.5\n",
         )
         .unwrap();
-        let cfg = parse_dns(&raw, None, None, &HashMap::new(), None, &HashMap::new())
-            .await
-            .unwrap();
+        let cfg = parse_dns(
+            &raw,
+            None,
+            None,
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
         assert!(
             cfg.proxy_resolver.is_some(),
             "proxy-server-nameserver must build a dedicated resolver"
@@ -944,9 +975,17 @@ mod tests {
     async fn no_proxy_server_nameserver_leaves_proxy_resolver_none() {
         let raw: RawConfig =
             serde_yaml::from_str("dns:\n  enable: true\n  nameserver:\n    - 1.1.1.1\n").unwrap();
-        let cfg = parse_dns(&raw, None, None, &HashMap::new(), None, &HashMap::new())
-            .await
-            .unwrap();
+        let cfg = parse_dns(
+            &raw,
+            None,
+            None,
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
         assert!(cfg.proxy_resolver.is_none());
     }
 
@@ -958,11 +997,185 @@ mod tests {
             "dns:\n  enable: false\n  proxy-server-nameserver:\n    - 223.5.5.5\n",
         )
         .unwrap();
-        let cfg = parse_dns(&raw, None, None, &HashMap::new(), None, &HashMap::new())
-            .await
-            .unwrap();
+        let cfg = parse_dns(
+            &raw,
+            None,
+            None,
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
         assert!(!cfg.enabled);
         assert!(cfg.proxy_resolver.is_none());
+    }
+
+    /// Issue #514 review follow-up: a config reload that rebuilds the
+    /// resolver (e.g. a nameserver change) must carry the live fake-IP
+    /// pool over when the range and store kind are unchanged — otherwise
+    /// clients holding `host → fake-ip` answers lose the mapping and the
+    /// fresh cursor reissues their addresses to other hosts.
+    #[tokio::test]
+    async fn fakeip_pool_is_carried_into_rebuilt_resolver() {
+        let yaml = |ns: &str| {
+            format!("dns:\n  enable: true\n  enhanced-mode: fake-ip\n  nameserver:\n    - {ns}\n")
+        };
+        let raw: RawConfig = serde_yaml::from_str(&yaml("1.1.1.1")).unwrap();
+        let cfg = parse_dns(
+            &raw,
+            None,
+            None,
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        let range: ipnet::IpNet = "198.18.0.1/16".parse().unwrap();
+        let old_pool = cfg.resolver.fakeip_pool_over(range).unwrap();
+        let ip = old_pool.lookup("a.example");
+        assert_eq!(old_pool.look_back(ip).as_deref(), Some("a.example"));
+
+        // Reload with a different nameserver: same fake-ip range → the
+        // same pool object is reused.
+        let raw2: RawConfig = serde_yaml::from_str(&yaml("8.8.8.8")).unwrap();
+        let cfg2 = parse_dns(
+            &raw2,
+            None,
+            None,
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+            Some(cfg.resolver.as_ref()),
+        )
+        .await
+        .unwrap();
+        let new_pool = cfg2.resolver.fakeip_pool_over(range).unwrap();
+        assert!(
+            Arc::ptr_eq(&old_pool, &new_pool),
+            "unchanged-range reload must reuse the live pool"
+        );
+        assert_eq!(new_pool.look_back(ip).as_deref(), Some("a.example"));
+        // Cursor carried too: the next allocation must not reissue
+        // a.example's address.
+        assert_ne!(new_pool.lookup("b.example"), ip);
+        assert_eq!(new_pool.lookup("a.example"), ip);
+    }
+
+    /// Same reload, but the fake-ip range changed: a fresh pool must be
+    /// built — old mappings do not apply to a different range.
+    #[tokio::test]
+    async fn fakeip_pool_not_carried_when_range_changes() {
+        let yaml = |range: &str| {
+            format!(
+                "dns:\n  enable: true\n  enhanced-mode: fake-ip\n  fake-ip-range: {range}\n  nameserver:\n    - 1.1.1.1\n"
+            )
+        };
+        let raw: RawConfig = serde_yaml::from_str(&yaml("198.18.0.1/16")).unwrap();
+        let cfg = parse_dns(
+            &raw,
+            None,
+            None,
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        let old_pool = cfg
+            .resolver
+            .fakeip_pool_over("198.18.0.1/16".parse().unwrap())
+            .unwrap();
+        let ip = old_pool.lookup("a.example");
+
+        let raw2: RawConfig = serde_yaml::from_str(&yaml("198.19.0.1/16")).unwrap();
+        let cfg2 = parse_dns(
+            &raw2,
+            None,
+            None,
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+            Some(cfg.resolver.as_ref()),
+        )
+        .await
+        .unwrap();
+        let new_pool = cfg2
+            .resolver
+            .fakeip_pool_over("198.19.0.1/16".parse().unwrap())
+            .unwrap();
+        assert!(new_pool.look_back(ip).is_none());
+    }
+
+    /// `store-fake-ip: true` across a reload: the persistent pool is
+    /// carried over too — reuse keeps ONE `FileStore` (and its flush task)
+    /// on the backing file instead of running a second writer over it.
+    /// Flipping the flag must NOT reuse.
+    #[tokio::test]
+    async fn fakeip_pool_is_carried_with_persistent_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = |ns: &str, store: &str| {
+            format!(
+                "dns:\n  enable: true\n  enhanced-mode: fake-ip\n  store-fake-ip: {store}\n  nameserver:\n    - {ns}\n"
+            )
+        };
+        let range: ipnet::IpNet = "198.18.0.1/16".parse().unwrap();
+        let raw: RawConfig = serde_yaml::from_str(&yaml("1.1.1.1", "true")).unwrap();
+        let cfg = parse_dns(
+            &raw,
+            None,
+            Some(dir.path()),
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        let old_pool = cfg.resolver.fakeip_pool_over(range).unwrap();
+        assert!(old_pool.is_persistent());
+        let ip = old_pool.lookup("a.example");
+
+        // persist → persist: same pool object — no second FileStore
+        // opened on fakeip-v4.json.
+        let raw2: RawConfig = serde_yaml::from_str(&yaml("8.8.8.8", "true")).unwrap();
+        let cfg2 = parse_dns(
+            &raw2,
+            None,
+            Some(dir.path()),
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+            Some(cfg.resolver.as_ref()),
+        )
+        .await
+        .unwrap();
+        let carried = cfg2.resolver.fakeip_pool_over(range).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&old_pool, &carried));
+        assert_eq!(carried.look_back(ip).as_deref(), Some("a.example"));
+
+        // persist → memory: the flag flipped, so the pool must not be
+        // reused.
+        let raw3: RawConfig = serde_yaml::from_str(&yaml("8.8.8.8", "false")).unwrap();
+        let cfg3 = parse_dns(
+            &raw3,
+            None,
+            Some(dir.path()),
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+            Some(cfg2.resolver.as_ref()),
+        )
+        .await
+        .unwrap();
+        let fresh = cfg3.resolver.fakeip_pool_over(range).unwrap();
+        assert!(!fresh.is_persistent());
+        assert!(!std::sync::Arc::ptr_eq(&old_pool, &fresh));
+        assert!(fresh.look_back(ip).is_none());
     }
 
     #[test]

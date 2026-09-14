@@ -549,6 +549,14 @@ impl Pool {
         self.ipnet
     }
 
+    /// Whether the backing store persists across restarts (`FileStore`)
+    /// or is memory-only (`MemoryStore`). Config reload keys pool reuse
+    /// on this together with the prefix — a pool must not be carried into
+    /// a resolver generation whose `store-fake-ip` flag flipped.
+    pub fn is_persistent(&self) -> bool {
+        self.store.is_persistent()
+    }
+
     /// Clear every allocation. Subsequent `lookup` calls start fresh from `first`.
     pub fn flush(&self) {
         self.store.flush();

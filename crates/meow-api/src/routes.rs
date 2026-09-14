@@ -1097,6 +1097,7 @@ async fn apply_raw_to_tunnel(
         &state.config_path,
         &proxies,
         &state.rule_providers,
+        Some(state.tunnel.resolver()),
     )
     .await?;
     state.tunnel.update_routing(proxies, rules);
@@ -1167,12 +1168,17 @@ fn dns_inputs_equal(a: &RawConfig, b: &RawConfig) -> bool {
 /// objects are written into on success — pass `state.rule_providers` (or
 /// the equivalent shared registry) so `PUT /providers/rules/{name}` and
 /// name-resolved refresh loops reach the live generation (issue #514).
+/// `prior_resolver` is the resolver generation being replaced — the
+/// tunnel's live resolver — so the rebuild can carry the fake-IP pool
+/// over when the range and store kind are unchanged (issue #514 review
+/// follow-up).
 pub async fn reconcile_dns_config(
     raw_config: &RwLock<RawConfig>,
     candidate: &RawConfig,
     config_path: &str,
     proxies: &std::collections::HashMap<smol_str::SmolStr, Arc<dyn meow_common::Proxy>>,
     rule_providers: &RwLock<HashMap<String, Arc<meow_config::rule_provider::RuleProvider>>>,
+    prior_resolver: Option<Arc<meow_dns::Resolver>>,
 ) -> Result<Option<meow_config::DnsConfig>, (StatusCode, String)> {
     let unchanged = {
         let old = raw_config.read();
@@ -1182,15 +1188,21 @@ pub async fn reconcile_dns_config(
         return Ok(None);
     }
     let cache_dir = meow_config::resource_cache_dir_for_config_path(config_path);
-    meow_config::parse_dns_from_raw(candidate, Some(&cache_dir), proxies, Some(rule_providers))
-        .await
-        .map(Some)
-        .map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                format!("dns config rebuild failed: {e}"),
-            )
-        })
+    meow_config::parse_dns_from_raw(
+        candidate,
+        Some(&cache_dir),
+        proxies,
+        Some(rule_providers),
+        prior_resolver.as_deref(),
+    )
+    .await
+    .map(Some)
+    .map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("dns config rebuild failed: {e}"),
+        )
+    })
 }
 
 /// Publish a rebuilt [`meow_config::DnsConfig`]: swap the tunnel's resolver
@@ -2269,6 +2281,7 @@ async fn put_configs(
         &state.config_path,
         &proxies,
         &state.rule_providers,
+        Some(state.tunnel.resolver()),
     )
     .await
     {

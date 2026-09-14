@@ -1647,6 +1647,28 @@ impl Resolver {
         self.fakeip_v4.as_ref().map(|p| p.gateway())
     }
 
+    /// The installed fake-IP pool covering exactly `prefix`, if any.
+    /// Config reload uses this to carry the live mapping table into a
+    /// rebuilt resolver: the pool (store + allocation cursor) IS the
+    /// fake-IP state — dropping it strands clients holding
+    /// `host → 198.18.x.y` answers and lets the cursor reissue their
+    /// addresses to other hosts (issue #514 review follow-up).
+    pub fn fakeip_pool_over(&self, prefix: ipnet::IpNet) -> Option<Arc<Pool>> {
+        [&self.fakeip_v4, &self.fakeip_v6]
+            .into_iter()
+            .flatten()
+            .find(|p| {
+                // Semantic range equality: `198.18.0.1/16` and
+                // `198.18.0.0/16` describe the same pool (anchors derive
+                // from network()/broadcast()), but `IpNet`'s PartialEq
+                // compares the stored address literally — compare the
+                // network base and prefix length instead.
+                let n = p.ipnet();
+                n.network() == prefix.network() && n.prefix_len() == prefix.prefix_len()
+            })
+            .cloned()
+    }
+
     /// Install a v4 fake-IP pool. Caller wires this after `new_with_bootstrap`.
     pub fn set_fakeip_v4(&mut self, pool: Arc<Pool>) {
         self.fakeip_v4 = Some(pool);

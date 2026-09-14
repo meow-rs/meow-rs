@@ -196,3 +196,52 @@ async fn native_x25519_0rtt_resumption() {
 async fn random_x25519_0rtt_resumption() {
     run_0rtt_case("random").await;
 }
+
+/// Half-close regression (issue #514 review follow-up): a server-side FIN
+/// on the send direction ends the client's record read loop on a clean
+/// boundary EOF — but the exchange is only half-closed, so a client still
+/// uploading must keep reaching the server. The old supervisor aborted the
+/// write task with the read loop, silently dropping the tail of uploads.
+#[tokio::test]
+async fn server_half_close_keeps_client_upload_alive() {
+    let keys = make_keys(&KeySpec::X25519);
+    let enc = client_encryption_string("native", "1rtt", &keys);
+    let client = parse_client_encryption(&enc).unwrap().unwrap();
+    let server = Arc::new(ServerInstance::init(keys, 0, 0, 0, "").unwrap());
+
+    let (c_raw, s_raw) = duplex(256 * 1024);
+    let server_task =
+        tokio::spawn(async move { server.handshake(Box::new(s_raw)).await.expect("server") });
+    let mut c = client.handshake(Box::new(c_raw)).await.expect("client");
+
+    c.write_all(b"ping").await.unwrap();
+    c.flush().await.unwrap();
+    let mut s = server_task.await.expect("server task");
+    let mut buf = [0u8; 4];
+    s.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"ping");
+
+    // Server half-closes its send direction but keeps reading uploads.
+    s.shutdown().await.unwrap();
+
+    // The client observes the half-close on its read direction.
+    let mut sink = Vec::new();
+    tokio::time::timeout(std::time::Duration::from_secs(2), c.read_to_end(&mut sink))
+        .await
+        .expect("client read side must observe the server FIN")
+        .unwrap();
+
+    // Give the supervisor a scheduling slice: under the buggy version it
+    // aborts the write task as soon as the read loop ends.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // A post-FIN upload must still reach the server.
+    c.write_all(b"post-fin upload").await.unwrap();
+    c.flush().await.unwrap();
+    let mut got = [0u8; 15];
+    tokio::time::timeout(std::time::Duration::from_secs(2), s.read_exact(&mut got))
+        .await
+        .expect("server must keep receiving uploads after its own FIN")
+        .unwrap();
+    assert_eq!(&got, b"post-fin upload");
+}
