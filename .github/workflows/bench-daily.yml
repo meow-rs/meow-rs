@@ -53,6 +53,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p target/bench
+          # The whole target/ dir is cache-restored — drop stale results
+          # so a failed run can't publish yesterday's numbers as today's
+          # artifact (the summary/upload steps below run `if: always()`).
+          rm -f target/bench/results.json target/bench/results.md
           bash bench.sh | tee target/bench/results.md
 
       - name: Publish results to run summary
@@ -72,12 +76,17 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          mkdir -p target/bench/prev
+          # $RUNNER_TEMP, not target/: the actions/cache above persists the
+          # whole target/ dir, so prev/ under it would accumulate run dirs
+          # from days ago and silently widen the median baseline past the
+          # intended 5 most-recent runs.
+          PREV="$RUNNER_TEMP/bench-prev"
+          mkdir -p "$PREV"
           gh run list --workflow "Daily Benchmark" --repo "$GITHUB_REPOSITORY" \
             --branch "$GITHUB_REF_NAME" --status success --limit 5 \
             --json databaseId --jq '.[].databaseId' | while read -r id; do
             gh run download "$id" --repo "$GITHUB_REPOSITORY" \
-              -n "bench-daily-$id" -D "target/bench/prev/$id" </dev/null 2>/dev/null || true
+              -n "bench-daily-$id" -D "$PREV/$id" </dev/null 2>/dev/null || true
           done
 
       - name: Check regression vs baseline
@@ -97,8 +106,8 @@ jobs:
         # Emits a workflow annotation rather than failing the job.
         continue-on-error: true
         run: |
-          if find target/bench/prev -name '*.json' -print -quit | grep -q .; then
-            python3 bench/compare.py target/bench/prev target/bench/results.json --threshold 0.20 \
+          if find "$RUNNER_TEMP/bench-prev" -name '*.json' -print -quit 2>/dev/null | grep -q .; then
+            python3 bench/compare.py "$RUNNER_TEMP/bench-prev" target/bench/results.json --threshold 0.20 \
               || echo "::warning::benchmark regressed >20% vs recent-run median — see compare output"
           else
             echo "no previous artifacts found; skipping day-over-day compare"
