@@ -81,7 +81,9 @@ jobs:
           # from days ago and silently widen the median baseline past the
           # intended 5 most-recent runs.
           PREV="$RUNNER_TEMP/bench-prev"
-          mkdir -p "$PREV"
+          # Rebuild from scratch: hosted runners give a fresh temp per
+          # job, but self-hosted runners may reuse it — never accumulate.
+          rm -rf "$PREV" && mkdir -p "$PREV"
           gh run list --workflow "Daily Benchmark" --repo "$GITHUB_REPOSITORY" \
             --branch "$GITHUB_REF_NAME" --status success --limit 5 \
             --json databaseId --jq '.[].databaseId' | while read -r id; do
