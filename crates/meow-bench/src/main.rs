@@ -90,6 +90,33 @@ struct Args {
 
 const PROXY_PORT: u16 = 17890;
 
+/// Best-effort provenance for the JSON artifact — every field degrades
+/// to `None` rather than failing the run.
+fn collect_meta(args: &Args) -> results::BenchMeta {
+    fn cmd_output(cmd: &str, args: &[&str]) -> Option<String> {
+        let out = Command::new(cmd).args(args).output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (!s.is_empty()).then_some(s)
+    }
+    results::BenchMeta {
+        meow_version: env!("CARGO_PKG_VERSION").to_string(),
+        tested_version: args
+            .rust_binary
+            .to_str()
+            .and_then(|b| cmd_output(b, &["-v"])),
+        git_sha: cmd_output("git", &["rev-parse", "HEAD"]),
+        rustc: cmd_output("rustc", &["--version"]),
+        mihomo_version: std::env::var("MIHOMO_VERSION")
+            .ok()
+            .filter(|s| !s.is_empty()),
+        platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+        duration_secs: args.duration,
+    }
+}
+
 async fn wait_for_port(addr: SocketAddr, timeout: Duration) -> anyhow::Result<()> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
@@ -114,7 +141,9 @@ async fn wait_for_udp_port(addr: SocketAddr, timeout: Duration) -> anyhow::Resul
 
     let mut msg = Message::new(0, MessageType::Query, OpCode::Query);
     msg.metadata.recursion_desired = true;
-    let name: Name = "ping.invalid.".parse()?;
+    // `.bench` is outside mihomo's default fake-ip-filter, so a fake-ip
+    // config answers this probe locally instead of forwarding upstream.
+    let name: Name = "probe.bench.".parse()?;
     msg.add_query(Query::query(name, RecordType::A));
     let probe = msg.to_bytes()?;
 
@@ -312,16 +341,9 @@ async fn benchmark_target(
     // W2 — Latency
     eprintln!("[{target_name}] benchmarking latency...");
     let latency = if run_all || only == "latency" {
-        bench_latency::bench_latency(proxy_addr, echo_addr, args.latency_iterations).await?
+        Some(bench_latency::bench_latency(proxy_addr, echo_addr, args.latency_iterations).await?)
     } else {
-        bench_latency::LatencyResult {
-            iterations: 0,
-            p50_us: 0.0,
-            p95_us: 0.0,
-            p99_us: 0.0,
-            min_us: 0.0,
-            max_us: 0.0,
-        }
+        None
     };
 
     // W3 — Connection rate (also measures peak RSS concurrently)
@@ -335,17 +357,11 @@ async fn benchmark_target(
             bench_connrate::bench_conn_rate(proxy_addr, echo_addr, args.duration, args.concurrency)
                 .await?;
         let peak_rss = rss_handle.await?.unwrap_or(0);
-        (cr, peak_rss)
+        (Some(cr), peak_rss)
     } else {
-        (
-            bench_connrate::ConnRateResult {
-                duration_secs: 0.0,
-                total_connections: 0,
-                connections_per_sec: 0.0,
-                echo_timeouts: 0,
-            },
-            rss_idle,
-        )
+        // Skipped: `rss_load` stays the idle reading — rendering shows
+        // idle twice, which is the honest answer when no load ran.
+        (None, rss_idle)
     };
 
     eprintln!(
@@ -372,7 +388,11 @@ async fn benchmark_target(
                     .arg(&args.binary_arg)
                     .arg(dns_config.as_os_str())
                     .stdout(Stdio::null())
-                    .stderr(Stdio::null())
+                    // Inherit stderr like the primary child: if the DNS
+                    // config is rejected (e.g. mihomo chokes on a field)
+                    // the failure must be visible, not a silent
+                    // `dns: null` in the results.
+                    .stderr(Stdio::inherit())
                     .spawn()
                     .map_err(|e| anyhow::anyhow!("failed to start DNS proxy: {e}"))?,
             );
@@ -446,6 +466,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let report = ComparisonReport {
+        meta: collect_meta(&args),
         rust: rust_results,
         go: go_results,
     };

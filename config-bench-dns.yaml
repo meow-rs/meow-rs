@@ -1,3 +1,9 @@
+# W4 DNS benchmark config — used by meow-bench --dns-config.
+#
+# fake-ip mode is deliberate: every A query is answered locally from the
+# pool (allocation + reverse mapping), so the workload needs no external
+# upstream and directly exercises the fake-IP path. mihomo understands
+# the same keys, so one config serves both targets.
 mixed-port: 17891
 allow-lan: false
 bind-address: "127.0.0.1"
@@ -7,7 +13,8 @@ ipv6: false
 
 dns:
   enable: true
-  listen: "127.0.0.1:15353"
+  listen: 127.0.0.1:15353
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
   nameserver:
-    - "8.8.8.8"
-    - "1.1.1.1"
+    - 127.0.0.1

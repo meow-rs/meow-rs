@@ -3,7 +3,12 @@
 Compare a new benchmark run against a baseline and flag regressions.
 
 Usage:
-    python3 bench/compare.py <baseline.json> <current.json> [--threshold 0.05]
+    python3 bench/compare.py <baseline> <current.json> [--threshold 0.05]
+
+`baseline` may be a single results.json, or a directory of downloaded
+run artifacts (searched recursively for *.json). A directory collapses
+into a synthetic baseline of per-metric medians — far more robust on
+noisy shared CI runners than comparing against any single day.
 
 Exit codes:
     0  no regressions beyond threshold
@@ -11,8 +16,10 @@ Exit codes:
 """
 
 import json
+import statistics
 import sys
 import argparse
+from pathlib import Path
 
 
 METRICS = [
@@ -35,20 +42,80 @@ def get_nested(obj, path):
     return obj
 
 
+def set_nested(obj, path, value):
+    keys = path.split(".")
+    for key in keys[:-1]:
+        obj = obj.setdefault(key, {})
+    obj[keys[-1]] = value
+
+
 def get_throughput(rust_obj, label):
-    for t in rust_obj.get("throughput", []):
+    for t in rust_obj.get("throughput") or []:
         if t.get("label", "").startswith(label):
             return t.get("gbps")
     return None
 
 
+def load_baseline_rust(baseline, current_path=None):
+    """Return the `rust` object to compare `current` against."""
+    p = Path(baseline)
+    if not p.is_dir():
+        with open(p) as f:
+            return json.load(f).get("rust", {})
+
+    current_resolved = Path(current_path).resolve() if current_path else None
+    rusts = []
+    files = []
+    for f in sorted(p.rglob("*.json")):
+        # Never let the current run become part of its own baseline —
+        # passing e.g. `target/bench` as the dir would otherwise dilute
+        # the regression signal with the very numbers being judged.
+        if current_resolved is not None and f.resolve() == current_resolved:
+            continue
+        try:
+            with open(f) as fh:
+                doc = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(doc, dict):
+            continue
+        rust = doc.get("rust")
+        if isinstance(rust, dict) and rust:
+            rusts.append(rust)
+            files.append(f)
+
+    if not rusts:
+        return {}
+
+    print(f"baseline: per-metric median over {len(rusts)} previous run(s)")
+    for f in files:
+        print(f"  - {f}")
+
+    base = {}
+    for path, _label, _hib in METRICS:
+        vals = [
+            v
+            for o in rusts
+            if isinstance(v := get_nested(o, path), (int, float))
+        ]
+        if vals:
+            set_nested(base, path, statistics.median(vals))
+
+    tps = [
+        t
+        for o in rusts
+        if isinstance(t := get_throughput(o, THROUGHPUT_LABEL), (int, float))
+    ]
+    base["throughput"] = (
+        [{"label": THROUGHPUT_LABEL, "gbps": statistics.median(tps)}] if tps else []
+    )
+    return base
+
+
 def compare(baseline_path, current_path, threshold):
-    with open(baseline_path) as f:
-        baseline = json.load(f)
+    base_rust = load_baseline_rust(baseline_path, current_path)
     with open(current_path) as f:
         current = json.load(f)
-
-    base_rust = baseline.get("rust", {})
     curr_rust = current.get("rust", {})
 
     regressions = []
@@ -86,6 +153,11 @@ def compare(baseline_path, current_path, threshold):
         print(f"{label:<35} {base:>12.2f} {curr:>12.2f} {pct:>+7.1f}%  {flag}{marker}")
 
     print()
+    if not rows:
+        print(
+            "WARNING: no comparable metrics — nothing was compared",
+            file=sys.stderr,
+        )
     if regressions:
         print(f"FAIL: {len(regressions)} regression(s) beyond {threshold*100:.0f}% threshold:")
         for r in regressions:
@@ -97,7 +169,7 @@ def compare(baseline_path, current_path, threshold):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("baseline", help="Path to baseline JSON")
+    parser.add_argument("baseline", help="Path to a baseline JSON, or a directory of run artifacts")
     parser.add_argument("current", help="Path to current run JSON")
     parser.add_argument("--threshold", type=float, default=0.05,
                         help="Regression threshold as a fraction (default: 0.05 = 5%%)")
