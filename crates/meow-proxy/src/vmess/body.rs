@@ -211,32 +211,46 @@ impl BodyCipher {
     }
 
     /// Read and decrypt one body record.
+    ///
+    /// `Ok(None)` is the clean close: the peer's FIN landed exactly on a
+    /// record boundary (zero bytes into the next length prefix), or it sent
+    /// the protocol's zero-length terminator record. Every `Err` — a
+    /// partial length prefix, a body shorter than the prefix promised,
+    /// decrypt failure, nonce-budget exhaustion, transport error — means a
+    /// corrupt session and is fatal for the exchange: a truncated AEAD
+    /// record must not be mistaken for a half-close (issue #514 review).
     pub async fn read_record<R: AsyncRead + Unpin>(
         &mut self,
         reader: &mut R,
-    ) -> std::io::Result<Vec<u8>> {
-        if matches!(self.read, RecordCipher::None) {
-            let mut len_buf = [0u8; 2];
-            reader.read_exact(&mut len_buf).await?;
-            let len = u16::from_be_bytes(len_buf) as usize;
-            if len == 0 {
-                return Err(std::io::ErrorKind::UnexpectedEof.into());
+    ) -> std::io::Result<Option<Vec<u8>>> {
+        // Two-phase length-prefix read: a bare `read` returning 0 is FIN
+        // at a record boundary; `read_exact` alone cannot tell that apart
+        // from a FIN arriving after part of the prefix already landed
+        // (both surface as UnexpectedEof) — and mid-record EOF is fatal.
+        let mut len_buf = [0u8; 2];
+        match reader.read(&mut len_buf).await {
+            Ok(0) => return Ok(None),
+            Ok(n) => {
+                reader.read_exact(&mut len_buf[n..]).await?;
             }
-            let mut buf = vec![0u8; len];
-            reader.read_exact(&mut buf).await?;
-            return Ok(buf);
+            Err(e) => return Err(e),
+        }
+        let len = u16::from_be_bytes(len_buf) as usize;
+        if len == 0 {
+            // Explicit chunk-streaming terminator record.
+            return Ok(None);
         }
 
-        let mut len_buf = [0u8; 2];
-        reader.read_exact(&mut len_buf).await?;
-        let ct_len = u16::from_be_bytes(len_buf) as usize;
-        if ct_len == 0 {
-            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        if matches!(self.read, RecordCipher::None) {
+            let mut buf = vec![0u8; len];
+            reader.read_exact(&mut buf).await?;
+            return Ok(Some(buf));
         }
-        let mut ct = vec![0u8; ct_len];
+
+        let mut ct = vec![0u8; len];
         reader.read_exact(&mut ct).await?;
         let nonce = self.read_nonce()?;
-        self.read.open(&nonce, &ct)
+        self.read.open(&nonce, &ct).map(Some)
     }
 
     pub fn max_plaintext() -> usize {
@@ -280,7 +294,10 @@ mod tests {
             let mut reader = BodyCipher::new(security, &req_key, &req_iv, 0x42);
             reader.mirror_write_to_read();
             let mut cursor = std::io::Cursor::new(wire);
-            assert_eq!(reader.read_record(&mut cursor).await.unwrap(), plaintext);
+            assert_eq!(
+                reader.read_record(&mut cursor).await.unwrap().as_deref(),
+                Some(plaintext.as_slice())
+            );
         }
     }
 
@@ -345,7 +362,10 @@ mod tests {
             let mut wire = Vec::new();
             c.write_record(&mut wire, b"last").await.unwrap();
             let mut cursor = std::io::Cursor::new(wire);
-            assert_eq!(c.read_record(&mut cursor).await.unwrap(), b"last");
+            assert_eq!(
+                c.read_record(&mut cursor).await.unwrap().as_deref(),
+                Some(b"last".as_slice())
+            );
             // The next read would need nonce 0 again.
             let mut more = Vec::new();
             let mut c2 = BodyCipher::new(security, &req_key, &req_iv, 0x42);
@@ -384,7 +404,66 @@ mod tests {
         let mut client = BodyCipher::new(Security::Aes128Gcm, &req_key, &req_iv, 0x42);
         let mut cursor = std::io::Cursor::new(wire);
         let decrypted = client.read_record(&mut cursor).await.unwrap();
-        assert_eq!(decrypted, plaintext);
+        assert_eq!(decrypted.as_deref(), Some(plaintext.as_slice()));
+    }
+
+    /// EOF classification contract: `Ok(None)` only for a FIN exactly at a
+    /// record boundary or the zero-length terminator; every mid-record EOF
+    /// is an `Err` — the relay treats it as a corrupt session, not a
+    /// half-close (issue #514 review).
+    async fn read_record_eof_classification() {
+        let (req_key, req_iv) = test_keys();
+
+        for security in [
+            Security::None,
+            Security::Aes128Gcm,
+            Security::ChaCha20Poly1305,
+        ] {
+            // Boundary FIN: stream ends before any byte of the next record.
+            let mut c = BodyCipher::new(security, &req_key, &req_iv, 0x42);
+            let mut cursor = std::io::Cursor::new(Vec::new());
+            assert_eq!(
+                c.read_record(&mut cursor).await.unwrap(),
+                None,
+                "{security:?}: boundary FIN must be Ok(None)"
+            );
+
+            // Terminator record: zero length prefix.
+            let mut c = BodyCipher::new(security, &req_key, &req_iv, 0x42);
+            let mut cursor = std::io::Cursor::new(vec![0x00, 0x00]);
+            assert_eq!(
+                c.read_record(&mut cursor).await.unwrap(),
+                None,
+                "{security:?}: terminator record must be Ok(None)"
+            );
+
+            // Partial length prefix: one byte of the two arrived, then FIN.
+            let mut c = BodyCipher::new(security, &req_key, &req_iv, 0x42);
+            let mut cursor = std::io::Cursor::new(vec![0x00]);
+            assert!(
+                c.read_record(&mut cursor).await.is_err(),
+                "{security:?}: half-read length prefix must be fatal"
+            );
+
+            // Truncated body: prefix promises 8 bytes, 3 arrive.
+            let mut c = BodyCipher::new(security, &req_key, &req_iv, 0x42);
+            let mut cursor = std::io::Cursor::new(vec![0x00, 0x08, 1, 2, 3]);
+            assert!(
+                c.read_record(&mut cursor).await.is_err(),
+                "{security:?}: truncated body must be fatal"
+            );
+        }
+
+        // AEAD tag corruption is fatal too (not an EOF at all).
+        let (req_key, req_iv) = test_keys();
+        let mut writer = BodyCipher::new(Security::Aes128Gcm, &req_key, &req_iv, 0x42);
+        let mut wire = Vec::new();
+        writer.write_record(&mut wire, b"payload").await.unwrap();
+        *wire.last_mut().unwrap() ^= 0xff;
+        let mut reader = BodyCipher::new(Security::Aes128Gcm, &req_key, &req_iv, 0x42);
+        reader.mirror_write_to_read();
+        let mut cursor = std::io::Cursor::new(wire);
+        assert!(reader.read_record(&mut cursor).await.is_err());
     }
 
     #[tokio::test]
@@ -393,6 +472,7 @@ mod tests {
         body_key_derivation_matches_protocol();
         record_nonce_overwrites_iv_prefix_and_increments();
         read_record_decrypts_independently_encoded_response().await;
+        read_record_eof_classification().await;
         nonce_budget_retires_instead_of_reusing().await;
     }
 }

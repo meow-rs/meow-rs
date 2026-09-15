@@ -401,7 +401,7 @@ pub(super) fn spawn_relay(stream: Box<dyn Stream>, dp: DataPhase) -> Box<dyn Str
         wr, proxy_rd, aead, write_ctr, pre_write, united_key, use_aes,
     ));
 
-    let aborts = [read_task.abort_handle(), write_task.abort_handle()];
+    let read_abort = read_task.abort_handle();
     let write_abort = write_task.abort_handle();
 
     // Same supervisor contract as the vmess relay: when the read side ends
@@ -429,7 +429,7 @@ pub(super) fn spawn_relay(stream: Box<dyn Stream>, dp: DataPhase) -> Box<dyn Str
     });
 
     Box::new(crate::tasked_duplex::TaskedDuplex::new(
-        client, aborts, write_task,
+        client, read_abort, write_task,
     ))
 }
 
@@ -471,7 +471,8 @@ async fn read_loop(
         Some(a) => a,
         None => {
             let mut sr = [0u8; 16];
-            if rd.read_exact(&mut sr).await.is_err() {
+            if let Err(e) = rd.read_exact(&mut sr).await {
+                tracing::debug!("vless encryption: server random read failed: {e}");
                 let _ = proxy_wr.shutdown().await;
                 return false;
             }
@@ -482,10 +483,18 @@ async fn read_loop(
         }
     };
 
-    // 1-RTT: consume the server's padding body (decrypt + discard).
+    // 1-RTT: consume the server's padding body (decrypt + discard). A
+    // failure here is post-handshake corruption, not an expected 0-RTT
+    // rejection — warn.
     if peer_padding_len > 0 {
         let mut pad = vec![0u8; peer_padding_len];
-        if rd.read_exact(&mut pad).await.is_err() || peer_aead.open(&pad).is_err() {
+        if let Err(e) = rd.read_exact(&mut pad).await {
+            tracing::warn!("vless encryption: server padding read failed: {e}");
+            let _ = proxy_wr.shutdown().await;
+            return false;
+        }
+        if peer_aead.open(&pad).is_err() {
+            tracing::warn!("vless encryption: server padding failed to authenticate");
             let _ = proxy_wr.shutdown().await;
             return false;
         }
@@ -504,23 +513,41 @@ async fn read_loop(
                 break;
             }
             Ok(n) => {
-                if rd.read_exact(&mut hdr[n..]).await.is_err() {
+                if let Err(e) = rd.read_exact(&mut hdr[n..]).await {
+                    tracing::warn!(
+                        "vless encryption: record header truncated by peer EOF \
+                         ({n}/{} bytes): {e}",
+                        hdr.len()
+                    );
                     break;
                 }
             }
-            Err(_) => break,
+            Err(e) => {
+                tracing::warn!("vless encryption: record header read failed: {e}");
+                break;
+            }
         }
         if let Some(ctr) = read_ctr.as_mut() {
             ctr.apply_keystream(&mut hdr);
         }
         let Ok(l) = decode_header(&hdr) else {
-            if !first_record_ok {
+            if first_record_ok {
+                tracing::warn!("vless encryption: undecodable record header");
+            } else {
+                // A first-record decode failure is the expected shape of a
+                // 0-RTT ticket rejection (the server answers deliberate
+                // noise) — invalidate quietly, do not warn.
                 invalidate(&reset_cache);
+                tracing::debug!(
+                    "vless encryption: first record header undecodable \
+                     (0-rtt ticket rejected?)"
+                );
             }
             break;
         };
         let mut data = vec![0u8; l];
-        if rd.read_exact(&mut data).await.is_err() {
+        if let Err(e) = rd.read_exact(&mut data).await {
+            tracing::warn!("vless encryption: record body truncated: {e}");
             break;
         }
         let rekey = peer_aead.is_exhausted().then(|| {
@@ -530,8 +557,14 @@ async fn read_loop(
             Aead::new(&ctx, &united_key, use_aes)
         });
         let Ok(plain) = peer_aead.open_ad(&data, &hdr) else {
-            if !first_record_ok {
+            if first_record_ok {
+                tracing::warn!("vless encryption: record authentication failed");
+            } else {
                 invalidate(&reset_cache);
+                tracing::debug!(
+                    "vless encryption: first record failed to authenticate \
+                     (0-rtt ticket rejected?)"
+                );
             }
             break;
         };

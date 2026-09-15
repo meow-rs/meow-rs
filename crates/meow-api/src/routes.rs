@@ -1170,8 +1170,8 @@ fn dns_inputs_equal(a: &RawConfig, b: &RawConfig) -> bool {
 /// name-resolved refresh loops reach the live generation (issue #514).
 /// `prior_resolver` is the resolver generation being replaced — the
 /// tunnel's live resolver — so the rebuild can carry the fake-IP pool
-/// over when the range and store kind are unchanged (issue #514 review
-/// follow-up).
+/// over when the range and store identity (in-memory vs the same
+/// backing file) are unchanged (issue #514 review follow-up).
 pub async fn reconcile_dns_config(
     raw_config: &RwLock<RawConfig>,
     candidate: &RawConfig,

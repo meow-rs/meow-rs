@@ -34,37 +34,50 @@ use tokio::task::{AbortHandle, JoinHandle};
 /// task to flush buffered plaintext onto the transport. Live transports
 /// drain in milliseconds; this only bounds wedged ones (full send buffer
 /// on a dead peer), after which the task is aborted and shutdown reports
-/// success. The bound is additive with the relay's half-close linger —
-/// a wedged transport with a dead peer tears down in at most
-/// drain-timeout + linger — never unbounded.
+/// an error — accepted bytes were dropped mid-drain, so `Ok(())` would
+/// claim a clean shutdown that did not happen. The bound is additive with
+/// the relay's half-close linger — a wedged transport with a dead peer
+/// tears down in at most drain-timeout + linger — never unbounded.
+/// Note the error is best-effort through the tunnel relay: if the other
+/// direction already finished, its earlier-armed linger may reap the
+/// relay first and the caller sees `Ok` — teardown is bounded either way.
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// A `DuplexStream` endpoint plus the `AbortHandle`s of the tasks serving it.
+/// A `DuplexStream` endpoint plus handles to the two tasks serving it.
+///
+/// Ownership is explicit rather than a bag of `AbortHandle`s: the
+/// read-side task is owned by the protocol supervisor (which decides
+/// whether its exit was a clean half-close or a fatal end and stops the
+/// write side accordingly) — we hold only its `AbortHandle` so `Drop`
+/// can still kill it. The write-side task is owned by us: its
+/// `JoinHandle` is what `poll_shutdown` waits on for the graceful drain,
+/// and its `AbortHandle` is derived here so no call site can forget it.
 pub(crate) struct TaskedDuplex {
     inner: DuplexStream,
-    tasks: Box<[AbortHandle]>,
+    /// Aborts the read-side relay task on drop.
+    read_abort: AbortHandle,
     /// Resolves when the write-side relay task exits — i.e. all buffered
     /// plaintext has been framed/encrypted onto the transport and the
     /// transport's write half was shut down. `None` once shutdown has
     /// observed it.
     write_done: Option<JoinHandle<()>>,
     /// Abort handle for that same write task — fired when the drain wait
-    /// times out so a wedged transport is released instead of pinning it.
+    /// times out so a wedged transport is released instead of pinning it,
+    /// and on drop.
     write_abort: AbortHandle,
     /// Lazily armed on the first pending drain poll.
     drain_deadline: Option<Pin<Box<tokio::time::Sleep>>>,
 }
 
 impl TaskedDuplex {
-    pub fn new(
-        inner: DuplexStream,
-        tasks: impl IntoIterator<Item = AbortHandle>,
-        write_task: JoinHandle<()>,
-    ) -> Self {
+    /// `read_abort` aborts the read-side relay task (owned by the
+    /// supervisor); `write_task` is the write-side relay task we wait on
+    /// during graceful shutdown.
+    pub fn new(inner: DuplexStream, read_abort: AbortHandle, write_task: JoinHandle<()>) -> Self {
         let write_abort = write_task.abort_handle();
         Self {
             inner,
-            tasks: tasks.into_iter().collect(),
+            read_abort,
             write_done: Some(write_task),
             write_abort,
             drain_deadline: None,
@@ -103,8 +116,9 @@ impl AsyncWrite for TaskedDuplex {
         // Graceful close: surface Ready only once the write-side task has
         // drained the duplex buffer onto the transport and shut the
         // transport down. A join error (aborted write task — e.g. a fatal
-        // read-side failure — or a panic) also ends the wait: there is
-        // nothing left to drain.
+        // read-side failure — or a panic) also ends the wait, but reports
+        // failure: accepted bytes were dropped, so `Ok(())` would claim a
+        // clean shutdown that did not happen.
         if let Some(handle) = self.write_done.as_mut() {
             match Pin::new(handle).poll(cx) {
                 Poll::Pending => {
@@ -114,19 +128,36 @@ impl AsyncWrite for TaskedDuplex {
                     if deadline.as_mut().poll(cx).is_pending() {
                         return Poll::Pending;
                     }
-                    // Wedged transport: release it and report success so the
-                    // connection can tear down inside the same bound the
-                    // abort-on-drop path provides.
+                    // Wedged transport: release it so the connection tears
+                    // down inside the same bound the abort-on-drop path
+                    // provides — but the shutdown failed, say so.
                     self.write_abort.abort();
+                    self.write_done = None;
+                    tracing::warn!(
+                        "tasked duplex: write drain timed out after {SHUTDOWN_DRAIN_TIMEOUT:?}; \
+                         accepted payload dropped"
+                    );
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "tasked duplex: write drain timed out",
+                    )));
                 }
-                // A panic mid-drain loses buffered plaintext while the
-                // caller sees Ok — keep it observable.
-                Poll::Ready(Err(e)) if e.is_panic() => {
-                    tracing::warn!("tasked duplex write task panicked: {e}");
+                Poll::Ready(Err(e)) => {
+                    // The writer died before draining (panic, or aborted by
+                    // the supervisor after a fatal read-side failure).
+                    if e.is_panic() {
+                        tracing::warn!("tasked duplex write task panicked: {e}");
+                    }
+                    self.write_done = None;
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "tasked duplex: write task ended before drain completed",
+                    )));
                 }
-                Poll::Ready(_) => {}
+                Poll::Ready(Ok(())) => {
+                    self.write_done = None;
+                }
             }
-            self.write_done = None;
         }
         Poll::Ready(Ok(()))
     }
@@ -134,12 +165,7 @@ impl AsyncWrite for TaskedDuplex {
 
 impl Drop for TaskedDuplex {
     fn drop(&mut self) {
-        for task in &self.tasks {
-            task.abort();
-        }
-        // `tasks` is expected to include the write task's handle, but the
-        // struct does not enforce that — abort it here unconditionally so
-        // a call site that forgot cannot leak the writer.
+        self.read_abort.abort();
         self.write_abort.abort();
     }
 }
@@ -163,8 +189,8 @@ mod tests {
             let _ = tokio::io::copy(&mut proxy_rd, &mut wr).await;
             let _ = wr.shutdown().await;
         });
-        let aborts = [read_task.abort_handle(), write_task.abort_handle()];
-        (TaskedDuplex::new(client, aborts, write_task), read_task)
+        let read_abort = read_task.abort_handle();
+        (TaskedDuplex::new(client, read_abort, write_task), read_task)
     }
 
     /// Regression for the #514 review follow-up: `shutdown()` must wait for
@@ -181,8 +207,9 @@ mod tests {
             let _ = tokio::io::copy(&mut proxy_rd, &mut wr).await;
             let _ = wr.shutdown().await;
         });
-        let abort = write_task.abort_handle();
-        let mut conn = TaskedDuplex::new(client, [abort], write_task);
+        // No read pump in this scenario — a parked task stands in for it.
+        let read_stub = tokio::spawn(std::future::pending::<()>());
+        let mut conn = TaskedDuplex::new(client, read_stub.abort_handle(), write_task);
 
         conn.write_all(b"accepted payload").await.unwrap();
         // Must not return until the writer pushed the bytes to the wire.
@@ -192,6 +219,48 @@ mod tests {
         let mut received = Vec::new();
         peer.read_to_end(&mut received).await.unwrap();
         assert_eq!(received, b"accepted payload");
+    }
+
+    /// A write task that never drains (wedged transport) must not hang
+    /// `shutdown()` forever — after [`SHUTDOWN_DRAIN_TIMEOUT`] the writer
+    /// is aborted and shutdown reports failure: accepted bytes were
+    /// dropped, so `Ok(())` would lie.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_times_out_and_reports_error_when_writer_wedged() {
+        let (client, _proxy) = tokio::io::duplex(4096);
+        let wedged_writer = tokio::spawn(std::future::pending::<()>());
+        let read_stub = tokio::spawn(std::future::pending::<()>());
+        let mut conn = TaskedDuplex::new(client, read_stub.abort_handle(), wedged_writer);
+
+        conn.write_all(b"never delivered").await.unwrap();
+        let err = conn
+            .shutdown()
+            .await
+            .expect_err("a wedged drain must not report a clean shutdown");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+
+        // Idempotent: the write side IS shut down (aborted) — a second
+        // call must not re-poll the spent JoinHandle or re-report.
+        conn.shutdown().await.unwrap();
+    }
+
+    /// If the write task is already gone when shutdown is polled (aborted
+    /// by the supervisor after a fatal read-side failure), the drain can
+    /// never complete — report failure rather than Ok(()).
+    #[tokio::test]
+    async fn shutdown_reports_error_when_writer_already_aborted() {
+        let (client, _proxy) = tokio::io::duplex(4096);
+        let write_task = tokio::spawn(std::future::pending::<()>());
+        let write_abort = write_task.abort_handle();
+        let read_stub = tokio::spawn(std::future::pending::<()>());
+        let mut conn = TaskedDuplex::new(client, read_stub.abort_handle(), write_task);
+        write_abort.abort();
+
+        let err = conn
+            .shutdown()
+            .await
+            .expect_err("a dead writer cannot complete the drain");
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
     }
 
     /// After a graceful shutdown the read direction still delivers data

@@ -574,8 +574,9 @@ pub fn rebuild_from_raw_with_cache_dir(
 /// of orphaned startup-era objects (issue #514 review).
 /// `prior_resolver` is the resolver generation being replaced — reload
 /// paths pass the tunnel's live resolver so the rebuilt one can inherit
-/// the fake-IP pool when the range and store kind are unchanged (issue
-/// #514 review follow-up). `None` on cold start.
+/// the fake-IP pool when the range and store identity (in-memory vs the
+/// same backing file) are unchanged (issue #514 review follow-up).
+/// `None` on cold start.
 pub async fn parse_dns_from_raw(
     raw: &raw::RawConfig,
     cache_dir: Option<&Path>,

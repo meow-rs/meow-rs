@@ -64,6 +64,15 @@ pub trait Store: Send + Sync {
     fn is_persistent(&self) -> bool {
         false
     }
+    /// The backing file for a persistent store, `None` for in-memory.
+    /// Config reload keys fake-IP pool reuse on this (together with the
+    /// prefix): two stores answering `is_persistent` but bound to
+    /// different files are NOT the same state — carrying one into a
+    /// resolver configured for the other path would keep writing the old
+    /// file and never load the new one.
+    fn persistent_path(&self) -> Option<&Path> {
+        None
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -422,6 +431,9 @@ impl Store for FileStore {
     fn is_persistent(&self) -> bool {
         true
     }
+    fn persistent_path(&self) -> Option<&Path> {
+        Some(&self.path)
+    }
 }
 
 fn serialise(s: &PersistedSnapshot) -> PersistedSnapshot {
@@ -550,11 +562,19 @@ impl Pool {
     }
 
     /// Whether the backing store persists across restarts (`FileStore`)
-    /// or is memory-only (`MemoryStore`). Config reload keys pool reuse
-    /// on this together with the prefix — a pool must not be carried into
-    /// a resolver generation whose `store-fake-ip` flag flipped.
+    /// or is memory-only (`MemoryStore`). Pool reuse on config reload is
+    /// keyed on the stronger [`Pool::store_path`] identity — a pool must
+    /// not be carried into a resolver generation whose `store-fake-ip`
+    /// flag flipped or whose persistent backing file moved.
     pub fn is_persistent(&self) -> bool {
         self.store.is_persistent()
+    }
+
+    /// The backing file of a persistent pool, `None` for an in-memory
+    /// one. Stronger than [`Pool::is_persistent`] for reuse decisions:
+    /// two persistent pools on *different* files hold different state.
+    pub fn store_path(&self) -> Option<&Path> {
+        self.store.persistent_path()
     }
 
     /// Clear every allocation. Subsequent `lookup` calls start fresh from `first`.
