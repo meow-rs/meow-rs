@@ -13,6 +13,9 @@ on:
 
 permissions:
   contents: read
+  # gh run download hits the artifacts API — required for the
+  # day-over-day compare step.
+  actions: read
 
 concurrency:
   group: bench-daily
@@ -50,6 +53,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p target/bench
+          # The whole target/ dir is cache-restored — drop stale results
+          # so a failed run can't publish yesterday's numbers as today's
+          # artifact (the summary/upload steps below run `if: always()`).
+          rm -f target/bench/results.json target/bench/results.md
           bash bench.sh | tee target/bench/results.md
 
       - name: Publish results to run summary
@@ -63,16 +70,50 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Fetch recent runs for day-over-day compare
+        # Best-effort: a gh API blip must not fail the benchmark itself.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # $RUNNER_TEMP, not target/: the actions/cache above persists the
+          # whole target/ dir, so prev/ under it would accumulate run dirs
+          # from days ago and silently widen the median baseline past the
+          # intended 5 most-recent runs.
+          PREV="$RUNNER_TEMP/bench-prev"
+          # Rebuild from scratch: hosted runners give a fresh temp per
+          # job, but self-hosted runners may reuse it — never accumulate.
+          rm -rf "$PREV" && mkdir -p "$PREV"
+          gh run list --workflow "Daily Benchmark" --repo "$GITHUB_REPOSITORY" \
+            --branch "$GITHUB_REF_NAME" --status success --limit 5 \
+            --json databaseId --jq '.[].databaseId' | while read -r id; do
+            gh run download "$id" --repo "$GITHUB_REPOSITORY" \
+              -n "bench-daily-$id" -D "$PREV/$id" </dev/null 2>/dev/null || true
+          done
+
       - name: Check regression vs baseline
         # Non-blocking: the checked-in baseline was measured on the dedicated
         # bench box (docs/benchmarks/hardware.md); GitHub-hosted runners are
         # slower and noisier, so absolute deltas are informational only.
-        # Day-over-day tracking comes from the uploaded artifacts.
         if: hashFiles('docs/benchmarks/baseline-*.json') != ''
         continue-on-error: true
         run: |
           BASELINE=$(ls docs/benchmarks/baseline-*.json | sort | tail -1)
           python3 bench/compare.py "$BASELINE" target/bench/results.json
+
+      - name: Check regression vs recent daily runs
+        # Day-over-day signal: per-metric median of up to 5 previous
+        # successful runs, 20% threshold — wide enough to ride over
+        # hosted-runner noise while still catching a real regression.
+        # Emits a workflow annotation rather than failing the job.
+        continue-on-error: true
+        run: |
+          if find "$RUNNER_TEMP/bench-prev" -name '*.json' -print -quit 2>/dev/null | grep -q .; then
+            python3 bench/compare.py "$RUNNER_TEMP/bench-prev" target/bench/results.json --threshold 0.20 \
+              || echo "::warning::benchmark regressed >20% vs recent-run median — see compare output"
+          else
+            echo "no previous artifacts found; skipping day-over-day compare"
+          fi
 
       - name: Upload results
         uses: actions/upload-artifact@v4

@@ -29,7 +29,8 @@ pub async fn bench_conn_rate(
 ) -> anyhow::Result<ConnRateResult> {
     let counter = Arc::new(AtomicU64::new(0));
     let echo_timeouts = Arc::new(AtomicU64::new(0));
-    let deadline = Instant::now() + Duration::from_secs(duration_secs);
+    let start = Instant::now();
+    let deadline = start + Duration::from_secs(duration_secs);
 
     let mut handles = Vec::new();
     for _ in 0..concurrency {
@@ -63,10 +64,14 @@ pub async fn bench_conn_rate(
 
     let total = counter.load(Ordering::Relaxed);
     let timeouts = echo_timeouts.load(Ordering::Relaxed);
-    let actual_elapsed = duration_secs as f64;
+    // Measured elapsed, not the configured duration: workers may run past
+    // the deadline by up to CONNECT_TIMEOUT + ECHO_TIMEOUT (~20 s) on
+    // their last in-flight conn, so dividing by `duration_secs` would
+    // understate the rate.
+    let actual_elapsed = start.elapsed().as_secs_f64();
     let cps = total as f64 / actual_elapsed;
 
-    eprintln!("  conn-rate: {total} connections in {duration_secs}s = {cps:.0}/s");
+    eprintln!("  conn-rate: {total} connections in {actual_elapsed:.1}s = {cps:.0}/s");
     if timeouts > 0 {
         eprintln!("  echo-timeouts: {timeouts} connections never answered their echo");
     }

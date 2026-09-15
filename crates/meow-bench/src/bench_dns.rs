@@ -51,9 +51,12 @@ pub async fn bench_dns(dns_addr: SocketAddr, duration_secs: u64) -> anyhow::Resu
     const WARMUP_DOMAINS: usize = 500;
     const TOTAL_QUERIES: usize = 5000;
 
-    // Cached domains: small set, 50% of traffic will hit these
+    // Cached domains: small set, 50% of traffic will hit these. The
+    // `.bench` TLD deliberately avoids every entry in mihomo's default
+    // fake-ip-filter (*.lan, *.invalid, *.test, ...) so both binaries
+    // synthesize fake-IP answers locally.
     let cached_domains: Vec<String> = (0..WARMUP_DOMAINS)
-        .map(|i| format!("bench-cache-{i}.example.com."))
+        .map(|i| format!("bench-cache-{i}.bench."))
         .collect();
 
     // Unique domains: generate fresh names so they're cache misses
@@ -92,7 +95,7 @@ pub async fn bench_dns(dns_addr: SocketAddr, duration_secs: u64) -> anyhow::Resu
         } else {
             // Cache miss: unique domain
             cache_miss_queries += 1;
-            format!("bench-miss-{miss_base}-{completed}.example.com.")
+            format!("bench-miss-{miss_base}-{completed}.bench.")
         };
 
         match send_dns_query(&socket, dns_addr, &domain, query_id).await {

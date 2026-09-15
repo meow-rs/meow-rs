@@ -47,11 +47,20 @@ if [ -z "$GO_BINARY" ]; then
         gunzip -f "target/bench/$PATTERN"
         mv "target/bench/mihomo-${OS}-${GO_ARCH}-${LATEST}" "$GO_BINARY"
         chmod +x "$GO_BINARY"
+        echo "$LATEST" > target/bench/mihomo-version
         echo "Go binary: $GO_BINARY"
     else
         echo "Using cached Go binary: $GO_BINARY"
     fi
+
+    # Provenance for results.json: meow-bench records $MIHOMO_VERSION.
+    # The stamp file only describes the managed binary — a caller-provided
+    # GO_BINARY must not inherit it (it may be a different release).
+    if [ -z "${MIHOMO_VERSION:-}" ] && [ -f target/bench/mihomo-version ]; then
+        MIHOMO_VERSION=$(cat target/bench/mihomo-version)
+    fi
 fi
+export MIHOMO_VERSION="${MIHOMO_VERSION:-}"
 
 echo ""
 echo "=== Binary sizes ==="
@@ -66,6 +75,8 @@ mkdir -p target/bench
     --rust-binary "$RUST_BINARY" \
     --go-binary "$GO_BINARY" \
     --config config-bench.yaml \
+    --dns-config config-bench-dns.yaml \
+    --dns-port 15353 \
     --duration "$DURATION" \
     --output target/bench/results.json \
     --markdown

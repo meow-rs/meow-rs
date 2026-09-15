@@ -19,6 +19,7 @@ pub async fn bench_latency(
     echo: SocketAddr,
     iterations: usize,
 ) -> anyhow::Result<LatencyResult> {
+    anyhow::ensure!(iterations > 0, "latency requires at least 1 iteration");
     let mut latencies = Vec::with_capacity(iterations);
 
     for _ in 0..iterations {
