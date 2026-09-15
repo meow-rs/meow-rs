@@ -25,7 +25,7 @@ Every group type accepts these:
 | `exclude-filter` | regex | — | Exclude members whose name matches |
 | `exclude-type` | string \| list | `[]` | Exclude member proxy types, e.g. `[ss, trojan]` |
 | `include-all` | bool | `false` | Include all proxies from all providers |
-| `include-all-proxies` | bool | `false` | Include all statically-defined proxies |
+| `include-all-proxies` | bool | `false` | Include all top-level `proxies:` entries, sorted by name; excludes proxy groups and built-ins |
 
 `filter` / `exclude-filter` are most useful with providers — e.g. keep only nodes whose
 name contains a region tag.

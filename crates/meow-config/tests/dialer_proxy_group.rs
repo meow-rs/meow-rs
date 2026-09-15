@@ -180,7 +180,7 @@ fn group_dialer_routing_back_is_a_config_error() {
         ("G", "  - name: G\n    type: select\n    proxies: [A, B]"),
         // Nested: G holds G2, G2 selects A.
         ("G", "  - name: G\n    type: select\n    proxies: [G2]\n  - name: G2\n    type: select\n    proxies: [A]"),
-        // include-all-proxies pulls every registry name in.
+        // include-all-proxies pulls every top-level proxy in.
         ("G", "  - name: G\n    type: select\n    include-all-proxies: true"),
         // The auto-created GLOBAL contains everything.
         ("GLOBAL", ""),

@@ -100,6 +100,8 @@ the canonical, in-repo source a release is cut from.
   provider-only group still parses but ends up with no members, so the
   warning is the signal to look for. See #485.
 
+- Proxy groups declared before their nested groups now retain those forward
+  references even when either group also names a missing proxy.
 - Hysteria2 authentication no longer advertises HTTP/3 datagrams, preventing
   the server's HTTP/3 receiver from consuming raw QUIC UDP relay packets.
   The TProxy test image now includes the mandatory BoringSSL build toolchain.

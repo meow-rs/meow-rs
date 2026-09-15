@@ -2407,9 +2407,17 @@ fn parse_vmess(
 pub fn parse_proxy_group(
     config: &crate::raw::RawProxyGroup,
     existing_proxies: &HashMap<SmolStr, Arc<dyn Proxy>>,
+    include_all_proxies: &[Arc<dyn Proxy>],
     providers: &HashMap<String, Arc<crate::proxy_provider::ProxyProvider>>,
 ) -> std::result::Result<Arc<dyn Proxy>, String> {
-    parse_proxy_group_inner(config, existing_proxies, true, providers, None)
+    parse_proxy_group_inner(
+        config,
+        existing_proxies,
+        include_all_proxies,
+        true,
+        providers,
+        None,
+    )
 }
 
 /// Variant of [`parse_proxy_group`] that wires a persistent [`meow_proxy::SelectorStore`]
@@ -2417,47 +2425,76 @@ pub fn parse_proxy_group(
 pub fn parse_proxy_group_with_store(
     config: &crate::raw::RawProxyGroup,
     existing_proxies: &HashMap<SmolStr, Arc<dyn Proxy>>,
+    include_all_proxies: &[Arc<dyn Proxy>],
     providers: &HashMap<String, Arc<crate::proxy_provider::ProxyProvider>>,
     store: Option<&Arc<meow_proxy::SelectorStore>>,
 ) -> std::result::Result<Arc<dyn Proxy>, String> {
-    parse_proxy_group_inner(config, existing_proxies, true, providers, store)
+    parse_proxy_group_inner(
+        config,
+        existing_proxies,
+        include_all_proxies,
+        true,
+        providers,
+        store,
+    )
 }
 
 /// Lenient variant: unknown members are warned and skipped rather than
-/// erroring out. Used by the multi-pass group loop on its final (stall) pass
-/// so groups that reference a truly-missing proxy still build with whatever
-/// members *did* resolve — matching upstream mihomo's warn-not-fail contract.
+/// erroring out. The multi-pass group resolver uses the corresponding
+/// with-store variant when strict resolution stalls and every declared group
+/// dependency has been built, and again on its final fallback when no further
+/// progress is possible. This preserves meow-rs's existing missing-member
+/// behavior; mihomo instead rejects a group whose static member name is
+/// missing.
 pub fn parse_proxy_group_lenient(
     config: &crate::raw::RawProxyGroup,
     existing_proxies: &HashMap<SmolStr, Arc<dyn Proxy>>,
+    include_all_proxies: &[Arc<dyn Proxy>],
     providers: &HashMap<String, Arc<crate::proxy_provider::ProxyProvider>>,
 ) -> std::result::Result<Arc<dyn Proxy>, String> {
-    parse_proxy_group_inner(config, existing_proxies, false, providers, None)
+    parse_proxy_group_inner(
+        config,
+        existing_proxies,
+        include_all_proxies,
+        false,
+        providers,
+        None,
+    )
 }
 
 /// Lenient variant with persistent-selector wiring; see
-/// [`parse_proxy_group_with_store`].
+/// [`parse_proxy_group_lenient`].
 pub fn parse_proxy_group_lenient_with_store(
     config: &crate::raw::RawProxyGroup,
     existing_proxies: &HashMap<SmolStr, Arc<dyn Proxy>>,
+    include_all_proxies: &[Arc<dyn Proxy>],
     providers: &HashMap<String, Arc<crate::proxy_provider::ProxyProvider>>,
     store: Option<&Arc<meow_proxy::SelectorStore>>,
 ) -> std::result::Result<Arc<dyn Proxy>, String> {
-    parse_proxy_group_inner(config, existing_proxies, false, providers, store)
+    parse_proxy_group_inner(
+        config,
+        existing_proxies,
+        include_all_proxies,
+        false,
+        providers,
+        store,
+    )
 }
 
 fn parse_proxy_group_inner(
     config: &crate::raw::RawProxyGroup,
     existing_proxies: &HashMap<SmolStr, Arc<dyn Proxy>>,
+    include_all_proxies: &[Arc<dyn Proxy>],
     strict: bool,
     providers: &HashMap<String, Arc<crate::proxy_provider::ProxyProvider>>,
     selector_store: Option<&Arc<meow_proxy::SelectorStore>>,
 ) -> std::result::Result<Arc<dyn Proxy>, String> {
     let mut proxies: Vec<Arc<dyn Proxy>> = Vec::new();
 
-    // include_all_proxies: add all config-defined proxies to static list
+    // Match mihomo: include only top-level `proxies:` entries, not built-ins
+    // or proxy groups that happen to have entered the registry already.
     if config.include_all_proxies.unwrap_or(false) {
-        for p in existing_proxies.values() {
+        for p in include_all_proxies {
             proxies.push(Arc::clone(p));
         }
     }
@@ -3231,7 +3268,7 @@ tls: true
             m
         };
         let config = relay_config("r", vec!["DIRECT".to_string()]);
-        let err = parse_proxy_group(&config, &existing, &Default::default())
+        let err = parse_proxy_group(&config, &existing, &[], &Default::default())
             .err()
             .expect("single-proxy relay must error");
         assert!(
@@ -3257,7 +3294,7 @@ tls: true
         // parse_proxy_group_inner will return "no valid proxies" before reaching
         // relay-specific check (0 proxies ≠ relay-specific error, but still errors).
         // Both paths must return Err.
-        assert!(parse_proxy_group(&config, &existing, &Default::default()).is_err());
+        assert!(parse_proxy_group(&config, &existing, &[], &Default::default()).is_err());
     }
 
     // B3: url field on relay group → warn (NOT error)
@@ -3279,7 +3316,7 @@ tls: true
             ..Default::default()
         };
         // Must NOT error — url is warn-only (Class B).
-        parse_proxy_group(&config, &existing, &Default::default())
+        parse_proxy_group(&config, &existing, &[], &Default::default())
             .expect("relay with url must not hard-error");
     }
 
@@ -3299,7 +3336,7 @@ tls: true
             interval: Some(300),
             ..Default::default()
         };
-        parse_proxy_group(&config, &existing, &Default::default())
+        parse_proxy_group(&config, &existing, &[], &Default::default())
             .expect("relay with interval must not hard-error");
     }
 
@@ -3320,7 +3357,7 @@ tls: true
             interval: Some(300),
             ..Default::default()
         };
-        parse_proxy_group(&config, &existing, &Default::default())
+        parse_proxy_group(&config, &existing, &[], &Default::default())
             .expect("relay with url+interval must not hard-error");
     }
 
@@ -3384,8 +3421,9 @@ tls: true
     #[test]
     fn load_balance_use_providers_warns_not_errors() {
         let config = lb_config_with_providers(Some(vec!["airport".to_string()]), None);
-        let (group, logs) =
-            capture_warns(|| parse_proxy_group(&config, &direct_reject(), &Default::default()));
+        let (group, logs) = capture_warns(|| {
+            parse_proxy_group(&config, &direct_reject(), &[], &Default::default())
+        });
         let group = group.expect("load-balance with use: must not hard-error");
         assert_eq!(
             group.members().unwrap_or_default().len(),
@@ -3402,8 +3440,9 @@ tls: true
     #[test]
     fn load_balance_include_all_warns_not_errors() {
         let config = lb_config_with_providers(None, Some(true));
-        let (group, logs) =
-            capture_warns(|| parse_proxy_group(&config, &direct_reject(), &Default::default()));
+        let (group, logs) = capture_warns(|| {
+            parse_proxy_group(&config, &direct_reject(), &[], &Default::default())
+        });
         let group = group.expect("load-balance with include-all must not hard-error");
         assert_eq!(
             group.members().unwrap_or_default().len(),
@@ -3420,8 +3459,9 @@ tls: true
     #[test]
     fn load_balance_without_providers_does_not_warn() {
         let config = lb_config_with_providers(None, None);
-        let (group, logs) =
-            capture_warns(|| parse_proxy_group(&config, &direct_reject(), &Default::default()));
+        let (group, logs) = capture_warns(|| {
+            parse_proxy_group(&config, &direct_reject(), &[], &Default::default())
+        });
         group.expect("plain load-balance must parse");
         assert!(
             !logs.contains(LB_PROVIDER_WARN),
@@ -3444,7 +3484,7 @@ tls: true
             ..Default::default()
         };
         let (group, logs) =
-            capture_warns(|| parse_proxy_group(&config, &HashMap::new(), &providers));
+            capture_warns(|| parse_proxy_group(&config, &HashMap::new(), &[], &providers));
         let group = group.expect("provider-only load-balance passes the non-empty guard");
         assert!(
             group.members().unwrap_or_default().is_empty(),
@@ -3506,7 +3546,7 @@ tls: true
             exclude_filter: Some("expat".to_string()),
             ..Default::default()
         };
-        let group = parse_proxy_group(&config, &HashMap::new(), &providers).unwrap();
+        let group = parse_proxy_group(&config, &HashMap::new(), &[], &providers).unwrap();
         assert_eq!(group.members().unwrap(), ["US 1"]);
     }
 
@@ -3522,7 +3562,7 @@ tls: true
             use_providers: Some(vec!["airport".to_string()]),
             ..Default::default()
         };
-        let group = parse_proxy_group(&config, &HashMap::new(), &providers).unwrap();
+        let group = parse_proxy_group(&config, &HashMap::new(), &[], &providers).unwrap();
         assert_eq!(group.members().unwrap(), ["US 1", "US 2 expat", "HK 1"]);
     }
 
@@ -3539,7 +3579,7 @@ tls: true
             filter: Some("(".to_string()),
             ..Default::default()
         };
-        let err = parse_proxy_group(&config, &HashMap::new(), &providers)
+        let err = parse_proxy_group(&config, &HashMap::new(), &[], &providers)
             .err()
             .expect("invalid filter regex must error");
         assert!(
