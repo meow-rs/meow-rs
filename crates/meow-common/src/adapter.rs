@@ -129,12 +129,20 @@ pub trait ProxyAdapter: Send + Sync {
     fn support_udp(&self) -> bool;
     async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>>;
     async fn dial_udp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>>;
-    /// Run this adapter's handshake over an already-established `stream`.
+    /// Run this adapter's complete post-connect pipeline over `stream`.
     ///
     /// Used by relay groups (M1.C-2) to chain proxy hops without dialling a
-    /// new TCP connection.  The TLS-wrap step from `dial_tcp` is intentionally
-    /// skipped — the passed stream is already inside whatever encryption the
-    /// relay chain provides.
+    /// new TCP connection.  Equivalent to mihomo's `DialContextWithDialer`
+    /// where the injected dialer yields the existing stream: the adapter runs
+    /// its full configured transport stack (TLS / WebSocket / obfs **to its
+    /// own server**) and then the protocol handshake targeting `metadata`.
+    /// The relay chain guarantees `stream` already terminates at this
+    /// adapter's server.
+    ///
+    /// Single-use resources don't apply here: mux/`reuse` pooling is skipped
+    /// (the stream cannot be re-dialled), and adapters whose protocol needs a
+    /// dedicated socket (hysteria2's QUIC/UDP) or a subprocess-owned leg (SS
+    /// external SIP003 plugins) keep the default.
     ///
     /// Default implementation returns `Err(NotSupported)`.  Override in
     /// adapters that support relay chaining (HTTP CONNECT, SOCKS5, …).

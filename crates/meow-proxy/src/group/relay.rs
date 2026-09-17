@@ -38,22 +38,42 @@ use tracing::debug;
 /// so the port is always the suffix after the rightmost colon.
 fn metadata_for_proxy(proxy: &Arc<dyn Proxy>) -> Metadata {
     let addr = proxy.addr();
-    if let Some(colon) = addr.rfind(':') {
-        let host = &addr[..colon];
-        let port = addr[colon + 1..].parse::<u16>().unwrap_or(0);
-        Metadata {
-            host: host.into(),
-            dst_port: port,
-            ..Default::default()
-        }
+    // IP literals land in `dst_ip` so the preceding hop encodes a typed
+    // address (ATYP 1/4, SocksAddr::Ip) rather than a domain name that
+    // happens to look like one.  `conn_type` is explicit `Inner`:
+    // `Metadata::default()` yields `ConnType::Http`, but this is an internal
+    // chained dial — rules, /connections, and stats must not classify it as
+    // an HTTP inbound.  Same rule `ProxyDialer::dial` applies (review B2).
+    let (host, port) = if let Some(colon) = addr.rfind(':') {
+        (
+            &addr[..colon],
+            addr[colon + 1..].parse::<u16>().unwrap_or(0),
+        )
     } else {
         // Addr with no port (e.g. DIRECT ""). Relay treats it as port 0;
         // DIRECT's connect_over ignores the metadata anyway.
-        Metadata {
-            host: addr.into(),
-            dst_port: 0,
+        (addr, 0)
+    };
+    // Strip brackets so `[2001:db8::1]` parses as an IpAddr too.
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    match bare.parse::<std::net::IpAddr>() {
+        Ok(ip) => Metadata {
+            network: meow_common::Network::Tcp,
+            conn_type: meow_common::ConnType::Inner,
+            dst_ip: Some(ip),
+            dst_port: port,
             ..Default::default()
-        }
+        },
+        Err(_) => Metadata {
+            network: meow_common::Network::Tcp,
+            conn_type: meow_common::ConnType::Inner,
+            host: host.into(),
+            dst_port: port,
+            ..Default::default()
+        },
     }
 }
 
@@ -263,15 +283,27 @@ impl ProxyAdapter for RelayGroup {
         final_target: &Metadata,
     ) -> Result<Box<dyn ProxyConn>> {
         debug_assert!(self.proxies.len() >= 2);
+
+        // Resolve groups to their selected leaf once, exactly like
+        // `relay_tcp` — a stateful selector must serve the same member to
+        // both the preceding hop's target metadata and its own connect_over.
+        let proxies: Vec<_> = self
+            .proxies
+            .iter()
+            .cloned()
+            .map(|proxy| resolve_proxy(proxy, final_target))
+            .collect();
         let mut conn = stream;
 
         // All hops use connect_over (stream already established by outer relay).
-        for (i, proxy) in self.proxies.iter().enumerate() {
-            let meta = if i < self.proxies.len() - 1 {
-                metadata_for_proxy(&self.proxies[i + 1])
-            } else {
-                final_target.clone()
-            };
+        for (i, proxy) in proxies.iter().enumerate() {
+            let meta = metadata_for_next_hop(&proxies, i + 1, final_target);
+            debug!(
+                relay.hop = i,
+                relay.proxy = proxy.name(),
+                relay.target = %meta.remote_address(),
+                "relay: connect_over nested hop {i}"
+            );
             conn =
                 proxy
                     .connect_over(conn, &meta)
@@ -350,6 +382,16 @@ mod tests {
         fail_with: Arc<parking_lot::Mutex<Option<MeowError>>>,
         /// If `Some`, `dial_tcp` returns this error.
         dial_fail_with: Arc<parking_lot::Mutex<Option<MeowError>>>,
+    }
+
+    /// Recorded dial target: `host` for domains, `dst_ip` for IP literals —
+    /// `metadata_for_proxy` types IP-literal servers as `dst_ip`.
+    fn recorded_host(metadata: &Metadata) -> String {
+        if metadata.host.is_empty() {
+            metadata.dst_ip.map(|ip| ip.to_string()).unwrap_or_default()
+        } else {
+            metadata.host.to_string()
+        }
     }
 
     impl MockProxy {
@@ -482,7 +524,7 @@ mod tests {
         }
 
         async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
-            *self.last_dial_host.lock() = Some(metadata.host.to_string());
+            *self.last_dial_host.lock() = Some(recorded_host(metadata));
             if let Some(err) = self.dial_fail_with.lock().take() {
                 return Err(err);
             }
@@ -502,7 +544,7 @@ mod tests {
             stream: Box<dyn ProxyConn>,
             metadata: &Metadata,
         ) -> Result<Box<dyn ProxyConn>> {
-            *self.last_dial_host.lock() = Some(metadata.host.to_string());
+            *self.last_dial_host.lock() = Some(recorded_host(metadata));
             self.visits.lock().push(self.marker);
             if let Some(err) = self.fail_with.lock().take() {
                 return Err(err);
@@ -713,6 +755,70 @@ mod tests {
         assert_eq!(*entry_host.lock(), Some("10.0.0.2".into()));
         assert_eq!(*exit_host.lock(), Some("target.example".into()));
         assert_eq!(*exit_visits.lock(), vec![2]);
+    }
+
+    /// `metadata_for_proxy` must type IP-literal server addrs as `dst_ip`
+    /// (ATYP 1/4 / SocksAddr::Ip for the preceding hop's CONNECT) rather
+    /// than stuffing them into `host` as pseudo-domains.
+    #[test]
+    fn metadata_for_proxy_types_ip_literals_as_dst_ip() {
+        let p: Arc<dyn Proxy> = MockProxy::new("ip-hop", "203.0.113.7", 8443, 1);
+        let m = metadata_for_proxy(&p);
+        assert_eq!(m.dst_ip, Some("203.0.113.7".parse().expect("v4")));
+        assert!(m.host.is_empty());
+        assert_eq!(m.dst_port, 8443);
+        assert_eq!(m.network, meow_common::Network::Tcp);
+        // Internal chained dial, not an HTTP inbound.
+        assert_eq!(m.conn_type, meow_common::ConnType::Inner);
+    }
+
+    #[test]
+    fn metadata_for_proxy_strips_ipv6_brackets_into_dst_ip() {
+        let p: Arc<dyn Proxy> = MockProxy::new("v6-hop", "[2001:db8::1]", 1080, 1);
+        let m = metadata_for_proxy(&p);
+        assert_eq!(m.dst_ip, Some("2001:db8::1".parse().expect("v6")));
+        assert_eq!(m.dst_port, 1080);
+    }
+
+    #[test]
+    fn metadata_for_proxy_keeps_domains_in_host() {
+        let p: Arc<dyn Proxy> = MockProxy::new("dns-hop", "example.com", 443, 1);
+        let m = metadata_for_proxy(&p);
+        assert_eq!(m.host.as_str(), "example.com");
+        assert!(m.dst_ip.is_none());
+        assert_eq!(m.dst_port, 443);
+    }
+
+    /// A nested relay whose members include a selector must resolve that
+    /// selector to its leaf before calling `connect_over` — the group's own
+    /// `connect_over` defaults to `NotSupported` and `addr()` is empty, so
+    /// skipping resolution both fails the hop and yields garbage metadata.
+    #[tokio::test]
+    async fn nested_connect_over_resolves_group_members() {
+        let a = MockProxy::new("a", "10.0.0.1", 1080, 1);
+        let b = MockProxy::new("b", "10.0.0.2", 1081, 2);
+        let c = MockProxy::new("c", "10.0.0.3", 1082, 3);
+        let b_visits = Arc::clone(&b.visits);
+        let b_host = Arc::clone(&b.last_dial_host);
+        let c_visits = Arc::clone(&c.visits);
+        let c_host = Arc::clone(&c.last_dial_host);
+        let sel: Arc<dyn Proxy> = Arc::new(SelectorGroup::new("sel", vec![b]));
+        let inner: Arc<dyn Proxy> = Arc::new(RelayGroup::new("inner", vec![sel, c]));
+        let outer = RelayGroup::new("outer", vec![a, inner]);
+        let target = Metadata {
+            host: "t.example".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+
+        outer.dial_tcp(&target).await.expect("nested relay");
+
+        // Inner chain ran sel→b (resolved) as a connect_over hop aimed at
+        // c's server, then c as the final hop aimed at the target.
+        assert_eq!(*b_visits.lock(), vec![2]);
+        assert_eq!(*b_host.lock(), Some("10.0.0.3".into()));
+        assert_eq!(*c_visits.lock(), vec![3]);
+        assert_eq!(*c_host.lock(), Some("t.example".into()));
     }
 
     #[tokio::test]
