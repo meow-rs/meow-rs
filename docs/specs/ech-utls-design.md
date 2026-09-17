@@ -1,6 +1,9 @@
 # Design: boring-based TLS backend for ECH + uTLS fingerprinting
 
-**Status:** Draft — awaiting greenlight  
+**Status:** Draft — historical implementation plan. The shipped workspace is
+currently pinned to `boring = 4.22.0` / `tokio-boring = 4.22.0` until a
+crates.io `quiche` release newer than `0.29.3` allows `boring` 5.x; see
+issue [#572](https://github.com/meow-rs/meow-rs/issues/572).  
 **Author:** dev  
 **Date:** 2026-04-12  
 **Tracking:** issue #32 (fingerprint stub), related to transport-layer.md  
