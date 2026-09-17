@@ -301,6 +301,85 @@ impl SsCore {
             }
         }
     }
+
+    /// Run the SS crypto handshake over `stream`, which must already
+    /// terminate at this SS server — relay groups pass a chained stream in
+    /// through `connect_over` instead of a fresh `dialer.dial`.
+    async fn tcp_stream_over(
+        &self,
+        stream: Box<dyn meow_transport::Stream>,
+        addr: Address,
+    ) -> Result<Box<dyn ProxyConn>> {
+        match &self.plugin {
+            PluginKind::None => {
+                let s = ProxyClientStream::from_stream(
+                    Arc::clone(&self.context),
+                    stream,
+                    &self.server_config,
+                    addr,
+                );
+                Ok(Box::new(SsConn(s)))
+            }
+            PluginKind::Obfs(obfs) => {
+                let stream = match obfs.clone() {
+                    BuiltinObfs::Http { host } => Box::new(HttpObfs::new(stream, host, self.port))
+                        as Box<dyn meow_transport::Stream>,
+                    BuiltinObfs::Tls { server } => {
+                        Box::new(TlsObfs::new(stream, server)) as Box<dyn meow_transport::Stream>
+                    }
+                };
+                let s = ProxyClientStream::from_stream(
+                    Arc::clone(&self.context),
+                    stream,
+                    &self.server_config,
+                    addr,
+                );
+                Ok(Box::new(SsConn(s)))
+            }
+            PluginKind::V2ray(cfg, tls) => {
+                let transport = v2ray_plugin::handshake_over(
+                    cfg,
+                    tls.as_ref(),
+                    &self.server,
+                    self.port,
+                    stream,
+                )
+                .await?;
+                let s = ProxyClientStream::from_stream(
+                    Arc::clone(&self.context),
+                    transport,
+                    &self.server_config,
+                    addr,
+                );
+                Ok(Box::new(SsConn(s)))
+            }
+            #[cfg(feature = "ech-tls-tunnel")]
+            PluginKind::EchTlsTunnel(cfg, tls) => {
+                let transport =
+                    ech_tls_tunnel::handshake_over(cfg, tls, &self.server, self.port, stream)
+                        .await?;
+                let s = ProxyClientStream::from_stream(
+                    Arc::clone(&self.context),
+                    transport,
+                    &self.server_config,
+                    addr,
+                );
+                Ok(Box::new(SsConn(s)))
+            }
+            PluginKind::External(_) => {
+                // A SIP003 subprocess owns its outbound leg (it dials the
+                // real server itself and we only reach its local listener).
+                // The relay-supplied stream already terminates at the real
+                // SS server, so plugin obfuscation cannot be applied to it —
+                // fail loudly rather than send un-obfuscated traffic.
+                Err(MeowError::NotSupported(
+                    "ss: external SIP003 plugin owns its outbound leg; \
+                     it cannot terminate on a relay-supplied stream"
+                        .into(),
+                ))
+            }
+        }
+    }
 }
 
 /// SIP003u: extract the plugin transport mode from SIP003 `plugin-opts`.
@@ -711,6 +790,29 @@ impl ProxyAdapter for ShadowsocksAdapter {
         }
 
         self.core.dial_tcp_stream(addr).await
+    }
+
+    /// Run the SS handshake over an existing stream (relay chain).
+    ///
+    /// The stream already terminates at this SS server, so the configured
+    /// obfs/v2ray-plugin/ech transport still applies on top of it — only
+    /// the raw dial is skipped.  Mux pooling is bypassed (single-use
+    /// stream), and external SIP003 plugins fail loudly because they own
+    /// their outbound leg.
+    async fn connect_over(
+        &self,
+        stream: Box<dyn ProxyConn>,
+        metadata: &Metadata,
+    ) -> Result<Box<dyn ProxyConn>> {
+        let addr = parse_address(metadata);
+        debug!("SS connecting to {} via relay stream", addr);
+
+        #[cfg(feature = "mux")]
+        if self.mux.is_some() {
+            debug!("SS mux bypassed on relay-supplied stream (single-use)");
+        }
+
+        self.core.tcp_stream_over(Box::new(stream), addr).await
     }
 
     #[cfg_attr(not(feature = "mux"), allow(unused_variables))]

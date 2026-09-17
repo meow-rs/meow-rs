@@ -623,3 +623,156 @@ async fn test_ss_tcp_relay_with_builtin_obfs_tls() {
         "TCP echo round-2 mismatch via built-in obfs-tls"
     );
 }
+
+// ─── Issue #570: relay-chain final hop (connect_over) ───────────────────────
+
+/// `connect_over` must wrap the caller-supplied stream in SS crypto framing —
+/// `ProxyClientStream` writes the target address encrypted, and ssserver
+/// relays to the echo server.
+#[tokio::test]
+async fn test_ss_connect_over_runs_ss_handshake() {
+    if !ssserver_available() {
+        skip_or_fail("ssserver not found in PATH");
+        return;
+    }
+
+    let (echo_addr, _echo_handle) = start_tcp_echo_server().await;
+    let ss_port = free_port().await;
+    let _ssserver = start_ssserver(ss_port).await;
+
+    let adapter = ShadowsocksAdapter::new(
+        "test-ss-connect-over",
+        "127.0.0.1",
+        ss_port,
+        SS_PASSWORD,
+        SS_CIPHER,
+        false,
+        None,
+        None,
+        Arc::new(DirectDialer),
+    )
+    .unwrap();
+
+    // Relay hop-0 leg: plain TCP already connected to ssserver.
+    let upstream = tokio::net::TcpStream::connect(format!("127.0.0.1:{ss_port}"))
+        .await
+        .expect("upstream connect");
+    let metadata = Metadata {
+        network: Network::Tcp,
+        dst_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        dst_port: echo_addr.port(),
+        ..Default::default()
+    };
+
+    let mut conn = timeout(TIMEOUT, adapter.connect_over(Box::new(upstream), &metadata))
+        .await
+        .expect("connect_over timed out")
+        .expect("connect_over failed");
+
+    let payload = b"ss over relay-supplied stream";
+    conn.write_all(payload).await.expect("write failed");
+    conn.flush().await.expect("flush failed");
+    let mut buf = vec![0u8; payload.len()];
+    conn.read_exact(&mut buf).await.expect("read_exact failed");
+    assert_eq!(&buf, payload, "echo mismatch through connect_over");
+}
+
+/// An external SIP003 plugin owns its own outbound connection — it cannot
+/// consume a relay-supplied stream. `connect_over` must fail loudly with
+/// `NotSupported` instead of silently dialing direct.
+#[tokio::test]
+async fn test_ss_connect_over_external_plugin_not_supported() {
+    if !obfs_available() {
+        skip_or_fail("obfs-local not found in PATH");
+        return;
+    }
+
+    // obfs-local only needs to *start*; connect_over must reject before any
+    // traffic, so point it at a throwaway listener — the plugin binds its own
+    // loopback listener regardless.
+    let dead_end = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ss_port = dead_end.local_addr().unwrap().port();
+    let adapter = ShadowsocksAdapter::new(
+        "test-ss-ext-plugin",
+        "127.0.0.1",
+        ss_port,
+        SS_PASSWORD,
+        SS_CIPHER,
+        false,
+        Some("obfs-local"),
+        Some("obfs=http"),
+        Arc::new(DirectDialer),
+    )
+    .expect("adapter with external plugin must construct");
+
+    let metadata = Metadata {
+        network: Network::Tcp,
+        dst_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        dst_port: 443,
+        ..Default::default()
+    };
+    let upstream = tokio::net::TcpStream::connect(format!("127.0.0.1:{ss_port}"))
+        .await
+        .expect("upstream connect");
+
+    match adapter.connect_over(Box::new(upstream), &metadata).await {
+        Err(meow_common::MeowError::NotSupported(_)) => {}
+        Err(other) => panic!("expected NotSupported, got {other:?}"),
+        Ok(_) => panic!("external SIP003 plugin must not support connect_over"),
+    }
+}
+
+/// `connect_over` with the *built-in* simple-obfs plugin must wrap the
+/// supplied stream in HTTP obfs before SS crypto — the server-side
+/// `obfs-server` unwraps it. Same wire path as the external plugin, but the
+/// stream ownership stays in-process so connect_over works.
+#[tokio::test]
+async fn test_ss_connect_over_builtin_obfs_http() {
+    if !ssserver_available() {
+        skip_or_fail("ssserver not found in PATH");
+        return;
+    }
+    if !obfs_server_available() {
+        skip_or_fail("obfs-server not found in PATH");
+        return;
+    }
+
+    let (echo_addr, _echo_handle) = start_tcp_echo_server().await;
+    let ss_port = free_port().await;
+    let _ssserver = start_ssserver_with_plugin(ss_port, "obfs-server", "obfs=http").await;
+
+    let adapter = ShadowsocksAdapter::new(
+        "test-ss-co-builtin-obfs",
+        "127.0.0.1",
+        ss_port,
+        SS_PASSWORD,
+        SS_CIPHER,
+        false,
+        Some("obfs"),
+        Some("obfs=http"),
+        Arc::new(DirectDialer),
+    )
+    .expect("failed to create adapter with built-in obfs");
+
+    let upstream = tokio::net::TcpStream::connect(format!("127.0.0.1:{ss_port}"))
+        .await
+        .expect("upstream connect");
+    let metadata = Metadata {
+        network: Network::Tcp,
+        dst_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        dst_port: echo_addr.port(),
+        ..Default::default()
+    };
+
+    let mut conn = timeout(TIMEOUT, adapter.connect_over(Box::new(upstream), &metadata))
+        .await
+        .expect("connect_over timed out")
+        .expect("connect_over failed");
+
+    let payload = b"ss+builtin-obfs over relay-supplied stream";
+    conn.write_all(payload).await.expect("write failed");
+    conn.flush().await.expect("flush failed");
+    let mut buf = vec![0u8; payload.len()];
+    conn.read_exact(&mut buf).await.expect("read_exact failed");
+    assert_eq!(&buf, payload, "echo mismatch through obfs connect_over");
+}

@@ -160,6 +160,26 @@ pub async fn dial(
     server_port: u16,
     dialer: &dyn crate::dialer::TcpDialer,
 ) -> Result<Box<dyn meow_transport::Stream>> {
+    // 1) Raw TCP.
+    let tcp = dialer
+        .dial(server_host, server_port)
+        .await
+        .map_err(MeowError::Io)?;
+
+    handshake_over(cfg, tls_layer, server_host, server_port, tcp).await
+}
+
+/// Apply the TLS-with-ECH handshake + WebSocket upgrade on `stream`, which
+/// must already terminate at `server_host:server_port` — `dial` obtains it
+/// from `dialer.dial`, the SS adapter's `connect_over` receives it from the
+/// relay chain.
+pub async fn handshake_over(
+    cfg: &EchTlsTunnelConfig,
+    tls_layer: &TlsLayer,
+    server_host: &str,
+    server_port: u16,
+    stream: Box<dyn meow_transport::Stream>,
+) -> Result<Box<dyn meow_transport::Stream>> {
     debug!(
         "ech-tls-tunnel: dialing {}:{} sni={} path={} ech_config_len={}",
         server_host,
@@ -169,16 +189,10 @@ pub async fn dial(
         cfg.ech_config.len(),
     );
 
-    // 1) Raw TCP.
-    let tcp = dialer
-        .dial(server_host, server_port)
-        .await
-        .map_err(MeowError::Io)?;
-
     // 2) TLS (with ECH). Reuse the pre-built TlsLayer — avoids rebuilding
     //    the BoringSSL SSL_CTX and re-parsing ~150 root certs per connection.
     let tls_stream = tls_layer
-        .connect(Box::new(tcp))
+        .connect(Box::new(stream))
         .await
         .map_err(transport_to_proxy_err)?;
 

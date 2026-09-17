@@ -145,6 +145,26 @@ pub async fn dial(
     server_port: u16,
     dialer: &dyn crate::dialer::TcpDialer,
 ) -> Result<Box<dyn meow_transport::Stream>> {
+    // 1) Raw TCP.
+    let tcp = dialer
+        .dial(server_host, server_port)
+        .await
+        .map_err(MeowError::Io)?;
+
+    handshake_over(cfg, tls_layer, server_host, server_port, tcp).await
+}
+
+/// Apply the optional TLS handshake + WebSocket upgrade on `stream`, which
+/// must already terminate at `server_host:server_port` — `dial` obtains it
+/// from `dialer.dial`, the SS adapter's `connect_over` receives it from the
+/// relay chain.
+pub async fn handshake_over(
+    cfg: &V2rayPluginConfig,
+    tls_layer: Option<&TlsLayer>,
+    server_host: &str,
+    server_port: u16,
+    stream: Box<dyn meow_transport::Stream>,
+) -> Result<Box<dyn meow_transport::Stream>> {
     let host_header = if cfg.host.is_empty() {
         server_host.to_string()
     } else {
@@ -156,19 +176,13 @@ pub async fn dial(
         server_host, server_port, cfg.tls, host_header, cfg.path, cfg.mux
     );
 
-    // 1) Raw TCP.
-    let tcp = dialer
-        .dial(server_host, server_port)
-        .await
-        .map_err(MeowError::Io)?;
-
     // 2) Optional TLS handshake via the pre-built TlsLayer.
     let stream: Box<dyn meow_transport::Stream> = if let Some(tls) = tls_layer {
-        tls.connect(Box::new(tcp))
+        tls.connect(Box::new(stream))
             .await
             .map_err(transport_to_proxy_err)?
     } else {
-        Box::new(tcp)
+        stream
     };
 
     // 3) WebSocket upgrade via WsLayer.
