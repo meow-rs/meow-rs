@@ -68,7 +68,7 @@ mod vless_tests {
     /// cmd(1)  port(2,BE)  addr_type(1)  addr
     /// ```
     /// NOTE: `port` comes BEFORE `addr_type` — the VLESS/VMess convention.
-    async fn read_vless_header<S: AsyncReadExt + Unpin>(
+    pub(super) async fn read_vless_header<S: AsyncReadExt + Unpin>(
         stream: &mut S,
     ) -> std::io::Result<([u8; 16], u8, SocketAddr)> {
         // version
@@ -774,6 +774,132 @@ mod connect_over_tests {
         let mut buf = vec![0u8; payload.len()];
         conn.read_exact(&mut buf).await.expect("read_exact failed");
         assert_eq!(&buf, payload, "echo mismatch through connect_over");
+    }
+
+    /// `connect_over` must apply the adapter's configured transport chain —
+    /// not just the VLESS header — over the supplied stream. The mock
+    /// terminates TLS (self-signed, skipped verify client-side) and only
+    /// then parses VLESS, so a plaintext header fails the TLS handshake
+    /// outright.
+    #[tokio::test]
+    async fn vless_connect_over_applies_tls_transport() {
+        use meow_transport::tls::{TlsConfig, TlsLayer};
+
+        let (echo_addr, _echo) = start_tcp_echo_server().await;
+
+        // Mock VLESS server behind TLS: accept → rustls handshake →
+        // VLESS header → relay to echo.
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let tls_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![rustls::pki_types::CertificateDer::from(
+                    ck.cert.der().to_vec(),
+                )],
+                rustls::pki_types::PrivateKeyDer::Pkcs8(
+                    rustls::pki_types::PrivatePkcs8KeyDer::from(ck.key_pair.serialize_der()),
+                ),
+            )
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let vless_tls_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(mut tls) = acceptor.accept(tcp).await else {
+                        eprintln!("mock vless+tls: TLS accept error — handshake missing?");
+                        return;
+                    };
+                    let Ok((uuid, cmd, target_addr)) =
+                        super::vless_tests::read_vless_header(&mut tls).await
+                    else {
+                        eprintln!("mock vless+tls: header parse error");
+                        return;
+                    };
+                    if uuid != TEST_UUID {
+                        return;
+                    }
+                    if tls.write_all(&[0x00, 0x00]).await.is_err() {
+                        return;
+                    }
+                    if cmd == 0x01 {
+                        if let Ok(mut target) = TcpStream::connect(target_addr).await {
+                            let _ = tokio::io::copy_bidirectional(&mut tls, &mut target).await;
+                        }
+                    }
+                });
+            }
+        });
+
+        let mut tls_cfg = TlsConfig::new("localhost");
+        tls_cfg.skip_cert_verify = true;
+        let mut chain = TransportChain::empty();
+        chain.push(Box::new(TlsLayer::new(&tls_cfg).expect("tls layer")));
+        let adapter = VlessAdapter::new(
+            "test-vless-tls-connect-over",
+            "127.0.0.1",
+            vless_tls_addr.port(),
+            TEST_UUID,
+            None,
+            false,
+            chain,
+            Arc::new(DirectDialer),
+        );
+
+        let upstream: Box<dyn ProxyConn> = Box::new(
+            TcpStream::connect(vless_tls_addr)
+                .await
+                .expect("upstream connect"),
+        );
+        let mut conn = timeout(
+            TIMEOUT,
+            adapter.connect_over(upstream, &echo_metadata(echo_addr.port())),
+        )
+        .await
+        .expect("connect_over timed out")
+        .expect("connect_over must run TLS over the supplied stream");
+
+        let payload = b"vless+tls over relay-supplied stream";
+        conn.write_all(payload).await.expect("write failed");
+        conn.flush().await.expect("flush failed");
+        let mut buf = vec![0u8; payload.len()];
+        conn.read_exact(&mut buf).await.expect("read_exact failed");
+        assert_eq!(&buf, payload, "echo mismatch through TLS connect_over");
+    }
+
+    /// Real three-hop chain `[vless₁ → direct → vless₂]`: hop 0 is itself a
+    /// full adapter (not direct), the middle hop is a passthrough, and the
+    /// final hop `connect_over`s onto the compounded stream. Exercises
+    /// metadata_for_next_hop skipping the addressless middle hop — hop 0's
+    /// VLESS request must target vless₂'s server, not `direct`'s "".
+    #[tokio::test]
+    async fn relay_group_vless_direct_vless_roundtrip() {
+        let (echo_addr, _echo) = start_tcp_echo_server().await;
+        let (vless1_addr, _v1) = start_mock_vless_server(TEST_UUID).await;
+        let (vless2_addr, _v2) = start_mock_vless_server(TEST_UUID).await;
+
+        let relay = RelayGroup::new(
+            "test-relay-3hop",
+            vec![
+                Arc::new(LeafProxy(vless_adapter(vless1_addr.port()))) as Arc<dyn Proxy>,
+                Arc::new(LeafProxy(DirectAdapter::new())) as Arc<dyn Proxy>,
+                Arc::new(LeafProxy(vless_adapter(vless2_addr.port()))) as Arc<dyn Proxy>,
+            ],
+        );
+
+        let mut conn = timeout(TIMEOUT, relay.dial_tcp(&echo_metadata(echo_addr.port())))
+            .await
+            .expect("relay dial_tcp timed out")
+            .expect("relay dial_tcp failed");
+
+        let payload = b"vless-direct-vless three-hop roundtrip";
+        conn.write_all(payload).await.expect("write failed");
+        conn.flush().await.expect("flush failed");
+        let mut buf = vec![0u8; payload.len()];
+        conn.read_exact(&mut buf).await.expect("read_exact failed");
+        assert_eq!(&buf, payload, "three-hop relay echo mismatch");
     }
 
     /// Full `RelayGroup [direct → vless]` end-to-end: hop 0 `dial_tcp`s to

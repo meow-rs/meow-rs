@@ -379,6 +379,70 @@ fn fnv1a32(data: &[u8]) -> u32 {
 pub(crate) mod tests {
     use super::*;
 
+    /// Decrypt the sealed length block inside a 42-byte request-header
+    /// prefix, returning the total frame length (`42 + L + 16`) so tests
+    /// can `read_exact` one header frame without racing buffered body
+    /// records — `server_open_request_header` rejects trailing bytes.
+    pub(crate) fn request_header_frame_len(
+        cmd_key: &[u8; 16],
+        prefix: &[u8; 42],
+    ) -> Result<usize, String> {
+        use aes_gcm::aead::Payload;
+        let auth_id = &prefix[0..16];
+        let encrypted_length = &prefix[16..34];
+        let conn_nonce = &prefix[34..42];
+        let length_key = kdf16(
+            cmd_key,
+            &[b"VMess Header AEAD Key_Length", auth_id, conn_nonce],
+        );
+        let length_iv = kdf12(
+            cmd_key,
+            &[b"VMess Header AEAD Nonce_Length", auth_id, conn_nonce],
+        );
+        let len_pt = Aes128Gcm::new_from_slice(&length_key)
+            .map_err(|e| e.to_string())?
+            .decrypt(
+                Nonce::from_slice(&length_iv),
+                Payload {
+                    msg: encrypted_length,
+                    aad: auth_id,
+                },
+            )
+            .map_err(|_| "length AEAD open failed".to_string())?;
+        Ok(42 + u16::from_be_bytes([len_pt[0], len_pt[1]]) as usize + 16)
+    }
+
+    /// Seal a minimal VMess response header `[resp_v, 0, 0, 0]` the way a
+    /// conformant server would — shared by the conn/mod duplex tests that
+    /// play the server side.
+    pub(crate) fn seal_response_header(
+        req_key: &[u8; 16],
+        req_iv: &[u8; 16],
+        resp_v: u8,
+    ) -> Vec<u8> {
+        let (resp_key, resp_iv) = response_body_keys(req_key, req_iv);
+        let header = [resp_v, 0, 0, 0];
+
+        let len_key = kdf16(&resp_key, &[b"AEAD Resp Header Len Key"]);
+        let len_iv = kdf12(&resp_iv, &[b"AEAD Resp Header Len IV"]);
+        let len_ct = Aes128Gcm::new_from_slice(&len_key)
+            .unwrap()
+            .encrypt(
+                Nonce::from_slice(&len_iv),
+                (header.len() as u16).to_be_bytes().as_ref(),
+            )
+            .unwrap();
+
+        let header_key = kdf16(&resp_key, &[b"AEAD Resp Header Key"]);
+        let header_iv = kdf12(&resp_iv, &[b"AEAD Resp Header IV"]);
+        let header_ct = Aes128Gcm::new_from_slice(&header_key)
+            .unwrap()
+            .encrypt(Nonce::from_slice(&header_iv), header.as_ref())
+            .unwrap();
+
+        [len_ct, header_ct].concat()
+    }
+
     fn protocol_constants_and_hashes_match_reference() {
         let uuid: [u8; 16] = [
             0xb8, 0x31, 0x38, 0x1d, 0x63, 0x24, 0x4d, 0x53, 0xad, 0x4f, 0x8c, 0xda, 0x48, 0xb3,

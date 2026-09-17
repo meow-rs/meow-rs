@@ -123,35 +123,9 @@ pub fn spawn_vmess_relay(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vmess::header::tests::seal_response_header;
     use crate::vmess::header::Security;
-    use crate::vmess::kdf::{kdf12, kdf16};
-    use aes_gcm::aead::Aead;
-    use aes_gcm::{Aes128Gcm, KeyInit, Nonce};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    fn seal_response_header(req_key: &[u8; 16], req_iv: &[u8; 16], resp_v: u8) -> Vec<u8> {
-        let (resp_key, resp_iv) = response_body_keys(req_key, req_iv);
-        let header = [resp_v, 0, 0, 0];
-
-        let len_key = kdf16(&resp_key, &[b"AEAD Resp Header Len Key"]);
-        let len_iv = kdf12(&resp_iv, &[b"AEAD Resp Header Len IV"]);
-        let len_ct = Aes128Gcm::new_from_slice(&len_key)
-            .unwrap()
-            .encrypt(
-                Nonce::from_slice(&len_iv),
-                (header.len() as u16).to_be_bytes().as_ref(),
-            )
-            .unwrap();
-
-        let header_key = kdf16(&resp_key, &[b"AEAD Resp Header Key"]);
-        let header_iv = kdf12(&resp_iv, &[b"AEAD Resp Header IV"]);
-        let header_ct = Aes128Gcm::new_from_slice(&header_key)
-            .unwrap()
-            .encrypt(Nonce::from_slice(&header_iv), header.as_ref())
-            .unwrap();
-
-        [len_ct, header_ct].concat()
-    }
 
     #[tokio::test]
     async fn forwards_request_body_before_response_header_arrives() {

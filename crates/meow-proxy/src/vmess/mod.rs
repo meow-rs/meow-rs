@@ -279,7 +279,7 @@ mod tests {
     use std::io;
     use std::pin::Pin;
     use std::task::{Context, Poll};
-    use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
+    use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
 
     /// Minimal AsyncRead+AsyncWrite+ProxyConn newtype over a duplex half —
     /// stands in for the relay chain's upstream leg. Same pattern as
@@ -346,22 +346,24 @@ mod tests {
             .await
             .expect("connect_over must succeed over duplex");
 
-        // Server side: the sealed header lands in one write; read the
-        // fixed 42-byte prefix, then the buffered remainder, and open it
-        // the way a conformant VMess server would.
+        // Server side: read the fixed 42-byte prefix, derive the exact
+        // frame length from its sealed length block, then read the rest —
+        // the header must be consumed exactly, with nothing trailing.
         let mut prefix = [0u8; 42];
         tokio::io::AsyncReadExt::read_exact(&mut server, &mut prefix)
             .await
             .expect("sealed header prefix");
-        let mut rest = vec![0u8; 2048];
-        let n = tokio::time::timeout(
+        let frame_len = header::tests::request_header_frame_len(&adapter.cmd_key, &prefix)
+            .expect("sealed length block must open");
+        let mut frame = prefix.to_vec();
+        frame.resize(frame_len, 0);
+        tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            tokio::io::AsyncReadExt::read(&mut server, &mut rest),
+            tokio::io::AsyncReadExt::read_exact(&mut server, &mut frame[42..]),
         )
         .await
         .expect("sealed payload must arrive")
         .expect("read");
-        let frame = [&prefix[..], &rest[..n]].concat();
         let pt = header::tests::server_open_request_header(&adapter.cmd_key, &frame)
             .expect("server must be able to open the sealed header");
 
@@ -377,5 +379,98 @@ mod tests {
             b"example.com",
             "header must carry metadata.host"
         );
+    }
+
+    /// `connect_over` must also carry the full duplex exchange, not just the
+    /// request header: the peer answers the sealed response header, reads
+    /// AEAD body records the client encrypts, and its encrypted reply
+    /// records surface as plaintext on the returned conn.
+    #[tokio::test]
+    async fn connect_over_carries_full_duplex_vmess_exchange() {
+        const UUID: [u8; 16] = [
+            0xb8, 0x31, 0x38, 0x1d, 0x63, 0x24, 0x4d, 0x53, 0xad, 0x4f, 0x8c, 0xda, 0x48, 0xb3,
+            0x08, 0x11,
+        ];
+        let adapter = VmessAdapter::new(
+            "vmess-relay-hop",
+            "127.0.0.1",
+            10086,
+            UUID,
+            Security::Aes128Gcm,
+            false,
+            TransportChain::empty(),
+            Arc::new(DirectDialer),
+        );
+
+        let (client, mut server) = tokio::io::duplex(64 * 1024);
+        let metadata = Metadata {
+            host: "example.com".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+        let mut conn = adapter
+            .connect_over(Box::new(DuplexConn(client)), &metadata)
+            .await
+            .expect("connect_over must succeed over duplex");
+
+        // Server side: open the request header, extract the per-connection
+        // key material, answer the response header, then echo body records.
+        let server_task = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            let mut prefix = [0u8; 42];
+            server.read_exact(&mut prefix).await.expect("header prefix");
+            let frame_len = header::tests::request_header_frame_len(&adapter.cmd_key, &prefix)
+                .expect("sealed length block must open");
+            let mut frame = prefix.to_vec();
+            frame.resize(frame_len, 0);
+            server
+                .read_exact(&mut frame[42..])
+                .await
+                .expect("header payload");
+            let pt = header::tests::server_open_request_header(&adapter.cmd_key, &frame)
+                .expect("sealed request header must open");
+
+            let req_iv: [u8; 16] = pt[1..17].try_into().unwrap();
+            let req_key: [u8; 16] = pt[17..33].try_into().unwrap();
+            let resp_v = pt[33];
+
+            server
+                .write_all(&header::tests::seal_response_header(
+                    &req_key, &req_iv, resp_v,
+                ))
+                .await
+                .expect("response header write");
+
+            let mut cipher =
+                body::BodyCipher::server_mirror(Security::Aes128Gcm, &req_key, &req_iv);
+            while let Some(rec) = cipher
+                .read_record(&mut server)
+                .await
+                .expect("body record must decrypt")
+            {
+                cipher
+                    .write_record(&mut server, &rec)
+                    .await
+                    .expect("echo record must encrypt");
+            }
+        });
+
+        // Client side: two plaintext ping-pongs through the record layer.
+        for payload in [b"ping-one".as_slice(), b"ping-two-longer".as_slice()] {
+            conn.write_all(payload).await.expect("write failed");
+            conn.flush().await.expect("flush failed");
+            let mut buf = vec![0u8; payload.len()];
+            tokio::io::AsyncReadExt::read_exact(&mut conn, &mut buf)
+                .await
+                .expect("echo read failed");
+            assert_eq!(&buf, payload, "duplex echo mismatch");
+        }
+
+        drop(conn);
+        tokio::time::timeout(std::time::Duration::from_secs(5), server_task)
+            .await
+            .expect("server echo task timed out")
+            .expect("server echo task panicked");
     }
 }

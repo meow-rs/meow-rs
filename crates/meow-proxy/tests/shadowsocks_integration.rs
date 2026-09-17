@@ -776,3 +776,57 @@ async fn test_ss_connect_over_builtin_obfs_http() {
     conn.read_exact(&mut buf).await.expect("read_exact failed");
     assert_eq!(&buf, payload, "echo mismatch through obfs connect_over");
 }
+
+/// Same as above, but for `mode=tls` simple-obfs: the supplied stream must
+/// be wrapped in the fake-TLS record layer before SS crypto — `obfs-server`
+/// (server side, `obfs=tls`) unwraps it.
+#[tokio::test]
+async fn test_ss_connect_over_builtin_obfs_tls() {
+    if !ssserver_available() {
+        skip_or_fail("ssserver not found in PATH");
+        return;
+    }
+    if !obfs_server_available() {
+        skip_or_fail("obfs-server not found in PATH");
+        return;
+    }
+
+    let (echo_addr, _echo_handle) = start_tcp_echo_server().await;
+    let ss_port = free_port().await;
+    let _ssserver = start_ssserver_with_plugin(ss_port, "obfs-server", "obfs=tls").await;
+
+    let adapter = ShadowsocksAdapter::new(
+        "test-ss-co-builtin-obfs-tls",
+        "127.0.0.1",
+        ss_port,
+        SS_PASSWORD,
+        SS_CIPHER,
+        false,
+        Some("obfs"),
+        Some("mode=tls;host=cloudflare.com"),
+        Arc::new(DirectDialer),
+    )
+    .expect("failed to create adapter with built-in obfs tls");
+
+    let upstream = tokio::net::TcpStream::connect(format!("127.0.0.1:{ss_port}"))
+        .await
+        .expect("upstream connect");
+    let metadata = Metadata {
+        network: Network::Tcp,
+        dst_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        dst_port: echo_addr.port(),
+        ..Default::default()
+    };
+
+    let mut conn = timeout(TIMEOUT, adapter.connect_over(Box::new(upstream), &metadata))
+        .await
+        .expect("connect_over timed out")
+        .expect("connect_over failed");
+
+    let payload = b"ss+builtin-obfs-tls over relay-supplied stream";
+    conn.write_all(payload).await.expect("write failed");
+    conn.flush().await.expect("flush failed");
+    let mut buf = vec![0u8; payload.len()];
+    conn.read_exact(&mut buf).await.expect("read_exact failed");
+    assert_eq!(&buf, payload, "echo mismatch through obfs-tls connect_over");
+}

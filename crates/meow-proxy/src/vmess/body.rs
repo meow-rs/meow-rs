@@ -163,6 +163,18 @@ impl BodyCipher {
         self.read_counter = self.write_counter;
     }
 
+    /// Test hook: the server-side mirror of [`Self::new`] — reads
+    /// request-keyed records and writes response-keyed ones, i.e. the
+    /// client constructor's two directions swapped. Lets duplex tests play
+    /// a conformant VMess server without re-deriving keys by hand.
+    #[cfg(test)]
+    pub(crate) fn server_mirror(security: Security, req_key: &[u8; 16], req_iv: &[u8; 16]) -> Self {
+        let mut c = Self::new(security, req_key, req_iv, 0);
+        std::mem::swap(&mut c.write, &mut c.read);
+        std::mem::swap(&mut c.write_iv, &mut c.read_iv);
+        c
+    }
+
     fn write_nonce(&mut self) -> std::io::Result<[u8; 12]> {
         if self.write_counter >= NONCE_BUDGET {
             return Err(std::io::Error::other(
