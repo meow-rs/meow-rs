@@ -196,6 +196,23 @@ Any PR touching these types **must** include before/after byte counts (from `-Zp
 
 Any PR touching relay code (`crates/meow-tunnel/src/relay.rs`, `tcp.rs`, or call sites in `meow-listener`) must preserve the zero-per-relay-setup-allocation invariant: relay buffers are stack-allocated in the caller's async frame, not heap-allocated per call.
 
+### Rule-engine footprint (docs/benchmarks/rule-engine-footprint-2026-09.md)
+
+The rule matching module is sized for large rule-sets on small devices; keep these properties when touching it:
+
+- **Sealed `DomainTrie`** (`crates/meow-trie/src/trie.rs`) is a flat breadth-first arena: 8 B per node, one deduplicated `.`-terminated label arena, four heap allocations total. Do not reintroduce per-node heap objects; rule-set / geosite / domain-index tries must be sealed after build.
+- **IP range matching** (`crates/meow-rules/src/ip_set.rs`) is `IpRangeSet`: sorted coalesced intervals, 8 B per IPv4 interval. GEOIP / IP-ASN / ipcidr rule-sets share one `Arc<IpRangeSet>` per country / ASN / provider. Do not add the `iprange` crate back.
+- **Rules own one heap block each**: adapter names are interned `Arc<str>` (`crates/meow-rules/src/adapter.rs`), payloads are inline `SmolStr`.
+- **Compiled IR slots** stay at ≤ 40 B / `RuleOp` ≤ 24 B (unit test `compiled_slot_stays_compact` in `rule_ir.rs`); a hit borrows the payload from the source rule rather than copying it into the slot.
+- **`.mrs` loaders stream** from the zstd decoder into the set builders; never materialise a `Vec<String>` of every entry on the load path.
+
+Measure before/after with the opt-in harnesses when touching any of the above:
+
+```bash
+cargo test -p meow-rules --test footprint_test --release -- --ignored --nocapture
+cargo test -p meow-tunnel --test rule_ir_synthetic_footprint --release -- --ignored --nocapture
+```
+
 ### Benchmark baselines (docs/benchmarks/)
 
 See [docs/benchmarks/index.md](docs/benchmarks/index.md) for a collated table of M2 deltas and pointers to all baseline documents. The full M2 exit gauntlet results live in `docs/benchmarks/m2-exit-summary.md` (produced by QA at M2 close).

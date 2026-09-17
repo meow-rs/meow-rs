@@ -16,6 +16,7 @@ refactor/cleanup-2026-05 work (M1 + M2).
 | [methodology.md](methodology.md) | Measurement methodology and workload definitions |
 | [binary-size.md](binary-size.md) | Stripped binary sizes by profile + target (ADR-0007 caps); §Post-mux (#412 stack, issue #426) records the post-mux `default` size and isolates the mux-attributable delta (~173–222 KiB) on aarch64/x86_64 — no cap breached, mipsel blocked by #421 |
 | [rule-engine-findings.md](rule-engine-findings.md) | Rule engine profiling notes |
+| [rule-engine-footprint-2026-09.md](rule-engine-footprint-2026-09.md) | Rule-engine retained-heap pass: sealed trie 8 B/node arena, `IpRangeSet` replaces `iprange`, interned adapters, 40 B IR slots, streaming `.mrs` loaders — 100k-domain rule-set 7.6 MiB → 1.5 MiB, GEOIP CN+US 12.6 MiB → 1.7 MiB, load peaks 3–5× lower |
 | [rule-ir-pi-2026-07.md](rule-ir-pi-2026-07.md) | Rule-IR series (#285–#297) on-device benchmark: Raspberry Pi 4 gateway, real 7,528-rule config — 1.8–2.9× match latency, −11.5% live slots, IR build 37.6→96.1 ms |
 | [baseline-2026-04-18.json](baseline-2026-04-18.json) | Raw dhat JSON snapshot at M2 open |
 | [baseline-2026-07-15.json](baseline-2026-07-15.json) | Refreshed dev-laptop harness baseline (median of 3 runs, post DNS-cache prealloc fix); supersedes 2026-04-18 for `bench/compare.py` — see [methodology.md](methodology.md) §Developer baseline refresh |

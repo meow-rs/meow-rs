@@ -4,16 +4,19 @@
 
 use meow_common::{Metadata, Rule, RuleMatchHelper, RuleType};
 
+use crate::adapter::{intern_adapter, Adapter};
+use smol_str::SmolStr;
+
 pub struct InNameRule {
-    name: String,
-    adapter: String,
+    name: SmolStr,
+    adapter: Adapter,
 }
 
 impl InNameRule {
     pub fn new(name: &str, adapter: &str) -> Result<Self, String> {
         Ok(Self {
-            name: name.to_string(),
-            adapter: adapter.to_string(),
+            name: name.into(),
+            adapter: intern_adapter(adapter),
         })
     }
 }
@@ -24,7 +27,7 @@ impl Rule for InNameRule {
     }
 
     fn match_metadata(&self, metadata: &Metadata, _helper: &RuleMatchHelper) -> bool {
-        !metadata.in_name.is_empty() && metadata.in_name == self.name
+        !metadata.in_name.is_empty() && metadata.in_name.as_str() == &*self.name
     }
 
     fn adapter(&self) -> &str {

@@ -1,15 +1,18 @@
 use meow_common::{Metadata, Rule, RuleMatchHelper, RuleType};
 
+use crate::adapter::{intern_adapter, Adapter};
+use smol_str::SmolStr;
+
 pub struct DomainKeywordRule {
-    keyword: String,
-    adapter: String,
+    keyword: SmolStr,
+    adapter: Adapter,
 }
 
 impl DomainKeywordRule {
     pub fn new(keyword: &str, adapter: &str) -> Self {
         Self {
-            keyword: keyword.to_ascii_lowercase(),
-            adapter: adapter.to_string(),
+            keyword: keyword.to_ascii_lowercase().into(),
+            adapter: intern_adapter(adapter),
         }
     }
 }

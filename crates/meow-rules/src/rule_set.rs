@@ -13,12 +13,12 @@
 use std::fmt;
 use std::str::FromStr;
 
-use ipnet::{IpNet, Ipv4Net, Ipv6Net};
-use iprange::IpRange;
+use ipnet::IpNet;
 use meow_common::{Metadata, Rule, RuleMatchHelper};
 use meow_trie::DomainTrie;
 use tracing::warn;
 
+use crate::ip_set::{IpRangeSet, IpRangeSetBuilder};
 use crate::parser::{parse_rule, ParserContext};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,18 +129,22 @@ pub fn build_rule_set_from_mrs(
 
 /// Parse an MRS binary payload and optionally validate it against the
 /// configured provider behavior.
+///
+/// Entries stream from the zstd decoder straight into the set builders: no
+/// decompressed copy of the payload and no per-entry `String` list is held,
+/// so the load peak is the finished set plus a small buffer.
 pub fn build_rule_set_from_mrs_with_behavior(
     bytes: &[u8],
     ctx: &ParserContext,
     expected: Option<RuleSetBehavior>,
 ) -> Result<Box<dyn RuleSet>, String> {
     use crate::mrs_parser::{
-        decompress_payload, parse_header, parse_upstream_ruleset_mrs, TYPE_CLASSICAL, TYPE_DOMAIN,
-        TYPE_IPCIDR, ZSTD_MAGIC,
+        parse_header, stream_ipcidr_list, stream_string_list, UpstreamRuleSetReader,
+        TYPE_CLASSICAL, TYPE_DOMAIN, TYPE_IPCIDR, ZSTD_MAGIC,
     };
     if bytes.len() >= 4 && bytes[..4] == ZSTD_MAGIC {
-        let payload = parse_upstream_ruleset_mrs(bytes).map_err(|e| e.to_string())?;
-        let actual = behavior_from_type_tag(payload.behavior)?;
+        let reader = UpstreamRuleSetReader::open(bytes).map_err(|e| e.to_string())?;
+        let actual = behavior_from_type_tag(reader.behavior())?;
         if let Some(expected) = expected {
             if expected != actual {
                 return Err(format!(
@@ -149,8 +153,20 @@ pub fn build_rule_set_from_mrs_with_behavior(
             }
         }
         return match actual {
-            RuleSetBehavior::Domain => Ok(Box::new(DomainRuleSet::from_entries(&payload.entries))),
-            RuleSetBehavior::IpCidr => Ok(Box::new(IpCidrRuleSet::from_entries(&payload.entries))),
+            RuleSetBehavior::Domain => {
+                let mut builder = DomainRuleSetBuilder::new();
+                reader
+                    .for_each_domain(|d| builder.push(d))
+                    .map_err(|e| e.to_string())?;
+                Ok(Box::new(builder.build()))
+            }
+            RuleSetBehavior::IpCidr => {
+                let mut builder = IpCidrRuleSetBuilder::new();
+                reader
+                    .for_each_net(|net| builder.push_net(net))
+                    .map_err(|e| e.to_string())?;
+                Ok(Box::new(builder.build()))
+            }
             RuleSetBehavior::Classical => {
                 Err("mrs: upstream format does not support classical behavior".to_string())
             }
@@ -166,19 +182,23 @@ pub fn build_rule_set_from_mrs_with_behavior(
             ));
         }
     }
-    let payload = decompress_payload(compressed).map_err(|e| e.to_string())?;
+    let decoder = zstd::stream::Decoder::new(std::io::Cursor::new(compressed))
+        .map_err(|e| format!("mrs: zstd decompression failed: {e}"))?;
     match hdr.type_tag {
         TYPE_DOMAIN => {
-            let entries = parse_string_list_payload(&payload)?;
-            Ok(Box::new(DomainRuleSet::from_entries(&entries)))
+            let mut builder = DomainRuleSetBuilder::new();
+            stream_string_list(decoder, |entry| builder.push(entry)).map_err(|e| e.to_string())?;
+            Ok(Box::new(builder.build()))
         }
         TYPE_IPCIDR => {
-            let entries = parse_ipcidr_payload(&payload)?;
-            Ok(Box::new(IpCidrRuleSet::from_entries(&entries)))
+            let mut builder = IpCidrRuleSetBuilder::new();
+            stream_ipcidr_list(decoder, |net| builder.push_net(net)).map_err(|e| e.to_string())?;
+            Ok(Box::new(builder.build()))
         }
         TYPE_CLASSICAL => {
-            let entries = parse_string_list_payload(&payload)?;
-            Ok(Box::new(ClassicalRuleSet::from_entries(&entries, ctx)))
+            let mut builder = ClassicalRuleSetBuilder::new(ctx);
+            stream_string_list(decoder, |entry| builder.push(entry)).map_err(|e| e.to_string())?;
+            Ok(Box::new(builder.build()))
         }
         other => Err(format!("mrs: unsupported type tag {other}")),
     }
@@ -194,65 +214,6 @@ fn behavior_from_type_tag(type_tag: u8) -> Result<RuleSetBehavior, String> {
     }
 }
 
-fn parse_string_list_payload(decompressed: &[u8]) -> Result<Vec<String>, String> {
-    let mut pos = 0;
-    let mut entries = Vec::new();
-    while pos < decompressed.len() {
-        if pos + 2 > decompressed.len() {
-            return Err("mrs: truncated string length".to_string());
-        }
-        let len = u16::from_be_bytes([decompressed[pos], decompressed[pos + 1]]) as usize;
-        pos += 2;
-        if pos + len > decompressed.len() {
-            return Err(format!("mrs: truncated string entry at offset {pos}"));
-        }
-        let s = std::str::from_utf8(&decompressed[pos..pos + len])
-            .map_err(|e| format!("mrs: invalid UTF-8: {e}"))?;
-        entries.push(s.to_string());
-        pos += len;
-    }
-    Ok(entries)
-}
-
-fn parse_ipcidr_payload(decompressed: &[u8]) -> Result<Vec<String>, String> {
-    let mut pos = 0;
-    let mut entries = Vec::new();
-    while pos < decompressed.len() {
-        if pos + 1 > decompressed.len() {
-            return Err("mrs: truncated ip family".to_string());
-        }
-        let family = decompressed[pos];
-        pos += 1;
-        let addr_len = match family {
-            4 => 4usize,
-            16 => 16usize,
-            other => return Err(format!("mrs: unknown ip family {other}")),
-        };
-        if pos + addr_len + 1 > decompressed.len() {
-            return Err("mrs: truncated ip address".to_string());
-        }
-        let addr_bytes = &decompressed[pos..pos + addr_len];
-        pos += addr_len;
-        let prefix_len = decompressed[pos];
-        pos += 1;
-        let cidr = if family == 4 {
-            let arr: [u8; 4] = addr_bytes
-                .try_into()
-                .map_err(|_| "mrs: bad ipv4".to_string())?;
-            let addr = std::net::Ipv4Addr::from(arr);
-            format!("{addr}/{prefix_len}")
-        } else {
-            let arr: [u8; 16] = addr_bytes
-                .try_into()
-                .map_err(|_| "mrs: bad ipv6".to_string())?;
-            let addr = std::net::Ipv6Addr::from(arr);
-            format!("{addr}/{prefix_len}")
-        };
-        entries.push(cidr);
-    }
-    Ok(entries)
-}
-
 // ---------------------------------------------------------------------------
 // Domain
 // ---------------------------------------------------------------------------
@@ -264,30 +225,54 @@ pub struct DomainRuleSet {
 
 impl DomainRuleSet {
     pub fn from_entries(entries: &[String]) -> Self {
-        let mut trie: DomainTrie<()> = DomainTrie::new();
-        let mut count = 0;
+        let mut builder = DomainRuleSetBuilder::new();
         for entry in entries {
-            let entry = entry.trim();
-            if entry.is_empty() {
-                continue;
-            }
-            let inserted = trie.insert(entry, ());
-            // `+.foo.com` should match both the bare `foo.com` and any
-            // subdomain (upstream mihomo semantics). `DomainTrie::insert`
-            // only registers the wildcards; also insert the bare host.
-            let bare_inserted = if let Some(rest) = entry.strip_prefix("+.") {
-                trie.insert(rest, ())
-            } else {
-                true
-            };
-            if inserted || bare_inserted {
-                count += 1;
-            } else {
-                warn!("rule-set (domain): skipping invalid entry '{}'", entry);
-            }
+            builder.push(entry);
         }
-        trie.seal();
-        Self { trie, count }
+        builder.build()
+    }
+}
+
+/// Incremental [`DomainRuleSet`] construction, so streamed payloads never
+/// need an intermediate entry list.
+#[derive(Default)]
+pub struct DomainRuleSetBuilder {
+    trie: DomainTrie<()>,
+    count: usize,
+}
+
+impl DomainRuleSetBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn push(&mut self, entry: &str) {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            return;
+        }
+        let inserted = self.trie.insert(entry, ());
+        // `+.foo.com` should match both the bare `foo.com` and any
+        // subdomain (upstream mihomo semantics). `DomainTrie::insert`
+        // only registers the wildcards; also insert the bare host.
+        let bare_inserted = if let Some(rest) = entry.strip_prefix("+.") {
+            self.trie.insert(rest, ())
+        } else {
+            true
+        };
+        if inserted || bare_inserted {
+            self.count += 1;
+        } else {
+            warn!("rule-set (domain): skipping invalid entry '{}'", entry);
+        }
+    }
+
+    pub fn build(mut self) -> DomainRuleSet {
+        self.trie.seal();
+        DomainRuleSet {
+            trie: self.trie,
+            count: self.count,
+        }
     }
 }
 
@@ -317,47 +302,65 @@ impl RuleSet for DomainRuleSet {
 // IpCidr
 // ---------------------------------------------------------------------------
 
-/// ipcidr rule-set backed by split `IpRange` Patricia tries — lookup is
-/// O(prefix-depth) instead of a linear scan over every CIDR. Country/ASN
-/// providers commonly carry thousands of entries, and every connection that
-/// reaches the rule paid O(N) comparisons with the previous `Vec<IpNet>`.
-/// Same structure `country_index.rs` already uses for GEOIP rules.
+/// ipcidr rule-set backed by a coalesced [`IpRangeSet`] — lookup is one
+/// binary search over sorted intervals instead of a linear scan over every
+/// CIDR. Country/ASN providers commonly carry thousands of entries; the
+/// interval form costs 8 bytes per IPv4 interval. Same structure
+/// `country_index.rs` uses for GEOIP rules.
 pub struct IpCidrRuleSet {
-    v4: IpRange<Ipv4Net>,
-    v6: IpRange<Ipv6Net>,
+    set: IpRangeSet,
     /// Parsed-entry count, as reported by `len()`. Kept separately because
-    /// `simplify()` merges adjacent/nested networks inside the tries.
+    /// building the set merges adjacent/nested networks.
     count: usize,
 }
 
 impl IpCidrRuleSet {
     pub fn from_entries(entries: &[String]) -> Self {
-        let mut v4: IpRange<Ipv4Net> = IpRange::new();
-        let mut v6: IpRange<Ipv6Net> = IpRange::new();
-        let mut count = 0usize;
+        let mut builder = IpCidrRuleSetBuilder::new();
         for entry in entries {
-            let entry = entry.trim();
-            if entry.is_empty() {
-                continue;
-            }
-            match entry.parse::<IpNet>() {
-                Ok(IpNet::V4(net)) => {
-                    v4.add(net);
-                    count += 1;
-                }
-                Ok(IpNet::V6(net)) => {
-                    v6.add(net);
-                    count += 1;
-                }
-                Err(e) => warn!(
-                    "rule-set (ipcidr): skipping invalid entry '{}': {}",
-                    entry, e
-                ),
-            }
+            builder.push(entry);
         }
-        v4.simplify();
-        v6.simplify();
-        Self { v4, v6, count }
+        builder.build()
+    }
+}
+
+/// Incremental [`IpCidrRuleSet`] construction.
+#[derive(Default)]
+pub struct IpCidrRuleSetBuilder {
+    set: IpRangeSetBuilder,
+    count: usize,
+}
+
+impl IpCidrRuleSetBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add one textual CIDR; invalid entries are logged and skipped.
+    pub fn push(&mut self, entry: &str) {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            return;
+        }
+        match entry.parse::<IpNet>() {
+            Ok(net) => self.push_net(net),
+            Err(e) => warn!(
+                "rule-set (ipcidr): skipping invalid entry '{}': {}",
+                entry, e
+            ),
+        }
+    }
+
+    pub fn push_net(&mut self, net: IpNet) {
+        self.set.add(net);
+        self.count += 1;
+    }
+
+    pub fn build(self) -> IpCidrRuleSet {
+        IpCidrRuleSet {
+            set: self.set.build(),
+            count: self.count,
+        }
     }
 }
 
@@ -367,17 +370,7 @@ impl RuleSet for IpCidrRuleSet {
     }
 
     fn matches(&self, metadata: &Metadata, _helper: &RuleMatchHelper) -> bool {
-        let Some(ip) = metadata.dst_ip else {
-            return false;
-        };
-        match ip {
-            std::net::IpAddr::V4(v4) => self
-                .v4
-                .contains(&Ipv4Net::new(v4, 32).expect("/32 is always valid")),
-            std::net::IpAddr::V6(v6) => self
-                .v6
-                .contains(&Ipv6Net::new(v6, 128).expect("/128 is always valid")),
-        }
+        metadata.dst_ip.is_some_and(|ip| self.set.contains(ip))
     }
 
     fn len(&self) -> usize {
@@ -399,24 +392,47 @@ pub struct ClassicalRuleSet {
 
 impl ClassicalRuleSet {
     pub fn from_entries(entries: &[String], ctx: &ParserContext) -> Self {
-        let mut rules: Vec<Box<dyn Rule>> = Vec::new();
+        let mut builder = ClassicalRuleSetBuilder::new(ctx);
         for entry in entries {
-            let entry = entry.trim();
-            if entry.is_empty() {
-                continue;
-            }
-            // Classical entries are `TYPE,PAYLOAD[,extra]` without an adapter.
-            // The existing parser expects an adapter column, so splice a
-            // placeholder in and discard it at match time (our wrapper owns
-            // the real adapter). A MATCH-only shorthand is unusual in
-            // classical sets and would be meaningless anyway.
-            let patched = splice_placeholder_adapter(entry);
-            match parse_rule(&patched, ctx) {
-                Ok(rule) => rules.push(rule),
-                Err(e) => warn!("rule-set (classical): skipping '{}': {}", entry, e),
-            }
+            builder.push(entry);
         }
-        Self { rules }
+        builder.build()
+    }
+}
+
+/// Incremental [`ClassicalRuleSet`] construction.
+pub struct ClassicalRuleSetBuilder<'a> {
+    rules: Vec<Box<dyn Rule>>,
+    ctx: &'a ParserContext,
+}
+
+impl<'a> ClassicalRuleSetBuilder<'a> {
+    pub fn new(ctx: &'a ParserContext) -> Self {
+        Self {
+            rules: Vec::new(),
+            ctx,
+        }
+    }
+
+    pub fn push(&mut self, entry: &str) {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            return;
+        }
+        // Classical entries are `TYPE,PAYLOAD[,extra]` without an adapter.
+        // The existing parser expects an adapter column, so splice a
+        // placeholder in and discard it at match time (our wrapper owns
+        // the real adapter). A MATCH-only shorthand is unusual in
+        // classical sets and would be meaningless anyway.
+        let patched = splice_placeholder_adapter(entry);
+        match parse_rule(&patched, self.ctx) {
+            Ok(rule) => self.rules.push(rule),
+            Err(e) => warn!("rule-set (classical): skipping '{}': {}", entry, e),
+        }
+    }
+
+    pub fn build(self) -> ClassicalRuleSet {
+        ClassicalRuleSet { rules: self.rules }
     }
 }
 
@@ -542,8 +558,8 @@ mod tests {
 
     #[test]
     fn ipcidr_rule_set_coalesces_adjacent_cidrs_without_semantic_change() {
-        // Adjacent /24s coalesce into one /23 inside the trie; matching
-        // behavior must be identical to checking each CIDR independently.
+        // Adjacent /24s coalesce into one interval; matching behavior must
+        // be identical to checking each CIDR independently.
         let set =
             IpCidrRuleSet::from_entries(&["10.0.0.0/24".to_string(), "10.0.1.0/24".to_string()]);
         assert_eq!(set.len(), 2);

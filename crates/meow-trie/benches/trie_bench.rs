@@ -48,6 +48,35 @@ fn bench_trie_search(c: &mut Criterion) {
             });
         });
 
+        let mut sealed = build_trie(n);
+        sealed.seal();
+
+        group.bench_with_input(BenchmarkId::new("sealed_hit", n), &n, |b, _| {
+            let mut idx = 0usize;
+            b.iter(|| {
+                let result = sealed.search(black_box(&hit_domains[idx % hit_domains.len()]));
+                idx = idx.wrapping_add(1);
+                black_box(result)
+            });
+        });
+
+        group.bench_with_input(BenchmarkId::new("sealed_miss", n), &n, |b, _| {
+            let mut idx = 0usize;
+            b.iter(|| {
+                let result = sealed.search(black_box(&miss_domains[idx % miss_domains.len()]));
+                idx = idx.wrapping_add(1);
+                black_box(result)
+            });
+        });
+
+        group.bench_with_input(BenchmarkId::new("seal", n), &n, |b, _| {
+            b.iter(|| {
+                let mut t = build_trie(black_box(n));
+                t.seal();
+                black_box(t)
+            });
+        });
+
         group.bench_with_input(BenchmarkId::new("insert", n), &n, |b, _| {
             b.iter(|| {
                 let mut t = DomainTrie::new();

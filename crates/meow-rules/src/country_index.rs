@@ -1,10 +1,10 @@
 //! Country-keyed IP-range index built once from a GeoIP MMDB.
 //!
 //! At config-load the GeoIP `Reader` is walked end-to-end; each network is
-//! binned by uppercased ISO country code into per-country `IpRange<Ipv4Net>`
-//! / `IpRange<Ipv6Net>` Patricia tries. After build, the MMDB Reader can be
-//! dropped — every `GEOIP` / `SRC-GEOIP` rule retains only an `Arc` to the
-//! per-country range pair and matches via `IpRange::contains` (no MMDB
+//! binned by uppercased ISO country code into a per-country
+//! [`IpRangeSet`] (sorted, coalesced intervals). After build, the MMDB
+//! Reader can be dropped — every `GEOIP` / `SRC-GEOIP` rule retains only an
+//! `Arc` to the per-country set and matches via one binary search (no MMDB
 //! lookup, no country-code String allocation on the hot path).
 //!
 //! ## Build-time optimisations
@@ -28,24 +28,16 @@
 //!   scan beats a HashMap probe at that size and avoids hashing.
 
 use ipnet::{Ipv4Net, Ipv6Net};
-use iprange::IpRange;
 use maxminddb::PathElement;
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::Arc;
 
-/// Per-country IPv4 + IPv6 range sets. Cheap to clone (`Arc` inside).
-#[derive(Clone, Default)]
-pub struct CountryRanges {
-    pub v4: Arc<IpRange<Ipv4Net>>,
-    pub v6: Arc<IpRange<Ipv6Net>>,
-}
+use crate::ip_set::{IpRangeSet, IpRangeSetBuilder};
 
-impl CountryRanges {
-    pub fn is_empty(&self) -> bool {
-        self.v4.is_empty() && self.v6.is_empty()
-    }
-}
+/// Per-country IPv4 + IPv6 range set, shared by every rule that names the
+/// country. Cheap to clone.
+pub type CountryRanges = Arc<IpRangeSet>;
 
 /// Country-code → `CountryRanges` map. Built once via [`CountryIndex::build`].
 #[derive(Default)]
@@ -118,8 +110,8 @@ impl CountryIndex {
                 u16::MAX
             ));
         }
-        let mut buckets: Vec<(IpRange<Ipv4Net>, IpRange<Ipv6Net>)> = (0..allowed_keys.len())
-            .map(|_| Default::default())
+        let mut buckets: Vec<IpRangeSetBuilder> = (0..allowed_keys.len())
+            .map(|_| IpRangeSetBuilder::new())
             .collect();
 
         let iter = reader
@@ -177,44 +169,35 @@ impl CountryIndex {
             match net.network() {
                 IpAddr::V4(v4) => {
                     if let Ok(net4) = Ipv4Net::new(v4, prefix) {
-                        bucket.0.add(net4);
+                        bucket.add_v4(net4);
                     }
                 }
                 IpAddr::V6(v6) => {
                     if let Ok(net6) = Ipv6Net::new(v6, prefix) {
-                        bucket.1.add(net6);
+                        bucket.add_v6(net6);
                     }
                 }
             }
         }
 
         let mut by_country = HashMap::with_capacity(allowed_keys.len());
-        for (key, (mut v4, mut v6)) in allowed_keys.iter().zip(buckets) {
-            if v4.is_empty() && v6.is_empty() {
+        for (key, bucket) in allowed_keys.iter().zip(buckets) {
+            if bucket.is_empty() {
                 continue;
             }
-            v4.simplify();
-            v6.simplify();
-            by_country.insert(
-                key.as_str().to_string(),
-                CountryRanges {
-                    v4: Arc::new(v4),
-                    v6: Arc::new(v6),
-                },
-            );
+            by_country.insert(key.as_str().to_string(), Arc::new(bucket.build()));
         }
 
         Ok(Self { by_country })
     }
 
-    /// Look up ranges for a country code. Unknown codes return empty ranges
+    /// Look up ranges for a country code. Unknown codes return an empty set
     /// (no panic) — the rule will simply never match, mirroring upstream's
     /// "MMDB has no record" path.
     pub fn ranges_for(&self, country: &str) -> CountryRanges {
         self.by_country
             .get(&country.to_ascii_uppercase())
-            .cloned()
-            .unwrap_or_default()
+            .map_or_else(|| Arc::new(IpRangeSet::default()), Arc::clone)
     }
 
     pub fn country_count(&self) -> usize {
@@ -265,29 +248,14 @@ mod tests {
     #[test]
     fn country_index_lookup_is_case_insensitive() {
         // Build a tiny manual index via the public-by-construction map.
-        let mut tmp: HashMap<String, (IpRange<Ipv4Net>, IpRange<Ipv6Net>)> = HashMap::new();
-        let mut v4 = IpRange::new();
-        v4.add("1.2.3.0/24".parse().unwrap());
-        tmp.insert("CN".into(), (v4, IpRange::new()));
-        let by_country = tmp
-            .into_iter()
-            .map(|(k, (mut v4, mut v6))| {
-                v4.simplify();
-                v6.simplify();
-                (
-                    k,
-                    CountryRanges {
-                        v4: Arc::new(v4),
-                        v6: Arc::new(v6),
-                    },
-                )
-            })
-            .collect();
+        let mut by_country: HashMap<String, CountryRanges> = HashMap::new();
+        let set = IpRangeSet::from_nets(["1.2.3.0/24".parse().unwrap()]);
+        by_country.insert("CN".into(), Arc::new(set));
         let idx = CountryIndex { by_country };
-        let probe: Ipv4Net = "1.2.3.42/32".parse().unwrap();
-        assert!(idx.ranges_for("cn").v4.contains(&probe));
-        assert!(idx.ranges_for("CN").v4.contains(&probe));
-        assert!(!idx.ranges_for("US").v4.contains(&probe));
+        let probe: IpAddr = "1.2.3.42".parse().unwrap();
+        assert!(idx.ranges_for("cn").contains(probe));
+        assert!(idx.ranges_for("CN").contains(probe));
+        assert!(!idx.ranges_for("US").contains(probe));
     }
 
     /// Build a real CountryIndex from the repo's Country.mmdb fixture, but
@@ -303,8 +271,8 @@ mod tests {
         let allowed: HashSet<String> = ["CN", "US"].into_iter().map(String::from).collect();
         let idx = CountryIndex::build(&reader, &allowed).expect("build CountryIndex");
         assert_eq!(idx.country_count(), 2, "should bin only CN + US");
-        assert!(!idx.ranges_for("US").v4.is_empty(), "US v4 ranges empty?");
-        assert!(!idx.ranges_for("CN").v4.is_empty(), "CN v4 ranges empty?");
+        assert!(idx.ranges_for("US").has_v4(), "US v4 ranges empty?");
+        assert!(idx.ranges_for("CN").has_v4(), "CN v4 ranges empty?");
         // Country outside the allowlist returns empty ranges.
         assert!(idx.ranges_for("JP").is_empty());
     }
@@ -338,16 +306,12 @@ mod tests {
         let c = idx.ranges_for("cn"); // case-insensitive must hit the same bucket
 
         assert!(
-            Arc::ptr_eq(&a.v4, &b.v4),
-            "two CN lookups must share the v4 IpRange Arc"
+            Arc::ptr_eq(&a, &b),
+            "two CN lookups must share the IpRangeSet Arc"
         );
         assert!(
-            Arc::ptr_eq(&a.v6, &b.v6),
-            "two CN lookups must share the v6 IpRange Arc"
-        );
-        assert!(
-            Arc::ptr_eq(&a.v4, &c.v4),
-            "case-insensitive CN lookup must share the v4 IpRange Arc"
+            Arc::ptr_eq(&a, &c),
+            "case-insensitive CN lookup must share the IpRangeSet Arc"
         );
     }
 
@@ -383,12 +347,8 @@ mod tests {
             // cloned into the rule.
             let again = idx.ranges_for("CN");
             assert!(
-                Arc::ptr_eq(&baseline.v4, &again.v4),
-                "iteration {i} broke v4 Arc sharing"
-            );
-            assert!(
-                Arc::ptr_eq(&baseline.v6, &again.v6),
-                "iteration {i} broke v6 Arc sharing"
+                Arc::ptr_eq(&baseline, &again),
+                "iteration {i} broke Arc sharing"
             );
         }
 
@@ -396,8 +356,8 @@ mod tests {
         // pathological refactor that collapses all countries to one bucket.
         let us = idx.ranges_for("US");
         assert!(
-            !Arc::ptr_eq(&baseline.v4, &us.v4),
-            "CN and US must hold distinct v4 Arcs"
+            !Arc::ptr_eq(&baseline, &us),
+            "CN and US must hold distinct Arcs"
         );
     }
 
@@ -410,6 +370,6 @@ mod tests {
         let allowed: HashSet<String> = ["cn"].into_iter().map(String::from).collect();
         let idx = CountryIndex::build(&reader, &allowed).expect("build CountryIndex");
         assert_eq!(idx.country_count(), 1);
-        assert!(!idx.ranges_for("CN").v4.is_empty());
+        assert!(idx.ranges_for("CN").has_v4());
     }
 }

@@ -2,24 +2,27 @@ use std::sync::Arc;
 
 use meow_common::{Metadata, Rule, RuleMatchHelper, RuleType};
 
+use crate::adapter::{intern_adapter, Adapter};
+use smol_str::SmolStr;
+
 use crate::rule_set::RuleSet;
 
 /// A `RULE-SET,<name>,<adapter>[,no-resolve]` rule — a thin wrapper that
 /// delegates matching to an `Arc<dyn RuleSet>` loaded by the rule-provider
 /// subsystem.
 pub struct RuleSetRule {
-    name: String,
+    name: SmolStr,
     set: Arc<dyn RuleSet>,
-    adapter: String,
+    adapter: Adapter,
     no_resolve: bool,
 }
 
 impl RuleSetRule {
     pub fn new(name: &str, set: Arc<dyn RuleSet>, adapter: &str, no_resolve: bool) -> Self {
         Self {
-            name: name.to_string(),
+            name: name.into(),
             set,
-            adapter: adapter.to_string(),
+            adapter: intern_adapter(adapter),
             no_resolve,
         }
     }

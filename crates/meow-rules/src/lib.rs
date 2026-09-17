@@ -3,6 +3,7 @@
 //! Domain, IP-CIDR, GeoIP, process, and logic (`AND`/`OR`/`NOT`) rules, plus
 //! the parser that turns Clash-style rule lines into matchers.
 
+pub mod adapter;
 pub mod asn_index;
 pub mod country_index;
 pub mod domain;
@@ -21,6 +22,7 @@ pub mod in_port;
 pub mod in_type;
 pub mod in_user;
 pub mod ip_asn;
+pub mod ip_set;
 pub mod ip_suffix;
 pub mod ipcidr;
 pub mod logic;

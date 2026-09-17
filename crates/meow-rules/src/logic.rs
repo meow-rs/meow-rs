@@ -1,9 +1,12 @@
 use meow_common::{Metadata, Rule, RuleMatchHelper, RuleType};
 
+use crate::adapter::{intern_adapter, Adapter};
+use smol_str::SmolStr;
+
 pub struct AndRule {
     rules: Vec<Box<dyn Rule>>,
-    adapter: String,
-    payload: String,
+    adapter: Adapter,
+    payload: SmolStr,
 }
 
 impl AndRule {
@@ -12,10 +15,11 @@ impl AndRule {
             .iter()
             .map(|r| r.payload().to_string())
             .collect::<Vec<_>>()
-            .join(" AND ");
+            .join(" AND ")
+            .into();
         Self {
             rules,
-            adapter: adapter.to_string(),
+            adapter: intern_adapter(adapter),
             payload,
         }
     }
@@ -59,8 +63,8 @@ impl Rule for AndRule {
 
 pub struct OrRule {
     rules: Vec<Box<dyn Rule>>,
-    adapter: String,
-    payload: String,
+    adapter: Adapter,
+    payload: SmolStr,
 }
 
 impl OrRule {
@@ -69,10 +73,11 @@ impl OrRule {
             .iter()
             .map(|r| r.payload().to_string())
             .collect::<Vec<_>>()
-            .join(" OR ");
+            .join(" OR ")
+            .into();
         Self {
             rules,
-            adapter: adapter.to_string(),
+            adapter: intern_adapter(adapter),
             payload,
         }
     }
@@ -116,16 +121,16 @@ impl Rule for OrRule {
 
 pub struct NotRule {
     rule: Box<dyn Rule>,
-    adapter: String,
-    payload: String,
+    adapter: Adapter,
+    payload: SmolStr,
 }
 
 impl NotRule {
     pub fn new(rule: Box<dyn Rule>, adapter: &str) -> Self {
-        let payload = format!("NOT {}", rule.payload());
+        let payload = format!("NOT {}", rule.payload()).into();
         Self {
             rule,
-            adapter: adapter.to_string(),
+            adapter: intern_adapter(adapter),
             payload,
         }
     }

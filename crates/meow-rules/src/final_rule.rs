@@ -1,13 +1,15 @@
 use meow_common::{Metadata, Rule, RuleMatchHelper, RuleType};
 
+use crate::adapter::{intern_adapter, Adapter};
+
 pub struct FinalRule {
-    adapter: String,
+    adapter: Adapter,
 }
 
 impl FinalRule {
     pub fn new(adapter: &str) -> Self {
         Self {
-            adapter: adapter.to_string(),
+            adapter: intern_adapter(adapter),
         }
     }
 }

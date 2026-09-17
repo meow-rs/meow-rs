@@ -7,16 +7,19 @@
 
 use meow_common::{Metadata, Rule, RuleMatchHelper, RuleType};
 
+use crate::adapter::{intern_adapter, Adapter};
+use smol_str::SmolStr;
+
 pub struct InUserRule {
-    username: String,
-    adapter: String,
+    username: SmolStr,
+    adapter: Adapter,
 }
 
 impl InUserRule {
     pub fn new(username: &str, adapter: &str) -> Result<Self, String> {
         Ok(Self {
-            username: username.to_string(),
-            adapter: adapter.to_string(),
+            username: username.into(),
+            adapter: intern_adapter(adapter),
         })
     }
 }
@@ -27,7 +30,7 @@ impl Rule for InUserRule {
     }
 
     fn match_metadata(&self, metadata: &Metadata, _helper: &RuleMatchHelper) -> bool {
-        metadata.in_user.as_deref() == Some(self.username.as_str())
+        metadata.in_user.as_deref() == Some(&*self.username)
     }
 
     fn adapter(&self) -> &str {

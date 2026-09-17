@@ -1,15 +1,18 @@
 use meow_common::{Metadata, Rule, RuleMatchHelper, RuleType};
 
+use crate::adapter::{intern_adapter, Adapter};
+use smol_str::SmolStr;
+
 pub struct ProcessRule {
-    process_name: String,
-    adapter: String,
+    process_name: SmolStr,
+    adapter: Adapter,
 }
 
 impl ProcessRule {
     pub fn new(name: &str, adapter: &str) -> Self {
         Self {
-            process_name: name.to_string(),
-            adapter: adapter.to_string(),
+            process_name: name.into(),
+            adapter: intern_adapter(adapter),
         }
     }
 }

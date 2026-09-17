@@ -1,9 +1,12 @@
 use meow_common::{Metadata, Network as NetType, Rule, RuleMatchHelper, RuleType};
 
+use crate::adapter::{intern_adapter, Adapter};
+use smol_str::SmolStr;
+
 pub struct NetworkRule {
     network: NetType,
-    raw: String,
-    adapter: String,
+    raw: SmolStr,
+    adapter: Adapter,
 }
 
 impl NetworkRule {
@@ -15,8 +18,8 @@ impl NetworkRule {
         };
         Ok(Self {
             network: net,
-            raw: network.to_string(),
-            adapter: adapter.to_string(),
+            raw: network.into(),
+            adapter: intern_adapter(adapter),
         })
     }
 }

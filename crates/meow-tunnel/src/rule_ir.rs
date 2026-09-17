@@ -1,12 +1,12 @@
 use crate::match_engine::DomainIndex;
-use ipnet::{IpNet, Ipv4Net, Ipv6Net};
-use iprange::IpRange;
+use ipnet::IpNet;
 use meow_common::{ConnType, Metadata, Network, Rule, RuleMatchHelper, RuleType};
 use meow_rules::{
     geoip::GeoIpRule,
     geosite::GeositeDB,
     geosite_rule::GeoSiteRule,
     ip_asn::IpAsnRule,
+    ip_set::IpRangeSet,
     ip_suffix::{IpSuffixMatcher, IpSuffixRule},
     logic::{AndRule, NotRule, OrRule},
     rule_set::RuleSet,
@@ -16,7 +16,6 @@ use meow_rules::{
 use regex::Regex;
 use smol_str::SmolStr;
 use std::collections::{HashMap, HashSet};
-use std::net::IpAddr;
 use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
@@ -74,12 +73,15 @@ pub struct CompiledRuleSet {
 
 pub type RuleIr = CompiledRuleSet;
 
+/// One live rule in the scan plan. Kept to 40 bytes: indices are `u32`, and
+/// the rule's payload is not copied — a match borrows it from the source
+/// rule via `rule_index`, so the plan stores no per-slot strings beyond
+/// what the lowered `op` itself needs.
 #[derive(Debug, Clone)]
 pub struct CompiledRuleSlot {
-    rule_index: usize,
+    rule_index: u32,
     rule_type: RuleType,
-    adapter_index: usize,
-    payload: SmolStr,
+    adapter_index: u32,
     target_plan: TargetPlan,
     /// This predicate reads `metadata.dst_ip` resolved from the hostname
     /// (the rule's `should_resolve_ip()`), so a lazy scan must stop here
@@ -112,9 +114,9 @@ enum ExecutionPlan {
 
 #[derive(Debug, Clone)]
 enum RuleOp {
-    Domain(String),
-    DomainSuffix(String),
-    DomainKeyword(String),
+    Domain(Box<str>),
+    DomainSuffix(Box<str>),
+    DomainKeyword(Box<str>),
     DomainRegex(Box<RegexMatcher>),
     DomainWildcard(Box<WildcardMatcher>),
     IpCidr {
@@ -125,13 +127,15 @@ enum RuleOp {
     DstPort(PortMatcher),
     InPort(PortMatcher),
     Dscp(u8),
-    ProcessName(String),
-    ProcessPath(ProcessPathOp),
+    ProcessName(Box<str>),
+    /// Boxed: two `Box<str>` variants leave no niche for the tag, so the
+    /// inline op would be 24 bytes and push every slot's `RuleOp` to 32.
+    ProcessPath(Box<ProcessPathOp>),
     Network(Network),
     Uid(u32),
-    InName(String),
+    InName(Box<str>),
     InType(InTypeMask),
-    InUser(String),
+    InUser(Box<str>),
     Match,
     /// GEOSITE lowered to pre-resolved bucket handles: the category lookup,
     /// attribute splitting, and per-connection `format!` allocation all
@@ -141,10 +145,9 @@ enum RuleOp {
     /// set, no rule-level dispatch). Safe to freeze: provider refresh goes
     /// through `Tunnel::update_rules`, which rebuilds this IR.
     RuleSetRef(RuleSetHandle),
-    /// GEOIP / SRC-GEOIP / IP-ASN lowered to their shared Patricia tries.
+    /// GEOIP / SRC-GEOIP / IP-ASN lowered to their shared interval sets.
     IpRanges {
-        v4: Arc<IpRange<Ipv4Net>>,
-        v6: Arc<IpRange<Ipv6Net>>,
+        set: Arc<IpRangeSet>,
         src: bool,
     },
     /// IP-SUFFIX lowered to its Copy matcher. Boxed: the matcher carries
@@ -198,7 +201,9 @@ enum PortRange {
 enum PortMatcher {
     Single(u16),
     Range(u16, u16),
-    Multiple(Vec<PortRange>),
+    /// Thin-boxed so the matcher stays 16 bytes; multi-span port lists are
+    /// rare and already pay one heap block for the spans.
+    Multiple(Box<Box<[PortRange]>>),
 }
 
 #[derive(Debug, Clone)]
@@ -210,8 +215,8 @@ struct RegexMatcher {
 #[derive(Debug, Clone)]
 enum ProcessPathOp {
     Glob(Box<Regex>),
-    Prefix(String),
-    Exact(String),
+    Prefix(Box<str>),
+    Exact(Box<str>),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -440,10 +445,9 @@ impl CompiledRuleSet {
             let terminator = matches!(op, RuleOp::Match);
 
             slots.push(CompiledRuleSlot {
-                rule_index,
+                rule_index: u32::try_from(rule_index).expect("rule index exceeds u32"),
                 rule_type,
-                adapter_index,
-                payload: SmolStr::from(payload),
+                adapter_index: u32::try_from(adapter_index).expect("adapter index exceeds u32"),
                 target_plan: target_plan(rule_type),
                 demands_ip,
                 demands_process,
@@ -483,11 +487,14 @@ impl CompiledRuleSet {
             // trie hit at T proves no owned slot before T matches, and a
             // trie miss proves no owned slot matches at all.
             for slot in &mut slots {
-                let owned =
-                    matches!(
-                        slot.op,
-                        RuleOp::Domain(_) | RuleOp::DomainSuffix(_) | RuleOp::DomainWildcard(_)
-                    ) && domain_index.insert_rule(slot.rule_index, slot.rule_type, &slot.payload);
+                let owned = matches!(
+                    slot.op,
+                    RuleOp::Domain(_) | RuleOp::DomainSuffix(_) | RuleOp::DomainWildcard(_)
+                ) && domain_index.insert_rule(
+                    slot.rule_index(),
+                    slot.rule_type,
+                    rules[slot.rule_index()].payload(),
+                );
                 if owned {
                     slot.op = RuleOp::TrieOwned;
                 }
@@ -560,11 +567,11 @@ impl CompiledRuleSet {
         // hit past a MATCH terminator is preempted by the terminator slot.
         let (scan_end, hit_slot) = match trie_hit {
             Some(rule_idx) => {
-                let pos = self.slots.partition_point(|s| s.rule_index < rule_idx);
+                let pos = self.slots.partition_point(|s| s.rule_index() < rule_idx);
                 let slot = self
                     .slots
                     .get(pos)
-                    .filter(|slot| slot.rule_index == rule_idx);
+                    .filter(|slot| slot.rule_index() == rule_idx);
                 (pos, slot)
             }
             None => (self.slots.len(), None),
@@ -584,7 +591,7 @@ impl CompiledRuleSet {
         // trie-owned) may live in the tail and must be evaluated directly.
         let mut tail_start = scan_end;
         if let Some(slot) = hit_slot {
-            let m = self.static_match(slot);
+            let m = self.static_match(slot, rules);
             if target_exists(m.adapter_name) {
                 return Some(m);
             }
@@ -648,11 +655,11 @@ impl CompiledRuleSet {
         };
         let (scan_end, hit_slot) = match trie_hit {
             Some(rule_idx) => {
-                let pos = self.slots.partition_point(|s| s.rule_index < rule_idx);
+                let pos = self.slots.partition_point(|s| s.rule_index() < rule_idx);
                 let slot = self
                     .slots
                     .get(pos)
-                    .filter(|slot| slot.rule_index == rule_idx);
+                    .filter(|slot| slot.rule_index() == rule_idx);
                 (pos, slot)
             }
             None => (self.slots.len(), None),
@@ -669,7 +676,7 @@ impl CompiledRuleSet {
 
         let mut tail_start = scan_end;
         if let Some(slot) = hit_slot {
-            let m = self.static_match(slot);
+            let m = self.static_match(slot, rules);
             if target_exists(m.adapter_name) {
                 return LazyMatchOutcome::Matched(m);
             }
@@ -798,31 +805,31 @@ impl CompiledRuleSet {
                 // dead target (issue #513 continue semantics).
                 RuleOp::TrieOwned => {
                     if EVAL_TRIE {
-                        rules.get(slot.rule_index).and_then(|rule| {
+                        rules.get(slot.rule_index()).and_then(|rule| {
                             rule.match_metadata(input.metadata, helper)
-                                .then(|| self.static_match(slot))
+                                .then(|| self.static_match(slot, rules))
                         })
                     } else {
                         None
                     }
                 }
                 RuleOp::Fallback => {
-                    let Some(rule) = rules.get(slot.rule_index) else {
+                    let Some(rule) = rules.get(slot.rule_index()) else {
                         return ScanOutcome::Exhausted;
                     };
                     match slot.target_plan {
                         TargetPlan::StaticAdapter => rule
                             .match_metadata(input.metadata, helper)
-                            .then(|| self.static_match(slot)),
+                            .then(|| self.static_match(slot, rules)),
                         TargetPlan::DynamicAdapter => rule
                             .match_and_resolve(input.metadata, helper)
                             .map(|adapter_name| {
                                 let adapter_index = self.adapter_lookup.get(adapter_name).copied();
-                                self.make_match(slot, adapter_name, adapter_index)
+                                self.make_match(slot, rules, adapter_name, adapter_index)
                             }),
                     }
                 }
-                op => matches_op(op, input, helper).then(|| self.static_match(slot)),
+                op => matches_op(op, input, helper).then(|| self.static_match(slot, rules)),
             };
             if let Some(m) = matched {
                 if target_exists(m.adapter_name) {
@@ -834,17 +841,23 @@ impl CompiledRuleSet {
         ScanOutcome::Exhausted
     }
 
-    fn static_match<'a>(&'a self, slot: &'a CompiledRuleSlot) -> CompiledMatchResult<'a> {
+    fn static_match<'a>(
+        &'a self,
+        slot: &'a CompiledRuleSlot,
+        rules: &'a [Box<dyn Rule>],
+    ) -> CompiledMatchResult<'a> {
         self.make_match(
             slot,
-            self.adapter_names[slot.adapter_index].as_str(),
-            Some(slot.adapter_index),
+            rules,
+            self.adapter_names[slot.adapter_index()].as_str(),
+            Some(slot.adapter_index()),
         )
     }
 
     fn make_match<'a>(
         &'a self,
         slot: &'a CompiledRuleSlot,
+        rules: &'a [Box<dyn Rule>],
         adapter_name: &'a str,
         adapter_index: Option<usize>,
     ) -> CompiledMatchResult<'a> {
@@ -852,8 +865,9 @@ impl CompiledRuleSet {
             adapter_name,
             adapter_index,
             rule_type: slot.rule_type,
-            rule_payload: slot.payload.as_str(),
-            rule_index: slot.rule_index,
+            // Borrowed from the source rule: the plan keeps no payload copy.
+            rule_payload: rules.get(slot.rule_index()).map_or("", |r| r.payload()),
+            rule_index: slot.rule_index(),
         }
     }
 }
@@ -869,7 +883,7 @@ impl<'a> MatchInput<'a> {
 
 impl CompiledRuleSlot {
     pub fn rule_index(&self) -> usize {
-        self.rule_index
+        self.rule_index as usize
     }
 
     pub fn rule_type(&self) -> RuleType {
@@ -877,11 +891,7 @@ impl CompiledRuleSlot {
     }
 
     pub fn adapter_index(&self) -> usize {
-        self.adapter_index
-    }
-
-    pub fn payload(&self) -> &str {
-        &self.payload
+        self.adapter_index as usize
     }
 
     pub fn has_dynamic_adapter(&self) -> bool {
@@ -945,7 +955,7 @@ fn dedup_fingerprint(payload: &str, op: &RuleOp) -> Option<String> {
     match op {
         // These ops store their payload pre-folded / pre-canonicalized.
         RuleOp::Domain(host) | RuleOp::DomainSuffix(host) | RuleOp::DomainKeyword(host) => {
-            Some(host.clone())
+            Some(host.to_string())
         }
         RuleOp::ProcessName(_) | RuleOp::DomainWildcard(_) => Some(payload.to_ascii_lowercase()),
         RuleOp::DomainRegex(_)
@@ -979,9 +989,7 @@ fn dedup_fingerprint(payload: &str, op: &RuleOp) -> Option<String> {
             geosite.keys.join(",")
         )),
         RuleOp::RuleSetRef(handle) => Some(format!("{:p}", Arc::as_ptr(&handle.0))),
-        RuleOp::IpRanges { v4, v6, src } => {
-            Some(format!("{:p}|{:p}|{src}", Arc::as_ptr(v4), Arc::as_ptr(v6)))
-        }
+        RuleOp::IpRanges { set, src } => Some(format!("{:p}|{src}", Arc::as_ptr(set))),
         RuleOp::IpSuffix(_)
         | RuleOp::AllOf(_)
         | RuleOp::AnyOf(_)
@@ -1039,10 +1047,10 @@ impl ShadowOracle {
     fn absorb(&mut self, op: &RuleOp, payload: &str, adapter_index: usize) {
         match op {
             RuleOp::DomainSuffix(suffix) if !suffix.is_empty() => {
-                self.suffixes.insert(suffix.clone(), adapter_index);
+                self.suffixes.insert(suffix.to_string(), adapter_index);
             }
             RuleOp::DomainKeyword(keyword) if !keyword.is_empty() => {
-                self.keywords.push((keyword.clone(), adapter_index));
+                self.keywords.push((keyword.to_string(), adapter_index));
             }
             RuleOp::DomainWildcard(_) => {
                 if let Some(rest) = star_rest(payload) {
@@ -1204,46 +1212,90 @@ fn fold_op(op: RuleOp) -> Folded {
 /// matched some earlier rule, and both sides share the same
 /// `ip.is_some()` gate.
 struct CidrCoverage {
-    v4: IpRange<Ipv4Net>,
-    v6: IpRange<Ipv6Net>,
+    /// Sorted, disjoint, coalesced inclusive intervals per family.
+    v4: Vec<(u32, u32)>,
+    v6: Vec<(u128, u128)>,
 }
 
 impl CidrCoverage {
     fn new() -> Self {
         Self {
-            v4: IpRange::new(),
-            v6: IpRange::new(),
+            v4: Vec::new(),
+            v6: Vec::new(),
         }
     }
 
     fn covers(&self, net: IpNet) -> bool {
         match net {
-            IpNet::V4(v4) => self.v4.contains(&v4),
-            IpNet::V6(v6) => self.v6.contains(&v6),
+            IpNet::V4(v4) => {
+                interval_covers(&self.v4, u32::from(v4.network()), u32::from(v4.broadcast()))
+            }
+            IpNet::V6(v6) => interval_covers(
+                &self.v6,
+                u128::from(v6.network()),
+                u128::from(v6.broadcast()),
+            ),
         }
     }
 
-    /// `simplify` merges sibling and nested blocks, so containment sees the
-    /// true union (10.0.0.0/9 + 10.128.0.0/9 covers a later 10.0.0.0/8).
+    /// Insertion merges overlapping and adjacent blocks, so containment sees
+    /// the true union (10.0.0.0/9 + 10.128.0.0/9 covers a later 10.0.0.0/8).
     fn absorb(&mut self, net: IpNet) {
         match net {
-            IpNet::V4(v4) => {
-                self.v4.add(v4);
-                self.v4.simplify();
-            }
-            IpNet::V6(v6) => {
-                self.v6.add(v6);
-                self.v6.simplify();
-            }
+            IpNet::V4(v4) => interval_insert(
+                &mut self.v4,
+                u32::from(v4.network()),
+                u32::from(v4.broadcast()),
+                |a| a.checked_add(1),
+            ),
+            IpNet::V6(v6) => interval_insert(
+                &mut self.v6,
+                u128::from(v6.network()),
+                u128::from(v6.broadcast()),
+                |a| a.checked_add(1),
+            ),
         }
     }
 }
 
+/// True iff `[start, end]` lies inside one interval of a sorted, disjoint
+/// interval list.
+fn interval_covers<A: Copy + Ord>(intervals: &[(A, A)], start: A, end: A) -> bool {
+    let idx = intervals.partition_point(|&(s, _)| s <= start);
+    idx > 0 && end <= intervals[idx - 1].1
+}
+
+/// Insert `[start, end]` into a sorted, disjoint interval list, merging
+/// every interval it overlaps or touches.
+fn interval_insert<A: Copy + Ord>(
+    intervals: &mut Vec<(A, A)>,
+    start: A,
+    end: A,
+    next: impl Fn(A) -> Option<A>,
+) {
+    // First interval that is not strictly left of (and not adjacent to) us.
+    let first = intervals.partition_point(|&(_, e)| next(e).is_some_and(|n| n < start));
+    // One past the last interval that starts at or before `end + 1`.
+    let last = first
+        + intervals[first..].partition_point(|&(s, _)| match next(end) {
+            Some(n) => s <= n,
+            None => true,
+        });
+    if first == last {
+        intervals.insert(first, (start, end));
+        return;
+    }
+    let merged_start = start.min(intervals[first].0);
+    let merged_end = end.max(intervals[last - 1].1);
+    intervals.drain(first + 1..last);
+    intervals[first] = (merged_start, merged_end);
+}
+
 fn compile_op(rule_type: RuleType, payload: &str) -> Option<RuleOp> {
     match rule_type {
-        RuleType::Domain => Some(RuleOp::Domain(payload.to_ascii_lowercase())),
-        RuleType::DomainSuffix => Some(RuleOp::DomainSuffix(payload.to_ascii_lowercase())),
-        RuleType::DomainKeyword => Some(RuleOp::DomainKeyword(payload.to_ascii_lowercase())),
+        RuleType::Domain => Some(RuleOp::Domain(payload.to_ascii_lowercase().into())),
+        RuleType::DomainSuffix => Some(RuleOp::DomainSuffix(payload.to_ascii_lowercase().into())),
+        RuleType::DomainKeyword => Some(RuleOp::DomainKeyword(payload.to_ascii_lowercase().into())),
         RuleType::DomainRegex => compile_domain_regex(payload).map(RuleOp::DomainRegex),
         RuleType::DomainWildcard => compile_domain_wildcard(payload).map(RuleOp::DomainWildcard),
         // Host bits are truncated at compile time: matching only consults
@@ -1266,13 +1318,15 @@ fn compile_op(rule_type: RuleType, payload: &str) -> Option<RuleOp> {
             .ok()
             .filter(|v| *v <= 63)
             .map(RuleOp::Dscp),
-        RuleType::ProcessName => Some(RuleOp::ProcessName(payload.to_string())),
-        RuleType::ProcessPath => compile_process_path(payload).map(RuleOp::ProcessPath),
+        RuleType::ProcessName => Some(RuleOp::ProcessName(payload.into())),
+        RuleType::ProcessPath => {
+            compile_process_path(payload).map(|op| RuleOp::ProcessPath(Box::new(op)))
+        }
         RuleType::Network => compile_network(payload),
         RuleType::Uid => payload.trim().parse::<u32>().ok().map(RuleOp::Uid),
-        RuleType::InName => Some(RuleOp::InName(payload.to_string())),
+        RuleType::InName => Some(RuleOp::InName(payload.into())),
         RuleType::InType => compile_in_type(payload).map(RuleOp::InType),
-        RuleType::InUser => Some(RuleOp::InUser(payload.to_string())),
+        RuleType::InUser => Some(RuleOp::InUser(payload.into())),
         RuleType::Match => Some(RuleOp::Match),
         RuleType::GeoSite
         | RuleType::GeoIp
@@ -1308,26 +1362,20 @@ fn lower_native(rule: &dyn Rule) -> Option<RuleOp> {
         ))));
     }
     if let Some(geoip) = any.downcast_ref::<GeoIpRule>() {
-        let ranges = geoip.ranges();
         return Some(RuleOp::IpRanges {
-            v4: Arc::clone(&ranges.v4),
-            v6: Arc::clone(&ranges.v6),
+            set: Arc::clone(geoip.ranges()),
             src: false,
         });
     }
     if let Some(src_geoip) = any.downcast_ref::<SrcGeoIpRule>() {
-        let ranges = src_geoip.ranges();
         return Some(RuleOp::IpRanges {
-            v4: Arc::clone(&ranges.v4),
-            v6: Arc::clone(&ranges.v6),
+            set: Arc::clone(src_geoip.ranges()),
             src: true,
         });
     }
     if let Some(asn) = any.downcast_ref::<IpAsnRule>() {
-        let ranges = asn.ranges();
         return Some(RuleOp::IpRanges {
-            v4: Arc::clone(&ranges.v4),
-            v6: Arc::clone(&ranges.v6),
+            set: Arc::clone(asn.ranges()),
             src: asn.is_src(),
         });
     }
@@ -1360,18 +1408,6 @@ fn lower_children(rules: &[Box<dyn Rule>]) -> Option<Box<[RuleOp]>> {
     rules.iter().map(|rule| lower_rule(rule.as_ref())).collect()
 }
 
-fn ip_ranges_contain(v4: &IpRange<Ipv4Net>, v6: &IpRange<Ipv6Net>, ip: Option<IpAddr>) -> bool {
-    match ip {
-        Some(IpAddr::V4(addr)) => {
-            v4.contains(&Ipv4Net::new(addr, 32).expect("/32 is always valid"))
-        }
-        Some(IpAddr::V6(addr)) => {
-            v6.contains(&Ipv6Net::new(addr, 128).expect("/128 is always valid"))
-        }
-        None => false,
-    }
-}
-
 /// Evaluate the state-carrying native ops (and logic trees, which recurse
 /// back into `matches_op`). Deliberately `#[inline(never)]`: these arms are
 /// fat (hash lookups, virtual calls, recursion), and folding them into
@@ -1389,13 +1425,13 @@ fn matches_native_op(op: &RuleOp, input: &MatchInput<'_>, helper: &RuleMatchHelp
                     .all(|key| geosite.db.lookup_resolved(key, input.host))
         }
         RuleOp::RuleSetRef(handle) => handle.0.matches(input.metadata, helper),
-        RuleOp::IpRanges { v4, v6, src } => {
+        RuleOp::IpRanges { set, src } => {
             let ip = if *src {
                 input.metadata.src_ip
             } else {
                 input.metadata.dst_ip
             };
-            ip_ranges_contain(v4, v6, ip)
+            ip.is_some_and(|ip| set.contains(ip))
         }
         RuleOp::IpSuffix(suffix) => {
             let ip = if suffix.src {
@@ -1452,10 +1488,10 @@ fn matches_op(op: &RuleOp, input: &MatchInput<'_>, helper: &RuleMatchHelper) -> 
         RuleOp::Network(network) => input.metadata.network == *network,
         RuleOp::Uid(uid) => uid_matches(input.metadata, *uid),
         RuleOp::InName(name) => {
-            !input.metadata.in_name.is_empty() && input.metadata.in_name.as_str() == name
+            !input.metadata.in_name.is_empty() && input.metadata.in_name.as_str() == &**name
         }
         RuleOp::InType(mask) => in_type_matches(*mask, input.metadata.conn_type),
-        RuleOp::InUser(user) => input.metadata.in_user.as_deref() == Some(user.as_str()),
+        RuleOp::InUser(user) => input.metadata.in_user.as_deref() == Some(&**user),
         RuleOp::Match => true,
         RuleOp::TrieOwned | RuleOp::Fallback => false,
     }
@@ -1734,7 +1770,7 @@ fn compile_port_matcher(payload: &str) -> Option<PortMatcher> {
         [] => None,
         [(lo, hi)] if lo == hi => Some(PortMatcher::Single(*lo)),
         [(lo, hi)] => Some(PortMatcher::Range(*lo, *hi)),
-        _ => Some(PortMatcher::Multiple(
+        _ => Some(PortMatcher::Multiple(Box::new(
             merged
                 .into_iter()
                 .map(|(lo, hi)| {
@@ -1745,7 +1781,7 @@ fn compile_port_matcher(payload: &str) -> Option<PortMatcher> {
                     }
                 })
                 .collect(),
-        )),
+        ))),
     }
 }
 
@@ -1803,9 +1839,9 @@ fn compile_process_path(payload: &str) -> Option<ProcessPathOp> {
             .map(Box::new)
             .map(ProcessPathOp::Glob)
     } else if payload.starts_with('/') || payload.starts_with('\\') {
-        Some(ProcessPathOp::Prefix(payload.to_string()))
+        Some(ProcessPathOp::Prefix(payload.into()))
     } else {
-        Some(ProcessPathOp::Exact(payload.to_string()))
+        Some(ProcessPathOp::Exact(payload.into()))
     }
 }
 
@@ -1816,11 +1852,11 @@ fn process_path_matches(op: &ProcessPathOp, process_path: &str) -> bool {
     match op {
         ProcessPathOp::Glob(regex) => regex.is_match(process_path),
         ProcessPathOp::Prefix(prefix) => {
-            if process_path == prefix {
+            if process_path == &**prefix {
                 return true;
             }
             process_path
-                .strip_prefix(prefix)
+                .strip_prefix(&**prefix)
                 .is_some_and(|rest| rest.starts_with('/') || rest.starts_with('\\'))
         }
         ProcessPathOp::Exact(exact) => {
@@ -1828,7 +1864,7 @@ fn process_path_matches(op: &ProcessPathOp, process_path: &str) -> bool {
                 .file_name()
                 .and_then(|f| f.to_str())
                 .unwrap_or(process_path);
-            filename == exact
+            filename == &**exact
         }
     }
 }
@@ -1848,6 +1884,20 @@ fn uid_matches(metadata: &Metadata, uid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Footprint guard: a 7.5k-rule config keeps 7.5k slots resident, so
+    /// the slot must stay compact (indices `u32`, no payload copy, ops with
+    /// boxed strings). Widening it needs a measured justification.
+    #[test]
+    fn compiled_slot_stays_compact() {
+        let slot = std::mem::size_of::<CompiledRuleSlot>();
+        let op = std::mem::size_of::<RuleOp>();
+        let port = std::mem::size_of::<PortMatcher>();
+        assert!(
+            slot <= 40 && op <= 24 && port <= 16,
+            "slot={slot} B, op={op} B, port_matcher={port} B"
+        );
+    }
     use crate::match_engine::{self, DomainIndex as LegacyDomainIndex};
     use meow_common::{Metadata, Rule};
     use meow_rules::{
@@ -2794,16 +2844,7 @@ mod tests {
 
     #[test]
     fn geoip_rule_lowers_to_ip_ranges_op() {
-        use iprange::IpRange;
-        use meow_rules::country_index::CountryRanges;
-
-        let mut v4: IpRange<ipnet::Ipv4Net> = IpRange::new();
-        v4.add("203.0.113.0/24".parse().unwrap());
-        v4.simplify();
-        let ranges = CountryRanges {
-            v4: Arc::new(v4),
-            v6: Arc::new(IpRange::new()),
-        };
+        let ranges = Arc::new(IpRangeSet::from_nets(["203.0.113.0/24".parse().unwrap()]));
         let rules: Vec<Box<dyn Rule>> = vec![
             Box::new(GeoIpRule::new("CN", "GeoProxy", false, ranges)),
             Box::new(FinalRule::new("DIRECT")),
@@ -3393,7 +3434,9 @@ mod tests {
         assert_eq!(match_count.load(Ordering::Relaxed), 0);
         assert_eq!(counts.rule_type.load(Ordering::Relaxed), 0);
         assert_eq!(counts.adapter.load(Ordering::Relaxed), 0);
-        assert_eq!(counts.payload.load(Ordering::Relaxed), 0);
+        // The payload is deliberately *not* copied into the slot (footprint):
+        // a hit borrows it from the source rule with one virtual call.
+        assert_eq!(counts.payload.load(Ordering::Relaxed), 1);
     }
 
     #[test]

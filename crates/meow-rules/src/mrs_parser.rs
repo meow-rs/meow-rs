@@ -152,6 +152,217 @@ fn decompress_payload_bounded(compressed: &[u8], max: u64) -> Result<Vec<u8>, Mr
     Ok(out)
 }
 
+/// Streaming big-endian frame reader over any `Read` — typically a zstd
+/// decoder, so a multi-megabyte payload is parsed through a small buffer
+/// instead of being decompressed into memory first.
+pub struct FrameReader<R: Read> {
+    inner: R,
+    pos: usize,
+}
+
+impl<R: Read> FrameReader<R> {
+    pub fn new(inner: R) -> Self {
+        Self { inner, pos: 0 }
+    }
+
+    fn fill(&mut self, what: &'static str, buf: &mut [u8]) -> Result<(), MrsError> {
+        // Same expansion bound as `decompress_payload`: zstd expansion is
+        // attacker-chosen, so a streamed payload is capped too (issue #513).
+        if (self.pos + buf.len()) as u64 > MAX_DECOMPRESSED_BYTES {
+            return Err(MrsError::InvalidLength(
+                "decompressed_payload",
+                MAX_DECOMPRESSED_BYTES as i64,
+            ));
+        }
+        match self.inner.read_exact(buf) {
+            Ok(()) => {
+                self.pos += buf.len();
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Err(MrsError::Truncated {
+                what,
+                offset: self.pos,
+                need: buf.len(),
+                have: 0,
+            }),
+            Err(e) => Err(MrsError::Zstd(e)),
+        }
+    }
+
+    pub fn read_u8(&mut self, what: &'static str) -> Result<u8, MrsError> {
+        let mut b = [0u8; 1];
+        self.fill(what, &mut b)?;
+        Ok(b[0])
+    }
+
+    pub fn read_u16_be(&mut self, what: &'static str) -> Result<u16, MrsError> {
+        let mut b = [0u8; 2];
+        self.fill(what, &mut b)?;
+        Ok(u16::from_be_bytes(b))
+    }
+
+    /// Like [`Self::read_u16_be`], but a clean end of stream (no bytes at
+    /// all) yields `None` instead of a truncation error.
+    pub fn read_u16_be_or_eof(&mut self, what: &'static str) -> Result<Option<u16>, MrsError> {
+        let mut b = [0u8; 2];
+        let mut got = 0;
+        while got < 2 {
+            match self.inner.read(&mut b[got..]) {
+                Ok(0) if got == 0 => return Ok(None),
+                Ok(0) => {
+                    return Err(MrsError::Truncated {
+                        what,
+                        offset: self.pos + got,
+                        need: 2,
+                        have: got,
+                    })
+                }
+                Ok(n) => got += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(MrsError::Zstd(e)),
+            }
+        }
+        self.pos += 2;
+        Ok(Some(u16::from_be_bytes(b)))
+    }
+
+    pub fn read_u32_be(&mut self, what: &'static str) -> Result<u32, MrsError> {
+        let mut b = [0u8; 4];
+        self.fill(what, &mut b)?;
+        Ok(u32::from_be_bytes(b))
+    }
+
+    pub fn read_array<const N: usize>(&mut self, what: &'static str) -> Result<[u8; N], MrsError> {
+        let mut b = [0u8; N];
+        self.fill(what, &mut b)?;
+        Ok(b)
+    }
+
+    /// Read exactly `len` bytes into `buf` (reused across calls).
+    pub fn read_into(
+        &mut self,
+        what: &'static str,
+        len: usize,
+        buf: &mut Vec<u8>,
+    ) -> Result<(), MrsError> {
+        buf.clear();
+        buf.resize(len, 0);
+        self.fill(what, buf)
+    }
+
+    pub fn skip(&mut self, what: &'static str, mut len: usize) -> Result<(), MrsError> {
+        let mut scratch = [0u8; 256];
+        while len > 0 {
+            let n = len.min(scratch.len());
+            self.fill(what, &mut scratch[..n])?;
+            len -= n;
+        }
+        Ok(())
+    }
+}
+
+fn utf8<'a>(what: &'static str, bytes: &'a [u8]) -> Result<&'a str, MrsError> {
+    std::str::from_utf8(bytes).map_err(|_| {
+        let err = String::from_utf8(bytes.to_vec()).expect_err("from_utf8 already failed");
+        MrsError::Utf8(what, err)
+    })
+}
+
+/// One item of a streamed geosite payload (see [`stream_geosite_payload`]).
+pub enum GeositeItem<'a> {
+    /// A category header: lower-cased name and its domain count. Return
+    /// `false` from the callback to skip the category's domains without
+    /// materialising them.
+    Category { name: &'a str, domains: u32 },
+    /// One domain of the most recent accepted category (case preserved).
+    Domain(&'a str),
+}
+
+/// Stream a decompressed geosite payload item by item through `on_item`,
+/// holding only one name and one domain in memory at a time. The callback's
+/// return value is consulted only for [`GeositeItem::Category`].
+pub fn stream_geosite_payload<R: Read>(
+    reader: R,
+    mut on_item: impl FnMut(GeositeItem<'_>) -> bool,
+) -> Result<(), MrsError> {
+    let mut r = FrameReader::new(reader);
+    let cat_count = r.read_u32_be("category_count")?;
+    let mut name_buf = Vec::new();
+    let mut domain_buf = Vec::new();
+    for _ in 0..cat_count {
+        let name_len = r.read_u16_be("category_name_len")? as usize;
+        r.read_into("category_name", name_len, &mut name_buf)?;
+        utf8("category_name", &name_buf)?;
+        name_buf.make_ascii_lowercase();
+        let name = utf8("category_name", &name_buf)?;
+        let dom_count = r.read_u32_be("domain_count")?;
+        let load = on_item(GeositeItem::Category {
+            name,
+            domains: dom_count,
+        });
+        for _ in 0..dom_count {
+            let dom_len = r.read_u16_be("domain_len")? as usize;
+            if load {
+                r.read_into("domain", dom_len, &mut domain_buf)?;
+                on_item(GeositeItem::Domain(utf8("domain", &domain_buf)?));
+            } else {
+                r.skip("domain", dom_len)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Stream a `u16-be length + UTF-8 bytes` list (rule-set `domain` /
+/// `classical` payloads) entry by entry.
+pub fn stream_string_list<R: Read>(
+    reader: R,
+    mut on_entry: impl FnMut(&str),
+) -> Result<(), MrsError> {
+    let mut r = FrameReader::new(reader);
+    let mut buf = Vec::new();
+    while let Some(len) = r.read_u16_be_or_eof("string length")? {
+        r.read_into("string entry", len as usize, &mut buf)?;
+        on_entry(utf8("string entry", &buf)?);
+    }
+    Ok(())
+}
+
+/// Stream a rule-set `ipcidr` payload (`u8 family + addr + u8 prefix`)
+/// network by network.
+pub fn stream_ipcidr_list<R: Read>(
+    reader: R,
+    mut on_net: impl FnMut(ipnet::IpNet),
+) -> Result<(), MrsError> {
+    let mut r = FrameReader::new(reader);
+    let mut family = [0u8; 1];
+    loop {
+        match r.inner.read(&mut family) {
+            Ok(0) => return Ok(()),
+            Ok(_) => r.pos += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(MrsError::Zstd(e)),
+        }
+        match family[0] {
+            4 => {
+                let addr = r.read_array::<4>("ipv4 address")?;
+                let prefix = r.read_u8("ipv4 prefix")?;
+                let net = ipnet::Ipv4Net::new(Ipv4Addr::from(addr), prefix)
+                    .map_err(|_| MrsError::InvalidLength("ipv4 prefix", i64::from(prefix)))?;
+                on_net(ipnet::IpNet::V4(net));
+            }
+            16 => {
+                let addr = r.read_array::<16>("ipv6 address")?;
+                let prefix = r.read_u8("ipv6 prefix")?;
+                let net = ipnet::Ipv6Net::new(Ipv6Addr::from(addr), prefix)
+                    .map_err(|_| MrsError::InvalidLength("ipv6 prefix", i64::from(prefix)))?;
+                on_net(ipnet::IpNet::V6(net));
+            }
+            other => return Err(MrsError::InvalidBehavior(other)),
+        }
+    }
+}
+
 /// Parsed current upstream mihomo rule-provider `.mrs` payload.
 ///
 /// Upstream stores the whole file as one zstd frame. The decompressed stream is:
@@ -169,43 +380,128 @@ pub struct UpstreamRuleSetPayload {
     pub entries: Vec<String>,
 }
 
+/// Materialise every entry of an upstream `.mrs` payload as text. Kept for
+/// tests and tooling; the rule-set loader streams through
+/// [`UpstreamRuleSetReader`] instead so no per-entry `String` list is built.
 pub fn parse_upstream_ruleset_mrs(bytes: &[u8]) -> Result<UpstreamRuleSetPayload, MrsError> {
-    let decompressed = decompress_payload(bytes)?;
-    let mut r = ByteReader::new(&decompressed);
-    let magic = r.read_array::<4>("upstream_magic")?;
-    if magic != UPSTREAM_MRS_MAGIC {
-        return Err(MrsError::WrongFormat);
-    }
-
-    let behavior = r.read_u8("behavior")?;
-    let count = r.read_i64_be("count")?;
-    if count < 0 {
-        return Err(MrsError::InvalidLength("count", count));
-    }
-
-    let extra_len = r.read_i64_be("extra_len")?;
-    if extra_len < 0 {
-        return Err(MrsError::InvalidReservedLength(extra_len));
-    }
-    let extra_len =
-        usize::try_from(extra_len).map_err(|_| MrsError::InvalidLength("extra_len", extra_len))?;
-    let _ = r.read_slice("extra", extra_len)?;
-
-    let body = r.remaining_slice();
-    let entries = match behavior {
-        TYPE_DOMAIN => parse_upstream_domain_set(body)?,
-        TYPE_IPCIDR => parse_upstream_ipcidr_set(body)?,
+    let reader = UpstreamRuleSetReader::open(bytes)?;
+    let mut entries = Vec::new();
+    match reader.behavior() {
+        TYPE_DOMAIN => reader.for_each_domain(|d| entries.push(d.to_string()))?,
+        TYPE_IPCIDR => reader.for_each_net(|net| entries.push(net.to_string()))?,
         other => return Err(MrsError::InvalidBehavior(other)),
-    };
-
+    }
     Ok(UpstreamRuleSetPayload {
-        behavior,
-        count: usize::try_from(count).map_err(|_| MrsError::InvalidLength("count", count))?,
+        behavior: reader.behavior(),
+        count: reader.count(),
         entries,
     })
 }
 
-fn parse_upstream_domain_set(data: &[u8]) -> Result<Vec<String>, MrsError> {
+/// Decoded upstream `.mrs` frame: header fields plus the still-encoded body
+/// (a succinct domain set or a range list), walked on demand.
+pub struct UpstreamRuleSetReader {
+    decompressed: Vec<u8>,
+    body_offset: usize,
+    behavior: u8,
+    count: usize,
+}
+
+impl UpstreamRuleSetReader {
+    pub fn open(bytes: &[u8]) -> Result<Self, MrsError> {
+        let decompressed = decompress_payload(bytes)?;
+        let mut r = ByteReader::new(&decompressed);
+        let magic = r.read_array::<4>("upstream_magic")?;
+        if magic != UPSTREAM_MRS_MAGIC {
+            return Err(MrsError::WrongFormat);
+        }
+
+        let behavior = r.read_u8("behavior")?;
+        if behavior != TYPE_DOMAIN && behavior != TYPE_IPCIDR {
+            return Err(MrsError::InvalidBehavior(behavior));
+        }
+        let count = r.read_i64_be("count")?;
+        if count < 0 {
+            return Err(MrsError::InvalidLength("count", count));
+        }
+        let count = usize::try_from(count).map_err(|_| MrsError::InvalidLength("count", count))?;
+
+        let extra_len = r.read_i64_be("extra_len")?;
+        if extra_len < 0 {
+            return Err(MrsError::InvalidReservedLength(extra_len));
+        }
+        let extra_len = usize::try_from(extra_len)
+            .map_err(|_| MrsError::InvalidLength("extra_len", extra_len))?;
+        let _ = r.read_slice("extra", extra_len)?;
+        let body_offset = decompressed.len() - r.remaining_slice().len();
+
+        Ok(Self {
+            decompressed,
+            body_offset,
+            behavior,
+            count,
+        })
+    }
+
+    pub fn behavior(&self) -> u8 {
+        self.behavior
+    }
+
+    pub fn count(&self) -> usize {
+        self.count
+    }
+
+    fn body(&self) -> &[u8] {
+        &self.decompressed[self.body_offset..]
+    }
+
+    /// Walk every domain of a `domain` body. Each domain is handed over as
+    /// a borrowed `&str` from one reused buffer.
+    pub fn for_each_domain(&self, mut on_domain: impl FnMut(&str)) -> Result<(), MrsError> {
+        if self.behavior != TYPE_DOMAIN {
+            return Err(MrsError::InvalidBehavior(self.behavior));
+        }
+        walk_upstream_domain_set(self.body(), &mut on_domain)
+    }
+
+    /// Walk every network of an `ipcidr` body (ranges are split into
+    /// aligned prefixes, IPv4-mapped addresses are unmapped).
+    pub fn for_each_net(&self, mut on_net: impl FnMut(ipnet::IpNet)) -> Result<(), MrsError> {
+        if self.behavior != TYPE_IPCIDR {
+            return Err(MrsError::InvalidBehavior(self.behavior));
+        }
+        let mut r = ByteReader::new(self.body());
+        let version = r.read_u8("ipcidr_set_version")?;
+        if version != 1 {
+            return Err(MrsError::InvalidIpCidrSetVersion(version));
+        }
+        let len = r.read_i64_be("ipcidr_set_ranges_len")?;
+        if len < 1 {
+            return Err(MrsError::InvalidLength("ipcidr_set_ranges_len", len));
+        }
+        let mut emitted = 0usize;
+        for _ in 0..len {
+            let from = r.read_array::<16>("ipcidr_from")?;
+            let to = r.read_array::<16>("ipcidr_to")?;
+            let from = IpAddr::from(Ipv6Addr::from(from));
+            let to = IpAddr::from(Ipv6Addr::from(to));
+            push_range_prefixes(from, to, &mut |net| {
+                emitted += 1;
+                on_net(net);
+            });
+            // One 32-byte record can expand to over a hundred CIDRs; bound
+            // the total or a max-size payload amplifies ~100x (issue #513).
+            if emitted > MAX_DOMAIN_SET_ENTRIES {
+                return Err(MrsError::InvalidLength("ipcidr_set_output", emitted as i64));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Decode a succinct domain set, calling `on_domain` once per domain
+/// (forward byte order, reused buffer).
+fn walk_upstream_domain_set(data: &[u8], on_domain: &mut dyn FnMut(&str)) -> Result<(), MrsError> {
     let mut r = ByteReader::new(data);
     let version = r.read_u8("domain_set_version")?;
     if version != 1 {
@@ -243,14 +539,22 @@ fn parse_upstream_domain_set(data: &[u8]) -> Result<Vec<String>, MrsError> {
         label_index: DomainSetIndex::new(&label_bitmap),
         labels,
     };
-    let mut reversed = Vec::new();
     let mut current = Vec::new();
-    traversal.traverse(0, 0, &mut current, &mut reversed)?;
+    let mut forward = Vec::new();
+    traversal.traverse(0, 0, &mut current, &mut |reversed: &[u8]| {
+        forward.clear();
+        forward.extend(reversed.iter().rev());
+        if let Ok(domain) = std::str::from_utf8(&forward) {
+            on_domain(domain);
+        }
+    })
+}
 
-    Ok(reversed
-        .into_iter()
-        .filter_map(|bytes| String::from_utf8(bytes.into_iter().rev().collect()).ok())
-        .collect())
+#[cfg(test)]
+fn parse_upstream_domain_set(data: &[u8]) -> Result<Vec<String>, MrsError> {
+    let mut out = Vec::new();
+    walk_upstream_domain_set(data, &mut |d| out.push(d.to_string()))?;
+    Ok(out)
 }
 
 fn read_u64_vec(r: &mut ByteReader<'_>, what: &'static str) -> Result<Vec<u64>, MrsError> {
@@ -299,7 +603,7 @@ impl DomainSetTraversal<'_> {
         root_node: usize,
         root_bm: usize,
         current: &mut Vec<u8>,
-        out: &mut Vec<Vec<u8>>,
+        out: &mut dyn FnMut(&[u8]),
     ) -> Result<(), MrsError> {
         self.traverse_bounded(
             root_node,
@@ -324,15 +628,17 @@ impl DomainSetTraversal<'_> {
         root_node: usize,
         root_bm: usize,
         current: &mut Vec<u8>,
-        out: &mut Vec<Vec<u8>>,
+        out: &mut dyn FnMut(&[u8]),
         max_entries: usize,
         max_bytes: usize,
         max_depth: usize,
     ) -> Result<(), MrsError> {
+        let mut out_count = 0usize;
         let mut out_bytes = 0usize;
         let mut stack: Vec<(usize, usize)> = vec![(root_node, root_bm)];
         if get_bit(self.leaves, root_node) {
-            out.push(current.clone());
+            out_count += 1;
+            out(current);
         }
         while let Some(top) = stack.last_mut() {
             let (node_id, idx) = *top;
@@ -359,14 +665,15 @@ impl DomainSetTraversal<'_> {
             top.1 = idx + 1;
             current.push(label);
             if get_bit(self.leaves, next_node_id) {
-                if out.len() >= max_entries || out_bytes + current.len() > max_bytes {
+                if out_count >= max_entries || out_bytes + current.len() > max_bytes {
                     return Err(MrsError::InvalidLength(
                         "domain_set_output",
-                        out.len() as i64,
+                        out_count as i64,
                     ));
                 }
                 out_bytes += current.len();
-                out.push(current.clone());
+                out_count += 1;
+                out(current);
             }
             if stack.len() >= max_depth {
                 return Err(MrsError::InvalidLength(
@@ -432,36 +739,7 @@ fn get_bit(bits: &[u64], idx: usize) -> bool {
         .is_some_and(|word| (word & (1u64 << (idx % 64))) != 0)
 }
 
-fn parse_upstream_ipcidr_set(data: &[u8]) -> Result<Vec<String>, MrsError> {
-    let mut r = ByteReader::new(data);
-    let version = r.read_u8("ipcidr_set_version")?;
-    if version != 1 {
-        return Err(MrsError::InvalidIpCidrSetVersion(version));
-    }
-    let len = r.read_i64_be("ipcidr_set_ranges_len")?;
-    if len < 1 {
-        return Err(MrsError::InvalidLength("ipcidr_set_ranges_len", len));
-    }
-    let mut out = Vec::new();
-    for _ in 0..len {
-        let from = r.read_array::<16>("ipcidr_from")?;
-        let to = r.read_array::<16>("ipcidr_to")?;
-        let from = IpAddr::from(Ipv6Addr::from(from));
-        let to = IpAddr::from(Ipv6Addr::from(to));
-        push_range_prefixes(from, to, &mut out);
-        // One 32-byte record can expand to over a hundred CIDR strings; bound
-        // the total or a max-size payload amplifies ~100x (issue #513).
-        if out.len() > MAX_DOMAIN_SET_ENTRIES {
-            return Err(MrsError::InvalidLength(
-                "ipcidr_set_output",
-                out.len() as i64,
-            ));
-        }
-    }
-    Ok(out)
-}
-
-fn push_range_prefixes(from: IpAddr, to: IpAddr, out: &mut Vec<String>) {
+fn push_range_prefixes(from: IpAddr, to: IpAddr, out: &mut dyn FnMut(ipnet::IpNet)) {
     match (from, to) {
         (IpAddr::V4(a), IpAddr::V4(b)) => push_v4_range(a, b, out),
         (IpAddr::V6(a), IpAddr::V6(b))
@@ -478,11 +756,13 @@ fn push_range_prefixes(from: IpAddr, to: IpAddr, out: &mut Vec<String>) {
     }
 }
 
-fn push_v4_range(from: Ipv4Addr, to: Ipv4Addr, out: &mut Vec<String>) {
+fn push_v4_range(from: Ipv4Addr, to: Ipv4Addr, out: &mut dyn FnMut(ipnet::IpNet)) {
     let mut start = u32::from(from);
     let end = u32::from(to);
     if start == 0 && end == u32::MAX {
-        out.push("0.0.0.0/0".to_string());
+        out(ipnet::IpNet::V4(
+            ipnet::Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 0).expect("/0 is valid"),
+        ));
         return;
     }
     while start <= end {
@@ -490,7 +770,9 @@ fn push_v4_range(from: Ipv4Addr, to: Ipv4Addr, out: &mut Vec<String>) {
         let remaining = u64::from(end) - u64::from(start) + 1;
         let block_bits = max_size.min(63 - remaining.leading_zeros());
         let prefix = 32 - block_bits;
-        out.push(format!("{}/{}", Ipv4Addr::from(start), prefix));
+        if let Ok(net) = ipnet::Ipv4Net::new(Ipv4Addr::from(start), prefix as u8) {
+            out(ipnet::IpNet::V4(net));
+        }
         let step = 1u32 << block_bits;
         if remaining == u64::from(step) {
             break;
@@ -499,11 +781,13 @@ fn push_v4_range(from: Ipv4Addr, to: Ipv4Addr, out: &mut Vec<String>) {
     }
 }
 
-fn push_v6_range(from: Ipv6Addr, to: Ipv6Addr, out: &mut Vec<String>) {
+fn push_v6_range(from: Ipv6Addr, to: Ipv6Addr, out: &mut dyn FnMut(ipnet::IpNet)) {
     let mut start = u128::from(from);
     let end = u128::from(to);
     if start == 0 && end == u128::MAX {
-        out.push("::/0".to_string());
+        out(ipnet::IpNet::V6(
+            ipnet::Ipv6Net::new(Ipv6Addr::UNSPECIFIED, 0).expect("/0 is valid"),
+        ));
         return;
     }
     while start <= end {
@@ -511,7 +795,9 @@ fn push_v6_range(from: Ipv6Addr, to: Ipv6Addr, out: &mut Vec<String>) {
         let remaining = end - start + 1;
         let block_bits = max_size.min(127 - remaining.leading_zeros());
         let prefix = 128 - block_bits;
-        out.push(format!("{}/{}", Ipv6Addr::from(start), prefix));
+        if let Ok(net) = ipnet::Ipv6Net::new(Ipv6Addr::from(start), prefix as u8) {
+            out(ipnet::IpNet::V6(net));
+        }
         let step = 1u128 << block_bits;
         if end - start + 1 == step {
             break;
@@ -527,75 +813,35 @@ pub struct GeositePayload {
 }
 
 /// Parse the inner (decompressed) geosite payload per the format described
-/// at the top of this module.
+/// at the top of this module into owned lists.
 ///
 /// When `allowed` is `Some`, only categories whose lowercased name is in the
-/// set are fully parsed; all others are skipped at the byte level (the cursor
-/// advances past their domains without allocating strings). Pass `None` to
-/// load every category.
+/// set are materialised; all others are skipped at the byte level. Pass
+/// `None` to load every category. The geosite loader itself streams via
+/// [`stream_geosite_payload`] and never builds these lists. Declared counts
+/// are remote-controlled, so nothing is reserved from them: a bogus count
+/// simply runs into a `Truncated` error (issue #513).
 pub fn parse_geosite_payload(
     decompressed: &[u8],
     allowed: Option<&std::collections::HashSet<String>>,
 ) -> Result<GeositePayload, MrsError> {
-    let mut r = ByteReader::new(decompressed);
-    let cat_count = r.read_u32_be("category_count")? as usize;
-    // Both counts come from a remote geodata file. Reserving them verbatim asks
-    // for hundreds of gigabytes on a bogus count, which aborts under the
-    // workspace's `panic = "abort"`; cap at what the input can actually hold —
-    // an empty category still costs a u16 name length plus a u32 domain count,
-    // and an empty domain still costs a u16 length.
-    let mut categories = Vec::with_capacity(bounded_capacity::<(String, Vec<String>)>(
-        cat_count,
-        r.remaining(),
-        6,
-    ));
-    for _ in 0..cat_count {
-        let name_len = r.read_u16_be("category_name_len")? as usize;
-        let name_bytes = r.read_slice("category_name", name_len)?;
-        let name = String::from_utf8(name_bytes.to_vec())
-            .map_err(|e| MrsError::Utf8("category_name", e))?
-            .to_ascii_lowercase();
-        let dom_count = r.read_u32_be("domain_count")? as usize;
-
-        // If an allow-set is active and this category is not in it, skip its
-        // domains at the byte level — read lengths and advance the cursor
-        // without allocating any domain strings.
-        if let Some(set) = allowed {
-            if !set.contains(&name) {
-                for _ in 0..dom_count {
-                    let dom_len = r.read_u16_be("domain_len")? as usize;
-                    let _ = r.read_slice("domain", dom_len)?;
-                }
-                continue;
+    let mut categories: Vec<(String, Vec<String>)> = Vec::new();
+    stream_geosite_payload(Cursor::new(decompressed), |item| match item {
+        GeositeItem::Category { name, .. } => {
+            if allowed.is_some_and(|set| !set.contains(name)) {
+                return false;
             }
+            categories.push((name.to_string(), Vec::new()));
+            true
         }
-
-        let mut domains =
-            Vec::with_capacity(bounded_capacity::<String>(dom_count, r.remaining(), 2));
-        for _ in 0..dom_count {
-            let dom_len = r.read_u16_be("domain_len")? as usize;
-            let dom_bytes = r.read_slice("domain", dom_len)?;
-            let domain = String::from_utf8(dom_bytes.to_vec())
-                .map_err(|e| MrsError::Utf8("domain", e))?
-                .to_ascii_lowercase();
-            domains.push(domain);
+        GeositeItem::Domain(domain) => {
+            if let Some((_, domains)) = categories.last_mut() {
+                domains.push(domain.to_ascii_lowercase());
+            }
+            true
         }
-        categories.push((name, domains));
-    }
+    })?;
     Ok(GeositePayload { categories })
-}
-
-/// Cap a reservation derived from a declared element count at what the
-/// remaining input can actually hold, given the smallest encoded size of one
-/// element. The declared counts are remote-controlled; without the cap a bogus
-/// count becomes an allocation failure rather than a `Truncated` error.
-///
-/// The divisor also accounts for the element's *decoded* size: without it the
-/// reservation can still reach ~8–12× the input (a 48-byte element against a
-/// 6-byte minimum encoding), which turns a large-but-legitimate input into an
-/// oversized allocation.
-fn bounded_capacity<T>(declared: usize, remaining: usize, min_element_bytes: usize) -> usize {
-    declared.min(remaining / min_element_bytes.max(std::mem::size_of::<T>()))
 }
 
 /// Encode a `GeositePayload` into the uncompressed inner payload bytes.
@@ -685,29 +931,10 @@ impl<'a> ByteReader<'a> {
         Ok(())
     }
 
-    fn read_u16_be(&mut self, what: &'static str) -> Result<u16, MrsError> {
-        self.need(what, 2)?;
-        let v = u16::from_be_bytes([self.data[self.pos], self.data[self.pos + 1]]);
-        self.pos += 2;
-        Ok(v)
-    }
-
     fn read_u8(&mut self, what: &'static str) -> Result<u8, MrsError> {
         self.need(what, 1)?;
         let v = self.data[self.pos];
         self.pos += 1;
-        Ok(v)
-    }
-
-    fn read_u32_be(&mut self, what: &'static str) -> Result<u32, MrsError> {
-        self.need(what, 4)?;
-        let v = u32::from_be_bytes([
-            self.data[self.pos],
-            self.data[self.pos + 1],
-            self.data[self.pos + 2],
-            self.data[self.pos + 3],
-        ]);
-        self.pos += 4;
         Ok(v)
     }
 
@@ -1115,27 +1342,28 @@ mod tests {
             label_index: DomainSetIndex::new(&label_bitmap),
             labels,
         };
-        let (mut out, mut current) = (Vec::new(), Vec::new());
+        let mut sink = |_: &[u8]| {};
+        let mut current = Vec::new();
         // Three domains in the set; cap at two.
         assert!(
             traversal
-                .traverse_bounded(0, 0, &mut current, &mut out, 2, usize::MAX, 4096)
+                .traverse_bounded(0, 0, &mut current, &mut sink, 2, usize::MAX, 4096)
                 .is_err(),
             "entry cap must error"
         );
-        let (mut out, mut current) = (Vec::new(), Vec::new());
+        let mut current = Vec::new();
         // Depth 1 refuses every descent.
         assert!(
             traversal
-                .traverse_bounded(0, 0, &mut current, &mut out, usize::MAX, usize::MAX, 1)
+                .traverse_bounded(0, 0, &mut current, &mut sink, usize::MAX, usize::MAX, 1)
                 .is_err(),
             "depth cap must error"
         );
-        let (mut out, mut current) = (Vec::new(), Vec::new());
+        let mut current = Vec::new();
         // Byte cap: each emitted domain is longer than 1 byte.
         assert!(
             traversal
-                .traverse_bounded(0, 0, &mut current, &mut out, usize::MAX, 1, 4096)
+                .traverse_bounded(0, 0, &mut current, &mut sink, usize::MAX, 1, 4096)
                 .is_err(),
             "byte cap must error"
         );

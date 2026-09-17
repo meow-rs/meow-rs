@@ -20,12 +20,15 @@
 //! upstream: `rules/common/process.go`
 
 use meow_common::{Metadata, Rule, RuleMatchHelper, RuleType};
+
+use crate::adapter::{intern_adapter, Adapter};
+use smol_str::SmolStr;
 use std::path::Path;
 
 pub struct ProcessPathRule {
-    payload: String,
+    payload: SmolStr,
     mode: MatchMode,
-    adapter: String,
+    adapter: Adapter,
 }
 
 #[derive(Debug)]
@@ -55,9 +58,9 @@ impl ProcessPathRule {
         };
 
         Ok(Self {
-            payload: payload.to_string(),
+            payload: payload.into(),
             mode,
-            adapter: adapter.to_string(),
+            adapter: intern_adapter(adapter),
         })
     }
 
@@ -70,7 +73,7 @@ impl ProcessPathRule {
             MatchMode::Prefix => {
                 // Exact match, or match on a path-component boundary.
                 // `/usr/bin` matches `/usr/bin/curl` but NOT `/usr/bin-extra`.
-                let payload = self.payload.as_str();
+                let payload = &*self.payload;
                 if process_path == payload {
                     return true;
                 }
@@ -85,7 +88,7 @@ impl ProcessPathRule {
                     .file_name()
                     .and_then(|f| f.to_str())
                     .unwrap_or(process_path);
-                filename == self.payload.as_str()
+                filename == &*self.payload
             }
         }
     }

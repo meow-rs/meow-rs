@@ -14,11 +14,14 @@
 
 use ipnet::IpNet;
 use meow_common::{Metadata, Rule, RuleMatchHelper, RuleType};
+
+use crate::adapter::{intern_adapter, Adapter};
+use smol_str::SmolStr;
 use std::net::IpAddr;
 
 pub struct IpSuffixRule {
-    payload_raw: String,
-    adapter: String,
+    payload_raw: SmolStr,
+    adapter: Adapter,
     family: Family,
     src: bool,
     no_resolve: bool,
@@ -111,8 +114,8 @@ impl IpSuffixRule {
             }
         };
         Ok(Self {
-            payload_raw: payload.to_string(),
-            adapter: adapter.to_string(),
+            payload_raw: payload.into(),
+            adapter: intern_adapter(adapter),
             family,
             src,
             no_resolve,

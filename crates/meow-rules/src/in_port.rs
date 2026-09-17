@@ -6,15 +6,14 @@
 
 use meow_common::{Metadata, Rule, RuleMatchHelper, RuleType};
 
-pub struct InPortRule {
-    ranges: Vec<InPortRange>,
-    raw: String,
-    adapter: String,
-}
+use crate::adapter::{intern_adapter, Adapter};
+use smol_str::SmolStr;
 
-enum InPortRange {
-    Single(u16),
-    Range(u16, u16),
+pub struct InPortRule {
+    /// Inclusive `(lo, hi)` pairs; a single port is `(p, p)`.
+    ranges: Box<[(u16, u16)]>,
+    raw: SmolStr,
+    adapter: Adapter,
 }
 
 impl InPortRule {
@@ -42,12 +41,12 @@ impl InPortRule {
                         "invalid IN-PORT range {lo}-{hi}: start must be <= end"
                     ));
                 }
-                ranges.push(InPortRange::Range(lo, hi));
+                ranges.push((lo, hi));
             } else {
                 let p = part
                     .parse::<u16>()
                     .map_err(|e| format!("invalid IN-PORT '{part}': {e}"))?;
-                ranges.push(InPortRange::Single(p));
+                ranges.push((p, p));
             }
         }
 
@@ -56,17 +55,16 @@ impl InPortRule {
         }
 
         Ok(Self {
-            ranges,
-            raw: ports.to_string(),
-            adapter: adapter.to_string(),
+            ranges: ranges.into_boxed_slice(),
+            raw: ports.into(),
+            adapter: intern_adapter(adapter),
         })
     }
 
     fn matches_port(&self, port: u16) -> bool {
-        self.ranges.iter().any(|range| match range {
-            InPortRange::Single(value) => port == *value,
-            InPortRange::Range(lo, hi) => port >= *lo && port <= *hi,
-        })
+        self.ranges
+            .iter()
+            .any(|&(lo, hi)| (lo..=hi).contains(&port))
     }
 }
 

@@ -40,13 +40,14 @@ pub struct ParserContext {
     /// SRC-GEOIP rules built through this context. `None` means those rules
     /// will parse-fail with a "no GeoIP database configured" error. The
     /// MMDB Reader itself is dropped after the index is built; per-rule
-    /// matching uses Patricia-trie `IpRange` lookups, not MMDB lookups.
+    /// matching is one binary search over a shared `IpRangeSet`, not an
+    /// MMDB lookup.
     pub geoip: Option<Arc<CountryIndex>>,
     /// Optional GeoLite2-ASN range index for `IP-ASN` rules. `None` triggers
     /// a parse-time hard-error on any `IP-ASN` payload — silent skipping would
     /// misroute ASN-gated traffic (Class A per ADR-0002). The MMDB Reader
-    /// itself is dropped after the index is built; per-rule matching uses
-    /// Patricia-trie `IpRange` lookups, not MMDB lookups.
+    /// itself is dropped after the index is built; per-rule matching is one
+    /// binary search over a shared `IpRangeSet`, not an MMDB lookup.
     pub asn: Option<Arc<AsnIndex>>,
     /// Optional geosite database for `GEOSITE` rules. Unlike GEOIP/ASN,
     /// absence does NOT hard-error at parse time — per spec §Divergences

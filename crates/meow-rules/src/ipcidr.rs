@@ -1,10 +1,13 @@
 use ipnet::IpNet;
 use meow_common::{Metadata, Rule, RuleMatchHelper, RuleType};
 
+use crate::adapter::{intern_adapter, Adapter};
+use smol_str::SmolStr;
+
 pub struct IpCidrRule {
     cidr: IpNet,
-    cidr_str: String,
-    adapter: String,
+    cidr_str: SmolStr,
+    adapter: Adapter,
     is_src: bool,
     no_resolve: bool,
 }
@@ -19,8 +22,8 @@ impl IpCidrRule {
         let parsed: IpNet = cidr.parse()?;
         Ok(Self {
             cidr: parsed,
-            cidr_str: cidr.to_string(),
-            adapter: adapter.to_string(),
+            cidr_str: cidr.into(),
+            adapter: intern_adapter(adapter),
             is_src,
             no_resolve,
         })

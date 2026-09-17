@@ -2,8 +2,8 @@
 //!
 //! Identical to [`crate::geoip::GeoIpRule`] except it reads `Metadata.src_ip`
 //! instead of `dst_ip`. Like `GEOIP`, the country's CIDR list is materialised
-//! into an `IpRange` Patricia trie at parse time via
-//! [`crate::country_index::CountryIndex`] — match is a Patricia lookup, no
+//! into a shared [`crate::ip_set::IpRangeSet`] at parse time via
+//! [`crate::country_index::CountryIndex`] — match is one binary search, no
 //! MMDB access on the hot path.
 //!
 //! `no-resolve` is not applicable: the source IP is always an IP address
@@ -11,23 +11,24 @@
 //!
 //! upstream: `rules/common/geoip.go::Rule` (`isSource` flag)
 
-use ipnet::{Ipv4Net, Ipv6Net};
 use meow_common::{Metadata, Rule, RuleMatchHelper, RuleType};
-use std::net::IpAddr;
+
+use crate::adapter::{intern_adapter, Adapter};
+use smol_str::SmolStr;
 
 use crate::country_index::CountryRanges;
 
 pub struct SrcGeoIpRule {
-    country: String,
-    adapter: String,
+    country: SmolStr,
+    adapter: Adapter,
     ranges: CountryRanges,
 }
 
 impl SrcGeoIpRule {
     pub fn new(country: &str, adapter: &str, ranges: CountryRanges) -> Self {
         Self {
-            country: country.to_uppercase(),
-            adapter: adapter.to_string(),
+            country: country.to_uppercase().into(),
+            adapter: intern_adapter(adapter),
             ranges,
         }
     }
@@ -45,17 +46,7 @@ impl Rule for SrcGeoIpRule {
     }
 
     fn match_metadata(&self, metadata: &Metadata, _helper: &RuleMatchHelper) -> bool {
-        match metadata.src_ip {
-            Some(IpAddr::V4(v4)) => self
-                .ranges
-                .v4
-                .contains(&Ipv4Net::new(v4, 32).expect("/32 is always valid")),
-            Some(IpAddr::V6(v6)) => self
-                .ranges
-                .v6
-                .contains(&Ipv6Net::new(v6, 128).expect("/128 is always valid")),
-            None => false,
-        }
+        metadata.src_ip.is_some_and(|ip| self.ranges.contains(ip))
     }
 
     fn adapter(&self) -> &str {

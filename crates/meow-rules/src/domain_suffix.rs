@@ -1,15 +1,18 @@
 use meow_common::{Metadata, Rule, RuleMatchHelper, RuleType};
 
+use crate::adapter::{intern_adapter, Adapter};
+use smol_str::SmolStr;
+
 pub struct DomainSuffixRule {
-    suffix: String,
-    adapter: String,
+    suffix: SmolStr,
+    adapter: Adapter,
 }
 
 impl DomainSuffixRule {
     pub fn new(suffix: &str, adapter: &str) -> Self {
         Self {
-            suffix: suffix.to_ascii_lowercase(),
-            adapter: adapter.to_string(),
+            suffix: suffix.to_ascii_lowercase().into(),
+            adapter: intern_adapter(adapter),
         }
     }
 }

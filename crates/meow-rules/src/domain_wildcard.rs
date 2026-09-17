@@ -8,10 +8,13 @@
 
 use meow_common::{Metadata, Rule, RuleMatchHelper, RuleType};
 
+use crate::adapter::{intern_adapter, Adapter};
+use smol_str::SmolStr;
+
 pub struct DomainWildcardRule {
     pattern: regex::Regex,
-    raw: String,
-    adapter: String,
+    raw: SmolStr,
+    adapter: Adapter,
 }
 
 impl DomainWildcardRule {
@@ -27,8 +30,8 @@ impl DomainWildcardRule {
             .map_err(|e| format!("invalid DOMAIN-WILDCARD pattern '{pattern}': {e}"))?;
         Ok(Self {
             pattern: re,
-            raw: pattern.to_string(),
-            adapter: adapter.to_string(),
+            raw: pattern.into(),
+            adapter: intern_adapter(adapter),
         })
     }
 }

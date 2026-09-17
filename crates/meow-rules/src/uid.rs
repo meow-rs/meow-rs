@@ -9,11 +9,14 @@
 
 use meow_common::{Metadata, Rule, RuleMatchHelper, RuleType};
 
+use crate::adapter::{intern_adapter, Adapter};
+use smol_str::SmolStr;
+
 pub struct UidRule {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     uid: u32,
-    raw: String,
-    adapter: String,
+    raw: SmolStr,
+    adapter: Adapter,
 }
 
 impl UidRule {
@@ -38,8 +41,8 @@ impl UidRule {
 
         Ok(Self {
             uid: value,
-            raw: uid.to_string(),
-            adapter: adapter.to_string(),
+            raw: uid.into(),
+            adapter: intern_adapter(adapter),
         })
     }
 }

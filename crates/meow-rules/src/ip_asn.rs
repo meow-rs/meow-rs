@@ -2,20 +2,21 @@
 //! equals the payload.
 //!
 //! At parse time, matching ranges for the requested ASN are materialised from
-//! the GeoLite2-ASN MMDB into Patricia tries. Match becomes a cheap
-//! `IpRange::contains` — no MMDB lookup, no allocation.
+//! the GeoLite2-ASN MMDB into a shared [`crate::ip_set::IpRangeSet`]. Match
+//! becomes one binary search — no MMDB lookup, no allocation.
 //!
 //! upstream: `rules/common/ipasn.go`
 
-use ipnet::{Ipv4Net, Ipv6Net};
 use meow_common::{Metadata, Rule, RuleMatchHelper, RuleType};
-use std::net::IpAddr;
+
+use crate::adapter::{intern_adapter, Adapter};
+use smol_str::SmolStr;
 
 use crate::asn_index::AsnRanges;
 
 pub struct IpAsnRule {
-    raw: String,
-    adapter: String,
+    raw: SmolStr,
+    adapter: Adapter,
     ranges: AsnRanges,
     src: bool,
     no_resolve: bool,
@@ -31,8 +32,8 @@ impl IpAsnRule {
         no_resolve: bool,
     ) -> Self {
         Self {
-            raw: raw.to_string(),
-            adapter: adapter.to_string(),
+            raw: raw.into(),
+            adapter: intern_adapter(adapter),
             ranges,
             src,
             no_resolve,
@@ -61,17 +62,7 @@ impl Rule for IpAsnRule {
         } else {
             metadata.dst_ip
         };
-        match ip {
-            Some(IpAddr::V4(v4)) => self
-                .ranges
-                .v4
-                .contains(&Ipv4Net::new(v4, 32).expect("/32 is always valid")),
-            Some(IpAddr::V6(v6)) => self
-                .ranges
-                .v6
-                .contains(&Ipv6Net::new(v6, 128).expect("/128 is always valid")),
-            None => false,
-        }
+        ip.is_some_and(|ip| self.ranges.contains(ip))
     }
 
     fn adapter(&self) -> &str {

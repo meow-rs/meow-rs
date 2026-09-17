@@ -124,7 +124,6 @@ lru = "0.16"
 
 # IP handling
 ipnet = "2"
-iprange = "0.6"
 
 # TUN inbound (issue #326) — cross-platform L3 device + userspace TCP/IP
 # stack + route table control. Optional; pulled in only by meow-listener's

@@ -11,10 +11,13 @@
 
 use meow_common::{Metadata, Rule, RuleMatchHelper, RuleType};
 
+use crate::adapter::{intern_adapter, Adapter};
+use smol_str::SmolStr;
+
 pub struct DscpRule {
     value: u8,
-    raw: String,
-    adapter: String,
+    raw: SmolStr,
+    adapter: Adapter,
 }
 
 impl DscpRule {
@@ -31,8 +34,8 @@ impl DscpRule {
         }
         Ok(Self {
             value,
-            raw: dscp.to_string(),
-            adapter: adapter.to_string(),
+            raw: dscp.into(),
+            adapter: intern_adapter(adapter),
         })
     }
 }

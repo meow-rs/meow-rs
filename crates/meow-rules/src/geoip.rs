@@ -1,21 +1,21 @@
 //! `GEOIP` rule — match on the **destination** IP's country.
 //!
-//! At parse time the country's CIDR list is materialised into an
-//! `IpRange<Ipv4Net>` + `IpRange<Ipv6Net>` Patricia trie via
-//! [`crate::country_index::CountryIndex`]. Match becomes a cheap
-//! `IpRange::contains` — no MMDB lookup, no allocation.
+//! At parse time the country's CIDR list is materialised into a shared
+//! [`crate::ip_set::IpRangeSet`] via [`crate::country_index::CountryIndex`].
+//! Match becomes one binary search — no MMDB lookup, no allocation.
 //!
 //! upstream: `rules/common/geoip.go::Rule` (the `isSource = false` path)
 
-use ipnet::{Ipv4Net, Ipv6Net};
 use meow_common::{Metadata, Rule, RuleMatchHelper, RuleType};
-use std::net::IpAddr;
+
+use crate::adapter::{intern_adapter, Adapter};
+use smol_str::SmolStr;
 
 use crate::country_index::CountryRanges;
 
 pub struct GeoIpRule {
-    country: String,
-    adapter: String,
+    country: SmolStr,
+    adapter: Adapter,
     no_resolve: bool,
     ranges: CountryRanges,
 }
@@ -23,8 +23,8 @@ pub struct GeoIpRule {
 impl GeoIpRule {
     pub fn new(country: &str, adapter: &str, no_resolve: bool, ranges: CountryRanges) -> Self {
         Self {
-            country: country.to_uppercase(),
-            adapter: adapter.to_string(),
+            country: country.to_uppercase().into(),
+            adapter: intern_adapter(adapter),
             no_resolve,
             ranges,
         }
@@ -43,17 +43,7 @@ impl Rule for GeoIpRule {
     }
 
     fn match_metadata(&self, metadata: &Metadata, _helper: &RuleMatchHelper) -> bool {
-        match metadata.dst_ip {
-            Some(IpAddr::V4(v4)) => self
-                .ranges
-                .v4
-                .contains(&Ipv4Net::new(v4, 32).expect("/32 is always valid")),
-            Some(IpAddr::V6(v6)) => self
-                .ranges
-                .v6
-                .contains(&Ipv6Net::new(v6, 128).expect("/128 is always valid")),
-            None => false,
-        }
+        metadata.dst_ip.is_some_and(|ip| self.ranges.contains(ip))
     }
 
     fn adapter(&self) -> &str {

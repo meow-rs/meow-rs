@@ -25,7 +25,9 @@ pub struct MatchResult<'a> {
 /// The adapter and payload are borrowed from the rule slice after lookup,
 /// which keeps the index compact and avoids per-match result allocation.
 pub struct DomainIndex {
-    trie: DomainTrie<usize>,
+    /// Rule indices as `u32`: halves the trie's value table versus `usize`
+    /// and no config approaches 2^32 rules.
+    trie: DomainTrie<u32>,
 }
 
 impl DomainIndex {
@@ -57,6 +59,7 @@ impl DomainIndex {
     /// Duplicate patterns keep the first (minimum) rule index: inserts happen
     /// in ascending rule order and the trie's per-slot value is first-write.
     pub fn insert_rule(&mut self, index: usize, rule_type: RuleType, payload: &str) -> bool {
+        let index = u32::try_from(index).expect("rule index exceeds u32");
         match rule_type {
             RuleType::Domain => indexable_pattern(payload) && self.trie.insert(payload, index),
             RuleType::DomainSuffix => {
@@ -90,7 +93,7 @@ impl DomainIndex {
     /// Probe the trie for a production-normalized hostname. Returns the
     /// minimum matching DOMAIN/DOMAIN-SUFFIX rule index, or `None`.
     pub fn search(&self, host: &str) -> Option<usize> {
-        self.trie.search_min_normalized(host).copied()
+        self.trie.search_min_normalized(host).map(|&i| i as usize)
     }
 }
 

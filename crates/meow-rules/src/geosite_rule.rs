@@ -7,14 +7,17 @@ use std::sync::Arc;
 
 use meow_common::{Metadata, Rule, RuleMatchHelper, RuleType};
 
+use crate::adapter::{intern_adapter, Adapter};
+use smol_str::SmolStr;
+
 use crate::geosite::GeositeDB;
 
 pub struct GeoSiteRule {
     /// Lower-cased category name, including any `@attribute` suffix.
-    category: String,
+    category: SmolStr,
     /// Raw payload preserved for diagnostics / API introspection.
-    payload_raw: String,
-    adapter: String,
+    payload_raw: SmolStr,
+    adapter: Adapter,
     /// Shared DB loaded once at startup. `None` when the DB file was not
     /// found at startup; matching always returns false.
     db: Option<Arc<GeositeDB>>,
@@ -26,11 +29,11 @@ impl GeoSiteRule {
     /// `"microsoft@cn"`); the suffix is preserved and interpreted by
     /// [`GeositeDB::lookup`].
     pub fn new(payload: &str, adapter: &str, db: Option<Arc<GeositeDB>>, no_resolve: bool) -> Self {
-        let category = payload.trim().to_ascii_lowercase();
+        let category = payload.trim().to_ascii_lowercase().into();
         Self {
             category,
-            payload_raw: payload.to_string(),
-            adapter: adapter.to_string(),
+            payload_raw: payload.into(),
+            adapter: intern_adapter(adapter),
             db,
             no_resolve,
         }

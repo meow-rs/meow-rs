@@ -13,9 +13,12 @@
 
 use meow_common::{ConnType, Metadata, Rule, RuleMatchHelper, RuleType};
 
+use crate::adapter::{intern_adapter, Adapter};
+use smol_str::SmolStr;
+
 pub struct InTypeRule {
-    raw: String,
-    adapter: String,
+    raw: SmolStr,
+    adapter: Adapter,
     /// Bitmask stored as a small fixed array; we have at most 2 variants to match.
     match_http: bool,
     match_https: bool,
@@ -30,8 +33,8 @@ impl InTypeRule {
     /// upstream: `rules/common/inbound.go::NewInType`
     pub fn new(type_str: &str, adapter: &str) -> Result<Self, String> {
         let mut r = Self {
-            raw: type_str.to_string(),
-            adapter: adapter.to_string(),
+            raw: type_str.into(),
+            adapter: intern_adapter(adapter),
             match_http: false,
             match_https: false,
             match_socks5: false,

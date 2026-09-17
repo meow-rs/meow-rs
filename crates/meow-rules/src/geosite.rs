@@ -13,9 +13,7 @@ use std::sync::Arc;
 use meow_trie::DomainTrie;
 use tracing::warn;
 
-use crate::mrs_parser::{
-    decompress_payload, parse_geosite_payload, parse_header, MrsError, TYPE_DOMAIN,
-};
+use crate::mrs_parser::{parse_header, stream_geosite_payload, GeositeItem, MrsError, TYPE_DOMAIN};
 
 #[derive(Debug, thiserror::Error)]
 pub enum GeositeError {
@@ -233,25 +231,42 @@ impl GeositeDB {
                 if header.type_tag != TYPE_DOMAIN {
                     return Err(GeositeError::UnexpectedType(header.type_tag));
                 }
-                let decompressed = decompress_payload(rest)?;
-                let payload = parse_geosite_payload(&decompressed, allowed)?;
-
-                let mut categories: HashMap<String, DomainTrie<()>> =
-                    HashMap::with_capacity(payload.categories.len());
-                let mut counts: HashMap<String, usize> =
-                    HashMap::with_capacity(payload.categories.len());
-                for (name, domains) in payload.categories {
-                    let mut trie = DomainTrie::new();
-                    let mut inserted = 0usize;
-                    for d in domains {
-                        if trie.insert(&d, ()) {
-                            inserted += 1;
-                        }
+                // Stream straight from the zstd decoder into per-category
+                // tries: neither the decompressed payload nor a per-domain
+                // string list is ever held in memory.
+                let decoder = zstd::stream::Decoder::new(std::io::Cursor::new(rest))
+                    .map_err(MrsError::Zstd)?;
+                let mut categories: HashMap<String, DomainTrie<()>> = HashMap::new();
+                let mut counts: HashMap<String, usize> = HashMap::new();
+                let mut current: Option<(String, DomainTrie<()>, usize)> = None;
+                let finish = |current: &mut Option<(String, DomainTrie<()>, usize)>,
+                              categories: &mut HashMap<String, DomainTrie<()>>,
+                              counts: &mut HashMap<String, usize>| {
+                    if let Some((name, mut trie, inserted)) = current.take() {
+                        trie.seal();
+                        counts.insert(name.clone(), inserted);
+                        categories.insert(name, trie);
                     }
-                    trie.seal();
-                    counts.insert(name.clone(), inserted);
-                    categories.insert(name, trie);
-                }
+                };
+                stream_geosite_payload(decoder, |item| match item {
+                    GeositeItem::Category { name, .. } => {
+                        finish(&mut current, &mut categories, &mut counts);
+                        let load = allowed.is_none_or(|set| set.contains(name));
+                        if load {
+                            current = Some((name.to_string(), DomainTrie::new(), 0));
+                        }
+                        load
+                    }
+                    GeositeItem::Domain(domain) => {
+                        if let Some((_, trie, inserted)) = current.as_mut() {
+                            if trie.insert(domain, ()) {
+                                *inserted += 1;
+                            }
+                        }
+                        true
+                    }
+                })?;
+                finish(&mut current, &mut categories, &mut counts);
                 Ok(Self {
                     categories,
                     counts,

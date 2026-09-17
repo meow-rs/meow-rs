@@ -1,10 +1,13 @@
 use meow_common::{Metadata, Rule, RuleMatchHelper, RuleType};
+
+use crate::adapter::{intern_adapter, Adapter};
 use regex::Regex;
+use smol_str::SmolStr;
 
 pub struct DomainRegexRule {
     regex: Regex,
-    pattern: String,
-    adapter: String,
+    pattern: SmolStr,
+    adapter: Adapter,
 }
 
 impl DomainRegexRule {
@@ -12,8 +15,8 @@ impl DomainRegexRule {
         let regex = Regex::new(pattern)?;
         Ok(Self {
             regex,
-            pattern: pattern.to_string(),
-            adapter: adapter.to_string(),
+            pattern: pattern.into(),
+            adapter: intern_adapter(adapter),
         })
     }
 }
