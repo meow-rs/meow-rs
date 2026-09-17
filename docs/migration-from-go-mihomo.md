@@ -361,6 +361,17 @@ the inner error, e.g.: `"relay chain failed at hop 1 (proxy-b → proxy-c): <inn
 as a relay hop is allowed. The currently-selected proxy in that group is
 used at dial time. This matches upstream.
 
+**Non-first hops** run the adapter's full post-connect pipeline — its own
+TLS/WS/obfs stack to its own server, then the protocol handshake — over the
+preceding hop's stream (mihomo `DialContextWithDialer` semantics).
+`direct`, `reject`, `http`, `socks5`, `snell`, `vless`, `vmess`, `trojan`,
+`anytls`, and `ss` (built-in obfs/v2ray-plugin/ech-tls-tunnel included) all
+terminate a relay chain. Two carve-outs fail loudly instead of silently
+misbehaving: `hysteria2` (QUIC/UDP cannot ride a TCP stream — first-hop
+only) and `ss` with an external SIP003 plugin (the subprocess owns its
+outbound leg). Mux pooling (`smux`/`yamux`/`h2mux`/`muxcool`) is bypassed on
+relay hops: a relay-supplied stream is single-use and cannot be re-dialled.
+
 **No health-check on the relay group itself.** Relay is a fixed chain, not
 a pool. For health-aware relay, wrap relay groups inside a Fallback group.
 
@@ -645,9 +656,11 @@ The following are unsupported or intentionally rejected:
   - *Adapter types that own their transport* — `anytls` and `hysteria2` (QUIC)
     do not dial through the pluggable dialer, and `ss` with an **external**
     SIP003 plugin always reaches that plugin over loopback. These fall back to
-    the relay-based wrapper, which works only where `connect_over` is
-    implemented (`http`, `socks5`, `snell` without TLS) and otherwise fails
-    loudly at dial time. It never degrades to a silent direct dial.
+    the relay-based wrapper, which works where `connect_over` is implemented
+    (all of `direct`, `reject`, `http`, `socks5`, `snell`, `vless`, `vmess`,
+    `trojan`, `anytls`, and `ss` — except `ss` with an external SIP003 plugin)
+    and otherwise fails loudly at dial time (`hysteria2` stays unsupported:
+    QUIC cannot ride a TCP stream). It never degrades to a silent direct dial.
   - *UDP* — associations whose datagrams ride a raw socket cannot follow the TCP
     chain (Shadowsocks plain relay, SOCKS5 UDP ASSOCIATE) and are refused
     rather than leaking the real source path. UDP carried inside a mux session

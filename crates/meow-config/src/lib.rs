@@ -637,9 +637,11 @@ pub async fn parse_dns_from_raw(
 /// pluggable dialer — `anytls`, `hysteria2` (QUIC), and `ss` with an external
 /// SIP003 plugin — reject the injected dialer at parse time. Those fall back to
 /// wrapping the existing entry with a [`meow_proxy::DialerProxyAdapter`] (relay
-/// chain), which works where `connect_over` is implemented (HTTP/SOCKS5/Snell)
-/// and fails loudly at dial time otherwise. The fallback never degrades to a
-/// direct dial, so a configured chain cannot be silently bypassed.
+/// chain), which works where `connect_over` is implemented (direct, reject,
+/// http, socks5, snell, vless, vmess, trojan, anytls, and ss without an
+/// external plugin) and fails loudly at dial time otherwise (`hysteria2`,
+/// `ss` + external SIP003). The fallback never degrades to a direct dial, so
+/// a configured chain cannot be silently bypassed.
 ///
 /// UDP: paths that use a raw datagram socket bypass the TCP dialer entirely
 /// (Shadowsocks plain relay, SOCKS5 UDP ASSOCIATE). Those refuse the
@@ -775,9 +777,11 @@ fn apply_dialer_proxies(
                 // otherwise unparseable. Fall back to the relay-based
                 // `DialerProxyAdapter`, which preserves the pre-dialer
                 // behaviour: it works for the protocols that implement
-                // `connect_over` (HTTP/SOCKS5/Snell) and fails loudly at dial
-                // time for the rest — never silently dialing direct and leaking
-                // past the chain.
+                // `connect_over` (direct/reject/http/socks5/snell/vless/
+                // vmess/trojan/anytls/ss-without-external-plugin) and fails
+                // loudly at dial time for the rest (hysteria2, ss + external
+                // SIP003) — never silently dialing direct and leaking past
+                // the chain.
                 //
                 // The inner outbound may itself have failed to parse earlier,
                 // in which case there is nothing to wrap.

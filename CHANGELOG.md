@@ -59,6 +59,29 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **Relay groups can now terminate on real protocol adapters, not just
+  `http`/`socks5`/`snell`.** Every hop after the first runs
+  `ProxyAdapter::connect_over`, which previously only `direct`, `reject`,
+  `http`, `socks5`, and `snell` implemented — a `relay` chain ending on a
+  `vless`/`vmess`/`trojan`/`anytls`/`ss` node failed at hop 1 with
+  `connect_over not supported`. `connect_over` now means the adapter's full
+  post-connect pipeline over the passed stream — its own TLS/WS/obfs stack
+  to its own server, then the protocol handshake (mihomo
+  `DialContextWithDialer` semantics) — and is implemented by `vless`,
+  `vmess`, `trojan`, `shadowsocks`, and `anytls` on top of the existing
+  five. Two latent bugs surfaced and were fixed along the way:
+  `http`/`socks5` `connect_over` silently skipped the adapter's own TLS
+  layer, so a `tls: true` node in a non-first position sent a plaintext
+  handshake to a TLS endpoint; and `RelayGroup::connect_over` did not
+  resolve group members, so a nested relay holding a selector hit
+  `NotSupported` on the group instead of running the selected leaf.
+  Boundaries: `hysteria2` stays first-hop-only (QUIC cannot ride a TCP
+  stream), `ss` with an external SIP003 plugin fails loudly (the subprocess
+  owns its outbound leg), and mux pooling is bypassed on relay hops because
+  a relay-supplied stream is single-use. The same fix makes `dialer-proxy`
+  work for `anytls`, which previously fell back to the relay wrapper and
+  still failed. (#570)
+
 - **TLS handshakes no longer fail on multiplexed transports whose
   `poll_flush` pends.** Every TLS-over-mux handshake — AnyTLS, smux, and any
   stream whose `poll_flush` waits on a writer-task acknowledgement — died at

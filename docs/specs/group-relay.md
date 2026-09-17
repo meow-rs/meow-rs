@@ -1,6 +1,15 @@
 # Spec: Relay proxy group (M1.C-2)
 
 Status: Approved (architect 2026-04-11, unblocked once M1.B-1 VMess lands `connect_over` trait change)
+Post-M1 update: issue #570 extended `connect_over` to the full TCP outbound
+set — vless, vmess, trojan, anytls, shadowsocks (built-in plugins only),
+plus the existing direct/reject/http/socks5/snell. `connect_over` now means
+"run the adapter's complete post-connect pipeline (its own transport/TLS
+stack + protocol handshake) over the supplied stream" — mihomo's
+`DialContextWithDialer` model. Hysteria2 stays first-hop-only (QUIC cannot
+ride a TCP stream); SS external SIP003 plugins fail loudly since the
+subprocess owns its outbound leg; mux pooling is bypassed on relay-supplied
+streams (single-use, nothing to pool).
 Owner: pm
 Tracks roadmap item: **M1.C-2**
 Depends on: none beyond the existing `ProxyAdapter` trait.
