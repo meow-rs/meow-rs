@@ -220,7 +220,12 @@ async fn connect_over(
     // run HTTP CONNECT / SOCKS5 handshake on `stream`
     // return wrapped stream
 }
-// Note: the TLS-wrap step from dial_tcp is SKIPPED in connect_over. The passed stream is already inside whatever encryption the relay chain provides; double-wrapping TLS would be incorrect.
+// Note: connect_over runs the adapter's complete post-connect pipeline —
+// including its own TLS layer when `tls: true` is configured. The passed
+// stream terminates at this adapter's own server, so its TLS stack is part
+// of the protocol, not double-wrapping. (An earlier revision skipped the
+// TLS wrap here; that was a bug fixed in #574 — a `tls: true` node in a
+// non-first relay position would send plaintext to a TLS endpoint.)
 ```
 
 This enables using HTTP CONNECT or SOCKS5 as hops in a relay chain.

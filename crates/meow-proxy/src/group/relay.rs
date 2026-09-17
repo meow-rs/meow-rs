@@ -93,8 +93,39 @@ fn resolve_proxy(mut proxy: Arc<dyn Proxy>, metadata: &Metadata) -> Arc<dyn Prox
     proxy
 }
 
+/// Resolve every hop once and splice nested relay groups' resolved members
+/// into the chain in place.
+///
+/// `resolve_proxy` cannot see through a nested `RelayGroup` (it is a leaf to
+/// `unwrap_proxy`), and a group hop has no `addr()` of its own — the address
+/// the preceding hop must dial is the *entry point* of the inner chain.  By
+/// flattening, `outer = [X, inner[p, q], Y]` becomes `[X, p, q, Y]`: X dials
+/// p's server, then each hop runs `connect_over` in order — exactly mihomo's
+/// composed-dialer semantics.  Resolving members here (once) also keeps
+/// stateful selectors coherent: the member the preceding hop dials is the
+/// same member whose `connect_over` runs.
+fn flatten_hops(proxies: &[Arc<dyn Proxy>], metadata: &Metadata) -> Vec<Arc<dyn Proxy>> {
+    let mut out = Vec::with_capacity(proxies.len());
+    for proxy in proxies {
+        let resolved = resolve_proxy(Arc::clone(proxy), metadata);
+        let inner = resolved
+            .as_any()
+            .and_then(|a| a.downcast_ref::<RelayGroup>());
+        match inner {
+            Some(relay) => out.extend(flatten_hops(&relay.proxies, metadata)),
+            None => out.push(resolved),
+        }
+    }
+    out
+}
+
 /// Return the target for a hop, skipping later DIRECT hops because they are
-/// transparent no-ops inside an already-established relay stream.
+/// transparent no-ops inside an already-established relay stream.  Members
+/// with no dialable address (`addr() == ""`, e.g. REJECT or an unresolvable
+/// group) are skipped for metadata purposes too — the preceding hop would
+/// otherwise be told to dial `""`, and the skipped member still gets its own
+/// `connect_over` call so it fails at its own hop index rather than
+/// misattributing the failure to an earlier hop.
 fn metadata_for_next_hop(
     proxies: &[Arc<dyn Proxy>],
     start: usize,
@@ -102,7 +133,7 @@ fn metadata_for_next_hop(
 ) -> Metadata {
     proxies[start..]
         .iter()
-        .find(|proxy| proxy.adapter_type() != AdapterType::Direct)
+        .find(|proxy| proxy.adapter_type() != AdapterType::Direct && !proxy.addr().is_empty())
         .map_or_else(|| final_target.clone(), metadata_for_proxy)
 }
 
@@ -121,11 +152,13 @@ pub(crate) async fn relay_tcp(
         "relay chain must have at least 2 proxies"
     );
 
-    let proxies: Vec<_> = proxies
-        .iter()
-        .cloned()
-        .map(|proxy| resolve_proxy(proxy, final_target))
-        .collect();
+    let proxies = flatten_hops(proxies, final_target);
+    if proxies.len() < 2 {
+        return Err(MeowError::Proxy(format!(
+            "relay: chain resolved to fewer than 2 hops ({})",
+            proxies.len()
+        )));
+    }
 
     // proxy[0]: real TCP connect; target = the next non-DIRECT proxy's
     // server:port, or the final destination if only DIRECT hops remain.
@@ -282,17 +315,16 @@ impl ProxyAdapter for RelayGroup {
         stream: Box<dyn ProxyConn>,
         final_target: &Metadata,
     ) -> Result<Box<dyn ProxyConn>> {
-        debug_assert!(self.proxies.len() >= 2);
-
         // Resolve groups to their selected leaf once, exactly like
         // `relay_tcp` — a stateful selector must serve the same member to
         // both the preceding hop's target metadata and its own connect_over.
-        let proxies: Vec<_> = self
-            .proxies
-            .iter()
-            .cloned()
-            .map(|proxy| resolve_proxy(proxy, final_target))
-            .collect();
+        let proxies = flatten_hops(&self.proxies, final_target);
+        if proxies.len() < 2 {
+            return Err(MeowError::Proxy(format!(
+                "relay: chain resolved to fewer than 2 hops ({})",
+                proxies.len()
+            )));
+        }
         let mut conn = stream;
 
         // All hops use connect_over (stream already established by outer relay).
@@ -340,6 +372,12 @@ impl Proxy for RelayGroup {
 
     fn delay_history(&self) -> Vec<meow_common::DelayHistory> {
         self.health.delay_history()
+    }
+
+    /// Lets `flatten_hops` downcast a nested relay hop and splice this
+    /// group's resolved members into the outer chain.
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
     }
 
     fn members(&self) -> Option<Vec<String>> {
@@ -780,6 +818,19 @@ mod tests {
         assert_eq!(m.dst_port, 1080);
     }
 
+    /// `addr()` is always `format!("{server}:{port}")`, so even an
+    /// unbracketed IPv6 server like `"2001:db8::1"` yields
+    /// `"2001:db8::1:1080"` — `rfind(':')` still isolates the true port and
+    /// the remainder parses as an `IpAddr`.  Pin that invariant.
+    #[test]
+    fn metadata_for_proxy_unbracketed_ipv6_server() {
+        let p: Arc<dyn Proxy> = MockProxy::new("v6-bare", "2001:db8::1", 1080, 1);
+        let m = metadata_for_proxy(&p);
+        assert_eq!(m.dst_ip, Some("2001:db8::1".parse().expect("v6")));
+        assert_eq!(m.dst_port, 1080);
+        assert!(m.host.is_empty());
+    }
+
     #[test]
     fn metadata_for_proxy_keeps_domains_in_host() {
         let p: Arc<dyn Proxy> = MockProxy::new("dns-hop", "example.com", 443, 1);
@@ -790,14 +841,17 @@ mod tests {
     }
 
     /// A nested relay whose members include a selector must resolve that
-    /// selector to its leaf before calling `connect_over` — the group's own
-    /// `connect_over` defaults to `NotSupported` and `addr()` is empty, so
-    /// skipping resolution both fails the hop and yields garbage metadata.
+    /// selector to its leaf before calling `connect_over`, and the nested
+    /// group must be *flattened* into the outer chain: `outer = [a,
+    /// inner[sel→b, c]]` runs as `[a, b, c]` so that `a` dials the inner
+    /// chain's entry point (b's server) rather than the group's own empty
+    /// `addr()`.
     #[tokio::test]
     async fn nested_connect_over_resolves_group_members() {
         let a = MockProxy::new("a", "10.0.0.1", 1080, 1);
         let b = MockProxy::new("b", "10.0.0.2", 1081, 2);
         let c = MockProxy::new("c", "10.0.0.3", 1082, 3);
+        let a_host = Arc::clone(&a.last_dial_host);
         let b_visits = Arc::clone(&b.visits);
         let b_host = Arc::clone(&b.last_dial_host);
         let c_visits = Arc::clone(&c.visits);
@@ -813,6 +867,9 @@ mod tests {
 
         outer.dial_tcp(&target).await.expect("nested relay");
 
+        // `a` dials the inner chain's entry point — b's server, not the
+        // relay group's empty addr().
+        assert_eq!(*a_host.lock(), Some("10.0.0.2".into()));
         // Inner chain ran sel→b (resolved) as a connect_over hop aimed at
         // c's server, then c as the final hop aimed at the target.
         assert_eq!(*b_visits.lock(), vec![2]);

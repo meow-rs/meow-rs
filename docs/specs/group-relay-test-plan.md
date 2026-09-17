@@ -1,9 +1,10 @@
 # Test Plan: Relay proxy group (M1.C-2)
 
-Status: **draft** — owner: qa. Last updated: 2026-04-11.
+Status: **implemented** — owner: qa. Last updated: 2026-04-11; corrected
+post-#570 (`connect_over` ships with a default `Err(NotSupported)` impl, so
+the "no default impl" guard-rails below — pre-flight §, G1, G3 — are void;
+the nested-relay case is implemented and runs unignored via `flatten_hops`).
 Tracks: task #51. Companion to `docs/specs/group-relay.md` (rev 1.0).
-**Implementation on hold** pending M1.B-1 (VMess) landing `connect_over` trait
-change (team-lead sequencing 2026-04-11).
 
 This is the QA-owned acceptance test plan. The spec's `§Test plan` section is
 PM's starting point; this document is the final shape engineer should implement
@@ -25,10 +26,9 @@ PM so the spec can be updated.
   boundary, NOT raw inner error.
 - Parse-time errors: single proxy, empty proxies (Class A); `url`/`interval`
   warn-once (Class B).
-- Nested relay (relay-of-relay): `#[ignore]` case for 4-hop chain.
+- Nested relay (relay-of-relay): flattened at any position.
 - `AdapterType::Relay` and `ProxyAdapter` trait method correctness.
-- Structural invariants: no default `connect_over` impl; no `anyhow` at public
-  boundary.
+- Structural invariants: no `anyhow` at public boundary.
 
 **Out of scope:**
 
@@ -39,21 +39,13 @@ PM so the spec can be updated.
 
 ---
 
-## Pre-flight issue: `connect_over` is a required trait method
+## Historical note: `connect_over` shipped with a default impl
 
-`connect_over` has no default implementation (architect-approved, 2026-04-11).
-This means **every** `MockProxy` used in relay tests must implement it. There is
-no "I forgot" path that compiles.
-
-**Consequence for test authorship:** the `MockProxy` defined below must include
-`connect_over`. If the engineer copy-pastes the `TestAdapter` from
-`api_test.rs::delay_support` and omits `connect_over`, the code will not compile.
-This is intentional — the compiler enforces the discipline.
-
-**Also:** M1.B-1 (VMess) must land before this test file can compile, because
-`connect_over` is added to the `ProxyAdapter` trait in that PR. Tests in this
-file will not compile until then. Mark the entire test module with a note:
-`// requires connect_over from M1.B-1 — compile-blocked until that PR lands`.
+The original plan called for a required method (no default). The shipped
+trait instead provides a default `Err(NotSupported)` (see spec Resolved
+questions §1), so a `MockProxy` that omits `connect_over` still compiles —
+it just fails relay calls at runtime with `NotSupported`. Tests that rely
+on `connect_over` must still implement it explicitly to pass.
 
 ---
 
@@ -162,7 +154,7 @@ an `AsyncRead + AsyncWrite + ProxyConn` that accepts all bytes and returns EOF.
 
 | # | Case | Asserts |
 |---|------|---------|
-| E1 | `relay_nested_relay_group` `#[ignore = "requires 4 connect_over-capable mock proxies; revisit once M1.B adapters land"]` | Outer relay chain: [inner_relay, proxy_D]. Inner relay chain: [proxy_A, proxy_B, proxy_C]. Effective sequence: A.dial_tcp → B.connect_over → C.connect_over → D.connect_over. Assert: all four visit counters show one call; payload arrives at mock target. <br/> Transparent nesting — architect-confirmed (spec §Nested relay groups). NOT a special case or explicit recursion guard. |
+| E1 | `relay_nested_relay_group` | Outer relay chain: [inner_relay, proxy_D]. Inner relay chain: [proxy_A, proxy_B, proxy_C]. Effective sequence: A.dial_tcp → B.connect_over → C.connect_over → D.connect_over (the inner group's members are spliced into the outer chain by `flatten_hops`, so the nested relay works at any position — not only hop 0). Assert: all four visit counters show one call; payload arrives at mock target. |
 
 ---
 
@@ -182,9 +174,9 @@ an `AsyncRead + AsyncWrite + ProxyConn` that accepts all bytes and returns EOF.
 
 | # | Case | Asserts |
 |---|------|---------|
-| G1 | `connect_over_is_required_no_default` **[guard-rail]** | `grep "fn connect_over" crates/meow-common/src/adapter.rs` → exactly one match, with no `{ … }` body on the trait definition line (i.e., it is a required method signature, not a method with a default body). Alternatively: confirm that removing `connect_over` from a `MockProxy` implementation produces a compile error. |
+| G1 | ~~`connect_over_is_required_no_default`~~ **void** | Superseded: the shipped trait has a default `Err(NotSupported)` impl. A `MockProxy` without `connect_over` compiles and fails relay calls at runtime; hop-failure tests (D1–D4) cover the visible behavior. |
 | G2 | `relay_has_debug_assert_on_proxy_len` **[guard-rail]** | `grep "debug_assert" crates/meow-proxy/src/group/relay.rs` → non-empty. Guards that `debug_assert!(proxies.len() >= 2)` is present in `relay.rs` as specified. The parse-time hard-error (B1/B2) prevents production use; the `debug_assert` catches test-harness mistakes. |
-| G3 | `no_default_connect_over_in_adapter_trait` **[guard-rail]** | A `MockProxy` that implements `ProxyAdapter` without a `connect_over` body must produce a compile error (`missing required method`). This cannot be expressed as a `#[test]` — document it as a compile-fail test using `trybuild` if available, otherwise as a comment. The compiler enforces this invariant; note it here so reviewers know to check. |
+| G3 | ~~`no_default_connect_over_in_adapter_trait`~~ **void** | Same as G1 — the default impl exists by design (hysteria2, SS external SIP003 rely on it). |
 
 ---
 

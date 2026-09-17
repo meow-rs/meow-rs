@@ -229,8 +229,8 @@ struct AnytlsConn {
     session: Arc<Session>,
     /// `true` when the session was built for this conn alone (relay
     /// `connect_over`) and is not shared through the client's pool — it is
-    /// closed when the conn drops rather than idling until the heartbeat
-    /// timeout (~60s) reaps it.
+    /// closed when the conn drops rather than living until the transport
+    /// dies (the heartbeat only reaps sessions whose peer stops answering).
     session_owned: bool,
     pending_read: Mutex<Option<PendingRead>>,
 }
@@ -337,10 +337,16 @@ impl Drop for AnytlsConn {
         self.fin_stream();
 
         // An owned (unpooled, relay-created) session holds the whole relay
-        // stream — close it now instead of leaving it to the heartbeat
-        // idle timeout. `Session::close` is idempotent, so a session that
-        // already failed is a no-op. Without a runtime handle (conn dropped
-        // from a non-tokio thread) the heartbeat timeout is the fallback.
+        // stream — close it now instead of leaving it to the heartbeat,
+        // which is a liveness probe (not an idle reaper) and would keep a
+        // live-server session alive indefinitely. The queued FIN above may
+        // never reach the wire here — `close` tears down the writer before
+        // draining the frame queue — but that's benign: closing the session
+        // releases every server-side stream anyway. `Session::close` is
+        // idempotent, so a session that already failed is a no-op. Without
+        // a runtime handle (conn dropped off-runtime or mid-shutdown) the
+        // session persists until its transport dies — no other watchdog
+        // exists; acceptable because conns are dropped on runtime tasks.
         if self.session_owned {
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 let session = Arc::clone(&self.session);

@@ -75,7 +75,13 @@ the canonical, in-repo source a release is cut from.
   handshake to a TLS endpoint; and `RelayGroup::connect_over` did not
   resolve group members, so a nested relay holding a selector hit
   `NotSupported` on the group instead of running the selected leaf.
-  Boundaries: `hysteria2` stays first-hop-only (QUIC cannot ride a TCP
+  Nested `relay` groups are now *flattened* into the outer chain at any
+  position — the preceding hop dials the inner chain's entry point
+  (previously a group member at a non-first position yielded `""`/`0`
+  target metadata for the preceding hop), and hops with an empty
+  `addr()` (REJECT, unresolvable groups) are skipped for metadata but
+  still run their own `connect_over` so failures stay correctly
+  attributed. Boundaries: `hysteria2` stays first-hop-only (QUIC cannot ride a TCP
   stream), `ss` with an external SIP003 plugin fails loudly (the subprocess
   owns its outbound leg), and mux pooling is bypassed on relay hops because
   a relay-supplied stream is single-use. The same fix makes `dialer-proxy`

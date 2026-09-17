@@ -101,9 +101,12 @@ cipher quirks, `vmess-legacy` feature flag) for diminishing returns. Dropped fro
 M1 scope; spec preserved in `docs/specs/proxy-vmess.md` as a design record if
 revisited in a future milestone.
 
-**`connect_over` trait status (updated 2026-04-18):** `ProxyAdapter::connect_over`
-is fully implemented and merged for HTTP CONNECT + SOCKS5 (df78968). VLESS
-has its own `connect_over` override in 334d55c. All B items are on main.
+**`connect_over` trait status (updated post-#570):** `ProxyAdapter::connect_over`
+runs each adapter's complete post-connect pipeline over a supplied stream and
+is implemented by every TCP-capable outbound — direct, reject, http, socks5,
+snell, vless, vmess, trojan, shadowsocks (built-in transports; external SIP003
+plugins fail loudly), and anytls. Hysteria2 stays first-hop-only (QUIC cannot
+ride a TCP stream). Mux pooling is bypassed on relay-supplied streams.
 
 **Deferred to M1.5 / M2** (architect recommendation, 2026-04-11):
 

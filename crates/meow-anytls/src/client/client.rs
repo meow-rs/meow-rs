@@ -415,7 +415,16 @@ impl Client {
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
     {
         let session = self.session_over_transport(tls_stream).await?;
-        let stream = Self::open_proxy_stream(&session, destination, None).await?;
+        let stream = match Self::open_proxy_stream(&session, destination, None).await {
+            Ok(stream) => stream,
+            Err(e) => {
+                // The unpooled session is invisible to the pool reaper and a
+                // live server keeps answering heartbeats, so it would leak
+                // (with the whole relay leg) indefinitely. Close it now.
+                let _ = session.close().await;
+                return Err(e);
+            }
+        };
         Ok((stream, session))
     }
 
