@@ -11,12 +11,14 @@
 //! - `proxy[N-1]`: `connect_over(stream, final_target)` — final hop connects to
 //!   the actual target.
 //!
-//! Nested relay-of-relay works transparently: `RelayGroup` implements
-//! `ProxyAdapter`, so its `connect_over` runs the inner chain starting from the
-//! passed stream.  No special casing needed — architect-confirmed 2026-04-11.
+//! Nested relay-of-relay works at any chain position: `flatten_hops` splices
+//! a nested `RelayGroup`'s resolved members into the outer chain in place, so
+//! the preceding hop dials the inner chain's entry point and each inner member
+//! runs `connect_over` like any other hop.
 //!
 //! upstream: adapter/outbound/relay.go
 
+use super::dialer_proxy::DialerProxyAdapter;
 use async_trait::async_trait;
 use meow_common::{
     AdapterType, MeowError, Metadata, Proxy, ProxyAdapter, ProxyConn, ProxyHealth, ProxyPacketConn,
@@ -104,17 +106,48 @@ fn resolve_proxy(mut proxy: Arc<dyn Proxy>, metadata: &Metadata) -> Arc<dyn Prox
 /// composed-dialer semantics.  Resolving members here (once) also keeps
 /// stateful selectors coherent: the member the preceding hop dials is the
 /// same member whose `connect_over` runs.
+///
+/// A `dialer-proxy` hop whose inner adapter is itself a `RelayGroup` is
+/// flattened the same way — inside a chain the per-outbound dialer is
+/// ignored by design (`DialerProxyAdapter::connect_over` delegates to the
+/// inner adapter), so the member effectively *is* the inner chain.
 fn flatten_hops(proxies: &[Arc<dyn Proxy>], metadata: &Metadata) -> Vec<Arc<dyn Proxy>> {
+    flatten_hops_at(proxies, metadata, 0)
+}
+
+/// Recursion bound for [`flatten_hops`] — far beyond any sane config; guards
+/// against a hand-constructed cyclic `RelayGroup` (config resolution already
+/// guarantees the group graph is a DAG).
+const MAX_FLATTEN_DEPTH: usize = 16;
+
+fn flatten_hops_at(
+    proxies: &[Arc<dyn Proxy>],
+    metadata: &Metadata,
+    depth: usize,
+) -> Vec<Arc<dyn Proxy>> {
     let mut out = Vec::with_capacity(proxies.len());
     for proxy in proxies {
         let resolved = resolve_proxy(Arc::clone(proxy), metadata);
-        let inner = resolved
-            .as_any()
-            .and_then(|a| a.downcast_ref::<RelayGroup>());
-        match inner {
-            Some(relay) => out.extend(flatten_hops(&relay.proxies, metadata)),
-            None => out.push(resolved),
+        if depth < MAX_FLATTEN_DEPTH {
+            if let Some(relay) = resolved
+                .as_any()
+                .and_then(|a| a.downcast_ref::<RelayGroup>())
+            {
+                out.extend(flatten_hops_at(&relay.proxies, metadata, depth + 1));
+                continue;
+            }
+            if let Some(dpa) = resolved
+                .as_any()
+                .and_then(|a| a.downcast_ref::<DialerProxyAdapter>())
+            {
+                let inner = resolve_proxy(Arc::clone(dpa.inner()), metadata);
+                if let Some(relay) = inner.as_any().and_then(|a| a.downcast_ref::<RelayGroup>()) {
+                    out.extend(flatten_hops_at(&relay.proxies, metadata, depth + 1));
+                    continue;
+                }
+            }
         }
+        out.push(resolved);
     }
     out
 }
@@ -876,6 +909,48 @@ mod tests {
         assert_eq!(*b_host.lock(), Some("10.0.0.3".into()));
         assert_eq!(*c_visits.lock(), vec![3]);
         assert_eq!(*c_host.lock(), Some("t.example".into()));
+    }
+
+    /// A `dialer-proxy` member whose inner outbound is itself a relay group
+    /// flattens the same way: `outer = [a, dpa[inner=[p,q]]]` runs as
+    /// `[a, p, q]`, so `a` dials the inner chain's entry point (p's server)
+    /// rather than the group's empty `addr()`.  The per-outbound dialer is
+    /// deliberately unresolvable here — inside a relay chain it must never
+    /// be consulted.
+    #[tokio::test]
+    async fn nested_dialer_proxy_relay_member_flattens_inner_chain() {
+        let a = MockProxy::new("a", "10.0.0.1", 1080, 1);
+        let p = MockProxy::new("p", "10.0.0.2", 1081, 2);
+        let q = MockProxy::new("q", "10.0.0.3", 1082, 3);
+        let a_host = Arc::clone(&a.last_dial_host);
+        let p_visits = Arc::clone(&p.visits);
+        let p_host = Arc::clone(&p.last_dial_host);
+        let q_host = Arc::clone(&q.last_dial_host);
+
+        let inner_relay: Arc<dyn Proxy> = Arc::new(RelayGroup::new("inner", vec![p, q]));
+        let dpa: Arc<dyn Proxy> = Arc::new(DialerProxyAdapter::new(
+            inner_relay,
+            crate::dialer::DialerTarget::new(
+                "never-resolved",
+                crate::dialer::ProxyRegistry::default(),
+            ),
+        ));
+        let outer = RelayGroup::new("outer", vec![a, dpa]);
+        let target = Metadata {
+            host: "t.example".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+
+        outer
+            .dial_tcp(&target)
+            .await
+            .expect("dpa-wrapped relay member");
+
+        assert_eq!(*a_host.lock(), Some("10.0.0.2".into()));
+        assert_eq!(*p_visits.lock(), vec![2]);
+        assert_eq!(*p_host.lock(), Some("10.0.0.3".into()));
+        assert_eq!(*q_host.lock(), Some("t.example".into()));
     }
 
     #[tokio::test]

@@ -66,6 +66,12 @@ impl DialerProxyAdapter {
     pub fn dialer_name(&self) -> &str {
         self.dialer.name()
     }
+
+    /// The wrapped outbound. Used by relay flattening to splice an inner
+    /// relay group's members into the outer chain.
+    pub(crate) fn inner(&self) -> &Arc<dyn Proxy> {
+        &self.inner
+    }
 }
 
 #[async_trait]
@@ -141,6 +147,12 @@ impl Proxy for DialerProxyAdapter {
 
     fn delay_history(&self) -> Vec<DelayHistory> {
         self.inner.delay_history()
+    }
+
+    /// Lets relay `flatten_hops` downcast the wrapper and reach an inner
+    /// `RelayGroup`'s members.
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
     }
 
     fn members(&self) -> Option<Vec<String>> {
