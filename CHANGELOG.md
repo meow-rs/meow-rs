@@ -78,7 +78,12 @@ the canonical, in-repo source a release is cut from.
   Nested `relay` groups are now *flattened* into the outer chain at any
   position — the preceding hop dials the inner chain's entry point
   (previously a group member at a non-first position yielded `""`/`0`
-  target metadata for the preceding hop), and hops with an empty
+  target metadata for the preceding hop). A `dialer-proxy` member whose
+  inner outbound is itself a `relay` group is spliced the same way — the
+  enclosing chain already defines the path, so the per-outbound dialer is
+  not applied again — and expansion is capped at depth 16 so a
+  hand-constructed cyclic graph degrades to a hop error rather than
+  unbounded recursion. Hops with an empty
   `addr()` (REJECT, unresolvable groups) are skipped for metadata but
   still run their own `connect_over` so failures stay correctly
   attributed. Boundaries: `hysteria2` stays first-hop-only (QUIC cannot ride a TCP

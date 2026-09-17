@@ -76,7 +76,12 @@ Out of scope:
   a `RelayGroup` appearing at any chain position is flattened into the
   outer chain by `flatten_hops` (`relay.rs`): its resolved members are
   spliced in place so the preceding hop dials the inner chain's entry
-  point and each inner member runs `connect_over` in order.
+  point and each inner member runs `connect_over` in order. A
+  `DialerProxyAdapter` whose inner proxy is a `RelayGroup` is likewise
+  spliced — the enclosing chain already establishes the path, so the
+  per-outbound dialer is not applied again. Expansion is capped at
+  `MAX_FLATTEN_DEPTH` (16) so a hand-constructed cyclic group graph
+  degrades to a hop error instead of unbounded recursion.
 
 ## Non-goals
 
@@ -84,6 +89,13 @@ Out of scope:
   existing `ProxyAdapter` implementations — no new wire format.
 - Exposing partial chain results if an intermediate hop fails.
   The entire chain fails as a unit with the offending hop's error.
+- Mux/session pooling across relay-supplied streams. A relay leg is a
+  single-use stream — there is nothing to pool against, so mux-enabled
+  adapters bypass their session layer at non-first hops. For a *fixed*
+  chain that must keep mux or anytls session pooling, prefer a
+  `dialer-proxy` front on the last hop (the mux layer pools above the
+  injected dialer, matching mihomo's model); `type: relay` is for ad
+  hoc multi-hop.
 
 ## User-facing config
 
@@ -229,10 +241,15 @@ async fn relay_tcp(
 position is flattened by `flatten_hops` — the outer chain splices the
 inner group's resolved members in place, so the preceding hop dials the
 inner chain's entry point (its first non-DIRECT member's server) and
-each inner member runs `connect_over` normally. Members with an empty
-`addr()` (REJECT, unresolvable groups) are skipped when computing the
-next hop's target but still receive their own `connect_over` call, so
-they fail at their own hop index.
+each inner member runs `connect_over` normally. A `DialerProxyAdapter`
+whose inner proxy resolves to a `RelayGroup` is spliced the same way —
+inside an existing chain the path is already established, so the
+dialer-proxy wrapper contributes only its inner group's members.
+Expansion recurses (a spliced member may itself contain groups) and is
+capped at `MAX_FLATTEN_DEPTH` = 16; members with an empty `addr()`
+(REJECT, unresolvable groups, wrappers past the depth cap) are skipped
+when computing the next hop's target but still receive their own
+`connect_over` call, so they fail at their own hop index.
 
 ### Struct
 
