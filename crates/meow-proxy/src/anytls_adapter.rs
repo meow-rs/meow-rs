@@ -39,6 +39,11 @@ pub struct AnytlsAdapter {
     addr: String,
     health: ProxyHealth,
     client: AnytlsClient,
+    /// The adapter's own TLS layer, `Arc`-shared with the `TlsConnect` hook
+    /// given to the anytls client. `connect_over` runs it directly on the
+    /// relay-supplied stream because `TlsConnect::connect` is typed on
+    /// `TcpStream` while a relay stream is a generic `meow_transport::Stream`.
+    tls_layer: Arc<TlsLayer>,
     udp: bool,
 }
 
@@ -75,12 +80,18 @@ impl AnytlsAdapter {
 
         // Same BoringSSL TlsLayer every other TLS outbound uses; the
         // SSL_CTX is shared across proxies with the same shaping key.
-        let tls_layer = TlsLayer::new(&TlsConfig {
-            skip_cert_verify,
-            ..TlsConfig::new(server_name)
-        })
-        .map_err(|e| format!("anytls[{name}]: tls config: {e}"))?;
-        let tls: Arc<dyn TlsConnect> = Arc::new(MeowTlsConnect { layer: tls_layer });
+        // `Arc`-shared with `MeowTlsConnect` so `connect_over` can run the
+        // identical handshake on a relay-supplied stream.
+        let tls_layer = Arc::new(
+            TlsLayer::new(&TlsConfig {
+                skip_cert_verify,
+                ..TlsConfig::new(server_name)
+            })
+            .map_err(|e| format!("anytls[{name}]: tls config: {e}"))?,
+        );
+        let tls: Arc<dyn TlsConnect> = Arc::new(MeowTlsConnect {
+            layer: Arc::clone(&tls_layer),
+        });
 
         let padding = PaddingFactory::default();
 
@@ -91,6 +102,7 @@ impl AnytlsAdapter {
             addr: server_addr,
             health: ProxyHealth::new(),
             client,
+            tls_layer,
             udp,
         })
     }
@@ -123,6 +135,35 @@ impl ProxyAdapter for AnytlsAdapter {
             .await
             .map_err(|e| MeowError::Proxy(format!("anytls dial: {e}")))?;
         Ok(Box::new(AnytlsConn::new(stream, session)))
+    }
+
+    /// Run TLS + the AnyTLS session handshake over an existing stream
+    /// (relay chain).
+    ///
+    /// The vendored client's `TlsConnect` hook is typed on `TcpStream`, so
+    /// the adapter runs its shared `TlsLayer` itself and hands the
+    /// handshaken stream to `create_proxy_stream_on_tls`. The session that
+    /// comes back is **not** pooled — pooling it would let a later direct
+    /// `dial_tcp` silently reuse the relay channel — so the returned conn
+    /// owns it and closes it on drop.
+    async fn connect_over(
+        &self,
+        stream: Box<dyn ProxyConn>,
+        metadata: &Metadata,
+    ) -> Result<Box<dyn ProxyConn>> {
+        let host = anytls_tcp_destination(metadata)?;
+        let port = metadata.dst_port;
+        let tls_stream = self
+            .tls_layer
+            .connect(Box::new(stream))
+            .await
+            .map_err(|e| MeowError::Proxy(format!("anytls relay tls: {e}")))?;
+        let (stream, session) = self
+            .client
+            .create_proxy_stream_on_tls(tls_stream, (host, port))
+            .await
+            .map_err(|e| MeowError::Proxy(format!("anytls relay dial: {e}")))?;
+        Ok(Box::new(AnytlsConn::new_owned(stream, session)))
     }
 
     /// Open a udp-over-tcp v2 relay stream (issue #75 follow-up).
@@ -183,9 +224,14 @@ type PendingRead = Pin<Box<dyn std::future::Future<Output = io::Result<Vec<u8>>>
 
 struct AnytlsConn {
     stream: Arc<AnytlsStream>,
-    // Keep the owning pooled session alive even if the adapter is dropped
-    // while this connection is still in use.
-    _session: Arc<Session>,
+    // Keep the owning session alive even if the adapter is dropped while
+    // this connection is still in use.
+    session: Arc<Session>,
+    /// `true` when the session was built for this conn alone (relay
+    /// `connect_over`) and is not shared through the client's pool — it is
+    /// closed when the conn drops rather than idling until the heartbeat
+    /// timeout (~60s) reaps it.
+    session_owned: bool,
     pending_read: Mutex<Option<PendingRead>>,
 }
 
@@ -193,7 +239,19 @@ impl AnytlsConn {
     fn new(stream: Arc<AnytlsStream>, session: Arc<Session>) -> Self {
         Self {
             stream,
-            _session: session,
+            session,
+            session_owned: false,
+            pending_read: Mutex::new(None),
+        }
+    }
+
+    /// Construct a conn that owns its session outright (relay `connect_over`
+    /// path — the session is deliberately unpooled).
+    fn new_owned(stream: Arc<AnytlsStream>, session: Arc<Session>) -> Self {
+        Self {
+            stream,
+            session,
+            session_owned: true,
             pending_read: Mutex::new(None),
         }
     }
@@ -277,6 +335,22 @@ impl Drop for AnytlsConn {
         // still FIN the stream so the proxied connection and map entry are
         // released. `fin_stream` is idempotent with `poll_shutdown`.
         self.fin_stream();
+
+        // An owned (unpooled, relay-created) session holds the whole relay
+        // stream — close it now instead of leaving it to the heartbeat
+        // idle timeout. `Session::close` is idempotent, so a session that
+        // already failed is a no-op. Without a runtime handle (conn dropped
+        // from a non-tokio thread) the heartbeat timeout is the fallback.
+        if self.session_owned {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let session = Arc::clone(&self.session);
+                handle.spawn(async move {
+                    if let Err(e) = session.close().await {
+                        tracing::debug!("anytls: owned session close failed: {e}");
+                    }
+                });
+            }
+        }
     }
 }
 
@@ -562,7 +636,7 @@ fn normalize_server_name(value: &str) -> std::result::Result<String, String> {
 /// Bridges `meow_transport::tls::TlsLayer` into anytls-rs's [`TlsConnect`]
 /// hook so the vendored client links no TLS library of its own.
 struct MeowTlsConnect {
-    layer: TlsLayer,
+    layer: Arc<TlsLayer>,
 }
 
 impl TlsConnect for MeowTlsConnect {

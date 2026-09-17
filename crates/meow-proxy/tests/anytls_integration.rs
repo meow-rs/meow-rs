@@ -1018,3 +1018,60 @@ async fn anytls_tcp_gets_immediate_synack_from_singbox_ordered_fake() {
         .expect("tcp write must succeed");
     conn.flush().await.unwrap();
 }
+
+/// Issue #570 — `connect_over` must apply the adapter's TLS layer to the
+/// relay-supplied stream, then run AnyTLS auth + session + proxy-stream on
+/// top. The upstream is plain TCP to the anytls server; the adapter's own
+/// TlsLayer terminates on it, so the server sees a normal TLS client.
+#[tokio::test]
+async fn anytls_connect_over_runs_tls_auth_and_stream() {
+    install_crypto_provider();
+
+    let (echo_addr, _echo_h) = start_echo_server().await;
+    let (cert, key) = self_signed_cert();
+    let (server_addr, _server_h) = start_anytls_server(cert, key).await;
+
+    let adapter = AnytlsAdapter::new(
+        "test-anytls-connect-over",
+        &server_addr.ip().to_string(),
+        server_addr.port(),
+        PASSWORD,
+        Some("localhost"),
+        true,
+        false,
+    )
+    .expect("adapter must build");
+
+    // Relay hop-0 leg: plain TCP already connected to the anytls server.
+    let upstream = tokio::net::TcpStream::connect(server_addr)
+        .await
+        .expect("upstream connect");
+    let metadata = Metadata {
+        network: Network::Tcp,
+        host: smol_str::SmolStr::from(echo_addr.ip().to_string()),
+        dst_port: echo_addr.port(),
+        ..Default::default()
+    };
+
+    let mut conn = timeout(T, adapter.connect_over(Box::new(upstream), &metadata))
+        .await
+        .expect("connect_over must not stall")
+        .expect("connect_over must succeed end-to-end");
+
+    let payload = b"anytls over relay-supplied stream";
+    timeout(T, conn.write_all(payload))
+        .await
+        .expect("write must not stall")
+        .expect("write must succeed");
+    timeout(T, conn.flush())
+        .await
+        .expect("flush must not stall")
+        .expect("flush must succeed");
+
+    let mut buf = vec![0u8; payload.len()];
+    timeout(T, conn.read_exact(&mut buf))
+        .await
+        .expect("echo must not stall")
+        .expect("echo must succeed");
+    assert_eq!(&buf[..], payload, "echo payload must match what we wrote");
+}

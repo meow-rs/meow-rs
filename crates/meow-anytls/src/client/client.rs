@@ -103,6 +103,18 @@ impl Client {
         let session = self.create_stream().await?;
         tracing::debug!("[Client] Got session for proxy stream");
 
+        let stream = Self::open_proxy_stream(&session, destination, payload).await?;
+        Ok((stream, session))
+    }
+
+    /// Open a proxy stream on an already-established session: open the
+    /// stream, write the SOCKS5-form destination, flush the optional eager
+    /// payload, and wait for SYNACK.
+    async fn open_proxy_stream(
+        session: &Arc<Session>,
+        destination: (String, u16),
+        payload: Option<Bytes>,
+    ) -> Result<Arc<crate::session::Stream>> {
         // Open a new stream in the session
         let (stream, synack_rx) = session.open_stream().await?;
         let mut guard = crate::session::stream::OpeningStreamGuard::new(Arc::clone(&stream));
@@ -202,7 +214,7 @@ impl Client {
                     "[Client] SYNACK received for stream {} - stream ready",
                     stream_id
                 );
-                Ok((stream, session))
+                Ok(stream)
             }
             Ok(Ok(Err(e))) => {
                 tracing::error!("[Client] SYNACK error for stream {}: {}", stream_id, e);
@@ -319,6 +331,25 @@ impl Client {
         })?;
         tracing::debug!("[Client] TLS handshake successful");
 
+        let session = self.session_over_transport(tls_stream).await?;
+
+        // Store in pool
+        self.session_pool.add_idle_session(session.clone()).await;
+        tracing::debug!("[Client] Session added to pool");
+
+        Ok(session)
+    }
+
+    /// Build and start a client session on an already-handshaken TLS
+    /// stream: split it, send authentication, create and start the session.
+    ///
+    /// Does **not** touch the session pool — callers decide whether the
+    /// session is poolable (`create_new_session`) or single-purpose
+    /// ([`create_proxy_stream_on_tls`]).
+    async fn session_over_transport<S>(&self, tls_stream: S) -> Result<Arc<Session>>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
+    {
         // Send authentication
         // Split TLS stream into reader and writer
         let (reader, mut writer) = tokio::io::split(tls_stream);
@@ -359,11 +390,33 @@ impl Client {
         session.clone().start_client().await?;
         tracing::debug!("[Client] Client session started successfully");
 
-        // Store in pool
-        self.session_pool.add_idle_session(session.clone()).await;
-        tracing::debug!("[Client] Session added to pool");
-
         Ok(session)
+    }
+
+    /// Open a proxy stream on a caller-supplied, already-handshaken TLS
+    /// stream to this server.
+    ///
+    /// Used by relay chaining (`ProxyAdapter::connect_over`): the preceding
+    /// hop's stream already terminates at this server and carries whatever
+    /// outer transport the chain established, so only the AnyTLS
+    /// authentication + session setup run here.
+    ///
+    /// The created session is deliberately **not** added to the shared pool:
+    /// it is bound to the passed stream's lifetime, and pooling it would let
+    /// a later direct `dial_tcp` silently reuse the relay channel. The
+    /// caller owns the returned `Arc<Session>` and should close it when the
+    /// stream is dropped.
+    pub async fn create_proxy_stream_on_tls<S>(
+        &self,
+        tls_stream: S,
+        destination: (String, u16),
+    ) -> Result<(Arc<crate::session::Stream>, Arc<Session>)>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
+    {
+        let session = self.session_over_transport(tls_stream).await?;
+        let stream = Self::open_proxy_stream(&session, destination, None).await?;
+        Ok((stream, session))
     }
 
     /// Stop the background cleanup task in the session pool (primarily for tests)
