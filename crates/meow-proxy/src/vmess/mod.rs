@@ -350,9 +350,13 @@ mod tests {
         // frame length from its sealed length block, then read the rest —
         // the header must be consumed exactly, with nothing trailing.
         let mut prefix = [0u8; 42];
-        tokio::io::AsyncReadExt::read_exact(&mut server, &mut prefix)
-            .await
-            .expect("sealed header prefix");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::io::AsyncReadExt::read_exact(&mut server, &mut prefix),
+        )
+        .await
+        .expect("sealed header prefix must arrive")
+        .expect("sealed header prefix");
         let frame_len = header::tests::request_header_frame_len(&adapter.cmd_key, &prefix)
             .expect("sealed length block must open");
         let mut frame = prefix.to_vec();
@@ -457,15 +461,21 @@ mod tests {
         });
 
         // Client side: two plaintext ping-pongs through the record layer.
-        for payload in [b"ping-one".as_slice(), b"ping-two-longer".as_slice()] {
-            conn.write_all(payload).await.expect("write failed");
-            conn.flush().await.expect("flush failed");
-            let mut buf = vec![0u8; payload.len()];
-            tokio::io::AsyncReadExt::read_exact(&mut conn, &mut buf)
-                .await
-                .expect("echo read failed");
-            assert_eq!(&buf, payload, "duplex echo mismatch");
-        }
+        // Bounded: a regression that drops the request header or corrupts
+        // framing must fail fast, not park the test.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            for payload in [b"ping-one".as_slice(), b"ping-two-longer".as_slice()] {
+                conn.write_all(payload).await.expect("write failed");
+                conn.flush().await.expect("flush failed");
+                let mut buf = vec![0u8; payload.len()];
+                tokio::io::AsyncReadExt::read_exact(&mut conn, &mut buf)
+                    .await
+                    .expect("echo read failed");
+                assert_eq!(&buf, payload, "duplex echo mismatch");
+            }
+        })
+        .await
+        .expect("duplex echo timed out");
 
         drop(conn);
         tokio::time::timeout(std::time::Duration::from_secs(5), server_task)

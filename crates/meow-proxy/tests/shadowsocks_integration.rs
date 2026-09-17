@@ -640,10 +640,12 @@ async fn test_ss_connect_over_runs_ss_handshake() {
     let ss_port = free_port().await;
     let _ssserver = start_ssserver(ss_port).await;
 
+    // Port 1 is dead: a `connect_over` that ignored the supplied stream and
+    // re-dialed its own server would fail — only `upstream` reaches ssserver.
     let adapter = ShadowsocksAdapter::new(
         "test-ss-connect-over",
         "127.0.0.1",
-        ss_port,
+        1,
         SS_PASSWORD,
         SS_CIPHER,
         false,
@@ -741,10 +743,11 @@ async fn test_ss_connect_over_builtin_obfs_http() {
     let ss_port = free_port().await;
     let _ssserver = start_ssserver_with_plugin(ss_port, "obfs-server", "obfs=http").await;
 
+    // Dead port 1 — only the supplied stream can reach ssserver.
     let adapter = ShadowsocksAdapter::new(
         "test-ss-co-builtin-obfs",
         "127.0.0.1",
-        ss_port,
+        1,
         SS_PASSWORD,
         SS_CIPHER,
         false,
@@ -795,10 +798,11 @@ async fn test_ss_connect_over_builtin_obfs_tls() {
     let ss_port = free_port().await;
     let _ssserver = start_ssserver_with_plugin(ss_port, "obfs-server", "obfs=tls").await;
 
+    // Dead port 1 — only the supplied stream can reach ssserver.
     let adapter = ShadowsocksAdapter::new(
         "test-ss-co-builtin-obfs-tls",
         "127.0.0.1",
-        ss_port,
+        1,
         SS_PASSWORD,
         SS_CIPHER,
         false,

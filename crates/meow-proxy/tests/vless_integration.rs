@@ -720,12 +720,12 @@ mod connect_over_tests {
         }
     }
 
-    fn vless_adapter(server_port: u16) -> VlessAdapter {
+    fn vless_adapter(server_port: u16, uuid: [u8; 16]) -> VlessAdapter {
         VlessAdapter::new(
             "test-vless-connect-over",
             "127.0.0.1",
             server_port,
-            TEST_UUID,
+            uuid,
             None,
             false,
             TransportChain::empty(),
@@ -750,7 +750,10 @@ mod connect_over_tests {
     async fn vless_connect_over_runs_vless_handshake() {
         let (echo_addr, _echo) = start_tcp_echo_server().await;
         let (vless_addr, _vless) = start_mock_vless_server(TEST_UUID).await;
-        let adapter = vless_adapter(vless_addr.port());
+        // Port 1 is dead: a `connect_over` that ignored the supplied stream
+        // and re-dialed its own server would fail — the ONLY path to the
+        // mock is through `upstream`.
+        let adapter = vless_adapter(1, TEST_UUID);
 
         // The relay chain's hop-0 leg: a plain TCP stream already connected
         // to the VLESS server.
@@ -768,12 +771,16 @@ mod connect_over_tests {
         .expect("connect_over timed out")
         .expect("connect_over failed");
 
-        let payload = b"vless over relay-supplied stream";
-        conn.write_all(payload).await.expect("write failed");
-        conn.flush().await.expect("flush failed");
-        let mut buf = vec![0u8; payload.len()];
-        conn.read_exact(&mut buf).await.expect("read_exact failed");
-        assert_eq!(&buf, payload, "echo mismatch through connect_over");
+        timeout(TIMEOUT, async {
+            let payload = b"vless over relay-supplied stream";
+            conn.write_all(payload).await.expect("write failed");
+            conn.flush().await.expect("flush failed");
+            let mut buf = vec![0u8; payload.len()];
+            conn.read_exact(&mut buf).await.expect("read_exact failed");
+            assert_eq!(&buf, payload, "echo mismatch through connect_over");
+        })
+        .await
+        .expect("connect_over echo timed out");
     }
 
     /// `connect_over` must apply the adapter's configured transport chain —
@@ -789,6 +796,7 @@ mod connect_over_tests {
 
         // Mock VLESS server behind TLS: accept → rustls handshake →
         // VLESS header → relay to echo.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let ck = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let tls_config = rustls::ServerConfig::builder()
             .with_no_client_auth()
@@ -837,10 +845,11 @@ mod connect_over_tests {
         tls_cfg.skip_cert_verify = true;
         let mut chain = TransportChain::empty();
         chain.push(Box::new(TlsLayer::new(&tls_cfg).expect("tls layer")));
+        // Dead port 1: only the supplied stream can reach the mock.
         let adapter = VlessAdapter::new(
             "test-vless-tls-connect-over",
             "127.0.0.1",
-            vless_tls_addr.port(),
+            1,
             TEST_UUID,
             None,
             false,
@@ -861,12 +870,16 @@ mod connect_over_tests {
         .expect("connect_over timed out")
         .expect("connect_over must run TLS over the supplied stream");
 
-        let payload = b"vless+tls over relay-supplied stream";
-        conn.write_all(payload).await.expect("write failed");
-        conn.flush().await.expect("flush failed");
-        let mut buf = vec![0u8; payload.len()];
-        conn.read_exact(&mut buf).await.expect("read_exact failed");
-        assert_eq!(&buf, payload, "echo mismatch through TLS connect_over");
+        timeout(TIMEOUT, async {
+            let payload = b"vless+tls over relay-supplied stream";
+            conn.write_all(payload).await.expect("write failed");
+            conn.flush().await.expect("flush failed");
+            let mut buf = vec![0u8; payload.len()];
+            conn.read_exact(&mut buf).await.expect("read_exact failed");
+            assert_eq!(&buf, payload, "echo mismatch through TLS connect_over");
+        })
+        .await
+        .expect("TLS connect_over echo timed out");
     }
 
     /// Real three-hop chain `[vless₁ → direct → vless₂]`: hop 0 is itself a
@@ -876,16 +889,21 @@ mod connect_over_tests {
     /// VLESS request must target vless₂'s server, not `direct`'s "".
     #[tokio::test]
     async fn relay_group_vless_direct_vless_roundtrip() {
+        // vless₂ uses a distinct UUID: if hop 0 misroutes its VLESS request
+        // to a wrong-but-VLESS-speaking server (e.g. vless₁'s own listener),
+        // the UUID mismatch closes the connection instead of silently
+        // passing through an unintended path.
+        const UUID2: [u8; 16] = [0xa5; 16];
         let (echo_addr, _echo) = start_tcp_echo_server().await;
         let (vless1_addr, _v1) = start_mock_vless_server(TEST_UUID).await;
-        let (vless2_addr, _v2) = start_mock_vless_server(TEST_UUID).await;
+        let (vless2_addr, _v2) = start_mock_vless_server(UUID2).await;
 
         let relay = RelayGroup::new(
             "test-relay-3hop",
             vec![
-                Arc::new(LeafProxy(vless_adapter(vless1_addr.port()))) as Arc<dyn Proxy>,
+                Arc::new(LeafProxy(vless_adapter(vless1_addr.port(), TEST_UUID))) as Arc<dyn Proxy>,
                 Arc::new(LeafProxy(DirectAdapter::new())) as Arc<dyn Proxy>,
-                Arc::new(LeafProxy(vless_adapter(vless2_addr.port()))) as Arc<dyn Proxy>,
+                Arc::new(LeafProxy(vless_adapter(vless2_addr.port(), UUID2))) as Arc<dyn Proxy>,
             ],
         );
 
@@ -894,12 +912,16 @@ mod connect_over_tests {
             .expect("relay dial_tcp timed out")
             .expect("relay dial_tcp failed");
 
-        let payload = b"vless-direct-vless three-hop roundtrip";
-        conn.write_all(payload).await.expect("write failed");
-        conn.flush().await.expect("flush failed");
-        let mut buf = vec![0u8; payload.len()];
-        conn.read_exact(&mut buf).await.expect("read_exact failed");
-        assert_eq!(&buf, payload, "three-hop relay echo mismatch");
+        timeout(TIMEOUT, async {
+            let payload = b"vless-direct-vless three-hop roundtrip";
+            conn.write_all(payload).await.expect("write failed");
+            conn.flush().await.expect("flush failed");
+            let mut buf = vec![0u8; payload.len()];
+            conn.read_exact(&mut buf).await.expect("read_exact failed");
+            assert_eq!(&buf, payload, "three-hop relay echo mismatch");
+        })
+        .await
+        .expect("three-hop echo timed out");
     }
 
     /// Full `RelayGroup [direct → vless]` end-to-end: hop 0 `dial_tcp`s to
@@ -914,7 +936,7 @@ mod connect_over_tests {
             "test-relay",
             vec![
                 Arc::new(LeafProxy(DirectAdapter::new())) as Arc<dyn Proxy>,
-                Arc::new(LeafProxy(vless_adapter(vless_addr.port()))) as Arc<dyn Proxy>,
+                Arc::new(LeafProxy(vless_adapter(vless_addr.port(), TEST_UUID))) as Arc<dyn Proxy>,
             ],
         );
 

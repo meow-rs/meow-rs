@@ -81,9 +81,10 @@ the canonical, in-repo source a release is cut from.
   target metadata for the preceding hop). A `dialer-proxy` member whose
   inner outbound is itself a `relay` group is spliced the same way — the
   enclosing chain already defines the path, so the per-outbound dialer is
-  not applied again — and expansion is capped at depth 16 so a
-  hand-constructed cyclic graph degrades to a hop error rather than
-  unbounded recursion. Hops with an empty
+  not applied again. Expansion deeper than 16 fails the dial outright
+  rather than retaining an unexpanded group mid-chain (config resolution
+  already guarantees the group graph is acyclic; the bound stops
+  pathological hand-built graphs). Hops with an empty
   `addr()` (REJECT, unresolvable groups) are skipped for metadata but
   still run their own `connect_over` so failures stay correctly
   attributed. Boundaries: `hysteria2` stays first-hop-only (QUIC cannot ride a TCP

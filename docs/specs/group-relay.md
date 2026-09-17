@@ -80,8 +80,8 @@ Out of scope:
   `DialerProxyAdapter` whose inner proxy is a `RelayGroup` is likewise
   spliced — the enclosing chain already establishes the path, so the
   per-outbound dialer is not applied again. Expansion is capped at
-  `MAX_FLATTEN_DEPTH` (16) so a hand-constructed cyclic group graph
-  degrades to a hop error instead of unbounded recursion.
+  `MAX_FLATTEN_DEPTH` (16) — deeper nesting fails the dial outright
+  rather than retaining an unexpanded group mid-chain.
 
 ## Non-goals
 
@@ -92,10 +92,14 @@ Out of scope:
 - Mux/session pooling across relay-supplied streams. A relay leg is a
   single-use stream — there is nothing to pool against, so mux-enabled
   adapters bypass their session layer at non-first hops. For a *fixed*
-  chain that must keep mux or anytls session pooling, prefer a
-  `dialer-proxy` front on the last hop (the mux layer pools above the
-  injected dialer, matching mihomo's model); `type: relay` is for ad
-  hoc multi-hop.
+  chain that must keep mux pooling, prefer a `dialer-proxy` front on the
+  last hop — for adapters that accept an injected `TcpDialer`
+  (vless/vmess/trojan/ss) the mux layer pools sessions above the
+  injected dialer, matching mihomo's model. This does not extend to
+  `anytls` or `hysteria2`: they cannot carry an injected dialer, so
+  `dialer-proxy` falls back to the same relay wrapper — anytls sessions
+  stay unpooled per connection and hysteria2 fails loudly at dial time.
+  `type: relay` is for ad hoc multi-hop.
 
 ## User-facing config
 
@@ -215,16 +219,19 @@ async fn relay_tcp(
     proxies: &[Arc<dyn Proxy>],
     final_target: &Metadata,
 ) -> Result<Box<dyn ProxyConn>> {
-    debug_assert!(proxies.len() >= 2, "relay chain validated at parse time");
+    // Splice nested RelayGroup / dialer-proxy-wrapped relay members in
+    // place; resolve group members once; hard-error past depth 16.
+    let proxies = flatten_hops(proxies, final_target)?;
 
-    // proxy[0]: real TCP connect, target = proxy[1]'s server:port
-    let mut meta = metadata_for_proxy(&proxies[1]);
-    let mut conn: Box<dyn ProxyConn> = proxies[0].dial_tcp(&meta).await
-        .map_err(|e| MeowError::relay_hop_failed(0, e))?;
+    // proxy[0]: real TCP connect, target = the next non-DIRECT,
+    // non-empty-addr member's server:port (or final_target if none).
+    let mut conn: Box<dyn ProxyConn> =
+        proxies[0].dial_tcp(&metadata_for_next_hop(&proxies, 1, final_target)).await
+            .map_err(|e| MeowError::relay_hop_failed(0, e))?;
 
     // proxy[1..N-2]: connect_over the previous hop's established stream
     for i in 1..proxies.len() - 1 {
-        meta = metadata_for_proxy(&proxies[i + 1]);
+        let meta = metadata_for_next_hop(&proxies, i + 1, final_target);
         conn = proxies[i].connect_over(conn, &meta).await
             .map_err(|e| MeowError::relay_hop_failed(i, e))?;
     }
@@ -242,14 +249,15 @@ position is flattened by `flatten_hops` — the outer chain splices the
 inner group's resolved members in place, so the preceding hop dials the
 inner chain's entry point (its first non-DIRECT member's server) and
 each inner member runs `connect_over` normally. A `DialerProxyAdapter`
-whose inner proxy resolves to a `RelayGroup` is spliced the same way —
-inside an existing chain the path is already established, so the
-dialer-proxy wrapper contributes only its inner group's members.
-Expansion recurses (a spliced member may itself contain groups) and is
-capped at `MAX_FLATTEN_DEPTH` = 16; members with an empty `addr()`
-(REJECT, unresolvable groups, wrappers past the depth cap) are skipped
-when computing the next hop's target but still receive their own
-`connect_over` call, so they fail at their own hop index.
+whose inner proxy resolves to a `RelayGroup` is spliced the same way at
+any non-first position — inside an existing chain the path is already
+established, so the dialer-proxy wrapper contributes only its inner
+group's members (at hop 0 the wrapper is kept so its own `dial_tcp`
+still fires the configured front dialer). Expansion recurses and fails
+hard past `MAX_FLATTEN_DEPTH` = 16. Members with an empty `addr()`
+(REJECT, unresolvable groups) are skipped when computing the next hop's
+target but still receive their own `connect_over` call — REJECT and
+unresolvable groups fail at their own hop index.
 
 ### Struct
 
@@ -291,7 +299,8 @@ Intermediate hop failures surface wrapped in `MeowError::RelayHopFailed`:
 MeowError::RelayHopFailed { hop: usize, source: Box<MeowError> }
 ```
 
-Error message shape: `"relay chain failed at hop 1 (proxy-b → proxy-c): <inner error>"`.
+Error message shape: `"relay chain failed at hop {hop}: {source}"`
+(`RelayHopFailed`'s `Display`; hop is the flattened chain index).
 
 Add `RelayHopFailed` to `MeowError` in `meow-common`. Do NOT use
 `anyhow::Context::context()` at the public boundary — `MeowError`

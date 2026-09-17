@@ -111,45 +111,67 @@ fn resolve_proxy(mut proxy: Arc<dyn Proxy>, metadata: &Metadata) -> Arc<dyn Prox
 /// flattened the same way — inside a chain the per-outbound dialer is
 /// ignored by design (`DialerProxyAdapter::connect_over` delegates to the
 /// inner adapter), so the member effectively *is* the inner chain.
-fn flatten_hops(proxies: &[Arc<dyn Proxy>], metadata: &Metadata) -> Vec<Arc<dyn Proxy>> {
+fn flatten_hops(proxies: &[Arc<dyn Proxy>], metadata: &Metadata) -> Result<Vec<Arc<dyn Proxy>>> {
     flatten_hops_at(proxies, metadata, 0)
 }
 
-/// Recursion bound for [`flatten_hops`] — far beyond any sane config; guards
-/// against a hand-constructed cyclic `RelayGroup` (config resolution already
-/// guarantees the group graph is a DAG).
+/// Recursion bound for [`flatten_hops`]: expansion past this depth is a hard
+/// error — far beyond any sane config (config resolution already guarantees
+/// the group graph is a DAG; the bound stops pathological hand-built graphs).
 const MAX_FLATTEN_DEPTH: usize = 16;
 
 fn flatten_hops_at(
     proxies: &[Arc<dyn Proxy>],
     metadata: &Metadata,
     depth: usize,
-) -> Vec<Arc<dyn Proxy>> {
+) -> Result<Vec<Arc<dyn Proxy>>> {
     let mut out = Vec::with_capacity(proxies.len());
     for proxy in proxies {
         let resolved = resolve_proxy(Arc::clone(proxy), metadata);
-        if depth < MAX_FLATTEN_DEPTH {
-            if let Some(relay) = resolved
-                .as_any()
-                .and_then(|a| a.downcast_ref::<RelayGroup>())
-            {
-                out.extend(flatten_hops_at(&relay.proxies, metadata, depth + 1));
-                continue;
+        if let Some(relay) = resolved
+            .as_any()
+            .and_then(|a| a.downcast_ref::<RelayGroup>())
+        {
+            if depth >= MAX_FLATTEN_DEPTH {
+                return Err(MeowError::Proxy(format!(
+                    "relay: group expansion exceeds depth {MAX_FLATTEN_DEPTH}"
+                )));
             }
-            if let Some(dpa) = resolved
+            out.extend(flatten_hops_at(&relay.proxies, metadata, depth + 1)?);
+            continue;
+        }
+        // Peel `DialerProxyAdapter` layers to reach an inner `RelayGroup`
+        // (DPA(DPA(relay)) …).  Each `resolve_proxy` call re-enters the
+        // unwrap chain because a DPA delegates `unwrap_proxy` to its inner;
+        // a peel that lands on a leaf keeps the ORIGINAL member below.  Not
+        // reachable from parsed configs — the dialer-proxy pass always wraps
+        // a leaf — but keeps hand-built graphs consistent.
+        //
+        // Guard: at the very first hop the DPA's own `dial_tcp` must run so
+        // its configured front dialer still fires, so only peel when the
+        // member lands at a non-first flattened position.
+        if !(depth == 0 && out.is_empty()) {
+            let mut peeled = Arc::clone(&resolved);
+            while let Some(inner) = peeled
                 .as_any()
                 .and_then(|a| a.downcast_ref::<DialerProxyAdapter>())
+                .map(|dpa| Arc::clone(dpa.inner()))
             {
-                let inner = resolve_proxy(Arc::clone(dpa.inner()), metadata);
-                if let Some(relay) = inner.as_any().and_then(|a| a.downcast_ref::<RelayGroup>()) {
-                    out.extend(flatten_hops_at(&relay.proxies, metadata, depth + 1));
-                    continue;
+                peeled = resolve_proxy(inner, metadata);
+            }
+            if let Some(relay) = peeled.as_any().and_then(|a| a.downcast_ref::<RelayGroup>()) {
+                if depth >= MAX_FLATTEN_DEPTH {
+                    return Err(MeowError::Proxy(format!(
+                        "relay: group expansion exceeds depth {MAX_FLATTEN_DEPTH}"
+                    )));
                 }
+                out.extend(flatten_hops_at(&relay.proxies, metadata, depth + 1)?);
+                continue;
             }
         }
         out.push(resolved);
     }
-    out
+    Ok(out)
 }
 
 /// Return the target for a hop, skipping later DIRECT hops because they are
@@ -185,7 +207,7 @@ pub(crate) async fn relay_tcp(
         "relay chain must have at least 2 proxies"
     );
 
-    let proxies = flatten_hops(proxies, final_target);
+    let proxies = flatten_hops(proxies, final_target)?;
     if proxies.len() < 2 {
         return Err(MeowError::Proxy(format!(
             "relay: chain resolved to fewer than 2 hops ({})",
@@ -338,48 +360,11 @@ impl ProxyAdapter for RelayGroup {
         relay_udp(&self.proxies, metadata).await
     }
 
-    /// Run the relay chain over an already-established stream.
-    ///
-    /// Used when this `RelayGroup` itself appears as a hop inside another
-    /// relay chain (relay-of-relay).  All hops use `connect_over` — there is
-    /// no fresh `dial_tcp` because the outer stream already exists.
-    async fn connect_over(
-        &self,
-        stream: Box<dyn ProxyConn>,
-        final_target: &Metadata,
-    ) -> Result<Box<dyn ProxyConn>> {
-        // Resolve groups to their selected leaf once, exactly like
-        // `relay_tcp` — a stateful selector must serve the same member to
-        // both the preceding hop's target metadata and its own connect_over.
-        let proxies = flatten_hops(&self.proxies, final_target);
-        if proxies.len() < 2 {
-            return Err(MeowError::Proxy(format!(
-                "relay: chain resolved to fewer than 2 hops ({})",
-                proxies.len()
-            )));
-        }
-        let mut conn = stream;
-
-        // All hops use connect_over (stream already established by outer relay).
-        for (i, proxy) in proxies.iter().enumerate() {
-            let meta = metadata_for_next_hop(&proxies, i + 1, final_target);
-            debug!(
-                relay.hop = i,
-                relay.proxy = proxy.name(),
-                relay.target = %meta.remote_address(),
-                "relay: connect_over nested hop {i}"
-            );
-            conn =
-                proxy
-                    .connect_over(conn, &meta)
-                    .await
-                    .map_err(|e| MeowError::RelayHopFailed {
-                        hop: i,
-                        source: Box::new(e),
-                    })?;
-        }
-        Ok(conn)
-    }
+    // No `connect_over` override: after `flatten_hops` no `RelayGroup` can
+    // legitimately appear at a non-first hop (nested relays are spliced in
+    // place and over-depth expansion is a hard error), so the trait's
+    // default `NotSupported` is the correct failure for any group that
+    // still reaches this point — loud, and attributed to its own hop index.
 
     fn health(&self) -> &ProxyHealth {
         &self.health
@@ -951,6 +936,115 @@ mod tests {
         assert_eq!(*p_visits.lock(), vec![2]);
         assert_eq!(*p_host.lock(), Some("10.0.0.3".into()));
         assert_eq!(*q_host.lock(), Some("t.example".into()));
+    }
+
+    /// `DPA(DPA(relay))` must peel both wrapper layers — a single-level peel
+    /// would retain the outer DPA (empty `addr()`), silently misrouting the
+    /// preceding hop's dial to the *next* member's server.
+    #[tokio::test]
+    async fn nested_dialer_proxy_layers_all_peel_to_inner_relay() {
+        let a = MockProxy::new("a", "10.0.0.1", 1080, 1);
+        let p = MockProxy::new("p", "10.0.0.2", 1081, 2);
+        let q = MockProxy::new("q", "10.0.0.3", 1082, 3);
+        let a_host = Arc::clone(&a.last_dial_host);
+        let p_visits = Arc::clone(&p.visits);
+        let q_host = Arc::clone(&q.last_dial_host);
+
+        let dead = || {
+            crate::dialer::DialerTarget::new(
+                "never-resolved",
+                crate::dialer::ProxyRegistry::default(),
+            )
+        };
+        let relay: Arc<dyn Proxy> = Arc::new(RelayGroup::new("inner", vec![p, q]));
+        let dpa_inner: Arc<dyn Proxy> = Arc::new(DialerProxyAdapter::new(relay, dead()));
+        let dpa_outer: Arc<dyn Proxy> = Arc::new(DialerProxyAdapter::new(dpa_inner, dead()));
+        let outer = RelayGroup::new("outer", vec![a, dpa_outer]);
+        let target = Metadata {
+            host: "t.example".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+
+        outer
+            .dial_tcp(&target)
+            .await
+            .expect("doubly-wrapped relay member");
+
+        assert_eq!(*a_host.lock(), Some("10.0.0.2".into()));
+        assert_eq!(*p_visits.lock(), vec![2]);
+        assert_eq!(*q_host.lock(), Some("t.example".into()));
+    }
+
+    /// A `dialer-proxy` member at hop 0 must NOT be peeled — its `dial_tcp`
+    /// preserves the configured front dialer. With an unresolvable dialer
+    /// the dial must fail loudly, not silently splice the inner chain.
+    #[tokio::test]
+    async fn dialer_proxy_at_hop0_keeps_its_front_dialer() {
+        let p = MockProxy::new("p", "10.0.0.2", 1081, 2);
+        let q = MockProxy::new("q", "10.0.0.3", 1082, 3);
+        let x = MockProxy::new("x", "10.0.0.4", 1083, 4);
+        let p_visits = Arc::clone(&p.visits);
+
+        let relay: Arc<dyn Proxy> = Arc::new(RelayGroup::new("inner", vec![p, q]));
+        let dpa: Arc<dyn Proxy> = Arc::new(DialerProxyAdapter::new(
+            relay,
+            crate::dialer::DialerTarget::new(
+                "never-resolved",
+                crate::dialer::ProxyRegistry::default(),
+            ),
+        ));
+        let outer = RelayGroup::new("outer", vec![dpa, x]);
+        let target = Metadata {
+            host: "t.example".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+
+        let err = outer
+            .dial_tcp(&target)
+            .await
+            .err()
+            .expect("hop-0 DPA must run its own dial_tcp and fail on the unresolvable dialer");
+        assert!(
+            err.to_string().contains("never-resolved") || err.to_string().contains("dialer"),
+            "error must name the missing dialer, got: {err}"
+        );
+        // Peeling would have spliced the inner chain and run `p` — visits
+        // must stay empty to prove no splice happened.
+        assert!(p_visits.lock().is_empty(), "hop-0 DPA must not be peeled");
+    }
+
+    /// Expansion deeper than `MAX_FLATTEN_DEPTH` is a hard error — a
+    /// hand-constructed cyclic or absurdly deep group graph must fail the
+    /// dial outright, not silently retain an unexpanded relay mid-chain
+    /// (which would misroute the preceding hop to the next member's server).
+    #[tokio::test]
+    async fn flatten_beyond_max_depth_is_a_hard_error() {
+        fn leaf(name: &str) -> Arc<dyn Proxy> {
+            MockProxy::new(name, "10.0.0.9", 1090, 9)
+        }
+        // 20-deep nesting exceeds MAX_FLATTEN_DEPTH (16).
+        let mut inner: Arc<dyn Proxy> = leaf("leaf0");
+        for i in 0..20 {
+            inner = Arc::new(RelayGroup::new("r", vec![inner, leaf(&format!("leaf{i}"))]));
+        }
+        let outer = RelayGroup::new("outer", vec![leaf("a"), inner]);
+        let target = Metadata {
+            host: "t.example".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+
+        let err = outer
+            .dial_tcp(&target)
+            .await
+            .err()
+            .expect("over-depth expansion must fail");
+        assert!(
+            err.to_string().contains("depth"),
+            "error must name the depth bound, got: {err}"
+        );
     }
 
     #[tokio::test]
