@@ -584,3 +584,48 @@ async fn test_trojan_udp_disabled_returns_not_supported() {
         Err(other) => panic!("expected NotSupported, got {other:?}"),
     }
 }
+
+/// Issue #570 — `connect_over` must run the adapter's own TLS layer plus the
+/// Trojan password/CONNECT header on the caller-supplied stream. The mock
+/// terminates TLS (`acceptor.accept`), so a plaintext Trojan header would
+/// fail the handshake outright.
+#[tokio::test]
+async fn test_trojan_connect_over_runs_tls_and_handshake() {
+    install_crypto_provider();
+
+    let (cert_der, key_der) = generate_self_signed_cert();
+    let (echo_addr, _echo_handle) = start_tcp_echo_server().await;
+    let (trojan_addr, _trojan_handle) = start_mock_trojan_server(cert_der, key_der).await;
+
+    let adapter = TrojanAdapter::new(
+        "test-trojan-relay",
+        "127.0.0.1",
+        trojan_addr.port(),
+        TROJAN_PASSWORD,
+        "localhost",
+        true,
+        false,
+        std::sync::Arc::new(meow_proxy::dialer::DirectDialer),
+    );
+
+    // Relay hop-0 leg: plain TCP already connected to the Trojan server.
+    let upstream = TcpStream::connect(trojan_addr).await.unwrap();
+    let metadata = Metadata {
+        network: Network::Tcp,
+        dst_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        dst_port: echo_addr.port(),
+        ..Default::default()
+    };
+
+    let mut conn = timeout(TIMEOUT, adapter.connect_over(Box::new(upstream), &metadata))
+        .await
+        .expect("connect_over timed out")
+        .expect("connect_over failed");
+
+    let payload = b"trojan over relay-supplied stream";
+    conn.write_all(payload).await.expect("write failed");
+    conn.flush().await.expect("flush failed");
+    let mut buf = vec![0u8; payload.len()];
+    conn.read_exact(&mut buf).await.expect("read_exact failed");
+    assert_eq!(&buf, payload, "echo mismatch through connect_over");
+}

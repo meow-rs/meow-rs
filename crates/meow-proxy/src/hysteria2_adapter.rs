@@ -477,4 +477,22 @@ mod tests {
         };
         assert_eq!(target_from_metadata(&md).unwrap(), "[::1]:443");
     }
+
+    /// QUIC/UDP cannot ride a TCP stream, so hysteria2 is first-hop-only:
+    /// the trait-default `connect_over` must keep returning NotSupported.
+    #[tokio::test]
+    async fn connect_over_is_not_supported() {
+        let adapter = Hy2Adapter::new(base_options()).unwrap();
+        // The error surfaces before any stream IO — a dead listener suffices.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let metadata = Metadata::default();
+        match adapter.connect_over(Box::new(upstream), &metadata).await {
+            Err(MeowError::NotSupported(_)) => {}
+            Err(other) => panic!("expected NotSupported, got {other:?}"),
+            Ok(_) => panic!("hysteria2 must not support connect_over"),
+        }
+    }
 }

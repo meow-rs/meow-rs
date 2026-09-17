@@ -119,15 +119,25 @@ impl Socks5Adapter {
             .dial(&self.server, self.port)
             .await
             .map_err(MeowError::Io)?;
+        self.wrap_tls(tcp).await
+    }
 
+    /// Apply the configured TLS layer to `stream` if `tls: true`.
+    /// `stream` must already terminate at this SOCKS5 server — `dial_tcp`
+    /// obtains it from `dialer.dial`, `connect_over` receives it from the
+    /// relay chain.
+    async fn wrap_tls(
+        &self,
+        stream: Box<dyn meow_transport::Stream>,
+    ) -> Result<Box<dyn meow_transport::Stream>> {
         if let Some(tls_layer) = &self.tls_layer {
             use meow_transport::Transport;
             tls_layer
-                .connect(Box::new(tcp))
+                .connect(Box::new(stream))
                 .await
                 .map_err(|e| MeowError::Proxy(e.to_string()))
         } else {
-            Ok(Box::new(tcp))
+            Ok(stream)
         }
     }
 
@@ -606,19 +616,22 @@ impl ProxyAdapter for Socks5Adapter {
 
     /// Run the SOCKS5 handshake over an already-established stream.
     ///
-    /// TLS-wrapping is intentionally skipped — the passed stream is already
-    /// inside the relay chain's encryption.
+    /// The stream already terminates at this SOCKS5 server — it carries
+    /// whichever outer transport the relay's preceding hop established, so
+    /// the adapter's own TLS layer (when `tls: true`) still applies before
+    /// the SOCKS5 negotiation.
     ///
     /// upstream: `adapter/outbound/socks5.go` — `DialContextWithDialer`
     async fn connect_over(
         &self,
-        mut stream: Box<dyn ProxyConn>,
+        stream: Box<dyn ProxyConn>,
         metadata: &Metadata,
     ) -> Result<Box<dyn ProxyConn>> {
         debug!(
             "socks5: CONNECT (relay) {}:{} over existing stream",
             metadata.host, metadata.dst_port
         );
+        let mut stream = self.wrap_tls(Box::new(stream)).await?;
         self.run_handshake(
             &mut stream,
             &metadata.host,
@@ -626,7 +639,7 @@ impl ProxyAdapter for Socks5Adapter {
             metadata.dst_port,
         )
         .await?;
-        Ok(stream)
+        Ok(Box::new(StreamConn(stream)))
     }
 
     fn health(&self) -> &ProxyHealth {

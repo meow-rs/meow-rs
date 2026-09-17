@@ -376,7 +376,7 @@ fn fnv1a32(data: &[u8]) -> u32 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn protocol_constants_and_hashes_match_reference() {
@@ -457,7 +457,10 @@ mod tests {
     /// (v2ray `OpenVMessAEADHeader`) does, re-deriving every key from the wire
     /// bytes. This catches the seal-order, plaintext-length, and length-salt
     /// bugs that a self-consistent seal/open pair would hide.
-    fn server_open_request_header(cmd_key: &[u8; 16], wire: &[u8]) -> Result<Vec<u8>, String> {
+    pub(crate) fn server_open_request_header(
+        cmd_key: &[u8; 16],
+        wire: &[u8],
+    ) -> Result<Vec<u8>, String> {
         use aes_gcm::aead::{Aead, Payload};
         let auth_id = &wire[0..16];
         let encrypted_length = &wire[16..34]; // 2 + 16 tag

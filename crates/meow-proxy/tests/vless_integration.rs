@@ -21,7 +21,7 @@ mod vless_tests {
     use tokio::time::{timeout, Duration};
 
     /// UUID for all VLESS integration tests: b831381d-6324-4d53-ad4f-8cda48b30811
-    const TEST_UUID: [u8; 16] = [
+    pub(super) const TEST_UUID: [u8; 16] = [
         0xb8, 0x31, 0x38, 0x1d, 0x63, 0x24, 0x4d, 0x53, 0xad, 0x4f, 0x8c, 0xda, 0x48, 0xb3, 0x08,
         0x11,
     ];
@@ -29,11 +29,11 @@ mod vless_tests {
     /// A different UUID — used to simulate a server that rejects the connection.
     const WRONG_UUID: [u8; 16] = [0xff; 16];
 
-    const TIMEOUT: Duration = Duration::from_secs(10);
+    pub(super) const TIMEOUT: Duration = Duration::from_secs(10);
 
     // ─── TCP echo server ──────────────────────────────────────────────────────
 
-    async fn start_tcp_echo_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    pub(super) async fn start_tcp_echo_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = tokio::spawn(async move {
@@ -155,7 +155,7 @@ mod vless_tests {
     /// 2. Closes without response if the UUID does not match `expected_uuid`.
     /// 3. Writes the VLESS response header `[0x00, 0x00]`.
     /// 4. Relays TCP traffic to `target_addr` (cmd = 0x01).
-    async fn start_mock_vless_server(
+    pub(super) async fn start_mock_vless_server(
         expected_uuid: [u8; 16],
     ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -645,5 +645,163 @@ mod vless_tests {
         let mut buf = vec![0u8; payload.len()];
         conn.read_exact(&mut buf).await.expect("read echo failed");
         assert_eq!(&buf, payload, "round-trip data must match");
+    }
+}
+
+// ─── Issue #570: relay-chain final hop (connect_over) ───────────────────────
+
+#[cfg(feature = "vless")]
+mod connect_over_tests {
+    use super::vless_tests::{start_mock_vless_server, start_tcp_echo_server, TEST_UUID, TIMEOUT};
+    use meow_common::{
+        AdapterType, DelayHistory, Metadata, Network, Proxy, ProxyAdapter, ProxyConn, ProxyHealth,
+        ProxyPacketConn, Result,
+    };
+    use meow_proxy::dialer::DirectDialer;
+    use meow_proxy::{DirectAdapter, RelayGroup, TransportChain, VlessAdapter};
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+    use tokio::time::timeout;
+
+    /// Minimal `Proxy` wrapper so leaf adapters can sit in a `RelayGroup` —
+    /// production wiring wraps adapters via meow-config's `WrappedProxy`,
+    /// which meow-proxy tests cannot reach (crate direction).
+    struct LeafProxy<A: ProxyAdapter>(A);
+
+    #[async_trait::async_trait]
+    impl<A: ProxyAdapter> ProxyAdapter for LeafProxy<A> {
+        fn name(&self) -> &str {
+            self.0.name()
+        }
+        fn adapter_type(&self) -> AdapterType {
+            self.0.adapter_type()
+        }
+        fn addr(&self) -> &str {
+            self.0.addr()
+        }
+        fn support_udp(&self) -> bool {
+            self.0.support_udp()
+        }
+        async fn dial_tcp(&self, m: &Metadata) -> Result<Box<dyn ProxyConn>> {
+            self.0.dial_tcp(m).await
+        }
+        async fn dial_udp(&self, m: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
+            self.0.dial_udp(m).await
+        }
+        async fn connect_over(
+            &self,
+            s: Box<dyn ProxyConn>,
+            m: &Metadata,
+        ) -> Result<Box<dyn ProxyConn>> {
+            self.0.connect_over(s, m).await
+        }
+        fn health(&self) -> &ProxyHealth {
+            self.0.health()
+        }
+    }
+
+    impl<A: ProxyAdapter> Proxy for LeafProxy<A> {
+        fn alive(&self) -> bool {
+            true
+        }
+        fn alive_for_url(&self, _url: &str) -> bool {
+            true
+        }
+        fn last_delay(&self) -> u16 {
+            0
+        }
+        fn last_delay_for_url(&self, _url: &str) -> u16 {
+            0
+        }
+        fn delay_history(&self) -> Vec<DelayHistory> {
+            Vec::new()
+        }
+    }
+
+    fn vless_adapter(server_port: u16) -> VlessAdapter {
+        VlessAdapter::new(
+            "test-vless-connect-over",
+            "127.0.0.1",
+            server_port,
+            TEST_UUID,
+            None,
+            false,
+            TransportChain::empty(),
+            Arc::new(DirectDialer),
+        )
+    }
+
+    fn echo_metadata(echo_port: u16) -> Metadata {
+        Metadata {
+            network: Network::Tcp,
+            dst_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            dst_port: echo_port,
+            ..Default::default()
+        }
+    }
+
+    /// `connect_over` must run the adapter's full post-connect pipeline —
+    /// transport chain + VLESS header — over the caller-supplied stream.
+    /// The mock asserts the UUID and relays to the echo target, so a skipped
+    /// or garbled handshake fails immediately.
+    #[tokio::test]
+    async fn vless_connect_over_runs_vless_handshake() {
+        let (echo_addr, _echo) = start_tcp_echo_server().await;
+        let (vless_addr, _vless) = start_mock_vless_server(TEST_UUID).await;
+        let adapter = vless_adapter(vless_addr.port());
+
+        // The relay chain's hop-0 leg: a plain TCP stream already connected
+        // to the VLESS server.
+        let upstream: Box<dyn ProxyConn> = Box::new(
+            TcpStream::connect(vless_addr)
+                .await
+                .expect("upstream connect"),
+        );
+
+        let mut conn = timeout(
+            TIMEOUT,
+            adapter.connect_over(upstream, &echo_metadata(echo_addr.port())),
+        )
+        .await
+        .expect("connect_over timed out")
+        .expect("connect_over failed");
+
+        let payload = b"vless over relay-supplied stream";
+        conn.write_all(payload).await.expect("write failed");
+        conn.flush().await.expect("flush failed");
+        let mut buf = vec![0u8; payload.len()];
+        conn.read_exact(&mut buf).await.expect("read_exact failed");
+        assert_eq!(&buf, payload, "echo mismatch through connect_over");
+    }
+
+    /// Full `RelayGroup [direct → vless]` end-to-end: hop 0 `dial_tcp`s to
+    /// the VLESS server, hop 1 `connect_over`s onto that stream and speaks
+    /// VLESS to the real target.
+    #[tokio::test]
+    async fn relay_group_direct_then_vless_roundtrip() {
+        let (echo_addr, _echo) = start_tcp_echo_server().await;
+        let (vless_addr, _vless) = start_mock_vless_server(TEST_UUID).await;
+
+        let relay = RelayGroup::new(
+            "test-relay",
+            vec![
+                Arc::new(LeafProxy(DirectAdapter::new())) as Arc<dyn Proxy>,
+                Arc::new(LeafProxy(vless_adapter(vless_addr.port()))) as Arc<dyn Proxy>,
+            ],
+        );
+
+        let mut conn = timeout(TIMEOUT, relay.dial_tcp(&echo_metadata(echo_addr.port())))
+            .await
+            .expect("relay dial_tcp timed out")
+            .expect("relay dial_tcp failed");
+
+        let payload = b"direct then vless relay roundtrip";
+        conn.write_all(payload).await.expect("write failed");
+        conn.flush().await.expect("flush failed");
+        let mut buf = vec![0u8; payload.len()];
+        conn.read_exact(&mut buf).await.expect("read_exact failed");
+        assert_eq!(&buf, payload, "relay echo mismatch");
     }
 }

@@ -190,18 +190,30 @@ impl TrojanAdapter {
         metadata: &Metadata,
         cmd: u8,
     ) -> Result<Box<dyn TransportStream>> {
-        let mut hdr_buf = [0u8; TROJAN_HEADER_BUF_SIZE];
-        let header = self.build_header(metadata, cmd, &mut hdr_buf)?;
-
         let tcp = self
             .dialer
             .dial(&self.server, self.port)
             .await
             .map_err(MeowError::Io)?;
+        self.tls_header_over(tcp, metadata, cmd).await
+    }
+
+    /// TLS-wrap `stream` and write the Trojan request header targeting
+    /// `metadata`.  `stream` must already terminate at this Trojan server —
+    /// `dial_tcp`/`dial_udp` obtain it from `dialer.dial`, `connect_over`
+    /// receives it from the relay chain.
+    async fn tls_header_over(
+        &self,
+        stream: Box<dyn TransportStream>,
+        metadata: &Metadata,
+        cmd: u8,
+    ) -> Result<Box<dyn TransportStream>> {
+        let mut hdr_buf = [0u8; TROJAN_HEADER_BUF_SIZE];
+        let header = self.build_header(metadata, cmd, &mut hdr_buf)?;
 
         let mut stream = self
             .tls_layer
-            .connect(tcp)
+            .connect(stream)
             .await
             .map_err(transport_to_proxy_err)?;
 
@@ -513,6 +525,24 @@ impl ProxyAdapter for TrojanAdapter {
             return Ok(Box::new(conn));
         }
         let stream = self.open_tls_with_header(metadata, CMD_CONNECT).await?;
+        Ok(Box::new(StreamConn(stream)))
+    }
+
+    /// Run TLS + the Trojan request header over an existing stream (relay
+    /// chain).  Mux pooling is bypassed — the relay-supplied stream is
+    /// single-use and cannot be re-dialled.
+    async fn connect_over(
+        &self,
+        stream: Box<dyn ProxyConn>,
+        metadata: &Metadata,
+    ) -> Result<Box<dyn ProxyConn>> {
+        #[cfg(feature = "mux")]
+        if self.mux.is_some() {
+            debug!("Trojan mux bypassed on relay-supplied stream (single-use)");
+        }
+        let stream = self
+            .tls_header_over(Box::new(stream), metadata, CMD_CONNECT)
+            .await?;
         Ok(Box::new(StreamConn(stream)))
     }
 
