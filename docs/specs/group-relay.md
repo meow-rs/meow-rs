@@ -79,9 +79,12 @@ Out of scope:
   point and each inner member runs `connect_over` in order. A
   `DialerProxyAdapter` whose inner proxy is a `RelayGroup` is likewise
   spliced — the enclosing chain already establishes the path, so the
-  per-outbound dialer is not applied again. Expansion is capped at
-  `MAX_FLATTEN_DEPTH` (16) — deeper nesting fails the dial outright
-  rather than retaining an unexpanded group mid-chain.
+  per-outbound dialer is not applied again — *except* when the member
+  lands at the chain's global first hop, where the wrapper is kept so
+  its own `dial_tcp` still applies the configured front dialer.
+  Expansion is capped at `MAX_FLATTEN_DEPTH` (16) — deeper nesting
+  fails the dial outright rather than retaining an unexpanded group
+  mid-chain.
 
 ## Non-goals
 
@@ -203,7 +206,7 @@ questions §1.)
 - `DirectAdapter::connect_over` — returns the passed stream unchanged.
   A direct hop in a relay chain is a no-op (useful for
   `relay: [direct, ss-node]`).
-- `RejectAdapter::connect_over` — returns `Err(MeowError::Rejected)`.
+- `RejectAdapter::connect_over` — returns `Err(MeowError::Proxy("rejected"))`.
 
 **Breaking change scope:** this trait change touches every
 `ProxyAdapter` impl (Direct, Reject, Shadowsocks, Trojan, and M1.B
@@ -254,10 +257,11 @@ any non-first position — inside an existing chain the path is already
 established, so the dialer-proxy wrapper contributes only its inner
 group's members (at hop 0 the wrapper is kept so its own `dial_tcp`
 still fires the configured front dialer). Expansion recurses and fails
-hard past `MAX_FLATTEN_DEPTH` = 16. Members with an empty `addr()`
-(REJECT, unresolvable groups) are skipped when computing the next hop's
-target but still receive their own `connect_over` call — REJECT and
-unresolvable groups fail at their own hop index.
+hard past `MAX_FLATTEN_DEPTH` = 16. A member that is not `DIRECT` and
+has no dialable `addr()` (REJECT, an unresolvable group) is terminal:
+flattening fails the dial with `RelayHopFailed` at that member's
+flattened index *before* any hop performs network I/O — the preceding
+hop is never told to open a real connection past it.
 
 ### Struct
 
