@@ -35,7 +35,8 @@
 //! - **As a relay hop**: when a dialer-proxy outbound itself appears inside a
 //!   `relay` chain, `connect_over` delegates to the inner adapter — the relay
 //!   chain already defines the path, so the per-outbound dialer is not applied a
-//!   second time.
+//!   second time. At the chain's *first* hop the wrapper is kept instead and
+//!   its own `dial_tcp` runs, so the configured front dialer still fires.
 
 use async_trait::async_trait;
 use meow_common::{

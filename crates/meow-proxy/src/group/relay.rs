@@ -108,11 +108,22 @@ fn resolve_proxy(mut proxy: Arc<dyn Proxy>, metadata: &Metadata) -> Arc<dyn Prox
 /// same member whose `connect_over` runs.
 ///
 /// A `dialer-proxy` hop whose inner adapter is itself a `RelayGroup` is
-/// flattened the same way — inside a chain the per-outbound dialer is
-/// ignored by design (`DialerProxyAdapter::connect_over` delegates to the
-/// inner adapter), so the member effectively *is* the inner chain.
+/// flattened the same way at a non-first position — inside a chain the
+/// per-outbound dialer is ignored by design
+/// (`DialerProxyAdapter::connect_over` delegates to the inner adapter), so
+/// the member effectively *is* the inner chain.  At the *global* first hop
+/// the wrapper is kept: its own `dial_tcp` is what applies the configured
+/// front dialer.
+///
+/// Flattening also fails the dial up front on terminal hops — members that
+/// are not a transparent `DIRECT` and have no dialable address (`REJECT`,
+/// an unresolvable group, …).  Their `connect_over` would error anyway, so
+/// failing here is equivalent — except it happens *before* the preceding
+/// hop is told to open a real connection to whatever comes after them.
 fn flatten_hops(proxies: &[Arc<dyn Proxy>], metadata: &Metadata) -> Result<Vec<Arc<dyn Proxy>>> {
-    flatten_hops_at(proxies, metadata, 0)
+    let mut out = Vec::with_capacity(proxies.len());
+    flatten_hops_at(proxies, metadata, 0, &mut out)?;
+    Ok(out)
 }
 
 /// Recursion bound for [`flatten_hops`]: expansion past this depth is a hard
@@ -120,14 +131,48 @@ fn flatten_hops(proxies: &[Arc<dyn Proxy>], metadata: &Metadata) -> Result<Vec<A
 /// the group graph is a DAG; the bound stops pathological hand-built graphs).
 const MAX_FLATTEN_DEPTH: usize = 16;
 
+/// `RelayHopFailed` for a hop that can never act as a dial target, raised
+/// during flattening — before any hop performs network I/O.
+fn undialable_hop_error(hop: usize, proxy: &Arc<dyn Proxy>) -> MeowError {
+    let name = proxy.name();
+    MeowError::RelayHopFailed {
+        hop,
+        source: Box::new(MeowError::Proxy(format!(
+            "relay: {name} has no dialable address"
+        ))),
+    }
+}
+
+/// `out` is threaded through the recursion (rather than collected per
+/// level) so `out.is_empty()` means "no hop emitted anywhere yet" — i.e.
+/// this member lands at the *global* first position, even when reached
+/// through nested-relay splicing.
 fn flatten_hops_at(
     proxies: &[Arc<dyn Proxy>],
     metadata: &Metadata,
     depth: usize,
-) -> Result<Vec<Arc<dyn Proxy>>> {
-    let mut out = Vec::with_capacity(proxies.len());
+    out: &mut Vec<Arc<dyn Proxy>>,
+) -> Result<()> {
     for proxy in proxies {
-        let resolved = resolve_proxy(Arc::clone(proxy), metadata);
+        // A `DialerProxyAdapter` at the global first hop must keep its
+        // wrapper, so do not run `resolve_proxy` on it: `unwrap_proxy`
+        // delegates to the inner adapter and would strip the wrapper (and
+        // its front dialer) whenever the inner is resolvable.
+        //
+        // Known limitation: this inspects the raw member only. A DPA
+        // reached *through* a resolvable group (e.g. Selector whose member
+        // is `DPA(group)`) is still unwrapped — parsed configs can only
+        // wrap leaf outbounds, so that shape is hand-built-only.
+        let resolved = if out.is_empty()
+            && proxy
+                .as_any()
+                .and_then(|a| a.downcast_ref::<DialerProxyAdapter>())
+                .is_some()
+        {
+            Arc::clone(proxy)
+        } else {
+            resolve_proxy(Arc::clone(proxy), metadata)
+        };
         if let Some(relay) = resolved
             .as_any()
             .and_then(|a| a.downcast_ref::<RelayGroup>())
@@ -137,50 +182,70 @@ fn flatten_hops_at(
                     "relay: group expansion exceeds depth {MAX_FLATTEN_DEPTH}"
                 )));
             }
-            out.extend(flatten_hops_at(&relay.proxies, metadata, depth + 1)?);
+            flatten_hops_at(&relay.proxies, metadata, depth + 1, out)?;
             continue;
         }
-        // Peel `DialerProxyAdapter` layers to reach an inner `RelayGroup`
-        // (DPA(DPA(relay)) …).  Each `resolve_proxy` call re-enters the
-        // unwrap chain because a DPA delegates `unwrap_proxy` to its inner;
-        // a peel that lands on a leaf keeps the ORIGINAL member below.  Not
-        // reachable from parsed configs — the dialer-proxy pass always wraps
-        // a leaf — but keeps hand-built graphs consistent.
-        //
-        // Guard: at the very first hop the DPA's own `dial_tcp` must run so
-        // its configured front dialer still fires, so only peel when the
-        // member lands at a non-first flattened position.
-        if !(depth == 0 && out.is_empty()) {
-            let mut peeled = Arc::clone(&resolved);
-            while let Some(inner) = peeled
-                .as_any()
-                .and_then(|a| a.downcast_ref::<DialerProxyAdapter>())
-                .map(|dpa| Arc::clone(dpa.inner()))
+        if out.is_empty() {
+            // Global first hop: it self-dials, so a preserved
+            // `DialerProxyAdapter` is valid here.  Anything else that is
+            // not a transparent DIRECT hop and has no dialable address is
+            // terminal — fail now rather than letting its black-hole
+            // `dial_tcp` (e.g. REJECT-DROP's sleep) burn the dial timeout.
+            if resolved.adapter_type() != AdapterType::Direct
+                && resolved.addr().is_empty()
+                && resolved
+                    .as_any()
+                    .and_then(|a| a.downcast_ref::<DialerProxyAdapter>())
+                    .is_none()
             {
-                peeled = resolve_proxy(inner, metadata);
+                return Err(undialable_hop_error(0, &resolved));
             }
-            if let Some(relay) = peeled.as_any().and_then(|a| a.downcast_ref::<RelayGroup>()) {
-                if depth >= MAX_FLATTEN_DEPTH {
-                    return Err(MeowError::Proxy(format!(
-                        "relay: group expansion exceeds depth {MAX_FLATTEN_DEPTH}"
-                    )));
-                }
-                out.extend(flatten_hops_at(&relay.proxies, metadata, depth + 1)?);
-                continue;
+            out.push(resolved);
+            continue;
+        }
+        // Non-first hop: peel `DialerProxyAdapter` layers to reach an inner
+        // `RelayGroup` (DPA(DPA(relay)) …).  Each `resolve_proxy` call
+        // re-enters the unwrap chain because a DPA delegates `unwrap_proxy`
+        // to its inner; a peel that lands on a leaf keeps the ORIGINAL
+        // member below.  Not reachable from parsed configs — the
+        // dialer-proxy pass always wraps a leaf — but keeps hand-built
+        // graphs consistent.
+        let mut peeled = Arc::clone(&resolved);
+        while let Some(inner) = peeled
+            .as_any()
+            .and_then(|a| a.downcast_ref::<DialerProxyAdapter>())
+            .map(|dpa| Arc::clone(dpa.inner()))
+        {
+            peeled = resolve_proxy(inner, metadata);
+        }
+        if let Some(relay) = peeled.as_any().and_then(|a| a.downcast_ref::<RelayGroup>()) {
+            if depth >= MAX_FLATTEN_DEPTH {
+                return Err(MeowError::Proxy(format!(
+                    "relay: group expansion exceeds depth {MAX_FLATTEN_DEPTH}"
+                )));
             }
+            flatten_hops_at(&relay.proxies, metadata, depth + 1, out)?;
+            continue;
+        }
+        // A non-DIRECT member with no dialable address (REJECT, an
+        // unresolvable group, …) is terminal, but `metadata_for_next_hop`
+        // would skip it and hand the preceding hop the *next* real target —
+        // `[entry, REJECT]` would make `entry` connect to the final
+        // destination before the reject fires.  Fail before any I/O.
+        if peeled.adapter_type() != AdapterType::Direct && peeled.addr().is_empty() {
+            return Err(undialable_hop_error(out.len(), &peeled));
         }
         out.push(resolved);
     }
-    Ok(out)
+    Ok(())
 }
 
 /// Return the target for a hop, skipping later DIRECT hops because they are
 /// transparent no-ops inside an already-established relay stream.  Members
 /// with no dialable address (`addr() == ""`, e.g. REJECT or an unresolvable
-/// group) are skipped for metadata purposes too — the preceding hop would
-/// otherwise be told to dial `""`, and the skipped member still gets its own
-/// `connect_over` call so it fails at its own hop index rather than
-/// misattributing the failure to an earlier hop.
+/// group) can no longer reach this point — `flatten_hops_at` rejects them
+/// before any hop performs I/O; the `!addr().is_empty()` predicate stays as
+/// defence-in-depth should the invariant ever break.
 fn metadata_for_next_hop(
     proxies: &[Arc<dyn Proxy>],
     start: usize,
@@ -482,6 +547,24 @@ mod tests {
             let inner = Arc::try_unwrap(proxy).ok().unwrap();
             Arc::new(Self {
                 adapter_type: AdapterType::Direct,
+                addr_str: String::new(),
+                ..inner
+            })
+        }
+
+        /// A terminal hop with no dialable address — the shape relay sees
+        /// for a `RejectAdapter` member (`adapter_type != Direct`,
+        /// `addr() == ""`; leaf adapters reach relay chains through the
+        /// config's `Proxy` wrapper).
+        fn reject(drop: bool) -> Arc<Self> {
+            let proxy = Self::new(if drop { "REJECT-DROP" } else { "REJECT" }, "", 0, 0);
+            let inner = Arc::try_unwrap(proxy).ok().unwrap();
+            Arc::new(Self {
+                adapter_type: if drop {
+                    AdapterType::RejectDrop
+                } else {
+                    AdapterType::Reject
+                },
                 addr_str: String::new(),
                 ..inner
             })
@@ -1345,6 +1428,272 @@ mod tests {
         assert_eq!(*b_visits.lock(), vec![2]);
         assert_eq!(*c_visits.lock(), vec![3]);
         assert_eq!(*d_visits.lock(), vec![4]);
+    }
+
+    // ─── H. Fail-closed hops & first-hop dialer-proxy ─────────────────────
+
+    /// A non-DIRECT member with no dialable address (REJECT, an
+    /// unresolvable group, …) is terminal — its `connect_over` errors — so
+    /// the chain must fail during flattening, before the preceding hop is
+    /// told to open a real connection to whatever comes after it.  The old
+    /// behaviour skipped the member when choosing the next hop's target,
+    /// which made `[entry, REJECT]` dial the *final target* first: the
+    /// reject fired, but only after the destination had been contacted.
+    #[tokio::test]
+    async fn reject_final_hop_fails_before_preceding_hop_dials() {
+        let entry = MockProxy::new("entry", "10.0.0.1", 1080, 1);
+        let entry_host = Arc::clone(&entry.last_dial_host);
+        let reject: Arc<dyn Proxy> = MockProxy::reject(false);
+
+        let group = RelayGroup::new("reject-final", vec![entry, reject]);
+        let target = Metadata {
+            host: "target.example".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+
+        let err = group.dial_tcp(&target).await.err().expect("must fail");
+        assert!(
+            matches!(err, MeowError::RelayHopFailed { hop: 1, .. }),
+            "failure must be attributed to the REJECT hop; got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("REJECT"),
+            "error must name the offending member; got: {err}"
+        );
+        assert!(
+            entry_host.lock().is_none(),
+            "preceding hop must not dial the final target: {:?}",
+            entry_host.lock()
+        );
+    }
+
+    /// Same for a middle position: nothing may touch the network.
+    #[tokio::test]
+    async fn reject_middle_hop_fails_before_any_dial() {
+        let entry = MockProxy::new("entry", "10.0.0.1", 1080, 1);
+        let exit = MockProxy::new("exit", "10.0.0.2", 1081, 2);
+        let entry_host = Arc::clone(&entry.last_dial_host);
+        let exit_visits = Arc::clone(&exit.visits);
+        let reject: Arc<dyn Proxy> = MockProxy::reject(false);
+
+        let group = RelayGroup::new("reject-mid", vec![entry, reject, exit]);
+        let target = Metadata {
+            host: "target.example".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+
+        let err = group.dial_tcp(&target).await.err().expect("must fail");
+        assert!(
+            matches!(err, MeowError::RelayHopFailed { hop: 1, .. }),
+            "failure must be attributed to the REJECT hop; got {err:?}"
+        );
+        assert!(entry_host.lock().is_none(), "no hop may perform I/O");
+        assert!(exit_visits.lock().is_empty());
+    }
+
+    /// REJECT-DROP at hop 0 must not burn the dial timeout inside its
+    /// black-hole sleep: flattening flags it before any hop runs.
+    #[tokio::test]
+    async fn reject_drop_first_hop_fails_fast() {
+        let reject: Arc<dyn Proxy> = MockProxy::reject(true);
+        let exit = MockProxy::new("exit", "10.0.0.2", 1081, 2);
+        let exit_visits = Arc::clone(&exit.visits);
+
+        let group = RelayGroup::new("reject-first", vec![reject, exit]);
+        let target = Metadata {
+            host: "target.example".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+
+        let err = group.dial_tcp(&target).await.err().expect("must fail");
+        assert!(
+            matches!(err, MeowError::RelayHopFailed { hop: 0, .. }),
+            "failure must be attributed to hop 0; got {err:?}"
+        );
+        assert!(exit_visits.lock().is_empty());
+    }
+
+    /// `[DIRECT, REJECT]`: the DIRECT exemption lets hop 0 pass the check
+    /// (empty addr is legal for a transparent hop), but the chain still
+    /// fails closed at hop 1 — before DIRECT opens a real socket.
+    #[tokio::test]
+    async fn direct_entry_reject_fails_before_direct_dials() {
+        let direct = MockProxy::direct();
+        let direct_host = Arc::clone(&direct.last_dial_host);
+        let reject: Arc<dyn Proxy> = MockProxy::reject(false);
+
+        let group = RelayGroup::new("direct-reject", vec![direct, reject]);
+        let target = Metadata {
+            host: "target.example".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+
+        let err = group.dial_tcp(&target).await.err().expect("must fail");
+        assert!(
+            matches!(err, MeowError::RelayHopFailed { hop: 1, .. }),
+            "failure must be attributed to the REJECT hop; got {err:?}"
+        );
+        assert!(direct_host.lock().is_none(), "DIRECT must not dial");
+    }
+
+    /// The fail-closed check covers every member that resolves to nothing
+    /// dialable — an empty Selector stays a group (`adapter_type !=
+    /// Direct`, `addr() == ""`), so it is terminal mid-chain like REJECT.
+    #[tokio::test]
+    async fn unresolvable_group_middle_hop_fails_before_any_dial() {
+        let entry = MockProxy::new("entry", "10.0.0.1", 1080, 1);
+        let exit = MockProxy::new("exit", "10.0.0.2", 1081, 2);
+        let entry_host = Arc::clone(&entry.last_dial_host);
+        let sel: Arc<dyn Proxy> = Arc::new(SelectorGroup::new("sel", vec![]));
+
+        let group = RelayGroup::new("sel-mid", vec![entry, sel, exit]);
+        let target = Metadata {
+            host: "target.example".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+
+        let err = group.dial_tcp(&target).await.err().expect("must fail");
+        assert!(
+            matches!(err, MeowError::RelayHopFailed { hop: 1, .. }),
+            "failure must be attributed to the group hop; got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("sel"),
+            "error must name the offending member; got: {err}"
+        );
+        assert!(entry_host.lock().is_none(), "no hop may perform I/O");
+    }
+
+    /// Error hop indices are flattened positions: a REJECT spliced in from
+    /// a nested relay is reported at its global index.
+    #[tokio::test]
+    async fn reject_inside_nested_relay_reports_flattened_index() {
+        let a = MockProxy::new("a", "10.0.0.1", 1080, 1);
+        let b = MockProxy::new("b", "10.0.0.3", 1082, 3);
+        let a_host = Arc::clone(&a.last_dial_host);
+        let reject: Arc<dyn Proxy> = MockProxy::reject(false);
+
+        let inner: Arc<dyn Proxy> = Arc::new(RelayGroup::new("inner", vec![reject, b]));
+        let outer = RelayGroup::new("outer", vec![a, inner]);
+        let target = Metadata {
+            host: "target.example".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+
+        let err = outer.dial_tcp(&target).await.err().expect("must fail");
+        assert!(
+            matches!(err, MeowError::RelayHopFailed { hop: 1, .. }),
+            "REJECT sits at flattened index 1 ([a, REJECT, b]); got {err:?}"
+        );
+        assert!(a_host.lock().is_none(), "no hop may perform I/O");
+    }
+
+    /// Regression: a `dialer-proxy` member that lands at the *global* first
+    /// hop through nested-relay splicing must keep its wrapper — the
+    /// configured front dialer has to fire.  The old guard tested a
+    /// per-call `depth == 0 && out.is_empty()`, but each recursion level
+    /// had a fresh `out`, so a nested relay's first member was peeled even
+    /// when it was the chain's true hop 0 — silently bypassing the dialer.
+    #[tokio::test]
+    async fn nested_relay_first_member_keeps_dialer_proxy() {
+        let p = MockProxy::new("p", "10.0.0.2", 1081, 2);
+        let q = MockProxy::new("q", "10.0.0.3", 1082, 3);
+        let r = MockProxy::new("r", "10.0.0.4", 1083, 4);
+        let s = MockProxy::new("s", "10.0.0.5", 1084, 5);
+        let p_visits = Arc::clone(&p.visits);
+        let r_visits = Arc::clone(&r.visits);
+        let s_visits = Arc::clone(&s.visits);
+
+        let inner: Arc<dyn Proxy> = Arc::new(RelayGroup::new("inner", vec![p, q]));
+        let dpa: Arc<dyn Proxy> = Arc::new(DialerProxyAdapter::new(
+            inner,
+            crate::dialer::DialerTarget::new(
+                "never-resolved",
+                crate::dialer::ProxyRegistry::default(),
+            ),
+        ));
+        let mid: Arc<dyn Proxy> = Arc::new(RelayGroup::new("mid", vec![dpa, r]));
+        let outer = RelayGroup::new("outer", vec![mid, s]);
+        let target = Metadata {
+            host: "t.example".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+
+        let err = outer
+            .dial_tcp(&target)
+            .await
+            .err()
+            .expect("global hop 0 must run the DPA's dial_tcp and fail on the missing dialer");
+        assert!(
+            matches!(err, MeowError::RelayHopFailed { hop: 0, .. }),
+            "failure must be attributed to hop 0; got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("never-resolved"),
+            "error must name the missing dialer, got: {err}"
+        );
+        // Peeling would have spliced the inner chain and run `p` directly —
+        // prove nothing ran.
+        assert!(p_visits.lock().is_empty());
+        assert!(r_visits.lock().is_empty());
+        assert!(s_visits.lock().is_empty());
+    }
+
+    /// The same nested shape with a *resolvable* front dialer must run the
+    /// whole chain through it: `outer = [mid[DPA(inner[p, q]), r], s]`
+    /// dials `front → p → q → r → s → target`.
+    #[tokio::test]
+    async fn nested_relay_first_member_dialer_proxy_dials_through_front() {
+        let front = MockProxy::new("front", "10.0.9.9", 1090, 9);
+        let p = MockProxy::new("p", "10.0.0.2", 1081, 2);
+        let q = MockProxy::new("q", "10.0.0.3", 1082, 3);
+        let r = MockProxy::new("r", "10.0.0.4", 1083, 4);
+        let s = MockProxy::new("s", "10.0.0.5", 1084, 5);
+        let front_host = Arc::clone(&front.last_dial_host);
+        let p_host = Arc::clone(&p.last_dial_host);
+        let q_host = Arc::clone(&q.last_dial_host);
+        let r_host = Arc::clone(&r.last_dial_host);
+        let s_host = Arc::clone(&s.last_dial_host);
+        let p_visits = Arc::clone(&p.visits);
+        let q_visits = Arc::clone(&q.visits);
+
+        let registry = crate::dialer::ProxyRegistry::default();
+        let mut proxies: std::collections::HashMap<SmolStr, Arc<dyn Proxy>> =
+            std::collections::HashMap::new();
+        proxies.insert(front.name().into(), front);
+        registry.publish(Arc::new(proxies));
+
+        let inner: Arc<dyn Proxy> = Arc::new(RelayGroup::new("inner", vec![p, q]));
+        let dpa: Arc<dyn Proxy> = Arc::new(DialerProxyAdapter::new(
+            inner,
+            crate::dialer::DialerTarget::new("front", registry),
+        ));
+        let mid: Arc<dyn Proxy> = Arc::new(RelayGroup::new("mid", vec![dpa, r]));
+        let outer = RelayGroup::new("outer", vec![mid, s]);
+        let target = Metadata {
+            host: "t.example".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+
+        outer.dial_tcp(&target).await.expect("nested DPA chain");
+
+        // The front dialer reaches the inner chain's entry point; each hop
+        // then gets the next hop's server; the last hop gets the target.
+        assert_eq!(*front_host.lock(), Some("10.0.0.2".into()));
+        assert_eq!(*p_host.lock(), Some("10.0.0.3".into()));
+        assert_eq!(*q_host.lock(), Some("10.0.0.4".into()));
+        assert_eq!(*r_host.lock(), Some("10.0.0.5".into()));
+        assert_eq!(*s_host.lock(), Some("t.example".into()));
+        assert_eq!(*p_visits.lock(), vec![2]);
+        assert_eq!(*q_visits.lock(), vec![3]);
     }
 
     // ─── F. AdapterType and ProxyAdapter trait methods ────────────────────
