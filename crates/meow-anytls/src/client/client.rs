@@ -333,8 +333,14 @@ impl Client {
 
         let session = self.session_over_transport(tls_stream).await?;
 
+        // The session's background tasks keep it alive on their own, so
+        // dropping this future while the pool-add is still pending would
+        // orphan a running session that no reaper owns. Close it on drop.
+        let mut guard = SessionCloseGuard::new(session.clone());
+
         // Store in pool
         self.session_pool.add_idle_session(session.clone()).await;
+        guard.disarm();
         tracing::debug!("[Client] Session added to pool");
 
         Ok(session)
@@ -406,6 +412,10 @@ impl Client {
     /// a later direct `dial_tcp` silently reuse the relay channel. The
     /// caller owns the returned `Arc<Session>` and should close it when the
     /// stream is dropped.
+    ///
+    /// Cancellation-safe: the host's dial timeout (5 s) drops this future
+    /// well inside the 30 s SYNACK wait, so the guard — not the `Err`
+    /// branch — is what closes the session on the common abort path.
     pub async fn create_proxy_stream_on_tls<S>(
         &self,
         tls_stream: S,
@@ -415,21 +425,137 @@ impl Client {
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
     {
         let session = self.session_over_transport(tls_stream).await?;
-        let stream = match Self::open_proxy_stream(&session, destination, None).await {
-            Ok(stream) => stream,
-            Err(e) => {
-                // The unpooled session is invisible to the pool reaper and a
-                // live server keeps answering heartbeats, so it would leak
-                // (with the whole relay leg) indefinitely. Close it now.
-                let _ = session.close().await;
-                return Err(e);
-            }
-        };
+        // Once `start_client` has run, the session's background tasks hold
+        // `Arc<Session>` references of their own: dropping this future no
+        // longer destroys it. The unpooled session is invisible to the pool
+        // reaper and a live server keeps answering heartbeats, so without a
+        // guard it leaks (with the whole relay leg) indefinitely.
+        let mut guard = SessionCloseGuard::new(session.clone());
+        // No inline `session.close()` on `Err`: `Session::close` sets
+        // `is_closed` in its first poll, so a close that is itself
+        // cancelled mid-flight (same dial timeout) would leave the flag
+        // set with the teardown half-done — and the guard's retry would
+        // then early-return on `already_closed`. Dropping the armed guard
+        // instead spawns a detached close that runs to completion.
+        let stream = Self::open_proxy_stream(&session, destination, None).await?;
+        guard.disarm();
         Ok((stream, session))
     }
 
     /// Stop the background cleanup task in the session pool (primarily for tests)
     pub async fn stop_session_pool_cleanup(&self) {
         self.session_pool.stop_cleanup_task().await;
+    }
+}
+
+/// Close a session whose ownership has not been handed off yet if the
+/// owning future is dropped.
+///
+/// `Session::start_client` spawns background tasks (recv loop, stream
+/// writer, heartbeat) that each retain an `Arc<Session>`: once they exist,
+/// dropping the caller's handle no longer destroys the session. When the
+/// host's dial timeout cancels the open, or an early `?` returns, this
+/// guard closes the session so the transport and tasks die with it.
+///
+/// `Drop` cannot `.await`, so the close is spawned — the same pattern
+/// `AnytlsConn`'s `Drop` uses for its owned session. Without a runtime
+/// handle the session persists until its transport dies; every caller runs
+/// inside one.
+struct SessionCloseGuard(Option<Arc<Session>>);
+
+impl SessionCloseGuard {
+    fn new(session: Arc<Session>) -> Self {
+        Self(Some(session))
+    }
+
+    /// Ownership successfully handed to the caller/pool: leave the session
+    /// running.
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for SessionCloseGuard {
+    fn drop(&mut self) {
+        let Some(session) = self.0.take() else {
+            return;
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    if let Err(e) = session.close().await {
+                        tracing::debug!("[Client] guarded session close failed: {e}");
+                    }
+                });
+            }
+            // Every caller runs inside a runtime; if one ever doesn't,
+            // don't leave the leak silent.
+            Err(_) => tracing::warn!(
+                "[Client] session guard dropped without a tokio runtime; unpooled session leaks"
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::util::{AnyTlsError, TlsConnectFuture};
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpStream;
+
+    /// `create_proxy_stream_on_tls` never touches the TLS hook (the caller
+    /// supplies an already-handshaken stream), so a stub suffices.
+    struct NoTls;
+
+    impl TlsConnect for NoTls {
+        fn connect(&self, _tcp: TcpStream) -> TlsConnectFuture<'_> {
+            Box::pin(async { Err(AnyTlsError::Protocol("NoTls stub".into())) })
+        }
+    }
+
+    /// Regression: a cancelled unpooled open must close its session — and
+    /// with it the transport. The dial timeout drops the open future while
+    /// it is parked in the 30 s SYNACK wait; without `SessionCloseGuard`
+    /// the session's recv/writer/heartbeat tasks keep it (and the whole
+    /// relay leg underneath) alive indefinitely.
+    #[tokio::test]
+    async fn cancelled_unpooled_open_closes_session_and_transport() {
+        let client = Client::new(
+            "password",
+            "127.0.0.1:1".to_string(),
+            Arc::new(NoTls),
+            PaddingFactory::default(),
+        );
+        let (tls_half, mut peer) = tokio::io::duplex(64 * 1024);
+
+        {
+            let open = client.create_proxy_stream_on_tls(tls_half, ("example.com".into(), 443));
+            tokio::pin!(open);
+
+            // Drive the open until handshake bytes reach the peer — the
+            // session has started and the open is now parked in (or about
+            // to enter) the SYNACK wait, i.e. inside the guarded window.
+            let mut first = [0u8; 16];
+            tokio::select! {
+                _res = &mut open => panic!("open completed unexpectedly"),
+                res = peer.read(&mut first) => {
+                    res.expect("peer must see the client's handshake bytes");
+                }
+            }
+            // `open` is dropped at scope end: cancellation.
+        }
+
+        // The guard must close the session: writer shutdown propagates EOF
+        // to the peer. Without the fix this read pends forever.
+        let mut drained = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), peer.read_to_end(&mut drained))
+            .await
+            .expect("session close must propagate EOF to the transport")
+            .expect("read_to_end must succeed once the transport closes");
+        assert!(
+            !drained.is_empty(),
+            "auth + settings + SYN bytes must have reached the peer"
+        );
     }
 }
