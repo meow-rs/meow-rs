@@ -884,8 +884,8 @@ impl EchKeyPairGenerator {
     ///
     /// # Implementation
     ///
-    /// Uses boring-sys FFI (`SSL_ECH_KEYS_*` family, v5.0.2+) to generate the keypair
-    /// at test startup via X25519 HPKE. Both server and client use the same bytes,
+    /// Uses boring-sys FFI (`SSL_ECH_KEYS_*` family) to generate the keypair at
+    /// test startup via X25519 HPKE. Both server and client use the same bytes,
     /// guaranteeing consistency without static test vectors.
     ///
     /// # Panics

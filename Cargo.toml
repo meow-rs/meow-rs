@@ -221,10 +221,13 @@ parking_lot = "0.12"
 # Wait-free read / atomic swap for hot-path rule-set + proxy-provider refreshes
 
 # BoringSSL — the single TLS/crypto backend for the whole app: meow-transport's
-# `tls` layer and quiche's QUIC (hysteria2). Pinned to 4.22 because quiche's
-# `boringssl-boring-crate` feature accepts `boring ^4.3`; this lets quiche and
-# meow-transport share ONE vendored BoringSSL (`links = "boringssl"` permits a
-# single copy). 4.22 carries every ECH / uTLS API the transport backend uses.
+# `tls` layer and quiche's QUIC (hysteria2). Pinned to 4.22 because the latest
+# published quiche (0.29.3) still constrains `boring` to ^4.3; this lets quiche
+# and meow-transport share ONE vendored BoringSSL (`links = "boringssl"`
+# permits a single copy). 4.22 carries every ECH / uTLS API the transport
+# backend uses. When crates.io quiche releases >0.29.3 with its merged boring
+# 4/5 support, upgrade `boring`/`tokio-boring` to 5.x and revisit the JA3 pins;
+# see issue #572.
 boring      = { version = "=4.22.0" }
 tokio-boring = { version = "=4.22.0" }
 
