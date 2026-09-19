@@ -50,10 +50,20 @@ impl std::fmt::Display for ProviderType {
 /// on every periodic `refresh()`: the download proxy (`None` = direct) and
 /// the flattened custom request headers (name-sorted; one entry per value,
 /// so multi-value headers repeat the name — RFC 9110 §5.2).
+///
+/// `_dialer_registry` retains the registry generation `proxy` was built from:
+/// providers outlive route-table swaps (`state.rule_providers` is populated
+/// once at startup), and a chained adapter's `dialer-proxy` lookup resolves
+/// through that cell weakly — without this keepalive its dials would fail
+/// closed on the first refresh after a config reload (issue #533). The cell
+/// pins that generation's *entire* snapshot map, not just this adapter —
+/// bounded to one extra generation since a DNS rebuild swaps providers
+/// wholesale and drops the old pin.
 #[derive(Default)]
 struct FetchContext {
     proxy: Option<Arc<dyn Proxy>>,
     headers: Vec<(String, String)>,
+    _dialer_registry: Option<meow_proxy::dialer::ProxyRegistry>,
 }
 
 /// A loaded rule-provider. Cheap to share via `Arc`; rule-set reads are
@@ -320,12 +330,18 @@ pub fn load_providers(
         download_proxy,
         &|_| None,
         &HashMap::new(),
+        None,
     )
 }
 
 /// Same as [`load_providers`] but reuses payload bytes already fetched by
 /// [`prefetch_payloads`]. Providers absent from `prefetched` fetch/read their
 /// payload themselves.
+/// `dialer_registry` should be the registry generation the resolved download
+/// proxies were built from; each provider's fetch context retains a clone so
+/// a chained adapter still resolves its front hop on later refreshes (issue
+/// #533). `None` is fine only when no retained adapter can carry a
+/// `dialer-proxy` chain.
 pub fn load_providers_prefetched(
     raw_providers: &HashMap<String, RawRuleProvider>,
     cache_dir: Option<&Path>,
@@ -333,6 +349,7 @@ pub fn load_providers_prefetched(
     default_proxy: Option<&Arc<dyn Proxy>>,
     lookup: ProxyLookup<'_>,
     prefetched: &PrefetchedPayloads,
+    dialer_registry: Option<&meow_proxy::dialer::ProxyRegistry>,
 ) -> HashMap<String, Arc<RuleProvider>> {
     let mut out = HashMap::new();
     if raw_providers.is_empty() {
@@ -351,7 +368,15 @@ pub fn load_providers_prefetched(
             None
         };
         let payload = prefetched.get(name).map(Vec::as_slice);
-        match load_one(name, cfg, cache_dir, ctx, download_proxy.as_ref(), payload) {
+        match load_one(
+            name,
+            cfg,
+            cache_dir,
+            ctx,
+            download_proxy.as_ref(),
+            payload,
+            dialer_registry,
+        ) {
             Ok(provider) => {
                 debug!(
                     "Loaded rule-provider '{}' ({}/{}): {} entries",
@@ -397,6 +422,7 @@ fn load_one(
     ctx: &ParserContext,
     download_proxy: Option<&Arc<dyn Proxy>>,
     prefetched: Option<&[u8]>,
+    dialer_registry: Option<&meow_proxy::dialer::ProxyRegistry>,
 ) -> Result<RuleProvider> {
     let behavior: RuleSetBehavior = cfg.behavior.parse().map_err(|e: String| anyhow!("{e}"))?;
     match cfg.provider_type.as_str() {
@@ -410,6 +436,7 @@ fn load_one(
             ctx,
             download_proxy,
             prefetched,
+            dialer_registry,
         ),
         other => Err(anyhow!("unknown rule-provider type: {other}")),
     }
@@ -479,6 +506,10 @@ fn load_file(
     ))
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each argument is a distinct piece of one provider's load context"
+)]
 fn load_http(
     name: &str,
     cfg: &RawRuleProvider,
@@ -487,6 +518,7 @@ fn load_http(
     ctx: &ParserContext,
     download_proxy: Option<&Arc<dyn Proxy>>,
     prefetched: Option<&[u8]>,
+    dialer_registry: Option<&meow_proxy::dialer::ProxyRegistry>,
 ) -> Result<RuleProvider> {
     let url = cfg
         .url
@@ -517,6 +549,7 @@ fn load_http(
         FetchContext {
             proxy: download_proxy.cloned(),
             headers,
+            _dialer_registry: dialer_registry.cloned(),
         },
     ))
 }
@@ -885,7 +918,8 @@ mod tests {
         // provider is skipped rather than loaded via the wrong proxy.
         let mut prefetched = HashMap::new();
         prefetched.insert("p".to_string(), b"payload:\n  - example.com\n".to_vec());
-        let out = load_providers_prefetched(&providers, None, &ctx(), None, &|_| None, &prefetched);
+        let out =
+            load_providers_prefetched(&providers, None, &ctx(), None, &|_| None, &prefetched, None);
         assert!(out.is_empty());
     }
 
@@ -895,7 +929,8 @@ mod tests {
         providers.insert("p".to_string(), http_cfg(Some("DIRECT")));
         let mut prefetched = HashMap::new();
         prefetched.insert("p".to_string(), b"payload:\n  - example.com\n".to_vec());
-        let out = load_providers_prefetched(&providers, None, &ctx(), None, &|_| None, &prefetched);
+        let out =
+            load_providers_prefetched(&providers, None, &ctx(), None, &|_| None, &prefetched, None);
         assert_eq!(out.len(), 1);
         assert_eq!(out.get("p").unwrap().rule_count(), 1);
     }

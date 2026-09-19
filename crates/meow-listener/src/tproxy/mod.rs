@@ -4,7 +4,7 @@ mod orig_dest;
 use crate::sniffer::SnifferRuntime;
 use firewall::FirewallGuard;
 use meow_common::{with_dial_timeout, ConnType, Metadata, Network};
-use meow_tunnel::{copy_bidirectional_buf_tracked, Tunnel, RELAY_BUF_SIZE};
+use meow_tunnel::{copy_bidirectional_buf_tracked, ResolvedTarget, Tunnel, RELAY_BUF_SIZE};
 use smallvec::smallvec;
 use std::collections::HashSet;
 use std::future::Future;
@@ -324,7 +324,13 @@ async fn handle_tproxy_conn(
 
     let inner = tunnel.inner();
     let admission = inner.tcp_admission();
-    let Some((proxy, rule_name, rule_payload)) = inner.resolve_proxy(&metadata) else {
+    let Some(ResolvedTarget {
+        adapter: proxy,
+        rule_name,
+        rule_payload,
+        route: _route,
+    }) = inner.resolve_proxy(&metadata)
+    else {
         return Err("no matching rule".into());
     };
 

@@ -129,7 +129,9 @@ async fn run_health_check_loop(inner: Weak<TunnelInner>, spec: HealthCheckSpec) 
         // must use the same set the group's set-triggered probes use,
         // otherwise the two can disagree on member health (issue #514).
         let expected_status = group.expected_status().filter(|s| !s.is_empty());
-        drop(route);
+        // Keep `route` alive across the probe: it owns this generation's
+        // dialer registry, and a mid-probe `update_routing` would otherwise
+        // fail chained members closed and mark live nodes dead (issue #533).
 
         let mut alive_count = 0u32;
         let mut total_count = 0u32;
@@ -560,7 +562,7 @@ mod tests {
             "lazy-fb".into(),
             std::sync::Arc::<meow_proxy::group::fallback::FallbackGroup>::clone(group),
         );
-        tunnel.update_proxies(proxies);
+        tunnel.update_proxies(proxies, Default::default());
     }
 
     #[tokio::test(start_paused = true)]
@@ -724,7 +726,7 @@ mod tests {
             "use-fb".into(),
             std::sync::Arc::<meow_proxy::group::fallback::FallbackGroup>::clone(&group),
         );
-        tunnel.update_proxies(proxies);
+        tunnel.update_proxies(proxies, Default::default());
 
         let spec = HealthCheckSpec {
             group_name: "use-fb".into(),

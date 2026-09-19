@@ -1004,7 +1004,7 @@ mod tests {
             inner_relay,
             crate::dialer::DialerTarget::new(
                 "never-resolved",
-                crate::dialer::ProxyRegistry::default(),
+                &crate::dialer::ProxyRegistry::default(),
             ),
         ));
         let outer = RelayGroup::new("outer", vec![a, dpa]);
@@ -1040,7 +1040,7 @@ mod tests {
         let dead = || {
             crate::dialer::DialerTarget::new(
                 "never-resolved",
-                crate::dialer::ProxyRegistry::default(),
+                &crate::dialer::ProxyRegistry::default(),
             )
         };
         let relay: Arc<dyn Proxy> = Arc::new(RelayGroup::new("inner", vec![p, q]));
@@ -1078,7 +1078,7 @@ mod tests {
             relay,
             crate::dialer::DialerTarget::new(
                 "never-resolved",
-                crate::dialer::ProxyRegistry::default(),
+                &crate::dialer::ProxyRegistry::default(),
             ),
         ));
         let outer = RelayGroup::new("outer", vec![dpa, x]);
@@ -1619,7 +1619,7 @@ mod tests {
             inner,
             crate::dialer::DialerTarget::new(
                 "never-resolved",
-                crate::dialer::ProxyRegistry::default(),
+                &crate::dialer::ProxyRegistry::default(),
             ),
         ));
         let mid: Arc<dyn Proxy> = Arc::new(RelayGroup::new("mid", vec![dpa, r]));
@@ -1677,7 +1677,7 @@ mod tests {
         let inner: Arc<dyn Proxy> = Arc::new(RelayGroup::new("inner", vec![p, q]));
         let dpa: Arc<dyn Proxy> = Arc::new(DialerProxyAdapter::new(
             inner,
-            crate::dialer::DialerTarget::new("front", registry),
+            crate::dialer::DialerTarget::new("front", &registry),
         ));
         let mid: Arc<dyn Proxy> = Arc::new(RelayGroup::new("mid", vec![dpa, r]));
         let outer = RelayGroup::new("outer", vec![mid, s]);

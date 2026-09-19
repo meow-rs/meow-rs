@@ -1,7 +1,9 @@
 use crate::sniffer::SnifferRuntime;
 use base64::Engine;
 use meow_common::{with_dial_timeout, AuthConfig, ConnType, Metadata, Network};
-use meow_tunnel::{copy_bidirectional_buf_tracked, route_inbound_tcp, Tunnel, RELAY_BUF_SIZE};
+use meow_tunnel::{
+    copy_bidirectional_buf_tracked, route_inbound_tcp, ResolvedTarget, Tunnel, RELAY_BUF_SIZE,
+};
 use smallvec::smallvec;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -239,8 +241,7 @@ async fn handle_http_inner(
         let inner = tunnel.inner();
         inner.pre_handle_metadata(&mut metadata);
         let admission = inner.tcp_admission();
-        let Some((proxy, rule_name, rule_payload)) = inner.resolve_proxy_lazy(&mut metadata).await
-        else {
+        let Some(target) = inner.resolve_proxy_lazy(&mut metadata).await else {
             write_bad_gateway(stream).await?;
             return Err("no matching rule".into());
         };
@@ -249,10 +250,19 @@ async fn handle_http_inner(
             "{} --> {} match {}({}) using {}",
             metadata.source_address(),
             metadata.remote_address(),
+            target.rule_name,
+            target.rule_payload,
+            target.adapter.name()
+        );
+
+        // `route` pins this generation's dialer registry across the dial
+        // (issue #533 review).
+        let ResolvedTarget {
+            adapter: proxy,
             rule_name,
             rule_payload,
-            proxy.name()
-        );
+            route: _route,
+        } = target;
 
         let Some(_guard) = admission.track(
             metadata.pure(),

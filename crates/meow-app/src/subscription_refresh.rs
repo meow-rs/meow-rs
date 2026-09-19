@@ -108,13 +108,23 @@ pub async fn run_loop(
                                 &candidate,
                                 Some(resolver),
                                 Some(cache_dir.as_path()),
+                                // Commit path: the candidate's provider set
+                                // loads fresh and is swapped into the live
+                                // registry only once validated (issue #533).
+                                None,
                             )
                         }
                     })
                     .await;
 
                     match rebuild {
-                        Ok(Ok((new_proxies, new_rules))) => {
+                        Ok(Ok(result)) => {
+                            let meow_config::RebuildResult {
+                                proxies: new_proxies,
+                                rules: new_rules,
+                                dialer_registry: new_registry,
+                                rule_providers: new_rule_providers,
+                            } = result;
                             // A swapped proxy set changes the objects a
                             // `#name` nameserver or `rule-set:` policy key
                             // references — reconcile BEFORE the raw write so
@@ -125,12 +135,25 @@ pub async fn run_loop(
                                 &candidate,
                                 &config_path,
                                 &new_proxies,
-                                &rule_providers,
+                                Some(&new_rule_providers),
                                 Some(tunnel.resolver()),
+                                Some(&new_registry),
                             )
                             .await;
 
-                            tunnel.update_routing(new_proxies, new_rules);
+                            // Install the rebuilt resolver before the route
+                            // swap drops the old registry cell — the old
+                            // resolver's chained `#name` adapters would fail
+                            // closed until `publish_dns` runs (issue #533).
+                            if let Ok(Some(dns)) = &dns {
+                                tunnel.set_resolver(Arc::clone(&dns.resolver));
+                            }
+                            tunnel.update_routing(new_proxies, new_rules, new_registry);
+                            // Commit point: the candidate's provider set —
+                            // already referenced by the rules and DNS
+                            // `rule-set:` matchers — becomes the live
+                            // registry (issue #533 review).
+                            *rule_providers.write() = new_rule_providers;
                             // Commit raw + routing together inside the lane:
                             // the on-disk/dashboard view and the running
                             // router can no longer diverge on failure.

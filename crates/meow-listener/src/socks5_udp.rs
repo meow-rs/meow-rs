@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use meow_common::{with_dial_timeout, ConnType, Metadata, Network, ProxyPacketConn};
-use meow_tunnel::Tunnel;
+use meow_tunnel::{ResolvedTarget, Tunnel};
 use smallvec::SmallVec;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
@@ -232,7 +232,12 @@ async fn handle_client_datagram(
     }
 
     // Client UDP follows the configured routing policy, including port 53.
-    let Some((proxy, _rule, _payload)) = inner.resolve_proxy(&metadata) else {
+    let Some(ResolvedTarget {
+        adapter: proxy,
+        route: _route,
+        ..
+    }) = inner.resolve_proxy(&metadata)
+    else {
         return Err(format!(
             "no matching rule for {}",
             metadata.remote_address()
@@ -477,14 +482,13 @@ mod tests {
                 true,
             ));
             let tunnel = meow_tunnel::Tunnel::new(resolver);
-            let mut proxies = meow_config::rebuild_from_raw(&Default::default())
-                .unwrap()
-                .0;
+            let res = meow_config::rebuild_from_raw(&Default::default()).unwrap();
+            let mut proxies = res.proxies;
             proxies.insert(
                 "flaky-udp".into(),
                 Arc::clone(&proxy) as Arc<dyn meow_common::Proxy>,
             );
-            tunnel.update_proxies(proxies);
+            tunnel.update_proxies(proxies, res.dialer_registry);
             tunnel.update_rules(vec![Box::new(meow_rules::final_rule::FinalRule::new(
                 "flaky-udp",
             ))]);

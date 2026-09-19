@@ -78,9 +78,12 @@ rules:
 }
 
 /// Registry plus the three mock servers, with per-server accept counters.
+/// `dialer_registry` is a keepalive: `DialerTarget`s resolve through it
+/// weakly (issue #533), so dropping it would fail every chained dial closed.
 struct Harness {
     proxies: HashMap<smol_str::SmolStr, Arc<dyn meow_common::Proxy>>,
     accepts: HashMap<&'static str, Arc<AtomicUsize>>,
+    _dialer_registry: meow_proxy::dialer::ProxyRegistry,
 }
 
 impl Harness {
@@ -112,11 +115,16 @@ async fn harness() -> Harness {
     let (server_c, c_accepts) = counting_listener().await;
 
     let raw = config(server_a.port(), server_b.port(), server_c.port());
-    let (proxies, _rules) = meow_config::rebuild_from_raw(&raw).expect("rebuild ok");
+    let meow_config::RebuildResult {
+        proxies,
+        dialer_registry,
+        ..
+    } = meow_config::rebuild_from_raw(&raw).expect("rebuild ok");
 
     Harness {
         proxies,
         accepts: HashMap::from([("A", a_accepts), ("B", b_accepts), ("C", c_accepts)]),
+        _dialer_registry: dialer_registry,
     }
 }
 

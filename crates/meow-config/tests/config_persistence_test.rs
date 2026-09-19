@@ -149,7 +149,7 @@ fn save_overwrites_previous_backup() {
 #[test]
 fn rebuild_from_raw_includes_builtins() {
     let raw = minimal_raw_config();
-    let (proxies, _rules) = rebuild_from_raw(&raw).unwrap();
+    let proxies = rebuild_from_raw(&raw).unwrap().proxies;
     assert!(proxies.contains_key("DIRECT"));
     assert!(proxies.contains_key("REJECT"));
     assert!(proxies.contains_key("REJECT-DROP"));
@@ -158,7 +158,7 @@ fn rebuild_from_raw_includes_builtins() {
 #[test]
 fn rebuild_from_raw_parses_rules() {
     let raw = minimal_raw_config();
-    let (_proxies, rules) = rebuild_from_raw(&raw).unwrap();
+    let rules = rebuild_from_raw(&raw).unwrap().rules;
     assert_eq!(rules.len(), 2);
     assert_eq!(rules[0].payload(), "example.com");
     assert_eq!(rules[0].adapter(), "DIRECT");
@@ -167,7 +167,8 @@ fn rebuild_from_raw_parses_rules() {
 #[test]
 fn rebuild_from_raw_empty_config() {
     let raw = RawConfig::default();
-    let (proxies, rules) = rebuild_from_raw(&raw).unwrap();
+    let res = rebuild_from_raw(&raw).unwrap();
+    let (proxies, rules) = (res.proxies, res.rules);
     // Should still have built-in proxies + auto-created GLOBAL
     assert_eq!(proxies.len(), 4);
     assert!(proxies.contains_key("GLOBAL"));
@@ -194,7 +195,7 @@ fn rebuild_from_raw_with_groups() {
             ..Default::default()
         },
     ]);
-    let (proxies, _rules) = rebuild_from_raw(&raw).unwrap();
+    let proxies = rebuild_from_raw(&raw).unwrap().proxies;
     assert!(proxies.contains_key("Select"));
     assert!(proxies.contains_key("Auto"));
     assert!(proxies.contains_key("GLOBAL"));
@@ -219,7 +220,7 @@ rules:
     )
     .unwrap();
 
-    let (proxies, _) = rebuild_from_raw(&raw).unwrap();
+    let proxies = rebuild_from_raw(&raw).unwrap().proxies;
     let global = proxies.get("GLOBAL").expect("auto-created GLOBAL");
 
     assert_eq!(global.current().as_deref(), Some("Proxies"));
@@ -245,7 +246,7 @@ rules:
 "#,
     )
     .unwrap();
-    let (proxies, _) = rebuild_from_raw(&group_first).unwrap();
+    let proxies = rebuild_from_raw(&group_first).unwrap().proxies;
     assert_eq!(
         proxies
             .get("GLOBAL")
@@ -263,7 +264,7 @@ rules:
 "#,
     )
     .unwrap();
-    let (proxies, _) = rebuild_from_raw(&proxy_only).unwrap();
+    let proxies = rebuild_from_raw(&proxy_only).unwrap().proxies;
     assert_eq!(
         proxies
             .get("GLOBAL")
@@ -287,7 +288,7 @@ rules:
 "#,
     )
     .unwrap();
-    let (proxies, _) = rebuild_from_raw(&raw).unwrap();
+    let proxies = rebuild_from_raw(&raw).unwrap().proxies;
     let global = proxies.get("GLOBAL").expect("user GLOBAL");
     assert_eq!(global.current().as_deref(), Some("DIRECT"));
     assert_eq!(
@@ -307,7 +308,7 @@ fn rebuild_from_raw_skips_invalid_proxy() {
     );
     raw.proxies = Some(vec![bad_proxy]);
     // Should not fail, just skip
-    let (proxies, _) = rebuild_from_raw(&raw).unwrap();
+    let proxies = rebuild_from_raw(&raw).unwrap().proxies;
     assert!(!proxies.contains_key("bad"));
 }
 

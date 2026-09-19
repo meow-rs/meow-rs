@@ -97,6 +97,13 @@ For DoT/DoH, layer `tokio_rustls` / HTTP/1.1 over the `Box<dyn AsyncRead+AsyncWr
 
 In `meow-config::build_config`, proxies are constructed before the resolver, so the registry handoff is straightforward.
 
+*Addendum (issue #533):* a `dialer-proxy`-chained adapter resolves its front hop
+through a registry cell owned by the route-table generation that built it. A
+retained resolver therefore must not outlive that generation — when either the
+old or candidate config contains `#name` nameserver refs, `reconcile_dns_config`
+forces a resolver rebuild on every commit, and the commit paths install the new
+resolver before swapping the route table so no query observes a dead cell.
+
 ### What this ADR does NOT cover
 
 - **UDP-native DNS through proxy** when the proxy supports UDP. V1 routes all `#PROXY` queries over TCP. UDP-over-proxy is an optimization that can land later behind a `udp-dns: true` flag.

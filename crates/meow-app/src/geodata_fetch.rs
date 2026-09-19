@@ -9,6 +9,7 @@
 use meow_common::adapter::Proxy;
 use meow_config::geodata::download_and_replace;
 use meow_config::raw::RawConfig;
+use meow_config::rule_provider::RuleProvider;
 use meow_config::GeoDataConfig;
 use meow_tunnel::Tunnel;
 use parking_lot::RwLock;
@@ -96,6 +97,7 @@ pub async fn run_on_startup(
     geo: GeoDataConfig,
     tunnel: Tunnel,
     raw_config: Arc<RwLock<RawConfig>>,
+    rule_providers: Arc<RwLock<std::collections::HashMap<String, Arc<RuleProvider>>>>,
     cache_dir: PathBuf,
 ) {
     let targets = compute_targets(&geo);
@@ -122,18 +124,23 @@ pub async fn run_on_startup(
     let resolver = tunnel.resolver_slot();
     let rebuild = tokio::task::spawn_blocking({
         let cache_dir = cache_dir.clone();
+        let rule_providers = Arc::clone(&rule_providers);
         move || {
             meow_config::rebuild_from_raw_with_resolver(
                 &raw,
                 Some(resolver),
                 Some(cache_dir.as_path()),
+                // Rules-only refresh — bind the rebuilt RULE-SET rules to
+                // the LIVE provider set so `PUT /providers/rules/{name}`
+                // refreshes keep reaching them (issue #533 review).
+                Some(rule_providers.read().clone()),
             )
         }
     })
     .await;
     match rebuild {
-        Ok(Ok((_proxies, new_rules))) => {
-            tunnel.update_rules(new_rules);
+        Ok(Ok(result)) => {
+            tunnel.update_rules(result.rules);
             info!("geodata startup-fetch: rules reloaded with downloaded DBs");
         }
         Ok(Err(e)) => warn!(
@@ -164,6 +171,7 @@ pub async fn auto_update_loop(
     geo: GeoDataConfig,
     tunnel: Tunnel,
     raw_config: Arc<RwLock<RawConfig>>,
+    rule_providers: Arc<RwLock<std::collections::HashMap<String, Arc<RuleProvider>>>>,
     cache_dir: PathBuf,
 ) {
     let interval = std::time::Duration::from_secs(geo.auto_update_interval as u64 * 3600);
@@ -231,18 +239,23 @@ pub async fn auto_update_loop(
         let resolver = tunnel.resolver_slot();
         let rebuild = tokio::task::spawn_blocking({
             let cache_dir = cache_dir.clone();
+            let rule_providers = Arc::clone(&rule_providers);
             move || {
                 meow_config::rebuild_from_raw_with_resolver(
                     &raw,
                     Some(resolver),
                     Some(cache_dir.as_path()),
+                    // Rules-only refresh — bind the rebuilt RULE-SET rules
+                    // to the LIVE provider set so API/provider refreshes
+                    // keep reaching them (issue #533 review).
+                    Some(rule_providers.read().clone()),
                 )
             }
         })
         .await;
         match rebuild {
-            Ok(Ok((_proxies, new_rules))) => {
-                tunnel.update_rules(new_rules);
+            Ok(Ok(result)) => {
+                tunnel.update_rules(result.rules);
                 info!("geodata auto-update: rules reloaded with updated DBs");
             }
             Ok(Err(e)) => {

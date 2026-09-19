@@ -807,7 +807,7 @@ async fn run(
     // reach the map's DIRECT adapters built from this slot (issue #514).
     let tunnel = Tunnel::new_with_slot(Arc::clone(&config.dns.resolver_slot));
     tunnel.set_mode(config.general.mode);
-    tunnel.update_routing(config.proxies, config.rules);
+    tunnel.update_routing(config.proxies, config.rules, config.dialer_registry);
     tunnel.spawn_background_tasks();
 
     // Spawn periodic health checks for fallback / url-test proxy groups.
@@ -898,9 +898,17 @@ async fn run(
         let geodata = config.geodata.clone();
         let tunnel = tunnel.clone();
         let raw_config = Arc::clone(&raw_config);
+        let rule_providers = Arc::clone(&rule_providers);
         let cache_dir = meow_config::resource_cache_dir_for_config_path(&config_path);
         tokio::spawn(async move {
-            meow_app::geodata_fetch::run_on_startup(geodata, tunnel, raw_config, cache_dir).await;
+            meow_app::geodata_fetch::run_on_startup(
+                geodata,
+                tunnel,
+                raw_config,
+                rule_providers,
+                cache_dir,
+            )
+            .await;
         });
     }
 
@@ -909,9 +917,17 @@ async fn run(
         let geodata = config.geodata.clone();
         let tunnel = tunnel.clone();
         let raw_config = Arc::clone(&raw_config);
+        let rule_providers = Arc::clone(&rule_providers);
         let cache_dir = meow_config::resource_cache_dir_for_config_path(&config_path);
         tokio::spawn(async move {
-            meow_app::geodata_fetch::auto_update_loop(geodata, tunnel, raw_config, cache_dir).await;
+            meow_app::geodata_fetch::auto_update_loop(
+                geodata,
+                tunnel,
+                raw_config,
+                rule_providers,
+                cache_dir,
+            )
+            .await;
         });
     }
 

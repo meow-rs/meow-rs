@@ -23,7 +23,7 @@
 
 use meow_common::{ConnType, Metadata, Network};
 use meow_transport::simple_obfs::server::{HttpObfsServer, TlsObfsServer};
-use meow_tunnel::{route_inbound_tcp, Tunnel};
+use meow_tunnel::{route_inbound_tcp, ResolvedTarget, Tunnel};
 use shadowsocks::config::{ServerConfig, ServerType};
 use shadowsocks::context::Context;
 use shadowsocks::crypto::CipherKind;
@@ -798,7 +798,12 @@ where
     }
 
     // Client UDP follows the configured routing policy, including port 53.
-    let Some((proxy, _rule, _payload)) = inner.resolve_proxy(&metadata) else {
+    let Some(ResolvedTarget {
+        adapter: proxy,
+        route: _route,
+        ..
+    }) = inner.resolve_proxy(&metadata)
+    else {
         return Err(format!(
             "no matching rule for {}",
             metadata.remote_address()
@@ -915,11 +920,8 @@ mod tests {
             true,
         ));
         let tunnel = Tunnel::new(resolver);
-        tunnel.update_proxies(
-            meow_config::rebuild_from_raw(&Default::default())
-                .unwrap()
-                .0,
-        );
+        let res = meow_config::rebuild_from_raw(&Default::default()).unwrap();
+        tunnel.update_proxies(res.proxies, res.dialer_registry);
         tunnel.update_rules(vec![Box::new(meow_rules::final_rule::FinalRule::new(
             "DIRECT",
         ))]);

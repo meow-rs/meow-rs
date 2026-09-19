@@ -152,6 +152,21 @@ the canonical, in-repo source a release is cut from.
   work for `anytls`, which previously fell back to the relay wrapper and
   still failed. (#570)
 
+- **The `dialer-proxy` by-name registry no longer pins every superseded
+  route generation.** Chained adapters held a strong `Arc` back to their
+  build's registry, closing a `registry → proxy map → adapter → registry`
+  reference cycle: each config reload leaked the entire previous proxy map
+  for the life of the process. The registry cell is now held weakly by the
+  adapters and owned per generation by the route table (plus a keepalive in
+  rule-provider fetch contexts and the startup `Config`), so a replaced
+  generation is freed once its last owner drops — and a chained adapter that
+  outlives its generation fails closed instead of silently dialing direct.
+  Because a DNS `#name` nameserver snapshots adapters at resolver-build
+  time, the resolver is now rebuilt on every API commit / subscription
+  refresh whenever either the old or candidate config uses proxy tags — the
+  only way to keep its chained upstreams bound to a live generation.
+  (#533)
+
 - **TLS handshakes no longer fail on multiplexed transports whose
   `poll_flush` pends.** Every TLS-over-mux handshake — AnyTLS, smux, and any
   stream whose `poll_flush` waits on a writer-task acknowledgement — died at

@@ -6,7 +6,7 @@ use meow_common::{DnsMode, Proxy};
 use meow_config::raw::{RawConfig, RawProxyGroup, RawSubscription};
 use meow_dns::{HostEntry, Resolver};
 use meow_trie::DomainTrie;
-use meow_tunnel::Tunnel;
+use meow_tunnel::{ResolvedTarget, Tunnel};
 use parking_lot::RwLock;
 use smallvec::smallvec;
 use std::collections::HashMap;
@@ -43,8 +43,9 @@ fn test_state(raw: RawConfig) -> Arc<AppState> {
     let tunnel = Tunnel::new(resolver);
 
     // Build proxies/rules from raw and apply
-    let (proxies, rules) = meow_config::rebuild_from_raw(&raw).unwrap();
-    tunnel.update_proxies(proxies);
+    let meow_config::RebuildResult { proxies, rules, .. } =
+        meow_config::rebuild_from_raw(&raw).unwrap();
+    tunnel.update_proxies(proxies, Default::default());
     tunnel.update_rules(rules);
 
     let dir = tempfile::tempdir().unwrap();
@@ -83,7 +84,7 @@ fn test_state_with_route(raw: RawConfig, named: Vec<(&str, Arc<dyn Proxy>)>) -> 
     for (name, proxy) in named {
         proxies.insert(smol_str::SmolStr::from(name), proxy);
     }
-    tunnel.update_proxies(proxies);
+    tunnel.update_proxies(proxies, Default::default());
 
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.yaml").to_str().unwrap().to_string();
@@ -120,8 +121,9 @@ fn test_state_with_secret(secret: &str) -> Arc<AppState> {
     ));
     let tunnel = Tunnel::new(resolver);
     let raw = test_raw_config();
-    let (proxies, rules) = meow_config::rebuild_from_raw(&raw).unwrap();
-    tunnel.update_proxies(proxies);
+    let meow_config::RebuildResult { proxies, rules, .. } =
+        meow_config::rebuild_from_raw(&raw).unwrap();
+    tunnel.update_proxies(proxies, Default::default());
     tunnel.update_rules(rules);
 
     let dir = tempfile::tempdir().unwrap();
@@ -209,8 +211,9 @@ async fn external_ui_serves_static_directory() {
     ));
     let tunnel = Tunnel::new(resolver);
     let raw = test_raw_config();
-    let (proxies, rules) = meow_config::rebuild_from_raw(&raw).unwrap();
-    tunnel.update_proxies(proxies);
+    let meow_config::RebuildResult { proxies, rules, .. } =
+        meow_config::rebuild_from_raw(&raw).unwrap();
+    tunnel.update_proxies(proxies, Default::default());
     tunnel.update_rules(rules);
     let state = Arc::new(AppState {
         tunnel,
@@ -1845,7 +1848,7 @@ mod delay_support {
             true,
         ));
         let tunnel = Tunnel::new(resolver);
-        tunnel.update_proxies(proxies);
+        tunnel.update_proxies(proxies, Default::default());
 
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.yaml").to_str().unwrap().to_string();
@@ -1901,7 +1904,7 @@ mod delay_support {
             true,
         ));
         let tunnel = Tunnel::new(resolver);
-        tunnel.update_proxies(proxies);
+        tunnel.update_proxies(proxies, Default::default());
 
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.yaml").to_str().unwrap().to_string();
@@ -2842,8 +2845,9 @@ fn test_state_with_hosts_entry() -> Arc<AppState> {
     let tunnel = Tunnel::new(resolver);
     let mut raw = test_raw_config();
     raw.dns = Some(serde_yaml::from_str("enable: true").unwrap());
-    let (proxies, rules) = meow_config::rebuild_from_raw(&raw).unwrap();
-    tunnel.update_proxies(proxies);
+    let meow_config::RebuildResult { proxies, rules, .. } =
+        meow_config::rebuild_from_raw(&raw).unwrap();
+    tunnel.update_proxies(proxies, Default::default());
     tunnel.update_rules(rules);
 
     let dir = tempfile::tempdir().unwrap();
@@ -3203,7 +3207,11 @@ async fn cold_reload_terminates_live_stream_without_drain_delay() {
         dst_port: 12345,
         ..Default::default()
     };
-    let (proxy, _, _) = state.tunnel.inner().resolve_proxy(&metadata).unwrap();
+    let ResolvedTarget {
+        adapter: proxy,
+        route: _route,
+        ..
+    } = state.tunnel.inner().resolve_proxy(&metadata).unwrap();
     assert_eq!(
         proxy.name(),
         "REJECT",
@@ -3243,8 +3251,9 @@ async fn cold_reload_rejects_tcp_setup_waiting_for_dns() {
             false,
             false,
         )));
-        let (proxies, rules) = meow_config::rebuild_from_raw(&raw).unwrap();
-        tunnel.update_proxies(proxies);
+        let meow_config::RebuildResult { proxies, rules, .. } =
+            meow_config::rebuild_from_raw(&raw).unwrap();
+        tunnel.update_proxies(proxies, Default::default());
         tunnel.update_rules(rules);
         Arc::get_mut(&mut state).unwrap().tunnel = tunnel;
 
@@ -3327,7 +3336,11 @@ async fn cold_reload_rejects_tcp_setup_waiting_for_dns() {
             network: Network::Tcp,
             ..Default::default()
         };
-        let (proxy, _, _) = state.tunnel.inner().resolve_proxy(&metadata).unwrap();
+        let ResolvedTarget {
+            adapter: proxy,
+            route: _route,
+            ..
+        } = state.tunnel.inner().resolve_proxy(&metadata).unwrap();
         assert_eq!(proxy.name(), "REJECT");
         let inner = Arc::clone(state.tunnel.inner());
         let fresh_task = tokio::spawn(async move {

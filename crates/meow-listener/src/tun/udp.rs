@@ -24,7 +24,7 @@ use ipnet::Ipv4Net;
 use lwip::UdpSocket;
 use meow_common::{with_dial_timeout, ConnType, Metadata, Network};
 use meow_dns::server::{hex_prefix, DnsServer};
-use meow_tunnel::Tunnel;
+use meow_tunnel::{ResolvedTarget, Tunnel};
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Instant};
 use tracing::{debug, info};
@@ -196,7 +196,13 @@ async fn relay_flow(
     let dst_addr = SocketAddr::new(dst_ip, metadata.dst_port);
 
     // Non-hijacked client traffic follows the same policy on every port.
-    let Some((proxy, rule_name, rule_payload)) = inner.resolve_proxy(&metadata) else {
+    let Some(ResolvedTarget {
+        adapter: proxy,
+        rule_name,
+        rule_payload,
+        route: _route,
+    }) = inner.resolve_proxy(&metadata)
+    else {
         return Err(format!(
             "no matching rule for {}",
             metadata.remote_address()

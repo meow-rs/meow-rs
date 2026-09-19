@@ -71,6 +71,10 @@ pub struct AppState {
     pub log_tx: broadcast::Sender<LogMessage>,
     /// Live proxy-provider registry — refreshed by background task and PUT endpoint.
     pub proxy_providers: Arc<DashMap<String, Arc<ProxyProvider>>>,
+    /// Live rule-provider registry — swapped wholesale to the committed
+    /// build's provider set on every successful config commit, so `RULE-SET`
+    /// rules, DNS `rule-set:` matchers, and `PUT /providers/rules/{name}`
+    /// refreshes all share one object per provider (issue #533 review).
     pub rule_providers: Arc<RwLock<HashMap<String, Arc<RuleProvider>>>>,
     /// Snapshot of active named listeners (read-only, startup-time only in M1).
     pub listeners: Vec<NamedListener>,
@@ -1045,10 +1049,15 @@ async fn save_config(
 /// apply to the live tunnel. Takes the config *by value* so callers
 /// clone-and-drop their `parking_lot` guard before awaiting — those guards
 /// are not Send and would otherwise break the axum Handler bound.
+///
+/// Returns the rebuilt [`meow_config::DnsConfig`] (when its inputs changed)
+/// plus the resolver generation that was live before the early install —
+/// the caller passes it to [`swap_config_and_reconcile_tun`] so the TUN
+/// fake-IP comparison sees the true old state (issue #533 review).
 async fn apply_raw_to_tunnel(
     mut raw: RawConfig,
     state: &AppState,
-) -> Result<Option<meow_config::DnsConfig>, (StatusCode, String)> {
+) -> Result<(Option<meow_config::DnsConfig>, Arc<meow_dns::Resolver>), (StatusCode, String)> {
     let expected_groups: Vec<String> = raw
         .proxy_groups
         .as_deref()
@@ -1073,10 +1082,16 @@ async fn apply_raw_to_tunnel(
     // Share the tunnel's resolver slot so the rebuilt map's DIRECT adapter
     // tracks later `set_resolver` swaps (issue #514).
     let resolver_slot = state.tunnel.resolver_slot();
-    let (proxies, rules) =
+    let result =
         rebuild_from_raw_with_resolver_async(raw.clone(), resolver_slot, providers, cache_dir)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let meow_config::RebuildResult {
+        proxies,
+        rules,
+        dialer_registry,
+        rule_providers,
+    } = result;
     if let Some(missing) = expected_groups
         .iter()
         .find(|name| !proxies.contains_key(name.as_str()))
@@ -1096,20 +1111,38 @@ async fn apply_raw_to_tunnel(
         &raw,
         &state.config_path,
         &proxies,
-        &state.rule_providers,
+        Some(&rule_providers),
         Some(state.tunnel.resolver()),
+        Some(&dialer_registry),
     )
     .await?;
-    state.tunnel.update_routing(proxies, rules);
-    Ok(dns)
+    // Snapshot the resolver being replaced BEFORE the early install below
+    // — `swap_config_and_reconcile_tun` compares its fake-IP inputs against
+    // the new generation's; reading `tunnel.resolver()` there would already
+    // see the candidate and never detect a change (issue #533 review).
+    let prior_resolver = state.tunnel.resolver();
+    // Install the rebuilt resolver before the route swap drops the old
+    // registry cell: the old resolver's chained `#name` adapters would fail
+    // closed in the gap until `publish_dns` runs (issue #533). Idempotent —
+    // `publish_dns` installs the same Arc again.
+    if let Some(dns) = &dns {
+        state.tunnel.set_resolver(Arc::clone(&dns.resolver));
+    }
+    state.tunnel.update_routing(proxies, rules, dialer_registry);
+    // Commit point reached: every fallible check passed. The candidate's
+    // provider set becomes the live registry — the rules and DNS `rule-set:`
+    // matchers installed above already reference these Arcs (issue #533
+    // review).
+    *state.rule_providers.write() = rule_providers;
+    Ok((dns, prior_resolver))
 }
 
 async fn commit_raw_candidate(
     state: &AppState,
     candidate: RawConfig,
 ) -> Result<(), (StatusCode, String)> {
-    let dns = apply_raw_to_tunnel(candidate.clone(), state).await?;
-    swap_config_and_reconcile_tun(state, candidate, dns).await;
+    let (dns, prior_resolver) = apply_raw_to_tunnel(candidate.clone(), state).await?;
+    swap_config_and_reconcile_tun(state, candidate, dns, prior_resolver).await;
     Ok(())
 }
 
@@ -1121,6 +1154,16 @@ async fn commit_raw_candidate(
 /// otherwise the resolver keeps dialing through adapters the new route
 /// table no longer owns (issue #514 review).
 fn dns_uses_runtime_refs(raw: &RawConfig) -> bool {
+    dns_uses_proxy_refs(raw) || meow_config::dns_parser::dns_needs_rule_providers(raw)
+}
+
+/// `true` when the `dns:` section names a proxy adapter (`#name` tags) —
+/// the subset of runtime refs that capture `Arc<dyn Proxy>` at build time.
+/// Unlike `rule-set:` policy matchers (whose providers live in
+/// `state.rule_providers` and refresh independently), a retained resolver
+/// must be rebuilt whenever the route table's registry generation is
+/// replaced, so this subset forces a rebuild on every commit (issue #533).
+fn dns_uses_proxy_refs(raw: &RawConfig) -> bool {
     let Some(dns) = raw.dns.as_ref() else {
         return false;
     };
@@ -1135,7 +1178,6 @@ fn dns_uses_runtime_refs(raw: &RawConfig) -> bool {
             m.iter()
                 .any(|(_k, v)| v.as_urls().iter().any(|u| u.contains('#')))
         })
-        || meow_config::dns_parser::dns_needs_rule_providers(raw)
 }
 
 /// `true` when two raw configs carry identical DNS-relevant inputs —
@@ -1161,28 +1203,45 @@ fn dns_inputs_equal(a: &RawConfig, b: &RawConfig) -> bool {
 /// `raw_config` must still hold the PRE-commit raw when this runs — the
 /// comparison is old-vs-candidate. Shared by the API commit paths and the
 /// subscription refresh loop (issue #514). `None` means unchanged — the
-/// running resolver stays. `Err` rejects the whole mutation (issue
+/// running resolver stays — which is only possible when neither side uses
+/// `#name`/`rule-set:` runtime refs: those capture adapters whose registry
+/// generation dies with the route swap, so they force a rebuild even on
+/// unrelated changes (issue #533). `Err` rejects the whole mutation (issue
 /// #514): a broken dns section must fail the PUT, not silently persist
 /// while the process keeps resolving through the old resolver.
-/// `rule_providers` is the live registry the policy matchers' provider
-/// objects are written into on success — pass `state.rule_providers` (or
-/// the equivalent shared registry) so `PUT /providers/rules/{name}` and
-/// name-resolved refresh loops reach the live generation (issue #514).
+/// `rule_providers` is the CANDIDATE build's provider set
+/// (`RebuildResult::rule_providers`) — `rule-set:` policy matchers clone
+/// these Arcs so the resolver shares one provider object with the rules
+/// and the live registry the commit installs (issue #533 review).
 /// `prior_resolver` is the resolver generation being replaced — the
 /// tunnel's live resolver — so the rebuild can carry the fake-IP pool
 /// over when the range and store identity (in-memory vs the same
 /// backing file) are unchanged (issue #514 review follow-up).
+/// `dialer_registry` is the registry generation `proxies` was published
+/// into — the candidate build's own cell. Provider fetch contexts built
+/// here retain it so chained download adapters keep resolving after later
+/// rebuilds (issue #533).
 pub async fn reconcile_dns_config(
     raw_config: &RwLock<RawConfig>,
     candidate: &RawConfig,
     config_path: &str,
     proxies: &std::collections::HashMap<smol_str::SmolStr, Arc<dyn meow_common::Proxy>>,
-    rule_providers: &RwLock<HashMap<String, Arc<meow_config::rule_provider::RuleProvider>>>,
+    rule_providers: Option<&HashMap<String, Arc<meow_config::rule_provider::RuleProvider>>>,
     prior_resolver: Option<Arc<meow_dns::Resolver>>,
+    dialer_registry: Option<&meow_proxy::dialer::ProxyRegistry>,
 ) -> Result<Option<meow_config::DnsConfig>, (StatusCode, String)> {
     let unchanged = {
         let old = raw_config.read();
+        // `#name`/`rule-set:` references capture objects whose identity is
+        // generation-bound: proxy Arcs die with this commit's registry
+        // cell, and a retained resolver's provider matchers would orphan
+        // the moment the commit swaps `state.rule_providers` — they would
+        // keep working but miss every later `PUT /providers/rules/{name}`
+        // refresh (issue #533 review). Rebuild whenever either side has
+        // them, even when the raw inputs compare equal.
         dns_inputs_equal(&old, candidate)
+            && !dns_uses_runtime_refs(&old)
+            && !dns_uses_runtime_refs(candidate)
     };
     if unchanged {
         return Ok(None);
@@ -1192,8 +1251,9 @@ pub async fn reconcile_dns_config(
         candidate,
         Some(&cache_dir),
         proxies,
-        Some(rule_providers),
+        rule_providers,
         prior_resolver.as_deref(),
+        dialer_registry,
     )
     .await
     .map(Some)
@@ -1860,7 +1920,9 @@ async fn get_proxy_delay(
     let Some(proxy) = route.proxies.get(name.as_str()).cloned() else {
         return msg_err(StatusCode::NOT_FOUND, "resource not found");
     };
-    drop(route);
+    // `route` stays alive across the probe — it owns this generation's
+    // dialer registry, and a mid-probe route swap would fail a chained
+    // member closed and report a live node dead (issue #533).
 
     match probe_and_record(&proxy, &url, expected.as_deref(), timeout).await {
         Ok(delay) => Json(DelayResp { delay }).into_response(),
@@ -1909,12 +1971,13 @@ async fn get_group_delay(
     let expected = params.expected.clone();
 
     // The spawned tasks hold their own Arc clones, so the route snapshot
-    // can go before the probes start.
+    // only needs to outlive the probe — it owns this generation's dialer
+    // registry, and a mid-probe route swap would fail chained members
+    // closed and report live nodes dead (issue #533).
     let members: Vec<(String, Arc<dyn meow_common::Proxy>)> = member_proxies
         .into_iter()
         .map(|p| (p.name().to_string(), p))
         .collect();
-    drop(route);
 
     // upstream: group probe wraps the whole batch in one context.WithTimeout,
     // not per-member. A slow member does not get its own budget.
@@ -2055,10 +2118,15 @@ async fn spawn_tun_from_raw(
 /// `dns` is the candidate's rebuilt [`meow_config::DnsConfig`] when its
 /// DNS-relevant inputs changed (`Some`), already validated by the caller —
 /// publishing it here keeps the swap inside the same lane (issue #514).
+/// `prior_resolver` is the resolver generation that was live BEFORE the
+/// caller early-installed the candidate's — the fake-IP comparison must
+/// read its inputs, not `tunnel.resolver()` (which already serves the new
+/// generation and would always compare equal) (issue #533 review).
 async fn swap_config_and_reconcile_tun(
     state: &AppState,
     candidate: RawConfig,
     dns: Option<meow_config::DnsConfig>,
+    prior_resolver: Arc<meow_dns::Resolver>,
 ) {
     let _guard = state.config_mutation_lock.lock().await;
 
@@ -2087,11 +2155,16 @@ async fn swap_config_and_reconcile_tun(
 
     // Publish the rebuilt DNS runtime — independent of TUN transitions, so
     // it must run before the equal-state early return (issue #514).
-    // Snapshot the fake-IP inputs the running TUN listener captured at
-    // build time — a resolver generation swap can change them.
+    // The fake-IP inputs of the resolver being replaced come from
+    // `prior_resolver` — the caller already early-installed the candidate's
+    // resolver, so `tunnel.resolver()` would read the NEW generation and
+    // the on→on `fake_ip_changed` check below could never fire
+    // (issue #533 review).
     let old_fake_ip = dns.is_some().then(|| {
-        let r = state.tunnel.resolver();
-        (r.fake_ip_v4_net(), r.fake_ip_v4_gateway())
+        (
+            prior_resolver.fake_ip_v4_net(),
+            prior_resolver.fake_ip_v4_gateway(),
+        )
     });
     if let Some(dns) = dns {
         publish_dns(&state.tunnel, &state.dns_server, dns).await;
@@ -2251,7 +2324,7 @@ async fn put_configs(
         .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
         .collect();
     let cache_dir = meow_config::resource_cache_dir_for_config_path(&state.config_path);
-    let (proxies, rules) = match rebuild_from_raw_with_resolver_async(
+    let result = match rebuild_from_raw_with_resolver_async(
         raw_config.clone(),
         resolver_slot,
         providers,
@@ -2263,7 +2336,7 @@ async fn put_configs(
         Err(e) => {
             if force {
                 tracing::error!("config reload forced despite validation error: {e}");
-                (Default::default(), Vec::new())
+                Default::default()
             } else {
                 return (
                     StatusCode::BAD_REQUEST,
@@ -2273,6 +2346,12 @@ async fn put_configs(
             }
         }
     };
+    let meow_config::RebuildResult {
+        proxies,
+        rules,
+        dialer_registry,
+        rule_providers,
+    } = result;
 
     // Issue #514: rebuild the DNS runtime too when its inputs changed —
     // failing here rejects the PUT before `reload_routing` publishes
@@ -2283,8 +2362,9 @@ async fn put_configs(
         &raw_config,
         &state.config_path,
         &proxies,
-        &state.rule_providers,
+        Some(&rule_providers),
         Some(state.tunnel.resolver()),
+        Some(&dialer_registry),
     )
     .await
     {
@@ -2305,15 +2385,30 @@ async fn put_configs(
         .mode
         .as_deref()
         .and_then(|mode| mode.parse().ok());
-    let dropped = state.tunnel.reload_routing(proxies, rules, mode);
+    // Snapshot the resolver being replaced BEFORE the early install — the
+    // TUN reconcile compares its fake-IP inputs against the new
+    // generation's (issue #533 review).
+    let prior_resolver = state.tunnel.resolver();
+    // Same early-install as the warm path: `reload_routing` drops the old
+    // route table — and its registry cell — before `publish_dns` runs below.
+    if let Some(dns) = &dns {
+        state.tunnel.set_resolver(Arc::clone(&dns.resolver));
+    }
+    let dropped = state
+        .tunnel
+        .reload_routing(proxies, rules, mode, dialer_registry);
     if dropped > 0 {
         tracing::warn!(
             connections_dropped = dropped,
             "connection closure requested for cold reload"
         );
     }
+    // Commit point: install the candidate's provider set — the rules and
+    // DNS `rule-set:` matchers above already reference these Arcs
+    // (issue #533 review).
+    *state.rule_providers.write() = rule_providers;
 
-    swap_config_and_reconcile_tun(&state, raw_config, dns).await;
+    swap_config_and_reconcile_tun(&state, raw_config, dns, prior_resolver).await;
 
     StatusCode::NO_CONTENT.into_response()
 }
@@ -3011,5 +3106,90 @@ mod tests {
         assert_eq!(parse_connections_interval(Some("101")), Some(101));
         assert_eq!(parse_connections_interval(Some("5000")), Some(5000));
         assert_eq!(parse_connections_interval(None), Some(1000));
+    }
+
+    /// Issue #533: a `#name` nameserver captures adapters whose registry
+    /// generation dies with every route swap, and a `rule-set:` policy key
+    /// captures provider Arcs whose identity dies when the commit swaps
+    /// `state.rule_providers` — a retained resolver would keep matching
+    /// against orphaned objects. When either ref exists the resolver must
+    /// rebuild on EVERY commit; "unchanged" is only valid without them
+    /// (issue #533 review).
+    #[test]
+    fn runtime_refs_force_dns_rebuild_on_identical_inputs() {
+        let raw_with_tag: RawConfig =
+            serde_yaml::from_str("dns:\n  enable: true\n  nameserver:\n    - tcp://1.1.1.1#P\n")
+                .unwrap();
+        // Identical raw on both sides — dns_inputs_equal says unchanged, but
+        // the proxy ref must override (its adapters' cell died in the swap).
+        assert!(dns_inputs_equal(&raw_with_tag, &raw_with_tag));
+        assert!(dns_uses_proxy_refs(&raw_with_tag));
+
+        let unchanged = dns_inputs_equal(&raw_with_tag, &raw_with_tag)
+            && !dns_uses_runtime_refs(&raw_with_tag)
+            && !dns_uses_runtime_refs(&raw_with_tag);
+        assert!(!unchanged, "a `#name` nameserver must force a rebuild");
+
+        // rule-set: policy refs also force a rebuild — the matcher holds
+        // provider Arcs that must track the committed generation's set.
+        let raw_with_ruleset: RawConfig = serde_yaml::from_str(
+            "dns:\n  enable: true\n  nameserver-policy:\n    'rule-set:cn':\n      - 223.5.5.5\nrule-providers:\n  cn:\n    type: inline\n    behavior: domain\n    payload: [example.cn]\n",
+        )
+        .unwrap();
+        assert!(!dns_uses_proxy_refs(&raw_with_ruleset));
+        assert!(dns_uses_runtime_refs(&raw_with_ruleset));
+        let unchanged = dns_inputs_equal(&raw_with_ruleset, &raw_with_ruleset)
+            && !dns_uses_runtime_refs(&raw_with_ruleset)
+            && !dns_uses_runtime_refs(&raw_with_ruleset);
+        assert!(!unchanged, "a `rule-set:` policy ref must force a rebuild");
+
+        let raw_plain: RawConfig =
+            serde_yaml::from_str("dns:\n  enable: true\n  nameserver:\n    - 223.5.5.5\n").unwrap();
+        assert!(!dns_uses_runtime_refs(&raw_plain));
+        assert!(
+            dns_inputs_equal(&raw_plain, &raw_plain)
+                && !dns_uses_runtime_refs(&raw_plain)
+                && !dns_uses_runtime_refs(&raw_plain)
+        );
+    }
+
+    /// Issue #533 review: `swap_config_and_reconcile_tun` compares the TUN
+    /// listener's fake-IP inputs against the resolver generation being
+    /// REPLACED — captured before the caller's early `set_resolver`. Reading
+    /// `tunnel.resolver()` at that point would see the new generation and
+    /// `fake_ip_changed` could never fire. Pin the building blocks: the
+    /// comparison reads `prior_resolver`'s accessors, and a changed pool
+    /// range must compare unequal.
+    #[test]
+    fn fake_ip_inputs_come_from_the_prior_resolver() {
+        let mk = |net: &str| {
+            let mut r = meow_dns::Resolver::new(
+                vec![],
+                vec![],
+                meow_common::DnsMode::FakeIp,
+                meow_trie::DomainTrie::new(),
+                true,
+                true,
+            );
+            r.set_fakeip_v4(Arc::new(
+                meow_dns::Pool::new(
+                    net.parse().unwrap(),
+                    Arc::new(meow_dns::MemoryStore::new(1024)),
+                )
+                .unwrap(),
+            ));
+            r
+        };
+        let prior = mk("198.18.0.0/16");
+        let candidate_same = mk("198.18.0.0/16");
+        let candidate_changed = mk("198.19.0.0/16");
+
+        let inputs = |r: &meow_dns::Resolver| (r.fake_ip_v4_net(), r.fake_ip_v4_gateway());
+        assert_eq!(inputs(&prior), inputs(&candidate_same));
+        assert_ne!(
+            inputs(&prior),
+            inputs(&candidate_changed),
+            "a fake-IP range change must be visible across generations"
+        );
     }
 }

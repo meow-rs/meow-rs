@@ -39,8 +39,9 @@ fn load_fixture_rules() -> Vec<Box<dyn Rule>> {
         .expect("fixture config merge keys must expand");
     let raw: RawConfig =
         serde_yaml::from_value(value).expect("fixture config must deserialize as RawConfig");
-    let (_, rules) =
-        meow_config::rebuild_from_raw(&raw).expect("fixture config rules must rebuild");
+    let rules = meow_config::rebuild_from_raw(&raw)
+        .expect("fixture config rules must rebuild")
+        .rules;
     assert_eq!(rules.len(), 19, "fixture rule count changed");
     rules
 }

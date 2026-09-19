@@ -74,6 +74,10 @@ pub struct Config {
     pub proxy_providers: HashMap<String, Arc<ProxyProvider>>,
     pub rules: Vec<Box<dyn Rule>>,
     pub rule_providers: HashMap<String, Arc<rule_provider::RuleProvider>>,
+    /// The `dialer-proxy` registry generation `proxies` was published into.
+    /// Hand it to `Tunnel::update_routing` so the route table retains it —
+    /// chained adapters resolve through it weakly (issue #533).
+    pub dialer_registry: meow_proxy::dialer::ProxyRegistry,
     pub listeners: ListenerConfig,
     pub tun: TunConfig,
     pub api: ApiConfig,
@@ -486,15 +490,46 @@ pub async fn save_raw_config_async(path: &str, raw: &raw::RawConfig) -> Result<(
     Ok(())
 }
 
-/// The result of rebuilding proxies and rules from a RawConfig.
-pub type RebuildResult = (HashMap<SmolStr, Arc<dyn Proxy>>, Vec<Box<dyn Rule>>);
+/// The result of rebuilding proxies and rules from a RawConfig: the proxy
+/// map, the rule list, and the [`meow_proxy::dialer::ProxyRegistry`] the
+/// build published into.
+///
+/// The registry must reach every long-lived owner of this build's adapters
+/// (`Tunnel::update_routing` / `reload_routing` take it for the route table;
+/// rule-provider fetch contexts retain a clone internally) — chained
+/// `dialer-proxy` adapters hold it weakly, so dropping it makes their dials
+/// fail closed (issue #533).
+#[derive(Default)]
+pub struct RebuildResult {
+    pub proxies: HashMap<SmolStr, Arc<dyn Proxy>>,
+    pub rules: Vec<Box<dyn Rule>>,
+    pub dialer_registry: meow_proxy::dialer::ProxyRegistry,
+    /// The rule-provider set parsed for this generation — shared by the
+    /// rules, any DNS `rule-set:` policy matchers, and (once the caller
+    /// commits) the live provider registry. The committing caller swaps it
+    /// into `state.rule_providers` only *after* every fallible check has
+    /// passed: a rejected candidate must never leave its provider objects
+    /// live, since their fetch contexts pin this generation's dialer cell
+    /// (issue #533 review).
+    pub rule_providers: HashMap<String, Arc<rule_provider::RuleProvider>>,
+}
 
 /// Rebuild proxies and rules from a RawConfig (used for runtime updates).
 ///
 /// Does not resolve rule-provider cache paths; use
 /// [`rebuild_from_raw_with_cache_dir`] when a working directory is available.
 pub fn rebuild_from_raw(raw: &raw::RawConfig) -> Result<RebuildResult, anyhow::Error> {
-    rebuild_from_raw_impl(raw, None, None, &HashMap::new(), None, None, None)
+    rebuild_from_raw_impl(
+        raw,
+        None,
+        None,
+        &HashMap::new(),
+        None,
+        None,
+        None,
+        &meow_proxy::dialer::ProxyRegistry::default(),
+        None,
+    )
 }
 
 /// Rebuild proxies/rules and inject `resolver` into the built-in DIRECT
@@ -511,19 +546,44 @@ pub fn rebuild_from_raw(raw: &raw::RawConfig) -> Result<RebuildResult, anyhow::E
 /// untrusted candidate, so relative rule-provider `path`s must keep
 /// resolving the same way they did at startup instead of hard-failing
 /// (issue #429 follow-up).
+///
+/// The result's [`RebuildResult::rule_providers`] carries this build's
+/// provider set — a committing caller swaps it into the live registry
+/// *after* all validation has passed (issue #533 review).
+///
+/// `shared_rule_providers` binds an already-loaded provider set into the
+/// build instead of parsing `raw.rule_providers` fresh: rules-only
+/// refreshes (geodata fetch/auto-update) pass a snapshot of the LIVE
+/// registry so the rebuilt `RULE-SET` rules keep referencing the same
+/// provider objects the API mutates, rather than a parallel set that
+/// would diverge on the next refresh (issue #533 review). Committing
+/// callers pass `None` — their candidate set must load fresh so a
+/// rejected build never aliases live state.
 pub fn rebuild_from_raw_with_resolver(
     raw: &raw::RawConfig,
     resolver: Option<meow_dns::ResolverSlot>,
     cache_dir: Option<&Path>,
+    shared_rule_providers: Option<HashMap<String, Arc<rule_provider::RuleProvider>>>,
 ) -> Result<RebuildResult, anyhow::Error> {
-    rebuild_from_raw_impl(raw, cache_dir, resolver, &HashMap::new(), None, None, None)
+    rebuild_from_raw_impl(
+        raw,
+        cache_dir,
+        resolver,
+        &HashMap::new(),
+        None,
+        None,
+        None,
+        &meow_proxy::dialer::ProxyRegistry::default(),
+        shared_rule_providers,
+    )
 }
 
 /// Runtime rebuild variant that keeps live proxy-provider slots and the
 /// process-wide selection store wired into rebuilt groups.
 ///
 /// See [`rebuild_from_raw_with_resolver`] for why `cache_dir` must be the
-/// startup provider-cache directory rather than `None`.
+/// startup provider-cache directory rather than `None`, and for the
+/// [`RebuildResult::rule_providers`] commit contract (issue #533 review).
 pub fn rebuild_from_raw_runtime(
     raw: &raw::RawConfig,
     resolver: Option<meow_dns::ResolverSlot>,
@@ -539,6 +599,8 @@ pub fn rebuild_from_raw_runtime(
         store.as_ref(),
         None,
         None,
+        &meow_proxy::dialer::ProxyRegistry::default(),
+        None,
     )
 }
 
@@ -550,7 +612,17 @@ pub fn rebuild_from_raw_with_cache_dir(
     cache_dir: Option<&Path>,
     resolver: Option<meow_dns::ResolverSlot>,
 ) -> Result<RebuildResult, anyhow::Error> {
-    rebuild_from_raw_impl(raw, cache_dir, resolver, &HashMap::new(), None, None, None)
+    rebuild_from_raw_impl(
+        raw,
+        cache_dir,
+        resolver,
+        &HashMap::new(),
+        None,
+        None,
+        None,
+        &meow_proxy::dialer::ProxyRegistry::default(),
+        None,
+    )
 }
 
 /// Parse a raw config's `dns:` section into a runnable [`DnsConfig`] with
@@ -577,30 +649,43 @@ pub fn rebuild_from_raw_with_cache_dir(
 /// the fake-IP pool when the range and store identity (in-memory vs the
 /// same backing file) are unchanged (issue #514 review follow-up).
 /// `None` on cold start.
+/// `dialer_registry` is the registry generation `proxy_registry` was built
+/// from — provider fetch contexts retain it so a chained download adapter
+/// keeps resolving after later rebuilds (issue #533).
+/// `rule_providers` is the provider set built alongside `proxy_registry` —
+/// DNS `rule-set:` policy matchers clone these Arcs so one provider object
+/// is shared by the rules, the matchers, and the live registry the caller
+/// commits (issue #533 review). `None` loads `raw.rule_providers`
+/// standalone (callers that never wired a rebuild, e.g. tests).
 pub async fn parse_dns_from_raw(
     raw: &raw::RawConfig,
     cache_dir: Option<&Path>,
     proxy_registry: &HashMap<SmolStr, Arc<dyn Proxy>>,
-    registry: Option<&parking_lot::RwLock<HashMap<String, Arc<rule_provider::RuleProvider>>>>,
+    rule_providers: Option<&HashMap<String, Arc<rule_provider::RuleProvider>>>,
     prior_resolver: Option<&meow_dns::Resolver>,
+    dialer_registry: Option<&meow_proxy::dialer::ProxyRegistry>,
 ) -> Result<DnsConfig, anyhow::Error> {
     let geo = geodata::parse_geodata(raw.geodata.as_ref())?;
     let payloads = rule_provider::PrefetchedPayloads::default();
     let ctx = build_parser_context_from_raw(raw, &payloads)?;
     let rule_providers = if dns_parser::dns_needs_rule_providers(raw) {
-        Some(
-            load_rule_providers_async(
-                raw.rule_providers.clone().unwrap_or_default(),
-                cache_dir.map(Path::to_path_buf),
-                ctx.clone(),
-                internal_http::first_named_proxy(raw.proxies.as_deref(), proxy_registry),
-                proxy_registry.clone(),
-                Arc::new(payloads),
-            )
-            .await?,
-        )
+        match rule_providers {
+            Some(shared) => shared.clone(),
+            None => {
+                load_rule_providers_async(
+                    raw.rule_providers.clone().unwrap_or_default(),
+                    cache_dir.map(Path::to_path_buf),
+                    ctx.clone(),
+                    internal_http::first_named_proxy(raw.proxies.as_deref(), proxy_registry),
+                    proxy_registry.clone(),
+                    Arc::new(payloads),
+                    dialer_registry.cloned(),
+                )
+                .await?
+            }
+        }
     } else {
-        None
+        HashMap::new()
     };
     let dns = dns_parser::parse_dns(
         raw,
@@ -608,13 +693,10 @@ pub async fn parse_dns_from_raw(
         cache_dir,
         proxy_registry,
         ctx.geosite,
-        rule_providers.as_ref().unwrap_or(&HashMap::new()),
+        &rule_providers,
         prior_resolver,
     )
     .await?;
-    if let (Some(registry), Some(loaded)) = (registry, rule_providers) {
-        *registry.write() = loaded;
-    }
     Ok(dns)
 }
 
@@ -744,7 +826,7 @@ fn apply_dialer_proxies(
     // Apply the edges. Order no longer matters — the front hop is resolved at
     // dial time — so nested chains need no deepest-first deferral pass.
     for (name, dialer) in &edges {
-        let target = meow_proxy::dialer::DialerTarget::new(dialer.clone(), registry.clone());
+        let target = meow_proxy::dialer::DialerTarget::new(dialer.clone(), registry);
         // `rev()` matters: the registry-building loop above uses `insert`, so
         // for a config with duplicate `name:` entries the *last* block wins. A
         // forward `find` here would resurrect the *first* block and silently
@@ -978,6 +1060,11 @@ fn has_unresolved_group_dependency(
     })
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the rebuild passes every stage of one config build through; \
+              bundling them would only rename the same list"
+)]
 fn rebuild_from_raw_impl(
     raw: &raw::RawConfig,
     cache_dir: Option<&Path>,
@@ -986,13 +1073,21 @@ fn rebuild_from_raw_impl(
     selector_store: Option<&Arc<meow_proxy::SelectorStore>>,
     shared_ctx: Option<&meow_rules::ParserContext>,
     prefetched_payloads: Option<&rule_provider::PrefetchedPayloads>,
+    // `dialer-proxy` front hops are resolved by name against this registry on
+    // every dial; it is published once the build below has finished. The
+    // caller supplies the cell so a multi-pass build (startup) can share one
+    // registry generation across passes; it is returned in [`RebuildResult`]
+    // so the generation owner can retain it (issue #533).
+    registry: &meow_proxy::dialer::ProxyRegistry,
+    // An already-loaded provider set to bind into this build (startup's
+    // two-pass build shares the set it loaded for DNS so rules, DNS
+    // `rule-set:` matchers, and `Config.rule_providers` all reference one
+    // object per provider). `None` = parse `raw.rule_providers` fresh.
+    shared_providers: Option<HashMap<String, Arc<rule_provider::RuleProvider>>>,
 ) -> Result<RebuildResult, anyhow::Error> {
     let ipv6 = effective_ipv6(raw.ipv6);
     let mut proxies: HashMap<SmolStr, Arc<dyn Proxy>> = HashMap::new();
     let mut static_proxy_names = std::collections::HashSet::new();
-    // `dialer-proxy` front hops are resolved by name against this registry on
-    // every dial; it is published once the build below has finished.
-    let registry = meow_proxy::dialer::ProxyRegistry::default();
     // Built-in proxies
     let mut direct = meow_proxy::DirectAdapter::new();
     if let Some(mark) = raw.routing_mark {
@@ -1052,7 +1147,7 @@ fn rebuild_from_raw_impl(
         &mut proxies,
         raw.proxies.as_deref().unwrap_or(&[]),
         raw_groups,
-        &registry,
+        registry,
         ipv6,
     )?;
 
@@ -1256,7 +1351,8 @@ fn rebuild_from_raw_impl(
     // dial through `download_proxy`, which may itself be a chained node whose
     // front hop must already resolve. A later rebuild publishes into its own
     // registry, so adapters already handed to the tunnel keep resolving the
-    // snapshot they were built from.
+    // snapshot they were built from — while the owning generation is still
+    // retained (the cell is only held weakly by the adapters, issue #533).
     registry.publish(Arc::new(proxies.clone()));
 
     let download_proxy = internal_http::first_named_proxy(raw.proxies.as_deref(), &proxies);
@@ -1306,16 +1402,20 @@ fn rebuild_from_raw_impl(
         }
     };
 
-    let providers = match raw.rule_providers.as_ref() {
-        Some(map) if !map.is_empty() => rule_provider::load_providers_prefetched(
-            map,
-            cache_dir,
-            ctx,
-            download_proxy.as_ref(),
-            &registry_lookup,
-            payloads,
-        ),
-        _ => HashMap::new(),
+    let providers = match shared_providers {
+        Some(shared) => shared,
+        None => match raw.rule_providers.as_ref() {
+            Some(map) if !map.is_empty() => rule_provider::load_providers_prefetched(
+                map,
+                cache_dir,
+                ctx,
+                download_proxy.as_ref(),
+                &registry_lookup,
+                payloads,
+                Some(registry),
+            ),
+            _ => HashMap::new(),
+        },
     };
     let ruleset_map = rule_provider::live_ruleset_map(&providers);
 
@@ -1348,7 +1448,16 @@ fn rebuild_from_raw_impl(
         }
     }
 
-    Ok((proxies, rules))
+    // The provider set is returned, not swapped: the committing caller
+    // publishes it into the live registry only after every fallible check
+    // has passed, so a rejected candidate never leaves its fetch contexts
+    // (and their pinned dialer cell) live (issue #533 review).
+    Ok(RebuildResult {
+        proxies,
+        rules,
+        dialer_registry: registry.clone(),
+        rule_providers: providers,
+    })
 }
 
 async fn open_selector_store_async(
@@ -1413,6 +1522,11 @@ async fn prefetch_rule_provider_payloads_async(
     })
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors rebuild_from_raw_impl, which stays one argument list \
+              per build stage"
+)]
 async fn rebuild_from_raw_impl_async(
     raw: raw::RawConfig,
     cache_dir: Option<PathBuf>,
@@ -1421,6 +1535,14 @@ async fn rebuild_from_raw_impl_async(
     selector_store: Option<Arc<meow_proxy::SelectorStore>>,
     ctx: meow_rules::ParserContext,
     provider_payloads: Arc<rule_provider::PrefetchedPayloads>,
+    // Caller's registry cell — shared across a multi-pass build so pass-1
+    // adapters retained elsewhere (DNS `#PROXY` handles, provider fetch
+    // contexts) resolve the latest published snapshot (issue #533).
+    registry: meow_proxy::dialer::ProxyRegistry,
+    // Startup's pass-2 shares the provider set already loaded for DNS so
+    // rules, `rule-set:` matchers, and `Config.rule_providers` reference one
+    // object per provider (issue #533 review). `None` = load fresh.
+    shared_providers: Option<HashMap<String, Arc<rule_provider::RuleProvider>>>,
 ) -> Result<RebuildResult, anyhow::Error> {
     spawn_blocking_with_current_dispatcher(move || {
         rebuild_from_raw_impl(
@@ -1431,6 +1553,8 @@ async fn rebuild_from_raw_impl_async(
             selector_store.as_ref(),
             Some(&ctx),
             Some(&provider_payloads),
+            &registry,
+            shared_providers,
         )
     })
     .await
@@ -1444,6 +1568,10 @@ async fn load_rule_providers_async(
     download_proxy: Option<Arc<dyn Proxy>>,
     registry: HashMap<SmolStr, Arc<dyn Proxy>>,
     provider_payloads: Arc<rule_provider::PrefetchedPayloads>,
+    // Retained inside each provider's fetch context so a chained download
+    // adapter keeps resolving its `dialer-proxy` front hop on refreshes that
+    // outlive this route generation (issue #533).
+    dialer_registry: Option<meow_proxy::dialer::ProxyRegistry>,
 ) -> Result<HashMap<String, Arc<rule_provider::RuleProvider>>, anyhow::Error> {
     spawn_blocking_with_current_dispatcher(move || {
         let lookup = |name: &str| registry.get(name).cloned();
@@ -1454,6 +1582,7 @@ async fn load_rule_providers_async(
             download_proxy.as_ref(),
             &lookup,
             &provider_payloads,
+            dialer_registry.as_ref(),
         )
     })
     .await
@@ -2325,6 +2454,13 @@ async fn build_config(
     //   3. Rebuild proxies with the real resolver attached. The two
     //      passes only differ in DIRECT's resolver field; nothing else
     //      depends on the placeholder built in step 1.
+    //
+    // Both passes publish into ONE shared `dialer-proxy` registry: pass-1
+    // adapters are retained by the DNS resolver (`#PROXY` nameservers) and
+    // by rule-provider fetch contexts for the app's whole first generation,
+    // and the shared cell lets them resolve the pass-2 snapshot rather than
+    // a stale pass-1 map (issue #533).
+    let dialer_registry = meow_proxy::dialer::ProxyRegistry::default();
     // Open the persistent selector store (one JSON file in cache_dir).
     // Missing/unreadable files yield an empty store — no fatal errors.
     let cache_dir_buf = cache_dir.map(Path::to_path_buf);
@@ -2356,16 +2492,21 @@ async fn build_config(
     )
     .await?;
 
-    let (proxies, _) = rebuild_from_raw_impl_async(
-        raw.clone(),
-        cache_dir_buf.clone(),
-        None,
-        proxy_providers.clone(),
-        selector_store.clone(),
-        ctx.clone(),
-        Arc::clone(&provider_payloads),
-    )
-    .await?;
+    let (proxies, _, _) = {
+        let res = rebuild_from_raw_impl_async(
+            raw.clone(),
+            cache_dir_buf.clone(),
+            None,
+            proxy_providers.clone(),
+            selector_store.clone(),
+            ctx.clone(),
+            Arc::clone(&provider_payloads),
+            dialer_registry.clone(),
+            None,
+        )
+        .await?;
+        (res.proxies, res.rules, res.dialer_registry)
+    };
 
     // Load rule-providers before DNS so that `nameserver-policy` `rule-set:`
     // entries can resolve against them. This uses the step-1 proxy registry;
@@ -2381,6 +2522,7 @@ async fn build_config(
                 download_proxy,
                 proxies.clone(),
                 Arc::clone(&provider_payloads),
+                Some(dialer_registry.clone()),
             )
             .await?
         }
@@ -2401,16 +2543,24 @@ async fn build_config(
     )
     .await?;
 
-    let (proxies, rules) = rebuild_from_raw_impl_async(
-        raw.clone(),
-        cache_dir_buf.clone(),
-        Some(Arc::clone(&dns_config.resolver_slot)),
-        proxy_providers.clone(),
-        selector_store.clone(),
-        ctx.clone(),
-        Arc::clone(&provider_payloads),
-    )
-    .await?;
+    let (proxies, rules, _) = {
+        let res = rebuild_from_raw_impl_async(
+            raw.clone(),
+            cache_dir_buf.clone(),
+            Some(Arc::clone(&dns_config.resolver_slot)),
+            proxy_providers.clone(),
+            selector_store.clone(),
+            ctx.clone(),
+            Arc::clone(&provider_payloads),
+            dialer_registry.clone(),
+            // Share the provider set already loaded for DNS so rules,
+            // `rule-set:` matchers, and `Config.rule_providers` reference
+            // one object per provider (issue #533 review).
+            Some(rule_providers.clone()),
+        )
+        .await?;
+        (res.proxies, res.rules, res.dialer_registry)
+    };
 
     // Listener config
     let bind_addr = if general.allow_lan {
@@ -2489,6 +2639,7 @@ async fn build_config(
         proxy_providers,
         rules,
         rule_providers,
+        dialer_registry,
         listeners,
         tun,
         api,
@@ -2547,10 +2698,13 @@ mod dialer_proxy_tests {
     /// Run the dialer pass against a fresh by-name registry and publish it on
     /// success, the way `rebuild_from_raw_impl` does — without the publish the
     /// chained adapters cannot resolve their front hop at dial time.
+    ///
+    /// Returns the registry: `DialerTarget`s hold it weakly (issue #533), so a
+    /// test that actually dials must keep the handle alive for the duration.
     fn apply_chains(
         proxies: &mut HashMap<SmolStr, Arc<dyn Proxy>>,
         raw_proxies: &[HashMap<String, serde_yaml::Value>],
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<meow_proxy::dialer::ProxyRegistry, anyhow::Error> {
         apply_chains_with_groups(proxies, raw_proxies, &[])
     }
 
@@ -2563,7 +2717,7 @@ mod dialer_proxy_tests {
         proxies: &mut HashMap<SmolStr, Arc<dyn Proxy>>,
         raw_proxies: &[HashMap<String, serde_yaml::Value>],
         raw_groups: &[raw::RawProxyGroup],
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<meow_proxy::dialer::ProxyRegistry, anyhow::Error> {
         let registry = meow_proxy::dialer::ProxyRegistry::default();
         let edges = apply_dialer_proxies(proxies, raw_proxies, raw_groups, &registry, true)?;
         for group in raw_groups {
@@ -2585,7 +2739,52 @@ mod dialer_proxy_tests {
             global_auto_created,
         )?;
         registry.publish(Arc::new(proxies.clone()));
-        Ok(())
+        Ok(registry)
+    }
+
+    /// The original #533 bug was a strong `registry → snapshot → adapter →
+    /// registry` cycle: every rebuild leaked the whole prior route table.
+    /// A dropped build must now free the cell — under the old edge the
+    /// adapter's strong `Arc` kept the cell alive, so this upgrade would
+    /// stay `Some` forever.
+    #[test]
+    fn dropped_build_leaves_no_registry_cycle() {
+        let raw: raw::RawConfig = serde_yaml::from_str(
+            "proxies:\n  - name: A\n    type: direct\n    dialer-proxy: B\n  - name: B\n    type: direct\n",
+        )
+        .unwrap();
+        let result = rebuild_from_raw(&raw).unwrap();
+        let weak = result.dialer_registry.downgrade();
+        let proxies = result.proxies;
+        drop(proxies);
+        drop(result.dialer_registry);
+        assert!(
+            weak.upgrade().is_none(),
+            "a strong adapter->registry edge would pin the dead generation"
+        );
+    }
+
+    /// Startup's two-pass build shares one registry cell (issue #533): a
+    /// `DialerTarget` bound by pass-1 resolves the *latest* published
+    /// snapshot, which is what lets pass-1 adapters retained by DNS
+    /// `#PROXY` nameservers and provider fetch contexts keep working.
+    #[test]
+    fn shared_registry_republishes_the_latest_snapshot() {
+        let reg = meow_proxy::dialer::ProxyRegistry::default();
+        let target = meow_proxy::dialer::DialerTarget::new("B", &reg);
+
+        reg.publish(Arc::new(registry(&["B"])));
+        let gen1 = target.resolve().expect("gen-1 published");
+        reg.publish(Arc::new(registry(&["B", "C"])));
+        let gen2 = target.resolve().expect("gen-2 republished");
+        assert!(
+            !Arc::ptr_eq(&gen1, &gen2),
+            "republish must hand out the new generation's adapter"
+        );
+        assert!(
+            target.name() == "B" && reg.downgrade().upgrade().is_some(),
+            "the handle stays live while retained"
+        );
     }
 
     #[test]
@@ -3134,7 +3333,11 @@ mod dialer_proxy_tests {
             proxy_parser::parse_proxy(&raw_inner, true).expect("parse inner"),
         );
 
-        apply_chains(&mut proxies, &[raw_front, raw_inner]).expect("valid chain applies");
+        // Keep the registry alive across the dial: `inner`'s front-hop target
+        // resolves through it weakly (issue #533), so dropping it here would
+        // fail the dial closed before `front` is ever contacted.
+        let _dialer_registry =
+            apply_chains(&mut proxies, &[raw_front, raw_inner]).expect("valid chain applies");
 
         // Dial a final target through `inner`; `inner` must reach its own
         // server (127.0.0.1:inner_port) *via* `front`.
@@ -3885,18 +4088,82 @@ rules:
 
         // `rebuild_from_raw_with_resolver` — used by subscription_refresh
         // and geodata_fetch.
-        let (_, rules) = rebuild_from_raw_with_resolver(&raw, None, Some(dir.path())).expect(
+        let result = rebuild_from_raw_with_resolver(&raw, None, Some(dir.path()), None).expect(
             "trusted rebuild with the real cache dir must not hard-fail on a file provider",
         );
-        assert_eq!(rules.len(), 2);
+        assert_eq!(result.rules.len(), 2);
 
         // `rebuild_from_raw_runtime` — used by meow-api's `PUT /configs`
         // family via `rebuild_from_raw_with_resolver_async`.
-        let (_, rules) = rebuild_from_raw_runtime(&raw, None, &HashMap::new(), Some(dir.path()))
+        let result = rebuild_from_raw_runtime(&raw, None, &HashMap::new(), Some(dir.path()))
             .expect(
             "trusted runtime rebuild with the real cache dir must not hard-fail on a file provider",
         );
-        assert_eq!(rules.len(), 2);
+        assert_eq!(result.rules.len(), 2);
+    }
+
+    /// Issue #533 review: the live rule-provider registry must follow the
+    /// committed build — a startup-era provider retained forever would keep
+    /// downloading through its own pinned dialer-registry cell even after a
+    /// `PUT /configs` rotated or removed the download proxy. The rebuild
+    /// therefore RETURNS the candidate provider set on `RebuildResult`;
+    /// committing callers swap it into the live registry only after every
+    /// validation has passed, so a rejected build never mutates live state.
+    #[test]
+    fn rebuild_returns_the_candidate_rule_provider_set() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("ads.yaml"),
+            "payload:\n  - '+.ads.example'\n",
+        )
+        .unwrap();
+        let raw: raw::RawConfig = serde_yaml::from_str(
+            r#"
+rule-providers:
+  ads:
+    type: file
+    behavior: domain
+    format: yaml
+    path: ads.yaml
+rules:
+  - RULE-SET,ads,REJECT
+  - "MATCH,DIRECT"
+"#,
+        )
+        .unwrap();
+        let live: parking_lot::RwLock<HashMap<String, Arc<rule_provider::RuleProvider>>> =
+            parking_lot::RwLock::new(HashMap::new());
+
+        // Commit path: swap the returned set in after validation succeeds.
+        let result =
+            rebuild_from_raw_with_resolver(&raw, None, Some(dir.path()), None).expect("rebuild ok");
+        *live.write() = result.rule_providers;
+        assert!(live.read().contains_key("ads"));
+
+        // A candidate that drops `rule-providers:` empties the registry.
+        let raw_bare: raw::RawConfig =
+            serde_yaml::from_str("rules:\n  - \"MATCH,DIRECT\"\n").unwrap();
+        let result = rebuild_from_raw_with_resolver(&raw_bare, None, Some(dir.path()), None)
+            .expect("rebuild ok");
+        *live.write() = result.rule_providers;
+        assert!(live.read().is_empty());
+
+        // A failing build returns Err — the caller never commits, so the
+        // live registry (seeded above via a good build) stays untouched.
+        let raw_ok: raw::RawConfig = serde_yaml::from_str(
+            "rule-providers:\n  ads:\n    type: file\n    behavior: domain\n    format: yaml\n    path: ads.yaml\nrules:\n  - RULE-SET,ads,REJECT\n  - \"MATCH,DIRECT\"\n",
+        )
+        .unwrap();
+        let result = rebuild_from_raw_with_resolver(&raw_ok, None, Some(dir.path()), None)
+            .expect("rebuild ok");
+        *live.write() = result.rule_providers;
+        let raw_bad: raw::RawConfig =
+            serde_yaml::from_str("rules:\n  - SUB-RULE,(MATCH,DIRECT),missing\n").unwrap();
+        assert!(rebuild_from_raw_with_resolver(&raw_bad, None, Some(dir.path()), None).is_err());
+        assert!(
+            live.read().contains_key("ads"),
+            "a failed rebuild must leave the live provider registry untouched"
+        );
     }
 
     #[test]

@@ -62,11 +62,8 @@ fn test_rule_tunnel() -> meow_tunnel::Tunnel {
         true,
     ));
     let tunnel = meow_tunnel::Tunnel::new(resolver);
-    tunnel.update_proxies(
-        meow_config::rebuild_from_raw(&Default::default())
-            .unwrap()
-            .0,
-    );
+    let res = meow_config::rebuild_from_raw(&Default::default()).unwrap();
+    tunnel.update_proxies(res.proxies, res.dialer_registry);
     tunnel.update_rules(vec![Box::new(meow_rules::final_rule::FinalRule::new(
         "REJECT",
     ))]);

@@ -12,7 +12,9 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Weak};
+
+use parking_lot::RwLock;
 
 use async_trait::async_trait;
 use meow_common::{ConnType, Metadata, Network, Proxy, ProxyConn};
@@ -175,6 +177,11 @@ impl TcpDialer for ProxyDialer {
 /// `dialer-proxy` bound from it.
 pub type ProxySnapshot = Arc<HashMap<SmolStr, Arc<dyn Proxy>>>;
 
+/// Shared cell a [`ProxyRegistry`] publishes into and [`DialerTarget`]s
+/// resolve through. The cell is the *generation anchor*: keeping it alive
+/// keeps the published snapshot — and every adapter inside it — alive.
+pub type RegistryCell = RwLock<Option<ProxySnapshot>>;
+
 /// The proxies built from one config, published when the build completes and
 /// consulted by name on every chained dial.
 ///
@@ -183,9 +190,20 @@ pub type ProxySnapshot = Arc<HashMap<SmolStr, Arc<dyn Proxy>>>;
 /// freezes a stale entry instead: proxy groups clone their members before the
 /// dialer pass replaces them, and a group-valued dialer does not exist yet when
 /// the outbound chaining through it is built (issue #513).
+///
+/// # Ownership (issue #533)
+///
+/// [`DialerTarget`] holds the cell **weakly** — a strong edge would close
+/// `registry → snapshot → adapter → registry` into a reference cycle that
+/// leaks every superseded route generation. Whoever retains adapters built
+/// from a build must therefore also retain this handle for as long as those
+/// adapters may dial: the tunnel keeps it inside `RouteTable`, and provider
+/// fetch contexts keep a clone so a retained download adapter still resolves
+/// its front hop after later rebuilds. When the last handle drops, chained
+/// adapters of that generation fail closed at dial time.
 #[derive(Clone, Default)]
 pub struct ProxyRegistry {
-    proxies: Arc<RwLock<Option<ProxySnapshot>>>,
+    proxies: Arc<RegistryCell>,
 }
 
 impl ProxyRegistry {
@@ -193,11 +211,26 @@ impl ProxyRegistry {
     /// leaf proxy and group exists; a rebuild publishes into its own registry,
     /// so adapters from a previous config keep resolving their own snapshot.
     pub fn publish(&self, proxies: ProxySnapshot) {
-        *self.proxies.write().unwrap() = Some(proxies);
+        // Swap under the lock but drop the superseded snapshot — which runs
+        // every adapter destructor — outside it.
+        let old = self.proxies.write().replace(proxies);
+        drop(old);
     }
 
-    fn resolve(&self, name: &str) -> Option<Arc<dyn Proxy>> {
-        self.proxies.read().unwrap().as_ref()?.get(name).cloned()
+    /// The weak edge [`DialerTarget`] stores. An upgrade succeeds only while
+    /// some [`ProxyRegistry`] clone still owns the cell.
+    pub fn downgrade(&self) -> Weak<RegistryCell> {
+        Arc::downgrade(&self.proxies)
+    }
+}
+
+impl std::fmt::Debug for ProxyRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The snapshot holds `Arc<dyn Proxy>` handles — not Debug — so report
+        // only whether a generation is published, not its contents.
+        f.debug_struct("ProxyRegistry")
+            .field("published", &self.proxies.read().is_some())
+            .finish()
     }
 }
 
@@ -205,14 +238,14 @@ impl ProxyRegistry {
 #[derive(Clone)]
 pub struct DialerTarget {
     name: SmolStr,
-    registry: ProxyRegistry,
+    registry: Weak<RegistryCell>,
 }
 
 impl DialerTarget {
-    pub fn new(name: impl Into<SmolStr>, registry: ProxyRegistry) -> Self {
+    pub fn new(name: impl Into<SmolStr>, registry: &ProxyRegistry) -> Self {
         Self {
             name: name.into(),
-            registry,
+            registry: registry.downgrade(),
         }
     }
 
@@ -221,17 +254,32 @@ impl DialerTarget {
         &self.name
     }
 
-    /// `None` when the registry has not been published yet or no longer holds
-    /// the name. Callers must fail loudly — falling back to a direct dial would
-    /// leak past a chain the user configured for policy reasons.
+    /// `None` when the registry generation is gone, has not been published
+    /// yet, or no longer holds the name. Callers must fail loudly — falling
+    /// back to a direct dial would leak past a chain the user configured for
+    /// policy reasons.
     pub fn resolve(&self) -> Option<Arc<dyn Proxy>> {
-        self.registry.resolve(&self.name)
+        self.registry.upgrade().and_then(|cell| {
+            cell.read()
+                .as_ref()
+                .and_then(|map| map.get(&self.name).cloned())
+        })
     }
 
     /// Error for an unresolvable target, worded for the two error types the
-    /// chained dial paths report through.
+    /// chained dial paths report through. Distinguishes a name absent from a
+    /// live registry (config names a nonexistent hop — a config bug) from a
+    /// dropped generation (the route table that owned the cell was swapped —
+    /// a reload crossed an in-flight dial, issue #533).
     pub fn missing_error(&self) -> String {
-        format!("dialer-proxy '{}' is not in the proxy registry", self.name)
+        if self.registry.upgrade().is_none() {
+            format!(
+                "dialer-proxy '{}': registry generation dropped (config reloaded mid-dial)",
+                self.name
+            )
+        } else {
+            format!("dialer-proxy '{}' is not in the proxy registry", self.name)
+        }
     }
 }
 
@@ -427,5 +475,34 @@ mod tests {
         assert_eq!(meta.dst_port, 443);
 
         assert_eq!(mock.seen.lock().unwrap().len(), 3);
+    }
+
+    /// `DialerTarget` holds the registry cell weakly (issue #533): it resolves
+    /// while a `ProxyRegistry` clone keeps the generation alive and fails
+    /// closed once the last owner drops — the cycle the strong edge used to
+    /// pin forever now dies with its generation.
+    #[test]
+    fn target_resolves_while_owned_and_fails_closed_after_drop() {
+        let registry = ProxyRegistry::default();
+        let target = DialerTarget::new("front", &registry);
+        // Unpublished cell: alive but empty.
+        assert!(target.resolve().is_none());
+
+        let mut proxies: HashMap<SmolStr, Arc<dyn Proxy>> = HashMap::new();
+        proxies.insert(
+            SmolStr::from("front"),
+            Arc::new(CapturingProxy {
+                seen: Mutex::new(Vec::new()),
+            }),
+        );
+        registry.publish(Arc::new(proxies));
+        assert!(target.resolve().is_some());
+
+        // A clone keeps the cell alive; dropping one handle is not enough.
+        let retained = registry.clone();
+        drop(registry);
+        assert!(target.resolve().is_some());
+        drop(retained);
+        assert!(target.resolve().is_none());
     }
 }

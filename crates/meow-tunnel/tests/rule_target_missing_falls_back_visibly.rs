@@ -13,7 +13,7 @@ use meow_common::{AdapterType, DnsMode, Metadata, Network, Rule, TunnelMode};
 use meow_dns::Resolver;
 use meow_rules::final_rule::FinalRule;
 use meow_trie::DomainTrie;
-use meow_tunnel::Tunnel;
+use meow_tunnel::{ResolvedTarget, Tunnel};
 use std::sync::Arc;
 
 fn resolver() -> Arc<Resolver> {
@@ -31,9 +31,9 @@ fn resolver() -> Arc<Resolver> {
 /// the built-in DIRECT / REJECT / REJECT-DROP entries and nothing else.
 fn tunnel_with_builtin_registry() -> Tunnel {
     let tunnel = Tunnel::new(resolver());
-    let (proxies, _) = meow_config::rebuild_from_raw(&meow_config::raw::RawConfig::default())
+    let res = meow_config::rebuild_from_raw(&meow_config::raw::RawConfig::default())
         .expect("an empty config must build its built-in registry");
-    tunnel.update_proxies(proxies);
+    tunnel.update_proxies(res.proxies, res.dialer_registry);
     tunnel.set_mode(TunnelMode::Rule);
     tunnel
 }
@@ -60,7 +60,12 @@ fn tunnel_with_ghost_target() -> Tunnel {
 fn a_matched_rule_with_a_missing_target_is_skipped_to_the_tail() {
     let tunnel = tunnel_with_ghost_target();
 
-    let (proxy, rule, _payload) = tunnel
+    let ResolvedTarget {
+        adapter: proxy,
+        rule_name: rule,
+        rule_payload: _payload,
+        route: _route,
+    } = tunnel
         .inner()
         .resolve_proxy(&metadata())
         .expect("the no-match tail always resolves");
@@ -100,7 +105,12 @@ fn a_later_rule_still_matches_after_a_skipped_dead_target() {
     ];
     tunnel.update_rules(rules);
 
-    let (proxy, rule, _payload) = tunnel
+    let ResolvedTarget {
+        adapter: proxy,
+        rule_name: rule,
+        rule_payload: _payload,
+        route: _route,
+    } = tunnel
         .inner()
         .resolve_proxy(&metadata())
         .expect("the FINAL rule resolves");
@@ -118,7 +128,12 @@ async fn the_lazy_resolve_path_skips_the_same_way() {
     let tunnel = tunnel_with_ghost_target();
 
     let mut md = metadata();
-    let (proxy, rule, _payload) = tunnel
+    let ResolvedTarget {
+        adapter: proxy,
+        rule_name: rule,
+        rule_payload: _payload,
+        route: _route,
+    } = tunnel
         .inner()
         .resolve_proxy_lazy(&mut md)
         .await
@@ -138,7 +153,12 @@ fn a_target_the_registry_holds_is_used_as_is() {
     let rules: Vec<Box<dyn Rule>> = vec![Box::new(FinalRule::new("REJECT-DROP"))];
     tunnel.update_rules(rules);
 
-    let (proxy, _rule, _payload) = tunnel
+    let ResolvedTarget {
+        adapter: proxy,
+        rule_name: _rule,
+        rule_payload: _payload,
+        route: _route,
+    } = tunnel
         .inner()
         .resolve_proxy(&metadata())
         .expect("a MATCH rule always resolves");
@@ -161,7 +181,12 @@ fn a_rule_naming_direct_needs_no_registry_entry() {
     let rules: Vec<Box<dyn Rule>> = vec![Box::new(FinalRule::new("DIRECT"))];
     tunnel.update_rules(rules);
 
-    let (proxy, _rule, _payload) = tunnel
+    let ResolvedTarget {
+        adapter: proxy,
+        rule_name: _rule,
+        rule_payload: _payload,
+        route: _route,
+    } = tunnel
         .inner()
         .resolve_proxy(&metadata())
         .expect("a MATCH rule always resolves");
@@ -181,7 +206,12 @@ fn no_rule_matching_still_falls_through_to_direct() {
     let rules: Vec<Box<dyn Rule>> = vec![];
     tunnel.update_rules(rules);
 
-    let (proxy, rule, _payload) = tunnel
+    let ResolvedTarget {
+        adapter: proxy,
+        rule_name: rule,
+        rule_payload: _payload,
+        route: _route,
+    } = tunnel
         .inner()
         .resolve_proxy(&metadata())
         .expect("the no-match path still yields DIRECT");
@@ -201,10 +231,10 @@ fn udp_flow_skips_a_target_without_udp_support() {
     let yaml =
         "proxies:\n  - name: TCP-ONLY\n    type: http\n    server: 127.0.0.1\n    port: 8080\n";
     let raw: meow_config::raw::RawConfig = serde_yaml::from_str(yaml).unwrap();
-    let (proxies, _) = meow_config::rebuild_from_raw(&raw).expect("http node parses");
+    let res = meow_config::rebuild_from_raw(&raw).expect("http node parses");
 
     let tunnel = Tunnel::new(resolver());
-    tunnel.update_proxies(proxies);
+    tunnel.update_proxies(res.proxies, res.dialer_registry);
     tunnel.set_mode(TunnelMode::Rule);
     let rules: Vec<Box<dyn Rule>> = vec![
         Box::new(meow_rules::domain::DomainRule::new(
@@ -217,7 +247,12 @@ fn udp_flow_skips_a_target_without_udp_support() {
 
     let mut udp_meta = metadata();
     udp_meta.network = Network::Udp;
-    let (proxy, rule, _payload) = tunnel
+    let ResolvedTarget {
+        adapter: proxy,
+        rule_name: rule,
+        rule_payload: _payload,
+        route: _route,
+    } = tunnel
         .inner()
         .resolve_proxy(&udp_meta)
         .expect("the later rule must win");
@@ -227,7 +262,12 @@ fn udp_flow_skips_a_target_without_udp_support() {
     assert_eq!(rule, "MATCH");
     assert_eq!(proxy.adapter_type(), AdapterType::Reject);
 
-    let (tcp_proxy, _r, _p) = tunnel
+    let ResolvedTarget {
+        adapter: tcp_proxy,
+        rule_name: _r,
+        rule_payload: _p,
+        route: _route,
+    } = tunnel
         .inner()
         .resolve_proxy(&metadata())
         .expect("tcp resolves");

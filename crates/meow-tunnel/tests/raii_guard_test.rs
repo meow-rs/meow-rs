@@ -167,8 +167,9 @@ async fn close_connection_cancels_pending_proxy_handshake() {
             rules: Some(vec!["MATCH,REJECT-DROP".into()]),
             ..Default::default()
         };
-        let (proxies, rules) = meow_config::rebuild_from_raw(&raw).unwrap();
-        tunnel.update_proxies(proxies);
+        let res = meow_config::rebuild_from_raw(&raw).unwrap();
+        let (proxies, rules) = (res.proxies, res.rules);
+        tunnel.update_proxies(proxies, res.dialer_registry);
         tunnel.update_rules(rules);
         tunnel.set_mode(meow_common::TunnelMode::Rule);
         let (server, mut client) = loopback_pair().await;

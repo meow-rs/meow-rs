@@ -66,7 +66,11 @@ and proxies are all read from the same route-table generation.
 `Tunnel::update_proxies()` does not rebuild rules. It clones the current
 `rules`, `domain_index`, and `compiled_rules` arcs into the new route table and
 replaces only the proxy map. Rule compilation is therefore paid on config/rule
-reload, not proxy refresh.
+reload, not proxy refresh. It also retains the current `dialer_registry`
+generation, so it must only be used with maps that still contain the same
+generation's chained adapters — a freshly rebuilt map belongs to
+`Tunnel::update_routing()`, which carries the rebuild's own registry
+(issue #533).
 
 ## IR Data Model
 

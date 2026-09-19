@@ -1,4 +1,4 @@
-use crate::tunnel::TunnelInner;
+use crate::tunnel::{ResolvedTarget, TunnelInner};
 use dashmap::DashMap;
 use meow_common::atomic::AtomicU;
 use meow_common::{with_dial_timeout, Metadata, ProxyPacketConn};
@@ -190,7 +190,15 @@ pub async fn handle_udp(
     }
 
     // Slow path: all client UDP, including port 53, follows routing policy.
-    let Some((proxy, rule_name, rule_payload)) = tunnel.resolve_proxy(&metadata) else {
+    // `_route` pins this generation's dialer registry across the dial
+    // (issue #533 review).
+    let Some(ResolvedTarget {
+        adapter: proxy,
+        rule_name,
+        rule_payload,
+        route: _route,
+    }) = tunnel.resolve_proxy(&metadata)
+    else {
         warn!("no matching rule for UDP {}", metadata.remote_address());
         return;
     };
@@ -297,11 +305,8 @@ mod tests {
     #[tokio::test]
     async fn udp_port_53_obeys_reject_rule() {
         let tunnel = mk_tunnel();
-        tunnel.update_proxies(
-            meow_config::rebuild_from_raw(&Default::default())
-                .unwrap()
-                .0,
-        );
+        let res = meow_config::rebuild_from_raw(&Default::default()).unwrap();
+        tunnel.update_proxies(res.proxies, res.dialer_registry);
         tunnel.update_rules(vec![Box::new(meow_rules::final_rule::FinalRule::new(
             "REJECT",
         ))]);
@@ -332,7 +337,7 @@ mod tests {
             let proxy = Arc::new(SlowDialProxy::new());
             let mut proxies: HashMap<SmolStr, Arc<dyn Proxy>> = HashMap::new();
             proxies.insert("GLOBAL".into(), Arc::clone(&proxy) as Arc<dyn Proxy>);
-            tunnel.update_proxies(proxies);
+            tunnel.update_proxies(proxies, Default::default());
             tunnel.update_rules(vec![Box::new(meow_rules::final_rule::FinalRule::new(
                 "GLOBAL",
             ))]);
@@ -589,7 +594,7 @@ mod tests {
             SmolStr::new_static("GLOBAL"),
             Arc::clone(&proxy) as Arc<dyn Proxy>,
         );
-        tunnel.update_proxies(proxies);
+        tunnel.update_proxies(proxies, Default::default());
 
         let src = SocketAddr::from(([127, 0, 0, 1], 6666));
         let dst = SocketAddr::from(([198, 51, 100, 8], 443));
@@ -757,7 +762,7 @@ mod tests {
                 health: ProxyHealth::new(),
             }) as Arc<dyn Proxy>,
         );
-        tunnel.update_proxies(proxies);
+        tunnel.update_proxies(proxies, Default::default());
 
         let src = SocketAddr::from(([127, 0, 0, 1], 8888));
         let dst = SocketAddr::from(([198, 51, 100, 10], 443));

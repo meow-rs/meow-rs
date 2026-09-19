@@ -6,7 +6,7 @@ use meow_common::{DnsMode, Metadata, Network, Rule};
 use meow_dns::{HostEntry, Resolver};
 use meow_rules::{domain_suffix::DomainSuffixRule, final_rule::FinalRule, ipcidr::IpCidrRule};
 use meow_trie::DomainTrie;
-use meow_tunnel::Tunnel;
+use meow_tunnel::{ResolvedTarget, Tunnel};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
@@ -36,9 +36,9 @@ fn tunnel_with_targets(resolver: Arc<Resolver>, names: &[&str]) -> Tunnel {
             .join("\n")
     );
     let cfg: meow_config::raw::RawConfig = serde_yaml::from_str(&raw).unwrap();
-    let (proxies, _) = meow_config::rebuild_from_raw(&cfg).unwrap();
+    let res = meow_config::rebuild_from_raw(&cfg).unwrap();
     let tunnel = Tunnel::new(resolver);
-    tunnel.update_proxies(proxies);
+    tunnel.update_proxies(res.proxies, res.dialer_registry);
     tunnel
 }
 
@@ -60,7 +60,12 @@ async fn lazy_resolves_ip_when_scan_reaches_ipcidr_rule() {
         network: Network::Tcp,
         ..Default::default()
     };
-    let (_proxy, rule_name, _payload) = tunnel
+    let ResolvedTarget {
+        adapter: _proxy,
+        rule_name,
+        rule_payload: _payload,
+        route: _route,
+    } = tunnel
         .inner()
         .resolve_proxy_lazy(&mut md)
         .await
@@ -92,7 +97,12 @@ async fn lazy_skips_dns_when_domain_rule_matches_first() {
         network: Network::Tcp,
         ..Default::default()
     };
-    let (_proxy, rule_name, _payload) = tunnel
+    let ResolvedTarget {
+        adapter: _proxy,
+        rule_name,
+        rule_payload: _payload,
+        route: _route,
+    } = tunnel
         .inner()
         .resolve_proxy_lazy(&mut md)
         .await
@@ -122,7 +132,12 @@ async fn lazy_falls_through_to_final_when_nothing_matches() {
         network: Network::Tcp,
         ..Default::default()
     };
-    let (_proxy, rule_name, _payload) = tunnel
+    let ResolvedTarget {
+        adapter: _proxy,
+        rule_name,
+        rule_payload: _payload,
+        route: _route,
+    } = tunnel
         .inner()
         .resolve_proxy_lazy(&mut md)
         .await

@@ -128,8 +128,13 @@ async fn cold_reload_rejects_plain_http_setup_before_registration() {
             rules: Some(vec!["MATCH,REJECT".into()]),
             ..Default::default()
         };
-        let (proxies, rules) = meow_config::rebuild_from_raw(&raw).unwrap();
-        assert_eq!(tunnel.reload_routing(proxies, rules, None), 0);
+        let meow_config::RebuildResult {
+            proxies,
+            rules,
+            dialer_registry: registry,
+            ..
+        } = meow_config::rebuild_from_raw(&raw).unwrap();
+        assert_eq!(tunnel.reload_routing(proxies, rules, None, registry), 0);
         resume_tx.send(()).unwrap();
         tokio::select! {
             biased;

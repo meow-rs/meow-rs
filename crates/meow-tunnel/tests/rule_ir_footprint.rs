@@ -224,7 +224,7 @@ fn rule_ir_fixture_memory_footprint() {
     let raw = load_raw_fixture();
     let (rebuilt, rules_alloc) = measure(|| meow_config::rebuild_from_raw(&raw));
     let rules = match rebuilt {
-        Ok((_, rules)) => rules,
+        Ok(res) => res.rules,
         // The fixture contains GEOIP rules that eagerly load the local GeoIP/
         // geosite databases (resolved under `~/.config/meow`). Those data files
         // are absent on CI and most dev machines, so skip the measurement

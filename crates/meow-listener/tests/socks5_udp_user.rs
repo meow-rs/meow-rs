@@ -67,11 +67,8 @@ async fn associate(tunnel: meow_tunnel::Tunnel, authenticate: bool) -> (TcpStrea
 async fn check_policy(authenticate: bool) {
     let tunnel = common::direct_tunnel();
     tunnel.set_mode(TunnelMode::Rule);
-    tunnel.update_proxies(
-        meow_config::rebuild_from_raw(&Default::default())
-            .unwrap()
-            .0,
-    );
+    let res = meow_config::rebuild_from_raw(&Default::default()).unwrap();
+    tunnel.update_proxies(res.proxies, res.dialer_registry);
     tunnel.update_rules(vec![
         Box::new(InUserRule::new(USER, "REJECT").unwrap()),
         Box::new(FinalRule::new("DIRECT")),

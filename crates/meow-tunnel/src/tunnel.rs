@@ -35,10 +35,20 @@ pub struct RouteTable {
     pub domain_index: Arc<DomainIndex>,
     pub compiled_rules: Arc<CompiledRuleSet>,
     pub proxies: HashMap<SmolStr, Arc<dyn Proxy>>,
+    /// The registry generation `proxies` was published into. Retained so the
+    /// `dialer-proxy` front-hop lookups the map's adapters perform keep
+    /// resolving for exactly as long as this route table lives — the adapters
+    /// hold the registry cell weakly (issue #533), so without this owner the
+    /// snapshot would drop while the adapters are still dialable.
+    pub dialer_registry: meow_proxy::dialer::ProxyRegistry,
 }
 
 impl RouteTable {
-    fn new(proxies: HashMap<SmolStr, Arc<dyn Proxy>>, rules: Vec<Box<dyn Rule>>) -> Self {
+    fn new(
+        proxies: HashMap<SmolStr, Arc<dyn Proxy>>,
+        rules: Vec<Box<dyn Rule>>,
+        dialer_registry: meow_proxy::dialer::ProxyRegistry,
+    ) -> Self {
         let domain_index = DomainIndex::build(&rules);
         let compiled_rules = CompiledRuleSet::build(&rules);
         Self {
@@ -46,6 +56,7 @@ impl RouteTable {
             domain_index: Arc::new(domain_index),
             compiled_rules: Arc::new(compiled_rules),
             proxies,
+            dialer_registry,
         }
     }
 
@@ -55,6 +66,7 @@ impl RouteTable {
             domain_index: Arc::new(DomainIndex::empty()),
             compiled_rules: Arc::new(CompiledRuleSet::empty()),
             proxies: HashMap::new(),
+            dialer_registry: meow_proxy::dialer::ProxyRegistry::default(),
         }
     }
 }
@@ -75,6 +87,11 @@ pub struct TunnelInner {
     /// internal resolver so hostname dials avoid the OS resolver; its
     /// resolver slot is swapped alongside `resolver` on reload.
     pub direct: Arc<DirectAdapter>,
+    /// Immediate-reject adapter for the defence-in-depth arm in
+    /// `materialize_rule_match`: a matched non-DIRECT target absent from
+    /// the registry must fail closed, never fall through to direct egress
+    /// (issue #533).
+    reject: Arc<meow_proxy::RejectAdapter>,
     pub nat_table: NatTable,
     pub stats: Arc<Statistics>,
     /// Cold-reload admission boundary. TCP setup captures this generation
@@ -207,32 +224,41 @@ impl TunnelInner {
     /// itself stays heap-allocation-free. This method materializes the public
     /// tracking payloads as `SmolStr` after matching, where short common names
     /// still remain inline.
-    pub fn resolve_proxy(
-        &self,
-        metadata: &Metadata,
-    ) -> Option<(Arc<dyn ProxyAdapter>, SmolStr, SmolStr)> {
+    ///
+    /// The returned [`ResolvedTarget`] retains the [`RouteTable`] snapshot the
+    /// adapter was resolved from. **Hold it in scope across the dial**: the
+    /// adapter may be a `dialer-proxy` chain whose front-hop lookups go
+    /// through the route table's registry cell — a reload that swaps the
+    /// table between resolve and dial would otherwise strand the chain on a
+    /// dead generation (issue #533 review).
+    pub fn resolve_proxy(&self, metadata: &Metadata) -> Option<ResolvedTarget> {
         let mode = *self.mode.read();
         match mode {
-            TunnelMode::Direct => Some((
-                Arc::clone(&self.direct) as Arc<dyn ProxyAdapter>,
-                SmolStr::new_static("Direct"),
-                SmolStr::default(),
-            )),
+            TunnelMode::Direct => Some(ResolvedTarget {
+                adapter: Arc::clone(&self.direct) as Arc<dyn ProxyAdapter>,
+                rule_name: SmolStr::new_static("Direct"),
+                rule_payload: SmolStr::default(),
+                route: self.route(),
+            }),
             TunnelMode::Global => {
                 let route = self.route();
-                if let Some(proxy) = route.proxies.get("GLOBAL") {
-                    Some((
+                let (adapter, rule_name) = if let Some(proxy) = route.proxies.get("GLOBAL") {
+                    (
                         Arc::clone(proxy) as Arc<dyn ProxyAdapter>,
                         SmolStr::new_static("Global"),
-                        SmolStr::default(),
-                    ))
+                    )
                 } else {
-                    Some((
+                    (
                         Arc::clone(&self.direct) as Arc<dyn ProxyAdapter>,
                         SmolStr::new_static("Direct"),
-                        SmolStr::default(),
-                    ))
-                }
+                    )
+                };
+                Some(ResolvedTarget {
+                    adapter,
+                    rule_name,
+                    rule_payload: SmolStr::default(),
+                    route,
+                })
             }
             TunnelMode::Rule => {
                 // One route-table snapshot — rules + index + proxies all read
@@ -265,10 +291,7 @@ impl TunnelInner {
     ///
     /// UDP paths must keep calling `pre_resolve`: their NAT session key
     /// requires a resolved `dst_ip` regardless of what the rules demand.
-    pub async fn resolve_proxy_lazy(
-        &self,
-        metadata: &mut Metadata,
-    ) -> Option<(Arc<dyn ProxyAdapter>, SmolStr, SmolStr)> {
+    pub async fn resolve_proxy_lazy(&self, metadata: &mut Metadata) -> Option<ResolvedTarget> {
         let mode = *self.mode.read();
         if mode != TunnelMode::Rule {
             return self.resolve_proxy(metadata);
@@ -335,13 +358,15 @@ impl TunnelInner {
         }
     }
 
-    /// Map a rule-match result to the public `(proxy, rule name, payload)`
-    /// tuple, recording match statistics; `None` falls through to DIRECT.
+    /// Map a rule-match result to a [`ResolvedTarget`], recording match
+    /// statistics; `None` falls through to DIRECT. The target retains
+    /// `route` so the generation's dialer registry stays pinned across the
+    /// caller's dial (see [`Self::resolve_proxy`]).
     fn materialize_rule_match(
         &self,
-        route: &RouteTable,
+        route: &Arc<RouteTable>,
         result: Option<CompiledMatchResult<'_>>,
-    ) -> (Arc<dyn ProxyAdapter>, SmolStr, SmolStr) {
+    ) -> ResolvedTarget {
         match result {
             Some(m) => {
                 let target = m.adapter_name;
@@ -365,22 +390,21 @@ impl TunnelInner {
                         // for any future path that resolves a match without a
                         // registry check (issue #513).
                         //
-                        // What it must not do is hide the fallback — it was a
-                        // `debug!` and `action` was derived from the name
-                        // alone, so at the default log level nothing said the
-                        // connection left the machine directly, and the
-                        // statistics counted a proxy hop that never happened.
+                        // Fail closed: materializing an absent target must
+                        // reject the connection, never fall through to direct
+                        // egress — a silent DIRECT hop is exactly the leak
+                        // class `dialer-proxy` exists to prevent (issue #533).
                         //
                         // Interpolate into the message itself: the /logs
                         // broadcast keeps only the `message` field, so
                         // structured fields would never reach it.
                         warn!(
                             "rule {} matched target '{target}' which is not in \
-                             the registry; dialling DIRECT",
+                             the registry; rejecting",
                             m.rule_type.as_str()
                         );
-                        action = "DIRECT";
-                        Arc::clone(&self.direct) as Arc<dyn ProxyAdapter>
+                        action = "REJECT";
+                        Arc::clone(&self.reject) as Arc<dyn ProxyAdapter>
                     }
                 };
                 self.stats
@@ -388,22 +412,47 @@ impl TunnelInner {
                     .increment(m.rule_type.as_str(), action);
                 // `rule_type.as_str()` is a `&'static str` — wrap it
                 // inline without heap.
-                (
-                    proxy,
-                    SmolStr::new_static(m.rule_type.as_str()),
-                    SmolStr::from(m.rule_payload),
-                )
+                ResolvedTarget {
+                    adapter: proxy,
+                    rule_name: SmolStr::new_static(m.rule_type.as_str()),
+                    rule_payload: SmolStr::from(m.rule_payload),
+                    route: Arc::clone(route),
+                }
             }
             None => {
                 // No rule matched, use DIRECT
-                (
-                    Arc::clone(&self.direct) as Arc<dyn ProxyAdapter>,
-                    SmolStr::new_static("Final"),
-                    SmolStr::default(),
-                )
+                ResolvedTarget {
+                    adapter: Arc::clone(&self.direct) as Arc<dyn ProxyAdapter>,
+                    rule_name: SmolStr::new_static("Final"),
+                    rule_payload: SmolStr::default(),
+                    route: Arc::clone(route),
+                }
             }
         }
     }
+}
+
+/// The outcome of [`TunnelInner::resolve_proxy`] /
+/// [`TunnelInner::resolve_proxy_lazy`]:
+/// the adapter to dial, the rule that produced it, and the route-table
+/// generation it was resolved from.
+///
+/// **Hold the value in scope across the dial.** `route` pins this
+/// generation's dialer-registry cell — a config reload landing between
+/// resolve and dial would otherwise strand a chained `dialer-proxy` front
+/// hop on a dead generation (issue #533 review).
+pub struct ResolvedTarget {
+    /// The adapter that should dial `metadata`'s destination.
+    pub adapter: Arc<dyn ProxyAdapter>,
+    /// Rule type name for logs/metrics ("Final" on the no-match tail).
+    pub rule_name: SmolStr,
+    /// Rule payload text for logs/metrics.
+    pub rule_payload: SmolStr,
+    /// The route-table generation `adapter` was resolved from, retained for
+    /// its `dialer_registry` cell. Destructure it into a scope that outlives
+    /// the dial (`route: _route`) — dropping it early re-opens the reload
+    /// race this type exists to close.
+    pub route: Arc<RouteTable>,
 }
 
 pub struct Tunnel {
@@ -430,6 +479,7 @@ impl Tunnel {
                 route: RwLock::new(Arc::new(RouteTable::empty())),
                 resolver,
                 direct,
+                reject: Arc::new(meow_proxy::RejectAdapter::new(false)),
                 nat_table: udp::new_nat_table(),
                 stats: Arc::new(Statistics::new()),
                 tcp_generation: RwLock::new(0),
@@ -489,6 +539,9 @@ impl Tunnel {
                 domain_index: Arc::new(new_index),
                 compiled_rules: Arc::new(compiled_rules),
                 proxies: route.proxies.clone(),
+                // The proxies map is unchanged, so the generation's chained
+                // adapters must keep resolving through the same registry cell.
+                dialer_registry: route.dialer_registry.clone(),
             };
             *route = Arc::new(new_route);
         }
@@ -504,7 +557,27 @@ impl Tunnel {
         );
     }
 
-    pub fn update_proxies(&self, proxies: HashMap<SmolStr, Arc<dyn Proxy>>) {
+    /// Swap the proxies map while keeping the current rules — and the current
+    /// dialer registry. Callers rebuilding a whole config should use
+    /// [`Self::update_routing`], which carries the rebuild's own registry;
+    /// keeping the old cell here lets a swapped-in map that still contains
+    /// the previous generation's chained adapters keep resolving them.
+    /// Hazard: a map built by a *new* rebuild binds its `dialer-proxy`
+    /// targets to that build's own cell — pass it here and every chain fails
+    /// closed the moment that build's returned registry drops. The mirror
+    /// hazard: the retained cell's snapshot still names proxies the swapped
+    /// map removed, so a stale front-hop name resolves instead of failing.
+    /// Production paths never call this — only tests do.
+    ///
+    /// `dialer_registry` is the registry generation the build published
+    /// `proxies` into — the route table must own it, or the map's
+    /// `dialer-proxy` chains lose their cell and fail closed (issue #533
+    /// review).
+    pub fn update_proxies(
+        &self,
+        proxies: HashMap<SmolStr, Arc<dyn Proxy>>,
+        dialer_registry: meow_proxy::dialer::ProxyRegistry,
+    ) {
         // Preserve the current rules + index via Arc refcount bumps. Held
         // as a single write section so a concurrent `update_rules` cannot
         // be lost.
@@ -515,6 +588,7 @@ impl Tunnel {
                 domain_index: Arc::clone(&route.domain_index),
                 compiled_rules: Arc::clone(&route.compiled_rules),
                 proxies,
+                dialer_registry,
             };
             *route = Arc::new(new_route);
         }
@@ -523,12 +597,17 @@ impl Tunnel {
 
     /// Publish a complete rules/proxies snapshot, preserving active TCP flows.
     /// Use this instead of successive partial updates for a config rebuild.
+    ///
+    /// `dialer_registry` is the registry the rebuild published `proxies`
+    /// into; the route table owns it so the map's `dialer-proxy` chains keep
+    /// resolving while this generation lives (issue #533).
     pub fn update_routing(
         &self,
         proxies: HashMap<SmolStr, Arc<dyn Proxy>>,
         rules: Vec<Box<dyn Rule>>,
+        dialer_registry: meow_proxy::dialer::ProxyRegistry,
     ) {
-        drop(self.install_routing(Arc::new(RouteTable::new(proxies, rules))));
+        drop(self.install_routing(Arc::new(RouteTable::new(proxies, rules, dialer_registry))));
         info!("Routing configuration updated");
     }
 
@@ -540,13 +619,18 @@ impl Tunnel {
     /// setup can capture the new generation only after publication completes.
     /// Returns closure requests for tracked TCP flows, not completed teardowns;
     /// unregistered setups are rejected later and UDP sessions are unaffected.
+    ///
+    /// `dialer_registry` is the registry generation the build published
+    /// `proxies` into; the new route table owns it so the map's `dialer-proxy`
+    /// chains keep resolving while this generation lives (issue #533).
     pub fn reload_routing(
         &self,
         proxies: HashMap<SmolStr, Arc<dyn Proxy>>,
         rules: Vec<Box<dyn Rule>>,
         mode: Option<TunnelMode>,
+        dialer_registry: meow_proxy::dialer::ProxyRegistry,
     ) -> usize {
-        let route = Arc::new(RouteTable::new(proxies, rules));
+        let route = Arc::new(RouteTable::new(proxies, rules, dialer_registry));
         let mut generation = self.inner.tcp_generation.write();
         *generation = generation.checked_add(1).expect("TCP generation exhausted");
         let closed = self.inner.stats.close_all_connections_counted();
@@ -756,12 +840,13 @@ mod tests {
             let tunnel = test_tunnel();
             let proxy = meow_config::rebuild_from_raw(&Default::default())
                 .unwrap()
-                .0
+                .proxies
                 .remove("DIRECT")
                 .unwrap();
             tunnel.update_routing(
                 HashMap::from([("OLD".into(), Arc::clone(&proxy))]),
                 vec![Box::new(meow_rules::final_rule::FinalRule::new("OLD"))],
+                Default::default(),
             );
             let stats = tunnel.statistics();
             let id = stats.track_connection(
@@ -780,9 +865,12 @@ mod tests {
                 let writer = scope.spawn(|| {
                     let proxies = HashMap::from([("NEW".into(), proxy)]);
                     if cold {
-                        assert_eq!(tunnel.reload_routing(proxies, candidate, None), 1);
+                        assert_eq!(
+                            tunnel.reload_routing(proxies, candidate, None, Default::default()),
+                            1
+                        );
                     } else {
-                        tunnel.update_routing(proxies, candidate);
+                        tunnel.update_routing(proxies, candidate, Default::default());
                     }
                 });
                 entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -803,6 +891,47 @@ mod tests {
             assert_eq!(stats.active_connection_count(), usize::from(!cold));
             stats.close_connection(id);
         }
+    }
+
+    /// Issue #533: `RouteTable` owns the registry generation its `proxies`
+    /// were published into. A chained adapter's weak `DialerTarget` resolves
+    /// while the route lives — including inside a snapshot held across a
+    /// later swap — and fails closed once the last owner drops.
+    #[test]
+    fn route_table_retains_its_dialer_registry_generation() {
+        use meow_proxy::dialer::{DialerTarget, ProxyRegistry};
+
+        let tunnel = test_tunnel();
+        let front = meow_config::rebuild_from_raw(&Default::default())
+            .unwrap()
+            .proxies
+            .remove("DIRECT")
+            .unwrap();
+        let proxies: HashMap<SmolStr, Arc<dyn Proxy>> = HashMap::from([("FRONT".into(), front)]);
+
+        let registry = ProxyRegistry::default();
+        // Stand-in for the weak edge every chained adapter holds.
+        let target = DialerTarget::new("FRONT", &registry);
+        registry.publish(Arc::new(proxies.clone()));
+        tunnel.update_routing(proxies, vec![], registry);
+        assert!(
+            target.resolve().is_some(),
+            "the route table retains its registry generation"
+        );
+
+        // A held route snapshot keeps the generation alive across a later
+        // swap; the new generation's (empty) registry replaces it.
+        let gen1 = tunnel.route_snapshot();
+        tunnel.update_routing(HashMap::new(), vec![], ProxyRegistry::default());
+        assert!(
+            target.resolve().is_some(),
+            "a held snapshot still retains the old generation"
+        );
+        drop(gen1);
+        assert!(
+            target.resolve().is_none(),
+            "with the last owner gone the weak target must fail closed"
+        );
     }
 
     /// Sends on drop, so a test can observe that an aborted listener task

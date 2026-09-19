@@ -188,20 +188,24 @@ mod tests {
 
     /// Publish `dialer` in a registry of its own and hand back the target that
     /// resolves it — the late-binding shape `meow-config` builds at load time.
-    fn front(dialer: Arc<MockProxy>) -> DialerTarget {
+    /// The registry is returned alongside because `DialerTarget` only holds it
+    /// weakly: the caller must keep the handle alive for the target to resolve
+    /// (issue #533).
+    fn front(dialer: Arc<MockProxy>) -> (DialerTarget, ProxyRegistry) {
         let name = SmolStr::from(dialer.name());
         let registry = ProxyRegistry::default();
         let mut proxies: HashMap<SmolStr, Arc<dyn Proxy>> = HashMap::new();
         proxies.insert(name.clone(), dialer);
         registry.publish(Arc::new(proxies));
-        DialerTarget::new(name, registry)
+        (DialerTarget::new(name, &registry), registry)
     }
 
     #[tokio::test]
     async fn dial_tcp_routes_through_dialer_first() {
         let dialer = MockProxy::new("fast");
         let inner = MockProxy::new("daniel");
-        let adapter = DialerProxyAdapter::new(Arc::clone(&inner) as _, front(Arc::clone(&dialer)));
+        let (target, _registry) = front(Arc::clone(&dialer));
+        let adapter = DialerProxyAdapter::new(Arc::clone(&inner) as _, target);
 
         // dialer.dial_tcp errors at relay hop 0 → confirms the chain dials the
         // front proxy first. The inner adapter is only reached via connect_over,
@@ -226,7 +230,7 @@ mod tests {
         let inner = MockProxy::new("daniel");
         let adapter = DialerProxyAdapter::new(
             Arc::clone(&inner) as _,
-            DialerTarget::new("ghost", ProxyRegistry::default()),
+            DialerTarget::new("ghost", &ProxyRegistry::default()),
         );
 
         match adapter.dial_tcp(&meta("example.com", 443)).await {
@@ -241,8 +245,8 @@ mod tests {
 
     #[tokio::test]
     async fn udp_is_unsupported() {
-        let adapter =
-            DialerProxyAdapter::new(MockProxy::new("inner"), front(MockProxy::new_udp("fast")));
+        let (target, _registry) = front(MockProxy::new_udp("fast"));
+        let adapter = DialerProxyAdapter::new(MockProxy::new("inner"), target);
         assert!(!adapter.support_udp());
         match adapter.dial_udp(&meta("example.com", 53)).await {
             Err(MeowError::UdpNotSupported) => {}
@@ -253,7 +257,8 @@ mod tests {
     #[test]
     fn identity_delegates_to_inner() {
         let inner = MockProxy::new("daniel");
-        let adapter = DialerProxyAdapter::new(inner, front(MockProxy::new("fast")));
+        let (target, _registry) = front(MockProxy::new("fast"));
+        let adapter = DialerProxyAdapter::new(inner, target);
         assert_eq!(adapter.name(), "daniel");
         assert_eq!(adapter.dialer_name(), "fast");
         assert_eq!(adapter.adapter_type(), AdapterType::Direct); // MockProxy's type
