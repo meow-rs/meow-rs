@@ -2207,6 +2207,48 @@ async fn d5_group_delay_records_into_each_member_history() {
     assert_eq!(b.delay_history().len(), 1);
 }
 
+/// Issue #543 item 1: `use:` / `include-all` members live in the group's
+/// provider slots, not in the proxies map. The endpoint used to resolve
+/// `members()` names through the map, so those members were silently
+/// dropped from the probe and the response.
+#[tokio::test]
+async fn d6_group_delay_reports_provider_slot_members() {
+    let a = TestAdapter::new(
+        "A",
+        DialBehavior::SleepThenOk(std::time::Duration::from_millis(5)),
+    )
+    .into_proxy();
+    let p = TestAdapter::new(
+        "P",
+        DialBehavior::SleepThenOk(std::time::Duration::from_millis(5)),
+    )
+    .into_proxy();
+    let slot: meow_common::ProviderSlot = Arc::new(RwLock::new(vec![Arc::clone(&p)]));
+    let group: Arc<dyn Proxy> = Arc::new(meow_proxy::FallbackGroup::new_with_providers(
+        "G",
+        vec![Arc::clone(&a)],
+        vec![slot],
+    ));
+    // `P` is deliberately absent from the registry, like a provider node.
+    let state = state_with_proxies(vec![("A", Arc::clone(&a)), ("G", group)]);
+    let app = create_router(state);
+    let resp = delay_req(app, format!("/group/G/delay?url={}&timeout=1000", url_q())).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = body_json(resp).await;
+    let obj = body.as_object().unwrap();
+    assert_eq!(obj.len(), 2, "static and provider members both reported");
+    for k in ["A", "P"] {
+        let v = obj.get(k).and_then(serde_json::Value::as_u64).unwrap();
+        assert!(v > 0, "member {k} should have positive delay");
+    }
+    assert_eq!(a.delay_history().len(), 1);
+    assert_eq!(
+        p.delay_history().len(),
+        1,
+        "provider-slot member must be probed (issue #543)"
+    );
+}
+
 // ── C: auth gating on the two new endpoints ──────────────────────────
 //
 // Delay endpoints live under the gated `api` subrouter; these cases lock

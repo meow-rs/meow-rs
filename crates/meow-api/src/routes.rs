@@ -1886,7 +1886,10 @@ async fn get_group_delay(
         return msg_err(StatusCode::NOT_FOUND, "resource not found");
     };
     // upstream: findProxyByName rejects non-groups with 404 for this route.
-    let Some(member_names) = group.members() else {
+    // Resolved through the group rather than the proxies map so `use:` /
+    // `include-all` provider members — which are not registry keys — are
+    // probed and reported too (issue #543 item 1).
+    let Some(member_proxies) = group.member_proxies() else {
         return msg_err(StatusCode::NOT_FOUND, "resource not found");
     };
 
@@ -1905,11 +1908,11 @@ async fn get_group_delay(
     let url = params.url.as_deref().unwrap_or("").to_string();
     let expected = params.expected.clone();
 
-    // Resolve each member name to an `Arc<dyn Proxy>` *before* dropping the
-    // proxies map so the spawned tasks hold their own Arc clones.
-    let members: Vec<(String, Arc<dyn meow_common::Proxy>)> = member_names
+    // The spawned tasks hold their own Arc clones, so the route snapshot
+    // can go before the probes start.
+    let members: Vec<(String, Arc<dyn meow_common::Proxy>)> = member_proxies
         .into_iter()
-        .filter_map(|n| route.proxies.get(n.as_str()).cloned().map(|p| (n, p)))
+        .map(|p| (p.name().to_string(), p))
         .collect();
     drop(route);
 

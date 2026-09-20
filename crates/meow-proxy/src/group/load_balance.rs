@@ -235,6 +235,10 @@ impl Proxy for LoadBalanceGroup {
         Some(self.proxies.iter().map(|p| p.name().to_string()).collect())
     }
 
+    fn member_proxies(&self) -> Option<Vec<Arc<dyn Proxy>>> {
+        Some(self.proxies.clone())
+    }
+
     fn current(&self) -> Option<String> {
         // For load-balance, no single "current" proxy; return first alive for API compat.
         self.proxies

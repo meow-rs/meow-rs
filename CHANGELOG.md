@@ -71,6 +71,16 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **Provider-sourced group members are now health-checked** (#543 item 1,
+  #555). The periodic sweep and `GET /group/{name}/delay` resolved
+  `group.members()` names through the route table, where `use:` /
+  `include-all` provider members are not keys, so a `use:`-only
+  `url-test` / `fallback` group woke every interval to probe nothing,
+  never became `alive`, and the delay endpoint returned `{}` for it. The
+  `Proxy` trait gains `member_proxies()`, which every group implements
+  over its static members *and* provider slots; both callers probe
+  through it. Load-balance still drops its `use:` slots at parse
+  (#555 item 3) and providers have no scheduled check of their own yet.
 - **Relay groups can now terminate on real protocol adapters, not just
   `http`/`socks5`/`snell`.** Every hop after the first runs
   `ProxyAdapter::connect_over`, which previously only `direct`, `reject`,

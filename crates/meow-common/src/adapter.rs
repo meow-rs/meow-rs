@@ -209,6 +209,15 @@ pub trait Proxy: ProxyAdapter {
     fn members(&self) -> Option<Vec<String>> {
         None
     }
+    /// For group adapters: the member proxies themselves, in the same
+    /// order as [`members`](Self::members). Includes members sourced from
+    /// `use:` / `include-all` provider slots, which are not keys of the
+    /// route table — anything that needs to probe or inspect *every*
+    /// member must resolve through this rather than look the names up in
+    /// the proxies map (issue #543 item 1). Leaf adapters return `None`.
+    fn member_proxies(&self) -> Option<Vec<Arc<dyn Proxy>>> {
+        None
+    }
     /// For group adapters: the name of the currently active member
     /// (selected/fastest/first-alive depending on group kind).
     fn current(&self) -> Option<String> {

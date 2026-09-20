@@ -113,13 +113,17 @@ async fn run_health_check_loop(inner: Weak<TunnelInner>, spec: HealthCheckSpec) 
             );
             continue;
         }
-        let Some(member_names) = group.members() else {
+        // Resolve through the group, not the route table: `use:` /
+        // `include-all` provider members are not registry keys, so a
+        // name lookup found zero of them and a `use:`-only group woke
+        // every interval to probe nothing (issue #543 item 1).
+        let Some(member_proxies) = group.member_proxies() else {
             continue;
         };
 
-        let members: Vec<_> = member_names
+        let members: Vec<_> = member_proxies
             .into_iter()
-            .filter_map(|n| proxies.get(n.as_str()).cloned().map(|p| (n, p)))
+            .map(|p| (p.name().to_string(), p))
             .collect();
         // `expected-status` narrows the acceptance set — a periodic probe
         // must use the same set the group's set-triggered probes use,
@@ -682,6 +686,72 @@ mod tests {
         until(Duration::from_secs(5), || a.dials() >= 1 && b.dials() >= 1).await;
         assert_eq!(a.dials(), 1, "immediate first tick probes unused members");
         assert!(a.last_delay() >= 1);
+
+        task.abort();
+    }
+
+    /// Issue #543 item 1: members that come from a `use:` / `include-all`
+    /// provider slot are not keys of the route table. The sweep used to
+    /// resolve `members()` names through that table, so a provider-backed
+    /// member was never probed and a `use:`-only group woke every interval
+    /// to probe nothing.
+    #[tokio::test(start_paused = true)]
+    async fn eager_loop_probes_provider_slot_members() {
+        let tunnel = stub_tunnel();
+        let static_member = ProbeMock::named("static");
+        let provider_member = ProbeMock::named("from-provider");
+        let slot: meow_common::ProviderSlot =
+            std::sync::Arc::new(parking_lot::RwLock::new(vec![std::sync::Arc::clone(
+                &provider_member,
+            )
+                as std::sync::Arc<dyn Proxy>]));
+        let group = std::sync::Arc::new(
+            meow_proxy::group::fallback::FallbackGroup::new_with_providers(
+                "use-fb",
+                vec![std::sync::Arc::clone(&static_member) as std::sync::Arc<dyn Proxy>],
+                vec![slot],
+            ),
+        );
+
+        // Mirror a real registry: the static node and the group are keys,
+        // the provider node is only reachable through the group's slot.
+        let mut proxies: HashMap<smol_str::SmolStr, std::sync::Arc<dyn Proxy>> = HashMap::new();
+        proxies.insert(
+            "static".into(),
+            std::sync::Arc::<ProbeMock>::clone(&static_member),
+        );
+        proxies.insert(
+            "use-fb".into(),
+            std::sync::Arc::<meow_proxy::group::fallback::FallbackGroup>::clone(&group),
+        );
+        tunnel.update_proxies(proxies);
+
+        let spec = HealthCheckSpec {
+            group_name: "use-fb".into(),
+            url: "http://probe.test/204".into(),
+            interval_secs: 1,
+            lazy: false,
+        };
+        let task = tokio::spawn(run_health_check_loop(Arc::downgrade(tunnel.inner()), spec));
+
+        until(Duration::from_secs(5), || {
+            static_member.dials() >= 1 && provider_member.dials() >= 1
+        })
+        .await;
+        assert_eq!(static_member.dials(), 1, "static member probed once");
+        assert_eq!(
+            provider_member.dials(),
+            1,
+            "provider-slot member must be probed by the sweep (issue #543)"
+        );
+        assert!(
+            provider_member.last_delay() >= 1,
+            "probe result recorded into the provider member's health"
+        );
+        assert!(
+            group.alive(),
+            "group becomes alive through its provider member"
+        );
 
         task.abort();
     }

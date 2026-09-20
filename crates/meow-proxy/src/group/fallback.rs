@@ -144,6 +144,19 @@ impl FallbackGroup {
         }
         out
     }
+
+    /// Static members followed by every provider-slot member, in
+    /// `member_names` order.
+    fn member_proxy_list(&self) -> Vec<Arc<dyn Proxy>> {
+        let mut out: Vec<Arc<dyn Proxy>> = self.static_proxies.iter().map(Arc::clone).collect();
+        for slot in &self.provider_slots {
+            let guard = slot.read();
+            for p in guard.iter() {
+                out.push(Arc::clone(p));
+            }
+        }
+        out
+    }
 }
 
 #[async_trait]
@@ -217,6 +230,10 @@ impl Proxy for FallbackGroup {
 
     fn members(&self) -> Option<Vec<String>> {
         Some(self.member_names())
+    }
+
+    fn member_proxies(&self) -> Option<Vec<Arc<dyn Proxy>>> {
+        Some(self.member_proxy_list())
     }
 
     fn current(&self) -> Option<String> {
@@ -339,6 +356,29 @@ mod tests {
             ],
         );
         assert_eq!(g.member_names(), vec!["a", "b", "c"]);
+    }
+
+    /// `member_proxies()` must cover provider-slot members (issue #543
+    /// item 1) and list them in `member_names()` order.
+    #[test]
+    fn member_proxies_include_provider_slots_in_member_names_order() {
+        let slot: ProviderSlot = Arc::new(RwLock::new(vec![
+            MockProxy::new("p1") as Arc<dyn Proxy>,
+            MockProxy::new("p2") as Arc<dyn Proxy>,
+        ]));
+        let g = FallbackGroup::new_with_providers(
+            "fb",
+            vec![MockProxy::new("a"), MockProxy::new("b")],
+            vec![slot],
+        );
+        let names: Vec<String> = g
+            .member_proxies()
+            .expect("groups expose members")
+            .iter()
+            .map(|p| p.name().to_string())
+            .collect();
+        assert_eq!(names, g.member_names());
+        assert_eq!(names, vec!["a", "b", "p1", "p2"]);
     }
 
     #[tokio::test]

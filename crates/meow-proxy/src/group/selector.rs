@@ -139,6 +139,19 @@ impl SelectorGroup {
         }
         out
     }
+
+    /// Static members followed by every provider-slot member, in
+    /// `proxy_names` order.
+    fn member_proxy_list(&self) -> Vec<Arc<dyn Proxy>> {
+        let mut out: Vec<Arc<dyn Proxy>> = self.static_proxies.iter().map(Arc::clone).collect();
+        for slot in &self.provider_slots {
+            let guard = slot.read();
+            for p in guard.iter() {
+                out.push(Arc::clone(p));
+            }
+        }
+        out
+    }
 }
 
 #[async_trait]
@@ -214,6 +227,10 @@ impl Proxy for SelectorGroup {
         Some(self.proxy_names())
     }
 
+    fn member_proxies(&self) -> Option<Vec<Arc<dyn Proxy>>> {
+        Some(self.member_proxy_list())
+    }
+
     fn current(&self) -> Option<String> {
         self.selected_proxy().map(|p| p.name().into())
     }
@@ -260,6 +277,29 @@ mod tests {
     use super::*;
     use crate::group::test_support::MockProxy;
     use meow_common::Metadata;
+
+    /// `member_proxies()` must cover provider-slot members (issue #543
+    /// item 1) and list them in `proxy_names()` order.
+    #[test]
+    fn member_proxies_include_provider_slots_in_proxy_names_order() {
+        let slot: ProviderSlot = Arc::new(RwLock::new(vec![
+            MockProxy::new("p1") as Arc<dyn Proxy>,
+            MockProxy::new("p2") as Arc<dyn Proxy>,
+        ]));
+        let g = SelectorGroup::new_with_providers(
+            "sel",
+            vec![MockProxy::new("a"), MockProxy::new("b")],
+            vec![slot],
+        );
+        let names: Vec<String> = g
+            .member_proxies()
+            .expect("groups expose members")
+            .iter()
+            .map(|p| p.name().to_string())
+            .collect();
+        assert_eq!(names, g.proxy_names());
+        assert_eq!(names, vec!["a", "b", "p1", "p2"]);
+    }
 
     #[test]
     fn unselected_falls_back_to_first_static() {

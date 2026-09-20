@@ -160,6 +160,10 @@ impl Proxy for DialerProxyAdapter {
         self.inner.members()
     }
 
+    fn member_proxies(&self) -> Option<Vec<Arc<dyn Proxy>>> {
+        self.inner.member_proxies()
+    }
+
     fn current(&self) -> Option<String> {
         self.inner.current()
     }

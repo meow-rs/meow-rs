@@ -466,6 +466,10 @@ impl Proxy for RelayGroup {
     fn members(&self) -> Option<Vec<String>> {
         Some(self.proxies.iter().map(|p| p.name().to_string()).collect())
     }
+
+    fn member_proxies(&self) -> Option<Vec<Arc<dyn Proxy>>> {
+        Some(self.proxies.clone())
+    }
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
