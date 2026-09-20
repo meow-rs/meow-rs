@@ -71,6 +71,17 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **`RULE-SET` rules now see refreshed rule-provider content without a
+  config rebuild** (#553). The rule parser received a snapshot `Arc` of
+  each provider's set, so a periodic refresh or `PUT /providers/rules/{name}`
+  logged "refreshed: N rules" and bumped `updated_at` while live traffic
+  kept matching the startup payload until the next `PUT /configs` or
+  restart. `RuleProvider` now implements `RuleSet` by reading through its
+  lock, and the parser map (`rule_provider::live_ruleset_map`, replacing
+  `snapshot_ruleset_map`) hands rules the provider itself; the DNS
+  `nameserver-policy` `rule-set:` matcher reads through the same way
+  instead of cloning a snapshot per query. Providers rebuilt by a config
+  reload still bypass the API registry (#543 item 2).
 - **Relay groups can now terminate on real protocol adapters, not just
   `http`/`socks5`/`snell`.** Every hop after the first runs
   `ProxyAdapter::connect_over`, which previously only `direct`, `reject`,
