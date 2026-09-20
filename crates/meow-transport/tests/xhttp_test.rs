@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use meow_transport::xhttp::{XhttpConfig, XhttpLayer};
 use meow_transport::{Transport, TransportError};
+use support::h2_push::spawn_h2_push_server;
 use support::loopback::{
     spawn_h2_server, spawn_h2_server_deferred_response, spawn_h2_server_with_body_result,
 };
@@ -308,4 +309,42 @@ async fn xhttp_drop_bounds_stalled_driver_lifetime() {
         .await
         .expect("stalled driver must terminate after drop")
         .expect("server task");
+}
+
+/// The client must advertise receive windows well above h2's 65 535-byte
+/// default (issue #495 item 12).  The server pushes 1 MiB while the client
+/// does not read a single byte; with the default windows it would park after
+/// 64 KiB waiting for a WINDOW_UPDATE that only a read can produce, and the
+/// timeout below would fire.
+#[tokio::test]
+async fn xhttp_receive_window_absorbs_1mib_before_first_read() {
+    const PAYLOAD_SIZE: usize = 1024 * 1024;
+
+    let (client_io, server_io) = tokio::io::duplex(256 * 1024);
+    let payload: Vec<u8> = (0u8..=255).cycle().take(PAYLOAD_SIZE).collect();
+    let pushed = spawn_h2_push_server(server_io, payload.clone());
+
+    let layer = XhttpLayer::new(XhttpConfig {
+        path: "/".into(),
+        hosts: vec!["example.com".into()],
+        ..Default::default()
+    });
+    let mut stream = layer
+        .connect(Box::new(client_io))
+        .await
+        .expect("xhttp connect");
+
+    // Deliberately no read until the server reports the whole push done.
+    let pushed = tokio::time::timeout(Duration::from_secs(5), pushed)
+        .await
+        .expect("server must push 1 MiB into the client's receive window without a read")
+        .expect("push server task");
+    assert_eq!(pushed, PAYLOAD_SIZE);
+
+    let mut recv_buf = Vec::with_capacity(PAYLOAD_SIZE);
+    stream
+        .read_to_end(&mut recv_buf)
+        .await
+        .expect("read_to_end 1 MiB");
+    assert_eq!(recv_buf, payload, "pushed bytes must arrive intact");
 }

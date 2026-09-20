@@ -71,6 +71,16 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **HTTP/2 transports (gRPC, h2, xhttp) and the h2mux multiplexer now
+  advertise 4 MiB per-stream / 16 MiB per-connection receive windows.**
+  Every client handshake used h2's defaults, so the download direction of a
+  gRPC / h2 / xhttp / h2mux stream stalled every 64 KiB waiting for a
+  WINDOW_UPDATE round-trip — a throughput ceiling of roughly 64 KiB per RTT
+  (#495 item 12). The windows now match Go's `http2.Transport` defaults,
+  which is what mihomo's gun / h2 clients and sing-mux's h2mux client
+  advertise; the upload direction is unchanged (bounded by the server's
+  window). Per-stream memory stays bounded by the 4 MiB window because
+  every read still releases capacity chunk by chunk.
 - **Relay groups can now terminate on real protocol adapters, not just
   `http`/`socks5`/`snell`.** Every hop after the first runs
   `ProxyAdapter::connect_over`, which previously only `direct`, `reject`,
