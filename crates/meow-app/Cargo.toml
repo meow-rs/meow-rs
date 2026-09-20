@@ -16,7 +16,7 @@ categories = ["network-programming", "command-line-utilities"]
 # TLS is BoringSSL everywhere (proxies, health probes, DoT/DoH, provider
 # fetches; ECH/uTLS included) — boring-sys is a hard requirement of the
 # `full` and `minimal` bundles alike, so every build needs cmake + a C++
-# compiler. rustls is linked only by quinn under `hysteria2`.
+# compiler. `hysteria2` runs quiche on the same BoringSSL; no rustls.
 default = ["full"]
 # Compatibility alias: BoringSSL is the only TLS backend now, so this is a
 # no-op kept for existing `--features boring-tls` invocations.

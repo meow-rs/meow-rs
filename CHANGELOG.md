@@ -23,18 +23,30 @@ the canonical, in-repo source a release is cut from.
   the TLS layer. rustls, tokio-rustls, quinn, h3, h3-quinn, reqwest,
   and webpki-roots are no longer runtime dependencies; rustls remains only as a
   dev-dependency for the loopback TLS test servers.
-  **Build change:** the `boring` crate is pinned to `=4.22.0`, the version
-  quiche's boring-crate feature accepts (`^4.3`), so that quiche and
-  meow-transport share one `links = "boringssl"` copy. 4.22 carries every ECH
-  and uTLS API the transport backend uses; `boring-sys` (cmake + a C++ compiler)
-  is a hard build requirement on every target. The `boring-tls`/`ech` features
-  are no-op aliases. The Hysteria2 quiche client is a single driver task that
+  **Build change:** `boring`, `tokio-boring` and `boring-sys` move together
+  through the workspace table (5.2 as of #572; quiche 0.30 accepts
+  `boring >=4.19,<6`) so that quiche and meow-transport share one
+  `links = "boringssl"` copy; `boring-sys` (cmake + a C++ compiler) is a hard
+  build requirement on every target. The `boring-tls`/`ech` features are
+  no-op aliases. The Hysteria2 quiche client is a single driver task that
   bridges quiche's synchronous state machine to the async `DuplexStream` (TCP)
   and `UdpSession` (UDP datagrams) with real QUIC-flow-control backpressure;
   Salamander obfs and port-hopping are applied on the driver's own UDP socket.
   Observable runtime differences: BoringSSL's default ClientHello replaces
   rustls' for proxies without `client-fingerprint`; TLS session resumption is
   per BoringSSL `SSL_CTX` (64-entry cache); the QUIC ClientHello is now quiche's.
+
+- **boring/tokio-boring 4.22 → 5.2 and quiche 0.29 → 0.30.** quiche 0.30
+  accepts `boring >=4.19,<6`, which unblocks the 5.x line the workspace had
+  been waiting on. One observable difference, from the newer vendored
+  BoringSSL: the *default* ClientHello — every handshake without a
+  `client-fingerprint`, including DoT/DoH and the Hysteria2 QUIC handshake —
+  now advertises a post-quantum key share (`X25519MLKEM768`), which makes it
+  about 1.2 KiB larger and can split the QUIC Initial across two packets
+  (verified against Hysteria 2.9.2). Named fingerprint profiles pin their
+  curve list explicitly, so their ClientHello and the JA3 pins in
+  `boring_tls_test` are unchanged. The 4.x-era `TolerantFlushStream` flush
+  workaround is removed (see the #569 entry under Fixed). (#572)
 
 - **`ipv6` is now effective end-to-end and keeps the `false` default.** The
   `ipv6` flag previously only gated a handful of code paths — the resolver
@@ -102,14 +114,14 @@ the canonical, in-repo source a release is cut from.
   `ErrorKind::WouldBlock`, and boring 4.22.0's `BIO_CTRL_FLUSH` handler stored
   the error but never called `BIO_set_retry_write`, so `SSL_get_error` mapped
   a routine retry to fatal `SSL_ERROR_SYSCALL`. Upstream fixed this in
-  cloudflare/boring@ed76885 but no 4.x release carries it, and quiche pins
-  this workspace to `boring ^4.3`. `BoringInner::connect` now wraps the inner
-  stream so a pending flush reports complete — safe because `BIO_flush` only
-  pushes an already-queued flight and mux writers drain in order. HTTPS
+  cloudflare/boring@ed76885, which only the 5.x line ships: #571 first
+  carried an in-tree wrapper that reported a pending flush as complete, and
+  #572 replaced it with the upstream fix by moving the workspace to boring
+  5.2 (quiche 0.30 lifted the `boring < 5` constraint). HTTPS
   URL-test probes over AnyTLS/smux recover (visible symptom: url-test groups
   with `https://` URLs reported nearly all mux members dead while the same
   nodes carried real traffic fine). Regression test:
-  `d1_tls_handshake_over_pending_flush_stream`. (#569)
+  `d1_tls_handshake_over_pending_flush_stream`. (#569, #571, #572)
 
 - **Provider `header:` maps now accept mihomo's list form, and rule-providers
   honor `header:` at all.** mihomo types provider headers as

@@ -98,7 +98,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "logg
 # QUIC for the hysteria2 outbound. quiche is built on BoringSSL and shares the
 # `boring` crate's vendored copy via `boringssl-boring-crate`, so no rustls and
 # no second crypto lib. `qlog` off; congestion control + h3 are in defaults.
-quiche = { version = "0.29", default-features = false, features = ["boringssl-boring-crate"] }
+quiche = { version = "0.30", default-features = false, features = ["boringssl-boring-crate"] }
 webpki-roots = "0.26"
 webpki-root-certs = "1"
 
@@ -221,12 +221,18 @@ parking_lot = "0.12"
 # Wait-free read / atomic swap for hot-path rule-set + proxy-provider refreshes
 
 # BoringSSL — the single TLS/crypto backend for the whole app: meow-transport's
-# `tls` layer and quiche's QUIC (hysteria2). Pinned to 4.22 because quiche's
-# `boringssl-boring-crate` feature accepts `boring ^4.3`; this lets quiche and
+# `tls` layer and quiche's QUIC (hysteria2). quiche >= 0.30 accepts
+# `boring >=4.19, <6` and detects the major through
+# `DEP_BORINGSSL_VERSION_MAJOR` (`boring-sys` >= 5.2), so quiche and
 # meow-transport share ONE vendored BoringSSL (`links = "boringssl"` permits a
-# single copy). 4.22 carries every ECH / uTLS API the transport backend uses.
-boring      = { version = "=4.22.0" }
-tokio-boring = { version = "=4.22.0" }
+# single copy). `boring`, `tokio-boring` and `boring-sys` (meow-transport's
+# ECH test FFI) must move together: a stale `boring-sys` pin is a second
+# `links = "boringssl"` package and cargo refuses to resolve. 5.x carries the
+# `BIO_CTRL_FLUSH` retry-flag fix (cloudflare/boring@ed76885, #569/#572) plus
+# every ECH / uTLS API the transport backend uses.
+boring       = { version = "5.2" }
+tokio-boring = { version = "5.2" }
+boring-sys   = { version = "5.2" }
 
 # Benchmarking
 criterion = { version = "0.5", features = ["html_reports"] }

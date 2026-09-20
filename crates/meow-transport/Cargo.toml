@@ -18,9 +18,9 @@ default = ["tls", "ws"]
 # tokio-boring; boring-sys vendors and builds BoringSSL, so cmake 3.14+ and a
 # C++ compiler are required at build time). Plain TLS, uTLS fingerprint
 # shaping, ECH (with server retry_configs self-healing), mTLS and ALPN are all
-# native here. There is no rustls backend: rustls is linked only by quinn for
-# the hysteria2 outbound (meow-proxy) and by the loopback test servers under
-# [dev-dependencies].
+# native here. There is no rustls backend: the hysteria2 outbound (meow-proxy)
+# runs quiche on the same vendored BoringSSL, and rustls is linked only by the
+# loopback test servers under [dev-dependencies].
 tls = [
     "dep:boring",
     "dep:tokio-boring",
@@ -102,7 +102,7 @@ x25519-dalek = { workspace = true, optional = true }
 # tls feature (BoringSSL)
 boring             = { workspace = true, optional = true }
 tokio-boring       = { workspace = true, optional = true }
-boring-sys         = { version = "=4.22.0", optional = true }
+boring-sys         = { workspace = true, optional = true }
 # Mozilla CA bundle for boring's X509Store. The BoringSSL connector
 # starts with an *empty* trust store; sandboxed runtimes (iOS
 # NetworkExtension, sealed app extensions) don't pick up system roots

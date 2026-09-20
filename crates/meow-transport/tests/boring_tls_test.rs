@@ -1073,12 +1073,14 @@ async fn c16_ech_self_heal_uses_retry_configs_on_next_connect() {
 // (meow-rs#569).  Multiplexed transports (anytls, smux, …) implement
 // `poll_flush` as a barrier on a writer-task acknowledgement, so the first
 // poll almost always returns `Poll::Pending`.  tokio-boring's BIO bridge maps
-// that Pending to `ErrorKind::WouldBlock`; boring's `bio.rs` ctrl handler
+// that Pending to `ErrorKind::WouldBlock`; boring 4.x's `bio.rs` ctrl handler
 // stored the error but never called `BIO_set_retry_write`, so `SSL_get_error`
 // mapped a routine flush retry to fatal `SSL_ERROR_SYSCALL` and surfaced the
 // misleading "TLS handshake failed operation would block".  Upstream fixed it
-// in cloudflare/boring@ed76885, but no 4.x release carries the fix and quiche
-// pins this workspace to `boring ^4.3`.
+// in cloudflare/boring@ed76885 (shipped in 5.x); #572 moved the workspace to
+// boring 5.2 and dropped the in-tree `TolerantFlushStream` workaround from
+// #571, so this test now guards the upstream behaviour directly: a pending
+// flush during the handshake must be retried as `WANT_WRITE`, never fatal.
 //
 // `DeferredFlushStream` pends `pending_budget` `poll_flush` calls before
 // delegating — the same observable behaviour as a mux writer barrier.

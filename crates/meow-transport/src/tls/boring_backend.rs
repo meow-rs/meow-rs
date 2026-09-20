@@ -5,12 +5,8 @@
 //! mTLS and ALPN.
 
 use std::collections::HashMap;
-use std::io;
-use std::pin::Pin;
 use std::sync::{Mutex, OnceLock};
-use std::task::{Context, Poll};
 
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tracing::warn;
 
 use super::{EchOpts, TlsConfig};
@@ -470,8 +466,9 @@ impl BoringInner {
             b.set_verify(boring::ssl::SslVerifyMode::PEER);
             // Mozilla CA bundle (plus any `additional_roots`) as the verify
             // store, rebuilt per distinct connector cache key from the shared,
-            // pre-parsed root certs. `set_cert_store_builder` is the
-            // non-deprecated setter on boring 4.x.
+            // pre-parsed root certs. `set_cert_store_builder` hands over the
+            // builder as-is; boring 4.x deprecated the `X509Store` variant and
+            // 5.x lifted that again, so either works.
             let store = build_root_store(&config.additional_roots)?;
             b.set_cert_store_builder(store);
         }
@@ -510,19 +507,13 @@ impl BoringInner {
         // Multiplexed transports (anytls, smux, …) implement `poll_flush` as a
         // barrier on a writer-task acknowledgement, so the first poll almost
         // always returns `Poll::Pending`.  tokio-boring's BIO bridge maps that
-        // Pending to `ErrorKind::WouldBlock`, and boring 4.22.0's
-        // `BIO_CTRL_FLUSH` handler stores the error but never calls
-        // `BIO_set_retry_write` — so `SSL_get_error` maps a routine flush retry
-        // to fatal `SSL_ERROR_SYSCALL`, surfacing the misleading "TLS handshake
-        // failed operation would block" and killing every TLS-over-mux
-        // handshake.  Upstream fixed this in cloudflare/boring@ed76885 but no
-        // 4.x release carries it, and quiche pins us to `boring ^4.3`.
-        // `TolerantFlushStream` reports a pending flush as complete, which is
-        // safe here: `BIO_flush` exists only to push an already-written flight
-        // onto the wire, and mux writers drain queued frames in order before
-        // the flush marker, so the bytes go out promptly without waiting on
-        // the barrier.
-        let inner = TolerantFlushStream::new(inner);
+        // Pending to `ErrorKind::WouldBlock`; boring 5.x carries
+        // cloudflare/boring@ed76885, which sets `BIO_set_retry_write` on
+        // `BIO_CTRL_FLUSH`, so the handshake retries as `WANT_WRITE` instead of
+        // dying with `SSL_ERROR_SYSCALL` (#569).  The 4.x-era
+        // `TolerantFlushStream` workaround from #571 is gone;
+        // `d1_tls_handshake_over_pending_flush_stream` guards the upstream
+        // behaviour.
         let mut cfg = self
             .connector
             .configure()
@@ -634,73 +625,6 @@ impl LazyBoringInner {
 
     pub(super) async fn connect(&self, inner: Box<dyn Stream>) -> Result<Box<dyn Stream>> {
         self.get_or_init()?.connect(inner).await
-    }
-}
-
-/// Stream adapter that reports a still-pending `poll_flush` as complete.
-///
-/// See the comment at the [`BoringInner::connect`] call site: this works
-/// around boring 4.22.0's `BIO_CTRL_FLUSH` handler never setting
-/// `BIO_set_retry_write`, which turns a routine `Poll::Pending` flush on a
-/// multiplexed transport into fatal `SSL_ERROR_SYSCALL`.  Only the flush
-/// result is masked — reads, writes and shutdown delegate unchanged, so a
-/// genuinely wedged writer still surfaces as a stalled read rather than a
-/// falsely-successful flush.
-///
-/// TODO(#572): remove once quiche releases >0.29.3 and `boring` upgrades to
-/// 5.x — upstream fix ed76885 then handles retriable flush errors natively,
-/// and this wrapper is a no-op for streams whose flush is Ready anyway, so
-/// removal is zero-risk.
-struct TolerantFlushStream<S> {
-    inner: S,
-}
-
-impl<S> TolerantFlushStream<S> {
-    fn new(inner: S) -> Self {
-        Self { inner }
-    }
-}
-
-impl<S: AsyncRead + Unpin> AsyncRead for TolerantFlushStream<S> {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
-    }
-}
-
-impl<S: AsyncWrite + Unpin> AsyncWrite for TolerantFlushStream<S> {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
-    }
-
-    fn poll_write_vectored(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        bufs: &[io::IoSlice<'_>],
-    ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.get_mut().inner).poll_write_vectored(cx, bufs)
-    }
-
-    fn is_write_vectored(&self) -> bool {
-        self.inner.is_write_vectored()
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match Pin::new(&mut self.get_mut().inner).poll_flush(cx) {
-            Poll::Pending => Poll::Ready(Ok(())),
-            ready => ready,
-        }
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
     }
 }
 
