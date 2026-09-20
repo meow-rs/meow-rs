@@ -59,6 +59,12 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **Built-in dashboard Overview loads with live traffic streaming.** Consume
+  `/traffic` through one reconnecting WebSocket instead of waiting for an
+  endless HTTP JSON response. Mode, listeners, and connections load
+  independently; changing the API secret refreshes authentication. Add
+  dashboard browser and lifecycle regression tests to CI.
+
 - **Relay groups can now terminate on real protocol adapters, not just
   `http`/`socks5`/`snell`.** Every hop after the first runs
   `ProxyAdapter::connect_over`, which previously only `direct`, `reject`,
