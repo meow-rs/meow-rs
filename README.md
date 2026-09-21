@@ -436,6 +436,24 @@ See [`config.example.yaml`](config.example.yaml) for a full annotated example.
 
 ## Testing
 
+Dashboard tests run the shipped HTML in Chromium against an isolated simulated
+controller, covering navigation, editing, authentication, error handling, and
+live traffic. They do not access a running meow instance or real subscriptions.
+The same suite runs in the `dashboard` CI job; failures retain Playwright traces.
+
+```bash
+cd tests/dashboard
+npm ci
+npx playwright install chromium
+npm test
+```
+
+The dependency-free traffic lifecycle regression tests can also run separately:
+
+```bash
+node --test crates/meow-api/tests/ui_test.cjs
+```
+
 ```bash
 # All unit tests
 cargo test --lib
