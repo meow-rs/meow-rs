@@ -120,7 +120,7 @@ maxminddb = { version = "0.27", features = ["mmap"] }
 dashmap = "6"
 
 # Caching
-lru = "0.16"
+lru = "0.18"
 
 # IP handling
 ipnet = "2"

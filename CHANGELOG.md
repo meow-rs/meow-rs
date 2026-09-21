@@ -48,6 +48,12 @@ the canonical, in-repo source a release is cut from.
   `boring_tls_test` are unchanged. The 4.x-era `TolerantFlushStream` flush
   workaround is removed (see the #569 entry under Fixed). (#572)
 
+- **lru 0.16 → 0.18.4.** Clears RUSTSEC-2026-0253 (`LruCache::pop()` not
+  panic-safe, fixed in 0.18.2). Not reachable here — the release profile is
+  `panic = "abort"` and the DNS cache / fake-IP keys (`Arc<str>`, `SmolStr`,
+  `IpAddr`) have no panicking `Drop` — so no behaviour change; the lock loses
+  its last `hashbrown` 0.16 copy (lru now shares the existing 0.17).
+
 - **`ipv6` is now effective end-to-end and keeps the `false` default.** The
   `ipv6` flag previously only gated a handful of code paths — the resolver
   queried A and AAAA regardless — so the documented `false` default and
