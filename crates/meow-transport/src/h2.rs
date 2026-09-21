@@ -88,8 +88,10 @@ impl Transport for H2Layer {
             .body(())
             .map_err(|e| TransportError::Config(format!("h2: invalid request config: {e}")))?;
 
-        // HTTP/2 client handshake over the inner stream.
-        let (mut h2, conn) = h2::client::handshake(inner)
+        // HTTP/2 client handshake over the inner stream, with the
+        // proxy-sized receive windows (see `h2_common::client_builder`).
+        let (mut h2, conn) = crate::h2_common::client_builder()
+            .handshake::<_, bytes::Bytes>(inner)
             .await
             .map_err(|e| TransportError::H2(e.to_string()))?;
 

@@ -14,6 +14,7 @@
 //! | D5 | `h2_round_trip_with_deferred_response` — server withholds response HEADERS until the first client DATA frame (issue #377) |
 //! | D6 | `h2_pending_write_retried_with_same_buffer_keeps_parking` — a parked write retried with the same remainder keeps parking |
 //! | D7 | `h2_pending_write_retried_with_changed_buffer_is_rejected` — a parked write retried with different bytes is rejected, not sent stale |
+//! | D8 | `h2_receive_window_absorbs_1mib_before_first_read` — the client advertises proxy-sized receive windows, so a server can push 1 MiB before the first read (issue #495) |
 
 mod support;
 
@@ -26,6 +27,7 @@ use meow_transport::h2::{H2Config, H2Layer};
 use meow_transport::h2_common::{H2Stream, RecvState};
 use meow_transport::Transport;
 use meow_transport::TransportError;
+use support::h2_push::spawn_h2_push_server;
 use support::h2_stalled::{stalled_h2_parts, STALLED_PAYLOAD_LEN};
 use support::loopback::{spawn_h2_server, spawn_h2_server_deferred_response};
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -378,4 +380,43 @@ async fn h2_pending_write_retried_with_changed_buffer_is_rejected() {
         error.to_string().contains("write buffer changed"),
         "unexpected error: {error}"
     );
+}
+
+// ─── D8: receive windows ──────────────────────────────────────────────────────
+
+/// D8: the client must advertise receive windows well above h2's 65 535-byte
+/// default (issue #495 item 12).  The server pushes 1 MiB while the client
+/// does not read a single byte; with the default windows it would park after
+/// 64 KiB waiting for a WINDOW_UPDATE that only a read can produce, and the
+/// timeout below would fire.
+#[tokio::test]
+async fn h2_receive_window_absorbs_1mib_before_first_read() {
+    const PAYLOAD_SIZE: usize = 1024 * 1024;
+
+    let (client_io, server_io) = tokio::io::duplex(256 * 1024);
+    let payload: Vec<u8> = (0u8..=255).cycle().take(PAYLOAD_SIZE).collect();
+    let pushed = spawn_h2_push_server(server_io, payload.clone());
+
+    let layer = H2Layer::new(H2Config {
+        path: "/".into(),
+        hosts: vec!["example.com".into()],
+    });
+    let mut stream = layer
+        .connect(Box::new(client_io))
+        .await
+        .expect("h2 connect");
+
+    // Deliberately no read until the server reports the whole push done.
+    let pushed = tokio::time::timeout(Duration::from_secs(5), pushed)
+        .await
+        .expect("server must push 1 MiB into the client's receive window without a read")
+        .expect("push server task");
+    assert_eq!(pushed, PAYLOAD_SIZE);
+
+    let mut recv_buf = Vec::with_capacity(PAYLOAD_SIZE);
+    stream
+        .read_to_end(&mut recv_buf)
+        .await
+        .expect("read_to_end 1 MiB");
+    assert_eq!(recv_buf, payload, "pushed bytes must arrive intact");
 }

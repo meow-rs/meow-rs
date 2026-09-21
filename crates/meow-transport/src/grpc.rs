@@ -99,8 +99,10 @@ impl Transport for GrpcLayer {
             .body(())
             .map_err(|e| TransportError::Config(format!("grpc: invalid request config: {e}")))?;
 
-        // Perform the HTTP/2 client handshake over the inner stream.
-        let (mut h2, conn) = h2::client::handshake(inner)
+        // Perform the HTTP/2 client handshake over the inner stream, with
+        // the proxy-sized receive windows (see `h2_common::client_builder`).
+        let (mut h2, conn) = crate::h2_common::client_builder()
+            .handshake::<_, Bytes>(inner)
             .await
             .map_err(|e| TransportError::Grpc(e.to_string()))?;
 

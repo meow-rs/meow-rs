@@ -50,8 +50,13 @@ impl Session {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let (send_request, connection) =
-            h2::client::handshake(io).await.map_err(io::Error::other)?;
+        // Proxy-sized receive windows (4 MiB / stream, 16 MiB / connection)
+        // instead of h2's 64 KiB default — see
+        // `meow_transport::h2_common::client_builder`.
+        let (send_request, connection) = meow_transport::h2_common::client_builder()
+            .handshake::<_, Bytes>(io)
+            .await
+            .map_err(io::Error::other)?;
         let dead = Arc::new(AtomicBool::new(false));
         let driver_dead = Arc::clone(&dead);
         // Drive SETTINGS / WINDOW_UPDATE / PING frames; the future resolves
@@ -161,6 +166,73 @@ mod tests {
                 });
             }
         })
+    }
+
+    /// Server that answers 200 at once and pushes `body` as fast as the
+    /// *client's* receive windows allow, resolving with the byte count once
+    /// h2 has accepted everything.  Against the 64 KiB default windows it
+    /// parks after 65 535 bytes until the client reads.
+    fn run_push_server<S>(io: S, body: Vec<u8>) -> tokio::sync::oneshot::Receiver<usize>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let mut connection = h2::server::handshake(io).await.expect("handshake");
+            let (request, mut respond) = connection
+                .accept()
+                .await
+                .expect("one request")
+                .expect("accept");
+            tokio::spawn(async move { while connection.accept().await.is_some() {} });
+            let response = http::Response::builder()
+                .status(StatusCode::OK)
+                .body(())
+                .expect("static response");
+            let mut send = respond.send_response(response, false).expect("respond");
+            let mut remaining = Bytes::from(body);
+            let total = remaining.len();
+            while !remaining.is_empty() {
+                send.reserve_capacity(remaining.len());
+                let granted = std::future::poll_fn(|cx| send.poll_capacity(cx))
+                    .await
+                    .expect("stream open")
+                    .expect("capacity");
+                let chunk = remaining.split_to(granted.min(remaining.len()));
+                send.send_data(chunk, false).expect("send_data");
+            }
+            send.send_data(Bytes::new(), true).expect("eos");
+            drop(request);
+            let _ = done_tx.send(total);
+        });
+        done_rx
+    }
+
+    /// The session must advertise receive windows well above h2's 65 535-byte
+    /// default (issue #495 item 12): a server pushes 1 MiB down one stream
+    /// while the client does not read, which with the default windows parks
+    /// after 64 KiB waiting for a WINDOW_UPDATE only a read can produce.
+    #[tokio::test]
+    async fn receive_window_absorbs_1mib_before_first_read() {
+        const PAYLOAD_SIZE: usize = 1024 * 1024;
+
+        let (client_io, server_io) = tokio::io::duplex(256 * 1024);
+        let payload: Vec<u8> = (0u8..=255).cycle().take(PAYLOAD_SIZE).collect();
+        let pushed = run_push_server(server_io, payload.clone());
+
+        let session = Session::client(client_io).await.unwrap();
+        let mut stream = session.open_stream().await.unwrap();
+
+        // Deliberately no read until the server reports the whole push done.
+        let pushed = tokio::time::timeout(Duration::from_secs(5), pushed)
+            .await
+            .expect("server must push 1 MiB into the client's receive window without a read")
+            .expect("push server task");
+        assert_eq!(pushed, PAYLOAD_SIZE);
+
+        let mut recv = Vec::with_capacity(PAYLOAD_SIZE);
+        stream.read_to_end(&mut recv).await.unwrap();
+        assert_eq!(recv, payload, "pushed bytes must arrive intact");
     }
 
     #[tokio::test]
