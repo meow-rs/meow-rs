@@ -1,0 +1,10 @@
+{
+  "name": "meow-dashboard-tests",
+  "private": true,
+  "scripts": {
+    "test": "node --test ../../crates/meow-api/tests/ui_test.cjs && playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.58.2"
+  }
+}

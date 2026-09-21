@@ -256,12 +256,10 @@ function esc(s) { if (!s) return ''; return s.replace(/&/g,'&amp;').replace(/</g
 
 async function loadOverview() {
   try {
-    const [cfg, traffic, conns] = await Promise.all([api('/configs'), api('/traffic'), api('/connections')]);
+    const [cfg, conns] = await Promise.all([api('/configs'), api('/connections')]);
     document.querySelectorAll('#mode-selector button').forEach(b => {
       b.classList.toggle('active', b.textContent.toLowerCase() === cfg.mode);
     });
-    document.getElementById('stat-upload').textContent = formatBytes(traffic.up);
-    document.getElementById('stat-download').textContent = formatBytes(traffic.down);
     document.getElementById('stat-connections').textContent = conns.connections.length;
     // Listeners
     const li = document.getElementById('listeners-info');
@@ -276,7 +274,7 @@ async function loadOverview() {
     for (const p of ports) {
       li.innerHTML += `<div class="stat-box"><div class="value" style="font-size:20px">${esc(String(p.value))}</div><div class="label">${esc(p.label)}</div></div>`;
     }
-  } catch (e) { console.error(e); }
+  } catch (e) { toast('Failed to load overview: ' + e.message, 'error'); }
 }
 
 async function setMode(mode) {
@@ -553,6 +551,43 @@ async function saveConfig() {
   } catch (e) { toast('Save failed: ' + e.message, 'error'); }
 }
 
+// /traffic is a continuous stream, not a finite JSON response. Keep one
+// WebSocket open and update counters as samples arrive.
+let trafficSocket;
+let trafficReconnect;
+function connectTraffic() {
+  clearTimeout(trafficReconnect);
+  if (trafficSocket) {
+    trafficSocket.onclose = null;
+    trafficSocket.close();
+  }
+  const url = new URL('/traffic', API);
+  url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+  const secret = localStorage.getItem('meow-secret') || '';
+  if (secret) url.searchParams.set('token', secret);
+  const socket = new WebSocket(url);
+  trafficSocket = socket;
+  socket.onmessage = event => {
+    if (socket !== trafficSocket) return;
+    try {
+      const traffic = JSON.parse(event.data);
+      document.getElementById('stat-upload').textContent = formatBytes(traffic.up);
+      document.getElementById('stat-download').textContent = formatBytes(traffic.down);
+    } catch (e) { console.error('Invalid traffic sample', e); }
+  };
+  socket.onclose = () => {
+    trafficReconnect = setTimeout(connectTraffic, 2000);
+  };
+}
+window.addEventListener('pagehide', () => {
+  clearTimeout(trafficReconnect);
+  if (trafficSocket) {
+    trafficSocket.onclose = null;
+    trafficSocket.close();
+  }
+});
+window.addEventListener('pageshow', () => connectTraffic());
+
 // ── Init ─────────────────────────────────────────────────────────
 
 // Restore API secret from localStorage
@@ -560,15 +595,15 @@ const secretInput = document.getElementById('api-secret');
 secretInput.value = localStorage.getItem('meow-secret') || '';
 secretInput.addEventListener('change', e => {
   localStorage.setItem('meow-secret', e.target.value);
+  connectTraffic();
+  loadOverview();
 });
 
 loadOverview();
 setInterval(async () => {
   if (!document.getElementById('tab-overview').classList.contains('hidden')) {
     try {
-      const [traffic, conns] = await Promise.all([api('/traffic'), api('/connections')]);
-      document.getElementById('stat-upload').textContent = formatBytes(traffic.up);
-      document.getElementById('stat-download').textContent = formatBytes(traffic.down);
+      const conns = await api('/connections');
       document.getElementById('stat-connections').textContent = conns.connections.length;
     } catch (e) {}
   }
