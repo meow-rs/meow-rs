@@ -8,7 +8,7 @@ use meow_dns::resolver::{
 };
 use meow_dns::upstream::{NameServerEntry, NameServerUrl};
 use meow_dns::{DnsClient, HostOrIp, Resolver};
-use meow_rules::RuleSetBehavior;
+use meow_rules::{RuleSet, RuleSetBehavior};
 use meow_trie::DomainTrie;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -466,9 +466,12 @@ async fn build_nameserver_policy(
                     }
                     RuleSetBehavior::Domain => {}
                 }
+                // The provider reads through to its current set (issue
+                // #553), so refreshes are seen here without cloning a
+                // snapshot `Arc` per query.
                 let provider = Arc::clone(provider);
                 patterns.push(PolicyPattern::Matcher(Arc::new(move |domain: &str| {
-                    provider.snapshot().matches_domain(domain)
+                    provider.matches_domain(domain)
                 })));
                 continue;
             }

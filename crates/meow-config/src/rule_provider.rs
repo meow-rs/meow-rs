@@ -13,6 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context, Result};
 use meow_common::adapter::Proxy;
 use meow_common::atomic::AtomicU;
+use meow_common::{Metadata, RuleMatchHelper};
 use meow_rules::{
     build_rule_set, build_rule_set_from_mrs_with_behavior, is_mrs_bytes, ParserContext, RuleSet,
     RuleSetBehavior, RuleSetFormat,
@@ -82,8 +83,50 @@ impl std::fmt::Debug for RuleProvider {
     }
 }
 
+/// Live read-through: the provider *is* the `Arc<dyn RuleSet>` a `RULE-SET`
+/// rule and the DNS `nameserver-policy` matcher hold (see
+/// [`live_ruleset_map`]), so a `refresh()` — periodic or via
+/// `PUT /providers/rules/{name}` — is observed by the very next match with
+/// no config rebuild (issue #553).  Every call takes the `parking_lot` read
+/// lock for the duration of the delegated call: two uncontended atomic ops,
+/// no allocation and no `Arc` clone on the match path; `refresh()` swaps
+/// the inner pointer under the write lock.
+impl RuleSet for RuleProvider {
+    fn behavior(&self) -> RuleSetBehavior {
+        self.behavior
+    }
+
+    fn matches(&self, metadata: &Metadata, helper: &RuleMatchHelper) -> bool {
+        self.rules.read().matches(metadata, helper)
+    }
+
+    fn len(&self) -> usize {
+        self.rules.read().len()
+    }
+
+    fn should_resolve_ip(&self) -> bool {
+        self.rules.read().should_resolve_ip()
+    }
+
+    fn should_find_process(&self) -> bool {
+        self.rules.read().should_find_process()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.rules.read().is_empty()
+    }
+
+    fn matches_domain(&self, domain: &str) -> bool {
+        self.rules.read().matches_domain(domain)
+    }
+}
+
 impl RuleProvider {
     /// Return a snapshot of the current rule set.
+    ///
+    /// A snapshot is detached from later `refresh()`es — anything that must
+    /// keep following the provider (rules, DNS policy matchers) should hold
+    /// the provider itself as its `Arc<dyn RuleSet>` instead (issue #553).
     pub fn snapshot(&self) -> Arc<dyn RuleSet> {
         self.rules.read().clone()
     }
@@ -122,6 +165,20 @@ impl RuleProvider {
         .map_err(|e| anyhow!("parse task panicked: {e}"))??;
         let count = boxed.len();
         let new_rules: Arc<dyn RuleSet> = Arc::from(boxed);
+        // The compiled rule table bakes each RULE-SET slot's "needs IP /
+        // needs process" demand at build time; behavior is fixed per
+        // provider, so only a classical set gaining or losing IP / PROCESS
+        // entries can move them. Say so instead of silently matching with
+        // stale demands until the next reload.
+        let demands = |set: &dyn RuleSet| (set.should_resolve_ip(), set.should_find_process());
+        if demands(&**self.rules.read()) != demands(&*new_rules) {
+            warn!(
+                provider = %self.name,
+                "rule-provider refresh changed whether the set needs IP resolution or \
+                 process lookup; live RULE-SET rules keep the previous demand flags \
+                 until the next config reload"
+            );
+        }
         *self.rules.write() = new_rules;
         self.touch();
         debug!(provider = %self.name, "rule-provider refreshed: {} rules", count);
@@ -313,15 +370,23 @@ pub fn load_providers_prefetched(
     out
 }
 
-/// Build the `HashMap<name, Arc<dyn RuleSet>>` snapshot that the rule parser
-/// needs. Snapshots the current rule set from each provider; safe to call
-/// concurrently with refresh.
-pub fn snapshot_ruleset_map(
+/// Build the `HashMap<name, Arc<dyn RuleSet>>` the rule parser needs.
+///
+/// Each value is the provider itself (see the [`RuleSet`] impl on
+/// [`RuleProvider`]), *not* a snapshot of its current set: `RULE-SET` rules
+/// built from this map keep following `refresh()` for as long as they live.
+/// The previous snapshot map detached every rule from later refreshes, so a
+/// provider with `interval:` logged "refreshed: N rules" while traffic kept
+/// matching the startup content (issue #553).
+pub fn live_ruleset_map(
     providers: &HashMap<String, Arc<RuleProvider>>,
 ) -> HashMap<String, Arc<dyn RuleSet>> {
     providers
         .iter()
-        .map(|(name, p)| (name.clone(), p.snapshot()))
+        .map(|(name, p)| {
+            let live: Arc<dyn RuleSet> = Arc::clone(p) as Arc<RuleProvider>;
+            (name.clone(), live)
+        })
         .collect()
 }
 
@@ -1289,7 +1354,7 @@ header:
     }
 
     #[test]
-    fn snapshot_ruleset_map_returns_all_providers() {
+    fn live_ruleset_map_returns_all_providers() {
         let mut providers = HashMap::new();
         providers.insert(
             "p1".to_string(),
@@ -1320,10 +1385,120 @@ header:
             },
         );
         let out = load_providers(&providers, None, &ctx(), None);
-        let ruleset_map = snapshot_ruleset_map(&out);
+        let ruleset_map = live_ruleset_map(&out);
         assert_eq!(ruleset_map.len(), 2);
         assert!(ruleset_map.contains_key("p1"));
         assert!(ruleset_map.contains_key("p2"));
+        // The map hands out the providers themselves, not detached snapshots.
+        assert!(Arc::ptr_eq(
+            &(Arc::clone(&out["p1"]) as Arc<dyn RuleSet>),
+            &ruleset_map["p1"]
+        ));
+        assert_eq!(ruleset_map["p1"].behavior(), RuleSetBehavior::Domain);
+        assert_eq!(ruleset_map["p2"].behavior(), RuleSetBehavior::IpCidr);
+        assert_eq!(ruleset_map["p1"].len(), 1);
+    }
+
+    /// Serve `bodies` one per accepted connection, in order, then exit.
+    fn serve_in_order(
+        listener: std::net::TcpListener,
+        bodies: Vec<&'static str>,
+    ) -> std::thread::JoinHandle<()> {
+        listener.set_nonblocking(true).unwrap();
+        std::thread::spawn(move || {
+            for body in bodies {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(
+                                Instant::now() < deadline,
+                                "timed out waiting for HTTP client"
+                            );
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(e) => panic!("HTTP test listener failed: {e}"),
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+                let mut buf = [0_u8; 1024];
+                let n = stream.read(&mut buf).unwrap();
+                assert!(n > 0, "expected an HTTP request from the client");
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+        })
+    }
+
+    /// Issue #553: a `RULE-SET` rule parsed against the provider map must
+    /// observe `refresh()` without a config rebuild.  Before the fix the
+    /// map held detached snapshots, so the same rule object kept matching
+    /// the startup payload after a successful refresh.
+    #[tokio::test]
+    async fn rule_set_rule_observes_refresh_without_rebuild() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = serve_in_order(
+            listener,
+            vec![
+                "payload:\n  - 'old.example'\n",
+                "payload:\n  - 'new.example'\n",
+            ],
+        );
+
+        let mut providers = HashMap::new();
+        providers.insert(
+            "live".to_string(),
+            RawRuleProvider {
+                url: Some(format!("http://{addr}/rules.yaml")),
+                ..http_cfg(None)
+            },
+        );
+        let out = load_providers(&providers, None, &ctx(), None);
+        let provider = out.get("live").expect("HTTP provider should load");
+        assert_eq!(provider.rule_count(), 1);
+
+        // Exactly what the config rebuild does: parse `rules:` against the
+        // provider map, then keep the resulting rule objects.
+        let map = live_ruleset_map(&out);
+        let rules = crate::rule_parser::parse_rules_full(
+            &["RULE-SET,live,DIRECT".to_string()],
+            &map,
+            &ctx(),
+            &HashMap::new(),
+        );
+        assert_eq!(rules.len(), 1);
+        let rule = &rules[0];
+        let helper = RuleMatchHelper;
+        let old = Metadata {
+            host: "old.example".into(),
+            ..Metadata::default()
+        };
+        let new = Metadata {
+            host: "new.example".into(),
+            ..Metadata::default()
+        };
+        assert!(rule.match_metadata(&old, &helper));
+        assert!(!rule.match_metadata(&new, &helper));
+
+        let before = provider.updated_at_secs();
+        provider.refresh(&ctx()).await.expect("refresh");
+        server.join().unwrap();
+        assert!(provider.updated_at_secs() >= before);
+
+        // Same rule object, no rebuild: the refreshed payload is what matches.
+        assert!(
+            rule.match_metadata(&new, &helper),
+            "refreshed provider content must reach the live RULE-SET rule (issue #553)"
+        );
+        assert!(!rule.match_metadata(&old, &helper));
+        assert_eq!(map["live"].len(), 1);
     }
 
     // -- issue #429: provider paths must stay inside the cache dir ---------

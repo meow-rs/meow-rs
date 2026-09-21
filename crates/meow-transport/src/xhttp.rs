@@ -164,7 +164,9 @@ impl Transport for XhttpLayer {
             .body(())
             .map_err(|e| TransportError::Config(format!("xhttp: invalid request config: {e}")))?;
 
-        let (mut h2, conn) = h2::client::handshake(inner)
+        // Proxy-sized receive windows — see `h2_common::client_builder`.
+        let (mut h2, conn) = crate::h2_common::client_builder()
+            .handshake::<_, bytes::Bytes>(inner)
             .await
             .map_err(|e| TransportError::Xhttp(e.to_string()))?;
 

@@ -82,6 +82,29 @@ the canonical, in-repo source a release is cut from.
   through it. Load-balance still drops its `use:` slots at parse
   (#555 item 3) and providers have no scheduled check of their own yet.
 
+- **`RULE-SET` rules now see refreshed rule-provider content without a
+  config rebuild** (#553). The rule parser received a snapshot `Arc` of
+  each provider's set, so a periodic refresh or `PUT /providers/rules/{name}`
+  logged "refreshed: N rules" and bumped `updated_at` while live traffic
+  kept matching the startup payload until the next `PUT /configs` or
+  restart. `RuleProvider` now implements `RuleSet` by reading through its
+  lock, and the parser map (`rule_provider::live_ruleset_map`, replacing
+  `snapshot_ruleset_map`) hands rules the provider itself; the DNS
+  `nameserver-policy` `rule-set:` matcher reads through the same way
+  instead of cloning a snapshot per query. Providers rebuilt by a config
+  reload still bypass the API registry (#543 item 2).
+
+- **HTTP/2 transports (gRPC, h2, xhttp) and the h2mux multiplexer now
+  advertise 4 MiB per-stream / 16 MiB per-connection receive windows.**
+  Every client handshake used h2's defaults, so the download direction of a
+  gRPC / h2 / xhttp / h2mux stream stalled every 64 KiB waiting for a
+  WINDOW_UPDATE round-trip — a throughput ceiling of roughly 64 KiB per RTT
+  (#495 item 12). The windows now match Go's `http2.Transport` defaults,
+  which is what mihomo's gun / h2 clients and sing-mux's h2mux client
+  advertise; the upload direction is unchanged (bounded by the server's
+  window). Per-stream memory stays bounded by the 4 MiB window because
+  every read still releases capacity chunk by chunk.
+
 - **Built-in dashboard Overview loads with live traffic streaming.** Consume
   `/traffic` through one reconnecting WebSocket instead of waiting for an
   endless HTTP JSON response. Mode, listeners, and connections load

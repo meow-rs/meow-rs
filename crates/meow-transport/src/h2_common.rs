@@ -11,6 +11,38 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 const DRIVER_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// Per-stream receive window advertised in the client SETTINGS
+/// (`SETTINGS_INITIAL_WINDOW_SIZE`).  h2's default is the RFC 9113 initial
+/// value, 65 535 bytes — sized for browser page loads.  A proxied TCP
+/// connection is one bulk stream, and with a 64 KiB window its download
+/// side stalls every 64 KiB waiting for a WINDOW_UPDATE round-trip, which
+/// caps throughput at roughly 64 KiB per RTT.  4 MiB matches Go's
+/// `http2.Transport` default (`transportDefaultStreamFlow`), i.e. what
+/// mihomo's gun / h2 clients and sing-mux's h2mux client advertise, so the
+/// download direction can now keep as much in flight as the upload
+/// direction already could (issue #495 item 12).
+pub const INITIAL_STREAM_WINDOW: u32 = 4 * 1024 * 1024;
+
+/// Connection-level receive window, sent as a WINDOW_UPDATE on stream 0
+/// right after the preface.  It must exceed the per-stream window or a
+/// single stream could never use its full allowance; 16 MiB lets a few
+/// concurrent h2mux streams run at full rate while still bounding how much
+/// unread data one physical connection can hold (per-stream windows bound
+/// the rest).
+pub const INITIAL_CONNECTION_WINDOW: u32 = 16 * 1024 * 1024;
+
+/// h2 client builder carrying the flow-control windows above.  Every
+/// client-side h2 handshake in the workspace (gRPC, h2, xhttp, sing-h2mux)
+/// goes through this so the windows cannot silently fall back to the
+/// 64 KiB default at one site but not another.
+pub fn client_builder() -> h2::client::Builder {
+    let mut builder = h2::client::Builder::new();
+    builder
+        .initial_window_size(INITIAL_STREAM_WINDOW)
+        .initial_connection_window_size(INITIAL_CONNECTION_WINDOW);
+    builder
+}
+
 /// Accepted response status for a lazily resolved HTTP/2 body.
 #[derive(Clone, Copy)]
 pub enum StatusPolicy {

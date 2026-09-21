@@ -142,8 +142,12 @@ enum RuleOp {
     /// happened once at compile time.
     GeoSite(Box<GeoSiteOp>),
     /// RULE-SET lowered to its shared set handle (one virtual call into the
-    /// set, no rule-level dispatch). Safe to freeze: provider refresh goes
-    /// through `Tunnel::update_rules`, which rebuilds this IR.
+    /// set, no rule-level dispatch). The handle is the `RuleProvider` itself
+    /// (issue #553): `refresh()` swaps the set behind it, so evaluation sees
+    /// new content without an IR rebuild. Only the slot's `demands_ip` /
+    /// `demands_process` flags are frozen at build time — a classical set
+    /// that gains or loses IP / PROCESS entries keeps the old flags until
+    /// the next config reload (the provider warns when that happens).
     RuleSetRef(RuleSetHandle),
     /// GEOIP / SRC-GEOIP / IP-ASN lowered to their shared interval sets.
     IpRanges {
@@ -2504,6 +2508,90 @@ mod tests {
             .match_rules(&meta, &rules, &|name| name != "A")
             .expect("must match");
         assert_eq!(result.adapter_name, "B");
+    }
+
+    /// A set whose contents can be swapped behind one `Arc`, the way
+    /// `RuleProvider::refresh` replaces the loaded set (issue #553).
+    #[derive(Debug)]
+    struct SwappableSet {
+        hosts: parking_lot::RwLock<Vec<String>>,
+    }
+
+    impl RuleSet for SwappableSet {
+        fn behavior(&self) -> RuleSetBehavior {
+            RuleSetBehavior::Domain
+        }
+
+        fn matches(&self, metadata: &Metadata, _helper: &RuleMatchHelper) -> bool {
+            self.hosts
+                .read()
+                .iter()
+                .any(|h| h == metadata.host.as_str())
+        }
+
+        fn len(&self) -> usize {
+            self.hosts.read().len()
+        }
+    }
+
+    /// Issue #553: `RuleSetRef` holds the provider's `Arc<dyn RuleSet>`
+    /// itself, so a refresh that swaps the set behind it must be visible to
+    /// the compiled rules without a rebuild — on the strict and the lazy
+    /// scan path alike. Guards against anyone re-introducing a build-time
+    /// snapshot of the set.
+    #[test]
+    fn rule_set_ref_reads_through_to_swapped_contents() {
+        let live = Arc::new(SwappableSet {
+            hosts: parking_lot::RwLock::new(vec!["old.example".to_string()]),
+        });
+        let handle = Arc::clone(&live) as Arc<dyn RuleSet>;
+        let rules: Vec<Box<dyn Rule>> = vec![
+            Box::new(RuleSetRule::new("prov", handle, "A", true)),
+            Box::new(FinalRule::new("DIRECT")),
+        ];
+        let set = CompiledRuleSet::build(&rules);
+
+        let meta = |host: &str| Metadata {
+            host: host.into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+        let strict = |host: &str| -> String {
+            set.match_rules(&meta(host), &rules, &|_| true)
+                .expect("FINAL always matches")
+                .adapter_name
+                .to_string()
+        };
+        let lazy = |host: &str| -> String {
+            match set.match_rules_lazy(&meta(host), &rules, &|_| true) {
+                LazyMatchOutcome::Matched(result) => result.adapter_name.to_string(),
+                LazyMatchOutcome::NeedsEnrichment { .. } => {
+                    panic!("a domain set never demands enrichment")
+                }
+                LazyMatchOutcome::NoMatch => panic!("FINAL always matches"),
+            }
+        };
+
+        assert_eq!(strict("old.example"), "A");
+        assert_eq!(strict("new.example"), "DIRECT");
+        assert_eq!(lazy("old.example"), "A");
+        assert_eq!(lazy("new.example"), "DIRECT");
+
+        // Simulate a provider refresh: new contents, same Arc, no rebuild.
+        *live.hosts.write() = vec!["new.example".to_string()];
+
+        assert_eq!(
+            strict("new.example"),
+            "A",
+            "compiled IR must read the refreshed set through the shared handle"
+        );
+        assert_eq!(
+            strict("old.example"),
+            "DIRECT",
+            "entries dropped by the refresh must stop matching"
+        );
+        assert_eq!(lazy("new.example"), "A");
+        assert_eq!(lazy("old.example"), "DIRECT");
     }
 
     #[test]

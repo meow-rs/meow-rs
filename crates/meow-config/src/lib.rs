@@ -1317,7 +1317,7 @@ fn rebuild_from_raw_impl(
         ),
         _ => HashMap::new(),
     };
-    let ruleset_map = rule_provider::snapshot_ruleset_map(&providers);
+    let ruleset_map = rule_provider::live_ruleset_map(&providers);
 
     // Parse sub-rules before top-level rules so that SUB-RULE entries in
     // `rules:` can resolve against already-built blocks.
