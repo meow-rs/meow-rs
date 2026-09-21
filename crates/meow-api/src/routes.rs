@@ -1121,12 +1121,13 @@ async fn apply_raw_to_tunnel(
     // the new generation's; reading `tunnel.resolver()` there would already
     // see the candidate and never detect a change (issue #533 review).
     let prior_resolver = state.tunnel.resolver();
-    // Install the rebuilt resolver before the route swap drops the old
-    // registry cell: the old resolver's chained `#name` adapters would fail
-    // closed in the gap until `publish_dns` runs (issue #533). Idempotent —
-    // `publish_dns` installs the same Arc again.
+    // Publish the rebuilt resolver to every consumer before the route swap
+    // drops the old registry cell: a `#name` upstream still resolving
+    // through the standalone DNS server's or host hook's OLD resolver
+    // would fail closed in the gap until `publish_dns` runs (issue #533
+    // review). Idempotent — `publish_dns` installs the same Arc again.
     if let Some(dns) = &dns {
-        state.tunnel.set_resolver(Arc::clone(&dns.resolver));
+        install_resolver_everywhere(&state.tunnel, state.dns_server.as_ref(), dns);
     }
     state.tunnel.update_routing(proxies, rules, dialer_registry);
     // Commit point reached: every fallible check passed. The candidate's
@@ -1265,15 +1266,22 @@ pub async fn reconcile_dns_config(
     })
 }
 
-/// Publish a rebuilt [`meow_config::DnsConfig`]: swap the tunnel's resolver
-/// slot (routing lookups + built-in DIRECT), refresh the standalone DNS
-/// server (in-place resolver swap when the listen addr is unchanged,
-/// rebind otherwise), and re-install the process-wide host-resolver hook
-/// under the same policy startup uses (issue #514).
-pub async fn publish_dns(
+/// Publish `dns.resolver` to every consumer that must not lag a route
+/// swap: the tunnel slot, the process-wide host-resolver hook, and a live
+/// standalone `dns.listen` server's resolver slot.
+///
+/// Commit paths call this BEFORE `update_routing`/`reload_routing` — the
+/// swap drops the old `RouteTable` and its dialer-registry cell, so a
+/// consumer still serving the old resolver would see its chained `#name`
+/// upstreams fail closed until `publish_dns` ran (issue #533 review).
+/// Idempotent: `publish_dns` re-runs the same installs (and additionally
+/// handles listener rebinds). Writing the slot of a soon-to-be-rebound
+/// server is harmless — it either keeps serving on the new generation or
+/// is torn down moments later.
+pub fn install_resolver_everywhere(
     tunnel: &Tunnel,
     dns_server: &RwLock<Option<DnsServerHandle>>,
-    dns: meow_config::DnsConfig,
+    dns: &meow_config::DnsConfig,
 ) {
     tunnel.set_resolver(Arc::clone(&dns.resolver));
 
@@ -1292,17 +1300,30 @@ pub async fn publish_dns(
         meow_common::clear_host_resolver();
     }
 
-    // Standalone `dns.listen` server. One read guard covers the
-    // keep-decision and the swap: `keep` also requires a live serve task —
-    // swapping the slot of a dead one would leave no listener.
+    if let Some(h) = dns_server.read().as_ref() {
+        *h.resolver_slot.write() = Arc::clone(&dns.resolver);
+    }
+}
+
+/// Publish a rebuilt [`meow_config::DnsConfig`]: swap the tunnel's resolver
+/// slot (routing lookups + built-in DIRECT), refresh the standalone DNS
+/// server (in-place resolver swap when the listen addr is unchanged,
+/// rebind otherwise), and re-install the process-wide host-resolver hook
+/// under the same policy startup uses (issue #514).
+pub async fn publish_dns(
+    tunnel: &Tunnel,
+    dns_server: &RwLock<Option<DnsServerHandle>>,
+    dns: meow_config::DnsConfig,
+) {
+    install_resolver_everywhere(tunnel, dns_server, &dns);
+
+    // Standalone `dns.listen` server keep-decision: `keep` also requires a
+    // live serve task — the slot was already swapped above, so an
+    // unchanged listen addr with a live task needs nothing more.
     {
         let guard = dns_server.read();
         if let Some(h) = guard.as_ref() {
             if dns.enabled && dns.listen_addr == Some(h.listen) && !h.task.is_finished() {
-                // Same listen addr: swap the resolver in place — the bound
-                // socket and workers keep running, queries see the new
-                // generation immediately.
-                *h.resolver_slot.write() = Arc::clone(&dns.resolver);
                 info!("DNS resolver hot-swapped on unchanged listen socket");
                 return;
             }
@@ -2390,9 +2411,11 @@ async fn put_configs(
     // generation's (issue #533 review).
     let prior_resolver = state.tunnel.resolver();
     // Same early-install as the warm path: `reload_routing` drops the old
-    // route table — and its registry cell — before `publish_dns` runs below.
+    // route table — and its registry cell — before `publish_dns` runs
+    // below, so every resolver consumer (tunnel, host hook, live
+    // `dns.listen` server) must be on the new generation first.
     if let Some(dns) = &dns {
-        state.tunnel.set_resolver(Arc::clone(&dns.resolver));
+        install_resolver_everywhere(&state.tunnel, state.dns_server.as_ref(), dns);
     }
     let dropped = state
         .tunnel

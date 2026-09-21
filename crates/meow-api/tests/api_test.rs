@@ -3621,4 +3621,70 @@ async fn put_configs_rule_set_policy_uses_candidate_providers() {
         StatusCode::BAD_REQUEST,
         "rule-set: policy referencing a provider absent from the candidate must be rejected"
     );
+    // The rejected commit must not have swapped the live registry — the
+    // candidate carried no providers, so a hoisted commit would silently
+    // empty it (issue #533 review).
+    assert!(
+        state.rule_providers.read().contains_key("doms"),
+        "a rejected commit must leave the live provider registry untouched"
+    );
+}
+
+/// Issue #533 review: a `dns:` section whose nameservers carry `#name`
+/// proxy tags must force a resolver rebuild on EVERY commit — a retained
+/// resolver's captured `#name` adapters hold `Weak`s into the OLD registry
+/// cell, which dies at the route swap. Two PUTs with identical `dns:` but
+/// a changed rule must still swap the resolver generation.
+#[tokio::test]
+async fn put_configs_rebuilds_resolver_when_dns_uses_runtime_refs() {
+    use base64::Engine as _;
+    let state = test_state(RawConfig {
+        rules: Some(vec!["MATCH,DIRECT".into()]),
+        ..Default::default()
+    });
+    let put = |yaml: &str| {
+        let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+        create_router(Arc::clone(&state)).oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+    };
+
+    let yaml = concat!(
+        "mode: rule\n",
+        "dns:\n",
+        "  enable: true\n",
+        "  nameserver:\n",
+        "    - tcp://127.0.0.1:9#hop\n",
+        "proxies:\n",
+        "  - {name: hop, type: socks5, server: 127.0.0.1, port: 11080}\n",
+        "rules:\n",
+        "  - MATCH,DIRECT\n",
+    );
+    assert_eq!(
+        put(yaml).await.unwrap().status(),
+        StatusCode::NO_CONTENT,
+        "config with a `#hop` nameserver must commit"
+    );
+    let first = state.tunnel.resolver();
+
+    // Second commit: identical `dns:` section, a different rule. The
+    // runtime `#hop` ref must still force a resolver rebuild — a retained
+    // resolver would keep resolving through the registry cell that just
+    // died with the route swap.
+    let yaml2 = yaml.replace(
+        "rules:\n  - MATCH,DIRECT\n",
+        "rules:\n  - DOMAIN,example.com,DIRECT\n  - MATCH,DIRECT\n",
+    );
+    assert_eq!(put(&yaml2).await.unwrap().status(), StatusCode::NO_CONTENT);
+    assert!(
+        !Arc::ptr_eq(&first, &state.tunnel.resolver()),
+        "a `#name`-tagged dns section must force a resolver rebuild on every commit"
+    );
 }

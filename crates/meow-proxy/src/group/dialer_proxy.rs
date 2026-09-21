@@ -234,10 +234,19 @@ mod tests {
         );
 
         match adapter.dial_tcp(&meta("example.com", 443)).await {
-            Err(MeowError::Proxy(msg)) => assert!(
-                msg.contains("ghost"),
-                "the error must name the missing dialer: {msg}"
-            ),
+            Err(MeowError::Proxy(msg)) => {
+                assert!(
+                    msg.contains("ghost"),
+                    "the error must name the missing dialer: {msg}"
+                );
+                // The temporary registry dropped at the end of the `new`
+                // call — this is the dead-cell arm, not the live-registry
+                // "name absent" arm (issue #533 review).
+                assert!(
+                    msg.contains("generation dropped"),
+                    "expected the dead-cell wording, got: {msg}"
+                );
+            }
             other => panic!("expected a Proxy error, got {:?}", other.err()),
         }
         assert_eq!(inner.dials(), 0, "the inner outbound must not be dialled");

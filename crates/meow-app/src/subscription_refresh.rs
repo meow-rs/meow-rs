@@ -141,12 +141,18 @@ pub async fn run_loop(
                             )
                             .await;
 
-                            // Install the rebuilt resolver before the route
-                            // swap drops the old registry cell — the old
-                            // resolver's chained `#name` adapters would fail
-                            // closed until `publish_dns` runs (issue #533).
+                            // Publish the rebuilt resolver to every
+                            // consumer before the route swap drops the old
+                            // registry cell — a `#name` upstream resolving
+                            // through the standalone DNS server's or host
+                            // hook's OLD resolver would fail closed until
+                            // `publish_dns` runs (issue #533).
                             if let Ok(Some(dns)) = &dns {
-                                tunnel.set_resolver(Arc::clone(&dns.resolver));
+                                meow_api::routes::install_resolver_everywhere(
+                                    &tunnel,
+                                    dns_server.as_ref(),
+                                    dns,
+                                );
                             }
                             tunnel.update_routing(new_proxies, new_rules, new_registry);
                             // Commit point: the candidate's provider set —

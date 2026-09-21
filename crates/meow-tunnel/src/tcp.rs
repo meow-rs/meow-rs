@@ -200,15 +200,17 @@ pub async fn route_inbound_tcp<C>(
         target.adapter.name()
     );
 
-    // `_route` pins this generation's dialer registry across the dial —
+    // `route` pins this generation's dialer registry across the dial —
     // a mid-dial reload must not strand a chained `dialer-proxy` front hop
-    // on a dead cell (issue #533 review).
+    // on a dead cell (issue #533 review). Held only until the dial
+    // completes: a long-lived relay must not pin the whole generation.
     let ResolvedTarget {
         adapter: proxy,
         rule_name,
         rule_payload,
-        route: _route,
+        route,
     } = target;
+    let mut route = Some(route);
 
     // Track the connection — guard drops it on every exit path, including
     // the abort case where the manual close call below would never run.
@@ -233,7 +235,11 @@ pub async fn route_inbound_tcp<C>(
     // this task, its inbound socket and its stats entry forever.
     guard
         .run_until_closed(async {
-            match with_dial_timeout(proxy.name(), proxy.dial_tcp(&metadata)).await {
+            let dial = with_dial_timeout(proxy.name(), proxy.dial_tcp(&metadata)).await;
+            // All chained front hops resolved during the dial — release the
+            // generation pin before entering the relay loop.
+            drop(route.take());
+            match dial {
                 Ok(mut remote) => {
                     let up = Arc::clone(guard.counters());
                     let dn = Arc::clone(guard.counters());

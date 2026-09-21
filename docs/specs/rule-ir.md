@@ -59,18 +59,18 @@ The IR is not:
 2. `domain_index: Arc<DomainIndex>` is retained for compatibility and tests.
 3. `compiled_rules: Arc<CompiledRuleSet>` is the hot-path execution plan.
 
-Those fields live together in `RouteTable`, which is published through
-`ArcSwap`. A routing lookup takes one `ArcSwap` snapshot, so rules, compiled IR,
-and proxies are all read from the same route-table generation.
+Those fields live together in `RouteTable`, which is published through a
+`parking_lot::RwLock<Arc<RouteTable>>` cell. A routing lookup takes one short
+read lock + `Arc` clone, so rules, compiled IR, and proxies are all read from
+the same route-table generation.
 
 `Tunnel::update_proxies()` does not rebuild rules. It clones the current
 `rules`, `domain_index`, and `compiled_rules` arcs into the new route table and
 replaces only the proxy map. Rule compilation is therefore paid on config/rule
-reload, not proxy refresh. It also retains the current `dialer_registry`
-generation, so it must only be used with maps that still contain the same
-generation's chained adapters — a freshly rebuilt map belongs to
-`Tunnel::update_routing()`, which carries the rebuild's own registry
-(issue #533).
+reload, not proxy refresh. It installs the caller-supplied `dialer_registry`
+alongside the map, so it must only be used with maps built under that registry
+generation — a freshly rebuilt map belongs to `Tunnel::update_routing()`,
+which carries the rebuild's own registry (issue #533).
 
 ## IR Data Model
 

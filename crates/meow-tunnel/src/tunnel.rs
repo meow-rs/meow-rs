@@ -532,7 +532,7 @@ impl Tunnel {
         // HashMap clone) — paid only on config-reload, not the hot path.
         // The write lock is held across the read-modify-write so a
         // concurrent `update_proxies` cannot be lost.
-        {
+        let old = {
             let mut route = self.inner.route.write();
             let new_route = RouteTable {
                 rules: Arc::new(rules),
@@ -543,8 +543,12 @@ impl Tunnel {
                 // adapters must keep resolving through the same registry cell.
                 dialer_registry: route.dialer_registry.clone(),
             };
-            *route = Arc::new(new_route);
-        }
+            std::mem::replace(&mut *route, Arc::new(new_route))
+        };
+        // The superseded table's destructor cascade (rules, adapters,
+        // possibly the last registry cell) runs outside the lock so
+        // `route()` readers are never stalled by it.
+        drop(old);
         self.inner
             .needs_ip_resolution
             .store(needs_ip, Ordering::Relaxed);
@@ -557,11 +561,12 @@ impl Tunnel {
         );
     }
 
-    /// Swap the proxies map while keeping the current rules — and the current
-    /// dialer registry. Callers rebuilding a whole config should use
-    /// [`Self::update_routing`], which carries the rebuild's own registry;
-    /// keeping the old cell here lets a swapped-in map that still contains
-    /// the previous generation's chained adapters keep resolving them.
+    /// Swap the proxies map while keeping the current rules, installing
+    /// `dialer_registry` alongside it. Callers rebuilding a whole config
+    /// should use [`Self::update_routing`], which carries the rebuild's own
+    /// registry; passing the CURRENT generation's registry here lets a
+    /// swapped-in map that still contains that generation's chained
+    /// adapters keep resolving them.
     /// Hazard: a map built by a *new* rebuild binds its `dialer-proxy`
     /// targets to that build's own cell — pass it here and every chain fails
     /// closed the moment that build's returned registry drops. The mirror
@@ -581,7 +586,7 @@ impl Tunnel {
         // Preserve the current rules + index via Arc refcount bumps. Held
         // as a single write section so a concurrent `update_rules` cannot
         // be lost.
-        {
+        let old = {
             let mut route = self.inner.route.write();
             let new_route = RouteTable {
                 rules: Arc::clone(&route.rules),
@@ -590,8 +595,11 @@ impl Tunnel {
                 proxies,
                 dialer_registry,
             };
-            *route = Arc::new(new_route);
-        }
+            std::mem::replace(&mut *route, Arc::new(new_route))
+        };
+        // Same drop-outside-lock rule as `update_rules` — the old table's
+        // destructors must not stall `route()` readers.
+        drop(old);
         info!("Proxies updated");
     }
 
@@ -714,6 +722,13 @@ impl Tunnel {
         self.inner.route()
     }
 
+    /// Fetch one adapter by name. Hazard: the returned `Arc` is detached
+    /// from its generation pin — a `dialer-proxy`-chained adapter fetched
+    /// this way fails closed as soon as the route generation that built it
+    /// is swapped out. Dial paths must go through
+    /// `TunnelInner::resolve_proxy` (or hold a `route_snapshot()` across the
+    /// dial) so the registry cell stays pinned (issue #533 review).
+    /// Test-only today.
     pub fn proxy(&self, name: &str) -> Option<Arc<dyn Proxy>> {
         self.inner.route.read().proxies.get(name).cloned()
     }
@@ -917,6 +932,15 @@ mod tests {
         assert!(
             target.resolve().is_some(),
             "the route table retains its registry generation"
+        );
+
+        // `update_rules` rebuilds the table around the SAME proxies map —
+        // it must preserve the generation's registry cell, or every chained
+        // adapter strands on the next geo-DB refresh (issue #533 review).
+        tunnel.update_rules(vec![]);
+        assert!(
+            target.resolve().is_some(),
+            "update_rules must preserve the registry generation"
         );
 
         // A held route snapshot keeps the generation alive across a later

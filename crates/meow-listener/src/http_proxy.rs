@@ -256,13 +256,15 @@ async fn handle_http_inner(
         );
 
         // `route` pins this generation's dialer registry across the dial
-        // (issue #533 review).
+        // (issue #533 review) — released as soon as the dial resolves its
+        // chained front hops so a long-lived relay pins nothing.
         let ResolvedTarget {
             adapter: proxy,
             rule_name,
             rule_payload,
-            route: _route,
+            route,
         } = target;
+        let mut route = Some(route);
 
         let Some(_guard) = admission.track(
             metadata.pure(),
@@ -275,7 +277,9 @@ async fn handle_http_inner(
 
         _guard
             .run_until_closed(async {
-                match with_dial_timeout(proxy.name(), proxy.dial_tcp(&metadata)).await {
+                let dial = with_dial_timeout(proxy.name(), proxy.dial_tcp(&metadata)).await;
+                drop(route.take());
+                match dial {
                     Ok(mut remote) => {
                         // Rewrite the request line: remove the absolute URI scheme+host,
                         // keep the path. Rebuild headers without Proxy-* headers while

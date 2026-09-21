@@ -505,4 +505,24 @@ mod tests {
         drop(retained);
         assert!(target.resolve().is_none());
     }
+
+    /// `NamedProxyDialer` is the chained path most adapters take — its
+    /// fail-closed arm must surface the dead-registry error, never fall
+    /// through to direct egress (issue #533 review).
+    #[tokio::test]
+    async fn named_proxy_dialer_fails_closed_when_registry_drops() {
+        let registry = ProxyRegistry::default();
+        let dialer = NamedProxyDialer::new(DialerTarget::new("ghost", &registry));
+        drop(registry);
+
+        let err = dialer
+            .dial("example.com", 443)
+            .await
+            .err()
+            .expect("a dead registry must fail the dial");
+        assert!(
+            err.to_string().contains("registry generation dropped"),
+            "expected the dead-cell error, got: {err}"
+        );
+    }
 }

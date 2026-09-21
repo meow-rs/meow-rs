@@ -328,11 +328,14 @@ async fn handle_tproxy_conn(
         adapter: proxy,
         rule_name,
         rule_payload,
-        route: _route,
+        route,
     }) = inner.resolve_proxy(&metadata)
     else {
         return Err("no matching rule".into());
     };
+    // The registry pin is needed only until the dial resolves its chained
+    // front hops — a long-lived relay must not pin the generation.
+    let mut route = Some(route);
 
     info!(
         "{} --> {} match {}({}) using {}",
@@ -358,7 +361,9 @@ async fn handle_tproxy_conn(
 
     _guard
         .run_until_closed(async {
-            match with_dial_timeout(proxy.name(), proxy.dial_tcp(&metadata)).await {
+            let dial = with_dial_timeout(proxy.name(), proxy.dial_tcp(&metadata)).await;
+            drop(route.take());
+            match dial {
                 Ok(mut remote) => {
                     let up = Arc::clone(_guard.counters());
                     let dn = Arc::clone(_guard.counters());
