@@ -29,10 +29,17 @@
 //! | `ech-opts.enable`     | `ech-opts.enable`    | bool                         |
 //! | `ech-opts.config`     | `ech-opts.config`    | base64 ECHConfigList         |
 //!
-//! Divergence: upstream reloads cert/key files on change (fswatch); the
-//! files here are read once at config load.
+//! Cert/key reload: upstream's `NewTLSKeyPairLoader` reloads
+//! `certificate`/`private-key` files on fswatch events. We poll instead —
+//! file-sourced PEMs are re-stat on every dial and the TLS layer rebuilt
+//! when the (mtime, len, inode, ctime) stamp changed
+//! (`ReloadableTlsLayer`); a failed reload keeps the last known-good pair
+//! and retries next dial. Inline PEMs are immutable.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::SystemTime;
 
 use meow_common::{MeowError, Result};
 use meow_transport::{
@@ -42,7 +49,9 @@ use meow_transport::{
 };
 use tracing::{debug, warn};
 
-use crate::plugin_util::{load_pem_or_path, parse_bool_strict, parse_cert_pin, sip003_opts};
+use crate::plugin_util::{
+    load_pem_or_path, parse_bool_strict, parse_cert_pin, pem_source, sip003_opts,
+};
 use crate::transport_to_proxy_err;
 
 const PLUGIN: &str = "gost-plugin";
@@ -71,8 +80,22 @@ pub struct GostPluginConfig {
     pub cert_pin: Option<[u8; 32]>,
     /// mTLS client certificate (`certificate` + `private-key`, PEM).
     pub client_cert: Option<ClientCert>,
+    /// Where `client_cert`'s halves came from — file-sourced sides are
+    /// re-stat per dial and hot-reloaded (upstream fswatch parity).
+    pub client_cert_source: Option<ClientCertSource>,
     /// ECH config (`ech-opts.enable` + base64 `ech-opts.config`).
     pub ech: Option<EchOpts>,
+}
+
+/// Where the mTLS `certificate`/`private-key` PEMs came from. A `None`
+/// side is inline PEM and never changes; a `Some` side is a resolved
+/// filesystem path polled for changes (issue #621).
+#[derive(Debug, Clone, Default)]
+pub struct ClientCertSource {
+    /// Resolved path when `certificate` named a file.
+    pub cert_path: Option<PathBuf>,
+    /// Resolved path when `private-key` named a file.
+    pub key_path: Option<PathBuf>,
 }
 
 /// Parse a flattened SIP003 opts string for `gost-plugin`
@@ -95,11 +118,14 @@ pub fn parse_opts(s: &str) -> Result<GostPluginConfig> {
         name_cert_verify: None,
         cert_pin: None,
         client_cert: None,
+        client_cert_source: None,
         ech: None,
     };
     let mut mode_seen = false;
     let mut cert_pem: Option<Vec<u8>> = None;
     let mut key_pem: Option<Vec<u8>> = None;
+    let mut cert_src = None;
+    let mut key_src = None;
     let mut ech_enable = false;
     let mut ech_config: Option<String> = None;
 
@@ -159,9 +185,15 @@ pub fn parse_opts(s: &str) -> Result<GostPluginConfig> {
             }
             "name-cert-verify" | "fingerprint" => {}
             // Upstream `NewTLSKeyPairLoader` accepts inline PEM or file
-            // paths (with fswatch reload — not mirrored here).
-            "certificate" => cert_pem = Some(load_pem_or_path(&value, "certificate", PLUGIN)?),
-            "private-key" => key_pem = Some(load_pem_or_path(&value, "private-key", PLUGIN)?),
+            // paths; file paths are kept for per-dial reload.
+            "certificate" => {
+                cert_src = pem_source(&value).into_path();
+                cert_pem = Some(load_pem_or_path(&value, "certificate", PLUGIN)?);
+            }
+            "private-key" => {
+                key_src = pem_source(&value).into_path();
+                key_pem = Some(load_pem_or_path(&value, "private-key", PLUGIN)?);
+            }
             "ech-opts.enable" | "ech-enable" => {
                 ech_enable = parse_bool_strict(&value, PLUGIN, "ech-opts.enable")?;
             }
@@ -206,6 +238,10 @@ pub fn parse_opts(s: &str) -> Result<GostPluginConfig> {
     match (cert_pem, key_pem) {
         (Some(cert_pem), Some(key_pem)) => {
             cfg.client_cert = Some(ClientCert { cert_pem, key_pem });
+            cfg.client_cert_source = Some(ClientCertSource {
+                cert_path: cert_src,
+                key_path: key_src,
+            });
         }
         (None, None) => {}
         _ => {
@@ -244,12 +280,185 @@ pub fn parse_opts(s: &str) -> Result<GostPluginConfig> {
     Ok(cfg)
 }
 
-/// Build a reusable `TlsLayer` for a gost config with `tls=true`.
+/// A `TlsLayer` that hot-reloads file-sourced `certificate`/`private-key`
+/// PEMs — poll-based parity with upstream's `NewTLSKeyPairLoader` fswatch.
+/// Each dial re-stats the source files; when the stamp (mtime, length,
+/// inode, ctime) changed, the pair is re-read and the layer rebuilt. A
+/// failed reload keeps the last known-good pair, warns, and retries on
+/// the next dial — a half-written or invalid file must not break the
+/// transport (issue #621). Inline PEMs never reload.
+pub struct ReloadableTlsLayer {
+    /// Config template — `client_cert` is swapped for the fresh pair on
+    /// each successful reload; every other field is fixed.
+    tls_config: TlsConfig,
+    source: Option<ClientCertSource>,
+    state: parking_lot::Mutex<TlsReloadState>,
+}
+
+struct TlsReloadState {
+    layer: Arc<TlsLayer>,
+    /// Last-good PEM pair — the reload source for inline sides.
+    cert: ClientCert,
+    /// Last observed stamp per file-sourced side; `None` when the side
+    /// is inline or its file was missing/non-regular at last check.
+    /// Stamps are consumed even on reload failure — every real fix path
+    /// (rewrite, chmod, rename-replace, symlink repoint) changes the
+    /// stamp, so a durably-broken file doesn't cost a read + rebuild +
+    /// warn per dial while still self-healing on the next change
+    /// (issue #621 review).
+    cert_stamp: Option<FileStamp>,
+    key_stamp: Option<FileStamp>,
+}
+
+/// Change-detection stamp for a cert/key file. `mtime`/`len` alone miss
+/// `cp -p` rewrites (preserved timestamps) and chmod-only repairs —
+/// inode + ctime (unix) catch those, since ctime bumps on every content
+/// or metadata change and can't be forged via `utimensat` (issue #621
+/// review).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileStamp {
+    mtime: SystemTime,
+    len: u64,
+    /// (ino, ctime, ctime_nsec) on unix; zeros elsewhere — non-unix
+    /// detection is mtime+len only, so a chmod-only fix won't trip it
+    /// there (accepted: cert files are a unix-ops feature in practice).
+    ext: (u64, i64, i64),
+}
+
+/// Read a cert/key file that `file_stamp` already proved regular. On
+/// unix the open carries `O_NONBLOCK` — a path swapped to a FIFO between
+/// the stat and this read can't wedge the reload mutex (a nonblocking
+/// FIFO read errors instead of blocking; regular files ignore the flag).
+fn read_cert_file(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NONBLOCK);
+    }
+    let mut f = opts.open(path)?;
+    let mut buf = Vec::new();
+    std::io::Read::read_to_end(&mut f, &mut buf)?;
+    Ok(buf)
+}
+
+/// The current stamp of a file — `None` when it can't be stat'ed **or
+/// isn't a regular file**: a FIFO/device read would block indefinitely
+/// while holding the reload mutex, wedging every later dial (issue #621
+/// review — a subscription-supplied path can name anything).
+fn file_stamp(path: &std::path::Path) -> Option<FileStamp> {
+    let md = std::fs::metadata(path).ok()?;
+    if !md.is_file() {
+        return None;
+    }
+    #[cfg(unix)]
+    let ext = {
+        use std::os::unix::fs::MetadataExt;
+        (md.ino(), md.ctime(), md.ctime_nsec())
+    };
+    #[cfg(not(unix))]
+    let ext = (0, 0, 0);
+    Some(FileStamp {
+        mtime: md.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+        len: md.len(),
+        ext,
+    })
+}
+
+impl ReloadableTlsLayer {
+    /// The layer to dial with, reloading cert/key files that changed since
+    /// the last build. Cheap: two `stat`s per dial for file-sourced PEMs,
+    /// a mutex `Arc` clone otherwise.
+    pub fn current(&self) -> Arc<TlsLayer> {
+        let Some(src) = &self.source else {
+            return Arc::clone(&self.state.lock().layer);
+        };
+        // Inline sides observe `None` forever (as stored) and never trip
+        // the change check; a missing file observes `None` and differs
+        // from a previously-good stamp exactly once.
+        let cert_obs = src.cert_path.as_deref().and_then(file_stamp);
+        let key_obs = src.key_path.as_deref().and_then(file_stamp);
+        let mut st = self.state.lock();
+        if cert_obs == st.cert_stamp && key_obs == st.key_stamp {
+            return Arc::clone(&st.layer);
+        }
+
+        // A file side whose stamp is None is missing, unstat'able, or not
+        // a regular file — never read it: a FIFO/device blocks the read
+        // under this mutex and wedges every later dial (issue #621
+        // review). Any failure consumes BOTH observed stamps: the stamp
+        // covers mtime/len/ino/ctime, so every real fix path trips the
+        // change detector next dial — while a durably-broken file costs
+        // no read/rebuild/warn per dial. (The good side's discarded bytes
+        // are not stranded: when the broken side's stamp moves, both are
+        // re-read.)
+        let cert_pem = match &src.cert_path {
+            Some(p) => match cert_obs.and_then(|_| read_cert_file(p).ok()) {
+                Some(b) => b,
+                None => {
+                    warn!(
+                        "{PLUGIN}: cert reload: {} missing, non-regular, or unreadable \
+                         — keeping last pair",
+                        p.display()
+                    );
+                    st.cert_stamp = cert_obs;
+                    st.key_stamp = key_obs;
+                    return Arc::clone(&st.layer);
+                }
+            },
+            None => st.cert.cert_pem.clone(),
+        };
+        let key_pem = match &src.key_path {
+            Some(p) => match key_obs.and_then(|_| read_cert_file(p).ok()) {
+                Some(b) => b,
+                None => {
+                    warn!(
+                        "{PLUGIN}: key reload: {} missing, non-regular, or unreadable \
+                         — keeping last pair",
+                        p.display()
+                    );
+                    st.cert_stamp = cert_obs;
+                    st.key_stamp = key_obs;
+                    return Arc::clone(&st.layer);
+                }
+            },
+            None => st.cert.key_pem.clone(),
+        };
+
+        let mut cfg = self.tls_config.clone();
+        cfg.client_cert = Some(ClientCert {
+            cert_pem: cert_pem.clone(),
+            key_pem: key_pem.clone(),
+        });
+        match TlsLayer::new(&cfg) {
+            Ok(layer) => {
+                debug!("{PLUGIN}: reloaded client certificate/key files");
+                st.layer = Arc::new(layer);
+                st.cert = ClientCert { cert_pem, key_pem };
+            }
+            Err(e) => {
+                warn!("{PLUGIN}: cert/key reload invalid, keeping last pair: {e}");
+            }
+        }
+        // Stamps record the pre-read observation either way: a rewrite
+        // landing between the stat and the read yields a stale stamp that
+        // trips once more next dial — reloading twice beats stranding an
+        // update — and a parse failure is consumed so a durably-invalid
+        // file doesn't rebuild an SSL_CTX per dial (see TlsReloadState).
+        st.cert_stamp = cert_obs;
+        st.key_stamp = key_obs;
+        Arc::clone(&st.layer)
+    }
+}
+
+/// Build a reusable, cert/key-reloading `TlsLayer` holder for a gost
+/// config with `tls=true`.
 ///
 /// Call once at adapter construction time. Returns `None` when TLS is
 /// disabled.  SNI is `host`, overridden by a `Host` entry in `headers`
 /// (upstream: `config.Headers.Get("Host")` replaces `ServerName`).
-pub fn build_tls_layer(cfg: &GostPluginConfig) -> Result<Option<TlsLayer>> {
+pub fn build_tls_layer(cfg: &GostPluginConfig) -> Result<Option<ReloadableTlsLayer>> {
     if !cfg.tls {
         return Ok(None);
     }
@@ -268,9 +477,24 @@ pub fn build_tls_layer(cfg: &GostPluginConfig) -> Result<Option<TlsLayer>> {
     tls_config.cert_pin = cfg.cert_pin;
     tls_config.client_cert = cfg.client_cert.clone();
     tls_config.ech = cfg.ech.clone();
-    TlsLayer::new(&tls_config)
-        .map(Some)
-        .map_err(transport_to_proxy_err)
+    let layer = TlsLayer::new(&tls_config).map_err(transport_to_proxy_err)?;
+    Ok(Some(ReloadableTlsLayer {
+        tls_config,
+        source: cfg.client_cert_source.clone(),
+        state: parking_lot::Mutex::new(TlsReloadState {
+            layer: Arc::new(layer),
+            cert: cfg.client_cert.clone().unwrap_or(ClientCert {
+                cert_pem: Vec::new(),
+                key_pem: Vec::new(),
+            }),
+            // Stamps start unknown: the first dial reloads once, closing
+            // the parse→stat gap — a file swapped between `TlsLayer::new`
+            // and a post-hoc stat here would otherwise pin a stamp newer
+            // than the loaded bytes (issue #621 review).
+            cert_stamp: None,
+            key_stamp: None,
+        }),
+    }))
 }
 
 /// Build a reusable `WsLayer` for a gost config.
@@ -321,8 +545,10 @@ pub fn build_ws_layer(cfg: &GostPluginConfig) -> Result<WsLayer> {
 /// `server_host:server_port` and return the framed stream ready to be
 /// wrapped by the SS encryption layer.
 ///
-/// When `tls_layer` is `Some`, it is reused across connections so the
-/// BoringSSL `SSL_CTX` and root cert store are allocated only once.
+/// When `tls_layer` is `Some`, [`ReloadableTlsLayer::current`] snapshots
+/// the current layer per dial (reloading changed cert/key files first),
+/// so the BoringSSL `SSL_CTX` and root cert store are rebuilt only when
+/// the source PEMs actually change.
 ///
 /// With `mux=true` a fresh smux session wraps the WebSocket and the
 /// returned stream is its first `open_stream` — upstream
@@ -330,7 +556,7 @@ pub fn build_ws_layer(cfg: &GostPluginConfig) -> Result<WsLayer> {
 /// when the stream drops.
 pub async fn dial(
     cfg: &GostPluginConfig,
-    tls_layer: Option<&TlsLayer>,
+    tls_layer: Option<&ReloadableTlsLayer>,
     ws_layer: &WsLayer,
     server_host: &str,
     server_port: u16,
@@ -348,10 +574,18 @@ pub async fn dial(
         .await
         .map_err(MeowError::Io)?;
 
-    // 2) Optional TLS handshake via the pre-built TlsLayer.  `dial` already
-    //    returns `Box<dyn Stream>` — no double-boxing.
-    debug_assert_eq!(cfg.tls, tls_layer.is_some());
-    let stream: Box<dyn meow_transport::Stream> = if let Some(tls) = tls_layer {
+    // 2) Optional TLS handshake via the reloadable layer — `current()`
+    //    re-stats the cert/key files and rebuilds on change.
+    //  `connect` already returns `Box<dyn Stream>` — no double-boxing.
+    // A `tls=true` config without a layer would silently dial plaintext —
+    // refuse rather than ship an unencrypted stream (issue #621 review).
+    if cfg.tls && tls_layer.is_none() {
+        return Err(MeowError::Config(format!(
+            "{PLUGIN}: tls=true but no TLS layer was built"
+        )));
+    }
+    let tls_snapshot = tls_layer.map(ReloadableTlsLayer::current);
+    let stream: Box<dyn meow_transport::Stream> = if let Some(tls) = tls_snapshot.as_deref() {
         tls.connect(tcp).await.map_err(transport_to_proxy_err)?
     } else {
         tcp
@@ -871,5 +1105,87 @@ mod tests {
             one_round("mode=websocket;mux=false;host=test.example").await,
             "test.example"
         );
+    }
+
+    /// File-sourced `certificate`/`private-key` are re-stat per dial: a
+    /// change rebuilds the layer (new `Arc`), a corrupt rewrite keeps the
+    /// last-good pair (issue #621 — upstream fswatch parity).
+    #[test]
+    fn reloadable_tls_layer_reloads_changed_cert_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        let write_pair = |cn: &str, cert_pad: &str| {
+            let ck = rcgen::generate_simple_self_signed(vec![cn.to_string()]).unwrap();
+            std::fs::write(&cert_path, format!("{}{cert_pad}", ck.cert.pem())).unwrap();
+            std::fs::write(&key_path, ck.key_pair.serialize_pem()).unwrap();
+        };
+        write_pair("one.example", "");
+
+        let cfg = parse_opts(&format!(
+            "mode=websocket;tls;mux=false;host=test.example;\
+             certificate={};private-key={}",
+            cert_path.display(),
+            key_path.display()
+        ))
+        .unwrap();
+        let src = cfg.client_cert_source.as_ref().unwrap();
+        assert_eq!(src.cert_path.as_deref(), Some(cert_path.as_path()));
+        assert_eq!(src.key_path.as_deref(), Some(key_path.as_path()));
+
+        let holder = build_tls_layer(&cfg).unwrap().unwrap();
+        let l1 = holder.current();
+        assert!(
+            Arc::ptr_eq(&l1, &holder.current()),
+            "unchanged files must reuse the built layer"
+        );
+
+        // Valid rewrite: the trailing newline also changes the length, so
+        // the stamp check trips even on coarse-granularity filesystems.
+        write_pair("two.example", "\n");
+        let l2 = holder.current();
+        assert!(
+            !Arc::ptr_eq(&l1, &l2),
+            "a changed cert/key file must rebuild the layer"
+        );
+
+        // Corrupt rewrite: warn + keep the last-good layer; the failed
+        // observation IS consumed so a durably-broken file doesn't cost a
+        // rebuild per dial — the stamp covers ino/ctime, so any real fix
+        // trips the detector and retries.
+        std::fs::write(&key_path, b"definitely not a pem, and longer").unwrap();
+        let l3 = holder.current();
+        assert!(
+            Arc::ptr_eq(&l2, &l3),
+            "an invalid reload must keep the last-good layer"
+        );
+        // ...and while the file stays corrupt, later dials keep the
+        // last-good layer without retrying.
+        assert!(Arc::ptr_eq(&l3, &holder.current()));
+
+        // Deleted file: last-good pair still serves (no panic, no error).
+        std::fs::remove_file(&cert_path).unwrap();
+        let l4 = holder.current();
+        assert!(
+            Arc::ptr_eq(&l3, &l4),
+            "a missing file keeps the last-good layer"
+        );
+    }
+
+    /// Inline PEM halves have no file source — `current()` is a pure
+    /// `Arc` clone and never reloads.
+    #[test]
+    fn reloadable_tls_layer_inline_pem_never_reloads() {
+        let cfg = parse_opts(
+            "mode=websocket;tls;mux=false;\
+             certificate=-----BEGIN CERTIFICATE-----x;\
+             private-key=-----BEGIN KEY-----k",
+        )
+        .unwrap();
+        let src = cfg.client_cert_source.as_ref().unwrap();
+        assert!(src.cert_path.is_none() && src.key_path.is_none());
+        // `TlsLayer::new` rejects the bogus PEM at construction — the
+        // parse-time validation, not the reload path, is what gates it.
+        assert!(build_tls_layer(&cfg).is_err());
     }
 }

@@ -91,8 +91,9 @@ pub(crate) fn parse_cert_pin(s: &str, plugin: &str) -> Result<[u8; 32]> {
 
 /// Upstream `NewTLSKeyPairLoader` accepts PEM content or a file path for
 /// `certificate`/`private-key`.  A `-----BEGIN` marker means inline PEM;
-/// anything else is read from the filesystem once at config load
-/// (upstream's fswatch reload is not mirrored).
+/// anything else is read from the filesystem once at config load —
+/// callers that want upstream's fswatch-style reload (gost-plugin) use
+/// [`pem_source`] to keep the resolved path.
 ///
 /// Note: provider/subscription nodes reach this too (in-process plugins
 /// are not gated by `allow-external-plugin`), so a remote feed can point
@@ -106,20 +107,61 @@ pub(crate) fn parse_cert_pin(s: &str, plugin: &str) -> Result<[u8; 32]> {
 /// not the process CWD — `resolved_home_dir` carries the `-d` override or
 /// the shared XDG config-dir default when no home is set.
 pub(crate) fn load_pem_or_path(value: &str, opt: &str, plugin: &str) -> Result<Vec<u8>> {
+    match pem_source(value) {
+        PemSource::Inline => Ok(value.as_bytes().to_vec()),
+        PemSource::File(resolved) => {
+            // Never read a non-regular file — a FIFO or device would
+            // block the read indefinitely, and a subscription-supplied
+            // opt reaches this path (issue #621 review).
+            if !resolved.is_file() {
+                return Err(MeowError::Config(format!(
+                    "{plugin}: '{opt}' is neither inline PEM nor a readable file ({}): \
+                     not a regular file",
+                    resolved.display()
+                )));
+            }
+            std::fs::read(&resolved).map_err(|e| {
+                MeowError::Config(format!(
+                    "{plugin}: '{opt}' is neither inline PEM nor a readable file ({}): {e}",
+                    resolved.display()
+                ))
+            })
+        }
+    }
+}
+
+/// Where a `certificate`/`private-key` opt value's PEM bytes live —
+/// classified by the same `-----BEGIN` rule [`load_pem_or_path`] uses.
+/// Consumers that support hot reload (gost-plugin; upstream
+/// `NewTLSKeyPairLoader` + fswatch) keep the [`PemSource::File`] path so
+/// they can re-stat and re-read it per dial.
+pub(crate) enum PemSource {
+    /// PEM content inline in the opt value — immutable.
+    Inline,
+    /// Filesystem path, already resolved against the meow home dir.
+    File(std::path::PathBuf),
+}
+
+impl PemSource {
+    /// The resolved path when the value named a file, else `None`.
+    pub(crate) fn into_path(self) -> Option<std::path::PathBuf> {
+        match self {
+            PemSource::File(p) => Some(p),
+            PemSource::Inline => None,
+        }
+    }
+}
+
+/// Classify a PEM opt value without reading it (see [`PemSource`]).
+pub(crate) fn pem_source(value: &str) -> PemSource {
     if value.contains("-----BEGIN") {
-        Ok(value.as_bytes().to_vec())
+        PemSource::Inline
     } else {
         let path = std::path::Path::new(value);
-        let resolved = if path.is_absolute() {
+        PemSource::File(if path.is_absolute() {
             path.to_path_buf()
         } else {
             meow_common::resolved_home_dir().join(path)
-        };
-        std::fs::read(&resolved).map_err(|e| {
-            MeowError::Config(format!(
-                "{plugin}: '{opt}' is neither inline PEM nor a readable file ({}): {e}",
-                resolved.display()
-            ))
         })
     }
 }

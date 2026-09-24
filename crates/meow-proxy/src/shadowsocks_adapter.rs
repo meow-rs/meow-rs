@@ -67,10 +67,12 @@ enum PluginKind {
     V2ray(V2rayPluginConfig, Option<TlsLayer>),
     /// Native gost-plugin websocket (+ optional TLS and smux) transport.
     /// `WsLayer` is built at construction so a malformed headers/path
-    /// config fails once at startup, not per dial.
+    /// config fails once at startup, not per dial. The TLS layer is a
+    /// `ReloadableTlsLayer` — file-sourced mTLS cert/key PEMs are re-stat
+    /// per dial and hot-reloaded on change (issue #621).
     Gost(
         gost_plugin::GostPluginConfig,
-        Option<TlsLayer>,
+        Option<gost_plugin::ReloadableTlsLayer>,
         meow_transport::ws::WsLayer,
     ),
     /// Native shadow-tls transport (v1/v2/v3). `TlsLayer` is built at
