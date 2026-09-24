@@ -280,7 +280,9 @@ fn ephemeral_port_first() -> u16 {
 
 /// Anchor path prefix — children of `com.apple/` get evaluated by the
 /// default `/etc/pf.conf`'s `rdr-anchor "com.apple/*"`.
-#[cfg(any(target_os = "macos", test))]
+/// Gated to `all(test, unix)` rather than bare `test`: the only users are
+/// unix-gated, so a bare `test` compiles an unused const on Windows.
+#[cfg(any(target_os = "macos", all(test, unix)))]
 const PF_ANCHOR_PREFIX: &str = "com.meow.tproxy";
 
 /// Whether `rel` (an anchor name relative to `com.apple/`) is a
@@ -456,7 +458,9 @@ struct PlatformGuard {
 }
 
 /// nftables table prefix — managed tables are `meow_tproxy_{pid}_{seq}`.
-#[cfg(any(target_os = "linux", test))]
+/// Gated to `all(test, unix)` rather than bare `test`: the only users are
+/// unix-gated, so a bare `test` compiles an unused const on Windows.
+#[cfg(any(target_os = "linux", all(test, unix)))]
 const NFT_TABLE_PREFIX: &str = "meow_tproxy";
 
 /// Whether `name` is a meow-managed nft table whose owner is gone: the
