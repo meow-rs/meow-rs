@@ -245,13 +245,17 @@ impl Session {
         self.close_notify.notify_waiters();
 
         // Close stream data receiver so process_stream_data exits
-        // Close all streams and notify pending waiters
+        // Close all streams and notify pending waiters. The two map
+        // writes are the only awaits; `close_with_error`/`notify_synack`
+        // are synchronous, so eviction + close + wakeup is one atomic
+        // step — no cancellation point can orphan a waiter on an
+        // already-evicted stream (issue #621).
         {
             let mut streams = self.streams.write().await;
             let mut receive_map = self.stream_receive_tx.write().await;
             for (stream_id, stream) in streams.drain() {
-                stream.close_with_error(AnyTlsError::SessionClosed).await;
-                stream.notify_synack(Err(AnyTlsError::SessionClosed)).await;
+                stream.close_with_error(AnyTlsError::SessionClosed);
+                stream.notify_synack(Err(AnyTlsError::SessionClosed));
                 receive_map.remove(&stream_id);
             }
         }
@@ -531,13 +535,17 @@ impl Session {
 
                     let stream = Arc::new(stream);
 
-                    {
-                        let mut receive_map = self.stream_receive_tx.write().await;
-                        receive_map.insert(stream_id, receive_tx);
-                    }
-
+                    // Acquire both locks before mutating either map, in
+                    // close()'s order — and recheck `is_closed` inside so a
+                    // concurrent close() can't leave a registered stream
+                    // behind on a dead session (issue #621 review).
                     {
                         let mut streams = self.streams.write().await;
+                        let mut receive_map = self.stream_receive_tx.write().await;
+                        if self.is_closed() {
+                            return Ok(());
+                        }
+                        receive_map.insert(stream_id, receive_tx);
                         streams.insert(stream_id, stream.clone());
                     }
 
@@ -602,18 +610,22 @@ impl Session {
                             frame.stream_id,
                             error_msg
                         );
+                        // Acquire both locks before mutating either map —
+                        // the same order `open_stream`/`close` use — so no
+                        // observer can see the stream evicted from one map
+                        // but present in the other (issue #621 review).
                         let removed = {
                             let mut streams = self.streams.write().await;
-                            let removed = streams.remove(&frame.stream_id);
                             let mut receive_map = self.stream_receive_tx.write().await;
+                            let removed = streams.remove(&frame.stream_id);
                             receive_map.remove(&frame.stream_id);
                             removed
                         };
                         if let Some(stream) = removed {
                             let error =
                                 AnyTlsError::Protocol(format!("Server error: {}", error_msg));
-                            stream.close_with_error(AnyTlsError::StreamClosed).await;
-                            stream.notify_synack(Err(error)).await;
+                            stream.close_with_error(AnyTlsError::StreamClosed);
+                            stream.notify_synack(Err(error));
                         } else {
                             tracing::warn!(
                                 session_id = session_id,
@@ -630,7 +642,7 @@ impl Session {
                                 frame.stream_id
                             );
                             // Notify stream about success
-                            stream.notify_synack(Ok(())).await;
+                            stream.notify_synack(Ok(()));
                         } else {
                             tracing::warn!(
                                 session_id = session_id,
@@ -653,10 +665,13 @@ impl Session {
                     "[Session] FIN received for stream {}, closing",
                     frame.stream_id
                 );
+                // Both locks before either mutation — same order as
+                // `open_stream`/`close` — so the two-map eviction is atomic
+                // to observers (issue #621 review).
                 let removed = {
                     let mut streams = self.streams.write().await;
-                    let removed = streams.remove(&frame.stream_id);
                     let mut receive_map = self.stream_receive_tx.write().await;
+                    let removed = streams.remove(&frame.stream_id);
                     receive_map.remove(&frame.stream_id);
                     removed
                 };
@@ -671,8 +686,8 @@ impl Session {
                 // immediately (issue #543). `notify_synack` no-ops once
                 // the SynAck landed.
                 if let Some(stream) = removed {
-                    stream.close_with_error(AnyTlsError::StreamClosed).await;
-                    stream.notify_synack(Err(AnyTlsError::StreamClosed)).await;
+                    stream.close_with_error(AnyTlsError::StreamClosed);
+                    stream.notify_synack(Err(AnyTlsError::StreamClosed));
                 }
             }
             Command::Settings => {
@@ -1348,11 +1363,16 @@ impl Session {
             // live synack-waiter across a local close; mark the stream
             // closed too so a retained Arc<Stream> can't still queue PSH.
             if let Some(stream_id) = fin_stream {
-                let removed = self.streams.write().await.remove(&stream_id);
-                self.stream_receive_tx.write().await.remove(&stream_id);
-                if let Some(stream) = removed {
-                    stream.close_with_error(AnyTlsError::StreamClosed).await;
-                    stream.notify_synack(Err(AnyTlsError::StreamClosed)).await;
+                // Acquire both locks before mutating either map — the same
+                // order `open_stream`/`close` use — then evict + close +
+                // wake in one synchronous step: no cancellation point can
+                // split removal from the waiter wakeup (issue #621).
+                let mut streams = self.streams.write().await;
+                let mut receive_map = self.stream_receive_tx.write().await;
+                if let Some(stream) = streams.remove(&stream_id) {
+                    receive_map.remove(&stream_id);
+                    stream.close_with_error(AnyTlsError::StreamClosed);
+                    stream.notify_synack(Err(AnyTlsError::StreamClosed));
                 }
             }
             let failed = result.is_err();

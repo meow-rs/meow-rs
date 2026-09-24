@@ -511,9 +511,21 @@ impl ProxyPacketConn for AnytlsPacketConn {
                 .await
                 .map_err(MeowError::Io)?;
         }
-        if length > to_copy {
-            let mut sink = vec![0u8; length - to_copy];
-            reader.read_exact(&mut sink).await.map_err(MeowError::Io)?;
+        // Drain the tail through a fixed stack scratch — a peer could
+        // otherwise force a ~64 KiB alloc/dealloc cycle per read by
+        // declaring max-size datagrams (issue #621). The frame length is
+        // a u16, so the loop terminates after at most ~8 iterations.
+        let mut remaining = length - to_copy;
+        if remaining > 0 {
+            let mut sink = [0u8; 8192];
+            while remaining > 0 {
+                let chunk = remaining.min(sink.len());
+                reader
+                    .read_exact(&mut sink[..chunk])
+                    .await
+                    .map_err(MeowError::Io)?;
+                remaining -= chunk;
+            }
         }
         guard.complete = true;
         Ok((to_copy, addr))
@@ -1040,6 +1052,49 @@ mod tests {
             .unwrap();
         assert_eq!(addr2, src);
         assert_eq!(&buf2[..n2], &[9]);
+        session.close().await.unwrap();
+    }
+
+    /// A drain larger than one 8 KiB sink pass: the loop must iterate and
+    /// still leave framing aligned (issue #621 review — single-pass drains
+    /// alone don't prove the loop).
+    #[tokio::test]
+    async fn udp_oversized_drain_iterates_sink() {
+        let (session, mut peer) = test_session().await;
+        let (stream, _) = session.open_stream().await.unwrap();
+        let id = stream.id();
+        assert_eq!(wire_frame(&mut peer).await.0, Command::Syn);
+        let conn = AnytlsPacketConn::new(stream, Arc::clone(&session));
+        let src: SocketAddr = "192.0.2.9:53".parse().unwrap();
+
+        // 20 KiB payload into a 1-byte buffer → 19999 bytes drained over
+        // three 8 KiB sink passes.
+        let mut datagram = Vec::new();
+        encode_uot_addr(&mut datagram, &src);
+        datagram.extend_from_slice(&20000u16.to_be_bytes());
+        datagram.extend_from_slice(&vec![0xAB; 20000]);
+        push_frame(&mut peer, id, &datagram).await;
+
+        let mut buf = [0u8; 1];
+        let (n, addr) = tokio::time::timeout(Duration::from_secs(2), conn.read_packet(&mut buf))
+            .await
+            .expect("oversized read must resolve")
+            .unwrap();
+        assert_eq!(addr, src);
+        assert_eq!(&buf[..n], &[0xAB]);
+
+        let mut datagram2 = Vec::new();
+        encode_uot_addr(&mut datagram2, &src);
+        datagram2.extend_from_slice(&2u16.to_be_bytes());
+        datagram2.extend_from_slice(&[7, 7]);
+        push_frame(&mut peer, id, &datagram2).await;
+
+        let mut buf2 = [0u8; 2048];
+        let (n2, _) = tokio::time::timeout(Duration::from_secs(2), conn.read_packet(&mut buf2))
+            .await
+            .expect("post-drain read must resolve")
+            .unwrap();
+        assert_eq!(&buf2[..n2], &[7, 7]);
         session.close().await.unwrap();
     }
 

@@ -50,8 +50,16 @@ pub struct Stream {
     // In particular, no network I/O or await occurs while it is held.
     write_state: Mutex<WriteState>,
     close_notify: Notify,
-    synack_tx: tokio::sync::Mutex<Option<oneshot::Sender<Result<()>>>>,
-    close_error: tokio::sync::Mutex<Option<AnyTlsError>>,
+    // Synchronous mutexes too — each critical section is a bare
+    // `Option` take/store, so `notify_synack`/`close_with_error` can be
+    // sync fns. That matters: an eviction path calls them right after
+    // removing the stream from the session maps, and an `.await` there
+    // would open a cancellation window in which the waiter pends
+    // forever on an already-evicted stream (issue #621).
+    synack_tx: Mutex<Option<oneshot::Sender<Result<()>>>>,
+    /// Write-only bookkeeping — upstream parity for `closeErr`. Nothing
+    /// reads it; kept so the close reason is inspectable in debugging.
+    close_error: Mutex<Option<AnyTlsError>>,
 }
 
 impl Stream {
@@ -75,8 +83,8 @@ impl Stream {
                     waker: None,
                 }),
                 close_notify: Notify::new(),
-                synack_tx: tokio::sync::Mutex::new(Some(synack_tx)),
-                close_error: tokio::sync::Mutex::new(None),
+                synack_tx: Mutex::new(Some(synack_tx)),
+                close_error: Mutex::new(None),
             },
             synack_rx,
         )
@@ -84,8 +92,12 @@ impl Stream {
 
     /// Resolve the stream's synack-waiter once; subsequent calls no-op
     /// (the first notify wins — e.g. a SynAck already landed).
-    pub async fn notify_synack(&self, result: Result<()>) {
-        if let Some(tx) = self.synack_tx.lock().await.take() {
+    ///
+    /// Deliberately synchronous: callers invoke this immediately after
+    /// evicting the stream from the session maps, and an await between
+    /// removal and wakeup would be a cancellation gap (issue #621).
+    pub fn notify_synack(&self, result: Result<()>) {
+        if let Some(tx) = self.synack_tx.lock().unwrap().take() {
             let _ = tx.send(result);
         }
     }
@@ -96,10 +108,11 @@ impl Stream {
 
     /// Mark the stream closed locally without emitting a `Fin` —
     /// upstream `closeLocally` semantics: the peer already ended the
-    /// stream, so no reply is owed.
-    pub async fn close_with_error(&self, err: AnyTlsError) {
+    /// stream, so no reply is owed. Synchronous for the same reason as
+    /// [`notify_synack`](Self::notify_synack).
+    pub fn close_with_error(&self, err: AnyTlsError) {
         self.mark_closed(false);
-        *self.close_error.lock().await = Some(err);
+        *self.close_error.lock().unwrap() = Some(err);
     }
 
     pub fn is_closed(&self) -> bool {

@@ -220,13 +220,13 @@ impl Client {
                 tracing::error!("[Client] SYNACK error for stream {}: {}", stream_id, e);
                 let error_msg = e.to_string();
                 let error = AnyTlsError::Protocol(error_msg.clone());
-                stream.close_with_error(error).await;
+                stream.close_with_error(error);
                 Err(AnyTlsError::Protocol(error_msg))
             }
             Ok(Err(_)) => {
                 tracing::error!("[Client] SYNACK channel closed for stream {}", stream_id);
                 let error = AnyTlsError::Protocol("SYNACK channel closed".into());
-                stream.close_with_error(error).await;
+                stream.close_with_error(error);
                 Err(AnyTlsError::Protocol("SYNACK channel closed".into()))
             }
             Err(_) => {
@@ -238,7 +238,7 @@ impl Client {
                 let error_msg =
                     format!("SYNACK timeout after {}s", DEFAULT_SYNACK_TIMEOUT.as_secs());
                 let error = AnyTlsError::Protocol(error_msg.clone());
-                stream.close_with_error(error).await;
+                stream.close_with_error(error);
                 Err(AnyTlsError::Protocol(error_msg))
             }
         }
