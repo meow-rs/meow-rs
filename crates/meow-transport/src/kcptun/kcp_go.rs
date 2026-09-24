@@ -39,6 +39,8 @@ pub enum KcpError {
     InvalidMtu(usize),
     #[error("invalid segment size {0}")]
     InvalidSegmentSize(usize),
+    #[error("invalid mss {0}")]
+    InvalidMss(usize),
     #[error("invalid segment data size, expected {0}, found {1}")]
     InvalidSegmentDataSize(usize, usize),
     #[error("{0}")]
@@ -537,7 +539,11 @@ impl<Output> Kcp<Output> {
     pub fn send(&mut self, mut buf: &[u8]) -> KcpResult<usize> {
         let mut sent_size = 0;
 
-        assert!(self.mss > 0);
+        // Defensive: `set_mtu` keeps mss >= 1, but `send` must not panic if
+        // a future construction path ever violates that (issue #621 audit).
+        if self.mss == 0 {
+            return Err(KcpError::InvalidMss(0));
+        }
 
         // Upstream `Send` rejects an empty buffer outright.
         if buf.is_empty() {
@@ -1545,6 +1551,15 @@ mod tests {
         let mut k = Kcp::new(1, Sink::default());
         k.set_nodelay(true, 10, 2, true);
         k
+    }
+
+    /// Issue #621: `send` must return an error — never panic — if mss is
+    /// somehow zero (unreachable via `set_mtu` today, defensive only).
+    #[test]
+    fn send_with_zero_mss_errors_instead_of_panicking() {
+        let mut k = fast3();
+        k.mss = 0;
+        assert!(matches!(k.send(b"aa"), Err(KcpError::InvalidMss(0))));
     }
 
     /// Upstream `Input` tail: a UNA slide flushes FULL immediately — the
