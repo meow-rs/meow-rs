@@ -1,5 +1,7 @@
 use std::io;
 use std::net::IpAddr;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use tracing::{info, warn};
 
 // Needed by `writeln!` in the `build_*` functions which are compiled under
@@ -9,10 +11,121 @@ use std::fmt::Write as _;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::process::Command;
 
+/// Per-process sequence for managed firewall objects — a listener's
+/// nftables table / pf anchor is named `meow_tproxy_{pid}_{seq}` /
+/// `com.apple/com.meow.tproxy.{pid}.{seq}`, so two listeners (or two meow
+/// processes) never share kernel state, teardown removes only what the
+/// instance created, and a dead owner's leftovers are identifiable for
+/// the startup sweep (issue #621).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+static INSTANCE_SEQ: AtomicU32 = AtomicU32::new(0);
+
+/// Serializes reserve+sweep+create inside `PlatformGuard::setup`.
+/// Without it, two listeners starting together can interleave
+/// `fetch_add`/`sweep`/`nft -f` so that the earlier reserver's *delayed*
+/// sweep sees — and deletes — the later sibling's just-created object:
+/// its seq is ≥ the early reserver's, which the stale rule reads as a
+/// prior-boot leftover (issue #621 review). Under the lock the
+/// lock-holder's seq always exceeds every seq created this boot, so
+/// `seq >= reserved` only matches pre-boot debris.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+static SETUP_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+/// Live managed firewalls in this process. A second one warns: two
+/// output-chain redirects for the same traffic can't both be satisfied —
+/// which table/anchor wins is insertion order.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+static LIVE_MANAGED: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether `pid` names a live process — `kill(pid, 0)` succeeds, or fails
+/// EPERM for a live pid owned by another user; ESRCH means the owner is
+/// gone and any firewall state it left is stale.
+#[cfg(any(target_os = "linux", target_os = "macos", all(test, unix)))]
+fn pid_alive(pid: u32) -> bool {
+    // pid 0 is not a real owner: `kill(0, 0)` targets our own process
+    // group and always succeeds, so it must not count as "alive".
+    if pid == 0 || pid > i32::MAX as u32 {
+        return false;
+    }
+    match unsafe { libc::kill(pid as i32, 0) } {
+        0 => true,
+        _ => io::Error::last_os_error().raw_os_error() == Some(libc::EPERM),
+    }
+}
+
+/// Whether `pid` runs a copy of this binary — the second half of the
+/// ownership check. `kill(pid, 0)` alone is fooled by pid reuse: a dead
+/// meow's `meow_tproxy_<pid>_<seq>` survives forever if some unrelated
+/// process took the pid (its stale redirect keeps black-holing traffic).
+/// Comparing `/proc/<pid>/exe` (linux) / `proc_pidpath` (macOS) with our
+/// own executable distinguishes "live meow sibling" (keep) from
+/// "recycled foreign pid" (stale). Unverifiable → keep: never delete
+/// what we can't reason about.
+#[cfg(target_os = "linux")]
+fn pid_is_meow(pid: u32) -> bool {
+    match (
+        std::fs::read_link(format!("/proc/{pid}/exe")),
+        std::env::current_exe(),
+    ) {
+        (Ok(exe), Ok(own)) => exe == own,
+        _ => true,
+    }
+}
+
+/// macOS variant of the linux `/proc/<pid>/exe` check above.
+#[cfg(target_os = "macos")]
+fn pid_is_meow(pid: u32) -> bool {
+    let mut buf = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    let n = unsafe { libc::proc_pidpath(pid as i32, buf.as_mut_ptr().cast(), buf.len() as u32) };
+    if n <= 0 {
+        return true;
+    }
+    use std::os::unix::ffi::OsStrExt;
+    let exe = std::ffi::OsStr::from_bytes(&buf[..n as usize]);
+    // proc_pidpath and current_exe may differ in symlink resolution —
+    // canonicalize both. If EITHER side can't be resolved the identity is
+    // unverifiable: keep (never delete what we can't reason about).
+    let Ok(own) = std::env::current_exe() else {
+        return true;
+    };
+    let (Ok(e), Ok(o)) = (std::fs::canonicalize(exe), std::fs::canonicalize(&own)) else {
+        return true;
+    };
+    e == o
+}
+
+/// Other unixes: no procfs equivalent wired up — test builds only
+/// (the classifiers compile under `all(test, unix)`), fall back to
+/// "can't verify → keep".
+#[cfg(all(test, unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn pid_is_meow(_pid: u32) -> bool {
+    true
+}
+
+/// The owner pid and per-process sequence embedded in a managed name's
+/// `<pid><sep><seq>` suffix (`_` for nftables `meow_tproxy_*`, `.` for
+/// pf `com.meow.tproxy.*`). Both halves must be all digits — a plain
+/// `u32::parse` would accept a leading `+`.
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn managed_suffix(rest: &str, sep: char) -> Option<(u32, u32)> {
+    let (pid, seq) = rest.split_once(sep)?;
+    if pid.is_empty()
+        || !pid.bytes().all(|b| b.is_ascii_digit())
+        || seq.is_empty()
+        || !seq.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    Some((pid.parse().ok()?, seq.parse().ok()?))
+}
+
 /// RAII guard that sets up firewall redirect rules on creation
 /// and tears them down on drop.
 pub struct FirewallGuard {
     inner: PlatformGuard,
+    /// This instance counted itself in `LIVE_MANAGED` at setup.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    managed_live: bool,
 }
 
 impl FirewallGuard {
@@ -22,6 +135,12 @@ impl FirewallGuard {
     /// - **Linux**: `meta mark` matching — DIRECT adapter sets SO_MARK on outbound sockets,
     ///   nftables skips packets with that mark. Plus IP bypass for upstream proxy servers.
     /// - **macOS**: `user` UID matching (pf has no mark support) + IP bypass.
+    ///
+    /// Each call manages a table/anchor unique to this listener instance
+    /// (`meow_tproxy_{pid}_{seq}` / `com.apple/com.meow.tproxy.{pid}.{seq}`)
+    /// and first sweeps leftovers whose owning pid is dead — an uncleaned
+    /// output-chain redirect otherwise keeps black-holing traffic after a
+    /// crash (issue #621).
     pub fn setup(
         listen_port: u16,
         routing_mark: Option<u32>,
@@ -34,12 +153,34 @@ impl FirewallGuard {
             bypass_ips.len()
         );
         let inner = PlatformGuard::setup(listen_port, routing_mark, bypass_ips)?;
-        Ok(FirewallGuard { inner })
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if LIVE_MANAGED.fetch_add(1, Ordering::Relaxed) > 0 {
+            warn!(
+                "multiple managed tproxy firewalls live in this process: each \
+                 redirects the host's output chain, so which listener serves \
+                 intercepted traffic is kernel insertion order — set \
+                 `firewall: false` on all but one (issue #621)"
+            );
+        }
+        Ok(FirewallGuard {
+            inner,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            managed_live: true,
+        })
     }
 
     /// Explicitly tear down the firewall rules.
     pub fn teardown(&mut self) -> io::Result<()> {
-        self.inner.teardown()
+        let result = self.inner.teardown();
+        // Decrement only after the attempt; note `inner.teardown`
+        // reports `Ok` on non-zero nft/pfctl exits (it warns instead), so
+        // this only keeps counting when the command couldn't even spawn.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if self.managed_live && result.is_ok() {
+            self.managed_live = false;
+            LIVE_MANAGED.fetch_sub(1, Ordering::Relaxed);
+        }
+        result
     }
 }
 
@@ -137,6 +278,81 @@ fn ephemeral_port_first() -> u16 {
     }
 }
 
+/// Anchor path prefix — children of `com.apple/` get evaluated by the
+/// default `/etc/pf.conf`'s `rdr-anchor "com.apple/*"`.
+#[cfg(any(target_os = "macos", test))]
+const PF_ANCHOR_PREFIX: &str = "com.meow.tproxy";
+
+/// Whether `rel` (an anchor name relative to `com.apple/`) is a
+/// meow-managed anchor whose owner is gone: the legacy shared anchor
+/// `com.meow.tproxy` (pre-#621 naming), `com.meow.tproxy.<pid>.<seq>`
+/// whose pid is dead or was recycled by a non-meow process, or an
+/// own-pid name with `seq >= reserved_seq` — a table of OUR pid that
+/// this boot never created can only be a prior process's leftover under
+/// a recycled pid (pid reuse to self would otherwise collide with the
+/// upcoming `add`, failing setup outright).
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn stale_anchor(rel: &str, own_pid: u32, reserved_seq: u32) -> bool {
+    if rel == PF_ANCHOR_PREFIX {
+        return true;
+    }
+    let Some(rest) = rel.strip_prefix("com.meow.tproxy.") else {
+        return false;
+    };
+    match managed_suffix(rest, '.') {
+        Some((pid, seq)) if pid == own_pid => seq >= reserved_seq,
+        Some((pid, _)) => !pid_alive(pid) || !pid_is_meow(pid),
+        None => false,
+    }
+}
+
+/// Flush pf anchors left behind by dead meow processes — a stale `rdr`
+/// under `com.apple/*` keeps redirecting host TCP to a dead listener
+/// port. Best-effort: failures warn and continue (issue #621).
+#[cfg(target_os = "macos")]
+fn sweep_stale_anchors(reserved_seq: u32) {
+    let own_pid = std::process::id();
+    let Ok(out) = Command::new("pfctl")
+        .args(["-a", "com.apple", "-sAnchors"])
+        .output()
+    else {
+        return;
+    };
+    if !out.status.success() {
+        return;
+    }
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let name = line.trim();
+        if name.is_empty() {
+            continue;
+        }
+        // Output may be relative to `com.apple/` or absolute — normalize.
+        let rel = name.strip_prefix("com.apple/").unwrap_or(name);
+        if !stale_anchor(rel, own_pid, reserved_seq) {
+            continue;
+        }
+        let full = format!("com.apple/{rel}");
+        match Command::new("pfctl")
+            .args(["-a", full.as_str(), "-F", "all"])
+            .output()
+        {
+            // warn for the legacy shared anchor: under a rolling restart
+            // it may belong to a still-running old-version process — the
+            // sweep then interrupts that instance's redirect until it
+            // exits (accepted: the alternative is leaking it forever).
+            Ok(o) if o.status.success() && rel == PF_ANCHOR_PREFIX => {
+                warn!("swept legacy shared pf anchor '{full}'");
+            }
+            Ok(o) if o.status.success() => info!("swept stale pf anchor '{full}'"),
+            Ok(o) => warn!(
+                "failed to sweep stale pf anchor '{full}': {}",
+                String::from_utf8_lossy(&o.stderr)
+            ),
+            Err(e) => warn!("failed to sweep stale pf anchor '{full}': {e}"),
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 impl PlatformGuard {
     fn setup(
@@ -149,20 +365,42 @@ impl PlatformGuard {
         // anchor (e.g. `com.meow.tproxy`) loads fine but is never referenced by
         // the active ruleset, so its `rdr` never takes effect (verified: a
         // sibling anchor does not intercept; a `com.apple/*` child does).
-        let anchor = "com.apple/com.meow.tproxy".to_string();
+        // The `.{pid}.{seq}` suffix keeps every listener instance's anchor
+        // distinct — teardown flushes only its own (issue #621).
+        let _setup = SETUP_LOCK.lock();
+        let seq = INSTANCE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let anchor = format!("com.apple/{PF_ANCHOR_PREFIX}.{pid}.{seq}");
         let uid = unsafe { libc::getuid() };
+
+        sweep_stale_anchors(seq);
 
         let rules = build_pf_ruleset(uid, listen_port, ephemeral_port_first(), bypass_ips);
 
-        let tmp_path = format!("/tmp/meow_tproxy_{pid}.conf", pid = std::process::id());
-        std::fs::write(&tmp_path, &rules)?;
+        // `create_new` so a pre-planted symlink in /tmp can't redirect a
+        // root-privileged write (the name is predictable). A stale
+        // same-name file (dead process that had our pid) is removed first.
+        let tmp_path = format!("/tmp/meow_tproxy_{pid}_{seq}.conf");
+        let _ = std::fs::remove_file(&tmp_path);
+        let wrote = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, rules.as_bytes()));
+        if let Err(e) = wrote {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e);
+        }
 
+        // Collect the spawn result before `?` — a failed spawn must still
+        // drop the temp conf rather than leak it in /tmp.
         let output = Command::new("pfctl")
             .args(["-a", &anchor, "-f", &tmp_path])
-            .output()?;
+            .output();
 
         let _ = std::fs::remove_file(&tmp_path);
 
+        let output = output?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(io::Error::other(format!(
@@ -188,17 +426,20 @@ impl PlatformGuard {
         if self.torn_down {
             return Ok(());
         }
-        self.torn_down = true;
 
         let output = Command::new("pfctl")
             .args(["-a", &self.anchor, "-F", "all"])
             .output()?;
 
         if output.status.success() {
+            self.torn_down = true;
             info!("pf anchor '{anchor}' flushed", anchor = self.anchor);
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
             warn!("pfctl flush anchor failed: {stderr}");
+            // Leave torn_down unset so a later Drop retries the flush —
+            // an anchor that survives teardown keeps redirecting the
+            // host's traffic for the rest of this process's life.
         }
         Ok(())
     }
@@ -212,6 +453,95 @@ impl PlatformGuard {
 struct PlatformGuard {
     table_name: String,
     torn_down: bool,
+}
+
+/// nftables table prefix — managed tables are `meow_tproxy_{pid}_{seq}`.
+#[cfg(any(target_os = "linux", test))]
+const NFT_TABLE_PREFIX: &str = "meow_tproxy";
+
+/// Whether `name` is a meow-managed nft table whose owner is gone: the
+/// legacy shared table `meow_tproxy` (pre-#621 naming),
+/// `meow_tproxy_<pid>_<seq>` whose pid is dead or was recycled by a
+/// non-meow process, or an own-pid name with `seq >= reserved_seq` — a
+/// table of OUR pid this boot never created can only be a prior
+/// process's leftover under a recycled pid, and would otherwise collide
+/// with the upcoming `add` and fail setup outright (issue #621 review).
+/// Tables owned by live meow processes — including a sibling listener in
+/// this one — are kept.
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn stale_table(name: &str, own_pid: u32, reserved_seq: u32) -> bool {
+    if name == NFT_TABLE_PREFIX {
+        return true;
+    }
+    let Some(rest) = name.strip_prefix("meow_tproxy_") else {
+        return false;
+    };
+    match managed_suffix(rest, '_') {
+        Some((pid, seq)) if pid == own_pid => seq >= reserved_seq,
+        Some((pid, _)) => !pid_alive(pid) || !pid_is_meow(pid),
+        None => false,
+    }
+}
+
+/// Delete managed tables left behind by dead meow processes — an
+/// uncleaned output-chain redirect keeps black-holing host TCP.
+/// `reserved_seq` is the just-allocated sequence of the instance about
+/// to be created: own-pid names at or above it predate this boot and
+/// are stale by definition. Best-effort: listing/deletion failures warn
+/// and continue; setup proceeds regardless (issue #621).
+#[cfg(target_os = "linux")]
+fn sweep_stale_tables(reserved_seq: u32) {
+    let own_pid = std::process::id();
+    let Ok(out) = Command::new("nft").args(["list", "tables"]).output() else {
+        return;
+    };
+    if !out.status.success() {
+        return;
+    }
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let Some(name) = line.strip_prefix("table inet ").map(str::trim) else {
+            continue;
+        };
+        if !stale_table(name, own_pid, reserved_seq) {
+            continue;
+        }
+        match Command::new("nft")
+            .args(["delete", "table", "inet", name])
+            .output()
+        {
+            // warn for the legacy shared table: under a rolling restart
+            // it may belong to a still-running old-version process — the
+            // sweep interrupts that instance's redirect until it exits
+            // (accepted: the alternative is leaking it forever).
+            Ok(o) if o.status.success() && name == NFT_TABLE_PREFIX => {
+                warn!("swept legacy shared nftables table '{name}'");
+            }
+            Ok(o) if o.status.success() => {
+                // A swept name whose embedded pid is still alive was the
+                // reused-pid/replaced-binary case: if that pid actually
+                // runs a live meow (different exe path), its redirect is
+                // now open — surface it louder than routine debris.
+                let swept_live_pid = name
+                    .strip_prefix("meow_tproxy_")
+                    .and_then(|rest| managed_suffix(rest, '_'))
+                    .is_some_and(|(pid, _)| pid_alive(pid));
+                if swept_live_pid {
+                    warn!(
+                        "swept nftables table '{name}' owned by a live pid \
+                         (exe mismatch: pid reuse or replaced binary — that \
+                         instance's redirect is now open)"
+                    );
+                } else {
+                    info!("swept stale nftables table '{name}'");
+                }
+            }
+            Ok(o) => warn!(
+                "failed to sweep stale nftables table '{name}': {}",
+                String::from_utf8_lossy(&o.stderr)
+            ),
+            Err(e) => warn!("failed to sweep stale nftables table '{name}': {e}"),
+        }
+    }
 }
 
 /// Build the nftables ruleset that the Linux code path feeds to `nft -f -`.
@@ -282,7 +612,12 @@ impl PlatformGuard {
         routing_mark: Option<u32>,
         bypass_ips: &[IpAddr],
     ) -> io::Result<Self> {
-        let table_name = "meow_tproxy".to_string();
+        // Per-instance table name — two listeners or processes never share
+        // kernel state, and teardown deletes only this table (issue #621).
+        let _setup = SETUP_LOCK.lock();
+        let seq = INSTANCE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let table_name = format!("{NFT_TABLE_PREFIX}_{}_{}", std::process::id(), seq);
+        sweep_stale_tables(seq);
         let ruleset = build_nft_ruleset(&table_name, listen_port, routing_mark, bypass_ips);
 
         let output = Command::new("nft")
@@ -322,17 +657,21 @@ impl PlatformGuard {
         if self.torn_down {
             return Ok(());
         }
-        self.torn_down = true;
 
         let output = Command::new("nft")
             .args(["delete", "table", "inet", &self.table_name])
             .output()?;
 
         if output.status.success() {
+            self.torn_down = true;
             info!("nftables table '{name}' deleted", name = self.table_name);
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
             warn!("nft delete table failed: {stderr}");
+            // Leave torn_down unset so a later Drop retries the delete —
+            // an orphaned managed table keeps redirecting host TCP for
+            // the rest of this process's life, and the startup sweep
+            // won't touch it while its owner (us) is alive.
         }
         Ok(())
     }
@@ -489,5 +828,72 @@ mod tests {
         let bypass = [IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))];
         let rs = build_pf_ruleset(501, 7893, 49152, &bypass);
         assert!(rs.contains("pass out quick on lo0 proto tcp from any to 1.1.1.1"));
+    }
+
+    // ─── Per-instance naming + stale sweep (issue #621) ──────────────────────
+
+    #[test]
+    fn managed_suffix_parses_owner() {
+        assert_eq!(managed_suffix("1234_0", '_'), Some((1234, 0)));
+        assert_eq!(managed_suffix("42.7", '.'), Some((42, 7)));
+        // Malformed suffixes aren't ours — never swept.
+        assert_eq!(managed_suffix("1234", '_'), None);
+        assert_eq!(managed_suffix("abc_0", '_'), None);
+        assert_eq!(managed_suffix("1234_", '_'), None);
+        assert_eq!(managed_suffix("1_2_3", '_'), None);
+        assert_eq!(managed_suffix("", '_'), None);
+        // A leading `+` parses under `u32::parse` but is not our shape.
+        assert_eq!(managed_suffix("+5_0", '_'), None);
+    }
+
+    /// A pid no live process can hold — `kill(pid, 0)` → ESRCH.
+    /// (`i32::MAX` is a valid pid number but exceeds every real pid_max.)
+    #[cfg(unix)]
+    const DEAD_PID: u32 = i32::MAX as u32;
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_table_classification() {
+        let live = std::process::id();
+        // Legacy shared table is always stale once per-instance naming lands.
+        assert!(stale_table("meow_tproxy", live, 0));
+        assert!(stale_table(&format!("meow_tproxy_{DEAD_PID}_0"), live, 0));
+        // pid 0 is never a real owner (`kill(0,0)` would probe our own
+        // process group) — treated as stale.
+        assert!(stale_table("meow_tproxy_0_0", live, 0));
+        // Own-pid tables: seq >= the just-reserved one predates this boot
+        // (a dead process recycled our pid) → stale; below it → a sibling
+        // created earlier this boot → keep.
+        assert!(stale_table(&format!("meow_tproxy_{live}_0"), live, 0));
+        assert!(!stale_table(&format!("meow_tproxy_{live}_0"), live, 1));
+        assert!(!stale_table(&format!("meow_tproxy_{live}_0"), live, 7));
+        // pid 1 is alive but is never a meow process — a `meow_tproxy_1_*`
+        // name can only be foreign-planted or a pid-reuse leftover.
+        #[cfg(target_os = "linux")]
+        assert!(stale_table("meow_tproxy_1_0", live, 0));
+        // Foreign tables are never swept.
+        assert!(!stale_table("meow_ext_fw", live, 0));
+        assert!(!stale_table("meow_tproxyx_1_0", live, 0));
+        assert!(!stale_table("meow_tproxy_noseq", live, 0));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_anchor_classification() {
+        let live = std::process::id();
+        assert!(stale_anchor("com.meow.tproxy", live, 0));
+        assert!(stale_anchor(
+            &format!("com.meow.tproxy.{DEAD_PID}.0"),
+            live,
+            0
+        ));
+        assert!(stale_anchor("com.meow.tproxy.0.0", live, 0));
+        // Own-pid seq boundary — same rule as tables.
+        assert!(stale_anchor(&format!("com.meow.tproxy.{live}.0"), live, 0));
+        assert!(!stale_anchor(&format!("com.meow.tproxy.{live}.0"), live, 1));
+        #[cfg(target_os = "macos")]
+        assert!(stale_anchor("com.meow.tproxy.1.0", live, 0));
+        assert!(!stale_anchor("com.apple.networking", live, 0));
+        assert!(!stale_anchor("com.meow.tproxyx.1.0", live, 0));
     }
 }

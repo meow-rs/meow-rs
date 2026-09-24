@@ -799,6 +799,19 @@ mod linux {
             || dst_ip == IpAddr::V4(Ipv4Addr::BROADCAST))
     }
 
+    /// Binds a spawned task's lifetime to a scope: dropping the guard —
+    /// on error return *or* on task cancellation — aborts it. Used for
+    /// the reply dispatcher, which otherwise lingered after the recv
+    /// loop exited until every flow channel closed, up to `udp_timeout`
+    /// (issue #621).
+    struct AbortOnDrop(tokio::task::AbortHandle);
+
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
     /// The UDP receive loop: socket → flow dispatch. Exits on socket
     /// errors; idle-flow eviction is lazy (channel-close observed on the
     /// next datagram, or the periodic sweep).
@@ -811,7 +824,7 @@ mod linux {
         in_port: u16,
     ) -> io::Result<()> {
         let (reply_tx, reply_rx) = mpsc::channel::<ReplyMsg>(REPLY_QUEUE);
-        tokio::spawn(reply_dispatch(reply_rx));
+        let _dispatcher = AbortOnDrop(tokio::spawn(reply_dispatch(reply_rx)).abort_handle());
 
         let mut dispatch =
             FlowDispatch::new(reply_tx, max_flows, udp_timeout, in_name.clone(), in_port);
