@@ -127,7 +127,7 @@ RESPONSE=""
 RESPONSE=$(echo "HELLO" | timeout 5 nc -w 3 10.88.0.1 9999 2>/dev/null) || true
 
 # Verify meow logged the intercepted connection to 10.88.0.1:9999
-if wait_log "10.88.0.1:9999" /tmp/meow.log; then
+if wait_log "10\.88\.0\.1:9999" /tmp/meow.log; then
     pass "tproxy_intercept"
 else
     fail "tproxy_intercept"
@@ -164,7 +164,7 @@ fi
     printf 'sni.example.com'                # Hostname (15 bytes)
 } | timeout 3 nc -w 2 10.88.0.1 443 2>/dev/null || true
 
-if wait_log "sni.example.com" /tmp/meow.log; then
+if wait_log "sni\.example\.com" /tmp/meow.log; then
     pass "tproxy_sni_extract"
 else
     fail "tproxy_sni_extract"
@@ -254,7 +254,7 @@ else
 fi
 
 # Test 13: ext_fw_log — startup log discloses external management
-if grep -q "external firewall management" /tmp/meow-ext.log 2>/dev/null; then
+if wait_log "external firewall management" /tmp/meow-ext.log; then
     pass "ext_fw_log"
 else
     fail "ext_fw_log"
@@ -266,7 +266,7 @@ EXT_RESPONSE=""
 EXT_RESPONSE=$(echo "HELLO" | timeout 5 nc -w 3 10.88.0.1 9999 2>/dev/null) || true
 
 if [ "$EXT_RESPONSE" = "ECHO_RESPONSE" ] \
-    && wait_log "10.88.0.1:9999" /tmp/meow-ext.log; then
+    && wait_log "10\.88\.0\.1:9999" /tmp/meow-ext.log; then
     pass "ext_tproxy_relay"
 else
     fail "ext_tproxy_relay"
@@ -451,7 +451,7 @@ TCP_SAME_PORT=""
 TCP_SAME_PORT=$(echo "HELLO" | timeout 5 nc -w 3 10.89.0.1 9999 2>/dev/null) || true
 
 if [ "$TCP_SAME_PORT" = "ECHO_RESPONSE" ] \
-    && wait_log "10.89.0.1:9999" /tmp/meow-udp.log; then
+    && wait_log "10\.89\.0\.1:9999" /tmp/meow-udp.log; then
     pass "udp_tcp_same_port"
 else
     fail "udp_tcp_same_port"
@@ -599,7 +599,7 @@ else
 fi
 
 # Test 25: multi_warn_logged — the ambiguity warning fired on second setup
-if grep -q "multiple managed tproxy firewalls" /tmp/meow-multi.log 2>/dev/null; then
+if wait_log "multiple managed tproxy firewalls" /tmp/meow-multi.log; then
     pass "multi_warn_logged"
 else
     fail "multi_warn_logged"

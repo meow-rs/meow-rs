@@ -913,10 +913,13 @@ mod tests {
             // sees the real `sleep` image (foreign exe → stale).
             let name = format!("meow_tproxy_{foreign}_0");
             let is_stale = eventually(|| stale_table(&name, live, 0));
-            // Pin the intended arm: the child must still be alive — if it
-            // died early, the !pid_alive arm would pass the assert for the
-            // wrong reason.
-            assert!(child.try_wait().unwrap().is_none());
+            // Pin the intended arm: the child must still be running — a
+            // dead unreaped child still passes kill(pid, 0) but its exe
+            // is unreadable, which classifies keep, not stale.
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "foreign-pid child (pid {foreign}) exited early"
+            );
             let _ = child.kill();
             let _ = child.wait();
             assert!(
@@ -955,7 +958,10 @@ mod tests {
             let foreign = child.id();
             let name = format!("com.meow.tproxy.{foreign}.0");
             let is_stale = eventually(|| stale_anchor(&name, live, 0));
-            assert!(child.try_wait().unwrap().is_none());
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "foreign-pid child (pid {foreign}) exited early"
+            );
             let _ = child.kill();
             let _ = child.wait();
             assert!(
