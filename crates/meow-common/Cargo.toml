@@ -23,6 +23,11 @@ httparse = { version = "1", default-features = false }
 ipnet = { workspace = true }
 subtle = { workspace = true }
 
+# fs_util's dead-pid scratch sweep uses `kill(pid, 0)`; the per-OS entries
+# below keep libc on their platforms for other modules.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(target_os = "android")'.dependencies]
 socket2 = { workspace = true }
 libc = "0.2"
