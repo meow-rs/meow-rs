@@ -28,6 +28,10 @@ pub struct LoadBalanceGroup {
     provider_slots: Vec<ProviderSlot>,
     strategy: LbStrategy,
     counter: AtomicUsize,
+    /// Group health-check `url:` (upstream `TestUrl`) — pick-time member
+    /// eligibility is `alive_for_url(test_url)`, and the sweep/API read it
+    /// via `Proxy::test_url`.
+    test_url: String,
     expected_status: String,
     health: ProxyHealth,
     usage: UsageTracker,
@@ -55,6 +59,7 @@ impl LoadBalanceGroup {
             provider_slots: slots,
             strategy,
             counter: AtomicUsize::new(0),
+            test_url: "https://www.gstatic.com/generate_204".to_string(),
             expected_status: String::new(),
             health: ProxyHealth::new(),
             usage: UsageTracker::new(),
@@ -119,26 +124,13 @@ impl LoadBalanceGroup {
         best
     }
 
-    /// Strategy-specific index into a set of `alive_count` members.
-    /// Callers must ensure `alive_count > 0`. `advance=false` is the
-    /// match-time peek (`Unwrap(metadata, false)` upstream): round-robin
-    /// reads the counter without committing it.
-    fn pick_index(&self, alive_count: usize, metadata: &Metadata, advance: bool) -> usize {
-        debug_assert!(alive_count > 0, "modulo over an empty pick space");
-        match self.strategy {
-            LbStrategy::RoundRobin => {
-                let c = if advance {
-                    self.counter.fetch_add(1, Ordering::Relaxed)
-                } else {
-                    self.counter.load(Ordering::Relaxed)
-                };
-                c % alive_count
-            }
-            LbStrategy::ConsistentHashing => {
-                let (bytes, len) = src_ip_bytes(metadata);
-                (fnv1a(&bytes[..len]) as usize) % alive_count
-            }
-        }
+    /// Attach the group health-check `url:` (upstream `TestUrl`). Member
+    /// eligibility on every pick is `alive_for_url(test_url)`, and the
+    /// sweep/API read it via `Proxy::test_url` (issue #621).
+    #[must_use]
+    pub fn with_test_url(mut self, test_url: String) -> Self {
+        self.test_url = test_url;
+        self
     }
 
     /// Attach the group-level `expected-status` probe expression
@@ -163,76 +155,139 @@ impl LoadBalanceGroup {
         self.pick(metadata, true, true)
     }
 
-    /// Two passes over the member set — count eligible members, pick an index,
-    /// then clone the nth eligible member. No materialized Vec even with
-    /// provider slots (the same walk url-test's `pick_for_dial` does). A
-    /// member dying between the passes can shift the pick or yield `None`
-    /// for this one dial — benign, self-correcting on the next call.
+    /// Eligibility for a pick: alive for the group's test URL (upstream
+    /// `AliveForTestUrl(testUrl)` — for leaf adapters the single health
+    /// flag makes this identical to `alive()`), and UDP-capable when the
+    /// pick is for a UDP flow (upstream LB does not filter by UDP — that
+    /// asymmetry is local).
+    fn eligible(&self, p: &Arc<dyn Proxy>, udp_only: bool) -> bool {
+        p.alive_for_url(&self.test_url) && (!udp_only || p.support_udp())
+    }
+
+    /// One immutable member snapshot per pick — statics first, then each
+    /// provider slot's current contents. The previous two-pass form
+    /// (count eligible, then re-walk under fresh slot read-guards) could
+    /// observe a member death or a provider-slot swap between passes and
+    /// shift the pick or yield `None` for one dial (issue #621).
     fn pick(&self, metadata: &Metadata, udp_only: bool, advance: bool) -> Option<Arc<dyn Proxy>> {
-        let eligible = |p: &Arc<dyn Proxy>| p.alive() && (!udp_only || p.support_udp());
-        let mut alive_count = 0usize;
-        self.for_each_member(|p| {
-            alive_count += usize::from(eligible(p));
-            true
-        });
-        if alive_count == 0 {
-            return None;
-        }
-        let idx = self.pick_index(alive_count, metadata, advance);
-        let mut picked = None;
-        let mut i = 0usize;
-        self.for_each_member(|p| {
-            if eligible(p) {
-                if i == idx {
-                    picked = Some(Arc::clone(p));
-                    return false;
+        let members = self.member_proxies().unwrap_or_default();
+        match self.strategy {
+            LbStrategy::RoundRobin => {
+                // Evaluate eligibility once: a health flag can flip between
+                // a count pass and a pick pass, which would shrink the set
+                // under `c % old_len` and yield `None` for a dial that had
+                // live members (issue #621 review).
+                let eligible: Vec<&Arc<dyn Proxy>> = members
+                    .iter()
+                    .filter(|p| self.eligible(p, udp_only))
+                    .collect();
+                if eligible.is_empty() {
+                    return None;
                 }
-                i += 1;
+                // `advance=false` is the match-time peek (`Unwrap(metadata,
+                // false)` upstream): round-robin reads the counter without
+                // committing it.
+                let c = if advance {
+                    self.counter.fetch_add(1, Ordering::Relaxed)
+                } else {
+                    self.counter.load(Ordering::Relaxed)
+                };
+                Some(Arc::clone(eligible[c % eligible.len()]))
             }
-            true
-        });
-        picked
+            LbStrategy::ConsistentHashing => {
+                // mihomo `strategyConsistentHashing`: jump-hash the
+                // destination key over the FULL member list; on an
+                // ineligible member retry with the incremented hash, up
+                // to five times, then fall back to a linear scan
+                // (adapter/outbound/loadbalance.go).
+                if members.is_empty() {
+                    return None;
+                }
+                let mut key = fnv1a64(get_key(metadata).as_bytes());
+                for _ in 0..5 {
+                    let idx = jump_hash(key, members.len()) as usize;
+                    let p = &members[idx];
+                    if self.eligible(p, udp_only) {
+                        return Some(Arc::clone(p));
+                    }
+                    key = key.wrapping_add(1);
+                }
+                members
+                    .iter()
+                    .find(|p| self.eligible(p, udp_only))
+                    .map(Arc::clone)
+            }
+        }
     }
 }
 
-/// Extract raw IP bytes from `Metadata.src_ip` for FNV hashing.
-///
-/// IPv4 → 4 bytes. IPv6 → 16 bytes.
-/// `None` (no src_addr, e.g. local probe) → 4 zero bytes (0.0.0.0 fallback).
-/// Every connection without a src_addr hashes to the same proxy — deterministic,
-/// not random. Upstream: undefined (assumes src always present).
-fn src_ip_bytes(metadata: &Metadata) -> ([u8; 16], usize) {
-    let mut buf = [0u8; 16];
-    match metadata.src_ip {
-        Some(IpAddr::V4(v4)) => {
-            let octets = v4.octets();
-            buf[..4].copy_from_slice(&octets);
-            (buf, 4)
+/// mihomo `getKey`: the consistent-hashing key derives from the
+/// *destination*, not the client. An IP-literal host is used verbatim, a
+/// domain is reduced to its eTLD+1 (`a.b.example.co.uk` → `example.co.uk`,
+/// so all of a registrable domain's hosts share one member), and anything
+/// else falls back to `dst_ip` (empty when neither exists — every such
+/// connection then lands on the same member, deterministic not random).
+fn get_key(metadata: &Metadata) -> String {
+    if !metadata.host.is_empty() {
+        if metadata.host.parse::<IpAddr>().is_ok() {
+            return metadata.host.to_string();
         }
-        Some(IpAddr::V6(v6)) => {
-            buf.copy_from_slice(&v6.octets());
-            (buf, 16)
+        // Lowercasing is a deliberate improvement, not upstream parity —
+        // Go's publicsuffix lookup is case-sensitive, so `getKey` there
+        // returns the mixed-case eTLD+1; DNS is case-insensitive, so
+        // folding first groups `WWW.Example.COM` with `example.com`
+        // instead of splitting them across members. Unreachable in
+        // practice either way: every ingress already lowercases `host`.
+        //
+        // A host still carrying a port/brackets (`example.com:443`,
+        // `[::1]`) isn't a bare domain. Upstream's helper *succeeds* on
+        // dotted ones (wildcard rule → the whole `domain:port` string
+        // becomes the key) and only fails on single-label port strings —
+        // we instead fall back to `dst_ip`, which keeps the destination
+        // keyed rather than inventing a suffix. Defensive: no ingress
+        // leaves a port in `host` today.
+        let lower = metadata.host.to_ascii_lowercase();
+        if !lower.contains(':') {
+            if let Some(domain) = psl::domain_str(&lower) {
+                return domain.to_string();
+            }
         }
-        None => (buf, 4),
     }
+    metadata.dst_ip.map(|ip| ip.to_string()).unwrap_or_default()
 }
 
-/// FNV-1a 32-bit hash over the client src-IP bytes, taken modulo the
-/// alive count — "same client → same member" stickiness.
-///
-/// Inline implementation — no crate dep. Upstream mihomo instead hashes a
-/// *destination* key (`getKey`: IP host → host, domain → eTLD+1, else
-/// `DstIP`) with `utils.MapHash` and picks via `jumpHash` over the full
-/// member list — a deliberately different scheme (spec divergence 4).
-fn fnv1a(data: &[u8]) -> u32 {
-    const OFFSET_BASIS: u32 = 0x811c9dc5;
-    const PRIME: u32 = 0x01000193;
+/// FNV-1a 64-bit over the destination key. Upstream hashes with
+/// `utils.MapHash` (Go `maphash`, seeded per process — its assignments are
+/// deliberately *not* reproducible across restarts), so parity targets the
+/// key derivation and selection structure, not bit-identical buckets; a
+/// fixed 64-bit hash gives us the stable cross-restart mapping upstream
+/// itself cannot offer.
+fn fnv1a64(data: &[u8]) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
     let mut hash = OFFSET_BASIS;
     for &byte in data {
-        hash ^= byte as u32;
+        hash ^= byte as u64;
         hash = hash.wrapping_mul(PRIME);
     }
     hash
+}
+
+/// Lamping–Veach jump consistent hash — a direct port of mihomo's
+/// `jumpHash` (adapter/outbound/loadbalance.go): same 64-bit LCG state and
+/// the same float64 bucket arithmetic, so identical keys land on identical
+/// bucket indices for a given member count.
+fn jump_hash(mut key: u64, buckets: usize) -> u32 {
+    if buckets == 0 {
+        return 0;
+    }
+    let (mut b, mut j) = (-1i64, 0i64);
+    while j < buckets as i64 {
+        b = j;
+        key = key.wrapping_mul(2862933555777941757).wrapping_add(1);
+        j = ((b + 1) as f64 * ((1u64 << 31) as f64 / ((key >> 33) + 1) as f64)) as i64;
+    }
+    b as u32
 }
 
 #[async_trait]
@@ -334,6 +389,10 @@ impl Proxy for LoadBalanceGroup {
         self.first_alive_member().map(|p| p.name().to_string())
     }
 
+    fn test_url(&self) -> Option<&str> {
+        Some(&self.test_url)
+    }
+
     fn expected_status(&self) -> Option<&str> {
         Some(&self.expected_status)
     }
@@ -348,6 +407,7 @@ mod tests {
     use super::*;
     use crate::group::test_support::MockProxy;
     use meow_common::{ConnType, DnsMode, Network};
+    use smol_str::SmolStr;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     fn meta_no_src() -> Metadata {
@@ -357,13 +417,14 @@ mod tests {
         }
     }
 
-    fn meta_src(ip: IpAddr) -> Metadata {
+    /// Destination-domain metadata — the consistent-hashing key derives
+    /// from the destination (mihomo `getKey`), not the client.
+    fn meta_dst_host(host: &str) -> Metadata {
         Metadata {
-            src_ip: Some(ip),
+            host: SmolStr::from(host),
             network: Network::Tcp,
             conn_type: ConnType::Http,
-            src_port: 12345,
-            dst_port: 80,
+            dst_port: 443,
             dns_mode: DnsMode::Normal,
             ..Metadata::default()
         }
@@ -377,38 +438,121 @@ mod tests {
         LoadBalanceGroup::new("test-lb", proxies, LbStrategy::ConsistentHashing)
     }
 
-    // ─── D. FNV-1a 32-bit implementation ─────────────────────────────────────
+    // ─── D. Hash primitives (mihomo getKey + jumpHash) ───────────────────────
 
     #[test]
-    fn fnv1a_known_vectors() {
-        // Known-answer vectors for the inline FNV-1a 32-bit implementation.
-        // Reference: https://fnvhash.github.io/fnv-calculator-online/
-        // Case labels map to docs/specs/group-load-balance-test-plan.md D1-D3.
-        // D3 ([1,1,1,1] = 0x154df079 / 357429369) guards consistent hashing,
-        // which derives its proxy index from this hash.
-        let cases: &[(&str, &[u8], u32)] = &[
-            ("D1 empty input (offset basis)", &[], 0x811c_9dc5),
-            ("D2 single null byte", &[0x00], 0x050c_5d1f),
-            ("D3 ipv4 bytes 1.1.1.1", &[1, 1, 1, 1], 0x154d_f079),
+    fn fnv1a64_known_vectors() {
+        // Known-answer vectors for the inline FNV-1a 64-bit hash feeding
+        // jump_hash (consistent hashing).
+        let cases: &[(&str, &[u8], u64)] = &[
+            ("empty input (offset basis)", &[], 0xcbf2_9ce4_8422_2325),
+            ("single null byte", &[0x00], 0xaf63_bd4c_8601_b7df),
+            ("example.com", b"example.com", 0x5768_4663_4e27_14c6),
         ];
 
         let mut failures = Vec::new();
         for (label, input, expected) in cases {
-            let got = fnv1a(input);
+            let got = fnv1a64(input);
             if got != *expected {
                 failures.push(format!(
-                    "{label}: fnv1a({input:?}) = {got:#010x}, expected {expected:#010x}"
+                    "{label}: fnv1a64({input:?}) = {got:#018x}, expected {expected:#018x}"
                 ));
             }
         }
         assert!(
             failures.is_empty(),
-            "FNV-1a vector mismatches:\n{}",
+            "FNV-1a-64 vector mismatches:\n{}",
             failures.join("\n")
         );
     }
 
-    // D4 is a build-time check: no `fnv` or `fnv1` crate dependency in Cargo.toml.
+    #[test]
+    fn jump_hash_stays_in_range() {
+        for key in [
+            0u64,
+            1,
+            u64::MAX,
+            fnv1a64(b"example.com"),
+            fnv1a64(b"203.0.113.7"),
+        ] {
+            for buckets in 1..=8usize {
+                let idx = jump_hash(key, buckets) as usize;
+                assert!(idx < buckets, "jump_hash({key}, {buckets}) = {idx}");
+            }
+        }
+    }
+
+    #[test]
+    fn jump_hash_known_answer_vectors() {
+        // Reference values from an independent Lamping–Veach implementation
+        // (the same upstream formulation): (key, [buckets 1,2,3,5,10]).
+        let vectors: &[(u64, [u32; 5])] = &[
+            (0, [0, 0, 0, 0, 0]),
+            (1, [0, 0, 0, 0, 6]),
+            (2, [0, 0, 0, 3, 6]),
+            (12345, [0, 1, 1, 1, 1]),
+            (fnv1a64(b"example.com"), [0, 0, 2, 3, 6]),
+        ];
+        for (key, expected) in vectors {
+            for (i, buckets) in [1usize, 2, 3, 5, 10].iter().enumerate() {
+                assert_eq!(
+                    jump_hash(*key, *buckets),
+                    expected[i],
+                    "jump_hash({key}, {buckets})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn get_key_host_ip_literal_passthrough() {
+        // mihomo getKey: an IP-literal host is the key verbatim.
+        assert_eq!(get_key(&meta_dst_host("203.0.113.7")), "203.0.113.7");
+        assert_eq!(get_key(&meta_dst_host("2001:db8::1")), "2001:db8::1");
+    }
+
+    #[test]
+    fn get_key_domain_reduces_to_etld_plus_one() {
+        // All hosts under one registrable domain share a member.
+        assert_eq!(
+            get_key(&meta_dst_host("a.b.example.co.uk")),
+            "example.co.uk"
+        );
+        assert_eq!(get_key(&meta_dst_host("cdn1.example.com")), "example.com");
+        // Uppercase folds to the lowercase eTLD+1 — our deliberate
+        // improvement over Go's case-sensitive lookup (see get_key).
+        assert_eq!(get_key(&meta_dst_host("WWW.Example.COM")), "example.com");
+    }
+
+    #[test]
+    fn get_key_falls_back_to_dst_ip_then_empty() {
+        // A host that IS a public suffix has no eTLD+1 → dst_ip.
+        let mut m = meta_dst_host("co.uk");
+        m.dst_ip = Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2)));
+        assert_eq!(get_key(&m), "198.51.100.2");
+        // No host → dst_ip; neither → "" (deterministic, not random).
+        let ip_only = Metadata {
+            dst_ip: Some(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+            ..Default::default()
+        };
+        assert_eq!(get_key(&ip_only), "::1");
+        assert_eq!(get_key(&Metadata::default()), "");
+    }
+
+    #[test]
+    fn get_key_edge_cases() {
+        // Trailing-dot FQDN reduces like its non-FQDN form (psl trims it).
+        assert_eq!(get_key(&meta_dst_host("www.example.com.")), "example.com");
+        // Unknown TLD → psl wildcard: the full host is the eTLD+1, matching
+        // Go's EffectiveTLDPlusOne on `foo.local`/`foo.internal`.
+        assert_eq!(get_key(&meta_dst_host("foo.local")), "foo.local");
+        assert_eq!(get_key(&meta_dst_host("a.foo.internal")), "foo.internal");
+        // A host still carrying a port is not a domain — upstream's helper
+        // fails and falls back to DstIP; pin that parity.
+        let mut m = meta_dst_host("example.com:443");
+        m.dst_ip = Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)));
+        assert_eq!(get_key(&m), "203.0.113.9");
+    }
 
     // ─── A. Round-robin strategy ──────────────────────────────────────────────
 
@@ -476,6 +620,7 @@ mod tests {
             provider_slots: Vec::new(),
             strategy: LbStrategy::RoundRobin,
             counter: AtomicUsize::new(usize::MAX - 1),
+            test_url: "https://www.gstatic.com/generate_204".to_string(),
             expected_status: String::new(),
             health: ProxyHealth::new(),
             usage: super::UsageTracker::new(),
@@ -516,14 +661,15 @@ mod tests {
     // ─── B. Consistent-hashing strategy ──────────────────────────────────────
 
     #[test]
-    fn consistent_hashing_stable_for_same_src() {
-        // upstream: adapter/outbound/loadbalance.go::ConsistentHashing.Addr
-        // NOT volatile — same src IP + fixed proxy list → same proxy every time.
+    fn consistent_hashing_stable_for_same_dst() {
+        // upstream: adapter/outbound/loadbalance.go::strategyConsistentHashing
+        // NOT volatile — same destination key + fixed proxy list → same
+        // member every time.
         let proxies: Vec<Arc<dyn Proxy>> = (0..3)
             .map(|i| MockProxy::new(&i.to_string()) as Arc<dyn Proxy>)
             .collect();
         let group = make_ch(proxies);
-        let meta = meta_src(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)));
+        let meta = meta_dst_host("example.com");
 
         let first = group.select(&meta).unwrap().name().to_string();
         for _ in 0..99 {
@@ -532,51 +678,120 @@ mod tests {
     }
 
     #[test]
-    fn consistent_hashing_differs_for_different_src() {
-        // verified: fnv1a([1,1,1,1]) % 3 = 0, fnv1a([127,0,0,1]) % 3 = 1
+    fn consistent_hashing_ignores_src_ip() {
+        // The key derives from the destination (mihomo getKey) — two
+        // clients reaching the same host share a member; that's the whole
+        // point of consistent hashing (per-egress spread).
         let proxies: Vec<Arc<dyn Proxy>> = (0..3)
             .map(|i| MockProxy::new(&i.to_string()) as Arc<dyn Proxy>)
             .collect();
         let group = make_ch(proxies);
 
-        let m1 = meta_src(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)));
-        let m2 = meta_src(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
+        let mut a = meta_dst_host("example.com");
+        a.src_ip = Some(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)));
+        let mut b = meta_dst_host("example.com");
+        b.src_ip = Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
 
-        let p1 = group.select(&m1).unwrap().name().to_string();
-        let p2 = group.select(&m2).unwrap().name().to_string();
-        assert_ne!(
-            p1, p2,
-            "1.1.1.1 and 127.0.0.1 must map to different proxies"
+        assert_eq!(
+            group.select(&a).unwrap().name(),
+            group.select(&b).unwrap().name()
         );
     }
 
     #[test]
-    fn consistent_hashing_skips_dead_proxy() {
-        // Mark the proxy that 1.1.1.1 would select as dead; another alive proxy is returned.
-        // 1.1.1.1 → fnv1a([1,1,1,1]) % 3 = 0 → proxies[0]
+    fn consistent_hashing_spreads_across_dst_keys() {
+        // Different destinations must not all collapse onto one member —
+        // scan dst hosts until two land on different members.
+        let proxies: Vec<Arc<dyn Proxy>> = (0..3)
+            .map(|i| MockProxy::new(&i.to_string()) as Arc<dyn Proxy>)
+            .collect();
+        let group = make_ch(proxies);
+
+        let mut seen = std::collections::BTreeSet::new();
+        for i in 0..64u8 {
+            let meta = meta_dst_host(&format!("host{i}.example{i}.com"));
+            seen.insert(group.select(&meta).unwrap().name().to_string());
+            if seen.len() > 1 {
+                return;
+            }
+        }
+        panic!("64 distinct dst keys all hashed to one member");
+    }
+
+    #[test]
+    fn consistent_hashing_retries_past_dead_member() {
+        // The member a key maps to dies → the jump-hash retry (key+1…+4)
+        // or the linear fallback must land on an *alive* member.
         let a = MockProxy::new("A");
         let b = MockProxy::new("B");
         let c = MockProxy::new("C");
-        let proxies: Vec<Arc<dyn Proxy>> = vec![Arc::clone(&a) as Arc<dyn Proxy>, b, c];
+        let proxies: Vec<Arc<dyn Proxy>> = vec![
+            Arc::clone(&a) as Arc<dyn Proxy>,
+            Arc::clone(&b) as Arc<dyn Proxy>,
+            Arc::clone(&c) as Arc<dyn Proxy>,
+        ];
         let group = make_ch(proxies);
-        let meta = meta_src(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)));
+        let meta = meta_dst_host("example.com");
 
-        // Verify A is the normal selection
-        assert_eq!(group.select(&meta).unwrap().name(), "A");
-        // Mark A dead
-        a.set_alive(false);
-        // Must still return an alive proxy
+        let picked = group.select(&meta).unwrap().name().to_string();
+        for p in [&a, &b, &c] {
+            p.set_alive(p.name() != picked);
+        }
         let selected = group
             .select(&meta)
-            .expect("should still select with A dead");
+            .expect("must still select with the mapped member dead");
         assert!(selected.alive(), "selected proxy must be alive");
     }
 
     #[test]
-    fn consistent_hashing_absent_src_addr_deterministic() {
-        // src_addr: None → hashes to 0.0.0.0 (4 zero bytes) → deterministic bucket.
-        // NOT random. NOT NoProxyAvailable. NOT an error.
-        // Upstream: undefined (assumes src always present) — we define the fallback.
+    fn consistent_hashing_dead_member_remaps_only_its_keys() {
+        // Jump-hash's minimal-reshuffle property: killing a member moves
+        // only the keys that mapped to it; keys on surviving members keep
+        // their member (upstream relies on this for connection stability).
+        let a = MockProxy::new("A");
+        let b = MockProxy::new("B");
+        let c = MockProxy::new("C");
+        let proxies: Vec<Arc<dyn Proxy>> = vec![
+            Arc::clone(&a) as Arc<dyn Proxy>,
+            Arc::clone(&b) as Arc<dyn Proxy>,
+            Arc::clone(&c) as Arc<dyn Proxy>,
+        ];
+        let group = make_ch(proxies);
+
+        // Find two dst keys landing on different members.
+        let (mut k1, mut k2) = (None, None);
+        for i in 0..64u8 {
+            let meta = meta_dst_host(&format!("site{i}.example{i}.net"));
+            let name = group.select(&meta).unwrap().name().to_string();
+            match name.as_str() {
+                n if k1.is_none() => k1 = Some((meta, n.to_string())),
+                n if n != k1.as_ref().unwrap().1 && k2.is_none() => {
+                    k2 = Some((meta, n.to_string()));
+                }
+                _ => {}
+            }
+            if k2.is_some() {
+                break;
+            }
+        }
+        let (k1, n1) = k1.unwrap();
+        let (k2, n2) = k2.unwrap();
+
+        // Kill the member k1 maps to; k2's mapping must not move.
+        for p in [&a, &b, &c] {
+            if p.name() == n1 {
+                p.set_alive(false);
+            }
+        }
+        assert_ne!(group.select(&k1).unwrap().name(), n1);
+        assert_eq!(group.select(&k2).unwrap().name(), n2, "k2 must not remap");
+    }
+
+    #[test]
+    fn consistent_hashing_absent_dst_deterministic() {
+        // No host and no dst_ip → the empty key — every such connection
+        // lands on the same member. NOT random. NOT NoProxyAvailable.
+        // Upstream hashes "" identically.
         let proxies: Vec<Arc<dyn Proxy>> = (0..3)
             .map(|i| MockProxy::new(&i.to_string()) as Arc<dyn Proxy>)
             .collect();
@@ -590,39 +805,23 @@ mod tests {
     }
 
     #[test]
-    fn consistent_hashing_ipv6_src_stable() {
-        // IPv6 src IP → 16-byte hash input → same proxy across 10 calls.
-        // Guards that src_ip_bytes() handles IpAddr::V6 without truncation.
+    fn consistent_hashing_ipv6_dst_stable() {
+        // IPv6 dst literal → the canonical ip string is the key — same
+        // member across calls.
         let proxies: Vec<Arc<dyn Proxy>> = (0..3)
             .map(|i| MockProxy::new(&i.to_string()) as Arc<dyn Proxy>)
             .collect();
         let group = make_ch(proxies);
         let ip6: IpAddr = IpAddr::V6(Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1));
-        let meta = meta_src(ip6);
+        let meta = Metadata {
+            dst_ip: Some(ip6),
+            ..Default::default()
+        };
 
         let first = group.select(&meta).unwrap().name().to_string();
         for _ in 0..9 {
             assert_eq!(group.select(&meta).unwrap().name(), first);
         }
-    }
-
-    #[test]
-    fn consistent_hashing_reshuffles_on_list_change() {
-        // consistent-hashing = stable for given src+list, NOT ring-consistent.
-        // Users should not assume minimal disruption on list change — ADR-0002 Class B row #4.
-        // 1.1.1.1 maps to proxy A (idx 0) with [A, B, C].
-        // Mark B dead → alive = [A, C]; 1.1.1.1 → fnv1a([1,1,1,1]) % 2 = 1 → C.
-        let a = MockProxy::new("A");
-        let b = MockProxy::new("B");
-        let c = MockProxy::new("C");
-        let proxies: Vec<Arc<dyn Proxy>> = vec![a, Arc::clone(&b) as Arc<dyn Proxy>, c];
-        let group = make_ch(proxies);
-        let meta = meta_src(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)));
-
-        assert_eq!(group.select(&meta).unwrap().name(), "A");
-        b.set_alive(false);
-        // fnv1a([1,1,1,1]) % 2 = 1, alive=[A,C], so idx 1 = C
-        assert_eq!(group.select(&meta).unwrap().name(), "C");
     }
 
     // ─── C. All-dead and zero-proxy error paths ───────────────────────────────
@@ -649,9 +848,7 @@ mod tests {
         b.set_alive(false);
         let proxies: Vec<Arc<dyn Proxy>> = vec![a, b];
         let group = make_ch(proxies);
-        assert!(group
-            .select(&meta_src(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))))
-            .is_none());
+        assert!(group.select(&meta_dst_host("example.com")).is_none());
     }
 
     #[test]
@@ -871,10 +1068,10 @@ mod tests {
 
     #[test]
     fn consistent_hashing_stable_across_slots() {
-        // Same src IP must keep landing on the same member whether the alive
-        // set is static or slot-sourced. Find a src IP whose hash lands on a
-        // slot member first — otherwise a statics-only pick space would
-        // satisfy the stability assertion vacuously.
+        // Same dst key must keep landing on the same member whether the
+        // member set is static or slot-sourced. Find a dst whose hash lands
+        // on a slot member first — otherwise a statics-only pick space
+        // would satisfy the stability assertion vacuously.
         let slot = slot_of(vec![MockProxy::new("P1"), MockProxy::new("P2")]);
         let group = LoadBalanceGroup::new_with_providers(
             "lb",
@@ -883,12 +1080,12 @@ mod tests {
             vec![slot],
         );
         let (meta, first) = (0..=255u8)
-            .map(|last| meta_src(IpAddr::V4(Ipv4Addr::new(10, 0, 0, last))))
+            .map(|i| meta_dst_host(&format!("host{i}.dst{i}.xyz")))
             .find_map(|m| {
                 let name = group.select(&m).unwrap().name().to_string();
                 (name != "A").then_some((m, name))
             })
-            .expect("some src IP must hash onto a slot member");
+            .expect("some dst key must hash onto a slot member");
         for _ in 0..9 {
             assert_eq!(group.select(&meta).unwrap().name(), first);
         }
@@ -1074,7 +1271,7 @@ mod tests {
     #[test]
     fn consistent_hashing_picks_alive_after_slot_member_death() {
         // A slot member dying mid-run must not strand the hash: the pick
-        // space shrinks and the same src IP lands on an *alive* member.
+        // space shrinks and the same dst key lands on an *alive* member.
         let a = MockProxy::new("P1");
         let b = MockProxy::new("P2");
         let a_ref = Arc::clone(&a);
@@ -1086,7 +1283,7 @@ mod tests {
             LbStrategy::ConsistentHashing,
             vec![slot],
         );
-        let meta = meta_src(IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)));
+        let meta = meta_dst_host("stable.example.org");
         let _ = group.select(&meta);
         a_ref.set_alive(false);
         b_ref.set_alive(false);

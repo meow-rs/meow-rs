@@ -1242,7 +1242,10 @@ fn reject_nonzero_hy2_option(
 fn parse_lb_strategy(strategy: Option<&str>) -> std::result::Result<LbStrategy, String> {
     match strategy.unwrap_or("round-robin") {
         "round-robin" => Ok(LbStrategy::RoundRobin),
-        "consistent-hashing" => Ok(LbStrategy::ConsistentHashing),
+        // Upstream treats an explicit empty strategy as consistent-hashing
+        // (`case "", "consistent-hashing"`); `strategy:` absent/null is
+        // round-robin via the unwrap_or above.
+        "" | "consistent-hashing" => Ok(LbStrategy::ConsistentHashing),
         other => Err(format!(
             "load-balance: unknown strategy '{other}'; valid values: \
              'round-robin' (default), 'consistent-hashing'. \
@@ -2712,6 +2715,12 @@ fn parse_proxy_group_inner(
             let strategy = parse_lb_strategy(config.strategy.as_deref())?;
             Ok(Arc::new(
                 LoadBalanceGroup::new_with_providers(&config.name, proxies, strategy, slots)
+                    .with_test_url(
+                        config
+                            .url
+                            .clone()
+                            .unwrap_or_else(|| "https://www.gstatic.com/generate_204".to_string()),
+                    )
                     .with_expected_status(config.expected_status.clone().unwrap_or_default()),
             ))
         }
@@ -3592,6 +3601,14 @@ tls: true
     }
 
     #[test]
+    fn parse_load_balance_empty_strategy_is_consistent_hashing() {
+        // Upstream `case "", "consistent-hashing"` — an explicit empty
+        // `strategy:` is CH, while absent/null defaults to round-robin.
+        let s = parse_lb_strategy(Some("")).unwrap();
+        assert!(matches!(s, LbStrategy::ConsistentHashing));
+    }
+
+    #[test]
     fn parse_load_balance_unknown_strategy_hard_errors() {
         // upstream: falls back silently to round-robin.
         // NOT silent fallback. ADR-0002 Class A.
@@ -4232,6 +4249,42 @@ tls: true
         let group = parse_proxy_group(&config, &direct_reject(), &[], &Default::default())
             .expect("load-balance with expected-status must parse");
         assert_eq!(group.expected_status(), Some("204"));
+    }
+
+    // `url` on load-balance is the consistent-hashing eligibility probe URL
+    // (`test_url`); previously the group had no such field at all (#621).
+    #[test]
+    fn load_balance_url_reaches_test_url() {
+        let config = crate::raw::RawProxyGroup {
+            url: Some("https://example.com/ping".to_string()),
+            ..lb_config_with_providers(None, None)
+        };
+        let group = parse_proxy_group(&config, &direct_reject(), &[], &Default::default())
+            .expect("load-balance with url must parse");
+        assert_eq!(group.test_url(), Some("https://example.com/ping"));
+        // Absent `url` → the shared generate_204 default.
+        let group = parse_proxy_group(
+            &lb_config_with_providers(None, None),
+            &direct_reject(),
+            &[],
+            &Default::default(),
+        )
+        .expect("load-balance without url must parse");
+        assert_eq!(
+            group.test_url(),
+            Some("https://www.gstatic.com/generate_204")
+        );
+    }
+
+    // Upstream maps an explicit empty strategy to consistent-hashing
+    // (`case "", "consistent-hashing"`).
+    #[test]
+    fn load_balance_empty_strategy_is_consistent_hashing() {
+        let config = crate::raw::RawProxyGroup {
+            strategy: Some("".to_string()),
+            ..lb_config_with_providers(None, None)
+        };
+        assert!(parse_proxy_group(&config, &direct_reject(), &[], &Default::default()).is_ok());
     }
 
     // A `use:`-only relay (no `proxies:`) reaches `parse_relay_group` on

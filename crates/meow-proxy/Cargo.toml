@@ -101,6 +101,10 @@ blake3 = { workspace = true, optional = true }
 ml-kem = { workspace = true, optional = true }
 x25519-dalek = { workspace = true, optional = true }
 ctr = { workspace = true, optional = true }
+# Pinned exactly: `psl` republishes the embedded public-suffix list on a
+# near-daily cadence, so a caret range would auto-resolve to releases only
+# hours old. Bump deliberately.
+psl = "=2.1.232"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
