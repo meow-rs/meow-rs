@@ -224,9 +224,9 @@ impl RuleProvider {
         let format = self.format;
         let cache_path = self.cache_path.clone();
         let cache_write_lock = Arc::clone(&self.cache_write_lock);
-        // Generation taken at call time: under the write lock an older
-        // refresh that finishes after a newer one already wrote skips its
-        // own write, so the file never regresses (issue #621).
+        // Generation taken when the fetch completes: under the write lock
+        // an older refresh that finishes after a newer one already wrote
+        // skips its own write, so the file never regresses (issue #621).
         #[allow(
             clippy::useless_conversion,
             reason = "identity on 64-bit; narrows u64 on targets without 64-bit atomics"

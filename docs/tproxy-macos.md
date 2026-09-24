@@ -22,7 +22,8 @@ is the recommended path for a fully transparent macOS setup.
 Configuring `tproxy-port` makes meow (which must run as root — pf requires it)
 auto-load a pf anchor `com.apple/com.meow.tproxy.<pid>.<seq>` on startup and
 flush it on exit. The anchor is unique per listener instance, and startup also
-flushes leftover `com.meow.tproxy*` anchors whose owning pid is dead (plus the
+flushes leftover `com.meow.tproxy*` anchors whose owning pid is dead or was
+recycled by a non-meow process (plus the
 legacy shared `com.apple/com.meow.tproxy`) — a crashed instance's `rdr` would
 otherwise keep redirecting traffic to a dead port (issue #621):
 

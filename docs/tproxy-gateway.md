@@ -30,7 +30,8 @@ Understand this before configuring — it explains every step below.
 - **The built-in firewall is `output`-chain only.** When you set a tproxy
   listener with managed firewall (the default), meow auto-creates an nftables
   table (`inet meow_tproxy_<pid>_<seq>` — unique per listener instance, swept
-  when its owning pid dies) with a `nat` hook on `output` that redirects the
+  at the next startup when its owning pid is dead or was recycled by a
+  non-meow process) with a `nat` hook on `output` that redirects the
   **host's own** outbound TCP to the listener. It is torn down automatically
   on shutdown (RAII guard). It includes loop-avoidance: a `meta mark` bypass
   for `DIRECT`-marked sockets (`routing-mark`), loopback bypass, and per-IP

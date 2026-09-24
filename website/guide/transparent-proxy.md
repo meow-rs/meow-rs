@@ -82,9 +82,9 @@ table hooking the **output** chain:
 
 Tables are unique per listener instance, so teardown removes only what
 that instance created; on startup meow sweeps `meow_tproxy*` tables whose
-owning pid is dead (plus the legacy shared `meow_tproxy` name) — an
-uncleaned redirect would otherwise keep black-holing traffic after a
-crash.
+owning pid is dead or now belongs to a non-meow process (pid reuse), plus
+the legacy shared `meow_tproxy` name — an uncleaned redirect would
+otherwise keep black-holing traffic after a crash.
 
 ### macOS (pf)
 

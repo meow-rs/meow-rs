@@ -50,7 +50,7 @@ use meow_transport::{
 use tracing::{debug, warn};
 
 use crate::plugin_util::{
-    load_pem_or_path, parse_bool_strict, parse_cert_pin, pem_source, sip003_opts,
+    load_pem_or_path, parse_bool_strict, parse_cert_pin, pem_source, read_cert_file, sip003_opts,
 };
 use crate::transport_to_proxy_err;
 
@@ -323,24 +323,6 @@ struct FileStamp {
     /// detection is mtime+len only, so a chmod-only fix won't trip it
     /// there (accepted: cert files are a unix-ops feature in practice).
     ext: (u64, i64, i64),
-}
-
-/// Read a cert/key file that `file_stamp` already proved regular. On
-/// unix the open carries `O_NONBLOCK` — a path swapped to a FIFO between
-/// the stat and this read can't wedge the reload mutex (a nonblocking
-/// FIFO read errors instead of blocking; regular files ignore the flag).
-fn read_cert_file(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
-    let mut opts = std::fs::OpenOptions::new();
-    opts.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NONBLOCK);
-    }
-    let mut f = opts.open(path)?;
-    let mut buf = Vec::new();
-    std::io::Read::read_to_end(&mut f, &mut buf)?;
-    Ok(buf)
 }
 
 /// The current stamp of a file — `None` when it can't be stat'ed **or

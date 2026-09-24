@@ -120,7 +120,7 @@ pub(crate) fn load_pem_or_path(value: &str, opt: &str, plugin: &str) -> Result<V
                     resolved.display()
                 )));
             }
-            std::fs::read(&resolved).map_err(|e| {
+            read_cert_file(&resolved).map_err(|e| {
                 MeowError::Config(format!(
                     "{plugin}: '{opt}' is neither inline PEM nor a readable file ({}): {e}",
                     resolved.display()
@@ -128,6 +128,24 @@ pub(crate) fn load_pem_or_path(value: &str, opt: &str, plugin: &str) -> Result<V
             })
         }
     }
+}
+
+/// Read a cert/key file that an `is_file` check already proved regular.
+/// On unix the open carries `O_NONBLOCK` — a path swapped to a FIFO
+/// between the stat and this read can't wedge the caller (a nonblocking
+/// FIFO read errors instead of blocking; regular files ignore the flag).
+pub(crate) fn read_cert_file(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NONBLOCK);
+    }
+    let mut f = opts.open(path)?;
+    let mut buf = Vec::new();
+    std::io::Read::read_to_end(&mut f, &mut buf)?;
+    Ok(buf)
 }
 
 /// Where a `certificate`/`private-key` opt value's PEM bytes live —

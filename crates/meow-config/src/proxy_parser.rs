@@ -1237,19 +1237,20 @@ fn reject_nonzero_hy2_option(
 ///
 /// Hard error on unknown values (Class A per ADR-0002): unknown strategy means
 /// the user may get different distribution behaviour than intended.
-/// upstream: adapter/outbound/loadbalance.go silently falls back to round-robin.
-/// NOT silent fallback.
+/// Upstream also rejects (`errStrategy` in adapter/outboundgroup/loadbalance.go).
 fn parse_lb_strategy(strategy: Option<&str>) -> std::result::Result<LbStrategy, String> {
     match strategy.unwrap_or("round-robin") {
         "round-robin" => Ok(LbStrategy::RoundRobin),
-        // Upstream treats an explicit empty strategy as consistent-hashing
-        // (`case "", "consistent-hashing"`); `strategy:` absent/null is
-        // round-robin via the unwrap_or above.
+        // Upstream maps "" to consistent-hashing (`case "",
+        // "consistent-hashing"` in NewLoadBalance — the same arm an
+        // absent strategy falls into upstream). Our absent default stays
+        // round-robin via the unwrap_or — deliberate divergence, spec
+        // row 10.
         "" | "consistent-hashing" => Ok(LbStrategy::ConsistentHashing),
         other => Err(format!(
             "load-balance: unknown strategy '{other}'; valid values: \
              'round-robin' (default), 'consistent-hashing'. \
-             (upstream: falls back silently to round-robin; we reject — Class A ADR-0002)"
+             (upstream also rejects via errStrategy — Class A ADR-0002)"
         )),
     }
 }
@@ -3610,8 +3611,7 @@ tls: true
 
     #[test]
     fn parse_load_balance_unknown_strategy_hard_errors() {
-        // upstream: falls back silently to round-robin.
-        // NOT silent fallback. ADR-0002 Class A.
+        // upstream also hard-errors (errStrategy). ADR-0002 Class A.
         let err = parse_lb_strategy(Some("sticky")).unwrap_err();
         assert!(
             err.contains("unknown strategy"),

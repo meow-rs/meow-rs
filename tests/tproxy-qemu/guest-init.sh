@@ -78,22 +78,26 @@ else
     fail "nftables_table"
 fi
 
+# Capture once: `producer | grep -q` lets grep exit early and SIGPIPEs the
+# producer's later writes, which pipefail turns into a spurious failure.
+CHAINS="$(meow_chains)"
+
 # Test 4: nftables_redirect — redirect rule exists in the output chain
-if meow_chains | grep -q "redirect to :7893"; then
+if grep -q "redirect to :7893" <<<"$CHAINS"; then
     pass "nftables_redirect"
 else
     fail "nftables_redirect"
 fi
 
 # Test 5: nftables_bypass — bypass rule for upstream proxy IP (10.99.0.1) exists
-if meow_chains | grep -q "10.99.0.1"; then
+if grep -q "10.99.0.1" <<<"$CHAINS"; then
     pass "nftables_bypass"
 else
     fail "nftables_bypass"
 fi
 
 # Test 5b: nftables_mark — SO_MARK bypass rule exists (routing-mark: 9527 = 0x2537)
-if meow_chains | grep -q "meta mark"; then
+if grep -q "meta mark" <<<"$CHAINS"; then
     pass "nftables_mark"
 else
     fail "nftables_mark"
