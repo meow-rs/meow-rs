@@ -1481,22 +1481,24 @@ pub async fn publish_dns(
     };
     match new_bound {
         Some((bound, slot)) => {
-            // New socket bound — safe to tear the old listener down.
-            let old = dns_server.write().take();
-            if let Some(old) = old {
-                old.task.abort();
-                let _ = old.task.await;
-            }
             let task = tokio::spawn(async move {
                 if let Err(e) = bound.run().await {
                     warn!("DNS server error: {e}");
                 }
             });
-            *dns_server.write() = Some(DnsServerHandle {
+            // Install the new handle BEFORE tearing the old listener down:
+            // `replace` commits the swap synchronously, so a cancellation
+            // in the abort/await below can never leave the slot empty with
+            // zero DNS listeners (issue #621).
+            let old = dns_server.write().replace(DnsServerHandle {
                 listen: dns.listen_addr.unwrap(),
                 task,
                 resolver_slot: slot,
             });
+            if let Some(old) = old {
+                old.task.abort();
+                let _ = old.task.await;
+            }
         }
         None => {
             // No new listener. Two sub-cases: the config turned the server
