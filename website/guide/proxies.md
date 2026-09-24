@@ -89,7 +89,19 @@ TLS and smux. Upstream defaults apply: `host` defaults to `bing.com` and
     # skip-cert-verify: false
     # name-cert-verify: real.example.com
     # fingerprint: "AA:BB:…"   # SHA-256 cert pin (SSL pinning), not uTLS
+    # certificate: /path/client.pem   # mTLS — inline PEM or a file path
+    # private-key: /path/client.key   # both or neither
 ```
+
+`certificate`/`private-key` accept inline PEM or a filesystem path
+(relative paths resolve against the config home, `-d`). When they name
+files, meow re-stats them on every dial and hot-reloads the client
+certificate when the contents change — matching upstream's fswatch
+behaviour without a watcher. A corrupt or half-written reload is ignored
+with a warning: the last known-good pair keeps serving, and the pair is
+re-read as soon as either file changes again (any fix bumps mtime,
+length, inode, or ctime). Inline PEM values are immutable, as they are
+upstream.
 
 `shadow-tls` runs in-process too — a cover-TLS record transport with all
 three upstream protocol versions. `host` (cover SNI) and `version`

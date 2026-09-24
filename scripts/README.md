@@ -25,9 +25,10 @@ the macOS local-mode guide (pf anchor, `route-to lo0` recipe, limitations) is
 
 ## Proxy this host's own traffic — `tproxy-local-*`
 
-meow's built-in firewall creates the redirect (`output`-chain nft REDIRECT, or
-the `com.apple/com.meow.tproxy` pf anchor) when a tproxy listener is configured,
-and removes it on exit. These wrappers just run meow and confirm it came up.
+meow's built-in firewall creates the redirect (`output`-chain nft REDIRECT in
+a per-instance `meow_tproxy_<pid>_<seq>` table, or a per-instance
+`com.apple/com.meow.tproxy.<pid>.<seq>` pf anchor) when a tproxy listener is
+configured, and removes it on exit. These wrappers just run meow and confirm it came up.
 
 ```bash
 # Quick demo (generated MATCH,DIRECT config — intercepts, but proxies nowhere):

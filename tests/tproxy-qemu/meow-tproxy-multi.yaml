@@ -1,0 +1,38 @@
+# Two managed tproxy listeners in one process (issue #621): each must own a
+# distinct `inet meow_tproxy_<pid>_<seq>` table — the second setup logs the
+# multi-firewall warning but must not collide with or replace the first.
+# Unique ports: this config runs concurrently with meow-tproxy.yaml in the
+# ownership phase (a live sibling owns the keep-side of the sweep test).
+mixed-port: 7899
+routing-mark: 9527
+mode: rule
+log-level: debug
+
+listeners:
+  - name: tproxy-a
+    type: tproxy
+    listen: 127.0.0.1
+    port: 7896
+  - name: tproxy-b
+    type: tproxy
+    listen: 127.0.0.1
+    port: 7897
+
+dns:
+  enable: true
+  # Distinct port — this config runs concurrently with meow-tproxy.yaml.
+  listen: "127.0.0.1:5354"
+  enhanced-mode: normal
+  nameserver:
+    - "8.8.8.8"
+
+proxies:
+  - name: "test-ss"
+    type: ss
+    server: "10.99.0.1"
+    port: 8388
+    cipher: "aes-128-gcm"
+    password: "test-password"
+
+rules:
+  - "MATCH,DIRECT"

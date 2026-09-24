@@ -35,12 +35,19 @@ if grep -qE "TProxy listener.*started" "$LOG"; then pass "tproxy_listener_starte
 
 # 2. firewall rules installed — skipped when the log shows `firewall: false`
 # external management (issue #563), where meow intentionally installs nothing.
+# Managed objects are per-listener-instance: nft table `meow_tproxy_<pid>_<seq>`,
+# pf anchor `com.apple/com.meow.tproxy.<pid>.<seq>` (issue #621) — glob the
+# whole family.
 if grep -q "external firewall management" "$LOG" 2>/dev/null; then
   echo "  SKIP: firewall_loaded (external management — deployer owns rules)"
 elif [ "$OS" = Darwin ]; then
-  if asroot pfctl -a com.apple/com.meow.tproxy -sn 2>/dev/null | grep -q rdr; then pass "pf_anchor_loaded"; else fail "pf_anchor_loaded"; fi
+  anchor_ok=""
+  for a in $(asroot pfctl -a com.apple -sAnchors 2>/dev/null | grep -oE 'com\.meow\.tproxy[0-9.]*'); do
+    asroot pfctl -a "com.apple/$a" -sn 2>/dev/null | grep -q rdr && anchor_ok=1
+  done
+  if [ -n "$anchor_ok" ]; then pass "pf_anchor_loaded"; else fail "pf_anchor_loaded"; fi
 else
-  if asroot nft list table inet meow_tproxy >/dev/null 2>&1; then pass "nft_table_loaded"; else fail "nft_table_loaded"; fi
+  if asroot nft list tables 2>/dev/null | awk '$2=="inet" && $3 ~ /^meow_tproxy/' | grep -q .; then pass "nft_table_loaded"; else fail "nft_table_loaded"; fi
 fi
 
 # 3. interception: connect as the (non-root) user; MATCH,REJECT => no echo

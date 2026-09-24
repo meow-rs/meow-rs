@@ -29,7 +29,8 @@ Understand this before configuring — it explains every step below.
   forwarded traffic, but only for **TCP**.
 - **The built-in firewall is `output`-chain only.** When you set a tproxy
   listener with managed firewall (the default), meow auto-creates an nftables
-  table (`inet meow_tproxy`) with a `nat` hook on `output` that redirects the
+  table (`inet meow_tproxy_<pid>_<seq>` — unique per listener instance, swept
+  when its owning pid dies) with a `nat` hook on `output` that redirects the
   **host's own** outbound TCP to the listener. It is torn down automatically
   on shutdown (RAII guard). It includes loop-avoidance: a `meta mark` bypass
   for `DIRECT`-marked sockets (`routing-mark`), loopback bypass, and per-IP
@@ -335,7 +336,7 @@ yours to cover). Add this table for **forwarded** LAN traffic. Save as
 ```nft
 #!/usr/sbin/nft -f
 # Intercept traffic FORWARDED from LAN clients and hand it to meow's tproxy
-# listener. meow's own `inet meow_tproxy` table only covers the host's own
+# listener. meow's own `inet meow_tproxy_*` table only covers the host's own
 # (output-chain) traffic.
 
 table inet meow_gateway {
@@ -478,10 +479,10 @@ On the gateway:
 ```bash
 # Listener is up on a NON-loopback address (::/0.0.0.0, not 127.0.0.1):
 ss -lntp | grep 7893
-# Both tables present (with managed firewall — `inet meow_tproxy` does not
-# exist under `firewall: false`, where your own table plays its role):
-nft list table inet meow_tproxy   # meow-managed, output chain
-nft list table inet meow_gateway  # this guide, prerouting chain
+# Both tables present (with managed firewall — no `meow_tproxy*` table
+# exists under `firewall: false`, where your own table plays its role):
+nft list tables | grep meow_tproxy  # meow-managed, output chain (per-instance name)
+nft list table inet meow_gateway    # this guide, prerouting chain
 ```
 
 From a LAN client that uses the gateway:

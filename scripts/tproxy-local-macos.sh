@@ -3,10 +3,10 @@
 # own outbound traffic (macOS / pf).
 #
 # You do NOT install firewall rules yourself: meow's built-in firewall loads a
-# pf anchor (`com.apple/com.meow.tproxy`, rdr on lo0) when a tproxy listener is
-# configured, and flushes it on exit. This wrapper runs meow with such a config
-# and confirms the anchor came up. To forward OTHER devices' traffic, use
-# tproxy-gateway-macos.sh instead.
+# pf anchor (`com.apple/com.meow.tproxy.<pid>.<seq>` — one per listener
+# instance, rdr on lo0) when a tproxy listener is configured, and flushes it on
+# exit. This wrapper runs meow with such a config and confirms the anchor came
+# up. To forward OTHER devices' traffic, use tproxy-gateway-macos.sh instead.
 #
 # NOTE: out of the box, interception covers only traffic that traverses lo0.
 # To proxy this host's real outbound traffic you additionally load a manual
@@ -22,7 +22,8 @@ STATE_DIR="${TMPDIR:-/tmp}/meow-tproxy-local"
 PIDF="$STATE_DIR/meow.pid"
 LOG="$STATE_DIR/meow.log"
 GENCFG="$STATE_DIR/meow.yaml"
-ANCHOR="com.apple/com.meow.tproxy"   # the anchor meow auto-loads
+# meow auto-loads one anchor per listener instance:
+# com.apple/com.meow.tproxy.<pid>.<seq>
 MEOW="${MEOW:-meow}"
 CONFIG=""
 
@@ -38,17 +39,27 @@ esac; done
 
 [ "$(uname)" = Darwin ] || die "this script is for macOS; use tproxy-local-linux.sh on Linux"
 
-fw_present() { pfctl -a "$ANCHOR" -sn 2>/dev/null | grep -q rdr; }
+meow_anchors() { pfctl -a com.apple -sAnchors 2>/dev/null | grep -oE 'com\.meow\.tproxy[0-9.]*'; }
+fw_present() {
+  local a
+  for a in $(meow_anchors); do
+    pfctl -a "com.apple/$a" -sn 2>/dev/null | grep -q rdr && return 0
+  done
+  return 1
+}
 
 case "$cmd" in
   down)
     [ -f "$PIDF" ] && kill "$(cat "$PIDF")" 2>/dev/null || true
     sleep 1
-    if fw_present; then echo "warning: anchor $ANCHOR still present"; else echo "stopped; pf anchor flushed"; fi
+    if fw_present; then echo "warning: com.meow.tproxy* anchors still present: $(meow_anchors | tr '\n' ' ')"; else echo "stopped; pf anchor flushed"; fi
     rm -rf "$STATE_DIR"; exit 0;;
   status)
     if [ -f "$PIDF" ] && kill -0 "$(cat "$PIDF")" 2>/dev/null; then echo "meow: running (pid $(cat "$PIDF"))"; else echo "meow: not running"; fi
-    if fw_present; then echo "firewall: pf anchor $ANCHOR present"; pfctl -a "$ANCHOR" -sn 2>/dev/null | sed 's/^/  /'; else echo "firewall: absent"; fi
+    if fw_present; then
+      echo "firewall: meow-managed anchors: $(meow_anchors | tr '\n' ' ')"
+      for a in $(meow_anchors); do pfctl -a "com.apple/$a" -sn 2>/dev/null | sed 's/^/  /'; done
+    else echo "firewall: absent"; fi
     exit 0;;
   up) ;;
   ""|-h|--help) sed -n '2,24p' "$0"; exit 0;;
@@ -93,10 +104,10 @@ for _ in $(seq 1 180); do
 done
 
 if fw_present; then
-  echo "local transparent proxy active — pf anchor $ANCHOR loaded."
+  echo "local transparent proxy active — pf anchor(s) com.apple/com.meow.tproxy.* loaded."
   echo "meow pid $(cat "$PIDF"). (See the macOS-tproxy note above re: loopback-only.)"
   echo "stop with: sudo $0 down"
 else
-  echo "warning: meow started but pf anchor $ANCHOR is absent; check $LOG"
+  echo "warning: meow started but no com.meow.tproxy* anchor is present; check $LOG"
   exit 1
 fi

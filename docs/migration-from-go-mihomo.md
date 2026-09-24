@@ -307,8 +307,9 @@ sweeps static members of every group type since v1.18.4).
 ### load-balance
 
 Supported in M1.C-1. Two strategies: `round-robin` (default) and
-`consistent-hashing` (sticky by source IP). Periodic health-check using the
-same URL-probe mechanism as `url-test`.
+`consistent-hashing` (sticky by destination — mihomo `getKey`: IP-literal
+host verbatim, domain reduced to eTLD+1, else `dst_ip`). Periodic
+health-check using the same URL-probe mechanism as `url-test`.
 
 ```yaml
 proxy-groups:
@@ -632,8 +633,8 @@ Most common format from public providers. Typical issues:
    `listeners:` tproxy entry and defaults **on** (managed nftables/pf table),
    and the `tproxy-port` shorthand is always managed. A config that ran
    externally-managed rules upstream must set `firewall: false` explicitly on
-   the listener, or meow will install its own `inet meow_tproxy` / pf anchor
-   alongside yours. A stray top-level `firewall:` key warns and is ignored —
+   the listener, or meow will install its own `inet meow_tproxy_<pid>_<seq>` /
+   `com.apple/com.meow.tproxy.<pid>.<seq>` pf anchor alongside yours. A stray top-level `firewall:` key warns and is ignored —
    it is not the upstream top-level `iptables:` equivalent; the upstream
    `iptables:` block itself (`enable`/`inbound-interface`/`bypass`/
    `dns-redirect`) is likewise ignored.

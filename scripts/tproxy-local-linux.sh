@@ -3,10 +3,11 @@
 # own outbound traffic (Linux / nftables).
 #
 # Unlike a gateway, you do NOT install firewall rules yourself: meow's built-in
-# firewall creates an `output`-chain nft REDIRECT (table `inet meow_tproxy`)
-# when a tproxy listener is configured, and removes it on exit. This wrapper
-# just runs meow with such a config and confirms the firewall came up. To
-# forward OTHER devices' traffic, use tproxy-gateway-linux.sh instead.
+# firewall creates an `output`-chain nft REDIRECT (per-instance table
+# `inet meow_tproxy_<pid>_<seq>`) when a tproxy listener is configured, and
+# removes it on exit. This wrapper just runs meow with such a config and
+# confirms the firewall came up. To forward OTHER devices' traffic, use
+# tproxy-gateway-linux.sh instead.
 #
 # Usage:
 #   sudo ./tproxy-local-linux.sh up [--config FILE] [--meow PATH]
@@ -23,7 +24,7 @@ STATE_DIR="/run/meow-tproxy-local"
 PIDF="$STATE_DIR/meow.pid"
 LOG="$STATE_DIR/meow.log"
 GENCFG="$STATE_DIR/meow.yaml"
-TABLE="meow_tproxy"           # the table meow auto-creates
+# meow auto-creates one table per listener instance: meow_tproxy_<pid>_<seq>.
 MEOW="${MEOW:-meow}"
 CONFIG=""
 
@@ -37,17 +38,21 @@ while [ $# -gt 0 ]; do case "$1" in
   *) die "unknown option: $1";;
 esac; done
 
-fw_present() { nft list table inet "$TABLE" >/dev/null 2>&1; }
+fw_tables() { nft list tables 2>/dev/null | awk '$2=="inet" && $3 ~ /^meow_tproxy/ {print $3}'; }
+fw_present() { [ -n "$(fw_tables)" ]; }
 
 case "$cmd" in
   down)
     [ -f "$PIDF" ] && kill "$(cat "$PIDF")" 2>/dev/null || true
     sleep 1
-    if fw_present; then echo "warning: table inet $TABLE still present"; else echo "stopped; firewall removed"; fi
+    if fw_present; then echo "warning: meow_tproxy* tables still present: $(fw_tables | tr '\n' ' ')"; else echo "stopped; firewall removed"; fi
     rm -rf "$STATE_DIR"; exit 0;;
   status)
     if [ -f "$PIDF" ] && kill -0 "$(cat "$PIDF")" 2>/dev/null; then echo "meow: running (pid $(cat "$PIDF"))"; else echo "meow: not running"; fi
-    if fw_present; then echo "firewall: table inet $TABLE present"; nft list table inet "$TABLE" 2>/dev/null | sed 's/^/  /'; else echo "firewall: absent"; fi
+    if fw_present; then
+      echo "firewall: meow-managed tables: $(fw_tables | tr '\n' ' ')"
+      for t in $(fw_tables); do nft list table inet "$t" 2>/dev/null | sed 's/^/  /'; done
+    else echo "firewall: absent"; fi
     exit 0;;
   up) ;;
   ""|-h|--help) sed -n '2,21p' "$0"; exit 0;;
@@ -98,9 +103,9 @@ done
 
 if fw_present; then
   echo "local transparent proxy active — this host's own outbound TCP is intercepted."
-  echo "meow pid $(cat "$PIDF"); firewall: table inet $TABLE"
+  echo "meow pid $(cat "$PIDF"); firewall: table(s) inet $(fw_tables | tr '\n' ' ')"
   echo "stop with: sudo $0 down"
 else
-  echo "warning: meow started but table inet $TABLE is absent; check $LOG"
+  echo "warning: meow started but no meow_tproxy* table is present; check $LOG"
   exit 1
 fi

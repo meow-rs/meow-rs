@@ -9,6 +9,16 @@ set -uo pipefail
 pass() { echo "TEST_PASS:$1"; }
 fail() { echo "TEST_FAIL:$1"; }
 
+# meow-managed nft tables are named `meow_tproxy_<pid>_<seq>` — one per
+# listener instance (issue #621), with the legacy shared `meow_tproxy`
+# swept on startup. Match the whole family by glob.
+meow_tables() { nft list tables 2>/dev/null | awk '$2=="inet" && ($3=="meow_tproxy" || $3 ~ /^meow_tproxy_[0-9]+_[0-9]+$/) {print $3}'; }
+meow_table_present() { [ -n "$(meow_tables)" ]; }
+meow_chains() { # dump the `output` chain of every meow-managed table
+    local t
+    for t in $(meow_tables); do nft list chain inet "$t" output 2>/dev/null; done
+}
+
 # --- Setup networking ---
 ip link set lo up 2>/dev/null || true
 # Add a non-loopback IP on lo for testing — traffic to this IP will be
@@ -61,29 +71,29 @@ else
     fail "meow_alive"
 fi
 
-# Test 3: nftables_table — nftables table was created
-if nft list table inet meow_tproxy >/dev/null 2>&1; then
+# Test 3: nftables_table — a meow-managed table was created
+if meow_table_present; then
     pass "nftables_table"
 else
     fail "nftables_table"
 fi
 
-# Test 4: nftables_redirect — redirect rule exists in output chain
-if nft list chain inet meow_tproxy output 2>/dev/null | grep -q "redirect to :7893"; then
+# Test 4: nftables_redirect — redirect rule exists in the output chain
+if meow_chains | grep -q "redirect to :7893"; then
     pass "nftables_redirect"
 else
     fail "nftables_redirect"
 fi
 
 # Test 5: nftables_bypass — bypass rule for upstream proxy IP (10.99.0.1) exists
-if nft list chain inet meow_tproxy output 2>/dev/null | grep -q "10.99.0.1"; then
+if meow_chains | grep -q "10.99.0.1"; then
     pass "nftables_bypass"
 else
     fail "nftables_bypass"
 fi
 
 # Test 5b: nftables_mark — SO_MARK bypass rule exists (routing-mark: 9527 = 0x2537)
-if nft list chain inet meow_tproxy output 2>/dev/null | grep -q "meta mark"; then
+if meow_chains | grep -q "meta mark"; then
     pass "nftables_mark"
 else
     fail "nftables_mark"
@@ -158,7 +168,7 @@ done
 kill -9 "$MEOW_PID" 2>/dev/null || true
 sleep 1
 
-if nft list table inet meow_tproxy >/dev/null 2>&1; then
+if meow_table_present; then
     fail "firewall_teardown"
 else
     pass "firewall_teardown"
@@ -168,8 +178,8 @@ fi
 #
 # The deployer installs the redirect table by hand (mirroring the managed
 # shape: mark/loopback/proxy-IP bypasses + catch-all redirect); meow must
-# serve the intercepted traffic without creating `inet meow_tproxy`, and
-# must leave this table alone on exit.
+# serve the intercepted traffic without creating a `meow_tproxy*` table,
+# and must leave this table alone on exit.
 echo ""
 echo "=== External-firewall phase (firewall: false) ==="
 
@@ -223,8 +233,8 @@ else
 fi
 
 # Test 12: ext_no_managed_table — meow created NO nftables state for this
-# listener (the managed table must not exist)
-if nft list table inet meow_tproxy >/dev/null 2>&1; then
+# listener (no meow-managed table may exist)
+if meow_table_present; then
     fail "ext_no_managed_table"
 else
     pass "ext_no_managed_table"
@@ -393,7 +403,7 @@ fi
 
 # Test 17: udp_no_managed_table — `firewall: false` still means zero
 # nftables state owned by meow
-if nft list table inet meow_tproxy >/dev/null 2>&1; then
+if meow_table_present; then
     fail "udp_no_managed_table"
 else
     pass "udp_no_managed_table"
@@ -473,6 +483,187 @@ ip netns del srv 2>/dev/null || true
 ip link del veth-host 2>/dev/null || true
 ip link del veth-srv 2>/dev/null || true
 
+# ═══ Phase 4: per-instance ownership, stale sweep, multi-listener (issue #621) ═══
+#
+# Two managed listeners in one process must own DISTINCT
+# `inet meow_tproxy_<pid>_<seq>` tables; a crash leaves them behind and
+# the next instance sweeps exactly what a dead owner left. Objects whose
+# embedded pid is a LIVE meow process are kept (a sibling owns them); a
+# live pid that isn't meow is a reused-pid residue and is swept too.
+echo ""
+echo "=== Per-instance ownership phase (issue #621) ==="
+
+# A live sibling meow (phase-1 config) owns `meow_tproxy_<sib>_0` — the
+# keep-side of every sweep below. Its setup (and therefore its sweep)
+# is done once its listener-start line lands.
+meow -f /etc/meow-tproxy.yaml > /tmp/meow-sib.log 2>&1 &
+SIB_PID=$!
+for i in $(seq 1 20); do
+    grep -qE "TProxy listener( '[^']*')? started" /tmp/meow-sib.log 2>/dev/null && break
+    kill -0 "$SIB_PID" 2>/dev/null || break
+    sleep 0.5
+done
+SIB_TABLE="meow_tproxy_${SIB_PID}_0"
+
+# A slow/crashed sibling must be caught here — otherwise its *delayed*
+# sweep could eat the plants below and sweep_on_start would attribute
+# the sibling's work to the multi instance.
+if ! nft list table inet "$SIB_TABLE" >/dev/null 2>&1; then
+    echo "SETUP FAILURE: sibling meow table '$SIB_TABLE' absent (pid $SIB_PID)"
+    fail "sibling_ready"
+fi
+
+# Plant sweep-classification objects before the multi instance starts:
+#   meow_tproxy_999999_0 — dead pid           → swept
+#   meow_tproxy_1_9      — live pid, not meow → swept (reused-pid residue)
+#   meow_tproxy          — legacy shared name → swept
+nft add table inet meow_tproxy_999999_0
+nft add table inet meow_tproxy_1_9
+nft add table inet meow_tproxy
+
+# Preflight: the sweep assertions below are vacuous if any plant failed.
+PLANTS_OK=1
+for t in meow_tproxy_999999_0 meow_tproxy_1_9 meow_tproxy; do
+    nft list table inet "$t" >/dev/null 2>&1 || PLANTS_OK=0
+done
+if [ "$PLANTS_OK" -eq 1 ]; then
+    pass "sweep_plants_installed"
+else
+    echo "SETUP FAILURE: sweep plant(s) failed to install"
+    fail "sweep_plants_installed"
+fi
+
+meow -f /etc/meow-tproxy-multi.yaml > /tmp/meow-multi.log 2>&1 &
+MULTI_PID=$!
+echo "meow (multi-listener) started (PID $MULTI_PID), sibling=$SIB_PID"
+
+# Both listeners are independent tasks — 'tproxy-b started' alone says
+# nothing about tproxy-a's setup. Poll for the outcome that matters:
+# two tables owned by THIS pid (which also implies both setups ran and
+# the multi-firewall warn fired).
+MULTI_READY=0
+for i in $(seq 1 20); do
+    if [ "$(meow_tables | grep -c "_${MULTI_PID}_")" -eq 2 ]; then
+        MULTI_READY=1
+        break
+    fi
+    if ! kill -0 "$MULTI_PID" 2>/dev/null; then
+        echo "meow (multi-listener) exited prematurely"
+        break
+    fi
+    sleep 0.5
+done
+
+# Test 22: multi_tables_two — two managed listeners own two distinct tables
+if [ "$MULTI_READY" -eq 1 ]; then
+    pass "multi_tables_two"
+else
+    fail "multi_tables_two (tables: $(meow_tables | tr '\n' ' '))"
+fi
+
+# Test 23: multi_table_contents — each table redirects to a DIFFERENT
+# listener port (don't bind port↔seq — assignment is lock-order dependent)
+# NOTE: capture first — `meow_chains | grep -q` would SIGPIPE the loop's
+# later `nft list chain` calls and pipefail turns the match into a fail.
+MULTI_CHAINS=$(meow_chains)
+if grep -q "redirect to :7896" <<<"$MULTI_CHAINS" \
+    && grep -q "redirect to :7897" <<<"$MULTI_CHAINS"; then
+    pass "multi_table_contents"
+else
+    fail "multi_table_contents (chains: $MULTI_CHAINS)"
+fi
+
+# Test 24: sweep_on_start — dead-pid, reused-pid, and legacy objects gone;
+# the sibling's live table untouched; the log proves the sweep ran. The
+# live-pid arm logs the louder `owned by a live pid` warn, not `stale`.
+if ! nft list table inet meow_tproxy_999999_0 >/dev/null 2>&1 \
+    && ! nft list table inet meow_tproxy_1_9 >/dev/null 2>&1 \
+    && ! nft list table inet meow_tproxy >/dev/null 2>&1 \
+    && nft list table inet "$SIB_TABLE" >/dev/null 2>&1 \
+    && grep -q "swept stale nftables table 'meow_tproxy_999999_0'" /tmp/meow-multi.log \
+    && grep -q "swept nftables table 'meow_tproxy_1_9' owned by a live pid" /tmp/meow-multi.log \
+    && grep -q "swept legacy shared nftables table 'meow_tproxy'" /tmp/meow-multi.log; then
+    pass "sweep_on_start"
+else
+    fail "sweep_on_start"
+fi
+
+# Test 25: multi_warn_logged — the ambiguity warning fired on second setup
+if grep -q "multiple managed tproxy firewalls" /tmp/meow-multi.log 2>/dev/null; then
+    pass "multi_warn_logged"
+else
+    fail "multi_warn_logged"
+fi
+
+# Test 26: crash_residue — SIGKILL leaves the tables behind (they are
+# INPUT to the sweep test below, so this asserts the residue exists)
+kill -9 "$MULTI_PID" 2>/dev/null || true
+sleep 1
+if [ "$(meow_tables | grep -c "_${MULTI_PID}_")" -eq 2 ]; then
+    pass "crash_residue"
+else
+    fail "crash_residue"
+fi
+
+meow -f /etc/meow-tproxy-multi.yaml > /tmp/meow-multi2.log 2>&1 &
+MULTI2_PID=$!
+MULTI2_READY=0
+for i in $(seq 1 20); do
+    if [ "$(meow_tables | grep -c "_${MULTI2_PID}_")" -eq 2 ]; then
+        MULTI2_READY=1
+        break
+    fi
+    if ! kill -0 "$MULTI2_PID" 2>/dev/null; then
+        echo "meow (multi2) exited prematurely"
+        break
+    fi
+    sleep 0.5
+done
+
+# Test 27: sweep_classification — the crashed instance's tables swept
+# (log-proven), the new instance created its own two, and the only
+# survivor outside the new pid is the live sibling's
+SURVIVORS=$(meow_tables | grep -v "_${MULTI2_PID}_" || true)
+if [ "$MULTI2_READY" -eq 1 ] && [ "$SURVIVORS" = "$SIB_TABLE" ] \
+    && grep -q "swept stale nftables table 'meow_tproxy_${MULTI_PID}_" /tmp/meow-multi2.log; then
+    pass "sweep_classification"
+else
+    fail "sweep_classification (ready=$MULTI2_READY survivors: $(echo "$SURVIVORS" | tr '\n' ' '))"
+fi
+
+# Test 28: graceful_teardown_multi — SIGTERM removes THIS instance's
+# tables; the sibling's table survives because its owner is alive
+kill -TERM "$MULTI2_PID" 2>/dev/null
+for i in $(seq 1 10); do
+    kill -0 "$MULTI2_PID" 2>/dev/null || break
+    sleep 0.5
+done
+kill -9 "$MULTI2_PID" 2>/dev/null || true
+sleep 1
+
+OWN_LEFT=$(meow_tables | grep -c "_${MULTI2_PID}_")
+if [ "$OWN_LEFT" -eq 0 ] && nft list table inet "$SIB_TABLE" >/dev/null 2>&1; then
+    pass "graceful_teardown_multi"
+else
+    fail "graceful_teardown_multi (own_left=$OWN_LEFT)"
+fi
+
+# Test 29: sibling_teardown — killing the sibling removes the last table;
+# nothing meow-owned remains
+kill -TERM "$SIB_PID" 2>/dev/null
+for i in $(seq 1 10); do
+    kill -0 "$SIB_PID" 2>/dev/null || break
+    sleep 0.5
+done
+kill -9 "$SIB_PID" 2>/dev/null || true
+sleep 1
+
+if meow_table_present; then
+    fail "sibling_teardown ($(meow_tables | tr '\n' ' '))"
+else
+    pass "sibling_teardown"
+fi
+
 # --- Debug output ---
 echo ""
 echo "=== meow log ==="
@@ -485,6 +676,14 @@ echo "=== end log ==="
 echo ""
 echo "=== meow log (udp tproxy) ==="
 cat /tmp/meow-udp.log 2>/dev/null || echo "(no log)"
+echo "=== end log ==="
+echo ""
+echo "=== meow log (multi-listener, first run) ==="
+cat /tmp/meow-multi.log 2>/dev/null || echo "(no log)"
+echo "=== end log ==="
+echo ""
+echo "=== meow log (multi-listener, after kill -9) ==="
+cat /tmp/meow-multi2.log 2>/dev/null || echo "(no log)"
 echo "=== end log ==="
 
 # Cleanup

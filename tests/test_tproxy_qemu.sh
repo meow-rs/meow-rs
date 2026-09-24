@@ -41,9 +41,13 @@ COPY . .
 # BoringSSL is mandatory, including for minimal TLS builds. Use a glibc
 # builder so bindgen can load libclang, and install its CMake/git toolchain.
 # TProxy does not need TUN/lwIP; retain the transport coverage without it.
-RUN cargo build -p meow-app --no-default-features \
+# debuginfo=0 + same-layer cleanup keep the build inside small Docker VM
+# disks — a default debug build of this dep tree is several GB.
+RUN CARGO_PROFILE_DEV_DEBUG=0 cargo build -p meow-app --no-default-features \
     --features=ss,trojan,vless,vless-vision,vless-encryption,vmess,snell,hysteria2,anytls,ech-tls-tunnel,dns-server,dns-encrypted,listener-http,listener-socks5,listener-tproxy,listener-mixed \
-    2>&1
+    2>&1 \
+    && rm -rf /src/target/debug/incremental /src/target/debug/.fingerprint \
+        /src/target/debug/deps /src/target/debug/build
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -52,6 +56,7 @@ COPY --from=builder /src/target/debug/meow /usr/local/bin/meow
 COPY tests/tproxy-qemu/meow-tproxy.yaml /etc/meow-tproxy.yaml
 COPY tests/tproxy-qemu/meow-tproxy-ext.yaml /etc/meow-tproxy-ext.yaml
 COPY tests/tproxy-qemu/meow-tproxy-udp.yaml /etc/meow-tproxy-udp.yaml
+COPY tests/tproxy-qemu/meow-tproxy-multi.yaml /etc/meow-tproxy-multi.yaml
 COPY tests/tproxy-qemu/guest-init.sh /run-tests.sh
 RUN chmod +x /run-tests.sh
 DOCKERFILE

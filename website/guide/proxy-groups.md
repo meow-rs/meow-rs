@@ -94,13 +94,15 @@ Spreads connections across members.
 | Field | Type | Default | Notes |
 | --- | --- | --- | --- |
 | `strategy` | string | `round-robin` | `round-robin` or `consistent-hashing` |
-| `url` | string | — | Health-check URL |
+| `url` | string | `https://www.gstatic.com/generate_204` | Health-check URL |
 | `interval` | u64 | — | Probe interval in seconds |
 | `lazy` | bool | `false` | Probe only when in use — housekeeping traffic does not count |
 | `expected-status` | string | — | Probe success expression, e.g. `204` |
 
-`consistent-hashing` keeps the same client (source IP) on the same node (sticky). An
-unknown strategy is a hard error.
+`consistent-hashing` pins each *destination* to the same node (mihomo
+`getKey`: an IP-literal destination is used verbatim, a domain is reduced to
+its registrable eTLD+1 — so all of `example.com`'s hosts share one node).
+An unknown strategy is a hard error.
 
 ```yaml
 - name: Balance

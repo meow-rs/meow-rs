@@ -20,8 +20,9 @@ the canonical, in-repo source a release is cut from.
   `headers`, `skip-cert-verify`, `name-cert-verify`, `fingerprint`
   (SHA-256 certificate pin — `TlsConfig::cert_pin` replaces CA
   verification, matching upstream SSL pinning), `certificate`/`private-key`
-  (mTLS; inline PEM or file path — upstream's file-watch reload is not
-  mirrored), and `ech-opts.enable` + `ech-opts.config` (inline
+  (mTLS; inline PEM or file path — file-sourced PEMs are re-stat per dial
+  and hot-reloaded on change, poll-based parity with upstream's file
+  watch), and `ech-opts.enable` + `ech-opts.config` (inline
   ECHConfigList, bounded to the u16 wire limit; DNS-queried ECH is not
   supported and errors clearly). `name-cert-verify` is wired through a new
   `TlsConfig::verify_name` — the certificate is verified against it while
@@ -907,6 +908,7 @@ the canonical, in-repo source a release is cut from.
 
   Breaking for crate consumers: `TunnelInner::pre_handle_metadata` now
   returns `PreHandleVerdict` (`Continue`/`Drop`) instead of `()`.
+
 - **Sniffer: fragmented TLS ClientHello no longer loses the SNI**
   (#622). The sniffer peeked at the socket once and parsed whatever was
   buffered; a ClientHello split across TCP segments parsed as a
@@ -914,3 +916,44 @@ the canonical, in-repo source a release is cut from.
   failed open. The gather now re-peeks (5→50ms poll, bounded by
   `sniffer.timeout`) until the declared record length is buffered or the
   prefix is provably not TLS. Found by the Docker TProxy e2e. (#623)
+
+- **Issue #621 audit: lifecycle races, firewall ownership, and
+  load-balance mihomo parity.** A deep audit of the reported findings
+  confirmed and fixed: (1) managed TProxy firewall objects are now
+  per-instance — nftables `inet meow_tproxy_<pid>_<seq>`, pf anchor
+  `com.apple/com.meow.tproxy.<pid>.<seq>` — so a second managed listener
+  no longer replaces or deletes its sibling's rules; startup sweeps only
+  the legacy shared names and per-instance objects whose owning pid is
+  dead or foreign (live/unverifiable processes keep theirs); (2)
+  `load-balance` consistent hashing now follows mihomo's `getKey`
+  derivation (IP literal verbatim, domain reduced to eTLD+1 via the
+  public-suffix list, else `dst_ip`) with FNV-1a-64 + jump hash over the
+  full member list, retry `key+1` ×5 then linear scan, and eligibility
+  probed against the group's `url:` — plus a single member snapshot per
+  pick closes a mid-selection provider-swap race (the prior src-IP
+  affinity hashing was a deliberate divergence that full parity
+  supersedes; `strategy: ""` maps to consistent-hashing as upstream);
+  (3) `select` group persistence serializes writers and re-snapshots
+  under the write lock so a slow writer can't publish a stale map last,
+  and a failed write leaves the store dirty so an unchanged-value retry
+  still persists (same stale-rename class fixed in the fake-IP file
+  store); (4) geodata refreshes now parse before committing, then commit
+  rules and the DNS resolver with no await between, so cancellation
+  can't split the generation — and `publish_dns` installs the new handle
+  before aborting the old server so a cancel can't leave zero DNS
+  listeners; (5) rule-provider cache writes moved off the async worker
+  into the blocking parse lane and are generation-gated so an older
+  refresh can't overwrite a newer cache or in-memory ruleset; (6)
+  `.{pid}.{n}.tmp` scratch siblings of atomic-write targets are swept
+  (older than 1h, or owned by a dead pid) from the selector cache,
+  fake-IP store, raw-config saves, rule/proxy-provider caches, and
+  geodata writes — SIGKILL leftovers no longer accumulate; (7) an
+  oversized AnyTLS UDP datagram drains through an 8 KiB stack buffer
+  instead of allocating per datagram; (8) gost-plugin `certificate`/
+  `private-key` file paths hot-reload on change (see the Added entry).
+  Residual lifecycle bugs fixed along the way: the TProxy UDP reply
+  dispatcher is torn down with its listener instead of idling detached;
+  KCP `send()` returns `Err(InvalidMss)` instead of asserting on a
+  zero MSS; and AnyTLS session `synack_tx`/`close_error` moved to
+  synchronous mutexes so close and FIN handling no longer await while
+  holding both stream-map write locks. (#621)

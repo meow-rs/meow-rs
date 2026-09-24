@@ -72,17 +72,27 @@ routing-mark: 9527     # Linux: SO_MARK for loop avoidance
 
 ### Linux (nftables)
 
-meow-rs creates an `inet meow_tproxy` table hooking the **output** chain:
+meow-rs creates a per-listener-instance `inet meow_tproxy_<pid>_<seq>`
+table hooking the **output** chain:
 
 - bypass the `routing-mark` mark,
 - bypass loopback (`127.0.0.0/8`, `::1`),
 - bypass each upstream proxy IP,
 - redirect remaining TCP to the TProxy port.
 
+Tables are unique per listener instance, so teardown removes only what
+that instance created; on startup meow sweeps `meow_tproxy*` tables whose
+owning pid is dead (plus the legacy shared `meow_tproxy` name) — an
+uncleaned redirect would otherwise keep black-holing traffic after a
+crash.
+
 ### macOS (pf)
 
-A `com.apple/com.meow.tproxy` anchor with `rdr` redirect on `lo0`, a UID bypass for meow's own
-traffic, loopback and proxy-IP bypasses. (macOS pf support is experimental.)
+A per-instance `com.apple/com.meow.tproxy.<pid>.<seq>` anchor with `rdr`
+redirect on `lo0`, a UID bypass for meow's own traffic, loopback and
+proxy-IP bypasses. Stale anchors owned by dead pids (and the legacy shared
+`com.apple/com.meow.tproxy` anchor) are flushed at startup. (macOS pf
+support is experimental.)
 
 ## External firewall management
 

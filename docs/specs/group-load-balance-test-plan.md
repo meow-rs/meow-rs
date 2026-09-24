@@ -1,7 +1,16 @@
 # Test Plan: Load-balance proxy group (M1.C-1)
 
-Status: **draft** — owner: qa. Last updated: 2026-04-11.
+Status: **superseded in part** — owner: qa. Last updated: 2026-04-11.
 Tracks: task #50. Companion to `docs/specs/group-load-balance.md` (rev 1.0).
+
+> **Issue #621 update:** §B and §D below describe the pre-#621
+> consistent-hashing design (source-IP key, FNV-1a 32-bit mod the alive
+> subset). The shipped implementation now follows mihomo's scheme —
+> destination `getKey` (IP-literal host → host, domain → eTLD+1, else
+> `dst_ip`), FNV-1a-64, `jumpHash` over the full member list. The
+> implemented tests are in `load_balance.rs` (`get_key_*`,
+> `jump_hash_*`, `fnv1a64_known_vectors`, `consistent_hashing_*`); the
+> §B/§D entries below are retained for history only.
 
 This is the QA-owned acceptance test plan. The spec's `§Test plan` section is
 PM's starting point; this document is the final shape engineer should implement
@@ -18,10 +27,12 @@ PM so the spec can be updated.
   consistent-hashing.
 - Dead-proxy skipping under both strategies.
 - `NoProxyAvailable` error path (all dead, or zero proxies).
-- Consistent-hashing stability: same src IP → same proxy across repeated calls.
-- Consistent-hashing with `src_addr: None` → deterministic (0.0.0.0 fallback).
+- Consistent-hashing stability: same destination key → same proxy across
+  repeated calls (mihomo `getKey`: IP literal verbatim, domain → eTLD+1,
+  else `dst_ip`, else `""`) — independent of client src IP.
+- Consistent-hashing with no usable destination → deterministic (`""` key).
 - Round-robin alive-set flap guard (acceptance criterion #11).
-- FNV-1a 32-bit implementation correctness (inline, no crate dep).
+- FNV-1a-64 + jump-hash correctness (known-answer vectors).
 - `support_udp()` and `dial_udp()` filtering for UDP-capable proxies.
 - Config parser: `strategy` field round-trip, unknown value → hard error.
 - `AdapterType::LoadBalance` enum presence and serialisation.
@@ -114,12 +125,14 @@ for strategy unit tests — that would require a real TCP stack.
 
 | # | Case | Asserts |
 |---|------|---------|
-| B1 | `consistent_hashing_stable_for_same_src` | Same `src_ip` (e.g. `1.1.1.1`), 3 alive proxies, 100 consecutive `select()` calls → all 100 calls return the same proxy. <br/> **The proxy list must not change during this test** — stability guarantee is "fixed src IP + fixed proxy list". <br/> Upstream: `adapter/outbound/loadbalance.go::ConsistentHashing.Addr`. <br/> NOT volatile — consistent-hash must be deterministic. |
-| B2 | `consistent_hashing_differs_for_different_src` | Two well-separated src IPs (e.g. `1.1.1.1` and `8.8.8.8`), 3 alive proxies → assert the two selected proxies are different. <br/> **Engineer must verify the two chosen IPs produce different `fnv1a(bytes) % 3` results before committing the test** — if they hash to the same bucket, pick different fixture IPs. Add a `// verified: fnv1a([1,1,1,1]) % 3 = X, fnv1a([8,8,8,8]) % 3 = Y` comment. |
-| B3 | `consistent_hashing_skips_dead_proxy` | Mark the proxy that src IP `1.1.1.1` would normally select as dead; assert `select()` still returns Ok (falls through to another alive proxy). The returned proxy must be alive. |
-| B4 | `consistent_hashing_absent_src_addr_deterministic` | `Metadata { src_ip: None, ..Default::default() }`, 3 alive proxies, 10 `select()` calls → all 10 return the same proxy. <br/> `src_addr: None` hashes to 0.0.0.0 (4 zero bytes) → deterministic hash → deterministic bucket. <br/> NOT random. NOT `NoProxyAvailable`. NOT an error. <br/> Upstream: undefined (assumes src always present) — we define the fallback. ADR-0002 acceptance criterion #10. |
-| B5 | `consistent_hashing_ipv6_src_stable` | IPv6 src IP (e.g. `2001:db8::1`), 16-byte hash input, 10 calls → same proxy each time. Guards that the `src_ip_bytes()` helper handles `IpAddr::V6` without truncation. |
-| B6 | `consistent_hashing_reshuffles_on_list_change` **[guard-rail]** | `1.1.1.1` maps to proxy X with list [A,B,C]. Remove B (make B dead). `1.1.1.1` now maps to proxy Y. Asserts the doc comment `// consistent-hashing = stable for given src+list, NOT ring-consistent` is honest — users should not assume minimal disruption on list change. Verify Y != "always X" (i.e. the index actually changes when the alive count changes). ADR-0002 Class B divergence row #4. |
+| B1 | `consistent_hashing_stable_for_same_dst` | Same destination key (e.g. host `example.com`), 3 alive proxies, repeated `select()` calls → all calls return the same proxy. <br/> **The proxy list must not change during this test** — stability guarantee is "fixed dst key + fixed proxy list". <br/> Upstream: `adapter/outboundgroup/loadbalance.go` `strategyConsistentHashing` (jump hash of `getKey(metadata)` over the full member list). <br/> NOT volatile — consistent-hash must be deterministic. |
+| B1b | `consistent_hashing_ignores_src_ip` | Two different client `src_ip`s, same destination host → same member. Guards the mihomo-parity keying: the key derives from the **destination**, never the client. |
+| B2 | `consistent_hashing_spreads_across_dst_keys` | A sweep of distinct destination hosts distributes picks across ≥2 members (jump hash spreads keys across the member list). <br/> Replaces the old src-IP spread test — divergence now happens per *destination*. |
+| B3 | `consistent_hashing_retries_past_dead_member` | Mark the member a dst key's first bucket lands on as dead; `select()` returns another **alive** member — upstream retries `key+1` up to 5× then falls back to a linear alive scan. |
+| B3b | `consistent_hashing_dead_member_remaps_only_its_keys` | Kill one member; assert keys that landed on live members still land on the same member (jump hash over the *full* list gives minimal reshuffle — only the dead member's keys move). |
+| B4 | `consistent_hashing_absent_dst_deterministic` | `Metadata` with no host/dst_ip (key `""`), 3 alive proxies, 10 `select()` calls → all 10 return the same proxy. <br/> Empty key hashes deterministically → deterministic bucket. <br/> NOT random. NOT `NoProxyAvailable`. NOT an error. <br/> Upstream: `getKey` returns `""` when nothing is usable — same fallback. |
+| B5 | `consistent_hashing_ipv6_dst_stable` | IPv6 literal destination (e.g. `2001:db8::1`), 10 calls → same proxy each time. Guards that `get_key` passes IP literals (v4 or v6) through verbatim as the key. |
+| B6 | `consistent_hashing_stable_across_slots` | Provider-slot refresh mid-sequence: a dst key keeps mapping to the same member across slot updates as long as the member list is unchanged. |
 
 ---
 
@@ -133,17 +146,18 @@ for strategy unit tests — that would require a real TCP stack.
 
 ---
 
-### D. FNV-1a 32-bit implementation
+### D. Hash + key-derivation implementation
 
-The inline `fnv1a()` must be tested against known reference vectors before any
-consistent-hashing tests build on top of it.
+The consistent-hashing path is `jump_hash(fnv1a64(key) + i, full_len)` for
+`i in 0..5`, then a linear eligible scan — the jump hash and the `get_key`
+derivation must each be pinned before the selection tests build on them.
 
 | # | Case | Asserts |
 |---|------|---------|
-| D1 | `fnv1a_empty_input` | `fnv1a(&[])` → FNV offset basis `0x811c9dc5`. Spec: FNV-1a starts from the offset basis; empty input returns it unchanged. |
-| D2 | `fnv1a_single_byte` | `fnv1a(&[0x00])` → `0x050c5d2f` (known FNV-1a 32-bit vector). Add a `// Reference: https://fnvhash.github.io/fnv-calculator-online/ or upstream test vectors` comment. |
-| D3 | `fnv1a_ipv4_bytes` | `fnv1a(&[1, 1, 1, 1])` → a specific u32 constant. Engineer derives this constant and commits it as a comment: `// FNV-1a 32-bit of [1,1,1,1] = 0xXXXXXXXX`. Guards against regression on the hash function. |
-| D4 | `fnv1a_no_crate_dep` **[guard-rail]** | `grep "fnv\|fnv1" crates/meow-proxy/Cargo.toml` → empty. Inline 8-line implementation only. NOT a crate dep. Comment in source cites `// FNV-1a 32-bit, matching upstream adapter/outbound/loadbalance.go`. |
+| D1 | `jump_hash_stays_in_range` | For a sweep of keys and bucket counts 1..64, every result `< buckets` (and `buckets == 0` returns `0` rather than `u32::MAX`). |
+| D2 | `jump_hash_known_answer_vectors` | `jump_hash` matches independent reference vectors (e.g. `jump_hash(0, N)` sequence), guarding the multiply-shift constants `0x27d4eb2f165667c5` / `0x9e3779b97f4a7c15`. |
+| D3 | `get_key_edge_cases` | `get_key` returns: the host verbatim for IP literals; eTLD+1 for domains (`www.bbc.co.uk` → `bbc.co.uk`); `dst_ip` when the host is absent or unusable; `""` when nothing is usable. Host strings carrying a port (`domain:443`, `[v6]:443`) fall back to `dst_ip` rather than leaking a bogus suffix lookup. |
+| D4 | `get_key_falls_back_to_dst_ip_then_empty` | Domain→eTLD+1→dst_ip→`""` precedence chain asserted case-by-case. |
 
 ---
 
@@ -197,11 +211,15 @@ consistent-hashing tests build on top of it.
 
 ## Divergence table cross-reference
 
-All 4 spec divergence rows have test coverage:
+The remaining spec divergence rows have test coverage:
 
 | Spec row | Class | Test cases |
 |----------|:-----:|------------|
 | 1 — Unknown `strategy` → hard error | A | F4 |
-| 2 — Consistent-hashing + all-dead → `NoProxyAvailable` (not panic) | A | C2 |
+| 2 — Consistent-hashing + all-dead → `NoProxyAvailable` (not panic / not `proxies[0]`) | A | C2 |
 | 3 — All dead → `NoProxyAvailable` (not dial-dead) | B | C1, C2 |
-| 4 — Consistent-hashing is modulo-hash, not ring-hash | B | B6 (reshuffles on list change) |
+| Sticky sessions (`sticky-sessions`) unimplemented | B | — (documented limitation, no test) |
+
+Row 4 of the original table (modulo-hash vs ring-hash) is **closed**: the
+implementation now uses the upstream jump-hash-over-full-list scheme, and
+B3b pins the minimal-reshuffle property.

@@ -20,8 +20,11 @@ is the recommended path for a fully transparent macOS setup.
 ## How it works
 
 Configuring `tproxy-port` makes meow (which must run as root — pf requires it)
-auto-load a pf anchor `com.apple/com.meow.tproxy` on startup and flush it on
-exit:
+auto-load a pf anchor `com.apple/com.meow.tproxy.<pid>.<seq>` on startup and
+flush it on exit. The anchor is unique per listener instance, and startup also
+flushes leftover `com.meow.tproxy*` anchors whose owning pid is dead (plus the
+legacy shared `com.apple/com.meow.tproxy`) — a crashed instance's `rdr` would
+otherwise keep redirecting traffic to a dead port (issue #621):
 
 ```
 no rdr on lo0 proto tcp from any to any port 49152:65535   # let replies through (#354)
@@ -57,7 +60,7 @@ rules:
 
 ```bash
 sudo ./meow -f config.yaml
-# → INFO pf anchor 'com.apple/com.meow.tproxy' loaded
+# → INFO pf anchor 'com.apple/com.meow.tproxy.<pid>.0' loaded
 # → INFO TProxy listener 'tproxy' started on 127.0.0.1:7893
 ```
 
@@ -101,8 +104,9 @@ these; skipping any one wedges or loops intercepted traffic:
   the listener.
 - **An evaluated anchor/ruleset.** A `pfctl -a` anchor only runs if the
   active ruleset references it — the stock `/etc/pf.conf` evaluates only
-  `com.apple/*` children (meow's managed anchor is `com.apple/com.meow.
-  tproxy` for exactly this reason), so either nest your anchor under
+  `com.apple/*` children (meow's managed anchor is
+  `com.apple/com.meow.tproxy.<pid>.<seq>` — still a direct `com.apple/`
+  child — for exactly this reason), so either nest your anchor under
   `com.apple/` or wire an `rdr-anchor`/`load anchor` reference yourself.
   pf must also be enabled (`pfctl -e`) for the `DIOCNATLOOK` lookup to find
   NAT state.
@@ -169,9 +173,12 @@ INFO meow_listener::tproxy: 192.168.x.x:49219 --> 1.1.1.1:80 match MATCH() using
 ## Troubleshooting
 
 ```bash
-sudo pfctl -a com.apple/com.meow.tproxy -sn   # rdr + no-rdr present?
-sudo pfctl -a com.apple/com.meow.tproxy -sr   # uid/loopback bypasses present?
-sudo pfctl -ss | grep <tproxy-port>           # states being created?
+# The anchor is per-instance: com.apple/com.meow.tproxy.<pid>.<seq> —
+# find it under com.apple first, then inspect it.
+sudo pfctl -a com.apple -sAnchors | grep com.meow.tproxy
+sudo pfctl -a com.apple/com.meow.tproxy.<pid>.<seq> -sn   # rdr + no-rdr present?
+sudo pfctl -a com.apple/com.meow.tproxy.<pid>.<seq> -sr   # uid/loopback bypasses present?
+sudo pfctl -ss | grep <tproxy-port>                       # states being created?
 ```
 
 A state stuck in `SYN_SENT:ESTABLISHED` alongside a second, reversed state
