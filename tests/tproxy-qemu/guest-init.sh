@@ -9,6 +9,17 @@ set -uo pipefail
 pass() { echo "TEST_PASS:$1"; }
 fail() { echo "TEST_FAIL:$1"; }
 
+# Poll for a log line up to ~10s — a one-shot `sleep 1; grep` is a
+# scheduling bet that false-fails on a stalled CI container.
+wait_log() {
+    local i
+    for i in $(seq 1 20); do
+        grep -qE "$1" "$2" 2>/dev/null && return 0
+        sleep 0.5
+    done
+    return 1
+}
+
 # meow-managed nft tables are named `meow_tproxy_<pid>_<seq>` — one per
 # listener instance (issue #621), with the legacy shared `meow_tproxy`
 # swept on startup. Match the whole family by glob.
@@ -114,10 +125,9 @@ fi
 # Connect to 10.88.0.1:9999 (non-loopback); nftables redirects through tproxy
 RESPONSE=""
 RESPONSE=$(echo "HELLO" | timeout 5 nc -w 3 10.88.0.1 9999 2>/dev/null) || true
-sleep 1
 
 # Verify meow logged the intercepted connection to 10.88.0.1:9999
-if grep -q "10.88.0.1:9999" /tmp/meow.log 2>/dev/null; then
+if wait_log "10.88.0.1:9999" /tmp/meow.log; then
     pass "tproxy_intercept"
 else
     fail "tproxy_intercept"
@@ -153,9 +163,8 @@ fi
     printf '\x00\x0f'                        # Host name length: 15
     printf 'sni.example.com'                # Hostname (15 bytes)
 } | timeout 3 nc -w 2 10.88.0.1 443 2>/dev/null || true
-sleep 1
 
-if grep -q "sni.example.com" /tmp/meow.log 2>/dev/null; then
+if wait_log "sni.example.com" /tmp/meow.log; then
     pass "tproxy_sni_extract"
 else
     fail "tproxy_sni_extract"
@@ -255,10 +264,9 @@ fi
 # served end-to-end (orig-dest recovery + relay through the tunnel)
 EXT_RESPONSE=""
 EXT_RESPONSE=$(echo "HELLO" | timeout 5 nc -w 3 10.88.0.1 9999 2>/dev/null) || true
-sleep 1
 
 if [ "$EXT_RESPONSE" = "ECHO_RESPONSE" ] \
-    && grep -q "10.88.0.1:9999" /tmp/meow-ext.log 2>/dev/null; then
+    && wait_log "10.88.0.1:9999" /tmp/meow-ext.log; then
     pass "ext_tproxy_relay"
 else
     fail "ext_tproxy_relay"
@@ -422,7 +430,6 @@ fi
 UDP_RESPONSE=""
 UDP_RESPONSE=$(ip netns exec lan sh -c \
     'echo PING | timeout 5 nc -u -w3 10.89.0.1 9998' 2>/dev/null) || true
-sleep 1
 
 if [ "$UDP_RESPONSE" = "PING" ]; then
     pass "udp_flow_relay"
@@ -432,7 +439,7 @@ fi
 
 # Test 19: udp_flow_logged — the flow was routed through the rule engine
 # (proves dispatch → resolve_proxy, not a raw socket shortcut)
-if grep -qE "UDP 10\.77\.0\.2:[0-9]+ --> 10\.89\.0\.1:9998 match" /tmp/meow-udp.log 2>/dev/null; then
+if wait_log "UDP 10\.77\.0\.2:[0-9]+ --> 10\.89\.0\.1:9998 match" /tmp/meow-udp.log; then
     pass "udp_flow_logged"
 else
     fail "udp_flow_logged"
@@ -442,10 +449,9 @@ fi
 # TCP REDIRECT'd traffic (TCP behaviour unchanged)
 TCP_SAME_PORT=""
 TCP_SAME_PORT=$(echo "HELLO" | timeout 5 nc -w 3 10.89.0.1 9999 2>/dev/null) || true
-sleep 1
 
 if [ "$TCP_SAME_PORT" = "ECHO_RESPONSE" ] \
-    && grep -q "10.89.0.1:9999" /tmp/meow-udp.log 2>/dev/null; then
+    && wait_log "10.89.0.1:9999" /tmp/meow-udp.log; then
     pass "udp_tcp_same_port"
 else
     fail "udp_tcp_same_port"
