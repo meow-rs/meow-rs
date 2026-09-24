@@ -855,6 +855,29 @@ mod tests {
     #[cfg(unix)]
     const DEAD_PID: u32 = i32::MAX as u32;
 
+    /// Poll `f` until it holds or the deadline hits — for conditions that
+    /// become true asynchronously (e.g. macOS `posix_spawn` image-swap lag
+    /// or a transient exe-read failure — both classify as keep → retry).
+    /// Waiting on the condition itself beats a fixed `sleep`, which is a
+    /// scheduling bet that flakes on loaded runners.
+    ///
+    /// Gated to linux/macos like the only call sites: other unixes have no
+    /// exe check (`pid_is_meow` falls back to keep), so the probed
+    /// condition can never hold there — and an unused helper would warn.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn eventually(mut f: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if f() {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn stale_table_classification() {
@@ -871,10 +894,36 @@ mod tests {
         assert!(stale_table(&format!("meow_tproxy_{live}_0"), live, 0));
         assert!(!stale_table(&format!("meow_tproxy_{live}_0"), live, 1));
         assert!(!stale_table(&format!("meow_tproxy_{live}_0"), live, 7));
-        // pid 1 is alive but is never a meow process — a `meow_tproxy_1_*`
-        // name can only be foreign-planted or a pid-reuse leftover.
-        #[cfg(target_os = "linux")]
-        assert!(stale_table("meow_tproxy_1_0", live, 0));
+        // A live pid whose executable is verifiably foreign is a pid-reuse
+        // leftover → swept. Spawn a child for this instead of hardcoding
+        // pid 1: on an unprivileged Linux runner /proc/1/exe is EACCES,
+        // which classifies as unverifiable → kept — that made a pid-1
+        // assertion fail in CI. Gated to the OSes whose `pid_is_meow`
+        // actually resolves an exe; other unixes always keep.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let mut child = std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("spawn foreign-pid child");
+            let foreign = child.id();
+            // A freshly spawned child can briefly resolve its exe to the
+            // parent's image (macOS posix_spawn lag / transient /proc read
+            // failure both classify as keep) — wait until the classifier
+            // sees the real `sleep` image (foreign exe → stale).
+            let name = format!("meow_tproxy_{foreign}_0");
+            let is_stale = eventually(|| stale_table(&name, live, 0));
+            // Pin the intended arm: the child must still be alive — if it
+            // died early, the !pid_alive arm would pass the assert for the
+            // wrong reason.
+            assert!(child.try_wait().unwrap().is_none());
+            let _ = child.kill();
+            let _ = child.wait();
+            assert!(
+                is_stale,
+                "foreign-pid child (pid {foreign}) never classified stale"
+            );
+        }
         // Foreign tables are never swept.
         assert!(!stale_table("meow_ext_fw", live, 0));
         assert!(!stale_table("meow_tproxyx_1_0", live, 0));
@@ -895,8 +944,25 @@ mod tests {
         // Own-pid seq boundary — same rule as tables.
         assert!(stale_anchor(&format!("com.meow.tproxy.{live}.0"), live, 0));
         assert!(!stale_anchor(&format!("com.meow.tproxy.{live}.0"), live, 1));
-        #[cfg(target_os = "macos")]
-        assert!(stale_anchor("com.meow.tproxy.1.0", live, 0));
+        // Same live-foreign-pid case for anchors — spawned child, not
+        // pid 1 (see stale_table_classification for why).
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let mut child = std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("spawn foreign-pid child");
+            let foreign = child.id();
+            let name = format!("com.meow.tproxy.{foreign}.0");
+            let is_stale = eventually(|| stale_anchor(&name, live, 0));
+            assert!(child.try_wait().unwrap().is_none());
+            let _ = child.kill();
+            let _ = child.wait();
+            assert!(
+                is_stale,
+                "foreign-pid child (pid {foreign}) never classified stale"
+            );
+        }
         assert!(!stale_anchor("com.apple.networking", live, 0));
         assert!(!stale_anchor("com.meow.tproxyx.1.0", live, 0));
     }
