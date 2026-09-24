@@ -4,6 +4,7 @@ use anyhow::anyhow;
 use meow_common::adapter::Proxy;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::SystemTime;
 use tracing::{info, warn};
 
 const DEFAULT_MMDB_URL: &str =
@@ -118,7 +119,34 @@ pub async fn download_and_replace(
     // Unique scratch, not `with_extension("tmp")` — same-stem targets
     // (`Country.mmdb`/`Country.yaml` → `Country.tmp`) and concurrent
     // downloaders (auto-update vs rebuild-time `ensure_geodata`) must not
-    // share it (issue #543 review).
+    // share it (issue #543 review). Sweep scratch a crashed downloader
+    // orphaned (issue #621) — on the blocking pool, off the async worker.
+    {
+        let sweep_target = dest.to_path_buf();
+        let _ = crate::spawn_blocking_with_current_dispatcher(move || {
+            meow_common::fs_util::sweep_scratch_siblings(
+                &sweep_target,
+                meow_common::fs_util::SCRATCH_STALE_AGE,
+            );
+            // The pre-#543 scratch was `with_extension("tmp")`
+            // (`Country.mmdb` → `Country.tmp`) — it does not match the
+            // `{base}.{pid}.{n}.tmp` sweep shape; remove it only when old
+            // (a young file could be a user's own).
+            let legacy = sweep_target.with_extension("tmp");
+            if legacy != sweep_target {
+                let old = std::fs::metadata(&legacy)
+                    .and_then(|m| m.modified())
+                    .is_ok_and(|t| {
+                        SystemTime::now().duration_since(t).unwrap_or_default()
+                            > meow_common::fs_util::SCRATCH_STALE_AGE
+                    });
+                if old {
+                    let _ = std::fs::remove_file(&legacy);
+                }
+            }
+        })
+        .await;
+    }
     let tmp = crate::unique_scratch_path(dest);
 
     if let Some(p) = proxy {

@@ -204,6 +204,12 @@ pub struct FileStore {
     reverse: Mutex<HashMap<IpAddr, SmolStr>>,
     dirty: Arc<AtomicBool>,
     notify: Arc<tokio::sync::Notify>,
+    /// Serializes `persist_to_file` between the debounce task and the
+    /// `Drop` flush — without it a still-running background persist could
+    /// rename an older snapshot over the shutdown flush (issue #621).
+    /// Under the lock writers always re-snapshot `state`, so the rename
+    /// that lands last carries the newest data.
+    persist_lock: Arc<Mutex<()>>,
     /// Handle to the background debounce-flush task, aborted on drop so the
     /// task (which parks forever on `notify.notified()` and holds `Arc` clones
     /// of `state`/`dirty`/`notify`) does not outlive the store.
@@ -243,12 +249,14 @@ impl FileStore {
         let state = Arc::new(Mutex::new(snapshot));
         let dirty = Arc::new(AtomicBool::new(false));
         let notify = Arc::new(tokio::sync::Notify::new());
+        let persist_lock = Arc::new(Mutex::new(()));
 
         let flush_task = Self::spawn_flush_task(
             path.clone(),
             Arc::clone(&state),
             Arc::clone(&dirty),
             Arc::clone(&notify),
+            Arc::clone(&persist_lock),
         );
 
         Self {
@@ -257,6 +265,7 @@ impl FileStore {
             reverse: Mutex::new(reverse),
             dirty,
             notify,
+            persist_lock,
             flush_task: Some(flush_task),
         }
     }
@@ -266,6 +275,7 @@ impl FileStore {
         state: Arc<Mutex<PersistedSnapshot>>,
         dirty: Arc<AtomicBool>,
         notify: Arc<tokio::sync::Notify>,
+        persist_lock: Arc<Mutex<()>>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             loop {
@@ -277,13 +287,23 @@ impl FileStore {
                 // changed" hint, and the `state` mutex acquired below
                 // provides the actual ordering for the snapshot data.
                 if dirty.swap(false, Ordering::Relaxed) {
-                    let snap = {
-                        let s = state.lock();
-                        serialise(&s)
-                    };
                     let path = path.clone();
-                    if let Err(e) =
-                        tokio::task::spawn_blocking(move || persist_to_file(&path, &snap)).await
+                    let state = Arc::clone(&state);
+                    let persist_lock = Arc::clone(&persist_lock);
+                    if let Err(e) = tokio::task::spawn_blocking(move || {
+                        // Snapshot *inside* the persist lock: the rename
+                        // that lands last then always carries the newest
+                        // state — a snapshot taken before the lock could
+                        // be written after `Drop`'s fresher shutdown flush
+                        // (issue #621).
+                        let _write = persist_lock.lock();
+                        let snap = {
+                            let s = state.lock();
+                            serialise(&s)
+                        };
+                        persist_to_file(&path, &snap);
+                    })
+                    .await
                     {
                         warn!("fakeip: persist task failed: {}", e);
                     }
@@ -309,6 +329,10 @@ impl Drop for FileStore {
         // task because it may be inside its own sleep and there is no
         // guarantee the runtime is still pumping.
         if self.dirty.swap(false, Ordering::Relaxed) {
+            // Wait out any in-flight background persist so this final
+            // flush is the last rename — never an older snapshot landing
+            // after it (issue #621).
+            let _write = self.persist_lock.lock();
             let snap = serialise(&self.state.lock());
             persist_to_file(&self.path, &snap);
         }
@@ -354,6 +378,9 @@ fn persist_to_file(path: &Path, snap: &PersistedSnapshot) {
     // Unique scratch per call — the `Drop` flush can overlap the
     // background task's in-flight persist, and a shared tmp would let one
     // writer's rename publish the other's splice (issue #543 review).
+    // Also sweep leftovers orphaned by a crash between create and rename
+    // (issue #621) — cheap here, once per persist.
+    meow_common::fs_util::sweep_scratch_siblings(path, meow_common::fs_util::SCRATCH_STALE_AGE);
     let tmp = scratch_path(path);
     let result = (|| -> io::Result<()> {
         let bytes = serde_json::to_vec(snap).map_err(io::Error::other)?;

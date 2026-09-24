@@ -108,20 +108,35 @@ pub async fn fetch_missing(
 /// The parse runs on a spawned task so a panic unwinds into a
 /// `JoinError` we can warn-and-continue on — a panic inside the loop
 /// task would silently kill auto-update until restart.
+///
+/// Ordering is the point of the signature taking `rules`: the DNS parse
+/// is the only await before the commits, and it runs FIRST — a
+/// cancellation during it leaves nothing committed (the next trigger
+/// retries the whole refresh). After the parse resolves, `update_rules`
+/// and `publish_dns`'s synchronous resolver swap run back to back with
+/// no await between, so the two commits cannot be split (issue #621).
+/// Parse inputs are invariant under `update_rules` (`route.proxies` /
+/// `dialer_registry` are unchanged by it; `prior` is just the old
+/// resolver), so computing them before the rules commit is equivalent.
 async fn republish_dns_for_geo_dbs(
     raw: &RawConfig,
     cache_dir: &std::path::Path,
-    rebuild: &meow_config::RebuildResult,
+    rule_providers: &std::collections::HashMap<String, Arc<RuleProvider>>,
+    rules: Vec<Box<dyn meow_common::rule::Rule>>,
     tunnel: &Tunnel,
     dns_server: &RwLock<Option<meow_api::routes::DnsServerHandle>>,
     label: &str,
 ) {
+    debug_assert!(
+        meow_api::routes::CONFIG_MUTATION.try_lock().is_err(),
+        "{label}: republish outside the CONFIG_MUTATION lane"
+    );
     let raw = raw.clone();
     let cache_dir = cache_dir.to_path_buf();
-    let providers = rebuild.rule_providers.clone();
+    let providers = rule_providers.clone();
     let prior = tunnel.resolver();
     let route = tunnel.route_snapshot();
-    let parsed = tokio::spawn(async move {
+    let parse = tokio::spawn(async move {
         meow_config::parse_dns_from_raw(
             &raw,
             Some(&cache_dir),
@@ -132,8 +147,20 @@ async fn republish_dns_for_geo_dbs(
             Some(&route.dialer_registry),
         )
         .await
-    })
-    .await;
+    });
+    // Abort the parse if this future is cancelled while awaiting it —
+    // a dropped JoinHandle would detach the task and keep the cloned
+    // inputs alive until it finishes anyway.
+    struct AbortOnDrop(tokio::task::AbortHandle);
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let _abort_guard = AbortOnDrop(parse.abort_handle());
+    let parsed = parse.await;
+    // Commits — synchronous, adjacent, no await between.
+    tunnel.update_rules(rules);
     match parsed {
         Ok(Ok(dns)) => meow_api::routes::publish_dns(tunnel, dns_server, &dns).await,
         Ok(Err(e)) => warn!("{label}: dns republish skipped: {e:#}"),
@@ -215,21 +242,21 @@ pub async fn run_on_startup(
     .await;
     match rebuild {
         Ok(Ok(rebuild)) => {
-            // Republish the resolver so `geosite:`/`rule-set:` policy
-            // matchers bind the DB generation this commit loads — the raw
-            // config is unchanged, so the reconcile gate would skip it.
-            // The DNS parse borrows the rebuild's (live) provider map
+            // The republish owns the commit order: DNS parse first
+            // (cancel = nothing committed), then `update_rules` and the
+            // synchronous resolver swap back to back (issue #621). The
+            // DNS parse borrows the rebuild's (live) provider map
             // (issue #543).
             republish_dns_for_geo_dbs(
                 &raw,
                 &cache_dir,
-                &rebuild,
+                &rebuild.rule_providers,
+                rebuild.rules,
                 &tunnel,
                 &dns_server,
                 "geodata startup-fetch",
             )
             .await;
-            tunnel.update_rules(rebuild.rules);
             // No registry swap or supervisor reconcile: the rebuild bound
             // the live provider objects, so the map is unchanged and every
             // interval task is already supervised. Known limitation:
@@ -397,21 +424,21 @@ async fn auto_update_tick(
     .await;
     match rebuild {
         Ok(Ok(rebuild)) => {
-            // Same ordering as the startup path — republish the
-            // resolver so policy matchers bind the new DB generation,
-            // then swap the rules. No registry write or reconcile:
-            // the rebuild bound the live provider objects (issue
-            // #543).
+            // Same ordering as the startup path — the republish parses
+            // DNS first (cancel = nothing committed), then commits rules
+            // and the resolver swap back to back (issue #621). No
+            // registry write or reconcile: the rebuild bound the live
+            // provider objects (issue #543).
             republish_dns_for_geo_dbs(
                 &raw,
                 cache_dir,
-                &rebuild,
+                &rebuild.rule_providers,
+                rebuild.rules,
                 tunnel,
                 dns_server,
                 "geodata auto-update",
             )
             .await;
-            tunnel.update_rules(rebuild.rules);
             info!("geodata auto-update: rules reloaded with updated DBs");
         }
         Ok(Err(e)) => {
@@ -548,7 +575,16 @@ mod tests {
         // Production callers hold the lane; the debug_assert in
         // `publish_dns` enforces that contract here too.
         let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
-        republish_dns_for_geo_dbs(&raw, dir.path(), &rebuild, &tunnel, &dns_server, "test").await;
+        republish_dns_for_geo_dbs(
+            &raw,
+            dir.path(),
+            &rebuild.rule_providers,
+            rebuild.rules,
+            &tunnel,
+            &dns_server,
+            "test",
+        )
+        .await;
 
         assert!(
             !Arc::ptr_eq(&before, &tunnel.resolver()),
@@ -610,7 +646,16 @@ mod tests {
         // Production callers hold the lane; the debug_assert in
         // `publish_dns` enforces that contract here too.
         let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
-        republish_dns_for_geo_dbs(&raw, dir.path(), &rebuild, &tunnel, &dns_server, "test").await;
+        republish_dns_for_geo_dbs(
+            &raw,
+            dir.path(),
+            &rebuild.rule_providers,
+            rebuild.rules,
+            &tunnel,
+            &dns_server,
+            "test",
+        )
+        .await;
 
         assert!(
             !Arc::ptr_eq(&stale, &slot.read()),
@@ -701,7 +746,16 @@ mod tests {
         // Production callers hold the lane; the debug_assert in
         // `publish_dns` enforces that contract here too.
         let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
-        republish_dns_for_geo_dbs(&raw, dir.path(), &rebuild, &tunnel, &dns_server, "test").await;
+        republish_dns_for_geo_dbs(
+            &raw,
+            dir.path(),
+            &rebuild.rule_providers,
+            rebuild.rules,
+            &tunnel,
+            &dns_server,
+            "test",
+        )
+        .await;
 
         assert!(!Arc::ptr_eq(&before, &tunnel.resolver()));
         tunnel.resolver().lookup_ipv4("hit.example").await;
@@ -751,7 +805,16 @@ mod tests {
         // Production callers hold the lane; the debug_assert in
         // `publish_dns` enforces that contract here too.
         let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
-        republish_dns_for_geo_dbs(&raw, dir.path(), &rebuild, &tunnel, &dns_server, "test").await;
+        republish_dns_for_geo_dbs(
+            &raw,
+            dir.path(),
+            &rebuild.rule_providers,
+            rebuild.rules,
+            &tunnel,
+            &dns_server,
+            "test",
+        )
+        .await;
 
         assert!(
             Arc::ptr_eq(&before, &tunnel.resolver()),
@@ -804,7 +867,16 @@ mod tests {
         // Production callers hold the lane; the debug_assert in
         // `publish_dns` enforces that contract here too.
         let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
-        republish_dns_for_geo_dbs(&raw, dir.path(), &rebuild, &tunnel, &dns_server, "test").await;
+        republish_dns_for_geo_dbs(
+            &raw,
+            dir.path(),
+            &rebuild.rule_providers,
+            rebuild.rules,
+            &tunnel,
+            &dns_server,
+            "test",
+        )
+        .await;
 
         let after = tunnel.resolver();
         assert!(
@@ -875,8 +947,22 @@ mod tests {
         // Production callers hold the lane; the debug_assert in
         // `publish_dns` enforces that contract here too.
         let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
-        republish_dns_for_geo_dbs(&raw, dir.path(), &rebuild, &tunnel, &dns_server, "test").await;
-        drop(rebuild);
+        republish_dns_for_geo_dbs(
+            &raw,
+            dir.path(),
+            &rebuild.rule_providers,
+            rebuild.rules,
+            &tunnel,
+            &dns_server,
+            "test",
+        )
+        .await;
+        // `rebuild.rules` moved into the republish; drop the remaining
+        // transient halves (proxy map + dialer-registry cell) so a
+        // dangling Weak would be caught below.
+        drop(rebuild.proxies);
+        drop(rebuild.dialer_registry);
+        drop(rebuild.rule_providers);
 
         // A dial through the captured `#chained` upstream resolves `hop`
         // via the live route's retained cell. A dead cell would fail with

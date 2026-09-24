@@ -566,6 +566,13 @@ pub(crate) fn unique_scratch_path(path: &Path) -> PathBuf {
 /// land an older document's rename last (issue #543).
 pub fn save_raw_config(path: &str, raw: &raw::RawConfig) -> Result<(), anyhow::Error> {
     let yaml = serde_yaml::to_string(raw)?;
+    // Scratch files orphaned by a crash between create and rename
+    // accumulate forever otherwise — sweep stale ones on each save
+    // (issue #621).
+    meow_common::fs_util::sweep_scratch_siblings(
+        Path::new(path),
+        meow_common::fs_util::SCRATCH_STALE_AGE,
+    );
     let tmp_path = unique_scratch_path(Path::new(path));
     let bak_path = format!("{path}.bak");
     // Unique scratch names would accumulate on repeated failures — sweep
@@ -592,6 +599,19 @@ pub fn save_raw_config(path: &str, raw: &raw::RawConfig) -> Result<(), anyhow::E
 /// the `CONFIG_MUTATION` lane so file order follows commit order (issue #543).
 pub async fn save_raw_config_async(path: &str, raw: &raw::RawConfig) -> Result<(), anyhow::Error> {
     let yaml = serde_yaml::to_string(raw)?;
+    // Same crash-leftover sweep as the sync variant (issue #621), off the
+    // async worker since it walks the config dir.
+    {
+        let dir_target = PathBuf::from(path);
+        spawn_blocking_with_current_dispatcher(move || {
+            meow_common::fs_util::sweep_scratch_siblings(
+                &dir_target,
+                meow_common::fs_util::SCRATCH_STALE_AGE,
+            );
+        })
+        .await
+        .ok();
+    }
     let tmp_path = unique_scratch_path(Path::new(path));
     let bak_path = format!("{path}.bak");
     if let Err(e) = tokio::fs::write(&tmp_path, &yaml).await {

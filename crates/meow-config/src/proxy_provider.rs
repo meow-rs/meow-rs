@@ -432,6 +432,19 @@ impl ProxyProvider {
                             if let Some(parent) = cache_path.parent() {
                                 let _ = tokio::fs::create_dir_all(parent).await;
                             }
+                            // Sweep scratch siblings a crashed writer left
+                            // behind (issue #621) — on the blocking pool so
+                            // the dir walk never stalls the worker.
+                            {
+                                let sweep_target = cache_path.clone();
+                                let _ = crate::spawn_blocking_with_current_dispatcher(move || {
+                                    meow_common::fs_util::sweep_scratch_siblings(
+                                        &sweep_target,
+                                        meow_common::fs_util::SCRATCH_STALE_AGE,
+                                    );
+                                })
+                                .await;
+                            }
                             let tmp = crate::unique_scratch_path(cache_path);
                             let saved = match tokio::fs::write(&tmp, &text).await {
                                 Ok(()) => tokio::fs::rename(&tmp, cache_path).await.is_ok(),

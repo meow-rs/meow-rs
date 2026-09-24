@@ -105,6 +105,20 @@ pub struct RuleProvider {
     /// `prefer_cache` restart loads the newest refresh instead of the
     /// initial-load-era file (issue #543).
     cache_path: Option<PathBuf>,
+    /// Serializes `write_cache` across concurrent `refresh()` calls —
+    /// a supervisor tick and a `PUT /providers/rules/{name}` can run at
+    /// once, and without ordering a slow writer carrying an older payload
+    /// could win the rename last (issue #621). The `u64` is the highest
+    /// refresh generation already persisted; an older generation
+    /// acquiring the lock after a newer one wrote skips its write.
+    cache_write_lock: Arc<parking_lot::Mutex<u64>>,
+    /// Highest refresh generation installed into `self.rules`. A stale
+    /// refresh that finishes parsing last must not regress live memory
+    /// just because its cache write was already (correctly) skipped —
+    /// file and memory stay on the same newest generation (issue #621).
+    install_gen: parking_lot::Mutex<u64>,
+    /// Monotonic refresh generation, taken after the awaited fetch.
+    refresh_gen: meow_common::atomic::AtomicU,
 }
 
 impl std::fmt::Debug for RuleProvider {
@@ -208,20 +222,35 @@ impl RuleProvider {
         let strict = self.strict;
         let ctx_clone = self.ctx.clone();
         let format = self.format;
-        let (bytes, boxed) = crate::spawn_blocking_with_current_dispatcher(move || {
-            parse_bytes_to_ruleset_with_format(&bytes, behavior, format, &ctx_clone, strict)
-                .map(|rules| (bytes, rules))
+        let cache_path = self.cache_path.clone();
+        let cache_write_lock = Arc::clone(&self.cache_write_lock);
+        // Generation taken at call time: under the write lock an older
+        // refresh that finishes after a newer one already wrote skips its
+        // own write, so the file never regresses (issue #621).
+        #[allow(
+            clippy::useless_conversion,
+            reason = "identity on 64-bit; narrows u64 on targets without 64-bit atomics"
+        )]
+        let gen: u64 = self.refresh_gen.fetch_add(1, Ordering::Relaxed).into();
+        let boxed: Box<dyn RuleSet> = crate::spawn_blocking_with_current_dispatcher(move || {
+            let rules =
+                parse_bytes_to_ruleset_with_format(&bytes, behavior, format, &ctx_clone, strict)?;
+            // Persist the payload only *after* the parse succeeds so the
+            // cache always holds the last usable payload — a
+            // `prefer_cache` restart then picks up the newest refresh
+            // rather than the initial-load-era file (issue #543). The
+            // write+rename runs on this blocking thread: synchronous fs
+            // I/O on the async worker can stall the executor (issue #621).
+            if let Some(path) = &cache_path {
+                let mut written_gen = cache_write_lock.lock();
+                if *written_gen < gen && write_cache(path, &bytes) {
+                    *written_gen = gen;
+                }
+            }
+            Ok::<Box<dyn RuleSet>, anyhow::Error>(rules)
         })
         .await
         .map_err(|e| anyhow!("parse task panicked: {e}"))??;
-        let boxed: Box<dyn RuleSet> = boxed;
-        // Persist the payload only *after* the parse succeeds so the cache
-        // always holds the last usable payload — a `prefer_cache` restart
-        // then picks up the newest refresh rather than the
-        // initial-load-era file (issue #543).
-        if let Some(path) = &self.cache_path {
-            write_cache(path, &bytes);
-        }
         let count = boxed.len();
         let new_rules: Arc<dyn RuleSet> = Arc::from(boxed);
         // The compiled rule table bakes each RULE-SET slot's "needs IP /
@@ -230,6 +259,19 @@ impl RuleProvider {
         // entries can move them. Say so instead of silently matching with
         // stale demands until the next reload.
         let demands = |set: &dyn RuleSet| (set.should_resolve_ip(), set.should_find_process());
+        // Install only the newest completed generation: two unlaned
+        // refreshes (supervisor tick vs `PUT /providers/rules/{name}`) can
+        // finish out of order, and without this gate the stale one's rules
+        // would overwrite live memory even though its cache write was
+        // already skipped (issue #621 review).
+        let mut installed = self.install_gen.lock();
+        if *installed >= gen {
+            debug!(
+                provider = %self.name,
+                "rule-provider refresh gen {gen} superseded; not installing"
+            );
+            return Ok(());
+        }
         if demands(&**self.rules.read()) != demands(&*new_rules) {
             warn!(
                 provider = %self.name,
@@ -239,6 +281,7 @@ impl RuleProvider {
             );
         }
         *self.rules.write() = new_rules;
+        *installed = gen;
         self.touch();
         debug!(provider = %self.name, "rule-provider refreshed: {} rules", count);
         Ok(())
@@ -810,6 +853,11 @@ fn make_provider(
         ctx,
         format,
         cache_path,
+        cache_write_lock: Arc::new(parking_lot::Mutex::new(0)),
+        install_gen: parking_lot::Mutex::new(0),
+        // Starts at 1 so the first refresh (gen 1) beats the initial
+        // `written_gen` of 0 under `cache_write_lock`.
+        refresh_gen: meow_common::atomic::AtomicU::new(1),
     }
 }
 
@@ -1039,7 +1087,7 @@ fn fetch_http_blocking_with_cache(
     match fetch_http_blocking(url, proxy, headers) {
         Ok(bytes) => {
             if let Some(path) = cache_path {
-                write_cache(path, &bytes);
+                let _ = write_cache(path, &bytes);
             }
             Ok(bytes)
         }
@@ -1104,7 +1152,7 @@ pub(crate) async fn fetch_http_async(
     internal_http::fetch(url, proxy, headers).await
 }
 
-fn write_cache(path: &Path, bytes: &[u8]) {
+fn write_cache(path: &Path, bytes: &[u8]) -> bool {
     if let Some(parent) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
             warn!(
@@ -1112,7 +1160,7 @@ fn write_cache(path: &Path, bytes: &[u8]) {
                 parent.display(),
                 e
             );
-            return;
+            return false;
         }
     }
     // Write-then-rename (the same pattern `save_config` uses): a
@@ -1124,7 +1172,10 @@ fn write_cache(path: &Path, bytes: &[u8]) {
     // `live.yaml` and `live.mrs` in the same dir never share a temp file,
     // and the unique per-call suffix keeps two racing `refresh()` writes
     // (supervisor tick vs `PUT /providers/rules/{name}`, neither laned)
-    // from splicing into each other (issue #543 review).
+    // from splicing into each other (issue #543 review). Sweep scratch
+    // siblings a crashed writer orphaned (issue #621) — this fn only ever
+    // runs on blocking threads, so the read_dir is fine here.
+    meow_common::fs_util::sweep_scratch_siblings(path, meow_common::fs_util::SCRATCH_STALE_AGE);
     let tmp = crate::unique_scratch_path(path);
     let result = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
     if let Err(e) = result {
@@ -1134,8 +1185,10 @@ fn write_cache(path: &Path, bytes: &[u8]) {
             path.display(),
             e
         );
+        false
     } else {
         debug!("rule-provider cache updated: {}", path.display());
+        true
     }
 }
 
