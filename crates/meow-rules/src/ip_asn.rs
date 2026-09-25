@@ -53,7 +53,11 @@ impl IpAsnRule {
 
 impl Rule for IpAsnRule {
     fn rule_type(&self) -> RuleType {
-        RuleType::IpAsn
+        if self.src {
+            RuleType::SrcIpAsn
+        } else {
+            RuleType::IpAsn
+        }
     }
 
     fn match_metadata(&self, metadata: &Metadata, _helper: &RuleMatchHelper) -> bool {
@@ -131,6 +135,29 @@ mod tests {
         assert!(!src.should_resolve_ip());
         let dst = IpAsnRule::new(13335, "13335", "P", ranges, false, false);
         assert!(dst.should_resolve_ip());
+    }
+
+    /// `SRC-IP-ASN`/`IP-ASN,...,src` must read `src_ip` — swapped axes
+    /// must not match, and the rule reports the Src variant upstream
+    /// uses for `/rules` output.
+    #[test]
+    fn src_ip_asn_matches_src_ip_axis() {
+        use crate::ip_set::IpRangeSetBuilder;
+        let mut b = IpRangeSetBuilder::new();
+        b.add_v4("10.0.0.0/8".parse().unwrap());
+        let ranges = std::sync::Arc::new(b.build());
+        let src = IpAsnRule::new(13335, "13335", "P", ranges, true, true);
+        assert_eq!(src.rule_type(), RuleType::SrcIpAsn);
+
+        let mut meta = Metadata {
+            src_ip: Some("10.1.2.3".parse().unwrap()),
+            dst_ip: Some("203.0.113.9".parse().unwrap()),
+            ..Default::default()
+        };
+        assert!(src.match_metadata(&meta, &RuleMatchHelper));
+        meta.src_ip = Some("203.0.113.9".parse().unwrap());
+        meta.dst_ip = Some("10.1.2.3".parse().unwrap());
+        assert!(!src.match_metadata(&meta, &RuleMatchHelper));
     }
 
     #[test]

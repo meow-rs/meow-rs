@@ -151,6 +151,8 @@ enum RuleOp {
     /// `demands_process` flags are frozen at build time — a classical set
     /// that gains or loses IP / PROCESS entries keeps the old flags until
     /// the next config reload (the provider warns when that happens).
+    /// `,src` rule-set entries never reach this op — the swap lives on the
+    /// `RuleSetRule` wrapper, so they stay `Fallback` (`lower_native`).
     RuleSetRef(RuleSetHandle),
     /// GEOIP / SRC-GEOIP / IP-ASN lowered to their shared interval sets.
     IpRanges {
@@ -1447,7 +1449,9 @@ fn compile_op(rule_type: RuleType, payload: &str) -> Option<RuleOp> {
         | RuleType::Or
         | RuleType::Not
         | RuleType::IpSuffix
+        | RuleType::SrcIpSuffix
         | RuleType::IpAsn
+        | RuleType::SrcIpAsn
         | RuleType::SubRule => None,
     }
 }
@@ -1468,6 +1472,13 @@ fn lower_native(rule: &dyn Rule) -> Option<RuleOp> {
         })));
     }
     if let Some(rule_set) = any.downcast_ref::<RuleSetRule>() {
+        // A `,src` entry must evaluate the provider against a swapped
+        // src/dst view of the metadata; `RuleSetRef` holds only the set
+        // handle, so leave it on the Fallback path where `match_metadata`
+        // performs the swap (#625 `,src` semantics).
+        if rule_set.is_src() {
+            return None;
+        }
         return Some(RuleOp::RuleSetRef(RuleSetHandle(Arc::clone(
             rule_set.rule_set(),
         ))));
@@ -2027,7 +2038,7 @@ mod tests {
         rule_set::{build_rule_set, RuleSet, RuleSetBehavior},
         rule_set_rule::RuleSetRule,
         sub_rule::SubRuleRule,
-        ParserContext,
+        ParserContext, RuleFlags,
     };
     use std::net::IpAddr;
     use std::sync::{
@@ -2910,15 +2921,39 @@ mod tests {
         let set_box = build_rule_set(RuleSetBehavior::Domain, &entries, &ParserContext::default());
         let rule_set: Arc<dyn RuleSet> = Arc::from(set_box);
         let rules: Vec<Box<dyn Rule>> = vec![
-            Box::new(RuleSetRule::new("prov", Arc::clone(&rule_set), "A", true)),
+            Box::new(RuleSetRule::new(
+                "prov",
+                Arc::clone(&rule_set),
+                "A",
+                RuleFlags {
+                    no_resolve: true,
+                    is_src: false,
+                },
+            )),
             // Same provider handle AND adapter: the predicate is identical,
             // so the later occurrence can never change the outcome and must
             // dedup by pointer identity (issue #513: adapter is part of the
             // dedup identity — a different adapter would stay live).
-            Box::new(RuleSetRule::new("prov", Arc::clone(&rule_set), "A", true)),
+            Box::new(RuleSetRule::new(
+                "prov",
+                Arc::clone(&rule_set),
+                "A",
+                RuleFlags {
+                    no_resolve: true,
+                    is_src: false,
+                },
+            )),
             // Same provider handle, DIFFERENT adapter: stays live — a dead
             // first target falls through to this twin.
-            Box::new(RuleSetRule::new("prov", Arc::clone(&rule_set), "B", true)),
+            Box::new(RuleSetRule::new(
+                "prov",
+                Arc::clone(&rule_set),
+                "B",
+                RuleFlags {
+                    no_resolve: true,
+                    is_src: false,
+                },
+            )),
             Box::new(FinalRule::new("DIRECT")),
         ];
 
@@ -2982,7 +3017,15 @@ mod tests {
         });
         let handle = Arc::clone(&live) as Arc<dyn RuleSet>;
         let rules: Vec<Box<dyn Rule>> = vec![
-            Box::new(RuleSetRule::new("prov", handle, "A", true)),
+            Box::new(RuleSetRule::new(
+                "prov",
+                handle,
+                "A",
+                RuleFlags {
+                    no_resolve: true,
+                    is_src: false,
+                },
+            )),
             Box::new(FinalRule::new("DIRECT")),
         ];
         let set = CompiledRuleSet::build(&rules);
@@ -4401,8 +4444,12 @@ mod tests {
         let entries = vec!["example.com".to_string()];
         let set_box = build_rule_set(RuleSetBehavior::Domain, &entries, &ParserContext::default());
         let rule_set: Arc<dyn RuleSet> = Arc::from(set_box);
-        let rules: Vec<Box<dyn Rule>> =
-            vec![Box::new(RuleSetRule::new("cn", rule_set, "Direct", false))];
+        let rules: Vec<Box<dyn Rule>> = vec![Box::new(RuleSetRule::new(
+            "cn",
+            rule_set,
+            "Direct",
+            RuleFlags::default(),
+        ))];
 
         let compiled = CompiledRuleSet::build(&rules);
         assert!(
@@ -4420,6 +4467,179 @@ mod tests {
             .expect("rule-set op must match");
         assert_eq!(result.adapter_name, "Direct");
         assert_eq!(result.rule_type, RuleType::RuleSet);
+    }
+
+    /// `RULE-SET,...,src` (issue #625 item 11, upstream `isSrc`): the entry
+    /// must evaluate the provider against the *source* tuple. It stays on
+    /// the Fallback path — `RuleSetRef` holds only the set handle, so the
+    /// src/dst swap cannot survive lowering.
+    #[test]
+    fn src_rule_set_stays_fallback_and_matches_src_ip() {
+        let entries = vec!["192.0.2.0/24".to_string()];
+        let set_box = build_rule_set(RuleSetBehavior::IpCidr, &entries, &ParserContext::default());
+        let rule_set: Arc<dyn RuleSet> = Arc::from(set_box);
+        let rules: Vec<Box<dyn Rule>> = vec![Box::new(RuleSetRule::new(
+            "ips",
+            rule_set,
+            "Src",
+            RuleFlags {
+                no_resolve: true,
+                is_src: true,
+            },
+        ))];
+
+        // A src-axis entry never demands dst_ip resolution.
+        assert!(!rules[0].should_resolve_ip());
+
+        let compiled = CompiledRuleSet::build(&rules);
+        assert!(
+            !compiled.slots()[0].is_lowered(),
+            "src RULE-SET must stay on the Fallback path (the swap lives in \
+             RuleSetRule::match_metadata)"
+        );
+
+        // src_ip inside the set, dst_ip outside → match on the source axis.
+        let hit = Metadata {
+            src_ip: Some("192.0.2.7".parse::<IpAddr>().unwrap()),
+            dst_ip: Some("203.0.113.9".parse::<IpAddr>().unwrap()),
+            dst_port: 443,
+            ..Default::default()
+        };
+        let result = compiled
+            .match_rules(&hit, &rules, &|_: &str| true)
+            .expect("src rule-set must match src_ip");
+        assert_eq!(result.adapter_name, "Src");
+        assert_eq!(result.rule_type, RuleType::RuleSet);
+
+        // Swapped axes must NOT match.
+        let miss = Metadata {
+            src_ip: Some("203.0.113.9".parse::<IpAddr>().unwrap()),
+            dst_ip: Some("192.0.2.7".parse::<IpAddr>().unwrap()),
+            dst_port: 443,
+            ..Default::default()
+        };
+        assert!(compiled
+            .match_rules(&miss, &rules, &|_: &str| true)
+            .is_none());
+
+        // The lazy scanner must hit the src-axis rule on `src_ip` alone —
+        // a `NeedsEnrichment` here would mean the slot still demands dst_ip
+        // resolution (`should_resolve_ip` suppression failed). The host
+        // must be populated: `ip_missing` treats an empty host as
+        // "nothing to resolve", which would make the Blocked path
+        // unreachable and this pin vacuous.
+        let unresolved = Metadata {
+            src_ip: Some("192.0.2.7".parse::<IpAddr>().unwrap()),
+            dst_ip: None,
+            host: "unresolved.example".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+        match compiled.match_rules_lazy(&unresolved, &rules, &|_: &str| true) {
+            LazyMatchOutcome::Matched(result) => assert_eq!(result.adapter_name, "Src"),
+            LazyMatchOutcome::NeedsEnrichment { .. } => {
+                panic!("a src RULE-SET must not demand dst_ip resolution")
+            }
+            LazyMatchOutcome::NoMatch => panic!("src_ip in the set must match"),
+        }
+    }
+
+    /// Src leaf rules lower with their axis flag intact: `IpRanges{src:true}`
+    /// (`IP-ASN,...,src` / `SRC-IP-ASN`) and `IpSuffixOp{src:true}`
+    /// (`IP-SUFFIX,...,src`) must evaluate `src_ip` under the IR, not
+    /// `dst_ip`.
+    #[test]
+    fn src_leaf_rules_lower_and_match_src_axis_under_ir() {
+        use meow_rules::ip_asn::IpAsnRule;
+        use meow_rules::ip_set::IpRangeSetBuilder;
+        use meow_rules::ip_suffix::IpSuffixRule;
+
+        let mut b = IpRangeSetBuilder::new();
+        b.add_v4("10.0.0.0/8".parse().unwrap());
+        let ranges = Arc::new(b.build());
+        let rules: Vec<Box<dyn Rule>> = vec![
+            Box::new(IpAsnRule::new(13335, "13335", "Asn", ranges, true, true)),
+            // IP-SUFFIX masks the *low* bits: `x.x.x.9` matches `0.0.0.9/8`.
+            Box::new(IpSuffixRule::new("0.0.0.9/8", "Sfx", true, true).unwrap()),
+        ];
+        let compiled = CompiledRuleSet::build(&rules);
+        assert!(
+            compiled.slots()[0].is_lowered(),
+            "src IP-ASN lowers to IpRanges"
+        );
+        assert!(
+            compiled.slots()[1].is_lowered(),
+            "src IP-SUFFIX lowers to IpSuffixOp"
+        );
+
+        // ASN leg hits on the source axis only.
+        let hit = Metadata {
+            src_ip: Some("10.1.2.3".parse::<IpAddr>().unwrap()),
+            dst_ip: Some("203.0.113.9".parse::<IpAddr>().unwrap()),
+            dst_port: 443,
+            ..Default::default()
+        };
+        let result = compiled
+            .match_rules(&hit, &rules, &|_: &str| true)
+            .expect("src ASN range must match src_ip");
+        assert_eq!(result.adapter_name, "Asn");
+        assert_eq!(result.rule_type, RuleType::SrcIpAsn);
+
+        // Suffix leg: src low byte 9 matches; dst `10.1.2.3` (low byte 3)
+        // must not.
+        let hit = Metadata {
+            src_ip: Some("192.0.2.9".parse::<IpAddr>().unwrap()),
+            dst_ip: Some("10.1.2.3".parse::<IpAddr>().unwrap()),
+            dst_port: 443,
+            ..Default::default()
+        };
+        let result = compiled
+            .match_rules(&hit, &rules, &|_: &str| true)
+            .expect("src suffix must match src_ip");
+        assert_eq!(result.adapter_name, "Sfx");
+    }
+
+    /// `SrcGeoIpRule` must lower to `IpRanges{src: true}` — a `src: false`
+    /// arm would silently read `dst_ip` instead (#625 review).
+    #[test]
+    fn src_geoip_lowers_to_src_ranges_under_ir() {
+        use meow_rules::ip_set::IpRangeSetBuilder;
+        use meow_rules::src_geoip::SrcGeoIpRule;
+
+        let mut b = IpRangeSetBuilder::new();
+        b.add_v4("10.0.0.0/8".parse().unwrap());
+        let rules: Vec<Box<dyn Rule>> = vec![Box::new(SrcGeoIpRule::new(
+            "CN",
+            "Geo",
+            Arc::new(b.build()),
+        ))];
+        let compiled = CompiledRuleSet::build(&rules);
+        assert!(
+            compiled.slots()[0].is_lowered(),
+            "SRC-GEOIP lowers to IpRanges{{src: true}}"
+        );
+
+        // Hits on the source axis only: a dst-side address inside the
+        // range must not fire the lowered op.
+        let hit = Metadata {
+            src_ip: Some("10.1.2.3".parse::<IpAddr>().unwrap()),
+            dst_ip: Some("203.0.113.9".parse::<IpAddr>().unwrap()),
+            ..Default::default()
+        };
+        let result = compiled
+            .match_rules(&hit, &rules, &|_: &str| true)
+            .expect("src geoip range must match src_ip");
+        assert_eq!(result.adapter_name, "Geo");
+        assert_eq!(result.rule_type, RuleType::SrcGeoIp);
+
+        let miss = Metadata {
+            src_ip: Some("203.0.113.9".parse::<IpAddr>().unwrap()),
+            dst_ip: Some("10.1.2.3".parse::<IpAddr>().unwrap()),
+            ..Default::default()
+        };
+        assert!(compiled
+            .match_rules(&miss, &rules, &|_: &str| true)
+            .is_none());
     }
 
     #[test]

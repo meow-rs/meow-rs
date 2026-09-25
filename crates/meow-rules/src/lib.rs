@@ -38,7 +38,7 @@ pub mod src_geoip;
 pub mod sub_rule;
 pub mod uid;
 
-pub use parser::{parse_rule, ParserContext};
+pub use parser::{parse_rule, parse_rule_flags, ParserContext, RuleFlags};
 pub use rule_set::{
     build_rule_set, build_rule_set_checked, build_rule_set_from_mrs,
     build_rule_set_from_mrs_with_behavior, is_mrs_bytes, ClassicalRuleSet, DomainRuleSet,

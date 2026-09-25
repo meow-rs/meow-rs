@@ -139,7 +139,11 @@ impl IpSuffixRule {
 
 impl Rule for IpSuffixRule {
     fn rule_type(&self) -> RuleType {
-        RuleType::IpSuffix
+        if self.src {
+            RuleType::SrcIpSuffix
+        } else {
+            RuleType::IpSuffix
+        }
     }
 
     fn match_metadata(&self, metadata: &Metadata, _helper: &RuleMatchHelper) -> bool {

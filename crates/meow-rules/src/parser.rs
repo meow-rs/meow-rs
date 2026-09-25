@@ -132,17 +132,16 @@ fn parse_rule_depth(
             .map(|r| Box::new(r) as Box<dyn Rule>)
             .map_err(|e| format!("invalid regex: {e}")),
         "IP-CIDR" | "IP-CIDR6" => {
-            let no_resolve = extra.is_some_and(|e| e.eq_ignore_ascii_case("no-resolve"));
-            IpCidrRule::new(payload, adapter, false, no_resolve)
+            // Trailing `,src` (upstream `ParseParams`) makes the rule
+            // source-axis, matching `SRC-IP-CIDR`.
+            let flags = parse_rule_flags(extra);
+            IpCidrRule::new(payload, adapter, flags.is_src, flags.no_resolve)
                 .map(|r| Box::new(r) as Box<dyn Rule>)
                 .map_err(|e| format!("invalid CIDR: {e}"))
         }
-        "SRC-IP-CIDR" => {
-            let no_resolve = extra.is_some_and(|e| e.eq_ignore_ascii_case("no-resolve"));
-            IpCidrRule::new(payload, adapter, true, no_resolve)
-                .map(|r| Box::new(r) as Box<dyn Rule>)
-                .map_err(|e| format!("invalid CIDR: {e}"))
-        }
+        "SRC-IP-CIDR" => IpCidrRule::new(payload, adapter, true, true)
+            .map(|r| Box::new(r) as Box<dyn Rule>)
+            .map_err(|e| format!("invalid CIDR: {e}")),
         "SRC-PORT" => PortRule::new(payload, adapter, true).map(|r| Box::new(r) as Box<dyn Rule>),
         "DST-PORT" => PortRule::new(payload, adapter, false).map(|r| Box::new(r) as Box<dyn Rule>),
         "NETWORK" => NetworkRule::new(payload, adapter).map(|r| Box::new(r) as Box<dyn Rule>),
@@ -151,11 +150,19 @@ fn parse_rule_depth(
             let index = ctx.geoip.as_ref().ok_or_else(|| {
                 "GEOIP rule requires a GeoIP database, but none is configured".to_string()
             })?;
-            let no_resolve = extra.is_some_and(|e| e.eq_ignore_ascii_case("no-resolve"));
+            let flags = parse_rule_flags(extra);
             let ranges = index.ranges_for(payload);
-            Ok(Box::new(GeoIpRule::new(
-                payload, adapter, no_resolve, ranges,
-            )))
+            if flags.is_src {
+                // Upstream parity: `GEOIP,...,src` is a `SRC-GEOIP` rule.
+                Ok(Box::new(SrcGeoIpRule::new(payload, adapter, ranges)))
+            } else {
+                Ok(Box::new(GeoIpRule::new(
+                    payload,
+                    adapter,
+                    flags.no_resolve,
+                    ranges,
+                )))
+            }
         }
         "SRC-GEOIP" => {
             let index = ctx.geoip.as_ref().ok_or_else(|| {
@@ -190,14 +197,12 @@ fn parse_rule_depth(
             DomainWildcardRule::new(payload, adapter).map(|r| Box::new(r) as Box<dyn Rule>)
         }
         "IP-SUFFIX" => {
-            let no_resolve = extra.is_some_and(|e| e.eq_ignore_ascii_case("no-resolve"));
-            IpSuffixRule::new(payload, adapter, false, no_resolve)
+            let flags = parse_rule_flags(extra);
+            IpSuffixRule::new(payload, adapter, flags.is_src, flags.no_resolve)
                 .map(|r| Box::new(r) as Box<dyn Rule>)
         }
         "SRC-IP-SUFFIX" => {
-            let no_resolve = extra.is_some_and(|e| e.eq_ignore_ascii_case("no-resolve"));
-            IpSuffixRule::new(payload, adapter, true, no_resolve)
-                .map(|r| Box::new(r) as Box<dyn Rule>)
+            IpSuffixRule::new(payload, adapter, true, true).map(|r| Box::new(r) as Box<dyn Rule>)
         }
         "IP-ASN" => {
             let index = ctx.asn.clone().ok_or_else(|| {
@@ -207,10 +212,15 @@ fn parse_rule_depth(
                     .to_string()
             })?;
             let asn = parse_asn_payload(payload)?;
-            let no_resolve = extra.is_some_and(|e| e.eq_ignore_ascii_case("no-resolve"));
+            let flags = parse_rule_flags(extra);
             let ranges = index.ranges_for(asn);
             Ok(Box::new(IpAsnRule::new(
-                asn, payload, adapter, ranges, false, no_resolve,
+                asn,
+                payload,
+                adapter,
+                ranges,
+                flags.is_src,
+                flags.no_resolve,
             )))
         }
         "SRC-IP-ASN" => {
@@ -235,6 +245,41 @@ fn parse_asn_payload(payload: &str) -> Result<u32, String> {
         .trim()
         .parse()
         .map_err(|e| format!("invalid IP-ASN value '{}': {}", payload.trim(), e))
+}
+
+/// Parsed trailing flags of a rule (`no-resolve`, `src`). Named fields so
+/// call sites can't swap the two same-typed bools.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RuleFlags {
+    /// `no-resolve`: never demand destination-IP resolution for this rule.
+    pub no_resolve: bool,
+    /// `src`: match against the source tuple instead of the destination
+    /// tuple. Implies `no_resolve` — a source-axis match never needs the
+    /// destination resolved (upstream `ParseParams` does the same fold).
+    pub is_src: bool,
+}
+
+/// Parse the trailing flag list of a rule — the `extra` field may itself be
+/// comma-separated (`IP-CIDR,x,DIRECT,no-resolve,src`). Mirrors upstream
+/// `rules/common.ParseParams`.
+///
+/// Unknown flags are ignored — upstream does the same for params a rule
+/// type does not consume. Flag names compare case-insensitively, a
+/// deliberate superset of upstream's exact-match parsing, consistent with
+/// the pre-existing `no-resolve` handling here.
+pub fn parse_rule_flags(extra: Option<&str>) -> RuleFlags {
+    let mut flags = RuleFlags::default();
+    if let Some(extra) = extra {
+        for flag in extra.split(',').map(str::trim) {
+            if flag.eq_ignore_ascii_case("no-resolve") {
+                flags.no_resolve = true;
+            } else if flag.eq_ignore_ascii_case("src") {
+                flags.is_src = true;
+            }
+        }
+    }
+    flags.no_resolve |= flags.is_src;
+    flags
 }
 
 fn split_once_trimmed(s: &str, sep: char) -> Option<(&str, &str)> {
@@ -280,9 +325,19 @@ fn parse_logic_rule(
     let end = end.ok_or_else(|| format!("{rule_type} rule: unbalanced parentheses"))?;
     let inner = &rest[1..end];
     let tail = rest[end + 1..].trim_start();
+    // Upstream `ParseRulePayload` takes the *last* comma field as the
+    // adapter on logic types (middle fields join the ignored payload
+    // region). `next_back()` mirrors that exactly: `...,Proxy,src` targets
+    // "src" — upstream fails the adapter lookup at config load, we warn
+    // and skip at match (issue #513 continue-on-missing) — and
+    // `...,src,Proxy` resolves `Proxy` like upstream. A first-field pick
+    // would route the same line differently.
     let adapter = tail
         .strip_prefix(',')
         .ok_or_else(|| format!("{rule_type} rule: expected ',ADAPTER' after payload"))?
+        .split(',')
+        .next_back()
+        .unwrap_or("")
         .trim();
     if adapter.is_empty() {
         return Err(format!("{rule_type} rule: missing adapter"));
@@ -295,6 +350,34 @@ fn parse_logic_rule(
 
     let mut inner_rules: Vec<Box<dyn Rule>> = Vec::with_capacity(groups.len());
     for g in &groups {
+        // Upstream `payloadToRule` rejects MATCH inside logic sub-rules —
+        // it would splice into an always-true `FinalRule` leg. Nested
+        // groups recurse through here, so the check covers any depth.
+        let mut fields = g.splitn(3, ',');
+        let first = fields.next().map_or("", str::trim);
+        if first == "MATCH" {
+            return Err(format!(
+                "{rule_type} rule: MATCH is not allowed inside logic groups"
+            ));
+        }
+        // An empty or missing payload silently degrades to match-all for
+        // the substring-match types (`DOMAIN-SUFFIX,` → ends_with(""),
+        // `DOMAIN-KEYWORD,` → contains("")) — same class as MATCH.
+        // Reject loudly.
+        if fields.next().map_or("", str::trim).is_empty() {
+            return Err(format!("{rule_type} rule: '{g}' has no payload"));
+        }
+        // Upstream comma-protects regex payloads (target = last field,
+        // payload = everything before it); our grammar splits payload at
+        // the first comma, so an inner entry with a comma in its payload
+        // would silently truncate (`DOMAIN-REGEX,a,b` → regex "a").
+        // Reject loudly instead.
+        if first == "DOMAIN-REGEX" && fields.next().is_some() {
+            return Err(format!(
+                "{rule_type} rule: {first} payloads containing commas are \
+                 not supported inside logic groups"
+            ));
+        }
         let patched = splice_inner_adapter(g.trim());
         inner_rules.push(parse_rule_depth(&patched, ctx, logic_depth + 1)?);
     }
@@ -390,7 +473,7 @@ fn splice_inner_adapter(entry: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use meow_common::{Metadata, RuleMatchHelper};
+    use meow_common::{Metadata, RuleMatchHelper, RuleType};
 
     fn noop_helper() -> RuleMatchHelper {
         RuleMatchHelper
@@ -582,6 +665,189 @@ mod tests {
     #[test]
     fn test_parse_geosite_without_db_tolerated() {
         assert!(parse_rule("GEOSITE,cn,DIRECT", &ctx()).is_ok());
+    }
+
+    // ─── `,src` trailing flag (issue #625 item 11; upstream
+    // `rules/common.ParseParams` + `Metadata.SwapSrcDst`) ────────────────
+
+    /// `parse_rule_flags`: `src` implies `no-resolve`; both flags may
+    /// appear in either order and tolerate whitespace.
+    #[test]
+    fn test_parse_rule_flags() {
+        let dst = |no_resolve, is_src| RuleFlags { no_resolve, is_src };
+        assert_eq!(parse_rule_flags(None), dst(false, false));
+        assert_eq!(parse_rule_flags(Some("no-resolve")), dst(true, false));
+        assert_eq!(parse_rule_flags(Some("src")), dst(true, true));
+        assert_eq!(parse_rule_flags(Some("no-resolve,src")), dst(true, true));
+        assert_eq!(parse_rule_flags(Some("src, no-resolve")), dst(true, true));
+        // Flag names compare case-insensitively — a deliberate superset of
+        // upstream's exact match, consistent with `no-resolve` handling.
+        assert_eq!(parse_rule_flags(Some("SRC")), dst(true, true));
+        assert_eq!(parse_rule_flags(Some("No-Resolve")), dst(true, false));
+        // Unknown flags are ignored, matching upstream param handling.
+        assert_eq!(parse_rule_flags(Some("bogus")), dst(false, false));
+        // A `src`-looking flag in an unknown name doesn't activate src.
+        assert_eq!(parse_rule_flags(Some("src2")), dst(false, false));
+    }
+
+    /// `IP-CIDR,...,src` matches the *source* IP — a ported
+    /// `IP-CIDR` config previously parsed fine but still matched `dst_ip`
+    /// (#625 item 11 silent misroute).
+    #[test]
+    fn test_parse_ip_cidr_src_flag() {
+        let rule = parse_rule("IP-CIDR,192.168.0.0/16,DIRECT,src", &ctx()).unwrap();
+        let mut meta = make_metadata("example.com", 443);
+        meta.src_ip = Some("192.168.1.5".parse().unwrap());
+        meta.dst_ip = Some("203.0.113.1".parse().unwrap());
+        assert!(rule.match_metadata(&meta, &noop_helper()));
+        // The same addresses on the opposite axes must NOT match.
+        meta.src_ip = Some("203.0.113.1".parse().unwrap());
+        meta.dst_ip = Some("192.168.1.5".parse().unwrap());
+        assert!(!rule.match_metadata(&meta, &noop_helper()));
+        // `src` implies `no-resolve`: no dst resolution demand.
+        assert!(!rule.should_resolve_ip());
+    }
+
+    /// `IP-SUFFIX,...,src` likewise routes onto the source axis.
+    /// (IP-SUFFIX masks the *low* bits: `x.x.x.1` matches `0.0.0.1/8`.)
+    #[test]
+    fn test_parse_ip_suffix_src_flag() {
+        let rule = parse_rule("IP-SUFFIX,0.0.0.1/8,DIRECT,src", &ctx()).unwrap();
+        let mut meta = make_metadata("", 80);
+        meta.src_ip = Some("192.0.2.1".parse().unwrap());
+        meta.dst_ip = Some("198.51.100.2".parse().unwrap());
+        assert!(rule.match_metadata(&meta, &noop_helper()));
+        // The same suffix on the *destination* must not match a src rule.
+        meta.src_ip = Some("198.51.100.2".parse().unwrap());
+        meta.dst_ip = Some("192.0.2.1".parse().unwrap());
+        assert!(!rule.match_metadata(&meta, &noop_helper()));
+        assert!(!rule.should_resolve_ip());
+    }
+
+    /// Logic rules take the *last* comma field after the payload as the
+    /// adapter, mirroring upstream `ParseRulePayload` (`target =
+    /// item[l-1]`). A trailing `,src` must not be silently dropped —
+    /// upstream would look up "src" as the adapter and fail; absorbing
+    /// `Proxy,src` into one name would also dead-route the rule.
+    #[test]
+    fn test_parse_logic_adapter_uses_last_tail_field() {
+        // `...,Proxy,src` → adapter "src", exactly like upstream: the
+        // target resolves at match time as missing → warn + fall through
+        // (issue #513 continue-on-missing), never silently via `Proxy`.
+        let rule = parse_rule(
+            "AND,((DOMAIN,and.example),(DST-PORT,443)),Proxy,src",
+            &ctx(),
+        )
+        .unwrap();
+        assert_eq!(rule.adapter(), "src");
+
+        // Middle fields are ignored like upstream — `...,src,Proxy`
+        // still resolves `Proxy` and matches.
+        let rule = parse_rule(
+            "AND,((DOMAIN,and.example),(DST-PORT,443)),src,Proxy",
+            &ctx(),
+        )
+        .unwrap();
+        assert_eq!(rule.adapter(), "Proxy");
+        let mut meta = make_metadata("and.example", 443);
+        meta.dst_ip = Some("203.0.113.1".parse().unwrap());
+        assert!(rule.match_metadata(&meta, &noop_helper()));
+    }
+
+    /// A `MATCH` leg inside a logic group must be rejected (upstream
+    /// `payloadToRule` parity) — it would splice into an always-true
+    /// `FinalRule` leg.
+    #[test]
+    fn test_parse_logic_rejects_inner_match() {
+        assert!(parse_rule("OR,((MATCH,x),(DOMAIN,a.example)),Proxy", &ctx()).is_err());
+        // And at arbitrary nesting depth.
+        assert!(parse_rule("AND,((NOT,((MATCH,x))),(DOMAIN,a.example)),Proxy", &ctx()).is_err());
+        // A comma-containing DOMAIN-REGEX payload cannot be represented
+        // in our grammar — reject loudly rather than silently truncating
+        // to a different regex.
+        assert!(parse_rule("AND,((DOMAIN-REGEX,a,b),(DOMAIN,a.example)),Proxy", &ctx()).is_err());
+        // A comma-free DOMAIN-REGEX leg still parses.
+        assert!(parse_rule("AND,((DOMAIN-REGEX,a+),(DOMAIN,a.example)),Proxy", &ctx()).is_ok());
+        // An empty-payload leg would silently become match-all
+        // (`DOMAIN-SUFFIX,` → ends_with("") is true) — reject loudly.
+        assert!(parse_rule("OR,((DOMAIN-SUFFIX,),(DOMAIN,a.example)),Proxy", &ctx()).is_err());
+        // Trailing comma is load-bearing: `(DOMAIN-KEYWORD,)` splices to
+        // an empty keyword (match-all) without the guard, while a bare
+        // `(DOMAIN-KEYWORD)` errors downstream on `< 2 parts` either way.
+        assert!(parse_rule("OR,((DOMAIN-KEYWORD,),(DOMAIN,a.example)),Proxy", &ctx()).is_err());
+    }
+
+    /// `IP-CIDR6,...,src` shares the IP-CIDR arm — IPv6 source axis.
+    #[test]
+    fn test_parse_ip_cidr6_src_flag() {
+        let rule = parse_rule("IP-CIDR6,2001:db8::/32,DIRECT,src", &ctx()).unwrap();
+        let mut meta = make_metadata("", 443);
+        meta.src_ip = Some("2001:db8::5".parse().unwrap());
+        meta.dst_ip = Some("192.0.2.9".parse().unwrap());
+        assert!(rule.match_metadata(&meta, &noop_helper()));
+        meta.src_ip = Some("192.0.2.9".parse().unwrap());
+        meta.dst_ip = Some("2001:db8::5".parse().unwrap());
+        assert!(!rule.match_metadata(&meta, &noop_helper()));
+    }
+
+    /// A dst-axis rule must not accidentally pick up `src` — plain
+    /// `IP-CIDR` still matches `dst_ip` and demands resolution.
+    #[test]
+    fn test_parse_ip_cidr_dst_unchanged() {
+        let rule = parse_rule("IP-CIDR,192.168.0.0/16,DIRECT", &ctx()).unwrap();
+        let mut meta = make_metadata("", 80);
+        meta.dst_ip = Some("192.168.9.9".parse().unwrap());
+        assert!(rule.match_metadata(&meta, &noop_helper()));
+        assert!(rule.should_resolve_ip());
+    }
+
+    /// `GEOIP,...,src` cannot bypass the GeoIP-DB requirement — the flag is
+    /// parsed after the context check, like every other GEOIP arm.
+    #[test]
+    fn test_parse_geoip_src_flag_still_needs_db() {
+        let err = parse_rule("GEOIP,CN,Proxy,src", &ctx())
+            .err()
+            .expect("GEOIP,src without a DB must error");
+        assert!(err.contains("GEOIP"), "unexpected error: {err}");
+    }
+
+    /// Same for `IP-ASN,...,src` — the ASN DB check precedes flag use.
+    #[test]
+    fn test_parse_ip_asn_src_flag_still_needs_db() {
+        let err = parse_rule("IP-ASN,13335,DIRECT,src", &ctx())
+            .err()
+            .expect("IP-ASN,src without a DB must error");
+        assert!(err.contains("IP-ASN"), "unexpected error: {err}");
+    }
+
+    /// With a (possibly empty) GeoIP index the `GEOIP,...,src` arm must
+    /// dispatch to `SrcGeoIpRule`, not a dst-axis `GeoIpRule` — the
+    /// miss-lookup path still exercises the dispatch.
+    #[test]
+    fn test_parse_geoip_src_flag_dispatches_src_rule() {
+        let ctx = ParserContext {
+            geoip: Some(Arc::new(CountryIndex::default())),
+            ..ParserContext::empty()
+        };
+        let rule = parse_rule("GEOIP,CN,Proxy,src", &ctx).unwrap();
+        assert_eq!(rule.rule_type(), RuleType::SrcGeoIp);
+        assert!(!rule.should_resolve_ip());
+        // Unknown country → empty ranges → no match, upstream parity.
+        let mut meta = make_metadata("", 80);
+        meta.src_ip = Some("1.2.3.4".parse().unwrap());
+        assert!(!rule.match_metadata(&meta, &noop_helper()));
+    }
+
+    /// `IP-ASN,...,src` dispatches to a src-axis `IpAsnRule`.
+    #[test]
+    fn test_parse_ip_asn_src_flag_dispatches_src_rule() {
+        let ctx = ParserContext {
+            asn: Some(Arc::new(AsnIndex::default())),
+            ..ParserContext::empty()
+        };
+        let rule = parse_rule("IP-ASN,13335,DIRECT,src", &ctx).unwrap();
+        assert_eq!(rule.rule_type(), RuleType::SrcIpAsn);
+        assert!(!rule.should_resolve_ip());
     }
 }
 

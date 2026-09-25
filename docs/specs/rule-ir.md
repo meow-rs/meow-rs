@@ -406,16 +406,16 @@ by public payload plus `Metadata`:
 Rules with private embedded state or composition stay as `Fallback` and call the
 public `Rule` trait:
 
-- `GEOSITE`
-- `GEOIP`
-- `SRC-GEOIP`
-- `RULE-SET`
-- `AND`
-- `OR`
-- `NOT`
-- `IP-SUFFIX`
-- `IP-ASN`
 - `SUB-RULE`
+- `RULE-SET` entries carrying `,src` — the src/dst swap lives on the
+  `RuleSetRule` wrapper; `RuleSetRef` lowering carries only the set handle,
+  so `is_src` entries stay `Fallback` (non-src entries lower to
+  `RuleSetRef`)
+
+Most other types now lower natively (`lower_native`): `GEOIP`/`SRC-GEOIP`/
+`IP-ASN`/`SRC-IP-ASN` → `IpRanges`, `IP-SUFFIX`/`SRC-IP-SUFFIX` → `IpSuffix`,
+`AND`/`OR`/`NOT` → `AllOf`/`AnyOf`/`NotOp`, `GEOSITE` → `GeoSite`, and
+`RULE-SET` (without `,src`) → `RuleSetRef`.
 
 This keeps the IR conservative. A rule type is lowered only when the compiled
 opcode can preserve existing behavior without duplicating hidden state.

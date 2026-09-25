@@ -92,4 +92,23 @@ mod tests {
         };
         assert!(!r.match_metadata(&meta, &helper()));
     }
+
+    /// `SRC-GEOIP`/`GEOIP,...,src` must match on `src_ip` — the same
+    /// addresses on the opposite axes must not match.
+    #[test]
+    fn src_geoip_matches_src_ip_axis() {
+        let mut b = IpRangeSetBuilder::new();
+        b.add_v4("10.0.0.0/8".parse().unwrap());
+        let r = SrcGeoIpRule::new("CN", "P", Arc::new(b.build()));
+
+        let mut meta = Metadata {
+            src_ip: Some("10.1.2.3".parse::<IpAddr>().unwrap()),
+            dst_ip: Some("203.0.113.9".parse::<IpAddr>().unwrap()),
+            ..Default::default()
+        };
+        assert!(r.match_metadata(&meta, &helper()));
+        meta.src_ip = Some("203.0.113.9".parse::<IpAddr>().unwrap());
+        meta.dst_ip = Some("10.1.2.3".parse::<IpAddr>().unwrap());
+        assert!(!r.match_metadata(&meta, &helper()));
+    }
 }

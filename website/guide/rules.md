@@ -10,7 +10,7 @@ against the list **top to bottom, first match wins**, and dispatched to the name
 TYPE,payload,target[,options]
 ```
 
-- **TYPE** — the rule type keyword (case-insensitive), e.g. `DOMAIN-SUFFIX`.
+- **TYPE** — the rule type keyword, e.g. `DOMAIN-SUFFIX`. Write it uppercase (upstream convention); `AND`/`OR`/`NOT`/`SUB-RULE` are also accepted case-insensitively, but leaf types and `MATCH`/`RULE-SET` are case-sensitive.
 - **payload** — the value to match (a domain, CIDR, port set, …).
 - **target** — where matching traffic goes.
 - **options** — rule-specific flags, most commonly `no-resolve`.
@@ -27,6 +27,17 @@ rules:
 For IP-based rules, `no-resolve` skips DNS resolution of a hostname destination during
 matching. Put `no-resolve` IP rules **before** any rule that would force a DNS lookup, so
 you don't resolve names you intend to route by domain.
+:::
+
+::: tip `src`
+A trailing `,src` option switches an IP rule to the **source** axis:
+`IP-CIDR,10.0.0.0/8,DIRECT,src` is equivalent to `SRC-IP-CIDR`. It is
+accepted on `IP-CIDR`/`IP-CIDR6`, `IP-SUFFIX`, `GEOIP`, `IP-ASN`, and
+`RULE-SET` (upstream `isSrc`), and implies `no-resolve` since a source
+match never needs the destination resolved. Flag names are
+case-insensitive. On a `domain`-behavior rule provider `,src` has no
+effect — the config still loads, but a warning is logged since the
+provider can only match on the destination host.
 :::
 
 Always end the list with a catch-all `MATCH` rule so every connection has a destination.
@@ -50,6 +61,7 @@ All IP rules accept `no-resolve`. `IP-CIDR` and `IP-CIDR6` are interchangeable.
 | `IP-CIDR` / `IP-CIDR6` | `IP-CIDR,192.168.0.0/16,DIRECT,no-resolve` | Destination IP in range |
 | `SRC-IP-CIDR` | `SRC-IP-CIDR,10.0.0.0/8,DIRECT` | Source (client) IP in range |
 | `IP-SUFFIX` | `IP-SUFFIX,127.0.0.1/8,DIRECT` | Low-bit suffix match on the IP |
+| `SRC-IP-SUFFIX` | `SRC-IP-SUFFIX,10.0.0.0/8,DIRECT` | Low-bit suffix match on the source IP |
 | `IP-ASN` | `IP-ASN,13335,Proxy` | Destination IP's ASN (needs GeoLite2-ASN) |
 | `SRC-IP-ASN` | `SRC-IP-ASN,13335,Proxy` | Source IP's ASN |
 
@@ -106,7 +118,7 @@ only ever matches on the TProxy listener.
 
 | Type | Example | Behavior |
 | --- | --- | --- |
-| `RULE-SET` | `RULE-SET,gfw,Proxy` | Delegates to a named [rule provider](./providers) |
+| `RULE-SET` | `RULE-SET,gfw,Proxy` | Delegates to a named [rule provider](./providers); `,src` matches the client IP (ipcidr/classical providers) |
 | `SUB-RULE` | `SUB-RULE,my-block,Proxy` | Evaluates a named block from `sub-rules:` |
 
 `SUB-RULE` blocks are declared at the top level:

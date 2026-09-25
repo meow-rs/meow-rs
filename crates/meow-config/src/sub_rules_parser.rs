@@ -97,8 +97,9 @@ fn build_reference_graph(
 /// a SUB-RULE reference. Returns `None` for any other rule type.
 ///
 /// upstream: `rules/parser.go` SUB-RULE case — two-field form
-/// `SUB-RULE,<block-name>`. Any further comma-delimited fields after the
-/// block name are currently rejected by `parse_one_rule_or_subrule`.
+/// `SUB-RULE,<block-name>` (upstream also accepts a `(cond)` field that
+/// meow-rs does not implement). Any further comma-delimited fields after
+/// the block name are silently dropped by `parse_one_rule_or_subrule`.
 pub(crate) fn parse_sub_rule_reference(line: &str) -> Option<String> {
     let line = line.trim();
     if line.is_empty() || line.starts_with('#') {
@@ -113,8 +114,9 @@ pub(crate) fn parse_sub_rule_reference(line: &str) -> Option<String> {
     if rest.is_empty() {
         return None;
     }
-    // Trim any trailing comma-separated flags (we reject them at parse time,
-    // but for reference-graph building we just need the block name).
+    // Trailing comma-separated fields are silently dropped (upstream
+    // would take the last field as the block name) — for reference-graph
+    // building we just need the first field.
     Some(rest.split(',').next()?.trim().to_string())
 }
 

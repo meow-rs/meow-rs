@@ -2,7 +2,8 @@
 //!
 //! A `RuleSet` is a collection of rules loaded from an external source (file or
 //! HTTP) that can be referenced from the main rule list via a single
-//! `RULE-SET,<name>,<adapter>` entry. Three behaviors are supported:
+//! `RULE-SET,<name>,<adapter>[,no-resolve][,src]` entry. Three behaviors are
+//! supported:
 //!
 //! - `Domain` — payload is a list of domains / `+.domain` wildcards, stored
 //!   in a `DomainTrie` for O(log N) lookup.
@@ -534,8 +535,37 @@ impl<'a> ClassicalRuleSetBuilder<'a> {
         // Classical entries are `TYPE,PAYLOAD[,extra]` without an adapter.
         // The existing parser expects an adapter column, so splice a
         // placeholder in and discard it at match time (our wrapper owns
-        // the real adapter). A MATCH-only shorthand is unusual in
-        // classical sets and would be meaningless anyway.
+        // the real adapter).
+        //
+        // `MATCH` would splice into an always-true FinalRule and make the
+        // whole provider match every connection — upstream explicitly
+        // rejects MATCH/RULE-SET/SUB-RULE in classical sets (the latter
+        // two already fail as unknown types here), and `payloadToRule`
+        // rejects MATCH inside logic sub-rules at any depth (enforced in
+        // `parse_logic_rule`).
+        let mut fields = entry.splitn(3, ',');
+        let first_field = fields.next().map_or("", str::trim);
+        if first_field == "MATCH" {
+            return Err(format!(
+                "'{entry}': MATCH is not allowed in a classical rule-set"
+            ));
+        }
+        // An empty or missing payload silently degrades to match-all for
+        // the substring-match types (`DOMAIN-SUFFIX,` → ends_with(""),
+        // `DOMAIN-KEYWORD,` → contains("") — same as `FinalRule`). Same
+        // class as MATCH — reject loudly (Class B, ADR-0002).
+        if fields.next().map_or("", str::trim).is_empty() {
+            return Err(format!("'{entry}': missing payload"));
+        }
+        // Comma-safe upstream regex payloads cannot be spliced
+        // unambiguously — the truncated payload could still be a
+        // valid-but-different regex. Reject loudly (Class B, ADR-0002).
+        if first_field == "DOMAIN-REGEX" && fields.next().is_some() {
+            return Err(format!(
+                "'{entry}': {first_field} payloads containing commas are \
+                 not supported in a classical rule-set"
+            ));
+        }
         let patched = splice_placeholder_adapter(entry);
         match parse_rule(&patched, self.ctx) {
             Ok(rule) => {
@@ -599,6 +629,15 @@ impl RuleSet for ClassicalRuleSet {
 /// so it satisfies `parse_rule`'s `type,payload,adapter[,extra]` shape.
 fn splice_placeholder_adapter(entry: &str) -> String {
     const PLACEHOLDER: &str = "RULE-SET-PLACEHOLDER";
+    // Logic sub-rules carry their own parenthesised payload that must not
+    // be split on commas — append the placeholder at the end, same as
+    // `splice_inner_adapter` in parser.rs.
+    if let Some((ty, _)) = entry.split_once(',') {
+        let upper = ty.trim().to_ascii_uppercase();
+        if matches!(upper.as_str(), "AND" | "OR" | "NOT") {
+            return format!("{entry},{PLACEHOLDER}");
+        }
+    }
     let parts: Vec<&str> = entry.splitn(3, ',').collect();
     match parts.as_slice() {
         [ty, payload] => format!("{},{},{}", ty.trim(), payload.trim(), PLACEHOLDER),
@@ -636,6 +675,68 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         }
+    }
+
+    /// A `MATCH` entry in a classical payload must not splice into an
+    /// always-true `FinalRule` — that would make the whole provider match
+    /// every connection. Upstream rejects MATCH/RULE-SET/SUB-RULE in
+    /// classical sets.
+    #[test]
+    fn classical_rule_set_rejects_match_entry() {
+        let set = ClassicalRuleSet::from_entries(
+            &[
+                "MATCH,DIRECT".to_string(),
+                "DOMAIN-SUFFIX,ok.example".to_string(),
+            ],
+            &ParserContext::empty(),
+        );
+        // The MATCH entry is dropped; only the real entry can match.
+        assert!(!set.matches(&meta_host("nope.example"), &helper()));
+        assert!(set.matches(&meta_host("ok.example"), &helper()));
+
+        // Nested `MATCH` inside a logic entry must not slip through either
+        // — `OR,((MATCH,x),…)` would otherwise splice the inner MATCH into
+        // an always-true leg and match-all the provider anyway.
+        let set = ClassicalRuleSet::from_entries(
+            &[
+                "OR,((MATCH,DIRECT),(DOMAIN-SUFFIX,ok.example))".to_string(),
+                "DOMAIN-SUFFIX,fine.example".to_string(),
+            ],
+            &ParserContext::empty(),
+        );
+        assert_eq!(set.len(), 1, "the nested-MATCH entry must be dropped");
+        assert!(!set.matches(&meta_host("nope.example"), &helper()));
+        assert!(set.matches(&meta_host("fine.example"), &helper()));
+
+        // A comma-containing DOMAIN-REGEX payload cannot be represented —
+        // the entry must be rejected, not silently truncated to a
+        // different regex (`DOMAIN-REGEX,a,b` → regex "a").
+        let set = ClassicalRuleSet::from_entries(
+            &[
+                "DOMAIN-REGEX,a,b".to_string(),
+                "DOMAIN-SUFFIX,ok.example".to_string(),
+            ],
+            &ParserContext::empty(),
+        );
+        assert_eq!(set.len(), 1, "the ambiguous DOMAIN-REGEX must be dropped");
+        assert!(set.matches(&meta_host("ok.example"), &helper()));
+
+        // Empty/missing payloads must not silently degrade to match-all
+        // (`DOMAIN-SUFFIX,` → ends_with(""), `DOMAIN-KEYWORD,` →
+        // contains("") — same as `MATCH`).
+        let set = ClassicalRuleSet::from_entries(
+            &[
+                "DOMAIN-SUFFIX,".to_string(),
+                "DOMAIN-KEYWORD,".to_string(),
+                "DOMAIN-SUFFIX,ok.example".to_string(),
+            ],
+            &ParserContext::empty(),
+        );
+        assert_eq!(set.len(), 1, "empty-payload entries must be dropped");
+        // `nope.example` host present but the empty-suffix member is gone —
+        // without the guard the set would match every connection.
+        assert!(!set.matches(&meta_host(""), &helper()));
+        assert!(set.matches(&meta_host("ok.example"), &helper()));
     }
 
     #[test]

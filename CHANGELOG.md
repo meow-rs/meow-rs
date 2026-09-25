@@ -1104,3 +1104,40 @@ the canonical, in-repo source a release is cut from.
   unaffected. `read_packet` also reuses one lazily allocated frame buffer
   per connection instead of allocating a fresh 16 KiB vector per datagram
   (ADR-0008).
+
+- `RULE-SET,<name>,<adapter>,src` is now honoured instead of silently
+  ignored (#625 item 11). Upstream mihomo parses an `isSrc` option for
+  rule-set entries and the `IP-CIDR`/`IP-CIDR6`, `IP-SUFFIX`, `GEOIP`, and
+  `IP-ASN` leaf rules; meow-rs previously parsed the trailing flag but
+  still matched `dst_ip`, silently misrouting ported configs. The flag is
+  now implemented with upstream `SwapSrcDst` semantics: the provider's
+  dst-axis matchers evaluate the source tuple on a swapped metadata view,
+  `src` implies `no-resolve` (a source-axis match never demands a `dst_ip`
+  resolution it cannot use), and the same trailing `,src` flag is
+  accepted on the leaf rules — `IP-CIDR,x,DIRECT,src` is equivalent to
+  `SRC-IP-CIDR,x,DIRECT`. `,src` on a `domain`-behavior provider is an
+  upstream no-op for matching; meow-rs warns instead of silently ignoring
+  it. `src` rule-set entries stay on the rule-IR fallback path because
+  the `RuleSetRef` lowering carries only the set handle and cannot
+  express the swap. Source-axis `IP-ASN`/`IP-SUFFIX` rules now report
+  `SRC-IP-ASN`/`SRC-IP-SUFFIX` via `rule_type()` (upstream parity for
+  API `/rules` output), and `AND`/`OR`/`NOT` entries inside a
+  `classical`-behavior rule provider payload are parsed instead of being
+  warn-dropped — the placeholder adapter splice mangled the
+  parenthesised payload before. A `MATCH` entry in a classical payload
+  is now rejected for the same reason: it spliced into an always-true
+  `FinalRule` and silently made the whole provider match every
+  connection; a `MATCH` leg inside `AND`/`OR`/`NOT` is likewise rejected
+  at any depth (upstream `payloadToRule` parity), and entries with an
+  empty or missing payload (`DOMAIN-SUFFIX,`, `DOMAIN-KEYWORD,`, a bare
+  `DOMAIN-KEYWORD`) are rejected in classical sets and logic groups —
+  they would otherwise splice into always-true members (an empty
+  substring/suffix/regex matches everything). Logic-rule adapter
+  selection now mirrors upstream `ParseRulePayload` — the *last* field
+  after the parenthesised payload is the target, so a trailing
+  `AND,((A),(B)),Proxy,src` resolves adapter `src` (missing → warn +
+  skip) instead of either silently routing via `Proxy` on the
+  destination axis or folding `Proxy,src` into a dead adapter name.
+  `DOMAIN-REGEX` payloads containing commas are rejected inside logic
+  groups and classical rule-sets: upstream comma-protects them but our
+  grammar cannot, and truncating would silently match a different regex.
