@@ -331,6 +331,27 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **Startup bind/setup failures surface eagerly, not inside detached
+  tasks** (#641): the DNS server and the REST API used to bind their
+  sockets inside a spawned task, so an `EADDRINUSE`/sandbox-denied bind
+  surfaced as one log line while the process kept running with a dead
+  endpoint that nothing rebinds until the next `PUT /configs` — and the
+  API listener has no rebind path at all. Both sockets now bind eagerly
+  in the startup path: `dns.listen {addr}: {e}` and
+  `external-controller {addr}: {e}` exit the process non-zero, matching
+  how listener address-parse errors already fail fast (a deliberate
+  divergence from mihomo's warn-and-continue, recorded in
+  docs/migration-from-go-mihomo.md). `ApiServer` gains
+  `run_on(listener)` alongside `run()`, mirroring the listener crates'
+  split. The same class inside `listeners:` entries is fixed too: the
+  Shadowsocks UDP relay socket (`bind_udp`) and the TProxy firewall
+  rules + `IP_TRANSPARENT` UDP socket (`prepare`) now run before the
+  accept task is spawned — previously their failure dropped the
+  already-bound TCP socket with the dead task. Per-listener setup
+  failures stay tolerated (`error!` + skip that entry), matching the
+  array's one-bad-member semantic; a `dns.listen` set under
+  `dns.enable: false` now warns instead of silently doing nothing.
+
 - **Accept/recv loops back off on persistent socket errors** (#641):
   `accept()` and UDP `recv_from` error paths in the mixed, TProxy, and
   Shadowsocks listeners, the SOCKS5-UDP association, and the DNS server

@@ -275,7 +275,7 @@ fn raise_nofile_limit() {
 
 /// Fail fast when a stale process squats the port a spawned child is
 /// about to bind — `wait_for_port` alone cannot tell our listener from
-/// a squatter's, and meow treats listener bind failure as non-fatal
+/// a squatter's, and meow tolerates a `listeners:` bind failure
 /// (the child stays alive serving nothing).
 fn ensure_port_free(addr: SocketAddr, what: &str) -> anyhow::Result<()> {
     match std::net::TcpListener::bind(addr) {
@@ -613,8 +613,8 @@ async fn benchmark_target(
 
             // A stale responder still bound on the DNS port answers the
             // probe and W4 would measure IT, not the spawned child —
-            // the UDP squatter check has to run before spawn (meow
-            // survives a failed bind, so ensure_alive cannot catch it).
+            // the UDP squatter check runs before spawn so the failure is
+            // a clear message rather than the child's exit-on-bind-error.
             if let Err(e) = ensure_udp_port_free(dns_addr, "DNS proxy") {
                 eprintln!("[{target_name}] {e} — skipping W4");
                 None

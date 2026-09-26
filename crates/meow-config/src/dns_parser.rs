@@ -40,6 +40,9 @@ pub async fn parse_dns(
     let dns = match &raw.dns {
         Some(dns) if dns.enable.unwrap_or(false) => dns,
         _ => {
+            if raw.dns.as_ref().is_some_and(|d| d.listen.is_some()) {
+                warn!("dns.listen is set but dns.enable is false — no DNS listener is started");
+            }
             let hosts = build_hosts_trie(raw.hosts.as_ref(), strict)?;
             let use_hosts = raw.dns.as_ref().and_then(|d| d.use_hosts).unwrap_or(true);
             let resolver = Resolver::new(

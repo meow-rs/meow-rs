@@ -133,7 +133,21 @@ impl ApiServer {
         }
     }
 
+    /// Bind and serve in one call. Kept for callers that await `run()`
+    /// directly and can observe its error; embedders that spawn the serve
+    /// loop should bind themselves and use [`Self::run_on`] so bind
+    /// failures surface at startup instead of inside a detached task.
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let listener = tokio::net::TcpListener::bind(self.listen_addr).await?;
+        self.run_on(listener).await
+    }
+
+    /// Serve on a pre-bound listener (issue #641 — the startup path binds
+    /// eagerly so `EADDRINUSE` is a hard error, not a dead spawned task).
+    pub async fn run_on(
+        &self,
+        listener: tokio::net::TcpListener,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let state = Arc::new(routes::AppState {
             tunnel: self.tunnel.clone(),
             secret: self.secret.clone(),
@@ -153,9 +167,9 @@ impl ApiServer {
 
         let app = routes::create_router(state);
 
-        let listener = tokio::net::TcpListener::bind(self.listen_addr).await?;
-        info!("REST API listening on {}", self.listen_addr);
-        info!("Web UI available at http://{}/ui", self.listen_addr);
+        let bound = listener.local_addr().unwrap_or(self.listen_addr);
+        info!("REST API listening on {bound}");
+        info!("Web UI available at http://{bound}/ui");
         axum::serve(listener, app).await?;
         Ok(())
     }
