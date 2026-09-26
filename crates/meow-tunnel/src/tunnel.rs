@@ -133,9 +133,9 @@ pub struct TunnelInner {
 /// The lwIP contract allows only one live stack generation per process;
 /// the core finishes teardown only after every stack handle — including
 /// the split halves inside the device pumps — is dropped. Since an aborted
-/// parent task cannot await that reaping, `stop_tun`/`set_tun_handle`
-/// additionally await `core_done` so a successor generation cannot overlap
-/// a core still tearing down (issue #514).
+/// parent task cannot await that reaping, `stop_tun`/`set_tun_handle`/
+/// `teardown_tun_handle` additionally await `core_done` so a successor
+/// generation cannot overlap a core still tearing down (issue #514).
 pub struct TunHandle {
     /// The listener task — abort + await it to stop.
     pub task: tokio::task::JoinHandle<()>,
@@ -159,6 +159,27 @@ async fn await_core_done(mut rx: tokio::sync::watch::Receiver<bool>) {
     match tokio::time::timeout(TUN_TEARDOWN_WAIT, rx.wait_for(|done| *done)).await {
         Ok(Ok(_)) | Ok(Err(_)) => {}
         Err(_) => warn!("timed out waiting for lwIP core teardown; continuing"),
+    }
+}
+
+/// Abort a TUN listener's task and await real teardown — including the
+/// lwIP core's `core_done`, so a successor `NetStack::new` can never
+/// overlap this generation (issue #514). Shared by `stop_tun`,
+/// `set_tun_handle`'s previous-generation teardown, and
+/// `teardown_tun_handle` for handles that were never stored.
+async fn teardown_tun(handle: TunHandle) {
+    let TunHandle {
+        task, core_done, ..
+    } = handle;
+    task.abort();
+    // Await the parent: dropping its future drops the TaskGroup, which
+    // requests abort of the child tasks holding the device. The runtime
+    // reaps those tasks asynchronously — the lwIP core only finishes
+    // teardown once their stack halves drop, so await `core_done` too:
+    // this returns only once the generation is truly gone.
+    let _ = task.await;
+    if let Some(done) = core_done {
+        await_core_done(done).await;
     }
 }
 
@@ -931,24 +952,21 @@ impl Tunnel {
     pub async fn set_tun_handle(&self, handle: TunHandle) {
         let prev = self.inner.tun_handle.write().replace(handle);
         // parking_lot RwLock write guard is dropped here — safe to .await
-        if let Some(TunHandle {
-            task, core_done, ..
-        }) = prev
-        {
-            task.abort();
-            // Await the parent: dropping its future drops the TaskGroup,
-            // which requests abort of the child tasks holding the device.
-            // The runtime reaps those tasks asynchronously — the lwIP core
-            // only finishes teardown once their stack halves drop, so
-            // await `core_done` too: this returns only once the previous
-            // generation is truly gone.
-            let _ = task.await;
-            if let Some(done) = core_done {
-                await_core_done(done).await;
-            }
+        if let Some(prev) = prev {
+            teardown_tun(prev).await;
             info!("abandoned previous TUN listener");
         }
         info!("TUN listener handle stored");
+    }
+
+    /// Tear down a TUN listener handle that was never stored in the slot —
+    /// a startup that finished after the committed config already moved on
+    /// (#625): `stop_tun` operates on the *stored* slot and would kill a
+    /// successor a concurrent config mutation already installed. Same
+    /// abort + `core_done` teardown as the stored-slot paths.
+    pub async fn teardown_tun_handle(&self, handle: TunHandle) {
+        teardown_tun(handle).await;
+        info!("discarded a stale TUN listener");
     }
 
     /// Abort the running TUN listener, if any, and wait for teardown —
@@ -957,15 +975,8 @@ impl Tunnel {
     pub async fn stop_tun(&self) {
         let handle = self.inner.tun_handle.write().take();
         // parking_lot RwLock write guard is dropped here — safe to .await
-        if let Some(TunHandle {
-            task, core_done, ..
-        }) = handle
-        {
-            task.abort();
-            let _ = task.await;
-            if let Some(done) = core_done {
-                await_core_done(done).await;
-            }
+        if let Some(handle) = handle {
+            teardown_tun(handle).await;
             info!("TUN listener stopped");
         }
     }
@@ -1319,6 +1330,79 @@ mod tests {
             }
             tokio::task::yield_now().await;
         }
+        assert!(!tunnel.has_tun());
+    }
+
+    /// #625: a startup that finishes after the committed config moved on
+    /// must tear down *its* handle — abort + `core_done` wait — without
+    /// touching a handle the PUT path already stored.
+    #[tokio::test]
+    async fn teardown_tun_handle_leaves_stored_handle_untouched() {
+        let tunnel = test_tunnel();
+
+        // A stored listener — stands in for the successor a config
+        // mutation installed while startup was still bringing up.
+        let (stored_tx, stored_rx) = tokio::sync::oneshot::channel();
+        tunnel
+            .set_tun_handle(task_handle(tokio::spawn(async move {
+                let _ = stored_rx.await;
+            })))
+            .await;
+
+        // The stale startup generation: task + core_done watch. The task
+        // parks on a oneshot we resolve *before* spawning teardown, so by
+        // assertion time its JoinHandle is already resolved — a teardown
+        // that skipped `await_core_done` would then be finished, making
+        // the `!is_finished` assert pin the core_done wait strictly.
+        let (done_tx, done_rx) = tokio::sync::watch::channel(false);
+        let (drop_tx, mut drop_rx) = tokio::sync::oneshot::channel();
+        let (exit_tx, exit_rx) = tokio::sync::oneshot::channel::<()>();
+        let stale = TunHandle {
+            task: tokio::spawn(async move {
+                let _guard = DropSignal(Some(drop_tx));
+                let _ = exit_rx.await;
+            }),
+            core_done: Some(done_rx),
+            udp_flows: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        let _ = exit_tx.send(());
+        // Let the stale task run to completion so `task.await` inside
+        // teardown resolves immediately.
+        let mut exited = false;
+        for _ in 0..100 {
+            if drop_rx.try_recv().is_ok() {
+                exited = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(exited, "stale task exited");
+
+        // Teardown in a task so we can observe it pending on core_done.
+        let teardown = tokio::spawn({
+            let tunnel = tunnel.clone();
+            async move { tunnel.teardown_tun_handle(stale).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !teardown.is_finished(),
+            "teardown_tun_handle must wait on core_done"
+        );
+        assert!(
+            tunnel.has_tun(),
+            "stored successor must survive the stale teardown"
+        );
+
+        done_tx.send(true).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), teardown)
+            .await
+            .expect("teardown returns once core_done fires")
+            .unwrap();
+        assert!(tunnel.has_tun(), "stored successor still running");
+
+        // Clean shutdown of the stored handle.
+        let _ = stored_tx.send(());
+        tunnel.stop_tun().await;
         assert!(!tunnel.has_tun());
     }
     #[tokio::test(start_paused = true)]

@@ -1147,6 +1147,9 @@ async fn run(
     if config.tun.enable {
         #[cfg(feature = "listener-tun")]
         {
+            // Snapshot the TunConfig this generation is built from — the
+            // Ready arm re-validates against the *committed* config.
+            let startup_tun = config.tun.clone();
             let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
             let listener = TunListener::new(
                 tunnel.clone(),
@@ -1170,13 +1173,17 @@ async fn run(
                     core_done,
                     udp_flows,
                 })) => {
-                    tunnel
-                        .set_tun_handle(meow_tunnel::TunHandle {
+                    publish_tun_if_committed(
+                        &tunnel,
+                        &raw_config,
+                        &startup_tun,
+                        meow_tunnel::TunHandle {
                             task: handle,
                             core_done: Some(core_done),
                             udp_flows,
-                        })
-                        .await;
+                        },
+                    )
+                    .await;
                 }
                 Ok(Ok(meow_listener::TunReady::Failed(msg))) => {
                     if msg.contains("wintun.dll") {
@@ -1188,10 +1195,12 @@ async fn run(
                         );
                     }
                     handle.abort();
+                    rollback_tun_enable(&tunnel, &raw_config).await;
                 }
                 Ok(Err(_)) => {
                     error!("TUN listener readiness signal dropped unexpectedly");
                     handle.abort();
+                    rollback_tun_enable(&tunnel, &raw_config).await;
                 }
                 Err(_) => {
                     error!(
@@ -1199,6 +1208,7 @@ async fn run(
                         meow_api::TUN_STARTUP_TIMEOUT.as_secs()
                     );
                     handle.abort();
+                    rollback_tun_enable(&tunnel, &raw_config).await;
                 }
             }
         }
@@ -1216,6 +1226,87 @@ async fn run(
     info!("Shutting down...");
 
     Ok(())
+}
+
+/// #625: roll the committed `tun.enable` back to false after an initial
+/// startup failure — mirrors the PUT-path rollback in
+/// `swap_config_and_reconcile_tun` so the stored config never claims TUN
+/// is up when nothing runs, and a later same-config PUT retries off→on
+/// instead of early-returning on an unchanged diff.
+///
+/// Skips the write when a listener is already stored+running: while the
+/// lane is held no sibling spawn can be in flight, so a live handle can
+/// only belong to a `PUT /configs` that committed its own `tun:` section
+/// during our bring-up — that mutation owns the outcome, and clobbering
+/// its `enable` would re-create the very divergence this fix removes
+/// (a live device the committed config claims is off).
+#[cfg(feature = "listener-tun")]
+async fn rollback_tun_enable(tunnel: &Tunnel, raw_config: &RwLock<meow_config::raw::RawConfig>) {
+    let _mutation = meow_api::routes::CONFIG_MUTATION.lock().await;
+    rollback_committed_enable(tunnel, raw_config);
+}
+
+/// The lane-held core of [`rollback_tun_enable`], shared with
+/// [`publish_tun_if_committed`]'s died-before-publish arm (the lane is
+/// already held there — re-locking would deadlock).
+#[cfg(feature = "listener-tun")]
+fn rollback_committed_enable(tunnel: &Tunnel, raw_config: &RwLock<meow_config::raw::RawConfig>) {
+    if tunnel.has_tun() {
+        return;
+    }
+    if let Some(ref mut tun) = raw_config.write().tun {
+        tun.enable = false;
+        warn!("tun.enable rolled back to false (startup failed)");
+    }
+}
+
+/// #625: publish a freshly-ready TUN handle only when the *committed*
+/// config still asks for exactly the TunConfig this generation was built
+/// from. A `PUT /configs` during bring-up commits before this runs — its
+/// `stop_tun` no-ops on the empty slot, and a committed `enable: false`
+/// (or a different `tun:` section whose own reconcile already spawned a
+/// replacement) would end up shadowed by this stale generation. The
+/// re-check runs inside the CONFIG_MUTATION lane; on mismatch the stale
+/// handle is torn down without touching the stored slot. A listener that
+/// sent `Ready` but already exited is likewise torn down and rolled back
+/// rather than stored dead. The `TunConfig` compare is section-only, but
+/// that is sufficient: a same-config PUT restart (e.g. fake-IP change)
+/// serializes through this lane and the listener's single-core gate, so
+/// a survivor here can't silently embed different resolver-era inputs.
+#[cfg(feature = "listener-tun")]
+async fn publish_tun_if_committed(
+    tunnel: &Tunnel,
+    raw_config: &RwLock<meow_config::raw::RawConfig>,
+    startup_tun: &meow_config::TunConfig,
+    tun_handle: meow_tunnel::TunHandle,
+) {
+    let _mutation = meow_api::routes::CONFIG_MUTATION.lock().await;
+    let still_current = {
+        let committed = raw_config.read();
+        committed.tun.as_ref().is_some_and(|t| t.enable)
+            && meow_config::parse_tun_config(committed.tun.as_ref(), committed.max_connections)
+                .is_ok_and(|c| c == *startup_tun)
+    };
+    if !still_current {
+        warn!(
+            "TUN startup finished after the committed config \
+             moved on — tearing down the stale device"
+        );
+        tunnel.teardown_tun_handle(tun_handle).await;
+        return;
+    }
+    if tun_handle.task.is_finished() {
+        // The listener sent `Ready` then died before we could publish it
+        // (pump/device failure post-ready, or a long lane wait). Storing
+        // it would commit `enable: true` over a dead handle and the next
+        // same-config PUT would early-return on the unchanged diff —
+        // treat it exactly like a startup failure.
+        warn!("TUN listener reported ready then exited before its handle was stored");
+        tunnel.teardown_tun_handle(tun_handle).await;
+        rollback_committed_enable(tunnel, raw_config);
+        return;
+    }
+    tunnel.set_tun_handle(tun_handle).await;
 }
 
 #[cfg(test)]
@@ -1311,5 +1402,253 @@ mod tests {
         assert!(log.contains("meow-rs stopped with an error"), "{log}");
         assert!(log.contains("Failed to load GeoIP database"), "{log}");
         assert!(log.contains("GEOIP,CN,DIRECT"), "{log}");
+    }
+
+    /// #625: initial TUN startup vs. `PUT /configs` — the Ready arm must
+    /// only publish while the committed config still wants this exact
+    /// generation, and startup failures must roll back committed
+    /// `tun.enable`.
+    #[cfg(feature = "listener-tun")]
+    mod tun_startup {
+        use crate::{publish_tun_if_committed, rollback_tun_enable};
+        use meow_common::DnsMode;
+        use meow_config::raw::RawConfig;
+        use meow_dns::Resolver;
+        use meow_trie::DomainTrie;
+        use meow_tunnel::{TunHandle, Tunnel};
+        use parking_lot::RwLock;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Arc;
+
+        fn test_tunnel() -> Tunnel {
+            Tunnel::new(Arc::new(Resolver::new(
+                vec!["8.8.8.8:53".parse().unwrap()],
+                vec![],
+                DnsMode::Normal,
+                DomainTrie::new(),
+                true,
+                true,
+            )))
+        }
+
+        fn raw_with_tun(yaml: &str) -> Arc<RwLock<RawConfig>> {
+            let raw: RawConfig = serde_yaml::from_str(yaml).unwrap();
+            Arc::new(RwLock::new(raw))
+        }
+
+        fn startup_tun(raw: &RwLock<RawConfig>) -> meow_config::TunConfig {
+            let guard = raw.read();
+            meow_config::parse_tun_config(guard.tun.as_ref(), guard.max_connections).unwrap()
+        }
+
+        /// A pending listener task plus a drop signal proving teardown.
+        fn pending_handle() -> (TunHandle, tokio::sync::oneshot::Receiver<()>) {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let handle = TunHandle {
+                task: tokio::spawn(async move {
+                    let _tx = tx;
+                    std::future::pending::<()>().await;
+                }),
+                core_done: None,
+                udp_flows: Arc::new(AtomicUsize::new(0)),
+            };
+            (handle, rx)
+        }
+
+        #[tokio::test]
+        async fn publishes_when_committed_config_is_unchanged() {
+            let tunnel = test_tunnel();
+            let raw = raw_with_tun("tun:\n  enable: true\n  mtu: 1500\n");
+            let startup = startup_tun(&raw);
+            let (handle, _drop_rx) = pending_handle();
+
+            publish_tun_if_committed(&tunnel, &raw, &startup, handle).await;
+            assert!(tunnel.has_tun(), "matching committed config → stored");
+
+            tunnel.stop_tun().await;
+        }
+
+        #[tokio::test]
+        async fn tears_down_when_committed_disabled_tun() {
+            let tunnel = test_tunnel();
+            // The PUT committed `enable: false` while startup was pending.
+            let raw = raw_with_tun("tun:\n  enable: false\n");
+            let startup = meow_config::TunConfig {
+                enable: true,
+                ..meow_config::TunConfig::default()
+            };
+            let (handle, mut drop_rx) = pending_handle();
+
+            publish_tun_if_committed(&tunnel, &raw, &startup, handle).await;
+            // Assert !has_tun first — under a regression to unconditional
+            // store this fails instead of hanging on the channel.
+            assert!(!tunnel.has_tun(), "stale generation must not publish");
+            // Teardown awaited the task → its drop guard already fired.
+            assert!(
+                matches!(
+                    drop_rx.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+                ),
+                "stale task was aborted"
+            );
+        }
+
+        #[tokio::test]
+        async fn tears_down_when_committed_tun_changed() {
+            let tunnel = test_tunnel();
+            // The PUT committed a different `tun:` section and installed
+            // its own generation — the stale startup handle must die
+            // without evicting the stored successor.
+            let raw = raw_with_tun("tun:\n  enable: true\n  mtu: 9000\n");
+            let (successor, mut keep_rx) = pending_handle();
+            tunnel.set_tun_handle(successor).await;
+
+            let startup = meow_config::TunConfig {
+                enable: true,
+                mtu: 1500,
+                ..meow_config::TunConfig::default()
+            };
+            let (stale, _stale_rx) = pending_handle();
+
+            publish_tun_if_committed(&tunnel, &raw, &startup, stale).await;
+            assert!(
+                tunnel.has_tun(),
+                "successor installed by the PUT must survive"
+            );
+            // The successor's task must still own its drop guard —
+            // `Empty` (alive, unsent) proves it wasn't aborted; under the
+            // old unconditional-store path the stale handle would have
+            // replaced and killed it (`Closed`).
+            assert!(
+                matches!(
+                    keep_rx.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                ),
+                "stored successor must not be torn down"
+            );
+
+            tunnel.stop_tun().await;
+        }
+
+        #[tokio::test]
+        async fn tears_down_when_tun_section_removed() {
+            let tunnel = test_tunnel();
+            // Committed config dropped the `tun:` key entirely.
+            let raw = raw_with_tun("mixed-port: 7890\n");
+            let startup = meow_config::TunConfig::default();
+            let (handle, _rx) = pending_handle();
+
+            publish_tun_if_committed(&tunnel, &raw, &startup, handle).await;
+            assert!(!tunnel.has_tun());
+        }
+
+        #[tokio::test]
+        async fn startup_failure_rolls_back_committed_enable() {
+            let tunnel = test_tunnel();
+            let raw = raw_with_tun("tun:\n  enable: true\n  mtu: 1500\n");
+            rollback_tun_enable(&tunnel, &raw).await;
+            assert!(!raw.read().tun.as_ref().unwrap().enable);
+        }
+
+        #[tokio::test]
+        async fn rollback_is_noop_without_tun_section() {
+            let tunnel = test_tunnel();
+            let raw = raw_with_tun("mixed-port: 7890\n");
+            rollback_tun_enable(&tunnel, &raw).await;
+            assert!(raw.read().tun.is_none());
+        }
+
+        /// #625 mirror: a sibling PUT that installed its own listener
+        /// during our bring-up owns the committed config — our startup
+        /// failure must not flip its `enable` off under a live device.
+        #[tokio::test]
+        async fn rollback_skipped_while_sibling_listener_is_live() {
+            let tunnel = test_tunnel();
+            let raw = raw_with_tun("tun:\n  enable: true\n  mtu: 9000\n");
+            let (successor, _keep) = pending_handle();
+            tunnel.set_tun_handle(successor).await;
+
+            rollback_tun_enable(&tunnel, &raw).await;
+            assert!(
+                raw.read().tun.as_ref().unwrap().enable,
+                "sibling-owned committed config must not be clobbered"
+            );
+            assert!(tunnel.has_tun());
+
+            tunnel.stop_tun().await;
+        }
+
+        /// A handle whose task already exited — the listener sent Ready
+        /// then died before publish could store it.
+        fn finished_handle() -> TunHandle {
+            TunHandle {
+                task: tokio::spawn(async {}),
+                core_done: None,
+                udp_flows: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        /// Storing a dead handle would commit `enable: true` over nothing
+        /// running and stick (a same-config PUT early-returns) — treat it
+        /// as a startup failure instead.
+        #[tokio::test]
+        async fn dead_ready_handle_rolls_back_instead_of_storing() {
+            let tunnel = test_tunnel();
+            let raw = raw_with_tun("tun:\n  enable: true\n  mtu: 1500\n");
+            let startup = startup_tun(&raw);
+
+            // Let the task actually reap before publish observes it.
+            let handle = finished_handle();
+            for _ in 0..100 {
+                if handle.task.is_finished() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert!(handle.task.is_finished());
+
+            publish_tun_if_committed(&tunnel, &raw, &startup, handle).await;
+            assert!(!tunnel.has_tun(), "dead handle must not be stored");
+            assert!(
+                !raw.read().tun.as_ref().unwrap().enable,
+                "dead-before-publish is a startup failure → rolled back"
+            );
+        }
+
+        /// Dead gen-A + live sibling B (a same-config PUT that respawned):
+        /// A must not evict B, and rollback must skip B's committed
+        /// enable.
+        #[tokio::test]
+        async fn dead_ready_handle_preserves_live_sibling() {
+            let tunnel = test_tunnel();
+            let raw = raw_with_tun("tun:\n  enable: true\n  mtu: 1500\n");
+            let startup = startup_tun(&raw);
+            let (successor, mut keep_rx) = pending_handle();
+            tunnel.set_tun_handle(successor).await;
+
+            let stale = finished_handle();
+            for _ in 0..100 {
+                if stale.task.is_finished() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+
+            publish_tun_if_committed(&tunnel, &raw, &startup, stale).await;
+            assert!(tunnel.has_tun(), "live sibling must survive");
+            assert!(
+                matches!(
+                    keep_rx.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                ),
+                "sibling task still owns its guard"
+            );
+            assert!(
+                raw.read().tun.as_ref().unwrap().enable,
+                "sibling's committed enable stays true"
+            );
+
+            tunnel.stop_tun().await;
+        }
     }
 }

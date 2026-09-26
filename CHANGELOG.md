@@ -1141,3 +1141,26 @@ the canonical, in-repo source a release is cut from.
   `DOMAIN-REGEX` payloads containing commas are rejected inside logic
   groups and classical rule-sets: upstream comma-protects them but our
   grammar cannot, and truncating would silently match a different regex.
+
+- TUN startup is now serialized with `PUT /configs` and rolls back on
+  failure (#625 item 4). Initial bring-up waits up to
+  `TUN_STARTUP_TIMEOUT` (300 s) for device readiness while holding no
+  lock; a concurrent config mutation committed `tun.enable: false` and
+  its `stop_tun` no-opped on the still-empty handle slot, so the late
+  `Ready` published a live device the committed config said was down —
+  the committed config diverged from the running state — and a changed
+  `tun:` section left two lwIP generations racing. The Ready arm now re-reads
+  the committed config inside the `CONFIG_MUTATION` lane: the handle is
+  only stored when the committed section still asks for exactly what was
+  built; otherwise the stale listener is torn down (abort + `core_done`,
+  same teardown as `stop_tun`) without evicting a successor the mutation
+  already installed. Startup failures — `TunReady::Failed`, a dropped
+  readiness channel, or timeout — now also roll committed `tun.enable`
+  back to `false` (the same rollback `PUT /configs` already had), so the
+  stored config never claims TUN is up when nothing runs and a later
+  same-config PUT retries off→on instead of early-returning on an
+  unchanged diff. The rollback is skipped when a concurrent mutation
+  already installed a live listener — that sibling owns the committed
+  `tun:` section. A `Ready` whose task exits before publication is
+  treated as a startup failure (teardown + rollback) rather than stored
+  as a dead handle.
