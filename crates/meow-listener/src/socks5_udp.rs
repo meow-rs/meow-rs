@@ -29,7 +29,7 @@ use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::mpsc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::monotonic_ms;
 
@@ -119,6 +119,11 @@ pub async fn handle_udp_associate(
     };
     let mut sweeper = tokio::time::interval(NAT_SWEEP_INTERVAL);
     sweeper.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // A persistent recv failure must not spin the select; the in-arm sleep
+    // stalls the sibling arms at most ~1s while a persistently-erroring
+    // socket can do no useful work anyway. Per-packet errors (ICMP async
+    // delivery) skip the delay inside `failed`.
+    let mut recv_backoff = meow_common::ErrorBackoff::new();
 
     loop {
         tokio::select! {
@@ -131,8 +136,20 @@ pub async fn handle_udp_associate(
             }
             r = relay.recv_from(&mut buf) => {
                 let (n, client) = match r {
-                    Ok(v) => v,
-                    Err(e) => { debug!("SOCKS5 UDP recv error: {e}"); continue; }
+                    Ok(v) => {
+                        recv_backoff.succeeded();
+                        v
+                    }
+                    Err(e) => {
+                        // Loud only when the backoff engaged — per-packet
+                        // async-ICMP errors stay at debug!.
+                        if recv_backoff.failed(&e).await {
+                            warn!("SOCKS5 UDP recv error: {e}");
+                        } else {
+                            debug!("SOCKS5 UDP recv error: {e}");
+                        }
+                        continue;
+                    }
                 };
                 if client.ip() != src_addr.ip() {
                     debug!("SOCKS5 UDP ignoring source {client}: TCP peer is {src_addr}");

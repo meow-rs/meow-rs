@@ -957,11 +957,23 @@ impl BoundDnsServer {
         let in_flight = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
 
         let mut buf = vec![0u8; 4096];
+        // A persistent recv failure must not spin the loop or flood the log;
+        // a transient one must not be delayed meaningfully.
+        let mut recv_backoff = meow_common::ErrorBackoff::new();
         loop {
             let (len, src) = match socket.recv_from(&mut buf).await {
-                Ok(v) => v,
+                Ok(v) => {
+                    recv_backoff.succeeded();
+                    v
+                }
                 Err(e) => {
-                    error!("DNS recv error: {}", e);
+                    // Loud only when the backoff engaged — per-packet
+                    // async-ICMP errors stay at debug!.
+                    if recv_backoff.failed(&e).await {
+                        error!("DNS recv error: {}", e);
+                    } else {
+                        debug!("DNS recv error: {}", e);
+                    }
                     continue;
                 }
             };

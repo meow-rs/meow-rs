@@ -200,9 +200,10 @@ impl TProxyListener {
                 let udp_max = self.max_connections;
                 let udp_name = self.name.clone();
                 let udp_port = bound_addr.port();
+                // `run_udp` retries socket errors internally and only ends
+                // via abort — there is no error return to surface here.
                 tokio::spawn(async move {
-                    let name = udp_name.clone();
-                    if let Err(e) = udp::run_udp(
+                    udp::run_udp(
                         udp_tunnel,
                         udp_socket,
                         udp_timeout,
@@ -210,10 +211,7 @@ impl TProxyListener {
                         udp_name,
                         udp_port,
                     )
-                    .await
-                    {
-                        error!("tproxy UDP receive loop for '{name}' failed: {e}");
-                    }
+                    .await;
                 });
                 info!(
                     "TProxy listener '{}': UDP TPROXY active on {} (external rules \
@@ -312,6 +310,9 @@ where
         None
     };
     let mut warned_saturated = false;
+    // A persistent accept failure (fd exhaustion) must not spin the loop
+    // or flood the log; a transient one must not be delayed meaningfully.
+    let mut accept_backoff = meow_common::ErrorBackoff::new();
 
     loop {
         let permit = if let Some(sem) = &conn_limit {
@@ -337,16 +338,24 @@ where
             None
         };
 
-        // Log-and-continue on accept errors (matching mixed.rs) rather than
-        // propagating: a transient EMFILE/ECONNABORTED must not tear down
-        // `run_on`'s `_firewall` guard and take the redirect rules with it.
-        // Logged at error! (not debug!) so fd-exhaustion events are visible
-        // at default log levels, mirroring mixed.rs's accept-error handling.
+        // Log, back off, and continue on accept errors (matching mixed.rs)
+        // rather than propagating: a transient EMFILE/ECONNABORTED must not
+        // tear down `run_on`'s `_firewall` guard and take the redirect rules
+        // with it. Loud only when the backoff engaged (socket-level failure,
+        // error! so fd-exhaustion events are visible at default log levels);
+        // per-connection errors are queue progress and stay at debug!.
         let (stream, src_addr) = match listener.accept().await {
-            Ok(v) => v,
+            Ok(v) => {
+                accept_backoff.succeeded();
+                v
+            }
             Err(e) => {
-                error!("TProxy listener '{}' accept error: {e}", name);
                 drop(permit);
+                if accept_backoff.failed(&e).await {
+                    error!("TProxy listener '{}' accept error: {e}", name);
+                } else {
+                    debug!("TProxy listener '{}' accept error: {e}", name);
+                }
                 continue;
             }
         };

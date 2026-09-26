@@ -36,7 +36,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::DEFAULT_HANDSHAKE_TIMEOUT;
 
@@ -233,6 +233,9 @@ impl ShadowsocksListener {
         F: Fn(TcpStream) -> S + Clone + Send + Sync + 'static,
     {
         let mut warned_saturated = false;
+        // A persistent accept failure (fd exhaustion) must not spin the loop
+        // or flood the log; a transient one must not be delayed meaningfully.
+        let mut accept_backoff = meow_common::ErrorBackoff::new();
         loop {
             // Acquire a concurrency slot (back-pressures the listen queue when
             // the cap is reached), mirroring MixedListener.
@@ -260,10 +263,19 @@ impl ShadowsocksListener {
             };
 
             let (ss, peer) = match pl.accept_map(map.clone()).await {
-                Ok(v) => v,
+                Ok(v) => {
+                    accept_backoff.succeeded();
+                    v
+                }
                 Err(e) => {
-                    debug!("ss listener '{}' accept error: {}", self.name, e);
                     drop(permit);
+                    // Loud only when the backoff engaged — per-connection
+                    // errors are queue progress and stay at debug!.
+                    if accept_backoff.failed(&e).await {
+                        error!("ss listener '{}' accept error: {}", self.name, e);
+                    } else {
+                        debug!("ss listener '{}' accept error: {}", self.name, e);
+                    }
                     continue;
                 }
             };
@@ -367,6 +379,7 @@ use meow_tunnel::udp::DEFAULT_UDP_IDLE;
 use meow_tunnel::TunnelInner;
 use shadowsocks::context::SharedContext;
 use shadowsocks::relay::udprelay::options::UdpSocketControlData;
+use shadowsocks::relay::udprelay::proxy_socket::ProxySocketError;
 use shadowsocks::relay::udprelay::{DatagramReceive, DatagramSend};
 use smallvec::SmallVec;
 use smol_str::SmolStr;
@@ -568,7 +581,8 @@ fn session_is_live(session: &ClientSession, now: Uint) -> bool {
 
 /// Run the SS UDP relay: decrypt inbound datagrams, route each through the
 /// tunnel (rule match → `dial_udp`), and relay replies back encrypted to the
-/// originating peer. Runs until the socket errors out (process lifetime).
+/// originating peer. Runs until the task is aborted (process lifetime) —
+/// socket-level recv errors retry with `ErrorBackoff` rather than terminate.
 ///
 /// `max_flows` caps the concurrent `(peer, target)` flow table (`0` =
 /// uncapped), mirroring the TCP accept loop's `max_connections` — each flow
@@ -624,6 +638,12 @@ async fn run_udp_relay<S>(
     sweeper.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let idle_ms = DEFAULT_UDP_IDLE.as_millis() as u64;
     let mut warned_saturated = false;
+    // A persistent recv failure must not spin the select; the in-arm sleep
+    // stalls the sweeper arm at most ~1s while a persistently-erroring
+    // socket can do no useful work anyway. Per-packet errors (protocol
+    // decode failures, ICMP async delivery) skip the delay — each consumed
+    // a datagram, so the loop is still making progress.
+    let mut recv_backoff = meow_common::ErrorBackoff::new();
 
     loop {
         // No `biased`: the recv arm is permanently ready under sustained
@@ -632,9 +652,27 @@ async fn run_udp_relay<S>(
         tokio::select! {
             r = sock.recv_from_with_ctrl(&mut buf) => {
                 let (n, peer, target, _recv_total, control) = match r {
-                    Ok(v) => v,
+                    Ok(v) => {
+                        recv_backoff.succeeded();
+                        v
+                    }
                     Err(e) => {
-                        debug!("ss udp '{}' recv error: {e}", in_name);
+                        // `IoError` is the socket-level variant — warn! only
+                        // when the backoff actually slept (per-packet
+                        // async-ICMP errors ride the same variant, and each
+                        // protocol/decode failure already consumed a
+                        // datagram = progress): both stay at debug!.
+                        let socket_failed = match &e {
+                            ProxySocketError::IoError(io_err) => {
+                                recv_backoff.failed(io_err).await
+                            }
+                            _ => false,
+                        };
+                        if socket_failed {
+                            warn!("ss udp '{}' recv error: {e}", in_name);
+                        } else {
+                            debug!("ss udp '{}' recv error: {e}", in_name);
+                        }
                         continue;
                     }
                 };

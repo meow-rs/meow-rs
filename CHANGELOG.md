@@ -331,6 +331,21 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **Accept/recv loops back off on persistent socket errors** (#641):
+  `accept()` and UDP `recv_from` error paths in the mixed, TProxy, and
+  Shadowsocks listeners, the SOCKS5-UDP association, and the DNS server
+  used to `continue` immediately — under fd exhaustion (`EMFILE`) or a
+  wedged socket that hot-spins a worker thread and floods the log (the
+  accept loops also churned a wasted inbound permit per iteration). Errors
+  now retry with a shared `ErrorBackoff` (10 ms, doubling to a 1 s cap,
+  reset on the first success) and log loudly only when a socket-level
+  delay engaged. Per-connection errors stay exempt: `ECONNABORTED`, the
+  Linux `accept(2)` pending-network-error set (`ENETUNREACH`/`EPROTO`/…),
+  and ICMP async errors on UDP recv each consumed a queue entry — real
+  progress — so delaying them would only throttle a healthy socket. As a
+  side fix the TProxy UDP loop no longer terminates the whole ingress
+  path on one transient `ENOBUFS`; it retries with the same backoff.
+
 - **`SUB-RULE,<name>` rejects trailing comma fields** (#625 item 17):
   `SUB-RULE,blk,junk` used to resolve `blk` with the rest silently
   dropped — a typo could name a block other than the intended one. The
