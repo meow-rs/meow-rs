@@ -141,10 +141,10 @@ impl ShadowsocksListener {
             return Ok(None);
         }
         let udp_cfg = ServerConfig::new(bound, self.password.clone(), self.method)
-            .map_err(|e| meow_common::MeowError::Config(format!("ss udp bind: {e}")))?;
+            .map_err(|e| meow_common::MeowError::Config(format!("udp server config: {e}")))?;
         let udp_sock = shadowsocks::ProxySocket::bind(Arc::clone(&self.ctx), &udp_cfg)
             .await
-            .map_err(|e| format!("ss listener '{}': udp bind failed: {e}", self.name))?;
+            .map_err(|e| format!("udp bind failed: {e}"))?;
         info!(
             "Shadowsocks listener '{}' UDP on {} (cipher={})",
             self.name, bound, self.method
@@ -188,7 +188,9 @@ impl ShadowsocksListener {
             // Convert the already-bound tokio listener into the shadowsocks
             // crate's listener wrapper (preserves the OS-assigned port for
             // `port: 0` ephemeral listeners). AcceptOpts::default() keeps the
-            // system TCP defaults (no TFO/MPTCP forcing).
+            // system TCP defaults (no TFO/MPTCP forcing) — with TFO off the
+            // only fallible step in `from_listener` is unreachable, so this
+            // `?` cannot fire today.
             let ss_listener =
                 SsTcpListener::from_listener(listener, shadowsocks::net::AcceptOpts::default())?;
             ProxyListener::from_listener(Arc::clone(&self.ctx), ss_listener, self.svr_cfg.as_ref())

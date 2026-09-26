@@ -48,10 +48,10 @@ pub struct TProxyListener {
 /// [`TProxyListener::prepare`] and [`TProxyListener::run_on`]. `Drop` on
 /// the firewall guard tears the rules down.
 struct Prepared {
-    /// Address the setup was performed against — `run_on` asserts the
-    /// served socket resolves to the same address so firewall rules and
-    /// the transparent UDP socket can't silently land on a different
-    /// port than the TCP listener.
+    /// Address the setup was performed against — `run_on` rejects the
+    /// served socket if it resolves to a different address, so firewall
+    /// rules and the transparent UDP socket can't silently land on a
+    /// different port than the TCP listener.
     bound_addr: SocketAddr,
     firewall: Option<FirewallGuard>,
     /// Bound `IP_TRANSPARENT` UDP socket (Linux `udp: true` only).
@@ -116,21 +116,31 @@ impl TProxyListener {
     /// system (issue #563): the listener only accepts TCP REDIRECT'd
     /// connections and recovers the original destination; no nftables/pf
     /// rules are installed, probed, or cleaned up. Default `true`.
+    /// Call before [`Self::prepare`] — mutating after prepare discards
+    /// the prepared firewall artifacts (guard dropped → rules removed).
     pub fn with_firewall(mut self, enabled: bool) -> Self {
         self.firewall = enabled;
+        self.prepared = None;
         self
     }
 
     /// Enable the Linux UDP TPROXY datagram path on the listener's port
     /// (issue #564). `udp_timeout` is the per-flow idle timeout. Linux-only
     /// and external-firewall-only in this release — both are enforced at
-    /// config-parse and again at `run_on`.
+    /// config-parse and again at [`Self::prepare`]. Call before `prepare`
+    /// — mutating after prepare discards the prepared artifacts.
     pub fn with_udp(mut self, enabled: bool, udp_timeout: std::time::Duration) -> Self {
         self.udp = enabled;
         self.udp_timeout = udp_timeout;
+        self.prepared = None;
         self
     }
 
+    /// Bind on `listen_addr` and serve — performs the fallible firewall/
+    /// UDP setup internally via [`Self::prepare`]. Callers that spawn
+    /// this in a detached task should instead bind the socket, call
+    /// `prepare`, and spawn [`Self::run_on`] so setup failures surface
+    /// at spawn time (issue #641).
     pub async fn run(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Bind first so a port-0 listen can resolve to the OS-assigned port
         // before firewall rules are installed against it.
@@ -145,7 +155,8 @@ impl TProxyListener {
     /// `bound_addr` is the resolved listen addr (post port-0 resolution)
     /// — it must be the `local_addr()` of the socket later passed to
     /// [`Self::run_on`], or the prepared firewall/UDP artifacts would
-    /// target a different port than the one accepting TCP (debug-asserted).
+    /// target a different port than the one accepting TCP (`run_on`
+    /// returns a hard error on mismatch).
     pub async fn prepare(
         mut self,
         bound_addr: SocketAddr,
@@ -175,24 +186,35 @@ impl TProxyListener {
         }
 
         let firewall = if self.firewall {
-            let bypass_ips = collect_proxy_server_ips(&self.tunnel);
-            Some(
-                FirewallGuard::setup(bound_addr.port(), self.routing_mark, &bypass_ips).map_err(
-                    |e| -> Box<dyn std::error::Error + Send + Sync> {
-                        // `firewall: false` is only a remedy where orig-dest
-                        // recovery can work — on other platforms the external
-                        // gate above refuses too, so don't send users down a
-                        // dead end.
-                        #[cfg(any(target_os = "macos", target_os = "linux"))]
-                        let e = format!(
-                            "{e} — to manage firewall rules externally (no nft/pfctl \
-                             required), declare this listener under `listeners:` \
-                             with `firewall: false`"
-                        );
-                        e.into()
-                    },
-                )?,
-            )
+            // `collect_proxy_server_ips` does blocking `getaddrinfo` per
+            // domain-shaped upstream and `FirewallGuard::setup` shells out
+            // to nft/pfctl — keep both off the async startup path's worker
+            // so a slow resolver doesn't serialize the listener loop.
+            let tunnel = self.tunnel.clone();
+            let port = bound_addr.port();
+            let routing_mark = self.routing_mark;
+            let guard = tokio::task::spawn_blocking(move || {
+                let bypass_ips = collect_proxy_server_ips(&tunnel);
+                FirewallGuard::setup(port, routing_mark, &bypass_ips)
+            })
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("firewall setup task: {e}").into()
+            })?
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                // `firewall: false` is only a remedy where orig-dest
+                // recovery can work — on other platforms the external
+                // gate above refuses too, so don't send users down a
+                // dead end.
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                let e = format!(
+                    "{e} — to manage firewall rules externally (no nft/pfctl \
+                     required), declare this listener under `listeners:` \
+                     with `firewall: false`"
+                );
+                e.into()
+            })?;
+            Some(guard)
         } else {
             None
         };
@@ -235,7 +257,8 @@ impl TProxyListener {
     /// so ephemeral listeners redirect correctly. Runs [`Self::prepare`]
     /// internally when the caller didn't — embedders that spawn this in a
     /// detached task should `prepare` first so setup failures surface at
-    /// spawn time.
+    /// spawn time. Errors when a caller-`prepare`d listener is served a
+    /// socket whose `local_addr()` differs from the prepared address.
     pub async fn run_on(
         mut self,
         listener: TcpListener,
@@ -245,12 +268,14 @@ impl TProxyListener {
             self = self.prepare(bound_addr).await?;
         }
         let prepared = self.prepared.take().expect("prepare fills the slot");
-        debug_assert_eq!(
-            prepared.bound_addr, bound_addr,
-            "TProxyListener::prepare was run against a different address \
-             than the socket passed to run_on — firewall rules/UDP socket \
-             would bind the wrong port"
-        );
+        if prepared.bound_addr != bound_addr {
+            return Err(format!(
+                "TProxyListener::prepare ran against {} but run_on serves {} — \
+                 firewall rules/UDP socket would bind the wrong port",
+                prepared.bound_addr, bound_addr
+            )
+            .into());
+        }
         // The guard keeps the managed ruleset alive for the loop's lifetime.
         let _firewall = prepared.firewall;
 
@@ -920,6 +945,48 @@ mod tests {
             logs.contains("external firewall management"),
             "external mode must disclose itself in the startup log, got: {logs}"
         );
+    }
+
+    /// `prepare(A)` then `run_on(socket bound to B)` must hard-error —
+    /// the prepared firewall/UDP artifacts would otherwise silently
+    /// target a port nothing accepts on (#641 review follow-up).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn run_on_rejects_prepared_addr_mismatch() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let resolver = std::sync::Arc::new(meow_dns::Resolver::new(
+                    vec![],
+                    vec![],
+                    meow_common::DnsMode::Normal,
+                    meow_trie::DomainTrie::new(),
+                    false,
+                    true,
+                ));
+                let tunnel = meow_tunnel::Tunnel::new(resolver);
+
+                let socket_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr_a = socket_a.local_addr().unwrap();
+                let socket_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+
+                let listener =
+                    TProxyListener::new(tunnel, addr_a, false, None, "mismatch".to_string())
+                        .with_firewall(false)
+                        .prepare(addr_a)
+                        .await
+                        .expect("prepare with firewall:false cannot fail");
+                let err = listener
+                    .run_on(socket_b)
+                    .await
+                    .expect_err("a mismatched socket must be rejected");
+                assert!(
+                    err.to_string().contains("wrong port"),
+                    "unexpected error: {err}"
+                );
+            });
     }
 
     /// The inverse contract on platforms without orig-dest recovery:
