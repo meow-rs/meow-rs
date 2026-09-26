@@ -433,6 +433,17 @@ impl ProxyRegistry {
     pub fn downgrade(&self) -> Weak<RegistryCell> {
         Arc::downgrade(&self.proxies)
     }
+
+    /// Resolve `name` against the currently published snapshot — `None` when
+    /// no generation has been published yet or the name is absent. For
+    /// one-shot lookups (provider `proxy:` / subscription fetches); adapters
+    /// that dial repeatedly keep a [`DialerTarget`] instead.
+    pub fn resolve_name(&self, name: &str) -> Option<Arc<dyn Proxy>> {
+        self.proxies
+            .read()
+            .as_ref()
+            .and_then(|map| map.get(name).cloned())
+    }
 }
 
 impl std::fmt::Debug for ProxyRegistry {

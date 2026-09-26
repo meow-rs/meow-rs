@@ -2671,8 +2671,9 @@ fn missing_geodata_downloads<'a>(
 /// references it could miss live inside fetched provider payloads, and when
 /// every provider is inline there are no fetched payloads (the first clause
 /// already returned true otherwise). `proxy-providers` are out of scope:
-/// their fetches run before any proxy layer exists and `RawProxyProvider`
-/// has no `proxy:` key — their subscriptions always egress direct.
+/// their fetches run before any proxy layer exists, and their `proxy:`
+/// field resolves later against the published `provider_dialer_registry`
+/// at fetch time (issue #625) — not through this prefetch layer.
 fn prefetch_proxy_layer_needed(raw: &raw::RawConfig, geo: &GeoDataConfig) -> bool {
     // No `proxies:` entries → the layer can never exist; skip the
     // spawn_blocking hop to a deterministic `Ok(None)`.

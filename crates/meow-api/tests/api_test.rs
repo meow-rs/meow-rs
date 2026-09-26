@@ -1127,6 +1127,7 @@ async fn get_subscriptions_with_data() {
         url: "https://example.com/sub".into(),
         interval: Some(3600),
         last_updated: Some(1000000),
+        proxy: None,
     }]);
     let state = test_state(raw);
     let app = create_router(state);
@@ -1156,6 +1157,7 @@ async fn get_subscriptions_reports_counts() {
         url: "https://example.com".into(),
         interval: None,
         last_updated: None,
+        proxy: None,
     }]);
     // Subscription replaces proxies/groups/rules with remote data
     let mut proxy1 = std::collections::HashMap::new();
@@ -1211,6 +1213,7 @@ async fn delete_subscription_clears_data() {
         url: "https://example.com".into(),
         interval: None,
         last_updated: None,
+        proxy: None,
     }]);
     let mut proxy1 = std::collections::HashMap::new();
     proxy1.insert("name".to_string(), serde_yaml::Value::String("S1".into()));
@@ -1296,6 +1299,7 @@ async fn refresh_subscription_deleted_mid_fetch_returns_404() {
         url: format!("http://{addr}/sub.yaml"),
         interval: None,
         last_updated: None,
+        proxy: None,
     }]);
     let state = test_state(raw);
     let app = create_router(Arc::clone(&state));
@@ -1345,6 +1349,199 @@ async fn refresh_subscription_deleted_mid_fetch_returns_404() {
             .all(|p| p.get("name").and_then(|n| n.as_str()) != Some("resurrected")),
         "a deleted subscription's fetched payload must not be committed"
     );
+}
+
+/// `POST /api/subscriptions` resolves `proxy` against the live
+/// provider-dialer registry before fetching: a blank name is a 400 that
+/// never reaches the network, a resolvable name carries the fetch through
+/// that hop, and the stored value is exposed by `GET` (issue #625).
+#[tokio::test]
+async fn add_subscription_proxy_resolution() {
+    use meow_common::{
+        AdapterType, DelayHistory, MeowError, Metadata, ProxyAdapter, ProxyConn, ProxyHealth,
+        ProxyPacketConn,
+    };
+    use std::sync::Mutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// Records each `dial_tcp` target, then dials it for real — a direct
+    /// fetch would leave `seen` empty (issue #625).
+    struct RecordingFront {
+        seen: Mutex<Vec<(String, u16)>>,
+        health: ProxyHealth,
+    }
+
+    #[async_trait::async_trait]
+    impl ProxyAdapter for RecordingFront {
+        fn name(&self) -> &str {
+            "front"
+        }
+        fn adapter_type(&self) -> AdapterType {
+            AdapterType::Direct
+        }
+        fn addr(&self) -> &str {
+            ""
+        }
+        fn support_udp(&self) -> bool {
+            false
+        }
+        async fn dial_tcp(&self, m: &Metadata) -> meow_common::Result<Box<dyn ProxyConn>> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((m.host.to_string(), m.dst_port));
+            let stream = tokio::net::TcpStream::connect((m.host.as_str(), m.dst_port))
+                .await
+                .map_err(MeowError::Io)?;
+            Ok(Box::new(stream))
+        }
+        async fn dial_udp(&self, _m: &Metadata) -> meow_common::Result<Box<dyn ProxyPacketConn>> {
+            unimplemented!("no udp")
+        }
+        fn health(&self) -> &ProxyHealth {
+            &self.health
+        }
+    }
+
+    impl Proxy for RecordingFront {
+        fn alive(&self) -> bool {
+            true
+        }
+        fn alive_for_url(&self, _url: &str) -> bool {
+            true
+        }
+        fn last_delay(&self) -> u16 {
+            0
+        }
+        fn last_delay_for_url(&self, _url: &str) -> u16 {
+            0
+        }
+        fn delay_history(&self) -> Vec<DelayHistory> {
+            Vec::new()
+        }
+    }
+
+    // Origin serving a one-node subscription payload.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let mut sink = [0u8; 2048];
+            let _ = sock.read(&mut sink).await;
+            let body = "proxies:\n  - {name: n1, type: direct}\n";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        }
+    });
+
+    let raw = test_raw_config();
+    let state = test_state(raw);
+    let front = Arc::new(RecordingFront {
+        seen: Mutex::new(Vec::new()),
+        health: ProxyHealth::new(),
+    });
+    state
+        .provider_dialer_registry
+        .publish(Arc::new(std::collections::HashMap::from([(
+            "front".into(),
+            Arc::clone(&front) as Arc<dyn Proxy>,
+        )])));
+    let app = create_router(Arc::clone(&state));
+
+    // Whitespace-only `proxy` is a typo, not a clear — 400, and nothing
+    // is dialed.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/subscriptions")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(format!(
+                    r#"{{"name":"bad","url":"http://{addr}/sub.yaml","proxy":"   "}}"#
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        front.seen.lock().unwrap().is_empty(),
+        "a blank proxy name must not reach the network"
+    );
+
+    // An unknown name fails closed the same way — 400, never a direct
+    // fetch (issue #625).
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/subscriptions")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(format!(
+                    r#"{{"name":"bad2","url":"http://{addr}/sub.yaml","proxy":"ghost"}}"#
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        front.seen.lock().unwrap().is_empty(),
+        "an unresolvable proxy name must not fall back to a direct fetch"
+    );
+
+    // A resolvable name carries the fetch through the hop.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/subscriptions")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(format!(
+                    r#"{{"name":"s","url":"http://{addr}/sub.yaml","proxy":"front"}}"#
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        front
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(host, _)| host == "127.0.0.1"),
+        "the subscription fetch must transit `front`"
+    );
+
+    // And the stored proxy surfaces in GET /api/subscriptions.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/subscriptions")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = http_body_util::BodyExt::collect(resp.into_body())
+        .await
+        .unwrap()
+        .to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json[0]["proxy"], "front");
 }
 
 // ── Config save test ─────────────────────────────────────────────

@@ -860,6 +860,23 @@ async fn run(
         Arc::new(meow_config::proxy_provider_refresh::ProxyProviderRefreshSupervisor::default());
     proxy_provider_refresh.reconcile(&proxy_providers, config.raw.proxy_providers.as_ref());
 
+    // Providers whose `proxy:` name could not resolve during the
+    // pre-publish initial fetch retry once now that `update_routing` has
+    // populated the provider dialer registry (issue #625).
+    for entry in proxy_providers.iter() {
+        if entry.take_deferred_initial() {
+            let provider = Arc::clone(entry.value());
+            tokio::spawn(async move {
+                if let Err(e) = provider.acquire_initial().await {
+                    warn!(
+                        "proxy-provider '{}': deferred initial fetch failed: {e}",
+                        provider.name
+                    );
+                }
+            });
+        }
+    }
+
     // Start subscription background refresh task
     {
         let raw_config = Arc::clone(&raw_config);

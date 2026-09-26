@@ -1272,6 +1272,20 @@ pub fn commit_proxy_providers(
                     tracing::warn!("proxy-provider '{name}': initial fetch failed: {e}");
                 }
             });
+        } else if provider.take_deferred_initial() {
+            // A reused provider whose `proxy:` could not resolve before
+            // this commit's map was published — the name may resolve now,
+            // so retry once. `refresh`, not `acquire_initial`: the cache
+            // fallback already ran at startup, and rewinding a populated
+            // slot to a staler cache would be a regression (issue #625
+            // review).
+            let provider = Arc::clone(provider);
+            let name = name.clone();
+            tokio::spawn(async move {
+                if let Err(e) = provider.refresh().await {
+                    tracing::warn!("proxy-provider '{name}': deferred fetch failed: {e}");
+                }
+            });
         }
     }
     registry.retain(|name, _| candidate.contains_key(name));
@@ -1605,6 +1619,7 @@ struct SubscriptionInfo {
     url: String,
     interval: Option<u64>,
     last_updated: Option<i64>,
+    proxy: Option<String>,
     proxy_count: usize,
     group_count: usize,
     rule_count: usize,
@@ -1620,6 +1635,7 @@ async fn get_subscriptions(State(state): State<Arc<AppState>>) -> Json<Vec<Subsc
             url: s.url.clone(),
             interval: s.interval,
             last_updated: s.last_updated,
+            proxy: s.proxy.clone(),
             proxy_count: raw.proxies.as_ref().map_or(0, std::vec::Vec::len),
             group_count: raw.proxy_groups.as_ref().map_or(0, std::vec::Vec::len),
             rule_count: raw.rules.as_ref().map_or(0, std::vec::Vec::len),
@@ -1633,6 +1649,7 @@ struct AddSubscriptionRequest {
     name: String,
     url: String,
     interval: Option<u64>,
+    proxy: Option<String>,
 }
 
 async fn add_subscription(
@@ -1642,9 +1659,17 @@ async fn add_subscription(
     // `strict` follows the daemon's live config — the subscription payload
     // doesn't carry the flag (issue #533).
     let strict = state.raw_config.read().strict.unwrap_or(false);
-    let mut fetched = meow_config::subscription::fetch_subscription(&body.url, strict)
-        .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("fetch failed: {e}")))?;
+    // `proxy:` resolves against the live route map — an unknown name fails
+    // the request instead of silently fetching direct (issue #625).
+    let download_proxy = meow_config::internal_http::resolve_download_proxy(
+        &state.provider_dialer_registry,
+        body.proxy.as_deref(),
+    )
+    .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let mut fetched =
+        meow_config::subscription::fetch_subscription(&body.url, strict, download_proxy.as_ref())
+            .await
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("fetch failed: {e}")))?;
     // Resolve DNS-sourced ECH configs BEFORE the mutation lane — this is
     // async network I/O and must not serialize other config commits; the
     // stored snapshot then carries inline `ech-opts.config` so the in-lane
@@ -1680,6 +1705,12 @@ async fn add_subscription(
             url: body.url.clone(),
             interval: body.interval,
             last_updated: Some(now),
+            proxy: body
+                .proxy
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
         };
         raw.subscriptions.get_or_insert_with(Vec::new).push(sub);
 
@@ -1739,20 +1770,26 @@ async fn refresh_subscription(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let (url, strict) = {
+    let (url, proxy_name, strict) = {
         let raw = state.raw_config.read();
-        let url = raw
+        let (url, proxy_name) = raw
             .subscriptions
             .as_ref()
             .and_then(|subs| subs.iter().find(|s| s.name == name))
-            .map(|s| s.url.clone())
+            .map(|s| (s.url.clone(), s.proxy.clone()))
             .ok_or_else(|| (StatusCode::NOT_FOUND, "subscription not found".into()))?;
-        (url, raw.strict.unwrap_or(false))
+        (url, proxy_name, raw.strict.unwrap_or(false))
     };
 
-    let mut fetched = meow_config::subscription::fetch_subscription(&url, strict)
-        .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("fetch failed: {e}")))?;
+    let download_proxy = meow_config::internal_http::resolve_download_proxy(
+        &state.provider_dialer_registry,
+        proxy_name.as_deref(),
+    )
+    .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let mut fetched =
+        meow_config::subscription::fetch_subscription(&url, strict, download_proxy.as_ref())
+            .await
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("fetch failed: {e}")))?;
     // Same pre-lane ECH resolution as `add_subscription` (issue #533).
     meow_config::ech_dns::preresolve_ech(&mut fetched.proxies, strict)
         .await
@@ -3741,6 +3778,145 @@ mod tests {
             provider.proxies().len(),
             1,
             "the committed interval task must refresh the provider"
+        );
+    }
+
+    /// Issue #625: a provider whose `proxy:` name could not resolve at
+    /// startup carries `deferred_initial`; when a later commit reuses the
+    /// same provider object (`needs_fetch` false) the commit must still
+    /// consume the flag and spawn `refresh()` — otherwise a provider with
+    /// no `interval` would stay empty forever once its proxy appears.
+    #[tokio::test]
+    async fn commit_proxy_providers_retries_deferred_reused_provider() {
+        use meow_common::{
+            AdapterType, DelayHistory, MeowError, Metadata, Proxy, ProxyAdapter, ProxyConn,
+            ProxyHealth, ProxyPacketConn,
+        };
+        use meow_config::proxy_provider::ProxyProvider;
+        use meow_config::raw::RawProxyProvider;
+
+        // Passthrough outbound: the provider payload can only arrive if
+        // the fetch dialed through this hop.
+        struct Front {
+            health: ProxyHealth,
+        }
+        #[async_trait::async_trait]
+        impl ProxyAdapter for Front {
+            fn name(&self) -> &str {
+                "ghost"
+            }
+            fn adapter_type(&self) -> AdapterType {
+                AdapterType::Direct
+            }
+            fn addr(&self) -> &str {
+                ""
+            }
+            fn support_udp(&self) -> bool {
+                false
+            }
+            async fn dial_tcp(&self, m: &Metadata) -> meow_common::Result<Box<dyn ProxyConn>> {
+                let stream = tokio::net::TcpStream::connect((m.host.as_str(), m.dst_port))
+                    .await
+                    .map_err(MeowError::Io)?;
+                Ok(Box::new(stream))
+            }
+            async fn dial_udp(
+                &self,
+                _m: &Metadata,
+            ) -> meow_common::Result<Box<dyn ProxyPacketConn>> {
+                unimplemented!("no udp")
+            }
+            fn health(&self) -> &ProxyHealth {
+                &self.health
+            }
+        }
+        impl Proxy for Front {
+            fn alive(&self) -> bool {
+                true
+            }
+            fn alive_for_url(&self, _url: &str) -> bool {
+                true
+            }
+            fn last_delay(&self) -> u16 {
+                0
+            }
+            fn last_delay_for_url(&self, _url: &str) -> u16 {
+                0
+            }
+            fn delay_history(&self) -> Vec<DelayHistory> {
+                Vec::new()
+            }
+        }
+
+        // Origin serving a one-node provider payload.
+        let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = origin.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = origin.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                // Read the request first — closing with unread client
+                // bytes resets the connection before the response lands.
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf).await;
+                let body = "proxies:\n  - {name: n1, type: direct}\n";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s.write_all(resp.as_bytes()).await;
+                let _ = s.shutdown().await;
+            }
+        });
+
+        let dialer_registry = meow_proxy::dialer::ProxyRegistry::default();
+        let def: RawProxyProvider = serde_yaml::from_str(&format!(
+            "type: http\nurl: http://127.0.0.1:{port}/x.yaml\nproxy: ghost"
+        ))
+        .unwrap();
+        let provider = Arc::new(
+            ProxyProvider::new("p", &def, None, false, false, dialer_registry.clone()).unwrap(),
+        );
+
+        // Startup fetch: `ghost` is not published — resolution fails
+        // closed and arms the deferred flag inside `fetch_source`.
+        provider
+            .acquire_initial()
+            .await
+            .expect_err("unresolvable proxy must fail closed");
+        assert!(provider.proxies().is_empty());
+
+        // A later commit republishes the route map — `ghost` resolves now.
+        let front = Arc::new(Front {
+            health: ProxyHealth::new(),
+        });
+        dialer_registry.publish(Arc::new(std::collections::HashMap::from([(
+            smol_str::SmolStr::from("ghost"),
+            Arc::clone(&front) as Arc<dyn Proxy>,
+        )])));
+
+        let registry: Arc<DashMap<String, Arc<ProxyProvider>>> = Arc::new(DashMap::new());
+        registry.insert("p".to_string(), Arc::clone(&provider));
+        let refresh =
+            meow_config::proxy_provider_refresh::ProxyProviderRefreshSupervisor::default();
+        let _lane = CONFIG_MUTATION.lock().await;
+        // Same Arc in the candidate ⇒ `needs_fetch` is false ⇒ only the
+        // deferred arm can populate this provider.
+        let candidate: HashMap<String, Arc<ProxyProvider>> =
+            HashMap::from([("p".to_string(), Arc::clone(&provider))]);
+        commit_proxy_providers(&registry, &candidate, false, None, &refresh);
+        drop(_lane);
+
+        for _ in 0..50 {
+            if provider.proxies().len() == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            provider.proxies().len(),
+            1,
+            "the commit must consume deferred_initial and refresh through the now-resolvable proxy"
         );
     }
 }

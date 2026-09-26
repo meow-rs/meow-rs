@@ -496,8 +496,8 @@ pub struct RawProxyProvider {
     /// mihomo subscription relies on it.
     pub allow_external_plugin: Option<bool>,
     /// mihomo `proxy:` — route this provider's fetches through a named
-    /// proxy/group. Parsed so it can warn instead of being silently dropped;
-    /// fetch-through-proxy is not implemented for proxy providers.
+    /// proxy/group, resolved against the live route map at fetch time
+    /// (issue #625). `DIRECT` or absent fetches directly.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy: Option<String>,
     /// mihomo `dialer-proxy` — chain every node in this provider through the
@@ -664,11 +664,75 @@ pub struct RawSubscription {
     pub url: String,
     pub interval: Option<u64>,
     pub last_updated: Option<i64>,
+    /// Route this subscription's fetches through the named proxy/group,
+    /// resolved against the live route map at fetch time — the same
+    /// semantics as proxy-provider `proxy:` (issue #625). `DIRECT` or
+    /// absent fetches directly.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_subscription_proxy"
+    )]
+    pub proxy: Option<String>,
+}
+
+/// `subscriptions[].proxy`: absent/`""` → unset (fetches direct); a
+/// whitespace-only value is a typo, not a clear — reject it (issue #625
+/// review). This is stricter than provider whitespace handling, which can
+/// warn-and-skip under lenient mode: serde cannot see `strict` (same
+/// document), so the rejection is unconditional. Values are stored
+/// trimmed so `" name "` normalizes to `name`.
+fn deserialize_subscription_proxy<'de, D>(d: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match Option::<String>::deserialize(d)? {
+        None => Ok(None),
+        Some(s) if s.trim().is_empty() => {
+            if s.is_empty() {
+                Ok(None)
+            } else {
+                Err(serde::de::Error::custom(
+                    "subscription 'proxy' must be a proxy/group name — whitespace-only is not valid",
+                ))
+            }
+        }
+        Some(s) => Ok(Some(s.trim().to_string())),
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{RawConfig, RawHealthCheck, RawProxyGroup};
+    use super::{RawConfig, RawHealthCheck, RawProxyGroup, RawSubscription};
+
+    #[test]
+    fn subscription_proxy_normalization_matrix() {
+        let parse = |yaml: &str| serde_yaml::from_str::<RawSubscription>(yaml).unwrap().proxy;
+
+        assert_eq!(parse("name: s\nurl: http://x\n"), None);
+        assert_eq!(parse("name: s\nurl: http://x\nproxy: null\n"), None);
+        assert_eq!(parse("name: s\nurl: http://x\nproxy: ''\n"), None);
+        assert_eq!(
+            parse("name: s\nurl: http://x\nproxy: front\n").as_deref(),
+            Some("front")
+        );
+        assert_eq!(
+            parse("name: s\nurl: http://x\nproxy: ' front '\n").as_deref(),
+            Some("front"),
+            "values are stored trimmed"
+        );
+        assert_eq!(
+            parse("name: s\nurl: http://x\nproxy: DIRECT\n").as_deref(),
+            Some("DIRECT"),
+            "DIRECT stays a value — it is resolved, not erased, at fetch time"
+        );
+        let err = serde_yaml::from_str::<RawSubscription>("name: s\nurl: http://x\nproxy: '   '\n")
+            .expect_err("whitespace-only proxy must fail the parse");
+        assert!(
+            err.to_string().contains("whitespace-only"),
+            "unexpected: {err}"
+        );
+    }
 
     #[test]
     fn expected_status_accepts_integer_scalar() {

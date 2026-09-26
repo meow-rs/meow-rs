@@ -103,6 +103,36 @@ fn is_valid_header_value(value: &str) -> bool {
         .all(|b| b == b'\t' || (b'\x20'..=b'\x7e').contains(&b) || b >= 0x80)
 }
 
+/// Resolve a `proxy:`-style download-proxy field against the published route
+/// map: absent, empty, or `DIRECT` fetch direct; any other name must resolve
+/// to a built proxy or group. An unresolvable name fails the fetch loudly —
+/// the alternative (silently falling back to direct) would leak egress past a
+/// chain the config declared (issue #625).
+pub fn resolve_download_proxy(
+    registry: &meow_proxy::dialer::ProxyRegistry,
+    name: Option<&str>,
+) -> Result<Option<Arc<dyn Proxy>>> {
+    match name {
+        None | Some("") => Ok(None),
+        // Whitespace-only is almost surely a typo — reject rather than
+        // silently downgrading to a direct fetch (same posture as
+        // `dialer-proxy`, proxy_provider.rs).
+        Some(s) if s.trim().is_empty() => Err(anyhow!(
+            "download proxy name is blank — expected a proxy/group name or DIRECT"
+        )),
+        Some(s) => {
+            let name = s.trim();
+            if name.eq_ignore_ascii_case("DIRECT") {
+                return Ok(None);
+            }
+            registry
+                .resolve_name(name)
+                .map(Some)
+                .ok_or_else(|| anyhow!("download proxy '{name}' is not a known proxy or group"))
+        }
+    }
+}
+
 /// Fetch `url` via `proxy` and return the response body.
 ///
 /// Follows up to 5 redirects (302/301/307/308). Returns an
@@ -916,5 +946,44 @@ mod tests {
              must not count them as use"
         );
         assert_eq!(meta.conn_type, ConnType::Http);
+    }
+
+    /// `resolve_download_proxy` (issue #625): absent/empty/`DIRECT` fetch
+    /// direct, a published name resolves to its entry, anything else fails
+    /// closed — a silent direct fallback would leak egress past a chain the
+    /// config declared. Whitespace-only is rejected like `dialer-proxy` —
+    /// a typo must not silently downgrade to direct either.
+    #[test]
+    fn resolve_download_proxy_variants() {
+        let registry = meow_proxy::dialer::ProxyRegistry::default();
+        for absent in [
+            None,
+            Some(""),
+            Some("DIRECT"),
+            Some("direct"),
+            Some(" DIRECT "),
+        ] {
+            let resolved = resolve_download_proxy(&registry, absent).unwrap();
+            assert!(resolved.is_none(), "{absent:?} must fetch direct");
+        }
+        assert!(resolve_download_proxy(&registry, Some("   ")).is_err());
+        // Unpublished registry: every real name is unresolvable.
+        assert!(resolve_download_proxy(&registry, Some("front")).is_err());
+
+        let front: Arc<dyn Proxy> = Arc::new(CapturingMetaProxy {
+            seen: std::sync::Mutex::new(Vec::new()),
+            health: meow_common::ProxyHealth::new(),
+        });
+        registry.publish(Arc::new(std::collections::HashMap::from([(
+            SmolStr::from("front"),
+            Arc::clone(&front),
+        )])));
+        let resolved = resolve_download_proxy(&registry, Some("front"))
+            .unwrap()
+            .expect("published name resolves");
+        assert!(Arc::ptr_eq(&resolved, &front));
+        // Surrounding whitespace is trimmed before lookup.
+        assert!(resolve_download_proxy(&registry, Some(" front ")).is_ok());
+        assert!(resolve_download_proxy(&registry, Some("missing")).is_err());
     }
 }

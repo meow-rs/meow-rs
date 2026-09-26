@@ -118,9 +118,16 @@ static files instead.
 | Method | Path | Description |
 | --- | --- | --- |
 | `GET` | `/api/subscriptions` | List, with counts and last-updated |
-| `POST` | `/api/subscriptions` | Add `{ name, url, interval? }` and apply |
+| `POST` | `/api/subscriptions` | Add `{ name, url, interval?, proxy? }` and apply |
 | `POST` | `/api/subscriptions/{name}/refresh` | Re-fetch |
 | `DELETE` | `/api/subscriptions/{name}` | Remove and clear its contents → 204 |
+
+`POST`'s `proxy` is resolved eagerly at request time — an unknown or
+whitespace-only name is a `400` and nothing is stored. That is stricter
+than a `subscriptions:` entry in the config file, where the name may
+forward-reference a proxy the fetched payload itself later publishes
+(the file path stores it and each refresh resolves it against the live
+route map).
 
 ## Listeners
 

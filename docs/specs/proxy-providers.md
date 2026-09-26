@@ -165,6 +165,8 @@ proxy-groups:
 | `filter` | string | no | `""` | Regex. Include only proxies whose `name` matches. Empty = include all. |
 | `exclude-filter` | string | no | `""` | Regex. Exclude proxies whose `name` matches. Applied after `filter`. |
 | `exclude-type` | string | no | `""` | Pipe-separated adapter type names. Exclude proxies of those types. Case-insensitive. |
+| `proxy` | string | no | `""` | Route this provider's `http` fetches through the named proxy or group, resolved against the live route map at fetch time (issue #625). `DIRECT` or absent fetches directly; an unresolvable name fails the fetch (never silently direct); whitespace-only is a build error. A named value on `file` providers warns — no fetch to chain. |
+| `dialer-proxy` | string | no | `""` | Chain every node in this provider through the named front hop (issue #489). Distinct from `proxy`: that one routes the *fetch*, this one routes each node's *dials*. |
 
 ### Field reference — proxy-group additions
 
@@ -176,6 +178,39 @@ proxy-groups:
 | `filter` | string | no | `""` | Applied to provider-sourced members only (`use:` / `include-all`), matching upstream mihomo — explicit `proxies:` entries are never filtered (otherwise `proxies: [DIRECT]` + `filter: "^HK"` would drop DIRECT). |
 | `exclude-filter` | string | no | `""` | Applied after `filter`. Provider-sourced members only. |
 | `exclude-type` | string | no | `""` | Applied after `filter`/`exclude-filter`. Provider-sourced members only. |
+
+#### Fetch-through-proxy (`proxy:`)
+
+The name resolves against the **top-level** proxies/groups map —
+provider-sourced node names are not reachable (upstream's
+`proxies[SpecialProxy]` has the same namespace). Resolution happens per
+fetch, matching upstream's `HttpRequestWithProxy` model, so a `PUT
+/configs` rebuild or subscription commit that renames the target takes
+effect on the next fetch without rebuilding the provider. An absent,
+empty, or `DIRECT` (case-insensitive) value fetches direct; a
+whitespace-only value is a build error (same posture as `dialer-proxy`);
+any other name that cannot be resolved fails the fetch — never a silent
+direct fallback, which would leak egress past a declared chain.
+
+Two deliberate divergences from upstream to be aware of:
+
+- **Absent `proxy:` fetches direct, not rule-routed.** Upstream's empty
+  `SpecialProxy` runs the fetch through the rule engine (so a
+  `MATCH,PROXY` config proxies provider fetches); `internal_http` has no
+  rule-routing capability, so meow-rs fetches direct and requires an
+  explicit `proxy:` for proxied egress. (Rule-providers diverge the other
+  way: an absent `proxy` there defaults to the first `proxies:` entry.)
+- **Startup ordering.** Providers are initially fetched before the first
+  route map exists, so a startup `proxy:` name cannot resolve yet; the
+  provider is flagged and retried once right after the map is published.
+  Later fetches resolve live — no deferral needed.
+
+Config trap: `proxy: G` where `G` is a group whose only members come from
+this same provider can never resolve — the slot is empty, the group dial
+fails, the fetch fails. Upstream has the same circularity; it is a
+configuration error, not a code bug. Also note `DIRECT` is matched
+case-insensitively, so a node literally named `direct`/`Direct` is not
+reachable via `proxy:` — rename it.
 
 #### Runtime rebuilds (`PUT /configs`, subscription refresh)
 
@@ -402,6 +437,12 @@ the same URL probe mechanism as the delay endpoint.
 [dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip"] }
 ```
+
+> **As shipped:** the provider HTTP client is the in-tree
+> `meow_config::internal_http` (no `reqwest` dependency) — the reqwest
+> plan below was superseded so provider/subscription/geodata downloads
+> could ride `proxy:`-named hops through `Arc<dyn Proxy>` dials
+> (issue #625).
 
 - **`rustls-tls`** — no OpenSSL; consistent with the rest of the
   workspace.

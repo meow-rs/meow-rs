@@ -97,9 +97,11 @@ subscriptions:
     interval: 86400 # seconds; omit to fetch once at startup
 ```
 
-Each entry takes `name`, `url`, `interval` (seconds, optional), and
-`last-updated` (a unix timestamp the daemon writes back itself — not meant
-to be set by hand). The semantics differ sharply from `proxy-providers`:
+Each entry takes `name`, `url`, `interval` (seconds, optional), `proxy`
+(optional — a top-level proxy or group name the fetch is routed through;
+absent, empty, or `DIRECT` fetches direct, and an unknown name fails the
+fetch rather than leaking a direct request), and `last-updated` (a unix
+timestamp the daemon writes back itself — not meant to be set by hand). The semantics differ sharply from `proxy-providers`:
 
 - **Wholesale replace, not merge.** A refresh replaces the entire
   `proxies:`, `proxy-groups:`, and `rules:` sections with the fetched
@@ -127,7 +129,8 @@ to be set by hand). The semantics differ sharply from `proxy-providers`:
   startup and — once `last-updated` is stamped — never again. Note that
   an explicit `interval: 0` behaves differently than on providers: it
   refetches every poll (60 s), not "never". Fetches go over a direct
-  connection, not through the tunnel.
+  connection unless the entry sets `proxy:` to a top-level proxy or group
+  name.
 - **One subscription at a time.** Every entry wholesale-replaces the
   same three sections, so multiple subscriptions perpetually clobber
   each other — last refresh wins. Declaring several is almost never

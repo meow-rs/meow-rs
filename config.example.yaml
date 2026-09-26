@@ -166,8 +166,12 @@ rules:
 # every 60 s, but an unparseable or shape-defective document stamps
 # last-updated and is retried only after `interval` — never, for an
 # interval-less entry. `-t` validates the file as written and does not
-# fetch subscriptions. See website/guide/configuration.md.
+# fetch subscriptions. `proxy:` (optional) routes the fetch through a
+# top-level proxy or group name — absent/empty/DIRECT fetches direct, and
+# an unknown name fails the fetch rather than leaking a direct request.
+# See website/guide/configuration.md.
 # subscriptions:
 #   - name: airport
 #     url: https://example.com/clash.yaml
 #     interval: 86400
+#     proxy: PROXY

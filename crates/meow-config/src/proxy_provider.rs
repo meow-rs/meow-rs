@@ -48,6 +48,16 @@ pub struct ProxyProvider {
     /// nodes — which outlive individual config builds — always resolve the
     /// *current* route map, matching mihomo's by-name-at-dial-time model.
     dialer_registry: meow_proxy::dialer::ProxyRegistry,
+    /// `proxy:` — the name this provider's HTTP fetches resolve against the
+    /// same republished cell at fetch time (upstream resolves the vehicle's
+    /// proxy per request). `None` = direct (`proxy:` absent, empty, or
+    /// `DIRECT`) (issue #625).
+    download_proxy: Option<smol_str::SmolStr>,
+    /// Set when a fetch found `download_proxy` unresolvable — the startup
+    /// build loads providers *before* the first route map is published, so
+    /// the post-publish kick re-runs `acquire_initial` for providers still
+    /// flagged (issue #625). Cleared once the name resolves again.
+    deferred_initial: AtomicBool,
     /// `dialer-proxy` names declared by the currently loaded nodes —
     /// repopulated on every [`refresh`](Self::refresh) so a config build can
     /// warn about references the registry will never resolve.
@@ -266,13 +276,36 @@ impl ProxyProvider {
             .map(crate::raw::flatten_header_map)
             .unwrap_or_default();
 
-        // Warn for every vehicle type — `proxy:` on a `file` provider is
-        // just as much a mistaken expectation (there is no fetch to chain).
-        if raw.proxy.is_some() {
+        // `proxy:` routes this provider's fetches through a named proxy or
+        // group, resolved against `dialer_registry` at fetch time so the
+        // binding follows every republished route map (issue #625). Absent,
+        // empty, or `DIRECT` fetches direct; whitespace-only is not a usable
+        // name — reject rather than silently fetch direct (same posture as
+        // `dialer-proxy` below). On a `file` provider there is no fetch to
+        // chain — the field is a mistaken expectation there.
+        let download_proxy = match raw.proxy.as_deref() {
+            Some(s) if !s.trim().is_empty() => {
+                let name = s.trim();
+                if name.eq_ignore_ascii_case("DIRECT") {
+                    None
+                } else {
+                    Some(smol_str::SmolStr::from(name))
+                }
+            }
+            // `""` = unset (upstream's `len > 0` check); `None` = absent.
+            Some("") | None => None,
+            Some(_) => {
+                return Err(format!(
+                    "proxy-provider '{name}': malformed proxy — \
+                     expected a proxy/group name"
+                ));
+            }
+        };
+        if download_proxy.is_some() && raw.provider_type == "file" {
             warn!(
                 provider = %name,
-                "proxy-provider 'proxy' (fetch-through-proxy) is not supported; \
-                 ignoring it"
+                "proxy-provider 'proxy' has no effect on a 'file' provider — \
+                 there is no fetch to chain"
             );
         }
 
@@ -346,6 +379,8 @@ impl ProxyProvider {
             allow_external_plugin: raw.allow_external_plugin.unwrap_or(false),
             strict: AtomicBool::new(strict),
             dialer_registry,
+            download_proxy,
+            deferred_initial: AtomicBool::new(false),
             declared_dialers: RwLock::new(Vec::new()),
             provider_dialer,
             override_dialer,
@@ -443,13 +478,34 @@ impl ProxyProvider {
                     self.name, path, e
                 )
             }),
-            Vehicle::Http { url, .. } => crate::internal_http::fetch(url, None, &self.header)
-                .await
-                .and_then(|bytes| {
-                    String::from_utf8(bytes)
-                        .map_err(|e| anyhow::anyhow!("response body is not UTF-8: {e}"))
-                })
-                .map_err(|e| e.to_string()),
+            Vehicle::Http { url, .. } => {
+                let download_proxy = match crate::internal_http::resolve_download_proxy(
+                    &self.dialer_registry,
+                    self.download_proxy.as_deref(),
+                ) {
+                    Ok(p) => {
+                        self.deferred_initial.store(false, Ordering::Relaxed);
+                        p
+                    }
+                    Err(e) => {
+                        // The startup load fetches before the first route
+                        // map is published — flag the deferred post-publish
+                        // retry (issue #625). Afterwards an unresolvable
+                        // name means a rebuild removed the proxy: fail the
+                        // fetch rather than leak a direct request past a
+                        // chain the config declared.
+                        self.deferred_initial.store(true, Ordering::Relaxed);
+                        return Err(format!("proxy-provider '{}': {e:#}", self.name));
+                    }
+                };
+                crate::internal_http::fetch(url, download_proxy.as_ref(), &self.header)
+                    .await
+                    .and_then(|bytes| {
+                        String::from_utf8(bytes)
+                            .map_err(|e| anyhow::anyhow!("response body is not UTF-8: {e}"))
+                    })
+                    .map_err(|e| e.to_string())
+            }
         }
     }
 
@@ -815,6 +871,18 @@ impl ProxyProvider {
         }
     }
 
+    /// Consumes the deferred-initial-fetch flag: `true` once per provider
+    /// whose `proxy:` name could not resolve during the pre-publish startup
+    /// load — the caller schedules one `acquire_initial` retry now that the
+    /// route map is published (issue #625). `meow-app` runs this check once
+    /// after the first `update_routing`; embedders that drive `load_config`
+    /// plus a `Tunnel` directly must do the same after their first routing
+    /// install, or a deferred provider stays on its cache until an interval
+    /// or manual refresh.
+    pub fn take_deferred_initial(&self) -> bool {
+        self.deferred_initial.swap(false, Ordering::Relaxed)
+    }
+
     pub fn proxies(&self) -> Vec<Arc<dyn Proxy>> {
         self.slot.read().clone()
     }
@@ -892,14 +960,10 @@ pub async fn load_proxy_providers(
                                 .await
                                 .map_err(|e| anyhow::anyhow!("proxy-provider '{name}': {e}"))?;
                         }
-                        Err(e) => {
-                            warn!(provider = %name, error = %e,
-                                "initial fetch failed; starting empty");
-                        }
+                        Err(e) => warn_initial_load_failure(&provider, &e),
                     }
                 } else if let Err(e) = provider.acquire_initial().await {
-                    warn!(provider = %name, error = %e,
-                        "initial provider load failed; starting empty");
+                    warn_initial_load_failure(&provider, &e);
                 }
                 result.insert(name.clone(), provider);
             }
@@ -914,6 +978,22 @@ pub async fn load_proxy_providers(
         }
     }
     Ok(result)
+}
+
+/// Warn for an initial-load failure, distinguishing a not-yet-resolvable
+/// `proxy:` — retried once the route map is published (issue #625) — from
+/// real fetch failures, so `-t` and startup logs don't read like a hard
+/// error. The flag is set inside `fetch_source`, so it must be read after
+/// the fetch attempt, not before.
+fn warn_initial_load_failure(provider: &ProxyProvider, error: &str) {
+    if provider.deferred_initial.load(Ordering::Relaxed) {
+        warn!(provider = %provider.name, error = %error,
+            "initial provider load failed (proxy not resolvable yet); \
+             starting empty — will retry once the route map is published");
+    } else {
+        warn!(provider = %provider.name, error = %error,
+            "initial provider load failed; starting empty");
+    }
 }
 
 fn compile_opt_regex(
@@ -2258,5 +2338,269 @@ header:
             node.dial_udp(&meta).await.is_err(),
             "UDP over a TCP front-hop chain must fail, not leak direct"
         );
+    }
+
+    /// `Proxy` that records each `dial_tcp` target and dials the real
+    /// destination — proves a provider fetch actually transits the named
+    /// hop instead of going direct (issue #625).
+    struct PassthroughProxy {
+        seen: std::sync::Mutex<Vec<(String, u16)>>,
+        health: meow_common::ProxyHealth,
+    }
+
+    #[async_trait::async_trait]
+    impl meow_common::ProxyAdapter for PassthroughProxy {
+        fn name(&self) -> &str {
+            "front"
+        }
+        fn adapter_type(&self) -> meow_common::AdapterType {
+            meow_common::AdapterType::Direct
+        }
+        fn addr(&self) -> &str {
+            ""
+        }
+        fn support_udp(&self) -> bool {
+            false
+        }
+        async fn dial_tcp(
+            &self,
+            m: &meow_common::Metadata,
+        ) -> meow_common::Result<Box<dyn meow_common::ProxyConn>> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((m.host.to_string(), m.dst_port));
+            let stream = tokio::net::TcpStream::connect((m.host.as_str(), m.dst_port))
+                .await
+                .map_err(meow_common::MeowError::Io)?;
+            Ok(Box::new(stream))
+        }
+        async fn dial_udp(
+            &self,
+            _m: &meow_common::Metadata,
+        ) -> meow_common::Result<Box<dyn meow_common::ProxyPacketConn>> {
+            unimplemented!("no udp")
+        }
+        fn health(&self) -> &meow_common::ProxyHealth {
+            &self.health
+        }
+    }
+
+    impl Proxy for PassthroughProxy {
+        fn alive(&self) -> bool {
+            true
+        }
+        fn alive_for_url(&self, _url: &str) -> bool {
+            true
+        }
+        fn last_delay(&self) -> u16 {
+            0
+        }
+        fn last_delay_for_url(&self, _url: &str) -> u16 {
+            0
+        }
+        fn delay_history(&self) -> Vec<meow_common::DelayHistory> {
+            Vec::new()
+        }
+    }
+
+    /// Serves `body` as `proxies.yaml` on a loop, returning the URL.
+    async fn spawn_payload_server(body: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut sink = [0u8; 2048];
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut sink).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await;
+            }
+        });
+        format!("http://{addr}/proxies.yaml")
+    }
+
+    fn raw_http_provider(url: &str, proxy: Option<&str>) -> RawProxyProvider {
+        RawProxyProvider {
+            provider_type: "http".to_string(),
+            url: Some(url.to_string()),
+            path: None,
+            interval: None,
+            filter: None,
+            exclude_filter: None,
+            exclude_type: None,
+            health_check: None,
+            allow_external_plugin: None,
+            header: None,
+            override_: None,
+            proxy: proxy.map(str::to_string),
+            dialer_proxy: None,
+        }
+    }
+
+    fn registry_with_front(front: Arc<dyn Proxy>) -> meow_proxy::dialer::ProxyRegistry {
+        let registry = meow_proxy::dialer::ProxyRegistry::default();
+        registry.publish(Arc::new(HashMap::from([(
+            smol_str::SmolStr::from("front"),
+            front,
+        )])));
+        registry
+    }
+
+    /// `proxy: <name>` routes the provider fetch through that registry
+    /// entry — the dial lands on the named hop, not on a direct socket.
+    #[tokio::test]
+    async fn http_provider_proxy_fetches_through_named_hop() {
+        let front = Arc::new(PassthroughProxy {
+            seen: std::sync::Mutex::new(Vec::new()),
+            health: meow_common::ProxyHealth::new(),
+        });
+        let registry = registry_with_front(Arc::<PassthroughProxy>::clone(&front));
+        let url = spawn_payload_server("proxies:\n  - {name: n1, type: direct}\n").await;
+        let port = url
+            .trim_start_matches("http://")
+            .split(':')
+            .nth(1)
+            .and_then(|rest| rest.split('/').next())
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let raw = raw_http_provider(&url, Some("front"));
+        let p = ProxyProvider::new("test", &raw, Some(dir.path()), false, false, registry).unwrap();
+        p.acquire_initial().await.expect("fetch through 'front'");
+        assert_eq!(p.proxies().len(), 1, "payload must parse");
+        let seen = front.seen.lock().unwrap();
+        assert_eq!(
+            seen.as_slice(),
+            &[("127.0.0.1".to_string(), port)],
+            "the fetch must dial through the named proxy"
+        );
+    }
+
+    /// At startup providers load before the route map is published: an
+    /// unresolvable `proxy:` fails the fetch AND flags the provider so the
+    /// post-publish kick retries `acquire_initial` (issue #625).
+    #[tokio::test]
+    async fn http_provider_unresolvable_proxy_defers_then_retries() {
+        let registry = meow_proxy::dialer::ProxyRegistry::default();
+        let url = spawn_payload_server("proxies:\n  - {name: n1, type: direct}\n").await;
+        let dir = tempfile::tempdir().unwrap();
+        let raw = raw_http_provider(&url, Some("front"));
+        let p = ProxyProvider::new(
+            "test",
+            &raw,
+            Some(dir.path()),
+            false,
+            false,
+            registry.clone(),
+        )
+        .unwrap();
+
+        let err = p
+            .acquire_initial()
+            .await
+            .expect_err("unresolvable proxy must fail the fetch");
+        // `fetch_content`'s cache fallback surfaces the cache error when no
+        // cache exists — the resolution failure itself still flagged the
+        // deferred retry inside `fetch_source`.
+        assert!(
+            err.contains("cache") || err.contains("'front'"),
+            "unexpected: {err}"
+        );
+        assert!(p.proxies().is_empty());
+        assert!(
+            p.take_deferred_initial(),
+            "the failed pre-publish fetch must flag the deferred retry"
+        );
+        assert!(!p.take_deferred_initial(), "the flag is consumed once");
+
+        // Simulate the startup publish: `acquire_initial` then succeeds
+        // through the named hop.
+        let front = Arc::new(PassthroughProxy {
+            seen: std::sync::Mutex::new(Vec::new()),
+            health: meow_common::ProxyHealth::new(),
+        });
+        registry.publish(Arc::new(HashMap::from([(
+            smol_str::SmolStr::from("front"),
+            Arc::<PassthroughProxy>::clone(&front) as Arc<dyn Proxy>,
+        )])));
+        p.acquire_initial().await.expect("fetch after publish");
+        assert_eq!(p.proxies().len(), 1);
+        assert!(
+            !p.take_deferred_initial(),
+            "a resolving fetch clears the flag"
+        );
+    }
+
+    /// `proxy: DIRECT` and `proxy:` on a `file` provider keep their
+    /// meanings: explicit direct fetch, and warn-but-load respectively.
+    #[tokio::test]
+    async fn provider_proxy_direct_and_file_variants() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = spawn_payload_server("proxies:\n  - {name: n1, type: direct}\n").await;
+        let raw = raw_http_provider(&url, Some("DIRECT"));
+        let p = ProxyProvider::new(
+            "test",
+            &raw,
+            Some(dir.path()),
+            false,
+            false,
+            Default::default(),
+        )
+        .unwrap();
+        p.acquire_initial().await.expect("DIRECT fetches directly");
+        assert_eq!(p.proxies().len(), 1);
+        assert!(!p.take_deferred_initial(), "a direct fetch never defers");
+
+        // `proxy:` on a file provider warns but does not break the load.
+        std::fs::write(
+            dir.path().join("nodes.yaml"),
+            "proxies:\n  - {name: n1, type: direct}\n",
+        )
+        .unwrap();
+        let mut raw = raw_file_provider("nodes.yaml");
+        raw.proxy = Some("front".to_string());
+        let p = ProxyProvider::new(
+            "filep",
+            &raw,
+            Some(dir.path()),
+            false,
+            false,
+            Default::default(),
+        )
+        .unwrap();
+        p.acquire_initial().await.expect("file load unaffected");
+        assert_eq!(p.proxies().len(), 1);
+    }
+
+    /// A whitespace-only `proxy:` or `dialer-proxy:` is a typo, not a
+    /// clear — build rejects it rather than silently fetching/dialing
+    /// direct (issue #625 review). `""` and absent still mean unset.
+    #[test]
+    fn provider_new_rejects_whitespace_proxy_names() {
+        let mut raw = raw_http_provider("http://127.0.0.1:1/x", Some("   "));
+        let err = ProxyProvider::new("t", &raw, None, false, false, Default::default())
+            .err()
+            .expect("whitespace proxy: must be rejected");
+        assert!(err.contains("malformed proxy"), "{err}");
+
+        raw = raw_http_provider("http://127.0.0.1:1/x", Some(""));
+        assert!(
+            ProxyProvider::new("t", &raw, None, false, false, Default::default()).is_ok(),
+            "empty proxy: means direct"
+        );
+
+        raw = raw_http_provider("http://127.0.0.1:1/x", None);
+        raw.dialer_proxy = Some(" \t ".to_string());
+        let err = ProxyProvider::new("t", &raw, None, false, false, Default::default())
+            .err()
+            .expect("whitespace dialer-proxy: must be rejected");
+        assert!(err.contains("malformed dialer-proxy"), "{err}");
     }
 }

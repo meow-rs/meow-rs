@@ -328,12 +328,23 @@ fn effective_download_proxy(
     default: Option<&Arc<dyn Proxy>>,
     lookup: ProxyLookup<'_>,
 ) -> Result<Option<Arc<dyn Proxy>>> {
-    match cfg.proxy.as_deref().map(str::trim) {
+    match cfg.proxy.as_deref() {
         None | Some("") => Ok(default.cloned()),
-        Some(name) if name.eq_ignore_ascii_case("DIRECT") => Ok(None),
-        Some(name) => lookup(name)
-            .map(Some)
-            .ok_or_else(|| anyhow!("download proxy '{name}' is not a known proxy or group")),
+        // Whitespace-only is a typo, not a clear — same posture as
+        // proxy-provider `proxy:`/`dialer-proxy:` (issue #625 review).
+        Some(s) if s.trim().is_empty() => Err(anyhow!(
+            "download proxy name is blank — expected a proxy/group name or DIRECT"
+        )),
+        Some(s) => {
+            let name = s.trim();
+            if name.eq_ignore_ascii_case("DIRECT") {
+                Ok(None)
+            } else {
+                lookup(name)
+                    .map(Some)
+                    .ok_or_else(|| anyhow!("download proxy '{name}' is not a known proxy or group"))
+            }
+        }
     }
 }
 

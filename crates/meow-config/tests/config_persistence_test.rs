@@ -84,6 +84,7 @@ fn save_roundtrip_with_subscriptions() {
         url: "https://example.com/sub.yaml".into(),
         interval: Some(3600),
         last_updated: Some(1700000000),
+        proxy: None,
     }]);
 
     save_raw_config(path_str, &raw).unwrap();
@@ -440,13 +441,34 @@ fn raw_subscription_serde() {
         url: "https://example.com".into(),
         interval: Some(7200),
         last_updated: Some(1700000000),
+        proxy: None,
     };
     let yaml = serde_yaml::to_string(&sub).unwrap();
+    assert!(
+        !yaml.contains("proxy"),
+        "absent proxy must be omitted: {yaml}"
+    );
     let loaded: RawSubscription = serde_yaml::from_str(&yaml).unwrap();
     assert_eq!(loaded.name, "test");
     assert_eq!(loaded.url, "https://example.com");
     assert_eq!(loaded.interval, Some(7200));
     assert_eq!(loaded.last_updated, Some(1700000000));
+    assert_eq!(loaded.proxy, None);
+}
+
+#[test]
+fn raw_subscription_serde_proxy() {
+    let sub = RawSubscription {
+        name: "test".into(),
+        url: "https://example.com".into(),
+        interval: Some(7200),
+        last_updated: Some(1700000000),
+        proxy: Some("front".into()),
+    };
+    let yaml = serde_yaml::to_string(&sub).unwrap();
+    assert!(yaml.contains("proxy: front"), "{yaml}");
+    let loaded: RawSubscription = serde_yaml::from_str(&yaml).unwrap();
+    assert_eq!(loaded.proxy.as_deref(), Some("front"));
 }
 
 #[test]
@@ -457,6 +479,7 @@ fn raw_config_clone() {
         url: "u".into(),
         interval: None,
         last_updated: None,
+        proxy: None,
     }]);
     let cloned = raw.clone();
     assert_eq!(cloned.mixed_port, raw.mixed_port);

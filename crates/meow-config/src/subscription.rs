@@ -1,6 +1,7 @@
 use crate::raw::RawProxyGroup;
 use serde_yaml::Value;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Result of parsing a subscription YAML.
 pub struct SubscriptionData {
@@ -14,11 +15,15 @@ pub struct SubscriptionData {
 /// section that fails to deserialize, a `proxies` entry that isn't a
 /// mapping — into hard errors instead of warn-and-skip, so a garbled
 /// subscription cannot silently empty every group under `strict: true`.
+/// `download_proxy` routes the fetch through a resolved proxy/group — the
+/// subscription's `proxy:` field, resolved by the caller against the live
+/// route map (issue #625).
 pub async fn fetch_subscription(
     url: &str,
     strict: bool,
+    download_proxy: Option<&Arc<dyn meow_common::Proxy>>,
 ) -> Result<SubscriptionData, anyhow::Error> {
-    let bytes = crate::internal_http::fetch_direct(url).await?;
+    let bytes = crate::internal_http::fetch(url, download_proxy, &[]).await?;
     let text = String::from_utf8(bytes)
         .map_err(|e| PayloadDefect(anyhow::anyhow!("subscription body is not UTF-8: {e}")))?;
     parse_subscription_yaml(&text, strict)
@@ -184,4 +189,131 @@ pub fn parse_subscription_yaml(
         proxy_groups,
         rules,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// `Proxy` that records each `dial_tcp` target and dials the real
+    /// destination — proves a subscription fetch transits the caller's
+    /// resolved hop instead of going direct (issue #625). Mirrors the
+    /// provider-side harness in `proxy_provider::tests`.
+    struct PassthroughProxy {
+        seen: Mutex<Vec<(String, u16)>>,
+        health: meow_common::ProxyHealth,
+    }
+
+    #[async_trait::async_trait]
+    impl meow_common::ProxyAdapter for PassthroughProxy {
+        fn name(&self) -> &str {
+            "front"
+        }
+        fn adapter_type(&self) -> meow_common::AdapterType {
+            meow_common::AdapterType::Direct
+        }
+        fn addr(&self) -> &str {
+            ""
+        }
+        fn support_udp(&self) -> bool {
+            false
+        }
+        async fn dial_tcp(
+            &self,
+            m: &meow_common::Metadata,
+        ) -> meow_common::Result<Box<dyn meow_common::ProxyConn>> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((m.host.to_string(), m.dst_port));
+            let stream = tokio::net::TcpStream::connect((m.host.as_str(), m.dst_port))
+                .await
+                .map_err(meow_common::MeowError::Io)?;
+            Ok(Box::new(stream))
+        }
+        async fn dial_udp(
+            &self,
+            _m: &meow_common::Metadata,
+        ) -> meow_common::Result<Box<dyn meow_common::ProxyPacketConn>> {
+            unimplemented!("no udp")
+        }
+        fn health(&self) -> &meow_common::ProxyHealth {
+            &self.health
+        }
+    }
+
+    impl meow_common::Proxy for PassthroughProxy {
+        fn alive(&self) -> bool {
+            true
+        }
+        fn alive_for_url(&self, _url: &str) -> bool {
+            true
+        }
+        fn last_delay(&self) -> u16 {
+            0
+        }
+        fn last_delay_for_url(&self, _url: &str) -> u16 {
+            0
+        }
+        fn delay_history(&self) -> Vec<meow_common::DelayHistory> {
+            Vec::new()
+        }
+    }
+
+    /// Serves `body` once per connection on a loop, returning the URL.
+    async fn spawn_payload_server(body: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut sink = [0u8; 2048];
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut sink).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await;
+            }
+        });
+        format!("http://{addr}/sub.yaml")
+    }
+
+    /// A subscription `proxy:` must carry the fetch through the resolved
+    /// hop — a regression to a direct fetch leaves `seen` empty.
+    #[tokio::test]
+    async fn fetch_subscription_through_download_proxy() {
+        let body = "proxies:\n  - {name: n1, type: direct}\n";
+        let url = spawn_payload_server(body).await;
+        let proxy = Arc::new(PassthroughProxy {
+            seen: Mutex::new(Vec::new()),
+            health: meow_common::ProxyHealth::new(),
+        });
+        let dyn_proxy = Arc::clone(&proxy) as Arc<dyn meow_common::Proxy>;
+        let data = fetch_subscription(&url, false, Some(&dyn_proxy))
+            .await
+            .unwrap();
+        assert_eq!(data.proxies.len(), 1);
+        assert!(
+            proxy
+                .seen
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(host, _)| host == "127.0.0.1"),
+            "the subscription fetch must reach the named hop"
+        );
+    }
+
+    /// The direct path (`proxy:` absent/DIRECT resolves to `None`) still
+    /// works and parses the payload.
+    #[tokio::test]
+    async fn fetch_subscription_direct() {
+        let url = spawn_payload_server("proxies:\n  - {name: n1, type: direct}\n").await;
+        let data = fetch_subscription(&url, false, None).await.unwrap();
+        assert_eq!(data.proxies[0].get("name").unwrap(), "n1");
+    }
 }

@@ -447,3 +447,149 @@ async fn refreshed_subscription_with_group_cycle_is_not_committed() {
         "the rejected candidate must not replace the live raw config"
     );
 }
+
+/// `Proxy` that records each `dial_tcp` target and dials the real
+/// destination — proves the refresh fetch transits the resolved `proxy:`
+/// hop instead of going direct (issue #625).
+struct RecordingFront {
+    seen: std::sync::Mutex<Vec<(String, u16)>>,
+    health: meow_common::ProxyHealth,
+}
+
+#[async_trait::async_trait]
+impl meow_common::ProxyAdapter for RecordingFront {
+    fn name(&self) -> &str {
+        "front"
+    }
+    fn adapter_type(&self) -> meow_common::AdapterType {
+        meow_common::AdapterType::Direct
+    }
+    fn addr(&self) -> &str {
+        ""
+    }
+    fn support_udp(&self) -> bool {
+        false
+    }
+    async fn dial_tcp(
+        &self,
+        m: &meow_common::Metadata,
+    ) -> meow_common::Result<Box<dyn meow_common::ProxyConn>> {
+        self.seen
+            .lock()
+            .unwrap()
+            .push((m.host.to_string(), m.dst_port));
+        let stream = tokio::net::TcpStream::connect((m.host.as_str(), m.dst_port))
+            .await
+            .map_err(meow_common::MeowError::Io)?;
+        Ok(Box::new(stream))
+    }
+    async fn dial_udp(
+        &self,
+        _m: &meow_common::Metadata,
+    ) -> meow_common::Result<Box<dyn meow_common::ProxyPacketConn>> {
+        unimplemented!("no udp")
+    }
+    fn health(&self) -> &meow_common::ProxyHealth {
+        &self.health
+    }
+}
+
+impl meow_common::Proxy for RecordingFront {
+    fn alive(&self) -> bool {
+        true
+    }
+    fn alive_for_url(&self, _url: &str) -> bool {
+        true
+    }
+    fn last_delay(&self) -> u16 {
+        0
+    }
+    fn last_delay_for_url(&self, _url: &str) -> u16 {
+        0
+    }
+    fn delay_history(&self) -> Vec<meow_common::DelayHistory> {
+        Vec::new()
+    }
+}
+
+/// The refresh loop must route `proxy:`-bearing subscription fetches
+/// through the name resolved out of the live provider-dialer registry —
+/// a regression dropping the field (always-direct fetch) leaves `seen`
+/// empty and would leak egress past the declared chain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refresh_fetches_through_subscription_proxy() {
+    let fx = fixture("proxies:\n  - {name: n1, type: http, server: 127.0.0.1, port: 9}\n").await;
+    let ghost_url = fx.raw_config.read().subscriptions.as_ref().unwrap()[0]
+        .url
+        .clone();
+    {
+        let mut raw = fx.raw_config.write();
+        let subs = raw.subscriptions.as_mut().unwrap();
+        subs[0].proxy = Some("front".to_string());
+        // Same origin URL: a regression that fetched `ghost` directly
+        // would succeed and stamp `last_updated` — fail-closed requires
+        // it never reach the network at all. Inserted FIRST so the pass
+        // rejects it synchronously before `s`'s fetch resolves — by the
+        // time `n1` commits below, `ghost-sub` has definitively been
+        // processed.
+        subs.insert(
+            0,
+            meow_config::raw::RawSubscription {
+                name: "ghost-sub".to_string(),
+                url: ghost_url,
+                interval: Some(3600),
+                last_updated: None,
+                proxy: Some("ghost".to_string()),
+            },
+        );
+    }
+    let front = Arc::new(RecordingFront {
+        seen: std::sync::Mutex::new(Vec::new()),
+        health: meow_common::ProxyHealth::new(),
+    });
+    fx.provider_dialer_registry
+        .publish(Arc::new(HashMap::from([(
+            smol_str::SmolStr::from("front"),
+            Arc::clone(&front) as Arc<dyn meow_common::Proxy>,
+        )])));
+    spawn_loop(&fx);
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if !front.seen.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the refresh must dial the subscription origin through `front`");
+
+    // The fetched payload commits — `n1` lands as a top-level leaf.
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if fx.tunnel.proxy("n1").is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the subscription payload must be committed");
+
+    // The unresolvable sibling stayed fail-closed: `last_updated` is
+    // stamped only on a successful fetch, so `None` here proves the
+    // ghost name never reached the network (issue #625 review).
+    let raw = fx.raw_config.read();
+    let ghost = raw
+        .subscriptions
+        .as_ref()
+        .unwrap()
+        .iter()
+        .find(|s| s.name == "ghost-sub")
+        .unwrap();
+    assert!(
+        ghost.last_updated.is_none(),
+        "an unresolvable subscription proxy must not fetch"
+    );
+}

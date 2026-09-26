@@ -40,7 +40,7 @@ proxy-groups:
 | `header` | map | `{}` | Extra HTTP request headers (`http` only) |
 | `dialer-proxy` | string | — | Chain every node through the named `proxies:`/`proxy-groups:` entry. Overrides node-level `dialer-proxy` fields (mihomo writes it into each node unconditionally) |
 | `override` | map | — | Provider-level node defaults (mihomo `OverrideSchema`). Only `dialer-proxy` is honoured — it chains every node **unconditionally**, outranking both provider-level and node-level values; an empty string clears the chain (the node dials direct), and a non-string value rejects the provider. Other keys log a warning |
-| `proxy` | string | — | mihomo's fetch-through-proxy field; **not supported** — parsed so a warning is logged instead of silently ignored. Payloads are always fetched direct |
+| `proxy` | string | — | Route this provider's `http` fetches through the named top-level `proxies:`/`proxy-groups:` entry, resolved against the live route map on every fetch. Absent, empty, or `DIRECT` fetches direct; an unknown or whitespace-only name fails the fetch — never a silent direct fallback (issue #625). A named value on a `file` provider warns: there is no fetch to chain |
 | `allow-external-plugin` | bool | `false` | Permit `ss` nodes to launch external SIP003 plugin executables. **Security-sensitive opt-in**: provider content is remote-controlled and the plugin name reaches `Command::new`, so off means such nodes are rejected. Built-in plugins (`obfs`, `simple-obfs`, `v2ray-plugin`, `gost-plugin`, `shadow-tls`, `restls`, `jls`, `kcptun`, `ech-tls-tunnel` — all in the default feature set) are always allowed; a non-default build without one treats its name as external. meow-rs extension; absent in mihomo |
 
 Provider nodes may also carry a per-node `dialer-proxy` field in the payload itself,
@@ -174,7 +174,7 @@ Subscriptions are also managed at runtime through the
 
 - `GET /api/subscriptions` — list, with the applied proxy/group/rule counts
   and last-updated times.
-- `POST /api/subscriptions` — add `{ name, url, interval? }` and apply immediately.
+- `POST /api/subscriptions` — add `{ name, url, interval?, proxy? }` and apply immediately.
 - `POST /api/subscriptions/{name}/refresh` — re-fetch.
 - `DELETE /api/subscriptions/{name}` — remove the entry **and empty all three
   sections** — previously-replaced local content is not restored. Note the

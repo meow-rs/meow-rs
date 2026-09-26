@@ -67,7 +67,7 @@ pub async fn run_loop(
             return;
         };
         let tunnel = Tunnel::from_inner(inner);
-        let subs_to_refresh: Vec<(String, String)> = {
+        let subs_to_refresh: Vec<(String, String, Option<String>)> = {
             let raw = raw_config.read();
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -82,17 +82,38 @@ pub async fn run_loop(
                     (Some(interval), Some(last)) => now - last >= interval as i64,
                     (None, Some(_)) => false,
                 })
-                .map(|s| (s.name.clone(), s.url.clone()))
+                .map(|s| (s.name.clone(), s.url.clone(), s.proxy.clone()))
                 .collect()
         };
 
-        for (name, url) in subs_to_refresh {
+        for (name, url, proxy_name) in subs_to_refresh {
             info!("Auto-refreshing subscription '{}'", name);
             // `strict` is a property of the daemon's live config, not the
             // fetched subscription payload — it gates both payload shape
             // errors in the parser and ECH pre-resolution below.
             let strict = raw_config.read().strict.unwrap_or(false);
-            match meow_config::subscription::fetch_subscription(&url, strict).await {
+            // `proxy:` resolves against the route map published into the
+            // provider dialer registry — a name a rebuild removed stays
+            // unresolvable until the next pass (treated like a transport
+            // failure: `last_updated` is not stamped, so the retry honors
+            // the loop cadence, issue #625).
+            let download_proxy = match meow_config::internal_http::resolve_download_proxy(
+                &provider_dialer_registry,
+                proxy_name.as_deref(),
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!("subscription '{name}': {e:#}");
+                    continue;
+                }
+            };
+            match meow_config::subscription::fetch_subscription(
+                &url,
+                strict,
+                download_proxy.as_ref(),
+            )
+            .await
+            {
                 Ok(mut fetched) => {
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
