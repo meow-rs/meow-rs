@@ -278,7 +278,9 @@ impl RuleProvider {
                 "rule-provider refresh changed whether the set needs IP resolution or \
                  process lookup; live RULE-SET rules keep the previous demand flags \
                  until the next config reload (entries requiring the new demand \
-                 cannot fire until then)"
+                 cannot fire until then — and inside a SUB-RULE block, the \
+                 resolution gate can skip the whole block while metadata is \
+                 unresolved)"
             );
         }
         *self.rules.write() = new_rules;

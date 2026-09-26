@@ -1589,13 +1589,15 @@ fn insert_parsed_leaves(
                     );
                     continue;
                 }
-                static_proxy_names.insert(key.clone());
-                // A repeated leaf name silently last-wins here — a
-                // deliberate divergence from upstream's
-                // `proxy %s is the duplicate name` hard error. Leaf
-                // duplicates are safe to keep: all leaves settle before
-                // any group captures members, so they cannot split the
-                // registry the way group duplicates did (#561).
+                // A repeated leaf name last-wins here — a deliberate
+                // divergence from upstream's `proxy %s is the duplicate
+                // name` hard error. Leaf duplicates are safe to keep: all
+                // leaves settle before any group captures members, so they
+                // cannot split the registry the way group duplicates did
+                // (#561). Warn so a typo doesn't silently rebind (#625).
+                if !static_proxy_names.insert(key.clone()) {
+                    warn!("duplicate proxy name '{key}': the later entry replaces the earlier one");
+                }
                 proxies.insert(key, proxy);
             }
             Err(e) if strict => {
@@ -4475,6 +4477,65 @@ mod dialer_proxy_tests {
         assert!(
             was_wrapped(&before, &proxies, "C"),
             "a whitespace-only value binds the fail-at-dial sentinel"
+        );
+    }
+
+    /// Issue #625 — a repeated leaf `name:` last-wins (deliberate
+    /// divergence from upstream's hard error), but it must warn so a typo
+    /// doesn't silently rebind a name.
+    #[test]
+    fn duplicate_leaf_name_warns() {
+        // Scoped WARN capture — `with_default` is thread-local.
+        #[derive(Clone)]
+        struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+            type Writer = Sink;
+            fn make_writer(&'a self) -> Sink {
+                self.clone()
+            }
+        }
+        let sink = Sink(Arc::new(std::sync::Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+
+        let raws: Vec<HashMap<String, serde_yaml::Value>> = serde_yaml::from_str(
+            "- name: dup\n  type: direct\n- name: dup\n  type: http\n  server: 127.0.0.1\n  port: 9\n- name: dup\n  type: socks5\n  server: 127.0.0.1\n  port: 9\n",
+        )
+        .unwrap();
+        let mut proxies: HashMap<SmolStr, Arc<dyn Proxy>> = HashMap::new();
+        let mut names = std::collections::HashSet::new();
+
+        tracing::subscriber::with_default(subscriber, || {
+            insert_parsed_leaves(&mut proxies, &mut names, &raws, false, false).unwrap();
+        });
+
+        assert_eq!(proxies.len(), 1, "last-wins is unchanged");
+        // Distinguishable leaf types pin *which* entry won — a first-wins
+        // regression would leave the `direct` adapter behind.
+        assert_eq!(
+            proxies["dup"].adapter_type(),
+            meow_common::AdapterType::Socks5,
+            "last definition must win"
+        );
+        let captured = String::from_utf8_lossy(&sink.0.lock().unwrap()).into_owned();
+        // One warn per *repeat* occurrence: a 3-dup fixture yields 2 warns.
+        // An inverted `insert` check would warn once on first sight instead.
+        assert_eq!(
+            captured.matches("duplicate proxy name 'dup'").count(),
+            2,
+            "expected one warn per repeat; got: {captured}"
         );
     }
 

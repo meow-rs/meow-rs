@@ -98,8 +98,10 @@ fn build_reference_graph(
 ///
 /// upstream: `rules/parser.go` SUB-RULE case — two-field form
 /// `SUB-RULE,<block-name>` (upstream also accepts a `(cond)` field that
-/// meow-rs does not implement). Any further comma-delimited fields after
-/// the block name are silently dropped by `parse_one_rule_or_subrule`.
+/// meow-rs does not implement). Further comma-delimited fields after the
+/// block name are *rejected* at rule-parse time (issue #625); this
+/// extractor still takes the first field so the reference-graph builder
+/// can point the error at the would-be name.
 pub(crate) fn parse_sub_rule_reference(line: &str) -> Option<String> {
     let line = line.trim();
     if line.is_empty() || line.starts_with('#') {
@@ -114,9 +116,9 @@ pub(crate) fn parse_sub_rule_reference(line: &str) -> Option<String> {
     if rest.is_empty() {
         return None;
     }
-    // Trailing comma-separated fields are silently dropped (upstream
-    // would take the last field as the block name) — for reference-graph
-    // building we just need the first field.
+    // Trailing comma-separated fields are rejected at rule-parse time
+    // (issue #625); for reference-graph building we only need the first
+    // field to name the would-be target in the undefined-block error.
     Some(rest.split(',').next()?.trim().to_string())
 }
 
@@ -229,6 +231,25 @@ mod tests {
         assert_eq!(parse_sub_rule_reference("# SUB-RULE,X"), None);
         assert_eq!(parse_sub_rule_reference("SUB-RULE"), None);
         assert_eq!(parse_sub_rule_reference("SUB-RULE,"), None);
+    }
+
+    #[test]
+    fn sub_rule_trailing_fields_rejected_inside_block_body() {
+        // `a` is defined so the reference graph succeeds and the body
+        // parse itself must surface the trailing-field error (fatal —
+        // block bodies have no lenient arm).
+        let raw_map = raw(&[
+            ("a", &["DOMAIN-SUFFIX,x.test,DIRECT"]),
+            ("b", &["SUB-RULE,a,junk"]),
+        ]);
+        let providers = HashMap::new();
+        let err = parse_sub_rules(&raw_map, &providers, &ParserContext::default())
+            .err()
+            .expect("SUB-RULE,a,junk inside a block body must fail");
+        assert!(
+            err.to_string().contains("trailing"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

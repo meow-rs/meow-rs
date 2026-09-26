@@ -323,7 +323,7 @@ Source rules:
 | index | source rule |
 | ---: | --- |
 | 0 | `OR,((DOMAIN-SUFFIX,corp.example),(DST-PORT,8443)),Proxy` |
-| 1 | `SUB-RULE,private-block,PrivateBlock` |
+| 1 | `SUB-RULE,private-block` |
 | 2 | `MATCH,DIRECT` |
 
 Compiled rule set:

@@ -1,17 +1,55 @@
-//! RSS stress test: 10K domains × 100K queries.
-//! Measures RSS before/after to detect leaks and fragmentation.
+//! Live-bytes stress test: 10K domains × 100K queries.
+//!
+//! Issue #625: this used to measure RSS via `ps`, which flakes under the
+//! threaded test harness — sibling tests' allocations land inside the
+//! same process RSS. The assertion now runs on a counting
+//! `#[global_allocator]` (live requested bytes), and a shared lane mutex
+//! keeps the two tests' measurement windows from overlapping.
 
-fn rss_kb() -> usize {
-    let pid = std::process::id();
-    let output = std::process::Command::new("ps")
-        .args(["-o", "rss=", "-p", &pid.to_string()])
-        .output()
-        .ok();
-    output
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| s.trim().parse::<usize>().ok())
-        .unwrap_or(0)
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// Counts requested allocation sizes; `dealloc` subtracts them, so the
+/// gauge reads live heap bytes — immune to RSS noise (page caching,
+/// jemalloc arenas, sibling threads) that made the `ps` version flake.
+struct LiveBytes;
+
+unsafe impl GlobalAlloc for LiveBytes {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let p = System.alloc(layout);
+        if !p.is_null() {
+            LIVE_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+        }
+        p
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
+        System.dealloc(ptr, layout);
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let p = System.realloc(ptr, layout, new_size);
+        if !p.is_null() {
+            LIVE_BYTES.fetch_add(new_size, Ordering::Relaxed);
+            LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
+        }
+        p
+    }
 }
+
+#[global_allocator]
+static ALLOC: LiveBytes = LiveBytes;
+
+fn live_bytes() -> usize {
+    LIVE_BYTES.load(Ordering::Relaxed)
+}
+
+/// Serializes the measurement windows of the tests in this binary —
+/// otherwise a parallel sibling's allocations pollute the delta.
+static MEASURE_LANE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn build_geosite_db(num_domains: usize) -> meow_rules::geosite::GeositeDB {
     let mut db = meow_rules::geosite::GeositeDB::empty();
@@ -23,20 +61,11 @@ fn build_geosite_db(num_domains: usize) -> meow_rules::geosite::GeositeDB {
 
 #[test]
 fn geosite_rss_10k_rules_100k_queries() {
+    let _lane = MEASURE_LANE.lock().unwrap();
     let num_domains = 10_000;
     let num_queries = 100_000;
 
-    let rss_before = rss_kb();
     let db = build_geosite_db(num_domains);
-
-    let rss_after_load = rss_kb();
-    eprintln!("\n=== RSS after loading {num_domains} domains ===");
-    eprintln!("  Before:     {rss_before} KB");
-    eprintln!("  After load: {rss_after_load} KB");
-    eprintln!(
-        "  Delta:      {} KB",
-        rss_after_load.saturating_sub(rss_before)
-    );
 
     let mut hits = 0u64;
     let mut misses = 0u64;
@@ -55,34 +84,29 @@ fn geosite_rss_10k_rules_100k_queries() {
         }
     }
 
-    let rss_after_100k = rss_kb();
-    eprintln!("\n=== RSS after {num_queries} queries ===");
-    eprintln!("  After 100K:  {rss_after_100k} KB");
-    eprintln!(
-        "  Growth:      {} KB",
-        rss_after_100k.saturating_sub(rss_after_load)
-    );
-    eprintln!("  Hits: {hits}, Misses: {misses}");
-
+    // Warm steady state reached — measure the second batch's delta.
+    let live_after_100k = live_bytes();
     for i in 0..num_queries {
         let domain = format!("domain{}.example.com", i % num_domains);
         let _ = db.lookup("test-category", &domain);
     }
+    let growth = live_bytes().saturating_sub(live_after_100k);
+    eprintln!("10K domains, 100K→200K queries: live-bytes growth {growth} B; hits {hits}, misses {misses}");
 
-    let rss_after_200k = rss_kb();
-    let growth = rss_after_200k.saturating_sub(rss_after_100k);
-    eprintln!("\n=== RSS after 200K total queries ===");
-    eprintln!("  After 200K:       {rss_after_200k} KB");
-    eprintln!("  Growth 100K→200K: {growth} KB");
-
+    // Batch 1 must actually exercise the hit path — a miss-only workload
+    // would make the growth assertion vacuous.
+    assert!(hits > 0, "batch 1 produced zero hits — test is vacuous");
+    // Lookups allocate only transient strings — live bytes must return to
+    // baseline. Slack covers lazy-once interning inside the lookup path.
     assert!(
-        growth < 512,
-        "RSS grew {growth} KB between 100K→200K queries — possible leak"
+        growth <= 64 * 1024,
+        "live bytes grew {growth} B between 100K→200K queries — possible leak"
     );
 }
 
 #[test]
 fn geosite_rss_real_dat_100k_queries() {
+    let _lane = MEASURE_LANE.lock().unwrap();
     use std::collections::HashSet;
     use std::path::PathBuf;
 
@@ -98,22 +122,8 @@ fn geosite_rss_real_dat_100k_queries() {
         .map(ToString::to_string)
         .collect();
 
-    let rss_before = rss_kb();
     let db = meow_rules::geosite::GeositeDB::load_from_path(&dat_path, Some(&allowed))
         .expect("load geosite.dat");
-
-    let rss_after_load = rss_kb();
-    eprintln!("\n=== Real geosite.dat — RSS after load ===");
-    eprintln!("  Before:     {rss_before} KB");
-    eprintln!(
-        "  After load: {rss_after_load} KB ({:.1} MB)",
-        rss_after_load as f64 / 1024.0
-    );
-    eprintln!(
-        "  Delta:      {} KB ({:.1} MB)",
-        rss_after_load.saturating_sub(rss_before),
-        rss_after_load.saturating_sub(rss_before) as f64 / 1024.0
-    );
 
     let domains = [
         "www.google.com",
@@ -139,36 +149,21 @@ fn geosite_rss_real_dat_100k_queries() {
         }
     }
 
-    let rss_after_100k = rss_kb();
-    eprintln!("\n=== Real geosite.dat — RSS after {num_queries} queries ===");
-    eprintln!(
-        "  After 100K: {rss_after_100k} KB ({:.1} MB)",
-        rss_after_100k as f64 / 1024.0
-    );
-    eprintln!(
-        "  Growth:     {} KB",
-        rss_after_100k.saturating_sub(rss_after_load)
-    );
-    eprintln!("  Hits: {hits}");
-
+    let live_after_100k = live_bytes();
     for i in 0..num_queries {
         let domain = domains[i % domains.len()];
         for cat in ["cn", "google", "geolocation-!cn"] {
             let _ = db.lookup(cat, domain);
         }
     }
+    let growth = live_bytes().saturating_sub(live_after_100k);
+    eprintln!("real geosite.dat, 100K→200K queries: live-bytes growth {growth} B; hits {hits}");
 
-    let rss_after_200k = rss_kb();
-    let growth = rss_after_200k.saturating_sub(rss_after_100k);
-    eprintln!("\n=== Real geosite.dat — RSS after 200K queries ===");
-    eprintln!(
-        "  After 200K: {rss_after_200k} KB ({:.1} MB)",
-        rss_after_200k as f64 / 1024.0
-    );
-    eprintln!("  Growth 100K→200K: {growth} KB");
-
+    // Batch 1 must actually exercise the hit path — a zero-hit run would
+    // make the growth assertion vacuous.
+    assert!(hits > 0, "batch 1 produced zero hits — test is vacuous");
     assert!(
-        growth < 1024,
-        "RSS grew {growth} KB between query batches — possible leak"
+        growth <= 64 * 1024,
+        "live bytes grew {growth} B between query batches — possible leak"
     );
 }

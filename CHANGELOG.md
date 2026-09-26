@@ -331,6 +331,39 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **`SUB-RULE,<name>` rejects trailing comma fields** (#625 item 17):
+  `SUB-RULE,blk,junk` used to resolve `blk` with the rest silently
+  dropped — a typo could name a block other than the intended one. The
+  unsupported `SUB-RULE,(cond),name` conditional form already failed
+  loudly (undefined block); both now surface a clear "trailing fields"
+  error. In lenient `rules:` the line is warn-dropped; in strict mode
+  and inside `sub-rules:` bodies it is fatal, matching the existing
+  block-parse posture.
+
+- **TProxy TCP path now pre-resolves `dst_ip`** (#625 review): the strict
+  `resolve_proxy` match ran without `pre_resolve`, so IP-demanding rules
+  (and resolution-gated SUB-RULE blocks) never matched there — a
+  pre-existing contract violation, most visible after fake-IP rescue
+  clears `dst_ip`. `pre_resolve` now runs before the match, mirroring the
+  UDP listeners.
+
+- **SUB-RULE blocks wait for IP resolution** (#625 item 17): upstream's
+  `Logic.Match` skips a `SUB-RULE` whose block needs a resolved dst IP
+  while the metadata is still unresolved; our `match_metadata` /
+  `match_and_resolve` omitted that gate, so an inner domain matcher could
+  match early and pre-empt an inner IP rule that would have won after
+  resolution. The gate is now applied on both paths.
+
+- **Duplicate leaf `name:` in `proxies:` now warns** (#625 item 7): the
+  last-wins semantics (a deliberate divergence from upstream's hard
+  error) is unchanged, but the rebinding is logged instead of silently
+  dropping the earlier entry.
+
+- **geosite stress test no longer flakes on RSS** (#625 item 18): the
+  `ps`-RSS assertion — which counts the whole test process, including
+  sibling test threads — is replaced by a counting `#[global_allocator]`
+  live-bytes delta with a serialization lane between the two tests.
+
 - **DNS forwarding preserves upstream error responses for non-address queries** —
   TXT, MX, HTTPS, and other non-A/AAAA queries retain the upstream response code
   instead of reporting `NOERROR` for `NXDOMAIN`, `SERVFAIL`, or `REFUSED` replies.

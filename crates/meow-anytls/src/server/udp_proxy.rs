@@ -3,6 +3,16 @@
 //! Implements the sing-box udp-over-tcp v2 protocol, both the Connect and the
 //! Bind (non-connect) format.
 //!
+//! # Vendored-code note (meow-rs issue #625)
+//!
+//! The sequential `read_exact` framing reads below can leave the stream
+//! mid-frame after a partial read error, desyncing subsequent packets —
+//! the same class of bug fixed in `meow-proxy`'s Snell UDP path. There
+//! are **no production-path callers** (meow-rs does not wire UDP-over-TCP
+//! through the vendored `Server`; only `meow-proxy` integration tests
+//! drive it). The note stands so the pattern is not copied into live
+//! code without the fix.
+//!
 //! # Protocol Format
 //!
 //! ## Request (sent once at stream start):

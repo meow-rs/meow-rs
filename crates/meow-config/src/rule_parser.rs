@@ -75,6 +75,21 @@ pub fn parse_one_rule_or_subrule(
         return result;
     }
     if let Some(block_name) = parse_sub_rule_reference(line) {
+        // `SUB-RULE,<name>` takes exactly one field. A further comma field
+        // — upstream's unsupported `SUB-RULE,(cond),name` conditional form,
+        // or a typo'd `SUB-RULE,name,junk` — used to be silently dropped,
+        // which routes by a different block than the author wrote (#625).
+        let rest = line
+            .split_once(',')
+            .map(|(_, r)| r)
+            .unwrap_or_default()
+            .trim();
+        if rest.contains(',') {
+            return Err(format!(
+                "SUB-RULE takes exactly <block-name> — trailing fields are \
+                 not supported: '{line}'"
+            ));
+        }
         return build_sub_rule_rule(&block_name, sub_rules);
     }
     meow_rules::parse_rule(line, ctx)
@@ -143,6 +158,40 @@ mod tests {
         ));
         map.insert("doms".to_string(), doms);
         map
+    }
+
+    /// Issue #625 — `SUB-RULE,<name>` takes exactly one field: a third
+    /// comma field (a typo, or upstream's unsupported `(cond)` conditional
+    /// form) must be rejected, not silently dropped onto the first field.
+    /// A silent drop would route by a different block than written.
+    #[test]
+    fn sub_rule_rejects_trailing_fields() {
+        use crate::sub_rules_parser::SubRuleBlocks;
+        let providers = providers();
+        let sub_rules: SubRuleBlocks = HashMap::from([("blk".to_string(), Arc::new(Vec::new()))]);
+
+        let ok = parse_one_rule_or_subrule(
+            "SUB-RULE,blk",
+            &providers,
+            &ParserContext::default(),
+            &sub_rules,
+        );
+        assert!(ok.is_ok(), "plain SUB-RULE,blk must parse");
+
+        for line in [
+            "SUB-RULE,blk,junk",
+            "SUB-RULE,(DOMAIN,a),blk",
+            "SUB-RULE,blk,",
+        ] {
+            let err =
+                parse_one_rule_or_subrule(line, &providers, &ParserContext::default(), &sub_rules)
+                    .err()
+                    .expect("trailing comma fields must be rejected");
+            assert!(
+                err.contains("trailing fields"),
+                "{line}: unexpected error {err}"
+            );
+        }
     }
 
     /// `RULE-SET,...,src` (issue #625 item 11, upstream `isSrc`): the set

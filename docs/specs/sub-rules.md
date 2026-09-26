@@ -95,19 +95,26 @@ target is always the target of whichever rule *inside* the block matched.
 `MATCH` inside a sub-rule block still works: `MATCH,Fallback` always matches, so
 the sub-rule block always produces a result when MATCH is present.
 
+**Resolution gate**: if any live rule inside the block needs a resolved
+destination IP (`should_resolve_ip()` — `IP-CIDR`, `GEOIP`, `RULE-SET` with an
+ipcidr provider, etc.) and `metadata.dst_ip` is not yet resolved, the SUB-RULE
+entry reports no-match and the tunnel continues to the next top-level rule —
+upstream `Logic.Match`'s `ShouldResolveIP() && !Resolved()` arm (push-resolution
+baseline; the later `LogicRules` refactor pulled resolution per-rule, which our
+engine does not support). On the lazy TCP path the demanding slot is flagged
+`NeedsEnrichment` and re-matched strictly after DNS; on UDP paths `pre_resolve`
+has already run, so the gate is unreachable there.
+
 An inner rule whose target is the literal name `PASS-RULE`, or an adapter
 (group) whose `unwrap_proxy` chain contains a `PASS-RULE`-typed adapter
 (upstream's `CheckPassRule`), is skipped and the inner scan continues —
 upstream `matchSubRules`' `continue`. At top level a rule targeting
 `PASS-RULE` materializes the nop adapter and rejects like `REJECT`.
 
-**⚠️ YAML syntax note**: upstream SUB-RULE is implemented as a logic rule
-(`rules/logic/logic.go`). The exact comma-separated field layout should be
-verified from `rules/parser.go` SUB-RULE case before engineer writes the
-Rust parser. The examples above use the two-field form `SUB-RULE,BLOCK-NAME`;
-upstream may use a gate expression as the first field with block-name as target
-(similar to AND/OR syntax). Engineer: confirm the parser call site before
-committing to a YAML shape.
+**YAML syntax**: the implemented form is the two-field `SUB-RULE,BLOCK-NAME`.
+A third field (`SUB-RULE,blk,junk`) is a parse error — it was silently dropped
+before #625, which read like a fallback target that never existed. Upstream's
+parenthesized `(cond)` gate-expression form is not implemented.
 
 **Divergences from upstream** (classified per
 [ADR-0002](../adr/0002-upstream-divergence-policy.md)):

@@ -119,7 +119,7 @@ only ever matches on the TProxy listener.
 | Type | Example | Behavior |
 | --- | --- | --- |
 | `RULE-SET` | `RULE-SET,gfw,Proxy` | Delegates to a named [rule provider](./providers); `,src` matches the client IP (ipcidr/classical providers) |
-| `SUB-RULE` | `SUB-RULE,my-block,Proxy` | Evaluates a named block from `sub-rules:` |
+| `SUB-RULE` | `SUB-RULE,my-block` | Evaluates a named block from `sub-rules:`; the matched inner rule supplies the target |
 
 `SUB-RULE` blocks are declared at the top level:
 
@@ -130,9 +130,13 @@ sub-rules:
     - IP-CIDR,10.0.0.0/8,Corporate
 
 rules:
-  - SUB-RULE,my-block,Proxy
+  - SUB-RULE,my-block
   - MATCH,DIRECT
 ```
+
+`SUB-RULE` takes exactly one field — the block name. A trailing field
+(`SUB-RULE,my-block,Proxy`) is rejected: it was silently ignored before,
+which read like a fallback target that never existed.
 
 ## Logic rules
 

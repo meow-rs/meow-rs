@@ -31,6 +31,13 @@
 //!     return matchSubRules(metadata, l.adapter, subRules)
 //! ```
 //!
+//! Baseline note: this gate ports the push-resolution generation of
+//! upstream (pre-`ae7967f`); the later `LogicRules` refactor removed it
+//! and let inner IP rules pull `helper.ResolveIP` themselves. Our engine
+//! drives resolution (`RuleMatchHelper` is a marker struct), so the gate
+//! is the correct port — future upstream-chasing should not treat its
+//! absence there as a signal to remove it here.
+//!
 //! Our Rust translation compiles the block reference at parse time: each
 //! `SubRule` owns an `Arc<Vec<Box<dyn Rule>>>` that points to the resolved
 //! block. Sharing via `Arc` is reference-count sharing only; not semantically
@@ -72,6 +79,14 @@ impl Rule for SubRuleRule {
         // Retained for API compatibility — only asks "did anything match?".
         // Non-authoritative: it applies no PASS-RULE filtering; the probe-
         // aware `match_and_resolve` is the contract the engines use.
+        //
+        // upstream logic.go: `l.ShouldResolveIP() && !metadata.Resolved()`
+        // skips the block until the dst IP is resolved — without it an
+        // inner domain rule can match early and pre-empt an inner IP rule
+        // that would have matched once the address resolved (#625).
+        if self.should_resolve_ip() && !metadata.resolved() {
+            return false;
+        }
         self.block
             .iter()
             .any(|r| r.match_metadata(metadata, helper))
@@ -116,6 +131,12 @@ impl Rule for SubRuleRule {
         helper: &RuleMatchHelper,
         probe: &dyn TargetProbe,
     ) -> Option<&'a str> {
+        // upstream logic.go::Logic.Match SUB_RULE arm — the whole block is
+        // skipped while the dst IP is unresolved (#625); same gate as
+        // `match_metadata` above.
+        if self.should_resolve_ip() && !metadata.resolved() {
+            return None;
+        }
         // upstream: rules/logic/logic.go::matchSubRules — an inner rule
         // resolving to the literal `PASS-RULE` name or a PASS-RULE-typed
         // adapter (`CheckPassRule`) is skipped and the scan moves to the
@@ -335,6 +356,59 @@ mod tests {
         assert!(sub.never_matches());
         let empty = SubRuleRule::from_rules("BLOCK", vec![]);
         assert!(empty.never_matches());
+    }
+
+    /// Issue #625 — upstream `Logic.Match` SUB_RULE arm: a block whose
+    /// rules demand a resolved IP must not match while `metadata.resolved()`
+    /// is still false. Without the gate an inner domain-type matcher wins
+    /// early, pre-empting an inner IP rule that would have matched once
+    /// the address resolved.
+    #[test]
+    fn sub_rule_waits_for_ip_resolution() {
+        /// IP-rule stand-in: demands resolution, matches only when the
+        /// dst IP is present.
+        struct NeedsIpRule;
+        impl Rule for NeedsIpRule {
+            fn rule_type(&self) -> RuleType {
+                RuleType::Match
+            }
+            fn match_metadata(&self, m: &Metadata, _: &RuleMatchHelper) -> bool {
+                m.resolved()
+            }
+            fn adapter(&self) -> &str {
+                "IP-TARGET"
+            }
+            fn payload(&self) -> &str {
+                "ip"
+            }
+            fn should_resolve_ip(&self) -> bool {
+                true
+            }
+        }
+
+        // Domain-first ordering: the early matcher must NOT win while the
+        // metadata is still unresolved.
+        let sub = SubRuleRule::from_rules(
+            "BLOCK",
+            vec![match_rule("DOMAIN-TARGET"), Box::new(NeedsIpRule)],
+        );
+        let unresolved = Metadata::default();
+        assert!(
+            sub.match_and_resolve(&unresolved, &helper(), &|_: &str| true)
+                .is_none(),
+            "a resolution-demanding block must not match unresolved metadata"
+        );
+        assert!(!sub.match_metadata(&unresolved, &helper()));
+
+        let resolved = Metadata {
+            dst_ip: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+            ..Metadata::default()
+        };
+        assert_eq!(
+            sub.match_and_resolve(&resolved, &helper(), &|_: &str| true),
+            Some("DOMAIN-TARGET"),
+            "post-resolution the block evaluates in order"
+        );
     }
 
     /// D2 — dead children's demands do not leak into the aggregate.

@@ -403,7 +403,7 @@ fn collect_proxy_server_ips(tunnel: &Tunnel) -> Vec<IpAddr> {
 
 async fn handle_tproxy_conn(
     tunnel: Tunnel,
-    mut stream: tokio::net::TcpStream,
+    stream: tokio::net::TcpStream,
     src_addr: SocketAddr,
     listen_addr: SocketAddr,
     sniffer: Option<Arc<SnifferRuntime>>,
@@ -417,6 +417,30 @@ async fn handle_tproxy_conn(
         return Err("original destination is the listen address (loop detected)".into());
     }
 
+    handle_tproxy_flow(
+        tunnel,
+        stream,
+        src_addr,
+        orig_dst,
+        listen_addr,
+        sniffer,
+        name,
+    )
+    .await
+}
+
+/// Everything after original-destination recovery, split out so tests can
+/// drive the flow with a plain loopback socket (`SO_ORIGINAL_DST` /
+/// `DIOCNATLOOK` only succeed on genuinely redirected connections).
+async fn handle_tproxy_flow(
+    tunnel: Tunnel,
+    mut stream: tokio::net::TcpStream,
+    src_addr: SocketAddr,
+    orig_dst: SocketAddr,
+    listen_addr: SocketAddr,
+    sniffer: Option<Arc<SnifferRuntime>>,
+    name: String,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Build initial metadata with IP-literal host for sniffer / DNS-snoop.
     let mut metadata = Metadata {
         network: Network::Tcp,
@@ -468,6 +492,11 @@ async fn handle_tproxy_conn(
     ) {
         return Err("unmapped fake-ip destination".into());
     }
+    // Strict `resolve_proxy` below requires the dst-IP pre-resolution
+    // contract (match_engine doc): fake-IP rescue above may have cleared
+    // `dst_ip` after recovering the hostname, and without this, IP rules
+    // never matched on the TProxy TCP path at all (issue #625 review).
+    inner.pre_resolve(&mut metadata).await;
     let admission = inner.tcp_admission();
     let Some(ResolvedTarget {
         adapter: proxy,
@@ -895,6 +924,72 @@ mod tests {
             msg.contains("Linux") || msg.contains("not supported on this platform"),
             "unexpected error: {err}"
         );
+    }
+
+    /// Issue #625 review: the strict `resolve_proxy` match requires the
+    /// pre-resolve contract — a fake-IP-rescued flow arrives with
+    /// `dst_ip=None` and a recovered host, so `pre_resolve` must run or the
+    /// IP-CIDR slot can never match and the flow silently falls through to
+    /// `MATCH`. Without the call, this test would observe `MATCH/DIRECT`.
+    #[tokio::test]
+    async fn tcp_flow_pre_resolves_dst_ip_for_ip_rules() {
+        use meow_dns::fakeip::{MemoryStore, Pool};
+
+        let mut resolver = meow_dns::Resolver::new(
+            vec![],
+            vec![],
+            meow_common::DnsMode::FakeIp,
+            meow_trie::DomainTrie::new(),
+            true,
+            true,
+        );
+        let net = "198.18.0.0/16".parse::<ipnet::IpNet>().unwrap();
+        resolver.set_fakeip_v4(Arc::new(
+            Pool::new(net, Arc::new(MemoryStore::new(1024))).unwrap(),
+        ));
+        let resolver = Arc::new(resolver);
+        let fake = resolver.lookup_ipv4("example.test").await.unwrap();
+        assert!(resolver.is_fake_ip(fake), "expected a fake IP, got {fake}");
+        let real = IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1));
+        resolver.preload_cache("example.test", &[real], Duration::from_secs(300));
+
+        let tunnel = Tunnel::new(resolver);
+        let res = meow_config::rebuild_from_raw(&Default::default()).unwrap();
+        tunnel.update_proxies(res.proxies, res.dialer_registry);
+        tunnel.update_rules(vec![
+            meow_rules::parse_rule("IP-CIDR,127.0.0.1/32,REJECT", &Default::default()).unwrap(),
+            Box::new(meow_rules::final_rule::FinalRule::new("DIRECT")),
+        ]);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(listen_addr).await.unwrap();
+        let (server, peer) = listener.accept().await.unwrap();
+        let orig_dst = SocketAddr::new(fake, 443);
+        let stats = Arc::clone(tunnel.statistics());
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let task = tokio::spawn(handle_tproxy_flow(
+                tunnel,
+                server,
+                peer,
+                orig_dst,
+                listen_addr,
+                None,
+                "tproxy".into(),
+            ));
+            // The relay waits for client EOF — close our end so the flow
+            // completes after the REJECT adapter yields its eof stream.
+            drop(client);
+            let _ = task.await.unwrap();
+            let snap = stats.rule_match.snapshot();
+            assert!(
+                snap.contains(&(("IP-CIDR", "REJECT"), 1)),
+                "pre_resolve must let the IP-CIDR rule match — got {snap:?}"
+            );
+        })
+        .await
+        .expect("pre_resolve must let the IP-CIDR rule match the rescued host");
     }
 
     #[test]
