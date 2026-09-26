@@ -93,6 +93,9 @@ impl MixedListener {
             None
         };
         let mut warned_saturated = false;
+        // A persistent accept failure (fd exhaustion) must not spin the loop
+        // or flood the log; a transient one must not be delayed meaningfully.
+        let mut accept_backoff = meow_common::ErrorBackoff::new();
 
         loop {
             // Acquire a slot before accepting — back-pressures the TCP listen
@@ -122,10 +125,20 @@ impl MixedListener {
             };
 
             let (stream, src_addr) = match listener.accept().await {
-                Ok(v) => v,
+                Ok(v) => {
+                    accept_backoff.succeeded();
+                    v
+                }
                 Err(e) => {
-                    error!("Accept error: {}", e);
                     drop(permit);
+                    // Loud only when the backoff engaged — per-connection
+                    // errors (a reset embryo, a pending network error) are
+                    // queue progress and stay at debug!.
+                    if accept_backoff.failed(&e).await {
+                        error!("Mixed listener '{}' accept error: {}", self.name, e);
+                    } else {
+                        debug!("Mixed listener '{}' accept error: {}", self.name, e);
+                    }
                     continue;
                 }
             };

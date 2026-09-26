@@ -8,6 +8,7 @@ pub mod adapter;
 pub mod adapter_type;
 pub mod atomic;
 pub mod auth;
+pub mod backoff;
 pub mod conn;
 pub mod dial;
 pub mod dns_mode;
@@ -29,6 +30,7 @@ pub use adapter::{
 };
 pub use adapter_type::{AdapterType, ConnType};
 pub use auth::{AuthConfig, Credentials};
+pub use backoff::ErrorBackoff;
 pub use conn::{ProxyConn, ProxyPacketConn, UdpPacket};
 pub use dial::{with_dial_timeout, DIAL_TIMEOUT};
 pub use dns_mode::DnsMode;

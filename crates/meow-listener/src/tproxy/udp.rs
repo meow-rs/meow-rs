@@ -799,10 +799,10 @@ mod linux {
             || dst_ip == IpAddr::V4(Ipv4Addr::BROADCAST))
     }
 
-    /// Binds a spawned task's lifetime to a scope: dropping the guard —
-    /// on error return *or* on task cancellation — aborts it. Used for
-    /// the reply dispatcher, which otherwise lingered after the recv
-    /// loop exited until every flow channel closed, up to `udp_timeout`
+    /// Binds a spawned task's lifetime to a scope: when the owning task's
+    /// frame is dropped (abort/cancellation — `run_udp` itself never
+    /// returns), the guard aborts the reply dispatcher, which otherwise
+    /// lingered until every flow channel closed, up to `udp_timeout`
     /// (issue #621).
     struct AbortOnDrop(tokio::task::AbortHandle);
 
@@ -812,9 +812,14 @@ mod linux {
         }
     }
 
-    /// The UDP receive loop: socket → flow dispatch. Exits on socket
-    /// errors; idle-flow eviction is lazy (channel-close observed on the
-    /// next datagram, or the periodic sweep).
+    /// The UDP receive loop: socket → flow dispatch. Runs until the task
+    /// is aborted — socket errors retry with `ErrorBackoff` rather than
+    /// terminate, since the reachable failures are transient `ENOBUFS`/
+    /// `ENOMEM` pressure and a permanent degrade behind one error would
+    /// be silent (the spawn discards the JoinHandle); a persistent
+    /// failure still surfaces via the backoff-rate-limited `warn!`.
+    /// Idle-flow eviction is lazy (channel-close observed on the next
+    /// datagram, or the periodic sweep).
     pub async fn run_udp(
         tunnel: Tunnel,
         socket: UdpSocket,
@@ -822,7 +827,7 @@ mod linux {
         max_flows: usize,
         in_name: String,
         in_port: u16,
-    ) -> io::Result<()> {
+    ) {
         let (reply_tx, reply_rx) = mpsc::channel::<ReplyMsg>(REPLY_QUEUE);
         let _dispatcher = AbortOnDrop(tokio::spawn(reply_dispatch(reply_rx)).abort_handle());
 
@@ -832,17 +837,25 @@ mod linux {
         let local_addr = socket
             .local_addr()
             .unwrap_or_else(|_| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), in_port));
+        // Retry-and-backoff rationale: see `run_udp`'s doc comment.
+        let mut recv_backoff = meow_common::ErrorBackoff::new();
 
         loop {
             let (n, client, orig_dst) = match recv_dgram(&socket, &mut buf).await {
-                Ok(Some(v)) => v,
+                Ok(Some(v)) => {
+                    recv_backoff.succeeded();
+                    v
+                }
+                // A dropped datagram is not proof of socket health — the
+                // delay stays elevated while errors still interleave.
                 Ok(None) => continue,
-                // A persistent socket error ends the UDP path while the
-                // TCP listener keeps running — never leave that degrade
-                // silent (the spawn discards the JoinHandle).
                 Err(e) => {
-                    warn!("tproxy UDP '{in_name}': recv loop terminating on error: {e}");
-                    return Err(e);
+                    if recv_backoff.failed(&e).await {
+                        warn!("tproxy UDP '{in_name}' recv error: {e}");
+                    } else {
+                        debug!("tproxy UDP '{in_name}' recv error: {e}");
+                    }
+                    continue;
                 }
             };
             // Sanity-guard the recovered destination before it ever reaches
