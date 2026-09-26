@@ -39,6 +39,24 @@ pub struct TProxyListener {
     udp: bool,
     /// Per-flow UDP idle timeout (both directions refresh it).
     udp_timeout: std::time::Duration,
+    /// Fallible setup performed by [`Self::prepare`] — carried so `run_on`
+    /// spawns nothing that can fail inside a detached task (issue #641).
+    prepared: Option<Prepared>,
+}
+
+/// Fallible setup artifacts held on the listener between
+/// [`TProxyListener::prepare`] and [`TProxyListener::run_on`]. `Drop` on
+/// the firewall guard tears the rules down.
+struct Prepared {
+    /// Address the setup was performed against — `run_on` asserts the
+    /// served socket resolves to the same address so firewall rules and
+    /// the transparent UDP socket can't silently land on a different
+    /// port than the TCP listener.
+    bound_addr: SocketAddr,
+    firewall: Option<FirewallGuard>,
+    /// Bound `IP_TRANSPARENT` UDP socket (Linux `udp: true` only).
+    #[cfg(target_os = "linux")]
+    udp_socket: Option<tokio::net::UdpSocket>,
 }
 
 impl TProxyListener {
@@ -76,6 +94,7 @@ impl TProxyListener {
             firewall: true,
             udp: false,
             udp_timeout: std::time::Duration::from_secs(60),
+            prepared: None,
         }
     }
 
@@ -119,16 +138,18 @@ impl TProxyListener {
         self.run_on(listener).await
     }
 
-    /// Serve on an already-bound socket, letting the caller resolve a
-    /// `port: 0` ephemeral listener to its OS-assigned port first. Firewall
-    /// redirect rules are installed against the socket's actual local port,
-    /// so ephemeral listeners redirect correctly.
-    pub async fn run_on(
-        self,
-        listener: TcpListener,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let bound_addr = listener.local_addr().unwrap_or(self.listen_addr);
-
+    /// Perform the fallible setup — platform/udp gate checks, managed
+    /// firewall rules, and the UDP `IP_TRANSPARENT` socket — eagerly, so a
+    /// caller spawning [`Self::run_on`] in a detached task can fail the
+    /// listener before the bound TCP socket is handed over (issue #641).
+    /// `bound_addr` is the resolved listen addr (post port-0 resolution)
+    /// — it must be the `local_addr()` of the socket later passed to
+    /// [`Self::run_on`], or the prepared firewall/UDP artifacts would
+    /// target a different port than the one accepting TCP (debug-asserted).
+    pub async fn prepare(
+        mut self,
+        bound_addr: SocketAddr,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         // Set up firewall redirect rules (tears down on drop) — skipped
         // entirely under external firewall management: no bypass-IP
         // collection, no nft/pfctl invocation, no cleanup ownership
@@ -153,7 +174,7 @@ impl TProxyListener {
             );
         }
 
-        let _firewall = if self.firewall {
+        let firewall = if self.firewall {
             let bypass_ips = collect_proxy_server_ips(&self.tunnel);
             Some(
                 FirewallGuard::setup(bound_addr.port(), self.routing_mark, &bypass_ips).map_err(
@@ -177,50 +198,87 @@ impl TProxyListener {
         };
 
         // #564: opt-in Linux UDP TPROXY datagram path on the same bound
-        // port. The socket is created BEFORE the "started" log so a UDP
-        // failure (missing CAP_NET_ADMIN, port conflict) never reports a
-        // half-ready TCP+UDP listener. Both invariants are re-enforced here
-        // even though config parsing already rejects `udp` + managed
-        // firewall and non-IPv4 binds — programmatic constructors get the
-        // same contract.
-        if self.udp {
-            #[cfg(target_os = "linux")]
-            {
-                let udp_socket = udp::bind_transparent(bound_addr).map_err(
-                    |e| -> Box<dyn std::error::Error + Send + Sync> {
-                        format!(
-                            "tproxy `udp` transparent socket on {bound_addr} failed \
-                                 (needs CAP_NET_ADMIN/CAP_NET_RAW): {e}"
-                        )
-                        .into()
-                    },
-                )?;
-                let udp_tunnel = self.tunnel.clone();
-                let udp_timeout = self.udp_timeout;
-                let udp_max = self.max_connections;
-                let udp_name = self.name.clone();
-                let udp_port = bound_addr.port();
-                // `run_udp` retries socket errors internally and only ends
-                // via abort — there is no error return to surface here.
-                tokio::spawn(async move {
-                    udp::run_udp(
-                        udp_tunnel,
-                        udp_socket,
-                        udp_timeout,
-                        udp_max,
-                        udp_name,
-                        udp_port,
+        // port. Both invariants are re-enforced here even though config
+        // parsing already rejects `udp` + managed firewall and non-IPv4
+        // binds — programmatic constructors get the same contract.
+        #[cfg(target_os = "linux")]
+        let udp_socket = if self.udp {
+            Some(udp::bind_transparent(bound_addr).map_err(
+                |e| -> Box<dyn std::error::Error + Send + Sync> {
+                    format!(
+                        "tproxy `udp` transparent socket on {bound_addr} failed \
+                             (needs CAP_NET_ADMIN/CAP_NET_RAW): {e}"
                     )
-                    .await;
-                });
-                info!(
-                    "TProxy listener '{}': UDP TPROXY active on {} (external rules \
-                     must steer LAN datagrams here — see docs/tproxy-gateway.md)",
-                    self.name, bound_addr
-                );
-            }
-            #[cfg(not(target_os = "linux"))]
+                    .into()
+                },
+            )?)
+        } else {
+            None
+        };
+        #[cfg(not(target_os = "linux"))]
+        if self.udp {
             return Err("tproxy `udp: true` is Linux-only in this release".into());
+        }
+
+        self.prepared = Some(Prepared {
+            bound_addr,
+            firewall,
+            #[cfg(target_os = "linux")]
+            udp_socket,
+        });
+        Ok(self)
+    }
+
+    /// Serve on an already-bound socket, letting the caller resolve a
+    /// `port: 0` ephemeral listener to its OS-assigned port first. Firewall
+    /// redirect rules are installed against the socket's actual local port,
+    /// so ephemeral listeners redirect correctly. Runs [`Self::prepare`]
+    /// internally when the caller didn't — embedders that spawn this in a
+    /// detached task should `prepare` first so setup failures surface at
+    /// spawn time.
+    pub async fn run_on(
+        mut self,
+        listener: TcpListener,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let bound_addr = listener.local_addr().unwrap_or(self.listen_addr);
+        if self.prepared.is_none() {
+            self = self.prepare(bound_addr).await?;
+        }
+        let prepared = self.prepared.take().expect("prepare fills the slot");
+        debug_assert_eq!(
+            prepared.bound_addr, bound_addr,
+            "TProxyListener::prepare was run against a different address \
+             than the socket passed to run_on — firewall rules/UDP socket \
+             would bind the wrong port"
+        );
+        // The guard keeps the managed ruleset alive for the loop's lifetime.
+        let _firewall = prepared.firewall;
+
+        #[cfg(target_os = "linux")]
+        if let Some(udp_socket) = prepared.udp_socket {
+            let udp_tunnel = self.tunnel.clone();
+            let udp_timeout = self.udp_timeout;
+            let udp_max = self.max_connections;
+            let udp_name = self.name.clone();
+            let udp_port = bound_addr.port();
+            // `run_udp` retries socket errors internally and only ends
+            // via abort — there is no error return to surface here.
+            tokio::spawn(async move {
+                udp::run_udp(
+                    udp_tunnel,
+                    udp_socket,
+                    udp_timeout,
+                    udp_max,
+                    udp_name,
+                    udp_port,
+                )
+                .await;
+            });
+            info!(
+                "TProxy listener '{}': UDP TPROXY active on {} (external rules \
+                 must steer LAN datagrams here — see docs/tproxy-gateway.md)",
+                self.name, bound_addr
+            );
         }
 
         if self.max_connections == 0 {

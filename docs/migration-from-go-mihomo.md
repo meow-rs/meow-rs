@@ -119,6 +119,8 @@ These fields parse without error but behave differently from Go mihomo:
 | `PUT /configs` payload with raw YAML (not base64) | Accepted in some versions | 400 with helpful message | B |
 | `GET /configs` response includes null Option fields | Full struct with nulls | Only non-null fields returned | B |
 | `geodata-mode`, `geodata-loader`, `geoip-matcher` | Valid fields | Ignored with warn-once (M2+) | B |
+| `dns.listen` / `external-controller` bind failure at startup | Logs error, daemon keeps running | Hard startup error (process exits non-zero) — no prior listener exists to fall back to; runtime `PUT /configs` rebind keeps its tolerant keep-old semantics | A |
+| `dns.listen` set while `dns.enable: false` | Silently ignored | Warn-once that no listener is started | B |
 
 ### Fields that are silently ignored in Go mihomo but error in meow-rs
 

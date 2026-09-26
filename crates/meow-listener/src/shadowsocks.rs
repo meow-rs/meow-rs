@@ -117,12 +117,62 @@ impl ShadowsocksListener {
         self
     }
 
-    /// Serve on an already-bound TCP socket. The caller binds first (so a
-    /// `port: 0` ephemeral listener resolves to its OS-assigned port before
-    /// the API snapshot is taken) and hands the socket over.
+    /// Bind the UDP relay socket on the resolved `bound` port — the fallible
+    /// half of startup split from [`Self::run_on`] (issue #641): a spawning
+    /// caller can bind eagerly so a UDP failure (`EADDRINUSE`, sandbox deny)
+    /// surfaces before the task is detached, instead of dropping the
+    /// already-bound TCP socket when the task exits. Returns `None` when
+    /// `udp: false` or obfs is set (simple-obfs is TCP-only, with a warn).
+    pub async fn bind_udp(
+        &self,
+        bound: SocketAddr,
+    ) -> Result<
+        Option<shadowsocks::ProxySocket<shadowsocks::net::UdpSocket>>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        if !self.udp {
+            return Ok(None);
+        }
+        if self.obfs.is_some() {
+            warn!(
+                "ss listener '{}': simple-obfs is TCP-only; UDP relay disabled",
+                self.name
+            );
+            return Ok(None);
+        }
+        let udp_cfg = ServerConfig::new(bound, self.password.clone(), self.method)
+            .map_err(|e| meow_common::MeowError::Config(format!("ss udp bind: {e}")))?;
+        let udp_sock = shadowsocks::ProxySocket::bind(Arc::clone(&self.ctx), &udp_cfg)
+            .await
+            .map_err(|e| format!("ss listener '{}': udp bind failed: {e}", self.name))?;
+        info!(
+            "Shadowsocks listener '{}' UDP on {} (cipher={})",
+            self.name, bound, self.method
+        );
+        Ok(Some(udp_sock))
+    }
+
+    /// Serve on an already-bound TCP socket — binds the UDP relay socket
+    /// internally via [`Self::bind_udp`]. Callers that spawn this in a
+    /// detached task should instead bind eagerly and use
+    /// [`Self::run_on_udp`] so a UDP failure surfaces at spawn time.
     pub async fn run_on(
         &self,
         listener: TcpListener,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let bound = listener.local_addr().unwrap_or(self.listen_addr);
+        let udp_sock = self.bind_udp(bound).await?;
+        self.run_on_udp(listener, udp_sock).await
+    }
+
+    /// Serve on an already-bound TCP socket with the UDP relay socket from
+    /// [`Self::bind_udp`]. `bind_udp` must have been given this socket's
+    /// `local_addr()` — binding UDP on a different port than the TCP
+    /// listener accepts on would split the listener across ports.
+    pub async fn run_on_udp(
+        &self,
+        listener: TcpListener,
+        udp_sock: Option<shadowsocks::ProxySocket<shadowsocks::net::UdpSocket>>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let bound = listener.local_addr().unwrap_or(self.listen_addr);
         info!(
@@ -144,39 +194,20 @@ impl ShadowsocksListener {
             ProxyListener::from_listener(Arc::clone(&self.ctx), ss_listener, self.svr_cfg.as_ref())
         };
 
-        // UDP relay: simple-obfs is TCP-only, so UDP is skipped (with a warn)
-        // when obfs is configured. Otherwise bind a `ProxySocket` on the same
-        // resolved port and run the (peer, target) flow table in a background
-        // task. The TCP accept loop below drives the task's lifetime by
-        // outliving it (both run for the process lifetime).
-        if self.udp {
-            if self.obfs.is_some() {
-                warn!(
-                    "ss listener '{}': simple-obfs is TCP-only; UDP relay disabled",
-                    self.name
-                );
-            } else {
-                let udp_cfg = ServerConfig::new(bound, self.password.clone(), self.method)
-                    .map_err(|e| meow_common::MeowError::Config(format!("ss udp bind: {e}")))?;
-                let udp_sock = shadowsocks::ProxySocket::bind(Arc::clone(&self.ctx), &udp_cfg)
-                    .await
-                    .map_err(|e| format!("ss listener '{}': udp bind failed: {e}", self.name))?;
-                info!(
-                    "Shadowsocks listener '{}' UDP on {} (cipher={})",
-                    self.name, bound, self.method
-                );
-                let tunnel = self.tunnel.clone();
-                let name = self.name.clone();
-                let in_port = bound.port();
-                let max_flows = self.max_connections;
-                // SIP022 §3.2.2 requires the *server* to mint its own random
-                // session ID per relay session, so the relay draws from the
-                // cipher context's CSPRNG instead of a plain counter.
-                let session_ids = ServerSessionIds::new(Arc::clone(&self.ctx), self.method);
-                tokio::spawn(async move {
-                    run_udp_relay(tunnel, udp_sock, session_ids, name, in_port, max_flows).await;
-                });
-            }
+        // The UDP relay task shares the TCP accept loop's lifetime — both
+        // run for the process lifetime, so a plain detached spawn suffices.
+        if let Some(udp_sock) = udp_sock {
+            let tunnel = self.tunnel.clone();
+            let name = self.name.clone();
+            let in_port = bound.port();
+            let max_flows = self.max_connections;
+            // SIP022 §3.2.2 requires the *server* to mint its own random
+            // session ID per relay session, so the relay draws from the
+            // cipher context's CSPRNG instead of a plain counter.
+            let session_ids = ServerSessionIds::new(Arc::clone(&self.ctx), self.method);
+            tokio::spawn(async move {
+                run_udp_relay(tunnel, udp_sock, session_ids, name, in_port, max_flows).await;
+            });
         }
 
         let sem: Option<Arc<Semaphore>> =

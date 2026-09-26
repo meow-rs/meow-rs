@@ -833,8 +833,16 @@ async fn run(
     if let Some(listen_addr) = config.dns.listen_addr {
         let dns_server = DnsServer::new(Arc::clone(&config.dns.resolver), listen_addr);
         let slot = dns_server.resolver_slot();
+        // Bind eagerly: a `dns.listen` failure (EADDRINUSE, sandbox deny)
+        // is a hard startup error — there is no prior listener to fall
+        // back to, and a detached `run()` would leave the process
+        // "running" with a dead DNS endpoint (issue #641).
+        let bound = dns_server
+            .bind()
+            .await
+            .map_err(|e| anyhow::anyhow!("dns.listen {listen_addr}: {e}"))?;
         let task = tokio::spawn(async move {
-            if let Err(e) = dns_server.run().await {
+            if let Err(e) = bound.run().await {
                 error!("DNS server error: {}", e);
             }
         });
@@ -1031,6 +1039,16 @@ async fn run(
                     .with_max_connections(nl.max_connections)
                     .with_firewall(*firewall)
                     .with_udp(*udp, std::time::Duration::from_secs(*udp_timeout));
+                    // Firewall rules and the UDP TPROXY socket are fallible
+                    // setup — run them eagerly so a failure can't drop the
+                    // bound TCP socket inside a detached task (issue #641).
+                    let listener = match listener.prepare(bound).await {
+                        Ok(l) => l,
+                        Err(e) => {
+                            error!("listener '{}': setup failed: {}", nl.name, e);
+                            continue;
+                        }
+                    };
                     tokio::spawn(async move {
                         if let Err(e) = listener.run_on(socket).await {
                             error!("TProxy listener error: {}", e);
@@ -1084,8 +1102,18 @@ async fn run(
                             continue;
                         }
                     };
+                    // The UDP relay socket binds eagerly — otherwise a UDP
+                    // bind failure would drop the already-bound TCP socket
+                    // when the detached task exits (issue #641).
+                    let udp_sock = match listener.bind_udp(bound).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            error!("listener '{}': {}", nl.name, e);
+                            continue;
+                        }
+                    };
                     tokio::spawn(async move {
-                        if let Err(e) = listener.run_on(socket).await {
+                        if let Err(e) = listener.run_on_udp(socket, udp_sock).await {
                             error!("Shadowsocks listener error: {}", e);
                         }
                     });
@@ -1152,8 +1180,14 @@ async fn run(
             Arc::clone(&dns_server_handle),
             config.provider_dialer_registry.clone(),
         );
+        // Bind eagerly like the DNS listener and the `listeners:` entries:
+        // an `external-controller` failure is a hard startup error, not a
+        // detached task that dies one log line deep (issue #641).
+        let socket = tokio::net::TcpListener::bind(api_addr)
+            .await
+            .map_err(|e| anyhow::anyhow!("external-controller {api_addr}: {e}"))?;
         tokio::spawn(async move {
-            if let Err(e) = api_server.run().await {
+            if let Err(e) = api_server.run_on(socket).await {
                 error!("API server error: {}", e);
             }
         });
