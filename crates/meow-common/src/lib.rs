@@ -37,7 +37,7 @@ pub use dns_mode::DnsMode;
 pub use error::{MeowError, Result};
 pub use fs_util::{sweep_scratch_siblings, SCRATCH_STALE_AGE};
 pub use home_dir::{meow_home_dir, resolved_home_dir, set_home_dir, xdg_home_dir};
-pub use metadata::{AddrDisplay, Metadata};
+pub use metadata::{metadata_ip_literal, AddrDisplay, Metadata};
 pub use network::Network;
 #[cfg(target_os = "linux")]
 pub use outbound_iface::apply_outbound_interface;

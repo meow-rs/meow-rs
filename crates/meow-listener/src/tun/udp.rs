@@ -178,25 +178,6 @@ pub(super) async fn run_udp(
             continue;
         }
 
-        // A destination inside the fake-IP range with no live allocation
-        // would spawn a flow that immediately drops — drop the datagram
-        // here instead of churning a spawn+evict per packet under a stale
-        // flood (issue #618). The flow task re-checks the verdict; the
-        // call is idempotent.
-        let mut probe = Metadata {
-            network: Network::Udp,
-            dst_ip: Some(dst.ip()),
-            dst_port: dst.port(),
-            ..Default::default()
-        };
-        if matches!(
-            tunnel.inner().pre_handle_metadata(&mut probe),
-            meow_tunnel::PreHandleVerdict::Drop
-        ) {
-            debug!("tun udp: drop datagram to unmapped fake-ip {dst}");
-            continue;
-        }
-
         sweep_countdown -= 1;
         if sweep_countdown == 0 {
             sweep_countdown = SWEEP_INTERVAL;
@@ -223,6 +204,28 @@ pub(super) async fn run_udp(
             }
             None => data,
         };
+
+        // A destination inside the fake-IP range with no live allocation
+        // would spawn a flow that immediately drops — drop the datagram
+        // here instead of churning a spawn+evict per packet under a stale
+        // flood (issue #618). Runs only when a flow is about to be
+        // (re)created: an established flow already pinned its resolved
+        // destination at creation, and the flow task re-checks the verdict
+        // there too, so probing per datagram was dead resolver work on the
+        // hit path (issue #648).
+        let mut probe = Metadata {
+            network: Network::Udp,
+            dst_ip: Some(dst.ip()),
+            dst_port: dst.port(),
+            ..Default::default()
+        };
+        if matches!(
+            tunnel.inner().pre_handle_metadata(&mut probe),
+            meow_tunnel::PreHandleVerdict::Drop
+        ) {
+            debug!("tun udp: drop datagram to unmapped fake-ip {dst}");
+            continue;
+        }
 
         // Admission bound: reclaim dead entries first, then evict the
         // least-recently-active live flow.

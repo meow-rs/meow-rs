@@ -282,9 +282,48 @@ impl fmt::Display for Metadata {
     }
 }
 
+/// Parse a metadata `host`/`sniff_host`-style string as an IP literal,
+/// tolerating the `[v6]` brackets HTTP listeners retain in `host`
+/// (`host_to_ip` strips them for `dst_ip` only, e.g.
+/// `CONNECT [fc00::5]:443`).
+///
+/// Shared with the inbound UDP demux loops: they apply this same cheap
+/// fold to derive a flow key without touching the resolver, before any
+/// `pre_handle_metadata` rewrite (issue #648).
+pub fn metadata_ip_literal(s: &str) -> Option<IpAddr> {
+    s.parse::<IpAddr>().ok().or_else(|| {
+        s.strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .and_then(|s| s.parse::<IpAddr>().ok())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Plain and bracketed IP literals parse; names and malformed
+    /// brackets do not — the UDP demux fast path keys on exactly this
+    /// fold (issue #648).
+    #[test]
+    fn metadata_ip_literal_parses_plain_and_bracketed() {
+        assert_eq!(
+            metadata_ip_literal("203.0.113.7"),
+            Some("203.0.113.7".parse().unwrap())
+        );
+        assert_eq!(
+            metadata_ip_literal("2001:db8::1"),
+            Some("2001:db8::1".parse().unwrap())
+        );
+        assert_eq!(
+            metadata_ip_literal("[2001:db8::1]"),
+            Some("2001:db8::1".parse().unwrap())
+        );
+        assert_eq!(metadata_ip_literal("example.com"), None);
+        assert_eq!(metadata_ip_literal(""), None);
+        assert_eq!(metadata_ip_literal("[2001:db8::1"), None);
+        assert_eq!(metadata_ip_literal("203.0.113.7]"), None);
+    }
 
     /// `swap_src_dst` exchanges exactly the source/destination tuple —
     /// ip, port, geo-ip — and leaves host/process/inbound fields alone,

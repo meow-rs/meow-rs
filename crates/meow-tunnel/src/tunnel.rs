@@ -3,14 +3,14 @@ use crate::rule_ir::{CompiledMatchResult, CompiledRuleSet, LazyMatchOutcome};
 use crate::statistics::Statistics;
 use crate::udp::{self, NatTable};
 use meow_common::{
-    AdapterType, Metadata, Network, Proxy, ProxyAdapter, Rule, TargetCheck, TargetProbe, TunnelMode,
+    metadata_ip_literal, AdapterType, Metadata, Network, Proxy, ProxyAdapter, Rule, TargetCheck,
+    TargetProbe, TunnelMode,
 };
 use meow_dns::Resolver;
 use meow_proxy::DirectAdapter;
 use parking_lot::{Mutex, RwLock};
 use smol_str::SmolStr;
 use std::collections::HashMap;
-use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use tracing::{debug, info, warn};
@@ -553,17 +553,6 @@ pub enum PreHandleVerdict {
     /// inbound (TUN `auto-route`) and self-saturates `max-connections`
     /// (issue #618); mihomo drops the same class in `preHandleMetadata`.
     Drop,
-}
-
-/// Parse a metadata `host`/`sniff_host` as an IP literal, tolerating the
-/// `[v6]` brackets HTTP listeners retain in `host` (`host_to_ip` strips
-/// them for `dst_ip` only, e.g. `CONNECT [fc00::5]:443`).
-fn metadata_ip_literal(s: &str) -> Option<IpAddr> {
-    s.parse::<IpAddr>().ok().or_else(|| {
-        s.strip_prefix('[')
-            .and_then(|s| s.strip_suffix(']'))
-            .and_then(|s| s.parse::<IpAddr>().ok())
-    })
 }
 
 /// Route-table-backed [`TargetProbe`] for the match engines.

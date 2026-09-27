@@ -331,6 +331,27 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **UDP hot loops no longer probe metadata per datagram** (#648): the
+  TUN, SOCKS5-UDP, and Shadowsocks-UDP receive loops ran
+  `pre_handle_metadata` — a resolver read-lock, fake-IP range check, and
+  LRU reverse-lookup — on every datagram before the flow-table lookup,
+  even though the verdict was discarded whenever an established flow
+  accepted the packet. Each loop now derives the session key cheaply
+  first (a lock-free IP-literal fold shared via
+  `meow_common::metadata_ip_literal`), hits the live flow directly, and
+  runs the probe only on the miss path that is about to create one —
+  the shape `tproxy`'s dispatch already had. Fake-IP drop and rewrite
+  semantics are unchanged: a stale fake-IP destination still drops before
+  a flow spawns, and a still-allocated mapping rejoins its flow via a
+  second lookup under the rewritten key.
+
+- **TProxy UDP datagrams ride inline, not on the heap** (#648): both
+  directions of the tproxy flow channels copied every packet into a
+  fresh `Vec<u8>` (`to_vec()` per datagram). Payloads are now
+  `SmallVec<[u8; 1500]>` — stack-inline for a standard MTU, heap only
+  for oversized datagrams — matching socks5_udp and shadowsocks UDP;
+  per-flow queue byte accounting is unchanged.
+
 - **Test-suite timing flakes removed** (#641): several tests raced
   real-time sleeps against asynchronous cleanup — asserting stream-map
   drain, session death, or port rebind after a fixed 50–300 ms that a

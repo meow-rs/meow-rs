@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use meow_common::{with_dial_timeout, ConnType, Metadata, Network};
+use meow_common::{metadata_ip_literal, with_dial_timeout, ConnType, Metadata, Network};
 use meow_tunnel::{ResolvedTarget, Tunnel, TunnelInner};
 use smallvec::SmallVec;
 use smol_str::SmolStr;
@@ -226,6 +226,35 @@ fn handle_client_datagram(
     if dst_ip.is_none() && host.is_empty() {
         return Err("UDP request with neither IP nor domain".into());
     }
+    let host = Metadata::lower_host(&host);
+    let payload = &datagram[data_off..];
+
+    // Provisional session key — identical to the post-pipeline key for
+    // every input that survives `pre_handle_metadata` unchanged: `dst_ip`
+    // canonicalized, a domain-typed IP literal folded in
+    // (`metadata_ip_literal`, the same fold the pipeline runs), else the
+    // lowercased host. A fake-IP input necessarily misses the lookup:
+    // stored keys are built post-rewrite, where `dst_ip` is cleared to
+    // `None` — `Addr(fake-ip)` can never exist in the table. Only a miss
+    // pays the probe (issue #648).
+    //
+    // The equivalence holds within one resolver generation: a live
+    // `Addr(ip)` session whose `ip` only enters the fake-IP range after a
+    // config reload that swaps the pool keeps delivering (it was
+    // legitimately established) — the shape tproxy's dispatch has always
+    // had.
+    let provisional = match dst_ip
+        .or_else(|| metadata_ip_literal(&host))
+        .map(|ip| ip.to_canonical())
+    {
+        Some(ip) => SessionKey::Addr(SocketAddr::new(ip, dst_port)),
+        None => SessionKey::Host(host.clone(), dst_port),
+    };
+    match deliver_to_existing(nat, &provisional, payload) {
+        Deliver::Done => return Ok(()),
+        Deliver::Miss => {}
+    }
+
     let mut metadata = Metadata {
         network: Network::Udp,
         conn_type: ConnType::Socks5,
@@ -233,7 +262,7 @@ fn handle_client_datagram(
         src_port: client.port(),
         dst_ip,
         dst_port,
-        host: Metadata::lower_host(&host),
+        host,
         in_name: inbound.in_name.clone(),
         in_port: inbound.in_port,
         in_user: inbound.in_user.clone(),
@@ -267,43 +296,14 @@ fn handle_client_datagram(
         None => SessionKey::Host(metadata.host.clone(), dst_port),
     };
 
-    if let Some(session) = nat.get(&key) {
-        // A dead session (task exited — dial failure, write error, or
-        // upstream close) is evicted so this datagram starts a fresh one
-        // (issue #514).
-        if session.dead.load(Ordering::Relaxed) {
-            nat.remove(&key);
-        } else {
-            // Check capacity before copying the payload onto the queue —
-            // a flooded session drops the datagram without paying the copy.
-            if session.tx.capacity() == 0 {
-                debug!("SOCKS5 UDP session queue full: dropping datagram");
-                return Ok(());
-            }
-            match session
-                .tx
-                .try_send(SmallVec::from_slice(&datagram[data_off..]))
-            {
-                Ok(()) => {
-                    session.last_activity_ms.store(
-                        monotonic_ms() as meow_common::atomic::Uint,
-                        Ordering::Relaxed,
-                    );
-                }
-                // Queue filled between the capacity check and the send:
-                // drop the datagram (UDP semantics — the client retries; a
-                // flooded session must not grow memory unboundedly).
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    debug!("SOCKS5 UDP session queue full: dropping datagram");
-                }
-                // The task exited between the dead check and the send:
-                // evict and start a fresh session with this datagram.
-                Err(mpsc::error::TrySendError::Closed(payload)) => {
-                    nat.remove(&key);
-                    return start_session(inner, relay, nat, key, client, metadata, payload);
-                }
-            }
-            return Ok(());
+    // The post-pipeline key differs from the provisional one only when
+    // the probe rewrote a fake-IP destination — try the rewritten key
+    // once more before paying for a session (a stale datagram to a still-
+    // allocated mapping rejoins the existing Host-keyed session).
+    if key != provisional {
+        match deliver_to_existing(nat, &key, payload) {
+            Deliver::Done => return Ok(()),
+            Deliver::Miss => {}
         }
     }
 
@@ -314,8 +314,72 @@ fn handle_client_datagram(
         key,
         client,
         metadata,
-        SmallVec::from_slice(&datagram[data_off..]),
+        SmallVec::from_slice(payload),
     )
+}
+
+/// Outcome of offering one datagram to the session under a key.
+enum Deliver {
+    /// Queued, or deliberately dropped on a full queue (UDP semantics —
+    /// the client retries).
+    Done,
+    /// No live session under the key — plain absent, or evicted
+    /// dead/closed here: the caller starts a fresh one and re-copies the
+    /// datagram, a one-off cost only a recreate pays.
+    Miss,
+}
+
+/// Offer `payload` to the live session under `key`, evicting a dead one
+/// (issue #514). Centralizes the hit-path so `handle_client_datagram`
+/// can run it for both the provisional and the post-pipeline key.
+fn deliver_to_existing(
+    nat: &mut HashMap<SessionKey, Session>,
+    key: &SessionKey,
+    payload: &[u8],
+) -> Deliver {
+    // A dead session (task exited — dial failure, write error, or
+    // upstream close) is evicted so this datagram starts a fresh one
+    // (issue #514).
+    let Some(session) = nat.get(key) else {
+        return Deliver::Miss;
+    };
+    if session.dead.load(Ordering::Relaxed) {
+        nat.remove(key);
+        return Deliver::Miss;
+    }
+    // Check capacity before copying the payload onto the queue —
+    // a flooded session drops the datagram without paying the copy.
+    // (The shadowsocks sibling drops this pre-check deliberately: a
+    // closed channel with a *full* queue would read capacity 0 and
+    // skip the evict — here the `dead` flag is set during teardown
+    // before the rx drop, so the window is ~1 datagram and the
+    // periodic sweeper backstops the corner either way.)
+    if session.tx.capacity() == 0 {
+        debug!("SOCKS5 UDP session queue full: dropping datagram");
+        return Deliver::Done;
+    }
+    match session.tx.try_send(SmallVec::from_slice(payload)) {
+        Ok(()) => {
+            session.last_activity_ms.store(
+                monotonic_ms() as meow_common::atomic::Uint,
+                Ordering::Relaxed,
+            );
+            Deliver::Done
+        }
+        // Queue filled between the capacity check and the send:
+        // drop the datagram (UDP semantics — the client retries; a
+        // flooded session must not grow memory unboundedly).
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            debug!("SOCKS5 UDP session queue full: dropping datagram");
+            Deliver::Done
+        }
+        // The task exited between the dead check and the send:
+        // evict and start a fresh session with this datagram.
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            nat.remove(key);
+            Deliver::Miss
+        }
+    }
 }
 
 /// Insert a new session for `key` whose task performs resolution, routing,
@@ -631,6 +695,83 @@ mod tests {
     }
 
     struct DeadReadConn;
+
+    /// Reply reader that parks forever — keeps the session alive so tests
+    /// can assert identity (`Arc::ptr_eq` on `dead`) instead of tolerating
+    /// the re-dial a dead conn legitimately triggers.
+    struct ParkedReadConn;
+
+    #[async_trait::async_trait]
+    impl meow_common::ProxyPacketConn for ParkedReadConn {
+        async fn read_packet(&self, _buf: &mut [u8]) -> meow_common::Result<(usize, SocketAddr)> {
+            std::future::pending().await
+        }
+        async fn write_packet(&self, buf: &[u8], _addr: &SocketAddr) -> meow_common::Result<usize> {
+            Ok(buf.len())
+        }
+        fn local_addr(&self) -> meow_common::Result<SocketAddr> {
+            Ok("127.0.0.1:0".parse().unwrap())
+        }
+        fn close(&self) -> meow_common::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Proxy whose sessions stay alive — dial once, park the read.
+    struct ParkedUdpProxy {
+        dials: std::sync::atomic::AtomicUsize,
+        health: meow_common::ProxyHealth,
+    }
+
+    #[async_trait::async_trait]
+    impl meow_common::ProxyAdapter for ParkedUdpProxy {
+        fn name(&self) -> &str {
+            "parked-udp"
+        }
+        fn adapter_type(&self) -> meow_common::AdapterType {
+            meow_common::AdapterType::Direct
+        }
+        fn addr(&self) -> &str {
+            ""
+        }
+        fn support_udp(&self) -> bool {
+            true
+        }
+        async fn dial_tcp(
+            &self,
+            _metadata: &Metadata,
+        ) -> meow_common::Result<Box<dyn meow_common::ProxyConn>> {
+            Err(meow_common::MeowError::NotSupported("no tcp".into()))
+        }
+        async fn dial_udp(
+            &self,
+            _metadata: &Metadata,
+        ) -> meow_common::Result<Box<dyn meow_common::ProxyPacketConn>> {
+            self.dials.fetch_add(1, Ordering::Relaxed);
+            Ok(Box::new(ParkedReadConn))
+        }
+        fn health(&self) -> &meow_common::ProxyHealth {
+            &self.health
+        }
+    }
+
+    impl meow_common::Proxy for ParkedUdpProxy {
+        fn alive(&self) -> bool {
+            true
+        }
+        fn alive_for_url(&self, _url: &str) -> bool {
+            true
+        }
+        fn last_delay(&self) -> u16 {
+            0
+        }
+        fn last_delay_for_url(&self, _url: &str) -> u16 {
+            0
+        }
+        fn delay_history(&self) -> Vec<meow_common::DelayHistory> {
+            Vec::new()
+        }
+    }
 
     #[async_trait::async_trait]
     impl meow_common::ProxyPacketConn for DeadReadConn {
@@ -1026,6 +1167,116 @@ mod tests {
     fn parse_udp_request_rejects_fragment_and_short() {
         assert!(parse_udp_request(&[0, 0, 1, ATYP_IPV4, 1, 2, 3, 4, 0, 80]).is_err());
         assert!(parse_udp_request(&[0, 0]).is_err());
+    }
+
+    /// Fake-IP datagrams must rejoin the single `Host`-keyed session via the
+    /// post-probe second lookup — the provisional `Addr(fake-ip)` key can
+    /// never exist in the table, so a missing second lookup would spawn a
+    /// replacement session per datagram (issue #648 review). `Arc::ptr_eq`
+    /// on the session's `dead` flag distinguishes "rejoined the same
+    /// session" from "evicted and respawned an identical-looking one".
+    #[tokio::test]
+    async fn fake_ip_datagrams_rejoin_single_session() {
+        // Parked conn keeps the session alive — a FlakyUdpProxy-style conn
+        // that dies instantly would let a respawn masquerade as a rejoin.
+        let proxy = Arc::new(ParkedUdpProxy {
+            dials: std::sync::atomic::AtomicUsize::new(0),
+            health: meow_common::ProxyHealth::new(),
+        });
+        // `in_fake_ip_range`/`reverse_lookup` consult pools, not the DNS
+        // mode — a v4 pool alone drives the rewrite path. The session task
+        // re-resolves the recovered host for `dst_ip` before `dial_udp`;
+        // pin it via `hosts:` (the only upstream-free resolution source).
+        let mut hosts: meow_trie::DomainTrie<meow_dns::HostEntry> = meow_trie::DomainTrie::new();
+        hosts.insert(
+            "example.com",
+            meow_dns::HostEntry::Addresses(vec!["93.184.216.34".parse().unwrap()]),
+        );
+        let mut resolver = meow_dns::Resolver::new(
+            vec![],
+            vec![],
+            meow_common::DnsMode::FakeIp,
+            hosts,
+            true,
+            true,
+        );
+        let pool = std::sync::Arc::new(
+            meow_dns::fakeip::Pool::new(
+                "198.18.0.0/16".parse().unwrap(),
+                std::sync::Arc::new(meow_dns::fakeip::MemoryStore::new(1024)),
+            )
+            .unwrap(),
+        );
+        let fake_ip = pool.lookup("example.com");
+        resolver.set_fakeip_v4(pool);
+        let resolver = std::sync::Arc::new(resolver);
+        let tunnel = meow_tunnel::Tunnel::new(resolver);
+        let res = meow_config::rebuild_from_raw(&Default::default()).unwrap();
+        let mut proxies = res.proxies;
+        proxies.insert(
+            "parked-udp".into(),
+            Arc::clone(&proxy) as Arc<dyn meow_common::Proxy>,
+        );
+        tunnel.update_proxies(proxies, res.dialer_registry);
+        tunnel.update_rules(vec![Box::new(meow_rules::final_rule::FinalRule::new(
+            "parked-udp",
+        ))]);
+
+        let relay = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let inner = Arc::clone(tunnel.inner());
+        let mut nat: HashMap<SessionKey, Session> = HashMap::new();
+        let client: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+        let inbound = Metadata::default();
+        let dst = SocketAddr::new(fake_ip, 443);
+        let mut packet: SmallVec<[u8; 1500]> = SmallVec::new();
+        encode_udp_header(&mut packet, &dst);
+        packet.extend_from_slice(b"first");
+
+        // Datagram 1: provisional `Addr(fake-ip)` provably misses; the probe
+        // rewrites to `Host("example.com")` and spawns one session.
+        handle_client_datagram(&inner, &relay, &mut nat, &packet, client, &inbound).unwrap();
+        assert_eq!(nat.len(), 1);
+        let host_key = SessionKey::Host("example.com".into(), 443);
+        assert!(
+            nat.contains_key(&host_key),
+            "fake-ip datagram must key the session by rewritten host, got keys: {:?}",
+            nat.keys().collect::<Vec<_>>()
+        );
+
+        // Wait for the session to finish establishing so the entry is
+        // stable, then pin its identity.
+        assert!(
+            eventually(Duration::from_secs(2), || {
+                proxy.dials.load(Ordering::Relaxed) == 1
+            })
+            .await,
+            "session never dialed"
+        );
+        let dead_flag = Arc::clone(&nat.get(&host_key).unwrap().dead);
+
+        // Datagram 2 (same fake ip): provisional misses, probe rewrites,
+        // second lookup hits the SAME session — ptr_eq fails if the code
+        // spawned a replacement instead.
+        handle_client_datagram(&inner, &relay, &mut nat, &packet, client, &inbound).unwrap();
+        assert_eq!(nat.len(), 1, "rejoin must not spawn a second session");
+        assert!(
+            Arc::ptr_eq(&dead_flag, &nat.get(&host_key).unwrap().dead),
+            "datagram 2 must rejoin session 1, not evict-and-respawn it"
+        );
+        assert_eq!(
+            proxy.dials.load(Ordering::Relaxed),
+            1,
+            "rejoin must not re-dial"
+        );
+
+        // An UNMAPPED in-range ip (stale row / never allocated) drops before
+        // any session is created — the #618 flood guard still runs pre-spawn.
+        let stale = SocketAddr::new("198.18.7.7".parse().unwrap(), 443);
+        let mut stale_pkt: SmallVec<[u8; 1500]> = SmallVec::new();
+        encode_udp_header(&mut stale_pkt, &stale);
+        stale_pkt.extend_from_slice(b"stale");
+        handle_client_datagram(&inner, &relay, &mut nat, &stale_pkt, client, &inbound).unwrap();
+        assert_eq!(nat.len(), 1, "unmapped fake-ip datagram must not spawn");
     }
 
     #[test]
