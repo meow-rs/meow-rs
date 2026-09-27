@@ -340,7 +340,8 @@ impl SsCore {
 
                 match obfs.clone() {
                     BuiltinObfs::Http { host } => {
-                        let wrapped = HttpObfs::new(tcp, host, self.port);
+                        let wrapped = HttpObfs::new(tcp, host, self.port)
+                            .map_err(|e| MeowError::Config(format!("ss obfs: {e}")))?;
                         let stream = ProxyClientStream::from_stream(
                             Arc::clone(&self.context),
                             wrapped,
@@ -350,7 +351,8 @@ impl SsCore {
                         Ok(Box::new(SsConn(stream)))
                     }
                     BuiltinObfs::Tls { server } => {
-                        let wrapped = TlsObfs::new(tcp, server);
+                        let wrapped = TlsObfs::new(tcp, server)
+                            .map_err(|e| MeowError::Config(format!("ss obfs: {e}")))?;
                         let stream = ProxyClientStream::from_stream(
                             Arc::clone(&self.context),
                             wrapped,
@@ -535,11 +537,16 @@ impl SsCore {
             }
             PluginKind::Obfs(obfs) => {
                 let stream = match obfs.clone() {
-                    BuiltinObfs::Http { host } => Box::new(HttpObfs::new(stream, host, self.port))
+                    BuiltinObfs::Http { host } => Box::new(
+                        HttpObfs::new(stream, host, self.port)
+                            .map_err(|e| MeowError::Config(format!("ss obfs: {e}")))?,
+                    )
                         as Box<dyn meow_transport::Stream>,
-                    BuiltinObfs::Tls { server } => {
-                        Box::new(TlsObfs::new(stream, server)) as Box<dyn meow_transport::Stream>
-                    }
+                    BuiltinObfs::Tls { server } => Box::new(
+                        TlsObfs::new(stream, server)
+                            .map_err(|e| MeowError::Config(format!("ss obfs: {e}")))?,
+                    )
+                        as Box<dyn meow_transport::Stream>,
                 };
                 let s = ProxyClientStream::from_stream(
                     Arc::clone(&self.context),
@@ -754,6 +761,14 @@ pub(crate) fn parse_obfs_opts(plugin_opts: Option<&str>, server: &str) -> Result
     let host = host
         .filter(|h| !h.is_empty())
         .unwrap_or_else(|| server.to_string());
+    // `host` lands verbatim in the emitted `Host:` header (http mode) or
+    // SNI (tls mode) — reject bytes that could inject into either. The
+    // opt arrives verbatim from provider payloads too (issue #648).
+    if !meow_transport::simple_obfs::client::is_valid_obfs_host(&host) {
+        return Err(MeowError::Config(
+            "simple-obfs plugin-opts host is empty, over 253 bytes, or contains whitespace/control bytes".to_string(),
+        ));
+    }
     match mode.as_str() {
         "http" => Ok(BuiltinObfs::Http { host }),
         "tls" => Ok(BuiltinObfs::Tls { server: host }),
@@ -1678,6 +1693,28 @@ mod tests {
             BuiltinObfs::Http { host } => assert_eq!(host, "cloudflare.com"),
             _ => panic!("expected Http"),
         }
+    }
+
+    #[test]
+    fn test_parse_obfs_opts_rejects_ctl_host() {
+        // `host` lands verbatim in the emitted `Host:` header (http) or SNI
+        // (tls) — provider-supplied CTLs and oversized names must not parse
+        // (issue #648). An embedded `;`/`=` is already unusable as a value
+        // (the tokenizer splits there), so CTLs are the injection vector.
+        for opts in [
+            "mode=http;host=a\rb\nc",
+            "mode=tls;obfs-host=a\0b",
+            "mode=http;host=a\tb",
+        ] {
+            assert!(
+                parse_obfs_opts(Some(opts), "1.2.3.4").is_err(),
+                "{opts:?} must be rejected"
+            );
+        }
+        let overlong = format!("mode=http;host={}", "a".repeat(254));
+        assert!(parse_obfs_opts(Some(&overlong), "1.2.3.4").is_err());
+        let at_limit = format!("mode=http;host={}", "a".repeat(253));
+        assert!(parse_obfs_opts(Some(&at_limit), "1.2.3.4").is_ok());
     }
 
     #[test]

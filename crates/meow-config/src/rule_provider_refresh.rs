@@ -23,7 +23,7 @@ use crate::rule_provider::{ProviderType, RuleProvider};
 /// would overflow `Instant + Duration` inside `tokio::time::interval`
 /// and panic the task on every reconcile — an over-ceiling provider is
 /// treated as non-refreshable instead (issue #543 review).
-const MAX_REFRESH_INTERVAL_SECS: u64 = 10 * 365 * 24 * 60 * 60;
+const MAX_REFRESH_INTERVAL_SECS: u64 = meow_common::MAX_DURATION_SECS;
 
 /// Tracks the live refresh task per provider name. Cheap to share via
 /// `Arc`; all mutation goes through [`reconcile`](Self::reconcile), which

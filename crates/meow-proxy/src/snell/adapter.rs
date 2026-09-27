@@ -146,21 +146,27 @@ impl SnellAdapter {
             .await
             .map_err(MeowError::Io)?;
         let inner: Box<dyn TransportStream> = Box::new(tcp);
-        Ok(self.wrap_stream(inner))
+        self.wrap_stream(inner)
     }
 
     /// Apply Snell's optional simple-obfs layer and AEAD codec to any already
     /// connected byte stream.
-    fn wrap_stream(&self, inner: Box<dyn TransportStream>) -> PoolStream {
+    fn wrap_stream(&self, inner: Box<dyn TransportStream>) -> Result<PoolStream> {
         let inner: Box<dyn TransportStream> = match &self.obfs {
             SnellObfs::None => inner,
-            SnellObfs::Http { host } => Box::new(HttpObfs::new(inner, host.clone(), self.port)),
-            SnellObfs::Tls { server } => Box::new(TlsObfs::new(inner, server.clone())),
+            SnellObfs::Http { host } => Box::new(
+                HttpObfs::new(inner, host.clone(), self.port)
+                    .map_err(|e| MeowError::Config(format!("snell obfs: {e}")))?,
+            ),
+            SnellObfs::Tls { server } => Box::new(
+                TlsObfs::new(inner, server.clone())
+                    .map_err(|e| MeowError::Config(format!("snell obfs: {e}")))?,
+            ),
         };
-        match self.version {
+        Ok(match self.version {
             SnellVersion::V3 => Snell::new_v3(inner, Arc::clone(&self.psk)),
             SnellVersion::V4 | SnellVersion::V5 => Snell::new(inner, Arc::clone(&self.psk)),
-        }
+        })
     }
 
     /// Number of idle connections currently parked in the reuse pool.
@@ -256,7 +262,7 @@ impl ProxyAdapter for SnellAdapter {
         );
 
         let inner: Box<dyn TransportStream> = Box::new(stream);
-        let mut snell = self.wrap_stream(inner);
+        let mut snell = self.wrap_stream(inner)?;
         write_header(&mut snell, &host, port, false)
             .await
             .map_err(MeowError::Io)?;

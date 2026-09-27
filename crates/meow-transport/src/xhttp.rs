@@ -18,6 +18,24 @@ use crate::{Result, Stream, Transport, TransportError};
 /// Mirrors H2Layer and h2mux's `OPEN_TIMEOUT` (5 s).
 const OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Upper bound for `x-padding-bytes` — the padding becomes a `String` of that
+/// length inside a Referer header on every connect, so an unbounded value is
+/// a remotely-configurable allocation (a provider/subscription node could
+/// request exabytes and abort the process at the first health check or dial).
+/// 64 KiB is far beyond any real deployment (Xray ships 100–1000) while still
+/// admitting every sane configuration (issue #648).
+///
+/// Enforced twice, deliberately: `parse_vless_xhttp_config` rejects at config
+/// load (fail-fast, per-node vocabulary) and `validate_config` re-checks at
+/// `connect()` (backstop for programmatic `XhttpConfig` construction).
+pub const MAX_X_PADDING_BYTES: usize = 64 * 1024;
+
+/// Same remotely-configurable memory concern as [`MAX_X_PADDING_BYTES`],
+/// much smaller blast radius. Enforced at both layers like the padding cap
+/// (issue #648). Defined at the crate root because `httpupgrade` shares the
+/// bound and the two features compile independently.
+pub use crate::MAX_EXTRA_HEADERS;
+
 // ─── Public types ─────────────────────────────────────────────────────────────
 
 /// Configuration for the XHTTP transport layer.
@@ -43,6 +61,7 @@ pub struct XhttpConfig {
     pub scheme: String,
 
     /// Extra custom HTTP headers sent with the request.
+    /// Bounded to [`MAX_EXTRA_HEADERS`] entries — `connect()` rejects more.
     ///
     /// upstream: `xhttp-opts.headers`.
     pub extra_headers: Vec<(String, String)>,
@@ -65,6 +84,7 @@ pub struct XhttpConfig {
     /// Xray's `queryInHeader` placement.
     ///
     /// upstream: `xhttp-opts.x-padding-bytes`; default `Some((100, 1000))`.
+    /// `max` must not exceed [`MAX_X_PADDING_BYTES`].
     pub x_padding_bytes: Option<(usize, usize)>,
 }
 
@@ -244,6 +264,14 @@ fn validate_config(config: &XhttpConfig) -> Result<()> {
     for host in &config.hosts {
         validate_host(host)?;
     }
+    // Structural bound before the per-entry scan — an oversized list bails
+    // without paying the O(n) byte checks first.
+    if config.extra_headers.len() > MAX_EXTRA_HEADERS {
+        return Err(TransportError::Config(format!(
+            "xhttp: too many extra headers ({}, max {MAX_EXTRA_HEADERS})",
+            config.extra_headers.len()
+        )));
+    }
     for (name, value) in &config.extra_headers {
         validate_header_name(name)?;
         validate_header_value(name, value)?;
@@ -259,6 +287,11 @@ fn validate_config(config: &XhttpConfig) -> Result<()> {
         if min > max {
             return Err(TransportError::Config(format!(
                 "xhttp: invalid x_padding_bytes: min ({min}) cannot exceed max ({max})"
+            )));
+        }
+        if max > MAX_X_PADDING_BYTES {
+            return Err(TransportError::Config(format!(
+                "xhttp: x_padding_bytes max ({max}) exceeds {MAX_X_PADDING_BYTES}"
             )));
         }
     }
@@ -424,6 +457,43 @@ mod tests {
         };
         assert!(validate_config(&config).is_ok());
     }
+    #[test]
+    fn padding_and_header_count_bounded() {
+        // An over-cap padding range is a remotely-configurable allocation
+        // (issue #648) — reject at validation, before `connect` allocates.
+        let config = XhttpConfig {
+            x_padding_bytes: Some((0, MAX_X_PADDING_BYTES + 1)),
+            ..Default::default()
+        };
+        assert!(validate_config(&config).is_err());
+
+        let config = XhttpConfig {
+            x_padding_bytes: Some((0, MAX_X_PADDING_BYTES)),
+            ..Default::default()
+        };
+        assert!(validate_config(&config).is_ok());
+
+        // Inverted and disable ranges.
+        let config = XhttpConfig {
+            x_padding_bytes: Some((200, 100)),
+            ..Default::default()
+        };
+        assert!(validate_config(&config).is_err());
+        let config = XhttpConfig {
+            x_padding_bytes: Some((0, 0)),
+            ..Default::default()
+        };
+        assert!(validate_config(&config).is_ok());
+
+        let config = XhttpConfig {
+            extra_headers: (0..=MAX_EXTRA_HEADERS)
+                .map(|i| (format!("X-H{i}"), "v".into()))
+                .collect(),
+            ..Default::default()
+        };
+        assert!(validate_config(&config).is_err());
+    }
+
     #[test]
     fn invalid_headers() {
         let mut config = XhttpConfig::default();

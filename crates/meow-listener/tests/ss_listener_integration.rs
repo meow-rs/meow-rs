@@ -357,11 +357,11 @@ async fn ss_obfs_tcp_round_trip(obfs: SsObfsMode) {
     // is never validated by the server codec.
     match obfs {
         SsObfsMode::Http => {
-            let obfs = HttpObfs::new(raw, "example.com".to_string(), ss_addr.port());
+            let obfs = HttpObfs::new(raw, "example.com".to_string(), ss_addr.port()).unwrap();
             relay_echo(ProxyClientStream::from_stream(ctx, obfs, &cfg, echo)).await;
         }
         SsObfsMode::Tls => {
-            let obfs = TlsObfs::new(raw, "example.com".to_string());
+            let obfs = TlsObfs::new(raw, "example.com".to_string()).unwrap();
             relay_echo(ProxyClientStream::from_stream(ctx, obfs, &cfg, echo)).await;
         }
     }

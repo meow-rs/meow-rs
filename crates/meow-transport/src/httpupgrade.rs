@@ -178,10 +178,22 @@ impl Transport for HttpUpgradeLayer {
     }
 }
 
+/// Bound on remote-supplied `http-upgrade-opts.headers` — shared with xhttp
+/// (issue #648). Enforced by `connect()` via `validate_request_config`.
+pub use crate::MAX_EXTRA_HEADERS;
+
 fn validate_request_config(config: &HttpUpgradeConfig) -> Result<()> {
     validate_path(&config.path)?;
     if let Some(host) = &config.host_header {
         validate_host_header(host)?;
+    }
+    // Structural bound before the per-entry scan — an oversized list bails
+    // without paying the O(n) byte checks first.
+    if config.extra_headers.len() > MAX_EXTRA_HEADERS {
+        return Err(TransportError::Config(format!(
+            "httpupgrade: too many extra headers ({}, max {MAX_EXTRA_HEADERS})",
+            config.extra_headers.len()
+        )));
     }
     for (name, value) in &config.extra_headers {
         validate_header_name(name)?;
@@ -313,5 +325,26 @@ impl AsyncWrite for PrefixedStream {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extra_headers_count_bounded() {
+        // The connect-time backstop for the parse-level `headers` cap
+        // (issue #648) — programmatic `HttpUpgradeConfig` construction hits
+        // the same bound.
+        let mut config = HttpUpgradeConfig {
+            extra_headers: (0..=MAX_EXTRA_HEADERS)
+                .map(|i| (format!("X-H{i}"), "v".into()))
+                .collect(),
+            ..HttpUpgradeConfig::default()
+        };
+        assert!(validate_request_config(&config).is_err());
+        config.extra_headers.pop();
+        assert!(validate_request_config(&config).is_ok());
     }
 }

@@ -33,7 +33,7 @@ use crate::raw::RawProxyProvider;
 /// `Instant + Duration` inside `tokio::time::interval`, panicking the task
 /// on every reconcile. An over-ceiling provider is treated as
 /// non-refreshable instead.
-const MAX_REFRESH_INTERVAL_SECS: u64 = 10 * 365 * 24 * 60 * 60;
+const MAX_REFRESH_INTERVAL_SECS: u64 = meow_common::MAX_DURATION_SECS;
 
 /// Tracks the live refresh task per provider name. Cheap to share via
 /// `Arc`; all mutation goes through [`reconcile`](Self::reconcile), which

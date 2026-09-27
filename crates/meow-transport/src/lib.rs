@@ -26,6 +26,13 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 pub use error::TransportError;
 
+/// Upper bound on remote-supplied HTTP extra-header lists —
+/// `xhttp-opts.headers` and `http-upgrade-opts.headers` alike. A giant
+/// `headers` map is attacker-chosen process memory; 64 is far beyond any
+/// real deployment (issue #648). Re-exported by the per-transport modules
+/// so config parsers can name the bound locally.
+pub const MAX_EXTRA_HEADERS: usize = 64;
+
 mod error;
 
 #[cfg(feature = "tls")]

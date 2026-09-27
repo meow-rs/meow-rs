@@ -22,7 +22,10 @@ vless-encryption = ["vless", "meow-proxy/vless-encryption"]
 vmess = ["meow-proxy/vmess"]
 anytls = ["meow-proxy/anytls"]
 hysteria2 = ["meow-proxy/hysteria2"]
-snell = ["meow-proxy/snell"]
+# `meow-transport/simple-obfs` is used directly by the snell parser's
+# `obfs-opts.host` check (issue #648) — declare it rather than rely on
+# `meow-proxy/snell`'s transitive activation.
+snell = ["meow-proxy/snell", "meow-transport/simple-obfs"]
 # Compatibility alias: BoringSSL is the only TLS backend now, so this is a
 # no-op kept for existing `--features boring-tls` invocations.
 boring-tls = []

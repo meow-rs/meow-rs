@@ -52,9 +52,29 @@ pub struct HttpObfs<S> {
     leftover_off: usize,
 }
 
+/// Whether `host` is safe to emit verbatim inside a `Host:` request
+/// header — rejects empty strings and any byte that could split the
+/// request line or smuggle headers (`<= 0x20`, `0x7f`). Shared gate for
+/// the config parse sites and [`HttpObfs::new`] (issue #648).
+pub fn is_valid_obfs_host(host: &str) -> bool {
+    // Length bound: the value also lands in the TLS SNI extension
+    // (`build_client_hello`), whose u16 length arithmetic would overflow on
+    // a >64 KiB hostname — 253 is the RFC 1034 FQDN ceiling and valid SNI.
+    !host.is_empty() && host.len() <= 253 && !host.bytes().any(|b| b <= b' ' || b == 0x7f)
+}
+
 impl<S> HttpObfs<S> {
-    pub fn new(inner: S, host: String, port: u16) -> Self {
-        Self {
+    /// `host` lands verbatim in the emitted `Host:` header — reject any
+    /// value that could inject request bytes ([`is_valid_obfs_host`]).
+    /// Fails closed rather than writing a corrupted request.
+    pub fn new(inner: S, host: String, port: u16) -> crate::Result<Self> {
+        if !is_valid_obfs_host(&host) {
+            return Err(crate::TransportError::Config(
+                "simple-obfs: invalid host (empty, over 253 bytes, or contains whitespace/control bytes)"
+                    .into(),
+            ));
+        }
+        Ok(Self {
             inner,
             host,
             port,
@@ -66,7 +86,7 @@ impl<S> HttpObfs<S> {
             response_scratch: Vec::new(),
             leftover: Vec::new(),
             leftover_off: 0,
-        }
+        })
     }
 
     fn build_request(&self, body: &[u8]) -> Vec<u8> {
@@ -312,8 +332,19 @@ enum TlsReadPhase {
 }
 
 impl<S> TlsObfs<S> {
-    pub fn new(inner: S, server: String) -> Self {
-        Self {
+    /// `server` lands verbatim in the fake ClientHello's SNI — same
+    /// injection surface as [`HttpObfs::new`]'s host, same predicate. The
+    /// `build_client_hello` `debug_assert!` only covers length; reject
+    /// CTL/oversize here for programmatic callers too (config paths are
+    /// pre-validated — issue #648 review).
+    pub fn new(inner: S, server: String) -> crate::Result<Self> {
+        if !is_valid_obfs_host(&server) {
+            return Err(crate::TransportError::Config(
+                "tls-obfs: invalid server (empty, over 253 bytes, or contains whitespace/control bytes)"
+                    .into(),
+            ));
+        }
+        Ok(Self {
             inner,
             server,
             first_response: true,
@@ -324,7 +355,7 @@ impl<S> TlsObfs<S> {
             write_buf: Vec::new(),
             write_buf_off: 0,
             pending_input: 0,
-        }
+        })
     }
 }
 
@@ -494,6 +525,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for TlsObfs<S> {
 /// extension and `server` inside the SNI extension. Byte-for-byte mirror of
 /// the Go reference implementation in `transport/simple-obfs/tls.go`.
 fn build_client_hello(data: &[u8], server: &str) -> Vec<u8> {
+    // All length fields below are u16 — `server` (SNI) must stay within the
+    // RFC 1034 FQDN bound enforced by `is_valid_obfs_host` on every parse
+    // path; a programmatic oversized host would otherwise wrap the record
+    // length into a malformed ClientHello (debug: panic).
+    debug_assert!(server.len() <= 253, "SNI host exceeds u16-safe length");
     let mut random = [0u8; 28];
     let mut session_id = [0u8; 32];
     rand::rng().fill_bytes(&mut random);
@@ -649,10 +685,29 @@ mod tests {
 
     // ---- HttpObfs round-trip against an in-memory duplex ----
 
+    #[test]
+    fn obfs_host_predicate_rejects_injectable_and_oversized() {
+        // Shared gate for the SS `plugin-opts`, Snell `obfs-opts`, and
+        // `HttpObfs::new` wrap-time check (issue #648).
+        assert!(is_valid_obfs_host("example.com"));
+        assert!(is_valid_obfs_host(&"a".repeat(253)));
+        for bad in [
+            "", "a b", "a\tb", "a\rb", "a\nb", "a\0b", "a\x7fb", "a\u{1f}b",
+        ] {
+            assert!(!is_valid_obfs_host(bad), "{bad:?} must be rejected");
+        }
+        assert!(!is_valid_obfs_host(&"a".repeat(254)));
+        // Non-ASCII is fine — the emitted header is opaque bytes to the peer.
+        assert!(is_valid_obfs_host("例え.jp"));
+        // Direct ctor check too.
+        let (s, _p) = tokio::io::duplex(64);
+        assert!(HttpObfs::new(s, "a\rb".to_string(), 80).is_err());
+    }
+
     #[tokio::test]
     async fn http_obfs_first_write_then_passthrough() {
         let (client, mut server) = tokio::io::duplex(8192);
-        let mut obfs = HttpObfs::new(client, "example.com".to_string(), 80);
+        let mut obfs = HttpObfs::new(client, "example.com".to_string(), 80).unwrap();
 
         // First write: should be wrapped in HTTP request.
         obfs.write_all(b"PAYLOAD1").await.unwrap();
@@ -687,7 +742,7 @@ mod tests {
     #[tokio::test]
     async fn http_obfs_strips_first_response_headers() {
         let (client, mut server) = tokio::io::duplex(8192);
-        let mut obfs = HttpObfs::new(client, "example.com".to_string(), 80);
+        let mut obfs = HttpObfs::new(client, "example.com".to_string(), 80).unwrap();
 
         // Server sends a fake HTTP response followed by raw body.
         let response = b"HTTP/1.1 101 Switching Protocols\r\n\
@@ -710,7 +765,7 @@ mod tests {
     #[tokio::test]
     async fn tls_obfs_write_first_then_chunks() {
         let (client, mut server) = tokio::io::duplex(65536);
-        let mut obfs = TlsObfs::new(client, "example.com".to_string());
+        let mut obfs = TlsObfs::new(client, "example.com".to_string()).unwrap();
 
         obfs.write_all(b"FIRST").await.unwrap();
         obfs.write_all(b"SECOND").await.unwrap();
@@ -760,7 +815,7 @@ mod tests {
     #[tokio::test]
     async fn tls_obfs_read_strips_framing() {
         let (client, mut server) = tokio::io::duplex(65536);
-        let mut obfs = TlsObfs::new(client, "example.com".to_string());
+        let mut obfs = TlsObfs::new(client, "example.com".to_string()).unwrap();
 
         // Server sends 105 bytes of fake handshake / change cipher / record header,
         // then a 2-byte length, then the payload.
@@ -793,7 +848,7 @@ mod tests {
         // Here we just verify the client's read side can handle frames produced
         // by *another* TlsObfs instance (so write/read are mutually consistent).
         let (a, mut b) = tokio::io::duplex(65536);
-        let mut a_obfs = TlsObfs::new(a, "example.com".to_string());
+        let mut a_obfs = TlsObfs::new(a, "example.com".to_string()).unwrap();
 
         // a writes two payloads, then drops to close the duplex.
         a_obfs.write_all(b"first-msg").await.unwrap();

@@ -105,6 +105,11 @@ impl HopState {
             min_secs.max(HY2_MIN_HOP_INTERVAL_SECS)
         };
         let max_secs = max_secs.max(min_secs);
+        // Backstop for programmatic callers: `Instant + Duration` overflows
+        // on absurd intervals and panics (config parse already rejects these
+        // — issue #648).
+        let min_secs = min_secs.min(meow_common::MAX_DURATION_SECS);
+        let max_secs = max_secs.min(meow_common::MAX_DURATION_SECS);
         let mut state = Self {
             server_addr,
             ports,
@@ -169,6 +174,10 @@ impl fmt::Debug for HopPorts {
     }
 }
 
+/// Bound on the pre-dedup port expansion in [`HopPorts::parse`] — the u16
+/// port space holds at most this many distinct values (issue #648).
+const MAX_HOP_PORT_ENTRIES: usize = u16::MAX as usize;
+
 impl HopPorts {
     fn parse(raw: &str) -> Result<Option<Self>> {
         let raw = raw.trim();
@@ -185,14 +194,29 @@ impl HopPorts {
             if part.is_empty() {
                 return Err(Error::config(format!("invalid hop ports '{raw}'")));
             }
+            // Bound the pre-dedup expansion: the port space has only
+            // u16::MAX values, so anything past that is necessarily a
+            // duplicate — a provider-supplied string of repeated
+            // "1-65535" ranges would otherwise amplify ~8 bytes of config
+            // into 128 KiB of Vec per range (issue #648).
             if let Some((start, end)) = part.split_once('-') {
                 let start = parse_port(start)?;
                 let end = parse_port(end)?;
                 if start > end {
                     return Err(Error::config(format!("invalid hop port range '{part}'")));
                 }
+                if ports.len() + (end as usize - start as usize + 1) > MAX_HOP_PORT_ENTRIES {
+                    return Err(Error::config(format!(
+                        "hop ports '{raw}' expand beyond {MAX_HOP_PORT_ENTRIES} entries"
+                    )));
+                }
                 ports.extend(start..=end);
             } else {
+                if ports.len() == MAX_HOP_PORT_ENTRIES {
+                    return Err(Error::config(format!(
+                        "hop ports '{raw}' expand beyond {MAX_HOP_PORT_ENTRIES} entries"
+                    )));
+                }
                 ports.push(parse_port(part)?);
             }
         }
@@ -235,11 +259,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn hop_ports_expansion_bounded() {
+        // Repeated full ranges would pre-dedup into a giant Vec — the port
+        // space can't hold more than u16::MAX entries anyway (issue #648).
+        assert!(HopPorts::parse("1-65535").unwrap().is_some());
+        assert!(HopPorts::parse("1-65535,1-65535").is_err());
+        assert!(HopPorts::parse("1-65535,80").is_err());
+        assert!(HopPorts::parse("80,443,1-65535").is_err());
+        // A full range plus duplicates *within* the bound stays fine.
+        let p = HopPorts::parse("1-1024,80,443").unwrap().unwrap();
+        assert!(p.contains(80));
+        assert!(!p.contains(2000));
+    }
+
+    #[test]
     fn salamander_round_trip() {
         let obfs = Salamander::new(b"secret");
         let encoded = obfs.encode(b"payload");
         assert_ne!(&encoded[SALAMANDER_SALT_LEN..], b"payload");
         assert_eq!(obfs.decode(&encoded).unwrap(), b"payload");
+    }
+
+    #[test]
+    fn hop_state_clamps_absurd_interval() {
+        // Programmatic callers skip the config-parse bound — the backstop
+        // keeps `Instant + Duration` from overflowing (issue #648).
+        let state = HopState::new("127.0.0.1:443".parse().unwrap(), "80", u64::MAX, u64::MAX)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            state.min,
+            Duration::from_secs(meow_common::MAX_DURATION_SECS)
+        );
+        assert_eq!(
+            state.max,
+            Duration::from_secs(meow_common::MAX_DURATION_SECS)
+        );
     }
 
     #[test]

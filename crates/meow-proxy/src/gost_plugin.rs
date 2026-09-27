@@ -209,6 +209,17 @@ pub fn parse_opts(s: &str) -> Result<GostPluginConfig> {
                     } else {
                         k.trim()
                     };
+                    // Same bound as v2ray-plugin / xhttp `headers` —
+                    // provider opts repeat `header=` and the map is
+                    // re-serialized per dial (issue #648).
+                    if cfg.headers.len() >= meow_transport::MAX_EXTRA_HEADERS
+                        && !cfg.headers.contains_key(k)
+                    {
+                        return Err(MeowError::Config(format!(
+                            "{PLUGIN}: more than {} header= entries",
+                            meow_transport::MAX_EXTRA_HEADERS
+                        )));
+                    }
                     cfg.headers.insert(k.to_string(), v.trim().to_string());
                 } else {
                     // The value may be a credential — log shape, not content.
@@ -809,6 +820,27 @@ mod tests {
             .unwrap()
             .cert_pin
             .is_none());
+    }
+
+    /// Provider-controlled `header=` opts repeat unboundedly — cap them like
+    /// v2ray-plugin / xhttp `headers` (issue #648).
+    #[test]
+    fn parse_opts_caps_header_count() {
+        let mut opts = String::from("mode=websocket");
+        for i in 0..meow_transport::MAX_EXTRA_HEADERS {
+            use std::fmt::Write;
+            write!(opts, ";header=H{i}:v").unwrap();
+        }
+        assert!(parse_opts(&opts).is_ok());
+        use std::fmt::Write;
+        write!(opts, ";header=one-more:v").unwrap();
+        let Err(err) = parse_opts(&opts) else {
+            panic!(
+                "{} headers must be rejected",
+                meow_transport::MAX_EXTRA_HEADERS + 1
+            )
+        };
+        assert!(err.to_string().contains("header"), "msg: {err}");
     }
 
     /// `Host` entries normalize to one canonical key regardless of input

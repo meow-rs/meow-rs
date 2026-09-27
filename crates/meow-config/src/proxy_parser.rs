@@ -513,15 +513,30 @@ fn parse_snell(
             .and_then(|v| v.as_str())
             .unwrap_or("off")
             .to_ascii_lowercase();
+        // Trim for parity with the SS `plugin-opts` path (which trims each
+        // `k=v` value) — `host: " bing.com "` should not hard-error.
         let host = opts
             .get("host")
             .and_then(|v| v.as_str())
+            .map(str::trim)
             .filter(|s| !s.is_empty())
             .map_or_else(|| server.to_string(), std::string::ToString::to_string);
         match mode.as_str() {
             "off" | "none" | "" => SnellObfs::None,
-            "http" => SnellObfs::Http { host },
-            "tls" => SnellObfs::Tls { server: host },
+            "http" | "tls" => {
+                // `host` lands verbatim in the emitted `Host:` header
+                // (http) or SNI (tls) — reject injectable bytes up front
+                // (issue #648). `HttpObfs::new` re-checks at wrap time.
+                if !meow_transport::simple_obfs::client::is_valid_obfs_host(&host) {
+                    return Err(format!(
+                        "snell[{name}]: obfs-opts.host is empty, over 253 bytes, or contains whitespace/control bytes"
+                    ));
+                }
+                match mode.as_str() {
+                    "http" => SnellObfs::Http { host },
+                    _ => SnellObfs::Tls { server: host },
+                }
+            }
             other => {
                 return Err(format!(
                     "snell[{name}]: obfs-opts.mode '{other}' invalid; expected one of off, http, tls"
@@ -587,16 +602,25 @@ fn parse_http(
         }
     };
 
-    // Parse optional headers map.
-    let extra_headers: Vec<(String, String)> = config
-        .get("headers")
-        .and_then(|v| v.as_mapping())
-        .map(|m| {
-            m.iter()
-                .filter_map(|(k, v)| Some((k.as_str()?.to_string(), v.as_str()?.to_string())))
-                .collect()
-        })
-        .unwrap_or_default();
+    // Parse optional headers map. The entries are re-serialized into every
+    // CONNECT request, so a giant provider-supplied map is attacker-chosen
+    // process memory — same bound as xhttp/http-upgrade (issue #648).
+    let extra_headers: Vec<(String, String)> =
+        match config.get("headers").and_then(|v| v.as_mapping()) {
+            Some(m) => {
+                if m.len() > meow_transport::MAX_EXTRA_HEADERS {
+                    return Err(format!(
+                        "http[{name}]: headers has {} entries (max {})",
+                        m.len(),
+                        meow_transport::MAX_EXTRA_HEADERS
+                    ));
+                }
+                m.iter()
+                    .filter_map(|(k, v)| Some((k.as_str()?.to_string(), v.as_str()?.to_string())))
+                    .collect()
+            }
+            None => Vec::new(),
+        };
 
     Ok(HttpAdapter::new(
         name,
@@ -700,6 +724,15 @@ fn parse_direct(
         let secs = v.as_u64().ok_or_else(|| {
             format!("direct[{name}]: connect-timeout must be a non-negative integer (seconds)")
         })?;
+        // The value reaches `tokio::time::timeout` — an absurd u64 overflows
+        // `Instant + Duration` and, under `panic = "abort"`, crashes the
+        // process on every dial (issue #648).
+        if secs > meow_common::MAX_DURATION_SECS {
+            return Err(format!(
+                "direct[{name}]: connect-timeout {secs}s exceeds the {}s ceiling",
+                meow_common::MAX_DURATION_SECS
+            ));
+        }
         adapter = adapter.with_connect_timeout(std::time::Duration::from_secs(secs));
     }
 
@@ -1022,22 +1055,47 @@ fn first_hy2_port(ports: &str) -> Option<u16> {
     first.parse::<u16>().ok().filter(|p| *p != 0)
 }
 
+/// Mirror of `HopPorts::parse`'s expansion bound (`hysteria2/obfs.rs`) —
+/// the port space holds at most this many distinct values, so a spec that
+/// expands past it can never dial; reject at config load (issue #648).
+#[cfg(feature = "hysteria2")]
+const MAX_HOP_PORT_ENTRIES: usize = u16::MAX as usize;
+
 #[cfg(feature = "hysteria2")]
 fn validate_hy2_ports(name: &str, ports: &str) -> std::result::Result<(), String> {
     let ports = ports.trim();
     if ports == "*" || ports.eq_ignore_ascii_case("all") {
         return Ok(());
     }
+    let mut total = 0usize;
     for part in ports.split(',') {
         let part = part.trim();
         if part.is_empty() {
             return Err(format!("hysteria2[{name}]: invalid ports '{ports}'"));
         }
-        if let Some((start, end)) = part.split_once('-') {
-            parse_hy2_port_part(name, start)?;
-            parse_hy2_port_part(name, end)?;
+        // Same bound the dial-time `HopPorts::parse` enforces — mirroring it
+        // here lets `-t`/load catch specs that could never dial (issue #648).
+        let span = if let Some((start, end)) = part.split_once('-') {
+            let s = parse_hy2_port_part(name, start)?;
+            let e = parse_hy2_port_part(name, end)?;
+            if s == 0 || e == 0 {
+                return Err(format!("hysteria2[{name}]: port must be non-zero"));
+            }
+            if s > e {
+                return Err(format!("hysteria2[{name}]: invalid port range '{part}'"));
+            }
+            e as usize - s as usize + 1
         } else {
-            parse_hy2_port_part(name, part)?;
+            if parse_hy2_port_part(name, part)? == 0 {
+                return Err(format!("hysteria2[{name}]: port must be non-zero"));
+            }
+            1
+        };
+        total += span;
+        if total > MAX_HOP_PORT_ENTRIES {
+            return Err(format!(
+                "hysteria2[{name}]: ports '{ports}' expand beyond {MAX_HOP_PORT_ENTRIES} entries"
+            ));
         }
     }
     Ok(())
@@ -1088,10 +1146,20 @@ fn parse_hy2_hop_interval(
 
 #[cfg(feature = "hysteria2")]
 fn parse_hy2_u64(name: &str, field: &str, value: &str) -> std::result::Result<u64, String> {
-    value
+    let n = value
         .trim()
         .parse::<u64>()
-        .map_err(|e| format!("hysteria2[{name}]: invalid {field} '{value}': {e}"))
+        .map_err(|e| format!("hysteria2[{name}]: invalid {field} '{value}': {e}"))?;
+    // `hop-interval` feeds `Instant + Duration` at rotate time — an
+    // out-of-range u64 (provider-supplied) overflows and, with
+    // `panic = "abort"`, crashes the process (issue #648).
+    if n > meow_common::MAX_DURATION_SECS {
+        return Err(format!(
+            "hysteria2[{name}]: {field} {n}s exceeds the {}s ceiling",
+            meow_common::MAX_DURATION_SECS
+        ));
+    }
+    Ok(n)
 }
 
 #[cfg(feature = "hysteria2")]
@@ -1253,6 +1321,27 @@ fn parse_lb_strategy(strategy: Option<&str>) -> std::result::Result<LbStrategy, 
              (upstream also rejects via errStrategy — Class A ADR-0002)"
         )),
     }
+}
+
+/// Parse `ws-opts.max-early-data`: absent → `0` (disabled); a value above
+/// the ceiling clamps with a warning (`meow-transport` re-clamps at
+/// connect for programmatic configs — issue #648).
+#[cfg(any(feature = "vless", feature = "vmess"))]
+fn ws_max_early_data(ws_opts: Option<&serde_yaml::Value>) -> usize {
+    ws_opts
+        .and_then(|o| o.get("max-early-data"))
+        .and_then(serde_yaml::Value::as_u64)
+        .map_or(0, |n| {
+            let v = usize::try_from(n).unwrap_or(usize::MAX);
+            if v > meow_transport::ws::MAX_WS_EARLY_DATA {
+                tracing::warn!(
+                    "ws-opts.max-early-data {v} exceeds the {}-byte ceiling; clamped",
+                    meow_transport::ws::MAX_WS_EARLY_DATA
+                );
+            }
+            v
+        })
+        .min(meow_transport::ws::MAX_WS_EARLY_DATA)
 }
 
 /// Parse a `type: vless` proxy config block into a `VlessAdapter`.
@@ -1508,10 +1597,10 @@ fn parse_vless(
                 .and_then(|h| h.get("Host"))
                 .and_then(|v| v.as_str())
                 .map_or_else(|| server.to_string(), std::string::ToString::to_string);
-            let max_early_data = ws_opts
-                .and_then(|o| o.get("max-early-data"))
-                .and_then(serde_yaml::Value::as_u64)
-                .unwrap_or(0) as usize;
+            // `max-early-data` buffers caller writes until the upgrade
+            // completes — clamped to the 2048-byte ceiling (the transport
+            // layer re-clamps programmatic configs at connect; #648).
+            let max_early_data = ws_max_early_data(ws_opts);
             let early_data_header_name = ws_opts
                 .and_then(|o| o.get("early-data-header-name"))
                 .and_then(|v| v.as_str())
@@ -1585,7 +1674,9 @@ fn parse_vless(
             chain.push(Box::new(H2Layer::new(h2_cfg)));
         }
         "httpupgrade" => {
-            use meow_transport::httpupgrade::{HttpUpgradeConfig, HttpUpgradeLayer};
+            use meow_transport::httpupgrade::{
+                HttpUpgradeConfig, HttpUpgradeLayer, MAX_EXTRA_HEADERS,
+            };
             let hu_opts = config.get("http-upgrade-opts");
             let path = hu_opts
                 .and_then(|o| o.get("path"))
@@ -1597,10 +1688,19 @@ fn parse_vless(
                 .and_then(|v| v.as_str())
                 .map(std::string::ToString::to_string)
                 .or_else(|| Some(server.to_string()));
-            let extra_headers: Vec<(String, String)> = hu_opts
+            let extra_headers: Vec<(String, String)> = match hu_opts
                 .and_then(|o| o.get("headers"))
                 .and_then(|h| h.as_mapping())
-                .map(|m| {
+            {
+                Some(m) => {
+                    // Same remotely-supplied header-list bound as xhttp
+                    // (issue #648); `connect()` re-checks it.
+                    if m.len() > MAX_EXTRA_HEADERS {
+                        return Err(format!(
+                            "vless: http-upgrade-opts.headers has {} entries (max {MAX_EXTRA_HEADERS})",
+                            m.len()
+                        ));
+                    }
                     m.iter()
                         .filter_map(|(k, v)| {
                             let key = k.as_str()?.to_string();
@@ -1608,8 +1708,9 @@ fn parse_vless(
                             Some((key, val))
                         })
                         .collect()
-                })
-                .unwrap_or_default();
+                }
+                None => Vec::new(),
+            };
             let hu_cfg = HttpUpgradeConfig {
                 path,
                 host_header,
@@ -1868,7 +1969,8 @@ fn mux_usize_field(
 ) -> std::result::Result<usize, String> {
     match mux_cfg.get(key) {
         None => Ok(default),
-        Some(serde_yaml::Value::Number(n)) if n.is_u64() => Ok(n.as_u64().unwrap() as usize),
+        Some(serde_yaml::Value::Number(n)) if n.is_u64() => usize::try_from(n.as_u64().unwrap())
+            .map_err(|_| format!("{name}: mux option '{key}' is too large")),
         Some(other) => Err(format!(
             "{name}: mux option '{key}' must be a non-negative integer, got {other:?}"
         )),
@@ -1881,7 +1983,7 @@ fn parse_vless_xhttp_config(
     servername: &str,
     tls: bool,
 ) -> std::result::Result<meow_transport::xhttp::XhttpConfig, String> {
-    use meow_transport::xhttp::XhttpConfig;
+    use meow_transport::xhttp::{XhttpConfig, MAX_EXTRA_HEADERS, MAX_X_PADDING_BYTES};
 
     let xhttp_opts = config.get("xhttp-opts");
     let path = xhttp_opts
@@ -1926,10 +2028,20 @@ fn parse_vless_xhttp_config(
             "vless: unsupported xhttp mode '{mode}'; only 'stream-one' is implemented"
         ));
     }
-    let extra_headers: Vec<(String, String)> = xhttp_opts
+    let extra_headers: Vec<(String, String)> = match xhttp_opts
         .and_then(|o| o.get("headers"))
         .and_then(|h| h.as_mapping())
-        .map(|m| {
+    {
+        Some(m) => {
+            // Bound remotely-supplied header lists — the padding cap below
+            // covers the worst case, but a giant `headers` map is still
+            // attacker-chosen process memory (issue #648).
+            if m.len() > MAX_EXTRA_HEADERS {
+                return Err(format!(
+                    "vless: xhttp-opts.headers has {} entries (max {MAX_EXTRA_HEADERS})",
+                    m.len()
+                ));
+            }
             m.iter()
                 .filter_map(|(k, v)| {
                     let key = k.as_str()?.to_string();
@@ -1937,8 +2049,9 @@ fn parse_vless_xhttp_config(
                     Some((key, val))
                 })
                 .collect()
-        })
-        .unwrap_or_default();
+        }
+        None => Vec::new(),
+    };
     let no_grpc_header = xhttp_opts
         .and_then(|o| o.get("no-grpc-header"))
         .and_then(serde_yaml::Value::as_bool)
@@ -1970,14 +2083,20 @@ fn parse_vless_xhttp_config(
                 if seq.len() != 2 {
                     return Err("vless: x-padding-bytes array must have 2 elements".into());
                 }
-                let min = seq[0]
-                    .as_u64()
-                    .ok_or_else(|| "vless: invalid min in x-padding-bytes".to_string())?
-                    as usize;
-                let max = seq[1]
-                    .as_u64()
-                    .ok_or_else(|| "vless: invalid max in x-padding-bytes".to_string())?
-                    as usize;
+                // `try_from`, not `as usize` — on 32-bit targets a u64 that
+                // exceeds usize::MAX would wrap under the cap check.
+                let min = usize::try_from(
+                    seq[0]
+                        .as_u64()
+                        .ok_or_else(|| "vless: invalid min in x-padding-bytes".to_string())?,
+                )
+                .map_err(|_| "vless: x-padding-bytes min out of range".to_string())?;
+                let max = usize::try_from(
+                    seq[1]
+                        .as_u64()
+                        .ok_or_else(|| "vless: invalid max in x-padding-bytes".to_string())?,
+                )
+                .map_err(|_| "vless: x-padding-bytes max out of range".to_string())?;
                 if min > max {
                     return Err(format!(
                         "vless: x-padding-bytes min ({min}) exceeds max ({max})"
@@ -1993,6 +2112,16 @@ fn parse_vless_xhttp_config(
         } else {
             Some((100, 1000))
         };
+    // The padding becomes a `String` of `pad_len` bytes on every connect —
+    // unbounded, a provider/subscription node could abort the process via a
+    // remote health check or any routed dial (issue #648).
+    if let Some((_, max)) = x_padding_bytes {
+        if max > MAX_X_PADDING_BYTES {
+            return Err(format!(
+                "vless: x-padding-bytes max ({max}) exceeds {MAX_X_PADDING_BYTES}"
+            ));
+        }
+    }
 
     Ok(XhttpConfig {
         path,
@@ -2452,10 +2581,10 @@ fn parse_vmess(
                 .and_then(|h| h.get("Host"))
                 .and_then(|v| v.as_str())
                 .map_or_else(|| server.to_string(), std::string::ToString::to_string);
-            let max_early_data = ws_opts
-                .and_then(|o| o.get("max-early-data"))
-                .and_then(serde_yaml::Value::as_u64)
-                .unwrap_or(0) as usize;
+            // `max-early-data` buffers caller writes until the upgrade
+            // completes — clamped to the 2048-byte ceiling (the transport
+            // layer re-clamps programmatic configs at connect; #648).
+            let max_early_data = ws_max_early_data(ws_opts);
             let early_data_header_name = ws_opts
                 .and_then(|o| o.get("early-data-header-name"))
                 .and_then(|v| v.as_str())
@@ -2971,6 +3100,112 @@ mod tests {
         assert_eq!(parsed.scheme, "http");
     }
 
+    #[cfg(feature = "vless")]
+    #[test]
+    fn xhttp_padding_bytes_bounded() {
+        // Over-cap padding is a remotely-configurable allocation — a hostile
+        // provider/subscription node must not parse (issue #648).
+        for opts in [
+            "x-padding-bytes: 0-70000",
+            "x-padding-bytes: \"9000000000000000000-9000000000000000000\"",
+            "x-padding-bytes: [0, 70000]",
+        ] {
+            let cfg = proxy_config(&format!("xhttp-opts:\n  path: /x\n  {opts}\n"));
+            let Err(err) = parse_vless_xhttp_config(&cfg, "203.0.113.7", "cdn.example.com", true)
+            else {
+                panic!("{opts:?} must be rejected")
+            };
+            assert!(err.contains("exceeds"), "{opts:?}: {err}");
+        }
+        for opts in [
+            // Inverted range — both string and sequence forms.
+            "x-padding-bytes: 800-200",
+            "x-padding-bytes: [800, 200]",
+            // A bare scalar is neither a "min-max" string nor a 2-seq.
+            "x-padding-bytes: 100",
+            // A u64 that wraps `usize` on 32-bit targets must not sneak
+            // under the cap via the sequence form.
+            "x-padding-bytes: [0, 18446744073709551615]",
+        ] {
+            let cfg = proxy_config(&format!("xhttp-opts:\n  path: /x\n  {opts}\n"));
+            assert!(
+                parse_vless_xhttp_config(&cfg, "203.0.113.7", "cdn.example.com", true).is_err(),
+                "{opts:?} must be rejected"
+            );
+        }
+        let ok = proxy_config("xhttp-opts:\n  path: /x\n  x-padding-bytes: 0-65536\n");
+        assert!(
+            parse_vless_xhttp_config(&ok, "203.0.113.7", "cdn.example.com", true).is_ok(),
+            "at-cap padding must stay accepted"
+        );
+        // `0-0` disables padding upstream — stays accepted.
+        let disabled = proxy_config("xhttp-opts:\n  path: /x\n  x-padding-bytes: 0-0\n");
+        assert!(
+            parse_vless_xhttp_config(&disabled, "203.0.113.7", "cdn.example.com", true).is_ok(),
+            "'0-0' (disable) must stay accepted"
+        );
+    }
+
+    #[cfg(feature = "vless")]
+    #[test]
+    fn xhttp_headers_bounded() {
+        // A remote `headers` map is attacker-chosen process memory — cap the
+        // count like the padding bound (issue #648).
+        use meow_transport::xhttp::MAX_EXTRA_HEADERS;
+        use std::fmt::Write;
+        let mut opts = String::from("xhttp-opts:\n  path: /x\n  headers:\n");
+        for i in 0..=MAX_EXTRA_HEADERS {
+            writeln!(opts, "    X-H{i}: v").unwrap();
+        }
+        let cfg = proxy_config(&opts);
+        let err = parse_vless_xhttp_config(&cfg, "203.0.113.7", "cdn.example.com", true)
+            .expect_err("65 headers must be rejected");
+        assert!(err.contains("headers"), "msg: {err}");
+    }
+
+    #[cfg(feature = "vless")]
+    #[test]
+    fn httpupgrade_headers_bounded() {
+        // Sibling path to xhttp-opts.headers (issue #648).
+        use meow_transport::httpupgrade::MAX_EXTRA_HEADERS;
+        use std::fmt::Write;
+        let mut opts = String::from(
+            "name: v\ntype: vless\nserver: 203.0.113.7\nport: 443\n\
+             uuid: b831381d-6324-4d53-ad4f-8cda48b30811\n\
+             network: httpupgrade\nhttp-upgrade-opts:\n  path: /x\n  headers:\n",
+        );
+        for i in 0..=MAX_EXTRA_HEADERS {
+            writeln!(opts, "    X-H{i}: v").unwrap();
+        }
+        let cfg = proxy_config(&opts);
+        let Err(err) = parse_proxy(&cfg) else {
+            panic!("65 headers must be rejected")
+        };
+        assert!(err.contains("headers"), "msg: {err}");
+    }
+
+    #[cfg(any(feature = "vless", feature = "vmess"))]
+    #[test]
+    fn ws_max_early_data_clamps_to_ceiling() {
+        use meow_transport::ws::MAX_WS_EARLY_DATA;
+        // Absent → disabled.
+        assert_eq!(ws_max_early_data(None), 0);
+        // Boundary: the ceiling itself survives.
+        let at_cap = serde_yaml::from_str::<serde_yaml::Value>(&format!(
+            "max-early-data: {MAX_WS_EARLY_DATA}"
+        ))
+        .unwrap();
+        assert_eq!(ws_max_early_data(Some(&at_cap)), MAX_WS_EARLY_DATA);
+        // Above → clamped (not rejected; excess bytes flow as normal frames).
+        let over = serde_yaml::from_str::<serde_yaml::Value>("max-early-data: 99999").unwrap();
+        assert_eq!(ws_max_early_data(Some(&over)), MAX_WS_EARLY_DATA);
+        // u64::MAX must not wrap the usize conversion.
+        let huge =
+            serde_yaml::from_str::<serde_yaml::Value>("max-early-data: 18446744073709551615")
+                .unwrap();
+        assert_eq!(ws_max_early_data(Some(&huge)), MAX_WS_EARLY_DATA);
+    }
+
     #[test]
     fn parse_proxy_rejects_port_overflow() {
         let cfg = proxy_config("name: bad\ntype: http\nserver: 1.2.3.4\nport: 65536\n");
@@ -3342,6 +3577,36 @@ tls: true
     }
 
     #[test]
+    fn parse_direct_rejects_absurd_connect_timeout() {
+        // Seconds reach `tokio::time::timeout` — an out-of-range u64 panics on
+        // `Instant + Duration` at first dial (issue #648).
+        let cfg = direct_config("name: bad\ntype: direct\nconnect-timeout: 18446744073709551615\n");
+        let Err(err) = parse_proxy(&cfg) else {
+            panic!("absurd connect-timeout must hard-error");
+        };
+        assert!(err.contains("connect-timeout"), "msg: {err}");
+        // The ceiling itself stays usable.
+        let cfg = direct_config("name: ok\ntype: direct\nconnect-timeout: 315360000\n");
+        assert!(parse_proxy(&cfg).is_ok());
+    }
+
+    #[test]
+    fn http_headers_bounded() {
+        // The map is re-serialized into every CONNECT request — cap the count
+        // like xhttp-opts.headers (issue #648).
+        use std::fmt::Write;
+        let mut yaml = String::from("name: h\ntype: http\nserver: 1.2.3.4\nport: 8080\nheaders:\n");
+        for i in 0..=meow_transport::MAX_EXTRA_HEADERS {
+            writeln!(yaml, "  X-H{i}: v").unwrap();
+        }
+        let cfg = proxy_config(&yaml);
+        let Err(err) = parse_proxy(&cfg) else {
+            panic!("65 headers must be rejected")
+        };
+        assert!(err.contains("headers"), "msg: {err}");
+    }
+
+    #[test]
     fn parse_direct_rejects_wrong_dns_type() {
         let cfg = direct_config("name: bad\ntype: direct\ndns: 53\n");
         // Integer 53 is neither a string nor a list — must be rejected.
@@ -3578,6 +3843,41 @@ tls: true
             parse_hy2_hop_interval("hy2", Some(&serde_yaml::Value::from("1-2"))).unwrap(),
             Some((5, 5))
         );
+        // The ceiling itself stays usable.
+        assert_eq!(
+            parse_hy2_hop_interval("hy2", Some(&serde_yaml::Value::from(315360000))).unwrap(),
+            Some((315360000, 315360000))
+        );
+    }
+
+    #[cfg(feature = "hysteria2")]
+    #[test]
+    fn parse_hysteria2_rejects_absurd_hop_interval_and_ports() {
+        // `hop-interval` seconds feed `Instant + Duration` at rotate and
+        // `ports` ranges expand pre-dedup — both provider-controlled
+        // (issue #648). Caught at load (`-t`), not first dial.
+        for (yaml, needle) in [
+            (
+                "name: h\ntype: hysteria2\nserver: 1.2.3.4\nport: 443\n\
+                 password: s\nhop-interval: 18446744073709551615\n",
+                "hop-interval",
+            ),
+            (
+                "name: h\ntype: hysteria2\nserver: 1.2.3.4\nport: 443\n\
+                 password: s\nhop-interval: \"10-18446744073709551615\"\n",
+                "hop-interval",
+            ),
+            (
+                "name: h\ntype: hysteria2\nserver: 1.2.3.4\nport: 443\n\
+                 password: s\nports: \"1-65535,1-65535\"\n",
+                "expand",
+            ),
+        ] {
+            let Err(err) = parse_proxy(&hy2_config(yaml)) else {
+                panic!("{yaml:?} must be rejected");
+            };
+            assert!(err.contains(needle), "{yaml:?} → {err}");
+        }
     }
 
     // ─── Load-balance strategy parser (F1-F7) ────────────────────────────────
@@ -4613,6 +4913,22 @@ tls: true
             "name: sn\ntype: snell\nserver: 1.2.3.4\nport: 8388\npsk: s\nobfs-opts:\n  mode: http\n",
         );
         assert!(parse_proxy(&cfg).is_ok());
+    }
+
+    #[cfg(feature = "snell")]
+    #[test]
+    fn parse_snell_obfs_host_rejects_ctl() {
+        // `obfs-opts.host` lands verbatim in the emitted `Host:` header —
+        // provider-supplied CTLs must not parse (issue #648).
+        for mode in ["http", "tls"] {
+            let cfg = snell_config(&format!(
+                "name: sn\ntype: snell\nserver: 1.2.3.4\nport: 8388\npsk: s\nobfs-opts:\n  mode: {mode}\n  host: \"a\\rb\\nc\"\n"
+            ));
+            let Err(err) = parse_proxy(&cfg) else {
+                panic!("{mode} obfs host with CRLF must hard-error");
+            };
+            assert!(err.contains("obfs-opts.host"), "{mode}: msg: {err}");
+        }
     }
 
     // ─── issue #513: provider nodes cannot select a local executable ─────────

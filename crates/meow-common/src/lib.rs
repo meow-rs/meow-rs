@@ -4,6 +4,15 @@
 //! [`Metadata`], connection types, and shared error values used by every
 //! other meow crate.
 
+/// Largest `u64` seconds value a config field may carry into
+/// `Duration::from_secs` + `Instant`/`tokio`-timer arithmetic. Beyond a few
+/// hundred years `Instant + Duration` overflows and panics, and the release
+/// profile's `panic = "abort"` turns that into a process crash — provider or
+/// subscription-controlled interval/timeout fields must never reach it
+/// (issue #648). Ten years is far beyond any meaningful value while staying
+/// representable on every supported platform.
+pub const MAX_DURATION_SECS: u64 = 10 * 365 * 24 * 60 * 60;
+
 pub mod adapter;
 pub mod adapter_type;
 pub mod atomic;

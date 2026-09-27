@@ -125,7 +125,7 @@ Loopback server built on `tokio-tungstenite` in `tests/support/loopback.rs`.
 | B5 | `ws_path_forwarded` | Client path is `/custom/path?x=1`; assert the server saw the same path verbatim (no normalization). |
 | B6 | `ws_early_data_zero_no_protocol_header` | `max_early_data = 0`; write 100 bytes after the handshake; assert server received them as a **data frame**, not via `Sec-WebSocket-Protocol`. Locks the "0 disables entirely" default. |
 | B7 | `ws_early_data_encoded_in_protocol_header` | `max_early_data = 32`; write 16 bytes before the handshake completes; assert the server's received `Sec-WebSocket-Protocol` header is the base64url-no-padding encoding of those 16 bytes. |
-| B8 | `ws_early_data_layer_trusts_input` | `WsConfig { max_early_data: 4096, … }` passed directly to `WsLayer` (bypassing config); assert the layer produces a `Sec-WebSocket-Protocol` header of exactly 4096 bytes of early data — **NOT clamped to 2048 at the layer**. Upstream: `adapter/outbound/util.go::parseWebsocketOptions` clamps `max-early-data` at parse time — NOT in the transport layer. ADR-0002 Class A (meow-rs mirrors upstream: clamp lives in `meow-config`, never inside `WsLayer`). Config-side clamp tests belong in `crates/meow-config/tests/config_test.rs`: (a) `ws_early_data_clamp_warn` — parse fixture with `max-early-data: 65535`; assert one `warn!` + `WsConfig { max_early_data: 2048 }`; (b) `ws_early_data_zero_passes_through` — parse `max-early-data: 0`; assert `WsConfig { max_early_data: 0 }` (default-off path, no warn). Add those to `config_test.rs` when `WsConfig` lands in `meow-config`. |
+| B8 | `ws_early_data_clamps_at_layer_and_parse` | **Superseded by #648**: the layer now clamps at `connect` (an unbounded programmatic `WsConfig` would otherwise emit an unbounded `Sec-WebSocket-Protocol` header) and `meow-config` clamps at parse with a `warn!`. Covered by `ws_max_early_data_clamps_to_ceiling` in `crates/meow-config/src/proxy_parser.rs` (absent→0, at-cap ok, 99999/`u64::MAX`→2048). The original "layer trusts input verbatim" assertion no longer holds — clamping is byte-preserving: excess early bytes are sent as normal frames post-handshake. |
 | B9 | `ws_handshake_failure_surfaces_websocket_error` | Loopback server closes the TCP socket before completing the upgrade; assert `connect` returns `Err(TransportError::WebSocket(_))`. |
 
 ### C. `grpc` layer (`tests/grpc_test.rs`) — the anti-regression wall
@@ -249,7 +249,7 @@ it pass") are scope bugs.
 
 ## Open questions for engineer (none blocking)
 
-1. ~~**`ws` early-data clamp location.**~~ **Resolved by architect**: clamp lives in `meow-config` at YAML parse time. B8 now asserts layer trusts input verbatim; config-side cases (`ws_early_data_clamp_warn`, `ws_early_data_zero_passes_through`) go in `config_test.rs` when `WsConfig` lands.
+1. ~~**`ws` early-data clamp location.**~~ **Resolved** — twice: originally "config-side only" (B8's layer-trusts-input assertion), then #648 added a connect-time clamp inside `WsLayer` as the programmatic-config backstop. See B8's updated row; parse-side coverage is `ws_max_early_data_clamps_to_ceiling` in `proxy_parser.rs`.
 2. **Loopback server hosting**. `tests/support/loopback.rs` will
    contain `TcpListener::bind` — that's the one case where the §F2
    grep-check needs a `tests/` whitelist. Make sure the grep walks

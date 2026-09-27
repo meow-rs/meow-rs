@@ -68,7 +68,11 @@ fn should_probe(lazy: bool, generation: u64, last_probed_generation: u64) -> boo
 async fn run_health_check_loop(inner: Weak<TunnelInner>, spec: HealthCheckSpec) {
     // `interval(Duration::ZERO)` panics — extract clamps 0→300, but a
     // spec constructed directly (embedders) must not kill the task.
-    let interval_secs = spec.interval_secs.max(1);
+    // The ceiling matters too: `PUT /configs?force=true` persists a raw
+    // candidate that `build_proxy_layer` rejected, and the reconcile
+    // below still extracts its interval — clamping at the consumer
+    // covers every population path (issue #648 review).
+    let interval_secs = spec.interval_secs.clamp(1, meow_common::MAX_DURATION_SECS);
     let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
     // `Delay` (not tokio's default `Burst`) so a probe that outlives a short
     // `interval` schedules the next tick a full interval from *now* instead
@@ -201,6 +205,25 @@ mod tests {
             interval,
             ..Default::default()
         }
+    }
+
+    /// Issue #648 review: `PUT /configs?force=true` persists raw intervals
+    /// that never passed `build_proxy_layer` — the consumer-side clamp in
+    /// `run_health_check_loop` must keep a `u64::MAX` spec from panicking
+    /// or hanging the task's first poll. A dead `Weak` exits after the
+    /// first tick regardless.
+    #[tokio::test]
+    async fn absurd_interval_spec_exits_cleanly() {
+        let spec = HealthCheckSpec {
+            group_name: "x".into(),
+            url: "http://probe.test/204".into(),
+            interval_secs: u64::MAX,
+            lazy: false,
+        };
+        let dead: Weak<TunnelInner> = Weak::new();
+        tokio::time::timeout(Duration::from_secs(5), run_health_check_loop(dead, spec))
+            .await
+            .expect("absurd interval spec must not hang or panic");
     }
 
     /// Issue #514: the supervisor must spawn for added groups, abort for

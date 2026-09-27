@@ -331,6 +331,104 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **`xhttp-opts.x-padding-bytes` is bounded — a provider node can no
+  longer abort the process** (#648): the option parsed any `min-max`
+  range into `XhttpConfig` and `connect()` repeated `pad_len` bytes into
+  a `String` before the h2 handshake, so a subscription/provider-supplied
+  node could request an astronomical padding and kill the daemon on the
+  first health check or routed dial (`alloc` failure → abort, or a
+  multi-GiB memset → OOM). Both the config parser and
+  `xhttp::validate_config` now reject `max` above
+  `MAX_X_PADDING_BYTES` (64 KiB — far beyond any real deployment; Xray's
+  own default is 100–1000) and `xhttp-opts.headers` /
+  `http-upgrade-opts.headers` above `MAX_EXTRA_HEADERS` (64 entries).
+  The caps are deliberate hardening divergences from upstream, which
+  accepts unbounded values.
+
+- **Hysteria2 `ports` hop lists are bounded** (#648): `HopPorts::parse`
+  expanded every `a-b` range into a `Vec<u16>` before deduplicating, so
+  a provider-supplied string of repeated `1-65535` ranges amplified ~8
+  bytes of config into 128 KiB per range. Expansion now fails once the
+  list would exceed the 65535-entry port space, and `ports:` is
+  validated the same way at config load (`-t`) instead of only on the
+  first dial.
+
+- **Sniffer `sniff.*.ports` lists are bounded** (#648): the same ranged
+  expansion primitive — `"0-65535"` becomes a 65,536-entry `Vec<u16>` per
+  list, and `sniff:` takes caller-chosen map keys, so a modest `PUT
+  /configs` body could demand gigabytes of `u16`s during YAML
+  deserialization, before any validation runs. Port lists now fail past
+  the 65,536-entry port space, and a counting `visit_map` rejects the
+  33rd key *before* its value materializes — the N × 128 KiB transient
+  is gone, not just the retained map. `PUT /configs` also routes through
+  `parse_raw_yaml` now, picking up the nesting-depth guard and merge-key
+  expansion the file-load path always had.
+
+- **`u64`-seconds config fields can no longer overflow
+  `Instant + Duration`** (#648): `hysteria2.hop-interval`,
+  `proxy-groups[].interval`, `tcp-connect-timeout`, `direct`'s
+  `connect-timeout`, `tun.udp-timeout`, and `listeners[].udp-timeout`
+  all parsed unrestricted `u64` seconds into `Duration`s consumed by
+  `tokio::time::{interval, timeout}` or `Instant + Duration` — absurd
+  values panic, and the release profile's `panic = "abort"` turns each
+  into a remote-triggered process crash (the same class already fixed
+  for provider/rule-provider refresh intervals). Every site now rejects
+  values above `meow_common::MAX_DURATION_SECS` (10 years), and
+  `hysteria2`'s `HopState` clamps as a programmatic-construction
+  backstop. Review follow-ups clamp the residual consumers the parser
+  bound can't reach: the health-check loop clamps `interval_secs` at the
+  consumer (the `PUT /configs?force=true` degraded-commit path persists
+  raw intervals that never passed `build_proxy_layer`), provider
+  `health-check.timeout` and the `/connections?interval` query clamp to
+  the same ceiling, and `subscription.interval` clamps before its `i64`
+  cast so `u64::MAX` can't wrap negative into a refresh-every-poll.
+
+- **`type: http` `headers:` and SIP003 plugin `header=` opts are
+  bounded** (#648): both collected arbitrary remote-controlled maps that
+  are re-serialized into every CONNECT / upgrade request — the same
+  `MAX_EXTRA_HEADERS` (64-entry) bound as `xhttp-opts.headers` now
+  applies at parse.
+
+- **`ws-opts.max-early-data` clamps to the conventional 2048-byte
+  ceiling** (#648): the transport doc claimed the clamp existed; it did
+  not (upstream mihomo also leaves the field unbounded — 2048 is the
+  Xray/sing-box convention we now enforce). The value is `min(2048)`
+  with a `warn!` at parse and again at connect for programmatic
+  `WsConfig`s, and `mux`/`max-early-data` integer fields use `try_from`
+  instead of a `as usize` truncation cast.
+
+- **VLESS encryption `padding` can no longer wrap its own cap** (#648):
+  `parse_padding` accumulated range endpoints in a plain `i64`, so two
+  near-`i64::MAX` segments wrapped `max_len` negative and slipped under
+  the 65553 ceiling — the sampled length then fed a `vec![0; len]`
+  allocation in `connect`. Endpoints are now required non-negative and
+  accumulated with `checked_add`; cumulative gap values are capped at
+  `MAX_PADDING_GAP_MS` (60 s) so a hostile schedule can't park a dial.
+
+- **simple-obfs / Snell `host` opts reject control bytes and oversized
+  names** (#648): `HttpObfs` wrote `Host: {host}` into the raw request
+  verbatim, and `TlsObfs` put the same value into the ClientHello SNI —
+  provider-sourced `plugin-opts`/`obfs-opts` hosts were unchecked, so a
+  `\r\n` injected extra request lines and a >64 KiB name wrapped the
+  SNI length fields. `is_valid_obfs_host` now rejects whitespace/CTL
+  bytes and names over 253 bytes, enforced by the SS and Snell parse
+  paths at config load and re-checked by `HttpObfs::new`/`TlsObfs::new`
+  at wrap time (both are now fallible constructors).
+
+- **Plugin `certificate`/`private-key` file reads are capped** (#648):
+  provider nodes may point those opts at local paths; `read_cert_file`
+  now refuses files over 1 MiB (real PEM bundles are a few KiB) instead
+  of reading unbounded. Whether provider-sourced paths should be
+  rejected outright is a separate policy decision — tracked in #648.
+
+- **Health-probe `url` can no longer inject raw bytes into the probe
+  request** (#648): `ParsedUrl::parse` emitted `path`/`authority`
+  verbatim into `GET {path} HTTP/1.1\r\nHost: …` — a subscription-
+  controlled `proxy-groups[].url` (or the `?url=` delay-endpoint
+  parameter) containing `\r\n` could append arbitrary request lines and
+  headers on the wire. Control and space bytes are now rejected at
+  parse.
+
 - **Test-suite timing flakes removed** (#641): several tests raced
   real-time sleeps against asynchronous cleanup — asserting stream-map
   drain, session death, or port rebind after a fixed 50–300 ms that a

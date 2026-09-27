@@ -184,10 +184,11 @@ Notes:
   is safe because wrong early-data encoding is a silent data-corruption
   bug; adapters that need it (e.g. VMess) flip the knob at their own
   spec's layer-config level, not at the `ws` layer default.
-- **`max-early-data` is capped at 2048.** Upstream caps at the same
-  value; meow-rs enforces it at YAML parse time in `meow-config`
-  with a `warn!` and clamps to 2048 if the user sets higher. Do not
-  silently accept 65535.
+- **`max-early-data` is capped at 2048.** Upstream mihomo leaves it
+  unbounded; 2048 follows the Xray/sing-box convention and is a
+  deliberate divergence. meow-rs clamps at YAML parse time in
+  `meow-config` with a `warn!`, and `WsLayer::connect` re-clamps as a
+  backstop for programmatic construction. Do not silently accept 65535.
 - `host_header` takes precedence over `extra_headers` with key `Host`,
   but if both are set we log a `warn!` once. The warn fires at
   `WsLayer::new()` time (not per-connect) — the conflict is

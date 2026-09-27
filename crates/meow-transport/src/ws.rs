@@ -48,6 +48,13 @@ fn ws_config() -> WebSocketConfig {
 
 // ─── Public types ────────────────────────────────────────────────────────────
 
+/// Early-data ceiling: 2048 bytes is the conventional value (the Xray /
+/// sing-box default; upstream mihomo itself leaves `max-early-data`
+/// unbounded — we cap deliberately). The deferred-upgrade buffer holds up
+/// to this many caller bytes before the handshake completes — enforced at
+/// config parse *and* at connect time (issue #648).
+pub const MAX_WS_EARLY_DATA: usize = 2048;
+
 /// Configuration for the WebSocket transport layer.
 #[derive(Debug, Clone)]
 pub struct WsConfig {
@@ -63,8 +70,8 @@ pub struct WsConfig {
     pub extra_headers: Vec<(String, String)>,
     /// Maximum bytes to send as early data in the upgrade request header.
     /// `0` (default) disables early data — the safe default.
-    /// Upstream caps this at 2048; `meow-config` enforces that clamp at
-    /// YAML parse time.
+    /// Clamped to [`MAX_WS_EARLY_DATA`]: `meow-config` clamps at parse
+    /// time and this crate clamps again at connect time (issue #648).
     pub max_early_data: usize,
     /// HTTP header name for the early data value.
     /// Defaults to `"Sec-WebSocket-Protocol"` (upstream convention).
@@ -174,7 +181,16 @@ impl Transport for WsLayer {
             .cloned()
             .collect();
 
-        let max_early_data = self.config.max_early_data;
+        // Clamp the early-data cap here too — the early bytes are buffered
+        // then base64'd into a single header, so an unclamped programmatic
+        // config would write an unbounded header (issue #648).
+        let max_early_data = self.config.max_early_data.min(MAX_WS_EARLY_DATA);
+        if self.config.max_early_data > MAX_WS_EARLY_DATA {
+            warn!(
+                "ws max-early-data {} exceeds the {MAX_WS_EARLY_DATA}-byte ceiling; clamped",
+                self.config.max_early_data
+            );
+        }
         let early_header = self
             .config
             .early_data_header_name

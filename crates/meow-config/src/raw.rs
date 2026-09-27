@@ -574,6 +574,7 @@ pub struct RawSniffer {
     /// this flag is parsed and ignored for upstream-config compatibility.
     pub force_dns_mapping: Option<bool>,
     /// Protocol → port list map. Recognised keys: `TLS`, `HTTP`.
+    #[serde(default, deserialize_with = "deserialize_sniff_map")]
     pub sniff: Option<HashMap<String, RawSniffProtocol>>,
     pub force_domain: Option<Vec<String>>,
     pub skip_domain: Option<Vec<String>>,
@@ -584,6 +585,70 @@ pub struct RawSniffer {
 pub struct RawSniffProtocol {
     #[serde(default, deserialize_with = "deserialize_port_list")]
     pub ports: Option<Vec<u16>>,
+}
+
+/// Cumulative cap on expanded sniff port entries: the u16 space holds at
+/// most 65,536 values and the consumer dedups into a `HashMap`, so a larger
+/// `Vec` is pure waste. `sniff:` is a map with caller-chosen keys — without
+/// this bound, N ranged entries expand to N × 128 KiB of `u16`s at YAML
+/// deserialize time, before any validation runs (issue #648 review).
+const MAX_SNIFF_PORT_ENTRIES: usize = u16::MAX as usize + 1;
+
+/// `sniff:` keys are caller-chosen strings; each entry can carry a full
+/// 65,536-port `Vec` (128 KiB), so the key count must also be bounded at
+/// deserialize time — recognised protocols number in single digits, 32 is
+/// generous headroom for forward-compat keys (issue #648 review).
+const MAX_SNIFF_MAP_ENTRIES: usize = 32;
+
+fn deserialize_sniff_map<'de, D>(
+    deserializer: D,
+) -> Result<Option<HashMap<String, RawSniffProtocol>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{MapAccess, Visitor};
+    use std::fmt;
+
+    struct SniffMapVisitor;
+    impl<'de> Visitor<'de> for SniffMapVisitor {
+        type Value = Option<HashMap<String, RawSniffProtocol>>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a protocol → port-list map")
+        }
+
+        fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            let mut out = HashMap::new();
+            // Count iterations, not distinct keys: a repeated key still
+            // materializes its value's port Vec, so the loop bound must
+            // cap parses, not insertions.
+            for _ in 0..MAX_SNIFF_MAP_ENTRIES {
+                let Some(key) = map.next_key::<String>()? else {
+                    return Ok(Some(out));
+                };
+                out.insert(key, map.next_value::<RawSniffProtocol>()?);
+            }
+            // Bound the key count *before* deserializing the (N+1)th value —
+            // a post-materialization `map.len()` check would still let N
+            // caller-chosen keys each expand a 128 KiB port Vec first.
+            if map.next_key::<serde::de::IgnoredAny>()?.is_some() {
+                return Err(serde::de::Error::custom(format!(
+                    "sniff map exceeds {MAX_SNIFF_MAP_ENTRIES} entries"
+                )));
+            }
+            Ok(Some(out))
+        }
+    }
+
+    deserializer.deserialize_any(SniffMapVisitor)
 }
 
 fn deserialize_port_list<'de, D>(deserializer: D) -> Result<Option<Vec<u16>>, D::Error>
@@ -619,6 +684,11 @@ where
                             .as_u64()
                             .and_then(|v| u16::try_from(v).ok())
                             .ok_or_else(|| de::Error::custom(format!("invalid port: {n}")))?;
+                        if ports.len() >= MAX_SNIFF_PORT_ENTRIES {
+                            return Err(de::Error::custom(format!(
+                                "port list expands beyond {MAX_SNIFF_PORT_ENTRIES} entries"
+                            )));
+                        }
                         ports.push(p);
                     }
                     serde_yaml::Value::String(s) => {
@@ -634,12 +704,23 @@ where
                                     "invalid port range: {start}-{end}"
                                 )));
                             }
+                            let span = end as usize - start as usize + 1;
+                            if ports.len() + span > MAX_SNIFF_PORT_ENTRIES {
+                                return Err(de::Error::custom(format!(
+                                    "port list expands beyond {MAX_SNIFF_PORT_ENTRIES} entries"
+                                )));
+                            }
                             ports.extend(start..=end);
                         } else {
                             let p: u16 = s
                                 .trim()
                                 .parse()
                                 .map_err(|_| de::Error::custom(format!("invalid port: {s}")))?;
+                            if ports.len() >= MAX_SNIFF_PORT_ENTRIES {
+                                return Err(de::Error::custom(format!(
+                                    "port list expands beyond {MAX_SNIFF_PORT_ENTRIES} entries"
+                                )));
+                            }
                             ports.push(p);
                         }
                     }
@@ -778,5 +859,82 @@ mod tests {
     fn tcp_connect_timeout_defaults_to_none() {
         let raw: RawConfig = serde_yaml::from_str("mixed-port: 7890\n").unwrap();
         assert_eq!(raw.tcp_connect_timeout, None);
+    }
+
+    #[test]
+    fn sniff_port_range_at_bound_is_accepted() {
+        let raw: RawConfig =
+            serde_yaml::from_str("sniffer:\n  sniff:\n    TLS:\n      ports: [\"0-65535\"]\n")
+                .unwrap();
+        assert_eq!(
+            raw.sniffer
+                .and_then(|s| s.sniff)
+                .and_then(|m| m.get("TLS").cloned())
+                .and_then(|p| p.ports)
+                .map(|v| v.len()),
+            Some(65536)
+        );
+    }
+
+    #[test]
+    fn sniff_port_list_rejects_cumulative_expansion() {
+        // Two full ranges = 131,072 entries — same primitive hy2's
+        // `MAX_HOP_PORT_ENTRIES` already bounds (issue #648 review).
+        let err = serde_yaml::from_str::<RawConfig>(
+            "sniffer:\n  sniff:\n    TLS:\n      ports: [\"0-65535\", \"0-1\"]\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("expands beyond"), "msg: {err}");
+
+        // Scalar pushes are bound too — 65,537 valid u16 entries.
+        let many = std::iter::once(80)
+            .chain(0..=65535u32)
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let err = serde_yaml::from_str::<RawConfig>(&format!(
+            "sniffer:\n  sniff:\n    TLS:\n      ports: [{many}]\n"
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("expands beyond"), "msg: {err}");
+    }
+
+    #[test]
+    fn sniff_map_rejects_arbitrary_key_fanout() {
+        // 33 caller-chosen keys × a full range each would demand ~4 MiB of
+        // u16s during deserialization — before any validation runs.
+        let mut yaml = String::from("sniffer:\n  sniff:\n");
+        for i in 0..33 {
+            use std::fmt::Write as _;
+            let _ = write!(yaml, "    K{i}:\n      ports: [80]\n");
+        }
+        let err = serde_yaml::from_str::<RawConfig>(&yaml).unwrap_err();
+        assert!(err.to_string().contains("exceeds 32"), "msg: {err}");
+    }
+
+    #[test]
+    fn sniff_map_at_bound_is_accepted() {
+        let mut yaml = String::from("sniffer:\n  sniff:\n");
+        for i in 0..32 {
+            use std::fmt::Write as _;
+            let _ = write!(yaml, "    K{i}:\n      ports: [80]\n");
+        }
+        let raw: RawConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(raw.sniffer.and_then(|s| s.sniff).map(|m| m.len()), Some(32));
+    }
+
+    #[test]
+    fn sniff_map_count_fires_before_33rd_value() {
+        // The 33rd key carries a value that is itself invalid; the count
+        // check must fire first — proving the value is never materialized
+        // (where it could have carried a 128 KiB port expansion instead).
+        let mut yaml = String::from("sniffer:\n  sniff:\n");
+        for i in 0..32 {
+            use std::fmt::Write as _;
+            let _ = write!(yaml, "    K{i}:\n      ports: [80]\n");
+        }
+        yaml.push_str("    K32:\n      ports: [notaport]\n");
+        let err = serde_yaml::from_str::<RawConfig>(&yaml).unwrap_err();
+        assert!(err.to_string().contains("exceeds 32"), "msg: {err}");
     }
 }

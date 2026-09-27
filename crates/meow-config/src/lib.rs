@@ -394,6 +394,14 @@ pub fn parse_tun_config(
                 "tun.udp-timeout: must be at least 1 second"
             ));
         }
+        // Feeds `Instant::now() + udp_timeout` in the flow idle loop — an
+        // absurd u64 overflows and aborts the process (issue #648).
+        Some(secs) if secs > meow_common::MAX_DURATION_SECS => {
+            return Err(anyhow::anyhow!(
+                "tun.udp-timeout: {secs}s exceeds the {}s ceiling",
+                meow_common::MAX_DURATION_SECS
+            ));
+        }
         Some(secs) => secs,
         None => defaults.udp_timeout.as_secs(),
     });
@@ -534,7 +542,12 @@ pub(crate) fn yaml_within_depth(doc: &str) -> bool {
 /// the `<<` key reaches the typed deserialiser and the merged fields look
 /// "missing". Upstream mihomo configs (e.g. `rule-anchor` patterns) rely on
 /// this expansion — see meow-ios#112.
-fn parse_raw_yaml(content: &str) -> Result<raw::RawConfig, anyhow::Error> {
+/// Shared YAML→[`raw::RawConfig`] entry — nesting-depth guard plus
+/// merge-key expansion. Every untrusted config ingest point (config file,
+/// subscription/provider payloads, and `PUT /configs`) must use this so a
+/// remotely-supplied document can't bypass the depth bound or silently
+/// lose merged fields (issue #648 review).
+pub fn parse_raw_yaml(content: &str) -> Result<raw::RawConfig, anyhow::Error> {
     if !yaml_within_depth(content) {
         return Err(anyhow::anyhow!(
             "YAML document exceeds {MAX_YAML_DEPTH} levels of nesting"
@@ -1708,6 +1721,17 @@ fn build_proxy_layer(
     let ipv6 = effective_ipv6(raw.ipv6);
     let mut proxies: HashMap<SmolStr, Arc<dyn Proxy>> = HashMap::new();
     let mut static_proxy_names = std::collections::HashSet::new();
+    // `tcp-connect-timeout` seconds feed `tokio::time::timeout` per dial —
+    // an absurd u64 overflows `Instant + Duration` and aborts the process
+    // (issue #648). Checked here, in the Result-returning scope, because the
+    // `make_direct` closure cannot propagate.
+    if let Some(secs) = raw.tcp_connect_timeout {
+        anyhow::ensure!(
+            secs <= meow_common::MAX_DURATION_SECS,
+            "tcp-connect-timeout: {secs}s exceeds the {}s ceiling",
+            meow_common::MAX_DURATION_SECS
+        );
+    }
     // Built-in proxies — upstream registers DIRECT, REJECT, REJECT-DROP,
     // COMPATIBLE, PASS, PASS-RULE (`config.go` ~line 891).
     let make_direct = |compatible: bool| {
@@ -1796,6 +1820,17 @@ fn build_proxy_layer(
             "proxy group '{}': the duplicate name — already used by a \
              proxy or reserved built-in",
             group.name
+        );
+        // `interval` (seconds) reaches `tokio::time::interval` in the
+        // health-check supervisor — an absurd u64 overflows
+        // `Instant + Duration` and, with `panic = "abort"`, kills the
+        // process. Subscription-controlled groups reach the same path
+        // (issue #648).
+        anyhow::ensure!(
+            group.interval.unwrap_or(0) <= meow_common::MAX_DURATION_SECS,
+            "proxy group '{}': interval exceeds the {}s ceiling",
+            group.name,
+            meow_common::MAX_DURATION_SECS
         );
         anyhow::ensure!(
             seen_group_names.insert(group.name.as_str()),
@@ -3181,6 +3216,15 @@ fn parse_listener_spec(
                 Some(0) => anyhow::bail!(
                     "listeners[{}].udp-timeout: must be at least 1 second",
                     raw_l.name
+                ),
+                // Same Instant+Duration overflow class as tun.udp-timeout
+                // (issue #648) — the tproxy consumer happens to use
+                // `checked_add` today, but the bound keeps every future
+                // consumer honest.
+                Some(s) if s > meow_common::MAX_DURATION_SECS => anyhow::bail!(
+                    "listeners[{}].udp-timeout: {s}s exceeds the {}s ceiling",
+                    raw_l.name,
+                    meow_common::MAX_DURATION_SECS
                 ),
                 Some(s) => s,
                 None => default_udp_timeout_secs(),
@@ -5960,6 +6004,69 @@ rules:
             .replace("  - \"NOSUCHRULE,x,DIRECT\"\n", "");
         let err = expect_strict_failure(&yaml, "a bad proxy-groups: entry");
         assert!(err.to_string().contains("g-broken"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn rejects_absurd_group_health_interval() {
+        // `interval` seconds reach `tokio::time::interval` in the health
+        // supervisor — an out-of-range u64 panics on `Instant + Duration`
+        // under `panic = "abort"` (issue #648).
+        let yaml = r#"
+strict: true
+proxies:
+  - { name: p, type: direct }
+proxy-groups:
+  - { name: g, type: url-test, proxies: [p], url: "https://example.com/", interval: 18446744073709551615 }
+rules:
+  - "MATCH,DIRECT"
+"#;
+        let Err(err) = rebuild_from_raw(&raw_config(yaml)) else {
+            panic!("absurd group interval must be rejected");
+        };
+        assert!(err.to_string().contains("interval"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn rejects_absurd_tcp_connect_timeout() {
+        // Same `Instant + Duration` class via `tokio::time::timeout`
+        // (issue #648).
+        let yaml = r#"
+tcp-connect-timeout: 18446744073709551615
+proxies:
+  - { name: p, type: direct }
+rules:
+  - "MATCH,DIRECT"
+"#;
+        let Err(err) = rebuild_from_raw(&raw_config(yaml)) else {
+            panic!("absurd tcp-connect-timeout must be rejected");
+        };
+        assert!(
+            err.to_string().contains("tcp-connect-timeout"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_absurd_udp_timeouts() {
+        // tun.udp-timeout feeds `Instant + udp_timeout`; the listeners:
+        // variant shares the bound for consumer safety (issue #648).
+        let tun = raw::RawTun {
+            enable: true,
+            udp_timeout: Some(u64::MAX),
+            ..raw::RawTun::default()
+        };
+        let err = parse_tun_config(Some(&tun), None)
+            .expect_err("absurd tun.udp-timeout must be rejected");
+        assert!(err.to_string().contains("udp-timeout"), "unexpected: {err}");
+
+        let raw_l: raw::RawListener = serde_yaml::from_str(
+            "name: t\ntype: tproxy\nport: 7893\nudp: true\nfirewall: false\n\
+             udp-timeout: 18446744073709551615\n",
+        )
+        .unwrap();
+        let err = parse_listener_spec(&raw_l, false)
+            .expect_err("absurd listener udp-timeout must be rejected");
+        assert!(err.to_string().contains("udp-timeout"), "unexpected: {err}");
     }
 
     #[test]

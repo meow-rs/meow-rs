@@ -412,6 +412,13 @@ pub(crate) fn decode_header(h: &[u8; 5]) -> Result<usize, std::io::Error> {
 
 // ─── Padding (`ParsePadding` / `CreatPadding`) ────────────────────────────────
 
+/// Upper bound on cumulative padding gaps (ms). Lens are capped by the
+/// u16-sized record length field (65553); gaps become `Duration` sleeps
+/// between the fragmented client-hello writes in `connect`, so an
+/// unbounded provider-supplied value would park a dial for up to
+/// ~292 My (issue #648). 60 s is beyond any pacing scheme.
+const MAX_PADDING_GAP_MS: i64 = 60_000;
+
 /// Parsed padding schedule: alternating length triples and gap triples.
 #[derive(Default, Clone)]
 pub(crate) struct Padding {
@@ -426,6 +433,7 @@ pub(crate) fn parse_padding(padding: &str) -> Result<Padding, String> {
         return Ok(out);
     }
     let mut max_len: i64 = 0;
+    let mut max_gap: i64 = 0;
     for (i, s) in padding.split('.').enumerate() {
         let parts: Vec<&str> = s.split('-').collect();
         if parts.len() < 3 || parts[0].is_empty() || parts[1].is_empty() || parts[2].is_empty() {
@@ -440,15 +448,33 @@ pub(crate) fn parse_padding(padding: &str) -> Result<Padding, String> {
         if i == 0 && (y[0] < 100 || y[1] < 18 + 17 || y[2] < 18 + 17) {
             return Err("first padding length must not be smaller than 35".into());
         }
+        // Reject negative range endpoints — a negative contribution would
+        // launder the length cap below, and `rand_between`/`Duration`
+        // conversion of a negative endpoint yields a giant `usize`/`u64`
+        // (issue #648). The `i64` sums use `checked_add` so two huge
+        // endpoints can't wrap `max_len` back under the cap either.
+        if y[1] < 0 || y[2] < 0 {
+            return Err(format!("negative padding range in: {s}"));
+        }
         if i % 2 == 0 {
             out.lens.push(y);
-            max_len += y[1].max(y[2]);
+            max_len = max_len
+                .checked_add(y[1].max(y[2]))
+                .ok_or_else(|| "total padding length overflow".to_string())?;
         } else {
             out.gaps.push(y);
+            max_gap = max_gap
+                .checked_add(y[1].max(y[2]))
+                .ok_or_else(|| "total padding gap overflow".to_string())?;
         }
     }
     if max_len > 18 + 65535 {
         return Err("total padding length must not be larger than 65553".into());
+    }
+    if max_gap > MAX_PADDING_GAP_MS {
+        return Err(format!(
+            "total padding gap must not be larger than {MAX_PADDING_GAP_MS} ms"
+        ));
     }
     Ok(out)
 }
@@ -587,5 +613,18 @@ mod tests {
         assert!(parse_padding("10-20-30").is_err());
         assert!(parse_padding("100-111-1111.75-0-111").is_ok());
         assert!(parse_padding("").is_ok());
+    }
+
+    #[test]
+    fn parse_padding_bounded_against_overflow() {
+        // Two i64::MAX lens endpoints would wrap `max_len` back under the
+        // cap without `checked_add` (issue #648).
+        let huge = format!("100-{m}-{m}.1-0-0.1-{m}-{m}", m = i64::MAX);
+        assert!(parse_padding(&huge).is_err());
+        // A single over-cap lens value is caught by the existing bound.
+        assert!(parse_padding("100-35-999999").is_err());
+        // Gaps get their own bound — a giant ms value is a dial-hang.
+        assert!(parse_padding("100-111-1111.75-0-99999999").is_err());
+        assert!(parse_padding("100-111-1111.75-0-111").is_ok());
     }
 }

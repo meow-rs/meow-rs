@@ -338,6 +338,14 @@ impl ParsedUrl {
         } else {
             (false, url.strip_prefix("http://")?)
         };
+        // CTL/space bytes would smuggle extra request lines or headers into
+        // the probe request — reject before splitting authority/path. A
+        // subscription-controlled `proxy-groups[].url` (or the `?url=` delay
+        // endpoint) could otherwise write a raw `\r\n` onto the wire
+        // (issue #648).
+        if rest.bytes().any(|b| b <= b' ' || b == 0x7f) {
+            return None;
+        }
         let (authority, path) = match rest.find('/') {
             Some(i) => (&rest[..i], &rest[i..]),
             None => (rest, "/"),
@@ -436,7 +444,22 @@ mod tests {
             ("http://example.com:8080", false, "example.com", 8080, "/"),
             ("http://[::1]:8080/x", false, "::1", 8080, "/x"),
         ];
-        let rejected: &[&str] = &["ftp://x", "example.com"];
+        // CTL/whitespace bytes would inject raw request lines or headers
+        // into the probe request (issue #648).
+        let rejected: &[&str] = &[
+            "ftp://x",
+            "example.com",
+            "http://victim/\r\nX-Injected: x",
+            "http://victim/x y",
+            "http://vic\ttim/",
+            "http://vic\0tim/",
+            "http://victim/\x0bz",
+            "http://victim/\x7f",
+            // CTL in the authority half, not just the path — these would
+            // still parse (valid host + port) without the guard.
+            "http://vic\ntim:8080/",
+            "http://vic\rtim:8080/",
+        ];
 
         // Collect instead of asserting inline so one bad input does not hide
         // the remaining cases.

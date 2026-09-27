@@ -130,10 +130,17 @@ pub(crate) fn load_pem_or_path(value: &str, opt: &str, plugin: &str) -> Result<V
     }
 }
 
+/// Bound on PEM cert/key file reads — provider-controlled paths reach this
+/// (issue #648), and a PEM bundle is a few KiB in practice. 1 MiB leaves
+/// generous headroom for stacked chains while capping a swapped-in huge
+/// regular file.
+const MAX_PEM_FILE_BYTES: u64 = 1024 * 1024;
+
 /// Read a cert/key file that an `is_file` check already proved regular.
 /// On unix the open carries `O_NONBLOCK` — a path swapped to a FIFO
 /// between the stat and this read can't wedge the caller (a nonblocking
 /// FIFO read errors instead of blocking; regular files ignore the flag).
+/// Reads are capped at [`MAX_PEM_FILE_BYTES`].
 pub(crate) fn read_cert_file(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true);
@@ -142,9 +149,16 @@ pub(crate) fn read_cert_file(path: &std::path::Path) -> std::io::Result<Vec<u8>>
         use std::os::unix::fs::OpenOptionsExt;
         opts.custom_flags(libc::O_NONBLOCK);
     }
-    let mut f = opts.open(path)?;
+    let f = opts.open(path)?;
     let mut buf = Vec::new();
-    std::io::Read::read_to_end(&mut f, &mut buf)?;
+    let mut take = std::io::Read::take(f, MAX_PEM_FILE_BYTES + 1);
+    let read = std::io::Read::read_to_end(&mut take, &mut buf)?;
+    if read as u64 > MAX_PEM_FILE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("file exceeds {MAX_PEM_FILE_BYTES} bytes"),
+        ));
+    }
     Ok(buf)
 }
 
@@ -215,6 +229,26 @@ mod tests {
         assert!(parse_bool_strict("bogus", "p", "k").is_err());
         // Strict also rejects the lenient empty-string coercion.
         assert!(parse_bool_strict("", "p", "k").is_err());
+    }
+
+    #[test]
+    fn read_cert_file_caps_oversized_files() {
+        // A provider-controlled `certificate`/`private-key` path reaches this
+        // read — a swapped-in huge regular file must not exhaust memory
+        // (issue #648).
+        let dir = std::env::temp_dir().join(format!("meow-pem-cap-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let big = dir.join("big.pem");
+        std::fs::write(&big, vec![b'x'; (MAX_PEM_FILE_BYTES + 1) as usize]).unwrap();
+        assert!(read_cert_file(&big).is_err());
+        let small = dir.join("small.pem");
+        std::fs::write(
+            &small,
+            b"-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        assert!(read_cert_file(&small).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

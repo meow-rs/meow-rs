@@ -1046,7 +1046,14 @@ fn build_health_check_config(raw: Option<&RawHealthCheck>) -> Option<HealthCheck
             .clone()
             .unwrap_or_else(|| "https://www.gstatic.com/generate_204".to_string()),
         interval: hc.interval.unwrap_or(300),
-        timeout: hc.timeout.unwrap_or(5000),
+        // `timeout` is milliseconds consumed by `tokio::time::timeout`
+        // (provider healthcheck API) — clamp to the shared duration
+        // ceiling so an absurd value degrades to "probe never fires"
+        // instead of wrapping Instant arithmetic (issue #648 review).
+        timeout: hc
+            .timeout
+            .unwrap_or(5000)
+            .min(meow_common::MAX_DURATION_SECS.saturating_mul(1000)),
         expected_status: hc.expected_status.clone().unwrap_or_default(),
         lazy: hc.lazy.unwrap_or(false),
     })

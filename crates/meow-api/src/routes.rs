@@ -534,13 +534,19 @@ const MIN_CONNECTIONS_INTERVAL_MS: u64 = 100;
 
 /// Parse the `interval` query param: `None` on `0` / non-numeric input
 /// (rendered as `400 Body invalid` by the caller), otherwise the value in
-/// milliseconds, defaulted to 1000 and clamped to
-/// [`MIN_CONNECTIONS_INTERVAL_MS`].
+/// milliseconds, defaulted to 1000 and clamped between
+/// [`MIN_CONNECTIONS_INTERVAL_MS`] and `MAX_DURATION_SECS * 1000`.
 fn parse_connections_interval(raw: Option<&str>) -> Option<u64> {
     match raw {
         Some(raw) => match raw.parse::<u64>() {
             Ok(0) | Err(_) => None,
-            Ok(value) => Some(value.max(MIN_CONNECTIONS_INTERVAL_MS)),
+            // The value feeds `tokio::time::interval(Duration::from_millis)`
+            // — clamp the top end so an absurd query cannot build a
+            // far-future deadline (issue #648 review).
+            Ok(value) => Some(value.clamp(
+                MIN_CONNECTIONS_INTERVAL_MS,
+                meow_common::MAX_DURATION_SECS.saturating_mul(1000),
+            )),
         },
         None => Some(1000),
     }
@@ -2603,8 +2609,10 @@ async fn put_configs(
                 .into_response(),
         };
 
-    // YAML syntax check — always 400 even with force=true (per spec)
-    let mut raw_config: RawConfig = match serde_yaml::from_str(&yaml) {
+    // YAML syntax check — always 400 even with force=true (per spec).
+    // `parse_raw_yaml` applies the nesting-depth guard and merge-key
+    // expansion the file-load path gets (issue #648 review).
+    let mut raw_config: RawConfig = match meow_config::parse_raw_yaml(&yaml) {
         Ok(c) => c,
         Err(e) => {
             return (

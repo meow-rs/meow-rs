@@ -616,7 +616,7 @@ mod tests {
     async fn http_client_to_server_round_trip() {
         // client writes through HttpObfs, server reads through HttpObfsServer.
         let (client_io, server_io) = tokio::io::duplex(8192);
-        let mut client = HttpObfs::new(client_io, "example.com".to_string(), 80);
+        let mut client = HttpObfs::new(client_io, "example.com".to_string(), 80).unwrap();
         let mut server = HttpObfsServer::new(server_io);
 
         client.write_all(b"FIRST_PAYLOAD").await.unwrap();
@@ -634,7 +634,7 @@ mod tests {
     async fn http_server_to_client_round_trip() {
         // server writes through HttpObfsServer, client reads through HttpObfs.
         let (client_io, server_io) = tokio::io::duplex(8192);
-        let mut client = HttpObfs::new(client_io, "example.com".to_string(), 80);
+        let mut client = HttpObfs::new(client_io, "example.com".to_string(), 80).unwrap();
         let mut server = HttpObfsServer::new(server_io);
 
         server.write_all(b"REPLY_BODY").await.unwrap();
@@ -653,7 +653,7 @@ mod tests {
     #[tokio::test]
     async fn tls_client_to_server_round_trip() {
         let (client_io, server_io) = tokio::io::duplex(65536);
-        let mut client = TlsObfs::new(client_io, "example.com".to_string());
+        let mut client = TlsObfs::new(client_io, "example.com".to_string()).unwrap();
         let mut server = TlsObfsServer::new(server_io);
 
         client.write_all(b"SECRET_FIRST").await.unwrap();
@@ -670,7 +670,7 @@ mod tests {
     #[tokio::test]
     async fn tls_server_to_client_round_trip() {
         let (client_io, server_io) = tokio::io::duplex(65536);
-        let mut client = TlsObfs::new(client_io, "example.com".to_string());
+        let mut client = TlsObfs::new(client_io, "example.com".to_string()).unwrap();
         let mut server = TlsObfsServer::new(server_io);
 
         server.write_all(b"SERVER_REPLY").await.unwrap();
@@ -688,7 +688,7 @@ mod tests {
     async fn tls_large_payload_round_trip() {
         // Exercise multi-chunk framing (> 16 KiB).
         let (client_io, server_io) = tokio::io::duplex(1 << 20);
-        let mut client = TlsObfs::new(client_io, "example.com".to_string());
+        let mut client = TlsObfs::new(client_io, "example.com".to_string()).unwrap();
         let mut server = TlsObfsServer::new(server_io);
 
         let payload: Vec<u8> = (0..40_000).map(|i| (i % 251) as u8).collect();

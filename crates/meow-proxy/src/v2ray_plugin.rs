@@ -95,6 +95,17 @@ pub fn parse_opts(s: &str) -> Result<V2rayPluginConfig> {
             "header" => {
                 // Form: header=Key:Value
                 if let Some((k, v)) = value.split_once(':') {
+                    // Provider opts can repeat `header=` — the map is
+                    // re-serialized per dial, so bound it like the xhttp
+                    // `headers` cap (issue #648).
+                    if cfg.headers.len() >= meow_transport::MAX_EXTRA_HEADERS
+                        && !cfg.headers.contains_key(k.trim())
+                    {
+                        return Err(MeowError::Config(format!(
+                            "v2ray-plugin: more than {} header= entries",
+                            meow_transport::MAX_EXTRA_HEADERS
+                        )));
+                    }
                     cfg.headers
                         .insert(k.trim().to_string(), v.trim().to_string());
                 } else {
@@ -204,6 +215,28 @@ pub async fn handshake_over(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Provider-controlled `header=` opts repeat unboundedly and the map is
+    /// re-serialized per dial — same bound as xhttp `headers` (issue #648).
+    #[test]
+    fn parse_opts_caps_header_count() {
+        let mut opts = String::from("mode=websocket");
+        for i in 0..meow_transport::MAX_EXTRA_HEADERS {
+            use std::fmt::Write;
+            write!(opts, ";header=H{i}:v").unwrap();
+        }
+        // At the cap: still parses (re-`insert` of a known key is a replace).
+        assert!(parse_opts(&opts).is_ok());
+        use std::fmt::Write;
+        write!(opts, ";header=one-more:v").unwrap();
+        let Err(err) = parse_opts(&opts) else {
+            panic!(
+                "{} headers must be rejected",
+                meow_transport::MAX_EXTRA_HEADERS + 1
+            )
+        };
+        assert!(err.to_string().contains("header"), "msg: {err}");
+    }
 
     #[test]
     fn parse_opts_cases() {
