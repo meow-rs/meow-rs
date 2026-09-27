@@ -89,6 +89,8 @@ not reimplement a dashboard:
   panel works without typing it again.
 - **Configuration**: raw YAML editor. Edits are validated with `meow -t`
   before they replace the file.
+- **Clients**: ARP-based client steering — pick which LAN devices are routed
+  through the side router (see below).
 - **Settings**: service options (enable, config path, working directory,
   panel port, API secret) and the transparent-proxy section.
 - **Log**: meow's entries from the system log.
@@ -124,9 +126,39 @@ sockets are exempt. Without it, DIRECT connections loop.
 
 **Side-router setup:** give OpenWrt a static address on the existing LAN,
 with the main router as its gateway and DNS. Disable its DHCP server and RA,
-and enable masquerading on the `lan` zone. Then point clients' gateway and
-DNS at the OpenWrt address, either per device or through the main router's
-DHCP options.
+and enable masquerading on the `lan` zone. Then steer clients to the OpenWrt
+address by one of:
+
+- a per-device **gateway + DNS** set on the client, or a DHCP
+  reservation/option on the main router (cleanest — no spoofing); or
+- **ARP client steering** (below), which needs no client or main-router change.
+
+## Selecting clients by ARP (Clients tab)
+
+**Services → meow → Clients** lists the LAN neighbour table with a checkbox per
+device. For each ticked client, the `meow-arp` service (`arp-hijack.sh`)
+periodically sends it a unicast ARP reply announcing this router as the
+client's gateway, so the client's off-LAN traffic arrives here and is
+transparently proxied — without touching the client or the main router's DHCP.
+
+This is **ARP spoofing**. It is appropriate only for devices you administer on
+a network you control, and it is **off by default**: the `arp_hijack` section
+of `/etc/config/meow` starts disabled and empty, so no device is ever affected
+until you enable steering and tick it. Untick a client (Save & Apply) to
+release it; its ARP cache relearns the real gateway once meow stops announcing.
+It needs the `arping` package (a dependency of `luci-app-meow`) and the
+transparent proxy enabled to actually handle the steered traffic.
+
+Notes and limits:
+
+- It is a continual re-announcement (`interval`, default 2s) racing the real
+  router's own ARP; a network with Dynamic ARP Inspection or port security
+  will drop it.
+- `gateway` (empty = the interface's real gateway) is the IP announced.
+- CLI: `uci set meow.arp.enabled=1`, `uci add_list meow.arp.client=<MAC>`,
+  `uci commit meow`, `/etc/init.d/meow-arp restart`.
+- Prefer the DHCP-option approach where the main router supports it: it is
+  reliable, survives reboots, and is not a spoofing technique.
 
 ### Running OpenWrt as a Docker side router
 

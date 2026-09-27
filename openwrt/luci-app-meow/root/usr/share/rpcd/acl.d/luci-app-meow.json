@@ -9,7 +9,8 @@
 			"file": {
 				"/etc/meow/*": [ "read" ],
 				"/sbin/logread -e meow": [ "exec" ],
-				"/usr/share/meow/gateway.sh status": [ "exec" ]
+				"/usr/share/meow/gateway.sh status": [ "exec" ],
+				"/usr/share/meow/arp-hijack.sh clients": [ "exec" ]
 			}
 		},
 		"write": {
@@ -18,7 +19,8 @@
 				"/etc/meow/*": [ "write" ],
 				"/tmp/meow-luci-check.yaml": [ "write" ],
 				"/usr/bin/meow -d * -f /tmp/meow-luci-check.yaml -t": [ "exec" ],
-				"/etc/init.d/meow restart": [ "exec" ]
+				"/etc/init.d/meow restart": [ "exec" ],
+				"/etc/init.d/meow-arp restart": [ "exec" ]
 			}
 		}
 	}

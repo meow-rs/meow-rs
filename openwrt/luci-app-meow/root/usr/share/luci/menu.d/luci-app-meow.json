@@ -38,6 +38,15 @@
 		}
 	},
 
+	"admin/services/meow/clients": {
+		"title": "Clients",
+		"order": 35,
+		"action": {
+			"type": "view",
+			"path": "meow/clients"
+		}
+	},
+
 	"admin/services/meow/settings": {
 		"title": "Settings",
 		"order": 40,

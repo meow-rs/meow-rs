@@ -13,5 +13,13 @@ if ! uci -q get meow.tproxy >/dev/null; then
 		set meow.tproxy.ipv6='0'
 	UCI
 fi
+if ! uci -q get meow.arp >/dev/null; then
+	uci -q batch <<-UCI
+		set meow.arp=arp_hijack
+		set meow.arp.enabled='0'
+		set meow.arp.interface='lan'
+		set meow.arp.interval='2'
+	UCI
+fi
 uci -q commit meow
 exit 0

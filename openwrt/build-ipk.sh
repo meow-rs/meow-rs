@@ -83,6 +83,8 @@ build_meow() {
     install -m 644 "$SCRIPT_DIR/meow/files/meow.config" "$staging/data/etc/config/meow"
     install -m 644 "$SCRIPT_DIR/meow/files/config.yaml" "$staging/data/etc/meow/config.yaml"
     install -m 755 "$SCRIPT_DIR/meow/files/gateway.sh" "$staging/data/usr/share/meow/gateway.sh"
+    install -m 755 "$SCRIPT_DIR/meow/files/arp-hijack.sh" "$staging/data/usr/share/meow/arp-hijack.sh"
+    install -m 755 "$SCRIPT_DIR/meow/files/meow-arp.init" "$staging/data/etc/init.d/meow-arp"
     install -m 755 "$SCRIPT_DIR/meow/files/meow.uci-defaults" "$staging/data/etc/uci-defaults/80_meow"
 
     cat > "$staging/control/control" <<EOF
@@ -108,12 +110,17 @@ EOF
 [ -n "${IPKG_INSTROOT}" ] && exit 0
 [ -f /etc/uci-defaults/80_meow ] && sh /etc/uci-defaults/80_meow && rm -f /etc/uci-defaults/80_meow
 /etc/init.d/meow enable || true
+# meow-arp self-gates on the (default-off) arp_hijack section, so enabling it
+# is safe: it steers nothing until clients are selected in LuCI.
+/etc/init.d/meow-arp enable || true
 exit 0
 EOF
 
     cat > "$staging/control/prerm" <<'EOF'
 #!/bin/sh
 [ -n "${IPKG_INSTROOT}" ] && exit 0
+/etc/init.d/meow-arp stop 2>/dev/null
+/etc/init.d/meow-arp disable 2>/dev/null
 /etc/init.d/meow stop 2>/dev/null
 /etc/init.d/meow disable || true
 exit 0
@@ -150,14 +157,14 @@ build_luci() {
     cat > "$staging/control/control" <<EOF
 Package: luci-app-meow
 Version: ${version}
-Depends: libc, luci-base, meow
+Depends: libc, luci-base, meow, arping
 Section: luci
 Architecture: all
 Installed-Size: $(installed_size "$staging/data")
 Maintainer: ${MAINTAINER}
 Description:  LuCI support for meow: status overview, YAML config editor,
-  service and transparent-proxy (gateway / side-router) settings, logs, and
-  the built-in meow web panel embedded in the LuCI interface.
+  service and transparent-proxy (gateway / side-router) settings, ARP-based
+  client steering, logs, and the built-in meow web panel embedded in LuCI.
 EOF
 
     cat > "$staging/control/postinst" <<'EOF'
