@@ -383,6 +383,7 @@ impl TunListener {
         // Each attempt runs on a blocking thread; the outer caller's
         // TUN_STARTUP_TIMEOUT guards the overall time spent here.
         const MAX_TUN_RETRIES: u32 = 5;
+        const TUN_CREATE_RETRY_DELAY: Duration = Duration::from_millis(500);
         let base_addr = cfg.inet4_address.addr();
         let prefix = cfg.inet4_address.prefix_len();
         let mut device: Option<tun_rs::AsyncDevice> = None;
@@ -463,6 +464,13 @@ impl TunListener {
                     "failed to create TUN device after {MAX_TUN_RETRIES} attempts{detail}"
                 ))));
             }
+
+            // The point of retrying is to outlast an asynchronously
+            // closing stale adapter (common on Windows after an unclean
+            // shutdown) — back-to-back attempts would race ahead of the
+            // cleanup they exist to wait for. Bounded by TUN_STARTUP_TIMEOUT
+            // (issue #641).
+            tokio::time::sleep(TUN_CREATE_RETRY_DELAY).await;
         }
         // SAFETY: the loop either breaks with `device = Some(...)` and
         // `dev_name` set, or returns `Err` above.

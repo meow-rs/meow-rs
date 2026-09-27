@@ -1,4 +1,30 @@
 //! Certificate reloader with file watching and hot reload support
+//!
+//! # Vendored-code note (meow-rs issue #641)
+//!
+//! The file-watch reload loop below is kept verbatim from upstream but
+//! has three known gaps that should not be copied into live code:
+//!
+//! 1. **Debounce drops the trailing event instead of coalescing it.**
+//!    `last_reload` only advances on a *successful* reload, so every
+//!    event inside `debounce_ms` after a success — including a second
+//!    rotation — is discarded outright; the same holds inside the first
+//!    `debounce_ms` after `start_watching` spawns, where `last_reload`
+//!    is initialized to `Instant::now()`. (A dropped event after a
+//!    *failed* reload does get rescued — the gate stays open — so the
+//!    real loss cases are the two above.)
+//! 2. **The fixed 100 ms pre-reload sleep** bets on the writer having
+//!    finished — fine for atomic-rename writes, racy for
+//!    truncate-and-write updaters.
+//! 3. **A failed reload keeps the old certificate with no retry** — one
+//!    transient failure (file mid-write at read time) leaves the stale
+//!    pair active until the next unrelated file event.
+//!
+//! There are **no callers at all** — `CertReloader` is dead code
+//! (meow-rs wires TLS through `meow-transport`, and the module is
+//! `server`-gated off by default; even the unit tests only exercise
+//! `CertReloaderConfig`), so the gaps are documented rather than
+//! diverged — same policy as the `#625` notes elsewhere in this crate.
 
 use crate::util::{AnyTlsError, CertificateInfo, Result, create_server_config_from_files};
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};

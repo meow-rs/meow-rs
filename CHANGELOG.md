@@ -331,6 +331,13 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **TUN device-create retries pause between attempts** (#641): the
+  retry loop exists to outlast an asynchronously closing stale adapter
+  (common on Windows after an unclean shutdown), but ran its five
+  attempts back-to-back — racing ahead of the cleanup it was meant to
+  wait for. Each failed attempt now waits 500 ms before the next
+  (bounded by `TUN_STARTUP_TIMEOUT`).
+
 - **Startup bind/setup failures surface eagerly, not inside detached
   tasks** (#641): the DNS server and the REST API used to bind their
   sockets inside a spawned task, so an `EADDRINUSE`/sandbox-denied bind
