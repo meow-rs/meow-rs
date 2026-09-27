@@ -612,8 +612,14 @@ mod tests {
             Arc::new(FailOnceDialer(AtomicUsize::new(0))),
         );
         let dead = c.pick().await.unwrap();
-        // Let the smux reader task observe the socket error and mark dead.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Let the smux reader task observe the socket error and mark dead —
+        // poll for it instead of racing a fixed sleep on a loaded runner.
+        for _ in 0..50 {
+            if dead.is_dead() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         assert!(dead.is_dead());
         let live = c.pick().await.unwrap();
         assert!(!Arc::ptr_eq(&dead, &live));

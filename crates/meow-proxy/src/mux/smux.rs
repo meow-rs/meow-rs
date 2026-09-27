@@ -2366,8 +2366,14 @@ mod tests {
         let opened =
             tokio::time::timeout(std::time::Duration::from_millis(50), session.open_stream()).await;
         assert!(opened.is_err(), "open must wait for outbound capacity");
-        // The cancellation guard removes the entry asynchronously.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // The cancel guard removes the entry on drop (synchronous for
+        // smux, but poll anyway — cheap and robust if that changes).
+        for _ in 0..50 {
+            if session.state.streams.lock().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
         assert!(
             session.state.streams.lock().is_empty(),
             "the cancelled open must not leave its stream-map entry"

@@ -87,9 +87,15 @@ async fn start_anytls_server(
     let h = tokio::spawn(async move {
         let _ = server.listen(&listen_addr).await;
     });
-    // Give the accept loop a beat to rebind.
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    (addr, h)
+    // Poll until the accept loop has actually re-bound — a fixed sleep
+    // races the bind on a loaded runner and flakes the first dial.
+    for _ in 0..100 {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            return (addr, h);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("anytls test server did not rebind within 5s");
 }
 
 #[tokio::test]

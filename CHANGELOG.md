@@ -331,6 +331,20 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **Test-suite timing flakes removed** (#641): several tests raced
+  real-time sleeps against asynchronous cleanup — asserting stream-map
+  drain, session death, or port rebind after a fixed 50–300 ms that a
+  loaded CI runner can exceed. They now poll bounded: smux/muxcool
+  cancel-guard drain, the kcptun dead-session mark, the anytls test
+  server's rebind (connect-probe), the shadowsocks obfs plugin dial, the
+  anytls fd-leak settle, and the NAT sweeper's drop/exit paths. The
+  `touched_sessions_are_kept` test no longer races `touch()` against a
+  real-time ticker at all — the sweep decision is exercised directly via
+  the extracted `sweep_idle_sessions` with injected activity stamps (a
+  deterministic `touch()` refresh test covers the path it vacated). The
+  hysteria2 keepalive test shrinks the negotiated idle timeout to 18 s
+  (client keepalive is 10 s) instead of sleeping a real 32 s.
+
 - **TUN device-create retries pause between attempts** (#641): the
   retry loop exists to outlast an asynchronously closing stale adapter
   (common on Windows after an unclean shutdown), but ran its five

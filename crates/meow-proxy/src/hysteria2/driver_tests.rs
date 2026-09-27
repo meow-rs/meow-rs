@@ -42,6 +42,15 @@ impl Peer {
 }
 
 async fn peer(authenticate: bool, response: Option<u8>, stream_limit: u64) -> Peer {
+    peer_with_idle_timeout(authenticate, response, stream_limit, 30_000).await
+}
+
+async fn peer_with_idle_timeout(
+    authenticate: bool,
+    response: Option<u8>,
+    stream_limit: u64,
+    idle_timeout_ms: u64,
+) -> Peer {
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let local = socket.local_addr().unwrap();
     let key = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
@@ -55,7 +64,7 @@ async fn peer(authenticate: bool, response: Option<u8>, stream_limit: u64) -> Pe
     let mut config =
         quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, ssl).unwrap();
     config.set_application_protos(&[b"h3"]).unwrap();
-    config.set_max_idle_timeout(30_000);
+    config.set_max_idle_timeout(idle_timeout_ms);
     config.set_initial_max_streams_bidi(stream_limit);
     config.set_initial_max_streams_uni(16);
     config.set_initial_max_data(1 << 20);
@@ -411,16 +420,20 @@ async fn non_fast_open_response_timeout_is_bounded() {
 
 #[tokio::test]
 async fn keepalive_preserves_an_idle_tcp_stream() {
-    let peer = peer(true, Some(0), 16).await;
+    // Shrink the negotiated idle timeout to 18s (the client's own is 30s):
+    // the client's 10s keepalive ping still lands ~8s inside the window,
+    // so the property under test — keepalive defeats the idle deadline —
+    // is the same as crossing 30s, without paying 32s of real time.
+    let peer = peer_with_idle_timeout(true, Some(0), 16, 18_000).await;
     let client = peer.client(false);
     let mut stream = timeout(TEST_TIMEOUT, client.tcp_connect(TARGET))
         .await
         .unwrap()
         .unwrap();
     round_trip(&mut stream).await;
-    // quiche uses std::time::Instant, so Tokio's virtual clock cannot exercise
-    // its 30-second idle timeout. This intentionally crosses it in real time.
-    sleep(Duration::from_secs(32)).await;
+    // quiche uses std::time::Instant, so Tokio's virtual clock cannot
+    // exercise its idle timeout. This intentionally crosses it in real time.
+    sleep(Duration::from_secs(20)).await;
     round_trip(&mut stream).await;
 }
 

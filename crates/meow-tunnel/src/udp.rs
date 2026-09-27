@@ -79,6 +79,29 @@ pub fn new_nat_table() -> NatTable {
     Arc::new(DashMap::new())
 }
 
+/// Evict sessions idle for more than `idle` from `table`, returning the
+/// eviction count. Split out of the sweeper loop so tests can exercise the
+/// decision synchronously instead of racing a real-time ticker.
+fn sweep_idle_sessions(table: &NatTable, idle: Duration) -> usize {
+    let before = table.len();
+    if before == 0 {
+        return 0;
+    }
+    table.retain(|_key, session| session.idle_for() < idle);
+    // A concurrent `handle_udp` insert can land between the `before`
+    // snapshot and the post-retain `len()`, so saturating-sub is load
+    // bearing — plain subtraction would panic in dev builds and kill the
+    // detached sweeper task.
+    let evicted = before.saturating_sub(table.len());
+    if evicted > 0 {
+        debug!(
+            "UDP NAT sweeper: evicted {evicted} idle sessions (remaining {})",
+            table.len()
+        );
+    }
+    evicted
+}
+
 /// Spawn the background sweeper that evicts UDP NAT sessions idle for more
 /// than `idle`. Scans every `interval`. The task exits when the caller drops
 /// the returned `JoinHandle`'s aborter (or the last Arc to the table is
@@ -100,18 +123,7 @@ pub fn spawn_nat_sweeper(
                 debug!("UDP NAT sweeper: table dropped, exiting");
                 return;
             };
-            let before = table.len();
-            if before == 0 {
-                continue;
-            }
-            table.retain(|_key, session| session.idle_for() < idle);
-            let evicted = before.saturating_sub(table.len());
-            if evicted > 0 {
-                debug!(
-                    "UDP NAT sweeper: evicted {evicted} idle sessions (remaining {})",
-                    table.len()
-                );
-            }
+            sweep_idle_sessions(&table, idle);
         }
     })
 }
@@ -416,26 +428,70 @@ mod tests {
         let _handle =
             spawn_nat_sweeper(&table, Duration::from_millis(50), Duration::from_millis(20));
 
-        // Wait past the idle threshold; sweeper runs every 20ms.
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert_eq!(table.len(), 0, "idle sessions should have been swept");
+        // Poll instead of racing a fixed sleep: the sweep needs one tick
+        // past the idle threshold (~70ms), but a loaded CI runner may
+        // stall the ticker far longer than that.
+        for _ in 0..100 {
+            if table.is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("idle sessions should have been swept");
     }
 
-    #[tokio::test(start_paused = false)]
-    async fn touched_sessions_are_kept() {
+    /// The sweep decision itself is deterministic once activity stamps are
+    /// injected — exercise `sweep_idle_sessions` directly rather than racing
+    /// `touch()` calls against a real-time ticker (a >55ms scheduler stall
+    /// between touches used to evict the session mid-test).
+    #[test]
+    fn sweep_keeps_fresh_evicts_stale() {
         let table = new_nat_table();
+        let fresh = mk_session();
+        let stale = mk_session();
+        // `idle_for` subtracts with wrapping arithmetic, so a wrapped-back
+        // stamp reads as "60s ago" even when the process monotonic clock
+        // is younger than that.
+        stale.last_activity_ms.store(
+            monotonic_ms().wrapping_sub(60_000) as meow_common::atomic::Uint,
+            Ordering::Relaxed,
+        );
+        table.insert(mk_key(1), Arc::clone(&fresh));
+        table.insert(mk_key(2), Arc::clone(&stale));
+        table.insert(mk_key(3), mk_session());
+
+        // A 5s horizon leaves the stale stamp (60s) safely evictable while
+        // making the "fresh" side immune to any realistic test-thread
+        // stall between stamping and retain.
+        let evicted = sweep_idle_sessions(&table, Duration::from_secs(5));
+        assert_eq!(evicted, 1);
+        assert_eq!(table.len(), 2);
+        assert!(table.contains_key(&mk_key(1)), "fresh session kept");
+        assert!(table.contains_key(&mk_key(3)), "fresh session kept");
+
+        // Even a previously-fresh entry goes once its activity ages past
+        // `idle`, while the still-fresh key-3 session survives.
+        fresh.last_activity_ms.store(
+            monotonic_ms().wrapping_sub(60_000) as meow_common::atomic::Uint,
+            Ordering::Relaxed,
+        );
+        assert_eq!(sweep_idle_sessions(&table, Duration::from_secs(5)), 1);
+        assert_eq!(table.len(), 1);
+        assert!(table.contains_key(&mk_key(3)));
+    }
+
+    /// `touch()` must refresh the same monotonic stamp the sweeper reads —
+    /// pinned directly since the real-time `touch`-vs-ticker race it used
+    /// to be covered by was flaky.
+    #[test]
+    fn touch_refreshes_the_sweep_clock() {
         let session = mk_session();
-        table.insert(mk_key(1), Arc::clone(&session));
-
-        let _handle =
-            spawn_nat_sweeper(&table, Duration::from_millis(80), Duration::from_millis(20));
-
-        // Touch repeatedly so the session stays young.
-        for _ in 0..6 {
-            tokio::time::sleep(Duration::from_millis(25)).await;
-            session.touch();
-        }
-        assert_eq!(table.len(), 1, "active session must not be evicted");
+        session.last_activity_ms.store(
+            monotonic_ms().wrapping_sub(60_000) as meow_common::atomic::Uint,
+            Ordering::Relaxed,
+        );
+        session.touch();
+        assert!(session.idle_for() < Duration::from_secs(1));
     }
 
     #[tokio::test(start_paused = false)]
@@ -445,11 +501,13 @@ mod tests {
         let handle = spawn_nat_sweeper(&table, Duration::from_secs(60), Duration::from_millis(20));
         drop(table);
         // Allow the next tick to observe the dropped table.
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(
-            handle.is_finished(),
-            "sweeper should exit once the table is dropped"
-        );
+        for _ in 0..100 {
+            if handle.is_finished() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("sweeper should exit once the table is dropped");
     }
 
     /// Regression: a fast-path write failure on an existing session must evict

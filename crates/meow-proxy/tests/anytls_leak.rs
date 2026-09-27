@@ -94,8 +94,15 @@ async fn start_anytls_server(
     let h = tokio::spawn(async move {
         let _ = server.listen(&listen_addr).await;
     });
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    (addr, h)
+    // Poll until the accept loop has actually re-bound — a fixed sleep
+    // races the bind on a loaded runner and flakes the first dial.
+    for _ in 0..100 {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            return (addr, h);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("anytls test server did not rebind within 5s");
 }
 
 async fn one_round_trip(adapter: &AnytlsAdapter, echo_addr: SocketAddr) {
@@ -155,10 +162,20 @@ async fn anytls_repeated_dials_do_not_leak_fds() {
             eprintln!("after {} dials: fds = {:?}", i + 1, open_fd_count());
         }
     }
-    // Give teardown a moment to settle.
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    let after = open_fd_count();
+    // Teardown settles asynchronously — poll until the fd count drops back
+    // under the bound instead of asserting after a fixed sleep, which
+    // false-fails whenever teardown lags on a loaded runner.
+    let mut after = open_fd_count();
+    if let Some(b) = baseline {
+        for _ in 0..100 {
+            match after {
+                Some(a) if a.saturating_sub(b) <= 8 => break,
+                _ => {}
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            after = open_fd_count();
+        }
+    }
     eprintln!("after {N} dials: fds = {after:?} (baseline {baseline:?})");
 
     if let (Some(b), Some(a)) = (baseline, after) {

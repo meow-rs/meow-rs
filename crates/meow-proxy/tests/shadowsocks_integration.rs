@@ -452,9 +452,6 @@ async fn test_ss_tcp_relay_with_obfs_plugin() {
     )
     .expect("failed to create adapter with obfs-local plugin");
 
-    // Give the obfs-local plugin subprocess time to start listening
-    sleep(Duration::from_secs(1)).await;
-
     // Build metadata pointing to the echo server
     let metadata = Metadata {
         network: Network::Tcp,
@@ -463,11 +460,29 @@ async fn test_ss_tcp_relay_with_obfs_plugin() {
         ..Default::default()
     };
 
-    // Dial TCP through the SS proxy with obfs plugin
-    let result = timeout(TIMEOUT, adapter.dial_tcp(&metadata)).await;
-    let mut conn = result
-        .expect("TCP dial timed out")
-        .expect("TCP dial failed");
+    // Dial TCP through the SS proxy with obfs plugin. The plugin's bound
+    // port is internal to the adapter, so instead of a blind sleep we
+    // retry the real dial — a refused connect means the plugin subprocess
+    // is still starting on a loaded runner.
+    let mut last_err = None;
+    let mut conn = None;
+    for _ in 0..40 {
+        match timeout(TIMEOUT, adapter.dial_tcp(&metadata)).await {
+            Ok(Ok(c)) => {
+                conn = Some(c);
+                break;
+            }
+            Ok(Err(e)) => last_err = Some(format!("{e}")),
+            Err(_) => last_err = Some("dial timed out".to_string()),
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+    let mut conn = conn.unwrap_or_else(|| {
+        panic!(
+            "TCP dial through obfs plugin failed: {}",
+            last_err.as_deref().unwrap_or("unknown")
+        )
+    });
 
     // Write and read back
     let payload = b"hello shadowsocks obfs-http";
