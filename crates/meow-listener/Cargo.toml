@@ -44,6 +44,7 @@ base64 = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 libc = "0.2"
+socket2 = { workspace = true }
 smallvec = { workspace = true }
 smol_str = { workspace = true }
 tun-rs = { workspace = true, optional = true }

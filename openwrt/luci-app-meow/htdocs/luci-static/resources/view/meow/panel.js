@@ -1,11 +1,11 @@
 'use strict';
 'require view';
 'require uci';
+'require tools.meow as meow';
 
 // Embeds meow's built-in web panel (served by the meow REST API at /ui)
-// instead of reimplementing a dashboard in LuCI. The panel port comes from
-// the `panel_port` UCI option, which must match the `external-controller`
-// port in the meow YAML config.
+// instead of reimplementing a dashboard in LuCI. The API secret, if any, is
+// handed over in the URL fragment so the panel works without re-entering it.
 
 return view.extend({
 	load: function() {
@@ -13,9 +13,8 @@ return view.extend({
 	},
 
 	render: function() {
-		var port = uci.get('meow', 'main', 'panel_port') || '9090';
-		var url = window.location.protocol + '//' +
-			window.location.hostname + ':' + port + '/ui';
+		var url = meow.panelURL();
+		var plain = meow.apiBase() + '/ui';
 
 		return E('div', { 'class': 'cbi-map' }, [
 			E('h2', {}, _('meow Panel')),
@@ -23,7 +22,7 @@ return view.extend({
 				_('Built-in web panel served by the meow REST API. '),
 				E('a', { 'href': url, 'target': '_blank', 'rel': 'noopener' },
 					_('Open in a new tab')),
-				' — ', url
+				' — ', plain
 			]),
 			E('iframe', {
 				'src': url,

@@ -13,8 +13,16 @@ pub fn get_original_dst(stream: &TcpStream, listen_addr: SocketAddr) -> io::Resu
     }
     #[cfg(target_os = "linux")]
     {
-        let _ = listen_addr;
+        // REDIRECT: conntrack's pre-NAT destination. Kernel TPROXY does not
+        // NAT — the accepted socket's local address *is* the original
+        // destination — so fall back to it when there is no conntrack entry
+        // (SO_ORIGINAL_DST also returns it when there is one).
         linux::get_original_dst(stream)
+            .or_else(|e| match stream.local_addr() {
+                Ok(local) if local.port() != listen_addr.port() => Ok(local),
+                _ => Err(e),
+            })
+            .map(|a| SocketAddr::new(a.ip().to_canonical(), a.port()))
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {

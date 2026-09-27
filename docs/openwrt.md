@@ -76,27 +76,73 @@ crashes.
 
 ## LuCI app
 
-`luci-app-meow` adds **Services → meow** with two tabs:
+`luci-app-meow` adds **Services → meow**. Runtime data comes straight from the
+meow REST API, and proxy management is the built-in web panel, so LuCI does
+not reimplement a dashboard:
 
-- **Panel** — embeds meow's built-in web dashboard (served by the REST API
-  at `http://<router>:9090/ui`) directly in LuCI: proxy selection, latency
-  tests, connections, rules, logs and traffic live here. No separate
-  dashboard is bundled — this is the same panel the binary always serves.
-- **Settings** — service status plus the UCI options (enable, config file
-  path, working directory, panel port). Save & Apply restarts the service.
+- **Overview**: service state, REST API reachability and version,
+  transparent-proxy state, mode switch (`PATCH /configs`), traffic totals and
+  rates, and active connections (`/connections`).
+- **Panel**: meow's built-in web dashboard (`http://<router>:<panel_port>/ui`)
+  embedded in LuCI, covering proxy selection, subscriptions, groups and
+  rules. The API secret is passed in the URL fragment (`#token=`), so the
+  panel works without typing it again.
+- **Configuration**: raw YAML editor. Edits are validated with `meow -t`
+  before they replace the file.
+- **Settings**: service options (enable, config path, working directory,
+  panel port, API secret) and the transparent-proxy section.
+- **Log**: meow's entries from the system log.
 
-For the panel to load, `external-controller` in the YAML config must listen
-on a LAN-reachable address (the shipped default `0.0.0.0:9090`) and the
-`panel_port` UCI option must match its port. OpenWrt's default firewall
-blocks WAN-side access to the router; set `secret:` in the YAML config if
-untrusted hosts share your LAN.
+`panel_port` and `secret` are authoritative: the init script passes them to
+meow as `--ext-ctl 0.0.0.0:<panel_port>` and `--secret <secret>`, overriding
+`external-controller` / `secret:` in the YAML. OpenWrt's default firewall
+blocks WAN-side access; set a secret if untrusted hosts share your LAN. If
+LuCI is served over HTTPS, the browser blocks the plain-HTTP panel as mixed
+content. Open it in a new tab instead.
 
-## Transparent proxy / gateway
+## Transparent proxy (gateway / side router)
 
-The packages set up meow as a regular HTTP/SOCKS5 proxy for LAN clients.
-To transparently redirect all LAN traffic, follow
-[tproxy-gateway.md](tproxy-gateway.md) — the nftables rules there adapt to
-OpenWrt's fw4 stack.
+Enable **Settings → Transparent proxy** (or `uci set meow.tproxy.enabled=1`).
+`/usr/share/meow/gateway.sh` then loads an nftables table
+`inet meow_gateway` for traffic arriving on the chosen LAN interface:
+
+- **`mode tproxy`** (default): kernel TPROXY for **TCP and UDP**. A
+  mangle-prerouting `tproxy to :<tproxy_port>` rule marks packets `0x2333`,
+  and a policy route (`ip rule fwmark 0x2333 lookup 233`, `local default dev
+  lo table 233`) delivers them to meow's transparent listener.
+- **`mode redirect`**: nat `REDIRECT`, TCP only.
+- **DNS hijack**: LAN DNS (port 53, any resolver) is redirected to meow's
+  resolver (`dns_port`, default 1053), which is needed for fake-ip.
+- Private, reserved, multicast and router-local destinations bypass the
+  proxy. Add more with `list bypass`.
+
+The shipped `config.yaml` already declares what this needs: a
+`type: tproxy` listener on `0.0.0.0:7893`, `dns.listen: 0.0.0.0:1053` with
+fake-ip, and `routing-mark: 9527`. Keep `routing-mark`: meow also redirects
+the router's own outbound TCP into the listener, and only marked (DIRECT)
+sockets are exempt. Without it, DIRECT connections loop.
+
+**Side-router setup:** give OpenWrt a static address on the existing LAN,
+with the main router as its gateway and DNS. Disable its DHCP server and RA,
+and enable masquerading on the `lan` zone. Then point clients' gateway and
+DNS at the OpenWrt address, either per device or through the main router's
+DHCP options.
+
+### Running OpenWrt as a Docker side router
+
+`openwrt/docker/side-router.sh` does all of this for an OpenWrt rootfs
+container attached to the physical LAN through a macvlan network in bridge
+mode:
+
+```sh
+PARENT=eth0 SUBNET=192.168.1.0/24 LAN_GW=192.168.1.1 OPENWRT_IP=192.168.1.250 \
+    openwrt/docker/side-router.sh up dist/     # dist/ holds the two ipks
+```
+
+It loads the needed nftables kernel modules on the host, creates the
+container, provisions the side-router UCI config and LuCI, and installs the
+ipks. It also adds a host-side macvlan shim so the Docker host itself can
+reach the container.
 
 ## Building ipks yourself
 

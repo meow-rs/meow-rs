@@ -11,21 +11,48 @@
 		}
 	},
 
+	"admin/services/meow/overview": {
+		"title": "Overview",
+		"order": 10,
+		"action": {
+			"type": "view",
+			"path": "meow/overview"
+		}
+	},
+
 	"admin/services/meow/panel": {
 		"title": "Panel",
-		"order": 10,
+		"order": 20,
 		"action": {
 			"type": "view",
 			"path": "meow/panel"
 		}
 	},
 
+	"admin/services/meow/config": {
+		"title": "Configuration",
+		"order": 30,
+		"action": {
+			"type": "view",
+			"path": "meow/config"
+		}
+	},
+
 	"admin/services/meow/settings": {
 		"title": "Settings",
-		"order": 20,
+		"order": 40,
 		"action": {
 			"type": "view",
 			"path": "meow/settings"
+		}
+	},
+
+	"admin/services/meow/log": {
+		"title": "Log",
+		"order": 50,
+		"action": {
+			"type": "view",
+			"path": "meow/log"
 		}
 	}
 }

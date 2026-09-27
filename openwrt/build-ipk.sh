@@ -74,12 +74,16 @@ build_meow() {
              "$staging/data/usr/bin" \
              "$staging/data/etc/init.d" \
              "$staging/data/etc/config" \
-             "$staging/data/etc/meow"
+             "$staging/data/etc/meow" \
+             "$staging/data/etc/uci-defaults" \
+             "$staging/data/usr/share/meow"
 
     install -m 755 "$binary" "$staging/data/usr/bin/meow"
     install -m 755 "$SCRIPT_DIR/meow/files/meow.init" "$staging/data/etc/init.d/meow"
     install -m 644 "$SCRIPT_DIR/meow/files/meow.config" "$staging/data/etc/config/meow"
     install -m 644 "$SCRIPT_DIR/meow/files/config.yaml" "$staging/data/etc/meow/config.yaml"
+    install -m 755 "$SCRIPT_DIR/meow/files/gateway.sh" "$staging/data/usr/share/meow/gateway.sh"
+    install -m 755 "$SCRIPT_DIR/meow/files/meow.uci-defaults" "$staging/data/etc/uci-defaults/80_meow"
 
     cat > "$staging/control/control" <<EOF
 Package: meow
@@ -102,6 +106,7 @@ EOF
     cat > "$staging/control/postinst" <<'EOF'
 #!/bin/sh
 [ -n "${IPKG_INSTROOT}" ] && exit 0
+[ -f /etc/uci-defaults/80_meow ] && sh /etc/uci-defaults/80_meow && rm -f /etc/uci-defaults/80_meow
 /etc/init.d/meow enable || true
 exit 0
 EOF
@@ -150,8 +155,9 @@ Section: luci
 Architecture: all
 Installed-Size: $(installed_size "$staging/data")
 Maintainer: ${MAINTAINER}
-Description:  LuCI support for meow. Service settings plus the built-in
-  meow web panel embedded in the LuCI interface.
+Description:  LuCI support for meow: status overview, YAML config editor,
+  service and transparent-proxy (gateway / side-router) settings, logs, and
+  the built-in meow web panel embedded in the LuCI interface.
 EOF
 
     cat > "$staging/control/postinst" <<'EOF'

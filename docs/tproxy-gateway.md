@@ -23,10 +23,16 @@ meow that way (`up`/`down`/`status`) and confirm the auto-created firewall. Read
 
 Understand this before configuring — it explains every step below.
 
-- **It is `REDIRECT`-based, not `IP_TRANSPARENT`/TPROXY** (despite the name).
-  meow recovers the original destination of a redirected connection with
-  `getsockopt(SO_ORIGINAL_DST)`. This works for both locally-generated and
-  forwarded traffic, but only for **TCP**.
+- **It accepts both `REDIRECT` and kernel TPROXY.** For redirected TCP, meow
+  recovers the original destination with `getsockopt(SO_ORIGINAL_DST)`. On
+  Linux the listener socket is also `IP_TRANSPARENT` (when meow has
+  `CAP_NET_ADMIN`), and a transparent UDP socket is bound on the same port.
+  An nftables `tproxy` rule can then hand it forwarded **TCP and UDP**; the
+  UDP original destination comes from `IP_RECVORIGDSTADDR`, and replies are
+  sent from that address. The recipe below uses `REDIRECT`. The OpenWrt
+  package's `gateway.sh` ([openwrt.md](openwrt.md)) implements the TPROXY
+  variant: a mangle-prerouting `tproxy` rule plus an fwmark policy route to
+  `local default dev lo`.
 - **The built-in firewall is `output`-chain only.** When you set a tproxy
   listener with managed firewall (the default), meow auto-creates an nftables
   table (`inet meow_tproxy_<pid>_<seq>` — unique per listener instance, swept

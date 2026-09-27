@@ -2,13 +2,24 @@
 	"luci-app-meow": {
 		"description": "Grant access to meow service configuration",
 		"read": {
-			"uci": [ "meow" ],
+			"uci": [ "meow", "network" ],
 			"ubus": {
 				"service": [ "list" ]
+			},
+			"file": {
+				"/etc/meow/*": [ "read" ],
+				"/sbin/logread -e meow": [ "exec" ],
+				"/usr/share/meow/gateway.sh status": [ "exec" ]
 			}
 		},
 		"write": {
-			"uci": [ "meow" ]
+			"uci": [ "meow" ],
+			"file": {
+				"/etc/meow/*": [ "write" ],
+				"/tmp/meow-luci-check.yaml": [ "write" ],
+				"/usr/bin/meow -d * -f /tmp/meow-luci-check.yaml -t": [ "exec" ],
+				"/etc/init.d/meow restart": [ "exec" ]
+			}
 		}
 	}
 }

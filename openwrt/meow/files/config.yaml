@@ -11,20 +11,46 @@ mode: rule
 log-level: info
 ipv6: false
 
-# REST API + built-in web panel (served at /ui). Bound to 0.0.0.0 so the
-# LuCI app can embed the panel for browsers on the LAN; OpenWrt's default
-# firewall still blocks WAN-side access. The port must match `panel_port`
-# in /etc/config/meow. Set a secret if untrusted hosts share the LAN.
+# REST API + built-in web panel (served at /ui). The init script overrides
+# the address with `--ext-ctl 0.0.0.0:<panel_port>` and, when set, the secret
+# with `--secret <secret>` from /etc/config/meow, so LuCI always knows how to
+# reach it. OpenWrt's default firewall still blocks WAN-side access.
 external-controller: 0.0.0.0:9090
 secret: ""
 
+# DIRECT sockets carry this fwmark. Required with the tproxy listener below:
+# meow also redirects the router's own outbound TCP into it, and only
+# marked sockets are exempt — without it DIRECT connections loop forever.
+routing-mark: 9527
+
+# Transparent-proxy listener for forwarded LAN traffic (gateway / side-router
+# mode, enabled in LuCI or via `uci set meow.tproxy.enabled=1`). It accepts
+# kernel TPROXY (TCP + UDP) as well as REDIRECTed TCP. Must bind a
+# non-loopback address. The port must match `tproxy_port` in /etc/config/meow.
+listeners:
+  - name: tproxy-lan
+    type: tproxy
+    listen: 0.0.0.0
+    port: 7893
+
+# Recover hostnames for connections made to raw IPs.
+sniffer:
+  enable: true
+  override-destination: false
+  sniff:
+    TLS: { ports: [443] }
+    HTTP: { ports: [80] }
+
 dns:
   enable: true
-  # dnsmasq owns :53; meow's resolver listens on 1053.
-  listen: 127.0.0.1:1053
+  # dnsmasq owns :53; meow's resolver listens on 1053. LAN DNS is redirected
+  # here when transparent proxy + DNS hijack are enabled (`dns_port`).
+  listen: 0.0.0.0:1053
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.0/16
   nameserver:
+    - 223.5.5.5
     - 8.8.8.8
-    - 1.1.1.1
 
 # Add your proxies and groups here, e.g.:
 # proxies:

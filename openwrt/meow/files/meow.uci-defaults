@@ -1,0 +1,17 @@
+#!/bin/sh
+# Add sections introduced after the first release to preserved configs.
+uci -q get meow.main.secret >/dev/null || uci -q set meow.main.secret=''
+if ! uci -q get meow.tproxy >/dev/null; then
+	uci -q batch <<-UCI
+		set meow.tproxy=transparent
+		set meow.tproxy.enabled='0'
+		set meow.tproxy.mode='tproxy'
+		set meow.tproxy.interface='lan'
+		set meow.tproxy.tproxy_port='7893'
+		set meow.tproxy.dns_hijack='1'
+		set meow.tproxy.dns_port='1053'
+		set meow.tproxy.ipv6='0'
+	UCI
+fi
+uci -q commit meow
+exit 0
