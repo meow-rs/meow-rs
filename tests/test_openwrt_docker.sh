@@ -282,6 +282,17 @@ else
     echo "TEST_SKIP: UDP TPROXY (socat unavailable on origin)"
 fi
 
+# --- LuCI: rpcd actually loads the meow ACL group, and the menu is on-device ---
+# rpcd ships in the base image; it reads /usr/share/rpcd/acl.d. A root ubus
+# login expands the granted access-groups, so the meow file grants must appear
+# in the session's ACLs — the same grants a logged-in LuCI user relies on.
+rexec '/etc/init.d/rpcd restart 2>/dev/null; sleep 1'
+LOGIN='ubus call session login "{\"username\":\"root\",\"password\":\"\"}"'
+check "LuCI rpcd loads arp-hijack grant" "arp-hijack.sh clients" bash -c "docker exec $ROUTER sh -c '$LOGIN'"
+check "LuCI rpcd loads meow-arp grant"   "meow-arp restart"      bash -c "docker exec $ROUTER sh -c '$LOGIN'"
+check "LuCI rpcd loads config grant"     "/etc/meow"             bash -c "docker exec $ROUTER sh -c '$LOGIN'"
+check "LuCI menu registers Clients view" "meow/clients"          bash -c "docker exec $ROUTER grep -o meow/clients /usr/share/luci/menu.d/luci-app-meow.json"
+
 if [ "$FAIL" -gt 0 ]; then
     echo ""; echo "=== Debug (failures present) ==="
     echo "-- opkg.log --"; rexec 'cat /tmp/opkg.log 2>/dev/null | tail -20'

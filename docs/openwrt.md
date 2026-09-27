@@ -211,11 +211,26 @@ that the LuCI Clients view + ACL ship. It is hermetic (the origin is on an
 RFC 5737 test-net so it is actually proxied, not bypassed as a private range)
 and needs no physical NIC or real LAN.
 
+It also checks the LuCI app end to end where the QEMU test does not: `rpcd`
+loads the `luci-app-meow` ACL group and a root `ubus` login expands the meow
+file/exec grants, and the Clients view is registered in the on-device menu.
+
 ```sh
 # requirements: docker, cargo-zigbuild + zig (or MEOW_BINARY), and the
 # nft_tproxy kernel module loadable (root/modprobe); it SKIPs otherwise.
 bash tests/test_openwrt_docker.sh
 # KEEP=1 leaves the containers/networks up for inspection.
+```
+
+`tests/test_luci_meow.sh` statically validates the `luci-app-meow` package with
+no device or container: it parses every view (the way LuCI loads them), checks
+the menu and ACL JSON, and cross-checks the wiring — every menu view has a view
+file and vice-versa, `require tools.*` modules exist, and the ACL's exec grants
+for meow's own scripts reference files the package actually ships and installs.
+
+```sh
+# requirements: node + jq (SKIPs otherwise)
+bash tests/test_luci_meow.sh
 ```
 
 ## Not yet provided
