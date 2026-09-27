@@ -7,13 +7,17 @@ const vm = require('node:vm');
 const html = fs.readFileSync(`${__dirname}/../static/index.html`, 'utf8');
 const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
 
-function dashboard(protocol = 'http:') {
+function dashboard(protocol = 'http:', hash = '') {
   const elements = new Map();
   const events = {};
   const sockets = [];
   const requests = [];
   const timers = new Map();
   const storage = new Map();
+  const history = [];
+  // `location` is shared between the bare global and `window.location`, as in
+  // a browser. `hash` includes the leading '#', like the real property.
+  const location = { origin: `${protocol}//localhost:9090`, pathname: '/ui/', search: '?x=1', hash };
   let timerId = 0;
   const element = id => {
     if (!elements.has(id)) elements.set(id, {
@@ -28,8 +32,9 @@ function dashboard(protocol = 'http:') {
     close() { this.closed = true; if (this.onclose) this.onclose(); }
   }
   vm.runInNewContext(script, {
-    window: { location: { origin: `${protocol}//localhost:9090` },
-      addEventListener: (name, callback) => { events[name] = callback; } },
+    window: { location, addEventListener: (name, callback) => { events[name] = callback; } },
+    location,
+    history: { replaceState: (state, title, url) => history.push(url) },
     document: { getElementById: element, querySelectorAll: () => [] },
     localStorage: { getItem: key => storage.get(key), setItem: (key, value) => storage.set(key, value) },
     fetch: async url => {
@@ -40,12 +45,12 @@ function dashboard(protocol = 'http:') {
       return { ok: true, json: async () => path === '/configs'
         ? { mode: 'rule', 'mixed-port': 7890 } : { connections: [{ id: 'test' }] } };
     },
-    WebSocket, URL, console,
+    WebSocket, URL, URLSearchParams, console,
     setInterval: callback => { events.poll = callback; },
     setTimeout: callback => { timers.set(++timerId, callback); return timerId; },
     clearTimeout: id => timers.delete(id),
   });
-  return { element, events, sockets, requests, timers, storage };
+  return { element, events, sockets, requests, timers, storage, history };
 }
 
 const settle = () => new Promise(resolve => setImmediate(resolve));
@@ -97,4 +102,20 @@ test('leaving the page cancels retries; restoring it opens a fresh socket', () =
   ui.events.pagehide();
   assert.equal(ui.sockets[1].closed, true);
   assert.equal(ui.timers.size, 0);
+});
+
+test('a #token= fragment from an embedding page seeds the secret and is stripped', () => {
+  const ui = dashboard('http:', '#token=from%20luci');
+  assert.equal(ui.storage.get('meow-secret'), 'from luci');
+  assert.equal(ui.element('api-secret').value, 'from luci');
+  // The fragment never reaches the server, but must not linger in the URL either.
+  assert.deepEqual(ui.history, ['/ui/?x=1']);
+  ui.events.pageshow();
+  assert.equal(ui.sockets[0].url.searchParams.get('token'), 'from luci');
+});
+
+test('without a fragment the stored secret is kept and the URL is untouched', () => {
+  const ui = dashboard();
+  assert.equal(ui.storage.has('meow-secret'), false);
+  assert.deepEqual(ui.history, []);
 });

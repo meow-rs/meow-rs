@@ -218,7 +218,7 @@ docker exec "$ROUTER" mkdir -p /tmp/ipk
 docker cp "$WORK/meow_0.0.0-e2e_${OW_ARCH}.ipk" "$ROUTER:/tmp/ipk/meow.ipk"
 docker cp "$WORK/luci-app-meow_0.0.0-e2e_all.ipk" "$ROUTER:/tmp/ipk/luci.ipk"
 # meow installs via opkg (arch-specific), exercising its postinst/uci-defaults
-# and procd wiring. The LuCI app is arch `all` and depends on luci-base/arping,
+# and procd wiring. The LuCI app is arch `all` and depends on luci-base,
 # which this stripped openwrt/rootfs image lacks and cannot resolve — so its
 # static files are laid down by unpacking the ipk's data payload directly. The
 # assertions then confirm the Clients view + ACL ship correctly. On a real

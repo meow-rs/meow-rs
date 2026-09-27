@@ -157,7 +157,7 @@ build_luci() {
     cat > "$staging/control/control" <<EOF
 Package: luci-app-meow
 Version: ${version}
-Depends: libc, luci-base, meow, arping
+Depends: libc, luci-base, meow
 Section: luci
 Architecture: all
 Installed-Size: $(installed_size "$staging/data")
@@ -165,6 +165,7 @@ Maintainer: ${MAINTAINER}
 Description:  LuCI support for meow: status overview, YAML config editor,
   service and transparent-proxy (gateway / side-router) settings, ARP-based
   client steering, logs, and the built-in meow web panel embedded in LuCI.
+  The optional client-steering feature needs the arping package at runtime.
 EOF
 
     cat > "$staging/control/postinst" <<'EOF'

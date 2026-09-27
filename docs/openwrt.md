@@ -146,7 +146,8 @@ a network you control, and it is **off by default**: the `arp_hijack` section
 of `/etc/config/meow` starts disabled and empty, so no device is ever affected
 until you enable steering and tick it. Untick a client (Save & Apply) to
 release it; its ARP cache relearns the real gateway once meow stops announcing.
-It needs the `arping` package (a dependency of `luci-app-meow`) and the
+It needs the `arping` package (`opkg install arping`; not pulled in
+automatically, so the LuCI app installs on images without it) and the
 transparent proxy enabled to actually handle the steered traffic.
 
 Notes and limits:
