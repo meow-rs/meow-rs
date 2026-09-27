@@ -201,6 +201,23 @@ procd service, REST API, built-in panel and proxy data path. It runs in CI
 bash tests/test_openwrt_qemu.sh
 ```
 
+`tests/test_openwrt_docker.sh` is a multi-container **side-router** test: it
+builds an OpenWrt router container that bridges an internal LAN to a WAN, puts
+an HTTP + UDP-echo origin on the WAN and two clients on the LAN (whose only
+route out is through the router), enables meow's transparent proxy, and asserts
+the full data path — TCP **and** UDP TPROXY (each client's flow shows up in
+meow's log), DNS hijack (fake-ip answer), the REST API + built-in panel, and
+that the LuCI Clients view + ACL ship. It is hermetic (the origin is on an
+RFC 5737 test-net so it is actually proxied, not bypassed as a private range)
+and needs no physical NIC or real LAN.
+
+```sh
+# requirements: docker, cargo-zigbuild + zig (or MEOW_BINARY), and the
+# nft_tproxy kernel module loadable (root/modprobe); it SKIPs otherwise.
+bash tests/test_openwrt_docker.sh
+# KEEP=1 leaves the containers/networks up for inspection.
+```
+
 ## Not yet provided
 
 - An opkg feed (per-release ipks only; `opkg update`-able feed may come
