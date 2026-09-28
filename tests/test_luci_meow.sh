@@ -83,6 +83,7 @@ done
 # Indexed pairs also work with macOS's Bash 3.2.
 SHIP=(
     /usr/libexec/meow-api "$APP/root/usr/libexec/meow-api"
+    /usr/libexec/meow-validate "$APP/root/usr/libexec/meow-validate"
     /usr/share/meow/gateway.sh "$FILES/gateway.sh"
     /usr/share/meow/arp-hijack.sh "$FILES/arp-hijack.sh"
     /etc/init.d/meow "$FILES/meow.init"

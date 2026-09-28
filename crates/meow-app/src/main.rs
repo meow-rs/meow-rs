@@ -97,12 +97,24 @@ struct Args {
     #[arg(long = "age-secret-key")]
     age_secret_key: Option<String>,
 
+    /// Disable executable SIP003 plugins (built-in plugins remain available)
+    #[arg(long)]
+    no_external_plugins: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
 
 #[derive(Subcommand)]
 enum Command {
+    /// Send one unicast ARP reply to a selected LAN client (Linux only)
+    #[cfg(target_os = "linux")]
+    ArpReply {
+        interface: String,
+        sender: std::net::Ipv4Addr,
+        target_mac: String,
+        target_ip: std::net::Ipv4Addr,
+    },
     /// Install as a system service
     Install {
         /// Config file path for the service
@@ -179,6 +191,7 @@ fn main() -> Result<()> {
     }
 
     let args = Args::parse();
+    meow_config::set_external_plugins_allowed(!args.no_external_plugins);
 
     // Hard-error on unsupported flags instead of silently ignoring them.
     if args.post_up.is_some() {
@@ -431,6 +444,13 @@ fn run_application_inner(
 
 fn handle_service_command(cmd: &Command, args: &Args) -> Result<()> {
     match cmd {
+        #[cfg(target_os = "linux")]
+        Command::ArpReply {
+            interface,
+            sender,
+            target_mac,
+            target_ip,
+        } => meow_app::arp::send(interface, *sender, target_mac, *target_ip),
         Command::Install { config } => install_service(config.as_deref(), args),
         Command::Uninstall => uninstall_service(),
         Command::Status => service_status(),

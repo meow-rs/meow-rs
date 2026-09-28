@@ -1,6 +1,11 @@
 #!/bin/sh
 # Add sections introduced after the first release to preserved configs.
-uci -q get meow.main.secret >/dev/null || uci -q set meow.main.secret=''
+# Preserve existing credentials on upgrades; initialize an empty install.
+if [ -z "$(uci -q get meow.main.secret)" ]; then
+    secret=$(head -c 32 /dev/urandom | hexdump -v -e '1/1 "%02x"')
+    [ "${#secret}" -eq 64 ] || exit 1
+    uci set "meow.main.secret=$secret"
+fi
 if ! uci -q get meow.tproxy >/dev/null; then
 	uci -q batch <<-UCI
 		set meow.tproxy=transparent

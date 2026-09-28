@@ -44,8 +44,8 @@ function setup(options = {}) {
           calls.push('restart');
           return options.restartResult ?? { code: 0 };
         }
-        assert.equal(command, '/usr/bin/meow');
-        assert.deepEqual(Array.from(args), ['-d', '/etc/meow', '-f', scratch, '-t']);
+        assert.equal(command, '/usr/libexec/meow-validate');
+        assert.deepEqual(Array.from(args), ['check']);
         calls.push('validate');
         if (options.execError) throw new Error(options.execError);
         return options.result ?? { code: 0 };

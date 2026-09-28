@@ -4,6 +4,8 @@
 //! geodata fetch, and subscription refresh. The binary wires
 //! configuration, the tunnel, listeners, DNS, and the REST API together.
 
+#[cfg(any(target_os = "linux", test))]
+pub mod arp;
 pub mod geodata_fetch;
 pub mod subscription_refresh;
 

@@ -30,7 +30,7 @@ test('imported YAML gets matching gateway, DNS and service settings; unrelated c
   assert.deepEqual(config.listeners, [{ name: 'tproxy-lan', type: 'tproxy', listen: '0.0.0.0',
     port: 7893, udp: false, firewall: false, 'max-connections': 4096 }]);
   assert.equal(config['routing-mark'], 9527);
-  assert.equal(config['external-controller'], '0.0.0.0:9090');
+  assert.equal(config['external-controller'], '127.0.0.1:9090');
   assert.equal(config.secret, '');
   assert.equal(transform(out, defaults), out);
 });
@@ -92,7 +92,7 @@ test('custom listener conflicts are rejected instead of silently replacing it', 
 function setup(options = {}) {
   let live = input, reads = 0;
   const calls = [], removed = [];
-  const path = '/etc/meow/selected.yaml';
+  const path = '/etc/meow/config.yaml';
   const uci = { get: (_, section, key) => {
     if (key === 'config_file') return path;
     if (key === 'work_dir') return '/etc/meow';
@@ -110,9 +110,9 @@ function setup(options = {}) {
       },
       exec: async (cmd, args) => {
         calls.push('validate');
-        assert.equal(cmd, '/usr/bin/meow');
-        assert.equal(args[1], '/etc/meow');
-        assert.match(args[3], /^\/tmp\/meow-luci-settings-[a-f0-9]{32}\.yaml$/);
+        assert.equal(cmd, '/usr/libexec/meow-validate');
+        assert.equal(args.length, 1);
+        assert.match(args[0], /^[a-f0-9]{32}$/);
         return options.invalid ? { code: 1, stdout: 'ERROR invalid candidate' } : { code: 0 };
       },
       remove: async p => removed.push(p)

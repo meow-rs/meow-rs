@@ -11,7 +11,7 @@ PROG=/usr/bin/meow
 GATEWAY=/usr/share/meow/gateway.sh
 
 start_service() {
-	local enabled config_file work_dir panel_port secret tproxy
+	local enabled config_file work_dir panel_port secret tproxy controller
 
 	config_load meow
 	config_get_bool enabled main enabled 0
@@ -22,15 +22,21 @@ start_service() {
 	config_get_bool tproxy tproxy enabled 0
 
 	[ "$enabled" -eq 1 ] || return 0
+    [ "$config_file" = /etc/meow/config.yaml ] && [ "$work_dir" = /etc/meow ] || {
+        logger -t meow 'managed service requires /etc/meow/config.yaml and work_dir /etc/meow'
+        return 1
+    }
 
-	if ! "$PROG" -d "$work_dir" -f "$config_file" -t >/dev/null 2>&1; then
+	if ! "$PROG" --no-external-plugins -d "$work_dir" -f "$config_file" -t >/dev/null 2>&1; then
 		logger -t meow "config test failed for $config_file, not starting"
 		return 1
 	fi
 
+	controller="127.0.0.1:$panel_port"
+	[ -z "$secret" ] || controller="0.0.0.0:$panel_port"
 	procd_open_instance meow
-	procd_set_param command "$PROG" -d "$work_dir" -f "$config_file" \
-		--ext-ctl "0.0.0.0:$panel_port"
+	procd_set_param command "$PROG" --no-external-plugins -d "$work_dir" -f "$config_file" \
+		--ext-ctl "$controller"
 	[ -n "$secret" ] && procd_append_param command --secret "$secret"
 	# Restart when either the UCI service settings or the YAML config change.
 	procd_set_param file /etc/config/meow "$config_file"
@@ -41,8 +47,13 @@ start_service() {
 	procd_close_instance
 
 	if [ "$tproxy" -eq 1 ]; then
-		# Load the redirect once meow has bound its tproxy listener.
-		( "$GATEWAY" wait && "$GATEWAY" up ) >/dev/null 2>&1 &
+        # A supervised instance owns the wait and rules, including teardown.
+        procd_open_instance gateway
+        procd_set_param command "$GATEWAY" run
+        procd_set_param term_timeout 5
+        procd_set_param stdout 1
+        procd_set_param stderr 1
+        procd_close_instance
 	else
 		"$GATEWAY" down
 	fi

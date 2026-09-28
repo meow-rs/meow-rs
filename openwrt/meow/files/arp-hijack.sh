@@ -57,7 +57,7 @@ cmd_clients() {
 mac_to_ip() {
 	ip neigh show dev "$device" 2>/dev/null | awk -v m="$(echo "$1" | tr 'A-F' 'a-f')" '
 		{ mac=""; for (i=1;i<=NF;i++) if ($i=="lladdr") mac=tolower($(i+1))
-		  if (mac==m) { print $1; exit } }'
+		  if (mac==m && !index($1,":")) { print $1; exit } }'
 }
 
 sweep() {
@@ -66,15 +66,16 @@ sweep() {
 		ip=$(mac_to_ip "$mac")
 		[ -n "$ip" ] || continue
 		# ARP reply: "gateway is at <our MAC>", unicast to the client.
-		arping -q -c 1 -A -I "$device" -s "$gateway" "$ip" 2>/dev/null
+		if ! /usr/bin/meow arp-reply "$device" "$gateway" "$mac" "$ip"; then
+            logger -t meow-arp "failed to send unicast reply to $mac ($ip)"
+            return 1
+        fi
 	done
 }
 
 precheck() {
-	command -v arping >/dev/null 2>&1 || {
-		logger -t meow-arp "arping not installed (opkg install arping); cannot steer clients"
-		return 1
-	}
+    case "$interval" in ''|*[!0-9]*) logger -t meow-arp 'interval must be an integer from 1 to 3600'; return 1 ;; esac
+    [ "$interval" -ge 1 ] && [ "$interval" -le 3600 ] || return 1
 	[ -n "$device" ] || { logger -t meow-arp "no device for interface '$interface'"; return 1; }
 	[ -n "$gateway" ] || { logger -t meow-arp "no gateway for '$interface'; set arp.gateway"; return 1; }
 	return 0
@@ -96,7 +97,7 @@ case "$1" in
 		[ -n "$clients" ] || { logger -t meow-arp "no clients selected; idle"; }
 		logger -t meow-arp "steering [$clients ] via $device as gateway $gateway"
 		while :; do
-			sweep
+			sweep || exit 1
 			sleep "$interval"
 		done
 		;;

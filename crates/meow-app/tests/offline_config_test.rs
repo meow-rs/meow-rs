@@ -115,3 +115,48 @@ async fn run_offline(
         .expect("offline validation must finish without network access")
         .unwrap()
 }
+
+#[tokio::test]
+async fn config_test_never_starts_external_plugins() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("plugin.yaml");
+    // This executable deliberately does not exist. Adapter construction must
+    // validate the proxy without even attempting to spawn it during -t.
+    std::fs::write(&config, format!(
+        "strict: true\nproxies:\n  - name: plugin\n    type: ss\n    server: 127.0.0.1\n    port: 1234\n    cipher: aes-128-gcm\n    password: test\n    plugin: '{}'\nrules: ['MATCH,plugin']\n",
+        directory.path().join("never-execute").display()
+    )).unwrap();
+    let output = run_offline(directory.path(), &config).await;
+    assert!(output.status.success(), "{output:?}");
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_meow"))
+        .args(["--no-external-plugins", "-t", "-f"])
+        .arg(&config)
+        .output()
+        .await
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("external plugins are disabled")
+            || String::from_utf8_lossy(&output.stderr).contains("external plugins are disabled")
+    );
+}
+
+#[tokio::test]
+async fn config_test_defers_dns_sourced_ech() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("ech.yaml");
+    std::fs::write(&config,
+        "proxies:\n  - name: tls\n    type: trojan\n    server: 127.0.0.1\n    port: 443\n    password: test\n    ech-opts: {enable: true, query-server-name: offline-validation.invalid}\nrules: ['MATCH,tls']\n"
+    ).unwrap();
+    let output = run_offline(directory.path(), &config).await;
+    assert!(output.status.success(), "{output:?}");
+    let logs = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !logs.contains("ech-dns:"),
+        "ECH lookup must not run: {logs}"
+    );
+}

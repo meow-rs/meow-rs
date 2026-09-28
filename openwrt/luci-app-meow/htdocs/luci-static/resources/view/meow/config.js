@@ -42,10 +42,9 @@ return view.extend({
 	},
 
 	validate: function(content) {
-		var workDir = uci.get('meow', 'main', 'work_dir') || '/etc/meow';
 
 		return writeConfig(SCRATCH, content).then(function() {
-			return fs.exec('/usr/bin/meow', [ '-d', workDir, '-f', SCRATCH, '-t' ]);
+			return fs.exec('/usr/libexec/meow-validate', ['check']);
 		}).then(function(res) {
 			if (res.code === 0)
 				return null;

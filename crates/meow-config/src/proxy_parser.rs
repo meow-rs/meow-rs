@@ -219,6 +219,18 @@ pub fn parse_proxy_with_dialer(
                 ));
             }
 
+            if is_external_sip003_plugin(plugin) && !crate::external_plugins_allowed() {
+                return Err(format!(
+                    "ss[{name}]: external plugins are disabled by process policy"
+                ));
+            }
+            // Validation constructs adapters, but must never execute a plugin.
+            let plugin = if crate::is_offline_validate() && is_external_sip003_plugin(plugin) {
+                None
+            } else {
+                plugin
+            };
+
             #[cfg_attr(not(feature = "mux"), allow(unused_mut))]
             let mut adapter = ShadowsocksAdapter::new(
                 name,

@@ -59,13 +59,15 @@ return view.extend({
 		o.rmempty = false;
 
 		o = s.option(form.Value, 'config_file', _('Configuration file'),
-			_('Path to the meow YAML configuration.'));
+			_('Fixed configuration path for the managed service.'));
 		o.default = '/etc/meow/config.yaml';
+		o.readonly = true;
 		o.rmempty = false;
 
 		o = s.option(form.Value, 'work_dir', _('Working directory'),
 			_('Directory for GeoIP databases, caches and downloaded rulesets.'));
 		o.default = '/etc/meow';
+		o.readonly = true;
 		o.rmempty = false;
 
 		o = s.option(form.Value, 'panel_port', _('Panel port'),
@@ -76,7 +78,7 @@ return view.extend({
 
 		o = s.option(form.Value, 'secret', _('API secret'),
 			_('Saved to secret in the YAML configuration, including when cleared. ' +
-			  'Recommended if untrusted hosts share the LAN.'));
+			  'Clearing it restricts the API and panel to this router; set a secret for LAN access.'));
 		o.password = true;
 
 		s = m.section(form.NamedSection, 'tproxy', 'transparent', _('Transparent proxy'),

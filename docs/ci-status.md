@@ -115,6 +115,9 @@ Runs on Ubuntu after `lint`:
 | VLESS parser/integration | `crates/meow-config/tests/vless_config_test.rs`, `vless_integration` | Yes |
 | Transport layers | `meow-transport` TLS/WS/gRPC/H2/HTTPUpgrade tests | Yes |
 | Feature powersets | `cargo hack check` for transport/proxy/listener crates | Yes |
+| OpenWrt packaging/gateway | `tests/test_openwrt_docker.sh` | Yes (Ubuntu Docker) |
+| LuCI | `tests/test_luci_meow.sh` | Yes |
+| Offline validation | `offline_config_test` | Yes (Ubuntu nextest) |
 | TProxy e2e | `tests/test_tproxy_docker.sh` | Yes (Ubuntu Docker) |
 | MSRV | Workspace `rust-version` | Yes |
 | Dependency advisories | `audit.yml` | Yes |
@@ -123,6 +126,11 @@ Runs on Ubuntu after `lint`:
 | Release artifacts | `release.yml` | Tags/manual |
 
 ## Known Gaps
+
+- The OpenWrt Docker job exercises x86_64-musl on the host kernel. It does
+  not provide aarch64-musl functional coverage or validate OpenWrt kernel
+  module packaging; gateway startup probes kernel support and reports the
+  required packages.
 
 - Docs-only PRs do not trigger `test.yml`; run local doc sanity checks for
   Markdown and links before publishing docs-only changes.

@@ -25,9 +25,9 @@ Understand this before configuring — it explains every step below.
 
 - **It accepts both `REDIRECT` and kernel TPROXY.** For redirected TCP, meow
   recovers the original destination with `getsockopt(SO_ORIGINAL_DST)`. On
-  Linux the listener socket is also `IP_TRANSPARENT` (when meow has
-  `CAP_NET_ADMIN`), and a transparent UDP socket is bound on the same port.
-  An nftables `tproxy` rule can then hand it forwarded **TCP and UDP**; the
+  Linux only the UDP socket is `IP_TRANSPARENT` (when meow has
+  `CAP_NET_ADMIN`). TCP uses REDIRECT; an nftables `tproxy` rule can hand
+  the transparent UDP socket forwarded **UDP** datagrams. The
   UDP original destination comes from `IP_RECVORIGDSTADDR`, and replies are
   sent from that address. The recipe below uses `REDIRECT`. The OpenWrt
   package's `gateway.sh` ([openwrt.md](openwrt.md)) implements the TPROXY
@@ -368,7 +368,7 @@ table inet meow_gateway {
         iifname != "eth0" return
 
         # 1. DNS hijack: send all LAN DNS (v4) to meow's resolver.
-        meta nfproto ipv4 meta l4proto { tcp, udp } th dport 53 \
+        meta nfproto ipv4 meta l4proto udp th dport 53 \
             dnat ip to 192.168.1.1:1053
 
         # 2. Traffic addressed to the gateway itself (SSH, API, ...) -> leave.

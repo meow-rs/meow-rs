@@ -489,6 +489,18 @@ pub fn is_offline_validate() -> bool {
     OFFLINE_VALIDATE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Process policy for hosts accepting configurations from delegated users.
+static EXTERNAL_PLUGINS_ALLOWED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+pub fn set_external_plugins_allowed(allowed: bool) {
+    EXTERNAL_PLUGINS_ALLOWED.store(allowed, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn external_plugins_allowed() -> bool {
+    EXTERNAL_PLUGINS_ALLOWED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub async fn load_config(path: &str) -> Result<Config, anyhow::Error> {
     let bytes = tokio::fs::read(path)
         .await

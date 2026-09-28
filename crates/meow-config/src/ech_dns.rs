@@ -209,6 +209,9 @@ pub async fn preresolve_ech(
     strict: bool,
 ) -> Result<(), String> {
     check_ech_defects(proxies, strict)?;
+    if crate::is_offline_validate() {
+        return Ok(());
+    }
     for proxy in proxies {
         let proxy_name = proxy
             .get("name")

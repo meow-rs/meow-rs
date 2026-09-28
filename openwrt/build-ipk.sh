@@ -154,7 +154,7 @@ build_luci() {
     find "$staging/data" -type d -exec chmod 755 {} +
     find "$staging/data" -type f -exec chmod 644 {} +
 
-    chmod 755 "$staging/data/usr/libexec/meow-api"
+    chmod 755 "$staging/data/usr/libexec/meow-api" "$staging/data/usr/libexec/meow-validate"
 
     cat > "$staging/control/control" <<EOF
 Package: luci-app-meow
@@ -167,7 +167,7 @@ Maintainer: ${MAINTAINER}
 Description:  LuCI support for meow: status overview, YAML config editor,
   service and transparent-proxy (gateway / side-router) settings, ARP-based
   client steering, logs, and the built-in meow web panel embedded in LuCI.
-  The optional client-steering feature needs the arping package at runtime.
+  Client steering uses the built-in unicast ARP sender.
 EOF
 
     cat > "$staging/control/postinst" <<'EOF'

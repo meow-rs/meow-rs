@@ -42,6 +42,19 @@ load_config() {
 	config_get bypass tproxy bypass ''
 }
 
+validate_config() {
+    case "$mode:$ipv6" in redirect:0|redirect:1|tproxy:0) ;; *)
+        logger -t meow 'gateway: invalid mode/IPv6 combination; IPv6 requires redirect mode'; return 1 ;; esac
+    for port in "$tproxy_port" "$dns_port"; do
+        case "$port" in ''|*[!0-9]*) return 1 ;; esac
+        [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || return 1
+    done
+    case "$interface" in ''|*[!a-zA-Z0-9_.:-]*) return 1 ;; esac
+    for cidr in $bypass; do
+        case "$cidr" in *[!0-9a-fA-F.:/]*|'') return 1 ;; esac
+    done
+}
+
 port_listening() {
 	# /proc/net/tcp{,6} list local ports in hex; state 0A is LISTEN.
 	local hex
@@ -87,7 +100,7 @@ gen_rules() {
 			meta mark $ROUTING_MARK return
 	NFT
 	[ "$dns_hijack" -eq 1 ] &&
-		echo "		meta nfproto ipv4 meta l4proto { tcp, udp } th dport 53 redirect to :$dns_port"
+		echo "		meta nfproto ipv4 meta l4proto udp th dport 53 redirect to :$dns_port"
 	[ "$ipv6" -eq 1 ] || echo "		meta nfproto ipv6 return"
 	cat <<-NFT
 			fib daddr type local return
@@ -122,8 +135,8 @@ gen_rules() {
 }
 
 route_up() {
-	ip rule add fwmark $FWMARK lookup $ROUTE_TABLE
-	ip route replace local 0.0.0.0/0 dev lo table $ROUTE_TABLE
+	ip rule add fwmark $FWMARK lookup $ROUTE_TABLE || return 1
+	ip route replace local 0.0.0.0/0 dev lo table $ROUTE_TABLE || return 1
 	if [ "$ipv6" -eq 1 ]; then
 		ip -6 rule add fwmark $FWMARK lookup $ROUTE_TABLE
 		ip -6 route replace local ::/0 dev lo table $ROUTE_TABLE
@@ -139,15 +152,30 @@ route_down() {
 }
 
 case "$1" in
+    run)
+        child=''
+        trap '[ -z "$child" ] || kill "$child" 2>/dev/null; "$0" down; exit 0' TERM INT
+        "$0" wait & child=$!
+        wait "$child" || exit 1
+        child=''
+        "$0" up || exit 1
+        while :; do sleep 3600 & child=$!; wait "$child"; done
+        ;;
 	up)
 		load_config
+		validate_config || { logger -t meow "gateway: invalid configuration"; exit 1; }
 		network_get_device device "$interface"
 		[ -n "$device" ] || {
 			logger -t meow "gateway: no device for interface '$interface'"
 			exit 1
 		}
+		case "$device" in *[!a-zA-Z0-9_.:-]*) exit 1 ;; esac
 		mkdir -p "${RULES%/*}"
 		gen_rules "$device" > "$RULES"
+        if ! nft -c -f "$RULES"; then
+            logger -t meow 'gateway: invalid rules or missing kernel support; install kmod-nft-socket kmod-nft-tproxy (opkg install, or apk add on newer OpenWrt)'
+            exit 1
+        fi
 		nft delete table $TABLE 2>/dev/null
 		route_down
 		if ! nft -f "$RULES"; then
@@ -157,7 +185,7 @@ case "$1" in
 		if [ "$mode" = redirect ]; then
 			logger -t meow "gateway: redirect $device tcp -> :$tproxy_port"
 		else
-			route_up
+			route_up || { "$0" down; logger -t meow "gateway: policy routing failed"; exit 1; }
 			logger -t meow "gateway: tproxy $device tcp(redirect)+udp -> :$tproxy_port"
 		fi
 		;;

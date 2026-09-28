@@ -1,0 +1,14 @@
+#!/bin/sh
+# No caller-supplied CLI flags or paths: only the generated scratch token.
+set -eu
+[ "$#" -eq 1 ] || exit 1
+case "$1" in
+    check) scratch=/tmp/meow-luci-check.yaml ;;
+    *)
+        [ "${#1}" -eq 32 ] || exit 1
+        case "$1" in *[!0-9a-f]*) exit 1 ;; esac
+        scratch="/tmp/meow-luci-settings-$1.yaml"
+        ;;
+esac
+# Delegated LuCI configuration is deliberately confined to /etc/meow.
+exec /usr/bin/meow --no-external-plugins -d /etc/meow -f "$scratch" -t

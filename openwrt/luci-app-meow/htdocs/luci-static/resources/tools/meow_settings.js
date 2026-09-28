@@ -31,7 +31,7 @@ function transform(content, settings) {
 	if (enabled && ipv6 && udp)
 		throw new Error(_('IPv6 capture requires REDIRECT mode; UDP TPROXY supports IPv4 only.'));
 
-	doc.set('external-controller', '0.0.0.0:' + panelPort);
+	doc.set('external-controller', (settings.secret ? '0.0.0.0:' : '127.0.0.1:') + panelPort);
 	doc.set('secret', settings.secret || '');
 
 	var listeners = doc.get('listeners', true), managed;
@@ -143,7 +143,8 @@ return baseclass.extend({
 	// rollback is used if the subsequent UCI save fails.
 	save: function() {
 		var path = uci.get('meow', 'main', 'config_file') || '/etc/meow/config.yaml';
-		var workDir = uci.get('meow', 'main', 'work_dir') || '/etc/meow';
+		if (path !== '/etc/meow/config.yaml' || (uci.get('meow', 'main', 'work_dir') || '/etc/meow') !== '/etc/meow')
+			return Promise.reject(new Error(_('LuCI edits require /etc/meow/config.yaml and working directory /etc/meow.')));
 		// getRandomValues also works on plain HTTP LuCI pages.
 		var token = Array.from(crypto.getRandomValues(new Uint32Array(4)), function(n) {
 			return n.toString(16).padStart(8, '0');
@@ -155,7 +156,7 @@ return baseclass.extend({
 			candidate = transform(content, values());
 			return write(scratch, candidate);
 		}).then(function() {
-			return fs.exec('/usr/bin/meow', ['-d', workDir, '-f', scratch, '-t']);
+			return fs.exec('/usr/libexec/meow-validate', [token]);
 		}).then(function(res) {
 			if (res.code !== 0) {
 				var output = ((res.stdout || '') + (res.stderr || '')).replace(/\x1b\[[0-9;]*m/g, '');

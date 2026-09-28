@@ -164,6 +164,7 @@ cargo test --lib --bin meow \
   --test trojan_integration --test vless_config_test --test vless_integration \
   --test v2ray_plugin_integration --test gost_plugin_integration \
   --test shadow_tls_test --test restls_e2e --test jls_e2e --test kcptun_e2e --test pre_resolve_test \
+  --test offline_config_test \
   --test geodata_fetch_test \
   --test subscription_refresh_test \
   --test tls_test --test boring_tls_test --test ws_test --test crate_invariants_test \

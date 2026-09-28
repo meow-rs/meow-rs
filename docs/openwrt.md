@@ -58,6 +58,17 @@ The `meow` package installs:
 Both `/etc/config/meow` and `/etc/meow/config.yaml` are conffiles: opkg
 preserves your edits across upgrades.
 
+LuCI's delegated file permissions are confined to `/etc/meow/config.yaml` and
+its validation scratch files; the managed service uses these fixed paths. Custom paths require running meow
+manually over SSH.
+Validation uses a fixed-argument helper, and OpenWrt disables external SIP003
+executables at both validation and runtime (built-in plugins remain supported).
+A random API secret is generated at installation, preserving existing secrets
+on upgrade. Clearing it restricts the API to loopback; remote panel access then
+requires setting a secret again. HTTP provider payloads absent from the cache
+are deferred during `-t`, including strict validation; cached rule payloads and
+inline definitions are still checked. ECH DNS lookup is deferred to startup.
+
 ## Configure and start
 
 Edit `/etc/meow/config.yaml` (add your proxies, groups and rules — see
@@ -110,6 +121,9 @@ origin; the packaged curl helper contacts only the router's loopback API.
 ## Transparent proxy (gateway / side router)
 
 Enable **Settings → Transparent proxy** (or `uci set meow.tproxy.enabled=1`).
+The default mode needs `kmod-nft-socket` and `kmod-nft-tproxy`; install them
+with `opkg install` (`apk add` on newer OpenWrt). Startup checks the generated
+rules and logs an install hint when kernel support is missing.
 `/usr/share/meow/gateway.sh` then loads an nftables table
 `inet meow_gateway` for traffic arriving on the chosen LAN interface:
 
@@ -128,7 +142,7 @@ Enable **Settings → Transparent proxy** (or `uci set meow.tproxy.enabled=1`).
   traffic is never re-captured. The firewall mark (`0x2333`) and `routing-mark`
   are deliberately different; keep `routing-mark` in the YAML matching the
   `ROUTING_MARK` in `gateway.sh`.
-- **DNS hijack**: LAN DNS (port 53, any resolver) is redirected to meow's
+- **DNS hijack**: LAN UDP DNS (port 53, any resolver) is redirected to meow's
   resolver (`dns_port`, default 1053), which is needed for fake-ip.
 - Private, reserved, multicast and router-local destinations bypass the
   proxy. Add more with `list bypass`.
@@ -185,9 +199,10 @@ a network you control, and it is **off by default**: the `arp_hijack` section
 of `/etc/config/meow` starts disabled and empty, so no device is ever affected
 until you enable steering and tick it. Untick a client (Save & Apply) to
 release it; its ARP cache relearns the real gateway once meow stops announcing.
-It needs the `arping` package (`opkg install arping`; not pulled in
-automatically, so the LuCI app installs on images without it) and the
-transparent proxy enabled to actually handle the steered traffic.
+Steering uses meow's built-in Linux `arp-reply` command. Each Ethernet and
+ARP target address is the selected client's MAC; no broadcast replies or
+external `arping` implementation are used. Stopping steering is passive:
+clients return to the real gateway when their ARP entries expire.
 
 Notes and limits:
 
