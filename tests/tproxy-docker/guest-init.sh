@@ -698,3 +698,6 @@ echo "=== end log ==="
 
 # Cleanup
 kill "$ECHO_PID" 2>/dev/null || true
+
+# The host requires this marker to reject interrupted or partial runs.
+echo ALL_TESTS_DONE

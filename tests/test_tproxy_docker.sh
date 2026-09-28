@@ -9,7 +9,7 @@
 #
 # Requirements: docker
 #
-# Usage: bash tests/test_tproxy_qemu.sh
+# Usage: bash tests/test_tproxy_docker.sh
 
 set -euo pipefail
 
@@ -19,11 +19,13 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 # --- Dependency check ---
 if ! command -v docker &>/dev/null; then
     echo "SKIP: docker not found in PATH"
+    [ "${MEOW_REQUIRE_DOCKER:-0}" != 1 ] || exit 1
     exit 0
 fi
 
 if ! docker info >/dev/null 2>&1; then
     echo "SKIP: docker daemon not running"
+    [ "${MEOW_REQUIRE_DOCKER:-0}" != 1 ] || exit 1
     exit 0
 fi
 
@@ -53,11 +55,11 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     nftables iproute2 netcat-traditional bash ca-certificates libstdc++6
 COPY --from=builder /src/target/debug/meow /usr/local/bin/meow
-COPY tests/tproxy-qemu/meow-tproxy.yaml /etc/meow-tproxy.yaml
-COPY tests/tproxy-qemu/meow-tproxy-ext.yaml /etc/meow-tproxy-ext.yaml
-COPY tests/tproxy-qemu/meow-tproxy-udp.yaml /etc/meow-tproxy-udp.yaml
-COPY tests/tproxy-qemu/meow-tproxy-multi.yaml /etc/meow-tproxy-multi.yaml
-COPY tests/tproxy-qemu/guest-init.sh /run-tests.sh
+COPY tests/tproxy-docker/meow-tproxy.yaml /etc/meow-tproxy.yaml
+COPY tests/tproxy-docker/meow-tproxy-ext.yaml /etc/meow-tproxy-ext.yaml
+COPY tests/tproxy-docker/meow-tproxy-udp.yaml /etc/meow-tproxy-udp.yaml
+COPY tests/tproxy-docker/meow-tproxy-multi.yaml /etc/meow-tproxy-multi.yaml
+COPY tests/tproxy-docker/guest-init.sh /run-tests.sh
 RUN chmod +x /run-tests.sh
 DOCKERFILE
 
@@ -65,9 +67,11 @@ echo ""
 echo "=== Running tproxy tests in container ==="
 
 CONTAINER_LOG=$(mktemp)
+trap 'rm -f "$CONTAINER_LOG"' EXIT
+RUN_STATUS=0
 docker run --rm --privileged \
     "$DOCKER_IMAGE" \
-    /bin/bash /run-tests.sh 2>&1 | tee "$CONTAINER_LOG" || true
+    /bin/bash /run-tests.sh 2>&1 | tee "$CONTAINER_LOG" || RUN_STATUS=$?
 
 echo ""
 echo "=== Parsing test results ==="
@@ -90,12 +94,14 @@ while IFS= read -r line; do
     TOTAL_COUNT=$((TOTAL_COUNT + 1))
 done < <(grep "^TEST_FAIL:" "$CONTAINER_LOG" 2>/dev/null || true)
 
-rm -f "$CONTAINER_LOG"
 
 echo ""
 echo "Results: $PASS_COUNT passed, $FAIL_COUNT failed, $TOTAL_COUNT total"
 
-if [ "$TOTAL_COUNT" -eq 0 ]; then
+if [ "$RUN_STATUS" -ne 0 ] || ! grep -qx ALL_TESTS_DONE "$CONTAINER_LOG"; then
+    echo "FAIL: container did not complete (exit $RUN_STATUS)"
+    exit 1
+elif [ "$TOTAL_COUNT" -eq 0 ]; then
     echo ""
     echo "=== FAIL: No tests ran ==="
     exit 1

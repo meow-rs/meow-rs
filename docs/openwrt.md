@@ -226,16 +226,6 @@ openwrt/build-ipk.sh luci --version 0.16.0-1 --outdir dist
 
 ## End-to-end test
 
-`tests/test_openwrt_qemu.sh` boots an official OpenWrt armsr/armv8 image in
-`qemu-system-aarch64`, installs both ipks inside the guest and verifies the
-procd service, REST API, built-in panel and proxy data path. It runs in CI
-(`.github/workflows/test.yml`, `openwrt` job) and locally:
-
-```sh
-# requirements: qemu-system-aarch64, expect, python3, curl, cargo-zigbuild
-bash tests/test_openwrt_qemu.sh
-```
-
 `tests/test_openwrt_docker.sh` is a multi-container **side-router** test: it
 builds an OpenWrt router container that bridges an internal LAN to a WAN, puts
 an HTTP + UDP-echo origin on the WAN and two clients on the LAN (whose only
@@ -246,13 +236,15 @@ that the LuCI Clients view + ACL ship. It is hermetic (the origin is on an
 RFC 5737 test-net so it is actually proxied, not bypassed as a private range)
 and needs no physical NIC or real LAN.
 
-It also checks the LuCI app end to end where the QEMU test does not: `rpcd`
+The CI `openwrt` job runs this suite, including package installation, shipped
+config validation, mixed-port HTTP relay, service stop/restart, and LuCI: `rpcd`
 loads the `luci-app-meow` ACL group and a root `ubus` login expands the meow
 file/exec grants, and the Clients view is registered in the on-device menu.
 
 ```sh
 # requirements: docker, cargo-zigbuild + zig (or MEOW_BINARY), and the
-# nft_tproxy kernel module loadable (root/modprobe); it SKIPs otherwise.
+# Docker host kernel with nftables TPROXY support.
+# MEOW_REQUIRE_DOCKER=1 makes missing prerequisites fail (used in CI).
 bash tests/test_openwrt_docker.sh
 # KEEP=1 leaves the containers/networks up for inspection.
 ```

@@ -113,7 +113,7 @@ Shadowsocks protocol integration tests pass (requires `ssserver` binary; verifie
 
 ---
 
-### 7. bash tests/test_tproxy_qemu.sh
+### 7. bash tests/test_tproxy_docker.sh
 
 ```
 Results: 11 passed, 0 failed, 11 total
@@ -224,7 +224,7 @@ Once tasks 1–3 complete, write `m2-exit-summary.md` with:
 ✅ **Local regression bar**: PASS — all 11 gates execute successfully, 0 failures  
 ✅ **Code quality** (all feature sets): PASS — 0 clippy violations (fixed by commit 7c91033)  
 ✅ **Engineer M2 deltas**: PASS — all 7 subtasks landed and documented  
-✅ **E2E integration tests**: PASS — tproxy QEMU 11/11, all other integration tests green  
+✅ **E2E integration tests**: PASS — tproxy Docker 11/11, all other integration tests green
 ⏳ **Reference-host benchmarks**: PENDING — task #45 (W1–W5 on Linux bench host)  
 ⏳ **Reference-host binary sizes**: PENDING — task #45 (musl builds + ADR-0007 caps)  
 ⏳ **Reference-host dhat audit**: PENDING — task #45 (Phase A on full W3 load)  

@@ -20,5 +20,5 @@ Packaging sources for the official OpenWrt `.ipk` release artifacts
   (macvlan, bridge mode) configured as a side router with meow installed.
 
 Release wiring lives in `.github/workflows/release.yml` (ipk matrix), the
-QEMU end-to-end test in `tests/test_openwrt_qemu.sh`, and user-facing
+Docker end-to-end test in `tests/test_openwrt_docker.sh`, and user-facing
 documentation in [docs/openwrt.md](../docs/openwrt.md).

@@ -91,7 +91,7 @@ Runs on `macos-latest` after `lint`:
 
 Runs on Ubuntu after `lint`:
 
-- `bash tests/test_tproxy_qemu.sh`
+- `bash tests/test_tproxy_docker.sh`
 - Builds a Docker test image and exercises the transparent-proxy listener
   end-to-end with nftables.
 
@@ -115,7 +115,7 @@ Runs on Ubuntu after `lint`:
 | VLESS parser/integration | `crates/meow-config/tests/vless_config_test.rs`, `vless_integration` | Yes |
 | Transport layers | `meow-transport` TLS/WS/gRPC/H2/HTTPUpgrade tests | Yes |
 | Feature powersets | `cargo hack check` for transport/proxy/listener crates | Yes |
-| TProxy e2e | `tests/test_tproxy_qemu.sh` | Yes (Ubuntu Docker) |
+| TProxy e2e | `tests/test_tproxy_docker.sh` | Yes (Ubuntu Docker) |
 | MSRV | Workspace `rust-version` | Yes |
 | Dependency advisories | `audit.yml` | Yes |
 | Coverage | `coverage.yml` | Scheduled/manual |

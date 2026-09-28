@@ -145,7 +145,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 ```
 
 Plus the integration suites at milestone exit (unchanged):
-`rules_test`, `trojan_integration`, `shadowsocks_integration`. tproxy QEMU
+`rules_test`, `trojan_integration`, `shadowsocks_integration`. tproxy Docker
 remains CI-only.
 
 **`cargo-deny`: deferred.** A `deny.toml` for license / advisory / duplicate

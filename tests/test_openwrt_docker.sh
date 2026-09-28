@@ -6,9 +6,9 @@
 # "side router":
 #
 #     origin (HTTP + UDP echo)                 client1, client2
-#        |  meow-e2e-wan (10.13.36.0/24)           |  meow-e2e-lan (10.13.37.0/24, internal)
+#        |  meow-e2e-wan (203.0.113.0/24)           |  meow-e2e-lan (10.13.37.0/24, internal)
 #        +------------- router (OpenWrt) ----------+
-#                    eth0 10.13.36.1   eth1 10.13.37.1
+#                    eth0 203.0.113.1   eth1 10.13.37.1
 #                    meow + gateway.sh (tproxy) + luci-app-meow
 #
 # The LAN is a Docker *internal* network, so a client can reach the origin
@@ -21,9 +21,9 @@
 # and that a second client works too.
 #
 # Requirements: docker, and either MEOW_BINARY (a prebuilt static musl meow for
-# the host arch) or cargo-zigbuild + zig to build one. Root (or passwordless
-# sudo) to modprobe the nftables TPROXY modules the container needs. Missing
-# tooling / capabilities SKIP (exit 0) rather than FAIL, matching the QEMU test.
+# the Docker server arch) or cargo-zigbuild + zig to build one. The Docker
+# host kernel needs nftables TPROXY support. Missing prerequisites skip locally;
+# MEOW_REQUIRE_DOCKER=1 (set in CI) makes them fail.
 #
 # Usage: bash tests/test_openwrt_docker.sh
 #
@@ -32,13 +32,13 @@
 #   OPENWRT_VERSION   openwrt/rootfs image version (default below)
 #   KEEP              set to 1 to leave the containers/networks up on exit
 
-set -uo pipefail
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-OPENWRT_VERSION="${OPENWRT_VERSION:-24.10.4}"
+OPENWRT_VERSION="${OPENWRT_VERSION:-24.10.7}"
 
-PFX="meow-e2e"
+PFX="meow-e2e-$$"
 NET_WAN="$PFX-wan"
 NET_LAN="$PFX-lan"
 ROUTER="$PFX-router"
@@ -59,105 +59,102 @@ UDP_PORT=9999
 PASS=0; FAIL=0
 pass() { echo "TEST_PASS: $1"; PASS=$((PASS + 1)); }
 fail() { echo "TEST_FAIL: $1 ${2:+-- $2}"; FAIL=$((FAIL + 1)); }
-skip() { echo "SKIP: $1"; exit 0; }
+skip() {
+    if [ "${MEOW_REQUIRE_DOCKER:-0}" = 1 ]; then
+        echo "FAIL: $1 (Docker coverage is required)"; exit 1
+    fi
+    echo "SKIP: $1"; exit 0
+}
 
 # check <name> <expected-substring> <command...>
 check() {
     local name="$1" want="$2"; shift 2
     local out
-    out="$("$@" 2>&1)"
-    if printf '%s' "$out" | grep -qF "$want"; then
+    local status=0
+    out="$("$@" 2>&1)" || status=$?
+    if [ "$status" -eq 0 ] && [[ "$out" == *"$want"* ]]; then
         pass "$name"
     else
         fail "$name" "want '$want', got: $(printf '%s' "$out" | tr '\n' '|' | cut -c1-200)"
     fi
 }
 
-rexec() { docker exec "$ROUTER" sh -c "$1"; }
+# Docker client proxy defaults must not redirect this isolated topology's
+# requests through a user's host proxy (including package downloads).
+NO_PROXY_ENV=(-e HTTP_PROXY= -e HTTPS_PROXY= -e ALL_PROXY= -e http_proxy= -e https_proxy= -e all_proxy=)
+
+rexec() { docker exec "$ROUTER" sh -c "unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy; $1"; }
 
 command -v docker >/dev/null 2>&1 || skip "docker not found"
 docker info >/dev/null 2>&1 || skip "docker daemon not available"
 
-# --- Host arch -> image / target ---
-case "$(uname -m)" in
+# Docker may be remote or run inside a VM: use its architecture and kernel.
+DOCKER_ARCH="$(docker info --format '{{.Architecture}}')"
+case "$DOCKER_ARCH" in
     aarch64|arm64) PLAT=linux/aarch64_generic; OW_TAG=armsr-armv8; OW_ARCH=aarch64_generic; RUST_TARGET=aarch64-unknown-linux-musl ;;
-    x86_64|amd64)  PLAT=linux/x86_64;          OW_TAG=x86-64;      OW_ARCH=x86_64;          RUST_TARGET=x86_64-unknown-linux-musl ;;
-    *) skip "unsupported host arch $(uname -m)" ;;
+    x86_64|amd64)  PLAT=linux/x86_64; OW_TAG=x86-64; OW_ARCH=x86_64; RUST_TARGET=x86_64-unknown-linux-musl ;;
+    *) skip "unsupported Docker architecture $DOCKER_ARCH" ;;
 esac
 IMAGE="openwrt/rootfs:${OW_TAG}-${OPENWRT_VERSION}"
 
-# --- nftables TPROXY modules (loaded on the host; containers share the kernel) ---
-MODULES="nf_tables nft_tproxy nft_socket nft_chain_nat nft_nat nft_redir
-nft_masq nft_fib nft_fib_inet nft_fib_ipv4 nf_nat nf_conntrack"
-for m in $MODULES; do sudo -n modprobe "$m" 2>/dev/null || modprobe "$m" 2>/dev/null || true; done
-# TPROXY is mandatory for this test; if the kernel has no nft_tproxy (loaded or
-# builtin) and we cannot load it, SKIP rather than FAIL — it is an environment
-# limitation, not a meow bug.
-if [ ! -d /sys/module/nft_tproxy ] && ! grep -qw nft_tproxy /proc/modules 2>/dev/null; then
-    skip "nft_tproxy kernel module unavailable (need root/modprobe or a kernel with TPROXY)"
+# Linux hosts can load modules explicitly; on Docker Desktop/remote servers,
+# the nft rule insertion below checks the actual server kernel instead.
+if [ "$(uname -s)" = Linux ]; then
+    for m in nf_tables nft_tproxy nft_socket nft_chain_nat nft_nat nft_redir nft_masq nft_fib nft_fib_inet nft_fib_ipv4 nf_nat nf_conntrack; do
+        sudo -n modprobe "$m" 2>/dev/null || modprobe "$m" 2>/dev/null || true
+    done
 fi
 
 # --- Build (or locate) the meow binary for the container arch ---
 if [ -n "${MEOW_BINARY:-}" ]; then
     BINARY="$MEOW_BINARY"
 else
-    PREBUILT="$ROOT_DIR/target/$RUST_TARGET/release/meow"
-    if [ -f "$PREBUILT" ]; then
-        BINARY="$PREBUILT"
-    elif command -v cargo-zigbuild >/dev/null 2>&1 && command -v zig >/dev/null 2>&1; then
-        echo "=== Building $RUST_TARGET meow binary ==="
-        ( cd "$ROOT_DIR" && cargo zigbuild --release --target "$RUST_TARGET" --bin meow ) || skip "binary build failed"
-        BINARY="$PREBUILT"
-    else
+    command -v cargo-zigbuild >/dev/null 2>&1 && command -v zig >/dev/null 2>&1 ||
         skip "no MEOW_BINARY and cargo-zigbuild/zig not available"
-    fi
+    echo "=== Building $RUST_TARGET meow binary ==="
+    ( cd "$ROOT_DIR" && cargo zigbuild --release --target "$RUST_TARGET" --bin meow )
+    BINARY="$ROOT_DIR/target/$RUST_TARGET/release/meow"
 fi
-[ -f "$BINARY" ] || skip "meow binary not found: $BINARY"
+[ -f "$BINARY" ] || { echo "FAIL: meow binary not found: $BINARY"; exit 1; }
 
 WORK="$(mktemp -d)"
 cleanup() {
     if [ "${KEEP:-0}" = 1 ]; then echo "KEEP=1: leaving $ROUTER/$ORIGIN/$CLIENTS and $NET_WAN/$NET_LAN up"; rm -rf "$WORK"; return; fi
-    docker rm -f $ROUTER $ORIGIN $CLIENTS >/dev/null 2>&1
-    docker network rm "$NET_WAN" "$NET_LAN" >/dev/null 2>&1
+    docker rm -f $ROUTER $ORIGIN $CLIENTS >/dev/null 2>&1 || true
+    docker network rm "$NET_WAN" "$NET_LAN" >/dev/null 2>&1 || true
     rm -rf "$WORK"
 }
 trap cleanup EXIT
 
 echo "=== Building ipks ($OW_ARCH) ==="
-bash "$ROOT_DIR/openwrt/build-ipk.sh" meow --binary "$BINARY" --version 0.0.0-e2e --arch "$OW_ARCH" --outdir "$WORK" >/dev/null || skip "meow ipk build failed"
-bash "$ROOT_DIR/openwrt/build-ipk.sh" luci --version 0.0.0-e2e --outdir "$WORK" >/dev/null || skip "luci ipk build failed"
+bash "$ROOT_DIR/openwrt/build-ipk.sh" meow --binary "$BINARY" --version 0.0.0-e2e --arch "$OW_ARCH" --outdir "$WORK" >/dev/null
+bash "$ROOT_DIR/openwrt/build-ipk.sh" luci --version 0.0.0-e2e --outdir "$WORK" >/dev/null
 
 echo "=== Pulling $IMAGE ==="
-docker pull --platform "$PLAT" "$IMAGE" >/dev/null 2>&1 || skip "cannot pull $IMAGE"
+docker image inspect "$IMAGE" >/dev/null 2>&1 || docker pull --platform "$PLAT" "$IMAGE" >/dev/null
 
 echo "=== Networks ==="
 # Docker reserves .1 for the bridge gateway, so park it at .254 and use .1 for
 # the router (its natural gateway address to the clients).
-docker rm -f $ROUTER $ORIGIN $CLIENTS >/dev/null 2>&1
-docker network rm "$NET_WAN" "$NET_LAN" >/dev/null 2>&1
+docker rm -f $ROUTER $ORIGIN $CLIENTS >/dev/null 2>&1 || true
+docker network rm "$NET_WAN" "$NET_LAN" >/dev/null 2>&1 || true
 docker network create --subnet "$WAN_SUBNET" --gateway "$WAN_GW" "$NET_WAN" >/dev/null
 docker network create --internal --subnet "$LAN_SUBNET" --gateway "$LAN_GW" "$NET_LAN" >/dev/null
 
 echo "=== Origin (HTTP + UDP echo on the WAN) ==="
-docker run -d --name "$ORIGIN" --network "$NET_WAN" --ip "$ORIGIN_IP" alpine:3 sleep infinity >/dev/null
-# socat serves both (busybox in alpine ships no httpd applet). The WAN bridge
-# NATs to the host, so apk can fetch socat.
-docker exec "$ORIGIN" sh -c 'apk add -q --no-cache socat >/dev/null 2>&1 || true'
-if docker exec "$ORIGIN" sh -c 'command -v socat >/dev/null'; then
-  ORIGIN_UDP=1
-  docker exec "$ORIGIN" sh -c 'cat > /resp.sh <<'\''EOF'\''
+docker run -d "${NO_PROXY_ENV[@]}" --name "$ORIGIN" --network "$NET_WAN" --ip "$ORIGIN_IP" alpine:3.20 sleep infinity >/dev/null
+# socat serves both protocols; failure to prepare either is a test failure.
+docker exec "$ORIGIN" sh -ec 'apk add -q --no-cache socat >/dev/null'
+docker exec "$ORIGIN" sh -c 'cat > /resp.sh <<'\''EOF'\''
 #!/bin/sh
 printf "HTTP/1.0 200 OK\r\nContent-Length: 9\r\n\r\npong-http"
 EOF
 chmod +x /resp.sh'
-  docker exec -d "$ORIGIN" socat TCP-LISTEN:80,reuseaddr,fork EXEC:/resp.sh
-  docker exec -d "$ORIGIN" socat -T10 "UDP-RECVFROM:$UDP_PORT,fork" EXEC:/bin/cat
-else
-  ORIGIN_UDP=0
-fi
+docker exec -d "$ORIGIN" socat TCP-LISTEN:80,reuseaddr,fork EXEC:/resp.sh
+docker exec -d "$ORIGIN" socat -T10 "UDP-RECVFROM:$UDP_PORT,fork" EXEC:/bin/cat
 
 echo "=== Router (OpenWrt) ==="
-docker run -d --name "$ROUTER" --hostname router --platform "$PLAT" \
+docker run -d "${NO_PROXY_ENV[@]}" --name "$ROUTER" --hostname router --platform "$PLAT" \
     --network "$NET_WAN" --ip "$ROUTER_WAN" \
     --cap-add NET_ADMIN --cap-add NET_RAW --cap-add SYS_ADMIN \
     --sysctl net.ipv4.ip_forward=1 \
@@ -199,6 +196,8 @@ config interface "wan"
 	option proto "static"
 	option ipaddr "'"$ROUTER_WAN"'"
 	option netmask "255.255.255.0"
+	option gateway "'"$WAN_GW"'"
+	list dns "127.0.0.11"
 config interface "lan"
 	option device "eth1"
 	option proto "static"
@@ -217,19 +216,33 @@ echo "=== Install ipks ==="
 docker exec "$ROUTER" mkdir -p /tmp/ipk
 docker cp "$WORK/meow_0.0.0-e2e_${OW_ARCH}.ipk" "$ROUTER:/tmp/ipk/meow.ipk"
 docker cp "$WORK/luci-app-meow_0.0.0-e2e_all.ipk" "$ROUTER:/tmp/ipk/luci.ipk"
-# meow installs via opkg (arch-specific), exercising its postinst/uci-defaults
-# and procd wiring. The LuCI app is arch `all` and depends on luci-base,
-# which this stripped openwrt/rootfs image lacks and cannot resolve — so its
-# static files are laid down by unpacking the ipk's data payload directly. The
-# assertions then confirm the Clients view + ACL ship correctly. On a real
-# OpenWrt image `opkg install luci-app-meow` pulls its deps and does this.
-rexec 'mkdir -p /var/lock
-opkg install --force-depends /tmp/ipk/meow.ipk >/tmp/opkg.log 2>&1
-cd /tmp/ipk && tar -xzf luci.ipk ./data.tar.gz && tar -xzf data.tar.gz -C / && rm -f /tmp/luci-indexcache*
-:'
+# Install both packages via opkg, including LuCI dependencies and postinst.
+# Containers use their host kernel, so kernel-module packages cannot be
+# installed here. nftables userspace and the actual rule probe cover that gap.
+rexec 'set -e
+mkdir -p /var/lock
+opkg update
+opkg install luci-base nftables ip-full
+opkg install /tmp/ipk/meow.ipk
+opkg install /tmp/ipk/luci.ipk
+' >"$WORK/opkg.log" 2>&1 || { cat "$WORK/opkg.log"; exit 1; }
+
+# Probe capabilities in the router namespace (also works with Docker Desktop).
+rexec 'set -e
+nft add table inet meow_probe
+nft "add chain inet meow_probe pre { type filter hook prerouting priority mangle; }"
+nft add rule inet meow_probe pre meta l4proto udp tproxy to :7893
+nft delete table inet meow_probe
+' || skip "Docker host kernel lacks nftables TPROXY support"
+
+for path in /usr/bin/meow /etc/init.d/meow /etc/config/meow /etc/meow/config.yaml /etc/rc.d/S95meow /www/luci-static/resources/view/meow/panel.js /www/luci-static/resources/view/meow/settings.js; do
+    check "package installs $path" "INSTALLED" rexec "test -e $path && echo INSTALLED"
+done
+check "shipped config validates" "VALID" rexec '/usr/bin/meow -d /etc/meow -f /etc/meow/config.yaml -t && echo VALID'
 
 echo "=== Enable meow + transparent proxy (tproxy) ==="
 rexec '
+set -e
 uci set meow.main.enabled=1
 uci set meow.tproxy.enabled=1
 uci set meow.tproxy.mode=tproxy
@@ -238,14 +251,14 @@ uci commit meow
 /etc/init.d/meow restart
 '
 # gateway.sh loads once meow has bound the listener.
-rexec '/usr/share/meow/gateway.sh wait && /usr/share/meow/gateway.sh up' >/dev/null 2>&1 || true
+rexec '/usr/share/meow/gateway.sh wait && /usr/share/meow/gateway.sh up' >/dev/null 2>&1
 sleep 2
 
 echo "=== Clients (LAN-only; routed through the router) ==="
 i=1
 for c in $CLIENTS; do
-    docker run -d --name "$c" --network "$NET_LAN" --ip "10.13.37.1$i" \
-        --cap-add NET_ADMIN alpine:3 sleep infinity >/dev/null
+    docker run -d "${NO_PROXY_ENV[@]}" --name "$c" --network "$NET_LAN" --ip "10.13.37.1$i" \
+        --cap-add NET_ADMIN alpine:3.20 sleep infinity >/dev/null
     docker exec "$c" sh -c "ip route replace default via $ROUTER_LAN; printf 'nameserver %s\n' $ROUTER_LAN > /etc/resolv.conf"
     i=$((i + 1))
 done
@@ -256,8 +269,8 @@ echo "=== Assertions ==="
 
 # Router service + control plane
 check "procd service running"      "MEOW_UP"    bash -c "docker exec $ROUTER sh -c 'pidof meow >/dev/null && echo MEOW_UP'"
-check "REST API /version"          "version"    bash -c "docker exec $ROUTER uclient-fetch -q -O - http://127.0.0.1:9090/version"
-check "built-in panel /ui"         "meow-rs"    bash -c "docker exec $ROUTER uclient-fetch -q -O - http://127.0.0.1:9090/ui"
+check "REST API /version"          "version"    rexec 'uclient-fetch -q -O - http://127.0.0.1:9090/version'
+check "built-in panel /ui"         "meow-rs"    rexec 'uclient-fetch -q -O - http://127.0.0.1:9090/ui'
 check "LuCI Clients asset served"  "meow Clients" bash -c "docker exec $ROUTER cat /www/luci-static/resources/view/meow/clients.js"
 check "LuCI ACL grants arp exec"   "arp-hijack.sh clients" bash -c "docker exec $ROUTER cat /usr/share/rpcd/acl.d/luci-app-meow.json"
 check "arp steering off by default" "0"         bash -c "docker exec $ROUTER uci -q get meow.arp.enabled"
@@ -274,13 +287,10 @@ check "meow logged client TCP flow" "$ORIGIN_IP:80" bash -c "docker exec $ROUTER
 # DNS hijack: any name resolves to a fake-ip (198.18/16) via the router.
 check "DNS hijack returns fake-ip" "198.18."   bash -c "docker exec $C1 nslookup probe.meow.test $ROUTER_LAN 2>&1 | tail -n +3"
 
-# UDP TPROXY (needs socat on origin); skip cleanly if unavailable.
-if [ "$ORIGIN_UDP" = 1 ]; then
-    check "client1 UDP via tproxy"   "ping-udp"  bash -c "docker exec $C1 sh -c 'echo ping-udp | nc -u -w2 $ORIGIN_IP $UDP_PORT'"
-    check "meow logged client UDP flow" "$ORIGIN_IP:$UDP_PORT" bash -c "docker exec $ROUTER logread -e meow | sed 's/\x1b\[[0-9;]*m//g'"
-else
-    echo "TEST_SKIP: UDP TPROXY (socat unavailable on origin)"
-fi
+# UDP is mandatory: no successful run may silently omit it.
+check "client1 UDP via tproxy" "ping-udp" bash -c "docker exec $C1 sh -c 'echo ping-udp | nc -u -w2 $ORIGIN_IP $UDP_PORT'"
+check "meow logged client UDP flow" "$ORIGIN_IP:$UDP_PORT" bash -c "docker exec $ROUTER logread -e meow | sed 's/\\x1b\\[[0-9;]*m//g'"
+check "mixed-port HTTP proxy relay" "pong-http" docker exec "$C1" sh -c "printf 'GET http://$ORIGIN_IP/probe HTTP/1.1\\r\\nHost: $ORIGIN_IP\\r\\nConnection: close\\r\\n\\r\\n' | nc -w 10 $ROUTER_LAN 7890"
 
 # --- LuCI: rpcd actually loads the meow ACL group, and the menu is on-device ---
 # rpcd ships in the base image; it reads /usr/share/rpcd/acl.d. A root ubus
@@ -292,6 +302,21 @@ check "LuCI rpcd loads arp-hijack grant" "arp-hijack.sh clients" bash -c "docker
 check "LuCI rpcd loads meow-arp grant"   "meow-arp restart"      bash -c "docker exec $ROUTER sh -c '$LOGIN'"
 check "LuCI rpcd loads config grant"     "/etc/meow"             bash -c "docker exec $ROUTER sh -c '$LOGIN'"
 check "LuCI menu registers Clients view" "meow/clients"          bash -c "docker exec $ROUTER grep -o meow/clients /usr/share/luci/menu.d/luci-app-meow.json"
+
+# Preserve the old packaging suite's lifecycle coverage and prove restart.
+rexec '/etc/init.d/meow stop'
+for _ in $(seq 1 20); do
+    rexec 'pidof meow' >/dev/null 2>&1 || break
+    sleep 1
+done
+check "service stop" "STOPPED" rexec '! pidof meow >/dev/null && echo STOPPED'
+check "gateway teardown" "CLEAN" rexec '! nft list table inet meow_gateway >/dev/null 2>&1 && echo CLEAN'
+rexec '/etc/init.d/meow start'
+for _ in $(seq 1 30); do
+    rexec 'uclient-fetch -q -O /dev/null http://127.0.0.1:9090/version' >/dev/null 2>&1 && break
+    sleep 1
+done
+check "service restart" "version" rexec 'uclient-fetch -q -O - http://127.0.0.1:9090/version'
 
 if [ "$FAIL" -gt 0 ]; then
     echo ""; echo "=== Debug (failures present) ==="

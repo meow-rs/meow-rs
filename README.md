@@ -476,7 +476,7 @@ cargo install shadowsocks-rust --features "stream-cipher aead-cipher-2022" --loc
 cargo test --test shadowsocks_integration
 
 # Transparent proxy end-to-end tests (requires Docker)
-bash tests/test_tproxy_qemu.sh
+bash tests/test_tproxy_docker.sh
 ```
 
 ## Contributing

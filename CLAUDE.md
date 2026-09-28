@@ -26,7 +26,7 @@ cargo test --lib
 cargo test --test rules_test           # 100 rule matching tests
 cargo test --test trojan_integration   # embedded mock server, no external deps
 cargo test --test shadowsocks_integration  # requires ssserver (see below)
-bash tests/test_tproxy_qemu.sh             # Docker-based tproxy e2e tests
+bash tests/test_tproxy_docker.sh             # Docker-based tproxy e2e tests
 
 # Install ssserver for SS integration tests
 cargo install shadowsocks-rust --features "stream-cipher aead-cipher-2022" --locked
@@ -221,7 +221,7 @@ cargo test --test rules_test
 cargo test --test trojan_integration
 cargo test --test shadowsocks_integration
 ```
-Docker-based tproxy QEMU test (`bash tests/test_tproxy_qemu.sh`) is CI-only; do not block local work on it.
+Docker-based tproxy Docker test (`bash tests/test_tproxy_docker.sh`) is CI-only; do not block local work on it.
 
 ## Architecture Invariants
 

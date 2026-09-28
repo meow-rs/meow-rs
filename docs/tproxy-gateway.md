@@ -103,7 +103,7 @@ table carried, or the loop-prevention story breaks:
    upstream, or meow's connections to your proxies re-enter the listener.
 4. **The catch-all redirect** — `tcp dport 1-65535 redirect to :<port>` last.
 
-`tests/tproxy-qemu/meow-tproxy-ext.yaml` + `guest-init.sh` phase 2 contain a
+`tests/tproxy-docker/meow-tproxy-ext.yaml` + `guest-init.sh` phase 2 contain a
 complete reference table. You also own the boot-ordering/fail-open story:
 rules pointing at the listener port before meow binds will refuse or pass
 through depending on your ruleset. Use a fixed port — `port: 0` is only
