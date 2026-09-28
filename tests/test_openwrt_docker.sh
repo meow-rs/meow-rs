@@ -82,9 +82,21 @@ check() {
 
 # Docker client proxy defaults must not redirect this isolated topology's
 # requests through a user's host proxy (including package downloads).
-PACKAGE_ENV=(-e HTTP_PROXY="${MEOW_PACKAGE_PROXY:-}" -e HTTPS_PROXY="${MEOW_PACKAGE_PROXY:-}"
-    -e http_proxy="${MEOW_PACKAGE_PROXY:-}" -e https_proxy="${MEOW_PACKAGE_PROXY:-}")
 NO_PROXY_ENV=(-e HTTP_PROXY= -e HTTPS_PROXY= -e ALL_PROXY= -e http_proxy= -e https_proxy= -e all_proxy=)
+
+# uclient treats an empty proxy URL as invalid; clear inherited variables before
+# optionally installing the explicit package-download proxy.
+package_exec() {
+    local container="$1"; shift
+    docker exec -e MEOW_PACKAGE_PROXY="${MEOW_PACKAGE_PROXY:-}" "$container" sh -c '
+        unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
+        if [ -n "$MEOW_PACKAGE_PROXY" ]; then
+            export HTTP_PROXY="$MEOW_PACKAGE_PROXY" HTTPS_PROXY="$MEOW_PACKAGE_PROXY"
+            export http_proxy="$MEOW_PACKAGE_PROXY" https_proxy="$MEOW_PACKAGE_PROXY"
+        fi
+        exec "$@"
+    ' sh "$@"
+}
 
 rexec() { docker exec "$ROUTER" sh -c "unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy; $1"; }
 
@@ -149,12 +161,16 @@ docker network create --internal --subnet "$LAN_SUBNET" --gateway "$LAN_GW" "$NE
 echo "=== Origin (HTTP + UDP echo on the WAN) ==="
 docker run -d "${NO_PROXY_ENV[@]}" --name "$ORIGIN" --network "$NET_WAN" --ip "$ORIGIN_IP" alpine:3.20 sleep infinity >/dev/null
 # socat serves both protocols; failure to prepare either is a test failure.
-docker exec "${PACKAGE_ENV[@]}" "$ORIGIN" sh -ec 'apk add -q --no-cache socat >/dev/null'
-docker exec "$ORIGIN" sh -c 'cat > /resp.sh <<'\''EOF'\''
+package_exec "$ORIGIN" sh -ec 'apk add -q --no-cache socat >/dev/null'
+docker exec -i "$ORIGIN" sh -c 'cat > /resp.sh; chmod +x /resp.sh' <<'EOF'
 #!/bin/sh
+# Drain the request headers before closing, avoiding resets from unread data.
+cr=$(printf '\r')
+while IFS= read -r line; do
+    [ -n "$line" ] && [ "$line" != "$cr" ] || break
+done
 printf "HTTP/1.0 200 OK\r\nContent-Length: 9\r\n\r\npong-http"
 EOF
-chmod +x /resp.sh'
 docker exec -d "$ORIGIN" socat TCP-LISTEN:80,reuseaddr,fork EXEC:/resp.sh
 docker exec -d "$ORIGIN" socat -T10 "UDP-RECVFROM:$UDP_PORT,fork" EXEC:/bin/cat
 
@@ -224,7 +240,7 @@ docker exec -i "$ROUTER" sh -c 'cat > /tmp/ipk/luci.ipk' < "$WORK/luci-app-meow_
 # Install both packages via opkg, including LuCI dependencies and postinst.
 # Containers use their host kernel, so kernel-module packages cannot be
 # installed here. nftables userspace and the actual rule probe cover that gap.
-docker exec "${PACKAGE_ENV[@]}" "$ROUTER" sh -ec '
+package_exec "$ROUTER" sh -ec '
 mkdir -p /var/lock
 opkg update
 opkg install luci-base nftables ip-full
@@ -265,7 +281,7 @@ for c in $CLIENTS; do
     # Install iproute2 before isolating the client on the LAN (ARP cache tests).
     docker run -d "${NO_PROXY_ENV[@]}" --name "$c" --network "$NET_WAN" \
         --cap-add NET_ADMIN alpine:3.20 sleep infinity >/dev/null
-    docker exec "${PACKAGE_ENV[@]}" "$c" apk --timeout 30 add -q --no-cache iproute2
+    package_exec "$c" apk --timeout 30 add -q --no-cache iproute2
     docker network disconnect "$NET_WAN" "$c"
     docker network connect --ip "10.13.37.1$i" "$NET_LAN" "$c"
     docker exec "$c" sh -c "ip route replace default via $ROUTER_LAN; printf 'nameserver %s\n' $ROUTER_LAN > /etc/resolv.conf"
