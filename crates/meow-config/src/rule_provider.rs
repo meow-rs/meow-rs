@@ -1088,7 +1088,7 @@ fn fetch_http_blocking_with_cache(
     prefer_cache: bool,
     headers: &[(String, String)],
 ) -> Result<Vec<u8>> {
-    if prefer_cache {
+    if prefer_cache || crate::is_offline_validate() {
         if let Some(path) = cache_path {
             if path.exists() {
                 debug!("rule-provider cache hit: {}", path.display());
@@ -1096,6 +1096,10 @@ fn fetch_http_blocking_with_cache(
                     .with_context(|| format!("reading cached provider {}", path.display()));
             }
         }
+    }
+
+    if crate::is_offline_validate() {
+        anyhow::bail!("offline validation: no cached payload for rule provider {url}");
     }
 
     match fetch_http_blocking(url, proxy, headers) {

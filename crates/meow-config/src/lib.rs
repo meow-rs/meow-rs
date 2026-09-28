@@ -2736,6 +2736,11 @@ async fn ensure_geodata(
     scan_lines: &[String],
     prefetch: Option<&PrefetchProxies>,
 ) {
+    if is_offline_validate() {
+        // Validate local databases when present; missing databases use empty
+        // indexes for structural checks and are fetched only at real startup.
+        return;
+    }
     let downloads = missing_geodata_downloads(raw, geo, scan_lines);
     if downloads.is_empty() {
         return;
@@ -2805,6 +2810,9 @@ fn build_parser_context_at(
 
     let geoip_trigger = lines.iter().find(|l| line_references_geoip(l));
     let geoip = match geoip_trigger {
+        Some(_) if is_offline_validate() && !geoip_path.exists() => {
+            Some(Arc::new(meow_rules::country_index::CountryIndex::default()))
+        }
         Some(trigger) => {
             let reader = load_mmdb_mmap(geoip_path, "GeoIP", trigger)?;
             let allowed = collect_geoip_countries(&lines);
@@ -2819,6 +2827,9 @@ fn build_parser_context_at(
 
     let asn_trigger = lines.iter().find(|l| line_references_asn(l));
     let asn = match asn_trigger {
+        Some(_) if is_offline_validate() && !asn_path.exists() => {
+            Some(Arc::new(meow_rules::asn_index::AsnIndex::default()))
+        }
         Some(trigger) => {
             let reader = load_mmdb_mmap(asn_path, "GeoLite2-ASN", trigger)?;
             let allowed = collect_asn_numbers(&lines);

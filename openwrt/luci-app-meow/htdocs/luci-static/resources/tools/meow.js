@@ -1,11 +1,12 @@
 'use strict';
 'require baseclass';
 'require rpc';
+'require fs';
 'require uci';
 
 // Shared helpers for the meow LuCI views. Runtime data comes straight from
-// the meow REST API (CORS-enabled), addressed via the UCI `panel_port` and
-// `secret` options that the init script passes to meow on the command line.
+// the meow REST API through authenticated LuCI RPC. The standalone panel
+// uses the HTTP endpoint configured by the UCI panel_port and secret options.
 
 var callServiceList = rpc.declare({
 	object: 'service',
@@ -17,7 +18,7 @@ var callServiceList = rpc.declare({
 return baseclass.extend({
 	apiBase: function() {
 		var port = uci.get('meow', 'main', 'panel_port') || '9090';
-		return window.location.protocol + '//' + window.location.hostname +
+		return 'http://' + window.location.hostname +
 			':' + port;
 	},
 
@@ -34,21 +35,14 @@ return baseclass.extend({
 	},
 
 	api: function(method, path, body) {
-		var headers = { 'Content-Type': 'application/json' };
-		var secret = this.secret();
-		if (secret)
-			headers['Authorization'] = 'Bearer ' + secret;
-
-		return fetch(this.apiBase() + path, {
-			method: method,
-			headers: headers,
-			body: body != null ? JSON.stringify(body) : null
-		}).then(function(res) {
-			if (!res.ok)
-				return res.text().then(function(t) {
-					throw new Error(t || res.statusText);
-				});
-			return res.status === 204 ? null : res.json();
+		// LuCI RPC stays on the page's authenticated origin, including HTTPS.
+		// The helper connects to loopback and reads the API secret from UCI.
+		var args = [method, path];
+		if (body != null) args.push(JSON.stringify(body));
+		return fs.exec('/usr/libexec/meow-api', args).then(function(res) {
+			if (res.code !== 0)
+				throw new Error(res.stderr || _('Unable to reach meow API'));
+			return (res.stdout || '').trim() ? JSON.parse(res.stdout) : null;
 		});
 	},
 

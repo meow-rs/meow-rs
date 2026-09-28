@@ -76,8 +76,8 @@ crashes.
 
 ## LuCI app
 
-`luci-app-meow` adds **Services → meow**. Runtime data comes straight from the
-meow REST API, and proxy management is the built-in web panel, so LuCI does
+`luci-app-meow` adds **Services → meow**. Runtime data comes from the
+meow REST API through authenticated LuCI RPC (including on HTTPS pages), and proxy management is the built-in web panel, so LuCI does
 not reimplement a dashboard:
 
 - **Overview**: service state, REST API reachability and version,
@@ -88,7 +88,11 @@ not reimplement a dashboard:
   rules. The API secret is passed in the URL fragment (`#token=`), so the
   panel works without typing it again.
 - **Configuration**: raw YAML editor. Edits are validated with `meow -t`
-  before they replace the file.
+  before they replace the file. Saving explicitly restarts a running service;
+  a stopped service stays stopped. Restart failures are reported separately.
+  Validation uses cached rule providers and local geodata without downloading;
+  missing databases are deferred to normal startup, so first-time setups can
+  still validate. Existing local databases are checked normally.
 - **Clients**: ARP-based client steering — pick which LAN devices are routed
   through the side router (see below).
 - **Settings**: service options (enable, config path, working directory,
@@ -99,8 +103,9 @@ not reimplement a dashboard:
 meow as `--ext-ctl 0.0.0.0:<panel_port>` and `--secret <secret>`, overriding
 `external-controller` / `secret:` in the YAML. OpenWrt's default firewall
 blocks WAN-side access; set a secret if untrusted hosts share your LAN. If
-LuCI is served over HTTPS, the browser blocks the plain-HTTP panel as mixed
-content. Open it in a new tab instead.
+LuCI is served over HTTPS, the Panel view offers a new-tab link instead of
+embedding mixed content. Overview API requests stay on LuCI's authenticated
+origin; the packaged curl helper contacts only the router's loopback API.
 
 ## Transparent proxy (gateway / side router)
 

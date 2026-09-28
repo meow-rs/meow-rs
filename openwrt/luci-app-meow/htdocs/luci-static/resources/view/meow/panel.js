@@ -24,7 +24,9 @@ return view.extend({
 					_('Open in a new tab')),
 				' — ', plain
 			]),
-			E('iframe', {
+			window.location.protocol === 'https:'
+				? E('p', {}, _('Open the panel in a new tab. The standalone panel uses HTTP and cannot be embedded in an HTTPS page.'))
+				: E('iframe', {
 				'src': url,
 				'style': 'width: 100%; min-height: 75vh; border: none;' +
 					' border-radius: 3px; background: #0f1923;'

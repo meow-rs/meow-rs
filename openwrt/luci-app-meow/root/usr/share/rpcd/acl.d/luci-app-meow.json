@@ -10,7 +10,10 @@
 				"/etc/meow/*": [ "read" ],
 				"/sbin/logread -e meow": [ "exec" ],
 				"/usr/share/meow/gateway.sh status": [ "exec" ],
-				"/usr/share/meow/arp-hijack.sh clients": [ "exec" ]
+				"/usr/share/meow/arp-hijack.sh clients": [ "exec" ],
+				"/usr/libexec/meow-api GET /version": [ "exec" ],
+				"/usr/libexec/meow-api GET /configs": [ "exec" ],
+				"/usr/libexec/meow-api GET /connections": [ "exec" ]
 			}
 		},
 		"write": {
@@ -22,7 +25,8 @@
 				"/usr/bin/meow -d * -f /tmp/meow-luci-settings-*.yaml -t": [ "exec" ],
 				"/usr/bin/meow -d * -f /tmp/meow-luci-check.yaml -t": [ "exec" ],
 				"/etc/init.d/meow restart": [ "exec" ],
-				"/etc/init.d/meow-arp restart": [ "exec" ]
+				"/etc/init.d/meow-arp restart": [ "exec" ],
+				"/usr/libexec/meow-api PATCH /configs *": [ "exec" ]
 			}
 		}
 	}

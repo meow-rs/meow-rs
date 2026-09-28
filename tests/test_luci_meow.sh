@@ -82,6 +82,7 @@ done
 # Map a runtime path the ACL references -> the package source that installs it.
 # Indexed pairs also work with macOS's Bash 3.2.
 SHIP=(
+    /usr/libexec/meow-api "$APP/root/usr/libexec/meow-api"
     /usr/share/meow/gateway.sh "$FILES/gateway.sh"
     /usr/share/meow/arp-hijack.sh "$FILES/arp-hijack.sh"
     /etc/init.d/meow "$FILES/meow.init"
@@ -106,7 +107,7 @@ for s in gateway.sh arp-hijack.sh meow-arp.init; do
 done
 
 # --- 8. Configuration editor request and failure handling ---
-if node --test "$SCRIPT_DIR/luci_config_test.cjs" "$SCRIPT_DIR/luci_settings_test.cjs"; then
+if node --test "$SCRIPT_DIR/luci_config_test.cjs" "$SCRIPT_DIR/luci_settings_test.cjs" "$SCRIPT_DIR/luci_runtime_test.cjs"; then
     pass "configuration editor regression tests"
 else
     fail "configuration editor regression tests"

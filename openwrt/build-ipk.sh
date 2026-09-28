@@ -154,10 +154,12 @@ build_luci() {
     find "$staging/data" -type d -exec chmod 755 {} +
     find "$staging/data" -type f -exec chmod 644 {} +
 
+    chmod 755 "$staging/data/usr/libexec/meow-api"
+
     cat > "$staging/control/control" <<EOF
 Package: luci-app-meow
 Version: ${version}
-Depends: libc, luci-base, meow
+Depends: libc, luci-base, meow, curl
 Section: luci
 Architecture: all
 Installed-Size: $(installed_size "$staging/data")

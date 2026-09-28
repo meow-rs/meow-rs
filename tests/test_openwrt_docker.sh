@@ -303,6 +303,18 @@ check "LuCI rpcd loads meow-arp grant"   "meow-arp restart"      bash -c "docker
 check "LuCI rpcd loads config grant"     "/etc/meow"             bash -c "docker exec $ROUTER sh -c '$LOGIN'"
 check "LuCI menu registers Clients view" "meow/clients"          bash -c "docker exec $ROUTER grep -o meow/clients /usr/share/luci/menu.d/luci-app-meow.json"
 
+# Authenticated LuCI API bridge works without cross-origin browser HTTP.
+check "LuCI API bridge installed executable" "EXECUTABLE" rexec 'test -x /usr/libexec/meow-api && echo EXECUTABLE'
+check "LuCI API bridge GET" "version" rexec '/usr/libexec/meow-api GET /version'
+check "LuCI RPC grants API bridge" "/usr/libexec/meow-api GET /version" bash -c "docker exec $ROUTER sh -c '$LOGIN'"
+check "LuCI bridge rejects arbitrary destinations" "REJECTED" rexec 'if /usr/libexec/meow-api GET http://example.com >/dev/null 2>&1; then exit 1; else echo REJECTED; fi'
+rexec "/usr/libexec/meow-api PATCH /configs '{\"mode\":\"direct\"}'"
+check "LuCI API bridge changes mode" '"mode":"direct"' rexec '/usr/libexec/meow-api GET /configs'
+rexec "/usr/libexec/meow-api PATCH /configs '{\"mode\":\"rule\"}'"
+rexec 'uci set meow.main.secret=container-test-secret; uci commit meow; /etc/init.d/meow restart'
+check "LuCI API bridge uses configured secret" "version" rexec '/usr/libexec/meow-api GET /version'
+rexec 'uci set meow.main.secret=""; uci commit meow; /etc/init.d/meow restart'
+
 # Preserve the old packaging suite's lifecycle coverage and prove restart.
 rexec '/etc/init.d/meow stop'
 for _ in $(seq 1 20); do

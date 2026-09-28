@@ -5,10 +5,11 @@
 'require ui';
 'require uci';
 'require tools.meow_settings as settings';
+'require tools.meow as meow';
 
 // Raw editor for the meow YAML configuration. Edits are validated with
-// `meow -t` against a scratch copy before they replace the real file; procd
-// restarts meow when the file changes. Changes made at runtime through the
+// `meow -t` against a scratch copy before they replace the real file. A running
+// service is explicitly restarted after saving. Runtime changes through the
 // panel are written back to this file by its "Save Config" button.
 
 var SCRATCH = '/tmp/meow-luci-check.yaml';
@@ -88,8 +89,22 @@ return view.extend({
 			}
 			return writeConfig(path, content).then(function() {
 				document.getElementById('meow-yaml').value = content;
-				ui.addTimeLimitedNotification(null,
-					E('p', _('Configuration saved; meow restarts if it is running.')), 5000, 'info');
+				return meow.serviceRunning().then(function(running) {
+					if (!running) return false;
+					return fs.exec('/etc/init.d/meow', ['restart']).then(function(res) {
+						if (res.code !== 0) throw new Error(res.stderr || _('Service restart failed'));
+						return meow.serviceRunning().then(function(active) {
+							if (!active) throw new Error(_('Service did not start'));
+							return true;
+						});
+					});
+				}).then(function(restarted) {
+					ui.addTimeLimitedNotification(null, E('p', restarted
+						? _('Configuration saved and service restarted.')
+						: _('Configuration saved; service remains stopped.')), 5000, 'info');
+				}).catch(function(error) {
+					ui.addNotification(null, E('p', _('Configuration saved, but restart failed: %s').format(error.message)), 'error');
+				});
 			});
 		}).catch(function(e) {
 			ui.addNotification(null, E('p', _('Unable to save: %s').format(e.message)));

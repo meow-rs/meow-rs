@@ -14,6 +14,7 @@ function setup(options = {}) {
   const content = options.content ?? 'rules:\r\n  - MATCH,🎯Direct';
   const context = vm.createContext({
     Blob, FormData,
+    meow: { serviceRunning: async () => !!options.running },
     settings: { prepare: value => {
       if (options.transformError) throw new Error(options.transformError);
       return options.prepare ? options.prepare(value) : value;
@@ -38,6 +39,11 @@ function setup(options = {}) {
       },
       write: async () => { throw new Error('XHR request aborted by browser'); },
       exec: async (command, args) => {
+        if (command === '/etc/init.d/meow') {
+          assert.deepEqual(Array.from(args), ['restart']);
+          calls.push('restart');
+          return options.restartResult ?? { code: 0 };
+        }
         assert.equal(command, '/usr/bin/meow');
         assert.deepEqual(Array.from(args), ['-d', '/etc/meow', '-f', scratch, '-t']);
         calls.push('validate');
@@ -162,4 +168,25 @@ test('YAML synchronization errors prevent uploads and are reported', async () =>
   await state.view.handleSave(null, path);
   assert.equal(state.uploads.length, 0);
   assert.match(messages(state), /Conflicting listener/);
+});
+
+test('saving reloads a running service after writing the validated YAML', async () => {
+  const state = setup({ running: true });
+  await state.view.handleSave(null, path);
+  assert.deepEqual(state.calls, [scratch, 'validate', path, 'restart']);
+  assert.match(messages(state), /service restarted/);
+});
+
+test('saving does not start a stopped service', async () => {
+  const state = setup();
+  await state.view.handleSave(null, path);
+  assert.ok(!state.calls.includes('restart'));
+  assert.match(messages(state), /remains stopped/);
+});
+
+test('restart failure is distinguished from a successful disk save', async () => {
+  const state = setup({ running: true, restartResult: { code: 1, stderr: 'invalid config' } });
+  await state.view.handleSave(null, path);
+  assert.match(messages(state), /saved, but restart failed/);
+  assert.doesNotMatch(messages(state), /service restarted/);
 });
