@@ -18,6 +18,8 @@
 			"file": {
 				"/etc/meow/*": [ "write" ],
 				"/tmp/meow-luci-check.yaml": [ "write" ],
+				"/tmp/meow-luci-settings-*.yaml": [ "write" ],
+				"/usr/bin/meow -d * -f /tmp/meow-luci-settings-*.yaml -t": [ "exec" ],
 				"/usr/bin/meow -d * -f /tmp/meow-luci-check.yaml -t": [ "exec" ],
 				"/etc/init.d/meow restart": [ "exec" ],
 				"/etc/init.d/meow-arp restart": [ "exec" ]

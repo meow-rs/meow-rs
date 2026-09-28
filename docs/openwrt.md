@@ -108,21 +108,55 @@ Enable **Settings → Transparent proxy** (or `uci set meow.tproxy.enabled=1`).
 `/usr/share/meow/gateway.sh` then loads an nftables table
 `inet meow_gateway` for traffic arriving on the chosen LAN interface:
 
-- **`mode tproxy`** (default): kernel TPROXY for **TCP and UDP**. A
-  mangle-prerouting `tproxy to :<tproxy_port>` rule marks packets `0x2333`,
-  and a policy route (`ip rule fwmark 0x2333 lookup 233`, `local default dev
-  lo table 233`) delivers them to meow's transparent listener.
-- **`mode redirect`**: nat `REDIRECT`, TCP only.
+- **`mode tproxy`** (default): nat `REDIRECT` for **TCP** plus kernel TPROXY
+  for **UDP**. TCP is redirected (not TPROXY'd) because meow's TCP listener
+  recovers the original destination via `SO_ORIGINAL_DST`, which only the
+  conntrack DNAT that `REDIRECT` creates populates; a TPROXY'd TCP flow leaves
+  no conntrack entry, so its destination resolves to the listener's own
+  address and meow dials itself in a loop. UDP has no `REDIRECT` equivalent
+  and a real `IP_TRANSPARENT` listener, so a mangle-prerouting `tproxy to
+  :<tproxy_port>` rule marks datagrams `0x2333` and a policy route (`ip rule
+  fwmark 0x2333 lookup 233`, `local default dev lo table 233`) delivers them.
+- **`mode redirect`**: nat `REDIRECT`, TCP only (no UDP).
+- **Loop avoidance**: both chains `return` early on meow's own outbound, which
+  carries the `routing-mark` (`9527` = `0x2537`) as an SO_MARK, so proxied
+  traffic is never re-captured. The firewall mark (`0x2333`) and `routing-mark`
+  are deliberately different; keep `routing-mark` in the YAML matching the
+  `ROUTING_MARK` in `gateway.sh`.
 - **DNS hijack**: LAN DNS (port 53, any resolver) is redirected to meow's
   resolver (`dns_port`, default 1053), which is needed for fake-ip.
 - Private, reserved, multicast and router-local destinations bypass the
   proxy. Add more with `list bypass`.
 
-The shipped `config.yaml` already declares what this needs: a
-`type: tproxy` listener on `0.0.0.0:7893`, `dns.listen: 0.0.0.0:1053` with
-fake-ip, and `routing-mark: 9527`. Keep `routing-mark`: meow also redirects
-the router's own outbound TCP into the listener, and only marked (DIRECT)
-sockets are exempt. Without it, DIRECT connections loop.
+Saving **Settings** synchronizes the selected local YAML before saving UCI:
+
+- Panel port and API secret are written to `external-controller` and `secret`
+  (clearing the secret clears it in YAML too).
+- Enabling transparent proxy creates or updates the `tproxy-lan` listener with
+  the selected port, `firewall: false`, and `udp: true` only in TPROXY mode.
+  It replaces the router-local `tproxy-port` shorthand and sets
+  `routing-mark: 9527` to match the gateway firewall bypass mark.
+- DNS hijacking enables the resolver and sets `dns.listen` to
+  `0.0.0.0:<DNS port>`. Loopback `proxy-server-nameserver` entries pointing
+  at the old DNS listener port are moved to the new port as well. Other
+  upstream DNS settings are retained.
+- Disabling transparent proxy removes only `tproxy-lan`; custom listeners,
+  proxies and rules remain intact. Disabling DNS hijacking stops the firewall
+  redirect but leaves the resolver configured for meow's own use.
+- IPv6 capture uses a dual-stack TCP listener in REDIRECT mode. IPv6 with
+  UDP TPROXY is rejected because that listener supports only IPv4.
+
+The candidate YAML is checked with `meow -t` before replacement. Validation
+and upload errors prevent the UCI save; a subsequent UCI save failure restores
+YAML. YAML is written on **Save**; **Save & Apply** also applies UCI and restarts
+the service. The Configuration tab reapplies these same settings when saving
+an imported subscription, so imports cannot remove the gateway listener.
+Comments, anchors and unrelated settings are retained by the YAML document
+editor. Avoid editing the same configuration in multiple browser sessions.
+
+Direct CLI changes to UCI still require matching YAML; this synchronization is
+performed by the LuCI views. The shipped default YAML already contains the
+matching gateway listener and DNS resolver.
 
 **Side-router setup:** give OpenWrt a static address on the existing LAN,
 with the main router as its gateway and DNS. Disable its DHCP server and RA,

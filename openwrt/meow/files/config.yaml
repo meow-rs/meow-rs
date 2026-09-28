@@ -18,20 +18,31 @@ ipv6: false
 external-controller: 0.0.0.0:9090
 secret: ""
 
-# DIRECT sockets carry this fwmark. Required with the tproxy listener below:
-# meow also redirects the router's own outbound TCP into it, and only
-# marked sockets are exempt — without it DIRECT connections loop forever.
+# SO_MARK for DIRECT sockets (loop avoidance on Linux).
 routing-mark: 9527
 
 # Transparent-proxy listener for forwarded LAN traffic (gateway / side-router
-# mode, enabled in LuCI or via `uci set meow.tproxy.enabled=1`). It accepts
-# kernel TPROXY (TCP + UDP) as well as REDIRECTed TCP. Must bind a
-# non-loopback address. The port must match `tproxy_port` in /etc/config/meow.
+# mode, enabled in LuCI or via `uci set meow.tproxy.enabled=1`). Must bind a
+# non-loopback IPv4 address; the port must match `tproxy_port` in
+# /etc/config/meow.
+#
+# `firewall: false` leaves all rule management to gateway.sh (this package's
+# nftables rules) — meow makes no nft calls itself. `udp: true` enables UDP
+# TPROXY, which requires `firewall: false`, an IPv4 listen, and the
+# deployer-owned fwmark + policy routing that gateway.sh's `tproxy` mode sets
+# up. In `redirect` mode gateway.sh uses nat REDIRECT and only TCP is proxied;
+# the same listener accepts it (UDP is simply never delivered).
 listeners:
   - name: tproxy-lan
     type: tproxy
     listen: 0.0.0.0
     port: 7893
+    udp: true
+    firewall: false
+    # A gateway serves many concurrent flows from every LAN client; the 256
+    # default saturates under a few busy devices and stalls new connections.
+    # 0 = unlimited.
+    max-connections: 4096
 
 # Recover hostnames for connections made to raw IPs.
 sniffer:

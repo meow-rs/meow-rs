@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Static validation of the luci-app-meow package.
+# Static and configuration-editor validation of the luci-app-meow package.
 #
 # No device or container needed: parses every client-side view (LuCI wraps each
 # file in a function at load time, so top-level `return` is valid — we validate
@@ -80,20 +80,23 @@ done
 
 # --- 6. ACL exec/file grants for the package's own scripts point at shipped files ---
 # Map a runtime path the ACL references -> the package source that installs it.
-declare -A SHIP=(
-    ["/usr/share/meow/gateway.sh"]="$FILES/gateway.sh"
-    ["/usr/share/meow/arp-hijack.sh"]="$FILES/arp-hijack.sh"
-    ["/etc/init.d/meow"]="$FILES/meow.init"
-    ["/etc/init.d/meow-arp"]="$FILES/meow-arp.init"
+# Indexed pairs also work with macOS's Bash 3.2.
+SHIP=(
+    /usr/share/meow/gateway.sh "$FILES/gateway.sh"
+    /usr/share/meow/arp-hijack.sh "$FILES/arp-hijack.sh"
+    /etc/init.d/meow "$FILES/meow.init"
+    /etc/init.d/meow-arp "$FILES/meow-arp.init"
 )
 # Pull the first token (the binary/script path) out of every exec-grant key.
 acl_exec_paths="$(jq -r '
     [ .[].read.file, .[].write.file ] | map(select(. != null)) | add // {}
     | to_entries[] | select(.value | index("exec")) | .key
 ' "$ACL" 2>/dev/null | awk '{print $1}' | sort -u)"
-for rt in "${!SHIP[@]}"; do
+for ((i = 0; i < ${#SHIP[@]}; i += 2)); do
+    rt="${SHIP[$i]}"
+    src="${SHIP[$((i + 1))]}"
     if printf '%s\n' $acl_exec_paths | grep -qx "$rt"; then
-        [ -f "${SHIP[$rt]}" ] && pass "ACL exec '$rt' is shipped" || fail "ACL exec '$rt' is shipped" "source ${SHIP[$rt]} missing"
+        [ -f "$src" ] && pass "ACL exec '$rt' is shipped" || fail "ACL exec '$rt' is shipped" "source $src missing"
     fi
 done
 
@@ -101,6 +104,13 @@ done
 for s in gateway.sh arp-hijack.sh meow-arp.init; do
     grep -q "$s" "$BUILD" && pass "build-ipk installs $s" || fail "build-ipk installs $s"
 done
+
+# --- 8. Configuration editor request and failure handling ---
+if node --test "$SCRIPT_DIR/luci_config_test.cjs" "$SCRIPT_DIR/luci_settings_test.cjs"; then
+    pass "configuration editor regression tests"
+else
+    fail "configuration editor regression tests"
+fi
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

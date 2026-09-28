@@ -1,0 +1,6 @@
+{
+  "name": "luci-app-meow-build",
+  "private": true,
+  "scripts": { "build": "node vendor/build.cjs" },
+  "devDependencies": { "esbuild": "0.28.2", "yaml": "2.9.1" }
+}

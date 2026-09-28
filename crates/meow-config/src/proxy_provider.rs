@@ -948,7 +948,14 @@ pub async fn load_proxy_providers(
         match ProxyProvider::new(name, raw, cache_dir, ipv6, strict, dialer_registry.clone()) {
             Ok(provider) => {
                 let provider = Arc::new(provider);
-                if strict {
+                if crate::is_offline_validate() {
+                    // Offline validation (`meow -t`): the provider parsed and
+                    // its path/filters are structurally valid — that is what a
+                    // config test checks. Skip the network fetch so a slow or
+                    // unreachable subscription can't hang validation (the
+                    // provider registers empty, exactly as a transient fetch
+                    // failure would leave it).
+                } else if strict {
                     // Strict gates the *parse*, not the fetch: a transient
                     // download failure is not a config defect, so a provider
                     // that can't be fetched still starts empty until a

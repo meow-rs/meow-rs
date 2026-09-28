@@ -3,9 +3,9 @@ name: Test
 on:
   push:
     branches: [main]
-    paths: ["crates/**", "tests/**", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".github/workflows/**"]
+    paths: ["crates/**", "tests/**", "openwrt/**", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".github/workflows/**"]
   pull_request:
-    paths: ["crates/**", "tests/**", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".github/workflows/**"]
+    paths: ["crates/**", "tests/**", "openwrt/**", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".github/workflows/**"]
 
 # One active run per ref: a superseded push to the same PR/branch cancels the
 # in-flight run instead of racing it to completion. `push` is limited to
@@ -23,6 +23,23 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  luci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: openwrt/luci-app-meow/package-lock.json
+      - name: Check vendored YAML bundle is reproducible
+        run: |
+          npm --prefix openwrt/luci-app-meow ci
+          npm --prefix openwrt/luci-app-meow run build
+          git diff --exit-code -- openwrt/luci-app-meow/htdocs/luci-static/resources/tools/meow_yaml.js openwrt/luci-app-meow/htdocs/luci-static/resources/tools/meow_yaml.LICENSE
+      - name: LuCI syntax, ACL and save regression tests
+        run: bash tests/test_luci_meow.sh
+
   dashboard:
     runs-on: ubuntu-latest
     defaults:

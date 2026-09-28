@@ -467,6 +467,28 @@ pub struct ApiConfig {
     pub external_ui_url: Option<String>,
 }
 
+/// When set, config loading validates structure only and performs no remote
+/// proxy-provider / subscription fetch. `meow -t` sets it so a config that
+/// references a slow or unreachable subscription still validates promptly
+/// instead of blocking on the network — which is what a config *test* should
+/// do, and what LuCI's pre-save `meow -t` validation needs (a hung fetch
+/// exceeds rpcd's exec timeout and surfaces as "XHR request aborted by
+/// browser" on Save). Process-global because `-t` is a one-shot; the flag is
+/// never set on the live-serving path.
+static OFFLINE_VALIDATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Enable offline (no remote fetch) config validation for this process. Call
+/// before [`load_config`] in the `-t` path.
+pub fn set_offline_validate(on: bool) {
+    OFFLINE_VALIDATE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// True when config loading must skip remote proxy-provider fetches (see
+/// [`set_offline_validate`]).
+pub fn is_offline_validate() -> bool {
+    OFFLINE_VALIDATE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub async fn load_config(path: &str) -> Result<Config, anyhow::Error> {
     let bytes = tokio::fs::read(path)
         .await

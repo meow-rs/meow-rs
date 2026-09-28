@@ -5,9 +5,10 @@
 # hooks prerouting on the LAN device. See docs/tproxy-gateway.md.
 #
 # Modes (`option mode`):
-#   tproxy    kernel TPROXY for TCP and UDP (default): a mangle-prerouting
-#             `tproxy` rule hands packets to meow's transparent listener and
-#             marks them; a policy route delivers marked packets locally
+#   tproxy    REDIRECT for TCP + kernel TPROXY for UDP (default). meow's TCP
+#             listener recovers the original destination via SO_ORIGINAL_DST,
+#             which only nat REDIRECT populates, so TCP is never sent through
+#             kernel TPROXY; UDP has a real IP_TRANSPARENT listener.
 #   redirect  nat REDIRECT, TCP only
 #
 # Usage: gateway.sh up|down|wait|status
@@ -18,9 +19,16 @@
 
 TABLE="inet meow_gateway"
 RULES=/var/run/meow/gateway.nft
-# Policy routing for TPROXY-marked packets. Distinct from meow's
-# `routing-mark` (9527 = 0x2537), which exempts its own DIRECT sockets.
+# Two marks, deliberately different (see docs/tproxy-gateway.md):
+#   FWMARK       tags the UDP datagrams the mangle chain hands to the TPROXY
+#                listener; a policy route delivers those marked packets
+#                locally. TCP never uses it.
+#   ROUTING_MARK meow's own outbound sockets carry this (SO_MARK, from the
+#                YAML `routing-mark`), so both capture chains RETURN on it and
+#                meow's own traffic is never re-proxied into a loop. This MUST
+#                equal `routing-mark` in the meow YAML config (default 9527).
 FWMARK=0x2333
+ROUTING_MARK=0x2537
 ROUTE_TABLE=233
 
 load_config() {
@@ -52,6 +60,12 @@ gen_rules() {
 		esac
 	done
 
+	# TCP goes through nat REDIRECT in BOTH modes (dstnat chain): meow's TCP
+	# listener recovers the original destination with SO_ORIGINAL_DST, which
+	# needs the conntrack DNAT that REDIRECT creates. Kernel TPROXY leaves no
+	# conntrack entry, so a TPROXY'd TCP flow resolves to the listener's own
+	# address and meow dials itself — a saturating loop. UDP has no REDIRECT
+	# equivalent and a real IP_TRANSPARENT listener, so it uses TPROXY.
 	cat <<-NFT
 	table inet meow_gateway {
 		set reserved4 {
@@ -70,42 +84,41 @@ gen_rules() {
 		chain dstnat {
 			type nat hook prerouting priority dstnat - 5; policy accept;
 			iifname != "$device" return
+			meta mark $ROUTING_MARK return
 	NFT
 	[ "$dns_hijack" -eq 1 ] &&
 		echo "		meta nfproto ipv4 meta l4proto { tcp, udp } th dport 53 redirect to :$dns_port"
-
-	if [ "$mode" = redirect ]; then
-		[ "$ipv6" -eq 1 ] || echo "		meta nfproto ipv6 return"
-		cat <<-NFT
-			fib daddr type local return
-			ip daddr @reserved4 return
-			ip6 daddr @reserved6 return
-			meta l4proto tcp redirect to :$tproxy_port
-		}
-	}
-		NFT
-		return
-	fi
-
-	cat <<-NFT
-		}
-
-		chain mangle_tproxy {
-			type filter hook prerouting priority mangle; policy accept;
-			iifname != "$device" return
-	NFT
-	# DNS is hijacked by the dstnat chain above; keep it out of TPROXY.
-	[ "$dns_hijack" -eq 1 ] && echo "		meta l4proto { tcp, udp } th dport 53 return"
 	[ "$ipv6" -eq 1 ] || echo "		meta nfproto ipv6 return"
 	cat <<-NFT
 			fib daddr type local return
 			ip daddr @reserved4 return
 			ip6 daddr @reserved6 return
-			meta l4proto tcp socket transparent 1 meta mark set $FWMARK accept
-			meta l4proto { tcp, udp } tproxy to :$tproxy_port meta mark set $FWMARK accept
+			meta l4proto tcp redirect to :$tproxy_port
 		}
-	}
 	NFT
+
+	# redirect mode stops at TCP; tproxy mode adds the UDP TPROXY chain.
+	if [ "$mode" != redirect ]; then
+		cat <<-NFT
+
+		chain mangle_tproxy {
+			type filter hook prerouting priority mangle; policy accept;
+			iifname != "$device" return
+			meta mark $ROUTING_MARK return
+		NFT
+		[ "$dns_hijack" -eq 1 ] && echo "		meta l4proto udp th dport 53 return"
+		[ "$ipv6" -eq 1 ] || echo "		meta nfproto ipv6 return"
+		cat <<-NFT
+			fib daddr type local return
+			ip daddr @reserved4 return
+			ip6 daddr @reserved6 return
+			meta l4proto udp socket transparent 1 meta mark set $FWMARK accept
+			meta l4proto udp tproxy to :$tproxy_port meta mark set $FWMARK accept
+		}
+		NFT
+	fi
+
+	echo "}"
 }
 
 route_up() {
@@ -145,7 +158,7 @@ case "$1" in
 			logger -t meow "gateway: redirect $device tcp -> :$tproxy_port"
 		else
 			route_up
-			logger -t meow "gateway: tproxy $device tcp+udp -> :$tproxy_port"
+			logger -t meow "gateway: tproxy $device tcp(redirect)+udp -> :$tproxy_port"
 		fi
 		;;
 	down)

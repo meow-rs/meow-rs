@@ -367,6 +367,10 @@ fn run_application_inner(
 
     if args.test {
         // Validate config only — spin up a minimal runtime for the async load.
+        // Offline: a config *test* checks structure, so it must not block on a
+        // slow or unreachable subscription fetch (which also lets LuCI's
+        // pre-save `meow -t` finish inside rpcd's exec timeout).
+        meow_config::set_offline_validate(true);
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
