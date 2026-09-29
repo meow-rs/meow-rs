@@ -27,7 +27,7 @@
 # on first proxy invocation (1.28.0 is the one release where that
 # auto-install was removed — avoid it / `RUSTUP_AUTO_INSTALL=0`), while a
 # non-rustup cargo ignores the file entirely and falls back to the
-# workspace `rust-version` floor. The QEMU tproxy e2e builds inside a
+# workspace `rust-version` floor. The Docker tproxy e2e builds inside a
 # `rust:1-bookworm` container (the file is .dockerignore'd), so that leg
 # floats on stable deliberately.
 [toolchain]

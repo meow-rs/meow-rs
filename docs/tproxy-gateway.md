@@ -23,10 +23,16 @@ meow that way (`up`/`down`/`status`) and confirm the auto-created firewall. Read
 
 Understand this before configuring — it explains every step below.
 
-- **It is `REDIRECT`-based, not `IP_TRANSPARENT`/TPROXY** (despite the name).
-  meow recovers the original destination of a redirected connection with
-  `getsockopt(SO_ORIGINAL_DST)`. This works for both locally-generated and
-  forwarded traffic, but only for **TCP**.
+- **It accepts both `REDIRECT` and kernel TPROXY.** For redirected TCP, meow
+  recovers the original destination with `getsockopt(SO_ORIGINAL_DST)`. On
+  Linux only the UDP socket is `IP_TRANSPARENT` (when meow has
+  `CAP_NET_ADMIN`). TCP uses REDIRECT; an nftables `tproxy` rule can hand
+  the transparent UDP socket forwarded **UDP** datagrams. The
+  UDP original destination comes from `IP_RECVORIGDSTADDR`, and replies are
+  sent from that address. The recipe below uses `REDIRECT`. The OpenWrt
+  package's `gateway.sh` ([openwrt.md](openwrt.md)) implements the TPROXY
+  variant: a mangle-prerouting `tproxy` rule plus an fwmark policy route to
+  `local default dev lo`.
 - **The built-in firewall is `output`-chain only.** When you set a tproxy
   listener with managed firewall (the default), meow auto-creates an nftables
   table (`inet meow_tproxy_<pid>_<seq>` — unique per listener instance, swept
@@ -97,7 +103,7 @@ table carried, or the loop-prevention story breaks:
    upstream, or meow's connections to your proxies re-enter the listener.
 4. **The catch-all redirect** — `tcp dport 1-65535 redirect to :<port>` last.
 
-`tests/tproxy-qemu/meow-tproxy-ext.yaml` + `guest-init.sh` phase 2 contain a
+`tests/tproxy-docker/meow-tproxy-ext.yaml` + `guest-init.sh` phase 2 contain a
 complete reference table. You also own the boot-ordering/fail-open story:
 rules pointing at the listener port before meow binds will refuse or pass
 through depending on your ruleset. Use a fixed port — `port: 0` is only
@@ -362,7 +368,7 @@ table inet meow_gateway {
         iifname != "eth0" return
 
         # 1. DNS hijack: send all LAN DNS (v4) to meow's resolver.
-        meta nfproto ipv4 meta l4proto { tcp, udp } th dport 53 \
+        meta nfproto ipv4 meta l4proto udp th dport 53 \
             dnat ip to 192.168.1.1:1053
 
         # 2. Traffic addressed to the gateway itself (SSH, API, ...) -> leave.

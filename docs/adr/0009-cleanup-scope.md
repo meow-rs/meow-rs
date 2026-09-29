@@ -29,7 +29,7 @@ this ADR scoped to `M0`. Two facts surface up front:
 
 Holding the regression bar at every milestone boundary
 (`cargo fmt --all -- --check && cargo clippy --all-targets -- -D warnings &&
-cargo test --lib` + integration suites + tproxy QEMU script) is non-negotiable.
+cargo test --lib` + integration suites + tproxy Docker script) is non-negotiable.
 
 ## Decision
 
@@ -69,7 +69,7 @@ cargo test --lib` + integration suites + tproxy QEMU script) is non-negotiable.
   work (task #3). M0 edits stay within a single file's `Cargo.toml` or
   `.rs` body where possible.
 - **Behavioural changes.** No proxy/DNS/listener semantics may change in M0.
-  The QEMU tproxy script and the `trojan_integration` / `rules_test` /
+  The Docker tproxy script and the `trojan_integration` / `rules_test` /
   `shadowsocks_integration` test suites must all stay green at M0 close.
 
 ### Public-API stability stance

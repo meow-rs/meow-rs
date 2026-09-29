@@ -1,0 +1,24 @@
+#!/bin/sh
+# Small, allowlisted bridge from authenticated LuCI RPC to the local HTTP API.
+# Caller-controlled hosts, ports and arbitrary API paths are never accepted.
+set -eu
+case "$#:${1:-}:${2:-}" in
+    2:GET:/version|2:GET:/configs|2:GET:/connections) body='' ;;
+    3:PATCH:/configs)
+        mode=$(jsonfilter -s "$3" -e '@.mode')
+        case "$mode" in rule|global|direct) ;; *) echo 'Invalid mode' >&2; exit 1 ;; esac
+        body="{\"mode\":\"$mode\"}"
+        ;;
+    *) echo 'Unsupported API request' >&2; exit 1 ;;
+esac
+method=$1
+path=$2
+port=$(uci -q get meow.main.panel_port || echo 9090)
+case "$port" in ''|*[!0-9]*) echo 'Invalid API port' >&2; exit 1 ;; esac
+[ "$port" -ge 1 ] && [ "$port" -le 65535 ] || exit 1
+secret=$(uci -q get meow.main.secret || true)
+set -- --noproxy '*' --silent --show-error --fail --connect-timeout 2 --max-time 5 \
+    --request "$method" "http://127.0.0.1:$port$path"
+[ -z "$secret" ] || set -- "$@" --header "Authorization: Bearer $secret"
+[ -z "$body" ] || set -- "$@" --header 'Content-Type: application/json' --data-binary "$body"
+exec curl "$@"

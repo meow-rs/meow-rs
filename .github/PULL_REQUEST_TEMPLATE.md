@@ -31,6 +31,6 @@ Closes #
 - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
 - [ ] `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`
 - [ ] The full "Unit + integration tests (default features)" target list from `CONTRIBUTING.md` (not just `cargo test --lib`)
-- [ ] Protocol-specific suites for the areas touched (Shadowsocks, Hysteria2/Snell Docker, AnyTLS, transport feature-gated, tproxy QEMU), if applicable
+- [ ] Protocol-specific suites for the areas touched (Shadowsocks, Hysteria2/Snell Docker, AnyTLS, transport feature-gated, tproxy Docker), if applicable
 - [ ] New behaviour has a test that fails before this change and passes after it
 - [ ] `CHANGELOG.md` updated for user-visible changes

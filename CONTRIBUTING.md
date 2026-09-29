@@ -87,7 +87,7 @@ Notes:
 - `cargo test --lib` alone is **not** enough: it skips every `--test` target,
   so a broken integration test passes locally and lands `main` red.
 - Protocol-specific suites (Shadowsocks with `ssserver`, Hysteria2 and Snell
-  under Docker, AnyTLS, the transport feature-gated tests, and the tproxy QEMU
+  under Docker, AnyTLS, the transport feature-gated tests, and the tproxy Docker
   test) also run in CI. If your change touches one of those areas, run the
   matching suite locally as well; see the [Testing](README.md#testing) section
   of the README for the commands.

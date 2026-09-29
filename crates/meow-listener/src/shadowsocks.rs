@@ -21,7 +21,7 @@
 //! concrete stream type (`TcpStream` / `HttpObfsServer` / `TlsObfsServer`)
 //! rather than type-erased, keeping the relay hot path dispatch-free.
 
-use meow_common::{ConnType, Metadata, Network};
+use meow_common::{metadata_ip_literal, ConnType, Metadata, Network};
 use meow_transport::simple_obfs::server::{HttpObfsServer, TlsObfsServer};
 use meow_tunnel::{route_inbound_tcp, ResolvedTarget, Tunnel};
 use shadowsocks::config::{ServerConfig, ServerType};
@@ -771,6 +771,65 @@ async fn run_udp_relay<S>(
     }
 }
 
+/// Outcome of offering one datagram to the flow under a key.
+enum Deliver {
+    /// Queued, or deliberately dropped on a full queue (UDP semantics —
+    /// the client retries).
+    Done,
+    /// No live flow under the key — plain absent, or evicted here
+    /// (dead / session-rotated / closed): the caller recreates one and
+    /// re-copies the datagram, a one-off cost only a recreate pays.
+    Miss,
+}
+
+/// Offer `payload` to the live flow under `key`, evicting a dead or
+/// session-rotated one. Two reasons to evict and let the caller fall
+/// through to a fresh dial instead of reusing the entry:
+///   * a dead task means the conn can never answer (issue #514);
+///   * a changed client session ID on the same `(peer, target)` is a new
+///     relay session per SIP022 §3.2.4 — replies must echo the new ID,
+///     which only a freshly built flow can do.
+///
+/// Centralizes the hit-path so `handle_ss_udp_datagram` can run it for
+/// both the provisional and the post-pipeline key (issue #648).
+fn deliver_to_flow(
+    flows: &mut HashMap<(SocketAddr, FlowKey), UdpFlow>,
+    key: &(SocketAddr, FlowKey),
+    client_session_id: u64,
+    payload: &[u8],
+) -> Deliver {
+    let Some(flow) = flows.get(key) else {
+        return Deliver::Miss;
+    };
+    if flow.dead.load(std::sync::atomic::Ordering::Relaxed)
+        || flow.client_session_id != client_session_id
+    {
+        flows.remove(key);
+        return Deliver::Miss;
+    }
+    // `try_send` alone discriminates all three outcomes — no
+    // capacity pre-check: a closed channel with a *full* queue
+    // would read capacity 0 and drop without evicting, widening
+    // the dead-flow race window (#625 review).
+    match flow.tx.try_send(SmallVec::from_slice(payload)) {
+        Ok(()) => {
+            flow.last_activity_ms
+                .store(monotonic_ms() as Uint, std::sync::atomic::Ordering::Relaxed);
+            Deliver::Done
+        }
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            debug!("ss udp flow queue full: dropping datagram");
+            Deliver::Done
+        }
+        // The task exited between the dead check and the send:
+        // evict so the caller recreates the flow with this datagram.
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            flows.remove(key);
+            Deliver::Miss
+        }
+    }
+}
+
 /// Decrypt is already done by `ProxySocket`; here we run the AEAD-2022
 /// session bookkeeping + replay check, resolve the *flow* (not the target —
 /// that happens inside the flow task), and queue the payload onto the
@@ -873,6 +932,35 @@ where
         Address::SocketAddress(sa) => (SmolStr::default(), Some(sa.ip()), sa.port()),
     };
 
+    // Provisional flow key — identical to the post-pipeline key for
+    // every input that survives `pre_handle_metadata` unchanged: a
+    // socket-address target canonicalizes, a domain-typed IP literal
+    // folds in (`metadata_ip_literal`, the same fold the pipeline runs),
+    // else the already-lowercased host keys directly. A fake-IP input
+    // necessarily misses: stored keys are built post-rewrite, where
+    // `dst_ip` is cleared to `None` — `Addr(fake-ip)` can never exist in
+    // the table. Only a miss pays the probe (issue #648).
+    //
+    // The equivalence holds within one resolver generation: a live
+    // `Addr(ip)` flow whose `ip` only enters the fake-IP range after a
+    // config reload that swaps the pool keeps delivering (it was
+    // legitimately established) — the shape tproxy's dispatch has
+    // always had.
+    let provisional = (
+        peer,
+        match dst_ip
+            .or_else(|| metadata_ip_literal(&host))
+            .map(|ip| ip.to_canonical())
+        {
+            Some(ip) => FlowKey::Addr(SocketAddr::new(ip, dst_port)),
+            None => FlowKey::Host(host.clone(), dst_port),
+        },
+    );
+    match deliver_to_flow(&mut state.flows, &provisional, client_session_id, payload) {
+        Deliver::Done => return Ok(true),
+        Deliver::Miss => {}
+    }
+
     let mut metadata = Metadata {
         network: Network::Udp,
         conn_type: ConnType::Shadowsocks,
@@ -913,43 +1001,14 @@ where
         },
     );
 
-    // Fast path: existing flow. Two reasons to evict and fall through to a
-    // fresh dial instead of reusing it:
-    //   * a dead task means the conn can never answer (issue #514);
-    //   * a changed client session ID on the same `(peer, target)` is a new
-    //     relay session per SIP022 §3.2.4 — replies must echo the new ID,
-    //     which only a freshly built flow can do.
-    let mut first_payload: Option<SmallVec<[u8; 1500]>> = None;
-    if let Some(flow) = state.flows.get(&key) {
-        if flow.dead.load(std::sync::atomic::Ordering::Relaxed)
-            || flow.client_session_id != client_session_id
-        {
-            state.flows.remove(&key);
-        } else {
-            // `try_send` alone discriminates all three outcomes — no
-            // capacity pre-check: a closed channel with a *full* queue
-            // would read capacity 0 and drop without evicting, widening
-            // the dead-flow race window (#625 review).
-            match flow.tx.try_send(SmallVec::from_slice(payload)) {
-                Ok(()) => {
-                    flow.last_activity_ms
-                        .store(monotonic_ms() as Uint, std::sync::atomic::Ordering::Relaxed);
-                    return Ok(true);
-                }
-                // Queue full — drop the datagram (UDP semantics — the
-                // client retries).
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    debug!("ss udp flow queue full: dropping datagram");
-                    return Ok(true);
-                }
-                // The task exited between the dead check and the send:
-                // evict and start a fresh flow, reusing the datagram the
-                // dead channel handed back instead of re-copying it.
-                Err(mpsc::error::TrySendError::Closed(returned)) => {
-                    state.flows.remove(&key);
-                    first_payload = Some(returned);
-                }
-            }
+    // The post-pipeline key differs from the provisional one only when
+    // the probe rewrote a fake-IP destination — try the rewritten key
+    // once more before paying for a flow (a stale datagram to a still-
+    // allocated mapping rejoins the existing Host-keyed flow).
+    if key != provisional {
+        match deliver_to_flow(&mut state.flows, &key, client_session_id, payload) {
+            Deliver::Done => return Ok(true),
+            Deliver::Miss => {}
         }
     }
 
@@ -982,7 +1041,7 @@ where
     let reply_control = build_reply_control(control, server_session.as_deref());
 
     let (tx, rx) = mpsc::channel(UDP_FLOW_QUEUE);
-    tx.try_send(first_payload.unwrap_or_else(|| SmallVec::from_slice(payload)))
+    tx.try_send(SmallVec::from_slice(payload))
         .map_err(|_| "fresh flow queue rejected payload".to_string())?;
 
     let last_activity_ms = Arc::new(AtomicU::new(monotonic_ms() as Uint));

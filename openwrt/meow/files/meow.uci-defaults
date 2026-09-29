@@ -1,0 +1,30 @@
+#!/bin/sh
+# Add sections introduced after the first release to preserved configs.
+# Preserve existing credentials on upgrades; initialize an empty install.
+if [ -z "$(uci -q get meow.main.secret)" ]; then
+    secret=$(head -c 32 /dev/urandom | hexdump -v -e '1/1 "%02x"')
+    [ "${#secret}" -eq 64 ] || exit 1
+    uci set "meow.main.secret=$secret"
+fi
+if ! uci -q get meow.tproxy >/dev/null; then
+	uci -q batch <<-UCI
+		set meow.tproxy=transparent
+		set meow.tproxy.enabled='0'
+		set meow.tproxy.mode='tproxy'
+		set meow.tproxy.interface='lan'
+		set meow.tproxy.tproxy_port='7893'
+		set meow.tproxy.dns_hijack='1'
+		set meow.tproxy.dns_port='1053'
+		set meow.tproxy.ipv6='0'
+	UCI
+fi
+if ! uci -q get meow.arp >/dev/null; then
+	uci -q batch <<-UCI
+		set meow.arp=arp_hijack
+		set meow.arp.enabled='0'
+		set meow.arp.interface='lan'
+		set meow.arp.interval='2'
+	UCI
+fi
+uci -q commit meow
+exit 0

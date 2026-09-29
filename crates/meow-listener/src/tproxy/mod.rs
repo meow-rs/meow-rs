@@ -866,7 +866,7 @@ mod tests {
     /// client connects still reach the accept loop.
     ///
     /// Also pins the startup-log disclosure ("external firewall management")
-    /// that the QEMU harness greps for (`tests/tproxy-qemu/guest-init.sh`).
+    /// that the Docker harness greps for (`tests/tproxy-docker/guest-init.sh`).
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn run_on_external_firewall_accepts_without_setup() {
@@ -1026,7 +1026,7 @@ mod tests {
     /// Issue #564: `udp: true` is Linux-only — on any other platform the
     /// listener must fail at startup, never silently degrade to TCP-only.
     /// The positive path (transparent socket + flow dispatch) is exercised
-    /// by the QEMU suite, which requires a Linux guest.
+    /// by the Docker suite, which requires a Linux container.
     #[cfg(not(target_os = "linux"))]
     #[tokio::test]
     async fn run_on_udp_rejected_off_linux() {

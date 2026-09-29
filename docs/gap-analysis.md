@@ -104,7 +104,7 @@ Upstream lives in `listener/`. Rust listeners live in `crates/meow-listener/src/
 | HTTP          | Yes      | Yes  | OK |
 | SOCKS5        | Yes      | Yes  | OK |
 | Mixed         | Yes      | Yes  | OK (single port for HTTP+SOCKS) |
-| TProxy (Linux)| Yes      | Yes  | OK — nftables/pf tested in `tests/test_tproxy_qemu.sh` |
+| TProxy (Linux)| Yes      | Yes  | OK — nftables/pf tested in `tests/test_tproxy_docker.sh` |
 | Redir (Linux) | Yes      | No   | **Gap** — SO_ORIGINAL_DST based redirect |
 | Tunnel        | Yes      | No   | **Gap** — static port→target tunnels |
 | Shadowsocks (inbound) | Yes | No | Gap — SS server mode |

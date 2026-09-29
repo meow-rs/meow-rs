@@ -590,6 +590,14 @@ window.addEventListener('pageshow', () => connectTraffic());
 
 // ── Init ─────────────────────────────────────────────────────────
 
+// Accept the API secret from an embedding page (e.g. LuCI) via `#token=`.
+// The fragment is never sent to the server; strip it once stored.
+const hashToken = new URLSearchParams(location.hash.slice(1)).get('token');
+if (hashToken !== null) {
+  localStorage.setItem('meow-secret', hashToken);
+  history.replaceState(null, '', location.pathname + location.search);
+}
+
 // Restore API secret from localStorage
 const secretInput = document.getElementById('api-secret');
 secretInput.value = localStorage.getItem('meow-secret') || '';

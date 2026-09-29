@@ -74,12 +74,18 @@ build_meow() {
              "$staging/data/usr/bin" \
              "$staging/data/etc/init.d" \
              "$staging/data/etc/config" \
-             "$staging/data/etc/meow"
+             "$staging/data/etc/meow" \
+             "$staging/data/etc/uci-defaults" \
+             "$staging/data/usr/share/meow"
 
     install -m 755 "$binary" "$staging/data/usr/bin/meow"
     install -m 755 "$SCRIPT_DIR/meow/files/meow.init" "$staging/data/etc/init.d/meow"
     install -m 644 "$SCRIPT_DIR/meow/files/meow.config" "$staging/data/etc/config/meow"
     install -m 644 "$SCRIPT_DIR/meow/files/config.yaml" "$staging/data/etc/meow/config.yaml"
+    install -m 755 "$SCRIPT_DIR/meow/files/gateway.sh" "$staging/data/usr/share/meow/gateway.sh"
+    install -m 755 "$SCRIPT_DIR/meow/files/arp-hijack.sh" "$staging/data/usr/share/meow/arp-hijack.sh"
+    install -m 755 "$SCRIPT_DIR/meow/files/meow-arp.init" "$staging/data/etc/init.d/meow-arp"
+    install -m 755 "$SCRIPT_DIR/meow/files/meow.uci-defaults" "$staging/data/etc/uci-defaults/80_meow"
 
     cat > "$staging/control/control" <<EOF
 Package: meow
@@ -102,13 +108,19 @@ EOF
     cat > "$staging/control/postinst" <<'EOF'
 #!/bin/sh
 [ -n "${IPKG_INSTROOT}" ] && exit 0
+[ -f /etc/uci-defaults/80_meow ] && sh /etc/uci-defaults/80_meow && rm -f /etc/uci-defaults/80_meow
 /etc/init.d/meow enable || true
+# meow-arp self-gates on the (default-off) arp_hijack section, so enabling it
+# is safe: it steers nothing until clients are selected in LuCI.
+/etc/init.d/meow-arp enable || true
 exit 0
 EOF
 
     cat > "$staging/control/prerm" <<'EOF'
 #!/bin/sh
 [ -n "${IPKG_INSTROOT}" ] && exit 0
+/etc/init.d/meow-arp stop 2>/dev/null
+/etc/init.d/meow-arp disable 2>/dev/null
 /etc/init.d/meow stop 2>/dev/null
 /etc/init.d/meow disable || true
 exit 0
@@ -142,16 +154,21 @@ build_luci() {
     find "$staging/data" -type d -exec chmod 755 {} +
     find "$staging/data" -type f -exec chmod 644 {} +
 
+    chmod 755 "$staging/data/usr/libexec/meow-api" "$staging/data/usr/libexec/meow-validate"
+
     cat > "$staging/control/control" <<EOF
 Package: luci-app-meow
 Version: ${version}
-Depends: libc, luci-base, meow
+Depends: libc, luci-base, meow, curl
 Section: luci
 Architecture: all
 Installed-Size: $(installed_size "$staging/data")
 Maintainer: ${MAINTAINER}
-Description:  LuCI support for meow. Service settings plus the built-in
-  meow web panel embedded in the LuCI interface.
+Description:  LuCI support for meow: status overview, YAML config editor,
+  service and transparent-proxy (gateway / side-router) settings, per-client
+  proxy bypass, opt-in ARP-based client steering, logs, and the built-in meow
+  web panel embedded in LuCI. Client steering uses the built-in unicast ARP
+  sender.
 EOF
 
     cat > "$staging/control/postinst" <<'EOF'

@@ -285,8 +285,8 @@ cargo test --test shadowsocks_integration
 # Snell 集成测试（需要 Docker）
 cargo test -p meow-proxy --features snell --test snell_server_docker_integration
 
-# TProxy 测试（需要 Docker + QEMU）
-bash tests/test_tproxy_qemu.sh
+# TProxy 测试（需要 Docker）
+bash tests/test_tproxy_docker.sh
 ```
 
 这些测试在 CI 中运行，本地开发**可选**。

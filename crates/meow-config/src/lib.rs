@@ -475,6 +475,40 @@ pub struct ApiConfig {
     pub external_ui_url: Option<String>,
 }
 
+/// When set, config loading validates structure only and performs no remote
+/// proxy-provider / subscription fetch. `meow -t` sets it so a config that
+/// references a slow or unreachable subscription still validates promptly
+/// instead of blocking on the network — which is what a config *test* should
+/// do, and what LuCI's pre-save `meow -t` validation needs (a hung fetch
+/// exceeds rpcd's exec timeout and surfaces as "XHR request aborted by
+/// browser" on Save). Process-global because `-t` is a one-shot; the flag is
+/// never set on the live-serving path.
+static OFFLINE_VALIDATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Enable offline (no remote fetch) config validation for this process. Call
+/// before [`load_config`] in the `-t` path.
+pub fn set_offline_validate(on: bool) {
+    OFFLINE_VALIDATE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// True when config loading must skip remote proxy-provider fetches (see
+/// [`set_offline_validate`]).
+pub fn is_offline_validate() -> bool {
+    OFFLINE_VALIDATE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Process policy for hosts accepting configurations from delegated users.
+static EXTERNAL_PLUGINS_ALLOWED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+pub fn set_external_plugins_allowed(allowed: bool) {
+    EXTERNAL_PLUGINS_ALLOWED.store(allowed, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn external_plugins_allowed() -> bool {
+    EXTERNAL_PLUGINS_ALLOWED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub async fn load_config(path: &str) -> Result<Config, anyhow::Error> {
     let bytes = tokio::fs::read(path)
         .await
@@ -2749,6 +2783,11 @@ async fn ensure_geodata(
     scan_lines: &[String],
     prefetch: Option<&PrefetchProxies>,
 ) {
+    if is_offline_validate() {
+        // Validate local databases when present; missing databases use empty
+        // indexes for structural checks and are fetched only at real startup.
+        return;
+    }
     let downloads = missing_geodata_downloads(raw, geo, scan_lines);
     if downloads.is_empty() {
         return;
@@ -2818,6 +2857,9 @@ fn build_parser_context_at(
 
     let geoip_trigger = lines.iter().find(|l| line_references_geoip(l));
     let geoip = match geoip_trigger {
+        Some(_) if is_offline_validate() && !geoip_path.exists() => {
+            Some(Arc::new(meow_rules::country_index::CountryIndex::default()))
+        }
         Some(trigger) => {
             let reader = load_mmdb_mmap(geoip_path, "GeoIP", trigger)?;
             let allowed = collect_geoip_countries(&lines);
@@ -2832,6 +2874,9 @@ fn build_parser_context_at(
 
     let asn_trigger = lines.iter().find(|l| line_references_asn(l));
     let asn = match asn_trigger {
+        Some(_) if is_offline_validate() && !asn_path.exists() => {
+            Some(Arc::new(meow_rules::asn_index::AsnIndex::default()))
+        }
         Some(trigger) => {
             let reader = load_mmdb_mmap(asn_path, "GeoLite2-ASN", trigger)?;
             let allowed = collect_asn_numbers(&lines);
