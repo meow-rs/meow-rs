@@ -10,16 +10,19 @@
 //! * Either side may send a zero-payload frame to signal half-close; in
 //!   reuse mode the client emits a zero chunk after each session so the
 //!   connection can be returned to the pool and reused for the next request.
+//! * v6 always uses the reuse-capable request and defers it into the
+//!   session's first record (see [`Snell::defer_request`]).
 
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use super::v3::{is_zero_chunk as is_v3_zero_chunk, V3Conn};
 use super::v4::{is_zero_chunk as is_v4_zero_chunk, V4Conn, MAX_PAYLOAD_LENGTH};
+use super::v6::{V6Codec, V6Conn, MAX_RECORD_PAYLOAD as V6_MAX_RECORD_PAYLOAD};
 
 /// First byte of every Snell request — `0x01` since v1.
 pub const HEADER_VERSION: u8 = 1;
@@ -35,7 +38,8 @@ pub const RESPONSE_TUNNEL: u8 = 0;
 pub const RESPONSE_PONG: u8 = 1;
 pub const RESPONSE_ERROR: u8 = 2;
 
-/// True iff an error is a version-specific Snell zero-chunk half-close.
+/// True iff an error is a version-specific Snell zero-chunk half-close
+/// (v6 reuses v4's).
 pub fn is_zero_chunk(err: &io::Error) -> bool {
     is_v3_zero_chunk(err) || is_v4_zero_chunk(err)
 }
@@ -59,14 +63,9 @@ impl std::fmt::Display for AppError {
 
 impl std::error::Error for AppError {}
 
-/// Encode a TCP CONNECT request header. The bytes are written through the
-/// caller's encrypted stream.
-pub async fn write_header<W: AsyncWrite + Unpin>(
-    stream: &mut W,
-    host: &str,
-    port: u16,
-    reuse: bool,
-) -> io::Result<()> {
+/// Encode a TCP CONNECT request. The host is sent as text, IP literals
+/// included.
+pub fn connect_request(host: &str, port: u16, reuse: bool) -> io::Result<Vec<u8>> {
     if host.len() > 255 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -84,12 +83,25 @@ pub async fn write_header<W: AsyncWrite + Unpin>(
     buf.push(host.len() as u8);
     buf.extend_from_slice(host.as_bytes());
     buf.extend_from_slice(&port.to_be_bytes());
-    stream.write_all(&buf).await
+    Ok(buf)
 }
 
-/// Encode a UDP-ASSOCIATE request header.
+/// Write a TCP CONNECT request through the caller's encrypted stream.
+pub async fn write_header<W: AsyncWrite + Unpin>(
+    stream: &mut W,
+    host: &str,
+    port: u16,
+    reuse: bool,
+) -> io::Result<()> {
+    stream.write_all(&connect_request(host, port, reuse)?).await
+}
+
+/// UDP-ASSOCIATE request (empty client ID).
+pub const UDP_REQUEST: [u8; 3] = [HEADER_VERSION, COMMAND_UDP, 0x00];
+
+/// Write a UDP-ASSOCIATE request header.
 pub async fn write_udp_header<W: AsyncWrite + Unpin>(stream: &mut W) -> io::Result<()> {
-    stream.write_all(&[HEADER_VERSION, COMMAND_UDP, 0x00]).await
+    stream.write_all(&UDP_REQUEST).await
 }
 
 /// Emit a zero-chunk (`payload_len == 0 && padding_len == 0`) — the
@@ -112,6 +124,7 @@ pub async fn write_zero_chunk<W: AsyncWrite + Unpin>(stream: &mut W) -> io::Resu
 enum SnellInner<S> {
     V3(V3Conn<S>),
     V4(V4Conn<S>),
+    V6(V6Conn<S>),
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> SnellInner<S> {
@@ -123,6 +136,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> SnellInner<S> {
         match self {
             SnellInner::V3(conn) => Pin::new(conn).poll_read(cx, out),
             SnellInner::V4(conn) => Pin::new(conn).poll_read(cx, out),
+            SnellInner::V6(conn) => Pin::new(conn).poll_read(cx, out),
         }
     }
 
@@ -130,6 +144,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> SnellInner<S> {
         match self {
             SnellInner::V3(conn) => Pin::new(conn).poll_write(cx, buf),
             SnellInner::V4(conn) => Pin::new(conn).poll_write(cx, buf),
+            SnellInner::V6(conn) => Pin::new(conn).poll_write(cx, buf),
         }
     }
 
@@ -137,6 +152,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> SnellInner<S> {
         match self {
             SnellInner::V3(conn) => Pin::new(conn).poll_flush(cx),
             SnellInner::V4(conn) => Pin::new(conn).poll_flush(cx),
+            SnellInner::V6(conn) => Pin::new(conn).poll_flush(cx),
         }
     }
 
@@ -144,6 +160,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> SnellInner<S> {
         match self {
             SnellInner::V3(conn) => Pin::new(conn).poll_shutdown(cx),
             SnellInner::V4(conn) => Pin::new(conn).poll_shutdown(cx),
+            SnellInner::V6(conn) => Pin::new(conn).poll_shutdown(cx),
         }
     }
 }
@@ -234,6 +251,42 @@ impl<S> Snell<S> {
         }
     }
 
+    pub fn new_v6(inner: S, psk: Arc<[u8]>, codec: V6Codec) -> Self
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        Self {
+            inner: SnellInner::V6(V6Conn::new(inner, psk, codec)),
+            reply_consumed: false,
+            peer_half_closed: false,
+            frame_write_torn: false,
+        }
+    }
+
+    /// v6: queue `request` to lead the next record, so it shares a record
+    /// with the session's first payload bytes. Earlier versions write their
+    /// request eagerly and reject this.
+    pub fn defer_request(&mut self, request: Vec<u8>) -> io::Result<()> {
+        match &mut self.inner {
+            SnellInner::V6(conn) => {
+                conn.defer_request(request);
+                Ok(())
+            }
+            SnellInner::V3(_) | SnellInner::V4(_) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "snell: deferred requests are v6-only",
+            )),
+        }
+    }
+
+    /// Largest datagram frame the codec carries in one record.
+    pub fn max_packet_frame_len(&self) -> usize {
+        match &self.inner {
+            SnellInner::V3(_) | SnellInner::V4(_) => MAX_PAYLOAD_LENGTH,
+            SnellInner::V6(_) => V6_MAX_RECORD_PAYLOAD,
+        }
+    }
+
     /// After a successful pool reuse the next request's reply byte is
     /// pending again — reset the flag so the next `read` consumes it.
     pub fn reset_reply_state(&mut self) {
@@ -243,6 +296,14 @@ impl<S> Snell<S> {
 
     pub fn peer_half_closed(&self) -> bool {
         self.peer_half_closed
+    }
+
+    /// Whether the zero chunk alone completes a local half-close. A v6
+    /// server aborts the whole session on transport EOF — dropping any
+    /// reply the upstream has yet to send — so its write side must stay
+    /// open until the connection is dropped.
+    pub fn half_close_keeps_transport(&self) -> bool {
+        matches!(self.inner, SnellInner::V6(_))
     }
 
     /// Stage a single frame carrying `buf` verbatim as a UDP datagram
@@ -259,7 +320,7 @@ impl<S> Snell<S> {
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
-        if buf.len() > MAX_PAYLOAD_LENGTH {
+        if buf.len() > self.max_packet_frame_len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "snell: packet frame too large",
@@ -286,6 +347,7 @@ impl<S> Snell<S> {
         let pending_leftover = match &self.inner {
             SnellInner::V3(conn) => conn.has_pending_write(),
             SnellInner::V4(conn) => conn.has_pending_write(),
+            SnellInner::V6(conn) => conn.has_pending_write(),
         };
         if self.frame_write_torn || pending_leftover {
             return Err(io::Error::new(
@@ -301,7 +363,7 @@ impl<S> Snell<S> {
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
-        if buf.len() > MAX_PAYLOAD_LENGTH {
+        if buf.len() > self.max_packet_frame_len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "snell: packet frame too large",
@@ -319,6 +381,10 @@ impl<S> Snell<S> {
                 // flush that pended after `pending` emptied is finished too.
                 std::future::poll_fn(|cx| Pin::new(&mut *conn).poll_flush(cx)).await?;
             }
+            SnellInner::V6(conn) => {
+                conn.stage_packet_frame(buf)?;
+                std::future::poll_fn(|cx| Pin::new(&mut *conn).poll_flush(cx)).await?;
+            }
         }
         Ok(buf.len())
     }
@@ -328,7 +394,7 @@ impl<S> Snell<S> {
     /// packet conn locks the shared stream only for the duration of each
     /// poll, so `progress` carries the write state between polls.
     ///
-    /// v4 stages `frame` as a single AEAD packet frame and drains it; v3
+    /// v4/v6 stage `frame` as a single packet record and drain it; v3
     /// writes through the regular AEAD stream. Both flush before returning
     /// `Ready(Ok(()))`.
     ///
@@ -345,7 +411,7 @@ impl<S> Snell<S> {
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
-        if frame.len() > MAX_PAYLOAD_LENGTH {
+        if frame.len() > self.max_packet_frame_len() {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "snell: packet frame too large",
@@ -413,6 +479,23 @@ impl<S> Snell<S> {
                 *progress = PacketFrameProgress::default();
                 Poll::Ready(Ok(()))
             }
+            SnellInner::V6(conn) => {
+                if !progress.staged {
+                    match conn.stage_packet_frame(frame) {
+                        Ok(()) => progress.staged = true,
+                        Err(e) => return Poll::Ready(Err(e)),
+                    }
+                }
+                // Same unconditional drain + flush as v4.
+                match Pin::new(&mut *conn).poll_flush(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Ready(Ok(())) => {}
+                }
+                self.frame_write_torn = false;
+                *progress = PacketFrameProgress::default();
+                Poll::Ready(Ok(()))
+            }
         }
     }
 }
@@ -447,6 +530,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Snell<S> {
                 format!("snell: unknown response code 0x{other:x}"),
             )),
         }
+    }
+
+    /// Whether an idle pooled connection still looks usable: one read poll
+    /// (with a no-op waker) must find nothing — no data, EOF or error. A
+    /// v6 request is only written with the session's first bytes, so a
+    /// connection the server dropped while idle is caught here rather than
+    /// after the caller has handed it data.
+    pub fn idle_conn_alive(&mut self) -> bool {
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut byte = [0u8; 1];
+        let mut rb = ReadBuf::new(&mut byte);
+        self.inner.poll_read_inner(&mut cx, &mut rb).is_pending()
     }
 
     async fn read_exact_underlying(&mut self, buf: &mut [u8]) -> io::Result<()> {

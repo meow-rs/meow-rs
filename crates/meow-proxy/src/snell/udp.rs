@@ -85,8 +85,10 @@ fn parse_response_frame(frame: &[u8], out: &mut [u8]) -> io::Result<(usize, Sock
             let mut ip = [0u8; 16];
             ip.copy_from_slice(&frame[1..17]);
             let port = [frame[17], frame[18]];
+            // Dual-stack servers (v6) report IPv4 sources as `::ffff:a.b.c.d`;
+            // unmap them so replies match the IPv4 target the caller sent to.
             (
-                SocketAddr::new(IpAddr::V6(Ipv6Addr::from(ip)), u16::from_be_bytes(port)),
+                SocketAddr::new(Ipv6Addr::from(ip).to_canonical(), u16::from_be_bytes(port)),
                 HEAD_LEN,
             )
         }
@@ -128,11 +130,14 @@ pub struct SnellPacketConn<S> {
     read_gate: Mutex<Vec<u8>>,
     write_gate: Mutex<()>,
     poisoned: AtomicBool,
+    /// Largest frame one record carries (v6 allows more than v3/v4).
+    max_frame: usize,
 }
 
 impl<S> SnellPacketConn<S> {
     pub fn new(snell: Snell<S>) -> Self {
         Self {
+            max_frame: snell.max_packet_frame_len(),
             stream: Arc::new(parking_lot::Mutex::new(snell)),
             read_gate: Mutex::new(Vec::new()),
             write_gate: Mutex::new(()),
@@ -156,8 +161,8 @@ where
         // One decoded AEAD frame per `poll_read` ready; the frame buffer is
         // sized so a full frame always fits and never splits across reads.
         // Sized lazily on first use — conns that never receive pay nothing.
-        if frame.len() < super::v4::MAX_PAYLOAD_LENGTH {
-            frame.resize(super::v4::MAX_PAYLOAD_LENGTH, 0);
+        if frame.len() < self.max_frame {
+            frame.resize(self.max_frame, 0);
         }
         let n = std::future::poll_fn(|cx| {
             let mut stream = self.stream.lock();
@@ -183,7 +188,7 @@ where
         // Oversize is rejected before arming the guard — an unwritable
         // datagram must not brick an otherwise healthy conn (the codec's
         // own check inside `poll_write_packet_frame` stays as backstop).
-        if frame.len() > super::v4::MAX_PAYLOAD_LENGTH {
+        if frame.len() > self.max_frame {
             return Err(MeowError::Io(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "snell: packet frame too large",
@@ -548,6 +553,49 @@ mod tests {
         assert_eq!(&buf[..n], b"a-longer-second-reply-payload");
     }
 
+    /// v6 records hold up to 0xffff bytes: a datagram past the v3/v4 frame
+    /// limit travels whole both ways, and a reply byte sharing a record
+    /// with the first datagram is split off correctly.
+    #[tokio::test]
+    async fn v6_datagrams_exceed_the_v4_frame_limit() {
+        use crate::snell::v6::{SnellV6Mode, V6Codec, V6Conn};
+
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let psk: Arc<[u8]> = Arc::from(b"test-psk".as_slice());
+        let codec = V6Codec::new(SnellV6Mode::Default, &psk);
+        let conn = SnellPacketConn::new(Snell::new_v6(a, Arc::clone(&psk), codec.clone()));
+        let mut peer = V6Conn::new(b, psk, codec);
+        let dst: SocketAddr = "9.9.9.9:53".parse().unwrap();
+        let big = vec![0x5a; crate::snell::v4::MAX_PAYLOAD_LENGTH + 4000];
+
+        let read_one = async {
+            let mut frame = vec![0u8; 1 << 16];
+            let n = peer.read(&mut frame).await.unwrap();
+            frame.truncate(n);
+            frame
+        };
+        let (written, uploaded) = timeout(Duration::from_secs(10), async {
+            tokio::join!(conn.write_packet(&big, &dst), read_one)
+        })
+        .await
+        .unwrap();
+        assert_eq!(written.unwrap(), big.len());
+        assert_eq!(uploaded, build_request_frame(&dst, &big));
+
+        let mut reply = vec![RESPONSE_TUNNEL, 0x04, 9, 9, 9, 9];
+        reply.extend_from_slice(&53u16.to_be_bytes());
+        reply.extend_from_slice(&big);
+        peer.stage_packet_frame(&reply).unwrap();
+        peer.flush().await.unwrap();
+        let mut buf = vec![0u8; 1 << 16];
+        let (n, from) = timeout(Duration::from_secs(10), conn.read_packet(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(from, dst);
+        assert!(buf[..n] == big[..]);
+    }
+
     #[test]
     fn request_frame_ipv4_layout() {
         let frame = build_request_frame(&"1.2.3.4:5353".parse().unwrap(), b"\x00\x01");
@@ -567,5 +615,25 @@ mod tests {
         assert_eq!(frame[2], 0x06);
         assert_eq!(frame.len(), 1 + 1 + 1 + 16 + 2 + 3);
         assert_eq!(&frame[frame.len() - 3..], b"abc");
+    }
+
+    #[test]
+    fn response_frame_unmaps_ipv4_mapped_sources() {
+        let reply = |ip: Ipv6Addr| {
+            let mut frame = vec![0x06];
+            frame.extend_from_slice(&ip.octets());
+            frame.extend_from_slice(&53u16.to_be_bytes());
+            frame.extend_from_slice(b"ok");
+            frame
+        };
+        let mut out = [0u8; 8];
+
+        let mapped = Ipv4Addr::new(127, 0, 0, 1).to_ipv6_mapped();
+        let (n, from) = parse_response_frame(&reply(mapped), &mut out).unwrap();
+        assert_eq!(&out[..n], b"ok");
+        assert_eq!(from, "127.0.0.1:53".parse().unwrap());
+
+        let (_, from) = parse_response_frame(&reply(Ipv6Addr::LOCALHOST), &mut out).unwrap();
+        assert_eq!(from, "[::1]:53".parse().unwrap());
     }
 }

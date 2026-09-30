@@ -48,7 +48,7 @@ pub mod trojan;
 #[cfg(feature = "snell")]
 pub mod snell;
 #[cfg(feature = "snell")]
-pub use snell::{SnellAdapter, SnellObfs, SnellVersion};
+pub use snell::{SnellAdapter, SnellObfs, SnellV6Mode, SnellVersion};
 
 #[cfg(feature = "anytls")]
 pub mod anytls_adapter;

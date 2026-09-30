@@ -443,10 +443,11 @@ fn feature_gated_proxy_type(proxy_type: &str) -> String {
 ///   server: 1.2.3.4
 ///   port: 443
 ///   psk: shared-secret
-///   version: 4         # optional; default 4. Accepts 3, 4, 5, "v3", "v4", "v5".
+///   version: 4         # optional; default 4. Accepts 3–6, "v3" … "v6".
 ///   udp: true          # optional; UDP-over-TCP relay.
 ///   reuse: true        # optional; CommandConnectV2 + connection pool.
-///   obfs-opts:         # optional
+///   mode: default      # v6 only; must match the server: default | unshaped | unsafe-raw
+///   obfs-opts:         # optional, v3–v5 only
 ///     mode: http       # off (default) | http | tls
 ///     host: bing.com   # falls back to server when missing
 /// ```
@@ -458,13 +459,16 @@ fn feature_gated_proxy_type(proxy_type: &str) -> String {
 /// - empty `psk` — caught by [`meow_proxy::SnellAdapter::new`].
 /// - `version` ∈ {1, 2} — this adapter does not implement those wires.
 /// - `obfs-opts.mode` is not one of off / http / tls.
+/// - `mode` on a version other than 6, or not one of default / unshaped /
+///   unsafe-raw.
+/// - an obfs mode other than off with version 6 (v6 servers have none).
 #[cfg(feature = "snell")]
 fn parse_snell(
     name: &str,
     config: &HashMap<String, serde_yaml::Value>,
     dialer: &Arc<dyn meow_proxy::dialer::TcpDialer>,
 ) -> std::result::Result<meow_proxy::SnellAdapter, String> {
-    use meow_proxy::{SnellAdapter, SnellObfs, SnellVersion};
+    use meow_proxy::{SnellAdapter, SnellObfs, SnellV6Mode, SnellVersion};
 
     let server = config
         .get("server")
@@ -489,29 +493,30 @@ fn parse_snell(
     let version = match config.get("version") {
         None => SnellVersion::V4,
         Some(v) => {
-            // Accept ints (1..=5) or strings ("v4", "5", ...).
+            // Accept ints (1..=6) or strings ("v4", "5", ...).
             let label = if let Some(n) = v.as_u64() {
                 n.to_string()
             } else if let Some(s) = v.as_str() {
                 s.to_string()
             } else {
                 return Err(format!(
-                    "snell[{name}]: version must be an integer or string (3, 4 or 5)"
+                    "snell[{name}]: version must be an integer or string (3, 4, 5 or 6)"
                 ));
             };
             match label.trim().to_ascii_lowercase().as_str() {
                 "3" | "v3" => SnellVersion::V3,
                 "" | "4" | "v4" => SnellVersion::V4,
                 "5" | "v5" => SnellVersion::V5,
+                "6" | "v6" => SnellVersion::V6,
                 "1" | "2" | "v1" | "v2" => {
                     return Err(format!(
                         "snell[{name}]: version '{label}' is not supported; \
-                         this adapter implements Snell v3 / v4 / v5 only"
+                         this adapter implements Snell v3 / v4 / v5 / v6 only"
                     ));
                 }
                 other => {
                     return Err(format!(
-                        "snell[{name}]: unknown version '{other}'; valid: 3, 4, 5"
+                        "snell[{name}]: unknown version '{other}'; valid: 3, 4, 5, 6"
                     ));
                 }
             }
@@ -559,7 +564,35 @@ fn parse_snell(
         SnellObfs::None
     };
 
-    SnellAdapter::new(
+    // ── v6 options ───────────────────────────────────────────────────────
+    let v6 = version == SnellVersion::V6;
+    if v6 && !matches!(obfs, SnellObfs::None) {
+        return Err(format!(
+            "snell[{name}]: obfs-opts is not supported by snell v6"
+        ));
+    }
+    let mode = match config.get("mode") {
+        None => None,
+        Some(_) if !v6 => {
+            return Err(format!(
+                "snell[{name}]: mode is a snell v6 option; set version: 6"
+            ));
+        }
+        Some(v) => {
+            let label = v
+                .as_str()
+                .ok_or_else(|| format!("snell[{name}]: mode must be a string"))?;
+            Some(
+                SnellV6Mode::parse(&label.trim().to_ascii_lowercase()).ok_or_else(|| {
+                    format!(
+                        "snell[{name}]: mode '{label}' invalid; expected one of default, unshaped, unsafe-raw"
+                    )
+                })?,
+            )
+        }
+    };
+
+    let adapter = SnellAdapter::new(
         name,
         server,
         port,
@@ -570,7 +603,13 @@ fn parse_snell(
         reuse,
         Arc::clone(dialer),
     )
-    .map_err(|e| format!("snell[{name}]: {e}"))
+    .map_err(|e| format!("snell[{name}]: {e}"))?;
+    match mode {
+        Some(mode) => adapter
+            .with_v6_mode(mode)
+            .map_err(|e| format!("snell[{name}]: {e}")),
+        None => Ok(adapter),
+    }
 }
 
 /// Parse a `type: http` proxy config block into an `HttpAdapter`.
@@ -4841,10 +4880,46 @@ tls: true
             "name: sn\ntype: snell\nserver: 1.2.3.4\nport: 8388\npsk: s\nversion: v4\n",
             "name: sn\ntype: snell\nserver: 1.2.3.4\nport: 8388\npsk: s\nversion: V5\n",
             "name: sn\ntype: snell\nserver: 1.2.3.4\nport: 8388\npsk: s\nversion: 5\n",
+            "name: sn\ntype: snell\nserver: 1.2.3.4\nport: 8388\npsk: s\nversion: 6\n",
+            "name: sn\ntype: snell\nserver: 1.2.3.4\nport: 8388\npsk: s\nversion: v6\n",
         ] {
             let cfg = snell_config(yaml);
             assert!(parse_proxy(&cfg).is_ok(), "expected Ok for yaml: {yaml}");
         }
+    }
+
+    #[cfg(feature = "snell")]
+    #[test]
+    fn parse_snell_v6_modes() {
+        for mode in ["default", "unshaped", "unsafe-raw", "Unshaped", "''"] {
+            let cfg = snell_config(&format!(
+                "name: sn\ntype: snell\nserver: 1.2.3.4\nport: 8388\npsk: s\nversion: 6\nudp: true\nreuse: true\nmode: {mode}\n"
+            ));
+            assert!(parse_proxy(&cfg).is_ok(), "mode {mode} must parse");
+        }
+        let cases: &[(&str, &str)] = &[
+            ("version: 6\nmode: shaped\n", "mode 'shaped' invalid"),
+            ("version: 6\nmode: 1\n", "mode must be a string"),
+            ("version: 5\nmode: default\n", "mode is a snell v6 option"),
+            ("mode: unshaped\n", "mode is a snell v6 option"),
+            (
+                "version: 6\nobfs-opts:\n  mode: http\n",
+                "obfs-opts is not supported by snell v6",
+            ),
+        ];
+        for (extra, expected) in cases {
+            let cfg = snell_config(&format!(
+                "name: sn\ntype: snell\nserver: 1.2.3.4\nport: 8388\npsk: s\n{extra}"
+            ));
+            let Err(err) = parse_proxy(&cfg) else {
+                panic!("{extra:?} must hard-error (Class A)");
+            };
+            assert!(err.contains(expected), "{extra:?}: msg: {err}");
+        }
+        let cfg = snell_config(
+            "name: sn\ntype: snell\nserver: 1.2.3.4\nport: 8388\npsk: s\nversion: 6\nobfs-opts:\n  mode: off\n",
+        );
+        assert!(parse_proxy(&cfg).is_ok(), "obfs off is fine on v6");
     }
 
     #[cfg(feature = "snell")]
@@ -4878,11 +4953,11 @@ tls: true
     #[cfg(feature = "snell")]
     #[test]
     fn parse_snell_rejects_unknown_version() {
-        let cfg_six = snell_config(
-            "name: sn\ntype: snell\nserver: 1.2.3.4\nport: 8388\npsk: s\nversion: '6'\n",
+        let cfg_seven = snell_config(
+            "name: sn\ntype: snell\nserver: 1.2.3.4\nport: 8388\npsk: s\nversion: '7'\n",
         );
-        let Err(err) = parse_proxy(&cfg_six) else {
-            panic!("unknown version '6' must hard-error (Class A)");
+        let Err(err) = parse_proxy(&cfg_seven) else {
+            panic!("unknown version '7' must hard-error (Class A)");
         };
         assert!(err.contains("unknown version"), "msg: {err}");
 

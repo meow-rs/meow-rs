@@ -10,6 +10,16 @@ the canonical, in-repo source a release is cut from.
 
 ### Added
 
+- **Snell v6 outbound** — `type: snell` accepts `version: 6` (or `v6`)
+  with a `mode` matching the server's: `default` (traffic-shaped records),
+  `unshaped`, or `unsafe-raw`. TCP, UDP-over-TCP and connection reuse are
+  supported; v6 servers keep every connection reusable, so `reuse: true`
+  pools up to 10 idle connections for 60 s and vets each with a liveness
+  probe before handing it out. v6 datagrams can reach 64 KiB (v3–v5 stop
+  at 16 KiB). `obfs-opts` is rejected for v6 (the server has no obfs),
+  and `mode` is rejected on other versions. Interop is covered by a
+  Docker e2e suite against the official v6 server in all three modes.
+
 - **SOCKS5 UDP ASSOCIATE through `dialer-proxy` chains** — a socks5 node's
   relay datagrams now ride the front proxy's own `dial_udp` association to
   the server-advertised `BND.ADDR` relay endpoint (mihomo
@@ -367,6 +377,11 @@ the canonical, in-repo source a release is cut from.
   exists for proxy providers. (#533)
 
 ### Fixed
+
+- **Snell UDP replies from IPv4-mapped sources are unmapped** — a server
+  answering from `::ffff:a.b.c.d` (the v6 server does, for IPv4 targets)
+  is now reported as `a.b.c.d`, so the reply source matches the target
+  the datagram was sent to.
 
 - **`xhttp-opts.x-padding-bytes` is bounded — a provider node can no
   longer abort the process** (#648): the option parsed any `min-max`

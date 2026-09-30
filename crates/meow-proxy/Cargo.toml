@@ -29,10 +29,11 @@ vless-encryption = [
     "dep:aes-gcm",
     "dep:chacha20poly1305",
 ]
-# Snell v3/v4/v5 outbound — argon2id KDF + AES-128-GCM AEAD frames,
+# Snell v3/v4/v5/v6 outbound — argon2id KDF + AES-128-GCM AEAD frames,
 # optional http/tls obfs (reused from the SS simple-obfs module),
-# UDP-over-TCP, and an opt-in v4/v5 reuse pool (CommandConnectV2).
-snell = ["dep:argon2", "dep:aes-gcm", "meow-transport/simple-obfs"]
+# UDP-over-TCP, and an opt-in v4–v6 reuse pool (CommandConnectV2). v6's
+# PSK-derived traffic-shaping profile is seeded with BLAKE2b.
+snell = ["dep:argon2", "dep:aes-gcm", "dep:blake2", "meow-transport/simple-obfs"]
 # Opt-in anytls outbound (uses the vendored `meow-anytls` crate, lib name
 # `anytls_rs`). The client's TLS is supplied by meow-transport's BoringSSL
 # TlsLayer through anytls-rs's `TlsConnect` hook, so no second TLS stack.

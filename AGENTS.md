@@ -26,7 +26,7 @@ cargo test --lib
 cargo test --test rules_test           # 78 rule matching tests
 cargo test --test trojan_integration   # embedded mock server, no external deps
 cargo test --test shadowsocks_integration  # requires ssserver (see below)
-cargo test -p meow-proxy --features snell --test snell_server_docker_integration  # requires Docker; real Snell v3 server
+cargo test -p meow-proxy --features snell --test snell_server_docker_integration  # requires Docker; real Snell v3 + v6 servers
 bash tests/test_tproxy_docker.sh             # Docker-based tproxy e2e tests
 
 # Install ssserver for SS integration tests

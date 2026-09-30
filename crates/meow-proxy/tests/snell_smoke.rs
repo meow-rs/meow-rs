@@ -8,12 +8,15 @@
 //!     SNELL_OBFS_MODE=http SNELL_OBFS_HOST=/ \
 //!     cargo test -p meow-proxy --features snell --test snell_smoke -- --nocapture
 //! ```
+//!
+//! For v6, `SNELL_VERSION=6` plus `SNELL_V6_MODE=default|unshaped|unsafe-raw`
+//! (default `default`).
 
 #![cfg(feature = "snell")]
 
 use meow_common::{Metadata, Network, ProxyAdapter};
 use meow_proxy::dialer::DirectDialer;
-use meow_proxy::{SnellAdapter, SnellObfs, SnellVersion};
+use meow_proxy::{SnellAdapter, SnellObfs, SnellV6Mode, SnellVersion};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -42,8 +45,16 @@ fn parse_version() -> SnellVersion {
         "3" | "v3" => SnellVersion::V3,
         "4" | "v4" => SnellVersion::V4,
         "5" | "v5" => SnellVersion::V5,
-        other => panic!("SNELL_VERSION must be 3, 4, or 5; got {other}"),
+        "6" | "v6" => SnellVersion::V6,
+        other => panic!("SNELL_VERSION must be 3, 4, 5, or 6; got {other}"),
     }
+}
+
+fn parse_v6_mode() -> SnellV6Mode {
+    let mode = opt_env("SNELL_V6_MODE").unwrap_or_default();
+    SnellV6Mode::parse(mode.trim()).unwrap_or_else(|| {
+        panic!("SNELL_V6_MODE must be default, unshaped, or unsafe-raw; got {mode}")
+    })
 }
 
 fn parse_obfs(server_host: &str) -> SnellObfs {
@@ -171,6 +182,13 @@ async fn snell_dial_real_server() {
         Arc::new(DirectDialer),
     )
     .expect("snell adapter config");
+    let adapter = if version == SnellVersion::V6 {
+        adapter
+            .with_v6_mode(parse_v6_mode())
+            .expect("snell v6 mode")
+    } else {
+        adapter
+    };
     let metadata = Metadata {
         network: Network::Tcp,
         host: target_host.clone().into(),

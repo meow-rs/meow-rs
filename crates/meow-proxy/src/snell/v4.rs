@@ -66,11 +66,11 @@ pub fn is_zero_chunk(err: &io::Error) -> bool {
             .is_some_and(|e| e.to_string() == ZERO_CHUNK_MSG)
 }
 
-fn zero_chunk_err() -> io::Error {
+pub(super) fn zero_chunk_err() -> io::Error {
     io::Error::new(ZERO_CHUNK_KIND, ZERO_CHUNK_MSG)
 }
 
-fn increment_nonce(nonce: &mut [u8; V4_NONCE_SIZE]) {
+pub(super) fn increment_nonce(nonce: &mut [u8; V4_NONCE_SIZE]) {
     for byte in nonce.iter_mut() {
         *byte = byte.wrapping_add(1);
         if *byte != 0 {

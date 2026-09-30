@@ -45,10 +45,17 @@ pub struct Pool {
 
 impl Pool {
     pub fn new() -> Self {
+        Self::with_limits(DEFAULT_MAX_SIZE, DEFAULT_MAX_AGE, DEFAULT_MAX_USES_PER_CONN)
+    }
+
+    /// A pool with custom caps: at most `max_size` idle entries, each
+    /// discarded after `max_age` idle or once it has served
+    /// `max_uses_per_conn` sessions.
+    pub fn with_limits(max_size: usize, max_age: Duration, max_uses_per_conn: u32) -> Self {
         Self {
-            max_size: DEFAULT_MAX_SIZE,
-            max_age: DEFAULT_MAX_AGE,
-            max_uses_per_conn: DEFAULT_MAX_USES_PER_CONN,
+            max_size,
+            max_age,
+            max_uses_per_conn,
             items: Mutex::new(Vec::new()),
         }
     }
@@ -162,6 +169,26 @@ mod tests {
         pool.put(reusable, 1);
         let (_conn, uses) = pool.take_idle().expect("uses=1 should be pooled");
         assert_eq!(uses, 1);
+    }
+
+    #[test]
+    fn custom_limits_apply() {
+        let pool = Pool::with_limits(1, Duration::from_secs(60), u32::MAX);
+        let (busy, _peer_busy) = make_stream();
+        pool.put(busy, 1000);
+        let (extra, _peer_extra) = make_stream();
+        pool.put(extra, 0);
+        assert_eq!(pool.idle_count(), 1, "max_size caps idle entries");
+        let (_conn, uses) = pool.take_idle().expect("uncapped uses are pooled");
+        assert_eq!(uses, 1000);
+
+        let expired = Pool::with_limits(4, Duration::ZERO, u32::MAX);
+        let (conn, _peer) = make_stream();
+        expired.put(conn, 0);
+        assert!(
+            expired.take_idle().is_none(),
+            "zero max_age expires at once"
+        );
     }
 
     #[test]

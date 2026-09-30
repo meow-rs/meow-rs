@@ -16,7 +16,7 @@ A high-performance Rust implementation of the [mihomo](https://github.com/MetaCu
 - **VMess** -- AEAD VMess outbound with TCP/WebSocket transports
 - **HTTP** -- HTTP CONNECT outbound proxy with optional TLS and basic auth
 - **SOCKS5** -- SOCKS5 outbound proxy with optional TLS and auth
-- **Snell** -- v3/v4/v5 TCP, UDP-over-TCP, optional HTTP/TLS obfs; v4/v5 connection reuse
+- **Snell** -- v3/v4/v5/v6 TCP, UDP-over-TCP, optional HTTP/TLS obfs (v3–v5); v4–v6 connection reuse; v6 `default` / `unshaped` / `unsafe-raw` modes
 - **AnyTLS** -- AnyTLS outbound (`anytls` feature; in the `full` bundle, so the release binaries include it)
 - **Direct** -- Direct connection to destination
 - **Reject** -- Drop connections (with configurable behavior)
@@ -397,6 +397,8 @@ proxies:
     obfs-opts:
       mode: http
       host: /
+    # version: 6 drops obfs-opts and instead takes
+    # `mode: default | unshaped | unsafe-raw` (must match the server)
 
   - name: my-hy2
     type: hysteria2

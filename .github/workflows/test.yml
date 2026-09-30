@@ -297,7 +297,7 @@ jobs:
           MIHOMO_REQUIRE_INTEGRATION_BINS: "1"
         run: cargo nextest run --test shadowsocks_integration --retries 2 --no-fail-fast
 
-      - name: Docker integration tests (Hysteria2 + Snell v3)
+      - name: Docker integration tests (Hysteria2 + Snell v3/v6)
         env:
           MEOW_REQUIRE_DOCKER: "1"
         run: |

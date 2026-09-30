@@ -56,7 +56,7 @@ cause problems; items marked ~ work with caveats; items marked ✓ work.
 | `proxies:` — VLESS | ✓ | Plain VLESS, XTLS-Vision, Reality/uTLS, and post-quantum Encryption (`mlkem768x25519plus`) in the default app build. |
 | `proxies:` — HTTP CONNECT outbound | ✓ | Full parity (M1.B-3). |
 | `proxies:` — SOCKS5 outbound | ✓ | Full parity (M1.B-4). |
-| `proxies:` — Snell | ✓ | v3/v4/v5, UDP-over-TCP, optional HTTP/TLS obfs. |
+| `proxies:` — Snell | ✓ | v3/v4/v5/v6, UDP-over-TCP, optional HTTP/TLS obfs (v3–v5), v6 `mode` (`default` / `unshaped` / `unsafe-raw`). |
 | `proxies:` — Hysteria2 | ✓ | QUIC TCP/UDP, Salamander obfs, port hopping, bandwidth hints. |
 | `proxies:` — AnyTLS | ✓ | TCP + UDP (udp-over-tcp v2, opt in with `udp: true`). In the `full` bundle, and therefore in the release binaries; excluded from `minimal`. |
 | `proxies:` — TUIC / WireGuard / SSH | ✗ | Not implemented. |
@@ -676,7 +676,7 @@ These have been tested against a real subscription and confirmed working:
 - Trojan with TLS + WebSocket transport
 - VLESS with TLS/WebSocket/gRPC/H2/HTTPUpgrade transports
 - VMess AEAD TCP/WebSocket outbound
-- Snell v3/v4/v5 outbound with UDP-over-TCP
+- Snell v3/v4/v5/v6 outbound with UDP-over-TCP
 - Hysteria2 TCP/UDP with Docker integration coverage
 - Proxy providers with group `use:`
 - Mixed listener on a single port with SOCKS5 + HTTP clients
@@ -694,7 +694,7 @@ The following are unsupported or intentionally rejected:
 - **TUIC / WireGuard / SSH / ShadowsocksR proxies** — hard error; no default-build adapter.
 - **AnyTLS proxies in a `minimal` build** — hard error; the `full` bundle and
   the release binaries support them.
-- **Snell v1/v2** — hard error; use Snell v3/v4/v5.
+- **Snell v1/v2** — hard error; use Snell v3/v4/v5/v6.
 - **`vless` with `flow: xtls-rprx-direct`** — hard error; use `xtls-rprx-vision`.
 - **External dashboard auto-download** (`external-ui-url`) — not performed.
   `external-ui` / `external-ui-name` *are* supported: point them at a directory
