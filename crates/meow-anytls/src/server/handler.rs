@@ -64,7 +64,7 @@ impl StreamHandler for TcpProxyHandler {
                 }
             };
 
-            tracing::info!(
+            tracing::debug!(
                 "[Proxy] Destination: {}:{}",
                 destination.addr,
                 destination.port
@@ -282,7 +282,7 @@ async fn proxy_tcp_connection_with_synack_internal(
     let outbound = match timeout(connect_timeout, TcpStream::connect(target_socket)).await {
         Ok(Ok(conn)) => {
             configure_tcp_stream(&conn, &target_display);
-            tracing::info!("[Proxy] Successfully connected to {}", target_display);
+            tracing::debug!("[Proxy] Successfully connected to {}", target_display);
             conn
         }
         Ok(Err(e)) => {

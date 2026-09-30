@@ -515,7 +515,13 @@ impl Session {
                         }
                     }
                 } else {
-                    tracing::warn!(
+                    // Not an anomaly: a local FIN evicts the stream (see the
+                    // writer loop's Fin eviction) while the peer's in-flight
+                    // PSH frames are still on the wire, so every stream that
+                    // closes while the peer is sending lands here. Keep it
+                    // off the default `info` filter (one line per late frame
+                    // otherwise).
+                    tracing::debug!(
                         session_id = session_id,
                         "[Session] handle_frame: No receiver found for stream {} (available streams: {:?})",
                         frame.stream_id,
@@ -658,7 +664,7 @@ impl Session {
                     } else {
                         let streams = self.streams.read().await;
                         if let Some(stream) = streams.get(&frame.stream_id) {
-                            tracing::info!(
+                            tracing::debug!(
                                 session_id = session_id,
                                 "[Session] Stream {} SYNACK received (success) - stream is ready",
                                 frame.stream_id
@@ -1683,6 +1689,72 @@ mod tests {
                     .await
                     .unwrap();
             }
+        }
+        .with_subscriber(subscriber)
+        .await;
+        assert_eq!(count.load(Ordering::Relaxed), 0);
+    }
+
+    /// The default log filter is `info`, so anything at `info` or above on
+    /// the per-stream success path is one log line per proxied connection
+    /// (issue #495 item 13). Drive a full client-side stream lifecycle —
+    /// SYNACK, data, FIN, and the peer's in-flight PSH that lands after the
+    /// local eviction — and require it to stay below `info`.
+    #[tokio::test]
+    async fn stream_lifecycle_emits_no_info_or_above_events() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tracing::instrument::WithSubscriber;
+        use tracing_subscriber::{Layer, layer::SubscriberExt};
+        struct CountInfoOrAbove(Arc<AtomicUsize>);
+        impl<S: tracing::Subscriber> Layer<S> for CountInfoOrAbove {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                // `Level` orders by verbosity: ERROR < WARN < INFO < DEBUG.
+                if *event.metadata().level() <= tracing::Level::INFO {
+                    self.0.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        let count = Arc::new(AtomicUsize::new(0));
+        let subscriber = tracing_subscriber::registry().with(CountInfoOrAbove(Arc::clone(&count)));
+        async {
+            let session = Arc::new(Session::new_client(
+                tokio::io::empty(),
+                tokio::io::sink(),
+                create_test_padding().into_shared(),
+                None,
+            ));
+            let worker = Arc::clone(&session);
+            let writer = tokio::spawn(async move { worker.process_stream_data().await });
+
+            let (stream, synack) = session.open_stream().await.unwrap();
+            let stream_id = stream.id();
+
+            session
+                .handle_frame(Frame::control(Command::SynAck, stream_id))
+                .await
+                .unwrap();
+            // The success arm really ran: the waiter resolved `Ok`.
+            assert!(synack.await.unwrap().is_ok());
+
+            session
+                .handle_frame(Frame::data(stream_id, Bytes::from_static(b"data")))
+                .await
+                .unwrap();
+            session
+                .handle_frame(Frame::control(Command::Fin, stream_id))
+                .await
+                .unwrap();
+            // Late PSH for the now-evicted stream (peer had it in flight).
+            session
+                .handle_frame(Frame::data(stream_id, Bytes::from_static(b"late")))
+                .await
+                .unwrap();
+
+            writer.abort();
         }
         .with_subscriber(subscriber)
         .await;

@@ -274,14 +274,15 @@ async fn run(
     keep_alive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     if let Err(e) = flush_send(&mut st, &mut conn, &mut send_buf).await {
-        fail(
-            &mut ready_tx,
-            &mut st,
-            Error::Quic(format!("initial send: {e}")),
-        );
+        // `Io` carries the socket errno through `hy2_error` →
+        // `MeowError::Io` so local exhaustion (ENOBUFS/ENOMEM on the
+        // send) stays exempt from group dead-marking; a `Quic` string
+        // would erase it (issue #668).
+        fail(&mut ready_tx, &mut st, Error::Io(e));
         return;
     }
 
+    let mut exit = Error::Closed;
     loop {
         let timeout = conn.timeout();
         tokio::select! {
@@ -352,6 +353,10 @@ async fn run(
 
         if let Err(e) = flush_send(&mut st, &mut conn, &mut send_buf).await {
             tracing::debug!("hysteria2 quiche send failed: {e}");
+            // Pre-auth this still reaches `ready_tx` below — carry the
+            // socket errno (ENOBUFS/ENOMEM under local pressure) instead
+            // of reporting a context-free `Closed` (issue #668).
+            exit = Error::Io(e);
             break;
         }
         if conn.is_closed() {
@@ -359,7 +364,7 @@ async fn run(
         }
     }
 
-    fail(&mut ready_tx, &mut st, Error::Closed);
+    fail(&mut ready_tx, &mut st, exit);
     // Only a received QUIC FIN is a clean EOF. Closing channels here makes
     // the stream report connection failure after any already queued data.
     st.streams.clear();

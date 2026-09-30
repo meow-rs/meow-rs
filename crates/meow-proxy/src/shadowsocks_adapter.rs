@@ -380,7 +380,7 @@ impl ShadowsocksAdapter {
                         meow_common::resolve_host_all(host, *port)
                             .await
                             .map_err(|e| {
-                                MeowError::Proxy(format!("ss udp lookup {host}:{port}: {e}"))
+                                MeowError::io_with(&format!("ss udp lookup {host}:{port}"), e)
                             })?;
                     let mut last_err = None;
                     for remote in candidates {
@@ -397,18 +397,25 @@ impl ShadowsocksAdapter {
                                 )));
                             }
                             Err(e) => {
-                                last_err = Some(format!("ss udp via dialer-proxy {remote}: {e}"));
+                                last_err = MeowError::prefer_errno(
+                                    last_err,
+                                    MeowError::io_with(
+                                        &format!("ss udp via dialer-proxy {remote}"),
+                                        e,
+                                    ),
+                                );
                             }
                         }
                     }
-                    Err(MeowError::Proxy(last_err.unwrap_or_else(|| {
-                        "ss udp via dialer-proxy: no candidates".into()
-                    })))
+                    Err(last_err.unwrap_or_else(|| {
+                        MeowError::Proxy("ss udp via dialer-proxy: no candidates".into())
+                    }))
                 }
             },
-            Err(e) => Err(MeowError::Proxy(format!(
-                "ss udp via dialer-proxy {target}: {e}"
-            ))),
+            Err(e) => Err(MeowError::io_with(
+                &format!("ss udp via dialer-proxy {target}"),
+                e,
+            )),
         }
     }
 }
@@ -429,7 +436,7 @@ impl SsCore {
                     .dialer
                     .dial(&self.server, self.port, internal)
                     .await
-                    .map_err(|e| MeowError::Proxy(format!("ss obfs tcp connect: {e}")))?;
+                    .map_err(|e| MeowError::io_with("ss obfs tcp connect", e))?;
 
                 match obfs.clone() {
                     BuiltinObfs::Http { host } => {
@@ -578,7 +585,7 @@ impl SsCore {
                         self.dialer.dial(host, *port, internal).await
                     }
                 }
-                .map_err(|e| MeowError::Proxy(format!("ss tcp connect: {e}")))?;
+                .map_err(|e| MeowError::io_with("ss tcp connect", e))?;
                 let stream = ProxyClientStream::from_stream(
                     Arc::clone(&self.context),
                     tcp,
@@ -598,7 +605,7 @@ impl SsCore {
                         meow_common::connect_tcp_host(host, *port).await
                     }
                 }
-                .map_err(|e| MeowError::Proxy(format!("ss plugin tcp connect: {e}")))?;
+                .map_err(|e| MeowError::io_with("ss plugin tcp connect", e))?;
                 let stream = ProxyClientStream::from_stream(
                     Arc::clone(&self.context),
                     tcp,
@@ -1549,7 +1556,7 @@ impl ProxyAdapter for ShadowsocksAdapter {
             ServerAddr::SocketAddr(sa) => vec![*sa],
             ServerAddr::DomainName(host, port) => meow_common::resolve_host_all(host, *port)
                 .await
-                .map_err(|e| MeowError::Proxy(format!("ss udp lookup {host}:{port}: {e}")))?,
+                .map_err(|e| MeowError::io_with(&format!("ss udp lookup {host}:{port}"), e))?,
         };
 
         // Hand-roll the UDP bind+connect so the installed
@@ -1566,7 +1573,7 @@ impl ProxyAdapter for ShadowsocksAdapter {
         // and keeps UDP relay alive where TcpStream::connect's built-in
         // multi-address loop already keeps TCP alive.
         let mut connected = None;
-        let mut last_err = None;
+        let mut last_err: Option<MeowError> = None;
         for remote in candidates {
             let bind_addr: SocketAddr = if remote.is_ipv4() {
                 "0.0.0.0:0".parse().expect("static")
@@ -1576,7 +1583,10 @@ impl ProxyAdapter for ShadowsocksAdapter {
             let udp = match meow_common::bind_udp(bind_addr).await {
                 Ok(udp) => udp,
                 Err(e) => {
-                    last_err = Some(format!("ss udp bind for {remote}: {e}"));
+                    last_err = MeowError::prefer_errno(
+                        last_err,
+                        MeowError::io_with(&format!("ss udp bind for {remote}"), e),
+                    );
                     continue;
                 }
             };
@@ -1585,13 +1595,17 @@ impl ProxyAdapter for ShadowsocksAdapter {
                     connected = Some((udp, remote));
                     break;
                 }
-                Err(e) => last_err = Some(format!("ss udp connect {remote}: {e}")),
+                Err(e) => {
+                    last_err = MeowError::prefer_errno(
+                        last_err,
+                        MeowError::io_with(&format!("ss udp connect {remote}"), e),
+                    );
+                }
             }
         }
         let Some((udp, remote)) = connected else {
-            return Err(MeowError::Proxy(
-                last_err.unwrap_or_else(|| "ss udp connect: no candidates".into()),
-            ));
+            return Err(last_err
+                .unwrap_or_else(|| MeowError::Proxy("ss udp connect: no candidates".into())));
         };
         let socket = ProxySocket::<TokioUdpDatagram>::from_socket(
             UdpSocketType::Client,

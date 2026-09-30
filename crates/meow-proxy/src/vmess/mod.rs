@@ -174,10 +174,12 @@ async fn vmess_over(
 ) -> Result<Box<dyn ProxyConn>> {
     use tokio::io::AsyncWriteExt;
 
-    let mut stream = transport
-        .connect(stream)
-        .await
-        .map_err(|e| MeowError::Proxy(format!("vmess transport: {e}")))?;
+    let mut stream = transport.connect(stream).await.map_err(|e| match e {
+        // Io/RelayHop chains carry errno + capability classification that
+        // dead-marking reads — do not stringify them away (issue #668).
+        e @ (MeowError::Io(_) | MeowError::RelayHopFailed { .. }) => e,
+        e => MeowError::Proxy(format!("vmess transport: {e}")),
+    })?;
 
     stream
         .write_all(&sealed.bytes)

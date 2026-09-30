@@ -444,7 +444,12 @@ pub async fn connect_tcp_host(host: &str, port: u16) -> io::Result<TcpStream> {
     for addr in &addrs {
         match connect_tcp(*addr).await {
             Ok(stream) => return Ok(stream),
-            Err(e) => last_err = Some(e),
+            Err(e) => {
+                // An errno-backed failure (e.g. EMFILE on socket()) must
+                // not be masked by a later errno-less error — it carries
+                // the local-vs-member classification (issue #668).
+                last_err = crate::MeowError::prefer_errno_io(last_err, e);
+            }
         }
     }
     // Every candidate failed — drop any cached system entry so the next dial

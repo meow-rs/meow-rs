@@ -16,7 +16,7 @@
 //!
 //! TODO: deduplicate with vmess::transport_chain once M1.B-1 lands (VMess PR).
 
-use meow_common::{MeowError, Result};
+use meow_common::Result;
 use meow_transport::{Stream, Transport};
 
 /// An ordered sequence of transport layers applied to a TCP stream.
@@ -52,7 +52,7 @@ impl TransportChain {
             stream = layer
                 .connect(stream)
                 .await
-                .map_err(|e| MeowError::Proxy(e.to_string()))?;
+                .map_err(crate::transport_to_proxy_err)?;
         }
         Ok(stream)
     }

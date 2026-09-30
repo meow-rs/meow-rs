@@ -122,7 +122,10 @@ impl HttpAdapter {
             tls_layer
                 .connect(Box::new(stream))
                 .await
-                .map_err(|e| MeowError::Proxy(e.to_string()))
+                .map_err(|e| match e {
+                    meow_transport::TransportError::Io(e) => MeowError::Io(e),
+                    other => MeowError::Proxy(other.to_string()),
+                })
         } else {
             Ok(stream)
         }

@@ -258,7 +258,7 @@ impl TcpDialer for DirectDialer {
         // resolver can order an unreachable family first and a UDP
         // connect() fails immediately with ENETUNREACH — falling through
         // keeps the association alive like the SS raw-socket arm does.
-        let mut last_err = None;
+        let mut last_err: Option<io::Error> = None;
         for remote in candidates {
             // Same bind-family + protect-hook dance as the SS UDP relay
             // path: `bind_udp` routes the fd through the installed
@@ -271,7 +271,10 @@ impl TcpDialer for DirectDialer {
             let udp = match meow_common::bind_udp(bind_addr).await {
                 Ok(udp) => udp,
                 Err(e) => {
-                    last_err = Some(e);
+                    // An errno-backed failure (e.g. EMFILE on socket())
+                    // outranks a later errno-less error — it carries the
+                    // local-vs-member classification (issue #668).
+                    last_err = MeowError::prefer_errno_io(last_err, e);
                     continue;
                 }
             };
@@ -282,7 +285,7 @@ impl TcpDialer for DirectDialer {
                         remote,
                     }));
                 }
-                Err(e) => last_err = Some(e),
+                Err(e) => last_err = MeowError::prefer_errno_io(last_err, e),
             }
         }
         Err(last_err
@@ -369,7 +372,7 @@ impl ProxyDialer {
             .proxy
             .dial_tcp(&meta)
             .await
-            .map_err(|e| io::Error::other(format!("dialer-proxy: {e}")))?;
+            .map_err(|e| e.into_io_error("dialer-proxy"))?;
         // `Box<dyn ProxyConn>` is unsized (!Sized), so it cannot satisfy
         // the `Any` bound required by the blanket `Stream` impl.  `ConnStream`
         // is a sized newtype that forwards `AsyncRead`/`AsyncWrite` through
@@ -598,17 +601,16 @@ impl TcpDialer for ProxyDialer {
                 ..Default::default()
             },
         };
-        let conn = self.proxy.dial_udp(&meta).await.map_err(|e| match e {
-            // Capability errors keep their class across the `io::Error`
-            // boundary so the adapter can reconstitute `NotSupported` —
-            // `DialFailureTracker::on_failure` exempts capability errors
-            // from dead-marking, and a UDP-less front must not cost the
-            // node its health.
-            MeowError::NotSupported(_) | MeowError::UdpNotSupported => {
-                io::Error::new(io::ErrorKind::Unsupported, format!("dialer-proxy udp: {e}"))
-            }
-            e => io::Error::other(format!("dialer-proxy udp: {e}")),
-        })?;
+        // Capability errors keep their class across the `io::Error`
+        // boundary so the adapter can reconstitute `NotSupported`, and
+        // `MeowError::Io` chains pass their errno through — a UDP-less
+        // front or local fd exhaustion must not cost the member its
+        // health (issues #663/#668).
+        let conn = self
+            .proxy
+            .dial_udp(&meta)
+            .await
+            .map_err(|e| e.into_io_error("dialer-proxy udp"))?;
         Ok(Arc::from(conn))
     }
 
