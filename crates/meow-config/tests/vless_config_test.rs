@@ -1282,6 +1282,59 @@ proxies:
     );
 }
 
+/// D16l (issue #495 item 11): `padding: true` is a sing-mux session layer —
+/// accepted on smux without a warn, but a hard error on `protocol: muxcool`,
+/// which has no padding and would silently go out unpadded (Class A per
+/// ADR-0002).
+#[cfg(feature = "mux")]
+#[tokio::test]
+async fn parse_vless_mux_padding_is_sing_mux_only() {
+    let yaml = r#"
+proxies:
+  - name: padded
+    type: vless
+    server: example.com
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    smux:
+      enabled: true
+      protocol: smux
+      padding: true
+  - name: padded-muxcool
+    type: vless
+    server: example.com
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    smux:
+      enabled: true
+      protocol: muxcool
+      padding: true
+"#;
+    let (result, lines) = with_warn_capture_async(load_config_from_str(yaml)).await;
+    let config = result.expect("an invalid proxy must not fail the whole config");
+    assert!(
+        config.proxies.contains_key("padded"),
+        "smux + padding must load; {lines:?}"
+    );
+    assert!(
+        !config.proxies.contains_key("padded-muxcool"),
+        "muxcool + padding node must be skipped"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("'padding' is sing-mux only")),
+        "expected a padding/muxcool error; {lines:?}"
+    );
+    let stray: Vec<_> = lines
+        .iter()
+        .filter(|l| {
+            l.contains("WARN") && l.to_lowercase().contains("mux") && !l.contains("padded-muxcool")
+        })
+        .collect();
+    assert!(stray.is_empty(), "smux + padding must not warn; {stray:?}");
+}
+
 /// D16d: `mux: { enabled: false }` → plain VLESS, no mux, no warn.
 #[cfg(feature = "mux")]
 #[tokio::test]

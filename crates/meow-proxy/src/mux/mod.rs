@@ -7,7 +7,8 @@
 //! * reserved destination `sp.mux.sing-box.arpa:444` in the proxy
 //!   handshake marks the connection as a mux connection (server side);
 //! * after the proxy handshake the client sends a 2-byte (+padding) request
-//!   header picking the mux protocol (smux / yamux / h2mux);
+//!   header picking the mux protocol (smux / yamux / h2mux); with padding
+//!   enabled the session then runs over a `padding::PaddingConn`;
 //! * every stream carries the real destination as a sing-encoded
 //!   `Socksaddr` prefix (see `address`).
 //!
@@ -18,6 +19,7 @@ pub mod client;
 pub mod h2mux;
 pub mod muxcool;
 pub mod packet;
+pub mod padding;
 pub mod request;
 pub mod smux;
 pub mod stream;

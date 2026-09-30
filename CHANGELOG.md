@@ -437,6 +437,22 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **sing-mux `padding: true` now produces a session the server can
+  parse** (#495 item 11). meow sent the version-1 request header with the
+  padding flag but then ran smux / yamux / h2mux over the raw connection,
+  while sing-mux wraps both ends in its padding layer after that header.
+  The server read our first smux / yamux / HTTP/2 bytes as a padding
+  header, and its padded replies reached our session as garbage. A
+  `padding: true` sing-box inbound also rejects clients that do not pad.
+  The session now runs over a `PaddingConn` that matches sing-mux's
+  `paddingConn`: the first 16 writes each way are framed as
+  `[len u16][padding_len u16][data][256..=767 padding bytes]`, and later
+  traffic passes through unframed. `padding: true` with
+  `protocol: muxcool` is now a config error, because Mux.Cool has no
+  padding and the node would go out unpadded. The sing-box e2e suite runs
+  padded smux, yamux and h2mux sessions against a `multiplex.padding: true`
+  inbound.
+
 - **Snell v4/v5 `reuse` keeps one connection for every session.** The
   reuse pool dropped a connection after its second session, on the belief
   that the v5 server closes it there. The official 4.0.0 through 5.0.1

@@ -13,7 +13,10 @@
 //   * a slow reader sharing the physical session (max-connections: 1)
 //     with fast readers: the slow stream is isolated, its peers and the
 //     session itself survive, and a fresh stream on the same session
-//     works afterwards.
+//     works afterwards;
+//   * `padding: true` sessions (smux, yamux, h2mux) against an inbound
+//     with `multiplex.padding: true`, which rejects unpadded clients
+//     (issue #495 item 11).
 //
 // Server availability policy — the inverse of the SKIP-by-default suites:
 // this test FAILS when sing-box is missing, because a green CI run must
@@ -111,9 +114,10 @@ impl Drop for SingBoxServer {
 }
 
 /// Start `sing-box run` with a VLESS inbound (multiplex enabled) and a
-/// direct outbound. The client selects smux via its sing-mux request header,
-/// so the server side needs only `"multiplex": {"enabled": true}`.
-fn start_singbox(bin: &Path, dir: &Path, port: u16) -> SingBoxServer {
+/// direct outbound. The client selects the mux protocol via its sing-mux
+/// request header, so the server side needs only `"enabled": true`;
+/// `padding` makes the inbound require padded sessions.
+fn start_singbox(bin: &Path, dir: &Path, port: u16, padding: bool) -> SingBoxServer {
     let config = format!(
         r#"{{
   "log": {{"level": "info", "output": "singbox.log"}},
@@ -123,7 +127,7 @@ fn start_singbox(bin: &Path, dir: &Path, port: u16) -> SingBoxServer {
     "listen": "127.0.0.1",
     "listen_port": {port},
     "users": [{{"name": "e2e", "uuid": "{TEST_UUID}"}}],
-    "multiplex": {{"enabled": true}}
+    "multiplex": {{"enabled": true, "padding": {padding}}}
   }}],
   "outbounds": [{{"type": "direct", "tag": "out"}}]
 }}"#
@@ -144,6 +148,10 @@ fn start_singbox(bin: &Path, dir: &Path, port: u16) -> SingBoxServer {
     SingBoxServer { child, log_path }
 }
 
+fn singbox_log(server: &SingBoxServer) -> String {
+    std::fs::read_to_string(&server.log_path).unwrap_or_default()
+}
+
 /// Poll until sing-box's VLESS inbound accepts connections.
 async fn wait_listening(server: &SingBoxServer, port: u16) {
     let addr: SocketAddr = ([127, 0, 0, 1], port).into();
@@ -153,8 +161,10 @@ async fn wait_listening(server: &SingBoxServer, port: u16) {
         }
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
-    let log = std::fs::read_to_string(&server.log_path).unwrap_or_default();
-    panic!("sing-box did not listen on {addr} within 15s; log:\n{log}");
+    panic!(
+        "sing-box did not listen on {addr} within 15s; log:\n{}",
+        singbox_log(server)
+    );
 }
 
 // ─── meow under test ─────────────────────────────────────────────────────
@@ -162,8 +172,8 @@ async fn wait_listening(server: &SingBoxServer, port: u16) {
 /// Build the meow side exactly like `main.rs` does: parse the config, wire
 /// the tunnel, and serve a mixed listener on an ephemeral port. The config
 /// pins `max-connections: 1` so every logical connection shares one
-/// physical smux session.
-async fn start_meow(singbox_port: u16) -> SocketAddr {
+/// physical mux session.
+async fn start_meow(singbox_port: u16, protocol: &str, padding: bool) -> SocketAddr {
     let yaml = format!(
         r#"
 mixed-port: 7890          # inert: the test binds its own ephemeral listener
@@ -180,7 +190,8 @@ proxies:
     uuid: {TEST_UUID}
     smux:
       enabled: true
-      protocol: smux
+      protocol: {protocol}
+      padding: {padding}
       max-connections: 1
 
 rules:
@@ -283,11 +294,11 @@ async fn large_transfer_survives_a_real_smux_server() {
     };
     let dir = tempfile::tempdir().expect("tempdir");
     let singbox_port = free_port();
-    let server = start_singbox(&bin, dir.path(), singbox_port);
+    let server = start_singbox(&bin, dir.path(), singbox_port, false);
     wait_listening(&server, singbox_port).await;
 
     let echo_addr = start_echo_server().await;
-    let mixed = start_meow(singbox_port).await;
+    let mixed = start_meow(singbox_port, "smux", false).await;
 
     let total = 32 * MAX_STREAM_BUFFER;
     let payload = pattern(total);
@@ -326,11 +337,11 @@ async fn slow_reader_is_isolated_and_fast_readers_survive() {
     };
     let dir = tempfile::tempdir().expect("tempdir");
     let singbox_port = free_port();
-    let server = start_singbox(&bin, dir.path(), singbox_port);
+    let server = start_singbox(&bin, dir.path(), singbox_port, false);
     wait_listening(&server, singbox_port).await;
 
     let echo_addr = start_echo_server().await;
-    let mixed = start_meow(singbox_port).await;
+    let mixed = start_meow(singbox_port, "smux", false).await;
 
     // The slow reader: 2 MiB requested (the writer blocks partway once
     // every buffer in the chain fills — that is the point), and the client
@@ -358,6 +369,84 @@ async fn slow_reader_is_isolated_and_fast_readers_survive() {
     // The retire stayed scoped: the session survived, and a fresh stream
     // multiplexed onto the same physical session works end-to-end.
     fast_roundtrip(mixed, echo_addr).await;
+}
+
+/// `padding: true` against an inbound that requires it: every sing-mux
+/// protocol must carry streams through the padded phase (the first 16
+/// frames each way) and past it into the unframed remainder, on one
+/// physical session.
+async fn padded_session_round_trips(protocol: &str) {
+    let Some(bin) = require_singbox() else {
+        return;
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let singbox_port = free_port();
+    let server = start_singbox(&bin, dir.path(), singbox_port, true);
+    wait_listening(&server, singbox_port).await;
+
+    let echo_addr = start_echo_server().await;
+    let mixed = start_meow(singbox_port, protocol, true).await;
+
+    // sing-box's log names the rejection ("non-padded connection
+    // rejected", or a mux parse error) — surface it on failure.
+    for _ in 0..4 {
+        if let Err(e) = tokio::spawn(fast_roundtrip(mixed, echo_addr)).await {
+            panic!(
+                "padded {protocol} roundtrip failed: {e}; sing-box log:\n{}",
+                singbox_log(&server)
+            );
+        }
+    }
+    let total = 1024 * 1024;
+    let payload = pattern(total);
+    let conn = socks5_connect(mixed, echo_addr).await;
+    let (mut reader_half, mut writer_half) = conn.into_split();
+    let reader = tokio::spawn(async move {
+        let mut received = vec![0u8; total];
+        reader_half
+            .read_exact(&mut received)
+            .await
+            .map(|_| received)
+    });
+    writer_half
+        .write_all(&payload)
+        .await
+        .expect("bulk write over a padded session");
+    let received = tokio::time::timeout(Duration::from_secs(30), reader)
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "padded {protocol} bulk echo timed out; sing-box log:\n{}",
+                singbox_log(&server)
+            )
+        })
+        .expect("reader task panicked")
+        .unwrap_or_else(|e| {
+            panic!(
+                "padded {protocol} bulk echo failed: {e}; sing-box log:\n{}",
+                singbox_log(&server)
+            )
+        });
+    assert_eq!(
+        received, payload,
+        "echo payload corrupted over padded {protocol}"
+    );
+    fast_roundtrip(mixed, echo_addr).await;
+}
+
+#[tokio::test]
+async fn padded_smux_session_interoperates_with_a_real_server() {
+    padded_session_round_trips("smux").await;
+}
+
+#[tokio::test]
+async fn padded_yamux_session_interoperates_with_a_real_server() {
+    padded_session_round_trips("yamux").await;
+}
+
+#[tokio::test]
+async fn padded_h2mux_session_interoperates_with_a_real_server() {
+    padded_session_round_trips("h2mux").await;
 }
 
 /// One small echo roundtrip through the mixed listener.

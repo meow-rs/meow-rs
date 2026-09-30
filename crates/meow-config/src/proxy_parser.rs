@@ -1410,6 +1410,8 @@ fn ws_max_early_data(ws_opts: Option<&serde_yaml::Value>) -> usize {
 /// - `flow: xtls-rprx-vision` + a `smux`/`mux` block using sing-mux
 ///   (`protocol: smux`/`yamux`/`h2mux`) — sing-box and Xray reject XTLS +
 ///   sing-mux (`protocol: muxcool` is fine)
+/// - a `smux`/`mux` block with `padding: true` + `protocol: muxcool` —
+///   Mux.Cool has no padding layer, so the node would go out unpadded
 ///
 /// # Warn-once (Class B per ADR-0002)
 ///
@@ -1837,6 +1839,9 @@ fn parse_vless(
 ///   header, frame mux).  Server must be Xray / sing-box based; VLESS and
 ///   VMess support it (Trojan/Shadowsocks reject it).
 ///
+/// `padding: true` is sing-mux session padding and is rejected with
+/// `protocol: muxcool`.
+///
 /// Returns `None` when the block is absent or disabled; `Err` for
 /// malformed values.  Only compiled when one of its call sites
 /// (trojan / vless / ss / vmess parsing) exists.
@@ -1901,9 +1906,20 @@ fn parse_mux_options(
             );
         }
     }
+    // Padding is a sing-mux session layer; Mux.Cool has none, so honouring
+    // the flag is impossible and ignoring it would send the unpadded traffic
+    // shape the operator opted out of (Class A per ADR-0002).
+    let padding = mux_bool_field(name, mux_cfg, "padding", false)?;
+    if padding && protocol == meow_proxy::mux::Protocol::MuxCool {
+        return Err(format!(
+            "{name}: mux option 'padding' is sing-mux only (smux/yamux/h2mux); \
+             Mux.Cool (`protocol: muxcool`) has no padding layer — remove `padding` \
+             or pick a sing-mux protocol"
+        ));
+    }
     Ok(Some(meow_proxy::mux::MuxOptions {
         protocol,
-        padding: mux_bool_field(name, mux_cfg, "padding", false)?,
+        padding,
         max_connections,
         min_streams: mux_usize_field(name, mux_cfg, "min-streams", 4)?,
         max_streams,

@@ -58,6 +58,29 @@ key remains accepted for compatibility; configuring both keys warns and prefers 
 | padding_len | u16 BE | only when padding=1; value = 256 + rand(512) |
 | padding bytes | n | random padding |
 
+#### 2.1 Padded sessions (`padding: true`)
+
+With the padding flag set, both ends wrap the physical connection in
+sing-mux's `paddingConn` (padding.go) **after** the request header and
+before the smux / yamux / h2mux session starts; the request header itself
+is not framed. The first 16 writes in each direction are framed as
+
+```text
+[data_len u16 BE][padding_len u16 BE][data][padding_len bytes]
+```
+
+with `padding_len = 256 + rand(512)` (256..=767) and at most 65535 data
+bytes per frame (larger writes are split). The reader parses the first 16
+frames the same way (a zero-length frame is legal and is not EOF);
+everything after the 16th frame passes through unframed. A sing-box
+inbound with `multiplex.padding: true` rejects clients that do not pad
+("non-padded connection rejected"). meow-rs implements this layer in
+`padding.rs` (`PaddingConn`) for the three sing-mux protocols; Mux.Cool
+has no padding, so `padding: true` with `protocol: muxcool` is a hard
+config error (Class A per
+[ADR-0002](../adr/0002-upstream-divergence-policy.md): ignoring it would
+silently send the unpadded traffic shape).
+
 ### 3. Sessions (one per physical connection, chosen by protocol)
 
 - **smux**: note — sing-mux uses the **sagernet/smux fork**, whose frame
@@ -117,7 +140,8 @@ on parse; brutal is Linux-only upstream).
 - Connection failure / closed session → retry at most 2 times; the
   *client* pool evicts zero-stream sessions after a 60s idle timeout
   (meow-rs `IDLE_TIMEOUT`, mirroring sing-mux Service IdleTimeout).
-- padding mode uses version=1; TCPTimeout=5s caps connection setup.
+- padding mode uses version=1 and wraps the session in the §2.1 padding
+  layer; TCPTimeout=5s caps connection setup.
 
 ### 6. Xray Mux.Cool (`protocol: muxcool`, VLESS + VMess)
 
@@ -218,6 +242,7 @@ header, which is what meow-rs sends.
 crates/meow-proxy/src/mux/
   mod.rs        Protocol (+MuxCool), MuxClient (session pool + offer/offerNew + idle sweep)
   request.rs    §2 sing-mux request header encode/decode (incl. padding)
+  padding.rs    §2.1 PaddingConn: padded-session framing (first 16 frames each way)
   address.rs    §4 stream request codec (flags + sing Socksaddr)
   smux.rs       smux session + stream (sagernet fork frame format, self-implemented)
   yamux.rs      yamux wrapper (on the libp2p yamux crate)
@@ -269,7 +294,9 @@ crates/meow-proxy/src/mux/
 
 ## Test Plan
 
-1. Unit: request header/padding codec; Socksaddr codec round trips; smux
+1. Unit: request header/padding codec; padded-session framing (byte-exact
+   frames, 16-frame cutoff both ways, u16 chunking, 1-byte split reads,
+   Pending-retry writes); Socksaddr codec round trips; smux
    frame codec (wire byte assertions), SYN/FIN/PSH state machine, large
    write frame splitting (in-memory duplex both-ends exercise); MuxClient
    offer/offerNew/min-max bounds and concurrency caps (mock dialer);
@@ -285,6 +312,10 @@ crates/meow-proxy/src/mux/
      config) — plaintext VLESS (TCP 204/200 + UDP echo), Reality (204),
      Reality+Vision (204 + UDP echo; configs meow-muxcool.yml /
      meow-reality-muxcool.yml / meow-rv-muxcool.yml) all pass.
+   - CI: `crates/meow-app/tests/smux_singbox_integration.rs` runs the full
+     stack against the pinned sing-box (1.14.0), including `padding: true`
+     smux / yamux / h2mux sessions against a VLESS inbound with
+     `multiplex.padding: true` (which rejects unpadded clients).
 3. Physical device: a real Xray node (example-xray-node, VLESS
    Reality+Vision, config meow-real-muxcool.yml) with `protocol: muxcool`
    passes 204 (h2 + http/1.1), and 4 consecutive connections reuse one
