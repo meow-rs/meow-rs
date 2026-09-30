@@ -437,6 +437,19 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **Relay groups no longer send UDP out of the first hop.** A relay's UDP
+  went through hop 0 whenever every member supported UDP, so
+  `relay: [DIRECT, ss-b]` sent UDP straight from the host while its TCP
+  exited at `ss-b`, and `[ss-a, ss-b]` sent UDP out of `ss-a`. UDP now
+  leaves from the chain's exit, as in mihomo's relay: DIRECT hops are
+  dropped, an all-DIRECT chain sends UDP directly, and a chain with one
+  proxy hop sends it from that hop (subject to its own `udp` support).
+  meow cannot chain UDP through several proxy hops yet, so such a chain
+  now reports no UDP support and its `dial_udp` fails with
+  `UdpNotSupported` before any hop runs; UDP rules targeting it are
+  skipped, as for any outbound without UDP. Use `dialer-proxy` on the exit
+  node for chained UDP (#495 item 6).
+
 - **Snell v4/v5 `reuse` keeps one connection for every session.** The
   reuse pool dropped a connection after its second session, on the belief
   that the v5 server closes it there. The official 4.0.0 through 5.0.1

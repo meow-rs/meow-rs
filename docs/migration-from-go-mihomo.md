@@ -370,13 +370,26 @@ proxy-groups:
 |-----------|-----------|-------------|
 | Single-proxy relay (`proxies` length 1) | Silently acts as passthrough | Hard parse error — likely misconfiguration (ADR-0002 Class A). |
 | Empty `proxies` list | Panics | Hard parse error (Class A). |
-| UDP relay when any chain member lacks UDP support | Returns a non-functional conn silently | Returns `UdpNotSupported` immediately (Class A). |
+| UDP through two or more proxy hops (DIRECT hops not counted) | Chains the exit's UDP through the earlier hops | Returns `UdpNotSupported` and the rule is skipped for UDP; chained UDP is a follow-up (Class A). |
 | `url:`/`interval:`/`lazy:`/`tolerance:`/`expected-status:` on a relay group | Probes static members (since `90bf158`, v1.18.4) | Warn-once per field; no probe loop runs (Class B). |
 | `use:`/`include-all*`/`filter:`/`exclude-*:` on a relay group | Relay accepts provider members | Warn-once per field; relay is static-only (Class B). |
 
-**UDP relay:** works only when every proxy in the chain supports UDP
-(`support_udp() == true` for all hops). If any hop lacks UDP, `dial_udp()`
-returns `UdpNotSupported` — it does not silently degrade to TCP.
+**UDP relay:** UDP always leaves from the chain's exit, never from an
+earlier hop. DIRECT hops are dropped first, as upstream does, and the
+proxy hops that remain decide:
+
+- none (`[DIRECT, DIRECT]`): UDP goes out directly;
+- one (`[DIRECT, ss-b]`): `ss-b` sends the UDP itself, the same exit as
+  the chain's TCP. Its own `udp` support decides;
+- two or more (`[ss-a, ss-b]`): `dial_udp()` returns `UdpNotSupported`,
+  and the group reports no UDP support, so a UDP flow skips the rule that
+  targets it. meow cannot yet chain UDP through relay hops.
+
+To get chained UDP today, give the exit node a `dialer-proxy` instead of
+a relay group. Shadowsocks and SOCKS5 then open their UDP association
+through the front's own UDP relay, and Trojan, VLESS, Snell and mux
+sessions carry UDP inside the chained TCP stream (see the `dialer-proxy`
+entry under [Known-broken patterns](#known-broken-patterns)).
 
 **Error messages:** intermediate hop failures include the hop index and
 the inner error, e.g.: `"relay chain failed at hop 1 (proxy-b → proxy-c): <inner error>"`.
