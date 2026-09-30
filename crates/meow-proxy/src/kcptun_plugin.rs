@@ -212,7 +212,7 @@ impl KcptunClient {
                     debug!("kcptun: pooled session died ({e}); redialing");
                 }
                 Err(e) => {
-                    return Err(MeowError::Proxy(format!("kcptun: smux open_stream: {e}")));
+                    return Err(MeowError::io_with("kcptun: smux open_stream", e));
                 }
             }
         }
@@ -281,7 +281,7 @@ impl KcptunClient {
     /// session.
     async fn dial(&self) -> Result<Arc<smux::Session>> {
         let candidates = self.resolve().await?;
-        let mut last_err = None;
+        let mut last_err: Option<MeowError> = None;
         for remote in candidates {
             let socket = match self.dialer.dial_udp_endpoint(remote).await {
                 Ok(s) => s,
@@ -294,7 +294,10 @@ impl KcptunClient {
                             "kcptun: udp endpoint for {remote}: {e}"
                         )));
                     }
-                    last_err = Some(format!("kcptun: udp endpoint for {remote}: {e}"));
+                    last_err = MeowError::prefer_errno(
+                        last_err,
+                        MeowError::io_with(&format!("kcptun: udp endpoint for {remote}"), e),
+                    );
                     continue;
                 }
             };
@@ -305,13 +308,11 @@ impl KcptunClient {
             match self.start_session(socket) {
                 Ok(session) => return Ok(session),
                 Err(e) => {
-                    last_err = Some(format!("kcptun: session via {remote}: {e}"));
+                    last_err = MeowError::prefer_errno(last_err, e);
                 }
             }
         }
-        Err(MeowError::Proxy(
-            last_err.unwrap_or_else(|| "kcptun: no server address".into()),
-        ))
+        Err(last_err.unwrap_or_else(|| MeowError::Proxy("kcptun: no server address".into())))
     }
 
     async fn resolve(&self) -> Result<Vec<SocketAddr>> {
@@ -321,10 +322,7 @@ impl KcptunClient {
         meow_common::resolve_host_all(&self.server, self.port)
             .await
             .map_err(|e| {
-                MeowError::Proxy(format!(
-                    "kcptun: resolve {}:{}: {e}",
-                    self.server, self.port
-                ))
+                MeowError::io_with(&format!("kcptun: resolve {}:{}", self.server, self.port), e)
             })
     }
 
@@ -337,7 +335,7 @@ impl KcptunClient {
     ) -> Result<Arc<smux::Session>> {
         let conv = rand::random::<u32>();
         let kcp = KcpStream::connect(socket, conv, &self.cfg)
-            .map_err(|e| MeowError::Proxy(format!("kcptun: kcp connect: {e}")))?;
+            .map_err(|e| MeowError::io_with("kcptun: kcp connect", e))?;
         let io: Box<dyn Stream> = if self.cfg.no_comp {
             Box::new(kcp)
         } else {
@@ -354,7 +352,7 @@ impl KcptunClient {
             self.cfg.smux_buf as usize,
         )
         .map(Arc::new)
-        .map_err(|e| MeowError::Proxy(format!("kcptun: smux session: {e}")))
+        .map_err(|e| MeowError::io_with("kcptun: smux session", e))
     }
 }
 

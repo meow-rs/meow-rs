@@ -49,9 +49,12 @@ In scope:
    `Metadata` target — not the final target. Every subsequent hop runs
    `ProxyAdapter::connect_over` over the stream its predecessor
    established; the final hop receives the actual target.
-3. UDP relay through a relay chain when all proxies in the chain
-   support UDP and the final hop supports UDP. Returns `UdpNotSupported`
-   if any chain member lacks UDP support.
+3. UDP through a relay chain, sent from the chain's exit and never from
+   an earlier hop. DIRECT/COMPATIBLE hops are dropped (as upstream
+   does). With no proxy hops left a DIRECT hop sends the UDP; with one,
+   that hop's own `dial_udp` does. With two or more, `dial_udp` returns
+   `UdpNotSupported`: chaining UDP through relay hops is a follow-up
+   (issue #495 item 6).
 4. Minimum chain length: 2 proxies. Single-proxy `relay` is a
    configuration error — hard-error at parse time.
 5. `AdapterType::Relay` added to `meow-common/src/adapter_type.rs`.
@@ -150,7 +153,7 @@ ignored, matching upstream (it is a load-balance-only option there too).
 |---|------|:-----:|-----------|
 | 1 | Single-proxy relay (`proxies` length 1) — upstream silently acts as a passthrough | A | A single-proxy relay is a misconfiguration: the user likely intended a different group type. Hard-error at parse time: "relay group requires at least 2 proxies; use type: selector or type: direct for a single proxy". |
 | 2 | Empty `proxies` list — upstream panics | A | Hard-error at parse time. |
-| 3 | UDP relay when any chain member lacks UDP — upstream silently returns a non-functional conn | A | We return `UdpNotSupported` immediately from `dial_udp` if any chain member's `support_udp()` is false. NOT a silent partial relay. |
+| 3 | UDP across two or more proxy hops — upstream chains the exit's UDP through the earlier hops (`ListenPacketWithDialer`) | A | `dial_udp` returns `UdpNotSupported` before any hop runs, and `support_udp()` is false so UDP rules skip the group. UDP is NEVER sent from a hop other than the exit. |
 | 4 | `url`/`interval`/`lazy`/`tolerance`/`expected-status` present on relay group — upstream probes static members since `90bf158` | B | Warn-once per field at parse time. No routing change. |
 | 5 | `use`/`include-all`/`include-all-providers`/`filter`/`exclude-filter`/`exclude-type` present on relay group — upstream relay accepts provider members | B | Warn-once per field at parse time. Relay is static-only. |
 
@@ -287,7 +290,10 @@ impl ProxyAdapter for RelayGroup {
     fn name(&self) -> &str { &self.name }
     fn adapter_type(&self) -> AdapterType { AdapterType::Relay }
     fn support_udp(&self) -> bool {
-        self.proxies.iter().all(|p| p.support_udp())
+        // Non-touching peek: flatten, drop DIRECT hops, ask the exit.
+        let peek = Metadata { network: Network::Udp, ..Default::default() };
+        flatten_hops(&self.proxies, &peek, false)
+            .is_ok_and(|hops| udp_exit(&hops).is_some_and(|exit| exit.support_udp()))
     }
 
     async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
@@ -295,9 +301,7 @@ impl ProxyAdapter for RelayGroup {
     }
 
     async fn dial_udp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
-        if !self.support_udp() {
-            return Err(MeowError::UdpNotSupported);
-        }
+        // Exit hop's `dial_udp`, or `UdpNotSupported` for 2+ proxy hops.
         relay_udp(&self.proxies, metadata).await
     }
 }
@@ -328,9 +332,11 @@ boundary.
 3. Single-proxy chain hard-errors at config parse time. Class A per
    ADR-0002.
 4. Empty chain hard-errors at config parse time. Class A per ADR-0002.
-5. UDP relay succeeds when all chain members support UDP.
-6. UDP relay returns `UdpNotSupported` when any chain member lacks
-   UDP support. Class A per ADR-0002: NOT a silent partial relay.
+5. UDP relay through `[DIRECT, B]` is sent by B, and through
+   `[DIRECT, DIRECT]` by DIRECT.
+6. UDP relay returns `UdpNotSupported` when two or more proxy hops remain
+   or the exit lacks UDP support, and no hop's `dial_udp` runs. Class A
+   per ADR-0002: NOT sent from a hop other than the exit.
 7. Intermediate hop failure surfaces with hop index and inner error
    message. Not a raw inner error with no relay context.
 8. Inert health-check fields (`url`/`interval`/`lazy`/`tolerance`/
@@ -363,14 +369,11 @@ boundary.
   NOT warn-ignore — hard error.
 - `relay_empty_proxies_hard_errors_at_parse` — `proxies: []`.
   Class A. Upstream: panics.
-- `relay_udp_all_support_udp_succeeds` — all mock proxies have
-  `support_udp = true`; assert `dial_udp` completes.
-- `relay_udp_one_lacks_udp_returns_error` — one mock proxy has
-  `support_udp = false`; assert `Err(UdpNotSupported)`.
-  Class A per ADR-0002. Upstream: returns a non-functional conn.
-  NOT a silent failure — must be `UdpNotSupported` specifically.
-  Run this variant three times: lacking-UDP proxy is at position 0
-  (first hop), middle position, and last position — all must error.
+- `relay_udp_direct_then_proxy_exits_at_proxy` — `[DIRECT, B]`;
+  assert B's `dial_udp` runs and DIRECT's does not.
+- `relay_udp_two_proxy_hops_fail_closed` — `[A, B]`, both with UDP;
+  assert `Err(UdpNotSupported)` and that neither `dial_udp` ran.
+  Class A per ADR-0002. NOT sent from hop 0.
 - `relay_hop_failure_includes_hop_index` — mock proxy[1] errors;
   assert the returned `MeowError::RelayHopFailed` contains `hop == 1`.
   NOT a raw inner error with no relay context. `anyhow` NOT at boundary.

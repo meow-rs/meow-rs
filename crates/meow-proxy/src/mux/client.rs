@@ -8,6 +8,7 @@
 use super::h2mux;
 use super::muxcool;
 use super::packet::MuxPacketConn;
+use super::padding::PaddingConn;
 use super::request::Request;
 use super::smux;
 use super::stream::MuxStreamConn;
@@ -43,6 +44,7 @@ pub type DialFn =
 #[derive(Debug, Clone)]
 pub struct MuxOptions {
     pub protocol: Protocol,
+    /// sing-mux session padding (smux/yamux/h2mux only; Mux.Cool has none).
     pub padding: bool,
     pub max_connections: usize,
     pub min_streams: usize,
@@ -454,7 +456,12 @@ impl MuxClient {
         for _ in 0..2 {
             let session = match self.offer().await {
                 Ok(session) => session,
-                Err(e) => return Err(e),
+                // Prefer an earlier errno-backed open_stream failure
+                // over this context-only offer error (issue #668).
+                Err(e) => {
+                    return Err(MeowError::prefer_errno(last_err, e)
+                        .expect("prefer_errno returns Some for a provided next"))
+                }
             };
             // offer() reserved one slot on `streams` via CAS.  The
             // guard releases it if the open future is cancelled or the
@@ -477,7 +484,13 @@ impl MuxClient {
                 }
                 Err(e) => {
                     // reservation drops here → slot released
-                    last_err = Some(MeowError::Io(e));
+                    // A session refusing the stream open is a capability
+                    // refusal, not member health (same `Unsupported` arm
+                    // as the SS/kcptun/socks5 dial sites, issue #663).
+                    if e.kind() == std::io::ErrorKind::Unsupported {
+                        return Err(MeowError::NotSupported(format!("mux stream open: {e}")));
+                    }
+                    last_err = MeowError::prefer_errno(last_err, MeowError::Io(e));
                     continue;
                 }
             }
@@ -596,6 +609,14 @@ impl MuxClient {
                 .encode();
                 conn.write_all(&header).await.map_err(MeowError::Io)?;
                 conn.flush().await.map_err(MeowError::Io)?;
+                // sing-mux pads the session, not the request header: the
+                // server wraps its end once it has read the padding flag
+                // (and a `padding: true` server rejects unpadded clients).
+                let conn: Box<dyn ProxyConn> = if self.options.padding {
+                    Box::new(PaddingConn::new(conn))
+                } else {
+                    conn
+                };
                 Ok(match self.options.protocol {
                     Protocol::Smux => SessionKind::Smux(Arc::new(
                         smux::Session::client(conn).map_err(MeowError::Io)?,
@@ -835,6 +856,58 @@ mod tests {
             }
             drop(streams);
         }
+    }
+
+    /// Issue #495 item 11: with `padding: true` everything after the
+    /// version-1 request header is padding-framed, so the first smux frame
+    /// (SYN) arrives inside a `[len][padding_len]` frame rather than raw.
+    #[tokio::test]
+    async fn padding_frames_the_session_after_the_request_header() {
+        let (wire_tx, wire_rx) = tokio::sync::oneshot::channel();
+        let wire_tx = Arc::new(std::sync::Mutex::new(Some(wire_tx)));
+        let dial: DialFn = Arc::new(move || {
+            let wire_tx = Arc::clone(&wire_tx);
+            Box::pin(async move {
+                let (client_io, mut server_io) = tokio::io::duplex(64 * 1024);
+                tokio::spawn(async move {
+                    let mut header = [0u8; 5];
+                    server_io.read_exact(&mut header).await.unwrap();
+                    let mut request_padding =
+                        vec![0u8; usize::from(u16::from_be_bytes([header[3], header[4]]))];
+                    server_io.read_exact(&mut request_padding).await.unwrap();
+                    let mut frame = [0u8; 6];
+                    server_io.read_exact(&mut frame).await.unwrap();
+                    if let Some(tx) = wire_tx.lock().unwrap().take() {
+                        let _ = tx.send((header, frame));
+                    }
+                    let mut sink = [0u8; 4096];
+                    while matches!(server_io.read(&mut sink).await, Ok(n) if n > 0) {}
+                });
+                Ok(Box::new(TestConn(client_io)) as Box<dyn ProxyConn>)
+            })
+        });
+        let client = MuxClient::new(
+            dial,
+            MuxOptions {
+                protocol: Protocol::Smux,
+                padding: true,
+                ..MuxOptions::default()
+            },
+        );
+        let _stream = client.open_stream("a.example", 80).await.unwrap();
+
+        let (header, frame) = wire_rx.await.unwrap();
+        assert_eq!(
+            &header[..3],
+            &[1, Protocol::Smux as u8, 1],
+            "v1, smux, padded"
+        );
+        let padding = u16::from_be_bytes([frame[2], frame[3]]);
+        assert!(
+            (256..=767).contains(&padding),
+            "session must be padding-framed, got padding_len {padding}"
+        );
+        assert_eq!(&frame[4..], &[1, 0], "framed payload is the smux SYN");
     }
 
     #[tokio::test]

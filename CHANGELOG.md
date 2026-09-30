@@ -449,6 +449,44 @@ the canonical, in-repo source a release is cut from.
   `encryption` is set. Docker e2e runs a TLS 1.3 session with 1 MiB each
   way through Vision + TLS against Xray-core.
 
+- **Relay groups no longer send UDP out of the first hop.** A relay's UDP
+  went through hop 0 whenever every member supported UDP, so
+  `relay: [DIRECT, ss-b]` sent UDP straight from the host while its TCP
+  exited at `ss-b`, and `[ss-a, ss-b]` sent UDP out of `ss-a`. UDP now
+  leaves from the chain's exit, as in mihomo's relay: DIRECT hops are
+  dropped, an all-DIRECT chain sends UDP directly, and a chain with one
+  proxy hop sends it from that hop (subject to its own `udp` support).
+  meow cannot chain UDP through several proxy hops yet, so such a chain
+  now reports no UDP support and its `dial_udp` fails with
+  `UdpNotSupported` before any hop runs; UDP rules targeting it are
+  skipped, as for any outbound without UDP. Use `dialer-proxy` on the exit
+  node for chained UDP (#495 item 6).
+
+- **AnyTLS no longer logs one `info` line per proxied stream** (#495
+  item 13). The client session logged `Stream N SYNACK received
+  (success)` at `info` for every stream it opened, so a busy AnyTLS proxy
+  wrote a line per connection under the default `info` filter. It is now
+  `debug`, as are the peer's in-flight data frames that arrive after a
+  local close (a `warn` per late frame) and the vendored server's
+  per-stream `Destination` / `Successfully connected` lines. Refused
+  streams, unexpected frames and session failures keep their levels.
+
+- **sing-mux `padding: true` now produces a session the server can
+  parse** (#495 item 11). meow sent the version-1 request header with the
+  padding flag but then ran smux / yamux / h2mux over the raw connection,
+  while sing-mux wraps both ends in its padding layer after that header.
+  The server read our first smux / yamux / HTTP/2 bytes as a padding
+  header, and its padded replies reached our session as garbage. A
+  `padding: true` sing-box inbound also rejects clients that do not pad.
+  The session now runs over a `PaddingConn` that matches sing-mux's
+  `paddingConn`: the first 16 writes each way are framed as
+  `[len u16][padding_len u16][data][256..=767 padding bytes]`, and later
+  traffic passes through unframed. `padding: true` with
+  `protocol: muxcool` is now a config error, because Mux.Cool has no
+  padding and the node would go out unpadded. The sing-box e2e suite runs
+  padded smux, yamux and h2mux sessions against a `multiplex.padding: true`
+  inbound.
+
 - **Snell v4/v5 `reuse` keeps one connection for every session.** The
   reuse pool dropped a connection after its second session, on the belief
   that the v5 server closes it there. The official 4.0.0 through 5.0.1
@@ -467,6 +505,36 @@ the canonical, in-repo source a release is cut from.
   the half-close on every version, and the connection closes when it is
   dropped. Docker e2e now runs bulk echo, a post-half-close reply and UDP
   against official v3.0.1, v4.1.1 and v5.0.1 servers, not only v6.
+
+- **Local resource-exhaustion and wrapped capability dial errors no longer
+  dead-mark proxy-group members** — `DialFailureTracker` now walks
+  `RelayHopFailed` chains and io-boundary reconstitution instead of only
+  matching the top-level error variant: a `NotSupported`/`UdpNotSupported`
+  refused at hop N of a chained front, and an `EMFILE`/`ENFILE`/`ENOBUFS`/
+  `ENOMEM` raised by a local `socket()` call anywhere in the chain, are
+  both recognized as non-health signals and never count toward the
+  5-failures-in-5s dead-mark threshold. The `dialer-proxy` io boundary
+  (`ProxyDialer::dial_metadata`/`dial_udp_conn`) now preserves the front's
+  classification — capability refusals map to `ErrorKind::Unsupported` and
+  innermost io errors pass through with their `raw_os_error` intact —
+  instead of collapsing everything into an untyped `Other` string, and the
+  same preservation was applied at adapter transport boundaries
+  (`Shadowsocks` TCP connect/lookup, `TransportChain`/
+  `transport_to_proxy_err`, `AnyTls` session setup and TLS-handshake
+  hook, `kcptun` session/resolve, SOCKS5 TLS wrap, and Hysteria2
+  initial-and-mid-session send/resolve) so a plain un-chained member
+  keeps its errno too. Multi-candidate retry loops (direct TCP
+  multi-address connect and UDP connect including the chained
+  domain-target path, Shadowsocks chained and un-chained UDP
+  bind/connect, kcptun endpoint/session, mux stream-open, socket-protect
+  TCP host connect, Hysteria2 multi-address dial) now prefer an earlier
+  errno-bearing failure over a later context-only one instead of
+  last-wins, and errno-less `ErrorKind::OutOfMemory`/`Unsupported` io
+  errors classify through the same arms as raw-errno ones. Previously, a local
+  fd-exhaustion burst (e.g. a client connection storm under the launchd
+  256-fd soft limit) dead-marked every member of a url-test/fallback
+  group and collapsed load-balance groups into `NoProxyAvailable` until
+  the next probe sweep revived them (issues #663, #668).
 
 - **Snell UDP replies from IPv4-mapped sources are unmapped** — a server
   answering from `::ffff:a.b.c.d` (the v6 server does, for IPv4 targets)

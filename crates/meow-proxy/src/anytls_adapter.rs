@@ -135,7 +135,7 @@ impl ProxyAdapter for AnytlsAdapter {
             .client
             .create_proxy_stream((host, port))
             .await
-            .map_err(|e| MeowError::Proxy(format!("anytls dial: {e}")))?;
+            .map_err(|e| anytls_err("dial", e))?;
         Ok(Box::new(AnytlsConn::new(stream, session)))
     }
 
@@ -159,12 +159,15 @@ impl ProxyAdapter for AnytlsAdapter {
             .tls_layer
             .connect(Box::new(stream))
             .await
-            .map_err(|e| MeowError::Proxy(format!("anytls relay tls: {e}")))?;
+            .map_err(|e| match e {
+                meow_transport::TransportError::Io(e) => MeowError::Io(e),
+                other => MeowError::Proxy(format!("anytls relay tls: {other}")),
+            })?;
         let (stream, session) = self
             .client
             .create_proxy_stream_on_tls(tls_stream, (host, port))
             .await
-            .map_err(|e| MeowError::Proxy(format!("anytls relay dial: {e}")))?;
+            .map_err(|e| anytls_err("relay dial", e))?;
         Ok(Box::new(AnytlsConn::new_owned(stream, session)))
     }
 
@@ -203,7 +206,7 @@ impl ProxyAdapter for AnytlsAdapter {
                 Some(Bytes::from(encode_uot_request(metadata))),
             )
             .await
-            .map_err(|e| MeowError::Proxy(format!("anytls udp dial: {e}")))?;
+            .map_err(|e| anytls_err("udp dial", e))?;
         Ok(Box::new(AnytlsPacketConn::new(
             stream,
             session,
@@ -213,6 +216,16 @@ impl ProxyAdapter for AnytlsAdapter {
 
     fn health(&self) -> &ProxyHealth {
         &self.health
+    }
+}
+
+/// An `AnyTlsError::Io` carries the real io error — `raw_os_error` survives
+/// for `DialFailureTracker`'s local-resource classification (issue #668);
+/// stringifying it would dead-mark the member for EMFILE & friends.
+fn anytls_err(context: &str, e: anytls_rs::AnyTlsError) -> MeowError {
+    match e {
+        anytls_rs::AnyTlsError::Io(e) => MeowError::Io(e),
+        other => MeowError::Proxy(format!("anytls {context}: {other}")),
     }
 }
 
@@ -588,7 +601,7 @@ impl ProxyPacketConn for AnytlsPacketConn {
         self.stream
             .send_data(Bytes::from(frame))
             .await
-            .map_err(|e| MeowError::Proxy(format!("anytls udp write: {e}")))?;
+            .map_err(|e| anytls_err("udp write", e))?;
         Ok(buf.len())
     }
 
@@ -632,10 +645,16 @@ struct MeowTlsConnect {
 impl TlsConnect for MeowTlsConnect {
     fn connect(&self, tcp: TcpStream) -> TlsConnectFuture<'_> {
         Box::pin(async move {
-            let stream =
-                self.layer.connect(Box::new(tcp)).await.map_err(|e| {
-                    anytls_rs::AnyTlsError::Tls(format!("TLS handshake failed: {e}"))
-                })?;
+            let stream = self.layer.connect(Box::new(tcp)).await.map_err(|e| {
+                // Keep the socket io error verbatim — `anytls_err` maps
+                // `Io` back to `MeowError::Io`, so errno survives to the
+                // group dead-mark classifiers (issue #668); same arm the
+                // `connect_over` path takes.
+                match e {
+                    meow_transport::TransportError::Io(e) => anytls_rs::AnyTlsError::Io(e),
+                    other => anytls_rs::AnyTlsError::Tls(format!("TLS handshake failed: {other}")),
+                }
+            })?;
             Ok(Box::new(stream) as Box<dyn AsyncStream>)
         })
     }

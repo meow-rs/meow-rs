@@ -20,8 +20,8 @@ PM so the spec can be updated.
 - `RelayGroup::dial_tcp` through 2- and 3-proxy chains.
 - `connect_over` chain traversal: hop[0] uses `dial_tcp`, hops[1..] use
   `connect_over`.
-- UDP relay: all-support-UDP path and `UdpNotSupported` error at every chain
-  position.
+- UDP relay: sent from the chain's exit (DIRECT hops dropped), and
+  `UdpNotSupported` with no `dial_udp` call once two proxy hops remain.
 - Error type: `MeowError::RelayHopFailed { hop, source }` at each hop
   boundary, NOT raw inner error.
 - Parse-time errors: single proxy, empty proxies (Class A); inert
@@ -133,11 +133,13 @@ an `AsyncRead + AsyncWrite + ProxyConn` that accepts all bytes and returns EOF.
 
 | # | Case | Asserts |
 |---|------|---------|
-| C1 | `relay_udp_all_support_udp_succeeds` | All chain members have `support_udp: true`; `dial_udp()` returns Ok. `support_udp()` on the group returns true. |
-| C2 | `relay_udp_hop0_lacks_udp_returns_error` | Proxy at position 0 has `support_udp: false`; `dial_udp()` → `Err(UdpNotSupported)`. <br/> Upstream: silently returns a non-functional conn. <br/> NOT a partial relay. ADR-0002 Class A. |
-| C3 | `relay_udp_middle_hop_lacks_udp_returns_error` | 3-proxy chain; proxy at position 1 (middle) lacks UDP; `dial_udp()` → `Err(UdpNotSupported)`. Same error regardless of position. |
-| C4 | `relay_udp_last_hop_lacks_udp_returns_error` | Last proxy lacks UDP; `dial_udp()` → `Err(UdpNotSupported)`. |
-| C5 | `relay_support_udp_requires_all_members` | 3-proxy chain; one lacks UDP; `group.support_udp()` is false. When all support UDP, `support_udp()` is true. |
+| C1 | `relay_udp_direct_then_proxy_exits_at_proxy` | `[DIRECT, B]`: `support_udp()` is true, and `dial_udp()` runs on B, not on DIRECT. |
+| C2 | `relay_udp_two_proxy_hops_fail_closed` | `[A, B]`, both with UDP: `support_udp()` is false, `dial_udp()` → `Err(UdpNotSupported)`, and neither A's nor B's `dial_udp` (nor any TCP dial) ran. <br/> NOT sent from hop 0. ADR-0002 Class A. |
+| C3 | `relay_udp_multi_hop_fails_closed_for_every_shape` | `[A, DIRECT, B]`, `[A(no UDP), B]`, `[A, B(no UDP)]`, `[A, B, C]`: all fail closed the same way, with no `dial_udp` call. |
+| C4 | `relay_udp_all_direct_sends_from_direct` | `[DIRECT, DIRECT]`: `support_udp()` is true and the first DIRECT sends the UDP. |
+| C5 | `relay_udp_exit_without_udp_fails_closed` | `[A(no UDP), DIRECT]` and `[DIRECT, A(no UDP)]`: `support_udp()` is false and `dial_udp()` → `Err(UdpNotSupported)` without calling A. |
+| C6 | `relay_udp_group_member_resolving_to_one_hop_acts_as_leaf` | A Selector hop or a nested relay that flattens to one proxy hop behaves like that leaf; a nested relay that adds a second proxy hop fails closed. |
+| C7 | `relay_support_udp_peek_does_not_touch_groups` | `support_udp()` on `[DIRECT, load-balance]` neither records usage nor advances round-robin; the next `dial_udp` does both once. |
 
 ---
 
@@ -191,6 +193,6 @@ All 5 spec divergence rows have test coverage:
 |----------|:-----:|------------|
 | 1 — Single-proxy relay → hard error (not passthrough) | A | B1 |
 | 2 — Empty proxy list → hard error (not panic) | A | B2 |
-| 3 — Any chain member lacks UDP → `UdpNotSupported` (not silent) | A | C2, C3, C4 |
+| 3 — UDP across two or more proxy hops → `UdpNotSupported` (never sent from hop 0) | A | C2, C3, C6 |
 | 4 — `url`/`interval`/`lazy`/`tolerance`/`expected-status` fields → warn-once (not error) | B | B3, B4, B5, B6 |
 | 5 — `use`/`include-all*`/`filter`/`exclude-*` fields → warn-once (not error) | B | B7 |

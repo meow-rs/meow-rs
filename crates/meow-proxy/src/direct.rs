@@ -338,7 +338,12 @@ impl ProxyAdapter for DirectAdapter {
             .await
             {
                 Ok(stream) => return Ok(Box::new(DirectConn(stream))),
-                Err(err) => last_err = Some(err),
+                // An errno-backed connect failure (e.g. EMFILE on
+                // socket()) outranks a later context-only error — the
+                // errno is what dead-mark classification reads (issue
+                // #668); this error also escapes through relay hop-0 /
+                // dialer-proxy front boundaries.
+                Err(err) => last_err = MeowError::prefer_errno(last_err, err),
             }
         }
 
@@ -372,7 +377,7 @@ impl ProxyAdapter for DirectAdapter {
                 let socket = match meow_common::bind_udp(bind).await {
                     Ok(s) => s,
                     Err(e) => {
-                        last_err = Some(e);
+                        last_err = MeowError::prefer_errno_io(last_err, e);
                         continue;
                     }
                 };
@@ -383,7 +388,7 @@ impl ProxyAdapter for DirectAdapter {
                             bound: Some(addr),
                         }));
                     }
-                    Err(e) => last_err = Some(e),
+                    Err(e) => last_err = MeowError::prefer_errno_io(last_err, e),
                 }
             }
             return Err(MeowError::Io(last_err.unwrap_or_else(|| {
