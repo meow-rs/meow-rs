@@ -298,14 +298,6 @@ impl<S> Snell<S> {
         self.peer_half_closed
     }
 
-    /// Whether the zero chunk alone completes a local half-close. A v6
-    /// server aborts the whole session on transport EOF — dropping any
-    /// reply the upstream has yet to send — so its write side must stay
-    /// open until the connection is dropped.
-    pub fn half_close_keeps_transport(&self) -> bool {
-        matches!(self.inner, SnellInner::V6(_))
-    }
-
     /// Stage a single frame carrying `buf` verbatim as a UDP datagram
     /// payload. v4 uses its packet-frame path to keep one datagram in one
     /// frame; v3 mirrors mihomo and writes through the regular AEAD stream.

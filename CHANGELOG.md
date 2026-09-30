@@ -423,6 +423,16 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **Snell v3–v5 half-close no longer loses the upstream's reply.** After
+  the protocol zero chunk, a session without `reuse` also closed the TCP
+  write side. The official servers (3.0.1, 4.1.1 and 5.0.1, like 6.0)
+  abort the whole session on that FIN, so a reply the upstream sent after
+  the client finished writing (e.g. a request/response protocol that
+  half-closes) was dropped and the read failed. The zero chunk now ends
+  the half-close on every version, and the connection closes when it is
+  dropped. Docker e2e now runs bulk echo, a post-half-close reply and UDP
+  against official v3.0.1, v4.1.1 and v5.0.1 servers, not only v6.
+
 - **Snell UDP replies from IPv4-mapped sources are unmapped** — a server
   answering from `::ffff:a.b.c.d` (the v6 server does, for IPv4 targets)
   is now reported as `a.b.c.d`, so the reply source matches the target

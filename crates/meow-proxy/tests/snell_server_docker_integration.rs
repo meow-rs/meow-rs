@@ -14,9 +14,11 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
-use tokio::time::{sleep, timeout, Duration, Instant};
+use tokio::time::{sleep, timeout, timeout_at, Duration, Instant};
 
 const IMAGE_SNELL_V3: &str = "geekdada/snell-server:3.0.1";
+const IMAGE_SNELL_V4: &str = "geekdada/snell-server:4.1.1";
+const IMAGE_SNELL_V5: &str = "geekdada/snell-server:5.0.1";
 const IMAGE_SNELL_V6: &str = "geekdada/snell-server:6.0.0rc2";
 const PSK: &str = "meow-snell-docker-psk";
 const T: Duration = Duration::from_secs(30);
@@ -268,21 +270,6 @@ async fn start_udp_echo_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
     (addr, handle)
 }
 
-fn adapter(port: u16) -> SnellAdapter {
-    SnellAdapter::new(
-        "docker-snell-v3",
-        "127.0.0.1",
-        port,
-        PSK,
-        SnellObfs::None,
-        SnellVersion::V3,
-        true,
-        false,
-        Arc::new(DirectDialer),
-    )
-    .expect("snell adapter must build")
-}
-
 /// Direct dialer that counts TCP dials, so reuse is observable end to end.
 struct CountingDialer(Arc<AtomicUsize>);
 
@@ -299,20 +286,30 @@ impl TcpDialer for CountingDialer {
     }
 }
 
-fn v6_adapter(port: u16, mode: SnellV6Mode, reuse: bool, dials: &Arc<AtomicUsize>) -> SnellAdapter {
+fn counted_adapter(
+    port: u16,
+    version: SnellVersion,
+    reuse: bool,
+    dials: &Arc<AtomicUsize>,
+) -> SnellAdapter {
     SnellAdapter::new(
-        "docker-snell-v6",
+        "docker-snell",
         "127.0.0.1",
         port,
         PSK,
         SnellObfs::None,
-        SnellVersion::V6,
+        version,
         true,
         reuse,
         Arc::new(CountingDialer(Arc::clone(dials))),
     )
-    .and_then(|adapter| adapter.with_v6_mode(mode))
-    .expect("snell v6 adapter must build")
+    .expect("snell adapter must build")
+}
+
+fn v6_adapter(port: u16, mode: SnellV6Mode, reuse: bool, dials: &Arc<AtomicUsize>) -> SnellAdapter {
+    counted_adapter(port, SnellVersion::V6, reuse, dials)
+        .with_v6_mode(mode)
+        .expect("snell v6 adapter must build")
 }
 
 fn metadata_for(addr: SocketAddr, network: Network) -> Metadata {
@@ -321,21 +318,6 @@ fn metadata_for(addr: SocketAddr, network: Network) -> Metadata {
         host: addr.ip().to_string().into(),
         dst_port: addr.port(),
         ..Default::default()
-    }
-}
-
-async fn dial_tcp_with_retry(
-    adapter: &SnellAdapter,
-    metadata: &Metadata,
-) -> meow_common::Result<Box<dyn meow_common::ProxyConn>> {
-    let deadline = Instant::now() + T;
-    loop {
-        match adapter.dial_tcp(metadata).await {
-            Ok(conn) => return Ok(conn),
-            Err(e) if Instant::now() >= deadline => return Err(e),
-            Err(_) => {}
-        }
-        sleep(Duration::from_millis(250)).await;
     }
 }
 
@@ -415,52 +397,122 @@ async fn v6_round_trips(mode: SnellV6Mode) {
         return;
     };
     wait_until_listening(&server, server_port).await;
+    // Datagrams past the 16 KiB cap of earlier versions.
+    fresh_round_trips(&server, 20_000, |reuse, dials| {
+        v6_adapter(server_port, mode, reuse, dials)
+    })
+    .await;
+    pooled_round_trips(&server, |reuse, dials| {
+        v6_adapter(server_port, mode, reuse, dials)
+    })
+    .await;
+}
+
+/// v3–v5, whose servers take the `obfs` setting (off here) instead of a
+/// `mode`.
+async fn versioned_round_trips(image: &str, version: SnellVersion, max_datagram: usize) {
+    let server_port = free_tcp_port();
+    let Some(server) = start_snell_server(server_port, image, "obfs = off\n") else {
+        return;
+    };
+    wait_until_listening(&server, server_port).await;
+    fresh_round_trips(&server, max_datagram, |reuse, dials| {
+        counted_adapter(server_port, version, reuse, dials)
+    })
+    .await;
+}
+
+/// Bulk echo, a reply the upstream sends only after the client's
+/// half-close, and UDP up to `max_datagram` bytes — each session on a
+/// connection of its own. `adapter(reuse, dials)` builds the client.
+/// Echo one datagram of each length in `lens` through a UDP association.
+/// UDP is best-effort, and the official v3.0.1 server now and then drops the
+/// first datagram of an association on a busy host, so a datagram whose echo
+/// does not arrive is resent with a fresh payload. A late echo of an earlier
+/// payload is skipped; any other reply fails the test.
+async fn udp_echo_round_trips(
+    packets: &dyn ProxyPacketConn,
+    echo: SocketAddr,
+    lens: &[usize],
+    server: &SnellServer,
+) {
+    const ATTEMPTS: u8 = 3;
+    const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut unanswered = Vec::new();
+    'datagrams: for (i, &len) in (0u8..).zip(lens) {
+        for attempt in 0..ATTEMPTS {
+            let datagram = patterned(len, 3 + i * ATTEMPTS + attempt);
+            timeout(T, packets.write_packet(&datagram, &echo))
+                .await
+                .expect("udp write timed out")
+                .expect("udp write failed");
+            let deadline = Instant::now() + ATTEMPT_TIMEOUT;
+            while let Ok(read) = timeout_at(deadline, packets.read_packet(&mut buf)).await {
+                let (n, src) = read.expect("udp read failed");
+                assert_eq!(src, echo);
+                if buf[..n] == datagram[..] {
+                    continue 'datagrams;
+                }
+                assert!(
+                    unanswered.iter().any(|sent: &Vec<u8>| buf[..n] == sent[..]),
+                    "udp datagram of {len} B changed"
+                );
+            }
+            unanswered.push(datagram);
+        }
+        panic!(
+            "udp echo of {len} B timed out after {ATTEMPTS} attempts\n{}",
+            server.logs()
+        );
+    }
+}
+
+async fn fresh_round_trips(
+    server: &SnellServer,
+    max_datagram: usize,
+    adapter: impl Fn(bool, &Arc<AtomicUsize>) -> SnellAdapter,
+) {
     let (tcp_echo, _tcp_h) = start_tcp_echo_server().await;
     let (eof_reply, _eof_h) = start_reply_after_eof_server().await;
     let (udp_echo, _udp_h) = start_udp_echo_server().await;
-    let echo_md = metadata_for(tcp_echo, Network::Tcp);
-    let eof_md = metadata_for(eof_reply, Network::Tcp);
 
-    // One connection per session: several records per direction (well past
-    // the 64 KiB record cap), then the zero-chunk half-close.
+    // Several records per direction, then the zero-chunk half-close.
     let dials = Arc::new(AtomicUsize::new(0));
-    let fresh = v6_adapter(server_port, mode, false, &dials);
-    let conn = timeout(T, fresh.dial_tcp(&echo_md))
+    let fresh = adapter(false, &dials);
+    let conn = timeout(T, fresh.dial_tcp(&metadata_for(tcp_echo, Network::Tcp)))
         .await
         .expect("dial timed out")
         .expect("dial failed");
-    bulk_echo(conn, &patterned(300 * 1024, 1), &server).await;
-    let conn = timeout(T, fresh.dial_tcp(&eof_md))
+    bulk_echo(conn, &patterned(300 * 1024, 1), server).await;
+    let conn = timeout(T, fresh.dial_tcp(&metadata_for(eof_reply, Network::Tcp)))
         .await
         .expect("dial timed out")
         .expect("dial failed");
-    reply_after_eof(conn, &patterned(90 * 1024, 2), &server).await;
+    reply_after_eof(conn, &patterned(90 * 1024, 2), server).await;
 
     let udp_md = metadata_for(udp_echo, Network::Udp);
     let packets = timeout(T, fresh.dial_udp(&udp_md))
         .await
         .expect("udp associate timed out")
         .unwrap_or_else(|e| panic!("udp associate failed: {e}\n{}", server.logs()));
-    let mut buf = vec![0u8; 64 * 1024];
-    for (seed, len) in [(3u8, 21usize), (4, 1400), (5, 20_000)] {
-        let datagram = patterned(len, seed);
-        timeout(T, packets.write_packet(&datagram, &udp_echo))
-            .await
-            .expect("udp write timed out")
-            .expect("udp write failed");
-        let (n, src) = timeout(T, packets.read_packet(&mut buf))
-            .await
-            .unwrap_or_else(|_| panic!("udp read of {len} B timed out\n{}", server.logs()))
-            .expect("udp read failed");
-        assert_eq!(src, udp_echo);
-        assert!(buf[..n] == datagram[..], "udp datagram of {len} B changed");
-    }
+    udp_echo_round_trips(&*packets, udp_echo, &[21, 1400, max_datagram], server).await;
     assert_eq!(dials.load(Ordering::SeqCst), 3, "one dial per session");
+}
 
-    // Reuse: every session after the first rides the pooled connection,
-    // including one that waits on the upstream's post-EOF reply.
+/// Four sessions over one pooled connection, including one that waits on
+/// the upstream's post-EOF reply.
+async fn pooled_round_trips(
+    server: &SnellServer,
+    adapter: impl Fn(bool, &Arc<AtomicUsize>) -> SnellAdapter,
+) {
+    let (tcp_echo, _tcp_h) = start_tcp_echo_server().await;
+    let (eof_reply, _eof_h) = start_reply_after_eof_server().await;
+    let echo_md = metadata_for(tcp_echo, Network::Tcp);
+    let eof_md = metadata_for(eof_reply, Network::Tcp);
+
     let dials = Arc::new(AtomicUsize::new(0));
-    let pooled = v6_adapter(server_port, mode, true, &dials);
+    let pooled = adapter(true, &dials);
     for session in 0u8..4 {
         let md = if session == 2 { &eof_md } else { &echo_md };
         let conn = timeout(T, pooled.dial_tcp(md))
@@ -469,70 +521,36 @@ async fn v6_round_trips(mode: SnellV6Mode) {
             .expect("dial failed");
         let payload = patterned(40 * 1024, 10 + session);
         if session == 2 {
-            reply_after_eof(conn, &payload, &server).await;
+            reply_after_eof(conn, &payload, server).await;
         } else {
-            bulk_echo(conn, &payload, &server).await;
+            bulk_echo(conn, &payload, server).await;
         }
         wait_for_pool_size(&pooled, 1).await;
     }
     assert_eq!(
         dials.load(Ordering::SeqCst),
         1,
-        "v6 sessions must share one connection\n{}",
+        "sessions must share one connection\n{}",
         server.logs()
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn snell_v3_docker_tcp_and_udp_round_trip() {
-    let server_port = free_tcp_port();
-    let Some(server) = start_snell_server(server_port, IMAGE_SNELL_V3, "obfs = off\n") else {
-        return;
-    };
-    sleep(Duration::from_millis(500)).await;
-    let (tcp_echo, _tcp_h) = start_tcp_echo_server().await;
-    let (udp_echo, _udp_h) = start_udp_echo_server().await;
-    let adapter = adapter(server_port);
+async fn snell_v3_docker_round_trips() {
+    versioned_round_trips(IMAGE_SNELL_V3, SnellVersion::V3, 16_000).await;
+}
 
-    let tcp_metadata = metadata_for(tcp_echo, Network::Tcp);
-    let mut conn = match timeout(T, dial_tcp_with_retry(&adapter, &tcp_metadata)).await {
-        Ok(Ok(conn)) => conn,
-        Ok(Err(e)) => panic!("snell v3 TCP dial failed: {e}\n{}", server.logs()),
-        Err(_) => panic!("snell v3 TCP dial timed out\n{}", server.logs()),
-    };
-    let tcp_payload = b"meow snell docker tcp";
-    timeout(T, conn.write_all(tcp_payload))
-        .await
-        .expect("tcp write timed out")
-        .expect("tcp write failed");
-    timeout(T, conn.flush())
-        .await
-        .expect("tcp flush timed out")
-        .expect("tcp flush failed");
-    let mut tcp_buf = vec![0u8; tcp_payload.len()];
-    timeout(T, conn.read_exact(&mut tcp_buf))
-        .await
-        .expect("tcp read timed out")
-        .expect("tcp read failed");
-    assert_eq!(&tcp_buf, tcp_payload);
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snell_v4_docker_round_trips() {
+    versioned_round_trips(IMAGE_SNELL_V4, SnellVersion::V4, 16_000).await;
+}
 
-    let udp_metadata = metadata_for(udp_echo, Network::Udp);
-    let packet_conn: Box<dyn ProxyPacketConn> = timeout(T, adapter.dial_udp(&udp_metadata))
-        .await
-        .expect("udp associate timed out")
-        .unwrap_or_else(|e| panic!("udp associate failed: {e}\n{}", server.logs()));
-    let udp_payload = b"meow snell docker udp";
-    timeout(T, packet_conn.write_packet(udp_payload, &udp_echo))
-        .await
-        .expect("udp write timed out")
-        .expect("udp write failed");
-    let mut udp_buf = [0u8; 1500];
-    let (n, src) = timeout(T, packet_conn.read_packet(&mut udp_buf))
-        .await
-        .unwrap_or_else(|_| panic!("udp read timed out\n{}", server.logs()))
-        .expect("udp read failed");
-    assert_eq!(src, udp_echo);
-    assert_eq!(&udp_buf[..n], udp_payload);
+/// A v5 server splits a reply bigger than its current record size (about
+/// 5 KB on a fresh connection) across records, and a UDP response frame has
+/// no length to reassemble it by, so datagrams stay below that.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snell_v5_docker_round_trips() {
+    versioned_round_trips(IMAGE_SNELL_V5, SnellVersion::V5, 4_000).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

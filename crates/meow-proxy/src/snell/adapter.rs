@@ -401,14 +401,16 @@ struct PooledConn {
     reuse_failed: bool,
 }
 
+/// Local half-close progress. It ends at the flushed zero chunk: every
+/// Snell server version aborts the whole session on transport EOF, dropping
+/// any reply the upstream has yet to send, so the write side stays open until
+/// the connection is dropped (or pooled).
 #[derive(Clone, Copy)]
 enum LocalHalfClose {
     Open,
     WritingZero,
     FlushingZero,
     Sent,
-    ClosingTransport,
-    Closed,
     Failed,
 }
 
@@ -442,9 +444,9 @@ async fn finish_local_half_close(snell: &mut PoolStream, state: LocalHalfClose) 
         }
         LocalHalfClose::FlushingZero => snell.flush().await,
         LocalHalfClose::Sent => Ok(()),
-        LocalHalfClose::ClosingTransport | LocalHalfClose::Closed | LocalHalfClose::Failed => Err(
-            io::Error::other("snell: pooled connection cannot finish protocol half-close"),
-        ),
+        LocalHalfClose::Failed => Err(io::Error::other(
+            "snell: pooled connection cannot finish protocol half-close",
+        )),
     }
 }
 
@@ -535,38 +537,7 @@ impl AsyncWrite for PooledConn {
                         }
                     }
                 }
-                LocalHalfClose::Sent
-                    if this.pool.is_some()
-                        || this
-                            .inner
-                            .as_ref()
-                            .is_some_and(PoolStream::half_close_keeps_transport) =>
-                {
-                    return Poll::Ready(Ok(()));
-                }
-                LocalHalfClose::Sent => {
-                    // Non-pooled v3/v4 sessions still need the underlying
-                    // write side closed after their protocol zero-chunk is
-                    // flushed.
-                    this.local_half_close = LocalHalfClose::ClosingTransport;
-                }
-                LocalHalfClose::ClosingTransport => {
-                    let inner = this
-                        .inner
-                        .as_mut()
-                        .expect("PooledConn::poll_shutdown after take");
-                    match Pin::new(inner).poll_shutdown(cx) {
-                        Poll::Pending => return Poll::Pending,
-                        Poll::Ready(Err(e)) => {
-                            this.local_half_close = LocalHalfClose::Failed;
-                            return Poll::Ready(Err(e));
-                        }
-                        Poll::Ready(Ok(())) => {
-                            this.local_half_close = LocalHalfClose::Closed;
-                        }
-                    }
-                }
-                LocalHalfClose::Closed => return Poll::Ready(Ok(())),
+                LocalHalfClose::Sent => return Poll::Ready(Ok(())),
                 LocalHalfClose::Failed => {
                     return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::BrokenPipe,
@@ -603,10 +574,7 @@ impl Drop for PooledConn {
         }
 
         let state = self.local_half_close;
-        if matches!(
-            state,
-            LocalHalfClose::ClosingTransport | LocalHalfClose::Closed | LocalHalfClose::Failed
-        ) {
+        if matches!(state, LocalHalfClose::Failed) {
             return;
         }
         if tokio::runtime::Handle::try_current().is_err() {
@@ -722,13 +690,36 @@ mod tests {
         assert_eq!(&body, b"ok");
     }
 
-    /// A v6 server tears the session down on transport EOF, so a
-    /// half-close must stop at the zero chunk: the upstream's late reply
-    /// still has to reach the client.
+    /// Every Snell server version tears the session down on transport EOF,
+    /// so a half-close must stop at the zero chunk: the upstream's late
+    /// reply still has to reach the client.
     #[tokio::test]
-    async fn v6_half_close_keeps_the_transport_open_for_the_reply() {
-        use super::super::protocol::is_zero_chunk;
+    async fn half_close_keeps_the_transport_open_for_the_reply() {
+        use super::super::v4::V4Conn;
         use super::super::v6::V6Conn;
+
+        let psk: Arc<[u8]> = Arc::from(b"test-psk".as_slice());
+        let (client, server) = tokio::io::duplex(1 << 16);
+        let peer = V3Conn::new(server, Arc::clone(&psk));
+        half_close_then_late_reply(SnellVersion::V3, client, peer).await;
+        let (client, server) = tokio::io::duplex(1 << 16);
+        let peer = V4Conn::new(server, Arc::clone(&psk));
+        half_close_then_late_reply(SnellVersion::V4, client, peer).await;
+        let (client, server) = tokio::io::duplex(1 << 16);
+        let codec = V6Codec::new(SnellV6Mode::Default, b"test-psk");
+        let peer = V6Conn::new(server, psk, codec);
+        half_close_then_late_reply(SnellVersion::V6, client, peer).await;
+    }
+
+    /// Half-close a `version` session to `peer` (the server side of
+    /// `client`), check that only the zero chunk crossed, then have the peer
+    /// reply.
+    async fn half_close_then_late_reply<P: AsyncRead + AsyncWrite + Unpin>(
+        version: SnellVersion,
+        client: DuplexStream,
+        mut peer: P,
+    ) {
+        use super::super::protocol::is_zero_chunk;
         use std::task::Waker;
 
         let adapter = SnellAdapter::new(
@@ -737,7 +728,7 @@ mod tests {
             8443,
             "test-psk",
             SnellObfs::None,
-            SnellVersion::V6,
+            version,
             false,
             false,
             Arc::new(crate::dialer::DirectDialer),
@@ -748,29 +739,33 @@ mod tests {
             dst_port: 443,
             ..Metadata::default()
         };
-        let (client, server) = tokio::io::duplex(1 << 16);
-        let psk: Arc<[u8]> = Arc::from(b"test-psk".as_slice());
-        let mut peer = V6Conn::new(server, psk, V6Codec::new(SnellV6Mode::Default, b"test-psk"));
-
         let mut conn = within(adapter.connect_over(Box::new(TestProxyConn(client)), &metadata))
             .await
             .unwrap();
         within(conn.write_all(b"ping")).await.unwrap();
         within(conn.shutdown()).await.unwrap();
 
-        let mut expected = connect_request("example.com", 443, true).unwrap();
+        // v6 always sends the reuse-capable request.
+        let mut expected =
+            connect_request("example.com", 443, version == SnellVersion::V6).unwrap();
         expected.extend_from_slice(b"ping");
         let mut got = vec![0u8; expected.len()];
         within(peer.read_exact(&mut got)).await.unwrap();
-        assert_eq!(got, expected);
+        assert_eq!(got, expected, "{version:?}");
         let err = within(peer.read(&mut [0u8; 1])).await.unwrap_err();
-        assert!(is_zero_chunk(&err), "expected the zero chunk, got {err}");
+        assert!(
+            is_zero_chunk(&err),
+            "{version:?}: expected the zero chunk, got {err}"
+        );
         let mut probe = [0u8; 1];
         let polled = Pin::new(&mut peer).poll_read(
             &mut Context::from_waker(Waker::noop()),
             &mut ReadBuf::new(&mut probe),
         );
-        assert!(polled.is_pending(), "half-close sent a transport FIN");
+        assert!(
+            polled.is_pending(),
+            "{version:?}: half-close sent a transport FIN"
+        );
 
         within(peer.write_all(&[RESPONSE_TUNNEL])).await.unwrap();
         within(peer.write_all(b"late")).await.unwrap();
@@ -778,6 +773,6 @@ mod tests {
         within(peer.flush()).await.unwrap();
         let mut reply = Vec::new();
         within(conn.read_to_end(&mut reply)).await.unwrap();
-        assert_eq!(reply, b"late");
+        assert_eq!(reply, b"late", "{version:?}");
     }
 }
