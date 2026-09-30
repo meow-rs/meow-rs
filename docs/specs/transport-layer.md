@@ -311,28 +311,44 @@ pub enum TransportError {
     WebSocket(String),
     #[error("grpc framing: {0}")]
     Grpc(String),
+    #[error("h2: {0}")]
+    H2(String),
     #[error("http upgrade: {0}")]
     HttpUpgrade(String),
+    #[error("xhttp: {0}")]
+    Xhttp(String),
     #[error("invalid config: {0}")]
     Config(String),
 }
 ```
 
 Adapters (VMess, VLESS, Trojan) convert `TransportError` into
-`MeowError::Proxy(...)` at the crate boundary. The conversion lives
+`MeowError` at the crate boundary. The conversion lives
 in `meow-proxy` (not in `meow-common` or `meow-transport`),
 preserving ADR-0001 §1's leaf-crate rule.
 
 **Form: free function, not `From` impl.** The orphan rule blocks
 `impl From<TransportError> for MeowError` in `meow-proxy` because
-both types are foreign to that crate. The canonical shape is:
+both types are foreign to that crate. The canonical shape preserves
+`Io` verbatim — its `raw_os_error` feeds `DialFailureTracker`'s
+local-resource classification (issues #663/#668/#680), so only
+genuinely context-only variants stringify:
 
 ```rust
 // crates/meow-proxy/src/lib.rs
 pub(crate) fn transport_to_proxy_err(e: TransportError) -> MeowError {
-    MeowError::Proxy(e.to_string())
+    match e {
+        TransportError::Io(e) => MeowError::Io(e),
+        other => MeowError::Proxy(other.to_string()),
+    }
 }
 ```
+
+Producer side, the crate likewise extracts io payloads before
+tagging: `tungstenite::Error::Io`, `h2::Error`'s io kind, and boring's
+`HandshakeError::as_io_error()` all surface as `TransportError::Io`
+(helpers `h2_common::{h2_to_io, h2_to_transport}`, `ws::tung_to_io`,
+`ConnectTypedError::into_transport`).
 
 Call sites use `.map_err(transport_to_proxy_err)?` instead of `?`. The
 ergonomic cost is trivial and grep-ability is higher than a `From`

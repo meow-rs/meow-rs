@@ -93,7 +93,7 @@ impl Transport for H2Layer {
         let (mut h2, conn) = crate::h2_common::client_builder()
             .handshake::<_, bytes::Bytes>(inner)
             .await
-            .map_err(|e| TransportError::H2(e.to_string()))?;
+            .map_err(|e| crate::h2_common::h2_to_transport(e, TransportError::H2))?;
 
         // Drive the h2 connection (SETTINGS, WINDOW_UPDATE, PING, …) in a
         // background task so control frames keep flowing while we stream data.
@@ -109,7 +109,7 @@ impl Transport for H2Layer {
             Ok(Ok(ready_h2)) => ready_h2,
             Ok(Err(e)) => {
                 abort_handle.abort();
-                return Err(TransportError::H2(e.to_string()));
+                return Err(crate::h2_common::h2_to_transport(e, TransportError::H2));
             }
             Err(_) => {
                 abort_handle.abort();
@@ -124,7 +124,7 @@ impl Transport for H2Layer {
             Ok(parts) => parts,
             Err(e) => {
                 abort_handle.abort();
-                return Err(TransportError::H2(e.to_string()));
+                return Err(crate::h2_common::h2_to_transport(e, TransportError::H2));
             }
         };
 

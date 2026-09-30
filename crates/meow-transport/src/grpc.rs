@@ -104,7 +104,7 @@ impl Transport for GrpcLayer {
         let (mut h2, conn) = crate::h2_common::client_builder()
             .handshake::<_, Bytes>(inner)
             .await
-            .map_err(|e| TransportError::Grpc(e.to_string()))?;
+            .map_err(|e| crate::h2_common::h2_to_transport(e, TransportError::Grpc))?;
 
         // Drive the connection in a background task.  The connection future
         // must be polled continuously to process h2 control frames (SETTINGS,
@@ -122,7 +122,7 @@ impl Transport for GrpcLayer {
                 // Dropping the JoinHandle would detach the driver with an
                 // unbounded shutdown flush; abort it explicitly (issue #669).
                 conn_driver.abort();
-                return Err(TransportError::Grpc(e.to_string()));
+                return Err(crate::h2_common::h2_to_transport(e, TransportError::Grpc));
             }
         };
 
@@ -426,7 +426,7 @@ impl AsyncRead for GunStream {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(None) => return Poll::Ready(Ok(())), // clean EOF
                 Poll::Ready(Some(Err(e))) => {
-                    return Poll::Ready(Err(io::Error::other(e)));
+                    return Poll::Ready(Err(crate::h2_common::h2_to_io(e)));
                 }
                 Poll::Ready(Some(Ok(bytes))) => {
                     // Release flow-control window back to the sender.
@@ -491,14 +491,14 @@ impl AsyncWrite for GunStream {
             }
             Poll::Ready(Some(Err(e))) => {
                 this.pending_write = None;
-                Poll::Ready(Err(io::Error::other(e)))
+                Poll::Ready(Err(crate::h2_common::h2_to_io(e)))
             }
             Poll::Ready(Some(Ok(_capacity))) => {
                 // Capacity granted — send the frame.
                 let encoded = this.pending_write.take().expect("set above");
                 this.send
                     .send_data(encoded, false)
-                    .map_err(io::Error::other)?;
+                    .map_err(crate::h2_common::h2_to_io)?;
                 Poll::Ready(Ok(buf.len()))
             }
         }
@@ -523,7 +523,9 @@ impl AsyncWrite for GunStream {
         // in a single poll (cancellation-safe) and is bounded to one frame.
         let frame = this.pending_write.take().unwrap_or_default();
         // DATA (possibly empty) + EOS signals end of the request stream.
-        this.send.send_data(frame, true).map_err(io::Error::other)?;
+        this.send
+            .send_data(frame, true)
+            .map_err(crate::h2_common::h2_to_io)?;
         Poll::Ready(Ok(()))
     }
 }

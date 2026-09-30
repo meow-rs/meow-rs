@@ -37,6 +37,20 @@ const RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 /// response, not the open.  Mirrors `SESSION_SETUP_TIMEOUT` (5 s).
 const OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Surface an io-carrying `h2::Error` as the inner `io::Error` verbatim —
+/// `io::Error::other` would erase its `raw_os_error`, which
+/// `DialFailureTracker`'s local-resource classification needs
+/// (issue #680).
+fn h2_to_io(e: h2::Error) -> io::Error {
+    if e.is_io() {
+        if let Some(io) = e.into_io() {
+            return io;
+        }
+        return io::Error::other("h2mux io error");
+    }
+    io::Error::other(e)
+}
+
 /// h2mux session over one physical connection (client role).  The concrete
 /// IO type is erased — the driver task owns the h2 connection.
 pub struct Session {
@@ -56,7 +70,7 @@ impl Session {
         let (send_request, connection) = meow_transport::h2_common::client_builder()
             .handshake::<_, Bytes>(io)
             .await
-            .map_err(io::Error::other)?;
+            .map_err(h2_to_io)?;
         let dead = Arc::new(AtomicBool::new(false));
         let driver_dead = Arc::clone(&dead);
         // Drive SETTINGS / WINDOW_UPDATE / PING frames; the future resolves
@@ -90,10 +104,10 @@ impl Session {
         send_request = tokio::time::timeout(OPEN_TIMEOUT, send_request.ready())
             .await
             .map_err(|_| io::Error::other("h2mux: timed out waiting for send readiness (open)"))?
-            .map_err(io::Error::other)?;
+            .map_err(h2_to_io)?;
         let (response_future, send_stream) = send_request
             .send_request(request, false)
-            .map_err(io::Error::other)?;
+            .map_err(h2_to_io)?;
         Ok(Stream::new(
             send_stream,
             RecvState::with_timeout(
@@ -423,5 +437,51 @@ Connection: close
             std::io::ErrorKind::InvalidInput,
             "expected InvalidInput, got {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod io_preserve_tests {
+    use super::*;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::ReadBuf;
+
+    /// An inner stream that fails every op with a raw errno (issue #680).
+    #[derive(Debug)]
+    struct ErrnoStream(i32);
+
+    impl AsyncRead for ErrnoStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::from_raw_os_error(self.0)))
+        }
+    }
+
+    impl AsyncWrite for ErrnoStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Err(io::Error::from_raw_os_error(self.0)))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::from_raw_os_error(self.0)))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::from_raw_os_error(self.0)))
+        }
+    }
+
+    #[tokio::test]
+    async fn session_client_preserves_handshake_errno() {
+        let Err(err) = Session::client(ErrnoStream(105)).await else {
+            panic!("handshake on an always-failing stream must error");
+        };
+        assert_eq!(err.raw_os_error(), Some(105));
     }
 }

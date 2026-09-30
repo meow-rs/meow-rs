@@ -437,6 +437,19 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **Transport layers no longer flatten io-bearing handshake/stream
+  errors into strings** (issue #680, follow-up to #663/#668). After
+  `connect()` succeeds, `EMFILE`-class errors can't recur mid-handshake,
+  but `ENOBUFS`/`ENOMEM` still can — and those reached
+  `DialFailureTracker` stringified, falsely dead-marking healthy group
+  members under local buffer/memory pressure. tungstenite `Error::Io`,
+  `h2::Error` io payloads (h2/grpc/xhttp transports and h2mux session
+  setup), boring handshake `as_io_error()` (including the shadow-tls v3
+  cover-handshake verdict), and `TransportError::Io` re-wraps
+  (`reality_tls`) now surface the original `io::Error` instead of a
+  string — the raw errno where the upstream layer keeps it (h2 itself
+  reduces post-handshake io errors to `ErrorKind` only).
+
 - **`meow install` no longer writes a broken systemd unit when a path
   contains spaces, quotes, backslashes, `%`, or `$`** (issue #689).
   `generate_systemd_unit()` interpolated the binary, config, and working

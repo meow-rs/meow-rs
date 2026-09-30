@@ -188,7 +188,7 @@ impl Transport for XhttpLayer {
         let (mut h2, conn) = crate::h2_common::client_builder()
             .handshake::<_, bytes::Bytes>(inner)
             .await
-            .map_err(|e| TransportError::Xhttp(e.to_string()))?;
+            .map_err(|e| crate::h2_common::h2_to_transport(e, TransportError::Xhttp))?;
 
         let driver_task = tokio::spawn(async move {
             let _ = conn.await;
@@ -198,7 +198,7 @@ impl Transport for XhttpLayer {
             Ok(Ok(ready_h2)) => ready_h2,
             Ok(Err(e)) => {
                 abort_handle.abort();
-                return Err(TransportError::Xhttp(e.to_string()));
+                return Err(crate::h2_common::h2_to_transport(e, TransportError::Xhttp));
             }
             Err(_) => {
                 abort_handle.abort();
@@ -213,7 +213,7 @@ impl Transport for XhttpLayer {
             Ok(parts) => parts,
             Err(e) => {
                 abort_handle.abort();
-                return Err(TransportError::Xhttp(e.to_string()));
+                return Err(crate::h2_common::h2_to_transport(e, TransportError::Xhttp));
             }
         };
 

@@ -34,6 +34,17 @@ use tracing::warn;
 
 use crate::{Result, Stream, Transport, TransportError};
 
+/// Surface `tungstenite::Error::Io` as the original `io::Error` — its
+/// `raw_os_error` feeds `DialFailureTracker`'s local-resource
+/// classification; wrapping it in `io::Error::other` would erase the
+/// errno (issue #680).
+fn tung_to_io(e: tokio_tungstenite::tungstenite::Error) -> io::Error {
+    match e {
+        tokio_tungstenite::tungstenite::Error::Io(io) => io,
+        e => io::Error::other(e),
+    }
+}
+
 /// Footprint-bounded WebSocket config (tungstenite defaults to a 128 KiB
 /// write buffer per connection and 64 MiB max message, which inflates RSS at
 /// high concurrency). 4 KiB matches `RELAY_BUF_SIZE` and is plenty for the
@@ -212,7 +223,10 @@ impl Transport for WsLayer {
             .map_err(|_| {
                 TransportError::WebSocket(format!("ws upgrade timed out after {UPGRADE_TIMEOUT:?}"))
             })?
-            .map_err(|e| TransportError::WebSocket(e.to_string()))?;
+            .map_err(|e| match e {
+                tokio_tungstenite::tungstenite::Error::Io(io) => TransportError::Io(io),
+                e => TransportError::WebSocket(e.to_string()),
+            })?;
             Ok(Box::new(WsStream::connected(ws)))
         } else {
             // Deferred path — accumulate early data on first writes.
@@ -400,7 +414,7 @@ fn begin_upgrade(state: &mut PendingState) -> UpgradeTask {
         .await
         {
             Ok(Ok((ws, _))) => Ok(ws),
-            Ok(Err(e)) => Err(io::Error::other(e)),
+            Ok(Err(e)) => Err(tung_to_io(e)),
             Err(_) => Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!("ws upgrade timed out after {UPGRADE_TIMEOUT:?}"),
@@ -483,7 +497,7 @@ impl AsyncRead for WsStream {
                     };
                     match msg {
                         None => return Poll::Ready(Ok(())), // EOF
-                        Some(Err(e)) => return Poll::Ready(Err(io::Error::other(e))),
+                        Some(Err(e)) => return Poll::Ready(Err(tung_to_io(e))),
                         Some(Ok(Message::Binary(data))) => {
                             state.read_buf = data;
                             state.read_pos = 0;
@@ -557,7 +571,7 @@ impl AsyncWrite for WsStream {
                     match Pin::new(&mut state.ws).poll_ready(cx) {
                         Poll::Ready(Ok(())) => {}
                         Poll::Ready(Err(e)) => {
-                            return Poll::Ready(Err(io::Error::other(e)));
+                            return Poll::Ready(Err(tung_to_io(e)));
                         }
                         Poll::Pending => return Poll::Pending,
                     }
@@ -570,7 +584,7 @@ impl AsyncWrite for WsStream {
                     if let Err(e) = Pin::new(&mut state.ws)
                         .start_send(Message::Binary(Bytes::copy_from_slice(buf)))
                     {
-                        return Poll::Ready(Err(io::Error::other(e)));
+                        return Poll::Ready(Err(tung_to_io(e)));
                     }
                     // Drive the queued frame onto the wire. tokio-tungstenite's
                     // Sink buffers messages internally — without an explicit
@@ -579,7 +593,7 @@ impl AsyncWrite for WsStream {
                     // both sides deadlock.
                     match Pin::new(&mut state.ws).poll_flush(cx) {
                         Poll::Ready(Ok(())) | Poll::Pending => {}
-                        Poll::Ready(Err(e)) => return Poll::Ready(Err(io::Error::other(e))),
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(tung_to_io(e))),
                     }
                     return Poll::Ready(Ok(buf.len()));
                 }
@@ -603,9 +617,7 @@ impl AsyncWrite for WsStream {
                     }
                 }
                 WsInner::Connected(state) => {
-                    return Pin::new(&mut state.ws)
-                        .poll_flush(cx)
-                        .map_err(io::Error::other);
+                    return Pin::new(&mut state.ws).poll_flush(cx).map_err(tung_to_io);
                 }
             }
         }
@@ -624,9 +636,7 @@ impl AsyncWrite for WsStream {
                     Poll::Ready(Ok(())) => {}
                 },
                 WsInner::Connected(state) => {
-                    return Pin::new(&mut state.ws)
-                        .poll_close(cx)
-                        .map_err(io::Error::other);
+                    return Pin::new(&mut state.ws).poll_close(cx).map_err(tung_to_io);
                 }
             }
         }
@@ -686,5 +696,74 @@ mod tests {
         config.early_data_header_name = Some("Bad Header".into());
 
         assert_invalid_config(config, "invalid request config");
+    }
+}
+
+#[cfg(test)]
+mod io_preserve_tests {
+    use super::*;
+
+    #[test]
+    fn tung_to_io_preserves_raw_errno() {
+        // 105 = ENOBUFS on Linux; opaque elsewhere — the assert is
+        // round-trip preservation, not the platform meaning.
+        let e = tokio_tungstenite::tungstenite::Error::Io(io::Error::from_raw_os_error(105));
+        let io = tung_to_io(e);
+        assert_eq!(io.raw_os_error(), Some(105));
+    }
+
+    /// An inner stream that fails every op with a raw errno (issue #680).
+    struct ErrnoStream(i32);
+
+    impl AsyncRead for ErrnoStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::from_raw_os_error(self.0)))
+        }
+    }
+
+    impl AsyncWrite for ErrnoStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Err(io::Error::from_raw_os_error(self.0)))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::from_raw_os_error(self.0)))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::from_raw_os_error(self.0)))
+        }
+    }
+
+    #[tokio::test]
+    async fn eager_connect_surfaces_io_errno() {
+        let layer = WsLayer::new(WsConfig {
+            path: "/".into(),
+            host_header: Some("example.com".into()),
+            extra_headers: Vec::new(),
+            max_early_data: 0,
+            early_data_header_name: None,
+        })
+        .expect("config");
+        let Err(err) = layer.connect(Box::new(ErrnoStream(105))).await else {
+            panic!("upgrade on an always-failing stream must error");
+        };
+        match err {
+            TransportError::Io(io) => assert_eq!(io.raw_os_error(), Some(105)),
+            other => panic!("io-bearing upgrade failure must surface as Io, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tung_to_io_keeps_non_io_errors_wrapped() {
+        let io = tung_to_io(tokio_tungstenite::tungstenite::Error::ConnectionClosed);
+        assert_eq!(io.raw_os_error(), None);
+        assert_eq!(io.kind(), io::ErrorKind::Other);
     }
 }

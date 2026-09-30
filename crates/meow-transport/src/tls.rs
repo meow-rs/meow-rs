@@ -43,6 +43,8 @@
 //! Configs carrying `additional_roots` / `client_cert` (or the
 //! per-construction `random` fingerprint) bypass the cache.
 
+use std::io;
+
 use async_trait::async_trait;
 use tracing::warn;
 
@@ -355,7 +357,19 @@ impl<S> ConnectTypedError<S> {
     pub fn into_transport(self) -> TransportError {
         match self {
             Self::Transport(e) => e,
-            Self::Handshake(e) => TransportError::Tls(format!("boring TLS handshake: {e}")),
+            Self::Handshake(e) => {
+                // Preserve the inner io error (raw errno) when the
+                // handshake failed at the socket layer — ENOBUFS/ENOMEM
+                // must reach DialFailureTracker's local-resource
+                // classification intact (issue #680).
+                match e.as_io_error() {
+                    Some(io_err) => TransportError::Io(match io_err.raw_os_error() {
+                        Some(errno) => io::Error::from_raw_os_error(errno),
+                        None => io::Error::new(io_err.kind(), format!("boring TLS handshake: {e}")),
+                    }),
+                    None => TransportError::Tls(format!("boring TLS handshake: {e}")),
+                }
+            }
         }
     }
 }

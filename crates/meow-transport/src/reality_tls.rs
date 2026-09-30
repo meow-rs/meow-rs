@@ -573,7 +573,12 @@ fn spawn_reality_stream(state: RealityConnected) -> Box<dyn Stream> {
 }
 
 fn transport_io_error(e: TransportError) -> io::Error {
-    io::Error::other(e)
+    // Keep `Io` payloads verbatim — `raw_os_error` feeds downstream
+    // local-resource classification (issue #680).
+    match e {
+        TransportError::Io(io) => io,
+        e => io::Error::other(e),
+    }
 }
 
 fn build_reality_client_hello(
@@ -1425,6 +1430,14 @@ fn put_u24(value: usize, out: &mut Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transport_io_error_preserves_io_payload() {
+        let io = transport_io_error(TransportError::Io(io::Error::from_raw_os_error(105)));
+        assert_eq!(io.raw_os_error(), Some(105));
+        let io = transport_io_error(TransportError::Tls("verdict".into()));
+        assert_eq!(io.raw_os_error(), None);
+    }
 
     #[test]
     fn reality_client_hello_writes_32_byte_session_id() {

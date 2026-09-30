@@ -9,10 +9,42 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+use crate::TransportError;
+
 /// Grace window for an h2 conn driver to finish after its last stream
 /// drops; the driver is aborted past it (wedged-flush peers could
 /// otherwise pin the socket indefinitely, issue #669).
 pub(crate) const DRIVER_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Extract the inner [`io::Error`] from an `h2::Error`, preserving the
+/// raw OS error (errno) for callers that classify local-resource
+/// failures — stringifying `ENOBUFS`/`ENOMEM` into `io::Error::other`
+/// would erase the signal `DialFailureTracker` relies on (issue #680).
+pub(crate) fn h2_to_io(e: h2::Error) -> io::Error {
+    if e.is_io() {
+        match e.into_io() {
+            Some(io) => io,
+            // `is_io()` implies `into_io()` is Some; stay panic-free.
+            None => io::Error::other("h2 io error"),
+        }
+    } else {
+        io::Error::other(e)
+    }
+}
+
+/// Same extraction for the connect path: io-bearing h2 errors become
+/// [`TransportError::Io`], everything else keeps its per-layer tag.
+pub(crate) fn h2_to_transport(e: h2::Error, tag: fn(String) -> TransportError) -> TransportError {
+    // `get_io` borrows first so the non-io Display survives `into_io`'s
+    // consume-either-way semantics.
+    if e.get_io().is_some() {
+        match e.into_io() {
+            Some(io) => return TransportError::Io(io),
+            None => return tag("h2 io error".into()),
+        }
+    }
+    tag(e.to_string())
+}
 
 /// Per-stream receive window advertised in the client SETTINGS
 /// (`SETTINGS_INITIAL_WINDOW_SIZE`).  h2's default is the RFC 9113 initial
@@ -127,7 +159,7 @@ impl RecvState {
                 }
                 Poll::Ready(Err(error)) => {
                     self.inner = RecvInner::Failed;
-                    return Poll::Ready(Err(io::Error::other(error)));
+                    return Poll::Ready(Err(h2_to_io(error)));
                 }
             },
         }
@@ -319,7 +351,7 @@ impl AsyncRead for H2Stream {
                     {
                         return Poll::Ready(Ok(()));
                     }
-                    return Poll::Ready(Err(io::Error::other(error)));
+                    return Poll::Ready(Err(h2_to_io(error)));
                 }
                 Poll::Ready(Some(Ok(bytes))) => {
                     let _ = recv.flow_control().release_capacity(bytes.len());
@@ -386,7 +418,7 @@ impl AsyncWrite for H2Stream {
             }
             Poll::Ready(Some(Err(error))) => {
                 this.pending_write = None;
-                Poll::Ready(Err(io::Error::other(error)))
+                Poll::Ready(Err(h2_to_io(error)))
             }
             Poll::Ready(Some(Ok(capacity))) => {
                 let data = this.pending_write.take().expect("set above");
@@ -406,7 +438,7 @@ impl AsyncWrite for H2Stream {
                 }
                 let chunk = data.slice(..allowed);
                 if let Err(error) = this.send.send_data(chunk, false) {
-                    return Poll::Ready(Err(io::Error::other(error)));
+                    return Poll::Ready(Err(h2_to_io(error)));
                 }
                 if allowed < data.len() {
                     // Short write: the unsent remainder is dropped (the
@@ -928,5 +960,82 @@ mod tests {
         })
         .await
         .expect("driver must terminate after drop");
+    }
+}
+
+#[cfg(test)]
+mod io_preserve_tests {
+    use super::*;
+
+    /// An inner stream that fails every operation with a raw errno —
+    /// stands in for socket-level resource exhaustion (issue #680).
+    #[derive(Debug)]
+    struct ErrnoStream(i32);
+
+    impl AsyncRead for ErrnoStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::from_raw_os_error(self.0)))
+        }
+    }
+
+    impl AsyncWrite for ErrnoStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Err(io::Error::from_raw_os_error(self.0)))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::from_raw_os_error(self.0)))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::from_raw_os_error(self.0)))
+        }
+    }
+
+    async fn handshake_errno_error() -> h2::Error {
+        // 105 = ENOBUFS on Linux; the value is opaque here — the test
+        // asserts round-trip preservation, not the platform meaning.
+        let raw = 105;
+        client_builder()
+            .handshake::<_, Bytes>(ErrnoStream(raw))
+            .await
+            .expect_err("handshake against an always-failing stream must error")
+    }
+
+    #[tokio::test]
+    async fn h2_to_io_preserves_raw_errno() {
+        let err = handshake_errno_error().await;
+        assert!(err.is_io(), "handshake failure must carry io: {err}");
+        let io = h2_to_io(err);
+        assert_eq!(io.raw_os_error(), Some(105));
+    }
+
+    #[tokio::test]
+    async fn h2_to_transport_maps_io_to_io_variant() {
+        let err = handshake_errno_error().await;
+        match h2_to_transport(err, TransportError::H2) {
+            TransportError::Io(io) => assert_eq!(io.raw_os_error(), Some(105)),
+            other => panic!("io-bearing h2 error must surface as Io, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn h2_to_transport_keeps_tag_for_protocol_errors() {
+        // A non-io h2 error keeps its per-layer tag instead of
+        // masquerading as Io (`From<Reason>` makes a reset-kind error).
+        let err = h2::Error::from(h2::Reason::INTERNAL_ERROR);
+        assert!(!err.is_io());
+        match h2_to_transport(err, TransportError::H2) {
+            TransportError::H2(_) => {}
+            other => panic!("protocol error must keep the layer tag, got {other:?}"),
+        }
+        let io = h2_to_io(h2::Error::from(h2::Reason::REFUSED_STREAM));
+        assert_eq!(io.raw_os_error(), None);
     }
 }

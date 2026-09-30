@@ -234,6 +234,22 @@ async fn dial_v3(
         }
         Err(ConnectTypedError::Transport(e)) => return Err(e),
         Err(ConnectTypedError::Handshake(e)) => {
+            // A socket-layer io failure (e.g. ENOBUFS mid-handshake) is
+            // not an authorization verdict — surface it verbatim so the
+            // local-resource classifier sees the errno (issue #680).
+            // Shim-authored io errors ("hmac mismatch", …) carry no errno
+            // and keep flowing to the verdict arms below.
+            if let Some(io_err) = e.as_io_error() {
+                if let Some(errno) = io_err.raw_os_error() {
+                    return Err(TransportError::Io(io::Error::from_raw_os_error(errno)));
+                }
+                if io_err.kind() == io::ErrorKind::OutOfMemory {
+                    return Err(TransportError::Io(io::Error::new(
+                        io_err.kind(),
+                        format!("boring TLS handshake: {e}"),
+                    )));
+                }
+            }
             // TLS 1.2 covers only: the plaintext handshake runs cert
             // verification before it dies at Finished, so the aborted
             // session's verify result is meaningful.  TLS 1.3 covers
