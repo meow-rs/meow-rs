@@ -156,21 +156,24 @@ Built-in web UI served at `http://<api-addr>/ui` with:
 
 ## Benchmarks
 
-Side-by-side against upstream Go mihomo v1.19.29 on the same host (Apple M4 arm64, macOS 26.5.2, loopback `127.0.0.1`). Both binaries use identical config: `mode: direct`, SOCKS5 listener on port 17890, DNS disabled. Reproduce with `bash bench.sh` (auto-downloads the latest Go mihomo release).
+Side-by-side against upstream Go mihomo v1.19.31 on the same host (Apple M4 Pro arm64, macOS 27.0.1, loopback `127.0.0.1`). Both binaries use the same direct-mode benchmark config with a mixed listener on port 17890; the DNS workload uses the matching fake-IP config on UDP port 15353. The table below reports the median of three successful runs from commit `095912e7` (`meow-rs` 0.21.2, rustc 1.97.1). Reproduce with `bash bench.sh` (auto-downloads the latest Go mihomo release).
 
-| Metric | mihomo (Go) v1.19.29 | meow-rs v0.20.1 | Delta |
+| Metric | mihomo (Go) v1.19.31 | meow-rs v0.21.2 | Delta |
 |--------|-------------|--------------------|-------|
-| Binary size (stripped) | 41.2 MB | **8.6 MB** | **−79%** |
-| RSS idle | 29.6 MB | **9.9 MB** | **−67%** |
-| RSS under load (peak) | 41.0 MB | **13.5 MB** | **−67%** |
-| TCP throughput, 64 MB×1 | 31.30 Gbps | 19.07 Gbps | −39% |
-| TCP throughput, 1 MB×10 | 35.77 Gbps | 18.86 Gbps | −47% |
-| TCP throughput, 4 KB×10000 | 2.14 Gbps | 1.99 Gbps | −7% |
-| Latency p50 (connect + 1 B echo) | 135 µs | **130 µs** | **−4%** |
-| Latency p99 | 198 µs | 232 µs | +17% |
-| Connections/sec (10 s, concurrency 64) | 711 /s | 714 /s | ±0% |
+| Binary size (stripped) | 54.0 MB | **7.8 MB** | **−86%** |
+| RSS idle | 31.3 MB | **9.7 MB** | **−69%** |
+| RSS under load (peak) | 42.4 MB | **12.2 MB** | **−71%** |
+| TCP throughput, 64 MB×1 | 14.40 Gbps | **14.91 Gbps** | **+4%** |
+| TCP throughput, 1 MB×10 | 17.19 Gbps | 16.76 Gbps | −2% |
+| TCP throughput, 4 KB×10000 | 1.25 Gbps | 1.24 Gbps | −1% |
+| Latency p50 (connect + 1 B echo) | 217 µs | **199 µs** | **−8%** |
+| Latency p95 | 323 µs | **250 µs** | **−23%** |
+| Latency p99 | 415 µs | **293 µs** | **−29%** |
+| Connections/sec (10 s, concurrency 64) | 588 /s | **724 /s** | **+23%** |
+| DNS QPS (50% cache hit) | 21,491 | **30,795** | **+43%** |
+| DNS p99 latency | 89 µs | **60 µs** | **−32%** |
 
-Per-metric medians of three `bash bench.sh` runs; numbers will vary with host load. Loopback bulk-transfer throughput measures per-proxy CPU overhead, not real-network throughput — both kernels saturate multi-Gbps links with headroom. For the full methodology, three-run-median protocol, and workload definitions (W1–W5), see [ADR-0006](docs/adr/0006-m2-benchmark-methodology.md) and [docs/benchmarks/index.md](docs/benchmarks/index.md).
+The table covers the direct and DNS legs. The optional proxied-outbound leg requires `sing-box`; the idle, steady-state, and config-reload legs write separate JSON artifacts under `target/bench/`. Numbers vary with host load, and the p99 latency spread was higher than the 10% acceptance band in this sample, so treat these as a current snapshot rather than a release gate. Loopback bulk-transfer throughput measures per-proxy CPU overhead, not real-network throughput. For the full methodology, three-run-median protocol, and workload definitions (W1–W5), see [ADR-0006](docs/adr/0006-m2-benchmark-methodology.md) and [docs/benchmarks/index.md](docs/benchmarks/index.md).
 
 ## Architecture
 
