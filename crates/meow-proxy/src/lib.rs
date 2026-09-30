@@ -183,13 +183,20 @@ pub(crate) fn check_not_desynced(
 /// A `From<TransportError> for MeowError` blanket impl is not possible here
 /// due to Rust's orphan rules (neither type is local to `meow-proxy`).
 /// Adapters call `.map_err(transport_to_proxy_err)?` at the connection
-/// boundary instead — this is the single conversion point.
+/// boundary instead — or hand-roll the identical `Io`-arm-preserving
+/// match inline where a per-site context string is needed (e.g.
+/// `socks5_adapter`, `anytls_adapter`).
 ///
 /// ADR-0001 §1 invariants still hold:
 /// - No adapter constructs `TransportError` variants by hand.
 /// - No `anyhow::Error` crosses the `meow-transport` boundary.
-#[cfg(any(feature = "ss", feature = "trojan", feature = "vless"))]
 #[allow(clippy::needless_pass_by_value)] // used as map_err(fn) callback — must take by value
 pub(crate) fn transport_to_proxy_err(e: meow_transport::TransportError) -> meow_common::MeowError {
-    meow_common::MeowError::Proxy(e.to_string())
+    // An `Io` arm carries the real io error — `raw_os_error` survives for
+    // `DialFailureTracker`'s local-resource classification (issue #668);
+    // stringifying it would dead-mark members for EMFILE & friends.
+    match e {
+        meow_transport::TransportError::Io(e) => meow_common::MeowError::Io(e),
+        other => meow_common::MeowError::Proxy(other.to_string()),
+    }
 }

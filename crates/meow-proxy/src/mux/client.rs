@@ -454,7 +454,12 @@ impl MuxClient {
         for _ in 0..2 {
             let session = match self.offer().await {
                 Ok(session) => session,
-                Err(e) => return Err(e),
+                // Prefer an earlier errno-backed open_stream failure
+                // over this context-only offer error (issue #668).
+                Err(e) => {
+                    return Err(MeowError::prefer_errno(last_err, e)
+                        .expect("prefer_errno returns Some for a provided next"))
+                }
             };
             // offer() reserved one slot on `streams` via CAS.  The
             // guard releases it if the open future is cancelled or the
@@ -477,7 +482,13 @@ impl MuxClient {
                 }
                 Err(e) => {
                     // reservation drops here → slot released
-                    last_err = Some(MeowError::Io(e));
+                    // A session refusing the stream open is a capability
+                    // refusal, not member health (same `Unsupported` arm
+                    // as the SS/kcptun/socks5 dial sites, issue #663).
+                    if e.kind() == std::io::ErrorKind::Unsupported {
+                        return Err(MeowError::NotSupported(format!("mux stream open: {e}")));
+                    }
+                    last_err = MeowError::prefer_errno(last_err, MeowError::Io(e));
                     continue;
                 }
             }

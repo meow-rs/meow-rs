@@ -83,7 +83,17 @@ async fn connect_new(cfg: Arc<Config>) -> Result<ConnHandle> {
     let server = ServerTarget::parse(&cfg.server_addr)?;
     let addrs = meow_common::resolve_host_all(&server.host, server.port)
         .await
-        .map_err(|e| Error::Resolve(format!("{}:{}: {e}", server.host, server.port)))?;
+        .map_err(|e| {
+            // errno-bearing failures (e.g. EMFILE opening the resolver
+            // socket under local fd pressure) keep the `Io` arm so the
+            // errno survives to `MeowError::Io`; context-only errors keep
+            // the `Resolve` shape (issue #668).
+            if meow_common::MeowError::io_errno_backed(&e) {
+                Error::Io(e)
+            } else {
+                Error::Resolve(format!("{}:{}: {e}", server.host, server.port))
+            }
+        })?;
     let server_name = if cfg.server_name.trim().is_empty() {
         server.host.clone()
     } else {
@@ -94,15 +104,32 @@ async fn connect_new(cfg: Arc<Config>) -> Result<ConnHandle> {
     for addr in addrs {
         match timeout(CONNECT_TIMEOUT, connect_addr(&cfg, addr, &server_name)).await {
             Ok(Ok(handle)) => return Ok(handle),
-            Ok(Err(e)) => last_error = Some(e),
+            Ok(Err(e)) => last_error = remember(last_error, e),
             Err(_) => {
-                last_error = Some(Error::Quic(format!(
-                    "connect timeout after {CONNECT_TIMEOUT:?}"
-                )));
+                last_error = remember(
+                    last_error,
+                    Error::Quic(format!("connect timeout after {CONNECT_TIMEOUT:?}")),
+                );
             }
         }
     }
     Err(last_error.unwrap_or_else(|| Error::Resolve("no address resolved".into())))
+}
+
+/// `last_error` accumulation for the multi-address dial loop: an
+/// errno-bearing io failure (e.g. EMFILE on the UDP bind — local
+/// exhaustion, not member health, issue #668) outranks context-only
+/// errors like a later candidate's timeout, which would otherwise mask
+/// the classification dead-marking reads.
+fn remember(prev: Option<Error>, next: Error) -> Option<Error> {
+    let next_errno = matches!(next, Error::Io(ref e) if meow_common::MeowError::io_errno_backed(e));
+    let prev_errno =
+        matches!(prev, Some(Error::Io(ref e)) if meow_common::MeowError::io_errno_backed(e));
+    if next_errno || !prev_errno {
+        Some(next)
+    } else {
+        prev
+    }
 }
 
 async fn connect_addr(
@@ -180,5 +207,41 @@ mod tests {
         let target = ServerTarget::parse("[::1]:443").unwrap();
         assert_eq!(target.host, "::1");
         assert_eq!(target.port, 443);
+    }
+
+    #[test]
+    fn remember_prefers_errno_over_context_only_errors() {
+        let emfile = Error::Io(std::io::Error::from_raw_os_error(1));
+        let timeout_err = Error::Quic("connect timeout".into());
+        // errno first, timeout second: errno survives.
+        let acc = remember(Some(emfile), timeout_err);
+        assert!(matches!(acc, Some(Error::Io(_))));
+        // timeout first, errno second: errno replaces it.
+        let acc = remember(
+            Some(Error::Quic("connect timeout".into())),
+            Error::Io(std::io::Error::from_raw_os_error(1)),
+        );
+        assert!(matches!(acc, Some(Error::Io(_))));
+        // Two context-only errors: the last one wins (historical shape).
+        let acc = remember(
+            Some(Error::Quic("first".into())),
+            Error::Quic("second".into()),
+        );
+        assert!(matches!(acc, Some(Error::Quic(ref s)) if s == "second"));
+        // An io error without errno does not gain precedence — neither
+        // as `next` (last-wins takes it, same as any context error)…
+        let acc = remember(
+            Some(Error::Quic("first".into())),
+            Error::Io(std::io::Error::other("ctx")),
+        );
+        assert!(matches!(acc, Some(Error::Io(_))));
+        // …nor as `prev`: `driver.rs` synthesizes errno-less io errors
+        // ("quiche send: {e}"), and they must not veto a later candidate
+        // — this is the discriminating direction.
+        let acc = remember(
+            Some(Error::Io(std::io::Error::other("ctx"))),
+            Error::Quic("second".into()),
+        );
+        assert!(matches!(acc, Some(Error::Quic(ref s)) if s == "second"));
     }
 }
