@@ -1,5 +1,5 @@
 use crate::cache::{DnsCache, DnsCacheSnapshotEntry, FamilyCacheHit, FamilyNeg, QueryFamilies};
-use crate::client::{DnsClient, FamilyAnswer, FamilySet};
+use crate::client::{prefer_errno, ClientError, DnsClient, FamilyAnswer, FamilySet};
 use crate::fakeip::{Pool, Skipper};
 use crate::upstream::{HostOrIp, NameServerEntry, NameServerUrl};
 use dashmap::DashMap;
@@ -11,6 +11,7 @@ use meow_common::DnsMode;
 use meow_trie::DomainTrie;
 use smol_str::SmolStr;
 use std::collections::{BTreeSet, HashMap};
+use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -60,7 +61,11 @@ pub enum BootstrapError {
 
 /// Broadcast channel used to share a singleflight lookup result.
 /// Capacity 1 is enough — subscribers call `recv()` at most once.
-type InflightTx = tokio::sync::broadcast::Sender<Option<FamilySet>>;
+///
+/// The `Err` arm is `Arc<ClientError>` so every subscriber sees the
+/// same errno-bearing cause when the whole flight failed (#682);
+/// `Ok(None)` means the flight produced no answer.
+type InflightTx = tokio::sync::broadcast::Sender<Result<Option<FamilySet>, Arc<ClientError>>>;
 
 /// Singleflight registry: one map per queried family set (keyed by
 /// `Arc<str>` so lookups go through a borrowed `&str` via
@@ -457,20 +462,25 @@ impl FamilySet {
 const NEGATIVE_GRACE_PERIOD: Duration = Duration::from_millis(300);
 
 /// Query a pool of clients in parallel for the requested family set `want`,
-/// returning the first positive resolution or, after a short grace period, the
-/// first definitive negative (review issue C: a fast NODATA/NXDOMAIN from a
-/// healthy upstream no longer waits out a dead upstream's full 5 s timeout).
-/// `Err` (network failure) is not definitive — keep racing the remaining
-/// clients. The grace period prevents a fast negative from suppressing a slow
-/// positive in split-horizon / multi-upstream configurations.
+/// returning `(set, error)`: the first positive resolution or, after a short
+/// grace period, the first definitive negative (review issue C: a fast
+/// NODATA/NXDOMAIN from a healthy upstream no longer waits out a dead
+/// upstream's full 5 s timeout), plus the most informative client failure
+/// seen (errno-bearing preferred, #682). An upstream `Err` is not definitive
+/// — keep racing the remaining clients. The grace period prevents a fast
+/// negative from suppressing a slow positive in split-horizon /
+/// multi-upstream configurations. Both slots may be `None` (empty pool); a
+/// failure observed alongside a partial answer is reported alongside so the
+/// caller can cache the partial *and* still surface the cause when no
+/// complete answer arrives.
 async fn query_pool_set(
     clients: &[Arc<DnsClient>],
     host: &str,
     want: QueryFamilies,
     ipv6_enabled: bool,
-) -> Option<FamilySet> {
+) -> (Option<FamilySet>, Option<ClientError>) {
     if clients.is_empty() {
-        return None;
+        return (None, None);
     }
     let mut pending = FuturesUnordered::new();
     for client in clients {
@@ -480,6 +490,7 @@ async fn query_pool_set(
         });
     }
     let mut negative: Option<FamilySet> = None;
+    let mut upstream_err: Option<ClientError> = None;
     let mut negative_deadline: Option<tokio::time::Instant> = None;
     loop {
         // Once we have a definitive negative, wait for the remaining futures
@@ -488,11 +499,11 @@ async fn query_pool_set(
         let next = if let Some(deadline) = negative_deadline {
             let now = tokio::time::Instant::now();
             if now >= deadline {
-                return negative;
+                break;
             }
             match tokio::time::timeout_at(deadline, pending.next()).await {
                 Ok(result) => result,
-                Err(_) => return negative, // grace period elapsed
+                Err(_) => break, // grace period elapsed
             }
         } else {
             pending.next().await
@@ -512,12 +523,13 @@ async fn query_pool_set(
                     %error,
                     "DNS upstream query failed"
                 );
+                upstream_err = prefer_errno(upstream_err, Some(error));
                 continue;
             }
         };
         if set.has_positive() {
             // A positive answer always wins, regardless of grace state.
-            return Some(set);
+            return (Some(set), upstream_err);
         }
         let definitive = set.is_definitive_negative(want);
         if negative.is_none() {
@@ -541,7 +553,31 @@ async fn query_pool_set(
             negative = Some(set);
         }
     }
-    negative
+    (negative, upstream_err)
+}
+
+/// Fold a tier chain's raw `(set, error)` outcome into the caller-facing
+/// `Result`. A positive or definitive-negative set is a real verdict and
+/// wins outright; otherwise an observed upstream failure is the honest
+/// answer — returning `None` ("unresolvable") would reclassify e.g. an
+/// `EMFILE` opening the upstream socket as a member-health failure (#682).
+/// A partial set reported alongside an error is still merged into the
+/// cache by `run_pipeline` before this collapses.
+fn collapse_outcome(
+    set: Option<FamilySet>,
+    err: Option<ClientError>,
+    want: QueryFamilies,
+) -> Result<Option<FamilySet>, ClientError> {
+    let verdict = set
+        .as_ref()
+        .is_some_and(|s| s.has_positive() || s.is_definitive_negative(want));
+    if verdict {
+        return Ok(set);
+    }
+    match err {
+        Some(e) => Err(e),
+        None => Ok(set),
+    }
 }
 
 fn encrypted_upstream_label(url: &NameServerUrl) -> Option<String> {
@@ -861,22 +897,24 @@ impl Resolver {
             // infrastructure connectivity.
             let mut map = HashMap::new();
             for host in &hostnames_needing_bootstrap {
-                match query_pool_set(&bootstrap_clients, host, QueryFamilies::BOTH, true).await {
-                    Some(set) => {
-                        let ips = set.positive_ips();
-                        if let Some(first) = ips.first() {
-                            map.insert(host.clone(), *first);
-                        } else {
-                            return Err(BootstrapError::CannotResolve {
-                                host: host.clone(),
-                                source: "no addresses returned".into(),
-                            });
-                        }
+                let (set, err) =
+                    query_pool_set(&bootstrap_clients, host, QueryFamilies::BOTH, true).await;
+                let first = set.and_then(|set| set.positive_ips().into_iter().next());
+                match first {
+                    Some(ip) => {
+                        map.insert(host.clone(), ip);
                     }
+                    // The upstream failure is the honest `source` — e.g.
+                    // "io: Too many open files" beats a context-less
+                    // "no addresses returned" when bootstrap is the thing
+                    // that ran out of fds (#682).
                     None => {
                         return Err(BootstrapError::CannotResolve {
                             host: host.clone(),
-                            source: "no addresses returned".into(),
+                            source: err.map_or_else(
+                                || "no addresses returned".into(),
+                                |e| -> BoxError { Box::new(e) },
+                            ),
                         });
                     }
                 }
@@ -1014,7 +1052,17 @@ impl Resolver {
         Arc::new(client)
     }
 
-    pub async fn resolve_ips(&self, host: &str) -> Option<Vec<IpAddr>> {
+    /// Resolve `host` to every enabled address.
+    ///
+    /// `Ok(Some(ips))` — at least one dialable address; `Ok(None)` — the
+    /// lookup completed but the name is unresolvable (definitive negative
+    /// or exhausted cache); `Err` — the lookup itself *failed*: no
+    /// upstream produced a complete answer. The `Err` arm carries the
+    /// upstream failure's `io::Error` — including `raw_os_error` — so a
+    /// local `EMFILE` while opening the resolver socket reaches
+    /// `is_local_resource_error` intact instead of decaying into a
+    /// "host unresolvable" member-health failure (#682).
+    pub async fn resolve_ips(&self, host: &str) -> io::Result<Option<Vec<IpAddr>>> {
         let lookup_host = if self.use_hosts {
             match self.lookup_hosts_entry(host) {
                 Some(HostsLookup::Addresses(ips)) => {
@@ -1024,7 +1072,7 @@ impl Resolver {
                     // still reach a host that the hosts file only pins for the
                     // other family.
                     if let Some(enabled) = self.filter_enabled_ips(ips) {
-                        return Some(enabled);
+                        return Ok(Some(enabled));
                     }
                     host
                 }
@@ -1057,10 +1105,20 @@ impl Resolver {
                 want = want.minus(QueryFamilies::IPV6);
             }
         }
+        // A pipeline failure is deferred, not returned immediately: a sibling
+        // family already fresh in the cache may still produce a usable
+        // answer below. The error is only reported when nothing else can.
+        let mut lookup_err: Option<io::Error> = None;
         let pipeline_set = if want.is_empty() {
             None
         } else {
-            self.run_pipeline(lookup_host, want).await
+            match self.run_pipeline(lookup_host, want).await {
+                Ok(set) => set,
+                Err(e) => {
+                    lookup_err = Some(e);
+                    None
+                }
+            }
         };
         // Prefer the pipeline's own result over re-reading the shared
         // cache: the entry can be LRU-evicted (1024 forward entries under
@@ -1073,13 +1131,13 @@ impl Resolver {
         if let Some(set) = &pipeline_set {
             if want == required {
                 if let Some(enabled) = self.filter_enabled_ips(&set.positive_ips()) {
-                    return Some(enabled);
+                    return Ok(Some(enabled));
                 }
                 if set.is_definitive_negative(want) {
                     // Every required family answered definitively (no
                     // usable addresses) — the name is genuinely
                     // unresolvable.
-                    return None;
+                    return Ok(None);
                 }
             }
         }
@@ -1087,7 +1145,7 @@ impl Resolver {
         // (not re-queried) with the freshly queried ones.
         if let Some(cached) = self.cache.get_lookup(lookup_host) {
             if let Some(enabled) = self.filter_enabled_ips(&cached.ips) {
-                return Some(enabled);
+                return Ok(Some(enabled));
             }
             // No usable IPs. If every required family is now fresh (cached or
             // just queried), the name is genuinely unresolvable — return `None`
@@ -1096,7 +1154,7 @@ impl Resolver {
                 || cached.v4.is_fresh())
                 && (!required.contains(QueryFamilies::IPV6) || cached.v6.is_fresh());
             if all_required_fresh {
-                return None;
+                return Ok(None);
             }
         }
         // The cache re-read missed (e.g. the entry was evicted between the
@@ -1105,10 +1163,13 @@ impl Resolver {
         // host unresolvable.
         if let Some(set) = &pipeline_set {
             if let Some(enabled) = self.filter_enabled_ips(&set.positive_ips()) {
-                return Some(enabled);
+                return Ok(Some(enabled));
             }
         }
-        None
+        match lookup_err {
+            Some(e) => Err(e),
+            None => Ok(None),
+        }
     }
 
     /// [`Self::resolve_ips`] restricted to answers this resolver already
@@ -1142,12 +1203,28 @@ impl Resolver {
         None
     }
 
-    pub async fn resolve_ip(&self, host: &str) -> Option<IpAddr> {
-        self.resolve_ips(host).await?.into_iter().next()
+    /// [`Self::resolve_ips`] first address. Same `Ok`/`Err` contract —
+    /// `Err` keeps the upstream failure's `io::Error` (errno intact, #682).
+    pub async fn resolve_ip(&self, host: &str) -> io::Result<Option<IpAddr>> {
+        Ok(self
+            .resolve_ips(host)
+            .await?
+            .and_then(|ips| ips.into_iter().next()))
     }
 
+    /// Best-effort resolution for the pre-resolve hint paths (`dst_ip`
+    /// seeding). Callers have no error destination — the errno-bearing
+    /// failure re-surfaces on the real dial's own `resolve_ips`, so the
+    /// `Err` arm decays to `None` here (logged at debug so a persistent
+    /// local-resource failure is still visible in traces).
     pub async fn resolve_ip_real(&self, host: &str) -> Option<IpAddr> {
-        self.resolve_ip(host).await
+        match self.resolve_ip(host).await {
+            Ok(ip) => ip,
+            Err(e) => {
+                debug!("pre-resolve hint for {host} dropped upstream error: {e}");
+                None
+            }
+        }
     }
 
     pub async fn lookup_ipv4(&self, host: &str) -> Option<IpAddr> {
@@ -1338,13 +1415,16 @@ impl Resolver {
         }
 
         let result = self.run_pipeline(host, family).await;
-        // `run_pipeline` returns `None` either when no upstream produced an
-        // answer, or when the single-flight broadcast was missed (the publisher
-        // sent and closed before this subscriber subscribed). In the latter
-        // case the publisher has already merged the result into the cache —
-        // re-read it here so a missed broadcast doesn't surface as a transient
-        // `Failed` (which would make the DNS server return SERVFAIL).
-        let Some(set) = result else {
+        // `run_pipeline` gives `Ok(None)`/`Err` when no upstream produced a
+        // usable answer — including a missed single-flight broadcast (the
+        // publisher sent and closed before this subscriber subscribed). In
+        // the latter case the publisher has already merged the result into
+        // the cache — re-read it here so a missed broadcast doesn't surface
+        // as a transient `Failed` (which would make the DNS server return
+        // SERVFAIL). An `Err` carries the upstream `io` failure (errno
+        // intact), but a downstream DNS client only understands rcode —
+        // it decays to `Failed` → SERVFAIL like any other upstream loss.
+        let Ok(Some(set)) = result else {
             if let Some(cached) = self.cache.get_lookup(host) {
                 let hit = if family == QueryFamilies::IPV4 {
                     &cached.v4
@@ -1432,7 +1512,13 @@ impl Resolver {
     /// distinguish NXDOMAIN/NODATA). The publisher merges positives and NODATA
     /// into the cache (per-family expiry) before broadcasting; subscribers
     /// receive the same `FamilySet` with the cache already populated.
-    async fn run_pipeline(&self, host: &str, want: QueryFamilies) -> Option<FamilySet> {
+    ///
+    /// The `Err` arm preserves the upstream `io::Error` — `raw_os_error`
+    /// included — so a local `EMFILE` while opening an upstream socket
+    /// reaches the caller as an errno-bearing failure rather than a
+    /// context-less "no answer" (#682). Subscribers reconstruct their own
+    /// owned error from the broadcast's shared `Arc<ClientError>`.
+    async fn run_pipeline(&self, host: &str, want: QueryFamilies) -> io::Result<Option<FamilySet>> {
         use dashmap::mapref::entry::Entry;
         // Both current callers filter `want` before calling. The
         // debug_assert keeps the invariant loud in dev; the release path
@@ -1442,51 +1528,76 @@ impl Resolver {
         // dedicated result", the same answer a cache miss gives.
         debug_assert!(!want.is_empty(), "singleflight requires a non-empty set");
         if want.is_empty() {
-            return None;
+            return Ok(None);
         }
         let inflight = &self.inflight[inflight_slot(want)];
-        // Borrowed-key fast path: `Arc<str>: Borrow<str>` lets both the
-        // subscriber check and the guard removal below run without ever
-        // allocating — the host is only cloned into an `Arc<str>` once a
-        // new flight is actually inserted (review issue M1).
-        if let Some(entry) = inflight.get(host) {
-            let mut rx = entry.subscribe();
-            drop(entry);
-            return rx.recv().await.ok().flatten();
-        }
-        // `entry()` consumes an owned key; keep one Arc for the guard so it
-        // can remove the inflight slot on drop — the map stores a second
-        // reference to the same allocation, so this is one allocation total,
-        // only on the insert path.
-        let guard_key: Arc<str> = Arc::from(host);
-        let tx = match inflight.entry(Arc::clone(&guard_key)) {
-            Entry::Occupied(existing) => {
-                let mut rx = existing.get().subscribe();
-                drop(existing);
-                return rx.recv().await.ok().flatten();
+        loop {
+            // Borrowed-key fast path: `Arc<str>: Borrow<str>` lets both the
+            // subscriber check and the guard removal below run without ever
+            // allocating — the host is only cloned into an `Arc<str>` once a
+            // new flight is actually inserted (review issue M1).
+            if let Some(entry) = inflight.get(host) {
+                let mut rx = entry.subscribe();
+                drop(entry);
+                match rx.recv().await {
+                    Ok(result) => return result.map_err(|e| e.to_io()),
+                    // A capacity-1 channel can only close *empty* when the
+                    // publisher died (cancel/panic) before `send` — nothing
+                    // was merged, so `Ok(None)` here would fabricate
+                    // "unresolvable" out of an errno-bearing failure (#682).
+                    // Loop back: the guard has removed the dead entry, so
+                    // the next iteration takes over as publisher.
+                    Err(_) => continue,
+                }
             }
-            Entry::Vacant(v) => {
-                let (tx, _) = tokio::sync::broadcast::channel(1);
-                v.insert(tx.clone());
-                tx
+            // `entry()` consumes an owned key; keep one Arc for the guard so
+            // it can remove the inflight slot on drop — the map stores a
+            // second reference to the same allocation, so this is one
+            // allocation total, only on the insert path.
+            let guard_key: Arc<str> = Arc::from(host);
+            let tx = match inflight.entry(Arc::clone(&guard_key)) {
+                Entry::Occupied(existing) => {
+                    let mut rx = existing.get().subscribe();
+                    drop(existing);
+                    match rx.recv().await {
+                        Ok(result) => return result.map_err(|e| e.to_io()),
+                        // Same dead-publisher case as above (#682).
+                        Err(_) => continue,
+                    }
+                }
+                Entry::Vacant(v) => {
+                    let (tx, _) = tokio::sync::broadcast::channel(1);
+                    v.insert(tx.clone());
+                    tx
+                }
+            };
+            let _guard = InflightGuard {
+                map: inflight,
+                key: guard_key,
+                _armed: (),
+            };
+            let (set, err) = self.pipeline_inner(host, want).await;
+            // Only the publisher writes to the cache — including a partial
+            // set observed alongside a failure, which a subscriber's cache
+            // re-read can still pick up.
+            if let Some(set) = &set {
+                self.merge_set_into_cache(host, set);
             }
-        };
-        let _guard = InflightGuard {
-            map: inflight,
-            key: guard_key,
-            _armed: (),
-        };
-        let result = self.pipeline_inner(host, want).await;
-        // Only the publisher writes to the cache; subscribers re-read it (or
-        // use the broadcast FamilySet directly) after the merge has landed.
-        if let Some(set) = &result {
-            self.merge_set_into_cache(host, set);
+            let result = collapse_outcome(set, err, want).map_err(Arc::new);
+            let _ = tx.send(result.clone());
+            return result.map_err(|e| e.to_io());
         }
-        let _ = tx.send(result.clone());
-        result
     }
 
-    async fn pipeline_inner(&self, host: &str, want: QueryFamilies) -> Option<FamilySet> {
+    /// The tier chain's raw outcome: the best `FamilySet` seen (always
+    /// non-positive at the return boundary — positives exit early) paired
+    /// with the most informative upstream failure observed anywhere along
+    /// the chain. `run_pipeline` caches the set and collapses the pair.
+    async fn pipeline_inner(
+        &self,
+        host: &str,
+        want: QueryFamilies,
+    ) -> (Option<FamilySet>, Option<ClientError>) {
         debug!(host, ?want, "DNS lookup");
 
         // Domain-gate: skip primary entirely, go straight to fallback.
@@ -1501,20 +1612,24 @@ impl Resolver {
         // overwrite it, so the rcode the client sees depends on tier order
         // (policy → main → fallback), not on an asymmetric clobber rule.
         let mut negative: Option<FamilySet> = None;
+        let mut upstream_err: Option<ClientError> = None;
 
         // Nameserver-policy lookup.
         if let Some(policy) = &self.policy {
             if let Some(entry) = policy.lookup(host) {
-                if let Some(set) = query_pool_set(&entry.nameservers, host, want, self.ipv6).await {
+                let (set, err) = query_pool_set(&entry.nameservers, host, want, self.ipv6).await;
+                upstream_err = prefer_errno(upstream_err, err);
+                if let Some(set) = set {
                     if set.has_positive() {
                         if self
                             .fallback_filter
                             .as_ref()
                             .is_some_and(|ff| ff.ip_gated(&set.positive_ips()))
                         {
-                            return self.query_fallback_set(host, want).await;
+                            let (set, err) = self.query_fallback_set(host, want).await;
+                            return (set, prefer_errno(err, upstream_err));
                         }
-                        return Some(set);
+                        return (Some(set), upstream_err);
                     }
                     if negative.is_none() {
                         negative = Some(set);
@@ -1525,35 +1640,51 @@ impl Resolver {
         }
 
         // Global nameservers (parallel, first-positive / first-definitive-negative).
-        if let Some(set) = query_pool_set(&self.main, host, want, self.ipv6).await {
-            if set.has_positive() {
-                if self
-                    .fallback_filter
-                    .as_ref()
-                    .is_some_and(|ff| ff.ip_gated(&set.positive_ips()))
-                {
-                    return self.query_fallback_set(host, want).await;
+        {
+            let (set, err) = query_pool_set(&self.main, host, want, self.ipv6).await;
+            upstream_err = prefer_errno(upstream_err, err);
+            if let Some(set) = set {
+                if set.has_positive() {
+                    if self
+                        .fallback_filter
+                        .as_ref()
+                        .is_some_and(|ff| ff.ip_gated(&set.positive_ips()))
+                    {
+                        let (set, err) = self.query_fallback_set(host, want).await;
+                        return (set, prefer_errno(err, upstream_err));
+                    }
+                    return (Some(set), upstream_err);
                 }
-                return Some(set);
-            }
-            if negative.is_none() {
-                negative = Some(set);
+                if negative.is_none() {
+                    negative = Some(set);
+                }
             }
         }
 
-        if let Some(set) = self.query_fallback_set(host, want).await {
-            if set.has_positive() {
-                return Some(set);
-            }
-            if negative.is_none() {
-                negative = Some(set);
+        {
+            let (set, err) = self.query_fallback_set(host, want).await;
+            upstream_err = prefer_errno(upstream_err, err);
+            if let Some(set) = set {
+                if set.has_positive() {
+                    return (Some(set), upstream_err);
+                }
+                if negative.is_none() {
+                    negative = Some(set);
+                }
             }
         }
-        negative
+        (negative, upstream_err)
     }
 
-    async fn query_fallback_set(&self, host: &str, want: QueryFamilies) -> Option<FamilySet> {
-        query_pool_set(self.fallback.as_deref()?, host, want, self.ipv6).await
+    async fn query_fallback_set(
+        &self,
+        host: &str,
+        want: QueryFamilies,
+    ) -> (Option<FamilySet>, Option<ClientError>) {
+        match self.fallback.as_deref() {
+            Some(clients) => query_pool_set(clients, host, want, self.ipv6).await,
+            None => (None, None),
+        }
     }
 
     /// Write a pipeline result's per-family answers into the cache. Positives,
@@ -1955,7 +2086,10 @@ mod tests {
         let real = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
         hosts.insert("example.test", vec![real].into());
         let resolver = Resolver::new(vec![], vec![], DnsMode::Normal, hosts, true, true);
-        assert_eq!(resolver.resolve_ip("example.test").await, Some(real));
+        assert_eq!(
+            resolver.resolve_ip("example.test").await.unwrap(),
+            Some(real)
+        );
         assert_eq!(resolver.resolve_ip_real("example.test").await, Some(real));
     }
 
@@ -1969,9 +2103,12 @@ mod tests {
         hosts.insert("example.test", ips.clone().into());
         let resolver = Resolver::new(vec![], vec![], DnsMode::Normal, hosts, true, true);
 
-        assert_eq!(resolver.resolve_ips("example.test").await, Some(ips));
         assert_eq!(
-            resolver.resolve_ip("example.test").await,
+            resolver.resolve_ips("example.test").await.unwrap(),
+            Some(ips)
+        );
+        assert_eq!(
+            resolver.resolve_ip("example.test").await.unwrap(),
             Some(IpAddr::V6(Ipv6Addr::LOCALHOST))
         );
     }
@@ -1986,7 +2123,10 @@ mod tests {
         );
         let resolver = Resolver::new(vec![], vec![], DnsMode::Normal, hosts, true, false);
 
-        assert_eq!(resolver.resolve_ips("example.test").await, Some(vec![ipv4]));
+        assert_eq!(
+            resolver.resolve_ips("example.test").await.unwrap(),
+            Some(vec![ipv4])
+        );
         assert_eq!(resolver.lookup_ipv6("example.test").await, None);
     }
 
@@ -2026,7 +2166,7 @@ mod tests {
         // The v6-only hosts pin is ignored for the disabled family and the
         // resolver falls through to the upstream A record.
         assert_eq!(
-            resolver.resolve_ips("v6only.test").await,
+            resolver.resolve_ips("v6only.test").await.unwrap(),
             Some(vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7))])
         );
     }
@@ -2160,7 +2300,7 @@ mod tests {
             false,
             true,
         );
-        let ips = resolver.resolve_ips("v6available.example").await;
+        let ips = resolver.resolve_ips("v6available.example").await.unwrap();
         let has_v6 = ips.as_ref().is_some_and(|v| v.iter().any(IpAddr::is_ipv6));
         assert!(
             has_v6,
@@ -2177,7 +2317,10 @@ mod tests {
         hosts.insert("origin.test", HostEntry::Addresses(vec![real]));
         let resolver = Resolver::new(vec![], vec![], DnsMode::FakeIp, hosts, true, true);
 
-        assert_eq!(resolver.resolve_ips("alias.test").await, Some(vec![real]));
+        assert_eq!(
+            resolver.resolve_ips("alias.test").await.unwrap(),
+            Some(vec![real])
+        );
         assert_eq!(
             resolver.lookup_ipv4("alias.test").await,
             Some(real),
@@ -2305,7 +2448,7 @@ mod tests {
 
         // Step 2: resolve_ips with ipv6=true should query the missing AAAA,
         // not short-circuit on the cached A.
-        let ips = resolver.resolve_ips("dual.example").await;
+        let ips = resolver.resolve_ips("dual.example").await.unwrap();
         let has_v6 = ips.as_ref().is_some_and(|v| v.iter().any(IpAddr::is_ipv6));
         assert!(has_v6, "resolve_ips must return both families, got {ips:?}");
         let queries_after_resolve = query_count.load(Ordering::SeqCst);
@@ -2370,7 +2513,7 @@ mod tests {
             true,
         );
 
-        let ips = resolver.resolve_ips("dual.example").await.unwrap();
+        let ips = resolver.resolve_ips("dual.example").await.unwrap().unwrap();
         let has_v4 = ips.iter().any(IpAddr::is_ipv4);
         let has_v6 = ips.iter().any(IpAddr::is_ipv6);
         assert!(has_v4, "must include IPv4: {ips:?}");
@@ -2539,7 +2682,10 @@ mod tests {
         resolver
             .cache
             .put("cached.test", &[real], Duration::from_secs(60));
-        assert_eq!(resolver.resolve_ip("cached.test").await, Some(real));
+        assert_eq!(
+            resolver.resolve_ip("cached.test").await.unwrap(),
+            Some(real)
+        );
     }
 
     #[tokio::test]
@@ -2554,7 +2700,10 @@ mod tests {
             .cache
             .put("cached.test", &ips, Duration::from_secs(60));
 
-        assert_eq!(resolver.resolve_ips("cached.test").await, Some(ips));
+        assert_eq!(
+            resolver.resolve_ips("cached.test").await.unwrap(),
+            Some(ips)
+        );
     }
 
     #[test]
@@ -2852,7 +3001,10 @@ mod tests {
             Some(vec![real]),
             "in-range answer must be filtered, not dialed"
         );
-        assert_eq!(resolver.resolve_ips("mixed.test").await, Some(vec![real]));
+        assert_eq!(
+            resolver.resolve_ips("mixed.test").await.unwrap(),
+            Some(vec![real])
+        );
 
         // All-filtered: report unresolvable rather than hand out the
         // fake IP the dial would loop on.
@@ -2860,7 +3012,7 @@ mod tests {
             .cache
             .put("poisoned.test", &[fake], Duration::from_secs(300));
         assert_eq!(resolver.resolve_ips_local("poisoned.test"), None);
-        assert_eq!(resolver.resolve_ips("poisoned.test").await, None);
+        assert_eq!(resolver.resolve_ips("poisoned.test").await.unwrap(), None);
     }
 
     #[test]
@@ -2970,7 +3122,11 @@ mod tests {
             r1.resolve_ips("concurrent.test"),
             r2.resolve_ips("concurrent.test"),
         );
-        assert_eq!(a, b, "concurrent callers must see the same result");
+        assert_eq!(
+            a.unwrap(),
+            b.unwrap(),
+            "concurrent callers must see the same result"
+        );
         assert!(resolver.inflight.iter().all(DashMap::is_empty));
     }
 
@@ -3238,7 +3394,7 @@ mod tests {
         let resolver = Resolver::new(vec![], vec![], DnsMode::Normal, hosts, false, true);
         // With use_hosts=false, hosts lookup is bypassed, no upstream → None.
         assert_eq!(
-            resolver.resolve_ip("example.test").await,
+            resolver.resolve_ip("example.test").await.unwrap(),
             None,
             "use_hosts=false must skip hosts trie"
         );
@@ -3279,7 +3435,11 @@ mod tests {
         resolver.fallback_filter = Some(ff);
         // No fallback configured → None returned (primary never tried).
         let result = resolver.resolve_ip("www.google.cn").await;
-        assert_eq!(result, None, "domain-gated query must skip primary");
+        assert_eq!(
+            result.unwrap(),
+            None,
+            "domain-gated query must skip primary"
+        );
     }
 
     // fallback-filter CIDR gate triggers when primary returns a bogon IP.
@@ -3399,7 +3559,7 @@ mod tests {
 
         // The aggregate resolve path runs first. Its NXDOMAIN must populate the
         // shared cache with the real negative kind, not fresh NODATA.
-        assert_eq!(resolver.resolve_ips("missing.example").await, None);
+        assert_eq!(resolver.resolve_ips("missing.example").await.unwrap(), None);
         assert!(matches!(
             resolver.lookup_ipv4_result("missing.example").await,
             AddressLookupResult::NxDomain
@@ -3417,5 +3577,212 @@ mod tests {
         // Both A and AAAA were queried once (parallel dual-stack path);
         // subsequent lookups are served from cache.
         assert_eq!(requests.load(Ordering::SeqCst), 2);
+    }
+
+    /// `EMFILE` on unix, `WSAEMFILE` on Windows — both are in
+    /// `is_local_resource_error`'s set. Literal constants keep a libc
+    /// dependency out of the test tree.
+    #[cfg(unix)]
+    const EMFILE: i32 = 24;
+    #[cfg(windows)]
+    const EMFILE: i32 = 10024;
+
+    /// `Proxy` whose `dial_tcp` fails with a fixed errno-bearing io error —
+    /// drives the dns-via-proxy exchange to a local-resource failure without
+    /// touching real sockets (#682).
+    struct ErrnoProxy {
+        health: meow_common::ProxyHealth,
+        /// When set, `dial_tcp` parks on this barrier before failing —
+        /// lets a test suspend the publisher mid-flight so a second
+        /// caller reliably lands on the single-flight subscriber arm.
+        gate: Option<Arc<tokio::sync::Barrier>>,
+        /// Number of `dial_tcp` calls — a single-flight test asserts it
+        /// stays 1 to prove the second caller rode the broadcast.
+        dials: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl meow_common::ProxyAdapter for ErrnoProxy {
+        fn name(&self) -> &str {
+            "errno"
+        }
+        fn adapter_type(&self) -> meow_common::AdapterType {
+            meow_common::AdapterType::Direct
+        }
+        fn addr(&self) -> &str {
+            ""
+        }
+        fn support_udp(&self) -> bool {
+            false
+        }
+        async fn dial_tcp(
+            &self,
+            _m: &meow_common::Metadata,
+        ) -> meow_common::Result<Box<dyn meow_common::ProxyConn>> {
+            self.dials.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(gate) = &self.gate {
+                gate.wait().await;
+            }
+            Err(meow_common::MeowError::Io(io::Error::from_raw_os_error(
+                EMFILE,
+            )))
+        }
+        async fn dial_udp(
+            &self,
+            _m: &meow_common::Metadata,
+        ) -> meow_common::Result<Box<dyn meow_common::ProxyPacketConn>> {
+            unimplemented!("errno mock has no UDP")
+        }
+        fn health(&self) -> &meow_common::ProxyHealth {
+            &self.health
+        }
+    }
+
+    impl meow_common::Proxy for ErrnoProxy {
+        fn alive(&self) -> bool {
+            true
+        }
+        fn alive_for_url(&self, _url: &str) -> bool {
+            true
+        }
+        fn last_delay(&self) -> u16 {
+            0
+        }
+        fn last_delay_for_url(&self, _url: &str) -> u16 {
+            0
+        }
+        fn delay_history(&self) -> Vec<meow_common::DelayHistory> {
+            Vec::new()
+        }
+    }
+
+    /// A resolver whose single upstream is an EMFILE-failing `dns-via-proxy`
+    /// client — no real sockets involved, so the test is hermetic.
+    /// `gate`/`dials` flow into the mock (see `ErrnoProxy`); the dial
+    /// counter is returned so callers can assert flight coalescing.
+    fn emfile_resolver_gated(
+        gate: Option<Arc<tokio::sync::Barrier>>,
+    ) -> (Resolver, Arc<std::sync::atomic::AtomicUsize>) {
+        let dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut resolver = Resolver::new(
+            vec![],
+            vec![],
+            DnsMode::Normal,
+            DomainTrie::new(),
+            true,
+            true,
+        );
+        resolver.main = vec![Arc::new(
+            DnsClient::udp("203.0.113.53:53".parse().unwrap()).with_proxy(Arc::new(ErrnoProxy {
+                health: meow_common::ProxyHealth::new(),
+                gate,
+                dials: Arc::clone(&dials),
+            })),
+        )];
+        (resolver, dials)
+    }
+
+    fn emfile_resolver() -> Resolver {
+        emfile_resolver_gated(None).0
+    }
+
+    /// #682: an upstream failure carrying an OS errno must surface through
+    /// `resolve_ips` as `Err` with `raw_os_error` intact — the old `Option`
+    /// contract decayed it into "unresolvable", so a local fd exhaustion
+    /// was counted against proxy-member health.
+    #[tokio::test]
+    async fn resolve_ips_surfaces_errno_backed_upstream_failure() {
+        let resolver = emfile_resolver();
+        let err = resolver
+            .resolve_ips("any.example")
+            .await
+            .expect_err("all-errno-failed upstream must surface Err");
+        assert_eq!(err.raw_os_error(), Some(EMFILE));
+        assert!(
+            meow_common::MeowError::Io(err).is_local_resource_error(),
+            "the errno must reach the classifier as local resource pressure"
+        );
+    }
+
+    /// A second caller riding the same single-flight sees the same
+    /// errno-bearing failure — the broadcast must not flatten the
+    /// publisher's error into a cache miss. The gate makes the overlap
+    /// deterministic: without it `join!` can finish the whole flight
+    /// during f1's first poll, and f2 silently becomes a second
+    /// publisher — never exercising the subscriber arm (R1 finding).
+    #[tokio::test]
+    async fn resolve_ips_singleflight_subscriber_sees_errno() {
+        let gate = Arc::new(tokio::sync::Barrier::new(3));
+        let (resolver, dials) = emfile_resolver_gated(Some(Arc::clone(&gate)));
+        let release = async {
+            // Both family dials increment before parking on the barrier;
+            // once both are in flight the subscriber has joined — open
+            // the gate (3rd arrival) so the publisher completes.
+            while dials.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+            gate.wait().await;
+        };
+        let (a, b, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(
+                resolver.resolve_ips("shared.example"),
+                resolver.resolve_ips("shared.example"),
+                release,
+            )
+        })
+        .await
+        .expect("flight must complete — a hang means the gate or subscriber arm regressed");
+        for r in [a, b] {
+            let err = r.expect_err("both flight participants must see Err");
+            assert_eq!(err.raw_os_error(), Some(EMFILE));
+        }
+        assert_eq!(
+            dials.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "exactly one flight (two family dials) must have run — \
+             a second publisher would double the count"
+        );
+    }
+
+    /// `resolve_ip` follows the same contract — errno-bearing `Err`, not
+    /// a context-less `None`.
+    #[tokio::test]
+    async fn resolve_ip_surfaces_errno_backed_upstream_failure() {
+        let resolver = emfile_resolver();
+        let err = resolver
+            .resolve_ip("any.example")
+            .await
+            .expect_err("lookup failure must surface Err");
+        assert_eq!(err.raw_os_error(), Some(EMFILE));
+    }
+
+    /// A *real* verdict is not swallowed by an observed error: a definitive
+    /// negative from a healthy upstream must still return `Ok(None)` even
+    /// when a sibling upstream fails with an errno — the name is
+    /// unresolvable, not unresolvable-*due-to-local-fd-pressure*.
+    #[tokio::test]
+    async fn resolve_ips_definitive_negative_beats_sibling_failure() {
+        let nxdomain = one_shot_a_upstream(ResponseCode::NXDomain, None).await;
+        let mut resolver = Resolver::new(
+            vec![],
+            vec![],
+            DnsMode::Normal,
+            DomainTrie::new(),
+            true,
+            false, // ipv4-only: the NXDOMAIN covers the whole `want` set
+        );
+        resolver.main = vec![
+            Arc::new(DnsClient::udp(nxdomain)),
+            Arc::new(
+                DnsClient::udp("203.0.113.53:53".parse().unwrap()).with_proxy(Arc::new(
+                    ErrnoProxy {
+                        health: meow_common::ProxyHealth::new(),
+                        gate: None,
+                        dials: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    },
+                )),
+            ),
+        ];
+        assert_eq!(resolver.resolve_ips("gone.example").await.unwrap(), None);
     }
 }

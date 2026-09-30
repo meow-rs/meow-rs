@@ -141,6 +141,53 @@ pub enum ClientError {
     Rcode(hickory_proto::op::ResponseCode),
 }
 
+impl ClientError {
+    /// True when this failure carries a concrete OS errno (e.g. `EMFILE`
+    /// opening the upstream socket). That errno is the signal
+    /// `is_local_resource_error` uses to keep local resource exhaustion
+    /// from dead-marking healthy proxy members, so it must survive the
+    /// resolver boundary (#682).
+    pub(crate) fn is_errno_backed(&self) -> bool {
+        // `OutOfMemory` parity with `MeowError::io_errno_backed`: an
+        // errno-less allocation failure is still local resource
+        // pressure and must not lose `prefer_errno` ordering.
+        matches!(self, Self::Io(e) if e.raw_os_error().is_some()
+            || e.kind() == io::ErrorKind::OutOfMemory)
+    }
+
+    /// Re-express as `io::Error`, preserving `raw_os_error` when one
+    /// exists. Used where a lookup failure must cross an `io::Result`
+    /// boundary (`Resolver::resolve_ips`), including single-flight
+    /// subscribers reconstructing an owned error from the broadcast's
+    /// shared `Arc<ClientError>`.
+    pub(crate) fn to_io(&self) -> io::Error {
+        match self {
+            Self::Io(e) => match e.raw_os_error() {
+                Some(errno) => io::Error::from_raw_os_error(errno),
+                None => io::Error::new(e.kind(), e.to_string()),
+            },
+            Self::Timeout(_) => io::Error::new(io::ErrorKind::TimedOut, self.to_string()),
+            _ => io::Error::other(self.to_string()),
+        }
+    }
+}
+
+/// Multi-candidate error accumulator, mirroring
+/// `MeowError::prefer_errno`: an errno-backed failure outranks a
+/// context-only one, because it is the concrete local cause the caller's
+/// error classifier must see (#682).
+pub(crate) fn prefer_errno(
+    prev: Option<ClientError>,
+    next: Option<ClientError>,
+) -> Option<ClientError> {
+    let Some(next) = next else { return prev };
+    if prev.as_ref().is_some_and(ClientError::is_errno_backed) && !next.is_errno_backed() {
+        prev
+    } else {
+        Some(next)
+    }
+}
+
 /// Optional proxy adapter for routing DNS queries through. When set, the
 /// TCP exchange is performed via `proxy.dial_tcp` instead of
 /// `factory().connect_tcp` — see ADR-0012 (issue #67 phase 2).
@@ -582,7 +629,11 @@ impl DnsClient {
                 }
             }
             Ok(FamilyLookupResult::NxDomain(ttl)) => FamilyAnswer::NxDomain(ttl),
-            Err(_) => FamilyAnswer::Failed,
+            // A transport failure must propagate: folding it into
+            // `FamilyAnswer::Failed` erases the errno before the
+            // resolver's error bookkeeping sees it (#682). `Failed`
+            // remains for *response* verdicts (SERVFAIL rcode etc.).
+            Err(e) => return Err(e),
         };
         let (v4, v6) = if family == QueryFamilies::IPV4 {
             (Some(answer), None)
@@ -633,42 +684,7 @@ impl DnsClient {
             self.query_inner(name, RecordType::A),
             self.query_inner(name, RecordType::AAAA)
         );
-
-        let v4 = v4_result.ok().map(|msg| classify_family_message(&msg));
-        let v6 = v6_result.ok().map(|msg| classify_family_message(&msg));
-
-        // NXDOMAIN from A means the name does not exist at all — propagate
-        // to both families (mirrors the old sequential behaviour).
-        if let Some(FamilyAnswer::NxDomain(ttl)) = &v4 {
-            return Ok(IpLookupResult {
-                ips: Vec::new(),
-                ttl: *ttl,
-                v4: v4.clone(),
-                v6: Some(FamilyAnswer::NxDomain(*ttl)),
-            });
-        }
-
-        // Collect addresses with IPv4 first (prefer-IPv4 ordering).
-        let mut addrs = Vec::new();
-        let mut min_ttl: Option<Duration> = None;
-        if let Some(FamilyAnswer::Answer { ips, ttl }) = &v4 {
-            addrs.extend_from_slice(ips);
-            min_ttl = Some(*ttl);
-        }
-        if let Some(FamilyAnswer::Answer { ips, ttl }) = &v6 {
-            addrs.extend_from_slice(ips);
-            min_ttl = Some(min_ttl.map_or(*ttl, |current| current.min(*ttl)));
-        }
-
-        if v4.is_none() && v6.is_none() {
-            return Err(ClientError::Protocol("no response"));
-        }
-        Ok(IpLookupResult {
-            ips: addrs,
-            ttl: min_ttl.unwrap_or(Duration::ZERO),
-            v4,
-            v6,
-        })
+        merge_family_results(v4_result, v6_result)
     }
 
     /// Send a direct `tcp://` query through a bounded keep-alive pool.
@@ -865,7 +881,11 @@ async fn proxy_tcp_exchange(
     let mut stream = proxy
         .dial_tcp(&metadata)
         .await
-        .map_err(|e| io::Error::other(format!("dns-via-proxy dial: {e}")))?;
+        // `into_io_error` keeps the innermost `Io` verbatim: an errno-bearing
+        // dial failure (EMFILE under local fd pressure) must not be flattened
+        // into a context-only `Other` before it reaches the resolver's
+        // classifier (#682) — and `Unsupported` refusals keep their kind.
+        .map_err(|e| e.into_io_error("dns-via-proxy dial"))?;
     write_lp(&mut stream, wire).await?;
     read_lp(&mut stream).await
 }
@@ -920,6 +940,77 @@ fn classify_family_message(message: &Message) -> FamilyAnswer {
         ResponseCode::NXDomain => FamilyAnswer::NxDomain(negative_ttl(message)),
         _ => FamilyAnswer::Failed,
     }
+}
+
+/// Merge the concurrent A and AAAA exchange results of the dual-stack
+/// `lookup_ip_with_ipv6_inner` path into one [`IpLookupResult`].
+///
+/// Verdict precedence (#682): a positive `Answer` on either family wins
+/// over a sibling transport failure — an `Err` cannot veto dialable
+/// addresses (name-authoritative NXDOMAIN can — see below).
+/// NXDOMAIN is name-authoritative and settles the whole lookup (the
+/// missing/errored sibling is reported as NXDOMAIN too, matching the
+/// historical A-side propagation). Only when *no* usable answer exists —
+/// the remaining verdicts are `NoData`/`Failed`, which say nothing about
+/// the family whose exchange never completed — does an observed
+/// transport failure surface as `Err`, with `prefer_errno` keeping the
+/// errno-bearing one. This is what stops a one-sided `EMFILE` from being
+/// reported as "host unresolvable" and dead-marking a healthy member.
+fn merge_family_results(
+    v4_result: Result<Message, ClientError>,
+    v6_result: Result<Message, ClientError>,
+) -> Result<IpLookupResult, ClientError> {
+    let v4 = v4_result.as_ref().ok().map(classify_family_message);
+    let v6 = v6_result.as_ref().ok().map(classify_family_message);
+
+    // NXDOMAIN from A means the name does not exist at all — propagate
+    // to both families (mirrors the old sequential behaviour).
+    if let Some(FamilyAnswer::NxDomain(ttl)) = &v4 {
+        return Ok(IpLookupResult {
+            ips: Vec::new(),
+            ttl: *ttl,
+            v4: v4.clone(),
+            v6: Some(FamilyAnswer::NxDomain(*ttl)),
+        });
+    }
+    // Symmetric arm: a v6 NXDOMAIN is equally name-authoritative. When the
+    // A exchange *errored* it still settles the lookup — an unknown family
+    // state cannot resurrect a nonexistent name. (When v4 produced a
+    // verdict, it is kept verbatim below.)
+    if v4.is_none() {
+        if let Some(FamilyAnswer::NxDomain(ttl)) = &v6 {
+            return Ok(IpLookupResult {
+                ips: Vec::new(),
+                ttl: *ttl,
+                v4: Some(FamilyAnswer::NxDomain(*ttl)),
+                v6: v6.clone(),
+            });
+        }
+    }
+
+    // Collect addresses with IPv4 first (prefer-IPv4 ordering).
+    let mut addrs = Vec::new();
+    let mut min_ttl: Option<Duration> = None;
+    if let Some(FamilyAnswer::Answer { ips, ttl }) = &v4 {
+        addrs.extend_from_slice(ips);
+        min_ttl = Some(*ttl);
+    }
+    if let Some(FamilyAnswer::Answer { ips, ttl }) = &v6 {
+        addrs.extend_from_slice(ips);
+        min_ttl = Some(min_ttl.map_or(*ttl, |current| current.min(*ttl)));
+    }
+
+    if addrs.is_empty() && (v4_result.is_err() || v6_result.is_err()) {
+        // No usable answer and at least one family's exchange failed —
+        // the lookup is *unproven*, not unresolvable (#682).
+        return Err(prefer_errno(v4_result.err(), v6_result.err()).expect("gated by is_err"));
+    }
+    Ok(IpLookupResult {
+        ips: addrs,
+        ttl: min_ttl.unwrap_or(Duration::ZERO),
+        v4,
+        v6,
+    })
 }
 
 struct CnameLink {
@@ -1086,10 +1177,13 @@ async fn read_lp<R: AsyncReadExt + Unpin>(r: &mut R) -> Result<Vec<u8>, ClientEr
 async fn dot_exchange(addr: SocketAddr, sni: &str, wire: &[u8]) -> Result<Vec<u8>, ClientError> {
     let tls = tls_layer(sni, "dot")?;
     let tcp = factory().connect_tcp(addr).await?;
-    let mut stream = tls
-        .connect(Box::new(tcp))
-        .await
-        .map_err(|e| ClientError::Tls(e.to_string()))?;
+    let mut stream = tls.connect(Box::new(tcp)).await.map_err(|e| match e {
+        // `TransportError::Io` still carries the raw errno (#680);
+        // stringifying it here would re-flatten an `EMFILE`-class
+        // handshake failure into a context-less `Tls` (#682).
+        meow_transport::TransportError::Io(io_err) => ClientError::Io(io_err),
+        other => ClientError::Tls(other.to_string()),
+    })?;
     write_lp(&mut stream, wire).await?;
     read_lp(&mut stream).await
 }
@@ -1141,10 +1235,13 @@ async fn doh_exchange(
 ) -> Result<Vec<u8>, ClientError> {
     let tls = tls_layer(sni, "http/1.1")?;
     let tcp = factory().connect_tcp(addr).await?;
-    let mut stream = tls
-        .connect(Box::new(tcp))
-        .await
-        .map_err(|e| ClientError::Tls(e.to_string()))?;
+    let mut stream = tls.connect(Box::new(tcp)).await.map_err(|e| match e {
+        // `TransportError::Io` still carries the raw errno (#680);
+        // stringifying it here would re-flatten an `EMFILE`-class
+        // handshake failure into a context-less `Tls` (#682).
+        meow_transport::TransportError::Io(io_err) => ClientError::Io(io_err),
+        other => ClientError::Tls(other.to_string()),
+    })?;
 
     // Minimal HTTP/1.1 POST. Connection: close so the server EOFs and we can
     // read-to-end without parsing chunked transfer-encoding.
@@ -2148,5 +2245,228 @@ mod tests {
              must not count them as use"
         );
         assert_eq!(meta.conn_type, meow_common::ConnType::Inner);
+    }
+
+    /// `EMFILE` on unix, `WSAEMFILE` on Windows — both are in
+    /// `is_local_resource_error`'s set. Literal constants keep a libc
+    /// dependency out of the test tree.
+    #[cfg(unix)]
+    const EMFILE: i32 = 24;
+    #[cfg(windows)]
+    const EMFILE: i32 = 10024;
+
+    /// `Proxy` whose `dial_tcp` fails with a fixed errno-bearing io
+    /// error — drives the dns-via-proxy exchange to a local-resource
+    /// failure without touching real sockets (#682).
+    struct ErrnoProxy {
+        health: meow_common::ProxyHealth,
+    }
+
+    #[async_trait::async_trait]
+    impl meow_common::ProxyAdapter for ErrnoProxy {
+        fn name(&self) -> &str {
+            "errno"
+        }
+        fn adapter_type(&self) -> meow_common::AdapterType {
+            meow_common::AdapterType::Direct
+        }
+        fn addr(&self) -> &str {
+            ""
+        }
+        fn support_udp(&self) -> bool {
+            false
+        }
+        async fn dial_tcp(
+            &self,
+            _m: &meow_common::Metadata,
+        ) -> meow_common::Result<Box<dyn meow_common::ProxyConn>> {
+            Err(meow_common::MeowError::Io(io::Error::from_raw_os_error(
+                EMFILE,
+            )))
+        }
+        async fn dial_udp(
+            &self,
+            _m: &meow_common::Metadata,
+        ) -> meow_common::Result<Box<dyn meow_common::ProxyPacketConn>> {
+            unimplemented!("errno mock has no UDP")
+        }
+        fn health(&self) -> &meow_common::ProxyHealth {
+            &self.health
+        }
+    }
+
+    impl meow_common::Proxy for ErrnoProxy {
+        fn alive(&self) -> bool {
+            true
+        }
+        fn alive_for_url(&self, _url: &str) -> bool {
+            true
+        }
+        fn last_delay(&self) -> u16 {
+            0
+        }
+        fn last_delay_for_url(&self, _url: &str) -> u16 {
+            0
+        }
+        fn delay_history(&self) -> Vec<meow_common::DelayHistory> {
+            Vec::new()
+        }
+    }
+
+    fn emfile_client() -> DnsClient {
+        DnsClient::udp("203.0.113.53:53".parse().unwrap()).with_proxy(std::sync::Arc::new(
+            ErrnoProxy {
+                health: meow_common::ProxyHealth::new(),
+            },
+        ))
+    }
+
+    /// #682: a `dns-via-proxy` dial failing with an errno-bearing io error
+    /// must keep `raw_os_error` — `io::Error::other` used to erase it.
+    #[tokio::test]
+    async fn dns_via_proxy_dial_failure_keeps_errno() {
+        let proxy: DnsProxy = std::sync::Arc::new(ErrnoProxy {
+            health: meow_common::ProxyHealth::new(),
+        });
+        let err = proxy_tcp_exchange(&proxy, "8.8.8.8:53".parse().unwrap(), b"\x00")
+            .await
+            .unwrap_err();
+        let ClientError::Io(e) = err else {
+            panic!("expected Io, got {err:?}");
+        };
+        assert_eq!(e.raw_os_error(), Some(EMFILE));
+    }
+
+    /// #682: `lookup_set` must surface the errno for both the single-family
+    /// path and the dual-stack both-failed path (which used to return the
+    /// context-less `Protocol("no response")`).
+    #[tokio::test]
+    async fn lookup_set_propagates_errno_backed_failure() {
+        let err = emfile_client()
+            .lookup_set("probe.example", QueryFamilies::IPV4, false)
+            .await
+            .unwrap_err();
+        assert!(
+            err.is_errno_backed(),
+            "single-family failure must carry the errno: {err:?}"
+        );
+
+        let err = emfile_client()
+            .lookup_set("probe.example", QueryFamilies::BOTH, true)
+            .await
+            .unwrap_err();
+        assert!(
+            err.is_errno_backed(),
+            "dual-stack all-failed must prefer the errno-bearing arm: {err:?}"
+        );
+        let ClientError::Io(e) = &err else {
+            panic!("expected Io, got {err:?}");
+        };
+        assert_eq!(e.raw_os_error(), Some(EMFILE));
+    }
+
+    /// `to_io` round-trips the errno for single-flight subscribers, and
+    /// errno-less errors keep their kind instead of collapsing to `Other`.
+    #[test]
+    fn client_error_to_io_preserves_errno_and_kind() {
+        let io = ClientError::Io(io::Error::from_raw_os_error(EMFILE)).to_io();
+        assert_eq!(io.raw_os_error(), Some(EMFILE));
+
+        let kindless =
+            ClientError::Io(io::Error::new(io::ErrorKind::ConnectionReset, "rst")).to_io();
+        assert_eq!(kindless.kind(), io::ErrorKind::ConnectionReset);
+        assert_eq!(kindless.raw_os_error(), None);
+
+        let timeout = ClientError::Timeout(Duration::from_secs(5)).to_io();
+        assert_eq!(timeout.kind(), io::ErrorKind::TimedOut);
+
+        // prefer_errno: an errno-backed failure outranks a context-only one,
+        // in either order.
+        let errno = || ClientError::Io(io::Error::from_raw_os_error(EMFILE));
+        let plain = || ClientError::Protocol("nope");
+        assert!(prefer_errno(Some(plain()), Some(errno()))
+            .unwrap()
+            .is_errno_backed());
+        assert!(prefer_errno(Some(errno()), Some(plain()))
+            .unwrap()
+            .is_errno_backed());
+        assert!(prefer_errno(None, Some(plain())).is_some());
+        assert!(prefer_errno(Some(errno()), None).unwrap().is_errno_backed());
+    }
+
+    /// #682 dual-stack merge precedence: a positive Answer on one family
+    /// always wins over a sibling transport failure; a name-authoritative
+    /// NXDOMAIN settles the lookup from either side; but a `NoData`/`Failed`
+    /// sibling cannot stand in for a family whose exchange errored — the
+    /// errno must surface instead of an unproven "unresolvable".
+    #[test]
+    fn merge_family_results_precedence() {
+        use hickory_proto::op::ResponseCode;
+
+        fn msg(code: ResponseCode) -> Message {
+            let mut m = Message::new(9, MessageType::Response, OpCode::Query);
+            m.metadata.response_code = code;
+            m.add_query(Query::query("example.".parse().unwrap(), RecordType::A));
+            m
+        }
+        fn a_answer() -> Message {
+            let mut m = msg(ResponseCode::NoError);
+            m.add_answer(a_record("example.", 60, [1, 2, 3, 4]));
+            m
+        }
+        let errno = || Err(ClientError::Io(io::Error::from_raw_os_error(EMFILE)));
+
+        // Sibling NoData cannot stand in for an unexchanged family —
+        // the errno must surface, on either side.
+        for (v4, v6) in [
+            (errno(), Ok(msg(ResponseCode::NoError))),
+            (Ok(msg(ResponseCode::NoError)), errno()),
+        ] {
+            let Err(err) = merge_family_results(v4, v6) else {
+                panic!("NoData + transport failure is unproven, not unresolvable")
+            };
+            assert!(err.is_errno_backed(), "errno must survive: {err:?}");
+        }
+
+        // Same for a SERVFAIL-classified sibling.
+        let Err(err) = merge_family_results(errno(), Ok(msg(ResponseCode::ServFail))) else {
+            panic!("Failed + transport failure is unproven")
+        };
+        assert!(err.is_errno_backed());
+
+        // NXDOMAIN is name-authoritative from either side — even against a
+        // sibling transport error the name cannot resolve.
+        for (v4, v6) in [
+            (errno(), Ok(msg(ResponseCode::NXDomain))),
+            (Ok(msg(ResponseCode::NXDomain)), errno()),
+        ] {
+            let r = merge_family_results(v4, v6).expect("NXDOMAIN settles the lookup");
+            assert!(r.ips.is_empty());
+            assert!(
+                matches!(r.v4, Some(FamilyAnswer::NxDomain(_))),
+                "missing sibling must be synthesized as NxDomain: {:?}",
+                r.v4
+            );
+            assert!(matches!(r.v6, Some(FamilyAnswer::NxDomain(_))));
+        }
+
+        // A positive answer still wins over a sibling failure.
+        let r = merge_family_results(Ok(a_answer()), errno())
+            .expect("a dialable answer beats a sibling error");
+        assert_eq!(r.ips, vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))]);
+
+        // Both families failed → errno arm.
+        let Err(err) = merge_family_results(errno(), errno()) else {
+            panic!("both-failed must surface the errno")
+        };
+        assert!(err.is_errno_backed());
+
+        // Genuine negatives on both sides still collapse to Ok.
+        let r = merge_family_results(
+            Ok(msg(ResponseCode::NoError)),
+            Ok(msg(ResponseCode::NXDomain)),
+        )
+        .unwrap();
+        assert!(r.ips.is_empty());
     }
 }

@@ -476,6 +476,25 @@ the canonical, in-repo source a release is cut from.
   warns instead of reporting success. On Windows, a failed registry
   backup script now aborts the guard instead of yielding an empty
   backup whose drop-time DHCP reset discarded static DNS.
+- **Resolver no longer erases upstream errno into "host unresolvable"**
+  (issue #682). `Resolver::resolve_ips`/`resolve_ip` returned `Option`,
+  so an `EMFILE`/`ENFILE`/`ENOBUFS`/`ENOMEM` raised inside a nameserver
+  exchange (DNS-via-proxy `dial_tcp`, socket bind, send/recv) flattened
+  to `None` — callers reported a generic DNS failure and proxy groups
+  dead-marked healthy members under local resource pressure. Both APIs
+  now return `io::Result<Option<…>>`: `Ok(Some(_))` is a dialable
+  answer, `Ok(None)` is a *definitive* negative (NXDOMAIN/NODATA or a
+  full policy miss), and `Err` carries the original `io::Error` —
+  `raw_os_error` included — through `lookup_set` (single-family
+  transport errors propagate verbatim, and the dual-stack merge now
+  surfaces the sibling's `Err` when no usable answer exists instead of
+  dropping it), `query_pool_set` (errno-bearing failures outrank
+  context-only ones), the single-flight broadcast (subscribers receive
+  the same `ClientError` via `Arc`, and a dead publisher's subscriber
+  takes over the flight rather than fabricating a miss), and the
+  host-resolver hook into `resolve_host_all` callers. Verdicts still
+  outrank errors: a positive answer or a name-authoritative NXDOMAIN
+  always wins over a sibling transport failure.
 
 - **Dead-marking a nested proxy-group member is no longer a dead write**
   (issue #681). `DialFailureTracker` escalation and probe sweeps record

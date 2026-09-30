@@ -117,15 +117,20 @@ impl DirectAdapter {
             if let Some(resolver) = &self.resolver {
                 let resolver = Arc::clone(&resolver.read());
                 return match resolver.resolve_ips(&metadata.host).await {
-                    Some(ips) if !ips.is_empty() => Ok(ips
+                    Ok(Some(ips)) if !ips.is_empty() => Ok(ips
                         .into_iter()
                         .map(|ip| SocketAddr::new(ip, metadata.dst_port))
                         .collect()),
-                    None => Err(MeowError::Dns(format!(
+                    // The lookup itself failed — the io error keeps its
+                    // raw_os_error, so a local EMFILE while opening the
+                    // resolver socket stays `is_local_resource_error`
+                    // instead of dead-marking this member (#682).
+                    Err(e) => Err(MeowError::Io(e)),
+                    Ok(None) => Err(MeowError::Dns(format!(
                         "direct: failed to resolve {}",
                         metadata.host
                     ))),
-                    Some(_) => Err(MeowError::Dns(format!(
+                    Ok(Some(_)) => Err(MeowError::Dns(format!(
                         "direct: no address for {}",
                         metadata.host
                     ))),
@@ -748,5 +753,109 @@ mod tests {
         assert_eq!(&buf[..n], b"ping");
         assert_eq!(src, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port));
         echo_task.await.unwrap();
+    }
+
+    /// `EMFILE` on unix, `WSAEMFILE` on Windows — both are in
+    /// `is_local_resource_error`'s set.
+    #[cfg(unix)]
+    const EMFILE: i32 = 24;
+    #[cfg(windows)]
+    const EMFILE: i32 = 10024;
+
+    /// `Proxy` whose `dial_tcp` fails with an errno-bearing io error —
+    /// the dns-via-proxy upstream path hits a local-resource failure
+    /// without touching real sockets (#682).
+    struct ErrnoProxy {
+        health: ProxyHealth,
+    }
+
+    #[async_trait]
+    impl ProxyAdapter for ErrnoProxy {
+        fn name(&self) -> &str {
+            "errno"
+        }
+        fn adapter_type(&self) -> AdapterType {
+            AdapterType::Direct
+        }
+        fn addr(&self) -> &str {
+            ""
+        }
+        fn support_udp(&self) -> bool {
+            false
+        }
+        async fn dial_tcp(&self, _m: &Metadata) -> Result<Box<dyn ProxyConn>> {
+            Err(MeowError::Io(std::io::Error::from_raw_os_error(EMFILE)))
+        }
+        async fn dial_udp(&self, _m: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
+            unimplemented!("errno mock has no UDP")
+        }
+        fn health(&self) -> &ProxyHealth {
+            &self.health
+        }
+    }
+
+    impl meow_common::Proxy for ErrnoProxy {
+        fn alive(&self) -> bool {
+            true
+        }
+        fn alive_for_url(&self, _url: &str) -> bool {
+            true
+        }
+        fn last_delay(&self) -> u16 {
+            0
+        }
+        fn last_delay_for_url(&self, _url: &str) -> u16 {
+            0
+        }
+        fn delay_history(&self) -> Vec<meow_common::DelayHistory> {
+            Vec::new()
+        }
+    }
+
+    /// #682 end-to-end: a resolver whose upstream fails with EMFILE must
+    /// reach `resolve_targets` as `MeowError::Io` carrying the errno — the
+    /// classifier then treats it as local resource pressure instead of a
+    /// member-health failure.
+    #[tokio::test]
+    async fn resolve_targets_surfaces_resolver_io_errno() {
+        use meow_dns::NameServerEntry;
+        use smol_str::SmolStr;
+        use std::collections::HashMap;
+
+        let mut registry: HashMap<SmolStr, Arc<dyn meow_common::Proxy>> = HashMap::new();
+        registry.insert(
+            SmolStr::from("emfile"),
+            Arc::new(ErrnoProxy {
+                health: ProxyHealth::new(),
+            }),
+        );
+        let resolver = Resolver::new_with_bootstrap_with_proxies(
+            vec![NameServerEntry::parse("udp://203.0.113.53#emfile").unwrap()],
+            vec![],
+            vec![],
+            DnsMode::Normal,
+            DomainTrie::new(),
+            true,
+            true,
+            None,
+            None,
+            &registry,
+        )
+        .await
+        .expect("resolver builds");
+        let adapter = DirectAdapter::new().with_resolver(Arc::new(resolver));
+
+        let err = adapter
+            .resolve_targets(&tcp_metadata("dial.example", 443))
+            .await
+            .expect_err("errno-bearing lookup failure must surface");
+        assert!(
+            matches!(&err, MeowError::Io(io) if io.raw_os_error() == Some(EMFILE)),
+            "errno must survive into MeowError::Io, got {err:?}"
+        );
+        assert!(
+            err.is_local_resource_error(),
+            "the classifier must see local resource pressure: {err:?}"
+        );
     }
 }

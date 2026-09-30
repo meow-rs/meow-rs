@@ -896,7 +896,7 @@ async fn dns_query(
     Json(body): Json<DnsQueryRequest>,
 ) -> Json<serde_json::Value> {
     let resolver = state.tunnel.resolver();
-    let result = resolver.resolve_ip(&body.name).await;
+    let result = resolver.resolve_ip(&body.name).await.ok().flatten();
     let _ = body.qtype;
     Json(serde_json::json!({ "name": body.name, "answer": result.map(|ip| ip.to_string()) }))
 }
@@ -953,7 +953,12 @@ async fn dns_query_get(
     response.insert("CD".into(), false.into());
 
     if matches!(record_type, RecordType::A | RecordType::AAAA) {
-        let ips = resolver.resolve_ips(&params.name).await.unwrap_or_default();
+        let ips = resolver
+            .resolve_ips(&params.name)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
         let answers: Vec<_> = ips
             .into_iter()
             .filter(|ip| {

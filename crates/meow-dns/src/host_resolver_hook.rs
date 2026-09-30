@@ -66,21 +66,29 @@ impl ResolverHostHook {
 #[async_trait]
 impl HostResolver for ResolverHostHook {
     async fn resolve(&self, host: &str) -> io::Result<IpAddr> {
-        self.active().resolve_ip(host).await.ok_or_else(|| {
-            io::Error::new(
+        // `Err` propagates verbatim — it carries the upstream failure's
+        // `raw_os_error` (e.g. EMFILE opening the resolver socket), which
+        // `is_local_resource_error` needs to see to keep local resource
+        // exhaustion off the proxy-member health ledger (#682).
+        match self.active().resolve_ip(host).await {
+            Ok(Some(ip)) => Ok(ip),
+            Ok(None) => Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("meow-dns resolver: no address for {host}"),
-            )
-        })
+            )),
+            Err(e) => Err(e),
+        }
     }
 
     async fn resolve_all(&self, host: &str) -> io::Result<Vec<IpAddr>> {
-        self.active().resolve_ips(host).await.ok_or_else(|| {
-            io::Error::new(
+        match self.active().resolve_ips(host).await {
+            Ok(Some(ips)) => Ok(ips),
+            Ok(None) => Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("meow-dns resolver: no address for {host}"),
-            )
-        })
+            )),
+            Err(e) => Err(e),
+        }
     }
 
     fn resolve_all_local(&self, host: &str) -> Option<Vec<IpAddr>> {

@@ -31,7 +31,7 @@ async fn dot_resolves_example_com() {
     )
     .await
     .expect("DoT resolver must build");
-    let ip = resolver.resolve_ip("example.com").await;
+    let ip = resolver.resolve_ip("example.com").await.unwrap();
     assert!(
         ip.is_some(),
         "expected an IPv4/IPv6 answer for example.com via DoT"
@@ -56,7 +56,7 @@ async fn doh_resolves_example_com() {
     )
     .await
     .expect("DoH resolver must build");
-    let ip = resolver.resolve_ip("example.com").await;
+    let ip = resolver.resolve_ip("example.com").await.unwrap();
     assert!(ip.is_some(), "expected an answer for example.com via DoH");
 }
 
@@ -79,10 +79,12 @@ async fn dot_bogus_sni_fails_cert_validation() {
     )
     .await
     .expect("resolver builds even with bad SNI");
-    let ip = resolver.resolve_ip("example.com").await;
+    // resolve_ip is io::Result<Option<_>>: cert validation failure is
+    // surfaced as Err, not Ok(None).
+    let result = resolver.resolve_ip("example.com").await;
     assert!(
-        ip.is_none(),
-        "DoT with bogus SNI must fail cert validation; unexpectedly got: {ip:?}"
+        matches!(result, Err(_) | Ok(None)),
+        "DoT with bogus SNI must fail cert validation; unexpectedly got: {result:?}"
     );
 }
 
@@ -105,10 +107,10 @@ async fn doh_bogus_sni_fails_cert_validation() {
     )
     .await
     .expect("resolver builds even with bad SNI");
-    let ip = resolver.resolve_ip("example.com").await;
+    let result = resolver.resolve_ip("example.com").await;
     assert!(
-        ip.is_none(),
-        "DoH with bogus SNI must fail cert validation; unexpectedly got: {ip:?}"
+        matches!(result, Err(_) | Ok(None)),
+        "DoH with bogus SNI must fail cert validation; unexpectedly got: {result:?}"
     );
 }
 
@@ -133,7 +135,7 @@ async fn dot_hostname_with_bootstrap_resolves() {
     )
     .await
     .expect("bootstrap + DoT resolver must build");
-    let ip = resolver.resolve_ip("example.com").await;
+    let ip = resolver.resolve_ip("example.com").await.unwrap();
     assert!(
         ip.is_some(),
         "expected an answer via dns.google DoT after bootstrap; got None"
