@@ -437,6 +437,15 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **AnyTLS no longer logs one `info` line per proxied stream** (#495
+  item 13). The client session logged `Stream N SYNACK received
+  (success)` at `info` for every stream it opened, so a busy AnyTLS proxy
+  wrote a line per connection under the default `info` filter. It is now
+  `debug`, as are the peer's in-flight data frames that arrive after a
+  local close (a `warn` per late frame) and the vendored server's
+  per-stream `Destination` / `Successfully connected` lines. Refused
+  streams, unexpected frames and session failures keep their levels.
+
 - **Snell v4/v5 `reuse` keeps one connection for every session.** The
   reuse pool dropped a connection after its second session, on the belief
   that the v5 server closes it there. The official 4.0.0 through 5.0.1
