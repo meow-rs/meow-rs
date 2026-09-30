@@ -156,7 +156,7 @@ Built-in web UI served at `http://<api-addr>/ui` with:
 
 ## Benchmarks
 
-Side-by-side against upstream Go mihomo v1.19.31 on the same host (Apple M4 Pro arm64, macOS 27.0.1, loopback `127.0.0.1`). Both binaries use the same direct-mode benchmark config with a mixed listener on port 17890; the DNS workload uses the matching fake-IP config on UDP port 15353. The table below reports the median of three successful runs from commit `095912e7` (`meow-rs` 0.21.2, rustc 1.97.1). Reproduce with `bash bench.sh` (auto-downloads the latest Go mihomo release).
+Side-by-side against upstream Go mihomo v1.19.31 on the same host (Apple M4 Pro arm64, macOS 27.0.1, loopback `127.0.0.1`). Both binaries use the same direct-mode benchmark config with a mixed listener on port 17890; the DNS workload uses the matching fake-IP config on UDP port 15353. The table below reports the median of three successful runs from commit `095912e7` (`meow-rs` 0.21.2). Reproduce with `bash bench.sh` (auto-downloads the latest Go mihomo release).
 
 | Metric | mihomo (Go) v1.19.31 | meow-rs v0.21.2 | Delta |
 |--------|-------------|--------------------|-------|
