@@ -11,6 +11,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use tracing::warn;
 
+use super::boring_stream::BoringTlsStream;
 use super::{ConnectTypedError, EchOpts, TlsConfig, TlsVersion};
 use crate::{Result, Stream, TransportError};
 
@@ -612,9 +613,11 @@ impl BoringInner {
         // `TolerantFlushStream` workaround from #571 is gone;
         // `d1_tls_handshake_over_pending_flush_stream` guards the upstream
         // behaviour.
+        //
+        // `BoringTlsStream` adds XTLS-Vision's raw switch (issue #495).
         self.connect_typed(inner)
             .await
-            .map(|s| Box::new(s) as Box<dyn Stream>)
+            .map(|s| Box::new(BoringTlsStream::new(s)) as Box<dyn Stream>)
             .map_err(ConnectTypedError::into_transport)
     }
 

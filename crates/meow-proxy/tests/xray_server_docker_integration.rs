@@ -1,15 +1,21 @@
-//! VMess and VLESS encryption against the official Xray-core server.
+//! VMess, VLESS encryption and VLESS XTLS-Vision against the official
+//! Xray-core server.
 //!
 //! The server binary is extracted from the pinned `ghcr.io/xtls/xray-core`
 //! image and run natively. These tests pin the record-layer AEADs — VMess
 //! AES-128-GCM / ChaCha20-Poly1305 and VLESS encryption's AES-256-GCM — to
 //! a real peer; the in-crate tests only check them against another Rust
-//! implementation.
+//! implementation.  The Vision leg pins the DIRECT switch to the raw socket
+//! under plain TLS (issue #495).
 //!
 //! Without Docker the tests skip; `MEOW_REQUIRE_DOCKER=1` (set in CI) turns
 //! a skip into a failure.
 
-#![cfg(any(feature = "vmess", feature = "vless-encryption"))]
+#![cfg(any(
+    feature = "vmess",
+    feature = "vless-encryption",
+    feature = "vless-vision"
+))]
 
 use meow_common::{Metadata, Network, ProxyAdapter, ProxyConn};
 use meow_proxy::dialer::DirectDialer;
@@ -22,7 +28,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tempfile::TempDir;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::time::{sleep, timeout, Duration, Instant};
 
@@ -261,7 +267,10 @@ async fn dial(
 
 /// Stream `payload` through an echo upstream with both directions in
 /// flight, then half-close and expect a clean EOF.
-async fn bulk_echo(mut conn: Box<dyn ProxyConn>, payload: &[u8], server: &XrayServer) {
+async fn bulk_echo<S>(mut conn: S, payload: &[u8], server: &XrayServer)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let (mut rd, mut wr) = tokio::io::split(&mut conn);
     let write = async {
         wr.write_all(payload).await?;
@@ -451,5 +460,166 @@ mod vless_encryption {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn vless_encryption_random_against_xray() {
         round_trips("random").await;
+    }
+}
+
+#[cfg(feature = "vless-vision")]
+mod vless_vision {
+    use super::*;
+    use meow_proxy::{VlessAdapter, VlessFlow};
+    use meow_transport::tls::{TlsConfig, TlsLayer};
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+    use std::sync::Mutex;
+
+    /// Collects the client's `tracing` output to show which Vision path ran.
+    #[derive(Clone, Default)]
+    struct LogSink(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogSink {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self {
+            self.clone()
+        }
+    }
+
+    fn pkcs8_key(key: &rcgen::KeyPair) -> PrivateKeyDer<'static> {
+        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()))
+    }
+
+    /// TLS 1.3-only echo upstream.  Its ServerHello is what makes Xray and
+    /// the client leave padding for DIRECT.
+    async fn start_tls13_echo_server() -> (
+        SocketAddr,
+        CertificateDer<'static>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert = CertificateDer::from(ck.cert.der().to_vec());
+        let config =
+            rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+                .with_no_client_auth()
+                .with_single_cert(vec![cert.clone()], pkcs8_key(&ck.key_pair))
+                .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(tls) = acceptor.accept(tcp).await else {
+                        return;
+                    };
+                    let (mut rd, mut wr) = tokio::io::split(tls);
+                    let _ = tokio::io::copy(&mut rd, &mut wr).await;
+                    let _ = wr.shutdown().await;
+                });
+            }
+        });
+        (addr, cert, handle)
+    }
+
+    /// Issue #495 item 5: Vision over plain (non-REALITY) TLS against a
+    /// TLS 1.3 destination.  Both sides switch to the socket under the
+    /// outer TLS after the inner handshake — Xray on its own once it sees
+    /// the TLS 1.3 ServerHello — so the client must switch its BoringSSL
+    /// stream both ways.  Before the fix the first inner app-data record
+    /// failed with "DIRECT requested but transport cannot switch".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn vless_vision_over_tls_to_tls13_target_against_xray() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let port = free_tcp_port();
+        let outer = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let pem_lines = |pem: String| pem.lines().map(str::to_owned).collect::<Vec<_>>();
+        let inbound = json!({
+            "protocol": "vless",
+            "settings": {
+                "clients": [{ "id": UUID, "flow": "xtls-rprx-vision" }],
+                "decryption": "none",
+            },
+            "streamSettings": {
+                "network": "raw",
+                "security": "tls",
+                "tlsSettings": {
+                    "certificates": [{
+                        "certificate": pem_lines(outer.cert.pem()),
+                        "key": pem_lines(outer.key_pair.serialize_pem()),
+                    }],
+                },
+            },
+        });
+        let Some(server) = start_xray(port, inbound).await else {
+            return;
+        };
+        let (target, target_cert, _target_h) = start_tls13_echo_server().await;
+
+        let tls = TlsConfig {
+            skip_cert_verify: true,
+            ..TlsConfig::new("localhost")
+        };
+        let mut chain = TransportChain::empty();
+        chain.push(Box::new(TlsLayer::new(&tls).expect("outer TLS layer")));
+        let adapter = VlessAdapter::new(
+            "docker-xray-vless-vision",
+            "127.0.0.1",
+            port,
+            uuid_bytes(),
+            Some(VlessFlow::XtlsRprxVision),
+            false,
+            chain,
+            Arc::new(DirectDialer),
+        );
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(target_cert).unwrap();
+        let inner_cfg =
+            rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(inner_cfg));
+
+        let logs = LogSink::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        // The client conn is polled on this thread only (`block_on`), so a
+        // thread-local subscriber sees every Vision event.
+        let guard = tracing::subscriber::set_default(subscriber);
+        let conn = dial(&adapter, &metadata_for(target, Network::Tcp), &server).await;
+        let inner = timeout(
+            T,
+            connector.connect(ServerName::try_from("localhost").unwrap(), conn),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("inner TLS handshake timed out\n{}", server.logs()))
+        .unwrap_or_else(|e| panic!("inner TLS handshake failed: {e}\n{}", server.logs()));
+        assert_eq!(
+            inner.get_ref().1.protocol_version(),
+            Some(rustls::ProtocolVersion::TLSv1_3)
+        );
+        // 1 MiB each way: the bulk of it rides the raw socket.
+        bulk_echo(inner, &patterned((1 << 20) + 777, 7), &server).await;
+        drop(guard);
+
+        let logs = String::from_utf8_lossy(&logs.0.lock().unwrap()).into_owned();
+        for event in [
+            "XTLS Vision direct write passthrough enabled",
+            "XTLS Vision direct passthrough enabled",
+        ] {
+            assert!(logs.contains(event), "no `{event}` in client logs:\n{logs}");
+        }
     }
 }

@@ -1402,7 +1402,10 @@ fn ws_max_early_data(ws_opts: Option<&serde_yaml::Value>) -> usize {
 /// - `flow: xtls-rprx-direct` / `xtls-rprx-splice` — deprecated and insecure
 /// - Unknown `flow` values — may skip expected security processing
 /// - `reality-opts` malformed, used without TLS, or missing `client-fingerprint`
-/// - `flow: xtls-rprx-vision` + no TLS-enforcing transport
+/// - `flow: xtls-rprx-vision` + any `network` other than raw `tcp`, or
+///   without `tls: true` (REALITY included) — Vision's DIRECT mode needs
+///   the TLS record layer right on the socket.  With VLESS `encryption`
+///   the older rule applies: `tls: true` or a grpc/h2 network
 /// - `encryption: <non-empty non-"none">` — unsupported cipher
 /// - `uuid` invalid
 /// - `server` domain > 255 bytes
@@ -1549,14 +1552,37 @@ fn parse_vless(
         }
     };
 
-    // ── Gating: Vision requires TLS (or a TLS-enforcing transport) (Class A) ─
+    // ── Gating: Vision requires raw TCP under TLS / REALITY (Class A) ─────
+    // Vision ends by switching both directions to the socket under the
+    // outer TLS (DIRECT); Xray's inbound refuses anything but TLS / REALITY
+    // right on the connection, and mihomo's client refuses the same.  The
+    // VLESS Encryption layer keeps its earlier gate (issue #495 item 5).
     if flow == Some(VlessFlow::XtlsRprxVision) {
-        let tls_transport = network == "grpc" || network == "h2";
-        if !tls && !tls_transport {
+        #[cfg(feature = "vless-encryption")]
+        let encrypted = vless_encryption.is_some();
+        #[cfg(not(feature = "vless-encryption"))]
+        let encrypted = false;
+        if encrypted {
+            let tls_transport = network == "grpc" || network == "h2";
+            if !tls && !tls_transport {
+                return Err(
+                    "vless: flow xtls-rprx-vision requires an encrypting transport; \
+                     set `tls: true` or use a TLS-enforcing network (grpc, h2). \
+                     Without outer TLS, Vision splice is a no-op and the user has no protection."
+                        .into(),
+                );
+            }
+        } else if network != "tcp" {
+            return Err(format!(
+                "vless: flow xtls-rprx-vision only works over `network: tcp` (got \
+                 '{network}'); Vision hands the connection to the raw TLS socket, which \
+                 a {network} transport does not expose, and Xray servers reject it too. \
+                 Remove `flow` or `network`."
+            ));
+        } else if !tls {
             return Err(
-                "vless: flow xtls-rprx-vision requires an encrypting transport; \
-                 set `tls: true` or use a TLS-enforcing network (grpc, h2). \
-                 Without outer TLS, Vision splice is a no-op and the user has no protection."
+                "vless: flow xtls-rprx-vision requires `tls: true` (or REALITY); \
+                 without outer TLS, Vision splice is a no-op and the user has no protection."
                     .into(),
             );
         }

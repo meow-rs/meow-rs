@@ -15,8 +15,9 @@ mod support;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 
 use meow_transport::{
@@ -1358,4 +1359,150 @@ async fn d1_tls_handshake_over_pending_flush_stream() {
             result.err()
         );
     }
+}
+
+// ─── E: raw passthrough switch (XTLS-Vision DIRECT, issue #495) ─────────────
+//
+// Vision DIRECT drops the outer TLS mid-stream: after its last TLS record
+// each peer reads and writes the TCP socket directly.  The server here is
+// rustls (TLS 1.3, so NewSessionTicket records ride ahead of the first
+// app data) and switches by writing to / reading from its TCP socket.
+
+type ServerTls = tokio_rustls::server::TlsStream<TcpStream>;
+
+/// A TLS 1.3 loopback pair: the client is `TlsLayer`'s BoringSSL stream.
+async fn raw_switch_pair() -> (Box<dyn meow_transport::Stream>, ServerTls) {
+    install_crypto_provider();
+    let (cert_der, key_der, _, _) = gen_cert(&["localhost"]);
+    let server_cfg =
+        rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der)
+            .expect("server TLS config");
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_cfg));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("loopback bind");
+    let addr = listener.local_addr().expect("local_addr");
+
+    let config = TlsConfig {
+        skip_cert_verify: true,
+        ..TlsConfig::new("localhost")
+    };
+    let layer = TlsLayer::new(&config).expect("TlsLayer::new");
+    let server = async {
+        let (tcp, _) = listener.accept().await.expect("accept");
+        acceptor.accept(tcp).await.expect("server handshake")
+    };
+    let client = async {
+        let tcp = TcpStream::connect(addr).await.expect("TCP connect");
+        layer
+            .connect(Box::new(tcp))
+            .await
+            .expect("client handshake")
+    };
+    let (mut client, server) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(client, server)
+    })
+    .await
+    .expect("handshake timed out");
+    assert_eq!(
+        server.get_ref().1.protocol_version(),
+        Some(rustls::ProtocolVersion::TLSv1_3)
+    );
+    assert!(meow_transport::supports_raw_passthrough(&mut *client));
+    (client, server)
+}
+
+async fn within<F: std::future::Future>(f: F) -> F::Output {
+    tokio::time::timeout(Duration::from_secs(10), f)
+        .await
+        .expect("raw switch test timed out")
+}
+
+#[tokio::test]
+async fn e1_raw_read_switch_leaves_bytes_after_last_record_on_socket() {
+    let (mut client, mut server) = raw_switch_pair().await;
+    server.write_all(b"tls-downlink").await.unwrap();
+    server.flush().await.unwrap();
+    server.get_mut().0.write_all(b"raw-downlink").await.unwrap();
+
+    let mut tls = [0u8; 12];
+    within(client.read_exact(&mut tls)).await.unwrap();
+    assert_eq!(&tls, b"tls-downlink");
+    assert!(meow_transport::enable_raw_read_passthrough(&mut *client));
+    let mut raw = [0u8; 12];
+    within(client.read_exact(&mut raw)).await.unwrap();
+    assert_eq!(&raw, b"raw-downlink");
+}
+
+#[tokio::test]
+async fn e2_raw_read_switch_drains_partly_read_record_first() {
+    let (mut client, mut server) = raw_switch_pair().await;
+    server.write_all(b"0123456789").await.unwrap();
+    server.flush().await.unwrap();
+    server.get_mut().0.write_all(b"RAW!").await.unwrap();
+
+    let mut head = [0u8; 4];
+    within(client.read_exact(&mut head)).await.unwrap();
+    assert_eq!(&head, b"0123");
+    assert!(meow_transport::enable_raw_read_passthrough(&mut *client));
+    let mut rest = [0u8; 10];
+    within(client.read_exact(&mut rest)).await.unwrap();
+    assert_eq!(&rest, b"456789RAW!");
+}
+
+#[tokio::test]
+async fn e3_raw_write_switch_and_shutdown_send_no_tls_bytes() {
+    let (mut client, mut server) = raw_switch_pair().await;
+    client.write_all(b"tls-uplink").await.unwrap();
+    client.flush().await.unwrap();
+    let mut tls = [0u8; 10];
+    within(server.read_exact(&mut tls)).await.unwrap();
+    assert_eq!(&tls, b"tls-uplink");
+    // The server is done reading TLS once it acks, so rustls cannot have
+    // buffered any raw byte the client sends afterwards.
+    server.write_all(b"ok").await.unwrap();
+    server.flush().await.unwrap();
+    let mut ack = [0u8; 2];
+    within(client.read_exact(&mut ack)).await.unwrap();
+
+    assert!(meow_transport::enable_raw_write_passthrough(&mut *client));
+    client.write_all(b"raw-uplink").await.unwrap();
+    within(client.shutdown()).await.unwrap();
+    let (mut tcp, _) = server.into_inner();
+    let mut raw = Vec::new();
+    within(tcp.read_to_end(&mut raw)).await.unwrap();
+    // A close_notify would trail as an encrypted 0x17 record.
+    assert_eq!(raw, b"raw-uplink");
+}
+
+#[tokio::test]
+async fn e4_raw_read_switch_refuses_when_ciphertext_is_buffered() {
+    let (mut client, mut server) = raw_switch_pair().await;
+    server.write_all(b"abc").await.unwrap();
+    server.flush().await.unwrap();
+    // Four raw bytes: one short of a record header, so a TLS read that
+    // runs past the switch point swallows them and then waits.
+    server.get_mut().0.write_all(b"XYZW").await.unwrap();
+
+    let mut tls = [0u8; 3];
+    within(client.read_exact(&mut tls)).await.unwrap();
+    let mut over = [0u8; 8];
+    let overread = tokio::time::timeout(Duration::from_millis(300), client.read(&mut over)).await;
+    assert!(overread.is_err(), "4 bytes can never complete a record");
+    assert!(
+        !meow_transport::enable_raw_read_passthrough(&mut *client),
+        "bytes stranded inside BoringSSL must refuse the switch"
+    );
+}
+
+#[tokio::test]
+async fn e5_plain_streams_cannot_switch() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut tcp = TcpStream::connect(addr).await.unwrap();
+    assert!(!meow_transport::supports_raw_passthrough(&mut tcp));
+    assert!(!meow_transport::enable_raw_read_passthrough(&mut tcp));
+    assert!(!meow_transport::enable_raw_write_passthrough(&mut tcp));
 }

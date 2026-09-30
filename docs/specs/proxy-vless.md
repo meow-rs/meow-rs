@@ -130,7 +130,7 @@ Field reference:
 | `udp` | bool | no | `false` | Enable UDP-over-TCP relay. |
 | `network` | enum | no | `tcp` | Outer transport — same semantics as VMess. |
 | `tls` | bool | no | `false` | Wrap in TLS. Without TLS or a TLS-enforcing transport, traffic is unauthenticated plaintext; we warn once at load. |
-| `flow: xtls-rprx-vision` | — | — | — | Requires `tls: true` (or `network: grpc`). Hard-error if `flow` is set without an encrypting transport. |
+| `flow: xtls-rprx-vision` | — | — | — | Requires `network: tcp` and `tls: true` (plain TLS or REALITY); any other network or no TLS is a hard error. With VLESS `encryption` the rule is `tls: true` or `network: grpc`/`h2`. See §Vision gating rules. |
 
 **Divergences from upstream** (classified per
 [ADR-0002](../adr/0002-upstream-divergence-policy.md)):
@@ -301,15 +301,28 @@ returns a `VisionConn` when `flow == Some(XtlsRprxVision)`, or a
 plain `VlessConn` otherwise. This keeps the adapter's transport chain
 and the vision-splice logic orthogonal.
 
+The DIRECT switch goes through `meow_transport::enable_raw_read_passthrough`
+/ `enable_raw_write_passthrough`, which the BoringSSL TLS stream and the
+REALITY stream implement: past the switch they read and write the socket
+under TLS, after draining plaintext BoringSSL already decrypted.  The
+uplink sends DIRECT only when `meow_transport::supports_raw_passthrough`
+says the transport can switch, and END otherwise (a Vision server accepts
+either).  The server decides DIRECT on the downlink by itself, so a
+transport that cannot switch reads fails with an `Unsupported` error.
+
 ### Vision gating rules
 
-- `flow: xtls-rprx-vision` requires `tls: true` (or a transport that
-  enforces TLS, such as `network: grpc` with a gRPC-TLS server). If
-  neither is set, **hard-error at config load** with
-  "xtls-rprx-vision requires an encrypting transport; set `tls: true`
-  or use a TLS-enforcing network". Class A per ADR-0002: user assumes
-  they have a Vision-splice connection; without outer TLS they have
-  nothing.
+- `flow: xtls-rprx-vision` requires `network: tcp` (the default) with
+  `tls: true` — plain TLS or REALITY.  Any other network (`ws`, `grpc`,
+  `h2`, `httpupgrade`, `xhttp`) is a **hard error at config load**
+  ("only works over `network: tcp`"), and so is `tls: false` ("requires
+  `tls: true` (or REALITY)").  After the inner handshake with a TLS 1.3
+  target, Vision's DIRECT command moves both directions onto the socket
+  under the outer TLS; a framed transport has no such socket, Xray's
+  inbound rejects it ("XTLS only supports TLS and REALITY directly") and
+  mihomo fails every dial (issue #495 item 5).  Class A per ADR-0002.
+  With VLESS `encryption` the earlier rule stays: `tls: true` or a
+  grpc/h2 network.
 - Vision does **not** require the application to be doing TLS — it
   falls through to pass-through if the first 5 bytes are not a TLS
   record header. No error at runtime, just a `trace!` log.

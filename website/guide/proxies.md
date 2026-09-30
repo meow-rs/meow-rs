@@ -243,7 +243,7 @@ The most feature-rich protocol: TLS, REALITY, XTLS-Vision flow, and five transpo
 | `alpn` | list | | `[]` | e.g. `[h2, http/1.1]` |
 | `network` | string | | `tcp` | `tcp` · `ws` · `grpc` · `h2` · `httpupgrade` |
 | `client-fingerprint` | string | | — | uTLS profile (required for REALITY) |
-| `flow` | string | | — | `xtls-rprx-vision` (needs TLS + `vless-vision` feature) |
+| `flow` | string | | — | `xtls-rprx-vision` (needs `network: tcp` + TLS or REALITY, and the `vless-vision` feature) |
 | `encryption` | string | | `none` | Must be `none`/empty |
 | `reality-opts` | map | | — | REALITY config (see below) |
 | `ech-opts` | map | | — | Encrypted Client Hello (see below) |

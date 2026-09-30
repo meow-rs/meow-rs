@@ -195,7 +195,7 @@ proxies:
     tls: true
     servername: example.com
     skip-cert-verify: false
-    flow: ""                    # "" (plain) | xtls-rprx-vision
+    flow: ""                    # "" (plain) | xtls-rprx-vision (network: tcp only)
     encryption: ""              # "" / none, or mlkem768x25519plus.native.0rtt.<key>
     network: ws                 # tcp | ws | grpc | h2 | httpupgrade
     ws-opts:
@@ -214,6 +214,7 @@ proxies:
 | `encryption:` any other non-`""`/`"none"` value | Accepted | Hard parse error — VLESS defines no other body cipher. |
 | `smux: {enabled: true}` | Multiplexes | Implemented as sing-mux (smux/yamux/h2mux; default h2mux) for sing-box/mihomo servers, plus Xray Mux.Cool (`protocol: muxcool`, VLESS/VMess) for Xray servers. Legacy `mux:` remains accepted. |
 | `tls: false` with no outer encryption | Accepted silently | Warn-once at load — traffic is plaintext. |
+| `flow: xtls-rprx-vision` over `network: ws`/`grpc`/`h2`/`httpupgrade`/`xhttp` (no `encryption`) | Loads; every dial fails ("failed to use vision") | Hard parse error — Vision needs `network: tcp` with `tls: true` or REALITY. |
 
 **Deferred:** VLESS inbound.
 

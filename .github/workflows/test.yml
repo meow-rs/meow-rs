@@ -297,11 +297,11 @@ jobs:
           MIHOMO_REQUIRE_INTEGRATION_BINS: "1"
         run: cargo nextest run --test shadowsocks_integration --retries 2 --no-fail-fast
 
-      - name: Docker integration tests (Hysteria2 + Snell v3–v6 + Xray VMess/VLESS encryption)
+      - name: Docker integration tests (Hysteria2 + Snell v3–v6 + Xray VMess/VLESS encryption/Vision)
         env:
           MEOW_REQUIRE_DOCKER: "1"
         run: |
-          cargo nextest run -p meow-proxy --features "hysteria2,snell,vmess,vless-encryption" \
+          cargo nextest run -p meow-proxy --features "hysteria2,snell,vmess,vless-encryption,vless-vision" \
             --test hysteria2_integration \
             --test snell_server_docker_integration \
             --test xray_server_docker_integration --retries 2 --no-fail-fast

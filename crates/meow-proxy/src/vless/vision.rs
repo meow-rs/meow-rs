@@ -60,12 +60,17 @@ pub struct VisionConn {
     write_sent_uuid: bool,
     write_seen_tls: bool,
     write_direct_enabled: bool,
+    /// The transport can switch writes to raw (plain TLS or REALITY over
+    /// the socket).  Without it the uplink ends padding with END, which a
+    /// Vision server accepts, instead of DIRECT (issue #495).
+    raw_write_capable: bool,
     read_tls_filter: ServerHelloFilter,
     vision_entered: bool,
 }
 
 impl VisionConn {
-    pub fn new(inner: VlessConn, user_uuid: [u8; UUID_LEN]) -> Self {
+    pub fn new(mut inner: VlessConn, user_uuid: [u8; UUID_LEN]) -> Self {
+        let raw_write_capable = inner.supports_raw_passthrough();
         Self {
             inner,
             user_uuid,
@@ -79,6 +84,7 @@ impl VisionConn {
             write_sent_uuid: false,
             write_seen_tls: false,
             write_direct_enabled: false,
+            raw_write_capable,
             read_tls_filter: ServerHelloFilter::new(),
             vision_entered: false,
         }
@@ -136,9 +142,12 @@ impl VisionConn {
         let mut command = COMMAND_PADDING_CONTINUE;
         let mut end_after_drain = false;
         if starts_tls_app_data && self.write_seen_tls {
-            command = if self.write_direct_enabled {
+            command = if self.write_direct_enabled && self.raw_write_capable {
                 COMMAND_PADDING_DIRECT
             } else {
+                if self.write_direct_enabled {
+                    tracing::debug!("XTLS Vision: transport cannot write raw, sending END");
+                }
                 COMMAND_PADDING_END
             };
             end_after_drain = true;
@@ -511,7 +520,8 @@ impl AsyncRead for VisionConn {
                             if !self.enable_inner_raw_read_passthrough() {
                                 return Poll::Ready(Err(io::Error::new(
                                     io::ErrorKind::Unsupported,
-                                    "vision: DIRECT requested but transport cannot switch to raw passthrough",
+                                    "vision: server sent DIRECT but this transport cannot switch \
+                                     reads to raw (Vision needs raw TCP with tls or REALITY)",
                                 )));
                             }
                             tracing::debug!("XTLS Vision direct passthrough enabled");
@@ -590,8 +600,130 @@ impl ProxyConn for VisionConn {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
 
     const UUID: [u8; UUID_LEN] = [0x11; UUID_LEN];
+    const CLIENT_HELLO: [u8; 6] = [TLS_HANDSHAKE, TLS_MAJOR, 0x01, 0x00, 0x01, TLS_CLIENT_HELLO];
+    const APP_DATA: [u8; 7] = [
+        TLS_APPLICATION_DATA,
+        TLS_MAJOR,
+        TLS_MAJOR,
+        0x00,
+        0x02,
+        b'h',
+        b'i',
+    ];
+
+    /// A Vision conn over an in-memory pipe, which (like ws, gRPC or VLESS
+    /// encryption) cannot switch to raw writes.
+    fn vision_over_pipe() -> (VisionConn, tokio::io::DuplexStream) {
+        let (client, server) = duplex(64 * 1024);
+        let vless = VlessConn {
+            inner: Box::new(client),
+            response_pending: true,
+            response_buf: [0; 2],
+            response_pos: 0,
+            response_addon: Vec::new(),
+            header_pending: None,
+            header_needs_flush: false,
+        };
+        (VisionConn::new(vless, UUID), server)
+    }
+
+    async fn read_frame(server: &mut tokio::io::DuplexStream, with_uuid: bool) -> (u8, Vec<u8>) {
+        if with_uuid {
+            let mut uuid = [0u8; UUID_LEN];
+            server.read_exact(&mut uuid).await.unwrap();
+            assert_eq!(uuid, UUID);
+        }
+        let mut head = [0u8; PADDING_HEADER_LEN - UUID_LEN];
+        server.read_exact(&mut head).await.unwrap();
+        let mut content = vec![0u8; u16::from_be_bytes([head[1], head[2]]) as usize];
+        server.read_exact(&mut content).await.unwrap();
+        let mut padding = vec![0u8; u16::from_be_bytes([head[3], head[4]]) as usize];
+        server.read_exact(&mut padding).await.unwrap();
+        (head[0], content)
+    }
+
+    /// The Vision request plus a server frame carrying the target's TLS 1.3
+    /// ServerHello, which arms DIRECT for the next app-data write.
+    async fn handshake_with_tls13_target(
+        conn: &mut VisionConn,
+        server: &mut tokio::io::DuplexStream,
+    ) {
+        conn.write_all(&CLIENT_HELLO).await.unwrap();
+        let hello = tls13_server_hello(0x1301);
+        let mut downlink = vec![0x00, 0x00];
+        downlink.extend(build_padding_frame(
+            COMMAND_PADDING_CONTINUE,
+            Some(&UUID),
+            &hello,
+            true,
+        ));
+        server.write_all(&downlink).await.unwrap();
+        let mut got = vec![0u8; hello.len()];
+        conn.read_exact(&mut got).await.unwrap();
+        assert_eq!(got, hello);
+        assert!(conn.write_direct_enabled);
+    }
+
+    #[tokio::test]
+    async fn uplink_direct_needs_a_raw_capable_transport() {
+        let (mut conn, _server) = vision_over_pipe();
+        assert!(!conn.raw_write_capable);
+        conn.write_seen_tls = true;
+        conn.write_direct_enabled = true;
+
+        conn.build_write_frame(&APP_DATA);
+        let pending = conn.write_pending.take().unwrap();
+        assert_eq!(pending.command, COMMAND_PADDING_END);
+        assert!(pending.end_padding_after_drain);
+
+        conn.raw_write_capable = true;
+        conn.build_write_frame(&APP_DATA);
+        let pending = conn.write_pending.take().unwrap();
+        assert_eq!(pending.command, COMMAND_PADDING_DIRECT);
+        assert!(pending.end_padding_after_drain);
+    }
+
+    /// Issue #495: a TLS 1.3 target over a transport that cannot write raw
+    /// used to fail the first app-data write with "DIRECT requested but
+    /// transport cannot switch".  It must end padding and carry on.
+    #[tokio::test]
+    async fn tls13_target_over_non_raw_transport_ends_padding() {
+        let (mut conn, mut server) = vision_over_pipe();
+        handshake_with_tls13_target(&mut conn, &mut server).await;
+
+        conn.write_all(&APP_DATA).await.unwrap();
+        conn.write_all(b"tail").await.unwrap();
+        conn.flush().await.unwrap();
+
+        assert_eq!(
+            read_frame(&mut server, true).await,
+            (COMMAND_PADDING_CONTINUE, CLIENT_HELLO.to_vec())
+        );
+        assert_eq!(
+            read_frame(&mut server, false).await,
+            (COMMAND_PADDING_END, APP_DATA.to_vec())
+        );
+        let mut tail = [0u8; 4];
+        server.read_exact(&mut tail).await.unwrap();
+        assert_eq!(&tail, b"tail");
+    }
+
+    #[tokio::test]
+    async fn downlink_direct_over_non_raw_transport_is_a_clear_error() {
+        let (mut conn, mut server) = vision_over_pipe();
+        handshake_with_tls13_target(&mut conn, &mut server).await;
+
+        let direct = build_padding_frame(COMMAND_PADDING_DIRECT, None, &APP_DATA, true);
+        server.write_all(&direct).await.unwrap();
+        let mut got = [0u8; APP_DATA.len()];
+        conn.read_exact(&mut got).await.unwrap();
+        assert_eq!(got, APP_DATA);
+        let err = conn.read(&mut [0u8; 8]).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+    }
 
     #[test]
     fn padding_frame_with_uuid_matches_mihomo_layout() {

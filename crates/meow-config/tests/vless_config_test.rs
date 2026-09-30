@@ -18,7 +18,7 @@
 //! | D10 | `parse_vless_tls_false_plain_warns_once`         — tls: false warns + loads |
 //! | D11 | `parse_vless_tls_false_no_duplicate_warn`        — warn fires once per load (not globally) |
 //! | D12 | `parse_vless_vision_without_tls_hard_errors`     — vision + no TLS → hard error |
-//! | D13 | `parse_vless_vision_with_grpc_transport_ok`      — vision + grpc (TLS-enforcing) → ok |
+//! | D13 | `parse_vless_vision_over_{grpc,ws,h2,…}_rejected` — vision + non-tcp network → hard error |
 //! | D14 | `parse_vless_encryption_non_none_hard_errors`    — encryption: aes-128-gcm → hard error |
 //! | D15 | `parse_vless_encryption_empty_string_accepted`   — encryption: "" → ok |
 //! | D16 | `parse_vless_mux_enabled_loads_with_sing_mux`   — smux loads (h2mux default) |
@@ -134,7 +134,8 @@ async fn parse_vless_minimal_ok() {
 
 /// D2: `parse_vless_all_fields_roundtrip`
 ///
-/// All documented fields parse without error.
+/// All documented fields parse without error.  `flow` is covered by D5:
+/// Vision needs `network: tcp` (D13), so it cannot ride this ws config.
 #[tokio::test]
 async fn parse_vless_all_fields_roundtrip() {
     let yaml = r#"
@@ -145,7 +146,6 @@ proxies:
     port: 443
     uuid: b831381d-6324-4d53-ad4f-8cda48b30811
     tls: true
-    flow: "xtls-rprx-vision"
     udp: true
     servername: cdn.example.com
     skip-cert-verify: false
@@ -691,19 +691,89 @@ proxies:
     );
 }
 
-// ─── D13: vision + grpc (TLS-enforcing) → ok ─────────────────────────────────
+// ─── D13: vision + non-tcp network → proxy skipped ───────────────────────────
 
-/// D13: `parse_vless_vision_with_grpc_transport_ok`
-///
-/// `flow: "xtls-rprx-vision"` + `tls: false` + `network: grpc` → parses OK.
-/// gRPC implies TLS at the transport level; the Vision-requires-TLS gate must
-/// accept grpc as a TLS-enforcing network.
-/// Acceptance criterion #9: "or a transport that enforces TLS, such as `network: grpc`".
-#[tokio::test]
-async fn parse_vless_vision_with_grpc_transport_ok() {
-    let yaml = r#"
+/// Load a TLS Vision node over `network` and assert it is skipped with the
+/// network error.
+async fn assert_vision_network_rejected(network: &str, tls: bool) {
+    let yaml = format!(
+        r#"
 proxies:
   - name: v
+    type: vless
+    server: example.com
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    tls: {tls}
+    network: {network}
+    flow: "xtls-rprx-vision"
+"#
+    );
+    let (result, lines) = with_warn_capture_async(load_config_from_str(&yaml)).await;
+    let config = result.expect("invalid proxy must not fail the whole config");
+    assert!(
+        !config.proxies.contains_key("v"),
+        "vision over {network} must be skipped"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("only works over `network: tcp`")),
+        "expected the vision network error; {lines:?}"
+    );
+}
+
+/// D13: `parse_vless_vision_over_grpc_rejected`
+///
+/// Issue #495 item 5: Vision's DIRECT mode switches to the socket right
+/// under the outer TLS, which gRPC / WebSocket / h2 / HTTPUpgrade / XHTTP
+/// framing does not expose; Xray's inbound rejects such a node ("XTLS only
+/// supports TLS and REALITY directly") and mihomo's client refuses it too.
+/// This used to be accepted (grpc even without `tls: true`).
+#[tokio::test]
+async fn parse_vless_vision_over_grpc_rejected() {
+    assert_vision_network_rejected("grpc", false).await;
+    assert_vision_network_rejected("grpc", true).await;
+}
+
+/// D13b: vision + `network: ws` → hard error (see D13).
+#[tokio::test]
+async fn parse_vless_vision_over_ws_rejected() {
+    assert_vision_network_rejected("ws", true).await;
+}
+
+/// D13c: vision + `network: h2` → hard error (see D13).
+#[tokio::test]
+async fn parse_vless_vision_over_h2_rejected() {
+    assert_vision_network_rejected("h2", false).await;
+    assert_vision_network_rejected("h2", true).await;
+}
+
+/// D13d: vision + `network: httpupgrade` / `xhttp` → hard error (see D13).
+#[tokio::test]
+async fn parse_vless_vision_over_httpupgrade_and_xhttp_rejected() {
+    assert_vision_network_rejected("httpupgrade", true).await;
+    assert_vision_network_rejected("xhttp", true).await;
+}
+
+/// D13e: with VLESS `encryption` the earlier Vision gate still applies
+/// (`tls: true` or a grpc/h2 network): Xray runs Vision over the encryption
+/// layer on any transport, so D13 does not narrow this path.
+#[cfg(feature = "vless-encryption")]
+#[tokio::test]
+async fn parse_vless_vision_with_encryption_keeps_transport_gate() {
+    let yaml = r#"
+proxies:
+  - name: enc-ws
+    type: vless
+    server: example.com
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    tls: true
+    network: ws
+    flow: "xtls-rprx-vision"
+    encryption: mlkem768x25519plus.native.0rtt.DA7B2WRj7X2zGFwMelbIbcaoUrpLjzoPpmydYW8NvQW
+  - name: enc-grpc
     type: vless
     server: example.com
     port: 443
@@ -711,10 +781,25 @@ proxies:
     tls: false
     network: grpc
     flow: "xtls-rprx-vision"
+    encryption: mlkem768x25519plus.native.0rtt.DA7B2WRj7X2zGFwMelbIbcaoUrpLjzoPpmydYW8NvQW
+  - name: enc-plain
+    type: vless
+    server: example.com
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    tls: false
+    flow: "xtls-rprx-vision"
+    encryption: mlkem768x25519plus.native.0rtt.DA7B2WRj7X2zGFwMelbIbcaoUrpLjzoPpmydYW8NvQW
 "#;
-    load_config_from_str(yaml)
+    let config = load_config_from_str(yaml)
         .await
-        .expect("vision + grpc (TLS-enforcing) must parse OK without tls: true");
+        .expect("invalid proxy must not fail the whole config");
+    assert!(config.proxies.contains_key("enc-ws"));
+    assert!(config.proxies.contains_key("enc-grpc"));
+    assert!(
+        !config.proxies.contains_key("enc-plain"),
+        "vision + encryption over plain tcp stays rejected"
+    );
 }
 
 // ─── D14: encryption: non-none → proxy skipped ───────────────────────────────

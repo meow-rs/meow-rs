@@ -357,11 +357,13 @@ impl AsyncRead for RealityTlsStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        if self.read_raw_passthrough {
-            return Pin::new(&mut self.inner).poll_read(cx, buf);
-        }
+        // Plaintext already opened from the last record comes before any
+        // raw byte, so it must drain first even after the raw switch.
         if self.drain_read_plain(buf) {
             return Poll::Ready(Ok(()));
+        }
+        if self.read_raw_passthrough {
+            return Pin::new(&mut self.inner).poll_read(cx, buf);
         }
 
         loop {

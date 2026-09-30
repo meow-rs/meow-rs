@@ -437,6 +437,18 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **XTLS Vision over plain TLS works with TLS 1.3 destinations**
+  (#495 item 5). Only the REALITY stream could switch to the raw socket
+  for Vision's DIRECT mode, so with `tls: true` (no REALITY) every
+  connection to a TLS 1.3 site (most of HTTPS) failed on its first app
+  data. The BoringSSL TLS stream now switches too, draining any plaintext
+  it already decrypted first; a transport that cannot switch now sends
+  END instead of DIRECT. `flow: xtls-rprx-vision` with a
+  `ws`/`grpc`/`h2`/`httpupgrade`/`xhttp` network is now a config error
+  (Xray rejects it too; it used to load, then fail on TLS 1.3 sites), unless VLESS
+  `encryption` is set. Docker e2e runs a TLS 1.3 session with 1 MiB each
+  way through Vision + TLS against Xray-core.
+
 - **Snell v4/v5 `reuse` keeps one connection for every session.** The
   reuse pool dropped a connection after its second session, on the belief
   that the v5 server closes it there. The official 4.0.0 through 5.0.1

@@ -118,20 +118,21 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + Sync + Any> Stream for T {
     }
 }
 
-pub fn enable_raw_passthrough(stream: &mut dyn Stream) -> bool {
-    let read = enable_raw_read_passthrough(stream);
-    let write = enable_raw_write_passthrough(stream);
-    read || write
-}
-
-pub fn enable_raw_read_passthrough(stream: &mut dyn Stream) -> bool {
-    #[cfg(all(feature = "tls", feature = "reality"))]
+/// Whether `stream` can later switch to raw passthrough — a REALITY or
+/// BoringSSL TLS stream from [`tls::TlsLayer`], not wrapped by any other
+/// layer.  Side-effect free; XTLS-Vision uses it to pick its final
+/// uplink padding command before committing to a switch.
+pub fn supports_raw_passthrough(stream: &mut dyn Stream) -> bool {
+    #[cfg(feature = "tls")]
     {
-        if let Some(reality) = stream
-            .as_any_mut()
-            .downcast_mut::<reality_tls::RealityTlsStream>()
+        let any = stream.as_any_mut();
+        #[cfg(feature = "reality")]
         {
-            reality.enable_raw_read_passthrough();
+            if any.is::<reality_tls::RealityTlsStream>() {
+                return true;
+            }
+        }
+        if any.is::<tls::boring_stream::BoringTlsStream>() {
             return true;
         }
     }
@@ -140,15 +141,54 @@ pub fn enable_raw_read_passthrough(stream: &mut dyn Stream) -> bool {
     false
 }
 
-pub fn enable_raw_write_passthrough(stream: &mut dyn Stream) -> bool {
-    #[cfg(all(feature = "tls", feature = "reality"))]
+pub fn enable_raw_passthrough(stream: &mut dyn Stream) -> bool {
+    let read = enable_raw_read_passthrough(stream);
+    let write = enable_raw_write_passthrough(stream);
+    read || write
+}
+
+/// Switch a TLS stream's reads, one-way, to the raw transport under it
+/// (XTLS-Vision DIRECT).  Plaintext already decrypted from the current
+/// record is returned first.  `false` if the stream cannot switch (see
+/// [`supports_raw_passthrough`]) or refuses because bytes past the
+/// switch point were already buffered inside TLS.
+pub fn enable_raw_read_passthrough(stream: &mut dyn Stream) -> bool {
+    #[cfg(feature = "tls")]
     {
-        if let Some(reality) = stream
-            .as_any_mut()
-            .downcast_mut::<reality_tls::RealityTlsStream>()
+        let any = stream.as_any_mut();
+        #[cfg(feature = "reality")]
         {
-            reality.enable_raw_write_passthrough();
-            return true;
+            if let Some(reality) = any.downcast_mut::<reality_tls::RealityTlsStream>() {
+                reality.enable_raw_read_passthrough();
+                return true;
+            }
+        }
+        if let Some(boring) = any.downcast_mut::<tls::boring_stream::BoringTlsStream>() {
+            return boring.enable_raw_read_passthrough();
+        }
+    }
+
+    let _ = stream;
+    false
+}
+
+/// Switch a TLS stream's writes, one-way, to the raw transport under it
+/// (XTLS-Vision DIRECT); shutdown then closes the transport without a
+/// TLS close_notify.  Call only after every TLS write has completed.
+/// `false` if the stream cannot switch or a TLS record is still pending.
+pub fn enable_raw_write_passthrough(stream: &mut dyn Stream) -> bool {
+    #[cfg(feature = "tls")]
+    {
+        let any = stream.as_any_mut();
+        #[cfg(feature = "reality")]
+        {
+            if let Some(reality) = any.downcast_mut::<reality_tls::RealityTlsStream>() {
+                reality.enable_raw_write_passthrough();
+                return true;
+            }
+        }
+        if let Some(boring) = any.downcast_mut::<tls::boring_stream::BoringTlsStream>() {
+            return boring.enable_raw_write_passthrough();
         }
     }
 
