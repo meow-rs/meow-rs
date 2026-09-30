@@ -27,13 +27,10 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
-use aes_gcm::aead::generic_array::GenericArray;
-use aes_gcm::aead::AeadInPlace;
-use aes_gcm::Aes128Gcm;
 use rand::RngCore;
 use tokio::io::{AsyncRead, AsyncWrite, BufReader, ReadBuf};
 
-use super::cipher::{aes_gcm, snell_kdf};
+use super::cipher::{aes_gcm, snell_kdf, Aes128Gcm};
 
 pub const V4_SALT_SIZE: usize = 16;
 pub const V4_NONCE_SIZE: usize = 12;
@@ -325,7 +322,7 @@ fn seal_in_place(
     nonce: &[u8; V4_NONCE_SIZE],
     buf: &mut Vec<u8>,
 ) -> io::Result<()> {
-    aead.encrypt_in_place(GenericArray::from_slice(nonce), b"", buf)
+    aead.seal_append(nonce, buf)
         .map_err(|_| io::Error::other("snell v4 encrypt failed"))
 }
 
@@ -334,7 +331,7 @@ fn open_in_place(
     nonce: &[u8; V4_NONCE_SIZE],
     buf: &mut Vec<u8>,
 ) -> io::Result<()> {
-    aead.decrypt_in_place(GenericArray::from_slice(nonce), b"", buf)
+    aead.open_trailing(nonce, buf)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "snell v4 decrypt failed"))
 }
 

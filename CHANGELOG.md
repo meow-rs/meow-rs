@@ -274,6 +274,14 @@ the canonical, in-repo source a release is cut from.
 
 ### Changed
 
+- **Snell AES-128-GCM runs on BoringSSL (#659).** The v3–v6 record
+  ciphers moved off RustCrypto's `aes-gcm`, which the release profile's
+  `opt-level = "z"` left at ~65 MB/s seal+open per core, onto BoringSSL's
+  assembly AES-GCM (`boring::aead`, already linked for TLS). Single-core
+  codec throughput rises ~9–19× (v6 `default` 57 → 523 MB/s, `unshaped`
+  61 → 1100+ MB/s, v4 61 → 780+ MB/s); on a real v6 link, CPU per MB
+  drops from ~16.5 ms to ~7 ms. No wire change.
+
 - **TCP tracking without an external controller (#626).** Store only
   cancellation handles when `external-controller` is absent at startup,
   while preserving full API tracking by default for embedders. Headless

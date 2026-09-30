@@ -16,13 +16,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use aes_gcm::aead::generic_array::GenericArray;
-use aes_gcm::aead::AeadInPlace;
-use aes_gcm::Aes128Gcm;
 use rand::RngCore;
 use tokio::io::{AsyncRead, AsyncWrite, BufReader, ReadBuf};
 
-use super::cipher::{aes_gcm, snell_kdf};
+use super::cipher::{aes_gcm, snell_kdf, Aes128Gcm};
 use super::v4::MAX_PAYLOAD_LENGTH;
 
 pub const V3_SALT_SIZE: usize = 16;
@@ -148,7 +145,7 @@ fn seal_in_place(
     nonce: &[u8; V3_NONCE_SIZE],
     buf: &mut Vec<u8>,
 ) -> io::Result<()> {
-    aead.encrypt_in_place(GenericArray::from_slice(nonce), b"", buf)
+    aead.seal_append(nonce, buf)
         .map_err(|_| io::Error::other("snell v3 encrypt failed"))
 }
 
@@ -157,7 +154,7 @@ fn open_in_place(
     nonce: &[u8; V3_NONCE_SIZE],
     buf: &mut Vec<u8>,
 ) -> io::Result<()> {
-    aead.decrypt_in_place(GenericArray::from_slice(nonce), b"", buf)
+    aead.open_trailing(nonce, buf)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "snell v3 decrypt failed"))
 }
 

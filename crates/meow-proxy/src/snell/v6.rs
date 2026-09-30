@@ -35,13 +35,10 @@ use std::sync::Arc;
 use std::task::{ready, Context, Poll};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aes_gcm::aead::generic_array::GenericArray;
-use aes_gcm::aead::AeadInPlace;
-use aes_gcm::Aes128Gcm;
 use rand::RngCore;
 use tokio::io::{AsyncRead, AsyncWrite, BufReader, ReadBuf};
 
-use super::cipher::{aes_gcm, snell_kdf};
+use super::cipher::{aes_gcm, snell_kdf, Aes128Gcm};
 use super::v4::{increment_nonce, zero_chunk_err};
 use super::v6_shape::{ShapeProfile, ShapeState, RECORD_LEN_MAX, SALT_LEN};
 
@@ -140,39 +137,31 @@ fn truncated() -> io::Error {
     )
 }
 
-/// One direction's AES-128-GCM key and nonce counter. The expanded key
-/// schedule is boxed (as v4's is shared) to keep `V6Conn` small.
+/// One direction's AES-128-GCM key and nonce counter.
 struct SessionKey {
-    aead: Box<Aes128Gcm>,
+    aead: Aes128Gcm,
     nonce: [u8; NONCE_LEN],
 }
 
 impl SessionKey {
     fn derive(psk: &[u8], salt: &[u8; SALT_LEN]) -> Self {
         Self {
-            aead: Box::new(aes_gcm(&snell_kdf(psk, salt, 16))),
+            aead: aes_gcm(&snell_kdf(psk, salt, 16)),
             nonce: [0; NONCE_LEN],
         }
     }
 
     fn seal(&mut self, ad: &[u8], data: &mut [u8], tag_out: &mut [u8]) -> io::Result<()> {
-        let tag = self
-            .aead
-            .encrypt_in_place_detached(GenericArray::from_slice(&self.nonce), ad, data)
+        self.aead
+            .seal_detached(&self.nonce, ad, data, tag_out)
             .map_err(|_| io::Error::other("snell v6: encrypt failed"))?;
-        tag_out.copy_from_slice(&tag);
         increment_nonce(&mut self.nonce);
         Ok(())
     }
 
     fn open(&mut self, ad: &[u8], data: &mut [u8], tag: &[u8]) -> io::Result<()> {
         self.aead
-            .decrypt_in_place_detached(
-                GenericArray::from_slice(&self.nonce),
-                ad,
-                data,
-                GenericArray::from_slice(tag),
-            )
+            .open_detached(&self.nonce, ad, data, tag)
             .map_err(|_| invalid("snell v6: decrypt failed (psk or mode mismatch?)"))?;
         increment_nonce(&mut self.nonce);
         Ok(())
