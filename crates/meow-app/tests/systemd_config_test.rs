@@ -33,13 +33,13 @@ fn systemd_unit_generation_table() {
             "read-write paths for config dir",
             "/usr/bin/meow",
             "/etc/meow/config.yaml",
-            &["ReadWritePaths=/etc/meow"],
+            &["ReadWritePaths=\"/etc/meow\""],
         ),
         (
             "exec start uses absolute config path",
             "/usr/bin/meow",
             "/etc/meow/config.yaml",
-            &["ExecStart=/usr/bin/meow -f /etc/meow/config.yaml"],
+            &["ExecStart=\"/usr/bin/meow\" -f \"/etc/meow/config.yaml\""],
         ),
         (
             "hardening: protect system strict",
@@ -51,7 +51,7 @@ fn systemd_unit_generation_table() {
             "working directory matches config parent",
             "/usr/bin/meow",
             "/opt/meow/config.yaml",
-            &["WorkingDirectory=/opt/meow", "ReadWritePaths=/opt/meow"],
+            &["WorkingDirectory=/opt/meow", "ReadWritePaths=\"/opt/meow\""],
         ),
         (
             "nested config path consistency",
@@ -59,14 +59,14 @@ fn systemd_unit_generation_table() {
             "/var/lib/meow/configs/config.yaml",
             &[
                 "WorkingDirectory=/var/lib/meow/configs",
-                "ReadWritePaths=/var/lib/meow/configs",
+                "ReadWritePaths=\"/var/lib/meow/configs\"",
             ],
         ),
         (
             "edge case: config at filesystem root",
             "/usr/bin/meow",
             "/config.yaml",
-            &["WorkingDirectory=/", "ReadWritePaths=/"],
+            &["WorkingDirectory=/", "ReadWritePaths=\"/\""],
         ),
     ];
 
@@ -74,7 +74,8 @@ fn systemd_unit_generation_table() {
     // all mismatches instead of stopping at the first.
     let mut failures: Vec<String> = Vec::new();
     for &(label, bin, config_path, expected) in cases {
-        let unit = meow_app::generate_systemd_unit(bin, config_path);
+        let unit =
+            meow_app::generate_systemd_unit(bin, config_path).expect("benign paths must generate");
         for needle in expected {
             if !unit.contains(needle) {
                 failures.push(format!(
@@ -89,6 +90,161 @@ fn systemd_unit_generation_table() {
         "systemd unit generation mismatches:\n{}",
         failures.join("\n---\n")
     );
+}
+
+#[test]
+fn systemd_unit_emits_each_field_per_its_grammar() {
+    // ExecStart argv and ReadWritePaths are quoted word lists;
+    // WorkingDirectory is a raw rvalue — systemd does not unquote it
+    // (issue #689).
+    let unit = meow_app::generate_systemd_unit("/opt/my dir/meow", "/etc/100% real/config.yaml")
+        .expect("space/percent paths must generate");
+
+    assert!(
+        unit.contains("ExecStart=\"/opt/my dir/meow\" -f \"/etc/100%% real/config.yaml\""),
+        "ExecStart must quote argv and double %:\n{unit}"
+    );
+    assert!(
+        unit.contains("WorkingDirectory=/etc/100%% real"),
+        "WorkingDirectory must be RAW (no quotes), %% escaped:\n{unit}"
+    );
+    assert!(
+        !unit.contains("WorkingDirectory=\""),
+        "quoting WorkingDirectory makes the unit unloadable:\n{unit}"
+    );
+    assert!(
+        unit.contains("ReadWritePaths=\"/etc/100%% real\""),
+        "ReadWritePaths must quote entries:\n{unit}"
+    );
+    assert!(!unit.contains("100% "), "unescaped % survived:\n{unit}");
+
+    // Escapes inside the quoted argument slot.
+    let unit2 = meow_app::generate_systemd_unit("/usr/bin/meow", "/etc/a\"b\\c/d$config.yaml")
+        .expect("quote/backslash/$ path must generate");
+    assert!(
+        unit2.contains("-f \"/etc/a\\\"b\\\\c/d$$config.yaml\""),
+        "arg escaping wrong (\\\" \\\\ $$):\n{unit2}"
+    );
+
+    // `%` in the program slot doubles too; `${...}` becomes `$${...}`
+    // so systemd cannot env-expand it — but only in the argv argument:
+    // command->path is not argv, so the program word must keep `$`
+    // verbatim (and WorkingDirectory/ReadWritePaths never env-expand).
+    let unit3 = meow_app::generate_systemd_unit("/usr/100%bin/me$ow", "/etc/${X}/config.yaml")
+        .expect("percent/env-looking paths must generate");
+    assert!(
+        unit3.contains("ExecStart=\"/usr/100%%bin/me$ow\" -f \"/etc/$${X}/config.yaml\""),
+        "exe %% + verbatim $ + arg $$ wrong:\n{unit3}"
+    );
+    assert!(
+        !unit3.contains("-f \"/etc/${X}"),
+        "bare ${{X}} in the argv slot would env-expand at runtime:\n{unit3}"
+    );
+    assert!(
+        unit3.contains("WorkingDirectory=/etc/${X}"),
+        "WorkingDirectory keeps $ verbatim (no env expansion there):\n{unit3}"
+    );
+    assert!(
+        unit3.contains("ReadWritePaths=\"/etc/${X}\""),
+        "ReadWritePaths keeps $ verbatim (no env expansion there):\n{unit3}"
+    );
+}
+
+#[test]
+fn systemd_unit_arg_slot_c_escapes() {
+    // A control char in the *filename* of a clean dir is representable
+    // in the ExecStart -f argument (CUNESCAPE decodes \n/\r/\t) — this
+    // is the only slot with an escape channel; the dir half stays clean.
+    for (label, cfg, needle) in [
+        ("tab", "/etc/meow/a\tb.yaml", "-f \"/etc/meow/a\\tb.yaml\""),
+        (
+            "newline",
+            "/etc/meow/a\nb.yaml",
+            "-f \"/etc/meow/a\\nb.yaml\"",
+        ),
+        ("cr", "/etc/meow/a\rb.yaml", "-f \"/etc/meow/a\\rb.yaml\""),
+    ] {
+        let unit = meow_app::generate_systemd_unit("/usr/bin/meow", cfg)
+            .unwrap_or_else(|e| panic!("[{label}] arg slot must generate: {e}"));
+        assert!(
+            unit.contains(needle),
+            "[{label}] missing {needle:?}:\n{unit}"
+        );
+        assert!(
+            !unit.contains(cfg),
+            "[{label}] raw control char must not survive:\n{unit}"
+        );
+    }
+}
+
+#[test]
+fn systemd_unit_rejects_unrepresentable_paths() {
+    let gen = |exe: &str, cfg: &str| meow_app::generate_systemd_unit(exe, cfg);
+
+    // C0 has no escape anywhere except the ExecStart -f argument — and
+    // the config dir feeds WorkingDirectory/ReadWritePaths where even
+    // \n/\r/\t are unrepresentable, so the whole unit is rejected.
+    for (label, bad) in [
+        ("bell", "/x/a\x07b"),
+        ("vtab", "/x/a\x0bb"),
+        ("nul-in-path", "/x/a\0b"),
+        ("newline-in-dir", "/etc/a\nb"),
+        ("tab-in-dir", "/etc/a\tb"),
+        ("cr-in-dir", "/etc/a\rb"),
+    ] {
+        let err = gen("/usr/bin/meow", &format!("{bad}/config.yaml"))
+            .expect_err(&format!("[{label}] config path must be rejected"));
+        assert!(
+            err.to_string().contains("cannot represent"),
+            "[{label}] unexpected error: {err}"
+        );
+    }
+
+    // exe_path program word: systemd's string_is_safe refuses these.
+    for (label, bad) in [
+        ("quote", "/opt/a\"b/meow"),
+        ("apostrophe", "/opt/a'b/meow"),
+        ("backslash", "/opt/a\\b/meow"),
+        ("del", "/opt/a\x7fb/meow"),
+        ("newline", "/opt/a\nb/meow"),
+    ] {
+        let err = gen(bad, "/etc/meow/config.yaml")
+            .expect_err(&format!("[{label}] exe path must be rejected"));
+        let _ = err;
+    }
+
+    // ':' in work_dir would parse as a ReadWritePaths bind pair.
+    gen("/usr/bin/meow", "/etc/a:b/config.yaml").expect_err("':' in work_dir must be rejected");
+
+    // Relative or `..`-containing paths produce non-absolute/broken dirs.
+    for (label, cfg) in [
+        ("bare filename", "config.yaml"),
+        ("relative", "etc/meow/config.yaml"),
+        ("dotdot", "/etc/../x/config.yaml"),
+    ] {
+        gen("/usr/bin/meow", cfg).expect_err(&format!("[{label}] must be rejected"));
+    }
+
+    // Same for exe_path: program word must be absolute, `..`-free, and
+    // not a directory.
+    for (label, exe) in [
+        ("relative exe", "meow"),
+        ("dotdot exe", "/opt/../x/meow"),
+        ("dir exe", "/opt/meow/"),
+    ] {
+        gen(exe, "/etc/meow/config.yaml").expect_err(&format!("[{label}] must be rejected"));
+    }
+
+    // WorkingDirectory hazards: trailing backslash (line continuation),
+    // trailing whitespace, and '#' / ';' comment-separator chars.
+    for (label, cfg) in [
+        ("trailing backslash", "/etc/a\\/config.yaml"),
+        ("trailing space dir", "/etc/a /config.yaml"),
+        ("hash in dir", "/etc/a#b/config.yaml"),
+        ("semicolon in dir", "/etc/a;b/config.yaml"),
+    ] {
+        gen("/usr/bin/meow", cfg).expect_err(&format!("[{label}] must be rejected"));
+    }
 }
 
 // ── config save under restricted permissions (simulates ProtectSystem=strict) ──

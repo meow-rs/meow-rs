@@ -4,6 +4,8 @@
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use anyhow::Context as _;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use dashmap::DashMap;
@@ -572,7 +574,8 @@ fn install_service(config_override: Option<&str>, args: &Args) -> Result<()> {
         cwd.join(config_rel).to_string_lossy().to_string()
     };
 
-    let unit = meow_app::generate_systemd_unit(&exe_path, &config_path);
+    let unit = meow_app::generate_systemd_unit(&exe_path, &config_path)
+        .context("failed to generate systemd unit")?;
 
     let service_path = format!("/etc/systemd/system/{SERVICE_NAME}.service");
 
@@ -648,8 +651,6 @@ fn service_status() -> Result<()> {
 
 // --- macOS launchd user agent ---
 
-#[cfg(target_os = "macos")]
-use anyhow::Context as _;
 #[cfg(target_os = "macos")]
 use meow_app::LAUNCHD_LABEL;
 

@@ -437,6 +437,24 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **`meow install` no longer writes a broken systemd unit when a path
+  contains spaces, quotes, backslashes, `%`, or `$`** (issue #689).
+  `generate_systemd_unit()` interpolated the binary, config, and working
+  directory paths verbatim into `ExecStart=`/`WorkingDirectory=`/
+  `ReadWritePaths=`, so a space split the argv, a `%h`-style sequence
+  was specifier-expanded at runtime, a `${...}` was env-expanded, and a
+  literal `\n` injected extra unit lines. Each path is now emitted per
+  its directive's grammar: `ExecStart=` words are double-quoted — the
+  program path keeps `$` verbatim (`command->path` is never
+  env-expanded) while the `-f` argument gets `\"`, `\\`, `%%`, `$$`,
+  and `\n`/`\r`/`\t` C-escapes;
+  `ReadWritePaths=` entries are quoted (systemd unquotes them without
+  C-escapes, so all C0 is rejected); and `WorkingDirectory=` is emitted
+  raw — systemd never unquotes it, so only `%%` is escaped while
+  unrepresentable characters, a trailing `\`, `#`/`;`, a bind-pair
+  `:` in the dir, and non-absolute or `..`-containing paths are all
+  rejected with a clear error before any file is written.
+
 - **The macOS install guide no longer prefixes `meow install` with
   `sudo`** (issue #678). The launchd agent installs into the calling
   user's `gui/<uid>` domain and `~/Library` directories; under sudo it
