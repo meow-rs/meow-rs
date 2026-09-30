@@ -145,6 +145,18 @@ echo "=== Footprint: steady state ==="
     --duration "$DURATION" \
     --output target/bench/steady.json
 
+# The idle leg (10k held conns) and the steady leg (tight conn churn)
+# leave both ends of every loopback conn in TIME_WAIT.  macOS allocates
+# ephemeral ports per local address (16k range, 2×MSL ≈ 30 s), so the
+# reload leg's pre-probe can find no free port and fail before any PUT
+# runs.  Linux picks ports per 4-tuple and reuses loopback TIME_WAIT
+# (tcp_tw_reuse=2), so the wait is macOS-only.
+if [ "$(uname -s)" = Darwin ]; then
+    echo ""
+    echo "=== Waiting 60s for ephemeral ports to recycle before reload ==="
+    sleep 60
+fi
+
 echo ""
 echo "=== Config-reload workload ==="
 "$BENCH_BINARY" \
