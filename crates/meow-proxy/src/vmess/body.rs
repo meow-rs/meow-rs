@@ -1,12 +1,10 @@
-use aes_gcm::aead::Aead;
-use aes_gcm::{Aes128Gcm, KeyInit, Nonce};
-use chacha20poly1305::ChaCha20Poly1305;
 use md5::{Digest, Md5};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 #[cfg(test)]
 use super::header::response_body_keys;
 use super::header::Security;
+use crate::aead::{Aead, TAG_LEN};
 
 /// Maximum plaintext per body record (matching upstream 16 KiB - 16 tag).
 const MAX_PLAINTEXT: usize = 16384 - 16;
@@ -66,7 +64,6 @@ fn derive_keys(security: Security, req_key: &[u8; 16], req_iv: &[u8; 16]) -> Der
 
 /// One direction's AEAD state. The cipher object (the expanded key schedule)
 /// is built once per connection — only the nonce changes per record.
-#[derive(Clone)]
 enum RecordCipher {
     None,
     /// Direction never constructed — a `BodyCipher` built via
@@ -75,51 +72,43 @@ enum RecordCipher {
     /// codec): sealing/opening through it is a bug and must error, never
     /// silently emit plaintext records.
     Unbuilt,
-    /// Boxed: the AES key schedule is ~10× the size of the other variants.
-    Aes128Gcm(Box<Aes128Gcm>),
-    ChaCha20Poly1305(Box<ChaCha20Poly1305>),
+    /// AES-128-GCM or ChaCha20-Poly1305, per the negotiated security.
+    Aead(Aead),
 }
 
 impl RecordCipher {
     fn new(security: Security, key: &[u8]) -> Self {
         match security {
             Security::None => Self::None,
-            Security::Aes128Gcm => Self::Aes128Gcm(Box::new(
-                Aes128Gcm::new_from_slice(key).expect("derived AES-128 key is 16 bytes"),
-            )),
-            Security::ChaCha20Poly1305 => Self::ChaCha20Poly1305(Box::new(
-                ChaCha20Poly1305::new_from_slice(key).expect("derived ChaCha20 key is 32 bytes"),
-            )),
+            Security::Aes128Gcm => Self::Aead(Aead::aes_128_gcm(key)),
+            Security::ChaCha20Poly1305 => Self::Aead(Aead::chacha20_poly1305(key)),
         }
     }
 
-    fn seal(&self, nonce: &[u8; 12], plaintext: &[u8]) -> std::io::Result<Vec<u8>> {
+    /// Encrypt `data` in place, writing the tag to `tag`.
+    fn seal(&self, nonce: &[u8; 12], data: &mut [u8], tag: &mut [u8]) -> std::io::Result<()> {
         match self {
             Self::Unbuilt => Err(std::io::Error::other(
                 "seal called on an unconstructed cipher direction",
             )),
             Self::None => Err(std::io::Error::other("seal called with Security::None")),
-            Self::Aes128Gcm(c) => c
-                .encrypt(Nonce::from_slice(nonce), plaintext)
-                .map_err(|e| std::io::Error::other(format!("aes-gcm encrypt: {e}"))),
-            Self::ChaCha20Poly1305(c) => c
-                .encrypt(chacha20poly1305::Nonce::from_slice(nonce), plaintext)
-                .map_err(|e| std::io::Error::other(format!("chacha encrypt: {e}"))),
+            Self::Aead(c) => c
+                .seal_detached(nonce, &[], data, tag)
+                .map_err(|_| std::io::Error::other("vmess body: record encrypt failed")),
         }
     }
 
-    fn open(&self, nonce: &[u8; 12], ciphertext: &[u8]) -> std::io::Result<Vec<u8>> {
+    /// Verify and strip the trailing tag of `buf`, decrypting the rest in
+    /// place.
+    fn open(&self, nonce: &[u8; 12], buf: &mut Vec<u8>) -> std::io::Result<()> {
         match self {
             Self::Unbuilt => Err(std::io::Error::other(
                 "open called on an unconstructed cipher direction",
             )),
             Self::None => Err(std::io::Error::other("open called with Security::None")),
-            Self::Aes128Gcm(c) => c
-                .decrypt(Nonce::from_slice(nonce), ciphertext)
-                .map_err(|e| std::io::Error::other(format!("aes-gcm decrypt: {e}"))),
-            Self::ChaCha20Poly1305(c) => c
-                .decrypt(chacha20poly1305::Nonce::from_slice(nonce), ciphertext)
-                .map_err(|e| std::io::Error::other(format!("chacha decrypt: {e}"))),
+            Self::Aead(c) => c
+                .open_trailing(nonce, &[], buf)
+                .map_err(|_| std::io::Error::other("vmess body: record authentication failed")),
         }
     }
 }
@@ -232,17 +221,15 @@ impl BodyCipher {
         }
     }
 
-    /// Test hook: make the read direction decrypt what the write direction
-    /// encrypts (real connections derive read keys from SHA-256 of req material).
+    /// Test hook: [`Self::new`] with its write schedule on the read side
+    /// too, so the codec opens what it seals (real connections derive read
+    /// keys from SHA-256 of req material).
     #[cfg(test)]
-    fn mirror_write_to_read(&mut self) {
-        debug_assert!(
-            !matches!(self.write, RecordCipher::Unbuilt),
-            "mirroring a reader destroys its only real half"
-        );
-        self.read = self.write.clone();
-        self.read_iv = self.write_iv;
-        self.read_counter = self.write_counter;
+    fn loopback(security: Security, req_key: &[u8; 16], req_iv: &[u8; 16]) -> Self {
+        let mut c = Self::new(security, req_key, req_iv, 0);
+        c.read = Self::new(security, req_key, req_iv, 0).write;
+        c.read_iv = c.write_iv;
+        c
     }
 
     /// Test hook: the server-side mirror of [`Self::new`] — reads
@@ -301,12 +288,18 @@ impl BodyCipher {
             return writer.flush().await;
         }
 
-        let nonce = self.write_nonce()?;
-        let ct = self.write.seal(&nonce, plaintext)?;
-        let len = u16::try_from(ct.len())
+        // Seal in place inside the finished frame, so the record leaves in
+        // one write rather than a 2-byte length write and a body write.
+        let len = u16::try_from(plaintext.len() + TAG_LEN)
             .map_err(|_| std::io::Error::other("vmess body record too large"))?;
-        writer.write_all(&len.to_be_bytes()).await?;
-        writer.write_all(&ct).await?;
+        let nonce = self.write_nonce()?;
+        let mut frame = Vec::with_capacity(2 + usize::from(len));
+        frame.extend_from_slice(&len.to_be_bytes());
+        frame.extend_from_slice(plaintext);
+        frame.resize(2 + usize::from(len), 0);
+        let (data, tag) = frame[2..].split_at_mut(plaintext.len());
+        self.write.seal(&nonce, data, tag)?;
+        writer.write_all(&frame).await?;
         writer.flush().await
     }
 
@@ -355,10 +348,11 @@ impl BodyCipher {
             return Ok(Some(buf));
         }
 
-        let mut ct = vec![0u8; len];
-        reader.read_exact(&mut ct).await?;
+        let mut buf = vec![0u8; len];
+        reader.read_exact(&mut buf).await?;
         let nonce = self.read_nonce()?;
-        self.read.open(&nonce, &ct).map(Some)
+        self.read.open(&nonce, &mut buf)?;
+        Ok(Some(buf))
     }
 
     pub fn max_plaintext() -> usize {
@@ -369,6 +363,10 @@ impl BodyCipher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // RustCrypto plays the independent peer: it pins the BoringSSL codec
+    // to the wire spec rather than to itself.
+    use aes_gcm::{Aes128Gcm, KeyInit, Nonce};
+    use chacha20poly1305::ChaCha20Poly1305;
 
     fn test_keys() -> ([u8; 16], [u8; 16]) {
         let req_key = [
@@ -395,14 +393,13 @@ mod tests {
 
         for security in [Security::Aes128Gcm, Security::ChaCha20Poly1305] {
             // new_writer's request-direction ciphertext opens under `new`'s
-            // write half mirrored to read — so new_writer's schedule/IV is
-            // the same as `new`'s, not merely self-consistent.
+            // write schedule on the read side — so new_writer's schedule/IV
+            // is the same as `new`'s, not merely self-consistent.
             let mut writer = BodyCipher::new_writer(security, &req_key, &req_iv);
             let mut wire = Vec::new();
             writer.write_record(&mut wire, plaintext).await.unwrap();
 
-            let mut dual = BodyCipher::new(security, &req_key, &req_iv, 0x42);
-            dual.mirror_write_to_read();
+            let mut dual = BodyCipher::loopback(security, &req_key, &req_iv);
             let mut cursor = std::io::Cursor::new(wire.clone());
             assert_eq!(
                 dual.read_record(&mut cursor).await.unwrap().as_deref(),
@@ -419,10 +416,10 @@ mod tests {
             );
 
             // Response-direction equivalence: seal with new_reader's read
-            // material (mirrored into write), open with `new`'s real read
+            // material (moved into write), open with `new`'s real read
             // half — proves new_reader's schedule/IV matches `new`'s.
             let mut resp_writer = BodyCipher::new_reader(security, &req_key, &req_iv);
-            resp_writer.write = resp_writer.read.clone();
+            resp_writer.write = BodyCipher::new_reader(security, &req_key, &req_iv).read;
             resp_writer.write_iv = resp_writer.read_iv;
             let mut wire2 = Vec::new();
             resp_writer
@@ -474,8 +471,12 @@ mod tests {
 
         // The Unbuilt codec itself fails closed on seal/open — defense in
         // depth behind the read_record/write_record guards.
-        assert!(RecordCipher::Unbuilt.seal(&[0; 12], b"x").is_err());
-        assert!(RecordCipher::Unbuilt.open(&[0; 12], b"x").is_err());
+        assert!(RecordCipher::Unbuilt
+            .seal(&[0; 12], &mut [0; 1], &mut [0; TAG_LEN])
+            .is_err());
+        assert!(RecordCipher::Unbuilt
+            .open(&[0; 12], &mut vec![0; TAG_LEN + 1])
+            .is_err());
     }
 
     async fn body_modes_round_trip_with_protocol_framing() {
@@ -495,8 +496,7 @@ mod tests {
             assert_eq!(framed_len, plaintext.len() + overhead);
             assert_eq!(wire.len(), 2 + framed_len);
 
-            let mut reader = BodyCipher::new(security, &req_key, &req_iv, 0x42);
-            reader.mirror_write_to_read();
+            let mut reader = BodyCipher::loopback(security, &req_key, &req_iv);
             let mut cursor = std::io::Cursor::new(wire);
             assert_eq!(
                 reader.read_record(&mut cursor).await.unwrap().as_deref(),
@@ -559,8 +559,7 @@ mod tests {
 
             // Read direction: a peer that keeps sending past the budget must
             // be refused, not decrypted under a reused nonce.
-            let mut c = BodyCipher::new(security, &req_key, &req_iv, 0x42);
-            c.mirror_write_to_read();
+            let mut c = BodyCipher::loopback(security, &req_key, &req_iv);
             c.read_counter = NONCE_BUDGET - 1;
             c.write_counter = NONCE_BUDGET - 1;
             let mut wire = Vec::new();
@@ -584,7 +583,7 @@ mod tests {
     /// response record with the response keys (SHA-256 of req material) and
     /// the client's `read_record` must decrypt it. This fails if the read
     /// derivation or the nonce construction diverges from the wire spec —
-    /// unlike the mirror-based round-trip which hides both.
+    /// unlike the loopback round-trip which hides both.
     async fn read_record_decrypts_independently_encoded_response() {
         use aes_gcm::aead::Aead;
         use sha2::{Digest, Sha256};
@@ -595,29 +594,46 @@ mod tests {
         let resp_key: [u8; 16] = bk[..16].try_into().unwrap();
         let resp_iv: [u8; 16] = bi[..16].try_into().unwrap();
 
-        // Server seals record 0 with nonce = count(0) || resp_iv[2..12].
+        // Server seals records 0 and 1 with nonce = count(n) || resp_iv[2..12].
         let plaintext = b"response payload from server";
-        let nonce = super::record_nonce(&resp_iv, 0);
-        let cipher = Aes128Gcm::new_from_slice(&resp_key).unwrap();
-        let ct = cipher
-            .encrypt(Nonce::from_slice(&nonce), plaintext.as_ref())
-            .unwrap();
-        let mut wire = (ct.len() as u16).to_be_bytes().to_vec();
-        wire.extend_from_slice(&ct);
+        let md5_1: [u8; 16] = Md5::digest(resp_key).into();
+        let md5_2: [u8; 16] = Md5::digest(md5_1).into();
+        let chacha_key = [md5_1, md5_2].concat();
+        for security in [Security::Aes128Gcm, Security::ChaCha20Poly1305] {
+            let mut wire = Vec::new();
+            for count in 0..2 {
+                let nonce = super::record_nonce(&resp_iv, count);
+                let ct = match security {
+                    // AES-128-GCM: the raw 16-byte response key.
+                    Security::Aes128Gcm => Aes128Gcm::new_from_slice(&resp_key)
+                        .unwrap()
+                        .encrypt(Nonce::from_slice(&nonce), plaintext.as_ref()),
+                    // ChaCha20-Poly1305: MD5(key) || MD5(MD5(key)).
+                    _ => ChaCha20Poly1305::new_from_slice(&chacha_key)
+                        .unwrap()
+                        .encrypt(Nonce::from_slice(&nonce), plaintext.as_ref()),
+                }
+                .unwrap();
+                wire.extend_from_slice(&(ct.len() as u16).to_be_bytes());
+                wire.extend_from_slice(&ct);
+            }
 
-        // `new_reader`, not `new`: the production read path must be pinned
-        // to the independently derived spec keys.
-        let mut client = BodyCipher::new_reader(Security::Aes128Gcm, &req_key, &req_iv);
-        let mut cursor = std::io::Cursor::new(wire);
-        let decrypted = client.read_record(&mut cursor).await.unwrap();
-        assert_eq!(decrypted.as_deref(), Some(plaintext.as_slice()));
+            // `new_reader`, not `new`: the production read path must be
+            // pinned to the independently derived spec keys.
+            let mut client = BodyCipher::new_reader(security, &req_key, &req_iv);
+            let mut cursor = std::io::Cursor::new(wire);
+            for _ in 0..2 {
+                let decrypted = client.read_record(&mut cursor).await.unwrap();
+                assert_eq!(decrypted.as_deref(), Some(plaintext.as_slice()));
+            }
+        }
     }
 
     /// Write-direction interop, mirroring the read-side test above: emit a
     /// record through `new_writer` and decrypt it in-test with a bare AEAD
     /// keyed by the raw request material per the wire spec. This is the only
     /// check that catches a systematic wrong-key or key/IV-swap bug inside
-    /// `new_writer` — every mirror-based round-trip stays self-consistent
+    /// `new_writer` — every loopback round-trip stays self-consistent
     /// even when both sides are wrong the same way (issue #533 review).
     async fn write_record_decrypts_under_independently_derived_request_keys() {
         use aes_gcm::aead::Aead;
@@ -705,8 +721,7 @@ mod tests {
         let mut wire = Vec::new();
         writer.write_record(&mut wire, b"payload").await.unwrap();
         *wire.last_mut().unwrap() ^= 0xff;
-        let mut reader = BodyCipher::new(Security::Aes128Gcm, &req_key, &req_iv, 0x42);
-        reader.mirror_write_to_read();
+        let mut reader = BodyCipher::loopback(Security::Aes128Gcm, &req_key, &req_iv);
         let mut cursor = std::io::Cursor::new(wire);
         assert!(reader.read_record(&mut cursor).await.is_err());
     }

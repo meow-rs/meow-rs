@@ -38,9 +38,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rand::RngCore;
 use tokio::io::{AsyncRead, AsyncWrite, BufReader, ReadBuf};
 
-use super::cipher::{aes_gcm, snell_kdf, Aes128Gcm};
+use super::cipher::snell_kdf;
 use super::v4::{increment_nonce, zero_chunk_err};
 use super::v6_shape::{ShapeProfile, ShapeState, RECORD_LEN_MAX, SALT_LEN};
+use crate::aead::Aead;
 
 /// Largest payload one record can carry.
 pub const MAX_RECORD_PAYLOAD: usize = RECORD_LEN_MAX;
@@ -139,14 +140,14 @@ fn truncated() -> io::Error {
 
 /// One direction's AES-128-GCM key and nonce counter.
 struct SessionKey {
-    aead: Aes128Gcm,
+    aead: Aead,
     nonce: [u8; NONCE_LEN],
 }
 
 impl SessionKey {
     fn derive(psk: &[u8], salt: &[u8; SALT_LEN]) -> Self {
         Self {
-            aead: aes_gcm(&snell_kdf(psk, salt, 16)),
+            aead: Aead::aes_128_gcm(&snell_kdf(psk, salt, 16)),
             nonce: [0; NONCE_LEN],
         }
     }

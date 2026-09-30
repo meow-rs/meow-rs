@@ -156,9 +156,8 @@ blake3 = "1"
 ml-kem = { version = "0.3", features = ["getrandom"] }
 x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
 ctr = "0.9"
-# Snell uses Argon2id (t=3, m=8 KiB, p=1) as its KDF and AES-128-GCM
-# (the `aes-gcm` entry above) as its AEAD; both are pure-Rust RustCrypto
-# crates sharing the AES backend with the existing crypto stack.
+# Snell uses Argon2id (t=3, m=8 KiB, p=1) as its KDF; its AEAD, like
+# VMess's and VLESS encryption's, is BoringSSL's (meow-proxy `src/aead.rs`).
 argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
 
 # Logging

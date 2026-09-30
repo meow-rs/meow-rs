@@ -306,6 +306,19 @@ the canonical, in-repo source a release is cut from.
   61 → 1100+ MB/s, v4 61 → 780+ MB/s); on a real v6 link, CPU per MB
   drops from ~16.5 ms to ~7 ms. No wire change.
 
+- **VMess and VLESS encryption records run on BoringSSL (#659).** The
+  VMess body and header ciphers (`aes-128-gcm`, `chacha20-poly1305`) and
+  the VLESS `mlkem768x25519plus` record AEAD (AES-256-GCM /
+  ChaCha20-Poly1305) had the same RustCrypto-under-`opt-level = "z"`
+  ceiling (~60–70 MB/s seal+open per core); they now share Snell's
+  BoringSSL record layer. Single-core codec throughput: VMess AES
+  61 → 1262 MB/s, ChaCha 70 → 613 MB/s; VLESS encryption AES 62 → 1014
+  MB/s, ChaCha 68 → 640 MB/s. Against a local Xray server, meow's CPU per
+  relayed MB drops from ~30–34 ms to ~12–13 ms and a single stream goes
+  from ~41–48 to ~68–72 MB/s. A VMess record now leaves in one write
+  instead of two. No wire change; a new Docker e2e suite pins interop
+  against Xray for both VMess ciphers and both VLESS-encryption modes.
+
 - **TCP tracking without an external controller (#626).** Store only
   cancellation handles when `external-controller` is absent at startup,
   while preserving full API tracking by default for embedders. Headless

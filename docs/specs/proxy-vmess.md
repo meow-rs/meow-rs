@@ -86,8 +86,8 @@ Out of scope (defer to follow-ups):
 - Implementing the legacy MD5 mode on the default build path. Crypto
   surface is small but the timestamp-window code is notoriously
   fingerprintable and we don't want it hot-pathed for new users.
-- Re-implementing an AEAD primitive. Use `aes-gcm` and `chacha20poly1305`
-  crates (already workspace deps via shadowsocks/trojan).
+- Re-implementing an AEAD primitive. Use BoringSSL's `boring::aead`
+  (already linked for TLS; meow-proxy `src/aead.rs`, issue #659).
 - Emulating upstream's internal buffer pool (`pool.Get/Put`). Tokio's
   `BytesMut` + reuse in the read loop is sufficient.
 - Config-parser-level negotiation of VMess protocol version. We only

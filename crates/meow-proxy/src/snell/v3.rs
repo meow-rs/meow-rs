@@ -19,8 +19,9 @@ use std::task::{Context, Poll};
 use rand::RngCore;
 use tokio::io::{AsyncRead, AsyncWrite, BufReader, ReadBuf};
 
-use super::cipher::{aes_gcm, snell_kdf, Aes128Gcm};
+use super::cipher::snell_kdf;
 use super::v4::MAX_PAYLOAD_LENGTH;
+use crate::aead::Aead;
 
 pub const V3_SALT_SIZE: usize = 16;
 pub const V3_NONCE_SIZE: usize = 12;
@@ -58,20 +59,20 @@ enum ReaderState {
         salt_progress: usize,
     },
     ReadingHeader {
-        aead: Arc<Aes128Gcm>,
+        aead: Arc<Aead>,
         nonce: [u8; V3_NONCE_SIZE],
         header_buf: [u8; V3_LENGTH_CIPHER_SIZE],
         header_progress: usize,
     },
     ReadingPayload {
-        aead: Arc<Aes128Gcm>,
+        aead: Arc<Aead>,
         nonce: [u8; V3_NONCE_SIZE],
         payload_len: usize,
         payload_buf: Vec<u8>,
         payload_progress: usize,
     },
     Drain {
-        aead: Arc<Aes128Gcm>,
+        aead: Arc<Aead>,
         nonce: [u8; V3_NONCE_SIZE],
         payload: Vec<u8>,
         payload_off: usize,
@@ -79,7 +80,7 @@ enum ReaderState {
 }
 
 struct Writer {
-    aead: Arc<Aes128Gcm>,
+    aead: Arc<Aead>,
     nonce: [u8; V3_NONCE_SIZE],
     salt: [u8; V3_SALT_SIZE],
     salt_sent: bool,
@@ -92,7 +93,7 @@ impl Writer {
     fn new(psk: &[u8]) -> Self {
         let mut salt = [0u8; V3_SALT_SIZE];
         rand::rng().fill_bytes(&mut salt);
-        let aead = aes_gcm(&snell_kdf(psk, &salt, 16));
+        let aead = Aead::aes_128_gcm(&snell_kdf(psk, &salt, 16));
         Self {
             aead: Arc::new(aead),
             nonce: [0u8; V3_NONCE_SIZE],
@@ -140,21 +141,13 @@ impl Writer {
     }
 }
 
-fn seal_in_place(
-    aead: &Aes128Gcm,
-    nonce: &[u8; V3_NONCE_SIZE],
-    buf: &mut Vec<u8>,
-) -> io::Result<()> {
-    aead.seal_append(nonce, buf)
+fn seal_in_place(aead: &Aead, nonce: &[u8; V3_NONCE_SIZE], buf: &mut Vec<u8>) -> io::Result<()> {
+    aead.seal_append(nonce, &[], buf)
         .map_err(|_| io::Error::other("snell v3 encrypt failed"))
 }
 
-fn open_in_place(
-    aead: &Aes128Gcm,
-    nonce: &[u8; V3_NONCE_SIZE],
-    buf: &mut Vec<u8>,
-) -> io::Result<()> {
-    aead.open_trailing(nonce, buf)
+fn open_in_place(aead: &Aead, nonce: &[u8; V3_NONCE_SIZE], buf: &mut Vec<u8>) -> io::Result<()> {
+    aead.open_trailing(nonce, &[], buf)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "snell v3 decrypt failed"))
 }
 
@@ -219,7 +212,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for V3Conn<S> {
                     if *salt_progress < V3_SALT_SIZE {
                         continue;
                     }
-                    let aead = Arc::new(aes_gcm(&snell_kdf(&this.psk, &salt_buf[..], 16)));
+                    let aead =
+                        Arc::new(Aead::aes_128_gcm(&snell_kdf(&this.psk, &salt_buf[..], 16)));
                     this.reader = ReaderState::ReadingHeader {
                         aead,
                         nonce: [0u8; V3_NONCE_SIZE],
