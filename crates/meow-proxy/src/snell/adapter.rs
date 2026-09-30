@@ -145,7 +145,6 @@ impl SnellAdapter {
                 (true, SnellVersion::V6) => Some(Arc::new(Pool::with_limits(
                     V6_POOL_MAX_IDLE,
                     V6_POOL_MAX_AGE,
-                    u32::MAX,
                 ))),
                 (true, _) => Some(Arc::new(Pool::new())),
             },
@@ -217,18 +216,14 @@ impl SnellAdapter {
     async fn dial_tcp_v6(&self, host: &str, port: u16) -> Result<Box<dyn ProxyConn>> {
         let request = connect_request(host, port, true).map_err(MeowError::Io)?;
         if let Some(pool) = &self.pool {
-            while let Some((mut snell, prev_uses)) = pool.take_idle() {
+            while let Some(mut snell) = pool.take_idle() {
                 if !snell.idle_conn_alive() {
                     debug!("snell v6: dropping pooled conn closed while idle");
                     continue;
                 }
                 snell.reset_reply_state();
                 snell.defer_request(request).map_err(MeowError::Io)?;
-                return Ok(Box::new(PooledConn::new(
-                    snell,
-                    Some(Arc::clone(pool)),
-                    prev_uses + 1,
-                )));
+                return Ok(Box::new(PooledConn::new(snell, Some(Arc::clone(pool)))));
             }
         }
         let mut snell = self.dial_fresh().await?;
@@ -236,7 +231,6 @@ impl SnellAdapter {
         Ok(Box::new(PooledConn::new(
             snell,
             self.pool.as_ref().map(Arc::clone),
-            1,
         )))
     }
 
@@ -292,23 +286,21 @@ impl ProxyAdapter for SnellAdapter {
 
         // Pool-first path — opensnell client.go DialTCP semantics.
         if let Some(pool) = &self.pool {
-            // Two tries: a pooled conn may have been silently closed by the
-            // server between sessions, in which case the header write fails
-            // and we try the next/dial fresh.
-            for attempt in 0..2u32 {
-                let Some((mut snell, prev_uses)) = pool.take_idle() else {
-                    break;
-                };
-                snell.reset_reply_state();
-                if let Err(e) = write_header(&mut snell, &host, port, true).await {
-                    debug!("snell pool conn write failed (attempt {attempt}): {e}");
+            // The server may have closed a pooled conn while it sat idle. A
+            // header write into such a conn usually still succeeds, so skip
+            // one that already reads EOF; a failed write also moves on to
+            // the next conn (or a fresh dial).
+            while let Some(mut snell) = pool.take_idle() {
+                if !snell.idle_conn_alive() {
+                    debug!("snell: dropping pooled conn closed while idle");
                     continue;
                 }
-                return Ok(Box::new(PooledConn::new(
-                    snell,
-                    Some(Arc::clone(pool)),
-                    prev_uses + 1,
-                )));
+                snell.reset_reply_state();
+                if let Err(e) = write_header(&mut snell, &host, port, true).await {
+                    debug!("snell pool conn write failed: {e}");
+                    continue;
+                }
+                return Ok(Box::new(PooledConn::new(snell, Some(Arc::clone(pool)))));
             }
         }
 
@@ -320,7 +312,6 @@ impl ProxyAdapter for SnellAdapter {
         Ok(Box::new(PooledConn::new(
             snell,
             self.pool.as_ref().map(Arc::clone),
-            1,
         )))
     }
 
@@ -345,7 +336,7 @@ impl ProxyAdapter for SnellAdapter {
                 .await
                 .map_err(MeowError::Io)?;
         }
-        Ok(Box::new(PooledConn::new(snell, None, 1)))
+        Ok(Box::new(PooledConn::new(snell, None)))
     }
 
     async fn dial_udp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
@@ -396,7 +387,6 @@ impl ProxyAdapter for SnellAdapter {
 struct PooledConn {
     inner: Option<PoolStream>,
     pool: Option<Arc<Pool>>,
-    uses: u32,
     local_half_close: LocalHalfClose,
     reuse_failed: bool,
 }
@@ -415,11 +405,10 @@ enum LocalHalfClose {
 }
 
 impl PooledConn {
-    fn new(snell: PoolStream, pool: Option<Arc<Pool>>, uses: u32) -> Self {
+    fn new(snell: PoolStream, pool: Option<Arc<Pool>>) -> Self {
         Self {
             inner: Some(snell),
             pool,
-            uses,
             local_half_close: LocalHalfClose::Open,
             reuse_failed: false,
         }
@@ -557,7 +546,6 @@ impl Drop for PooledConn {
         let (Some(snell), Some(pool)) = (self.inner.take(), self.pool.take()) else {
             return;
         };
-        let uses = self.uses;
 
         // A raw TCP EOF or unread server tail is not reusable. In particular,
         // never drain arbitrary bytes here: doing so can swallow an old
@@ -569,7 +557,7 @@ impl Drop for PooledConn {
         if matches!(self.local_half_close, LocalHalfClose::Sent) {
             let mut snell = snell;
             snell.reset_reply_state();
-            pool.put(snell, uses);
+            pool.put(snell);
             return;
         }
 
@@ -586,7 +574,7 @@ impl Drop for PooledConn {
                 return;
             }
             snell.reset_reply_state();
-            pool.put(snell, uses);
+            pool.put(snell);
         });
     }
 }

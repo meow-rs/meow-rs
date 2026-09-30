@@ -423,6 +423,15 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **Snell v4/v5 `reuse` keeps one connection for every session.** The
+  reuse pool dropped a connection after its second session, on the belief
+  that the v5 server closes it there. The official 4.0.0 through 5.0.1
+  servers all serve any number of sessions on one connection, so a
+  connection now goes back to the pool after every clean session, as it
+  already did on v6. A pooled connection that the server closed while idle
+  is now skipped before the next request is written into it. Docker e2e
+  runs four pooled sessions per connection against v4.1.1 and v5.0.1.
+
 - **Snell v3–v5 half-close no longer loses the upstream's reply.** After
   the protocol zero chunk, a session without `reuse` also closed the TCP
   write side. The official servers (3.0.1, 4.1.1 and 5.0.1, like 6.0)

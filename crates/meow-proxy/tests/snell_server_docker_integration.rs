@@ -416,10 +416,13 @@ async fn versioned_round_trips(image: &str, version: SnellVersion, max_datagram:
         return;
     };
     wait_until_listening(&server, server_port).await;
-    fresh_round_trips(&server, max_datagram, |reuse, dials| {
-        counted_adapter(server_port, version, reuse, dials)
-    })
-    .await;
+    let adapter =
+        |reuse, dials: &Arc<AtomicUsize>| counted_adapter(server_port, version, reuse, dials);
+    fresh_round_trips(&server, max_datagram, adapter).await;
+    // v3 has no reuse mode.
+    if version != SnellVersion::V3 {
+        pooled_round_trips(&server, adapter).await;
+    }
 }
 
 /// Bulk echo, a reply the upstream sends only after the client's

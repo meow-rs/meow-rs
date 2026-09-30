@@ -1,9 +1,9 @@
 //! Reuse pool for snell `CommandConnectV2` sessions.
 //!
 //! Port of opensnell `components/snell/pool.go`. The Surge `snell-server`
-//! v5.0.1 implementation closes a reuse-mode TCP connection after the second
-//! session (one fresh CONNECT + one reuse), so this pool caps `uses_per_conn`
-//! at 2 and discards beyond that. Idle entries also age out after 15 s.
+//! v4 and v5 releases (4.0.0 through 5.0.1, like v6) serve any number of
+//! sessions on a reuse-mode TCP connection, so a connection goes back to the
+//! pool after every clean session. Idle entries age out after 15 s.
 //!
 //! Lifecycle of a pooled session:
 //!
@@ -27,42 +27,36 @@ pub type PoolStream = Snell<Box<dyn TransportStream>>;
 
 const DEFAULT_MAX_SIZE: usize = 10;
 const DEFAULT_MAX_AGE: Duration = Duration::from_secs(15);
-const DEFAULT_MAX_USES_PER_CONN: u32 = 2;
 struct PooledEntry {
     conn: PoolStream,
     expires_at: Instant,
-    /// CONNECT sessions already served by this TCP stream.
-    uses: u32,
 }
 
 /// Bounded LIFO pool of warm snell streams.
 pub struct Pool {
     max_size: usize,
     max_age: Duration,
-    max_uses_per_conn: u32,
     items: Mutex<Vec<PooledEntry>>,
 }
 
 impl Pool {
     pub fn new() -> Self {
-        Self::with_limits(DEFAULT_MAX_SIZE, DEFAULT_MAX_AGE, DEFAULT_MAX_USES_PER_CONN)
+        Self::with_limits(DEFAULT_MAX_SIZE, DEFAULT_MAX_AGE)
     }
 
     /// A pool with custom caps: at most `max_size` idle entries, each
-    /// discarded after `max_age` idle or once it has served
-    /// `max_uses_per_conn` sessions.
-    pub fn with_limits(max_size: usize, max_age: Duration, max_uses_per_conn: u32) -> Self {
+    /// discarded after `max_age` idle.
+    pub fn with_limits(max_size: usize, max_age: Duration) -> Self {
         Self {
             max_size,
             max_age,
-            max_uses_per_conn,
             items: Mutex::new(Vec::new()),
         }
     }
 
     /// Try to take a still-fresh idle entry off the pool. Returns `None` if
     /// the pool is empty or every entry has expired.
-    pub fn take_idle(&self) -> Option<(PoolStream, u32)> {
+    pub fn take_idle(&self) -> Option<PoolStream> {
         let now = Instant::now();
         let mut items = self
             .items
@@ -70,7 +64,7 @@ impl Pool {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         while let Some(entry) = items.pop() {
             if now < entry.expires_at {
-                return Some((entry.conn, entry.uses));
+                return Some(entry.conn);
             }
             // Expired — drop on the floor; the underlying TCP will close
             // when the Snell wrapper is dropped.
@@ -90,11 +84,8 @@ impl Pool {
     }
 
     /// Re-insert a conn that has just finished a session. Drops the conn if
-    /// the pool is full or the conn has reached its session cap.
-    pub fn put(&self, conn: PoolStream, uses: u32) {
-        if uses >= self.max_uses_per_conn {
-            return;
-        }
+    /// the pool is full.
+    pub fn put(&self, conn: PoolStream) {
         let mut items = self
             .items
             .lock()
@@ -105,7 +96,6 @@ impl Pool {
         items.push(PooledEntry {
             conn,
             expires_at: Instant::now() + self.max_age,
-            uses,
         });
     }
 }
@@ -144,47 +134,51 @@ mod tests {
     #[test]
     fn pool_is_lifo() {
         let pool = Pool::new();
-        let (conn_a, _peer_a) = make_stream();
-        let (conn_b, _peer_b) = make_stream();
-        pool.put(conn_a, 0);
-        pool.put(conn_b, 1);
+        // The older conn's peer is gone, so the two are told apart by
+        // whether the conn still looks alive.
+        let (older, peer_older) = make_stream();
+        drop(peer_older);
+        let (newer, _peer_newer) = make_stream();
+        pool.put(older);
+        pool.put(newer);
 
-        let (_conn, uses) = pool.take_idle().expect("first take should pop an entry");
-        assert_eq!(uses, 1, "most recently returned conn comes back first");
-        let (_conn, uses) = pool.take_idle().expect("second take should pop an entry");
-        assert_eq!(uses, 0);
+        let mut conn = pool.take_idle().expect("first take should pop an entry");
+        assert!(
+            conn.idle_conn_alive(),
+            "most recently returned conn comes back first"
+        );
+        let mut conn = pool.take_idle().expect("second take should pop an entry");
+        assert!(!conn.idle_conn_alive());
         assert!(pool.take_idle().is_none());
     }
 
     #[test]
-    fn put_discards_at_uses_cap() {
+    fn put_keeps_a_conn_after_any_number_of_sessions() {
         let pool = Pool::new();
-        // Surge snell-server v5.0.1 closes after the second session, so a
-        // conn that has already served 2 sessions must not be pooled.
-        let (capped, _peer_capped) = make_stream();
-        pool.put(capped, 2);
-        assert!(pool.take_idle().is_none());
-
-        let (reusable, _peer_reusable) = make_stream();
-        pool.put(reusable, 1);
-        let (_conn, uses) = pool.take_idle().expect("uses=1 should be pooled");
-        assert_eq!(uses, 1);
+        let (conn, _peer) = make_stream();
+        pool.put(conn);
+        for session in 0..8 {
+            let conn = pool
+                .take_idle()
+                .unwrap_or_else(|| panic!("session {session} found no pooled conn"));
+            pool.put(conn);
+        }
+        assert_eq!(pool.idle_count(), 1);
     }
 
     #[test]
     fn custom_limits_apply() {
-        let pool = Pool::with_limits(1, Duration::from_secs(60), u32::MAX);
-        let (busy, _peer_busy) = make_stream();
-        pool.put(busy, 1000);
+        let pool = Pool::with_limits(1, Duration::from_secs(60));
+        let (first, _peer_first) = make_stream();
+        pool.put(first);
         let (extra, _peer_extra) = make_stream();
-        pool.put(extra, 0);
+        pool.put(extra);
         assert_eq!(pool.idle_count(), 1, "max_size caps idle entries");
-        let (_conn, uses) = pool.take_idle().expect("uncapped uses are pooled");
-        assert_eq!(uses, 1000);
+        assert!(pool.take_idle().is_some());
 
-        let expired = Pool::with_limits(4, Duration::ZERO, u32::MAX);
+        let expired = Pool::with_limits(4, Duration::ZERO);
         let (conn, _peer) = make_stream();
-        expired.put(conn, 0);
+        expired.put(conn);
         assert!(
             expired.take_idle().is_none(),
             "zero max_age expires at once"
@@ -198,7 +192,7 @@ mod tests {
         for _ in 0..11 {
             let (conn, peer) = make_stream();
             peers.push(peer);
-            pool.put(conn, 0);
+            pool.put(conn);
         }
         for i in 0..10 {
             assert!(

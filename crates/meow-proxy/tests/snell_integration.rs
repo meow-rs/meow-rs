@@ -32,6 +32,9 @@ enum Behavior {
     /// Reply `RESPONSE_TUNNEL`, then echo every chunk back. Honours the
     /// zero-chunk half-close handshake so reuse-mode sessions work.
     Echo,
+    /// `Echo` for one session, then close the TCP connection right after
+    /// acknowledging the client's half-close.
+    EchoThenClose,
     /// Send a tail and the server zero-chunk before the client half-closes,
     /// then require the client zero-chunk before accepting another session.
     PeerClosesFirst,
@@ -53,6 +56,8 @@ struct MockServer {
     addr: SocketAddr,
     /// Number of accepted TCP connections (not sessions).
     accepted: Arc<AtomicUsize>,
+    /// Number of connections the server has closed.
+    closed: Arc<AtomicUsize>,
     requests: Arc<Mutex<Vec<RecordedRequest>>>,
     /// Protocol violations observed by spawned per-connection tasks. A panic
     /// inside a tokio-spawned task would be swallowed by the runtime, so the
@@ -204,7 +209,7 @@ async fn serve_conn(
                 let _ = conn.flush().await;
                 return Ok(());
             }
-            Behavior::Echo | Behavior::PeerClosesFirst => {
+            Behavior::Echo | Behavior::EchoThenClose | Behavior::PeerClosesFirst => {
                 if conn.write_all(&[RESPONSE_TUNNEL]).await.is_err() || conn.flush().await.is_err()
                 {
                     return Ok(());
@@ -246,7 +251,9 @@ async fn serve_conn(
                             // Acknowledge the client's half-close with our
                             // own zero chunk, then wait for the next session
                             // header on the same TCP stream (reuse mode).
-                            if send_zero_chunk(&mut conn).await.is_err() {
+                            if send_zero_chunk(&mut conn).await.is_err()
+                                || matches!(behavior, Behavior::EchoThenClose)
+                            {
                                 return Ok(());
                             }
                             break;
@@ -263,9 +270,11 @@ async fn start_mock_server(psk: &'static str, behavior: Behavior) -> MockServer 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let accepted = Arc::new(AtomicUsize::new(0));
+    let closed = Arc::new(AtomicUsize::new(0));
     let requests: Arc<Mutex<Vec<RecordedRequest>>> = Arc::new(Mutex::new(Vec::new()));
     let violations: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let accepted_task = Arc::clone(&accepted);
+    let closed_task = Arc::clone(&closed);
     let requests_task = Arc::clone(&requests);
     let violations_task = Arc::clone(&violations);
     tokio::spawn(async move {
@@ -277,18 +286,21 @@ async fn start_mock_server(psk: &'static str, behavior: Behavior) -> MockServer 
             let conn = V4Conn::new(stream, Arc::from(psk.as_bytes()));
             let requests_conn = Arc::clone(&requests_task);
             let violations_conn = Arc::clone(&violations_task);
+            let closed_conn = Arc::clone(&closed_task);
             tokio::spawn(async move {
                 if let Err(violation) =
                     serve_conn(conn, behavior, requests_conn, is_v4_zero_chunk).await
                 {
                     violations_conn.lock().unwrap().push(violation);
                 }
+                closed_conn.fetch_add(1, Ordering::SeqCst);
             });
         }
     });
     MockServer {
         addr,
         accepted,
+        closed,
         requests,
         violations,
     }
@@ -298,9 +310,11 @@ async fn start_v3_mock_server(psk: &'static str, behavior: Behavior) -> MockServ
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let accepted = Arc::new(AtomicUsize::new(0));
+    let closed = Arc::new(AtomicUsize::new(0));
     let requests: Arc<Mutex<Vec<RecordedRequest>>> = Arc::new(Mutex::new(Vec::new()));
     let violations: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let accepted_task = Arc::clone(&accepted);
+    let closed_task = Arc::clone(&closed);
     let requests_task = Arc::clone(&requests);
     let violations_task = Arc::clone(&violations);
     tokio::spawn(async move {
@@ -312,18 +326,21 @@ async fn start_v3_mock_server(psk: &'static str, behavior: Behavior) -> MockServ
             let conn = V3Conn::new(stream, Arc::from(psk.as_bytes()));
             let requests_conn = Arc::clone(&requests_task);
             let violations_conn = Arc::clone(&violations_task);
+            let closed_conn = Arc::clone(&closed_task);
             tokio::spawn(async move {
                 if let Err(violation) =
                     serve_conn(conn, behavior, requests_conn, is_v3_zero_chunk).await
                 {
                     violations_conn.lock().unwrap().push(violation);
                 }
+                closed_conn.fetch_add(1, Ordering::SeqCst);
             });
         }
     });
     MockServer {
         addr,
         accepted,
+        closed,
         requests,
         violations,
     }
@@ -396,6 +413,16 @@ async fn wait_for_pool_size(adapter: &SnellAdapter, want: usize) {
     })
     .await
     .expect("reuse pool was not replenished in time");
+}
+
+async fn wait_for_closed(server: &MockServer, want: usize) {
+    timeout(TIMEOUT, async {
+        while server.closed.load(Ordering::SeqCst) < want {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("mock server did not close enough connections in time");
 }
 
 async fn wait_for_accepted(server: &MockServer, want: usize) {
@@ -580,39 +607,46 @@ async fn reuse_pool_reuses_tcp_connection() {
     let adapter = make_adapter(server.addr.port(), PSK, false, true);
     let metadata = tcp_metadata("reuse.example.com", 443);
 
-    // Session 1 — fresh dial.
-    relay_roundtrip(&adapter, &metadata, b"session-1").await;
-    wait_for_pool_size(&adapter, 1).await;
-
-    // Session 2 — must reuse the pooled TCP connection.
-    relay_roundtrip(&adapter, &metadata, b"session-2").await;
+    // Session 1 dials; every later session reuses the pooled TCP connection.
+    for session in 1..=4 {
+        relay_roundtrip(&adapter, &metadata, format!("session-{session}").as_bytes()).await;
+        wait_for_pool_size(&adapter, 1).await;
+    }
     assert_eq!(
         server.accepted.load(Ordering::SeqCst),
         1,
-        "session 2 must reuse the pooled TCP connection"
-    );
-    // `Pool::put` discards a conn at the 2-uses cap without inserting it.
-
-    // Session 3 — the 2-uses-per-conn cap forces a fresh dial.
-    let mut conn = timeout(TIMEOUT, adapter.dial_tcp(&metadata))
-        .await
-        .expect("dial 3 timed out")
-        .expect("dial 3 failed");
-    roundtrip(&mut conn, b"session-3").await;
-    assert_eq!(
-        server.accepted.load(Ordering::SeqCst),
-        2,
-        "the uses-per-conn cap must force a fresh dial for session 3"
+        "every session must reuse the pooled TCP connection"
     );
 
     {
         let requests = server.requests.lock().unwrap();
-        assert_eq!(requests.len(), 3);
+        assert_eq!(requests.len(), 4);
         assert!(
             requests.iter().all(|r| r.cmd == COMMAND_CONNECT_V2),
             "reuse mode must always send COMMAND_CONNECT_V2, got {requests:?}"
         );
     }
+    server.assert_no_violations();
+}
+
+#[tokio::test]
+async fn pooled_conn_closed_while_idle_is_skipped() {
+    let server = start_mock_server(PSK, Behavior::EchoThenClose).await;
+    let adapter = make_adapter(server.addr.port(), PSK, false, true);
+    let metadata = tcp_metadata("idle-close.example.com", 443);
+
+    relay_roundtrip(&adapter, &metadata, b"session-1").await;
+    wait_for_pool_size(&adapter, 1).await;
+    wait_for_closed(&server, 1).await;
+
+    // The pooled conn now reads EOF, so session 2 must dial fresh instead
+    // of sending its header into the closed connection.
+    relay_roundtrip(&adapter, &metadata, b"session-2").await;
+    assert_eq!(
+        server.accepted.load(Ordering::SeqCst),
+        2,
+        "session 2 must not reuse the closed connection"
+    );
     server.assert_no_violations();
 }
 
