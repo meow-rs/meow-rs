@@ -437,6 +437,18 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **Dead-marking a nested proxy-group member is no longer a dead write**
+  (issue #681). `DialFailureTracker` escalation and probe sweeps record
+  health on `member.health()`, but `Selector`/`Fallback`/`UrlTest`/
+  `LoadBalance` groups derived `alive()`/`alive_for_url()` purely by
+  delegating to their current pick — the mark landed on the member's own
+  `ProxyHealth` bit, which nothing read. A `fallback: [selector-a, …]`
+  arm whose selected leaf failed escalated the dead-mark, observed
+  nothing, and re-picked the broken member forever. Each group's
+  liveness now ANDs its own health bit with the delegated member check:
+  escalation/probe writes are observable, and a dead leaf still
+  propagates through a selector unchanged.
+
 - **Transport layers no longer flatten io-bearing handshake/stream
   errors into strings** (issue #680, follow-up to #663/#668). After
   `connect()` succeeds, `EMFILE`-class errors can't recur mid-handshake,

@@ -204,11 +204,15 @@ impl Proxy for SelectorGroup {
     }
 
     fn alive(&self) -> bool {
-        self.selected_proxy().is_some_and(|p| p.alive())
+        // The delegated half keeps a member dead-mark visible; the own
+        // `health` half is what `record_dial_failure` escalation and probe
+        // sweeps write — without it the write is unreadable and a dead
+        // selector member wedges its parent group forever (issue #681).
+        self.health.alive() && self.selected_proxy().is_some_and(|p| p.alive())
     }
 
     fn alive_for_url(&self, url: &str) -> bool {
-        self.selected_proxy().is_some_and(|p| p.alive_for_url(url))
+        self.health.alive() && self.selected_proxy().is_some_and(|p| p.alive_for_url(url))
     }
 
     fn last_delay(&self) -> u16 {
@@ -383,6 +387,41 @@ mod tests {
         assert!(!g.support_udp(), "default selection is tcp-only");
         assert!(g.select("udp-able"));
         assert!(g.support_udp(), "switching selection updates udp support");
+    }
+
+    /// Issue #681: `record_dial_failure` escalation and probe sweeps write
+    /// `health().set_alive` / `record_delay` — a pure delegation made the
+    /// group member's own dead-mark unreadable, wedging any parent group
+    /// that picked it.
+    #[test]
+    fn own_health_bit_makes_dead_marks_observable() {
+        let leaf = MockProxy::new("leaf");
+        let g = SelectorGroup::new("sel", vec![leaf]);
+        assert!(g.alive() && g.alive_for_url("https://x"));
+
+        g.health().set_alive(false);
+        assert!(!g.alive(), "escalation mark must stop selection");
+        assert!(!g.alive_for_url("https://x"));
+
+        // The delegated half is preserved: a leaf dead-marked by its own
+        // tracker/sweep still propagates through the selector.
+        g.health().set_alive(true);
+        assert!(g.alive());
+        g.selected_proxy().unwrap().health().set_alive(false);
+        assert!(!g.alive(), "dead selected member still reports dead");
+    }
+
+    /// Probe sweeps revive via `record_delay`, not `set_alive(true)` — the
+    /// write must clear the same bit escalation sets.
+    #[test]
+    fn record_delay_revives_a_dead_marked_selector() {
+        let g = SelectorGroup::new("sel", vec![MockProxy::new("leaf")]);
+        g.health().set_alive(false);
+        assert!(!g.alive());
+        g.health().record_delay(42);
+        assert!(g.alive(), "a successful probe must clear the dead-mark");
+        g.health().record_delay(0);
+        assert!(!g.alive(), "a failed probe dead-marks the same way");
     }
 
     #[tokio::test]

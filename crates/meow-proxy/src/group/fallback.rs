@@ -209,11 +209,15 @@ impl ProxyAdapter for FallbackGroup {
 
 impl Proxy for FallbackGroup {
     fn alive(&self) -> bool {
-        self.first_alive().is_some_and(|p| p.alive())
+        // Own `health` bit AND delegated member liveness — the write side
+        // of `record_dial_failure` escalation and `record_delay` sweeps
+        // lands on `health`, so a pure delegation made every dead-mark on a
+        // nested group member a silent no-op (issue #681).
+        self.health.alive() && self.first_alive().is_some_and(|p| p.alive())
     }
 
     fn alive_for_url(&self, url: &str) -> bool {
-        self.first_alive().is_some_and(|p| p.alive_for_url(url))
+        self.health.alive() && self.first_alive().is_some_and(|p| p.alive_for_url(url))
     }
 
     fn last_delay(&self) -> u16 {
@@ -449,6 +453,39 @@ mod tests {
         );
         let _ = g.unwrap_proxy(&meta, true);
         assert_eq!(g.usage_generation(), 1, "real unwrap records the use");
+    }
+
+    /// Issue #681 wedge repro: `fallback: [selector, spare]` where the
+    /// selector's pick always fails. Escalation used to dead-mark the
+    /// selector's own (unread) health bit, so `alive()` stayed delegated-
+    /// true and every dial re-picked the broken member forever.
+    #[tokio::test]
+    async fn dead_marked_selector_member_is_skipped() {
+        let leaf = MockProxy::new("leaf"); // dial always errors
+        let sel: Arc<dyn Proxy> = Arc::new(crate::group::selector::SelectorGroup::new(
+            "sel",
+            vec![leaf],
+        ));
+        let spare = MockProxy::new("spare");
+        let spare_ref = Arc::clone(&spare);
+        let g = FallbackGroup::new("fb", vec![sel, spare]);
+
+        // Five dial failures inside the window escalate (each `dial_tcp`
+        // fails instantly, so the streak stays inside 5s).
+        for _ in 0..5 {
+            let _ = g.dial_tcp(&Metadata::default()).await;
+        }
+        assert_eq!(
+            spare_ref.dials(),
+            0,
+            "before escalation the first member is picked"
+        );
+        let _ = g.dial_tcp(&Metadata::default()).await;
+        assert_eq!(
+            spare_ref.dials(),
+            1,
+            "dead-marked selector member must be skipped"
+        );
     }
 
     #[test]

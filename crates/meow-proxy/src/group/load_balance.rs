@@ -360,11 +360,13 @@ impl ProxyAdapter for LoadBalanceGroup {
 
 impl Proxy for LoadBalanceGroup {
     fn alive(&self) -> bool {
-        self.any_member(|p| p.alive())
+        // Own `health` bit AND delegated member liveness — see
+        // `FallbackGroup::alive` (issue #681).
+        self.health.alive() && self.any_member(|p| p.alive())
     }
 
     fn alive_for_url(&self, url: &str) -> bool {
-        self.any_member(|p| p.alive_for_url(url))
+        self.health.alive() && self.any_member(|p| p.alive_for_url(url))
     }
 
     fn last_delay(&self) -> u16 {
@@ -1359,5 +1361,16 @@ mod tests {
             !Arc::ptr_eq(&peeked, &next_peek),
             "after a committed pick the peek must move on"
         );
+    }
+    /// Issue #681: escalation/probe writes land on the group's own health
+    /// bit — it must be observable next to any-member delegation.
+    #[test]
+    fn own_health_bit_makes_dead_marks_observable() {
+        let g = LoadBalanceGroup::new("lb", vec![MockProxy::new("a")], LbStrategy::RoundRobin);
+        assert!(g.alive());
+        g.health().set_alive(false);
+        assert!(!g.alive() && !g.alive_for_url("https://x"));
+        g.health().record_delay(50);
+        assert!(g.alive());
     }
 }

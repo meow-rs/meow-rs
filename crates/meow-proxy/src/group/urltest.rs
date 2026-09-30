@@ -314,11 +314,13 @@ impl ProxyAdapter for UrlTestGroup {
 
 impl Proxy for UrlTestGroup {
     fn alive(&self) -> bool {
-        self.fastest_proxy().is_some_and(|p| p.alive())
+        // Own `health` bit AND delegated member liveness — see
+        // `FallbackGroup::alive` (issue #681).
+        self.health.alive() && self.fastest_proxy().is_some_and(|p| p.alive())
     }
 
     fn alive_for_url(&self, url: &str) -> bool {
-        self.fastest_proxy().is_some_and(|p| p.alive_for_url(url))
+        self.health.alive() && self.fastest_proxy().is_some_and(|p| p.alive_for_url(url))
     }
 
     fn last_delay(&self) -> u16 {
@@ -651,5 +653,44 @@ mod tests {
         let _ = g.dial_tcp(&Metadata::default()).await;
         assert!(!a_ref.alive(), "refused escalates on the first failure");
         assert_eq!(pick(&g), "b", "the refused member is no longer selected");
+    }
+    /// Issue #681 wedge repro at the pick level: `url-test: [selector,
+    /// spare]` where the selector's pick always fails. The dead-mark must
+    /// evict the selector from `pick_for_dial`'s alive-member scan.
+    #[tokio::test]
+    async fn dead_marked_selector_member_is_skipped() {
+        let leaf = MockProxy::new("leaf"); // dial always errors
+        leaf.set_delay(50); // make sel the incumbent fastest
+        let sel: Arc<dyn Proxy> = Arc::new(crate::group::selector::SelectorGroup::new(
+            "sel",
+            vec![leaf],
+        ));
+        let spare = MockProxy::new("spare");
+        spare.set_delay(100);
+        let spare_ref = Arc::clone(&spare);
+        let g = UrlTestGroup::new("ut", vec![sel, spare], 0);
+
+        for _ in 0..5 {
+            let _ = g.dial_tcp(&Metadata::default()).await;
+        }
+        assert_eq!(spare_ref.dials(), 0, "fastest member serves all dials");
+        let _ = g.dial_tcp(&Metadata::default()).await;
+        assert_eq!(
+            spare_ref.dials(),
+            1,
+            "dead-marked selector member must be skipped"
+        );
+    }
+
+    /// Issue #681: escalation/probe writes land on the group's own health
+    /// bit — it must be observable next to the delegated fastest member.
+    #[test]
+    fn own_health_bit_makes_dead_marks_observable() {
+        let g = UrlTestGroup::new("ut", vec![MockProxy::new("a")], 0);
+        assert!(g.alive());
+        g.health().set_alive(false);
+        assert!(!g.alive() && !g.alive_for_url("https://x"));
+        g.health().record_delay(50);
+        assert!(g.alive());
     }
 }

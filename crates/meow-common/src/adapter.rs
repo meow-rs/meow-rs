@@ -170,9 +170,13 @@ pub trait ProxyAdapter: Send + Sync {
     fn unwrap_proxy(&self, _metadata: &Metadata, _touch: bool) -> Option<Arc<dyn Proxy>> {
         None
     }
-    /// Per-adapter health handle — owned, infallible. Dashboards (via the
-    /// delay endpoints) record probe results through `health().record_delay`
-    /// so `GET /proxies/:name` reflects the measurement.
+    /// Per-adapter health handle — owned, infallible. Writers: dashboards
+    /// and delay endpoints record probe results through
+    /// `health().record_delay`; `DialFailureTracker` escalation dead-marks
+    /// failed group members via `health().set_alive(false)` and probe
+    /// sweeps revive them via `record_delay`. For group adapters those
+    /// writes must stay observable — each group's `alive()` reads this bit
+    /// alongside its delegated member check (issue #681).
     fn health(&self) -> &ProxyHealth;
 }
 
