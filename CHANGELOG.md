@@ -437,6 +437,19 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **Server-first protocols work over the TUN inbound** (issue #695). The
+  TUN accept path waited up to 15 s for the client's first payload before
+  dialing upstream, and reset the flow when none came. Protocols where
+  the server speaks first — SMTP, POP3, IMAP, FTP, MySQL, VNC, SSH
+  banners — never sent one, so they hung for 15 s and were reset while
+  the same domain worked through the mixed/SOCKS inbound. The wait is now
+  a 200 ms sniff window (mihomo's pre-dial peek): a silent flow is dialed
+  with an empty prefix and gets its banner right after, a client-first
+  flow still carries its first bytes as the prefix, and a connection that
+  closes or resets inside the window is still dropped before it is
+  matched, counted or dialed. A `max-connections` slot is taken once a
+  flow leaves the window.
+
 - **TUN: dropping a finished connection can no longer close an
   unrelated one** (issue #695). When meow closed its side first and the
   client then sent its FIN, the connection's lwIP pcb entered TIME_WAIT,
@@ -447,6 +460,22 @@ the canonical, in-repo source a release is cut from.
   a FIN/RST, plus a use-after-free. The core now detaches its callbacks
   and hands the pcb to lwIP as soon as both directions are closed;
   data received before the client's FIN still reaches the reader.
+
+- **macOS TUN `dns-hijack` restores system DNS on exit** (issue #695).
+  The macOS `DnsGuard` matched `networksetup -getdnsservers` against
+  "There aren't any DNS Servers set on this device.", but networksetup
+  names the service ("…set on Ethernet."), so a DHCP-configured service
+  backed up that sentence as its server list. Restoring it failed
+  (`-setdnsservers` rejects it, exit 4) and the exit status was never
+  checked, so the first clean exit silently left system DNS on the
+  dead fake-IP gateway — a full DNS outage. The backup is now exactly
+  the lines that parse as IP addresses (none ⇒ restore `Empty`), every
+  `networksetup` call checks its exit status and logs the diagnostic
+  it prints, a service whose DNS can't be read is left untouched
+  instead of hijacked with no restore entry, and a failed restore
+  warns instead of reporting success. On Windows, a failed registry
+  backup script now aborts the guard instead of yielding an empty
+  backup whose drop-time DHCP reset discarded static DNS.
 
 - **`tun.auto-route: global` no longer loops meow's own traffic back
   into the TUN** (issue #695). Two holes let outbound sockets escape the
