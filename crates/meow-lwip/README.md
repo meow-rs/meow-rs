@@ -6,8 +6,10 @@
 > The Rust layer diverges from upstream: the core is single-owner (`LWIP_MUTEX`
 > removed entirely), with fixes for a data race / use-after-free in
 > `Stream::poll_next`, a `poll_flush` Pending-without-waker deadlock, a
-> FIN_WAIT_2 pcb leak and a timer-task livelock. The C lwIP sources under
-> `old-src/` are unmodified upstream lwIP (BSD-3-Clause, see `COPYING`).
+> FIN_WAIT_2 pcb leak, a timer-task livelock and a use-after-free on
+> TIME_WAIT pcbs that lwIP recycles without an error callback. The C lwIP
+> sources under `old-src/` are unmodified upstream lwIP (BSD-3-Clause, see
+> `COPYING`).
 >
 > Dependents use it as `lwip = { package = "meow-lwip", … }`, so `use lwip::…`
 > paths are unchanged.
