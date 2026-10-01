@@ -437,6 +437,22 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **macOS TUN `dns-hijack` restores system DNS on exit** (issue #695).
+  The macOS `DnsGuard` matched `networksetup -getdnsservers` against
+  "There aren't any DNS Servers set on this device.", but networksetup
+  names the service ("…set on Ethernet."), so a DHCP-configured service
+  backed up that sentence as its server list. Restoring it failed
+  (`-setdnsservers` rejects it, exit 4) and the exit status was never
+  checked, so the first clean exit silently left system DNS on the
+  dead fake-IP gateway — a full DNS outage. The backup is now exactly
+  the lines that parse as IP addresses (none ⇒ restore `Empty`), every
+  `networksetup` call checks its exit status and logs the diagnostic
+  it prints, a service whose DNS can't be read is left untouched
+  instead of hijacked with no restore entry, and a failed restore
+  warns instead of reporting success. On Windows, a failed registry
+  backup script now aborts the guard instead of yielding an empty
+  backup whose drop-time DHCP reset discarded static DNS.
+
 - **Dead-marking a nested proxy-group member is no longer a dead write**
   (issue #681). `DialFailureTracker` escalation and probe sweeps record
   health on `member.health()`, but `Selector`/`Fallback`/`UrlTest`/
