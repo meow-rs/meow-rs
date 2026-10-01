@@ -124,13 +124,17 @@ How each loop-avoidance piece works:
    teardown is a plain route delete — no restore step that can be lost to a
    crash.
 2. **Outbound interface binding.** Every outbound socket meow creates (proxy
-   upstream dials, DIRECT, marked sockets) is bound to the physical
-   interface with `SO_BINDTODEVICE` *before* connect/bind, so its packets
-   take the physical route regardless of the routing table. The interface is
-   `tun.outbound-interface` if set, otherwise auto-detected from
-   `/proc/net/route` **before** the split defaults go in. If the binding
-   cannot be installed, startup **fails closed** — no default routes are
-   installed without loop avoidance.
+   upstream dials including Hysteria2's QUIC socket, DIRECT, DNS upstreams,
+   marked sockets) is bound to the physical interface with `SO_BINDTODEVICE`
+   *before* connect/bind, so its packets take the physical route regardless
+   of the routing table. The interface is `tun.outbound-interface` if set,
+   otherwise auto-detected from `/proc/net/route` **before** the split
+   defaults go in. The binding is installed as soon as the config is parsed,
+   ahead of the first startup dial (provider and geodata fetches, health
+   checks), so no long-lived session opened during startup escapes it
+   (#695); the TUN listener then owns it and clears it with its routes. If
+   the binding cannot be installed, startup **fails closed** — no default
+   routes are installed without loop avoidance.
 3. **Own-resolver hostname dials.** Proxy-server domains are resolved
    through meow's resolver hook (installed at startup), not libc's
    `getaddrinfo`, so those lookups don't depend on the OS resolver's

@@ -20,6 +20,8 @@
 //! | T10 | `enable: false` with other fields set → parsed but disabled        |
 //! | T16 | `TunConfig` semantic equality — the PUT reconcile diff boundary    |
 //! |     | (issue #543): respellings/ignored fields equal, real params not  |
+//! | T17 | `global_route_outbound_interface` (the pre-build binding gate,    |
+//! |     | issue #695) agrees with the parsed `TunConfig`                     |
 
 use std::time::Duration;
 
@@ -361,4 +363,59 @@ async fn t16_tun_config_semantic_equality_boundary() {
     ] {
         assert_ne!(omitted, tun(yaml).await, "a real {what} change must differ");
     }
+}
+
+// ─── T17: the pre-build global-route gate agrees with the parser (#695) ───
+// The binary installs the outbound-interface binding from the *raw*
+// document before `build_config` dials anything. That gate must select
+// exactly the configs the parser turns into an enabled global-scope TUN,
+// with the same interface — never a fake-IP / disabled one (zero change
+// there), never miss a global one (its early sockets would loop).
+
+#[tokio::test]
+async fn t17_global_route_gate_matches_parsed_config() {
+    use meow_config::{global_route_outbound_interface, parse_raw_yaml, TunRouteMode};
+
+    for yaml in [
+        "port: 7890\n",
+        "tun:\n  enable: true\n",
+        "tun:\n  enable: false\n  auto-route: global\n  outbound-interface: eth0\n",
+        "tun:\n  enable: true\n  auto-route: true\n  outbound-interface: eth0\n",
+        "tun:\n  enable: true\n  auto-route: false\n",
+        "tun:\n  enable: true\n  auto-route: fake-ip\n  outbound-interface: eth0\n",
+        "tun:\n  enable: true\n  auto-route: global\n",
+        "tun:\n  enable: true\n  auto-route: global\n  outbound-interface: eth0\n",
+        "tun:\n  enable: true\n  auto-route: global\n  outbound-interface: ''\n",
+        "tun:\n  enable: true\n  auto-route: everything\n",
+    ] {
+        let raw = parse_raw_yaml(yaml).expect("raw YAML must parse");
+        let gate = global_route_outbound_interface(raw.tun.as_ref());
+        let expected = match load_config_from_str(yaml).await {
+            Ok(cfg)
+                if cfg.tun.enable
+                    && cfg.tun.auto_route
+                    && cfg.tun.route_mode == TunRouteMode::Global =>
+            {
+                Some(cfg.tun.outbound_interface)
+            }
+            // Not global scope, or rejected by the parser: no early binding.
+            _ => None,
+        };
+        assert_eq!(gate, expected, "{yaml}");
+    }
+
+    // Spot-check the global cases explicitly so a regression to "always
+    // None" can't pass by matching a parser that also stopped selecting
+    // global scope.
+    let gate =
+        |yaml: &str| global_route_outbound_interface(parse_raw_yaml(yaml).unwrap().tun.as_ref());
+    assert_eq!(
+        gate("tun:\n  enable: true\n  auto-route: global\n  outbound-interface: eth0\n"),
+        Some(Some("eth0".to_owned()))
+    );
+    assert_eq!(
+        gate("tun:\n  enable: true\n  auto-route: global\n"),
+        Some(None),
+        "no outbound-interface → auto-detect"
+    );
 }

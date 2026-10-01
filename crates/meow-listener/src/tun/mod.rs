@@ -51,6 +51,7 @@ mod device;
 mod dns;
 #[cfg(target_os = "windows")]
 mod local_dns;
+mod outbound_binding;
 mod route;
 mod udp;
 #[cfg(any(test, target_os = "windows"))]
@@ -82,6 +83,8 @@ const TUN_PAYLOAD_WAIT: Duration = crate::DEFAULT_HANDSHAKE_TIMEOUT;
 const TUN_FIRST_READ: usize = 256;
 
 use route::RouteGuard;
+
+pub use outbound_binding::OutboundBinding;
 
 /// Process-global serialization point for lwIP generations (issue #514).
 /// `NetStack::new` must not run while a previous core is still tearing
@@ -289,22 +292,11 @@ struct TunDevice {
     #[allow(dead_code)]
     route_guard: Option<RouteGuard>,
     /// Held only for its `Drop` side effect — clears the process-global
-    /// outbound-interface binding installed for global route scope.
+    /// outbound-interface binding installed for global route scope (after
+    /// `route_guard` has removed the routes it protects).
     #[allow(dead_code)]
-    iface_guard: Option<OutboundIfaceGuard>,
+    iface_guard: Option<OutboundBinding>,
     pub(super) device: tun_rs::AsyncDevice,
-}
-
-/// RAII wrapper for `meow_common::set_outbound_interface`: global route
-/// scope installs the binding at startup; dropping this (listener teardown /
-/// config reload) clears it so later sessions don't inherit a stale
-/// interface.
-struct OutboundIfaceGuard;
-
-impl Drop for OutboundIfaceGuard {
-    fn drop(&mut self) {
-        meow_common::clear_outbound_interface();
-    }
 }
 
 pub struct TunListener {
@@ -317,6 +309,9 @@ pub struct TunListener {
     /// `Drop` impl sends `TunReady::Failed`, giving callers an immediate
     /// error without waiting for a timeout.
     ready: Option<tokio::sync::oneshot::Sender<TunReady>>,
+    /// Global-scope binding installed by the caller before this listener
+    /// was built (see [`Self::with_outbound_binding`]).
+    outbound_binding: Option<OutboundBinding>,
 }
 
 impl TunListener {
@@ -326,7 +321,20 @@ impl TunListener {
             cfg,
             name,
             ready: None,
+            outbound_binding: None,
         }
+    }
+
+    /// Hand over an [`OutboundBinding`] the caller installed early — the
+    /// binary does so before its first startup dial, so no socket predates
+    /// the binding (issue #695). The listener uses it instead of installing
+    /// its own and owns it from here on: it is cleared with the routes on
+    /// teardown, or straight away if startup fails or the listener is
+    /// dropped without running. Ignored (and so cleared) outside global
+    /// route scope.
+    pub fn with_outbound_binding(mut self, binding: OutboundBinding) -> Self {
+        self.outbound_binding = Some(binding);
+        self
     }
 
     /// Attach a readiness signal. The sender will fire `TunReady::Ready`
@@ -347,7 +355,8 @@ impl TunListener {
         // is dropped mid-setup the notifier's `Drop` impl sends a generic
         // failure — either way no timeout wait.
         let mut notifier = self.ready.take().map(ReadyNotifier::new);
-        let result = self.run_inner(&mut notifier).await;
+        let preinstalled = self.outbound_binding.take();
+        let result = self.run_inner(&mut notifier, preinstalled).await;
         if let Err(e) = &result {
             if let Some(n) = notifier.take() {
                 n.fail(e.to_string());
@@ -359,6 +368,7 @@ impl TunListener {
     async fn run_inner(
         &self,
         notifier: &mut Option<ReadyNotifier>,
+        preinstalled: Option<OutboundBinding>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let t0 = Instant::now();
         info!("TUN listener '{}' starting...", self.name);
@@ -482,40 +492,19 @@ impl TunListener {
         // Obtain the interface index before moving `device` into `TunDevice`.
         let if_index = device.if_index()?;
 
-        // Global route scope (#375): before any routes go in, install the
-        // outbound-interface binding so meow's own dials cannot loop back
-        // into the device. Fail closed — a global default route without
-        // working loop avoidance would blackhole the host's connectivity.
+        // Global route scope (#375): before any routes go in, the
+        // outbound-interface binding must be installed so meow's own dials
+        // cannot loop back into the device — usually it already is (the
+        // binary installs it before its first startup dial, issue #695).
+        // Fail closed — a global default route without working loop
+        // avoidance would blackhole the host's connectivity.
         let iface_guard = if cfg.auto_route && cfg.route_scope == TunRouteScope::Global {
-            if !cfg!(target_os = "linux") {
-                return Err(Box::new(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "tun auto-route: global is currently Linux-only (tracked on #375); \
-                     use auto-route: fake-ip on this platform",
-                )));
-            }
-            let iface = match cfg.outbound_interface.clone() {
-                Some(name) => name,
-                None => route::default_interface().map_err(|e| {
-                    io::Error::other(format!(
-                        "tun auto-route: global: could not auto-detect the physical \
-                         interface ({e}); set tun.outbound-interface explicitly"
-                    ))
-                })?,
-            };
-            meow_common::set_outbound_interface(&iface).map_err(|e| {
-                io::Error::other(format!(
-                    "tun auto-route: global: outbound interface binding failed ({e}); \
-                     refusing to install default routes without loop avoidance"
-                ))
-            })?;
-            info!(
-                "tun '{}': global route scope — outbound sockets bound to '{iface}' \
-                 (experimental, #375)",
-                self.name
-            );
-            Some(OutboundIfaceGuard)
+            Some(match preinstalled {
+                Some(binding) => binding,
+                None => OutboundBinding::install(cfg.outbound_interface.as_deref())?,
+            })
         } else {
+            drop(preinstalled);
             None
         };
 

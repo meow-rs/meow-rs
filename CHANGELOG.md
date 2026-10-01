@@ -448,6 +448,23 @@ the canonical, in-repo source a release is cut from.
   and hands the pcb to lwIP as soon as both directions are closed;
   data received before the client's FIN still reaches the reader.
 
+- **`tun.auto-route: global` no longer loops meow's own traffic back
+  into the TUN** (issue #695). Two holes let outbound sockets escape the
+  `SO_BINDTODEVICE` outbound-interface binding. First, Hysteria2 bound
+  its QUIC socket with a raw `UdpSocket::bind`, so every Initial took
+  the split default routes back into the device and the dial timed out.
+  It now goes through `meow_common::bind_udp`. Second, the binding was
+  only installed when the TUN listener started, which is after the
+  config build's provider/geodata fetches, the startup geodata download,
+  health checks and DNS. A session one of those opened (QUIC, mux,
+  pooled DNS TCP) stayed unbound and looped once the routes went in. The
+  binding is now installed right after the config is parsed, before the
+  first dial, and handed to the TUN listener. The listener still clears
+  it on teardown, reload or a failed start. Startup without TUN or in
+  fake-ip scope is unchanged. A new `crate_invariants_test` guard (F5)
+  fails on any raw socket creation outside meow_common's chokepoints
+  unless it is allowlisted with a reason.
+
 - **Dead-marking a nested proxy-group member is no longer a dead write**
   (issue #681). `DialFailureTracker` escalation and probe sweeps record
   health on `member.health()`, but `Selector`/`Fallback`/`UrlTest`/

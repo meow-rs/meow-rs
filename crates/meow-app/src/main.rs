@@ -497,8 +497,15 @@ fn run_application_inner(
         .build()?;
 
     runtime.block_on(async move {
+        let early_binding: EarlyOutboundBinding;
         // --config-string replaces the config file as the source (mihomo
         // behavior); the flag overrides below apply on top of either source.
+        //
+        // Parse first and build second: the build is where startup network
+        // I/O begins (ECH pre-resolution, provider / geodata fetches), and a
+        // `tun.auto-route: global` config needs its outbound-interface
+        // binding in place before the first of those sockets exists
+        // (issue #695) — see `preinstall_global_route_binding`.
         let mut config = if let Some(ref cs) = args.config_string {
             use base64::Engine;
             let bytes = base64::engine::general_purpose::STANDARD
@@ -506,13 +513,19 @@ fn run_application_inner(
                 .map_err(|e| anyhow::anyhow!("--config-string: invalid base64: {e}"))?;
             let yaml = String::from_utf8(bytes)
                 .map_err(|e| anyhow::anyhow!("--config-string: invalid UTF-8: {e}"))?;
-            let config = meow_config::load_config_from_str(&yaml)
+            let raw = meow_config::parse_raw_yaml(&yaml)
+                .map_err(|e| anyhow::anyhow!("--config-string: {e}"))?;
+            early_binding = preinstall_global_route_binding(&raw);
+            let config = meow_config::build_config(raw, None)
                 .await
                 .map_err(|e| anyhow::anyhow!("--config-string: {e}"))?;
             info!("Config loaded from --config-string");
             config
         } else {
-            let config = load_config(&config_path).await?;
+            let raw = meow_config::load_raw_config(&config_path).await?;
+            early_binding = preinstall_global_route_binding(&raw);
+            let cache_dir = meow_config::resource_cache_dir_for_config_path(&config_path);
+            let config = meow_config::build_config(raw, Some(cache_dir.as_path())).await?;
             info!("Config loaded from {}", config_path);
             config
         };
@@ -534,8 +547,60 @@ fn run_application_inner(
             info!("External UI overridden by --ext-ui");
         }
 
-        run(config, config_path, log_tx, shutdown, on_ready).await
+        run(
+            config,
+            config_path,
+            log_tx,
+            shutdown,
+            on_ready,
+            early_binding,
+        )
+        .await
     })
+}
+
+/// Owner of the outbound-interface binding installed ahead of the config
+/// build (see [`preinstall_global_route_binding`]); handed to the TUN
+/// listener, which keeps it for as long as its routes exist.
+#[cfg(feature = "listener-tun")]
+type EarlyOutboundBinding = Option<meow_listener::OutboundBinding>;
+#[cfg(not(feature = "listener-tun"))]
+type EarlyOutboundBinding = Option<std::convert::Infallible>;
+
+/// Install the `tun.auto-route: global` outbound-interface binding before
+/// anything dials (issue #695).
+///
+/// The binding is per-socket and applied at creation, so any socket opened
+/// before it exists stays unbound for life: the config build's provider /
+/// geodata / ECH fetches, the startup geodata download, provider and
+/// subscription refreshes, health-check probes and DNS upstreams all run
+/// before the TUN listener comes up, and a session they leave open (QUIC,
+/// mux, pooled DNS TCP) re-enters the TUN as soon as the split default
+/// routes go in — looping until it times out. Installing here, between
+/// parsing the raw document and building it, precedes every one of those
+/// sockets; the TUN listener then adopts the binding instead of installing
+/// its own (`TunListener::with_outbound_binding`).
+///
+/// A no-op (`None`) unless the raw config selects an enabled TUN with
+/// `auto-route: global` — TUN-off and fake-IP-scope startups are untouched.
+/// An install failure is not fatal here: the listener retries before it
+/// touches any route and fails closed with the same error, exactly as
+/// before, and until then no global route exists for a socket to loop on.
+#[cfg(feature = "listener-tun")]
+fn preinstall_global_route_binding(raw: &meow_config::raw::RawConfig) -> EarlyOutboundBinding {
+    let iface = meow_config::global_route_outbound_interface(raw.tun.as_ref())?;
+    match meow_listener::OutboundBinding::install(iface.as_deref()) {
+        Ok(binding) => Some(binding),
+        Err(e) => {
+            tracing::debug!("early outbound-interface binding failed ({e}); TUN startup retries");
+            None
+        }
+    }
+}
+
+#[cfg(not(feature = "listener-tun"))]
+fn preinstall_global_route_binding(_raw: &meow_config::raw::RawConfig) -> EarlyOutboundBinding {
+    None
 }
 
 fn handle_service_command(cmd: &Command, args: &Args) -> Result<()> {
@@ -884,6 +949,7 @@ async fn run(
     log_tx: tokio::sync::broadcast::Sender<meow_api::log_stream::LogMessage>,
     shutdown: ShutdownSignal,
     on_ready: Option<ReadyCallback>,
+    early_binding: EarlyOutboundBinding,
 ) -> Result<()> {
     // Keep raw config in shared state for runtime mutations
     let raw_config = Arc::new(RwLock::new(config.raw.clone()));
@@ -1341,12 +1407,18 @@ async fn run(
             // Ready arm re-validates against the *committed* config.
             let startup_tun = config.tun.clone();
             let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-            let listener = TunListener::new(
+            let mut listener = TunListener::new(
                 tunnel.clone(),
                 tun_config_to_listener_config(&config.tun),
                 "meow-tun".to_string(),
             )
             .with_readiness_signal(ready_tx);
+            // The global-route binding installed before the config build
+            // moves into the listener, which clears it with its routes —
+            // or right away if startup fails (issue #695).
+            if let Some(binding) = early_binding {
+                listener = listener.with_outbound_binding(binding);
+            }
 
             let handle = tokio::spawn(async move {
                 if let Err(e) = listener.run().await {
@@ -1403,7 +1475,10 @@ async fn run(
             }
         }
         #[cfg(not(feature = "listener-tun"))]
-        warn!("tun.enable is set but this build lacks the 'listener-tun' feature");
+        {
+            let _ = early_binding;
+            warn!("tun.enable is set but this build lacks the 'listener-tun' feature");
+        }
     }
 
     if let Some(on_ready) = on_ready {
@@ -1839,6 +1914,58 @@ mod tests {
             );
 
             tunnel.stop_tun().await;
+        }
+    }
+
+    /// #695: the global-route binding is installed from the raw config,
+    /// ahead of the build's first dial, only for an enabled TUN in
+    /// `auto-route: global` — TUN-off and fake-IP startups never touch the
+    /// process-global registry.
+    #[cfg(all(feature = "listener-tun", target_os = "linux"))]
+    mod early_outbound_binding {
+        use crate::preinstall_global_route_binding;
+        use meow_config::raw::RawConfig;
+
+        fn raw(yaml: &str) -> RawConfig {
+            meow_config::parse_raw_yaml(yaml).unwrap()
+        }
+
+        /// One test drives every case because the registry is
+        /// process-global; separate `#[test]` fns would race each other.
+        #[test]
+        fn preinstalls_only_for_global_route_scope() {
+            assert!(meow_common::outbound_interface().is_none());
+
+            for yaml in [
+                "port: 7890\n",
+                "tun:\n  enable: false\n  auto-route: global\n  outbound-interface: lo\n",
+                "tun:\n  enable: true\n  outbound-interface: lo\n",
+                "tun:\n  enable: true\n  auto-route: true\n  outbound-interface: lo\n",
+                "tun:\n  enable: true\n  auto-route: fake-ip\n  outbound-interface: lo\n",
+                "tun:\n  enable: true\n  auto-route: false\n",
+                // Rejected later by `build_config`; never pre-installs.
+                "tun:\n  enable: true\n  auto-route: bogus\n  outbound-interface: lo\n",
+            ] {
+                assert!(
+                    preinstall_global_route_binding(&raw(yaml)).is_none(),
+                    "{yaml}"
+                );
+                assert!(meow_common::outbound_interface().is_none(), "{yaml}");
+            }
+
+            // A failed early install is not fatal (the listener retries and
+            // fails closed) and leaves nothing installed.
+            let missing = "tun:\n  enable: true\n  auto-route: global\n  \
+                           outbound-interface: no-such-iface-zz9\n";
+            assert!(preinstall_global_route_binding(&raw(missing)).is_none());
+            assert!(meow_common::outbound_interface().is_none());
+
+            let global = "tun:\n  enable: true\n  auto-route: global\n  outbound-interface: lo\n";
+            let binding = preinstall_global_route_binding(&raw(global))
+                .expect("global route scope pre-installs the binding");
+            assert_eq!(meow_common::outbound_interface().as_deref(), Some("lo"));
+            drop(binding);
+            assert!(meow_common::outbound_interface().is_none());
         }
     }
 }

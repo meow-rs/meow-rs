@@ -406,24 +406,9 @@ pub fn parse_tun_config(
         None => defaults.udp_timeout.as_secs(),
     });
 
-    // `auto-route` (#375): mihomo boolean, or a mode string selecting what
-    // gets routed. `true` keeps the loop-free v1 fake-IP scope.
-    let (auto_route, route_mode) = match r.auto_route.as_ref() {
-        None => (defaults.auto_route, defaults.route_mode),
-        Some(raw::RawAutoRoute::Enabled(on)) => (*on, TunRouteMode::FakeIp),
-        Some(raw::RawAutoRoute::Mode(s)) => match s.as_str() {
-            "fake-ip" => (true, TunRouteMode::FakeIp),
-            "global" => (true, TunRouteMode::Global),
-            other => {
-                return Err(anyhow::anyhow!(
-                    "tun.auto-route: unknown value '{other}' (expected true, false, \
-                     fake-ip, or global)"
-                ));
-            }
-        },
-    };
+    let (auto_route, route_mode) = parse_auto_route(r)?;
 
-    let outbound_interface = r.outbound_interface.clone().filter(|s| !s.is_empty());
+    let outbound_interface = raw_outbound_interface(r);
     if outbound_interface.is_some() && route_mode != TunRouteMode::Global {
         warn!(
             "tun.outbound-interface: only used with 'auto-route: global'; \
@@ -449,6 +434,52 @@ pub fn parse_tun_config(
         udp_timeout,
         max_connections: global_max_connections.unwrap_or(defaults.max_connections),
     })
+}
+
+/// `auto-route` (#375): mihomo boolean, or a mode string selecting what
+/// gets routed. `true` keeps the loop-free v1 fake-IP scope. Shared by
+/// [`parse_tun_config`] and [`global_route_outbound_interface`] so the two
+/// can never disagree on what selects global scope.
+fn parse_auto_route(r: &raw::RawTun) -> Result<(bool, TunRouteMode), anyhow::Error> {
+    let defaults = TunConfig::default();
+    Ok(match r.auto_route.as_ref() {
+        None => (defaults.auto_route, defaults.route_mode),
+        Some(raw::RawAutoRoute::Enabled(on)) => (*on, TunRouteMode::FakeIp),
+        Some(raw::RawAutoRoute::Mode(s)) => match s.as_str() {
+            "fake-ip" => (true, TunRouteMode::FakeIp),
+            "global" => (true, TunRouteMode::Global),
+            other => {
+                return Err(anyhow::anyhow!(
+                    "tun.auto-route: unknown value '{other}' (expected true, false, \
+                     fake-ip, or global)"
+                ));
+            }
+        },
+    })
+}
+
+/// `tun.outbound-interface` with the empty string normalised to "unset".
+fn raw_outbound_interface(r: &raw::RawTun) -> Option<String> {
+    r.outbound_interface.clone().filter(|s| !s.is_empty())
+}
+
+/// Whether `raw` selects an enabled TUN with `auto-route: global`, and if
+/// so the configured `outbound-interface` (`Some(None)` = auto-detect).
+/// `None` for a disabled TUN, fake-IP scope, `auto-route: false`, or a
+/// section [`parse_tun_config`] would reject.
+///
+/// Side-effect free — no validation warnings — so the binary can call it
+/// on the raw document *before* [`build_config`] to install the outbound
+/// interface binding ahead of the first startup dial (issue #695): a
+/// socket created before the binding exists stays unbound and loops into
+/// the TUN once its split default routes go in. [`parse_tun_config`] stays
+/// the authoritative validator and runs later in [`build_config`].
+pub fn global_route_outbound_interface(raw: Option<&raw::RawTun>) -> Option<Option<String>> {
+    let r = raw.filter(|r| r.enable)?;
+    match parse_auto_route(r) {
+        Ok((true, TunRouteMode::Global)) => Some(raw_outbound_interface(r)),
+        _ => None,
+    }
 }
 
 pub struct ListenerConfig {
@@ -510,6 +541,17 @@ pub fn external_plugins_allowed() -> bool {
 }
 
 pub async fn load_config(path: &str) -> Result<Config, anyhow::Error> {
+    let raw = load_raw_config(path).await?;
+    let cache_dir = resource_cache_dir_for_config_path(path);
+    build_config(raw, Some(cache_dir.as_path())).await
+}
+
+/// Read and parse the config file at `path` into a [`raw::RawConfig`]
+/// without building it — no network I/O. [`load_config`] is this followed
+/// by [`build_config`]; the binary splits the two so it can act on the raw
+/// document (the TUN global-route interface binding, issue #695) before
+/// the build's provider / geodata / ECH fetches open their first socket.
+pub async fn load_raw_config(path: &str) -> Result<raw::RawConfig, anyhow::Error> {
     let bytes = tokio::fs::read(path)
         .await
         .map_err(|e| anyhow::anyhow!("failed to read config file {path}: {e}"))?;
@@ -524,9 +566,7 @@ pub async fn load_config(path: &str) -> Result<Config, anyhow::Error> {
             e.valid_up_to()
         )
     })?;
-    let raw: raw::RawConfig = parse_raw_yaml(content)?;
-    let cache_dir = resource_cache_dir_for_config_path(path);
-    build_config(raw, Some(cache_dir.as_path())).await
+    parse_raw_yaml(content)
 }
 
 pub async fn load_config_from_str(content: &str) -> Result<Config, anyhow::Error> {
@@ -3581,7 +3621,13 @@ fn build_named_listeners(
     Ok(result)
 }
 
-async fn build_config(
+/// Build a runnable [`Config`] from an already-parsed raw document. This is
+/// where startup network I/O happens (ECH pre-resolution, proxy-provider
+/// and rule-provider fetches, geodata downloads). `cache_dir` is the
+/// resource cache for provider/geodata files — pass
+/// [`resource_cache_dir_for_config_path`] of the config file, or `None`
+/// for a document with no backing file (`--config-string`).
+pub async fn build_config(
     mut raw: raw::RawConfig,
     cache_dir: Option<&Path>,
 ) -> Result<Config, anyhow::Error> {

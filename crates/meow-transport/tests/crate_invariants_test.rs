@@ -1,4 +1,5 @@
-//! Structural guardrail tests — cases F1..F4 from the transport-layer test plan.
+//! Structural guardrail tests — cases F1..F4 from the transport-layer test plan,
+//! plus F5, the workspace-wide outbound-socket chokepoint guard (issue #695).
 //!
 //! These tests enforce ADR-0001 crate boundary invariants mechanically so that
 //! PR reviewers see failing *tests* (not just a lint warning) when an invariant
@@ -159,7 +160,7 @@ fn test_only_lines(path: &std::path::Path, content: &str) -> HashSet<usize> {
     let mut i = 0;
 
     while i < lines.len() {
-        if !is_cfg_test_attr(lines[i]) {
+        if !opens_cfg_test_attr(&lines, i) {
             i += 1;
             continue;
         }
@@ -206,6 +207,23 @@ fn test_only_lines(path: &std::path::Path, content: &str) -> HashSet<usize> {
     }
 
     test_only
+}
+
+/// Whether the attribute opening at `lines[i]` is a `#[cfg(test)]`-family
+/// attribute ([`is_cfg_test_attr`]), joining one that rustfmt split across
+/// lines (`#[cfg(all(` / `    test,` / `    target_os = "linux"` / `))]`).
+fn opens_cfg_test_attr(lines: &[&str], i: usize) -> bool {
+    if !lines[i].trim_start().starts_with("#[cfg(") {
+        return false;
+    }
+    let mut joined = String::new();
+    for line in &lines[i..] {
+        joined.extend(line.chars().filter(|c| !c.is_whitespace()));
+        if joined.contains(']') {
+            break;
+        }
+    }
+    is_cfg_test_attr(&joined)
 }
 
 /// Whether `line` opens a `#[cfg(test)]` (or `all(test, …)` / `any(test, …)`)
@@ -370,6 +388,22 @@ mod tests {
 }
 
 #[test]
+fn cfg_test_span_covers_a_multi_line_attribute() {
+    let src = "\
+fn client() {}
+#[cfg(all(
+    test,
+    target_os = \"linux\"
+))]
+mod tests {
+    fn f() {}
+}
+";
+    let span = test_only_lines(std::path::Path::new("<memory>"), src);
+    assert_eq!(span, (1..8).collect::<HashSet<usize>>());
+}
+
+#[test]
 fn non_test_cfg_attributes_are_not_exempt() {
     let src = "\
 #[cfg(feature = \"test-utils\")]
@@ -462,4 +496,469 @@ fn no_anyhow_at_boundary() {
          TransportError is the only error type allowed at the crate boundary:\n{}",
         violations.join("\n")
     );
+}
+
+// ─── F5: outbound sockets go through meow_common's chokepoints (#695) ───────
+
+/// Raw socket-creation primitives. Production code must create outbound
+/// sockets through `meow_common::{connect_tcp, connect_tcp_host, bind_udp}`
+/// (or the DNS `SocketFactory`, which wraps them): only those apply the TUN
+/// global-route interface binding (`SO_BINDTODEVICE`) and the Android
+/// `protect()` hook. A raw socket escapes both and, under
+/// `tun.auto-route: global`, loops back into the TUN (issue #695 — the
+/// Hysteria2 QUIC socket was one).
+const RAW_SOCKET_PRIMITIVES: &[&str] = &[
+    "UdpSocket::bind(",
+    "TcpStream::connect(",
+    "TcpStream::connect_timeout(",
+    "TcpSocket::new(",
+    "TcpSocket::new_v4(",
+    "TcpSocket::new_v6(",
+    "Socket::new(",
+    "Socket::new_raw(",
+    "libc::socket(",
+];
+
+/// Production raw-socket sites that are correct as they are:
+/// `(path from the workspace root, primitive, exact count, why)`. The count
+/// is exact so a *new* raw call in an allowlisted file still fails, and a
+/// removed one forces the entry to be trimmed.
+const RAW_SOCKET_ALLOWLIST: &[(&str, &str, usize, &str)] = &[
+    // The chokepoints themselves.
+    (
+        "crates/meow-common/src/socket_protect.rs",
+        "Socket::new(",
+        4,
+        "the chokepoints: Android protect() + SO_BINDTODEVICE paths",
+    ),
+    (
+        "crates/meow-common/src/socket_protect.rs",
+        "TcpStream::connect(",
+        1,
+        "connect_tcp's fall-through when no binding/protector is installed",
+    ),
+    (
+        "crates/meow-common/src/socket_protect.rs",
+        "UdpSocket::bind(",
+        1,
+        "bind_udp's fall-through when no binding/protector is installed",
+    ),
+    (
+        "crates/meow-proxy/src/direct.rs",
+        "Socket::new(",
+        1,
+        "routing-mark dial; applies meow_common::apply_outbound_interface itself",
+    ),
+    // Vendored anytls: its own protect helper and its server side.
+    (
+        "crates/meow-anytls/src/util/socket_protect.rs",
+        "Socket::new(",
+        2,
+        "anytls protect helper (Android); session dials go through meow's \
+         DialBridge (meow-proxy anytls_adapter.rs install_anytls_bridges)",
+    ),
+    (
+        "crates/meow-anytls/src/util/socket_protect.rs",
+        "TcpStream::connect(",
+        1,
+        "fallback only when no TcpDialer is installed; meow installs \
+         DialBridge -> meow_common::connect_tcp_host before any dial",
+    ),
+    (
+        "crates/meow-anytls/src/util/socket_protect.rs",
+        "UdpSocket::bind(",
+        1,
+        "only reached via UdpClient::create_udp_proxy, which meow never calls",
+    ),
+    (
+        "crates/meow-anytls/src/server/handler.rs",
+        "TcpStream::connect(",
+        1,
+        "anytls server side; meow only runs it in tests",
+    ),
+    (
+        "crates/meow-anytls/src/server/udp_proxy.rs",
+        "UdpSocket::bind(",
+        1,
+        "anytls server side; meow only runs it in tests",
+    ),
+    // Not outbound: inbound listeners and client-facing reply sockets.
+    (
+        "crates/meow-dns/src/client.rs",
+        "UdpSocket::bind(",
+        1,
+        "loopback upstream: bound to 127.0.0.1/::1, never routed into the TUN, \
+         and must not be bound to the physical interface",
+    ),
+    (
+        "crates/meow-dns/src/server.rs",
+        "UdpSocket::bind(",
+        1,
+        "inbound DNS listener",
+    ),
+    (
+        "crates/meow-listener/src/socks5_udp.rs",
+        "UdpSocket::bind(",
+        1,
+        "inbound SOCKS5 UDP relay socket facing the client",
+    ),
+    (
+        "crates/meow-listener/src/tproxy/udp.rs",
+        "libc::socket(",
+        1,
+        "IP_TRANSPARENT reply socket towards the inbound client",
+    ),
+    (
+        "crates/meow-listener/src/tun/local_dns.rs",
+        "UdpSocket::bind(",
+        2,
+        "loopback DNS listener (127.0.0.1:53 / [::1]:53)",
+    ),
+    (
+        "crates/meow-app/src/arp.rs",
+        "libc::socket(",
+        1,
+        "AF_PACKET ARP frame on an explicit interface; not IP-routed",
+    ),
+];
+
+/// No production source in the workspace creates an outbound socket with a
+/// raw primitive outside [`RAW_SOCKET_ALLOWLIST`]. `#[cfg(test)]` items and
+/// files whose `mod` declaration is `#[cfg(test)]`-gated are test
+/// scaffolding and exempt; `meow-bench` is a standalone benchmark tool, not
+/// part of the shipped binary.
+#[test]
+fn outbound_sockets_use_meow_common_chokepoints() {
+    let Some(root) = workspace_root() else {
+        eprintln!("workspace sources not available — skipping the F5 socket scan");
+        return;
+    };
+
+    let mut sources: Vec<(std::path::PathBuf, String)> = Vec::new();
+    let mut crates: Vec<_> = std::fs::read_dir(root.join("crates"))
+        .expect("read crates/")
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir() && !p.ends_with("meow-bench"))
+        .collect();
+    crates.sort();
+    for krate in &crates {
+        // `rust/` is meow-lwip's source root.
+        for dir in ["src", "rust"] {
+            walk_rs_files(&krate.join(dir), &mut |path, content| {
+                sources.push((path.to_path_buf(), content.to_owned()));
+            });
+        }
+    }
+    assert!(
+        sources.len() > 100,
+        "F5 found only {} source files under {} — the scan is not looking \
+         where the code is",
+        sources.len(),
+        root.display()
+    );
+
+    let sources: Vec<Source> = sources
+        .into_iter()
+        .map(|(path, raw)| Source {
+            code: blank_literals_and_comments(&raw),
+            path,
+            raw,
+        })
+        .collect();
+    let test_files = test_only_module_files(&sources);
+    let mut counts: std::collections::BTreeMap<(String, &str), Vec<usize>> = Default::default();
+    for src in &sources {
+        if test_files.contains(&src.path) {
+            continue;
+        }
+        let rel = src
+            .path
+            .strip_prefix(&root)
+            .unwrap_or(&src.path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let test_only = test_only_lines(&src.path, &src.code);
+        for (line_no, code) in src.code.lines().enumerate() {
+            if test_only.contains(&line_no) {
+                continue;
+            }
+            for &prim in RAW_SOCKET_PRIMITIVES {
+                let hits = find_path_calls(code, prim).count();
+                if hits > 0 {
+                    counts
+                        .entry((rel.clone(), prim))
+                        .or_default()
+                        .extend(std::iter::repeat_n(line_no + 1, hits));
+                }
+            }
+        }
+    }
+
+    let mut problems = Vec::new();
+    for ((file, prim), lines) in &counts {
+        let allowed = RAW_SOCKET_ALLOWLIST
+            .iter()
+            .find(|(f, p, _, _)| *f == file.as_str() && p == prim)
+            .map_or(0, |(_, _, n, _)| *n);
+        if lines.len() > allowed {
+            problems.push(format!(
+                "{file}: {} raw `{prim}…)` call(s) at line(s) {lines:?}, {allowed} \
+                 allowlisted — create outbound sockets with meow_common::connect_tcp / \
+                 connect_tcp_host / bind_udp instead (TUN global-route binding + \
+                 Android protect, issue #695); if the socket is not outbound, \
+                 allowlist it with the reason",
+                lines.len()
+            ));
+        }
+    }
+    for (file, prim, n, _) in RAW_SOCKET_ALLOWLIST {
+        let found = counts.get(&((*file).to_owned(), *prim)).map_or(0, Vec::len);
+        if found < *n {
+            problems.push(format!(
+                "stale allowlist entry: {file} `{prim}…)` expects {n}, found {found} — \
+                 lower the count or drop the entry"
+            ));
+        }
+    }
+    assert!(
+        problems.is_empty(),
+        "raw outbound socket creation outside meow_common's chokepoints:\n{}",
+        problems.join("\n")
+    );
+}
+
+/// One scanned source file: `raw` as read, `code` with every comment and
+/// literal blanked ([`blank_literals_and_comments`]) — same line layout.
+struct Source {
+    path: std::path::PathBuf,
+    raw: String,
+    code: String,
+}
+
+/// `content` with every comment and string/char literal blanked to spaces,
+/// newlines kept so line numbers survive. Whole-file, unlike the per-line
+/// [`strip_literals_and_comments`]: workspace sources carry multi-line
+/// literals (YAML fixtures, `\`-continued messages) whose braces would
+/// derail the `#[cfg(test)]` span tracking, and block comments whose prose
+/// would read as code.
+fn blank_literals_and_comments(content: &str) -> String {
+    let chars: Vec<char> = content.chars().collect();
+    let mut out = String::with_capacity(content.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let next = chars.get(i + 1).copied();
+        let end = match chars[i] {
+            '/' if next == Some('/') => Some(
+                chars[i..]
+                    .iter()
+                    .position(|&c| c == '\n')
+                    .map_or(chars.len(), |p| i + p),
+            ),
+            '/' if next == Some('*') => Some(block_comment_end(&chars, i)),
+            'r' if matches!(next, Some('"' | '#')) => raw_string_end(&chars, i),
+            '"' => Some(string_end(&chars, i)),
+            '\'' => char_literal_end(&chars, i),
+            _ => None,
+        };
+        if let Some(end) = end {
+            out.extend(
+                chars[i..end]
+                    .iter()
+                    .map(|&c| if c == '\n' { '\n' } else { ' ' }),
+            );
+            i = end;
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// End index (exclusive) of the (possibly nested) block comment opening at
+/// `start`.
+fn block_comment_end(chars: &[char], start: usize) -> usize {
+    let mut depth = 0usize;
+    let mut i = start;
+    while i + 1 < chars.len() {
+        match (chars[i], chars[i + 1]) {
+            ('/', '*') => {
+                depth += 1;
+                i += 2;
+            }
+            ('*', '/') => {
+                depth -= 1;
+                i += 2;
+                if depth == 0 {
+                    return i;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    chars.len()
+}
+
+/// The workspace root, or `None` when this test runs from a packaged crate
+/// with no sibling sources.
+fn workspace_root() -> Option<std::path::PathBuf> {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    root.join("crates/meow-common/src/socket_protect.rs")
+        .is_file()
+        .then(|| root.canonicalize().unwrap_or(root))
+}
+
+/// Byte offsets of `prim` in `code` where it starts a path segment — i.e.
+/// not the tail of a longer identifier (`PacketConnSocket::new(` is not
+/// `Socket::new(`).
+fn find_path_calls<'a>(code: &'a str, prim: &'a str) -> impl Iterator<Item = usize> + 'a {
+    code.match_indices(prim).filter_map(move |(at, _)| {
+        let prev = code[..at].chars().next_back();
+        (!prev.is_some_and(|c| c.is_alphanumeric() || c == '_')).then_some(at)
+    })
+}
+
+/// Files compiled only into test builds: the targets of
+/// `#[cfg(test)] mod x;` declarations (honouring `#[path = "…"]`), and
+/// every out-of-line module declared inside such a file.
+fn test_only_module_files(sources: &[Source]) -> HashSet<std::path::PathBuf> {
+    let mut test_files: HashSet<std::path::PathBuf> = HashSet::new();
+    for src in sources {
+        test_files.extend(mod_decl_files(src, true));
+    }
+    loop {
+        let mut grown = false;
+        for src in sources {
+            if test_files.contains(&src.path) {
+                for child in mod_decl_files(src, false) {
+                    grown |= test_files.insert(child);
+                }
+            }
+        }
+        if !grown {
+            return test_files;
+        }
+    }
+}
+
+/// Resolved files of the out-of-line `mod x;` declarations in `src` (only
+/// the `#[cfg(test)]`-gated ones when `test_gated_only`).
+fn mod_decl_files(src: &Source, test_gated_only: bool) -> Vec<std::path::PathBuf> {
+    let path = src.path.as_path();
+    let dir = path.parent().unwrap_or(std::path::Path::new("."));
+    let is_mod_rs = matches!(
+        path.file_name().and_then(|n| n.to_str()),
+        Some("mod.rs" | "lib.rs" | "main.rs")
+    );
+    let mod_dir = if is_mod_rs {
+        dir.to_path_buf()
+    } else {
+        dir.join(path.file_stem().unwrap_or_default())
+    };
+    let test_only = test_only_lines(path, &src.code);
+    let mut path_attr: Option<String> = None;
+    let mut out = Vec::new();
+    for (line_no, (raw, code)) in src.raw.lines().zip(src.code.lines()).enumerate() {
+        if test_gated_only && !test_only.contains(&line_no) {
+            path_attr = None;
+            continue;
+        }
+        let trimmed = code.trim();
+        if trimmed.starts_with("#[path") {
+            // The literal is blanked in `code`; read it from the raw line.
+            path_attr = raw.split('"').nth(1).map(str::to_owned);
+            continue;
+        }
+        let Some((vis, name)) = trimmed
+            .strip_suffix(';')
+            .and_then(|decl| decl.rsplit_once("mod "))
+        else {
+            if !trimmed.starts_with("#[") {
+                path_attr = None;
+            }
+            continue;
+        };
+        let vis = vis.trim();
+        if !(vis.is_empty() || vis.starts_with("pub"))
+            || name.is_empty()
+            || !name.chars().all(|c| c.is_alphanumeric() || c == '_')
+        {
+            path_attr = None;
+            continue;
+        }
+        // Rust reference: a non-inline `#[path]` is relative to the
+        // declaring file's directory; otherwise `<mod dir>/x.rs` or
+        // `<mod dir>/x/mod.rs`.
+        let file = match path_attr.take() {
+            Some(p) => dir.join(p),
+            None => {
+                let flat = mod_dir.join(format!("{name}.rs"));
+                if flat.is_file() {
+                    flat
+                } else {
+                    mod_dir.join(name).join("mod.rs")
+                }
+            }
+        };
+        out.push(file.canonicalize().unwrap_or(file));
+    }
+    out
+}
+
+// ─── F5 helper self-tests ────────────────────────────────────────────────────
+
+#[test]
+fn blanking_spans_multi_line_literals_and_block_comments() {
+    let src = "let a = \"{\n}\";\n/* x {\n /* y */ } */ let b = r#\"\n{\"#;\nUdpSocket::bind(x)\n";
+    let code = blank_literals_and_comments(src);
+    assert_eq!(
+        code.lines().count(),
+        src.lines().count(),
+        "line layout kept"
+    );
+    assert!(!code.contains('{') && !code.contains('}'), "{code:?}");
+    assert!(
+        code.contains("let b ="),
+        "code after a nested block comment survives"
+    );
+    assert_eq!(code.lines().last(), Some("UdpSocket::bind(x)"));
+}
+
+#[test]
+fn raw_primitive_match_respects_identifier_boundaries() {
+    let hits = |code: &str| find_path_calls(code, "Socket::new(").count();
+    assert_eq!(hits("let s = socket2::Socket::new(d, t, p)?;"), 1);
+    assert_eq!(hits("let s = Socket::new(d, t, p)?;"), 1);
+    assert_eq!(hits("Box::new(PacketConnSocket::new(conn, remote))"), 0);
+    assert_eq!(hits("let s = TcpSocket::new(d)?;"), 0);
+}
+
+#[test]
+fn test_gated_mod_declarations_resolve_to_files() {
+    let dir = std::path::Path::new("/ws/crates/x/src/proto");
+    let src = "\
+mod live;
+#[cfg(test)]
+#[path = \"driver_tests.rs\"]
+mod tests;
+#[cfg(test)]
+pub(crate) mod support;
+";
+    let source = |file: &str| Source {
+        path: dir.join(file),
+        raw: src.to_owned(),
+        code: blank_literals_and_comments(src),
+    };
+    let gated = mod_decl_files(&source("driver.rs"), true);
+    assert_eq!(
+        gated,
+        vec![
+            dir.join("driver_tests.rs"),
+            dir.join("driver").join("support").join("mod.rs"),
+        ]
+    );
+    let all = mod_decl_files(&source("mod.rs"), false);
+    assert_eq!(all.len(), 3);
+    assert_eq!(all[0], dir.join("live").join("mod.rs"));
 }

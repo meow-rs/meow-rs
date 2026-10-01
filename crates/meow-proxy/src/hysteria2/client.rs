@@ -10,7 +10,6 @@ use super::udp::UdpSession;
 use super::{Error, Result};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
-use tokio::net::UdpSocket;
 use tokio::sync::{oneshot, Mutex};
 use tokio::time::{timeout, Duration};
 
@@ -142,7 +141,12 @@ async fn connect_addr(
     } else {
         SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
     };
-    let socket = UdpSocket::bind(bind_addr).await.map_err(Error::Io)?;
+    // Through the outbound-socket chokepoint, never a raw bind: it applies
+    // the TUN global-route interface binding (`SO_BINDTODEVICE`) and the
+    // Android `protect()` hook before the first QUIC Initial leaves —
+    // otherwise the datagrams follow the TUN's split default routes back
+    // into the device and loop (issue #695).
+    let socket = meow_common::bind_udp(bind_addr).await.map_err(Error::Io)?;
     let local = socket.local_addr().map_err(Error::Io)?;
 
     let mut config = super::tls::build_quiche_config(cfg)?;
