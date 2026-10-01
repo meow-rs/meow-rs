@@ -11,9 +11,14 @@
 //! lwIP's accept hook runs only after the TCP handshake, so a SYN-only
 //! packet never becomes a `TcpStream`. PCB / window / heap caps live in
 //! that crate's `lwipopts.h` (`MEMP_NUM_TCP_PCB`, `TCP_WND`, `MEM_SIZE`).
-//! We still wait for the first payload byte before rule-match / stats /
-//! DIRECT — empty ESTABLISHED sockets (Office reconnects) never enter
-//! `handle_tcp`.
+//! An accepted flow then gets a short sniff window (`TUN_SNIFF_WINDOW`,
+//! 200 ms) for the client's first bytes, which are replayed upstream as
+//! the relay prefix. A flow that closes or resets inside the window
+//! (connect scans, aborted reconnects) is dropped before rule-match /
+//! stats / dial. A flow that stays silent is dialed anyway with an empty
+//! prefix: server-first protocols (SMTP, POP3, IMAP, FTP, MySQL, VNC,
+//! SSH) wait for the server's banner and would otherwise never get one
+//! (#695).
 //!
 //! ## Loop freedom (v1: fake-IP-scoped capture)
 //!
@@ -73,10 +78,19 @@ use tokio::sync::Semaphore;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
-/// How long a TUN TCP socket may sit after the handshake with no payload
-/// before we drop it. SYN scans and half-open reconnects never become
-/// meow connections.
-const TUN_PAYLOAD_WAIT: Duration = crate::DEFAULT_HANDSHAKE_TIMEOUT;
+/// Post-handshake sniff window: how long an accepted TUN TCP flow may stay
+/// silent before it is dialed anyway with an empty prefix (#695).
+///
+/// Server-first clients (SMTP, POP3, IMAP, FTP, MySQL, VNC, SSH) send
+/// nothing until they see the server's banner, so they pay this window
+/// once before the dial — it must stay well under a second. 200 ms is
+/// mihomo's pre-dial peek window (`tunnel/tunnel.go` `handleTCPConn`:
+/// `SetReadDeadline(now + 200ms)` + `Peek(1)`, deadline error ignored).
+/// A client-first flow's first segment normally follows the handshake ACK
+/// back-to-back and lands well inside it; one that misses the window just
+/// relays its bytes without a prefix — the prefix takes no part in
+/// routing, so nothing else changes.
+const TUN_SNIFF_WINDOW: Duration = Duration::from_millis(200);
 /// First-read size when waiting for real traffic. Large enough to pull a
 /// TLS ClientHello record header + a bit of payload in one shot.
 const TUN_FIRST_READ: usize = 256;
@@ -774,11 +788,22 @@ impl TunListener {
                         let warned = Arc::clone(&warned_saturated);
                         tasks.spawn(async move {
                             // lwIP only delivers this stream after the
-                            // handshake. We still wait for the first payload
-                            // before taking a max-connections slot / dialing.
+                            // handshake. Sniff the client's first bytes for
+                            // up to TUN_SNIFF_WINDOW; a close/reset inside
+                            // the window drops the flow, silence dials it
+                            // with an empty prefix (server-first, #695).
                             let mut stream = stream;
-                            let prefix = match wait_for_first_payload(&mut stream).await {
-                                Ok(p) => p,
+                            let prefix = match sniff_first_payload(&mut stream).await {
+                                Ok(p) => {
+                                    if p.is_empty() {
+                                        debug!(
+                                            "tun TCP: {src} -> {dst} silent for {}ms, \
+                                             dialing without prefix",
+                                            TUN_SNIFF_WINDOW.as_millis()
+                                        );
+                                    }
+                                    p
+                                }
                                 Err(e) => {
                                     debug!(
                                         "tun TCP: dropping {src} -> {dst} before payload: {e}"
@@ -786,13 +811,21 @@ impl TunListener {
                                     return;
                                 }
                             };
+                            // A slot is taken only once the flow leaves the
+                            // sniff window (payload seen, or silent past it),
+                            // so a flow that dies inside the window never
+                            // occupies one. Past the window every flow —
+                            // including an idle server-first one — holds its
+                            // slot for its lifetime, exactly as on the other
+                            // inbounds. Flows queued here at saturation are
+                            // bounded by lwIP's MEMP_NUM_TCP_PCB.
                             let permit = if let Some(sem) = sem {
                                 if sem.available_permits() == 0
                                     && !warned.swap(true, Ordering::Relaxed)
                                 {
                                     warn!(
                                         "TUN listener '{name}' saturated at max-connections; \
-                                         payload-ready flows will wait"
+                                         new flows will wait for a free slot before dialing"
                                     );
                                 }
                                 match Arc::clone(&sem).acquire_owned().await {
@@ -876,20 +909,33 @@ fn pump_error(direction: &str, joined: Result<io::Result<()>, tokio::task::JoinE
     }
 }
 
-/// Wait until the client sends at least one payload byte (handshake is
-/// already done by lwIP). Times out empty ESTABLISHED sockets.
-async fn wait_for_first_payload(tcp: &mut lwip::TcpStream) -> io::Result<Vec<u8>> {
-    wait_for_first_payload_timed(tcp, TUN_PAYLOAD_WAIT).await
+/// Sniff the client's first payload within [`TUN_SNIFF_WINDOW`] (the
+/// handshake is already done by lwIP).
+///
+/// - `Ok(bytes)` — the client spoke first; `bytes` is the relay prefix.
+/// - `Ok(empty)` — the window expired in silence: dial anyway, the server
+///   may be the one to speak first (#695). No allocation is kept.
+/// - `Err(_)` — EOF or reset before any payload: drop the flow.
+async fn sniff_first_payload<R>(tcp: &mut R) -> io::Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    sniff_first_payload_within(tcp, TUN_SNIFF_WINDOW).await
 }
 
-async fn wait_for_first_payload_timed<R>(tcp: &mut R, wait: Duration) -> io::Result<Vec<u8>>
+/// [`sniff_first_payload`] with an explicit window. The stream stays usable
+/// after the window expires: lwIP's `TcpStream::poll_read` only consumes a
+/// chunk on the poll that returns it, so dropping the pending read loses
+/// nothing — the relay picks up whatever arrives later.
+async fn sniff_first_payload_within<R>(tcp: &mut R, window: Duration) -> io::Result<Vec<u8>>
 where
     R: AsyncRead + Unpin,
 {
     let mut buf = vec![0u8; TUN_FIRST_READ];
-    let n = timeout(wait, tcp.read(&mut buf))
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "no payload after TCP handshake"))??;
+    let Ok(read) = timeout(window, tcp.read(&mut buf)).await else {
+        return Ok(Vec::new());
+    };
+    let n = read?;
     if n == 0 {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
@@ -920,8 +966,12 @@ async fn handle_tcp_flow(
     };
 
     // handle_tcp does the rest: fake-IP rewrite, lazy rule match, stats
-    // guard, dial, zero-alloc relay. `prefix` is the first payload already
-    // read while waiting for real traffic.
+    // guard, dial, zero-alloc relay. `prefix` is the first payload read
+    // during the sniff window; it reaches the upstream as the relay's first
+    // client read (counted as upload there). It is empty for a flow that
+    // stayed silent (server-first): `TunTcpConn` then reads straight from
+    // the stream and nothing is written upstream until a side speaks — no
+    // zero-length write, no synthetic EOF.
     meow_tunnel::tcp::handle_tcp(
         tunnel.inner(),
         Box::new(TunTcpConn {
@@ -934,8 +984,8 @@ async fn handle_tcp_flow(
     .await;
 }
 
-/// Netstack TCP stream plus the bytes already consumed while waiting for
-/// the first payload. The inner stream sits in a `Mutex` so the type is
+/// Netstack TCP stream plus the bytes already consumed during the sniff
+/// window (possibly none). The inner stream sits in a `Mutex` so the type is
 /// `Sync` (`ProxyConn` requires it); lwIP's `TcpStream` is `Send` but not
 /// `Sync`. Only one task ever polls a given connection.
 struct TunTcpConn<S> {
@@ -1007,10 +1057,15 @@ impl<S: AsyncRead + AsyncWrite + Send + Sync + Unpin> ProxyConn for TunTcpConn<S
 
 #[cfg(test)]
 mod tests {
-    use super::{device_name_for_attempt, wait_for_first_payload_timed, TunTcpConn};
+    use super::{
+        device_name_for_attempt, sniff_first_payload, sniff_first_payload_within, TunTcpConn,
+        TUN_SNIFF_WINDOW,
+    };
     use std::io;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
     use std::time::Duration;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
 
     #[cfg(target_os = "macos")]
     #[test]
@@ -1045,36 +1100,106 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn wait_for_payload_returns_first_bytes() {
+    #[test]
+    fn sniff_window_is_short_enough_for_server_first_banners() {
+        // #695: a server-first client (SMTP/IMAP/FTP/MySQL/SSH) waits this
+        // long for its banner on every connect. Keep it on mihomo's
+        // pre-dial peek (200 ms), never back up toward the 15 s handshake
+        // timeout that used to drop these flows.
+        assert_eq!(TUN_SNIFF_WINDOW, Duration::from_millis(200));
+        assert!(TUN_SNIFF_WINDOW < crate::DEFAULT_HANDSHAKE_TIMEOUT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sniff_returns_client_first_payload_inside_window() {
         let (mut client, mut server) = tokio::io::duplex(64);
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            // Late but inside the production window.
+            tokio::time::sleep(TUN_SNIFF_WINDOW - Duration::from_millis(50)).await;
             server.write_all(b"GET /").await.unwrap();
+            // Keep the peer open so the read sees data, not EOF.
+            std::future::pending::<()>().await;
         });
-        let got = wait_for_first_payload_timed(&mut client, Duration::from_secs(1))
-            .await
-            .expect("payload");
+        let got = sniff_first_payload(&mut client).await.expect("payload");
         assert_eq!(got, b"GET /");
     }
 
-    #[tokio::test]
-    async fn wait_for_payload_times_out_without_data() {
-        let (mut client, _server) = tokio::io::duplex(64);
-        let err = wait_for_first_payload_timed(&mut client, Duration::from_millis(20))
+    #[tokio::test(start_paused = true)]
+    async fn sniff_window_expiry_dials_with_empty_prefix() {
+        // Server-first flow (#695): the client stays silent until it sees
+        // a banner. Window expiry must proceed (empty prefix), not drop.
+        let (mut client, mut server) = tokio::io::duplex(64);
+        let start = tokio::time::Instant::now();
+        let got = sniff_first_payload(&mut client)
             .await
-            .expect_err("syn-only");
-        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+            .expect("silence past the window proceeds instead of dropping");
+        assert!(got.is_empty(), "no prefix for a silent flow");
+        assert_eq!(got.capacity(), 0, "the scratch buffer is not kept");
+        // Proceeds right at the window (paused clock; the timer wheel may
+        // round the deadline up by a tick).
+        let waited = start.elapsed();
+        assert!(
+            waited >= TUN_SNIFF_WINDOW && waited < TUN_SNIFF_WINDOW + Duration::from_millis(5),
+            "waited {waited:?}"
+        );
+
+        // The abandoned read lost nothing: the client's reply to the
+        // banner arrives after the window and the relay side reads it
+        // through the (prefix-less) TunTcpConn.
+        let mut conn = TunTcpConn {
+            prefix: got,
+            pos: 0,
+            inner: std::sync::Mutex::new(client),
+        };
+        server.write_all(b"EHLO meow\r\n").await.unwrap();
+        let mut buf = [0u8; 32];
+        let n = conn.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"EHLO meow\r\n");
     }
 
     #[tokio::test]
-    async fn wait_for_payload_eof_before_data_is_an_error() {
+    async fn sniff_eof_before_payload_drops_the_flow() {
         let (mut client, server) = tokio::io::duplex(64);
         drop(server);
-        let err = wait_for_first_payload_timed(&mut client, Duration::from_secs(1))
+        let err = sniff_first_payload_within(&mut client, Duration::from_secs(5))
             .await
             .expect_err("eof");
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[tokio::test]
+    async fn sniff_reset_before_payload_drops_the_flow() {
+        // lwIP surfaces an RST (tcp_err_cb) as a read error.
+        struct Reset;
+        impl AsyncRead for Reset {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()))
+            }
+        }
+        let err = sniff_first_payload_within(&mut Reset, Duration::from_secs(5))
+            .await
+            .expect_err("reset");
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn empty_prefix_waits_for_inner_instead_of_reporting_eof() {
+        // An empty prefix must not surface as a zero-length read — the
+        // relay would take that as client EOF and half-close upstream
+        // before the server's banner arrives.
+        let (client, _server) = tokio::io::duplex(64);
+        let mut conn = TunTcpConn {
+            prefix: Vec::new(),
+            pos: 0,
+            inner: std::sync::Mutex::new(client),
+        };
+        let mut buf = [0u8; 8];
+        let pending = tokio::time::timeout(Duration::from_secs(30), conn.read(&mut buf)).await;
+        assert!(pending.is_err(), "read must pend, got {pending:?}");
     }
 
     #[tokio::test]

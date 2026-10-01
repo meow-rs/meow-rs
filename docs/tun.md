@@ -1,6 +1,6 @@
 # TUN inbound — transparent proxy on Windows (and everywhere else)
 
-Last updated: 2026-08-17. Tracks the `listener-tun` feature (issue
+Last updated: 2026-10-01. Tracks the `listener-tun` feature (issue
 [#326](https://github.com/madeye/meow-rs/issues/326)).
 Audience: users who want system-wide transparent proxying on a platform
 without a tproxy/REDIRECT firewall — Windows first and foremost. The same
@@ -97,6 +97,13 @@ Consequences:
   the range — is dropped rather than dialed: dialing it would route
   straight back into the device (issue #618). The drop applies on every
   inbound, not just TUN.
+- TCP flows are dialed as soon as the client sends its first bytes, or
+  after a 200 ms sniff window if it stays silent (mihomo's pre-dial peek).
+  Server-first protocols — SMTP, POP3, IMAP, FTP, MySQL, VNC, SSH — wait
+  for the server's banner without sending anything, so they see it after
+  that window plus the dial (before #695 they were reset after 15 s). A
+  connection that closes or resets inside the window (connect scans,
+  aborted reconnects) is dropped before it is matched, counted or dialed.
 - ICMP echo requests entering the device are answered by the userspace
   stack itself — `ping` to a fake IP confirms the tun is up, but is not an
   end-to-end probe of the remote host.
@@ -170,7 +177,7 @@ ip route | grep -c '/1 dev' # → 0
 | `outbound-interface` | auto-detect | Physical interface outbound sockets bind to in `global` mode. Ignored otherwise. |
 | `dns-hijack` | off | List of targets; any `:53` entry turns on in-process answering of UDP :53 flows entering the device. Non-`:53` entries warn and are ignored. |
 | `udp-timeout` | `60` | Seconds of idle before a UDP flow is evicted. |
-| `max-connections` | `256` | Inherited from the top-level `max-connections` (`0` = unlimited); bounds **TCP** flows — a change while TUN runs restarts the listener. The UDP flow table has its own fixed bound (1024 live flows, least-recently-active eviction) that `max-connections` does not adjust. |
+| `max-connections` | `256` | Inherited from the top-level `max-connections` (`0` = unlimited); bounds **TCP** flows (a flow takes its slot when it leaves the 200 ms sniff window, so one that closes inside it never occupies one) — a change while TUN runs restarts the listener. The UDP flow table has its own fixed bound (1024 live flows, least-recently-active eviction) that `max-connections` does not adjust. |
 
 mihomo fields meow does not implement (`stack`, `strict-route`,
 `auto-detect-interface`, `inet6-address`, `endpoint-independent-nat`,

@@ -437,6 +437,19 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **Server-first protocols work over the TUN inbound** (issue #695). The
+  TUN accept path waited up to 15 s for the client's first payload before
+  dialing upstream, and reset the flow when none came. Protocols where
+  the server speaks first — SMTP, POP3, IMAP, FTP, MySQL, VNC, SSH
+  banners — never sent one, so they hung for 15 s and were reset while
+  the same domain worked through the mixed/SOCKS inbound. The wait is now
+  a 200 ms sniff window (mihomo's pre-dial peek): a silent flow is dialed
+  with an empty prefix and gets its banner right after, a client-first
+  flow still carries its first bytes as the prefix, and a connection that
+  closes or resets inside the window is still dropped before it is
+  matched, counted or dialed. A `max-connections` slot is taken once a
+  flow leaves the window.
+
 - **Dead-marking a nested proxy-group member is no longer a dead write**
   (issue #681). `DialFailureTracker` escalation and probe sweeps record
   health on `member.health()`, but `Selector`/`Fallback`/`UrlTest`/
