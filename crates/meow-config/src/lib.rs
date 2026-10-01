@@ -2321,6 +2321,22 @@ fn rebuild_from_raw_impl(
     // and provider payload nodes are gated by the caller (they are async).
     let strict = raw.strict.unwrap_or(false);
 
+    // Subscription names key the `applied-*` contribution tracking (issue
+    // #640): two entries sharing a name would split ownership bookkeeping —
+    // an apply via one entry would credit the other's tracked set. Reject
+    // duplicates the same way groups and listeners do.
+    let mut seen_subscription_names: std::collections::HashSet<&str> =
+        std::collections::HashSet::with_capacity(
+            raw.subscriptions.as_deref().map_or(0, <[_]>::len),
+        );
+    for s in raw.subscriptions.as_deref().unwrap_or(&[]) {
+        anyhow::ensure!(
+            seen_subscription_names.insert(s.name.as_str()),
+            "subscription '{}': the duplicate name — declared more than once",
+            s.name
+        );
+    }
+
     // Materialize this candidate's proxy-provider set: reuse the caller's
     // live objects for still-declared names (their slots, health state, and
     // fetched content carry over) and construct empty providers for newly
@@ -6118,6 +6134,30 @@ rules:
             panic!("absurd group interval must be rejected");
         };
         assert!(err.to_string().contains("interval"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn rejects_duplicate_subscription_names() {
+        // Subscription names key the `applied-*` contribution tracking
+        // (issue #640): a duplicate would split ownership bookkeeping
+        // between entries, so the same-name apply/deletes corrupt each
+        // other's tracked sets.
+        let yaml = r#"
+proxies:
+  - { name: p, type: direct }
+subscriptions:
+  - { name: s, url: "https://a.example.com/" }
+  - { name: s, url: "https://b.example.com/" }
+rules:
+  - "MATCH,DIRECT"
+"#;
+        let Err(err) = rebuild_from_raw(&raw_config(yaml)) else {
+            panic!("duplicate subscription names must be rejected");
+        };
+        assert!(
+            err.to_string().contains("duplicate name") && err.to_string().contains('s'),
+            "unexpected: {err}"
+        );
     }
 
     #[test]

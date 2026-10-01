@@ -1632,7 +1632,10 @@ async fn rebuild_from_raw_runtime_async(
 }
 
 // ── Subscriptions ────────────────────────────────────────────────────
-// Subscriptions replace local proxies/groups/rules with the remote data as-is.
+// Subscriptions merge their payload in as a tracked contribution —
+// `applied-*` bookkeeping on the entry records which proxies/groups/rules
+// it added, so local content and sibling subscriptions survive
+// add/refresh/delete (issue #640).
 
 #[derive(Serialize)]
 struct SubscriptionInfo {
@@ -1657,9 +1660,13 @@ async fn get_subscriptions(State(state): State<Arc<AppState>>) -> Json<Vec<Subsc
             interval: s.interval,
             last_updated: s.last_updated,
             proxy: s.proxy.clone(),
-            proxy_count: raw.proxies.as_ref().map_or(0, std::vec::Vec::len),
-            group_count: raw.proxy_groups.as_ref().map_or(0, std::vec::Vec::len),
-            rule_count: raw.rules.as_ref().map_or(0, std::vec::Vec::len),
+            // Per-subscription contribution counts (issue #640) — the
+            // entries this subscription last applied, not merged section
+            // totals (those are identical on every row and in the
+            // add/refresh response).
+            proxy_count: s.applied_proxies.len(),
+            group_count: s.applied_groups.len(),
+            rule_count: s.applied_rules.len(),
         })
         .collect();
     Json(result)
@@ -1704,14 +1711,16 @@ async fn add_subscription(
         .unwrap_or_default()
         .as_secs() as i64;
 
-    let pc = fetched.proxies.len();
-    let gc = fetched.proxy_groups.len();
-    let rc = fetched.rules.len();
-
     let _mutation = CONFIG_MUTATION.lock().await;
-    let snapshot = {
+    let (snapshot, counts) = {
         let mut raw = state.raw_config.read().clone();
 
+        if body.name.trim().is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "subscription name must not be empty".into(),
+            ));
+        }
         if let Some(ref subs) = raw.subscriptions {
             if subs.iter().any(|s| s.name == body.name) {
                 return Err((
@@ -1732,15 +1741,19 @@ async fn add_subscription(
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string),
+            applied_proxies: Vec::new(),
+            applied_groups: Vec::new(),
+            applied_rules: Vec::new(),
         };
         raw.subscriptions.get_or_insert_with(Vec::new).push(sub);
 
-        // Replace proxies, groups, and rules with remote data as-is
-        raw.proxies = Some(fetched.proxies);
-        raw.proxy_groups = Some(fetched.proxy_groups);
-        raw.rules = Some(fetched.rules);
+        // Contribution merge (issue #640): the payload replaces only this
+        // subscription's tracked entries — local proxies/groups/rules and
+        // other subscriptions' content survive.
+        let counts = meow_config::subscription::apply_subscription(&mut raw, &body.name, fetched)
+            .expect("the subscription entry was just pushed");
 
-        raw
+        (raw, counts)
     };
     commit_raw_candidate(&state, snapshot.clone()).await?;
 
@@ -1751,7 +1764,9 @@ async fn add_subscription(
 
     Ok(Json(serde_json::json!({
         "message": "subscription added",
-        "proxy_count": pc, "group_count": gc, "rule_count": rc
+        "proxy_count": counts.proxies,
+        "group_count": counts.proxy_groups,
+        "rule_count": counts.rules,
     })))
 }
 
@@ -1763,20 +1778,25 @@ async fn delete_subscription(
     let snapshot = {
         let mut raw = state.raw_config.read().clone();
 
-        if let Some(ref mut subs) = raw.subscriptions {
-            let before = subs.len();
-            subs.retain(|s| s.name != name);
-            if subs.len() == before {
-                return Err((StatusCode::NOT_FOUND, "subscription not found".into()));
-            }
-        } else {
-            return Err((StatusCode::NOT_FOUND, "no subscriptions".into()));
+        if raw
+            .subscriptions
+            .as_ref()
+            .is_none_or(|subs| !subs.iter().any(|s| s.name == name))
+        {
+            return Err((StatusCode::NOT_FOUND, "subscription not found".into()));
         }
 
-        // Clear everything from the remote subscription
-        raw.proxies = Some(Vec::new());
-        raw.proxy_groups = Some(Vec::new());
-        raw.rules = Some(Vec::new());
+        // Drop only what this subscription contributed (issue #640) —
+        // local proxies/groups/rules and sibling subscriptions' content
+        // stay. A subscription written before contribution tracking
+        // existed removes nothing.
+        meow_config::subscription::remove_subscription_contribution(&mut raw, &name);
+        if let Some(ref mut subs) = raw.subscriptions {
+            subs.retain(|s| s.name != name);
+            if subs.is_empty() {
+                raw.subscriptions = None;
+            }
+        }
 
         raw
     };
@@ -1821,38 +1841,43 @@ async fn refresh_subscription(
         .unwrap_or_default()
         .as_secs() as i64;
 
-    let pc = fetched.proxies.len();
-    let gc = fetched.proxy_groups.len();
-    let rc = fetched.rules.len();
-
     let _mutation = CONFIG_MUTATION.lock().await;
-    let snapshot = {
+    let (snapshot, counts) = {
         let mut raw = state.raw_config.read().clone();
 
         // The subscription may have been deleted while the fetch ran —
         // re-verify inside the lane so a removed subscription's payload
         // cannot resurrect (issue #543).
-        let sub = raw
+        let sub_url = raw
             .subscriptions
-            .as_mut()
-            .and_then(|subs| subs.iter_mut().find(|s| s.name == name))
+            .as_ref()
+            .and_then(|subs| subs.iter().find(|s| s.name == name))
+            .map(|s| s.url.clone())
             .ok_or_else(|| (StatusCode::NOT_FOUND, "subscription not found".into()))?;
         // A same-name re-add (or `PUT /configs` rewrite) with a different
         // URL must not inherit the payload fetched from the old one
         // (issue #543 review).
-        if sub.url != url {
+        if sub_url != url {
             return Err((
                 StatusCode::CONFLICT,
                 "subscription changed while refresh was in flight".into(),
             ));
         }
-        sub.last_updated = Some(now);
+        if let Some(sub) = raw
+            .subscriptions
+            .as_mut()
+            .and_then(|subs| subs.iter_mut().find(|s| s.name == name))
+        {
+            sub.last_updated = Some(now);
+        }
 
-        raw.proxies = Some(fetched.proxies);
-        raw.proxy_groups = Some(fetched.proxy_groups);
-        raw.rules = Some(fetched.rules);
+        // Contribution merge (issue #640): local content and sibling
+        // subscriptions' entries survive; only this subscription's tracked
+        // contribution is replaced.
+        let counts = meow_config::subscription::apply_subscription(&mut raw, &name, fetched)
+            .ok_or_else(|| (StatusCode::NOT_FOUND, "subscription not found".into()))?;
 
-        raw
+        (raw, counts)
     };
     commit_raw_candidate(&state, snapshot.clone()).await?;
 
@@ -1863,7 +1888,9 @@ async fn refresh_subscription(
 
     Ok(Json(serde_json::json!({
         "message": "subscription refreshed",
-        "proxy_count": pc, "group_count": gc, "rule_count": rc
+        "proxy_count": counts.proxies,
+        "group_count": counts.proxy_groups,
+        "rule_count": counts.rules,
     })))
 }
 
@@ -1997,6 +2024,11 @@ async fn delete_proxy_group(
                 parts.last().is_none_or(|target| target.trim() != name)
             });
         }
+        // The deletion can orphan a subscription's `applied-*` claim on
+        // this group or the pruned rules — release stale claims so a
+        // later refresh/`DELETE` cannot eat a user re-created entry
+        // (issue #640 review).
+        meow_config::subscription::reconcile_contribution_claims(&mut raw);
         raw
     };
     commit_raw_candidate(&state, snapshot).await?;
@@ -2044,6 +2076,7 @@ async fn replace_rules(
     let snapshot = {
         let mut raw = state.raw_config.read().clone();
         raw.rules = Some(body.rules);
+        meow_config::subscription::reconcile_contribution_claims(&mut raw);
         raw
     };
     commit_raw_candidate(&state, snapshot).await?;
@@ -2068,6 +2101,7 @@ async fn update_rule_at_index(
             return Err((StatusCode::BAD_REQUEST, "index out of range".into()));
         }
         rules[body.index] = body.rule;
+        meow_config::subscription::reconcile_contribution_claims(&mut raw);
         raw
     };
     commit_raw_candidate(&state, snapshot).await?;
@@ -2086,6 +2120,7 @@ async fn delete_rule(
             return Err((StatusCode::BAD_REQUEST, "index out of range".into()));
         }
         rules.remove(index);
+        meow_config::subscription::reconcile_contribution_claims(&mut raw);
         raw
     };
     commit_raw_candidate(&state, snapshot).await?;
@@ -2695,6 +2730,27 @@ async fn put_configs(
         }
     };
 
+    // Duplicate `subscriptions:` names must never commit — not even under
+    // `?force=true`: they split `applied-*` contribution bookkeeping
+    // between same-named entries, and the persisted file would then fail
+    // the next boot's rebuild-time dup check (issue #640 review).
+    {
+        let mut seen = std::collections::HashSet::new();
+        if raw_config
+            .subscriptions
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .any(|s| !seen.insert(s.name.as_str()))
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"message": "duplicate subscription name"})),
+            )
+                .into_response();
+        }
+    }
+
     // Enter the mutation lane before the first network I/O this candidate
     // triggers — the ECH pre-resolution below — so its global-route binding
     // can be installed first (issue #695): a candidate that turns on, or
@@ -2728,6 +2784,42 @@ async fn put_configs(
             let _ = meow_config::ech_dns::preresolve_ech(ps, false).await;
         }
     }
+
+    // Contribution tracking is authoritative, never document-trusted
+    // (issue #640 review): subscriptions the PUT document keeps (same
+    // name + same URL) inherit the live `applied-*` sets — without this
+    // a PUT that omits the bookkeeping fields would orphan tracking and
+    // remote-dropped nodes could never be removed again. Entries whose
+    // URL changed are a different feed: their claims start empty —
+    // trusting document-supplied sets there would let a stale or crafted
+    // `applied-*` mark user content for removal.
+    {
+        let live = state.raw_config.read();
+        let live_subs = live.subscriptions.as_deref().unwrap_or(&[]);
+        if let Some(new_subs) = raw_config.subscriptions.as_mut() {
+            for new in new_subs.iter_mut() {
+                match live_subs
+                    .iter()
+                    .find(|o| o.name == new.name && o.url == new.url)
+                {
+                    Some(old) => {
+                        new.applied_proxies = old.applied_proxies.clone();
+                        new.applied_groups = old.applied_groups.clone();
+                        new.applied_rules = old.applied_rules.clone();
+                    }
+                    None => {
+                        new.applied_proxies.clear();
+                        new.applied_groups.clear();
+                        new.applied_rules.clear();
+                    }
+                }
+            }
+        }
+    }
+    // The document may rewrite the sections independently of the
+    // subscriptions it keeps — clamp claims to entries that actually
+    // made it into the PUT.
+    meow_config::subscription::reconcile_contribution_claims(&mut raw_config);
 
     // Semantic rebuild (proxy/rule parsing). Share the tunnel's resolver
     // slot so the rebuilt map's DIRECT adapter tracks later

@@ -157,11 +157,14 @@ rules:
   # Final fallback
   - MATCH,Proxy
 
-# Subscriptions (remote Clash configs applied wholesale).
-# WARNING: a refresh REPLACES the entire proxies/proxy-groups/rules sections
-# above with the fetched document's — local entries there are overwritten —
-# and the result is written back to this file (re-serialised — comments are
-# lost; a .bak of the previous file is kept once). `interval` is in seconds;
+# Subscriptions (remote Clash configs merged in as a tracked contribution).
+# A refresh merges the fetched document's proxies/proxy-groups by name
+# (remote entries shadow same-named local ones) and prepends its rules —
+# local entries and other subscriptions' content survive, and entries the
+# remote stopped shipping are removed on the next apply (tracked via the
+# written-back applied-proxies/applied-groups/applied-rules fields). The
+# result is written back to this file (re-serialised — comments are lost;
+# a .bak of the previous file is kept once). `interval` is in seconds;
 # omit it to fetch once. A transport failure (unreachable/non-2xx) retries
 # every 60 s, but an unparseable or shape-defective document stamps
 # last-updated and is retried only after `interval` — never, for an

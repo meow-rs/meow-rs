@@ -9,11 +9,12 @@ use meow_config::raw::RawConfig;
 use meow_tunnel::Tunnel;
 use parking_lot::RwLock;
 use std::sync::Arc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Poll subscriptions in `raw_config` every 60s; for each subscription whose
 /// `interval` has elapsed (or which has never been fetched), download the
-/// remote config, replace proxies/groups/rules, rebuild the tunnel, and
+/// remote config, merge its proxies/groups/rules contribution (issue #640 —
+/// local entries and sibling subscriptions survive), rebuild the tunnel, and
 /// persist back to `config_path`. Runs forever; spawn as a background task.
 ///
 /// The loop captures the tunnel weakly (issue #514): an embedder that drops
@@ -186,9 +187,18 @@ pub async fn run_loop(
                         };
                         sub.last_updated = Some(now);
 
-                        c.proxies = Some(fetched.proxies);
-                        c.proxy_groups = Some(fetched.proxy_groups);
-                        c.rules = Some(fetched.rules);
+                        // Contribution merge (issue #640): the payload
+                        // replaces only this subscription's tracked entries
+                        // — local proxies/groups/rules and sibling
+                        // subscriptions' content survive the refresh.
+                        let counts =
+                            meow_config::subscription::apply_subscription(&mut c, &name, fetched)
+                                .expect("the subscription entry was just re-verified");
+                        debug!(
+                            "subscription '{name}': committed \
+                             {} proxies / {} groups / {} rules (merged totals)",
+                            counts.proxies, counts.proxy_groups, counts.rules
+                        );
                         c
                     };
 

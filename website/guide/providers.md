@@ -154,10 +154,12 @@ node list.
 
 `subscriptions:` is the blunt instrument next to providers. `proxy-providers`
 entries feed *nodes* into a named pool that groups pull from via `use:` —
-local `proxies:` and `rules:` stay yours. A subscription instead **replaces the
-whole `proxies:` / `proxy-groups:` / `rules:` sections** with the remote
-document's contents, and the result is **written back to the config file**
-on every successful refresh.
+local `proxies:` and `rules:` stay yours. A subscription instead merges the
+remote document's `proxies:`/`proxy-groups:`/`rules:` into the live config as
+its tracked contribution (remote wins name collisions, remote rules prepend
+ahead of the local table), and the result is **written back to the config
+file** on every successful refresh. Local entries survive — but the remote
+content lands directly in the main sections rather than a namespaced pool.
 
 ```yaml
 subscriptions:
@@ -167,17 +169,18 @@ subscriptions:
 ```
 
 See [Configuration — Subscriptions](./configuration#subscriptions) for the
-full semantics (replace-not-merge, write-back, `-t` behaviour).
+full semantics (contribution merge, write-back, `-t` behaviour).
 
 Subscriptions are also managed at runtime through the
 [REST API](../reference/rest-api):
 
-- `GET /api/subscriptions` — list, with the applied proxy/group/rule counts
-  and last-updated times.
+- `GET /api/subscriptions` — list, with each entry's applied
+  proxy/group/rule counts (its recorded contribution) and last-updated
+  times.
 - `POST /api/subscriptions` — add `{ name, url, interval?, proxy? }` and apply immediately.
 - `POST /api/subscriptions/{name}/refresh` — re-fetch.
-- `DELETE /api/subscriptions/{name}` — remove the entry **and empty all three
-  sections** — previously-replaced local content is not restored. Note the
-  delete itself saves, so `.bak` afterwards holds the *subscription-applied*
-  file; the original local sections survive on disk only if no earlier
-  write-back already rotated them out.
+- `DELETE /api/subscriptions/{name}` — remove the entry **and the
+  contribution it tracked** (`applied-*` bookkeeping): nodes, groups, and
+  rules that subscription added are dropped, while local content it never
+  declared survives. Note the delete itself saves, so `.bak` afterwards
+  holds the post-delete file.

@@ -755,6 +755,18 @@ pub struct RawSubscription {
         deserialize_with = "deserialize_subscription_proxy"
     )]
     pub proxy: Option<String>,
+    /// Names/rules this subscription's last fetch contributed to
+    /// `proxies:`/`proxy-groups:`/`rules:` — subscription apply is a
+    /// contribution merge (issue #640): only these tracked entries are
+    /// replaced on refresh or removed on `DELETE`, so local content and
+    /// sibling subscriptions survive. Empty for configs written before
+    /// the tracking existed; those entries are kept rather than wiped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub applied_proxies: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub applied_groups: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub applied_rules: Vec<String>,
 }
 
 /// `subscriptions[].proxy`: absent/`""` → unset (fetches direct); a

@@ -40,7 +40,7 @@ Use it as a pre-flight check.
 | `rules` | list | — | Routing rules — [Rules](./rules) |
 | `rule-providers` | map | — | External rule sets — [Providers](./providers) |
 | `sub-rules` | map | — | Named rule blocks referenced by `SUB-RULE` |
-| `subscriptions` | list | — | Remote Clash configs applied wholesale — [Subscriptions](#subscriptions) |
+| `subscriptions` | list | — | Remote Clash configs merged in as tracked contributions — [Subscriptions](#subscriptions) |
 | `dns` | block | — | DNS resolver/server config — [DNS](./dns) |
 | `sniffer` | block | — | Domain sniffing config — [Sniffer](./sniffer) |
 | `listeners` | list | — | Explicit named listeners — [Listeners](./listeners) |
@@ -100,15 +100,41 @@ subscriptions:
 Each entry takes `name`, `url`, `interval` (seconds, optional), `proxy`
 (optional — a top-level proxy or group name the fetch is routed through;
 absent, empty, or `DIRECT` fetches direct, and an unknown name fails the
-fetch rather than leaking a direct request), and `last-updated` (a unix
-timestamp the daemon writes back itself — not meant to be set by hand). The semantics differ sharply from `proxy-providers`:
+fetch rather than leaking a direct request), `last-updated` (a unix
+timestamp the daemon writes back itself), and the
+`applied-proxies`/`applied-groups`/`applied-rules` bookkeeping fields —
+all daemon-managed write-back, not meant to be set by hand.
+The semantics differ sharply from `proxy-providers`:
 
-- **Wholesale replace, not merge.** A refresh replaces the entire
-  `proxies:`, `proxy-groups:`, and `rules:` sections with the fetched
-  document's — local entries in those sections are overwritten. Everything
-  else (`dns:`, `mode:`, listeners, `proxy-providers:`…) is untouched —
-  and `use:`/`include-all` groups keep resolving against the declared
-  `proxy-providers:` on scheduled refreshes too.
+- **Contribution merge.** A refresh merges the fetched document into the
+  live config as *that subscription's contribution*: its `proxies:` and
+  `proxy-groups:` entries merge **by name** — remote entries shadow
+  same-named local ones, and entries the remote stopped shipping are
+  removed on the next apply (the entry's applied set is tracked in the
+  written-back `applied-proxies`/`applied-groups`/`applied-rules`
+  bookkeeping fields). Its `rules:` are **prepended** ahead of the kept
+  local table, so the subscription's own routing still works even when
+  local rules end in a `MATCH,` rule. Local entries — helper proxies such
+  as `dialer-proxy` hops and `proxy:` fetch-through endpoints,
+  hand-written groups, and the local rule table — survive add/refresh,
+  and multiple subscriptions coexist instead of clobbering each other.
+  Everything else (`dns:`, `mode:`, listeners, `proxy-providers:`…) is
+  untouched — and `use:`/`include-all` groups keep resolving against the
+  declared `proxy-providers:` on scheduled refreshes too.
+
+  Caveats worth knowing: a remote entry shadowing a local one **replaces**
+  it — the local definition is not restored when the remote drops the
+  name or the subscription is deleted (and the auto-save persists that;
+  the apply logs a warning). Since remote rules are prepended, a
+  subscription shipping a `MATCH,` rule effectively shadows the whole
+  local table behind it; and when several subscriptions carry rules,
+  ordering is last-applied-first — the most recently applied table wins.
+  Ownership is name-keyed: a name listed in an entry's `applied-*` set
+  belongs to that subscription, so local content must not reuse it. And
+  while the merge itself is surgical, the commit still validates as a
+  whole — a local group left empty when its subscription-sourced members
+  go away (or a remote name colliding across sections) fails the refresh
+  loudly rather than committing half-state.
 - **The config file is rewritten.** After a successful fetch and rebuild
   the daemon saves the resulting config — fetched sections plus the
   `last-updated` stamp — back to disk, so subscription data survives
@@ -131,15 +157,19 @@ timestamp the daemon writes back itself — not meant to be set by hand). The se
   refetches every poll (60 s), not "never". Fetches go over a direct
   connection unless the entry sets `proxy:` to a top-level proxy or group
   name.
-- **One subscription at a time.** Every entry wholesale-replaces the
-  same three sections, so multiple subscriptions perpetually clobber
-  each other — last refresh wins. Declaring several is almost never
-  what you want.
+- **Multiple subscriptions coexist.** Each entry owns only the
+  contribution its last apply recorded, so two subscriptions merge into
+  the same config without destroying each other's nodes. Deleting an
+  entry removes exactly its recorded contribution.
 - **Only three sections are taken from the remote document.** A remote
   `dns:`, `proxy-providers:`, `sub-rules:`, listener or `mode:` setting
   is ignored — only `proxies`, `proxy-groups`, and `rules` are applied.
-  A document missing `proxy-groups:`/`rules:` *empties* those sections;
-  missing `proxies:` is a fetch error instead.
+  Consequently a payload's `use:`/`include-all` group references resolve
+  against the **local** provider map, not remote providers — a
+  provider-shaped document starves those groups. A document missing
+  `proxy-groups:`/`rules:` contributes nothing to
+  those sections — its previous contribution there (if any) vacates and
+  local entries stay; missing `proxies:` is a fetch error instead.
 - **`-t` does not fetch subscriptions.** Config-test mode validates the
   file exactly as written — including whatever a previous refresh wrote
   back — and exits before the refresh loop starts. (It is not fully
@@ -167,7 +197,8 @@ Subscriptions can also be managed at runtime via the
 [REST API](../reference/rest-api) (`GET`/`POST` `/api/subscriptions`,
 `DELETE /api/subscriptions/{name}`,
 `POST /api/subscriptions/{name}/refresh`); those endpoints follow the same
-replace-and-write-back semantics.
+merge-and-write-back semantics, and `DELETE` removes only the entry's
+recorded contribution.
 
 ## A complete example
 

@@ -1128,6 +1128,9 @@ async fn get_subscriptions_with_data() {
         interval: Some(3600),
         last_updated: Some(1000000),
         proxy: None,
+        applied_proxies: Vec::new(),
+        applied_groups: Vec::new(),
+        applied_rules: Vec::new(),
     }]);
     let state = test_state(raw);
     let app = create_router(state);
@@ -1158,19 +1161,30 @@ async fn get_subscriptions_reports_counts() {
         interval: None,
         last_updated: None,
         proxy: None,
+        // Counts report the subscription's own contribution (issue
+        // #640), not merged section totals — mark S1/G/MATCH,G as
+        // applied while `selfhop` stays local and uncounted.
+        applied_proxies: vec!["S1".into()],
+        applied_groups: vec!["G".into()],
+        applied_rules: vec!["MATCH,G".into()],
     }]);
-    // Subscription replaces proxies/groups/rules with remote data
     let mut proxy1 = std::collections::HashMap::new();
     proxy1.insert("name".to_string(), serde_yaml::Value::String("S1".into()));
     proxy1.insert("type".to_string(), serde_yaml::Value::String("ss".into()));
-    raw.proxies = Some(vec![proxy1]);
+    let mut local = std::collections::HashMap::new();
+    local.insert(
+        "name".to_string(),
+        serde_yaml::Value::String("selfhop".into()),
+    );
+    local.insert("type".to_string(), serde_yaml::Value::String("http".into()));
+    raw.proxies = Some(vec![proxy1, local]);
     raw.proxy_groups = Some(vec![RawProxyGroup {
         name: "G".into(),
         group_type: "select".into(),
         proxies: Some(vec!["S1".into()]),
         ..Default::default()
     }]);
-    raw.rules = Some(vec!["MATCH,DIRECT".into()]);
+    raw.rules = Some(vec!["MATCH,G".into(), "MATCH,selfhop".into()]);
 
     let state = test_state(raw);
     let app = create_router(state);
@@ -1205,6 +1219,9 @@ async fn delete_subscription_not_found() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
+/// Issue #640: `DELETE` removes only the entries the subscription
+/// actually contributed (its `applied-*` tracking) — local proxies,
+/// groups, and rules it never declared must survive.
 #[tokio::test]
 async fn delete_subscription_clears_data() {
     let mut raw = test_raw_config();
@@ -1214,17 +1231,38 @@ async fn delete_subscription_clears_data() {
         interval: None,
         last_updated: None,
         proxy: None,
+        applied_proxies: vec!["S1".into()],
+        applied_groups: vec!["G".into()],
+        applied_rules: vec!["MATCH,G".into()],
     }]);
     let mut proxy1 = std::collections::HashMap::new();
     proxy1.insert("name".to_string(), serde_yaml::Value::String("S1".into()));
     proxy1.insert("type".to_string(), serde_yaml::Value::String("ss".into()));
-    raw.proxies = Some(vec![proxy1]);
-    raw.proxy_groups = Some(vec![RawProxyGroup {
-        name: "G".into(),
-        group_type: "select".into(),
-        proxies: Some(vec!["DIRECT".into(), "S1".into()]),
-        ..Default::default()
-    }]);
+    let mut proxy2 = std::collections::HashMap::new();
+    proxy2.insert(
+        "name".to_string(),
+        serde_yaml::Value::String("selfhop".into()),
+    );
+    proxy2.insert(
+        "type".to_string(),
+        serde_yaml::Value::String("direct".into()),
+    );
+    raw.proxies = Some(vec![proxy1, proxy2]);
+    raw.proxy_groups = Some(vec![
+        RawProxyGroup {
+            name: "G".into(),
+            group_type: "select".into(),
+            proxies: Some(vec!["DIRECT".into(), "S1".into()]),
+            ..Default::default()
+        },
+        RawProxyGroup {
+            name: "local-g".into(),
+            group_type: "select".into(),
+            proxies: Some(vec!["selfhop".into()]),
+            ..Default::default()
+        },
+    ]);
+    raw.rules = Some(vec!["MATCH,G".into(), "MATCH,selfhop".into()]);
 
     let state = test_state(raw);
     let app = create_router(Arc::clone(&state));
@@ -1241,12 +1279,21 @@ async fn delete_subscription_clears_data() {
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
     let raw = state.raw_config.read();
-    // Subscription removed
-    assert!(raw.subscriptions.as_ref().unwrap().is_empty());
-    // Proxies, groups, rules all cleared
-    assert!(raw.proxies.as_ref().unwrap().is_empty());
-    assert!(raw.proxy_groups.as_ref().unwrap().is_empty());
-    assert!(raw.rules.as_ref().unwrap().is_empty());
+    // Subscription removed; only its tracked contribution is gone.
+    assert!(raw.subscriptions.as_deref().unwrap_or_default().is_empty());
+    let proxies = raw.proxies.as_deref().unwrap_or_default();
+    assert_eq!(proxies.len(), 1);
+    assert_eq!(
+        proxies[0].get("name").and_then(|n| n.as_str()),
+        Some("selfhop")
+    );
+    let groups = raw.proxy_groups.as_deref().unwrap_or_default();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].name, "local-g");
+    assert_eq!(
+        raw.rules.as_deref().unwrap_or_default(),
+        &["MATCH,selfhop".to_string()]
+    );
 }
 
 /// A `DELETE` landing while `POST /api/subscriptions/{name}/refresh` is
@@ -1300,6 +1347,9 @@ async fn refresh_subscription_deleted_mid_fetch_returns_404() {
         interval: None,
         last_updated: None,
         proxy: None,
+        applied_proxies: Vec::new(),
+        applied_groups: Vec::new(),
+        applied_rules: Vec::new(),
     }]);
     let state = test_state(raw);
     let app = create_router(Arc::clone(&state));
@@ -1542,6 +1592,196 @@ async fn add_subscription_proxy_resolution() {
         .to_bytes();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json[0]["proxy"], "front");
+}
+
+/// Issue #640 repro: `POST /api/subscriptions` with a proxies-only payload
+/// must merge into the local config — the hand-written proxy, group, and
+/// rule table survive at runtime AND in the auto-saved file, while the
+/// remote node joins `proxies:`. A refresh that drops the remote node
+/// removes only the tracked contribution.
+#[tokio::test]
+async fn add_subscription_merges_with_local_config() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    // Proxies-only subscription — the common shape. Second fetch drops
+    // `node-1` so the manual refresh below exercises contribution removal.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (switch_tx, switch_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let dropped = *switch_rx.borrow();
+            let body: &'static str = if dropped {
+                "proxies:\n  - {name: node-2, type: http, server: 127.0.0.1, port: 9}\n"
+            } else {
+                "proxies:\n  - {name: node-1, type: http, server: 127.0.0.1, port: 9}\n"
+            };
+            let mut sink = [0u8; 2048];
+            let _ = sock.read(&mut sink).await;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        }
+    });
+
+    // The issue's hand-written config: a local helper proxy plus a rule
+    // table referencing it.
+    let mut raw = test_raw_config();
+    // `http` keeps its configured name — a `direct` node's `name()` is
+    // hardcoded "DIRECT" and would collide with the builtin.
+    let mut selfhop = std::collections::HashMap::new();
+    selfhop.insert(
+        "name".to_string(),
+        serde_yaml::Value::String("selfhop".into()),
+    );
+    selfhop.insert("type".to_string(), serde_yaml::Value::String("http".into()));
+    selfhop.insert(
+        "server".to_string(),
+        serde_yaml::Value::String("127.0.0.1".into()),
+    );
+    selfhop.insert("port".to_string(), serde_yaml::Value::Number(18080.into()));
+    raw.proxies = Some(vec![selfhop]);
+    raw.proxy_groups = Some(vec![RawProxyGroup {
+        name: "local-g".into(),
+        group_type: "select".into(),
+        proxies: Some(vec!["selfhop".into()]),
+        ..Default::default()
+    }]);
+    raw.rules = Some(vec!["DOMAIN,x.test,REJECT".into(), "MATCH,selfhop".into()]);
+    let state = test_state(raw);
+    let app = create_router(Arc::clone(&state));
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/subscriptions")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(format!(
+                    r#"{{"name":"s","url":"http://{addr}/sub.yaml"}}"#
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    // Counts report the merged section totals, not the payload's sizes.
+    assert_eq!(json["proxy_count"], 2, "{json}");
+    assert_eq!(json["group_count"], 1, "{json}");
+    assert_eq!(json["rule_count"], 2, "{json}");
+
+    {
+        let raw = state.raw_config.read();
+        let names: Vec<String> = raw
+            .proxies
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|p| p.get("name").and_then(|n| n.as_str()).map(str::to_string))
+            .collect();
+        assert_eq!(names, vec!["selfhop".to_string(), "node-1".to_string()]);
+        assert_eq!(
+            raw.rules.as_deref().unwrap_or_default(),
+            &[
+                "DOMAIN,x.test,REJECT".to_string(),
+                "MATCH,selfhop".to_string()
+            ]
+        );
+        assert_eq!(
+            raw.proxy_groups.as_deref().unwrap_or_default()[0].name,
+            "local-g"
+        );
+        // The contribution is tracked so refresh/delete stay surgical.
+        let subs = raw.subscriptions.as_deref().unwrap_or_default();
+        assert_eq!(subs[0].applied_proxies, vec!["node-1".to_string()]);
+        assert!(subs[0].applied_groups.is_empty());
+        assert!(subs[0].applied_rules.is_empty());
+    }
+
+    // The auto-save must carry the merged config — a restart after the
+    // add must not come back with the local table lost (issue #640).
+    let saved = std::fs::read_to_string(&state.config_path).unwrap();
+    assert!(saved.contains("selfhop"), "{saved}");
+    assert!(saved.contains("DOMAIN,x.test,REJECT"), "{saved}");
+
+    // Refresh after the remote dropped node-1: only the tracked
+    // contribution is replaced — local entries and the remote node the
+    // refresh actually ships survive.
+    switch_tx.send(true).unwrap();
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/subscriptions/s/refresh")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    {
+        let raw = state.raw_config.read();
+        let names: Vec<String> = raw
+            .proxies
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|p| p.get("name").and_then(|n| n.as_str()).map(str::to_string))
+            .collect();
+        assert_eq!(
+            names,
+            vec!["selfhop".to_string(), "node-2".to_string()],
+            "refresh must replace only the tracked contribution"
+        );
+        assert_eq!(
+            raw.rules.as_deref().unwrap_or_default(),
+            &[
+                "DOMAIN,x.test,REJECT".to_string(),
+                "MATCH,selfhop".to_string()
+            ]
+        );
+        let subs = raw.subscriptions.as_deref().unwrap_or_default();
+        assert_eq!(subs[0].applied_proxies, vec!["node-2".to_string()]);
+    }
+
+    // DELETE removes only the contribution — local config intact.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/subscriptions/s")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let raw = state.raw_config.read();
+    let names: Vec<String> = raw
+        .proxies
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|p| p.get("name").and_then(|n| n.as_str()).map(str::to_string))
+        .collect();
+    assert_eq!(names, vec!["selfhop".to_string()]);
+    assert_eq!(
+        raw.rules.as_deref().unwrap_or_default(),
+        &[
+            "DOMAIN,x.test,REJECT".to_string(),
+            "MATCH,selfhop".to_string()
+        ]
+    );
 }
 
 // ── Config save test ─────────────────────────────────────────────
@@ -4053,6 +4293,95 @@ async fn put_configs_duplicate_group_names_rejected() {
             .as_ref()
             .is_some_and(|g| g.len() == 2),
         "the force contract still persists the raw config"
+    );
+}
+
+/// Issue #640: a `PUT /configs` document that keeps a subscription by
+/// name+URL but omits its `applied-*` bookkeeping fields must carry the
+/// tracking forward — otherwise the next refresh treats the tracked
+/// nodes as local and they can never be removed. Entries whose URL
+/// changed start with empty tracking (different feed, different
+/// contribution).
+#[tokio::test]
+async fn put_configs_carries_subscription_tracking_forward() {
+    use base64::Engine as _;
+    let mut raw = test_raw_config();
+    let mut node = std::collections::HashMap::new();
+    node.insert(
+        "name".to_string(),
+        serde_yaml::Value::String("node-1".into()),
+    );
+    node.insert("type".to_string(), serde_yaml::Value::String("http".into()));
+    node.insert(
+        "server".to_string(),
+        serde_yaml::Value::String("127.0.0.1".into()),
+    );
+    node.insert("port".to_string(), serde_yaml::Value::from(9));
+    raw.proxies = Some(vec![node]);
+    raw.subscriptions = Some(vec![
+        RawSubscription {
+            name: "s".into(),
+            url: "https://a.example.com/".into(),
+            interval: None,
+            last_updated: None,
+            proxy: None,
+            applied_proxies: vec!["node-1".into()],
+            applied_groups: Vec::new(),
+            applied_rules: Vec::new(),
+        },
+        RawSubscription {
+            name: "t".into(),
+            url: "https://t.example.com/".into(),
+            interval: None,
+            last_updated: None,
+            proxy: None,
+            applied_proxies: vec!["t-node".into()],
+            applied_groups: Vec::new(),
+            applied_rules: Vec::new(),
+        },
+    ]);
+    let state = test_state(raw);
+
+    // Same name+URL for `s` but no applied-* fields; `t` keeps its name
+    // but changes URL — its tracking must NOT carry over.
+    let yaml = concat!(
+        "mode: rule\n",
+        "proxies:\n",
+        "  - { name: node-1, type: http, server: 127.0.0.1, port: 9 }\n",
+        "subscriptions:\n",
+        "  - { name: s, url: \"https://a.example.com/\" }\n",
+        "  - { name: t, url: \"https://new-t.example.com/\" }\n",
+        "rules:\n",
+        "  - MATCH,DIRECT\n",
+    );
+    let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let raw = state.raw_config.read();
+    let subs = raw.subscriptions.as_ref().unwrap();
+    let s = subs.iter().find(|x| x.name == "s").unwrap();
+    assert_eq!(
+        s.applied_proxies,
+        vec!["node-1".to_string()],
+        "kept name+URL must inherit the live tracking set"
+    );
+    let t = subs.iter().find(|x| x.name == "t").unwrap();
+    assert!(
+        t.applied_proxies.is_empty(),
+        "a changed URL must not inherit the old feed's tracking"
     );
 }
 

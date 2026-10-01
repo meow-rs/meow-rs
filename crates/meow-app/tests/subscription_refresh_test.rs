@@ -448,6 +448,62 @@ async fn refreshed_subscription_with_group_cycle_is_not_committed() {
     );
 }
 
+/// Issue #640: an interval refresh must merge the payload as the
+/// subscription's contribution — local `proxies:`/`proxy-groups:`/`rules:`
+/// entries survive, and the fetched node joins `proxies:` rather than
+/// replacing the section.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interval_refresh_preserves_local_sections() {
+    let fx =
+        fixture("proxies:\n  - {name: node-1, type: http, server: 127.0.0.1, port: 9}\n").await;
+    // Local content the old wholesale-replace would have destroyed.
+    {
+        let mut raw = fx.raw_config.write();
+        raw.proxies = Some(vec![HashMap::from([
+            (
+                "name".to_string(),
+                serde_yaml::Value::String("selfhop".to_string()),
+            ),
+            (
+                "type".to_string(),
+                serde_yaml::Value::String("http".to_string()),
+            ),
+            (
+                "server".to_string(),
+                serde_yaml::Value::String("127.0.0.1".to_string()),
+            ),
+            ("port".to_string(), serde_yaml::Value::Number(9.into())),
+        ])]);
+        raw.rules = Some(vec![
+            "DOMAIN,x.test,REJECT".to_string(),
+            "MATCH,selfhop".to_string(),
+        ]);
+    }
+    spawn_loop(&fx);
+
+    wait_group(&fx.tunnel, "node-1").await;
+
+    let raw = fx.raw_config.read();
+    let names: Vec<String> = raw
+        .proxies
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|p| p.get("name").and_then(|n| n.as_str()).map(str::to_string))
+        .collect();
+    assert_eq!(names, vec!["selfhop".to_string(), "node-1".to_string()]);
+    assert_eq!(
+        raw.rules.as_deref().unwrap_or_default(),
+        &[
+            "DOMAIN,x.test,REJECT".to_string(),
+            "MATCH,selfhop".to_string()
+        ],
+        "the local rule table must survive a subscription refresh"
+    );
+    let subs = raw.subscriptions.as_deref().unwrap_or_default();
+    assert_eq!(subs[0].applied_proxies, vec!["node-1".to_string()]);
+}
+
 /// `Proxy` that records each `dial_tcp` target and dials the real
 /// destination — proves the refresh fetch transits the resolved `proxy:`
 /// hop instead of going direct (issue #625).
@@ -540,6 +596,9 @@ async fn refresh_fetches_through_subscription_proxy() {
                 interval: Some(3600),
                 last_updated: None,
                 proxy: Some("ghost".to_string()),
+                applied_proxies: Vec::new(),
+                applied_groups: Vec::new(),
+                applied_rules: Vec::new(),
             },
         );
     }

@@ -429,13 +429,44 @@ the canonical, in-repo source a release is cut from.
   early-warning canary for the next pin bump. (#533)
 
 - **The `subscriptions:` config key is documented.** The guide now covers
-  its wholesale-replace of `proxies:`/`proxy-groups:`/`rules:`, the config
-  write-back on every successful refresh, the `-t`-doesn't-fetch boundary,
-  and a providers.md contrast note against `use:` provider pools. The
-  proxy-provider `interval` field is also corrected: no scheduled refresh
-  exists for proxy providers. (#533)
+  its apply semantics, the config write-back on every successful refresh,
+  the `-t`-doesn't-fetch boundary, and a providers.md contrast note
+  against `use:` provider pools. The proxy-provider `interval` field is
+  also corrected: no scheduled refresh exists for proxy providers. (#533)
+  The apply semantics described there changed again in this release —
+  wholesale-replace became contribution merge; see the #640 fix below.
 
 ### Fixed
+
+- **Subscription apply is now a contribution merge, not a wholesale
+  replace** (issue #640). `POST /api/subscriptions`, manual refresh, and
+  interval refresh used to overwrite `proxies:`/`proxy-groups:`/`rules:`
+  with whatever the payload contained — a proxies-only subscription (the
+  common shape) emptied the hand-written rule table and deleted local
+  helper proxies, and the auto-save persisted the loss. Each entry now
+  tracks the names/rule-strings it contributed (`applied-*` fields on the
+  written-back entry): remote proxies/groups merge by name next to local
+  entries, remote rules prepend ahead of the local table so its routing
+  still works beside a local `MATCH,` tail, and entries the remote
+  stopped shipping are removed on the next apply — upstream deletions
+  still propagate. Sibling subscriptions coexist instead of clobbering
+  each other, and `DELETE` removes only the subscription's recorded
+  contribution. Follow-ups from review: `proxies:` entries without a
+  string `name` are now dropped at parse (they could never be tracked or
+  removed and accumulated on every refresh); duplicate `subscriptions:`
+  names are rejected at rebuild (they would split contribution
+  bookkeeping); a remote node/group shadowing a genuinely-local name
+  logs a warning; `PUT /configs` carries `applied-*` tracking forward
+  for kept name+URL entries so a PUT cannot orphan tracking (and clears
+  document-supplied claims on new/URL-changed entries — tracking is
+  authoritative, never document-trusted); rule/group CRUD endpoints and
+  `PUT` reconcile `applied-*` claims against physical presence so a
+  deleted-then-recreated user entry cannot be eaten by a stale claim;
+  duplicate `subscriptions:` names are rejected even under `?force=true`
+  (a committed dup would corrupt bookkeeping and fail the next boot);
+  `POST` rejects empty subscription names (an unnamed entry is
+  unaddressable); and `GET /api/subscriptions` counts now report each
+  entry's own contribution rather than merged section totals.
 
 - **VMess `support_udp()` no longer over-advertises** (issue #662). With
   `udp: true` configured but no UDP-capable mux session, the adapter

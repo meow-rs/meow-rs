@@ -74,6 +74,9 @@ static files instead.
 `PUT /configs` accepts `{ "path": "/path/to/config.yaml" }` or
 `{ "payload": "<base64-yaml>" }`. Add `?force=true` to apply despite validation errors
 (logged). Returns 204 on success, or 400 `{ message }` on a parse/validation failure.
+For `subscriptions:` entries kept by name+URL the daemon carries its
+`applied-*` contribution tracking forward — a PUT that omits those
+bookkeeping fields does not orphan the subscription's tracked content.
 
 ## Traffic & metrics
 
@@ -120,7 +123,20 @@ static files instead.
 | `GET` | `/api/subscriptions` | List, with counts and last-updated |
 | `POST` | `/api/subscriptions` | Add `{ name, url, interval?, proxy? }` and apply |
 | `POST` | `/api/subscriptions/{name}/refresh` | Re-fetch |
-| `DELETE` | `/api/subscriptions/{name}` | Remove and clear its contents → 204 |
+| `DELETE` | `/api/subscriptions/{name}` | Remove the entry and its contributed nodes/groups/rules → 204 |
+
+Applying a subscription **merges** it into the config rather than
+replacing sections wholesale: remote proxies/groups merge by name into
+`proxies:`/`proxy-groups:` (remote wins a name collision; entries it
+stopped shipping are removed on the next apply) and its `rules:` are
+prepended ahead of the local table. Local entries and other
+subscriptions' content survive; `DELETE` removes only the contribution
+the entry tracked. The `proxy_count`/`group_count`/`rule_count` fields in
+add/refresh responses report the merged section totals; in `GET` they
+report each subscription's own recorded contribution (`applied-*` counts).
+`DELETE` shares the rebuild-and-commit path, so it can return 400 when
+removing the contribution would starve a local group — fix or remove the
+group first.
 
 `POST`'s `proxy` is resolved eagerly at request time — an unknown or
 whitespace-only name is a `400` and nothing is stored. That is stricter

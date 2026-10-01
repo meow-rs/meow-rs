@@ -379,7 +379,7 @@ async function refreshSub(name) {
 }
 
 async function deleteSub(name) {
-  if (!confirm(`Delete subscription "${name}"? This will clear all proxies, groups, and rules.`)) return;
+  if (!confirm(`Delete subscription "${name}"? This removes the nodes, groups, and rules it contributed.`)) return;
   try {
     await api(`/api/subscriptions/${encodeURIComponent(name)}`, { method: 'DELETE' });
     toast('Subscription deleted', 'success');

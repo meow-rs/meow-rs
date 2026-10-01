@@ -85,6 +85,9 @@ fn save_roundtrip_with_subscriptions() {
         interval: Some(3600),
         last_updated: Some(1700000000),
         proxy: None,
+        applied_proxies: Vec::new(),
+        applied_groups: Vec::new(),
+        applied_rules: Vec::new(),
     }]);
 
     save_raw_config(path_str, &raw).unwrap();
@@ -442,11 +445,18 @@ fn raw_subscription_serde() {
         interval: Some(7200),
         last_updated: Some(1700000000),
         proxy: None,
+        applied_proxies: Vec::new(),
+        applied_groups: Vec::new(),
+        applied_rules: Vec::new(),
     };
     let yaml = serde_yaml::to_string(&sub).unwrap();
     assert!(
         !yaml.contains("proxy"),
         "absent proxy must be omitted: {yaml}"
+    );
+    assert!(
+        !yaml.contains("applied-"),
+        "empty applied-* sets must be omitted: {yaml}"
     );
     let loaded: RawSubscription = serde_yaml::from_str(&yaml).unwrap();
     assert_eq!(loaded.name, "test");
@@ -454,6 +464,39 @@ fn raw_subscription_serde() {
     assert_eq!(loaded.interval, Some(7200));
     assert_eq!(loaded.last_updated, Some(1700000000));
     assert_eq!(loaded.proxy, None);
+    assert!(loaded.applied_proxies.is_empty());
+}
+
+/// The contribution-tracking fields must round-trip with kebab-case key
+/// names — a serialization regression would silently orphan tracking
+/// across restart (issue #640).
+#[test]
+fn raw_subscription_serde_applied_fields() {
+    let sub = RawSubscription {
+        name: "test".into(),
+        url: "https://example.com".into(),
+        interval: None,
+        last_updated: None,
+        proxy: None,
+        applied_proxies: vec!["node-1".into(), "node-2".into()],
+        applied_groups: vec!["g".into()],
+        applied_rules: vec!["MATCH,DIRECT".into()],
+    };
+    let yaml = serde_yaml::to_string(&sub).unwrap();
+    assert!(yaml.contains("applied-proxies:"), "{yaml}");
+    assert!(yaml.contains("applied-groups:"), "{yaml}");
+    assert!(yaml.contains("applied-rules:"), "{yaml}");
+    let loaded: RawSubscription = serde_yaml::from_str(&yaml).unwrap();
+    assert_eq!(loaded.applied_proxies, vec!["node-1", "node-2"]);
+    assert_eq!(loaded.applied_groups, vec!["g"]);
+    assert_eq!(loaded.applied_rules, vec!["MATCH,DIRECT"]);
+
+    // A file written before tracking existed loads with empty sets.
+    let legacy: RawSubscription =
+        serde_yaml::from_str("name: t\nurl: https://example.com\n").unwrap();
+    assert!(legacy.applied_proxies.is_empty());
+    assert!(legacy.applied_groups.is_empty());
+    assert!(legacy.applied_rules.is_empty());
 }
 
 #[test]
@@ -464,6 +507,9 @@ fn raw_subscription_serde_proxy() {
         interval: Some(7200),
         last_updated: Some(1700000000),
         proxy: Some("front".into()),
+        applied_proxies: Vec::new(),
+        applied_groups: Vec::new(),
+        applied_rules: Vec::new(),
     };
     let yaml = serde_yaml::to_string(&sub).unwrap();
     assert!(yaml.contains("proxy: front"), "{yaml}");
@@ -480,6 +526,9 @@ fn raw_config_clone() {
         interval: None,
         last_updated: None,
         proxy: None,
+        applied_proxies: Vec::new(),
+        applied_groups: Vec::new(),
+        applied_rules: Vec::new(),
     }]);
     let cloned = raw.clone();
     assert_eq!(cloned.mixed_port, raw.mixed_port);
