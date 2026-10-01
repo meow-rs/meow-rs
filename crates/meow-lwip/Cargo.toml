@@ -22,7 +22,10 @@
 #
 # Local delta vs the fork: `rust/udp.rs` uses `io::Error::other(..)` in two
 # places instead of `io::Error::new(ErrorKind::Other, ..)`, to satisfy clippy's
-# `io_other_error` under the workspace `-D warnings` gate. Re-apply when syncing.
+# `io_other_error` under the workspace `-D warnings` gate; and `rust/core.rs`'s
+# `tcp_recv_cb` hands a fully closed (CLOSING/TIME_WAIT) pcb back to lwIP,
+# because lwIP frees TIME_WAIT pcbs without calling `errf` (issue #695;
+# regression test in `rust/core_tests.rs`). Re-apply when syncing.
 [package]
 name = "meow-lwip"
 version.workspace = true

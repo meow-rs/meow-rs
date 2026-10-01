@@ -88,7 +88,10 @@ pub(crate) enum Cmd {
     Sent(StreamId),
     /// `tcp_poll_cb` coarse tick — same retry opportunity as `Sent`.
     PollTick(StreamId),
-    /// `tcp_err_cb` fired: lwIP already freed the pcb.
+    /// The pcb is no longer ours: `tcp_err_cb` fired (lwIP already freed
+    /// it), or `tcp_recv_cb` handed a fully closed pcb back to lwIP with
+    /// all callbacks detached. Either way, reap our side without touching
+    /// the pcb.
     PcbErr(StreamId),
     /// The UDP out channel has new datagrams — drain it.
     UdpKick,
@@ -110,7 +113,8 @@ pub(crate) struct CbCtx {
     read_tx: Option<UnboundedSender<Vec<u8>>>,
     cmd_tx: UnboundedSender<Cmd>,
     local_addr: SocketAddr,
-    /// Set SYNCHRONOUSLY by `tcp_err_cb`, shared with the core's
+    /// Set SYNCHRONOUSLY by `tcp_err_cb` (and by `tcp_recv_cb` when it hands
+    /// a fully closed pcb back to lwIP), shared with the core's
     /// `StreamState`. When the err callback fires, lwIP has ALREADY freed the
     /// pcb — but Recved/Kick commands the handle queued before the resulting
     /// `PcbErr` are still ahead of it in the command FIFO. The core checks
@@ -186,10 +190,39 @@ pub unsafe extern "C" fn tcp_recv_cb(
 
     if p.is_null() {
         trace!("netstack tcp eof {}", ctx.local_addr);
-        // Empty Vec is the EOF marker; the sender stays alive so a handle
-        // mid-read still drains buffered data first.
+        // Empty Vec is the EOF marker, queued behind any undrained data so a
+        // handle mid-read sees that data first.
         if let Some(tx) = ctx.read_tx.as_ref() {
             let _ = tx.send(Vec::new());
+        }
+        // If our FIN already went out (`Cmd::Shutdown`), this peer FIN put
+        // the pcb in TIME_WAIT, or in CLOSING on its way there (lwIP moves
+        // the state before delivering EOF; FIN_WAIT_1/2 are listed only
+        // defensively). lwIP frees a TIME_WAIT pcb WITHOUT calling `errf`:
+        // `tcp_kill_timewait()` when `tcp_alloc` runs out of pcbs, and
+        // `tcp_slowtmr()` after 2*TCP_MSL. `dead` would never be set, and a
+        // later drop of the handle would run `tcp_arg`/`tcp_close` on a memp
+        // slot that may already belong to an unrelated connection. Both
+        // directions are finished, so hand the pcb to lwIP now: detach every
+        // callback, mark it dead and have the core forget it. What remains
+        // (retransmitting unacked data and our FIN, then TIME_WAIT) is
+        // driven by lwIP's own input and timers and needs no calls from us.
+        // Dropping `read_tx` is safe: the receiver yields the queued data
+        // and EOF marker before it reports the closed channel.
+        let state = std::ptr::read_unaligned(std::ptr::addr_of!((*tpcb).state));
+        if state == tcp_state_FIN_WAIT_1
+            || state == tcp_state_FIN_WAIT_2
+            || state == tcp_state_CLOSING
+            || state == tcp_state_TIME_WAIT
+        {
+            tcp_arg(tpcb, std::ptr::null_mut());
+            tcp_recv(tpcb, None);
+            tcp_sent(tpcb, None);
+            tcp_err(tpcb, None);
+            tcp_poll(tpcb, None, 0);
+            ctx.dead.store(true, std::sync::atomic::Ordering::Release);
+            let _ = ctx.read_tx.take();
+            let _ = ctx.cmd_tx.send(Cmd::PcbErr(ctx.id));
         }
         return err_enum_t_ERR_OK as err_t;
     }
@@ -368,9 +401,11 @@ struct StreamState {
     tx_shut: bool,
     /// Raw `CbCtx` to free once callbacks are detached.
     cbctx: usize,
-    /// Set by `tcp_err_cb` the instant lwIP frees the pcb. MUST be checked
-    /// before every C call on `pcb`: commands queued before the matching
-    /// `PcbErr` would otherwise dereference the dangling pointer.
+    /// Set by `tcp_err_cb` the instant lwIP frees the pcb, or by
+    /// `tcp_recv_cb` when it gives a fully closed pcb back to lwIP (which may
+    /// then free it silently). MUST be checked before every C call on `pcb`:
+    /// commands queued before the matching `PcbErr` would otherwise
+    /// dereference a dangling pointer.
     dead: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -607,7 +642,8 @@ impl LwipCore {
             }
             Cmd::Kick(id) | Cmd::Sent(id) | Cmd::PollTick(id) => self.drain_writes(id),
             Cmd::PcbErr(id) => {
-                // lwIP freed the pcb before tcp_err_cb fired; just reap our
+                // lwIP freed the pcb before tcp_err_cb fired, or owns it
+                // outright after tcp_recv_cb detached it; just reap our
                 // side. Dropping the state drops write_rx, which surfaces
                 // BrokenPipe to a parked writer.
                 if let Some(st) = self.streams.remove(&id) {
@@ -867,3 +903,7 @@ fn flush_output(pcb: usize) {
         trace!("netstack tcp_output error {}", err);
     }
 }
+
+#[cfg(test)]
+#[path = "core_tests.rs"]
+mod tests;
