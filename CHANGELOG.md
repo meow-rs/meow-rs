@@ -437,6 +437,17 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **TUN: dropping a finished connection can no longer close an
+  unrelated one** (issue #695). When meow closed its side first and the
+  client then sent its FIN, the connection's lwIP pcb entered TIME_WAIT,
+  and lwIP frees TIME_WAIT pcbs without notifying the netstack core
+  (when the pcb pool runs dry, or after 2×MSL). The core kept the stale
+  pointer, so dropping the stream later ran `tcp_close` on memory lwIP
+  had already reassigned to a new connection: that live connection got
+  a FIN/RST, plus a use-after-free. The core now detaches its callbacks
+  and hands the pcb to lwIP as soon as both directions are closed;
+  data received before the client's FIN still reaches the reader.
+
 - **macOS TUN `dns-hijack` restores system DNS on exit** (issue #695).
   The macOS `DnsGuard` matched `networksetup -getdnsservers` against
   "There aren't any DNS Servers set on this device.", but networksetup
