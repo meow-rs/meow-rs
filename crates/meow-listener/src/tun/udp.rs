@@ -378,6 +378,9 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
         proxy.name()
     );
 
+    // Taken before the dial so a flush landing mid-dial still ends the flow
+    // (issue #695): its socket may predate the new outbound binding.
+    let mut flush = inner.udp_flush_watch();
     let conn: std::sync::Arc<dyn meow_common::ProxyPacketConn> = std::sync::Arc::from(
         with_dial_timeout(proxy.name(), proxy.dial_udp(&metadata))
             .await
@@ -422,6 +425,9 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
     let result = loop {
         tokio::select! {
             () = &mut idle => break Ok(()), // idle-timeout eviction
+            // Outbound sessions flushed (issue #695): end the flow; the
+            // client's next datagram opens a fresh one with a fresh dial.
+            () = flush.flushed() => break Ok(()),
             queued = rx.recv() => match queued {
                 Some(data) => {
                     if let Err(e) = conn.write_packet(&data, &dst_addr).await {

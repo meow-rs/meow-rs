@@ -157,6 +157,16 @@ impl SessionKind {
             SessionKind::MuxCool(session) => session.unavailable(),
         }
     }
+
+    /// Close the physical connection now, failing every stream on it.
+    pub(crate) fn close(&self) {
+        match self {
+            SessionKind::Smux(session) => session.close(),
+            SessionKind::Yamux(session) => session.close(),
+            SessionKind::H2Mux(session) => session.close(),
+            SessionKind::MuxCool(session) => session.close(),
+        }
+    }
 }
 
 /// A stream on either mux protocol, exposed with tokio IO traits.
@@ -311,6 +321,10 @@ pub(crate) struct MuxSession {
     /// increment are one atomic step.
     pub(crate) streams: AtomicUsize,
     pub(crate) last_used_ms: AtomicU,
+    /// [`MuxClient::generation`] when this session was dialled; a session
+    /// from an older generation predates a [`MuxClient::reset`] and is never
+    /// offered again.
+    pub(crate) generation: Uint,
 }
 
 /// Releases a [`MuxSession`] slot when dropped — the cancellation-safe
@@ -328,6 +342,9 @@ pub struct MuxClient {
     dial: DialFn,
     options: MuxOptions,
     sessions: Mutex<VecDeque<Arc<MuxSession>>>,
+    /// Bumped by [`reset`](Self::reset). Compared for equality only, so the
+    /// mips32 `u32` wrap is harmless.
+    generation: AtomicU,
 }
 
 impl MuxClient {
@@ -336,7 +353,50 @@ impl MuxClient {
             dial,
             options,
             sessions: Mutex::new(VecDeque::new()),
+            generation: AtomicU::new(0),
         })
+    }
+
+    fn generation(&self) -> Uint {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    /// Close every pooled session — idle or carrying streams (those streams
+    /// fail) — so the next open dials a fresh physical connection. Called
+    /// when the outbound-interface binding changes (issue #695): a session
+    /// dialled before the binding was installed rides an unbound socket.
+    ///
+    /// Non-blocking: the pool lock is held across a session dial, so when it
+    /// is contended the drain is deferred to a task that runs once the dial
+    /// releases it; opening a stream also prunes stale sessions and a
+    /// dial that straddles the reset is discarded and redialled. Returns
+    /// the number of sessions closed synchronously.
+    pub fn reset(self: &Arc<Self>) -> usize {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        if let Ok(mut sessions) = self.sessions.try_lock() {
+            return Self::drain_stale(&mut sessions, self.generation());
+        }
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let client = Arc::clone(self);
+            handle.spawn(async move {
+                let mut sessions = client.sessions.lock().await;
+                Self::drain_stale(&mut sessions, client.generation());
+            });
+        }
+        0
+    }
+
+    /// Close and remove every session dialled before `generation`.
+    fn drain_stale(sessions: &mut VecDeque<Arc<MuxSession>>, generation: Uint) -> usize {
+        let before = sessions.len();
+        sessions.retain(|s| {
+            if s.generation == generation {
+                return true;
+            }
+            s.kind.close();
+            false
+        });
+        before - sessions.len()
     }
 
     /// Whether UDP should use mux rather than the adapter's plain UDP path.
@@ -508,6 +568,9 @@ impl MuxClient {
     /// overshoot max-streams.
     async fn offer(self: &Arc<Self>) -> Result<Arc<MuxSession>> {
         let mut sessions = self.sessions.lock().await;
+        // A reset whose drain lost the lock race is applied here at the
+        // latest (issue #695).
+        Self::drain_stale(&mut sessions, self.generation());
         let now = now_ms();
         sessions.retain(|s| {
             if s.kind.is_unusable() {
@@ -577,24 +640,39 @@ impl MuxClient {
         self: &Arc<Self>,
         sessions: &mut VecDeque<Arc<MuxSession>>,
     ) -> Result<Arc<MuxSession>> {
-        let kind = tokio::time::timeout(SESSION_SETUP_TIMEOUT, self.create_session())
-            .await
-            .map_err(|_| {
-                MeowError::Io(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "mux: session setup timed out",
-                ))
-            })??;
-        let session = Arc::new(MuxSession {
-            kind,
-            // Start at 1: the caller's reservation.  The pool lock is
-            // held, so no concurrent offer can see this session before
-            // the slot is reserved.
-            streams: AtomicUsize::new(1),
-            last_used_ms: AtomicU::new(now_ms()),
-        });
-        sessions.push_back(Arc::clone(&session));
-        Ok(session)
+        // A reset landing mid-dial (issue #695) invalidates the session being
+        // set up — its socket may predate the new outbound binding — so it
+        // is closed and redialled once rather than cached.
+        for _ in 0..2 {
+            let generation = self.generation();
+            let kind = tokio::time::timeout(SESSION_SETUP_TIMEOUT, self.create_session())
+                .await
+                .map_err(|_| {
+                    MeowError::Io(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "mux: session setup timed out",
+                    ))
+                })??;
+            if self.generation() != generation {
+                kind.close();
+                continue;
+            }
+            let session = Arc::new(MuxSession {
+                kind,
+                // Start at 1: the caller's reservation.  The pool lock is
+                // held, so no concurrent offer can see this session before
+                // the slot is reserved.
+                streams: AtomicUsize::new(1),
+                last_used_ms: AtomicU::new(now_ms()),
+                generation,
+            });
+            sessions.push_back(Arc::clone(&session));
+            return Ok(session);
+        }
+        Err(MeowError::Io(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "mux: session pool reset during setup",
+        )))
     }
 
     async fn create_session(&self) -> Result<SessionKind> {
@@ -1099,5 +1177,122 @@ mod tests {
             Ok(_) => panic!("oversized domain target must error"),
         }
         assert_eq!(dials.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// Mock dialer for the reset tests: counts dials and physical
+    /// connections the far end saw close; the first dial parks on `gate`
+    /// when one is given.
+    fn tracked_mux_client(
+        protocol: Protocol,
+        dials: Arc<AtomicUsize>,
+        closed: Arc<AtomicUsize>,
+        gate: Option<Arc<tokio::sync::Notify>>,
+    ) -> Arc<MuxClient> {
+        let dial: DialFn = Arc::new(move || {
+            let dials = Arc::clone(&dials);
+            let closed = Arc::clone(&closed);
+            let gate = gate.clone();
+            Box::pin(async move {
+                let n = dials.fetch_add(1, Ordering::SeqCst);
+                if let (0, Some(gate)) = (n, gate) {
+                    gate.notified().await;
+                }
+                let (client_io, mut server_io) = tokio::io::duplex(64 * 1024);
+                tokio::spawn(async move {
+                    let mut sink = [0u8; 4096];
+                    while matches!(server_io.read(&mut sink).await, Ok(n) if n > 0) {}
+                    closed.fetch_add(1, Ordering::SeqCst);
+                });
+                Ok(Box::new(TestConn(client_io)) as Box<dyn ProxyConn>)
+            })
+        });
+        MuxClient::new(
+            dial,
+            MuxOptions {
+                protocol,
+                // One physical connection per concurrent stream, so the test
+                // controls exactly which sessions are idle and which busy.
+                max_connections: 0,
+                min_streams: 0,
+                max_streams: 0,
+                ..MuxOptions::default()
+            },
+        )
+    }
+
+    async fn wait_for(counter: &AtomicUsize, want: usize, what: &str) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while counter.load(Ordering::SeqCst) < want {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {what} >= {want}"));
+        assert_eq!(counter.load(Ordering::SeqCst), want, "{what}");
+    }
+
+    /// Issue #695: a reset closes the idle *and* the busy session's physical
+    /// connection, fails the busy session's stream, and the next open dials
+    /// fresh instead of reusing either.
+    #[tokio::test]
+    async fn reset_closes_idle_and_busy_sessions_and_redials() {
+        for protocol in [Protocol::Smux, Protocol::Yamux] {
+            let dials = Arc::new(AtomicUsize::new(0));
+            let closed = Arc::new(AtomicUsize::new(0));
+            let client =
+                tracked_mux_client(protocol, Arc::clone(&dials), Arc::clone(&closed), None);
+            let mut busy = client.open_stream("a.example", 80).await.unwrap();
+            let idle = client.open_stream("b.example", 80).await.unwrap();
+            drop(idle);
+            assert_eq!(dials.load(Ordering::SeqCst), 2);
+
+            assert_eq!(client.reset(), 2, "{protocol:?}: both sessions drained");
+            wait_for(&closed, 2, "closed physical connections").await;
+            assert!(
+                busy.write_all(b"after reset").await.is_err(),
+                "{protocol:?}: a stream on a reset session must fail"
+            );
+
+            let _fresh = client.open_stream("c.example", 80).await.unwrap();
+            assert_eq!(
+                dials.load(Ordering::SeqCst),
+                3,
+                "{protocol:?}: the open after a reset must dial fresh"
+            );
+            assert_eq!(client.reset(), 1);
+        }
+    }
+
+    /// Issue #695: a reset that lands while a session dial holds the pool
+    /// lock cannot drain synchronously; the straddling session must be
+    /// discarded and redialled, never cached.
+    #[tokio::test]
+    async fn reset_discards_a_session_dialled_across_it() {
+        let dials = Arc::new(AtomicUsize::new(0));
+        let closed = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let client = tracked_mux_client(
+            Protocol::Smux,
+            Arc::clone(&dials),
+            Arc::clone(&closed),
+            Some(Arc::clone(&gate)),
+        );
+        let opener = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.open_stream("a.example", 80).await })
+        };
+        wait_for(&dials, 1, "dials started").await;
+
+        assert_eq!(client.reset(), 0, "pool lock is held across the dial");
+        gate.notify_one();
+        let stream = opener.await.unwrap().expect("open redials after the reset");
+
+        assert_eq!(dials.load(Ordering::SeqCst), 2, "straddling dial redialled");
+        wait_for(&closed, 1, "closed straddling connection").await;
+        let sessions = client.sessions.lock().await;
+        assert_eq!(sessions.len(), 1, "only the post-reset session is pooled");
+        assert_eq!(sessions[0].generation, client.generation());
+        drop(sessions);
+        drop(stream);
     }
 }

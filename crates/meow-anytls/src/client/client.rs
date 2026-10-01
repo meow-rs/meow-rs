@@ -253,13 +253,27 @@ impl Client {
         }
 
         tracing::debug!("[Client] No idle session found, creating new session");
-        // Create new session
-        self.create_new_session().await
+        // A pool reset landing mid-dial discards the new session (its socket
+        // may predate the host's new outbound binding); redial once.
+        for _ in 0..2 {
+            if let Some(session) = self.create_new_session().await? {
+                return Ok(session);
+            }
+        }
+        Err(AnyTlsError::SessionClosed)
     }
 
-    /// Create a new session with the server
-    async fn create_new_session(&self) -> Result<Arc<Session>> {
+    /// Close every pooled session so the next stream dials a fresh
+    /// connection (see [`SessionPool::reset`]). Non-blocking.
+    pub fn reset_sessions(&self) {
+        self.session_pool.reset();
+    }
+
+    /// Create a new session with the server. `None` when a pool reset ran
+    /// while it was being dialled: the session was closed, not pooled.
+    async fn create_new_session(&self) -> Result<Option<Arc<Session>>> {
         tracing::debug!("[Client] Creating new session to {}", self.server_addr);
+        let generation = self.session_pool.generation();
 
         // Establish TCP connection
         tracing::trace!(
@@ -339,11 +353,18 @@ impl Client {
         let mut guard = SessionCloseGuard::new(session.clone());
 
         // Store in pool
-        self.session_pool.add_idle_session(session.clone()).await;
+        if !self
+            .session_pool
+            .add_idle_session_from(session.clone(), generation)
+            .await
+        {
+            tracing::debug!("[Client] Pool reset during dial; closing the new session");
+            return Ok(None);
+        }
         guard.disarm();
         tracing::debug!("[Client] Session added to pool");
 
-        Ok(session)
+        Ok(Some(session))
     }
 
     /// Build and start a client session on an already-handshaken TLS

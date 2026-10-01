@@ -470,6 +470,9 @@ async fn run_session(
         }
     }
     let _dead_guard = DeadOnExit(Arc::clone(&dead));
+    // Taken before the dial so a flush landing mid-dial still ends the
+    // session (issue #695): its socket may predate the new outbound binding.
+    let mut flush = inner.udp_flush_watch();
 
     let outcome = async {
         if matches!(
@@ -591,6 +594,11 @@ async fn run_session(
                     Err(e) => format!("reply reader task: {e}"),
                 };
                 debug!("SOCKS5 UDP session to {dst_addr}: {reason}; next datagram re-dials");
+                return;
+            }
+            () = flush.flushed() => {
+                debug!("SOCKS5 UDP session to {dst_addr}: outbound sessions flushed; next datagram re-dials");
+                let _ = conn.close();
                 return;
             }
         }
@@ -1713,5 +1721,77 @@ mod tests {
         })
         .await
         .expect("mid-dial eviction test timed out");
+    }
+
+    /// Issue #695: an outbound-session flush ends a live SOCKS5 UDP session
+    /// — its socket may predate the new outbound binding — and the client's
+    /// next datagram to the same destination redials.
+    #[tokio::test]
+    async fn outbound_flush_ends_the_session_and_the_next_datagram_redials() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let proxy = Arc::new(ParkedUdpProxy {
+                dials: std::sync::atomic::AtomicUsize::new(0),
+                health: meow_common::ProxyHealth::new(),
+            });
+            let resolver = std::sync::Arc::new(meow_dns::Resolver::new(
+                vec![],
+                vec![],
+                meow_common::DnsMode::Normal,
+                meow_trie::DomainTrie::new(),
+                false,
+                true,
+            ));
+            let tunnel = meow_tunnel::Tunnel::new(resolver);
+            let res = meow_config::rebuild_from_raw(&Default::default()).unwrap();
+            let mut proxies = res.proxies;
+            proxies.insert(
+                "parked-udp".into(),
+                Arc::clone(&proxy) as Arc<dyn meow_common::Proxy>,
+            );
+            tunnel.update_proxies(proxies, res.dialer_registry);
+            tunnel.update_rules(vec![Box::new(meow_rules::final_rule::FinalRule::new(
+                "parked-udp",
+            ))]);
+
+            let relay = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let inner = Arc::clone(tunnel.inner());
+            let mut nat: HashMap<SessionKey, Session> = HashMap::new();
+            let client: SocketAddr = "127.0.0.1:40001".parse().unwrap();
+            let inbound = Metadata::default();
+            let dst: SocketAddr = "203.0.113.10:5353".parse().unwrap();
+            let key = SessionKey::Addr(dst);
+            let mut packet: SmallVec<[u8; 1500]> = SmallVec::new();
+            encode_udp_header(&mut packet, &dst);
+            packet.extend_from_slice(b"payload");
+
+            handle_client_datagram(&inner, &relay, &mut nat, &packet, client, &inbound).unwrap();
+            assert!(
+                eventually(Duration::from_secs(2), || {
+                    proxy.dials.load(Ordering::Relaxed) == 1
+                })
+                .await,
+                "session task never dialed"
+            );
+            let dead = Arc::clone(&nat[&key].dead);
+            assert!(!dead.load(Ordering::Relaxed), "a parked session stays up");
+
+            assert_eq!(tunnel.close_all_udp_sessions(), 1, "the session's flow");
+            assert!(
+                eventually(Duration::from_secs(2), || dead.load(Ordering::Relaxed)).await,
+                "the flush must end the session"
+            );
+
+            handle_client_datagram(&inner, &relay, &mut nat, &packet, client, &inbound).unwrap();
+            assert!(
+                eventually(Duration::from_secs(2), || {
+                    proxy.dials.load(Ordering::Relaxed) == 2
+                })
+                .await,
+                "the next datagram must redial"
+            );
+            assert!(!Arc::ptr_eq(&nat[&key].dead, &dead));
+        })
+        .await
+        .expect("flush test timed out");
     }
 }

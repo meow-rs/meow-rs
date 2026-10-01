@@ -5,6 +5,7 @@
 //! reuse pool (`CommandConnectV2`, v4 and later).
 
 use async_trait::async_trait;
+use meow_common::atomic::Uint;
 use meow_common::{
     AdapterType, MeowError, Metadata, ProxyAdapter, ProxyConn, ProxyHealth, ProxyPacketConn, Result,
 };
@@ -215,6 +216,8 @@ impl SnellAdapter {
     /// a header write.
     async fn dial_tcp_v6(&self, host: &str, port: u16) -> Result<Box<dyn ProxyConn>> {
         let request = connect_request(host, port, true).map_err(MeowError::Io)?;
+        // Captured before the take / dial: see `Pool::generation`.
+        let pool_ticket = self.pool_ticket();
         if let Some(pool) = &self.pool {
             while let Some(mut snell) = pool.take_idle() {
                 if !snell.idle_conn_alive() {
@@ -223,15 +226,12 @@ impl SnellAdapter {
                 }
                 snell.reset_reply_state();
                 snell.defer_request(request).map_err(MeowError::Io)?;
-                return Ok(Box::new(PooledConn::new(snell, Some(Arc::clone(pool)))));
+                return Ok(Box::new(PooledConn::new(snell, pool_ticket)));
             }
         }
         let mut snell = self.dial_fresh().await?;
         snell.defer_request(request).map_err(MeowError::Io)?;
-        Ok(Box::new(PooledConn::new(
-            snell,
-            self.pool.as_ref().map(Arc::clone),
-        )))
+        Ok(Box::new(PooledConn::new(snell, pool_ticket)))
     }
 
     /// Number of idle connections currently parked in the reuse pool.
@@ -240,6 +240,14 @@ impl SnellAdapter {
     /// instead of sleeping.
     pub fn idle_pool_size(&self) -> usize {
         self.pool.as_ref().map_or(0, |pool| pool.idle_count())
+    }
+
+    /// The pool and its current generation, captured before a conn is taken
+    /// or dialled so one straddling a reset is never re-pooled.
+    fn pool_ticket(&self) -> Option<(Arc<Pool>, Uint)> {
+        self.pool
+            .as_ref()
+            .map(|pool| (Arc::clone(pool), pool.generation()))
     }
 
     fn extract_dest(metadata: &Metadata) -> Result<(String, u16)> {
@@ -284,6 +292,8 @@ impl ProxyAdapter for SnellAdapter {
             return self.dial_tcp_v6(&host, port).await;
         }
 
+        // Captured before the take / dial: see `Pool::generation`.
+        let pool_ticket = self.pool_ticket();
         // Pool-first path — opensnell client.go DialTCP semantics.
         if let Some(pool) = &self.pool {
             // The server may have closed a pooled conn while it sat idle. A
@@ -300,7 +310,7 @@ impl ProxyAdapter for SnellAdapter {
                     debug!("snell pool conn write failed: {e}");
                     continue;
                 }
-                return Ok(Box::new(PooledConn::new(snell, Some(Arc::clone(pool)))));
+                return Ok(Box::new(PooledConn::new(snell, pool_ticket)));
             }
         }
 
@@ -309,10 +319,7 @@ impl ProxyAdapter for SnellAdapter {
         write_header(&mut snell, &host, port, reuse)
             .await
             .map_err(MeowError::Io)?;
-        Ok(Box::new(PooledConn::new(
-            snell,
-            self.pool.as_ref().map(Arc::clone),
-        )))
+        Ok(Box::new(PooledConn::new(snell, pool_ticket)))
     }
 
     async fn connect_over(
@@ -374,6 +381,15 @@ impl ProxyAdapter for SnellAdapter {
         Ok(Box::new(SnellPacketConn::with_target(snell, write_target)))
     }
 
+    /// Issue #695: drop the idle reuse pool and refuse to re-pool any conn
+    /// checked out before now — every pooled socket may predate the
+    /// outbound-interface binding.
+    fn reset_sessions(&self) {
+        if let Some(pool) = &self.pool {
+            pool.reset();
+        }
+    }
+
     fn health(&self) -> &ProxyHealth {
         &self.health
     }
@@ -386,7 +402,8 @@ impl ProxyAdapter for SnellAdapter {
 /// otherwise — the v4 zero-chunk → EOF mapping happens inside `Snell` itself.
 struct PooledConn {
     inner: Option<PoolStream>,
-    pool: Option<Arc<Pool>>,
+    /// Pool plus the generation the conn was taken or dialled under.
+    pool: Option<(Arc<Pool>, Uint)>,
     local_half_close: LocalHalfClose,
     reuse_failed: bool,
 }
@@ -405,7 +422,7 @@ enum LocalHalfClose {
 }
 
 impl PooledConn {
-    fn new(snell: PoolStream, pool: Option<Arc<Pool>>) -> Self {
+    fn new(snell: PoolStream, pool: Option<(Arc<Pool>, Uint)>) -> Self {
         Self {
             inner: Some(snell),
             pool,
@@ -543,7 +560,7 @@ impl ProxyConn for PooledConn {}
 
 impl Drop for PooledConn {
     fn drop(&mut self) {
-        let (Some(snell), Some(pool)) = (self.inner.take(), self.pool.take()) else {
+        let (Some(snell), Some((pool, generation))) = (self.inner.take(), self.pool.take()) else {
             return;
         };
 
@@ -557,7 +574,7 @@ impl Drop for PooledConn {
         if matches!(self.local_half_close, LocalHalfClose::Sent) {
             let mut snell = snell;
             snell.reset_reply_state();
-            pool.put(snell);
+            pool.put(snell, generation);
             return;
         }
 
@@ -574,7 +591,7 @@ impl Drop for PooledConn {
                 return;
             }
             snell.reset_reply_state();
-            pool.put(snell);
+            pool.put(snell, generation);
         });
     }
 }

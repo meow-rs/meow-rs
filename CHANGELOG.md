@@ -603,6 +603,22 @@ the canonical, in-repo source a release is cut from.
   eight global → global restarts under a DIRECT dial storm looped
   1753–2378 → 0 frames.
 
+- **Sessions opened before a reload into global route scope are flushed
+  instead of looping** (issue #695). The pre-install above binds what a
+  reload dials, but a socket opened earlier — unbound while TUN was off,
+  or bound to another `outbound-interface` — stays that way: a SOCKS5 UDP
+  flow or a provider member's cached Hysteria2 QUIC connection kept
+  sending into `meow-tun` after `PUT /configs` switched to global. When
+  the reload's binding changed the interface in effect, the (re)spawned
+  listener now triggers one flush: tracked TCP (if the routing publish
+  did not already close it), every tunnel and listener UDP session,
+  pooled upstream DNS connections, and the cached mux / smux / yamux /
+  h2mux, Hysteria2, AnyTLS, Snell and kcptun sessions of every adapter
+  reachable from the route table or a proxy provider. Pools take a
+  generation, so a session dialled across the flush is closed rather than
+  cached. In a privileged container the pre-existing sessions looped
+  204–218 hy2 QUIC and 59–60 SOCKS5-UDP frames in 12 s; now 0.
+
 - **Dead-marking a nested proxy-group member is no longer a dead write**
   (issue #681). `DialFailureTracker` escalation and probe sweeps record
   health on `member.health()`, but `Selector`/`Fallback`/`UrlTest`/

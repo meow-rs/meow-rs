@@ -1690,6 +1690,21 @@ impl ProxyAdapter for ShadowsocksAdapter {
         }))
     }
 
+    /// Issue #695: close every pooled mux session and every pooled kcptun
+    /// KCP/smux session so the next dial opens fresh sockets. An external
+    /// SIP003 plugin's own upstream sockets live in a subprocess meow does
+    /// not control and are not reset.
+    fn reset_sessions(&self) {
+        #[cfg(feature = "mux")]
+        if let Some(mux) = &self.mux {
+            mux.reset();
+        }
+        #[cfg(feature = "kcptun")]
+        if let PluginKind::Kcptun(client) = &self.core.plugin {
+            client.reset();
+        }
+    }
+
     fn health(&self) -> &ProxyHealth {
         &self.health
     }

@@ -224,8 +224,28 @@ effect, so
   the new binding is in effect before the old listener is stopped, and the
   old listener's teardown cannot clear it;
 - an `outbound-interface` change (or off → global) takes effect for every
-  socket the reload opens. Sockets opened *before* the reload keep the
-  route they were created with until they close.
+  socket the reload opens, and once the new listener is up the reload
+  flushes the sessions opened *before* it, which are not bound to the new
+  interface and would loop into the device: tracked TCP connections
+  (unless the reload's routing swap already closed them), UDP sessions —
+  the tunnel's NAT table and every listener's UDP flows (SOCKS5, TUN,
+  TProxy, Shadowsocks inbound) — pooled upstream DNS connections, and
+  the cached transport sessions of every adapter
+  reachable from the route table or a proxy provider (mux / smux / yamux /
+  h2mux, Hysteria2 QUIC, AnyTLS, the Snell reuse pool, kcptun). Clients
+  reconnect and the redials are bound; a request in flight on a flushed
+  session fails. One info line logs the counts
+  (`Outbound interface binding changed: closed …`).
+
+The flush has known gaps. It does not run when the pre-install failed
+(the listener's own install then binds only what is opened afterwards),
+and leaving global scope is not flagged (it removes the routes old
+sockets could loop on). It cannot reach an external SIP003 plugin's
+upstream sockets (a separate process) or the AnyTLS fallback dialer used
+when no dial bridge is installed. Idle DNS connections pooled by
+resolvers other than the live one are retired but only closed on their
+pool's next use (an idle socket sends nothing). TLS session and
+VLESS-encryption ticket caches hold no sockets and are kept.
 
 Non-global candidates (`auto-route: true`/`fake-ip`/`false`, TUN disabled)
 install nothing. A pre-install failure is not fatal — it is logged at

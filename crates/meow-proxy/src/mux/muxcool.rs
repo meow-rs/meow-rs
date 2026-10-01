@@ -546,6 +546,17 @@ impl MuxCoolSession {
     }
 }
 
+impl MuxCoolSession {
+    /// Tear the session down now even while streams still hold it: the
+    /// driver exits and drops the VLESS connection, so every stream fails.
+    /// Used by pool resets (issue #695). Idempotent.
+    pub(crate) fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        // notify_one: see `Drop` below.
+        self.done.notify_one();
+    }
+}
+
 impl Drop for MuxCoolSession {
     fn drop(&mut self) {
         self.closed.store(true, Ordering::SeqCst);
@@ -2572,6 +2583,7 @@ mod tests {
             kind: SessionKind::MuxCool(Arc::clone(&session)),
             streams: std::sync::atomic::AtomicUsize::new(1),
             last_used_ms: meow_common::atomic::AtomicU::new(0),
+            generation: 0,
         });
         let parts = session
             .open_stream_parts("a.example", 80, true)
@@ -2651,6 +2663,7 @@ mod tests {
             kind: super::super::client::SessionKind::MuxCool(Arc::clone(&session)),
             streams: AtomicUsize::new(1),
             last_used_ms: meow_common::atomic::AtomicU::new(0),
+            generation: 0,
         });
         let parts = session
             .open_stream_parts("127.0.0.1", 18082, true)

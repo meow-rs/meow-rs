@@ -1133,6 +1133,9 @@ async fn run_ss_udp_flow<S>(
     };
     let dst_addr = SocketAddr::new(dst_ip, metadata.dst_port);
 
+    // Taken before the dial so a flush landing mid-dial still ends the flow
+    // (issue #695): its socket may predate the new outbound binding.
+    let mut flush = inner.udp_flush_watch();
     // Client UDP follows the configured routing policy, including port 53.
     // `route` pins this generation's dialer registry across `dial_udp`
     // (issue #533 review) — block-scoped so a long-lived flow doesn't
@@ -1262,6 +1265,11 @@ async fn run_ss_udp_flow<S>(
                     Err(e) => format!("reply pump task: {e}"),
                 };
                 debug!("ss udp flow to {dst_addr}: {reason}; next datagram re-dials");
+                return;
+            }
+            () = flush.flushed() => {
+                debug!("ss udp flow to {dst_addr}: outbound sessions flushed; next datagram re-dials");
+                let _ = conn.close();
                 return;
             }
         }

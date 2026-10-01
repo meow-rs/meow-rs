@@ -16,7 +16,7 @@ use meow_config::{
     rule_provider::RuleProvider,
     NamedListener,
 };
-use meow_tunnel::Tunnel;
+use meow_tunnel::{TrackedTcp, Tunnel};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -1228,7 +1228,17 @@ async fn commit_raw_candidate(
     );
     let preinstalled = preinstall_global_route_binding(&candidate);
     let (dns, prior_resolver) = apply_raw_to_tunnel(candidate.clone(), state).await?;
-    swap_config_and_reconcile_tun(state, candidate, dns, prior_resolver, preinstalled).await;
+    // `apply_raw_to_tunnel` publishes through `update_routing`, which keeps
+    // tracked TCP: a flush must cancel the flows that predate the binding.
+    swap_config_and_reconcile_tun(
+        state,
+        candidate,
+        dns,
+        prior_resolver,
+        preinstalled,
+        TrackedTcp::Cancel,
+    )
+    .await;
     Ok(())
 }
 
@@ -2461,12 +2471,17 @@ async fn spawn_tun_from_raw(
 /// spawn — the old listener's teardown cannot clear an owner installed
 /// after it. Without a spawn it is dropped on return, handing the binding
 /// back to the running listener (or clearing it when none runs).
+///
+/// `tracked_tcp` says whether the caller's routing publish already
+/// cancelled every tracked TCP flow after the binding was installed
+/// (`reload_routing`), for [`outbound_binding_adopted`]'s flush.
 async fn swap_config_and_reconcile_tun(
     state: &AppState,
     candidate: RawConfig,
     dns: Option<meow_config::DnsConfig>,
     prior_resolver: Arc<meow_dns::Resolver>,
     mut preinstalled: PreinstalledBinding,
+    tracked_tcp: TrackedTcp,
 ) {
     debug_assert!(
         CONFIG_MUTATION.try_lock().is_err(),
@@ -2570,7 +2585,11 @@ async fn swap_config_and_reconcile_tun(
                         tun_changed, "TUN listener restarted via config reload"
                     );
                     if adopted {
-                        outbound_binding_adopted(state, preinstalled.interface_changed());
+                        outbound_binding_adopted(
+                            state,
+                            preinstalled.interface_changed(),
+                            tracked_tcp,
+                        );
                     }
                 }
                 // Unreachable like the off→on arm — `enable` is still true
@@ -2606,7 +2625,7 @@ async fn swap_config_and_reconcile_tun(
                 state.tunnel.set_tun_handle(handle).await;
                 info!("TUN listener started via config reload");
                 if adopted {
-                    outbound_binding_adopted(state, preinstalled.interface_changed());
+                    outbound_binding_adopted(state, preinstalled.interface_changed(), tracked_tcp);
                 }
             }
             Ok(None) => {
@@ -2640,25 +2659,43 @@ async fn swap_config_and_reconcile_tun(
 /// the mutation pre-installed ([`preinstall_global_route_binding`]) — the
 /// binding is now the configuration's, for as long as the listener runs.
 ///
-/// Issue #695 step 2 hooks in here. `interface_changed` is the
-/// `None → Some(Y)` / `Some(X) → Some(Y ≠ X)` transition read under the
-/// lane before the install: sessions opened before it (UDP NAT sessions,
-/// DNS upstream pools, pooled QUIC/mux sessions of adapters retained across
-/// the reload) are not bound to `Y` and must be flushed. Within this
-/// mutation nothing predates the binding — it was installed before the
-/// mutation's first dial — so only older sessions need it. Runs only after
-/// a successful (re)spawn: a rejected mutation or failed spawn leaves no
-/// global routes of this configuration for an old session to loop on.
-fn outbound_binding_adopted(state: &AppState, interface_changed: bool) {
+/// When the binding changed the interface in effect (`interface_changed`:
+/// the `None → Some(Y)` / `Some(X) → Some(Y ≠ X)` transition read under the
+/// lane before the install), sessions opened before it — UDP NAT and
+/// listener flows, DNS upstream pools, pooled QUIC/mux/smux sessions of
+/// adapters retained across the reload, tracked TCP unless `tracked_tcp`
+/// says the routing publish already cancelled it — are not bound to `Y` and
+/// would loop into the TUN, so they are flushed
+/// ([`Tunnel::flush_for_outbound_interface_change`], issue #695). Proxy
+/// provider members are passed as extra roots: a provider no group `use:`s
+/// is not reachable from the route table. Nothing opened within this
+/// mutation predates the binding — it was installed before the mutation's
+/// first dial — and what the flush closes redials bound.
+///
+/// Runs only after a successful (re)spawn: a rejected mutation or failed
+/// spawn leaves no global routes of this configuration for an old session
+/// to loop on. Not reached when the pre-install itself failed (the
+/// listener's own install then binds only what it dials) or on
+/// `Some(X) → None` (global → off removes the routes that could loop).
+fn outbound_binding_adopted(
+    state: &AppState,
+    interface_changed: bool,
+    tracked_tcp: TrackedTcp,
+) -> Option<meow_tunnel::OutboundFlush> {
     if !interface_changed {
-        return;
+        return None;
     }
-    // Step 2 (follow-up): flush the sessions that predate the binding.
-    debug!(
-        tun_running = state.tunnel.has_tun(),
-        "outbound interface changed with the TUN restart; sessions opened \
-         before the binding stay on their old route"
-    );
+    // Collected first: no DashMap shard lock is held across the flush.
+    let provider_members: Vec<Arc<dyn meow_common::Proxy>> = state
+        .proxy_providers
+        .iter()
+        .flat_map(|entry| entry.value().proxies())
+        .collect();
+    Some(
+        state
+            .tunnel
+            .flush_for_outbound_interface_change(tracked_tcp, provider_members),
+    )
 }
 
 #[derive(Deserialize)]
@@ -2896,7 +2933,17 @@ async fn put_configs(
         // intentionally follow the *retained* registry (its providers
         // still back the live route table), so no reconcile runs here.
         let prior_resolver = state.tunnel.resolver();
-        swap_config_and_reconcile_tun(&state, raw_config, None, prior_resolver, preinstalled).await;
+        // No `reload_routing` ran, so tracked TCP predating the binding
+        // is still live.
+        swap_config_and_reconcile_tun(
+            &state,
+            raw_config,
+            None,
+            prior_resolver,
+            preinstalled,
+            TrackedTcp::Cancel,
+        )
+        .await;
         return StatusCode::NO_CONTENT.into_response();
     };
     let meow_config::RebuildResult {
@@ -3045,7 +3092,17 @@ async fn put_configs(
         &state.proxy_provider_refresh,
     );
 
-    swap_config_and_reconcile_tun(&state, raw_config, dns, prior_resolver, preinstalled).await;
+    // `reload_routing` above ran after the pre-install and cancelled every
+    // tracked TCP flow; any admitted since dialled under the binding.
+    swap_config_and_reconcile_tun(
+        &state,
+        raw_config,
+        dns,
+        prior_resolver,
+        preinstalled,
+        TrackedTcp::AlreadyCancelled,
+    )
+    .await;
 
     StatusCode::NO_CONTENT.into_response()
 }
@@ -4106,6 +4163,140 @@ mod tests {
     }
 }
 
+/// Issue #695: the post-spawn flush hook (`outbound_binding_adopted`).
+#[cfg(test)]
+mod outbound_flush_tests {
+    use super::*;
+    use meow_common::ProxyAdapter as _;
+
+    fn test_state() -> Arc<AppState> {
+        let resolver = Arc::new(meow_dns::Resolver::new(
+            vec![],
+            vec![],
+            meow_common::DnsMode::Normal,
+            meow_trie::DomainTrie::new(),
+            false,
+            true,
+        ));
+        let tunnel = Tunnel::new(resolver);
+        let raw = meow_config::parse_raw_yaml("mode: rule\nrules:\n  - MATCH,DIRECT\n").unwrap();
+        let meow_config::RebuildResult {
+            proxies,
+            rules,
+            dialer_registry,
+            ..
+        } = meow_config::rebuild_from_raw(&raw).unwrap();
+        tunnel.update_routing(proxies, rules, dialer_registry);
+        Arc::new(AppState {
+            tunnel,
+            secret: None,
+            config_path: std::env::temp_dir()
+                .join("meow-api-695-flush.yaml")
+                .to_string_lossy()
+                .into_owned(),
+            raw_config: Arc::new(RwLock::new(raw)),
+            log_tx: broadcast::channel(16).0,
+            proxy_providers: Arc::new(DashMap::new()),
+            provider_dialer_registry: Default::default(),
+            rule_providers: Arc::new(RwLock::new(HashMap::new())),
+            rule_provider_refresh: Default::default(),
+            proxy_provider_refresh: Default::default(),
+            listeners: vec![],
+            external_ui: None,
+            traffic_feed: TrafficFeed::default(),
+            dns_server: Default::default(),
+        })
+    }
+
+    async fn insert_nat_session(state: &AppState) {
+        let conn = meow_proxy::RejectAdapter::new(false)
+            .dial_udp(&meow_common::Metadata::default())
+            .await
+            .unwrap();
+        state.tunnel.inner().nat_table.insert(
+            (
+                "127.0.0.1:40000".parse().unwrap(),
+                "203.0.113.10:443".parse().unwrap(),
+            ),
+            Arc::new(meow_tunnel::udp::UdpSession::new(conn, Arc::from("DIRECT"))),
+        );
+    }
+
+    fn tracked_tcp(state: &AppState) -> meow_tunnel::ConnectionGuard<'_> {
+        meow_tunnel::ConnectionGuard::track(
+            state.tunnel.statistics(),
+            meow_common::Metadata {
+                network: meow_common::Network::Tcp,
+                host: "example.com".into(),
+                dst_port: 443,
+                ..Default::default()
+            },
+            "MATCH".into(),
+            "".into(),
+            Default::default(),
+        )
+    }
+
+    /// Issue #695: the adoption hook flushes only on an interface change;
+    /// the caller decides whether tracked TCP still needs cancelling; and
+    /// members of a proxy provider no group uses are reset too.
+    #[tokio::test]
+    async fn adoption_flushes_only_when_the_interface_changed() {
+        let state = test_state();
+        insert_nat_session(&state).await;
+        let listener_flow = state.tunnel.inner().udp_flush_watch();
+        let tcp = tracked_tcp(&state);
+
+        assert_eq!(
+            outbound_binding_adopted(&state, false, TrackedTcp::Cancel),
+            None
+        );
+        assert_eq!(state.tunnel.inner().nat_table.len(), 1);
+        assert!(!listener_flow.is_flushed());
+        assert_eq!(tcp.run_until_closed(async {}).await, Some(()));
+
+        // Cold `PUT /configs`: `reload_routing` already cancelled TCP.
+        let cold = outbound_binding_adopted(&state, true, TrackedTcp::AlreadyCancelled)
+            .expect("an interface change flushes");
+        assert_eq!((cold.tcp, cold.udp), (0, 2));
+        assert!(cold.adapters > 0, "the route table's adapters are reset");
+        assert!(state.tunnel.inner().nat_table.is_empty());
+        assert!(listener_flow.is_flushed());
+        assert_eq!(tcp.run_until_closed(async {}).await, Some(()));
+
+        // Warm commit (`update_routing` keeps TCP), with a provider that no
+        // group references: its two members are extra roots.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("members.yaml"),
+            "proxies:\n  \
+             - {name: a, type: socks5, server: 192.0.2.1, port: 1080}\n  \
+             - {name: b, type: http, server: 192.0.2.2, port: 8080}\n",
+        )
+        .unwrap();
+        let def: meow_config::raw::RawProxyProvider =
+            serde_yaml::from_str("type: file\npath: members.yaml").unwrap();
+        let provider = Arc::new(
+            ProxyProvider::new(
+                "p",
+                &def,
+                Some(dir.path()),
+                false,
+                false,
+                Default::default(),
+            )
+            .unwrap(),
+        );
+        provider.acquire_initial().await.unwrap();
+        assert_eq!(provider.proxies().len(), 2);
+        state.proxy_providers.insert("p".into(), provider);
+        let warm = outbound_binding_adopted(&state, true, TrackedTcp::Cancel).unwrap();
+        assert_eq!(warm.tcp, 1);
+        assert_eq!(warm.adapters, cold.adapters + 2);
+        assert_eq!(tcp.run_until_closed(async {}).await, None);
+    }
+}
+
 /// Issue #695: a config mutation installs its candidate's global-route
 /// binding before its first dial, and gives it back on every exit that does
 /// not hand it to a running listener. Needs the real `OutboundBinding`
@@ -4114,6 +4305,7 @@ mod tests {
 #[cfg(all(test, feature = "listener-tun", target_os = "linux"))]
 mod global_route_binding_tests {
     use super::*;
+    use meow_common::ProxyAdapter as _;
     use std::io::{Read as _, Write as _};
     use std::sync::atomic::{AtomicBool, Ordering};
     use tower::ServiceExt as _;
@@ -4324,11 +4516,30 @@ mod global_route_binding_tests {
 
         // ── Rejected PUT, nothing running: the rebuild's fetch already
         // runs under the candidate's binding, and the rejection clears it.
+        // The binding was a `None → lo` change, yet nothing is flushed: a
+        // rejected mutation installs no routes to loop on.
+        let nat_key = (
+            "127.0.0.1:40000".parse().unwrap(),
+            "203.0.113.10:443".parse().unwrap(),
+        );
+        state.tunnel.inner().nat_table.insert(
+            nat_key,
+            Arc::new(meow_tunnel::udp::UdpSession::new(
+                meow_proxy::RejectAdapter::new(false)
+                    .dial_udp(&meow_common::Metadata::default())
+                    .await
+                    .unwrap(),
+                Arc::from("DIRECT"),
+            )),
+        );
+        let listener_flow = state.tunnel.inner().udp_flush_watch();
         let (status, body) = put(&state, &candidate(GLOBAL_LO, &origin, BAD_LISTENERS)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert!(body.contains("listeners config error"), "{body}");
         assert_eq!(origin.take_seen(), vec![Some("lo".to_string())]);
         assert_eq!(iface(), None, "a rejected PUT must not leave a binding");
+        assert!(state.tunnel.inner().nat_table.contains_key(&nat_key));
+        assert!(!listener_flow.is_flushed(), "a rejected PUT must not flush");
 
         // ── Rejected PUT over a running global listener: its binding is
         // back in effect afterwards, and the PUT's own owner is gone.

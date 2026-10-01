@@ -142,6 +142,14 @@ impl ProxyAdapter for DialerProxyAdapter {
         self.inner.unwrap_proxy(metadata, touch)
     }
 
+    /// Forward the session flush (issue #695): `member_proxies` exposes the
+    /// inner adapter's members, never the inner adapter itself, so the
+    /// reachability walk would otherwise miss its pools. A wrapper chain is
+    /// built bottom-up, so this cannot recurse into a cycle.
+    fn reset_sessions(&self) {
+        self.inner.reset_sessions();
+    }
+
     fn health(&self) -> &ProxyHealth {
         self.inner.health()
     }
@@ -289,5 +297,22 @@ mod tests {
         assert_eq!(adapter.name(), "daniel");
         assert_eq!(adapter.dialer_name(), "fast");
         assert_eq!(adapter.adapter_type(), AdapterType::Direct); // MockProxy's type
+    }
+
+    /// Issue #695: `member_proxies` exposes the inner outbound's members,
+    /// never the inner outbound itself, so the reachability walk only
+    /// reaches its pools through the wrapper's own forwarding. The front
+    /// hop is not reset through the wrapper: it is a route-table entry the
+    /// walk reaches on its own.
+    #[test]
+    fn reset_sessions_reaches_the_inner_outbound() {
+        let inner = MockProxy::new("daniel");
+        let fast = MockProxy::new("fast");
+        let (target, _registry) = front(Arc::clone(&fast));
+        let adapter: Arc<dyn Proxy> =
+            Arc::new(DialerProxyAdapter::new(Arc::clone(&inner) as _, target));
+        assert_eq!(meow_common::reset_sessions_reachable([adapter]), 1);
+        assert_eq!(inner.resets(), 1);
+        assert_eq!(fast.resets(), 0);
     }
 }

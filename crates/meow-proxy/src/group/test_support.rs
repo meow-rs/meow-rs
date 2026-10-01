@@ -26,6 +26,7 @@ pub struct MockProxy {
     dial_error: Option<String>,
     udp_unsupported: bool,
     pub dial_count: AtomicUsize,
+    reset_count: AtomicUsize,
 }
 
 impl MockProxy {
@@ -38,6 +39,7 @@ impl MockProxy {
             dial_error: None,
             udp_unsupported: false,
             dial_count: AtomicUsize::new(0),
+            reset_count: AtomicUsize::new(0),
         })
     }
 
@@ -50,6 +52,7 @@ impl MockProxy {
             dial_error: None,
             udp_unsupported: false,
             dial_count: AtomicUsize::new(0),
+            reset_count: AtomicUsize::new(0),
         })
     }
 
@@ -68,6 +71,7 @@ impl MockProxy {
             dial_error: Some(error.to_string()),
             udp_unsupported: false,
             dial_count: AtomicUsize::new(0),
+            reset_count: AtomicUsize::new(0),
         })
     }
 
@@ -82,6 +86,7 @@ impl MockProxy {
             dial_error: Some(error.to_string()),
             udp_unsupported: false,
             dial_count: AtomicUsize::new(0),
+            reset_count: AtomicUsize::new(0),
         })
     }
 
@@ -98,6 +103,7 @@ impl MockProxy {
             dial_error: None,
             udp_unsupported: true,
             dial_count: AtomicUsize::new(0),
+            reset_count: AtomicUsize::new(0),
         })
     }
 
@@ -114,6 +120,11 @@ impl MockProxy {
 
     pub fn dials(&self) -> usize {
         self.dial_count.load(Ordering::Relaxed)
+    }
+
+    /// `reset_sessions` calls so far.
+    pub fn resets(&self) -> usize {
+        self.reset_count.load(Ordering::Relaxed)
     }
 }
 
@@ -147,6 +158,9 @@ impl ProxyAdapter for MockProxy {
             Some(err) => Err(MeowError::Proxy(err.clone())),
             None => Err(MeowError::Proxy(format!("mock {} dial_udp", self.name))),
         }
+    }
+    fn reset_sessions(&self) {
+        self.reset_count.fetch_add(1, Ordering::Relaxed);
     }
     fn health(&self) -> &ProxyHealth {
         &self.health

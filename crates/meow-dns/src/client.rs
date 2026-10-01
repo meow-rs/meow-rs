@@ -20,6 +20,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::Mutex as AsyncMutex;
 
+use meow_common::atomic::{AtomicU, Uint};
+use std::sync::atomic::Ordering;
+
 #[cfg(feature = "encrypted")]
 use meow_transport::{
     tls::{TlsConfig, TlsLayer},
@@ -67,6 +70,34 @@ const TCP_POOL_CAPACITY: usize = 4;
 /// server timeouts; 30 s stays under the shortest of those while still
 /// covering the bursts pooling exists to serve.
 const TCP_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Process-wide generation of pooled upstream connections (issue #695).
+///
+/// Every pooled `tcp://` stream records the generation current *before* its
+/// socket was created; [`reset_pooled_connections`] bumps it, after which
+/// stale streams are never handed to a query again nor returned to a pool.
+/// Process-wide on purpose: the outbound-interface binding that makes a
+/// pre-existing socket stale (`meow_common::outbound_iface`) is itself
+/// process-global, and pools live in resolvers the tunnel cannot reach (the
+/// `proxy-server-nameserver` host hook, a retained standalone DNS server).
+static CONNECTION_GENERATION: AtomicU = AtomicU::new(0);
+
+fn connection_generation() -> Uint {
+    CONNECTION_GENERATION.load(Ordering::Acquire)
+}
+
+/// Retire every pooled DNS upstream connection in the process so the next
+/// query dials a fresh socket — reaches pools in resolvers nobody holds a
+/// handle to (e.g. the `proxy-server-nameserver` host hook).
+///
+/// Lock-free and non-blocking. Idle streams are closed lazily, on their
+/// pool's next checkout (eagerly through [`DnsClient::reset_connections`] /
+/// `Resolver::reset_connections`); an in-flight exchange finishes on the
+/// stream it already holds — bounded by the per-query timeout — and then
+/// closes it instead of pooling it.
+pub fn reset_pooled_connections() {
+    CONNECTION_GENERATION.fetch_add(1, Ordering::AcqRel);
+}
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -208,8 +239,26 @@ struct TcpPool {
     /// Idle streams paired with the instant they were returned to the pool.
     /// Pushed and popped at the end, so the freshest stream is reused first
     /// and the staler ones age out instead of being handed to a query.
-    idle: AsyncMutex<Vec<(TcpStream, Instant)>>,
+    idle: AsyncMutex<Vec<(PooledTcp, Instant)>>,
     idle_timeout: Duration,
+    /// This pool's own generation, bumped by [`DnsClient::reset_connections`]
+    /// — the per-client counterpart of [`CONNECTION_GENERATION`].
+    generation: AtomicU,
+}
+
+/// The pool generation a stream was created under: stale once either the
+/// process-wide or the pool-local counter moves (issue #695).
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PoolGeneration {
+    global: Uint,
+    local: Uint,
+}
+
+/// A pooled `tcp://` stream plus the [`PoolGeneration`] captured before its
+/// socket was created.
+struct PooledTcp {
+    stream: TcpStream,
+    generation: PoolGeneration,
 }
 
 impl TcpPool {
@@ -217,22 +266,58 @@ impl TcpPool {
         Self {
             idle: AsyncMutex::new(Vec::with_capacity(TCP_POOL_CAPACITY)),
             idle_timeout: TCP_POOL_IDLE_TIMEOUT,
+            generation: AtomicU::new(0),
         }
     }
 
+    fn generation(&self) -> PoolGeneration {
+        PoolGeneration {
+            global: connection_generation(),
+            local: self.generation.load(Ordering::Acquire),
+        }
+    }
+
+    /// Retire every stream this pool handed out or holds — idle ones close
+    /// now, checked-out ones on return. Returns the idle streams closed.
+    fn reset(&self) -> usize {
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        self.close_idle()
+    }
+
     /// Return a validated stream to the idle pool, closing it instead when
-    /// the pool is already at capacity.
+    /// the pool is already at capacity or [`reset_pooled_connections`]
+    /// retired its generation while it was checked out.
     ///
     /// The size bound is enforced *here*, on the push side — it is not an
     /// emergent property of the exchange path — so any future caller
     /// (e.g. a background reaper returning streams) cannot silently grow
     /// the pool beyond [`TCP_POOL_CAPACITY`].
-    async fn push(&self, stream: TcpStream) {
+    async fn push(&self, pooled: PooledTcp) {
         let mut idle = self.idle.lock().await;
-        if idle.len() < TCP_POOL_CAPACITY {
-            idle.push((stream, Instant::now()));
+        if idle.len() < TCP_POOL_CAPACITY && pooled.generation == self.generation() {
+            idle.push((pooled, Instant::now()));
         }
-        // else: `stream` drops here, closing the connection.
+        // else: `pooled` drops here, closing the connection.
+    }
+
+    /// Pop the freshest reusable stream, closing every idle-expired or
+    /// generation-retired one on the way.
+    async fn take(&self) -> Option<PooledTcp> {
+        let generation = self.generation();
+        let mut idle = self.idle.lock().await;
+        idle.retain(|(pooled, _)| pooled.generation == generation);
+        take_fresh(&mut idle, Instant::now(), self.idle_timeout)
+    }
+
+    /// Close every idle stream now, without waiting for the lock: a
+    /// contended pool is mid-checkout and [`Self::take`] / [`Self::push`]
+    /// drop retired streams on their own. Returns the number closed.
+    fn close_idle(&self) -> usize {
+        self.idle.try_lock().map_or(0, |mut idle| {
+            let closed = idle.len();
+            idle.clear();
+            closed
+        })
     }
 }
 
@@ -421,6 +506,17 @@ impl DnsClient {
     /// dialer-registry generation across resolver republishes.
     pub fn proxy(&self) -> Option<&DnsProxy> {
         self.proxy.as_ref()
+    }
+
+    /// Drop this client's pooled `tcp://` connections so the next query
+    /// dials a fresh socket (issue #695). Idle streams close now unless the
+    /// pool is mid-checkout, in which case they close on the next checkout;
+    /// a stream an in-flight query holds finishes that query (bounded by the
+    /// per-query timeout) and is then closed instead of pooled. Non-blocking.
+    /// Returns the idle streams closed now. UDP, DoT and DoH open a socket
+    /// per query and pool nothing.
+    pub fn reset_connections(&self) -> usize {
+        self.tcp_pool.reset()
     }
 
     /// Human-readable upstream identifier for API/UI surfaces.
@@ -725,10 +821,7 @@ impl DnsClient {
         wire: &[u8],
         expected: &ExpectedResponse,
     ) -> Result<Message, ClientError> {
-        let pooled = {
-            let mut idle = self.tcp_pool.idle.lock().await;
-            take_fresh(&mut idle, Instant::now(), self.tcp_pool.idle_timeout)
-        };
+        let pooled = self.tcp_pool.take().await;
         // A reused stream should answer within about one RTT; anything
         // slower is presumed a silently half-closed stream. Bounding the
         // discovery attempt to at most half the query timeout (and 250 ms)
@@ -736,10 +829,10 @@ impl DnsClient {
         let pooled_budget = self.timeout / 2;
         let pooled_budget = pooled_budget.min(Duration::from_millis(250));
 
-        if let Some(mut stream) = pooled {
-            let attempt = tcp_message_exchange(&mut stream, wire, expected);
+        if let Some(mut pooled) = pooled {
+            let attempt = tcp_message_exchange(&mut pooled.stream, wire, expected);
             if let Ok(Ok(response)) = tokio::time::timeout(pooled_budget, attempt).await {
-                self.tcp_pool.push(stream).await;
+                self.tcp_pool.push(pooled).await;
                 return Ok(response);
             }
             // Timeout or error: drop the (possibly desynced/half-closed)
@@ -747,9 +840,12 @@ impl DnsClient {
             // to the pool.
         }
 
+        // Captured before the socket exists: a reset racing the connect
+        // must retire this stream too (issue #695).
+        let generation = self.tcp_pool.generation();
         let mut stream = factory().connect_tcp(addr).await?;
         let response = tcp_message_exchange(&mut stream, wire, expected).await?;
-        self.tcp_pool.push(stream).await;
+        self.tcp_pool.push(PooledTcp { stream, generation }).await;
         Ok(response)
     }
 
@@ -1581,6 +1677,106 @@ mod tests {
             .query("victim.example", RecordType::A)
             .await
             .expect("the valid UDP response must win without a TCP connection");
+    }
+
+    /// Persistent `tcp://` upstream counting accepted connections. A query
+    /// for `held.example` is answered only after `release` is notified, and
+    /// `held_tx` reports that the server is holding it.
+    async fn spawn_gated_tcp_upstream(
+        accepted: Arc<AtomicUsize>,
+        held_tx: tokio::sync::mpsc::UnboundedSender<()>,
+        release: Arc<tokio::sync::Notify>,
+    ) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                accepted.fetch_add(1, Ordering::SeqCst);
+                let held_tx = held_tx.clone();
+                let release = Arc::clone(&release);
+                tokio::spawn(async move {
+                    while let Ok(request) = read_lp(&mut stream).await {
+                        let request = Message::from_bytes(&request).unwrap();
+                        let held = request.queries.first().is_some_and(|q| {
+                            q.name().to_ascii().trim_end_matches('.') == "held.example"
+                        });
+                        if held {
+                            let notified = release.notified();
+                            held_tx.send(()).unwrap();
+                            notified.await;
+                        }
+                        let response = response_for(&request, request.metadata.id);
+                        if write_lp(&mut stream, &response.to_bytes().unwrap())
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// Issue #695: `reset_connections` closes the idle pooled stream so the
+    /// next query dials fresh, and a stream an in-flight query holds across
+    /// the reset completes that query but is never pooled afterwards.
+    #[tokio::test]
+    async fn reset_connections_redials_and_never_pools_an_in_flight_stream() {
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let (held_tx, mut held_rx) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let addr =
+            spawn_gated_tcp_upstream(Arc::clone(&accepted), held_tx, Arc::clone(&release)).await;
+        let client = Arc::new(DnsClient::tcp(addr));
+
+        client.query("warm.example", RecordType::A).await.unwrap();
+        client.query("reuse.example", RecordType::A).await.unwrap();
+        assert_eq!(accepted.load(Ordering::SeqCst), 1, "the pool is reused");
+
+        assert_eq!(client.reset_connections(), 1, "the idle stream closes now");
+        assert_eq!(client.reset_connections(), 0, "nothing left to close");
+        client
+            .query("after-reset.example", RecordType::A)
+            .await
+            .unwrap();
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            2,
+            "a reset forces a redial"
+        );
+
+        // Empty the pool so the held query rides a fresh connection (the
+        // pooled attempt's short deadline would otherwise race the hold).
+        client.reset_connections();
+        let in_flight = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move { client.query("held.example", RecordType::A).await }
+        });
+        held_rx.recv().await.unwrap();
+        assert_eq!(accepted.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            client.reset_connections(),
+            0,
+            "the in-flight stream is checked out, not idle"
+        );
+        release.notify_one();
+        in_flight
+            .await
+            .unwrap()
+            .expect("an in-flight query completes across a reset");
+
+        client
+            .query("after-in-flight.example", RecordType::A)
+            .await
+            .unwrap();
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            4,
+            "the stream that was in flight across the reset must not be pooled"
+        );
     }
 
     #[tokio::test]

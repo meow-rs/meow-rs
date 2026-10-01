@@ -154,6 +154,9 @@ pub(super) mod flow {
             proxy.name()
         );
 
+        // Taken before the dial so a flush landing mid-dial still ends the
+        // flow (issue #695): its socket may predate the new outbound binding.
+        let mut flush = inner.udp_flush_watch();
         let conn: Arc<dyn meow_common::ProxyPacketConn> = Arc::from(
             with_dial_timeout(proxy.name(), proxy.dial_udp(&metadata))
                 .await
@@ -192,6 +195,9 @@ pub(super) mod flow {
         let result = loop {
             tokio::select! {
                 () = &mut idle => break Ok(()), // idle-timeout eviction
+                // Outbound sessions flushed (issue #695): end the flow; the
+                // client's next datagram opens a fresh one with a fresh dial.
+                () = flush.flushed() => break Ok(()),
                 queued = rx.recv() => match queued {
                     Some(data) => {
                         queued_bytes.fetch_sub(data.len(), Ordering::Relaxed);

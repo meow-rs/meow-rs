@@ -123,6 +123,15 @@ impl Session {
     pub fn is_dead(&self) -> bool {
         self.dead.load(Ordering::SeqCst)
     }
+
+    /// Tear the session down now even while streams still hold it: aborts
+    /// the driver (dropping the h2 connection, so every stream fails) and
+    /// marks it dead — an aborted driver never reaches its own
+    /// `dead.store`. Used by pool resets (issue #695). Idempotent.
+    pub fn close(&self) {
+        self.dead.store(true, Ordering::SeqCst);
+        self._task.abort();
+    }
 }
 
 impl Drop for Session {

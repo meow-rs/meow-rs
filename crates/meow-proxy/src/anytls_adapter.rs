@@ -214,6 +214,13 @@ impl ProxyAdapter for AnytlsAdapter {
         )))
     }
 
+    /// Issue #695: close every pooled AnyTLS session so the next dial opens a
+    /// fresh, interface-bound connection (see `SessionPool::reset`). The
+    /// unpooled `connect_over` sessions belong to their relay stream.
+    fn reset_sessions(&self) {
+        self.client.reset_sessions();
+    }
+
     fn health(&self) -> &ProxyHealth {
         &self.health
     }

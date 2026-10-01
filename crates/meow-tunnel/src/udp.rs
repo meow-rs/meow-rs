@@ -79,6 +79,39 @@ pub fn new_nat_table() -> NatTable {
     Arc::new(DashMap::new())
 }
 
+/// One UDP flow's handle on the tunnel's flush signal (issue #695).
+///
+/// The listeners own their UDP flow tables (TUN, SOCKS5, TProxy and the
+/// Shadowsocks inbound each run one task per flow), so the tunnel cannot
+/// close those flows directly. Each flow takes a watch from
+/// [`TunnelInner::udp_flush_watch`] *before* dialling its outbound and adds
+/// [`flushed`](Self::flushed) to its relay `select!`: once
+/// [`Tunnel::close_all_udp_sessions`](crate::Tunnel::close_all_udp_sessions)
+/// runs, the flow ends and closes its outbound conn, and the client's next
+/// datagram opens a fresh flow with a fresh dial. A live watch is what the
+/// flush counts as a listener-owned flow.
+pub struct UdpFlushWatch(tokio::sync::watch::Receiver<u64>);
+
+impl UdpFlushWatch {
+    pub(crate) fn new(receiver: tokio::sync::watch::Receiver<u64>) -> Self {
+        Self(receiver)
+    }
+
+    /// Resolve once a flush has been issued since this watch was taken —
+    /// immediately if one landed while the flow was still dialling.
+    /// Cancel-safe. Never resolves once the tunnel is gone.
+    pub async fn flushed(&mut self) {
+        if self.0.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+
+    /// Whether a flush has been issued since this watch was taken.
+    pub fn is_flushed(&self) -> bool {
+        self.0.has_changed().unwrap_or(false)
+    }
+}
+
 /// Evict sessions idle for more than `idle` from `table`, returning the
 /// eviction count. Split out of the sweeper loop so tests can exercise the
 /// decision synchronously instead of racing a real-time ticker.
@@ -231,10 +264,20 @@ pub async fn handle_udp(
         proxy.name()
     );
 
+    // Taken before the dial: a session dialled across a flush may sit on a
+    // socket that predates the new outbound binding (issue #695).
+    let flush = tunnel.udp_flush_watch();
     // Bounded like mihomo's `C.DefaultUDPTimeout`. An unbounded dial here is
     // worse than on TCP: the key is still unclaimed (see below), so every
     // datagram of the flow starts its own stalled dial.
     match with_dial_timeout(proxy.name(), proxy.dial_udp(&metadata)).await {
+        Ok(conn) if flush.is_flushed() => {
+            debug!(
+                "UDP {} -> {}: sessions flushed during the dial; dropping datagram",
+                src, dst_addr
+            );
+            let _ = conn.close();
+        }
         Ok(conn) => {
             let session = Arc::new(UdpSession::new(conn, Arc::from(proxy.name())));
             // Claim the key atomically before the first write. The dial above
@@ -840,5 +883,91 @@ mod tests {
             tunnel.inner().nat_table.is_empty(),
             "a dial that never completed must not leave a session behind"
         );
+    }
+
+    fn recording_session() -> (Arc<UdpSession>, Arc<AtomicBool>) {
+        let closed = Arc::new(AtomicBool::new(false));
+        let conn = RecordingPacketConn {
+            writes: Arc::new(AtomicUsize::new(0)),
+            closed: Arc::clone(&closed),
+        };
+        (
+            Arc::new(UdpSession::new(Box::new(conn), Arc::from("test"))),
+            closed,
+        )
+    }
+
+    /// Issue #695: `close_all_udp_sessions` closes and evicts every NAT
+    /// session and signals every listener flow (or dial) holding a flush
+    /// watch, counting both; watches taken after it see no flush.
+    #[tokio::test]
+    async fn close_all_udp_sessions_drains_nat_and_signals_listener_flows() {
+        let tunnel = mk_tunnel();
+        let (first, first_closed) = recording_session();
+        let (second, second_closed) = recording_session();
+        tunnel.inner().nat_table.insert(mk_key(1000), first);
+        tunnel.inner().nat_table.insert(mk_key(1001), second);
+
+        let mut established = tunnel.inner().udp_flush_watch();
+        let flow = tokio::spawn(async move { established.flushed().await });
+        let dialling = tunnel.inner().udp_flush_watch();
+        assert!(!dialling.is_flushed());
+
+        assert_eq!(tunnel.close_all_udp_sessions(), 4);
+        assert!(tunnel.inner().nat_table.is_empty());
+        assert!(first_closed.load(Ordering::SeqCst));
+        assert!(second_closed.load(Ordering::SeqCst));
+        tokio::time::timeout(Duration::from_secs(2), flow)
+            .await
+            .expect("a listener flow must observe the flush")
+            .unwrap();
+        assert!(dialling.is_flushed());
+        assert!(!tunnel.inner().udp_flush_watch().is_flushed());
+
+        drop(dialling);
+        let _late = tunnel.inner().udp_flush_watch();
+        assert_eq!(tunnel.close_all_udp_sessions(), 1);
+    }
+
+    /// Issue #695: a session whose dial straddles a flush may ride a socket
+    /// created before the new outbound binding, so it is closed instead of
+    /// cached; the next datagram dials afresh.
+    #[tokio::test(start_paused = true)]
+    async fn a_session_dialled_across_a_flush_is_not_cached() {
+        let tunnel = mk_tunnel();
+        tunnel.set_mode(TunnelMode::Global);
+        let proxy = Arc::new(SlowDialProxy::new());
+        let mut proxies: HashMap<SmolStr, Arc<dyn Proxy>> = HashMap::new();
+        proxies.insert(
+            SmolStr::new_static("GLOBAL"),
+            Arc::clone(&proxy) as Arc<dyn Proxy>,
+        );
+        tunnel.update_proxies(proxies, Default::default());
+
+        let src = SocketAddr::from(([127, 0, 0, 1], 6667));
+        let dst = SocketAddr::from(([198, 51, 100, 10], 443));
+        let flush = async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            tunnel.close_all_udp_sessions()
+        };
+        let ((), flushed) = tokio::join!(
+            handle_udp(tunnel.inner(), b"ping", src, mk_metadata(src, dst)),
+            flush,
+        );
+        assert_eq!(flushed, 1, "the in-flight dial holds a flush watch");
+        assert!(tunnel.inner().nat_table.is_empty());
+        {
+            let conns = proxy.conns.lock().unwrap();
+            assert_eq!(conns.len(), 1);
+            assert!(conns[0].1.load(Ordering::SeqCst), "stale conn is closed");
+            assert_eq!(conns[0].0.load(Ordering::SeqCst), 0, "and never written");
+        }
+
+        handle_udp(tunnel.inner(), b"ping", src, mk_metadata(src, dst)).await;
+        assert_eq!(proxy.dials.load(Ordering::SeqCst), 2);
+        assert_eq!(tunnel.inner().nat_table.len(), 1);
+        let conns = proxy.conns.lock().unwrap();
+        assert!(!conns[1].1.load(Ordering::SeqCst));
+        assert_eq!(conns[1].0.load(Ordering::SeqCst), 1);
     }
 }

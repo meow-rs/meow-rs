@@ -23,6 +23,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use meow_common::atomic::{AtomicU, Uint};
 use meow_common::error::{MeowError, Result};
 use meow_common::ProxyPacketConn;
 use meow_transport::kcptun::{comp_stream, KcpConfig, KcpStream};
@@ -181,6 +182,10 @@ pub(crate) struct KcptunClient {
     pool: Mutex<Vec<Pooled>>,
     /// Round-robin cursor over `pool`.
     rr: AtomicUsize,
+    /// Bumped by [`reset`](Self::reset): a session whose dial straddles a
+    /// reset is closed instead of pooled. Compared for equality only, so
+    /// the mips32 `u32` wrap is harmless.
+    generation: AtomicU,
 }
 
 impl KcptunClient {
@@ -192,7 +197,28 @@ impl KcptunClient {
             dialer,
             pool: Mutex::new(Vec::new()),
             rr: AtomicUsize::new(0),
+            generation: AtomicU::new(0),
         }
+    }
+
+    /// Close every pooled KCP/smux session — streams still on them fail —
+    /// so the next stream dials a fresh UDP endpoint. Called when the
+    /// outbound-interface binding changes (issue #695): a session's UDP
+    /// socket bound before the binding was installed stays unbound for
+    /// life. Returns the number of sessions closed.
+    pub(crate) fn reset(&self) -> usize {
+        let mut pool = self.pool.lock();
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        for pooled in pool.iter() {
+            pooled.session.close();
+        }
+        let closed = pool.len();
+        pool.clear();
+        closed
+    }
+
+    fn generation(&self) -> Uint {
+        self.generation.load(Ordering::SeqCst)
     }
 
     /// Open a stream to the SS server: pick (or dial) a pooled session,
@@ -236,34 +262,48 @@ impl KcptunClient {
     /// pool meanwhile — the extra session is then used unpooled rather than
     /// exceeding `conn`).
     async fn pick(&self) -> Result<Arc<smux::Session>> {
-        {
-            let mut pool = self.pool.lock();
-            pool.retain(Self::usable);
-            // `conn` is clamped ≥1 by `fill_defaults`, but a hand-built
-            // `KcpConfig::blank()` can still carry 0 — `.max(1)` keeps the
-            // empty-pool modulo unreachable.
-            if pool.len() >= (self.cfg.conn as usize).max(1) {
-                let i = self.rr.fetch_add(1, Ordering::Relaxed) % pool.len();
-                return Ok(Arc::clone(&pool[i].session));
-            }
-        }
+        // A reset landing mid-dial closes the straddling session (its socket
+        // may predate the new outbound binding) and redials once.
+        for _ in 0..2 {
+            let generation = {
+                let mut pool = self.pool.lock();
+                pool.retain(Self::usable);
+                // `conn` is clamped ≥1 by `fill_defaults`, but a hand-built
+                // `KcpConfig::blank()` can still carry 0 — `.max(1)` keeps the
+                // empty-pool modulo unreachable.
+                if pool.len() >= (self.cfg.conn as usize).max(1) {
+                    let i = self.rr.fetch_add(1, Ordering::Relaxed) % pool.len();
+                    return Ok(Arc::clone(&pool[i].session));
+                }
+                // Read under the lock `reset` bumps under.
+                self.generation()
+            };
 
-        let session = self.dial().await?;
-        let expire_at = (self.cfg.auto_expire > 0)
-            .then(|| {
-                // A deadline beyond the clock's range simply never expires.
-                Instant::now().checked_add(Duration::from_secs(self.cfg.auto_expire as u64))
-            })
-            .flatten();
-        let mut pool = self.pool.lock();
-        pool.retain(Self::usable);
-        if pool.len() < self.cfg.conn as usize {
-            pool.push(Pooled {
-                session: Arc::clone(&session),
-                expire_at,
-            });
+            let session = self.dial().await?;
+            let expire_at = (self.cfg.auto_expire > 0)
+                .then(|| {
+                    // A deadline beyond the clock's range simply never expires.
+                    Instant::now().checked_add(Duration::from_secs(self.cfg.auto_expire as u64))
+                })
+                .flatten();
+            let mut pool = self.pool.lock();
+            if self.generation() != generation {
+                session.close();
+                continue;
+            }
+            pool.retain(Self::usable);
+            if pool.len() < self.cfg.conn as usize {
+                pool.push(Pooled {
+                    session: Arc::clone(&session),
+                    expire_at,
+                });
+            }
+            return Ok(session);
         }
-        Ok(session)
+        Err(MeowError::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionAborted,
+            "kcptun: session pool reset during setup",
+        )))
     }
 
     /// Dead, or past its `autoexpire` deadline (upstream `x_sess.expire`).
@@ -641,5 +681,104 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(1100)).await;
         let second = c.pick().await.unwrap();
         assert!(!Arc::ptr_eq(&first, &second));
+    }
+
+    /// Silent socket that records its own drop — i.e. its session's
+    /// teardown.
+    struct DropFlagSocket(Arc<std::sync::atomic::AtomicBool>);
+    impl SocketIo for DropFlagSocket {
+        fn poll_send(&mut self, _: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_recv(&mut self, _: &mut Context<'_>, _: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+    impl Drop for DropFlagSocket {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Hands out [`DropFlagSocket`]s; the first dial parks on `gate`.
+    struct GatedDialer {
+        gate: tokio::sync::Notify,
+        dropped: Mutex<Vec<Arc<std::sync::atomic::AtomicBool>>>,
+    }
+    #[async_trait]
+    impl TcpDialer for GatedDialer {
+        async fn dial(&self, _: &str, _: u16, _: bool) -> io::Result<Box<dyn Stream>> {
+            Err(io::Error::other("unused in pool tests"))
+        }
+        async fn dial_udp_endpoint(&self, _: SocketAddr) -> io::Result<Box<dyn SocketIo>> {
+            let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let first = {
+                let mut dropped = self.dropped.lock();
+                dropped.push(Arc::clone(&flag));
+                dropped.len() == 1
+            };
+            if first {
+                self.gate.notified().await;
+            }
+            Ok(Box::new(DropFlagSocket(flag)))
+        }
+    }
+
+    async fn wait_until(what: &str, cond: impl Fn() -> bool) {
+        for _ in 0..200 {
+            if cond() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    /// Issue #695: `reset` closes every pooled session (their sockets may
+    /// predate a new outbound binding) and the next stream dials afresh.
+    #[tokio::test]
+    async fn reset_closes_pooled_sessions_and_redials() {
+        let c = client("conn=2;nocomp=true", Arc::new(SilentDialer));
+        let a = c.pick().await.unwrap();
+        let b = c.pick().await.unwrap();
+        assert_eq!(c.reset(), 2);
+        assert!(a.is_dead() && b.is_dead(), "pooled sessions are closed");
+        assert!(c.pool.lock().is_empty());
+        let fresh = c.pick().await.unwrap();
+        assert!(!fresh.is_dead());
+        assert!(!Arc::ptr_eq(&fresh, &a) && !Arc::ptr_eq(&fresh, &b));
+        assert_eq!(c.pool.lock().len(), 1);
+        assert_eq!(c.reset(), 1);
+    }
+
+    /// Issue #695: a session whose dial straddles a reset is closed rather
+    /// than pooled or handed out, and the pick redials once.
+    #[tokio::test]
+    async fn reset_discards_a_session_dialled_across_it() {
+        let dialer = Arc::new(GatedDialer {
+            gate: tokio::sync::Notify::new(),
+            dropped: Mutex::new(Vec::new()),
+        });
+        let c = Arc::new(client(
+            "conn=1;nocomp=true",
+            Arc::clone(&dialer) as Arc<dyn TcpDialer>,
+        ));
+        let pick = tokio::spawn({
+            let c = Arc::clone(&c);
+            async move { c.pick().await }
+        });
+        wait_until("the first dial", || dialer.dropped.lock().len() == 1).await;
+        assert_eq!(c.reset(), 0, "nothing pooled yet");
+        dialer.gate.notify_one();
+        let session = pick.await.unwrap().unwrap();
+        assert!(!session.is_dead());
+        let flags = dialer.dropped.lock().clone();
+        assert_eq!(flags.len(), 2, "the straddling dial is redialled");
+        wait_until("the stale session's teardown", || {
+            flags[0].load(Ordering::SeqCst)
+        })
+        .await;
+        assert!(!flags[1].load(Ordering::SeqCst));
+        assert_eq!(c.pool.lock().len(), 1);
     }
 }

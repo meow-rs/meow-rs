@@ -35,7 +35,8 @@ pub mod socket_protect;
 pub mod tunnel_mode;
 
 pub use adapter::{
-    DelayHistory, ProviderSlot, Proxy, ProxyAdapter, ProxyHealth, ProxySelection, ProxyState,
+    reset_sessions_reachable, DelayHistory, ProviderSlot, Proxy, ProxyAdapter, ProxyHealth,
+    ProxySelection, ProxyState,
 };
 pub use adapter_type::{AdapterType, ConnType};
 pub use auth::{AuthConfig, Credentials};

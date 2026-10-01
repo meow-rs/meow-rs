@@ -1,7 +1,7 @@
 //! Session pool for connection reuse with configurable cleanup
 
 use crate::session::Session;
-use meow_common::atomic::AtomicU;
+use meow_common::atomic::{AtomicU, Uint};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -38,6 +38,9 @@ struct PooledSession {
     seq: u64,
     session: Arc<Session>,
     idle_since: Instant,
+    /// Pool generation the session was dialled under (see
+    /// [`SessionPool::reset`]).
+    generation: Uint,
 }
 
 /// SessionPool manages idle sessions for reuse with automatic cleanup
@@ -53,6 +56,10 @@ pub struct SessionPool {
 
     // Cleanup task handle
     cleanup_task: Arc<Mutex<Option<JoinHandle<()>>>>,
+
+    // Bumped by `reset`; sessions from an older generation are never handed
+    // out again. Compared for equality only, so the MIPS32 wrap is harmless.
+    generation: Arc<AtomicU>,
 }
 
 impl Default for SessionPool {
@@ -74,6 +81,7 @@ impl SessionPool {
             next_seq: Arc::new(AtomicU::new(1)),
             config,
             cleanup_task: Arc::new(Mutex::new(None)),
+            generation: Arc::new(AtomicU::new(0)),
         };
 
         // Start automatic cleanup task
@@ -93,6 +101,50 @@ impl SessionPool {
         self.next_seq.fetch_add(1, Ordering::Relaxed).into()
     }
 
+    /// Current pool generation. Capture it before dialling a session and hand
+    /// it to [`add_idle_session_from`](Self::add_idle_session_from) so a
+    /// session whose dial straddles a [`reset`](Self::reset) is never pooled.
+    pub fn generation(&self) -> Uint {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    /// Close every pooled session — streams still on them fail with
+    /// `SessionClosed` — so the next stream dials a fresh connection. Called
+    /// when the host's outbound-interface binding changes (meow-rs issue
+    /// #695): a session's socket dialled before the binding stays unbound.
+    ///
+    /// Non-blocking: stale sessions stop being handed out at once, and the
+    /// close itself (async) runs on a spawned task. Pooled sessions keep
+    /// themselves alive through their own tasks, so dropping them from the
+    /// map without `close` would leak their sockets.
+    pub fn reset(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!("[SessionPool] reset without a tokio runtime; sessions stay pooled");
+            return;
+        };
+        let idle_sessions = Arc::clone(&self.idle_sessions);
+        let generation = Arc::clone(&self.generation);
+        runtime.spawn(async move {
+            let stale: Vec<PooledSession> = {
+                let mut sessions = idle_sessions.write().await;
+                let current = generation.load(Ordering::SeqCst);
+                let seqs: Vec<u64> = sessions
+                    .iter()
+                    .filter(|(_, pooled)| pooled.generation != current)
+                    .map(|(seq, _)| *seq)
+                    .collect();
+                seqs.iter().filter_map(|seq| sessions.remove(seq)).collect()
+            };
+            tracing::debug!("[SessionPool] Reset: closing {} sessions", stale.len());
+            for pooled in stale {
+                if let Err(e) = pooled.session.close().await {
+                    tracing::debug!("[SessionPool] Failed to close reset session: {}", e);
+                }
+            }
+        });
+    }
+
     /// Get an idle session for reuse (the most recent live one, largest seq).
     ///
     /// The session is **left in the pool** (peek-and-touch, not remove): AnyTLS
@@ -109,10 +161,15 @@ impl SessionPool {
 
         let mut closed = Vec::new();
         let mut chosen = None;
+        let generation = self.generation();
         // Iterate newest-first; reuse the first live session.
         for (seq, pooled) in sessions.iter_mut().rev() {
             if pooled.session.is_closed() {
                 closed.push(*seq);
+                continue;
+            }
+            // Pre-reset: the reset's task closes and removes it.
+            if pooled.generation != generation {
                 continue;
             }
             pooled.idle_since = Instant::now();
@@ -133,9 +190,16 @@ impl SessionPool {
 
     /// Add a session to the idle pool
     pub async fn add_idle_session(&self, session: Arc<Session>) {
+        self.add_idle_session_from(session, self.generation()).await;
+    }
+
+    /// Add a session dialled under `generation` to the idle pool. Returns
+    /// `false` (and does not pool it) if a [`reset`](Self::reset) has run
+    /// since — the caller must close it.
+    pub async fn add_idle_session_from(&self, session: Arc<Session>, generation: Uint) -> bool {
         if session.is_closed() {
             tracing::debug!("[SessionPool] Session already closed, skipping add to pool");
-            return;
+            return true;
         }
         let seq = session.seq();
 
@@ -143,9 +207,15 @@ impl SessionPool {
             seq,
             session,
             idle_since: Instant::now(),
+            generation,
         };
 
         let mut sessions = self.idle_sessions.write().await;
+        // Checked under the map lock the reset's drain takes, after the
+        // bump: a stale session can never slip in behind the drain.
+        if generation != self.generation() {
+            return false;
+        }
         sessions.insert(seq, pooled);
 
         tracing::debug!(
@@ -153,6 +223,7 @@ impl SessionPool {
             seq,
             sessions.len()
         );
+        true
     }
 
     /// Get current number of idle sessions
@@ -398,5 +469,59 @@ mod tests {
         let pool = SessionPool::new();
         let session = pool.get_idle_session().await;
         assert!(session.is_none());
+    }
+
+    fn test_session(seq: u64) -> Arc<Session> {
+        let session = Arc::new(Session::new_client(
+            tokio::io::empty(),
+            tokio::io::sink(),
+            crate::padding::PaddingFactory::default().into_shared(),
+            None,
+        ));
+        session.set_seq(seq);
+        session
+    }
+
+    /// meow-rs issue #695: a reset stops handing out pooled sessions at once,
+    /// closes them (they keep themselves alive otherwise), refuses a session
+    /// dialled across it, and pools post-reset sessions normally.
+    #[tokio::test]
+    async fn reset_closes_pooled_sessions_and_refuses_straddling_ones() {
+        let pool = SessionPool::new();
+        let pooled = test_session(1);
+        pool.add_idle_session(Arc::clone(&pooled)).await;
+        assert!(pool.get_idle_session().await.is_some());
+        let dialled_at = pool.generation();
+
+        pool.reset();
+        assert!(
+            pool.get_idle_session().await.is_none(),
+            "a pre-reset session is never handed out again"
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !pooled.is_closed() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the reset closes the pooled session");
+        assert_eq!(pool.idle_count().await, 0);
+
+        let straddling = test_session(2);
+        assert!(
+            !pool
+                .add_idle_session_from(Arc::clone(&straddling), dialled_at)
+                .await,
+            "a session dialled before the reset is refused"
+        );
+        assert_eq!(pool.idle_count().await, 0);
+
+        let fresh = test_session(3);
+        pool.add_idle_session(Arc::clone(&fresh)).await;
+        let reused = pool
+            .get_idle_session()
+            .await
+            .expect("post-reset session pooled");
+        assert!(Arc::ptr_eq(&reused, &fresh));
     }
 }

@@ -412,6 +412,15 @@ impl ProxyAdapter for VlessAdapter {
         Ok(Box::new(conn))
     }
 
+    /// Issue #695: close every pooled mux session so the next dial opens a
+    /// fresh physical connection (see `MuxClient::reset`).
+    #[cfg(feature = "mux")]
+    fn reset_sessions(&self) {
+        if let Some(mux) = &self.mux {
+            mux.reset();
+        }
+    }
+
     fn health(&self) -> &ProxyHealth {
         &self.health
     }

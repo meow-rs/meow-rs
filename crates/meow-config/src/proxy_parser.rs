@@ -77,6 +77,12 @@ impl ProxyAdapter for WrappedProxy {
         self.adapter.unwrap_proxy(metadata, touch)
     }
 
+    /// Forward the session flush (issue #695) — every parsed leaf sits behind
+    /// this wrapper, so the default no-op here would hide all their pools.
+    fn reset_sessions(&self) {
+        self.adapter.reset_sessions();
+    }
+
     fn health(&self) -> &ProxyHealth {
         self.adapter.health()
     }

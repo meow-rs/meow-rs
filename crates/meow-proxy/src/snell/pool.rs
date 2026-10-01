@@ -13,9 +13,11 @@
 //! 3. `PooledConn` returns the stream only after both peers have completed
 //!    their zero-chunk half-close handshake. Incomplete sessions are dropped.
 
+use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use meow_common::atomic::{AtomicU, Uint};
 use meow_transport::Stream as TransportStream;
 
 use super::protocol::Snell;
@@ -37,6 +39,10 @@ pub struct Pool {
     max_size: usize,
     max_age: Duration,
     items: Mutex<Vec<PooledEntry>>,
+    /// Bumped by [`Pool::reset`]; a conn checked out (or dialled) under an
+    /// older generation is never re-pooled. Compared for equality only, so
+    /// the mips32 `u32` wrap is harmless.
+    generation: AtomicU,
 }
 
 impl Pool {
@@ -51,7 +57,31 @@ impl Pool {
             max_size,
             max_age,
             items: Mutex::new(Vec::new()),
+            generation: AtomicU::new(0),
         }
+    }
+
+    /// Current generation. Capture it *before* taking an idle conn or
+    /// dialling a fresh one and hand it back to [`Pool::put`], so a conn
+    /// that straddles a [`Pool::reset`] is dropped instead of re-pooled.
+    pub fn generation(&self) -> Uint {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    /// Drop every idle conn and invalidate every checked-out one, so the
+    /// next dial opens a fresh socket. Called when the outbound-interface
+    /// binding changes (issue #695). Returns the number of idle conns
+    /// closed; checked-out conns are exclusive to their session and close
+    /// when it ends (the caller cancels those relays).
+    pub fn reset(&self) -> usize {
+        let mut items = self
+            .items
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        let closed = items.len();
+        items.clear();
+        closed
     }
 
     /// Try to take a still-fresh idle entry off the pool. Returns `None` if
@@ -84,13 +114,16 @@ impl Pool {
     }
 
     /// Re-insert a conn that has just finished a session. Drops the conn if
-    /// the pool is full.
-    pub fn put(&self, conn: PoolStream) {
+    /// the pool is full or `generation` (captured when the conn was taken
+    /// or dialled) predates a [`Pool::reset`].
+    pub fn put(&self, conn: PoolStream, generation: Uint) {
         let mut items = self
             .items
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if items.len() >= self.max_size {
+        // Checked under the lock `reset` bumps under: a put can never slip
+        // a stale conn in after the reset's clear.
+        if items.len() >= self.max_size || generation != self.generation() {
             return;
         }
         items.push(PooledEntry {
@@ -139,8 +172,8 @@ mod tests {
         let (older, peer_older) = make_stream();
         drop(peer_older);
         let (newer, _peer_newer) = make_stream();
-        pool.put(older);
-        pool.put(newer);
+        pool.put(older, pool.generation());
+        pool.put(newer, pool.generation());
 
         let mut conn = pool.take_idle().expect("first take should pop an entry");
         assert!(
@@ -156,12 +189,12 @@ mod tests {
     fn put_keeps_a_conn_after_any_number_of_sessions() {
         let pool = Pool::new();
         let (conn, _peer) = make_stream();
-        pool.put(conn);
+        pool.put(conn, pool.generation());
         for session in 0..8 {
             let conn = pool
                 .take_idle()
                 .unwrap_or_else(|| panic!("session {session} found no pooled conn"));
-            pool.put(conn);
+            pool.put(conn, pool.generation());
         }
         assert_eq!(pool.idle_count(), 1);
     }
@@ -170,15 +203,15 @@ mod tests {
     fn custom_limits_apply() {
         let pool = Pool::with_limits(1, Duration::from_secs(60));
         let (first, _peer_first) = make_stream();
-        pool.put(first);
+        pool.put(first, pool.generation());
         let (extra, _peer_extra) = make_stream();
-        pool.put(extra);
+        pool.put(extra, pool.generation());
         assert_eq!(pool.idle_count(), 1, "max_size caps idle entries");
         assert!(pool.take_idle().is_some());
 
         let expired = Pool::with_limits(4, Duration::ZERO);
         let (conn, _peer) = make_stream();
-        expired.put(conn);
+        expired.put(conn, expired.generation());
         assert!(
             expired.take_idle().is_none(),
             "zero max_age expires at once"
@@ -192,7 +225,7 @@ mod tests {
         for _ in 0..11 {
             let (conn, peer) = make_stream();
             peers.push(peer);
-            pool.put(conn);
+            pool.put(conn, pool.generation());
         }
         for i in 0..10 {
             assert!(
@@ -201,5 +234,26 @@ mod tests {
             );
         }
         assert!(pool.take_idle().is_none(), "pool is capped at 10 entries");
+    }
+
+    /// Issue #695: a reset drops idle conns and refuses conns checked out
+    /// (or dialled) before it, while post-reset conns pool normally.
+    #[test]
+    fn reset_drops_idle_and_refuses_stale_returns() {
+        let pool = Pool::new();
+        let (idle, _peer_idle) = make_stream();
+        pool.put(idle, pool.generation());
+        let checked_out_at = pool.generation();
+        let (busy, _peer_busy) = make_stream();
+
+        assert_eq!(pool.reset(), 1, "the idle conn is dropped");
+        assert_eq!(pool.idle_count(), 0);
+        pool.put(busy, checked_out_at);
+        assert_eq!(pool.idle_count(), 0, "a pre-reset conn is never re-pooled");
+
+        let (fresh, _peer_fresh) = make_stream();
+        pool.put(fresh, pool.generation());
+        assert_eq!(pool.idle_count(), 1, "post-reset conns pool normally");
+        assert_eq!(pool.reset(), 1);
     }
 }

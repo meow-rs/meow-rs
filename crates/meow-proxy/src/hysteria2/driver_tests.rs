@@ -52,6 +52,25 @@ async fn peer_with_idle_timeout(
     idle_timeout_ms: u64,
 ) -> Peer {
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    peer_on(
+        socket,
+        authenticate,
+        response,
+        stream_limit,
+        idle_timeout_ms,
+    )
+}
+
+/// A peer serving its single QUIC connection on an already bound `socket`
+/// (re-binding a dropped peer's address stands in for a server that accepts
+/// a second connection).
+fn peer_on(
+    socket: UdpSocket,
+    authenticate: bool,
+    response: Option<u8>,
+    stream_limit: u64,
+    idle_timeout_ms: u64,
+) -> Peer {
     let local = socket.local_addr().unwrap();
     let key = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let mut ssl = boring::ssl::SslContextBuilder::new(boring::ssl::SslMethod::tls()).unwrap();
@@ -480,4 +499,56 @@ async fn dropping_the_client_releases_an_authenticated_driver() {
         .unwrap()
         .unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+}
+
+/// Issue #695: a reset drops the cached connection — its driver and UDP
+/// socket are released and an in-flight stream fails — and the next dial
+/// reconnects instead of reusing it.
+#[tokio::test]
+async fn reset_releases_the_cached_connection_and_reconnects() {
+    let mut first = peer(true, Some(0), 16).await;
+    let server = first.addr;
+    let client = Arc::new(first.client(false));
+    let mut stream = timeout(TEST_TIMEOUT, client.tcp_connect(TARGET))
+        .await
+        .unwrap()
+        .unwrap();
+    round_trip(&mut stream).await;
+    let local = first.auth_seen.recv().await.unwrap();
+
+    assert!(
+        client.reset(),
+        "the idle cache lock is free: dropped synchronously"
+    );
+    assert_socket_released(local).await;
+    let error = timeout(TEST_TIMEOUT, stream.read(&mut [0; 1]))
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+
+    // The peer serves one connection; a fresh one on the same address
+    // proves the next dial reconnects rather than reusing the dropped one.
+    drop(first);
+    let rebound = timeout(TEST_TIMEOUT, async {
+        loop {
+            if let Ok(socket) = UdpSocket::bind(server).await {
+                break socket;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("first peer released its address");
+    let mut second = peer_on(rebound, true, Some(0), 16, 30_000);
+    let mut stream = timeout(TEST_TIMEOUT, client.tcp_connect(TARGET))
+        .await
+        .unwrap()
+        .unwrap();
+    round_trip(&mut stream).await;
+    timeout(TEST_TIMEOUT, second.auth_seen.recv())
+        .await
+        .unwrap()
+        .expect("the post-reset dial authenticated on a new connection");
+    assert!(client.reset(), "the reconnected connection was cached");
 }

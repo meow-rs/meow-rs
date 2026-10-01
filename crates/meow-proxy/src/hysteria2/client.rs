@@ -8,7 +8,9 @@ use super::proto;
 use super::tcp::DuplexStream;
 use super::udp::UdpSession;
 use super::{Error, Result};
+use meow_common::atomic::{AtomicU, Uint};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::sync::{oneshot, Mutex};
 use tokio::time::{timeout, Duration};
@@ -17,7 +19,13 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct ReconnectableClient {
     cfg: Arc<Config>,
-    conn: Mutex<Option<Arc<ConnHandle>>>,
+    /// The cached connection and the [`generation`](Self::generation) it
+    /// was established under.
+    conn: Mutex<Option<(Arc<ConnHandle>, Uint)>>,
+    /// Bumped by [`reset`](Self::reset); a connection from an older
+    /// generation is never handed out again. Compared for equality only, so
+    /// the mips32 `u32` wrap is harmless.
+    generation: AtomicU,
 }
 
 impl ReconnectableClient {
@@ -25,7 +33,43 @@ impl ReconnectableClient {
         Self {
             cfg: Arc::new(cfg),
             conn: Mutex::new(None),
+            generation: AtomicU::new(0),
         }
+    }
+
+    fn generation(&self) -> Uint {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    /// Drop the cached QUIC connection so the next dial reconnects on a
+    /// fresh UDP socket. Called when the outbound-interface binding changes
+    /// (issue #695): the cached connection's socket may predate the binding.
+    ///
+    /// The cache holds the only long-lived `Arc<ConnHandle>` (streams and
+    /// UDP sessions hold just the command channel), so dropping it aborts
+    /// the driver: in-flight streams fail with `ConnectionReset` and UDP
+    /// sessions with `Closed`. Non-blocking: the cache lock is held across a
+    /// connect, so when it is contended the drop is deferred to a task, and
+    /// a connect that straddles the reset is discarded and redialled.
+    /// Returns whether a connection was dropped synchronously.
+    pub fn reset(self: &Arc<Self>) -> bool {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        if let Ok(mut guard) = self.conn.try_lock() {
+            return guard.take().is_some();
+        }
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let client = Arc::clone(self);
+            runtime.spawn(async move {
+                let mut guard = client.conn.lock().await;
+                if guard
+                    .as_ref()
+                    .is_some_and(|(_, generation)| *generation != client.generation())
+                {
+                    guard.take();
+                }
+            });
+        }
+        false
     }
 
     pub async fn tcp_connect(&self, target: &str) -> Result<DuplexStream> {
@@ -67,14 +111,29 @@ impl ReconnectableClient {
 
     async fn handle(&self) -> Result<Arc<ConnHandle>> {
         let mut guard = self.conn.lock().await;
-        if let Some(handle) = guard.as_ref() {
-            if handle.is_active() {
+        if let Some((handle, generation)) = guard.as_ref() {
+            if *generation == self.generation() && handle.is_active() {
                 return Ok(Arc::clone(handle));
             }
         }
-        let handle = Arc::new(connect_new(Arc::clone(&self.cfg)).await?);
-        *guard = Some(Arc::clone(&handle));
-        Ok(handle)
+        // Stale or dead: release its driver (and socket) before dialling.
+        guard.take();
+        // A reset landing mid-connect (issue #695) invalidates the new
+        // connection — its socket may predate the new outbound binding — so
+        // it is dropped and redialled once rather than cached.
+        for _ in 0..2 {
+            let generation = self.generation();
+            let handle = Arc::new(connect_new(Arc::clone(&self.cfg)).await?);
+            if self.generation() != generation {
+                continue;
+            }
+            *guard = Some((Arc::clone(&handle), generation));
+            return Ok(handle);
+        }
+        Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionAborted,
+            "hysteria2: connection reset during setup",
+        )))
     }
 }
 

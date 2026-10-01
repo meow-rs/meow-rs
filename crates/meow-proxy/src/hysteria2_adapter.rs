@@ -419,6 +419,13 @@ impl ProxyAdapter for Hy2Adapter {
         Ok(Box::new(Hy2PacketConn::new(session, write_target)))
     }
 
+    /// Issue #695: drop the cached QUIC connection (see
+    /// `ReconnectableClient::reset`) so the next dial reconnects on a fresh,
+    /// interface-bound UDP socket.
+    fn reset_sessions(&self) {
+        self.client.reset();
+    }
+
     fn health(&self) -> &ProxyHealth {
         &self.health
     }

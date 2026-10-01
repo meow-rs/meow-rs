@@ -116,6 +116,10 @@ pub struct NameserverPolicy {
     exact: HashMap<String, PolicyEntry>,
     wildcard: DomainTrie<PolicyEntry>,
     matchers: Vec<MatcherPolicyEntry>,
+    /// Every client inserted under any pattern — the wildcard trie cannot
+    /// be iterated, and [`Resolver::reset_connections`] must reach each
+    /// policy upstream's connection pool (issue #695).
+    clients: Vec<Arc<DnsClient>>,
 }
 
 impl Default for NameserverPolicy {
@@ -130,16 +134,32 @@ impl NameserverPolicy {
             exact: HashMap::new(),
             wildcard: DomainTrie::new(),
             matchers: Vec::new(),
+            clients: Vec::new(),
         }
     }
 
     pub fn insert_exact(&mut self, domain: String, entry: PolicyEntry) {
+        self.track_clients(&entry);
         self.exact.insert(domain, entry);
+    }
+
+    fn track_clients(&mut self, entry: &PolicyEntry) {
+        for client in &entry.nameservers {
+            if !self.clients.iter().any(|known| Arc::ptr_eq(known, client)) {
+                self.clients.push(Arc::clone(client));
+            }
+        }
+    }
+
+    /// Every distinct upstream client this policy can route to.
+    pub fn clients(&self) -> &[Arc<DnsClient>] {
+        &self.clients
     }
 
     /// Insert a `+.` wildcard pattern. Also inserts an exact match for the root
     /// domain since `DomainTrie`'s `+.` semantics don't include the root itself.
     pub fn insert_wildcard(&mut self, pattern: &str, entry: PolicyEntry) {
+        self.track_clients(&entry);
         // Insert root domain explicitly: DomainTrie's +. doesn't match root.
         if let Some(bare) = pattern.strip_prefix("+.") {
             self.exact
@@ -150,6 +170,7 @@ impl NameserverPolicy {
     }
 
     pub fn insert_matcher(&mut self, matcher: NameserverPolicyMatcher, entry: PolicyEntry) {
+        self.track_clients(&entry);
         self.matchers.push(MatcherPolicyEntry { matcher, entry });
     }
 
@@ -1963,6 +1984,34 @@ impl Resolver {
         self.cache.clear();
     }
 
+    /// Drop pooled upstream connections so the next query dials a fresh
+    /// socket — mihomo's `resolver.ResetConnection()`, which `ApplyConfig`
+    /// runs on every config apply. Used when the outbound-interface binding
+    /// changes (issue #695): a pooled socket created before the binding
+    /// stays unbound and, under `tun.auto-route: global`, loops into the TUN.
+    ///
+    /// Resets every upstream this resolver queries — main, fallback, and
+    /// nameserver-policy clients ([`DnsClient::reset_connections`]).
+    /// Pools in other resolvers (the `proxy-server-nameserver` host hook)
+    /// are reached by [`crate::client::reset_pooled_connections`].
+    /// Non-blocking. In-flight queries finish on the connection they already
+    /// hold, bounded by the per-query timeout, and close it afterwards
+    /// instead of pooling it; the cache is untouched. Returns the number of
+    /// idle connections closed now.
+    pub fn reset_connections(&self) -> usize {
+        let fallback = self.fallback.as_deref().unwrap_or_default();
+        let policy = self
+            .policy
+            .as_ref()
+            .map_or(&[][..], NameserverPolicy::clients);
+        self.main
+            .iter()
+            .chain(fallback)
+            .chain(policy)
+            .map(|client| client.reset_connections())
+            .sum()
+    }
+
     pub fn dns_results(&self, search: Option<&str>, limit: usize) -> Vec<DnsCacheSnapshotEntry> {
         let search = search
             .map(str::trim)
@@ -2041,6 +2090,94 @@ mod tests {
                 .unwrap();
         });
         addr
+    }
+
+    /// Persistent `tcp://` upstream answering every query with an empty
+    /// NOERROR, counting accepted connections.
+    async fn counting_tcp_upstream(accepted: Arc<AtomicUsize>) -> SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                accepted.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    loop {
+                        let mut len = [0u8; 2];
+                        if stream.read_exact(&mut len).await.is_err() {
+                            return;
+                        }
+                        let mut request = vec![0u8; u16::from_be_bytes(len) as usize];
+                        if stream.read_exact(&mut request).await.is_err() {
+                            return;
+                        }
+                        let request = Message::from_bytes(&request).unwrap();
+                        let mut response =
+                            Message::new(request.metadata.id, MessageType::Response, OpCode::Query);
+                        response.add_queries(request.queries.iter().cloned());
+                        let wire = response.to_bytes().unwrap();
+                        let mut framed = (wire.len() as u16).to_be_bytes().to_vec();
+                        framed.extend_from_slice(&wire);
+                        if stream.write_all(&framed).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// Issue #695: `reset_connections` reaches every upstream the resolver
+    /// can query — main, fallback, and a nameserver-policy client reachable
+    /// only through the (non-iterable) wildcard trie.
+    #[tokio::test]
+    async fn reset_connections_reaches_main_fallback_and_policy_pools() {
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let addr = counting_tcp_upstream(Arc::clone(&accepted)).await;
+        let main = Arc::new(DnsClient::tcp(addr));
+        let fallback = Arc::new(DnsClient::tcp(addr));
+        let policy_client = Arc::new(DnsClient::tcp(addr));
+        let mut policy = NameserverPolicy::new();
+        policy.insert_wildcard(
+            "+.corp.example",
+            PolicyEntry {
+                nameservers: vec![Arc::clone(&policy_client)],
+            },
+        );
+        assert_eq!(
+            policy.clients().len(),
+            1,
+            "the wildcard's root-domain alias must not double-track the client"
+        );
+        let mut resolver = Resolver::new(
+            vec![],
+            vec![],
+            DnsMode::Normal,
+            DomainTrie::new(),
+            true,
+            false,
+        );
+        resolver.main = vec![Arc::clone(&main)];
+        resolver.fallback = Some(vec![Arc::clone(&fallback)]);
+        resolver.policy = Some(policy);
+
+        let clients = [&main, &fallback, &policy_client];
+        for client in clients {
+            client.query("warm.example", RecordType::A).await.unwrap();
+        }
+        assert_eq!(accepted.load(Ordering::SeqCst), 3);
+
+        assert_eq!(resolver.reset_connections(), 3);
+        for client in clients {
+            client.query("fresh.example", RecordType::A).await.unwrap();
+        }
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            6,
+            "every upstream must redial after the reset"
+        );
     }
 
     #[test]

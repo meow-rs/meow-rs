@@ -851,10 +851,20 @@ impl Drop for MapEntryGuard {
     }
 }
 
-impl Drop for Session {
-    fn drop(&mut self) {
+impl Session {
+    /// Tear the session down now even while streams still hold it: marks it
+    /// dead (every stream fails) and stops the reader/writer/keepalive tasks,
+    /// which drops the physical connection. Used by pool resets when the
+    /// outbound-interface binding changes (issue #695). Idempotent.
+    pub fn close(&self) {
         self.state.mark_dead();
         self.cancel.cancel();
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.close();
     }
 }
 

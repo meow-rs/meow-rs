@@ -77,6 +77,30 @@ impl RouteTable {
     }
 }
 
+/// Whether [`Tunnel::flush_for_outbound_interface_change`] cancels tracked
+/// TCP flows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackedTcp {
+    /// Cancel them — the warm reload path ([`Tunnel::update_routing`])
+    /// preserves tracked TCP.
+    Cancel,
+    /// The caller already did ([`Tunnel::reload_routing`]).
+    AlreadyCancelled,
+}
+
+/// What [`Tunnel::flush_for_outbound_interface_change`] tore down.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OutboundFlush {
+    /// Tracked TCP flows cancelled (0 for [`TrackedTcp::AlreadyCancelled`]).
+    pub tcp: usize,
+    /// UDP sessions closed — see [`Tunnel::close_all_udp_sessions`].
+    pub udp: usize,
+    /// Idle pooled upstream DNS connections of the live resolver dropped.
+    pub dns: usize,
+    /// Distinct adapters (groups included) whose sessions were reset.
+    pub adapters: usize,
+}
+
 pub struct TunnelInner {
     pub mode: RwLock<TunnelMode>,
     /// Current route table (rules + domain index + proxies), replaced
@@ -125,6 +149,10 @@ pub struct TunnelInner {
     /// install republishes the live proxies map into it so provider nodes —
     /// which persist across config rebuilds — always resolve current names.
     dialer_registry: std::sync::OnceLock<meow_proxy::dialer::ProxyRegistry>,
+    /// UDP flush signal (issue #695): bumped by
+    /// [`Tunnel::close_all_udp_sessions`]; every listener-owned UDP flow
+    /// holds a receiver ([`udp::UdpFlushWatch`]).
+    udp_flush: tokio::sync::watch::Sender<u64>,
 }
 
 /// A running TUN listener: the task plus the signal resolving once its
@@ -194,6 +222,13 @@ impl TunnelInner {
     /// `Arc` clone. Always reflects the latest `Tunnel::set_resolver`.
     pub fn resolver(&self) -> Arc<Resolver> {
         Arc::clone(&self.resolver.read())
+    }
+
+    /// Subscribe a UDP flow to [`Tunnel::close_all_udp_sessions`] (issue
+    /// #695). Take it before dialling the flow's outbound; see
+    /// [`udp::UdpFlushWatch`].
+    pub fn udp_flush_watch(&self) -> udp::UdpFlushWatch {
+        udp::UdpFlushWatch::new(self.udp_flush.subscribe())
     }
 
     /// Rewrite a fake-IP destination back to its real hostname before rule
@@ -650,6 +685,7 @@ impl Tunnel {
                 needs_process_lookup: AtomicBool::new(false),
                 tun_handle: RwLock::new(None),
                 dialer_registry: std::sync::OnceLock::new(),
+                udp_flush: tokio::sync::watch::Sender::new(0),
             }),
         }
     }
@@ -838,6 +874,78 @@ impl Tunnel {
         drop(old);
         info!("Routing configuration reloaded");
         closed
+    }
+
+    /// Close every UDP session the tunnel can reach and return how many:
+    /// the tunnel's own NAT table (drained, each conn closed) plus every
+    /// listener-owned flow holding a [`udp::UdpFlushWatch`] — those end on
+    /// their own once signalled, including flows still dialling. Clients'
+    /// next datagrams open fresh flows with fresh dials. Issue #695.
+    pub fn close_all_udp_sessions(&self) -> usize {
+        let mut closed = 0;
+        self.inner.nat_table.retain(|_, session| {
+            let _ = session.conn.close();
+            closed += 1;
+            false
+        });
+        closed += self.inner.udp_flush.receiver_count();
+        self.inner
+            .udp_flush
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
+        closed
+    }
+
+    /// Tear down every outbound session that may ride a socket created
+    /// before the outbound-interface binding changed (issue #695): under
+    /// `tun.auto-route: global` such a socket is unbound and loops back into
+    /// the TUN device. Call after the new binding is installed
+    /// (`meow_common::outbound_iface`), so everything redialled is bound.
+    ///
+    /// In order: resets the cached transport sessions
+    /// ([`ProxyAdapter::reset_sessions`]) of every distinct adapter
+    /// reachable from the live route table and `extra_roots` (e.g.
+    /// proxy-provider members no group references) — first, so the
+    /// reconnects the teardown below provokes cannot reuse a stale session;
+    /// drops pooled upstream DNS connections (the live resolver's now, every
+    /// other resolver's on next use); cancels tracked TCP flows unless
+    /// `tcp` says the caller already did; closes every UDP session
+    /// ([`Self::close_all_udp_sessions`]). Logs one info line.
+    ///
+    /// Non-blocking and safe under concurrent dials: pools whose locks are
+    /// contended defer their drain, and a dial straddling the flush is
+    /// discarded rather than cached.
+    pub fn flush_for_outbound_interface_change<I>(
+        &self,
+        tcp: TrackedTcp,
+        extra_roots: I,
+    ) -> OutboundFlush
+    where
+        I: IntoIterator<Item = Arc<dyn Proxy>>,
+    {
+        let route = self.inner.route();
+        let adapters = meow_common::reset_sessions_reachable(
+            route.proxies.values().cloned().chain(extra_roots),
+        );
+        drop(route);
+        let dns = self.resolver().reset_connections();
+        meow_dns::reset_pooled_connections();
+        let tcp = match tcp {
+            TrackedTcp::Cancel => self.inner.stats.close_all_connections_counted(),
+            TrackedTcp::AlreadyCancelled => 0,
+        };
+        let udp = self.close_all_udp_sessions();
+        let flush = OutboundFlush {
+            tcp,
+            udp,
+            dns,
+            adapters,
+        };
+        info!(
+            "Outbound interface binding changed: closed {tcp} TCP connections, \
+             {udp} UDP sessions, {dns} pooled DNS connections; reset sessions \
+             of {adapters} adapters"
+        );
+        flush
     }
 
     fn install_routing(&self, route: Arc<RouteTable>) -> Arc<RouteTable> {
@@ -1826,6 +1934,170 @@ mod tests {
         assert_eq!(
             resolved.rule_name, "PROCESS-NAME",
             "PROCESS-NAME rule must match the enrichment done inside resolve_proxy"
+        );
+    }
+
+    /// Adapter counting `reset_sessions` calls; a group when `members` is
+    /// non-empty.
+    struct ResetCounting {
+        resets: std::sync::atomic::AtomicUsize,
+        members: Vec<Arc<dyn Proxy>>,
+        health: meow_common::ProxyHealth,
+    }
+
+    impl ResetCounting {
+        fn new(members: Vec<Arc<dyn Proxy>>) -> Arc<Self> {
+            Arc::new(Self {
+                resets: std::sync::atomic::AtomicUsize::new(0),
+                members,
+                health: meow_common::ProxyHealth::new(),
+            })
+        }
+
+        fn resets(&self) -> usize {
+            self.resets.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl meow_common::ProxyAdapter for ResetCounting {
+        fn name(&self) -> &str {
+            "reset-counting"
+        }
+        fn adapter_type(&self) -> AdapterType {
+            AdapterType::Direct
+        }
+        fn addr(&self) -> &str {
+            ""
+        }
+        fn support_udp(&self) -> bool {
+            false
+        }
+        async fn dial_tcp(
+            &self,
+            _metadata: &Metadata,
+        ) -> meow_common::Result<Box<dyn meow_common::ProxyConn>> {
+            Err(meow_common::MeowError::NotSupported(
+                "reset-counting".into(),
+            ))
+        }
+        async fn dial_udp(
+            &self,
+            _metadata: &Metadata,
+        ) -> meow_common::Result<Box<dyn meow_common::ProxyPacketConn>> {
+            Err(meow_common::MeowError::NotSupported(
+                "reset-counting".into(),
+            ))
+        }
+        fn reset_sessions(&self) {
+            self.resets.fetch_add(1, Ordering::SeqCst);
+        }
+        fn health(&self) -> &meow_common::ProxyHealth {
+            &self.health
+        }
+    }
+
+    impl Proxy for ResetCounting {
+        fn alive(&self) -> bool {
+            true
+        }
+        fn alive_for_url(&self, _url: &str) -> bool {
+            true
+        }
+        fn last_delay(&self) -> u16 {
+            0
+        }
+        fn last_delay_for_url(&self, _url: &str) -> u16 {
+            0
+        }
+        fn delay_history(&self) -> Vec<meow_common::DelayHistory> {
+            Vec::new()
+        }
+        fn member_proxies(&self) -> Option<Vec<Arc<dyn Proxy>>> {
+            (!self.members.is_empty()).then(|| self.members.clone())
+        }
+    }
+
+    fn tracked_tcp(tunnel: &Tunnel) -> crate::ConnectionGuard<'_> {
+        crate::ConnectionGuard::track(
+            tunnel.statistics(),
+            Metadata {
+                network: meow_common::Network::Tcp,
+                host: "example.com".into(),
+                dst_port: 443,
+                ..Default::default()
+            },
+            "MATCH".into(),
+            "".into(),
+            smallvec::smallvec![],
+        )
+    }
+
+    /// Issue #695: the flush resets every distinct adapter reachable from
+    /// the route table and the extra roots exactly once (a leaf shared by a
+    /// group and the map included), cancels tracked TCP only when asked, and
+    /// closes the tunnel's and the listeners' UDP sessions.
+    #[tokio::test]
+    async fn outbound_interface_flush_resets_reachable_adapters_and_closes_flows() {
+        let tunnel = test_tunnel();
+        let in_group = ResetCounting::new(vec![]);
+        let shared = ResetCounting::new(vec![]);
+        let group = ResetCounting::new(vec![
+            Arc::clone(&in_group) as Arc<dyn Proxy>,
+            Arc::clone(&shared) as Arc<dyn Proxy>,
+        ]);
+        let provider_only = ResetCounting::new(vec![]);
+        let mut proxies: HashMap<SmolStr, Arc<dyn Proxy>> = HashMap::new();
+        proxies.insert("GROUP".into(), Arc::clone(&group) as Arc<dyn Proxy>);
+        proxies.insert("SHARED".into(), Arc::clone(&shared) as Arc<dyn Proxy>);
+        tunnel.update_routing(proxies, vec![], Default::default());
+
+        let first = tracked_tcp(&tunnel);
+        let second = tracked_tcp(&tunnel);
+        tunnel.inner().nat_table.insert(
+            (
+                "127.0.0.1:1000".parse().unwrap(),
+                "198.51.100.1:443".parse().unwrap(),
+            ),
+            Arc::new(crate::udp::UdpSession::new(
+                meow_proxy::RejectAdapter::new(false)
+                    .dial_udp(&Metadata::default())
+                    .await
+                    .expect("reject packet conn"),
+                Arc::from("test"),
+            )),
+        );
+        let listener_flow = tunnel.inner().udp_flush_watch();
+
+        let flush = tunnel.flush_for_outbound_interface_change(
+            TrackedTcp::Cancel,
+            [Arc::clone(&provider_only) as Arc<dyn Proxy>],
+        );
+        assert_eq!(
+            flush,
+            OutboundFlush {
+                tcp: 2,
+                udp: 2,
+                dns: 0,
+                adapters: 4,
+            }
+        );
+        for adapter in [&group, &in_group, &shared, &provider_only] {
+            assert_eq!(adapter.resets(), 1, "each adapter is reset exactly once");
+        }
+        assert!(first.run_until_closed(async {}).await.is_none());
+        assert!(second.run_until_closed(async {}).await.is_none());
+        assert!(tunnel.inner().nat_table.is_empty());
+        assert!(listener_flow.is_flushed());
+        drop((first, second, listener_flow));
+
+        // A cold reload already cancelled TCP: the flush leaves it alone.
+        let survivor = tracked_tcp(&tunnel);
+        let flush = tunnel.flush_for_outbound_interface_change(TrackedTcp::AlreadyCancelled, []);
+        assert_eq!((flush.tcp, flush.udp, flush.adapters), (0, 0, 3));
+        assert_eq!(
+            survivor.run_until_closed(async { "relay" }).await,
+            Some("relay")
         );
     }
 }
