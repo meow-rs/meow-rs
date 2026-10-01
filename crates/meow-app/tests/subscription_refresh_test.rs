@@ -10,7 +10,7 @@
 use dashmap::DashMap;
 use meow_common::DnsMode;
 use meow_config::proxy_provider::{load_proxy_providers, ProxyProvider};
-use meow_config::raw::RawConfig;
+use meow_config::raw::{RawConfig, RawSubscription};
 use meow_config::rule_provider_refresh::RefreshSupervisor;
 use meow_dns::Resolver;
 use meow_proxy::SelectorStore;
@@ -343,6 +343,40 @@ async fn delete_during_in_flight_refresh_discards_payload() {
     )
     .await;
     let fx = fixture_at(sub_addr).await;
+
+    // Marker subscription iterated AFTER `s` in the same pass (the loop
+    // walks `subscriptions` in order and each entry's fetch → in-lane
+    // section is fully awaited before the next begins — subscription_refresh.rs).
+    // `s`'s gated fetch blocks the whole pass, so `marker`'s commit is
+    // reachable only once `s`'s in-lane recheck has run: observing
+    // `marker-node` in the tunnel is the deterministic "s's section is
+    // done" signal that replaces the old 500 ms lane-queueing bet
+    // (issue #641).
+    let marker_addr = spawn_origin(
+        "proxies:\n\
+         \x20 - name: marker-node\n\
+         \x20   type: http\n\
+         \x20   server: 127.0.0.1\n\
+         \x20   port: 9\n\
+         rules:\n\
+         \x20 - MATCH,DIRECT\n",
+    )
+    .await;
+    fx.raw_config
+        .write()
+        .subscriptions
+        .as_mut()
+        .unwrap()
+        .push(RawSubscription {
+            name: "marker".into(),
+            url: format!("http://{marker_addr}/sub"),
+            interval: Some(3600),
+            last_updated: None,
+            proxy: None,
+            applied_proxies: Vec::new(),
+            applied_groups: Vec::new(),
+            applied_rules: Vec::new(),
+        });
     spawn_loop(&fx);
 
     // The fetch is in flight; park the loop on the mutation lane while
@@ -355,10 +389,12 @@ async fn delete_during_in_flight_refresh_discards_payload() {
         .expect("origin must see the request");
     let lane = meow_api::routes::CONFIG_MUTATION.lock().await;
     go_tx.send(()).expect("origin must still be listening");
-    // Let the loop consume the response and queue on the lane — it
-    // cannot run its commit section while we hold it, so the delete
-    // below is guaranteed to precede the candidate build.
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    // The fetch response was only released after we acquired the lane, so
+    // the loop cannot already be inside it — whenever its lane request
+    // lands it queues behind us, and the delete below mutates the live
+    // raw *before* we release. Its in-lane recheck therefore runs
+    // strictly after the delete. `marker` survives the retain so its own
+    // commit can proceed past `s`'s discard.
     {
         let mut live = fx.raw_config.write();
         if let Some(subs) = live.subscriptions.as_mut() {
@@ -370,10 +406,18 @@ async fn delete_during_in_flight_refresh_discards_payload() {
     }
     drop(lane);
 
-    // tokio's Mutex is FIFO-fair: this re-acquisition queues behind the
-    // parked loop and resolves only after its in-lane section (recheck →
-    // discard, or a buggy commit) has run to completion.
-    let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
+    // `marker`'s commit is strictly ordered after `s`'s in-lane section
+    // by the sequential pass — once its node is in the tunnel, `s`'s
+    // recheck (discard, or a buggy commit) has already run.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while fx.tunnel.proxy("marker-node").is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "marker subscription never committed — the refresh loop stalled \
+             before finishing 's'"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
     assert!(
         fx.tunnel.proxy("resurrected").is_none(),
         "a deleted subscription's fetched payload must not be committed"

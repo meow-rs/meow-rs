@@ -36,8 +36,27 @@ async fn start_mixed_listener(echo_addr: std::net::SocketAddr) -> u16 {
         let _ = listener.run().await;
     });
 
-    // Give the listener a moment to bind.
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    // Poll until the listener actually accepts — the bind happens inside
+    // the spawned task, so a fixed settle is a startup race (issue #641).
+    // The deadline is a std Instant: it stays real-time even if this test
+    // were ever switched to `start_paused`.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match tokio::time::timeout(Duration::from_secs(1), TcpStream::connect(bind)).await {
+            Err(_) if std::time::Instant::now() >= deadline => {
+                panic!("mixed listener never came up: connect timed out")
+            }
+            Err(_) => {}
+            Ok(Ok(probe)) => {
+                drop(probe);
+                break;
+            }
+            Ok(Err(_)) if std::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            Ok(Err(e)) => panic!("mixed listener never came up: {e}"),
+        }
+    }
     port
 }
 

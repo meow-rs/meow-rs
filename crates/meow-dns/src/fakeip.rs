@@ -1194,8 +1194,25 @@ mod tests {
             let store = Arc::new(FileStore::open(&path).unwrap());
             let pool = Pool::new(net, store).unwrap();
             ip = pool.lookup("example.com");
-            // Wait for the debounced background persistence to complete.
-            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            // Poll for the debounced (1 s) background persistence instead
+            // of betting on a fixed settle (issue #641): the snapshot is
+            // atomic (tmp + rename), so a parsed `entries` hit means the
+            // flush completed.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let done = fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+                    .is_some_and(|snap| snap["entries"]["example.com"].is_string());
+                if done {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "fakeip snapshot never persisted to {path:?}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
         }
         // Re-open; mapping must survive.
         {

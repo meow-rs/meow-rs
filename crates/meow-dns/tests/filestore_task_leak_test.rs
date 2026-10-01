@@ -14,7 +14,7 @@
 //! alive-task count returns to baseline. It FAILS if the abort-on-drop
 //! regresses.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use meow_dns::fakeip::FileStore;
 
@@ -23,9 +23,21 @@ async fn filestore_does_not_leak_flush_task_on_drop() {
     let handle = tokio::runtime::Handle::current();
     let tmp = std::env::temp_dir();
 
-    // Settle, then snapshot the alive-task count.
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    let baseline = handle.metrics().num_alive_tasks();
+    // Baseline: poll the alive-task count until two consecutive reads
+    // agree — a fixed settle is a scheduling bet, and an inflated
+    // baseline would hide leaks (issue #641).
+    let baseline = {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut prev = handle.metrics().num_alive_tasks();
+        loop {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let cur = handle.metrics().num_alive_tasks();
+            if cur == prev || Instant::now() >= deadline {
+                break cur;
+            }
+            prev = cur;
+        }
+    };
 
     const N: usize = 50;
     for i in 0..N {
@@ -36,10 +48,16 @@ async fn filestore_does_not_leak_flush_task_on_drop() {
         let _ = std::fs::remove_file(&path);
     }
 
-    // Give any (correct) drop-time cleanup time to run.
-    // Allow abort-on-drop cancellations to be reaped by the runtime.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let after = handle.metrics().num_alive_tasks();
+    // Poll until the runtime reaps the abort-on-drop cancellations
+    // instead of betting on a fixed settle (issue #641). The deadline is
+    // a std Instant on purpose — it stays real-time even if this test
+    // were ever switched to `start_paused`.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut after = handle.metrics().num_alive_tasks();
+    while after > baseline + 2 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        after = handle.metrics().num_alive_tasks();
+    }
     let leaked = after.saturating_sub(baseline);
 
     println!(

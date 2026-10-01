@@ -438,6 +438,24 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **Windows SCM status polling now scales with the service-advertised
+  `wait_hint`** (issue #641). `meow install`/`uninstall` polled service
+  status at a fixed 250 ms regardless of the SCM wait hint the pending
+  operation advertised; polls now run at
+  `wait_hint / 10` clamped to `[10 ms, 250 ms]` — quicker transitions
+  get quicker observation, and a zero/absent hint cannot hot-spin.
+
+- **Test-side fixed settles replaced by deterministic waits** (issue
+  #641): `mixed_dispatch.rs` polls the port instead of a 20 ms
+  bind-settle; `filestore_task_leak_test.rs` polls
+  `num_alive_tasks` (stable-baseline + reaped) instead of 20/200 ms
+  settles; `fakeip.rs`'s `file_store_roundtrip` polls the snapshot
+  file contents instead of a 1.5 s debounce wait; and the
+  `subscription_refresh_test` lane-queueing bet is replaced by a marker
+  subscription ordered after the gated one — the sequential pass makes
+  its commit reachable only after the deleted entry's in-lane recheck
+  has run.
+
 - **Subscription apply is now a contribution merge, not a wholesale
   replace** (issue #640). `POST /api/subscriptions`, manual refresh, and
   interval refresh used to overwrite `proxies:`/`proxy-groups:`/`rules:`

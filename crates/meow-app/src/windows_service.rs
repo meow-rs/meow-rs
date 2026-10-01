@@ -33,6 +33,14 @@ const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const START_PENDING_WAIT_HINT: Duration = Duration::from_secs(15);
 const STARTUP_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Poll cadence honoring the service's advertised `wait_hint` (issue
+/// #641): a tenth of the hint, clamped to a sane floor so a zero hint
+/// cannot hot-spin and to the historic interval so a huge hint cannot
+/// stall progress observation.
+fn status_poll_interval(wait_hint: Duration) -> Duration {
+    (wait_hint / 10).clamp(Duration::from_millis(10), POLL_INTERVAL)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ServicePhase {
     Starting,
@@ -234,7 +242,18 @@ pub(super) fn uninstall() -> Result<()> {
             }
             Err(error) if is_winapi_error(&error, ERROR_SERVICE_MARKED_FOR_DELETE) => {}
             Err(error) => return Err(error).context("failed while waiting for service deletion"),
-            Ok(service) => drop(service),
+            Ok(service) => {
+                // Unknown hint (query failed on a doomed service) keeps
+                // the historic cadence rather than polling hot.
+                let interval = service
+                    .query_status()
+                    .map_or(POLL_INTERVAL, |s| status_poll_interval(s.wait_hint));
+                // Release the handle before sleeping so SCM can finalize
+                // the deletion between polls.
+                drop(service);
+                thread::sleep(interval);
+                continue;
+            }
         }
         thread::sleep(POLL_INTERVAL);
     }
@@ -496,7 +515,7 @@ fn wait_until_running(
                 last_checkpoint.unwrap_or(0)
             )
         }
-        thread::sleep(POLL_INTERVAL);
+        thread::sleep(status_poll_interval(status.wait_hint));
     }
 }
 
@@ -520,7 +539,7 @@ fn stop_and_wait(service: &windows_service::service::Service, timeout: Duration)
         if Instant::now() >= deadline {
             anyhow::bail!("timed out waiting for the meow service to stop");
         }
-        thread::sleep(POLL_INTERVAL);
+        thread::sleep(status_poll_interval(status.wait_hint));
     }
 }
 
@@ -592,6 +611,29 @@ fn format_service_status(status: &ServiceStatus) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_poll_interval_scales_with_wait_hint_within_bounds() {
+        // A zero/absent hint must not hot-spin; a huge hint must not
+        // poll slower than the historic fixed cadence.
+        assert_eq!(
+            status_poll_interval(Duration::ZERO),
+            Duration::from_millis(10)
+        );
+        assert_eq!(
+            status_poll_interval(Duration::from_millis(100)),
+            Duration::from_millis(10)
+        );
+        assert_eq!(
+            status_poll_interval(Duration::from_secs(1)),
+            Duration::from_millis(100)
+        );
+        assert_eq!(status_poll_interval(Duration::from_secs(30)), POLL_INTERVAL);
+        assert_eq!(
+            status_poll_interval(Duration::from_secs(3600)),
+            POLL_INTERVAL
+        );
+    }
 
     #[test]
     fn service_info_preserves_unicode_paths_and_expected_launch_order() {
