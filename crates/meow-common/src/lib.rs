@@ -50,7 +50,7 @@ pub use metadata::{metadata_ip_literal, AddrDisplay, Metadata};
 pub use network::Network;
 #[cfg(target_os = "linux")]
 pub use outbound_iface::apply_outbound_interface;
-pub use outbound_iface::{clear_outbound_interface, outbound_interface, set_outbound_interface};
+pub use outbound_iface::{install_outbound_interface, outbound_interface, OutboundIfaceGuard};
 pub use process_lookup::{find_process, find_process_async, ProcessInfo};
 pub use replay_window::ReplayWindow;
 pub use rule::{Rule, RuleMatchHelper, RuleType, TargetCheck, TargetProbe};

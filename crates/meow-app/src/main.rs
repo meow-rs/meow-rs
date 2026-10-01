@@ -581,21 +581,16 @@ type EarlyOutboundBinding = Option<std::convert::Infallible>;
 /// sockets; the TUN listener then adopts the binding instead of installing
 /// its own (`TunListener::with_outbound_binding`).
 ///
-/// A no-op (`None`) unless the raw config selects an enabled TUN with
+/// Shares [`meow_api::preinstall_global_route_binding`] with the config
+/// reload paths, so startup and reload agree on when a binding is due: a
+/// no-op (`None`) unless the raw config selects an enabled TUN with
 /// `auto-route: global` — TUN-off and fake-IP-scope startups are untouched.
 /// An install failure is not fatal here: the listener retries before it
 /// touches any route and fails closed with the same error, exactly as
 /// before, and until then no global route exists for a socket to loop on.
 #[cfg(feature = "listener-tun")]
 fn preinstall_global_route_binding(raw: &meow_config::raw::RawConfig) -> EarlyOutboundBinding {
-    let iface = meow_config::global_route_outbound_interface(raw.tun.as_ref())?;
-    match meow_listener::OutboundBinding::install(iface.as_deref()) {
-        Ok(binding) => Some(binding),
-        Err(e) => {
-            tracing::debug!("early outbound-interface binding failed ({e}); TUN startup retries");
-            None
-        }
-    }
+    meow_api::preinstall_global_route_binding(raw).into_binding()
 }
 
 #[cfg(not(feature = "listener-tun"))]

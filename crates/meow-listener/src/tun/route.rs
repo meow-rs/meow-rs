@@ -53,8 +53,11 @@ impl Drop for RouteGuard {
 /// Detect the physical interface carrying the IPv4 default route, for
 /// global route scope's outbound-socket binding (#375). Linux-only for now:
 /// reads `/proc/net/route` and returns the interface of the first UP
-/// `0.0.0.0/0` entry — captured **before** the TUN's own split defaults go
-/// in, so the TUN device can never be the answer.
+/// `0.0.0.0/0` entry. The TUN's own split defaults are never the answer,
+/// even when they are installed: a config reload detects the new
+/// configuration's interface while the old global-scope listener's routes
+/// still exist (issue #695), and the kernel lists `0.0.0.0/1` *before* the
+/// real default — so the mask must be `/0`, not just the destination.
 pub(super) fn default_interface() -> std::io::Result<String> {
     #[cfg(target_os = "linux")]
     {
@@ -78,19 +81,19 @@ pub(super) fn default_interface() -> std::io::Result<String> {
 /// Pure parser behind [`default_interface`], split out for unit testing on
 /// every host (hence `test` in the cfg — only Linux uses it at runtime).
 /// `/proc/net/route` columns: Iface, Destination (hex LE),
-/// Gateway, Flags (hex; bit 0 = RTF_UP), … A default route has destination
-/// `00000000` and the UP flag set.
+/// Gateway, Flags (hex; bit 0 = RTF_UP), RefCnt, Use, Metric, Mask, … A
+/// default route has destination `00000000`, mask `00000000` (a split
+/// `0.0.0.0/1` shares the destination but has mask `00000080`) and the UP
+/// flag set.
 #[cfg(any(target_os = "linux", test))]
 fn parse_default_interface(table: &str) -> Option<String> {
     for line in table.lines().skip(1) {
-        let mut cols = line.split_whitespace();
-        let (Some(iface), Some(dest), _gateway, Some(flags)) =
-            (cols.next(), cols.next(), cols.next(), cols.next())
-        else {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        let [iface, dest, _gateway, flags, _refcnt, _use, _metric, mask, ..] = cols[..] else {
             continue;
         };
         let up = u32::from_str_radix(flags, 16).is_ok_and(|f| f & 0x1 != 0);
-        if dest == "00000000" && up {
+        if dest == "00000000" && mask == "00000000" && up {
             return Some(iface.to_string());
         }
     }
@@ -120,5 +123,28 @@ eth0\t0001A8C0\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0
         assert_eq!(parse_default_interface(&down), None);
         assert_eq!(parse_default_interface("Iface\tDestination\n"), None);
         assert_eq!(parse_default_interface(""), None);
+    }
+
+    /// Issue #695: a reload detects the interface while the running global
+    /// listener's split defaults are installed, and the kernel lists
+    /// `0.0.0.0/1` ahead of the real default (captured from a live table
+    /// with `0.0.0.0/1` + `128.0.0.0/1` on the TUN).
+    #[test]
+    fn skips_the_tun_split_default_routes() {
+        let table = "\
+Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT
+meow-tun\t00000000\t00000000\t0001\t0\t0\t0\t00000080\t0\t0\t0
+eth0\t00000000\t010011AC\t0003\t0\t0\t0\t00000000\t0\t0\t0
+meow-tun\t00000080\t00000000\t0001\t0\t0\t0\t00000080\t0\t0\t0
+eth0\t000011AC\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0
+";
+        assert_eq!(parse_default_interface(table).as_deref(), Some("eth0"));
+        // Only the split routes left (no real default): nothing to bind to.
+        let only_split: String = table
+            .lines()
+            .filter(|l| !l.starts_with("eth0"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        assert_eq!(parse_default_interface(&only_split), None);
     }
 }

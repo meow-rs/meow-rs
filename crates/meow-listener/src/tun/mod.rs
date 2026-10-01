@@ -42,7 +42,7 @@
 //! installs split default routes (`0.0.0.0/1` + `128.0.0.0/1`), and loop
 //! freedom moves from route scoping to the outbound path — every socket
 //! meow creates is bound to the physical interface
-//! (`meow_common::set_outbound_interface`, `SO_BINDTODEVICE`) before
+//! (`meow_common::install_outbound_interface`, `SO_BINDTODEVICE`) before
 //! connect/bind, and hostname dials resolve through meow's own resolver
 //! hook. Startup fails closed if the binding cannot be installed.
 //!
@@ -305,9 +305,11 @@ struct TunDevice {
     /// this field is dropped, before `device` is destroyed.
     #[allow(dead_code)]
     route_guard: Option<RouteGuard>,
-    /// Held only for its `Drop` side effect — clears the process-global
-    /// outbound-interface binding installed for global route scope (after
-    /// `route_guard` has removed the routes it protects).
+    /// Held only for its `Drop` side effect — gives up this listener's
+    /// ownership of the process-global outbound-interface binding for
+    /// global route scope (after `route_guard` has removed the routes it
+    /// protects). A successor that already installed its own binding keeps
+    /// it; otherwise the binding is cleared.
     #[allow(dead_code)]
     iface_guard: Option<OutboundBinding>,
     pub(super) device: tun_rs::AsyncDevice,
@@ -340,11 +342,12 @@ impl TunListener {
     }
 
     /// Hand over an [`OutboundBinding`] the caller installed early — the
-    /// binary does so before its first startup dial, so no socket predates
-    /// the binding (issue #695). The listener uses it instead of installing
-    /// its own and owns it from here on: it is cleared with the routes on
+    /// binary does so before its first startup dial, and a config reload
+    /// before the reload's first dial, so no socket predates the binding
+    /// (issue #695). The listener uses it instead of installing its own
+    /// and owns it from here on: it is given up with the routes on
     /// teardown, or straight away if startup fails or the listener is
-    /// dropped without running. Ignored (and so cleared) outside global
+    /// dropped without running. Ignored (and so given up) outside global
     /// route scope.
     pub fn with_outbound_binding(mut self, binding: OutboundBinding) -> Self {
         self.outbound_binding = Some(binding);
@@ -509,7 +512,8 @@ impl TunListener {
         // Global route scope (#375): before any routes go in, the
         // outbound-interface binding must be installed so meow's own dials
         // cannot loop back into the device — usually it already is (the
-        // binary installs it before its first startup dial, issue #695).
+        // binary installs it before its first startup dial, a config
+        // reload before the reload's first dial; issue #695).
         // Fail closed — a global default route without working loop
         // avoidance would blackhole the host's connectivity.
         let iface_guard = if cfg.auto_route && cfg.route_scope == TunRouteScope::Global {

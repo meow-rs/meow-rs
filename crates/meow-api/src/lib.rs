@@ -64,6 +64,119 @@ pub fn tun_config_to_listener_config(
     }
 }
 
+/// The TUN listener's outbound-interface binding — or an uninhabited
+/// stand-in in builds without the `listener-tun` feature, where no TUN
+/// (and so no global route scope) can run.
+#[cfg(feature = "listener-tun")]
+pub(crate) type OutboundBinding = meow_listener::OutboundBinding;
+#[cfg(not(feature = "listener-tun"))]
+pub(crate) type OutboundBinding = std::convert::Infallible;
+
+/// A `tun.auto-route: global` outbound-interface binding installed for a
+/// configuration *before* its first dial (issue #695), as returned by
+/// [`preinstall_global_route_binding`]. Holding it keeps the binding in
+/// effect; handing it to the TUN listener the configuration spawns keeps it
+/// in effect for as long as the listener's routes exist; dropping it gives
+/// it up, which restores the binding of a still-running older owner (the
+/// previous configuration's listener) or clears it when there is none.
+#[must_use = "dropping it gives the pre-installed binding up immediately"]
+#[derive(Debug, Default)]
+pub struct PreinstalledBinding {
+    binding: Option<OutboundBinding>,
+    interface_changed: bool,
+}
+
+impl PreinstalledBinding {
+    /// Whether a binding was installed: the configuration selects an
+    /// enabled TUN with `auto-route: global` and the install succeeded.
+    pub fn is_installed(&self) -> bool {
+        self.binding.is_some()
+    }
+
+    /// Whether installing the binding changed the interface in effect —
+    /// none was bound (`None → Some(Y)`) or another one was
+    /// (`Some(X) → Some(Y ≠ X)`). Sockets and pooled sessions created
+    /// before such a transition are not bound to `Y`: they stay unbound
+    /// (or bound to `X`) for life, and once global routes steer through
+    /// the TUN their traffic can loop into it. `false` when nothing was
+    /// installed. Read before installing, so a mutation must evaluate it
+    /// under the `CONFIG_MUTATION` lane it installed in.
+    pub fn interface_changed(&self) -> bool {
+        self.interface_changed
+    }
+
+    /// The binding, for `TunListener::with_outbound_binding`.
+    #[cfg(feature = "listener-tun")]
+    pub fn into_binding(self) -> Option<meow_listener::OutboundBinding> {
+        self.binding
+    }
+
+    /// Move the binding out (into a TUN listener) while keeping
+    /// [`Self::interface_changed`] readable.
+    pub(crate) fn take_binding(&mut self) -> Option<OutboundBinding> {
+        self.binding.take()
+    }
+}
+
+/// Install the `tun.auto-route: global` outbound-interface binding for `raw`
+/// before anything dials on its behalf (issue #695).
+///
+/// The binding is per-socket and applied at creation, so a socket opened
+/// before it exists stays unbound for life and loops into the TUN once the
+/// split default routes go in. Every dial a configuration triggers before
+/// its TUN listener comes up must therefore see the binding already: at
+/// startup the config build's ECH / provider / geodata fetches and
+/// everything `run()` starts ahead of the listener; on a config reload
+/// (`PUT /configs` and every other mutation that commits a candidate) the
+/// candidate's ECH pre-resolution, the rebuild's provider fetches with the
+/// new adapters, the DNS rebuild, and any dial routed through the new
+/// adapters once the route swap publishes them. The (re)spawned listener
+/// adopts the returned binding (`TunListener::with_outbound_binding`)
+/// instead of installing its own, so the binding stays in effect without
+/// a gap across a listener restart.
+///
+/// The registry is owner-aware (`meow_common::OutboundIfaceGuard`): this
+/// install supersedes a running listener's binding without invalidating it.
+/// If the mutation is rejected the returned value is dropped and the
+/// listener's binding is back in effect; if it commits a restart, the old
+/// listener's teardown does not disturb this one.
+///
+/// A no-op (default value) unless `raw` selects an enabled TUN with
+/// `auto-route: global` — TUN-off, fake-IP-scope and `auto-route: false`
+/// configs are untouched. An install failure is not fatal here: the
+/// listener retries before it touches any route and fails closed with the
+/// same error, exactly as before, and until then no global route exists for
+/// a socket to loop on. API callers must hold the `CONFIG_MUTATION` lane
+/// (the registry's before/after comparison and the install must not
+/// interleave with a sibling mutation's).
+#[cfg(feature = "listener-tun")]
+pub fn preinstall_global_route_binding(raw: &RawConfig) -> PreinstalledBinding {
+    let Some(iface) = meow_config::global_route_outbound_interface(raw.tun.as_ref()) else {
+        return PreinstalledBinding::default();
+    };
+    let previous = meow_common::outbound_interface();
+    match meow_listener::OutboundBinding::install(iface.as_deref()) {
+        Ok(binding) => PreinstalledBinding {
+            interface_changed: previous.as_deref() != Some(binding.interface()),
+            binding: Some(binding),
+        },
+        Err(e) => {
+            tracing::debug!(
+                "early outbound-interface binding failed ({e}); the TUN listener retries \
+                 before installing routes"
+            );
+            PreinstalledBinding::default()
+        }
+    }
+}
+
+/// Without the `listener-tun` feature no TUN can run, so there is never a
+/// global-route binding to install.
+#[cfg(not(feature = "listener-tun"))]
+pub fn preinstall_global_route_binding(_raw: &RawConfig) -> PreinstalledBinding {
+    PreinstalledBinding::default()
+}
+
 pub struct ApiServer {
     tunnel: Tunnel,
     listen_addr: SocketAddr,

@@ -138,13 +138,16 @@ How each loop-avoidance piece works:
    marked sockets) is bound to the physical interface with `SO_BINDTODEVICE`
    *before* connect/bind, so its packets take the physical route regardless
    of the routing table. The interface is `tun.outbound-interface` if set,
-   otherwise auto-detected from `/proc/net/route` **before** the split
-   defaults go in. The binding is installed as soon as the config is parsed,
-   ahead of the first startup dial (provider and geodata fetches, health
-   checks), so no long-lived session opened during startup escapes it
-   (#695); the TUN listener then owns it and clears it with its routes. If
-   the binding cannot be installed, startup **fails closed** — no default
-   routes are installed without loop avoidance.
+   otherwise auto-detected from `/proc/net/route` (the real `0.0.0.0/0`
+   entry — the TUN's own `/1` split routes are skipped, so detection is
+   safe while a previous listener's routes are still up). The binding is
+   installed as soon as the config is parsed, ahead of the first startup
+   dial (provider and geodata fetches, health checks), so no long-lived
+   session opened during startup escapes it (#695); the TUN listener then
+   owns it and gives it up with its routes. Runtime reloads do the same —
+   see *Runtime reloads* below. If the binding cannot be installed, startup
+   **fails closed** — no default routes are installed without loop
+   avoidance.
 3. **Own-resolver hostname dials.** Proxy-server domains are resolved
    through meow's resolver hook (installed at startup), not libc's
    `getaddrinfo`, so those lookups don't depend on the OS resolver's
@@ -203,6 +206,31 @@ The PUT still returns 204 — the failure is logged, not surfaced. The
 one case where an unchanged re-PUT does *not* retry is a listener that
 dies *after* a successful start (no rollback ran, committed stays
 `true`); revival there needs an `enable` flip or a parameter change.
+
+In global route mode a reload binds outbound sockets before its first dial,
+exactly like startup (#695). A `PUT /configs` whose candidate has
+`auto-route: global` installs the candidate's binding right after taking
+the config-mutation lane — before the ECH pre-resolve, the config build's
+provider fetches and the health checks the swap restarts — and hands it to
+the (re)spawned listener. (The proxy / group / subscription commits that
+share the lane pre-install too, but they never change `tun:`, so with
+global scope running the binding is already in effect for them.) The
+binding is owned, not set: owners stack, and the newest live one is in
+effect, so
+
+- a **rejected** PUT (or a failed spawn) gives its binding up and the
+  running listener's is back in effect — or none, if TUN was off;
+- a **global → global restart** (e.g. an `mtu` change) never leaves a gap:
+  the new binding is in effect before the old listener is stopped, and the
+  old listener's teardown cannot clear it;
+- an `outbound-interface` change (or off → global) takes effect for every
+  socket the reload opens. Sockets opened *before* the reload keep the
+  route they were created with until they close.
+
+Non-global candidates (`auto-route: true`/`fake-ip`/`false`, TUN disabled)
+install nothing. A pre-install failure is not fatal — it is logged at
+debug and the listener retries before installing routes, failing closed as
+at startup.
 
 ## Relationship to the tproxy inbound
 

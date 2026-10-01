@@ -31,6 +31,7 @@ use meow_listener::TunListener;
 
 use crate::log_stream::{parse_log_level, LogMessage};
 use crate::ui;
+use crate::{preinstall_global_route_binding, OutboundBinding, PreinstalledBinding};
 
 struct MaybeWebSocket(Option<WebSocketUpgrade>);
 
@@ -1106,10 +1107,11 @@ async fn apply_raw_to_tunnel(
         .map(|group| group.name.clone())
         .collect();
     // Defect-check only, no DNS: every writer preresolves ECH into the
-    // stored raw before the lane (PUT /configs, subscription add/refresh),
-    // so remaining work here would be retrying a previously-failed lookup —
-    // an async network call that would serialize every other commit behind
-    // it (issue #533 review).
+    // stored raw before committing (subscription add/refresh before the
+    // lane; PUT /configs in the lane, under its pre-installed binding —
+    // issue #695), so remaining work here would be retrying a
+    // previously-failed lookup — an async network call that would
+    // serialize every other commit behind it (issue #533 review).
     if let Some(ps) = raw.proxies.as_ref() {
         meow_config::ech_dns::check_ech_defects(ps, raw.strict.unwrap_or(false))
             .map_err(|e| (StatusCode::BAD_REQUEST, format!("{e} (strict mode)")))?;
@@ -1209,6 +1211,13 @@ async fn apply_raw_to_tunnel(
 /// config and reconcile the TUN listener. Callers must hold the
 /// `CONFIG_MUTATION` lane — it is the sole serialisation of the
 /// read-old → write-new → reconcile sequence (issue #543).
+///
+/// The candidate's global-route binding is installed before the rebuild
+/// dials anything, like `PUT /configs` (issue #695). Today's callers only
+/// rewrite proxies / groups / rules / subscriptions, so for them it merely
+/// re-asserts the running listener's binding for the rebuild and is handed
+/// back on return — but any `tun:` or fake-IP change reaching the reconcile
+/// is covered the same way as on the cold path.
 async fn commit_raw_candidate(
     state: &AppState,
     candidate: RawConfig,
@@ -1217,8 +1226,9 @@ async fn commit_raw_candidate(
         CONFIG_MUTATION.try_lock().is_err(),
         "caller must hold the CONFIG_MUTATION lane"
     );
+    let preinstalled = preinstall_global_route_binding(&candidate);
     let (dns, prior_resolver) = apply_raw_to_tunnel(candidate.clone(), state).await?;
-    swap_config_and_reconcile_tun(state, candidate, dns, prior_resolver).await;
+    swap_config_and_reconcile_tun(state, candidate, dns, prior_resolver, preinstalled).await;
     Ok(())
 }
 
@@ -2289,10 +2299,17 @@ async fn get_group_delay(
 /// (issue #514) — `Ok(None)` when `tun.enable` is false, or `Err(msg)`
 /// when startup fails (permission denied, device-name conflict, timeout,
 /// or the `listener-tun` feature is not compiled in).
+///
+/// `binding` is the global-route binding the mutation pre-installed for
+/// `raw` ([`preinstall_global_route_binding`], issue #695); the listener
+/// adopts it, so it stays in effect from the mutation's first dial through
+/// the listener's lifetime. On any failure it is dropped with the listener,
+/// which hands the binding back to an older live owner or clears it.
 #[cfg(feature = "listener-tun")]
 async fn spawn_tun_from_raw(
     tunnel: &Tunnel,
     raw: &RawConfig,
+    binding: Option<OutboundBinding>,
 ) -> Result<Option<meow_tunnel::TunHandle>, String> {
     let tun_cfg = match meow_config::parse_tun_config(raw.tun.as_ref(), raw.max_connections) {
         Ok(c) => c,
@@ -2305,12 +2322,15 @@ async fn spawn_tun_from_raw(
     }
 
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-    let listener = TunListener::new(
+    let mut listener = TunListener::new(
         tunnel.clone(),
         crate::tun_config_to_listener_config(&tun_cfg),
         "meow-tun".to_string(),
     )
     .with_readiness_signal(ready_tx);
+    if let Some(binding) = binding {
+        listener = listener.with_outbound_binding(binding);
+    }
 
     let handle = tokio::spawn(async move {
         if let Err(e) = listener.run().await {
@@ -2364,6 +2384,7 @@ async fn spawn_tun_from_raw(
 async fn spawn_tun_from_raw(
     _tunnel: &Tunnel,
     raw: &RawConfig,
+    _binding: Option<OutboundBinding>,
 ) -> Result<Option<meow_tunnel::TunHandle>, String> {
     if raw.tun.as_ref().is_some_and(|t| t.enable) {
         // Err (not Ok(None)) so the off→on reconcile path rolls
@@ -2397,11 +2418,20 @@ async fn spawn_tun_from_raw(
 /// caller early-installed the candidate's — the fake-IP comparison must
 /// read its inputs, not `tunnel.resolver()` (which already serves the new
 /// generation and would always compare equal) (issue #533 review).
+///
+/// `preinstalled` is the candidate's global-route binding, installed by
+/// the caller under this lane before the mutation's first dial
+/// ([`preinstall_global_route_binding`], issue #695). A (re)spawned
+/// listener adopts it, so the binding never lapses across `stop_tun` →
+/// spawn — the old listener's teardown cannot clear an owner installed
+/// after it. Without a spawn it is dropped on return, handing the binding
+/// back to the running listener (or clearing it when none runs).
 async fn swap_config_and_reconcile_tun(
     state: &AppState,
     candidate: RawConfig,
     dns: Option<meow_config::DnsConfig>,
     prior_resolver: Arc<meow_dns::Resolver>,
+    mut preinstalled: PreinstalledBinding,
 ) {
     debug_assert!(
         CONFIG_MUTATION.try_lock().is_err(),
@@ -2491,15 +2521,22 @@ async fn swap_config_and_reconcile_tun(
         // but-enabled listener must attempt a respawn too, and a failed
         // one rolls `enable` back so it self-limits to one attempt.
         if old_enable && (fake_ip_changed || tun_changed) {
+            // The candidate's binding (if global) is already in effect, so
+            // the stop → spawn gap below is covered (issue #695).
             state.tunnel.stop_tun().await;
             let raw = state.raw_config.read().clone();
-            match spawn_tun_from_raw(&state.tunnel, &raw).await {
+            let binding = preinstalled.take_binding();
+            let adopted = binding.is_some();
+            match spawn_tun_from_raw(&state.tunnel, &raw, binding).await {
                 Ok(Some(handle)) => {
                     state.tunnel.set_tun_handle(handle).await;
                     info!(
                         fake_ip_changed,
                         tun_changed, "TUN listener restarted via config reload"
                     );
+                    if adopted {
+                        outbound_binding_adopted(state, preinstalled.interface_changed());
+                    }
                 }
                 // Unreachable like the off→on arm — `enable` is still true
                 // in the committed raw. Roll back the same way rather than
@@ -2527,10 +2564,15 @@ async fn swap_config_and_reconcile_tun(
         // (its PREVIOUS_CORE gate hard-fails the spawn after a 10 s
         // teardown timeout rather than stack two generations).
         state.tunnel.stop_tun().await;
-        match spawn_tun_from_raw(&state.tunnel, &snapshot).await {
+        let binding = preinstalled.take_binding();
+        let adopted = binding.is_some();
+        match spawn_tun_from_raw(&state.tunnel, &snapshot, binding).await {
             Ok(Some(handle)) => {
                 state.tunnel.set_tun_handle(handle).await;
                 info!("TUN listener started via config reload");
+                if adopted {
+                    outbound_binding_adopted(state, preinstalled.interface_changed());
+                }
             }
             Ok(None) => {
                 // Unreachable today — `spawn_tun_from_raw` only yields
@@ -2557,6 +2599,31 @@ async fn swap_config_and_reconcile_tun(
         state.tunnel.stop_tun().await;
         info!("TUN listener stopped via config reload");
     }
+}
+
+/// A committed mutation's TUN listener came up with the global-route binding
+/// the mutation pre-installed ([`preinstall_global_route_binding`]) — the
+/// binding is now the configuration's, for as long as the listener runs.
+///
+/// Issue #695 step 2 hooks in here. `interface_changed` is the
+/// `None → Some(Y)` / `Some(X) → Some(Y ≠ X)` transition read under the
+/// lane before the install: sessions opened before it (UDP NAT sessions,
+/// DNS upstream pools, pooled QUIC/mux sessions of adapters retained across
+/// the reload) are not bound to `Y` and must be flushed. Within this
+/// mutation nothing predates the binding — it was installed before the
+/// mutation's first dial — so only older sessions need it. Runs only after
+/// a successful (re)spawn: a rejected mutation or failed spawn leaves no
+/// global routes of this configuration for an old session to loop on.
+fn outbound_binding_adopted(state: &AppState, interface_changed: bool) {
+    if !interface_changed {
+        return;
+    }
+    // Step 2 (follow-up): flush the sessions that predate the binding.
+    debug!(
+        tun_running = state.tunnel.has_tun(),
+        "outbound interface changed with the TUN restart; sessions opened \
+         before the binding stay on their old route"
+    );
 }
 
 #[derive(Deserialize)]
@@ -2628,6 +2695,21 @@ async fn put_configs(
         }
     };
 
+    // Enter the mutation lane before the first network I/O this candidate
+    // triggers — the ECH pre-resolution below — so its global-route binding
+    // can be installed first (issue #695): a candidate that turns on, or
+    // re-targets, `tun.auto-route: global` must have every socket it
+    // creates bound, and the registry may only be touched in the lane. The
+    // cost is that a slow ECH lookup now also queues sibling mutations;
+    // this cold path already holds the lane across the rebuild's provider
+    // fetches, which dominate it. (The warm-path writers — subscription
+    // add/refresh — keep resolving before the lane: they never change
+    // `tun:`, so the running listener's binding already covers them.)
+    let _mutation = CONFIG_MUTATION.lock().await;
+    // Dropped on every rejection below, restoring the running listener's
+    // binding; a TUN (re)spawn in the reconcile adopts it instead.
+    let preinstalled = preinstall_global_route_binding(&raw_config);
+
     // Pre-resolve any DNS-sourced ECH configs into inline base64. Under
     // `force`, a strict-ECH defect is retried leniently so it degrades the
     // same way as every other strict defect class (issue #533 review).
@@ -2646,8 +2728,6 @@ async fn put_configs(
             let _ = meow_config::ech_dns::preresolve_ech(ps, false).await;
         }
     }
-
-    let _mutation = CONFIG_MUTATION.lock().await;
 
     // Semantic rebuild (proxy/rule parsing). Share the tunnel's resolver
     // slot so the rebuilt map's DIRECT adapter tracks later
@@ -2724,7 +2804,7 @@ async fn put_configs(
         // intentionally follow the *retained* registry (its providers
         // still back the live route table), so no reconcile runs here.
         let prior_resolver = state.tunnel.resolver();
-        swap_config_and_reconcile_tun(&state, raw_config, None, prior_resolver).await;
+        swap_config_and_reconcile_tun(&state, raw_config, None, prior_resolver, preinstalled).await;
         return StatusCode::NO_CONTENT.into_response();
     };
     let meow_config::RebuildResult {
@@ -2873,7 +2953,7 @@ async fn put_configs(
         &state.proxy_provider_refresh,
     );
 
-    swap_config_and_reconcile_tun(&state, raw_config, dns, prior_resolver).await;
+    swap_config_and_reconcile_tun(&state, raw_config, dns, prior_resolver, preinstalled).await;
 
     StatusCode::NO_CONTENT.into_response()
 }
@@ -3931,5 +4011,293 @@ mod tests {
             1,
             "the commit must consume deferred_initial and refresh through the now-resolvable proxy"
         );
+    }
+}
+
+/// Issue #695: a config mutation installs its candidate's global-route
+/// binding before its first dial, and gives it back on every exit that does
+/// not hand it to a running listener. Needs the real `OutboundBinding`
+/// (`listener-tun`) and Linux's `SO_BINDTODEVICE`; runs unprivileged —
+/// every TUN spawn below fails before touching a device or route.
+#[cfg(all(test, feature = "listener-tun", target_os = "linux"))]
+mod global_route_binding_tests {
+    use super::*;
+    use std::io::{Read as _, Write as _};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tower::ServiceExt as _;
+
+    fn raw(yaml: &str) -> RawConfig {
+        meow_config::parse_raw_yaml(yaml).unwrap()
+    }
+
+    fn iface() -> Option<String> {
+        meow_common::outbound_interface().map(|s| s.to_string())
+    }
+
+    fn test_state(raw: RawConfig) -> Arc<AppState> {
+        let resolver = Arc::new(meow_dns::Resolver::new(
+            vec!["127.0.0.1:53".parse().unwrap()],
+            vec![],
+            meow_common::DnsMode::Normal,
+            meow_trie::DomainTrie::new(),
+            true,
+            true,
+        ));
+        let tunnel = Tunnel::new(resolver);
+        let meow_config::RebuildResult { proxies, rules, .. } =
+            meow_config::rebuild_from_raw(&raw).unwrap();
+        tunnel.update_proxies(proxies, Default::default());
+        tunnel.update_rules(rules);
+        let dir = std::env::temp_dir().join(format!("meow-api-695-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        Arc::new(AppState {
+            tunnel,
+            secret: None,
+            config_path: dir.join("config.yaml").to_string_lossy().into_owned(),
+            raw_config: Arc::new(RwLock::new(raw)),
+            log_tx: broadcast::channel(16).0,
+            proxy_providers: Arc::new(DashMap::new()),
+            provider_dialer_registry: Default::default(),
+            rule_providers: Arc::new(RwLock::new(HashMap::new())),
+            rule_provider_refresh: Default::default(),
+            proxy_provider_refresh: Default::default(),
+            listeners: vec![],
+            external_ui: None,
+            traffic_feed: TrafficFeed::default(),
+            dns_server: Default::default(),
+        })
+    }
+
+    /// Rule-provider origin that records the outbound-interface binding in
+    /// effect when each fetch arrives — i.e. the binding the rebuild's
+    /// socket was created under (it binds at creation, before connect).
+    struct RecordingOrigin {
+        addr: std::net::SocketAddr,
+        seen: Arc<parking_lot::Mutex<Vec<Option<String>>>>,
+        stop: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl RecordingOrigin {
+        fn start() -> Self {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let addr = listener.local_addr().unwrap();
+            let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let stop = Arc::new(AtomicBool::new(false));
+            let thread = std::thread::spawn({
+                let seen = Arc::clone(&seen);
+                let stop = Arc::clone(&stop);
+                move || {
+                    while !stop.load(Ordering::SeqCst) {
+                        match listener.accept() {
+                            Ok((mut stream, _)) => {
+                                seen.lock().push(iface());
+                                stream.set_nonblocking(false).unwrap();
+                                let timeout = Some(Duration::from_secs(2));
+                                let _ = stream.set_read_timeout(timeout);
+                                let _ = stream.set_write_timeout(timeout);
+                                let mut buf = [0_u8; 2048];
+                                let _ = stream.read(&mut buf);
+                                let body = "payload:\n  - '+.example.com'\n";
+                                let _ = write!(
+                                    stream,
+                                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\
+                                     connection: close\r\n\r\n{body}",
+                                    body.len()
+                                );
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                std::thread::sleep(Duration::from_millis(5));
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
+            });
+            Self {
+                addr,
+                seen,
+                stop,
+                thread: Some(thread),
+            }
+        }
+
+        fn take_seen(&self) -> Vec<Option<String>> {
+            std::mem::take(&mut *self.seen.lock())
+        }
+    }
+
+    impl Drop for RecordingOrigin {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(t) = self.thread.take() {
+                let _ = t.join();
+            }
+        }
+    }
+
+    /// A candidate whose rebuild fetches a rule-provider from `origin`.
+    fn candidate(tun: &str, origin: &RecordingOrigin, tail: &str) -> String {
+        format!(
+            "mode: rule\n{tun}rule-providers:\n  p:\n    type: http\n    behavior: domain\n    \
+             url: http://{}/rules.yaml\nrules:\n  - MATCH,DIRECT\n{tail}",
+            origin.addr
+        )
+    }
+
+    /// Rejected after the rebuild (and so after its fetch) by the
+    /// `listeners:` admission check.
+    const BAD_LISTENERS: &str =
+        "listeners:\n  - name: tp\n    type: tproxy\n    port: 7895\n    udp: true\n";
+
+    const GLOBAL_LO: &str =
+        "tun:\n  enable: true\n  auto-route: global\n  outbound-interface: lo\n";
+
+    async fn put(state: &Arc<AppState>, yaml: &str) -> (StatusCode, String) {
+        use base64::Engine as _;
+        use http_body_util::BodyExt as _;
+        let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+        let resp = create_router(Arc::clone(state))
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/configs")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "payload": payload }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// Stand-in for the running global-scope listener: owns a binding, and
+    /// records the binding in effect right after giving its own up — i.e.
+    /// across `stop_tun`, before the successor spawns.
+    struct OldListener {
+        binding: Option<meow_listener::OutboundBinding>,
+        after_drop: Arc<parking_lot::Mutex<Option<Option<String>>>>,
+    }
+
+    impl Drop for OldListener {
+        fn drop(&mut self) {
+            drop(self.binding.take());
+            *self.after_drop.lock() = Some(iface());
+        }
+    }
+
+    /// One test drives every case because the registry is process-global;
+    /// separate `#[test]` fns would race each other.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mutations_preinstall_and_restore_the_binding() {
+        assert_eq!(iface(), None);
+
+        // ── The helper: only an enabled global-scope TUN installs. ──
+        for yaml in [
+            "port: 7890\n",
+            "tun:\n  enable: false\n  auto-route: global\n  outbound-interface: lo\n",
+            "tun:\n  enable: true\n  outbound-interface: lo\n",
+            "tun:\n  enable: true\n  auto-route: fake-ip\n  outbound-interface: lo\n",
+            "tun:\n  enable: true\n  auto-route: false\n",
+            "tun:\n  enable: true\n  auto-route: bogus\n  outbound-interface: lo\n",
+            // A missing interface: not fatal here, nothing installed.
+            "tun:\n  enable: true\n  auto-route: global\n  outbound-interface: no-such-iface-zz9\n",
+        ] {
+            let p = preinstall_global_route_binding(&raw(yaml));
+            assert!(!p.is_installed() && !p.interface_changed(), "{yaml}");
+            assert_eq!(iface(), None, "{yaml}");
+        }
+        // None → Some(lo) is a change; a second owner of the same
+        // interface is not; a non-global candidate leaves it alone.
+        let first = preinstall_global_route_binding(&raw(GLOBAL_LO));
+        assert!(first.is_installed() && first.interface_changed());
+        assert_eq!(iface().as_deref(), Some("lo"));
+        let second = preinstall_global_route_binding(&raw(GLOBAL_LO));
+        assert!(second.is_installed() && !second.interface_changed());
+        let fake_ip =
+            preinstall_global_route_binding(&raw("tun:\n  enable: true\n  auto-route: fake-ip\n"));
+        assert!(!fake_ip.is_installed() && !fake_ip.interface_changed());
+        drop(second);
+        assert_eq!(iface().as_deref(), Some("lo"), "first owner restored");
+        drop(first);
+        assert_eq!(iface(), None);
+
+        let origin = RecordingOrigin::start();
+        let state = test_state(raw("mode: rule\nrules:\n  - MATCH,DIRECT\n"));
+
+        // ── Rejected PUT, nothing running: the rebuild's fetch already
+        // runs under the candidate's binding, and the rejection clears it.
+        let (status, body) = put(&state, &candidate(GLOBAL_LO, &origin, BAD_LISTENERS)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("listeners config error"), "{body}");
+        assert_eq!(origin.take_seen(), vec![Some("lo".to_string())]);
+        assert_eq!(iface(), None, "a rejected PUT must not leave a binding");
+
+        // ── Rejected PUT over a running global listener: its binding is
+        // back in effect afterwards, and the PUT's own owner is gone.
+        let running = meow_listener::OutboundBinding::install(Some("lo")).unwrap();
+        let (status, body) = put(&state, &candidate(GLOBAL_LO, &origin, BAD_LISTENERS)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(origin.take_seen(), vec![Some("lo".to_string())]);
+        assert_eq!(iface().as_deref(), Some("lo"));
+        drop(running);
+        assert_eq!(iface(), None, "the rejected PUT's owner must be released");
+
+        // ── Non-global candidates never install (no behaviour change).
+        for tun in ["", "tun:\n  enable: true\n  auto-route: fake-ip\n"] {
+            let (status, body) = put(&state, &candidate(tun, &origin, BAD_LISTENERS)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(origin.take_seen(), vec![None], "{tun}");
+            assert_eq!(iface(), None, "{tun}");
+        }
+
+        // ── Accepted global → global restart (`mtu` changed): the binding
+        // stays in effect across `stop_tun` → spawn. The spawn then fails
+        // (the device name exceeds IFNAMSIZ, so not even root creates a
+        // device), `enable` rolls back, and with nothing running the
+        // binding is cleared.
+        state.raw_config.write().tun = raw(GLOBAL_LO).tun;
+        let after_drop = Arc::new(parking_lot::Mutex::new(None));
+        let old = OldListener {
+            binding: Some(meow_listener::OutboundBinding::install(Some("lo")).unwrap()),
+            after_drop: Arc::clone(&after_drop),
+        };
+        state
+            .tunnel
+            .set_tun_handle(meow_tunnel::TunHandle {
+                task: tokio::spawn(async move {
+                    let _old = old;
+                    std::future::pending::<()>().await;
+                }),
+                core_done: None,
+                udp_flows: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            })
+            .await;
+        let restart =
+            format!("{GLOBAL_LO}  mtu: 9000\n  device: meow-name-too-long-for-ifnamsiz\n");
+        let (status, body) = put(&state, &candidate(&restart, &origin, "")).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        assert_eq!(origin.take_seen(), vec![Some("lo".to_string())]);
+        assert_eq!(
+            *after_drop.lock(),
+            Some(Some("lo".to_string())),
+            "the old listener's teardown must leave the reload's binding in effect"
+        );
+        assert!(
+            state
+                .raw_config
+                .read()
+                .tun
+                .as_ref()
+                .is_some_and(|t| !t.enable),
+            "the failed spawn rolls `enable` back"
+        );
+        assert!(!state.tunnel.has_tun());
+        assert_eq!(iface(), None, "nothing runs, so nothing stays bound");
     }
 }

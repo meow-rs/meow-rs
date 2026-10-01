@@ -544,11 +544,33 @@ the canonical, in-repo source a release is cut from.
   health checks and DNS. A session one of those opened (QUIC, mux,
   pooled DNS TCP) stayed unbound and looped once the routes went in. The
   binding is now installed right after the config is parsed, before the
-  first dial, and handed to the TUN listener. The listener still clears
-  it on teardown, reload or a failed start. Startup without TUN or in
+  first dial, and handed to the TUN listener. The listener still gives
+  it up on teardown or a failed start. Startup without TUN or in
   fake-ip scope is unchanged. A new `crate_invariants_test` guard (F5)
   fails on any raw socket creation outside meow_common's chokepoints
   unless it is allowlisted with a reason.
+
+- **Config reloads into `tun.auto-route: global` bind before their first
+  dial too** (issue #695). The early binding above only covered startup.
+  A `PUT /configs` switching to global scope still installed it inside the
+  TUN listener, after the swap had already restarted health checks, so
+  their QUIC/TCP sockets stayed unbound and looped once the routes went
+  in. A global → global restart (e.g. an `mtu` change) was worse: the old
+  listener's teardown cleared the binding, and every dial in the
+  stop → spawn gap looped for life. Config mutations now pre-install the
+  candidate's binding under the config-mutation lane before any network
+  I/O — `PUT /configs` takes the lane ahead of its ECH pre-resolve for
+  this — and hand it to the (re)spawned listener. The registry behind it
+  is now owner-aware: installs stack, dropping the newest owner restores
+  the newest still-live one (a rejected PUT or failed spawn puts the
+  running listener's binding back), and dropping a superseded owner is a
+  no-op (the old listener's teardown cannot clear its successor's). The
+  interface auto-detection also skips the TUN's own `0.0.0.0/1` route,
+  which the kernel lists before the real default and the pre-install now
+  sees while the old listener is up. Non-global configs are unchanged.
+  In a privileged container, off → global looped 5 → 0 hy2 frames and
+  eight global → global restarts under a DIRECT dial storm looped
+  1753–2378 → 0 frames.
 
 - **Dead-marking a nested proxy-group member is no longer a dead write**
   (issue #681). `DialFailureTracker` escalation and probe sweeps record
