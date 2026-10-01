@@ -101,9 +101,12 @@ Consequences:
   after a 200 ms sniff window if it stays silent (mihomo's pre-dial peek).
   Server-first protocols — SMTP, POP3, IMAP, FTP, MySQL, VNC, SSH — wait
   for the server's banner without sending anything, so they see it after
-  that window plus the dial (before #695 they were reset after 15 s). A
-  connection that closes or resets inside the window (connect scans,
-  aborted reconnects) is dropped before it is matched, counted or dialed.
+  that window plus the dial (before #695 they were reset after 15 s).
+  Through a Shadowsocks outbound add one more 200 ms: the outbound waits
+  that long for client bytes to send with its request header before
+  sending the header alone. A connection that closes or resets inside
+  the window (connect scans, aborted reconnects) is dropped before it is
+  matched, counted or dialed.
 - ICMP echo requests entering the device are answered by the userspace
   stack itself — `ping` to a fake IP confirms the tun is up, but is not an
   end-to-end probe of the remote host.

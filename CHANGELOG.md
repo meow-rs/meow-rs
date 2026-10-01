@@ -475,6 +475,18 @@ the canonical, in-repo source a release is cut from.
   matched, counted or dialed. A `max-connections` slot is taken once a
   flow leaves the window.
 
+- **Server-first protocols work through Shadowsocks outbounds** (#695
+  follow-up). The SS codec only sends its request header (salt + target
+  address) together with the client's first bytes, and meow's relay
+  never writes an empty buffer. A client waiting for a banner — SMTP,
+  POP3, IMAP, FTP, MySQL, VNC — and an SS server waiting for the
+  address therefore deadlocked, from every inbound. The outbound now
+  sends the header on its own once the client has stayed silent for
+  200 ms after the dial (mihomo's peek window; sslocal waits 500 ms). A
+  client that writes first still gets the header coalesced with its
+  first bytes. Covers every SS plugin transport and relay-chain last
+  hops.
+
 - **TUN: dropping a finished connection can no longer close an
   unrelated one** (issue #695). When meow closed its side first and the
   client then sent its FIN, the connection's lwIP pcb entered TIME_WAIT,

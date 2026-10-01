@@ -859,3 +859,131 @@ async fn test_ss_connect_over_builtin_obfs_tls() {
     conn.read_exact(&mut buf).await.expect("read_exact failed");
     assert_eq!(&buf, payload, "echo mismatch through obfs-tls connect_over");
 }
+
+// ─── Server-first protocols (SMTP/FTP/POP3/IMAP/MySQL/VNC) ──────────────────
+
+const BANNER: &[u8] = b"220 meow-test ESMTP ready\r\n";
+
+/// Start a server-first TCP server: it greets every connection before
+/// reading anything, then answers one `QUIT` line.
+async fn start_banner_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                if stream.write_all(BANNER).await.is_err() {
+                    return;
+                }
+                let mut line = [0u8; 6];
+                if stream.read_exact(&mut line).await.is_ok() && &line == b"QUIT\r\n" {
+                    let _ = stream.write_all(b"221 bye\r\n").await;
+                }
+            });
+        }
+    });
+    (addr, handle)
+}
+
+/// A client that sends nothing until it gets the server's banner, behind a
+/// relay that — like meow's — only ever writes bytes it read, so it never
+/// issues the empty write that would push out the SS request header. The
+/// adapter must send the header on its own, or ssserver waits for the target
+/// address while the client waits for the banner.
+async fn ss_server_first(cipher: &str, key: &str) {
+    if !ssserver_available() {
+        skip_or_fail("ssserver not found in PATH");
+        return;
+    }
+
+    let (banner_addr, _banner_handle) = start_banner_server().await;
+    let ss_port = free_port().await;
+    let _ssserver = start_ssserver_with_cipher(ss_port, cipher, key).await;
+
+    let adapter = ShadowsocksAdapter::new(
+        "test-ss-server-first",
+        "127.0.0.1",
+        ss_port,
+        key,
+        cipher,
+        false,
+        None,
+        None,
+        None,
+        Arc::new(DirectDialer),
+    )
+    .unwrap();
+    let metadata = Metadata {
+        network: Network::Tcp,
+        dst_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        dst_port: banner_addr.port(),
+        ..Default::default()
+    };
+
+    for attempt in 1..=3 {
+        let mut remote = timeout(TIMEOUT, adapter.dial_tcp(&metadata))
+            .await
+            .expect("TCP dial timed out")
+            .expect("TCP dial failed");
+        let (mut client, mut inbound) = tokio::io::duplex(16 * 1024);
+        let relay =
+            tokio::spawn(
+                async move { tokio::io::copy_bidirectional(&mut inbound, &mut remote).await },
+            );
+
+        let start = tokio::time::Instant::now();
+        let mut banner = vec![0u8; BANNER.len()];
+        match timeout(TIMEOUT, client.read_exact(&mut banner)).await {
+            Err(_) => panic!(
+                "no banner after {TIMEOUT:?} through SS ({cipher}): the request \
+                 header was never sent for a silent client"
+            ),
+            // shadowsocks 1.24 pads a payload-less AEAD-2022 header with
+            // 0..=900 random bytes and ssserver rejects zero padding, so 1 in
+            // 901 header-only requests is refused upstream; re-dial instead
+            // of flaking.
+            Ok(Err(e)) if cipher.starts_with("2022-") && attempt < 3 => {
+                eprintln!("attempt {attempt}: ssserver closed before the banner ({e}); retrying");
+                continue;
+            }
+            Ok(Err(e)) => panic!("banner read failed: {e}"),
+            Ok(Ok(_)) => {}
+        }
+        let elapsed = start.elapsed();
+        eprintln!("server-first banner through SS ({cipher}) after {elapsed:?}");
+        assert_eq!(banner, BANNER, "banner mismatch");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "banner took {elapsed:?}: header-only send should follow a short window"
+        );
+
+        // The connection carries client data after the header-only start.
+        client
+            .write_all(b"QUIT\r\n")
+            .await
+            .expect("QUIT write failed");
+        let mut bye = [0u8; 9];
+        timeout(TIMEOUT, client.read_exact(&mut bye))
+            .await
+            .expect("reply timed out")
+            .expect("reply read failed");
+        assert_eq!(&bye, b"221 bye\r\n");
+        drop(client);
+        let _ = timeout(TIMEOUT, relay).await;
+        return;
+    }
+}
+
+#[tokio::test]
+async fn test_ss_server_first_banner_without_client_bytes() {
+    ss_server_first(SS_CIPHER, SS_PASSWORD).await;
+}
+
+#[tokio::test]
+async fn test_ss_server_first_banner_without_client_bytes_2022() {
+    // 16-byte base64 iPSK ("1234567890123456"), as in test_ss_udp_relay_2022.
+    ss_server_first("2022-blake3-aes-128-gcm", "MTIzNDU2Nzg5MDEyMzQ1Ng==").await;
+}
