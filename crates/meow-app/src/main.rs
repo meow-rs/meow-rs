@@ -484,11 +484,24 @@ fn run_application_inner(
             .enable_all()
             .build()?;
         runtime.block_on(async {
-            let config = load_config(&config_path).await?;
+            // Same source as the run path: `-t --config-string` must
+            // validate the string, not the file (issue #711).
+            let config = if let Some(ref cs) = args.config_string {
+                let raw = parse_config_string(cs)?;
+                meow_config::build_config(raw, None)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("--config-string: {e}"))?
+            } else {
+                load_config(&config_path).await?
+            };
             // An inbound this build did not compile would be
             // warn-skipped at startup — that must not pass a config test.
             ensure_inbounds_supported(&config)?;
-            info!("Configuration test passed");
+            if args.config_string.is_some() {
+                info!("Configuration test passed (--config-string)");
+            } else {
+                info!("Configuration test passed");
+            }
             Ok::<(), anyhow::Error>(())
         })?;
         return Ok(());
@@ -510,14 +523,7 @@ fn run_application_inner(
         // binding in place before the first of those sockets exists
         // (issue #695) — see `preinstall_global_route_binding`.
         let mut config = if let Some(ref cs) = args.config_string {
-            use base64::Engine;
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(cs)
-                .map_err(|e| anyhow::anyhow!("--config-string: invalid base64: {e}"))?;
-            let yaml = String::from_utf8(bytes)
-                .map_err(|e| anyhow::anyhow!("--config-string: invalid UTF-8: {e}"))?;
-            let raw = meow_config::parse_raw_yaml(&yaml)
-                .map_err(|e| anyhow::anyhow!("--config-string: {e}"))?;
+            let raw = parse_config_string(cs)?;
             early_binding = preinstall_global_route_binding(&raw);
             let config = meow_config::build_config(raw, None)
                 .await
@@ -642,6 +648,23 @@ fn ensure_inbounds_supported(config: &meow_config::Config) -> anyhow::Result<()>
         );
     }
     Ok(())
+}
+
+/// Decode a `--config-string` argument (base64-encoded YAML — mihomo
+/// compat) into the raw config document. Shared by `-t` and the run path
+/// so both validate/run the same source (issue #711 — `-t` used to ignore
+/// the string and test the file).
+fn parse_config_string(cs: &str) -> anyhow::Result<meow_config::raw::RawConfig> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(cs)
+        .map_err(|e| anyhow::anyhow!("--config-string: invalid base64: {e}"))?;
+    let yaml = String::from_utf8(bytes)
+        .map_err(|e| anyhow::anyhow!("--config-string: invalid UTF-8: {e}"))?;
+    // Parity with `load_raw_config`: a UTF-8 BOM must not break parsing —
+    // libyaml otherwise reports a misleading "more than one document".
+    let yaml = yaml.strip_prefix('\u{feff}').unwrap_or(&yaml);
+    meow_config::parse_raw_yaml(yaml).map_err(|e| anyhow::anyhow!("--config-string: {e}"))
 }
 
 /// `tun:` isn't a `listeners:` entry so [`listener_feature_gate`] can't

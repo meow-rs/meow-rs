@@ -15,20 +15,12 @@ async fn config_test_does_not_contact_remote_providers() {
         ),
     )
     .unwrap();
-    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_meow"));
+    let mut command = offline_command();
     command
         .arg("-d")
         .arg(directory.path())
         .arg("-f")
-        .arg(&config)
-        .arg("-t")
-        .env_remove("HTTP_PROXY")
-        .env_remove("HTTPS_PROXY")
-        .env_remove("ALL_PROXY")
-        .env_remove("http_proxy")
-        .env_remove("https_proxy")
-        .env_remove("all_proxy")
-        .kill_on_drop(true);
+        .arg(&config);
     let output = tokio::time::timeout(std::time::Duration::from_secs(10), command.output())
         .await
         .expect("offline validation must not wait for a subscription response")
@@ -88,18 +80,12 @@ async fn config_test_does_not_download_missing_geodata() {
     );
 }
 
-async fn run_offline(
-    directory: &std::path::Path,
-    config: &std::path::Path,
-) -> std::process::Output {
+/// A `meow -t` command hardened the way this suite requires: kills the
+/// child on drop, strips inherited proxy env vars, and is meant to run
+/// under a timeout — offline validation must never hang on network I/O.
+fn offline_command() -> tokio::process::Command {
     let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_meow"));
-    command
-        .args(["-d"])
-        .arg(directory)
-        .arg("-f")
-        .arg(config)
-        .arg("-t")
-        .kill_on_drop(true);
+    command.arg("-t").kill_on_drop(true);
     for variable in [
         "HTTP_PROXY",
         "HTTPS_PROXY",
@@ -110,6 +96,15 @@ async fn run_offline(
     ] {
         command.env_remove(variable);
     }
+    command
+}
+
+async fn run_offline(
+    directory: &std::path::Path,
+    config: &std::path::Path,
+) -> std::process::Output {
+    let mut command = offline_command();
+    command.args(["-d"]).arg(directory).arg("-f").arg(config);
     tokio::time::timeout(std::time::Duration::from_secs(10), command.output())
         .await
         .expect("offline validation must finish without network access")
@@ -158,5 +153,76 @@ async fn config_test_defers_dns_sourced_ech() {
     assert!(
         !logs.contains("ech-dns:"),
         "ECH lookup must not run: {logs}"
+    );
+}
+
+/// Regression for issue #711: `-t` used to validate `-f` even when
+/// `--config-string` was given. Both directions are discriminating:
+/// a broken string must fail `-t` even with a valid file present, and a
+/// valid string must pass `-t` even when the file does not exist.
+#[tokio::test]
+async fn config_test_uses_config_string_over_file() {
+    use base64::Engine;
+    let b64 = |yaml: &str| base64::engine::general_purpose::STANDARD.encode(yaml);
+
+    // (a) broken --config-string + valid -f file → must FAIL (previously
+    // the file's validity leaked into the result).
+    let directory = tempfile::tempdir().unwrap();
+    let good_file = directory.path().join("good.yaml");
+    std::fs::write(&good_file, "mixed-port: 0\nrules: ['MATCH,DIRECT']\n").unwrap();
+    let mut command = offline_command();
+    command
+        .arg("-f")
+        .arg(&good_file)
+        .arg("--config-string")
+        .arg(b64("rules: [this is not a valid rule: [}}"));
+    let output = tokio::time::timeout(std::time::Duration::from_secs(10), command.output())
+        .await
+        .expect("offline validation must finish without network access")
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "broken --config-string must fail -t even with a valid -f file: {output:?}"
+    );
+    let logs = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        logs.contains("--config-string"),
+        "error must blame the string source: {logs}"
+    );
+
+    // (b) valid --config-string + nonexistent -f → must PASS.
+    let missing = directory.path().join("does-not-exist.yaml");
+    let mut command = offline_command();
+    command
+        .arg("-f")
+        .arg(&missing)
+        .arg("--config-string")
+        .arg(b64("mixed-port: 0\nrules: ['MATCH,DIRECT']\n"));
+    let output = tokio::time::timeout(std::time::Duration::from_secs(10), command.output())
+        .await
+        .expect("offline validation must finish without network access")
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "valid --config-string must pass -t despite missing -f file: {output:?}"
+    );
+
+    // (c) BOM parity: a front-end that base64-encodes a BOM'd file must
+    // get the same result as -f on that file (load_raw_config strips it).
+    let mut command = offline_command();
+    command
+        .arg("--config-string")
+        .arg(b64("\u{feff}mixed-port: 0\nrules: ['MATCH,DIRECT']\n"));
+    let output = tokio::time::timeout(std::time::Duration::from_secs(10), command.output())
+        .await
+        .expect("offline validation must finish without network access")
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "BOM'd --config-string must parse like a BOM'd file: {output:?}"
     );
 }

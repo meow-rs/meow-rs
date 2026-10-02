@@ -438,6 +438,15 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **`meow -t --config-string` now validates the string, not the file**
+  (issue #711). The `-t` path used to always load `-f`, so a broken
+  `--config-string` passed as long as the file was valid — and a valid
+  string failed when the file was missing. Both paths share the same
+  source selection, including the `--config-string:` error context, and
+  a leading UTF-8 BOM in the decoded payload is now stripped — the same
+  tolerance `load_raw_config` applies to `-f` files (libyaml otherwise
+  fails with a misleading "more than one document").
+
 - **`meow -t` and startup now reject inbounds the binary did not
   compile.** A `listeners:` entry such as `type: shadowsocks` without
   the opt-in `listener-shadowsocks` feature used to pass
