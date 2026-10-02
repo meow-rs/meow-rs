@@ -91,7 +91,8 @@ A random API secret is generated at installation, preserving existing secrets
 on upgrade. Clearing it restricts the API to loopback; remote panel access then
 requires setting a secret again. HTTP provider payloads absent from the cache
 are deferred during `-t`, including strict validation; cached rule payloads and
-inline definitions are still checked. ECH DNS lookup is deferred to startup.
+inline definitions are still checked. ECH DNS lookup and DNS bootstrap for
+hostname-bearing upstreams are deferred to startup.
 
 ## Configure and start
 

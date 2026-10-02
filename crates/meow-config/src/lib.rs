@@ -579,6 +579,11 @@ static OFFLINE_VALIDATE: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 
 /// Enable offline (no remote fetch) config validation for this process. Call
 /// before [`load_config`] in the `-t` path.
+///
+/// Hostname-bearing DNS upstreams are not resolved either — the built
+/// resolver binds them to an unroutable `192.0.2.1` placeholder (RFC 5737
+/// TEST-NET-1). The flag is never reset; a process that sets it must not
+/// serve queries with the resulting resolver (it is meant to exit).
 pub fn set_offline_validate(on: bool) {
     OFFLINE_VALIDATE.store(on, std::sync::atomic::Ordering::Relaxed);
 }

@@ -860,6 +860,7 @@ mod tests {
             None,
             None,
             &registry,
+            false,
         )
         .await
         .expect("resolver builds");

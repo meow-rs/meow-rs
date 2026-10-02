@@ -129,6 +129,7 @@ pub async fn parse_dns(
                 None,
                 None,
                 proxy_registry,
+                crate::is_offline_validate(),
             )
             .await
             .map_err(|e| anyhow::anyhow!("proxy-server-nameserver: {e}"))?,
@@ -183,6 +184,7 @@ pub async fn parse_dns(
         policy,
         fallback_filter,
         proxy_registry,
+        crate::is_offline_validate(),
     )
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -752,6 +754,11 @@ async fn resolve_policy_host(
     host: &str,
     bootstrap_clients: &[Arc<DnsClient>],
 ) -> Option<IpAddr> {
+    // The no-bootstrap-clients skip is a *static* property of the config
+    // (IP-literal, unproxied, non-rcode entries only — see
+    // `build_policy_bootstrap_clients`), so it must run before the
+    // offline gate: `-t` should reproduce the runtime skip → "no valid
+    // nameservers" verdict, not green-light a config that cannot start.
     if bootstrap_clients.is_empty() {
         warn!(
             "nameserver-policy entry '{}': URL '{}' uses hostname '{}' but no IP-literal \
@@ -759,6 +766,16 @@ async fn resolve_policy_host(
             key, url_str, host
         );
         return None;
+    }
+
+    // Offline validation (`-t`) must not query the network (issue #716).
+    // Keep the entry structurally — an unreachable placeholder stands in
+    // for the bootstrap result so a valid policy doesn't error out on an
+    // isolated host; the resolver is never queried before `-t` exits.
+    if crate::is_offline_validate() {
+        // RFC 5737 TEST-NET-1 — strictly unroutable, unlike UNSPECIFIED
+        // which aliases to localhost on POSIX stacks.
+        return Some(IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1)));
     }
 
     for client in bootstrap_clients {

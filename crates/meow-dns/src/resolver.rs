@@ -12,7 +12,7 @@ use meow_trie::DomainTrie;
 use smol_str::SmolStr;
 use std::collections::{BTreeSet, HashMap};
 use std::io;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::debug;
@@ -770,6 +770,7 @@ impl Resolver {
             policy,
             fallback_filter,
             &HashMap::new(),
+            false,
         )
         .await
     }
@@ -782,6 +783,12 @@ impl Resolver {
     /// (`udp://`/`tcp://`) entries (issue #67 phase 2). Pass an empty map
     /// when proxies aren't yet built — entries that reference proxies
     /// will then be rejected with `BootstrapError::UnknownProxy`.
+    ///
+    /// `skip_bootstrap` is for offline validation (`-t`): all structural
+    /// checks still run, but the bootstrap lookups are skipped and each
+    /// hostname upstream is built against a placeholder address instead —
+    /// validation must not perform network I/O (issue #716), and the
+    /// resulting resolver is never queried because the process exits.
     #[allow(clippy::too_many_arguments)]
     pub async fn new_with_bootstrap_with_proxies(
         main_urls: Vec<NameServerEntry>,
@@ -794,6 +801,7 @@ impl Resolver {
         policy: Option<NameserverPolicy>,
         fallback_filter: Option<FallbackFilter>,
         proxy_registry: &HashMap<SmolStr, Arc<dyn meow_common::Proxy>>,
+        skip_bootstrap: bool,
     ) -> Result<Self, BootstrapError> {
         // ── Validate proxy references up front so misconfig fails loud.
         // `default_ns` entries are forbidden from carrying #PROXY — they
@@ -873,9 +881,24 @@ impl Resolver {
             }
         }
 
-        // Step 3: Short-circuit if no bootstrap needed.
+        // Step 3: Short-circuit if no bootstrap needed — or defer it
+        // entirely under offline validation (`-t`), where no network I/O
+        // is allowed. Hostname upstreams get an unreachable placeholder
+        // so client construction still succeeds; `-t` exits without ever
+        // querying the resolver, so the placeholder is never dialed.
         let resolved_map: HashMap<String, IpAddr> = if hostnames_needing_bootstrap.is_empty() {
             HashMap::new()
+        } else if skip_bootstrap {
+            for host in &hostnames_needing_bootstrap {
+                tracing::debug!("offline validation: deferred DNS bootstrap for '{host}'");
+            }
+            // RFC 5737 TEST-NET-1 — strictly unroutable, unlike
+            // UNSPECIFIED which aliases to localhost on POSIX stacks.
+            let placeholder = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+            hostnames_needing_bootstrap
+                .iter()
+                .map(|host| (host.clone(), placeholder))
+                .collect()
         } else {
             // Step 4: Build throwaway bootstrap clients. When `default-nameserver`
             // is configured, use it. When absent, fall back to the system

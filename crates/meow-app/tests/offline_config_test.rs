@@ -123,11 +123,11 @@ async fn config_test_never_starts_external_plugins() {
     )).unwrap();
     let output = run_offline(directory.path(), &config).await;
     assert!(output.status.success(), "{output:?}");
-    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_meow"))
-        .args(["--no-external-plugins", "-t", "-f"])
-        .arg(&config)
-        .output()
+    let mut command = offline_command();
+    command.arg("--no-external-plugins").arg("-f").arg(&config);
+    let output = tokio::time::timeout(std::time::Duration::from_secs(10), command.output())
         .await
+        .expect("offline validation must finish without network access")
         .unwrap();
     assert!(!output.status.success());
     assert!(
@@ -224,5 +224,69 @@ async fn config_test_uses_config_string_over_file() {
     assert!(
         output.status.success(),
         "BOM'd --config-string must parse like a BOM'd file: {output:?}"
+    );
+}
+
+/// Regression for issue #716: `-t` used to run real DNS bootstrap for
+/// hostname-bearing upstreams (`udp://name`, DoH/DoT, `nameserver-policy`,
+/// `proxy-server-nameserver`) — network I/O during "offline" validation,
+/// and on an isolated host a structurally valid config failed with
+/// `CannotResolve`. Point `default-nameserver` at a bound UDP socket that
+/// never answers: pre-fix the bootstrap query hits it (and `-t` fails);
+/// post-fix the socket must receive nothing and `-t` must pass.
+#[tokio::test]
+async fn config_test_does_not_run_dns_bootstrap() {
+    let sentinel = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    sentinel.set_nonblocking(true).unwrap();
+    let sentinel_addr = sentinel.local_addr().unwrap();
+
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("dns-bootstrap.yaml");
+    std::fs::write(
+        &config,
+        format!(
+            "dns:\n  enable: true\n  default-nameserver: ['{sentinel_addr}']\n  nameserver: ['udp://bootstrap-must-not-run.invalid:53']\n  proxy-server-nameserver: ['udp://psn-must-not-run.invalid:53']\n  nameserver-policy: {{'+.internal.example': 'udp://policy-must-not-run.invalid:53'}}\nrules: ['MATCH,DIRECT']\n"
+        ),
+    )
+    .unwrap();
+
+    let output = run_offline(directory.path(), &config).await;
+    assert!(
+        output.status.success(),
+        "offline -t must pass for hostname-bearing dns upstreams: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // Any pre-fix bootstrap datagram is already queued (loopback delivery
+    // is synchronous) — a nonblocking recv decides immediately.
+    let err = sentinel
+        .recv_from(&mut [0u8; 2048])
+        .expect_err("offline validation sent a real DNS bootstrap query");
+    assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock, "{err}");
+
+    // Verdict parity: a hostname policy entry with NO IP-literal
+    // bootstrap source (default-nameserver absent, nameserver hostname-
+    // only) is statically unservable — runtime warn-skips it into a "no
+    // valid nameservers" error, and `-t` must reproduce that verdict
+    // rather than green-light a config that cannot start.
+    let bad = directory.path().join("dns-no-bootstrap-src.yaml");
+    std::fs::write(
+        &bad,
+        "dns:\n  enable: true\n  nameserver: ['udp://bootstrap-must-not-run.invalid:53']\n  nameserver-policy: {'+.internal.example': 'udp://policy-must-not-run.invalid:53'}\nrules: ['MATCH,DIRECT']\n",
+    )
+    .unwrap();
+    let output = run_offline(directory.path(), &bad).await;
+    assert!(
+        !output.status.success(),
+        "-t must reject a nameserver-policy that has no bootstrap source: {output:?}"
+    );
+    let logs = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        logs.contains("no valid nameservers"),
+        "failure must come from the unbootstrappable policy, not an earlier error: {logs}"
     );
 }

@@ -14,7 +14,7 @@ meow [OPTIONS] [COMMAND]
 | `-f, --config <PATH>` | Config file path (default `config.yaml`) |
 | `--config-string <B64>` | Base64-encoded YAML config; replaces `-f` as the source entirely (mihomo compat) |
 | `-d, --directory <DIR>` | Home directory for resource discovery (geodata, caches); relative config paths resolve under it |
-| `-t, --test` | Validate the config and exit without starting (validates `--config-string` when given) |
+| `-t, --test` | Validate the config and exit without starting — performs no network access (validates `--config-string` when given) |
 
 ```bash
 # build, validate, run

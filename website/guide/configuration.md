@@ -170,12 +170,13 @@ The semantics differ sharply from `proxy-providers`:
   `proxy-groups:`/`rules:` contributes nothing to
   those sections — its previous contribution there (if any) vacates and
   local entries stay; missing `proxies:` is a fetch error instead.
-- **`-t` does not fetch subscriptions.** Config-test mode validates the
+- **`-t` performs no network access.** Config-test mode validates the
   file exactly as written — including whatever a previous refresh wrote
-  back — and exits before the refresh loop starts. (It is not fully
-  network-free: `load_config` still fetches `proxy-providers:`,
-  prefetches `rule-providers:` payloads, may download geodata, and
-  performs ECH pre-resolution DNS lookups.)
+  back — and exits before the refresh loop starts. It reads local files
+  only (the config, `/etc/hosts`, caches, geo DBs): remote providers,
+  geodata downloads, ECH pre-resolution, and DNS bootstrap lookups for
+  hostname upstreams are all deferred to startup (the resolver builds
+  them against an unroutable `192.0.2.1` placeholder).
 - **Safety.** `ss` nodes carrying external SIP003 `plugin:` values are
   dropped at parse time: remote content must not select a local
   executable, and unlike `proxy-providers` there is no

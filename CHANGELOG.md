@@ -354,6 +354,11 @@ the canonical, in-repo source a release is cut from.
 
 ### Changed
 
+- **`Resolver::new_with_bootstrap_with_proxies` gained a trailing
+  `skip_bootstrap: bool` parameter** (meow-dns is a published crate —
+  API break for external callers). Pass `false` to keep the previous
+  behavior; `new_with_bootstrap` is unchanged. (#716)
+
 - **Snell AES-128-GCM runs on BoringSSL (#659).** The v3–v6 record
   ciphers moved off RustCrypto's `aes-gcm`, which the release profile's
   `opt-level = "z"` left at ~65 MB/s seal+open per core, onto BoringSSL's
@@ -479,6 +484,17 @@ the canonical, in-repo source a release is cut from.
   wholesale-replace became contribution merge; see the #640 fix below.
 
 ### Fixed
+
+- **`meow -t` no longer performs real DNS bootstrap lookups** (issue
+  #716). A `dns:` config with hostname-bearing upstreams
+  (`nameserver: [udp://name]`, `tls://`/`https://`, hostname
+  `nameserver-policy` or `proxy-server-nameserver` entries) used to send
+  sequential ~3s-timeout queries during "offline" validation — network
+  I/O in a mode meant to be offline, and a wrong verdict on isolated
+  hosts where a structurally valid config failed `CannotResolve`. The
+  lookups are now deferred: every structural check still runs, and
+  hostname upstreams build against a placeholder address that `-t`
+  exits without querying.
 
 - **`meow -t --config-string` now validates the string, not the file**
   (issue #711). The `-t` path used to always load `-f`, so a broken
