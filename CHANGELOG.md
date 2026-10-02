@@ -49,8 +49,16 @@ the canonical, in-repo source a release is cut from.
   the userspace stack carrying IPv6 TCP and UDP flows with addresses
   intact, and a Windows cross-compile. What was not: global routes on a
   real `utun` or Wintun adapter, the Windows binding at runtime, and the
-  IPv6 device address / routes on any platform. See `docs/tun.md` →
-  "Global route mode".
+  IPv6 device address / routes on macOS and Windows. On **Linux** the
+  mode is now verified with real routes for both families, in privileged
+  containers (not a bare host): startup and interface auto-detection,
+  IP-literal / domain / UDP capture direct and through a SOCKS5 outbound,
+  no packet of meow's own re-entering the device, SIGTERM and `kill -9`
+  teardown, `PUT /configs` transitions and fail-closed startup. The run
+  also pinned down limits that are now documented: only default-routed
+  traffic is captured, inbound connections from outside the local subnet
+  break while the mode is on, and the stack answers ICMP echo for every
+  address. See `docs/tun.md` → "Global route mode".
 
 - **Rolling alpha prereleases** — every push to `main` now refreshes the
   `Prerelease-Alpha` GitHub prerelease (all release targets, sha256 files and
@@ -515,6 +523,19 @@ the canonical, in-repo source a release is cut from.
   file that never existed; and `meow install --config-string` now fails
   fast — a service unit must point at a real `-f` file — instead of
   silently installing a unit that resurrects a different config.
+
+- **A TUN restart no longer races its own old device** (found verifying
+  issue #375 on Linux). A reload that restarts the TUN listener waits for
+  the old lwIP core to finish before building the successor, but each
+  packet pump released its half of the stack *before* its handle on the
+  device, so the core could report done while the old device was still
+  deleting its routes. The new listener's device create then hit `EBUSY`
+  on the configured name, waited 500 ms and came up as `meow-tun-1` — 6 of
+  the 10 `auto-route: global` restarts whose old listener had four `/1`
+  routes to remove. The pumps now release the device first (0 of 30
+  restarts afterwards). The startup warning
+  `lwip::util: Unsupported IP address type`, logged on every TUN start for
+  the stack's own wildcard UDP socket, is gone too.
 
 - **`meow -t --config-string` now validates the string, not the file**
   (issue #711). The `-t` path used to always load `-f`, so a broken

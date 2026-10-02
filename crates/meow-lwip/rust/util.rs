@@ -24,7 +24,10 @@ pub fn to_socket_addr(addr: &ip_addr_t, port: u16_t) -> SocketAddr {
                 let addr = Ipv6Addr::from(p);
                 SocketAddr::new(IpAddr::V6(addr), port)
             }
-            // FIXME Ipv4+Ipv6 (dual-stack)
+            // IPADDR_TYPE_ANY: the dual-stack wildcard the stack's own UDP
+            // pcb is bound to (`ip_addr_any_type`). Not an error — it used
+            // to log the warning below on every TUN start.
+            46 => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port),
             _ => {
                 log::warn!("Unsupported IP address type");
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port)
