@@ -46,7 +46,7 @@ jobs:
           set -euo pipefail
           short_sha="${GITHUB_SHA::7}"
           # Commit time (not wall clock) so re-runs of one commit agree.
-          stamp=$(TZ=UTC git show -s --format=%cd --date=format:%Y%m%d%H%M "$GITHUB_SHA")
+          stamp=$(TZ=UTC git show -s --format=%cd --date=format-local:%Y%m%d%H%M "$GITHUB_SHA")
           base=$(sed -nE '/^\[workspace\.package\]/,/^\[/ s/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' Cargo.toml | head -n1)
           if [ -z "$base" ]; then
             echo "::error::could not parse workspace version from Cargo.toml"
@@ -146,7 +146,9 @@ jobs:
             if [ -n "$last" ]; then
               echo "### Commits since ${last}"
               echo
-              git log --no-merges --pretty='- %s (%h)' "${last}..${GITHUB_SHA}" | head -n 50
+              # `-n`, not `| head`: head closing the pipe early SIGPIPEs git
+              # and pipefail turns that into a failed step.
+              git log --no-merges --pretty='- %s (%h)' -n 50 "${last}..${GITHUB_SHA}"
               total=$(git rev-list --no-merges --count "${last}..${GITHUB_SHA}")
               if [ "$total" -gt 50 ]; then
                 echo "- … and $((total - 50)) more: https://github.com/${GITHUB_REPOSITORY}/compare/${last}...${GITHUB_SHA}"
