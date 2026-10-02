@@ -40,7 +40,8 @@
 //!
 //! [`TunRouteScope::Global`] opts into capturing everything: `auto-route`
 //! installs split default routes (`0.0.0.0/1` + `128.0.0.0/1`, plus
-//! `::/1` + `8000::/1` when the device has an `inet6-address`), and loop
+//! `::/1` + `8000::/1` when the device has an `inet6-address`; on macOS an
+//! equivalent set that avoids the all-zero destination), and loop
 //! freedom moves from route scoping to the outbound path — every socket
 //! meow creates is bound to the physical interface
 //! (`meow_common::install_outbound_interface`: `SO_BINDTODEVICE` on Linux,
@@ -543,7 +544,8 @@ impl TunListener {
         // outer TUN_STARTUP_TIMEOUT guards the overall startup.
         let route_nets: Option<Vec<ipnet::IpNet>> = if cfg.auto_route {
             match cfg.route_scope {
-                // Split defaults: two /1s cover all IPv4 while staying more
+                // Split defaults: two /1s (macOS: eight routes that avoid
+                // the all-zero key) cover all IPv4 while staying more
                 // specific than the physical 0/0 default, so the original
                 // route survives untouched and restore-on-drop is trivial.
                 // The device's own /30 and the fake-IP range (if any) are
@@ -887,13 +889,59 @@ impl TunListener {
     }
 }
 
-/// The split default routes of global route scope (#375): two `/1`s per
-/// family, more specific than the physical default so it is never touched.
-/// IPv6 is included only when the device carries an IPv6 address — routes
-/// into a device that cannot source IPv6 would blackhole that traffic.
+/// The split default routes of global route scope (#375): more specific
+/// than the physical default so it is never touched. IPv6 is included only
+/// when the device carries an IPv6 address — routes into a device that
+/// cannot source IPv6 would blackhole that traffic.
 fn global_route_nets(ipv6: bool) -> Vec<ipnet::IpNet> {
-    let v4 = ["0.0.0.0/1", "128.0.0.0/1"];
-    let v6 = ["::/1", "8000::/1"];
+    global_route_nets_for(ipv6, cfg!(target_os = "macos"))
+}
+
+/// Pure selection behind [`global_route_nets`], split out so both shapes
+/// are unit-tested on every host.
+///
+/// Everywhere but macOS a family is two `/1`s. On macOS
+/// (`zero_key_shadows_default`) the lower half is instead split into seven
+/// routes that skip the first `/8`, so that **no installed route has the
+/// all-zero destination**.
+///
+/// The reason is XNU's scoped route lookup, which is what an outbound
+/// socket bound with `IP_BOUND_IF` / `IPV6_BOUND_IF` gets. When the best
+/// match belongs to another interface (the TUN) and the bound interface
+/// has no scoped route of its own — the primary interface's default is
+/// unscoped — the kernel falls back to looking the default route up *by
+/// key*, `0.0.0.0` / `::`. A `0.0.0.0/1` (or `::/1`) route shares that key
+/// and is returned instead of the real default; its interface is not the
+/// bound one, so the lookup fails and every dial meow makes dies with
+/// `ENETUNREACH` (IPv4) / `EHOSTUNREACH` (IPv6) — for destinations in
+/// *both* halves. Observed on macOS 26.6 (#375); removing the zero-keyed
+/// route alone restores the bound sockets.
+///
+/// The skipped `0.0.0.0/8` is "this network" and never a destination. The
+/// skipped `::/8` holds the unspecified/loopback addresses and the
+/// IPv4-mapped and NAT64 (`64:ff9b::/96`) ranges, which therefore bypass
+/// the device on macOS.
+fn global_route_nets_for(ipv6: bool, zero_key_shadows_default: bool) -> Vec<ipnet::IpNet> {
+    const V4: &[&str] = &["0.0.0.0/1", "128.0.0.0/1"];
+    const V6: &[&str] = &["::/1", "8000::/1"];
+    const V4_NO_ZERO_KEY: &[&str] = &[
+        "1.0.0.0/8",
+        "2.0.0.0/7",
+        "4.0.0.0/6",
+        "8.0.0.0/5",
+        "16.0.0.0/4",
+        "32.0.0.0/3",
+        "64.0.0.0/2",
+        "128.0.0.0/1",
+    ];
+    const V6_NO_ZERO_KEY: &[&str] = &[
+        "100::/8", "200::/7", "400::/6", "800::/5", "1000::/4", "2000::/3", "4000::/2", "8000::/1",
+    ];
+    let (v4, v6) = if zero_key_shadows_default {
+        (V4_NO_ZERO_KEY, V6_NO_ZERO_KEY)
+    } else {
+        (V4, V6)
+    };
     v4.iter()
         .chain(v6.iter().filter(|_| ipv6))
         .map(|net| net.parse().expect("static CIDR parses"))
@@ -1077,7 +1125,7 @@ impl<S: AsyncRead + AsyncWrite + Send + Sync + Unpin> ProxyConn for TunTcpConn<S
 #[cfg(test)]
 mod tests {
     use super::{
-        device_name_for_attempt, global_route_nets, sniff_first_payload,
+        device_name_for_attempt, global_route_nets, global_route_nets_for, sniff_first_payload,
         sniff_first_payload_within, TunTcpConn, TUN_SNIFF_WINDOW,
     };
     use std::io;
@@ -1122,11 +1170,16 @@ mod tests {
     #[test]
     fn global_routes_cover_ipv6_only_for_a_dual_stack_device() {
         let nets = |ipv6| -> Vec<String> {
-            global_route_nets(ipv6)
+            global_route_nets_for(ipv6, false)
                 .iter()
                 .map(ToString::to_string)
                 .collect()
         };
+        // The platform's own set is one of the two shapes.
+        assert_eq!(
+            global_route_nets(true),
+            global_route_nets_for(true, cfg!(target_os = "macos"))
+        );
         assert_eq!(nets(false), ["0.0.0.0/1", "128.0.0.0/1"]);
         assert_eq!(nets(true), ["0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1"]);
         // Each family's pair covers the whole space without being a default.
@@ -1134,6 +1187,47 @@ mod tests {
             let pair: Vec<ipnet::IpNet> = family.iter().map(|n| n.parse().unwrap()).collect();
             assert!(pair.iter().all(|n| n.prefix_len() == 1));
             assert_ne!(pair[0].network(), pair[1].network());
+        }
+    }
+
+    /// macOS (#375): a route keyed on the all-zero address shadows the
+    /// physical default in the scoped lookup an `IP_BOUND_IF` socket gets,
+    /// so the set must cover everything from the second `/8` up without
+    /// ever using that key.
+    #[test]
+    fn macos_global_routes_never_use_the_all_zero_destination() {
+        let nets = global_route_nets_for(true, true);
+        assert!(nets.iter().all(|n| !n.network().is_unspecified()));
+        assert_eq!(nets.iter().filter(|n| n.addr().is_ipv4()).count(), 8);
+        assert_eq!(nets.iter().filter(|n| n.addr().is_ipv6()).count(), 8);
+        assert_eq!(global_route_nets_for(false, true).len(), 8);
+
+        let covering = |ip: &str| {
+            let ip: std::net::IpAddr = ip.parse().unwrap();
+            nets.iter().filter(|n| n.contains(&ip)).count()
+        };
+        // Exactly one route per address: contiguous, no overlap.
+        for ip in [
+            "1.0.0.0",
+            "1.1.1.1",
+            "8.8.8.8",
+            "100.64.0.1",
+            "127.255.255.255",
+            "128.0.0.0",
+            "198.18.0.1",
+            "255.255.255.254",
+            "100::1",
+            "2001:4860:4860::8888",
+            "2606:4700:4700::1111",
+            "7fff::1",
+            "8000::",
+            "fd00::1",
+        ] {
+            assert_eq!(covering(ip), 1, "{ip}");
+        }
+        // Only the first /8 of each family is left out.
+        for ip in ["0.0.0.0", "0.255.255.255", "::", "::1", "64:ff9b::101:101"] {
+            assert_eq!(covering(ip), 0, "{ip}");
         }
     }
 

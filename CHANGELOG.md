@@ -21,8 +21,8 @@ the canonical, in-repo source a release is cut from.
   installs them into an OpenWrt 25.12 rootfs container.
 
 - **`tun.auto-route: global` on macOS and Windows, and opt-in IPv6
-  capture** (issue #375) — experimental, **not yet verified on a real
-  macOS or Windows host**. Global route mode was Linux-only because the
+  capture** (issue #375) — experimental; run with real routes on Linux, macOS
+  and Windows (scope below). Global route mode was Linux-only because the
   outbound-socket interface binding that keeps meow's own dials out of the
   TUN only existed as `SO_BINDTODEVICE`. The binding now also uses
   `IP_BOUND_IF` / `IPV6_BOUND_IF` on macOS and `IP_UNICAST_IF` /
@@ -40,25 +40,43 @@ the canonical, in-repo source a release is cut from.
   New `tun.inet6-address` (mihomo's key; a CIDR string or a list whose
   first entry is used): under `auto-route: global` it gives the device an
   IPv6 address and adds `::/1` + `8000::/1`, so IPv6 traffic is captured
-  too. Without it nothing changes — the device stays IPv4-only and no
+  too. **macOS installs a different route set**: `1.0.0.0/8`, `2.0.0.0/7`,
+  `4.0.0.0/6`, `8.0.0.0/5`, `16.0.0.0/4`, `32.0.0.0/3`, `64.0.0.0/2` +
+  `128.0.0.0/1` (and `100::/8` … `4000::/2` + `8000::/1`). A route keyed on
+  the all-zero address (`0.0.0.0/1`, `::/1`) shadows the physical default
+  in the scoped lookup an `IP_BOUND_IF` socket gets, so with the plain
+  `/1` pair every dial meow made failed with `ENETUNREACH` (IPv4) / `No
+  route to host` (IPv6) as soon as the routes went in — found on the
+  first real run. `0.0.0.0/8` and `::/8` are therefore not captured on
+  macOS. Without it nothing changes — the device stays IPv4-only and no
   IPv6 route is installed — and outside global mode it is ignored with a
   warning, as before. What was tested: the macOS binding against real
   sockets without root (bound sockets report the interface, and a
   loopback-scoped socket gets `ENETUNREACH` for a non-loopback
   destination), macOS interface detection against the live routing table,
   the userspace stack carrying IPv6 TCP and UDP flows with addresses
-  intact, and a Windows cross-compile. What was not: global routes on a
-  real `utun` or Wintun adapter, the Windows binding at runtime, and the
-  IPv6 device address / routes on macOS and Windows. On **Linux** the
-  mode is now verified with real routes for both families, in privileged
-  containers (not a bare host): startup and interface auto-detection,
-  IP-literal / domain / UDP capture direct and through a SOCKS5 outbound,
-  no packet of meow's own re-entering the device, SIGTERM and `kill -9`
-  teardown, `PUT /configs` transitions and fail-closed startup. The run
-  also pinned down limits that are now documented: only default-routed
-  traffic is captured, inbound connections from outside the local subnet
-  break while the mode is on, and the stack answers ICMP echo for every
-  address. See `docs/tun.md` → "Global route mode".
+  intact, and a Windows cross-compile. The mode has since been run with
+  real routes on all three platforms, IPv4 and IPv6 (#375):
+  **Linux** in privileged containers (not a bare host) — startup and
+  interface auto-detection, IP-literal / domain / UDP capture direct and
+  through a SOCKS5 outbound, no packet of meow's own re-entering the
+  device, SIGTERM and `kill -9` teardown, `PUT /configs` transitions and
+  fail-closed startup; **macOS** 26.6 (arm64 VM, DIRECT outbound) —
+  startup with auto-detected and explicit `outbound-interface`,
+  IP-literal and fake-ip TCP, UDP, loopback dials, IPv6 TCP and UDP, no
+  re-entry of meow's own dials into the `utun`, a global → global reload,
+  and SIGTERM / `kill -9` teardown; **Windows** 11 arm64 (Wintun, one
+  physical NIC, DIRECT outbound) — auto-detection and an explicit alias,
+  the split `/1` routes, IP-literal and fake-ip TCP, UDP, meow's own
+  dials leaving from the physical address, reload into and out of global
+  scope, fail-closed on an unknown alias, and IPv6 address, routes and
+  TCP + UDP flows. What was not: a bare Linux host, encrypted proxy
+  outbounds under global mode, multi-interface hosts on macOS, and
+  Windows default-route selection with more than one uplink. The Linux
+  run also pinned down limits that are now documented: only
+  default-routed traffic is captured, inbound connections from outside
+  the local subnet break while the mode is on, and the stack answers
+  ICMP echo for every address. See `docs/tun.md` → "Global route mode".
 
 - **Rolling alpha prereleases** — every push to `main` now refreshes the
   `Prerelease-Alpha` GitHub prerelease (all release targets, sha256 files and
