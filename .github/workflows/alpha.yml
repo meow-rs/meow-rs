@@ -31,7 +31,7 @@ jobs:
   prepare:
     name: Compute alpha identifiers
     # Forks must never publish (or even burn minutes on) a Prerelease-Alpha.
-    if: github.repository == 'madeye/meow-rs'
+    if: github.repository == 'meow-rs/meow-rs'
     runs-on: ubuntu-latest
     outputs:
       short_sha: ${{ steps.id.outputs.short_sha }}
