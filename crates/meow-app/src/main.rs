@@ -2044,13 +2044,24 @@ mod tests {
     /// ahead of the build's first dial, only for an enabled TUN in
     /// `auto-route: global` — TUN-off and fake-IP startups never touch the
     /// process-global registry.
-    #[cfg(all(feature = "listener-tun", target_os = "linux"))]
+    #[cfg(all(
+        feature = "listener-tun",
+        any(target_os = "linux", target_os = "macos")
+    ))]
     mod early_outbound_binding {
         use crate::preinstall_global_route_binding;
         use meow_config::raw::RawConfig;
 
+        /// Loopback exists on every host.
+        const LO: &str = if cfg!(target_os = "macos") {
+            "lo0"
+        } else {
+            "lo"
+        };
+
+        /// Parse `yaml` with `LO` standing in for the loopback interface.
         fn raw(yaml: &str) -> RawConfig {
-            meow_config::parse_raw_yaml(yaml).unwrap()
+            meow_config::parse_raw_yaml(&yaml.replace("LO", LO)).unwrap()
         }
 
         /// One test drives every case because the registry is
@@ -2061,13 +2072,13 @@ mod tests {
 
             for yaml in [
                 "port: 7890\n",
-                "tun:\n  enable: false\n  auto-route: global\n  outbound-interface: lo\n",
-                "tun:\n  enable: true\n  outbound-interface: lo\n",
-                "tun:\n  enable: true\n  auto-route: true\n  outbound-interface: lo\n",
-                "tun:\n  enable: true\n  auto-route: fake-ip\n  outbound-interface: lo\n",
+                "tun:\n  enable: false\n  auto-route: global\n  outbound-interface: LO\n",
+                "tun:\n  enable: true\n  outbound-interface: LO\n",
+                "tun:\n  enable: true\n  auto-route: true\n  outbound-interface: LO\n",
+                "tun:\n  enable: true\n  auto-route: fake-ip\n  outbound-interface: LO\n",
                 "tun:\n  enable: true\n  auto-route: false\n",
                 // Rejected later by `build_config`; never pre-installs.
-                "tun:\n  enable: true\n  auto-route: bogus\n  outbound-interface: lo\n",
+                "tun:\n  enable: true\n  auto-route: bogus\n  outbound-interface: LO\n",
             ] {
                 assert!(
                     preinstall_global_route_binding(&raw(yaml)).is_none(),
@@ -2083,10 +2094,10 @@ mod tests {
             assert!(preinstall_global_route_binding(&raw(missing)).is_none());
             assert!(meow_common::outbound_interface().is_none());
 
-            let global = "tun:\n  enable: true\n  auto-route: global\n  outbound-interface: lo\n";
+            let global = "tun:\n  enable: true\n  auto-route: global\n  outbound-interface: LO\n";
             let binding = preinstall_global_route_binding(&raw(global))
                 .expect("global route scope pre-installs the binding");
-            assert_eq!(meow_common::outbound_interface().as_deref(), Some("lo"));
+            assert_eq!(meow_common::outbound_interface().as_deref(), Some(LO));
             drop(binding);
             assert!(meow_common::outbound_interface().is_none());
         }

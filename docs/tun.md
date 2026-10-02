@@ -1,6 +1,6 @@
 # TUN inbound — transparent proxy on Windows (and everywhere else)
 
-Last updated: 2026-10-01. Tracks the `listener-tun` feature (issue
+Last updated: 2026-10-02. Tracks the `listener-tun` feature (issue
 [#326](https://github.com/madeye/meow-rs/issues/326)).
 Audience: users who want system-wide transparent proxying on a platform
 without a tproxy/REDIRECT firewall — Windows first and foremost. The same
@@ -111,20 +111,36 @@ Consequences:
   stack itself — `ping` to a fake IP confirms the tun is up, but is not an
   end-to-end probe of the remote host.
 
-## Global route mode — `auto-route: global` (experimental, Linux-only)
+## Global route mode — `auto-route: global` (experimental)
 
 Tracked on [#375](https://github.com/madeye/meow-rs/issues/375). Routes
 **all IPv4 traffic** into the device instead of just the fake-ip range, so
-IP-literal connections are captured too:
+IP-literal connections are captured too — and all IPv6 traffic as well when
+the device is given an `inet6-address`:
 
 ```yaml
 tun:
   enable: true
   auto-route: global
   # outbound-interface: eth0   # optional; auto-detected from the default route
+  # inet6-address: fdfe:dcba:9876::1/126   # optional; also capture IPv6
   dns-hijack:
     - any:53
 ```
+
+Status per platform — "implemented" means the code path exists, compiles
+and is unit-tested; only Linux has been exercised with real routes:
+
+| Platform | Outbound binding | Interface auto-detection | Status |
+|----------|------------------|--------------------------|--------|
+| Linux | `SO_BINDTODEVICE` (by name) | `/proc/net/route` | IPv4 exercised in a privileged container (#695); not yet on a bare host. |
+| macOS | `IP_BOUND_IF` / `IPV6_BOUND_IF` (by index) | routing table, unscoped `0.0.0.0/0` | **Experimental, not yet verified on a real host.** The socket binding itself is tested unprivileged; global routes on a `utun` are not. |
+| Windows | `IP_UNICAST_IF` / `IPV6_UNICAST_IF` (by index) | routing table, lowest route + interface metric | **Experimental, not yet verified on a real host.** Compile-checked only. |
+
+IPv6 capture (`inet6-address`) is **experimental and not yet verified on a
+real host on any platform**: the userspace stack is unit-tested carrying
+IPv6 TCP and UDP flows, but the device address and the IPv6 routes have
+not been exercised.
 
 How each loop-avoidance piece works:
 
@@ -132,20 +148,27 @@ How each loop-avoidance piece works:
    `128.0.0.0/1` into the device. The two /1s are more specific than the
    physical `0.0.0.0/0`, so the original default route is never touched and
    teardown is a plain route delete — no restore step that can be lost to a
-   crash.
+   crash. With `inet6-address` set, `::/1` and `8000::/1` are installed the
+   same way; without it no IPv6 route is installed and IPv6 traffic keeps
+   bypassing the device.
 2. **Outbound interface binding.** Every outbound socket meow creates (proxy
    upstream dials including Hysteria2's QUIC socket, DIRECT, DNS upstreams,
-   marked sockets) is bound to the physical interface with `SO_BINDTODEVICE`
-   *before* connect/bind, so its packets take the physical route regardless
-   of the routing table. The interface is `tun.outbound-interface` if set,
-   otherwise auto-detected from `/proc/net/route` (the real `0.0.0.0/0`
-   entry — the TUN's own `/1` split routes are skipped, so detection is
-   safe while a previous listener's routes are still up). The binding is
-   installed as soon as the config is parsed, ahead of the first startup
-   dial (provider and geodata fetches, health checks), so no long-lived
-   session opened during startup escapes it (#695); the TUN listener then
-   owns it and gives it up with its routes. Runtime reloads do the same —
-   see *Runtime reloads* below. If the binding cannot be installed, startup
+   marked sockets) is bound to the physical interface *before*
+   connect/bind, so its packets take the physical route regardless of the
+   routing table: `SO_BINDTODEVICE` on Linux, `IP_BOUND_IF` /
+   `IPV6_BOUND_IF` on macOS, `IP_UNICAST_IF` / `IPV6_UNICAST_IF` on
+   Windows. The interface is `tun.outbound-interface` if set (on Windows:
+   the interface *alias*, e.g. `Ethernet` or `Wi-Fi`), otherwise
+   auto-detected from the real IPv4 `0.0.0.0/0` route — the TUN's own `/1`
+   split routes are skipped, so detection is safe while a previous
+   listener's routes are still up. On macOS the default of a non-primary
+   interface (`netstat -rn` flag `I`) is skipped; on Windows the default
+   with the lowest route + interface metric wins. The binding is installed
+   as soon as the config is parsed, ahead of the first startup dial
+   (provider and geodata fetches, health checks), so no long-lived session
+   opened during startup escapes it (#695); the TUN listener then owns it
+   and gives it up with its routes. Runtime reloads do the same — see
+   *Runtime reloads* below. If the binding cannot be installed, startup
    **fails closed** — no default routes are installed without loop
    avoidance.
 3. **Own-resolver hostname dials.** Proxy-server domains are resolved
@@ -155,14 +178,33 @@ How each loop-avoidance piece works:
 
 Scope and caveats:
 
-- **Linux-only for now.** macOS (`IP_BOUND_IF`) and Windows
-  (`IP_UNICAST_IF`) bindings are follow-ups on #375; `auto-route: global`
-  on those platforms is a startup error. On Windows the fake-ip mode
-  remains the supported transparent path.
-- IPv4 only, matching the rest of the TUN v1 flow (no `inet6-address`).
+- **Linux, macOS and Windows.** Any other target fails at startup rather
+  than install default routes it cannot protect.
+- **macOS and Windows bind by interface index**, resolved once when the
+  binding is installed. If the physical interface is destroyed and
+  re-created (not a plain link flap), the index changes and outbound dials
+  fail until the TUN listener restarts (`PUT /configs` with a changed
+  `tun:` section, or a restart of meow). Linux binds by name and follows
+  the re-created interface.
+- **Loopback upstreams on macOS and Windows are left unbound.** A socket
+  scoped to a physical interface cannot connect to `127.0.0.1` on macOS,
+  and loopback traffic never follows the TUN's routes, so TCP dials to a
+  loopback address (a local upstream proxy, a SIP003 plugin) skip the
+  binding there, as do UDP sockets bound to a loopback address. Linux
+  binds every socket.
+- **IPv6 is opt-in.** Without `inet6-address` the device is IPv4-only and
+  IPv6 traffic is not captured (it leaves through the physical interface
+  untouched). With it, outbound IPv6 sockets are bound to the same
+  physical interface as IPv4 ones — the interface is still chosen from
+  the *IPv4* default route. If that interface has no IPv6 connectivity,
+  DIRECT dials to IPv6 destinations fail (clients fall back to IPv4);
+  proxied ones are unaffected. `inet6-address` is ignored, with a warning,
+  outside `auto-route: global`: the fake-ip scope has no IPv6 range to
+  route.
 - `fake-ip` DNS mode is still recommended so domain rules match; global
   mode adds IP-literal capture on top rather than replacing the DNS flow.
-- Requires root/`CAP_NET_ADMIN` like the rest of the TUN inbound.
+- Requires root/`CAP_NET_ADMIN` (Administrator on Windows) like the rest
+  of the TUN inbound.
 
 Verification on a Linux host (or VM):
 
@@ -175,6 +217,25 @@ curl https://example.com              # domain flow — still captured
 ip route | grep -c '/1 dev' # → 0
 ```
 
+The same checks, not yet run by the maintainers, on macOS and Windows —
+please report results on #375:
+
+```bash
+# macOS
+sudo ./meow -f config.yaml
+route -n get 1.1.1.1 | grep interface   # → the utun device
+curl 1.1.1.1                            # captured (check meow logs)
+netstat -rn -f inet | grep '/1'         # after stopping meow: no 0/1, 128.0/1
+```
+
+```powershell
+# Windows (elevated)
+.\meow.exe -f config.yaml
+Find-NetRoute -RemoteIPAddress 1.1.1.1 | Select-Object InterfaceAlias  # → the tun adapter
+curl.exe 1.1.1.1                       # captured (check meow logs)
+Get-NetRoute -DestinationPrefix 0.0.0.0/1, 128.0.0.0/1   # after stopping meow: none
+```
+
 ## `tun:` reference
 
 | Field | Default | Notes |
@@ -183,14 +244,15 @@ ip route | grep -c '/1 dev' # → 0
 | `device` | platform-chosen | Adapter name. macOS always auto-assigns `utunN`. |
 | `mtu` | `1500` | Hard error below 1280 (userspace-stack minimum). |
 | `inet4-address` | `172.19.0.1/30` | CIDR assigned to the device. |
-| `auto-route` | `true` | What to route into the device at startup (removed on shutdown): `true`/`fake-ip` = the fake-ip range; `global` = all IPv4 (experimental, Linux-only, see above); `false` = nothing. |
-| `outbound-interface` | auto-detect | Physical interface outbound sockets bind to in `global` mode. Ignored otherwise. |
+| `inet6-address` | none | IPv6 CIDR assigned to the device, e.g. `fdfe:dcba:9876::1/126` — a string, or mihomo's list form (only the first entry is used). Only honoured with `auto-route: global`, where it also adds the `::/1` + `8000::/1` routes (experimental, see above); ignored with a warning otherwise. An invalid CIDR is a hard error. |
+| `auto-route` | `true` | What to route into the device at startup (removed on shutdown): `true`/`fake-ip` = the fake-ip range; `global` = all IPv4, plus all IPv6 with `inet6-address` (experimental; macOS and Windows not yet verified on a real host, see above); `false` = nothing. |
+| `outbound-interface` | auto-detect | Physical interface outbound sockets bind to in `global` mode — the interface name on Linux/macOS (`eth0`, `en0`), the interface alias on Windows (`Ethernet`). Ignored otherwise. |
 | `dns-hijack` | off | List of targets; any `:53` entry turns on in-process answering of UDP :53 flows entering the device. Non-`:53` entries warn and are ignored. |
 | `udp-timeout` | `60` | Seconds of idle before a UDP flow is evicted. |
 | `max-connections` | `256` | Inherited from the top-level `max-connections` (`0` = unlimited); bounds **TCP** flows (a flow takes its slot when it leaves the 200 ms sniff window, so one that closes inside it never occupies one) — a change while TUN runs restarts the listener. The UDP flow table has its own fixed bound (1024 live flows, least-recently-active eviction) that `max-connections` does not adjust. |
 
 mihomo fields meow does not implement (`stack`, `strict-route`,
-`auto-detect-interface`, `inet6-address`, `endpoint-independent-nat`,
+`auto-detect-interface`, `mtu-v6`, `endpoint-independent-nat`,
 UID filters, …) are accepted with a startup warning and ignored — same
 forward-compat policy as the rest of the config surface.
 

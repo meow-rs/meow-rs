@@ -49,7 +49,7 @@ pub use fs_util::{sweep_scratch_siblings, SCRATCH_STALE_AGE};
 pub use home_dir::{meow_home_dir, resolved_home_dir, set_home_dir, xdg_home_dir};
 pub use metadata::{metadata_ip_literal, AddrDisplay, Metadata};
 pub use network::Network;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub use outbound_iface::apply_outbound_interface;
 pub use outbound_iface::{install_outbound_interface, outbound_interface, OutboundIfaceGuard};
 pub use process_lookup::{

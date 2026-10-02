@@ -296,12 +296,16 @@ pub struct RawTun {
     pub dns_hijack: Option<Vec<String>>,
     /// UDP NAT idle timeout in seconds. Default 60.
     pub udp_timeout: Option<u64>,
+    /// IPv6 CIDR assigned to the device, e.g. `fdfe:dcba:9876::1/126` —
+    /// a string, or mihomo's list form (the first entry is used). Opts
+    /// `auto-route: global` into IPv6 capture (#375); ignored with a
+    /// warning in every other mode. Default: none (IPv4 only).
+    pub inet6_address: Option<serde_yaml::Value>,
     // Upstream-only fields accepted for forward-compat; warn and ignore.
     pub stack: Option<serde_yaml::Value>,
     pub strict_route: Option<serde_yaml::Value>,
     pub auto_detect_interface: Option<serde_yaml::Value>,
     pub auto_redirect: Option<serde_yaml::Value>,
-    pub inet6_address: Option<serde_yaml::Value>,
     pub endpoint_independent_nat: Option<serde_yaml::Value>,
     pub mtu_v6: Option<serde_yaml::Value>,
     pub route_address: Option<serde_yaml::Value>,

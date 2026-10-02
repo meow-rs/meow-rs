@@ -311,9 +311,11 @@ pub async fn connect_tcp(addr: SocketAddr) -> io::Result<TcpStream> {
     // TUN global-route loop avoidance (#375): when an outbound interface is
     // installed, bind the socket to it before connect() so the SYN already
     // takes the physical route past the TUN default routes.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     {
-        if crate::outbound_iface::outbound_interface().is_some() {
+        if crate::outbound_iface::binds_peer(addr.ip())
+            && crate::outbound_iface::outbound_interface().is_some()
+        {
             return connect_tcp_iface_bound(addr).await;
         }
     }
@@ -321,17 +323,18 @@ pub async fn connect_tcp(addr: SocketAddr) -> io::Result<TcpStream> {
 }
 
 /// Dial with the socket bound to the installed outbound interface
-/// (`SO_BINDTODEVICE`) before `connect()`. Uses `tokio::net::TcpSocket` for
-/// the async connect so connection errors surface here, not on first I/O.
-#[cfg(target_os = "linux")]
-async fn connect_tcp_iface_bound(addr: SocketAddr) -> io::Result<TcpStream> {
+/// (`SO_BINDTODEVICE` / `IP_BOUND_IF` / `IP_UNICAST_IF`) before `connect()`.
+/// Uses `tokio::net::TcpSocket` for the async connect so connection errors
+/// surface here, not on first I/O.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+pub(crate) async fn connect_tcp_iface_bound(addr: SocketAddr) -> io::Result<TcpStream> {
     let domain = if addr.is_ipv4() {
         socket2::Domain::IPV4
     } else {
         socket2::Domain::IPV6
     };
     let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
-    crate::outbound_iface::apply_outbound_interface(&socket)?;
+    crate::outbound_iface::apply_outbound_interface(&socket, domain)?;
     socket.set_nonblocking(true)?;
     let tokio_socket = tokio::net::TcpSocket::from_std_stream(socket.into());
     tokio_socket.connect(addr).await
@@ -504,7 +507,7 @@ pub async fn bind_udp<A: ToSocketAddrs>(local: A) -> io::Result<UdpSocket> {
     // TUN global-route loop avoidance (#375): bind the socket to the
     // installed outbound interface before the local-address bind, mirroring
     // `connect_tcp` — so the first datagram already bypasses the TUN routes.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     {
         if crate::outbound_iface::outbound_interface().is_some() {
             let resolved = tokio::net::lookup_host(local)
@@ -520,16 +523,20 @@ pub async fn bind_udp<A: ToSocketAddrs>(local: A) -> io::Result<UdpSocket> {
 }
 
 /// Bind a UDP socket to the installed outbound interface
-/// (`SO_BINDTODEVICE`), then to `local`.
-#[cfg(target_os = "linux")]
-fn bind_udp_iface_bound(local: SocketAddr) -> io::Result<UdpSocket> {
+/// (`SO_BINDTODEVICE` / `IP_BOUND_IF` / `IP_UNICAST_IF`), then to `local`.
+/// A socket pinned to a loopback `local` address is left unbound where the
+/// platform's binding would break it (see `outbound_iface::binds_peer`).
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+pub(crate) fn bind_udp_iface_bound(local: SocketAddr) -> io::Result<UdpSocket> {
     let domain = if local.is_ipv4() {
         socket2::Domain::IPV4
     } else {
         socket2::Domain::IPV6
     };
     let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
-    crate::outbound_iface::apply_outbound_interface(&socket)?;
+    if crate::outbound_iface::binds_peer(local.ip()) {
+        crate::outbound_iface::apply_outbound_interface(&socket, domain)?;
+    }
     socket.bind(&local.into())?;
     socket.set_nonblocking(true)?;
     UdpSocket::from_std(socket.into())

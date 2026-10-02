@@ -201,8 +201,8 @@ async fn connect_addr(
         SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
     };
     // Through the outbound-socket chokepoint, never a raw bind: it applies
-    // the TUN global-route interface binding (`SO_BINDTODEVICE`) and the
-    // Android `protect()` hook before the first QUIC Initial leaves —
+    // the TUN global-route interface binding (`meow_common::outbound_iface`)
+    // and the Android `protect()` hook before the first QUIC Initial leaves —
     // otherwise the datagrams follow the TUN's split default routes back
     // into the device and loop (issue #695).
     let socket = meow_common::bind_udp(bind_addr).await.map_err(Error::Io)?;

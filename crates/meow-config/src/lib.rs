@@ -268,6 +268,10 @@ pub struct TunConfig {
     pub mtu: u16,
     /// Address + prefix assigned to the device.
     pub inet4_address: ipnet::Ipv4Net,
+    /// IPv6 address + prefix assigned to the device (`inet6-address`).
+    /// Only ever `Some` in global route mode, where it also adds the IPv6
+    /// split default routes (#375); `None` = the device is IPv4-only.
+    pub inet6_address: Option<ipnet::Ipv6Net>,
     pub auto_route: bool,
     /// Which routes `auto-route` installs (#375). Only meaningful when
     /// `auto_route` is true.
@@ -292,9 +296,10 @@ pub enum TunRouteMode {
     /// by construction; IP-literal traffic is not captured.
     #[default]
     FakeIp,
-    /// Route all IPv4 traffic into the device (split default routes) and
-    /// bind outbound sockets to the physical interface for loop avoidance.
-    /// Experimental; currently Linux-only.
+    /// Route all IPv4 traffic — and all IPv6 traffic when `inet6-address`
+    /// is set — into the device (split default routes) and bind outbound
+    /// sockets to the physical interface for loop avoidance. Experimental;
+    /// Linux, macOS and Windows.
     Global,
 }
 
@@ -306,6 +311,7 @@ impl Default for TunConfig {
             mtu: 1500,
             // mihomo's default TUN subnet.
             inet4_address: "172.19.0.1/30".parse().expect("static CIDR parses"),
+            inet6_address: None,
             auto_route: true,
             route_mode: TunRouteMode::FakeIp,
             outbound_interface: None,
@@ -343,7 +349,6 @@ pub fn parse_tun_config(
         ("strict-route", &r.strict_route),
         ("auto-detect-interface", &r.auto_detect_interface),
         ("auto-redirect", &r.auto_redirect),
-        ("inet6-address", &r.inet6_address),
         ("endpoint-independent-nat", &r.endpoint_independent_nat),
         ("mtu-v6", &r.mtu_v6),
         ("route-address", &r.route_address),
@@ -422,11 +427,26 @@ pub fn parse_tun_config(
     // (issue #543 review).
     let outbound_interface = outbound_interface.filter(|_| route_mode == TunRouteMode::Global);
 
+    // `inet6-address` is validated in every mode, but only global mode has
+    // IPv6 routes to send into the device — elsewhere an address on the
+    // device would capture nothing, so it is normalised out for the same
+    // restart-diff reason as `outbound-interface` above.
+    let inet6_address = parse_inet6_address(r.inet6_address.as_ref())?;
+    let global = auto_route && route_mode == TunRouteMode::Global;
+    if inet6_address.is_some() && !global {
+        warn!(
+            "tun.inet6-address: only used with 'auto-route: global'; \
+             ignored (the device stays IPv4-only)"
+        );
+    }
+    let inet6_address = inet6_address.filter(|_| global);
+
     Ok(TunConfig {
         enable: r.enable,
         device: r.device.clone().filter(|s| !s.is_empty()),
         mtu,
         inet4_address,
+        inet6_address,
         auto_route,
         route_mode,
         outbound_interface,
@@ -434,6 +454,47 @@ pub fn parse_tun_config(
         udp_timeout,
         max_connections: global_max_connections.unwrap_or(defaults.max_connections),
     })
+}
+
+/// `tun.inet6-address` (#375): one IPv6 CIDR, as a string or as mihomo's
+/// list form. The device takes a single IPv6 address, so of a list only
+/// the first entry is used; an empty list or empty string is "unset".
+fn parse_inet6_address(
+    raw: Option<&serde_yaml::Value>,
+) -> Result<Option<ipnet::Ipv6Net>, anyhow::Error> {
+    let cidr = match raw {
+        None | Some(serde_yaml::Value::Null) => return Ok(None),
+        Some(serde_yaml::Value::String(s)) => s.as_str(),
+        Some(serde_yaml::Value::Sequence(entries)) => {
+            if entries.len() > 1 {
+                warn!(
+                    "tun.inet6-address: {} entries given; meow-rs assigns one IPv6 \
+                     address to the device — only the first is used",
+                    entries.len()
+                );
+            }
+            match entries.first() {
+                None => return Ok(None),
+                Some(serde_yaml::Value::String(s)) => s.as_str(),
+                Some(other) => {
+                    return Err(anyhow::anyhow!(
+                        "tun.inet6-address: expected a CIDR string, got {other:?}"
+                    ));
+                }
+            }
+        }
+        Some(other) => {
+            return Err(anyhow::anyhow!(
+                "tun.inet6-address: expected a CIDR string or a list of them, got {other:?}"
+            ));
+        }
+    };
+    if cidr.is_empty() {
+        return Ok(None);
+    }
+    cidr.parse::<ipnet::Ipv6Net>()
+        .map(Some)
+        .map_err(|e| anyhow::anyhow!("tun.inet6-address: invalid CIDR '{cidr}': {e}"))
 }
 
 /// `auto-route` (#375): mihomo boolean, or a mode string selecting what

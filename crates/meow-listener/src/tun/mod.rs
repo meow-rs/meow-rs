@@ -36,13 +36,15 @@
 //!
 //! The trade-off: IP-literal traffic (no DNS lookup) is not captured.
 //!
-//! ## Global route scope (#375, experimental, Linux-only)
+//! ## Global route scope (#375, experimental)
 //!
 //! [`TunRouteScope::Global`] opts into capturing everything: `auto-route`
-//! installs split default routes (`0.0.0.0/1` + `128.0.0.0/1`), and loop
+//! installs split default routes (`0.0.0.0/1` + `128.0.0.0/1`, plus
+//! `::/1` + `8000::/1` when the device has an `inet6-address`), and loop
 //! freedom moves from route scoping to the outbound path — every socket
 //! meow creates is bound to the physical interface
-//! (`meow_common::install_outbound_interface`, `SO_BINDTODEVICE`) before
+//! (`meow_common::install_outbound_interface`: `SO_BINDTODEVICE` on Linux,
+//! `IP_BOUND_IF` on macOS, `IP_UNICAST_IF` on Windows) before
 //! connect/bind, and hostname dials resolve through meow's own resolver
 //! hook. Startup fails closed if the binding cannot be installed.
 //!
@@ -71,7 +73,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
-use ipnet::Ipv4Net;
+use ipnet::{Ipv4Net, Ipv6Net};
 use meow_common::{ConnType, Metadata, Network, ProxyConn};
 use meow_tunnel::Tunnel;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
@@ -192,6 +194,9 @@ pub struct TunListenerConfig {
     pub mtu: u16,
     /// Address + prefix assigned to the device.
     pub inet4_address: Ipv4Net,
+    /// IPv6 address + prefix assigned to the device; `None` = IPv4-only.
+    /// In global scope it also adds the IPv6 split default routes (#375).
+    pub inet6_address: Option<Ipv6Net>,
     /// Install routes on startup (removed on shutdown). What gets routed is
     /// selected by `route_scope`.
     pub auto_route: bool,
@@ -215,9 +220,10 @@ pub enum TunRouteScope {
     /// v1: route only the fake-IP range — loop-free by construction.
     #[default]
     FakeIp,
-    /// Route all IPv4 (split defaults `0.0.0.0/1` + `128.0.0.0/1`) into the
-    /// device; outbound sockets bind to the physical interface for loop
-    /// avoidance. Experimental, Linux-only.
+    /// Route all IPv4 (split defaults `0.0.0.0/1` + `128.0.0.0/1`) — and
+    /// all IPv6 (`::/1` + `8000::/1`) when the device has an IPv6 address —
+    /// into the device; outbound sockets bind to the physical interface
+    /// for loop avoidance. Experimental.
     Global,
 }
 
@@ -434,6 +440,7 @@ impl TunListener {
             // Copy the values we need inside `spawn_blocking` so we don't
             // borrow `cfg` across the closure boundary.
             let mtu = cfg.mtu;
+            let inet6 = cfg.inet6_address;
             let name_for_closure = name.clone();
             #[cfg(target_os = "windows")]
             let wintun_file = wintun_file.clone();
@@ -451,6 +458,9 @@ impl TunListener {
                 let mut builder = tun_rs::DeviceBuilder::new()
                     .mtu(mtu)
                     .ipv4(addr, prefix, None);
+                if let Some(v6) = inet6 {
+                    builder = builder.ipv6(v6.addr(), v6.prefix_len());
+                }
                 if let Some(n) = &name_for_closure {
                     builder = builder.name(n);
                 }
@@ -538,10 +548,7 @@ impl TunListener {
                 // route survives untouched and restore-on-drop is trivial.
                 // The device's own /30 and the fake-IP range (if any) are
                 // inside the /1s already.
-                TunRouteScope::Global => Some(vec![
-                    "0.0.0.0/1".parse().expect("static CIDR parses"),
-                    "128.0.0.0/1".parse().expect("static CIDR parses"),
-                ]),
+                TunRouteScope::Global => Some(global_route_nets(cfg.inet6_address.is_some())),
                 TunRouteScope::FakeIp => self.tunnel.resolver().fake_ip_v4_net().map(|n| vec![n]),
             }
         } else {
@@ -712,6 +719,10 @@ impl TunListener {
             });
         }
 
+        let tun_net = udp::TunNets {
+            v4: cfg.inet4_address,
+            v6: cfg.inet6_address,
+        };
         let (mut pump_in, mut pump_out) = device::spawn_pumps(device, stack);
         tasks.push(&pump_in);
         tasks.push(&pump_out);
@@ -724,18 +735,21 @@ impl TunListener {
             cfg.dns_hijack,
             cfg.udp_timeout,
             self.name.clone(),
-            cfg.inet4_address,
+            tun_net,
             std::sync::Arc::clone(&udp_flows),
         ));
 
         let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let max_conn = cfg.max_connections;
         info!(
-            "TUN listener '{}' started on device '{dev_name}' ({}/{}, mtu {}, auto-route: {}, \
+            "TUN listener '{}' started on device '{dev_name}' ({}/{}{}, mtu {}, auto-route: {}, \
              dns-hijack: {}, max-connections: {}, stack: lwip, total startup {total_ms:.0}ms)",
             self.name,
             used_addr,
             prefix,
+            cfg.inet6_address
+                .map(|v6| format!(" + {v6}"))
+                .unwrap_or_default(),
             cfg.mtu,
             cfg.auto_route,
             cfg.dns_hijack,
@@ -756,7 +770,6 @@ impl TunListener {
             debug!("TUN listener '{}' readiness signalled", self.name);
         }
 
-        let tun_net = cfg.inet4_address;
         let conn_limit: Option<Arc<Semaphore>> = if max_conn > 0 {
             Some(Arc::new(Semaphore::new(max_conn)))
         } else {
@@ -872,6 +885,19 @@ impl TunListener {
         drop(tcp_listener);
         result
     }
+}
+
+/// The split default routes of global route scope (#375): two `/1`s per
+/// family, more specific than the physical default so it is never touched.
+/// IPv6 is included only when the device carries an IPv6 address — routes
+/// into a device that cannot source IPv6 would blackhole that traffic.
+fn global_route_nets(ipv6: bool) -> Vec<ipnet::IpNet> {
+    let v4 = ["0.0.0.0/1", "128.0.0.0/1"];
+    let v6 = ["::/1", "8000::/1"];
+    v4.iter()
+        .chain(v6.iter().filter(|_| ipv6))
+        .map(|net| net.parse().expect("static CIDR parses"))
+        .collect()
 }
 
 /// Device name to try on creation `attempt` (0-based).
@@ -1051,8 +1077,8 @@ impl<S: AsyncRead + AsyncWrite + Send + Sync + Unpin> ProxyConn for TunTcpConn<S
 #[cfg(test)]
 mod tests {
     use super::{
-        device_name_for_attempt, sniff_first_payload, sniff_first_payload_within, TunTcpConn,
-        TUN_SNIFF_WINDOW,
+        device_name_for_attempt, global_route_nets, sniff_first_payload,
+        sniff_first_payload_within, TunTcpConn, TUN_SNIFF_WINDOW,
     };
     use std::io;
     use std::pin::Pin;
@@ -1091,6 +1117,24 @@ mod tests {
             device_name_for_attempt(Some("mytun"), 1),
             Some("mytun-1".to_string())
         );
+    }
+
+    #[test]
+    fn global_routes_cover_ipv6_only_for_a_dual_stack_device() {
+        let nets = |ipv6| -> Vec<String> {
+            global_route_nets(ipv6)
+                .iter()
+                .map(ToString::to_string)
+                .collect()
+        };
+        assert_eq!(nets(false), ["0.0.0.0/1", "128.0.0.0/1"]);
+        assert_eq!(nets(true), ["0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1"]);
+        // Each family's pair covers the whole space without being a default.
+        for family in [&nets(true)[..2], &nets(true)[2..]] {
+            let pair: Vec<ipnet::IpNet> = family.iter().map(|n| n.parse().unwrap()).collect();
+            assert!(pair.iter().all(|n| n.prefix_len() == 1));
+            assert_ne!(pair[0].network(), pair[1].network());
+        }
     }
 
     #[test]

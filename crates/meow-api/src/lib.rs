@@ -52,6 +52,7 @@ pub fn tun_config_to_listener_config(
         device: tun.device.clone(),
         mtu: tun.mtu,
         inet4_address: tun.inet4_address,
+        inet6_address: tun.inet6_address,
         auto_route: tun.auto_route,
         route_scope: match tun.route_mode {
             meow_config::TunRouteMode::FakeIp => meow_listener::TunRouteScope::FakeIp,

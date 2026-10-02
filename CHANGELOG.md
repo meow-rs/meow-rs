@@ -19,6 +19,39 @@ the canonical, in-repo source a release is cut from.
   (`X.Y.Z-r1`). Packages are unsigned: `apk add --allow-untrusted
   ./meow_<ver>-r1_<arch>.apk`. A new `openwrt-apk` CI job builds the apks and
   installs them into an OpenWrt 25.12 rootfs container.
+
+- **`tun.auto-route: global` on macOS and Windows, and opt-in IPv6
+  capture** (issue #375) — experimental, **not yet verified on a real
+  macOS or Windows host**. Global route mode was Linux-only because the
+  outbound-socket interface binding that keeps meow's own dials out of the
+  TUN only existed as `SO_BINDTODEVICE`. The binding now also uses
+  `IP_BOUND_IF` / `IPV6_BOUND_IF` on macOS and `IP_UNICAST_IF` /
+  `IPV6_UNICAST_IF` on Windows (the IPv4 option takes the interface index
+  in network byte order, the IPv6 one in host order), both keyed by an
+  interface index resolved when the binding is installed. The physical
+  interface is auto-detected from the routing table on both — the
+  unscoped `0.0.0.0/0` route on macOS, the lowest route + interface
+  metric on Windows — skipping the TUN's own `/1` split routes exactly as
+  the Linux detection does; on Windows `tun.outbound-interface` is the
+  interface alias. Startup still fails closed when the binding cannot be
+  installed, and any other platform is still rejected. On macOS and
+  Windows, TCP dials to a loopback address skip the binding (an
+  interface-scoped socket cannot reach `127.0.0.1` on macOS).
+  New `tun.inet6-address` (mihomo's key; a CIDR string or a list whose
+  first entry is used): under `auto-route: global` it gives the device an
+  IPv6 address and adds `::/1` + `8000::/1`, so IPv6 traffic is captured
+  too. Without it nothing changes — the device stays IPv4-only and no
+  IPv6 route is installed — and outside global mode it is ignored with a
+  warning, as before. What was tested: the macOS binding against real
+  sockets without root (bound sockets report the interface, and a
+  loopback-scoped socket gets `ENETUNREACH` for a non-loopback
+  destination), macOS interface detection against the live routing table,
+  the userspace stack carrying IPv6 TCP and UDP flows with addresses
+  intact, and a Windows cross-compile. What was not: global routes on a
+  real `utun` or Wintun adapter, the Windows binding at runtime, and the
+  IPv6 device address / routes on any platform. See `docs/tun.md` →
+  "Global route mode".
+
 - **`RLIMIT_NOFILE` raise at startup** — on Unix, `meow` now raises its
   file-descriptor soft limit toward the hard limit (≤ 65536) before any
   listener or outbound socket is created, matching the precedent the

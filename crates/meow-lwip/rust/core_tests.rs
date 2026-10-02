@@ -10,10 +10,10 @@
 //! lwIP state is process-global and only one stack generation may be live
 //! at a time (see the `core` module docs), while `cargo test` runs tests on
 //! parallel threads. The test therefore tears its stack down and awaits
-//! `core_done` before returning; a second stack-building test must also
-//! serialize with this one.
+//! `core_done` before returning, and every stack-building test holds
+//! [`STACK_LOCK`] for its whole body.
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use futures::stream::{SplitSink, SplitStream};
@@ -39,6 +39,9 @@ const CLIENT_ISN: u32 = 1000;
 /// synchronously from `tcp_input` or a core command, never from an lwIP
 /// timer, so this only trips when the expected segment never comes.
 const STEP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Serializes the stack-building tests (one live generation per process).
+static STACK_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// A segment the stack emitted, reduced to the fields the test checks.
 #[derive(Debug, Clone, Copy)]
@@ -159,6 +162,7 @@ async fn timewait_pcb_recycled_by_lwip_is_not_closed_on_drop() {
     const A_PORT: u16 = 40000;
     const FILLER_BASE: u16 = 20000;
 
+    let _serial = STACK_LOCK.lock().await;
     let (stack, mut listener, _udp) = NetStack::new().unwrap();
     let mut core_done = stack.core_done();
     let (sink, egress) = stack.split();
@@ -238,6 +242,137 @@ async fn timewait_pcb_recycled_by_lwip_is_not_closed_on_drop() {
     // Orderly teardown, so no later stack in this process inherits a
     // half-live generation: closing ingress stops the core.
     peer.sink.close().await.unwrap();
+    timeout(STEP_TIMEOUT, core_done.wait_for(|done| *done))
+        .await
+        .expect("core teardown timed out")
+        .expect("core dropped its done signal");
+}
+
+const CLIENT6: Ipv6Addr = Ipv6Addr::new(0xfdfe, 0xdcba, 0x9876, 0, 0, 0, 0, 2);
+const SERVER6: Ipv6Addr = Ipv6Addr::new(
+    0x2001, 0xdb8, 0x1234, 0x5678, 0x9abc, 0xdef0, 0x1122, 0x3344,
+);
+
+/// IPv6 header + `l4` from `CLIENT6` to `SERVER6`.
+fn v6_frame(next_header: u8, l4: &[u8]) -> Vec<u8> {
+    let len = u16::try_from(l4.len()).expect("test payload fits one frame");
+    let mut f = Vec::with_capacity(40 + l4.len());
+    f.extend_from_slice(&[0x60, 0, 0, 0]); // version 6; traffic class; flow label
+    f.extend_from_slice(&len.to_be_bytes());
+    f.extend_from_slice(&[next_header, 64]); // next header; hop limit
+    f.extend_from_slice(&CLIENT6.octets());
+    f.extend_from_slice(&SERVER6.octets());
+    f.extend_from_slice(l4);
+    f
+}
+
+/// The stack's next IPv6 frame carrying `next_header`, as (src, dst, l4).
+async fn next_v6(
+    egress: &mut SplitStream<NetStack>,
+    next_header: u8,
+    what: &str,
+) -> (Ipv6Addr, Ipv6Addr, Vec<u8>) {
+    let deadline = Instant::now() + STEP_TIMEOUT;
+    loop {
+        let frame = timeout_at(deadline, egress.next())
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
+            .unwrap_or_else(|| panic!("egress closed while waiting for {what}"))
+            .expect("egress error");
+        if frame.len() < 40 || frame[0] >> 4 != 6 || frame[6] != next_header {
+            continue;
+        }
+        let src: [u8; 16] = frame[8..24].try_into().unwrap();
+        let dst: [u8; 16] = frame[24..40].try_into().unwrap();
+        return (src.into(), dst.into(), frame[40..].to_vec());
+    }
+}
+
+/// IPv6 flows are carried end to end (#375): a TCP connection and a UDP
+/// datagram addressed to an arbitrary global IPv6 destination are
+/// terminated by the stack with the original addresses intact — in the
+/// byte order `util::to_socket_addr` assumes — and replies leave as IPv6
+/// frames from that destination back to the client.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ipv6_tcp_and_udp_flows_keep_their_addresses() {
+    const SPORT: u16 = 41000;
+    const TCP_PROTO: u8 = 6;
+    const UDP_PROTO: u8 = 17;
+    let client = SocketAddr::new(CLIENT6.into(), SPORT);
+    let server = SocketAddr::new(SERVER6.into(), SERVER_PORT);
+
+    let tcp = |seq: u32, ack: u32, flags: u8, payload: &[u8]| {
+        // Reuse the IPv4 builder for the TCP header (bytes 20..).
+        v6_frame(TCP_PROTO, &tcp_frame(SPORT, seq, ack, flags, payload)[20..])
+    };
+
+    let _serial = STACK_LOCK.lock().await;
+    let (stack, mut listener, udp) = NetStack::new().unwrap();
+    let mut core_done = stack.core_done();
+    let (mut sink, mut egress) = stack.split();
+
+    // TCP: handshake, then one payload in each direction.
+    sink.send(tcp(CLIENT_ISN, 0, SYN, &[])).await.unwrap();
+    let (src, dst, syn_ack) = next_v6(&mut egress, TCP_PROTO, "SYN-ACK").await;
+    assert_eq!((src, dst), (SERVER6, CLIENT6), "SYN-ACK addresses");
+    assert_eq!(syn_ack[13] & (SYN | ACK), SYN | ACK);
+    let server_isn = u32::from_be_bytes(syn_ack[4..8].try_into().unwrap());
+    let acked = server_isn.wrapping_add(1);
+    sink.send(tcp(CLIENT_ISN + 1, acked, ACK, &[]))
+        .await
+        .unwrap();
+    let (mut stream, accepted_src, accepted_dst) = timeout(STEP_TIMEOUT, listener.next())
+        .await
+        .expect("accept timed out")
+        .expect("listener closed");
+    assert_eq!((accepted_src, accepted_dst), (client, server));
+
+    sink.send(tcp(CLIENT_ISN + 1, acked, PSH | ACK, b"ping6"))
+        .await
+        .unwrap();
+    let mut buf = [0u8; 16];
+    let n = timeout(STEP_TIMEOUT, stream.read(&mut buf))
+        .await
+        .expect("read timed out")
+        .unwrap();
+    assert_eq!(&buf[..n], b"ping6");
+
+    stream.write_all(b"pong6").await.unwrap();
+    loop {
+        let (src, dst, seg) = next_v6(&mut egress, TCP_PROTO, "the reply segment").await;
+        let doff = usize::from(seg[12] >> 4) * 4;
+        if seg.len() > doff {
+            assert_eq!((src, dst), (SERVER6, CLIENT6), "data segment addresses");
+            assert_eq!(&seg[doff..], b"pong6");
+            break;
+        }
+    }
+
+    // UDP: a datagram in, and the reply out from the original destination.
+    let (udp_tx, mut udp_rx) = udp.split();
+    let mut datagram = Vec::new();
+    datagram.extend_from_slice(&SPORT.to_be_bytes());
+    datagram.extend_from_slice(&SERVER_PORT.to_be_bytes());
+    datagram.extend_from_slice(&(8u16 + 5).to_be_bytes()); // length
+    datagram.extend_from_slice(&[0, 0]); // checksum (not checked inbound)
+    datagram.extend_from_slice(b"query");
+    sink.send(v6_frame(UDP_PROTO, &datagram)).await.unwrap();
+    let (payload, from, to) = timeout(STEP_TIMEOUT, udp_rx.recv_from())
+        .await
+        .expect("udp recv timed out")
+        .unwrap();
+    assert_eq!(payload, b"query");
+    assert_eq!((from, to), (client, server));
+
+    udp_tx.send_to(b"answer", &server, &client).unwrap();
+    let (src, dst, reply) = next_v6(&mut egress, UDP_PROTO, "the UDP reply").await;
+    assert_eq!((src, dst), (SERVER6, CLIENT6), "UDP reply addresses");
+    assert_eq!(reply[..2], SERVER_PORT.to_be_bytes());
+    assert_eq!(reply[2..4], SPORT.to_be_bytes());
+    assert_eq!(&reply[8..], b"answer");
+
+    drop((stream, listener, udp_tx, udp_rx));
+    sink.close().await.unwrap();
     timeout(STEP_TIMEOUT, core_done.wait_for(|done| *done))
         .await
         .expect("core teardown timed out")

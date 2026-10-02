@@ -16,6 +16,8 @@
 //! | T6  | `dns-hijack: [any:53]` → hijack on                                 |
 //! | T7  | `dns-hijack` with only non-53 entries → hijack off (warn-only)     |
 //! | T8  | upstream-only fields (`stack`, `strict-route`, …) → warn, not err  |
+//! | T8b | `inet6-address` (#375): honoured only under `auto-route: global`,  |
+//! |     | string or list form, invalid CIDR → hard error                     |
 //! | T9  | `udp-timeout: 0` → hard error                                      |
 //! | T10 | `enable: false` with other fields set → parsed but disabled        |
 //! | T16 | `TunConfig` semantic equality — the PUT reconcile diff boundary    |
@@ -168,6 +170,77 @@ tun:
 "#;
     let cfg = load_config_from_str(yaml).await.expect("config must load");
     assert!(cfg.tun.enable, "unsupported fields are warn-only");
+}
+
+// ─── T8b: inet6-address (#375) ────────────────────────────────────────────
+// Opt-in IPv6 capture for global route mode: string or mihomo list form,
+// honoured only under `auto-route: global`, validated everywhere.
+
+#[tokio::test]
+async fn t8b_inet6_address_is_honoured_only_in_global_mode() {
+    let v6 = |yaml: &str| {
+        let yaml = yaml.to_string();
+        async move { load_config_from_str(&yaml).await.unwrap().tun.inet6_address }
+    };
+    let want: ipnet::Ipv6Net = "fdfe:dcba:9876::1/126".parse().unwrap();
+
+    // Unset by default — the device stays IPv4-only, in every mode.
+    assert_eq!(v6("tun:\n  enable: true\n").await, None);
+    assert_eq!(
+        v6("tun:\n  enable: true\n  auto-route: global\n").await,
+        None
+    );
+
+    // Global mode: scalar and mihomo's list form (first entry wins).
+    let global = "tun:\n  enable: true\n  auto-route: global\n";
+    assert_eq!(
+        v6(&format!("{global}  inet6-address: fdfe:dcba:9876::1/126\n")).await,
+        Some(want)
+    );
+    assert_eq!(
+        v6(&format!(
+            "{global}  inet6-address: [fdfe:dcba:9876::1/126]\n"
+        ))
+        .await,
+        Some(want)
+    );
+    assert_eq!(
+        v6(&format!(
+            "{global}  inet6-address:\n    - fdfe:dcba:9876::1/126\n    - fd00::1/64\n"
+        ))
+        .await,
+        Some(want)
+    );
+    // Empty forms are "unset".
+    assert_eq!(v6(&format!("{global}  inet6-address: ''\n")).await, None);
+    assert_eq!(v6(&format!("{global}  inet6-address: []\n")).await, None);
+
+    // Every other mode has no IPv6 routes to send into the device: the
+    // address is ignored (with a warning), and normalised out so it cannot
+    // trigger a listener restart on reload.
+    for mode in [
+        "",
+        "  auto-route: true\n",
+        "  auto-route: fake-ip\n",
+        "  auto-route: false\n",
+    ] {
+        let yaml = format!("tun:\n  enable: true\n{mode}  inet6-address: fdfe:dcba:9876::1/126\n");
+        assert_eq!(v6(&yaml).await, None, "{yaml}");
+    }
+}
+
+#[tokio::test]
+async fn t8b_invalid_inet6_address_errors_in_every_mode() {
+    for yaml in [
+        "tun:\n  enable: true\n  auto-route: global\n  inet6-address: not-a-cidr\n",
+        "tun:\n  enable: true\n  auto-route: global\n  inet6-address: 172.19.0.1/30\n",
+        "tun:\n  enable: true\n  auto-route: global\n  inet6-address: [fdfe::1]\n",
+        "tun:\n  enable: true\n  auto-route: global\n  inet6-address: 7\n",
+        "tun:\n  enable: true\n  inet6-address: not-a-cidr\n",
+    ] {
+        let err = expect_load_err(yaml).await;
+        assert!(err.contains("inet6-address"), "{yaml}: got {err}");
+    }
 }
 
 // ─── T9: udp-timeout: 0 ───────────────────────────────────────────────────

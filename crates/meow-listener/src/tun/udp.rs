@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::{FutureExt, StreamExt};
-use ipnet::Ipv4Net;
+use ipnet::{Ipv4Net, Ipv6Net};
 use lwip::UdpSocket;
 use meow_common::{with_dial_timeout, ConnType, Metadata, Network};
 use meow_dns::server::{hex_prefix, DnsServer, LocalAnswer};
@@ -88,7 +88,7 @@ pub(super) async fn run_udp(
     dns_hijack: bool,
     udp_timeout: Duration,
     in_name: String,
-    tun_net: Ipv4Net,
+    tun_net: TunNets,
     live_flows: Arc<AtomicUsize>,
 ) {
     let (write_half, mut read_half) = socket.split();
@@ -461,6 +461,14 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
     result
 }
 
+/// The subnets assigned to the TUN device: `inet4-address`, plus
+/// `inet6-address` when the device carries IPv6 (global route scope).
+#[derive(Debug, Clone, Copy)]
+pub(super) struct TunNets {
+    pub(super) v4: Ipv4Net,
+    pub(super) v6: Option<Ipv6Net>,
+}
+
 /// True when a dial to `dst` could only route back into the TUN device —
 /// its own subnet (on-link, including the device address and the subnet
 /// broadcast), the IPv4 limited broadcast, or multicast. Relaying such a
@@ -469,17 +477,16 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
 /// name-service broadcasts to the subnet broadcast address (e.g.
 /// `172.19.0.3:137` for the default `172.19.0.1/30`) trigger exactly this,
 /// exhausting ephemeral ports within seconds of TUN start.
-pub(super) fn is_looping_dst(dst: std::net::IpAddr, tun_net: Ipv4Net) -> bool {
+pub(super) fn is_looping_dst(dst: std::net::IpAddr, tun_net: TunNets) -> bool {
     match dst {
-        IpAddr::V4(v4) => v4.is_broadcast() || v4.is_multicast() || tun_net.contains(&v4),
-        IpAddr::V6(v6) => v6.is_multicast(),
+        IpAddr::V4(v4) => v4.is_broadcast() || v4.is_multicast() || tun_net.v4.contains(&v4),
+        IpAddr::V6(v6) => v6.is_multicast() || tun_net.v6.is_some_and(|n| n.contains(&v6)),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{evict_for_admission, is_looping_dst, FlowEntry, MAX_FLOWS};
-    use ipnet::Ipv4Net;
+    use super::{evict_for_admission, is_looping_dst, FlowEntry, TunNets, MAX_FLOWS};
     use std::collections::HashMap;
     use std::net::{IpAddr, SocketAddr};
 
@@ -596,8 +603,18 @@ mod tests {
         }
     }
 
-    fn net() -> Ipv4Net {
-        "172.19.0.1/30".parse().unwrap()
+    fn net() -> TunNets {
+        TunNets {
+            v4: "172.19.0.1/30".parse().unwrap(),
+            v6: None,
+        }
+    }
+
+    fn dual_net() -> TunNets {
+        TunNets {
+            v6: Some("fdfe:dcba:9876::1/126".parse().unwrap()),
+            ..net()
+        }
     }
 
     fn ip(s: &str) -> IpAddr {
@@ -615,6 +632,10 @@ mod tests {
         assert!(is_looping_dst(ip("255.255.255.255"), net()));
         assert!(is_looping_dst(ip("224.0.0.251"), net()));
         assert!(is_looping_dst(ip("ff02::fb"), net()));
+        // The IPv6 device subnet, when the device carries one (#375).
+        assert!(is_looping_dst(ip("fdfe:dcba:9876::1"), dual_net()));
+        assert!(is_looping_dst(ip("fdfe:dcba:9876::3"), dual_net()));
+        assert!(is_looping_dst(ip("172.19.0.3"), dual_net()));
     }
 
     #[test]
@@ -626,5 +647,10 @@ mod tests {
         assert!(!is_looping_dst(ip("2001:db8::1"), net()));
         // Just outside the /30.
         assert!(!is_looping_dst(ip("172.19.0.4"), net()));
+        // An IPv4-only device has no IPv6 subnet to guard; a dual-stack one
+        // guards exactly its /126.
+        assert!(!is_looping_dst(ip("fdfe:dcba:9876::1"), net()));
+        assert!(!is_looping_dst(ip("fdfe:dcba:9876::4"), dual_net()));
+        assert!(!is_looping_dst(ip("2001:db8::1"), dual_net()));
     }
 }

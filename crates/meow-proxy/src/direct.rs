@@ -292,7 +292,7 @@ async fn connect_with_mark(
         // TUN global-route loop avoidance (#375): this branch bypasses
         // `meow_common::connect_tcp`, so apply the outbound-interface
         // binding here too (no-op when none is installed).
-        meow_common::apply_outbound_interface(&socket)?;
+        meow_common::apply_outbound_interface(&socket, domain)?;
         socket.set_nonblocking(true)?;
 
         match socket.connect(&dest.into()) {

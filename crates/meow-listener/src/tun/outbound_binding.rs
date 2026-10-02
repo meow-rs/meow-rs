@@ -1,8 +1,10 @@
 //! Outbound-interface binding for global route scope (#375, issue #695).
 //!
-//! `auto-route: global` steers all IPv4 into the TUN, so every socket meow
-//! opens must be bound to the physical interface (`SO_BINDTODEVICE`, via
-//! `meow_common::install_outbound_interface`) or it loops back into the device.
+//! `auto-route: global` steers all traffic into the TUN, so every socket
+//! meow opens must be bound to the physical interface (via
+//! `meow_common::install_outbound_interface`: `SO_BINDTODEVICE` on Linux,
+//! `IP_BOUND_IF` on macOS, `IP_UNICAST_IF` on Windows) or it loops back
+//! into the device.
 //! The binding is per-socket and applied at creation: a socket created
 //! before it is installed stays unbound for its whole life, and once the
 //! split default routes go in its traffic re-enters the TUN — a QUIC or mux
@@ -49,14 +51,18 @@ impl OutboundBinding {
     /// listener is still running).
     ///
     /// Fails closed: an error means nothing is installed, and callers must
-    /// not install global routes. Non-Linux targets always fail — the
-    /// per-socket binding syscall is Linux-only for now (#375).
+    /// not install global routes. Targets other than Linux, macOS and
+    /// Windows always fail — they have no per-socket binding (#375).
     pub fn install(outbound_interface: Option<&str>) -> io::Result<Self> {
-        if !cfg!(target_os = "linux") {
+        if !cfg!(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "windows"
+        )) {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "tun auto-route: global is currently Linux-only (tracked on #375); \
-                 use auto-route: fake-ip on this platform",
+                "tun auto-route: global is only implemented on Linux, macOS and \
+                 Windows (#375); use auto-route: fake-ip on this platform",
             ));
         }
         let iface = match outbound_interface {
@@ -87,9 +93,16 @@ impl OutboundBinding {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::OutboundBinding;
+
+    /// Loopback exists on every host.
+    const LO: &str = if cfg!(target_os = "macos") {
+        "lo0"
+    } else {
+        "lo"
+    };
 
     /// One test drives every case because the registry is process-global;
     /// separate `#[test]` fns would race each other.
@@ -101,17 +114,17 @@ mod tests {
         assert!(OutboundBinding::install(Some("no-such-iface-zz9")).is_err());
         assert!(meow_common::outbound_interface().is_none());
 
-        // Loopback exists on every Linux host.
-        let binding = OutboundBinding::install(Some("lo")).expect("lo must exist");
-        assert_eq!(meow_common::outbound_interface().as_deref(), Some("lo"));
+        let binding = OutboundBinding::install(Some(LO)).expect("loopback must exist");
+        assert_eq!(binding.interface(), LO);
+        assert_eq!(meow_common::outbound_interface().as_deref(), Some(LO));
         drop(binding);
         assert!(meow_common::outbound_interface().is_none());
 
         // A binding handed to a listener is owned by it: dropping a
         // listener that never ran (startup aborted before the TUN came up)
         // clears the binding instead of leaking it into a TUN-less process.
-        let listener = global_listener(OutboundBinding::install(Some("lo")).unwrap());
-        assert_eq!(meow_common::outbound_interface().as_deref(), Some("lo"));
+        let listener = global_listener(OutboundBinding::install(Some(LO)).unwrap());
+        assert_eq!(meow_common::outbound_interface().as_deref(), Some(LO));
         drop(listener);
         assert!(meow_common::outbound_interface().is_none());
 
@@ -119,21 +132,21 @@ mod tests {
         // installed while the old listener still owns its own; tearing the
         // old listener down afterwards must leave the new binding in
         // place (a single-slot registry cleared it here).
-        let old = global_listener(OutboundBinding::install(Some("lo")).unwrap());
-        let reload = OutboundBinding::install(Some("lo")).expect("lo must exist");
+        let old = global_listener(OutboundBinding::install(Some(LO)).unwrap());
+        let reload = OutboundBinding::install(Some(LO)).expect("loopback must exist");
         drop(old);
-        assert_eq!(meow_common::outbound_interface().as_deref(), Some("lo"));
+        assert_eq!(meow_common::outbound_interface().as_deref(), Some(LO));
         let new = global_listener(reload);
-        assert_eq!(meow_common::outbound_interface().as_deref(), Some("lo"));
+        assert_eq!(meow_common::outbound_interface().as_deref(), Some(LO));
         drop(new);
         assert!(meow_common::outbound_interface().is_none());
 
         // Rejected reload: its binding goes away first, and the running
         // listener's binding is back in effect rather than cleared.
-        let running = global_listener(OutboundBinding::install(Some("lo")).unwrap());
-        let rejected = OutboundBinding::install(Some("lo")).expect("lo must exist");
+        let running = global_listener(OutboundBinding::install(Some(LO)).unwrap());
+        let rejected = OutboundBinding::install(Some(LO)).expect("loopback must exist");
         drop(rejected);
-        assert_eq!(meow_common::outbound_interface().as_deref(), Some("lo"));
+        assert_eq!(meow_common::outbound_interface().as_deref(), Some(LO));
         drop(running);
         assert!(meow_common::outbound_interface().is_none());
     }
@@ -145,9 +158,10 @@ mod tests {
                 device: None,
                 mtu: 1500,
                 inet4_address: "172.19.0.1/30".parse().unwrap(),
+                inet6_address: None,
                 auto_route: true,
                 route_scope: super::super::TunRouteScope::Global,
-                outbound_interface: Some("lo".into()),
+                outbound_interface: Some(LO.into()),
                 dns_hijack: false,
                 udp_timeout: std::time::Duration::from_secs(60),
                 max_connections: 0,

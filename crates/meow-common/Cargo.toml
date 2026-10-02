@@ -39,10 +39,17 @@ socket2 = { workspace = true }
 [target.'cfg(target_os = "macos")'.dependencies]
 libproc = "0.14"
 libc = "0.2"
+# outbound_iface: `IP_BOUND_IF` / `IPV6_BOUND_IF` (#375).
+socket2 = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
+# outbound_iface: `IP_UNICAST_IF` / `IPV6_UNICAST_IF` need raw `setsockopt`
+# (WinSock) and the alias → LUID → index conversion (Ndis) (#375).
+socket2 = { workspace = true }
 windows-sys = { version = "0.60", features = [
     "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
     "Win32_System_Threading",
     "Win32_Foundation",
 ] }
