@@ -71,6 +71,32 @@ meow-app                                     (→ everything)
    - Verify: `cargo install meow-app` (or `cargo info meow-app`).
    - Cut a GitHub Release for the tag with notes / prebuilt binaries.
 
+## Alpha prereleases
+
+[`alpha.yml`](../.github/workflows/alpha.yml) publishes a rolling GitHub
+prerelease (tag `Prerelease-Alpha`, issue #565) on every push to `main` and on
+manual dispatch. Docs/website/markdown-only pushes are skipped. Nothing here is
+part of cutting a stable release; it needs no manual steps.
+
+- **Shared build.** Both `release.yml` and `alpha.yml` call the reusable
+  [`build.yml`](../.github/workflows/build.yml) (target matrix, packaging, OpenWrt
+  ipks). Change targets/packaging there, once.
+- **Assets.** `meow-alpha-<sha7>-<target>.{tar.gz,zip}` plus `.sha256`, and the
+  OpenWrt `.ipk`s. Each run moves the tag to the built commit, uploads the new
+  assets, then deletes stale ones. The release is `prerelease` and never
+  `latest`; notes list the commit, build time and commits since the last `v*` tag.
+- **Version.** `meow -v` prints `<version>-alpha+<sha7>`
+  (`MEOW_VERSION_SUFFIX`, read by `crates/meow-app/build.rs`). `.ipk` versions are
+  `<workspace version>-alpha.<YYYYMMDDHHMM>.<sha7>-1`: because `main` stays at the last
+  released version between releases, this sorts above `<ver>-1` and below the next
+  release under opkg's Debian-style ordering.
+- **No cross-triggering.** `release.yml` and `publish.yml` fire only on `v*` tags;
+  `Prerelease-Alpha` does not match, and tags pushed by `GITHUB_TOKEN` do not
+  trigger workflows anyway. Never create a `v*` tag by hand for alphas.
+- **Upstream only.** Jobs are gated on `github.repository == 'madeye/meow-rs'`.
+- **Concurrency.** A newer push cancels an in-flight alpha run; the publish job also
+  skips itself if `main` has already moved on.
+
 ## Rate limits
 
 - **New crate names:** burst of ~5, then ~1 per 10 minutes. This only bit the

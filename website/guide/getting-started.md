@@ -28,6 +28,14 @@ for Linux (x86_64/aarch64 gnu+musl, armv7 gnu, riscv64 musl), macOS
 ships with the default feature set (`full` + `boring-tls`).
 :::
 
+::: warning Alpha builds (unstable)
+Every push to `main` also refreshes a rolling
+[`Prerelease-Alpha`](https://github.com/madeye/meow-rs/releases/tag/Prerelease-Alpha)
+prerelease with the same targets (and OpenWrt `.ipk`s). It is untested,
+may be broken, and is replaced on each push, so don't rely on it for anything
+important. `meow -v` shows `<version>-alpha+<sha>` for these builds.
+:::
+
 ## Configure
 
 Copy the sample config and edit in your servers:

@@ -37,7 +37,7 @@ mod windows_service;
 const SERVICE_NAME: &str = "meow";
 
 #[derive(Parser)]
-#[command(name = "meow", version, about = "A rule-based tunnel in Rust")]
+#[command(name = "meow", version = env!("MEOW_VERSION"), about = "A rule-based tunnel in Rust")]
 struct Args {
     /// Path to configuration file
     #[arg(short = 'f', long = "config", default_value = "config.yaml")]
@@ -188,7 +188,7 @@ fn main() -> Result<()> {
 
     // nyanpasu uses -v to query version (mihomo format)
     if std::env::args().any(|a| a == "-v") {
-        println!("Meow Meta {}", env!("CARGO_PKG_VERSION"));
+        println!("Meow Meta {}", env!("MEOW_VERSION"));
         return Ok(());
     }
 

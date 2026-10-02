@@ -52,6 +52,14 @@ the canonical, in-repo source a release is cut from.
   IPv6 device address / routes on any platform. See `docs/tun.md` →
   "Global route mode".
 
+- **Rolling alpha prereleases** — every push to `main` now refreshes the
+  `Prerelease-Alpha` GitHub prerelease (all release targets, sha256 files and
+  OpenWrt `.ipk`s, named `meow-alpha-<sha7>-<target>.*`), like mihomo's
+  `Prerelease-Alpha`. Alpha binaries report `<version>-alpha+<sha7>` from
+  `meow -v`. The build/package matrix moved from `release.yml` into a reusable
+  `build.yml` shared by both workflows; tagged-release output is unchanged
+  (issue #565).
+
 - **`RLIMIT_NOFILE` raise at startup** — on Unix, `meow` now raises its
   file-descriptor soft limit toward the hard limit (≤ 65536) before any
   listener or outbound socket is created, matching the precedent the

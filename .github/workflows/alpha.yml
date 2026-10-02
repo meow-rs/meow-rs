@@ -1,0 +1,197 @@
+name: Alpha
+
+# Rolling prerelease built from every push to `main` (issue #565), modelled on
+# mihomo's `Prerelease-Alpha`. One GitHub release, tag `Prerelease-Alpha`,
+# whose tag and assets are replaced on every run. It is marked prerelease and
+# is never "latest". The tag does not match the `v*` filters of release.yml /
+# publish.yml, and tags pushed with GITHUB_TOKEN never trigger workflows
+# anyway, so no stable-release or crates.io job can fire from it.
+#
+# Builds come from build.yml — the same matrix and packaging as a tagged
+# release. See docs/RELEASING.md ("Alpha prereleases").
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "website/**"
+      - "LICENSE"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: alpha-prerelease
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    name: Compute alpha identifiers
+    # Forks must never publish (or even burn minutes on) a Prerelease-Alpha.
+    if: github.repository == 'madeye/meow-rs'
+    runs-on: ubuntu-latest
+    outputs:
+      short_sha: ${{ steps.id.outputs.short_sha }}
+      ipk_version: ${{ steps.id.outputs.ipk_version }}
+      apk_version: ${{ steps.id.outputs.apk_version }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Compute ids
+        id: id
+        run: |
+          set -euo pipefail
+          short_sha="${GITHUB_SHA::7}"
+          # Commit time (not wall clock) so re-runs of one commit agree.
+          stamp=$(TZ=UTC git show -s --format=%cd --date=format:%Y%m%d%H%M "$GITHUB_SHA")
+          base=$(sed -nE '/^\[workspace\.package\]/,/^\[/ s/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' Cargo.toml | head -n1)
+          if [ -z "$base" ]; then
+            echo "::error::could not parse workspace version from Cargo.toml"
+            exit 1
+          fi
+          # opkg ordering (Debian rules): base-alpha.* sorts above the stable
+          # base-1 of the same version and below the next release (main sits
+          # at the last released version between releases, see RELEASING.md).
+          # apk versions allow neither "-" nor a hex sha; "_git<stamp>" is a
+          # post-release suffix, so it likewise sorts above base-r1 and below
+          # the next release.
+          {
+            echo "short_sha=${short_sha}"
+            echo "ipk_version=${base}-alpha.${stamp}.${short_sha}"
+            echo "apk_version=${base}_git${stamp}"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    uses: ./.github/workflows/build.yml
+    with:
+      ref: alpha-${{ needs.prepare.outputs.short_sha }}
+      ipk_version: ${{ needs.prepare.outputs.ipk_version }}
+      apk_version: ${{ needs.prepare.outputs.apk_version }}
+      version_suffix: -alpha+${{ needs.prepare.outputs.short_sha }}
+
+  publish:
+    name: Update Prerelease-Alpha
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: Prerelease-Alpha
+      SHORT_SHA: ${{ needs.prepare.outputs.short_sha }}
+      IPK_VERSION: ${{ needs.prepare.outputs.ipk_version }}
+      APK_VERSION: ${{ needs.prepare.outputs.apk_version }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # full history + tags for the changelog and tag move
+
+      - name: Skip if a newer commit has landed on main
+        id: fresh
+        run: |
+          set -euo pipefail
+          head=$(git ls-remote origin refs/heads/main | cut -f1)
+          # workflow_dispatch may run on another branch; only guard pushes.
+          if [ "$GITHUB_EVENT_NAME" = "push" ] && [ "$head" != "$GITHUB_SHA" ]; then
+            echo "main moved to ${head}; leaving the release to that run."
+            echo "stale=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "stale=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/download-artifact@v4
+        if: steps.fresh.outputs.stale != 'true'
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Package luci-app-meow ipk (arch-independent)
+        if: steps.fresh.outputs.stale != 'true'
+        run: |
+          set -euo pipefail
+          bash openwrt/build-ipk.sh luci --version "${IPK_VERSION}-1" --outdir dist
+          cd dist
+          f="luci-app-meow_${IPK_VERSION}-1_all.ipk"
+          sha256sum "$f" > "$f.sha256"
+
+      - name: Package luci-app-meow apk (arch-independent)
+        if: steps.fresh.outputs.stale != 'true'
+        run: |
+          set -euo pipefail
+          bash openwrt/install-apk-tools.sh "$HOME/.cache/apk-tools"
+          sudo APK="$HOME/.cache/apk-tools/apk" bash openwrt/build-apk.sh luci \
+            --version "${APK_VERSION}-r1" --outdir dist
+          sudo chown -R "$(id -u):$(id -g)" dist
+          cd dist
+          f="luci-app-meow_${APK_VERSION}-r1_all.apk"
+          sha256sum "$f" > "$f.sha256"
+
+      - name: Write release notes
+        if: steps.fresh.outputs.stale != 'true'
+        run: |
+          set -euo pipefail
+          built=$(date -u +'%Y-%m-%d %H:%M UTC')
+          last=$(git describe --tags --abbrev=0 --match 'v*' "$GITHUB_SHA" 2>/dev/null || true)
+          {
+            echo "> **Unstable rolling build of \`main\`** — not a release. Replaced on every"
+            echo "> push to \`main\`; use the latest stable release for anything important."
+            echo
+            echo "- Commit: [\`${SHORT_SHA}\`](https://github.com/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA})"
+            echo "- Built: ${built}"
+            echo "- \`meow -v\` reports: \`<version>-alpha+${SHORT_SHA}\`"
+            echo "- OpenWrt package version: \`${IPK_VERSION}-1\` (ipk), \`${APK_VERSION}-r1\` (apk)"
+            echo
+            if [ -n "$last" ]; then
+              echo "### Commits since ${last}"
+              echo
+              git log --no-merges --pretty='- %s (%h)' "${last}..${GITHUB_SHA}" | head -n 50
+              total=$(git rev-list --no-merges --count "${last}..${GITHUB_SHA}")
+              if [ "$total" -gt 50 ]; then
+                echo "- … and $((total - 50)) more: https://github.com/${GITHUB_REPOSITORY}/compare/${last}...${GITHUB_SHA}"
+              fi
+            else
+              echo "### Commits"
+              echo
+              git log --no-merges --pretty='- %s (%h)' -n 20 "$GITHUB_SHA"
+            fi
+          } > "$RUNNER_TEMP/notes.md"
+
+      - name: Move tag and publish release
+        if: steps.fresh.outputs.stale != 'true'
+        run: |
+          set -euo pipefail
+          title="Prerelease-Alpha (${SHORT_SHA})"
+
+          # Collect the new asset set (same globs as the stable release).
+          mapfile -t files < <(find dist -type f \( -name '*.tar.gz' -o -name '*.tar.gz.sha256' \
+            -o -name '*.zip' -o -name '*.zip.sha256' -o -name '*.ipk' -o -name '*.ipk.sha256' \
+            -o -name '*.apk' -o -name '*.apk.sha256' \))
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::no release assets found in dist/"
+            exit 1
+          fi
+
+          # Move the rolling tag to the built commit.
+          git tag -f "$TAG" "$GITHUB_SHA"
+          git push --force origin "refs/tags/${TAG}"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "$title" --notes-file "$RUNNER_TEMP/notes.md" \
+              --prerelease --latest=false
+          else
+            gh release create "$TAG" --verify-tag --title "$title" \
+              --notes-file "$RUNNER_TEMP/notes.md" --prerelease --latest=false
+          fi
+
+          # Upload first, then drop stale assets, so the release is never
+          # left empty by a failed upload.
+          gh release upload "$TAG" "${files[@]}" --clobber
+          new_names=$(for f in "${files[@]}"; do basename "$f"; done)
+          gh release view "$TAG" --json assets --jq '.assets[].name' | while read -r name; do
+            if ! grep -qxF -- "$name" <<<"$new_names"; then
+              echo "deleting stale asset: $name"
+              gh release delete-asset "$TAG" "$name" --yes
+            fi
+          done

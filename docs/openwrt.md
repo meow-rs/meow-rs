@@ -22,6 +22,13 @@ dependencies beyond OpenWrt's base system. All aarch64 packages contain
 the same `aarch64` binary — only the opkg `Architecture:` label differs so
 that `opkg` accepts the package on your device.
 
+Rolling alpha `.ipk`s and `.apk`s from `main` are published on the
+[`Prerelease-Alpha`](https://github.com/madeye/meow-rs/releases/tag/Prerelease-Alpha)
+prerelease (unstable). Their version is `<last-release>-alpha.<YYYYMMDDHHMM>.<sha7>-1`,
+which opkg orders above the last stable release and below the next one;
+the `.apk`s use `<last-release>_git<YYYYMMDDHHMM>-r1`, which apk orders the
+same way. They cover the same architectures as above.
+
 Feature note: release binaries use the default meow-app feature set
 (`full` + `boring-tls`), so ECH and uTLS fingerprinting are included.
 

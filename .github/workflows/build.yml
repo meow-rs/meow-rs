@@ -1,0 +1,287 @@
+name: Build release artifacts
+
+# Reusable build + package matrix shared by the tagged release (release.yml)
+# and the rolling alpha prerelease (alpha.yml, issue #565). Both callers get
+# byte-for-byte the same targets, packaging and artifact names from this one
+# definition; only the naming inputs below differ.
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: >-
+          Name embedded in archive names: meow-<ref>-<target>.{tar.gz,zip}
+          (a tag such as v0.3.0, or alpha-<sha7>).
+        required: true
+        type: string
+      ipk_version:
+        description: >-
+          OpenWrt package version before the "-1" revision. Empty = derive
+          from `ref` (strip a leading "v", "/" -> "-").
+        required: false
+        type: string
+        default: ""
+      apk_version:
+        description: >-
+          OpenWrt apk package version before the "-r1" revision (apk syntax:
+          no "-", suffixes like "_git<digits>"). Empty = derive from `ref`.
+        required: false
+        type: string
+        default: ""
+      version_suffix:
+        description: >-
+          Appended to the version the binary reports (`meow -v`), e.g.
+          "-alpha+abc1234". Empty for tagged releases.
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    env:
+      # Read by crates/meow-app/build.rs; empty for tagged releases.
+      MEOW_VERSION_SUFFIX: ${{ inputs.version_suffix }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Every release target builds with the meow-app default feature set
+          # (`full`; TLS is BoringSSL). Targets that cannot link boring-sys
+          # (MIPS, 32-bit musl, windows-gnu) are not shipped and — since the
+          # rustls backend was removed — cannot be built with TLS at all.
+          # Linux musl
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            # x86_64: informational only, no size gate
+            minimal_budget_bytes: 0
+            minimal_soft_gate: true
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-latest
+            # aarch64: hard gate — release fails if minimal binary exceeds 8 MiB
+            minimal_budget_bytes: 8388608
+            minimal_soft_gate: false
+            # Static musl binary → one build serves several OpenWrt arch
+            # labels; the .ipk/.apk differ only in the architecture field
+            # (#284, #466).
+            openwrt_archs: >-
+              aarch64_generic aarch64_cortex-a53 aarch64_cortex-a72
+              aarch64_cortex-a76
+          # Linux GNU
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            minimal_budget_bytes: 0
+            minimal_soft_gate: true
+          - target: armv7-unknown-linux-gnueabihf
+            runner: ubuntu-latest
+            minimal_budget_bytes: 0
+            minimal_soft_gate: true
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            minimal_budget_bytes: 0
+            minimal_soft_gate: true
+          - target: riscv64gc-unknown-linux-musl
+            runner: ubuntu-latest
+            minimal_budget_bytes: 0
+            minimal_soft_gate: true
+          # Windows
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            minimal_budget_bytes: 0
+            minimal_soft_gate: true
+          - target: aarch64-pc-windows-msvc
+            runner: windows-latest
+            minimal_budget_bytes: 0
+            minimal_soft_gate: true
+          - target: i686-pc-windows-msvc
+            runner: windows-latest
+            minimal_budget_bytes: 0
+            minimal_soft_gate: true
+          # macOS
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+            minimal_budget_bytes: 0
+            minimal_soft_gate: true
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            minimal_budget_bytes: 0
+            minimal_soft_gate: true
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Rust toolchain
+        shell: bash
+        run: |
+          # rust-toolchain.toml overrides `rustup default` inside the
+          # checkout — install the pinned channel and add the target to it
+          # explicitly, not to floating stable. The sed pattern tolerates
+          # leading whitespace and prints nothing on no match, so a
+          # malformed toml fails here instead of installing "".
+          tc=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n1)
+          if [ -z "$tc" ]; then
+            echo "::error::could not parse channel from rust-toolchain.toml"
+            exit 1
+          fi
+          rustup toolchain install "$tc" --profile minimal --no-self-update
+          rustup target add --toolchain "$tc" "${{ matrix.target }}"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          key: release-${{ matrix.target }}
+
+      - name: Install cargo-zigbuild and zig
+        if: runner.os == 'Linux'
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.13.0
+
+      - run: cargo install --locked cargo-zigbuild
+        if: runner.os == 'Linux'
+
+      - name: Build release binary
+        shell: bash
+        run: |
+          # Default features = full (meow-app/Cargo.toml); TLS is BoringSSL.
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            cargo zigbuild --release --locked --target ${{ matrix.target }} --bin meow
+          else
+            cargo build --release --locked --target ${{ matrix.target }} --bin meow
+          fi
+
+      - name: Build minimal release binary (stripped, for size check)
+        if: matrix.minimal_budget_bytes != 0 && runner.os == 'Linux'
+        env:
+          # Keep the size-check build separate from the full release artifact.
+          # Cargo otherwise reuses target/<triple>/release/meow and the
+          # minimal build replaces the binary that is packaged below.
+          CARGO_TARGET_DIR: target/minimal
+        run: |
+          cargo zigbuild --release --locked \
+            --no-default-features --features minimal \
+            --target ${{ matrix.target }} \
+            --bin meow
+
+      - name: Minimal binary size check
+        if: matrix.minimal_budget_bytes != 0 && runner.os == 'Linux'
+        run: |
+          SIZE=$(stat -c%s "target/minimal/${{ matrix.target }}/release/meow")
+          BUDGET=${{ matrix.minimal_budget_bytes }}
+          echo "Minimal binary size: ${SIZE} bytes (budget: ${BUDGET} bytes)"
+          if [ "${SIZE}" -gt "${BUDGET}" ]; then
+            if [ "${{ matrix.minimal_soft_gate }}" = "true" ]; then
+              echo "::warning::${{ matrix.target }} minimal binary ${SIZE} bytes exceeds soft budget ${BUDGET} bytes (ADR-0007 §1)"
+            else
+              echo "::error::${{ matrix.target }} minimal binary ${SIZE} bytes exceeds hard budget ${BUDGET} bytes (ADR-0007 §2)"
+              exit 1
+            fi
+          else
+            echo "Size check passed: ${SIZE} <= ${BUDGET}"
+          fi
+
+      - name: Fetch wintun.dll
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          # Official signed Wintun DLL (https://www.wintun.net/). Required
+          # for the Windows TUN inbound / transparent-proxy path.
+          bash scripts/fetch-wintun.sh \
+            --target "${{ matrix.target }}" \
+            --outdir dist/wintun
+
+      - name: Package archive
+        id: pkg
+        shell: bash
+        run: |
+          set -euo pipefail
+          # `ref` is chosen by the caller (the tag, or the dispatch tag input
+          # — GITHUB_REF_NAME would be a branch name that may contain slashes).
+          ref="${{ inputs.ref }}"
+          name="meow-${ref}-${{ matrix.target }}"
+          staging="dist/${name}"
+          mkdir -p "${staging}"
+
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "target/${{ matrix.target }}/release/meow.exe" "${staging}/"
+            cp dist/wintun/wintun.dll "${staging}/"
+            if [ -f dist/wintun/LICENSE.txt ]; then
+              cp dist/wintun/LICENSE.txt "${staging}/LICENSE.wintun.txt"
+            fi
+            cp README.md LICENSE "${staging}/" 2>/dev/null || true
+            pwsh -Command "Compress-Archive -Path 'dist/${name}' -DestinationPath '${name}.zip'"
+            sha256sum "${name}.zip" > "${name}.zip.sha256"
+            echo "archive=${name}.zip" >> "$GITHUB_OUTPUT"
+            echo "checksum=${name}.zip.sha256" >> "$GITHUB_OUTPUT"
+          else
+            cp "target/${{ matrix.target }}/release/meow" "${staging}/"
+            cp README.md LICENSE "${staging}/" 2>/dev/null || true
+            tar -C dist -czf "${name}.tar.gz" "${name}"
+            sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256"
+            echo "archive=${name}.tar.gz" >> "$GITHUB_OUTPUT"
+            echo "checksum=${name}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Package OpenWrt ipks
+        if: matrix.openwrt_archs != ''
+        run: |
+          set -euo pipefail
+          ref="${{ inputs.ref }}"
+          version="${{ inputs.ipk_version }}"
+          if [ -z "${version}" ]; then
+            version="${ref#v}"
+            version="${version//\//-}"
+          fi
+          for arch in ${{ matrix.openwrt_archs }}; do
+            bash openwrt/build-ipk.sh meow \
+              --binary "target/${{ matrix.target }}/release/meow" \
+              --version "${version}-1" --arch "${arch}" --outdir dist-ipk
+          done
+          cd dist-ipk
+          for f in *.ipk; do sha256sum "$f" > "$f.sha256"; done
+
+      - name: Cache apk-tools
+        if: matrix.openwrt_archs != ''
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/apk-tools
+          # Key on the pin: bumping install-apk-tools.sh busts the cache.
+          key: apk-tools-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('openwrt/install-apk-tools.sh') }}
+
+      - name: Package OpenWrt apks (OpenWrt 25.12+)
+        if: matrix.openwrt_archs != ''
+        run: |
+          set -euo pipefail
+          bash openwrt/install-apk-tools.sh "$HOME/.cache/apk-tools"
+          ref="${{ inputs.ref }}"
+          version="${{ inputs.apk_version }}"
+          if [ -z "${version}" ]; then
+            version="${ref#v}"
+            version="${version//\//-}"
+          fi
+          for arch in ${{ matrix.openwrt_archs }}; do
+            # root so the payload is owned by root:root inside the apk
+            sudo APK="$HOME/.cache/apk-tools/apk" bash openwrt/build-apk.sh meow \
+              --binary "target/${{ matrix.target }}/release/meow" \
+              --version "${version}-r1" --arch "${arch}" --outdir dist-apk
+          done
+          sudo chown -R "$(id -u):$(id -g)" dist-apk
+          cd dist-apk
+          for f in *.apk; do sha256sum "$f" > "$f.sha256"; done
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: meow-${{ matrix.target }}
+          path: |
+            ${{ steps.pkg.outputs.archive }}
+            ${{ steps.pkg.outputs.checksum }}
+            dist-ipk/*.ipk
+            dist-ipk/*.ipk.sha256
+            dist-apk/*.apk
+            dist-apk/*.apk.sha256
+          if-no-files-found: error
+          retention-days: 14

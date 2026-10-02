@@ -327,6 +327,14 @@ Official `.ipk` (opkg) and `.apk` (OpenWrt 25.12+) packages for aarch64 routers 
 to every [release](https://github.com/meow-rs/meow-rs/releases). See
 [docs/openwrt.md](docs/openwrt.md).
 
+**Alpha builds (unstable):** every push to `main` refreshes the rolling
+[`Prerelease-Alpha`](https://github.com/madeye/meow-rs/releases/tag/Prerelease-Alpha)
+prerelease with binaries for all release targets plus OpenWrt `.ipk`s
+(`meow-alpha-<sha7>-<target>.*`), so you can try current `main` without
+compiling. These builds are untested and may break; `meow -v` reports
+`<version>-alpha+<sha7>`. Use the latest stable release for anything
+important.
+
 ### Open the Web UI
 
 After starting, open your browser to:
