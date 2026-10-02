@@ -1,14 +1,22 @@
 # meow on OpenWrt
 
-Official `.ipk` packages for aarch64 OpenWrt devices are attached to every
-[GitHub release](https://github.com/madeye/meow-rs/releases) (issue
-[#284](https://github.com/madeye/meow-rs/issues/284)):
+Official `.ipk` (opkg) and `.apk` (apk-tools v3, OpenWrt 25.12+) packages for
+aarch64 OpenWrt devices are attached to every
+[GitHub release](https://github.com/madeye/meow-rs/releases) (issues
+[#284](https://github.com/madeye/meow-rs/issues/284) and
+[#466](https://github.com/madeye/meow-rs/issues/466)):
 
 | Package | Architectures |
 |---------|---------------|
 | `meow_<ver>_<arch>.ipk` | `aarch64_generic`, `aarch64_cortex-a53`, `aarch64_cortex-a72`, `aarch64_cortex-a76` |
 | `luci-app-meow_<ver>_all.ipk` | any (LuCI app, architecture-independent) |
+| `meow_<ver>-r1_<arch>.apk` | same architectures as the ipk |
+| `luci-app-meow_<ver>-r1_all.apk` | any (LuCI app, architecture-independent) |
 
+OpenWrt 25.12 and later replaced opkg with apk; use the `.apk` files there and
+the `.ipk` files on 24.10 and older. Both formats carry the same payload,
+maintainer scripts and config-file handling. Note the apk version suffix:
+apk spells the package revision `-rN` where opkg uses `-N`.
 The binaries are fully static musl builds, so they have no library
 dependencies beyond OpenWrt's base system. All aarch64 packages contain
 the same `aarch64` binary — only the opkg `Architecture:` label differs so
@@ -36,13 +44,29 @@ for `x86_64`, the `x86_64-unknown-linux-musl` release tarball as-is.
 
 ## Install
 
-Transfer the ipks to the device and install:
+Transfer the packages to the device and install.
+
+OpenWrt 24.10 and older (opkg):
 
 ```sh
 opkg install ./meow_<ver>_<arch>.ipk
 # optional, for the LuCI integration:
 opkg install ./luci-app-meow_<ver>_all.ipk
 ```
+
+OpenWrt 25.12 and newer (apk). The packages are unsigned, so apk needs
+`--allow-untrusted`:
+
+```sh
+apk add --allow-untrusted ./meow_<ver>-r1_<arch>.apk
+# optional, for the LuCI integration:
+apk add --allow-untrusted ./luci-app-meow_<ver>-r1_all.apk
+```
+
+Upgrades work the same way (`apk add --allow-untrusted ./newer.apk`). Edited
+`/etc/config/meow` and `/etc/meow/config.yaml` are kept; the packaged copy is
+written next to them as `*.apk-new`. `apk del meow` leaves the config files in
+place; `apk del --purge meow` removes them too.
 
 The `meow` package installs:
 
@@ -261,7 +285,7 @@ container, provisions the side-router UCI config and LuCI, and installs the
 ipks. It also adds a host-side macvlan shim so the Docker host itself can
 reach the container.
 
-## Building ipks yourself
+## Building ipks and apks yourself
 
 `openwrt/build-ipk.sh` assembles ipks from any static musl build without
 the OpenWrt SDK:
@@ -273,6 +297,22 @@ openwrt/build-ipk.sh meow \
     --version 0.16.0-1 --arch aarch64_generic --outdir dist
 openwrt/build-ipk.sh luci --version 0.16.0-1 --outdir dist
 ```
+
+`openwrt/build-apk.sh` is the apk counterpart with the same arguments. It
+needs apk-tools 3 (`apk mkpkg`) and root, and takes the apk-style
+`X.Y.Z-rN` version:
+
+```sh
+# one-time: fetch a pinned static apk-tools 3 (Linux x86_64 / aarch64)
+openwrt/install-apk-tools.sh ~/.cache/apk-tools
+sudo APK=$HOME/.cache/apk-tools/apk openwrt/build-apk.sh meow \
+    --binary target/aarch64-unknown-linux-musl/release/meow \
+    --version 0.16.0-r1 --arch aarch64_generic --outdir dist
+sudo APK=$HOME/.cache/apk-tools/apk openwrt/build-apk.sh luci --version 0.16.0-r1 --outdir dist
+```
+
+On macOS, run it inside an Alpine container (`apk add bash`, apk-tools 3 is
+the default `apk` in current Alpine).
 
 ## End-to-end test
 
@@ -314,7 +354,7 @@ bash tests/test_luci_meow.sh
 
 - An opkg feed (per-release ipks only; `opkg update`-able feed may come
   later once this stabilizes).
-- `apk` packages for OpenWrt snapshot/main builds (which replaced opkg).
+- An apk repository/feed (per-release `.apk` files only; they are unsigned).
 - 32-bit arm / mips release ipks — release artifacts require the default
   `full` + `boring-tls` feature set; boring-sys does not build for those
   targets. Build from source with `--no-default-features --features full`

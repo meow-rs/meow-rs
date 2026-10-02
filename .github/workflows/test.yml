@@ -560,3 +560,27 @@ jobs:
         env:
           MEOW_REQUIRE_DOCKER: "1"
         run: bash tests/test_openwrt_docker.sh
+
+  # OpenWrt .apk packaging (apk-tools v3, OpenWrt 25.12+; #466): builds both
+  # packages with build-apk.sh, checks them with `apk verify` / `apk adbdump`,
+  # and installs them into a real OpenWrt 25.12 rootfs container.
+  openwrt-apk:
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Cache apk-tools
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/apk-tools
+          key: apk-tools-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('openwrt/install-apk-tools.sh') }}
+
+      - name: Install apk-tools 3 (pinned)
+        run: bash openwrt/install-apk-tools.sh "$HOME/.cache/apk-tools"
+
+      - name: Build, verify and install the apks
+        env:
+          MEOW_REQUIRE_DOCKER: "1"
+        run: |
+          APK="$HOME/.cache/apk-tools/apk" bash tests/test_openwrt_apk.sh

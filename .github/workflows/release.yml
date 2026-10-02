@@ -37,7 +37,8 @@ jobs:
             minimal_budget_bytes: 8388608
             minimal_soft_gate: false
             # Static musl binary → one build serves several OpenWrt arch
-            # labels; the .ipk differs only in the Architecture field (#284).
+            # labels; the .ipk/.apk differ only in the architecture field
+            # (#284, #466).
             openwrt_archs: >-
               aarch64_generic aarch64_cortex-a53 aarch64_cortex-a72
               aarch64_cortex-a76
@@ -211,6 +212,32 @@ jobs:
           cd dist-ipk
           for f in *.ipk; do sha256sum "$f" > "$f.sha256"; done
 
+      - name: Cache apk-tools
+        if: matrix.openwrt_archs != ''
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/apk-tools
+          # Key on the pin: bumping install-apk-tools.sh busts the cache.
+          key: apk-tools-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('openwrt/install-apk-tools.sh') }}
+
+      - name: Package OpenWrt apks (OpenWrt 25.12+)
+        if: matrix.openwrt_archs != ''
+        run: |
+          set -euo pipefail
+          bash openwrt/install-apk-tools.sh "$HOME/.cache/apk-tools"
+          ref="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}"
+          version="${ref#v}"
+          version="${version//\//-}"
+          for arch in ${{ matrix.openwrt_archs }}; do
+            # root so the payload is owned by root:root inside the apk
+            sudo APK="$HOME/.cache/apk-tools/apk" bash openwrt/build-apk.sh meow \
+              --binary "target/${{ matrix.target }}/release/meow" \
+              --version "${version}-r1" --arch "${arch}" --outdir dist-apk
+          done
+          sudo chown -R "$(id -u):$(id -g)" dist-apk
+          cd dist-apk
+          for f in *.apk; do sha256sum "$f" > "$f.sha256"; done
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -220,6 +247,8 @@ jobs:
             ${{ steps.pkg.outputs.checksum }}
             dist-ipk/*.ipk
             dist-ipk/*.ipk.sha256
+            dist-apk/*.apk
+            dist-apk/*.apk.sha256
           if-no-files-found: error
           retention-days: 14
 
@@ -245,6 +274,24 @@ jobs:
           f="luci-app-meow_${version}-1_all.ipk"
           sha256sum "$f" > "$f.sha256"
 
+      - name: Cache apk-tools
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/apk-tools
+          key: apk-tools-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('openwrt/install-apk-tools.sh') }}
+
+      - name: Package luci-app-meow apk (arch-independent)
+        run: |
+          set -euo pipefail
+          bash openwrt/install-apk-tools.sh "$HOME/.cache/apk-tools"
+          version="${GITHUB_REF_NAME#v}"
+          sudo APK="$HOME/.cache/apk-tools/apk" bash openwrt/build-apk.sh luci \
+            --version "${version}-r1" --outdir dist
+          sudo chown -R "$(id -u):$(id -g)" dist
+          cd dist
+          f="luci-app-meow_${version}-r1_all.apk"
+          sha256sum "$f" > "$f.sha256"
+
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
@@ -255,5 +302,7 @@ jobs:
             dist/*.zip.sha256
             dist/**/*.ipk
             dist/**/*.ipk.sha256
+            dist/**/*.apk
+            dist/**/*.apk.sha256
           generate_release_notes: true
           fail_on_unmatched_files: true

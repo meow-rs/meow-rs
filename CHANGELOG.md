@@ -10,6 +10,15 @@ the canonical, in-repo source a release is cut from.
 
 ### Added
 
+- **OpenWrt `.apk` packages** (issue #466) — releases now ship `meow` and
+  `luci-app-meow` in the apk-tools v3 format used by OpenWrt 25.12+ (which
+  dropped opkg), next to the existing `.ipk` files. Built by the new
+  `openwrt/build-apk.sh` (`apk mkpkg`, same payload, config-file protection
+  and service enable/disable scripts as the ipk) with a pinned static
+  apk-tools from `openwrt/install-apk-tools.sh`. Versions use apk syntax
+  (`X.Y.Z-r1`). Packages are unsigned: `apk add --allow-untrusted
+  ./meow_<ver>-r1_<arch>.apk`. A new `openwrt-apk` CI job builds the apks and
+  installs them into an OpenWrt 25.12 rootfs container.
 - **`RLIMIT_NOFILE` raise at startup** — on Unix, `meow` now raises its
   file-descriptor soft limit toward the hard limit (≤ 65536) before any
   listener or outbound socket is created, matching the precedent the

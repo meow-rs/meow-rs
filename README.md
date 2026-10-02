@@ -320,9 +320,9 @@ tail -f ~/Library/Logs/meow/meow.log
 ./target/release/meow uninstall
 ```
 
-**OpenWrt (opkg + LuCI):**
+**OpenWrt (opkg / apk + LuCI):**
 
-Official `.ipk` packages for aarch64 routers — including a
+Official `.ipk` (opkg) and `.apk` (OpenWrt 25.12+) packages for aarch64 routers — including a
 `luci-app-meow` that embeds the built-in web panel in LuCI — are attached
 to every [release](https://github.com/meow-rs/meow-rs/releases). See
 [docs/openwrt.md](docs/openwrt.md).

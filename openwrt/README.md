@@ -1,11 +1,19 @@
 # OpenWrt packaging
 
-Packaging sources for the official OpenWrt `.ipk` release artifacts
-(issue [#284](https://github.com/madeye/meow-rs/issues/284)).
+Packaging sources for the official OpenWrt `.ipk` and `.apk` release artifacts
+(issues [#284](https://github.com/madeye/meow-rs/issues/284) and
+[#466](https://github.com/madeye/meow-rs/issues/466)).
 
 - `build-ipk.sh` — assembles opkg-format `.ipk` packages from a prebuilt
   static musl binary, without the OpenWrt SDK. Run with no arguments for
   usage.
+- `build-apk.sh` — same CLI, produces apk-tools v3 (ADB) `.apk` packages for
+  OpenWrt 25.12+ via `apk mkpkg`, following OpenWrt's `package-pack.mk`
+  (`/lib/apk/packages/<pkg>.{list,conffiles,conffiles_static}`, post-install /
+  post-upgrade / pre-deinstall scripts). Versions are `X.Y.Z-rN`. Packages are
+  unsigned: install with `apk add --allow-untrusted`. Must run as root.
+- `install-apk-tools.sh` — fetches the pinned static apk-tools 3 binary
+  (Alpine `apk-tools-static`, sha256-verified) used by CI and `build-apk.sh`.
 - `meow/files/` — procd init scripts (`meow.init`, `meow-arp.init`),
   `/etc/config/meow` UCI settings, the default `/etc/meow/config.yaml`,
   `gateway.sh` (transparent-proxy nftables rules for gateway / side-router
@@ -20,6 +28,7 @@ Packaging sources for the official OpenWrt `.ipk` release artifacts
 - `docker/side-router.sh` — runs OpenWrt in a Docker container on the LAN
   (macvlan, bridge mode) configured as a side router with meow installed.
 
-Release wiring lives in `.github/workflows/release.yml` (ipk matrix), the
-Docker end-to-end test in `tests/test_openwrt_docker.sh`, and user-facing
+Release wiring lives in `.github/workflows/release.yml` (ipk + apk matrix), the
+Docker end-to-end test in `tests/test_openwrt_docker.sh`, the apk build/install
+check in `tests/test_openwrt_apk.sh` (CI job `openwrt-apk`), and user-facing
 documentation in [docs/openwrt.md](../docs/openwrt.md).
