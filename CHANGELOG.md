@@ -504,6 +504,18 @@ the canonical, in-repo source a release is cut from.
   hostname upstreams build against a placeholder address that `-t`
   exits without querying.
 
+- **`--config-string` runs no longer treat `-f` as a backing file**
+  (issue #717). The backing path is now optional end-to-end:
+  `POST /api/config/save` returns 400 instead of writing a phantom
+  `./config.yaml`; subscription add/refresh/delete and the background
+  refresh loop still apply in memory but skip the disk write
+  (`"persisted": false` in responses, a `warn!` in logs); runtime
+  rebuilds and DNS reconciliation use the same `cache_dir: None`
+  strictness startup had instead of resolving provider paths against a
+  file that never existed; and `meow install --config-string` now fails
+  fast — a service unit must point at a real `-f` file — instead of
+  silently installing a unit that resurrects a different config.
+
 - **`meow -t --config-string` now validates the string, not the file**
   (issue #711). The `-t` path used to always load `-f`, so a broken
   `--config-string` passed as long as the file was valid — and a valid

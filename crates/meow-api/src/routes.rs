@@ -66,7 +66,9 @@ pub struct AppState {
     pub tunnel: Tunnel,
     /// Optional Bearer token enforced by `require_auth`. `None` or empty disables auth.
     pub secret: Option<String>,
-    pub config_path: String,
+    /// Backing config file — `None` when the daemon was loaded via
+    /// `--config-string`; persist endpoints refuse then (issue #717).
+    pub config_path: Option<String>,
     pub raw_config: Arc<RwLock<RawConfig>>,
     /// Fan-out channel for log events. Each WS client subscribes a Receiver.
     pub log_tx: broadcast::Sender<LogMessage>,
@@ -1064,6 +1066,18 @@ async fn close_all_connections(State(state): State<Arc<AppState>>) -> StatusCode
 
 // ── Config save ──────────────────────────────────────────────────────
 
+/// The daemon's backing config file, or a client-visible refusal when the
+/// daemon was started from `--config-string` — persisting would otherwise
+/// create a phantom `config.yaml` the user never asked for (issue #717).
+fn backing_config_path(state: &AppState) -> Result<&str, (StatusCode, String)> {
+    state.config_path.as_deref().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "no backing config file — the daemon was started via --config-string".into(),
+        )
+    })
+}
+
 async fn save_config(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
@@ -1072,7 +1086,7 @@ async fn save_config(
     // the runtime immediately reverts (issue #543).
     let _mutation = CONFIG_MUTATION.lock().await;
     let raw = state.raw_config.read().clone();
-    meow_config::save_raw_config_async(&state.config_path, &raw)
+    meow_config::save_raw_config_async(backing_config_path(&state)?, &raw)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(serde_json::json!({"message": "config saved"})))
@@ -1125,8 +1139,13 @@ async fn apply_raw_to_tunnel(
     // with — this is a trusted rebuild of the daemon's own running config,
     // not an untrusted candidate, so relative rule-provider paths must keep
     // resolving instead of hard-failing with `cache_dir: None` (issue #429
-    // follow-up).
-    let cache_dir = meow_config::resource_cache_dir_for_config_path(&state.config_path);
+    // follow-up). A `--config-string` run has no backing file and gets the
+    // same `None` startup used — reloads cannot admit paths startup would
+    // have rejected (issue #717).
+    let cache_dir = state
+        .config_path
+        .as_deref()
+        .map(meow_config::resource_cache_dir_for_config_path);
     // Share the tunnel's resolver slot so the rebuilt map's DIRECT adapter
     // tracks later `set_resolver` swaps (issue #514).
     let resolver_slot = state.tunnel.resolver_slot();
@@ -1166,7 +1185,7 @@ async fn apply_raw_to_tunnel(
     let dns = reconcile_dns_config(
         &state.raw_config,
         &raw,
-        &state.config_path,
+        state.config_path.as_deref(),
         &proxies,
         Some(&rule_providers),
         Some(&prefetched_payloads),
@@ -1417,7 +1436,7 @@ fn dns_inputs_equal(a: &RawConfig, b: &RawConfig) -> bool {
 pub async fn reconcile_dns_config(
     raw_config: &RwLock<RawConfig>,
     candidate: &RawConfig,
-    config_path: &str,
+    config_path: Option<&str>,
     proxies: &std::collections::HashMap<smol_str::SmolStr, Arc<dyn meow_common::Proxy>>,
     rule_providers: Option<&HashMap<String, Arc<meow_config::rule_provider::RuleProvider>>>,
     prefetched_payloads: Option<&Arc<meow_config::rule_provider::PrefetchedPayloads>>,
@@ -1444,10 +1463,10 @@ pub async fn reconcile_dns_config(
     if unchanged {
         return Ok(None);
     }
-    let cache_dir = meow_config::resource_cache_dir_for_config_path(config_path);
+    let cache_dir = config_path.map(meow_config::resource_cache_dir_for_config_path);
     meow_config::parse_dns_from_raw(
         candidate,
-        Some(&cache_dir),
+        cache_dir.as_deref(),
         proxies,
         rule_providers,
         prefetched_payloads,
@@ -1624,7 +1643,7 @@ async fn rebuild_from_raw_runtime_async(
     raw: RawConfig,
     resolver_slot: meow_dns::ResolverSlot,
     providers: HashMap<String, Arc<ProxyProvider>>,
-    cache_dir: std::path::PathBuf,
+    cache_dir: Option<std::path::PathBuf>,
     provider_dialer_registry: meow_proxy::dialer::ProxyRegistry,
 ) -> Result<meow_config::RebuildResult, String> {
     tokio::task::spawn_blocking(move || {
@@ -1632,7 +1651,7 @@ async fn rebuild_from_raw_runtime_async(
             &raw,
             Some(&resolver_slot),
             &providers,
-            Some(&cache_dir),
+            cache_dir.as_deref(),
             &provider_dialer_registry,
         )
     })
@@ -1767,16 +1786,17 @@ async fn add_subscription(
     };
     commit_raw_candidate(&state, snapshot.clone()).await?;
 
-    // Auto-save so subscription data is cached on disk
-    meow_config::save_raw_config_async(&state.config_path, &snapshot)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    // Auto-save so subscription data is cached on disk — skipped (with a
+    // warning and `persisted: false`) when the daemon was started via
+    // `--config-string` and has no backing file (issue #717).
+    let persisted = persist_candidate(&state, &snapshot, &body.name).await?;
 
     Ok(Json(serde_json::json!({
         "message": "subscription added",
         "proxy_count": counts.proxies,
         "group_count": counts.proxy_groups,
         "rule_count": counts.rules,
+        "persisted": persisted,
     })))
 }
 
@@ -1811,9 +1831,7 @@ async fn delete_subscription(
         raw
     };
     commit_raw_candidate(&state, snapshot.clone()).await?;
-    meow_config::save_raw_config_async(&state.config_path, &snapshot)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    persist_candidate(&state, &snapshot, &name).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1891,17 +1909,45 @@ async fn refresh_subscription(
     };
     commit_raw_candidate(&state, snapshot.clone()).await?;
 
-    // Auto-save so subscription data is cached on disk
-    meow_config::save_raw_config_async(&state.config_path, &snapshot)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    // Auto-save so subscription data is cached on disk — skipped (with a
+    // warning and `persisted: false`) when the daemon was started via
+    // `--config-string` and has no backing file (issue #717).
+    let persisted = persist_candidate(&state, &snapshot, &name).await?;
 
     Ok(Json(serde_json::json!({
         "message": "subscription refreshed",
         "proxy_count": counts.proxies,
         "group_count": counts.proxy_groups,
         "rule_count": counts.rules,
+        "persisted": persisted,
     })))
+}
+
+/// Persist a committed subscription candidate to the backing file.
+/// Returns `false` without writing when the daemon was started via
+/// `--config-string` — there is no file to update, and inventing
+/// `./config.yaml` would resurrect as an unrelated backing file next boot
+/// (issue #717).
+async fn persist_candidate(
+    state: &AppState,
+    snapshot: &RawConfig,
+    name: &str,
+) -> Result<bool, (StatusCode, String)> {
+    match state.config_path.as_deref() {
+        Some(path) => {
+            meow_config::save_raw_config_async(path, snapshot)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            Ok(true)
+        }
+        None => {
+            warn!(
+                "subscription '{name}' applied in memory only — \
+                 no backing config file (--config-string)"
+            );
+            Ok(false)
+        }
+    }
 }
 
 // ── Proxy Groups ─────────────────────────────────────────────────────
@@ -2867,7 +2913,10 @@ async fn put_configs(
         .iter()
         .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
         .collect();
-    let cache_dir = meow_config::resource_cache_dir_for_config_path(&state.config_path);
+    let cache_dir = state
+        .config_path
+        .as_deref()
+        .map(meow_config::resource_cache_dir_for_config_path);
     // When the strict rebuild fails and `force` retries leniently, the
     // DNS reconcile below must parse with the SAME effective strictness —
     // a `#name` reference to a proxy the lenient build dropped is a hard
@@ -3006,7 +3055,7 @@ async fn put_configs(
     let dns = match reconcile_dns_config(
         &state.raw_config,
         dns_raw.as_ref().unwrap_or(&raw_config),
-        &state.config_path,
+        state.config_path.as_deref(),
         &proxies,
         Some(&rule_providers),
         Some(&prefetched_payloads),
@@ -3032,7 +3081,7 @@ async fn put_configs(
                     reconcile_dns_config(
                         &state.raw_config,
                         &stripped,
-                        &state.config_path,
+                        state.config_path.as_deref(),
                         &proxies,
                         Some(&rule_providers),
                         Some(&prefetched_payloads),
@@ -4195,10 +4244,12 @@ mod outbound_flush_tests {
         Arc::new(AppState {
             tunnel,
             secret: None,
-            config_path: std::env::temp_dir()
-                .join("meow-api-695-flush.yaml")
-                .to_string_lossy()
-                .into_owned(),
+            config_path: Some(
+                std::env::temp_dir()
+                    .join("meow-api-695-flush.yaml")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
             raw_config: Arc::new(RwLock::new(raw)),
             log_tx: broadcast::channel(16).0,
             proxy_providers: Arc::new(DashMap::new()),
@@ -4342,7 +4393,7 @@ mod global_route_binding_tests {
         Arc::new(AppState {
             tunnel,
             secret: None,
-            config_path: dir.join("config.yaml").to_string_lossy().into_owned(),
+            config_path: Some(dir.join("config.yaml").to_string_lossy().into_owned()),
             raw_config: Arc::new(RwLock::new(raw)),
             log_tx: broadcast::channel(16).0,
             proxy_providers: Arc::new(DashMap::new()),

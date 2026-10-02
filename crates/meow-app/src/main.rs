@@ -565,7 +565,10 @@ fn run_application_inner(
 
         run(
             config,
-            config_path,
+            // A --config-string run has no backing file: persist paths
+            // (PUT/save, subscription write-back) must not invent one
+            // (issue #717).
+            args.config_string.is_none().then_some(config_path),
             log_tx,
             shutdown,
             on_ready,
@@ -667,6 +670,16 @@ fn parse_config_string(cs: &str) -> anyhow::Result<meow_config::raw::RawConfig> 
     meow_config::parse_raw_yaml(yaml).map_err(|e| anyhow::anyhow!("--config-string: {e}"))
 }
 
+/// Cache dir for geodata DBs and provider payloads: beside the config
+/// file when one exists, else the `-d`/XDG home — `--config-string`
+/// runs have no file to resolve against (issue #717).
+fn resource_cache_dir(config_path: Option<&str>) -> std::path::PathBuf {
+    config_path.map_or_else(
+        || meow_common::meow_home_dir().unwrap_or_else(meow_common::xdg_home_dir),
+        meow_config::resource_cache_dir_for_config_path,
+    )
+}
+
 /// `tun:` isn't a `listeners:` entry so [`listener_feature_gate`] can't
 /// see it — same contract separately: enabled on a build without the
 /// feature is unservable.
@@ -683,7 +696,15 @@ fn handle_service_command(cmd: &Command, args: &Args) -> Result<()> {
             target_mac,
             target_ip,
         } => meow_app::arp::send(interface, *sender, target_mac, *target_ip),
-        Command::Install { config } => install_service(config.as_deref(), args),
+        Command::Install { config } => {
+            if args.config_string.is_some() {
+                anyhow::bail!(
+                    "--config-string is not supported for `meow install` — a service \
+                     unit must point at a file; write the config to a file and pass -f"
+                );
+            }
+            install_service(config.as_deref(), args)
+        }
         Command::Uninstall => uninstall_service(),
         Command::Status => service_status(),
         #[cfg(target_os = "windows")]
@@ -1016,7 +1037,7 @@ fn bind_socket_addr(listen: &str, port: u16) -> Result<SocketAddr> {
 
 async fn run(
     config: meow_config::Config,
-    config_path: String,
+    config_path: Option<String>,
     log_tx: tokio::sync::broadcast::Sender<meow_api::log_stream::LogMessage>,
     shutdown: ShutdownSignal,
     on_ready: Option<ReadyCallback>,
@@ -1199,7 +1220,7 @@ async fn run(
         let rule_providers = Arc::clone(&rule_providers);
         let proxy_providers = Arc::clone(&proxy_providers);
         let dns_server = Arc::clone(&dns_server_handle);
-        let cache_dir = meow_config::resource_cache_dir_for_config_path(&config_path);
+        let cache_dir = resource_cache_dir(config_path.as_deref());
         tokio::spawn(async move {
             meow_app::geodata_fetch::run_on_startup(
                 geodata,
@@ -1222,7 +1243,7 @@ async fn run(
         let rule_providers = Arc::clone(&rule_providers);
         let proxy_providers = Arc::clone(&proxy_providers);
         let dns_server = Arc::clone(&dns_server_handle);
-        let cache_dir = meow_config::resource_cache_dir_for_config_path(&config_path);
+        let cache_dir = resource_cache_dir(config_path.as_deref());
         tokio::spawn(async move {
             meow_app::geodata_fetch::auto_update_loop(
                 geodata,

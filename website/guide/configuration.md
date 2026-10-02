@@ -148,7 +148,11 @@ The semantics differ sharply from `proxy-providers`:
   nothing; if the committed `dns:` section fails to rebuild, the refresh
   is not committed at all — the previous routing stays live and nothing
   is saved (though `last-updated` is still stamped in memory, so the
-  failed document is not retried until `interval`).
+  failed document is not retried until `interval`). When the daemon runs
+  from `--config-string` there is no backing file at all: every write-back
+  (auto-save, `POST /api/config/save`, subscription add/refresh/delete)
+  is skipped or refused rather than creating a `config.yaml` next boot
+  would pick up — subscription responses report `"persisted": false`.
 - **Refetch cadence.** A background task polls every 60 s: an entry is
   fetched when it has no `last-updated` (first run) or when `interval`
   seconds have elapsed. An entry without `interval` fetches once at

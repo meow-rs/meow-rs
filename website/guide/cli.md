@@ -12,7 +12,7 @@ meow [OPTIONS] [COMMAND]
 | Flag | Description |
 | --- | --- |
 | `-f, --config <PATH>` | Config file path (default `config.yaml`) |
-| `--config-string <B64>` | Base64-encoded YAML config; replaces `-f` as the source entirely (mihomo compat) |
+| `--config-string <B64>` | Base64-encoded YAML config; replaces `-f` as the source entirely (mihomo compat). No backing file exists: `POST /api/config/save` is refused, subscription changes apply in memory only (`persisted: false`), and `meow install` rejects the combination — a service unit must point at a real `-f` file |
 | `-d, --directory <DIR>` | Home directory for resource discovery (geodata, caches); relative config paths resolve under it |
 | `-t, --test` | Validate the config and exit without starting — performs no network access (validates `--config-string` when given) |
 

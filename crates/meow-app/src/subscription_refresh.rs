@@ -28,7 +28,10 @@ use tracing::{debug, error, info, warn};
 pub async fn run_loop(
     raw_config: Arc<RwLock<RawConfig>>,
     tunnel: Tunnel,
-    config_path: String,
+    // Backing config file for write-back — `None` under `--config-string`
+    // (refreshes still apply in-memory; the persist step is skipped with a
+    // warning rather than writing a phantom `./config.yaml`, issue #717).
+    config_path: Option<String>,
     dns_server: Arc<RwLock<Option<meow_api::routes::DnsServerHandle>>>,
     rule_providers: Arc<
         RwLock<std::collections::HashMap<String, Arc<meow_config::rule_provider::RuleProvider>>>,
@@ -56,8 +59,12 @@ pub async fn run_loop(
     // Same provider-cache directory `load_config` used at startup — trusted
     // rebuilds of the daemon's own config must keep resolving relative
     // rule-provider paths the same way, not hard-fail with `cache_dir: None`
-    // (issue #429 follow-up).
-    let cache_dir = meow_config::resource_cache_dir_for_config_path(&config_path);
+    // (issue #429 follow-up). A `--config-string` run has no backing file —
+    // `None` reproduces startup's strictness instead of inventing a root
+    // (issue #717).
+    let cache_dir = config_path
+        .as_deref()
+        .map(meow_config::resource_cache_dir_for_config_path);
     let weak = tunnel.weak_inner();
     drop(tunnel);
     loop {
@@ -232,7 +239,7 @@ pub async fn run_loop(
                                 &candidate,
                                 Some(&resolver),
                                 &proxy_providers,
-                                Some(cache_dir.as_path()),
+                                cache_dir.as_deref(),
                                 &provider_dialer_registry,
                             )
                         }
@@ -283,7 +290,7 @@ pub async fn run_loop(
                             let dns = match meow_api::routes::reconcile_dns_config(
                                 &raw_config,
                                 &candidate,
-                                &config_path,
+                                config_path.as_deref(),
                                 &new_proxies,
                                 Some(&new_rule_providers),
                                 Some(&new_prefetched_payloads),
@@ -376,13 +383,24 @@ pub async fn run_loop(
                             // must follow commit order — otherwise an older
                             // candidate's rename can land last and
                             // resurrect stale state on restart (issue #543
-                            // review).
-                            if let Err(e) =
-                                meow_config::save_raw_config_async(&config_path, &candidate).await
-                            {
-                                // Runtime and raw committed — disk may
-                                // diverge until the next successful save.
-                                warn!("auto-save after refreshing '{name}' failed: {e}");
+                            // review). A `--config-string` run has no
+                            // backing file — keep the in-memory refresh and
+                            // skip the write instead of inventing
+                            // `./config.yaml` (issue #717).
+                            match &config_path {
+                                Some(path) => {
+                                    if let Err(e) =
+                                        meow_config::save_raw_config_async(path, &candidate).await
+                                    {
+                                        // Runtime and raw committed — disk may
+                                        // diverge until the next successful save.
+                                        warn!("auto-save after refreshing '{name}' failed: {e}");
+                                    }
+                                }
+                                None => warn!(
+                                    "subscription '{name}' refreshed but not persisted — \
+                                     no backing config file (--config-string)"
+                                ),
                             }
                         }
                         Ok(Err(e)) => {

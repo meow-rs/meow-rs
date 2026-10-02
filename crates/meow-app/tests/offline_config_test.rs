@@ -290,3 +290,139 @@ async fn config_test_does_not_run_dns_bootstrap() {
         "failure must come from the unbootstrappable policy, not an earlier error: {logs}"
     );
 }
+
+/// Regression for issue #717: `meow install --config-string …` used to
+/// silently install a service unit pointing at the default `-f` path —
+/// resurrecting whatever `config.yaml` happened to sit in the launch
+/// directory. The combination must now fail fast and tell the user to
+/// write a real file.
+#[tokio::test]
+async fn install_rejects_config_string() {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD
+        .encode("mixed-port: 0\nrules: ['MATCH,DIRECT']\n");
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_meow"));
+    command
+        .arg("--config-string")
+        .arg(b64)
+        .arg("install")
+        .kill_on_drop(true);
+    for variable in [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ] {
+        command.env_remove(variable);
+    }
+    let output = tokio::time::timeout(std::time::Duration::from_secs(10), command.output())
+        .await
+        .expect("install rejection must not block")
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "install --config-string must fail instead of baking a phantom -f path: {output:?}"
+    );
+    let logs = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        logs.contains("--config-string") && logs.contains("-f"),
+        "the error must name the flag and point at -f: {logs}"
+    );
+}
+
+/// Issue #717 end-to-end: a daemon started from `--config-string` has no
+/// backing file — `POST /api/config/save` must refuse (400) and the launch
+/// directory must NOT gain a phantom `config.yaml`.
+#[tokio::test]
+async fn config_string_run_never_writes_phantom_config() {
+    use base64::Engine;
+
+    // Reserve a loopback port for the API.
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let api_port = probe.local_addr().unwrap().port();
+    drop(probe);
+
+    let workdir = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        "mixed-port: 0\nexternal-controller: '127.0.0.1:{api_port}'\nrules: ['MATCH,DIRECT']\n"
+    );
+    let b64 = base64::engine::general_purpose::STANDARD.encode(yaml);
+
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_meow"));
+    child
+        .arg("--config-string")
+        .arg(b64)
+        .current_dir(workdir.path())
+        .kill_on_drop(true)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    for variable in [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ] {
+        child.env_remove(variable);
+    }
+    let mut child = child.spawn().expect("spawn meow");
+
+    // Wait for the API to accept connections (bounded).
+    let ready = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            if tokio::net::TcpStream::connect(("127.0.0.1", api_port))
+                .await
+                .is_ok()
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    if ready.is_err() {
+        let _ = child.kill().await;
+        panic!("api server did not come up within 15s");
+    }
+
+    let response = tokio::time::timeout(std::time::Duration::from_secs(10), reqwest_save(api_port))
+        .await
+        .expect("save request must not hang")
+        .expect("save request failed");
+    assert_eq!(
+        response, 400,
+        "save on a --config-string daemon must be refused, got {response}"
+    );
+
+    child.kill().await.unwrap();
+    assert!(
+        !workdir.path().join("config.yaml").exists(),
+        "a --config-string run must not create ./config.yaml"
+    );
+}
+
+/// Minimal HTTP POST for the e2e above — keeps the test file free of an
+/// HTTP-client dependency; returns the status code.
+async fn reqwest_save(port: u16) -> std::io::Result<u16> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await?;
+    stream
+        .write_all(b"POST /api/config/save HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        .await?;
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await?;
+    let head = String::from_utf8_lossy(&buf);
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(0);
+    Ok(status)
+}

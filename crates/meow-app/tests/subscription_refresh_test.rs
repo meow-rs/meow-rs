@@ -193,7 +193,7 @@ fn spawn_loop(fx: &Fixture) {
     tokio::spawn(meow_app::subscription_refresh::run_loop(
         Arc::clone(&fx.raw_config),
         fx.tunnel.clone(),
-        fx.config_path.clone(),
+        Some(fx.config_path.clone()),
         Arc::new(RwLock::new(None)),
         Arc::new(RwLock::new(HashMap::new())),
         Arc::clone(&fx.proxy_providers),

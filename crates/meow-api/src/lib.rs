@@ -257,7 +257,9 @@ pub struct ApiServer {
     tunnel: Tunnel,
     listen_addr: SocketAddr,
     secret: Option<String>,
-    config_path: String,
+    /// Backing config file — `None` when the daemon was loaded via
+    /// `--config-string` (persist endpoints refuse then; issue #717).
+    config_path: Option<String>,
     raw_config: Arc<RwLock<RawConfig>>,
     log_tx: broadcast::Sender<LogMessage>,
     proxy_providers: Arc<DashMap<String, Arc<ProxyProvider>>>,
@@ -290,7 +292,7 @@ impl ApiServer {
         tunnel: Tunnel,
         listen_addr: SocketAddr,
         secret: Option<String>,
-        config_path: String,
+        config_path: Option<String>,
         raw_config: Arc<RwLock<RawConfig>>,
         log_tx: broadcast::Sender<LogMessage>,
         proxy_providers: Arc<DashMap<String, Arc<ProxyProvider>>>,

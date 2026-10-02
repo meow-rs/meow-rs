@@ -37,7 +37,7 @@ fn make_state_with_cap(cap: usize) -> (Arc<AppState>, broadcast::Sender<LogMessa
     let state = Arc::new(AppState {
         tunnel,
         secret: None,
-        config_path,
+        config_path: Some(config_path),
         raw_config: Arc::new(RwLock::new(raw)),
         log_tx: log_tx.clone(),
         proxy_providers: Arc::new(DashMap::new()),

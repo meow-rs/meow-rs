@@ -33,6 +33,21 @@ fn test_raw_config() -> RawConfig {
 }
 
 fn test_state(raw: RawConfig) -> Arc<AppState> {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.yaml").to_str().unwrap().to_string();
+    // Leak the tempdir so it persists for the test — fine for tests
+    std::mem::forget(dir);
+    test_state_with_backing(raw, Some(config_path))
+}
+
+/// State as if the daemon had been started via `--config-string`: there is
+/// no backing config file, so persist endpoints must refuse or explicitly
+/// skip the write rather than create a phantom `./config.yaml` (issue #717).
+fn test_state_ephemeral(raw: RawConfig) -> Arc<AppState> {
+    test_state_with_backing(raw, None)
+}
+
+fn test_state_with_backing(raw: RawConfig, config_path: Option<String>) -> Arc<AppState> {
     let resolver = Arc::new(Resolver::new(
         vec!["8.8.8.8:53".parse().unwrap()],
         vec![],
@@ -48,11 +63,6 @@ fn test_state(raw: RawConfig) -> Arc<AppState> {
         meow_config::rebuild_from_raw(&raw).unwrap();
     tunnel.update_proxies(proxies, Default::default());
     tunnel.update_rules(rules);
-
-    let dir = tempfile::tempdir().unwrap();
-    let config_path = dir.path().join("config.yaml").to_str().unwrap().to_string();
-    // Leak the tempdir so it persists for the test — fine for tests
-    std::mem::forget(dir);
 
     Arc::new(AppState {
         tunnel,
@@ -96,7 +106,7 @@ fn test_state_with_route(raw: RawConfig, named: Vec<(&str, Arc<dyn Proxy>)>) -> 
     Arc::new(AppState {
         tunnel,
         secret: None,
-        config_path,
+        config_path: Some(config_path),
         raw_config: Arc::new(RwLock::new(raw)),
         log_tx: test_log_tx(),
         proxy_providers: Arc::new(DashMap::new()),
@@ -138,7 +148,7 @@ fn test_state_with_secret(secret: &str) -> Arc<AppState> {
     Arc::new(AppState {
         tunnel,
         secret: Some(secret.to_string()),
-        config_path,
+        config_path: Some(config_path),
         raw_config: Arc::new(RwLock::new(raw)),
         log_tx: test_log_tx(),
         proxy_providers: Arc::new(DashMap::new()),
@@ -278,7 +288,7 @@ async fn external_ui_serves_static_directory() {
     let state = Arc::new(AppState {
         tunnel,
         secret: None,
-        config_path: String::new(),
+        config_path: Some(String::new()),
         raw_config: Arc::new(RwLock::new(raw)),
         log_tx: test_log_tx(),
         proxy_providers: Arc::new(DashMap::new()),
@@ -1709,7 +1719,7 @@ async fn add_subscription_merges_with_local_config() {
 
     // The auto-save must carry the merged config — a restart after the
     // add must not come back with the local table lost (issue #640).
-    let saved = std::fs::read_to_string(&state.config_path).unwrap();
+    let saved = std::fs::read_to_string(state.config_path.as_deref().unwrap()).unwrap();
     assert!(saved.contains("selfhop"), "{saved}");
     assert!(saved.contains("DOMAIN,x.test,REJECT"), "{saved}");
 
@@ -1803,7 +1813,7 @@ async fn save_config_creates_file() {
     assert_eq!(resp.status(), StatusCode::OK);
 
     // Verify file was written
-    let content = std::fs::read_to_string(&state.config_path).unwrap();
+    let content = std::fs::read_to_string(state.config_path.as_deref().unwrap()).unwrap();
     assert!(content.contains("mixed-port"));
 }
 
@@ -1812,7 +1822,7 @@ async fn save_config_creates_backup() {
     let state = test_state_default();
 
     // Write initial file
-    std::fs::write(&state.config_path, "old content").unwrap();
+    std::fs::write(state.config_path.as_deref().unwrap(), "old content").unwrap();
 
     let app = create_router(Arc::clone(&state));
     let resp = app
@@ -1828,9 +1838,73 @@ async fn save_config_creates_backup() {
     assert_eq!(resp.status(), StatusCode::OK);
 
     // Verify backup was created
-    let bak_path = format!("{}.bak", state.config_path);
+    let bak_path = format!("{}.bak", state.config_path.as_deref().unwrap());
     let bak_content = std::fs::read_to_string(bak_path).unwrap();
     assert_eq!(bak_content, "old content");
+}
+
+/// A `--config-string` run has no backing file — the save endpoint must
+/// refuse explicitly instead of inventing `./config.yaml` (issue #717).
+#[tokio::test]
+async fn save_config_refuses_without_backing_file() {
+    let state = test_state_ephemeral(test_raw_config());
+    let app = create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/config/save")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_string(resp).await;
+    assert!(
+        body.contains("no backing config file"),
+        "expected a no-backing-file refusal, got: {body}"
+    );
+}
+
+/// Subscription deletes still apply in memory under `--config-string`;
+/// only the disk write is skipped — the response stays 204 and the live
+/// raw config drops the entry (issue #717).
+#[tokio::test]
+async fn delete_subscription_without_backing_file_skips_persist() {
+    let mut raw = test_raw_config();
+    raw.subscriptions = Some(vec![RawSubscription {
+        name: "delsub".into(),
+        url: "https://example.com".into(),
+        interval: None,
+        last_updated: None,
+        proxy: None,
+        applied_proxies: Vec::new(),
+        applied_groups: Vec::new(),
+        applied_rules: Vec::new(),
+    }]);
+    let state = test_state_ephemeral(raw);
+    let app = create_router(Arc::clone(&state));
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/subscriptions/delsub")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert!(
+        state
+            .raw_config
+            .read()
+            .subscriptions
+            .as_deref()
+            .is_none_or(<[_]>::is_empty),
+        "subscription must be removed from the live raw config"
+    );
 }
 
 // ── PUT /proxies/{name} selector switch test ─────────────────────
@@ -2462,7 +2536,7 @@ mod delay_support {
         Arc::new(AppState {
             tunnel,
             secret: None,
-            config_path,
+            config_path: Some(config_path),
             raw_config: Arc::new(RwLock::new(test_raw_config())),
             log_tx: tokio::sync::broadcast::channel(16).0,
             proxy_providers: Arc::new(DashMap::new()),
@@ -2520,7 +2594,7 @@ mod delay_support {
         Arc::new(AppState {
             tunnel,
             secret: Some(secret.to_string()),
-            config_path,
+            config_path: Some(config_path),
             raw_config: Arc::new(RwLock::new(test_raw_config())),
             log_tx: tokio::sync::broadcast::channel(16).0,
             proxy_providers: Arc::new(DashMap::new()),
@@ -3466,7 +3540,7 @@ fn test_state_with_hosts_entry() -> Arc<AppState> {
     Arc::new(AppState {
         tunnel,
         secret: None,
-        config_path,
+        config_path: Some(config_path),
         raw_config: Arc::new(RwLock::new(raw)),
         log_tx: test_log_tx(),
         proxy_providers: Arc::new(DashMap::new()),
@@ -3626,7 +3700,7 @@ async fn get_dns_query_txt_relays_upstream_sections_and_flags() {
     let state = Arc::new(AppState {
         tunnel,
         secret: None,
-        config_path,
+        config_path: Some(config_path),
         raw_config: Arc::new(RwLock::new(raw)),
         log_tx: test_log_tx(),
         proxy_providers: Arc::new(DashMap::new()),
