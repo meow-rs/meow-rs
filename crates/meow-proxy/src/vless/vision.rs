@@ -1,6 +1,5 @@
 //! XTLS-Vision padding wrapper for VLESS.
 
-use std::collections::VecDeque;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -30,6 +29,9 @@ enum ReadState {
         buf: Vec<u8>,
         need_uuid: bool,
     },
+    /// Terminal clean EOF — latched so repeated `poll_read`s stay cheap and
+    /// do not re-emit the mid-frame debug notes.
+    Eof,
     Content {
         command: u8,
         remaining_content: usize,
@@ -54,7 +56,6 @@ pub struct VisionConn {
     inner: VlessConn,
     user_uuid: [u8; UUID_LEN],
     read_state: ReadState,
-    read_plain: VecDeque<u8>,
     write_pending: Option<PendingWrite>,
     write_padding: bool,
     write_sent_uuid: bool,
@@ -78,7 +79,6 @@ impl VisionConn {
                 buf: Vec::with_capacity(PADDING_HEADER_LEN),
                 need_uuid: true,
             },
-            read_plain: VecDeque::new(),
             write_pending: None,
             write_padding: true,
             write_sent_uuid: false,
@@ -179,17 +179,6 @@ impl VisionConn {
             command,
             end_padding_after_drain: end_after_drain,
         });
-    }
-
-    fn drain_read_plain(&mut self, buf: &mut ReadBuf<'_>) -> bool {
-        if self.read_plain.is_empty() {
-            return false;
-        }
-        let n = buf.remaining().min(self.read_plain.len());
-        for b in self.read_plain.drain(..n) {
-            buf.put_slice(&[b]);
-        }
-        true
     }
 
     fn enable_inner_raw_read_passthrough(&mut self) -> bool {
@@ -323,13 +312,13 @@ impl AsyncRead for VisionConn {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        if self.drain_read_plain(buf) {
-            return Poll::Ready(Ok(()));
-        }
-
         loop {
             let state = std::mem::replace(&mut self.read_state, ReadState::Through);
             match state {
+                ReadState::Eof => {
+                    self.read_state = ReadState::Eof;
+                    return Poll::Ready(Ok(()));
+                }
                 ReadState::Through => {
                     self.read_state = ReadState::Through;
                     return Pin::new(&mut self.inner).poll_read(cx, buf);
@@ -359,11 +348,27 @@ impl AsyncRead for VisionConn {
                             Poll::Ready(Ok(())) => {
                                 let n = rb.filled().len();
                                 if n == 0 {
-                                    self.read_state = ReadState::Header { buf: h, need_uuid };
-                                    return Poll::Ready(Err(io::Error::new(
-                                        io::ErrorKind::UnexpectedEof,
-                                        "vision: EOF while reading padding header",
-                                    )));
+                                    // Vision has no end-of-stream marker: a
+                                    // peer finishes by simply closing the
+                                    // transport, possibly mid-padding. Xray
+                                    // and mihomo surface this as io.EOF, so
+                                    // report a clean EOF and let the relay
+                                    // take the graceful shutdown path.
+                                    if h.is_empty() && need_uuid {
+                                        tracing::debug!(
+                                            "vision: EOF before first padding \
+                                             frame (server closed without data)"
+                                        );
+                                    } else if !h.is_empty() {
+                                        tracing::debug!(
+                                            partial = h.len(),
+                                            need,
+                                            "vision: EOF mid padding header \
+                                             (treated as clean close)"
+                                        );
+                                    }
+                                    self.read_state = ReadState::Eof;
+                                    return Poll::Ready(Ok(()));
                                 }
                                 h.extend_from_slice(rb.filled());
                             }
@@ -441,15 +446,17 @@ impl AsyncRead for VisionConn {
                         Poll::Ready(Ok(())) => {
                             let n = rb.filled().len();
                             if n == 0 {
-                                self.read_state = ReadState::Content {
+                                // See the Header-state EOF arm: a mid-frame
+                                // FIN is still a clean close — the bytes
+                                // already delivered remain valid.
+                                tracing::debug!(
                                     command,
                                     remaining_content,
-                                    remaining_padding,
-                                };
-                                return Poll::Ready(Err(io::Error::new(
-                                    io::ErrorKind::UnexpectedEof,
-                                    "vision: EOF while reading padded content",
-                                )));
+                                    "vision: EOF mid padded content \
+                                     (treated as clean close)"
+                                );
+                                self.read_state = ReadState::Eof;
+                                return Poll::Ready(Ok(()));
                             }
                             remaining_content -= n;
                             self.filter_server_tls(rb.filled());
@@ -496,14 +503,14 @@ impl AsyncRead for VisionConn {
                             Poll::Ready(Ok(())) => {
                                 let n = rb.filled().len();
                                 if n == 0 {
-                                    self.read_state = ReadState::Padding {
+                                    tracing::debug!(
                                         command,
                                         remaining_padding,
-                                    };
-                                    return Poll::Ready(Err(io::Error::new(
-                                        io::ErrorKind::UnexpectedEof,
-                                        "vision: EOF while reading padding",
-                                    )));
+                                        "vision: EOF mid padding \
+                                         (treated as clean close)"
+                                    );
+                                    self.read_state = ReadState::Eof;
+                                    return Poll::Ready(Ok(()));
                                 }
                                 remaining_padding -= n;
                             }
@@ -723,6 +730,109 @@ mod tests {
         assert_eq!(got, APP_DATA);
         let err = conn.read(&mut [0u8; 8]).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+    }
+
+    /// Vision has no end-of-stream frame: peers terminate by closing the
+    /// transport, possibly while the downlink is still padded.  Xray and
+    /// mihomo surface that as io.EOF; erroring here would make the relay
+    /// skip the graceful half-close (shutdown + linger) and drop the
+    /// inbound socket abruptly.
+    #[tokio::test]
+    async fn eof_between_padding_frames_is_a_clean_eof() {
+        let (mut conn, mut server) = vision_over_pipe();
+        let mut downlink = vec![0x00, 0x00];
+        downlink.extend(build_padding_frame(
+            COMMAND_PADDING_CONTINUE,
+            Some(&UUID),
+            b"payload",
+            false,
+        ));
+        server.write_all(&downlink).await.unwrap();
+
+        let mut got = [0u8; 7];
+        conn.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"payload");
+
+        drop(server);
+        assert_eq!(conn.read(&mut [0u8; 8]).await.unwrap(), 0);
+    }
+
+    /// A server that closes after the bare VLESS response header — before
+    /// any padding frame — is still a normal termination (born-dead conn).
+    #[tokio::test]
+    async fn eof_before_first_padding_frame_is_a_clean_eof() {
+        let (mut conn, mut server) = vision_over_pipe();
+        server.write_all(&[0x00, 0x00]).await.unwrap();
+        drop(server);
+        assert_eq!(conn.read(&mut [0u8; 8]).await.unwrap(), 0);
+    }
+
+    /// A FIN landing mid-frame likewise ends the stream cleanly: the bytes
+    /// already decoded are delivered and the next read observes EOF.
+    #[tokio::test]
+    async fn eof_mid_padded_content_is_a_clean_eof() {
+        let (mut conn, mut server) = vision_over_pipe();
+        let mut downlink = vec![0x00, 0x00];
+        downlink.extend_from_slice(&UUID);
+        downlink.push(COMMAND_PADDING_CONTINUE);
+        downlink.extend_from_slice(&100u16.to_be_bytes()); // claims 100 B content
+        downlink.extend_from_slice(&0u16.to_be_bytes()); // no padding
+        downlink.extend_from_slice(b"only-7b");
+        server.write_all(&downlink).await.unwrap();
+
+        let mut got = [0u8; 7];
+        conn.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"only-7b");
+
+        drop(server);
+        assert_eq!(conn.read(&mut [0u8; 8]).await.unwrap(), 0);
+    }
+
+    /// Same for a FIN landing mid-header: the partial header bytes are
+    /// undeliverable framing, the conn still ends as a clean EOF.
+    #[tokio::test]
+    async fn eof_mid_padding_header_is_a_clean_eof() {
+        let (mut conn, mut server) = vision_over_pipe();
+        let mut downlink = vec![0x00, 0x00];
+        downlink.extend_from_slice(&UUID);
+        downlink.extend_from_slice(&[COMMAND_PADDING_CONTINUE, 0x00]); // 2 of 5 header bytes
+        server.write_all(&downlink).await.unwrap();
+
+        drop(server);
+        assert_eq!(conn.read(&mut [0u8; 8]).await.unwrap(), 0);
+    }
+
+    /// And mid-padding-bytes: all content was delivered, the truncated
+    /// padding run still ends as clean EOF.
+    #[tokio::test]
+    async fn eof_mid_padding_bytes_is_a_clean_eof() {
+        let (mut conn, mut server) = vision_over_pipe();
+        let mut downlink = vec![0x00, 0x00];
+        downlink.extend_from_slice(&UUID);
+        downlink.push(COMMAND_PADDING_CONTINUE);
+        downlink.extend_from_slice(&4u16.to_be_bytes()); // 4 B content
+        downlink.extend_from_slice(&50u16.to_be_bytes()); // claims 50 B padding
+        downlink.extend_from_slice(b"data");
+        downlink.extend_from_slice(&[0u8; 20]); // only 20 of 50 padding bytes
+        server.write_all(&downlink).await.unwrap();
+
+        let mut got = [0u8; 4];
+        conn.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"data");
+
+        drop(server);
+        assert_eq!(conn.read(&mut [0u8; 8]).await.unwrap(), 0);
+    }
+
+    /// EOF is latched: further reads stay EOF without re-emitting the
+    /// mid-frame debug note.
+    #[tokio::test]
+    async fn eof_is_latched_for_repeated_reads() {
+        let (mut conn, mut server) = vision_over_pipe();
+        server.write_all(&[0x00, 0x00]).await.unwrap();
+        drop(server);
+        assert_eq!(conn.read(&mut [0u8; 8]).await.unwrap(), 0);
+        assert_eq!(conn.read(&mut [0u8; 8]).await.unwrap(), 0);
     }
 
     #[test]

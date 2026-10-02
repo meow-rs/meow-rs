@@ -83,7 +83,9 @@ impl Server {
                     let span = info_span!(
                         "anytls.connection",
                         peer_addr = %addr,
-                        session_id = field::Empty
+                        session_id = field::Empty,
+                        tls_version = field::Empty,
+                        cipher_suite = field::Empty
                     );
 
                     tokio::spawn(
@@ -126,14 +128,11 @@ async fn handle_connection(
         .map(|a| a.to_string())
         .unwrap_or_else(|_| "unknown".to_string());
     configure_tcp_stream(&tcp_stream, &peer_addr);
-    let handshake_span = info_span!(
-        "anytls.handshake",
-        peer_addr = %peer_addr,
-        session_id = field::Empty,
-        tls_version = field::Empty,
-        cipher_suite = field::Empty
-    );
-    let _handshake_guard = handshake_span.enter();
+    // This task is already instrumented with `anytls.connection` (see the
+    // accept loop), which carries peer_addr/session_id/tls_version/
+    // cipher_suite — a nested handshake span entered across the awaits below
+    // would leak onto unrelated tasks on this worker thread, so records go
+    // onto the connection span directly.
     tracing::info!("[Server] New connection from {}", peer_addr);
     // Perform TLS handshake
     tracing::debug!("[Server] Starting TLS handshake");
@@ -144,10 +143,10 @@ async fn handle_connection(
     tracing::debug!("[Server] TLS handshake successful");
     let (_, server_connection) = tls_stream.get_ref();
     if let Some(protocol) = server_connection.protocol_version() {
-        handshake_span.record("tls_version", field::display(format!("{:?}", protocol)));
+        Span::current().record("tls_version", field::display(format!("{:?}", protocol)));
     }
     if let Some(suite) = server_connection.negotiated_cipher_suite() {
-        handshake_span.record(
+        Span::current().record(
             "cipher_suite",
             field::display(format!("{:?}", suite.suite())),
         );
@@ -173,7 +172,6 @@ async fn handle_connection(
     let session = Arc::new(session);
     let session_id = session.id();
     Span::current().record("session_id", session_id);
-    handshake_span.record("session_id", field::display(session_id));
 
     tracing::info!(
         session_id = session_id,
@@ -241,9 +239,12 @@ async fn handle_connection(
     tracing::debug!("[Server] Starting receive loop");
     let session_clone = Arc::clone(&session);
     let recv_span = info_span!(
-        "anytls.session.recv_loop",
+        "anytls.session.recv",
         session_id = session_clone.id(),
-        peer_addr = %peer_addr
+        peer_addr = %peer_addr,
+        role = "server",
+        bytes_in = field::Empty,
+        iterations = field::Empty
     );
     tokio::spawn(
         async move {

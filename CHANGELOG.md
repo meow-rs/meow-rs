@@ -519,6 +519,31 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **XTLS Vision: a padded-mode FIN is no longer misreported as a relay
+  error.** Vision has no end-of-stream frame — a peer that is done simply
+  closes the transport, possibly while the downlink is still padded — and
+  upstream implementations (Xray, mihomo) surface that as `io.EOF`.
+  meow-rs used to promote every such close to `UnexpectedEof`, which both
+  flooded debug logs with `relay error: vision: EOF while reading padding
+  header` for ordinary server-side closes and, more importantly, made the
+  TCP relay take its error path: no `poll_shutdown` on the surviving
+  direction and no graceful-close linger, so the inbound socket could be
+  dropped with undrained bytes and reset the client. Padded-mode EOFs —
+  frame boundary, mid-header, mid-content, mid-padding, or before the
+  first frame — now read as clean EOF. Mid-frame EOFs still emit a
+  `debug!` note so real truncations stay observable.
+
+- **anytls vendored session: fix a tracing span leak.** `recv_loop` held
+  an `Entered` guard across every `.await` (including the long-parked
+  socket read), so `anytls.session.recv` stayed on the worker thread's
+  current-span stack and unrelated connections' log lines were stamped
+  with it. The guard is gone; the spawn site now `.instrument()`s the
+  task instead, matching the server side. The same `enter()`-across-await
+  leak is removed from `handle_connection`'s `anytls.handshake` (folded
+  into the surrounding `anytls.connection` span, which now carries the
+  `tls_version`/`cipher_suite` fields), the per-stream `anytls.udp.proxy`
+  guard in `handle_udp_over_tcp`, and `SessionPool::cleanup_expired`.
+
 - **`meow -t` no longer performs real DNS bootstrap lookups** (issue
   #716). A `dns:` config with hostname-bearing upstreams
   (`nameserver: [udp://name]`, `tls://`/`https://`, hostname

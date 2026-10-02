@@ -121,8 +121,9 @@ pub async fn handle_udp_over_tcp(stream: Arc<Stream>) -> Result<()> {
         bytes_in = field::Empty,
         bytes_out = field::Empty
     );
-    let _udp_guard = udp_span.enter();
-
+    // Record-only span: callers run this inside the `anytls.stream.proxy`
+    // span; an Entered guard held across the awaits below would leak onto
+    // unrelated tasks sharing this worker thread.
     tracing::debug!("[UDP] Starting UDP over TCP proxy for stream {}", stream_id);
 
     let reader = stream.reader();

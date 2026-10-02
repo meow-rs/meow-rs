@@ -12,7 +12,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Notify, RwLock, mpsc};
 use tokio::time::{self, Duration, Instant, MissedTickBehavior};
-use tracing::{field, info_span};
+use tracing::{Instrument, Span, field, info_span};
 
 static SESSION_COUNTER: meow_common::atomic::AtomicU = meow_common::atomic::AtomicU::new(1);
 use tokio_util::codec::Decoder;
@@ -299,18 +299,13 @@ impl Session {
         Ok(())
     }
 
-    /// Start the receive loop (should be run in a tokio task)
+    /// Start the receive loop (should be run in a tokio task).
+    ///
+    /// Callers must wrap the future in `.instrument(span)` — holding an
+    /// `Entered` guard across `.await` leaks this span onto whatever task the
+    /// worker thread polls while this loop is parked.
     pub async fn recv_loop(&self) -> Result<()> {
         let session_id = self.id();
-        let role = if self.is_client { "client" } else { "server" };
-        let recv_span = info_span!(
-            "anytls.session.recv",
-            session_id,
-            role = %role,
-            bytes_in = field::Empty,
-            iterations = field::Empty
-        );
-        let _recv_guard = recv_span.enter();
         tracing::debug!(
             session_id = session_id,
             is_client = self.is_client,
@@ -455,8 +450,8 @@ impl Session {
             iterations = iteration,
             "[Session] recv_loop completed"
         );
-        recv_span.record("bytes_in", total_bytes_in as u64);
-        recv_span.record("iterations", iteration);
+        Span::current().record("bytes_in", total_bytes_in as u64);
+        Span::current().record("iterations", iteration);
         Ok(())
     }
 
@@ -1268,42 +1263,52 @@ impl Session {
 
         // Start receive loop in background
         let session = Arc::clone(&self);
-        tokio::spawn(async move {
-            tracing::debug!(
-                "[Session] recv_loop task spawned (client={})",
-                session.is_client
-            );
-            match session.recv_loop().await {
-                Ok(()) => {
-                    tracing::debug!("[Session] recv_loop task completed normally");
-                }
-                Err(AnyTlsError::Io(e)) => {
-                    // Check if this is a close_notify error (normal connection close)
-                    let error_msg = e.to_string();
-                    if error_msg.contains("close_notify")
-                        || error_msg.contains("unexpected EOF")
-                        || e.kind() == std::io::ErrorKind::UnexpectedEof
-                    {
-                        tracing::debug!(
-                            "[Session] recv_loop task ended: Connection closed by peer (no close_notify) - this is normal"
-                        );
-                    } else {
+        let recv_span = info_span!(
+            "anytls.session.recv",
+            session_id = session.id(),
+            role = "client",
+            bytes_in = field::Empty,
+            iterations = field::Empty
+        );
+        tokio::spawn(
+            async move {
+                tracing::debug!(
+                    "[Session] recv_loop task spawned (client={})",
+                    session.is_client
+                );
+                match session.recv_loop().await {
+                    Ok(()) => {
+                        tracing::debug!("[Session] recv_loop task completed normally");
+                    }
+                    Err(AnyTlsError::Io(e)) => {
+                        // Check if this is a close_notify error (normal connection close)
+                        let error_msg = e.to_string();
+                        if error_msg.contains("close_notify")
+                            || error_msg.contains("unexpected EOF")
+                            || e.kind() == std::io::ErrorKind::UnexpectedEof
+                        {
+                            tracing::debug!(
+                                "[Session] recv_loop task ended: Connection closed by peer (no close_notify) - this is normal"
+                            );
+                        } else {
+                            tracing::error!("[Session] recv_loop task error: {}", e);
+                        }
+                    }
+                    Err(AnyTlsError::SessionClosed) => {
+                        tracing::debug!("[Session] recv_loop task ended: Session closed");
+                    }
+                    Err(e) => {
                         tracing::error!("[Session] recv_loop task error: {}", e);
                     }
                 }
-                Err(AnyTlsError::SessionClosed) => {
-                    tracing::debug!("[Session] recv_loop task ended: Session closed");
-                }
-                Err(e) => {
-                    tracing::error!("[Session] recv_loop task error: {}", e);
-                }
+                // The read side is gone: mark the session closed so the pool stops
+                // handing it out, its writer half is shut down, and the heartbeat
+                // task exits — otherwise a server-closed session lingered in the
+                // pool (heartbeat keeping its socket open) and leaked its fd.
+                let _ = session.close().await;
             }
-            // The read side is gone: mark the session closed so the pool stops
-            // handing it out, its writer half is shut down, and the heartbeat
-            // task exits — otherwise a server-closed session lingered in the
-            // pool (heartbeat keeping its socket open) and leaked its fd.
-            let _ = session.close().await;
-        });
+            .instrument(recv_span),
+        );
 
         // Start stream data processing in background
         let session = Arc::clone(&self);

@@ -247,7 +247,8 @@ impl SessionPool {
             removed = field::Empty,
             remaining = field::Empty
         );
-        let _cleanup_guard = cleanup_span.enter();
+        // Record-only span — an Entered guard held across the awaits below
+        // would leak this span onto unrelated tasks on this worker thread.
         let mut to_remove = Vec::new();
         let mut active_count = 0;
 
