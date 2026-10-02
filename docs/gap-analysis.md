@@ -38,7 +38,7 @@ Upstream lives in `adapter/outbound/`. Current Rust adapters live in `crates/meo
 | ShadowsocksR    | Yes      | No        | **Gap** | Legacy; low priority |
 | Trojan          | Yes      | Yes       | OK      | Includes rustls TLS |
 | VMess           | Yes      | No        | **Excluded** | Dropped from M1 2026-04-11 — use VLESS. Spec preserved as design record. |
-| VLESS           | Yes      | No        | **Gap** | High priority; includes XTLS/Reality upstream |
+| VLESS           | Yes      | Yes       | OK      | Includes XTLS Vision and REALITY |
 | Snell           | Yes      | No        | **Gap** | Medium priority |
 | Hysteria v1     | Yes      | No        | **Gap** | Medium priority, QUIC-based |
 | Hysteria2       | Yes      | Yes       | OK      | QUIC via quiche (BoringSSL-native) |
@@ -48,7 +48,7 @@ Upstream lives in `adapter/outbound/`. Current Rust adapters live in `crates/meo
 | HTTP (outbound) | Yes      | No        | **Gap** | HTTP CONNECT outbound |
 | SOCKS5 (outbound)| Yes     | No        | **Gap** | SOCKS5 outbound |
 | anytls / mieru / trusttunnel / sudoku / masque | Yes | No | Low | Niche/new protocols — defer |
-| Reality (transport) | Yes  | No        | **Gap** | TLS spoofing — pairs with VLESS |
+| Reality (transport) | Yes  | Yes       | OK      | In-tree REALITY client; the ClientHello is shaped by `client-fingerprint` (chrome / firefox / safari / ios / edge / random) |
 | ECH (TLS)       | Yes      | No        | Gap     | Encrypted Client Hello — defer |
 
 ### Transports / plugins
@@ -76,7 +76,7 @@ Rust port currently supports:
 | restls           | Yes      | Yes (SS plugin, tls12/tls13) | OK |
 | jls              | Yes      | Yes (SS plugin) | OK |
 | kcptun           | Yes      | Yes (SS plugin, smux v1 only) | OK |
-| Reality          | Yes      | No   | **Gap** |
+| Reality          | Yes      | Yes  | OK |
 | simple-obfs      | Yes      | Yes  | OK |
 | SMUX / mux       | Yes      | Yes (`mux` feature: smux/yamux/h2mux/muxcool; `smux:`/`mux:` node option + gost-plugin single-stream; smux v1 also underlays kcptun) | OK |
 

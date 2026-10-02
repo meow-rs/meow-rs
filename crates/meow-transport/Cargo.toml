@@ -35,13 +35,16 @@ tls = [
 # manifests keep building. New code should enable `tls`.
 boring-tls = ["tls", "reality"]
 # reality: xray REALITY client handshake (issue #377). The record layer, the
-# X25519 / HKDF / AES-GCM crypto and the ClientHello builder are all in-tree
-# (`reality_tls.rs`) on top of the always-present aes-gcm/hmac/sha2 deps, so
-# this does not touch BoringSSL at all.
+# X25519 / HKDF / AEAD crypto and the browser-shaped ClientHello builder
+# (`reality_hello.rs`, issue #708) are all in-tree (`reality_tls.rs`) on top
+# of the always-present aes-gcm/hmac/sha2 deps; chacha20poly1305 covers the
+# third TLS 1.3 suite a browser hello offers. BoringSSL is used only to mint
+# the decoy P-256 key share of the `firefox` profile.
 reality = [
     "tls",
     "dep:rand",
     "dep:x25519-dalek",
+    "dep:chacha20poly1305",
 ]
 ws = [
     "dep:tokio-tungstenite",

@@ -473,6 +473,23 @@ the canonical, in-repo source a release is cut from.
   API on the `spin::Mutex` fallback. Also removes `parking_lot 0.11`,
   `parking_lot_core 0.8`, `redox_syscall 0.2`, and `bitflags 1.3`.
 
+- **REALITY honours `client-fingerprint`** — the REALITY ClientHello was a
+  fixed minimal shape (one cipher suite, nine extensions, no GREASE, no
+  padding) whatever `client-fingerprint` said, which made the handshake a
+  reliable "not a browser" signal and defeated the transport's cover. It is
+  now encoded from the selected uTLS profile — `chrome` (Chrome 120, with
+  per-connection extension shuffling, GREASE, ALPS and ECH GREASE),
+  `firefox`, `safari`, `ios`, `edge`, or `random` — matching the versions
+  the plain-TLS backend already parrots. REALITY is TLS 1.3-only, so
+  `android` and unknown names use `chrome` with a warning. Because a
+  browser hello offers all three TLS 1.3 suites, the REALITY record layer
+  now also completes `TLS_AES_256_GCM_SHA384` and
+  `TLS_CHACHA20_POLY1305_SHA256` (previously only AES-128-GCM), and a
+  server that selects a key-share group other than X25519 fails the
+  handshake loudly. Also fixed: a server flight that packs several
+  handshake messages into one TLS record stalled the handshake until the
+  10 s timeout (issue #708).
+
 - **Bracketed IPv6 `server:` fields now work end-to-end** (issue #701).
   `server: "[::1]"` used to delegate the dial as the literal string
   `"[::1]"` — an unresolvable "domain" — so both the direct and the

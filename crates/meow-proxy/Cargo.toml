@@ -112,7 +112,8 @@ tokio = { workspace = true, features = ["test-util"] }
 # Loopback anytls *server* for the integration tests (rustls-based, test-only).
 meow-anytls = { workspace = true, features = ["server"] }
 meow-trie = { workspace = true }
-meow-transport = { workspace = true, features = ["xhttp"] }
+# `reality`: the REALITY leg of `xray_server_docker_integration`.
+meow-transport = { workspace = true, features = ["xhttp", "reality"] }
 rcgen = "0.13"
 http = "1"
 tokio-rustls = { workspace = true }

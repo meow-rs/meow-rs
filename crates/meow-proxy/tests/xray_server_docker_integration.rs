@@ -8,8 +8,12 @@
 //! implementation.  The Vision leg pins the DIRECT switch to the raw socket
 //! under plain TLS (issue #495).
 //!
+//! The REALITY leg pins the browser-shaped ClientHello of every
+//! `client-fingerprint` profile to a real REALITY server (issue #708).
+//!
 //! Without Docker the tests skip; `MEOW_REQUIRE_DOCKER=1` (set in CI) turns
-//! a skip into a failure.
+//! a skip into a failure.  `XRAY_BIN` points the suite at a native Xray
+//! binary instead, which is the only way to run it off Linux.
 
 #![cfg(any(
     feature = "vmess",
@@ -146,26 +150,39 @@ fn extract_xray_binary(dir: &Path) -> Option<PathBuf> {
 
 /// Run Xray with a single `inbound` on `127.0.0.1:port` and a direct
 /// (`freedom`) outbound, and wait until it accepts TCP.
-async fn start_xray(port: u16, mut inbound: Value) -> Option<XrayServer> {
-    if !cfg!(target_os = "linux") {
-        skip_or_panic("test requires the Linux xray binary from the Docker image");
-        return None;
-    }
-    if !docker_available() {
-        skip_or_panic("docker daemon is not available");
-        return None;
-    }
+async fn start_xray(port: u16, inbound: Value) -> Option<XrayServer> {
+    start_xray_inbounds(vec![(port, inbound)]).await
+}
 
+/// [`start_xray`] with several inbounds, each on its own loopback port;
+/// waits for the first one.
+async fn start_xray_inbounds(mut inbounds: Vec<(u16, Value)>) -> Option<XrayServer> {
     let dir = TempDir::new().unwrap();
-    let Some(xray) = extract_xray_binary(dir.path()) else {
-        skip_or_panic(format!("failed to extract xray from {IMAGE_XRAY}"));
-        return None;
+    let xray = if let Some(bin) = std::env::var_os("XRAY_BIN") {
+        PathBuf::from(bin)
+    } else {
+        if !cfg!(target_os = "linux") {
+            skip_or_panic("test requires the Linux xray binary from the Docker image");
+            return None;
+        }
+        if !docker_available() {
+            skip_or_panic("docker daemon is not available");
+            return None;
+        }
+        let Some(xray) = extract_xray_binary(dir.path()) else {
+            skip_or_panic(format!("failed to extract xray from {IMAGE_XRAY}"));
+            return None;
+        };
+        xray
     };
-    inbound["listen"] = json!("127.0.0.1");
-    inbound["port"] = json!(port);
+    for (port, inbound) in &mut inbounds {
+        inbound["listen"] = json!("127.0.0.1");
+        inbound["port"] = json!(*port);
+    }
+    let port = inbounds[0].0;
     let config = json!({
         "log": { "loglevel": "warning" },
-        "inbounds": [inbound],
+        "inbounds": inbounds.into_iter().map(|(_, inbound)| inbound).collect::<Vec<_>>(),
         "outbounds": [{ "protocol": "freedom" }],
     });
     let config_path = dir.path().join("config.json");
@@ -466,8 +483,9 @@ mod vless_encryption {
 #[cfg(feature = "vless-vision")]
 mod vless_vision {
     use super::*;
+    use base64::Engine as _;
     use meow_proxy::{VlessAdapter, VlessFlow};
-    use meow_transport::tls::{TlsConfig, TlsLayer};
+    use meow_transport::tls::{RealityConfig, TlsConfig, TlsLayer};
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
     use std::sync::Mutex;
 
@@ -620,6 +638,106 @@ mod vless_vision {
             "XTLS Vision direct passthrough enabled",
         ] {
             assert!(logs.contains(event), "no `{event}` in client logs:\n{logs}");
+        }
+    }
+
+    /// RFC 7748 §6.1 X25519 key pair: the REALITY server's private key and
+    /// the public key the client pins.
+    const REALITY_PRIVATE_KEY: &str =
+        "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a";
+    const REALITY_PUBLIC_KEY: &str =
+        "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a";
+
+    /// Issue #708: the REALITY ClientHello is shaped by `client-fingerprint`
+    /// (cipher list, extension set and order, GREASE, padding) instead of a
+    /// fixed minimal hello.  Xray authenticates the client from a
+    /// `session_id` sealed with the *whole* hello as AAD, then picks the
+    /// cipher suite and key share out of what the profile offered — so a
+    /// round trip per profile proves the shaped hello is well-formed, that
+    /// shaping left the seal intact, and that the handshake completes on
+    /// whatever the server negotiates.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn vless_reality_every_fingerprint_profile_against_xray() {
+        let port = free_tcp_port();
+        // The cover site REALITY borrows its server flight from: a plain
+        // TLS inbound on the same Xray, i.e. Go's TLS 1.3 server, which
+        // frames the flight one handshake message per record like the
+        // sites REALITY is deployed in front of.
+        let cover_port = free_tcp_port();
+        let cover_cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let pem_lines = |pem: String| pem.lines().map(str::to_owned).collect::<Vec<_>>();
+        let cover = json!({
+            "protocol": "vless",
+            "settings": {
+                "clients": [{ "id": UUID }],
+                "decryption": "none",
+            },
+            "streamSettings": {
+                "network": "raw",
+                "security": "tls",
+                "tlsSettings": {
+                    "certificates": [{
+                        "certificate": pem_lines(cover_cert.cert.pem()),
+                        "key": pem_lines(cover_cert.key_pair.serialize_pem()),
+                    }],
+                },
+            },
+        });
+        let private_key = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(hex::decode(REALITY_PRIVATE_KEY).unwrap());
+        let inbound = json!({
+            "protocol": "vless",
+            "settings": {
+                "clients": [{ "id": UUID }],
+                "decryption": "none",
+            },
+            "streamSettings": {
+                "network": "raw",
+                "security": "reality",
+                "realitySettings": {
+                    "target": format!("127.0.0.1:{cover_port}"),
+                    "serverNames": ["localhost"],
+                    "privateKey": private_key,
+                    "shortIds": ["0123abcd"],
+                },
+            },
+        });
+        let Some(server) = start_xray_inbounds(vec![(port, inbound), (cover_port, cover)]).await
+        else {
+            return;
+        };
+        let (target, _target_h) = start_tcp_echo_server().await;
+
+        for (seed, fingerprint) in ["chrome", "firefox", "safari", "ios", "edge", "random"]
+            .into_iter()
+            .enumerate()
+        {
+            let tls = TlsConfig {
+                fingerprint: Some(fingerprint.into()),
+                reality: Some(RealityConfig {
+                    public_key: hex::decode(REALITY_PUBLIC_KEY).unwrap().try_into().unwrap(),
+                    short_id: [0x01, 0x23, 0xab, 0xcd, 0, 0, 0, 0],
+                    support_x25519_mlkem768: false,
+                }),
+                ..TlsConfig::new("localhost")
+            };
+            let mut chain = TransportChain::empty();
+            chain.push(Box::new(TlsLayer::new(&tls).expect("REALITY TLS layer")));
+            let adapter = VlessAdapter::new(
+                "docker-xray-vless-reality",
+                "127.0.0.1",
+                port,
+                uuid_bytes(),
+                None,
+                false,
+                chain,
+                Arc::new(DirectDialer),
+            );
+            let conn = timeout(T, adapter.dial_tcp(&metadata_for(target, Network::Tcp)))
+                .await
+                .unwrap_or_else(|_| panic!("{fingerprint}: dial timed out\n{}", server.logs()))
+                .unwrap_or_else(|e| panic!("{fingerprint}: dial failed: {e}\n{}", server.logs()));
+            bulk_echo(conn, &patterned(256 * 1024 + 13, seed as u8), &server).await;
         }
     }
 }

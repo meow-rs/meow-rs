@@ -10,16 +10,19 @@ use aes_gcm::{
     aead::{AeadInPlace, KeyInit},
     Aes128Gcm, Aes256Gcm, Nonce, Tag,
 };
+use chacha20poly1305::ChaCha20Poly1305;
 use hmac::{Hmac, Mac};
-use sha2::{Digest, Sha256, Sha512};
+use sha2::{Digest, Sha256, Sha384, Sha512};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::{
+    reality_hello::{build_client_hello, HelloParams, HelloProfile},
     tls::{RealityConfig, TlsConfig},
     Result, Stream, Transport, TransportError,
 };
 
 type HmacSha256 = Hmac<Sha256>;
+type HmacSha384 = Hmac<Sha384>;
 type HmacSha512 = Hmac<Sha512>;
 
 const TLS_RECORD_HANDSHAKE: u8 = 22;
@@ -27,6 +30,7 @@ const TLS_RECORD_APPLICATION_DATA: u8 = 23;
 const TLS_RECORD_ALERT: u8 = 21;
 const TLS_RECORD_CHANGE_CIPHER_SPEC: u8 = 20;
 
+#[cfg(test)]
 const HS_CLIENT_HELLO: u8 = 1;
 const HS_SERVER_HELLO: u8 = 2;
 const HS_NEW_SESSION_TICKET: u8 = 4;
@@ -36,6 +40,8 @@ const HS_CERTIFICATE_VERIFY: u8 = 15;
 const HS_FINISHED: u8 = 20;
 
 const TLS_AES_128_GCM_SHA256: u16 = 0x1301;
+const TLS_AES_256_GCM_SHA384: u16 = 0x1302;
+const TLS_CHACHA20_POLY1305_SHA256: u16 = 0x1303;
 
 const GROUP_X25519: u16 = 0x001d;
 
@@ -87,6 +93,9 @@ pub(crate) struct RealityTlsLayer {
     server_name: String,
     alpn: Vec<String>,
     reality: RealityConfig,
+    /// Browser the ClientHello imitates (`client-fingerprint`), resolved
+    /// once so a `random` pick stays stable for this proxy.
+    profile: HelloProfile,
 }
 
 impl RealityTlsLayer {
@@ -130,6 +139,7 @@ impl RealityTlsLayer {
             server_name,
             alpn: config.alpn.clone(),
             reality,
+            profile: HelloProfile::resolve(config.fingerprint.as_deref()),
         })
     }
 }
@@ -139,7 +149,13 @@ impl Transport for RealityTlsLayer {
     async fn connect(&self, inner: Box<dyn Stream>) -> Result<Box<dyn Stream>> {
         let state = tokio::time::timeout(
             REALITY_HANDSHAKE_TIMEOUT,
-            reality_handshake(inner, &self.server_name, &self.alpn, &self.reality),
+            reality_handshake(
+                inner,
+                &self.server_name,
+                &self.alpn,
+                &self.reality,
+                self.profile,
+            ),
         )
         .await
         .map_err(|_| {
@@ -162,6 +178,7 @@ async fn reality_handshake(
     server_name: &str,
     alpn: &[String],
     reality: &RealityConfig,
+    profile: HelloProfile,
 ) -> Result<RealityConnected> {
     let mut client_private = rand::random::<[u8; 32]>();
     clamp_x25519_private(&mut client_private);
@@ -176,6 +193,7 @@ async fn reality_handshake(
         &client_public,
         &auth_key,
         reality,
+        profile,
     )?;
     inner
         .write_all(&wrap_plain_record(TLS_RECORD_HANDSHAKE, &client_hello)?)
@@ -211,10 +229,17 @@ async fn reality_handshake(
     let server_finished;
 
     loop {
-        fill_decrypted_handshake(&mut inner, &mut server_hs, &mut handshake_buf).await?;
-        let msg = pop_handshake_message(&mut handshake_buf).ok_or_else(|| {
-            TransportError::Tls("Reality TLS: decrypted empty handshake record".into())
-        })?;
+        // A record may carry several handshake messages (RFC 8446 §5.1), so
+        // drain what is buffered before reading the next record.
+        let msg = match pop_handshake_message(&mut handshake_buf) {
+            Some(msg) => msg,
+            None => {
+                fill_decrypted_handshake(&mut inner, &mut server_hs, &mut handshake_buf).await?;
+                pop_handshake_message(&mut handshake_buf).ok_or_else(|| {
+                    TransportError::Tls("Reality TLS: decrypted empty handshake record".into())
+                })?
+            }
+        };
         match msg.typ {
             HS_ENCRYPTED_EXTENSIONS | HS_CERTIFICATE | HS_CERTIFICATE_VERIFY => {
                 flight.admit(&mut transcript, &msg)?;
@@ -229,7 +254,7 @@ async fn reality_handshake(
                     ));
                 }
                 server_finished = msg.raw;
-                verify_finished(&hs.server_secret, &transcript, &msg.body)?;
+                verify_finished(cipher.hash(), &hs.server_secret, &transcript, &msg.body)?;
                 break;
             }
             HS_NEW_SESSION_TICKET => {
@@ -257,7 +282,7 @@ async fn reality_handshake(
     transcript.extend_from_slice(&server_finished);
     let app = ApplicationKeys::derive(cipher, &hs.master_secret, &transcript);
 
-    let client_finished_body = finished_verify_data(&hs.client_secret, &transcript);
+    let client_finished_body = finished_verify_data(cipher.hash(), &hs.client_secret, &transcript);
     let mut client_finished = Vec::with_capacity(4 + client_finished_body.len());
     client_finished.push(HS_FINISHED);
     put_u24(client_finished_body.len(), &mut client_finished);
@@ -588,48 +613,20 @@ fn build_reality_client_hello(
     key_share: &[u8; 32],
     auth_key: &[u8; 32],
     reality: &RealityConfig,
+    profile: HelloProfile,
 ) -> Result<(Vec<u8>, [u8; 32])> {
-    let mut body = Vec::with_capacity(512);
-    body.extend_from_slice(&[0x03, 0x03]);
-    body.extend_from_slice(random);
-    body.push(32);
-    body.extend_from_slice(&[0u8; 32]);
-
-    let ciphers = [TLS_AES_128_GCM_SHA256];
-    put_u16((ciphers.len() * 2) as u16, &mut body);
-    for cipher in ciphers {
-        put_u16(cipher, &mut body);
-    }
-    body.extend_from_slice(&[1, 0]);
-
-    let mut exts = Vec::new();
-    push_ext(&mut exts, 0, &server_name_ext(server_name)?);
-    push_ext(
-        &mut exts,
-        10,
-        &u16_list_ext(&[GROUP_X25519, 0x0017, 0x0018]),
-    );
-    push_ext(&mut exts, 11, &[1, 0]);
-    push_ext(
-        &mut exts,
-        13,
-        &u16_list_ext(&[0x0807, 0x0403, 0x0804, 0x0805]),
-    );
-    if !alpn.is_empty() {
-        push_ext(&mut exts, 16, &alpn_ext(alpn)?);
-    }
-    push_ext(&mut exts, 35, &[]);
-    push_ext(&mut exts, 43, &[4, 0x03, 0x04, 0x03, 0x03]);
-    push_ext(&mut exts, 45, &[1, 1]);
-    push_ext(&mut exts, 51, &key_share_ext(key_share));
-
-    put_u16(exts.len() as u16, &mut body);
-    body.extend_from_slice(&exts);
-
-    let mut hello = Vec::with_capacity(4 + body.len());
-    hello.push(HS_CLIENT_HELLO);
-    put_u24(body.len(), &mut hello);
-    hello.extend_from_slice(&body);
+    // The hello comes back with a zeroed 32-byte session_id at [39..71];
+    // the seal below authenticates those exact bytes as AAD, so nothing
+    // but the session_id may change after this point.
+    let mut hello = build_client_hello(
+        profile,
+        &HelloParams {
+            server_name,
+            alpn,
+            random,
+            x25519_public: key_share,
+        },
+    )?;
 
     let auth_key = hkdf_sha256(auth_key, &hello[4 + 2..4 + 2 + 20], b"REALITY", 32);
     let mut aead_key = [0u8; 32];
@@ -670,66 +667,6 @@ fn build_reality_client_hello(
     }
     hello[39..71].copy_from_slice(&session_id);
     Ok((hello, aead_key))
-}
-
-fn server_name_ext(server_name: &str) -> Result<Vec<u8>> {
-    if server_name.len() > u16::MAX as usize {
-        return Err(TransportError::Config("SNI is too long".into()));
-    }
-    let mut name = Vec::new();
-    name.push(0);
-    put_u16(server_name.len() as u16, &mut name);
-    name.extend_from_slice(server_name.as_bytes());
-
-    let mut out = Vec::new();
-    put_u16(name.len() as u16, &mut out);
-    out.extend_from_slice(&name);
-    Ok(out)
-}
-
-fn alpn_ext(alpn: &[String]) -> Result<Vec<u8>> {
-    let mut list = Vec::new();
-    for protocol in alpn {
-        let bytes = protocol.as_bytes();
-        if bytes.len() > u8::MAX as usize {
-            return Err(TransportError::Config(format!(
-                "ALPN protocol id '{protocol}' is too long"
-            )));
-        }
-        list.push(bytes.len() as u8);
-        list.extend_from_slice(bytes);
-    }
-    let mut out = Vec::new();
-    put_u16(list.len() as u16, &mut out);
-    out.extend_from_slice(&list);
-    Ok(out)
-}
-
-fn u16_list_ext(values: &[u16]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(2 + values.len() * 2);
-    put_u16((values.len() * 2) as u16, &mut out);
-    for value in values {
-        put_u16(*value, &mut out);
-    }
-    out
-}
-
-fn key_share_ext(public_key: &[u8; 32]) -> Vec<u8> {
-    let mut entry = Vec::with_capacity(4 + public_key.len());
-    put_u16(GROUP_X25519, &mut entry);
-    put_u16(public_key.len() as u16, &mut entry);
-    entry.extend_from_slice(public_key);
-
-    let mut out = Vec::with_capacity(2 + entry.len());
-    put_u16(entry.len() as u16, &mut out);
-    out.extend_from_slice(&entry);
-    out
-}
-
-fn push_ext(out: &mut Vec<u8>, typ: u16, data: &[u8]) {
-    put_u16(typ, out);
-    put_u16(data.len() as u16, out);
-    out.extend_from_slice(data);
 }
 
 fn wrap_plain_record(typ: u8, payload: &[u8]) -> Result<Vec<u8>> {
@@ -898,11 +835,18 @@ fn parse_server_hello(raw: &[u8]) -> Result<ParsedServerHello> {
                     key_len = bytes.len(),
                     "Reality TLS ServerHello key_share"
                 );
-                if group == GROUP_X25519 && bytes.len() == 32 {
-                    let mut share = [0u8; 32];
-                    share.copy_from_slice(bytes);
-                    key_share = Some(share);
+                // The browser profiles advertise more groups than the
+                // handshake can complete; a peer that picks one of them
+                // must fail loudly, not degrade.
+                if group != GROUP_X25519 || bytes.len() != 32 {
+                    return Err(TransportError::Tls(format!(
+                        "Reality TLS: server selected key-share group 0x{group:04x}; \
+                         only X25519 is supported"
+                    )));
                 }
+                let mut share = [0u8; 32];
+                share.copy_from_slice(bytes);
+                key_share = Some(share);
             }
             _ => {}
         }
@@ -1128,15 +1072,66 @@ fn der_read<'a>(input: &'a [u8], pos: &mut usize) -> Option<DerNode<'a>> {
     Some(DerNode { tag, value })
 }
 
+/// Transcript hash / HKDF hash of a TLS 1.3 cipher suite.
+#[derive(Clone, Copy)]
+enum HashAlg {
+    Sha256,
+    Sha384,
+}
+
+impl HashAlg {
+    fn len(self) -> usize {
+        match self {
+            Self::Sha256 => 32,
+            Self::Sha384 => 48,
+        }
+    }
+
+    fn digest(self, data: &[u8]) -> Vec<u8> {
+        match self {
+            Self::Sha256 => Sha256::digest(data).to_vec(),
+            Self::Sha384 => Sha384::digest(data).to_vec(),
+        }
+    }
+
+    fn hmac(self, key: &[u8], parts: &[&[u8]]) -> Vec<u8> {
+        match self {
+            Self::Sha256 => {
+                let mut h =
+                    <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
+                for part in parts {
+                    h.update(part);
+                }
+                h.finalize().into_bytes().to_vec()
+            }
+            Self::Sha384 => {
+                let mut h =
+                    <HmacSha384 as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
+                for part in parts {
+                    h.update(part);
+                }
+                h.finalize().into_bytes().to_vec()
+            }
+        }
+    }
+}
+
+/// The three TLS 1.3 suites every browser profile offers; the server
+/// picks, so all of them have to complete (a Go peer without AES
+/// hardware prefers ChaCha20-Poly1305).
 #[derive(Clone, Copy)]
 enum CipherSuite {
     Aes128GcmSha256,
+    Aes256GcmSha384,
+    ChaCha20Poly1305Sha256,
 }
 
 impl CipherSuite {
     fn try_from(value: u16) -> Result<Self> {
         match value {
             TLS_AES_128_GCM_SHA256 => Ok(Self::Aes128GcmSha256),
+            TLS_AES_256_GCM_SHA384 => Ok(Self::Aes256GcmSha384),
+            TLS_CHACHA20_POLY1305_SHA256 => Ok(Self::ChaCha20Poly1305Sha256),
             other => Err(TransportError::Tls(format!(
                 "Reality TLS: unsupported cipher suite 0x{other:04x}"
             ))),
@@ -1146,6 +1141,14 @@ impl CipherSuite {
     fn key_len(self) -> usize {
         match self {
             Self::Aes128GcmSha256 => 16,
+            Self::Aes256GcmSha384 | Self::ChaCha20Poly1305Sha256 => 32,
+        }
+    }
+
+    fn hash(self) -> HashAlg {
+        match self {
+            Self::Aes128GcmSha256 | Self::ChaCha20Poly1305Sha256 => HashAlg::Sha256,
+            Self::Aes256GcmSha384 => HashAlg::Sha384,
         }
     }
 }
@@ -1153,23 +1156,26 @@ impl CipherSuite {
 struct HandshakeKeys {
     client: RecordKey,
     server: RecordKey,
-    client_secret: [u8; 32],
-    server_secret: [u8; 32],
-    master_secret: [u8; 32],
+    client_secret: Vec<u8>,
+    server_secret: Vec<u8>,
+    master_secret: Vec<u8>,
 }
 
 impl HandshakeKeys {
     fn derive(cipher: CipherSuite, shared_secret: &[u8; 32], transcript: &[u8]) -> Self {
-        let zero = [0u8; 32];
-        let empty_hash = Sha256::digest([]);
-        let early_secret = hkdf_extract(&zero, &zero);
-        let derived = derive_secret(&early_secret, b"derived", &empty_hash);
-        let handshake_secret = hkdf_extract(&derived, shared_secret);
-        let transcript_hash = Sha256::digest(transcript);
-        let client_secret = derive_secret(&handshake_secret, b"c hs traffic", &transcript_hash);
-        let server_secret = derive_secret(&handshake_secret, b"s hs traffic", &transcript_hash);
-        let derived = derive_secret(&handshake_secret, b"derived", &empty_hash);
-        let master_secret = hkdf_extract(&derived, &zero);
+        let hash = cipher.hash();
+        let zero = vec![0u8; hash.len()];
+        let empty_hash = hash.digest(&[]);
+        let early_secret = hkdf_extract(hash, &zero, &zero);
+        let derived = derive_secret(hash, &early_secret, b"derived", &empty_hash);
+        let handshake_secret = hkdf_extract(hash, &derived, shared_secret);
+        let transcript_hash = hash.digest(transcript);
+        let client_secret =
+            derive_secret(hash, &handshake_secret, b"c hs traffic", &transcript_hash);
+        let server_secret =
+            derive_secret(hash, &handshake_secret, b"s hs traffic", &transcript_hash);
+        let derived = derive_secret(hash, &handshake_secret, b"derived", &empty_hash);
+        let master_secret = hkdf_extract(hash, &derived, &zero);
         Self {
             client: RecordKey::new(cipher, &client_secret),
             server: RecordKey::new(cipher, &server_secret),
@@ -1186,10 +1192,11 @@ struct ApplicationKeys {
 }
 
 impl ApplicationKeys {
-    fn derive(cipher: CipherSuite, master_secret: &[u8; 32], transcript: &[u8]) -> Self {
-        let transcript_hash = Sha256::digest(transcript);
-        let client_secret = derive_secret(master_secret, b"c ap traffic", &transcript_hash);
-        let server_secret = derive_secret(master_secret, b"s ap traffic", &transcript_hash);
+    fn derive(cipher: CipherSuite, master_secret: &[u8], transcript: &[u8]) -> Self {
+        let hash = cipher.hash();
+        let transcript_hash = hash.digest(transcript);
+        let client_secret = derive_secret(hash, master_secret, b"c ap traffic", &transcript_hash);
+        let server_secret = derive_secret(hash, master_secret, b"s ap traffic", &transcript_hash);
         Self {
             client: RecordKey::new(cipher, &client_secret),
             server: RecordKey::new(cipher, &server_secret),
@@ -1199,6 +1206,8 @@ impl ApplicationKeys {
 
 enum AeadCipher {
     Aes128(Box<Aes128Gcm>),
+    Aes256(Box<Aes256Gcm>),
+    ChaCha20(Box<ChaCha20Poly1305>),
 }
 
 struct RecordKey {
@@ -1208,14 +1217,22 @@ struct RecordKey {
 }
 
 impl RecordKey {
-    fn new(cipher_suite: CipherSuite, secret: &[u8; 32]) -> Self {
-        let key = hkdf_expand_label(secret, b"key", &[], cipher_suite.key_len());
-        let iv = hkdf_expand_label(secret, b"iv", &[], 12);
+    /// `secret` is a traffic secret of the suite's hash length.
+    fn new(cipher_suite: CipherSuite, secret: &[u8]) -> Self {
+        let hash = cipher_suite.hash();
+        let key = hkdf_expand_label(hash, secret, b"key", &[], cipher_suite.key_len());
+        let iv = hkdf_expand_label(hash, secret, b"iv", &[], 12);
         let mut iv_arr = [0u8; 12];
         iv_arr.copy_from_slice(&iv);
         let cipher = match cipher_suite {
             CipherSuite::Aes128GcmSha256 => AeadCipher::Aes128(Box::new(
                 Aes128Gcm::new_from_slice(&key).expect("AES-128 key"),
+            )),
+            CipherSuite::Aes256GcmSha384 => AeadCipher::Aes256(Box::new(
+                Aes256Gcm::new_from_slice(&key).expect("AES-256 key"),
+            )),
+            CipherSuite::ChaCha20Poly1305Sha256 => AeadCipher::ChaCha20(Box::new(
+                ChaCha20Poly1305::new_from_slice(&key).expect("ChaCha20 key"),
             )),
         };
         Self {
@@ -1279,11 +1296,13 @@ impl RecordKey {
     }
 
     fn encrypt_detached(&self, nonce: &[u8; 12], aad: &[u8], body: &mut [u8]) -> Result<Tag> {
+        let nonce = Nonce::from_slice(nonce);
         match &self.cipher {
-            AeadCipher::Aes128(c) => c
-                .encrypt_in_place_detached(Nonce::from_slice(nonce), aad, body)
-                .map_err(|e| TransportError::Tls(format!("TLS AES-128-GCM encrypt: {e}"))),
+            AeadCipher::Aes128(c) => c.encrypt_in_place_detached(nonce, aad, body),
+            AeadCipher::Aes256(c) => c.encrypt_in_place_detached(nonce, aad, body),
+            AeadCipher::ChaCha20(c) => c.encrypt_in_place_detached(nonce, aad, body),
         }
+        .map_err(|e| TransportError::Tls(format!("TLS record encrypt: {e}")))
     }
 
     fn decrypt_detached(
@@ -1293,16 +1312,18 @@ impl RecordKey {
         body: &mut [u8],
         tag: &Tag,
     ) -> Result<()> {
+        let nonce = Nonce::from_slice(nonce);
         match &self.cipher {
-            AeadCipher::Aes128(c) => c
-                .decrypt_in_place_detached(Nonce::from_slice(nonce), aad, body, tag)
-                .map_err(|e| TransportError::Tls(format!("TLS AES-128-GCM decrypt: {e}"))),
+            AeadCipher::Aes128(c) => c.decrypt_in_place_detached(nonce, aad, body, tag),
+            AeadCipher::Aes256(c) => c.decrypt_in_place_detached(nonce, aad, body, tag),
+            AeadCipher::ChaCha20(c) => c.decrypt_in_place_detached(nonce, aad, body, tag),
         }
+        .map_err(|e| TransportError::Tls(format!("TLS record decrypt: {e}")))
     }
 }
 
-fn verify_finished(secret: &[u8; 32], transcript: &[u8], received: &[u8]) -> Result<()> {
-    let expected = finished_verify_data(secret, transcript);
+fn verify_finished(hash: HashAlg, secret: &[u8], transcript: &[u8], received: &[u8]) -> Result<()> {
+    let expected = finished_verify_data(hash, secret, transcript);
     if expected.as_slice() == received {
         Ok(())
     } else {
@@ -1312,22 +1333,22 @@ fn verify_finished(secret: &[u8; 32], transcript: &[u8], received: &[u8]) -> Res
     }
 }
 
-fn finished_verify_data(secret: &[u8; 32], transcript: &[u8]) -> Vec<u8> {
-    let finished_key = hkdf_expand_label(secret, b"finished", &[], 32);
-    let transcript_hash = Sha256::digest(transcript);
-    let mut h = <HmacSha256 as Mac>::new_from_slice(&finished_key).expect("HMAC key");
-    h.update(&transcript_hash);
-    h.finalize().into_bytes().to_vec()
+fn finished_verify_data(hash: HashAlg, secret: &[u8], transcript: &[u8]) -> Vec<u8> {
+    let finished_key = hkdf_expand_label(hash, secret, b"finished", &[], hash.len());
+    hash.hmac(&finished_key, &[&hash.digest(transcript)])
 }
 
-fn derive_secret(secret: &[u8; 32], label: &[u8], transcript_hash: &[u8]) -> [u8; 32] {
-    let expanded = hkdf_expand_label(secret, label, transcript_hash, 32);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&expanded);
-    out
+fn derive_secret(hash: HashAlg, secret: &[u8], label: &[u8], transcript_hash: &[u8]) -> Vec<u8> {
+    hkdf_expand_label(hash, secret, label, transcript_hash, hash.len())
 }
 
-fn hkdf_expand_label(secret: &[u8], label: &[u8], context: &[u8], len: usize) -> Vec<u8> {
+fn hkdf_expand_label(
+    hash: HashAlg,
+    secret: &[u8],
+    label: &[u8],
+    context: &[u8],
+    len: usize,
+) -> Vec<u8> {
     let mut info = Vec::with_capacity(2 + 1 + 6 + label.len() + 1 + context.len());
     put_u16(len as u16, &mut info);
     info.push((6 + label.len()) as u8);
@@ -1335,32 +1356,24 @@ fn hkdf_expand_label(secret: &[u8], label: &[u8], context: &[u8], len: usize) ->
     info.extend_from_slice(label);
     info.push(context.len() as u8);
     info.extend_from_slice(context);
-    hkdf_expand(secret, &info, len)
+    hkdf_expand(hash, secret, &info, len)
 }
 
 fn hkdf_sha256(secret: &[u8], salt: &[u8], info: &[u8], len: usize) -> Vec<u8> {
-    let prk = hkdf_extract(salt, secret);
-    hkdf_expand(&prk, info, len)
+    let prk = hkdf_extract(HashAlg::Sha256, salt, secret);
+    hkdf_expand(HashAlg::Sha256, &prk, info, len)
 }
 
-fn hkdf_extract(salt: &[u8], ikm: &[u8]) -> [u8; 32] {
-    let mut h = <HmacSha256 as Mac>::new_from_slice(salt).expect("HMAC accepts any key length");
-    h.update(ikm);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&h.finalize().into_bytes());
-    out
+fn hkdf_extract(hash: HashAlg, salt: &[u8], ikm: &[u8]) -> Vec<u8> {
+    hash.hmac(salt, &[ikm])
 }
 
-fn hkdf_expand(prk: &[u8], info: &[u8], len: usize) -> Vec<u8> {
+fn hkdf_expand(hash: HashAlg, prk: &[u8], info: &[u8], len: usize) -> Vec<u8> {
     let mut okm = Vec::with_capacity(len);
     let mut previous = Vec::new();
     let mut counter = 1u8;
     while okm.len() < len {
-        let mut h = <HmacSha256 as Mac>::new_from_slice(prk).expect("HMAC accepts any key length");
-        h.update(&previous);
-        h.update(info);
-        h.update(&[counter]);
-        previous = h.finalize().into_bytes().to_vec();
+        previous = hash.hmac(prk, &[&previous, info, &[counter]]);
         okm.extend_from_slice(&previous);
         counter = counter.checked_add(1).expect("HKDF output too long");
     }
@@ -1456,6 +1469,7 @@ mod tests {
             &client_public,
             &auth_key,
             &reality,
+            HelloProfile::Chrome,
         )
         .expect("client hello");
         assert_eq!(hello[0], HS_CLIENT_HELLO);
@@ -1466,7 +1480,7 @@ mod tests {
     #[test]
     fn hkdf_expand_label_finished_len() {
         let secret = [1u8; 32];
-        let out = hkdf_expand_label(&secret, b"finished", &[], 32);
+        let out = hkdf_expand_label(HashAlg::Sha256, &secret, b"finished", &[], 32);
         assert_eq!(out.len(), 32);
     }
 
@@ -1773,6 +1787,7 @@ mod tests {
             &client_public,
             &auth_key,
             &reality,
+            HelloProfile::Chrome,
         )
         .expect("client hello");
 
@@ -2087,12 +2102,20 @@ mod tests {
             let data = &client_hello[pos + 4..pos + 4 + len];
             if typ == 51 {
                 // ClientHello key_share carries a 2-byte list length, then
-                // one KeyShareEntry (group u16, len u16, key bytes).
-                let group = u16::from_be_bytes([data[2], data[3]]);
-                assert_eq!(group, GROUP_X25519, "test only supports X25519");
-                let mut key = [0u8; 32];
-                key.copy_from_slice(&data[6..38]);
-                return key;
+                // KeyShareEntry items (group u16, len u16, key bytes); a
+                // browser profile may put a GREASE entry ahead of X25519.
+                let mut p = 2;
+                while p < data.len() {
+                    let group = u16::from_be_bytes([data[p], data[p + 1]]);
+                    let klen = u16::from_be_bytes([data[p + 2], data[p + 3]]) as usize;
+                    if group == GROUP_X25519 {
+                        let mut key = [0u8; 32];
+                        key.copy_from_slice(&data[p + 4..p + 4 + klen]);
+                        return key;
+                    }
+                    p += 4 + klen;
+                }
+                panic!("key_share carried no X25519 entry");
             }
             pos += 4 + len;
         }
@@ -2103,13 +2126,27 @@ mod tests {
     /// `session_id`, negotiates `TLS_AES_128_GCM_SHA256`, and carries an
     /// unwrapped (server-style) X25519 `key_share`. Matches what
     /// `parse_server_hello` expects.
+    fn push_ext(out: &mut Vec<u8>, typ: u16, data: &[u8]) {
+        put_u16(typ, out);
+        put_u16(data.len() as u16, out);
+        out.extend_from_slice(data);
+    }
+
     fn build_fake_server_hello(session_id: &[u8], server_public: &[u8; 32]) -> Vec<u8> {
+        build_fake_server_hello_with(session_id, server_public, TLS_AES_128_GCM_SHA256)
+    }
+
+    fn build_fake_server_hello_with(
+        session_id: &[u8],
+        server_public: &[u8; 32],
+        cipher_suite: u16,
+    ) -> Vec<u8> {
         let mut body = Vec::new();
         body.extend_from_slice(&[0x03, 0x03]);
         body.extend_from_slice(&[0xAAu8; 32]); // random; must not be the HRR magic
         body.push(session_id.len() as u8);
         body.extend_from_slice(session_id);
-        put_u16(TLS_AES_128_GCM_SHA256, &mut body);
+        put_u16(cipher_suite, &mut body);
         body.push(0); // compression
 
         let mut exts = Vec::new();
@@ -2210,7 +2247,13 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(10),
-            reality_handshake(Box::new(client_io), "example.com", &[], &reality),
+            reality_handshake(
+                Box::new(client_io),
+                "example.com",
+                &[],
+                &reality,
+                HelloProfile::Chrome,
+            ),
         )
         .await
         .expect("handshake must not hang while the flood is rejected");
@@ -2222,6 +2265,165 @@ mod tests {
             matches!(&err, TransportError::Tls(msg) if msg.contains("unexpected EncryptedExtensions")),
             "unexpected error: {err:?}"
         );
+
+        server_task.await.expect("server task must not panic");
+    }
+
+    /// A complete REALITY handshake against an in-memory server, once per
+    /// (browser profile, TLS 1.3 suite) pair.  The server authenticates the
+    /// client the way Xray does — opening the `session_id` with the whole
+    /// shaped hello as AAD — negotiates the given suite, and sends its
+    /// flight as **one** record (RFC 8446 §5.1 lets handshake messages
+    /// share a record), then both sides exchange application data.
+    ///
+    /// Covers what a real peer on this host cannot: a browser hello offers
+    /// AES-256-GCM-SHA384 and ChaCha20-Poly1305 too, and which one a
+    /// server picks depends on its hardware, so each must complete.
+    #[tokio::test]
+    async fn reality_handshake_completes_for_every_profile_and_suite() {
+        let profiles = [
+            HelloProfile::Chrome,
+            HelloProfile::Firefox,
+            HelloProfile::Safari,
+            HelloProfile::Ios,
+            HelloProfile::Edge,
+        ];
+        let suites = [
+            TLS_AES_128_GCM_SHA256,
+            TLS_AES_256_GCM_SHA384,
+            TLS_CHACHA20_POLY1305_SHA256,
+        ];
+        for profile in profiles {
+            for suite in suites {
+                full_handshake_round_trip(profile, suite).await;
+            }
+        }
+    }
+
+    async fn full_handshake_round_trip(profile: HelloProfile, suite: u16) {
+        let (client_io, mut server_io) = tokio::io::duplex(1024 * 1024);
+
+        let mut reality_private = [0x5au8; 32];
+        clamp_x25519_private(&mut reality_private);
+        let short_id = [1, 2, 3, 4, 5, 6, 7, 8];
+        let reality = RealityConfig {
+            public_key: x25519_public_from_private(&reality_private),
+            short_id,
+            support_x25519_mlkem768: false,
+        };
+
+        let server_task = tokio::spawn(async move {
+            let client_hello = read_record(&mut server_io)
+                .await
+                .expect("read ClientHello")
+                .expect("ClientHello present")
+                .payload;
+            let client_public = extract_client_key_share(&client_hello);
+
+            // Authenticate like a REALITY server: AuthKey from the static
+            // key and the client's share, session_id opened with the hello
+            // (session_id zeroed) as AAD.
+            let shared = x25519(&reality_private, &client_public).expect("auth ECDH");
+            let auth_key = hkdf_sha256(&shared, &client_hello[6..26], b"REALITY", 32);
+            let mut aad = client_hello.clone();
+            aad[39..71].fill(0);
+            let (sealed, tag) = client_hello[39..71].split_at(16);
+            let mut plain = sealed.to_vec();
+            Aes256Gcm::new_from_slice(&auth_key)
+                .unwrap()
+                .decrypt_in_place_detached(
+                    Nonce::from_slice(&client_hello[26..38]),
+                    &aad,
+                    &mut plain,
+                    Tag::from_slice(tag),
+                )
+                .expect("session_id must open with the shaped hello as AAD");
+            assert_eq!(&plain[8..16], &short_id);
+
+            let mut eph_private = rand::random::<[u8; 32]>();
+            clamp_x25519_private(&mut eph_private);
+            let shared_secret = x25519(&eph_private, &client_public).expect("ECDH");
+            let server_hello = build_fake_server_hello_with(
+                &client_hello[39..71],
+                &x25519_public_from_private(&eph_private),
+                suite,
+            );
+            server_io
+                .write_all(&wrap_plain_record(TLS_RECORD_HANDSHAKE, &server_hello).unwrap())
+                .await
+                .unwrap();
+
+            let cipher = CipherSuite::try_from(suite).unwrap();
+            let mut transcript = client_hello.clone();
+            transcript.extend_from_slice(&server_hello);
+            let hs = HandshakeKeys::derive(cipher, &shared_secret, &transcript);
+            let (mut server_hs, mut client_hs) = (hs.server, hs.client);
+
+            let cert_pubkey = [0x22u8; 32];
+            let cert =
+                build_test_ed25519_cert(&cert_pubkey, &reality_cert_hmac(&auth_key, &cert_pubkey));
+            let mut cert_body = vec![0]; // certificate_request_context
+            put_u24(cert.len() + 5, &mut cert_body);
+            put_u24(cert.len(), &mut cert_body);
+            cert_body.extend_from_slice(&cert);
+            cert_body.extend_from_slice(&[0, 0]); // no entry extensions
+
+            let mut flight = Vec::new();
+            for (typ, body) in [
+                (HS_ENCRYPTED_EXTENSIONS, vec![0, 0]),
+                (HS_CERTIFICATE, cert_body),
+                (HS_CERTIFICATE_VERIFY, vec![0x08, 0x07, 0, 0]),
+            ] {
+                flight.extend_from_slice(&handshake_message(typ, body).raw);
+            }
+            transcript.extend_from_slice(&flight);
+            let verify_data = finished_verify_data(cipher.hash(), &hs.server_secret, &transcript);
+            let finished = handshake_message(HS_FINISHED, verify_data).raw;
+            flight.extend_from_slice(&finished);
+            transcript.extend_from_slice(&finished);
+            server_io
+                .write_all(&server_hs.seal(TLS_RECORD_HANDSHAKE, &flight).unwrap())
+                .await
+                .unwrap();
+
+            let record = read_record(&mut server_io).await.unwrap().unwrap();
+            let (typ, client_finished) = client_hs.open(&record.header, &record.payload).unwrap();
+            assert_eq!(typ, TLS_RECORD_HANDSHAKE);
+            assert_eq!(
+                client_finished[4..],
+                finished_verify_data(cipher.hash(), &hs.client_secret, &transcript)
+            );
+
+            let mut app = ApplicationKeys::derive(cipher, &hs.master_secret, &transcript);
+            let record = read_record(&mut server_io).await.unwrap().unwrap();
+            let (typ, ping) = app.client.open(&record.header, &record.payload).unwrap();
+            assert_eq!(
+                (typ, ping.as_slice()),
+                (TLS_RECORD_APPLICATION_DATA, &b"ping"[..])
+            );
+            server_io
+                .write_all(
+                    &app.server
+                        .seal(TLS_RECORD_APPLICATION_DATA, b"pong")
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+        });
+
+        let state = tokio::time::timeout(
+            Duration::from_secs(10),
+            reality_handshake(Box::new(client_io), "example.com", &[], &reality, profile),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{profile:?} / 0x{suite:04x}: handshake hung"))
+        .unwrap_or_else(|e| panic!("{profile:?} / 0x{suite:04x}: {e}"));
+        let mut stream = spawn_reality_stream(state);
+        stream.write_all(b"ping").await.unwrap();
+        stream.flush().await.unwrap();
+        let mut pong = [0u8; 4];
+        stream.read_exact(&mut pong).await.unwrap();
+        assert_eq!(&pong, b"pong", "{profile:?} / 0x{suite:04x}");
 
         server_task.await.expect("server task must not panic");
     }

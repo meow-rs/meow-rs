@@ -39,6 +39,8 @@ mod error;
 pub mod tls;
 
 #[cfg(all(feature = "tls", feature = "reality"))]
+mod reality_hello;
+#[cfg(all(feature = "tls", feature = "reality"))]
 mod reality_tls;
 
 #[cfg(feature = "ws")]

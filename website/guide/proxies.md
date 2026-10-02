@@ -242,7 +242,7 @@ The most feature-rich protocol: TLS, REALITY, XTLS-Vision flow, and five transpo
 | `skip-cert-verify` | bool | | `false` | |
 | `alpn` | list | | `[]` | e.g. `[h2, http/1.1]` |
 | `network` | string | | `tcp` | `tcp` · `ws` · `grpc` · `h2` · `httpupgrade` |
-| `client-fingerprint` | string | | — | uTLS profile (required for REALITY) |
+| `client-fingerprint` | string | | — | uTLS profile (required for REALITY, where it shapes the ClientHello — see below) |
 | `flow` | string | | — | `xtls-rprx-vision` (needs `network: tcp` + TLS or REALITY, and the `vless-vision` feature) |
 | `encryption` | string | | `none` | Must be `none`/empty |
 | `reality-opts` | map | | — | REALITY config (see below) |
@@ -426,8 +426,13 @@ A configurable direct outbound. Useful to pin specific DNS servers for a route.
 
 Across the TLS-capable protocols meow-rs supports:
 
-- **rustls** by default; **BoringSSL** optionally (`boring-tls`) for ECH.
+- **BoringSSL** is the TLS backend for every protocol.
 - **uTLS fingerprinting** via `client-fingerprint` — Chrome, Firefox, Safari, iOS,
   Android, Edge — to evade TLS fingerprint detection.
-- **REALITY** for VLESS (see above).
+- **REALITY** for VLESS (see above). Its ClientHello follows `client-fingerprint`
+  too: `chrome` (Chrome 120), `firefox` (Firefox 120), `safari` (Safari 16),
+  `ios` (iOS 14), `edge` (Edge 85) or `random` set the cipher list, extension
+  set and order, GREASE and padding. REALITY is TLS 1.3-only, so `android`
+  (OkHttp's TLS 1.2 hello) and any other name fall back to `chrome` with a
+  warning.
 - **ECH (Encrypted Client Hello)** with DNS-sourced configs (HTTPS/SVCB records).
