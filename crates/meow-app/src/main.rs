@@ -522,8 +522,37 @@ fn run_application_inner(
         // `tun.auto-route: global` config needs its outbound-interface
         // binding in place before the first of those sockets exists
         // (issue #695) — see `preinstall_global_route_binding`.
-        let mut config = if let Some(ref cs) = args.config_string {
-            let raw = parse_config_string(cs)?;
+        let raw = if let Some(ref cs) = args.config_string {
+            parse_config_string(cs)?
+        } else {
+            meow_config::load_raw_config(&config_path).await?
+        };
+
+        // `log-level:` is the deployment's stated level — apply it to the
+        // reloadable filter before build_config so parse/provider warnings
+        // are already at the configured level, matching mihomo's
+        // parseGeneral → SetLogLevel ordering (issue #729: the field was
+        // parsed but never applied, so a configured `debug` silently ran
+        // at `info` until a PATCH). An explicit `RUST_LOG` wins: env is
+        // the operator override, config is the baseline.
+        if std::env::var_os("RUST_LOG").is_none() {
+            let level = raw.log_level.as_deref().unwrap_or("info");
+            // Whitelist before reload: an invalid string would reach
+            // EnvFilter as a `target=TRACE` directive and silence all
+            // logging instead of erroring (same set PATCH enforces).
+            if meow_api::log_stream::is_valid_log_level(level) {
+                if let Err(e) = meow_api::log_stream::reload_log_level(level) {
+                    warn!("failed to apply log-level '{level}': {e}");
+                }
+            } else {
+                warn!(
+                    "unknown log-level '{level}' — keeping current filter \
+                     (expected one of: debug, info, warning, warn, error, silent)"
+                );
+            }
+        }
+
+        let mut config = if args.config_string.is_some() {
             early_binding = preinstall_global_route_binding(&raw);
             let config = meow_config::build_config(raw, None)
                 .await
@@ -531,7 +560,6 @@ fn run_application_inner(
             info!("Config loaded from --config-string");
             config
         } else {
-            let raw = meow_config::load_raw_config(&config_path).await?;
             early_binding = preinstall_global_route_binding(&raw);
             let cache_dir = meow_config::resource_cache_dir_for_config_path(&config_path);
             let config = meow_config::build_config(raw, Some(cache_dir.as_path())).await?;

@@ -521,6 +521,23 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **`log-level:` in the config file now applies at startup** (issue #729).
+  The field was parsed into `Config` and echoed by `GET /configs`, but the
+  tracing filter was only ever built from `RUST_LOG` (defaulting to
+  `info`) — a configured `log-level: debug` produced INFO-only output
+  until a runtime `PATCH /configs` set it, and the PATCH was lost on every
+  restart. The configured level is now applied once the raw config is
+  loaded — before `build_config`, so parse/provider diagnostics already
+  respect it — and `PUT /configs` applies the level when the committed
+  document actually changes it, so `GET /configs` can no longer echo a
+  level the process isn't running (unchanged-value commits — e.g. rules
+  or subscription edits — leave a `RUST_LOG` override alone).
+  An explicitly set `RUST_LOG` still takes precedence at startup as the
+  operator override. Values are whitelisted to the accepted level names
+  (the same set `PATCH` enforces) — a typo warns and keeps the current
+  filter instead of reaching `EnvFilter`, where a bare word parses as a
+  `target=TRACE` directive and would silence all logging.
+
 - **XTLS Vision: a padded-mode FIN is no longer misreported as a relay
   error.** Vision has no end-of-stream frame — a peer that is done simply
   closes the transport, possibly while the downlink is still padded — and

@@ -20,6 +20,19 @@ pub fn reload_log_level(level: &str) -> Result<(), String> {
     }
 }
 
+/// The `log-level` values meow accepts (mihomo names — `warning`/`silent`
+/// are normalized to `warn`/`off` by the filter's caller). Shared by the
+/// PATCH whitelist and the startup `log-level:` application so a typo can
+/// never reach `EnvFilter::new`, which would parse a bare word as a
+/// `target=TRACE` directive and blackhole all logging instead of erroring
+/// (issue #729).
+pub fn is_valid_log_level(level: &str) -> bool {
+    matches!(
+        level.to_ascii_lowercase().as_str(),
+        "debug" | "info" | "warning" | "warn" | "error" | "silent"
+    )
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum LogLevel {
     Debug,
@@ -164,6 +177,19 @@ mod tests {
         assert_eq!(parse_log_level(""), LogLevel::Info);
         assert_eq!(parse_log_level("nonsense"), LogLevel::Info);
         assert_eq!(parse_log_level("trace"), LogLevel::Info);
+    }
+
+    #[test]
+    fn is_valid_log_level_whitelists_only_levels() {
+        for s in ["debug", "info", "warning", "warn", "error", "silent"] {
+            assert!(is_valid_log_level(s), "{s}");
+            assert!(is_valid_log_level(&s.to_uppercase()), "{s} upper");
+        }
+        // A bare word must never reach EnvFilter — it parses as a
+        // `target=TRACE` directive and blackholes all logging (#729).
+        for s in ["debg", "trace", "", "meow_tunnel=debug", " a "] {
+            assert!(!is_valid_log_level(s), "{s}");
+        }
     }
 
     #[test]

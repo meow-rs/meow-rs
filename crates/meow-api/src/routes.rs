@@ -701,10 +701,7 @@ async fn update_configs(
         return msg_err(StatusCode::BAD_REQUEST, "Body invalid");
     }
     if let Some(ref level) = body.log_level {
-        if !matches!(
-            level.to_ascii_lowercase().as_str(),
-            "debug" | "info" | "warning" | "warn" | "error" | "silent"
-        ) {
+        if !crate::log_stream::is_valid_log_level(level) {
             return msg_err(StatusCode::BAD_REQUEST, "Body invalid");
         }
     }
@@ -2544,7 +2541,7 @@ async fn swap_config_and_reconcile_tun(
     // Snapshot the candidate (only on an off→on transition, before it is
     // moved into the lock) so the parking_lot write guard — which is
     // !Send — is dropped before the first .await below.
-    let (old_enable, tun_changed, snapshot, specs) = {
+    let (old_enable, tun_changed, snapshot, specs, new_log_level) = {
         let mut guard = state.raw_config.write();
         let old = guard.tun.as_ref().is_some_and(|t| t.enable);
         // Semantic diff (issue #543): compare the PARSED `TunConfig`s so
@@ -2583,9 +2580,34 @@ async fn swap_config_and_reconcile_tun(
         let specs = meow_config::extract_health_check_specs(
             candidate.proxy_groups.as_deref().unwrap_or(&[]),
         );
+        // Same for `log-level`: a full-config PUT commits raw.log_level
+        // (GET /configs echoes it) — apply it so reported and effective
+        // level can't diverge (issue #729). PATCH semantics: an explicit
+        // PUT is an operator override, so RUST_LOG does not gate it.
+        // Gated on the value actually changing: the warm-mutation callers
+        // (rules/groups/subscriptions) clone the committed raw and can
+        // never alter log_level, so they must not re-assert it — that
+        // would silently undo a RUST_LOG override mid-session (issue #729
+        // review).
+        let new_log_level =
+            (guard.log_level != candidate.log_level).then(|| candidate.log_level.clone());
         *guard = candidate;
-        (old, tun_changed, snapshot, specs)
+        (old, tun_changed, snapshot, specs, new_log_level)
     };
+
+    if let Some(new_log_level) = new_log_level {
+        let level = new_log_level.as_deref().unwrap_or("info");
+        if crate::log_stream::is_valid_log_level(level) {
+            if let Err(e) = crate::log_stream::reload_log_level(level) {
+                warn!("failed to apply log-level '{level}': {e}");
+            }
+        } else {
+            warn!(
+                "unknown log-level '{level}' in PUT /configs — keeping current \
+                 filter (expected one of: debug, info, warning, warn, error, silent)"
+            );
+        }
+    }
 
     // Reconcile health-check tasks with the committed proxy-group section
     // — groups added get a check, removed abort, changed specs respawn

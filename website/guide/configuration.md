@@ -20,7 +20,7 @@ Use it as a pre-flight check.
 | `bind-address` | string | `127.0.0.1` | Default bind address for listeners |
 | `allow-lan` | bool | `false` | Accept connections from non-loopback addresses |
 | `mode` | string | `rule` | Tunnel mode: `rule`, `global`, or `direct` |
-| `log-level` | string | `info` | `trace` · `debug` · `info` · `warn` · `error` · `off` |
+| `log-level` | string | `info` | `debug` · `info` · `warning`/`warn` · `error` · `silent` |
 | `ipv6` | bool | `false` | Enable IPv6 (AAAA) resolution |
 | `strict` | bool | `false` | Fail on unparseable entries instead of warn-and-skip |
 | `external-controller` | string | — | REST API listen address, e.g. `127.0.0.1:9090` |

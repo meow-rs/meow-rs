@@ -25,8 +25,9 @@ cargo build --release
 
 ### Logging
 
-The console log level comes from `RUST_LOG` (default `info`); the config's `log-level`
-sets the default too. The WebSocket `/logs` stream always carries full detail and is
+The config's `log-level` sets the console/file level at startup (default `info`).
+An explicitly set `RUST_LOG` overrides it, and `PATCH /configs` can change it at
+runtime. The WebSocket `/logs` stream always carries full detail and is
 filtered client-side via `?level=`.
 
 ## Run as a service
