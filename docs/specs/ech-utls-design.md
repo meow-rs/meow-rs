@@ -1,6 +1,8 @@
 # Design: boring-based TLS backend for ECH + uTLS fingerprinting
 
-**Status:** Draft — awaiting greenlight  
+**Status:** Implemented — historical design plan. Version numbers below are
+as of drafting; the shipped workspace uses `boring`/`tokio-boring` 5.2 with
+quiche 0.30 (#572). Current state: [ech-utls-status.md](ech-utls-status.md).  
 **Author:** dev  
 **Date:** 2026-04-12  
 **Tracking:** issue #32 (fingerprint stub), related to transport-layer.md  
