@@ -8,6 +8,14 @@ the canonical, in-repo source a release is cut from.
 
 ## [Unreleased]
 
+### Added
+
+- **OpenWrt x86_64 packages** (issue #725): releases and alpha prereleases
+  now ship `meow` `.ipk` and `.apk` packages for OpenWrt's x86/64 target
+  (architecture `x86_64`), built from the existing static
+  `x86_64-unknown-linux-musl` binary, so `luci-app-meow` can be installed on
+  x86 OpenWrt.
+
 ## [0.22.0] - 2026-10-03
 
 ### Added

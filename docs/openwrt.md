@@ -1,14 +1,15 @@
 # meow on OpenWrt
 
 Official `.ipk` (opkg) and `.apk` (apk-tools v3, OpenWrt 25.12+) packages for
-aarch64 OpenWrt devices are attached to every
+aarch64 and x86_64 OpenWrt devices are attached to every
 [GitHub release](https://github.com/madeye/meow-rs/releases) (issues
 [#284](https://github.com/madeye/meow-rs/issues/284) and
-[#466](https://github.com/madeye/meow-rs/issues/466)):
+[#466](https://github.com/madeye/meow-rs/issues/466); x86_64 since
+[#725](https://github.com/meow-rs/meow-rs/issues/725)):
 
 | Package | Architectures |
 |---------|---------------|
-| `meow_<ver>_<arch>.ipk` | `aarch64_generic`, `aarch64_cortex-a53`, `aarch64_cortex-a72`, `aarch64_cortex-a76` |
+| `meow_<ver>_<arch>.ipk` | `aarch64_generic`, `aarch64_cortex-a53`, `aarch64_cortex-a72`, `aarch64_cortex-a76`, `x86_64` |
 | `luci-app-meow_<ver>_all.ipk` | any (LuCI app, architecture-independent) |
 | `meow_<ver>-r1_<arch>.apk` | same architectures as the ipk |
 | `luci-app-meow_<ver>-r1_all.apk` | any (LuCI app, architecture-independent) |
@@ -20,7 +21,8 @@ apk spells the package revision `-rN` where opkg uses `-N`.
 The binaries are fully static musl builds, so they have no library
 dependencies beyond OpenWrt's base system. All aarch64 packages contain
 the same `aarch64` binary — only the opkg `Architecture:` label differs so
-that `opkg` accepts the package on your device.
+that `opkg` accepts the package on your device. The `x86_64` package is for
+OpenWrt's x86/64 target (VMs and mini-PCs).
 
 Rolling alpha `.ipk`s and `.apk`s from `main` are published on the
 [`Prerelease-Alpha`](https://github.com/madeye/meow-rs/releases/tag/Prerelease-Alpha)

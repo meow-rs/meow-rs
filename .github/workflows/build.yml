@@ -60,6 +60,9 @@ jobs:
             # x86_64: informational only, no size gate
             minimal_budget_bytes: 0
             minimal_soft_gate: true
+            # OpenWrt x86/64 (VMs, mini-PCs) uses the plain `x86_64` label
+            # (#725).
+            openwrt_archs: x86_64
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-latest
             # aarch64: hard gate — release fails if minimal binary exceeds 8 MiB
