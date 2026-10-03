@@ -8,6 +8,18 @@ the canonical, in-repo source a release is cut from.
 
 ## [Unreleased]
 
+### Added
+
+- **release-plz release automation** (`release-plz.toml`,
+  `.github/workflows/release-plz.yml`). Every push to `main` refreshes a
+  standing `chore(release): X.Y.Z` PR that bumps the workspace version, the
+  `[workspace.dependencies]` pins, `meow-anytls` and `Cargo.lock`. Merging it
+  pushes the single `vX.Y.Z` tag and calls `publish.yml` (crates.io) and
+  `release.yml` (GitHub release), which also gained a `workflow_call`
+  trigger taking `release_tag`. `CHANGELOG.md` stays hand-curated: a check on
+  the release PR fails until `## [X.Y.Z]` exists. The manual flow remains as a
+  fallback; setup and steps are in `docs/RELEASING.md`.
+
 ## [0.22.0] - 2026-10-03
 
 ### Added

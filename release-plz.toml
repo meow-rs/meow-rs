@@ -1,0 +1,46 @@
+# release-plz configuration (https://release-plz.dev/docs/config).
+#
+# release-plz only *prepares* releases here: it keeps a standing
+# `chore(release): X.Y.Z` PR that bumps the shared workspace version, the
+# `[workspace.dependencies]` pins, `meow-anytls` and `Cargo.lock`, and, once
+# that PR is merged, pushes the single `vX.Y.Z` tag. Publishing to crates.io
+# (publish.yml, dependency-ordered) and the GitHub release with binaries
+# (release.yml) stay in their existing workflows, which
+# `.github/workflows/release-plz.yml` calls after tagging. See
+# docs/RELEASING.md.
+
+[workspace]
+# CHANGELOG.md is curated by hand: the maintainer cuts `## [Unreleased]`
+# into the new version on the release PR branch before merging.
+changelog_update = false
+# publish.yml owns `cargo publish` (fixed order incl. dev-dependency edges).
+publish = false
+# release.yml creates the GitHub release, with binaries and packages.
+git_release_enable = false
+# One tag per release, on meow-app (below); never `<crate>-vX.Y.Z` tags.
+git_tag_enable = false
+# Only tag when the merged commit came from the release PR, not on every push.
+release_always = false
+# cargo-semver-checks would build all 13 crates (BoringSSL included) per run.
+semver_check = false
+# In 0.x, a `feat` commit bumps the minor version, matching past releases.
+features_always_increment_minor = true
+pr_name = "chore(release): {{ version }}"
+pr_labels = ["release"]
+
+# Every published crate shares one version. Most inherit
+# `[workspace.package] version`; meow-anytls declares its own (edition 2024
+# fork), so the group keeps it in lockstep.
+[[package]]
+name = "meow-app"
+version_group = "meow"
+git_tag_enable = true
+git_tag_name = "v{{ version }}"
+
+[[package]]
+name = "meow-anytls"
+version_group = "meow"
+
+[[package]]
+name = "meow-bench"
+release = false

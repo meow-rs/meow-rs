@@ -9,6 +9,14 @@ on:
       tag:
         description: "Release tag to build (e.g. v0.3.0) — dry-run only, no upload"
         required: true
+  # release-plz.yml calls this after pushing the tag: a GITHUB_TOKEN tag push
+  # does not trigger the `push: tags` path above.
+  workflow_call:
+    inputs:
+      release_tag:
+        description: "Tag to build and publish as a GitHub release (e.g. v0.23.0)"
+        type: string
+        required: true
 
 permissions:
   contents: write
@@ -20,15 +28,20 @@ jobs:
     with:
       # On workflow_dispatch GITHUB_REF_NAME is the *branch* name (which may
       # contain slashes and break the archive path) — use the tag input.
-      ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
+      ref: ${{ inputs.release_tag || (github.event_name == 'workflow_dispatch' && github.event.inputs.tag) || github.ref_name }}
 
   release:
     name: Publish GitHub release
     runs-on: ubuntu-latest
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Tag pushes and release-plz calls only; a manual dispatch is a dry run.
+    if: startsWith(github.ref, 'refs/tags/v') || (inputs.release_tag || '') != ''
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - uses: actions/download-artifact@v4
         with:
@@ -38,7 +51,7 @@ jobs:
       - name: Package luci-app-meow ipk (arch-independent)
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
+          version="${RELEASE_TAG#v}"
           bash openwrt/build-ipk.sh luci --version "${version}-1" --outdir dist
           cd dist
           f="luci-app-meow_${version}-1_all.ipk"
@@ -54,7 +67,7 @@ jobs:
         run: |
           set -euo pipefail
           bash openwrt/install-apk-tools.sh "$HOME/.cache/apk-tools"
-          version="${GITHUB_REF_NAME#v}"
+          version="${RELEASE_TAG#v}"
           sudo APK="$HOME/.cache/apk-tools/apk" bash openwrt/build-apk.sh luci \
             --version "${version}-r1" --outdir dist
           sudo chown -R "$(id -u):$(id -g)" dist
@@ -65,6 +78,7 @@ jobs:
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.RELEASE_TAG }}
           files: |
             dist/*.tar.gz
             dist/*.tar.gz.sha256

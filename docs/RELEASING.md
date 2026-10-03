@@ -17,6 +17,18 @@ at a single workspace version. This is the checklist for cutting a release.
    (`Settings → Secrets and variables → Actions`). The
    [`publish.yml`](../.github/workflows/publish.yml) workflow reads it.
 3. Confirm you own all 13 crate names on crates.io.
+4. For [release-plz](#release-steps-release-plz), either:
+   - **(preferred)** add a **`RELEASE_PLZ_TOKEN`** Actions secret: a GitHub App
+     installation token or a fine-grained PAT on this repo with *Contents: read
+     & write* and *Pull requests: read & write*. The release PR is then opened
+     by that identity, so CI runs on it like on any other PR; or
+   - enable *Settings → Actions → General → Allow GitHub Actions to create and
+     approve pull requests*. The release PR is then opened by `GITHUB_TOKEN`,
+     and GitHub runs **no CI on it** until a human pushes to the branch (the
+     CHANGELOG cut below does that).
+
+   Without either, the `release-pr` job fails and releases fall back to the
+   [manual steps](#manual-release-steps).
 
 ## The crates & publish order
 
@@ -35,7 +47,57 @@ meow-listener  meow-api                      (→ tunnel, config)
 meow-app                                     (→ everything)
 ```
 
-## Release steps
+## Release steps (release-plz)
+
+[`release-plz.yml`](../.github/workflows/release-plz.yml) with
+[`release-plz.toml`](../release-plz.toml) automates the version bump and the
+tag. It does **not** write the changelog, publish crates or build binaries
+itself: `CHANGELOG.md` stays hand-curated, and the existing
+[`publish.yml`](../.github/workflows/publish.yml) and
+[`release.yml`](../.github/workflows/release.yml) do the publishing.
+
+1. **Every push to `main`** refreshes a standing PR titled
+   `chore(release): X.Y.Z` (branch `release-plz-*`, label `release`). It bumps
+   `[workspace.package] version`, the `[workspace.dependencies]` pins,
+   `meow-anytls` (its own `version`, kept in the same `version_group`) and
+   `Cargo.lock`. The version comes from the conventional commits since the
+   last release: `feat` → minor, `fix`/`perf` → patch, `!`/`BREAKING CHANGE` →
+   minor while we are on 0.x. To pick a different version, edit the PR (see
+   step 3).
+
+2. **Green CI on `main`.** The release does not run the test suite; make sure
+   [`test.yml`](../.github/workflows/test.yml) is passing on `main`.
+
+3. **Cut the changelog on the release PR branch**, as the last thing before
+   merging: rename `## [Unreleased]` to `## [X.Y.Z] - YYYY-MM-DD`, add a fresh
+   empty `## [Unreleased]` above it, and push that commit to the `release-plz-*`
+   branch. The `CHANGELOG has the release section` check on the PR stays red
+   until the section exists. Your push also starts the normal CI on the PR.
+
+   > [!NOTE]
+   > If anything else merges to `main` after your push, release-plz closes
+   > the PR (it never force-pushes over human commits) and opens a new one.
+   > Redo the cut on the new PR.
+
+4. **Squash-merge the release PR** once CI is green. On that merge commit the
+   `release` job pushes the single `vX.Y.Z` tag (on `meow-app`; no per-crate
+   tags), then calls `publish.yml` (crates.io) and `release.yml` (binaries,
+   OpenWrt packages, GitHub release). Pushes to `main` that did not come from
+   a release PR never tag anything.
+
+5. **Post-release.** Check the *Release-plz* run, then
+   `cargo info meow-app` and the GitHub release.
+
+Because the tag is pushed with `GITHUB_TOKEN`, GitHub does not start the
+`push: tags` runs of `publish.yml` / `release.yml` as well; the calls in
+step 4 are the only ones. If one of them fails, re-run that job from the
+*Release-plz* run (`publish.yml` skips crates already on the registry).
+
+## Manual release steps
+
+The fallback when release-plz is not set up or a release needs special handling.
+Do not mix the two for one version: if you cut a release by hand, close the
+open release-plz PR afterwards (it is regenerated on the next push).
 
 1. **Green CI on `main`.** The release does not run the test suite; make sure
    [`test.yml`](../.github/workflows/test.yml) is passing first.
@@ -93,7 +155,7 @@ part of cutting a stable release; it needs no manual steps.
 - **No cross-triggering.** `release.yml` and `publish.yml` fire only on `v*` tags;
   `Prerelease-Alpha` does not match, and tags pushed by `GITHUB_TOKEN` do not
   trigger workflows anyway. Never create a `v*` tag by hand for alphas.
-- **Upstream only.** Jobs are gated on `github.repository == 'madeye/meow-rs'`.
+- **Upstream only.** Jobs are gated on `github.repository == 'meow-rs/meow-rs'`.
 - **Concurrency.** A newer push cancels an in-flight alpha run; the publish job also
   skips itself if `main` has already moved on.
 

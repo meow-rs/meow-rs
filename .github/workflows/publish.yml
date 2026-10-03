@@ -5,6 +5,9 @@ name: Publish to crates.io
 # Triggers:
 #   - push a tag `vX.Y.Z`  -> real publish (tag must match the workspace version)
 #   - workflow_dispatch    -> dry-run by default; untick "dry-run" to publish
+#   - workflow_call        -> real publish of `release_tag`; release-plz.yml calls
+#                             this after pushing the tag (a GITHUB_TOKEN tag push
+#                             does not trigger the `push: tags` path above)
 #
 # Requires the repository secret CARGO_REGISTRY_TOKEN (a crates.io API token
 # with publish-update + publish-new scope). See docs/RELEASING.md.
@@ -18,6 +21,15 @@ on:
         description: "Dry run (package + verify only, no upload)"
         type: boolean
         default: true
+  workflow_call:
+    inputs:
+      release_tag:
+        description: "Tag to publish (e.g. v0.23.0); must match the workspace version"
+        type: string
+        required: true
+    secrets:
+      CARGO_REGISTRY_TOKEN:
+        required: true
 
 permissions:
   contents: read
@@ -32,8 +44,12 @@ jobs:
     runs-on: ubuntu-latest
     env:
       CARGO_TERM_COLOR: always
+      # Set when publishing a release; empty for a manual dry-run.
+      RELEASE_TAG: ${{ inputs.release_tag || (startsWith(github.ref, 'refs/tags/v') && github.ref_name || '') }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.RELEASE_TAG || github.sha }}
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -42,9 +58,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y cmake
 
       - name: Verify tag matches workspace version
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: env.RELEASE_TAG != ''
         run: |
-          tag="${GITHUB_REF_NAME#v}"
+          tag="${RELEASE_TAG#v}"
           ver="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
           echo "tag=$tag workspace version=$ver"
           if [ "$tag" != "$ver" ]; then
