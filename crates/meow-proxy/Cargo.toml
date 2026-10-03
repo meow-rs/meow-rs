@@ -42,6 +42,8 @@ anytls = ["dep:meow-anytls"]
 # Hysteria2 outbound implemented in-tree on top of quiche (BoringSSL-native
 # QUIC + HTTP/3), so it links no rustls and no second crypto library.
 hysteria2 = ["dep:quiche", "dep:boring", "dep:blake2", "dep:webpki-root-certs", "dep:tokio-util"]
+# TrustTunnel H2 client outbound; opt-in pending upstream profile review (#727).
+trusttunnel = ["dep:h2", "dep:tokio-util"]
 # sing-mux connection multiplexing for VLESS/Trojan/Shadowsocks/VMess. Pulls h2 + yamux +
 # tokio-util/compat — opt-out in `minimal` builds (ADR-0007 binary-size caps).
 mux = ["dep:h2", "dep:yamux", "dep:tokio-util", "meow-transport/h2"]

@@ -115,6 +115,16 @@ pub fn parse_proxy(
     parse_proxy_with_dialer(config, &dialer, ipv6)
 }
 
+/// TT errors must reject the containing config/provider even in lenient
+/// mode. Dropping the requested transport can make a group select DIRECT.
+/// This check deliberately remains available when the feature is disabled.
+pub(crate) fn node_is_trusttunnel(config: &HashMap<String, serde_yaml::Value>) -> bool {
+    config
+        .get("type")
+        .and_then(serde_yaml::Value::as_str)
+        .is_some_and(|kind| kind.eq_ignore_ascii_case("trusttunnel"))
+}
+
 /// Whether `config` describes an `ss` node whose `plugin:` names an external
 /// SIP003 executable — i.e. one that would reach `Command::new` during
 /// adapter construction. Gates untrusted node sources (proxy-providers,
@@ -186,6 +196,8 @@ pub fn parse_proxy_with_dialer(
         .ok_or("missing proxy type")?;
 
     match proxy_type {
+        #[cfg(feature = "trusttunnel")]
+        "trusttunnel" => parse_trusttunnel(name, config, dialer),
         #[cfg(feature = "ss")]
         "ss" => {
             let server = config
@@ -842,6 +854,134 @@ fn parse_direct(
     }
 
     Ok(adapter)
+}
+
+/// Parse the H2-only TrustTunnel schema shared by static and provider nodes.
+/// Unsupported transport and TLS policies fail before adapter construction.
+#[cfg(feature = "trusttunnel")]
+fn parse_trusttunnel(
+    name: &str,
+    config: &HashMap<String, serde_yaml::Value>,
+    dialer: &Arc<dyn meow_proxy::dialer::TcpDialer>,
+) -> std::result::Result<Arc<dyn Proxy>, String> {
+    let required = |key: &str| {
+        config
+            .get(key)
+            .and_then(serde_yaml::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("trusttunnel: missing {key}"))
+    };
+    let boolean = |key: &str, default: bool| -> std::result::Result<bool, String> {
+        match config.get(key) {
+            None => Ok(default),
+            Some(value) => value
+                .as_bool()
+                .ok_or_else(|| format!("trusttunnel: {key} must be boolean")),
+        }
+    };
+    if boolean("quic", false)? {
+        return Err("trusttunnel: mihomo supports HTTP/3 with quic: true; this contribution only implements HTTP/2".into());
+    }
+    // These TLS declarations are not wired into this adapter. Reject
+    // them before construction instead of silently weakening policy.
+    for field in [
+        "certificate",
+        "private-key",
+        "fingerprint",
+        "cert-fingerprint",
+        "reality-opts",
+        "ech-opts",
+        "curve-preferences",
+        "ca",
+        "ca-str",
+    ] {
+        if config.contains_key(field) {
+            return Err(format!(
+                "trusttunnel: mihomo can apply {field}; this H2 candidate rejects the option because its policy is not implemented"
+            ));
+        }
+    }
+    for field in ["bbr-profile", "bbr-opts", "congestion-controller", "cwnd"] {
+        if config.contains_key(field) {
+            return Err(format!(
+                "trusttunnel: mihomo exposes {field} for QUIC; this adapter only implements HTTP/2"
+            ));
+        }
+    }
+    let expected_alpn = "h2";
+    if let Some(alpn) = config.get("alpn") {
+        if !alpn
+            .as_sequence()
+            .is_some_and(|list| list.len() == 1 && list[0].as_str() == Some(expected_alpn))
+        {
+            return Err(format!(
+                "trusttunnel: selected transport requires alpn: [{expected_alpn}]"
+            ));
+        }
+    }
+    let text = |key: &str| -> std::result::Result<Option<&str>, String> {
+        match config.get(key) {
+            None => Ok(None),
+            Some(value) => value
+                .as_str()
+                .map(Some)
+                .ok_or_else(|| format!("trusttunnel: {key} must be a string")),
+        }
+    };
+    let server = required("server")?;
+    let mut tls = meow_transport::tls::TlsConfig::new(
+        text("sni")?.filter(|s| !s.is_empty()).unwrap_or(server),
+    );
+    tls.skip_cert_verify = boolean("skip-cert-verify", false)?;
+    tls.verify_name = text("name-cert-verify")?
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    tls.fingerprint = text("client-fingerprint")?
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    let mut options = meow_proxy::trusttunnel::Options::new(
+        required("username")?.into(),
+        required("password")?.into(),
+    );
+    let number = |key: &str, default: usize| -> std::result::Result<usize, String> {
+        match config.get(key) {
+            None => Ok(default),
+            Some(v) => v
+                .as_u64()
+                .and_then(|n| usize::try_from(n).ok())
+                .ok_or_else(|| format!("trusttunnel: invalid {key}")),
+        }
+    };
+    let max_connections = number("max-connections", 0)?;
+    let min_streams = number("min-streams", 0)?;
+    let max_streams = number("max-streams", 0)?;
+    if max_connections != 0 {
+        // Mihomo prioritizes max-connections/min-streams over legacy max-streams.
+        options.max_connections = max_connections;
+        options.min_streams = min_streams;
+    } else if min_streams != 0 || max_streams != 0 {
+        // Mihomo's legacy mode grows without a connection cap. Bound this mode
+        // explicitly and warn rather than pretending the resource policies match.
+        options.max_connections = 16;
+        options.min_streams = max_streams;
+        tracing::warn!(name, "trusttunnel: mihomo's legacy pool is unbounded; meow caps it at 16 connections and 512 streams per connection");
+    }
+    options.max_streams = options.max_streams.max(options.min_streams);
+    options.health_check = boolean("health-check", false)?;
+    if options.health_check {
+        tracing::warn!(name, "trusttunnel: mihomo performs idle health checks; this H2 candidate currently checks only new sessions");
+    }
+    let adapter = meow_proxy::trusttunnel::TrustTunnelAdapter::new(
+        name,
+        server,
+        required_port(config, "trusttunnel")?,
+        tls,
+        options,
+        boolean("udp", false)?,
+        Arc::clone(dialer),
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
 }
 
 /// Parse a `type: anytls` proxy block into an [`AnytlsAdapter`].

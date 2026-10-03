@@ -210,6 +210,19 @@ jobs:
       - name: Build
         run: cargo build --tests
 
+      - name: Fetch official TrustTunnel endpoint (pinned, SHA256 verified)
+        run: bash scripts/fetch-trusttunnel-endpoint.sh "$RUNNER_TEMP/trusttunnel"
+
+      - name: TrustTunnel opt-in protocol and configuration tests
+        env:
+          TRUSTTUNNEL_SERVER_BIN: ${{ runner.temp }}/trusttunnel/trusttunnel_endpoint
+        run: |
+          cargo test -p meow-proxy --no-default-features --features trusttunnel --lib trusttunnel
+          cargo test -p meow-proxy --no-default-features --features trusttunnel --test trusttunnel_integration
+          cargo test -p meow-proxy --no-default-features --features trusttunnel --test trusttunnel_e2e
+          cargo test -p meow-config --features trusttunnel --test trusttunnel_config_test
+          cargo test -p meow-config --no-default-features --test trusttunnel_config_test
+
       # One workspace-scoped invocation for every default-features test
       # target. A single invocation keeps a single feature-resolution scope,
       # so every target reuses the `cargo build --tests` artifacts instead of

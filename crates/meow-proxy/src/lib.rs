@@ -20,6 +20,8 @@ pub mod stream_conn;
 #[cfg(any(feature = "vmess", feature = "vless-encryption"))]
 pub(crate) mod tasked_duplex;
 pub mod transport_chain;
+#[cfg(feature = "trusttunnel")]
+pub mod trusttunnel;
 
 #[cfg(feature = "ech-tls-tunnel")]
 pub mod ech_tls_tunnel;

@@ -40,6 +40,8 @@ snell = ["meow-config/snell", "meow-proxy/snell"]
 # binaries carry it; excluded from `minimal` (ADR-0007 binary-size caps).
 anytls = ["meow-config/anytls", "meow-proxy/anytls"]
 hysteria2 = ["meow-config/hysteria2", "meow-proxy/hysteria2"]
+# TrustTunnel H2 client outbound; opt-in pending upstream profile review (#727).
+trusttunnel = ["meow-config/trusttunnel", "meow-proxy/trusttunnel"]
 ech-tls-tunnel = [
     "ss",
     "meow-config/ech-tls-tunnel",

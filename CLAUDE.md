@@ -150,6 +150,19 @@ cargo test -p meow-listener --features listener-shadowsocks --test ss_listener_i
 # tests never compile under default features.
 cargo test -p meow-proxy --features anytls --lib
 
+# TrustTunnel is opt-in; its wire tests and parser/adapter integration need
+# explicit feature runs, including the disabled-feature parser contract.
+cargo test -p meow-proxy --no-default-features --features trusttunnel --lib trusttunnel
+cargo test -p meow-proxy --no-default-features --features trusttunnel --test trusttunnel_integration
+cargo test -p meow-proxy --no-default-features --features trusttunnel --test trusttunnel_e2e
+cargo test -p meow-config --features trusttunnel --test trusttunnel_config_test
+cargo test -p meow-config --no-default-features --test trusttunnel_config_test
+
+# The official TrustTunnel test peer is required for the e2e target.
+# Fetch with `bash scripts/fetch-trusttunnel-endpoint.sh /tmp/meow-tt-peer`,
+# then export TRUSTTUNNEL_SERVER_BIN=/tmp/meow-tt-peer/trusttunnel_endpoint.
+# MEOW_TRUSTTUNNEL_E2E_ALLOW_SKIP=1 prints a loud local-only skip; CI rejects it.
+
 # Mirrors the "Unit + integration tests (default features)" CI step. `--lib`
 # alone is not enough: it skips every `--test` target, so a broken integration
 # test (e.g. the ADR-0001 guard in `crate_invariants_test`) passes locally and

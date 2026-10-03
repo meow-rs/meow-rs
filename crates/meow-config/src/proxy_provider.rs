@@ -100,6 +100,19 @@ pub struct ProxyProvider {
 /// Weak counterpart of [`ProviderSlot`].
 type WeakSlot = std::sync::Weak<RwLock<Vec<Arc<dyn Proxy>>>>;
 
+/// Typed so initial acquisition can distinguish a transport/policy defect
+/// from a transient fetch error without inspecting diagnostic strings.
+#[derive(Debug)]
+struct TrustTunnelConfigError(String);
+
+impl std::fmt::Display for TrustTunnelConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for TrustTunnelConfigError {}
+
 /// Compiled group-level member filter (issue #358): the `filter`,
 /// `exclude-filter`, and `exclude-type` fields declared on a proxy-group
 /// apply to the proxies that group pulls from providers (`use:` /
@@ -575,7 +588,7 @@ impl ProxyProvider {
     /// (upstream's hash early-return — `updated_at` only advances on real
     /// content changes). `from_remote` distinguishes a live fetch from an
     /// on-disk cache read — cache content is never written back.
-    async fn ingest(&self, content: String, from_remote: bool) -> Result<bool, String> {
+    async fn ingest(&self, content: String, from_remote: bool) -> Result<bool, anyhow::Error> {
         let strict = self.strict.load(Ordering::Relaxed);
         let hash = content_hash(&content);
         if *self.content_hash.lock() == Some((hash, strict)) {
@@ -598,18 +611,21 @@ impl ProxyProvider {
     /// keeps the last-good slot instead of committing an empty one. This
     /// matters now that refreshes are timer-driven: a 200-OK captive-portal
     /// page must not wipe the provider every tick. `strict` still gates
-    /// *per-node* failures only.
+    /// ordinary *per-node* failures. TT transport/policy errors always
+    /// reject the payload so a removed TT node cannot select a fallback.
     ///
     /// `declared_dialers` is rewritten only on the success path that will
     /// be committed: an `Err` keeps the last-good slot running, so it must
     /// keep that generation's declarations too (issue #489 review).
-    async fn parse_proxies(&self, content: &str) -> Result<Vec<Arc<dyn Proxy>>, String> {
+    async fn parse_proxies(&self, content: &str) -> Result<Vec<Arc<dyn Proxy>>, anyhow::Error> {
         let strict = self.strict.load(Ordering::Relaxed);
         if !crate::yaml_within_depth(content) {
-            return Err("provider YAML exceeds the nesting-depth limit".to_string());
+            return Err(anyhow::anyhow!(
+                "provider YAML exceeds the nesting-depth limit"
+            ));
         }
         let mut doc: serde_yaml::Value = serde_yaml::from_str(content)
-            .map_err(|e| format!("provider YAML is malformed: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("provider YAML is malformed: {e}"))?;
         // Expand `<<:` merge keys — remote payloads legitimately carry
         // anchors, and an unexpanded merge silently drops the merged
         // `dialer-proxy` into a literal `<<` key (the one field whose loss
@@ -619,7 +635,7 @@ impl ProxyProvider {
         // drop the whole payload rather than risk nodes losing their
         // chained front hop.
         doc.apply_merge()
-            .map_err(|e| format!("provider YAML merge keys failed to expand: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("provider YAML merge keys failed to expand: {e}"))?;
 
         // Accept both `proxies: [...]` wrapper and a bare list. A
         // `Value::Null` document is an empty or comments-only file — treat
@@ -633,14 +649,14 @@ impl ProxyProvider {
 
         let mut proxy_maps: Vec<HashMap<String, serde_yaml::Value>> =
             serde_yaml::from_value(list_val)
-                .map_err(|e| format!("provider content is not a proxy list: {e}"))?;
+                .map_err(|e| anyhow::anyhow!("provider content is not a proxy list: {e}"))?;
 
         // Pre-resolve any DNS-sourced ECH configs into inline base64 — keeps
         // `parse_proxy` itself sync. An `ech-opts.enable: true` node with no
         // query source at all is a defect — strict turns it into an error.
         crate::ech_dns::preresolve_ech(&mut proxy_maps, strict)
             .await
-            .map_err(|e| format!("{e} (strict mode)"))?;
+            .map_err(|e| anyhow::anyhow!("{e} (strict mode)"))?;
 
         let mut declared = Vec::new();
         let mut result = Vec::new();
@@ -671,9 +687,15 @@ impl ProxyProvider {
                 Ok(proxy) => result.push(proxy),
                 Err(e) => {
                     if strict {
-                        return Err(format!(
+                        return Err(anyhow::anyhow!(
                             "node '{raw_name}' failed to parse (strict mode): {e}"
                         ));
+                    }
+                    if proxy_parser::node_is_trusttunnel(raw_map) {
+                        return Err(TrustTunnelConfigError(format!(
+                            "trusttunnel node '{raw_name}' must not be skipped: {e}"
+                        ))
+                        .into());
                     }
                     warn!(provider = %self.name, proxy = raw_name, error = %e, "failed to parse proxy");
                 }
@@ -848,7 +870,7 @@ impl ProxyProvider {
                     // A torn payload keeps the last-good set instead of
                     // replacing it with nothing.
                     warn!(provider = %self.name, error = %e, "proxy-provider refresh failed");
-                    Err(e)
+                    Err(e.to_string())
                 }
             },
             Err(e) => {
@@ -866,7 +888,11 @@ impl ProxyProvider {
     pub async fn acquire_initial(&self) -> Result<(), String> {
         let _generation = self.refresh_lock.lock().await;
         match self.fetch_content().await {
-            Ok((content, from_remote)) => self.ingest(content, from_remote).await.map(|_| ()),
+            Ok((content, from_remote)) => self
+                .ingest(content, from_remote)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
             Err(e) => Err(e),
         }
     }
@@ -969,8 +995,18 @@ pub async fn load_proxy_providers(
                         }
                         Err(e) => warn_initial_load_failure(&provider, &e),
                     }
-                } else if let Err(e) = provider.acquire_initial().await {
-                    warn_initial_load_failure(&provider, &e);
+                } else {
+                    match provider.fetch_content().await {
+                        Ok((content, from_remote)) => {
+                            if let Err(e) = provider.ingest(content, from_remote).await {
+                                if e.is::<TrustTunnelConfigError>() {
+                                    return Err(anyhow::anyhow!("proxy-provider '{name}': {e}"));
+                                }
+                                warn_initial_load_failure(&provider, &e.to_string());
+                            }
+                        }
+                        Err(e) => warn_initial_load_failure(&provider, &e),
+                    }
                 }
                 result.insert(name.clone(), provider);
             }

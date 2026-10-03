@@ -1756,13 +1756,18 @@ fn insert_parsed_leaves(
                 }
                 proxies.insert(key, proxy);
             }
-            Err(e) if strict => {
+            Err(e) if strict || proxy_parser::node_is_trusttunnel(raw_proxy) => {
                 let name = raw_proxy
                     .get("name")
                     .and_then(|v| v.as_str())
                     .unwrap_or("<unnamed>");
+                let policy = if strict {
+                    "strict mode"
+                } else {
+                    "trusttunnel must not be skipped"
+                };
                 return Err(anyhow::anyhow!(
-                    "proxies: failed to parse '{name}' (strict mode): {e}"
+                    "proxies: failed to parse '{name}' ({policy}): {e}"
                 ));
             }
             Err(e) => warn!("Failed to parse proxy: {}", e),
