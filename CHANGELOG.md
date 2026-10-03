@@ -8,6 +8,8 @@ the canonical, in-repo source a release is cut from.
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-10-03
+
 ### Added
 
 - **OpenWrt `.apk` packages** (issue #466) — releases now ship `meow` and

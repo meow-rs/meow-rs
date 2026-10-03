@@ -33,7 +33,7 @@ debug = 1
 opt-level = 1
 
 [workspace.package]
-version = "0.21.2"
+version = "0.22.0"
 edition = "2021"
 rust-version = "1.89"
 license = "MIT"
@@ -134,7 +134,7 @@ tun-rs = { version = "2.8", features = ["async_tokio"] }
 # poll_next UAF / poll_flush deadlock / FIN_WAIT_2 leak / livelock fixes that
 # upstream `lwip` lacks. Registry version, not a `git =` pin — crates.io
 # forbids git deps in a published manifest (see docs/RELEASING.md).
-lwip = { package = "meow-lwip", path = "crates/meow-lwip", version = "0.21.2" }
+lwip = { package = "meow-lwip", path = "crates/meow-lwip", version = "0.22.0" }
 route_manager = "0.2"
 
 # Crypto
@@ -253,18 +253,18 @@ proptest = "1"
 # Workspace crates
 # default-features = false on feature-gated crates so each consumer controls
 # which optional protocols/listeners are compiled (M2.E feature-flag infra).
-meow-common = { path = "crates/meow-common", version = "0.21.2" }
-meow-trie = { path = "crates/meow-trie", version = "0.21.2" }
+meow-common = { path = "crates/meow-common", version = "0.22.0" }
+meow-trie = { path = "crates/meow-trie", version = "0.22.0" }
 # Vendored anytls fork (lib name `anytls_rs`); optional, pulled in only by
 # meow-proxy's `anytls` feature.
-meow-anytls = { path = "crates/meow-anytls", version = "0.21.2" }
-meow-dns = { path = "crates/meow-dns", version = "0.21.2", default-features = false }
-meow-rules = { path = "crates/meow-rules", version = "0.21.2" }
+meow-anytls = { path = "crates/meow-anytls", version = "0.22.0" }
+meow-dns = { path = "crates/meow-dns", version = "0.22.0", default-features = false }
+meow-rules = { path = "crates/meow-rules", version = "0.22.0" }
 # default-features = false so each consumer names the layers it needs
 # (meow-dns wants only `tls`; meow-listener only `simple-obfs`).
-meow-transport = { path = "crates/meow-transport", version = "0.21.2", default-features = false }
-meow-proxy = { path = "crates/meow-proxy", version = "0.21.2", default-features = false }
-meow-tunnel = { path = "crates/meow-tunnel", version = "0.21.2" }
-meow-listener = { path = "crates/meow-listener", version = "0.21.2", default-features = false }
-meow-api = { path = "crates/meow-api", version = "0.21.2" }
-meow-config = { path = "crates/meow-config", version = "0.21.2", default-features = false }
+meow-transport = { path = "crates/meow-transport", version = "0.22.0", default-features = false }
+meow-proxy = { path = "crates/meow-proxy", version = "0.22.0", default-features = false }
+meow-tunnel = { path = "crates/meow-tunnel", version = "0.22.0" }
+meow-listener = { path = "crates/meow-listener", version = "0.22.0", default-features = false }
+meow-api = { path = "crates/meow-api", version = "0.22.0" }
+meow-config = { path = "crates/meow-config", version = "0.22.0", default-features = false }
