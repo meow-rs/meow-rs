@@ -33,7 +33,66 @@ use meow_common::{
     AdapterType, MeowError, Metadata, ProxyAdapter, ProxyConn, ProxyHealth, ProxyPacketConn, Result,
 };
 
+use crate::certificate_pin::parse_cert_pin;
 use crate::uot::{encode_uot_addr, encode_uot_addr_domain, read_uot_addr};
+
+/// Optional TLS settings using mihomo's AnyTLS field names and defaults.
+#[derive(Debug, Clone, Default)]
+pub struct AnytlsTlsOptions {
+    pub sni: Option<String>,
+    pub skip_cert_verify: bool,
+    pub fingerprint: Option<String>,
+    pub name_cert_verify: Option<String>,
+    pub client_fingerprint: Option<String>,
+    pub alpn: Vec<String>,
+}
+
+impl AnytlsTlsOptions {
+    fn tls_config(&self, name: &str, server: &str) -> std::result::Result<TlsConfig, String> {
+        if self.alpn.iter().any(|s| s.is_empty() || s.len() > 255) {
+            return Err(format!(
+                "anytls[{name}]: alpn entries must contain 1 to 255 bytes"
+            ));
+        }
+        let effective_sni = self
+            .sni
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(server);
+        let server_name =
+            normalize_server_name(effective_sni).map_err(|e| format!("anytls[{name}]: {e}"))?;
+        let verify_name = self
+            .name_cert_verify
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(normalize_server_name)
+            .transpose()
+            .map_err(|e| format!("anytls[{name}]: name-cert-verify: {e}"))?;
+        let cert_pin = self
+            .fingerprint
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(|value| parse_cert_pin(value, &format!("anytls[{name}]")))
+            .transpose()
+            .map_err(|e| e.to_string())?;
+        let fingerprint = self
+            .client_fingerprint
+            .as_ref()
+            .filter(|s| !s.is_empty() && s.as_str() != "none")
+            .cloned();
+        // Mihomo's explicit verification name overrides skip-cert-verify;
+        // a configured pin owns verification independently of that flag.
+        let skip_cert_verify = self.skip_cert_verify && verify_name.is_none() && cert_pin.is_none();
+        Ok(TlsConfig {
+            verify_name,
+            cert_pin,
+            fingerprint,
+            alpn: self.alpn.clone(),
+            skip_cert_verify,
+            ..TlsConfig::new(server_name)
+        })
+    }
+}
 
 /// AnyTLS outbound adapter.
 pub struct AnytlsAdapter {
@@ -69,6 +128,35 @@ impl AnytlsAdapter {
         skip_cert_verify: bool,
         udp: bool,
     ) -> std::result::Result<Self, String> {
+        let options = AnytlsTlsOptions {
+            sni: sni.map(str::to_string),
+            skip_cert_verify,
+            ..Default::default()
+        };
+        Self::new_with_tls(name, server, port, password, &options, udp)
+    }
+
+    /// Build an adapter with certificate verification and ClientHello options.
+    pub fn new_with_tls(
+        name: &str,
+        server: &str,
+        port: u16,
+        password: &str,
+        options: &AnytlsTlsOptions,
+        udp: bool,
+    ) -> std::result::Result<Self, String> {
+        let tls_config = options.tls_config(name, server)?;
+        Self::build(name, server, port, password, &tls_config, udp)
+    }
+
+    fn build(
+        name: &str,
+        server: &str,
+        port: u16,
+        password: &str,
+        tls_config: &TlsConfig,
+        udp: bool,
+    ) -> std::result::Result<Self, String> {
         // Bridge meow_common's outbound-socket hooks (resolver-aware TCP
         // dialer + Android `SocketProtector`) into anytls-rs's separate
         // registries exactly once — see `install_anytls_bridges`.
@@ -76,20 +164,12 @@ impl AnytlsAdapter {
 
         let server_addr = format!("{server}:{port}");
 
-        let effective_sni = sni.filter(|s| !s.trim().is_empty()).unwrap_or(server);
-        let server_name =
-            normalize_server_name(effective_sni).map_err(|e| format!("anytls[{name}]: {e}"))?;
-
         // Same BoringSSL TlsLayer every other TLS outbound uses; the
         // SSL_CTX is shared across proxies with the same shaping key.
         // `Arc`-shared with `MeowTlsConnect` so `connect_over` can run the
         // identical handshake on a relay-supplied stream.
         let tls_layer = Arc::new(
-            TlsLayer::new(&TlsConfig {
-                skip_cert_verify,
-                ..TlsConfig::new(server_name)
-            })
-            .map_err(|e| format!("anytls[{name}]: tls config: {e}"))?,
+            TlsLayer::new(tls_config).map_err(|e| format!("anytls[{name}]: tls config: {e}"))?,
         );
         let tls: Arc<dyn TlsConnect> = Arc::new(MeowTlsConnect {
             layer: Arc::clone(&tls_layer),

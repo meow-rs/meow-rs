@@ -23,6 +23,10 @@ the canonical, in-repo source a release is cut from.
   that address, as in mihomo. User-declared
   `type: direct` proxies follow it too unless they set their own `dns:`.
   Configs without `direct-nameserver` behave as before.
+- **AnyTLS TLS options**: support certificate SHA-256 `fingerprint` pinning,
+  `name-cert-verify`, `alpn`, and existing `client-fingerprint` profiles for
+  direct and relay connections. Explicit verification remains mandatory
+  with `skip-cert-verify`; malformed pins fail configuration validation.
 
 ### Fixed
 

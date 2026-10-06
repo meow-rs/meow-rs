@@ -64,46 +64,10 @@ pub(crate) fn parse_bool_strict(s: &str, plugin: &str, key: &str) -> Result<bool
     }
 }
 
-/// Parse a `fingerprint` option value: `:`-separated hex of the 32-byte
-/// SHA-256 of the pinned certificate (upstream
-/// `ca.NewFingerprintVerifier`).  uTLS profile names are rejected,
-/// mirroring upstream's explicit check.
+/// Certificate-pin parsing lives in [`crate::certificate_pin`] so the
+/// anytls adapter can share it without the `ss` feature.
 #[cfg(any(feature = "gost-plugin", feature = "shadow-tls", feature = "restls"))]
-pub(crate) fn parse_cert_pin(s: &str, plugin: &str) -> Result<[u8; 32]> {
-    // Upstream guards against the easy confusion between this pin and a
-    // uTLS ClientHello profile name.
-    const UTLS_NAMES: &[&str] = &[
-        "chrome",
-        "firefox",
-        "safari",
-        "ios",
-        "android",
-        "edge",
-        "360",
-        "qq",
-        "random",
-        "randomized",
-    ];
-    if UTLS_NAMES.contains(&s.to_ascii_lowercase().as_str()) {
-        // No pointer at `client-fingerprint` here: that node-level option
-        // is only honoured by plugins that wire it into their TLS layer
-        // (shadow-tls's cover handshake) — a hint that is silently ignored
-        // elsewhere is worse than none.
-        return Err(MeowError::Config(format!(
-            "{plugin}: 'fingerprint' is a TLS certificate pin (SHA-256 hex), \
-             not a uTLS ClientHello profile name"
-        )));
-    }
-    let stripped: String = s.trim().replace(':', "");
-    let bytes = hex::decode(&stripped)
-        .map_err(|e| MeowError::Config(format!("{plugin}: fingerprint hex decode failed: {e}")))?;
-    <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
-        MeowError::Config(format!(
-            "{plugin}: fingerprint must be a SHA-256 hash (32 bytes), got {}",
-            bytes.len()
-        ))
-    })
-}
+pub(crate) use crate::certificate_pin::parse_cert_pin;
 
 /// PEM cert/key loading shared by the gost-plugin and shadow-tls parsers.
 /// One cfg for the whole cluster: every consumer sits behind
