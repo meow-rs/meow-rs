@@ -68,6 +68,9 @@ the canonical, in-repo source a release is cut from.
   warning vs strict refusal), not what the entry matches.
   `DOMAIN-REGEX` stays unchecked: whether an arbitrary pattern can match
   a normalized host is not decidable by label inspection.
+- **Outbound interface binding**: exempt loopback and multicast destinations
+  on Linux, macOS and Windows, using the actual UDP peer rather than the local
+  wildcard address. Preserve mapped IPv4 targets and IPv6 scope IDs.
 
 ## [0.28.0] - 2026-10-30
 

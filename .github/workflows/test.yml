@@ -272,7 +272,10 @@ jobs:
           # And for v2ray_plugin_integration's official server plugin.
           V2RAY_PLUGIN_BIN: ${{ runner.temp }}/v2ray-plugin/v2ray-plugin
         run: |
+          export MEOW_TEST_OUTBOUND_INTERFACE="$(ip -4 route get 1.1.1.1 | awk '{for (i=1;i<NF;i++) if ($i=="dev") {print $(i+1); exit}}')"
+          test -n "$MEOW_TEST_OUTBOUND_INTERFACE"
           cargo nextest run --lib --bin meow --bin meow-bench --bin meow-cli \
+            --test direct_udp_binding \
             --test common_test \
             --test socks5_udp_user \
             --test host_validation \
@@ -514,7 +517,10 @@ jobs:
       - name: Unit + integration tests (windows)
         shell: bash
         run: |
+          export MEOW_TEST_OUTBOUND_INTERFACE="$(powershell.exe -NoProfile -Command '(Find-NetRoute -RemoteIPAddress 1.1.1.1 | Select-Object -First 1).InterfaceAlias' | tr -d '\r')"
+          test -n "$MEOW_TEST_OUTBOUND_INTERFACE"
           cargo nextest run --lib --bin meow --bin meow-bench --bin meow-cli \
+            --test direct_udp_binding \
             --test common_test \
             --test config_test \
             --test rules_test \
@@ -586,7 +592,10 @@ jobs:
 
       - name: Core smoke tests
         run: |
+          export MEOW_TEST_OUTBOUND_INTERFACE="$(route -n get default | awk '/interface:/ {print $2}')"
+          test -n "$MEOW_TEST_OUTBOUND_INTERFACE"
           cargo nextest run --lib --bin meow --bin meow-bench --bin meow-cli \
+            --test direct_udp_binding \
             --test common_test \
             --test config_test \
             --test rules_test \
