@@ -107,6 +107,17 @@ Not shipping in M2 (explicitly): `armv7-musl` (covered by aarch64 for M2
 priorities), `mips-musl` (big-endian is vanishing), Windows,
 macOS-universal, any glibc target. Those are future releases.
 
+**Amendment — `armv7-musl` now ships** (release-target PR, 2026-10).
+`armv7-unknown-linux-musleabihf` is built and published as a static musl
+binary. The M2 reason above was prioritization, but the "cannot be built
+with TLS at all" note in `build.yml` did hold for the `cargo zigbuild`
+path: zig's musl headers declare `time_t` 64-bit on 32-bit targets while
+Rust's `libc` crate types it as `i32`, so `boring` fails to compile
+(E0308). A real musl cross toolchain has no such disagreement and builds
+the target statically. It carries no cap here — `minimal_budget_bytes` is
+0 (informational) until someone measures the `minimal` feature set on it;
+if a cap is wanted, §6 applies as usual.
+
 **Why mipsel is soft for M2:** roadmap §M2 item 3 names mipsel-musl
 explicitly, but the current tree has zero mipsel build infrastructure
 and no way to functionally validate a mipsel binary (no QEMU runner,
