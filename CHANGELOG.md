@@ -10,6 +10,11 @@ the canonical, in-repo source a release is cut from.
 
 ### Added
 
+- **AnyTLS TLS options**: support certificate SHA-256 `fingerprint` pinning,
+  `name-cert-verify`, `alpn`, and existing `client-fingerprint` profiles for
+  direct and relay connections. Explicit verification remains mandatory
+  with `skip-cert-verify`; malformed pins fail configuration validation.
+
 - **OpenWrt x86_64 packages** (issue #725): releases and alpha prereleases
   now ship `meow` `.ipk` and `.apk` packages for OpenWrt's x86/64 target
   (architecture `x86_64`), built from the existing static

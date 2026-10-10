@@ -7,6 +7,8 @@
 /// BoringSSL record-layer AEAD shared by Snell, VMess and VLESS encryption.
 #[cfg(any(feature = "snell", feature = "vmess", feature = "vless-encryption"))]
 mod aead;
+#[cfg(any(feature = "ss", feature = "anytls"))]
+mod certificate_pin;
 pub mod dialer;
 pub mod direct;
 pub mod group;
@@ -56,7 +58,7 @@ pub use snell::{SnellAdapter, SnellObfs, SnellV6Mode, SnellVersion};
 #[cfg(feature = "anytls")]
 pub mod anytls_adapter;
 #[cfg(feature = "anytls")]
-pub use anytls_adapter::AnytlsAdapter;
+pub use anytls_adapter::{AnytlsAdapter, AnytlsTlsOptions};
 
 #[cfg(feature = "hysteria2")]
 mod hysteria2;

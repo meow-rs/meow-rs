@@ -5,6 +5,8 @@
 use meow_common::error::{MeowError, Result};
 use tracing::warn;
 
+pub(crate) use crate::certificate_pin::parse_cert_pin;
+
 /// SIP003 `plugin-opts` tokenizer shared by every built-in plugin parser:
 /// `;`-separated `key=value` tokens, trimmed; a bare key parses as
 /// `key=true`.  Keys are lowercased — upstream decodes the opts map
@@ -47,46 +49,6 @@ pub(crate) fn parse_bool_strict(s: &str, plugin: &str, key: &str) -> Result<bool
             "{plugin}: '{key}' expects a boolean, got '{s}'"
         ))),
     }
-}
-
-/// Parse a `fingerprint` option value: `:`-separated hex of the 32-byte
-/// SHA-256 of the pinned certificate (upstream
-/// `ca.NewFingerprintVerifier`).  uTLS profile names are rejected,
-/// mirroring upstream's explicit check.
-pub(crate) fn parse_cert_pin(s: &str, plugin: &str) -> Result<[u8; 32]> {
-    // Upstream guards against the easy confusion between this pin and a
-    // uTLS ClientHello profile name.
-    const UTLS_NAMES: &[&str] = &[
-        "chrome",
-        "firefox",
-        "safari",
-        "ios",
-        "android",
-        "edge",
-        "360",
-        "qq",
-        "random",
-        "randomized",
-    ];
-    if UTLS_NAMES.contains(&s.to_ascii_lowercase().as_str()) {
-        // No pointer at `client-fingerprint` here: that node-level option
-        // is only honoured by plugins that wire it into their TLS layer
-        // (shadow-tls's cover handshake) — a hint that is silently ignored
-        // elsewhere is worse than none.
-        return Err(MeowError::Config(format!(
-            "{plugin}: 'fingerprint' is a TLS certificate pin (SHA-256 hex), \
-             not a uTLS ClientHello profile name"
-        )));
-    }
-    let stripped: String = s.trim().replace(':', "");
-    let bytes = hex::decode(&stripped)
-        .map_err(|e| MeowError::Config(format!("{plugin}: fingerprint hex decode failed: {e}")))?;
-    <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
-        MeowError::Config(format!(
-            "{plugin}: fingerprint must be a SHA-256 hash (32 bytes), got {}",
-            bytes.len()
-        ))
-    })
 }
 
 /// Upstream `NewTLSKeyPairLoader` accepts PEM content or a file path for

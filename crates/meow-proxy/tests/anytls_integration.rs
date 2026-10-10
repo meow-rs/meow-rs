@@ -15,7 +15,8 @@ use anytls_rs::padding::PaddingFactory;
 use anytls_rs::protocol::Command;
 use anytls_rs::server::Server as AnytlsServer;
 use meow_common::{Metadata, Network, ProxyAdapter};
-use meow_proxy::AnytlsAdapter;
+use meow_proxy::{AnytlsAdapter, AnytlsTlsOptions};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::time::{timeout, Duration};
@@ -69,9 +70,16 @@ async fn start_anytls_server(
     cert_der: rustls::pki_types::CertificateDer<'static>,
     key_der: rustls::pki_types::PrivateKeyDer<'static>,
 ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    start_anytls_server_chain(vec![cert_der], key_der).await
+}
+
+async fn start_anytls_server_chain(
+    chain: Vec<rustls::pki_types::CertificateDer<'static>>,
+    key_der: rustls::pki_types::PrivateKeyDer<'static>,
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let tls_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(vec![cert_der], key_der)
+        .with_single_cert(chain, key_der)
         .unwrap();
     let acceptor = Arc::new(tokio_rustls::TlsAcceptor::from(Arc::new(tls_config)));
 
@@ -147,6 +155,202 @@ async fn anytls_round_trip_through_upstream_server() {
         .expect("echo must not stall")
         .expect("echo must succeed");
     assert_eq!(&buf[..], payload, "echo payload must match what we wrote");
+}
+
+#[tokio::test]
+async fn anytls_certificate_pin_authenticates_direct_and_relay() {
+    install_crypto_provider();
+    let (echo_addr, _echo_h) = start_echo_server().await;
+    let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    ca_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "AnyTLS test CA");
+    ca_params.key_usages = vec![
+        rcgen::KeyUsagePurpose::KeyCertSign,
+        rcgen::KeyUsagePurpose::CrlSign,
+    ];
+    let ca_key = rcgen::KeyPair::generate().unwrap();
+    let ca = ca_params.self_signed(&ca_key).unwrap();
+    let leaf_key = rcgen::KeyPair::generate().unwrap();
+    let leaf = rcgen::CertificateParams::new(vec!["localhost".into()])
+        .unwrap()
+        .signed_by(&leaf_key, &ca, &ca_key)
+        .unwrap();
+    let pin = Sha256::digest(leaf.der().as_ref());
+    let ca_fingerprint = hex::encode(Sha256::digest(ca.der().as_ref()));
+    let fingerprint = format!(
+        " {} ",
+        pin.iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect::<Vec<_>>()
+            .join(":")
+    );
+    let mut wrong_pin = pin;
+    wrong_pin[0] ^= 1;
+    let wrong_fingerprint = hex::encode(wrong_pin);
+    let (server_addr, _server_h) = start_anytls_server_chain(
+        vec![leaf.der().clone(), ca.der().clone()],
+        rustls::pki_types::PrivatePkcs8KeyDer::from(leaf_key.serialize_der()).into(),
+    )
+    .await;
+    let metadata = Metadata {
+        network: Network::Tcp,
+        host: echo_addr.ip().to_string().into(),
+        dst_port: echo_addr.port(),
+        ..Default::default()
+    };
+
+    for via_relay in [false, true] {
+        for (configured_pin, verify_name, skip, accepted) in [
+            (None, None, false, false),
+            (None, None, true, true),
+            (None, Some("localhost"), true, false),
+            (Some(&fingerprint), None, false, true),
+            (Some(&fingerprint), None, true, true),
+            (Some(&fingerprint), Some("wrong-name.invalid"), true, true),
+            (Some(&ca_fingerprint), Some("localhost"), false, true),
+            (Some(&ca_fingerprint), Some("localhost"), true, true),
+            (
+                Some(&ca_fingerprint),
+                Some("wrong-name.invalid"),
+                true,
+                false,
+            ),
+            (Some(&ca_fingerprint), None, true, false),
+            (Some(&wrong_fingerprint), None, false, false),
+            (Some(&wrong_fingerprint), None, true, false),
+        ] {
+            let options = AnytlsTlsOptions {
+                sni: Some("different-name.invalid".into()),
+                fingerprint: configured_pin.cloned(),
+                name_cert_verify: verify_name.map(str::to_string),
+                skip_cert_verify: skip,
+                ..Default::default()
+            };
+            let adapter = AnytlsAdapter::new_with_tls(
+                "verification",
+                "127.0.0.1",
+                server_addr.port(),
+                PASSWORD,
+                &options,
+                false,
+            )
+            .unwrap();
+            let result = timeout(T, async {
+                if via_relay {
+                    let stream = tokio::net::TcpStream::connect(server_addr).await.unwrap();
+                    adapter.connect_over(Box::new(stream), &metadata).await
+                } else {
+                    adapter.dial_tcp(&metadata).await
+                }
+            })
+            .await
+            .expect("certificate verification must not stall");
+
+            if !accepted {
+                let Err(error) = result else {
+                    panic!("untrusted or mismatched certificate must be rejected");
+                };
+                assert!(error.to_string().to_lowercase().contains("tls"), "{error}");
+                continue;
+            }
+            let mut conn = result.unwrap_or_else(|error| {
+                panic!("relay={via_relay} pin={configured_pin:?} name={verify_name:?} skip={skip}: {error}")
+            });
+            let payload = b"authenticated AnyTLS stream";
+            timeout(T, async {
+                conn.write_all(payload).await.unwrap();
+                conn.flush().await.unwrap();
+                let mut received = vec![0u8; payload.len()];
+                conn.read_exact(&mut received).await.unwrap();
+                assert_eq!(&received, payload);
+            })
+            .await
+            .expect("pinned AnyTLS echo must not stall");
+        }
+    }
+}
+
+#[tokio::test]
+async fn anytls_client_hello_preserves_sni_alpn_and_profiles() {
+    install_crypto_provider();
+    for via_relay in [false, true] {
+        let mut baseline = None;
+        for profile in [
+            None,
+            Some("none"),
+            Some("qq"),
+            Some("firefox"),
+            Some("chrome"),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let capture = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let handshake = tokio_rustls::LazyConfigAcceptor::new(
+                    rustls::server::Acceptor::default(),
+                    stream,
+                )
+                .await
+                .unwrap();
+                let hello = handshake.client_hello();
+                assert_eq!(hello.server_name(), Some("cover.example.com"));
+                assert_eq!(
+                    hello.alpn().unwrap().collect::<Vec<_>>(),
+                    vec![b"h2".as_slice(), b"http/1.1".as_slice()]
+                );
+                hello
+                    .cipher_suites()
+                    .iter()
+                    .map(|suite| u16::from(*suite))
+                    .filter(|suite| suite & 0x0f0f != 0x0a0a)
+                    .collect::<Vec<_>>()
+            });
+            let options = AnytlsTlsOptions {
+                sni: Some("cover.example.com".into()),
+                skip_cert_verify: true,
+                client_fingerprint: profile.map(str::to_string),
+                alpn: vec!["h2".into(), "http/1.1".into()],
+                ..Default::default()
+            };
+            let adapter = AnytlsAdapter::new_with_tls(
+                "hello",
+                "127.0.0.1",
+                addr.port(),
+                PASSWORD,
+                &options,
+                false,
+            )
+            .unwrap();
+            let metadata = Metadata {
+                network: Network::Tcp,
+                host: "example.com".into(),
+                dst_port: 443,
+                ..Default::default()
+            };
+            let result = timeout(T, async {
+                if via_relay {
+                    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+                    adapter.connect_over(Box::new(stream), &metadata).await
+                } else {
+                    adapter.dial_tcp(&metadata).await
+                }
+            })
+            .await
+            .expect("ClientHello must not stall");
+            assert!(
+                result.is_err(),
+                "capture server terminates after ClientHello"
+            );
+            let suites = capture.await.unwrap();
+            match profile {
+                None => baseline = Some(suites),
+                Some("none" | "qq") => assert_eq!(Some(suites), baseline),
+                Some(_) => assert_ne!(Some(suites), baseline, "profile must shape ClientHello"),
+            }
+        }
+    }
 }
 
 #[tokio::test]

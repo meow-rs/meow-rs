@@ -847,8 +847,9 @@ fn parse_direct(
 /// Parse a `type: anytls` proxy block into an [`AnytlsAdapter`].
 ///
 /// Required fields: `server`, `port`, `password`. Optional: `sni`,
-/// `skip-cert-verify`, `udp`. Closes the parser side of issue #75; the wire
-/// protocol itself is provided by the `anytls-rs` crate.
+/// `skip-cert-verify`, `fingerprint`, `name-cert-verify`, `client-fingerprint`,
+/// `alpn`, `udp`. The wire protocol itself is
+/// provided by the `anytls-rs` crate.
 ///
 /// `udp` defaults to `false`, matching mihomo's `AnyTLSOption.UDP` (the
 /// adapter then relays datagrams over udp-over-tcp v2).
@@ -883,7 +884,33 @@ fn parse_anytls(
         .and_then(serde_yaml::Value::as_bool)
         .unwrap_or(false);
 
-    meow_proxy::AnytlsAdapter::new(name, server, port, password, sni, skip_cert_verify, udp)
+    let optional_string = |field: &str| match config.get(field) {
+        Some(serde_yaml::Value::String(value)) => Ok(Some(value.clone())),
+        None | Some(serde_yaml::Value::Null) => Ok(None),
+        Some(_) => Err(format!("anytls[{name}]: {field} must be a string")),
+    };
+    let alpn = match config.get("alpn") {
+        None | Some(serde_yaml::Value::Null) => Vec::new(),
+        Some(serde_yaml::Value::Sequence(values)) => values
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| format!("anytls[{name}]: alpn entries must be strings"))
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?,
+        Some(_) => return Err(format!("anytls[{name}]: alpn must be a string list")),
+    };
+    let options = meow_proxy::AnytlsTlsOptions {
+        sni: sni.map(str::to_string),
+        skip_cert_verify,
+        fingerprint: optional_string("fingerprint")?,
+        name_cert_verify: optional_string("name-cert-verify")?,
+        client_fingerprint: optional_string("client-fingerprint")?,
+        alpn,
+    };
+    meow_proxy::AnytlsAdapter::new_with_tls(name, server, port, password, &options, udp)
 }
 
 /// Parse a `type: hysteria2` proxy block.
@@ -3778,6 +3805,59 @@ tls: true
             panic!("zero port must hard-error (Class A)");
         };
         assert!(err.contains("port must be non-zero"), "msg: {err}");
+    }
+
+    #[cfg(feature = "anytls")]
+    #[tokio::test]
+    async fn parse_anytls_rejects_invalid_fingerprint() {
+        for value in ["chrome", "not-hex", "abcd", "true", "[abc]", "{pin: abc}"] {
+            let cfg = anytls_config(&format!(
+                "name: jp\ntype: anytls\nserver: 127.0.0.1\nport: 443\npassword: secret\nfingerprint: {value}\nskip-cert-verify: true\n"
+            ));
+            let Err(err) = parse_proxy(&cfg) else {
+                panic!("invalid fingerprint {value} must not be ignored");
+            };
+            assert!(err.contains("fingerprint"), "msg: {err}");
+        }
+    }
+
+    #[cfg(feature = "anytls")]
+    #[tokio::test]
+    async fn parse_anytls_optional_fingerprint_formats() {
+        for value in [
+            "null".to_string(),
+            "''".to_string(),
+            format!("'{}'", "ab".repeat(32)),
+            format!("' {} '", ["AB"; 32].join(":")),
+        ] {
+            for skip_cert_verify in [false, true] {
+                let cfg = anytls_config(&format!(
+                    "name: jp\ntype: anytls\nserver: 127.0.0.1\nport: 443\npassword: secret\nfingerprint: {value}\nskip-cert-verify: {skip_cert_verify}\nname-cert-verify: localhost\nalpn: [h2, http/1.1]\nclient-fingerprint: chrome\n"
+                ));
+                assert!(parse_proxy(&cfg).is_ok(), "fingerprint: {value}");
+            }
+        }
+    }
+
+    #[cfg(feature = "anytls")]
+    #[tokio::test]
+    async fn parse_anytls_rejects_malformed_tls_options() {
+        for (field, value) in [
+            ("name-cert-verify", "true"),
+            ("name-cert-verify", "[localhost]"),
+            ("client-fingerprint", "[chrome]"),
+            ("alpn", "h2"),
+            ("alpn", "[h2, 42]"),
+            ("alpn", "['']"),
+        ] {
+            let cfg = anytls_config(&format!(
+                "name: jp\ntype: anytls\nserver: 127.0.0.1\nport: 443\npassword: secret\n{field}: {value}\n"
+            ));
+            let Err(err) = parse_proxy(&cfg) else {
+                panic!("malformed {field}: {value} must not be ignored");
+            };
+            assert!(err.contains(field), "msg: {err}");
+        }
     }
 
     // ─── hysteria2 parser ────────────────────────────────────────────────────
