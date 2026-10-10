@@ -19,12 +19,10 @@
 //! new index, which the binding does not follow until it is re-installed
 //! (a TUN listener restart).
 //!
-//! On macOS a socket scoped to a physical interface cannot reach an IPv4
-//! loopback peer (`connect()` fails with `EADDRNOTAVAIL`), and loopback
-//! traffic never follows the TUN's routes anyway — so on the index-keyed
-//! platforms TCP dials to a loopback address, and UDP sockets pinned to a
-//! loopback local address, are left unbound (`binds_peer`). Linux keeps
-//! binding every socket, as it did before those platforms were added.
+//! Loopback and multicast destinations are left unbound on every platform,
+//! matching sing's interface-binding policy. UDP callers with a known peer
+//! use that destination, rather than their wildcard local address, to decide
+//! whether binding is necessary.
 //!
 //! This module is the process-global registry for that interface, mirroring
 //! the `SocketProtector` pattern in [`crate::socket_protect`]: the owners of
@@ -264,26 +262,25 @@ pub fn outbound_interface() -> Option<Arc<str>> {
     OWNERS.read().last().map(|o| Arc::clone(&o.iface))
 }
 
-/// Whether a socket talking to `peer` — a TCP dial's destination, or the
-/// local address a UDP socket is pinned to — takes the binding.
-///
-/// Loopback is exempt on the index-keyed platforms (see the
-/// [module docs](self)): the traffic never follows the TUN's routes, and
-/// macOS refuses an IPv4 loopback connect from an interface-scoped socket.
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+/// Whether traffic to `peer` takes the physical-interface binding.
+#[cfg(any(test, target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub(crate) fn binds_peer(peer: IpAddr) -> bool {
-    cfg!(target_os = "linux") || !is_loopback(peer)
+    let peer = peer.to_canonical();
+    !peer.is_loopback() && !peer.is_multicast()
 }
 
-/// Loopback including the IPv4-mapped form a dual-stack socket dials.
-#[cfg(any(test, target_os = "linux", target_os = "macos", target_os = "windows"))]
-fn is_loopback(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => v4.is_loopback(),
-        IpAddr::V6(v6) => {
-            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
-        }
+/// Apply the installed binding for a destination, leaving loopback and
+/// multicast traffic to the OS routing policy on every platform.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+pub fn apply_outbound_interface_for_peer(
+    socket: &socket2::Socket,
+    domain: socket2::Domain,
+    peer: IpAddr,
+) -> io::Result<()> {
+    if binds_peer(peer) {
+        apply_outbound_interface(socket, domain)?;
     }
+    Ok(())
 }
 
 /// Bind `socket` — created in `domain` — to the installed interface, if one
@@ -388,9 +385,18 @@ mod pure_tests {
     }
 
     #[test]
-    fn loopback_peers_include_the_mapped_form() {
-        for ip in ["127.0.0.1", "127.8.9.10", "::1", "::ffff:127.0.0.1"] {
-            assert!(is_loopback(ip.parse().unwrap()), "{ip}");
+    fn local_peers_bypass_binding_including_mapped_ipv4() {
+        for ip in [
+            "127.0.0.1",
+            "127.8.9.10",
+            "::1",
+            "::ffff:127.0.0.1",
+            "224.0.0.1",
+            "ff01::1",
+            "ff02::1",
+            "::ffff:224.0.0.1",
+        ] {
+            assert!(!binds_peer(ip.parse().unwrap()), "{ip}");
         }
         for ip in [
             "192.0.2.1",
@@ -399,7 +405,7 @@ mod pure_tests {
             "2001:db8::1",
             "::ffff:192.0.2.1",
         ] {
-            assert!(!is_loopback(ip.parse().unwrap()), "{ip}");
+            assert!(binds_peer(ip.parse().unwrap()), "{ip}");
         }
     }
 }
@@ -561,17 +567,16 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            // TCP: the dial is bound and still reaches a loopback listener.
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             let stream = connect_tcp_iface_bound(addr).await.expect("loopback dial");
             listener.accept().await.unwrap();
-            assert_bound_to_loopback(&SockRef::from(&stream), Domain::IPV4);
+            assert_unbound(&SockRef::from(&stream), Domain::IPV4);
 
             // UDP: a wildcard socket is bound and carries a datagram.
             let receiver = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let wildcard: SocketAddr = "0.0.0.0:0".parse().unwrap();
-            let socket = bind_udp_iface_bound(wildcard).expect("wildcard bind");
+            let socket = bind_udp_iface_bound(wildcard, wildcard.ip()).expect("wildcard bind");
             assert_bound_to_loopback(&SockRef::from(&socket), Domain::IPV4);
             socket
                 .send_to(b"ping", receiver.local_addr().unwrap())
@@ -582,8 +587,29 @@ mod tests {
             assert_eq!(&buf[..n], b"ping");
 
             let wildcard6: SocketAddr = "[::]:0".parse().unwrap();
-            let socket6 = bind_udp_iface_bound(wildcard6).expect("v6 wildcard bind");
+            let socket6 =
+                bind_udp_iface_bound(wildcard6, wildcard6.ip()).expect("v6 wildcard bind");
             assert_bound_to_loopback(&SockRef::from(&socket6), Domain::IPV6);
+
+            for (local, peer) in [
+                (wildcard, "127.0.0.1"),
+                (wildcard, "224.0.0.1"),
+                (wildcard6, "::1"),
+                (wildcard6, "ff01::1"),
+                (wildcard6, "ff02::1"),
+            ] {
+                let socket = bind_udp_iface_bound(local, peer.parse().unwrap()).unwrap();
+                let domain = if local.is_ipv4() {
+                    Domain::IPV4
+                } else {
+                    Domain::IPV6
+                };
+                assert_unbound(&SockRef::from(&socket), domain);
+            }
+
+            let pinned: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let pinned_socket = bind_udp_iface_bound(pinned, pinned.ip()).expect("loopback bind");
+            assert_unbound(&SockRef::from(&pinned_socket), Domain::IPV4);
 
             // The scope is enforced by the kernel, not just recorded: a
             // socket bound to loopback has no route to a non-loopback
@@ -597,14 +623,25 @@ mod tests {
                 assert_eq!(err.raw_os_error(), Some(libc::ENETUNREACH), "{err}");
                 let err = socket.send_to(b"x", outside).await.expect_err("scoped UDP");
                 assert_eq!(err.raw_os_error(), Some(libc::ENETUNREACH), "{err}");
-
-                // A UDP socket pinned to a loopback address is exempt.
-                let pinned: SocketAddr = "127.0.0.1:0".parse().unwrap();
-                let socket = bind_udp_iface_bound(pinned).expect("loopback bind");
-                assert_eq!(SockRef::from(&socket).device_index_v4().unwrap(), None);
-                assert!(!binds_peer(pinned.ip()) && binds_peer(outside.ip()));
             }
         });
+    }
+
+    fn assert_unbound(socket: &socket2::Socket, domain: socket2::Domain) {
+        #[cfg(target_os = "macos")]
+        {
+            let index = if domain == socket2::Domain::IPV6 {
+                socket.device_index_v6().unwrap()
+            } else {
+                socket.device_index_v4().unwrap()
+            };
+            assert_eq!(index, None);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let _ = domain;
+            assert_eq!(socket.device().unwrap(), None);
+        }
     }
 
     /// The kernel reports the binding the socket option installed.

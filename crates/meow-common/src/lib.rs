@@ -50,7 +50,7 @@ pub use home_dir::{meow_home_dir, resolved_home_dir, set_home_dir, xdg_home_dir}
 pub use metadata::{metadata_ip_literal, AddrDisplay, Metadata};
 pub use network::Network;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-pub use outbound_iface::apply_outbound_interface;
+pub use outbound_iface::{apply_outbound_interface, apply_outbound_interface_for_peer};
 pub use outbound_iface::{install_outbound_interface, outbound_interface, OutboundIfaceGuard};
 pub use process_lookup::{
     disable_socket_table_cache, find_process, find_process_async, ProcessInfo,
@@ -58,7 +58,9 @@ pub use process_lookup::{
 pub use replay_window::ReplayWindow;
 pub use rule::{Rule, RuleMatchHelper, RuleType, TargetCheck, TargetProbe};
 pub use sniffer::SnifferConfig;
-pub use socket_protect::{bind_udp, connect_tcp, connect_tcp_host, resolve_host, resolve_host_all};
+pub use socket_protect::{
+    bind_udp, bind_udp_for_peer, connect_tcp, connect_tcp_host, resolve_host, resolve_host_all,
+};
 // Host-resolver hook is cross-platform (iOS installs it without a protector).
 pub use socket_protect::{clear_host_resolver, host_resolver, set_host_resolver, HostResolver};
 // Socket protector is Android-only (raw-fd `VpnService.protect`).

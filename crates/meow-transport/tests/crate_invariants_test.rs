@@ -547,7 +547,7 @@ const RAW_SOCKET_ALLOWLIST: &[(&str, &str, usize, &str)] = &[
         "crates/meow-proxy/src/direct.rs",
         "Socket::new(",
         1,
-        "routing-mark dial; applies meow_common::apply_outbound_interface itself",
+        "routing-mark dial; applies meow_common::apply_outbound_interface_for_peer itself",
     ),
     // Vendored anytls: its own protect helper and its server side.
     (

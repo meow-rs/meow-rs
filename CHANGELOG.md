@@ -8,6 +8,12 @@ the canonical, in-repo source a release is cut from.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Outbound interface binding**: exempt loopback and multicast destinations
+  on Linux, macOS and Windows, using the actual UDP peer rather than the local
+  wildcard address. Preserve mapped IPv4 targets and IPv6 scope IDs.
+
 ### Added
 
 - **OpenWrt x86_64 packages** (issue #725): releases and alpha prereleases

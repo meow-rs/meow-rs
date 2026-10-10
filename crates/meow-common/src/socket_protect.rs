@@ -293,8 +293,8 @@ pub use android::{
 
 /// Dial an outbound TCP stream to an already-resolved [`SocketAddr`]. On
 /// Android, applies the installed `SocketProtector` (if any) to the
-/// socket fd before `connect()` so the connection bypasses the VPN. On
-/// every other target this is equivalent to [`TcpStream::connect`].
+/// socket fd before `connect()` so the connection bypasses the VPN.
+/// Desktop targets apply the installed outbound-interface policy.
 ///
 /// Callers that only have a hostname must use [`connect_tcp_host`] —
 /// passing a hostname here is a compile error by construction (the type
@@ -334,7 +334,7 @@ pub(crate) async fn connect_tcp_iface_bound(addr: SocketAddr) -> io::Result<TcpS
         socket2::Domain::IPV6
     };
     let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
-    crate::outbound_iface::apply_outbound_interface(&socket, domain)?;
+    crate::outbound_iface::apply_outbound_interface_for_peer(&socket, domain, addr.ip())?;
     socket.set_nonblocking(true)?;
     let tokio_socket = tokio::net::TcpSocket::from_std_stream(socket.into());
     tokio_socket.connect(addr).await
@@ -489,9 +489,29 @@ pub async fn resolve_host_all(host: &str, port: u16) -> io::Result<Vec<SocketAdd
 }
 
 /// Bind an outbound UDP socket. On Android, applies the installed
-/// `SocketProtector` (if any) to the socket fd before `bind()`. On every
-/// other target this is equivalent to [`UdpSocket::bind`].
+/// `SocketProtector` (if any) to the socket fd before `bind()`. Desktop
+/// targets apply the installed outbound-interface policy.
 pub async fn bind_udp<A: ToSocketAddrs>(local: A) -> io::Result<UdpSocket> {
+    bind_udp_with_peer(local, None).await
+}
+
+/// Bind an outbound UDP socket using the destination's address family and
+/// interface policy, including loopback and multicast exemptions.
+pub async fn bind_udp_for_peer(peer: IpAddr) -> io::Result<UdpSocket> {
+    let peer = peer.to_canonical();
+    let local = match peer {
+        IpAddr::V4(_) => std::net::Ipv4Addr::UNSPECIFIED.into(),
+        IpAddr::V6(_) => std::net::Ipv6Addr::UNSPECIFIED.into(),
+    };
+    bind_udp_with_peer(SocketAddr::new(local, 0), Some(peer)).await
+}
+
+async fn bind_udp_with_peer<A: ToSocketAddrs>(
+    local: A,
+    peer: Option<IpAddr>,
+) -> io::Result<UdpSocket> {
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    let _ = peer;
     #[cfg(any(target_os = "android", all(test, unix)))]
     {
         if let Some(p) = android::socket_protector() {
@@ -516,7 +536,7 @@ pub async fn bind_udp<A: ToSocketAddrs>(local: A) -> io::Result<UdpSocket> {
                 .ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidInput, "bind_udp: no address resolved")
                 })?;
-            return bind_udp_iface_bound(resolved);
+            return bind_udp_iface_bound(resolved, peer.unwrap_or(resolved.ip()));
         }
     }
     UdpSocket::bind(local).await
@@ -524,19 +544,16 @@ pub async fn bind_udp<A: ToSocketAddrs>(local: A) -> io::Result<UdpSocket> {
 
 /// Bind a UDP socket to the installed outbound interface
 /// (`SO_BINDTODEVICE` / `IP_BOUND_IF` / `IP_UNICAST_IF`), then to `local`.
-/// A socket pinned to a loopback `local` address is left unbound where the
-/// platform's binding would break it (see `outbound_iface::binds_peer`).
+/// The destination determines whether the interface binding is required.
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-pub(crate) fn bind_udp_iface_bound(local: SocketAddr) -> io::Result<UdpSocket> {
+pub(crate) fn bind_udp_iface_bound(local: SocketAddr, peer: IpAddr) -> io::Result<UdpSocket> {
     let domain = if local.is_ipv4() {
         socket2::Domain::IPV4
     } else {
         socket2::Domain::IPV6
     };
     let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
-    if crate::outbound_iface::binds_peer(local.ip()) {
-        crate::outbound_iface::apply_outbound_interface(&socket, domain)?;
-    }
+    crate::outbound_iface::apply_outbound_interface_for_peer(&socket, domain, peer)?;
     socket.bind(&local.into())?;
     socket.set_nonblocking(true)?;
     UdpSocket::from_std(socket.into())
@@ -857,6 +874,9 @@ mod tests {
         let sock = bind_udp(addr).await.expect("bind");
         assert!(sock.local_addr().unwrap().port() != 0);
         assert_eq!(counter.count(), 1);
+        let peer_sock = bind_udp_for_peer(addr.ip()).await.expect("peer bind");
+        assert!(peer_sock.local_addr().unwrap().port() != 0);
+        assert_eq!(counter.count(), 2);
         clear_socket_protector();
     }
 

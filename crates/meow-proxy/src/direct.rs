@@ -3,7 +3,7 @@ use meow_common::{
     AdapterType, MeowError, Metadata, ProxyAdapter, ProxyConn, ProxyHealth, ProxyPacketConn, Result,
 };
 use meow_dns::Resolver;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpStream, UdpSocket};
@@ -227,7 +227,11 @@ impl ProxyPacketConn for DirectPacketConn {
             // send_to() with the caller's placeholder arg would fail with
             // EISCONN on a connected socket.
             Some(_) => self.socket.send(buf).await.map_err(MeowError::Io),
-            None => self.socket.send_to(buf, addr).await.map_err(MeowError::Io),
+            None => {
+                let mut addr = *addr;
+                addr.set_ip(addr.ip().to_canonical());
+                self.socket.send_to(buf, addr).await.map_err(MeowError::Io)
+            }
         }
     }
 
@@ -292,7 +296,7 @@ async fn connect_with_mark(
         // TUN global-route loop avoidance (#375): this branch bypasses
         // `meow_common::connect_tcp`, so apply the outbound-interface
         // binding here too (no-op when none is installed).
-        meow_common::apply_outbound_interface(&socket, domain)?;
+        meow_common::apply_outbound_interface_for_peer(&socket, domain, dest.ip())?;
         socket.set_nonblocking(true)?;
 
         match socket.connect(&dest.into()) {
@@ -375,13 +379,9 @@ impl ProxyAdapter for DirectAdapter {
         // placeholder.
         if metadata.domain_udp_target().is_some() {
             let mut last_err = None;
-            for addr in self.resolve_targets(metadata).await? {
-                let bind: SocketAddr = if addr.is_ipv4() {
-                    "0.0.0.0:0".parse().expect("static")
-                } else {
-                    "[::]:0".parse().expect("static")
-                };
-                let socket = match meow_common::bind_udp(bind).await {
+            for mut addr in self.resolve_targets(metadata).await? {
+                addr.set_ip(addr.ip().to_canonical());
+                let socket = match meow_common::bind_udp_for_peer(addr.ip()).await {
                     Ok(s) => s,
                     Err(e) => {
                         last_err = MeowError::prefer_errno_io(last_err, e);
@@ -413,12 +413,11 @@ impl ProxyAdapter for DirectAdapter {
         // session only ever targets one destination → one address family; we
         // bind the matching family up front. Falls back to IPv4 when the
         // destination family is unknown (preserves the legacy behaviour).
-        let dst_is_v6 = match metadata.dst_ip {
-            Some(ip) => ip.is_ipv6(),
-            None => meow_common::metadata_ip_literal(&metadata.host).is_some_and(|ip| ip.is_ipv6()),
-        };
-        let bind_addr = if dst_is_v6 { "[::]:0" } else { "0.0.0.0:0" };
-        let socket = meow_common::bind_udp(bind_addr)
+        let peer = metadata
+            .dst_ip
+            .or_else(|| meow_common::metadata_ip_literal(&metadata.host))
+            .unwrap_or(Ipv4Addr::UNSPECIFIED.into());
+        let socket = meow_common::bind_udp_for_peer(peer)
             .await
             .map_err(MeowError::Io)?;
         Ok(Box::new(DirectPacketConn {
