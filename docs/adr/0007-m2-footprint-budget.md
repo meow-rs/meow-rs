@@ -107,16 +107,19 @@ Not shipping in M2 (explicitly): `armv7-musl` (covered by aarch64 for M2
 priorities), `mips-musl` (big-endian is vanishing), Windows,
 macOS-universal, any glibc target. Those are future releases.
 
-**Amendment — `armv7-musl` now ships** (release-target PR, 2026-10).
+**Amendment — `armv7-musl` now ships** (PR #744, 2026-10).
 `armv7-unknown-linux-musleabihf` is built and published as a static musl
 binary. The M2 reason above was prioritization, but the "cannot be built
 with TLS at all" note in `build.yml` did hold for the `cargo zigbuild`
-path: zig's musl headers declare `time_t` 64-bit on 32-bit targets while
-Rust's `libc` crate types it as `i32`, so `boring` fails to compile
-(E0308). A real musl cross toolchain has no such disagreement and builds
-the target statically. It carries no cap here — `minimal_budget_bytes` is
-0 (informational) until someone measures the `minimal` feature set on it;
-if a cap is wanted, §6 applies as usual.
+path: musl 1.2.x headers declare `time_t` 64-bit on 32-bit targets
+(time64/Y2038) while Rust's `libc` crate types it as `i32`, so bindgen
+emits 64-bit signatures and `boring` fails to compile (E0308) — and
+zig-linked static armv7 binaries were unreliable under QEMU in testing.
+A real musl cross toolchain container builds the target statically; the
+same time64-vs-`libc` disagreement there is bridged by a one-line cast in
+`boring` (`meow-rs` never calls `set_time`). It carries no cap here —
+`minimal_budget_bytes` is 0 (informational) until someone measures the
+`minimal` feature set on it; if a cap is wanted, §6 applies as usual.
 
 **Why mipsel is soft for M2:** roadmap §M2 item 3 names mipsel-musl
 explicitly, but the current tree has zero mipsel build infrastructure

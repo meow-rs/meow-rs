@@ -6,8 +6,9 @@ This page takes you from a fresh clone to a running proxy with a live dashboard.
 
 - **Rust 1.89+** (the workspace pins a minimum `rust-version`). Install via
   [rustup](https://rustup.rs).
-- A C toolchain is only needed if you enable the optional BoringSSL backend
-  (`boring-tls`, used for ECH).
+- A C toolchain (C/C++ compiler, cmake, libclang) is needed to build:
+  BoringSSL via `boring-sys` is a hard dependency of the default
+  (`full`) and `minimal` feature sets.
 
 ## Build
 
