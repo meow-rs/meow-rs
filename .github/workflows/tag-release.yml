@@ -1,0 +1,108 @@
+name: Tag release
+
+# Step 2 of a release (docs/RELEASING.md). When a push to main changes the
+# workspace version — i.e. a `chore(release): X.Y.Z` PR from
+# prepare-release.yml was merged — tag the pushed commit `vX.Y.Z`, then run
+# the crates.io publish and the GitHub Release for that tag.
+#
+# Tags pushed with GITHUB_TOKEN do not trigger workflows, so publish.yml and
+# release.yml are called here via workflow_call rather than by the tag push.
+# Pushing a v* tag by hand still triggers both directly; that remains the
+# manual fallback. If the tag already exists, nothing runs (it was released
+# that way, or by an earlier run of this workflow).
+
+on:
+  push:
+    branches: [main]
+    paths: [Cargo.toml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tag-release
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    name: Tag version bump
+    if: github.repository == 'meow-rs/meow-rs'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # The pre-push commit is needed to tell whether the version changed.
+          fetch-depth: 0
+
+      - name: Detect version bump
+        id: detect
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          version_at() {
+            git show "$1:Cargo.toml" |
+              sed -nE '/^\[workspace\.package\]/,/^\[/ s/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' |
+              head -n1
+          }
+          new=$(version_at "$GITHUB_SHA")
+          old=$(version_at "$BEFORE")
+          echo "workspace version: $old -> $new"
+          if [ -z "$new" ] || [ -z "$old" ]; then
+            echo "::error::could not parse the workspace version at $BEFORE or $GITHUB_SHA"
+            exit 1
+          fi
+          if [ "$new" = "$old" ]; then
+            echo "Version unchanged; nothing to release."
+            exit 0
+          fi
+          if [ "$(printf '%s\n%s\n' "$old" "$new" | sort -V | tail -n1)" != "$new" ]; then
+            echo "::warning::version went down ($old -> $new); not releasing"
+            exit 0
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/v$new" >/dev/null; then
+            echo "::notice::tag v$new already exists; it was released from that tag"
+            exit 0
+          fi
+          # A version bump without its CHANGELOG cut is not a release commit.
+          scripts/release/changelog-section.sh "$new" >/dev/null
+          echo "version=$new" >>"$GITHUB_OUTPUT"
+
+      - name: Create tag
+        id: tag
+        if: steps.detect.outputs.version != ''
+        env:
+          VERSION: ${{ steps.detect.outputs.version }}
+        run: |
+          set -euo pipefail
+          tag="v$VERSION"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git tag -a "$tag" -m "$tag" "$GITHUB_SHA"
+          git push origin "refs/tags/$tag"
+          echo "::notice::tagged $tag at $GITHUB_SHA"
+          echo "tag=$tag" >>"$GITHUB_OUTPUT"
+
+  publish:
+    name: crates.io
+    needs: tag
+    if: needs.tag.outputs.tag != ''
+    uses: ./.github/workflows/publish.yml
+    with:
+      release_tag: ${{ needs.tag.outputs.tag }}
+    secrets:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  release:
+    name: GitHub Release
+    needs: tag
+    if: needs.tag.outputs.tag != ''
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release.yml
+    with:
+      release_tag: ${{ needs.tag.outputs.tag }}

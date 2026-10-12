@@ -1,0 +1,115 @@
+name: Prepare release
+
+# Step 1 of a release (issue #709, docs/RELEASING.md). Bumps the lockstep
+# workspace version, refreshes Cargo.lock and cuts CHANGELOG.md's
+# [Unreleased] section (scripts/release/prepare.sh), then pushes the result
+# as one `chore(release): X.Y.Z` commit on branch `release/vX.Y.Z`.
+#
+# It does not open the PR: the repo does not let GITHUB_TOKEN create pull
+# requests, and a PR opened by GITHUB_TOKEN would not run test.yml anyway.
+# The run summary links a prefilled compare page — open the PR from there,
+# review the cut CHANGELOG, merge it. tag-release.yml does the rest.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: >-
+          Version to release (X.Y.Z). Empty = infer from the commits since
+          the last tag: breaking or feat -> minor, else patch (pre-1.0).
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: prepare-release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Prepare release branch
+    if: github.repository == 'meow-rs/meow-rs'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Require main
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::run this workflow from main (got $GITHUB_REF)"
+          exit 1
+
+      - uses: actions/checkout@v5
+        with:
+          # Full history + tags: the version inference reads the commits
+          # since the last v* tag.
+          fetch-depth: 0
+
+      - name: Setup Rust toolchain
+        run: |
+          tc=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n1)
+          if [ -z "$tc" ]; then
+            echo "::error::could not parse channel from rust-toolchain.toml"
+            exit 1
+          fi
+          rustup toolchain install "$tc" --profile minimal --no-self-update
+
+      - name: Bump version and cut CHANGELOG
+        id: prepare
+        env:
+          VERSION: ${{ inputs.version }}
+        run: scripts/release/prepare.sh ${VERSION:+"$VERSION"}
+
+      - name: Commit and push release branch
+        id: push
+        env:
+          VERSION: ${{ steps.prepare.outputs.version }}
+          PREVIOUS: ${{ steps.prepare.outputs.previous }}
+          ACTOR: ${{ github.actor }}
+          ACTOR_ID: ${{ github.actor_id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          branch="release/v$VERSION"
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null; then
+            echo "::error::branch $branch already exists; delete it (or merge its PR) and re-run"
+            exit 1
+          fi
+          # Authored by whoever dispatched the run; committed by the bot.
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -c "$branch"
+          git add Cargo.toml Cargo.lock CHANGELOG.md crates/*/Cargo.toml
+          git commit \
+            --author "$ACTOR <$ACTOR_ID+$ACTOR@users.noreply.github.com>" \
+            -m "chore(release): $VERSION" \
+            -m "Bump the workspace from $PREVIOUS to $VERSION and cut the CHANGELOG.md
+          [Unreleased] section. Merging this tags v$VERSION on the merge commit and
+          publishes crates.io + the GitHub Release (tag-release.yml).
+
+          Prepared by $RUN_URL"
+          git show --stat HEAD
+          git push origin "HEAD:refs/heads/$branch"
+          echo "branch=$branch" >>"$GITHUB_OUTPUT"
+
+      - name: Summary
+        env:
+          VERSION: ${{ steps.prepare.outputs.version }}
+          BRANCH: ${{ steps.push.outputs.branch }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          title="chore%28release%29%3A%20$VERSION"
+          {
+            echo "## Release $VERSION prepared"
+            echo
+            echo "Branch \`$BRANCH\` is pushed. **[Open the release PR]($REPO_URL/compare/main...$BRANCH?quick_pull=1&title=$title)**,"
+            echo "review the notes below, and merge it to tag \`v$VERSION\` and publish."
+            echo
+            echo "### Release notes (CHANGELOG.md)"
+            echo
+            scripts/release/changelog-section.sh "$VERSION"
+          } >>"$GITHUB_STEP_SUMMARY"
