@@ -5,10 +5,18 @@
 //! HTTP providers with `interval > 0` expose a `refresh()` method that is
 //! called from per-provider tasks owned by
 //! [`crate::rule_provider_refresh::RefreshSupervisor`].
+//!
+//! HTTP payloads load cache-first: a provider with an on-disk cache starts
+//! from it without a request, and the ones without download concurrently
+//! (bounded by [`crate::provider_fetch_deadline`]). Whatever the load left
+//! owing — a cache to revalidate, an empty set to fill, a download still
+//! running at the deadline — is fetched in the background once the provider
+//! is committed ([`RuleProvider::spawn_initial_fetch`]).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
@@ -21,9 +29,12 @@ use meow_rules::{
 };
 use parking_lot::RwLock;
 use std::sync::atomic::Ordering;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::internal_http;
+use crate::proxy_provider::{
+    BACKGROUND_RETRY_MAX, BACKGROUND_RETRY_MIN, MAX_REVALIDATION_ATTEMPTS,
+};
 use crate::raw::RawRuleProvider;
 
 // ---------------------------------------------------------------------------
@@ -102,8 +113,8 @@ pub struct RuleProvider {
     /// Resolved on-disk cache location, http providers only (inside
     /// `cache_dir`; `None` when the build context has no cache directory).
     /// `refresh()` writes each successfully parsed payload here so a
-    /// `prefer_cache` restart loads the newest refresh instead of the
-    /// initial-load-era file (issue #543).
+    /// restart, which loads cache-first, starts from the newest refresh
+    /// instead of the initial-load-era file (issue #543).
     cache_path: Option<PathBuf>,
     /// Serializes `write_cache` across concurrent `refresh()` calls —
     /// a supervisor tick and a `PUT /providers/rules/{name}` can run at
@@ -119,6 +130,22 @@ pub struct RuleProvider {
     install_gen: parking_lot::Mutex<u64>,
     /// Monotonic refresh generation, taken after the awaited fetch.
     refresh_gen: meow_common::atomic::AtomicU,
+    /// The remote fetch the load left owing, taken by
+    /// [`Self::spawn_initial_fetch`] once the provider is committed.
+    initial_fetch: parking_lot::Mutex<InitialFetch>,
+}
+
+/// What an http provider's load left for the background to fetch.
+enum InitialFetch {
+    /// Loaded from a download (or not http): nothing owed.
+    Settled,
+    /// Serving its on-disk cache: refetch it, with bounded retries.
+    Revalidate,
+    /// Loaded empty: fetch until a payload lands.
+    Retry,
+    /// Loaded empty while its startup download was still running at the
+    /// fetch deadline: adopt that download before fetching again.
+    Adopt(PendingFetch),
 }
 
 impl std::fmt::Debug for RuleProvider {
@@ -218,12 +245,6 @@ impl RuleProvider {
                 .with_context(|| format!("reading provider file {}", self.vehicle))?,
             ProviderType::Inline => return Ok(()),
         };
-        let behavior = self.behavior;
-        let strict = self.strict;
-        let ctx_clone = self.ctx.clone();
-        let format = self.format;
-        let cache_path = self.cache_path.clone();
-        let cache_write_lock = Arc::clone(&self.cache_write_lock);
         // Generation taken when the fetch completes: under the write lock
         // an older refresh that finishes after a newer one already wrote
         // skips its own write, so the file never regresses (issue #621).
@@ -232,13 +253,39 @@ impl RuleProvider {
             reason = "identity on 64-bit; narrows u64 on targets without 64-bit atomics"
         )]
         let gen: u64 = self.refresh_gen.fetch_add(1, Ordering::Relaxed).into();
+        self.install_payload(Arc::new(bytes), gen).await
+    }
+
+    /// Install the startup download a deadline left running. `Ok(false)`
+    /// when a refresh has already finished fetching: its payload is newer,
+    /// since the startup download began before any refresh did.
+    async fn adopt_download(&self, bytes: Arc<Vec<u8>>) -> Result<bool> {
+        if self
+            .refresh_gen
+            .compare_exchange(1, 2, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return Ok(false);
+        }
+        self.install_payload(bytes, 1).await.map(|()| true)
+    }
+
+    /// Parse fetched payload bytes on a blocking thread, persist them, and
+    /// install them as refresh generation `gen`.
+    async fn install_payload(&self, bytes: Arc<Vec<u8>>, gen: u64) -> Result<()> {
+        let behavior = self.behavior;
+        let strict = self.strict;
+        let ctx_clone = self.ctx.clone();
+        let format = self.format;
+        let cache_path = self.cache_path.clone();
+        let cache_write_lock = Arc::clone(&self.cache_write_lock);
         let boxed: Box<dyn RuleSet> = crate::spawn_blocking_with_current_dispatcher(move || {
             let rules =
                 parse_bytes_to_ruleset_with_format(&bytes, behavior, format, &ctx_clone, strict)?;
             // Persist the payload only *after* the parse succeeds so the
-            // cache always holds the last usable payload — a
-            // `prefer_cache` restart then picks up the newest refresh
-            // rather than the initial-load-era file (issue #543). The
+            // cache always holds the last usable payload — a cache-first
+            // restart then picks up the newest refresh rather than the
+            // initial-load-era file (issue #543). The
             // write+rename runs on this blocking thread: synchronous fs
             // I/O on the async worker can stall the executor (issue #621).
             if let Some(path) = &cache_path {
@@ -290,13 +337,51 @@ impl RuleProvider {
         Ok(())
     }
 
+    /// Fetch, on a detached task, whatever remote payload this provider's
+    /// load left owing:
+    ///
+    /// - serving its on-disk cache: refetch it, retrying with backoff up to
+    ///   `MAX_REVALIDATION_ATTEMPTS` times, then leave it to the `interval`
+    ///   loop with the cached rules installed;
+    /// - loaded empty: retry with backoff (5 s doubling to 5 min) until a
+    ///   payload lands;
+    /// - its startup download was still running at the fetch deadline: wait
+    ///   for that download first, so it is not requested twice.
+    ///
+    /// Ends early once any refresh — an `interval` tick or a manual one —
+    /// installs a remote payload, and holds only a `Weak` between attempts,
+    /// so a provider dropped by a config commit ends it. The obligation is
+    /// taken, so this spawns at most once per provider: `None` when nothing
+    /// is owed. [`crate::rule_provider_refresh::RefreshSupervisor::reconcile`]
+    /// calls it for every committed provider.
+    pub fn spawn_initial_fetch(self: &Arc<Self>) -> Option<tokio::task::JoinHandle<()>> {
+        let owed = std::mem::replace(&mut *self.initial_fetch.lock(), InitialFetch::Settled);
+        if matches!(owed, InitialFetch::Settled) {
+            return None;
+        }
+        Some(tokio::spawn(initial_fetch_loop(Arc::downgrade(self), owed)))
+    }
+
+    fn owe(&self, owed: InitialFetch) {
+        *self.initial_fetch.lock() = owed;
+    }
+
+    /// Whether a refresh has installed a remote payload yet.
+    fn fetched_remote(&self) -> bool {
+        *self.install_gen.lock() > 0
+    }
+
     fn touch(&self) {
-        let now = SystemTime::now()
+        self.set_updated_at(SystemTime::now());
+    }
+
+    fn set_updated_at(&self, at: SystemTime) {
+        let secs = at
             .duration_since(UNIX_EPOCH)
             .unwrap_or(Duration::ZERO)
             .as_secs();
         self.updated_at
-            .store(now as meow_common::atomic::Uint, Ordering::Relaxed);
+            .store(secs as meow_common::atomic::Uint, Ordering::Relaxed);
     }
 
     /// Atomically install a freshly-parsed rule set (initial fill after an
@@ -307,15 +392,293 @@ impl RuleProvider {
     }
 }
 
+async fn initial_fetch_loop(provider: Weak<RuleProvider>, owed: InitialFetch) {
+    let bounded = matches!(owed, InitialFetch::Revalidate);
+    let mut delay = BACKGROUND_RETRY_MIN;
+    if let InitialFetch::Adopt(pending) = owed {
+        let outcome = pending.wait().await;
+        let Some(p) = provider.upgrade() else {
+            return;
+        };
+        match outcome {
+            Ok(bytes) => match p.adopt_download(bytes).await {
+                Ok(true) => {
+                    info!(provider = %p.name, "rule-provider download finished in the background");
+                    return;
+                }
+                Ok(false) => {}
+                Err(e) => warn!(provider = %p.name, "rule-provider payload rejected: {e:#}"),
+            },
+            Err(e) => warn!(provider = %p.name, "rule-provider download failed: {e}"),
+        }
+        // A finished-but-failed download was the first attempt: back off
+        // before the next one. Superseded means a refresh already fetched.
+        if !p.fetched_remote() {
+            drop(p);
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(BACKGROUND_RETRY_MAX);
+        }
+    }
+    let mut failed_revalidations = 0;
+    loop {
+        let Some(p) = provider.upgrade() else {
+            return;
+        };
+        if p.fetched_remote() {
+            return;
+        }
+        let Err(e) = p.refresh().await else {
+            return;
+        };
+        if bounded {
+            failed_revalidations += 1;
+            if failed_revalidations >= MAX_REVALIDATION_ATTEMPTS {
+                warn!(provider = %p.name,
+                    "rule-provider refetch failed; keeping the cached rules until the next refresh: {e:#}");
+                return;
+            }
+        }
+        warn!(provider = %p.name, retry_in = ?delay, "rule-provider fetch failed; retrying: {e:#}");
+        drop(p);
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(BACKGROUND_RETRY_MAX);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Loader
 // ---------------------------------------------------------------------------
 
-/// Payload bytes of file/http rule-providers, fetched/read once and keyed by
-/// provider name. Reused for both the geo-allowlist scan (issue #277) and the
-/// provider parse passes so each payload is fetched exactly once per (re)load.
-/// Inline providers never appear here — their payload lives in the raw config.
-pub type PrefetchedPayloads = HashMap<String, Vec<u8>>;
+/// Payloads of file/http rule-providers, acquired once per (re)load and keyed
+/// by provider name. Reused for both the geo-allowlist scan (issue #277) and
+/// the provider parse passes, so each payload is fetched at most once per
+/// (re)load: a failed download is recorded too, and the later passes
+/// register that provider empty instead of fetching it again. Inline
+/// providers never appear here — their payload lives in the raw config.
+#[derive(Default)]
+pub struct PrefetchedPayloads {
+    entries: HashMap<String, Prefetched>,
+}
+
+impl PrefetchedPayloads {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record `bytes` as `name`'s payload; the load passes parse it as-is.
+    pub fn insert(&mut self, name: String, bytes: Vec<u8>) {
+        self.entries.insert(name, Prefetched::Fresh(bytes));
+    }
+
+    /// Every acquired payload. Failed and still-running downloads have none.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &[u8])> {
+        self.entries
+            .iter()
+            .filter_map(|(name, entry)| Some((name.as_str(), entry.bytes()?)))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+/// How [`prefetch_payloads`] acquired one provider's payload.
+enum Prefetched {
+    /// Bytes parsed as-is: a `file` payload, or one a caller supplied.
+    Fresh(Vec<u8>),
+    /// An http download that just completed. The first load pass that
+    /// parses it writes the provider's cache, so the cache only ever holds
+    /// a payload that parsed.
+    Downloaded {
+        bytes: Vec<u8>,
+        persisted: AtomicBool,
+    },
+    /// An http provider's on-disk cache, read without a request.
+    Cached {
+        bytes: Vec<u8>,
+        modified: Option<SystemTime>,
+    },
+    /// The download failed; the load pass reports it.
+    Failed(String),
+    /// Still downloading at the fetch deadline.
+    Pending(PendingFetch),
+}
+
+impl Prefetched {
+    fn bytes(&self) -> Option<&[u8]> {
+        match self {
+            Self::Fresh(bytes) | Self::Downloaded { bytes, .. } | Self::Cached { bytes, .. } => {
+                Some(bytes)
+            }
+            Self::Failed(_) | Self::Pending(_) => None,
+        }
+    }
+}
+
+type DownloadResult = Result<Arc<Vec<u8>>, Arc<str>>;
+
+/// A download the fetch deadline left running. It keeps going on its own
+/// thread; the provider built for it adopts the result when it lands.
+#[derive(Clone)]
+struct PendingFetch(tokio::sync::watch::Receiver<Option<DownloadResult>>);
+
+impl PendingFetch {
+    async fn wait(mut self) -> DownloadResult {
+        match self.0.wait_for(Option::is_some).await {
+            Ok(result) => result
+                .clone()
+                .unwrap_or_else(|| unreachable!("waited for Some")),
+            Err(_) => Err(Arc::from("the download ended without a result")),
+        }
+    }
+}
+
+/// One http payload the prefetch has to download.
+struct Download {
+    name: String,
+    url: String,
+    proxy: Option<Arc<dyn Proxy>>,
+    headers: Vec<(String, String)>,
+}
+
+enum DownloadState {
+    Running,
+    Done(Result<Vec<u8>, String>),
+    /// The deadline passed first: the result goes to whoever adopts it.
+    Detached(tokio::sync::watch::Sender<Option<DownloadResult>>),
+    Taken,
+}
+
+/// Download progress shared between the prefetch and its worker thread.
+struct DownloadBoard {
+    states: parking_lot::Mutex<Vec<DownloadState>>,
+    changed: parking_lot::Condvar,
+}
+
+impl DownloadBoard {
+    fn complete(&self, index: usize, result: Result<Vec<u8>, String>) {
+        let mut states = self.states.lock();
+        match std::mem::replace(&mut states[index], DownloadState::Taken) {
+            DownloadState::Detached(adopter) => {
+                adopter.send_replace(Some(result.map(Arc::new).map_err(Arc::from)));
+            }
+            DownloadState::Running => {
+                states[index] = DownloadState::Done(result);
+                self.changed.notify_all();
+            }
+            done @ (DownloadState::Done(_) | DownloadState::Taken) => states[index] = done,
+        }
+    }
+}
+
+/// Fails every download still running when the worker exits, however it
+/// exits — the prefetch must never wait on a result that cannot come.
+struct AbandonRemaining(Arc<DownloadBoard>, usize);
+
+impl Drop for AbandonRemaining {
+    fn drop(&mut self) {
+        for index in 0..self.1 {
+            self.0
+                .complete(index, Err("the download worker exited".to_string()));
+        }
+    }
+}
+
+/// Download every payload concurrently on one worker thread and wait for
+/// them until `deadline`. Downloads still running then keep going and are
+/// returned as [`Prefetched::Pending`].
+fn download_all(downloads: Vec<Download>, deadline: Option<Duration>) -> Vec<(String, Prefetched)> {
+    if downloads.is_empty() {
+        return Vec::new();
+    }
+    let count = downloads.len();
+    let names: Vec<String> = downloads.iter().map(|d| d.name.clone()).collect();
+    let board = Arc::new(DownloadBoard {
+        states: parking_lot::Mutex::new((0..count).map(|_| DownloadState::Running).collect()),
+        changed: parking_lot::Condvar::new(),
+    });
+    let deadline_at = deadline.and_then(|d| std::time::Instant::now().checked_add(d));
+    let worker_board = Arc::clone(&board);
+    let dispatch = tracing::dispatcher::get_default(Clone::clone);
+    let spawned = std::thread::Builder::new()
+        .name("rule-provider-fetch".to_string())
+        .spawn(move || {
+            tracing::dispatcher::with_default(&dispatch, || {
+                let _abandon = AbandonRemaining(Arc::clone(&worker_board), count);
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(e) => {
+                        warn!("rule-provider downloads: cannot build a runtime: {e}");
+                        return;
+                    }
+                };
+                runtime.block_on(async {
+                    let mut tasks = tokio::task::JoinSet::new();
+                    let mut indexes = HashMap::with_capacity(count);
+                    for (index, d) in downloads.into_iter().enumerate() {
+                        let task = tasks.spawn(async move {
+                            internal_http::fetch(&d.url, d.proxy.as_ref(), &d.headers).await
+                        });
+                        indexes.insert(task.id(), index);
+                    }
+                    while let Some(joined) = tasks.join_next_with_id().await {
+                        let (id, result) = match joined {
+                            Ok((id, result)) => (id, result.map_err(|e| format!("{e:#}"))),
+                            Err(e) => (e.id(), Err(format!("download task failed: {e}"))),
+                        };
+                        worker_board.complete(indexes[&id], result);
+                    }
+                });
+            });
+        });
+    if let Err(e) = spawned {
+        let error = format!("cannot spawn the download thread: {e}");
+        return names
+            .into_iter()
+            .map(|name| (name, Prefetched::Failed(error.clone())))
+            .collect();
+    }
+
+    let mut states = board.states.lock();
+    while states.iter().any(|s| matches!(s, DownloadState::Running)) {
+        match deadline_at {
+            None => board.changed.wait(&mut states),
+            Some(at) => {
+                if board.changed.wait_until(&mut states, at).timed_out() {
+                    break;
+                }
+            }
+        }
+    }
+    names
+        .into_iter()
+        .zip(states.iter_mut())
+        .map(|(name, state)| {
+            let entry = match std::mem::replace(state, DownloadState::Taken) {
+                DownloadState::Done(Ok(bytes)) => Prefetched::Downloaded {
+                    bytes,
+                    persisted: AtomicBool::new(false),
+                },
+                DownloadState::Done(Err(e)) => {
+                    debug!("rule-provider '{name}': download failed: {e}");
+                    Prefetched::Failed(e)
+                }
+                DownloadState::Running => {
+                    let (adopter, pending) = tokio::sync::watch::channel(None);
+                    *state = DownloadState::Detached(adopter);
+                    Prefetched::Pending(PendingFetch(pending))
+                }
+                DownloadState::Detached(_) | DownloadState::Taken => {
+                    unreachable!("only this harvest detaches or takes a download")
+                }
+            };
+            (name, entry)
+        })
+        .collect()
+}
 
 /// Resolves a per-provider `proxy:` name (mihomo compat, issue #377) to a
 /// live proxy at load time. Returns `None` for names it cannot resolve.
@@ -350,81 +713,157 @@ fn effective_download_proxy(
     }
 }
 
-/// Fetch/read the raw payload bytes of every file/http provider without
-/// parsing them. Failures are logged and skipped; `load_providers_prefetched`
-/// retries any provider missing from the map and reports the error there.
+/// Acquire the payload of every file/http provider without parsing it.
 ///
-/// A `proxy:` name `lookup` cannot resolve (provider-sourced proxies are
-/// never indexed by the lookup, and the prefetch layer can be absent when
-/// the caller had no need to build it) skips the prefetch quietly — the
-/// load pass retries against the full registry.
+/// - `file` payloads are read from their path.
+/// - An http provider with an on-disk cache is served from it without a
+///   request (mihomo's fetcher reads its local file first too); the load
+///   marks it for a background revalidation.
+/// - The remaining http payloads download concurrently. The wait is bounded
+///   by [`crate::provider_fetch_deadline`] (unbounded by default); a download
+///   still running then keeps going and is handed to its provider.
+///
+/// Failures are recorded (and logged at debug — the load pass reports them),
+/// so `load_providers_prefetched` registers those providers empty instead of
+/// downloading them again. A `proxy:` name `lookup` cannot resolve
+/// (provider-sourced proxies are never indexed by the lookup, and the
+/// prefetch layer can be absent when the caller had no need to build it)
+/// skips the provider quietly — the load pass acquires it against the full
+/// registry.
 pub fn prefetch_payloads(
     raw_providers: &HashMap<String, RawRuleProvider>,
     cache_dir: Option<&Path>,
     default_proxy: Option<&Arc<dyn Proxy>>,
     lookup: ProxyLookup<'_>,
 ) -> PrefetchedPayloads {
-    let mut out = HashMap::new();
+    prefetch_payloads_within(
+        raw_providers,
+        cache_dir,
+        default_proxy,
+        lookup,
+        crate::provider_fetch_deadline(),
+    )
+}
+
+/// [`prefetch_payloads`] with an explicit download deadline instead of the
+/// process-wide [`crate::provider_fetch_deadline`].
+pub fn prefetch_payloads_within(
+    raw_providers: &HashMap<String, RawRuleProvider>,
+    cache_dir: Option<&Path>,
+    default_proxy: Option<&Arc<dyn Proxy>>,
+    lookup: ProxyLookup<'_>,
+    deadline: Option<Duration>,
+) -> PrefetchedPayloads {
+    let mut out = PrefetchedPayloads::default();
+    let mut downloads = Vec::new();
     for (name, cfg) in raw_providers {
-        let download_proxy = if cfg.provider_type == "http" {
-            match effective_download_proxy(cfg, default_proxy, lookup) {
-                Ok(p) => p,
-                Err(e) => {
-                    debug!(
-                        "rule-provider '{}': prefetch skipped ({:#}); \
-                         retried once proxies are built",
-                        name, e
-                    );
-                    continue;
+        let entry = match cfg.provider_type.as_str() {
+            "file" => read_file_payload(name, cfg, cache_dir).map(Prefetched::Fresh),
+            "http" => {
+                let proxy = match effective_download_proxy(cfg, default_proxy, lookup) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        debug!(
+                            "rule-provider '{}': prefetch skipped ({:#}); \
+                             retried once proxies are built",
+                            name, e
+                        );
+                        continue;
+                    }
+                };
+                match http_source(name, cfg, cache_dir) {
+                    Err(e) => Err(e),
+                    Ok((url, cache_path)) => match read_cache(cache_path.as_deref()) {
+                        Some(cached) => Ok(cached),
+                        None if crate::is_offline_validate() => {
+                            Ok(Prefetched::Failed(offline_miss(url)))
+                        }
+                        None => {
+                            downloads.push(Download {
+                                name: name.clone(),
+                                url: url.to_string(),
+                                proxy,
+                                headers: provider_headers(cfg),
+                            });
+                            continue;
+                        }
+                    },
                 }
             }
-        } else {
-            None
+            _ => continue,
         };
-        match read_payload_bytes(name, cfg, cache_dir, download_proxy.as_ref()) {
-            Ok(Some(bytes)) => {
-                out.insert(name.clone(), bytes);
+        match entry {
+            Ok(entry) => {
+                out.entries.insert(name.clone(), entry);
             }
-            Ok(None) => {}
             Err(e) => warn!("rule-provider '{}': payload prefetch failed: {:#}", name, e),
         }
     }
+    out.entries.extend(download_all(downloads, deadline));
     out
 }
 
-fn read_payload_bytes(
+fn read_file_payload(
     name: &str,
     cfg: &RawRuleProvider,
     cache_dir: Option<&Path>,
-    download_proxy: Option<&Arc<dyn Proxy>>,
-) -> Result<Option<Vec<u8>>> {
-    match cfg.provider_type.as_str() {
-        "file" => {
-            let path = resolve_path(cfg, cache_dir, name, false)?
-                .ok_or_else(|| anyhow!("file provider '{name}' requires a 'path'"))?;
-            let bytes = std::fs::read(&path)
-                .with_context(|| format!("reading provider file {}", path.display()))?;
-            Ok(Some(bytes))
+) -> Result<Vec<u8>> {
+    let path = resolve_path(cfg, cache_dir, name, false)?
+        .ok_or_else(|| anyhow!("file provider '{name}' requires a 'path'"))?;
+    std::fs::read(&path).with_context(|| format!("reading provider file {}", path.display()))
+}
+
+/// An http provider's `url:` and resolved cache location.
+fn http_source<'a>(
+    name: &str,
+    cfg: &'a RawRuleProvider,
+    cache_dir: Option<&Path>,
+) -> Result<(&'a str, Option<PathBuf>)> {
+    let url = cfg
+        .url
+        .as_deref()
+        .ok_or_else(|| anyhow!("http provider '{name}' requires a 'url'"))?;
+    Ok((url, resolve_path(cfg, cache_dir, name, false)?))
+}
+
+/// The on-disk cache of an http provider, if it has a readable one.
+fn read_cache(cache_path: Option<&Path>) -> Option<Prefetched> {
+    let path = cache_path?;
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            debug!("rule-provider cache hit: {}", path.display());
+            let modified = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+            Some(Prefetched::Cached { bytes, modified })
         }
-        "http" => {
-            let url = cfg
-                .url
-                .as_deref()
-                .ok_or_else(|| anyhow!("http provider '{name}' requires a 'url'"))?;
-            let cache_path = resolve_path(cfg, cache_dir, name, false)?;
-            let prefer_cache = cfg.interval.unwrap_or(0) > 0;
-            let headers = provider_headers(cfg);
-            let bytes = fetch_http_blocking_with_cache(
-                url,
-                cache_path.as_deref(),
-                download_proxy,
-                prefer_cache,
-                &headers,
-            )?;
-            Ok(Some(bytes))
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            warn!(
+                "rule-provider cache {} is unreadable, downloading instead: {}",
+                path.display(),
+                e
+            );
+            None
         }
-        _ => Ok(None),
     }
+}
+
+fn offline_miss(url: &str) -> String {
+    format!("offline validation: no cached payload for rule provider {url}")
+}
+
+/// Whether a cache the load served needs a background refetch: always
+/// without an `interval` (nothing else would ever update it), otherwise once
+/// it is at least `interval` old — mihomo's fetcher refetches a stale local
+/// file at startup the same way. An unknown age counts as stale.
+fn cache_needs_revalidation(modified: Option<SystemTime>, interval: u64) -> bool {
+    if interval == 0 {
+        return true;
+    }
+    modified.is_none_or(|m| {
+        SystemTime::now()
+            .duration_since(m)
+            .is_ok_and(|age| age.as_secs() >= interval)
+    })
 }
 
 /// Load every configured rule-provider at startup.
@@ -447,15 +886,16 @@ pub fn load_providers(
         ctx,
         download_proxy,
         &|_| None,
-        &HashMap::new(),
+        &PrefetchedPayloads::default(),
         None,
         strict,
     )
 }
 
-/// Same as [`load_providers`] but reuses payload bytes already fetched by
-/// [`prefetch_payloads`]. Providers absent from `prefetched` fetch/read their
-/// payload themselves.
+/// Same as [`load_providers`] but reuses the payloads [`prefetch_payloads`]
+/// acquired; a download it recorded as failed or still running registers the
+/// provider empty without another request. Providers absent from
+/// `prefetched` acquire their payload themselves (cache first).
 /// `dialer_registry` should be the registry generation the resolved download
 /// proxies were built from; each provider's fetch context retains a clone so
 /// a chained adapter still resolves its front hop on later refreshes (issue
@@ -497,7 +937,7 @@ pub fn load_providers_prefetched(
         } else {
             None
         };
-        let payload = prefetched.get(name).map(Vec::as_slice);
+        let payload = prefetched.entries.get(name);
         match load_one(
             name,
             cfg,
@@ -600,7 +1040,7 @@ fn load_one(
     cache_dir: Option<&Path>,
     ctx: &ParserContext,
     download_proxy: Option<&Arc<dyn Proxy>>,
-    prefetched: Option<&[u8]>,
+    prefetched: Option<&Prefetched>,
     dialer_registry: Option<&meow_proxy::dialer::ProxyRegistry>,
     strict: bool,
 ) -> Result<RuleProvider, LoadError> {
@@ -610,7 +1050,15 @@ fn load_one(
         .map_err(|e: String| LoadError::Defect(anyhow!("{e}")))?;
     match cfg.provider_type.as_str() {
         "inline" => load_inline(name, cfg, behavior, ctx, strict),
-        "file" => load_file(name, cfg, cache_dir, behavior, ctx, prefetched, strict),
+        "file" => load_file(
+            name,
+            cfg,
+            cache_dir,
+            behavior,
+            ctx,
+            prefetched.and_then(Prefetched::bytes),
+            strict,
+        ),
         "http" => load_http(
             name,
             cfg,
@@ -769,7 +1217,7 @@ fn load_http(
     behavior: RuleSetBehavior,
     ctx: &ParserContext,
     download_proxy: Option<&Arc<dyn Proxy>>,
-    prefetched: Option<&[u8]>,
+    prefetched: Option<&Prefetched>,
     dialer_registry: Option<&meow_proxy::dialer::ProxyRegistry>,
     strict: bool,
 ) -> Result<RuleProvider, LoadError> {
@@ -790,8 +1238,8 @@ fn load_http(
     let interval = cfg.interval.unwrap_or(0);
     let headers = provider_headers(cfg);
     // Constructed before acquisition: a fetch failure registers this
-    // provider empty so `RULE-SET` references resolve and the interval
-    // refresh task can heal it (issue #533 review).
+    // provider empty so `RULE-SET` references resolve, and the background
+    // fetch the commit kicks off heals it (issue #533 review).
     let provider = make_provider(
         name,
         ProviderType::Http,
@@ -809,26 +1257,81 @@ fn load_http(
         explicit_format,
         cache_path.clone(),
     );
-    let bytes_owned;
-    let bytes: &[u8] = match prefetched {
-        Some(b) => b,
-        None => match fetch_http_blocking_with_cache(
-            url,
-            cache_path.as_deref(),
-            download_proxy,
-            interval > 0,
-            &headers,
-        ) {
-            Ok(b) => {
-                bytes_owned = b;
-                &bytes_owned
+    let acquired;
+    let entry = match prefetched {
+        Some(entry) => entry,
+        None => {
+            let fetched = match read_cache(cache_path.as_deref()) {
+                Some(cached) => Ok(cached),
+                None if crate::is_offline_validate() => Err(anyhow!(offline_miss(url))),
+                None => fetch_http_blocking(url, download_proxy, &headers).map(|bytes| {
+                    Prefetched::Downloaded {
+                        bytes,
+                        persisted: AtomicBool::new(false),
+                    }
+                }),
+            };
+            match fetched {
+                Ok(entry) => {
+                    acquired = entry;
+                    &acquired
+                }
+                Err(e) => {
+                    provider.owe(InitialFetch::Retry);
+                    return Err(LoadError::Acquisition(Box::new(provider), e));
+                }
             }
-            Err(e) => return Err(LoadError::Acquisition(Box::new(provider), e)),
-        },
+        }
     };
-    let rules = parse_bytes_to_ruleset_with_format(bytes, behavior, explicit_format, ctx, strict)
-        .map_err(LoadError::Payload)?;
-    provider.swap_rules(rules);
+    let parse = |bytes: &[u8]| {
+        parse_bytes_to_ruleset_with_format(bytes, behavior, explicit_format, ctx, strict)
+    };
+    match entry {
+        Prefetched::Fresh(bytes) => {
+            provider.swap_rules(parse(bytes).map_err(LoadError::Payload)?);
+        }
+        Prefetched::Downloaded { bytes, persisted } => {
+            provider.swap_rules(parse(bytes).map_err(LoadError::Payload)?);
+            if let Some(path) = &cache_path {
+                if !persisted.swap(true, Ordering::Relaxed) {
+                    write_cache(path, bytes);
+                }
+            }
+        }
+        Prefetched::Cached { bytes, modified } => match parse(bytes) {
+            Ok(rules) => {
+                provider.swap_rules(rules);
+                // Report the cache's age, not the load time.
+                if let Some(modified) = modified {
+                    provider.set_updated_at(*modified);
+                }
+                if cache_needs_revalidation(*modified, interval) {
+                    provider.owe(InitialFetch::Revalidate);
+                }
+            }
+            // A cache that no longer parses (a different `format:`, a
+            // truncated write) is not a config defect: start empty and let
+            // the background fetch replace it.
+            Err(e) => {
+                provider.owe(InitialFetch::Retry);
+                return Err(LoadError::Acquisition(
+                    Box::new(provider),
+                    e.context("ignoring the on-disk cache, which no longer parses"),
+                ));
+            }
+        },
+        Prefetched::Failed(e) => {
+            provider.owe(InitialFetch::Retry);
+            return Err(LoadError::Acquisition(Box::new(provider), anyhow!("{e}")));
+        }
+        Prefetched::Pending(pending) => {
+            provider.owe(InitialFetch::Adopt(pending.clone()));
+            return Err(LoadError::Acquisition(
+                Box::new(provider),
+                anyhow!("still downloading at the fetch deadline; it finishes in the background"),
+            ));
+        }
+    }
     Ok(provider)
 }
 
@@ -872,6 +1375,7 @@ fn make_provider(
         // Starts at 1 so the first refresh (gen 1) beats the initial
         // `written_gen` of 0 under `cache_write_lock`.
         refresh_gen: meow_common::atomic::AtomicU::new(1),
+        initial_fetch: parking_lot::Mutex::new(InitialFetch::Settled),
     }
 }
 
@@ -1081,51 +1585,6 @@ pub(crate) fn validate_paths(
 // HTTP fetch
 // ---------------------------------------------------------------------------
 
-fn fetch_http_blocking_with_cache(
-    url: &str,
-    cache_path: Option<&Path>,
-    proxy: Option<&Arc<dyn Proxy>>,
-    prefer_cache: bool,
-    headers: &[(String, String)],
-) -> Result<Vec<u8>> {
-    if prefer_cache || crate::is_offline_validate() {
-        if let Some(path) = cache_path {
-            if path.exists() {
-                debug!("rule-provider cache hit: {}", path.display());
-                return std::fs::read(path)
-                    .with_context(|| format!("reading cached provider {}", path.display()));
-            }
-        }
-    }
-
-    if crate::is_offline_validate() {
-        anyhow::bail!("offline validation: no cached payload for rule provider {url}");
-    }
-
-    match fetch_http_blocking(url, proxy, headers) {
-        Ok(bytes) => {
-            if let Some(path) = cache_path {
-                let _ = write_cache(path, &bytes);
-            }
-            Ok(bytes)
-        }
-        Err(fetch_err) => {
-            if let Some(path) = cache_path {
-                if path.exists() {
-                    warn!(
-                        "rule-provider fetch failed ({}); falling back to cache {}",
-                        fetch_err,
-                        path.display()
-                    );
-                    return std::fs::read(path)
-                        .with_context(|| format!("reading cached provider {}", path.display()));
-                }
-            }
-            Err(fetch_err)
-        }
-    }
-}
-
 fn fetch_http_blocking(
     url: &str,
     proxy: Option<&Arc<dyn Proxy>>,
@@ -1182,7 +1641,7 @@ fn write_cache(path: &Path, bytes: &[u8]) -> bool {
         }
     }
     // Write-then-rename (the same pattern `save_config` uses): a
-    // `refresh()` and a commit's `prefer_cache` read can race outside the
+    // `refresh()` and a commit's cache-first read can race outside the
     // config lane — a truncate-in-place write could be torn mid-read,
     // injecting mixed-generation bytes into the commit snapshot (issue
     // #543 review).
@@ -1217,6 +1676,7 @@ fn write_cache(path: &Path, bytes: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{eventually, Origin};
     use meow_rules::mrs_parser::{write_ruleset_mrs, TYPE_DOMAIN};
     use std::io::{Read, Write};
     use std::time::{Duration, Instant};
@@ -1276,7 +1736,7 @@ mod tests {
         providers.insert("p".to_string(), http_cfg(Some("NoSuch")));
         // Payload already prefetched — resolution still fails first, so the
         // provider is skipped rather than loaded via the wrong proxy.
-        let mut prefetched = HashMap::new();
+        let mut prefetched = PrefetchedPayloads::new();
         prefetched.insert("p".to_string(), b"payload:\n  - example.com\n".to_vec());
         let out = load_providers_prefetched(
             &providers,
@@ -1296,7 +1756,7 @@ mod tests {
     fn http_provider_with_direct_proxy_loads_prefetched_payload() {
         let mut providers = HashMap::new();
         providers.insert("p".to_string(), http_cfg(Some("DIRECT")));
-        let mut prefetched = HashMap::new();
+        let mut prefetched = PrefetchedPayloads::new();
         prefetched.insert("p".to_string(), b"payload:\n  - example.com\n".to_vec());
         let out = load_providers_prefetched(
             &providers,
@@ -1923,7 +2383,7 @@ header:
     }
 
     /// Issue #543: a successful `refresh()` must persist the payload to the
-    /// provider's cache file — otherwise a `prefer_cache` restart reverts
+    /// provider's cache file — otherwise a cache-first restart reverts
     /// to the initial-load-era payload until the next tick.
     #[tokio::test]
     async fn refresh_writes_payload_cache_after_successful_parse() {
@@ -1960,7 +2420,7 @@ header:
         assert_eq!(
             std::fs::read_to_string(&cache).unwrap(),
             "payload:\n  - 'new.example'\n",
-            "refresh must persist the new payload for prefer_cache restarts"
+            "refresh must persist the new payload for cache-first restarts"
         );
     }
 
@@ -2209,5 +2669,317 @@ header:
             snap.matches_domain("first.example"),
             "GEOSITE entry must keep matching — refresh used the stored ctx"
         );
+    }
+
+    // -- Cache-first load and the background initial fetch ----------------
+
+    const OLD_RULES: &str = "payload:\n  - 'old.example'\n";
+    const NEW_RULES: &str = "payload:\n  - 'new.example'\n  - 'newer.example'\n";
+
+    fn http_provider(url: &str, interval: u64) -> RawRuleProvider {
+        RawRuleProvider {
+            url: Some(url.to_string()),
+            interval: (interval > 0).then_some(interval),
+            ..http_cfg(None)
+        }
+    }
+
+    fn cache_file(dir: &Path, name: &str) -> PathBuf {
+        dir.join("rule-providers").join(format!("{name}.yaml"))
+    }
+
+    fn write_cache_file(dir: &Path, name: &str, body: &str, age: Duration) -> PathBuf {
+        let path = cache_file(dir, name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, body).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(SystemTime::now() - age)
+            .unwrap();
+        path
+    }
+
+    /// The prefetch waits on its downloads synchronously, so it runs off the
+    /// test runtime, which keeps serving the origin.
+    async fn prefetch_within(
+        raw: &HashMap<String, RawRuleProvider>,
+        dir: &Path,
+        deadline: Option<Duration>,
+    ) -> Arc<PrefetchedPayloads> {
+        let (raw, dir) = (raw.clone(), dir.to_path_buf());
+        tokio::task::spawn_blocking(move || {
+            Arc::new(prefetch_payloads_within(
+                &raw,
+                Some(&dir),
+                None,
+                &|_| None,
+                deadline,
+            ))
+        })
+        .await
+        .unwrap()
+    }
+
+    /// One load pass, off the test runtime too: an absent entry would make
+    /// it download synchronously, and the origin must keep answering.
+    async fn load_pass(
+        raw: &HashMap<String, RawRuleProvider>,
+        dir: &Path,
+        prefetched: &Arc<PrefetchedPayloads>,
+        strict: bool,
+    ) -> HashMap<String, Arc<RuleProvider>> {
+        let (raw, dir, prefetched) = (raw.clone(), dir.to_path_buf(), Arc::clone(prefetched));
+        tokio::task::spawn_blocking(move || {
+            load_providers_prefetched(
+                &raw,
+                Some(&dir),
+                &ctx(),
+                None,
+                &|_| None,
+                &prefetched,
+                None,
+                strict,
+            )
+            .unwrap()
+        })
+        .await
+        .unwrap()
+    }
+
+    /// A cached provider loads with zero requests — startup runs two load
+    /// passes over one prefetch, and neither touches the network — and the
+    /// background fetch then replaces the cached generation and the cache.
+    #[tokio::test]
+    async fn cached_provider_loads_without_network_then_revalidates() {
+        let origin = Origin::spawn(Some(NEW_RULES), true).await;
+        let dir = tempfile::tempdir().unwrap();
+        let cache = write_cache_file(dir.path(), "p", OLD_RULES, Duration::from_secs(600));
+        let raw = HashMap::from([("p".to_string(), http_provider(&origin.url, 0))]);
+
+        let prefetched = prefetch_within(&raw, dir.path(), None).await;
+        let _first_pass = load_pass(&raw, dir.path(), &prefetched, false).await;
+        let providers = load_pass(&raw, dir.path(), &prefetched, false).await;
+        let p = &providers["p"];
+        assert_eq!(p.rule_count(), 1, "the cached generation is live");
+        assert_eq!(
+            origin.hits(),
+            0,
+            "a cached provider must not wait on the network"
+        );
+        let age = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - p.updated_at_secs();
+        assert!(age >= 600, "updated_at reports the cache's age, got {age}s");
+
+        let fetch = p
+            .spawn_initial_fetch()
+            .expect("a cache without `interval` is revalidated");
+        fetch.await.unwrap();
+        assert_eq!(p.rule_count(), 2);
+        assert_eq!(origin.hits(), 1);
+        assert_eq!(std::fs::read_to_string(&cache).unwrap(), NEW_RULES);
+        assert!(
+            p.spawn_initial_fetch().is_none(),
+            "the obligation is taken once"
+        );
+    }
+
+    /// With an `interval`, a cache younger than it is left to the refresh
+    /// loop; one at least that old is revalidated at once.
+    #[tokio::test]
+    async fn cache_with_interval_is_revalidated_only_once_stale() {
+        let origin = Origin::spawn(Some(NEW_RULES), true).await;
+        let dir = tempfile::tempdir().unwrap();
+        let raw = HashMap::from([("p".to_string(), http_provider(&origin.url, 3600))]);
+
+        write_cache_file(dir.path(), "p", OLD_RULES, Duration::from_secs(60));
+        let prefetched = prefetch_within(&raw, dir.path(), None).await;
+        let providers = load_pass(&raw, dir.path(), &prefetched, false).await;
+        assert!(providers["p"].spawn_initial_fetch().is_none());
+
+        write_cache_file(dir.path(), "p", OLD_RULES, Duration::from_secs(7200));
+        let prefetched = prefetch_within(&raw, dir.path(), None).await;
+        let providers = load_pass(&raw, dir.path(), &prefetched, false).await;
+        let p = &providers["p"];
+        assert_eq!(p.rule_count(), 1);
+        p.spawn_initial_fetch()
+            .expect("a stale cache is revalidated")
+            .await
+            .unwrap();
+        assert_eq!(p.rule_count(), 2);
+        assert_eq!(origin.hits(), 1);
+    }
+
+    /// Uncached providers download concurrently: a gated origin sees every
+    /// request before it answers any. Each payload lands in its cache.
+    #[tokio::test]
+    async fn uncached_providers_download_concurrently() {
+        let origin = Origin::spawn(Some(NEW_RULES), false).await;
+        let dir = tempfile::tempdir().unwrap();
+        let raw = HashMap::from([
+            ("a".to_string(), http_provider(&origin.url, 0)),
+            ("b".to_string(), http_provider(&origin.url, 0)),
+        ]);
+
+        let prefetch = tokio::spawn({
+            let (raw, dir) = (raw.clone(), dir.path().to_path_buf());
+            async move { prefetch_within(&raw, &dir, None).await }
+        });
+        eventually("both downloads in flight", || origin.hits() == 2).await;
+        origin.gate.send_replace(true);
+        let prefetched = prefetch.await.unwrap();
+
+        let providers = load_pass(&raw, dir.path(), &prefetched, false).await;
+        for name in ["a", "b"] {
+            assert_eq!(providers[name].rule_count(), 2);
+            assert!(providers[name].spawn_initial_fetch().is_none());
+            assert_eq!(
+                std::fs::read_to_string(cache_file(dir.path(), name)).unwrap(),
+                NEW_RULES
+            );
+        }
+        assert_eq!(origin.hits(), 2);
+    }
+
+    /// A failed download is not repeated by the load passes (startup ran
+    /// it three times, one after another): the provider starts empty and
+    /// the background fetch retries until the feed recovers.
+    #[tokio::test]
+    async fn failed_download_starts_empty_and_retries_in_background() {
+        let origin = Origin::spawn(None, true).await;
+        let dir = tempfile::tempdir().unwrap();
+        let raw = HashMap::from([("p".to_string(), http_provider(&origin.url, 0))]);
+
+        let prefetched = prefetch_within(&raw, dir.path(), None).await;
+        let _first_pass = load_pass(&raw, dir.path(), &prefetched, false).await;
+        let providers = load_pass(&raw, dir.path(), &prefetched, false).await;
+        let p = &providers["p"];
+        assert_eq!(p.rule_count(), 0, "registered empty, so RULE-SET resolves");
+        assert_eq!(origin.hits(), 1, "only the prefetch requested the payload");
+
+        let fetch = p.spawn_initial_fetch().expect("an empty provider retries");
+        eventually("a failed background attempt", || origin.hits() >= 3).await;
+        *origin.body.lock() = Some(NEW_RULES);
+        fetch.await.unwrap();
+        assert_eq!(p.rule_count(), 2);
+        assert_eq!(
+            std::fs::read_to_string(cache_file(dir.path(), "p")).unwrap(),
+            NEW_RULES
+        );
+    }
+
+    /// A download still running at the deadline keeps going, and the
+    /// provider adopts it when it lands instead of requesting it again.
+    #[tokio::test]
+    async fn deadline_hands_the_running_download_to_the_provider() {
+        let origin = Origin::spawn(Some(NEW_RULES), false).await;
+        let dir = tempfile::tempdir().unwrap();
+        let raw = HashMap::from([("p".to_string(), http_provider(&origin.url, 0))]);
+
+        let prefetched = prefetch_within(&raw, dir.path(), Some(Duration::from_millis(100))).await;
+        let providers = load_pass(&raw, dir.path(), &prefetched, false).await;
+        let p = &providers["p"];
+        assert_eq!(p.rule_count(), 0);
+
+        let fetch = p
+            .spawn_initial_fetch()
+            .expect("the running download is owed");
+        origin.gate.send_replace(true);
+        fetch.await.unwrap();
+        assert_eq!(p.rule_count(), 2);
+        assert_eq!(
+            origin.hits(),
+            1,
+            "the straggler is adopted, not re-requested"
+        );
+        assert_eq!(
+            std::fs::read_to_string(cache_file(dir.path(), "p")).unwrap(),
+            NEW_RULES
+        );
+    }
+
+    /// A cache that no longer parses is not a config defect, even under
+    /// strict: the provider starts empty and the background fetch replaces
+    /// the cache.
+    #[tokio::test]
+    async fn unparseable_cache_starts_empty_and_is_replaced() {
+        let origin = Origin::spawn(Some(NEW_RULES), true).await;
+        let dir = tempfile::tempdir().unwrap();
+        let cache = write_cache_file(dir.path(), "p", "not a rule-set\n", Duration::ZERO);
+        let raw = HashMap::from([("p".to_string(), http_provider(&origin.url, 3600))]);
+
+        let prefetched = prefetch_within(&raw, dir.path(), None).await;
+        let providers = load_pass(&raw, dir.path(), &prefetched, true).await;
+        let p = &providers["p"];
+        assert_eq!(p.rule_count(), 0);
+        assert_eq!(origin.hits(), 0);
+        p.spawn_initial_fetch()
+            .expect("an unusable cache is refetched")
+            .await
+            .unwrap();
+        assert_eq!(p.rule_count(), 2);
+        assert_eq!(std::fs::read_to_string(&cache).unwrap(), NEW_RULES);
+    }
+
+    /// A cached provider whose feed stays down keeps its cached rules and
+    /// gives up after `MAX_REVALIDATION_ATTEMPTS`.
+    #[tokio::test]
+    async fn cache_revalidation_retries_are_bounded() {
+        let origin = Origin::spawn(None, true).await;
+        let dir = tempfile::tempdir().unwrap();
+        write_cache_file(dir.path(), "p", OLD_RULES, Duration::ZERO);
+        let raw = HashMap::from([("p".to_string(), http_provider(&origin.url, 0))]);
+
+        let prefetched = prefetch_within(&raw, dir.path(), None).await;
+        let providers = load_pass(&raw, dir.path(), &prefetched, false).await;
+        let p = &providers["p"];
+        tokio::time::timeout(Duration::from_secs(10), p.spawn_initial_fetch().unwrap())
+            .await
+            .expect("revalidation gives up")
+            .unwrap();
+        assert_eq!(origin.hits(), MAX_REVALIDATION_ATTEMPTS as usize);
+        assert_eq!(p.rule_count(), 1, "the cached rules stay installed");
+    }
+
+    #[tokio::test]
+    async fn initial_fetch_ends_when_the_provider_is_dropped() {
+        let origin = Origin::spawn(None, true).await;
+        let dir = tempfile::tempdir().unwrap();
+        let raw = HashMap::from([("p".to_string(), http_provider(&origin.url, 0))]);
+
+        let prefetched = prefetch_within(&raw, dir.path(), None).await;
+        let providers = load_pass(&raw, dir.path(), &prefetched, false).await;
+        let fetch = providers["p"].spawn_initial_fetch().unwrap();
+        eventually("a background attempt", || origin.hits() >= 2).await;
+        drop(providers);
+        tokio::time::timeout(Duration::from_secs(5), fetch)
+            .await
+            .expect("the task ends with its provider")
+            .unwrap();
+    }
+
+    /// Committing a provider through the refresh supervisor starts the
+    /// fetch its load left owing.
+    #[tokio::test]
+    async fn reconcile_starts_the_owed_initial_fetch() {
+        let origin = Origin::spawn(Some(NEW_RULES), true).await;
+        let dir = tempfile::tempdir().unwrap();
+        let raw = HashMap::from([("p".to_string(), http_provider(&origin.url, 0))]);
+
+        let prefetched = prefetch_within(&raw, dir.path(), Some(Duration::ZERO)).await;
+        let registry = Arc::new(RwLock::new(
+            load_pass(&raw, dir.path(), &prefetched, false).await,
+        ));
+        let supervisor = crate::rule_provider_refresh::RefreshSupervisor::default();
+        supervisor.reconcile(&registry);
+        let p = Arc::clone(&registry.read()["p"]);
+        eventually("the committed provider fills", || p.rule_count() == 2).await;
+        supervisor.reconcile(&registry);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(origin.hits(), 1, "a later commit does not fetch again");
     }
 }

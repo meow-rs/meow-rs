@@ -7,6 +7,10 @@
 //! `interval`ed by a reload gain/lose their task without a restart (issue
 //! #543). Before this supervisor existed the tasks were spawned once at
 //! startup, so reloads could only ever refresh startup-era providers.
+//!
+//! `reconcile` also starts the one-off background fetch a newly committed
+//! provider's load left owing ([`RuleProvider::spawn_initial_fetch`]):
+//! revalidating a cache it started from, or filling a set it started empty.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
@@ -58,6 +62,11 @@ impl RefreshSupervisor {
     /// dies between commits stays dead until the next one (same semantics
     /// as the health-check supervisor).
     ///
+    /// Every provider in the registry that still owes its initial remote
+    /// fetch gets it spawned here — any type and interval, since an http
+    /// provider without `interval` needs it most. That task is detached and
+    /// ends on its own (see [`RuleProvider::spawn_initial_fetch`]).
+    ///
     /// Callers must not hold the registry's write guard — `reconcile`
     /// takes `registry.read()` and `parking_lot` locks are not reentrant.
     /// Commits that swap the map should prefer
@@ -103,6 +112,11 @@ impl RefreshSupervisor {
                 Arc::downgrade(registry),
             ));
             tasks.insert(name, (interval, task));
+        }
+        drop(tasks);
+
+        for provider in registry.read().values() {
+            provider.spawn_initial_fetch();
         }
     }
 

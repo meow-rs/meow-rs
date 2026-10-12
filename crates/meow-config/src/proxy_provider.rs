@@ -12,22 +12,23 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
-/// First retry delay for a provider whose background fetch failed.
+/// First retry delay for a provider whose background fetch failed (proxy-
+/// and rule-providers share the policy).
 #[cfg(not(test))]
-const BACKGROUND_RETRY_MIN: Duration = Duration::from_secs(5);
+pub(crate) const BACKGROUND_RETRY_MIN: Duration = Duration::from_secs(5);
 #[cfg(test)]
-const BACKGROUND_RETRY_MIN: Duration = Duration::from_millis(20);
+pub(crate) const BACKGROUND_RETRY_MIN: Duration = Duration::from_millis(20);
 /// Backoff ceiling for those retries — a provider with nothing loaded keeps
 /// retrying at this pace until a fetch lands.
 #[cfg(not(test))]
-const BACKGROUND_RETRY_MAX: Duration = Duration::from_secs(300);
+pub(crate) const BACKGROUND_RETRY_MAX: Duration = Duration::from_secs(300);
 #[cfg(test)]
-const BACKGROUND_RETRY_MAX: Duration = Duration::from_millis(80);
+pub(crate) const BACKGROUND_RETRY_MAX: Duration = Duration::from_millis(80);
 /// Failed revalidations of a cache-loaded provider before the background
 /// task leaves it to the `interval` loop. Spans the first ~75 s at the
 /// production backoff — long enough to outlast a mobile VPN that has no
 /// network until its tunnel is up.
-const MAX_REVALIDATION_ATTEMPTS: u32 = 5;
+pub(crate) const MAX_REVALIDATION_ATTEMPTS: u32 = 5;
 
 pub struct HealthCheckConfig {
     pub url: String,
@@ -1370,6 +1371,7 @@ fn build_health_check_config(raw: Option<&RawHealthCheck>) -> Option<HealthCheck
 mod tests {
     use super::*;
     use crate::raw::RawProxyProvider;
+    use crate::test_support::{eventually, Origin};
 
     fn raw_file_provider(path: &str) -> RawProxyProvider {
         RawProxyProvider {
@@ -2975,71 +2977,6 @@ header:
     const ONE_NODE: &str = "proxies:\n  - {name: n1, type: direct}\n";
     const TWO_NODES: &str =
         "proxies:\n  - {name: n1, type: direct}\n  - {name: n2, type: direct}\n";
-
-    /// A provider origin the test steers: counts requests, answers with the
-    /// current body (503 while `None`), and holds each request until the
-    /// gate is open.
-    struct Origin {
-        url: String,
-        hits: Arc<std::sync::atomic::AtomicUsize>,
-        body: Arc<Mutex<Option<&'static str>>>,
-        gate: tokio::sync::watch::Sender<bool>,
-    }
-
-    impl Origin {
-        async fn spawn(body: Option<&'static str>, open: bool) -> Self {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let url = format!("http://{}/proxies.yaml", listener.local_addr().unwrap());
-            let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let body = Arc::new(Mutex::new(body));
-            let (gate, _) = tokio::sync::watch::channel(open);
-            let (task_hits, task_body, task_gate) =
-                (Arc::clone(&hits), Arc::clone(&body), gate.clone());
-            tokio::spawn(async move {
-                while let Ok((mut stream, _)) = listener.accept().await {
-                    task_hits.fetch_add(1, Ordering::SeqCst);
-                    let body = Arc::clone(&task_body);
-                    let mut gate = task_gate.subscribe();
-                    tokio::spawn(async move {
-                        let mut sink = [0u8; 2048];
-                        let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut sink).await;
-                        let _ = gate.wait_for(|open| *open).await;
-                        let response = match *body.lock() {
-                            Some(body) => format!(
-                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
-                                body.len()
-                            ),
-                            None => "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n"
-                                .to_string(),
-                        };
-                        let _ =
-                            tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes())
-                                .await;
-                    });
-                }
-            });
-            Self {
-                url,
-                hits,
-                body,
-                gate,
-            }
-        }
-
-        fn hits(&self) -> usize {
-            self.hits.load(Ordering::SeqCst)
-        }
-    }
-
-    async fn eventually(what: &str, mut done: impl FnMut() -> bool) {
-        for _ in 0..500 {
-            if done() {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        panic!("timed out waiting for: {what}");
-    }
 
     async fn load_within(
         providers: &[(&str, &str)],

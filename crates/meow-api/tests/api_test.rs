@@ -5154,8 +5154,8 @@ async fn put_configs_publishes_rule_provider_registry_changes() {
 /// payload exactly once: the routing rebuild's prefetched bytes are shared
 /// with the DNS rebuild instead of being fetched a second time inside
 /// `CONFIG_MUTATION`. A counting HTTP listener makes a second fetch
-/// observable. The provider declares no `interval`, so every fetch hits
-/// the wire (`prefer_cache` is off).
+/// observable. The provider has no on-disk cache to start from, so every
+/// fetch hits the wire.
 #[tokio::test]
 async fn put_configs_fetches_rule_provider_payload_once() {
     use base64::Engine as _;

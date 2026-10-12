@@ -25,6 +25,8 @@ pub mod rule_provider_refresh;
 mod safe_path;
 pub mod sub_rules_parser;
 pub mod subscription;
+#[cfg(test)]
+mod test_support;
 
 pub use geodata::GeoDataConfig;
 
@@ -594,27 +596,35 @@ pub fn is_offline_validate() -> bool {
     OFFLINE_VALIDATE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Upper bound, in milliseconds, on how long [`load_config`] waits for the
-/// remote proxy-provider fetches that have no usable on-disk cache.
-/// `u64::MAX` = wait for every fetch to finish (the default).
+/// Upper bound, in milliseconds, on how long a config load waits for the
+/// remote proxy- and rule-provider fetches that have no usable on-disk
+/// cache. `u64::MAX` = wait for every fetch to finish (the default).
 static PROVIDER_FETCH_DEADLINE_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(u64::MAX);
 
-/// Bound how long startup waits for proxy-provider downloads that have no
+/// Bound how long a config load waits for provider downloads that have no
 /// cache to fall back on. `None` (the default) waits for every fetch, as
 /// mihomo does; `Some(d)` returns after `d` and lets the stragglers finish
-/// in the background, where they populate their `use:` groups as they land.
-/// `Some(Duration::ZERO)` never waits.
+/// in the background, where they populate their `use:` groups or `RULE-SET`
+/// rules as they land. `Some(Duration::ZERO)` never waits.
 ///
 /// For embedders that must not hold their own startup on a third-party feed
 /// — a mobile VPN cannot establish its tunnel until `load_config` returns,
 /// and with "block connections without VPN" the fetch cannot even succeed
-/// before then. Providers the deadline leaves empty are retried by
-/// [`proxy_provider::spawn_deferred_initial_fetches`], which every embedder
-/// runs after its first routing install anyway (it also revalidates the
-/// cache-loaded ones). Cached providers never wait on the network, whatever
-/// this is set to. Under `strict`, a payload rejection that lands after the
-/// deadline is logged rather than failing the load.
+/// before then. Proxy-providers and rule-providers each get the window in
+/// turn (rule-provider downloads can ride proxies, so they start after
+/// the proxy-providers), and runtime rebuilds (`PUT /configs`, subscription
+/// applies) honour it for rule-providers too.
+///
+/// Providers the deadline leaves empty are retried in the background:
+/// proxy-providers by [`proxy_provider::spawn_deferred_initial_fetches`],
+/// rule-providers by [`rule_provider::RuleProvider::spawn_initial_fetch`]
+/// (which [`rule_provider_refresh::RefreshSupervisor::reconcile`] runs).
+/// Every embedder runs both after its first routing install anyway; they
+/// also revalidate the cache-loaded providers. Cached providers never wait
+/// on the network, whatever this is set to. Under `strict`, a payload
+/// rejection that lands after the deadline is logged rather than failing
+/// the load.
 pub fn set_provider_fetch_deadline(deadline: Option<std::time::Duration>) {
     let ms = deadline.map_or(u64::MAX, |d| {
         u64::try_from(d.as_millis()).unwrap_or(u64::MAX - 1)
@@ -2554,7 +2564,7 @@ fn rebuild_from_raw_impl(
         // `shared_providers` rebuilds bind the live provider objects — their
         // payloads are never re-parsed, so prefetching would only re-fetch
         // every http provider per geodata tick for bytes nothing reads.
-        None if shared_providers.is_some() => Arc::new(HashMap::new()),
+        None if shared_providers.is_some() => Arc::default(),
         None => Arc::new(match raw.rule_providers.as_ref() {
             Some(map) if !map.is_empty() => rule_provider::prefetch_payloads(
                 map,
@@ -2562,7 +2572,7 @@ fn rebuild_from_raw_impl(
                 download_proxy.as_ref(),
                 &proxy_lookup,
             ),
-            _ => HashMap::new(),
+            _ => rule_provider::PrefetchedPayloads::default(),
         }),
     };
 
@@ -2670,7 +2680,7 @@ async fn prefetch_rule_provider_payloads_async(
     prefetch: Option<Arc<PrefetchProxies>>,
 ) -> rule_provider::PrefetchedPayloads {
     let Some(raw_providers) = raw.rule_providers.as_ref().filter(|m| !m.is_empty()) else {
-        return HashMap::new();
+        return rule_provider::PrefetchedPayloads::default();
     };
     let raw_providers = raw_providers.clone();
     let raw_proxies: Vec<HashMap<String, serde_yaml::Value>> =
@@ -2690,7 +2700,7 @@ async fn prefetch_rule_provider_payloads_async(
     .await
     .unwrap_or_else(|e| {
         warn!("rule-provider payload prefetch task failed: {e}");
-        HashMap::new()
+        rule_provider::PrefetchedPayloads::default()
     })
 }
 
@@ -2955,7 +2965,7 @@ fn prefetch_proxy_layer_needed(raw: &raw::RawConfig, geo: &GeoDataConfig) -> boo
     if has_fetchable_provider {
         return true;
     }
-    let scan = collect_geo_scan_lines(raw, &HashMap::new());
+    let scan = collect_geo_scan_lines(raw, &rule_provider::PrefetchedPayloads::default());
     !missing_geodata_downloads(raw, geo, &scan).is_empty()
 }
 
@@ -3317,7 +3327,7 @@ fn collect_geo_scan_lines(
     // scanned — a caller-supplied superset map must not trigger geo loads
     // for providers the candidate does not carry (issue #543).
     let declared = raw.rule_providers.as_ref();
-    for (name, bytes) in provider_payloads {
+    for (name, bytes) in provider_payloads.iter() {
         if !declared.is_some_and(|m| m.contains_key(name)) || meow_rules::is_mrs_bytes(bytes) {
             continue;
         }
@@ -4410,7 +4420,7 @@ mod dialer_proxy_tests {
         // The fetch itself fails — the counting listener accepts then drops
         // — but the TCP connect to B proves `proxy: A` dialled its front hop.
         let payloads = prefetch_rule_provider_payloads_async(&raw, None, Some(layer)).await;
-        assert!(payloads.is_empty());
+        assert_eq!(payloads.iter().count(), 0, "no payload was acquired");
         assert!(b_hits.load(std::sync::atomic::Ordering::SeqCst) >= 1);
     }
 
@@ -5397,7 +5407,7 @@ mod geoip_context_tests {
             sub_rules: Some(sub_rules),
             ..Default::default()
         };
-        let lines = collect_geo_scan_lines(&raw, &HashMap::new());
+        let lines = collect_geo_scan_lines(&raw, &rule_provider::PrefetchedPayloads::default());
         let countries = collect_geoip_countries(&lines);
         assert!(
             countries.contains("JP"),
@@ -5431,7 +5441,7 @@ mod geoip_context_tests {
             rule_providers: Some(providers),
             ..Default::default()
         };
-        let lines = collect_geo_scan_lines(&raw, &HashMap::new());
+        let lines = collect_geo_scan_lines(&raw, &rule_provider::PrefetchedPayloads::default());
         assert!(collect_geoip_countries(&lines).contains("KR"));
         assert!(collect_geosite_categories(&lines).contains("youtube"));
     }
@@ -5461,7 +5471,7 @@ mod geoip_context_tests {
             ])),
             ..Default::default()
         };
-        let mut payloads: rule_provider::PrefetchedPayloads = HashMap::new();
+        let mut payloads = rule_provider::PrefetchedPayloads::new();
         payloads.insert(
             "yaml-provider".to_string(),
             b"payload:\n  - 'GEOIP,BR,no-resolve'\n  - DOMAIN,example.com\n".to_vec(),
@@ -5511,7 +5521,7 @@ mod geoip_context_tests {
             &nonexistent_asn(),
             &nonexistent_geosite(),
             None,
-            &HashMap::new(),
+            &rule_provider::PrefetchedPayloads::default(),
         )
         .expect_err("sub-rules GEOIP must trigger the mmdb load");
         let msg = format!("{err}");
@@ -5553,7 +5563,7 @@ mod geoip_context_tests {
             &nonexistent_asn(),
             &nonexistent_geosite(),
             None,
-            &HashMap::new(),
+            &rule_provider::PrefetchedPayloads::default(),
         )
         .unwrap();
         assert!(ctx.geoip.is_none());
@@ -5570,7 +5580,7 @@ mod geoip_context_tests {
             &nonexistent_asn(),
             &nonexistent_geosite(),
             None,
-            &HashMap::new(),
+            &rule_provider::PrefetchedPayloads::default(),
         )
         .expect_err("must fail-fast when mmdb is missing");
         let msg = format!("{err}");
@@ -5595,7 +5605,7 @@ mod geoip_context_tests {
             &nonexistent_asn(),
             &nonexistent_geosite(),
             None,
-            &HashMap::new(),
+            &rule_provider::PrefetchedPayloads::default(),
         )
         .expect_err("garbage bytes must fail to parse as mmdb");
         let msg = format!("{err}");
@@ -5628,7 +5638,7 @@ mod geoip_context_tests {
             &nonexistent_asn(),
             &nonexistent_geosite(),
             None,
-            &HashMap::new(),
+            &rule_provider::PrefetchedPayloads::default(),
         )
         .unwrap();
         assert!(ctx.asn.is_none());
@@ -5693,7 +5703,7 @@ rule-providers:
             &asn,
             &nonexistent_geosite(),
             None,
-            &HashMap::new(),
+            &rule_provider::PrefetchedPayloads::default(),
         )
         .expect_err("must fail-fast when ASN mmdb is missing");
         let msg = format!("{err}");

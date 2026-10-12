@@ -42,6 +42,23 @@ the canonical, in-repo source a release is cut from.
   `take_deferred_initial` → `acquire_initial` loop with
   `meow_config::proxy_provider::spawn_deferred_initial_fetches`.
 
+- **Rule-provider startup no longer waits on the feed**: HTTP rule-providers
+  get the same cold-start treatment. A provider with a parseable on-disk
+  cache starts from it without a request, whatever its `interval` (it was
+  remote-first with none), and is revalidated in the background once the
+  cache is older than `interval`. Uncached providers download concurrently
+  and once per startup — each failing provider used to be fetched three
+  times in a row across the load passes, so two unreachable feeds held
+  startup for 45 s instead of 15 s. A provider whose first fetch fails
+  starts empty and is retried with the proxy-provider backoff until a fetch
+  lands, instead of matching nothing until `interval` — or for good when it
+  has none. `set_provider_fetch_deadline` now bounds the rule-provider wait
+  too, and a download still running at the deadline lands in the background.
+  `rule_provider::PrefetchedPayloads` is now a struct (build it with
+  `PrefetchedPayloads::new()` / `insert`, read it with `iter()`); the
+  retries start from `RefreshSupervisor::reconcile`, which embedders already
+  call.
+
 - **TCP benchmark measurements** (issue #746): disable Nagle on the harness
   client and echo sockets to reduce macOS loopback tail stalls, reject
   incomplete echoes, and add an interleaved comparison runner with retained
