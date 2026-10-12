@@ -4509,10 +4509,16 @@ mod global_route_binding_tests {
     }
 
     /// A candidate whose rebuild fetches a rule-provider from `origin`.
+    /// Rule-providers load cache-first, so each candidate names a fresh
+    /// cache file — the one an earlier PUT's fetch wrote would otherwise
+    /// satisfy the rebuild without a request.
     fn candidate(tun: &str, origin: &RecordingOrigin, tail: &str) -> String {
+        static CANDIDATES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = CANDIDATES.fetch_add(1, Ordering::Relaxed);
         format!(
             "mode: rule\n{tun}rule-providers:\n  p:\n    type: http\n    behavior: domain\n    \
-             url: http://{}/rules.yaml\nrules:\n  - MATCH,DIRECT\n{tail}",
+             url: http://{}/rules.yaml\n    path: ./rule-providers/p-{n}.yaml\n\
+             rules:\n  - MATCH,DIRECT\n{tail}",
             origin.addr
         )
     }

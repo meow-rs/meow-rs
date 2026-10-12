@@ -1309,9 +1309,13 @@ fn load_http(
                     provider.owe(InitialFetch::Revalidate);
                 }
             }
-            // A cache that no longer parses (a different `format:`, a
-            // truncated write) is not a config defect: start empty and let
-            // the background fetch replace it.
+            // Offline validation (`-t`) validates the cache itself: it is
+            // the payload the next start serves.
+            Err(e) if crate::is_offline_validate() => return Err(LoadError::Payload(e)),
+            // Otherwise a cache that no longer parses (a different
+            // `format:`, a payload an older build cached unparsed) is not a
+            // config defect: start empty and let the background fetch
+            // replace it.
             Err(e) => {
                 provider.owe(InitialFetch::Retry);
                 return Err(LoadError::Acquisition(
