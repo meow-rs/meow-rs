@@ -34,10 +34,23 @@ TARGET=armv7-unknown-linux-musleabihf
 
 # BoringSSL is built from C/C++ by boring-sys; its bindgen bindings need
 # libclang, and CMake needs cmake. `file` backs the static-linkage assert at
-# the end. None are in the toolchain image.
-apt-get update
-apt-get install -y --no-install-recommends cmake clang libclang-dev file
-rm -rf /var/lib/apt/lists/*
+# the end. All four packages are already installed in the toolchain image
+# (verified on the armv7-musleabihf-amd64 image), so probe first: only a
+# genuinely missing package pays `apt-get update` — the call that dies the
+# day the image's Ubuntu 22.04 base reaches EOL.
+missing=""
+for pkg in cmake clang libclang-dev file; do
+    dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q 'install ok installed' || missing="$missing $pkg"
+done
+if [ -n "$missing" ]; then
+    echo "::warning::toolchain image missing build packages:$missing — installing via apt"
+    apt-get update
+    # Deliberate word-splitting: $missing is a package list.
+    apt-get install -y --no-install-recommends $missing
+    rm -rf /var/lib/apt/lists/*
+else
+    echo "cmake clang libclang-dev file already installed; skipping apt"
+fi
 
 # Build with the pinned channel from rust-toolchain.toml, not with whatever
 # rustc the image happens to ship. RUSTUP_TOOLCHAIN overrides the file's
