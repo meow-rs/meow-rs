@@ -1320,17 +1320,11 @@ pub fn commit_proxy_providers(
             .insert(name.clone(), Arc::clone(provider))
             .is_some_and(|previous| Arc::ptr_eq(&previous, provider));
         if !reused {
-            let provider = Arc::clone(provider);
-            let name = name.clone();
-            // `acquire_initial`, not `refresh`: a freshly committed
-            // provider has an empty slot, so the on-disk cache fallback
-            // (offline bootstrap) applies — refresh ticks deliberately
-            // skip it to keep the in-memory last-good set.
-            tokio::spawn(async move {
-                if let Err(e) = provider.acquire_initial().await {
-                    tracing::warn!("proxy-provider '{name}': initial fetch failed: {e}");
-                }
-            });
+            // A freshly committed provider has an empty slot: serve its
+            // on-disk cache first (offline bootstrap — refresh ticks
+            // deliberately skip it to keep the in-memory last-good set),
+            // then fetch the remote, retrying with backoff.
+            provider.spawn_initial_fetch();
         } else if provider.take_deferred_initial() {
             // A reused provider whose `proxy:` could not resolve before
             // this commit's map was published — the name may resolve now,

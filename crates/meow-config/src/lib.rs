@@ -594,6 +594,42 @@ pub fn is_offline_validate() -> bool {
     OFFLINE_VALIDATE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Upper bound, in milliseconds, on how long [`load_config`] waits for the
+/// remote proxy-provider fetches that have no usable on-disk cache.
+/// `u64::MAX` = wait for every fetch to finish (the default).
+static PROVIDER_FETCH_DEADLINE_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Bound how long startup waits for proxy-provider downloads that have no
+/// cache to fall back on. `None` (the default) waits for every fetch, as
+/// mihomo does; `Some(d)` returns after `d` and lets the stragglers finish
+/// in the background, where they populate their `use:` groups as they land.
+/// `Some(Duration::ZERO)` never waits.
+///
+/// For embedders that must not hold their own startup on a third-party feed
+/// — a mobile VPN cannot establish its tunnel until `load_config` returns,
+/// and with "block connections without VPN" the fetch cannot even succeed
+/// before then. Providers the deadline leaves empty are retried by
+/// [`proxy_provider::spawn_deferred_initial_fetches`], which every embedder
+/// runs after its first routing install anyway (it also revalidates the
+/// cache-loaded ones). Cached providers never wait on the network, whatever
+/// this is set to. Under `strict`, a payload rejection that lands after the
+/// deadline is logged rather than failing the load.
+pub fn set_provider_fetch_deadline(deadline: Option<std::time::Duration>) {
+    let ms = deadline.map_or(u64::MAX, |d| {
+        u64::try_from(d.as_millis()).unwrap_or(u64::MAX - 1)
+    });
+    PROVIDER_FETCH_DEADLINE_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The deadline set by [`set_provider_fetch_deadline`].
+pub fn provider_fetch_deadline() -> Option<std::time::Duration> {
+    match PROVIDER_FETCH_DEADLINE_MS.load(std::sync::atomic::Ordering::Relaxed) {
+        u64::MAX => None,
+        ms => Some(std::time::Duration::from_millis(ms)),
+    }
+}
+
 /// Process policy for hosts accepting configurations from delegated users.
 static EXTERNAL_PLUGINS_ALLOWED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);

@@ -1183,28 +1183,17 @@ async fn run(
         Arc::new(meow_config::proxy_provider_refresh::ProxyProviderRefreshSupervisor::default());
     proxy_provider_refresh.reconcile(&proxy_providers, config.raw.proxy_providers.as_ref());
 
-    // Providers whose `proxy:` name could not resolve during the
-    // pre-publish initial fetch retry once now that `update_routing` has
-    // populated the provider dialer registry (issue #625).
+    // Providers the startup load left owing a remote fetch — served from
+    // their on-disk cache, failed, or with a `proxy:` name that could not
+    // resolve before `update_routing` populated the provider dialer
+    // registry (issue #625) — fetch now, retrying with backoff.
     //
     // Detached, and after the listeners are up: a provider reached through
     // a proxy front is the flakiest thing at cold start, and awaiting it
     // here would leave the box with no listener, no DNS and no API for as
     // long as the fetch takes — or, if it is treated as fatal, refuse to
     // start at all over a third-party feed being down.
-    for entry in proxy_providers.iter() {
-        if entry.take_deferred_initial() {
-            let provider = Arc::clone(entry.value());
-            tokio::spawn(async move {
-                if let Err(e) = provider.acquire_initial().await {
-                    warn!(
-                        "proxy-provider '{}': deferred initial fetch failed: {e}",
-                        provider.name
-                    );
-                }
-            });
-        }
-    }
+    meow_config::proxy_provider::spawn_deferred_initial_fetches(&proxy_providers);
 
     // Start subscription background refresh task
     {

@@ -1,5 +1,6 @@
 use crate::proxy_parser;
 use crate::raw::{RawHealthCheck, RawProxyProvider};
+use dashmap::DashMap;
 use meow_common::atomic::AtomicU;
 use meow_common::{ProviderSlot, Proxy};
 use meow_proxy::dialer::ProxyRegistry;
@@ -7,9 +8,26 @@ use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Weak};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
+
+/// First retry delay for a provider whose background fetch failed.
+#[cfg(not(test))]
+const BACKGROUND_RETRY_MIN: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const BACKGROUND_RETRY_MIN: Duration = Duration::from_millis(20);
+/// Backoff ceiling for those retries — a provider with nothing loaded keeps
+/// retrying at this pace until a fetch lands.
+#[cfg(not(test))]
+const BACKGROUND_RETRY_MAX: Duration = Duration::from_secs(300);
+#[cfg(test)]
+const BACKGROUND_RETRY_MAX: Duration = Duration::from_millis(80);
+/// Failed revalidations of a cache-loaded provider before the background
+/// task leaves it to the `interval` loop. Spans the first ~75 s at the
+/// production backoff — long enough to outlast a mobile VPN that has no
+/// network until its tunnel is up.
+const MAX_REVALIDATION_ATTEMPTS: u32 = 5;
 
 pub struct HealthCheckConfig {
     pub url: String,
@@ -56,9 +74,22 @@ pub struct ProxyProvider {
     download_proxy: Option<smol_str::SmolStr>,
     /// Set when a fetch found `download_proxy` unresolvable — the startup
     /// build loads providers *before* the first route map is published, so
-    /// the post-publish kick re-runs `acquire_initial` for providers still
-    /// flagged (issue #625). Cleared once the name resolves again.
+    /// the post-publish kick ([`spawn_deferred_initial_fetches`]) fetches
+    /// those still flagged (issue #625). Cleared once the name resolves
+    /// again.
     deferred_initial: AtomicBool,
+    /// Set by the startup load for a provider whose remote payload has not
+    /// landed yet — it started from its on-disk cache (to be revalidated),
+    /// or its fetch failed or outlived the
+    /// [`crate::set_provider_fetch_deadline`] budget. Consumed with
+    /// `deferred_initial` by [`Self::take_deferred_initial`]. A separate
+    /// flag because `fetch_source` clears `deferred_initial` as soon as the
+    /// `proxy:` name resolves, which would race a straggling fetch.
+    background_pending: AtomicBool,
+    /// A remote payload has been committed (or matched the committed one)
+    /// at least once — lets a queued background attempt skip the fetch a
+    /// straggling startup fetch just completed.
+    fetched_remote: AtomicBool,
     /// `dialer-proxy` names declared by the currently loaded nodes —
     /// repopulated on every [`refresh`](Self::refresh) so a config build can
     /// warn about references the registry will never resolve.
@@ -382,6 +413,8 @@ impl ProxyProvider {
             dialer_registry,
             download_proxy,
             deferred_initial: AtomicBool::new(false),
+            background_pending: AtomicBool::new(false),
+            fetched_remote: AtomicBool::new(false),
             declared_dialers: RwLock::new(Vec::new()),
             provider_dialer,
             override_dialer,
@@ -581,6 +614,9 @@ impl ProxyProvider {
         let strict = self.strict.load(Ordering::Relaxed);
         let hash = content_hash(&content);
         if *self.content_hash.lock() == Some((hash, strict)) {
+            if from_remote {
+                self.fetched_remote.store(true, Ordering::Relaxed);
+            }
             return Ok(false);
         }
         let proxies = self.parse_proxies(&content).await?;
@@ -589,7 +625,126 @@ impl ProxyProvider {
         }
         self.commit(proxies);
         *self.content_hash.lock() = Some((hash, strict));
+        if from_remote {
+            self.fetched_remote.store(true, Ordering::Relaxed);
+        }
         Ok(true)
+    }
+
+    /// Whether any payload generation has been committed — from the remote
+    /// or from the on-disk cache.
+    fn has_content(&self) -> bool {
+        self.content_hash.lock().is_some()
+    }
+
+    /// Cache-first load into an empty provider: commit the on-disk copy of
+    /// an HTTP payload without touching the network, the way mihomo's
+    /// fetcher reads its local file before anything else. `false` when there
+    /// is no cache, it cannot be read, it no longer parses, or the provider
+    /// already holds a payload — the caller then fetches.
+    ///
+    /// The cached set is served at once and revalidated in the background
+    /// ([`Self::spawn_initial_fetch`]), so a restart neither waits on the
+    /// feed nor keeps a stale generation past that first refetch.
+    async fn load_from_cache(&self) -> bool {
+        let Vehicle::Http {
+            cache_path: Some(path),
+            ..
+        } = &self.vehicle
+        else {
+            return false;
+        };
+        let _generation = self.refresh_lock.lock().await;
+        if self.has_content() {
+            return false;
+        }
+        let content = match tokio::fs::read_to_string(path).await {
+            Ok(content) => content,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+            Err(e) => {
+                warn!(provider = %self.name, path = ?path, error = %e, "ignoring unreadable provider cache");
+                return false;
+            }
+        };
+        if let Err(e) = self.ingest(content, false).await {
+            warn!(provider = %self.name, path = ?path, error = %e, "ignoring unparseable provider cache");
+            return false;
+        }
+        // Report the cache's age, not the load time (upstream sets
+        // `UpdatedAt` to the file's mtime too).
+        if let Ok(mtime) = tokio::fs::metadata(path).await.and_then(|m| m.modified()) {
+            if let Ok(age) = mtime.duration_since(UNIX_EPOCH) {
+                self.updated_at.store(
+                    age.as_secs() as meow_common::atomic::Uint,
+                    Ordering::Relaxed,
+                );
+            }
+        }
+        info!(provider = %self.name, "proxy-provider loaded from cache; refetching in the background");
+        true
+    }
+
+    /// The startup fetch for a provider without a usable cache. `Err` only
+    /// for a strict-mode payload rejection, which fails the config load;
+    /// `Ok(false)` when nothing could be acquired (already logged).
+    ///
+    /// Strict gates the *parse*, not the fetch: a transient download
+    /// failure is not a config defect, so a provider that can't be fetched
+    /// still starts empty until a background retry, a scheduled tick or a
+    /// manual refresh succeeds. Lenient keeps the payload's usable nodes and
+    /// binds the rest to unavailable placeholders, so only a defect that
+    /// stops the *whole* payload from parsing fails it. That feed is
+    /// third-party and refetched on a timer: rejecting it wholesale would
+    /// hand its operator a daemon-wide kill switch that re-fires every tick.
+    async fn initial_load(&self, strict: bool) -> anyhow::Result<bool> {
+        let _generation = self.refresh_lock.lock().await;
+        let (content, from_remote) = match self.fetch_content().await {
+            Ok(fetched) => fetched,
+            Err(e) => {
+                warn_initial_load_failure(self, &e);
+                return Ok(false);
+            }
+        };
+        match self.ingest(content, from_remote).await {
+            Ok(_) => Ok(true),
+            Err(e) if strict => Err(anyhow::anyhow!("proxy-provider '{}': {e}", self.name)),
+            Err(e) => {
+                warn_initial_load_failure(self, &e.to_string());
+                Ok(false)
+            }
+        }
+    }
+
+    /// One attempt of the background fetch — `refresh` semantics: no cache
+    /// fallback (the task already served the cache), and a failure keeps
+    /// whatever the provider holds. Holds `refresh_lock`, so it queues
+    /// behind a straggling startup fetch and sees its outcome rather than
+    /// duplicating it.
+    async fn background_attempt(&self) -> Result<(), String> {
+        let _generation = self.refresh_lock.lock().await;
+        if self.fetched_remote.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let content = self.fetch_source().await?;
+        self.ingest(content, true)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Acquire this provider's remote payload on a detached task: an empty
+    /// provider first serves its on-disk cache, then the remote fetch
+    /// retries with backoff while it fails — indefinitely (capped at
+    /// `BACKGROUND_RETRY_MAX` between attempts) while the provider has
+    /// nothing loaded, and up to `MAX_REVALIDATION_ATTEMPTS` times while it
+    /// serves a cached set, after which the `interval` loop takes over. Ends
+    /// early once any fetch — a tick or a manual refresh included — commits
+    /// a remote payload.
+    ///
+    /// The task holds only a `Weak` between attempts, so a provider dropped
+    /// by a config commit — or an embedder shutting down — ends it.
+    pub fn spawn_initial_fetch(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(background_fetch_loop(Arc::downgrade(self)))
     }
 
     /// Parse a fetched provider payload into proxies.
@@ -895,16 +1050,21 @@ impl ProxyProvider {
         self.ingest(content, from_remote).await.map(|_| ())
     }
 
-    /// Consumes the deferred-initial-fetch flag: `true` once per provider
-    /// whose `proxy:` name could not resolve during the pre-publish startup
-    /// load — the caller schedules one `acquire_initial` retry now that the
-    /// route map is published (issue #625). `meow-app` runs this check once
-    /// after the first `update_routing`; embedders that drive `load_config`
-    /// plus a `Tunnel` directly must do the same after their first routing
-    /// install, or a deferred provider stays on its cache until an interval
-    /// or manual refresh.
+    /// Consumes the deferred-initial-fetch flags: `true` once per provider
+    /// whose startup load still owes a remote fetch — its `proxy:` name
+    /// could not resolve before the route map was published (issue #625),
+    /// it started from its on-disk cache, or its fetch failed or outlived
+    /// [`crate::set_provider_fetch_deadline`]. The caller fetches it now
+    /// that the route map is published; [`spawn_deferred_initial_fetches`]
+    /// does exactly that, with retries. `meow-app` runs it once after the
+    /// first `update_routing`; embedders that drive `load_config` plus a
+    /// `Tunnel` directly must do the same after their first routing
+    /// install, or such a provider stays on its cache (or empty) until an
+    /// interval or manual refresh.
     pub fn take_deferred_initial(&self) -> bool {
+        // `|`, not `||`: both flags must be consumed.
         self.deferred_initial.swap(false, Ordering::Relaxed)
+            | self.background_pending.swap(false, Ordering::Relaxed)
     }
 
     pub fn proxies(&self) -> Vec<Arc<dyn Proxy>> {
@@ -960,6 +1120,16 @@ pub(crate) fn validate_paths(
     Ok(())
 }
 
+/// Build and load every declared proxy-provider for a startup config.
+///
+/// HTTP providers with a parseable on-disk cache start from it without
+/// touching the network and are flagged for a background refetch. The rest
+/// fetch concurrently, waited on for at most
+/// [`crate::provider_fetch_deadline`]; one that fails, or is still in
+/// flight at the deadline, starts empty (populating its groups if it lands
+/// later) and is flagged for a background retry. The caller runs
+/// [`spawn_deferred_initial_fetches`] after its first routing install to
+/// serve both flags. `file` providers load inline — they are local reads.
 pub async fn load_proxy_providers(
     raw_map: &HashMap<String, RawProxyProvider>,
     cache_dir: Option<&Path>,
@@ -967,43 +1137,39 @@ pub async fn load_proxy_providers(
     strict: bool,
     dialer_registry: &meow_proxy::dialer::ProxyRegistry,
 ) -> Result<HashMap<String, Arc<ProxyProvider>>, anyhow::Error> {
+    load_proxy_providers_within(
+        raw_map,
+        cache_dir,
+        ipv6,
+        strict,
+        dialer_registry,
+        crate::provider_fetch_deadline(),
+    )
+    .await
+}
+
+/// [`load_proxy_providers`] with an explicit fetch deadline instead of the
+/// process-wide [`crate::provider_fetch_deadline`].
+pub async fn load_proxy_providers_within(
+    raw_map: &HashMap<String, RawProxyProvider>,
+    cache_dir: Option<&Path>,
+    ipv6: bool,
+    strict: bool,
+    dialer_registry: &meow_proxy::dialer::ProxyRegistry,
+    deadline: Option<Duration>,
+) -> Result<HashMap<String, Arc<ProxyProvider>>, anyhow::Error> {
     let mut result = HashMap::new();
+    let mut fetches = Vec::new();
     for (name, raw) in raw_map {
-        match ProxyProvider::new(name, raw, cache_dir, ipv6, strict, dialer_registry.clone()) {
-            Ok(provider) => {
-                let provider = Arc::new(provider);
-                if crate::is_offline_validate() {
-                    // Offline validation (`meow -t`): the provider parsed and
-                    // its path/filters are structurally valid — that is what a
-                    // config test checks. Skip the network fetch so a slow or
-                    // unreachable subscription can't hang validation (the
-                    // provider registers empty, exactly as a transient fetch
-                    // failure would leave it).
-                } else if strict {
-                    // Strict gates the *parse*, not the fetch: a transient
-                    // download failure is not a config defect, so a provider
-                    // that can't be fetched still starts empty until a
-                    // scheduled tick or manual refresh succeeds.
-                    match provider.fetch_content().await {
-                        Ok((content, from_remote)) => {
-                            provider
-                                .ingest(content, from_remote)
-                                .await
-                                .map_err(|e| anyhow::anyhow!("proxy-provider '{name}': {e}"))?;
-                        }
-                        Err(e) => warn_initial_load_failure(&provider, &e),
-                    }
-                } else if let Err(e) = provider.acquire_initial().await {
-                    // Lenient keeps the payload's usable nodes and binds the
-                    // rest to unavailable placeholders, so only a defect that
-                    // stops the *whole* payload from parsing lands here. This
-                    // feed is third-party and refetched on a timer: rejecting
-                    // it wholesale would hand its operator a daemon-wide kill
-                    // switch that re-fires on every tick.
-                    warn_initial_load_failure(&provider, &e.to_string());
-                }
-                result.insert(name.clone(), provider);
-            }
+        let provider = match ProxyProvider::new(
+            name,
+            raw,
+            cache_dir,
+            ipv6,
+            strict,
+            dialer_registry.clone(),
+        ) {
+            Ok(provider) => Arc::new(provider),
             Err(e) if strict => {
                 return Err(anyhow::anyhow!(
                     "proxy-provider '{name}' failed to load (strict mode): {e}"
@@ -1011,10 +1177,114 @@ pub async fn load_proxy_providers(
             }
             Err(e) => {
                 warn!(provider = %name, error = %e, "failed to create proxy-provider, skipping");
+                continue;
+            }
+        };
+        if crate::is_offline_validate() {
+            // Offline validation (`meow -t`): the provider parsed and its
+            // path/filters are structurally valid — that is what a config
+            // test checks. Skip the network fetch so a slow or unreachable
+            // subscription can't hang validation (the provider registers
+            // empty, exactly as a transient fetch failure would leave it).
+        } else if matches!(provider.vehicle, Vehicle::File(_)) {
+            provider.initial_load(strict).await?;
+        } else if provider.load_from_cache().await {
+            provider.background_pending.store(true, Ordering::Relaxed);
+        } else {
+            let fetching = Arc::clone(&provider);
+            fetches.push((
+                name.clone(),
+                Arc::clone(&provider),
+                tokio::spawn(async move { fetching.initial_load(strict).await }),
+            ));
+        }
+        result.insert(name.clone(), provider);
+    }
+
+    // Concurrent, so startup waits for the slowest feed rather than the sum
+    // of them. Every wait shares one absolute deadline.
+    let deadline_at = deadline.map(|d| tokio::time::Instant::now() + d);
+    for (name, provider, mut fetch) in fetches {
+        let outcome = match deadline_at {
+            None => Some((&mut fetch).await),
+            Some(at) => tokio::time::timeout_at(at, &mut fetch).await.ok(),
+        };
+        match outcome {
+            Some(Ok(Ok(true))) => {}
+            Some(Ok(Ok(false))) => provider.background_pending.store(true, Ordering::Relaxed),
+            Some(Ok(Err(e))) => return Err(e),
+            Some(Err(e)) => {
+                warn!(provider = %name, error = %e, "proxy-provider initial fetch task failed");
+                provider.background_pending.store(true, Ordering::Relaxed);
+            }
+            None => {
+                // Left running: it populates the provider's groups if it
+                // lands, and the background retry queues behind it. Past
+                // the deadline a strict rejection can no longer fail the
+                // load, so it is logged instead.
+                warn!(provider = %name,
+                    "proxy-provider still fetching at the startup deadline; \
+                     starting empty and finishing in the background");
+                provider.background_pending.store(true, Ordering::Relaxed);
+                tokio::spawn(async move {
+                    if let Ok(Err(e)) = fetch.await {
+                        warn!(provider = %name, error = %e, "proxy-provider payload rejected");
+                    }
+                });
             }
         }
     }
     Ok(result)
+}
+
+/// Post-publish kick for the providers [`load_proxy_providers`] left owing
+/// a remote fetch (see [`ProxyProvider::take_deferred_initial`]): spawns
+/// [`ProxyProvider::spawn_initial_fetch`] for each. Run once after the
+/// first routing install, so `proxy:` names resolve against the published
+/// route map.
+pub fn spawn_deferred_initial_fetches(registry: &DashMap<String, Arc<ProxyProvider>>) {
+    for entry in registry {
+        if entry.take_deferred_initial() {
+            entry.value().spawn_initial_fetch();
+        }
+    }
+}
+
+async fn background_fetch_loop(provider: Weak<ProxyProvider>) {
+    // A provider a config commit just created starts empty; a startup-loaded
+    // one already tried its cache (this re-check is then a no-op).
+    if let Some(p) = provider.upgrade() {
+        p.load_from_cache().await;
+    }
+    let mut delay = BACKGROUND_RETRY_MIN;
+    let mut failed_revalidations = 0;
+    loop {
+        let Some(p) = provider.upgrade() else {
+            return;
+        };
+        let Err(e) = p.background_attempt().await else {
+            return;
+        };
+        if p.deferred_initial.load(Ordering::Relaxed) {
+            // Unresolvable against the *published* map: a config defect,
+            // not an outage. The next commit retries a flagged provider.
+            warn!(provider = %p.name, error = %e,
+                "proxy-provider fetch skipped: its `proxy:` does not resolve");
+            return;
+        }
+        if p.has_content() {
+            failed_revalidations += 1;
+            if failed_revalidations >= MAX_REVALIDATION_ATTEMPTS {
+                warn!(provider = %p.name, error = %e,
+                    "proxy-provider refetch failed; keeping the cached nodes until the next refresh");
+                return;
+            }
+        }
+        warn!(provider = %p.name, error = %e, retry_in = ?delay, "proxy-provider fetch failed; retrying");
+        drop(p);
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(BACKGROUND_RETRY_MAX);
+    }
 }
 
 /// Warn for an initial-load failure, distinguishing a not-yet-resolvable
@@ -1029,7 +1299,7 @@ fn warn_initial_load_failure(provider: &ProxyProvider, error: &str) {
              starting empty — will retry once the route map is published");
     } else {
         warn!(provider = %provider.name, error = %error,
-            "initial provider load failed; starting empty");
+            "initial provider load failed; starting empty until a background fetch succeeds");
     }
 }
 
@@ -2700,5 +2970,260 @@ header:
             .err()
             .expect("whitespace dialer-proxy: must be rejected");
         assert!(err.contains("malformed dialer-proxy"), "{err}");
+    }
+
+    const ONE_NODE: &str = "proxies:\n  - {name: n1, type: direct}\n";
+    const TWO_NODES: &str =
+        "proxies:\n  - {name: n1, type: direct}\n  - {name: n2, type: direct}\n";
+
+    /// A provider origin the test steers: counts requests, answers with the
+    /// current body (503 while `None`), and holds each request until the
+    /// gate is open.
+    struct Origin {
+        url: String,
+        hits: Arc<std::sync::atomic::AtomicUsize>,
+        body: Arc<Mutex<Option<&'static str>>>,
+        gate: tokio::sync::watch::Sender<bool>,
+    }
+
+    impl Origin {
+        async fn spawn(body: Option<&'static str>, open: bool) -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/proxies.yaml", listener.local_addr().unwrap());
+            let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let body = Arc::new(Mutex::new(body));
+            let (gate, _) = tokio::sync::watch::channel(open);
+            let (task_hits, task_body, task_gate) =
+                (Arc::clone(&hits), Arc::clone(&body), gate.clone());
+            tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    task_hits.fetch_add(1, Ordering::SeqCst);
+                    let body = Arc::clone(&task_body);
+                    let mut gate = task_gate.subscribe();
+                    tokio::spawn(async move {
+                        let mut sink = [0u8; 2048];
+                        let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut sink).await;
+                        let _ = gate.wait_for(|open| *open).await;
+                        let response = match *body.lock() {
+                            Some(body) => format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                                body.len()
+                            ),
+                            None => "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n"
+                                .to_string(),
+                        };
+                        let _ =
+                            tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes())
+                                .await;
+                    });
+                }
+            });
+            Self {
+                url,
+                hits,
+                body,
+                gate,
+            }
+        }
+
+        fn hits(&self) -> usize {
+            self.hits.load(Ordering::SeqCst)
+        }
+    }
+
+    async fn eventually(what: &str, mut done: impl FnMut() -> bool) {
+        for _ in 0..500 {
+            if done() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for: {what}");
+    }
+
+    async fn load_within(
+        providers: &[(&str, &str)],
+        dir: &Path,
+        deadline: Option<Duration>,
+    ) -> HashMap<String, Arc<ProxyProvider>> {
+        let raw = providers
+            .iter()
+            .map(|(name, url)| ((*name).to_string(), raw_http_provider(url, None)))
+            .collect();
+        load_proxy_providers_within(&raw, Some(dir), false, false, &Default::default(), deadline)
+            .await
+            .unwrap()
+    }
+
+    fn registry_of(
+        providers: &HashMap<String, Arc<ProxyProvider>>,
+    ) -> DashMap<String, Arc<ProxyProvider>> {
+        providers
+            .iter()
+            .map(|(name, p)| (name.clone(), Arc::clone(p)))
+            .collect()
+    }
+
+    /// A cached provider starts from its cache with zero requests — a
+    /// subscription that is blocked or slow can no longer hold startup —
+    /// and the post-publish kick then replaces the cached generation with
+    /// the remote one.
+    #[tokio::test]
+    async fn startup_serves_cache_without_network_then_revalidates() {
+        let origin = Origin::spawn(Some(TWO_NODES), true).await;
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("provider_p.yaml");
+        std::fs::write(&cache, ONE_NODE).unwrap();
+
+        let providers = load_within(&[("p", &origin.url)], dir.path(), None).await;
+        let p = &providers["p"];
+        assert_eq!(p.proxies().len(), 1, "the cached generation is live");
+        assert_eq!(
+            origin.hits(),
+            0,
+            "a cached provider must not wait on the network"
+        );
+        assert!(
+            p.updated_at_secs() > 0,
+            "updated_at reports the cache's age"
+        );
+
+        spawn_deferred_initial_fetches(&registry_of(&providers));
+        eventually("the background revalidation", || p.proxies().len() == 2).await;
+        assert_eq!(origin.hits(), 1);
+        assert_eq!(std::fs::read_to_string(&cache).unwrap(), TWO_NODES);
+        assert!(!p.take_deferred_initial(), "the kick consumed the flag");
+    }
+
+    /// No cache and a failing feed: startup goes on with the provider empty,
+    /// and the background task keeps retrying until the feed recovers —
+    /// instead of leaving its groups empty until `interval` (or forever).
+    #[tokio::test]
+    async fn startup_fetch_failure_starts_empty_and_retries_until_it_lands() {
+        let origin = Origin::spawn(None, true).await;
+        let dir = tempfile::tempdir().unwrap();
+
+        let providers = load_within(&[("p", &origin.url)], dir.path(), None).await;
+        let p = &providers["p"];
+        assert!(p.proxies().is_empty());
+        assert_eq!(origin.hits(), 1);
+
+        spawn_deferred_initial_fetches(&registry_of(&providers));
+        eventually("a few failed retries", || origin.hits() >= 3).await;
+        assert!(p.proxies().is_empty());
+        *origin.body.lock() = Some(ONE_NODE);
+        eventually("the retry that lands", || p.proxies().len() == 1).await;
+    }
+
+    /// Uncached providers fetch concurrently: a gated origin sees both
+    /// requests before it answers either. A sequential loader would hold
+    /// the second request behind the first and never get there.
+    #[tokio::test]
+    async fn startup_fetches_uncached_providers_concurrently() {
+        let origin = Origin::spawn(Some(ONE_NODE), false).await;
+        let dir = tempfile::tempdir().unwrap();
+        let url = origin.url.clone();
+        let path = dir.path().to_path_buf();
+        let load =
+            tokio::spawn(
+                async move { load_within(&[("a", &url), ("b", &url)], &path, None).await },
+            );
+
+        eventually("both requests in flight", || origin.hits() == 2).await;
+        assert!(
+            !load.is_finished(),
+            "no deadline: startup waits for the fetches"
+        );
+        origin.gate.send_replace(true);
+        let providers = load.await.unwrap();
+        assert_eq!(providers["a"].proxies().len(), 1);
+        assert_eq!(providers["b"].proxies().len(), 1);
+        assert!(
+            !providers["a"].take_deferred_initial(),
+            "a landed fetch owes nothing"
+        );
+    }
+
+    /// With an embedder deadline, startup returns while a fetch is still in
+    /// flight; the straggler populates the provider when it lands, and the
+    /// queued background attempt does not fetch it a second time.
+    #[tokio::test]
+    async fn startup_deadline_returns_before_a_stalled_fetch() {
+        let origin = Origin::spawn(Some(ONE_NODE), false).await;
+        let dir = tempfile::tempdir().unwrap();
+
+        let providers = tokio::time::timeout(
+            Duration::from_secs(5),
+            load_within(
+                &[("p", &origin.url)],
+                dir.path(),
+                Some(Duration::from_millis(50)),
+            ),
+        )
+        .await
+        .expect("the deadline must bound startup");
+        let p = &providers["p"];
+        assert!(p.proxies().is_empty(), "the straggler has not landed yet");
+
+        spawn_deferred_initial_fetches(&registry_of(&providers));
+        origin.gate.send_replace(true);
+        eventually("the straggling fetch", || p.proxies().len() == 1).await;
+        tokio::time::sleep(BACKGROUND_RETRY_MAX * 2).await;
+        assert_eq!(
+            origin.hits(),
+            1,
+            "the background attempt saw the straggler land"
+        );
+    }
+
+    /// A provider a config commit creates (empty) serves its cache first;
+    /// while the feed stays down the revalidation gives up after
+    /// `MAX_REVALIDATION_ATTEMPTS`, keeping the cached nodes.
+    #[tokio::test]
+    async fn spawn_initial_fetch_serves_cache_and_bounds_revalidation() {
+        let origin = Origin::spawn(None, true).await;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("provider_p.yaml"), ONE_NODE).unwrap();
+        let raw = raw_http_provider(&origin.url, None);
+        let p = Arc::new(
+            ProxyProvider::new(
+                "p",
+                &raw,
+                Some(dir.path()),
+                false,
+                false,
+                Default::default(),
+            )
+            .unwrap(),
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), p.spawn_initial_fetch())
+            .await
+            .expect("revalidation retries are bounded")
+            .unwrap();
+        assert_eq!(
+            p.proxies().len(),
+            1,
+            "a failed revalidation keeps the cache"
+        );
+        assert_eq!(origin.hits(), MAX_REVALIDATION_ATTEMPTS as usize);
+    }
+
+    /// The task holds only a `Weak` between attempts: dropping the provider
+    /// (a commit removed it) ends an otherwise endless retry loop.
+    #[tokio::test]
+    async fn spawn_initial_fetch_ends_when_the_provider_is_dropped() {
+        let origin = Origin::spawn(None, true).await;
+        let raw = raw_http_provider(&origin.url, None);
+        let p = Arc::new(
+            ProxyProvider::new("p", &raw, None, false, false, Default::default()).unwrap(),
+        );
+        let task = p.spawn_initial_fetch();
+        eventually("a failed attempt", || origin.hits() >= 1).await;
+        drop(p);
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the retry loop must end with its provider")
+            .unwrap();
     }
 }

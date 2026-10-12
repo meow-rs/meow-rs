@@ -27,6 +27,21 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **Proxy-provider startup no longer waits on the feed**: an HTTP
+  provider with a parseable on-disk cache now starts from it without a
+  request and is refetched in the background right after startup (mihomo
+  reads its local file first too); providers without a cache fetch
+  concurrently instead of one after another. A provider whose first fetch
+  fails starts empty and is retried with backoff (5 s doubling to 5 min)
+  until a fetch lands, instead of leaving its `use:` groups empty until
+  `interval` — or for good when it has none. Embedders that must not block
+  their startup on a third-party feed (a mobile VPN cannot bring its tunnel
+  up before `load_config` returns) can bound the wait with
+  `meow_config::set_provider_fetch_deadline`; stragglers then land in the
+  background. Embedders should replace their post-publish
+  `take_deferred_initial` → `acquire_initial` loop with
+  `meow_config::proxy_provider::spawn_deferred_initial_fetches`.
+
 - **TCP benchmark measurements** (issue #746): disable Nagle on the harness
   client and echo sockets to reduce macOS loopback tail stalls, reject
   incomplete echoes, and add an interleaved comparison runner with retained
