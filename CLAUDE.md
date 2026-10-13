@@ -165,6 +165,7 @@ cargo test -p meow-api --features meow-config/trusttunnel --test api_test trustt
 cargo test -p meow-proxy --no-default-features --features trusttunnel-h3 --lib trusttunnel
 cargo test -p meow-proxy --no-default-features --features trusttunnel-h3 --test trusttunnel_e2e
 cargo test -p meow-config --features trusttunnel-h3 --test trusttunnel_config_test
+cargo test -p meow-config --features trusttunnel-h3 --lib
 
 # The official TrustTunnel test peer is required for the e2e target.
 # Fetch with `bash scripts/fetch-trusttunnel-endpoint.sh /tmp/meow-tt-peer`,

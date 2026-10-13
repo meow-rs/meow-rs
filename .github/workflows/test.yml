@@ -230,6 +230,9 @@ jobs:
           cargo nextest run -p meow-proxy --no-default-features --features trusttunnel-h3 --lib trusttunnel --retries 2 --no-fail-fast
           cargo nextest run -p meow-proxy --no-default-features --features trusttunnel-h3 --test trusttunnel_e2e --retries 2 --no-fail-fast
           cargo nextest run -p meow-config --features trusttunnel-h3 --test trusttunnel_config_test --retries 2 --no-fail-fast
+          # meow-config's own unit tests embed TrustTunnel fixtures too; only
+          # this scope compiles them with every TrustTunnel transport on.
+          cargo nextest run -p meow-config --features trusttunnel-h3 --lib --retries 2 --no-fail-fast
 
       # One workspace-scoped invocation for every default-features test
       # target. A single invocation keeps a single feature-resolution scope,

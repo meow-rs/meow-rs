@@ -2778,8 +2778,10 @@ header:
     /// on every refresh tick.
     #[tokio::test]
     async fn unparseable_node_becomes_a_dead_placeholder_not_a_payload_rejection() {
+        // `bad` lacks `username`, so every feature set rejects it (a
+        // `quic: true` node alone would parse under `trusttunnel-h3`).
         let url = spawn_payload_server(
-            "proxies:\n  - {name: good, type: direct}\n  - {name: bad, type: trusttunnel, server: vpn.example.test, port: 443, username: fixture, password: test-only, quic: true}\n",
+            "proxies:\n  - {name: good, type: direct}\n  - {name: bad, type: trusttunnel, server: vpn.example.test, port: 443, password: test-only}\n",
         )
         .await;
         let dir = tempfile::tempdir().unwrap();
