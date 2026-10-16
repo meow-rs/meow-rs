@@ -36,6 +36,11 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **`/connections` reports the app that opened a flow**: `metadata.process`,
+  `processPath` and `uid` were blanked when a connection was registered, so
+  an inbound that supplies them (an Android VPN) never showed the owner.
+  They are now kept, as in mihomo.
+
 - **`/connections` shows the node a group actually uses**: a flow whose
   rule targets a proxy group now records every group's selected member in
   `chains`, leaf first like mihomo (`["HK-01", "Auto", "Proxy"]`), instead

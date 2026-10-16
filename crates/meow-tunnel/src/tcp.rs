@@ -725,6 +725,40 @@ mod tests {
         assert_eq!(stats.active_connection_count(), 0);
     }
 
+    /// `/connections` names the app that opened a flow when the inbound
+    /// knows it (an Android VPN asks the system per flow): registering the
+    /// flow must not drop it.
+    #[tokio::test]
+    async fn tracked_connection_keeps_the_inbound_supplied_owner() {
+        let tunnel = test_tunnel();
+        let meta = Metadata {
+            process: "com.example.maps".into(),
+            process_path: "/opt/maps/bin/maps".into(),
+            uid: Some(10_123),
+            ..metadata()
+        };
+        let guard = tunnel
+            .inner()
+            .tcp_admission()
+            .track_named(
+                &meta,
+                "PROCESS-NAME".into(),
+                "com.example.maps".into(),
+                &DirectAdapter::new(),
+            )
+            .unwrap();
+        let id = guard.id().unwrap();
+        let tracked = tunnel
+            .statistics()
+            .active_connections()
+            .into_iter()
+            .find(|c| c.id == id)
+            .unwrap();
+        assert_eq!(tracked.metadata.process, "com.example.maps");
+        assert_eq!(tracked.metadata.process_path, "/opt/maps/bin/maps");
+        assert_eq!(tracked.metadata.uid, Some(10_123));
+    }
+
     /// Route through the tunnel and register the flow the way
     /// `route_inbound_tcp` does, returning the API-visible chain.
     async fn tracked_chain(tunnel: &crate::Tunnel) -> Vec<String> {

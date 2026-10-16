@@ -308,11 +308,12 @@ fn test_metadata_pure_clears_extra_fields() {
     assert_eq!(pure.src_port, 1234);
     assert_eq!(pure.dst_port, 443);
     assert_eq!(pure.host, "example.com");
+    // The flow's owner is part of what `/connections` reports.
+    assert_eq!(pure.process, "curl");
+    assert_eq!(pure.process_path, "/usr/bin/curl");
+    assert_eq!(pure.uid, Some(1000));
 
     // Cleared fields
-    assert!(pure.process.is_empty());
-    assert!(pure.process_path.is_empty());
-    assert!(pure.uid.is_none());
     assert!(pure.dscp.is_none());
     assert!(pure.src_geo_ip.is_empty());
     assert!(pure.dst_geo_ip.is_empty());
