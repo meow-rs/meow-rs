@@ -47,6 +47,15 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **simple-obfs HTTP sends an empty `Host` for hosts Go would reject**:
+  subscriptions write `obfs-opts: {mode: http, host: /}` to get the empty
+  `Host:` header mihomo emits (Go's `Request.Write` blanks an invalid one),
+  but meow sent `Host: /:8443` verbatim. Behind a `dialer-proxy` whose
+  server sniffs HTTP and routes by `Host` (seen with airport VLESS nodes),
+  that sent the flow to a bogus target, so such a Snell or SS node worked in
+  mihomo and failed in meow. A host with a byte outside Go's valid set now
+  yields an empty `Host`, as in mihomo; ordinary hosts are unchanged.
+
 - **`/connections` reports the app that opened a flow**: `metadata.process`,
   `processPath` and `uid` were blanked when a connection was registered, so
   an inbound that supplies them (an Android VPN) never showed the owner.

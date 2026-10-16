@@ -101,7 +101,14 @@ fn build_http_request(host: &str, port: u16, body: &[u8]) -> Vec<u8> {
     rand::rng().fill_bytes(&mut rand_bytes);
     let key = base64::engine::general_purpose::URL_SAFE.encode(rand_bytes);
 
-    let host_header = if port == 80 {
+    // mihomo writes the request through Go's `Request.Write`, which blanks a
+    // `Host` that fails `httpguts.ValidHostHeader` (go.dev/issue/61431), and
+    // subscriptions rely on it: `host: /` means "send an empty Host". Emitting
+    // `/:8443` verbatim instead hands a sniffing hop in a dialer chain (e.g.
+    // Xray's HTTP destination override) a bogus target, and the flow dies.
+    let host_header = if !host.bytes().all(is_go_valid_host_byte) {
+        String::new()
+    } else if port == 80 {
         host.to_string()
     } else {
         format!("{host}:{port}")
@@ -131,6 +138,12 @@ fn build_http_request(host: &str, port: u16, body: &[u8]) -> Vec<u8> {
     );
     req.extend_from_slice(body);
     req
+}
+
+/// Go `httpguts.validHostByte`: the bytes `net/http` accepts in a `Host`
+/// value. Non-ASCII passes — Go punycodes it before the check.
+fn is_go_valid_host_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"!$%&'()*+,-.:;=[]_~".contains(&b) || !b.is_ascii()
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> HttpObfs<S> {
@@ -648,6 +661,37 @@ mod tests {
         let req = build_http_request("example.com", 8080, b"x");
         let s = std::str::from_utf8(&req).unwrap();
         assert!(s.contains("Host: example.com:8080\r\n"));
+    }
+
+    #[test]
+    fn http_request_blanks_host_go_would_reject() {
+        // Go's `Request.Write` sends `Host: ` for these, and subscriptions
+        // ship `host: /` to get exactly that.
+        for (host, port) in [
+            ("/", 8443),
+            ("/", 80),
+            ("a/b", 443),
+            ("a?b", 80),
+            ("a@b", 80),
+        ] {
+            let req = build_http_request(host, port, b"x");
+            let s = std::str::from_utf8(&req).unwrap();
+            assert!(
+                s.contains("\r\nHost: \r\nUser-Agent: "),
+                "{host:?}:{port}: {s:?}"
+            );
+        }
+        // Go-valid hosts keep their value, including IPv6 literals and
+        // non-ASCII (Go punycodes it first; meow sends it as-is).
+        for (host, want) in [
+            ("[::1]", "Host: [::1]:8443\r\n"),
+            ("例え.jp", "Host: 例え.jp:8443\r\n"),
+            ("a_b-c.example", "Host: a_b-c.example:8443\r\n"),
+        ] {
+            let req = build_http_request(host, 8443, b"x");
+            let s = std::str::from_utf8(&req).unwrap();
+            assert!(s.contains(want), "{host:?}: {s:?}");
+        }
     }
 
     // ---- TLS ClientHello layout ----
