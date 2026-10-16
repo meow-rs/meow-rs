@@ -70,6 +70,13 @@ the canonical, in-repo source a release is cut from.
   entirely when connection details are not tracked (no external
   controller).
 
+- **Bare IPv6 nameserver addresses** (#738): an unbracketed IPv6 literal in
+  any nameserver list is now taken as the whole address on the transport's
+  default port. The parser used to split on the last colon first, so
+  `2402:4e00::` failed with `InvalidPort("")` and `::1` / `tls://::1` were
+  read as host `:` on port 1. Bracketed `[addr]:port` keeps its explicit
+  port.
+
 - **LuCI notifications on OpenWrt 23.05 and 24.10.0**: configuration
   validation/saves, service actions, and client updates no longer report
   failure after succeeding when `ui.addTimeLimitedNotification()` is
@@ -122,6 +129,23 @@ the canonical, in-repo source a release is cut from.
 - **muxcool UDP compatibility**: reject outgoing datagrams larger than
   Xray's 8 KiB packet limit before transmission, preserving other streams
   on the shared mux session.
+
+- **`log-level:` in the config file now applies at startup** (issue #729).
+  The field was parsed into `Config` and echoed by `GET /configs`, but the
+  tracing filter was only ever built from `RUST_LOG` (defaulting to
+  `info`) — a configured `log-level: debug` produced INFO-only output
+  until a runtime `PATCH /configs` set it, and the PATCH was lost on every
+  restart. The configured level is now applied once the raw config is
+  loaded — before `build_config`, so parse/provider diagnostics already
+  respect it — and `PUT /configs` applies the level when the committed
+  document actually changes it, so `GET /configs` can no longer echo a
+  level the process isn't running (unchanged-value commits — e.g. rules
+  or subscription edits — leave a `RUST_LOG` override alone).
+  An explicitly set `RUST_LOG` still takes precedence at startup as the
+  operator override. Values are whitelisted to the accepted level names
+  (the same set `PATCH` enforces) — a typo warns and keeps the current
+  filter instead of reaching `EnvFilter`, where a bare word parses as a
+  `target=TRACE` directive and would silence all logging.
 
 ## [0.22.0] - 2026-10-03
 
@@ -635,23 +659,6 @@ the canonical, in-repo source a release is cut from.
   wholesale-replace became contribution merge; see the #640 fix below.
 
 ### Fixed
-
-- **`log-level:` in the config file now applies at startup** (issue #729).
-  The field was parsed into `Config` and echoed by `GET /configs`, but the
-  tracing filter was only ever built from `RUST_LOG` (defaulting to
-  `info`) — a configured `log-level: debug` produced INFO-only output
-  until a runtime `PATCH /configs` set it, and the PATCH was lost on every
-  restart. The configured level is now applied once the raw config is
-  loaded — before `build_config`, so parse/provider diagnostics already
-  respect it — and `PUT /configs` applies the level when the committed
-  document actually changes it, so `GET /configs` can no longer echo a
-  level the process isn't running (unchanged-value commits — e.g. rules
-  or subscription edits — leave a `RUST_LOG` override alone).
-  An explicitly set `RUST_LOG` still takes precedence at startup as the
-  operator override. Values are whitelisted to the accepted level names
-  (the same set `PATCH` enforces) — a typo warns and keeps the current
-  filter instead of reaching `EnvFilter`, where a bare word parses as a
-  `target=TRACE` directive and would silence all logging.
 
 - **XTLS Vision: a padded-mode FIN is no longer misreported as a relay
   error.** Vision has no end-of-stream frame — a peer that is done simply
