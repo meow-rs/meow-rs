@@ -27,6 +27,15 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **`/connections` shows the node a group actually uses**: a flow whose
+  rule targets a proxy group now records every group's selected member in
+  `chains`, leaf first like mihomo (`["HK-01", "Auto", "Proxy"]`), instead
+  of only the rule's group name, so dashboards and clients can tell which
+  node carries it. The chain is read when the flow is registered by peeking
+  each group's current pick (round-robin does not advance), and is skipped
+  entirely when connection details are not tracked (no external
+  controller).
+
 - **LuCI notifications on OpenWrt 23.05 and 24.10.0**: configuration
   validation/saves, service actions, and client updates no longer report
   failure after succeeding when `ui.addTimeLimitedNotification()` is

@@ -271,7 +271,8 @@ async fn handle_http_inner(
         } = target;
         let mut route = Some(route);
 
-        let Some(_guard) = admission.track_named(&metadata, rule_name, rule_payload, proxy.name())
+        let Some(_guard) =
+            admission.track_named(&metadata, rule_name, rule_payload, proxy.as_ref())
         else {
             return Ok(());
         };

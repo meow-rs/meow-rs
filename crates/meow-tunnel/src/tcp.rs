@@ -1,7 +1,7 @@
 use crate::relay::{copy_bidirectional_buf_tracked, RELAY_BUF_SIZE};
 use crate::statistics::Statistics;
 use crate::tunnel::{ResolvedTarget, TunnelInner};
-use meow_common::{with_dial_timeout, Metadata, ProxyConn};
+use meow_common::{with_dial_timeout, Metadata, ProxyAdapter, ProxyConn};
 use smallvec::{smallvec, SmallVec};
 use smol_str::SmolStr;
 use std::sync::Arc;
@@ -34,13 +34,49 @@ enum ConnectionKey {
     Headless,
 }
 
+/// Bound on the group hops [`connection_chain`] walks.
+/// `reject_group_membership_cycles` keeps config-declared groups acyclic,
+/// so this only guards hand-built registries (same bound as the match
+/// loop's `RouteTargetProbe::unwraps_to`).
+const MAX_CHAIN_HOPS: usize = 16;
+
+/// The `/connections` `chains` entry for a flow routed to `adapter`: the
+/// leaf the dial will use first, the rule's target last — upstream's order,
+/// e.g. `["HK-01", "Auto", "Proxy"]` — so a dashboard can show which member
+/// each group picked rather than only the rule's group name.
+///
+/// Upstream builds the chain on the dialed conn (each group appends its
+/// name once its member's dial returns) and registers the flow afterwards.
+/// meow registers before dialing, so an in-flight dial is listed and
+/// cancellable; the walk therefore peeks `unwrap_proxy(metadata, false)`,
+/// which reports the member the next dial takes (Selector, URLTest and
+/// Fallback deterministically; round-robin while no other dial commits in
+/// between) without advancing counters or recording group use.
+fn connection_chain(adapter: &dyn ProxyAdapter, metadata: &Metadata) -> SmallVec<[Arc<str>; 1]> {
+    let mut chain: SmallVec<[Arc<str>; 1]> = smallvec![Arc::from(adapter.name())];
+    let mut next = adapter.unwrap_proxy(metadata, false);
+    while let Some(hop) = next {
+        if chain.len() > MAX_CHAIN_HOPS {
+            debug!(
+                "{}: unwrap chain exceeded {MAX_CHAIN_HOPS} hops recording connection chain",
+                adapter.name()
+            );
+            break;
+        }
+        chain.push(Arc::from(hop.name()));
+        next = hop.unwrap_proxy(metadata, false);
+    }
+    chain.reverse();
+    chain
+}
+
 impl<'a> ConnectionGuard<'a> {
     fn track_named(
         stats: &'a Statistics,
         metadata: &Metadata,
         rule: SmolStr,
         rule_payload: SmolStr,
-        proxy_name: &str,
+        adapter: &dyn ProxyAdapter,
     ) -> Self {
         if let Some(counters) = stats.begin_headless_connection() {
             return Self {
@@ -53,7 +89,7 @@ impl<'a> ConnectionGuard<'a> {
             metadata.pure(),
             rule,
             rule_payload,
-            smallvec![Arc::from(proxy_name)],
+            connection_chain(adapter, metadata),
         );
         Self {
             stats,
@@ -144,8 +180,9 @@ impl TunnelInner {
 }
 
 impl<'a> TcpAdmission<'a> {
-    /// Register a routed connection without constructing API-only metadata
-    /// when the application has no external controller.
+    /// Register a connection routed to `adapter` without constructing
+    /// API-only metadata or the group chain when the application has no
+    /// external controller.
     /// The read lock covers generation validation and registry insertion,
     /// so a cold reload cannot drain between them and miss this connection.
     pub fn track_named(
@@ -153,20 +190,15 @@ impl<'a> TcpAdmission<'a> {
         metadata: &Metadata,
         rule: SmolStr,
         rule_payload: SmolStr,
-        proxy_name: &str,
+        adapter: &dyn ProxyAdapter,
     ) -> Option<ConnectionGuard<'a>> {
         let generation = self.inner.tcp_generation.read();
         if *generation != self.generation {
             debug!("TCP routing setup invalidated by cold reload");
             return None;
         }
-        let guard = ConnectionGuard::track_named(
-            &self.inner.stats,
-            metadata,
-            rule,
-            rule_payload,
-            proxy_name,
-        );
+        let guard =
+            ConnectionGuard::track_named(&self.inner.stats, metadata, rule, rule_payload, adapter);
         drop(generation);
         Some(guard)
     }
@@ -298,8 +330,8 @@ pub async fn route_inbound_tcp<C>(
 
     // Track the connection — guard drops it on every exit path, including
     // the abort case where the manual close call below would never run.
-    // API-only metadata and proxy-name ownership are built only when needed.
-    let Some(guard) = admission.track_named(&metadata, rule_name, rule_payload, proxy.name())
+    // API-only metadata and the proxy chain are built only when needed.
+    let Some(guard) = admission.track_named(&metadata, rule_name, rule_payload, proxy.as_ref())
     else {
         return;
     };
@@ -397,6 +429,7 @@ pub async fn route_inbound_tcp<C>(
 mod tests {
     use super::*;
     use meow_common::{ConnType, Network};
+    use meow_proxy::DirectAdapter;
 
     fn metadata() -> Metadata {
         Metadata {
@@ -462,7 +495,12 @@ mod tests {
         let inner = tunnel.inner();
         let guard = inner
             .tcp_admission()
-            .track_named(&metadata(), "MATCH".into(), "".into(), "DIRECT")
+            .track_named(
+                &metadata(),
+                "MATCH".into(),
+                "".into(),
+                &DirectAdapter::new(),
+            )
             .unwrap();
 
         assert_eq!(tunnel.statistics().active_connection_count(), 0);
@@ -492,7 +530,12 @@ mod tests {
         let old = tunnel
             .inner()
             .tcp_admission()
-            .track_named(&metadata(), "MATCH".into(), "".into(), "DIRECT")
+            .track_named(
+                &metadata(),
+                "MATCH".into(),
+                "".into(),
+                &DirectAdapter::new(),
+            )
             .unwrap();
         assert_eq!(
             tunnel.reload_routing(Default::default(), vec![], None, Default::default()),
@@ -505,7 +548,12 @@ mod tests {
         let fresh = tunnel
             .inner()
             .tcp_admission()
-            .track_named(&metadata(), "MATCH".into(), "".into(), "DIRECT")
+            .track_named(
+                &metadata(),
+                "MATCH".into(),
+                "".into(),
+                &DirectAdapter::new(),
+            )
             .unwrap();
         let completed =
             ConnectionGuard::track(stats, metadata(), "MATCH".into(), "".into(), smallvec![]);
@@ -535,7 +583,12 @@ mod tests {
                 let guard = std::thread::scope(|scope| {
                     let registration = scope.spawn(|| {
                         start.wait();
-                        admission.track_named(&metadata(), "MATCH".into(), "".into(), "DIRECT")
+                        admission.track_named(
+                            &metadata(),
+                            "MATCH".into(),
+                            "".into(),
+                            &DirectAdapter::new(),
+                        )
                     });
                     start.wait();
                     tunnel.reload_routing(Default::default(), vec![], None, Default::default());
@@ -670,5 +723,78 @@ mod tests {
         assert_eq!(stats.active_connection_count(), 1);
         drop(g2);
         assert_eq!(stats.active_connection_count(), 0);
+    }
+
+    /// Route through the tunnel and register the flow the way
+    /// `route_inbound_tcp` does, returning the API-visible chain.
+    async fn tracked_chain(tunnel: &crate::Tunnel) -> Vec<String> {
+        let meta = metadata();
+        let target = tunnel.inner().resolve_proxy(&meta).await.unwrap();
+        let guard = tunnel
+            .inner()
+            .tcp_admission()
+            .track_named(
+                &meta,
+                target.rule_name,
+                target.rule_payload,
+                target.adapter.as_ref(),
+            )
+            .unwrap();
+        let id = guard.id().unwrap();
+        tunnel
+            .statistics()
+            .active_connections()
+            .into_iter()
+            .find(|c| c.id == id)
+            .unwrap()
+            .chains
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    /// `/connections` `chains` names the member every group on the path
+    /// picked, leaf first like upstream — not just the rule's group, which
+    /// left a dashboard unable to tell which node a flow actually uses.
+    #[tokio::test]
+    async fn tracked_chain_names_each_group_selection_leaf_first() {
+        let raw: meow_config::raw::RawConfig = serde_yaml::from_str(
+            "proxies:
+  - {name: HK-01, type: socks5, server: 127.0.0.1, port: 1}
+  - {name: JP-01, type: socks5, server: 127.0.0.1, port: 2}
+proxy-groups:
+  - {name: Auto, type: fallback, proxies: [HK-01, JP-01], url: 'http://probe.test/204', interval: 300}
+  - {name: RR, type: load-balance, strategy: round-robin, proxies: [HK-01, JP-01], url: 'http://probe.test/204', interval: 300}
+  - {name: Proxy, type: select, proxies: [Auto, RR, DIRECT]}
+",
+        )
+        .unwrap();
+        let proxies = meow_config::rebuild_from_raw(&raw).unwrap().proxies;
+        let tunnel = test_tunnel();
+        tunnel.update_routing(
+            proxies.clone(),
+            vec![Box::new(meow_rules::final_rule::FinalRule::new("Proxy"))],
+            Default::default(),
+        );
+
+        // Nested groups: Selector -> Fallback -> first alive leaf.
+        assert_eq!(tracked_chain(&tunnel).await, ["HK-01", "Auto", "Proxy"]);
+        proxies["HK-01"].health().set_alive(false);
+        assert_eq!(tracked_chain(&tunnel).await, ["JP-01", "Auto", "Proxy"]);
+
+        // Round-robin: recording peeks, so registering the flow does not
+        // rotate the group, and the recorded member is the one the dial's
+        // committing pick then takes.
+        let selector = proxies["Proxy"].selection().unwrap();
+        selector.set("RR").await.unwrap();
+        let first = tracked_chain(&tunnel).await;
+        assert_eq!(first[1..], ["RR", "Proxy"]);
+        assert_eq!(tracked_chain(&tunnel).await, first, "peek must not rotate");
+        let dialed = proxies["RR"].unwrap_proxy(&metadata(), true).unwrap();
+        assert_eq!(dialed.name(), first[0]);
+
+        // A leaf selection records just the leaf behind the group.
+        selector.set("DIRECT").await.unwrap();
+        assert_eq!(tracked_chain(&tunnel).await, ["DIRECT", "Proxy"]);
     }
 }
