@@ -3501,6 +3501,109 @@ async fn h6_sleep_then_transport_error_is_503() {
 // ── Connection management tests ──────────────────────────────────
 
 /// DELETE /connections/{id} removes the named connection and returns 204.
+/// `GET /connections/{id}` serves a connection's notes while it is live and,
+/// because notes are on, after it closes; the list keeps its shape.
+#[tokio::test]
+async fn get_connection_by_id_returns_notes_live_and_after_close() {
+    use meow_common::{ConnType, Metadata, Network};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let state = test_state_default();
+    let rule =
+        meow_rules::parse_rule("MATCH,DIRECT", &meow_rules::ParserContext::default()).unwrap();
+    state
+        .tunnel
+        .update_routing(HashMap::new(), vec![rule], Default::default());
+    state.tunnel.set_connection_notes(true);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 64];
+        loop {
+            let n = socket.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            socket.write_all(&buf[..n]).await.unwrap();
+        }
+    });
+    let meta = Metadata {
+        network: Network::Tcp,
+        conn_type: ConnType::Http,
+        dst_ip: Some(server.ip()),
+        dst_port: server.port(),
+        ..Default::default()
+    };
+    let (mut client, mut inbound) = tokio::io::duplex(1024);
+    let inner = Arc::clone(state.tunnel.inner());
+    let flow = tokio::spawn(async move {
+        meow_tunnel::route_inbound_tcp(&inner, &mut inbound, meta, &[]).await;
+    });
+    client.write_all(b"ping").await.unwrap();
+    let mut echoed = [0u8; 4];
+    client.read_exact(&mut echoed).await.unwrap();
+
+    let get = |uri: String| {
+        let app = create_router(Arc::clone(&state));
+        async move {
+            app.oneshot(Request::get(uri).body(axum::body::Body::empty()).unwrap())
+                .await
+                .unwrap()
+        }
+    };
+
+    let json = body_json(get("/connections".into()).await).await;
+    let conns = json["connections"].as_array().unwrap();
+    assert_eq!(conns.len(), 1);
+    assert!(conns[0].get("notes").is_none(), "{conns:?}");
+    let id = conns[0]["id"].as_str().unwrap().to_owned();
+
+    let resp = get(format!("/connections/{id}")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let live = body_json(resp).await;
+    assert_eq!(live["id"], id.as_str());
+    assert_eq!(live["closed"], false);
+    assert!(live.get("end").is_none());
+    let texts = |detail: &serde_json::Value| -> Vec<String> {
+        detail["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|note| note["text"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let notes = texts(&live);
+    assert!(
+        notes.contains(&"Matched rule #1 MATCH → DIRECT".to_owned()),
+        "{notes:?}"
+    );
+    assert!(
+        notes.iter().any(|note| note.starts_with("Connected in ")),
+        "{notes:?}"
+    );
+    assert_eq!(live["notes"][0]["kind"], "connection");
+
+    drop(client);
+    flow.await.unwrap();
+
+    let resp = get(format!("/connections/{id}")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let closed = body_json(resp).await;
+    assert_eq!(closed["closed"], true);
+    assert!(closed["end"].is_string());
+    assert_eq!(closed["upload"], 4);
+    assert_eq!(closed["download"], 4);
+    let notes = texts(&closed);
+    assert_eq!(notes.last().unwrap(), "Closed: 4 B up, 4 B down");
+
+    let resp = get(format!("/connections/{}", uuid::Uuid::new_v4())).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let resp = get("/connections/not-a-uuid".into()).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
 #[tokio::test]
 async fn delete_connection_by_id_returns_204_and_removes_entry() {
     use meow_common::{ConnType, Metadata, Network};

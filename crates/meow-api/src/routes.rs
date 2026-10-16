@@ -208,7 +208,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/rules/{index}", delete(delete_rule))
         .route("/rules/reorder", post(reorder_rules))
         .route("/connections", get(get_connections))
-        .route("/connections/{id}", delete(close_connection))
+        .route(
+            "/connections/{id}",
+            get(get_connection).delete(close_connection),
+        )
         .route("/connections", delete(close_all_connections))
         .route(
             "/configs",
@@ -615,6 +618,19 @@ async fn get_connections(
 
     let body = connections_json(&state).await;
     ([(header::CONTENT_TYPE, "application/json")], body).into_response()
+}
+
+/// One live or recently closed connection with its notes (a meow
+/// extension; mihomo only has `DELETE` here). Closed connections stay
+/// readable only when they recorded notes, until the ring ages them out.
+async fn get_connection(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    let Ok(uuid) = uuid::Uuid::parse_str(&id) else {
+        return msg_err(StatusCode::BAD_REQUEST, "Body invalid");
+    };
+    match state.tunnel.statistics().connection_detail(uuid) {
+        Some(detail) => Json(detail).into_response(),
+        None => msg_err(StatusCode::NOT_FOUND, "Resource not found"),
+    }
 }
 
 async fn close_connection(
@@ -1114,6 +1130,7 @@ async fn apply_raw_to_tunnel(
         CONFIG_MUTATION.try_lock().is_err(),
         "caller must hold the CONFIG_MUTATION lane"
     );
+    let connection_notes = raw.connection_notes.unwrap_or(false);
     let expected_groups: Vec<String> = raw
         .proxy_groups
         .as_deref()
@@ -1209,6 +1226,7 @@ async fn apply_raw_to_tunnel(
         install_resolver_everywhere(&state.tunnel, state.dns_server.as_ref(), dns);
     }
     state.tunnel.update_routing(proxies, rules, dialer_registry);
+    state.tunnel.set_connection_notes(connection_notes);
     // Commit point reached: every fallible check passed. The candidate's
     // provider sets become the live registries — the rules and DNS
     // `rule-set:` matchers installed above already reference these Arcs
@@ -3156,6 +3174,9 @@ async fn put_configs(
     let dropped = state
         .tunnel
         .reload_routing(proxies, rules, mode, dialer_registry);
+    state
+        .tunnel
+        .set_connection_notes(raw_config.connection_notes.unwrap_or(false));
     if dropped > 0 {
         tracing::warn!(
             connections_dropped = dropped,

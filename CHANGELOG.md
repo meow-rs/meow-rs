@@ -10,6 +10,17 @@ the canonical, in-repo source a release is cut from.
 
 ### Added
 
+- **Per-connection notes** (`connection-notes: true`, off by default): the
+  tunnel records a short, timestamped account of how it handled each TCP
+  connection — the inbound and owning app, the fake-IP reversal, every DNS
+  lookup a rule needed (upstream, answer or error, and how long it took), the
+  rule that matched, the dial result and how the relay ended. The new
+  `GET /connections/{id}` endpoint (a meow-rs extension) returns the
+  `/connections` entry plus its `notes`, and keeps answering for the last 256
+  closed connections that recorded notes, so short or failed flows can still
+  be explained. `/connections` itself is unchanged. Embedders can toggle the
+  recording with `Tunnel::set_connection_notes`.
+
 - **Inbound-supplied process identity for embedders**:
   `meow_common::process_lookup::enable_inbound_process_info()` declares that
   the embedder's inbound fills `Metadata::process` / `process_path` / `uid`

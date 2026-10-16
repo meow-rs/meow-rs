@@ -2,6 +2,8 @@ use crate::match_engine::{self, DomainIndex};
 use crate::rule_ir::{CompiledMatchResult, CompiledRuleSet, LazyMatchOutcome};
 use crate::statistics::Statistics;
 use crate::udp::{self, NatTable};
+use meow_common::conn_note;
+use meow_common::conn_notes::ConnNotes;
 use meow_common::{
     metadata_ip_literal, AdapterType, Metadata, Network, Proxy, ProxyAdapter, Rule, TargetCheck,
     TargetProbe, TunnelMode,
@@ -153,6 +155,8 @@ pub struct TunnelInner {
     /// [`Tunnel::close_all_udp_sessions`]; every listener-owned UDP flow
     /// holds a receiver ([`udp::UdpFlushWatch`]).
     udp_flush: tokio::sync::watch::Sender<u64>,
+    /// Record per-connection notes — see [`Tunnel::set_connection_notes`].
+    connection_notes: AtomicBool,
 }
 
 /// A running TUN listener: the task plus the signal resolving once its
@@ -231,6 +235,16 @@ impl TunnelInner {
         udp::UdpFlushWatch::new(self.udp_flush.subscribe())
     }
 
+    /// The note log a new connection should record into: the inbound's own
+    /// when it opened a [`ConnNotes`] scope, a fresh one when notes are on
+    /// (see [`Tunnel::set_connection_notes`]), else `None`.
+    pub fn connection_notes(&self) -> Option<ConnNotes> {
+        ConnNotes::current().or_else(|| {
+            (self.connection_notes.load(Ordering::Relaxed) && !self.stats.is_headless())
+                .then(ConnNotes::new)
+        })
+    }
+
     /// Rewrite a fake-IP destination back to its real hostname before rule
     /// matching. Mirrors upstream `preHandleMetadata` in
     /// `tunnel/tunnel.go`. Every inbound that can dial calls this before
@@ -283,6 +297,7 @@ impl TunnelInner {
             match resolver.reverse_lookup(ip) {
                 Some(host) => {
                     debug!("pre_handle_metadata: fake-ip {ip} → {host}");
+                    conn_note!(Dns, "Fake IP {ip} maps to {host}");
                     metadata.host = host;
                     metadata.dst_ip = None;
                 }
@@ -302,8 +317,18 @@ impl TunnelInner {
                     }
                     if metadata.host.is_empty() {
                         debug!("pre_handle_metadata: drop unmapped fake-ip {ip}");
+                        conn_note!(
+                            Dns,
+                            "Fake IP {ip} has no live mapping and the flow carries no \
+                             name; dropped"
+                        );
                         return PreHandleVerdict::Drop;
                     }
+                    conn_note!(
+                        Dns,
+                        "Fake IP {ip} has no live mapping; using the name {}",
+                        metadata.host
+                    );
                     metadata.dst_ip = None;
                 }
             }
@@ -314,6 +339,7 @@ impl TunnelInner {
         // `DNSMapping` mode contract used by the tproxy listener.
         if metadata.host.is_empty() {
             if let Some(host) = resolver.reverse_lookup(ip) {
+                conn_note!(Dns, "{ip} was resolved earlier for {host}; using that name");
                 metadata.host = host;
             }
         }
@@ -360,12 +386,15 @@ impl TunnelInner {
     pub async fn resolve_proxy(&self, metadata: &Metadata) -> Option<ResolvedTarget> {
         let mode = *self.mode.read();
         match mode {
-            TunnelMode::Direct => Some(ResolvedTarget {
-                adapter: Arc::clone(&self.direct) as Arc<dyn ProxyAdapter>,
-                rule_name: SmolStr::new_static("Direct"),
-                rule_payload: SmolStr::default(),
-                route: self.route(),
-            }),
+            TunnelMode::Direct => {
+                conn_note!(Rule, "Direct mode → DIRECT");
+                Some(ResolvedTarget {
+                    adapter: Arc::clone(&self.direct) as Arc<dyn ProxyAdapter>,
+                    rule_name: SmolStr::new_static("Direct"),
+                    rule_payload: SmolStr::default(),
+                    route: self.route(),
+                })
+            }
             TunnelMode::Global => {
                 let route = self.route();
                 let (adapter, rule_name) = if let Some(proxy) = route.proxies.get("GLOBAL") {
@@ -379,6 +408,7 @@ impl TunnelInner {
                         SmolStr::new_static("Direct"),
                     )
                 };
+                conn_note!(Rule, "Global mode → {}", adapter.name());
                 Some(ResolvedTarget {
                     adapter,
                     rule_name,
@@ -436,7 +466,21 @@ impl TunnelInner {
             LazyMatchOutcome::NeedsEnrichment {
                 needs_ip,
                 needs_process,
+                blocked_rule,
             } => {
+                if let Some(rule) = route.rules.get(blocked_rule) {
+                    let needs = match (needs_ip, needs_process) {
+                        (true, true) => "the destination IP and the owning process",
+                        (true, false) => "the destination IP",
+                        _ => "the owning process",
+                    };
+                    conn_note!(
+                        Rule,
+                        "Rule #{} {} needs {needs}",
+                        blocked_rule + 1,
+                        RuleText::new(rule.as_ref())
+                    );
+                }
                 // Process enrichment matches `resolve_proxy`: the enriched
                 // copy is used for matching only, so tracked connection
                 // metadata stays byte-identical to the eager path.
@@ -445,12 +489,31 @@ impl TunnelInner {
                 } else {
                     None
                 };
+                if needs_process {
+                    match enriched.as_ref().filter(|m| !m.process.is_empty()) {
+                        Some(m) => conn_note!(Rule, "Owning process: {}", m.process),
+                        None => conn_note!(Rule, "Owning process not found"),
+                    }
+                }
                 if needs_ip {
                     // `needs_ip` already encodes the `pre_resolve` guards:
                     // host present, dst_ip absent.
+                    let started = std::time::Instant::now();
                     if let Some(real_ip) = self.resolver().resolve_ip_real(&metadata.host).await {
                         debug!("lazy resolve: {} -> {}", metadata.host, real_ip);
+                        conn_note!(
+                            Rule,
+                            "Destination IP for matching: {real_ip} ({} ms)",
+                            started.elapsed().as_millis()
+                        );
                         metadata.dst_ip = Some(real_ip);
+                    } else {
+                        conn_note!(
+                            Rule,
+                            "No address for {} after {} ms; IP rules cannot match",
+                            metadata.host,
+                            started.elapsed().as_millis()
+                        );
                     }
                 }
                 if let (Some(enriched), Some(ip)) = (enriched.as_mut(), metadata.dst_ip) {
@@ -532,6 +595,12 @@ impl TunnelInner {
                 self.stats
                     .rule_match
                     .increment(m.rule_type.as_str(), action);
+                conn_note!(
+                    Rule,
+                    "Matched rule #{} {} → {target}",
+                    m.rule_index + 1,
+                    RuleText::parts(m.rule_type.as_str(), m.rule_payload)
+                );
                 // `rule_type.as_str()` is a `&'static str` — wrap it
                 // inline without heap.
                 ResolvedTarget {
@@ -543,6 +612,7 @@ impl TunnelInner {
             }
             None => {
                 // No rule matched, use DIRECT
+                conn_note!(Rule, "No rule matched → DIRECT");
                 ResolvedTarget {
                     adapter: Arc::clone(&self.direct) as Arc<dyn ProxyAdapter>,
                     rule_name: SmolStr::new_static("Final"),
@@ -550,6 +620,30 @@ impl TunnelInner {
                     route: Arc::clone(route),
                 }
             }
+        }
+    }
+}
+
+/// `TYPE,payload` (or bare `TYPE` for payload-less rules like `MATCH`) as
+/// written in the config, for notes.
+struct RuleText<'a>(&'a str, &'a str);
+
+impl<'a> RuleText<'a> {
+    fn new(rule: &'a dyn Rule) -> Self {
+        Self(rule.rule_type().as_str(), rule.payload())
+    }
+
+    fn parts(rule_type: &'a str, payload: &'a str) -> Self {
+        Self(rule_type, payload)
+    }
+}
+
+impl std::fmt::Display for RuleText<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.1.is_empty() {
+            f.write_str(self.0)
+        } else {
+            write!(f, "{},{}", self.0, self.1)
         }
     }
 }
@@ -687,8 +781,21 @@ impl Tunnel {
                 tun_handle: RwLock::new(None),
                 dialer_registry: std::sync::OnceLock::new(),
                 udp_flush: tokio::sync::watch::Sender::new(0),
+                connection_notes: AtomicBool::new(false),
             }),
         }
+    }
+
+    /// Record per-connection notes from now on: a timestamped account of
+    /// the fake-IP reversal, the DNS lookups rules needed, the matched rule,
+    /// the dial and the close, served by `GET /connections/{id}` for live
+    /// and recently closed connections. Off by default; each recording
+    /// connection allocates its note log. Headless statistics never record:
+    /// nothing could read the notes.
+    pub fn set_connection_notes(&self, enabled: bool) {
+        self.inner
+            .connection_notes
+            .store(enabled, Ordering::Relaxed);
     }
 
     pub fn inner(&self) -> &Arc<TunnelInner> {

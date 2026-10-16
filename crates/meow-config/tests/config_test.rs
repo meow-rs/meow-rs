@@ -18,6 +18,15 @@ mixed-port: 7890
     assert!(config.proxies.contains_key("DIRECT"));
     assert!(config.proxies.contains_key("REJECT"));
     assert!(config.proxies.contains_key("REJECT-DROP"));
+    assert!(!config.general.connection_notes);
+}
+
+#[tokio::test]
+async fn test_connection_notes_flag() {
+    let config = load_config_from_str("connection-notes: true\n")
+        .await
+        .unwrap();
+    assert!(config.general.connection_notes);
 }
 
 #[tokio::test]

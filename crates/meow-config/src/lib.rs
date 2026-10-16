@@ -104,6 +104,8 @@ pub struct GeneralConfig {
     pub ipv6: bool,
     pub allow_lan: bool,
     pub bind_address: String,
+    /// `connection-notes` — see `Tunnel::set_connection_notes`.
+    pub connection_notes: bool,
 }
 
 /// Single source of truth for the effective `ipv6` setting of a config
@@ -3849,6 +3851,7 @@ pub async fn build_config(
         ipv6: effective_ipv6(raw.ipv6),
         allow_lan: raw.allow_lan.unwrap_or(false),
         bind_address,
+        connection_notes: raw.connection_notes.unwrap_or(false),
     };
 
     // Registry the provider nodes' `dialer-proxy` targets resolve against

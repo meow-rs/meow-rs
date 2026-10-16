@@ -19,6 +19,7 @@ pub mod atomic;
 pub mod auth;
 pub mod backoff;
 pub mod conn;
+pub mod conn_notes;
 pub mod dial;
 pub mod dns_mode;
 pub mod error;

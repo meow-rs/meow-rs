@@ -267,7 +267,13 @@ pub enum LazyMatchOutcome<'a> {
     /// emitted — returning this variant without the strict re-run loses
     /// them permanently. The re-scan re-derives each skipped match and
     /// warns exactly once.
-    NeedsEnrichment { needs_ip: bool, needs_process: bool },
+    ///
+    /// `blocked_rule` is the source index of the rule the scan stopped at.
+    NeedsEnrichment {
+        needs_ip: bool,
+        needs_process: bool,
+        blocked_rule: usize,
+    },
     /// No rule matched (and no slot was blocked on missing metadata).
     NoMatch,
 }
@@ -803,6 +809,7 @@ impl CompiledRuleSet {
         LazyMatchOutcome::NeedsEnrichment {
             needs_ip,
             needs_process,
+            blocked_rule: self.slots[from_pos].rule_index as usize,
         }
     }
 
@@ -3237,6 +3244,7 @@ mod tests {
             LazyMatchOutcome::NeedsEnrichment {
                 needs_ip,
                 needs_process,
+                ..
             } => {
                 assert!(needs_ip);
                 assert!(!needs_process);
@@ -3764,6 +3772,7 @@ mod tests {
             LazyMatchOutcome::NeedsEnrichment {
                 needs_ip,
                 needs_process,
+                ..
             } => {
                 assert!(!needs_ip);
                 assert!(needs_process);

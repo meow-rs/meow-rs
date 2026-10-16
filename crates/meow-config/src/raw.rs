@@ -211,6 +211,11 @@ pub struct RawConfig {
     /// Explicit `type: direct` proxy blocks are NOT covered by this
     /// global; they accept their own per-proxy `connect-timeout` field.
     pub tcp_connect_timeout: Option<u64>,
+    /// `connection-notes: true` records a timestamped account of how each
+    /// TCP connection was handled (fake-IP reversal, DNS lookups, matched
+    /// rule, dial, close), served by `GET /connections/{id}`. A meow
+    /// extension; off by default.
+    pub connection_notes: Option<bool>,
     /// Static host mappings, preferred over upstream DNS lookups. Values may
     /// be a single IP, a list of IPs, or one domain-name alias.
     pub hosts: Option<HashMap<String, HostsValue>>,

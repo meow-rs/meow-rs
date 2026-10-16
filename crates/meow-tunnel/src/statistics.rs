@@ -18,11 +18,13 @@
 
 use dashmap::DashMap;
 use meow_common::atomic::{AtomicI, Int};
+use meow_common::conn_notes::ConnNotes;
 use meow_common::Metadata;
 use parking_lot::Mutex;
 use serde::Serialize;
 use smallvec::SmallVec;
 use smol_str::SmolStr;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use uuid::Uuid;
@@ -70,6 +72,11 @@ pub struct ConnCounters {
     // Stored in the existing Arc so cancellation adds no setup allocation.
     closed: AtomicBool,
     close_notify: tokio::sync::Notify,
+    /// The connection's notes when the tunnel records them (see
+    /// `Tunnel::set_connection_notes`). Kept here, not on `ConnectionInfo`,
+    /// so the info struct keeps its size and the list JSON its shape; only
+    /// `GET /connections/{id}` serializes them.
+    notes: Option<ConnNotes>,
 }
 
 impl ConnCounters {
@@ -95,6 +102,10 @@ impl ConnCounters {
 
     pub fn download_bytes(&self) -> Int {
         self.download.load(Ordering::Relaxed)
+    }
+
+    pub fn notes(&self) -> Option<&ConnNotes> {
+        self.notes.as_ref()
     }
 }
 
@@ -168,7 +179,56 @@ pub struct Statistics {
     /// Headless flows still need cancellation on a cold config reload, but
     /// never need the metadata and serialization fields used by the API.
     headless_connections: OnceLock<DashMap<usize, Arc<ConnCounters>>>,
+    /// Connections that recorded notes, kept after they close so a client
+    /// can still read why a short-lived or failed flow went where it did.
+    /// Newest last, at most [`RECENTLY_CLOSED_CAPACITY`]. Flows without
+    /// notes never enter it, so it stays empty unless notes are on.
+    recently_closed: Mutex<VecDeque<ClosedConnection>>,
     pub rule_match: Arc<RuleMatchCounters>,
+}
+
+/// How many closed connections with notes [`Statistics`] keeps.
+pub const RECENTLY_CLOSED_CAPACITY: usize = 256;
+
+/// A connection that has left the live table, with the time it did.
+#[derive(Clone)]
+struct ClosedConnection {
+    info: ConnectionInfo,
+    end: SmolStr,
+}
+
+/// One connection as `GET /connections/{id}` shows it: the `/connections`
+/// entry plus its notes, and for a closed one, when it closed.
+#[derive(Clone, Serialize)]
+pub struct ConnectionDetail {
+    #[serde(flatten)]
+    pub info: ConnectionInfo,
+    pub closed: bool,
+    /// RFC 3339 time the connection left the live table; closed ones only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end: Option<SmolStr>,
+    /// Empty when the connection records no notes.
+    pub notes: NotesField,
+}
+
+/// The `notes` array of a [`ConnectionDetail`], read at serialization time
+/// so a live connection's latest notes are included.
+#[derive(Clone)]
+pub struct NotesField(Option<ConnNotes>);
+
+impl NotesField {
+    pub fn get(&self) -> Option<&ConnNotes> {
+        self.0.as_ref()
+    }
+}
+
+impl Serialize for NotesField {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match &self.0 {
+            Some(notes) => notes.serialize(serializer),
+            None => serializer.collect_seq(std::iter::empty::<()>()),
+        }
+    }
 }
 
 impl Statistics {
@@ -179,6 +239,7 @@ impl Statistics {
             traffic: Mutex::new(TrafficSnapshot::default()),
             connections: DashMap::new(),
             headless_connections: OnceLock::new(),
+            recently_closed: Mutex::new(VecDeque::new()),
             rule_match: Arc::new(RuleMatchCounters::new()),
         }
     }
@@ -253,7 +314,7 @@ impl Statistics {
         rule_payload: SmolStr,
         chains: SmallVec<[Arc<str>; 1]>,
     ) -> Uuid {
-        self.track_connection_with_counters(metadata, rule, rule_payload, chains)
+        self.track_connection_with_counters(metadata, rule, rule_payload, chains, None)
             .0
     }
 
@@ -263,9 +324,13 @@ impl Statistics {
         rule: SmolStr,
         rule_payload: SmolStr,
         chains: SmallVec<[Arc<str>; 1]>,
+        notes: Option<ConnNotes>,
     ) -> (Uuid, Arc<ConnCounters>) {
         let uuid = Uuid::new_v4();
-        let counters = Arc::new(ConnCounters::default());
+        let counters = Arc::new(ConnCounters {
+            notes,
+            ..ConnCounters::default()
+        });
         let info = ConnectionInfo {
             id: uuid,
             metadata: Arc::new(metadata),
@@ -284,6 +349,11 @@ impl Statistics {
     pub fn set_headless(&self) {
         assert!(self.connections.is_empty());
         assert!(self.headless_connections.set(DashMap::new()).is_ok());
+    }
+
+    /// Whether [`Self::set_headless`] dropped the API-visible registry.
+    pub fn is_headless(&self) -> bool {
+        self.headless_connections.get().is_some()
     }
 
     pub(crate) fn begin_headless_connection(&self) -> Option<Arc<ConnCounters>> {
@@ -313,7 +383,67 @@ impl Statistics {
     pub fn close_connection(&self, id: Uuid) {
         if let Some((_, info)) = self.connections.remove(&id) {
             info.counters.close();
+            self.remember_closed(info);
         }
+    }
+
+    /// File a connection that left the live table into the recently-closed
+    /// ring, if it recorded notes. The notes stay shared with the
+    /// connection task, so a close reason noted after removal (an API
+    /// close, a reload) still shows up.
+    fn remember_closed(&self, info: ConnectionInfo) {
+        if info.counters.notes.is_none() {
+            return;
+        }
+        let closed = ClosedConnection {
+            info,
+            end: chrono_now(),
+        };
+        let mut ring = self.recently_closed.lock();
+        if ring.len() == RECENTLY_CLOSED_CAPACITY {
+            ring.pop_front();
+        }
+        ring.push_back(closed);
+    }
+
+    /// Closed connections that recorded notes, newest first.
+    pub fn recently_closed(&self) -> Vec<ConnectionDetail> {
+        self.recently_closed
+            .lock()
+            .iter()
+            .rev()
+            .map(|closed| ConnectionDetail {
+                info: closed.info.clone(),
+                closed: true,
+                end: Some(closed.end.clone()),
+                notes: NotesField(closed.info.counters.notes.clone()),
+            })
+            .collect()
+    }
+
+    /// A live or recently closed connection by id, with its notes.
+    /// `None` once a closed connection has aged out of the ring, and for
+    /// closed connections that recorded no notes.
+    pub fn connection_detail(&self, id: Uuid) -> Option<ConnectionDetail> {
+        if let Some(entry) = self.connections.get(&id) {
+            let info = entry.value().clone();
+            drop(entry);
+            let notes = NotesField(info.counters.notes.clone());
+            return Some(ConnectionDetail {
+                info,
+                closed: false,
+                end: None,
+                notes,
+            });
+        }
+        let ring = self.recently_closed.lock();
+        let closed = ring.iter().rev().find(|closed| closed.info.id == id)?;
+        Some(ConnectionDetail {
+            info: closed.info.clone(),
+            closed: true,
+            end: Some(closed.end.clone()),
+            notes: NotesField(closed.info.counters.notes.clone()),
+        })
     }
 
     /// Live cumulative `(upload, download)` totals, read straight from the
@@ -357,11 +487,18 @@ impl Statistics {
         let mut closed = 0;
         // Signal and remove under the same shard lock. A separate iteration
         // followed by clear could erase newly inserted, unsignalled entries.
+        let mut noted = Vec::new();
         self.connections.retain(|_, info| {
             info.counters.close();
             closed += 1;
+            if info.counters.notes.is_some() {
+                noted.push(info.clone());
+            }
             false
         });
+        for info in noted {
+            self.remember_closed(info);
+        }
         if let Some(connections) = self.headless_connections.get() {
             connections.retain(|_, counters| {
                 counters.close();
