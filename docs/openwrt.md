@@ -34,9 +34,12 @@ same way. They cover the same architectures as above.
 Feature note: release binaries use the default meow-app feature set
 (`full` + `boring-tls`), so ECH and uTLS fingerprinting are included.
 
-32-bit arm / MIPS OpenWrt packages are not published: `boring-sys` does not
-build for those targets. Cross-build from source with
-`--no-default-features --features full` if you need them without BoringSSL.
+32-bit arm / MIPS OpenWrt `.ipk`/`.apk` packages are not published
+(`openwrt_archs` is empty for those targets in the release matrix). The
+static `meow-<ref>-armv7-unknown-linux-musleabihf.tar.gz` release tarball
+works on 32-bit arm as-is; for MIPS, cross-build from source with
+`--no-default-features --features full` if you need a build without
+BoringSSL.
 
 Find your device's architecture with:
 
@@ -48,8 +51,10 @@ For example, a Raspberry Pi 4 OpenWrt image is typically
 `aarch64_cortex-a72`. If your architecture is not in the table but is a
 superset of one that is, the closest smaller package works — the binary
 makes no assumptions beyond the aarch64 baseline. Devices of other
-families (32-bit arm, mips, x86) can use a self-built static binary or,
-for `x86_64`, the `x86_64-unknown-linux-musl` release tarball as-is.
+families (32-bit arm, mips, x86) can use a release tarball or a self-built
+static binary: 32-bit arm has the
+`meow-<ref>-armv7-unknown-linux-musleabihf.tar.gz` static build, and for
+`x86_64` the `x86_64-unknown-linux-musl` tarball works as-is.
 
 ## Install
 
@@ -365,7 +370,8 @@ bash tests/test_luci_meow.sh
 - An opkg feed (per-release ipks only; `opkg update`-able feed may come
   later once this stabilizes).
 - An apk repository/feed (per-release `.apk` files only; they are unsigned).
-- 32-bit arm / mips release ipks — release artifacts require the default
-  `full` + `boring-tls` feature set; boring-sys does not build for those
-  targets. Build from source with `--no-default-features --features full`
-  if needed.
+- 32-bit arm / mips release ipks — the static armv7 tarball
+  (`meow-<ref>-armv7-unknown-linux-musleabihf.tar.gz`) covers 32-bit arm
+  without a package; mips has no release artifact (boring-sys does not
+  build there). Build from source with
+  `--no-default-features --features full` if needed.

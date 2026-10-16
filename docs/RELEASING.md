@@ -50,6 +50,29 @@ meow-app                                     (→ everything)
    cargo update -w        # re-resolve workspace members to the new version
    cargo check --workspace
    ```
+   If `cargo update -w` moved `boring`, `boring-sys`, or `tokio-boring`
+   (they must move together — see the note in `Cargo.toml`), the
+   `armv7-unknown-linux-musleabihf` release leg may break: it sed-patches
+   `boring`'s vendored `src/x509/verify.rs`
+   (`scripts/build-armv7-musl.sh`) and fails the leg — which blocks the
+   whole release — when the patched line is gone. `cargo check` above
+   already unpacked the locked sources, so verify the patch target before
+   tagging:
+   ```bash
+   ver=$(grep -A1 '^name = "boring"$' Cargo.lock | sed -n 's/^version = "\(.*\)"/\1/p')
+   grep -l 'X509_VERIFY_PARAM_set_time(self\.as_ptr(), time)' \
+     "${CARGO_HOME:-$HOME/.cargo}"/registry/src/*/boring-"$ver"/src/x509/verify.rs 2>/dev/null
+   ```
+   Expected: prints the vendored `verify.rs` path. Empty output means the
+   leg will fail on the release run — update the script or revert the
+   bump first. For the definitive check, run the leg itself (same image
+   as `build.yml`'s `toolchain:` key; use its digest-pinned form for
+   exact CI parity):
+   ```bash
+   docker run --rm -v "$PWD:/src" -w /src \
+     ghcr.io/rust-cross/rust-musl-cross:armv7-musleabihf-amd64@sha256:c2603200841eac1a6681d7beef44816c9954b0f59952ae7ae96652788287e16f \
+     bash scripts/build-armv7-musl.sh
+   ```
 
 4. **PR & merge to `main`** with the version bump (e.g. `chore(release): 0.15.1`).
 

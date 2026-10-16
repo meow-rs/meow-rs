@@ -28,6 +28,19 @@ the canonical, in-repo source a release is cut from.
   no second crypto library. See `docs/specs/proxy-trusttunnel.md` for
   configuration and explicit compatibility limits (proposal #727).
 
+- **Static 32-bit ARM musl release target** — releases and alpha
+  prereleases now ship `meow-<ref>-armv7-unknown-linux-musleabihf.tar.gz`,
+  a statically linked musl binary for 32-bit ARM routers. The existing
+  `armv7-unknown-linux-gnueabihf` build is dynamically linked and needs
+  `GLIBC_2.28`, which Alpine's armhf `gcompat` does not provide, so
+  `execve` fails with `ENOENT` on a file that exists. The target builds in a
+  musl cross toolchain container (`scripts/build-armv7-musl.sh`) instead of
+  via `cargo zigbuild`: musl 1.2.x headers declare `time_t` as 64-bit on
+  32-bit targets (time64/Y2038 hardening) while Rust's `libc` crate types it
+  as `i32`, so bindgen emits a 64-bit `X509_VERIFY_PARAM_set_time` and
+  `boring` fails to compile; a real cross toolchain plus a one-line cast in
+  `boring` gets past both.
+
 - **OpenWrt x86_64 packages** (issue #725): releases and alpha prereleases
   now ship `meow` `.ipk` and `.apk` packages for OpenWrt's x86/64 target
   (architecture `x86_64`), built from the existing static
