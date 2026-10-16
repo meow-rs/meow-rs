@@ -41,17 +41,18 @@ impl Rule for ProcessRule {
 
     fn should_find_process(&self) -> bool {
         // `find_process` has real implementations only where
-        // `PROCESS_LOOKUP_SUPPORTED`; elsewhere `metadata.process` can
-        // never be populated, so demanding the lookup is pure cost (#625).
+        // `PROCESS_LOOKUP_SUPPORTED`; elsewhere demanding it is pure cost
+        // (#625). An inbound that supplies `metadata.process` needs no
+        // lookup either way.
         meow_common::process_lookup::PROCESS_LOOKUP_SUPPORTED
     }
 
     fn never_matches(&self) -> bool {
-        // Off the supported platforms `find_process` is a stub returning
-        // `None`, so `metadata.process` stays empty forever — a non-empty
-        // payload is provably dead. (An empty payload matches the empty
-        // field; leave that quirk alone.)
-        !meow_common::process_lookup::PROCESS_LOOKUP_SUPPORTED && !self.process_name.is_empty()
+        // Where neither a native lookup nor the inbound can fill
+        // `metadata.process`, it stays empty forever — a non-empty payload
+        // is provably dead. (An empty payload matches the empty field;
+        // leave that quirk alone.)
+        !meow_common::process_lookup::process_info_available() && !self.process_name.is_empty()
     }
 }
 

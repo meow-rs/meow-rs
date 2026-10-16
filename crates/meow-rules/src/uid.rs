@@ -4,6 +4,9 @@
 //! `match_metadata` always returns `false`, and a `warn!` is emitted
 //! once at parse time.  Class B per ADR-0002: user's traffic still routes
 //! correctly (rule is skipped); the warn signals that the rule is a no-op.
+//! The exception is an embedder whose inbound supplies `uid` itself (an
+//! Android VPN, see `meow_common::process_lookup::enable_inbound_process_info`):
+//! there the rule matches that uid on any platform.
 //!
 //! upstream: `rules/common/uid.go`
 
@@ -13,7 +16,6 @@ use crate::adapter::{intern_adapter, Adapter};
 use smol_str::SmolStr;
 
 pub struct UidRule {
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     uid: u32,
     raw: SmolStr,
     adapter: Adapter,
@@ -22,8 +24,9 @@ pub struct UidRule {
 impl UidRule {
     /// Parse `uid` as a Unix UID (unsigned integer).
     ///
-    /// Emits a warn on non-Linux: `rules/common/uid.go` — UID rules are
-    /// meaningless outside Linux.  Class B per ADR-0002.
+    /// Emits a warn on non-Linux, unless the inbound supplies uids:
+    /// `rules/common/uid.go` — UID rules are meaningless outside Linux.
+    /// Class B per ADR-0002.
     ///
     /// upstream: `rules/common/uid.go`
     pub fn new(uid: &str, adapter: &str) -> Result<Self, String> {
@@ -32,12 +35,13 @@ impl UidRule {
             .parse()
             .map_err(|e| format!("invalid UID value '{}': {}", uid.trim(), e))?;
 
-        #[cfg(not(target_os = "linux"))]
-        tracing::warn!(
-            uid = value,
-            "UID rule is Linux-only; this rule will never match on the current platform \
-             (Class B per ADR-0002 — upstream: rules/common/uid.go)"
-        );
+        if !meow_common::process_lookup::uid_info_available() {
+            tracing::warn!(
+                uid = value,
+                "UID rule is Linux-only; this rule will never match on the current platform \
+                 (Class B per ADR-0002 — upstream: rules/common/uid.go)"
+            );
+        }
 
         Ok(Self {
             uid: value,
@@ -53,14 +57,7 @@ impl Rule for UidRule {
     }
 
     fn match_metadata(&self, metadata: &Metadata, _helper: &RuleMatchHelper) -> bool {
-        #[cfg(target_os = "linux")]
-        return metadata.uid == Some(self.uid);
-
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = metadata;
-            false
-        }
+        meow_common::process_lookup::uid_info_available() && metadata.uid == Some(self.uid)
     }
 
     fn adapter(&self) -> &str {
@@ -79,11 +76,11 @@ impl Rule for UidRule {
     }
 
     fn never_matches(&self) -> bool {
-        // `match_metadata` is compiled to a constant `false` off Linux —
-        // the rule is provably dead there even though e.g. the macOS
-        // lookup does populate `metadata.uid` (deadness is a policy
-        // choice, Class B per ADR-0002).
-        cfg!(not(target_os = "linux"))
+        // `match_metadata` is a constant `false` off Linux unless the
+        // inbound supplies `uid` — the rule is provably dead there even
+        // though e.g. the macOS lookup does populate `metadata.uid`
+        // (deadness is a policy choice, Class B per ADR-0002).
+        !meow_common::process_lookup::uid_info_available()
     }
 }
 
