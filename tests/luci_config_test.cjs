@@ -4,30 +4,38 @@ const assert = require('node:assert/strict');
 const { readFileSync } = require('node:fs');
 const { test } = require('node:test');
 const vm = require('node:vm');
-const source = readFileSync(require('node:path').join(__dirname,
-  '../openwrt/luci-app-meow/htdocs/luci-static/resources/view/meow/config.js'), 'utf8');
+const resources = require('node:path').join(__dirname,
+  '../openwrt/luci-app-meow/htdocs/luci-static/resources');
+const source = readFileSync(require('node:path').join(resources, 'view/meow/config.js'), 'utf8');
+const helperSource = readFileSync(require('node:path').join(resources, 'tools/meow.js'), 'utf8');
 const scratchPattern = /^\/tmp\/meow-luci-settings-[0-9a-f]{32}\.yaml$/;
 const path = '/etc/meow/config.yaml';
 
 function setup(options = {}) {
-  const uploads = [], notifications = [], removed = [], calls = [];
+  const uploads = [], notifications = [], removed = [], calls = [], timers = [];
   const content = options.content ?? 'rules:\r\n  - MATCH,🎯Direct';
   const context = vm.createContext({
     Blob, FormData, crypto: require('node:crypto').webcrypto,
-    meow: { serviceRunning: async () => !!options.running },
+    baseclass: { extend: value => value },
+    rpc: { declare: () => async () => ({ meow: { instances: { meow: { running: !!options.running } } } }) },
+    setTimeout: (callback, timeout) => { timers.push({ callback, timeout }); },
     settings: { prepare: value => {
       if (options.transformError) throw new Error(options.transformError);
       return options.prepare ? options.prepare(value) : value;
     } },
     view: { extend: value => value },
-    L: { env: { sessionid: 'test-session', cgi_base: '/cgi-bin' } },
+    L: { env: { sessionid: 'test-session', cgi_base: '/cgi-bin' },
+      resolveDefault: (promise, fallback) => promise.catch(() => fallback) },
     _: value => value,
     E: (tag, attrs, children) => ({ tag, attrs, children, style: {} }),
     document: { getElementById: () => options.textarea ?? ({ value: content }) },
     uci: { load: async () => {}, get: () => undefined },
     ui: {
-      addNotification: (...args) => notifications.push(args),
-      addTimeLimitedNotification: (...args) => notifications.push(args),
+      // LuCI 23.05 has addNotification(), but no timed notification API.
+      addNotification: (...args) => {
+        notifications.push(args);
+        return { classList: { add() {} }, remove() {} };
+      },
       createHandlerFn: (ctx, fn, ...args) => (...rest) => ctx[fn](...args, ...rest)
     },
     fs: {
@@ -71,8 +79,9 @@ function setup(options = {}) {
     } }
   });
   vm.runInContext("String.prototype.format = function(value) { return this.replace('%s', value); };", context);
+  context.meow = vm.runInContext('(function() {\n' + helperSource + '\n})()', context);
   const view = vm.runInContext('(function() {\n' + source + '\n})()', context);
-  return { view, content, uploads, notifications, removed, calls };
+  return { view, content, uploads, notifications, removed, calls, timers };
 }
 
 function messages(state) { return JSON.stringify(state.notifications); }
@@ -134,6 +143,14 @@ test('Validate reports transport errors', async () => {
   assert.match(messages(state), /Unable to validate.*Command timed out/);
 });
 
+test('Validate reports success with the LuCI 23.05 notification API', async () => {
+  const state = setup();
+  await state.view.handleValidate();
+  assert.deepEqual(state.notifications.map(n => n[2]), ['info']);
+  assert.equal(state.uploads.length, 1);
+  assert.deepEqual(state.removed, [state.uploads[0].target]);
+});
+
 test('a failed final upload does not claim the configuration was saved', async () => {
   const state = setup({ saveError: 'No space left on device' });
   await state.view.handleSave(null, path);
@@ -184,6 +201,7 @@ test('saving reloads a running service after writing the validated YAML', async 
   assert.match(scratch, scratchPattern);
   assert.deepEqual(state.calls, [scratch, 'validate', path, 'restart']);
   assert.match(messages(state), /service restarted/);
+  assert.deepEqual(state.notifications.map(n => n[2]), ['info']);
 });
 
 test('saving does not start a stopped service', async () => {
@@ -191,6 +209,7 @@ test('saving does not start a stopped service', async () => {
   await state.view.handleSave(null, path);
   assert.ok(!state.calls.includes('restart'));
   assert.match(messages(state), /remains stopped/);
+  assert.deepEqual(state.notifications.map(n => n[2]), ['info']);
 });
 
 test('restart failure is distinguished from a successful disk save', async () => {

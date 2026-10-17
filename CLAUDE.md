@@ -150,11 +150,33 @@ cargo test -p meow-listener --features listener-shadowsocks --test ss_listener_i
 # tests never compile under default features.
 cargo test -p meow-proxy --features anytls --lib
 
+# TrustTunnel is opt-in; its wire tests and parser/adapter integration need
+# explicit feature runs, including the disabled-feature parser contract.
+cargo test -p meow-proxy --no-default-features --features trusttunnel --lib trusttunnel
+cargo test -p meow-proxy --no-default-features --features trusttunnel --test trusttunnel_integration
+cargo test -p meow-proxy --no-default-features --features trusttunnel --test trusttunnel_e2e
+cargo test -p meow-config --features trusttunnel --test trusttunnel_config_test
+cargo test -p meow-config --no-default-features --test trusttunnel_config_test
+cargo test -p meow-api --features meow-config/trusttunnel --test api_test trusttunnel_provider
+# `trusttunnel-h3` (the `quic: true` transport) is a second opt-in feature on
+# top: the quiche driver, its in-tree HTTP/3 peer tests, the official
+# endpoint's `[listen_protocols.quic]` interop leg and the `quic:` parser
+# contract never compile under the runs above.
+cargo test -p meow-proxy --no-default-features --features trusttunnel-h3 --lib trusttunnel
+cargo test -p meow-proxy --no-default-features --features trusttunnel-h3 --test trusttunnel_e2e
+cargo test -p meow-config --features trusttunnel-h3 --test trusttunnel_config_test
+cargo test -p meow-config --features trusttunnel-h3 --lib
+
+# The official TrustTunnel test peer is required for the e2e target.
+# Fetch with `bash scripts/fetch-trusttunnel-endpoint.sh /tmp/meow-tt-peer`,
+# then export TRUSTTUNNEL_SERVER_BIN=/tmp/meow-tt-peer/trusttunnel_endpoint.
+# MEOW_TRUSTTUNNEL_E2E_ALLOW_SKIP=1 prints a loud local-only skip; CI rejects it.
+
 # Mirrors the "Unit + integration tests (default features)" CI step. `--lib`
 # alone is not enough: it skips every `--test` target, so a broken integration
 # test (e.g. the ADR-0001 guard in `crate_invariants_test`) passes locally and
 # lands `main` red.
-cargo test --lib --bin meow \
+cargo test --lib --bin meow --bin meow-bench \
   --test socks5_udp_user \
   --test common_test --test dns_cache_test --test config_test \
   --test tun_config_test --test dialer_proxy_group \

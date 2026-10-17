@@ -548,6 +548,35 @@ async fn snell_v4_docker_round_trips() {
     versioned_round_trips(IMAGE_SNELL_V4, SnellVersion::V4, 16_000).await;
 }
 
+/// Subscriptions write `host: /` to get the empty `Host` mihomo (via Go's
+/// `Request.Write`) sends; the official server must take that request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snell_v4_docker_obfs_http_empty_host() {
+    let server_port = free_tcp_port();
+    let Some(server) = start_snell_server(server_port, IMAGE_SNELL_V4, "obfs = http\n") else {
+        return;
+    };
+    wait_until_listening(&server, server_port).await;
+    let (tcp_echo, _tcp_h) = start_tcp_echo_server().await;
+    let adapter = SnellAdapter::new(
+        "docker-snell-obfs",
+        "127.0.0.1",
+        server_port,
+        PSK,
+        SnellObfs::Http { host: "/".into() },
+        SnellVersion::V4,
+        true,
+        false,
+        Arc::new(DirectDialer),
+    )
+    .expect("snell adapter must build");
+    let conn = timeout(T, adapter.dial_tcp(&metadata_for(tcp_echo, Network::Tcp)))
+        .await
+        .expect("dial timed out")
+        .expect("dial failed");
+    bulk_echo(conn, &patterned(300 * 1024, 4), &server).await;
+}
+
 /// A v5 server splits a reply bigger than its current record size (about
 /// 5 KB on a fresh connection) across records, and a UDP response frame has
 /// no length to reassemble it by, so datagrams stay below that.

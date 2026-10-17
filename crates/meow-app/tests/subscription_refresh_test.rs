@@ -760,3 +760,74 @@ async fn refresh_without_backing_file_applies_in_memory_only() {
         "a --config-string refresh must not create ./config.yaml"
     );
 }
+
+/// A refreshed declaration whose payload this build cannot fully parse must
+/// still commit. The unparseable node keeps its slot as a dead placeholder,
+/// which is what closes the fall-through-to-DIRECT hole; freezing the whole
+/// configuration instead would let the payload's operator stop every future
+/// refresh — groups, rules, DNS and all — by serving one unsupported entry
+/// on a timer.
+#[tokio::test]
+async fn refreshed_trusttunnel_provider_commits_with_a_dead_placeholder() {
+    let provider_address = spawn_origin("proxies:\n  - {name: invalid, type: trusttunnel, server: vpn.example.test, port: 443, username: fixture, password: test-only, quic: true}\n").await;
+    let fx = fixture("proxies: []\nproxy-groups:\n  - {name: front, type: select, proxies: [DIRECT]}\n  - {name: new-group, type: select, use: [prov]}\nrules: ['MATCH,new-group']\n").await;
+    let original = Arc::clone(fx.proxy_providers.get("prov").unwrap().value());
+    let live: HashMap<_, _> = fx
+        .proxy_providers
+        .iter()
+        .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
+        .collect();
+    let initial = meow_config::rebuild_from_raw_runtime(
+        &fx.raw_config.read(),
+        Some(&fx.tunnel.resolver_slot()),
+        &live,
+        Some(fx.dir.path()),
+        &fx.provider_dialer_registry,
+    )
+    .unwrap();
+    fx.tunnel
+        .set_dialer_registry(fx.provider_dialer_registry.clone());
+    fx.tunnel
+        .update_routing(initial.proxies, initial.rules, initial.dialer_registry);
+    // Stage a redefined provider while its live slot still holds the
+    // last-good generation. The new front only exists in the fetched
+    // subscription, so the acquisition must use the published route map.
+    let declaration = serde_yaml::from_str(&format!(
+        "type: http\nurl: http://{provider_address}/provider\nproxy: front\npath: redefined.yaml\n"
+    ))
+    .unwrap();
+    fx.raw_config
+        .write()
+        .proxy_providers
+        .as_mut()
+        .unwrap()
+        .insert("prov".into(), declaration);
+    let rules = fx.raw_config.read().rules.clone();
+    spawn_loop(&fx);
+    let _group = wait_group(&fx.tunnel, "new-group").await;
+    assert!(fx.tunnel.proxy("front").is_some());
+    assert_ne!(fx.raw_config.read().rules, rules, "the refresh must commit");
+    assert!(fx.raw_config.read().proxy_groups.is_some());
+    // A changed declaration cannot reuse the live object, so the slot holds
+    // a fresh provider whose first acquisition is detached.
+    let provider = Arc::clone(fx.proxy_providers.get("prov").unwrap().value());
+    assert!(!Arc::ptr_eq(&provider, &original));
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while provider.proxies().is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the detached acquisition must publish the fetched payload");
+    let nodes = provider.proxies();
+    assert_eq!(nodes.len(), 1, "the unparseable node keeps its slot");
+    assert_eq!(nodes[0].name(), "invalid");
+    assert!(!nodes[0].alive(), "a placeholder must never look usable");
+    assert!(
+        nodes[0]
+            .dial_tcp(&meow_common::Metadata::default())
+            .await
+            .is_err(),
+        "a placeholder must fail the dial instead of leaking it direct"
+    );
+}

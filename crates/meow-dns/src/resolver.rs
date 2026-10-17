@@ -7,6 +7,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use hickory_proto::op::Message;
 use hickory_proto::rr::{Name, RecordType};
 use ipnet::IpNet;
+use meow_common::conn_note;
 use meow_common::DnsMode;
 use meow_trie::DomainTrie;
 use smol_str::SmolStr;
@@ -503,6 +504,7 @@ async fn query_pool_set(
     if clients.is_empty() {
         return (None, None);
     }
+    let started = tokio::time::Instant::now();
     let mut pending = FuturesUnordered::new();
     for client in clients {
         pending.push(async move {
@@ -544,14 +546,33 @@ async fn query_pool_set(
                     %error,
                     "DNS upstream query failed"
                 );
+                conn_note!(
+                    Dns,
+                    "{} failed for {host} after {} ms: {error}",
+                    client.upstream_label(),
+                    started.elapsed().as_millis()
+                );
                 upstream_err = prefer_errno(upstream_err, Some(error));
                 continue;
             }
         };
         if set.has_positive() {
+            conn_note!(
+                Dns,
+                "{} answered {host} → {} in {} ms",
+                client.upstream_label(),
+                IpList(&set.positive_ips()),
+                started.elapsed().as_millis()
+            );
             // A positive answer always wins, regardless of grace state.
             return (Some(set), upstream_err);
         }
+        conn_note!(
+            Dns,
+            "{} has no address for {host} ({} ms)",
+            client.upstream_label(),
+            started.elapsed().as_millis()
+        );
         let definitive = set.is_definitive_negative(want);
         if negative.is_none() {
             // First negative — definitive or partial. Don't return yet: a
@@ -575,6 +596,25 @@ async fn query_pool_set(
         }
     }
     (negative, upstream_err)
+}
+
+/// At most four addresses, then a count of the rest, for connection notes.
+struct IpList<'a>(&'a [IpAddr]);
+
+impl std::fmt::Display for IpList<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        const SHOWN: usize = 4;
+        for (i, ip) in self.0.iter().take(SHOWN).enumerate() {
+            if i > 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "{ip}")?;
+        }
+        if self.0.len() > SHOWN {
+            write!(f, " (+{} more)", self.0.len() - SHOWN)?;
+        }
+        Ok(())
+    }
 }
 
 /// Fold a tier chain's raw `(set, error)` outcome into the caller-facing
@@ -1116,6 +1156,7 @@ impl Resolver {
                     // still reach a host that the hosts file only pins for the
                     // other family.
                     if let Some(enabled) = self.filter_enabled_ips(ips) {
+                        conn_note!(Dns, "hosts: {host} → {}", IpList(&enabled));
                         return Ok(Some(enabled));
                     }
                     host
@@ -1189,6 +1230,9 @@ impl Resolver {
         // (not re-queried) with the freshly queried ones.
         if let Some(cached) = self.cache.get_lookup(lookup_host) {
             if let Some(enabled) = self.filter_enabled_ips(&cached.ips) {
+                if want.is_empty() {
+                    conn_note!(Dns, "Cached: {lookup_host} → {}", IpList(&enabled));
+                }
                 return Ok(Some(enabled));
             }
             // No usable IPs. If every required family is now fresh (cached or
@@ -1583,6 +1627,7 @@ impl Resolver {
             if let Some(entry) = inflight.get(host) {
                 let mut rx = entry.subscribe();
                 drop(entry);
+                conn_note!(Dns, "Waiting for a lookup of {host} already in flight");
                 match rx.recv().await {
                     Ok(result) => return result.map_err(|e| e.to_io()),
                     // A capacity-1 channel can only close *empty* when the
@@ -1603,6 +1648,7 @@ impl Resolver {
                 Entry::Occupied(existing) => {
                     let mut rx = existing.get().subscribe();
                     drop(existing);
+                    conn_note!(Dns, "Waiting for a lookup of {host} already in flight");
                     match rx.recv().await {
                         Ok(result) => return result.map_err(|e| e.to_io()),
                         // Same dead-publisher case as above (#682).
@@ -1647,6 +1693,7 @@ impl Resolver {
         // Domain-gate: skip primary entirely, go straight to fallback.
         if let Some(ff) = &self.fallback_filter {
             if ff.domain_gated(host) {
+                conn_note!(Dns, "fallback-filter sends {host} to the fallback servers");
                 return self.query_fallback_set(host, want).await;
             }
         }
@@ -1661,6 +1708,7 @@ impl Resolver {
         // Nameserver-policy lookup.
         if let Some(policy) = &self.policy {
             if let Some(entry) = policy.lookup(host) {
+                conn_note!(Dns, "nameserver-policy matched {host}");
                 let (set, err) = query_pool_set(&entry.nameservers, host, want, self.ipv6).await;
                 upstream_err = prefer_errno(upstream_err, err);
                 if let Some(set) = set {
@@ -1670,6 +1718,11 @@ impl Resolver {
                             .as_ref()
                             .is_some_and(|ff| ff.ip_gated(&set.positive_ips()))
                         {
+                            conn_note!(
+                                Dns,
+                                "fallback-filter rejects {}; asking the fallback servers",
+                                IpList(&set.positive_ips())
+                            );
                             let (set, err) = self.query_fallback_set(host, want).await;
                             return (set, prefer_errno(err, upstream_err));
                         }
@@ -1694,6 +1747,11 @@ impl Resolver {
                         .as_ref()
                         .is_some_and(|ff| ff.ip_gated(&set.positive_ips()))
                     {
+                        conn_note!(
+                            Dns,
+                            "fallback-filter rejects {}; asking the fallback servers",
+                            IpList(&set.positive_ips())
+                        );
                         let (set, err) = self.query_fallback_set(host, want).await;
                         return (set, prefer_errno(err, upstream_err));
                     }
@@ -2832,6 +2890,39 @@ mod tests {
             resolver.lookup_ipv4_result("fallback.example").await,
             AddressLookupResult::Answer(IpAddr::V4(ip), _) if ip == fallback_ip
         ));
+    }
+
+    /// A connection that records notes sees which upstream answered, and
+    /// then that the answer came from the cache.
+    #[tokio::test]
+    async fn connection_notes_record_upstream_answers_and_cache_hits() {
+        use meow_common::conn_notes::ConnNotes;
+        let upstream =
+            one_shot_a_upstream(ResponseCode::NoError, Some(Ipv4Addr::new(192, 0, 2, 7))).await;
+        let resolver = Resolver::new(
+            vec![upstream],
+            vec![],
+            DnsMode::Normal,
+            DomainTrie::new(),
+            false,
+            false,
+        );
+        let notes = ConnNotes::new();
+        for _ in 0..2 {
+            let ip = ConnNotes::scope(Some(notes.clone()), resolver.resolve_ip("notes.example"))
+                .await
+                .unwrap();
+            assert_eq!(ip, Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7))));
+        }
+        let texts = notes.texts();
+        assert_eq!(texts.len(), 2, "{texts:?}");
+        assert!(
+            texts[0].starts_with(&format!(
+                "{upstream} answered notes.example → 192.0.2.7 in "
+            )),
+            "{texts:?}"
+        );
+        assert_eq!(texts[1], "Cached: notes.example → 192.0.2.7");
     }
 
     #[tokio::test]

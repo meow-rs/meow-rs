@@ -299,9 +299,10 @@ fn parse_host_port(s: &str, default_port: u16) -> Result<(HostOrIp, u16), NameSe
         return Ok((HostOrIp::Ip(ip), port));
     }
 
-    // Try host:port split — last colon (to handle IPv6 without brackets, though
-    // that case should be handled above; here it's a fallback).
-    // We split on the last ':' only if what follows looks like a port number.
+    if let Ok(ip) = s.parse::<IpAddr>() {
+        return Ok((HostOrIp::Ip(ip), default_port));
+    }
+
     if let Some(idx) = s.rfind(':') {
         let maybe_port = &s[idx + 1..];
         if maybe_port.chars().all(|c| c.is_ascii_digit()) {
@@ -386,6 +387,87 @@ mod tests {
                 port: 53
             }
         );
+    }
+
+    #[test]
+    fn parse_plain_bare_ipv6_preserves_address_and_default_port() {
+        for literal in [
+            "2402:4e00::",
+            "::1",
+            "2001:db8::8888",
+            "2001:db8::abcd",
+            "2001:db8::1:853",
+            "::ffff:192.0.2.1",
+        ] {
+            let addr = HostOrIp::Ip(literal.parse().unwrap());
+            for prefix in ["", "udp://", "tcp://"] {
+                let input = format!("{prefix}{literal}");
+                let expected = if prefix == "tcp://" {
+                    NameServerUrl::Tcp {
+                        addr: addr.clone(),
+                        port: 53,
+                    }
+                } else {
+                    NameServerUrl::Udp {
+                        addr: addr.clone(),
+                        port: 53,
+                    }
+                };
+                assert_eq!(NameServerUrl::parse(&input).unwrap(), expected, "{input}");
+            }
+        }
+    }
+
+    #[cfg(feature = "encrypted")]
+    #[test]
+    fn parse_encrypted_bare_ipv6_uses_transport_default_port() {
+        for literal in ["2402:4e00::", "::1", "2001:db8::1:853"] {
+            let addr = HostOrIp::Ip(literal.parse().unwrap());
+            let sni = addr.to_string();
+            assert_eq!(
+                NameServerUrl::parse(&format!("tls://{literal}")).unwrap(),
+                NameServerUrl::Tls {
+                    addr: addr.clone(),
+                    port: 853,
+                    sni: sni.clone()
+                },
+            );
+            assert_eq!(
+                NameServerUrl::parse(&format!("https://{literal}/dns-query")).unwrap(),
+                NameServerUrl::Https {
+                    addr,
+                    port: 443,
+                    path: "/dns-query".into(),
+                    sni
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn parse_bracketed_ipv6_keeps_explicit_ports() {
+        let addr = HostOrIp::Ip(IpAddr::V6(Ipv6Addr::LOCALHOST));
+        for prefix in ["", "udp://", "tcp://"] {
+            let input = format!("{prefix}[::1]:5353");
+            let expected = if prefix == "tcp://" {
+                NameServerUrl::Tcp {
+                    addr: addr.clone(),
+                    port: 5353,
+                }
+            } else {
+                NameServerUrl::Udp {
+                    addr: addr.clone(),
+                    port: 5353,
+                }
+            };
+            assert_eq!(NameServerUrl::parse(&input).unwrap(), expected, "{input}");
+        }
+        for port in ["0", "65536", "invalid"] {
+            assert!(matches!(
+                NameServerUrl::parse(&format!("[::1]:{port}")),
+                Err(NameServerParseError::InvalidPort(_)),
+            ));
+        }
     }
 
     // A2

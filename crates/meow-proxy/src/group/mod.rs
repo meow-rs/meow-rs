@@ -254,6 +254,25 @@ pub(crate) mod test_support;
 mod tests {
     use super::*;
 
+    #[test]
+    fn explicit_pool_pressure_never_escalates() {
+        let tracker = DialFailureTracker::new();
+        let error = MeowError::RelayHopFailed {
+            hop: 1,
+            source: Box::new(MeowError::io_with(
+                "adapter",
+                meow_common::error::local_resource_limit("bounded pool full"),
+            )),
+        };
+        for _ in 0..100 {
+            assert!(!tracker.on_failure(&error));
+        }
+        for _ in 1..DIAL_FAILURE_THRESHOLD {
+            assert!(!tracker.on_failure(&proxy_err("timed out")));
+        }
+        assert!(tracker.on_failure(&proxy_err("timed out")));
+    }
+
     fn proxy_err(msg: &str) -> MeowError {
         MeowError::Proxy(msg.into())
     }

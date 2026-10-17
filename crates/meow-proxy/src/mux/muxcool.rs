@@ -72,6 +72,11 @@ const KEEPALIVE_SESSION_ID: u16 = 0;
 /// (common/mux/writer.go::WriteMultiBuffer), keeping frame latency bounded.
 const MAX_PAYLOAD: usize = 8 * 1024;
 
+/// Xray's PacketReader (common/mux/reader.go) rejects UDP payloads larger
+/// than common/buf.Size — the same 8 KiB `MAX_PAYLOAD` derives from — and
+/// aborts the entire mux session. Reject them before queuing a frame.
+const MAX_UDP_PAYLOAD: usize = MAX_PAYLOAD;
+
 /// Per-stream inbound queue depth (frames, not bytes).  A stalled consumer
 /// applies session-wide flow control: the driver parks the overflowing
 /// frame (at most one) and pauses the connection read until the consumer
@@ -1362,10 +1367,10 @@ impl ProxyPacketConn for PacketConn {
     }
 
     async fn write_packet(&self, buf: &[u8], addr: &SocketAddr) -> Result<usize> {
-        if buf.len() > u16::MAX as usize {
+        if buf.len() > MAX_UDP_PAYLOAD {
             return Err(MeowError::Proxy(format!(
-                "mux.cool: UDP packet ({} bytes) exceeds u16 framing",
-                buf.len()
+                "mux.cool: UDP packet ({} bytes) exceeds peer limit ({MAX_UDP_PAYLOAD} bytes)",
+                buf.len(),
             )));
         }
         // The destination rides the Keep frame meta, encoded straight from
@@ -2676,6 +2681,49 @@ mod tests {
         let (n, src) = conn.read_packet(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"ping-udp");
         assert_eq!(src, dst);
+    }
+
+    #[tokio::test]
+    async fn oversized_udp_rejection_preserves_packet_and_tcp_streams() {
+        let (session, _log) = session_pair(vec![]).await;
+        let pool_session = Arc::new(MuxSession {
+            kind: super::super::client::SessionKind::MuxCool(Arc::clone(&session)),
+            streams: AtomicUsize::new(1),
+            last_used_ms: meow_common::atomic::AtomicU::new(0),
+            generation: 0,
+        });
+        let parts = session
+            .open_stream_parts("127.0.0.1", 18082, true)
+            .await
+            .unwrap();
+        let dst = "127.0.0.1:18082".parse().unwrap();
+        let conn = PacketConn::new(parts, pool_session, dst);
+        let mut tcp = session.open_stream("a.example", 80, false).await.unwrap();
+
+        // Xray accepts at most 8192 bytes per UDP frame. None of these
+        // rejected packets may reach the peer or poison the shared session.
+        for size in [8193, 32768, 65536] {
+            conn.write_packet(&vec![0x55; size], &dst)
+                .await
+                .expect_err("oversized UDP must be rejected locally");
+        }
+        let payload = vec![0xa5; 8192];
+        assert_eq!(conn.write_packet(&payload, &dst).await.unwrap(), 8192);
+        let mut buf = vec![0; 8192];
+        let (n, src) = tokio::time::timeout(Duration::from_secs(5), conn.read_packet(&mut buf))
+            .await
+            .expect("valid UDP must still receive a response")
+            .unwrap();
+        assert_eq!(&buf[..n], &payload);
+        assert_eq!(src, dst);
+
+        tcp.write_all(b"tcp-survives").await.unwrap();
+        let mut reply = [0; 12];
+        tokio::time::timeout(Duration::from_secs(5), tcp.read_exact(&mut reply))
+            .await
+            .expect("sibling TCP stream must remain usable")
+            .unwrap();
+        assert_eq!(&reply, b"tcp-survives");
     }
 
     // --- VLESS integration (request header + response consumption) -----------

@@ -113,17 +113,17 @@ impl Rule for ProcessPathRule {
 
     fn should_find_process(&self) -> bool {
         // `find_process` has real implementations only where
-        // `PROCESS_LOOKUP_SUPPORTED`; elsewhere `metadata.process_path`
-        // can never be populated, so demanding the lookup is pure cost
-        // (#625).
+        // `PROCESS_LOOKUP_SUPPORTED`; elsewhere demanding it is pure cost
+        // (#625). An inbound that supplies `metadata.process_path` needs
+        // no lookup either way.
         meow_common::process_lookup::PROCESS_LOOKUP_SUPPORTED
     }
 
     fn never_matches(&self) -> bool {
-        // Off the supported platforms `find_process` is a stub returning
-        // `None`, so `metadata.process_path` stays empty — and `matches`
-        // is `false` on an empty path for every payload (#625).
-        !meow_common::process_lookup::PROCESS_LOOKUP_SUPPORTED
+        // Where neither a native lookup nor the inbound can fill
+        // `metadata.process_path`, it stays empty — and `matches` is
+        // `false` on an empty path for every payload (#625).
+        !meow_common::process_lookup::process_info_available()
     }
 }
 

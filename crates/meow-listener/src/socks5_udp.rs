@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use meow_common::{metadata_ip_literal, with_dial_timeout, ConnType, Metadata, Network};
+use meow_common::{metadata_ip_literal, ConnType, Metadata, Network};
 use meow_tunnel::{ResolvedTarget, Tunnel, TunnelInner};
 use smallvec::SmallVec;
 use smol_str::SmolStr;
@@ -520,7 +520,8 @@ async fn run_session(
         );
 
         let conn: Arc<dyn meow_common::ProxyPacketConn> = Arc::from(
-            with_dial_timeout(proxy.name(), proxy.dial_udp(&metadata))
+            inner
+                .dial_udp(proxy.as_ref(), &metadata)
                 .await
                 .map_err(|e| format!("dial_udp via {}: {e}", proxy.name()))?,
         );

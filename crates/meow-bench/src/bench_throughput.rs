@@ -66,6 +66,10 @@ async fn run_large_transfer(
         })???;
     let _wr = write_task.await??;
     let elapsed = start.elapsed().as_secs_f64();
+    anyhow::ensure!(
+        received == size,
+        "large transfer ended early: received {received} of {size} echo bytes"
+    );
 
     let total = (size + received) as u64;
     Ok((total, elapsed))
@@ -156,4 +160,40 @@ pub async fn bench_throughput(
     }
 
     Ok(results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn truncated_echo_is_not_a_throughput_result() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut greeting = [0; 3];
+            stream.read_exact(&mut greeting).await.unwrap();
+            stream.write_all(&[5, 0]).await.unwrap();
+            let mut request = [0; 10];
+            stream.read_exact(&mut request).await.unwrap();
+            stream
+                .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+            let mut payload = [0; 4096];
+            stream.read_exact(&mut payload).await.unwrap();
+            // Accept the entire upload but return only half of its echo.
+            stream.write_all(&payload[..2048]).await.unwrap();
+        });
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_large_transfer(proxy, "127.0.0.1:9".parse().unwrap(), 4096),
+        )
+        .await
+        .expect("truncated echo should finish promptly")
+        .expect_err("an incomplete transfer must not produce a throughput score");
+        assert!(error.to_string().contains("received 2048 of 4096"));
+        server.await.unwrap();
+    }
 }

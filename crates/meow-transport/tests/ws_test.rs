@@ -74,6 +74,128 @@ async fn ws_host_header_override() {
     );
 }
 
+/// A read-only tunnel must answer peer pings without an application write or
+/// flush. The duplex capacity is smaller than the pong frame so the automatic
+/// reply also has to recover from write backpressure while reads stay pending.
+#[tokio::test]
+async fn ws_read_only_client_replies_to_ping_under_backpressure() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio::io::AsyncReadExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let (client_io, peer_io) = tokio::io::duplex(64);
+    let peer = async move {
+        let mut ws = tokio_tungstenite::accept_async(peer_io)
+            .await
+            .expect("peer accepts upgrade");
+        for marker in [0x35, 0x79] {
+            let payload = vec![marker; 125];
+            ws.send(Message::Ping(payload.clone().into()))
+                .await
+                .expect("peer sends ping");
+            let reply = ws
+                .next()
+                .await
+                .expect("peer receives pong")
+                .expect("pong is a valid frame");
+            assert_eq!(reply, Message::Pong(payload.into()));
+        }
+        ws.send(Message::Binary(b"ok".to_vec().into()))
+            .await
+            .expect("peer sends application data");
+    };
+    let client = async move {
+        let mut stream = WsLayer::new(WsConfig {
+            host_header: Some("localhost".into()),
+            ..WsConfig::default()
+        })
+        .expect("WsLayer::new")
+        .connect(Box::new(client_io))
+        .await
+        .expect("client upgrades");
+        let mut received = [0; 2];
+        stream
+            .read_exact(&mut received)
+            .await
+            .expect("client receives application data after replying to pings");
+        assert_eq!(&received, b"ok");
+    };
+
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        tokio::join!(peer, client);
+    })
+    .await
+    .expect("read-only client must flush matching pongs without user writes");
+}
+
+/// AsyncWrite accepts arbitrary caller slices and preserves every byte when
+/// a stalled peer forces partial writes. Exercise both a mux-sized batch and
+/// repeated small writes without allowing the peer to read before backpressure.
+#[tokio::test]
+async fn ws_writes_preserve_bytes_under_backpressure() {
+    use futures_util::{future::poll_fn, StreamExt};
+    use std::future::Future;
+    use std::task::Poll;
+    use tokio::io::AsyncWriteExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    for write_size in [256 * 1024, 1024] {
+        let expected: Vec<u8> = (0..256 * 1024).map(|index| (index % 251) as u8).collect();
+        let sent = expected.clone();
+        let (client_io, peer_io) = tokio::io::duplex(64);
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        let peer = async move {
+            let mut ws = tokio_tungstenite::accept_async(peer_io)
+                .await
+                .expect("peer accepts upgrade");
+            resume_rx.await.expect("client encountered backpressure");
+            let mut received = Vec::with_capacity(expected.len());
+            while received.len() < expected.len() {
+                match ws
+                    .next()
+                    .await
+                    .expect("peer receives all bytes")
+                    .expect("valid binary frame")
+                {
+                    Message::Binary(bytes) => received.extend_from_slice(&bytes),
+                    frame => panic!("unexpected application frame: {frame:?}"),
+                }
+            }
+            assert_eq!(received, expected, "caller write size: {write_size}");
+        };
+        let client = async move {
+            let mut stream = WsLayer::new(WsConfig {
+                host_header: Some("localhost".into()),
+                ..WsConfig::default()
+            })
+            .expect("WsLayer::new")
+            .connect(Box::new(client_io))
+            .await
+            .expect("client upgrades");
+            let mut write = Box::pin(async {
+                for chunk in sent.chunks(write_size) {
+                    stream.write_all(chunk).await?;
+                }
+                stream.flush().await
+            });
+            poll_fn(|cx| match write.as_mut().poll(cx) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(Ok(())) => panic!("stalled peer must cause backpressure"),
+                Poll::Ready(Err(error)) => panic!("stalled write must remain pending: {error}"),
+            })
+            .await;
+            resume_tx.send(()).expect("peer is waiting to resume");
+            write.await.expect("all caller bytes are accepted");
+        };
+
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            tokio::join!(peer, client);
+        })
+        .await
+        .expect("writes must complete when the peer resumes reading");
+    }
+}
+
 // ─── B3: ws_early_data_encoded_in_protocol_header ────────────────────────────
 
 /// With `max_early_data = 32`, writing 16 bytes and then flushing sends those

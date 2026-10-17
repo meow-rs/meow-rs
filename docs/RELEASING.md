@@ -37,39 +37,87 @@ meow-app                                     (→ everything)
 
 ## Release steps
 
-1. **Green CI on `main`.** The release does not run the test suite; make sure
-   [`test.yml`](../.github/workflows/test.yml) is passing first.
+A release is two clicks: dispatch **Prepare release**, then merge the PR it
+prepares. Tagging, crates.io and the GitHub Release follow from the merge. No
+secret beyond `CARGO_REGISTRY_TOKEN` is involved.
 
-2. **Bump the version.** Edit `[workspace.package] version` in the root
-   `Cargo.toml`. Because the internal deps are pinned to that version (e.g.
-   `meow-common = { path = "…", version = "0.15.0" }`), bump those entries in
-   `[workspace.dependencies]` to match the new version too.
+1. **Green CI on `main`, complete `[Unreleased]`.** The release does not run
+   the test suite; make sure [`test.yml`](../.github/workflows/test.yml) is
+   passing. The `CHANGELOG.md` `[Unreleased]` entries become the release notes
+   as written (GitHub's generated PR list is appended below them), so curate
+   them first — the prepare step refuses an empty `[Unreleased]`.
 
-3. **Refresh the lockfile.**
-   ```bash
-   cargo update -w        # re-resolve workspace members to the new version
-   cargo check --workspace
-   ```
+2. **Prepare.** `Actions → Prepare release → Run workflow` on `main`
+   ([`prepare-release.yml`](../.github/workflows/prepare-release.yml)). Leave
+   **version** empty to infer it from the conventional commits since the last
+   tag — a breaking change (`type!:` / `BREAKING CHANGE:`) or any `feat` bumps
+   the minor while we are on 0.x, anything else the patch — or enter `X.Y.Z`.
+   [`scripts/release/prepare.sh`](../scripts/release/prepare.sh) then:
+   - bumps `[workspace.package] version` and every internal
+     `version = "…"` pin (root `[workspace.dependencies]`, `lwip`, and the
+     vendored `crates/meow-anytls`, which spells its version out);
+   - runs `cargo update -w` to move the workspace members in `Cargo.lock`;
+   - opens `## [X.Y.Z] - YYYY-MM-DD` directly under `## [Unreleased]`, which
+     stays as an empty heading.
 
-4. **PR & merge to `main`** with the version bump (e.g. `chore(release): 0.15.1`).
+   The workflow commits that as `chore(release): X.Y.Z` and pushes branch
+   `release/vX.Y.Z`. The same script works locally
+   (`scripts/release/prepare.sh [X.Y.Z]` in a clean checkout with tags).
 
-5. **Tag and push** from the merged commit on `main`:
-   ```bash
-   git checkout main && git pull --ff-only
-   git tag v0.15.1
-   git push origin v0.15.1
-   ```
-   The tag push triggers [`publish.yml`](../.github/workflows/publish.yml), which
-   verifies the tag matches the workspace version and publishes all 13 crates in
-   order. (The workflow is idempotent — a re-run skips versions already on the
-   registry, so a partial release can resume.)
+3. **Open and merge the PR.** The run summary has an *Open the release PR*
+   link (a prefilled compare page) and the cut notes. The workflow cannot open
+   the PR itself: this repo does not let `GITHUB_TOKEN` create pull requests,
+   and a PR opened by `GITHUB_TOKEN` would not trigger `test.yml`. Review the
+   version and the notes (push fixes to the branch if needed), wait for CI,
+   squash-merge.
 
-6. **Dry-run option.** To rehearse without uploading, run the workflow manually
-   (`Actions → Publish to crates.io → Run workflow`) with **dry-run** left ticked.
+4. **Tag + publish (automatic).** The merge changes the workspace version on
+   `main`, which triggers [`tag-release.yml`](../.github/workflows/tag-release.yml).
+   It checks that `CHANGELOG.md` has the `## [X.Y.Z]` section, creates the
+   annotated tag `vX.Y.Z` on the merge commit, and then calls:
+   - [`publish.yml`](../.github/workflows/publish.yml) — verifies the tag
+     matches the workspace version and publishes all 13 crates in order;
+   - [`release.yml`](../.github/workflows/release.yml) — builds the binaries
+     and OpenWrt packages and publishes the GitHub Release, with the
+     `CHANGELOG.md` section as its notes.
 
-7. **Post-release.**
-   - Verify: `cargo install meow-app` (or `cargo info meow-app`).
-   - Cut a GitHub Release for the tag with notes / prebuilt binaries.
+   A tag pushed with `GITHUB_TOKEN` triggers no workflows, so these two run
+   from `tag-release.yml` instead of from the tag push — exactly once. If a
+   job fails, fix the cause and use **Re-run failed jobs**; re-running *all*
+   jobs sees that the tag exists and does nothing. `publish.yml` skips
+   versions already on the registry, so a partial publish resumes.
+
+5. **Post-release.** Verify `cargo install meow-app` (or `cargo info
+   meow-app`) and the Release page.
+
+`crate_publish_metadata_test` (part of CI) asserts that every workspace crate
+is at one version and every internal dependency pins it, so a hand-edited bump
+that misses a pin fails the release PR.
+
+### Tagging by hand
+
+The original flow still works and is the fallback when `tag-release.yml` did
+not tag (an Actions outage, the workflow disabled, or a bump it refused
+because its CHANGELOG section is missing): push the tag yourself from the
+merged release commit.
+
+```bash
+git fetch origin && git checkout --detach <merged chore(release) commit>
+git tag -a v0.15.1 -m v0.15.1
+git push origin v0.15.1
+```
+
+A tag pushed by a person (not `GITHUB_TOKEN`) triggers `publish.yml` and
+`release.yml` directly. Whichever of the two paths creates the tag first
+wins; the other sees the tag and stands down.
+
+### Rehearsal
+
+- **crates.io:** `Actions → Publish to crates.io → Run workflow` with
+  **dry-run** left ticked packages and verifies all 13 crates without
+  uploading.
+- **Binaries:** `Actions → Release → Run workflow` with a tag builds the full
+  artifact matrix without publishing a Release.
 
 ## Alpha prereleases
 
@@ -93,7 +141,7 @@ part of cutting a stable release; it needs no manual steps.
 - **No cross-triggering.** `release.yml` and `publish.yml` fire only on `v*` tags;
   `Prerelease-Alpha` does not match, and tags pushed by `GITHUB_TOKEN` do not
   trigger workflows anyway. Never create a `v*` tag by hand for alphas.
-- **Upstream only.** Jobs are gated on `github.repository == 'madeye/meow-rs'`.
+- **Upstream only.** Jobs are gated on `github.repository == 'meow-rs/meow-rs'`.
 - **Concurrency.** A newer push cancels an in-flight alpha run; the publish job also
   skips itself if `main` has already moved on.
 
@@ -125,9 +173,9 @@ anything can depend on it:
 If you need a newer fork change, publish it to crates.io first, then bump the
 version here — never point `[workspace.dependencies]` at a git rev.
 
-## Manual fallback
+## Publishing locally
 
-If the workflow is unavailable, publish locally (logged in via `cargo login`):
+If the publish workflow is unavailable, publish locally (logged in via `cargo login`):
 
 ```bash
 for c in meow-common meow-trie meow-anytls meow-lwip meow-transport \

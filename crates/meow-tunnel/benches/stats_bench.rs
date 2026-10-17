@@ -64,13 +64,32 @@ fn bench_accounting(c: &mut Criterion) {
         dst_port: 443,
         ..Default::default()
     };
+    let direct = meow_proxy::DirectAdapter::new();
+    // A rule targeting a group records the selected member too
+    // (`["DIRECT", "Proxy"]`), so full-mode setup walks one unwrap hop.
+    let group = meow_proxy::SelectorGroup::new(
+        "Proxy",
+        vec![Arc::new(meow_config::proxy_parser::WrappedProxy::new(
+            Box::new(meow_proxy::DirectAdapter::new()),
+        ))],
+    );
     c.bench_function("stats_connection_setup_full", |b| {
         b.iter(|| {
             black_box(full.inner().tcp_admission().track_named(
                 black_box(&metadata),
                 "MATCH".into(),
                 "".into(),
-                "DIRECT",
+                &direct,
+            ));
+        });
+    });
+    c.bench_function("stats_connection_setup_full_group", |b| {
+        b.iter(|| {
+            black_box(full.inner().tcp_admission().track_named(
+                black_box(&metadata),
+                "MATCH".into(),
+                "".into(),
+                &group,
             ));
         });
     });
@@ -80,7 +99,7 @@ fn bench_accounting(c: &mut Criterion) {
                 black_box(&metadata),
                 "MATCH".into(),
                 "".into(),
-                "DIRECT",
+                &direct,
             ));
         });
     });

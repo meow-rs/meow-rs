@@ -83,6 +83,10 @@ fn can_publish(pkg: &serde_json::Value) -> bool {
     }
 }
 
+fn package_version(pkg: &serde_json::Value) -> &str {
+    pkg["version"].as_str().expect("package version")
+}
+
 fn lib_src_path(pkg: &serde_json::Value) -> &Path {
     let name = pkg["name"].as_str().unwrap();
     let target = pkg["targets"]
@@ -219,6 +223,50 @@ fn publishable_crates_advertise_org_urls() {
         );
     }
     assert_eq!(seen_publishable.len(), PUBLISHABLE.len());
+}
+
+/// The workspace releases in lockstep: every member is at one version and
+/// every dependency on a member pins exactly that version. This is the
+/// invariant `scripts/release/prepare.sh` maintains on a bump; a pin left
+/// at the previous version would make `cargo publish` resolve the previous
+/// release from crates.io instead of the crate being published alongside it.
+#[test]
+fn workspace_crates_release_in_lockstep() {
+    let meta = cargo_metadata();
+    let packages = workspace_packages(&meta);
+    let members: HashSet<&str> = packages
+        .iter()
+        .map(|pkg| pkg["name"].as_str().expect("package name"))
+        .collect();
+    let workspace_version = packages
+        .iter()
+        .find(|pkg| pkg["name"] == "meow-common")
+        .map(|pkg| package_version(pkg))
+        .expect("meow-common in workspace");
+    let pin = format!("^{workspace_version}");
+
+    for pkg in &packages {
+        let name = pkg["name"].as_str().expect("package name");
+        assert_eq!(
+            package_version(pkg),
+            workspace_version,
+            "{name} is not at the workspace version"
+        );
+        for dep in pkg["dependencies"].as_array().expect("dependencies") {
+            let dep_name = dep["name"].as_str().expect("dependency name");
+            if !members.contains(dep_name) {
+                continue;
+            }
+            let req = dep["req"].as_str().expect("dependency req");
+            if req == "*" && !can_publish(pkg) {
+                continue;
+            }
+            assert_eq!(
+                req, pin,
+                "{name} depends on {dep_name} with `{req}`; workspace crates must pin `version = \"{workspace_version}\"`"
+            );
+        }
+    }
 }
 
 #[test]

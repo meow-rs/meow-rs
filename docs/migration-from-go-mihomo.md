@@ -644,7 +644,11 @@ Most common format from public providers. Typical issues:
    `TPROXY`/`REDIRECT` rules.
 2. **`redir-port`** — not supported. Use `tproxy-port`.
 3. **PROCESS-NAME / PROCESS-PATH rules** — platform lookup wired (Linux netlink,
-   macOS libproc) via M1.D-1.
+   macOS libproc) via M1.D-1. Elsewhere (Android, iOS) they stay dead unless
+   the embedder's inbound names each flow's owner itself and calls
+   `meow_common::process_lookup::enable_inbound_process_info()` before the
+   first config load; an Android VPN can then match package names
+   (`PROCESS-NAME,com.example.app,…`) and app uids (`UID,10123,…`).
 4. **Firewall-management polarity is reversed.** In Go mihomo the top-level
    `iptables:` block defaults **off** (the deployer owns redirect rules
    unless they opt in); in meow-rs the equivalent `firewall:` key lives on a

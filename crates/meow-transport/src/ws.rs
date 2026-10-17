@@ -45,14 +45,31 @@ fn tung_to_io(e: tokio_tungstenite::tungstenite::Error) -> io::Error {
     }
 }
 
+/// Hard ceiling on tungstenite's per-connection write buffer. `start_send`
+/// fails with `WriteBufferFull` — fatal for the stream — once a frame would
+/// push the buffer past it, so every frame `poll_write` queues must fit.
+const WS_MAX_WRITE_BUFFER: usize = 64 * 1024;
+
+/// Largest payload `poll_write` accepts per call. Mux writers coalesce many
+/// frames into one caller slice that can exceed [`WS_MAX_WRITE_BUFFER`];
+/// `AsyncWrite` permits partial progress, so each masked frame stays well
+/// below the ceiling with room for its header and a queued pong.
+const WS_WRITE_CHUNK: usize = 16 * 1024;
+
+const _: () = assert!(
+    WS_WRITE_CHUNK * 2 <= WS_MAX_WRITE_BUFFER,
+    "a write chunk plus control frames must fit tungstenite's write buffer"
+);
+
 /// Footprint-bounded WebSocket config (tungstenite defaults to a 128 KiB
 /// write buffer per connection and 64 MiB max message, which inflates RSS at
-/// high concurrency). 4 KiB matches `RELAY_BUF_SIZE` and is plenty for the
-/// streaming-relay use case where each write is a single relay-buf chunk.
+/// high concurrency). 4 KiB matches `RELAY_BUF_SIZE`: the common relay write
+/// is a single relay-buf chunk, and larger caller slices are split into
+/// [`WS_WRITE_CHUNK`]-sized frames by `poll_write`.
 fn ws_config() -> WebSocketConfig {
     WebSocketConfig::default()
         .write_buffer_size(4 * 1024)
-        .max_write_buffer_size(64 * 1024)
+        .max_write_buffer_size(WS_MAX_WRITE_BUFFER)
         .max_message_size(Some(4 * 1024 * 1024))
         .max_frame_size(Some(1024 * 1024))
         .accept_unmasked_frames(false)
@@ -503,17 +520,6 @@ impl AsyncRead for WsStream {
                             state.read_pos = 0;
                             // loop to drain
                         }
-                        Some(Ok(Message::Ping(payload))) => {
-                            // Best-effort pong: only attempt when the sink is
-                            // immediately ready.  Per the Sink contract,
-                            // start_send must not be called unless poll_ready
-                            // returned Ready(Ok(())).  Dropping a pong when
-                            // the queue is briefly full is acceptable for an
-                            // optional keepalive; blocking the read path is not.
-                            if let Poll::Ready(Ok(())) = Pin::new(&mut state.ws).poll_ready(cx) {
-                                let _ = Pin::new(&mut state.ws).start_send(Message::Pong(payload));
-                            }
-                        }
                         Some(Ok(Message::Close(_))) => {
                             return Poll::Ready(Ok(())); // EOF
                         }
@@ -523,9 +529,12 @@ impl AsyncRead for WsStream {
                                 "ws: unexpected text frame",
                             )));
                         }
-                        Some(Ok(Message::Pong(_) | Message::Frame(_))) => {
-                            // Pong replies and raw frames are noise on the read
-                            // path; ignore and poll for the next frame.
+                        Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => {
+                            // Tungstenite queues the matching pong and flushes
+                            // it on subsequent reads, including after write
+                            // backpressure. A manual pong replaces that reply
+                            // and can leave it buffered on a read-only tunnel.
+                            // Control frames carry no byte-stream payload.
                         }
                     }
                 }
@@ -568,6 +577,14 @@ impl AsyncWrite for WsStream {
                     }
                 }
                 WsInner::Connected(state) => {
+                    // Drain the previously accepted frame before queuing
+                    // another. Sink readiness alone can accept small frames
+                    // while the socket is blocked, filling the bounded buffer.
+                    match Pin::new(&mut state.ws).poll_flush(cx) {
+                        Poll::Ready(Ok(())) => {}
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(tung_to_io(e))),
+                        Poll::Pending => return Poll::Pending,
+                    }
                     match Pin::new(&mut state.ws).poll_ready(cx) {
                         Poll::Ready(Ok(())) => {}
                         Poll::Ready(Err(e)) => {
@@ -581,8 +598,11 @@ impl AsyncWrite for WsStream {
                     // it in place (`try_into_mut`) instead of re-copying the
                     // frame — one allocation per chunk, down from the 0.24
                     // `Vec<u8>` copy + internal re-copy.
+                    // Partial write: see `WS_WRITE_CHUNK` for why a caller
+                    // slice is capped below tungstenite's write-buffer ceiling.
+                    let accepted = buf.len().min(WS_WRITE_CHUNK);
                     if let Err(e) = Pin::new(&mut state.ws)
-                        .start_send(Message::Binary(Bytes::copy_from_slice(buf)))
+                        .start_send(Message::Binary(Bytes::copy_from_slice(&buf[..accepted])))
                     {
                         return Poll::Ready(Err(tung_to_io(e)));
                     }
@@ -595,7 +615,7 @@ impl AsyncWrite for WsStream {
                         Poll::Ready(Ok(())) | Poll::Pending => {}
                         Poll::Ready(Err(e)) => return Poll::Ready(Err(tung_to_io(e))),
                     }
-                    return Poll::Ready(Ok(buf.len()));
+                    return Poll::Ready(Ok(accepted));
                 }
             }
         }

@@ -44,7 +44,7 @@ pub(super) mod flow {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use meow_common::{with_dial_timeout, ConnType, Metadata, Network};
+    use meow_common::{ConnType, Metadata, Network};
     use meow_tunnel::Tunnel;
     use tokio::sync::mpsc;
     use tokio::time::{sleep_until, Instant};
@@ -158,7 +158,8 @@ pub(super) mod flow {
         // flow (issue #695): its socket may predate the new outbound binding.
         let mut flush = inner.udp_flush_watch();
         let conn: Arc<dyn meow_common::ProxyPacketConn> = Arc::from(
-            with_dial_timeout(proxy.name(), proxy.dial_udp(&metadata))
+            inner
+                .dial_udp(proxy.as_ref(), &metadata)
                 .await
                 .map_err(|e| format!("dial_udp via {}: {e}", proxy.name()))?,
         );

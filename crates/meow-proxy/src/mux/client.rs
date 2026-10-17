@@ -329,9 +329,11 @@ pub(crate) struct MuxSession {
 
 /// Releases a [`MuxSession`] slot when dropped — the cancellation-safe
 /// counterpart of the reservation `offer()` made via CAS on `streams`.
-struct Reservation(Arc<MuxSession>);
+/// Borrowing the open attempt's session lets success transfer the slot
+/// without retaining an extra owned reference to the physical connection.
+struct Reservation<'a>(&'a MuxSession);
 
-impl Drop for Reservation {
+impl Drop for Reservation<'_> {
     fn drop(&mut self) {
         self.0.streams.fetch_sub(1, Ordering::SeqCst);
     }
@@ -520,19 +522,19 @@ impl MuxClient {
                 // over this context-only offer error (issue #668).
                 Err(e) => {
                     return Err(MeowError::prefer_errno(last_err, e)
-                        .expect("prefer_errno returns Some for a provided next"))
+                        .expect("prefer_errno returns Some for a provided next"));
                 }
             };
             // offer() reserved one slot on `streams` via CAS.  The
             // guard releases it if the open future is cancelled or the
             // session rejects the stream.
-            let reservation = Reservation(Arc::clone(&session));
+            let reservation = Reservation(&session);
             match session.kind.open_stream(host, port, udp).await {
                 Ok(stream) => {
                     // The slot reserved by offer() is now an established
-                    // stream.  Forget the reservation so its Drop doesn't
-                    // decrement — MuxStreamConn::drop will do that when
-                    // the stream is eventually closed.
+                    // stream. Forget this borrowed guard so its Drop doesn't
+                    // decrement — the returned connection now releases the
+                    // slot when the stream is eventually closed.
                     std::mem::forget(reservation);
                     // Idle eviction is measured from the last successful open
                     // (not the last activity): conservative — a long-lived
@@ -1003,13 +1005,55 @@ mod tests {
 
     #[tokio::test]
     async fn idle_sessions_are_evicted() {
-        let dials = Arc::new(AtomicUsize::new(0));
-        let client = mock_mux_client(Arc::clone(&dials)).await;
-        let s = client.open_stream("a.example", 80).await.unwrap();
-        drop(s);
-        // The zero-stream session stays reusable within IDLE_TIMEOUT.
-        let _s2 = client.open_stream("b.example", 81).await.unwrap();
-        assert_eq!(dials.load(Ordering::SeqCst), 1);
+        for protocol in [Protocol::MuxCool, Protocol::Smux, Protocol::Yamux] {
+            // TCP and UDP use distinct connection wrappers, each responsible
+            // for releasing the pool's established-stream reservation.
+            for udp in [false, true] {
+                let dials = Arc::new(AtomicUsize::new(0));
+                let closed = Arc::new(AtomicUsize::new(0));
+                let client =
+                    tracked_mux_client(protocol, Arc::clone(&dials), Arc::clone(&closed), None);
+                if udp {
+                    let stream = client.open_packet_stream("127.0.0.1", 53).await.unwrap();
+                    drop(stream);
+                } else {
+                    let stream = client.open_stream("a.example", 80).await.unwrap();
+                    drop(stream);
+                }
+
+                // A completed stream leaves its session reusable before the
+                // idle deadline, including after the UDP wrapper drops.
+                let reused = client.open_stream("b.example", 81).await.unwrap();
+                assert_eq!(dials.load(Ordering::SeqCst), 1, "{protocol:?}, UDP={udp}");
+                drop(reused);
+                {
+                    let sessions = client.sessions.lock().await;
+                    sessions[0].last_used_ms.store(
+                        now_ms().wrapping_sub(IDLE_TIMEOUT.as_millis() as Uint),
+                        Ordering::SeqCst,
+                    );
+                }
+
+                let fresh = client.open_stream("c.example", 82).await.unwrap();
+                assert_eq!(dials.load(Ordering::SeqCst), 2, "{protocol:?}, UDP={udp}");
+                // Removing the pool entry must close the old physical
+                // connection, rather than merely hiding it from future opens.
+                wait_for(
+                    &closed,
+                    1,
+                    &format!("{protocol:?}, UDP={udp}: evicted connection"),
+                )
+                .await;
+                drop(fresh);
+                drop(client);
+                wait_for(
+                    &closed,
+                    2,
+                    &format!("{protocol:?}, UDP={udp}: dropped pool"),
+                )
+                .await;
+            }
+        }
     }
 
     /// Regression test for issue #421: `offer()`'s idle check must compare
@@ -1179,7 +1223,7 @@ mod tests {
         assert_eq!(dials.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
-    /// Mock dialer for the reset tests: counts dials and physical
+    /// Mock dialer for lifecycle tests: counts dials and physical
     /// connections the far end saw close; the first dial parks on `gate`
     /// when one is given.
     fn tracked_mux_client(

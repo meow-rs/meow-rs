@@ -240,6 +240,9 @@ impl Metadata {
         self.dst_ip.is_some()
     }
 
+    /// The copy the connection table keeps for `/connections`. Who opened
+    /// the flow (`process` / `processPath` / `uid`) stays, as upstream
+    /// reports it; inbound details and per-match extras are dropped.
     pub fn pure(&self) -> Self {
         Self {
             network: self.network,
@@ -250,9 +253,9 @@ impl Metadata {
             dst_port: self.dst_port,
             host: self.host.clone(),
             dns_mode: self.dns_mode,
-            process: SmolStr::default(),
-            process_path: SmolStr::default(),
-            uid: None,
+            process: self.process.clone(),
+            process_path: self.process_path.clone(),
+            uid: self.uid,
             dscp: None,
             src_geo_ip: Vec::new(),
             dst_geo_ip: Vec::new(),

@@ -22,6 +22,10 @@ vless-encryption = ["vless", "meow-proxy/vless-encryption"]
 vmess = ["meow-proxy/vmess"]
 anytls = ["meow-proxy/anytls"]
 hysteria2 = ["meow-proxy/hysteria2"]
+# TrustTunnel H2 client outbound; opt-in pending upstream profile review (#727).
+trusttunnel = ["meow-proxy/trusttunnel"]
+# `quic: true` for that outbound; see meow-proxy's `trusttunnel-h3`.
+trusttunnel-h3 = ["trusttunnel", "meow-proxy/trusttunnel-h3"]
 # `meow-transport/simple-obfs` is used directly by the snell parser's
 # `obfs-opts.host` check (issue #648) — declare it rather than rely on
 # `meow-proxy/snell`'s transitive activation.
@@ -65,7 +69,7 @@ url = "2"
 httparse = "1"
 # Optional: only compiled when the `external-ui-download` feature is enabled.
 # `deflate` is the only codec GitHub release zips use; skip the heavier ones.
-zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
+zip = { version = "9", default-features = false, features = ["deflate"], optional = true }
 dashmap = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]

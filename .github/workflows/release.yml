@@ -1,5 +1,11 @@
 name: Release
 
+# Builds the release artifacts and publishes the GitHub Release for a v* tag:
+# on a tag push, or via workflow_call from tag-release.yml (which creates the
+# tag with GITHUB_TOKEN, and such a tag push triggers no workflows). The
+# release notes are the tag's CHANGELOG.md section followed by GitHub's
+# generated PR list. workflow_dispatch only builds (dry run, no upload).
+
 on:
   push:
     tags:
@@ -9,6 +15,12 @@ on:
       tag:
         description: "Release tag to build (e.g. v0.3.0) — dry-run only, no upload"
         required: true
+  workflow_call:
+    inputs:
+      release_tag:
+        description: "Tag to release (vX.Y.Z); must already exist"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -19,14 +31,17 @@ jobs:
     uses: ./.github/workflows/build.yml
     with:
       # On workflow_dispatch GITHUB_REF_NAME is the *branch* name (which may
-      # contain slashes and break the archive path) — use the tag input.
-      ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
+      # contain slashes and break the archive path) — use the tag input. Under
+      # workflow_call it is the caller's ref (main), so use release_tag.
+      ref: ${{ inputs.release_tag || (github.event_name == 'workflow_dispatch' && github.event.inputs.tag) || github.ref_name }}
 
   release:
     name: Publish GitHub release
     runs-on: ubuntu-latest
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: inputs.release_tag != '' || startsWith(github.ref, 'refs/tags/v')
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v5
 
@@ -38,7 +53,7 @@ jobs:
       - name: Package luci-app-meow ipk (arch-independent)
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
+          version="${RELEASE_TAG#v}"
           bash openwrt/build-ipk.sh luci --version "${version}-1" --outdir dist
           cd dist
           f="luci-app-meow_${version}-1_all.ipk"
@@ -54,7 +69,7 @@ jobs:
         run: |
           set -euo pipefail
           bash openwrt/install-apk-tools.sh "$HOME/.cache/apk-tools"
-          version="${GITHUB_REF_NAME#v}"
+          version="${RELEASE_TAG#v}"
           sudo APK="$HOME/.cache/apk-tools/apk" bash openwrt/build-apk.sh luci \
             --version "${version}-r1" --outdir dist
           sudo chown -R "$(id -u):$(id -g)" dist
@@ -62,9 +77,24 @@ jobs:
           f="luci-app-meow_${version}-r1_all.apk"
           sha256sum "$f" > "$f.sha256"
 
+      - name: Write release notes
+        run: |
+          set -euo pipefail
+          # The curated CHANGELOG.md section leads; softprops appends GitHub's
+          # generated "What's Changed" list below it. Tags cut before the
+          # CHANGELOG existed (<= v0.21.2) get the generated list only.
+          if scripts/release/changelog-section.sh "${RELEASE_TAG#v}" >"$RUNNER_TEMP/notes.md"; then
+            echo "Using the CHANGELOG.md section for ${RELEASE_TAG}."
+          else
+            echo "::warning::CHANGELOG.md has no section for ${RELEASE_TAG}; using generated notes only"
+            : >"$RUNNER_TEMP/notes.md"
+          fi
+
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          body_path: ${{ runner.temp }}/notes.md
           files: |
             dist/*.tar.gz
             dist/*.tar.gz.sha256

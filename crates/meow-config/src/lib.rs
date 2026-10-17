@@ -25,6 +25,8 @@ pub mod rule_provider_refresh;
 mod safe_path;
 pub mod sub_rules_parser;
 pub mod subscription;
+#[cfg(test)]
+mod test_support;
 
 pub use geodata::GeoDataConfig;
 
@@ -102,6 +104,8 @@ pub struct GeneralConfig {
     pub ipv6: bool,
     pub allow_lan: bool,
     pub bind_address: String,
+    /// `connection-notes` — see `Tunnel::set_connection_notes`.
+    pub connection_notes: bool,
 }
 
 /// Single source of truth for the effective `ipv6` setting of a config
@@ -592,6 +596,50 @@ pub fn set_offline_validate(on: bool) {
 /// [`set_offline_validate`]).
 pub fn is_offline_validate() -> bool {
     OFFLINE_VALIDATE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Upper bound, in milliseconds, on how long a config load waits for the
+/// remote proxy- and rule-provider fetches that have no usable on-disk
+/// cache. `u64::MAX` = wait for every fetch to finish (the default).
+static PROVIDER_FETCH_DEADLINE_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Bound how long a config load waits for provider downloads that have no
+/// cache to fall back on. `None` (the default) waits for every fetch, as
+/// mihomo does; `Some(d)` returns after `d` and lets the stragglers finish
+/// in the background, where they populate their `use:` groups or `RULE-SET`
+/// rules as they land. `Some(Duration::ZERO)` never waits.
+///
+/// For embedders that must not hold their own startup on a third-party feed
+/// — a mobile VPN cannot establish its tunnel until `load_config` returns,
+/// and with "block connections without VPN" the fetch cannot even succeed
+/// before then. Proxy-providers and rule-providers each get the window in
+/// turn (rule-provider downloads can ride proxies, so they start after
+/// the proxy-providers), and runtime rebuilds (`PUT /configs`, subscription
+/// applies) honour it for rule-providers too.
+///
+/// Providers the deadline leaves empty are retried in the background:
+/// proxy-providers by [`proxy_provider::spawn_deferred_initial_fetches`],
+/// rule-providers by [`rule_provider::RuleProvider::spawn_initial_fetch`]
+/// (which [`rule_provider_refresh::RefreshSupervisor::reconcile`] runs).
+/// Every embedder runs both after its first routing install anyway; they
+/// also revalidate the cache-loaded providers. Cached providers never wait
+/// on the network, whatever this is set to. Under `strict`, a payload
+/// rejection that lands after the deadline is logged rather than failing
+/// the load.
+pub fn set_provider_fetch_deadline(deadline: Option<std::time::Duration>) {
+    let ms = deadline.map_or(u64::MAX, |d| {
+        u64::try_from(d.as_millis()).unwrap_or(u64::MAX - 1)
+    });
+    PROVIDER_FETCH_DEADLINE_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The deadline set by [`set_provider_fetch_deadline`].
+pub fn provider_fetch_deadline() -> Option<std::time::Duration> {
+    match PROVIDER_FETCH_DEADLINE_MS.load(std::sync::atomic::Ordering::Relaxed) {
+        u64::MAX => None,
+        ms => Some(std::time::Duration::from_millis(ms)),
+    }
 }
 
 /// Process policy for hosts accepting configurations from delegated users.
@@ -1706,6 +1754,29 @@ fn has_unresolved_group_dependency(
     })
 }
 
+/// Bind a node that failed to parse to a permanently-dead stand-in instead of
+/// dropping it from the registry (see [`meow_proxy::UnavailableAdapter`]).
+///
+/// Used for the protocols where a *missing* member is worse than a broken one:
+/// a group that lists the name can neither quietly shift that traffic onto a
+/// sibling member nor, once no member survives, degrade to a direct dial.
+/// Rejecting the enclosing `proxies:` block or provider payload closes the
+/// same hole, but it also fires for a protocol the running binary simply does
+/// not contain — which the operator cannot repair by editing anything — and on
+/// a provider payload it hands a third party a daemon-wide kill switch.
+/// `declared` keeps the node's own type in the registry, so the placeholder
+/// reads as "the node you asked for, dead" rather than as a REJECT the
+/// operator wrote on purpose.
+pub(crate) fn unavailable_placeholder(
+    name: &str,
+    reason: &str,
+    declared: meow_common::AdapterType,
+) -> Arc<dyn Proxy> {
+    Arc::new(proxy_parser::WrappedProxy::new(Box::new(
+        meow_proxy::UnavailableAdapter::new(name, reason, declared),
+    )))
+}
+
 /// Parse every `proxies:` leaf entry into `proxies`, keyed by its YAML `name:`
 /// (`proxy.name()` only as fallback — `DirectAdapter::name()` is hardcoded to
 /// "DIRECT" and would overwrite the built-in, hiding a user-named direct proxy
@@ -1721,41 +1792,8 @@ fn insert_parsed_leaves(
     strict: bool,
 ) -> Result<(), anyhow::Error> {
     for raw_proxy in raw_proxies {
-        match proxy_parser::parse_proxy(raw_proxy, ipv6) {
-            Ok(proxy) => {
-                // Prefer the YAML `name:` as the registry key. `proxy.name()`
-                // is fine for SS/Trojan/VLESS (their parsers thread the name
-                // into the adapter) but `DirectAdapter::name()` is hardcoded
-                // to "DIRECT" and would overwrite the built-in, hiding any
-                // user-named direct proxy (e.g. `name: "直连"`) from groups.
-                let key: SmolStr = raw_proxy
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_else(|| proxy.name())
-                    .into();
-                if BUILTIN_ADAPTER_NAMES.contains(&key.as_str()) {
-                    if strict {
-                        return Err(anyhow::anyhow!(
-                            "proxies: '{key}' shadows a built-in adapter (strict mode)"
-                        ));
-                    }
-                    warn!(
-                        "Proxy named '{key}' shadows a built-in adapter; the \
-                         entry is dropped and the built-in stays"
-                    );
-                    continue;
-                }
-                // A repeated leaf name last-wins here — a deliberate
-                // divergence from upstream's `proxy %s is the duplicate
-                // name` hard error. Leaf duplicates are safe to keep: all
-                // leaves settle before any group captures members, so they
-                // cannot split the registry the way group duplicates did
-                // (#561). Warn so a typo doesn't silently rebind (#625).
-                if !static_proxy_names.insert(key.clone()) {
-                    warn!("duplicate proxy name '{key}': the later entry replaces the earlier one");
-                }
-                proxies.insert(key, proxy);
-            }
+        let proxy = match proxy_parser::parse_proxy(raw_proxy, ipv6) {
+            Ok(proxy) => proxy,
             Err(e) if strict => {
                 let name = raw_proxy
                     .get("name")
@@ -1765,8 +1803,54 @@ fn insert_parsed_leaves(
                     "proxies: failed to parse '{name}' (strict mode): {e}"
                 ));
             }
-            Err(e) => warn!("Failed to parse proxy: {}", e),
+            Err(e) if proxy_parser::node_is_trusttunnel(raw_proxy) => {
+                let name = raw_proxy
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("<unnamed>");
+                warn!(
+                    "proxies: '{name}' failed to parse ({e}); keeping the name bound \
+                     to an unavailable node so no dial can fall back past it"
+                );
+                unavailable_placeholder(name, &e, meow_common::AdapterType::TrustTunnel)
+            }
+            Err(e) => {
+                warn!("Failed to parse proxy: {}", e);
+                continue;
+            }
+        };
+        // Prefer the YAML `name:` as the registry key. `proxy.name()`
+        // is fine for SS/Trojan/VLESS (their parsers thread the name
+        // into the adapter) but `DirectAdapter::name()` is hardcoded
+        // to "DIRECT" and would overwrite the built-in, hiding any
+        // user-named direct proxy (e.g. `name: "直连"`) from groups.
+        let key: SmolStr = raw_proxy
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| proxy.name())
+            .into();
+        if BUILTIN_ADAPTER_NAMES.contains(&key.as_str()) {
+            if strict {
+                return Err(anyhow::anyhow!(
+                    "proxies: '{key}' shadows a built-in adapter (strict mode)"
+                ));
+            }
+            warn!(
+                "Proxy named '{key}' shadows a built-in adapter; the \
+                 entry is dropped and the built-in stays"
+            );
+            continue;
         }
+        // A repeated leaf name last-wins here — a deliberate
+        // divergence from upstream's `proxy %s is the duplicate
+        // name` hard error. Leaf duplicates are safe to keep: all
+        // leaves settle before any group captures members, so they
+        // cannot split the registry the way group duplicates did
+        // (#561). Warn so a typo doesn't silently rebind (#625).
+        if !static_proxy_names.insert(key.clone()) {
+            warn!("duplicate proxy name '{key}': the later entry replaces the earlier one");
+        }
+        proxies.insert(key, proxy);
     }
     Ok(())
 }
@@ -1782,9 +1866,9 @@ fn insert_parsed_leaves(
 ///   old filters forever while the committed config claims otherwise
 ///   (issue #533 review).
 /// - A newly declared def constructs an empty [`ProxyProvider`] (no fetch —
-///   this path is sync); the committing caller installs it into the live
-///   registry and spawns the initial refresh, so `use:`/`include-all` wire a
-///   real slot instead of dangling until restart.
+///   this path is sync); the committing caller spawns the first acquisition
+///   detached, so a slow or blackholed provider URL cannot hold the config
+///   mutation lane.
 /// - A def that fails construction is warn-skipped leniently and a hard
 ///   error under `strict` — the same gate startup's
 ///   [`proxy_provider::load_proxy_providers`] applies, so a committed
@@ -2482,7 +2566,7 @@ fn rebuild_from_raw_impl(
         // `shared_providers` rebuilds bind the live provider objects — their
         // payloads are never re-parsed, so prefetching would only re-fetch
         // every http provider per geodata tick for bytes nothing reads.
-        None if shared_providers.is_some() => Arc::new(HashMap::new()),
+        None if shared_providers.is_some() => Arc::default(),
         None => Arc::new(match raw.rule_providers.as_ref() {
             Some(map) if !map.is_empty() => rule_provider::prefetch_payloads(
                 map,
@@ -2490,7 +2574,7 @@ fn rebuild_from_raw_impl(
                 download_proxy.as_ref(),
                 &proxy_lookup,
             ),
-            _ => HashMap::new(),
+            _ => rule_provider::PrefetchedPayloads::default(),
         }),
     };
 
@@ -2598,7 +2682,7 @@ async fn prefetch_rule_provider_payloads_async(
     prefetch: Option<Arc<PrefetchProxies>>,
 ) -> rule_provider::PrefetchedPayloads {
     let Some(raw_providers) = raw.rule_providers.as_ref().filter(|m| !m.is_empty()) else {
-        return HashMap::new();
+        return rule_provider::PrefetchedPayloads::default();
     };
     let raw_providers = raw_providers.clone();
     let raw_proxies: Vec<HashMap<String, serde_yaml::Value>> =
@@ -2618,7 +2702,7 @@ async fn prefetch_rule_provider_payloads_async(
     .await
     .unwrap_or_else(|e| {
         warn!("rule-provider payload prefetch task failed: {e}");
-        HashMap::new()
+        rule_provider::PrefetchedPayloads::default()
     })
 }
 
@@ -2883,7 +2967,7 @@ fn prefetch_proxy_layer_needed(raw: &raw::RawConfig, geo: &GeoDataConfig) -> boo
     if has_fetchable_provider {
         return true;
     }
-    let scan = collect_geo_scan_lines(raw, &HashMap::new());
+    let scan = collect_geo_scan_lines(raw, &rule_provider::PrefetchedPayloads::default());
     !missing_geodata_downloads(raw, geo, &scan).is_empty()
 }
 
@@ -3245,7 +3329,7 @@ fn collect_geo_scan_lines(
     // scanned — a caller-supplied superset map must not trigger geo loads
     // for providers the candidate does not carry (issue #543).
     let declared = raw.rule_providers.as_ref();
-    for (name, bytes) in provider_payloads {
+    for (name, bytes) in provider_payloads.iter() {
         if !declared.is_some_and(|m| m.contains_key(name)) || meow_rules::is_mrs_bytes(bytes) {
             continue;
         }
@@ -3767,6 +3851,7 @@ pub async fn build_config(
         ipv6: effective_ipv6(raw.ipv6),
         allow_lan: raw.allow_lan.unwrap_or(false),
         bind_address,
+        connection_notes: raw.connection_notes.unwrap_or(false),
     };
 
     // Registry the provider nodes' `dialer-proxy` targets resolve against
@@ -4338,7 +4423,7 @@ mod dialer_proxy_tests {
         // The fetch itself fails — the counting listener accepts then drops
         // — but the TCP connect to B proves `proxy: A` dialled its front hop.
         let payloads = prefetch_rule_provider_payloads_async(&raw, None, Some(layer)).await;
-        assert!(payloads.is_empty());
+        assert_eq!(payloads.iter().count(), 0, "no payload was acquired");
         assert!(b_hits.load(std::sync::atomic::Ordering::SeqCst) >= 1);
     }
 
@@ -5325,7 +5410,7 @@ mod geoip_context_tests {
             sub_rules: Some(sub_rules),
             ..Default::default()
         };
-        let lines = collect_geo_scan_lines(&raw, &HashMap::new());
+        let lines = collect_geo_scan_lines(&raw, &rule_provider::PrefetchedPayloads::default());
         let countries = collect_geoip_countries(&lines);
         assert!(
             countries.contains("JP"),
@@ -5359,7 +5444,7 @@ mod geoip_context_tests {
             rule_providers: Some(providers),
             ..Default::default()
         };
-        let lines = collect_geo_scan_lines(&raw, &HashMap::new());
+        let lines = collect_geo_scan_lines(&raw, &rule_provider::PrefetchedPayloads::default());
         assert!(collect_geoip_countries(&lines).contains("KR"));
         assert!(collect_geosite_categories(&lines).contains("youtube"));
     }
@@ -5389,7 +5474,7 @@ mod geoip_context_tests {
             ])),
             ..Default::default()
         };
-        let mut payloads: rule_provider::PrefetchedPayloads = HashMap::new();
+        let mut payloads = rule_provider::PrefetchedPayloads::new();
         payloads.insert(
             "yaml-provider".to_string(),
             b"payload:\n  - 'GEOIP,BR,no-resolve'\n  - DOMAIN,example.com\n".to_vec(),
@@ -5439,7 +5524,7 @@ mod geoip_context_tests {
             &nonexistent_asn(),
             &nonexistent_geosite(),
             None,
-            &HashMap::new(),
+            &rule_provider::PrefetchedPayloads::default(),
         )
         .expect_err("sub-rules GEOIP must trigger the mmdb load");
         let msg = format!("{err}");
@@ -5481,7 +5566,7 @@ mod geoip_context_tests {
             &nonexistent_asn(),
             &nonexistent_geosite(),
             None,
-            &HashMap::new(),
+            &rule_provider::PrefetchedPayloads::default(),
         )
         .unwrap();
         assert!(ctx.geoip.is_none());
@@ -5498,7 +5583,7 @@ mod geoip_context_tests {
             &nonexistent_asn(),
             &nonexistent_geosite(),
             None,
-            &HashMap::new(),
+            &rule_provider::PrefetchedPayloads::default(),
         )
         .expect_err("must fail-fast when mmdb is missing");
         let msg = format!("{err}");
@@ -5523,7 +5608,7 @@ mod geoip_context_tests {
             &nonexistent_asn(),
             &nonexistent_geosite(),
             None,
-            &HashMap::new(),
+            &rule_provider::PrefetchedPayloads::default(),
         )
         .expect_err("garbage bytes must fail to parse as mmdb");
         let msg = format!("{err}");
@@ -5556,7 +5641,7 @@ mod geoip_context_tests {
             &nonexistent_asn(),
             &nonexistent_geosite(),
             None,
-            &HashMap::new(),
+            &rule_provider::PrefetchedPayloads::default(),
         )
         .unwrap();
         assert!(ctx.asn.is_none());
@@ -5621,7 +5706,7 @@ rule-providers:
             &asn,
             &nonexistent_geosite(),
             None,
-            &HashMap::new(),
+            &rule_provider::PrefetchedPayloads::default(),
         )
         .expect_err("must fail-fast when ASN mmdb is missing");
         let msg = format!("{err}");

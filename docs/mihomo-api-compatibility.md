@@ -73,6 +73,15 @@ The following routes are retained and do not collide with the mihomo surface:
 - rule CRUD extensions on `/rules`
 - `GET /dns/results` and `POST /dns/query`
 - `GET /listeners`
+- `GET /statistics`: `uploadTotal` / `downloadTotal` (the `/traffic`
+  totals) and `proxies`, the bytes each proxy carried since start, TCP and
+  UDP: `{"DIRECT": {"upload": N, "download": N}, ...}`. A group's traffic
+  counts at the member that carried it, and a proxy a reload removed stays
+  listed; empty when the tunnel runs headless
+- `GET /connections/{id}`: one `/connections` entry plus `closed`, `end`
+  and the `notes` timeline (`[{time, kind, text}]`) recorded when
+  `connection-notes: true`; closed connections with notes stay readable
+  for the last 256
 
 When the mihomo baseline changes, compare `hub/route` and the outbound-group
 JSON marshalers against this table before marking a new release compatible.

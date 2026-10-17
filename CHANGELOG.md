@@ -16,11 +16,183 @@ the canonical, in-repo source a release is cut from.
 
 ### Added
 
+- **Traffic per proxy** (`GET /statistics`): the upload and download totals
+  plus the bytes each proxy carried since the tunnel started, TCP and UDP,
+  for a client's statistics screen. A group's traffic counts at the member
+  that carried it (the `chains[0]` of `/connections`); a proxy keeps its
+  totals after its connections close, and after a reload removes it.
+
+### Fixed
+
+- **UDP traffic counts toward the totals**: only TCP relays added to the
+  upload and download totals, so `/traffic`, the `/connections` totals and
+  every client speed or usage figure built on them left out QUIC and every
+  other UDP flow. Each inbound now dials its UDP flows through one tunnel
+  helper that counts their payload, except for flows sent to REJECT or PASS,
+  which drop it.
+
+## [0.23.1] - 2026-10-17
+
+### Fixed
+
+- **meow-transport builds for iOS and tvOS again**: kcptun's `dscp:` option
+  called socket2's `set_tclass_v6` on every Unix target, but socket2 only
+  provides it on Android, Linux, macOS, the BSDs, Fuchsia and Cygwin. Since
+  kcptun joined meow-proxy's default features in 0.22.0, meow-transport has
+  failed to compile for `aarch64-apple-ios` / `aarch64-apple-tvos`. The call
+  is now limited to the targets socket2 supports; elsewhere the IPv6 traffic
+  class is skipped, as it already was on Windows, and the IPv4 DSCP is still
+  applied.
+
+### Security
+
+- **`zip` 9 for `external-ui-download`**: meow-config's opt-in dashboard
+  download moves from zip 2.4 to 9.0, which is patched for RUSTSEC-2026-0367,
+  -0368 and -0369. Those advisories are in zip's own `extract()`, which
+  meow-config never called: it writes each entry itself, skips names that
+  would leave the target directory, creates no symlinks and applies no stored
+  permissions. The feature is off in every release bundle.
+
+## [0.23.0] - 2026-10-16
+
+### Added
+
+- **Per-connection notes** (`connection-notes: true`, off by default): the
+  tunnel records a short, timestamped account of how it handled each TCP
+  connection — the inbound and owning app, the fake-IP reversal, every DNS
+  lookup a rule needed (upstream, answer or error, and how long it took), the
+  rule that matched, the dial result and how the relay ended. The new
+  `GET /connections/{id}` endpoint (a meow-rs extension) returns the
+  `/connections` entry plus its `notes`, and keeps answering for the last 256
+  closed connections that recorded notes, so short or failed flows can still
+  be explained. `/connections` itself is unchanged. Embedders can toggle the
+  recording with `Tunnel::set_connection_notes`.
+
+- **Inbound-supplied process identity for embedders**:
+  `meow_common::process_lookup::enable_inbound_process_info()` declares that
+  the embedder's inbound fills `Metadata::process` / `process_path` / `uid`
+  before dispatch. PROCESS-NAME, PROCESS-PATH and UID rules then stay live on
+  platforms without a native process lookup (Android) and match those fields
+  as supplied, so an Android VPN that resolves each flow's owner through
+  `ConnectivityManager.getConnectionOwnerUid` can route by package name or
+  app uid. Default behaviour is unchanged.
+
+- Opt-in TrustTunnel client outbound (`--features trusttunnel`):
+  authenticated CONNECT, TCP half-close, bounded pooling and IPv4/IPv6 UDP
+  multiplexing over HTTP/2, plus the specification's per-stream `user-agent`
+  (`platform` / `app-name`) and operator-declared `headers` with re-rolled
+  `<random-string(N)>` padding. `--features trusttunnel-h3` adds the HTTP/3
+  transport (`quic: true`) on the same vendored BoringSSL as hysteria2, with
+  no second crypto library. See `docs/specs/proxy-trusttunnel.md` for
+  configuration and explicit compatibility limits (proposal #727).
+
 - **OpenWrt x86_64 packages** (issue #725): releases and alpha prereleases
   now ship `meow` `.ipk` and `.apk` packages for OpenWrt's x86/64 target
   (architecture `x86_64`), built from the existing static
   `x86_64-unknown-linux-musl` binary, so `luci-app-meow` can be installed on
   x86 OpenWrt.
+
+### Fixed
+
+- **simple-obfs HTTP sends an empty `Host` for hosts Go would reject**:
+  subscriptions write `obfs-opts: {mode: http, host: /}` to get the empty
+  `Host:` header mihomo emits (Go's `Request.Write` blanks an invalid one),
+  but meow sent `Host: /:8443` verbatim. Behind a `dialer-proxy` whose
+  server sniffs HTTP and routes by `Host` (seen with airport VLESS nodes),
+  that sent the flow to a bogus target, so such a Snell or SS node worked in
+  mihomo and failed in meow. A host with a byte outside Go's valid set now
+  yields an empty `Host`, as in mihomo; ordinary hosts are unchanged.
+
+- **`/connections` reports the app that opened a flow**: `metadata.process`,
+  `processPath` and `uid` were blanked when a connection was registered, so
+  an inbound that supplies them (an Android VPN) never showed the owner.
+  They are now kept, as in mihomo.
+
+- **`/connections` shows the node a group actually uses**: a flow whose
+  rule targets a proxy group now records every group's selected member in
+  `chains`, leaf first like mihomo (`["HK-01", "Auto", "Proxy"]`), instead
+  of only the rule's group name, so dashboards and clients can tell which
+  node carries it. The chain is read when the flow is registered by peeking
+  each group's current pick (round-robin does not advance), and is skipped
+  entirely when connection details are not tracked (no external
+  controller).
+
+- **Bare IPv6 nameserver addresses** (#738): an unbracketed IPv6 literal in
+  any nameserver list is now taken as the whole address on the transport's
+  default port. The parser used to split on the last colon first, so
+  `2402:4e00::` failed with `InvalidPort("")` and `::1` / `tls://::1` were
+  read as host `:` on port 1. Bracketed `[addr]:port` keeps its explicit
+  port.
+
+- **LuCI notifications on OpenWrt 23.05 and 24.10.0**: configuration
+  validation/saves, service actions, and client updates no longer report
+  failure after succeeding when `ui.addTimeLimitedNotification()` is
+  unavailable (it first shipped in 24.10.1). Newer LuCI versions keep using
+  the native API; older versions use timed `addNotification()` banners that
+  keep their `info` styling.
+
+- **Proxy-provider startup no longer waits on the feed**: an HTTP
+  provider with a parseable on-disk cache now starts from it without a
+  request and is refetched in the background right after startup (mihomo
+  reads its local file first too); providers without a cache fetch
+  concurrently instead of one after another. A provider whose first fetch
+  fails starts empty and is retried with backoff (5 s doubling to 5 min)
+  until a fetch lands, instead of leaving its `use:` groups empty until
+  `interval` — or for good when it has none. Embedders that must not block
+  their startup on a third-party feed (a mobile VPN cannot bring its tunnel
+  up before `load_config` returns) can bound the wait with
+  `meow_config::set_provider_fetch_deadline`; stragglers then land in the
+  background. Embedders should replace their post-publish
+  `take_deferred_initial` → `acquire_initial` loop with
+  `meow_config::proxy_provider::spawn_deferred_initial_fetches`.
+
+- **Rule-provider startup no longer waits on the feed**: HTTP rule-providers
+  get the same cold-start treatment. A provider with a parseable on-disk
+  cache starts from it without a request, whatever its `interval` (it was
+  remote-first with none), and is revalidated in the background once the
+  cache is older than `interval`. Uncached providers download concurrently
+  and once per startup — each failing provider used to be fetched three
+  times in a row across the load passes, so two unreachable feeds held
+  startup for 45 s instead of 15 s. A provider whose first fetch fails
+  starts empty and is retried with the proxy-provider backoff until a fetch
+  lands, instead of matching nothing until `interval` — or for good when it
+  has none. `set_provider_fetch_deadline` now bounds the rule-provider wait
+  too, and a download still running at the deadline lands in the background.
+  `rule_provider::PrefetchedPayloads` is now a struct (build it with
+  `PrefetchedPayloads::new()` / `insert`, read it with `iter()`); the
+  retries start from `RefreshSupervisor::reconcile`, which embedders already
+  call.
+
+- **TCP benchmark measurements** (issue #746): disable Nagle on the harness
+  client and echo sockets to reduce macOS loopback tail stalls, reject
+  incomplete echoes, and add an interleaved comparison runner with retained
+  samples and a three-trial throughput report.
+
+- **WebSocket tunnel stability**: large and repeated writes now respect
+  bounded sink backpressure, and Ping replies flush correctly when a
+  read-only tunnel recovers from write backpressure.
+- **Mux connection cleanup**: successful TCP and UDP stream opens no longer
+  retain physical connections after idle eviction or pool shutdown.
+- **muxcool UDP compatibility**: reject outgoing datagrams larger than
+  Xray's 8 KiB packet limit before transmission, preserving other streams
+  on the shared mux session.
+
+- **`log-level:` in the config file now applies at startup** (issue #729).
+  The field was parsed into `Config` and echoed by `GET /configs`, but the
+  tracing filter was only ever built from `RUST_LOG` (defaulting to
+  `info`) — a configured `log-level: debug` produced INFO-only output
+  until a runtime `PATCH /configs` set it, and the PATCH was lost on every
+  restart. The configured level is now applied once the raw config is
+  loaded — before `build_config`, so parse/provider diagnostics already
+  respect it — and `PUT /configs` applies the level when the committed
+  document actually changes it, so `GET /configs` can no longer echo a
+  level the process isn't running (unchanged-value commits — e.g. rules
+  or subscription edits — leave a `RUST_LOG` override alone).
+  An explicitly set `RUST_LOG` still takes precedence at startup as the
+  operator override. Values are whitelisted to the accepted level names
+  (the same set `PATCH` enforces) — a typo warns and keeps the current
+  filter instead of reaching `EnvFilter`, where a bare word parses as a
+  `target=TRACE` directive and would silence all logging.
 
 ## [0.22.0] - 2026-10-03
 
@@ -534,23 +706,6 @@ the canonical, in-repo source a release is cut from.
   wholesale-replace became contribution merge; see the #640 fix below.
 
 ### Fixed
-
-- **`log-level:` in the config file now applies at startup** (issue #729).
-  The field was parsed into `Config` and echoed by `GET /configs`, but the
-  tracing filter was only ever built from `RUST_LOG` (defaulting to
-  `info`) — a configured `log-level: debug` produced INFO-only output
-  until a runtime `PATCH /configs` set it, and the PATCH was lost on every
-  restart. The configured level is now applied once the raw config is
-  loaded — before `build_config`, so parse/provider diagnostics already
-  respect it — and `PUT /configs` applies the level when the committed
-  document actually changes it, so `GET /configs` can no longer echo a
-  level the process isn't running (unchanged-value commits — e.g. rules
-  or subscription edits — leave a `RUST_LOG` override alone).
-  An explicitly set `RUST_LOG` still takes precedence at startup as the
-  operator override. Values are whitelisted to the accepted level names
-  (the same set `PATCH` enforces) — a typo warns and keeps the current
-  filter instead of reaching `EnvFilter`, where a bare word parses as a
-  `target=TRACE` directive and would silence all logging.
 
 - **XTLS Vision: a padded-mode FIN is no longer misreported as a relay
   error.** Vision has no end-of-stream frame — a peer that is done simply

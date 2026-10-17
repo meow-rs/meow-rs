@@ -98,9 +98,21 @@ impl SocketIo for UdpSocket {
             // traffic class raw. `& 0xff` mirrors the kernel's u8 TOS store
             // for a >63 value.
             let _ = sock.set_tos(((dscp as u32) << 2) & 0xff);
-            // `set_tclass_v6` is unix-only in socket2 — on Windows the
-            // IPv6 DSCP is simply not applied (best-effort like the rest).
-            #[cfg(unix)]
+            // socket2 only has `set_tclass_v6` on the targets listed here
+            // (not on Windows, iOS or tvOS); elsewhere the IPv6 DSCP is
+            // simply not applied (best-effort like the rest). Keep the list
+            // in step with socket2's own `cfg` on that method.
+            #[cfg(any(
+                target_os = "android",
+                target_os = "cygwin",
+                target_os = "dragonfly",
+                target_os = "freebsd",
+                target_os = "fuchsia",
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "netbsd",
+                target_os = "openbsd",
+            ))]
             let _ = sock.set_tclass_v6(dscp as u32);
         }
     }

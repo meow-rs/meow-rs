@@ -208,7 +208,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/rules/{index}", delete(delete_rule))
         .route("/rules/reorder", post(reorder_rules))
         .route("/connections", get(get_connections))
-        .route("/connections/{id}", delete(close_connection))
+        .route(
+            "/connections/{id}",
+            get(get_connection).delete(close_connection),
+        )
         .route("/connections", delete(close_all_connections))
         .route(
             "/configs",
@@ -216,6 +219,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         )
         .route("/metrics", get(get_metrics))
         .route("/traffic", get(get_traffic))
+        .route("/statistics", get(get_statistics))
         .route("/logs", get(get_logs))
         .route("/memory", get(get_memory))
         .route("/dns/results", get(get_dns_results))
@@ -617,6 +621,19 @@ async fn get_connections(
     ([(header::CONTENT_TYPE, "application/json")], body).into_response()
 }
 
+/// One live or recently closed connection with its notes (a meow
+/// extension; mihomo only has `DELETE` here). Closed connections stay
+/// readable only when they recorded notes, until the ring ages them out.
+async fn get_connection(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    let Ok(uuid) = uuid::Uuid::parse_str(&id) else {
+        return msg_err(StatusCode::BAD_REQUEST, "Body invalid");
+    };
+    match state.tunnel.statistics().connection_detail(uuid) {
+        Some(detail) => Json(detail).into_response(),
+        None => msg_err(StatusCode::NOT_FOUND, "Resource not found"),
+    }
+}
+
 async fn close_connection(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -847,6 +864,40 @@ async fn get_traffic(
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from_stream(stream))
         .expect("valid traffic stream response")
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StatisticsResponse {
+    upload_total: meow_common::atomic::Int,
+    download_total: meow_common::atomic::Int,
+    proxies: BTreeMap<Arc<str>, ProxyTotals>,
+}
+
+#[derive(Serialize)]
+struct ProxyTotals {
+    upload: meow_common::atomic::Int,
+    download: meow_common::atomic::Int,
+}
+
+/// `GET /statistics` (meow extension, no mihomo equivalent): the byte totals
+/// and what each proxy carried since the tunnel started, TCP and UDP. A
+/// group's traffic is counted at the member that carried it, so `proxies`
+/// holds the leaves a flow ended at; a proxy stays listed after a reload
+/// removes it. Empty `proxies` when the tunnel runs headless.
+async fn get_statistics(State(state): State<Arc<AppState>>) -> Json<StatisticsResponse> {
+    let stats = state.tunnel.statistics();
+    let (upload_total, download_total) = stats.snapshot();
+    let proxies = stats
+        .proxy_traffic()
+        .into_iter()
+        .map(|(name, (upload, download))| (name, ProxyTotals { upload, download }))
+        .collect();
+    Json(StatisticsResponse {
+        upload_total,
+        download_total,
+        proxies,
+    })
 }
 
 #[derive(Deserialize)]
@@ -1114,6 +1165,7 @@ async fn apply_raw_to_tunnel(
         CONFIG_MUTATION.try_lock().is_err(),
         "caller must hold the CONFIG_MUTATION lane"
     );
+    let connection_notes = raw.connection_notes.unwrap_or(false);
     let expected_groups: Vec<String> = raw
         .proxy_groups
         .as_deref()
@@ -1209,6 +1261,7 @@ async fn apply_raw_to_tunnel(
         install_resolver_everywhere(&state.tunnel, state.dns_server.as_ref(), dns);
     }
     state.tunnel.update_routing(proxies, rules, dialer_registry);
+    state.tunnel.set_connection_notes(connection_notes);
     // Commit point reached: every fallible check passed. The candidate's
     // provider sets become the live registries — the rules and DNS
     // `rule-set:` matchers installed above already reference these Arcs
@@ -1308,22 +1361,23 @@ pub fn commit_proxy_providers(
         // a newly declared name inserts fresh, and a re-declared name whose
         // definition changed carries a rebuilt provider that has never
         // fetched (issue #533 review).
-        let needs_fetch = match registry.insert(name.clone(), Arc::clone(provider)) {
-            Some(prev) => !Arc::ptr_eq(&prev, provider),
-            None => true,
-        };
-        if needs_fetch {
-            let provider = Arc::clone(provider);
-            let name = name.clone();
-            // `acquire_initial`, not `refresh`: a freshly committed
-            // provider has an empty slot, so the on-disk cache fallback
-            // (offline bootstrap) applies — refresh ticks deliberately
-            // skip it to keep the in-memory last-good set.
-            tokio::spawn(async move {
-                if let Err(e) = provider.acquire_initial().await {
-                    tracing::warn!("proxy-provider '{name}': initial fetch failed: {e}");
-                }
-            });
+        //
+        // Detached on purpose: this runs inside the `CONFIG_MUTATION` lane,
+        // where an awaited download would serialize every other commit
+        // behind one slow or blackholed provider URL — the same reason ECH
+        // preresolution is kept out of `apply_raw_to_tunnel` (issue #533
+        // review). A node this build cannot parse can no longer reject the
+        // payload (it binds an unavailable placeholder instead), so there
+        // is nothing here for a pre-commit await to gate.
+        let reused = registry
+            .insert(name.clone(), Arc::clone(provider))
+            .is_some_and(|previous| Arc::ptr_eq(&previous, provider));
+        if !reused {
+            // A freshly committed provider has an empty slot: serve its
+            // on-disk cache first (offline bootstrap — refresh ticks
+            // deliberately skip it to keep the in-memory last-good set),
+            // then fetch the remote, retrying with backoff.
+            provider.spawn_initial_fetch();
         } else if provider.take_deferred_initial() {
             // A reused provider whose `proxy:` could not resolve before
             // this commit's map was published — the name may resolve now,
@@ -3155,6 +3209,9 @@ async fn put_configs(
     let dropped = state
         .tunnel
         .reload_routing(proxies, rules, mode, dialer_registry);
+    state
+        .tunnel
+        .set_connection_notes(raw_config.connection_notes.unwrap_or(false));
     if dropped > 0 {
         tracing::warn!(
             connections_dropped = dropped,
@@ -4508,10 +4565,16 @@ mod global_route_binding_tests {
     }
 
     /// A candidate whose rebuild fetches a rule-provider from `origin`.
+    /// Rule-providers load cache-first, so each candidate names a fresh
+    /// cache file — the one an earlier PUT's fetch wrote would otherwise
+    /// satisfy the rebuild without a request.
     fn candidate(tun: &str, origin: &RecordingOrigin, tail: &str) -> String {
+        static CANDIDATES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = CANDIDATES.fetch_add(1, Ordering::Relaxed);
         format!(
             "mode: rule\n{tun}rule-providers:\n  p:\n    type: http\n    behavior: domain\n    \
-             url: http://{}/rules.yaml\nrules:\n  - MATCH,DIRECT\n{tail}",
+             url: http://{}/rules.yaml\n    path: ./rule-providers/p-{n}.yaml\n\
+             rules:\n  - MATCH,DIRECT\n{tail}",
             origin.addr
         )
     }

@@ -5,6 +5,7 @@
 'require rpc';
 'require uci';
 'require ui';
+'require tools.meow as meow';
 
 // LAN clients known to this router. The main control is a per-client proxy
 // bypass: ticked MACs are stored as `tproxy.bypass_mac` in /etc/config/meow and
@@ -323,7 +324,7 @@ return view.extend({
 					return fs.exec('/etc/init.d/meow-arp', [ 'restart' ]).catch(function() {});
 			})
 			.then(function() {
-				ui.addTimeLimitedNotification(null, E('p', arpEnabled
+				meow.addTimeLimitedNotification(null, E('p', arpEnabled
 					? _('Bypassing %d client(s); steering %d.').format(bypass.length, steer.length)
 					: _('Bypassing %d client(s); steering disabled.').format(bypass.length)), 4000, 'info');
 			})

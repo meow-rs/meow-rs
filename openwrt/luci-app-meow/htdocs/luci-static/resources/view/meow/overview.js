@@ -151,7 +151,7 @@ return view.extend({
 		}).then(function(running) {
 			if (running !== want)
 				throw new Error(want ? _('meow did not start; see the Log tab.') : _('meow is still running.'));
-			ui.addTimeLimitedNotification(null, E('p', {
+			meow.addTimeLimitedNotification(null, E('p', {
 				start: _('meow started.'), stop: _('meow stopped.'), restart: _('meow restarted.')
 			}[action]), 3000, 'info');
 		}).catch(function(e) {

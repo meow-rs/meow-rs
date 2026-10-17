@@ -12,6 +12,7 @@ refactor/cleanup-2026-05 work (M1 + M2).
 | [footprint-alloc-baseline.md](footprint-alloc-baseline.md) | dhat peak live 2.93 MB; top allocation sites: Statistics::track_connection (~36 B/conn), Metadata alloc (~24 B/conn), relay CopyBuffer (~8 KiB/conn × 2) |
 | [m1-addendum-lint-probe.md](m1-addendum-lint-probe.md) | All 9 allocation lints = 0 hits at M2 open (after M1 hygiene work) |
 | [smallvec-audit-findings.md](smallvec-audit-findings.md) | Task #37 null result: all candidates regress; element types ≥ 16 B make SmallVec a size loss |
+| [tcp-throughput-746.md](tcp-throughput-746.md) | Issue #746 harness socket fix and repeated TCP comparisons |
 | [hardware.md](hardware.md) | Reference bench host spec |
 | [methodology.md](methodology.md) | Measurement methodology and workload definitions |
 | [binary-size.md](binary-size.md) | Stripped binary sizes by profile + target (ADR-0007 caps); §Post-mux (#412 stack, issue #426) records the post-mux `default` size and isolates the mux-attributable delta (~173–222 KiB) on aarch64/x86_64 — no cap breached, mipsel blocked by #421 |

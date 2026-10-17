@@ -11,6 +11,9 @@ const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 pub async fn socks5_connect(proxy: SocketAddr, target: SocketAddr) -> std::io::Result<TcpStream> {
     tokio::time::timeout(CONNECT_TIMEOUT, async {
         let mut stream = TcpStream::connect(proxy).await?;
+        // Keep the load generator from adding Nagle/delayed-ACK stalls to the
+        // proxy measurement, including immediately after the SOCKS handshake.
+        stream.set_nodelay(true)?;
 
         // Auth negotiation: version 5, 1 method, no-auth (0x00)
         stream.write_all(&[0x05, 0x01, 0x00]).await?;
@@ -87,6 +90,9 @@ async fn socks5_connect_domain_inner(
     port: u16,
 ) -> std::io::Result<TcpStream> {
     let mut stream = TcpStream::connect(proxy).await?;
+    // Keep the load generator from adding Nagle/delayed-ACK stalls to the
+    // proxy measurement, including immediately after the SOCKS handshake.
+    stream.set_nodelay(true)?;
 
     stream.write_all(&[0x05, 0x01, 0x00]).await?;
 

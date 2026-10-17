@@ -4,9 +4,14 @@
 //! UID rules. It receives the connection's local (client-side) address and
 //! returns the owning process, if any. Returns `None` on platforms that are
 //! not yet supported (everything except Linux, macOS and Windows).
+//!
+//! An embedder whose inbound can name a flow's owner itself (an Android VPN)
+//! fills those `Metadata` fields before dispatch instead, and says so with
+//! [`enable_inbound_process_info`].
 
 use crate::network::Network;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// `true` on platforms with a real [`find_process`] implementation
 /// (Linux / macOS / Windows); `false` where it is a stub that always
@@ -18,6 +23,43 @@ pub const PROCESS_LOOKUP_SUPPORTED: bool = cfg!(any(
     target_os = "macos",
     target_os = "windows"
 ));
+
+/// Set by [`enable_inbound_process_info`].
+static INBOUND_PROCESS_INFO: AtomicBool = AtomicBool::new(false);
+
+/// Declare that this embedder's inbound fills `Metadata::process`,
+/// `process_path` and/or `uid` itself before dispatch.
+///
+/// For platforms where [`find_process`] is a stub but the embedder can
+/// still name a flow's owner: an Android VPN asks
+/// `ConnectivityManager.getConnectionOwnerUid` with the app socket's
+/// original 4-tuple, which only its TUN inbound sees (fake-IP handling
+/// drops the original destination before rule matching). With it,
+/// PROCESS-NAME / PROCESS-PATH / UID rules stay live there and match the
+/// supplied fields as they are; without it they are folded dead (#625).
+///
+/// Liveness is decided when rules are built, so call this before the first
+/// config load. One-way: rules built while it was on would stay live anyway.
+pub fn enable_inbound_process_info() {
+    INBOUND_PROCESS_INFO.store(true, Ordering::Relaxed);
+}
+
+/// Whether `Metadata::process` / `process_path` can ever be populated here:
+/// by a native [`find_process`], or by an inbound that supplies them
+/// ([`enable_inbound_process_info`]). Gates PROCESS-NAME / PROCESS-PATH
+/// deadness; the demand for a native lookup stays on
+/// [`PROCESS_LOOKUP_SUPPORTED`].
+pub fn process_info_available() -> bool {
+    PROCESS_LOOKUP_SUPPORTED || INBOUND_PROCESS_INFO.load(Ordering::Relaxed)
+}
+
+/// Whether UID rules can match here: on Linux by policy (Class B per
+/// ADR-0002; the macOS lookup fills `uid` too, but the rule stays dead
+/// there), or wherever an inbound supplies `uid`
+/// ([`enable_inbound_process_info`]).
+pub fn uid_info_available() -> bool {
+    cfg!(target_os = "linux") || INBOUND_PROCESS_INFO.load(Ordering::Relaxed)
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct ProcessInfo {
@@ -909,5 +951,20 @@ mod tests {
             // u64::MAX never matches a real inode; the miss is cached.
             assert!(platform::find_pid_by_inode_cached(u64::MAX).is_none());
         }
+    }
+}
+
+#[cfg(test)]
+mod inbound_tests {
+    use super::*;
+
+    // The only test that sets the flag: it is process-global and one-way,
+    // and the dead-off-platform assertions in meow-rules / meow-tunnel run
+    // in other binaries.
+    #[test]
+    fn inbound_process_info_keeps_process_and_uid_rules_live() {
+        enable_inbound_process_info();
+        assert!(process_info_available());
+        assert!(uid_info_available());
     }
 }

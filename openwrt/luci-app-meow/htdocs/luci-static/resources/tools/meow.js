@@ -3,6 +3,7 @@
 'require rpc';
 'require fs';
 'require uci';
+'require ui';
 
 // Shared helpers for the meow LuCI views. Runtime data comes straight from
 // the meow REST API through authenticated LuCI RPC. The standalone panel
@@ -16,6 +17,21 @@ var callServiceList = rpc.declare({
 });
 
 return baseclass.extend({
+	// Prefer LuCI's native timed notification API; OpenWrt 23.05 and 24.10.0
+	// lack it and need a local timer. 24.10.0's addNotification(title,
+	// children, timeout, ...classes) takes `type` as a (non-numeric, ignored)
+	// timeout, so set the class explicitly; classList.add is idempotent.
+	addTimeLimitedNotification: function(title, children, timeout, type) {
+		if (typeof ui.addTimeLimitedNotification === 'function')
+			return ui.addTimeLimitedNotification(title, children, timeout, type);
+
+		var notification = ui.addNotification(title, children, type);
+		if (type)
+			notification.classList.add(type);
+		setTimeout(function() { notification.remove(); }, timeout);
+		return notification;
+	},
+
 	apiBase: function() {
 		var port = uci.get('meow', 'main', 'panel_port') || '9090';
 		return 'http://' + window.location.hostname +

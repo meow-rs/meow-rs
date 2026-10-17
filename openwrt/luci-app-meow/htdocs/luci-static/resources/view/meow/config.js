@@ -71,7 +71,7 @@ return view.extend({
 			if (err)
 				ui.addNotification(_('Invalid configuration'), E('pre', {}, err), 'error');
 			else
-				ui.addTimeLimitedNotification(null, E('p', _('Configuration test passed')), 3000, 'info');
+				meow.addTimeLimitedNotification(null, E('p', _('Configuration test passed')), 3000, 'info');
 		}).catch(function(e) {
 			ui.addNotification(null, E('p', _('Unable to validate: %s').format(e.message)), 'error');
 		});
@@ -109,7 +109,7 @@ return view.extend({
 						});
 					});
 				}).then(function(restarted) {
-					ui.addTimeLimitedNotification(null, E('p', restarted
+					meow.addTimeLimitedNotification(null, E('p', restarted
 						? _('Configuration saved and service restarted.')
 						: _('Configuration saved; service remains stopped.')), 5000, 'info');
 				}).catch(function(error) {

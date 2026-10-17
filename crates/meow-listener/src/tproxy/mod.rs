@@ -612,7 +612,7 @@ async fn handle_tproxy_flow(
         proxy.name()
     );
 
-    let Some(_guard) = admission.track_named(&metadata, rule_name, rule_payload, proxy.name())
+    let Some(_guard) = admission.track_named(&metadata, rule_name, rule_payload, proxy.as_ref())
     else {
         return Ok(());
     };

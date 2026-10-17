@@ -475,3 +475,70 @@ async fn raw_http_save(port: u16) -> std::io::Result<u16> {
         .unwrap_or(0);
     Ok(status)
 }
+
+/// A provider payload this build cannot fully parse must not stop the daemon
+/// from starting (issue #625). Every official `full` release is built without
+/// `--features trusttunnel`, so a payload-level rejection would brick startup
+/// on a config its operator cannot repair by editing anything — and because a
+/// third-party payload is refetched on a timer, it would also hand that
+/// payload's operator a daemon-wide kill switch. The unparseable node keeps
+/// its slot as a dead placeholder instead (covered in
+/// `meow-config`'s `trusttunnel_config_test`), and the fetch stays detached
+/// and behind the listeners.
+#[tokio::test]
+async fn deferred_trusttunnel_provider_does_not_block_startup_or_listeners() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = origin.local_addr().unwrap();
+    let served = std::sync::Arc::new(AtomicUsize::new(0));
+    let count = std::sync::Arc::clone(&served);
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = origin.accept().await.unwrap();
+            let mut buffer = [0; 2048];
+            let _ = stream.read(&mut buffer).await.unwrap();
+            count.fetch_add(1, Ordering::SeqCst);
+            let body = "proxies:\n  - {name: invalid, type: trusttunnel, server: vpn.example.test, port: 443, username: fixture, password: test-only, quic: true}\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        }
+    });
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("config.yaml");
+    let port = free_port();
+    std::fs::write(&config, format!(
+        "mixed-port: {port}\nallow-lan: false\ndns: {{enable: false}}\nproxies: [{{name: front, type: direct}}]\nproxy-providers:\n  p:\n    type: http\n    url: http://{address}/proxies.yaml\n    proxy: front\nproxy-groups: [{{name: G, type: select, use: [p]}}]\nrules: ['MATCH,G']\n"
+    )).unwrap();
+    let mut child = spawn_meow(
+        &["-f".into(), config.to_string_lossy().into_owned()],
+        directory.path(),
+    );
+    wait_api(port, &mut child).await;
+    let fetched = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while served.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+    assert!(
+        fetched.is_ok(),
+        "the detached acquisition must still fetch through the configured front"
+    );
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "one unparseable provider node must not abort the daemon"
+    );
+    assert!(
+        tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_ok(),
+        "the listener must keep serving"
+    );
+    let _ = child.kill().await;
+    server.abort();
+}

@@ -20,6 +20,9 @@ pub mod stream_conn;
 #[cfg(any(feature = "vmess", feature = "vless-encryption"))]
 pub(crate) mod tasked_duplex;
 pub mod transport_chain;
+#[cfg(feature = "trusttunnel")]
+pub mod trusttunnel;
+pub mod unavailable;
 
 #[cfg(feature = "ech-tls-tunnel")]
 pub mod ech_tls_tunnel;
@@ -90,6 +93,7 @@ pub use stream_conn::StreamConn;
 pub use transport_chain::TransportChain;
 #[cfg(feature = "trojan")]
 pub use trojan::TrojanAdapter;
+pub use unavailable::UnavailableAdapter;
 
 #[cfg(feature = "vless")]
 pub use vless_adapter::{VlessAdapter, VlessFlow};

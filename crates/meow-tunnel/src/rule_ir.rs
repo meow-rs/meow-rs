@@ -267,7 +267,13 @@ pub enum LazyMatchOutcome<'a> {
     /// emitted — returning this variant without the strict re-run loses
     /// them permanently. The re-scan re-derives each skipped match and
     /// warns exactly once.
-    NeedsEnrichment { needs_ip: bool, needs_process: bool },
+    ///
+    /// `blocked_rule` is the source index of the rule the scan stopped at.
+    NeedsEnrichment {
+        needs_ip: bool,
+        needs_process: bool,
+        blocked_rule: usize,
+    },
     /// No rule matched (and no slot was blocked on missing metadata).
     NoMatch,
 }
@@ -803,6 +809,7 @@ impl CompiledRuleSet {
         LazyMatchOutcome::NeedsEnrichment {
             needs_ip,
             needs_process,
+            blocked_rule: self.slots[from_pos].rule_index as usize,
         }
     }
 
@@ -1235,22 +1242,23 @@ fn star_rest(payload: &str) -> Option<String> {
 /// Ops that are compile-time-provably false on this platform.
 fn op_never_matches(op: &RuleOp) -> bool {
     match op {
-        // `uid_matches` is a constant `false` off Linux — UID matching is
-        // Linux-only by policy even though e.g. the macOS lookup does
-        // populate `metadata.uid` (Class B per ADR-0002, uid.rs).
-        RuleOp::Uid(_) => cfg!(not(target_os = "linux")),
+        // `uid_matches` is a constant `false` off Linux unless the inbound
+        // supplies `uid` — UID matching is Linux-only by policy even though
+        // e.g. the macOS lookup does populate `metadata.uid` (Class B per
+        // ADR-0002, uid.rs).
+        RuleOp::Uid(_) => !meow_common::process_lookup::uid_info_available(),
         // An empty range set can never contain an address (GEOIP /
         // SRC-GEOIP / IP-ASN payloads absent from the loaded index land
         // here when nested inside a live composite).
         RuleOp::IpRanges { set, .. } => set.is_empty(),
         // `find_process` is a stub returning `None` outside
-        // linux/macos/windows, so `metadata.process` / `process_path`
-        // stay empty forever there. PROCESS-PATH never matches an empty
-        // path; PROCESS-NAME only does on the empty-payload quirk, which
-        // is preserved, not folded.
-        RuleOp::ProcessPath(_) => !meow_common::process_lookup::PROCESS_LOOKUP_SUPPORTED,
+        // linux/macos/windows, so unless the inbound supplies them
+        // `metadata.process` / `process_path` stay empty forever there.
+        // PROCESS-PATH never matches an empty path; PROCESS-NAME only does
+        // on the empty-payload quirk, which is preserved, not folded.
+        RuleOp::ProcessPath(_) => !meow_common::process_lookup::process_info_available(),
         RuleOp::ProcessName(payload) => {
-            !meow_common::process_lookup::PROCESS_LOOKUP_SUPPORTED && !payload.is_empty()
+            !meow_common::process_lookup::process_info_available() && !payload.is_empty()
         }
         _ => false,
     }
@@ -1992,15 +2000,7 @@ fn process_path_matches(op: &ProcessPathOp, process_path: &str) -> bool {
 }
 
 fn uid_matches(metadata: &Metadata, uid: u32) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        metadata.uid == Some(uid)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (metadata, uid);
-        false
-    }
+    meow_common::process_lookup::uid_info_available() && metadata.uid == Some(uid)
 }
 
 #[cfg(test)]
@@ -3244,6 +3244,7 @@ mod tests {
             LazyMatchOutcome::NeedsEnrichment {
                 needs_ip,
                 needs_process,
+                ..
             } => {
                 assert!(needs_ip);
                 assert!(!needs_process);
@@ -3771,6 +3772,7 @@ mod tests {
             LazyMatchOutcome::NeedsEnrichment {
                 needs_ip,
                 needs_process,
+                ..
             } => {
                 assert!(!needs_ip);
                 assert!(needs_process);

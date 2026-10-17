@@ -11,6 +11,8 @@ function load(config, dhcpHosts = []) {
   const store = JSON.parse(JSON.stringify(config));
   const writes = [];
   const execs = [];
+  const notifications = [];
+  const timers = [];
   const E = (tag, attrs, children) => {
     const node = { tag, attrs: attrs || {}, children, style: {} };
     if (tag === 'input') node.checked = node.attrs.checked === '';
@@ -26,21 +28,35 @@ function load(config, dhcpHosts = []) {
     apply: async () => {}
   };
   const modules = {
+    baseclass: { extend: x => x },
     view: { extend: x => x },
     fs: { exec: async (...args) => { execs.push(args); return { code: 0 }; } },
     rpc: { declare: () => async () => ({}) },
     uci,
-    ui: { createHandlerFn: () => () => {}, addTimeLimitedNotification: () => {}, addNotification: () => {} }
+    ui: {
+      createHandlerFn: () => () => {},
+      addNotification: (...args) => {
+        notifications.push(args);
+        return { classList: { add() {} }, remove() {} };
+      }
+    }
   };
-  const source = readFileSync(join(root, 'view/meow/clients.js'), 'utf8');
-  const scope = { _: x => x, E, L: { resolveDefault: p => p } };
-  for (const [, path] of source.matchAll(/'require ([\w.]+)';/g)) scope[path] = modules[path];
-  // LuCI adds String.prototype.format; emulate %d/%s substitution.
-  const view = vm.runInNewContext(
-    'String.prototype.format = function() { var a = arguments, i = 0; ' +
-    'return this.replace(/%[ds]/g, function() { return a[i++]; }); };' +
-    '(function() {' + source + '\n})()', scope);
-  return { view, store, writes, execs };
+  function loadModule(file) {
+    const source = readFileSync(join(root, file), 'utf8');
+    const scope = { _: x => x, E, L: { resolveDefault: p => p },
+      setTimeout: (callback, timeout) => { timers.push({ callback, timeout }); } };
+    for (const [, path, alias] of source.matchAll(/'require ([\w.]+)(?: as (\w+))?';/g)) {
+      scope[alias || path] = modules[path];
+    }
+    // LuCI adds String.prototype.format; emulate %d/%s substitution.
+    return vm.runInNewContext(
+      'String.prototype.format = function() { var a = arguments, i = 0; ' +
+      'return this.replace(/%[ds]/g, function() { return a[i++]; }); };' +
+      '(function() {' + source + '\n})()', scope);
+  }
+  modules['tools.meow'] = loadModule('tools/meow.js');
+  const view = loadModule('view/meow/clients.js');
+  return { view, store, writes, execs, notifications, timers };
 }
 
 const hints = {
@@ -98,7 +114,7 @@ test('Steer column is hidden unless ARP steering is enabled', () => {
 
 test('Save writes lowercase bypass MACs and keeps hidden steer selections', async () => {
   const cfg = { ...base, arp: { enabled: '1', client: ['aa:bb:cc:00:00:02'] } };
-  const { view, store, execs } = load(cfg);
+  const { view, store, execs, notifications } = load(cfg);
   view.render([null, null, hints, leases]);
   view.bypassChecks['aa:bb:cc:00:00:01'].checked = true;
   view.arpToggle.checked = false;
@@ -107,6 +123,7 @@ test('Save writes lowercase bypass MACs and keeps hidden steer selections', asyn
   assert.equal(store.arp.enabled, '0');
   assert.deepEqual(plain(store.arp.client), ['aa:bb:cc:00:00:02']);
   assert.deepEqual(plain(execs), [['/etc/init.d/meow-arp', ['restart']]]);
+  assert.deepEqual(notifications.map(n => n[2]), ['info']);
 });
 
 test('Save unsets bypass_mac when nothing is ticked and skips the ARP restart', async () => {

@@ -115,6 +115,17 @@ pub fn parse_proxy(
     parse_proxy_with_dialer(config, &dialer, ipv6)
 }
 
+/// A TT node that fails to parse must stay *bound* even in lenient mode —
+/// to a dead placeholder, never dropped. Dropping the requested transport
+/// can make a group select DIRECT, i.e. send the flow out in plaintext.
+/// This check deliberately remains available when the feature is disabled.
+pub(crate) fn node_is_trusttunnel(config: &HashMap<String, serde_yaml::Value>) -> bool {
+    config
+        .get("type")
+        .and_then(serde_yaml::Value::as_str)
+        .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("trusttunnel"))
+}
+
 /// Whether `config` describes an `ss` node whose `plugin:` names an external
 /// SIP003 executable — i.e. one that would reach `Command::new` during
 /// adapter construction. Gates untrusted node sources (proxy-providers,
@@ -186,6 +197,8 @@ pub fn parse_proxy_with_dialer(
         .ok_or("missing proxy type")?;
 
     match proxy_type {
+        #[cfg(feature = "trusttunnel")]
+        "trusttunnel" => parse_trusttunnel(name, config, dialer),
         #[cfg(feature = "ss")]
         "ss" => {
             let server = config
@@ -357,6 +370,8 @@ pub fn parse_proxy_with_dialer(
             let adapter = parse_snell(name, config, dialer)?;
             Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
         }
+        #[cfg(not(feature = "trusttunnel"))]
+        "trusttunnel" => Err(feature_gated_proxy_type("trusttunnel")),
         #[cfg(not(feature = "ss"))]
         "ss" => Err(feature_gated_proxy_type("ss")),
         #[cfg(not(feature = "trojan"))]
@@ -371,6 +386,19 @@ pub fn parse_proxy_with_dialer(
         "vmess" => Err(feature_gated_proxy_type("vmess")),
         #[cfg(not(feature = "snell"))]
         "snell" => Err(feature_gated_proxy_type("snell")),
+        // `node_is_trusttunnel` trims and ignores case; this dispatch is
+        // exact, like mihomo's. Without this arm a ` trusttunnel ` or
+        // `TrustTunnel` node reports a generic "unsupported proxy type"
+        // while still being *treated* as a TT node by that gate — name the
+        // actual defect instead of leaving two strings to diff by eye.
+        _ if proxy_type != "trusttunnel"
+            && proxy_type.trim().eq_ignore_ascii_case("trusttunnel") =>
+        {
+            Err(format!(
+                "proxy type {proxy_type:?} must be spelled exactly \"trusttunnel\" \
+                 — lowercase, with no surrounding whitespace"
+            ))
+        }
         _ => Err(format!("unsupported proxy type: {proxy_type}")),
     }
 }
@@ -426,9 +454,13 @@ fn reject_unthreaded_dialer(
     feature = "anytls",
     feature = "hysteria2",
     feature = "vmess",
-    feature = "snell"
+    feature = "snell",
+    feature = "trusttunnel"
 )))]
 fn feature_gated_proxy_type(proxy_type: &str) -> String {
+    if proxy_type == "trusttunnel" {
+        return "proxy type 'trusttunnel' is not compiled into this build; rebuild with `--features trusttunnel` (the protocol is opt-in and excluded from full)".into();
+    }
     format!(
         "proxy type '{proxy_type}' is not compiled into this build; \
          use an official release binary or rebuild with `--features full` \
@@ -842,6 +874,226 @@ fn parse_direct(
     }
 
     Ok(adapter)
+}
+
+/// Parse the TrustTunnel schema shared by static and provider nodes.
+/// Unsupported transport and TLS policies fail before adapter construction.
+/// `quic: true` selects HTTP/3 and needs the `trusttunnel-h3` feature.
+#[cfg(feature = "trusttunnel")]
+fn parse_trusttunnel(
+    name: &str,
+    config: &HashMap<String, serde_yaml::Value>,
+    dialer: &Arc<dyn meow_proxy::dialer::TcpDialer>,
+) -> std::result::Result<Arc<dyn Proxy>, String> {
+    let required = |key: &str| {
+        config
+            .get(key)
+            .and_then(serde_yaml::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("trusttunnel: missing {key}"))
+    };
+    let boolean = |key: &str, default: bool| -> std::result::Result<bool, String> {
+        match config.get(key) {
+            None | Some(serde_yaml::Value::Null) => Ok(default),
+            Some(value) => value
+                .as_bool()
+                .ok_or_else(|| format!("trusttunnel: {key} must be boolean")),
+        }
+    };
+    let quic = boolean("quic", false)?;
+    #[cfg(not(feature = "trusttunnel-h3"))]
+    if quic {
+        return Err("trusttunnel: `quic: true` selects the HTTP/3 transport, which is not compiled into this build; rebuild with `--features trusttunnel-h3`".into());
+    }
+    if quic {
+        // QUIC carries its own UDP socket, so there is no TCP connection for
+        // a `dialer-proxy` chain to carry (same reason hysteria2 refuses it).
+        reject_unthreaded_dialer(name, "trusttunnel", dialer)?;
+    }
+    let nonempty = |field: &str| {
+        config.get(field).is_some_and(|value| match value {
+            serde_yaml::Value::Null => false,
+            serde_yaml::Value::String(text) => !text.is_empty(),
+            serde_yaml::Value::Sequence(list) => !list.is_empty(),
+            serde_yaml::Value::Mapping(map) => !map.is_empty(),
+            _ => true,
+        })
+    };
+    // These TLS declarations are not wired into this adapter. Reject
+    // them before construction instead of silently weakening policy.
+    for field in [
+        "certificate",
+        "private-key",
+        "fingerprint",
+        "cert-fingerprint",
+        "reality-opts",
+        "ech-opts",
+        "curve-preferences",
+        "ca",
+        "ca-str",
+    ] {
+        if nonempty(field) {
+            return Err(format!(
+                "trusttunnel: this client does not implement the {field} policy"
+            ));
+        }
+    }
+    for field in ["bbr-profile", "bbr-opts", "congestion-controller", "cwnd"] {
+        if nonempty(field) {
+            return Err(format!(
+                "trusttunnel: this client does not implement the QUIC option {field}"
+            ));
+        }
+    }
+    if quic {
+        // Both are TLS policies the QUIC path structurally cannot honor:
+        // there is no uTLS ClientHello shaping over quiche, and quiche
+        // installs one name as *both* the SNI and the certificate's verify
+        // hostname, so they cannot differ. Refusing beats silently dropping
+        // a policy the operator asked for.
+        for field in ["client-fingerprint", "name-cert-verify"] {
+            if nonempty(field) {
+                return Err(format!(
+                    "trusttunnel: the HTTP/3 transport cannot honor {field}"
+                ));
+            }
+        }
+    }
+    let expected_alpn = if quic { "h3" } else { "h2" };
+    if let Some(alpn) = config.get("alpn").filter(|value| !value.is_null()) {
+        if !alpn.as_sequence().is_some_and(|list| {
+            list.is_empty() || (list.len() == 1 && list[0].as_str() == Some(expected_alpn))
+        }) {
+            return Err(format!(
+                "trusttunnel: selected transport requires alpn: [{expected_alpn}]"
+            ));
+        }
+    }
+    let text = |key: &str| -> std::result::Result<Option<&str>, String> {
+        match config.get(key) {
+            None | Some(serde_yaml::Value::Null) => Ok(None),
+            Some(value) => value
+                .as_str()
+                .map(Some)
+                .ok_or_else(|| format!("trusttunnel: {key} must be a string")),
+        }
+    };
+    let server = required("server")?;
+    let mut tls = meow_transport::tls::TlsConfig::new(
+        text("sni")?.filter(|s| !s.is_empty()).unwrap_or(server),
+    );
+    tls.skip_cert_verify = boolean("skip-cert-verify", false)?;
+    tls.verify_name = text("name-cert-verify")?
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    tls.fingerprint = text("client-fingerprint")?
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    let mut options = meow_proxy::trusttunnel::Options::new(
+        required("username")?.into(),
+        required("password")?.into(),
+    );
+    let number = |key: &str, default: usize| -> std::result::Result<usize, String> {
+        match config.get(key) {
+            None | Some(serde_yaml::Value::Null) => Ok(default),
+            Some(v) => v
+                .as_u64()
+                .and_then(|n| usize::try_from(n).ok())
+                .ok_or_else(|| format!("trusttunnel: invalid {key}")),
+        }
+    };
+    let max_connections = number("max-connections", 0)?;
+    let min_streams = number("min-streams", 0)?;
+    let max_streams = number("max-streams", 0)?;
+    // Each field is independently optional: an absent or zero one keeps its
+    // `Options::new` default (8 connections / 5 active streams / 128 hard
+    // per-session ceiling) instead of zeroing it. A `min_streams` of 0 means
+    // "only ever reuse a fully idle session", i.e. one physical TLS + H2
+    // handshake per concurrent dial — so writing a field explicitly must
+    // never perform worse than leaving it out.
+    if max_connections != 0 {
+        options.max_connections = max_connections;
+    }
+    if min_streams != 0 {
+        options.min_streams = min_streams;
+    }
+    if max_streams != 0 {
+        if max_connections == 0 && min_streams == 0 {
+            // Mihomo's legacy mode: `max-streams` is the count past which it
+            // opens another connection, and the pool then grows without a
+            // cap. Map it onto the reuse threshold and bound the pool
+            // explicitly, warning rather than pretending the policies match.
+            options.max_connections = 16;
+            options.min_streams = max_streams;
+            tracing::warn!(
+                name,
+                max_connections = options.max_connections,
+                min_streams = options.min_streams,
+                "trusttunnel: legacy pool is unbounded upstream; using bounded pool"
+            );
+        } else {
+            // Beside the modern fields there is no upstream meaning to
+            // mirror, so honor it as this client's hard per-session ceiling
+            // rather than dropping it on the floor.
+            options.max_streams = max_streams;
+        }
+    }
+    options.max_streams = options.max_streams.max(options.min_streams);
+    // `platform` / `app-name` are the two fields of the spec's per-stream
+    // `user-agent`; `headers` can replace it outright, and anything else it
+    // declares rides along on every CONNECT. Values may carry
+    // `<random-string(N)>` / `<random-string(MIN-MAX)>`, re-rolled per
+    // request — the padding idiom Surge spells the same way.
+    if let Some(platform) = text("platform")? {
+        options.platform = platform.to_owned();
+    }
+    if let Some(app_name) = text("app-name")? {
+        options.app_name = app_name.to_owned();
+    }
+    let declared: Vec<(String, String)> = match config.get("headers") {
+        None | Some(serde_yaml::Value::Null) => Vec::new(),
+        Some(value) => value
+            .as_mapping()
+            .ok_or("trusttunnel: headers must be a map of name to value")?
+            .iter()
+            .map(|(key, value)| {
+                let name = key
+                    .as_str()
+                    .ok_or("trusttunnel: header names must be strings")?;
+                let text = value
+                    .as_str()
+                    .ok_or_else(|| format!("trusttunnel: header '{name}' must be a string"))?;
+                Ok((name.to_owned(), text.to_owned()))
+            })
+            .collect::<std::result::Result<_, String>>()?,
+    };
+    options.headers =
+        meow_proxy::trusttunnel::ExtraHeaders::new(&declared, meow_transport::MAX_EXTRA_HEADERS)
+            .map_err(|e| format!("trusttunnel: {e}"))?;
+    options.health_check = boolean("health-check", false)?;
+    if options.health_check {
+        tracing::warn!(name, "trusttunnel: mihomo performs idle health checks; this client currently checks only new sessions");
+    }
+    #[cfg(feature = "trusttunnel-h3")]
+    let transport = if quic {
+        meow_proxy::trusttunnel::Transport::H3
+    } else {
+        meow_proxy::trusttunnel::Transport::H2
+    };
+    #[cfg(not(feature = "trusttunnel-h3"))]
+    let transport = meow_proxy::trusttunnel::Transport::H2;
+    let adapter = meow_proxy::trusttunnel::TrustTunnelAdapter::new(
+        name,
+        server,
+        required_port(config, "trusttunnel")?,
+        tls,
+        options,
+        boolean("udp", false)?,
+        transport,
+        Arc::clone(dialer),
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
 }
 
 /// Parse a `type: anytls` proxy block into an [`AnytlsAdapter`].

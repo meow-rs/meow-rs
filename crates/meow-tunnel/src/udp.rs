@@ -1,7 +1,8 @@
+use crate::statistics::{ProxyTraffic, Statistics};
 use crate::tunnel::{ResolvedTarget, TunnelInner};
 use dashmap::DashMap;
-use meow_common::atomic::AtomicU;
-use meow_common::{with_dial_timeout, Metadata, ProxyPacketConn};
+use meow_common::atomic::{AtomicU, Int};
+use meow_common::{with_dial_timeout, AdapterType, Metadata, ProxyAdapter, ProxyPacketConn};
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -77,6 +78,98 @@ pub type NatTable = Arc<DashMap<(SocketAddr, SocketAddr), Arc<UdpSession>>>;
 
 pub fn new_nat_table() -> NatTable {
     Arc::new(DashMap::new())
+}
+
+/// A UDP flow's outbound, counting the payload it carries into the tunnel
+/// totals and its proxy's, as the TCP relay counts a stream. Wraps the
+/// conn rather than the relay loops because the NAT table's replies are
+/// read outside the crate (the mobile FFIs read `UdpSession::conn`). Costs
+/// each datagram one more boxed future (`async_trait`) than the bare conn.
+struct CountedPacketConn {
+    conn: Box<dyn ProxyPacketConn>,
+    stats: Arc<Statistics>,
+    proxy: Option<Arc<ProxyTraffic>>,
+}
+
+#[async_trait::async_trait]
+impl ProxyPacketConn for CountedPacketConn {
+    async fn read_packet(&self, buf: &mut [u8]) -> meow_common::Result<(usize, SocketAddr)> {
+        let (n, from) = self.conn.read_packet(buf).await?;
+        self.stats
+            .record_packet_download(self.proxy.as_deref(), n as Int);
+        Ok((n, from))
+    }
+
+    async fn write_packet(&self, buf: &[u8], addr: &SocketAddr) -> meow_common::Result<usize> {
+        let n = self.conn.write_packet(buf, addr).await?;
+        self.stats
+            .record_packet_upload(self.proxy.as_deref(), n as Int);
+        Ok(n)
+    }
+
+    fn local_addr(&self) -> meow_common::Result<SocketAddr> {
+        self.conn.local_addr()
+    }
+
+    fn close(&self) -> meow_common::Result<()> {
+        self.conn.close()
+    }
+}
+
+impl TunnelInner {
+    /// Dial a UDP flow through `proxy`, bounded like mihomo's
+    /// `C.DefaultUDPTimeout`, and count what it carries toward the totals and
+    /// the proxy it ends at: a group's current member, the `chains[0]` a TCP
+    /// connection records. Every inbound dials its UDP flows here. A flow
+    /// ending at REJECT or PASS is not counted: those swallow each write and
+    /// report it sent.
+    pub async fn dial_udp(
+        &self,
+        proxy: &dyn ProxyAdapter,
+        metadata: &Metadata,
+    ) -> meow_common::Result<Box<dyn ProxyPacketConn>> {
+        let counted = udp_leaf_counters(&self.stats, proxy, metadata);
+        let conn = with_dial_timeout(proxy.name(), proxy.dial_udp(metadata)).await?;
+        let Some(leaf) = counted else {
+            return Ok(conn);
+        };
+        Ok(Box::new(CountedPacketConn {
+            conn,
+            stats: Arc::clone(&self.stats),
+            proxy: leaf,
+        }))
+    }
+}
+
+/// How a UDP flow through `adapter` is counted: `None` when it ends at an
+/// adapter that sends nothing, else the counters of the leaf it ends at
+/// (themselves `None` while headless, which keeps only the totals).
+fn udp_leaf_counters(
+    stats: &Statistics,
+    adapter: &dyn ProxyAdapter,
+    metadata: &Metadata,
+) -> Option<Option<Arc<ProxyTraffic>>> {
+    let mut leaf = None;
+    let mut next = adapter.unwrap_proxy(metadata, false);
+    for _ in 0..crate::tcp::MAX_CHAIN_HOPS {
+        let Some(hop) = next else {
+            break;
+        };
+        next = hop.unwrap_proxy(metadata, false);
+        leaf = Some(hop);
+    }
+    let (name, kind) = leaf
+        .as_deref()
+        .map_or((adapter.name(), adapter.adapter_type()), |hop| {
+            (hop.name(), hop.adapter_type())
+        });
+    match kind {
+        AdapterType::Reject
+        | AdapterType::RejectDrop
+        | AdapterType::Pass
+        | AdapterType::PassRule => None,
+        _ => Some(stats.proxy_counters(name)),
+    }
 }
 
 /// One UDP flow's handle on the tunnel's flush signal (issue #695).
@@ -270,7 +363,7 @@ pub async fn handle_udp(
     // Bounded like mihomo's `C.DefaultUDPTimeout`. An unbounded dial here is
     // worse than on TCP: the key is still unclaimed (see below), so every
     // datagram of the flow starts its own stalled dial.
-    match with_dial_timeout(proxy.name(), proxy.dial_udp(&metadata)).await {
+    match tunnel.dial_udp(proxy.as_ref(), &metadata).await {
         Ok(conn) if flush.is_flushed() => {
             debug!(
                 "UDP {} -> {}: sessions flushed during the dial; dropping datagram",
@@ -409,6 +502,56 @@ mod tests {
             assert_eq!(proxy.dials.load(Ordering::SeqCst), 1);
             assert_eq!(proxy.conns.lock().unwrap()[0].0.load(Ordering::SeqCst), 1);
         }
+    }
+
+    /// A UDP flow counts what it sends and what comes back toward the
+    /// totals and the member its group dialled; a flow the group sends to
+    /// REJECT counts nothing, though REJECT reports its writes sent.
+    #[tokio::test]
+    async fn udp_flows_count_toward_the_proxy_they_end_at() {
+        let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dst = echo.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 64];
+            while let Ok((_, peer)) = echo.recv_from(&mut buf).await {
+                let _ = echo.send_to(b"pong!!", peer).await;
+            }
+        });
+        let raw: meow_config::raw::RawConfig = serde_yaml::from_str(
+            "proxy-groups:\n  - {name: Proxy, type: select, proxies: [DIRECT, REJECT]}\n",
+        )
+        .unwrap();
+        let proxies = meow_config::rebuild_from_raw(&raw).unwrap().proxies;
+        let tunnel = mk_tunnel();
+        tunnel.update_routing(
+            proxies.clone(),
+            vec![Box::new(meow_rules::final_rule::FinalRule::new("Proxy"))],
+            Default::default(),
+        );
+        let stats = tunnel.statistics();
+
+        let src: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+        handle_udp(tunnel.inner(), b"ping", src, mk_metadata(src, dst)).await;
+        let session = Arc::clone(tunnel.inner().nat_table.get(&(src, dst)).unwrap().value());
+        let mut buf = [0u8; 64];
+        let (n, _) =
+            tokio::time::timeout(Duration::from_secs(5), session.conn.read_packet(&mut buf))
+                .await
+                .expect("a reply")
+                .unwrap();
+        assert_eq!(&buf[..n], b"pong!!");
+        assert_eq!(stats.snapshot(), (4, 6));
+        let by_proxy = stats.proxy_traffic();
+        assert_eq!(by_proxy.len(), 1, "the group itself is not counted");
+        assert_eq!(by_proxy.get("DIRECT"), Some(&(4, 6)));
+
+        let selector = proxies["Proxy"].selection().unwrap();
+        selector.set("REJECT").await.unwrap();
+        let src: SocketAddr = "127.0.0.1:40001".parse().unwrap();
+        handle_udp(tunnel.inner(), b"dropped", src, mk_metadata(src, dst)).await;
+        assert!(tunnel.inner().nat_table.contains_key(&(src, dst)));
+        assert_eq!(stats.snapshot(), (4, 6));
+        assert_eq!(stats.proxy_traffic(), by_proxy);
     }
 
     struct NoopPacketConn;

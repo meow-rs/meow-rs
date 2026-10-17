@@ -1,6 +1,23 @@
 use std::io;
 use thiserror::Error;
 
+/// Explicit local admission pressure, distinct from socket EAGAIN. The
+/// marker survives dialer context wrapping without enlarging MeowError.
+#[derive(Debug, Error)]
+#[error("{0}")]
+struct LocalResourceLimit(&'static str);
+
+/// An adapter exhausted its own bounded pool, rather than a remote node
+/// failing. Only explicit admission sites should construct this error.
+pub fn local_resource_limit(reason: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::WouldBlock, LocalResourceLimit(reason))
+}
+
+fn is_local_limit(e: &io::Error) -> bool {
+    e.get_ref()
+        .is_some_and(<dyn std::error::Error + Send + Sync>::is::<LocalResourceLimit>)
+}
+
 #[derive(Error, Debug)]
 pub enum MeowError {
     #[error("IO error: {0}")]
@@ -53,7 +70,8 @@ impl MeowError {
     /// True when the failure is *local* resource exhaustion — this process,
     /// not the remote member, ran out: fd-table, socket-buffer, or memory
     /// pressure (`EMFILE`/`ENFILE`/`ENOBUFS`/`ENOMEM`, or the WSA
-    /// equivalents) at any [`RelayHopFailed`] depth. Dead-marking the
+    /// equivalents), or an explicit adapter admission limit, at any
+    /// [`RelayHopFailed`] depth. Dead-marking the
     /// member punishes a healthy node for a local condition; for a
     /// load-balance group it escalates to `NoProxyAvailable` until the
     /// next probe sweep (issue #668).
@@ -67,8 +85,8 @@ impl MeowError {
         }
     }
 
-    /// Whether an `io::Error` carries a preservable payload — a raw
-    /// errno, or an errno-less `OutOfMemory` allocation failure — that
+    /// Whether an `io::Error` carries a raw errno or an errno-less
+    /// `OutOfMemory` allocation failure — a concrete socket failure that
     /// classification must not lose to a later context-only error.
     pub fn io_errno_backed(e: &io::Error) -> bool {
         e.raw_os_error().is_some() || e.kind() == io::ErrorKind::OutOfMemory
@@ -139,8 +157,9 @@ impl MeowError {
 
     /// Wrap a transport-layer `io::Error` at an adapter boundary (e.g.
     /// `ss tcp connect: {e}`). An error carrying a preservable io
-    /// payload (`raw_os_error` or errno-less `OutOfMemory`), or one
-    /// carrying the `Unsupported` capability class, passes through as
+    /// payload (raw errno, explicit admission limit, or errno-less
+    /// `OutOfMemory`), or one carrying the `Unsupported` capability
+    /// class, passes through as
     /// `Io` verbatim — `Proxy`/`Other` stringification would erase the
     /// classification dead-marking reads to tell local resource
     /// exhaustion and capability refusals from member health (issues
@@ -148,7 +167,8 @@ impl MeowError {
     /// synthesized io errors keep the historical `{context}: {e}`
     /// `Proxy` shape.
     pub fn io_with(context: &str, e: io::Error) -> Self {
-        if Self::io_errno_backed(&e) || e.kind() == io::ErrorKind::Unsupported {
+        if Self::io_errno_backed(&e) || is_local_limit(&e) || e.kind() == io::ErrorKind::Unsupported
+        {
             Self::Io(e)
         } else {
             Self::Proxy(format!("{context}: {e}"))
@@ -182,7 +202,8 @@ impl MeowError {
 #[cfg(unix)]
 fn is_local_resource_io_error(e: &io::Error) -> bool {
     // `OutOfMemory` covers errno-less synthesized allocation failures.
-    e.kind() == io::ErrorKind::OutOfMemory
+    is_local_limit(e)
+        || e.kind() == io::ErrorKind::OutOfMemory
         || matches!(
             e.raw_os_error(),
             Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
@@ -195,13 +216,14 @@ fn is_local_resource_io_error(e: &io::Error) -> bool {
 /// raw os errors.
 #[cfg(windows)]
 fn is_local_resource_io_error(e: &io::Error) -> bool {
-    e.kind() == io::ErrorKind::OutOfMemory
+    is_local_limit(e)
+        || e.kind() == io::ErrorKind::OutOfMemory
         || matches!(e.raw_os_error(), Some(10024 | 10055 | 8 | 14))
 }
 
 #[cfg(not(any(unix, windows)))]
 fn is_local_resource_io_error(e: &io::Error) -> bool {
-    e.kind() == io::ErrorKind::OutOfMemory
+    is_local_limit(e) || e.kind() == io::ErrorKind::OutOfMemory
 }
 
 pub type Result<T> = std::result::Result<T, MeowError>;
@@ -209,6 +231,61 @@ pub type Result<T> = std::result::Result<T, MeowError>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_admission_limit_survives_context_and_relay_hops() {
+        let error = MeowError::io_with("outer", local_resource_limit("pool full"));
+        assert!(error.is_local_resource_error());
+        assert!(!error.is_errno_backed());
+        let nested = MeowError::RelayHopFailed {
+            hop: 1,
+            source: Box::new(error),
+        };
+        assert!(nested.is_local_resource_error());
+        let io = nested.into_io_error("dialer");
+        assert!(MeowError::io_with("adapter", io).is_local_resource_error());
+        assert!(!MeowError::Io(io::ErrorKind::WouldBlock.into()).is_local_resource_error());
+        #[cfg(unix)]
+        assert!(
+            !MeowError::Io(io::Error::from_raw_os_error(libc::EAGAIN)).is_local_resource_error()
+        );
+    }
+
+    #[test]
+    fn admission_limits_keep_context_error_precedence() {
+        let limit = || MeowError::io_with("front", local_resource_limit("pool full"));
+        let timeout = || MeowError::Io(io::ErrorKind::TimedOut.into());
+        let chosen = MeowError::prefer_errno(Some(limit()), timeout()).unwrap();
+        assert!(matches!(chosen, MeowError::Io(ref e) if e.kind() == io::ErrorKind::TimedOut));
+        let chosen = MeowError::prefer_errno(Some(timeout()), limit()).unwrap();
+        assert!(chosen.is_local_resource_error());
+        assert!(!chosen.is_errno_backed());
+
+        let chosen = MeowError::prefer_errno_io(
+            Some(local_resource_limit("pool full")),
+            io::ErrorKind::TimedOut.into(),
+        )
+        .unwrap();
+        assert_eq!(chosen.kind(), io::ErrorKind::TimedOut);
+        let chosen = MeowError::prefer_errno_io(
+            Some(io::ErrorKind::TimedOut.into()),
+            local_resource_limit("pool full"),
+        )
+        .unwrap();
+        assert!(is_local_limit(&chosen));
+        assert!(!MeowError::io_errno_backed(&chosen));
+        #[cfg(unix)]
+        {
+            let chosen = MeowError::prefer_errno(
+                Some(MeowError::Io(io::Error::from_raw_os_error(libc::EMFILE))),
+                limit(),
+            )
+            .unwrap();
+            assert!(
+                matches!(chosen, MeowError::Io(ref e) if e.raw_os_error() == Some(libc::EMFILE))
+            );
+        }
+    }
 
     #[test]
     fn capability_errors_are_detected_at_any_hop_depth() {
