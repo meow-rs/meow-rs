@@ -8,6 +8,17 @@ the canonical, in-repo source a release is cut from.
 
 ## [Unreleased]
 
+### Fixed
+
+- **meow-transport builds for iOS and tvOS again**: kcptun's `dscp:` option
+  called socket2's `set_tclass_v6` on every Unix target, but socket2 only
+  provides it on Android, Linux, macOS, the BSDs, Fuchsia and Cygwin. Since
+  kcptun joined meow-proxy's default features in 0.22.0, meow-transport has
+  failed to compile for `aarch64-apple-ios` / `aarch64-apple-tvos`. The call
+  is now limited to the targets socket2 supports; elsewhere the IPv6 traffic
+  class is skipped, as it already was on Windows, and the IPv4 DSCP is still
+  applied.
+
 ## [0.23.0] - 2026-10-16
 
 ### Added
