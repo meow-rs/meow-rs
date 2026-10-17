@@ -19,6 +19,15 @@ the canonical, in-repo source a release is cut from.
   class is skipped, as it already was on Windows, and the IPv4 DSCP is still
   applied.
 
+### Security
+
+- **`zip` 9 for `external-ui-download`**: meow-config's opt-in dashboard
+  download moves from zip 2.4 to 9.0, which is patched for RUSTSEC-2026-0367,
+  -0368 and -0369. Those advisories are in zip's own `extract()`, which
+  meow-config never called: it writes each entry itself, skips names that
+  would leave the target directory, creates no symlinks and applies no stored
+  permissions. The feature is off in every release bundle.
+
 ## [0.23.0] - 2026-10-16
 
 ### Added

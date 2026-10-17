@@ -68,12 +68,15 @@ fn extract_zip(bytes: &[u8], dir: &Path) -> anyhow::Result<()> {
 /// If every entry sits under one shared top-level directory, return it so it can
 /// be stripped; otherwise `None`.
 fn common_top_level(archive: &zip::ZipArchive<Cursor<&[u8]>>) -> Option<PathBuf> {
-    let mut names = archive.file_names();
+    // A name that does not decode is skipped: `extract_zip` never writes that
+    // entry either (its `enclosed_name` is `None`).
+    let mut names = archive.file_names().filter_map(Result::ok);
     let first = names.next()?;
     let top = first.split('/').next().filter(|s| !s.is_empty())?;
     let prefix = format!("{top}/");
     if archive
         .file_names()
+        .filter_map(Result::ok)
         .all(|n| n == top || n.starts_with(&prefix))
     {
         Some(PathBuf::from(top))
