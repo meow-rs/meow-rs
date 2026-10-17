@@ -261,6 +261,10 @@ pub struct Resolver {
     /// Whether IPv6 resolution is enabled. Driven by the top-level `ipv6`
     /// config flag and fixed at construction time.
     ipv6: bool,
+    /// Dedicated resolver built from `dns.direct-nameserver` (mihomo
+    /// `DirectHostResolver`). Carried by this generation so a config swap
+    /// replaces main and direct lookups together.
+    direct: Option<Arc<Resolver>>,
 }
 
 impl Resolver {
@@ -770,6 +774,7 @@ impl Resolver {
             fakeip_skipper: None,
             fakeip_ttl: DEFAULT_FAKE_IP_TTL,
             ipv6,
+            direct: None,
         }
     }
 
@@ -1041,6 +1046,7 @@ impl Resolver {
             fakeip_skipper: None,
             fakeip_ttl: DEFAULT_FAKE_IP_TTL,
             ipv6,
+            direct: None,
         })
     }
 
@@ -2057,12 +2063,27 @@ impl Resolver {
         self.fakeip_ttl = ttl;
     }
 
+    /// Install the `dns.direct-nameserver` resolver used by `DIRECT`
+    /// outbounds to resolve their destination hostnames.
+    pub fn set_direct_resolver(&mut self, resolver: Arc<Resolver>) {
+        self.direct = Some(resolver);
+    }
+
+    /// The `dns.direct-nameserver` resolver, or `None` when `DIRECT`
+    /// resolves through this resolver.
+    pub fn direct_resolver(&self) -> Option<&Arc<Resolver>> {
+        self.direct.as_ref()
+    }
+
     pub fn mode(&self) -> DnsMode {
         self.mode
     }
 
     pub fn clear_cache(&self) {
         self.cache.clear();
+        if let Some(direct) = &self.direct {
+            direct.clear_cache();
+        }
     }
 
     /// Drop pooled upstream connections so the next query dials a fresh
@@ -2071,8 +2092,9 @@ impl Resolver {
     /// changes (issue #695): a pooled socket created before the binding
     /// stays unbound and, under `tun.auto-route: global`, loops into the TUN.
     ///
-    /// Resets every upstream this resolver queries — main, fallback, and
-    /// nameserver-policy clients ([`DnsClient::reset_connections`]).
+    /// Resets every upstream this resolver queries — main, fallback,
+    /// nameserver-policy and `direct-nameserver` clients
+    /// ([`DnsClient::reset_connections`]).
     /// Pools in other resolvers (the `proxy-server-nameserver` host hook)
     /// are reached by [`crate::client::reset_pooled_connections`].
     /// Non-blocking. In-flight queries finish on the connection they already
@@ -2085,12 +2107,17 @@ impl Resolver {
             .policy
             .as_ref()
             .map_or(&[][..], NameserverPolicy::clients);
-        self.main
+        let own: usize = self
+            .main
             .iter()
             .chain(fallback)
             .chain(policy)
             .map(|client| client.reset_connections())
-            .sum()
+            .sum();
+        own + self
+            .direct
+            .as_ref()
+            .map_or(0, |direct| direct.reset_connections())
     }
 
     pub fn dns_results(&self, search: Option<&str>, limit: usize) -> Vec<DnsCacheSnapshotEntry> {

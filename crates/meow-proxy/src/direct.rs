@@ -99,6 +99,18 @@ impl DirectAdapter {
     /// Determine the concrete `SocketAddr` candidates to dial for `metadata`,
     /// avoiding the OS resolver whenever possible.
     async fn resolve_targets(&self, metadata: &Metadata) -> Result<Vec<SocketAddr>> {
+        // 0. `dns.direct-nameserver` (mihomo `DirectHostResolver`): a named
+        //    destination resolves through it even when rule matching already
+        //    pre-resolved `dst_ip` via the main nameservers — mihomo's direct
+        //    dial prefers `Host` over `DstIP` for the same reason.
+        if let Some(direct) = self.direct_resolver() {
+            if !metadata.host.is_empty()
+                && meow_common::metadata_ip_literal(&metadata.host).is_none()
+            {
+                return Self::resolve_host_with(&direct, metadata).await;
+            }
+        }
+
         // 1. Destination already resolved (e.g. by rule-matching pre_resolve,
         //    or when the client supplied an IP literal).
         if let Some(ip) = metadata.dst_ip {
@@ -118,25 +130,7 @@ impl DirectAdapter {
         if !metadata.host.is_empty() {
             if let Some(resolver) = &self.resolver {
                 let resolver = Arc::clone(&resolver.read());
-                return match resolver.resolve_ips(&metadata.host).await {
-                    Ok(Some(ips)) if !ips.is_empty() => Ok(ips
-                        .into_iter()
-                        .map(|ip| SocketAddr::new(ip, metadata.dst_port))
-                        .collect()),
-                    // The lookup itself failed — the io error keeps its
-                    // raw_os_error, so a local EMFILE while opening the
-                    // resolver socket stays `is_local_resource_error`
-                    // instead of dead-marking this member (#682).
-                    Err(e) => Err(MeowError::Io(e)),
-                    Ok(None) => Err(MeowError::Dns(format!(
-                        "direct: failed to resolve {}",
-                        metadata.host
-                    ))),
-                    Ok(Some(_)) => Err(MeowError::Dns(format!(
-                        "direct: no address for {}",
-                        metadata.host
-                    ))),
-                };
+                return Self::resolve_host_with(&resolver, metadata).await;
             }
 
             // Legacy fallback: let tokio use getaddrinfo. Only reachable when
@@ -158,6 +152,38 @@ impl DirectAdapter {
         Err(MeowError::Proxy(
             "direct: metadata has no destination".into(),
         ))
+    }
+
+    /// The current generation's `dns.direct-nameserver` resolver, if any.
+    fn direct_resolver(&self) -> Option<Arc<Resolver>> {
+        self.resolver
+            .as_ref()
+            .and_then(|slot| slot.read().direct_resolver().map(Arc::clone))
+    }
+
+    async fn resolve_host_with(
+        resolver: &Resolver,
+        metadata: &Metadata,
+    ) -> Result<Vec<SocketAddr>> {
+        match resolver.resolve_ips(&metadata.host).await {
+            Ok(Some(ips)) if !ips.is_empty() => Ok(ips
+                .into_iter()
+                .map(|ip| SocketAddr::new(ip, metadata.dst_port))
+                .collect()),
+            // The lookup itself failed — the io error keeps its
+            // raw_os_error, so a local EMFILE while opening the
+            // resolver socket stays `is_local_resource_error`
+            // instead of dead-marking this member (#682).
+            Err(e) => Err(MeowError::Io(e)),
+            Ok(None) => Err(MeowError::Dns(format!(
+                "direct: failed to resolve {}",
+                metadata.host
+            ))),
+            Ok(Some(_)) => Err(MeowError::Dns(format!(
+                "direct: no address for {}",
+                metadata.host
+            ))),
+        }
     }
 }
 
@@ -475,6 +501,53 @@ mod tests {
             dst_port: port,
             ..Default::default()
         }
+    }
+
+    fn hosts_only_resolver(host: &str, ip: IpAddr) -> Resolver {
+        let mut hosts: DomainTrie<HostEntry> = DomainTrie::new();
+        hosts.insert(host, vec![ip].into());
+        Resolver::new(vec![], vec![], DnsMode::Normal, hosts, true, true)
+    }
+
+    #[tokio::test]
+    async fn direct_resolver_overrides_pre_resolved_destination() {
+        let main_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let direct_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2));
+        let mut main = hosts_only_resolver("node.test", main_ip);
+        main.set_direct_resolver(Arc::new(hosts_only_resolver("node.test", direct_ip)));
+        let adapter = DirectAdapter::new().with_resolver(Arc::new(main));
+
+        // Rule matching pre-resolved through the main nameservers.
+        let mut metadata = tcp_metadata("node.test", 443);
+        metadata.dst_ip = Some(main_ip);
+        assert_eq!(
+            adapter.resolve_targets(&metadata).await.unwrap(),
+            vec![SocketAddr::new(direct_ip, 443)]
+        );
+
+        // No name to resolve — the literal destination is dialed as-is.
+        assert_eq!(
+            adapter
+                .resolve_targets(&udp_metadata(main_ip))
+                .await
+                .unwrap(),
+            vec![SocketAddr::new(main_ip, 443)]
+        );
+    }
+
+    #[tokio::test]
+    async fn without_direct_resolver_pre_resolved_destination_is_kept() {
+        let main_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let adapter = DirectAdapter::new().with_resolver(Arc::new(hosts_only_resolver(
+            "node.test",
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 9)),
+        )));
+        let mut metadata = tcp_metadata("node.test", 443);
+        metadata.dst_ip = Some(main_ip);
+        assert_eq!(
+            adapter.resolve_targets(&metadata).await.unwrap(),
+            vec![SocketAddr::new(main_ip, 443)]
+        );
     }
 
     #[tokio::test]

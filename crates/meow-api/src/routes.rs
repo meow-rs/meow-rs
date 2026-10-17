@@ -1395,6 +1395,7 @@ fn dns_uses_proxy_refs(raw: &RawConfig) -> bool {
         || urls_tagged(&dns.fallback)
         || urls_tagged(&dns.default_nameserver)
         || urls_tagged(&dns.proxy_server_nameserver)
+        || urls_tagged(&dns.direct_nameserver)
         || dns.nameserver_policy.as_ref().is_some_and(|m| {
             m.iter()
                 .any(|(_k, v)| v.as_urls().iter().any(|u| u.contains('#')))

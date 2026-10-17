@@ -73,6 +73,7 @@ pub async fn parse_dns(
         parse_nameserver_entries(dns.default_nameserver.as_deref().unwrap_or(&[]))?;
     let proxy_ns_urls =
         parse_nameserver_entries(dns.proxy_server_nameserver.as_deref().unwrap_or(&[]))?;
+    let direct_ns_urls = parse_nameserver_entries(dns.direct_nameserver.as_deref().unwrap_or(&[]))?;
 
     let mode = match dns.enhanced_mode.as_deref() {
         Some("fake-ip") => DnsMode::FakeIp,
@@ -158,6 +159,59 @@ pub async fn parse_dns(
         None
     };
 
+    // mihomo `direct-nameserver`: the resolver `DIRECT` outbounds use for
+    // their destination hostnames (dns.Config.DirectServer →
+    // DirectHostResolver). Built like the proxy-server resolver — Normal
+    // mode, no fallback, own hosts trie, bootstrapped via
+    // default-nameserver — except `direct-nameserver-follow-policy` lets it
+    // share the main nameserver-policy (its own copy: policy clients are
+    // owned per resolver).
+    let direct_resolver = if direct_ns_urls.is_empty() {
+        None
+    } else {
+        let direct_policy = match &dns.nameserver_policy {
+            Some(nsp_map)
+                if !nsp_map.is_empty() && dns.direct_nameserver_follow_policy.unwrap_or(false) =>
+            {
+                let bootstrap_clients =
+                    build_policy_bootstrap_clients(&default_ns_urls, &main_urls);
+                Some(
+                    build_nameserver_policy(
+                        nsp_map,
+                        geosite.as_ref(),
+                        &bootstrap_clients,
+                        proxy_registry,
+                        rule_providers,
+                        strict,
+                    )
+                    .await?,
+                )
+            }
+            _ => None,
+        };
+        let mut direct_hosts = build_hosts_trie(raw.hosts.as_ref(), strict)?;
+        if use_hosts && use_system_hosts {
+            merge_system_hosts(&mut direct_hosts).await;
+        }
+        Some(Arc::new(
+            Resolver::new_with_bootstrap_with_proxies(
+                direct_ns_urls,
+                vec![],
+                default_ns_urls.clone(),
+                DnsMode::Normal,
+                direct_hosts,
+                use_hosts,
+                crate::effective_ipv6(raw.ipv6),
+                direct_policy,
+                None,
+                proxy_registry,
+                crate::is_offline_validate(),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("direct-nameserver: {e}"))?,
+        ))
+    };
+
     // Build fallback-filter only when fallback nameservers are configured.
     let fallback_filter = if fallback_urls.is_empty() {
         None
@@ -195,6 +249,9 @@ pub async fn parse_dns(
     // privacy regression.
     if mode == DnsMode::FakeIp {
         install_fakeip(&mut resolver, dns, cache_dir, prior).await?;
+    }
+    if let Some(direct) = direct_resolver {
+        resolver.set_direct_resolver(direct);
     }
 
     let resolver = Arc::new(resolver);
@@ -1131,6 +1188,49 @@ mod tests {
         .await
         .unwrap();
         assert!(cfg.proxy_resolver.is_none());
+    }
+
+    #[tokio::test]
+    async fn direct_nameserver_installs_direct_resolver() {
+        let raw: RawConfig = serde_yaml::from_str(
+            "dns:\n  enable: true\n  nameserver:\n    - 1.1.1.1\n  direct-nameserver:\n    - 223.5.5.5\n  direct-nameserver-follow-policy: true\n  nameserver-policy:\n    '+.example.cn': 119.29.29.29\n",
+        )
+        .unwrap();
+        let cfg = parse_dns(
+            &raw,
+            None,
+            None,
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        let direct = cfg
+            .resolver
+            .direct_resolver()
+            .expect("direct-nameserver must install a direct resolver");
+        assert_eq!(direct.mode(), DnsMode::Normal);
+        assert!(direct.direct_resolver().is_none());
+    }
+
+    #[tokio::test]
+    async fn no_direct_nameserver_leaves_direct_resolver_none() {
+        let raw: RawConfig =
+            serde_yaml::from_str("dns:\n  enable: true\n  nameserver:\n    - 1.1.1.1\n").unwrap();
+        let cfg = parse_dns(
+            &raw,
+            None,
+            None,
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(cfg.resolver.direct_resolver().is_none());
     }
 
     #[tokio::test]
