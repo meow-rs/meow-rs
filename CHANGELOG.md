@@ -8,12 +8,6 @@ the canonical, in-repo source a release is cut from.
 
 ## [Unreleased]
 
-### Fixed
-
-- **Windows TUN readiness**: configure owned Wintun addresses as Preferred
-  before installing routes or starting packet handling, avoiding the
-  tentative-address window during startup and configuration reload.
-
 ### Added
 
 - **Traffic per proxy** (`GET /statistics`): the upload and download totals
@@ -23,6 +17,13 @@ the canonical, in-repo source a release is cut from.
   totals after its connections close, and after a reload removes it.
 
 ### Fixed
+
+- **Windows TUN works as soon as it reports ready**: Windows kept a new
+  Wintun address tentative while it checked the address for duplicates, and
+  a tentative address cannot send packets, so DNS and traffic right after
+  startup or a configuration reload could fail. meow now turns that check
+  off on its own adapter and creates the addresses ready to use, replacing
+  any an adapter reopened after an unclean shutdown still carries.
 
 - **UDP traffic counts toward the totals**: only TCP relays added to the
   upload and download totals, so `/traffic`, the `/connections` totals and
