@@ -491,6 +491,13 @@ jobs:
       - name: meow-listener TUN tests (listener-tun)
         run: cargo nextest run -p meow-listener --features listener-tun --lib --retries 2 --no-fail-fast
 
+      # Creates a real Wintun adapter, which needs Administrator (the hosted
+      # runner has it), so the test is `#[ignore]`d for local runs: its
+      # addresses must come up Preferred, not tentative, and replace the
+      # ones a reopened adapter still carries.
+      - name: Wintun address setup (privileged)
+        run: cargo nextest run -p meow-listener --features listener-tun --lib --run-ignored only --no-capture windows_device
+
   macos:
     runs-on: macos-latest
     needs: lint

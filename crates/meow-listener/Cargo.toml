@@ -24,6 +24,7 @@ listener-tun = [
     "dep:route_manager",
     "dep:meow-dns",
     "dep:ipnet",
+    "dep:windows-sys",
 ]
 # Shadowsocks encrypted-server inbound. Reuses the `shadowsocks` crate's
 # server-side ProxyListener/ProxySocket (the same crate already used by the
@@ -68,6 +69,16 @@ shadowsocks = { workspace = true }
 async-trait = { workspace = true }
 tracing-subscriber = { workspace = true }
 smol_str = { workspace = true }
+
+# listener-tun: the Wintun adapter's addresses are assigned through IP
+# Helper (`tun/windows_device.rs`) so they come up Preferred, not tentative.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.60", optional = true, features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+] }
 
 [[test]]
 name = "ss_listener_integration"

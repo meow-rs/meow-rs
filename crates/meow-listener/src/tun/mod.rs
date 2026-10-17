@@ -62,6 +62,8 @@ mod local_dns;
 mod outbound_binding;
 mod route;
 mod udp;
+#[cfg(target_os = "windows")]
+mod windows_device;
 #[cfg(any(test, target_os = "windows"))]
 mod wintun;
 
@@ -455,12 +457,16 @@ impl TunListener {
                 MAX_TUN_RETRIES,
             );
 
-            match tokio::task::spawn_blocking(move || {
-                let mut builder = tun_rs::DeviceBuilder::new()
-                    .mtu(mtu)
-                    .ipv4(addr, prefix, None);
-                if let Some(v6) = inet6 {
-                    builder = builder.ipv6(v6.addr(), v6.prefix_len());
+            match tokio::task::spawn_blocking(move || -> io::Result<tun_rs::AsyncDevice> {
+                let mut builder = tun_rs::DeviceBuilder::new().mtu(mtu);
+                // Windows assigns the addresses itself once the adapter
+                // exists: the builder's would start out tentative.
+                #[cfg(not(target_os = "windows"))]
+                {
+                    builder = builder.ipv4(addr, prefix, None);
+                    if let Some(v6) = inet6 {
+                        builder = builder.ipv6(v6.addr(), v6.prefix_len());
+                    }
                 }
                 if let Some(n) = &name_for_closure {
                     builder = builder.name(n);
@@ -471,7 +477,15 @@ impl TunListener {
                 {
                     builder = builder.wintun_file(wintun_file).wintun_log(true);
                 }
-                builder.build_async()
+                let device = builder.build_async()?;
+                // On failure the adapter drops here and the attempt retries.
+                #[cfg(target_os = "windows")]
+                windows_device::configure_addresses(
+                    device.if_index()?,
+                    Ipv4Net::new(addr, prefix).map_err(io::Error::other)?,
+                    inet6,
+                )?;
+                Ok(device)
             })
             .await
             {
