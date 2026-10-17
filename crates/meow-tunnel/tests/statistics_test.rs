@@ -285,3 +285,67 @@ fn test_connection_chains() {
     assert_eq!(&*conns[0].chains[0], "proxy-group");
     assert_eq!(&*conns[0].chains[1], "ss-server");
 }
+
+/// A connection counts toward the proxy that dialled it, `chains[0]`, and
+/// that proxy keeps the bytes after the connection closes.
+#[test]
+fn test_proxy_traffic_counts_the_leaf_and_outlives_the_connection() {
+    let stats = Statistics::new();
+    let track = |chains| {
+        let id = stats.track_connection(Metadata::default(), "MATCH".into(), "".into(), chains);
+        (id, stats.connection_counters(id).unwrap())
+    };
+    let (first, counters) = track(smallvec![
+        Arc::from("HK-01"),
+        Arc::from("Auto"),
+        Arc::from("Proxy")
+    ]);
+    stats.record_upload(&counters, 100);
+    stats.record_download(&counters, 1000);
+    stats.close_connection(first);
+    let (_second, counters) = track(smallvec![Arc::from("HK-01")]);
+    stats.record_upload(&counters, 1);
+    let (_direct, counters) = track(smallvec![Arc::from("DIRECT")]);
+    stats.record_download(&counters, 7);
+    // No chain: the totals only.
+    let (_none, counters) = track(smallvec![]);
+    stats.record_upload(&counters, 5);
+
+    let proxies: Vec<_> = stats
+        .proxy_traffic()
+        .into_iter()
+        .map(|(name, totals)| (name.to_string(), totals))
+        .collect();
+    assert_eq!(
+        proxies,
+        [
+            ("DIRECT".to_string(), (0, 7)),
+            ("HK-01".to_string(), (101, 1000))
+        ]
+    );
+    assert_eq!(stats.snapshot(), (106, 1007));
+}
+
+#[test]
+fn test_proxy_counters_are_shared_per_proxy() {
+    let stats = Statistics::new();
+    let a = stats.proxy_counters("DIRECT").unwrap();
+    let b = stats.proxy_counters("DIRECT").unwrap();
+    assert!(Arc::ptr_eq(&a, &b));
+    stats.record_packet_upload(Some(&a), 3);
+    stats.record_packet_download(Some(&b), 4);
+    stats.record_packet_download(None, 10);
+    assert_eq!((a.upload_bytes(), a.download_bytes()), (3, 4));
+    assert_eq!(stats.snapshot(), (3, 14));
+}
+
+/// Headless keeps the totals and nothing per proxy.
+#[test]
+fn test_headless_keeps_no_proxy_traffic() {
+    let stats = Statistics::new();
+    stats.set_headless();
+    assert!(stats.proxy_counters("DIRECT").is_none());
+    stats.record_packet_upload(None, 9);
+    assert!(stats.proxy_traffic().is_empty());
+    assert_eq!(stats.snapshot(), (9, 0));
+}

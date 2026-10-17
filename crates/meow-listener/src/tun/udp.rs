@@ -25,7 +25,7 @@ use std::time::Duration;
 use futures::{FutureExt, StreamExt};
 use ipnet::{Ipv4Net, Ipv6Net};
 use lwip::UdpSocket;
-use meow_common::{with_dial_timeout, ConnType, Metadata, Network};
+use meow_common::{ConnType, Metadata, Network};
 use meow_dns::server::{hex_prefix, DnsServer, LocalAnswer};
 use meow_tunnel::{ResolvedTarget, Tunnel};
 use tokio::sync::mpsc;
@@ -382,7 +382,8 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
     // (issue #695): its socket may predate the new outbound binding.
     let mut flush = inner.udp_flush_watch();
     let conn: std::sync::Arc<dyn meow_common::ProxyPacketConn> = std::sync::Arc::from(
-        with_dial_timeout(proxy.name(), proxy.dial_udp(&metadata))
+        inner
+            .dial_udp(proxy.as_ref(), &metadata)
             .await
             .map_err(|e| format!("dial_udp via {}: {e}", proxy.name()))?,
     );

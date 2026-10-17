@@ -125,6 +125,7 @@ Built-in web UI served at `http://<api-addr>/ui` with:
 | `/connections/{id}` | DELETE | Close a connection |
 | `/configs` | GET/PATCH/PUT | Get config, patch mode, or reload config |
 | `/traffic` | GET | Upload/download statistics (also supports WS upgrade) |
+| `/statistics` | GET | Upload/download totals since start, per proxy |
 | `/logs` | GET | Runtime log stream (HTTP streaming or WS upgrade) |
 | `/memory` | GET | Runtime memory stream (HTTP streaming or WS upgrade) |
 | `/metrics` | GET | Prometheus metrics |

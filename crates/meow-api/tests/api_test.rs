@@ -532,6 +532,46 @@ async fn get_traffic() {
     assert_eq!(json["downTotal"], 456);
 }
 
+/// `GET /statistics` reports the totals and each proxy's share, a closed
+/// connection's included, keyed by the leaf that carried it.
+#[tokio::test]
+async fn get_statistics_reports_traffic_per_proxy() {
+    let state = test_state_default();
+    let stats = state.tunnel.statistics();
+    let id = stats.track_connection(
+        Default::default(),
+        smol_str::SmolStr::new_static("MATCH"),
+        smol_str::SmolStr::default(),
+        smallvec![Arc::from("HK-01"), Arc::from("Proxy")],
+    );
+    let counters = stats.connection_counters(id).unwrap();
+    stats.record_upload(&counters, 10);
+    stats.record_download(&counters, 20);
+    stats.close_connection(id);
+    stats.record_packet_upload(stats.proxy_counters("DIRECT").as_deref(), 3);
+
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::get("/statistics")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        body_json(resp).await,
+        serde_json::json!({
+            "uploadTotal": 13,
+            "downloadTotal": 20,
+            "proxies": {
+                "DIRECT": {"upload": 3, "download": 0},
+                "HK-01": {"upload": 10, "download": 20},
+            },
+        })
+    );
+}
+
 #[tokio::test]
 async fn dns_results_returns_searchable_cache_entries() {
     let state = test_state_default();

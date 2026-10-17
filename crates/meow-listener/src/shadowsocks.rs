@@ -407,7 +407,7 @@ fn build_metadata(peer: SocketAddr, target: &Address, in_name: &str, in_port: u1
 // dropped, aborting its task and freeing the outbound conn.
 
 use meow_common::atomic::{checked_increment, AtomicU, Uint};
-use meow_common::{with_dial_timeout, ProxyPacketConn, ReplayWindow};
+use meow_common::{ProxyPacketConn, ReplayWindow};
 use meow_tunnel::udp::DEFAULT_UDP_IDLE;
 use meow_tunnel::TunnelInner;
 use shadowsocks::context::SharedContext;
@@ -1160,7 +1160,7 @@ async fn run_ss_udp_flow<S>(
             metadata.remote_address(),
             proxy.name()
         );
-        match with_dial_timeout(proxy.name(), proxy.dial_udp(&metadata)).await {
+        match inner.dial_udp(proxy.as_ref(), &metadata).await {
             Ok(conn) => Arc::from(conn),
             Err(e) => {
                 debug!(

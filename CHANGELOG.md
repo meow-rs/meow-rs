@@ -8,6 +8,23 @@ the canonical, in-repo source a release is cut from.
 
 ## [Unreleased]
 
+### Added
+
+- **Traffic per proxy** (`GET /statistics`): the upload and download totals
+  plus the bytes each proxy carried since the tunnel started, TCP and UDP,
+  for a client's statistics screen. A group's traffic counts at the member
+  that carried it (the `chains[0]` of `/connections`); a proxy keeps its
+  totals after its connections close, and after a reload removes it.
+
+### Fixed
+
+- **UDP traffic counts toward the totals**: only TCP relays added to the
+  upload and download totals, so `/traffic`, the `/connections` totals and
+  every client speed or usage figure built on them left out QUIC and every
+  other UDP flow. Each inbound now dials its UDP flows through one tunnel
+  helper that counts their payload, except for flows sent to REJECT or PASS,
+  which drop it.
+
 ## [0.23.1] - 2026-10-17
 
 ### Fixed

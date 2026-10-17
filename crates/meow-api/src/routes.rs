@@ -219,6 +219,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         )
         .route("/metrics", get(get_metrics))
         .route("/traffic", get(get_traffic))
+        .route("/statistics", get(get_statistics))
         .route("/logs", get(get_logs))
         .route("/memory", get(get_memory))
         .route("/dns/results", get(get_dns_results))
@@ -863,6 +864,40 @@ async fn get_traffic(
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from_stream(stream))
         .expect("valid traffic stream response")
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StatisticsResponse {
+    upload_total: meow_common::atomic::Int,
+    download_total: meow_common::atomic::Int,
+    proxies: BTreeMap<Arc<str>, ProxyTotals>,
+}
+
+#[derive(Serialize)]
+struct ProxyTotals {
+    upload: meow_common::atomic::Int,
+    download: meow_common::atomic::Int,
+}
+
+/// `GET /statistics` (meow extension, no mihomo equivalent): the byte totals
+/// and what each proxy carried since the tunnel started, TCP and UDP. A
+/// group's traffic is counted at the member that carried it, so `proxies`
+/// holds the leaves a flow ended at; a proxy stays listed after a reload
+/// removes it. Empty `proxies` when the tunnel runs headless.
+async fn get_statistics(State(state): State<Arc<AppState>>) -> Json<StatisticsResponse> {
+    let stats = state.tunnel.statistics();
+    let (upload_total, download_total) = stats.snapshot();
+    let proxies = stats
+        .proxy_traffic()
+        .into_iter()
+        .map(|(name, (upload, download))| (name, ProxyTotals { upload, download }))
+        .collect();
+    Json(StatisticsResponse {
+        upload_total,
+        download_total,
+        proxies,
+    })
 }
 
 #[derive(Deserialize)]

@@ -36,11 +36,12 @@ enum ConnectionKey {
     Headless,
 }
 
-/// Bound on the group hops [`connection_chain`] walks.
+/// Bound on the group hops [`connection_chain`] and `TunnelInner::dial_udp`
+/// walk.
 /// `reject_group_membership_cycles` keeps config-declared groups acyclic,
 /// so this only guards hand-built registries (same bound as the match
 /// loop's `RouteTargetProbe::unwraps_to`).
-const MAX_CHAIN_HOPS: usize = 16;
+pub(crate) const MAX_CHAIN_HOPS: usize = 16;
 
 /// The `/connections` `chains` entry for a flow routed to `adapter`: the
 /// leaf the dial will use first, the rule's target last — upstream's order,

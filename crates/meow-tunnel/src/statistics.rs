@@ -24,7 +24,7 @@ use parking_lot::Mutex;
 use serde::Serialize;
 use smallvec::SmallVec;
 use smol_str::SmolStr;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use uuid::Uuid;
@@ -77,6 +77,8 @@ pub struct ConnCounters {
     /// so the info struct keeps its size and the list JSON its shape; only
     /// `GET /connections/{id}` serializes them.
     notes: Option<ConnNotes>,
+    /// The leaf proxy's totals (`chains[0]`), bumped alongside these.
+    proxy: Option<Arc<ProxyTraffic>>,
 }
 
 impl ConnCounters {
@@ -106,6 +108,26 @@ impl ConnCounters {
 
     pub fn notes(&self) -> Option<&ConnNotes> {
         self.notes.as_ref()
+    }
+}
+
+/// Bytes relayed through one proxy since the tunnel started: the TCP
+/// connections whose chain starts at it (`chains[0]`, the leaf that dials)
+/// and the UDP flows dialled through it. Flows hold the `Arc` and bump it
+/// next to the totals, so the relay never looks a proxy up per chunk.
+#[derive(Debug, Default)]
+pub struct ProxyTraffic {
+    upload: AtomicI,
+    download: AtomicI,
+}
+
+impl ProxyTraffic {
+    pub fn upload_bytes(&self) -> Int {
+        self.upload.load(Ordering::Relaxed)
+    }
+
+    pub fn download_bytes(&self) -> Int {
+        self.download.load(Ordering::Relaxed)
     }
 }
 
@@ -185,6 +207,10 @@ pub struct Statistics {
     /// notes never enter it, so it stays empty unless notes are on.
     recently_closed: Mutex<VecDeque<ClosedConnection>>,
     pub rule_match: Arc<RuleMatchCounters>,
+    /// Per proxy, created on its first flow and kept for the tunnel's life,
+    /// so a proxy a reload removed still shows what it carried. Empty while
+    /// headless, which keeps only the totals.
+    proxy_traffic: DashMap<Arc<str>, Arc<ProxyTraffic>>,
 }
 
 /// How many closed connections with notes [`Statistics`] keeps.
@@ -241,6 +267,7 @@ impl Statistics {
             headless_connections: OnceLock::new(),
             recently_closed: Mutex::new(VecDeque::new()),
             rule_match: Arc::new(RuleMatchCounters::new()),
+            proxy_traffic: DashMap::new(),
         }
     }
 
@@ -252,18 +279,65 @@ impl Statistics {
         self.download_total.fetch_add(n, Ordering::Relaxed);
     }
 
-    /// Per-chunk relay accounting: two relaxed atomic adds, no map lookup.
+    /// Per-chunk relay accounting: relaxed atomic adds (the connection, its
+    /// proxy, the totals), no map lookup.
     /// Callers obtain the `ConnCounters` once at connection setup via
     /// [`Self::connection_counters`] (or `ConnectionGuard::counters`).
     pub fn record_upload(&self, counters: &ConnCounters, n: Int) {
         counters.upload.fetch_add(n, Ordering::Relaxed);
-        self.add_upload(n);
+        self.record_packet_upload(counters.proxy.as_deref(), n);
     }
 
     /// See [`Self::record_upload`].
     pub fn record_download(&self, counters: &ConnCounters, n: Int) {
         counters.download.fetch_add(n, Ordering::Relaxed);
+        self.record_packet_download(counters.proxy.as_deref(), n);
+    }
+
+    /// Count `n` bytes sent through `proxy` by a flow without connection
+    /// counters (UDP): the totals and the proxy's, when it has them.
+    pub fn record_packet_upload(&self, proxy: Option<&ProxyTraffic>, n: Int) {
+        if let Some(proxy) = proxy {
+            proxy.upload.fetch_add(n, Ordering::Relaxed);
+        }
+        self.add_upload(n);
+    }
+
+    /// See [`Self::record_packet_upload`].
+    pub fn record_packet_download(&self, proxy: Option<&ProxyTraffic>, n: Int) {
+        if let Some(proxy) = proxy {
+            proxy.download.fetch_add(n, Ordering::Relaxed);
+        }
         self.add_download(n);
+    }
+
+    /// `proxy`'s totals, created on its first flow; `None` while headless.
+    /// Setup path (once per connection or UDP flow), never per chunk: a
+    /// proxy seen before costs a lookup and a refcount, no allocation.
+    pub fn proxy_counters(&self, proxy: &str) -> Option<Arc<ProxyTraffic>> {
+        if self.is_headless() {
+            return None;
+        }
+        if let Some(entry) = self.proxy_traffic.get(proxy) {
+            return Some(Arc::clone(entry.value()));
+        }
+        let entry = self.proxy_traffic.entry(Arc::from(proxy)).or_default();
+        Some(Arc::clone(entry.value()))
+    }
+
+    /// Every proxy that carried a flow, with its `(upload, download)` bytes
+    /// so far, by name. Live connections count as far as they have got.
+    pub fn proxy_traffic(&self) -> BTreeMap<Arc<str>, (Int, Int)> {
+        self.proxy_traffic
+            .iter()
+            .map(|entry| {
+                let traffic = entry.value();
+                (
+                    Arc::clone(entry.key()),
+                    (traffic.upload_bytes(), traffic.download_bytes()),
+                )
+            })
+            .collect()
     }
 
     /// One-time (per connection) handle to the live byte counters of a
@@ -329,6 +403,7 @@ impl Statistics {
         let uuid = Uuid::new_v4();
         let counters = Arc::new(ConnCounters {
             notes,
+            proxy: chains.first().and_then(|leaf| self.proxy_counters(leaf)),
             ..ConnCounters::default()
         });
         let info = ConnectionInfo {
