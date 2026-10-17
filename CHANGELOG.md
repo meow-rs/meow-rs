@@ -8,6 +8,8 @@ the canonical, in-repo source a release is cut from.
 
 ## [Unreleased]
 
+## [0.23.1] - 2026-10-17
+
 ### Fixed
 
 - **meow-transport builds for iOS and tvOS again**: kcptun's `dscp:` option
