@@ -15,6 +15,12 @@ the canonical, in-repo source a release is cut from.
   for a client's statistics screen. A group's traffic counts at the member
   that carried it (the `chains[0]` of `/connections`); a proxy keeps its
   totals after its connections close, and after a reload removes it.
+- **Connection notes name the `dialer-proxy` hop**: the policy path stopped
+  at the outbound that owns the `dialer-proxy`, so a connection never showed
+  which member of the dialer group carried it. Each front-hop dial now adds
+  a note such as `Dialing ss.example.com:8443 via dialer-proxy fast → HK-01
+  (Vless)`, one per hop when chains nest. `chains` in `/connections` is
+  unchanged and still matches mihomo.
 
 ### Fixed
 

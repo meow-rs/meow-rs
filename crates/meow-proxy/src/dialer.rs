@@ -10,6 +10,7 @@
 //! upstream: mihomo `component/proxydialer` + `BasicOption.NewDialer`.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, Weak};
@@ -17,6 +18,7 @@ use std::sync::{Arc, Weak};
 use parking_lot::RwLock;
 
 use async_trait::async_trait;
+use meow_common::conn_note;
 use meow_common::{ConnType, MeowError, Metadata, Network, Proxy, ProxyConn, ProxyPacketConn};
 use meow_transport::Stream;
 use smol_str::SmolStr;
@@ -375,6 +377,7 @@ impl ProxyDialer {
 
     /// Dial the front proxy with a fully-formed [`Metadata`] target.
     async fn dial_metadata(&self, meta: Metadata) -> io::Result<Box<dyn Stream>> {
+        note_front_hop(&self.proxy, meta.remote_address(), &meta);
         let conn = self
             .proxy
             .dial_tcp(&meta)
@@ -508,6 +511,55 @@ mod packet_conn_socket {
 #[cfg(feature = "kcptun")]
 use packet_conn_socket::PacketConnSocket;
 
+/// Add the front hop of a `dialer-proxy` dial to the current connection's
+/// notes, e.g. `Dialing ss.example.com:8443 via dialer-proxy fast → HK-01
+/// (Vless)`. The tunnel's policy path ends at the outbound that owns the
+/// `dialer-proxy`, so without this note a connection never shows which
+/// member of the dialer group carried it. `metadata` must be what the
+/// front's groups select with on the dial that follows.
+pub(crate) fn note_front_hop(
+    front: &Arc<dyn Proxy>,
+    server: impl fmt::Display,
+    metadata: &Metadata,
+) {
+    let udp = if metadata.network == Network::Udp {
+        " over UDP"
+    } else {
+        ""
+    };
+    conn_note!(
+        Dial,
+        "Dialing {server}{udp} via dialer-proxy {}",
+        FrontHopPath { front, metadata }
+    );
+}
+
+/// `fast → HK-01 (Vless)`: the dialer, each group's pick, then the leaf's
+/// type. Like the tunnel's policy path it peeks `unwrap_proxy(metadata,
+/// false)`, which names the member the dial about to start takes without
+/// advancing round-robin counters or recording group use.
+struct FrontHopPath<'a> {
+    front: &'a Arc<dyn Proxy>,
+    metadata: &'a Metadata,
+}
+
+impl fmt::Display for FrontHopPath<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.front.name())?;
+        let mut leaf = Arc::clone(self.front);
+        // Config groups are acyclic (`reject_group_membership_cycles`); the
+        // bound only guards hand-built registries, as the tunnel's walk does.
+        for _ in 0..MAX_DIALER_CHAIN_DEPTH {
+            let Some(next) = leaf.unwrap_proxy(self.metadata, false) else {
+                break;
+            };
+            write!(f, " → {}", next.name())?;
+            leaf = next;
+        }
+        write!(f, " ({})", leaf.adapter_type())
+    }
+}
+
 /// Build the `Metadata` for a chained front-hop dial by `host`/`port`.
 ///
 /// An IP-literal `host` becomes a typed `dst_ip` so the front proxy encodes
@@ -632,6 +684,7 @@ impl TcpDialer for ProxyDialer {
         // `MeowError::Io` chains pass their errno through — a UDP-less
         // front or local fd exhaustion must not cost the member its
         // health (issues #663/#668).
+        note_front_hop(&self.proxy, meta.remote_address(), &meta);
         let conn = self
             .proxy
             .dial_udp(&meta)
@@ -1645,6 +1698,67 @@ mod tests {
         let addr: SocketAddr = "192.0.2.10:8443".parse().unwrap();
         let _ = dialer.dial_addr(addr, true).await;
         assert!(last_seen(&mock).internal, "dial_addr forwards it too");
+    }
+
+    /// The tunnel's policy path ends at the outbound that owns the
+    /// `dialer-proxy`, so the front hop's dial must name the dialer group's
+    /// pick in the connection's notes, IPv6 servers bracketed.
+    #[tokio::test]
+    async fn front_hop_dial_notes_the_dialer_groups_pick() {
+        use crate::group::fallback::FallbackGroup;
+        use crate::group::test_support::MockProxy;
+        use meow_common::conn_notes::ConnNotes;
+
+        let down = MockProxy::new_failing("down", AdapterType::Vless, "unused");
+        down.set_alive(false);
+        let pick = MockProxy::new_failing("HK-01", AdapterType::Vless, "boom");
+        let fast: Arc<dyn Proxy> = Arc::new(FallbackGroup::new("fast", vec![down, pick]));
+        let registry = ProxyRegistry::default();
+        let mut proxies: HashMap<SmolStr, Arc<dyn Proxy>> = HashMap::new();
+        proxies.insert(SmolStr::from("fast"), fast);
+        registry.publish(Arc::new(proxies));
+        let dialer = NamedProxyDialer::new(DialerTarget::new("fast", &registry));
+
+        let notes = ConnNotes::new();
+        ConnNotes::scope(Some(notes.clone()), async {
+            let _ = dialer.dial("ss.example.com", 8443, false).await;
+            let addr: SocketAddr = "[2001:db8::1]:8443".parse().unwrap();
+            let _ = dialer.dial_addr(addr, false).await;
+        })
+        .await;
+        assert_eq!(
+            notes.texts(),
+            [
+                "Dialing ss.example.com:8443 via dialer-proxy fast → HK-01 (Vless)",
+                "Dialing [2001:db8::1]:8443 via dialer-proxy fast → HK-01 (Vless)",
+            ]
+        );
+
+        // Outside a recording connection the dial notes nothing.
+        let _ = dialer.dial("ss.example.com", 8443, false).await;
+        assert_eq!(notes.len(), 2);
+    }
+
+    /// A UDP association through the front (kcptun sessions, chained SS
+    /// UDP) notes its hop too, marked as UDP.
+    #[tokio::test]
+    async fn front_hop_udp_dial_is_noted_as_udp() {
+        use meow_common::conn_notes::ConnNotes;
+
+        let dialer = ProxyDialer::new(Arc::new(CapturingUdpProxy {
+            udp: true,
+            seen: Mutex::new(Vec::new()),
+        }) as Arc<dyn Proxy>);
+        let remote: SocketAddr = "203.0.113.7:29900".parse().unwrap();
+        let notes = ConnNotes::new();
+        ConnNotes::scope(Some(notes.clone()), async {
+            let _ = dialer.dial_udp_conn(UdpTarget::Addr(remote), false).await;
+        })
+        .await;
+        assert_eq!(
+            notes.texts(),
+            ["Dialing 203.0.113.7:29900 over UDP via dialer-proxy udp-front (Socks5)"]
+        );
     }
 
     #[tokio::test]

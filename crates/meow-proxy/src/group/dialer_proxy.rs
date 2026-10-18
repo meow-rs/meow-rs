@@ -117,6 +117,9 @@ impl ProxyAdapter for DialerProxyAdapter {
                     .dialer
                     .resolve()
                     .ok_or_else(|| MeowError::Proxy(self.dialer.missing_error()))?;
+                // `relay_tcp` resolves the front's groups against the final
+                // target, so the note's walk uses that metadata too.
+                crate::dialer::note_front_hop(&front, self.inner.addr(), metadata);
                 let chain = [front, Arc::clone(&self.inner)];
                 relay_tcp(&chain, metadata).await
             },
@@ -245,6 +248,37 @@ mod tests {
             inner.dials(),
             0,
             "inner is reached via connect_over, not dial_tcp"
+        );
+    }
+
+    /// The relay-wrapper path notes the dialer group's pick like the
+    /// injected dialer does.
+    #[tokio::test]
+    async fn dial_tcp_notes_the_dialer_groups_pick() {
+        use crate::group::selector::SelectorGroup;
+        use meow_common::conn_notes::ConnNotes;
+
+        let pick = MockProxy::new_failing("HK-01", AdapterType::Trojan, "boom");
+        let fast: Arc<dyn Proxy> = Arc::new(SelectorGroup::new("fast", vec![pick]));
+        let registry = ProxyRegistry::default();
+        let mut proxies: HashMap<SmolStr, Arc<dyn Proxy>> = HashMap::new();
+        proxies.insert(SmolStr::from("fast"), fast);
+        registry.publish(Arc::new(proxies));
+        let adapter = DialerProxyAdapter::new(
+            MockProxy::new("daniel"),
+            DialerTarget::new("fast", &registry),
+        );
+
+        let notes = ConnNotes::new();
+        ConnNotes::scope(Some(notes.clone()), async {
+            let _ = adapter.dial_tcp(&meta("example.com", 443)).await;
+        })
+        .await;
+        let texts = notes.texts();
+        assert_eq!(texts.len(), 1, "{texts:?}");
+        assert!(
+            texts[0].ends_with(" via dialer-proxy fast → HK-01 (Trojan)"),
+            "{texts:?}"
         );
     }
 
