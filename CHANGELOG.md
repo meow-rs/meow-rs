@@ -16,6 +16,10 @@ the canonical, in-repo source a release is cut from.
   `direct-nameserver-follow-policy: true` the `nameserver-policy` applies
   to those lookups too. A named destination is resolved through it even
   when rule matching already resolved it through the main nameservers.
+  This covers UDP (QUIC included): a DIRECT UDP flow sends to the
+  direct-resolved address, and one the main nameservers cannot resolve
+  falls back to `direct-nameserver` instead of being dropped. User-declared
+  `type: direct` proxies follow it too unless they set their own `dns:`.
   Configs without `direct-nameserver` behave as before.
 
 ### Fixed

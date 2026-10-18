@@ -23,6 +23,12 @@ pub struct DirectAdapter {
     /// built via `with_resolver_slot` the slot is shared with the tunnel,
     /// so map `DIRECT` and `TunnelInner.direct` track one generation.
     resolver: Option<meow_dns::ResolverSlot>,
+    /// The tunnel's shared slot, consulted only for its
+    /// `dns.direct-nameserver` resolver. Set on user-declared `type: direct`
+    /// proxies without a `dns:` override so they follow `direct-nameserver`
+    /// like the built-in DIRECT, while every other lookup keeps the
+    /// adapter's own resolution (`resolver`, else the OS resolver).
+    direct_slot: Option<meow_dns::ResolverSlot>,
     /// Wall-clock bound on `TcpStream::connect`. iOS / macOS scoped-routing
     /// and reachability-cache transients can leave a `connect()` hanging
     /// indefinitely against a destination whose route is in flux (Wi-Fi
@@ -41,6 +47,7 @@ impl DirectAdapter {
             adapter_type: AdapterType::Direct,
             routing_mark: None,
             resolver: None,
+            direct_slot: None,
             connect_timeout: None,
             health: ProxyHealth::new(),
         }
@@ -78,6 +85,15 @@ impl DirectAdapter {
         self
     }
 
+    /// Follow `slot`'s `dns.direct-nameserver` resolver (see the
+    /// `direct_slot` field doc). Ignored while `resolver` is set: a shared
+    /// resolver slot already carries the direct resolver, and a private one
+    /// is an explicit per-proxy `dns:` override.
+    pub fn with_direct_resolver_slot(mut self, slot: meow_dns::ResolverSlot) -> Self {
+        self.direct_slot = Some(slot);
+        self
+    }
+
     /// Bound `TcpStream::connect` on `dial_tcp`. Returns `MeowError::Io`
     /// with `ErrorKind::TimedOut` if the connect exceeds `timeout`. See
     /// the `connect_timeout` field doc for the motivating failure mode
@@ -104,9 +120,7 @@ impl DirectAdapter {
         //    pre-resolved `dst_ip` via the main nameservers — mihomo's direct
         //    dial prefers `Host` over `DstIP` for the same reason.
         if let Some(direct) = self.direct_resolver() {
-            if !metadata.host.is_empty()
-                && meow_common::metadata_ip_literal(&metadata.host).is_none()
-            {
+            if Self::is_named(metadata) {
                 return Self::resolve_host_with(&direct, metadata).await;
             }
         }
@@ -161,7 +175,18 @@ impl DirectAdapter {
     fn direct_resolver(&self) -> Option<Arc<Resolver>> {
         self.resolver
             .as_ref()
+            .or(self.direct_slot.as_ref())
             .and_then(|slot| slot.read().direct_resolver().map(Arc::clone))
+    }
+
+    /// `true` when `metadata` names a host (not an IP literal) that the
+    /// `dns.direct-nameserver` resolver will resolve at dial time.
+    fn direct_resolver_applies(&self, metadata: &Metadata) -> bool {
+        Self::is_named(metadata) && self.direct_resolver().is_some()
+    }
+
+    fn is_named(metadata: &Metadata) -> bool {
+        !metadata.host.is_empty() && meow_common::metadata_ip_literal(&metadata.host).is_none()
     }
 
     async fn resolve_host_with(
@@ -406,7 +431,13 @@ impl ProxyAdapter for DirectAdapter {
         // and *connect* the socket. The conn is bound: the caller holds no
         // literal for a name target and its write arg is only an advisory
         // placeholder.
-        if metadata.domain_udp_target().is_some() {
+        //
+        // A named destination under `dns.direct-nameserver` takes the same
+        // bound path: the listener's `dst_ip` came from the main
+        // nameservers (NAT key), while `resolve_targets` re-resolves the
+        // host through the direct resolver, so the socket connects there
+        // and the caller's main-resolved write address is ignored.
+        if metadata.domain_udp_target().is_some() || self.direct_resolver_applies(metadata) {
             let mut last_err = None;
             for addr in self.resolve_targets(metadata).await? {
                 let bind: SocketAddr = if addr.is_ipv4() {
@@ -837,6 +868,88 @@ mod tests {
         assert_eq!(&buf[..n], b"ping");
         assert_eq!(src, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port));
         echo_task.await.unwrap();
+    }
+
+    /// Ordinary listener UDP carries a main-resolved `dst_ip` (NAT key).
+    /// Under `dns.direct-nameserver` the named destination re-resolves
+    /// through the direct resolver and the socket connects there; the
+    /// caller's main-resolved write address is ignored.
+    #[tokio::test]
+    async fn dial_udp_named_destination_uses_direct_resolver() {
+        let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = echo.local_addr().unwrap().port();
+        let echo_task = tokio::spawn(async move {
+            let mut buf = [0u8; 16];
+            let (n, src) = echo.recv_from(&mut buf).await.unwrap();
+            echo.send_to(&buf[..n], src).await.unwrap();
+        });
+
+        let main_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let mut main = hosts_only_resolver("node.test", main_ip);
+        main.set_direct_resolver(Arc::new(hosts_only_resolver(
+            "node.test",
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+        )));
+        let adapter = DirectAdapter::new().with_resolver(Arc::new(main));
+
+        let meta = Metadata {
+            network: meow_common::Network::Udp,
+            host: "node.test".into(),
+            dst_ip: Some(main_ip),
+            dst_port: port,
+            ..Default::default()
+        };
+        assert!(meta.domain_udp_target().is_none());
+        let conn = adapter.dial_udp(&meta).await.expect("dial_udp");
+        conn.write_packet(b"ping", &SocketAddr::new(main_ip, port))
+            .await
+            .expect("write");
+        let mut buf = [0u8; 16];
+        let (n, src) = tokio::time::timeout(Duration::from_secs(2), conn.read_packet(&mut buf))
+            .await
+            .expect("reply from the direct-resolved address")
+            .expect("read");
+        assert_eq!(&buf[..n], b"ping");
+        assert_eq!(src, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port));
+        echo_task.await.unwrap();
+    }
+
+    /// A user-declared direct proxy shares the tunnel slot for
+    /// `direct-nameserver` only: without one its pre-resolved destination
+    /// is kept, with one the name re-resolves through it.
+    #[tokio::test]
+    async fn direct_resolver_slot_only_supplies_direct_nameserver() {
+        let main_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let direct_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2));
+        let slot = meow_dns::new_resolver_slot(Arc::new(hosts_only_resolver(
+            "node.test",
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 9)),
+        )));
+        let adapter = DirectAdapter::new().with_direct_resolver_slot(Arc::clone(&slot));
+        let mut metadata = tcp_metadata("node.test", 443);
+        metadata.dst_ip = Some(main_ip);
+        assert_eq!(
+            adapter.resolve_targets(&metadata).await.unwrap(),
+            vec![SocketAddr::new(main_ip, 443)]
+        );
+
+        // A config swap installs a generation carrying `direct-nameserver`.
+        let mut main = hosts_only_resolver("node.test", main_ip);
+        main.set_direct_resolver(Arc::new(hosts_only_resolver("node.test", direct_ip)));
+        *slot.write() = Arc::new(main);
+        assert_eq!(
+            adapter.resolve_targets(&metadata).await.unwrap(),
+            vec![SocketAddr::new(direct_ip, 443)]
+        );
+
+        // An explicit per-proxy `dns:` resolver wins over the shared slot.
+        let own = DirectAdapter::new()
+            .with_resolver(Arc::new(hosts_only_resolver("node.test", main_ip)))
+            .with_direct_resolver_slot(slot);
+        assert_eq!(
+            own.resolve_targets(&metadata).await.unwrap(),
+            vec![SocketAddr::new(main_ip, 443)]
+        );
     }
 
     /// `EMFILE` on unix, `WSAEMFILE` on Windows — both are in

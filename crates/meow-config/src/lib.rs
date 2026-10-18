@@ -2085,48 +2085,50 @@ fn insert_parsed_leaves(
     proxies: &mut HashMap<SmolStr, Arc<dyn Proxy>>,
     static_proxy_names: &mut std::collections::HashSet<SmolStr>,
     raw_proxies: &[HashMap<String, serde_json::Value>],
+    resolver: Option<&meow_dns::ResolverSlot>,
     ipv6: bool,
     strict: bool,
 ) -> Result<std::collections::HashSet<SmolStr>, anyhow::Error> {
     let mut placeholder_names = std::collections::HashSet::new();
     for raw_proxy in raw_proxies {
-        let (proxy, placeholder_bound) = match proxy_parser::parse_proxy(raw_proxy, ipv6) {
-            Ok(proxy) => (proxy, false),
-            Err(e) if strict => {
-                let name = raw_proxy
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("<unnamed>");
-                return Err(anyhow::anyhow!(
-                    "proxies: failed to parse '{name}' (strict mode): {e}"
-                ));
-            }
-            // Keep the slot entry as a dead placeholder instead of dropping
-            // it: a `select` group, an explicit `MATCH` target or a
-            // `dialer-proxy` chain that names the node fails the dial rather
-            // than shifting the traffic to a sibling member or DIRECT —
-            // the same contract the compiled-out `trusttunnel` type gets
-            // (other compiled-out types stay warn-and-drop). The operator
-            // cannot fix a missing protocol or a missing built-in plugin
-            // transport by editing the config, so `-t`, boot, `PUT /configs`
-            // and refreshes all read identically here.
-            Err(e) => {
-                if let Some(declared) = proxy_parser::placeholder_adapter_type(raw_proxy) {
+        let (proxy, placeholder_bound) =
+            match proxy_parser::parse_static_proxy(raw_proxy, ipv6, resolver) {
+                Ok(proxy) => (proxy, false),
+                Err(e) if strict => {
                     let name = raw_proxy
                         .get("name")
                         .and_then(|v| v.as_str())
                         .unwrap_or("<unnamed>");
-                    warn!(
-                        "proxies: '{name}' failed to parse ({e}); keeping the name bound \
-                         to an unavailable node so no dial can fall back past it"
-                    );
-                    (unavailable_placeholder(name, &e, declared), true)
-                } else {
-                    warn!("Failed to parse proxy: {}", e);
-                    continue;
+                    return Err(anyhow::anyhow!(
+                        "proxies: failed to parse '{name}' (strict mode): {e}"
+                    ));
                 }
-            }
-        };
+                // Keep the slot entry as a dead placeholder instead of dropping
+                // it: a `select` group, an explicit `MATCH` target or a
+                // `dialer-proxy` chain that names the node fails the dial rather
+                // than shifting the traffic to a sibling member or DIRECT —
+                // the same contract the compiled-out `trusttunnel` type gets
+                // (other compiled-out types stay warn-and-drop). The operator
+                // cannot fix a missing protocol or a missing built-in plugin
+                // transport by editing the config, so `-t`, boot, `PUT /configs`
+                // and refreshes all read identically here.
+                Err(e) => {
+                    if let Some(declared) = proxy_parser::placeholder_adapter_type(raw_proxy) {
+                        let name = raw_proxy
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("<unnamed>");
+                        warn!(
+                            "proxies: '{name}' failed to parse ({e}); keeping the name bound \
+                         to an unavailable node so no dial can fall back past it"
+                        );
+                        (unavailable_placeholder(name, &e, declared), true)
+                    } else {
+                        warn!("Failed to parse proxy: {}", e);
+                        continue;
+                    }
+                }
+            };
         // Prefer the YAML `name:` as the registry key. `proxy.name()`
         // is fine for SS/Trojan/VLESS (their parsers thread the name
         // into the adapter) but `DirectAdapter::name()` is hardcoded
@@ -2381,6 +2383,7 @@ fn build_proxy_layer(
         &mut proxies,
         &mut static_proxy_names,
         raw.proxies.as_deref().unwrap_or(&[]),
+        resolver,
         ipv6,
         strict,
     )?;
@@ -5004,7 +5007,15 @@ mod missing_plugin_placeholder_tests {
     async fn missing_plugin_node_binds_a_dead_placeholder() {
         let mut proxies = HashMap::new();
         let mut names = std::collections::HashSet::new();
-        insert_parsed_leaves(&mut proxies, &mut names, &[raw_gost_node()], false, false).unwrap();
+        insert_parsed_leaves(
+            &mut proxies,
+            &mut names,
+            &[raw_gost_node()],
+            None,
+            false,
+            false,
+        )
+        .unwrap();
         let bound = proxies
             .get("s-gost")
             .expect("a missing-plugin node must stay bound, not dropped");
@@ -5018,8 +5029,15 @@ mod missing_plugin_placeholder_tests {
     fn missing_plugin_node_still_hard_errors_under_strict() {
         let mut proxies = HashMap::new();
         let mut names = std::collections::HashSet::new();
-        let err = insert_parsed_leaves(&mut proxies, &mut names, &[raw_gost_node()], false, true)
-            .unwrap_err();
+        let err = insert_parsed_leaves(
+            &mut proxies,
+            &mut names,
+            &[raw_gost_node()],
+            None,
+            false,
+            true,
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("strict mode"),
             "strict must still hard-error: {err}"
@@ -5194,6 +5212,7 @@ mod missing_plugin_placeholder_tests {
             &mut proxies,
             &mut names,
             &[raw_direct_dup(), raw_dead_dup()],
+            None,
             false,
             false,
         )
@@ -5216,6 +5235,7 @@ mod missing_plugin_placeholder_tests {
             &mut proxies,
             &mut names,
             &[raw_dead_dup(), raw_direct_dup()],
+            None,
             false,
             false,
         )
@@ -6068,7 +6088,7 @@ mod dialer_proxy_tests {
         let mut names = std::collections::HashSet::new();
 
         tracing::subscriber::with_default(subscriber, || {
-            insert_parsed_leaves(&mut proxies, &mut names, &raws, false, false).unwrap();
+            insert_parsed_leaves(&mut proxies, &mut names, &raws, None, false, false).unwrap();
         });
 
         assert_eq!(proxies.len(), 1, "last-wins is unchanged");

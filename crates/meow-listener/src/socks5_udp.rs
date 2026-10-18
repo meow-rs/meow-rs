@@ -484,9 +484,7 @@ async fn run_session(
         // UDP keeps the eager pre_resolve (no lazy enrichment): the writer
         // needs a resolved dst_ip regardless of what the rules demand.
         inner.pre_resolve(&mut metadata).await;
-        if metadata.dst_ip.is_none() && !metadata.host.is_empty() {
-            metadata.dst_ip = inner.resolver().resolve_ip_real(&metadata.host).await;
-        }
+        inner.resolve_udp_dst(&mut metadata).await;
         let Some(dst_ip) = metadata.dst_ip else {
             return Err(format!(
                 "dst_ip not resolved for {}",

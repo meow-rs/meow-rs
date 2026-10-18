@@ -1397,7 +1397,7 @@ mod tests {
 
     #[tokio::test]
     async fn direct_nameserver_installs_direct_resolver() {
-        let raw: RawConfig = serde_yaml::from_str(
+        let raw: RawConfig = serde_saphyr::from_str(
             "dns:\n  enable: true\n  nameserver:\n    - 1.1.1.1\n  direct-nameserver:\n    - 223.5.5.5\n  direct-nameserver-follow-policy: true\n  nameserver-policy:\n    '+.example.cn': 119.29.29.29\n",
         )
         .unwrap();
@@ -1423,7 +1423,7 @@ mod tests {
     #[tokio::test]
     async fn no_direct_nameserver_leaves_direct_resolver_none() {
         let raw: RawConfig =
-            serde_yaml::from_str("dns:\n  enable: true\n  nameserver:\n    - 1.1.1.1\n").unwrap();
+            serde_saphyr::from_str("dns:\n  enable: true\n  nameserver:\n    - 1.1.1.1\n").unwrap();
         let cfg = parse_dns(
             &raw,
             None,
