@@ -8,6 +8,8 @@ the canonical, in-repo source a release is cut from.
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-10-18
+
 ### Added
 
 - **Traffic per proxy** (`GET /statistics`): the upload and download totals

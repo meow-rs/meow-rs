@@ -2322,7 +2322,7 @@ dependencies = [
 
 [[package]]
 name = "meow-anytls"
-version = "0.23.1"
+version = "0.24.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2351,7 +2351,7 @@ dependencies = [
 
 [[package]]
 name = "meow-api"
-version = "0.23.1"
+version = "0.24.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2392,7 +2392,7 @@ dependencies = [
 
 [[package]]
 name = "meow-app"
-version = "0.23.1"
+version = "0.24.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2425,7 +2425,7 @@ dependencies = [
 
 [[package]]
 name = "meow-bench"
-version = "0.23.1"
+version = "0.24.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2439,7 +2439,7 @@ dependencies = [
 
 [[package]]
 name = "meow-common"
-version = "0.23.1"
+version = "0.24.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2463,7 +2463,7 @@ dependencies = [
 
 [[package]]
 name = "meow-config"
-version = "0.23.1"
+version = "0.24.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2495,7 +2495,7 @@ dependencies = [
 
 [[package]]
 name = "meow-dns"
-version = "0.23.1"
+version = "0.24.0"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -2521,7 +2521,7 @@ dependencies = [
 
 [[package]]
 name = "meow-listener"
-version = "0.23.1"
+version = "0.24.0"
 dependencies = [
  "async-trait",
  "base64",
@@ -2549,7 +2549,7 @@ dependencies = [
 
 [[package]]
 name = "meow-lwip"
-version = "0.23.1"
+version = "0.24.0"
 dependencies = [
  "bindgen",
  "bytes",
@@ -2563,7 +2563,7 @@ dependencies = [
 
 [[package]]
 name = "meow-proxy"
-version = "0.23.1"
+version = "0.24.0"
 dependencies = [
  "aes 0.8.4",
  "aes-gcm 0.10.3",
@@ -2617,7 +2617,7 @@ dependencies = [
 
 [[package]]
 name = "meow-rules"
-version = "0.23.1"
+version = "0.24.0"
 dependencies = [
  "criterion",
  "ipnet",
@@ -2634,7 +2634,7 @@ dependencies = [
 
 [[package]]
 name = "meow-transport"
-version = "0.23.1"
+version = "0.24.0"
 dependencies = [
  "aes 0.9.3",
  "aes-gcm 0.10.3",
@@ -2685,7 +2685,7 @@ dependencies = [
 
 [[package]]
 name = "meow-trie"
-version = "0.23.1"
+version = "0.24.0"
 dependencies = [
  "criterion",
  "proptest",
@@ -2693,7 +2693,7 @@ dependencies = [
 
 [[package]]
 name = "meow-tunnel"
-version = "0.23.1"
+version = "0.24.0"
 dependencies = [
  "async-trait",
  "criterion",
