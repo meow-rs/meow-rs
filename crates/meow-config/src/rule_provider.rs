@@ -22,6 +22,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context, Result};
 use meow_common::adapter::Proxy;
 use meow_common::atomic::AtomicU;
+use meow_common::logbook::{self, Level};
 use meow_common::{Metadata, RuleMatchHelper};
 use meow_rules::{
     build_rule_set, build_rule_set_checked, build_rule_set_from_mrs_with_behavior, is_mrs_bytes,
@@ -133,6 +134,10 @@ pub struct RuleProvider {
     /// The remote fetch the load left owing, taken by
     /// [`Self::spawn_initial_fetch`] once the provider is committed.
     initial_fetch: parking_lot::Mutex<InitialFetch>,
+    /// Why the load registered this provider empty, recorded in the
+    /// logbook once the provider is committed ([`Self::spawn_initial_fetch`]):
+    /// a candidate that is built twice, or never committed, records nothing.
+    load_failure: parking_lot::Mutex<Option<String>>,
 }
 
 /// What an http provider's load left for the background to fetch.
@@ -231,6 +236,14 @@ impl RuleProvider {
     /// databases the initial load saw. Refresh callers therefore cannot
     /// accidentally pass a different (e.g. empty) context.
     pub async fn refresh(&self) -> Result<()> {
+        let refreshed = self.fetch_and_install().await;
+        if let Err(e) = &refreshed {
+            self.logbook_failed(&format!("{e:#}"));
+        }
+        refreshed
+    }
+
+    async fn fetch_and_install(&self) -> Result<()> {
         let bytes = match self.provider_type {
             ProviderType::Http => {
                 fetch_http_async(
@@ -319,6 +332,7 @@ impl RuleProvider {
             );
             return Ok(());
         }
+        let previous = self.rules.read().len();
         if demands(&**self.rules.read()) != demands(&*new_rules) {
             warn!(
                 provider = %self.name,
@@ -334,7 +348,34 @@ impl RuleProvider {
         *installed = gen;
         self.touch();
         debug!(provider = %self.name, "rule-provider refreshed: {} rules", count);
+        self.logbook_updated(previous, count);
         Ok(())
+    }
+
+    /// Logbook: a fetched payload replaced `previous` rules with `count`.
+    /// Recorded when the count changed or the update ends a failure the
+    /// logbook shows: a refresh that keeps the count is routine, and
+    /// providers refresh daily in the dozens.
+    fn logbook_updated(&self, previous: usize, count: usize) {
+        let name = &self.name;
+        if count == previous && !logbook::failing(logbook::kind::RULE_PROVIDER_UPDATE, name) {
+            return;
+        }
+        let message = if count == previous {
+            format!("Updated rule provider '{name}': {count} rules")
+        } else {
+            format!("Updated rule provider '{name}': {count} rules (was {previous})")
+        };
+        logbook::event(logbook::kind::RULE_PROVIDER_UPDATE, Level::Info, message)
+            .subject(name.as_str())
+            .field("rules", count)
+            .record();
+    }
+
+    /// Logbook: fetching or parsing the payload failed. Repeats fold while
+    /// the provider keeps failing.
+    fn logbook_failed(&self, error: &str) {
+        rule_provider_failed(&self.name, error);
     }
 
     /// Fetch, on a detached task, whatever remote payload this provider's
@@ -352,9 +393,12 @@ impl RuleProvider {
     /// installs a remote payload, and holds only a `Weak` between attempts,
     /// so a provider dropped by a config commit ends it. The obligation is
     /// taken, so this spawns at most once per provider: `None` when nothing
-    /// is owed. [`crate::rule_provider_refresh::RefreshSupervisor::reconcile`]
+    /// is owed. A load failure is recorded here too, once. [`crate::rule_provider_refresh::RefreshSupervisor::reconcile`]
     /// calls it for every committed provider.
     pub fn spawn_initial_fetch(self: &Arc<Self>) -> Option<tokio::task::JoinHandle<()>> {
+        if let Some(error) = self.load_failure.lock().take() {
+            self.logbook_failed(&error);
+        }
         let owed = std::mem::replace(&mut *self.initial_fetch.lock(), InitialFetch::Settled);
         if matches!(owed, InitialFetch::Settled) {
             return None;
@@ -407,9 +451,15 @@ async fn initial_fetch_loop(provider: Weak<RuleProvider>, owed: InitialFetch) {
                     return;
                 }
                 Ok(false) => {}
-                Err(e) => warn!(provider = %p.name, "rule-provider payload rejected: {e:#}"),
+                Err(e) => {
+                    warn!(provider = %p.name, "rule-provider payload rejected: {e:#}");
+                    p.logbook_failed(&format!("{e:#}"));
+                }
             },
-            Err(e) => warn!(provider = %p.name, "rule-provider download failed: {e}"),
+            Err(e) => {
+                warn!(provider = %p.name, "rule-provider download failed: {e}");
+                p.logbook_failed(&e);
+            }
         }
         // A finished-but-failed download was the first attempt: back off
         // before the next one. Superseded means a refresh already fetched.
@@ -931,6 +981,7 @@ pub fn load_providers_prefetched(
                         ));
                     }
                     warn!("Failed to load rule-provider '{}': {:#}", name, e);
+                    rule_provider_failed(name, &format!("{e:#}"));
                     continue;
                 }
             }
@@ -966,6 +1017,11 @@ pub fn load_providers_prefetched(
                 // later `PUT /providers/rules/{name}` refresh can heal it.
                 // Matches mihomo, which registers failed providers.
                 warn!("rule-provider '{name}': payload unavailable, starting empty: {e:#}");
+                // A download still running at the deadline is not a
+                // failure; the adopted download records its own outcome.
+                if !matches!(*provider.initial_fetch.lock(), InitialFetch::Adopt(_)) {
+                    *provider.load_failure.lock() = Some(format!("{e:#}"));
+                }
                 out.insert(name.clone(), Arc::new(*provider));
             }
             Err(e) if strict => {
@@ -975,10 +1031,24 @@ pub fn load_providers_prefetched(
             }
             Err(e) => {
                 warn!("Failed to load rule-provider '{}': {:#}", name, e);
+                rule_provider_failed(name, &format!("{e:#}"));
             }
         }
     }
     Ok(out)
+}
+
+/// Logbook: loading or updating rule provider `name` failed.
+fn rule_provider_failed(name: &str, error: &str) {
+    logbook::event(
+        logbook::kind::RULE_PROVIDER_UPDATE,
+        Level::Error,
+        format!("Updating rule provider '{name}' failed: {error}"),
+    )
+    .subject(name)
+    .field("error", error)
+    .coalesce()
+    .record();
 }
 
 /// Why a provider failed to load — the strict gate needs the failure
@@ -1380,6 +1450,7 @@ fn make_provider(
         // `written_gen` of 0 under `cache_write_lock`.
         refresh_gen: meow_common::atomic::AtomicU::new(1),
         initial_fetch: parking_lot::Mutex::new(InitialFetch::Settled),
+        load_failure: parking_lot::Mutex::new(None),
     }
 }
 

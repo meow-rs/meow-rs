@@ -56,6 +56,7 @@
 //! on platforms where the binding syscall is not implemented, which lets
 //! the TUN listener fail closed instead of starting a looping configuration.
 
+use crate::logbook;
 use std::io;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -127,8 +128,25 @@ impl Drop for OutboundIfaceGuard {
             Some(name) if *name == *self.iface => {}
             Some(name) => {
                 tracing::info!("outbound interface binding restored to '{name}' ({MECHANISM})");
+                logbook::event(
+                    logbook::kind::NETWORK_INTERFACE,
+                    logbook::Level::Info,
+                    format!("Outbound connections bind to '{name}' again"),
+                )
+                .field("interface", &*name)
+                .field("previous", &*self.iface)
+                .record();
             }
-            None => tracing::info!("outbound interface binding cleared"),
+            None => {
+                tracing::info!("outbound interface binding cleared");
+                logbook::event(
+                    logbook::kind::NETWORK_INTERFACE,
+                    logbook::Level::Info,
+                    format!("Outbound connections no longer bind to '{}'", self.iface),
+                )
+                .field("previous", &*self.iface)
+                .record();
+            }
         }
     }
 }
@@ -247,15 +265,26 @@ fn push_owner(iface: Arc<str>, index: u32) -> OutboundIfaceGuard {
         index,
     });
     drop(owners);
-    match superseded {
-        Some(prev) if *prev == *iface => {
+    match &superseded {
+        Some(prev) if **prev == *iface => {
             tracing::debug!("outbound interface binding '{iface}' taken over by a new owner");
+            return OutboundIfaceGuard { id, iface };
         }
         Some(prev) => tracing::info!(
             "outbound sockets bound to interface '{iface}' ({MECHANISM}; supersedes '{prev}')"
         ),
         None => tracing::info!("outbound sockets bound to interface '{iface}' ({MECHANISM})"),
     }
+    let mut event = logbook::event(
+        logbook::kind::NETWORK_INTERFACE,
+        logbook::Level::Info,
+        format!("Outbound connections bind to '{iface}'"),
+    )
+    .field("interface", &*iface);
+    if let Some(prev) = superseded {
+        event = event.field("previous", &*prev);
+    }
+    event.record();
     OutboundIfaceGuard { id, iface }
 }
 

@@ -119,6 +119,7 @@ pub async fn run_loop(
                 Ok(p) => p,
                 Err(e) => {
                     warn!("subscription '{name}': {e:#}");
+                    meow_api::routes::subscription_failed(&name, &format!("{e:#}"));
                     continue;
                 }
             };
@@ -145,6 +146,10 @@ pub async fn run_loop(
                             "subscription '{}': ECH pre-resolution failed (strict mode): {}; \
                              skipping refresh",
                             name, e
+                        );
+                        meow_api::routes::subscription_failed(
+                            &name,
+                            &format!("ECH pre-resolution failed: {e}"),
                         );
                         // Same stamping as the rebuild-error arms below —
                         // a statically-defective payload shouldn't
@@ -273,6 +278,10 @@ pub async fn run_loop(
                                     "subscription '{name}': proxy group '{missing}' \
                                      failed validation; NOT committing"
                                 );
+                                meow_api::routes::subscription_failed(
+                                    &name,
+                                    &format!("proxy group '{missing}' failed validation"),
+                                );
                                 let mut live = raw_config.write();
                                 if let Some(sub) = live
                                     .subscriptions
@@ -313,6 +322,10 @@ pub async fn run_loop(
                                     warn!(
                                         "subscription '{name}': dns reconcile failed; \
                                          NOT committing: {msg}"
+                                    );
+                                    meow_api::routes::subscription_failed(
+                                        &name,
+                                        &format!("DNS reconcile failed: {msg}"),
                                     );
                                     let mut live = raw_config.write();
                                     if let Some(sub) = live
@@ -365,6 +378,11 @@ pub async fn run_loop(
                             // merge widens the candidate's sections, route it
                             // through the reconcile instead (issue #543
                             // review).
+                            let update = meow_api::routes::subscription_update(
+                                &raw_config.read(),
+                                &candidate,
+                                &name,
+                            );
                             *raw_config.write() = candidate.clone();
                             if let Some(dns) = dns {
                                 meow_api::routes::publish_dns(&tunnel, dns_server.as_ref(), &dns)
@@ -378,6 +396,9 @@ pub async fn run_loop(
                                 ),
                             );
                             info!("Subscription '{}' refreshed successfully", name);
+                            if let Some(update) = update {
+                                update.record();
+                            }
                             // Save while still in the lane: every other
                             // writer serializes its rename under
                             // `CONFIG_MUTATION`, so the file's last writer
@@ -406,6 +427,7 @@ pub async fn run_loop(
                         }
                         Ok(Err(e)) => {
                             error!("Failed to rebuild after refreshing '{}': {}", name, e);
+                            meow_api::routes::subscription_failed(&name, &format!("{e:#}"));
                             // Still stamp `last_updated` on the live raw —
                             // without it the next 60 s pass re-downloads and
                             // re-fails forever instead of honoring
@@ -424,6 +446,10 @@ pub async fn run_loop(
                                 "Failed to join rebuild task after refreshing '{}': {}",
                                 name, e
                             );
+                            meow_api::routes::subscription_failed(
+                                &name,
+                                &format!("the rebuild task failed: {e}"),
+                            );
                             // Same stamping as the rebuild-error arm — a
                             // panicking task shouldn't re-download every
                             // 60 s either.
@@ -440,6 +466,7 @@ pub async fn run_loop(
                 }
                 Err(e) => {
                     error!("Failed to refresh subscription '{}': {}", name, e);
+                    meow_api::routes::subscription_failed(&name, &format!("{e:#}"));
                     // A payload defect is permanent until the publisher fixes
                     // it — stamp `last_updated` so the pass honors `interval`
                     // rather than re-downloading the same garbled body every

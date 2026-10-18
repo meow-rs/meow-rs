@@ -10,6 +10,23 @@ the canonical, in-repo source a release is cut from.
 
 ### Added
 
+- **Logbook** (`GET /logbook`, `DELETE /logbook`, a meow extension): a
+  persistent record of the engine events worth reading later, the way
+  Surge's Logbook sits next to its log. It keeps starts and stops, runs that
+  ended without a clean stop (a crash, a kill, a power cut), config reloads
+  and API edits, subscription, proxy-provider, rule-provider and geodata
+  updates and their failures, listeners that did not start, outbound
+  interface changes, health-check sweeps that find members of a group going
+  down or coming back, and `url-test` / `fallback` groups switching member.
+  Repeats of a failure fold into one entry with a count. Entries are JSON
+  Lines under `<home>/logbook/`, kept for 7 days and 2 MiB, and survive
+  restarts and crashes; the API filters by level, kind and subject, pages
+  back with `before` and polls with `since`. The logbook never records the
+  destinations of user traffic, and records rule edits by index, not rule
+  text. On by default; `logbook:
+  {enable: false}` turns it off. Details and the event kinds are in
+  ADR-0014.
+
 - **`dialer-proxy` groups skip members that cannot reach the chained
   server**: a member of a `url-test`, `fallback` or `load-balance` group can
   pass the group's URL test and still be unable to reach the server of the

@@ -106,6 +106,8 @@ pub struct GeneralConfig {
     pub bind_address: String,
     /// `connection-notes` — see `Tunnel::set_connection_notes`.
     pub connection_notes: bool,
+    /// `logbook.enable` — see `meow_common::logbook::apply`.
+    pub logbook: bool,
 }
 
 /// Single source of truth for the effective `ipv6` setting of a config
@@ -3886,6 +3888,7 @@ pub async fn build_config(
         allow_lan: raw.allow_lan.unwrap_or(false),
         bind_address,
         connection_notes: raw.connection_notes.unwrap_or(false),
+        logbook: raw::RawLogbook::enabled(raw.logbook.as_ref()),
     };
 
     // Registry the provider nodes' `dialer-proxy` targets resolve against

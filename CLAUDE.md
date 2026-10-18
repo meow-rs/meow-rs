@@ -99,6 +99,7 @@ The `tun:` config section (issue #326, feature `listener-tun`, in the `full` bun
 - **`Rule` trait** (`meow-common/src/rule.rs`) — all rule types implement this for matching against `Metadata`
 - **Proxy groups** (`meow-proxy/src/group/`) — Selector, URLTest, Fallback wrap multiple adapters with selection strategies
 - **Tunnel** (`meow-tunnel/src/tunnel.rs`) — central `Arc`-shared routing engine; holds proxies, rules, DNS resolver, connection stats
+- **Logbook** (`meow-common/src/logbook/`) — persistent record of notable engine events (`GET /logbook`); producers call `logbook::event(kind, level, message).subject(..).record()`, a no-op when none is installed. New kinds go in `logbook::kind` and the [ADR-0014](docs/adr/0014-logbook.md) table; never record traffic destinations, and reference rules by index
 
 ### Adding New Proxy Protocols
 

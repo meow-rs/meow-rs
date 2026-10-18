@@ -574,6 +574,7 @@ tools built for Go mihomo will ignore them.
 | Subscription management API | `GET\|POST /api/subscriptions`, `DELETE /api/subscriptions/{name}`, `POST /api/subscriptions/{name}/refresh` | meow-rs-specific |
 | Extended proxy group API | `GET\|POST\|PUT\|DELETE /api/proxy-groups[/:name]` | meow-rs-specific |
 | Rule CRUD API | `POST\|PUT\|DELETE /rules[/:index]` | Runtime rule editing |
+| Logbook | `GET\|DELETE /logbook`, `logbook: {enable: true}` | Persistent record of notable engine events, kept 7 days under `<home>/logbook/` ([ADR-0014](adr/0014-logbook.md)) |
 
 Keep these under the `/api/` prefix so they do not collide with
 Clash-compatible paths.

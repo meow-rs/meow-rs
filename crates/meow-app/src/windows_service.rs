@@ -739,9 +739,10 @@ mod tests {
     async fn windows_service_shutdown_signal_completes() {
         let (sender, receiver) = tokio::sync::oneshot::channel();
         sender.send(()).unwrap();
-        ShutdownSignal::WindowsService(receiver)
+        let by = ShutdownSignal::WindowsService(receiver)
             .wait()
             .await
             .unwrap();
+        assert_eq!(by, "service stop");
     }
 }

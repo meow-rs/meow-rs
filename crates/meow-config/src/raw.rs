@@ -216,6 +216,10 @@ pub struct RawConfig {
     /// rule, dial, close), served by `GET /connections/{id}`. A meow
     /// extension; off by default.
     pub connection_notes: Option<bool>,
+    /// `logbook:` — the persistent record of notable engine events served
+    /// by `GET /logbook` (see `meow_common::logbook`). A meow extension; on
+    /// by default.
+    pub logbook: Option<RawLogbook>,
     /// Static host mappings, preferred over upstream DNS lookups. Values may
     /// be a single IP, a list of IPs, or one domain-name alias.
     pub hosts: Option<HashMap<String, HostsValue>>,
@@ -567,6 +571,21 @@ pub struct RawRuleProvider {
     pub header: Option<HashMap<String, StringOrList>>,
     /// Inline payload: list of rule strings (only for type=inline).
     pub payload: Option<Vec<String>>,
+}
+
+/// `logbook:` section.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub struct RawLogbook {
+    /// Record events under `<home>/logbook/`. Default true.
+    pub enable: Option<bool>,
+}
+
+impl RawLogbook {
+    /// The effective `logbook.enable` of a config.
+    pub fn enabled(raw: Option<&Self>) -> bool {
+        raw.and_then(|logbook| logbook.enable).unwrap_or(true)
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]

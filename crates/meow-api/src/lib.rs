@@ -4,6 +4,7 @@
 //! plus the built-in web dashboard.
 
 pub mod log_stream;
+mod logbook;
 pub mod routes;
 pub mod ui;
 
