@@ -18,6 +18,7 @@ pub mod adapter_type;
 pub mod atomic;
 pub mod auth;
 pub mod backoff;
+pub mod chain_health;
 pub mod conn;
 pub mod conn_notes;
 pub mod dial;
@@ -43,6 +44,7 @@ pub use adapter::{
 pub use adapter_type::{AdapterType, ConnType};
 pub use auth::{AuthConfig, Credentials};
 pub use backoff::ErrorBackoff;
+pub use chain_health::{ChainHealth, ChainTarget, ChainVerdict};
 pub use conn::{ProxyConn, ProxyPacketConn, UdpPacket};
 pub use dial::{with_dial_timeout, DIAL_TIMEOUT};
 pub use dns_mode::DnsMode;

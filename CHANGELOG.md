@@ -8,6 +8,24 @@ the canonical, in-repo source a release is cut from.
 
 ## [Unreleased]
 
+### Added
+
+- **`dialer-proxy` groups skip members that cannot reach the chained
+  server**: a member of a `url-test`, `fallback` or `load-balance` group can
+  pass the group's URL test and still be unable to reach the server of the
+  outbound chained through it, for example when an airport's audit rules
+  drop the port. A lazy front returns before the remote side connects, so
+  the chain failed as `Connected in 0 ms` followed by EOF or a broken pipe,
+  and the group kept picking the member. The group now skips the member for
+  that server once two chains in a row close before any reply, or once the
+  health check's chain probe fails through it. The probe runs after each
+  sweep, starting with the group's pick, and stops when 3 members pass, at
+  most 12 probes per server. Blocks
+  back off from 5 to 30 minutes and clear on any success, and the rest of
+  the group's traffic keeps its normal pick. There is no config change and
+  no mihomo equivalent. UDP chains and the relay-based fallback wrapper
+  (`anytls`, `hysteria2`, `ss` with an external plugin) are not covered.
+
 ## [0.24.0] - 2026-10-18
 
 ### Added

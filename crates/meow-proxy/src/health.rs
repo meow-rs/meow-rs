@@ -1,13 +1,18 @@
+use async_trait::async_trait;
 use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt};
-use meow_common::{Proxy, ProxyAdapter};
+use meow_common::{
+    AdapterType, ChainTarget, ChainVerdict, MeowError, Metadata, Proxy, ProxyAdapter, ProxyConn,
+    ProxyPacketConn,
+};
 use meow_transport::tls::{TlsConfig, TlsLayer};
 use meow_transport::Transport as _;
 use smol_str::SmolStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Semaphore;
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 pub use meow_common::ProxyHealth;
 
@@ -199,6 +204,173 @@ fn named_probe_future(
         }
     }
     .boxed()
+}
+
+/// Chain probes per target per round stop once this many members reached
+/// the target.
+pub const CHAIN_PROBE_PASSES: usize = 3;
+
+/// Chain probes per target per round at most. A target that is down itself
+/// would otherwise cost a probe through every member, every round.
+pub const CHAIN_PROBE_LIMIT: usize = 12;
+
+/// What one [`probe_chain_target`] round found, by member name.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ChainProbeReport {
+    pub reached: Vec<String>,
+    pub blocked: Vec<String>,
+}
+
+/// The active half of [`meow_common::chain_health`]: probe the
+/// `dialer-proxy` chain to `target`, `[member, owner]` to `url`, through
+/// the members of `group`, an automatic group, and record each verdict in
+/// its chain health.
+///
+/// The group's own pick goes first, being the member the next front hop
+/// takes, then the rest fastest first by the group's URL test, live ones
+/// only. The round stops once [`CHAIN_PROBE_PASSES`] members reach the
+/// target, or after [`CHAIN_PROBE_LIMIT`] probes. A member that is an
+/// automatic group itself is skipped: it keeps its own verdicts. A failed
+/// probe blocks the member for at least `hold`, which callers set past
+/// their next round. When `owner` cannot run over a relayed stream, the
+/// round records nothing.
+pub async fn probe_chain_target(
+    group: &Arc<dyn Proxy>,
+    target: &ChainTarget,
+    owner: &Arc<dyn Proxy>,
+    url: &str,
+    expected: Option<&str>,
+    timeout: Duration,
+    hold: Duration,
+) -> ChainProbeReport {
+    let (Some(health), Some(members)) = (group.chain_health(), group.member_proxies()) else {
+        return ChainProbeReport::default();
+    };
+    let group_name = group.name();
+    // Not a front hop, so the pick the group makes before its verdicts.
+    let pick = group.unwrap_proxy(&Metadata::default(), false);
+    let mut candidates: Vec<&Arc<dyn Proxy>> = members
+        .iter()
+        .filter(|m| {
+            m.chain_health().is_none()
+                && m.alive()
+                && m.last_delay() > 0
+                && m.name() != owner.name()
+        })
+        .collect();
+    candidates.sort_by_key(|m| {
+        let picked = pick.as_ref().is_some_and(|p| p.name() == m.name());
+        (!picked, m.last_delay())
+    });
+    candidates.truncate(CHAIN_PROBE_LIMIT);
+
+    let mut report = ChainProbeReport::default();
+    let mut candidates = candidates.into_iter();
+    while report.reached.len() < CHAIN_PROBE_PASSES {
+        let batch: Vec<&Arc<dyn Proxy>> = candidates
+            .by_ref()
+            .take(CHAIN_PROBE_PASSES - report.reached.len())
+            .collect();
+        if batch.is_empty() {
+            break;
+        }
+        let probes = batch.iter().map(|member| async move {
+            let probe = ChainProbe::new(member, owner);
+            let _permit = global_delay_probe_limiter()
+                .acquire()
+                .await
+                .expect("global delay probe semaphore is never closed");
+            let result = url_test(&probe, url, expected, timeout).await;
+            (*member, result, probe.unsupported.load(Ordering::Relaxed))
+        });
+        for (member, result, unsupported) in futures::future::join_all(probes).await {
+            if unsupported {
+                debug!(
+                    "proxy-group '{group_name}': cannot probe chains to {target}: '{}' does not \
+                     run over a relayed stream",
+                    owner.name()
+                );
+                return ChainProbeReport::default();
+            }
+            let name = member.name();
+            if result.is_ok() {
+                health.record_reached(target, name);
+                report.reached.push(name.to_string());
+                continue;
+            }
+            if let Some(length) = health.record_failed(target, name, ChainVerdict::Probe { hold }) {
+                info!(
+                    "proxy-group '{group_name}': member '{name}' cannot carry '{}' to {target}; \
+                     skipping it for that target for {}s",
+                    owner.name(),
+                    length.as_secs()
+                );
+            }
+            report.blocked.push(name.to_string());
+        }
+    }
+    report
+}
+
+/// `[member, owner]` as one adapter for [`url_test`]. The relay dials the
+/// owner's protocol fresh over a front hop through `member`, so no pooled
+/// or multiplexed session of the owner's, which may ride another member,
+/// answers for it.
+struct ChainProbe {
+    name: String,
+    hops: [Arc<dyn Proxy>; 2],
+    /// The relay refused the chain for a capability, not health.
+    unsupported: AtomicBool,
+    health: ProxyHealth,
+}
+
+impl ChainProbe {
+    fn new(member: &Arc<dyn Proxy>, owner: &Arc<dyn Proxy>) -> Self {
+        Self {
+            name: format!("{} via {}", owner.name(), member.name()),
+            hops: [Arc::clone(member), Arc::clone(owner)],
+            unsupported: AtomicBool::new(false),
+            health: ProxyHealth::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl ProxyAdapter for ChainProbe {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn adapter_type(&self) -> AdapterType {
+        AdapterType::Relay
+    }
+
+    fn addr(&self) -> &str {
+        ""
+    }
+
+    fn support_udp(&self) -> bool {
+        false
+    }
+
+    async fn dial_tcp(&self, metadata: &Metadata) -> meow_common::Result<Box<dyn ProxyConn>> {
+        let result = crate::group::relay::relay_tcp(&self.hops, metadata, None).await;
+        if result.as_ref().is_err_and(MeowError::is_capability_error) {
+            self.unsupported.store(true, Ordering::Relaxed);
+        }
+        result
+    }
+
+    async fn dial_udp(
+        &self,
+        _metadata: &Metadata,
+    ) -> meow_common::Result<Box<dyn ProxyPacketConn>> {
+        Err(MeowError::UdpNotSupported)
+    }
+
+    fn health(&self) -> &ProxyHealth {
+        &self.health
+    }
 }
 
 fn global_delay_probe_limiter() -> &'static Semaphore {
@@ -544,5 +716,128 @@ mod tests {
             "parse_expected mismatches:\n{}",
             failures.join("\n")
         );
+    }
+
+    mod chain_probe {
+        use super::*;
+        use crate::group::test_support::StreamProxy;
+
+        const URL: &str = "http://probe.example/generate_204";
+
+        fn daniel() -> Arc<dyn Proxy> {
+            StreamProxy::new("daniel", "snell.example.com:8443")
+        }
+
+        fn fallback(members: &[Arc<StreamProxy>]) -> Arc<dyn Proxy> {
+            let members = members.iter().map(|m| Arc::clone(m) as _).collect();
+            Arc::new(crate::group::fallback::FallbackGroup::new("fast", members))
+        }
+
+        async fn probe(group: &Arc<dyn Proxy>, owner: &Arc<dyn Proxy>) -> ChainProbeReport {
+            let target = ChainTarget::from_server_addr(owner.addr()).unwrap();
+            probe_chain_target(
+                group,
+                &target,
+                owner,
+                URL,
+                None,
+                Duration::from_secs(5),
+                Duration::from_secs(600),
+            )
+            .await
+        }
+
+        fn blocked(group: &Arc<dyn Proxy>, owner: &Arc<dyn Proxy>, member: &str) -> bool {
+            let target = ChainTarget::from_server_addr(owner.addr()).unwrap();
+            group.chain_health().unwrap().is_blocked(&target, member)
+        }
+
+        fn names(names: &[&str]) -> Vec<String> {
+            names.iter().map(ToString::to_string).collect()
+        }
+
+        /// The member that passes the group's URL test but closes the
+        /// chained outbound's port is blocked for that server at once;
+        /// dead and unprobed members are not probed.
+        #[tokio::test]
+        async fn blocks_the_member_that_cannot_carry_the_chain() {
+            let dead = StreamProxy::new("JP-01", "10.0.0.3:443");
+            dead.set_delay(5);
+            dead.health().set_alive(false);
+            let unprobed = StreamProxy::new("US-01", "10.0.0.4:443");
+            let clean = StreamProxy::new("HK-01", "10.0.0.2:443");
+            clean.set_delay(20);
+            let audited = StreamProxy::auditing("SG-01", "10.0.0.1:443", 8443);
+            audited.set_delay(10);
+            let group = fallback(&[
+                Arc::clone(&dead),
+                Arc::clone(&unprobed),
+                Arc::clone(&clean),
+                Arc::clone(&audited),
+            ]);
+            let owner = daniel();
+
+            let report = probe(&group, &owner).await;
+            assert_eq!(
+                report,
+                ChainProbeReport {
+                    reached: names(&["HK-01"]),
+                    blocked: names(&["SG-01"]),
+                }
+            );
+            assert!(blocked(&group, &owner, "SG-01"));
+            assert!(!blocked(&group, &owner, "HK-01"));
+            assert_eq!((dead.dials(), unprobed.dials()), (0, 0));
+        }
+
+        /// A round stops at [`CHAIN_PROBE_PASSES`] members that reach the
+        /// target: the group's pick, however slow, then the fastest.
+        #[tokio::test]
+        async fn probes_the_pick_then_the_fastest_until_enough_pass() {
+            let members: Vec<Arc<StreamProxy>> = [50, 40, 10, 30, 20]
+                .into_iter()
+                .enumerate()
+                .map(|(i, delay)| {
+                    let member = StreamProxy::new(&format!("m{i}"), "10.0.0.1:443");
+                    member.set_delay(delay);
+                    member
+                })
+                .collect();
+            let report = probe(&fallback(&members), &daniel()).await;
+            assert_eq!(report.reached, names(&["m0", "m2", "m4"]));
+            assert!(report.blocked.is_empty());
+            let dials: Vec<usize> = members.iter().map(|m| m.dials()).collect();
+            assert_eq!(dials, [1, 0, 1, 0, 1]);
+        }
+
+        /// Behind failures the round tries further members, up to
+        /// [`CHAIN_PROBE_LIMIT`] probes in all.
+        #[tokio::test]
+        async fn a_target_no_member_reaches_costs_at_most_the_limit() {
+            let members: Vec<Arc<StreamProxy>> = (1..=CHAIN_PROBE_LIMIT as u16 + 3)
+                .map(|i| {
+                    let member = StreamProxy::auditing(&format!("m{i}"), "10.0.0.1:443", 8443);
+                    member.set_delay(i);
+                    member
+                })
+                .collect();
+            let report = probe(&fallback(&members), &daniel()).await;
+            assert!(report.reached.is_empty());
+            assert_eq!(report.blocked.len(), CHAIN_PROBE_LIMIT);
+            let dials: usize = members.iter().map(|m| m.dials()).sum();
+            assert_eq!(dials, CHAIN_PROBE_LIMIT);
+        }
+
+        /// An outbound that cannot run over a relayed stream says nothing
+        /// about the members: the round records nothing.
+        #[tokio::test]
+        async fn an_owner_without_relay_support_records_nothing() {
+            let audited = StreamProxy::auditing("SG-01", "10.0.0.1:443", 8443);
+            audited.set_delay(10);
+            let group = fallback(&[audited]);
+            let owner: Arc<dyn Proxy> = StreamProxy::without_relay("hy2", "hy2.example.com:8443");
+            assert_eq!(probe(&group, &owner).await, ChainProbeReport::default());
+            assert!(!blocked(&group, &owner, "SG-01"));
+        }
     }
 }

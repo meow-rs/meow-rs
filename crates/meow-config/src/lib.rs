@@ -1406,8 +1406,9 @@ fn apply_dialer_proxies(
         // Re-parse the raw block with the by-name dialer injected (mihomo
         // model), so the adapter's own dial + handshake runs on the tunneled
         // stream.
-        let proxy_dialer: Arc<dyn meow_proxy::dialer::TcpDialer> =
-            Arc::new(meow_proxy::dialer::NamedProxyDialer::new(target.clone()));
+        let proxy_dialer: Arc<dyn meow_proxy::dialer::TcpDialer> = Arc::new(
+            meow_proxy::dialer::NamedProxyDialer::new(target.clone()).owned_by(name.clone()),
+        );
         match proxy_parser::parse_proxy_with_dialer(raw, &proxy_dialer, ipv6) {
             Ok(rebuilt) => {
                 proxies.insert(name.clone(), rebuilt);
@@ -2367,7 +2368,40 @@ fn build_proxy_layer(
         global_auto_created,
     )?;
 
+    seed_chain_owners(&dialer_edges, &proxies);
+
     Ok(proxies)
+}
+
+/// Tell each automatic group used as a `dialer-proxy` which outbounds dial
+/// which server through it, so the group's first health check already
+/// probes those chains (see [`meow_common::chain_health`]). Groups also
+/// learn this from the dials themselves; seeding only makes it earlier.
+///
+/// Outbounds on the relay-based `DialerProxyAdapter` fallback are left out:
+/// their front hop picks a member without the chain verdicts, so probing
+/// for them would cost probes and change nothing.
+fn seed_chain_owners(
+    dialer_edges: &[(SmolStr, SmolStr)],
+    proxies: &HashMap<SmolStr, Arc<dyn Proxy>>,
+) {
+    for (name, dialer) in dialer_edges {
+        let (Some(owner), Some(front)) = (proxies.get(name), proxies.get(dialer)) else {
+            continue;
+        };
+        if owner
+            .as_any()
+            .is_some_and(<dyn std::any::Any>::is::<meow_proxy::DialerProxyAdapter>)
+        {
+            continue;
+        }
+        let Some(chain) = front.chain_health() else {
+            continue;
+        };
+        if let Some(target) = meow_common::ChainTarget::from_server_addr(owner.addr()) {
+            chain.note_owner(&target, name);
+        }
+    }
 }
 
 /// A full proxy layer for the pre-registry payload prefetch — built by the

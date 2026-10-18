@@ -2,8 +2,8 @@ use super::selector_store::SelectorStore;
 use super::{DialFailureTracker, UsageTracker};
 use async_trait::async_trait;
 use meow_common::{
-    AdapterType, DelayHistory, MeowError, Metadata, ProviderSlot, Proxy, ProxyAdapter, ProxyConn,
-    ProxyHealth, ProxyPacketConn, ProxySelection, Result,
+    AdapterType, ChainHealth, ChainTarget, DelayHistory, MeowError, Metadata, ProviderSlot, Proxy,
+    ProxyAdapter, ProxyConn, ProxyHealth, ProxyPacketConn, ProxySelection, Result,
 };
 use parking_lot::RwLock;
 use smol_str::SmolStr;
@@ -20,6 +20,7 @@ pub struct FallbackGroup {
     health: ProxyHealth,
     usage: UsageTracker,
     dial_failures: DialFailureTracker,
+    chain_health: Arc<ChainHealth>,
 }
 
 impl FallbackGroup {
@@ -35,6 +36,7 @@ impl FallbackGroup {
             health: ProxyHealth::new(),
             usage: UsageTracker::new(),
             dial_failures: DialFailureTracker::new(),
+            chain_health: Arc::default(),
         }
     }
 
@@ -54,6 +56,7 @@ impl FallbackGroup {
             health: ProxyHealth::new(),
             usage: UsageTracker::new(),
             dial_failures: DialFailureTracker::new(),
+            chain_health: Arc::default(),
         }
     }
 
@@ -130,6 +133,29 @@ impl FallbackGroup {
         fallback
     }
 
+    /// [`Self::first_alive`], or for a `dialer-proxy` front hop the first
+    /// alive member not blocked for its target.
+    fn pick_for(
+        &self,
+        metadata: &Metadata,
+        dial: bool,
+    ) -> Option<(Arc<dyn Proxy>, Option<ChainTarget>)> {
+        let pick = self.first_alive()?;
+        let Some(target) = super::front_hop_target(&self.chain_health, metadata, dial) else {
+            return Some((pick, None));
+        };
+        let pick = super::front_hop_pick(
+            &self.name,
+            &self.chain_health,
+            &target,
+            pick,
+            || self.member_proxy_list(),
+            |p| p.alive(),
+            dial,
+        );
+        Some((pick, Some(target)))
+    }
+
     fn member_names(&self) -> Vec<String> {
         let mut out: Vec<String> = self
             .static_proxies
@@ -179,11 +205,17 @@ impl ProxyAdapter for FallbackGroup {
 
     async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
         self.usage.touch_user_traffic(metadata);
-        let proxy = self
-            .first_alive()
+        let (proxy, front_hop) = self
+            .pick_for(metadata, true)
             .ok_or_else(|| MeowError::Proxy("no proxy available".into()))?;
         let attempt = super::DialAttempt::new(&self.name, &self.dial_failures, &proxy);
-        attempt.finish(proxy.dial_tcp(metadata).await)
+        let conn = attempt.finish(proxy.dial_tcp(metadata).await)?;
+        Ok(match front_hop {
+            Some(target) => {
+                super::watch_front_hop(conn, &self.name, &self.chain_health, target, &proxy)
+            }
+            None => conn,
+        })
     }
 
     async fn dial_udp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
@@ -199,7 +231,7 @@ impl ProxyAdapter for FallbackGroup {
         if touch {
             self.usage.touch_user_traffic(metadata);
         }
-        self.first_alive()
+        self.pick_for(metadata, false).map(|(pick, _)| pick)
     }
 
     fn health(&self) -> &ProxyHealth {
@@ -260,6 +292,10 @@ impl Proxy for FallbackGroup {
 
     fn usage_generation(&self) -> u64 {
         self.usage.generation()
+    }
+
+    fn chain_health(&self) -> Option<&Arc<ChainHealth>> {
+        Some(&self.chain_health)
     }
 }
 

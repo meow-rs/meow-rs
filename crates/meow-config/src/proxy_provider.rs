@@ -969,7 +969,7 @@ impl ProxyProvider {
 
         let target = meow_proxy::dialer::DialerTarget::new(dialer_name, &self.dialer_registry);
         let chained: Arc<dyn meow_proxy::dialer::TcpDialer> =
-            Arc::new(meow_proxy::dialer::NamedProxyDialer::new(target.clone()));
+            Arc::new(meow_proxy::dialer::NamedProxyDialer::new(target.clone()).owned_by(raw_name));
         let proxy = match proxy_parser::parse_proxy_provider_node(
             raw_map,
             self.ipv6,

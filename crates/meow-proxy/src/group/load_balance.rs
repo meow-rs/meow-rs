@@ -1,12 +1,13 @@
 use async_trait::async_trait;
 use meow_common::{
-    AdapterType, DelayHistory, MeowError, Metadata, ProviderSlot, Proxy, ProxyAdapter, ProxyConn,
-    ProxyHealth, ProxyPacketConn, Result,
+    AdapterType, ChainHealth, ChainTarget, DelayHistory, MeowError, Metadata, ProviderSlot, Proxy,
+    ProxyAdapter, ProxyConn, ProxyHealth, ProxyPacketConn, Result,
 };
 use smol_str::SmolStr;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use super::{DialFailureTracker, UsageTracker};
 
@@ -40,6 +41,7 @@ pub struct LoadBalanceGroup {
     /// liveness signal on top of the periodic sweep, which probes provider
     /// members too via `member_proxies()` (issue #543).
     dial_failures: DialFailureTracker,
+    chain_health: Arc<ChainHealth>,
 }
 
 impl LoadBalanceGroup {
@@ -64,6 +66,7 @@ impl LoadBalanceGroup {
             health: ProxyHealth::new(),
             usage: UsageTracker::new(),
             dial_failures: DialFailureTracker::new(),
+            chain_health: Arc::default(),
         }
     }
 
@@ -170,6 +173,41 @@ impl LoadBalanceGroup {
     /// observe a member death or a provider-slot swap between passes and
     /// shift the pick or yield `None` for one dial (issue #621).
     fn pick(&self, metadata: &Metadata, udp_only: bool, advance: bool) -> Option<Arc<dyn Proxy>> {
+        self.pick_excluding(metadata, udp_only, advance, &[])
+    }
+
+    /// The TCP pick, or for a `dialer-proxy` front hop the strategy's pick
+    /// among the members not blocked for its target. With every eligible
+    /// member blocked, the plain pick stands (see `front_hop_pick`).
+    fn pick_for(
+        &self,
+        metadata: &Metadata,
+        advance: bool,
+    ) -> Option<(Arc<dyn Proxy>, Option<ChainTarget>)> {
+        let Some(target) = super::front_hop_target(&self.chain_health, metadata, advance) else {
+            return self.pick(metadata, false, advance).map(|p| (p, None));
+        };
+        let blocked = self.chain_health.blocked(&target);
+        let pick = if blocked.is_empty() {
+            None
+        } else {
+            self.pick_excluding(metadata, false, advance, &blocked)
+        };
+        let pick = pick.or_else(|| self.pick(metadata, false, advance))?;
+        Some((pick, Some(target)))
+    }
+
+    /// [`Self::pick`] over the eligible members not named in `blocked`.
+    fn pick_excluding(
+        &self,
+        metadata: &Metadata,
+        udp_only: bool,
+        advance: bool,
+        blocked: &[(SmolStr, Duration)],
+    ) -> Option<Arc<dyn Proxy>> {
+        let usable = |p: &Arc<dyn Proxy>| {
+            self.eligible(p, udp_only) && !blocked.iter().any(|(name, _)| name == p.name())
+        };
         let members = self.member_proxies().unwrap_or_default();
         match self.strategy {
             LbStrategy::RoundRobin => {
@@ -177,10 +215,7 @@ impl LoadBalanceGroup {
                 // a count pass and a pick pass, which would shrink the set
                 // under `c % old_len` and yield `None` for a dial that had
                 // live members (issue #621 review).
-                let eligible: Vec<&Arc<dyn Proxy>> = members
-                    .iter()
-                    .filter(|p| self.eligible(p, udp_only))
-                    .collect();
+                let eligible: Vec<&Arc<dyn Proxy>> = members.iter().filter(|p| usable(p)).collect();
                 if eligible.is_empty() {
                     return None;
                 }
@@ -207,15 +242,12 @@ impl LoadBalanceGroup {
                 for _ in 0..5 {
                     let idx = jump_hash(key, members.len()) as usize;
                     let p = &members[idx];
-                    if self.eligible(p, udp_only) {
+                    if usable(p) {
                         return Some(Arc::clone(p));
                     }
                     key = key.wrapping_add(1);
                 }
-                members
-                    .iter()
-                    .find(|p| self.eligible(p, udp_only))
-                    .map(Arc::clone)
+                members.iter().find(|p| usable(p)).map(Arc::clone)
             }
         }
     }
@@ -315,9 +347,17 @@ impl ProxyAdapter for LoadBalanceGroup {
 
     async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
         self.usage.touch_user_traffic(metadata);
-        let proxy = self.select(metadata).ok_or(MeowError::NoProxyAvailable)?;
+        let (proxy, front_hop) = self
+            .pick_for(metadata, true)
+            .ok_or(MeowError::NoProxyAvailable)?;
         let attempt = super::DialAttempt::new(&self.name, &self.dial_failures, &proxy);
-        attempt.finish(proxy.dial_tcp(metadata).await)
+        let conn = attempt.finish(proxy.dial_tcp(metadata).await)?;
+        Ok(match front_hop {
+            Some(target) => {
+                super::watch_front_hop(conn, &self.name, &self.chain_health, target, &proxy)
+            }
+            None => conn,
+        })
     }
 
     async fn dial_udp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
@@ -346,11 +386,10 @@ impl ProxyAdapter for LoadBalanceGroup {
         // Peek the same member space the upcoming dial uses: UDP flows pick
         // from UDP-capable members only (upstream LB does not filter by UDP,
         // so this asymmetry is local — keep probe and dial consistent).
-        self.pick(
-            metadata,
-            metadata.network == meow_common::Network::Udp,
-            touch,
-        )
+        if metadata.network == meow_common::Network::Udp {
+            return self.pick(metadata, true, touch);
+        }
+        self.pick_for(metadata, touch).map(|(pick, _)| pick)
     }
 
     fn health(&self) -> &ProxyHealth {
@@ -416,6 +455,10 @@ impl Proxy for LoadBalanceGroup {
 
     fn usage_generation(&self) -> u64 {
         self.usage.generation()
+    }
+
+    fn chain_health(&self) -> Option<&Arc<ChainHealth>> {
+        Some(&self.chain_health)
     }
 }
 
@@ -642,6 +685,7 @@ mod tests {
             health: ProxyHealth::new(),
             usage: super::UsageTracker::new(),
             dial_failures: DialFailureTracker::new(),
+            chain_health: Arc::default(),
         };
         let meta = meta_no_src();
         // Should not panic; indices are (usize::MAX-1)%4 and (usize::MAX)%4

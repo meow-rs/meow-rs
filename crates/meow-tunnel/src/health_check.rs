@@ -1,5 +1,6 @@
 use crate::tunnel::TunnelInner;
-use meow_common::HealthCheckSpec;
+use meow_common::{ChainHealth, HealthCheckSpec, Proxy};
+use smol_str::SmolStr;
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
@@ -172,7 +173,73 @@ async fn run_health_check_loop(inner: Weak<TunnelInner>, spec: HealthCheckSpec) 
             "health-check: {} — {}/{} alive",
             spec.group_name, alive_count, total_count
         );
+
+        if let Some(chain) = group.chain_health() {
+            // A block outlives the gap to the next round, which probes
+            // the member again if it is still among the fastest.
+            let hold = Duration::from_secs(interval_secs).saturating_mul(2);
+            probe_chain_targets(&spec, &group, chain, proxies, expected_status, hold).await;
+        }
     }
+}
+
+/// Probe the `dialer-proxy` chains that run through `group`, once its own
+/// URL test has refreshed the member delays the probes are ordered by. See
+/// [`meow_common::chain_health`].
+async fn probe_chain_targets(
+    spec: &HealthCheckSpec,
+    group: &Arc<dyn Proxy>,
+    chain: &ChainHealth,
+    proxies: &HashMap<SmolStr, Arc<dyn Proxy>>,
+    expected_status: Option<&str>,
+    hold: Duration,
+) {
+    for (target, owners) in chain.targets() {
+        let Some(owner) = owners
+            .iter()
+            .rev()
+            .find_map(|name| resolve_owner(proxies, name))
+        else {
+            debug!(
+                "health-check: {} — no outbound left that dials {target} through it",
+                spec.group_name
+            );
+            continue;
+        };
+        let report = meow_proxy::health::probe_chain_target(
+            group,
+            &target,
+            &owner,
+            &spec.url,
+            expected_status,
+            PROBE_TIMEOUT,
+            hold,
+        )
+        .await;
+        if !report.reached.is_empty() || !report.blocked.is_empty() {
+            info!(
+                "health-check: {} — dialer-proxy chain to {target} via '{}': {} reached, {} blocked",
+                spec.group_name,
+                owner.name(),
+                report.reached.len(),
+                report.blocked.len()
+            );
+        }
+    }
+}
+
+/// The outbound `name` names: a route-table entry, or a provider-sourced
+/// member of a group there. Provider nodes that carry their own
+/// `dialer-proxy` are not route-table keys.
+fn resolve_owner(proxies: &HashMap<SmolStr, Arc<dyn Proxy>>, name: &str) -> Option<Arc<dyn Proxy>> {
+    if let Some(proxy) = proxies.get(name) {
+        return Some(Arc::clone(proxy));
+    }
+    proxies
+        .values()
+        .filter_map(|p| p.member_proxies())
+        .flatten()
+        .find(|p| p.name() == name)
 }
 
 #[cfg(test)]

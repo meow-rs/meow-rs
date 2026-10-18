@@ -22,7 +22,8 @@ use meow_common::atomic::Int;
 use meow_common::conn_note;
 use meow_common::traffic::{ProxyTraffic, ProxyTrafficSource};
 use meow_common::{
-    AdapterType, ConnType, MeowError, Metadata, Network, Proxy, ProxyConn, ProxyPacketConn,
+    AdapterType, ChainTarget, ConnType, MeowError, Metadata, Network, Proxy, ProxyConn,
+    ProxyPacketConn,
 };
 use meow_transport::Stream;
 use smol_str::SmolStr;
@@ -946,11 +947,25 @@ impl DialerTarget {
 /// dial time. Equivalent to mihomo's `proxydialer.NewByNameDialer`.
 pub struct NamedProxyDialer {
     target: DialerTarget,
+    /// The outbound this dialer belongs to. The front's automatic groups
+    /// remember it per target, so the health check can probe the chain
+    /// through it (see [`meow_common::chain_health`]).
+    owner: Option<SmolStr>,
 }
 
 impl NamedProxyDialer {
     pub fn new(target: DialerTarget) -> Self {
-        Self { target }
+        Self {
+            target,
+            owner: None,
+        }
+    }
+
+    /// Name the outbound that dials through this dialer.
+    #[must_use]
+    pub fn owned_by(mut self, owner: impl Into<SmolStr>) -> Self {
+        self.owner = Some(owner.into());
+        self
     }
 
     /// The front hop, counting into the statistics of the tunnel that owns
@@ -965,6 +980,44 @@ impl NamedProxyDialer {
 
     async fn dial_front(&self, meta: Metadata) -> io::Result<Box<dyn Stream>> {
         self.front()?.dial_metadata(meta).await
+    }
+}
+
+tokio::task_local! {
+    /// Set while a by-name `dialer-proxy` front hop is dialled over TCP.
+    /// The scope ends when the front hop's stream is returned, before the
+    /// chained protocol's handshake.
+    static FRONT_HOP: FrontHop;
+}
+
+/// A `dialer-proxy` front hop being dialled on the current task.
+#[derive(Clone)]
+pub(crate) struct FrontHop {
+    /// The server the front hop connects to.
+    pub(crate) target: ChainTarget,
+    /// The outbound dialling through the front, when known.
+    pub(crate) owner: Option<SmolStr>,
+}
+
+/// The front hop in flight, when a dial for `metadata` is one: a group on
+/// the front's path dials with the front hop's own target. Any other dial
+/// made while the front hop is set, such as a nested chain's front or a
+/// lookup on the way, targets something else and gets `None`.
+pub(crate) fn front_hop_for(metadata: &Metadata) -> Option<FrontHop> {
+    FRONT_HOP
+        .try_with(|hop| {
+            let target = ChainTarget::from_metadata(metadata)?;
+            (target == hop.target).then(|| hop.clone())
+        })
+        .ok()
+        .flatten()
+}
+
+/// Run `f`, a front-hop dial, with [`FRONT_HOP`] set to `hop`.
+async fn scoped_front_hop<F: std::future::Future>(hop: Option<FrontHop>, f: F) -> F::Output {
+    match hop {
+        Some(hop) => FRONT_HOP.scope(hop, f).await,
+        None => f.await,
     }
 }
 
@@ -1055,7 +1108,13 @@ impl NamedProxyDialer {
                      a provider member or group is routing the dial back into itself"
                 ))
             },
-            self.dial_front(meta),
+            async {
+                let hop = ChainTarget::from_metadata(&meta).map(|target| FrontHop {
+                    target,
+                    owner: self.owner.clone(),
+                });
+                scoped_front_hop(hop, self.dial_front(meta)).await
+            },
         )
         .await
     }
@@ -2745,6 +2804,127 @@ mod tests {
             None,
             "the tunnel counts the chained outbound itself"
         );
+    }
+
+    /// The registry with `fast` as the only entry.
+    fn registry_of(fast: &Arc<dyn Proxy>) -> ProxyRegistry {
+        let registry = ProxyRegistry::default();
+        registry.publish(Arc::new(HashMap::from([(
+            SmolStr::from("fast"),
+            Arc::clone(fast),
+        )])));
+        registry
+    }
+
+    /// Run one chain over `dialer` to `host:port` as a chained protocol
+    /// would: send a header, read the reply. The bytes read come back.
+    async fn chain(dialer: &NamedProxyDialer, host: &str, port: u16) -> usize {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = dialer.dial(host, port, false).await.unwrap();
+        stream.write_all(b"chained header").await.unwrap();
+        let mut buf = [0u8; 128];
+        stream.read(&mut buf).await.unwrap_or(0)
+    }
+
+    /// The fastest member of a url-test front audits the chained outbound's
+    /// port (it passes the group's URL test): two chains it closes before a
+    /// reply block it for that server, and the next front hop there takes
+    /// the next fastest member. Chains to other servers, plain dials
+    /// through the group, and its displayed pick keep the fastest.
+    #[tokio::test]
+    async fn a_front_hop_skips_the_member_that_closes_its_chains() {
+        use crate::group::test_support::{StreamProxy, REPLY};
+        use crate::group::urltest::UrlTestGroup;
+
+        let audited = StreamProxy::auditing("SG-01", "10.0.0.1:443", 8443);
+        audited.set_delay(10);
+        let clean = StreamProxy::new("HK-01", "10.0.0.2:443");
+        clean.set_delay(20);
+        let fast: Arc<dyn Proxy> = Arc::new(UrlTestGroup::new(
+            "fast",
+            vec![
+                Arc::clone(&audited) as Arc<dyn Proxy>,
+                Arc::clone(&clean) as Arc<dyn Proxy>,
+            ],
+            0,
+        ));
+        let registry = registry_of(&fast);
+        let daniel = NamedProxyDialer::new(DialerTarget::new("fast", &registry)).owned_by("daniel");
+
+        assert_eq!(chain(&daniel, "snell.example.com", 8443).await, 0);
+        assert_eq!(chain(&daniel, "snell.example.com", 8443).await, 0);
+        assert_eq!((audited.dials(), clean.dials()), (2, 0));
+        assert_eq!(chain(&daniel, "snell.example.com", 8443).await, REPLY.len());
+        assert_eq!((audited.dials(), clean.dials()), (2, 1));
+
+        let target = ChainTarget::from_server_addr("snell.example.com:8443").unwrap();
+        let health = fast.chain_health().expect("url-test keeps chain verdicts");
+        assert_eq!(
+            health.targets(),
+            vec![(target, vec![SmolStr::from("daniel")])],
+            "the owner is known to the chain probe"
+        );
+
+        let trojan = NamedProxyDialer::new(DialerTarget::new("fast", &registry));
+        assert_eq!(chain(&trojan, "trojan.example.com", 443).await, REPLY.len());
+        assert_eq!(audited.dials(), 3, "another server still takes the fastest");
+        let plain = Metadata {
+            host: "snell.example.com".into(),
+            dst_port: 8443,
+            ..Default::default()
+        };
+        drop(fast.dial_tcp(&plain).await.unwrap());
+        assert_eq!(audited.dials(), 4, "a dial that is no front hop too");
+        assert_eq!(fast.current().as_deref(), Some("SG-01"));
+    }
+
+    /// Fallback and load-balance fronts skip a blocked member the same way.
+    #[tokio::test]
+    async fn fallback_and_load_balance_fronts_skip_blocked_members() {
+        use crate::group::fallback::FallbackGroup;
+        use crate::group::load_balance::{LbStrategy, LoadBalanceGroup};
+        use crate::group::test_support::StreamProxy;
+
+        let target = ChainTarget::from_server_addr("snell.example.com:8443").unwrap();
+        for kind in ["fallback", "round-robin", "consistent-hashing"] {
+            let audited = StreamProxy::auditing("SG-01", "10.0.0.1:443", 8443);
+            let clean = StreamProxy::new("HK-01", "10.0.0.2:443");
+            let members = vec![
+                Arc::clone(&audited) as Arc<dyn Proxy>,
+                Arc::clone(&clean) as Arc<dyn Proxy>,
+            ];
+            let fast: Arc<dyn Proxy> = match kind {
+                "fallback" => Arc::new(FallbackGroup::new("fast", members)),
+                "round-robin" => Arc::new(LoadBalanceGroup::new(
+                    "fast",
+                    members,
+                    LbStrategy::RoundRobin,
+                )),
+                _ => Arc::new(LoadBalanceGroup::new(
+                    "fast",
+                    members,
+                    LbStrategy::ConsistentHashing,
+                )),
+            };
+            fast.chain_health().unwrap().record_failed(
+                &target,
+                "SG-01",
+                meow_common::ChainVerdict::Probe {
+                    hold: std::time::Duration::from_secs(600),
+                },
+            );
+            let registry = registry_of(&fast);
+            let daniel =
+                NamedProxyDialer::new(DialerTarget::new("fast", &registry)).owned_by("daniel");
+            for _ in 0..4 {
+                chain(&daniel, "snell.example.com", 8443).await;
+            }
+            assert_eq!(
+                (audited.dials(), clean.dials()),
+                (0, 4),
+                "{kind}: every front hop avoids the blocked member"
+            );
+        }
     }
 
     /// Hops count only while the statistics they were given live; nothing

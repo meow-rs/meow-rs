@@ -311,3 +311,58 @@ rules:
          hop could not resolve during the build"
     );
 }
+
+/// An automatic group used as a `dialer-proxy` learns at load which
+/// outbounds chain through it to which server, so its first health check
+/// already probes those chains (`meow_common::chain_health`). A select
+/// group keeps no chain verdicts.
+#[test]
+fn an_automatic_dialer_group_is_seeded_with_its_chains() {
+    let raw: RawConfig = serde_yaml::from_str(
+        r#"
+mixed-port: 17890
+proxies:
+  - name: daniel
+    type: trojan
+    server: snell.example.com
+    port: 8443
+    password: chain-health
+    dialer-proxy: fast
+  - name: tw
+    type: trojan
+    server: 203.0.113.7
+    port: 443
+    password: chain-health
+    dialer-proxy: pick
+  - name: HK-01
+    type: trojan
+    server: 127.0.0.1
+    port: 1
+    password: chain-health
+proxy-groups:
+  - name: fast
+    type: url-test
+    proxies: [HK-01]
+  - name: pick
+    type: select
+    proxies: [HK-01]
+rules:
+  - MATCH,DIRECT
+"#,
+    )
+    .unwrap();
+    let meow_config::RebuildResult { proxies, .. } =
+        meow_config::rebuild_from_raw(&raw).expect("rebuild ok");
+
+    let chain = proxies["fast"]
+        .chain_health()
+        .expect("url-test keeps chain verdicts");
+    assert_eq!(
+        chain.targets(),
+        vec![(
+            meow_common::ChainTarget::from_server_addr("snell.example.com:8443").unwrap(),
+            vec![smol_str::SmolStr::from("daniel")]
+        )]
+    );
+    assert!(proxies["pick"].chain_health().is_none());
+}

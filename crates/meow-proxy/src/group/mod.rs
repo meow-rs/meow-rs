@@ -1,10 +1,18 @@
 use meow_common::atomic::AtomicU;
-use meow_common::{AdapterType, MeowError, Metadata, Proxy};
+use meow_common::{
+    conn_note, AdapterType, ChainHealth, ChainTarget, ChainVerdict, MeowError, Metadata, Proxy,
+    ProxyConn,
+};
 use parking_lot::Mutex;
+use smol_str::SmolStr;
+use std::io;
+use std::pin::Pin;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use tracing::debug;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tracing::{debug, info};
 
 /// Lock-free traffic-use generation shared by automatic proxy groups. A lazy
 /// health-check loop remembers the last generation it probed and sleeps until
@@ -239,6 +247,213 @@ impl Drop for DialAttempt<'_> {
     }
 }
 
+/// The chain target when the dial for `metadata` is a `dialer-proxy` front
+/// hop through this group. A dial (`dial`) also records the chained
+/// outbound as an owner of the target, for the health check's chain probe;
+/// a peek does not.
+pub(super) fn front_hop_target(
+    health: &ChainHealth,
+    metadata: &Metadata,
+    dial: bool,
+) -> Option<ChainTarget> {
+    let hop = crate::dialer::front_hop_for(metadata)?;
+    if dial {
+        if let Some(owner) = &hop.owner {
+            health.note_owner(&hop.target, owner);
+        }
+    }
+    Some(hop.target)
+}
+
+/// The member a front hop to `target` uses in place of `pick`, when `pick`
+/// is blocked for it: the first of `members` that `usable` accepts and that
+/// is not blocked. `members` comes in the group's preference order. With
+/// every usable member blocked the target itself is the likelier fault, so
+/// the group's own pick stands rather than a dial with nowhere to go. A
+/// dial (`dial`) notes the swap on the connection.
+pub(super) fn front_hop_pick(
+    group: &str,
+    health: &ChainHealth,
+    target: &ChainTarget,
+    pick: Arc<dyn Proxy>,
+    members: impl FnOnce() -> Vec<Arc<dyn Proxy>>,
+    usable: impl Fn(&Arc<dyn Proxy>) -> bool,
+    dial: bool,
+) -> Arc<dyn Proxy> {
+    if !health.is_blocked(target, pick.name()) {
+        return pick;
+    }
+    let blocked = health.blocked(target);
+    let Some(alternative) = members()
+        .into_iter()
+        .find(|p| usable(p) && !blocked.iter().any(|(name, _)| name == p.name()))
+    else {
+        return pick;
+    };
+    if dial {
+        conn_note!(
+            Dial,
+            "{group}: {} cannot reach {target} as a dialer-proxy front, using {}",
+            pick.name(),
+            alternative.name()
+        );
+    }
+    alternative
+}
+
+/// Judge `conn`, a front hop to `target` through `member`, on its first
+/// read (see [`meow_common::chain_health`]). A member that is an automatic
+/// group itself judges its own pick, so it is not wrapped again.
+pub(super) fn watch_front_hop(
+    conn: Box<dyn ProxyConn>,
+    group: &str,
+    health: &Arc<ChainHealth>,
+    target: ChainTarget,
+    member: &Arc<dyn Proxy>,
+) -> Box<dyn ProxyConn> {
+    if member.chain_health().is_some() {
+        return conn;
+    }
+    Box::new(FrontHopConn {
+        conn,
+        pending: Some(PendingVerdict {
+            group: SmolStr::new(group),
+            health: Arc::clone(health),
+            target,
+            member: Arc::clone(member),
+            wrote: false,
+            shut: false,
+        }),
+    })
+}
+
+/// A front-hop stream that settles one verdict for its member: reached on
+/// the first byte read; failed on EOF or an error before that, once the
+/// chained protocol has written. EOF before any write, or after our own
+/// shutdown, says nothing about the member.
+struct FrontHopConn {
+    conn: Box<dyn ProxyConn>,
+    /// `None` once the verdict is in.
+    pending: Option<PendingVerdict>,
+}
+
+struct PendingVerdict {
+    group: SmolStr,
+    health: Arc<ChainHealth>,
+    target: ChainTarget,
+    member: Arc<dyn Proxy>,
+    wrote: bool,
+    shut: bool,
+}
+
+impl FrontHopConn {
+    fn settle(&mut self, reached: bool) {
+        let Some(verdict) = self.pending.take() else {
+            return;
+        };
+        let member = verdict.member.name();
+        if reached {
+            verdict.health.record_reached(&verdict.target, member);
+            return;
+        }
+        if let Some(length) =
+            verdict
+                .health
+                .record_failed(&verdict.target, member, ChainVerdict::Passive)
+        {
+            info!(
+                "proxy-group '{}': member '{member}' closed dialer-proxy chains to {} \
+                 before any reply; skipping it for that target for {}s",
+                verdict.group,
+                verdict.target,
+                length.as_secs()
+            );
+        }
+    }
+
+    /// Settle a write: an error before the first byte read is a failure.
+    fn on_write(&mut self, poll: &Poll<io::Result<usize>>) {
+        let Some(verdict) = self.pending.as_mut() else {
+            return;
+        };
+        match poll {
+            Poll::Ready(Ok(n)) if *n > 0 => verdict.wrote = true,
+            Poll::Ready(Err(_)) => self.settle(false),
+            _ => {}
+        }
+    }
+}
+
+impl AsyncRead for FrontHopConn {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let capacity = buf.remaining();
+        let before = buf.filled().len();
+        let poll = Pin::new(&mut this.conn).poll_read(cx, buf);
+        if let (Some(verdict), Poll::Ready(result)) = (&this.pending, &poll) {
+            let read = buf.filled().len() - before;
+            let judged = verdict.wrote && !verdict.shut;
+            match result {
+                Ok(()) if read > 0 => this.settle(true),
+                Ok(()) if capacity == 0 => {}
+                Ok(()) | Err(_) if judged => this.settle(false),
+                Ok(()) | Err(_) => this.pending = None,
+            }
+        }
+        poll
+    }
+}
+
+impl AsyncWrite for FrontHopConn {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let poll = Pin::new(&mut this.conn).poll_write(cx, buf);
+        this.on_write(&poll);
+        poll
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let poll = Pin::new(&mut this.conn).poll_write_vectored(cx, bufs);
+        this.on_write(&poll);
+        poll
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.conn.is_write_vectored()
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().conn).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if let Some(verdict) = this.pending.as_mut() {
+            verdict.shut = true;
+        }
+        Pin::new(&mut this.conn).poll_shutdown(cx)
+    }
+}
+
+impl ProxyConn for FrontHopConn {
+    fn remote_destination(&self) -> String {
+        self.conn.remote_destination()
+    }
+}
+
 pub mod dialer_proxy;
 pub mod fallback;
 pub mod load_balance;
@@ -426,3 +641,6 @@ mod tests {
 
 #[cfg(test)]
 mod dial_timeout_tests;
+
+#[cfg(test)]
+mod front_hop_tests;
