@@ -774,9 +774,10 @@ The following are unsupported or intentionally rejected:
     until 3 pass and at most 12 probes) failed through it.
 
   The skip holds for that server only, and other traffic through the group
-  still uses its normal pick. Blocks back off from 5 to 30 minutes, and any
-  success clears them. With every live member blocked, the group's own pick
-  stands. There is no config change and `select` groups are untouched. Not
+  still uses its normal pick. Blocks back off from 5 minutes to 6 hours,
+  and any success clears them. With every live member blocked, the group's
+  own pick stands. There is no config change and `select` groups are
+  untouched. Not
   covered: UDP chains, and outbounds on the relay-based fallback wrapper
   (`anytls`, `hysteria2`, `ss` with an external plugin), whose front hop
   ignores the verdicts.

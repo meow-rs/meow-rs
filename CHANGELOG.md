@@ -20,9 +20,9 @@ the canonical, in-repo source a release is cut from.
   that server once two chains in a row close before any reply, or once the
   health check's chain probe fails through it. The probe runs after each
   sweep, starting with the group's pick, and stops when 3 members pass, at
-  most 12 probes per server. Blocks
-  back off from 5 to 30 minutes and clear on any success, and the rest of
-  the group's traffic keeps its normal pick. There is no config change and
+  most 12 probes per server. Blocks back off from 5 minutes to 6 hours and
+  clear on any success, and the rest of the group's traffic keeps its
+  normal pick. There is no config change and
   no mihomo equivalent. UDP chains and the relay-based fallback wrapper
   (`anytls`, `hysteria2`, `ss` with an external plugin) are not covered.
 

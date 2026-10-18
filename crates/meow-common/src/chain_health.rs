@@ -46,8 +46,10 @@ pub const PASSIVE_STRIKES: u8 = 2;
 /// Length of a member's first block.
 pub const BASE_BLOCK: Duration = Duration::from_secs(5 * 60);
 
-/// Ceiling for repeated blocks.
-pub const MAX_BLOCK: Duration = Duration::from_secs(30 * 60);
+/// Ceiling for repeated blocks. Generous: without the chain probe, each
+/// block that runs out costs a user connection to find the member still
+/// failing, while a passing probe clears a block whatever its length.
+pub const MAX_BLOCK: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// Targets one group remembers. A chain target is a proxy server, so a real
 /// config has a handful; the bound only caps a provider that churns server
