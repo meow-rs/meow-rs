@@ -14,7 +14,12 @@ the canonical, in-repo source a release is cut from.
   plus the bytes each proxy carried since the tunnel started, TCP and UDP,
   for a client's statistics screen. A group's traffic counts at the member
   that carried it (the `chains[0]` of `/connections`); a proxy keeps its
-  totals after its connections close, and after a reload removes it.
+  totals after its connections close, and after a reload removes it. The
+  member of a `dialer-proxy` group also counts the front hop it carries for
+  the outbound chained through it, TCP and UDP, so the node in the middle
+  of a chain shows its traffic too, health probes and downloads through the
+  chain included; the upload and download totals still count each
+  connection once.
 - **Connection notes name the `dialer-proxy` hop**: the policy path stopped
   at the outbound that owns the `dialer-proxy`, so a connection never showed
   which member of the dialer group carried it. Each front-hop dial now adds

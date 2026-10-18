@@ -33,6 +33,7 @@ pub mod replay_window;
 pub mod rule;
 pub mod sniffer;
 pub mod socket_protect;
+pub mod traffic;
 pub mod tunnel_mode;
 
 pub use adapter::{
@@ -67,6 +68,7 @@ pub use socket_protect::{clear_host_resolver, host_resolver, set_host_resolver, 
 pub use socket_protect::{
     clear_socket_protector, set_socket_protector, socket_protector, SocketProtector,
 };
+pub use traffic::{ProxyTraffic, ProxyTrafficSource};
 pub use tunnel_mode::TunnelMode;
 
 pub mod health_check;

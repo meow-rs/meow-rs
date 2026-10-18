@@ -883,8 +883,10 @@ struct ProxyTotals {
 /// `GET /statistics` (meow extension, no mihomo equivalent): the byte totals
 /// and what each proxy carried since the tunnel started, TCP and UDP. A
 /// group's traffic is counted at the member that carried it, so `proxies`
-/// holds the leaves a flow ended at; a proxy stays listed after a reload
-/// removes it. Empty `proxies` when the tunnel runs headless.
+/// holds the leaves a flow ended at, plus the members of `dialer-proxy`
+/// groups that carried a chained outbound's hop (counted once in the
+/// totals); a proxy stays listed after a reload removes it. Empty `proxies`
+/// when the tunnel runs headless.
 async fn get_statistics(State(state): State<Arc<AppState>>) -> Json<StatisticsResponse> {
     let stats = state.tunnel.statistics();
     let (upload_total, download_total) = stats.snapshot();

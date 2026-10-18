@@ -820,8 +820,18 @@ impl Tunnel {
     /// registry, if one was installed (issue #489). Runs on every routing
     /// install so provider-sourced `dialer-proxy` targets resolve the current
     /// route map rather than a frozen startup-era snapshot.
+    ///
+    /// Both registries also get this tunnel's statistics, so a
+    /// `dialer-proxy` hop counts what it carries toward the member of the
+    /// front that carries it.
     fn publish_dialer_registry(&self, route: &RouteTable) {
+        let stats: Weak<dyn meow_common::ProxyTrafficSource> =
+            Arc::<Statistics>::downgrade(&self.inner.stats);
+        route
+            .dialer_registry
+            .count_traffic_into(Weak::clone(&stats));
         if let Some(registry) = self.inner.dialer_registry.get() {
+            registry.count_traffic_into(stats);
             registry.publish(std::sync::Arc::clone(&route.proxies));
         }
     }
@@ -1696,6 +1706,33 @@ mod tests {
                 .is_some(),
             "reload_routing must republish through install_routing"
         );
+    }
+
+    /// Routing installs hand both dialer registries this tunnel's
+    /// statistics, so a `dialer-proxy` hop counts toward the per-proxy
+    /// totals of the member that carries it, never toward the tunnel totals.
+    #[test]
+    fn routing_installs_count_dialer_hops_into_the_statistics() {
+        use meow_proxy::dialer::{DialerTarget, ProxyRegistry};
+
+        let tunnel = test_tunnel();
+        let provider_registry = ProxyRegistry::default();
+        tunnel.set_dialer_registry(provider_registry.clone());
+        let build_registry = ProxyRegistry::default();
+        tunnel.update_routing(HashMap::new(), vec![], build_registry.clone());
+
+        for registry in [&build_registry, &provider_registry] {
+            let traffic = DialerTarget::new("fast", registry)
+                .traffic()
+                .expect("a routing install must attach the statistics");
+            let hk = traffic.proxy_counters("HK-01").unwrap();
+            hk.add_upload(7);
+            hk.add_download(11);
+        }
+        let stats = tunnel.statistics();
+        assert_eq!(stats.proxy_traffic().get("HK-01"), Some(&(14, 22)));
+        stats.sample_traffic();
+        assert_eq!(stats.traffic_snapshot(), (0, 0, 0, 0));
     }
 
     /// Issue #533: the built-in proxies map registers PASS / PASS-RULE /

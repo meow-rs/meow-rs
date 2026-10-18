@@ -118,10 +118,16 @@ impl ProxyAdapter for DialerProxyAdapter {
                     .resolve()
                     .ok_or_else(|| MeowError::Proxy(self.dialer.missing_error()))?;
                 // `relay_tcp` resolves the front's groups against the final
-                // target, so the note's walk uses that metadata too.
+                // target, so the note's and the counters' walks use that
+                // metadata too.
                 crate::dialer::note_front_hop(&front, self.inner.addr(), metadata);
+                let counters = crate::dialer::front_hop_counters(
+                    &front,
+                    metadata,
+                    self.dialer.traffic().as_deref(),
+                );
                 let chain = [front, Arc::clone(&self.inner)];
-                relay_tcp(&chain, metadata).await
+                relay_tcp(&chain, metadata, counters).await
             },
         )
         .await

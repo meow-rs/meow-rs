@@ -19,6 +19,8 @@
 use dashmap::DashMap;
 use meow_common::atomic::{AtomicI, Int};
 use meow_common::conn_notes::ConnNotes;
+pub use meow_common::traffic::ProxyTraffic;
+use meow_common::traffic::ProxyTrafficSource;
 use meow_common::Metadata;
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -108,26 +110,6 @@ impl ConnCounters {
 
     pub fn notes(&self) -> Option<&ConnNotes> {
         self.notes.as_ref()
-    }
-}
-
-/// Bytes relayed through one proxy since the tunnel started: the TCP
-/// connections whose chain starts at it (`chains[0]`, the leaf that dials)
-/// and the UDP flows dialled through it. Flows hold the `Arc` and bump it
-/// next to the totals, so the relay never looks a proxy up per chunk.
-#[derive(Debug, Default)]
-pub struct ProxyTraffic {
-    upload: AtomicI,
-    download: AtomicI,
-}
-
-impl ProxyTraffic {
-    pub fn upload_bytes(&self) -> Int {
-        self.upload.load(Ordering::Relaxed)
-    }
-
-    pub fn download_bytes(&self) -> Int {
-        self.download.load(Ordering::Relaxed)
     }
 }
 
@@ -298,7 +280,7 @@ impl Statistics {
     /// counters (UDP): the totals and the proxy's, when it has them.
     pub fn record_packet_upload(&self, proxy: Option<&ProxyTraffic>, n: Int) {
         if let Some(proxy) = proxy {
-            proxy.upload.fetch_add(n, Ordering::Relaxed);
+            proxy.add_upload(n);
         }
         self.add_upload(n);
     }
@@ -306,7 +288,7 @@ impl Statistics {
     /// See [`Self::record_packet_upload`].
     pub fn record_packet_download(&self, proxy: Option<&ProxyTraffic>, n: Int) {
         if let Some(proxy) = proxy {
-            proxy.download.fetch_add(n, Ordering::Relaxed);
+            proxy.add_download(n);
         }
         self.add_download(n);
     }
@@ -588,6 +570,15 @@ impl Statistics {
 impl Default for Statistics {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// `dialer-proxy` front hops count into the same per-proxy totals, never
+/// into the tunnel totals: the connection they carry is already counted
+/// there once.
+impl ProxyTrafficSource for Statistics {
+    fn proxy_counters(&self, proxy: &str) -> Option<Arc<ProxyTraffic>> {
+        Statistics::proxy_counters(self, proxy)
     }
 }
 
