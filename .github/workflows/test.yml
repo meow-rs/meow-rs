@@ -495,20 +495,27 @@ jobs:
       # hosted runner has it), so the tests are `#[ignore]`d for local
       # runs: the addresses must come up Preferred, not tentative, and
       # replace the ones a reopened adapter still carries. Each test runs
-      # in its own nextest invocation named exactly — a rename of any one
-      # of them fails that leg with "no tests run" (--no-tests=fail)
+      # in its own step invoking nextest with an exact-name filter — a
+      # rename fails that step with "no tests run" (--no-tests=fail)
       # instead of a module-path substring silently matching nothing — or
       # an OR'd filter still running the survivors and staying green.
-      - name: Wintun address setup (privileged)
+      # Three steps rather than one `run:` block: the pwsh wrapper only
+      # propagates the LAST command's exit code, so a failing non-last
+      # leg in a shared block would stay green.
+      - name: Wintun address setup (privileged) — preferred addresses
         run: >-
           cargo nextest run -p meow-listener --features listener-tun --lib
           --run-ignored only --no-capture --retries 2 --no-tests=fail
           -E "test(=tun::windows_device::tests::addresses_are_preferred_and_replace_stale_ones)"
 
+      - name: Wintun address setup (privileged) — inet6 none replaces both families
+        run: >-
           cargo nextest run -p meow-listener --features listener-tun --lib
           --run-ignored only --no-capture --retries 2 --no-tests=fail
           -E "test(=tun::windows_device::tests::inet6_none_replaces_stale_addresses_of_both_families)"
 
+      - name: Wintun address setup (privileged) — conflicted address left as found
+        run: >-
           cargo nextest run -p meow-listener --features listener-tun --lib
           --run-ignored only --no-capture --retries 2 --no-tests=fail
           -E "test(=tun::windows_device::tests::conflicted_address_fails_and_leaves_the_adapter_as_found)"

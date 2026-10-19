@@ -1038,7 +1038,19 @@ fn rotate_v6(net: Ipv6Net, attempt: u32) -> Ipv6Net {
     // the subnet's top host still moves to a fresh address per attempt.
     // A tiny subnet can cycle back onto the configured address; the
     // retry still moves to a fresh adapter name.
-    let host = (bits & host_mask).wrapping_add(u128::from(attempt - 2)) % host_mask + 1;
+    //
+    // The offset is added modulo host_mask, not modulo 2^128: for a /0
+    // config host_mask is u128::MAX and a base host at the very top of
+    // the space would otherwise wrap one above the residue ring, which
+    // folds two attempts onto the same address. `host0` may equal
+    // host_mask (≡ 0), where the wrapped sum is just `step`.
+    let host0 = bits & host_mask;
+    let step = u128::from(attempt - 2) % host_mask;
+    let host = if host0 >= host_mask - step {
+        host0 - (host_mask - step)
+    } else {
+        host0 + step
+    } + 1;
     Ipv6Net::new_assert(
         std::net::Ipv6Addr::from((bits & !host_mask) | host),
         net.prefix_len(),
@@ -1265,6 +1277,27 @@ mod tests {
         assert_eq!(rotate_v6(wide, 4), net("fd00::4/64"));
         // A single-address subnet cannot rotate.
         assert_eq!(rotate_v6(net("fd00::1/128"), 4), net("fd00::1/128"));
+        // A /0 config makes the mask u128::MAX: even a base host at the
+        // very top of the space must yield three distinct nonzero
+        // addresses (the offset is added modulo the mask, not 2^128).
+        for top in [
+            "::1/0",
+            "ffff:ffff:ffff:ffff:ffff:ffff:ffff:fffe/0",
+            "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff/0",
+        ] {
+            let base = net(top);
+            let rotated: Vec<u128> = (2..5)
+                .map(|attempt| u128::from(rotate_v6(base, attempt).addr()))
+                .collect();
+            for (i, host) in rotated.iter().enumerate() {
+                assert_ne!(*host, 0, "{top} attempt {}", i + 2);
+                assert!(
+                    rotated[i + 1..].iter().all(|other| other != host),
+                    "{top} attempt {} repeats {host:#x}",
+                    i + 2
+                );
+            }
+        }
     }
 
     #[test]
