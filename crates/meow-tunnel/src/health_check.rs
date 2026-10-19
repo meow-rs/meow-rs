@@ -2,7 +2,7 @@ use crate::tunnel::TunnelInner;
 use meow_common::logbook::{self, Level};
 use meow_common::{AdapterType, ChainHealth, HealthCheckSpec, Metadata, Proxy};
 use smol_str::SmolStr;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -84,7 +84,7 @@ async fn run_health_check_loop(inner: Weak<TunnelInner>, spec: HealthCheckSpec) 
     // missed-tick probe storm right after system suspend.
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_probed_generation = 0;
-    let mut watch = GroupWatch::resume(&spec.group_name);
+    let mut watch = GroupWatch::default();
 
     if spec.lazy {
         ticker.tick().await;
@@ -140,28 +140,40 @@ async fn run_health_check_loop(inner: Weak<TunnelInner>, spec: HealthCheckSpec) 
         // dialer registry, and a mid-probe `update_routing` would otherwise
         // fail chained members closed and mark live nodes dead (issue #533).
 
+        // Automatic groups that carry `dialer-proxy` chains: a chained
+        // member that fails its probe is checked through them before it
+        // is taken for down.
+        let fronts: Vec<Arc<dyn Proxy>> = proxies
+            .values()
+            .filter(|p| p.chain_health().is_some())
+            .cloned()
+            .collect();
+        let hold = Duration::from_secs(interval_secs).saturating_mul(2);
+
         let mut alive_count = 0u32;
         let mut total_count = 0u32;
-        let mut delays = HashMap::new();
-        for (name, delay) in meow_proxy::health::probe_many_bounded(
+        let mut probed = HashMap::new();
+        for member in meow_proxy::health::sweep_members(
             members,
+            &fronts,
             &spec.url,
             expected_status,
             PROBE_TIMEOUT,
             meow_proxy::health::PROVIDER_HEALTHCHECK_CONCURRENCY,
+            hold,
         )
         .await
         {
             total_count += 1;
-            if delay > 0 {
+            if member.delay > 0 {
                 alive_count += 1;
             } else {
                 warn!(
                     "health-check: {} / {} is dead (probe failed)",
-                    spec.group_name, name
+                    spec.group_name, member.name
                 );
             }
-            delays.insert(name, delay);
+            probed.insert(member.name, (member.delay, member.reason));
         }
 
         // Record the generation only now that a probe round actually ran
@@ -178,13 +190,12 @@ async fn run_health_check_loop(inner: Weak<TunnelInner>, spec: HealthCheckSpec) 
             spec.group_name, alive_count, total_count
         );
         if total_count > 0 {
-            watch.record(&spec.group_name, &group, &delays);
+            watch.record(&spec.group_name, &group, &probed);
         }
 
         if let Some(chain) = group.chain_health() {
             // A block outlives the gap to the next round, which probes
             // the member again if it is still among the fastest.
-            let hold = Duration::from_secs(interval_secs).saturating_mul(2);
             probe_chain_targets(&spec, &group, chain, proxies, expected_status, hold).await;
         }
     }
@@ -223,63 +234,38 @@ async fn probe_chain_targets(
             hold,
         )
         .await;
-        if !report.reached.is_empty() || !report.blocked.is_empty() {
+        if !report.reached.is_empty() || !report.blocked.is_empty() || !report.failed.is_empty() {
             info!(
-                "health-check: {} — dialer-proxy chain to {target} via '{}': {} reached, {} blocked",
+                "health-check: {} — dialer-proxy chain to {target} via '{}': {} reached, {} \
+                 blocked, {} failed",
                 spec.group_name,
                 owner.name(),
                 report.reached.len(),
-                report.blocked.len()
+                report.blocked.len(),
+                report.failed.len()
             );
         }
     }
 }
 
-/// What the logbook last heard about one group: its dead members and the
-/// member it routes to, so a sweep is recorded only when either changes.
+/// Each member a sweep probed: its delay, `0` when it is down, and why it
+/// is down.
+type Probed = HashMap<String, (u16, Option<String>)>;
+
+/// A `group.switch`: the previous pick, the new one, the message, and why
+/// the previous pick went down, when it did.
+type Switch = (String, String, String, Option<String>);
+
+/// The member a url-test or fallback group routed to after its previous
+/// sweep, so a sweep is recorded only when the pick changes.
 #[derive(Default)]
 struct GroupWatch {
-    /// The dead members last recorded; `None` before the first sweep.
-    down: Option<BTreeSet<String>>,
-    /// Members whose probe failed in the previous sweep.
-    failed: BTreeSet<String>,
-    /// The logbook's latest `group.health` entry for the group, when this
-    /// watch started, says members are down. A loop respawned for a changed
-    /// spec, or a restart, starts a new watch.
-    logged_down: bool,
     pick: Option<String>,
 }
 
-/// Dead members named in a `group.health` message; the `down` field lists
-/// up to [`DOWN_FIELD_NAMES`].
-const DOWN_MESSAGE_NAMES: usize = 3;
-const DOWN_FIELD_NAMES: usize = 20;
-
 impl GroupWatch {
-    /// A watch picking up from what the logbook last recorded for `group`.
-    fn resume(group: &str) -> Self {
-        Self {
-            logged_down: logbook::latest_level(logbook::kind::GROUP_HEALTH, group)
-                .is_some_and(|level| level > Level::Info),
-            ..Self::default()
-        }
-    }
-
-    /// Record a finished sweep of `group`: `delays` holds each probed
-    /// member's delay, `0` when it is dead.
-    fn record(&mut self, name: &str, group: &Arc<dyn Proxy>, delays: &HashMap<String, u16>) {
-        if let Some((level, message, down)) = self.health(name, delays) {
-            let mut event = logbook::event(logbook::kind::GROUP_HEALTH, level, message)
-                .subject(name)
-                .field("alive", delays.len() - down.len())
-                .field("total", delays.len());
-            if level == Level::Warning {
-                let listed: Vec<String> = down.iter().take(DOWN_FIELD_NAMES).cloned().collect();
-                event = event.field("down", listed);
-            }
-            event.coalesce().record();
-        }
-
+    /// Record a finished sweep of `group`.
+    fn record(&mut self, name: &str, group: &Arc<dyn Proxy>, probed: &Probed) {
         // Only url-test and fallback route to one member. The peek
         // recomputes the pick from the fresh delays, as a dial would.
         if !matches!(
@@ -291,97 +277,30 @@ impl GroupWatch {
         let pick = group
             .unwrap_proxy(&Metadata::default(), false)
             .map(|p| p.name().to_string());
-        if let Some((from, to, message)) = self.switch(name, pick, delays) {
-            logbook::event(logbook::kind::GROUP_SWITCH, Level::Info, message)
+        if let Some((from, to, message, reason)) = self.switch(name, pick, probed) {
+            let mut event = logbook::event(logbook::kind::GROUP_SWITCH, Level::Info, message)
                 .subject(name)
                 .field("from", from)
-                .field("to", to)
-                .coalesce()
-                .record();
+                .field("to", to);
+            if let Some(reason) = reason {
+                event = event.field("reason", reason);
+            }
+            event.coalesce().record();
         }
     }
 
-    /// The level, message and dead members of the `group.health` entry for
-    /// a sweep that probed `delays`, if the dead members changed. A member
-    /// is dead from its first failed probe until it passes two sweeps in a
-    /// row, so a member that flaps between sweeps is one entry, not one per
-    /// sweep. A first sweep is recorded when something is down, or when
-    /// nothing is and the logbook still says otherwise.
-    fn health(
-        &mut self,
-        name: &str,
-        delays: &HashMap<String, u16>,
-    ) -> Option<(Level, String, BTreeSet<String>)> {
-        let failed: BTreeSet<String> = delays
-            .iter()
-            .filter(|(_, delay)| **delay == 0)
-            .map(|(member, _)| member.clone())
-            .collect();
-        let mut down = failed.clone();
-        down.extend(
-            self.failed
-                .iter()
-                .filter(|member| delays.contains_key(*member))
-                .cloned(),
-        );
-        self.failed = failed;
-        let changed = match &self.down {
-            Some(previous) => *previous != down,
-            None => !down.is_empty() || self.logged_down,
-        };
-        let total = delays.len();
-        let event = changed.then(|| {
-            if down.is_empty() {
-                (
-                    Level::Info,
-                    format!("All {total} members of '{name}' are up again"),
-                )
-            } else if down.len() == total {
-                (
-                    Level::Error,
-                    format!("All {total} members of '{name}' are down"),
-                )
-            } else {
-                let names: Vec<String> = down
-                    .iter()
-                    .take(DOWN_MESSAGE_NAMES)
-                    .map(|member| format!("'{member}'"))
-                    .collect();
-                let more = match down.len().saturating_sub(DOWN_MESSAGE_NAMES) {
-                    0 => String::new(),
-                    more => format!(" and {more} more"),
-                };
-                (
-                    Level::Warning,
-                    format!(
-                        "{} of {total} members of '{name}' are down: {}{more}",
-                        down.len(),
-                        names.join(", ")
-                    ),
-                )
-            }
-        });
-        self.down = Some(down.clone());
-        event.map(|(level, message)| (level, message, down))
-    }
-
-    /// The previous pick, the new one and the `group.switch` message, if
-    /// `pick` differs from the pick after the previous sweep. The first
-    /// sweep only learns the pick.
-    fn switch(
-        &mut self,
-        name: &str,
-        pick: Option<String>,
-        delays: &HashMap<String, u16>,
-    ) -> Option<(String, String, String)> {
+    /// The `group.switch` to record, if `pick` differs from the pick after
+    /// the previous sweep. The first sweep only learns the pick.
+    fn switch(&mut self, name: &str, pick: Option<String>, probed: &Probed) -> Option<Switch> {
         let from = std::mem::replace(&mut self.pick, pick)?;
         let to = self.pick.clone()?;
         if from == to {
             return None;
         }
-        let state = |member: &str| match delays.get(member) {
-            Some(0) => " (down)".to_owned(),
-            Some(delay) => format!(" ({delay} ms)"),
+        let state = |member: &str| match probed.get(member) {
+            Some((0, Some(reason))) => format!(" (down: {reason})"),
+            Some((0, None)) => " (down)".to_owned(),
+            Some((delay, _)) => format!(" ({delay} ms)"),
             None => String::new(),
         };
         let message = format!(
@@ -389,7 +308,10 @@ impl GroupWatch {
             state(&from),
             state(&to)
         );
-        Some((from, to, message))
+        let reason = probed
+            .get(&from)
+            .and_then(|(delay, reason)| reason.clone().filter(|_| *delay == 0));
+        Some((from, to, message, reason))
     }
 }
 
@@ -414,105 +336,37 @@ mod tests {
     use meow_common::{Metadata, Proxy, ProxyAdapter};
     use meow_config::extract_health_check_specs as extract_specs;
 
-    /// A sweep of members `a` to `e` where `failed` did not answer.
-    fn sweep(failed: &[&str]) -> HashMap<String, u16> {
-        ["a", "b", "c", "d", "e"]
-            .into_iter()
-            .map(|m| (m.to_owned(), if failed.contains(&m) { 0 } else { 80 }))
-            .collect()
-    }
-
-    fn health(watch: &mut GroupWatch, failed: &[&str]) -> Option<(Level, String)> {
-        watch
-            .health("G", &sweep(failed))
-            .map(|(level, message, _)| (level, message))
-    }
-
-    #[test]
-    fn group_health_is_recorded_when_the_dead_members_change() {
-        let mut watch = GroupWatch::default();
-        assert_eq!(health(&mut watch, &[]), None, "a healthy group");
-        assert_eq!(
-            health(&mut watch, &["a"]),
-            Some((Level::Warning, "1 of 5 members of 'G' are down: 'a'".into()))
-        );
-        assert_eq!(health(&mut watch, &["a"]), None, "unchanged");
-        assert_eq!(
-            health(&mut watch, &["a", "b", "c", "d"]),
-            Some((
-                Level::Warning,
-                "4 of 5 members of 'G' are down: 'a', 'b', 'c' and 1 more".into()
-            ))
-        );
-        assert_eq!(
-            health(&mut watch, &["a", "b", "c", "d", "e"]),
-            Some((Level::Error, "All 5 members of 'G' are down".into()))
-        );
-        assert_eq!(
-            health(&mut watch, &[]),
-            None,
-            "back after two healthy sweeps"
-        );
-        assert_eq!(
-            health(&mut watch, &[]),
-            Some((Level::Info, "All 5 members of 'G' are up again".into()))
-        );
-
-        let mut fresh = GroupWatch::default();
-        assert_eq!(
-            health(&mut fresh, &["a"]).map(|(level, _)| level),
-            Some(Level::Warning),
-            "a first sweep is recorded when something is down"
-        );
-    }
-
-    #[test]
-    fn a_flapping_member_is_one_entry() {
-        let mut watch = GroupWatch::default();
-        assert!(health(&mut watch, &["a"]).is_some());
-        for failed in [&[][..], &["a"], &[], &["a"], &[]] {
-            assert_eq!(health(&mut watch, failed), None);
-        }
-        assert_eq!(
-            health(&mut watch, &[]).map(|(level, _)| level),
-            Some(Level::Info)
-        );
-    }
-
-    #[test]
-    fn a_new_watch_reports_a_recovery_the_logbook_has_not_seen() {
-        let mut watch = GroupWatch {
-            logged_down: true,
-            ..GroupWatch::default()
-        };
-        assert_eq!(
-            health(&mut watch, &[]),
-            Some((Level::Info, "All 5 members of 'G' are up again".into()))
-        );
-    }
-
     #[test]
     fn group_switch_is_recorded_when_the_pick_changes() {
         let mut watch = GroupWatch::default();
-        let delays = HashMap::from([("a".to_owned(), 0), ("b".to_owned(), 120)]);
+        let probed = Probed::from([
+            ("a".to_owned(), (0, Some("timed out".to_owned()))),
+            ("b".to_owned(), (120, None)),
+        ]);
         let pick = |m: &str| Some(m.to_owned());
         assert_eq!(
-            watch.switch("G", pick("a"), &delays),
+            watch.switch("G", pick("a"), &probed),
             None,
             "learns the pick"
         );
-        assert_eq!(watch.switch("G", pick("a"), &delays), None, "unchanged");
+        assert_eq!(watch.switch("G", pick("a"), &probed), None, "unchanged");
         assert_eq!(
-            watch.switch("G", pick("b"), &delays),
+            watch.switch("G", pick("b"), &probed),
             Some((
                 "a".into(),
                 "b".into(),
-                "'G' switched from 'a' (down) to 'b' (120 ms)".into()
+                "'G' switched from 'a' (down: timed out) to 'b' (120 ms)".into(),
+                Some("timed out".into())
             ))
         );
         assert_eq!(
-            watch.switch("G", pick("c"), &delays).map(|(_, _, m)| m),
-            Some("'G' switched from 'b' (120 ms) to 'c'".into()),
+            watch.switch("G", pick("c"), &probed),
+            Some((
+                "b".into(),
+                "c".into(),
+                "'G' switched from 'b' (120 ms) to 'c'".into(),
+                None
+            )),
             "a member the sweep did not probe has no state"
         );
     }

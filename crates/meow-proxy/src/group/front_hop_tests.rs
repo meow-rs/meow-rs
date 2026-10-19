@@ -139,6 +139,7 @@ fn a_blocked_pick_gives_way_to_the_next_usable_member() {
             ChainVerdict::Probe {
                 hold: Duration::from_secs(600),
             },
+            "timed out",
         );
     };
     let [a, b, c]: [Arc<dyn Proxy>; 3] = ["a", "b", "c"].map(|n| MockProxy::new(n) as _);
@@ -161,6 +162,7 @@ fn a_blocked_pick_gives_way_to_the_next_usable_member() {
             &health,
             &t,
             Arc::clone(pick),
+            None,
             members,
             |p| p.alive(),
             true,
@@ -181,4 +183,184 @@ fn a_blocked_pick_gives_way_to_the_next_usable_member() {
         "a",
         "with every live member blocked the group's own pick stands"
     );
+}
+
+/// `风之谷`, a fallback over `daniel`, which dials its server through
+/// `fast`, and a spare.
+struct Wind {
+    wind: Arc<dyn Proxy>,
+    daniel: Arc<dyn Proxy>,
+    fast: Arc<dyn Proxy>,
+    /// Resolves `fast` for `daniel`'s dials.
+    _registry: crate::dialer::ProxyRegistry,
+}
+
+/// [`Wind`] with `fast` a url-test over `members`.
+fn wind_over(members: Vec<Arc<dyn Proxy>>) -> Wind {
+    use super::fallback::FallbackGroup;
+    use super::test_support::{registry_of, ChainedProxy};
+    let fast: Arc<dyn Proxy> = Arc::new(UrlTestGroup::new("fast", members, 0));
+    let registry = registry_of(&[&fast]);
+    let daniel: Arc<dyn Proxy> =
+        ChainedProxy::handshaking("daniel", "snell.example.com:8443", "fast", &registry);
+    daniel.health().record_delay(30);
+    let spare = MockProxy::new("daniel-eu");
+    spare.set_delay(40);
+    let wind: Arc<dyn Proxy> = Arc::new(FallbackGroup::new(
+        "风之谷",
+        vec![Arc::clone(&daniel), spare as Arc<dyn Proxy>],
+    ));
+    Wind {
+        wind,
+        daniel,
+        fast,
+        _registry: registry,
+    }
+}
+
+/// A front member refusing the connection is `fast`'s failure: `fast`
+/// marks its member dead, and `风之谷` keeps `daniel`, whose next dial
+/// goes through the next member.
+#[tokio::test]
+async fn a_refusing_front_member_does_not_take_the_chained_outbound_down() {
+    use super::test_support::StreamProxy;
+    let refusing = MockProxy::new_failing("SG-01", AdapterType::Vless, "connection refused");
+    refusing.set_delay(10);
+    let clean = StreamProxy::new("HK-01", "10.0.0.2:443");
+    clean.set_delay(20);
+    let w = wind_over(vec![
+        Arc::clone(&refusing) as Arc<dyn Proxy>,
+        Arc::clone(&clean) as Arc<dyn Proxy>,
+    ]);
+
+    let metadata = Metadata::default();
+    assert!(w.wind.dial_tcp(&metadata).await.is_err());
+    assert!(
+        !refusing.alive(),
+        "fast counts the refusal against its member"
+    );
+    assert!(w.daniel.alive(), "风之谷 does not count it against daniel");
+    assert!(w.wind.dial_tcp(&metadata).await.is_ok());
+    assert_eq!(clean.dials(), 1);
+}
+
+/// With no live member left in its front group, the chained outbound has
+/// no way out: the refusal counts against it.
+#[tokio::test]
+async fn a_front_group_with_no_live_member_left_counts_against_the_outbound() {
+    let refusing = MockProxy::new_failing("SG-01", AdapterType::Vless, "connection refused");
+    refusing.set_delay(10);
+    let w = wind_over(vec![refusing as Arc<dyn Proxy>]);
+    assert!(w.wind.dial_tcp(&Metadata::default()).await.is_err());
+    assert!(!w.daniel.alive());
+}
+
+/// A url-test front keeps a target's chains on their carrier while the
+/// fastest member to the test URL changes, and moves them once the carrier
+/// is blocked for the target, which the logbook records under the chained
+/// outbound.
+#[tokio::test]
+async fn a_url_test_front_keeps_chains_on_their_carrier() {
+    use super::test_support::{registry_of, StreamProxy, TestLogbook};
+    use crate::dialer::{DialerTarget, NamedProxyDialer, TcpDialer as _};
+    let book = TestLogbook::install();
+    let first = StreamProxy::new("SG-01", "10.0.0.1:443");
+    first.set_delay(20);
+    let second = StreamProxy::new("HK-01", "10.0.0.2:443");
+    second.set_delay(30);
+    let fast: Arc<dyn Proxy> = Arc::new(UrlTestGroup::new(
+        "fast",
+        vec![
+            Arc::clone(&first) as Arc<dyn Proxy>,
+            Arc::clone(&second) as Arc<dyn Proxy>,
+        ],
+        0,
+    ));
+    let registry = registry_of(&[&fast]);
+    let owner = "carrier-daniel";
+    let dialer = NamedProxyDialer::new(DialerTarget::new("fast", &registry)).owned_by(owner);
+    let chain = || async {
+        let mut stream = dialer.dial("snell.example.com", 8443, false).await.unwrap();
+        stream.write_all(b"chained header").await.unwrap();
+        let mut buf = [0u8; 128];
+        stream.read(&mut buf).await.unwrap_or(0)
+    };
+
+    assert_eq!(chain().await, REPLY.len());
+    let health = fast.chain_health().unwrap();
+    assert_eq!(health.carrier(&target()).as_deref(), Some("SG-01"));
+
+    // HK-01 is now the fastest; the chains stay on SG-01.
+    second.set_delay(5);
+    assert_eq!(chain().await, REPLY.len());
+    assert_eq!((first.dials(), second.dials()), (2, 0));
+
+    let hold = ChainVerdict::Probe {
+        hold: Duration::from_secs(600),
+    };
+    health.record_failed(&target(), "SG-01", hold, "timed out");
+    assert_eq!(chain().await, REPLY.len());
+    assert_eq!((first.dials(), second.dials()), (2, 1));
+    assert_eq!(health.carrier(&target()).as_deref(), Some("HK-01"));
+    let entries = book.entries(owner);
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(
+        entries[0].message,
+        "'carrier-daniel' now dials through 'HK-01' of 'fast' (was 'SG-01': timed out)"
+    );
+
+    // A dead carrier gives way too.
+    health.record_reached(&target(), "SG-01");
+    meow_common::ProxyAdapter::health(&*first).set_alive(false);
+    assert_eq!(chain().await, REPLY.len());
+    assert_eq!((first.dials(), second.dials()), (2, 2));
+}
+
+/// A burst of dials through a front member that closes the server's port
+/// before any reply, a member that never carried a chain there: each fails
+/// for the member, so `风之谷` keeps `daniel`, and the next dial goes
+/// through the next member.
+#[tokio::test]
+async fn a_burst_through_an_unproven_front_member_keeps_the_outbound() {
+    use super::test_support::StreamProxy;
+    let audited = StreamProxy::auditing("SG-01", "10.0.0.1:443", 8443);
+    audited.set_delay(10);
+    let clean = StreamProxy::new("HK-01", "10.0.0.2:443");
+    clean.set_delay(20);
+    let w = wind_over(vec![
+        Arc::clone(&audited) as Arc<dyn Proxy>,
+        Arc::clone(&clean) as Arc<dyn Proxy>,
+    ]);
+
+    let metadata = Metadata::default();
+    let burst = (0..6).map(|_| w.wind.dial_tcp(&metadata));
+    let failed = futures::future::join_all(burst)
+        .await
+        .iter()
+        .filter(|r| r.is_err())
+        .count();
+    assert_eq!((failed, audited.dials()), (6, 6));
+    assert!(w.daniel.alive());
+    assert!(w.wind.dial_tcp(&metadata).await.is_ok());
+    assert_eq!(clean.dials(), 1);
+}
+
+/// The same burst through the member that carried the chains before counts
+/// against `daniel`: a carrier failing is the likelier sign of a server
+/// that is down.
+#[tokio::test]
+async fn a_burst_through_the_carrier_counts_against_the_outbound() {
+    use super::test_support::StreamProxy;
+    let audited = StreamProxy::auditing("SG-01", "10.0.0.1:443", 8443);
+    audited.set_delay(10);
+    let w = wind_over(vec![Arc::clone(&audited) as Arc<dyn Proxy>]);
+    w.fast
+        .chain_health()
+        .unwrap()
+        .record_reached(&target(), "SG-01");
+
+    let metadata = Metadata::default();
+    let burst = (0..6).map(|_| w.wind.dial_tcp(&metadata));
+    futures::future::join_all(burst).await;
+    assert!(!w.daniel.alive());
 }

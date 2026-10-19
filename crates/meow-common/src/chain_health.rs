@@ -26,6 +26,14 @@
 //! When a block runs out, the member is on probation: the next dial may use
 //! it, and one more failure blocks it again for twice as long. Any success
 //! clears the member.
+//!
+//! A table that tracks carriers ([`ChainHealth::tracking_carriers`]) also
+//! remembers, per target, the member that last carried a chain there. A
+//! url-test group keeps a target's front hops on its carrier while that
+//! member is alive and not blocked, rather than moving them each time the
+//! fastest member to the test URL changes: the chained outbound sits behind
+//! one member that is known to reach its server, and moves only when that
+//! member fails.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -124,10 +132,12 @@ pub enum ChainVerdict {
     Probe { hold: Duration },
 }
 
-/// A target's entry: outbounds seen dialling it and members with a record.
+/// A target's entry: outbounds seen dialling it, members with a record and
+/// the member carrying its chains.
 struct TargetState {
     owners: Vec<SmolStr>,
     members: HashMap<SmolStr, MemberState>,
+    carrier: Option<SmolStr>,
     used: Instant,
 }
 
@@ -136,19 +146,36 @@ impl TargetState {
         Self {
             owners: Vec::new(),
             members: HashMap::new(),
+            carrier: None,
             used: now,
         }
     }
+
+    fn is_blocked_at(&self, member: &str, now: Instant) -> bool {
+        self.members.get(member).is_some_and(|m| m.blocked_at(now))
+    }
+}
+
+/// The member carrying the chains to a target changed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CarrierChange {
+    /// The member that carried them before.
+    pub from: SmolStr,
+    /// Why `from` stopped: its last failure, while it is blocked.
+    pub reason: Option<&'static str>,
+    /// The outbound last seen dialling the target.
+    pub owner: Option<SmolStr>,
 }
 
 /// Failures since the last success. `level` counts blocks in a row: it sets
 /// the next block's length, and a non-zero level puts the member on
-/// probation once the block expires.
+/// probation once the block expires. `reason` describes the last failure.
 #[derive(Clone, Copy, Default)]
 struct MemberState {
     strikes: u8,
     level: u8,
     blocked_until: Option<Instant>,
+    reason: &'static str,
 }
 
 impl MemberState {
@@ -177,11 +204,29 @@ fn block_length(level: u8) -> Duration {
 #[derive(Default)]
 pub struct ChainHealth {
     targets: RwLock<HashMap<ChainTarget, TargetState>>,
+    /// Remember each target's carrier.
+    carriers: bool,
 }
 
 impl ChainHealth {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A table that also remembers each target's carrier, for a group whose
+    /// front hops to one target take one member at a time (url-test,
+    /// fallback).
+    pub fn tracking_carriers() -> Self {
+        Self {
+            carriers: true,
+            ..Self::default()
+        }
+    }
+
+    /// The member that last carried a chain to `target`, if this table
+    /// tracks carriers.
+    pub fn carrier(&self, target: &ChainTarget) -> Option<SmolStr> {
+        self.targets.read().get(target)?.carrier.clone()
     }
 
     /// Remember that `owner` dials `target` through this group. The health
@@ -221,8 +266,7 @@ impl ChainHealth {
         self.targets
             .read()
             .get(target)
-            .and_then(|state| state.members.get(member))
-            .is_some_and(|m| m.blocked_at(now))
+            .is_some_and(|state| state.is_blocked_at(member, now))
     }
 
     /// Members blocked for `target` now, with the time left on each block.
@@ -243,33 +287,92 @@ impl ChainHealth {
             })
     }
 
-    /// The chain to `target` through `member` worked: forget its record.
-    pub fn record_reached(&self, target: &ChainTarget, member: &str) {
-        let known = self
-            .targets
-            .read()
-            .get(target)
-            .is_some_and(|state| state.members.contains_key(member));
-        if !known {
-            return;
-        }
-        let mut targets = self.targets.write();
-        if let Some(state) = targets.get_mut(target) {
-            state.members.remove(member);
-        }
+    /// A front hop to `target` through `member` worked: forget the member's
+    /// record. A table tracking carriers makes `member` the target's
+    /// carrier, as the dial chose it; returns the change when it replaced
+    /// another member.
+    pub fn record_reached(&self, target: &ChainTarget, member: &str) -> Option<CarrierChange> {
+        self.reached_at(target, member, true, Instant::now())
     }
 
-    /// The chain to `target` through `member` failed. Returns the block
-    /// length when this failure blocked the member.
+    /// A chain probe to `target` through `member` worked: forget the
+    /// member's record. It becomes the carrier only when the target has
+    /// none, or its carrier is blocked: a probe round reaches through
+    /// several members, and the carrier stays while it works.
+    pub fn record_probe_reached(
+        &self,
+        target: &ChainTarget,
+        member: &str,
+    ) -> Option<CarrierChange> {
+        self.reached_at(target, member, false, Instant::now())
+    }
+
+    fn reached_at(
+        &self,
+        target: &ChainTarget,
+        member: &str,
+        dialled: bool,
+        now: Instant,
+    ) -> Option<CarrierChange> {
+        {
+            let targets = self.targets.read();
+            let state = targets.get(target);
+            let known = state.is_some_and(|state| state.members.contains_key(member));
+            let settled = !self.carriers
+                || state.is_some_and(|state| match &state.carrier {
+                    Some(carrier) if carrier == member => true,
+                    Some(carrier) => !dialled && !state.is_blocked_at(carrier, now),
+                    None => false,
+                });
+            if !known && settled {
+                return None;
+            }
+        }
+        let mut targets = self.targets.write();
+        let state = if self.carriers {
+            entry(&mut targets, target, now)
+        } else {
+            targets.get_mut(target)?
+        };
+        state.members.remove(member);
+        if !self.carriers || state.carrier.as_deref() == Some(member) {
+            return None;
+        }
+        let adopt = dialled
+            || state
+                .carrier
+                .as_ref()
+                .is_none_or(|carrier| state.is_blocked_at(carrier, now));
+        if !adopt {
+            return None;
+        }
+        let from = state.carrier.replace(SmolStr::new(member))?;
+        let reason = state
+            .members
+            .get(&from)
+            .filter(|m| m.blocked_at(now))
+            .map(|m| m.reason);
+        Some(CarrierChange {
+            from,
+            reason,
+            owner: state.owners.last().cloned(),
+        })
+    }
+
+    /// The chain to `target` through `member` failed, for `reason`, one of
+    /// [`failure_reason`]'s. Returns the block length when this failure
+    /// blocked the member.
     pub fn record_failed(
         &self,
         target: &ChainTarget,
         member: &str,
         verdict: ChainVerdict,
+        reason: &'static str,
     ) -> Option<Duration> {
-        self.record_failed_at(target, member, verdict, Instant::now())
+        self.failed_at(target, member, verdict, reason, Instant::now())
     }
 
+    #[cfg(test)]
     fn record_failed_at(
         &self,
         target: &ChainTarget,
@@ -277,9 +380,21 @@ impl ChainHealth {
         verdict: ChainVerdict,
         now: Instant,
     ) -> Option<Duration> {
+        self.failed_at(target, member, verdict, "test", now)
+    }
+
+    fn failed_at(
+        &self,
+        target: &ChainTarget,
+        member: &str,
+        verdict: ChainVerdict,
+        reason: &'static str,
+        now: Instant,
+    ) -> Option<Duration> {
         let mut targets = self.targets.write();
         let state = entry(&mut targets, target, now);
         let m = state.members.entry(SmolStr::new(member)).or_default();
+        m.reason = reason;
         match verdict {
             ChainVerdict::Probe { hold } => Some(m.block(now, hold)),
             ChainVerdict::Passive => {
@@ -294,6 +409,38 @@ impl ChainHealth {
         }
     }
 }
+
+/// A dial or probe failure in a few words, for records that outlive the
+/// process: error text can carry server addresses, which the logbook never
+/// keeps (ADR-0014), and a fixed vocabulary lets repeats fold into one
+/// entry.
+pub fn failure_reason(error: &str) -> &'static str {
+    let error = error.to_ascii_lowercase();
+    let has = |words: &[&str]| words.iter().any(|w| error.contains(w));
+    if has(&["timed out", "timeout", "deadline"]) {
+        "timed out"
+    } else if has(&["refused"]) {
+        "connection refused"
+    } else if has(&["reset", "aborted"]) {
+        "connection reset"
+    } else if has(&["unexpected status"]) {
+        "unexpected HTTP status"
+    } else if has(&["tls", "ssl", "certificate", "handshake"]) {
+        "TLS handshake failed"
+    } else if has(&["eof", "closed", "broken pipe"]) {
+        CLOSED_BEFORE_REPLY
+    } else if has(&["resolve", "dns", "lookup", "no address"]) {
+        "name resolution failed"
+    } else if has(&["unreachable"]) {
+        "network unreachable"
+    } else {
+        "connection failed"
+    }
+}
+
+/// The [`failure_reason`] of a chain whose stream ended before the first
+/// byte of a reply.
+pub const CLOSED_BEFORE_REPLY: &str = "closed before any reply";
 
 /// `target`'s entry, created on first use. A new entry past
 /// [`MAX_TARGETS`] evicts the least recently used one.
@@ -418,10 +565,10 @@ mod tests {
     fn a_success_between_failures_resets_the_strikes() {
         let health = ChainHealth::new();
         let t = target();
-        health.record_failed(&t, "HK-01", ChainVerdict::Passive);
+        health.record_failed(&t, "HK-01", ChainVerdict::Passive, "eof");
         health.record_reached(&t, "HK-01");
         assert_eq!(
-            health.record_failed(&t, "HK-01", ChainVerdict::Passive),
+            health.record_failed(&t, "HK-01", ChainVerdict::Passive, "eof"),
             None
         );
         assert!(!health.is_blocked(&t, "HK-01"));
@@ -470,12 +617,12 @@ mod tests {
     fn success_clears_the_block_and_the_probation() {
         let health = ChainHealth::new();
         let t = target();
-        health.record_failed(&t, "HK-01", PROBE);
+        health.record_failed(&t, "HK-01", PROBE, "eof");
         assert!(health.is_blocked(&t, "HK-01"));
         health.record_reached(&t, "HK-01");
         assert!(!health.is_blocked(&t, "HK-01"));
         assert_eq!(
-            health.record_failed(&t, "HK-01", ChainVerdict::Passive),
+            health.record_failed(&t, "HK-01", ChainVerdict::Passive, "eof"),
             None,
             "back to a clean slate: one passive failure is a strike"
         );
@@ -492,6 +639,105 @@ mod tests {
             None
         );
         assert!(!health.is_blocked_at(&t, "HK-01", now + BASE_BLOCK));
+    }
+
+    #[test]
+    fn a_table_without_carriers_remembers_none() {
+        let health = ChainHealth::new();
+        let t = target();
+        assert_eq!(health.record_reached(&t, "HK-01"), None);
+        assert_eq!(health.record_probe_reached(&t, "HK-01"), None);
+        assert_eq!(health.carrier(&t), None);
+    }
+
+    #[test]
+    fn a_dial_makes_its_member_the_carrier() {
+        let health = ChainHealth::tracking_carriers();
+        let t = target();
+        health.note_owner(&t, "daniel");
+        assert_eq!(
+            health.record_reached(&t, "HK-01"),
+            None,
+            "the first carrier"
+        );
+        assert_eq!(health.carrier(&t).as_deref(), Some("HK-01"));
+        assert_eq!(health.record_reached(&t, "HK-01"), None, "unchanged");
+        assert_eq!(
+            health.record_reached(&t, "HK-02"),
+            Some(CarrierChange {
+                from: "HK-01".into(),
+                reason: None,
+                owner: Some("daniel".into()),
+            })
+        );
+        assert_eq!(health.carrier(&t).as_deref(), Some("HK-02"));
+    }
+
+    #[test]
+    fn a_probe_takes_over_only_from_a_blocked_carrier() {
+        let health = ChainHealth::tracking_carriers();
+        let now = Instant::now();
+        let t = target();
+        assert_eq!(health.reached_at(&t, "HK-01", false, now), None);
+        assert_eq!(
+            health.carrier(&t).as_deref(),
+            Some("HK-01"),
+            "no carrier yet"
+        );
+        assert_eq!(health.reached_at(&t, "HK-02", false, now), None);
+        assert_eq!(
+            health.carrier(&t).as_deref(),
+            Some("HK-01"),
+            "a working carrier stays"
+        );
+
+        health.failed_at(&t, "HK-01", PROBE, "timed out", now);
+        let change = health.reached_at(&t, "HK-02", false, now).unwrap();
+        assert_eq!(
+            (change.from.as_str(), change.reason),
+            ("HK-01", Some("timed out"))
+        );
+        assert_eq!(health.carrier(&t).as_deref(), Some("HK-02"));
+    }
+
+    #[test]
+    fn a_carrier_change_names_the_reason_only_while_blocked() {
+        let health = ChainHealth::tracking_carriers();
+        let now = Instant::now();
+        let t = target();
+        health.reached_at(&t, "HK-01", true, now);
+        health.failed_at(&t, "HK-01", ChainVerdict::Passive, "closed", now);
+        let change = health.reached_at(&t, "HK-02", true, now).unwrap();
+        assert_eq!(change.reason, None, "one strike does not block");
+    }
+
+    #[test]
+    fn failure_reasons_keep_no_addresses() {
+        for (error, reason) in [
+            (
+                "dial: connect 203.0.113.7:8443: Connection refused (os error 111)",
+                "connection refused",
+            ),
+            (
+                "read: Connection reset by peer (os error 104)",
+                "connection reset",
+            ),
+            ("eof before status line", CLOSED_BEFORE_REPLY),
+            ("snell: unexpected eof reading reply", CLOSED_BEFORE_REPLY),
+            ("tls: handshake failure", "TLS handshake failed"),
+            ("unexpected status 403", "unexpected HTTP status"),
+            ("outbound dial deadline elapsed", "timed out"),
+            (
+                "failed to lookup address information",
+                "name resolution failed",
+            ),
+            (
+                "something else at snell.example.com:8443",
+                "connection failed",
+            ),
+        ] {
+            assert_eq!(failure_reason(error), reason, "{error}");
+        }
     }
 
     #[test]

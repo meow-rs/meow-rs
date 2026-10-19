@@ -85,7 +85,7 @@ The following routes are retained and do not collide with the mihomo surface:
   `connection-notes: true`; closed connections with notes stay readable
   for the last 256
 - `GET /logbook` and `DELETE /logbook`: the persistent record of notable
-  engine events (reloads, subscription and provider updates, group health,
+  engine events (reloads, subscription and provider updates, group switches,
   unclean exits), newest first, kept for 7 days across restarts. Filters
   `level` (lowest returned), `kind` (a kind or its area), `subject`; pages
   with `before=<id>`, polls with `since=<rev>`. `logbook: {enable: false}`

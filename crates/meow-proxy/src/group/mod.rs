@@ -1,10 +1,13 @@
 use meow_common::atomic::AtomicU;
+use meow_common::logbook::{self, Level};
 use meow_common::{
-    conn_note, AdapterType, ChainHealth, ChainTarget, ChainVerdict, MeowError, Metadata, Proxy,
-    ProxyConn,
+    conn_note, failure_reason, AdapterType, CarrierChange, ChainHealth, ChainTarget, ChainVerdict,
+    MeowError, Metadata, Proxy, ProxyConn, CLOSED_BEFORE_REPLY,
 };
 use parking_lot::Mutex;
 use smol_str::SmolStr;
+use std::cell::Cell;
+use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::sync::atomic::Ordering;
@@ -197,6 +200,28 @@ pub(super) fn record_dial_failure(
     }
 }
 
+tokio::task_local! {
+    /// Set while an automatic group dials a member. A `dialer-proxy` front
+    /// hop on the member's path that fails for its own member flags it
+    /// ([`front_hop_failed`]).
+    static MEMBER_DIAL: Cell<bool>;
+}
+
+/// The current dial failed at a `dialer-proxy` front hop, for the front
+/// group's member: it failed to dial while the group still has a live
+/// member, or it closed the chain before any reply without having carried
+/// a chain to that server before. The front group counts the member; the
+/// group dialling the chained outbound does not count the outbound. A front
+/// member refusing a connection would otherwise mark a healthy chained
+/// outbound dead at once, and a burst of connections through a member that
+/// drops the server's port would mark it dead after five
+/// (`DialFailureTracker`). A carrier that fails still counts against the
+/// outbound: a member known to reach the server failing is the likelier
+/// sign that the server is down.
+pub(crate) fn front_hop_failed() {
+    let _ = MEMBER_DIAL.try_with(|failed| failed.set(true));
+}
+
 /// Tracks the selected member even when an outer dial deadline drops the
 /// group future before its error arm can run. Capturing the deadline avoids
 /// consulting task-local state during destruction. Ordinary cancellation
@@ -222,10 +247,26 @@ impl<'a> DialAttempt<'a> {
         }
     }
 
-    fn finish<T>(mut self, result: meow_common::Result<T>) -> meow_common::Result<T> {
+    /// Dial the member with `dial` and count the outcome.
+    async fn run<T>(
+        mut self,
+        dial: impl Future<Output = meow_common::Result<T>>,
+    ) -> meow_common::Result<T> {
+        let (result, front_failed) = MEMBER_DIAL
+            .scope(Cell::new(false), async {
+                let result = dial.await;
+                (result, MEMBER_DIAL.with(Cell::get))
+            })
+            .await;
         self.deadline = None;
         match &result {
             Ok(_) => self.tracker.on_success(),
+            Err(err) if front_failed => debug!(
+                "proxy-group '{}': not counting a failed dial of '{}' against it: its \
+                 dialer-proxy front hop failed ({err})",
+                self.group_name,
+                self.member.name()
+            ),
             Err(err) => record_dial_failure(self.group_name, self.tracker, self.member, err),
         }
         result
@@ -265,21 +306,39 @@ pub(super) fn front_hop_target(
     Some(hop.target)
 }
 
-/// The member a front hop to `target` uses in place of `pick`, when `pick`
-/// is blocked for it: the first of `members` that `usable` accepts and that
-/// is not blocked. `members` comes in the group's preference order. With
-/// every usable member blocked the target itself is the likelier fault, so
-/// the group's own pick stands rather than a dial with nowhere to go. A
-/// dial (`dial`) notes the swap on the connection.
+/// The member a front hop to `target` uses. `carrier`, the member that
+/// carries the target's chains, when the group keeps them on it: it stays
+/// while `usable` accepts it and it is not blocked. Otherwise `pick`, the
+/// group's own, unless it is blocked for `target`; then the first of
+/// `members` that `usable` accepts and that is not blocked. `members` comes
+/// in the group's preference order. With every usable member blocked the
+/// target itself is the likelier fault, so the group's own pick stands
+/// rather than a dial with nowhere to go. A dial (`dial`) notes a member
+/// other than `pick` on the connection.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one call per group kind; a struct would only name the same values"
+)]
 pub(super) fn front_hop_pick(
     group: &str,
     health: &ChainHealth,
     target: &ChainTarget,
     pick: Arc<dyn Proxy>,
+    carrier: Option<Arc<dyn Proxy>>,
     members: impl FnOnce() -> Vec<Arc<dyn Proxy>>,
     usable: impl Fn(&Arc<dyn Proxy>) -> bool,
     dial: bool,
 ) -> Arc<dyn Proxy> {
+    if let Some(carrier) = carrier.filter(|c| usable(c) && !health.is_blocked(target, c.name())) {
+        if dial && carrier.name() != pick.name() {
+            conn_note!(
+                Dial,
+                "{group}: keeping dialer-proxy chains to {target} on {}",
+                carrier.name()
+            );
+        }
+        return carrier;
+    }
     if !health.is_blocked(target, pick.name()) {
         return pick;
     }
@@ -314,6 +373,7 @@ pub(super) fn watch_front_hop(
     if member.chain_health().is_some() {
         return conn;
     }
+    let carrier = health.carrier(&target).as_deref() == Some(member.name());
     Box::new(FrontHopConn {
         conn,
         pending: Some(PendingVerdict {
@@ -321,10 +381,44 @@ pub(super) fn watch_front_hop(
             health: Arc::clone(health),
             target,
             member: Arc::clone(member),
+            carrier,
             wrote: false,
             shut: false,
         }),
     })
+}
+
+/// Log and record that `member` took over the chains to `target` through
+/// `group` from `change.from`. The logbook entry's subject is the chained
+/// outbound, so a user following it sees every front-hop move in one place.
+pub(crate) fn carrier_changed(
+    group: &str,
+    target: &ChainTarget,
+    member: &str,
+    change: &CarrierChange,
+) {
+    let from = change.from.as_str();
+    let why = change
+        .reason
+        .map_or_else(String::new, |reason| format!(": {reason}"));
+    info!(
+        "proxy-group '{group}': dialer-proxy chains to {target} moved from '{from}'{why} to \
+         '{member}'"
+    );
+    let subject = change.owner.as_deref().unwrap_or(group);
+    let mut event = logbook::event(
+        logbook::kind::DIALER_PROXY_SWITCH,
+        Level::Info,
+        format!("'{subject}' now dials through '{member}' of '{group}' (was '{from}'{why})"),
+    )
+    .subject(subject)
+    .field("group", group)
+    .field("from", from)
+    .field("to", member);
+    if let Some(reason) = change.reason {
+        event = event.field("reason", reason);
+    }
+    event.coalesce().record();
 }
 
 /// A front-hop stream that settles one verdict for its member: reached on
@@ -342,28 +436,36 @@ struct PendingVerdict {
     health: Arc<ChainHealth>,
     target: ChainTarget,
     member: Arc<dyn Proxy>,
+    /// The member carried the target's chains when this one started.
+    carrier: bool,
     wrote: bool,
     shut: bool,
 }
 
 impl FrontHopConn {
-    fn settle(&mut self, reached: bool) {
+    /// Settle the verdict: reached, or failed for the reason given.
+    fn settle(&mut self, failure: Option<&'static str>) {
         let Some(verdict) = self.pending.take() else {
             return;
         };
         let member = verdict.member.name();
-        if reached {
-            verdict.health.record_reached(&verdict.target, member);
+        let Some(reason) = failure else {
+            if let Some(change) = verdict.health.record_reached(&verdict.target, member) {
+                carrier_changed(&verdict.group, &verdict.target, member, &change);
+            }
             return;
+        };
+        if !verdict.carrier {
+            front_hop_failed();
         }
         if let Some(length) =
             verdict
                 .health
-                .record_failed(&verdict.target, member, ChainVerdict::Passive)
+                .record_failed(&verdict.target, member, ChainVerdict::Passive, reason)
         {
             info!(
-                "proxy-group '{}': member '{member}' closed dialer-proxy chains to {} \
-                 before any reply; skipping it for that target for {}s",
+                "proxy-group '{}': member '{member}' failed dialer-proxy chains to {} \
+                 ({reason}); skipping it for that target for {}s",
                 verdict.group,
                 verdict.target,
                 length.as_secs()
@@ -378,7 +480,7 @@ impl FrontHopConn {
         };
         match poll {
             Poll::Ready(Ok(n)) if *n > 0 => verdict.wrote = true,
-            Poll::Ready(Err(_)) => self.settle(false),
+            Poll::Ready(Err(e)) => self.settle(Some(failure_reason(&e.to_string()))),
             _ => {}
         }
     }
@@ -398,9 +500,10 @@ impl AsyncRead for FrontHopConn {
             let read = buf.filled().len() - before;
             let judged = verdict.wrote && !verdict.shut;
             match result {
-                Ok(()) if read > 0 => this.settle(true),
+                Ok(()) if read > 0 => this.settle(None),
                 Ok(()) if capacity == 0 => {}
-                Ok(()) | Err(_) if judged => this.settle(false),
+                Ok(()) if judged => this.settle(Some(CLOSED_BEFORE_REPLY)),
+                Err(e) if judged => this.settle(Some(failure_reason(&e.to_string()))),
                 Ok(()) | Err(_) => this.pending = None,
             }
         }

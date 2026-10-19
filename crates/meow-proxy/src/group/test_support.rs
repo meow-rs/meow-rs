@@ -346,3 +346,179 @@ impl Proxy for StreamProxy {
         self.health.delay_history()
     }
 }
+
+/// Outbound with a `dialer-proxy` that speaks no protocol of its own: it
+/// dials its server through the dialer and hands back the front hop's
+/// stream. `connect_over` passes the stream through, so it relays too.
+pub struct ChainedProxy {
+    name: String,
+    addr: String,
+    dialer: crate::dialer::NamedProxyDialer,
+    health: ProxyHealth,
+    /// Send a header and wait for the server's reply in the dial, as Snell
+    /// and SOCKS5 do.
+    handshake: bool,
+}
+
+impl ChainedProxy {
+    /// `name` at `addr`, dialling through `front`, which `registry`
+    /// resolves. Keep `registry` alive while it dials.
+    pub fn new(
+        name: &str,
+        addr: &str,
+        front: &str,
+        registry: &crate::dialer::ProxyRegistry,
+    ) -> Arc<Self> {
+        Self::build(name, addr, front, registry, false)
+    }
+
+    /// Like [`Self::new`], with a handshake in the dial: a header, then the
+    /// server's reply, so a front hop closed before any reply fails the
+    /// dial.
+    pub fn handshaking(
+        name: &str,
+        addr: &str,
+        front: &str,
+        registry: &crate::dialer::ProxyRegistry,
+    ) -> Arc<Self> {
+        Self::build(name, addr, front, registry, true)
+    }
+
+    fn build(
+        name: &str,
+        addr: &str,
+        front: &str,
+        registry: &crate::dialer::ProxyRegistry,
+        handshake: bool,
+    ) -> Arc<Self> {
+        let target = crate::dialer::DialerTarget::new(front, registry);
+        Arc::new(Self {
+            name: name.to_string(),
+            addr: addr.to_string(),
+            dialer: crate::dialer::NamedProxyDialer::new(target).owned_by(name),
+            health: ProxyHealth::new(),
+            handshake,
+        })
+    }
+}
+
+#[async_trait]
+impl ProxyAdapter for ChainedProxy {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn adapter_type(&self) -> AdapterType {
+        AdapterType::Snell
+    }
+    fn addr(&self) -> &str {
+        &self.addr
+    }
+    fn support_udp(&self) -> bool {
+        false
+    }
+    async fn dial_tcp(&self, _metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
+        use crate::dialer::TcpDialer as _;
+        let (host, port) = self.addr.rsplit_once(':').expect("host:port");
+        let mut stream = self
+            .dialer
+            .dial(host, port.parse().expect("port"), false)
+            .await
+            .map_err(MeowError::Io)?;
+        if self.handshake {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            stream.write_all(b"chained header").await?;
+            let mut reply = [0u8; REPLY.len()];
+            if stream.read(&mut reply).await? == 0 {
+                return Err(MeowError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "closed before the reply",
+                )));
+            }
+        }
+        Ok(Box::new(crate::stream_conn::StreamConn(stream)))
+    }
+    async fn dial_udp(&self, _m: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
+        Err(MeowError::UdpNotSupported)
+    }
+    async fn connect_over(
+        &self,
+        stream: Box<dyn ProxyConn>,
+        _metadata: &Metadata,
+    ) -> Result<Box<dyn ProxyConn>> {
+        Ok(stream)
+    }
+    fn health(&self) -> &ProxyHealth {
+        &self.health
+    }
+}
+
+impl Proxy for ChainedProxy {
+    fn alive(&self) -> bool {
+        self.health.alive()
+    }
+    fn alive_for_url(&self, _url: &str) -> bool {
+        self.health.alive()
+    }
+    fn last_delay(&self) -> u16 {
+        self.health.last_delay()
+    }
+    fn last_delay_for_url(&self, _url: &str) -> u16 {
+        self.health.last_delay()
+    }
+    fn delay_history(&self) -> Vec<DelayHistory> {
+        self.health.delay_history()
+    }
+}
+
+/// A registry publishing `proxies` by name, as a tunnel's generation does.
+pub fn registry_of(proxies: &[&Arc<dyn Proxy>]) -> crate::dialer::ProxyRegistry {
+    let registry = crate::dialer::ProxyRegistry::default();
+    registry.publish(Arc::new(
+        proxies
+            .iter()
+            .map(|p| (smol_str::SmolStr::new(p.name()), Arc::clone(p)))
+            .collect(),
+    ));
+    registry
+}
+
+/// The process-wide logbook, installed in a temporary directory for one
+/// test at a time and uninstalled on drop. Tests that do not take it record
+/// into it meanwhile, so a test reads its own subjects only.
+pub struct TestLogbook {
+    _dir: tempfile::TempDir,
+    _serial: parking_lot::MutexGuard<'static, ()>,
+}
+
+static LOGBOOK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+impl TestLogbook {
+    pub fn install() -> Self {
+        use meow_common::logbook;
+        let serial = LOGBOOK.lock();
+        let dir = tempfile::tempdir().unwrap();
+        logbook::install(dir.path(), logbook::Options::default()).unwrap();
+        Self {
+            _dir: dir,
+            _serial: serial,
+        }
+    }
+
+    /// The entries about `subject`, newest first.
+    pub fn entries(&self, subject: &str) -> Vec<meow_common::logbook::Entry> {
+        let query = meow_common::logbook::Query {
+            subject: Some(subject.to_owned()),
+            ..Default::default()
+        };
+        meow_common::logbook::query(&query)
+            .unwrap()
+            .unwrap()
+            .entries
+    }
+}
+
+impl Drop for TestLogbook {
+    fn drop(&mut self) {
+        meow_common::logbook::uninstall();
+    }
+}

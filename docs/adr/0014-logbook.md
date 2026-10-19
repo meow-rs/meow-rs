@@ -54,16 +54,22 @@ once released, because clients filter, label and translate by kind.
 | `geodata.update` | info / error | `GeoIP MMDB`, `ASN MMDB`, `geosite` | Downloaded and loaded into the rules, or the download or reload failed |
 | `listener.start` | error | listener (`tun` for TUN) | A listener did not start |
 | `network.interface` | info | | The interface outbound sockets bind to (TUN `auto-route: global`) changed, or they no longer bind to one. Recorded for a binding once its TUN listener is up: a reload candidate's binding, installed for the validation's dials, records nothing until then, and nothing at all when the candidate is rejected |
-| `group.health` | info / warning / error | group | A health-check sweep found a different set of dead members: some down (warning, up to 20 names in `down`), all down (error), all up again (info). A member is dead from its first failed probe until it passes two sweeps in a row |
-| `group.switch` | info | group | A `url-test` or `fallback` group routes to another member than after the previous sweep (`from`, `to`) |
+| `group.switch` | info | group | A `url-test` or `fallback` group routes to another member than after the previous sweep (`from`, `to`; `reason` when `from` went down) |
+| `dialer-proxy.switch` | info | chained outbound | The member of a `dialer-proxy` group carrying the outbound's chains to its server changed (`group`, `from`, `to`; `reason` when `from` is blocked for that server) |
+| `dialer-proxy.check` | info / error | chained outbound | A health check of the outbound failed through every member of its `dialer-proxy` group tried (`group`, `reason`, `tried`), or passed again |
+
+Failure reasons in these entries come from a fixed vocabulary
+(`timed out`, `connection refused`, `closed before any reply`, ...), not
+the error text, which can name server addresses, and members are named,
+never their servers.
 
 Routine successes are not recorded: a first provider load belongs to the
 start or config change that declared it (so does the first payload of a
 provider registered empty, such as a download adopted after the fetch
-deadline), an unchanged refetch is noise, and
-a sweep that finds the same dead members as the last one says nothing new;
-a member that flaps between sweeps stays dead until it passes two in a row,
-so it is one entry rather than one per sweep. Whether a success ends a
+deadline), and an unchanged refetch is noise. Members of a group going
+down are not recorded either: the same airport nodes sit in several
+groups, so one dead node made an entry in each, and none of them said
+whether the traffic still went where it should. Whether a success ends a
 failure is read from the logbook itself (`logbook::failing`): the subject's
 latest entry of the kind is an error. A recovery is then recorded even when
 the provider object that failed was rebuilt by a config commit, or the

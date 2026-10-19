@@ -60,6 +60,7 @@ proxy-groups:
 meow keeps such chains up and shows what they do:
 
 - **Skips members that cannot reach the chained server** -- a member of a `url-test`, `fallback` or `load-balance` dialer group can pass the group's URL test and still be unable to reach `home`'s server, for example when an airport's audit rules drop the port. meow notices when two chains in a row through that member close before any reply, and probes the chain itself after each health check, then routes the chain around the member until it works again; the group's other traffic keeps its normal pick. On by default, no config, no mihomo equivalent
+- **Keeps the chained node in its group** -- with `home` first in a `fallback` group, a failing front hop no longer moves traffic off `home`: a `url-test` dialer group keeps `home`'s chains on the member that last carried them instead of following its fastest member, a health check of `home` that fails is checked again through up to 3 other members before `home` counts as down, and a member refusing the connection counts against that member, not `home`
 - **Traffic per hop** -- `GET /statistics` credits the group member that carries the front hop, TCP and UDP, so the node in the middle of a chain shows its traffic too; the totals still count each connection once
 - **Connection notes name the hop** -- with `connection-notes: true`, `GET /connections/{id}` shows which member carried the chain, e.g. `Dialing home.example.com:8443 via dialer-proxy fast → HK-01 (Vless)`, one note per hop when chains nest
 - **UDP through chains** -- Shadowsocks UDP, SOCKS5 UDP ASSOCIATE and domain targets ride the front proxy's own UDP relay; a front without UDP fails the dial instead of leaking around the chain
@@ -73,7 +74,8 @@ A persistent record of the engine events worth reading later, like Surge's Logbo
 - config reloads and API edits, with the error when a reload is rejected
 - subscription, proxy-provider, rule-provider and geodata updates, and their failures
 - listeners that did not start, and outbound interface changes
-- `url-test` / `fallback` groups switching member
+- `url-test` / `fallback` groups switching member, with why the previous one went down
+- `dialer-proxy` chains moving to another member, and chained nodes whose health check failed through every member tried
 
 Repeats of a failure fold into one entry with a count: a provider that fails every minute for a day is one entry with a count of 1440. Entries live in an SQLite database under `<home>/logbook/` for 7 days (up to 2 MiB) and survive restarts and crashes. `GET /logbook` filters by level, kind and subject, pages back with `before` and polls with `since`, and a client app in another process can read the database directly. The logbook never records where user traffic goes, and records rule edits by index, not rule text.
 

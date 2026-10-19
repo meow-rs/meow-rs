@@ -1,8 +1,9 @@
 use async_trait::async_trait;
 use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt};
+use meow_common::logbook::{self, Level};
 use meow_common::{
-    AdapterType, ChainTarget, ChainVerdict, MeowError, Metadata, Proxy, ProxyAdapter, ProxyConn,
-    ProxyPacketConn,
+    failure_reason, AdapterType, ChainTarget, ChainVerdict, MeowError, Metadata, Proxy,
+    ProxyAdapter, ProxyConn, ProxyPacketConn,
 };
 use meow_transport::tls::{TlsConfig, TlsLayer};
 use meow_transport::Transport as _;
@@ -214,26 +215,39 @@ pub const CHAIN_PROBE_PASSES: usize = 3;
 /// would otherwise cost a probe through every member, every round.
 pub const CHAIN_PROBE_LIMIT: usize = 12;
 
-/// What one [`probe_chain_target`] round found, by member name.
+/// Members a sweep's [chain check](sweep_members) tries at most before it
+/// takes a chained outbound for down.
+pub const CHAIN_CHECK_LIMIT: usize = 3;
+
+/// What one chain probe round found, by member name.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ChainProbeReport {
-    pub reached: Vec<String>,
+    /// Members that reached the target, in the order tried, with the
+    /// probe's delay.
+    pub reached: Vec<(String, u16)>,
+    /// Members that failed while another reached the target. Each is
+    /// blocked for it now.
     pub blocked: Vec<String>,
+    /// Members that failed in a round where none reached the target. The
+    /// target is the likelier fault, so their records stand.
+    pub failed: Vec<String>,
 }
 
 /// The active half of [`meow_common::chain_health`]: probe the
 /// `dialer-proxy` chain to `target`, `[member, owner]` to `url`, through
-/// the members of `group`, an automatic group, and record each verdict in
+/// the members of `group`, an automatic group, and record the verdicts in
 /// its chain health.
 ///
-/// The group's own pick goes first, being the member the next front hop
-/// takes, then the rest fastest first by the group's URL test, live ones
-/// only. The round stops once [`CHAIN_PROBE_PASSES`] members reach the
-/// target, or after [`CHAIN_PROBE_LIMIT`] probes. A member that is an
-/// automatic group itself is skipped: it keeps its own verdicts. A failed
-/// probe blocks the member for at least `hold`, which callers set past
-/// their next round. When `owner` cannot run over a relayed stream, the
-/// round records nothing.
+/// Members go in the order the next front hop would take them: the
+/// target's carrier, then the group's own pick, then the rest fastest
+/// first by the group's URL test, live ones only. The round stops once
+/// [`CHAIN_PROBE_PASSES`] members reach the target, or after
+/// [`CHAIN_PROBE_LIMIT`] probes. A member that is an automatic group itself
+/// is skipped: it keeps its own verdicts. When some member reaches the
+/// target, each one that failed is blocked for at least `hold`, which
+/// callers set past their next round; when none does, the target is the
+/// likelier fault and the round records nothing. When `owner` cannot run
+/// over a relayed stream, the round records nothing either.
 pub async fn probe_chain_target(
     group: &Arc<dyn Proxy>,
     target: &ChainTarget,
@@ -243,73 +257,315 @@ pub async fn probe_chain_target(
     timeout: Duration,
     hold: Duration,
 ) -> ChainProbeReport {
-    let (Some(health), Some(members)) = (group.chain_health(), group.member_proxies()) else {
-        return ChainProbeReport::default();
+    let round = ChainRound {
+        group,
+        target,
+        owner,
+        url,
+        expected,
+        timeout,
+        hold,
     };
-    let group_name = group.name();
-    // Not a front hop, so the pick the group makes before its verdicts.
-    let pick = group.unwrap_proxy(&Metadata::default(), false);
-    let mut candidates: Vec<&Arc<dyn Proxy>> = members
-        .iter()
-        .filter(|m| {
-            m.chain_health().is_none()
-                && m.alive()
-                && m.last_delay() > 0
-                && m.name() != owner.name()
-        })
-        .collect();
-    candidates.sort_by_key(|m| {
-        let picked = pick.as_ref().is_some_and(|p| p.name() == m.name());
-        (!picked, m.last_delay())
-    });
-    candidates.truncate(CHAIN_PROBE_LIMIT);
+    round
+        .run(CHAIN_PROBE_PASSES, CHAIN_PROBE_LIMIT, false)
+        .await
+        .unwrap_or_default()
+}
 
-    let mut report = ChainProbeReport::default();
-    let mut candidates = candidates.into_iter();
-    while report.reached.len() < CHAIN_PROBE_PASSES {
-        let batch: Vec<&Arc<dyn Proxy>> = candidates
-            .by_ref()
-            .take(CHAIN_PROBE_PASSES - report.reached.len())
+/// One round of chain probes; see [`probe_chain_target`].
+struct ChainRound<'a> {
+    group: &'a Arc<dyn Proxy>,
+    target: &'a ChainTarget,
+    owner: &'a Arc<dyn Proxy>,
+    url: &'a str,
+    expected: Option<&'a str>,
+    timeout: Duration,
+    hold: Duration,
+}
+
+impl ChainRound<'_> {
+    /// Probe until `passes` members reach the target, `limit` probes at
+    /// most. A `check` skips members blocked for the target and tries
+    /// members the group has not probed yet, after the rest: the first
+    /// sweep of the group dialling the owner may run before the front
+    /// group's. `None` when the group keeps no verdicts or the owner cannot
+    /// be relayed.
+    async fn run(&self, passes: usize, limit: usize, check: bool) -> Option<ChainProbeReport> {
+        let health = self.group.chain_health()?;
+        let members = self.group.member_proxies()?;
+        let group_name = self.group.name();
+        let owner = self.owner;
+        let carrier = health.carrier(self.target);
+        // Not a front hop, so the pick the group makes before its verdicts.
+        let pick = self.group.unwrap_proxy(&Metadata::default(), false);
+        let mut candidates: Vec<&Arc<dyn Proxy>> = members
+            .iter()
+            .filter(|m| {
+                m.chain_health().is_none()
+                    && m.alive()
+                    && (check || m.last_delay() > 0)
+                    && m.name() != owner.name()
+                    && !(check && health.is_blocked(self.target, m.name()))
+            })
             .collect();
-        if batch.is_empty() {
-            break;
-        }
-        let probes = batch.iter().map(|member| async move {
-            let probe = ChainProbe::new(member, owner);
-            let _permit = global_delay_probe_limiter()
-                .acquire()
-                .await
-                .expect("global delay probe semaphore is never closed");
-            let result = url_test(&probe, url, expected, timeout).await;
-            (*member, result, probe.unsupported.load(Ordering::Relaxed))
+        candidates.sort_by_key(|m| {
+            let rank = if carrier.as_deref() == Some(m.name()) {
+                0
+            } else if pick.as_ref().is_some_and(|p| p.name() == m.name()) {
+                1
+            } else {
+                2
+            };
+            (rank, m.last_delay() == 0, m.last_delay())
         });
-        for (member, result, unsupported) in futures::future::join_all(probes).await {
-            if unsupported {
-                debug!(
-                    "proxy-group '{group_name}': cannot probe chains to {target}: '{}' does not \
-                     run over a relayed stream",
-                    owner.name()
-                );
-                return ChainProbeReport::default();
+        candidates.truncate(limit);
+
+        let mut reached: Vec<(&Arc<dyn Proxy>, u16)> = Vec::new();
+        let mut failed: Vec<(&Arc<dyn Proxy>, &'static str)> = Vec::new();
+        let mut candidates = candidates.into_iter();
+        while reached.len() < passes {
+            let batch: Vec<&Arc<dyn Proxy>> =
+                candidates.by_ref().take(passes - reached.len()).collect();
+            if batch.is_empty() {
+                break;
             }
-            let name = member.name();
-            if result.is_ok() {
-                health.record_reached(target, name);
-                report.reached.push(name.to_string());
-                continue;
+            let probes = batch.iter().map(|member| async move {
+                let probe = ChainProbe::new(member, owner);
+                let _permit = global_delay_probe_limiter()
+                    .acquire()
+                    .await
+                    .expect("global delay probe semaphore is never closed");
+                let result = url_test(&probe, self.url, self.expected, self.timeout).await;
+                (*member, result, probe.unsupported.load(Ordering::Relaxed))
+            });
+            for (member, result, unsupported) in futures::future::join_all(probes).await {
+                if unsupported {
+                    debug!(
+                        "proxy-group '{group_name}': cannot probe chains to {}: '{}' does not \
+                         run over a relayed stream",
+                        self.target,
+                        owner.name()
+                    );
+                    return None;
+                }
+                match result {
+                    Ok(delay) => reached.push((member, delay)),
+                    Err(error) => failed.push((member, url_test_reason(&error))),
+                }
             }
-            if let Some(length) = health.record_failed(target, name, ChainVerdict::Probe { hold }) {
+        }
+
+        let name = |m: &Arc<dyn Proxy>| m.name().to_owned();
+        if reached.is_empty() {
+            return Some(ChainProbeReport {
+                failed: failed.iter().map(|(m, _)| name(m)).collect(),
+                ..ChainProbeReport::default()
+            });
+        }
+        // Failures first: a carrier blocked here hands over to the first
+        // member that reached the target.
+        for (member, reason) in &failed {
+            let probe = ChainVerdict::Probe { hold: self.hold };
+            if let Some(length) = health.record_failed(self.target, member.name(), probe, reason) {
                 info!(
-                    "proxy-group '{group_name}': member '{name}' cannot carry '{}' to {target}; \
-                     skipping it for that target for {}s",
+                    "proxy-group '{group_name}': member '{}' cannot carry '{}' to {} \
+                     ({reason}); skipping it for that target for {}s",
+                    member.name(),
                     owner.name(),
+                    self.target,
                     length.as_secs()
                 );
             }
-            report.blocked.push(name.to_string());
         }
+        for (member, _) in &reached {
+            if let Some(change) = health.record_probe_reached(self.target, member.name()) {
+                crate::group::carrier_changed(group_name, self.target, member.name(), &change);
+            }
+        }
+        Some(ChainProbeReport {
+            reached: reached.iter().map(|(m, delay)| (name(m), *delay)).collect(),
+            blocked: failed.iter().map(|(m, _)| name(m)).collect(),
+            failed: Vec::new(),
+        })
     }
-    report
+}
+
+/// [`failure_reason`] of a [`url_test`] error.
+fn url_test_reason(error: &UrlTestError) -> &'static str {
+    match error {
+        UrlTestError::Timeout => "timed out",
+        UrlTestError::Transport(e) => failure_reason(e),
+    }
+}
+
+/// One member's outcome in [`sweep_members`].
+#[derive(Debug)]
+pub struct SweptMember {
+    pub name: String,
+    /// The delay recorded, `0` when the member is down.
+    pub delay: u16,
+    /// Why the member is down.
+    pub reason: Option<String>,
+}
+
+/// Probe the members of a group being swept and record each delay, like
+/// [`probe_many_bounded`], with one difference for a chained outbound: an
+/// outbound that dials through an automatic group among `fronts`, with its
+/// health check failing. The failure may be the front hop's, not the
+/// outbound's, so before it is recorded the chain is checked through other
+/// members of that group: the target's carrier first, then the members
+/// the next front hop would take, [`CHAIN_CHECK_LIMIT`] at most, each over
+/// a fresh connection, skipping members blocked for the outbound's server.
+/// When one reaches the server, the outbound is up: its delay through that
+/// member is recorded, each member that failed is blocked for that server
+/// for at least `hold`, and the member that reached it becomes the
+/// carrier. Only when none does is the outbound down. Without this, one
+/// failed probe through a bad front member took the outbound out of its
+/// group until the next sweep.
+///
+/// A failed check is recorded in the logbook (`dialer-proxy.check`), and
+/// so is the next passing health check of that outbound.
+pub async fn sweep_members(
+    members: Vec<(String, Arc<dyn Proxy>)>,
+    fronts: &[Arc<dyn Proxy>],
+    url: &str,
+    expected: Option<&str>,
+    timeout: Duration,
+    concurrency: usize,
+    hold: Duration,
+) -> Vec<SweptMember> {
+    let sweeps: Vec<_> = members
+        .into_iter()
+        .map(|(name, proxy)| sweep_member(name, proxy, fronts, url, expected, timeout, hold))
+        .collect();
+    futures::stream::iter(sweeps)
+        .buffer_unordered(concurrency.max(1))
+        .collect()
+        .await
+}
+
+/// [`sweep_members`] for one member.
+async fn sweep_member(
+    name: String,
+    proxy: Arc<dyn Proxy>,
+    fronts: &[Arc<dyn Proxy>],
+    url: &str,
+    expected: Option<&str>,
+    timeout: Duration,
+    hold: Duration,
+) -> SweptMember {
+    let result = {
+        let _permit = global_delay_probe_limiter()
+            .acquire()
+            .await
+            .expect("global delay probe semaphore is never closed");
+        url_test(proxy.as_ref(), url, expected, timeout).await
+    };
+    let (delay, reason) = match result {
+        Ok(delay) => (delay, None),
+        Err(error) => {
+            let reason = url_test_reason(&error);
+            match chain_of(fronts, &name) {
+                Some((front, target)) => {
+                    let round = ChainRound {
+                        group: front,
+                        target: &target,
+                        owner: &proxy,
+                        url,
+                        expected,
+                        timeout,
+                        hold,
+                    };
+                    check_chain(&round, &name, reason).await
+                }
+                None => (0, Some(reason.to_owned())),
+            }
+        }
+    };
+    proxy.health().record_delay(delay);
+    if delay > 0 && logbook::failing(logbook::kind::DIALER_PROXY_CHECK, &name) {
+        logbook::event(
+            logbook::kind::DIALER_PROXY_CHECK,
+            Level::Info,
+            format!("'{name}' passes its health check again"),
+        )
+        .subject(name.as_str())
+        .record();
+    }
+    SweptMember {
+        name,
+        delay,
+        reason,
+    }
+}
+
+/// The automatic group among `fronts` that `owner` dials through, with the
+/// server it dials. The owner's own failed probe has just noted it there.
+fn chain_of<'a>(
+    fronts: &'a [Arc<dyn Proxy>],
+    owner: &str,
+) -> Option<(&'a Arc<dyn Proxy>, ChainTarget)> {
+    fronts.iter().find_map(|front| {
+        let (target, _) = front
+            .chain_health()?
+            .targets()
+            .into_iter()
+            .find(|(_, owners)| owners.iter().any(|o| o == owner))?;
+        Some((front, target))
+    })
+}
+
+/// [`sweep_members`]' chain check of `owner`, whose health check failed
+/// for `reason`: the delay to record and, when that is `0`, why.
+async fn check_chain(
+    round: &ChainRound<'_>,
+    owner: &str,
+    reason: &'static str,
+) -> (u16, Option<String>) {
+    let front = round.group.name();
+    let report = round.run(1, CHAIN_CHECK_LIMIT, true).await;
+    let Some(report) = report else {
+        return (0, Some(reason.to_owned()));
+    };
+    if let Some((member, delay)) = report.reached.first() {
+        info!(
+            "health-check: '{owner}' failed its probe ({reason}) but reached its server \
+             through '{member}' of '{front}'; keeping it up"
+        );
+        return (*delay, None);
+    }
+    let tried = report.failed.len();
+    let why = if tried == 0 {
+        format!("{reason}; no member of '{front}' left to try")
+    } else {
+        format!("{reason}; unreachable through {tried} members of '{front}' tried")
+    };
+    warn!("health-check: '{owner}' is down: {why}");
+    let message = if tried == 0 {
+        format!("'{owner}' failed its health check ({reason}) and no member of '{front}' was left to try")
+    } else {
+        format!(
+            "'{owner}' failed its health check ({reason}) through every member of '{front}' tried: {}",
+            quoted(&report.failed)
+        )
+    };
+    logbook::event(logbook::kind::DIALER_PROXY_CHECK, Level::Error, message)
+        .subject(owner)
+        .field("group", front)
+        .field("reason", reason)
+        .field("tried", tried)
+        .coalesce()
+        .record();
+    (0, Some(why))
+}
+
+/// `'a', 'b', 'c'`.
+fn quoted(names: &[String]) -> String {
+    names
+        .iter()
+        .map(|n| format!("'{n}'"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// `[member, owner]` as one adapter for [`url_test`]. The relay dials the
@@ -720,7 +976,8 @@ mod tests {
 
     mod chain_probe {
         use super::*;
-        use crate::group::test_support::StreamProxy;
+        use crate::group::test_support::{StreamProxy, TestLogbook};
+        use meow_common::logbook::kind;
 
         const URL: &str = "http://probe.example/generate_204";
 
@@ -756,6 +1013,14 @@ mod tests {
             names.iter().map(ToString::to_string).collect()
         }
 
+        fn reached(report: &ChainProbeReport) -> Vec<String> {
+            report
+                .reached
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect()
+        }
+
         /// The member that passes the group's URL test but closes the
         /// chained outbound's port is blocked for that server at once;
         /// dead and unprobed members are not probed.
@@ -778,13 +1043,9 @@ mod tests {
             let owner = daniel();
 
             let report = probe(&group, &owner).await;
-            assert_eq!(
-                report,
-                ChainProbeReport {
-                    reached: names(&["HK-01"]),
-                    blocked: names(&["SG-01"]),
-                }
-            );
+            assert_eq!(reached(&report), names(&["HK-01"]));
+            assert_eq!(report.blocked, names(&["SG-01"]));
+            assert!(report.failed.is_empty());
             assert!(blocked(&group, &owner, "SG-01"));
             assert!(!blocked(&group, &owner, "HK-01"));
             assert_eq!((dead.dials(), unprobed.dials()), (0, 0));
@@ -804,14 +1065,15 @@ mod tests {
                 })
                 .collect();
             let report = probe(&fallback(&members), &daniel()).await;
-            assert_eq!(report.reached, names(&["m0", "m2", "m4"]));
+            assert_eq!(reached(&report), names(&["m0", "m2", "m4"]));
             assert!(report.blocked.is_empty());
             let dials: Vec<usize> = members.iter().map(|m| m.dials()).collect();
             assert_eq!(dials, [1, 0, 1, 0, 1]);
         }
 
         /// Behind failures the round tries further members, up to
-        /// [`CHAIN_PROBE_LIMIT`] probes in all.
+        /// [`CHAIN_PROBE_LIMIT`] probes in all. When none reaches the
+        /// target, the target is the likelier fault: no member is blocked.
         #[tokio::test]
         async fn a_target_no_member_reaches_costs_at_most_the_limit() {
             let members: Vec<Arc<StreamProxy>> = (1..=CHAIN_PROBE_LIMIT as u16 + 3)
@@ -821,11 +1083,68 @@ mod tests {
                     member
                 })
                 .collect();
-            let report = probe(&fallback(&members), &daniel()).await;
+            let group = fallback(&members);
+            let owner = daniel();
+            let report = probe(&group, &owner).await;
             assert!(report.reached.is_empty());
-            assert_eq!(report.blocked.len(), CHAIN_PROBE_LIMIT);
+            assert!(report.blocked.is_empty());
+            assert_eq!(report.failed.len(), CHAIN_PROBE_LIMIT);
             let dials: usize = members.iter().map(|m| m.dials()).sum();
             assert_eq!(dials, CHAIN_PROBE_LIMIT);
+            assert!(!blocked(&group, &owner, "m1"));
+        }
+
+        /// The target's carrier goes first, ahead of the group's pick, and
+        /// stays the carrier while it reaches the target.
+        #[tokio::test]
+        async fn probes_the_carrier_first() {
+            let members: Vec<Arc<StreamProxy>> = [10, 20, 30, 40]
+                .into_iter()
+                .enumerate()
+                .map(|(i, delay)| {
+                    let member = StreamProxy::new(&format!("m{i}"), "10.0.0.1:443");
+                    member.set_delay(delay);
+                    member
+                })
+                .collect();
+            let group = fallback(&members);
+            let owner = daniel();
+            let target = ChainTarget::from_server_addr(owner.addr()).unwrap();
+            let health = group.chain_health().unwrap();
+            health.record_reached(&target, "m3");
+            let report = probe(&group, &owner).await;
+            assert_eq!(reached(&report), names(&["m3", "m0", "m1"]));
+            assert_eq!(health.carrier(&target).as_deref(), Some("m3"));
+        }
+
+        /// A carrier that fails a round is blocked, and the first member
+        /// that reached the target takes over, which the logbook records
+        /// under the chained outbound with the reason.
+        #[tokio::test]
+        async fn a_blocked_carrier_hands_over_to_the_first_that_reached() {
+            let book = TestLogbook::install();
+            let audited = StreamProxy::auditing("SG-01", "10.0.0.1:443", 8443);
+            audited.set_delay(10);
+            let clean = StreamProxy::new("HK-01", "10.0.0.2:443");
+            clean.set_delay(20);
+            let group = fallback(&[Arc::clone(&audited), Arc::clone(&clean)]);
+            let owner: Arc<dyn Proxy> = StreamProxy::new("carrier-owner", "snell.example.com:8443");
+            let target = ChainTarget::from_server_addr(owner.addr()).unwrap();
+            let health = group.chain_health().unwrap();
+            health.note_owner(&target, "carrier-owner");
+            health.record_reached(&target, "SG-01");
+
+            let report = probe(&group, &owner).await;
+            assert_eq!(report.blocked, names(&["SG-01"]));
+            assert_eq!(health.carrier(&target).as_deref(), Some("HK-01"));
+            let entries = book.entries("carrier-owner");
+            assert_eq!(entries.len(), 1, "{entries:?}");
+            assert_eq!(entries[0].kind, kind::DIALER_PROXY_SWITCH);
+            assert_eq!(
+                entries[0].message,
+                "'carrier-owner' now dials through 'HK-01' of 'fast' (was 'SG-01': closed \
+                 before any reply)"
+            );
         }
 
         /// An outbound that cannot run over a relayed stream says nothing
@@ -838,6 +1157,142 @@ mod tests {
             let owner: Arc<dyn Proxy> = StreamProxy::without_relay("hy2", "hy2.example.com:8443");
             assert_eq!(probe(&group, &owner).await, ChainProbeReport::default());
             assert!(!blocked(&group, &owner, "SG-01"));
+        }
+
+        /// A url-test `fast` of `members`, published for a chained `owner`
+        /// at `snell.example.com:8443` that dials through it. The registry
+        /// must outlive the dials.
+        fn chained(
+            owner: &str,
+            members: &[&Arc<StreamProxy>],
+        ) -> (Arc<dyn Proxy>, Arc<dyn Proxy>, crate::dialer::ProxyRegistry) {
+            use crate::group::test_support::{registry_of, ChainedProxy};
+            let members = members.iter().map(|m| Arc::clone(m) as _).collect();
+            let fast: Arc<dyn Proxy> =
+                Arc::new(crate::group::urltest::UrlTestGroup::new("fast", members, 0));
+            let registry = registry_of(&[&fast]);
+            let owner: Arc<dyn Proxy> =
+                ChainedProxy::new(owner, "snell.example.com:8443", "fast", &registry);
+            (fast, owner, registry)
+        }
+
+        async fn sweep(fast: &Arc<dyn Proxy>, member: &Arc<dyn Proxy>) -> SweptMember {
+            let mut swept = sweep_members(
+                vec![(member.name().to_owned(), Arc::clone(member))],
+                std::slice::from_ref(fast),
+                URL,
+                None,
+                Duration::from_secs(5),
+                4,
+                Duration::from_secs(600),
+            )
+            .await;
+            assert_eq!(swept.len(), 1);
+            swept.pop().unwrap()
+        }
+
+        /// The chained outbound's own probe goes through the fastest
+        /// member, which closes its port. Before taking the outbound for
+        /// down, the sweep checks the chain through the next member, which
+        /// reaches the server: the outbound stays up, the member that
+        /// failed is blocked for the server, and the one that reached it
+        /// carries its chains.
+        #[tokio::test]
+        async fn a_chained_outbound_stays_up_when_another_front_member_reaches_it() {
+            let audited = StreamProxy::auditing("SG-01", "10.0.0.1:443", 8443);
+            audited.set_delay(10);
+            let clean = StreamProxy::new("HK-01", "10.0.0.2:443");
+            clean.set_delay(20);
+            let (fast, owner, _registry) = chained("daniel", &[&audited, &clean]);
+
+            let swept = sweep(&fast, &owner).await;
+            assert!(swept.delay > 0, "{swept:?}");
+            assert_eq!(swept.reason, None);
+            assert!(owner.alive());
+            assert!(blocked(&fast, &owner, "SG-01"));
+            let target = ChainTarget::from_server_addr(owner.addr()).unwrap();
+            let health = fast.chain_health().unwrap();
+            assert_eq!(health.carrier(&target).as_deref(), Some("HK-01"));
+            assert_eq!(audited.dials(), 2, "the outbound's probe and one check");
+            assert_eq!(clean.dials(), 1);
+
+            // The next probe goes straight through the carrier.
+            assert!(sweep(&fast, &owner).await.delay > 0);
+            assert_eq!((audited.dials(), clean.dials()), (2, 2));
+        }
+
+        /// The first sweep of the group dialling the outbound may run
+        /// before the front group's: a check then tries members not probed
+        /// yet.
+        #[tokio::test]
+        async fn a_check_before_the_front_groups_first_sweep_tries_unprobed_members() {
+            let audited = StreamProxy::auditing("SG-01", "10.0.0.1:443", 8443);
+            let clean = StreamProxy::new("HK-01", "10.0.0.2:443");
+            let (fast, owner, _registry) = chained("daniel-early", &[&audited, &clean]);
+            let swept = sweep(&fast, &owner).await;
+            assert!(swept.delay > 0, "{swept:?}");
+            assert!(blocked(&fast, &owner, "SG-01"));
+        }
+
+        /// When no member reaches the server, the outbound is down: the
+        /// logbook says so once, blaming no member, and records the next
+        /// passing check.
+        #[tokio::test]
+        async fn a_chained_outbound_no_member_reaches_is_down() {
+            let book = TestLogbook::install();
+            let first = StreamProxy::auditing("SG-01", "10.0.0.1:443", 8443);
+            first.set_delay(10);
+            let second = StreamProxy::auditing("JP-01", "10.0.0.3:443", 8443);
+            second.set_delay(30);
+            let clean = StreamProxy::new("HK-01", "10.0.0.2:443");
+            clean.set_delay(50);
+            clean.health().set_alive(false);
+            let (fast, owner, _registry) = chained("daniel-down", &[&first, &second, &clean]);
+
+            let swept = sweep(&fast, &owner).await;
+            assert_eq!(swept.delay, 0);
+            assert_eq!(
+                swept.reason.as_deref(),
+                Some("closed before any reply; unreachable through 2 members of 'fast' tried")
+            );
+            assert!(!owner.alive());
+            assert!(!blocked(&fast, &owner, "SG-01"));
+            assert!(!blocked(&fast, &owner, "JP-01"));
+            let entries = book.entries("daniel-down");
+            assert_eq!(entries.len(), 1, "{entries:?}");
+            assert_eq!(
+                (entries[0].kind.as_str(), entries[0].level),
+                (kind::DIALER_PROXY_CHECK, Level::Error)
+            );
+            assert_eq!(
+                entries[0].message,
+                "'daniel-down' failed its health check (closed before any reply) through every \
+                 member of 'fast' tried: 'SG-01', 'JP-01'"
+            );
+
+            // A member that reaches the server comes back as the fastest.
+            clean.set_delay(5);
+            assert!(sweep(&fast, &owner).await.delay > 0);
+            let entries = book.entries("daniel-down");
+            assert_eq!(entries.len(), 2, "{entries:?}");
+            assert_eq!(
+                (entries[0].level, entries[0].message.as_str()),
+                (Level::Info, "'daniel-down' passes its health check again")
+            );
+        }
+
+        /// A member that dials through no automatic group fails as before.
+        #[tokio::test]
+        async fn an_unchained_member_fails_without_a_check() {
+            let audited = StreamProxy::auditing("SG-01", "10.0.0.1:443", 80);
+            audited.set_delay(10);
+            let fast = fallback(&[]);
+            let member: Arc<dyn Proxy> = Arc::clone(&audited) as _;
+            let swept = sweep(&fast, &member).await;
+            assert_eq!(swept.delay, 0);
+            assert_eq!(swept.reason.as_deref(), Some("closed before any reply"));
+            assert!(!member.alive());
+            assert_eq!(audited.dials(), 1);
         }
     }
 }

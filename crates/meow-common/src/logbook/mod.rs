@@ -114,11 +114,15 @@ pub mod kind {
     /// Outbound sockets were bound to another network interface, or no
     /// longer are.
     pub const NETWORK_INTERFACE: &str = "network.interface";
-    /// Members of a health-checked group went down or came back. Subject:
-    /// the group.
-    pub const GROUP_HEALTH: &str = "group.health";
     /// A url-test or fallback group switched member. Subject: the group.
     pub const GROUP_SWITCH: &str = "group.switch";
+    /// The member of a `dialer-proxy` group carrying an outbound's chains
+    /// changed. Subject: the chained outbound.
+    pub const DIALER_PROXY_SWITCH: &str = "dialer-proxy.switch";
+    /// A health check of a chained outbound failed through every member of
+    /// its `dialer-proxy` group tried, or passed again. Subject: the
+    /// chained outbound.
+    pub const DIALER_PROXY_CHECK: &str = "dialer-proxy.check";
 }
 
 /// Severity of an event, which is also its outcome: a failed reload is an

@@ -449,7 +449,7 @@ fn the_latest_level_follows_the_subjects_latest_entry() {
     assert_eq!(book.latest_level(kind, "rules"), None);
     book.record_at(failure("rules", "failed"), at(0));
     assert_eq!(book.latest_level(kind, "rules"), Some(Level::Error));
-    assert_eq!(book.latest_level("group.health", "rules"), None, "per kind");
+    assert_eq!(book.latest_level("group.switch", "rules"), None, "per kind");
     book.record_at(event(kind, Level::Info, "updated").subject("rules"), at(1));
     assert_eq!(book.latest_level(kind, "rules"), Some(Level::Info));
 }

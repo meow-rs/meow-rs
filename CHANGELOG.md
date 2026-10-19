@@ -16,19 +16,20 @@ the canonical, in-repo source a release is cut from.
   ended without a clean stop (a crash, a kill, a power cut), config reloads
   and API edits, subscription, proxy-provider, rule-provider and geodata
   updates and their failures, listeners that did not start, outbound
-  interface changes, health-check sweeps that find members of a group going
-  down or coming back, and `url-test` / `fallback` groups switching member.
-  Repeats of a failure fold into one entry with a count. Entries are kept
-  in an SQLite database, `<home>/logbook/logbook.db`, for 7 days and 2 MiB,
-  and survive restarts and crashes; the API filters by level, kind and
-  subject, pages back with `before` and polls with `since`, and an app's
-  UI in another process can read the database directly. The logbook never
-  records the destinations of user traffic, and records rule edits by
-  index, not rule text. On by default; `logbook: {enable: false}` turns it
-  off. It bundles SQLite (about 1 MiB), so it is in the `full` build and
-  the release binaries but not in `minimal`, where `GET /logbook` reports
-  `enabled: false`. Details, the schema and the event kinds are in
-  ADR-0014.
+  interface changes, `url-test` / `fallback` groups switching member (and
+  why the previous one went down), and `dialer-proxy` chains changing the
+  member that carries them or failing their health check through every
+  member tried. Repeats of a failure fold into one entry with a count.
+  Entries are kept in an SQLite database, `<home>/logbook/logbook.db`, for
+  7 days and 2 MiB, and survive restarts and crashes; the API filters by
+  level, kind and subject, pages back with `before` and polls with
+  `since`, and an app's UI in another process can read the database
+  directly. The logbook never records the destinations of user traffic,
+  and records rule edits by index, not rule text. On by default;
+  `logbook: {enable: false}` turns it off. It bundles SQLite (about
+  1 MiB), so it is in the `full` build and the release binaries but not in
+  `minimal`, where `GET /logbook` reports `enabled: false`. Details, the
+  schema and the event kinds are in ADR-0014.
 
 - **`dialer-proxy` groups skip members that cannot reach the chained
   server**: a member of a `url-test`, `fallback` or `load-balance` group can
@@ -45,6 +46,33 @@ the canonical, in-repo source a release is cut from.
   normal pick. There is no config change and
   no mihomo equivalent. UDP chains and the relay-based fallback wrapper
   (`anytls`, `hysteria2`, `ss` with an external plugin) are not covered.
+
+- **A chained outbound stays in its group when its front hop fails**: an
+  outbound with `dialer-proxy` first in a `fallback` group (an own server
+  chained through an airport's `url-test`) left the group whenever the
+  front hop failed, not the server: one failed health-check probe through
+  a bad front member took it out until the next sweep, and a front member
+  refusing a connection marked it dead at once. Now:
+  - A `url-test` group keeps an outbound's chains on the member that last
+    carried them, the outbound's carrier, while that member is alive and
+    not blocked for its server, instead of following the fastest member
+    to the test URL. They move only when the carrier fails.
+  - A chained outbound that fails its health check is checked through up
+    to 3 other members of its `dialer-proxy` group (the carrier first,
+    each over a fresh connection) before it is taken for down. When one
+    reaches the server, the outbound stays up, the members that failed
+    are blocked for that server, and the one that reached it carries the
+    chains.
+  - A dial whose front hop fails to connect counts against the front
+    group's member, not against the chained outbound in the group dialling
+    it, while the front group has a live member left. So does a chain
+    that closes before any reply through a member that was not yet the
+    outbound's carrier: a burst of such chains strikes the member, not the
+    outbound. A carrier's failure still counts against the outbound, since
+    its server is then the likelier fault.
+  - A chain probe round in which no member reaches the server blocks none
+    of them: the server is the likelier fault, and its members would
+    otherwise all be blocked when it comes back.
 
 ### Fixed
 

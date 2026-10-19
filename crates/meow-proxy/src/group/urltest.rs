@@ -45,7 +45,7 @@ impl UrlTestGroup {
             health: ProxyHealth::new(),
             usage: UsageTracker::new(),
             dial_failures: DialFailureTracker::new(),
-            chain_health: Arc::default(),
+            chain_health: Arc::new(ChainHealth::tracking_carriers()),
         }
     }
 
@@ -68,7 +68,7 @@ impl UrlTestGroup {
             health: ProxyHealth::new(),
             usage: UsageTracker::new(),
             dial_failures: DialFailureTracker::new(),
-            chain_health: Arc::default(),
+            chain_health: Arc::new(ChainHealth::tracking_carriers()),
         }
     }
 
@@ -198,11 +198,13 @@ impl UrlTestGroup {
         let Some(target) = super::front_hop_target(&self.chain_health, metadata, dial) else {
             return Some((pick, None));
         };
+        let carrier = self.carrier_for(&target);
         let pick = super::front_hop_pick(
             &self.name,
             &self.chain_health,
             &target,
             pick,
+            carrier,
             || {
                 let mut members = self.member_proxy_list();
                 // Fastest first; an unprobed member (delay 0) last.
@@ -216,6 +218,22 @@ impl UrlTestGroup {
             dial,
         );
         Some((pick, Some(target)))
+    }
+
+    /// The member carrying the chains to `target`, unless a member the user
+    /// fixed is in force.
+    fn carrier_for(&self, target: &ChainTarget) -> Option<Arc<dyn Proxy>> {
+        if self.fixed_proxy_if_alive().is_some() {
+            return None;
+        }
+        let name = self.chain_health.carrier(target)?;
+        if let Some(p) = self.static_proxies.iter().find(|p| p.name() == name) {
+            return Some(Arc::clone(p));
+        }
+        self.provider_slots.iter().find_map(|slot| {
+            let guard = slot.read();
+            guard.iter().find(|p| p.name() == name).map(Arc::clone)
+        })
     }
 
     /// Read-only lookup of whatever `fastest` currently points at — used by
@@ -320,7 +338,7 @@ impl ProxyAdapter for UrlTestGroup {
             .pick_for(metadata, true)
             .ok_or_else(|| MeowError::Proxy("no proxy available".into()))?;
         let attempt = super::DialAttempt::new(&self.name, &self.dial_failures, &proxy);
-        let conn = attempt.finish(proxy.dial_tcp(metadata).await)?;
+        let conn = attempt.run(proxy.dial_tcp(metadata)).await?;
         Ok(match front_hop {
             Some(target) => {
                 super::watch_front_hop(conn, &self.name, &self.chain_health, target, &proxy)
@@ -335,7 +353,7 @@ impl ProxyAdapter for UrlTestGroup {
             .pick_for_dial()
             .ok_or_else(|| MeowError::Proxy("no proxy available".into()))?;
         let attempt = super::DialAttempt::new(&self.name, &self.dial_failures, &proxy);
-        attempt.finish(proxy.dial_udp(metadata).await)
+        attempt.run(proxy.dial_udp(metadata)).await
     }
 
     fn unwrap_proxy(&self, metadata: &Metadata, touch: bool) -> Option<Arc<dyn Proxy>> {

@@ -351,7 +351,7 @@ impl ProxyAdapter for LoadBalanceGroup {
             .pick_for(metadata, true)
             .ok_or(MeowError::NoProxyAvailable)?;
         let attempt = super::DialAttempt::new(&self.name, &self.dial_failures, &proxy);
-        let conn = attempt.finish(proxy.dial_tcp(metadata).await)?;
+        let conn = attempt.run(proxy.dial_tcp(metadata)).await?;
         Ok(match front_hop {
             Some(target) => {
                 super::watch_front_hop(conn, &self.name, &self.chain_health, target, &proxy)
@@ -376,7 +376,7 @@ impl ProxyAdapter for LoadBalanceGroup {
             }
         })?;
         let attempt = super::DialAttempt::new(&self.name, &self.dial_failures, &proxy);
-        attempt.finish(proxy.dial_udp(metadata).await)
+        attempt.run(proxy.dial_udp(metadata)).await
     }
 
     fn unwrap_proxy(&self, metadata: &Metadata, touch: bool) -> Option<Arc<dyn Proxy>> {
