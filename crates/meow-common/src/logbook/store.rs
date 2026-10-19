@@ -141,8 +141,9 @@ struct State {
 
 struct Slot {
     entry: Entry,
-    /// When the entry was last queued for the disk.
-    written: SystemTime,
+    /// When the entry was last queued for the disk; `None` when it never
+    /// was, which makes it due at once.
+    written: Option<SystemTime>,
     /// A folded repeat is not queued yet (see [`FOLD_WRITE_INTERVAL`]).
     dirty: bool,
 }
@@ -250,7 +251,7 @@ impl Logbook {
             .recent
             .into_iter()
             .map(|entry| Slot {
-                written: entry.last_time(),
+                written: Some(entry.last_time()),
                 entry,
                 dirty: false,
             })
@@ -383,7 +384,7 @@ impl Logbook {
     /// wait (briefly) for the writer. Ids keep increasing, so a client drops
     /// whatever it holds below the `logbook.cleared` entry.
     pub fn clear(&self) {
-        let tx = {
+        {
             let mut state = self.state.lock();
             state.recent.clear();
             state.latest_by_subject.clear();
@@ -398,22 +399,34 @@ impl Logbook {
                 to_millis(SystemTime::now()),
                 &self.options,
             );
-            state.queue.tx.clone()
-        };
-        if let Some(tx) = tx {
-            flush_queued(&tx);
         }
+        // A full queue refuses the `logbook.cleared` entry; queue it before
+        // the wait, or the wait ends without it.
+        self.flush();
     }
 
     /// Write out pending repeats and wait (briefly) for the writer.
     pub fn flush(&self) {
-        let tx = {
+        let deadline = Instant::now() + FLUSH_TIMEOUT;
+        if let Some(tx) = self.queue_pending(deadline) {
+            flush_queued(&tx, deadline);
+        }
+    }
+
+    /// Queue every write still pending — held-back repeats and writes a
+    /// full queue refused — waiting until `deadline` for room, so that what
+    /// is queued next comes after them. The queue, `None` once closed.
+    fn queue_pending(&self, deadline: Instant) -> Option<SyncSender<Op>> {
+        loop {
             let mut state = self.state.lock();
             state.write_held(SystemTime::now(), true);
-            state.queue.tx.clone()
-        };
-        if let Some(tx) = tx {
-            flush_queued(&tx);
+            let refused = state.held_due.is_some();
+            let tx = state.queue.tx.clone();
+            drop(state);
+            if !refused || tx.is_none() || Instant::now() >= deadline {
+                return tx;
+            }
+            std::thread::sleep(Duration::from_millis(5));
         }
     }
 
@@ -422,7 +435,24 @@ impl Logbook {
     pub(super) fn settle(&self) {
         let tx = self.state.lock().queue.tx.clone();
         if let Some(tx) = tx {
-            flush_queued(&tx);
+            flush_queued(&tx, Instant::now() + FLUSH_TIMEOUT);
+        }
+    }
+
+    /// Fill the writer's queue, as a writer that fell behind leaves it,
+    /// once the writer is held up (a locked database): returns when the
+    /// queue stays full.
+    #[cfg(test)]
+    pub(super) fn fill_queue(&self) {
+        let Some(tx) = self.state.lock().queue.tx.clone() else {
+            return;
+        };
+        loop {
+            while tx.try_send(Op::Wake).is_ok() {}
+            std::thread::sleep(Duration::from_millis(50));
+            if let Err(TrySendError::Full(_)) = tx.try_send(Op::Wake) {
+                return;
+            }
         }
     }
 
@@ -542,12 +572,11 @@ impl Logbook {
 
 impl Drop for Logbook {
     fn drop(&mut self) {
+        let _ = self.queue_pending(Instant::now() + FLUSH_TIMEOUT);
         {
-            let mut state = self.state.lock();
-            state.write_held(SystemTime::now(), true);
             // Closing the queue lets the writer finish what is queued and
             // exit.
-            state.queue.tx = None;
+            self.state.lock().queue.tx = None;
         }
         if let Some(writer) = self.writer.take() {
             let _ = writer.join();
@@ -598,9 +627,8 @@ fn send_by(tx: &SyncSender<Op>, mut op: Op, deadline: Instant) -> bool {
     }
 }
 
-/// Wait (briefly) until the writer has committed everything queued.
-fn flush_queued(tx: &SyncSender<Op>) {
-    let deadline = Instant::now() + FLUSH_TIMEOUT;
+/// Wait, until `deadline`, for the writer to commit everything queued.
+fn flush_queued(tx: &SyncSender<Op>, deadline: Instant) {
     let (ack, done) = mpsc::sync_channel(1);
     if send_by(tx, Op::Flush(ack), deadline) {
         let _ = done.recv_timeout(deadline.saturating_duration_since(Instant::now()));
@@ -670,7 +698,7 @@ impl State {
             };
             if evicted.dirty {
                 // A new revision, as in `write_out`.
-                evicted.entry.rev = self.next_rev(now);
+                evicted.entry.rev = self.rewrite_rev(evicted.entry.rev, now);
                 self.disk_rev = self.disk_rev.max(evicted.entry.rev);
                 self.queue.send(Op::Write(Box::new(evicted.entry)));
             } else {
@@ -695,7 +723,7 @@ impl State {
             .insert((entry.kind.clone(), entry.subject.clone()), entry.id);
         self.recent.push_back(Slot {
             entry: entry.clone(),
-            written: now,
+            written: queued.then_some(now),
             dirty: !queued,
         });
         if !queued {
@@ -716,7 +744,7 @@ impl State {
         if self.queue.send(Op::Write(entry)) {
             let slot = &mut self.recent[i];
             slot.dirty = false;
-            slot.written = now;
+            slot.written = Some(now);
         } else {
             self.hold(i);
         }
@@ -736,11 +764,23 @@ impl State {
         self.held_due = Some(self.held_due.map_or(due, |held| held.min(due)));
     }
 
-    /// Queue slot `i`'s held-back repeat as a new revision: a reader that
-    /// polled past its fold, at a later entry's rev, still sees it.
+    /// Queue slot `i`'s held-back repeat, as a new revision when a later
+    /// one was handed out: a reader that polled past its fold, at a later
+    /// entry's rev, still sees it.
     fn write_out(&mut self, i: usize, now: SystemTime) {
-        self.recent[i].entry.rev = self.next_rev(now);
+        self.recent[i].entry.rev = self.rewrite_rev(self.recent[i].entry.rev, now);
         self.send_slot(i, now);
+    }
+
+    /// The rev a held-back write of an entry at `rev` reaches the disk
+    /// with: a new one, unless `rev` is still the latest. Keeping it then
+    /// spares a reader that polled at `rev` the same entry again.
+    fn rewrite_rev(&mut self, rev: u64, now: SystemTime) -> u64 {
+        if rev < self.rev {
+            self.next_rev(now)
+        } else {
+            rev
+        }
     }
 
     /// Queue the held-back repeats due at `now`, or all of them.
@@ -774,13 +814,17 @@ impl State {
 }
 
 /// Whether a repeat of an entry last queued at `written` is due at `now`.
-fn is_due(written: SystemTime, now: SystemTime) -> bool {
-    !now.duration_since(written)
-        .is_ok_and(|since| since < FOLD_WRITE_INTERVAL)
+fn is_due(written: Option<SystemTime>, now: SystemTime) -> bool {
+    written.is_none_or(|written| {
+        !now.duration_since(written)
+            .is_ok_and(|since| since < FOLD_WRITE_INTERVAL)
+    })
 }
 
-fn fold_due(written: SystemTime) -> SystemTime {
-    written.checked_add(FOLD_WRITE_INTERVAL).unwrap_or(written)
+fn fold_due(written: Option<SystemTime>) -> SystemTime {
+    written.map_or(UNIX_EPOCH, |written| {
+        written.checked_add(FOLD_WRITE_INTERVAL).unwrap_or(written)
+    })
 }
 
 /// Why the database could not be opened.

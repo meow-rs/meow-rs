@@ -49,16 +49,18 @@ once released, because clients filter, label and translate by kind.
 | `config.reload` | info / warning / error | | `PUT /configs` committed (counts, `connectionsClosed`; warning when `force` pushed past errors), or was rejected |
 | `config.change` | info | group or subscription | An API edit: subscription added or removed, proxy group created, changed or deleted, rules replaced, changed, deleted or moved |
 | `subscription.update` | info / error | subscription | Fetched and merged with a change to the config (counting the subscription's own proxies, groups and rules), the first success after a failure, or the fetch, rebuild or commit failed |
-| `proxy-provider.update` | info / error | provider | A payload replaced an earlier one (`proxies`, with the previous count), the first success after a failure, or a fetch or parse failure |
-| `rule-provider.update` | info / error | provider | The rule count changed, the first success after a failure, or a load, fetch or parse failure (a provider registered empty is recorded once committed) |
+| `proxy-provider.update` | info / error | provider | A payload replaced an earlier one (`proxies`, with the previous count), the first success after a failure, or a definition, fetch or parse failure (a provider a lenient build left out is recorded once the build is committed) |
+| `rule-provider.update` | info / error | provider | A payload changed the rule count of an earlier one, the first success after a failure, or a load, fetch or parse failure (a provider registered empty, or left out by a lenient build, is recorded once the build is committed) |
 | `geodata.update` | info / error | `GeoIP MMDB`, `ASN MMDB`, `geosite` | Downloaded and loaded into the rules, or the download or reload failed |
 | `listener.start` | error | listener (`tun` for TUN) | A listener did not start |
-| `network.interface` | info | | Outbound sockets were bound to another interface, or no longer are |
+| `network.interface` | info | | The interface outbound sockets bind to (TUN `auto-route: global`) changed, or they no longer bind to one. Recorded for a binding once its TUN listener is up: a reload candidate's binding, installed for the validation's dials, records nothing until then, and nothing at all when the candidate is rejected |
 | `group.health` | info / warning / error | group | A health-check sweep found a different set of dead members: some down (warning, up to 20 names in `down`), all down (error), all up again (info). A member is dead from its first failed probe until it passes two sweeps in a row |
 | `group.switch` | info | group | A `url-test` or `fallback` group routes to another member than after the previous sweep (`from`, `to`) |
 
 Routine successes are not recorded: a first provider load belongs to the
-start or config change that declared it, an unchanged refetch is noise, and
+start or config change that declared it (so does the first payload of a
+provider registered empty, such as a download adopted after the fetch
+deadline), an unchanged refetch is noise, and
 a sweep that finds the same dead members as the last one says nothing new;
 a member that flaps between sweeps stays dead until it passes two in a row,
 so it is one entry rather than one per sweep. Whether a success ends a
@@ -66,6 +68,14 @@ failure is read from the logbook itself (`logbook::failing`): the subject's
 latest entry of the kind is an error. A recovery is then recorded even when
 the provider object that failed was rebuilt by a config commit, or the
 engine restarted in between.
+
+Producers record what a running configuration does. A build that may not
+be committed (startup builds its providers more than once, and a
+`PUT /configs` candidate can be rejected) records nothing itself: what it
+leaves for the logbook — the providers a lenient build left out
+(`DroppedProviders`), a provider's load failure or recovery, a TUN
+binding — is recorded by the commit that installs it. An embedder that loads a config with
+`load_config` records the config's `dropped_providers` once it runs it.
 
 ### Coalescing
 
@@ -113,22 +123,26 @@ connection, so not even the write-ahead log is checkpointed.
   place (an upsert by `id`, only to a higher `rev`), at most once a minute.
   A held-back repeat is written once due (the writer wakes for it, with no
   further event needed), on flush, when its entry leaves memory, and at
-  close, each time with a new `rev`: a reader polling the database with
-  `since` sees it even after later entries reached the disk. The writer
+  close. It gets a new `rev` when a later one was handed out meanwhile: a
+  reader polling the database with `since` sees it even after later
+  entries reached the disk, while one polling memory does not see an
+  unchanged entry again. The writer
   drains a bounded queue (1024) and commits up to 256 operations per
   transaction. **Recording never waits on the disk**: a write the full
-  queue refuses stays pending in memory like a held-back repeat, and is
-  lost only if its entry leaves memory before the queue has room; the
-  first such write warns.
+  queue refuses stays pending in memory like a held-back repeat, is tried
+  again as soon as the writer has room, and is lost only if its entry
+  leaves memory first; the first such write warns. Flush, close and
+  `DELETE /logbook` first queue every pending write, waiting up to 2 s for
+  room, so what they wait for includes them.
 - **Failed commits.** A transaction takes the write lock up front
   (`BEGIN IMMEDIATE`). A commit that fails (a process holding the lock
   past the 1 s busy timeout, a full disk) keeps its writes, up to 1024,
   and is tried again with the next commit or after 10 s; a query that needs
   the database fails meanwhile (`GET /logbook` answers 503). A single
   entry SQLite refuses (too big, a constraint) is skipped with a warning
-  instead. `DELETE /logbook` never waits on the queue: it sets a bound,
-  and the writer deletes the rows below it, drops the queued writes below
-  it, and keeps trying until the delete commits.
+  instead. The delete behind `DELETE /logbook` needs no room in the
+  queue: it sets a bound, and the writer deletes the rows below it, drops
+  the queued writes below it, and keeps trying until the delete commits.
 - **Durability.** WAL with `synchronous=NORMAL`: a committed write
   survives a killed process, and a power cut can lose the last commits but
   not the database. The write-ahead log is checkpointed every 64 pages and
@@ -248,6 +262,9 @@ not open a logbook, so tests and benches that build an `AppState` never
 write into the real home. `install(dir, options)` opens one at an explicit
 directory. `query(query)` and `clear()` serve the API in the engine's
 process; `read(dir, query)` serves other processes (see Storage). An
+embedder that runs a config from `meow_config::load_config` calls
+`config.dropped_providers.record()` once it runs it, after committing its
+rule providers. An
 embedder that wants the logbook enables `meow-common/logbook`; the `full`
 bundle of `meow` does.
 
@@ -268,5 +285,6 @@ bundle of `meow` does.
   for the chained server shows up as aggregated failure and stall events
   rather than one entry per connection.
 - Logbook pages in meow-android and meow-ios, which enable
-  `meow-common/logbook` and call `apply`, `engine_started` and
-  `engine_stopped` from their FFI.
+  `meow-common/logbook` and call `apply`, `engine_started`,
+  `engine_stopped` and `Config::dropped_providers.record()` from their
+  FFI.

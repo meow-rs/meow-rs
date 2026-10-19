@@ -32,6 +32,7 @@ use parking_lot::RwLock;
 use std::sync::atomic::Ordering;
 use tracing::{debug, info, warn};
 
+use crate::dropped_providers::DroppedProviders;
 use crate::internal_http;
 use crate::proxy_provider::{
     BACKGROUND_RETRY_MAX, BACKGROUND_RETRY_MIN, MAX_REVALIDATION_ATTEMPTS,
@@ -134,10 +135,22 @@ pub struct RuleProvider {
     /// The remote fetch the load left owing, taken by
     /// [`Self::spawn_initial_fetch`] once the provider is committed.
     initial_fetch: parking_lot::Mutex<InitialFetch>,
-    /// Why the load registered this provider empty, recorded in the
-    /// logbook once the provider is committed ([`Self::spawn_initial_fetch`]):
-    /// a candidate that is built twice, or never committed, records nothing.
-    load_failure: parking_lot::Mutex<Option<String>>,
+    /// What the load has for the logbook, recorded once the provider is
+    /// committed ([`Self::spawn_initial_fetch`]): a candidate that is built
+    /// twice, or never committed, records nothing.
+    load_note: parking_lot::Mutex<Option<LoadNote>>,
+    /// Holds a payload: false only for the empty set a provider whose
+    /// payload was unavailable is registered with, until one lands.
+    filled: AtomicBool,
+}
+
+/// What a provider's load leaves for the logbook.
+enum LoadNote {
+    /// Registered empty: the payload was unavailable.
+    Failed(String),
+    /// Loaded a payload fetched or read for this load, not the on-disk
+    /// cache: ends a failure the logbook shows.
+    Fresh,
 }
 
 /// What an http provider's load left for the background to fetch.
@@ -332,7 +345,10 @@ impl RuleProvider {
             );
             return Ok(());
         }
-        let previous = self.rules.read().len();
+        let previous = self
+            .filled
+            .swap(true, Ordering::Relaxed)
+            .then(|| self.rules.read().len());
         if demands(&**self.rules.read()) != demands(&*new_rules) {
             warn!(
                 provider = %self.name,
@@ -352,30 +368,23 @@ impl RuleProvider {
         Ok(())
     }
 
-    /// Logbook: a fetched payload replaced `previous` rules with `count`.
-    /// Recorded when the count changed or the update ends a failure the
-    /// logbook shows: a refresh that keeps the count is routine, and
-    /// providers refresh daily in the dozens.
-    fn logbook_updated(&self, previous: usize, count: usize) {
+    /// Logbook: a payload of `count` rules replaced `previous` ones, or
+    /// filled the provider (`None`).
+    fn logbook_updated(&self, previous: Option<usize>, count: usize) {
         let name = &self.name;
-        if count == previous && !logbook::failing(logbook::kind::RULE_PROVIDER_UPDATE, name) {
-            return;
+        let failing = || logbook::failing(logbook::kind::RULE_PROVIDER_UPDATE, name);
+        if let Some(message) = update_message(name, previous, count, failing) {
+            logbook::event(logbook::kind::RULE_PROVIDER_UPDATE, Level::Info, message)
+                .subject(name.as_str())
+                .field("rules", count)
+                .record();
         }
-        let message = if count == previous {
-            format!("Updated rule provider '{name}': {count} rules")
-        } else {
-            format!("Updated rule provider '{name}': {count} rules (was {previous})")
-        };
-        logbook::event(logbook::kind::RULE_PROVIDER_UPDATE, Level::Info, message)
-            .subject(name.as_str())
-            .field("rules", count)
-            .record();
     }
 
     /// Logbook: fetching or parsing the payload failed. Repeats fold while
     /// the provider keeps failing.
     fn logbook_failed(&self, error: &str) {
-        rule_provider_failed(&self.name, error);
+        record_failure(&self.name, error);
     }
 
     /// Fetch, on a detached task, whatever remote payload this provider's
@@ -396,8 +405,10 @@ impl RuleProvider {
     /// is owed. A load failure is recorded here too, once. [`crate::rule_provider_refresh::RefreshSupervisor::reconcile`]
     /// calls it for every committed provider.
     pub fn spawn_initial_fetch(self: &Arc<Self>) -> Option<tokio::task::JoinHandle<()>> {
-        if let Some(error) = self.load_failure.lock().take() {
-            self.logbook_failed(&error);
+        match self.load_note.lock().take() {
+            Some(LoadNote::Failed(error)) => self.logbook_failed(&error),
+            Some(LoadNote::Fresh) => self.logbook_updated(None, self.rule_count()),
+            None => {}
         }
         let owed = std::mem::replace(&mut *self.initial_fetch.lock(), InitialFetch::Settled);
         if matches!(owed, InitialFetch::Settled) {
@@ -432,7 +443,35 @@ impl RuleProvider {
     /// acquisition-then-parse load, or a refresh).
     fn swap_rules(&self, rules: Box<dyn RuleSet>) {
         *self.rules.write() = Arc::from(rules);
+        self.filled.store(true, Ordering::Relaxed);
         self.touch();
+    }
+
+    /// [`Self::swap_rules`] with a payload fetched or read for this load.
+    fn fill_fresh(&self, rules: Box<dyn RuleSet>) {
+        self.swap_rules(rules);
+        *self.load_note.lock() = Some(LoadNote::Fresh);
+    }
+}
+
+/// The logbook message for a payload of `count` rules that replaced
+/// `previous` ones, or filled the provider (`None`); `None` when there is
+/// nothing to record. Recorded when the count changed, or when the update
+/// ends a failure the logbook shows (`failing`): filling a provider is its
+/// load, and a refresh that keeps the count is routine — providers refresh
+/// daily in the dozens.
+fn update_message(
+    name: &str,
+    previous: Option<usize>,
+    count: usize,
+    failing: impl FnOnce() -> bool,
+) -> Option<String> {
+    match previous {
+        Some(previous) if previous != count => Some(format!(
+            "Updated rule provider '{name}': {count} rules (was {previous})"
+        )),
+        _ if failing() => Some(format!("Updated rule provider '{name}': {count} rules")),
+        _ => None,
     }
 }
 
@@ -939,6 +978,7 @@ pub fn load_providers(
         &PrefetchedPayloads::default(),
         None,
         strict,
+        &mut DroppedProviders::default(),
     )
 }
 
@@ -950,7 +990,8 @@ pub fn load_providers(
 /// proxies were built from; each provider's fetch context retains a clone so
 /// a chained adapter still resolves its front hop on later refreshes (issue
 /// #533). `None` is fine only when no retained adapter can carry a
-/// `dialer-proxy` chain.
+/// `dialer-proxy` chain. Providers left out leniently go into `dropped`,
+/// for the commit to record.
 #[allow(
     clippy::too_many_arguments,
     reason = "each argument is a distinct piece of one provider's load context"
@@ -964,6 +1005,7 @@ pub fn load_providers_prefetched(
     prefetched: &PrefetchedPayloads,
     dialer_registry: Option<&meow_proxy::dialer::ProxyRegistry>,
     strict: bool,
+    dropped: &mut DroppedProviders,
 ) -> Result<HashMap<String, Arc<RuleProvider>>, anyhow::Error> {
     let mut out = HashMap::new();
     if raw_providers.is_empty() {
@@ -981,7 +1023,7 @@ pub fn load_providers_prefetched(
                         ));
                     }
                     warn!("Failed to load rule-provider '{}': {:#}", name, e);
-                    rule_provider_failed(name, &format!("{e:#}"));
+                    dropped.rule(name, format!("{e:#}"));
                     continue;
                 }
             }
@@ -1020,7 +1062,7 @@ pub fn load_providers_prefetched(
                 // A download still running at the deadline is not a
                 // failure; the adopted download records its own outcome.
                 if !matches!(*provider.initial_fetch.lock(), InitialFetch::Adopt(_)) {
-                    *provider.load_failure.lock() = Some(format!("{e:#}"));
+                    *provider.load_note.lock() = Some(LoadNote::Failed(format!("{e:#}")));
                 }
                 out.insert(name.clone(), Arc::new(*provider));
             }
@@ -1031,15 +1073,16 @@ pub fn load_providers_prefetched(
             }
             Err(e) => {
                 warn!("Failed to load rule-provider '{}': {:#}", name, e);
-                rule_provider_failed(name, &format!("{e:#}"));
+                dropped.rule(name, format!("{e:#}"));
             }
         }
     }
     Ok(out)
 }
 
-/// Logbook: loading or updating rule provider `name` failed.
-fn rule_provider_failed(name: &str, error: &str) {
+/// Logbook: loading or updating rule provider `name` failed. Repeats fold
+/// while it keeps failing.
+pub(crate) fn record_failure(name: &str, error: &str) {
     logbook::event(
         logbook::kind::RULE_PROVIDER_UPDATE,
         Level::Error,
@@ -1191,19 +1234,20 @@ fn load_inline(
         ))
     })?;
     let rules = entries_to_rule_set(behavior, payload, ctx, strict)?;
-    Ok(make_provider(
+    let provider = make_provider(
         name,
         ProviderType::Inline,
         behavior,
         String::new(),
         0,
-        rules,
         FetchContext::default(),
         strict,
         ctx.clone(),
         None,
         None,
-    ))
+    );
+    provider.fill_fresh(rules);
+    Ok(provider)
 }
 
 fn load_file(
@@ -1242,7 +1286,6 @@ fn load_file(
         behavior,
         path.display().to_string(),
         0,
-        empty_rule_set(behavior, ctx),
         FetchContext::default(),
         strict,
         ctx.clone(),
@@ -1272,7 +1315,7 @@ fn load_file(
     };
     let rules = parse_bytes_to_ruleset_with_format(bytes, behavior, explicit_format, ctx, strict)
         .map_err(LoadError::Payload)?;
-    provider.swap_rules(rules);
+    provider.fill_fresh(rules);
     Ok(provider)
 }
 
@@ -1316,7 +1359,6 @@ fn load_http(
         behavior,
         url.to_string(),
         interval,
-        empty_rule_set(behavior, ctx),
         FetchContext {
             proxy: download_proxy.cloned(),
             headers: headers.clone(),
@@ -1358,10 +1400,10 @@ fn load_http(
     };
     match entry {
         Prefetched::Fresh(bytes) => {
-            provider.swap_rules(parse(bytes).map_err(LoadError::Payload)?);
+            provider.fill_fresh(parse(bytes).map_err(LoadError::Payload)?);
         }
         Prefetched::Downloaded { bytes, persisted } => {
-            provider.swap_rules(parse(bytes).map_err(LoadError::Payload)?);
+            provider.fill_fresh(parse(bytes).map_err(LoadError::Payload)?);
             if let Some(path) = &cache_path {
                 if !persisted.swap(true, Ordering::Relaxed) {
                     write_cache(path, bytes);
@@ -1419,7 +1461,6 @@ fn make_provider(
     behavior: RuleSetBehavior,
     vehicle: String,
     interval: u64,
-    rules: Box<dyn RuleSet>,
     fetch: FetchContext,
     strict: bool,
     ctx: ParserContext,
@@ -1430,7 +1471,8 @@ fn make_provider(
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::ZERO)
         .as_secs();
-    let rules_arc: Arc<dyn RuleSet> = Arc::from(rules);
+    // Empty until a payload lands (`swap_rules`).
+    let rules_arc: Arc<dyn RuleSet> = Arc::from(empty_rule_set(behavior, &ctx));
     RuleProvider {
         name: name.to_string(),
         provider_type,
@@ -1450,7 +1492,8 @@ fn make_provider(
         // `written_gen` of 0 under `cache_write_lock`.
         refresh_gen: meow_common::atomic::AtomicU::new(1),
         initial_fetch: parking_lot::Mutex::new(InitialFetch::Settled),
-        load_failure: parking_lot::Mutex::new(None),
+        load_note: parking_lot::Mutex::new(None),
+        filled: AtomicBool::new(false),
     }
 }
 
@@ -1474,19 +1517,24 @@ pub(crate) fn test_provider_with_vehicle(
     interval: u64,
     vehicle: String,
 ) -> Arc<RuleProvider> {
-    Arc::new(make_provider(
+    let provider = make_provider(
         name,
         provider_type,
         RuleSetBehavior::Domain,
         vehicle,
         interval,
-        meow_rules::build_rule_set(RuleSetBehavior::Domain, &[], &ParserContext::empty()),
         FetchContext::default(),
         false,
         ParserContext::empty(),
         None,
         None,
-    ))
+    );
+    provider.swap_rules(meow_rules::build_rule_set(
+        RuleSetBehavior::Domain,
+        &[],
+        &ParserContext::empty(),
+    ));
+    Arc::new(provider)
 }
 
 /// Flattened `header:` pairs for one provider; empty when none declared.
@@ -1751,13 +1799,33 @@ fn write_cache(path: &Path, bytes: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{eventually, Origin};
+    use crate::test_support::{eventually, Origin, TestLogbook};
     use meow_rules::mrs_parser::{write_ruleset_mrs, TYPE_DOMAIN};
     use std::io::{Read, Write};
     use std::time::{Duration, Instant};
 
     fn ctx() -> ParserContext {
         ParserContext::empty()
+    }
+
+    #[test]
+    fn a_payload_filling_a_provider_is_its_load_not_an_update() {
+        let message = |previous, count, failing| update_message("p", previous, count, || failing);
+        assert_eq!(message(None, 2, false), None);
+        assert_eq!(
+            message(None, 2, true).as_deref(),
+            Some("Updated rule provider 'p': 2 rules"),
+            "ends a failure, with no count to compare"
+        );
+        assert_eq!(
+            message(Some(1), 2, false).as_deref(),
+            Some("Updated rule provider 'p': 2 rules (was 1)")
+        );
+        assert_eq!(message(Some(2), 2, false), None, "routine");
+        assert_eq!(
+            message(Some(2), 2, true).as_deref(),
+            Some("Updated rule provider 'p': 2 rules")
+        );
     }
 
     fn http_cfg(proxy: Option<&str>) -> RawRuleProvider {
@@ -1822,6 +1890,7 @@ mod tests {
             &prefetched,
             None,
             false,
+            &mut DroppedProviders::default(),
         )
         .unwrap();
         assert!(out.is_empty());
@@ -1842,6 +1911,7 @@ mod tests {
             &prefetched,
             None,
             false,
+            &mut DroppedProviders::default(),
         )
         .unwrap();
         assert_eq!(out.len(), 1);
@@ -2816,6 +2886,7 @@ header:
                 &prefetched,
                 None,
                 strict,
+                &mut DroppedProviders::default(),
             )
             .unwrap()
         })
@@ -2975,6 +3046,45 @@ header:
             std::fs::read_to_string(cache_file(dir.path(), "p")).unwrap(),
             NEW_RULES
         );
+    }
+
+    /// Logbook: a provider's first payload is its load. Adopted after the
+    /// fetch deadline it records nothing; ending the failure its commit
+    /// recorded, it records the recovery without a count to compare.
+    #[tokio::test]
+    async fn logbook_counts_a_first_payload_as_the_load() {
+        let book = TestLogbook::install();
+        let dir = tempfile::tempdir().unwrap();
+
+        let origin = Origin::spawn(Some(NEW_RULES), false).await;
+        let raw = HashMap::from([("adopted".to_string(), http_provider(&origin.url, 0))]);
+        let prefetched = prefetch_within(&raw, dir.path(), Some(Duration::from_millis(100))).await;
+        let providers = load_pass(&raw, dir.path(), &prefetched, false).await;
+        let fetch = providers["adopted"].spawn_initial_fetch().unwrap();
+        origin.gate.send_replace(true);
+        fetch.await.unwrap();
+        assert_eq!(providers["adopted"].rule_count(), 2);
+        assert_eq!(book.entries("adopted"), vec![]);
+
+        let origin = Origin::spawn(None, true).await;
+        let raw = HashMap::from([("recovered".to_string(), http_provider(&origin.url, 0))]);
+        let prefetched = prefetch_within(&raw, dir.path(), None).await;
+        let providers = load_pass(&raw, dir.path(), &prefetched, false).await;
+        assert_eq!(book.entries("recovered"), vec![], "not committed yet");
+        let fetch = providers["recovered"].spawn_initial_fetch().unwrap();
+        *origin.body.lock() = Some(NEW_RULES);
+        fetch.await.unwrap();
+        let entries = book.entries("recovered");
+        let entries: Vec<_> = entries
+            .iter()
+            .map(|e| (e.level, e.message.as_str()))
+            .collect();
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert_eq!(
+            entries[0],
+            (Level::Info, "Updated rule provider 'recovered': 2 rules")
+        );
+        assert_eq!(entries[1].0, Level::Error, "{entries:?}");
     }
 
     /// A cache that no longer parses is not a config defect, even under

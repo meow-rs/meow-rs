@@ -1,3 +1,4 @@
+use crate::dropped_providers::DroppedProviders;
 use crate::proxy_parser;
 use crate::raw::{RawHealthCheck, RawProxyProvider};
 use dashmap::DashMap;
@@ -675,20 +676,7 @@ impl ProxyProvider {
     /// Logbook: fetching or parsing the payload failed. Repeats fold while
     /// the provider keeps failing.
     fn logbook_failed(&self, error: &str) {
-        let name = &self.name;
-        // The fetch errors name the provider already.
-        let error = error
-            .strip_prefix(&format!("proxy-provider '{name}': "))
-            .unwrap_or(error);
-        logbook::event(
-            logbook::kind::PROXY_PROVIDER_UPDATE,
-            Level::Error,
-            format!("Updating proxy provider '{name}' failed: {error}"),
-        )
-        .subject(name.as_str())
-        .field("error", error)
-        .coalesce()
-        .record();
+        record_failure(&self.name, error);
     }
 
     /// Whether any payload generation has been committed — from the remote
@@ -1219,12 +1207,14 @@ pub async fn load_proxy_providers(
         strict,
         dialer_registry,
         crate::provider_fetch_deadline(),
+        &mut DroppedProviders::default(),
     )
     .await
 }
 
 /// [`load_proxy_providers`] with an explicit fetch deadline instead of the
-/// process-wide [`crate::provider_fetch_deadline`].
+/// process-wide [`crate::provider_fetch_deadline`]. Providers left out
+/// leniently go into `dropped`, for the commit to record.
 pub async fn load_proxy_providers_within(
     raw_map: &HashMap<String, RawProxyProvider>,
     cache_dir: Option<&Path>,
@@ -1232,6 +1222,7 @@ pub async fn load_proxy_providers_within(
     strict: bool,
     dialer_registry: &meow_proxy::dialer::ProxyRegistry,
     deadline: Option<Duration>,
+    dropped: &mut DroppedProviders,
 ) -> Result<HashMap<String, Arc<ProxyProvider>>, anyhow::Error> {
     let mut result = HashMap::new();
     let mut fetches = Vec::new();
@@ -1252,6 +1243,7 @@ pub async fn load_proxy_providers_within(
             }
             Err(e) => {
                 warn!(provider = %name, error = %e, "failed to create proxy-provider, skipping");
+                dropped.proxy(name, e);
                 continue;
             }
         };
@@ -1323,6 +1315,24 @@ pub fn spawn_deferred_initial_fetches(registry: &DashMap<String, Arc<ProxyProvid
             entry.value().spawn_initial_fetch();
         }
     }
+}
+
+/// Logbook: creating, fetching or parsing proxy provider `name` failed.
+/// Repeats fold while it keeps failing.
+pub(crate) fn record_failure(name: &str, error: &str) {
+    // The errors name the provider already.
+    let error = error
+        .strip_prefix(&format!("proxy-provider '{name}': "))
+        .unwrap_or(error);
+    logbook::event(
+        logbook::kind::PROXY_PROVIDER_UPDATE,
+        Level::Error,
+        format!("Updating proxy provider '{name}' failed: {error}"),
+    )
+    .subject(name)
+    .field("error", error)
+    .coalesce()
+    .record();
 }
 
 /// What a parsed fetch did to the provider's payload, for the logbook.
@@ -3074,9 +3084,17 @@ header:
             .iter()
             .map(|(name, url)| ((*name).to_string(), raw_http_provider(url, None)))
             .collect();
-        load_proxy_providers_within(&raw, Some(dir), false, false, &Default::default(), deadline)
-            .await
-            .unwrap()
+        load_proxy_providers_within(
+            &raw,
+            Some(dir),
+            false,
+            false,
+            &Default::default(),
+            deadline,
+            &mut DroppedProviders::default(),
+        )
+        .await
+        .unwrap()
     }
 
     fn registry_of(

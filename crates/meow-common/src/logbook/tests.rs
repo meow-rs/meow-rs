@@ -691,6 +691,99 @@ fn a_clear_while_the_database_is_locked_still_clears() {
     assert_eq!(rows(dir.path()), 2);
 }
 
+/// Hold the writer up on a locked database, behind a full queue. The
+/// returned lock releases it.
+fn stall_writer(book: &Logbook, dir: &Path) -> rusqlite::Connection {
+    let lock = lock_database(dir);
+    book.record(info("holds the writer up"));
+    book.fill_queue();
+    lock
+}
+
+/// Release `lock` from another thread while the caller waits on the
+/// writer.
+fn release_soon(lock: rusqlite::Connection) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        drop(lock);
+    })
+}
+
+#[test]
+fn a_write_a_full_queue_refused_is_tried_again_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let book = open(dir.path(), t0());
+    let lock = stall_writer(&book, dir.path());
+    book.record_at(info("refused"), at(1));
+    drop(lock);
+    // No flush: the writer retries it on its own.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !messages(&on_disk(dir.path(), at(2))).contains(&"refused") {
+        assert!(
+            Instant::now() < deadline,
+            "the refused write never reached the disk"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn a_flush_behind_a_full_queue_writes_the_held_back_repeats() {
+    let dir = tempfile::tempdir().unwrap();
+    let book = open(dir.path(), t0());
+    book.record_at(failure("rules", "a"), at(0));
+    book.settle();
+    book.record_at(failure("rules", "b"), at(1));
+    let release = release_soon(stall_writer(&book, dir.path()));
+    book.flush();
+    release.join().unwrap();
+    let entries = on_disk(dir.path(), at(2));
+    let rules = entries.iter().find(|e| e.subject == "rules").unwrap();
+    assert_eq!(rules.count, 2);
+}
+
+#[test]
+fn a_clear_behind_a_full_queue_writes_its_entry_before_returning() {
+    let dir = tempfile::tempdir().unwrap();
+    let book = open(dir.path(), t0());
+    book.record(info("one"));
+    book.settle();
+    let release = release_soon(stall_writer(&book, dir.path()));
+    book.clear();
+    release.join().unwrap();
+    assert_eq!(
+        messages(&on_disk(dir.path(), SystemTime::now())),
+        ["Cleared the logbook"]
+    );
+}
+
+#[test]
+fn a_held_back_repeat_with_nothing_after_it_keeps_its_rev() {
+    let dir = tempfile::tempdir().unwrap();
+    let book = open(dir.path(), t0());
+    book.record_at(failure("rules", "a"), at(0));
+    book.settle();
+    let b = book.record_at(failure("rules", "b"), at(1));
+    let since = |rev| Query {
+        since: Some(rev),
+        ..Query::default()
+    };
+    let seen = book.query_at(&since(0), at(2)).unwrap();
+    assert_eq!((seen.rev, seen.entries[0].count), (b.rev, 2));
+    let disk = read_at(dir.path(), &since(0), at(2)).unwrap();
+    assert_eq!(disk.entries[0].count, 1, "held back");
+    book.flush();
+    // No rev was handed out after the fold, so a reader that polled at it
+    // is not shown the entry again, and one polling the database still is.
+    assert!(book
+        .query_at(&since(seen.rev), at(2))
+        .unwrap()
+        .entries
+        .is_empty());
+    let next = read_at(dir.path(), &since(disk.rev), at(2)).unwrap();
+    assert_eq!((next.entries[0].rev, next.entries[0].count), (b.rev, 2));
+}
+
 #[test]
 fn long_messages_are_cut_at_a_char_boundary() {
     let long = "界".repeat(MAX_MESSAGE);

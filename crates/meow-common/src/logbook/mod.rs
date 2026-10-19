@@ -311,6 +311,16 @@ impl Event {
             book.record(self);
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn message(&self) -> &str {
+        &self.message
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fields(&self) -> &Map<String, Value> {
+        &self.fields
+    }
 }
 
 static CURRENT: RwLock<Option<Arc<Logbook>>> = RwLock::new(None);

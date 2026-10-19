@@ -312,12 +312,11 @@ struct TunDevice {
     /// this field is dropped, before `device` is destroyed.
     #[allow(dead_code)]
     route_guard: Option<RouteGuard>,
-    /// Held only for its `Drop` side effect — gives up this listener's
-    /// ownership of the process-global outbound-interface binding for
-    /// global route scope (after `route_guard` has removed the routes it
-    /// protects). A successor that already installed its own binding keeps
-    /// it; otherwise the binding is cleared.
-    #[allow(dead_code)]
+    /// This listener's ownership of the process-global outbound-interface
+    /// binding for global route scope, committed once the listener is up.
+    /// Dropping it gives the ownership up (after `route_guard` has removed
+    /// the routes it protects). A successor that already installed its own
+    /// binding keeps it; otherwise the binding is cleared.
     iface_guard: Option<OutboundBinding>,
     pub(super) device: tun_rs::AsyncDevice,
 }
@@ -725,6 +724,11 @@ impl TunListener {
             v4: cfg.inet4_address,
             v6: cfg.inet6_address,
         };
+        // Nothing past here fails: the listener is up, and its binding is
+        // the running one.
+        if let Some(binding) = &device.iface_guard {
+            binding.commit();
+        }
         let (mut pump_in, mut pump_out) = device::spawn_pumps(device, stack);
         tasks.push(&pump_in);
         tasks.push(&pump_out);

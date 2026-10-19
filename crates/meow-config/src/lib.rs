@@ -5,6 +5,7 @@
 
 pub mod auth;
 pub mod dns_parser;
+pub mod dropped_providers;
 pub mod ech_dns;
 // Force-disabled on iOS/Android: mobile apps embed their own UI and must not
 // ship the unzip/download path regardless of the feature flag (issue #223).
@@ -28,6 +29,7 @@ pub mod subscription;
 #[cfg(test)]
 mod test_support;
 
+pub use dropped_providers::DroppedProviders;
 pub use geodata::GeoDataConfig;
 
 use meow_common::AuthConfig;
@@ -85,6 +87,9 @@ pub struct Config {
     pub provider_dialer_registry: meow_proxy::dialer::ProxyRegistry,
     pub rules: Vec<Box<dyn Rule>>,
     pub rule_providers: HashMap<String, Arc<rule_provider::RuleProvider>>,
+    /// Providers the load left out leniently. The embedder records them once
+    /// it runs this config ([`DroppedProviders::record`]).
+    pub dropped_providers: DroppedProviders,
     /// The `dialer-proxy` registry generation `proxies` was published into.
     /// Hand it to `Tunnel::update_routing` so the route table retains it —
     /// chained adapters resolve through it weakly (issue #533).
@@ -968,6 +973,9 @@ pub struct RebuildResult {
     /// and a newly declared provider becomes refreshable (issue #533
     /// review).
     pub proxy_providers: HashMap<String, Arc<ProxyProvider>>,
+    /// Providers this build left out leniently. The committing caller
+    /// records them with the commit ([`DroppedProviders::record`]).
+    pub dropped_providers: DroppedProviders,
     /// The file/http rule-provider payload bytes this rebuild prefetched.
     /// The same commit's DNS rebuild should reuse them rather than
     /// fetching again inside `CONFIG_MUTATION`, and its geo-scan needs
@@ -1202,6 +1210,8 @@ pub async fn parse_dns_from_raw(
                     raw.strict.unwrap_or(false),
                 )
                 .await?
+                // Never committed: these providers only back the matchers.
+                .0
             }
         }
     } else {
@@ -1889,6 +1899,7 @@ fn materialize_proxy_providers(
     // newly declared providers must share it, or their `dialer-proxy`
     // nodes can never resolve (issue #489).
     provider_dialer_registry: &meow_proxy::dialer::ProxyRegistry,
+    dropped: &mut DroppedProviders,
 ) -> Result<HashMap<String, Arc<ProxyProvider>>, anyhow::Error> {
     let Some(raw_map) = raw.proxy_providers.as_ref() else {
         return Ok(HashMap::new());
@@ -1920,6 +1931,7 @@ fn materialize_proxy_providers(
             }
             Err(e) => {
                 warn!("failed to create proxy-provider '{name}': {e}");
+                dropped.proxy(name, e);
             }
         }
     }
@@ -2534,8 +2546,15 @@ fn rebuild_from_raw_impl(
     // provider" (issue #533 review). `strict` also validates newly
     // declared defs here so a bad def can't be committed and then fail the
     // next startup.
-    let candidate_providers =
-        materialize_proxy_providers(raw, providers, cache_dir, strict, provider_dialer_registry)?;
+    let mut dropped = DroppedProviders::default();
+    let candidate_providers = materialize_proxy_providers(
+        raw,
+        providers,
+        cache_dir,
+        strict,
+        provider_dialer_registry,
+        &mut dropped,
+    )?;
     let proxies = build_proxy_layer(
         raw,
         resolver,
@@ -2635,6 +2654,7 @@ fn rebuild_from_raw_impl(
                 &payloads,
                 Some(registry),
                 strict,
+                &mut dropped,
             )?,
             _ => HashMap::new(),
         },
@@ -2681,6 +2701,7 @@ fn rebuild_from_raw_impl(
         dialer_registry: registry.clone(),
         rule_providers,
         proxy_providers: candidate_providers,
+        dropped_providers: dropped,
         prefetched_payloads: payloads,
     })
 }
@@ -2801,9 +2822,16 @@ async fn load_rule_providers_async(
     // outlive this route generation (issue #533).
     dialer_registry: Option<meow_proxy::dialer::ProxyRegistry>,
     strict: bool,
-) -> Result<HashMap<String, Arc<rule_provider::RuleProvider>>, anyhow::Error> {
+) -> Result<
+    (
+        HashMap<String, Arc<rule_provider::RuleProvider>>,
+        DroppedProviders,
+    ),
+    anyhow::Error,
+> {
     spawn_blocking_with_current_dispatcher(move || {
         let lookup = |name: &str| proxies.get(name).cloned();
+        let mut dropped = DroppedProviders::default();
         rule_provider::load_providers_prefetched(
             &raw_providers,
             cache_dir.as_deref(),
@@ -2813,7 +2841,9 @@ async fn load_rule_providers_async(
             &provider_payloads,
             dialer_registry.as_ref(),
             strict,
+            &mut dropped,
         )
+        .map(|providers| (providers, dropped))
     })
     .await
     .map_err(|e| anyhow::anyhow!("rule-provider load task failed: {e}"))?
@@ -3897,17 +3927,21 @@ pub async fn build_config(
     // tunnel publishes the live route map into it on every routing install.
     let provider_dialer_registry = meow_proxy::dialer::ProxyRegistry::default();
 
-    // Load proxy providers (async: may HTTP-fetch provider files).
+    // Load proxy providers (async: may HTTP-fetch provider files). The build
+    // passes below leave out the same ones again; this load's are kept.
+    let mut dropped_providers = DroppedProviders::default();
     let proxy_providers = if let Some(raw_pp) = raw.proxy_providers.as_ref() {
         if raw_pp.is_empty() {
             HashMap::new()
         } else {
-            proxy_provider::load_proxy_providers(
+            proxy_provider::load_proxy_providers_within(
                 raw_pp,
                 cache_dir,
                 general.ipv6,
                 raw.strict.unwrap_or(false),
                 &provider_dialer_registry,
+                provider_fetch_deadline(),
+                &mut dropped_providers,
             )
             .await?
         }
@@ -4006,7 +4040,7 @@ pub async fn build_config(
     let download_proxy = internal_http::first_named_proxy(raw.proxies.as_deref(), &proxies);
     let rule_providers = match raw.rule_providers.as_ref() {
         Some(map) if !map.is_empty() => {
-            load_rule_providers_async(
+            let (providers, mut dropped) = load_rule_providers_async(
                 map.clone(),
                 cache_dir_buf.clone(),
                 ctx.clone(),
@@ -4016,7 +4050,9 @@ pub async fn build_config(
                 Some(dialer_registry.clone()),
                 raw.strict.unwrap_or(false),
             )
-            .await?
+            .await?;
+            dropped_providers.take_rule(&mut dropped);
+            providers
         }
         _ => HashMap::new(),
     };
@@ -4128,6 +4164,7 @@ pub async fn build_config(
         provider_dialer_registry,
         rules,
         rule_providers,
+        dropped_providers,
         dialer_registry,
         listeners,
         tun,
@@ -7178,14 +7215,21 @@ rules:
             Some(cache_dir),
             false,
             &Default::default(),
+            &mut DroppedProviders::default(),
         )
         .expect("provider materializes");
         let provider = Arc::clone(first.get("p").unwrap());
 
         // Unchanged def → same Arc reused.
-        let again =
-            materialize_proxy_providers(&raw, &first, Some(cache_dir), false, &Default::default())
-                .expect("reuse");
+        let again = materialize_proxy_providers(
+            &raw,
+            &first,
+            Some(cache_dir),
+            false,
+            &Default::default(),
+            &mut DroppedProviders::default(),
+        )
+        .expect("reuse");
         assert!(Arc::ptr_eq(again.get("p").unwrap(), &provider));
 
         // Changed def (filter added) → a new object materializes.
@@ -7197,6 +7241,7 @@ rules:
             Some(cache_dir),
             false,
             &Default::default(),
+            &mut DroppedProviders::default(),
         )
         .expect("changed def materializes fresh");
         assert!(
@@ -7233,6 +7278,7 @@ rules:
             Some(cache_dir),
             false,
             &Default::default(),
+            &mut DroppedProviders::default(),
         )
         .expect("provider materializes");
         let provider = Arc::clone(first.get("p").unwrap());
@@ -7244,6 +7290,7 @@ rules:
             Some(cache_dir),
             false,
             &Default::default(),
+            &mut DroppedProviders::default(),
         )
         .expect("interval-only change must reuse the provider");
         assert!(

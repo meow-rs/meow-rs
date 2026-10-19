@@ -261,6 +261,7 @@ pub async fn run_loop(
                                 rule_providers: new_rule_providers,
                                 proxy_providers: new_proxy_providers,
                                 prefetched_payloads: new_prefetched_payloads,
+                                dropped_providers,
                             } = result;
                             // Same guard as `apply_raw_to_tunnel`: a group
                             // warn-dropped under lenient parsing must not
@@ -368,6 +369,7 @@ pub async fn run_loop(
                                 candidate.proxy_providers.as_ref(),
                                 &proxy_provider_refresh,
                             );
+                            dropped_providers.record();
                             // Commit raw + routing together inside the lane:
                             // the on-disk/dashboard view and the running
                             // router can no longer diverge on failure.

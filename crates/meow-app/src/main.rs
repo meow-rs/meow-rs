@@ -1185,6 +1185,9 @@ async fn run(
     let rule_provider_refresh =
         Arc::new(meow_config::rule_provider_refresh::RefreshSupervisor::default());
     rule_provider_refresh.reconcile(&rule_providers);
+    // The providers the startup build left out, recorded once now that it
+    // runs (startup builds its providers more than once).
+    config.dropped_providers.record();
 
     // Same supervision for `proxy-providers` `interval:` — reconciled
     // against the committed declarations on every registry swap

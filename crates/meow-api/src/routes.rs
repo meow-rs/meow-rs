@@ -1228,6 +1228,7 @@ async fn apply_raw_to_tunnel(
         rule_providers,
         proxy_providers,
         prefetched_payloads,
+        dropped_providers,
     } = result;
     if let Some(missing) = expected_groups
         .iter()
@@ -1285,6 +1286,7 @@ async fn apply_raw_to_tunnel(
         raw.proxy_providers.as_ref(),
         &state.proxy_provider_refresh,
     );
+    dropped_providers.record();
     Ok((dns, prior_resolver))
 }
 
@@ -3192,6 +3194,7 @@ async fn put_configs(
         rule_providers,
         proxy_providers,
         prefetched_payloads,
+        dropped_providers,
     } = result;
 
     // A `tun:` section the listener cannot parse must be rejected before
@@ -3336,6 +3339,7 @@ async fn put_configs(
         raw_config.proxy_providers.as_ref(),
         &state.proxy_provider_refresh,
     );
+    dropped_providers.record();
 
     let reloaded = reload_succeeded(&raw_config, &forced, dropped);
     // `reload_routing` above ran after the pre-install and cancelled every

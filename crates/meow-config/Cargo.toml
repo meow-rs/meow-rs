@@ -77,6 +77,8 @@ libc = "0.2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+# Unit tests open a logbook.
+meow-common = { workspace = true, features = ["logbook"] }
 tempfile = "3"
 tracing-subscriber = { workspace = true }
 
