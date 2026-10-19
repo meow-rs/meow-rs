@@ -1,11 +1,12 @@
-use super::store::format_uptime;
+use super::store::{format_uptime, read_at, Logbook};
 use super::*;
 use std::fs;
-use std::time::UNIX_EPOCH;
+use std::time::Instant;
 
-/// 2027-01-15T08:00:00Z.
+/// 2100-01-01T00:00:00Z: far enough ahead that the writer's timer, which
+/// runs on the real clock, never finds a repeat held back here due.
 fn t0() -> SystemTime {
-    UNIX_EPOCH + Duration::from_secs(1_800_000_000)
+    UNIX_EPOCH + Duration::from_secs(4_102_444_800)
 }
 
 fn at(secs: u64) -> SystemTime {
@@ -42,14 +43,24 @@ fn all(book: &Logbook, now: SystemTime) -> Vec<Entry> {
         },
         now,
     )
+    .unwrap()
     .entries
 }
 
-fn lines(dir: &Path) -> usize {
-    fs::read_to_string(dir.join("logbook.jsonl"))
+/// Everything on disk, read as another process would.
+fn on_disk(dir: &Path, now: SystemTime) -> Vec<Entry> {
+    let query = Query {
+        limit: Some(MAX_LIMIT),
+        ..Query::default()
+    };
+    read_at(dir, &query, now).unwrap().entries
+}
+
+/// Rows in the database, expired or not.
+fn rows(dir: &Path) -> u64 {
+    let conn = rusqlite::Connection::open(dir.join("logbook.db")).unwrap();
+    conn.query_row("SELECT COUNT(*) FROM entries", [], |row| row.get(0))
         .unwrap()
-        .lines()
-        .count()
 }
 
 fn messages(entries: &[Entry]) -> Vec<&str> {
@@ -88,8 +99,8 @@ fn an_entry_serializes_to_the_documented_shape() {
         json,
         serde_json::json!({
             "id": 1,
-            "rev": 1_800_000_000_123_u64,
-            "time": "2027-01-15T08:00:00.123Z",
+            "rev": 4_102_444_800_123_u64,
+            "time": "2100-01-01T00:00:00.123Z",
             "count": 1,
             "kind": "config.reload",
             "level": "error",
@@ -127,7 +138,7 @@ fn repeats_fold_into_the_subjects_latest_entry() {
 }
 
 #[test]
-fn repeats_within_a_minute_reach_the_disk_once() {
+fn a_repeat_reaches_the_disk_at_most_once_a_minute() {
     let dir = tempfile::tempdir().unwrap();
     {
         let book = open(dir.path(), t0());
@@ -135,16 +146,62 @@ fn repeats_within_a_minute_reach_the_disk_once() {
         book.record_at(failure("rules", "b"), at(1));
         book.record_at(failure("rules", "c"), at(2));
         assert_eq!(all(&book, at(3))[0].count, 3, "memory is current");
-        book.flush();
-        assert_eq!(
-            lines(dir.path()),
-            2,
-            "the first write and the held-back repeats"
-        );
+        book.settle();
+        assert_eq!(on_disk(dir.path(), at(3))[0].count, 1, "held back");
+        book.record_at(failure("rules", "d"), at(61));
+        book.settle();
+        assert_eq!(on_disk(dir.path(), at(62))[0].count, 4, "due again");
+        book.record_at(failure("rules", "e"), at(62));
     }
-    let book = open(dir.path(), at(10));
-    let entry = &all(&book, at(10))[0];
-    assert_eq!((entry.count, entry.message.as_str()), (3, "c"));
+    // Held-back repeats are written when the logbook closes.
+    let book = open(dir.path(), at(70));
+    let entry = &all(&book, at(70))[0];
+    assert_eq!((entry.count, entry.message.as_str()), (5, "e"));
+}
+
+#[test]
+fn a_held_back_repeat_reaches_a_reader_polling_the_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let book = open(dir.path(), t0());
+    book.record_at(failure("rules", "a"), at(0));
+    book.record_at(failure("rules", "b"), at(1));
+    book.record_at(info("later"), at(2));
+    book.settle();
+    let poll = |since| {
+        let query = Query {
+            since: Some(since),
+            ..Query::default()
+        };
+        read_at(dir.path(), &query, at(3)).unwrap()
+    };
+    let first = poll(0);
+    assert_eq!(messages(&first.entries), ["later", "a"], "b held back");
+    // Written out after `later`: a newer rev than the reader has seen.
+    book.flush();
+    let next = poll(first.rev);
+    assert_eq!(messages(&next.entries), ["b"]);
+    assert_eq!(next.entries[0].count, 2);
+}
+
+#[test]
+fn a_held_back_repeat_is_written_once_due_without_another_event() {
+    let dir = tempfile::tempdir().unwrap();
+    // The writer's timer runs on the real clock.
+    let now = SystemTime::now();
+    let ago = |secs| now - Duration::from_secs(secs);
+    let book = open(dir.path(), ago(200));
+    book.record_at(failure("rules", "a"), ago(120));
+    book.record_at(failure("rules", "b"), ago(100));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let count = || on_disk(dir.path(), now).first().map_or(0, |e| e.count);
+    while count() < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "the repeat never reached the disk"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    drop(book);
 }
 
 #[test]
@@ -176,44 +233,31 @@ fn another_outcome_for_the_subject_or_a_long_gap_starts_a_new_entry() {
 }
 
 #[test]
-fn a_torn_last_line_is_skipped() {
+fn the_database_stays_under_its_cap_and_keeps_the_newest() {
     let dir = tempfile::tempdir().unwrap();
-    {
-        let book = open(dir.path(), t0());
-        book.record_at(info("kept"), at(1));
-    }
-    let current = dir.path().join("logbook.jsonl");
-    let mut bytes = fs::read(&current).unwrap();
-    bytes.extend_from_slice(br#"{"id":2,"rev":2,"time":"2027-01-"#);
-    fs::write(&current, bytes).unwrap();
-    {
-        let book = open(dir.path(), at(2));
-        assert_eq!(messages(&all(&book, at(2))), ["kept"]);
-        assert_eq!(book.record_at(info("next"), at(3)).id, 2);
-    }
-    // The torn line was ended, so the next line was not glued to it.
-    let book = open(dir.path(), at(4));
-    assert_eq!(messages(&all(&book, at(4))), ["next", "kept"]);
-}
-
-#[test]
-fn segments_rotate_under_the_size_cap_and_keep_the_newest() {
-    let dir = tempfile::tempdir().unwrap();
-    let max_size = 4096;
+    let max_size = 64 * 1024;
     {
         let book = Logbook::open_at(dir.path(), small(8, max_size), t0()).unwrap();
-        for i in 0..200 {
-            book.record_at(info(&format!("entry {i}")), at(i));
+        for i in 0..2000 {
+            book.record_at(
+                info(&format!("entry {i}")).field("detail", "x".repeat(100)),
+                at(i),
+            );
+            // Faster than any engine records: let the writer keep up
+            // rather than drop.
+            if i % 100 == 99 {
+                book.settle();
+            }
         }
-        book.flush();
     }
-    let size = |name: &str| fs::metadata(dir.path().join(name)).map_or(0, |m| m.len());
-    assert!(size("logbook.jsonl") + size("logbook.1.jsonl") <= max_size);
-    assert!(size("logbook.1.jsonl") > 0, "rotated at least once");
-    let book = Logbook::open_at(dir.path(), small(8, max_size), at(300)).unwrap();
-    let entries = all(&book, at(300));
-    assert_eq!(entries[0].message, "entry 199");
-    assert!(entries.len() > 8, "pages back into the files");
+    // Closed: the write-ahead log is checkpointed into the database.
+    let size = fs::metadata(dir.path().join("logbook.db")).unwrap().len();
+    assert!(size <= max_size, "{size} bytes");
+    let book = Logbook::open_at(dir.path(), small(8, max_size), at(3000)).unwrap();
+    let entries = all(&book, at(3000));
+    assert_eq!(entries[0].message, "entry 1999");
+    assert!(entries.len() > 8, "pages back into the database");
+    assert!(entries.len() < 1000, "the oldest were deleted");
     assert!(
         entries.windows(2).all(|w| w[0].id == w[1].id + 1),
         "a contiguous run of the newest entries"
@@ -234,29 +278,7 @@ fn entries_past_the_retention_are_dropped() {
 }
 
 #[test]
-fn a_compaction_folds_the_writes_of_an_entry_into_one_line() {
-    let dir = tempfile::tempdir().unwrap();
-    let max_size = 16 * 1024;
-    {
-        let book = Logbook::open_at(dir.path(), small(8, max_size), t0()).unwrap();
-        book.record_at(info("the first entry"), at(0));
-        // A failure retried every two minutes for two days: every repeat
-        // reaches the disk, many times what the segments hold.
-        for i in 0..1440 {
-            book.record_at(failure("rules", "timed out"), at(1 + 120 * i));
-        }
-    }
-    let size = |name: &str| fs::metadata(dir.path().join(name)).map_or(0, |m| m.len());
-    assert!(size("logbook.jsonl") + size("logbook.1.jsonl") <= max_size);
-    let now = at(1440 * 120);
-    let book = Logbook::open_at(dir.path(), small(8, max_size), now).unwrap();
-    let entries = all(&book, now);
-    assert_eq!(messages(&entries), ["timed out", "the first entry"]);
-    assert_eq!(entries[0].count, 1440);
-}
-
-#[test]
-fn expired_entries_leave_the_files_but_ids_keep_increasing() {
+fn expired_entries_leave_the_database_but_ids_keep_increasing() {
     let dir = tempfile::tempdir().unwrap();
     {
         let book = open(dir.path(), t0());
@@ -265,21 +287,149 @@ fn expired_entries_leave_the_files_but_ids_keep_increasing() {
         }
     }
     drop(open(dir.path(), at(6 * 24 * 3600)));
-    assert_eq!(lines(dir.path()), 20, "still within the retention");
+    assert_eq!(rows(dir.path()), 20, "still within the retention");
     let now = at(8 * 24 * 3600);
     {
         let book = open(dir.path(), now);
         assert!(all(&book, now).is_empty());
-        book.flush();
     }
-    let on_disk = fs::read_to_string(dir.path().join("logbook.1.jsonl")).unwrap();
-    assert_eq!(on_disk.lines().count(), 1, "only the highest id is kept");
+    assert_eq!(rows(dir.path()), 0);
     let book = open(dir.path(), now);
     assert_eq!(
         book.record_at(info("next"), now).id,
         21,
         "ids keep increasing"
     );
+}
+
+#[test]
+fn a_running_logbook_deletes_what_expires() {
+    let dir = tempfile::tempdir().unwrap();
+    let book = open(dir.path(), t0());
+    book.record_at(info("old"), at(0));
+    book.record_at(info("new"), at(8 * 24 * 3600));
+    book.settle();
+    assert_eq!(rows(dir.path()), 1);
+}
+
+#[test]
+fn an_unreadable_database_is_set_aside_and_the_logbook_starts_over() {
+    let dir = tempfile::tempdir().unwrap();
+    let garbage = b"this is not an SQLite database".repeat(10);
+    fs::write(dir.path().join("logbook.db"), &garbage).unwrap();
+    let book = open(dir.path(), t0());
+    let entries = all(&book, t0());
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].kind, kind::LOGBOOK_RESET);
+    assert_eq!(entries[0].level, Level::Warning);
+    assert_eq!(entries[0].id, 1);
+    assert_eq!(
+        fs::read(dir.path().join("logbook.db.corrupt")).unwrap(),
+        garbage
+    );
+    assert_eq!(book.record_at(info("next"), at(1)).id, 2);
+}
+
+#[test]
+fn a_database_from_a_newer_meow_is_left_alone() {
+    let newer = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let files = ["logbook.db", "logbook.db-wal"];
+    {
+        let conn = rusqlite::Connection::open(newer.path().join("logbook.db")).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0;
+             CREATE TABLE entries (id INTEGER PRIMARY KEY, future TEXT);
+             INSERT INTO entries VALUES (1, 'x');
+             PRAGMA user_version = 99;",
+        )
+        .unwrap();
+        // What a newer meow that was killed leaves behind: its writes
+        // still in the write-ahead log.
+        for name in files {
+            fs::copy(newer.path().join(name), dir.path().join(name)).unwrap();
+        }
+    }
+    let before = files.map(|name| fs::read(dir.path().join(name)).unwrap());
+    let opened = Logbook::open_at(dir.path(), Options::default(), t0());
+    assert_eq!(
+        opened.err().map(|e| e.kind()),
+        Some(io::ErrorKind::InvalidData)
+    );
+    assert!(read_at(dir.path(), &Query::default(), t0()).is_err());
+    assert!(!dir.path().join("logbook.db.corrupt").exists());
+    // Not even checkpointed.
+    let after = files.map(|name| fs::read(dir.path().join(name)).unwrap());
+    assert!(before == after, "the files changed");
+}
+
+#[test]
+fn a_row_meow_cannot_read_sets_the_database_aside() {
+    let dir = tempfile::tempdir().unwrap();
+    drop(open(dir.path(), t0()).record_at(info("one"), at(1)));
+    {
+        let conn = rusqlite::Connection::open(dir.path().join("logbook.db")).unwrap();
+        conn.execute("UPDATE entries SET count = 'many'", [])
+            .unwrap();
+    }
+    let book = open(dir.path(), at(2));
+    let entries = all(&book, at(2));
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].kind, kind::LOGBOOK_RESET);
+    assert!(dir.path().join("logbook.db.corrupt").exists());
+}
+
+#[test]
+fn a_killed_process_keeps_what_was_committed() {
+    let dir = tempfile::tempdir().unwrap();
+    let copy = tempfile::tempdir().unwrap();
+    let book = open(dir.path(), t0());
+    book.record_at(info("committed"), at(1));
+    book.settle();
+    // What a killed process leaves behind: the database and its
+    // write-ahead log, not checkpointed.
+    for name in ["logbook.db", "logbook.db-wal"] {
+        fs::copy(dir.path().join(name), copy.path().join(name)).unwrap();
+    }
+    let reopened = open(copy.path(), at(2));
+    assert_eq!(messages(&all(&reopened, at(2))), ["committed"]);
+}
+
+#[test]
+fn another_process_reads_what_was_committed() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(on_disk(dir.path(), t0()).is_empty(), "no database yet");
+    assert!(!dir.path().join("logbook.db").exists(), "and none created");
+
+    let book = Logbook::open_at(dir.path(), small(2, MAX_SIZE), t0()).unwrap();
+    for i in 0..5 {
+        let level = if i % 2 == 0 {
+            Level::Info
+        } else {
+            Level::Error
+        };
+        book.record_at(
+            event("rule-provider.update", level, format!("p{i}")).subject("s"),
+            at(i),
+        );
+    }
+    let last = book.record_at(info("last"), at(5));
+    book.settle();
+    let read = |query: Query| read_at(dir.path(), &query, at(10)).unwrap();
+    let page = read(Query {
+        limit: Some(2),
+        ..Query::default()
+    });
+    assert_eq!(messages(&page.entries), ["last", "p4"]);
+    assert!(page.more);
+    assert_eq!(page.rev, last.rev);
+    let errors = read(Query {
+        level: Some(Level::Error),
+        kind: Some("rule-provider".into()),
+        ..Query::default()
+    });
+    assert_eq!(messages(&errors.entries), ["p3", "p1"]);
+    assert!(!errors.more);
 }
 
 #[test]
@@ -302,6 +452,20 @@ fn the_latest_level_follows_the_subjects_latest_entry() {
     assert_eq!(book.latest_level("group.health", "rules"), None, "per kind");
     book.record_at(event(kind, Level::Info, "updated").subject("rules"), at(1));
     assert_eq!(book.latest_level(kind, "rules"), Some(Level::Info));
+}
+
+#[test]
+fn an_expired_failure_is_no_longer_the_latest_level() {
+    let dir = tempfile::tempdir().unwrap();
+    let book = open(dir.path(), t0());
+    let kind = "rule-provider.update";
+    book.record_at(failure("rules", "failed"), at(0));
+    assert_eq!(
+        book.latest_level_at(kind, "rules", at(1)),
+        Some(Level::Error)
+    );
+    let later = at(0) + RETENTION + Duration::from_secs(1);
+    assert_eq!(book.latest_level_at(kind, "rules", later), None);
 }
 
 #[test]
@@ -333,8 +497,8 @@ fn a_run_that_never_stopped_is_reported_at_the_next_start() {
     let unclean = &entries[1];
     assert_eq!(unclean.kind, kind::ENGINE_UNCLEAN_EXIT);
     assert_eq!(unclean.level, Level::Warning);
-    assert_eq!(unclean.fields["started"], "2027-01-15T08:00:00Z");
-    assert_eq!(unclean.fields["lastSeen"], "2027-01-15T08:00:50Z");
+    assert_eq!(unclean.fields["started"], "2100-01-01T00:00:00Z");
+    assert_eq!(unclean.fields["lastSeen"], "2100-01-01T00:00:50Z");
     assert_eq!(entries[0].fields["config"], "/etc/meow/config.yaml");
 }
 
@@ -397,7 +561,7 @@ fn queries_filter_page_back_and_poll() {
         at(10),
     );
 
-    let page = |query: Query| book.query_at(&query, at(20));
+    let page = |query: Query| book.query_at(&query, at(20)).unwrap();
     let first = page(Query {
         limit: Some(3),
         ..Query::default()
@@ -406,7 +570,7 @@ fn queries_filter_page_back_and_poll() {
     assert!(first.more);
     assert_eq!(first.rev, first.entries[0].rev);
 
-    // Paging back crosses from memory (4 entries) into the files.
+    // Paging back crosses from memory (4 entries) into the database.
     let second = page(Query {
         limit: Some(5),
         before: Some(first.entries[2].id),
@@ -475,6 +639,58 @@ fn clearing_deletes_everything_but_ids_keep_increasing() {
     );
 }
 
+/// Another process holding the database's write lock, as a reader that
+/// opened it for writing could.
+fn lock_database(dir: &Path) -> rusqlite::Connection {
+    let conn = rusqlite::Connection::open(dir.join("logbook.db")).unwrap();
+    conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+    conn
+}
+
+#[test]
+fn writes_refused_by_a_locked_database_are_tried_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let book = Logbook::open_at(dir.path(), small(1, MAX_SIZE), t0()).unwrap();
+    book.record_at(info("one"), at(1));
+    book.settle();
+    let lock = lock_database(dir.path());
+    let two = book.record_at(info("two"), at(2));
+    // Past memory, so it needs the database.
+    let past = Query {
+        before: Some(two.id),
+        ..Query::default()
+    };
+    assert!(book.query_at(&past, at(3)).is_err());
+    drop(lock);
+    book.settle();
+    assert_eq!(messages(&on_disk(dir.path(), at(3))), ["two", "one"]);
+    assert_eq!(
+        messages(&book.query_at(&past, at(3)).unwrap().entries),
+        ["one"]
+    );
+}
+
+#[test]
+fn a_clear_while_the_database_is_locked_still_clears() {
+    let dir = tempfile::tempdir().unwrap();
+    let book = open(dir.path(), t0());
+    for i in 0..3 {
+        book.record(info(&format!("committed {i}")));
+    }
+    book.settle();
+    let lock = lock_database(dir.path());
+    book.record(info("queued"));
+    book.clear();
+    book.record(info("after"));
+    drop(lock);
+    book.settle();
+    assert_eq!(
+        messages(&on_disk(dir.path(), SystemTime::now())),
+        ["after", "Cleared the logbook"]
+    );
+    assert_eq!(rows(dir.path()), 2);
+}
+
 #[test]
 fn long_messages_are_cut_at_a_char_boundary() {
     let long = "界".repeat(MAX_MESSAGE);
@@ -501,18 +717,19 @@ fn levels_parse_and_order_by_severity() {
     assert!(Level::Info < Level::Warning && Level::Warning < Level::Error);
 }
 
-/// The only test that touches the process-wide logbook.
+/// The only test that installs the process-wide logbook. Tests elsewhere
+/// in the crate record into it while it is installed (`outbound_iface`), so
+/// it looks at its own kinds only.
 #[test]
 fn the_installed_logbook_records_and_watches_the_run() {
     let dir = tempfile::tempdir().unwrap();
     let marker = dir.path().join("run.json");
     info("before install").record();
-    let book = install(dir.path(), Options::default()).unwrap();
+    install(dir.path(), Options::default()).unwrap();
     assert!(enabled());
-    assert!(Arc::ptr_eq(
-        &book,
-        &install(dir.path(), Options::default()).unwrap()
-    ));
+    let book = current().unwrap();
+    install(dir.path(), Options::default()).unwrap();
+    assert!(Arc::ptr_eq(&book, &current().unwrap()), "kept");
     engine_started("inline");
     assert!(marker.exists());
     info("recorded").record();
@@ -525,13 +742,15 @@ fn the_installed_logbook_records_and_watches_the_run() {
     drop(book);
 
     // Back on mid-run: the rest of the run is watched again.
-    let book = install(dir.path(), Options::default()).unwrap();
+    install(dir.path(), Options::default()).unwrap();
+    let book = current().unwrap();
     assert!(marker.exists());
     engine_stopped(Stop::Requested("test"));
     assert!(!marker.exists());
     uninstall();
     let kinds: Vec<String> = all(&book, SystemTime::now())
         .iter()
+        .filter(|e| e.kind.starts_with("engine.") || e.kind.starts_with("test."))
         .map(|e| format!("{} {}", e.kind, e.message))
         .collect();
     assert_eq!(kinds.len(), 3, "{kinds:?}");

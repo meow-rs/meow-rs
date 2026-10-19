@@ -99,7 +99,7 @@ The `tun:` config section (issue #326, feature `listener-tun`, in the `full` bun
 - **`Rule` trait** (`meow-common/src/rule.rs`) — all rule types implement this for matching against `Metadata`
 - **Proxy groups** (`meow-proxy/src/group/`) — Selector, URLTest, Fallback wrap multiple adapters with selection strategies
 - **Tunnel** (`meow-tunnel/src/tunnel.rs`) — central `Arc`-shared routing engine; holds proxies, rules, DNS resolver, connection stats
-- **Logbook** (`meow-common/src/logbook/`) — persistent record of notable engine events (`GET /logbook`); producers call `logbook::event(kind, level, message).subject(..).record()`, a no-op when none is installed. New kinds go in `logbook::kind` and the [ADR-0014](docs/adr/0014-logbook.md) table; never record traffic destinations, and reference rules by index
+- **Logbook** (`meow-common/src/logbook/`) — persistent record of notable engine events (`GET /logbook`), an SQLite database behind the `logbook` feature (bundled `rusqlite`; in `full`, not `minimal`, where `disabled.rs` stands in); producers call `logbook::event(kind, level, message).subject(..).record()`, a no-op when none is installed. New kinds go in `logbook::kind` and the [ADR-0014](docs/adr/0014-logbook.md) table; never record traffic destinations, and reference rules by index
 
 ### Adding New Proxy Protocols
 
@@ -141,6 +141,10 @@ cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo clippy --all-targets --no-default-features -- -D warnings
 cargo clippy --all-targets --all-features -- -D warnings
+# `minimal` leaves out `logbook`, which every run above unifies on; its
+# stub (`logbook/disabled.rs`) only compiles here.
+cargo clippy -p meow-common --all-targets -- -D warnings
+cargo test -p meow-common --lib logbook
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 cargo test -p meow-listener --all-features --lib udp_port_53
 # `listener-shadowsocks` is opt-in: the default-features suite never compiles
@@ -301,3 +305,4 @@ See [docs/benchmarks/index.md](docs/benchmarks/index.md) for a collated table of
 - **DNS**: `hickory-resolver`/`hickory-server`/`hickory-proto`
 - **Web framework**: axum + tower
 - **GeoIP**: `maxminddb`
+- **Logbook storage**: `rusqlite` with `bundled` (SQLite compiled in, so every platform runs the same version), optional behind meow-common's `logbook` feature; `minimal` leaves it out (ADR-0007)

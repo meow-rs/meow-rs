@@ -47,6 +47,8 @@ libc = "0.2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+# api_test opens a logbook.
+meow-common = { workspace = true, features = ["logbook"] }
 meow-trie = { workspace = true }
 tower = { workspace = true }
 http-body-util = "0.1"

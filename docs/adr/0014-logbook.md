@@ -45,6 +45,7 @@ once released, because clients filter, label and translate by kind.
 | `engine.stop` | info / error | | A clean stop (`reason`: `SIGTERM`, `service stop`, ...) or a run that failed (`error`); `uptime` in seconds |
 | `engine.unclean-exit` | warning | | Recorded at start: the previous run ended without a stop (crash, kill, power cut); `version`, `started`, `lastSeen` |
 | `logbook.cleared` | info | | `DELETE /logbook` ran |
+| `logbook.reset` | warning | | The database could not be read and the logbook started over (`error`); the old file is kept as `logbook.db.corrupt` and ids start again from 1 |
 | `config.reload` | info / warning / error | | `PUT /configs` committed (counts, `connectionsClosed`; warning when `force` pushed past errors), or was rejected |
 | `config.change` | info | group or subscription | An API edit: subscription added or removed, proxy group created, changed or deleted, rules replaced, changed, deleted or moved |
 | `subscription.update` | info / error | subscription | Fetched and merged with a change to the config (counting the subscription's own proxies, groups and rules), the first success after a failure, or the fetch, rebuild or commit failed |
@@ -79,35 +80,78 @@ new one.
 
 ### Storage
 
-`<home>/logbook/` holds two JSON Lines segments, `logbook.jsonl` and the
-rotated `logbook.1.jsonl`, each at most half of the 2 MiB cap. Each line is
-a whole entry. A folded entry is appended again with the same `id` and a
-higher `rev`, at most once a minute (pending folds are written on flush,
-when the entry leaves memory, and at drop), and on load the line with the
-highest `rev` wins.
+`<home>/logbook/logbook.db` is an SQLite database that one writer thread
+owns. SQLite is bundled (`rusqlite` with `bundled`), so every platform runs
+the same version, and any platform's SQLite bindings and tools read the
+file. Schema version 1, in `PRAGMA user_version`:
 
-When the current segment reaches half the cap, the writer **compacts**:
-both segments are rewritten into the rotated one, keeping each entry's
-latest line (a failure folded every minute for a day is one line again,
-not 1440) and the newest entries that fit in half the cap, minus the ones
-past the 7 days; the current segment then starts empty. The entry with the
-highest `id` is kept even when expired, so ids keep increasing. An open
-that finds expired entries compacts as well, so a quiet logbook that never
-fills a segment still drops them. Expired entries are never served, from
-memory or the files.
+```sql
+CREATE TABLE entries (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    rev     INTEGER NOT NULL,  -- write sequence, see the API
+    time    INTEGER NOT NULL,  -- first occurrence, Unix milliseconds
+    last    INTEGER NOT NULL,  -- latest occurrence; time until a repeat folds in
+    count   INTEGER NOT NULL,
+    kind    TEXT NOT NULL,
+    level   TEXT NOT NULL,     -- info, warning, error
+    subject TEXT NOT NULL,     -- '' when the event has none
+    message TEXT NOT NULL,
+    fields  TEXT               -- JSON object, NULL when none
+);
+CREATE INDEX entries_rev ON entries (rev);
+```
 
-- **No fsync.** A killed process loses nothing the kernel already has; a
-  power cut loses at most the last seconds. A torn last line is skipped,
-  and ended with a newline before the next append so the next line is not
-  lost with it.
-- **Recording never waits on the disk.** Lines go to a bounded queue
-  (1024) that a writer thread drains; a full queue drops the line and warns
-  once.
+A row is an entry as the API serves it (`last` is served once `count` is
+above 1). The schema is a contract with readers in other processes: a
+later version may add columns, indexes or tables, and raises
+`user_version` only for a change an older reader cannot read. meow
+neither reads nor writes a database with a higher version than it knows,
+and leaves the file alone: it checks the version on a read-only
+connection, so not even the write-ahead log is checkpointed.
+
+- **Writes.** A new entry is inserted; a folded repeat updates its row in
+  place (an upsert by `id`, only to a higher `rev`), at most once a minute.
+  A held-back repeat is written once due (the writer wakes for it, with no
+  further event needed), on flush, when its entry leaves memory, and at
+  close, each time with a new `rev`: a reader polling the database with
+  `since` sees it even after later entries reached the disk. The writer
+  drains a bounded queue (1024) and commits up to 256 operations per
+  transaction. **Recording never waits on the disk**: a write the full
+  queue refuses stays pending in memory like a held-back repeat, and is
+  lost only if its entry leaves memory before the queue has room; the
+  first such write warns.
+- **Failed commits.** A transaction takes the write lock up front
+  (`BEGIN IMMEDIATE`). A commit that fails (a process holding the lock
+  past the 1 s busy timeout, a full disk) keeps its writes, up to 1024,
+  and is tried again with the next commit or after 10 s; a query that needs
+  the database fails meanwhile (`GET /logbook` answers 503). A single
+  entry SQLite refuses (too big, a constraint) is skipped with a warning
+  instead. `DELETE /logbook` never waits on the queue: it sets a bound,
+  and the writer deletes the rows below it, drops the queued writes below
+  it, and keeps trying until the delete commits.
+- **Durability.** WAL with `synchronous=NORMAL`: a committed write
+  survives a killed process, and a power cut can lose the last commits but
+  not the database. The write-ahead log is checkpointed every 64 pages and
+  cut back to 256 KiB after a checkpoint; the page cache is 256 KiB, for
+  the memory limit of an iOS network extension.
+- **Bounds.** Entries last seen more than 7 days ago are deleted at open
+  and then hourly. Past the 2 MiB cap (pages in use), the oldest entries
+  are deleted down to three quarters of it, and `auto_vacuum=INCREMENTAL`
+  hands the freed pages back to the file system. AUTOINCREMENT keeps ids
+  increasing past deleted rows, after `DELETE /logbook` too. Expired
+  entries are never served, from memory or the database.
+- **Damage.** `PRAGMA quick_check` runs at open. A file that is not a
+  database, fails the check, or holds rows meow cannot read (a text
+  `count`) is renamed to `logbook.db.corrupt`
+  (replacing an older one), and the logbook starts over with a
+  `logbook.reset` entry. Ids then start again from 1, so a client drops
+  the entries it holds.
 - **Revisions are time-based** (`max(rev + 1, unix millis)`), so they keep
   increasing across restarts even when a crash lost the last writes, and a
   client polling with `since` never misses an entry.
-- **One process per directory**: `logbook.lock` is taken with
-  `File::try_lock`.
+- **One writer per directory**: `logbook.lock` is taken with
+  `File::try_lock`. SQLite's own locks only order transactions; two meow
+  processes would hand out the same ids.
 - **Unclean exits**: `run.json` (`started`, `version`) is written once the
   engine is up (`engine_started`) and removed when it stops. A marker left
   behind at the next start is the `engine.unclean-exit` entry. It is not
@@ -116,11 +160,48 @@ memory or the files.
   would read as a crash. Turning the logbook off mid-run removes the
   marker, so it does not report a false unclean exit.
 
-The last 256 entries stay in memory; queries past them read the files.
+The last 256 entries stay in memory, so the first page, polls, coalescing
+and `latest_level` never touch the disk. Queries past them run on the
+writer's connection, after everything queued.
 
-JSON Lines over SQLite: no new dependency or binary-size cost (ADR-0007),
-appends are cheap, a torn write is one skipped line, and the files are
-readable with `tail`. The size cap bounds the load at open.
+#### Readers in other processes
+
+`logbook::read(dir, query)` opens the database read-only for one query:
+for an app whose UI runs in another process than the engine, or that
+shows the logbook while the engine is stopped. It does not see the
+repeats the writer holds back (at most a minute). A reader in another
+language reads the schema above. Every reader:
+
+- opens the database read-only, keeps the connection short-lived and
+  never leaves a transaction open: readers do not block the writer, but a
+  long read keeps the write-ahead log from being checkpointed, and a
+  connection that writes holds up the writer's commits;
+- has write access to the directory, or to the existing `-wal` and `-shm`
+  files: a read-only connection to a WAL database still writes the
+  shared-memory index;
+- uses one SQLite library per process for this file. Two copies in one
+  process (the one bundled in meow's library and the platform's) do not
+  see each other's POSIX locks, and closing a handle in one drops the
+  other's locks. A process that links meow reads through `logbook::read`;
+- on iOS, does not hold the database open while the app is suspended: an
+  app that holds an SQLite lock in an App Group container at suspension is
+  killed (`0xdead10cc`);
+- on Android, opens with `SQLiteDatabase.OPEN_READONLY` and never changes
+  the journal mode (`enableWriteAheadLogging`, `disableWriteAheadLogging`).
+
+#### SQLite over JSON Lines
+
+The first version kept two JSON Lines segments with compaction. SQLite
+answers what clients ask without loading the file: a page past memory or
+a filtered query reads the rows it returns (about 0.5 ms for a page of
+100, release build), an open does not parse every entry, a fold updates
+its row instead of appending a line that a compaction later drops, and
+every platform an app runs on reads it with its own tools. The cost is
+binary size: the bundled SQLite adds about 1 MiB (x86_64 release). The
+`logbook` Cargo feature carries it, and the `minimal` bundle leaves it
+out, since the aarch64 minimal binary has about 0.5 MiB left under its
+8 MiB hard cap (ADR-0007). Built without the feature, the logbook API
+stays, records nothing, and `GET /logbook` reports `enabled: false`.
 
 ### API
 
@@ -129,8 +210,10 @@ readable with `tail`. The size cap bounds the load at open.
   100, at most 1000. `level` is the lowest level returned; `kind` is a kind
   or its area (`config` matches `config.reload`, not `configs.x`). Page back
   with `before=<id>` of the last entry while `more` is true; poll with
-  `since=<rev>` of the previous page. A bad `level` is a 400. With the
-  logbook off, `enabled` is false and `entries` is empty.
+  `since=<rev>` of the previous page. A bad `level` is a 400; a query
+  that needs the database while it cannot answer is a 503. With the
+  logbook off, or built without the `logbook` feature, `enabled` is false
+  and `entries` is empty.
 - `DELETE /logbook`: deletes every entry, then records `logbook.cleared`.
   Ids keep increasing.
 
@@ -154,7 +237,7 @@ logbook:
 ```
 
 The section is read at start and on every config commit; turning it off
-closes the logbook and keeps its files. `meow -t` never opens it.
+closes the logbook and keeps its database. `meow -t` never opens it.
 
 ### Embedders
 
@@ -163,11 +246,16 @@ resolved home dir, `engine_started(config)` (once the engine is up) and
 `engine_stopped(Stop)` mark the run. Until `apply` runs, config commits do
 not open a logbook, so tests and benches that build an `AppState` never
 write into the real home. `install(dir, options)` opens one at an explicit
-directory.
+directory. `query(query)` and `clear()` serve the API in the engine's
+process; `read(dir, query)` serves other processes (see Storage). An
+embedder that wants the logbook enables `meow-common/logbook`; the `full`
+bundle of `meow` does.
 
 ## Consequences
 
-- One more writer thread and up to 2 MiB under `<home>/logbook/`.
+- One more writer thread, and up to 2 MiB under `<home>/logbook/` plus a
+  write-ahead log of up to 256 KiB while the logbook is open.
+- About 1 MiB of bundled SQLite in `full` builds; none in `minimal`.
 - Producers call `event(...).record()`, which does nothing when no logbook
   is installed: no cost for headless embedders and tests.
 - Messages are English sentences. Clients that localize key off `kind`,
@@ -179,5 +267,6 @@ directory.
 - Dial-stage tracking for `dialer-proxy` chains, so a member that times out
   for the chained server shows up as aggregated failure and stall events
   rather than one entry per connection.
-- Logbook pages in meow-android and meow-ios, which call `apply`,
-  `engine_started` and `engine_stopped` from their FFI.
+- Logbook pages in meow-android and meow-ios, which enable
+  `meow-common/logbook` and call `apply`, `engine_started` and
+  `engine_stopped` from their FFI.

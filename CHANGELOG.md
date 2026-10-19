@@ -18,13 +18,16 @@ the canonical, in-repo source a release is cut from.
   updates and their failures, listeners that did not start, outbound
   interface changes, health-check sweeps that find members of a group going
   down or coming back, and `url-test` / `fallback` groups switching member.
-  Repeats of a failure fold into one entry with a count. Entries are JSON
-  Lines under `<home>/logbook/`, kept for 7 days and 2 MiB, and survive
-  restarts and crashes; the API filters by level, kind and subject, pages
-  back with `before` and polls with `since`. The logbook never records the
-  destinations of user traffic, and records rule edits by index, not rule
-  text. On by default; `logbook:
-  {enable: false}` turns it off. Details and the event kinds are in
+  Repeats of a failure fold into one entry with a count. Entries are kept
+  in an SQLite database, `<home>/logbook/logbook.db`, for 7 days and 2 MiB,
+  and survive restarts and crashes; the API filters by level, kind and
+  subject, pages back with `before` and polls with `since`, and an app's
+  UI in another process can read the database directly. The logbook never
+  records the destinations of user traffic, and records rule edits by
+  index, not rule text. On by default; `logbook: {enable: false}` turns it
+  off. It bundles SQLite (about 1 MiB), so it is in the `full` build and
+  the release binaries but not in `minimal`, where `GET /logbook` reports
+  `enabled: false`. Details, the schema and the event kinds are in
   ADR-0014.
 
 - **`dialer-proxy` groups skip members that cannot reach the chained

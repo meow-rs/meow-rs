@@ -22,7 +22,8 @@ pub(crate) struct LogbookParams {
 
 #[derive(Serialize)]
 struct LogbookResponse {
-    /// `logbook.enable`. Off, nothing is recorded and `entries` is empty.
+    /// `logbook.enable`. Off, or built without the `logbook` feature,
+    /// nothing is recorded and `entries` is empty.
     enabled: bool,
     #[serde(flatten)]
     page: Page,
@@ -44,13 +45,6 @@ pub(crate) async fn get_logbook(Query(params): Query<LogbookParams>) -> Response
                 .into_response();
         }
     };
-    let Some(book) = logbook::current() else {
-        return Json(LogbookResponse {
-            enabled: false,
-            page: Page::default(),
-        })
-        .into_response();
-    };
     let query = logbook::Query {
         limit: params.limit,
         before: params.before,
@@ -59,13 +53,25 @@ pub(crate) async fn get_logbook(Query(params): Query<LogbookParams>) -> Response
         kind: params.kind,
         subject: params.subject,
     };
-    // Paging back past the entries kept in memory reads the files.
-    match tokio::task::spawn_blocking(move || book.query(&query)).await {
-        Ok(page) => Json(LogbookResponse {
+    // Paging back past the entries kept in memory reads the database.
+    match tokio::task::spawn_blocking(move || logbook::query(&query)).await {
+        Ok(Some(Ok(page))) => Json(LogbookResponse {
             enabled: true,
             page,
         })
         .into_response(),
+        Ok(None) => Json(LogbookResponse {
+            enabled: false,
+            page: Page::default(),
+        })
+        .into_response(),
+        // The database cannot answer for now: another process holds its
+        // lock, or the disk fails.
+        Ok(Some(Err(e))) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "message": format!("logbook query failed: {e}") })),
+        )
+            .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "message": format!("logbook query failed: {e}") })),
@@ -77,8 +83,6 @@ pub(crate) async fn get_logbook(Query(params): Query<LogbookParams>) -> Response
 /// `DELETE /logbook`: delete every entry. One `logbook.cleared` entry
 /// remains; entries with a lower `id` are gone.
 pub(crate) async fn clear_logbook() -> StatusCode {
-    if let Some(book) = logbook::current() {
-        let _ = tokio::task::spawn_blocking(move || book.clear()).await;
-    }
+    let _ = tokio::task::spawn_blocking(logbook::clear).await;
     StatusCode::NO_CONTENT
 }

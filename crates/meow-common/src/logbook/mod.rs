@@ -5,7 +5,7 @@
 //! — a config reload, a provider update, members of a group going down, a
 //! run that ended without a clean stop — on disk, so they are still there
 //! after a restart or a crash. Entries are kept for [`RETENTION`] and the
-//! files stay under [`MAX_SIZE`]. A meow extension; mihomo has no
+//! database stays under [`MAX_SIZE`]. A meow extension; mihomo has no
 //! equivalent.
 //!
 //! The logbook records engine and proxy events only, never the
@@ -14,29 +14,33 @@
 //!
 //! # Storage
 //!
-//! `<home>/logbook/` holds two JSON Lines segments, `logbook.jsonl` and the
-//! rotated `logbook.1.jsonl`. Each line is a whole [`Entry`]. An entry that
-//! is updated (a repeat folded into it, see [`Event::coalesce`]) is
-//! appended again with the same `id` and a higher `rev`, at most once a
-//! minute, and on load the line with the highest `rev` wins. When the
-//! current segment is full, both are compacted into the rotated one: each
-//! entry's latest line, the newest that fit, none past the retention. A
-//! torn last line from a killed process is skipped. Lines are written
-//! without fsync: a killed process loses nothing the kernel already has,
-//! and a power cut loses at most the last few seconds. A lock file keeps a
-//! second meow process off the same directory, and a run marker detects a
-//! run that ended without [`engine_stopped`].
+//! `<home>/logbook/logbook.db` is an SQLite database (bundled SQLite, WAL
+//! mode) with one row per [`Entry`]; ADR-0014 documents the schema for
+//! readers in other processes ([`read`]). An entry that is updated (a
+//! repeat folded into it, see [`Event::coalesce`]) is written again in
+//! place, at most once a minute. A committed write survives a killed
+//! process; a power cut loses at most the writes since the last
+//! checkpoint, never the database. A database that cannot be read is set
+//! aside and the logbook starts over. A lock file keeps a second meow
+//! process off the directory, and a run marker detects a run that ended
+//! without [`engine_stopped`].
+//!
+//! Built without the `logbook` feature (the `minimal` bundle), the API
+//! stays and nothing is recorded.
 //!
 //! # Recording
 //!
 //! Producers anywhere in the workspace build an [`event`] and
 //! [`record`](Event::record) it. Recording never waits on the disk: the
-//! line goes to a bounded queue that a writer thread drains, and a full
-//! queue drops the line. With no logbook installed (tests, benches, the
-//! `-t` config check) recording does nothing.
+//! write goes to a bounded queue that a writer thread drains. A write the
+//! full queue refuses stays pending in memory and is tried again within a
+//! minute, and a commit that fails is tried again too. With no logbook
+//! installed (tests, benches, the `-t` config check) recording does
+//! nothing.
 
+#[cfg_attr(not(feature = "logbook"), path = "disabled.rs")]
 mod store;
-#[cfg(test)]
+#[cfg(all(test, feature = "logbook"))]
 mod tests;
 
 use serde::{Deserialize, Serialize};
@@ -46,18 +50,19 @@ use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub use store::{Logbook, Page, Query, DEFAULT_LIMIT, MAX_LIMIT};
+use store::Logbook;
 
 /// How long entries are kept.
 pub const RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
-/// Cap on both segments together, in bytes.
+/// Cap on the database, in bytes. Its write-ahead log adds up to a quarter
+/// MiB while the logbook is open.
 pub const MAX_SIZE: u64 = 2 * 1024 * 1024;
 
 /// Newest entries kept in memory for queries and coalescing. Older pages
-/// are read from disk.
+/// are read from the database.
 pub const RECENT: usize = 256;
 
 /// A repeat folds into the subject's latest entry only while that entry
@@ -83,6 +88,10 @@ pub mod kind {
     pub const ENGINE_UNCLEAN_EXIT: &str = "engine.unclean-exit";
     /// The logbook was cleared. Entries with a lower `id` are gone.
     pub const LOGBOOK_CLEARED: &str = "logbook.cleared";
+    /// The database could not be read and the logbook started over; the
+    /// old file is kept as `logbook.db.corrupt`. Ids start again from 1,
+    /// so a client drops every entry it holds.
+    pub const LOGBOOK_RESET: &str = "logbook.reset";
     /// The config was replaced (`PUT /configs`), or replacing it failed.
     pub const CONFIG_RELOAD: &str = "config.reload";
     /// The config was edited through the API: a subscription added or
@@ -206,9 +215,44 @@ impl Default for Options {
     }
 }
 
+/// Page size without `limit`, and the largest page.
+pub const DEFAULT_LIMIT: usize = 100;
+pub const MAX_LIMIT: usize = 1000;
+
+/// Which entries [`query`] and [`read`] return. All conditions must hold.
+#[derive(Debug, Clone, Default)]
+pub struct Query {
+    /// Page size, [`DEFAULT_LIMIT`] when unset, at most [`MAX_LIMIT`].
+    pub limit: Option<usize>,
+    /// Entries with a lower `id`: page back from the oldest one shown.
+    pub before: Option<u64>,
+    /// Entries written after this `rev`: poll with the last page's `rev`.
+    pub since: Option<u64>,
+    /// The lowest level returned.
+    pub level: Option<Level>,
+    /// A kind, or its area: `config` matches `config.reload`.
+    pub kind: Option<String>,
+    pub subject: Option<String>,
+}
+
+/// One page of entries, newest first.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Page {
+    pub entries: Vec<Entry>,
+    /// The latest `rev`: pass it as `since` to poll for what comes next.
+    pub rev: u64,
+    /// More matching entries exist past this page; page back with
+    /// `before` set to the last entry's `id`.
+    pub more: bool,
+}
+
 /// An event being built. Nothing is recorded until [`Event::record`].
 #[must_use = "an event is recorded only by `record()`"]
 #[derive(Debug, Clone)]
+#[cfg_attr(
+    not(feature = "logbook"),
+    allow(dead_code, reason = "read by the store, which the feature leaves out")
+)]
 pub struct Event {
     kind: &'static str,
     level: Level,
@@ -276,7 +320,7 @@ static CURRENT: RwLock<Option<Arc<Logbook>>> = RwLock::new(None);
 static RUN: Mutex<Option<SystemTime>> = Mutex::new(None);
 
 /// The installed logbook.
-pub fn current() -> Option<Arc<Logbook>> {
+fn current() -> Option<Arc<Logbook>> {
     CURRENT
         .read()
         .unwrap_or_else(PoisonError::into_inner)
@@ -294,10 +338,12 @@ pub fn enabled() -> bool {
 
 /// Install a logbook in `dir`, replacing one installed elsewhere. A
 /// logbook already installed in `dir` is kept. Installed while the engine
-/// runs, it watches the rest of the run for an unclean exit.
-pub fn install(dir: &Path, options: Options) -> io::Result<Arc<Logbook>> {
-    if let Some(book) = current().filter(|book| book.dir() == dir) {
-        return Ok(book);
+/// runs, it watches the rest of the run for an unclean exit. Fails with
+/// [`io::ErrorKind::Unsupported`] when built without the `logbook`
+/// feature.
+pub fn install(dir: &Path, options: Options) -> io::Result<()> {
+    if current().is_some_and(|book| book.dir() == dir) {
+        return Ok(());
     }
     // Opened, and the previous one flushed, outside the lock: recording
     // goes on meanwhile.
@@ -314,7 +360,34 @@ pub fn install(dir: &Path, options: Options) -> io::Result<Arc<Logbook>> {
     if let Some(started) = run {
         book.track_run(started, SystemTime::now());
     }
-    Ok(book)
+    Ok(())
+}
+
+/// Entries of the installed logbook matching `query`, newest first; `None`
+/// when nothing is being recorded. Paging back past the newest
+/// [`RECENT`] reads the database, so call it off the async runtime; that
+/// read fails while the database cannot answer (another process holds its
+/// lock, the disk fails).
+pub fn query(query: &Query) -> Option<io::Result<Page>> {
+    Some(current()?.query(query))
+}
+
+/// Delete every entry of the installed logbook, then record that it was
+/// cleared ([`kind::LOGBOOK_CLEARED`]). Ids keep increasing, so a client
+/// drops whatever it holds below that entry. Waits on the disk.
+pub fn clear() {
+    if let Some(book) = current() {
+        book.clear();
+    }
+}
+
+/// Entries matching `query` from the logbook in `dir`, read by a process
+/// that does not write it: an app's UI while the engine runs in another
+/// process, or after it stopped. Opens the database read-only for this one
+/// read; repeats held back in the writer's memory (at most a minute) are
+/// not seen yet. An empty page when there is no database.
+pub fn read(dir: &Path, query: &Query) -> io::Result<Page> {
+    store::read(dir, query)
 }
 
 /// The level of the latest entry of `kind` for `subject` in the installed
@@ -350,8 +423,14 @@ pub fn apply(enable: bool) {
         return;
     }
     let dir = crate::resolved_home_dir().join(DIR_NAME);
-    if let Err(e) = install(&dir, Options::default()) {
-        tracing::warn!("logbook: cannot open {}: {e}; not recording", dir.display());
+    match install(&dir, Options::default()) {
+        Ok(()) => {}
+        // `logbook.enable` defaults to true, so a `minimal` build would warn
+        // at every start.
+        Err(e) if e.kind() == io::ErrorKind::Unsupported => {
+            tracing::debug!("logbook: {e}; not recording");
+        }
+        Err(e) => tracing::warn!("logbook: cannot open {}: {e}; not recording", dir.display()),
     }
 }
 
@@ -407,6 +486,13 @@ pub fn engine_stopped(stop: Stop<'_>) {
     }
 }
 
+/// `t` rounded down to whole milliseconds, the stored precision.
+fn to_millis(t: SystemTime) -> SystemTime {
+    t.duration_since(UNIX_EPOCH).map_or(UNIX_EPOCH, |since| {
+        UNIX_EPOCH + Duration::new(since.as_secs(), since.subsec_millis() * 1_000_000)
+    })
+}
+
 fn truncate_at_char_boundary(text: &mut String, max: usize) {
     if text.len() <= max {
         return;
@@ -427,7 +513,7 @@ mod rfc3339 {
     use time::OffsetDateTime;
 
     pub fn format(t: SystemTime) -> String {
-        OffsetDateTime::from(super::store::to_millis(t))
+        OffsetDateTime::from(super::to_millis(t))
             .format(&Rfc3339)
             .unwrap_or_else(|_| String::from("1970-01-01T00:00:00Z"))
     }
