@@ -55,7 +55,7 @@ once released, because clients filter, label and translate by kind.
 | `listener.start` | error | listener (`tun` for TUN) | A listener did not start |
 | `network.interface` | info | | The interface outbound sockets bind to (TUN `auto-route: global`) changed, or they no longer bind to one. Recorded for a binding once its TUN listener is up: a reload candidate's binding, installed for the validation's dials, records nothing until then, and nothing at all when the candidate is rejected |
 | `group.switch` | info | group | A `url-test` or `fallback` group routes to another member than after the previous sweep (`from`, `to`; `reason` when `from` went down) |
-| `dialer-proxy.switch` | info | chained outbound | The member of a `dialer-proxy` group carrying the outbound's chains to its server changed (`group`, `from`, `to`; `reason` when `from` is blocked for that server) |
+| `dialer-proxy.switch` | info | chained outbound | The member of a `dialer-proxy` group carrying the outbound's chains to its server changed (`group`, `from`, `to`; `reason` when `from` is blocked for that server, or `down` when a chain probe took over from it while its group had it down) |
 | `dialer-proxy.check` | info / error | chained outbound | A health check of the outbound failed through every member of its `dialer-proxy` group tried (`group`, `reason`, `tried`), or passed again |
 
 Failure reasons in these entries come from a fixed vocabulary

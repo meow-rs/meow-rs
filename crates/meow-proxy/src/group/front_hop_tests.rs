@@ -364,3 +364,104 @@ async fn a_burst_through_the_carrier_counts_against_the_outbound() {
     futures::future::join_all(burst).await;
     assert!(!w.daniel.alive());
 }
+
+/// While the failing member is the front group's last live one, the chained
+/// outbound has no other way out: each failure counts against it, and the
+/// two go down together.
+#[tokio::test]
+async fn a_failing_last_live_front_member_counts_against_the_outbound() {
+    let failing = MockProxy::new_failing("SG-01", AdapterType::Vless, "handshake timed out");
+    failing.set_delay(10);
+    let dead = MockProxy::new("HK-01");
+    dead.set_alive(false);
+    let w = wind_over(vec![
+        Arc::clone(&failing) as Arc<dyn Proxy>,
+        dead as Arc<dyn Proxy>,
+    ]);
+    let metadata = Metadata::default();
+    for _ in 0..DIAL_FAILURE_THRESHOLD {
+        assert!(w.wind.dial_tcp(&metadata).await.is_err());
+    }
+    assert!(!failing.alive());
+    assert!(!w.daniel.alive());
+}
+
+/// `风之谷`'s dial under the deadline the tunnel sets.
+async fn dial_in_time(w: &Wind) -> meow_common::Result<Box<dyn ProxyConn>> {
+    meow_common::with_dial_timeout(w.wind.name(), w.wind.dial_tcp(&Metadata::default())).await
+}
+
+fn timed_out(result: &meow_common::Result<Box<dyn ProxyConn>>) -> bool {
+    matches!(result, Err(MeowError::Io(e)) if e.kind() == io::ErrorKind::TimedOut)
+}
+
+/// A burst of dials that expire at a front member whose dials hang: the
+/// member's own dial times out first, inside `fast`, which counts it; and
+/// `风之谷` keeps `daniel`, whose next dial goes through the next member.
+#[tokio::test(start_paused = true)]
+async fn front_dials_that_hang_past_the_deadline_keep_the_outbound() {
+    use super::test_support::StreamProxy;
+    let hanging = StreamProxy::hanging("SG-01", "10.0.0.1:443");
+    hanging.set_delay(10);
+    let clean = StreamProxy::new("HK-01", "10.0.0.2:443");
+    clean.set_delay(20);
+    let w = wind_over(vec![
+        Arc::clone(&hanging) as Arc<dyn Proxy>,
+        Arc::clone(&clean) as Arc<dyn Proxy>,
+    ]);
+
+    let burst = (0..DIAL_FAILURE_THRESHOLD).map(|_| dial_in_time(&w));
+    let results = futures::future::join_all(burst).await;
+    assert!(results.iter().all(timed_out));
+    assert!(!hanging.alive(), "fast counts the hung dials");
+    assert!(
+        w.daniel.alive(),
+        "风之谷 does not count them against daniel"
+    );
+    assert!(dial_in_time(&w).await.is_ok());
+    assert_eq!(clean.dials(), 1);
+}
+
+/// A burst through a front member that black-holes the server's port: the
+/// chained handshake waits until the deadline drops it, which fails for the
+/// member like EOF before a reply. `风之谷` keeps `daniel`, and `fast`, with
+/// the member blocked for the server, routes the next dial around it.
+#[tokio::test(start_paused = true)]
+async fn a_front_member_that_black_holes_the_server_keeps_the_outbound() {
+    use super::test_support::StreamProxy;
+    let silent = StreamProxy::black_holing("SG-01", "10.0.0.1:443", 8443);
+    silent.set_delay(10);
+    let clean = StreamProxy::new("HK-01", "10.0.0.2:443");
+    clean.set_delay(20);
+    let w = wind_over(vec![
+        Arc::clone(&silent) as Arc<dyn Proxy>,
+        Arc::clone(&clean) as Arc<dyn Proxy>,
+    ]);
+
+    let burst = (0..DIAL_FAILURE_THRESHOLD).map(|_| dial_in_time(&w));
+    let results = futures::future::join_all(burst).await;
+    assert!(results.iter().all(timed_out));
+    assert!(w.daniel.alive());
+    let health = w.fast.chain_health().unwrap();
+    assert!(health.is_blocked(&target(), "SG-01"));
+    assert!(dial_in_time(&w).await.is_ok());
+    assert_eq!(clean.dials(), 1);
+}
+
+/// The same black hole in the member that carried the chains counts
+/// against `daniel`, as a carrier's EOF does.
+#[tokio::test(start_paused = true)]
+async fn a_carrier_that_black_holes_the_server_counts_against_the_outbound() {
+    use super::test_support::StreamProxy;
+    let silent = StreamProxy::black_holing("SG-01", "10.0.0.1:443", 8443);
+    silent.set_delay(10);
+    let w = wind_over(vec![Arc::clone(&silent) as Arc<dyn Proxy>]);
+    w.fast
+        .chain_health()
+        .unwrap()
+        .record_reached(&target(), "SG-01");
+
+    let burst = (0..DIAL_FAILURE_THRESHOLD).map(|_| dial_in_time(&w));
+    futures::future::join_all(burst).await;
+    assert!(!w.daniel.alive());
+}

@@ -134,7 +134,12 @@ impl FallbackGroup {
     }
 
     /// [`Self::first_alive`], or for a `dialer-proxy` front hop the first
-    /// alive member not blocked for its target.
+    /// alive member not blocked for its target. The group's order holds for
+    /// front hops too, so no carrier is passed: a front hop returns to an
+    /// earlier member once it is no longer blocked, and the health check's
+    /// chain probes keep a member that still fails blocked. The carrier the
+    /// table tracks names the member whose failures count against the
+    /// chained outbound (see `front_hop_failed`).
     fn pick_for(
         &self,
         metadata: &Metadata,

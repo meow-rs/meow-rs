@@ -56,23 +56,37 @@ the canonical, in-repo source a release is cut from.
   - A `url-test` group keeps an outbound's chains on the member that last
     carried them, the outbound's carrier, while that member is alive and
     not blocked for its server, instead of following the fastest member
-    to the test URL. They move only when the carrier fails.
+    to the test URL. They move only when the carrier fails, or its group
+    marks it down. A `fallback` group keeps its order: chains return to
+    an earlier member once it is no longer blocked.
   - A chained outbound that fails its health check is checked through up
     to 3 other members of its `dialer-proxy` group (the carrier first,
-    each over a fresh connection) before it is taken for down. When one
-    reaches the server, the outbound stays up, the members that failed
-    are blocked for that server, and the one that reached it carries the
-    chains.
+    each over a fresh connection) before it is taken for down. The member
+    its own probe went through counts as tried, not dialled again. When
+    one reaches the server, the outbound stays up, the members that
+    failed are blocked for that server, and the one that reached it
+    carries the chains.
   - A dial whose front hop fails to connect counts against the front
     group's member, not against the chained outbound in the group dialling
-    it, while the front group has a live member left. So does a chain
-    that closes before any reply through a member that was not yet the
-    outbound's carrier: a burst of such chains strikes the member, not the
-    outbound. A carrier's failure still counts against the outbound, since
-    its server is then the likelier fault.
+    it, while the front group has another live member left. So does a
+    chain that closes before any reply through a member that was not yet
+    the outbound's carrier: a burst of such chains strikes the member, not
+    the outbound. A carrier's failure still counts against the outbound,
+    since its server is then the likelier fault, and so does the failure
+    of the front group's last live member, at once rather than after that
+    member is given up on.
+  - The 5 s dial deadline is judged the same way: a front member whose
+    dial hangs times out inside its own group's dial, which counts it, and
+    a chained handshake left unanswered until the deadline (a member that
+    black-holes the server's port) fails like a chain closed before any
+    reply. Before, an expired dial always counted against the chained
+    outbound.
   - A chain probe round in which no member reaches the server blocks none
     of them: the server is the likelier fault, and its members would
-    otherwise all be blocked when it comes back.
+    otherwise all be blocked when it comes back. A round probes members
+    blocked for the server too, so a passing probe clears a block early;
+    one that fails again stays blocked without its backoff growing each
+    round.
 
 ### Fixed
 

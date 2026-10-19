@@ -195,7 +195,8 @@ async fn run_health_check_loop(inner: Weak<TunnelInner>, spec: HealthCheckSpec) 
 
         if let Some(chain) = group.chain_health() {
             // A block outlives the gap to the next round, which probes
-            // the member again if it is still among the fastest.
+            // the member again if it is among those the round tries: one
+            // that still fails stays blocked, one that passes is cleared.
             probe_chain_targets(&spec, &group, chain, proxies, expected_status, hold).await;
         }
     }

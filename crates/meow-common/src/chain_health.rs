@@ -21,6 +21,9 @@
 //!   in a row block the member.
 //! - **Active**: the health check probes the chain itself, `[member,
 //!   outbound]` to the group's test URL. One failed probe blocks the member.
+//!   A member blocked already is probed again, so a passing probe can clear
+//!   it early; failing again keeps it blocked past the next round, without
+//!   lengthening its backoff.
 //!
 //! Blocks back off exponentially, from [`BASE_BLOCK`] up to [`MAX_BLOCK`].
 //! When a block runs out, the member is on probation: the next dial may use
@@ -33,7 +36,11 @@
 //! member is alive and not blocked, rather than moving them each time the
 //! fastest member to the test URL changes: the chained outbound sits behind
 //! one member that is known to reach its server, and moves only when that
-//! member fails.
+//! member fails. A fallback group keeps its order, so its front hops return
+//! to an earlier member once that member is no longer blocked; its carrier
+//! still names the member whose failures count against the chained
+//! outbound. When the carrier goes down for its group, the next member to
+//! reach the target takes over.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -167,6 +174,20 @@ pub struct CarrierChange {
     pub owner: Option<SmolStr>,
 }
 
+/// How a member reached a target, for [`ChainHealth::reached_at`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    /// A front-hop dial, which the group sent through the member.
+    Dial,
+    /// A chain probe, while the carrier is usable.
+    Probe,
+    /// A chain probe, while the carrier is not a live member any more.
+    OverDownCarrier,
+}
+
+/// [`CarrierChange::reason`] for a carrier its group no longer has alive.
+const CARRIER_DOWN: &str = "down";
+
 /// Failures since the last success. `level` counts blocks in a row: it sets
 /// the next block's length, and a non-zero level puts the member on
 /// probation once the block expires. `reason` describes the last failure.
@@ -292,26 +313,34 @@ impl ChainHealth {
     /// carrier, as the dial chose it; returns the change when it replaced
     /// another member.
     pub fn record_reached(&self, target: &ChainTarget, member: &str) -> Option<CarrierChange> {
-        self.reached_at(target, member, true, Instant::now())
+        self.reached_at(target, member, Reach::Dial, Instant::now())
     }
 
     /// A chain probe to `target` through `member` worked: forget the
     /// member's record. It becomes the carrier only when the target has
-    /// none, or its carrier is blocked: a probe round reaches through
-    /// several members, and the carrier stays while it works.
+    /// none, or its carrier is blocked or, as the caller sees it
+    /// (`carrier_down`), no longer a live member of the group: a probe round
+    /// reaches through several members, and the carrier stays while it
+    /// works.
     pub fn record_probe_reached(
         &self,
         target: &ChainTarget,
         member: &str,
+        carrier_down: bool,
     ) -> Option<CarrierChange> {
-        self.reached_at(target, member, false, Instant::now())
+        let reach = if carrier_down {
+            Reach::OverDownCarrier
+        } else {
+            Reach::Probe
+        };
+        self.reached_at(target, member, reach, Instant::now())
     }
 
     fn reached_at(
         &self,
         target: &ChainTarget,
         member: &str,
-        dialled: bool,
+        reach: Reach,
         now: Instant,
     ) -> Option<CarrierChange> {
         {
@@ -321,7 +350,7 @@ impl ChainHealth {
             let settled = !self.carriers
                 || state.is_some_and(|state| match &state.carrier {
                     Some(carrier) if carrier == member => true,
-                    Some(carrier) => !dialled && !state.is_blocked_at(carrier, now),
+                    Some(carrier) => reach == Reach::Probe && !state.is_blocked_at(carrier, now),
                     None => false,
                 });
             if !known && settled {
@@ -338,7 +367,7 @@ impl ChainHealth {
         if !self.carriers || state.carrier.as_deref() == Some(member) {
             return None;
         }
-        let adopt = dialled
+        let adopt = reach != Reach::Probe
             || state
                 .carrier
                 .as_ref()
@@ -351,7 +380,8 @@ impl ChainHealth {
             .members
             .get(&from)
             .filter(|m| m.blocked_at(now))
-            .map(|m| m.reason);
+            .map(|m| m.reason)
+            .or((reach == Reach::OverDownCarrier).then_some(CARRIER_DOWN));
         Some(CarrierChange {
             from,
             reason,
@@ -361,7 +391,8 @@ impl ChainHealth {
 
     /// The chain to `target` through `member` failed, for `reason`, one of
     /// [`failure_reason`]'s. Returns the block length when this failure
-    /// blocked the member.
+    /// blocked the member; a member blocked already stays so, and gets
+    /// `None`.
     pub fn record_failed(
         &self,
         target: &ChainTarget,
@@ -396,6 +427,13 @@ impl ChainHealth {
         let m = state.members.entry(SmolStr::new(member)).or_default();
         m.reason = reason;
         match verdict {
+            // A probe round tries a blocked member again, so a passing probe
+            // can clear it early. Failing again, it stays blocked past the
+            // next round, at the same level: one block, not one per round.
+            ChainVerdict::Probe { hold } if m.blocked_at(now) => {
+                m.blocked_until = m.blocked_until.max(Some(now + hold));
+                None
+            }
             ChainVerdict::Probe { hold } => Some(m.block(now, hold)),
             ChainVerdict::Passive => {
                 // A dial that slipped through while the member was blocked:
@@ -646,7 +684,7 @@ mod tests {
         let health = ChainHealth::new();
         let t = target();
         assert_eq!(health.record_reached(&t, "HK-01"), None);
-        assert_eq!(health.record_probe_reached(&t, "HK-01"), None);
+        assert_eq!(health.record_probe_reached(&t, "HK-01", false), None);
         assert_eq!(health.carrier(&t), None);
     }
 
@@ -678,13 +716,13 @@ mod tests {
         let health = ChainHealth::tracking_carriers();
         let now = Instant::now();
         let t = target();
-        assert_eq!(health.reached_at(&t, "HK-01", false, now), None);
+        assert_eq!(health.reached_at(&t, "HK-01", Reach::Probe, now), None);
         assert_eq!(
             health.carrier(&t).as_deref(),
             Some("HK-01"),
             "no carrier yet"
         );
-        assert_eq!(health.reached_at(&t, "HK-02", false, now), None);
+        assert_eq!(health.reached_at(&t, "HK-02", Reach::Probe, now), None);
         assert_eq!(
             health.carrier(&t).as_deref(),
             Some("HK-01"),
@@ -692,7 +730,7 @@ mod tests {
         );
 
         health.failed_at(&t, "HK-01", PROBE, "timed out", now);
-        let change = health.reached_at(&t, "HK-02", false, now).unwrap();
+        let change = health.reached_at(&t, "HK-02", Reach::Probe, now).unwrap();
         assert_eq!(
             (change.from.as_str(), change.reason),
             ("HK-01", Some("timed out"))
@@ -701,13 +739,65 @@ mod tests {
     }
 
     #[test]
+    fn a_probe_takes_over_from_a_carrier_that_is_down() {
+        let health = ChainHealth::tracking_carriers();
+        let t = target();
+        health.record_reached(&t, "HK-01");
+        let change = health.record_probe_reached(&t, "HK-02", true).unwrap();
+        assert_eq!(
+            (change.from.as_str(), change.reason),
+            ("HK-01", Some(CARRIER_DOWN))
+        );
+        assert_eq!(
+            health.record_probe_reached(&t, "HK-03", false),
+            None,
+            "the new carrier works"
+        );
+        assert_eq!(health.carrier(&t).as_deref(), Some("HK-02"));
+    }
+
+    #[test]
+    fn a_failed_probe_while_blocked_holds_the_block_at_its_level() {
+        let health = ChainHealth::new();
+        let start = Instant::now();
+        let t = target();
+        // Rounds a minute apart, holding a block for two, as the health
+        // check does.
+        let round = Duration::from_secs(60);
+        let hold = round * 2;
+        let probe = ChainVerdict::Probe { hold };
+        assert_eq!(
+            health.record_failed_at(&t, "HK-01", probe, start),
+            Some(BASE_BLOCK)
+        );
+        // Still blocked at each round: no new block, and the backoff level
+        // stays where it was.
+        let mut now = start;
+        for _ in 0..10 {
+            now += round;
+            assert_eq!(health.record_failed_at(&t, "HK-01", probe, now), None);
+        }
+        assert!(
+            health.is_blocked_at(&t, "HK-01", now + hold - Duration::from_secs(1)),
+            "each failure holds it past the next round"
+        );
+        let now = now + hold;
+        assert!(!health.is_blocked_at(&t, "HK-01", now));
+        assert_eq!(
+            health.record_failed_at(&t, "HK-01", probe, now),
+            Some(BASE_BLOCK * 2),
+            "one level up, once the block ran out"
+        );
+    }
+
+    #[test]
     fn a_carrier_change_names_the_reason_only_while_blocked() {
         let health = ChainHealth::tracking_carriers();
         let now = Instant::now();
         let t = target();
-        health.reached_at(&t, "HK-01", true, now);
+        health.reached_at(&t, "HK-01", Reach::Dial, now);
         health.failed_at(&t, "HK-01", ChainVerdict::Passive, "closed", now);
-        let change = health.reached_at(&t, "HK-02", true, now).unwrap();
+        let change = health.reached_at(&t, "HK-02", Reach::Dial, now).unwrap();
         assert_eq!(change.reason, None, "one strike does not block");
     }
 

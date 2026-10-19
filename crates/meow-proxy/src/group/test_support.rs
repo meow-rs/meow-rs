@@ -236,32 +236,55 @@ pub struct StreamProxy {
     name: String,
     addr: String,
     health: ProxyHealth,
-    audits: Option<u16>,
+    serves: Serves,
     relays: bool,
     pub dial_count: AtomicUsize,
 }
 
+/// What a [`StreamProxy`]'s server does with a stream.
+#[derive(Clone, Copy)]
+enum Serves {
+    Everything,
+    /// Closes streams to the port after their first request.
+    ClosesPort(u16),
+    /// Reads streams to the port and never answers.
+    SilencesPort(u16),
+    /// No stream: the dial never completes.
+    Nothing,
+}
+
 impl StreamProxy {
     pub fn new(name: &str, addr: &str) -> Arc<Self> {
-        Self::build(name, addr, None, true)
+        Self::build(name, addr, Serves::Everything, true)
     }
 
     /// Member that closes every stream to `port` after its first request.
     pub fn auditing(name: &str, addr: &str, port: u16) -> Arc<Self> {
-        Self::build(name, addr, Some(port), true)
+        Self::build(name, addr, Serves::ClosesPort(port), true)
+    }
+
+    /// Member that black-holes `port`: it takes every stream there and
+    /// never answers.
+    pub fn black_holing(name: &str, addr: &str, port: u16) -> Arc<Self> {
+        Self::build(name, addr, Serves::SilencesPort(port), true)
+    }
+
+    /// Member whose dials hang.
+    pub fn hanging(name: &str, addr: &str) -> Arc<Self> {
+        Self::build(name, addr, Serves::Nothing, true)
     }
 
     /// Outbound whose `connect_over` is unsupported, like hysteria2.
     pub fn without_relay(name: &str, addr: &str) -> Arc<Self> {
-        Self::build(name, addr, None, false)
+        Self::build(name, addr, Serves::Everything, false)
     }
 
-    fn build(name: &str, addr: &str, audits: Option<u16>, relays: bool) -> Arc<Self> {
+    fn build(name: &str, addr: &str, serves: Serves, relays: bool) -> Arc<Self> {
         Arc::new(Self {
             name: name.to_string(),
             addr: addr.to_string(),
             health: ProxyHealth::new(),
-            audits,
+            serves,
             relays,
             dial_count: AtomicUsize::new(0),
         })
@@ -294,11 +317,21 @@ impl ProxyAdapter for StreamProxy {
     async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         self.dial_count.fetch_add(1, Ordering::Relaxed);
-        let audited = self.audits == Some(metadata.dst_port);
+        let port = metadata.dst_port;
+        let (closes, silences) = match self.serves {
+            Serves::Everything => (false, false),
+            Serves::ClosesPort(audited) => (port == audited, false),
+            Serves::SilencesPort(audited) => (false, port == audited),
+            Serves::Nothing => return std::future::pending().await,
+        };
         let (client, mut server) = tokio::io::duplex(4096);
         tokio::spawn(async move {
             let mut buf = [0u8; 1024];
-            if !matches!(server.read(&mut buf).await, Ok(n) if n > 0) || audited {
+            if !matches!(server.read(&mut buf).await, Ok(n) if n > 0) || closes {
+                return;
+            }
+            if silences {
+                while matches!(server.read(&mut buf).await, Ok(n) if n > 0) {}
                 return;
             }
             if server.write_all(REPLY).await.is_err() {

@@ -985,9 +985,10 @@ impl NamedProxyDialer {
     }
 
     /// A front hop through an automatic group that failed while the group
-    /// still has a live member is the group's failure, not the outbound's;
-    /// see [`crate::group::front_hop_failed`]. A single front, or a
-    /// group with nothing left alive, is the outbound's only way out.
+    /// still has a live member besides the one it took is the group's
+    /// failure, not the outbound's; see [`crate::group::front_hop_failed`].
+    /// A single front, or a group with nothing else left alive, is the
+    /// outbound's only way out.
     fn judge_front<T>(&self, result: &io::Result<T>) {
         if result.is_err()
             && self
@@ -1000,14 +1001,19 @@ impl NamedProxyDialer {
     }
 }
 
-/// Whether `front` is an automatic group with a live member. Not the
-/// group's own `alive()`: a url-test group answers for its last pick until
-/// it picks again, and that pick may be the member that just failed.
+/// Whether `front` is an automatic group with a live member other than the
+/// one the failed dial took: the member stays alive until the group's
+/// failure tracker gives up on it, and while it is the only one left, the
+/// outbound has no other way out. Not the group's own `alive()`: a url-test
+/// group answers for its last pick until it picks again, and that pick may
+/// be the member that just failed.
 fn has_live_member(front: &Arc<dyn Proxy>) -> bool {
     front.chain_health().is_some()
-        && front
-            .member_proxies()
-            .is_some_and(|members| members.iter().any(|m| m.alive()))
+        && front.member_proxies().is_some_and(|members| {
+            members
+                .iter()
+                .any(|m| m.alive() && !crate::group::last_pick_is(m.name()))
+        })
 }
 
 tokio::task_local! {
