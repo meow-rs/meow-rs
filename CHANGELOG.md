@@ -23,7 +23,11 @@ the canonical, in-repo source a release is cut from.
   a tentative address cannot send packets, so DNS and traffic right after
   startup or a configuration reload could fail. meow now turns that check
   off on its own adapter and creates the addresses ready to use, replacing
-  any an adapter reopened after an unclean shutdown still carries.
+  the stale ones an adapter reopened after an unclean shutdown still
+  carries — of both families, IPv6 included, and even when no IPv6 address
+  is configured. An address another adapter still holds fails the attempt
+  loudly instead of leaving the device half-configured, and is retried on
+  a different one of both families.
 
 - **UDP traffic counts toward the totals**: only TCP relays added to the
   upload and download totals, so `/traffic`, the `/connections` totals and

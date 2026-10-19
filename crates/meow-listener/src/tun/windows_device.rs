@@ -477,39 +477,167 @@ fn is_link_local(ip: IpAddr) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::net::Ipv4Addr;
+    use std::time::Duration;
+
     use windows_sys::Win32::Networking::WinSock::NL_DAD_STATE;
 
+    use super::*;
+
     /// `(address, prefix, DAD state)` of each address of `family` on
-    /// interface `index`, IPv6 link-local ones aside.
+    /// interface `index`, link-local ones aside — the IPv6 `fe80::/10`
+    /// range and the IPv4 APIPA range alike, either of which the OS may
+    /// add on its own and none of the assertions here has a stake in.
     fn addresses(index: u32, family: ADDRESS_FAMILY) -> Vec<(IpAddr, u8, NL_DAD_STATE)> {
         interface_addresses(index, family)
             .expect("read the address table")
             .iter()
             .filter_map(|row| Some((row_ip(row)?, row.OnLinkPrefixLength, row.DadState)))
-            .filter(|&(ip, ..)| !is_link_local(ip))
+            .filter(|&(ip, ..)| match ip {
+                IpAddr::V4(v4) => !v4.is_link_local(),
+                IpAddr::V6(v6) => !v6.is_unicast_link_local(),
+            })
             .collect()
     }
 
+    /// The interface carries each of `expected` with its configured
+    /// prefix, as Preferred. Presence-shaped, not an exact set: an
+    /// address the OS adds on its own is none of these assertions'
+    /// business, while a stale one that survived the replacement still
+    /// shows up as a missing expectation.
+    fn assert_preferred(index: u32, family: ADDRESS_FAMILY, expected: &[(IpAddr, u8)]) {
+        let carried = addresses(index, family);
+        for (ip, prefix) in expected {
+            assert!(
+                carried.contains(&(*ip, *prefix, IpDadStatePreferred)),
+                "interface {index} does not carry {ip}/{prefix} as Preferred; it has {carried:?}"
+            );
+        }
+    }
+
+    /// The interface no longer carries any of `gone`.
+    fn assert_gone(index: u32, family: ADDRESS_FAMILY, gone: &[IpAddr]) {
+        let carried = addresses(index, family);
+        for ip in gone {
+            assert!(
+                !carried.iter().any(|(addr, ..)| addr == ip),
+                "interface {index} still carries {ip}; it has {carried:?}"
+            );
+        }
+    }
+
+    /// The OS error code of `err` — wherever along the `source` chain it
+    /// ended up. `step_error` wraps the original error, so the top-level
+    /// `raw_os_error` is `None` and the code has to be picked out of the
+    /// chain instead of out of the Display text, which the OS localizes.
+    fn raw_os_error_of(err: &io::Error) -> Option<i32> {
+        let mut current: &(dyn std::error::Error + 'static) = err;
+        loop {
+            if let Some(code) = current
+                .downcast_ref::<io::Error>()
+                .and_then(io::Error::raw_os_error)
+            {
+                return Some(code);
+            }
+            current = current.source()?;
+        }
+    }
+
     #[test]
-    #[ignore = "creates a Wintun adapter, which needs Administrator; the windows CI job runs it"]
+    fn wrapped_step_error_keeps_the_os_code_reachable() {
+        let raw = io::Error::from_raw_os_error(ERROR_OBJECT_ALREADY_EXISTS as i32);
+        let wrapped = step_error("failed to assign 198.18.250.1/30".to_string(), 7, raw);
+        assert_eq!(wrapped.raw_os_error(), None);
+        assert_eq!(
+            raw_os_error_of(&wrapped),
+            Some(ERROR_OBJECT_ALREADY_EXISTS as i32)
+        );
+    }
+
+    #[test]
+    fn adapter_exists_matches_the_whole_friendly_name_only() {
+        // A hand-built `GetAdaptersAddresses` list — two entries linked
+        // through `Next`, the way the API builds it — exercising the
+        // adapter probe the listener warns with, without needing a real
+        // adapter. The backing store is u64-aligned, like the API's own
+        // allocation, so the struct written into it stays aligned.
+        let mut names: Vec<Vec<u16>> = ["meow-addr-test", "meow-addr-test-2"]
+            .iter()
+            .map(|name| name.encode_utf16().chain(Some(0)).collect())
+            .collect();
+        let entry_size = std::mem::size_of::<IP_ADAPTER_ADDRESSES_LH>();
+        let words = 2 * entry_size.div_ceil(std::mem::size_of::<u64>()) + 4;
+        let mut store: Vec<u64> = vec![0; words];
+        let buf_len = store.len() * std::mem::size_of::<u64>();
+        let buf = unsafe {
+            let first = store.as_mut_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>();
+            // SAFETY: the store is sized for two entries.
+            let second = first.byte_add(entry_size);
+            // SAFETY: both entries live inside the store, which outlives
+            // this function, and the name buffers outlive the assertions
+            // that read them.
+            (*first).Next = second;
+            (*first).FriendlyName = names[0].as_mut_ptr();
+            (*second).FriendlyName = names[1].as_mut_ptr();
+            // SAFETY: the store is fully initialised.
+            std::slice::from_raw_parts(store.as_ptr().cast::<u8>(), buf_len)
+        };
+        assert!(table_has_adapter(buf, "meow-addr-test"));
+        assert!(table_has_adapter(buf, "meow-addr-test-2"));
+        // The whole friendly name has to match — a prefix or a
+        // superstring of one entry's name must not hit.
+        assert!(!table_has_adapter(buf, "meow-addr-tes"));
+        assert!(!table_has_adapter(buf, "meow-addr-test-22"));
+    }
+
+    /// A test adapter's name: the listener's own naming scheme
+    /// (`device_name_for_attempt`, `tun/mod.rs`) over a per-process
+    /// base, so a leftover from a killed run — Wintun removes an adapter
+    /// it created only on a clean close — can never be reopened and
+    /// reconfigured by mistake.
+    fn adapter_name(tag: &str) -> String {
+        let base = format!("meow-addr-test-{tag}-{}", std::process::id());
+        crate::tun::device_name_for_attempt(Some(&base), 0).unwrap()
+    }
+
+    /// An adapter built the way the listener's `spawn_blocking` closure
+    /// builds one (`tun/mod.rs`): the configured mtu, the pinned
+    /// `wintun.dll`, logging on — and no addresses, which on Windows the
+    /// listener assigns itself through [`configure_addresses`]
+    /// (`build_async` wraps the same blocking setup; this stays
+    /// synchronous).
+    fn listener_adapter(dll: &str, name: &str) -> tun_rs::SyncDevice {
+        tun_rs::DeviceBuilder::new()
+            .mtu(1500)
+            .name(name)
+            .wintun_file(dll.to_string())
+            .wintun_log(true)
+            .build_sync()
+            .expect("create a Wintun adapter the way the listener does")
+    }
+
+    #[test]
+    #[ignore = "creates a real Wintun adapter: needs Administrator, the wintun.dll sidecar (or the copy embedded in the binary), and the Wintun driver; the windows CI job runs it"]
     fn addresses_are_preferred_and_replace_stale_ones() {
         let dll = super::super::wintun::resolve_wintun_dll().expect("locate wintun.dll");
         let dll = dll.to_string_lossy();
-        let create = |name: &str| {
-            tun_rs::DeviceBuilder::new()
-                .name(name)
-                .wintun_file(dll.to_string())
-                .build_sync()
-                .expect("create a Wintun adapter")
-        };
-        let device = create("meow-addr-test");
+        let name = adapter_name("preferred");
+        assert!(
+            !adapter_exists(&name).expect("probe the adapter table"),
+            "no adapter called '{name}' should exist yet"
+        );
+        let device = listener_adapter(&dll, &name);
+        assert!(
+            adapter_exists(&name).expect("probe the adapter table"),
+            "the adapter just created should be findable by its friendly name"
+        );
         let index = device.if_index().expect("adapter index");
         let v4: Ipv4Net = "198.18.250.1/30".parse().unwrap();
         let v6: Ipv6Net = "fdfe:dcba:9876::1/126".parse().unwrap();
 
-        // The address the tun-rs builder path assigns: what an adapter
-        // reopened after an unclean shutdown still carries.
+        // The address the tun-rs builder path assigns (its
+        // `set_network_address`): what an adapter reopened after an
+        // unclean shutdown still carries.
         device
             .set_network_address(v4.addr(), v4.prefix_len(), None)
             .expect("assign through tun-rs");
@@ -518,29 +646,149 @@ mod tests {
             addresses(index, AF_INET)
         );
 
-        configure_addresses(index, v4, Some(v6)).expect("configure over the stale address");
-        assert_eq!(
-            addresses(index, AF_INET),
-            [(IpAddr::V4(v4.addr()), 30, IpDadStatePreferred)]
-        );
-        assert_eq!(
-            addresses(index, AF_INET6),
-            [(IpAddr::V6(v6.addr()), 126, IpDadStatePreferred)]
-        );
+        // The listener's own call shape (tun/mod.rs).
+        configure_addresses(
+            index,
+            Ipv4Net::new_assert(v4.addr(), v4.prefix_len()),
+            Some(v6),
+        )
+        .expect("configure over the stale address");
+        assert_preferred(index, AF_INET, &[(IpAddr::V4(v4.addr()), v4.prefix_len())]);
+        assert_preferred(index, AF_INET6, &[(IpAddr::V6(v6.addr()), v6.prefix_len())]);
 
         // Reopened with a changed address, the adapter drops the old one.
         let changed: Ipv4Net = "198.18.250.5/30".parse().unwrap();
         configure_addresses(index, changed, Some(v6)).expect("configure a changed address");
+        assert_preferred(
+            index,
+            AF_INET,
+            &[(IpAddr::V4(changed.addr()), changed.prefix_len())],
+        );
+        assert_gone(index, AF_INET, &[IpAddr::V4(v4.addr())]);
+
+        // DAD is off, not merely optimistic: the setting reads back as
+        // zero, and the addresses survive — Preferred — past the time
+        // the OS's duplicate-address detection would have run.
         assert_eq!(
-            addresses(index, AF_INET),
-            [(IpAddr::V4(changed.addr()), 30, IpDadStatePreferred)]
+            set_dad_transmits(index, AF_INET, 0).expect("read DadTransmits back"),
+            0
+        );
+        assert_eq!(
+            set_dad_transmits(index, AF_INET6, 0).expect("read DadTransmits back"),
+            0
+        );
+        std::thread::sleep(Duration::from_millis(3500));
+        assert_preferred(
+            index,
+            AF_INET,
+            &[(IpAddr::V4(changed.addr()), changed.prefix_len())],
+        );
+        assert_preferred(index, AF_INET6, &[(IpAddr::V6(v6.addr()), v6.prefix_len())]);
+    }
+
+    #[test]
+    #[ignore = "creates a real Wintun adapter: needs Administrator, the wintun.dll sidecar (or the copy embedded in the binary), and the Wintun driver; the windows CI job runs it"]
+    fn inet6_none_replaces_stale_addresses_of_both_families() {
+        let dll = super::super::wintun::resolve_wintun_dll().expect("locate wintun.dll");
+        let dll = dll.to_string_lossy();
+        let name = adapter_name("no-inet6");
+        let device = listener_adapter(&dll, &name);
+        let index = device.if_index().expect("adapter index");
+        let v4: Ipv4Net = "198.18.250.9/30".parse().unwrap();
+        let v6: Ipv6Net = "fdfe:dcba:9876::9/126".parse().unwrap();
+
+        // A previous run with inet6 configured left both families behind.
+        configure_addresses(
+            index,
+            Ipv4Net::new_assert(v4.addr(), v4.prefix_len()),
+            Some(v6),
+        )
+        .expect("configure with an inet6 address");
+        assert_preferred(index, AF_INET, &[(IpAddr::V4(v4.addr()), v4.prefix_len())]);
+        assert_preferred(index, AF_INET6, &[(IpAddr::V6(v6.addr()), v6.prefix_len())]);
+
+        // Reopened with inet6 dropped from the config: the stale IPv6
+        // address goes the way of the stale IPv4 one — the adapter ends
+        // up with exactly what the config says.
+        let changed: Ipv4Net = "198.18.250.13/30".parse().unwrap();
+        configure_addresses(index, changed, None).expect("configure without inet6");
+        assert_preferred(
+            index,
+            AF_INET,
+            &[(IpAddr::V4(changed.addr()), changed.prefix_len())],
+        );
+        assert_gone(index, AF_INET, &[IpAddr::V4(v4.addr())]);
+        assert_gone(index, AF_INET6, &[IpAddr::V6(v6.addr())]);
+        assert!(
+            addresses(index, AF_INET6).is_empty(),
+            "without inet6 configured the adapter should carry no IPv6 address; it has {:?}",
+            addresses(index, AF_INET6)
+        );
+    }
+
+    #[test]
+    #[ignore = "creates a real Wintun adapter: needs Administrator, the wintun.dll sidecar (or the copy embedded in the binary), and the Wintun driver; the windows CI job runs it"]
+    fn conflicted_address_fails_and_rolls_the_adapter_back() {
+        let dll = super::super::wintun::resolve_wintun_dll().expect("locate wintun.dll");
+        let dll = dll.to_string_lossy();
+        let device = listener_adapter(&dll, &adapter_name("conflict-a"));
+        let other = listener_adapter(&dll, &adapter_name("conflict-b"));
+        let index = device.if_index().expect("adapter index");
+        let other_index = other.if_index().expect("adapter index");
+        let owned: Ipv4Net = "198.18.250.17/30".parse().unwrap();
+        let taken: Ipv4Net = "198.18.250.21/30".parse().unwrap();
+
+        // What each adapter carries before the conflict: the state a
+        // failed attempt has to leave the reconfigured one in.
+        configure_addresses(
+            index,
+            Ipv4Net::new_assert(owned.addr(), owned.prefix_len()),
+            None,
+        )
+        .expect("configure the first adapter");
+        configure_addresses(
+            other_index,
+            Ipv4Net::new_assert(taken.addr(), taken.prefix_len()),
+            None,
+        )
+        .expect("configure the second adapter");
+
+        // `taken` still belongs to the second adapter: the add fails,
+        // the conflict stays tellable apart along the source chain, and
+        // the failed attempt leaves the first adapter as it was found.
+        let err = configure_addresses(index, taken, None)
+            .expect_err("the address belongs to the other adapter");
+        assert_eq!(
+            raw_os_error_of(&err),
+            Some(ERROR_OBJECT_ALREADY_EXISTS as i32),
+            "{err}"
+        );
+        assert_gone(index, AF_INET, &[IpAddr::V4(taken.addr())]);
+        assert_preferred(
+            index,
+            AF_INET,
+            &[(IpAddr::V4(owned.addr()), owned.prefix_len())],
+        );
+        assert_preferred(
+            other_index,
+            AF_INET,
+            &[(IpAddr::V4(taken.addr()), taken.prefix_len())],
         );
 
-        // An address another adapter holds stays an error for the retry
-        // loop to rotate past.
-        let other = create("meow-addr-test-2");
-        let err = configure_addresses(other.if_index().expect("adapter index"), changed, None)
-            .expect_err("the address belongs to the first adapter");
-        assert!(err.to_string().contains("os error 5010"), "{err}");
+        // The retry loop's answer to a conflict (`tun/mod.rs`): from the
+        // third attempt a different address — IPv4 steps 4 addresses up
+        // from the configured one — on a fresh adapter name. Here the
+        // first adapter takes the rotated one and comes up.
+        let rotated = Ipv4Net::new_assert(
+            Ipv4Addr::from(u32::from(taken.addr()) + 4),
+            taken.prefix_len(),
+        );
+        configure_addresses(index, rotated, None).expect("configure the rotated address");
+        assert_preferred(
+            index,
+            AF_INET,
+            &[(IpAddr::V4(rotated.addr()), rotated.prefix_len())],
+        );
+        assert_gone(index, AF_INET, &[IpAddr::V4(owned.addr())]);
     }
 }
