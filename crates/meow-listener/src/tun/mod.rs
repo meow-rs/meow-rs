@@ -426,6 +426,10 @@ impl TunListener {
         let mut device: Option<tun_rs::AsyncDevice> = None;
         let mut dev_name = String::new();
         let mut used_addr = base_addr;
+        // The IPv6 address the device actually carries: attempt >= 2
+        // rotates it inside the configured subnet, so the startup log
+        // records the rotated value, not just the configured one.
+        let mut used_addr6 = cfg.inet6_address.map(|net| net.addr());
         let mut last_err: Option<String>;
         let mut if_index: Option<u32> = None;
 
@@ -520,6 +524,7 @@ impl TunListener {
                         .name()
                         .unwrap_or_else(|_| name.clone().unwrap_or_default());
                     used_addr = addr;
+                    used_addr6 = inet6.map(|net| net.addr());
                     device = Some(d);
                     if_index = Some(idx);
                     break;
@@ -789,9 +794,10 @@ impl TunListener {
             self.name,
             used_addr,
             prefix,
-            cfg.inet6_address
-                .map(|v6| format!(" + {v6}"))
-                .unwrap_or_default(),
+            match (used_addr6, cfg.inet6_address) {
+                (Some(addr), Some(net)) => format!(" + {addr}/{}", net.prefix_len()),
+                _ => String::new(),
+            },
             cfg.mtu,
             cfg.auto_route,
             cfg.dns_hijack,
@@ -1023,10 +1029,16 @@ fn rotate_v6(net: Ipv6Net, attempt: u32) -> Ipv6Net {
         return net;
     }
     let bits = u128::from(net.addr());
-    let host_mask = (1u128 << host_bits) - 1;
-    // A wrap back to the configured address is possible in a tiny subnet;
-    // the retry still moves to a fresh adapter name.
-    let host = ((bits + u128::from(attempt - 1)) & host_mask).max(1);
+    // `u128::MAX >> prefix` keeps the shift under 128 here (the early
+    // return took care of /127 and /128) and gives the right mask for a
+    // /0 config too.
+    let host_mask = u128::MAX >> u32::from(net.prefix_len());
+    // The host part steps through 1..=host_mask without repeating: the
+    // all-zero identifier stays skipped, and a base address sitting on
+    // the subnet's top host still moves to a fresh address per attempt.
+    // A tiny subnet can cycle back onto the configured address; the
+    // retry still moves to a fresh adapter name.
+    let host = (bits & host_mask).wrapping_add(u128::from(attempt - 2)) % host_mask + 1;
     Ipv6Net::new_assert(
         std::net::Ipv6Addr::from((bits & !host_mask) | host),
         net.prefix_len(),

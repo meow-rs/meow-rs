@@ -494,17 +494,24 @@ jobs:
       # Creates real Wintun adapters, which needs Administrator (the
       # hosted runner has it), so the tests are `#[ignore]`d for local
       # runs: the addresses must come up Preferred, not tentative, and
-      # replace the ones a reopened adapter still carries. Each test is
-      # named exactly, so a rename shows up here as "no tests run"
-      # (--no-tests=fail) instead of a module-path substring silently
-      # matching nothing — or accidentally picking up a new test.
+      # replace the ones a reopened adapter still carries. Each test runs
+      # in its own nextest invocation named exactly — a rename of any one
+      # of them fails that leg with "no tests run" (--no-tests=fail)
+      # instead of a module-path substring silently matching nothing — or
+      # an OR'd filter still running the survivors and staying green.
       - name: Wintun address setup (privileged)
         run: >-
           cargo nextest run -p meow-listener --features listener-tun --lib
           --run-ignored only --no-capture --retries 2 --no-tests=fail
-          -E "test(=tun::windows_device::tests::addresses_are_preferred_and_replace_stale_ones)
-          | test(=tun::windows_device::tests::inet6_none_replaces_stale_addresses_of_both_families)
-          | test(=tun::windows_device::tests::conflicted_address_fails_and_rolls_the_adapter_back)"
+          -E "test(=tun::windows_device::tests::addresses_are_preferred_and_replace_stale_ones)"
+
+          cargo nextest run -p meow-listener --features listener-tun --lib
+          --run-ignored only --no-capture --retries 2 --no-tests=fail
+          -E "test(=tun::windows_device::tests::inet6_none_replaces_stale_addresses_of_both_families)"
+
+          cargo nextest run -p meow-listener --features listener-tun --lib
+          --run-ignored only --no-capture --retries 2 --no-tests=fail
+          -E "test(=tun::windows_device::tests::conflicted_address_fails_and_leaves_the_adapter_as_found)"
 
   macos:
     runs-on: macos-latest

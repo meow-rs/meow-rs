@@ -152,22 +152,31 @@ struct FamilyUndo {
     /// The `DadTransmits` the interface had, when the run turned DAD
     /// off for it.
     old_transmits: Option<u32>,
-    /// The address the run added, when the add made it in; it stays.
+    /// The address the run added, when the add made it in; the rollback
+    /// removes it again.
     added: Option<IpAddr>,
 }
 
-/// Best-effort rollback after a failure: write the addresses and the DAD
-/// settings a failed run replaced back, so an adapter the run merely
-/// opened is left as it was found — the address the run managed to add
-/// stays (it is the run's own, Preferred and usable). Restore failures
-/// are logged, not fatal: the caller is already on a failure path.
+/// Best-effort rollback after a failure: remove the address the run
+/// managed to add and write the addresses and the DAD settings it
+/// replaced back, so an adapter the run merely opened is left as it
+/// was found — a leftover `added` would otherwise keep colliding with
+/// the next attempt's own adapter (`ERROR_OBJECT_ALREADY_EXISTS`
+/// crosses adapters). Restore failures are logged, not fatal: the
+/// caller is already on a failure path.
 fn rollback(index: u32, undo: &[FamilyUndo]) {
     for entry in undo {
+        // The run's own add goes first: it can share the IP of a
+        // `previous` row (a different prefix makes it a distinct
+        // entry), so deleting it first lets the restored row come back
+        // with its old prefix instead of colliding with the survivor.
+        if let Some(ip) = entry.added {
+            if let Err(e) = delete_added(index, ip) {
+                warn!("failed to remove the added {ip} on interface {index}: {e}");
+            }
+        }
         for row in &entry.previous {
             let Some(ip) = row_ip(row) else { continue };
-            if Some(ip) == entry.added {
-                continue;
-            }
             if let Err(e) = restore_row(row) {
                 if e.raw_os_error() != Some(ERROR_OBJECT_ALREADY_EXISTS as i32) {
                     warn!("failed to restore {ip} on interface {index}: {e}");
@@ -235,6 +244,35 @@ fn delete_row(row: &MIB_UNICASTIPADDRESS_ROW) -> io::Result<()> {
     Ok(())
 }
 
+/// Delete the address `ip` this run added to interface `index`. Unlike
+/// [`delete_row`], which replays a row IP Helper returned, the row is
+/// fabricated here — the delete keys on (interface, address) alone.
+fn delete_added(index: u32, ip: IpAddr) -> io::Result<()> {
+    let mut row = MIB_UNICASTIPADDRESS_ROW::default();
+    // SAFETY: `row` is a valid, exclusively borrowed row; the call sets
+    // every field to its documented default.
+    unsafe { InitializeUnicastIpAddressEntry(&raw mut row) };
+    row.InterfaceIndex = index;
+    match ip {
+        IpAddr::V4(ip) => {
+            row.Address.Ipv4.sin_family = AF_INET;
+            row.Address.Ipv4.sin_addr.S_un.S_addr = u32::from_ne_bytes(ip.octets());
+        }
+        IpAddr::V6(ip) => {
+            row.Address.Ipv6.sin6_family = AF_INET6;
+            row.Address.Ipv6.sin6_addr.u.Byte = ip.octets();
+        }
+    }
+    // SAFETY: `row` carries the members the delete keys on — `Address`
+    // and `InterfaceIndex` — both set above. As in `delete_row`, a
+    // not-found result already is the end state wanted here.
+    let result = unsafe { DeleteUnicastIpAddressEntry(&raw const row) };
+    if result != ERROR_NOT_FOUND {
+        check(result)?;
+    }
+    Ok(())
+}
+
 fn add_address(index: u32, network: IpNet) -> io::Result<()> {
     let mut row = MIB_UNICASTIPADDRESS_ROW::default();
     // SAFETY: `row` is a valid, exclusively borrowed row; the call sets
@@ -263,7 +301,11 @@ fn add_address(index: u32, network: IpNet) -> io::Result<()> {
 /// Re-create an address the failed run deleted, from the row IP Helper
 /// returned. Best effort, on the rollback path only: DAD is still off
 /// (or was, for a family whose run went no further than a disabled DAD),
-/// so the address returns as Preferred instead of tentative.
+/// so the address returns as Preferred instead of tentative. The
+/// snapshot's lifetimes and `SkipAsSource` come back with it, so the
+/// restored row matches what was found; `PrefixOrigin`/`SuffixOrigin`
+/// are output-only members and keep the defaults the initialize call
+/// wrote.
 fn restore_row(row: &MIB_UNICASTIPADDRESS_ROW) -> io::Result<()> {
     let mut fresh = MIB_UNICASTIPADDRESS_ROW::default();
     // SAFETY: `fresh` is a valid, exclusively borrowed row; the call
@@ -273,8 +315,9 @@ fn restore_row(row: &MIB_UNICASTIPADDRESS_ROW) -> io::Result<()> {
     fresh.InterfaceIndex = row.InterfaceIndex;
     fresh.OnLinkPrefixLength = row.OnLinkPrefixLength;
     fresh.DadState = IpDadStatePreferred;
-    fresh.ValidLifetime = u32::MAX;
-    fresh.PreferredLifetime = u32::MAX;
+    fresh.ValidLifetime = row.ValidLifetime;
+    fresh.PreferredLifetime = row.PreferredLifetime;
+    fresh.SkipAsSource = row.SkipAsSource;
     // SAFETY: `fresh` is fully initialised above.
     check(unsafe { CreateUnicastIpAddressEntry(&raw const fresh) })
 }
@@ -297,13 +340,16 @@ pub(super) fn adapter_exists(name: &str) -> io::Result<bool> {
         | GAA_FLAG_SKIP_DNS_SERVER
         | GAA_FLAG_INCLUDE_ALL_INTERFACES;
     // The buffer size the API docs recommend starting at; the loop grows
-    // it while the API reports `ERROR_BUFFER_OVERFLOW`.
+    // it while the API reports `ERROR_BUFFER_OVERFLOW`. A u64 store keeps
+    // the `IP_ADAPTER_ADDRESSES_LH` list the call writes into it 8-aligned,
+    // like the API's own allocation — the struct carries u64 members.
     let mut size: u32 = 15000;
-    let mut buf = vec![0u8; size as usize];
+    let mut buf = vec![0u64; size as usize / 8 + 1];
     for _ in 0..4 {
-        // SAFETY: `buf` holds `size` initialised bytes and outlives the
-        // call; `size` is a valid in/out pointer; on overflow the call
-        // reports the size it needs there.
+        // SAFETY: `buf` is 8-aligned by its element type, holds at least
+        // `size` initialised bytes, and outlives the call; `size` is a
+        // valid in/out pointer; on overflow the call reports the size it
+        // needs there.
         let result = unsafe {
             GetAdaptersAddresses(
                 AF_UNSPEC as u32,
@@ -314,7 +360,7 @@ pub(super) fn adapter_exists(name: &str) -> io::Result<bool> {
             )
         };
         if result == ERROR_BUFFER_OVERFLOW {
-            buf.resize(size as usize, 0);
+            buf.resize(size as usize / 8 + 1, 0);
             continue;
         }
         check(result)?;
@@ -326,10 +372,12 @@ pub(super) fn adapter_exists(name: &str) -> io::Result<bool> {
 }
 
 /// Whether the linked list `GetAdaptersAddresses` built in `buf` holds
-/// an adapter named `name`.
-fn table_has_adapter(buf: &[u8], name: &str) -> bool {
-    // SAFETY: on success the buffer starts with the linked list the call
-    // built, valid for as long as the buffer is; the walk only reads it.
+/// an adapter named `name`. The u64 element type conveys the alignment
+/// the entries need — the struct carries u64 members.
+fn table_has_adapter(buf: &[u64], name: &str) -> bool {
+    // SAFETY: `buf` is 8-aligned by its element type; on success the
+    // buffer starts with the linked list the call built, valid for as
+    // long as the buffer is; the walk only reads it.
     let mut next = buf.as_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>();
     while !next.is_null() {
         // SAFETY: `next` points at one of the list's entries.
@@ -568,26 +616,23 @@ mod tests {
         let entry_size = std::mem::size_of::<IP_ADAPTER_ADDRESSES_LH>();
         let words = 2 * entry_size.div_ceil(std::mem::size_of::<u64>()) + 4;
         let mut store: Vec<u64> = vec![0; words];
-        let buf_len = store.len() * std::mem::size_of::<u64>();
-        let buf = unsafe {
+        // SAFETY: `first`/`second` point at the two entries the store is
+        // sized for — it is u64-aligned, like the API's own allocation —
+        // and it outlives this function, as do the name buffers the
+        // assertions read through the entries.
+        unsafe {
             let first = store.as_mut_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>();
-            // SAFETY: the store is sized for two entries.
             let second = first.byte_add(entry_size);
-            // SAFETY: both entries live inside the store, which outlives
-            // this function, and the name buffers outlive the assertions
-            // that read them.
             (*first).Next = second;
             (*first).FriendlyName = names[0].as_mut_ptr();
             (*second).FriendlyName = names[1].as_mut_ptr();
-            // SAFETY: the store is fully initialised.
-            std::slice::from_raw_parts(store.as_ptr().cast::<u8>(), buf_len)
-        };
-        assert!(table_has_adapter(buf, "meow-addr-test"));
-        assert!(table_has_adapter(buf, "meow-addr-test-2"));
+        }
+        assert!(table_has_adapter(&store, "meow-addr-test"));
+        assert!(table_has_adapter(&store, "meow-addr-test-2"));
         // The whole friendly name has to match — a prefix or a
         // superstring of one entry's name must not hit.
-        assert!(!table_has_adapter(buf, "meow-addr-tes"));
-        assert!(!table_has_adapter(buf, "meow-addr-test-22"));
+        assert!(!table_has_adapter(&store, "meow-addr-tes"));
+        assert!(!table_has_adapter(&store, "meow-addr-test-22"));
     }
 
     /// A test adapter's name: the listener's own naming scheme
@@ -728,7 +773,7 @@ mod tests {
 
     #[test]
     #[ignore = "creates a real Wintun adapter: needs Administrator, the wintun.dll sidecar (or the copy embedded in the binary), and the Wintun driver; the windows CI job runs it"]
-    fn conflicted_address_fails_and_rolls_the_adapter_back() {
+    fn conflicted_address_fails_and_leaves_the_adapter_as_found() {
         let dll = super::super::wintun::resolve_wintun_dll().expect("locate wintun.dll");
         let dll = dll.to_string_lossy();
         let device = listener_adapter(&dll, &adapter_name("conflict-a"));

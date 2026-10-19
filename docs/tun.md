@@ -71,21 +71,23 @@ stays *tentative* while the OS checks it for duplicates, and a tentative
 address cannot send packets. Three consequences of how that is done:
 
 - **A reused adapter is reconfigured.** An adapter left behind by an
-  unclean shutdown carries its previous run's addresses; meow opens it
-  (and logs a warning) and replaces what it carries — every
-  non-link-local address, IPv6 included. Stale IPv6 addresses are removed
-  even when no `inet6-address` is configured: the adapter ends up with
-  exactly what the config says. An adapter that outlives meow also keeps
-  duplicate-address detection off.
+  unclean shutdown carries its previous run's addresses; meow logs a
+  warning, opens it — or recreates it, when the driver has orphaned the
+  leftover — and assigns exactly the configured addresses, replacing
+  every non-link-local one it finds, IPv6 included. Stale IPv6 addresses
+  are removed even when no `inet6-address` is configured: the adapter
+  ends up with exactly what the config says. An adapter that outlives
+  meow also keeps duplicate-address detection off.
 - **A conflicted address fails loudly, then rotates.** An address another
   adapter still holds fails the attempt instead of starting the device
-  half-configured; from the third attempt meow uses a new adapter name and
-  rotates the address of both families — IPv4 steps a few addresses up
-  from the configured one, IPv6 cycles through the addresses of its
-  subnet.
-- **A failed attempt rolls the adapter back.** The failed attempt restores
-  the addresses it replaced (an address it managed to add stays — it is
-  meow's own, ready to use), and the listener moves on to the next one.
+  half-configured; each retry gets a new adapter name, and from the third
+  attempt the address of both families also rotates — IPv4 steps a few
+  addresses up from the configured one, IPv6 cycles through the addresses
+  of its subnet.
+- **A failed attempt rolls the adapter back.** The failed attempt removes
+  an address it managed to add and restores the ones it replaced — the
+  adapter is left as it was found — and the listener moves on to the
+  next one.
 
 ## How v1 stays loop-free (and what it doesn't capture)
 
@@ -421,7 +423,7 @@ Get-NetRoute -DestinationPrefix 0.0.0.0/1, 128.0.0.0/1   # after stopping meow: 
 | Field | Default | Notes |
 |-------|---------|-------|
 | `enable` | `false` | Master switch. Requires a build with the `listener-tun` feature (included in `full`). |
-| `device` | platform-chosen | Adapter name. macOS always auto-assigns `utunN`. On Windows a same-named leftover adapter is opened and reconfigured rather than replaced (see *Windows: address setup, adapter reuse, and conflicts*). |
+| `device` | platform-chosen | Adapter name. macOS always auto-assigns `utunN`. On Windows a same-named leftover adapter is reopened — or recreated, when the driver has orphaned it — and reconfigured either way (see *Windows: address setup, adapter reuse, and conflicts*). |
 | `mtu` | `1500` | Hard error below 1280 (userspace-stack minimum). |
 | `inet4-address` | `172.19.0.1/30` | CIDR assigned to the device. |
 | `inet6-address` | none | IPv6 CIDR assigned to the device, e.g. `fdfe:dcba:9876::1/126` — a string, or mihomo's list form (only the first entry is used). Only honoured with `auto-route: global`, where it also adds the IPv6 split default routes (experimental, see above); ignored with a warning otherwise. An invalid CIDR is a hard error. |
