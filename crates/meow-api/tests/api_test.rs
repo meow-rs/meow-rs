@@ -6087,7 +6087,7 @@ async fn logbook_lists_filters_and_clears_entries() {
     assert_eq!(resp.status(), StatusCode::OK);
     for message in ["first", "second"] {
         logbook::event(
-            logbook::kind::GROUP_SWITCH,
+            logbook::kind::PROXY_PROVIDER_UPDATE,
             logbook::Level::Warning,
             message,
         )
@@ -6100,7 +6100,7 @@ async fn logbook_lists_filters_and_clears_entries() {
     assert_eq!(page["enabled"], true);
     let entries = page["entries"].as_array().unwrap();
     assert_eq!(entries.len(), 2, "{page}");
-    assert_eq!(entries[0]["kind"], "group.switch");
+    assert_eq!(entries[0]["kind"], "proxy-provider.update");
     assert_eq!(entries[0]["message"], "second", "the fold keeps the latest");
     assert_eq!(entries[0]["count"], 2);
     assert_eq!(entries[1]["kind"], "config.change");

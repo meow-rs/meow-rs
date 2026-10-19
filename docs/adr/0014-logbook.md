@@ -54,7 +54,6 @@ once released, because clients filter, label and translate by kind.
 | `geodata.update` | info / error | `GeoIP MMDB`, `ASN MMDB`, `geosite` | Downloaded and loaded into the rules, or the download or reload failed |
 | `listener.start` | error | listener (`tun` for TUN) | A listener did not start |
 | `network.interface` | info | | The interface outbound sockets bind to (TUN `auto-route: global`) changed, or they no longer bind to one. Recorded for a binding once its TUN listener is up: a reload candidate's binding, installed for the validation's dials, records nothing until then, and nothing at all when the candidate is rejected |
-| `group.switch` | info | group | A `url-test` or `fallback` group routes to another member than after the previous sweep (`from`, `to`; `reason` when `from` went down) |
 | `dialer-proxy.switch` | info | chained outbound | The member of a `dialer-proxy` group carrying the outbound's chains to its server changed (`group`, `from`, `to`; `reason` when `from` is blocked for that server, or `down` when a chain probe took over from it while its group had it down) |
 | `dialer-proxy.check` | info / error | chained outbound | A health check of the outbound failed through every member of its `dialer-proxy` group tried (`group`, `reason`, `tried`), or passed again |
 
@@ -69,11 +68,17 @@ provider registered empty, such as a download adopted after the fetch
 deadline), and an unchanged refetch is noise. Members of a group going
 down are not recorded either: the same airport nodes sit in several
 groups, so one dead node made an entry in each, and none of them said
-whether the traffic still went where it should. Whether a success ends a
-failure is read from the logbook itself (`logbook::failing`): the subject's
-latest entry of the kind is an error. A recovery is then recorded even when
-the provider object that failed was rebuilt by a config commit, or the
-engine restarted in between.
+whether the traffic still went where it should. Nor is a group switching
+member. A `url-test` group moving to its fastest member is the group doing
+its job. A `group.switch` recorded by the health check, as a draft of this
+ADR had, compared only the members picked after two sweeps, so a
+`fallback` group that left its first member between sweeps and came back
+was never seen; what it did see was the first member's probe failing,
+which for a chained outbound `dialer-proxy.check` records with the members
+tried. Whether a success ends a failure is read from the logbook itself
+(`logbook::failing`): the subject's latest entry of the kind is an error.
+A recovery is then recorded even when the provider object that failed was
+rebuilt by a config commit, or the engine restarted in between.
 
 Producers record what a running configuration does. A build that may not
 be committed (startup builds its providers more than once, and a

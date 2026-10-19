@@ -1,6 +1,5 @@
 use crate::tunnel::TunnelInner;
-use meow_common::logbook::{self, Level};
-use meow_common::{AdapterType, ChainHealth, HealthCheckSpec, Metadata, Proxy};
+use meow_common::{ChainHealth, HealthCheckSpec, Proxy};
 use smol_str::SmolStr;
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
@@ -84,7 +83,6 @@ async fn run_health_check_loop(inner: Weak<TunnelInner>, spec: HealthCheckSpec) 
     // missed-tick probe storm right after system suspend.
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_probed_generation = 0;
-    let mut watch = GroupWatch::default();
 
     if spec.lazy {
         ticker.tick().await;
@@ -152,7 +150,6 @@ async fn run_health_check_loop(inner: Weak<TunnelInner>, spec: HealthCheckSpec) 
 
         let mut alive_count = 0u32;
         let mut total_count = 0u32;
-        let mut probed = HashMap::new();
         for member in meow_proxy::health::sweep_members(
             members,
             &fronts,
@@ -173,7 +170,6 @@ async fn run_health_check_loop(inner: Weak<TunnelInner>, spec: HealthCheckSpec) 
                     spec.group_name, member.name
                 );
             }
-            probed.insert(member.name, (member.delay, member.reason));
         }
 
         // Record the generation only now that a probe round actually ran
@@ -189,9 +185,6 @@ async fn run_health_check_loop(inner: Weak<TunnelInner>, spec: HealthCheckSpec) 
             "health-check: {} — {}/{} alive",
             spec.group_name, alive_count, total_count
         );
-        if total_count > 0 {
-            watch.record(&spec.group_name, &group, &probed);
-        }
 
         if let Some(chain) = group.chain_health() {
             // A block outlives the gap to the next round, which probes
@@ -249,73 +242,6 @@ async fn probe_chain_targets(
     }
 }
 
-/// Each member a sweep probed: its delay, `0` when it is down, and why it
-/// is down.
-type Probed = HashMap<String, (u16, Option<String>)>;
-
-/// A `group.switch`: the previous pick, the new one, the message, and why
-/// the previous pick went down, when it did.
-type Switch = (String, String, String, Option<String>);
-
-/// The member a url-test or fallback group routed to after its previous
-/// sweep, so a sweep is recorded only when the pick changes.
-#[derive(Default)]
-struct GroupWatch {
-    pick: Option<String>,
-}
-
-impl GroupWatch {
-    /// Record a finished sweep of `group`.
-    fn record(&mut self, name: &str, group: &Arc<dyn Proxy>, probed: &Probed) {
-        // Only url-test and fallback route to one member. The peek
-        // recomputes the pick from the fresh delays, as a dial would.
-        if !matches!(
-            group.adapter_type(),
-            AdapterType::UrlTest | AdapterType::Fallback
-        ) {
-            return;
-        }
-        let pick = group
-            .unwrap_proxy(&Metadata::default(), false)
-            .map(|p| p.name().to_string());
-        if let Some((from, to, message, reason)) = self.switch(name, pick, probed) {
-            let mut event = logbook::event(logbook::kind::GROUP_SWITCH, Level::Info, message)
-                .subject(name)
-                .field("from", from)
-                .field("to", to);
-            if let Some(reason) = reason {
-                event = event.field("reason", reason);
-            }
-            event.coalesce().record();
-        }
-    }
-
-    /// The `group.switch` to record, if `pick` differs from the pick after
-    /// the previous sweep. The first sweep only learns the pick.
-    fn switch(&mut self, name: &str, pick: Option<String>, probed: &Probed) -> Option<Switch> {
-        let from = std::mem::replace(&mut self.pick, pick)?;
-        let to = self.pick.clone()?;
-        if from == to {
-            return None;
-        }
-        let state = |member: &str| match probed.get(member) {
-            Some((0, Some(reason))) => format!(" (down: {reason})"),
-            Some((0, None)) => " (down)".to_owned(),
-            Some((delay, _)) => format!(" ({delay} ms)"),
-            None => String::new(),
-        };
-        let message = format!(
-            "'{name}' switched from '{from}'{} to '{to}'{}",
-            state(&from),
-            state(&to)
-        );
-        let reason = probed
-            .get(&from)
-            .and_then(|(delay, reason)| reason.clone().filter(|_| *delay == 0));
-        Some((from, to, message, reason))
-    }
-}
-
 /// The outbound `name` names: a route-table entry, or a provider-sourced
 /// member of a group there. Provider nodes that carry their own
 /// `dialer-proxy` are not route-table keys.
@@ -336,41 +262,6 @@ mod tests {
     use crate::Tunnel;
     use meow_common::{Metadata, Proxy, ProxyAdapter};
     use meow_config::extract_health_check_specs as extract_specs;
-
-    #[test]
-    fn group_switch_is_recorded_when_the_pick_changes() {
-        let mut watch = GroupWatch::default();
-        let probed = Probed::from([
-            ("a".to_owned(), (0, Some("timed out".to_owned()))),
-            ("b".to_owned(), (120, None)),
-        ]);
-        let pick = |m: &str| Some(m.to_owned());
-        assert_eq!(
-            watch.switch("G", pick("a"), &probed),
-            None,
-            "learns the pick"
-        );
-        assert_eq!(watch.switch("G", pick("a"), &probed), None, "unchanged");
-        assert_eq!(
-            watch.switch("G", pick("b"), &probed),
-            Some((
-                "a".into(),
-                "b".into(),
-                "'G' switched from 'a' (down: timed out) to 'b' (120 ms)".into(),
-                Some("timed out".into())
-            ))
-        );
-        assert_eq!(
-            watch.switch("G", pick("c"), &probed),
-            Some((
-                "b".into(),
-                "c".into(),
-                "'G' switched from 'b' (120 ms) to 'c'".into(),
-                None
-            )),
-            "a member the sweep did not probe has no state"
-        );
-    }
 
     fn stub_tunnel() -> Tunnel {
         let resolver = std::sync::Arc::new(meow_dns::Resolver::new(

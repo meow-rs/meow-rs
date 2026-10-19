@@ -427,8 +427,6 @@ pub struct SweptMember {
     pub name: String,
     /// The delay recorded, `0` when the member is down.
     pub delay: u16,
-    /// Why the member is down.
-    pub reason: Option<String>,
 }
 
 /// Probe the members of a group being swept and record each delay, like
@@ -486,8 +484,8 @@ async fn sweep_member(
             .expect("global delay probe semaphore is never closed");
         crate::group::watch_member_dial(url_test(proxy.as_ref(), url, expected, timeout)).await
     };
-    let (delay, reason) = match result {
-        Ok(delay) => (delay, None),
+    let delay = match result {
+        Ok(delay) => delay,
         Err(error) => {
             let reason = url_test_reason(&error);
             match chain_of(fronts, &name) {
@@ -504,7 +502,7 @@ async fn sweep_member(
                     };
                     check_chain(&round, &name, reason).await
                 }
-                None => (0, Some(reason.to_owned())),
+                None => 0,
             }
         }
     };
@@ -518,11 +516,7 @@ async fn sweep_member(
         .subject(name.as_str())
         .record();
     }
-    SweptMember {
-        name,
-        delay,
-        reason,
-    }
+    SweptMember { name, delay }
 }
 
 /// The automatic group among `fronts` that `owner` dials through, with the
@@ -542,23 +536,19 @@ fn chain_of<'a>(
 }
 
 /// [`sweep_members`]' chain check of `owner`, whose health check failed
-/// for `reason`: the delay to record and, when that is `0`, why.
-async fn check_chain(
-    round: &ChainRound<'_>,
-    owner: &str,
-    reason: &'static str,
-) -> (u16, Option<String>) {
+/// for `reason`: the delay to record.
+async fn check_chain(round: &ChainRound<'_>, owner: &str, reason: &'static str) -> u16 {
     let front = round.group.name();
     let report = round.run(1, CHAIN_CHECK_LIMIT, true).await;
     let Some(report) = report else {
-        return (0, Some(reason.to_owned()));
+        return 0;
     };
     if let Some((member, delay)) = report.reached.first() {
         info!(
             "health-check: '{owner}' failed its probe ({reason}) but reached its server \
              through '{member}' of '{front}'; keeping it up"
         );
-        return (*delay, None);
+        return *delay;
     }
     let tried = report.failed.len();
     let why = if tried == 0 {
@@ -582,7 +572,7 @@ async fn check_chain(
         .field("tried", tried)
         .coalesce()
         .record();
-    (0, Some(why))
+    0
 }
 
 /// `'a', 'b', 'c'`.
@@ -1295,7 +1285,6 @@ mod tests {
 
             let swept = sweep(&fast, &owner).await;
             assert!(swept.delay > 0, "{swept:?}");
-            assert_eq!(swept.reason, None);
             assert!(owner.alive());
             assert!(blocked(&fast, &owner, "SG-01"));
             let target = ChainTarget::from_server_addr(owner.addr()).unwrap();
@@ -1368,10 +1357,6 @@ mod tests {
 
             let swept = sweep(&fast, &owner).await;
             assert_eq!(swept.delay, 0);
-            assert_eq!(
-                swept.reason.as_deref(),
-                Some("closed before any reply; unreachable through 2 members of 'fast' tried")
-            );
             assert!(!owner.alive());
             assert!(!blocked(&fast, &owner, "SG-01"));
             assert!(!blocked(&fast, &owner, "JP-01"));
@@ -1407,7 +1392,6 @@ mod tests {
             let member: Arc<dyn Proxy> = Arc::clone(&audited) as _;
             let swept = sweep(&fast, &member).await;
             assert_eq!(swept.delay, 0);
-            assert_eq!(swept.reason.as_deref(), Some("closed before any reply"));
             assert!(!member.alive());
             assert_eq!(audited.dials(), 1);
         }

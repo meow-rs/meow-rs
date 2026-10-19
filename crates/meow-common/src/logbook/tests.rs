@@ -120,7 +120,7 @@ fn repeats_fold_into_the_subjects_latest_entry() {
         book.record_at(failure("other", "timed out"), at(61));
         // Another kind about the same subject does not interrupt the fold.
         book.record_at(
-            event("group.switch", Level::Info, "switched").subject("rules"),
+            event("config.change", Level::Info, "changed").subject("rules"),
             at(62),
         );
         let folded = book.record_at(failure("rules", "reset"), at(120));
@@ -449,7 +449,11 @@ fn the_latest_level_follows_the_subjects_latest_entry() {
     assert_eq!(book.latest_level(kind, "rules"), None);
     book.record_at(failure("rules", "failed"), at(0));
     assert_eq!(book.latest_level(kind, "rules"), Some(Level::Error));
-    assert_eq!(book.latest_level("group.switch", "rules"), None, "per kind");
+    assert_eq!(
+        book.latest_level("config.change", "rules"),
+        None,
+        "per kind"
+    );
     book.record_at(event(kind, Level::Info, "updated").subject("rules"), at(1));
     assert_eq!(book.latest_level(kind, "rules"), Some(Level::Info));
 }

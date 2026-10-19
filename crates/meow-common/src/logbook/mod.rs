@@ -114,8 +114,6 @@ pub mod kind {
     /// Outbound sockets were bound to another network interface, or no
     /// longer are.
     pub const NETWORK_INTERFACE: &str = "network.interface";
-    /// A url-test or fallback group switched member. Subject: the group.
-    pub const GROUP_SWITCH: &str = "group.switch";
     /// The member of a `dialer-proxy` group carrying an outbound's chains
     /// changed. Subject: the chained outbound.
     pub const DIALER_PROXY_SWITCH: &str = "dialer-proxy.switch";

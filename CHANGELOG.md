@@ -16,10 +16,9 @@ the canonical, in-repo source a release is cut from.
   ended without a clean stop (a crash, a kill, a power cut), config reloads
   and API edits, subscription, proxy-provider, rule-provider and geodata
   updates and their failures, listeners that did not start, outbound
-  interface changes, `url-test` / `fallback` groups switching member (and
-  why the previous one went down), and `dialer-proxy` chains changing the
-  member that carries them or failing their health check through every
-  member tried. Repeats of a failure fold into one entry with a count.
+  interface changes, and `dialer-proxy` chains changing the member that
+  carries them or failing their health check through every member tried.
+  Repeats of a failure fold into one entry with a count.
   Entries are kept in an SQLite database, `<home>/logbook/logbook.db`, for
   7 days and 2 MiB, and survive restarts and crashes; the API filters by
   level, kind and subject, pages back with `before` and polls with
