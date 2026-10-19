@@ -1,20 +1,18 @@
-//! First-bytes sniffing for inbounds that hand [`crate::tcp::handle_tcp`] a
-//! raw netstack stream (meow-android's tun2socks).
+//! First-bytes sniffing in [`crate::tcp::handle_tcp`], the entry point for
+//! inbounds that hand the tunnel a raw netstack stream (the desktop TUN
+//! listener, meow-android's tun2socks).
 //!
 //! The listener-side `SnifferRuntime` peeks a kernel socket; a userspace
 //! netstack stream has no `peek`, so here the client's first bytes are
-//! read, parsed, and replayed to the upstream ahead of the rest of the
-//! stream. Only flows the tunnel cannot otherwise name are touched: every
-//! other flow is returned unread, so its routing and timing are unchanged.
+//! read, parsed, and handed to the relay as its prefix, which reaches the
+//! upstream ahead of the rest of the stream. Only flows the tunnel cannot
+//! otherwise name are read: every other flow keeps its routing and timing.
 
-use std::io;
-use std::pin::Pin;
-use std::task::{Context, Poll};
 use std::time::Duration;
 
 use meow_common::sniffer::{sniff_http, sniff_tls};
-use meow_common::{Metadata, ProxyConn};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
+use meow_common::Metadata;
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::TunnelInner;
 
@@ -33,32 +31,26 @@ const SNIFF_CAP: usize = 8192;
 ///
 /// A found name lands in `metadata.sniff_host`, which
 /// [`TunnelInner::pre_handle_metadata`] then dials instead of the literal.
-/// Bytes read while sniffing are replayed by the returned stream before
-/// anything else, so the upstream sees the flow unchanged. A read error or
-/// EOF ends sniffing early and the relay meets it on its next read.
-pub async fn sniff_unnamed<C>(
+/// Returns the bytes read, which the caller must relay upstream before
+/// anything else; empty, and no allocation, for a flow that needs no name.
+/// A read error or EOF ends sniffing early and the relay meets it on its
+/// next read.
+pub(crate) async fn sniff_unnamed<R>(
     tunnel: &TunnelInner,
-    mut conn: C,
+    conn: &mut R,
     metadata: &mut Metadata,
-) -> Box<dyn ProxyConn>
+) -> Vec<u8>
 where
-    C: ProxyConn + 'static,
+    R: AsyncRead + Unpin + ?Sized,
 {
     if !tunnel.needs_sniffed_name(metadata) {
-        return Box::new(conn);
+        return Vec::new();
     }
-    let prefix = read_first_bytes(&mut conn, SNIFF_WINDOW).await;
+    let prefix = read_first_bytes(conn, SNIFF_WINDOW).await;
     if let Some(name) = sniff_tls(&prefix).or_else(|| sniff_http(&prefix)) {
         metadata.sniff_host = name;
     }
-    if prefix.is_empty() {
-        return Box::new(conn);
-    }
-    Box::new(PrefixedConn {
-        prefix,
-        pos: 0,
-        inner: conn,
-    })
+    prefix
 }
 
 /// Read the client's first bytes within `window`. Keeps reading while the
@@ -82,6 +74,8 @@ where
         }
     }
     buf.truncate(n);
+    // The prefix lives as long as the relay; keep only what was read.
+    buf.shrink_to_fit();
     buf
 }
 
@@ -97,79 +91,13 @@ fn tls_record_incomplete(buf: &[u8]) -> bool {
     }
 }
 
-/// `inner` with the bytes consumed while sniffing replayed first.
-struct PrefixedConn<C> {
-    prefix: Vec<u8>,
-    pos: usize,
-    inner: C,
-}
-
-impl<C: AsyncRead + Unpin> AsyncRead for PrefixedConn<C> {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        if this.pos < this.prefix.len() {
-            let rest = &this.prefix[this.pos..];
-            let n = rest.len().min(buf.remaining());
-            buf.put_slice(&rest[..n]);
-            this.pos += n;
-            if this.pos == this.prefix.len() {
-                // Free the sniff buffer for the rest of the flow.
-                this.prefix = Vec::new();
-                this.pos = 0;
-            }
-            return Poll::Ready(Ok(()));
-        }
-        Pin::new(&mut this.inner).poll_read(cx, buf)
-    }
-}
-
-impl<C: AsyncWrite + Unpin> AsyncWrite for PrefixedConn<C> {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
-    }
-
-    fn poll_write_vectored(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        bufs: &[io::IoSlice<'_>],
-    ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.get_mut().inner).poll_write_vectored(cx, bufs)
-    }
-
-    fn is_write_vectored(&self) -> bool {
-        self.inner.is_write_vectored()
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
-    }
-}
-
-impl<C: ProxyConn> ProxyConn for PrefixedConn<C> {
-    fn remote_destination(&self) -> String {
-        self.inner.remote_destination()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{PreHandleVerdict, Tunnel};
-    use meow_common::{DnsMode, Network};
+    use meow_common::{ConnType, DnsMode, Network};
     use meow_dns::fakeip::{MemoryStore, Pool};
-    use meow_dns::Resolver;
+    use meow_dns::{HostEntry, Resolver};
     use meow_trie::DomainTrie;
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::Arc;
@@ -178,19 +106,16 @@ mod tests {
 
     /// The mobile clients' setup: own fake-IP pool 28.0.0.0/8, so a
     /// 198.18.x destination can only be another resolver's fake IP.
-    fn mobile_tunnel() -> Tunnel {
-        let mut resolver = Resolver::new(
-            vec![],
-            vec![],
-            DnsMode::FakeIp,
-            DomainTrie::new(),
-            true,
-            true,
-        );
+    fn mobile_tunnel_with_hosts(hosts: DomainTrie<HostEntry>) -> Tunnel {
+        let mut resolver = Resolver::new(vec![], vec![], DnsMode::FakeIp, hosts, true, true);
         let net = "28.0.0.0/8".parse().unwrap();
         let pool = Pool::new(net, Arc::new(MemoryStore::new(1024))).unwrap();
         resolver.set_fakeip_v4(Arc::new(pool));
         Tunnel::new(Arc::new(resolver))
+    }
+
+    fn mobile_tunnel() -> Tunnel {
+        mobile_tunnel_with_hosts(DomainTrie::new())
     }
 
     fn tcp_to(ip: Ipv4Addr, port: u16) -> Metadata {
@@ -239,28 +164,33 @@ mod tests {
         (client, server)
     }
 
-    async fn read_exact_from(conn: &mut dyn ProxyConn, len: usize) -> Vec<u8> {
-        let mut got = vec![0u8; len];
-        conn.read_exact(&mut got).await.unwrap();
+    /// The sniffed prefix followed by the rest of the stream, up to `len`
+    /// bytes: what the relay hands the upstream.
+    async fn relayed(prefix: Vec<u8>, conn: &mut TcpStream, len: usize) -> Vec<u8> {
+        let mut got = prefix;
+        let at = got.len();
+        got.resize(len, 0);
+        conn.read_exact(&mut got[at..]).await.unwrap();
         got
     }
 
     #[tokio::test]
-    async fn surge_fake_ip_dials_the_sniffed_sni() {
+    async fn surge_fake_ip_sniffs_the_sni() {
         let tunnel = mobile_tunnel();
-        let (mut client, server) = stream_pair().await;
+        let (mut client, mut server) = stream_pair().await;
         let hello = client_hello("account.example.com");
         client.write_all(&hello).await.unwrap();
         client.write_all(b"after").await.unwrap();
 
         let mut md = tcp_to(SURGE_FAKE_IP, 443);
-        let mut conn = sniff_unnamed(tunnel.inner(), server, &mut md).await;
+        let prefix = sniff_unnamed(tunnel.inner(), &mut server, &mut md).await;
         assert_eq!(md.sniff_host, "account.example.com");
+        assert!(prefix.starts_with(&hello));
 
         // The upstream sees the ClientHello first, then the rest.
         let mut want = hello.clone();
         want.extend_from_slice(b"after");
-        assert_eq!(read_exact_from(&mut *conn, want.len()).await, want);
+        assert_eq!(relayed(prefix, &mut server, want.len()).await, want);
 
         assert_eq!(
             tunnel.inner().pre_handle_metadata(&mut md),
@@ -273,7 +203,7 @@ mod tests {
     #[tokio::test]
     async fn split_client_hello_is_gathered() {
         let tunnel = mobile_tunnel();
-        let (mut client, server) = stream_pair().await;
+        let (mut client, mut server) = stream_pair().await;
         let hello = client_hello("split.example.com");
         let (head, tail) = hello.split_at(3);
         client.write_all(head).await.unwrap();
@@ -287,23 +217,24 @@ mod tests {
         });
 
         let mut md = tcp_to(SURGE_FAKE_IP, 443);
-        let mut conn = sniff_unnamed(tunnel.inner(), server, &mut md).await;
+        let prefix = sniff_unnamed(tunnel.inner(), &mut server, &mut md).await;
         assert_eq!(md.sniff_host, "split.example.com");
-        assert_eq!(read_exact_from(&mut *conn, hello.len()).await, hello);
+        assert_eq!(prefix, hello);
+        assert_eq!(prefix.capacity(), prefix.len(), "sniff buffer trimmed");
     }
 
     #[tokio::test]
     async fn stale_own_fake_ip_is_rescued_by_http_host() {
         let tunnel = mobile_tunnel();
-        let (mut client, server) = stream_pair().await;
+        let (mut client, mut server) = stream_pair().await;
         let request = b"GET / HTTP/1.1\r\nHost: stale.example.com\r\n\r\n";
         client.write_all(request).await.unwrap();
 
         // In our range with no live mapping: dropped without a name.
         let mut md = tcp_to(Ipv4Addr::new(28, 0, 0, 9), 80);
-        let mut conn = sniff_unnamed(tunnel.inner(), server, &mut md).await;
+        let prefix = sniff_unnamed(tunnel.inner(), &mut server, &mut md).await;
         assert_eq!(md.sniff_host, "stale.example.com");
-        assert_eq!(read_exact_from(&mut *conn, request.len()).await, request);
+        assert_eq!(prefix, request);
         assert_eq!(
             tunnel.inner().pre_handle_metadata(&mut md),
             PreHandleVerdict::Continue
@@ -311,6 +242,8 @@ mod tests {
         assert_eq!(md.host, "stale.example.com");
     }
 
+    /// A live mapping, a real address and a flow the inbound already
+    /// sniffed are left unread: no prefix, no allocation, no wait.
     #[tokio::test]
     async fn named_and_real_destinations_are_not_read() {
         let tunnel = mobile_tunnel();
@@ -322,39 +255,114 @@ mod tests {
         let IpAddr::V4(mapped) = mapped else {
             panic!("v4 pool hands out v4 addresses");
         };
-        for dst in [mapped, Ipv4Addr::new(93, 184, 216, 34)] {
-            let (mut client, server) = stream_pair().await;
+        let mut sniffed = tcp_to(SURGE_FAKE_IP, 443);
+        sniffed.sniff_host = "inbound.example.com".into();
+        for mut md in [
+            tcp_to(mapped, 443),
+            tcp_to(Ipv4Addr::new(93, 184, 216, 34), 443),
+            sniffed,
+        ] {
+            let (mut client, mut server) = stream_pair().await;
             let hello = client_hello("other.example.com");
             client.write_all(&hello).await.unwrap();
 
-            let mut md = tcp_to(dst, 443);
-            let mut conn = sniff_unnamed(tunnel.inner(), server, &mut md).await;
-            assert_eq!(md.sniff_host, "", "{dst} needs no sniffed name");
-            assert_eq!(read_exact_from(&mut *conn, hello.len()).await, hello);
+            let before = md.sniff_host.clone();
+            let prefix = sniff_unnamed(tunnel.inner(), &mut server, &mut md).await;
+            assert_eq!(
+                md.sniff_host, before,
+                "{:?} needs no sniffed name",
+                md.dst_ip
+            );
+            assert_eq!(prefix.capacity(), 0);
+            assert_eq!(relayed(prefix, &mut server, hello.len()).await, hello);
         }
     }
 
     #[tokio::test]
     async fn silent_client_dials_after_the_window_without_losing_bytes() {
         let tunnel = mobile_tunnel();
-        let (mut client, server) = stream_pair().await;
+        let (mut client, mut server) = stream_pair().await;
         let mut md = tcp_to(SURGE_FAKE_IP, 22);
 
         let start = tokio::time::Instant::now();
-        let mut conn = sniff_unnamed(tunnel.inner(), server, &mut md).await;
+        let prefix = sniff_unnamed(tunnel.inner(), &mut server, &mut md).await;
         let waited = start.elapsed();
         assert!(waited >= SNIFF_WINDOW, "waited {waited:?}");
         assert!(waited < SNIFF_WINDOW * 3, "waited {waited:?}");
         assert_eq!(md.sniff_host, "");
+        assert!(prefix.is_empty());
 
         client.write_all(b"SSH-2.0-client\r\n").await.unwrap();
-        assert_eq!(read_exact_from(&mut *conn, 16).await, b"SSH-2.0-client\r\n");
+        assert_eq!(
+            relayed(prefix, &mut server, 16).await,
+            b"SSH-2.0-client\r\n"
+        );
         // No name: the literal is kept, exactly as before.
         assert_eq!(
             tunnel.inner().pre_handle_metadata(&mut md),
             PreHandleVerdict::Continue
         );
         assert_eq!(md.dst_ip, Some(IpAddr::V4(SURGE_FAKE_IP)));
+    }
+
+    /// The whole path through `handle_tcp` (meow-android's tun2socks entry):
+    /// a flow to a LAN gateway's fake IP routes on the sniffed SNI, IP rules
+    /// see that name's real address, DIRECT dials it, and the upstream
+    /// receives every byte, the sniffed ClientHello first.
+    #[tokio::test]
+    async fn handle_tcp_dials_the_sniffed_name_for_a_foreign_fake_ip() {
+        let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = echo.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut socket, _) = echo.accept().await.unwrap();
+            let mut buf = Vec::new();
+            socket.read_to_end(&mut buf).await.unwrap();
+            socket.write_all(&buf).await.unwrap();
+        });
+
+        let mut hosts = DomainTrie::new();
+        hosts.insert(
+            "account.example.com",
+            HostEntry::from(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]),
+        );
+        let tunnel = mobile_tunnel_with_hosts(hosts);
+        let rules = ["IP-CIDR,198.18.0.0/15,REJECT", "MATCH,DIRECT"]
+            .into_iter()
+            .map(|line| meow_rules::parse_rule(line, &meow_rules::ParserContext::default()))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        tunnel.update_routing(Default::default(), rules, Default::default());
+        tunnel.set_connection_notes(true);
+
+        let (mut client, server) = stream_pair().await;
+        let md = Metadata {
+            conn_type: ConnType::Inner,
+            ..tcp_to(SURGE_FAKE_IP, port)
+        };
+        let inner = tunnel.inner();
+        let relay = crate::tcp::handle_tcp(inner, Box::new(server), md);
+        let mut sent = client_hello("account.example.com");
+        sent.extend_from_slice(b"after");
+        let talk = async {
+            client.write_all(&sent).await.unwrap();
+            client.shutdown().await.unwrap();
+            let mut echoed = Vec::new();
+            client.read_to_end(&mut echoed).await.unwrap();
+            echoed
+        };
+        let ((), echoed) = tokio::join!(relay, talk);
+        assert_eq!(echoed, sent);
+
+        let closed = tunnel.statistics().recently_closed();
+        assert_eq!(closed.len(), 1);
+        let notes = closed[0].notes.get().unwrap().texts();
+        let has = |want: &str| notes.iter().any(|note| note.starts_with(want));
+        assert!(
+            has("198.18.1.220 is a fake IP from another resolver"),
+            "{notes:?}"
+        );
+        assert!(has("Destination IP for matching: 127.0.0.1"), "{notes:?}");
+        assert!(has("Matched rule #2 MATCH → DIRECT"), "{notes:?}");
     }
 
     #[test]

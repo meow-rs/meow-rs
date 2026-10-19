@@ -25,13 +25,6 @@ the canonical, in-repo source a release is cut from.
   normal pick. There is no config change and
   no mihomo equivalent. UDP chains and the relay-based fallback wrapper
   (`anytls`, `hysteria2`, `ss` with an external plugin) are not covered.
-- **`meow_tunnel::sniff::sniff_unnamed`** for inbounds that hand
-  `handle_tcp` a raw netstack stream, such as the Android client's
-  tun2socks. For a flow the tunnel cannot name (an unmapped address in its
-  own fake-IP range, or another resolver's fake IP as below) it reads the
-  client's first bytes for up to 200 ms, records the TLS SNI or HTTP `Host`
-  as the sniffed name, and replays the bytes to the upstream. Every other
-  flow is passed through unread.
 
 ### Fixed
 
@@ -43,8 +36,18 @@ the canonical, in-repo source a release is cut from.
   connection hangs until the app re-resolves. Such a destination, outside
   the tunnel's own fake-IP range and with no snooped name, now dials the
   name the sniffer saw, as a stale address in the own range already did,
-  and the connection notes say so. This holds with
-  `override-destination: false`; real addresses keep their literal.
+  and the connection notes say so. The literal is dropped whatever
+  `override-destination` says, including on the tproxy listener, so IP
+  rules and DIRECT use the name's real address; real addresses keep their
+  literal.
+- **`handle_tcp` sniffs flows it cannot name**: inbounds that hand the
+  tunnel a raw netstack stream (the TUN listener, the Android client's
+  tun2socks) had no sniffer, so an unmapped address in the own fake-IP
+  range was dropped and another resolver's fake IP black-holed. For those
+  flows only, `handle_tcp` now reads the client's first bytes for up to
+  200 ms, takes the TLS SNI or HTTP `Host` as the sniffed name, and relays
+  the bytes upstream first. Every other flow is relayed unread, and
+  callers need no change.
 
 ## [0.24.0] - 2026-10-18
 

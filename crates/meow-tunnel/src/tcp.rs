@@ -254,8 +254,20 @@ impl<'a> TcpAdmission<'a> {
     }
 }
 
-pub async fn handle_tcp(tunnel: &TunnelInner, mut conn: Box<dyn ProxyConn>, metadata: Metadata) {
-    route_inbound_tcp(tunnel, &mut conn, metadata, &[]).await;
+/// Route a TCP stream accepted from a userspace netstack (the TUN listener,
+/// meow-android's tun2socks) through the tunnel.
+///
+/// A flow whose destination the tunnel cannot name (an unmapped address in
+/// our fake-IP range, another resolver's fake IP) first has its TLS SNI or
+/// HTTP `Host` sniffed from the client's first bytes, which are then relayed
+/// as the prefix. Every other flow is relayed untouched.
+pub async fn handle_tcp(
+    tunnel: &TunnelInner,
+    mut conn: Box<dyn ProxyConn>,
+    mut metadata: Metadata,
+) {
+    let prefix = crate::sniff::sniff_unnamed(tunnel, &mut conn, &mut metadata).await;
+    route_inbound_tcp(tunnel, &mut conn, metadata, &prefix).await;
 }
 
 /// Route a decrypted inbound TCP connection through the rule engine and relay
