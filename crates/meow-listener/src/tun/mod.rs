@@ -414,7 +414,8 @@ impl TunListener {
         // Try up to 5 device names and IPs in case the previous instance
         // left a stale adapter that hasn't been cleaned up yet (common on
         // Windows after an unclean shutdown).  After the first retry fails,
-        // we also rotate the TUN IP to work around address conflicts.
+        // we also rotate the TUN addresses (IPv4 and IPv6 alike) to work
+        // around address conflicts.
         //
         // Each attempt runs on a blocking thread; the outer caller's
         // TUN_STARTUP_TIMEOUT guards the overall time spent here.
@@ -426,12 +427,16 @@ impl TunListener {
         let mut dev_name = String::new();
         let mut used_addr = base_addr;
         let mut last_err: Option<String>;
+        let mut if_index: Option<u32> = None;
 
         for attempt in 0..MAX_TUN_RETRIES {
             let name = device_name_for_attempt(cfg.device.as_deref(), attempt);
 
-            // Rotate IP after the first retry fails (attempt >= 2).
-            // Each /30 subnet spans 4 addresses, so we step by 4.
+            // Rotate the addresses after the first retry fails
+            // (attempt >= 2), so a conflict with an address another
+            // adapter still holds is worked around.  Each /30 subnet
+            // spans 4 addresses, so the IPv4 one steps to the next
+            // subnet; the IPv6 one steps within the configured subnet.
             let addr = if attempt >= 2 {
                 let offset = (attempt - 1) * 4;
                 std::net::Ipv4Addr::from(u32::from(base_addr).wrapping_add(offset))
@@ -443,7 +448,7 @@ impl TunListener {
             // Copy the values we need inside `spawn_blocking` so we don't
             // borrow `cfg` across the closure boundary.
             let mtu = cfg.mtu;
-            let inet6 = cfg.inet6_address;
+            let inet6 = cfg.inet6_address.map(|net| rotate_v6(net, attempt));
             let name_for_closure = name.clone();
             #[cfg(target_os = "windows")]
             let wintun_file = wintun_file.clone();
@@ -457,10 +462,11 @@ impl TunListener {
                 MAX_TUN_RETRIES,
             );
 
-            match tokio::task::spawn_blocking(move || -> io::Result<tun_rs::AsyncDevice> {
+            match tokio::task::spawn_blocking(move || -> io::Result<(tun_rs::AsyncDevice, u32)> {
                 let mut builder = tun_rs::DeviceBuilder::new().mtu(mtu);
-                // Windows assigns the addresses itself once the adapter
-                // exists: the builder's would start out tentative.
+                // On Windows the listener assigns the addresses itself
+                // once the adapter exists: the ones the builder sets
+                // would start out tentative.
                 #[cfg(not(target_os = "windows"))]
                 {
                     builder = builder.ipv4(addr, prefix, None);
@@ -477,28 +483,49 @@ impl TunListener {
                 {
                     builder = builder.wintun_file(wintun_file).wintun_log(true);
                 }
+                // tun-rs opens a same-named, non-orphaned adapter instead
+                // of creating one (an orphaned one it replaces), and
+                // Wintun does not delete a merely-opened adapter when it
+                // is closed: this run then replaces that adapter's
+                // addresses. Warn so the reuse is visible.
+                #[cfg(target_os = "windows")]
+                if let Some(n) = &name_for_closure {
+                    match windows_device::adapter_exists(n) {
+                        Ok(true) => warn!(
+                            "adapter '{n}' already exists; opening it and replacing the addresses it carries"
+                        ),
+                        Ok(false) => {}
+                        Err(e) => {
+                            warn!("could not check whether adapter '{n}' already exists: {e}");
+                        }
+                    }
+                }
                 let device = builder.build_async()?;
+                // One read of the index serves both the address setup
+                // and the caller.
+                let if_index = device.if_index()?;
                 // On failure the adapter drops here and the attempt retries.
                 #[cfg(target_os = "windows")]
                 windows_device::configure_addresses(
-                    device.if_index()?,
-                    Ipv4Net::new(addr, prefix).map_err(io::Error::other)?,
+                    if_index,
+                    Ipv4Net::new_assert(addr, prefix),
                     inet6,
                 )?;
-                Ok(device)
+                Ok((device, if_index))
             })
             .await
             {
-                Ok(Ok(d)) => {
+                Ok(Ok((d, idx))) => {
                     dev_name = d
                         .name()
                         .unwrap_or_else(|_| name.clone().unwrap_or_default());
                     used_addr = addr;
                     device = Some(d);
+                    if_index = Some(idx);
                     break;
                 }
                 Ok(Err(e)) => {
-                    warn!("failed to create TUN device '{}': {e}", display_name);
+                    warn!("failed to create or configure TUN device '{display_name}': {e}");
                     last_err = Some(e.to_string());
                 }
                 Err(join_err) => {
@@ -513,7 +540,7 @@ impl TunListener {
             if attempt + 1 >= MAX_TUN_RETRIES {
                 let detail = last_err.map(|e| format!(": {e}")).unwrap_or_default();
                 return Err(Box::new(io::Error::other(format!(
-                    "failed to create TUN device after {MAX_TUN_RETRIES} attempts{detail}"
+                    "failed to set up TUN device after {MAX_TUN_RETRIES} attempts{detail}"
                 ))));
             }
 
@@ -527,12 +554,11 @@ impl TunListener {
         // SAFETY: the loop either breaks with `device = Some(...)` and
         // `dev_name` set, or returns `Err` above.
         let device = device.unwrap();
+        // SAFETY: set on the same break that sets `device`.
+        let if_index = if_index.unwrap();
 
         let tun_create_ms = t0.elapsed().as_secs_f64() * 1000.0;
         info!("TUN device '{dev_name}' created in {tun_create_ms:.0}ms");
-
-        // Obtain the interface index before moving `device` into `TunDevice`.
-        let if_index = device.if_index()?;
 
         // Global route scope (#375): before any routes go in, the
         // outbound-interface binding must be installed so meow's own dials
@@ -982,6 +1008,31 @@ fn device_name_for_attempt(configured: Option<&str>, attempt: u32) -> Option<Str
     }
 }
 
+/// The configured IPv6 net for `attempt`: from the third attempt the host
+/// bits step by one address, wrapping inside the subnet, so a conflict
+/// with an address another adapter still holds is worked around like the
+/// IPv4 rotation above does. An all-zero interface identifier is skipped
+/// (RFC 7136 reserves it for the subnet-router anycast on a /64); a
+/// subnet with fewer than two host bits has nothing to rotate.
+fn rotate_v6(net: Ipv6Net, attempt: u32) -> Ipv6Net {
+    if attempt < 2 {
+        return net;
+    }
+    let host_bits = 128 - u32::from(net.prefix_len());
+    if host_bits < 2 {
+        return net;
+    }
+    let bits = u128::from(net.addr());
+    let host_mask = (1u128 << host_bits) - 1;
+    // A wrap back to the configured address is possible in a tiny subnet;
+    // the retry still moves to a fresh adapter name.
+    let host = ((bits + u128::from(attempt - 1)) & host_mask).max(1);
+    Ipv6Net::new_assert(
+        std::net::Ipv6Addr::from((bits & !host_mask) | host),
+        net.prefix_len(),
+    )
+}
+
 fn pump_error(direction: &str, joined: Result<io::Result<()>, tokio::task::JoinError>) -> String {
     match joined {
         Ok(Ok(())) => format!("tun {direction} pump exited"),
@@ -1139,8 +1190,8 @@ impl<S: AsyncRead + AsyncWrite + Send + Sync + Unpin> ProxyConn for TunTcpConn<S
 #[cfg(test)]
 mod tests {
     use super::{
-        device_name_for_attempt, global_route_nets, global_route_nets_for, sniff_first_payload,
-        sniff_first_payload_within, TunTcpConn, TUN_SNIFF_WINDOW,
+        device_name_for_attempt, global_route_nets, global_route_nets_for, rotate_v6,
+        sniff_first_payload, sniff_first_payload_within, Ipv6Net, TunTcpConn, TUN_SNIFF_WINDOW,
     };
     use std::io;
     use std::pin::Pin;
@@ -1179,6 +1230,29 @@ mod tests {
             device_name_for_attempt(Some("mytun"), 1),
             Some("mytun-1".to_string())
         );
+    }
+
+    #[test]
+    fn ipv6_address_rotates_inside_the_configured_subnet_from_the_third_attempt() {
+        let net = |s: &str| -> Ipv6Net { s.parse().unwrap() };
+        let base = net("fdfe:dcba:9876::1/126");
+        // The first two attempts keep the configured address, like the
+        // IPv4 rotation keeps the first two.
+        assert_eq!(rotate_v6(base, 0), base);
+        assert_eq!(rotate_v6(base, 1), base);
+        // From the third attempt the host bits step by one, inside the
+        // subnet.
+        assert_eq!(rotate_v6(base, 2), net("fdfe:dcba:9876::2/126"));
+        assert_eq!(rotate_v6(base, 3), net("fdfe:dcba:9876::3/126"));
+        // A two-bit subnet wraps back; the all-zero interface
+        // identifier is skipped (RFC 7136).
+        assert_eq!(rotate_v6(base, 4), base);
+        // A /64 has the same interface-identifier space to step in.
+        let wide = net("fd00::1/64");
+        assert_eq!(rotate_v6(wide, 2), net("fd00::2/64"));
+        assert_eq!(rotate_v6(wide, 4), net("fd00::4/64"));
+        // A single-address subnet cannot rotate.
+        assert_eq!(rotate_v6(net("fd00::1/128"), 4), net("fd00::1/128"));
     }
 
     #[test]
