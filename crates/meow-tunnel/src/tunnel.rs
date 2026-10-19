@@ -272,7 +272,13 @@ impl TunnelInner {
     /// - a sniffed name (`sniff_host`) rescues a stale flow — upstream
     ///   re-runs `TCPSniff` on exactly this failure; promoting the
     ///   observed name matches that rescue and additionally clears the
-    ///   stale `dst_ip` upstream would keep.
+    ///   stale `dst_ip` upstream would keep;
+    /// - the same rescue covers another resolver's fake IP: an unnamed
+    ///   destination in 198.18.0.0/15 outside our range (a LAN Surge or
+    ///   Clash gateway answered DNS while the tunnel was down) dials the
+    ///   sniffed name even with `override-destination: false`. Upstream
+    ///   gets there through its default `override-destination: true`;
+    ///   real addresses keep their literal either way.
     pub fn pre_handle_metadata(&self, metadata: &mut Metadata) -> PreHandleVerdict {
         // `fixMetadata` parity: an IP literal in `host` IS the
         // destination, not a name — fold it into `dst_ip` so a
@@ -343,7 +349,48 @@ impl TunnelInner {
                 metadata.host = host;
             }
         }
+        // Another resolver's fake IP: a LAN gateway (Surge, a second
+        // Clash) answered a DNS query while this tunnel was out of the
+        // path. Only that resolver can map it back and the range is never
+        // routable on the internet, so a proxy dialing the literal
+        // black-holes the flow. A sniffed name is the only usable target.
+        if metadata.host.is_empty()
+            && is_benchmarking_ip(ip)
+            && !metadata.sniff_host.is_empty()
+            && metadata_ip_literal(&metadata.sniff_host).is_none()
+        {
+            conn_note!(
+                Dns,
+                "{ip} is a fake IP from another resolver (198.18.0.0/15); \
+                 dialing the sniffed name {} instead",
+                metadata.sniff_host
+            );
+            metadata.host = metadata.sniff_host.clone();
+            metadata.dst_ip = None;
+        }
         PreHandleVerdict::Continue
+    }
+
+    /// Whether [`Self::pre_handle_metadata`] can route `metadata` only by a
+    /// sniffed name: its destination IP is an unmapped address in our own
+    /// fake-IP range (dropped otherwise) or another resolver's fake IP in
+    /// 198.18.0.0/15 with no snooped name (black-holed otherwise). Every
+    /// other flow already has a name, or is a real address that dials
+    /// as-is. Gates [`crate::sniff::sniff_unnamed`].
+    pub(crate) fn needs_sniffed_name(&self, metadata: &Metadata) -> bool {
+        if !metadata.host.is_empty() && metadata_ip_literal(&metadata.host).is_none() {
+            return false;
+        }
+        let Some(ip) = metadata
+            .dst_ip
+            .or_else(|| metadata_ip_literal(&metadata.host))
+            .map(|ip| ip.to_canonical())
+        else {
+            return false;
+        };
+        let resolver = self.resolver();
+        (resolver.in_fake_ip_range(ip) || is_benchmarking_ip(ip))
+            && resolver.reverse_lookup(ip).is_none()
     }
 
     /// Pre-process metadata before rule matching: if any rule needs IP
@@ -1228,6 +1275,13 @@ impl Clone for Tunnel {
             inner: Arc::clone(&self.inner),
         }
     }
+}
+
+/// 198.18.0.0/15 (RFC 2544 benchmarking): never routed on the internet,
+/// and the default fake-IP range of Surge, Clash/mihomo and sing-box.
+/// `Ipv4Addr::is_benchmarking` is still unstable.
+fn is_benchmarking_ip(ip: std::net::IpAddr) -> bool {
+    matches!(ip, std::net::IpAddr::V4(v4) if v4.octets()[0] == 198 && v4.octets()[1] & 0xfe == 18)
 }
 
 #[cfg(test)]
@@ -2245,5 +2299,145 @@ mod tests {
             survivor.run_until_closed(async { "relay" }).await,
             Some("relay")
         );
+    }
+
+    fn fake_ip_tunnel(range: &str) -> Tunnel {
+        let mut resolver = Resolver::new(
+            vec![],
+            vec![],
+            DnsMode::FakeIp,
+            DomainTrie::new(),
+            true,
+            true,
+        );
+        let pool = meow_dns::fakeip::Pool::new(
+            range.parse().unwrap(),
+            Arc::new(meow_dns::fakeip::MemoryStore::new(1024)),
+        )
+        .unwrap();
+        resolver.set_fakeip_v4(Arc::new(pool));
+        Tunnel::new(Arc::new(resolver))
+    }
+
+    fn tcp_flow(dst: [u8; 4], sniff_host: &str) -> Metadata {
+        Metadata {
+            network: Network::Tcp,
+            dst_ip: Some(std::net::IpAddr::from(dst)),
+            dst_port: 443,
+            sniff_host: sniff_host.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn benchmarking_range_is_198_18_slash_15() {
+        for (ip, want) in [
+            ("198.17.255.255", false),
+            ("198.18.0.0", true),
+            ("198.18.1.220", true),
+            ("198.19.255.255", true),
+            ("198.20.0.0", false),
+            ("28.0.0.1", false),
+            ("::ffff:198.18.0.1", false),
+        ] {
+            assert_eq!(is_benchmarking_ip(ip.parse().unwrap()), want, "{ip}");
+        }
+    }
+
+    /// A LAN gateway's fake IP (Surge / Clash, 198.18.0.0/15) outside our
+    /// own range: the sniffed name replaces the literal, which no proxy can
+    /// reach.
+    #[test]
+    fn foreign_fake_ip_dials_the_sniffed_name() {
+        // Mobile clients pin 28.0.0.0/8; desktop defaults to 198.18.0.1/16,
+        // which leaves Surge's upper half 198.19.0.0/16 foreign.
+        for (range, dst) in [
+            ("28.0.0.0/8", [198, 18, 1, 220]),
+            ("198.18.0.1/16", [198, 19, 0, 5]),
+        ] {
+            let tunnel = fake_ip_tunnel(range);
+            let inner = tunnel.inner();
+            let mut md = tcp_flow(dst, "account.example.com");
+            assert!(inner.needs_sniffed_name(&md), "{range}");
+            assert_eq!(
+                inner.pre_handle_metadata(&mut md),
+                PreHandleVerdict::Continue
+            );
+            assert_eq!(md.host, "account.example.com", "{range}");
+            assert_eq!(md.dst_ip, None, "{range}");
+        }
+    }
+
+    /// Everything outside the rescue keeps its literal: a real address
+    /// even with a sniffed name (`override-destination` stays the only
+    /// switch for that), a foreign fake IP with nothing sniffed, a sniffed
+    /// IP literal, and a snooped name, which wins over the sniffed one.
+    #[test]
+    fn foreign_fake_ip_rescue_leaves_other_flows_alone() {
+        let tunnel = fake_ip_tunnel("28.0.0.0/8");
+        let inner = tunnel.inner();
+
+        let mut real = tcp_flow([93, 184, 216, 34], "example.com");
+        assert!(!inner.needs_sniffed_name(&real));
+        assert_eq!(
+            inner.pre_handle_metadata(&mut real),
+            PreHandleVerdict::Continue
+        );
+        assert_eq!(real.host, "");
+        assert_eq!(real.dst_ip, Some([93, 184, 216, 34].into()));
+
+        for sniffed in ["", "198.18.1.220"] {
+            let mut md = tcp_flow([198, 18, 1, 220], sniffed);
+            assert_eq!(
+                inner.pre_handle_metadata(&mut md),
+                PreHandleVerdict::Continue
+            );
+            assert_eq!(md.host, "", "sniffed {sniffed:?}");
+            assert_eq!(
+                md.dst_ip,
+                Some([198, 18, 1, 220].into()),
+                "sniffed {sniffed:?}"
+            );
+        }
+
+        tunnel.resolver().preload_cache(
+            "snooped.example.com",
+            &[[198, 18, 1, 220].into()],
+            std::time::Duration::from_secs(60),
+        );
+        let mut snooped = tcp_flow([198, 18, 1, 220], "sni.example.com");
+        assert!(!inner.needs_sniffed_name(&snooped));
+        assert_eq!(
+            inner.pre_handle_metadata(&mut snooped),
+            PreHandleVerdict::Continue
+        );
+        assert_eq!(snooped.host, "snooped.example.com");
+        assert_eq!(snooped.dst_ip, Some([198, 18, 1, 220].into()));
+    }
+
+    /// The sniff gate mirrors the rescue paths: an unmapped address in our
+    /// own range needs a name, a mapped one and any named flow do not.
+    #[tokio::test]
+    async fn needs_sniffed_name_follows_the_pool() {
+        let tunnel = fake_ip_tunnel("28.0.0.0/8");
+        let inner = tunnel.inner();
+        assert!(inner.needs_sniffed_name(&tcp_flow([28, 0, 0, 9], "")));
+
+        let mapped = tunnel
+            .resolver()
+            .lookup_ipv4("mapped.example.com")
+            .await
+            .unwrap();
+        let mut md = tcp_flow([0, 0, 0, 0], "");
+        md.dst_ip = Some(mapped);
+        assert!(!inner.needs_sniffed_name(&md));
+
+        let mut named = tcp_flow([198, 18, 1, 220], "");
+        named.host = "socks.example.com".into();
+        assert!(!inner.needs_sniffed_name(&named));
+        // A literal in `host` is no name.
+        named.host = "198.18.1.220".into();
+        named.dst_ip = None;
+        assert!(inner.needs_sniffed_name(&named));
     }
 }

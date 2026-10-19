@@ -25,6 +25,26 @@ the canonical, in-repo source a release is cut from.
   normal pick. There is no config change and
   no mihomo equivalent. UDP chains and the relay-based fallback wrapper
   (`anytls`, `hysteria2`, `ss` with an external plugin) are not covered.
+- **`meow_tunnel::sniff::sniff_unnamed`** for inbounds that hand
+  `handle_tcp` a raw netstack stream, such as the Android client's
+  tun2socks. For a flow the tunnel cannot name (an unmapped address in its
+  own fake-IP range, or another resolver's fake IP as below) it reads the
+  client's first bytes for up to 200 ms, records the TLS SNI or HTTP `Host`
+  as the sniffed name, and replays the bytes to the upstream. Every other
+  flow is passed through unread.
+
+### Fixed
+
+- **Another resolver's fake IP dials the sniffed name**: when a phone on a
+  LAN with a Surge (or Clash) gateway resolves a name while the VPN is down,
+  the app caches the gateway's fake IP from 198.18.0.0/15. Once the VPN is
+  back the flow reaches the tunnel with that literal and no name, matches
+  by IP and goes to a proxy, which cannot reach the range, so the
+  connection hangs until the app re-resolves. Such a destination, outside
+  the tunnel's own fake-IP range and with no snooped name, now dials the
+  name the sniffer saw, as a stale address in the own range already did,
+  and the connection notes say so. This holds with
+  `override-destination: false`; real addresses keep their literal.
 
 ## [0.24.0] - 2026-10-18
 
