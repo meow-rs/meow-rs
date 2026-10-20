@@ -99,7 +99,7 @@ impl<S> HttpObfs<S> {
 fn build_http_request(host: &str, port: u16, body: &[u8]) -> Vec<u8> {
     let mut rand_bytes = [0u8; 16];
     rand::rng().fill_bytes(&mut rand_bytes);
-    let key = base64::engine::general_purpose::URL_SAFE.encode(rand_bytes);
+    let key = encode_websocket_key(rand_bytes);
 
     // mihomo writes the request through Go's `Request.Write`, which blanks a
     // `Host` that fails `httpguts.ValidHostHeader` (go.dev/issue/61431), and
@@ -120,24 +120,34 @@ fn build_http_request(host: &str, port: u16, body: &[u8]) -> Vec<u8> {
 
     use std::io::Write;
     let mut req = Vec::with_capacity(256 + body.len());
+    // Match mihomo's github.com/metacubex/http Request.Write byte order. A
+    // few deployed simple-obfs frontends use a strict HTTP-shaped matcher
+    // instead of a fully conforming parser, so semantically equivalent header
+    // permutations can be rejected before the encrypted response begins.
     let _ = write!(
         req,
         "GET / HTTP/1.1\r\n\
          Host: {}\r\n\
          User-Agent: curl/7.{}.{}\r\n\
-         Upgrade: websocket\r\n\
-         Connection: Upgrade\r\n\
-         Sec-WebSocket-Key: {}\r\n\
          Content-Length: {}\r\n\
+         Connection: Upgrade\r\n\
+         Sec-Websocket-Key: {}\r\n\
+         Upgrade: websocket\r\n\
          \r\n",
         host_header,
         ua_maj,
         ua_min,
-        key,
-        body.len()
+        body.len(),
+        key
     );
     req.extend_from_slice(body);
     req
+}
+
+fn encode_websocket_key(random: [u8; 16]) -> String {
+    // Match the de-facto simple-obfs HTTP transport used by mihomo. Its
+    // WebSocket-shaped handshake deliberately uses URL-safe Base64.
+    base64::engine::general_purpose::URL_SAFE.encode(random)
 }
 
 /// Go `httpguts.validHostByte`: the bytes `net/http` accepts in a `Host`
@@ -198,13 +208,27 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for HttpObfs<S> {
                 ready!(Pin::new(&mut this.inner).poll_read(cx, &mut rb))?;
                 let n = rb.filled().len();
                 if n == 0 {
-                    return Poll::Ready(Ok(())); // EOF before headers complete
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "obfs http: peer closed before response headers",
+                    )));
                 }
                 this.response_scratch.extend_from_slice(&tmp[..n]);
                 if let Some(idx) = find_double_crlf(&this.response_scratch) {
                     this.first_response = false;
                     let body_start = idx + 4;
                     let body = &this.response_scratch[body_start..];
+                    if body.is_empty() {
+                        // AsyncRead reserves an empty successful read for EOF.
+                        // A simple-obfs peer may send the HTTP response headers
+                        // and the encrypted Shadowsocks response in separate TCP
+                        // packets. Poll the underlying stream again instead of
+                        // reporting a false EOF after consuming a header-only
+                        // packet.
+                        this.response_scratch.clear();
+                        this.response_scratch.shrink_to_fit();
+                        return Pin::new(&mut this.inner).poll_read(cx, buf);
+                    }
                     let take = body.len().min(buf.remaining());
                     buf.put_slice(&body[..take]);
                     if take < body.len() {
@@ -651,7 +675,7 @@ mod tests {
         assert!(s.contains("Upgrade: websocket\r\n"));
         assert!(s.contains("Connection: Upgrade\r\n"));
         assert!(s.contains(&format!("Content-Length: {}\r\n", body.len())));
-        assert!(s.contains("Sec-WebSocket-Key: "));
+        assert!(s.contains("Sec-Websocket-Key: "));
         assert!(s.ends_with("\r\n\r\n"));
         assert_eq!(&req[req.len() - body.len()..], body);
     }
@@ -661,6 +685,39 @@ mod tests {
         let req = build_http_request("example.com", 8080, b"x");
         let s = std::str::from_utf8(&req).unwrap();
         assert!(s.contains("Host: example.com:8080\r\n"));
+    }
+
+    #[test]
+    fn http_request_matches_mihomo_header_order() {
+        let req = build_http_request("example.com", 8080, b"payload");
+        let text = String::from_utf8(req).unwrap();
+        let header = text.split("\r\n\r\n").next().unwrap();
+        let names: Vec<&str> = header
+            .lines()
+            .skip(1)
+            .map(|line| line.split(':').next().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "Host",
+                "User-Agent",
+                "Content-Length",
+                "Connection",
+                "Sec-Websocket-Key",
+                "Upgrade",
+            ]
+        );
+    }
+
+    #[test]
+    fn websocket_key_matches_mihomo_url_safe_alphabet() {
+        let key = encode_websocket_key([0xfb; 16]);
+        assert_eq!(key, "-_v7-_v7-_v7-_v7-_v7-w==");
+        let decoded = base64::engine::general_purpose::URL_SAFE
+            .decode(key)
+            .unwrap();
+        assert_eq!(decoded, vec![0xfb; 16]);
     }
 
     #[test]
@@ -802,6 +859,27 @@ mod tests {
         let mut got = Vec::new();
         obfs.read_to_end(&mut got).await.unwrap();
         assert_eq!(got, b"HELLO_BODY_BYTES_AND_MORE");
+    }
+
+    #[tokio::test]
+    async fn http_obfs_waits_when_response_headers_arrive_without_body() {
+        let (client, mut server) = tokio::io::duplex(8192);
+        let mut obfs = HttpObfs::new(client, "example.com".to_string(), 80).unwrap();
+
+        let sender = tokio::spawn(async move {
+            server
+                .write_all(b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\n\r\n")
+                .await
+                .unwrap();
+            server.flush().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            server.write_all(b"HELLO").await.unwrap();
+        });
+
+        let mut got = [0u8; 5];
+        obfs.read_exact(&mut got).await.unwrap();
+        sender.await.unwrap();
+        assert_eq!(&got, b"HELLO");
     }
 
     // ---- TlsObfs round-trip ----

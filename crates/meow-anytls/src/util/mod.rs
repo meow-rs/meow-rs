@@ -23,7 +23,7 @@ pub use cert_reloader::*;
 pub use dns_cache::*;
 pub use error::*;
 pub use net::*;
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 pub use socket_protect::{
     SocketProtector, clear_socket_protector, set_socket_protector, socket_protector,
 };
