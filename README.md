@@ -6,7 +6,7 @@
 
 A high-performance Rust implementation of the [mihomo](https://github.com/MetaCubeX/mihomo) (Clash Meta) proxy kernel. Rule-based tunneling with support for multiple proxy protocols, transparent proxy, DNS snooping, a persistent logbook, a REST API, and a built-in web dashboard.
 
-Beyond mihomo, meow keeps [`dialer-proxy` chains](#dialer-proxy-chains) working when a member of the dialer group can pass its URL test but not reach the chained server, and keeps a [logbook](#logbook) of what the engine did (reloads, provider failures, crashes, group switches) that survives restarts.
+Beyond mihomo, meow keeps [`dialer-proxy` chains](#dialer-proxy-chains) working when a member of the dialer group can pass its URL test but not reach the chained server, and keeps a [logbook](#logbook) of what the engine did (reloads, provider failures, crashes, chained nodes going down) that survives restarts.
 
 ## Features
 
@@ -74,7 +74,7 @@ A persistent record of the engine events worth reading later, like Surge's Logbo
 - config reloads and API edits, with the error when a reload is rejected
 - subscription, proxy-provider, rule-provider and geodata updates, and their failures
 - listeners that did not start, and outbound interface changes
-- `dialer-proxy` chains moving to another member, and chained nodes whose health check failed through every member tried
+- `dialer-proxy` chains moving to another member, and chained nodes that went down: their health check failed through every member tried, or their dials failed until a group took them down between health checks
 
 Repeats of a failure fold into one entry with a count: a provider that fails every minute for a day is one entry with a count of 1440. Entries live in an SQLite database under `<home>/logbook/` for 7 days (up to 2 MiB) and survive restarts and crashes. `GET /logbook` filters by level, kind and subject, pages back with `before` and polls with `since`, and a client app in another process can read the database directly. The logbook never records where user traffic goes, and records rule edits by index, not rule text.
 

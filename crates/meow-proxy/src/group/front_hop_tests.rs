@@ -255,6 +255,116 @@ async fn a_front_group_with_no_live_member_left_counts_against_the_outbound() {
     assert!(!w.daniel.alive());
 }
 
+/// A chained outbound its group's dials take down between health checks:
+/// no health check failed, so the logbook records it then, with the member
+/// of the front group the dials went through, and the next passing health
+/// check ends it.
+#[tokio::test]
+async fn a_chained_outbound_its_dials_take_down_is_in_the_logbook() {
+    use super::fallback::FallbackGroup;
+    use super::test_support::{registry_of, ChainedProxy, StreamProxy, TestLogbook};
+    let book = TestLogbook::install();
+    let refusing = MockProxy::new_failing("SG-01", AdapterType::Vless, "connection refused");
+    refusing.set_delay(10);
+    let clean = StreamProxy::new("HK-01", "10.0.0.2:443");
+    let clean_member: Arc<dyn Proxy> = Arc::clone(&clean) as _;
+    clean_member.health().set_alive(false);
+    let fast: Arc<dyn Proxy> = Arc::new(UrlTestGroup::new(
+        "fast",
+        vec![Arc::clone(&refusing) as Arc<dyn Proxy>, clean_member],
+        0,
+    ));
+    let registry = registry_of(&[&fast]);
+    let owner = "daniel-dials";
+    let daniel: Arc<dyn Proxy> =
+        ChainedProxy::new(owner, "snell.example.com:8443", "fast", &registry);
+    daniel.health().record_delay(30);
+    let wind: Arc<dyn Proxy> = Arc::new(FallbackGroup::new("风之谷", vec![Arc::clone(&daniel)]));
+
+    assert!(wind.dial_tcp(&Metadata::default()).await.is_err());
+    assert!(!daniel.alive());
+    let entries = book.entries(owner);
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(
+        (entries[0].kind.as_str(), entries[0].level),
+        (logbook::kind::DIALER_PROXY_CHECK, Level::Error)
+    );
+    assert_eq!(
+        entries[0].message,
+        "'daniel-dials' is down until its next health check: its dials from '风之谷' failed \
+         (connection refused) through 'SG-01' of 'fast'"
+    );
+    let fields = &entries[0].fields;
+    assert_eq!(
+        (
+            &fields["group"],
+            &fields["member"],
+            &fields["by"],
+            &fields["reason"]
+        ),
+        (
+            &"fast".into(),
+            &"SG-01".into(),
+            &"风之谷".into(),
+            &"connection refused".into()
+        )
+    );
+
+    // HK-01 is back, and the health check reaches the server through it.
+    clean.set_delay(20);
+    let swept = crate::health::sweep_members(
+        vec![(owner.to_owned(), Arc::clone(&daniel))],
+        std::slice::from_ref(&fast),
+        "http://probe.example/generate_204",
+        None,
+        Duration::from_secs(5),
+        1,
+        Duration::from_secs(600),
+    )
+    .await;
+    assert!(swept[0].delay > 0, "{swept:?}");
+    let checks: Vec<_> = book
+        .entries(owner)
+        .into_iter()
+        .filter(|e| e.kind == logbook::kind::DIALER_PROXY_CHECK)
+        .collect();
+    assert_eq!(checks.len(), 2, "{checks:?}");
+    assert_eq!(
+        (checks[0].level, checks[0].message.as_str()),
+        (Level::Info, "'daniel-dials' passes its health check again")
+    );
+}
+
+/// An outbound whose front is a single proxy, or that has none, is not a
+/// chain the logbook follows: its group takes it down without an entry.
+#[tokio::test]
+async fn an_outbound_its_dials_take_down_without_a_front_group_is_not_recorded() {
+    use super::fallback::FallbackGroup;
+    use super::test_support::{registry_of, ChainedProxy, TestLogbook};
+    let book = TestLogbook::install();
+    let front: Arc<dyn Proxy> =
+        MockProxy::new_failing("single-front", AdapterType::Vless, "connection refused");
+    let registry = registry_of(&[&front]);
+    let chained: Arc<dyn Proxy> = ChainedProxy::new(
+        "over-single-front",
+        "snell.example.com:8443",
+        "single-front",
+        &registry,
+    );
+    chained.health().record_delay(30);
+    let unchained: Arc<dyn Proxy> =
+        MockProxy::new_failing("unchained-dials", AdapterType::Vless, "connection refused");
+    unchained.health().record_delay(30);
+
+    for member in [chained, unchained] {
+        let group: Arc<dyn Proxy> =
+            Arc::new(FallbackGroup::new("风之谷", vec![Arc::clone(&member)]));
+        assert!(group.dial_tcp(&Metadata::default()).await.is_err());
+        assert!(!member.alive(), "{}", member.name());
+        assert!(book.entries(member.name()).is_empty(), "{}", member.name());
+    }
+}
+
 /// A url-test front keeps a target's chains on their carrier while the
 /// fastest member to the test URL changes, and moves them once the carrier
 /// is blocked for the target, which the logbook records under the chained

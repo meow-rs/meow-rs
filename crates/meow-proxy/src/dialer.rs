@@ -970,12 +970,14 @@ impl NamedProxyDialer {
     }
 
     /// The front hop, counting into the statistics of the tunnel that owns
-    /// this generation.
+    /// this generation. A group dialling the outbound learns the front (see
+    /// [`crate::group::dialled_through`]).
     fn front(&self) -> io::Result<ProxyDialer> {
         let front = self
             .target
             .resolve()
             .ok_or_else(|| io::Error::other(self.target.missing_error()))?;
+        crate::group::dialled_through(&front);
         Ok(ProxyDialer::new(front).counting_into(self.target.traffic()))
     }
 

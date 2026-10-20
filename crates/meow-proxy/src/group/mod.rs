@@ -173,12 +173,15 @@ impl DialFailureTracker {
 /// describe the *target* (Direct / Reject family) are never tracked, and
 /// everything else escalates through the group's [`DialFailureTracker`].
 /// Escalation marks the failed member dead — see [`DialFailureTracker`] for
-/// why this stands in for mihomo's forced health check.
+/// why this stands in for mihomo's forced health check. A chained outbound
+/// marked dead so is recorded in the logbook (`chain` is the dial's path,
+/// see [`record_chained_down`]).
 pub(super) fn record_dial_failure(
     group_name: &str,
     tracker: &DialFailureTracker,
     member: &Arc<dyn Proxy>,
     err: &MeowError,
+    chain: Option<&ChainedDial>,
 ) {
     if matches!(
         member.adapter_type(),
@@ -193,11 +196,53 @@ pub(super) fn record_dial_failure(
     }
     if tracker.on_failure(err) {
         debug!(
-            "proxy-group '{group_name}': marking member '{}' dead after repeated dial failures",
+            "proxy-group '{group_name}': marking member '{}' dead after repeated dial failures \
+             ({err})",
             member.name()
         );
         member.health().set_alive(false);
+        if let Some(chain) = chain {
+            record_chained_down(group_name, member.name(), err, chain);
+        }
     }
+}
+
+/// The `dialer-proxy` front hop a member dial went through: an automatic
+/// group ([`dialled_through`]), and the member of it the dial took, when it
+/// got that far.
+pub(super) struct ChainedDial {
+    front: Arc<dyn Proxy>,
+    member: Option<Arc<dyn Proxy>>,
+}
+
+/// Record that `group`'s dial failures took `owner`, a chained outbound,
+/// down. No health check saw it fail, and until its next one passes, which
+/// records the recovery, the outbound is out of every group that holds it.
+/// The reason is [`failure_reason`]'s, so no error text reaches the
+/// logbook.
+fn record_chained_down(group: &str, owner: &str, err: &MeowError, chain: &ChainedDial) {
+    let front = chain.front.name();
+    let reason = failure_reason(&err.to_string());
+    let path = match &chain.member {
+        Some(member) => format!("'{}' of '{front}'", member.name()),
+        None => format!("'{front}'"),
+    };
+    let mut event = logbook::event(
+        logbook::kind::DIALER_PROXY_CHECK,
+        Level::Error,
+        format!(
+            "'{owner}' is down until its next health check: its dials from '{group}' failed \
+             ({reason}) through {path}"
+        ),
+    )
+    .subject(owner)
+    .field("group", front)
+    .field("reason", reason)
+    .field("by", group);
+    if let Some(member) = &chain.member {
+        event = event.field("member", member.name());
+    }
+    event.coalesce().record();
 }
 
 tokio::task_local! {
@@ -215,6 +260,28 @@ struct MemberDial {
     /// The member the last group dialled on the path took. A front hop
     /// that fails reads it ([`last_pick_is`]).
     pick: RefCell<Option<Arc<dyn Proxy>>>,
+    /// The automatic group a `dialer-proxy` front hop on the path dialled
+    /// through ([`dialled_through`]).
+    front: RefCell<Option<Arc<dyn Proxy>>>,
+}
+
+impl MemberDial {
+    /// The front hop the dial went through, if any.
+    fn chain(&self) -> Option<ChainedDial> {
+        Some(ChainedDial {
+            front: self.front.take()?,
+            member: self.pick.take(),
+        })
+    }
+}
+
+/// A `dialer-proxy` front hop on the current member dial resolved to
+/// `front`. An automatic group is noted, so a group that takes the chained
+/// outbound down for its dial failures can say through which member.
+pub(crate) fn dialled_through(front: &Arc<dyn Proxy>) {
+    if front.chain_health().is_some() {
+        let _ = MEMBER_DIAL.try_with(|dial| dial.front.replace(Some(Arc::clone(front))));
+    }
 }
 
 /// The current dial failed at a `dialer-proxy` front hop, for the front
@@ -312,13 +379,16 @@ impl<'a> DialAttempt<'a> {
         let _ = MEMBER_DIAL.try_with(|outer| outer.pick.replace(Some(Arc::clone(self.member))));
         let deadline = self.deadline;
         let member = self.member.name();
-        let (result, front_failed) = MEMBER_DIAL
+        let (result, (front_failed, chain)) = MEMBER_DIAL
             .scope(MemberDial::default(), async {
                 let result = match deadline {
                     Some(_) => meow_common::with_dial_timeout(member, dial).await,
                     None => dial.await,
                 };
-                (result, MEMBER_DIAL.with(|dial| dial.front_failed.get()))
+                (
+                    result,
+                    MEMBER_DIAL.with(|dial| (dial.front_failed.get(), dial.chain())),
+                )
             })
             .await;
         self.deadline = None;
@@ -330,7 +400,13 @@ impl<'a> DialAttempt<'a> {
                 self.group_name,
                 self.member.name()
             ),
-            Err(err) => record_dial_failure(self.group_name, self.tracker, self.member, err),
+            Err(err) => record_dial_failure(
+                self.group_name,
+                self.tracker,
+                self.member,
+                err,
+                chain.as_ref(),
+            ),
         }
         result
     }
@@ -346,7 +422,9 @@ impl Drop for DialAttempt<'_> {
                 std::io::ErrorKind::TimedOut,
                 "outbound dial deadline elapsed",
             ));
-            record_dial_failure(self.group_name, self.tracker, self.member, &err);
+            // The dial's path went with its scope: a chained outbound taken
+            // down here is not in the logbook until its health check fails.
+            record_dial_failure(self.group_name, self.tracker, self.member, &err, None);
         }
     }
 }
