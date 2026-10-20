@@ -25,6 +25,9 @@ boring-tls = []
 # Off by default — adds the `zip` dependency (ADR-0007 binary-size caps).
 # Force-disabled at compile time on iOS/Android even if enabled.
 external-ui-download = ["meow-config/external-ui-download"]
+# Persistent logbook (ADR-0014): bundles SQLite. In `full`; excluded from
+# `minimal` (ADR-0007 binary-size caps), where `GET /logbook` reports it off.
+logbook = ["meow-common/logbook"]
 # Heap profiling via dhat crate — swaps global allocator; never enable in production.
 dhat-heap = ["dhat"]
 
@@ -82,6 +85,7 @@ full = [
     "ss", "trojan", "vless", "vless-vision", "vless-encryption", "vmess", "snell", "hysteria2", "anytls", "ech-tls-tunnel", "mux", "kcptun",
     "dns-server", "dns-encrypted",
     "listener-http", "listener-socks5", "listener-tproxy", "listener-mixed", "listener-tun",
+    "logbook",
 ]
 
 [[bin]]

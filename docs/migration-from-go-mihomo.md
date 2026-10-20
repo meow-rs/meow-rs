@@ -574,6 +574,7 @@ tools built for Go mihomo will ignore them.
 | Subscription management API | `GET\|POST /api/subscriptions`, `DELETE /api/subscriptions/{name}`, `POST /api/subscriptions/{name}/refresh` | meow-rs-specific |
 | Extended proxy group API | `GET\|POST\|PUT\|DELETE /api/proxy-groups[/:name]` | meow-rs-specific |
 | Rule CRUD API | `POST\|PUT\|DELETE /rules[/:index]` | Runtime rule editing |
+| Logbook | `GET\|DELETE /logbook`, `logbook: {enable: true}` | Persistent record of notable engine events, kept 7 days in `<home>/logbook/logbook.db`; not in `minimal` builds ([ADR-0014](adr/0014-logbook.md)) |
 
 Keep these under the `/api/` prefix so they do not collide with
 Clash-compatible paths.
@@ -591,6 +592,7 @@ meow-rs uses Cargo feature flags where Go mihomo uses build tags:
 | Full app bundle | `meow-app/full` | on |
 | Minimal app bundle | `meow-app/minimal` | off |
 | AnyTLS outbound | `meow-app/anytls` (in `full`, not in `minimal`) | on |
+| Logbook (bundles SQLite) | `meow-app/logbook` (in `full`, not in `minimal`) | on |
 
 To build without encrypted DNS (smaller binary):
 
@@ -759,6 +761,34 @@ The following are unsupported or intentionally rejected:
   provider group membership (invisible to the static cycle check) is
   bounded at 16 hops and fails the dial — Go's growable stacks tolerate
   unbounded recursion where Rust's fixed async frames cannot.
+
+  **Chain-aware member selection** (a meow extension; mihomo has none). A
+  `url-test`, `fallback` or `load-balance` group used as a `dialer-proxy`
+  keeps per-server verdicts for its members, because a member can pass the
+  group's URL test and still be unable to reach the chained outbound's
+  server (an airport whose audit rules drop the port). A lazy front
+  (VLESS, Trojan, Shadowsocks) returns before the remote side connects, so
+  such a member shows up only as `Connected in 0 ms` followed by EOF or a
+  broken pipe. The group now skips a member for that server once:
+  - two chains through it in a row closed before any reply byte, or
+  - the health check's chain probe (`[member, outbound]` to the group's
+    URL, run after each sweep: the group's pick first, then the fastest,
+    until 3 pass and at most 12 probes) failed through it.
+
+  The skip holds for that server only, and other traffic through the group
+  still uses its normal pick. Blocks back off from 5 minutes to 6 hours,
+  and any success clears them. With every live member blocked, the group's
+  own pick stands, and its failures count against the chained outbound.
+  When a 4th member in a row fails the same server, none reaching it in
+  between, the server is taken for the fault too: its chains count against
+  the chained outbound and block no member until one reaches it again. A
+  chained outbound that is down comes back as soon as a chain probe reaches
+  its server through any member, without waiting for the health check of
+  the group holding it. There is no config change and `select` groups are
+  untouched. Not
+  covered: UDP chains, and outbounds on the relay-based fallback wrapper
+  (`anytls`, `hysteria2`, `ss` with an external plugin), whose front hop
+  ignores the verdicts.
 
 ---
 

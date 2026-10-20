@@ -1250,6 +1250,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "fallible-iterator"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2acce4a10f12dc2fb14a218589d4f1f62ef011b2d0cc4b3cb1bba8e94da14649"
+
+[[package]]
+name = "fallible-streaming-iterator"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
+
+[[package]]
 name = "fastrand"
 version = "2.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2186,6 +2198,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "libsqlite3-sys"
+version = "0.38.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1d20bef17f513b9b3004532233187769cd072d790971f4e4da0e346eb6401e8"
+dependencies = [
+ "cc",
+ "pkg-config",
+ "vcpkg",
+]
+
+[[package]]
 name = "linked-hash-map"
 version = "0.5.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2322,7 +2345,7 @@ dependencies = [
 
 [[package]]
 name = "meow-anytls"
-version = "0.23.1"
+version = "0.24.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2351,7 +2374,7 @@ dependencies = [
 
 [[package]]
 name = "meow-api"
-version = "0.23.1"
+version = "0.24.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2392,7 +2415,7 @@ dependencies = [
 
 [[package]]
 name = "meow-app"
-version = "0.23.1"
+version = "0.24.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2425,7 +2448,7 @@ dependencies = [
 
 [[package]]
 name = "meow-bench"
-version = "0.23.1"
+version = "0.24.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2439,7 +2462,7 @@ dependencies = [
 
 [[package]]
 name = "meow-common"
-version = "0.23.1"
+version = "0.24.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2448,6 +2471,7 @@ dependencies = [
  "libc",
  "libproc",
  "parking_lot",
+ "rusqlite",
  "serde",
  "serde_json",
  "smol_str",
@@ -2463,7 +2487,7 @@ dependencies = [
 
 [[package]]
 name = "meow-config"
-version = "0.23.1"
+version = "0.24.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2495,7 +2519,7 @@ dependencies = [
 
 [[package]]
 name = "meow-dns"
-version = "0.23.1"
+version = "0.24.0"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -2521,7 +2545,7 @@ dependencies = [
 
 [[package]]
 name = "meow-listener"
-version = "0.23.1"
+version = "0.24.0"
 dependencies = [
  "async-trait",
  "base64",
@@ -2550,7 +2574,7 @@ dependencies = [
 
 [[package]]
 name = "meow-lwip"
-version = "0.23.1"
+version = "0.24.0"
 dependencies = [
  "bindgen",
  "bytes",
@@ -2564,7 +2588,7 @@ dependencies = [
 
 [[package]]
 name = "meow-proxy"
-version = "0.23.1"
+version = "0.24.0"
 dependencies = [
  "aes 0.8.4",
  "aes-gcm 0.10.3",
@@ -2618,7 +2642,7 @@ dependencies = [
 
 [[package]]
 name = "meow-rules"
-version = "0.23.1"
+version = "0.24.0"
 dependencies = [
  "criterion",
  "ipnet",
@@ -2635,7 +2659,7 @@ dependencies = [
 
 [[package]]
 name = "meow-transport"
-version = "0.23.1"
+version = "0.24.0"
 dependencies = [
  "aes 0.9.3",
  "aes-gcm 0.10.3",
@@ -2686,7 +2710,7 @@ dependencies = [
 
 [[package]]
 name = "meow-trie"
-version = "0.23.1"
+version = "0.24.0"
 dependencies = [
  "criterion",
  "proptest",
@@ -2694,7 +2718,7 @@ dependencies = [
 
 [[package]]
 name = "meow-tunnel"
-version = "0.23.1"
+version = "0.24.0"
 dependencies = [
  "async-trait",
  "criterion",
@@ -3618,6 +3642,19 @@ dependencies = [
  "netlink-packet-route 0.28.0",
  "netlink-sys",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "rusqlite"
+version = "0.40.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23f2a97da3e3873c73cb2a2e71b35c40ff95e0b1eefa8d72d8499a6928c3b5b3"
+dependencies = [
+ "bitflags",
+ "fallible-iterator",
+ "fallible-streaming-iterator",
+ "libsqlite3-sys",
+ "smallvec",
 ]
 
 [[package]]
@@ -4792,6 +4829,12 @@ name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
+
+[[package]]
+name = "vcpkg"
+version = "0.2.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
 name = "version_check"

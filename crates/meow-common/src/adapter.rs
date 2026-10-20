@@ -284,6 +284,13 @@ pub trait Proxy: ProxyAdapter {
     fn usage_generation(&self) -> u64 {
         0
     }
+
+    /// For automatic groups: which members cannot carry a `dialer-proxy`
+    /// chain to which server. Leaf adapters and manual groups return
+    /// `None`. See [`crate::chain_health`].
+    fn chain_health(&self) -> Option<&Arc<crate::chain_health::ChainHealth>> {
+        None
+    }
 }
 
 /// Call [`ProxyAdapter::reset_sessions`] once on every distinct adapter

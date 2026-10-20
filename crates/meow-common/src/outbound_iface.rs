@@ -51,17 +51,24 @@
 //!   down after its successor installed cannot clear or clobber the
 //!   successor's binding.
 //!
+//! The logbook records the binding a running configuration uses, not every
+//! owner: an owner counts once it is committed
+//! ([`OutboundIfaceGuard::commit`], when its TUN listener is up). While the
+//! newest owner is uncommitted — a reload candidate under validation —
+//! nothing is recorded, so a rejected candidate leaves no entries.
+//!
 //! The registry itself compiles on every platform so call sites stay free of
 //! `cfg` spaghetti; [`install_outbound_interface`] fails with `Unsupported`
 //! on platforms where the binding syscall is not implemented, which lets
 //! the TUN listener fail closed instead of starting a looping configuration.
 
+use crate::logbook;
 use std::io;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 /// One live owner of the binding.
 struct Owner {
@@ -70,6 +77,8 @@ struct Owner {
     /// OS interface index, resolved when the owner installed. What the
     /// index-keyed platforms bind to; Linux binds by name.
     index: u32,
+    /// Its configuration runs ([`OutboundIfaceGuard::commit`]).
+    committed: bool,
 }
 
 /// The socket option the binding uses on this platform, for log lines.
@@ -90,6 +99,10 @@ static OWNERS: RwLock<Vec<Owner>> = RwLock::new(Vec::new());
 /// overlapping owners routinely bind the same interface.
 static NEXT_OWNER_ID: AtomicU64 = AtomicU64::new(1);
 
+/// The binding the logbook last recorded as in effect. Taken while
+/// [`OWNERS`] is held, so changes record in the order they happened.
+static RECORDED: Mutex<Option<Arc<str>>> = Mutex::new(None);
+
 /// Ownership of one installation of the outbound-interface binding,
 /// returned by [`install_outbound_interface`]. Dropping it gives the
 /// binding up: the newest owner still alive takes over, or the binding is
@@ -108,6 +121,17 @@ impl OutboundIfaceGuard {
     pub fn interface(&self) -> &str {
         &self.iface
     }
+
+    /// Mark this owner's configuration as running, which the logbook then
+    /// records once it is the newest owner (see the [module docs](self)).
+    /// Idempotent.
+    pub fn commit(&self) {
+        let mut owners = OWNERS.write();
+        if let Some(owner) = owners.iter_mut().find(|o| o.id == self.id) {
+            owner.committed = true;
+        }
+        settle(owners);
+    }
 }
 
 impl Drop for OutboundIfaceGuard {
@@ -117,19 +141,19 @@ impl Drop for OutboundIfaceGuard {
             return;
         };
         owners.remove(pos);
-        if pos != owners.len() {
-            // A superseded owner left; the binding in effect is unchanged.
-            return;
-        }
-        let restored = owners.last().map(|o| Arc::clone(&o.iface));
-        drop(owners);
-        match restored {
-            Some(name) if *name == *self.iface => {}
-            Some(name) => {
-                tracing::info!("outbound interface binding restored to '{name}' ({MECHANISM})");
+        if pos == owners.len() {
+            match owners.last() {
+                Some(o) if *o.iface == *self.iface => {}
+                Some(o) => tracing::info!(
+                    "outbound interface binding restored to '{}' ({MECHANISM})",
+                    o.iface
+                ),
+                None => tracing::info!("outbound interface binding cleared"),
             }
-            None => tracing::info!("outbound interface binding cleared"),
         }
+        // A superseded owner leaving changes nothing in effect, but may have
+        // been the last committed one under a candidate.
+        settle(owners);
     }
 }
 
@@ -245,10 +269,11 @@ fn push_owner(iface: Arc<str>, index: u32) -> OutboundIfaceGuard {
         id,
         iface: Arc::clone(&iface),
         index,
+        committed: false,
     });
     drop(owners);
-    match superseded {
-        Some(prev) if *prev == *iface => {
+    match &superseded {
+        Some(prev) if **prev == *iface => {
             tracing::debug!("outbound interface binding '{iface}' taken over by a new owner");
         }
         Some(prev) => tracing::info!(
@@ -256,7 +281,60 @@ fn push_owner(iface: Arc<str>, index: u32) -> OutboundIfaceGuard {
         ),
         None => tracing::info!("outbound sockets bound to interface '{iface}' ({MECHANISM})"),
     }
+    // Uncommitted: nothing to record until its configuration runs.
     OutboundIfaceGuard { id, iface }
+}
+
+/// Logbook: record the binding the owners now leave in effect, if it is
+/// not what was last recorded. Nothing while the newest owner is
+/// uncommitted: what it binds is on trial, and what it supersedes is
+/// already recorded.
+fn settle(owners: parking_lot::RwLockWriteGuard<'_, Vec<Owner>>) {
+    let Some(now) = in_effect(&owners) else {
+        return;
+    };
+    let mut recorded = RECORDED.lock();
+    drop(owners);
+    if let Some(event) = binding_change(recorded.as_deref(), now.as_deref()) {
+        event.record();
+    }
+    *recorded = now;
+}
+
+/// The binding `owners` leave in effect for the logbook (`Some(None)`: no
+/// binding), or `None` while the newest owner is uncommitted.
+fn in_effect(owners: &[Owner]) -> Option<Option<Arc<str>>> {
+    match owners.last() {
+        Some(owner) if !owner.committed => None,
+        last => Some(last.map(|o| Arc::clone(&o.iface))),
+    }
+}
+
+/// The logbook entry for the binding in effect moving from `recorded` to
+/// `now`; `None` when it did not move.
+fn binding_change(recorded: Option<&str>, now: Option<&str>) -> Option<logbook::Event> {
+    let event = match (recorded, now) {
+        (recorded, Some(now)) if recorded != Some(now) => {
+            let event = logbook::event(
+                logbook::kind::NETWORK_INTERFACE,
+                logbook::Level::Info,
+                format!("Outbound connections bind to '{now}'"),
+            )
+            .field("interface", now);
+            match recorded {
+                Some(previous) => event.field("previous", previous),
+                None => event,
+            }
+        }
+        (Some(previous), None) => logbook::event(
+            logbook::kind::NETWORK_INTERFACE,
+            logbook::Level::Info,
+            format!("Outbound connections no longer bind to '{previous}'"),
+        )
+        .field("previous", previous),
+        _ => return None,
+    };
+    Some(event)
 }
 
 /// The interface currently in effect (the newest live owner's), if any.
@@ -402,6 +480,80 @@ mod pure_tests {
             assert!(!is_loopback(ip.parse().unwrap()), "{ip}");
         }
     }
+
+    fn owner(iface: &str, committed: bool) -> Owner {
+        Owner {
+            id: 0,
+            iface: Arc::from(iface),
+            index: 1,
+            committed,
+        }
+    }
+
+    #[test]
+    fn the_logbook_follows_the_newest_owner_once_committed() {
+        let effect = |owners: &[Owner]| in_effect(owners).map(|i| i.as_deref().map(str::to_owned));
+        assert_eq!(effect(&[]), Some(None));
+        assert_eq!(effect(&[owner("eth0", true)]), Some(Some("eth0".into())));
+        // A candidate on trial, alone or over the running owner.
+        assert_eq!(effect(&[owner("wlan0", false)]), None);
+        assert_eq!(effect(&[owner("eth0", true), owner("wlan0", false)]), None);
+        assert_eq!(
+            effect(&[owner("eth0", true), owner("wlan0", true)]),
+            Some(Some("wlan0".into()))
+        );
+        // An uncommitted owner under the newest does not hold it back.
+        assert_eq!(
+            effect(&[owner("eth0", false), owner("wlan0", true)]),
+            Some(Some("wlan0".into()))
+        );
+    }
+
+    #[test]
+    fn binding_changes_record_where_connections_bind_now() {
+        let change = |recorded, now| {
+            binding_change(recorded, now).map(|event| {
+                let field = |key| {
+                    event
+                        .fields()
+                        .get(key)
+                        .and_then(|v| v.as_str())
+                        .map(str::to_owned)
+                };
+                (
+                    event.message().to_owned(),
+                    field("interface"),
+                    field("previous"),
+                )
+            })
+        };
+        assert_eq!(change(None, None), None);
+        assert_eq!(change(Some("eth0"), Some("eth0")), None);
+        assert_eq!(
+            change(None, Some("eth0")),
+            Some((
+                "Outbound connections bind to 'eth0'".into(),
+                Some("eth0".into()),
+                None
+            ))
+        );
+        assert_eq!(
+            change(Some("eth0"), Some("wlan0")),
+            Some((
+                "Outbound connections bind to 'wlan0'".into(),
+                Some("wlan0".into()),
+                Some("eth0".into())
+            ))
+        );
+        assert_eq!(
+            change(Some("eth0"), None),
+            Some((
+                "Outbound connections no longer bind to 'eth0'".into(),
+                None,
+                Some("eth0".into())
+            ))
+        );
+    }
 }
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
@@ -427,6 +579,11 @@ mod tests {
         OWNERS.read().len()
     }
 
+    /// The binding the logbook last recorded.
+    fn recorded() -> Option<String> {
+        RECORDED.lock().as_deref().map(str::to_owned)
+    }
+
     fn lo() -> OutboundIfaceGuard {
         install_outbound_interface(LO).expect("loopback must exist")
     }
@@ -448,6 +605,11 @@ mod tests {
         assert_eq!(a.interface(), LO);
         assert_eq!(outbound_interface().as_deref(), Some(LO));
         assert_eq!(current_owner(), Some(a.id));
+        // In effect, but recorded only once committed.
+        assert_eq!(recorded(), None);
+        a.commit();
+        a.commit();
+        assert_eq!(recorded().as_deref(), Some(LO));
         // Binding a fresh socket to loopback succeeds, in both families
         // and for both socket types.
         for domain in [socket2::Domain::IPV4, socket2::Domain::IPV6] {
@@ -464,6 +626,22 @@ mod tests {
         drop(a);
         assert!(outbound_interface().is_none());
         assert_eq!(live_owners(), 0);
+        assert_eq!(recorded(), None);
+
+        // A rejected candidate: never committed, it records nothing, and
+        // neither does the running owner it superseded taking over again.
+        let running = lo();
+        running.commit();
+        let candidate = lo();
+        drop(candidate);
+        assert_eq!(recorded().as_deref(), Some(LO));
+        // The running owner leaving while a candidate is on trial records
+        // nothing yet: the candidate's commit or drop settles it.
+        let candidate = lo();
+        drop(running);
+        assert_eq!(recorded().as_deref(), Some(LO));
+        drop(candidate);
+        assert_eq!(recorded(), None);
 
         // With nothing installed, apply is a no-op.
         let socket2 = socket2::Socket::new(

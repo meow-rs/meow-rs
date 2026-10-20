@@ -7,6 +7,7 @@
 //! without reimplementing it.
 
 use meow_common::adapter::Proxy;
+use meow_common::logbook::{self, Level};
 use meow_config::geodata::download_and_replace;
 use meow_config::proxy_provider::ProxyProvider;
 use meow_config::raw::RawConfig;
@@ -80,10 +81,13 @@ pub async fn fetch_missing(
         );
         match download_and_replace(&t.url, &t.path, download_proxy).await {
             Ok(()) => downloaded.push(t.label),
-            Err(e) => warn!(
-                "geodata startup-fetch: {} download failed: {:#}",
-                t.label, e
-            ),
+            Err(e) => {
+                warn!(
+                    "geodata startup-fetch: {} download failed: {:#}",
+                    t.label, e
+                );
+                download_failed(t.label, &e);
+            }
         }
     }
     downloaded
@@ -269,15 +273,22 @@ pub async fn run_on_startup(
             // provider's load-time ctx — a DB arriving via this fetch only
             // reaches them at the next full config commit.
             info!("geodata startup-fetch: rules reloaded with downloaded DBs");
+            reloaded(&downloaded, "Downloaded");
         }
-        Ok(Err(e)) => warn!(
-            "geodata startup-fetch: rule rebuild failed after download: {:#}",
-            e
-        ),
-        Err(e) => warn!(
-            "geodata startup-fetch: rule rebuild task failed after download: {}",
-            e
-        ),
+        Ok(Err(e)) => {
+            warn!(
+                "geodata startup-fetch: rule rebuild failed after download: {:#}",
+                e
+            );
+            reload_failed(&downloaded, &format!("{e:#}"));
+        }
+        Err(e) => {
+            warn!(
+                "geodata startup-fetch: rule rebuild task failed after download: {}",
+                e
+            );
+            reload_failed(&downloaded, &e.to_string());
+        }
     }
 }
 
@@ -371,7 +382,7 @@ async fn auto_update_tick(
     asn_target: &std::path::Path,
     geosite_target: &std::path::Path,
 ) {
-    let mut any_updated = false;
+    let mut updated = Vec::new();
 
     let route = tunnel.route_snapshot();
     let proxies = &route.proxies;
@@ -382,19 +393,21 @@ async fn auto_update_tick(
 
     if let Err(e) = download_and_replace(&geo.asn_url, asn_target, download_proxy.as_ref()).await {
         warn!("geodata auto-update: ASN MMDB download failed: {:#}", e);
+        download_failed("ASN MMDB", &e);
     } else {
-        any_updated = true;
+        updated.push("ASN MMDB");
     }
 
     if let Err(e) =
         download_and_replace(&geo.geosite_url, geosite_target, download_proxy.as_ref()).await
     {
         warn!("geodata auto-update: geosite download failed: {:#}", e);
+        download_failed("geosite", &e);
     } else {
-        any_updated = true;
+        updated.push("geosite");
     }
 
-    if !any_updated {
+    if updated.is_empty() {
         warn!("geodata auto-update: all downloads failed; rules not reloaded");
         return;
     }
@@ -447,19 +460,66 @@ async fn auto_update_tick(
             )
             .await;
             info!("geodata auto-update: rules reloaded with updated DBs");
+            reloaded(&updated, "Updated");
         }
         Ok(Err(e)) => {
             warn!(
                 "geodata auto-update: rule rebuild failed after DB download: {:#}",
                 e
             );
+            reload_failed(&updated, &format!("{e:#}"));
         }
         Err(e) => {
             warn!(
                 "geodata auto-update: rule rebuild task failed after DB download: {}",
                 e
             );
+            reload_failed(&updated, &e.to_string());
         }
+    }
+}
+
+/// Logbook: downloading DB `label` failed. Each DB is its own subject, so
+/// a DB that keeps failing folds into one entry.
+fn download_failed(label: &'static str, error: &anyhow::Error) {
+    let error = format!("{error:#}");
+    logbook::event(
+        logbook::kind::GEODATA_UPDATE,
+        Level::Error,
+        format!("Downloading {label} failed: {error}"),
+    )
+    .subject(label)
+    .field("error", error)
+    .coalesce()
+    .record();
+}
+
+/// Logbook: the rules now use the downloaded DBs.
+fn reloaded(labels: &[&'static str], verb: &str) {
+    for label in labels {
+        logbook::event(
+            logbook::kind::GEODATA_UPDATE,
+            Level::Info,
+            format!("{verb} {label}"),
+        )
+        .subject(*label)
+        .record();
+    }
+}
+
+/// Logbook: DBs were downloaded, but rebuilding the rules on them failed,
+/// so the running rules still use the previous data.
+fn reload_failed(labels: &[&'static str], error: &str) {
+    for label in labels {
+        logbook::event(
+            logbook::kind::GEODATA_UPDATE,
+            Level::Error,
+            format!("Downloaded {label}, but reloading the rules failed: {error}"),
+        )
+        .subject(*label)
+        .field("error", error)
+        .coalesce()
+        .record();
     }
 }
 

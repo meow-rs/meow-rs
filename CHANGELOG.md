@@ -10,11 +10,143 @@ the canonical, in-repo source a release is cut from.
 
 ### Added
 
+- **Logbook** (`GET /logbook`, `DELETE /logbook`, a meow extension): a
+  persistent record of the engine events worth reading later, the way
+  Surge's Logbook sits next to its log. It keeps starts and stops, runs that
+  ended without a clean stop (a crash, a kill, a power cut), config reloads
+  and API edits, subscription, proxy-provider, rule-provider and geodata
+  updates and their failures, listeners that did not start, outbound
+  interface changes, and `dialer-proxy` chains changing the member that
+  carries them, failing their health check through every member tried, or
+  taken down by their own dial failures between health checks.
+  Repeats of a failure fold into one entry with a count.
+  Entries are kept in an SQLite database, `<home>/logbook/logbook.db`, for
+  7 days and 2 MiB, and survive restarts and crashes; the API filters by
+  level, kind and subject, pages back with `before` and polls with
+  `since`, and an app's UI in another process can read the database
+  directly. The logbook never records the destinations of user traffic,
+  and records rule edits by index, not rule text. On by default;
+  `logbook: {enable: false}` turns it off. It bundles SQLite (about
+  1 MiB), so it is in the `full` build and the release binaries but not in
+  `minimal`, where `GET /logbook` reports `enabled: false`. Details, the
+  schema and the event kinds are in ADR-0014.
+
+- **`dialer-proxy` groups skip members that cannot reach the chained
+  server**: a member of a `url-test`, `fallback` or `load-balance` group can
+  pass the group's URL test and still be unable to reach the server of the
+  outbound chained through it, for example when an airport's audit rules
+  drop the port. A lazy front returns before the remote side connects, so
+  the chain failed as `Connected in 0 ms` followed by EOF or a broken pipe,
+  and the group kept picking the member. The group now skips the member for
+  that server once two chains in a row close before any reply, or once the
+  health check's chain probe fails through it. The probe runs after each
+  sweep, starting with the group's pick, and stops when 3 members pass, at
+  most 12 probes per server. Blocks back off from 5 minutes to 6 hours and
+  clear on any success, and the rest of the group's traffic keeps its
+  normal pick. There is no config change and
+  no mihomo equivalent. UDP chains and the relay-based fallback wrapper
+  (`anytls`, `hysteria2`, `ss` with an external plugin) are not covered.
+
+- **A chained outbound stays in its group when its front hop fails**: an
+  outbound with `dialer-proxy` first in a `fallback` group (an own server
+  chained through an airport's `url-test`) left the group whenever the
+  front hop failed, not the server: one failed health-check probe through
+  a bad front member took it out until the next sweep, and a front member
+  refusing a connection marked it dead at once. Now:
+  - A `url-test` group keeps an outbound's chains on the member that last
+    carried them, the outbound's carrier, while that member is alive and
+    not blocked for its server, instead of following the fastest member
+    to the test URL. They move only when the carrier fails, or its group
+    marks it down. A `fallback` group keeps its order: chains return to
+    an earlier member once it is no longer blocked.
+  - A chained outbound that fails its health check is checked through up
+    to 3 other members of its `dialer-proxy` group (the carrier first,
+    each over a fresh connection) before it is taken for down. The member
+    its own probe went through counts as tried, not dialled again. When
+    one reaches the server, the outbound stays up, the members that
+    failed are blocked for that server, and the one that reached it
+    carries the chains.
+  - A dial whose front hop fails to connect counts against the front
+    group's member, not against the chained outbound in the group dialling
+    it, while the front group has another live member left. So does a
+    chain that closes before any reply through a member that was not yet
+    the outbound's carrier: a burst of such chains strikes the member, not
+    the outbound. A carrier's failure still counts against the outbound,
+    since its server is then the likelier fault, and so does the failure
+    of the front group's last live member, at once rather than after that
+    member is given up on.
+  - At most 3 members take the blame for one server in a row. When a 4th
+    member fails it too, with none reaching it in between, the server is
+    the likelier fault: its failures count against the outbound and block
+    no member, until a member reaches it again. Without the bound, a
+    server that was down struck every member of the front group in turn,
+    and a front member that reports the refusal in its dial (hysteria2)
+    was marked dead, all before the outbound left its group. A member the
+    group dials with every usable one blocked for the server is its last
+    resort, and its failures count against the outbound too: blocks left
+    from an earlier outage, or a group of 3 members or fewer, no longer
+    leave too few members to fail the server in a row.
+  - The 5 s dial deadline is judged the same way: a front member whose
+    dial hangs times out inside its own group's dial, which counts it, and
+    a chained handshake left unanswered until the deadline (a member that
+    black-holes the server's port) fails like a chain closed before any
+    reply. Before, an expired dial always counted against the chained
+    outbound.
+  - A chain probe round in which no member reaches the server blocks none
+    of them: the server is the likelier fault, and its members would
+    otherwise all be blocked when it comes back. A round probes members
+    blocked for the server too, so a passing probe clears a block early;
+    one that fails again stays blocked without its backoff growing each
+    round.
+  - A chained outbound that is down comes back as soon as a chain probe
+    of its `dialer-proxy` group reaches its server through any member:
+    the probe ran the outbound's own protocol to the test URL, so its
+    delay is recorded and the groups holding the outbound take it back,
+    rather than at their own next health check.
+
+### Fixed
+
+- **Another resolver's fake IP dials the sniffed name**: when a phone on a
+  LAN with a Surge (or Clash) gateway resolves a name while the VPN is down,
+  the app caches the gateway's fake IP from 198.18.0.0/15. Once the VPN is
+  back the flow reaches the tunnel with that literal and no name, matches
+  by IP and goes to a proxy, which cannot reach the range, so the
+  connection hangs until the app re-resolves. Such a destination, outside
+  the tunnel's own fake-IP range and with no snooped name, now dials the
+  name the sniffer saw, as a stale address in the own range already did,
+  and the connection notes say so. The literal is dropped whatever
+  `override-destination` says, including on the tproxy listener, so IP
+  rules and DIRECT use the name's real address; real addresses keep their
+  literal.
+- **`handle_tcp` sniffs flows it cannot name**: inbounds that hand the
+  tunnel a raw netstack stream (the TUN listener, the Android client's
+  tun2socks) had no sniffer, so an unmapped address in the own fake-IP
+  range was dropped and another resolver's fake IP black-holed. For those
+  flows only, `handle_tcp` now reads the client's first bytes for up to
+  200 ms, takes the TLS SNI or HTTP `Host` as the sniffed name, and relays
+  the bytes upstream first. Every other flow is relayed unread, and
+  callers need no change.
+
+## [0.24.0] - 2026-10-18
+
+### Added
+
 - **Traffic per proxy** (`GET /statistics`): the upload and download totals
   plus the bytes each proxy carried since the tunnel started, TCP and UDP,
   for a client's statistics screen. A group's traffic counts at the member
   that carried it (the `chains[0]` of `/connections`); a proxy keeps its
-  totals after its connections close, and after a reload removes it.
+  totals after its connections close, and after a reload removes it. The
+  member of a `dialer-proxy` group also counts the front hop it carries for
+  the outbound chained through it, TCP and UDP, so the node in the middle
+  of a chain shows its traffic too, health probes and downloads through the
+  chain included; the upload and download totals still count each
+  connection once.
+- **Connection notes name the `dialer-proxy` hop**: the policy path stopped
+  at the outbound that owns the `dialer-proxy`, so a connection never showed
+  which member of the dialer group carried it. Each front-hop dial now adds
+  a note such as `Dialing ss.example.com:8443 via dialer-proxy fast → HK-01
+  (Vless)`, one per hop when chains nest. `chains` in `/connections` is
+  unchanged and still matches mihomo.
 
 ### Fixed
 

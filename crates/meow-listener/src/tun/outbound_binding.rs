@@ -91,6 +91,13 @@ impl OutboundBinding {
     pub fn interface(&self) -> &str {
         self.0.interface()
     }
+
+    /// Mark the binding's listener as up: from here the logbook records
+    /// it (`meow_common::OutboundIfaceGuard::commit`). A reload candidate
+    /// rejected before its listener starts never gets here.
+    pub fn commit(&self) {
+        self.0.commit();
+    }
 }
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]

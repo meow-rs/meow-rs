@@ -95,6 +95,12 @@ jobs:
       - name: Clippy (no default features)
         run: cargo clippy --all-targets --no-default-features -- -D warnings
 
+      # `minimal` leaves out `logbook`, but every workspace run above turns it
+      # on (meow-api's dev-dependency enables it), so the stub that stands in
+      # for it (`meow-common/src/logbook/disabled.rs`) needs its own run.
+      - name: Clippy (meow-common without logbook)
+        run: cargo clippy -p meow-common --all-targets -- -D warnings
+
       - name: Doc check
         run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 
@@ -292,6 +298,12 @@ jobs:
       # unified invocation above feature unification compiles them out.
       - name: API tests without listener-tun (TUN reconcile)
         run: cargo nextest run -p meow-api --test api_test --retries 2 --no-fail-fast
+
+      # `minimal` leaves out `logbook`, which every run above unifies on;
+      # `-p meow-common` alone builds the stub that stands in for it
+      # (`meow-common/src/logbook/disabled.rs`).
+      - name: Logbook stub tests (meow-common without logbook)
+        run: cargo nextest run -p meow-common --lib logbook --retries 2 --no-fail-fast
 
       - name: UDP routing regression (SOCKS5, Shadowsocks, TUN)
         run: cargo nextest run -p meow-listener --all-features --lib udp_port_53 --retries 2 --no-fail-fast

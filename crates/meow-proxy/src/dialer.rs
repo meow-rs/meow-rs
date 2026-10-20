@@ -9,7 +9,9 @@
 //!
 //! upstream: mihomo `component/proxydialer` + `BasicOption.NewDialer`.
 
+use std::cell::Cell;
 use std::collections::HashMap;
+use std::fmt;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, Weak};
@@ -17,7 +19,13 @@ use std::sync::{Arc, Weak};
 use parking_lot::RwLock;
 
 use async_trait::async_trait;
-use meow_common::{ConnType, MeowError, Metadata, Network, Proxy, ProxyConn, ProxyPacketConn};
+use meow_common::atomic::Int;
+use meow_common::conn_note;
+use meow_common::traffic::{ProxyTraffic, ProxyTrafficSource};
+use meow_common::{
+    AdapterType, Blame, ChainTarget, ConnType, MeowError, Metadata, Network, Proxy, ProxyConn,
+    ProxyPacketConn,
+};
 use meow_transport::Stream;
 use smol_str::SmolStr;
 
@@ -366,15 +374,31 @@ impl ProxyPacketConn for ConnectedUdpConn {
 /// `dialer-proxy` chain edge (issue #489).
 pub struct ProxyDialer {
     proxy: Arc<dyn Proxy>,
+    /// Where each hop counts its bytes; see [`Self::counting_into`].
+    traffic: Option<Arc<dyn ProxyTrafficSource>>,
 }
 
 impl ProxyDialer {
     pub fn new(proxy: Arc<dyn Proxy>) -> Self {
-        Self { proxy }
+        Self {
+            proxy,
+            traffic: None,
+        }
+    }
+
+    /// Count the bytes of every hop this dialer opens into `traffic`, under
+    /// the member the front proxy's groups pick for it, the one its
+    /// connection note names.
+    #[must_use]
+    pub fn counting_into(mut self, traffic: Option<Arc<dyn ProxyTrafficSource>>) -> Self {
+        self.traffic = traffic;
+        self
     }
 
     /// Dial the front proxy with a fully-formed [`Metadata`] target.
     async fn dial_metadata(&self, meta: Metadata) -> io::Result<Box<dyn Stream>> {
+        note_front_hop(&self.proxy, meta.remote_address(), &meta);
+        let counters = front_hop_counters(&self.proxy, &meta, self.traffic.as_deref());
         let conn = self
             .proxy
             .dial_tcp(&meta)
@@ -384,7 +408,7 @@ impl ProxyDialer {
         // the `Any` bound required by the blanket `Stream` impl.  `ConnStream`
         // is a sized newtype that forwards `AsyncRead`/`AsyncWrite` through
         // the boxed conn, bridging `ProxyConn` → `Stream`.
-        Ok(Box::new(ConnStream(conn)))
+        Ok(Box::new(ConnStream(count_hop(conn, counters))))
     }
 }
 
@@ -507,6 +531,106 @@ mod packet_conn_socket {
 
 #[cfg(feature = "kcptun")]
 use packet_conn_socket::PacketConnSocket;
+
+/// Add the front hop of a `dialer-proxy` dial to the current connection's
+/// notes, e.g. `Dialing ss.example.com:8443 via dialer-proxy fast → HK-01
+/// (Vless)`. The tunnel's policy path ends at the outbound that owns the
+/// `dialer-proxy`, so without this note a connection never shows which
+/// member of the dialer group carried it. `metadata` must be what the
+/// front's groups select with on the dial that follows.
+pub(crate) fn note_front_hop(
+    front: &Arc<dyn Proxy>,
+    server: impl fmt::Display,
+    metadata: &Metadata,
+) {
+    let udp = if metadata.network == Network::Udp {
+        " over UDP"
+    } else {
+        ""
+    };
+    conn_note!(
+        Dial,
+        "Dialing {server}{udp} via dialer-proxy {}",
+        FrontHopPath { front, metadata }
+    );
+}
+
+/// `fast → HK-01 (Vless)`: the dialer, each group's pick, then the leaf's
+/// type.
+struct FrontHopPath<'a> {
+    front: &'a Arc<dyn Proxy>,
+    metadata: &'a Metadata,
+}
+
+impl fmt::Display for FrontHopPath<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.front.name())?;
+        let mut leaf = Arc::clone(self.front);
+        for next in front_hop_picks(self.front, self.metadata) {
+            write!(f, " → {}", next.name())?;
+            leaf = next;
+        }
+        write!(f, " ({})", leaf.adapter_type())
+    }
+}
+
+/// The members `front`'s groups pick for `metadata`, outermost first; none
+/// for a leaf front. Like the tunnel's policy path it peeks
+/// `unwrap_proxy(metadata, false)`, which names the member the dial about to
+/// start takes without advancing round-robin counters or recording group use.
+fn front_hop_picks<'a>(
+    front: &Arc<dyn Proxy>,
+    metadata: &'a Metadata,
+) -> impl Iterator<Item = Arc<dyn Proxy>> + 'a {
+    let mut leaf = Arc::clone(front);
+    std::iter::from_fn(move || {
+        let next = leaf.unwrap_proxy(metadata, false)?;
+        leaf = Arc::clone(&next);
+        Some(next)
+    })
+    // Config groups are acyclic (`reject_group_membership_cycles`); the
+    // bound only guards hand-built registries, as the tunnel's walk does.
+    .take(MAX_DIALER_CHAIN_DEPTH)
+}
+
+/// The totals a hop dialed through `front` counts into: those of the member
+/// `front`'s groups pick for `metadata`, the one [`note_front_hop`] names.
+/// The tunnel credits a connection to the proxy at the end of its own chain
+/// only, so without this a `dialer-proxy` member never shows the bytes it
+/// carried. Every hop counts, probes and fetches chained through the front
+/// included, as upstream's hop tracker counts them: a pooled or multiplexed
+/// session dials with `internal` false whoever opens it, so skipping
+/// `internal` would depend on the protocol rather than the traffic. `None`
+/// for a pick that sends nothing (REJECT, PASS), which the tunnel's UDP
+/// accounting skips too.
+pub(crate) fn front_hop_counters(
+    front: &Arc<dyn Proxy>,
+    metadata: &Metadata,
+    traffic: Option<&dyn ProxyTrafficSource>,
+) -> Option<Arc<ProxyTraffic>> {
+    let traffic = traffic?;
+    let leaf = front_hop_picks(front, metadata)
+        .last()
+        .unwrap_or_else(|| Arc::clone(front));
+    match leaf.adapter_type() {
+        AdapterType::Reject
+        | AdapterType::RejectDrop
+        | AdapterType::Pass
+        | AdapterType::PassRule => None,
+        _ => traffic.proxy_counters(leaf.name()),
+    }
+}
+
+/// `conn` counting into `counters`, when there are any.
+pub(crate) fn count_hop(
+    conn: Box<dyn ProxyConn>,
+    counters: Option<Arc<ProxyTraffic>>,
+) -> Box<dyn ProxyConn> {
+    match counters {
+        Some(traffic) => Box::new(CountedHopConn { conn, traffic }),
+        None => conn,
+    }
+}
 
 /// Build the `Metadata` for a chained front-hop dial by `host`/`port`.
 ///
@@ -632,12 +756,17 @@ impl TcpDialer for ProxyDialer {
         // `MeowError::Io` chains pass their errno through — a UDP-less
         // front or local fd exhaustion must not cost the member its
         // health (issues #663/#668).
+        note_front_hop(&self.proxy, meta.remote_address(), &meta);
+        let counters = front_hop_counters(&self.proxy, &meta, self.traffic.as_deref());
         let conn = self
             .proxy
             .dial_udp(&meta)
             .await
             .map_err(|e| e.into_io_error("dialer-proxy udp"))?;
-        Ok(Arc::from(conn))
+        Ok(match counters {
+            Some(traffic) => Arc::new(CountedHopPacketConn { conn, traffic }),
+            None => Arc::from(conn),
+        })
     }
 
     fn supports_udp(&self) -> bool {
@@ -676,7 +805,14 @@ pub type ProxySnapshot = Arc<HashMap<SmolStr, Arc<dyn Proxy>>>;
 /// Shared cell a [`ProxyRegistry`] publishes into and [`DialerTarget`]s
 /// resolve through. The cell is the *generation anchor*: keeping it alive
 /// keeps the published snapshot — and every adapter inside it — alive.
-pub type RegistryCell = RwLock<Option<ProxySnapshot>>;
+#[derive(Default)]
+pub struct RegistryCell {
+    proxies: RwLock<Option<ProxySnapshot>>,
+    /// See [`ProxyRegistry::count_traffic_into`]. Weak because a registry
+    /// can outlive the tunnel that installed it: provider fetch contexts
+    /// keep clones.
+    traffic: RwLock<Option<Weak<dyn ProxyTrafficSource>>>,
+}
 
 /// The proxies built from one config, published when the build completes and
 /// consulted by name on every chained dial.
@@ -699,7 +835,7 @@ pub type RegistryCell = RwLock<Option<ProxySnapshot>>;
 /// adapters of that generation fail closed at dial time.
 #[derive(Clone, Default)]
 pub struct ProxyRegistry {
-    proxies: Arc<RegistryCell>,
+    cell: Arc<RegistryCell>,
 }
 
 impl ProxyRegistry {
@@ -709,14 +845,22 @@ impl ProxyRegistry {
     pub fn publish(&self, proxies: ProxySnapshot) {
         // Swap under the lock but drop the superseded snapshot — which runs
         // every adapter destructor — outside it.
-        let old = self.proxies.write().replace(proxies);
+        let old = self.cell.proxies.write().replace(proxies);
         drop(old);
+    }
+
+    /// Count the bytes every `dialer-proxy` hop dialed through this registry
+    /// carries into `traffic`, under the front member that carries them.
+    /// The tunnel installs its statistics when it takes the registry; the
+    /// latest call wins.
+    pub fn count_traffic_into(&self, traffic: Weak<dyn ProxyTrafficSource>) {
+        *self.cell.traffic.write() = Some(traffic);
     }
 
     /// The weak edge [`DialerTarget`] stores. An upgrade succeeds only while
     /// some [`ProxyRegistry`] clone still owns the cell.
     pub fn downgrade(&self) -> Weak<RegistryCell> {
-        Arc::downgrade(&self.proxies)
+        Arc::downgrade(&self.cell)
     }
 
     /// Resolve `name` against the currently published snapshot — `None` when
@@ -724,7 +868,8 @@ impl ProxyRegistry {
     /// one-shot lookups (provider `proxy:` / subscription fetches); adapters
     /// that dial repeatedly keep a [`DialerTarget`] instead.
     pub fn resolve_name(&self, name: &str) -> Option<Arc<dyn Proxy>> {
-        self.proxies
+        self.cell
+            .proxies
             .read()
             .as_ref()
             .and_then(|map| map.get(name).cloned())
@@ -736,7 +881,7 @@ impl std::fmt::Debug for ProxyRegistry {
         // The snapshot holds `Arc<dyn Proxy>` handles — not Debug — so report
         // only whether a generation is published, not its contents.
         f.debug_struct("ProxyRegistry")
-            .field("published", &self.proxies.read().is_some())
+            .field("published", &self.cell.proxies.read().is_some())
             .finish()
     }
 }
@@ -767,10 +912,19 @@ impl DialerTarget {
     /// policy reasons.
     pub fn resolve(&self) -> Option<Arc<dyn Proxy>> {
         self.registry.upgrade().and_then(|cell| {
-            cell.read()
+            cell.proxies
+                .read()
                 .as_ref()
                 .and_then(|map| map.get(&self.name).cloned())
         })
+    }
+
+    /// Where hops through this target count their bytes: `None` until a
+    /// tunnel installs its statistics, and once it or the generation is gone.
+    pub fn traffic(&self) -> Option<Arc<dyn ProxyTrafficSource>> {
+        let cell = self.registry.upgrade()?;
+        let traffic = cell.traffic.read().as_ref().and_then(Weak::upgrade);
+        traffic
     }
 
     /// Error for an unresolvable target, worded for the two error types the
@@ -794,19 +948,158 @@ impl DialerTarget {
 /// dial time. Equivalent to mihomo's `proxydialer.NewByNameDialer`.
 pub struct NamedProxyDialer {
     target: DialerTarget,
+    /// The outbound this dialer belongs to. The front's automatic groups
+    /// remember it per target, so the health check can probe the chain
+    /// through it (see [`meow_common::chain_health`]).
+    owner: Option<SmolStr>,
 }
 
 impl NamedProxyDialer {
     pub fn new(target: DialerTarget) -> Self {
-        Self { target }
+        Self {
+            target,
+            owner: None,
+        }
     }
 
-    async fn dial_front(&self, meta: Metadata) -> io::Result<Box<dyn Stream>> {
+    /// Name the outbound that dials through this dialer.
+    #[must_use]
+    pub fn owned_by(mut self, owner: impl Into<SmolStr>) -> Self {
+        self.owner = Some(owner.into());
+        self
+    }
+
+    /// The front hop, counting into the statistics of the tunnel that owns
+    /// this generation. A group dialling the outbound learns the front (see
+    /// [`crate::group::dialled_through`]).
+    fn front(&self) -> io::Result<ProxyDialer> {
         let front = self
             .target
             .resolve()
             .ok_or_else(|| io::Error::other(self.target.missing_error()))?;
-        ProxyDialer::new(front).dial_metadata(meta).await
+        crate::group::dialled_through(&front);
+        Ok(ProxyDialer::new(front).counting_into(self.target.traffic()))
+    }
+
+    async fn dial_front(&self, meta: Metadata) -> io::Result<Box<dyn Stream>> {
+        let result = self.front()?.dial_metadata(meta).await;
+        self.judge_front(&result);
+        result
+    }
+
+    /// A front hop through an automatic group that failed while the group
+    /// still has a live member besides the one it took is the group's
+    /// failure, not the outbound's; see [`crate::group::front_hop_failed`].
+    /// A single front, or a group with nothing else left alive, is the
+    /// outbound's only way out. A failure the group puts down to the
+    /// server (see [`blame_front_hop`]) is the outbound's too.
+    fn judge_front<T>(&self, result: &io::Result<T>) {
+        if result.is_err()
+            && self.target.resolve().is_some_and(|front| {
+                blame_front_hop(&front) == Blame::Member && has_live_member(&front)
+            })
+        {
+            crate::group::front_hop_failed();
+        }
+    }
+}
+
+/// Record a failed front hop through `front` in its chain health, for the
+/// member it took, and say who it is put down to
+/// ([`meow_common::ChainHealth::blame`]). The member, unless the group
+/// keeps verdicts and the hop has a target: not over UDP, and not through a
+/// member that is an automatic group itself, which keeps its own. A member
+/// the group took with every usable one blocked for the target
+/// ([`FrontHop::last_resort`]) puts it down to the target.
+fn blame_front_hop(front: &Arc<dyn Proxy>) -> Blame {
+    let (Some(health), Some(member)) = (front.chain_health(), crate::group::last_pick()) else {
+        return Blame::Member;
+    };
+    if member.chain_health().is_some() {
+        return Blame::Member;
+    }
+    FRONT_HOP
+        .try_with(|hop| {
+            let blame = health.blame(&hop.target, member.name());
+            if hop.last_resort.get() {
+                Blame::Target
+            } else {
+                blame
+            }
+        })
+        .unwrap_or(Blame::Member)
+}
+
+/// Whether `front` is an automatic group with a live member other than the
+/// one the failed dial took: the member stays alive until the group's
+/// failure tracker gives up on it, and while it is the only one left, the
+/// outbound has no other way out. Not the group's own `alive()`: a url-test
+/// group answers for its last pick until it picks again, and that pick may
+/// be the member that just failed.
+fn has_live_member(front: &Arc<dyn Proxy>) -> bool {
+    front.chain_health().is_some()
+        && front.member_proxies().is_some_and(|members| {
+            members
+                .iter()
+                .any(|m| m.alive() && !crate::group::last_pick_is(m.name()))
+        })
+}
+
+tokio::task_local! {
+    /// Set while a by-name `dialer-proxy` front hop is dialled over TCP.
+    /// The scope ends when the front hop's stream is returned, before the
+    /// chained protocol's handshake.
+    static FRONT_HOP: FrontHop;
+}
+
+/// A `dialer-proxy` front hop being dialled on the current task.
+#[derive(Clone)]
+pub(crate) struct FrontHop {
+    /// The server the front hop connects to.
+    pub(crate) target: ChainTarget,
+    /// The outbound dialling through the front, when known.
+    pub(crate) owner: Option<SmolStr>,
+    /// The group dialling the front hop took a member blocked for the
+    /// target, which it does only with every usable member blocked
+    /// (`front_hop_pick` in the group module). The target is the likelier
+    /// fault then, so a failure through that member counts against the
+    /// chained outbound. Set by [`note_last_resort`].
+    last_resort: Cell<bool>,
+}
+
+/// The front hop in flight, when a dial for `metadata` is one: a group on
+/// the front's path dials with the front hop's own target. Any other dial
+/// made while the front hop is set, such as a nested chain's front or a
+/// lookup on the way, targets something else and gets `None`.
+pub(crate) fn front_hop_for(metadata: &Metadata) -> Option<FrontHop> {
+    FRONT_HOP
+        .try_with(|hop| {
+            let target = ChainTarget::from_metadata(metadata)?;
+            (target == hop.target).then(|| hop.clone())
+        })
+        .ok()
+        .flatten()
+}
+
+/// Note whether the member a group took for the front hop in flight is its
+/// last resort ([`FrontHop::last_resort`]).
+pub(crate) fn note_last_resort(last_resort: bool) {
+    let _ = FRONT_HOP.try_with(|hop| hop.last_resort.set(last_resort));
+}
+
+/// Whether the member a group took for the front hop in flight is its last
+/// resort ([`FrontHop::last_resort`]).
+pub(crate) fn front_hop_last_resort() -> bool {
+    FRONT_HOP
+        .try_with(|hop| hop.last_resort.get())
+        .unwrap_or(false)
+}
+
+/// Run `f`, a front-hop dial, with [`FRONT_HOP`] set to `hop`.
+async fn scoped_front_hop<F: std::future::Future>(hop: Option<FrontHop>, f: F) -> F::Output {
+    match hop {
+        Some(hop) => FRONT_HOP.scope(hop, f).await,
+        None => f.await,
     }
 }
 
@@ -897,7 +1190,14 @@ impl NamedProxyDialer {
                      a provider member or group is routing the dial back into itself"
                 ))
             },
-            self.dial_front(meta),
+            async {
+                let hop = ChainTarget::from_metadata(&meta).map(|target| FrontHop {
+                    target,
+                    owner: self.owner.clone(),
+                    last_resort: Cell::new(false),
+                });
+                scoped_front_hop(hop, self.dial_front(meta)).await
+            },
         )
         .await
     }
@@ -937,13 +1237,9 @@ impl TcpDialer for NamedProxyDialer {
                 ))
             },
             async {
-                let front = self
-                    .target
-                    .resolve()
-                    .ok_or_else(|| io::Error::other(self.target.missing_error()))?;
-                ProxyDialer::new(front)
-                    .dial_udp_conn(remote, internal)
-                    .await
+                let result = self.front()?.dial_udp_conn(remote, internal).await;
+                self.judge_front(&result);
+                result
             },
         )
         .await
@@ -978,13 +1274,7 @@ impl TcpDialer for NamedProxyDialer {
                      a provider member or group is routing the dial back into itself"
                 ))
             },
-            async {
-                let front = self
-                    .target
-                    .resolve()
-                    .ok_or_else(|| io::Error::other(self.target.missing_error()))?;
-                ProxyDialer::new(front).dial_udp_endpoint(remote).await
-            },
+            async { self.front()?.dial_udp_endpoint(remote).await },
         )
         .await
     }
@@ -1039,6 +1329,113 @@ impl tokio::io::AsyncWrite for ConnStream {
 }
 
 impl Unpin for ConnStream {}
+
+/// A `dialer-proxy` hop's stream, counting what it carries into the totals
+/// of the front member that carries it. Only those: the connection riding
+/// the hop is already in the tunnel totals once, as upstream's hop tracker
+/// stays out of the manager totals (`pushToManager` false).
+struct CountedHopConn {
+    conn: Box<dyn ProxyConn>,
+    traffic: Arc<ProxyTraffic>,
+}
+
+impl tokio::io::AsyncRead for CountedHopConn {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let poll = std::pin::Pin::new(&mut this.conn).poll_read(cx, buf);
+        if let std::task::Poll::Ready(Ok(())) = poll {
+            this.traffic
+                .add_download((buf.filled().len() - before) as Int);
+        }
+        poll
+    }
+}
+
+impl tokio::io::AsyncWrite for CountedHopConn {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let poll = std::pin::Pin::new(&mut this.conn).poll_write(cx, buf);
+        if let std::task::Poll::Ready(Ok(n)) = poll {
+            this.traffic.add_upload(n as Int);
+        }
+        poll
+    }
+
+    fn poll_write_vectored(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> std::task::Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let poll = std::pin::Pin::new(&mut this.conn).poll_write_vectored(cx, bufs);
+        if let std::task::Poll::Ready(Ok(n)) = poll {
+            this.traffic.add_upload(n as Int);
+        }
+        poll
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.conn.is_write_vectored()
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().conn).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().conn).poll_shutdown(cx)
+    }
+}
+
+impl ProxyConn for CountedHopConn {
+    fn remote_destination(&self) -> String {
+        self.conn.remote_destination()
+    }
+}
+
+/// The datagram counterpart of [`CountedHopConn`].
+struct CountedHopPacketConn {
+    conn: Box<dyn ProxyPacketConn>,
+    traffic: Arc<ProxyTraffic>,
+}
+
+#[async_trait]
+impl ProxyPacketConn for CountedHopPacketConn {
+    async fn read_packet(&self, buf: &mut [u8]) -> meow_common::Result<(usize, SocketAddr)> {
+        let (n, from) = self.conn.read_packet(buf).await?;
+        self.traffic.add_download(n as Int);
+        Ok((n, from))
+    }
+
+    async fn write_packet(&self, buf: &[u8], addr: &SocketAddr) -> meow_common::Result<usize> {
+        let n = self.conn.write_packet(buf, addr).await?;
+        self.traffic.add_upload(n as Int);
+        Ok(n)
+    }
+
+    fn local_addr(&self) -> meow_common::Result<SocketAddr> {
+        self.conn.local_addr()
+    }
+
+    fn close(&self) -> meow_common::Result<()> {
+        self.conn.close()
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1647,6 +2044,67 @@ mod tests {
         assert!(last_seen(&mock).internal, "dial_addr forwards it too");
     }
 
+    /// The tunnel's policy path ends at the outbound that owns the
+    /// `dialer-proxy`, so the front hop's dial must name the dialer group's
+    /// pick in the connection's notes, IPv6 servers bracketed.
+    #[tokio::test]
+    async fn front_hop_dial_notes_the_dialer_groups_pick() {
+        use crate::group::fallback::FallbackGroup;
+        use crate::group::test_support::MockProxy;
+        use meow_common::conn_notes::ConnNotes;
+
+        let down = MockProxy::new_failing("down", AdapterType::Vless, "unused");
+        down.set_alive(false);
+        let pick = MockProxy::new_failing("HK-01", AdapterType::Vless, "boom");
+        let fast: Arc<dyn Proxy> = Arc::new(FallbackGroup::new("fast", vec![down, pick]));
+        let registry = ProxyRegistry::default();
+        let mut proxies: HashMap<SmolStr, Arc<dyn Proxy>> = HashMap::new();
+        proxies.insert(SmolStr::from("fast"), fast);
+        registry.publish(Arc::new(proxies));
+        let dialer = NamedProxyDialer::new(DialerTarget::new("fast", &registry));
+
+        let notes = ConnNotes::new();
+        ConnNotes::scope(Some(notes.clone()), async {
+            let _ = dialer.dial("ss.example.com", 8443, false).await;
+            let addr: SocketAddr = "[2001:db8::1]:8443".parse().unwrap();
+            let _ = dialer.dial_addr(addr, false).await;
+        })
+        .await;
+        assert_eq!(
+            notes.texts(),
+            [
+                "Dialing ss.example.com:8443 via dialer-proxy fast → HK-01 (Vless)",
+                "Dialing [2001:db8::1]:8443 via dialer-proxy fast → HK-01 (Vless)",
+            ]
+        );
+
+        // Outside a recording connection the dial notes nothing.
+        let _ = dialer.dial("ss.example.com", 8443, false).await;
+        assert_eq!(notes.len(), 2);
+    }
+
+    /// A UDP association through the front (kcptun sessions, chained SS
+    /// UDP) notes its hop too, marked as UDP.
+    #[tokio::test]
+    async fn front_hop_udp_dial_is_noted_as_udp() {
+        use meow_common::conn_notes::ConnNotes;
+
+        let dialer = ProxyDialer::new(Arc::new(CapturingUdpProxy {
+            udp: true,
+            seen: Mutex::new(Vec::new()),
+        }) as Arc<dyn Proxy>);
+        let remote: SocketAddr = "203.0.113.7:29900".parse().unwrap();
+        let notes = ConnNotes::new();
+        ConnNotes::scope(Some(notes.clone()), async {
+            let _ = dialer.dial_udp_conn(UdpTarget::Addr(remote), false).await;
+        })
+        .await;
+        assert_eq!(
+            notes.texts(),
+            ["Dialing 203.0.113.7:29900 over UDP via dialer-proxy udp-front (Socks5)"]
+        );
+    }
+
     #[tokio::test]
     async fn internal_marker_survives_reconstruction_for_lazy_groups() {
         // #555: housekeeping dials chained through `dialer-proxy` reach the
@@ -2162,5 +2620,414 @@ mod tests {
         let mut rb3 = ReadBuf::new(&mut sink);
         let r = poll_fn(|cx| sock.poll_recv(cx, &mut rb3)).await;
         assert_eq!(r.unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
+    }
+
+    /// Per-proxy totals for the hop-counting tests, keyed like the tunnel's.
+    #[derive(Default)]
+    struct TestTraffic(Mutex<HashMap<String, Arc<ProxyTraffic>>>);
+
+    impl ProxyTrafficSource for TestTraffic {
+        fn proxy_counters(&self, proxy: &str) -> Option<Arc<ProxyTraffic>> {
+            let mut map = self.0.lock().unwrap();
+            Some(Arc::clone(map.entry(proxy.to_owned()).or_default()))
+        }
+    }
+
+    impl TestTraffic {
+        /// `(upload, download)` counted for `proxy`, `None` when it never
+        /// carried a flow.
+        fn of(&self, proxy: &str) -> Option<(Int, Int)> {
+            let map = self.0.lock().unwrap();
+            map.get(proxy)
+                .map(|t| (t.upload_bytes(), t.download_bytes()))
+        }
+    }
+
+    fn counting_into(traffic: &Arc<TestTraffic>) -> Weak<dyn ProxyTrafficSource> {
+        Arc::<TestTraffic>::downgrade(traffic)
+    }
+
+    /// One end of an in-memory pipe as a [`ProxyConn`].
+    struct PipeConn(tokio::io::DuplexStream);
+
+    impl tokio::io::AsyncRead for PipeConn {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::pin::Pin::new(&mut self.0).poll_read(cx, buf)
+        }
+    }
+
+    impl tokio::io::AsyncWrite for PipeConn {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            std::pin::Pin::new(&mut self.0).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::pin::Pin::new(&mut self.0).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::pin::Pin::new(&mut self.0).poll_shutdown(cx)
+        }
+    }
+
+    impl ProxyConn for PipeConn {}
+
+    /// What a [`PipeProxy`] server says first on every stream.
+    const GREETING: &[u8] = b"hello, client";
+
+    /// Datagram conn whose server answers every read with [`GREETING`].
+    struct GreetingPacketConn;
+
+    #[async_trait]
+    impl ProxyPacketConn for GreetingPacketConn {
+        async fn read_packet(&self, buf: &mut [u8]) -> MeowResult<(usize, SocketAddr)> {
+            buf[..GREETING.len()].copy_from_slice(GREETING);
+            Ok((GREETING.len(), "203.0.113.7:29900".parse().unwrap()))
+        }
+        async fn write_packet(&self, buf: &[u8], _addr: &SocketAddr) -> MeowResult<usize> {
+            Ok(buf.len())
+        }
+        fn local_addr(&self) -> MeowResult<SocketAddr> {
+            Ok("0.0.0.0:0".parse().unwrap())
+        }
+        fn close(&self) -> MeowResult<()> {
+            Ok(())
+        }
+    }
+
+    /// Leaf whose dials succeed: each TCP stream is a pipe whose server
+    /// sends [`GREETING`] and keeps what it is sent, and `connect_over`
+    /// passes the stream through, as a hop whose handshake adds nothing.
+    struct PipeProxy {
+        name: &'static str,
+        addr: &'static str,
+        health: ProxyHealth,
+        servers: Mutex<Vec<tokio::io::DuplexStream>>,
+    }
+
+    impl PipeProxy {
+        fn new(name: &'static str, addr: &'static str) -> Arc<Self> {
+            Arc::new(Self {
+                name,
+                addr,
+                health: ProxyHealth::new(),
+                servers: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ProxyAdapter for PipeProxy {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn adapter_type(&self) -> AdapterType {
+            AdapterType::Vless
+        }
+        fn addr(&self) -> &str {
+            self.addr
+        }
+        fn support_udp(&self) -> bool {
+            true
+        }
+        async fn dial_tcp(&self, _metadata: &Metadata) -> MeowResult<Box<dyn ProxyConn>> {
+            use tokio::io::AsyncWriteExt;
+            let (client, mut server) = tokio::io::duplex(1024);
+            server.write_all(GREETING).await?;
+            self.servers.lock().unwrap().push(server);
+            Ok(Box::new(PipeConn(client)))
+        }
+        async fn dial_udp(&self, _metadata: &Metadata) -> MeowResult<Box<dyn ProxyPacketConn>> {
+            Ok(Box::new(GreetingPacketConn))
+        }
+        async fn connect_over(
+            &self,
+            stream: Box<dyn ProxyConn>,
+            _metadata: &Metadata,
+        ) -> MeowResult<Box<dyn ProxyConn>> {
+            Ok(stream)
+        }
+        fn health(&self) -> &ProxyHealth {
+            &self.health
+        }
+    }
+
+    impl Proxy for PipeProxy {
+        fn alive(&self) -> bool {
+            true
+        }
+        fn alive_for_url(&self, _url: &str) -> bool {
+            true
+        }
+        fn last_delay(&self) -> u16 {
+            0
+        }
+        fn last_delay_for_url(&self, _url: &str) -> u16 {
+            0
+        }
+        fn delay_history(&self) -> Vec<DelayHistory> {
+            Vec::new()
+        }
+    }
+
+    /// Send `ping` up `stream` and read the greeting back: 4 bytes up,
+    /// [`GREETING`] down.
+    async fn exchange<S>(stream: &mut S)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + ?Sized,
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        stream.write_all(b"ping").await.unwrap();
+        let mut greeting = [0u8; GREETING.len()];
+        stream.read_exact(&mut greeting).await.unwrap();
+        assert_eq!(greeting, GREETING);
+    }
+
+    /// `fast` picks `HK-01`, the registry's `dialer-proxy` front for a
+    /// chained outbound.
+    fn fast_group_registry() -> ProxyRegistry {
+        use crate::group::fallback::FallbackGroup;
+        use crate::group::test_support::MockProxy;
+
+        let down = MockProxy::new_failing("down", AdapterType::Vless, "unused");
+        down.set_alive(false);
+        let pick: Arc<dyn Proxy> = PipeProxy::new("HK-01", "10.0.0.1:443");
+        let fast: Arc<dyn Proxy> = Arc::new(FallbackGroup::new("fast", vec![down, pick]));
+        let registry = ProxyRegistry::default();
+        registry.publish(Arc::new(HashMap::from([(SmolStr::from("fast"), fast)])));
+        registry
+    }
+
+    /// The tunnel credits a connection only to the outbound at the end of
+    /// its chain, so the bytes a chained outbound's front hop carries count
+    /// for the member of the dialer group that carries them, not the group.
+    #[tokio::test]
+    async fn front_hop_counts_for_the_dialer_groups_pick() {
+        let registry = fast_group_registry();
+        let traffic = Arc::new(TestTraffic::default());
+        registry.count_traffic_into(counting_into(&traffic));
+        let dialer = NamedProxyDialer::new(DialerTarget::new("fast", &registry));
+
+        let mut stream = dialer.dial("ss.example.com", 8443, false).await.unwrap();
+        exchange(&mut stream).await;
+        assert_eq!(traffic.of("HK-01"), Some((4, GREETING.len() as Int)));
+        assert_eq!(traffic.of("fast"), None, "a group carries nothing itself");
+
+        let addr: SocketAddr = "[2001:db8::1]:8443".parse().unwrap();
+        let mut stream = dialer.dial_addr(addr, false).await.unwrap();
+        exchange(&mut stream).await;
+        assert_eq!(traffic.of("HK-01"), Some((8, 2 * GREETING.len() as Int)));
+    }
+
+    /// Probes and fetches chained through the front (`internal`) count
+    /// too: the member carried them, whatever the chained outbound pools.
+    #[tokio::test]
+    async fn internal_front_hops_count_too() {
+        let registry = fast_group_registry();
+        let traffic = Arc::new(TestTraffic::default());
+        registry.count_traffic_into(counting_into(&traffic));
+        let dialer = NamedProxyDialer::new(DialerTarget::new("fast", &registry));
+
+        let mut stream = dialer.dial("ss.example.com", 8443, true).await.unwrap();
+        exchange(&mut stream).await;
+        assert_eq!(traffic.of("HK-01"), Some((4, GREETING.len() as Int)));
+    }
+
+    /// A UDP association through the front (chained SS/Snell UDP, kcptun
+    /// sessions) counts its datagrams the same way.
+    #[tokio::test]
+    async fn front_hop_udp_counts_for_the_dialer_groups_pick() {
+        let registry = fast_group_registry();
+        let traffic = Arc::new(TestTraffic::default());
+        registry.count_traffic_into(counting_into(&traffic));
+        let dialer = NamedProxyDialer::new(DialerTarget::new("fast", &registry));
+
+        let remote: SocketAddr = "203.0.113.7:29900".parse().unwrap();
+        let conn = dialer
+            .dial_udp_conn(UdpTarget::Addr(remote), false)
+            .await
+            .unwrap();
+        assert_eq!(conn.write_packet(b"query", &remote).await.unwrap(), 5);
+        let mut buf = [0u8; 64];
+        let (n, _) = conn.read_packet(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], GREETING);
+        assert_eq!(traffic.of("HK-01"), Some((5, GREETING.len() as Int)));
+    }
+
+    /// Outbounds that cannot take an injected dialer reach their front
+    /// through `DialerProxyAdapter`'s relay instead; that hop counts too.
+    #[tokio::test]
+    async fn relay_wrapper_front_hop_counts_for_the_dialer_groups_pick() {
+        let registry = fast_group_registry();
+        let traffic = Arc::new(TestTraffic::default());
+        registry.count_traffic_into(counting_into(&traffic));
+        let daniel: Arc<dyn Proxy> = PipeProxy::new("daniel", "ss.example.com:8443");
+        let dpa = crate::DialerProxyAdapter::new(daniel, DialerTarget::new("fast", &registry));
+
+        let target = Metadata {
+            host: "example.com".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+        let mut conn = dpa.dial_tcp(&target).await.unwrap();
+        exchange(&mut conn).await;
+        assert_eq!(traffic.of("HK-01"), Some((4, GREETING.len() as Int)));
+        assert_eq!(
+            traffic.of("daniel"),
+            None,
+            "the tunnel counts the chained outbound itself"
+        );
+    }
+
+    /// The registry with `fast` as the only entry.
+    fn registry_of(fast: &Arc<dyn Proxy>) -> ProxyRegistry {
+        let registry = ProxyRegistry::default();
+        registry.publish(Arc::new(HashMap::from([(
+            SmolStr::from("fast"),
+            Arc::clone(fast),
+        )])));
+        registry
+    }
+
+    /// Run one chain over `dialer` to `host:port` as a chained protocol
+    /// would: send a header, read the reply. The bytes read come back.
+    async fn chain(dialer: &NamedProxyDialer, host: &str, port: u16) -> usize {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = dialer.dial(host, port, false).await.unwrap();
+        stream.write_all(b"chained header").await.unwrap();
+        let mut buf = [0u8; 128];
+        stream.read(&mut buf).await.unwrap_or(0)
+    }
+
+    /// The fastest member of a url-test front audits the chained outbound's
+    /// port (it passes the group's URL test): two chains it closes before a
+    /// reply block it for that server, and the next front hop there takes
+    /// the next fastest member. Chains to other servers, plain dials
+    /// through the group, and its displayed pick keep the fastest.
+    #[tokio::test]
+    async fn a_front_hop_skips_the_member_that_closes_its_chains() {
+        use crate::group::test_support::{StreamProxy, REPLY};
+        use crate::group::urltest::UrlTestGroup;
+
+        let audited = StreamProxy::auditing("SG-01", "10.0.0.1:443", 8443);
+        audited.set_delay(10);
+        let clean = StreamProxy::new("HK-01", "10.0.0.2:443");
+        clean.set_delay(20);
+        let fast: Arc<dyn Proxy> = Arc::new(UrlTestGroup::new(
+            "fast",
+            vec![
+                Arc::clone(&audited) as Arc<dyn Proxy>,
+                Arc::clone(&clean) as Arc<dyn Proxy>,
+            ],
+            0,
+        ));
+        let registry = registry_of(&fast);
+        let daniel = NamedProxyDialer::new(DialerTarget::new("fast", &registry)).owned_by("daniel");
+
+        assert_eq!(chain(&daniel, "snell.example.com", 8443).await, 0);
+        assert_eq!(chain(&daniel, "snell.example.com", 8443).await, 0);
+        assert_eq!((audited.dials(), clean.dials()), (2, 0));
+        assert_eq!(chain(&daniel, "snell.example.com", 8443).await, REPLY.len());
+        assert_eq!((audited.dials(), clean.dials()), (2, 1));
+
+        let target = ChainTarget::from_server_addr("snell.example.com:8443").unwrap();
+        let health = fast.chain_health().expect("url-test keeps chain verdicts");
+        assert_eq!(
+            health.targets(),
+            vec![(target, vec![SmolStr::from("daniel")])],
+            "the owner is known to the chain probe"
+        );
+
+        let trojan = NamedProxyDialer::new(DialerTarget::new("fast", &registry));
+        assert_eq!(chain(&trojan, "trojan.example.com", 443).await, REPLY.len());
+        assert_eq!(audited.dials(), 3, "another server still takes the fastest");
+        let plain = Metadata {
+            host: "snell.example.com".into(),
+            dst_port: 8443,
+            ..Default::default()
+        };
+        drop(fast.dial_tcp(&plain).await.unwrap());
+        assert_eq!(audited.dials(), 4, "a dial that is no front hop too");
+        assert_eq!(fast.current().as_deref(), Some("SG-01"));
+    }
+
+    /// Fallback and load-balance fronts skip a blocked member the same way.
+    #[tokio::test]
+    async fn fallback_and_load_balance_fronts_skip_blocked_members() {
+        use crate::group::fallback::FallbackGroup;
+        use crate::group::load_balance::{LbStrategy, LoadBalanceGroup};
+        use crate::group::test_support::StreamProxy;
+
+        let target = ChainTarget::from_server_addr("snell.example.com:8443").unwrap();
+        for kind in ["fallback", "round-robin", "consistent-hashing"] {
+            let audited = StreamProxy::auditing("SG-01", "10.0.0.1:443", 8443);
+            let clean = StreamProxy::new("HK-01", "10.0.0.2:443");
+            let members = vec![
+                Arc::clone(&audited) as Arc<dyn Proxy>,
+                Arc::clone(&clean) as Arc<dyn Proxy>,
+            ];
+            let fast: Arc<dyn Proxy> = match kind {
+                "fallback" => Arc::new(FallbackGroup::new("fast", members)),
+                "round-robin" => Arc::new(LoadBalanceGroup::new(
+                    "fast",
+                    members,
+                    LbStrategy::RoundRobin,
+                )),
+                _ => Arc::new(LoadBalanceGroup::new(
+                    "fast",
+                    members,
+                    LbStrategy::ConsistentHashing,
+                )),
+            };
+            fast.chain_health().unwrap().record_failed(
+                &target,
+                "SG-01",
+                meow_common::ChainVerdict::Probe {
+                    hold: std::time::Duration::from_secs(600),
+                },
+                "timed out",
+            );
+            let registry = registry_of(&fast);
+            let daniel =
+                NamedProxyDialer::new(DialerTarget::new("fast", &registry)).owned_by("daniel");
+            for _ in 0..4 {
+                chain(&daniel, "snell.example.com", 8443).await;
+            }
+            assert_eq!(
+                (audited.dials(), clean.dials()),
+                (0, 4),
+                "{kind}: every front hop avoids the blocked member"
+            );
+        }
+    }
+
+    /// Hops count only while the statistics they were given live; nothing
+    /// is counted before a tunnel installs them.
+    #[test]
+    fn target_traffic_follows_the_installed_source() {
+        let registry = ProxyRegistry::default();
+        let target = DialerTarget::new("fast", &registry);
+        assert!(target.traffic().is_none());
+
+        let traffic = Arc::new(TestTraffic::default());
+        registry.count_traffic_into(counting_into(&traffic));
+        assert!(target.traffic().is_some());
+
+        drop(traffic);
+        assert!(target.traffic().is_none());
     }
 }

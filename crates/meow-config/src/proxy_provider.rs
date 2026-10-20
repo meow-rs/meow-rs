@@ -1,7 +1,9 @@
+use crate::dropped_providers::DroppedProviders;
 use crate::proxy_parser;
 use crate::raw::{RawHealthCheck, RawProxyProvider};
 use dashmap::DashMap;
 use meow_common::atomic::AtomicU;
+use meow_common::logbook::{self, Level};
 use meow_common::{ProviderSlot, Proxy};
 use meow_proxy::dialer::ProxyRegistry;
 use parking_lot::{Mutex, RwLock};
@@ -553,17 +555,23 @@ impl ProxyProvider {
     /// `Update` semantics) instead of rewinding the slot to whatever
     /// generation the disk happens to hold.
     async fn fetch_content(&self) -> Result<(String, bool), String> {
-        match self.fetch_source().await {
-            Ok(text) => Ok((text, true)),
-            Err(e) => match &self.vehicle {
-                Vehicle::Http { cache_path, .. } => {
-                    warn!(provider = %self.name, error = %e, "HTTP provider fetch failed, trying cache");
-                    read_cache(cache_path.as_deref(), &self.name)
-                        .await
-                        .map(|text| (text, false))
-                }
-                Vehicle::File(_) => Err(e),
-            },
+        let e = match self.fetch_source().await {
+            Ok(text) => return Ok((text, true)),
+            Err(e) => e,
+        };
+        // Before the first route map is published a `proxy:` name cannot
+        // resolve yet; that fetch is retried, not failed.
+        if !self.deferred_initial.load(Ordering::Relaxed) {
+            self.logbook_failed(&e);
+        }
+        match &self.vehicle {
+            Vehicle::Http { cache_path, .. } => {
+                warn!(provider = %self.name, error = %e, "HTTP provider fetch failed, trying cache");
+                read_cache(cache_path.as_deref(), &self.name)
+                    .await
+                    .map(|text| (text, false))
+            }
+            Vehicle::File(_) => Err(e),
         }
     }
 
@@ -617,6 +625,7 @@ impl ProxyProvider {
         if *self.content_hash.lock() == Some((hash, strict)) {
             if from_remote {
                 self.fetched_remote.store(true, Ordering::Relaxed);
+                self.logbook_updated(Payload::Unchanged);
             }
             return Ok(false);
         }
@@ -624,12 +633,50 @@ impl ProxyProvider {
         if from_remote {
             self.write_cache(&content).await;
         }
+        let payload = if self.has_content() {
+            Payload::Replaced(self.slot.read().len())
+        } else {
+            Payload::First
+        };
         self.commit(proxies);
         *self.content_hash.lock() = Some((hash, strict));
         if from_remote {
             self.fetched_remote.store(true, Ordering::Relaxed);
+            self.logbook_updated(payload);
         }
         Ok(true)
+    }
+
+    /// Logbook: a fetch from the source parsed. Recorded when it replaced a
+    /// payload or ends a failure the logbook shows: a first load belongs to
+    /// the start or config change that declared the provider, and an
+    /// unchanged refetch is routine.
+    fn logbook_updated(&self, payload: Payload) {
+        let name = &self.name;
+        let recovered = || logbook::failing(logbook::kind::PROXY_PROVIDER_UPDATE, name);
+        let count = self.slot.read().len();
+        let message = match payload {
+            Payload::Replaced(previous) => {
+                format!("Updated proxy provider '{name}': {count} proxies (was {previous})")
+            }
+            Payload::First if recovered() => {
+                format!("Updated proxy provider '{name}': {count} proxies")
+            }
+            Payload::Unchanged if recovered() => {
+                format!("Updated proxy provider '{name}': {count} proxies, unchanged")
+            }
+            Payload::First | Payload::Unchanged => return,
+        };
+        logbook::event(logbook::kind::PROXY_PROVIDER_UPDATE, Level::Info, message)
+            .subject(name.as_str())
+            .field("proxies", count)
+            .record();
+    }
+
+    /// Logbook: fetching or parsing the payload failed. Repeats fold while
+    /// the provider keeps failing.
+    fn logbook_failed(&self, error: &str) {
+        record_failure(&self.name, error);
     }
 
     /// Whether any payload generation has been committed — from the remote
@@ -708,8 +755,11 @@ impl ProxyProvider {
         };
         match self.ingest(content, from_remote).await {
             Ok(_) => Ok(true),
-            Err(e) if strict => Err(anyhow::anyhow!("proxy-provider '{}': {e}", self.name)),
             Err(e) => {
+                self.logbook_failed(&e.to_string());
+                if strict {
+                    return Err(anyhow::anyhow!("proxy-provider '{}': {e}", self.name));
+                }
                 warn_initial_load_failure(self, &e.to_string());
                 Ok(false)
             }
@@ -726,11 +776,18 @@ impl ProxyProvider {
         if self.fetched_remote.load(Ordering::Relaxed) {
             return Ok(());
         }
-        let content = self.fetch_source().await?;
-        self.ingest(content, true)
-            .await
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+        let result = match self.fetch_source().await {
+            Ok(content) => self
+                .ingest(content, true)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = &result {
+            self.logbook_failed(e);
+        }
+        result
     }
 
     /// Acquire this provider's remote payload on a detached task: an empty
@@ -969,7 +1026,7 @@ impl ProxyProvider {
 
         let target = meow_proxy::dialer::DialerTarget::new(dialer_name, &self.dialer_registry);
         let chained: Arc<dyn meow_proxy::dialer::TcpDialer> =
-            Arc::new(meow_proxy::dialer::NamedProxyDialer::new(target.clone()));
+            Arc::new(meow_proxy::dialer::NamedProxyDialer::new(target.clone()).owned_by(raw_name));
         let proxy = match proxy_parser::parse_proxy_provider_node(
             raw_map,
             self.ipv6,
@@ -1030,11 +1087,13 @@ impl ProxyProvider {
                     // A torn payload keeps the last-good set instead of
                     // replacing it with nothing.
                     warn!(provider = %self.name, error = %e, "proxy-provider refresh failed");
+                    self.logbook_failed(&e.to_string());
                     Err(e.to_string())
                 }
             },
             Err(e) => {
                 warn!(provider = %self.name, error = %e, "proxy-provider refresh failed");
+                self.logbook_failed(&e);
                 Err(e)
             }
         }
@@ -1048,7 +1107,10 @@ impl ProxyProvider {
     pub async fn acquire_initial(&self) -> anyhow::Result<()> {
         let _generation = self.refresh_lock.lock().await;
         let (content, from_remote) = self.fetch_content().await.map_err(anyhow::Error::msg)?;
-        self.ingest(content, from_remote).await.map(|_| ())
+        self.ingest(content, from_remote)
+            .await
+            .map(|_| ())
+            .inspect_err(|e| self.logbook_failed(&e.to_string()))
     }
 
     /// Consumes the deferred-initial-fetch flags: `true` once per provider
@@ -1145,12 +1207,14 @@ pub async fn load_proxy_providers(
         strict,
         dialer_registry,
         crate::provider_fetch_deadline(),
+        &mut DroppedProviders::default(),
     )
     .await
 }
 
 /// [`load_proxy_providers`] with an explicit fetch deadline instead of the
-/// process-wide [`crate::provider_fetch_deadline`].
+/// process-wide [`crate::provider_fetch_deadline`]. Providers left out
+/// leniently go into `dropped`, for the commit to record.
 pub async fn load_proxy_providers_within(
     raw_map: &HashMap<String, RawProxyProvider>,
     cache_dir: Option<&Path>,
@@ -1158,6 +1222,7 @@ pub async fn load_proxy_providers_within(
     strict: bool,
     dialer_registry: &meow_proxy::dialer::ProxyRegistry,
     deadline: Option<Duration>,
+    dropped: &mut DroppedProviders,
 ) -> Result<HashMap<String, Arc<ProxyProvider>>, anyhow::Error> {
     let mut result = HashMap::new();
     let mut fetches = Vec::new();
@@ -1178,6 +1243,7 @@ pub async fn load_proxy_providers_within(
             }
             Err(e) => {
                 warn!(provider = %name, error = %e, "failed to create proxy-provider, skipping");
+                dropped.proxy(name, e);
                 continue;
             }
         };
@@ -1249,6 +1315,35 @@ pub fn spawn_deferred_initial_fetches(registry: &DashMap<String, Arc<ProxyProvid
             entry.value().spawn_initial_fetch();
         }
     }
+}
+
+/// Logbook: creating, fetching or parsing proxy provider `name` failed.
+/// Repeats fold while it keeps failing.
+pub(crate) fn record_failure(name: &str, error: &str) {
+    // The errors name the provider already.
+    let error = error
+        .strip_prefix(&format!("proxy-provider '{name}': "))
+        .unwrap_or(error);
+    logbook::event(
+        logbook::kind::PROXY_PROVIDER_UPDATE,
+        Level::Error,
+        format!("Updating proxy provider '{name}' failed: {error}"),
+    )
+    .subject(name)
+    .field("error", error)
+    .coalesce()
+    .record();
+}
+
+/// What a parsed fetch did to the provider's payload, for the logbook.
+#[derive(Clone, Copy)]
+enum Payload {
+    /// The provider held nothing yet.
+    First,
+    /// Replaced a payload of this many nodes.
+    Replaced(usize),
+    /// Matched the committed payload byte for byte.
+    Unchanged,
 }
 
 async fn background_fetch_loop(provider: Weak<ProxyProvider>) {
@@ -2989,9 +3084,17 @@ header:
             .iter()
             .map(|(name, url)| ((*name).to_string(), raw_http_provider(url, None)))
             .collect();
-        load_proxy_providers_within(&raw, Some(dir), false, false, &Default::default(), deadline)
-            .await
-            .unwrap()
+        load_proxy_providers_within(
+            &raw,
+            Some(dir),
+            false,
+            false,
+            &Default::default(),
+            deadline,
+            &mut DroppedProviders::default(),
+        )
+        .await
+        .unwrap()
     }
 
     fn registry_of(

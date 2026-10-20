@@ -9,6 +9,7 @@ use axum::{
     Router,
 };
 use dashmap::DashMap;
+use meow_common::logbook::{self, Level};
 use meow_common::TunnelMode;
 use meow_config::{
     proxy_provider::ProxyProvider,
@@ -221,6 +222,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/traffic", get(get_traffic))
         .route("/statistics", get(get_statistics))
         .route("/logs", get(get_logs))
+        .route(
+            "/logbook",
+            get(crate::logbook::get_logbook).delete(crate::logbook::clear_logbook),
+        )
         .route("/memory", get(get_memory))
         .route("/dns/results", get(get_dns_results))
         .route("/dns/query", get(dns_query_get).post(dns_query))
@@ -883,8 +888,10 @@ struct ProxyTotals {
 /// `GET /statistics` (meow extension, no mihomo equivalent): the byte totals
 /// and what each proxy carried since the tunnel started, TCP and UDP. A
 /// group's traffic is counted at the member that carried it, so `proxies`
-/// holds the leaves a flow ended at; a proxy stays listed after a reload
-/// removes it. Empty `proxies` when the tunnel runs headless.
+/// holds the leaves a flow ended at, plus the members of `dialer-proxy`
+/// groups that carried a chained outbound's hop (counted once in the
+/// totals); a proxy stays listed after a reload removes it. Empty `proxies`
+/// when the tunnel runs headless.
 async fn get_statistics(State(state): State<Arc<AppState>>) -> Json<StatisticsResponse> {
     let stats = state.tunnel.statistics();
     let (upload_total, download_total) = stats.snapshot();
@@ -1221,6 +1228,7 @@ async fn apply_raw_to_tunnel(
         rule_providers,
         proxy_providers,
         prefetched_payloads,
+        dropped_providers,
     } = result;
     if let Some(missing) = expected_groups
         .iter()
@@ -1278,6 +1286,7 @@ async fn apply_raw_to_tunnel(
         raw.proxy_providers.as_ref(),
         &state.proxy_provider_refresh,
     );
+    dropped_providers.record();
     Ok((dns, prior_resolver))
 }
 
@@ -1292,9 +1301,12 @@ async fn apply_raw_to_tunnel(
 /// re-asserts the running listener's binding for the rebuild and is handed
 /// back on return — but any `tun:` or fake-IP change reaching the reconcile
 /// is covered the same way as on the cold path.
+///
+/// `change` is recorded in the logbook once the candidate is committed.
 async fn commit_raw_candidate(
     state: &AppState,
     candidate: RawConfig,
+    change: impl Into<Option<logbook::Event>>,
 ) -> Result<(), (StatusCode, String)> {
     debug_assert!(
         CONFIG_MUTATION.try_lock().is_err(),
@@ -1313,7 +1325,78 @@ async fn commit_raw_candidate(
         TrackedTcp::Cancel,
     )
     .await;
+    if let Some(change) = change.into() {
+        change.record();
+    }
     Ok(())
+}
+
+/// A `config.change` logbook event, for [`commit_raw_candidate`].
+fn config_change(message: String) -> logbook::Event {
+    logbook::event(logbook::kind::CONFIG_CHANGE, Level::Info, message)
+}
+
+/// `{verb} subscription 'name': 84 proxies, 2 groups, 10 rules`, counting
+/// what the subscription itself contributes to `raw` — not the merged
+/// section totals [`meow_config::subscription::apply_subscription`] returns,
+/// which include local entries and sibling subscriptions.
+pub fn subscription_event(
+    kind: &'static str,
+    verb: &str,
+    raw: &RawConfig,
+    name: &str,
+) -> logbook::Event {
+    let (proxies, groups, rules) = raw
+        .subscriptions
+        .iter()
+        .flatten()
+        .find(|s| s.name == name)
+        .map_or((0, 0, 0), |s| {
+            (
+                s.applied_proxies.len(),
+                s.applied_groups.len(),
+                s.applied_rules.len(),
+            )
+        });
+    logbook::event(
+        kind,
+        Level::Info,
+        format!("{verb} subscription '{name}': {proxies} proxies, {groups} groups, {rules} rules"),
+    )
+    .subject(name)
+    .field("proxies", proxies)
+    .field("groups", groups)
+    .field("rules", rules)
+}
+
+/// The `subscription.update` entry for a refresh that merged subscription
+/// `name` into `previous`, giving `raw`. `None` when the merge changed no
+/// proxy, group or rule and the subscription is not recovering from a
+/// failure: refetching the same payload says nothing new.
+pub fn subscription_update(
+    previous: &RawConfig,
+    raw: &RawConfig,
+    name: &str,
+) -> Option<logbook::Event> {
+    let changed = previous.proxies != raw.proxies
+        || previous.proxy_groups != raw.proxy_groups
+        || previous.rules != raw.rules;
+    let kind = logbook::kind::SUBSCRIPTION_UPDATE;
+    (changed || logbook::failing(kind, name))
+        .then(|| subscription_event(kind, "Updated", raw, name))
+}
+
+/// Updating subscription `name` failed. Repeats fold while it keeps failing.
+pub fn subscription_failed(name: &str, error: &str) {
+    logbook::event(
+        logbook::kind::SUBSCRIPTION_UPDATE,
+        Level::Error,
+        format!("Updating subscription '{name}' failed: {error}"),
+    )
+    .subject(name)
+    .field("error", error)
+    .coalesce()
+    .record();
 }
 
 /// Commit a validated candidate proxy-provider set into the live registry.
@@ -1842,7 +1925,8 @@ async fn add_subscription(
 
         (raw, counts)
     };
-    commit_raw_candidate(&state, snapshot.clone()).await?;
+    let change = subscription_event(logbook::kind::CONFIG_CHANGE, "Added", &snapshot, &body.name);
+    commit_raw_candidate(&state, snapshot.clone(), change).await?;
 
     // Auto-save so subscription data is cached on disk — skipped (with a
     // warning and `persisted: false`) when the daemon was started via
@@ -1888,7 +1972,8 @@ async fn delete_subscription(
 
         raw
     };
-    commit_raw_candidate(&state, snapshot.clone()).await?;
+    let change = config_change(format!("Removed subscription '{name}'")).subject(name.as_str());
+    commit_raw_candidate(&state, snapshot.clone(), change).await?;
     persist_candidate(&state, &snapshot, &name).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1908,19 +1993,23 @@ async fn refresh_subscription(
         (url, proxy_name, raw.strict.unwrap_or(false))
     };
 
+    let failed = |message: String| {
+        subscription_failed(&name, &message);
+        (StatusCode::BAD_REQUEST, message)
+    };
     let download_proxy = meow_config::internal_http::resolve_download_proxy(
         &state.provider_dialer_registry,
         proxy_name.as_deref(),
     )
-    .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    .map_err(|e| failed(e.to_string()))?;
     let mut fetched =
         meow_config::subscription::fetch_subscription(&url, strict, download_proxy.as_ref())
             .await
-            .map_err(|e| (StatusCode::BAD_REQUEST, format!("fetch failed: {e}")))?;
+            .map_err(|e| failed(format!("fetch failed: {e}")))?;
     // Same pre-lane ECH resolution as `add_subscription` (issue #533).
     meow_config::ech_dns::preresolve_ech(&mut fetched.proxies, strict)
         .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("{e} (strict mode)")))?;
+        .map_err(|e| failed(format!("{e} (strict mode)")))?;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1965,7 +2054,10 @@ async fn refresh_subscription(
 
         (raw, counts)
     };
-    commit_raw_candidate(&state, snapshot.clone()).await?;
+    let update = subscription_update(&state.raw_config.read(), &snapshot, &name);
+    commit_raw_candidate(&state, snapshot.clone(), update)
+        .await
+        .inspect_err(|(_, message)| subscription_failed(&name, message))?;
 
     // Auto-save so subscription data is cached on disk — skipped (with a
     // warning and `persisted: false`) when the daemon was started via
@@ -2086,7 +2178,9 @@ async fn create_proxy_group(
         raw.proxy_groups.get_or_insert_with(Vec::new).push(group);
         raw
     };
-    commit_raw_candidate(&state, snapshot).await?;
+    let change =
+        config_change(format!("Created proxy group '{group_name}'")).subject(group_name.as_str());
+    commit_raw_candidate(&state, snapshot, change).await?;
     Ok(Json(
         serde_json::json!({"message": "group created", "name": group_name}),
     ))
@@ -2112,7 +2206,8 @@ async fn update_proxy_group(
         group.tolerance = body.tolerance;
         raw
     };
-    commit_raw_candidate(&state, snapshot).await?;
+    let change = config_change(format!("Changed proxy group '{name}'")).subject(name.as_str());
+    commit_raw_candidate(&state, snapshot, change).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2145,7 +2240,8 @@ async fn delete_proxy_group(
         meow_config::subscription::reconcile_contribution_claims(&mut raw);
         raw
     };
-    commit_raw_candidate(&state, snapshot).await?;
+    let change = config_change(format!("Deleted proxy group '{name}'")).subject(name.as_str());
+    commit_raw_candidate(&state, snapshot, change).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2186,6 +2282,7 @@ async fn replace_rules(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ReplaceRulesRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    let count = body.rules.len();
     let _mutation = CONFIG_MUTATION.lock().await;
     let snapshot = {
         let mut raw = state.raw_config.read().clone();
@@ -2193,7 +2290,8 @@ async fn replace_rules(
         meow_config::subscription::reconcile_contribution_claims(&mut raw);
         raw
     };
-    commit_raw_candidate(&state, snapshot).await?;
+    let change = config_change(format!("Replaced the rules ({count})")).field("rules", count);
+    commit_raw_candidate(&state, snapshot, change).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2218,7 +2316,8 @@ async fn update_rule_at_index(
         meow_config::subscription::reconcile_contribution_claims(&mut raw);
         raw
     };
-    commit_raw_candidate(&state, snapshot).await?;
+    let change = config_change(format!("Changed rule {}", body.index)).field("index", body.index);
+    commit_raw_candidate(&state, snapshot, change).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2237,7 +2336,8 @@ async fn delete_rule(
         meow_config::subscription::reconcile_contribution_claims(&mut raw);
         raw
     };
-    commit_raw_candidate(&state, snapshot).await?;
+    let change = config_change(format!("Deleted rule {index}")).field("index", index);
+    commit_raw_candidate(&state, snapshot, change).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2262,7 +2362,10 @@ async fn reorder_rules(
         rules.insert(body.to, rule);
         raw
     };
-    commit_raw_candidate(&state, snapshot).await?;
+    let change = config_change(format!("Moved rule {} to {}", body.from, body.to))
+        .field("from", body.from)
+        .field("to", body.to);
+    commit_raw_candidate(&state, snapshot, change).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2595,7 +2698,7 @@ async fn swap_config_and_reconcile_tun(
     // Snapshot the candidate (only on an off→on transition, before it is
     // moved into the lock) so the parking_lot write guard — which is
     // !Send — is dropped before the first .await below.
-    let (old_enable, tun_changed, snapshot, specs, new_log_level) = {
+    let (old_enable, tun_changed, snapshot, specs, new_log_level, logbook_enable) = {
         let mut guard = state.raw_config.write();
         let old = guard.tun.as_ref().is_some_and(|t| t.enable);
         // Semantic diff (issue #543): compare the PARSED `TunConfig`s so
@@ -2645,9 +2748,18 @@ async fn swap_config_and_reconcile_tun(
         // review).
         let new_log_level =
             (guard.log_level != candidate.log_level).then(|| candidate.log_level.clone());
+        let logbook_enable = meow_config::raw::RawLogbook::enabled(candidate.logbook.as_ref());
         *guard = candidate;
-        (old, tun_changed, snapshot, specs, new_log_level)
+        (
+            old,
+            tun_changed,
+            snapshot,
+            specs,
+            new_log_level,
+            logbook_enable,
+        )
     };
+    logbook::reconfigure(logbook_enable);
 
     if let Some(new_log_level) = new_log_level {
         let level = new_log_level.as_deref().unwrap_or("info");
@@ -2732,6 +2844,7 @@ async fn swap_config_and_reconcile_tun(
                 }
                 Err(e) => {
                     warn!("TUN listener failed to restart: {e} (config rolled back)");
+                    tun_failed(format!("TUN failed to restart and was turned off: {e}"));
                     if let Some(ref mut tun) = state.raw_config.write().tun {
                         tun.enable = false;
                     }
@@ -2772,6 +2885,7 @@ async fn swap_config_and_reconcile_tun(
                 // nyanpasu / the dashboard don't show TUN as active when
                 // nothing is actually running.
                 warn!("TUN listener failed to start: {e} (config rolled back)");
+                tun_failed(format!("TUN failed to start and was turned off: {e}"));
                 if let Some(ref mut tun) = state.raw_config.write().tun {
                     tun.enable = false;
                 }
@@ -2782,6 +2896,14 @@ async fn swap_config_and_reconcile_tun(
         state.tunnel.stop_tun().await;
         info!("TUN listener stopped via config reload");
     }
+}
+
+/// Record a TUN listener that did not (re)start, at startup or on a config
+/// reload, and was turned off.
+pub fn tun_failed(message: String) {
+    logbook::event(logbook::kind::LISTENER_START, Level::Error, message)
+        .subject("tun")
+        .record();
 }
 
 /// A committed mutation's TUN listener came up with the global-route binding
@@ -2840,47 +2962,31 @@ async fn put_configs(
 ) -> Response {
     let force = params.get("force").is_some_and(|v| v == "true");
 
-    let yaml =
-        match (body.path, body.payload) {
-            (Some(p), _) => match tokio::fs::read_to_string(&p).await {
+    let yaml = match (body.path, body.payload) {
+        (Some(p), _) => match tokio::fs::read_to_string(&p).await {
+            Ok(s) => s,
+            Err(e) => return reload_rejected(StatusCode::BAD_REQUEST, &e.to_string()),
+        },
+        (_, Some(b64)) => {
+            use base64::engine::general_purpose::STANDARD;
+            use base64::Engine as _;
+            let Ok(bytes) = STANDARD.decode(&b64) else {
+                return reload_rejected(StatusCode::BAD_REQUEST, "payload is not valid base64");
+            };
+            match String::from_utf8(bytes) {
                 Ok(s) => s,
-                Err(e) => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({"message": e.to_string()})),
-                    )
-                        .into_response()
-                }
-            },
-            (_, Some(b64)) => {
-                use base64::engine::general_purpose::STANDARD;
-                use base64::Engine as _;
-                let Ok(bytes) = STANDARD.decode(&b64) else {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({"message": "payload is not valid base64"})),
-                    )
-                        .into_response();
-                };
-                match String::from_utf8(bytes) {
-                    Ok(s) => s,
-                    Err(_) => {
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            Json(serde_json::json!({"message": "payload is not valid UTF-8"})),
-                        )
-                            .into_response()
-                    }
+                Err(_) => {
+                    return reload_rejected(StatusCode::BAD_REQUEST, "payload is not valid UTF-8")
                 }
             }
-            _ => return (
+        }
+        _ => {
+            return reload_rejected(
                 StatusCode::BAD_REQUEST,
-                Json(
-                    serde_json::json!({"message": "request body must contain 'path' or 'payload'"}),
-                ),
+                "request body must contain 'path' or 'payload'",
             )
-                .into_response(),
-        };
+        }
+    };
 
     // YAML syntax check — always 400 even with force=true (per spec).
     // `parse_raw_yaml` applies the nesting-depth guard and merge-key
@@ -2888,11 +2994,7 @@ async fn put_configs(
     let mut raw_config: RawConfig = match meow_config::parse_raw_yaml(&yaml) {
         Ok(c) => c,
         Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"message": format!("config parse error: {e}")})),
-            )
-                .into_response()
+            return reload_rejected(StatusCode::BAD_REQUEST, &format!("config parse error: {e}"))
         }
     };
 
@@ -2909,11 +3011,7 @@ async fn put_configs(
             .iter()
             .any(|s| !seen.insert(s.name.as_str()))
         {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"message": "duplicate subscription name"})),
-            )
-                .into_response();
+            return reload_rejected(StatusCode::BAD_REQUEST, "duplicate subscription name");
         }
     }
 
@@ -2931,6 +3029,8 @@ async fn put_configs(
     // Dropped on every rejection below, restoring the running listener's
     // binding; a TUN (re)spawn in the reconcile adopts it instead.
     let preinstalled = preinstall_global_route_binding(&raw_config);
+    // Errors `force` pushed past, for the logbook.
+    let mut forced: Vec<String> = Vec::new();
 
     // Pre-resolve any DNS-sourced ECH configs into inline base64. Under
     // `force`, a strict-ECH defect is retried leniently so it degrades the
@@ -2940,13 +3040,10 @@ async fn put_configs(
             meow_config::ech_dns::preresolve_ech(ps, raw_config.strict.unwrap_or(false)).await
         {
             if !force {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"message": format!("{e} (strict mode)")})),
-                )
-                    .into_response();
+                return reload_rejected(StatusCode::BAD_REQUEST, &format!("{e} (strict mode)"));
             }
             tracing::warn!("config reload: {e}; retrying ECH preresolve leniently under force");
+            forced.push(e.to_string());
             let _ = meow_config::ech_dns::preresolve_ech(ps, false).await;
         }
     }
@@ -3028,6 +3125,7 @@ async fn put_configs(
                 tracing::error!(
                     "config reload: rebuild failed ({e}); retrying leniently under force"
                 );
+                forced.push(e.to_string());
                 let mut lenient = raw_config.clone();
                 lenient.strict = Some(false);
                 match rebuild_from_raw_runtime_async(
@@ -3047,15 +3145,15 @@ async fn put_configs(
                         tracing::error!(
                             "forced config reload still failed: {e2}; keeping previous routing"
                         );
+                        forced.push(e2);
                         None
                     }
                 }
             } else {
-                return (
+                return reload_rejected(
                     StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"message": format!("config validation error: {e}")})),
-                )
-                    .into_response();
+                    &format!("config validation error: {e}"),
+                );
             }
         }
     };
@@ -3077,6 +3175,16 @@ async fn put_configs(
             TrackedTcp::Cancel,
         )
         .await;
+        logbook::event(
+            logbook::kind::CONFIG_RELOAD,
+            Level::Error,
+            format!(
+                "Saved the forced config, but nothing in it built; kept the previous routing: {}",
+                forced.join("; ")
+            ),
+        )
+        .field("error", forced.join("; "))
+        .record();
         return StatusCode::NO_CONTENT.into_response();
     };
     let meow_config::RebuildResult {
@@ -3086,6 +3194,7 @@ async fn put_configs(
         rule_providers,
         proxy_providers,
         prefetched_payloads,
+        dropped_providers,
     } = result;
 
     // A `tun:` section the listener cannot parse must be rejected before
@@ -3101,12 +3210,9 @@ async fn put_configs(
     {
         if force {
             tracing::error!("config reload forced despite tun config error: {e}");
+            forced.push(format!("tun config error: {e}"));
         } else {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"message": format!("tun config error: {e}")})),
-            )
-                .into_response();
+            return reload_rejected(StatusCode::BAD_REQUEST, &format!("tun config error: {e}"));
         }
     }
 
@@ -3123,12 +3229,12 @@ async fn put_configs(
     {
         if force {
             tracing::error!("config reload forced despite listeners config error: {e}");
+            forced.push(format!("listeners config error: {e}"));
         } else {
-            return (
+            return reload_rejected(
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"message": format!("listeners config error: {e}")})),
-            )
-                .into_response();
+                &format!("listeners config error: {e}"),
+            );
         }
     }
 
@@ -3152,6 +3258,7 @@ async fn put_configs(
         Err((status, msg)) => {
             if force {
                 tracing::error!("config reload forced despite dns rebuild error: {msg}");
+                forced.push(msg.clone());
                 // Keeping the old resolver is only safe when it references
                 // no runtime objects — `#name`/`rule-set:` adapters capture
                 // refs whose registry/provider generation dies with the
@@ -3184,7 +3291,7 @@ async fn put_configs(
                     None
                 }
             } else {
-                return (status, Json(serde_json::json!({"message": msg}))).into_response();
+                return reload_rejected(status, &msg);
             }
         }
     };
@@ -3232,7 +3339,9 @@ async fn put_configs(
         raw_config.proxy_providers.as_ref(),
         &state.proxy_provider_refresh,
     );
+    dropped_providers.record();
 
+    let reloaded = reload_succeeded(&raw_config, &forced, dropped);
     // `reload_routing` above ran after the pre-install and cancelled every
     // tracked TCP flow; any admitted since dialled under the binding.
     swap_config_and_reconcile_tun(
@@ -3244,8 +3353,52 @@ async fn put_configs(
         TrackedTcp::AlreadyCancelled,
     )
     .await;
+    reloaded.record();
 
     StatusCode::NO_CONTENT.into_response()
+}
+
+/// Answer a rejected `PUT /configs`, recording the failure in the logbook.
+fn reload_rejected(status: StatusCode, message: &str) -> Response {
+    logbook::event(
+        logbook::kind::CONFIG_RELOAD,
+        Level::Error,
+        format!("Reloading the config failed: {message}"),
+    )
+    .field("error", message)
+    .record();
+    (status, Json(serde_json::json!({ "message": message }))).into_response()
+}
+
+/// The logbook event of a committed `PUT /configs`; a warning when `force`
+/// pushed past errors.
+fn reload_succeeded(raw: &RawConfig, forced: &[String], dropped: usize) -> logbook::Event {
+    let proxies = raw.proxies.as_ref().map_or(0, Vec::len);
+    let groups = raw.proxy_groups.as_ref().map_or(0, Vec::len);
+    let rules = raw.rules.as_ref().map_or(0, Vec::len);
+    let counts = format!("{proxies} proxies, {groups} groups, {rules} rules");
+    let event = if forced.is_empty() {
+        logbook::event(
+            logbook::kind::CONFIG_RELOAD,
+            Level::Info,
+            format!("Reloaded the config: {counts}"),
+        )
+    } else {
+        logbook::event(
+            logbook::kind::CONFIG_RELOAD,
+            Level::Warning,
+            format!(
+                "Reloaded the config past errors (force): {counts}; {}",
+                forced.join("; ")
+            ),
+        )
+        .field("error", forced.join("; "))
+    };
+    event
+        .field("proxies", proxies)
+        .field("groups", groups)
+        .field("rules", rules)
+        .field("connectionsClosed", dropped)
 }
 
 // ── Prometheus metrics (M1.H-2) ──────────────────────────────────────

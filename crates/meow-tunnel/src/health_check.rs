@@ -1,5 +1,6 @@
 use crate::tunnel::TunnelInner;
-use meow_common::HealthCheckSpec;
+use meow_common::{ChainHealth, HealthCheckSpec, Proxy};
+use smol_str::SmolStr;
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
@@ -137,24 +138,36 @@ async fn run_health_check_loop(inner: Weak<TunnelInner>, spec: HealthCheckSpec) 
         // dialer registry, and a mid-probe `update_routing` would otherwise
         // fail chained members closed and mark live nodes dead (issue #533).
 
+        // Automatic groups that carry `dialer-proxy` chains: a chained
+        // member that fails its probe is checked through them before it
+        // is taken for down.
+        let fronts: Vec<Arc<dyn Proxy>> = proxies
+            .values()
+            .filter(|p| p.chain_health().is_some())
+            .cloned()
+            .collect();
+        let hold = Duration::from_secs(interval_secs).saturating_mul(2);
+
         let mut alive_count = 0u32;
         let mut total_count = 0u32;
-        for (name, delay) in meow_proxy::health::probe_many_bounded(
+        for member in meow_proxy::health::sweep_members(
             members,
+            &fronts,
             &spec.url,
             expected_status,
             PROBE_TIMEOUT,
             meow_proxy::health::PROVIDER_HEALTHCHECK_CONCURRENCY,
+            hold,
         )
         .await
         {
             total_count += 1;
-            if delay > 0 {
+            if member.delay > 0 {
                 alive_count += 1;
             } else {
                 warn!(
                     "health-check: {} / {} is dead (probe failed)",
-                    spec.group_name, name
+                    spec.group_name, member.name
                 );
             }
         }
@@ -172,7 +185,75 @@ async fn run_health_check_loop(inner: Weak<TunnelInner>, spec: HealthCheckSpec) 
             "health-check: {} — {}/{} alive",
             spec.group_name, alive_count, total_count
         );
+
+        if let Some(chain) = group.chain_health() {
+            // A block outlives the gap to the next round, which probes
+            // the member again if it is among those the round tries: one
+            // that still fails stays blocked, one that passes is cleared.
+            probe_chain_targets(&spec, &group, chain, proxies, expected_status, hold).await;
+        }
     }
+}
+
+/// Probe the `dialer-proxy` chains that run through `group`, once its own
+/// URL test has refreshed the member delays the probes are ordered by. See
+/// [`meow_common::chain_health`].
+async fn probe_chain_targets(
+    spec: &HealthCheckSpec,
+    group: &Arc<dyn Proxy>,
+    chain: &ChainHealth,
+    proxies: &HashMap<SmolStr, Arc<dyn Proxy>>,
+    expected_status: Option<&str>,
+    hold: Duration,
+) {
+    for (target, owners) in chain.targets() {
+        let Some(owner) = owners
+            .iter()
+            .rev()
+            .find_map(|name| resolve_owner(proxies, name))
+        else {
+            debug!(
+                "health-check: {} — no outbound left that dials {target} through it",
+                spec.group_name
+            );
+            continue;
+        };
+        let report = meow_proxy::health::probe_chain_target(
+            group,
+            &target,
+            &owner,
+            &spec.url,
+            expected_status,
+            PROBE_TIMEOUT,
+            hold,
+        )
+        .await;
+        if !report.reached.is_empty() || !report.blocked.is_empty() || !report.failed.is_empty() {
+            info!(
+                "health-check: {} — dialer-proxy chain to {target} via '{}': {} reached, {} \
+                 blocked, {} failed",
+                spec.group_name,
+                owner.name(),
+                report.reached.len(),
+                report.blocked.len(),
+                report.failed.len()
+            );
+        }
+    }
+}
+
+/// The outbound `name` names: a route-table entry, or a provider-sourced
+/// member of a group there. Provider nodes that carry their own
+/// `dialer-proxy` are not route-table keys.
+fn resolve_owner(proxies: &HashMap<SmolStr, Arc<dyn Proxy>>, name: &str) -> Option<Arc<dyn Proxy>> {
+    if let Some(proxy) = proxies.get(name) {
+        return Some(Arc::clone(proxy));
+    }
+    proxies
+        .values()
+        .filter_map(|p| p.member_proxies())
+        .flatten()
+        .find(|p| p.name() == name)
 }
 
 #[cfg(test)]

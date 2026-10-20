@@ -4,7 +4,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use parking_lot::Mutex;
+use meow_common::logbook::{self, Entry, Query};
+use parking_lot::{Mutex, MutexGuard};
 
 /// A provider origin the test steers: counts requests, answers with the
 /// current body (503 while `None`), and holds each request until the gate
@@ -68,4 +69,41 @@ pub(crate) async fn eventually(what: &str, mut done: impl FnMut() -> bool) {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("timed out waiting for: {what}");
+}
+
+/// The process-wide logbook, installed in a temporary directory for one
+/// test at a time and uninstalled on drop. Tests that do not take it record
+/// into it meanwhile, so a test reads its own subjects only.
+pub(crate) struct TestLogbook {
+    _dir: tempfile::TempDir,
+    _serial: MutexGuard<'static, ()>,
+}
+
+static LOGBOOK: Mutex<()> = Mutex::new(());
+
+impl TestLogbook {
+    pub(crate) fn install() -> Self {
+        let serial = LOGBOOK.lock();
+        let dir = tempfile::tempdir().unwrap();
+        logbook::install(dir.path(), logbook::Options::default()).unwrap();
+        Self {
+            _dir: dir,
+            _serial: serial,
+        }
+    }
+
+    /// The entries about `subject`, newest first.
+    pub(crate) fn entries(&self, subject: &str) -> Vec<Entry> {
+        let query = Query {
+            subject: Some(subject.to_owned()),
+            ..Query::default()
+        };
+        logbook::query(&query).unwrap().unwrap().entries
+    }
+}
+
+impl Drop for TestLogbook {
+    fn drop(&mut self) {
+        logbook::uninstall();
+    }
 }

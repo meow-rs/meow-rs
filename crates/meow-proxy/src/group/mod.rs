@@ -1,10 +1,21 @@
 use meow_common::atomic::AtomicU;
-use meow_common::{AdapterType, MeowError, Metadata, Proxy};
+use meow_common::logbook::{self, Level};
+use meow_common::{
+    conn_note, failure_reason, AdapterType, Blame, CarrierChange, ChainHealth, ChainTarget,
+    ChainVerdict, MeowError, Metadata, Proxy, ProxyConn, CLOSED_BEFORE_REPLY,
+};
 use parking_lot::Mutex;
+use smol_str::SmolStr;
+use std::cell::{Cell, RefCell};
+use std::future::Future;
+use std::io;
+use std::pin::Pin;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use tracing::debug;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tracing::{debug, info};
 
 /// Lock-free traffic-use generation shared by automatic proxy groups. A lazy
 /// health-check loop remembers the last generation it probed and sleeps until
@@ -162,12 +173,15 @@ impl DialFailureTracker {
 /// describe the *target* (Direct / Reject family) are never tracked, and
 /// everything else escalates through the group's [`DialFailureTracker`].
 /// Escalation marks the failed member dead — see [`DialFailureTracker`] for
-/// why this stands in for mihomo's forced health check.
+/// why this stands in for mihomo's forced health check. A chained outbound
+/// marked dead so is recorded in the logbook (`chain` is the dial's path,
+/// see [`record_chained_down`]).
 pub(super) fn record_dial_failure(
     group_name: &str,
     tracker: &DialFailureTracker,
     member: &Arc<dyn Proxy>,
     err: &MeowError,
+    chain: Option<&ChainedDial>,
 ) {
     if matches!(
         member.adapter_type(),
@@ -182,17 +196,157 @@ pub(super) fn record_dial_failure(
     }
     if tracker.on_failure(err) {
         debug!(
-            "proxy-group '{group_name}': marking member '{}' dead after repeated dial failures",
+            "proxy-group '{group_name}': marking member '{}' dead after repeated dial failures \
+             ({err})",
             member.name()
         );
         member.health().set_alive(false);
+        if let Some(chain) = chain {
+            record_chained_down(group_name, member.name(), err, chain);
+        }
     }
 }
 
-/// Tracks the selected member even when an outer dial deadline drops the
-/// group future before its error arm can run. Capturing the deadline avoids
-/// consulting task-local state during destruction. Ordinary cancellation
-/// before expiry is not a node failure, and completed dials are counted once.
+/// The `dialer-proxy` front hop a member dial went through: an automatic
+/// group ([`dialled_through`]), and the member of it the dial took, when it
+/// got that far.
+pub(super) struct ChainedDial {
+    front: Arc<dyn Proxy>,
+    member: Option<Arc<dyn Proxy>>,
+}
+
+/// Record that `group`'s dial failures took `owner`, a chained outbound,
+/// down. No health check saw it fail, and the outbound is out of every
+/// group that holds it until its next one passes, or a chain probe of its
+/// `dialer-proxy` group reaches its server; either records the recovery.
+/// The reason is [`failure_reason`]'s, so no error text reaches the
+/// logbook.
+fn record_chained_down(group: &str, owner: &str, err: &MeowError, chain: &ChainedDial) {
+    let front = chain.front.name();
+    let reason = failure_reason(&err.to_string());
+    let path = match &chain.member {
+        Some(member) => format!("'{}' of '{front}'", member.name()),
+        None => format!("'{front}'"),
+    };
+    let mut event = logbook::event(
+        logbook::kind::DIALER_PROXY_CHECK,
+        Level::Error,
+        format!("'{owner}' is down: its dials from '{group}' failed ({reason}) through {path}"),
+    )
+    .subject(owner)
+    .field("group", front)
+    .field("reason", reason)
+    .field("by", group);
+    if let Some(member) = &chain.member {
+        event = event.field("member", member.name());
+    }
+    event.coalesce().record();
+}
+
+tokio::task_local! {
+    /// Set while an automatic group dials a member, and while the health
+    /// check probes one ([`watch_member_dial`]): what the groups and
+    /// `dialer-proxy` front hops on the member's path report.
+    static MEMBER_DIAL: MemberDial;
+}
+
+#[derive(Default)]
+struct MemberDial {
+    /// A front hop on the path failed for its own member
+    /// ([`front_hop_failed`]).
+    front_failed: Cell<bool>,
+    /// The member the last group dialled on the path took. A front hop
+    /// that fails reads it ([`last_pick_is`]).
+    pick: RefCell<Option<Arc<dyn Proxy>>>,
+    /// The automatic group a `dialer-proxy` front hop on the path dialled
+    /// through ([`dialled_through`]).
+    front: RefCell<Option<Arc<dyn Proxy>>>,
+}
+
+impl MemberDial {
+    /// The front hop the dial went through, if any.
+    fn chain(&self) -> Option<ChainedDial> {
+        Some(ChainedDial {
+            front: self.front.take()?,
+            member: self.pick.take(),
+        })
+    }
+}
+
+/// A `dialer-proxy` front hop on the current member dial resolved to
+/// `front`. An automatic group is noted, so a group that takes the chained
+/// outbound down for its dial failures can say through which member.
+pub(crate) fn dialled_through(front: &Arc<dyn Proxy>) {
+    if front.chain_health().is_some() {
+        let _ = MEMBER_DIAL.try_with(|dial| dial.front.replace(Some(Arc::clone(front))));
+    }
+}
+
+/// The current dial failed at a `dialer-proxy` front hop, for the front
+/// group's member: it failed to dial while the group still has another
+/// live member, or it closed the chain before any reply, or let the dial's
+/// deadline pass with the request unanswered, without having carried a
+/// chain to that server before. The front group counts the member; the
+/// group dialling the chained outbound does not count the outbound. A front
+/// member refusing a connection would otherwise mark a healthy chained
+/// outbound dead at once, and a burst of connections through a member that
+/// drops the server's port would mark it dead after five
+/// (`DialFailureTracker`). A carrier that fails still counts against the
+/// outbound: a member known to reach the server failing is the likelier
+/// sign that the server is down. So does any member once more than
+/// [`meow_common::chain_health::BLAMED_MEMBERS`] have failed the server in
+/// a row ([`ChainHealth::blame`]): a server that is down would otherwise
+/// fail through each member of the group in turn before the outbound
+/// counted it. And so does a member the group took with every usable one
+/// blocked for the server ([`note_front_hop_member`]), which no other
+/// member can stand in for.
+pub(crate) fn front_hop_failed() {
+    let _ = MEMBER_DIAL.try_with(|dial| dial.front_failed.set(true));
+}
+
+/// The member the last group dialled on the current member dial took.
+pub(crate) fn last_pick() -> Option<Arc<dyn Proxy>> {
+    MEMBER_DIAL
+        .try_with(|dial| dial.pick.borrow().clone())
+        .ok()
+        .flatten()
+}
+
+/// Whether the last group dialled on the current member dial took the
+/// member named `name`.
+pub(crate) fn last_pick_is(name: &str) -> bool {
+    MEMBER_DIAL
+        .try_with(|dial| {
+            dial.pick
+                .borrow()
+                .as_ref()
+                .is_some_and(|p| p.name() == name)
+        })
+        .unwrap_or(false)
+}
+
+/// Run `dial`, a dial or probe of a member, and name the member that the
+/// last group dialled on its path took: a chained outbound's front hop.
+pub(crate) async fn watch_member_dial<T>(
+    dial: impl Future<Output = T>,
+) -> (T, Option<Arc<dyn Proxy>>) {
+    MEMBER_DIAL
+        .scope(MemberDial::default(), async {
+            let output = dial.await;
+            (output, MEMBER_DIAL.with(|dial| dial.pick.take()))
+        })
+        .await
+}
+
+/// Counts the outcome of one member dial. The dial runs under the outer
+/// dial deadline itself, so expiry settles like any failure, front-hop
+/// verdicts included: the innermost dial on a path times out first, and a
+/// front hop's member takes the blame before the group dialling the chained
+/// outbound sees the error. A dial dropped at or past the deadline without
+/// being polled to its end still counts on drop, for the member alone.
+/// Capturing the deadline avoids consulting task-local state during
+/// destruction. Ordinary cancellation before expiry is not a node failure,
+/// and completed dials are counted once.
 struct DialAttempt<'a> {
     group_name: &'a str,
     tracker: &'a DialFailureTracker,
@@ -214,11 +368,43 @@ impl<'a> DialAttempt<'a> {
         }
     }
 
-    fn finish<T>(mut self, result: meow_common::Result<T>) -> meow_common::Result<T> {
+    /// Dial the member with `dial` and count the outcome.
+    async fn run<T>(
+        mut self,
+        dial: impl Future<Output = meow_common::Result<T>>,
+    ) -> meow_common::Result<T> {
+        // The member dial enclosing this one learns which member was taken.
+        let _ = MEMBER_DIAL.try_with(|outer| outer.pick.replace(Some(Arc::clone(self.member))));
+        let deadline = self.deadline;
+        let member = self.member.name();
+        let (result, (front_failed, chain)) = MEMBER_DIAL
+            .scope(MemberDial::default(), async {
+                let result = match deadline {
+                    Some(_) => meow_common::with_dial_timeout(member, dial).await,
+                    None => dial.await,
+                };
+                (
+                    result,
+                    MEMBER_DIAL.with(|dial| (dial.front_failed.get(), dial.chain())),
+                )
+            })
+            .await;
         self.deadline = None;
         match &result {
             Ok(_) => self.tracker.on_success(),
-            Err(err) => record_dial_failure(self.group_name, self.tracker, self.member, err),
+            Err(err) if front_failed => debug!(
+                "proxy-group '{}': not counting a failed dial of '{}' against it: its \
+                 dialer-proxy front hop failed ({err})",
+                self.group_name,
+                self.member.name()
+            ),
+            Err(err) => record_dial_failure(
+                self.group_name,
+                self.tracker,
+                self.member,
+                err,
+                chain.as_ref(),
+            ),
         }
         result
     }
@@ -234,8 +420,335 @@ impl Drop for DialAttempt<'_> {
                 std::io::ErrorKind::TimedOut,
                 "outbound dial deadline elapsed",
             ));
-            record_dial_failure(self.group_name, self.tracker, self.member, &err);
+            // The dial's path went with its scope: a chained outbound taken
+            // down here is not in the logbook until its health check fails.
+            record_dial_failure(self.group_name, self.tracker, self.member, &err, None);
         }
+    }
+}
+
+/// The chain target when the dial for `metadata` is a `dialer-proxy` front
+/// hop through this group. A dial (`dial`) also records the chained
+/// outbound as an owner of the target, for the health check's chain probe;
+/// a peek does not.
+pub(super) fn front_hop_target(
+    health: &ChainHealth,
+    metadata: &Metadata,
+    dial: bool,
+) -> Option<ChainTarget> {
+    let hop = crate::dialer::front_hop_for(metadata)?;
+    if dial {
+        if let Some(owner) = &hop.owner {
+            health.note_owner(&hop.target, owner);
+        }
+    }
+    Some(hop.target)
+}
+
+/// The member a front hop to `target` uses. `carrier`, the member that
+/// carries the target's chains, when the group keeps them on it: it stays
+/// while `usable` accepts it and it is not blocked. Otherwise `pick`, the
+/// group's own, unless it is blocked for `target`; then the first of
+/// `members` that `usable` accepts and that is not blocked. `members` comes
+/// in the group's preference order. With every usable member blocked the
+/// target itself is the likelier fault, so the group's own pick stands
+/// rather than a dial with nowhere to go, and a failure through it counts
+/// against the chained outbound ([`note_front_hop_member`]). A dial
+/// (`dial`) notes a member other than `pick` on the connection.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one call per group kind; a struct would only name the same values"
+)]
+pub(super) fn front_hop_pick(
+    group: &str,
+    health: &ChainHealth,
+    target: &ChainTarget,
+    pick: Arc<dyn Proxy>,
+    carrier: Option<Arc<dyn Proxy>>,
+    members: impl FnOnce() -> Vec<Arc<dyn Proxy>>,
+    usable: impl Fn(&Arc<dyn Proxy>) -> bool,
+    dial: bool,
+) -> Arc<dyn Proxy> {
+    if let Some(carrier) = carrier.filter(|c| usable(c) && !health.is_blocked(target, c.name())) {
+        if dial && carrier.name() != pick.name() {
+            conn_note!(
+                Dial,
+                "{group}: keeping dialer-proxy chains to {target} on {}",
+                carrier.name()
+            );
+        }
+        return carrier;
+    }
+    if !health.is_blocked(target, pick.name()) {
+        return pick;
+    }
+    let blocked = health.blocked(target);
+    let Some(alternative) = members()
+        .into_iter()
+        .find(|p| usable(p) && !blocked.iter().any(|(name, _)| name == p.name()))
+    else {
+        return pick;
+    };
+    if dial {
+        conn_note!(
+            Dial,
+            "{group}: {} cannot reach {target} as a dialer-proxy front, using {}",
+            pick.name(),
+            alternative.name()
+        );
+    }
+    alternative
+}
+
+/// Note on the front hop in flight whether `member`, the member a group is
+/// about to dial for it, is blocked for `target`. A group takes a blocked
+/// member only with every usable one blocked ([`front_hop_pick`]), and then
+/// the target is the likelier fault: a failure through the member counts
+/// against the chained outbound, on a dial error and on a chain closed
+/// before any reply alike, and strikes no member. Without this, a group
+/// with members blocked before the server went down, or with no more
+/// members than [`meow_common::chain_health::BLAMED_MEMBERS`], had too few
+/// left to fail it in a row, and the outbound was excused for as long as
+/// the server stayed down.
+pub(super) fn note_front_hop_member(
+    health: &ChainHealth,
+    target: &ChainTarget,
+    member: &Arc<dyn Proxy>,
+) {
+    crate::dialer::note_last_resort(health.is_blocked(target, member.name()));
+}
+
+/// Judge `conn`, a front hop to `target` through `member`, on its first
+/// read (see [`meow_common::chain_health`]). A member that is an automatic
+/// group itself judges its own pick, so it is not wrapped again.
+pub(super) fn watch_front_hop(
+    conn: Box<dyn ProxyConn>,
+    group: &str,
+    health: &Arc<ChainHealth>,
+    target: ChainTarget,
+    member: &Arc<dyn Proxy>,
+) -> Box<dyn ProxyConn> {
+    if member.chain_health().is_some() {
+        return conn;
+    }
+    let carrier = health.carrier(&target).as_deref() == Some(member.name());
+    Box::new(FrontHopConn {
+        conn,
+        pending: Some(PendingVerdict {
+            group: SmolStr::new(group),
+            health: Arc::clone(health),
+            target,
+            member: Arc::clone(member),
+            carrier,
+            last_resort: crate::dialer::front_hop_last_resort(),
+            wrote: false,
+            shut: false,
+        }),
+    })
+}
+
+/// Log and record that `member` took over the chains to `target` through
+/// `group` from `change.from`. The logbook entry's subject is the chained
+/// outbound, so a user following it sees every front-hop move in one place.
+pub(crate) fn carrier_changed(
+    group: &str,
+    target: &ChainTarget,
+    member: &str,
+    change: &CarrierChange,
+) {
+    let from = change.from.as_str();
+    let why = change
+        .reason
+        .map_or_else(String::new, |reason| format!(": {reason}"));
+    info!(
+        "proxy-group '{group}': dialer-proxy chains to {target} moved from '{from}'{why} to \
+         '{member}'"
+    );
+    let subject = change.owner.as_deref().unwrap_or(group);
+    let mut event = logbook::event(
+        logbook::kind::DIALER_PROXY_SWITCH,
+        Level::Info,
+        format!("'{subject}' now dials through '{member}' of '{group}' (was '{from}'{why})"),
+    )
+    .subject(subject)
+    .field("group", group)
+    .field("from", from)
+    .field("to", member);
+    if let Some(reason) = change.reason {
+        event = event.field("reason", reason);
+    }
+    event.coalesce().record();
+}
+
+/// A front-hop stream that settles one verdict for its member: reached on
+/// the first byte read; failed on EOF or an error before that, or on the
+/// dial's deadline, once the chained protocol has written. EOF before any
+/// write, or after our own shutdown, says nothing about the member. A
+/// failure the table puts down to the target ([`ChainHealth::blame`])
+/// strikes no member and counts against the chained outbound, as does one
+/// through a member the group took as its last resort
+/// ([`note_front_hop_member`]).
+struct FrontHopConn {
+    conn: Box<dyn ProxyConn>,
+    /// `None` once the verdict is in.
+    pending: Option<PendingVerdict>,
+}
+
+struct PendingVerdict {
+    group: SmolStr,
+    health: Arc<ChainHealth>,
+    target: ChainTarget,
+    member: Arc<dyn Proxy>,
+    /// The member carried the target's chains when this one started.
+    carrier: bool,
+    /// The group took the member with every usable one blocked for the
+    /// target ([`note_front_hop_member`]).
+    last_resort: bool,
+    wrote: bool,
+    shut: bool,
+}
+
+impl FrontHopConn {
+    /// Settle the verdict: reached, or failed for the reason given.
+    fn settle(&mut self, failure: Option<&'static str>) {
+        let Some(verdict) = self.pending.take() else {
+            return;
+        };
+        let member = verdict.member.name();
+        let Some(reason) = failure else {
+            if let Some(change) = verdict.health.record_reached(&verdict.target, member) {
+                carrier_changed(&verdict.group, &verdict.target, member, &change);
+            }
+            return;
+        };
+        let blame = verdict.health.blame(&verdict.target, member);
+        if blame == Blame::Target || verdict.last_resort {
+            debug!(
+                "proxy-group '{}': dialer-proxy chain to {} failed through '{member}' \
+                 ({reason}), the likelier fault of that server; counting it against the \
+                 chained outbound",
+                verdict.group, verdict.target
+            );
+            return;
+        }
+        if !verdict.carrier {
+            front_hop_failed();
+        }
+        if let Some(length) =
+            verdict
+                .health
+                .record_failed(&verdict.target, member, ChainVerdict::Passive, reason)
+        {
+            info!(
+                "proxy-group '{}': member '{member}' failed dialer-proxy chains to {} \
+                 ({reason}); skipping it for that target for {}s",
+                verdict.group,
+                verdict.target,
+                length.as_secs()
+            );
+        }
+    }
+
+    /// Settle a write: an error before the first byte read is a failure.
+    fn on_write(&mut self, poll: &Poll<io::Result<usize>>) {
+        let Some(verdict) = self.pending.as_mut() else {
+            return;
+        };
+        match poll {
+            Poll::Ready(Ok(n)) if *n > 0 => verdict.wrote = true,
+            Poll::Ready(Err(e)) => self.settle(Some(failure_reason(&e.to_string()))),
+            _ => {}
+        }
+    }
+}
+
+impl AsyncRead for FrontHopConn {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let capacity = buf.remaining();
+        let before = buf.filled().len();
+        let poll = Pin::new(&mut this.conn).poll_read(cx, buf);
+        if let (Some(verdict), Poll::Ready(result)) = (&this.pending, &poll) {
+            let read = buf.filled().len() - before;
+            let judged = verdict.wrote && !verdict.shut;
+            match result {
+                Ok(()) if read > 0 => this.settle(None),
+                Ok(()) if capacity == 0 => {}
+                Ok(()) if judged => this.settle(Some(CLOSED_BEFORE_REPLY)),
+                Err(e) if judged => this.settle(Some(failure_reason(&e.to_string()))),
+                Ok(()) | Err(_) => this.pending = None,
+            }
+        }
+        poll
+    }
+}
+
+impl AsyncWrite for FrontHopConn {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let poll = Pin::new(&mut this.conn).poll_write(cx, buf);
+        this.on_write(&poll);
+        poll
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let poll = Pin::new(&mut this.conn).poll_write_vectored(cx, bufs);
+        this.on_write(&poll);
+        poll
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.conn.is_write_vectored()
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().conn).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if let Some(verdict) = this.pending.as_mut() {
+            verdict.shut = true;
+        }
+        Pin::new(&mut this.conn).poll_shutdown(cx)
+    }
+}
+
+impl Drop for FrontHopConn {
+    /// A stream that the dial's deadline drops with the chained request
+    /// unanswered fails like EOF before a reply: a front member that
+    /// black-holes the server's port shows only so while the chained
+    /// protocol's handshake waits. Any other drop before a reply, such as a
+    /// client giving up, says nothing about the member. The deadline is read
+    /// where the stream is dropped: a dial that returned left it behind, so
+    /// the end of a relay never counts.
+    fn drop(&mut self) {
+        let unanswered = self.pending.as_ref().is_some_and(|v| v.wrote && !v.shut);
+        if unanswered
+            && meow_common::dial::dial_deadline()
+                .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+        {
+            self.settle(Some(failure_reason("timed out")));
+        }
+    }
+}
+
+impl ProxyConn for FrontHopConn {
+    fn remote_destination(&self) -> String {
+        self.conn.remote_destination()
     }
 }
 
@@ -426,3 +939,6 @@ mod tests {
 
 #[cfg(test)]
 mod dial_timeout_tests;
+
+#[cfg(test)]
+mod front_hop_tests;

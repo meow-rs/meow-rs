@@ -19,6 +19,7 @@ mixed-port: 7890
     assert!(config.proxies.contains_key("REJECT"));
     assert!(config.proxies.contains_key("REJECT-DROP"));
     assert!(!config.general.connection_notes);
+    assert!(config.general.logbook, "the logbook is on by default");
 }
 
 #[tokio::test]
@@ -27,6 +28,18 @@ async fn test_connection_notes_flag() {
         .await
         .unwrap();
     assert!(config.general.connection_notes);
+}
+
+#[tokio::test]
+async fn test_logbook_switch() {
+    for (yaml, enabled) in [
+        ("logbook:\n  enable: false\n", false),
+        ("logbook:\n  enable: true\n", true),
+        ("logbook: {}\n", true),
+    ] {
+        let config = load_config_from_str(yaml).await.unwrap();
+        assert_eq!(config.general.logbook, enabled, "{yaml}");
+    }
 }
 
 #[tokio::test]

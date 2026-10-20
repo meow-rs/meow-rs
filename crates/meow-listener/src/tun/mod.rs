@@ -94,8 +94,10 @@ use tracing::{debug, info, warn};
 /// `SetReadDeadline(now + 200ms)` + `Peek(1)`, deadline error ignored).
 /// A client-first flow's first segment normally follows the handshake ACK
 /// back-to-back and lands well inside it; one that misses the window just
-/// relays its bytes without a prefix — the prefix takes no part in
-/// routing, so nothing else changes.
+/// relays its bytes without a prefix. Routing reads the first bytes only
+/// for a flow the tunnel cannot name (an unmapped fake IP):
+/// `meow_tunnel::tcp::handle_tcp` sniffs its SNI / `Host`, through the
+/// replayed prefix or its own short wait.
 const TUN_SNIFF_WINDOW: Duration = Duration::from_millis(200);
 /// First-read size when waiting for real traffic. Large enough to pull a
 /// TLS ClientHello record header + a bit of payload in one shot.
@@ -314,12 +316,11 @@ struct TunDevice {
     /// this field is dropped, before `device` is destroyed.
     #[allow(dead_code)]
     route_guard: Option<RouteGuard>,
-    /// Held only for its `Drop` side effect — gives up this listener's
-    /// ownership of the process-global outbound-interface binding for
-    /// global route scope (after `route_guard` has removed the routes it
-    /// protects). A successor that already installed its own binding keeps
-    /// it; otherwise the binding is cleared.
-    #[allow(dead_code)]
+    /// This listener's ownership of the process-global outbound-interface
+    /// binding for global route scope, committed once the listener is up.
+    /// Dropping it gives the ownership up (after `route_guard` has removed
+    /// the routes it protects). A successor that already installed its own
+    /// binding keeps it; otherwise the binding is cleared.
     iface_guard: Option<OutboundBinding>,
     pub(super) device: tun_rs::AsyncDevice,
 }
@@ -770,6 +771,11 @@ impl TunListener {
             v4: cfg.inet4_address,
             v6: cfg.inet6_address,
         };
+        // Nothing past here fails: the listener is up, and its binding is
+        // the running one.
+        if let Some(binding) = &device.iface_guard {
+            binding.commit();
+        }
         let (mut pump_in, mut pump_out) = device::spawn_pumps(device, stack);
         tasks.push(&pump_in);
         tasks.push(&pump_out);
@@ -1121,13 +1127,14 @@ async fn handle_tcp_flow(
         ..Default::default()
     };
 
-    // handle_tcp does the rest: fake-IP rewrite, lazy rule match, stats
-    // guard, dial, zero-alloc relay. `prefix` is the first payload read
-    // during the sniff window; it reaches the upstream as the relay's first
-    // client read (counted as upload there). It is empty for a flow that
-    // stayed silent (server-first): `TunTcpConn` then reads straight from
-    // the stream and nothing is written upstream until a side speaks — no
-    // zero-length write, no synthetic EOF.
+    // handle_tcp does the rest: name sniff for an unmapped fake IP,
+    // fake-IP rewrite, lazy rule match, stats guard, dial, zero-alloc
+    // relay. `prefix` is the first payload read during the sniff window; it
+    // reaches the upstream as the relay's first client read (counted as
+    // upload there). It is empty for a flow that stayed silent
+    // (server-first): `TunTcpConn` then reads straight from the stream and
+    // nothing is written upstream until a side speaks — no zero-length
+    // write, no synthetic EOF.
     meow_tunnel::tcp::handle_tcp(
         tunnel.inner(),
         Box::new(TunTcpConn {

@@ -121,6 +121,8 @@ psl = "=2.1.232"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+# The logbook tests record into a real logbook.
+meow-common = { workspace = true, features = ["logbook"] }
 # Loopback anytls *server* for the integration tests (rustls-based, test-only).
 meow-anytls = { workspace = true, features = ["server"] }
 meow-trie = { workspace = true }

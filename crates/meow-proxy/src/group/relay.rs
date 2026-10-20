@@ -43,6 +43,7 @@
 
 use super::dialer_proxy::DialerProxyAdapter;
 use async_trait::async_trait;
+use meow_common::traffic::ProxyTraffic;
 use meow_common::{
     AdapterType, MeowError, Metadata, Proxy, ProxyAdapter, ProxyConn, ProxyHealth, ProxyPacketConn,
     Result,
@@ -317,9 +318,13 @@ fn metadata_for_next_hop(
 ///
 /// `proxies` must have length ≥ 2 (validated at parse time; `debug_assert`
 /// guards against test-harness mistakes).
+///
+/// `first_hop_traffic` counts the first hop's stream, which carries every
+/// byte of the chain: a `dialer-proxy` front passes its member's totals.
 pub(crate) async fn relay_tcp(
     proxies: &[Arc<dyn Proxy>],
     final_target: &Metadata,
+    first_hop_traffic: Option<Arc<ProxyTraffic>>,
 ) -> Result<Box<dyn ProxyConn>> {
     debug_assert!(
         proxies.len() >= 2,
@@ -351,6 +356,7 @@ pub(crate) async fn relay_tcp(
                 hop: 0,
                 source: Box::new(e),
             })?;
+    conn = crate::dialer::count_hop(conn, first_hop_traffic);
 
     // proxy[1..N-2]: connect_over through the previous hop's stream.
     for i in 1..proxies.len() - 1 {
@@ -503,7 +509,7 @@ impl ProxyAdapter for RelayGroup {
     }
 
     async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
-        relay_tcp(&self.proxies, metadata).await
+        relay_tcp(&self.proxies, metadata, None).await
     }
 
     /// Sends UDP from the chain's exit hop, or fails closed with

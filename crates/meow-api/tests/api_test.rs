@@ -6046,3 +6046,92 @@ async fn put_configs_does_not_await_provider_downloads_in_the_mutation_lane() {
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     server.abort();
 }
+
+/// `GET /logbook` and `DELETE /logbook`. The logbook is process-global and
+/// other tests in this binary may record into it while it is installed, so
+/// every read filters on this test's subject.
+#[tokio::test]
+async fn logbook_lists_filters_and_clears_entries() {
+    use meow_common::logbook;
+
+    let state = test_state_default();
+    let app = create_router(Arc::clone(&state));
+    let get = |uri: &str| {
+        let app = app.clone();
+        let request = Request::get(uri).body(axum::body::Body::empty()).unwrap();
+        async move { app.oneshot(request).await.unwrap() }
+    };
+
+    let off = body_json(get("/logbook").await).await;
+    assert_eq!(off["enabled"], false);
+    assert_eq!(off["entries"], serde_json::json!([]));
+
+    let dir = tempfile::tempdir().unwrap();
+    logbook::install(dir.path(), logbook::Options::default()).unwrap();
+
+    // An API mutation records itself once committed.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/proxy-groups")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    r#"{"name":"LogbookGroup","type":"select","proxies":["DIRECT"]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    for message in ["first", "second"] {
+        logbook::event(
+            logbook::kind::PROXY_PROVIDER_UPDATE,
+            logbook::Level::Warning,
+            message,
+        )
+        .subject("LogbookGroup")
+        .coalesce()
+        .record();
+    }
+
+    let page = body_json(get("/logbook?subject=LogbookGroup").await).await;
+    assert_eq!(page["enabled"], true);
+    let entries = page["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 2, "{page}");
+    assert_eq!(entries[0]["kind"], "proxy-provider.update");
+    assert_eq!(entries[0]["message"], "second", "the fold keeps the latest");
+    assert_eq!(entries[0]["count"], 2);
+    assert_eq!(entries[1]["kind"], "config.change");
+    assert_eq!(entries[1]["message"], "Created proxy group 'LogbookGroup'");
+
+    let warnings = body_json(get("/logbook?subject=LogbookGroup&level=warning").await).await;
+    assert_eq!(warnings["entries"].as_array().unwrap().len(), 1);
+    let area = body_json(get("/logbook?subject=LogbookGroup&kind=config").await).await;
+    assert_eq!(area["entries"][0]["kind"], "config.change");
+    let paged = body_json(get("/logbook?subject=LogbookGroup&limit=1").await).await;
+    assert_eq!(paged["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(paged["more"], true);
+
+    let bad = get("/logbook?level=loud").await;
+    assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::delete("/logbook")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let cleared = body_json(get("/logbook?subject=LogbookGroup").await).await;
+    assert_eq!(cleared["entries"], serde_json::json!([]));
+    let marker = body_json(get("/logbook?kind=logbook.cleared").await).await;
+    assert_eq!(marker["entries"].as_array().unwrap().len(), 1);
+
+    logbook::uninstall();
+    assert_eq!(body_json(get("/logbook").await).await["enabled"], false);
+}
