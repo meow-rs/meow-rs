@@ -8,6 +8,8 @@ the canonical, in-repo source a release is cut from.
 
 ## [Unreleased]
 
+## [0.25.0] - 2026-10-20
+
 ### Added
 
 - **Logbook** (`GET /logbook`, `DELETE /logbook`, a meow extension): a
