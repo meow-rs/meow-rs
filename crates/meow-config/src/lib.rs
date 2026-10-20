@@ -26,6 +26,7 @@ pub mod rule_provider_refresh;
 mod safe_path;
 pub mod sub_rules_parser;
 pub mod subscription;
+pub mod subscription_userinfo;
 #[cfg(test)]
 mod test_support;
 

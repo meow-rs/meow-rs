@@ -3852,6 +3852,33 @@ struct ProviderInfo {
     expected_status: String,
     #[serde(rename = "updatedAt", skip_serializing_if = "Option::is_none")]
     updated_at: Option<String>,
+    /// The plan usage the provider's server reported in its
+    /// `subscription-userinfo` header, as mihomo reports it.
+    #[serde(rename = "subscriptionInfo", skip_serializing_if = "Option::is_none")]
+    subscription_info: Option<ProviderSubscriptionInfo>,
+}
+
+/// `subscriptionInfo` of a proxy provider: bytes uploaded, downloaded and
+/// allowed on the plan, and its end in Unix seconds. A key the server left
+/// out reads 0.
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct ProviderSubscriptionInfo {
+    upload: u64,
+    download: u64,
+    total: u64,
+    expire: u64,
+}
+
+impl From<meow_config::subscription_userinfo::SubscriptionUserinfo> for ProviderSubscriptionInfo {
+    fn from(usage: meow_config::subscription_userinfo::SubscriptionUserinfo) -> Self {
+        Self {
+            upload: usage.upload,
+            download: usage.download,
+            total: usage.total,
+            expire: usage.expire,
+        }
+    }
 }
 
 fn unix_rfc3339(seconds: u64) -> Option<String> {
@@ -3882,6 +3909,7 @@ fn provider_to_info(name: &str, provider: &ProxyProvider) -> ProviderInfo {
             .as_ref()
             .map_or_else(String::new, |hc| hc.expected_status.clone()),
         updated_at: unix_rfc3339(provider.updated_at_secs()),
+        subscription_info: provider.subscription_userinfo().map(Into::into),
     }
 }
 
