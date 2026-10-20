@@ -40,7 +40,16 @@ pub struct Metadata {
     /// `DSCP,0`.  This prevents the previous `u8`-default-0 silent misroute
     /// where every HTTP/SOCKS5 connection matched `DSCP,0`.
     /// Class A fix per ADR-0002 (upstream: `rules/common/dscp.go`).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    ///
+    /// JSON always carries the key as a number, `0` for `None`: mihomo
+    /// dashboards read `metadata.dscp` unconditionally. Reading JSON back,
+    /// `0` (or `null`, or no key) is `None`, so serialized metadata can
+    /// never come back as a flow that matches `DSCP,0`.
+    #[serde(
+        default,
+        serialize_with = "dscp_json::serialize",
+        deserialize_with = "dscp_json::deserialize"
+    )]
     pub dscp: Option<u8>,
     #[serde(rename = "sourceGeoIP")]
     pub src_geo_ip: Vec<SmolStr>,
@@ -74,6 +83,27 @@ pub struct Metadata {
     /// claiming it.
     #[serde(skip)]
     pub internal: bool,
+}
+
+/// The JSON form of [`Metadata::dscp`]: always a number, `0` when the
+/// inbound saw no DSCP. JSON cannot tell an unknown DSCP from a real `0`,
+/// so reading it back takes `0` for unknown: the reading that never
+/// matches a `DSCP` rule.
+mod dscp_json {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(
+        dscp: &Option<u8>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u8(dscp.unwrap_or(0))
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<u8>, D::Error> {
+        Ok(Option::<u8>::deserialize(deserializer)?.filter(|&dscp| dscp != 0))
+    }
 }
 
 impl Metadata {
@@ -241,8 +271,9 @@ impl Metadata {
     }
 
     /// The copy the connection table keeps for `/connections`. Who opened
-    /// the flow (`process` / `processPath` / `uid`) stays, as upstream
-    /// reports it; inbound details and per-match extras are dropped.
+    /// the flow (`process` / `processPath` / `uid`) and the DSCP its
+    /// packets carried stay, as upstream reports them; inbound details and
+    /// per-match extras are dropped.
     pub fn pure(&self) -> Self {
         Self {
             network: self.network,
@@ -256,7 +287,7 @@ impl Metadata {
             process: self.process.clone(),
             process_path: self.process_path.clone(),
             uid: self.uid,
-            dscp: None,
+            dscp: self.dscp,
             src_geo_ip: Vec::new(),
             dst_geo_ip: Vec::new(),
             sniff_host: SmolStr::default(),

@@ -112,6 +112,11 @@ pub struct RuleProvider {
     /// Retained for `refresh()` — a `format: text` file whose bytes aren't
     /// MRS must not be reparsed as YAML on refresh (issue #533 review).
     format: Option<RuleSetFormat>,
+    /// What the installed payload parsed as, for [`Self::format`]: the
+    /// declared format, except that MRS bytes parse as MRS whatever was
+    /// declared. The declared format (YAML when undeclared) until a
+    /// payload lands.
+    payload_format: parking_lot::Mutex<RuleSetFormat>,
     /// Resolved on-disk cache location, http providers only (inside
     /// `cache_dir`; `None` when the build context has no cache directory).
     /// `refresh()` writes each successfully parsed payload here so a
@@ -228,6 +233,15 @@ impl RuleProvider {
         self.rules.read().len()
     }
 
+    /// The format this provider's rules come in: what its installed
+    /// payload parsed as, or the declared `format:` (YAML when
+    /// undeclared) before one has landed. MRS is detected from the bytes,
+    /// so a payload that turns out to be MRS reports MRS whatever the
+    /// config declared.
+    pub fn format(&self) -> RuleSetFormat {
+        *self.payload_format.lock()
+    }
+
     pub fn updated_at_secs(&self) -> u64 {
         #[allow(
             clippy::useless_conversion,
@@ -305,8 +319,8 @@ impl RuleProvider {
         let format = self.format;
         let cache_path = self.cache_path.clone();
         let cache_write_lock = Arc::clone(&self.cache_write_lock);
-        let boxed: Box<dyn RuleSet> = crate::spawn_blocking_with_current_dispatcher(move || {
-            let rules =
+        let (boxed, parsed_as) = crate::spawn_blocking_with_current_dispatcher(move || {
+            let parsed =
                 parse_bytes_to_ruleset_with_format(&bytes, behavior, format, &ctx_clone, strict)?;
             // Persist the payload only *after* the parse succeeds so the
             // cache always holds the last usable payload — a cache-first
@@ -320,7 +334,7 @@ impl RuleProvider {
                     *written_gen = gen;
                 }
             }
-            Ok::<Box<dyn RuleSet>, anyhow::Error>(rules)
+            Ok::<_, anyhow::Error>(parsed)
         })
         .await
         .map_err(|e| anyhow!("parse task panicked: {e}"))??;
@@ -361,6 +375,7 @@ impl RuleProvider {
             );
         }
         *self.rules.write() = new_rules;
+        *self.payload_format.lock() = parsed_as;
         *installed = gen;
         self.touch();
         debug!(provider = %self.name, "rule-provider refreshed: {} rules", count);
@@ -440,16 +455,18 @@ impl RuleProvider {
     }
 
     /// Atomically install a freshly-parsed rule set (initial fill after an
-    /// acquisition-then-parse load, or a refresh).
-    fn swap_rules(&self, rules: Box<dyn RuleSet>) {
+    /// acquisition-then-parse load, or a refresh), with the format its
+    /// payload parsed as.
+    fn swap_rules(&self, (rules, format): (Box<dyn RuleSet>, RuleSetFormat)) {
         *self.rules.write() = Arc::from(rules);
+        *self.payload_format.lock() = format;
         self.filled.store(true, Ordering::Relaxed);
         self.touch();
     }
 
     /// [`Self::swap_rules`] with a payload fetched or read for this load.
-    fn fill_fresh(&self, rules: Box<dyn RuleSet>) {
-        self.swap_rules(rules);
+    fn fill_fresh(&self, parsed: (Box<dyn RuleSet>, RuleSetFormat)) {
+        self.swap_rules(parsed);
         *self.load_note.lock() = Some(LoadNote::Fresh);
     }
 }
@@ -1234,6 +1251,12 @@ fn load_inline(
         ))
     })?;
     let rules = entries_to_rule_set(behavior, payload, ctx, strict)?;
+    // `format:` does not apply to a payload written in the config itself,
+    // but a declared one is still what the provider reports.
+    let declared = parse_explicit_format(cfg)
+        .ok()
+        .flatten()
+        .unwrap_or(RuleSetFormat::Yaml);
     let provider = make_provider(
         name,
         ProviderType::Inline,
@@ -1246,7 +1269,7 @@ fn load_inline(
         None,
         None,
     );
-    provider.fill_fresh(rules);
+    provider.fill_fresh((rules, declared));
     Ok(provider)
 }
 
@@ -1313,9 +1336,9 @@ fn load_file(
             }
         },
     };
-    let rules = parse_bytes_to_ruleset_with_format(bytes, behavior, explicit_format, ctx, strict)
+    let parsed = parse_bytes_to_ruleset_with_format(bytes, behavior, explicit_format, ctx, strict)
         .map_err(LoadError::Payload)?;
-    provider.fill_fresh(rules);
+    provider.fill_fresh(parsed);
     Ok(provider)
 }
 
@@ -1411,8 +1434,8 @@ fn load_http(
             }
         }
         Prefetched::Cached { bytes, modified } => match parse(bytes) {
-            Ok(rules) => {
-                provider.swap_rules(rules);
+            Ok(parsed) => {
+                provider.swap_rules(parsed);
                 // Report the cache's age, not the load time.
                 if let Some(modified) = modified {
                     provider.set_updated_at(*modified);
@@ -1485,6 +1508,7 @@ fn make_provider(
         strict,
         ctx,
         format,
+        payload_format: parking_lot::Mutex::new(format.unwrap_or(RuleSetFormat::Yaml)),
         cache_path,
         cache_write_lock: Arc::new(parking_lot::Mutex::new(0)),
         install_gen: parking_lot::Mutex::new(0),
@@ -1529,10 +1553,9 @@ pub(crate) fn test_provider_with_vehicle(
         None,
         None,
     );
-    provider.swap_rules(meow_rules::build_rule_set(
-        RuleSetBehavior::Domain,
-        &[],
-        &ParserContext::empty(),
+    provider.swap_rules((
+        meow_rules::build_rule_set(RuleSetBehavior::Domain, &[], &ParserContext::empty()),
+        RuleSetFormat::Yaml,
     ));
     Arc::new(provider)
 }
@@ -1556,29 +1579,35 @@ fn parse_explicit_format(cfg: &RawRuleProvider) -> Result<Option<RuleSetFormat>>
         .transpose()
 }
 
+/// Parse payload bytes into a rule set, returned with the format they
+/// parsed as: MRS when declared or when the bytes carry the MRS magic,
+/// otherwise the declared format (YAML when undeclared).
 fn parse_bytes_to_ruleset_with_format(
     bytes: &[u8],
     behavior: RuleSetBehavior,
     explicit_format: Option<RuleSetFormat>,
     ctx: &ParserContext,
     strict: bool,
-) -> Result<Box<dyn RuleSet>> {
+) -> Result<(Box<dyn RuleSet>, RuleSetFormat)> {
     let use_mrs = explicit_format == Some(RuleSetFormat::Mrs) || is_mrs_bytes(bytes);
     if use_mrs {
         return build_rule_set_from_mrs_with_behavior(bytes, ctx, Some(behavior), strict)
+            .map(|rules| (rules, RuleSetFormat::Mrs))
             .map_err(|e| anyhow!("mrs parse error: {e}"));
     }
     let text = std::str::from_utf8(bytes).context("payload is not valid UTF-8")?;
-    let entries = match explicit_format.unwrap_or(RuleSetFormat::Yaml) {
+    let format = explicit_format.unwrap_or(RuleSetFormat::Yaml);
+    let entries = match format {
         RuleSetFormat::Yaml => parse_yaml_payload(text, strict)?,
         RuleSetFormat::Text => parse_text_payload(text),
         RuleSetFormat::Mrs => unreachable!("handled above"),
     };
     if strict {
         return build_rule_set_checked(behavior, &entries, ctx)
+            .map(|rules| (rules, format))
             .map_err(|e| anyhow!("rule-set entry error: {e}"));
     }
-    Ok(build_rule_set(behavior, &entries, ctx))
+    Ok((build_rule_set(behavior, &entries, ctx), format))
 }
 
 fn parse_yaml_payload(raw: &str, strict: bool) -> Result<Vec<String>> {
@@ -2042,6 +2071,121 @@ mod tests {
             load_providers(&providers, Some(dir.path()), &ctx(), None, false).expect("load failed");
         let p = out.get("mrs-test").expect("provider should load");
         assert_eq!(p.rule_count(), 2);
+        assert_eq!(p.format(), RuleSetFormat::Mrs, "reports what it parsed as");
+    }
+
+    fn file_cfg(path: &Path, format: Option<&str>) -> RawRuleProvider {
+        RawRuleProvider {
+            provider_type: "file".to_string(),
+            behavior: "domain".to_string(),
+            format: format.map(str::to_string),
+            url: None,
+            path: Some(path.to_string_lossy().to_string()),
+            interval: None,
+            proxy: None,
+            header: None,
+            payload: None,
+        }
+    }
+
+    /// `format()` is the declared format, in any case, or YAML when none
+    /// is declared, except that an MRS payload reports MRS whatever was
+    /// declared: the bytes decide how it parses. An inline provider
+    /// reports its declared format too.
+    #[test]
+    fn format_reports_what_the_payload_parsed_as() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = dir.path().join("rules.yaml");
+        std::fs::write(&yaml, "payload:\n  - '+.example.com'\n").unwrap();
+        let text = dir.path().join("rules.txt");
+        std::fs::write(&text, "+.example.com\n").unwrap();
+        let mrs = dir.path().join("rules.mrs");
+        std::fs::write(
+            &mrs,
+            write_ruleset_mrs(TYPE_DOMAIN, &["example.com"]).unwrap(),
+        )
+        .unwrap();
+        let inline = |format: Option<&str>| RawRuleProvider {
+            provider_type: "inline".to_string(),
+            path: None,
+            payload: Some(vec!["+.example.com".to_string()]),
+            ..file_cfg(&yaml, format)
+        };
+        let cases = [
+            ("yaml", file_cfg(&yaml, Some("yaml")), RuleSetFormat::Yaml),
+            ("text", file_cfg(&text, Some("text")), RuleSetFormat::Text),
+            ("mrs", file_cfg(&mrs, Some("mrs")), RuleSetFormat::Mrs),
+            ("absent", file_cfg(&yaml, None), RuleSetFormat::Yaml),
+            ("upper", file_cfg(&text, Some("TEXT")), RuleSetFormat::Text),
+            ("mrs-undeclared", file_cfg(&mrs, None), RuleSetFormat::Mrs),
+            (
+                "mrs-as-yaml",
+                file_cfg(&mrs, Some("yaml")),
+                RuleSetFormat::Mrs,
+            ),
+            ("inline", inline(None), RuleSetFormat::Yaml),
+            ("inline-text", inline(Some("text")), RuleSetFormat::Text),
+        ];
+        let providers: HashMap<_, _> = cases
+            .iter()
+            .map(|(name, cfg, _)| ((*name).to_string(), cfg.clone()))
+            .collect();
+        let out = load_providers(&providers, Some(dir.path()), &ctx(), None, true)
+            .expect("every provider loads");
+        for (name, _, expected) in &cases {
+            assert_eq!(out[*name].format(), *expected, "{name}");
+        }
+    }
+
+    /// A refresh that lands a payload in another format reports the new
+    /// one; until a payload lands, the declared format stands.
+    #[tokio::test]
+    async fn format_follows_a_refreshed_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rules");
+        std::fs::write(&path, "payload:\n  - '+.example.com'\n").unwrap();
+        let providers = HashMap::from([("p".to_string(), file_cfg(&path, None))]);
+        let out =
+            load_providers(&providers, Some(dir.path()), &ctx(), None, false).expect("load failed");
+        let provider = &out["p"];
+        assert_eq!(provider.format(), RuleSetFormat::Yaml);
+
+        std::fs::write(
+            &path,
+            write_ruleset_mrs(TYPE_DOMAIN, &["example.com"]).unwrap(),
+        )
+        .unwrap();
+        provider.refresh().await.expect("refresh must succeed");
+        assert_eq!(provider.format(), RuleSetFormat::Mrs);
+
+        let missing = dir.path().join("missing.txt");
+        let providers = HashMap::from([("m".to_string(), file_cfg(&missing, Some("text")))]);
+        let out = load_providers(&providers, Some(dir.path()), &ctx(), None, false)
+            .expect("an unreadable file registers the provider empty");
+        assert_eq!(
+            out["m"].format(),
+            RuleSetFormat::Text,
+            "declared, no payload yet"
+        );
+    }
+
+    /// An unknown `format:` never loads, so nothing reports one: strict
+    /// fails the config, lenient leaves the provider out.
+    #[test]
+    fn unknown_format_never_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rules.yaml");
+        std::fs::write(&path, "payload:\n  - '+.example.com'\n").unwrap();
+        let providers = HashMap::from([("p".to_string(), file_cfg(&path, Some("json")))]);
+        let err = load_providers(&providers, Some(dir.path()), &ctx(), None, true)
+            .expect_err("strict rejects it");
+        assert!(
+            format!("{err:#}").contains("unsupported rule-set format"),
+            "{err:#}"
+        );
+        let out = load_providers(&providers, Some(dir.path()), &ctx(), None, false)
+            .expect("lenient keeps running");
+        assert!(out.is_empty(), "left out leniently");
     }
 
     #[test]

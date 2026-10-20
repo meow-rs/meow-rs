@@ -1002,6 +1002,18 @@ fn parse_dscp_none_never_matches() {
     assert!(!r.match_metadata(&m, &helper()));
 }
 
+#[test]
+fn parse_dscp_zero_matches_a_flow_marked_zero() {
+    // A DSCP the inbound did read (TProxy) matches even when it is 0: only
+    // an unknown DSCP (`None`, which the API shows as 0) never matches.
+    let r = parse_rule("DSCP,0,DIRECT").unwrap();
+    let m = Metadata {
+        dscp: Some(0),
+        ..Default::default()
+    };
+    assert!(r.match_metadata(&m, &helper()));
+}
+
 // ─── UID (M1.D-1) ──────────────────────────────────────────────────
 
 #[test]

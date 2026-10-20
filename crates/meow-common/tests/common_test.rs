@@ -312,9 +312,10 @@ fn test_metadata_pure_clears_extra_fields() {
     assert_eq!(pure.process, "curl");
     assert_eq!(pure.process_path, "/usr/bin/curl");
     assert_eq!(pure.uid, Some(1000));
+    // So is the DSCP the flow's packets carried (TProxy).
+    assert_eq!(pure.dscp, Some(46));
 
     // Cleared fields
-    assert!(pure.dscp.is_none());
     assert!(pure.src_geo_ip.is_empty());
     assert!(pure.dst_geo_ip.is_empty());
     assert!(pure.sniff_host.is_empty());
@@ -412,6 +413,38 @@ fn test_metadata_json_field_rename() {
     assert!(json.contains("\"destinationPort\""));
     assert!(json.contains("\"dnsMode\""));
     assert!(json.contains("\"type\""));
+}
+
+/// `dscp` is always in the JSON as a number, `0` when the inbound saw no
+/// DSCP, the shape mihomo panels read unconditionally. Read back, `0`
+/// (like `null` or no key) is `None`: JSON cannot tell "no DSCP" from a
+/// real `0`, and only `None` keeps a flow off a `DSCP,0` rule.
+#[test]
+fn test_metadata_dscp_json_is_always_a_number() {
+    let json_of = |dscp| {
+        serde_json::to_value(Metadata {
+            dscp,
+            ..Default::default()
+        })
+        .unwrap()
+    };
+    assert_eq!(json_of(None)["dscp"], serde_json::json!(0), "None is 0");
+    assert_eq!(json_of(Some(46))["dscp"], serde_json::json!(46));
+    assert_eq!(json_of(Some(0))["dscp"], serde_json::json!(0));
+
+    let read_back = |value: Option<serde_json::Value>| {
+        let mut json = json_of(None);
+        let obj = json.as_object_mut().unwrap();
+        match value {
+            Some(value) => obj.insert("dscp".to_string(), value),
+            None => obj.remove("dscp"),
+        };
+        serde_json::from_value::<Metadata>(json).unwrap().dscp
+    };
+    assert_eq!(read_back(Some(serde_json::json!(46))), Some(46));
+    assert_eq!(read_back(Some(serde_json::json!(0))), None, "0 is no DSCP");
+    assert_eq!(read_back(Some(serde_json::Value::Null)), None);
+    assert_eq!(read_back(None), None, "no key is no DSCP");
 }
 
 #[test]

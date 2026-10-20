@@ -3088,6 +3088,148 @@ async fn d6_group_delay_reports_provider_slot_members() {
     );
 }
 
+/// A member whose probe fails is left out of the answer, which stays a 200
+/// as long as another member passed: a transport error and a status
+/// outside `expected` both count as failing. Their failures still land in
+/// their histories.
+#[tokio::test]
+async fn d7_group_delay_leaves_out_failed_members() {
+    let ok = TestAdapter::new("ok", DialBehavior::InstantOk).into_proxy();
+    let refused = TestAdapter::new("refused", DialBehavior::ImmediateError).into_proxy();
+    let bad_status =
+        TestAdapter::new("bad-status", DialBehavior::InstantStatus(500, "Oops")).into_proxy();
+    let group = fallback_group(
+        "G",
+        vec![
+            Arc::clone(&ok),
+            Arc::clone(&refused),
+            Arc::clone(&bad_status),
+        ],
+    );
+    let state = state_with_proxies(vec![
+        ("ok", Arc::clone(&ok)),
+        ("refused", Arc::clone(&refused)),
+        ("bad-status", Arc::clone(&bad_status)),
+        ("G", group),
+    ]);
+    let app = create_router(state);
+    let resp = delay_req(app, format!("/group/G/delay?url={}&timeout=1000", url_q())).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = body_json(resp).await;
+    let obj = body.as_object().unwrap();
+    assert_eq!(
+        obj.keys().collect::<Vec<_>>(),
+        ["ok"],
+        "only the member that passed is reported: {body}"
+    );
+    assert!(obj["ok"].as_u64().unwrap() >= 1);
+    for (label, failed) in [("refused", &refused), ("bad-status", &bad_status)] {
+        let history = failed.delay_history();
+        assert_eq!(history.len(), 1, "{label}: failure recorded");
+        assert_eq!(history[0].delay, 0, "{label}: recorded as down");
+    }
+}
+
+/// The batch shares one deadline: a member still probing when it passes is
+/// left out, and the members that passed before it are the answer.
+#[tokio::test]
+async fn d8_group_delay_at_the_deadline_reports_the_members_that_passed() {
+    let fast = TestAdapter::new(
+        "fast",
+        DialBehavior::SleepThenOk(std::time::Duration::from_millis(5)),
+    )
+    .into_proxy();
+    let slow = TestAdapter::new(
+        "slow",
+        DialBehavior::SleepThenOk(std::time::Duration::from_secs(5)),
+    )
+    .into_proxy();
+    let group = fallback_group("G", vec![Arc::clone(&fast), Arc::clone(&slow)]);
+    let state = state_with_proxies(vec![("fast", fast), ("slow", slow), ("G", group)]);
+    let app = create_router(state);
+    let start = std::time::Instant::now();
+    let resp = delay_req(app, format!("/group/G/delay?url={}&timeout=200", url_q())).await;
+    let elapsed = start.elapsed();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = body_json(resp).await;
+    let obj = body.as_object().unwrap();
+    assert_eq!(
+        obj.keys().collect::<Vec<_>>(),
+        ["fast"],
+        "the member still probing at the deadline is left out: {body}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "the answer comes at the deadline, not when the slow member ends: {elapsed:?}"
+    );
+}
+
+/// No member passing is the one 504, whether the members failed outright
+/// or ran out of time, and an empty group has none that could.
+#[tokio::test]
+async fn d9_group_delay_is_504_when_no_member_passes() {
+    struct Case {
+        label: &'static str,
+        members: Vec<(&'static str, DialBehavior)>,
+        timeout_ms: u16,
+    }
+    let cases = [
+        Case {
+            label: "every member fails",
+            members: vec![
+                ("refused", DialBehavior::ImmediateError),
+                ("bad-status", DialBehavior::InstantStatus(500, "Oops")),
+            ],
+            timeout_ms: 1000,
+        },
+        Case {
+            label: "failed and timed-out members",
+            members: vec![
+                ("refused", DialBehavior::ImmediateError),
+                (
+                    "slow",
+                    DialBehavior::SleepThenOk(std::time::Duration::from_secs(5)),
+                ),
+            ],
+            timeout_ms: 100,
+        },
+        Case {
+            label: "empty group",
+            members: vec![],
+            timeout_ms: 1000,
+        },
+    ];
+    for case in cases {
+        let members: Vec<(&str, Arc<dyn Proxy>)> = case
+            .members
+            .into_iter()
+            .map(|(name, behavior)| (name, TestAdapter::new(name, behavior).into_proxy()))
+            .collect();
+        let group = fallback_group("G", members.iter().map(|(_, p)| Arc::clone(p)).collect());
+        let mut named = members;
+        named.push(("G", group));
+        let app = create_router(state_with_proxies(named));
+        let resp = delay_req(
+            app,
+            format!("/group/G/delay?url={}&timeout={}", url_q(), case.timeout_ms),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::GATEWAY_TIMEOUT,
+            "{}: expected 504",
+            case.label
+        );
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            &bytes[..],
+            br#"{"message":"Timeout"}"#,
+            "{}: unexpected body",
+            case.label
+        );
+    }
+}
+
 // ── C: auth gating on the two new endpoints ──────────────────────────
 //
 // Delay endpoints live under the gated `api` subrouter; these cases lock
@@ -3156,20 +3298,10 @@ async fn c4_get_group_delay_missing_auth_401() {
 
 // ── E: group endpoint — concurrency and timeout semantics ────────────
 //
-// Divergence note vs docs/specs/api-delay-endpoints-test-plan.md:
-// - E3 (one slow member → partial map with 0 for slow) is **not**
-//   implementable without contradicting the spec. Spec §Error cases row
-//   3 and §"Timeout semantics — group-wide" both say: any single slow
-//   member pushes the entire group probe past the deadline and the
-//   endpoint returns 504. There is no "partial results" mode. This is
-//   the upstream mihomo contract (see hub/route/groups.go::getGroupDelay
-//   — single context.WithTimeout around the whole URLTest call). QA
-//   plan's E3 wording pre-dates the final spec lock; skipping it is the
-//   correct choice here — covered instead by d4 (all-slow → 504).
-// - E4 is a duplicate of d4; not re-added.
-// Class A divergence per ADR-0002 (silent-misroute avoidance): the
-// group-wide-timeout semantic must be preserved byte-exactly so dashboards
-// relying on upstream's error shape don't quietly show stale zeros.
+// The batch shares one deadline, as in mihomo. Members that passed by
+// then make up the answer; a failed member, or one still probing, is left
+// out (no `0` entries), and the endpoint is a 504 only when none passed.
+// E3 of docs/specs/api-delay-endpoints-test-plan.md is d8; E4 is d4.
 //
 // Memory note on timing: tokio::time::pause() virtualises tokio::sleep
 // and tokio::time::timeout, but `url_test` uses std::time::Instant which
@@ -3495,10 +3627,10 @@ async fn h_series_expected_status_table() {
 }
 
 #[tokio::test]
-async fn h5_group_member_bad_status_is_zero() {
-    // Group member whose HTTP response is 500 records as 0 in the map,
-    // alongside a successful member. Matches upstream group behaviour:
-    // per-member failures are map-zero, not a top-level error.
+async fn h5_group_member_bad_status_is_left_out() {
+    // A group member whose HTTP response is 500 is missing from the map,
+    // next to a successful member: a per-member failure is neither a
+    // top-level error nor a `0` entry, as in mihomo.
     let good = TestAdapter::new("good", DialBehavior::InstantOk).into_proxy();
     let bad = TestAdapter::new("bad", DialBehavior::InstantStatus(500, "Oops")).into_proxy();
     let group = fallback_group("G", vec![Arc::clone(&good), Arc::clone(&bad)]);
@@ -3508,7 +3640,7 @@ async fn h5_group_member_bad_status_is_zero() {
     assert_eq!(resp.status(), StatusCode::OK);
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(body["bad"], 0);
+    assert!(body.get("bad").is_none(), "failed member left out: {body}");
     assert!(body["good"].as_u64().unwrap() >= 1);
 }
 
@@ -4140,6 +4272,134 @@ async fn get_connections_entry_has_camel_case_shape() {
         conn.get("rule_payload").is_none(),
         "snake_case key must not appear"
     );
+}
+
+/// `metadata.dscp` is always a number in `/connections`, as mihomo panels
+/// read it: `0` for a flow whose inbound saw no DSCP (every listener but
+/// TProxy), the value otherwise.
+#[tokio::test]
+async fn get_connections_metadata_always_carries_dscp() {
+    use meow_common::Metadata;
+    let state = test_state_default();
+    let stats = state.tunnel.statistics();
+    let track = |host: &str, dscp| {
+        stats.track_connection(
+            Metadata {
+                host: host.into(),
+                dst_port: 443,
+                dscp,
+                ..Default::default()
+            },
+            smol_str::SmolStr::new_static("MATCH"),
+            smol_str::SmolStr::default(),
+            smallvec![Arc::from("DIRECT")],
+        )
+    };
+    let unmarked = track("unmarked.example", None);
+    let marked = track("marked.example", Some(46));
+
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::get("/connections")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let dscp_of = |id: uuid::Uuid| {
+        json["connections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|conn| conn["id"] == id.to_string())
+            .map(|conn| conn["metadata"]["dscp"].clone())
+            .expect("connection listed")
+    };
+    assert_eq!(dscp_of(unmarked), serde_json::json!(0), "no DSCP is 0");
+    assert_eq!(dscp_of(marked), serde_json::json!(46));
+}
+
+/// `format` in `GET /providers/rules` is mihomo's name for the format a
+/// provider's rules come in (`YamlRule` / `TextRule` / `MrsRule`), which
+/// panels switch on: the declared `format:` in any case, `YamlRule` when
+/// none is declared, and `MrsRule` for an MRS payload whatever was
+/// declared, since the bytes decide how it parses.
+#[tokio::test]
+async fn rule_provider_format_uses_mihomo_names() {
+    use meow_config::raw::RawRuleProvider;
+    use meow_rules::mrs_parser::{write_ruleset_mrs, TYPE_DOMAIN};
+
+    let dir = tempfile::tempdir().unwrap();
+    let yaml = dir.path().join("rules.yaml");
+    std::fs::write(&yaml, "payload:\n  - '+.example.com'\n").unwrap();
+    let text = dir.path().join("rules.txt");
+    std::fs::write(&text, "+.example.com\n").unwrap();
+    let mrs = dir.path().join("rules.mrs");
+    std::fs::write(
+        &mrs,
+        write_ruleset_mrs(TYPE_DOMAIN, &["example.com"]).unwrap(),
+    )
+    .unwrap();
+    let file = |path: &std::path::Path, format: Option<&str>| RawRuleProvider {
+        provider_type: "file".into(),
+        behavior: "domain".into(),
+        format: format.map(Into::into),
+        url: None,
+        path: Some(path.to_string_lossy().into_owned()),
+        interval: None,
+        proxy: None,
+        header: None,
+        payload: None,
+    };
+    let cases = [
+        ("yaml", file(&yaml, Some("yaml")), "YamlRule"),
+        ("text", file(&text, Some("text")), "TextRule"),
+        ("mrs", file(&mrs, Some("mrs")), "MrsRule"),
+        ("absent", file(&yaml, None), "YamlRule"),
+        ("upper-case", file(&text, Some("TEXT")), "TextRule"),
+        ("mixed-case", file(&mrs, Some("Mrs")), "MrsRule"),
+        ("mrs-undeclared", file(&mrs, None), "MrsRule"),
+        (
+            "inline",
+            RawRuleProvider {
+                provider_type: "inline".into(),
+                path: None,
+                payload: Some(vec!["+.example.com".into()]),
+                ..file(&yaml, None)
+            },
+            "YamlRule",
+        ),
+    ];
+    let raw: HashMap<String, RawRuleProvider> = cases
+        .iter()
+        .map(|(name, cfg, _)| ((*name).to_string(), cfg.clone()))
+        .collect();
+    let providers = meow_config::rule_provider::load_providers(
+        &raw,
+        Some(dir.path()),
+        &meow_rules::ParserContext::default(),
+        None,
+        true,
+    )
+    .expect("every provider loads");
+    let state = test_state_default();
+    *state.rule_providers.write() = providers;
+
+    let get = |uri: String| {
+        create_router(Arc::clone(&state))
+            .oneshot(Request::get(uri).body(axum::body::Body::empty()).unwrap())
+    };
+    let list = body_json(get("/providers/rules".into()).await.unwrap()).await;
+    for (name, _, expected) in &cases {
+        assert_eq!(
+            list["providers"][*name]["format"], *expected,
+            "list: {name}"
+        );
+        let one = body_json(get(format!("/providers/rules/{name}")).await.unwrap()).await;
+        assert_eq!(one["format"], *expected, "one: {name}");
+    }
 }
 
 // Exercise actual sockets: an empty statistics map alone cannot prove closure.

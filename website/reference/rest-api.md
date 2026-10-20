@@ -42,7 +42,7 @@ static files instead.
 | `GET` | `/proxies/{name}` | One proxy/group (name, type, alive, history, udp, `all`, `now`) |
 | `PUT` | `/proxies/{name}` | Select a member in a group — body `{ "name": "member" }` → 204 |
 | `GET` | `/proxies/{name}/delay` | Probe delay — query `url`, `timeout`, `expected` |
-| `GET` | `/group/{name}/delay` | Probe every member of a group |
+| `GET` | `/group/{name}/delay` | Probe every member of a group — same query; `{ "member": delay }` for the members that passed within `timeout`, 504 when none did |
 
 ## Rules
 
@@ -58,7 +58,7 @@ static files instead.
 
 | Method | Path | Description |
 | --- | --- | --- |
-| `GET` | `/connections` | Snapshot: totals + per-connection `src`/`dst`/`chains`/`rule`/`upload`/`download`/`start` |
+| `GET` | `/connections` | Snapshot: totals + per-connection `metadata`/`chains`/`rule`/`upload`/`download`/`start` (`metadata.dscp` is `0` when the inbound saw none) |
 | `DELETE` | `/connections` | Close all connections → 204 |
 | `DELETE` | `/connections/{id}` | Close one connection by UUID → 204 |
 
@@ -102,7 +102,7 @@ bookkeeping fields does not orphan the subscription's tracked content.
 | `GET` | `/providers/proxies/{name}` | One proxy provider |
 | `PUT` | `/providers/proxies/{name}` | Refresh (re-fetch) → 204 |
 | `GET` | `/providers/proxies/{name}/healthcheck` | Health-check all proxies in it |
-| `GET` | `/providers/rules` | List rule providers |
+| `GET` | `/providers/rules` | List rule providers (`format` is `YamlRule`, `TextRule` or `MrsRule`) |
 | `GET` | `/providers/rules/{name}` | One rule provider |
 | `PUT` | `/providers/rules/{name}` | Refresh a rule provider |
 

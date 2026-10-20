@@ -8,6 +8,33 @@ the canonical, in-repo source a release is cut from.
 
 ## [Unreleased]
 
+### Changed
+
+- **Rule providers report their format under mihomo's names**:
+  `GET /providers/rules` and `GET /providers/rules/{name}` echoed the
+  `format:` string as written in the config (`yaml`, `TEXT`, or `yaml`
+  when absent), while mihomo panels switch on `YamlRule`, `TextRule` and
+  `MrsRule`. `format` is now one of those three, and it is the format the
+  payload actually parsed as: an undeclared set is `YamlRule`, and an MRS
+  payload found by its magic bytes is `MrsRule` whatever was declared.
+  `format:` in the config stays case-insensitive. A client that matched
+  the old lower-case strings needs to accept the new names.
+
+### Fixed
+
+- **Connection metadata always carries `dscp`**: `GET /connections` left
+  `metadata.dscp` out when the inbound saw no DSCP, and mihomo dashboards
+  read it unconditionally. It is now always a number, `0` when there was
+  none, as in mihomo. A flow without a DSCP still never matches `DSCP,0`,
+  and the connection table now keeps a DSCP an inbound did record.
+- **Group delay tests keep the members that answered**:
+  `GET /group/{name}/delay` returned 504 as soon as one member timed out,
+  so panels showed a whole group as timed out over one slow node, and a
+  member that failed for another reason came back as `0`. The answer now
+  maps each member whose probe passed within `timeout` to its delay and
+  leaves the rest out, as mihomo does; it is a 504 only when no member
+  passed, an empty group included.
+
 ## [0.25.0] - 2026-10-20
 
 ### Added

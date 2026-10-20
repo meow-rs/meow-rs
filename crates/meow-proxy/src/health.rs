@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt};
+use futures::{future::BoxFuture, FutureExt, Stream, StreamExt};
 use meow_common::logbook::{self, Level};
 use meow_common::{
     failure_reason, AdapterType, ChainTarget, ChainVerdict, MeowError, Metadata, Proxy,
@@ -147,40 +147,29 @@ pub async fn probe_many_bounded_detailed(
     timeout: Duration,
     concurrency: usize,
 ) -> Vec<NamedProbeResult> {
+    probe_stream_bounded(probes, url, expected, timeout, concurrency)
+        .collect()
+        .await
+}
+
+/// [`probe_many_bounded_detailed`] as a stream: each result as soon as its
+/// probe ends, with at most `concurrency` probes running. A caller with a
+/// deadline of its own keeps what arrived by then; dropping the stream
+/// cancels the probes still running, and those record nothing.
+pub fn probe_stream_bounded(
+    probes: Vec<(String, Arc<dyn Proxy + 'static>)>,
+    url: &str,
+    expected: Option<&str>,
+    timeout: Duration,
+    concurrency: usize,
+) -> impl Stream<Item = NamedProbeResult> + Send + 'static {
     let url = Arc::<str>::from(url.to_owned());
     let expected = expected.map(|s| Arc::<str>::from(s.to_owned()));
-    let concurrency = concurrency.max(1);
-
-    let mut probes = probes.into_iter();
-    let mut pending = FuturesUnordered::new();
-    for _ in 0..concurrency {
-        let Some((name, proxy)) = probes.next() else {
-            break;
-        };
-        pending.push(named_probe_future(
-            name,
-            proxy,
-            Arc::clone(&url),
-            expected.clone(),
-            timeout,
-        ));
-    }
-
-    let mut results = Vec::new();
-    while let Some(result) = pending.next().await {
-        results.push(result);
-        if let Some((name, proxy)) = probes.next() {
-            pending.push(named_probe_future(
-                name,
-                proxy,
-                Arc::clone(&url),
-                expected.clone(),
-                timeout,
-            ));
-        }
-    }
-
-    results
+    futures::stream::iter(probes)
+        .map(move |(name, proxy)| {
+            named_probe_future(name, proxy, Arc::clone(&url), expected.clone(), timeout)
+        })
+        .buffer_unordered(concurrency.max(1))
 }
 
 fn named_probe_future(

@@ -114,6 +114,9 @@ rules:
 
 `behavior` describes the payload: `domain` (domain list), `ipcidr` (CIDR list), or
 `classical` (full `TYPE,payload` rule lines). `mrs` is the compiled binary format.
+`format` is case-insensitive. `GET /providers/rules` reports the format the
+payload actually parsed as, under the names mihomo panels expect: `YamlRule`,
+`TextRule` or `MrsRule`.
 
 ### `type: http` / `file`
 

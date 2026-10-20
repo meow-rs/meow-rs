@@ -113,22 +113,22 @@ Same query parameters (`url`, `timeout`, `expected`). Success (`200`):
 ```json
 {
   "proxy-A": 123,
-  "proxy-B": 245,
-  "proxy-C": 0
+  "proxy-B": 245
 }
 ```
 
-A value of `0` indicates the member failed its probe (matches upstream).
+The map holds only the members whose probe passed (matches upstream): a
+member that failed, or was still probing at the deadline, has no key.
 The map key is the member proxy name, **not** the group name.
 
-**Timeout semantics — group-wide, not per-member.** Upstream wraps the
-entire group probe in a single `context.WithTimeout(..., timeout)` and
-passes it to `group.URLTest`. We match: one `tokio::time::timeout` around
-the whole `JoinSet`. A slow member does not get its own `timeout` budget;
-if the group deadline elapses, members still in flight are recorded as
-`0` in the map and the endpoint returns 504 (see error cases below).
-This is a deliberate upstream-compat choice, not what I'd design from
-scratch — dashboards rely on it.
+**Timeout semantics — group-wide, not per-member.** Upstream runs the
+entire group probe under a single `timeout` deadline. We match: one
+deadline for the whole batch. A slow member does not get its own
+`timeout` budget; when the deadline elapses the endpoint answers with
+the members that passed by then, and members still in flight are left
+out. Only a batch where no member passed is a 504 (see error cases
+below). This is a deliberate upstream-compat choice — dashboards rely
+on it.
 
 **URL-test group re-selection:** the handler **only records** delay
 measurements into `ProxyHealth.history` of each member. It does **not**
@@ -146,7 +146,7 @@ Error cases (verbatim from upstream `hub/route/groups.go::getGroupDelay`):
 |------|------|------|
 | `400` | `{"message": "Body invalid"}` | `timeout` / `expected` unparseable or out of range |
 | `404` | `{"message": "resource not found"}` | `:name` not in the registry, **or** `:name` exists but is not a `ProxyGroup` — upstream returns 404 for both cases (`findProxyByName` rejects non-groups at the middleware layer for this route). We match. |
-| `504` | `{"message": "Timeout"}` | group probe exceeded `timeout` |
+| `504` | `{"message": "Timeout"}` | no member passed its probe by the `timeout` deadline (an empty group included) |
 
 All member probes run concurrently; the endpoint waits up to the
 group-wide `timeout` before responding (no streaming).
@@ -315,10 +315,10 @@ A PR implementing this spec must:
   standalone proxy.
 - `get_group_delay_concurrent_within_timeout` — 5 members, each sleeping
   `timeout/2`, assert wall time < `timeout * 1.5`.
-- `get_group_delay_one_slow_member_recorded_as_zero` — 3 members: 2
+- `get_group_delay_one_slow_member_left_out` — 3 members: 2
   fast, 1 sleeping `timeout*2`. Assert the group-wide timeout kicks in,
   the two fast members appear with non-zero delay in the map, and the
-  slow member appears as `0`. Verifies the group-wide (not per-member)
+  slow member has no key. Verifies the group-wide (not per-member)
   timeout semantic from the spec.
 - `get_group_delay_url_test_no_reselection` — `UrlTestGroup` with two
   members, currently selecting member A. Call group delay. Assert

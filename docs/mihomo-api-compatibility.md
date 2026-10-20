@@ -22,9 +22,9 @@ Status meanings:
 | `DELETE /proxies/{name}` | Compatible | Unfixes URLTest/Fallback; Selector and leaf adapters return 400. |
 | `GET /proxies/{name}/delay` | Compatible | Implements mihomo delay/error semantics. |
 | `GET /group[/{name}]` | Compatible | Lists and returns groups only. |
-| `GET /group/{name}/delay` | Compatible | Unfixes automatic groups before the batch probe. |
+| `GET /group/{name}/delay` | Compatible | Unfixes automatic groups before the batch probe; maps each member that passed within `timeout` to its delay, leaving out the rest, and is 504 only when none passed. |
 | `GET /traffic` | Compatible | HTTP newline-delimited JSON and WebSocket, including current and total counters. |
-| `GET /connections` | Partial | HTTP snapshot and WebSocket interval mode are implemented; UDP sessions are not tracked. |
+| `GET /connections` | Partial | HTTP snapshot and WebSocket interval mode are implemented; `metadata.dscp` is always a number (`0` when the inbound saw none); UDP sessions are not tracked. |
 | `DELETE /connections[/{id}]` | Compatible | Closes one or all tracked connections. |
 | `GET /logs` | Compatible | HTTP/WebSocket and plain/structured formats are supported. |
 | `GET /memory` | Compatible | HTTP/WebSocket; each client starts with the mihomo-compatible zero frame. |
@@ -33,7 +33,7 @@ Status meanings:
 | `GET/PUT /providers/proxies[/{name}]` | Compatible | Refresh failures return 503. |
 | `GET /providers/proxies/{name}/healthcheck` | Compatible | Uses provider health-check configuration and returns 204. |
 | `GET /providers/proxies/{provider}/{proxy}[/healthcheck]` | Compatible | Provider member detail and delay probe. |
-| `GET/PUT /providers/rules[/{name}]` | Compatible | Includes format, vehicle type, rule count, and RFC 3339 update time. |
+| `GET/PUT /providers/rules[/{name}]` | Compatible | Includes format (`YamlRule`, `TextRule` or `MrsRule`: what the payload parsed as), vehicle type, rule count, and RFC 3339 update time. |
 | `GET/PATCH /configs` | Partial | Runtime mode and log level are mutable. Dynamic listeners, TUN/TUIC, and interface changes are unavailable. |
 | `PUT /configs` | Partial | Reloads proxies/rules/mode while retaining providers and selection persistence; the DNS runtime is republished on input changes and the TUN listener restarts on `tun:` diffs, but ordinary listener hot replacement is unavailable. |
 | `POST /cache/dns/flush` | Compatible | Clears resolver cache. |

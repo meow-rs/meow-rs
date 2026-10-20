@@ -131,6 +131,7 @@ warning): `relay` runs no health-check task. A relay is static-only — provider
 `select` and `relay` do not. You can also trigger probes on demand through the REST API:
 
 - `GET /proxies/{name}/delay` — probe one proxy.
-- `GET /group/{name}/delay` — probe every member of a group.
+- `GET /group/{name}/delay` — probe every member of a group; the answer lists the
+  members that passed within the timeout, and is a 504 only when none did.
 
 See the [REST API reference](../reference/rest-api).

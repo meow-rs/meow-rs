@@ -2472,6 +2472,8 @@ async fn get_group_delay(
     Path(name): Path<String>,
     Query(params): Query<DelayParams>,
 ) -> Response {
+    use futures::StreamExt as _;
+
     let route = state.tunnel.route_snapshot();
     let Some(group) = route.proxies.get(name.as_str()).cloned() else {
         return msg_err(StatusCode::NOT_FOUND, "resource not found");
@@ -2508,32 +2510,26 @@ async fn get_group_delay(
         .map(|p| (p.name().to_string(), p))
         .collect();
 
-    // upstream: group probe wraps the whole batch in one context.WithTimeout,
-    // not per-member. A slow member does not get its own budget.
-    let collected = tokio::time::timeout(
+    // One deadline for the whole batch, as in mihomo: a slow member does
+    // not get a budget of its own. The answer maps the members whose probe
+    // passed by then to their delay; one that failed or was still probing
+    // is left out, and only a batch where none passed is a 504.
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut probes = std::pin::pin!(meow_proxy::health::probe_stream_bounded(
+        members,
+        &url,
+        expected.as_deref(),
         timeout,
-        meow_proxy::health::probe_many_bounded_detailed(
-            members,
-            &url,
-            expected.as_deref(),
-            timeout,
-            meow_proxy::health::GROUP_DELAY_CONCURRENCY,
-        ),
-    )
-    .await;
-
-    let Ok(pairs) = collected else {
-        // upstream: 504 "Timeout". Even if some members completed before the
-        // deadline, upstream still returns the timeout error — we match.
-        return msg_err(StatusCode::GATEWAY_TIMEOUT, "Timeout");
-    };
-
+        meow_proxy::health::GROUP_DELAY_CONCURRENCY,
+    ));
     let mut result: BTreeMap<String, u16> = BTreeMap::new();
-    for pair in pairs {
-        if matches!(pair.error, Some(meow_proxy::health::UrlTestError::Timeout)) {
-            return msg_err(StatusCode::GATEWAY_TIMEOUT, "Timeout");
+    while let Ok(Some(probe)) = tokio::time::timeout_at(deadline, probes.next()).await {
+        if probe.error.is_none() {
+            result.insert(probe.name, probe.delay);
         }
-        result.insert(pair.name, pair.delay);
+    }
+    if result.is_empty() {
+        return msg_err(StatusCode::GATEWAY_TIMEOUT, "Timeout");
     }
     Json(result).into_response()
 }
@@ -3964,7 +3960,7 @@ struct RuleProviderInfo {
     #[serde(rename = "type")]
     provider_type: String,
     behavior: String,
-    format: String,
+    format: &'static str,
     #[serde(rename = "ruleCount")]
     rule_count: usize,
     #[serde(rename = "updatedAt")]
@@ -3973,8 +3969,19 @@ struct RuleProviderInfo {
     vehicle_type: String,
 }
 
+/// A rule-provider format by the name mihomo reports it under, which
+/// panels switch on (an `MrsRule` set is binary, for one).
+fn rule_format_name(format: meow_rules::RuleSetFormat) -> &'static str {
+    use meow_rules::RuleSetFormat;
+    match format {
+        RuleSetFormat::Yaml => "YamlRule",
+        RuleSetFormat::Text => "TextRule",
+        RuleSetFormat::Mrs => "MrsRule",
+    }
+}
+
 impl RuleProviderInfo {
-    fn from_provider(p: &Arc<RuleProvider>, format: Option<&str>) -> Self {
+    fn from_provider(p: &Arc<RuleProvider>) -> Self {
         let vehicle_type = match p.provider_type {
             meow_config::rule_provider::ProviderType::Http => "HTTP",
             meow_config::rule_provider::ProviderType::File => "File",
@@ -3984,7 +3991,7 @@ impl RuleProviderInfo {
             name: p.name.clone(),
             provider_type: "Rule".to_string(),
             behavior: p.behavior.to_string(),
-            format: format.unwrap_or("yaml").to_string(),
+            format: rule_format_name(p.format()),
             rule_count: p.rule_count(),
             updated_at: unix_rfc3339(p.updated_at_secs()).unwrap_or_default(),
             vehicle_type: vehicle_type.to_string(),
@@ -3999,16 +4006,10 @@ struct RuleProvidersResponse {
 
 async fn get_rule_providers(State(state): State<Arc<AppState>>) -> Json<RuleProvidersResponse> {
     let providers = state.rule_providers.read();
-    let raw = state.raw_config.read();
     let map: HashMap<String, RuleProviderInfo> = providers
         .iter()
         .map(|(name, p): (&String, &Arc<RuleProvider>)| {
-            let format = raw
-                .rule_providers
-                .as_ref()
-                .and_then(|all| all.get(name))
-                .and_then(|provider| provider.format.as_deref());
-            (name.clone(), RuleProviderInfo::from_provider(p, format))
+            (name.clone(), RuleProviderInfo::from_provider(p))
         })
         .collect();
     Json(RuleProvidersResponse { providers: map })
@@ -4020,13 +4021,7 @@ async fn get_rule_provider(
 ) -> Result<Json<RuleProviderInfo>, StatusCode> {
     let providers = state.rule_providers.read();
     let p = providers.get(&name).ok_or(StatusCode::NOT_FOUND)?;
-    let raw = state.raw_config.read();
-    let format = raw
-        .rule_providers
-        .as_ref()
-        .and_then(|all| all.get(&name))
-        .and_then(|provider| provider.format.as_deref());
-    Ok(Json(RuleProviderInfo::from_provider(p, format)))
+    Ok(Json(RuleProviderInfo::from_provider(p)))
 }
 
 async fn refresh_rule_provider(
