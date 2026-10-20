@@ -156,22 +156,54 @@ pub async fn fetch(
     proxy: Option<&Arc<dyn Proxy>>,
     headers: &[(String, String)],
 ) -> Result<Vec<u8>> {
+    fetch_response(url, proxy, headers)
+        .await
+        .map(|response| response.body)
+}
+
+/// [`fetch`], returning the response header fields along with the body.
+pub async fn fetch_response(
+    url: &str,
+    proxy: Option<&Arc<dyn Proxy>>,
+    headers: &[(String, String)],
+) -> Result<Response> {
     fetch_capped(url, proxy, headers, MAX_BODY_BYTES).await
 }
 
-/// [`fetch`] with the body cap as a parameter, so tests can exercise the
-/// oversize paths without transferring hundreds of megabytes.
+/// A terminal 2xx response, after redirects.
+#[derive(Debug)]
+pub struct Response {
+    /// The body, with any chunked framing removed.
+    pub body: Vec<u8>,
+    /// Header fields in the order received. A field whose value is not
+    /// UTF-8 is left out.
+    headers: Vec<(String, String)>,
+}
+
+impl Response {
+    /// The value of the first header field named `name`, compared
+    /// case-insensitively.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(field, _)| field.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+/// [`fetch_response`] with the body cap as a parameter, so tests can
+/// exercise the oversize paths without transferring hundreds of megabytes.
 async fn fetch_capped(
     url: &str,
     proxy: Option<&Arc<dyn Proxy>>,
     headers: &[(String, String)],
     limit: usize,
-) -> Result<Vec<u8>> {
+) -> Result<Response> {
     let mut current = Url::parse(url).map_err(|e| anyhow!("invalid URL '{url}': {e}"))?;
     let mut headers = headers.to_vec();
     for _ in 0..=MAX_REDIRECTS {
         match fetch_one(&current, proxy, &headers, limit).await? {
-            Outcome::Body(bytes) => return Ok(bytes),
+            Outcome::Body(response) => return Ok(response),
             Outcome::Redirect(next) => {
                 let next = current
                     .join(&next)
@@ -197,7 +229,7 @@ async fn fetch_capped(
 }
 
 enum Outcome {
-    Body(Vec<u8>),
+    Body(Response),
     Redirect(String),
 }
 
@@ -453,7 +485,15 @@ fn parse_response(buf: &[u8], limit: usize) -> Result<Outcome> {
         }
         body.to_vec()
     };
-    Ok(Outcome::Body(body))
+    let headers = resp
+        .headers
+        .iter()
+        .filter_map(|header| {
+            let value = std::str::from_utf8(header.value).ok()?;
+            Some((header.name.to_owned(), value.trim().to_owned()))
+        })
+        .collect();
+    Ok(Outcome::Body(Response { body, headers }))
 }
 
 fn decode_chunked(mut input: &[u8], limit: usize) -> Result<Vec<u8>> {
@@ -511,9 +551,34 @@ mod tests {
     fn parse_response_decodes_chunked_body_and_extensions() {
         let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4;foo=bar\r\nWiki\r\n5\r\npedia\r\n0\r\nX-Trailer: yes\r\n\r\n";
         match parse_response(response, MAX_BODY_BYTES).unwrap() {
-            Outcome::Body(body) => assert_eq!(body, b"Wikipedia"),
+            Outcome::Body(response) => assert_eq!(response.body, b"Wikipedia"),
             Outcome::Redirect(_) => panic!("unexpected redirect"),
         }
+    }
+
+    #[test]
+    fn parse_response_keeps_header_fields_for_lookup() {
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nSubscription-Userinfo:  upload=1; total=2 \r\nX-Dup: first\r\nx-dup: second\r\nX-Bin: \xff\r\n\r\nok";
+        let Outcome::Body(response) = parse_response(response, MAX_BODY_BYTES).unwrap() else {
+            panic!("unexpected redirect");
+        };
+        assert_eq!(response.body, b"ok");
+        assert_eq!(
+            response.header("subscription-userinfo"),
+            Some("upload=1; total=2"),
+            "names compare case-insensitively and values are trimmed"
+        );
+        assert_eq!(
+            response.header("X-DUP"),
+            Some("first"),
+            "the first field wins"
+        );
+        assert_eq!(
+            response.header("x-bin"),
+            None,
+            "a non-UTF-8 value reads as absent"
+        );
+        assert_eq!(response.header("etag"), None);
     }
 
     #[test]
@@ -644,8 +709,8 @@ mod tests {
     #[tokio::test]
     async fn response_bytes_capped_accepts_body_within_limit() {
         let url = spawn_raw_http_server(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello").await;
-        let bytes = fetch_capped(&url, None, &[], 16).await.unwrap();
-        assert_eq!(bytes, b"hello");
+        let response = fetch_capped(&url, None, &[], 16).await.unwrap();
+        assert_eq!(response.body, b"hello");
     }
 
     #[tokio::test]
@@ -664,7 +729,7 @@ mod tests {
             assert!(parse_response(response, MAX_BODY_BYTES).is_err());
         }
         assert!(
-            matches!(parse_response(b"HTTP/1.1 200 OK\r\n\r\nabc", MAX_BODY_BYTES).unwrap(), Outcome::Body(body) if body == b"abc")
+            matches!(parse_response(b"HTTP/1.1 200 OK\r\n\r\nabc", MAX_BODY_BYTES).unwrap(), Outcome::Body(response) if response.body == b"abc")
         );
     }
 

@@ -8,6 +8,56 @@ the canonical, in-repo source a release is cut from.
 
 ## [Unreleased]
 
+### Added
+
+- **`PATCH /configs` turns TUN on and off without a restart**: a mihomo
+  GUI's TUN switch, Clash Party's for one, sends
+  `PATCH /configs {"tun": {"enable": true}}` and never restarts the core,
+  but the PATCH only took `mode` and `log-level`, so the switch did nothing
+  and still answered 204. A `tun` object is now merged over the committed
+  `tun:` section and the listener is started, stopped or restarted from the
+  result, the same way `PUT /configs` applies a `tun:` change, matching
+  mihomo. It takes the keys meow implements (`enable`, `device`, `mtu`,
+  `inet4-address`, `inet6-address`, `auto-route`, `outbound-interface`,
+  `dns-hijack`, `udp-timeout`) and ignores the others, such as `stack` and
+  `strict-route`; unlike mihomo, an omitted `enable` keeps the current state
+  rather than turning TUN off. A section the listener cannot parse answers
+  400 and applies nothing. A TUN that fails to start, for lack of
+  permission to create the device or in a build without TUN, is turned off
+  again as on a reload, and the PATCH answers 500 with the reason.
+  `GET /configs` now reports `tun` as well, with `enable` saying whether
+  the listener runs. Like a patched `mode`, the change is kept in memory
+  until the config is saved.
+
+- **`provider-name` on every proxy in the API**: `GET /proxies`, the group
+  routes and `GET /providers/proxies` now report, on each proxy, the
+  proxy-provider that supplied it, or `""` for `proxies:` entries, groups
+  and the built-ins, matching mihomo. GUIs such as Clash Party read it to
+  send a provider node's delay test to the provider route; without it they
+  probed `/proxies/{name}/delay`, got a 404 and showed every provider node
+  as timed out. `GET /proxies/{name}` and `GET /proxies/{name}/delay` also
+  resolve a provider node now (a meow extension; mihomo returns 404), so
+  clients that probe each member of a `use:` group there, like meow-android
+  and meow-ios, get a real delay. A `proxies:` entry wins over a provider
+  node of the same name, and between providers the first by name wins.
+
+- **Proxy-group `hidden:` and `icon:`**: both keys are parsed and reported
+  on every group in `GET /proxies` (`false` / `""` when unset), matching
+  mihomo, so GUIs can leave hidden groups out of their list and show a
+  group's icon. Routing ignores both.
+
+- **Proxy providers report their plan usage** (`subscriptionInfo`):
+  `GET /providers/proxies` and `GET /providers/proxies/{name}` include the
+  traffic and expiry an `http` provider's server sends in its
+  `subscription-userinfo` response header, as
+  `"subscriptionInfo": {"Upload", "Download", "Total", "Expire"}`, the way
+  mihomo does, so dashboards such as Clash Party, zashboard and metacubexd
+  show how much of a plan is used and when it ends. The last fetch the
+  provider accepted decides: one without the header drops the field, a
+  failed one keeps it. The usage is kept next to the provider cache
+  (`<path>.subscription-userinfo`), so a restart that starts from the cache
+  reports it before the first refetch. `file` providers have none.
+
 ### Changed
 
 - **Rule providers report their format under mihomo's names**:

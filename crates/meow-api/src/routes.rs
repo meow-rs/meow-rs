@@ -13,7 +13,7 @@ use meow_common::logbook::{self, Level};
 use meow_common::TunnelMode;
 use meow_config::{
     proxy_provider::ProxyProvider,
-    raw::{RawConfig, RawProxyGroup, RawSubscription},
+    raw::{RawAutoRoute, RawConfig, RawProxyGroup, RawSubscription, RawTun},
     rule_provider::RuleProvider,
     NamedListener,
 };
@@ -357,12 +357,31 @@ struct ProxyInfo {
     /// Last measured delay in ms; omitted until a probe has succeeded.
     #[serde(skip_serializing_if = "Option::is_none")]
     delay: Option<u16>,
+    /// The proxy-provider the proxy came from; `""` for inline proxies,
+    /// groups and built-ins. Present on every entry, as in mihomo, and GUIs
+    /// key on it: Clash Party probes a node whose `provider-name` is set
+    /// through `/providers/proxies/{provider}/{name}/healthcheck`.
+    #[serde(rename = "provider-name")]
+    provider_name: String,
+    /// Group-only: the group's `hidden:` key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hidden: Option<bool>,
+    /// Group-only: the group's `icon:` key, `""` when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    icon: Option<String>,
 }
 
 impl ProxyInfo {
-    fn from_proxy(proxy: &Arc<dyn meow_common::Proxy>) -> Self {
+    /// `provider` names the proxy-provider `proxy` was read from; pass `""`
+    /// for route-table entries, which never come from one.
+    fn from_proxy(proxy: &Arc<dyn meow_common::Proxy>, provider: &str) -> Self {
         let members = proxy.members();
         let current = proxy.current();
+        // mihomo reports both keys on every group, `false` / `""` when the
+        // config leaves them out.
+        let display = members
+            .is_some()
+            .then(|| proxy.group_display().cloned().unwrap_or_default());
         debug!(
             name = proxy.name(),
             proxy_type = %proxy.adapter_type(),
@@ -385,6 +404,9 @@ impl ProxyInfo {
             test_url: proxy.test_url().map(str::to_string),
             expected_status: proxy.expected_status().map(str::to_string),
             delay,
+            provider_name: provider.to_string(),
+            hidden: display.as_ref().map(|d| d.hidden),
+            icon: display.map(|d| d.icon.into_string()),
         }
     }
 }
@@ -398,9 +420,45 @@ async fn get_proxies(State(state): State<Arc<AppState>>) -> Json<ProxiesResponse
     let route = state.tunnel.route_snapshot();
     let mut result = std::collections::HashMap::new();
     for (name, proxy) in route.proxies.iter() {
-        result.insert(name.to_string(), ProxyInfo::from_proxy(proxy));
+        result.insert(name.to_string(), ProxyInfo::from_proxy(proxy, ""));
     }
     Json(ProxiesResponse { proxies: result })
+}
+
+/// The proxy a `GET /proxies/{name}[/delay]` path names, with the
+/// proxy-provider it came from (`""` for a route-table entry).
+///
+/// Route-table keys come first: inline proxies, groups and built-ins, the
+/// set mihomo answers there. A miss falls back to the proxy-providers'
+/// members, where mihomo answers 404: a client that probes each member of
+/// a `use:` group through this route would otherwise see every provider
+/// node as down. Providers are searched in name order, the order
+/// `include-all` lists them in, so when two providers ship the same name
+/// the first one answers; `/providers/proxies/{provider}/{name}` reaches
+/// either.
+fn find_proxy(
+    state: &AppState,
+    proxies: &HashMap<smol_str::SmolStr, Arc<dyn meow_common::Proxy>>,
+    name: &str,
+) -> Option<(Arc<dyn meow_common::Proxy>, String)> {
+    if let Some(proxy) = proxies.get(name) {
+        return Some((Arc::clone(proxy), String::new()));
+    }
+    let mut providers: Vec<(String, Arc<ProxyProvider>)> = state
+        .proxy_providers
+        .iter()
+        .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
+        .collect();
+    providers.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    providers.into_iter().find_map(|(provider_name, provider)| {
+        let member = provider
+            .slot
+            .read()
+            .iter()
+            .find(|proxy| proxy.name() == name)
+            .cloned()?;
+        Some((member, provider_name))
+    })
 }
 
 async fn get_proxy(
@@ -408,11 +466,9 @@ async fn get_proxy(
     Path(name): Path<String>,
 ) -> Result<Json<ProxyInfo>, StatusCode> {
     let route = state.tunnel.route_snapshot();
-    let proxy = route
-        .proxies
-        .get(name.as_str())
-        .ok_or(StatusCode::NOT_FOUND)?;
-    Ok(Json(ProxyInfo::from_proxy(proxy)))
+    let (proxy, provider) =
+        find_proxy(&state, &route.proxies, &name).ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(ProxyInfo::from_proxy(&proxy, &provider)))
 }
 
 #[derive(Deserialize)]
@@ -469,7 +525,7 @@ async fn get_groups(State(state): State<Arc<AppState>>) -> Json<ProxiesResponse>
         .proxies
         .iter()
         .filter(|(_, proxy)| proxy.members().is_some())
-        .map(|(name, proxy)| (name.to_string(), ProxyInfo::from_proxy(proxy)))
+        .map(|(name, proxy)| (name.to_string(), ProxyInfo::from_proxy(proxy, "")))
         .collect();
     Json(ProxiesResponse { proxies })
 }
@@ -478,7 +534,7 @@ async fn get_group(State(state): State<Arc<AppState>>, Path(name): Path<String>)
     let route = state.tunnel.route_snapshot();
     match route.proxies.get(name.as_str()) {
         Some(proxy) if proxy.members().is_some() => {
-            Json(ProxyInfo::from_proxy(proxy)).into_response()
+            Json(ProxyInfo::from_proxy(proxy, "")).into_response()
         }
         _ => msg_err(StatusCode::NOT_FOUND, "Resource not found"),
     }
@@ -683,9 +739,14 @@ struct ConfigResponse {
     /// runtime state so nyanpasu can correctly render its toggle.
     #[serde(rename = "tun-enable")]
     tun_enable: bool,
+    /// The `tun:` section as mihomo reports it, for clients reading
+    /// `tun.enable` rather than `tun-enable`: `enable` is the running
+    /// state, the other keys echo the committed section.
+    tun: TunFields,
 }
 
 async fn get_configs(State(state): State<Arc<AppState>>) -> Json<ConfigResponse> {
+    let tun_running = state.tunnel.has_tun();
     let raw = state.raw_config.read();
     Json(ConfigResponse {
         mode: state.tunnel.mode().to_string(),
@@ -702,8 +763,79 @@ async fn get_configs(State(state): State<Arc<AppState>>) -> Json<ConfigResponse>
             .clone()
             .unwrap_or_else(|| "0.0.0.0".to_string()),
         ipv6: meow_config::effective_ipv6(raw.ipv6),
-        tun_enable: state.tunnel.has_tun(),
+        tun_enable: tun_running,
+        tun: TunFields::reported(raw.tun.as_ref(), tun_running),
     })
+}
+
+/// The `tun` keys `PATCH /configs` applies and `GET /configs` reports:
+/// the ones the TUN listener implements, under their `tun:` config names.
+///
+/// In a patch every key is optional and `null` counts as absent: the keys
+/// it carries are merged over the committed section and the rest keep
+/// their value, `enable` included (mihomo reads an omitted `enable` as
+/// `false`). Any other key is ignored, mihomo's upstream-only ones
+/// (`stack`, `strict-route`, `auto-detect-interface`, …) included.
+#[derive(Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+struct TunFields {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enable: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mtu: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inet4_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inet6_address: Option<serde_yaml::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auto_route: Option<RawAutoRoute>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    outbound_interface: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dns_hijack: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    udp_timeout: Option<u64>,
+}
+
+impl TunFields {
+    /// What `GET /configs` reports for the committed section `tun` while
+    /// the listener is `running`.
+    fn reported(tun: Option<&RawTun>, running: bool) -> Self {
+        let tun = tun.cloned().unwrap_or_default();
+        Self {
+            enable: Some(running),
+            device: tun.device,
+            mtu: tun.mtu,
+            inet4_address: tun.inet4_address,
+            inet6_address: tun.inet6_address,
+            auto_route: tun.auto_route,
+            outbound_interface: tun.outbound_interface,
+            dns_hijack: tun.dns_hijack,
+            udp_timeout: tun.udp_timeout,
+        }
+    }
+
+    /// Merge the keys this patch carries over `tun`.
+    fn merge_into(self, tun: &mut RawTun) {
+        fn merge<T>(slot: &mut Option<T>, patched: Option<T>) {
+            if patched.is_some() {
+                *slot = patched;
+            }
+        }
+        if let Some(enable) = self.enable {
+            tun.enable = enable;
+        }
+        merge(&mut tun.device, self.device);
+        merge(&mut tun.mtu, self.mtu);
+        merge(&mut tun.inet4_address, self.inet4_address);
+        merge(&mut tun.inet6_address, self.inet6_address);
+        merge(&mut tun.auto_route, self.auto_route);
+        merge(&mut tun.outbound_interface, self.outbound_interface);
+        merge(&mut tun.dns_hijack, self.dns_hijack);
+        merge(&mut tun.udp_timeout, self.udp_timeout);
+    }
 }
 
 #[derive(Deserialize)]
@@ -711,13 +843,14 @@ struct UpdateConfigRequest {
     mode: Option<String>,
     #[serde(rename = "log-level")]
     log_level: Option<String>,
+    tun: Option<TunFields>,
 }
 
 async fn update_configs(
     State(state): State<Arc<AppState>>,
     Json(body): Json<UpdateConfigRequest>,
 ) -> Response {
-    // Validate both fields first so we never partially apply on error.
+    // Validate every field first so we never partially apply on error.
     let mode = body.mode.map(|s| s.parse::<TunnelMode>());
     if let Some(Err(_)) = mode {
         return msg_err(StatusCode::BAD_REQUEST, "Body invalid");
@@ -728,13 +861,56 @@ async fn update_configs(
         }
     }
 
-    // Both valid — apply atomically. Enter the shared mutation lane first:
-    // a bare `raw_config.write()` here would race a concurrent PUT
-    // /configs, whose candidate swap would clobber the patched fields
-    // (issue #514).
+    // Enter the shared mutation lane before applying anything: a bare
+    // `raw_config.write()` here would race a concurrent PUT /configs,
+    // whose candidate swap would clobber the patched fields (issue #514).
     let _mutation = CONFIG_MUTATION.lock().await;
-    // Apply the fallible side first — committing mode before a failed
-    // log-level reload would partially apply the PATCH (issue #514).
+    // The patched `tun:` section, checked like a `PUT /configs` one before
+    // anything is applied; `None` when the patch leaves it as it is.
+    let tun = match body.tun {
+        None => None,
+        Some(patch) => {
+            let raw = state.raw_config.read();
+            let mut tun = raw.tun.clone().unwrap_or_default();
+            patch.merge_into(&mut tun);
+            if let Err(e) = meow_config::parse_tun_config(Some(&tun), raw.max_connections) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "message": format!("tun config error: {e}") })),
+                )
+                    .into_response();
+            }
+            (raw.tun.as_ref() != Some(&tun)).then_some(tun)
+        }
+    };
+    // Apply the fallible sides first — committing mode before a failed
+    // step would partially apply the PATCH (issue #514). TUN goes first:
+    // it is the step that fails in practice (a device the process may not
+    // create), so such a PATCH leaves mode and log level as they were. The
+    // TUN change runs the reload path's reconcile, rollback included.
+    if let Some(tun) = tun {
+        let mut candidate = state.raw_config.read().clone();
+        candidate.tun = Some(tun);
+        let preinstalled = preinstall_global_route_binding(&candidate);
+        // No routing publish runs here, so tracked TCP predating a
+        // pre-installed global-route binding is still live.
+        if let Err(e) = swap_config_and_reconcile_tun(
+            &state,
+            candidate,
+            None,
+            state.tunnel.resolver(),
+            preinstalled,
+            TrackedTcp::Cancel,
+        )
+        .await
+        {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "message": e })),
+            )
+                .into_response();
+        }
+    }
     if let Some(level) = body.log_level.as_deref() {
         if let Err(e) = crate::log_stream::reload_log_level(level) {
             return (
@@ -1316,7 +1492,9 @@ async fn commit_raw_candidate(
     let (dns, prior_resolver) = apply_raw_to_tunnel(candidate.clone(), state).await?;
     // `apply_raw_to_tunnel` publishes through `update_routing`, which keeps
     // tracked TCP: a flush must cancel the flows that predate the binding.
-    swap_config_and_reconcile_tun(
+    // A TUN restart that fails is rolled back and recorded there; the edit
+    // itself is committed.
+    let _ = swap_config_and_reconcile_tun(
         state,
         candidate,
         dns,
@@ -2445,8 +2623,9 @@ async fn get_proxy_delay(
     let expected = params.expected.clone();
 
     let route = state.tunnel.route_snapshot();
-    // upstream: hub/route/proxies.go::getProxyDelay — findProxyByName middleware
-    let Some(proxy) = route.proxies.get(name.as_str()).cloned() else {
+    // upstream: hub/route/proxies.go::getProxyDelay — findProxyByName
+    // middleware; provider members also resolve here (see `find_proxy`).
+    let Some((proxy, _)) = find_proxy(&state, &route.proxies, &name) else {
         return msg_err(StatusCode::NOT_FOUND, "resource not found");
     };
     // `route` stays alive across the probe — it owns this generation's
@@ -2656,8 +2835,11 @@ async fn spawn_tun_from_raw(
 /// On an off→on transition, if the TUN listener fails to start the stored
 /// config is rolled back (`tun.enable` set to `false`) to prevent state
 /// inconsistency (the HTTP API would report TUN as enabled but nothing is
-/// actually running).  The HTTP response is still 204 — the error is
-/// logged but not surfaced to the caller.
+/// actually running); a failed restart rolls back the same way. The error
+/// is logged, recorded, and returned: `PUT /configs` and the warm
+/// mutations still answer success, since the rest of their document is
+/// committed, while `PATCH /configs`, whose `tun` change is the request,
+/// answers it with an error.
 ///
 /// `dns` is the candidate's rebuilt [`meow_config::DnsConfig`] when its
 /// DNS-relevant inputs changed (`Some`), already validated by the caller —
@@ -2685,7 +2867,7 @@ async fn swap_config_and_reconcile_tun(
     prior_resolver: Arc<meow_dns::Resolver>,
     mut preinstalled: PreinstalledBinding,
     tracked_tcp: TrackedTcp,
-) {
+) -> Result<(), String> {
     debug_assert!(
         CONFIG_MUTATION.try_lock().is_err(),
         "caller must hold the CONFIG_MUTATION lane"
@@ -2837,17 +3019,20 @@ async fn swap_config_and_reconcile_tun(
                     if let Some(ref mut tun) = state.raw_config.write().tun {
                         tun.enable = false;
                     }
+                    return Err("TUN did not restart and was turned off".into());
                 }
                 Err(e) => {
                     warn!("TUN listener failed to restart: {e} (config rolled back)");
-                    tun_failed(format!("TUN failed to restart and was turned off: {e}"));
+                    let message = format!("TUN failed to restart and was turned off: {e}");
+                    tun_failed(message.clone());
                     if let Some(ref mut tun) = state.raw_config.write().tun {
                         tun.enable = false;
                     }
+                    return Err(message);
                 }
             }
         }
-        return;
+        return Ok(());
     }
     if let Some(snapshot) = snapshot {
         // off → on. Defensive: if a handle somehow outlives a raw config
@@ -2875,16 +3060,19 @@ async fn swap_config_and_reconcile_tun(
                 if let Some(ref mut tun) = state.raw_config.write().tun {
                     tun.enable = false;
                 }
+                return Err("TUN did not start and was turned off".into());
             }
             Err(e) => {
                 // TUN failed to start — roll back tun.enable to false so
                 // nyanpasu / the dashboard don't show TUN as active when
                 // nothing is actually running.
                 warn!("TUN listener failed to start: {e} (config rolled back)");
-                tun_failed(format!("TUN failed to start and was turned off: {e}"));
+                let message = format!("TUN failed to start and was turned off: {e}");
+                tun_failed(message.clone());
                 if let Some(ref mut tun) = state.raw_config.write().tun {
                     tun.enable = false;
                 }
+                return Err(message);
             }
         }
     } else {
@@ -2892,6 +3080,7 @@ async fn swap_config_and_reconcile_tun(
         state.tunnel.stop_tun().await;
         info!("TUN listener stopped via config reload");
     }
+    Ok(())
 }
 
 /// Record a TUN listener that did not (re)start, at startup or on a config
@@ -3161,8 +3350,9 @@ async fn put_configs(
         // still back the live route table), so no reconcile runs here.
         let prior_resolver = state.tunnel.resolver();
         // No `reload_routing` ran, so tracked TCP predating the binding
-        // is still live.
-        swap_config_and_reconcile_tun(
+        // is still live. A TUN that fails to come up is rolled back and
+        // recorded there; the document is committed, so the PUT succeeds.
+        let _ = swap_config_and_reconcile_tun(
             &state,
             raw_config,
             None,
@@ -3339,8 +3529,10 @@ async fn put_configs(
 
     let reloaded = reload_succeeded(&raw_config, &forced, dropped);
     // `reload_routing` above ran after the pre-install and cancelled every
-    // tracked TCP flow; any admitted since dialled under the binding.
-    swap_config_and_reconcile_tun(
+    // tracked TCP flow; any admitted since dialled under the binding. A TUN
+    // that fails to come up is rolled back and recorded there; the
+    // document is committed, so the PUT succeeds.
+    let _ = swap_config_and_reconcile_tun(
         &state,
         raw_config,
         dns,
@@ -3791,6 +3983,33 @@ struct ProviderInfo {
     expected_status: String,
     #[serde(rename = "updatedAt", skip_serializing_if = "Option::is_none")]
     updated_at: Option<String>,
+    /// The plan usage the provider's server reported in its
+    /// `subscription-userinfo` header, as mihomo reports it.
+    #[serde(rename = "subscriptionInfo", skip_serializing_if = "Option::is_none")]
+    subscription_info: Option<ProviderSubscriptionInfo>,
+}
+
+/// `subscriptionInfo` of a proxy provider: bytes uploaded, downloaded and
+/// allowed on the plan, and its end in Unix seconds. A key the server left
+/// out reads 0.
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct ProviderSubscriptionInfo {
+    upload: u64,
+    download: u64,
+    total: u64,
+    expire: u64,
+}
+
+impl From<meow_config::subscription_userinfo::SubscriptionUserinfo> for ProviderSubscriptionInfo {
+    fn from(usage: meow_config::subscription_userinfo::SubscriptionUserinfo) -> Self {
+        Self {
+            upload: usage.upload,
+            download: usage.download,
+            total: usage.total,
+            expire: usage.expire,
+        }
+    }
 }
 
 fn unix_rfc3339(seconds: u64) -> Option<String> {
@@ -3805,7 +4024,7 @@ fn provider_to_info(name: &str, provider: &ProxyProvider) -> ProviderInfo {
     let proxies = provider
         .proxies()
         .iter()
-        .map(ProxyInfo::from_proxy)
+        .map(|proxy| ProxyInfo::from_proxy(proxy, name))
         .collect();
     ProviderInfo {
         name: name.to_string(),
@@ -3821,6 +4040,7 @@ fn provider_to_info(name: &str, provider: &ProxyProvider) -> ProviderInfo {
             .as_ref()
             .map_or_else(String::new, |hc| hc.expected_status.clone()),
         updated_at: unix_rfc3339(provider.updated_at_secs()),
+        subscription_info: provider.subscription_userinfo().map(Into::into),
     }
 }
 
@@ -3909,7 +4129,7 @@ async fn get_provider_proxy(
         .into_iter()
         .find(|p| p.name() == proxy_name)
     {
-        Some(proxy) => Json(ProxyInfo::from_proxy(&proxy)).into_response(),
+        Some(proxy) => Json(ProxyInfo::from_proxy(&proxy, &provider_name)).into_response(),
         None => msg_err(StatusCode::NOT_FOUND, "Resource not found"),
     }
 }

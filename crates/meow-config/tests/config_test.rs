@@ -660,6 +660,99 @@ proxy-groups:
     );
 }
 
+/// mihomo's `hidden:` / `icon:` group keys reach every group type the
+/// parser builds; a group that sets neither is shown with no icon, and so
+/// is the auto-created `GLOBAL`.
+#[tokio::test]
+async fn test_proxy_group_hidden_and_icon() {
+    let yaml = r#"
+proxies:
+  - name: node-a
+    type: socks5
+    server: 127.0.0.1
+    port: 10001
+  - name: node-b
+    type: socks5
+    server: 127.0.0.1
+    port: 10002
+
+proxy-groups:
+  - name: pick
+    type: select
+    proxies: [node-a]
+    hidden: true
+    icon: https://example.com/icons/pick.png
+  - name: fastest
+    type: url-test
+    proxies: [node-a, node-b]
+    icon: "<svg xmlns='http://www.w3.org/2000/svg'/>"
+  - name: first-alive
+    type: fallback
+    proxies: [node-a, node-b]
+    hidden: true
+  - name: spread
+    type: load-balance
+    proxies: [node-a, node-b]
+    hidden: false
+    icon: /icons/spread.png
+  - name: chain
+    type: relay
+    proxies: [node-a, node-b]
+    hidden: true
+    icon: chain.png
+  - name: plain
+    type: select
+    proxies: [node-b]
+"#;
+
+    let config = load_config_from_str(yaml).await.unwrap();
+    let display = |name: &str| {
+        config
+            .proxies
+            .get(name)
+            .unwrap_or_else(|| panic!("group {name} must be built"))
+            .group_display()
+            .cloned()
+            .unwrap_or_else(|| panic!("group {name} must report its display keys"))
+    };
+    for (name, hidden, icon) in [
+        ("pick", true, "https://example.com/icons/pick.png"),
+        (
+            "fastest",
+            false,
+            "<svg xmlns='http://www.w3.org/2000/svg'/>",
+        ),
+        ("first-alive", true, ""),
+        ("spread", false, "/icons/spread.png"),
+        ("chain", true, "chain.png"),
+        ("plain", false, ""),
+        ("GLOBAL", false, ""),
+    ] {
+        let display = display(name);
+        assert_eq!(display.hidden, hidden, "{name}: hidden");
+        assert_eq!(&*display.icon, icon, "{name}: icon");
+    }
+    assert!(
+        config.proxies["node-a"].group_display().is_none(),
+        "a leaf proxy carries no group display keys"
+    );
+
+    let raw: meow_config::raw::RawConfig = serde_yaml::from_str(yaml).unwrap();
+    let groups = raw.proxy_groups.unwrap();
+    assert_eq!(groups[0].hidden, Some(true));
+    assert_eq!(
+        groups[0].icon.as_deref(),
+        Some("https://example.com/icons/pick.png")
+    );
+    let plain = groups.iter().find(|group| group.name == "plain").unwrap();
+    assert_eq!((plain.hidden, plain.icon.as_deref()), (None, None));
+    let saved = serde_yaml::to_string(plain).unwrap();
+    assert!(
+        !saved.contains("hidden") && !saved.contains("icon"),
+        "unset keys stay out of a saved config: {saved}"
+    );
+}
+
 #[tokio::test]
 async fn test_deferred_sibling_does_not_change_include_all_proxy_membership() {
     let yaml = r#"

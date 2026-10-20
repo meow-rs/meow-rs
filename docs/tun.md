@@ -451,6 +451,14 @@ one case where an unchanged re-PUT does *not* retry is a listener that
 dies *after* a successful start (no rollback ran, committed stays
 `true`); revival there needs an `enable` flip or a parameter change.
 
+`PATCH /configs` with a `tun` object, which is what a mihomo GUI's TUN
+switch sends, runs the same reconcile. The keys it carries are merged
+over the committed section: an omitted key, `enable` included, keeps its
+value, the fields of the table above apply and any other key is ignored.
+A section that fails to parse is rejected with 400 and nothing applied;
+a failed (re)start rolls `enable` back as above, but the PATCH answers
+500 with the reason instead of 204.
+
 In global route mode a reload binds outbound sockets before its first dial,
 exactly like startup (#695). A `PUT /configs` whose candidate has
 `auto-route: global` installs the candidate's binding right after taking

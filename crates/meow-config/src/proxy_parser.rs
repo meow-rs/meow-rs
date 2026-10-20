@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use meow_common::{
-    AdapterType, DelayHistory, Metadata, Proxy, ProxyAdapter, ProxyConn, ProxyHealth,
+    AdapterType, DelayHistory, GroupDisplay, Metadata, Proxy, ProxyAdapter, ProxyConn, ProxyHealth,
     ProxyPacketConn, Result,
 };
 #[cfg(feature = "ss")]
@@ -3161,7 +3161,8 @@ fn parse_proxy_group_inner(
             // upstream sweeps its static members since mihomo 90bf158, so
             // warn on the inert probe fields instead of ignoring silently.
             warn_inert_health_fields("select", &config.name, config);
-            let mut group = SelectorGroup::new_with_providers(&config.name, proxies, slots);
+            let mut group = SelectorGroup::new_with_providers(&config.name, proxies, slots)
+                .with_display(group_display(config));
             if let Some(store) = selector_store {
                 group = group.with_store(Arc::clone(store));
             }
@@ -3177,7 +3178,8 @@ fn parse_proxy_group_inner(
                         .unwrap_or_else(|| "https://www.gstatic.com/generate_204".to_string()),
                     config.expected_status.clone().unwrap_or_default(),
                     selector_store.cloned(),
-                );
+                )
+                .with_display(group_display(config));
             Ok(Arc::new(group))
         }
         "fallback" => {
@@ -3189,7 +3191,8 @@ fn parse_proxy_group_inner(
                         .unwrap_or_else(|| "https://www.gstatic.com/generate_204".to_string()),
                     config.expected_status.clone().unwrap_or_default(),
                     selector_store.cloned(),
-                );
+                )
+                .with_display(group_display(config));
             Ok(Arc::new(group))
         }
         "load-balance" => {
@@ -3202,7 +3205,8 @@ fn parse_proxy_group_inner(
                             .clone()
                             .unwrap_or_else(|| "https://www.gstatic.com/generate_204".to_string()),
                     )
-                    .with_expected_status(config.expected_status.clone().unwrap_or_default()),
+                    .with_expected_status(config.expected_status.clone().unwrap_or_default())
+                    .with_display(group_display(config)),
             ))
         }
         "relay" => {
@@ -3354,7 +3358,17 @@ fn parse_relay_group(
     warn_inert_health_fields("relay", name, config);
     warn_dropped_provider_fields("relay", name, config);
 
-    Ok(Arc::new(RelayGroup::new(name, proxies)))
+    Ok(Arc::new(
+        RelayGroup::new(name, proxies).with_display(group_display(config)),
+    ))
+}
+
+/// A group's `hidden:` / `icon:` keys, defaulting to shown with no icon.
+fn group_display(config: &crate::raw::RawProxyGroup) -> GroupDisplay {
+    GroupDisplay {
+        hidden: config.hidden.unwrap_or(false),
+        icon: config.icon.as_deref().unwrap_or_default().into(),
+    }
 }
 
 #[cfg(test)]

@@ -62,6 +62,11 @@ named dial error at 16 hops instead.
 The cached file is the offline fallback: startup always fetches first and
 writes the cache; the file is read only when that fetch fails.
 
+A `subscription-userinfo` header on the response (plan traffic and expiry)
+is reported as the provider's `subscriptionInfo` in
+[`GET /providers/proxies`](../reference/rest-api#providers) and kept in
+`<path>.subscription-userinfo` next to the cache.
+
 ### `type: file`
 
 | Field | Type | Default | Notes |
