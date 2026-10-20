@@ -34,7 +34,7 @@ use std::task::{ready, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::time::Sleep;
-use tracing::{debug, warn};
+use tracing::{debug, warn, Instrument};
 
 /// Built-in (native, no external process) simple-obfs configuration.
 #[derive(Debug, Clone)]
@@ -464,7 +464,12 @@ impl SsCore {
                     BuiltinObfs::Http { host } => {
                         let wrapped = HttpObfs::new(tcp, host, self.port)
                             .map_err(|e| MeowError::Config(format!("ss obfs: {e}")))?;
-                        Ok(self.ss_conn(wrapped, addr))
+                        let mut stream = self.ss_conn(wrapped, addr);
+                        use tokio::io::AsyncWriteExt;
+                        // HTTP-obfs matches Mihomo: send encrypted destination before ClientHello.
+                        let _ = stream.write(&[]).await?;
+                        stream.flush().await?;
+                        Ok(stream)
                     }
                     BuiltinObfs::Tls { server } => {
                         let wrapped = TlsObfs::new(tcp, server)
@@ -1452,9 +1457,33 @@ impl ProxyAdapter for ShadowsocksAdapter {
             return Ok(Box::new(conn));
         }
 
-        self.core
-            .dial_tcp_stream(addr, metadata.is_internal())
-            .await
+        let internal = metadata.is_internal();
+        static FLOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let flow = FLOW.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let span = tracing::info_span!("paws_flow", connection = flow, source = %metadata.source_address(), target = %addr);
+        let conn = self
+            .core
+            .dial_tcp_stream(addr.clone(), internal)
+            .instrument(span.clone())
+            .await?;
+        if matches!(self.core.plugin, PluginKind::Obfs(BuiltinObfs::Http { .. })) {
+            let core = Arc::clone(&self.core);
+            let redial: crate::first_flight::Redial = Arc::new(move || {
+                let core = Arc::clone(&core);
+                let addr = addr.clone();
+                let span = span.clone();
+                Box::pin(async move {
+                    core.dial_tcp_stream(addr, internal)
+                        .instrument(span)
+                        .await
+                        .map_err(|e| std::io::Error::other(e.to_string()))
+                })
+            });
+            return Ok(Box::new(crate::first_flight::FirstFlight::new(
+                conn, redial, flow,
+            )));
+        }
+        Ok(conn)
     }
 
     /// Run the SS handshake over an existing stream (relay chain).

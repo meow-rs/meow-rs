@@ -142,6 +142,11 @@ fn wants_bulk_upgrade(amt: u64, buf_len: usize) -> bool {
     amt >= RELAY_BULK_UPGRADE_BYTES && buf_len < RELAY_BULK_BUF_SIZE
 }
 
+// Keep the error kind unchanged so diagnostics never alter relay behavior.
+fn relay_operation_error(operation: &str, error: &io::Error) -> io::Error {
+    io::Error::new(error.kind(), format!("{operation}: {error}"))
+}
+
 struct HalfCopy<'buf> {
     buf: Scratch<'buf>,
     read_done: bool,
@@ -201,14 +206,14 @@ impl<'buf> HalfCopy<'buf> {
                         self.cap = filled;
                     }
                 }
-                Poll::Ready(Err(e)) => return Err(e),
+                Poll::Ready(Err(e)) => return Err(relay_operation_error("read", &e)),
                 Poll::Pending => {
                     // Nothing buffered and the reader is idle: push written
                     // bytes to the peer before parking this direction.
                     if self.need_flush {
                         match writer.as_mut().poll_flush(cx) {
                             Poll::Ready(Ok(())) => self.need_flush = false,
-                            Poll::Ready(Err(e)) => return Err(e),
+                            Poll::Ready(Err(e)) => return Err(relay_operation_error("flush", &e)),
                             Poll::Pending => return Ok(Cycle::Pending),
                         }
                     }
@@ -233,7 +238,7 @@ impl<'buf> HalfCopy<'buf> {
                     on_progress(n as u64);
                     self.need_flush = true;
                 }
-                Poll::Ready(Err(e)) => return Err(e),
+                Poll::Ready(Err(e)) => return Err(relay_operation_error("write", &e)),
                 // Blocked on the writer — retrying this direction cannot help
                 // until its waker fires, even though bytes may have moved.
                 Poll::Pending => return Ok(Cycle::Pending),
@@ -243,7 +248,7 @@ impl<'buf> HalfCopy<'buf> {
         if self.read_done {
             return match writer.as_mut().poll_shutdown(cx) {
                 Poll::Ready(Ok(())) => Ok(Cycle::Done),
-                Poll::Ready(Err(e)) => Err(e),
+                Poll::Ready(Err(e)) => Err(relay_operation_error("shutdown", &e)),
                 Poll::Pending => Ok(Cycle::Pending),
             };
         }
@@ -345,7 +350,9 @@ where
                         cycles += 1;
                     }
                     Ok(Cycle::Pending) => a_parked = true,
-                    Err(e) => return Poll::Ready(Err(e)),
+                    Err(e) => {
+                        return Poll::Ready(Err(relay_operation_error("client-to-proxy", &e)))
+                    }
                 }
             }
 
@@ -359,7 +366,9 @@ where
                         cycles += 1;
                     }
                     Ok(Cycle::Pending) => b_parked = true,
-                    Err(e) => return Poll::Ready(Err(e)),
+                    Err(e) => {
+                        return Poll::Ready(Err(relay_operation_error("proxy-to-client", &e)))
+                    }
                 }
             }
 

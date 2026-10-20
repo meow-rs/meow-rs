@@ -87,6 +87,12 @@ pub trait HostResolver: Send + Sync {
 
 static RESOLVER: RwLock<Option<Arc<dyn HostResolver>>> = RwLock::new(None);
 
+// Physical-network resolver for bootstrap and resolver re-entry on HarmonyOS.
+static BOOTSTRAP_RESOLVER: RwLock<Option<Arc<dyn HostResolver>>> = RwLock::new(None);
+pub fn set_bootstrap_host_resolver(resolver: Arc<dyn HostResolver>) {
+    *BOOTSTRAP_RESOLVER.write() = Some(resolver);
+}
+
 /// Install the global host resolver. Call once at startup, right after the
 /// meow-rs `Resolver` is built. Safe to re-install (e.g. config reload) — the
 /// new resolver takes effect on the next hostname dial.
@@ -186,12 +192,13 @@ fn sys_cache_evict(host: &str) {
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn sys_cache_evict(_host: &str) {}
 
-// In production we only compile the protector hook on Android — that's the
+// TinyPaws also enables the pre-connect protector on OpenHarmony.
+// In upstream production this hook was limited to Android — that's the
 // platform whose VPN model demands `VpnService.protect(fd)` and we don't want
 // non-Android binaries paying any footprint for it. For tests we additionally
 // enable the module on any unix host so CI (which does not target Android)
 // can actually exercise the protector path against real loopback sockets.
-#[cfg(any(target_os = "android", all(test, unix)))]
+#[cfg(any(target_os = "android", target_env = "ohos", all(test, unix)))]
 mod android {
     use super::*;
     use std::os::fd::{AsRawFd, RawFd};
@@ -286,7 +293,7 @@ mod android {
     }
 }
 
-#[cfg(any(target_os = "android", all(test, unix)))]
+#[cfg(any(target_os = "android", target_env = "ohos", all(test, unix)))]
 pub use android::{
     clear_socket_protector, set_socket_protector, socket_protector, SocketProtector,
 };
@@ -302,16 +309,24 @@ pub use android::{
 /// silent regressions back into the system resolver; see the module docs
 /// for the loop-routing failure mode.
 pub async fn connect_tcp(addr: SocketAddr) -> io::Result<TcpStream> {
-    #[cfg(any(target_os = "android", all(test, unix)))]
+    #[cfg(any(target_os = "android", target_env = "ohos", all(test, unix)))]
     {
         if let Some(p) = android::socket_protector() {
             return android::connect_tcp_protected(addr, p.as_ref()).await;
         }
     }
+    #[cfg(target_env = "ohos")]
+    return Err(io::Error::new(
+        io::ErrorKind::NotConnected,
+        "Harmony socket protector is not initialized",
+    ));
     // TUN global-route loop avoidance (#375): when an outbound interface is
     // installed, bind the socket to it before connect() so the SYN already
     // takes the physical route past the TUN default routes.
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    #[cfg(all(
+        not(target_env = "ohos"),
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    ))]
     {
         if crate::outbound_iface::binds_peer(addr.ip())
             && crate::outbound_iface::outbound_interface().is_some()
@@ -319,7 +334,10 @@ pub async fn connect_tcp(addr: SocketAddr) -> io::Result<TcpStream> {
             return connect_tcp_iface_bound(addr).await;
         }
     }
-    TcpStream::connect(addr).await
+    #[cfg(not(target_env = "ohos"))]
+    {
+        TcpStream::connect(addr).await
+    }
 }
 
 /// Dial with the socket bound to the installed outbound interface
@@ -392,7 +410,7 @@ async fn resolve_addrs(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
         return Ok(cached);
     }
 
-    #[cfg(any(target_os = "android", all(test, unix)))]
+    #[cfg(any(target_os = "android", target_env = "ohos", all(test, unix)))]
     {
         if android::socket_protector().is_some() {
             tracing::warn!(
@@ -403,15 +421,29 @@ async fn resolve_addrs(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
         }
     }
 
-    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port)).await?.collect();
-    if addrs.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("resolve: no address for {host}:{port}"),
-        ));
+    #[cfg(target_env = "ohos")]
+    {
+        let bootstrap = BOOTSTRAP_RESOLVER.read().clone().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "physical DNS resolver is not initialized",
+            )
+        })?;
+        return resolve_via_hook(bootstrap.as_ref(), host, port).await;
     }
-    sys_cache_put(host, &addrs);
-    Ok(addrs)
+    #[cfg(not(target_env = "ohos"))]
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port)).await?.collect();
+    #[cfg(not(target_env = "ohos"))]
+    {
+        if addrs.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("resolve: no address for {host}:{port}"),
+            ));
+        }
+        sys_cache_put(host, &addrs);
+        Ok(addrs)
+    }
 }
 
 /// Run one [`HostResolver`] lookup with [`IN_HOST_RESOLVER`] set, so a dial
@@ -492,7 +524,7 @@ pub async fn resolve_host_all(host: &str, port: u16) -> io::Result<Vec<SocketAdd
 /// `SocketProtector` (if any) to the socket fd before `bind()`. On every
 /// other target this is equivalent to [`UdpSocket::bind`].
 pub async fn bind_udp<A: ToSocketAddrs>(local: A) -> io::Result<UdpSocket> {
-    #[cfg(any(target_os = "android", all(test, unix)))]
+    #[cfg(any(target_os = "android", target_env = "ohos", all(test, unix)))]
     {
         if let Some(p) = android::socket_protector() {
             let resolved = tokio::net::lookup_host(local)
@@ -504,10 +536,18 @@ pub async fn bind_udp<A: ToSocketAddrs>(local: A) -> io::Result<UdpSocket> {
             return android::bind_udp_protected(resolved, p.as_ref());
         }
     }
+    #[cfg(target_env = "ohos")]
+    return Err(io::Error::new(
+        io::ErrorKind::NotConnected,
+        "Harmony socket protector is not initialized",
+    ));
     // TUN global-route loop avoidance (#375): bind the socket to the
     // installed outbound interface before the local-address bind, mirroring
     // `connect_tcp` — so the first datagram already bypasses the TUN routes.
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    #[cfg(all(
+        not(target_env = "ohos"),
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    ))]
     {
         if crate::outbound_iface::outbound_interface().is_some() {
             let resolved = tokio::net::lookup_host(local)
@@ -519,7 +559,10 @@ pub async fn bind_udp<A: ToSocketAddrs>(local: A) -> io::Result<UdpSocket> {
             return bind_udp_iface_bound(resolved);
         }
     }
-    UdpSocket::bind(local).await
+    #[cfg(not(target_env = "ohos"))]
+    {
+        UdpSocket::bind(local).await
+    }
 }
 
 /// Bind a UDP socket to the installed outbound interface

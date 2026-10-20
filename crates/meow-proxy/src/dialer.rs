@@ -245,6 +245,10 @@ impl TcpDialer for DirectDialer {
         // previously called `tcp.set_nodelay(true)` on the raw
         // `TcpStream` now rely on the dialer to do it once here.
         let _ = tcp.set_nodelay(true);
+        #[cfg(feature = "ss")]
+        if option_env!("PAWS_RAW_ENGINE_DIAGNOSTIC") == Some("1") {
+            return Ok(Box::new(crate::socket_trace::TracedSocket::new(tcp)));
+        }
         Ok(Box::new(tcp))
     }
 
@@ -253,6 +257,10 @@ impl TcpDialer for DirectDialer {
         // `SocketAddr` as-is and keeps the SocketProtector hook.
         let tcp = meow_common::connect_tcp(addr).await?;
         let _ = tcp.set_nodelay(true);
+        #[cfg(feature = "ss")]
+        if option_env!("PAWS_RAW_ENGINE_DIAGNOSTIC") == Some("1") {
+            return Ok(Box::new(crate::socket_trace::TracedSocket::new(tcp)));
+        }
         Ok(Box::new(tcp))
     }
 
