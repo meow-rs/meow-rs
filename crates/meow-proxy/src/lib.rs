@@ -9,12 +9,16 @@
 mod aead;
 pub mod dialer;
 pub mod direct;
+#[cfg(feature = "ss")]
+mod first_flight;
 pub mod group;
 pub mod health;
 pub mod http_adapter;
 #[cfg(feature = "mux")]
 pub mod mux;
 pub mod reject;
+#[cfg(feature = "ss")]
+mod socket_trace;
 pub mod socks5_adapter;
 pub mod stream_conn;
 #[cfg(any(feature = "vmess", feature = "vless-encryption"))]

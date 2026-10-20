@@ -20,6 +20,8 @@ pub(crate) fn monotonic_ms() -> u64 {
 }
 
 #[cfg(feature = "listener-http")]
+mod benchmark_probe;
+#[cfg(feature = "listener-http")]
 pub mod http_proxy;
 #[cfg(feature = "listener-mixed")]
 pub mod mixed;
