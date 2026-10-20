@@ -1,8 +1,8 @@
 use super::selector_store::SelectorStore;
 use async_trait::async_trait;
 use meow_common::{
-    AdapterType, DelayHistory, MeowError, Metadata, ProviderSlot, Proxy, ProxyAdapter, ProxyConn,
-    ProxyHealth, ProxyPacketConn, ProxySelection, Result,
+    AdapterType, DelayHistory, GroupDisplay, MeowError, Metadata, ProviderSlot, Proxy,
+    ProxyAdapter, ProxyConn, ProxyHealth, ProxyPacketConn, ProxySelection, Result,
 };
 use parking_lot::RwLock;
 use smol_str::SmolStr;
@@ -20,6 +20,7 @@ pub struct SelectorGroup {
     /// Optional write-through persistence; primed at construction.
     store: Option<Arc<SelectorStore>>,
     health: ProxyHealth,
+    display: GroupDisplay,
 }
 
 impl SelectorGroup {
@@ -31,6 +32,7 @@ impl SelectorGroup {
             selected: RwLock::new(None),
             store: None,
             health: ProxyHealth::new(),
+            display: GroupDisplay::default(),
         }
     }
 
@@ -46,6 +48,7 @@ impl SelectorGroup {
             selected: RwLock::new(None),
             store: None,
             health: ProxyHealth::new(),
+            display: GroupDisplay::default(),
         }
     }
 
@@ -58,6 +61,14 @@ impl SelectorGroup {
             *self.selected.write() = Some(SmolStr::from(prev));
         }
         self.store = Some(store);
+        self
+    }
+
+    /// Attach the group's `hidden:` / `icon:` keys, which `GET /proxies`
+    /// reports on the group.
+    #[must_use]
+    pub fn with_display(mut self, display: GroupDisplay) -> Self {
+        self.display = display;
         self
     }
 
@@ -244,6 +255,10 @@ impl Proxy for SelectorGroup {
 
     fn selection(&self) -> Option<&dyn ProxySelection> {
         Some(self)
+    }
+
+    fn group_display(&self) -> Option<&GroupDisplay> {
+        Some(&self.display)
     }
 }
 

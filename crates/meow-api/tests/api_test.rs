@@ -415,6 +415,324 @@ async fn get_proxy_found() {
     assert_eq!(json["name"], "DIRECT");
 }
 
+// ── provider-name and provider members on /proxies ──────────────────
+
+async fn get_json(state: &Arc<AppState>, path: &str) -> (StatusCode, serde_json::Value) {
+    let resp = create_router(Arc::clone(state))
+        .oneshot(Request::get(path).body(axum::body::Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, json)
+}
+
+/// Commit `config` through `PUT /configs` after writing each
+/// `(provider, payload)` to `<provider>.yaml` beside the backing config
+/// (`{dir}` in `config` expands to that directory), then wait for every
+/// provider's detached first load to publish its nodes.
+async fn state_with_file_providers(config: &str, providers: &[(&str, &str)]) -> Arc<AppState> {
+    use base64::Engine as _;
+    let state = test_state(test_raw_config());
+    let dir = std::path::Path::new(state.config_path.as_deref().unwrap())
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    for (name, payload) in providers {
+        std::fs::write(dir.join(format!("{name}.yaml")), payload).unwrap();
+    }
+    let document = config.replace("{dir}", &dir.display().to_string());
+    let response = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "payload": base64::engine::general_purpose::STANDARD.encode(&document)
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    for (name, payload) in providers {
+        let expected = payload.matches("name:").count();
+        let provider = Arc::clone(state.proxy_providers.get(*name).unwrap().value());
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while provider.proxies().len() < expected {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("provider {name} must publish its nodes"));
+    }
+    state
+}
+
+/// A provider file of SOCKS5 nodes named `names`, all pointing at `server`.
+/// (`type: direct` would not do: a direct node always calls itself `DIRECT`.)
+fn socks5_nodes(names: &[&str], server: std::net::SocketAddr) -> String {
+    use std::fmt::Write as _;
+    let mut yaml = String::from("proxies:\n");
+    for name in names {
+        writeln!(
+            yaml,
+            "  - {{name: {name}, type: socks5, server: {}, port: {}}}",
+            server.ip(),
+            server.port()
+        )
+        .unwrap();
+    }
+    yaml
+}
+
+/// A no-auth SOCKS5 server relaying every CONNECT, so a node pointing at it
+/// passes a real delay probe.
+async fn spawn_socks5_relay() -> std::net::SocketAddr {
+    async fn relay(mut client: tokio::net::TcpStream) -> std::io::Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut greeting = [0u8; 2];
+        client.read_exact(&mut greeting).await?;
+        let mut methods = vec![0u8; usize::from(greeting[1])];
+        client.read_exact(&mut methods).await?;
+        client.write_all(&[5, 0]).await?;
+        let mut request = [0u8; 4];
+        client.read_exact(&mut request).await?;
+        let host = match request[3] {
+            1 => {
+                let mut ip = [0u8; 4];
+                client.read_exact(&mut ip).await?;
+                Ipv4Addr::from(ip).to_string()
+            }
+            3 => {
+                let mut domain = vec![0u8; usize::from(client.read_u8().await?)];
+                client.read_exact(&mut domain).await?;
+                String::from_utf8_lossy(&domain).into_owned()
+            }
+            _ => return Ok(()),
+        };
+        let port = client.read_u16().await?;
+        let mut upstream = tokio::net::TcpStream::connect((host.as_str(), port)).await?;
+        client.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
+        tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
+        Ok(())
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((client, _)) = listener.accept().await {
+            tokio::spawn(relay(client));
+        }
+    });
+    addr
+}
+
+/// Nodes the tests never dial point here; nothing listens on port 1.
+const UNUSED_SERVER: std::net::SocketAddr =
+    std::net::SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
+
+const AIRPORT_CONFIG: &str = "mode: rule
+proxies:
+  - {name: home, type: socks5, server: 127.0.0.1, port: 1}
+proxy-providers:
+  airport:
+    type: file
+    path: {dir}/airport.yaml
+proxy-groups:
+  - {name: PROXY, type: select, proxies: [home], use: [airport]}
+rules: ['MATCH,PROXY']
+";
+
+/// mihomo sets `provider-name` on every proxy it serializes: the provider's
+/// name on a node a proxy-provider supplied, `""` on everything else. Clash
+/// Party reads it to pick the delay route; without it every provider node
+/// went to `/proxies/{name}/delay` and showed as timed out.
+#[tokio::test]
+async fn provider_members_carry_provider_name() {
+    let nodes = socks5_nodes(&["hk-01", "jp-01"], UNUSED_SERVER);
+    let state = state_with_file_providers(AIRPORT_CONFIG, &[("airport", nodes.as_str())]).await;
+
+    let (status, all) = get_json(&state, "/providers/proxies").await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, one) = get_json(&state, "/providers/proxies/airport").await;
+    assert_eq!(status, StatusCode::OK);
+    for listing in [&all["providers"]["airport"], &one] {
+        let nodes = listing["proxies"].as_array().unwrap();
+        assert_eq!(nodes.len(), 2, "{listing}");
+        for node in nodes {
+            assert_eq!(node["provider-name"], "airport", "{node}");
+        }
+    }
+    let (status, node) = get_json(&state, "/providers/proxies/airport/hk-01").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(node["provider-name"], "airport");
+
+    // `/proxies` keeps mihomo's shape: route-table entries only, each with
+    // an empty `provider-name`; provider nodes are listed by their provider.
+    let (status, json) = get_json(&state, "/proxies").await;
+    assert_eq!(status, StatusCode::OK);
+    let proxies = json["proxies"].as_object().unwrap();
+    for name in ["home", "PROXY", "GLOBAL", "DIRECT"] {
+        assert_eq!(proxies[name]["provider-name"], "", "{name}");
+    }
+    assert!(!proxies.contains_key("hk-01"), "{json}");
+    assert_eq!(
+        proxies["PROXY"]["all"],
+        serde_json::json!(["home", "hk-01", "jp-01"])
+    );
+
+    // A provider node resolves on `/proxies/{name}` too, naming its provider.
+    let (status, node) = get_json(&state, "/proxies/hk-01").await;
+    assert_eq!(status, StatusCode::OK, "{node}");
+    assert_eq!(node["name"], "hk-01");
+    assert_eq!(node["provider-name"], "airport");
+    let (_, home) = get_json(&state, "/proxies/home").await;
+    assert_eq!(home["provider-name"], "");
+}
+
+/// `GET /proxies/{name}/delay` used to 404 for a provider node, so a client
+/// probing each member of a `use:` group there saw every provider node as
+/// down. It now probes the provider's own adapter, the same one
+/// `/providers/proxies/{provider}/{name}/healthcheck` probes.
+#[tokio::test]
+async fn provider_member_delay_resolves_through_proxies_route() {
+    let nodes = socks5_nodes(&["hk-01"], spawn_socks5_relay().await);
+    let state = state_with_file_providers(AIRPORT_CONFIG, &[("airport", nodes.as_str())]).await;
+    let origin = spawn_sub_origin("").await;
+    let url = format!("http://{origin}/generate_204");
+
+    let (status, body) = get_json(
+        &state,
+        &format!("/proxies/hk-01/delay?url={url}&timeout=5000"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["delay"].as_u64().unwrap() >= 1, "{body}");
+    let provider = Arc::clone(state.proxy_providers.get("airport").unwrap().value());
+    let node = provider
+        .proxies()
+        .into_iter()
+        .find(|proxy| proxy.name() == "hk-01")
+        .unwrap();
+    assert_eq!(
+        node.delay_history().len(),
+        1,
+        "the probe records on the provider's node"
+    );
+
+    // The route Clash Party takes once `provider-name` is set.
+    let (status, body) = get_json(
+        &state,
+        &format!("/providers/proxies/airport/hk-01/healthcheck?url={url}&timeout=5000"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(node.delay_history().len(), 2);
+
+    let (status, body) = get_json(
+        &state,
+        &format!("/proxies/nowhere/delay?url={url}&timeout=5000"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["message"], "resource not found");
+}
+
+/// Names the route table and the providers share resolve the way groups
+/// already treat them: the route-table entry wins, then providers in name
+/// order (the order `include-all` lists them in).
+#[tokio::test]
+async fn proxies_route_prefers_route_table_then_provider_name_order() {
+    let beta = socks5_nodes(&["twin", "shared"], UNUSED_SERVER);
+    let alpha = socks5_nodes(&["shared"], UNUSED_SERVER);
+    let state = state_with_file_providers(
+        "mode: rule
+proxies:
+  - {name: twin, type: socks5, server: 127.0.0.1, port: 1}
+proxy-providers:
+  beta:
+    type: file
+    path: {dir}/beta.yaml
+  alpha:
+    type: file
+    path: {dir}/alpha.yaml
+proxy-groups:
+  - {name: PROXY, type: select, proxies: [twin], use: [beta, alpha]}
+rules: ['MATCH,PROXY']
+",
+        &[("beta", beta.as_str()), ("alpha", alpha.as_str())],
+    )
+    .await;
+
+    let (status, twin) = get_json(&state, "/proxies/twin").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(twin["provider-name"], "", "the inline proxy wins");
+    let (status, shared) = get_json(&state, "/proxies/shared").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(shared["provider-name"], "alpha", "first provider by name");
+    let (status, beta) = get_json(&state, "/providers/proxies/beta/shared").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(beta["provider-name"], "beta");
+}
+
+/// mihomo reports `hidden` and `icon` on every group (`false` / `""` when
+/// unset) and on no leaf proxy. Clash Party leaves hidden groups out of its
+/// list and draws the icon on the group's header.
+#[tokio::test]
+async fn groups_report_hidden_and_icon() {
+    let raw: RawConfig = serde_yaml::from_str(
+        r#"
+mode: rule
+proxies:
+  - {name: n1, type: direct}
+  - {name: n2, type: direct}
+proxy-groups:
+  - {name: Hidden, type: select, proxies: [n1], hidden: true, icon: "https://example.com/hk.png"}
+  - {name: Auto, type: url-test, proxies: [n1, n2]}
+  - {name: Backup, type: fallback, proxies: [n1, n2], hidden: true}
+  - {name: Spread, type: load-balance, proxies: [n1, n2], icon: "<svg/>"}
+rules: ['MATCH,DIRECT']
+"#,
+    )
+    .unwrap();
+    let state = test_state(raw);
+
+    let (status, json) = get_json(&state, "/proxies").await;
+    assert_eq!(status, StatusCode::OK);
+    let proxies = &json["proxies"];
+    for (name, hidden, icon) in [
+        ("Hidden", true, "https://example.com/hk.png"),
+        ("Auto", false, ""),
+        ("Backup", true, ""),
+        ("Spread", false, "<svg/>"),
+        ("GLOBAL", false, ""),
+    ] {
+        assert_eq!(proxies[name]["hidden"], hidden, "{name}");
+        assert_eq!(proxies[name]["icon"], icon, "{name}");
+        assert_eq!(proxies[name]["provider-name"], "", "{name}");
+    }
+    for leaf in ["n1", "DIRECT"] {
+        let entry = proxies[leaf].as_object().unwrap();
+        assert!(
+            !entry.contains_key("hidden") && !entry.contains_key("icon"),
+            "{leaf}: {entry:?}"
+        );
+    }
+
+    for path in ["/proxies/Hidden", "/group/Hidden"] {
+        let (status, group) = get_json(&state, path).await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert_eq!(group["hidden"], true, "{path}");
+        assert_eq!(group["icon"], "https://example.com/hk.png", "{path}");
+    }
+}
+
 #[tokio::test]
 async fn get_configs_returns_mode() {
     let state = test_state_default();
@@ -6394,4 +6712,275 @@ async fn logbook_lists_filters_and_clears_entries() {
 
     logbook::uninstall();
     assert_eq!(body_json(get("/logbook").await).await["enabled"], false);
+}
+
+// ── Proxy-provider subscriptionInfo ──────────────────────────────
+
+/// What [`UserinfoOrigin`] answers every request with.
+#[derive(Clone, Copy)]
+struct OriginReply {
+    status: u16,
+    /// The `subscription-userinfo` header value, sent when `Some`.
+    userinfo: Option<&'static str>,
+    body: &'static str,
+}
+
+const USERINFO_PAYLOAD: &str = "proxies:\n  - {name: n1, type: direct}\n";
+
+/// A proxy-provider origin the test steers: counts requests and answers
+/// each with the current [`OriginReply`].
+struct UserinfoOrigin {
+    url: String,
+    reply: Arc<parking_lot::Mutex<OriginReply>>,
+    hits: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl UserinfoOrigin {
+    async fn spawn(reply: OriginReply) -> Self {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/sub.yaml", listener.local_addr().unwrap());
+        let reply = Arc::new(parking_lot::Mutex::new(reply));
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (task_reply, task_hits) = (Arc::clone(&reply), Arc::clone(&hits));
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                task_hits.fetch_add(1, Ordering::SeqCst);
+                let reply = *task_reply.lock();
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => head.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    // Mixed case on purpose: the header name is
+                    // case-insensitive.
+                    let userinfo = reply
+                        .userinfo
+                        .map(|value| format!("Subscription-Userinfo: {value}\r\n"))
+                        .unwrap_or_default();
+                    let response = format!(
+                        "HTTP/1.1 {} X\r\nContent-Length: {}\r\nConnection: close\r\n{userinfo}\r\n{}",
+                        reply.status,
+                        reply.body.len(),
+                        reply.body
+                    );
+                    let _ = sock.write_all(response.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        Self { url, reply, hits }
+    }
+
+    fn set(&self, reply: OriginReply) {
+        *self.reply.lock() = reply;
+    }
+
+    fn hits(&self) -> usize {
+        self.hits.load(Ordering::SeqCst)
+    }
+}
+
+/// Load `providers` (name → YAML declaration) the way startup does, with
+/// `dir` as the provider cache directory, and serve them from a fresh
+/// [`AppState`].
+async fn state_with_providers(
+    providers: &[(&str, String)],
+    dir: &std::path::Path,
+) -> Arc<AppState> {
+    let raw: HashMap<String, meow_config::raw::RawProxyProvider> = providers
+        .iter()
+        .map(|(name, yaml)| ((*name).to_string(), serde_yaml::from_str(yaml).unwrap()))
+        .collect();
+    let loaded = meow_config::proxy_provider::load_proxy_providers_within(
+        &raw,
+        Some(dir),
+        false,
+        false,
+        &Default::default(),
+        None,
+        &mut meow_config::DroppedProviders::default(),
+    )
+    .await
+    .unwrap();
+    let state = test_state_default();
+    for (name, provider) in loaded {
+        state.proxy_providers.insert(name, provider);
+    }
+    state
+}
+
+async fn api_call(state: &Arc<AppState>, method: &str, uri: &str) -> axum::response::Response {
+    create_router(Arc::clone(state))
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+/// `subscriptionInfo` of provider `name` as `GET /providers/proxies` lists
+/// it, checked against `GET /providers/proxies/{name}`; `None` when absent.
+async fn listed_subscription_info(state: &Arc<AppState>, name: &str) -> Option<serde_json::Value> {
+    let list = body_json(api_call(state, "GET", "/providers/proxies").await).await;
+    let one = api_call(state, "GET", &format!("/providers/proxies/{name}")).await;
+    assert_eq!(one.status(), StatusCode::OK);
+    let one = body_json(one).await;
+    assert_eq!(list["providers"][name], one, "list and detail agree");
+    assert_eq!(
+        one["proxies"].as_array().map(Vec::len),
+        Some(1),
+        "the payload loaded: {one}"
+    );
+    one.as_object().unwrap().get("subscriptionInfo").cloned()
+}
+
+/// An HTTP provider whose response carries `subscription-userinfo` reports
+/// it as mihomo's `subscriptionInfo`; one without the header, and a `file`
+/// provider, leave the field out.
+#[tokio::test]
+async fn proxy_providers_report_subscription_userinfo() {
+    let with = UserinfoOrigin::spawn(OriginReply {
+        status: 200,
+        userinfo: Some("upload=1234; download=5678; total=1073741824; expire=1700000000"),
+        body: USERINFO_PAYLOAD,
+    })
+    .await;
+    let without = UserinfoOrigin::spawn(OriginReply {
+        status: 200,
+        userinfo: None,
+        body: USERINFO_PAYLOAD,
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("local.yaml"), USERINFO_PAYLOAD).unwrap();
+    let state = state_with_providers(
+        &[
+            ("usage", format!("type: http\nurl: {}\n", with.url)),
+            ("plain", format!("type: http\nurl: {}\n", without.url)),
+            ("local", "type: file\npath: local.yaml\n".to_string()),
+        ],
+        dir.path(),
+    )
+    .await;
+
+    assert_eq!(
+        listed_subscription_info(&state, "usage").await,
+        Some(serde_json::json!({
+            "Upload": 1234,
+            "Download": 5678,
+            "Total": 1_073_741_824_u64,
+            "Expire": 1_700_000_000_u64,
+        }))
+    );
+    assert_eq!(listed_subscription_info(&state, "plain").await, None);
+    assert_eq!(listed_subscription_info(&state, "local").await, None);
+}
+
+/// The usage is persisted next to the provider cache, so a restart that
+/// serves the cache without touching the network reports it at once; each
+/// later fetch the provider accepts replaces it, even when the payload is
+/// unchanged, a failed fetch keeps it, and a fetch without the header
+/// clears it.
+#[tokio::test]
+async fn proxy_provider_subscription_info_survives_restart_and_follows_fetches() {
+    let origin = UserinfoOrigin::spawn(OriginReply {
+        status: 200,
+        userinfo: Some("upload=1; download=2; total=1000"),
+        body: USERINFO_PAYLOAD,
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let decl = [("usage", format!("type: http\nurl: {}\n", origin.url))];
+    let sidecar = dir.path().join("provider_usage.yaml.subscription-userinfo");
+    let first = serde_json::json!({"Upload": 1, "Download": 2, "Total": 1000, "Expire": 0});
+
+    let state = state_with_providers(&decl, dir.path()).await;
+    assert_eq!(
+        listed_subscription_info(&state, "usage").await,
+        Some(first.clone())
+    );
+    assert!(sidecar.exists(), "persisted next to the cache");
+    drop(state);
+
+    // Restart with the feed down: the cache and its usage are served
+    // before (and without) any request.
+    origin.set(OriginReply {
+        status: 503,
+        userinfo: None,
+        body: "",
+    });
+    let hits = origin.hits();
+    let state = state_with_providers(&decl, dir.path()).await;
+    assert_eq!(
+        origin.hits(),
+        hits,
+        "a cached provider starts without a fetch"
+    );
+    assert_eq!(
+        listed_subscription_info(&state, "usage").await,
+        Some(first.clone())
+    );
+
+    // The usage moved; the payload did not.
+    origin.set(OriginReply {
+        status: 200,
+        userinfo: Some("upload=10; download=20; total=1000; expire=1800000000"),
+        body: USERINFO_PAYLOAD,
+    });
+    let refreshed = api_call(&state, "PUT", "/providers/proxies/usage").await;
+    assert_eq!(refreshed.status(), StatusCode::NO_CONTENT);
+    let second = serde_json::json!({"Upload": 10, "Download": 20, "Total": 1000, "Expire": 1_800_000_000_u64});
+    assert_eq!(
+        listed_subscription_info(&state, "usage").await,
+        Some(second.clone())
+    );
+
+    origin.set(OriginReply {
+        status: 503,
+        userinfo: Some("upload=99; download=99; total=99"),
+        body: "",
+    });
+    let failed = api_call(&state, "PUT", "/providers/proxies/usage").await;
+    assert_eq!(failed.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        listed_subscription_info(&state, "usage").await,
+        Some(second.clone()),
+        "a failed fetch keeps the last accepted usage"
+    );
+
+    // A restart now reports the refetched usage, not the first one.
+    drop(state);
+    let state = state_with_providers(&decl, dir.path()).await;
+    assert_eq!(
+        listed_subscription_info(&state, "usage").await,
+        Some(second)
+    );
+
+    origin.set(OriginReply {
+        status: 200,
+        userinfo: None,
+        body: USERINFO_PAYLOAD,
+    });
+    let cleared = api_call(&state, "PUT", "/providers/proxies/usage").await;
+    assert_eq!(cleared.status(), StatusCode::NO_CONTENT);
+    assert_eq!(listed_subscription_info(&state, "usage").await, None);
+    assert!(!sidecar.exists(), "nothing left to restore");
+    drop(state);
+
+    origin.set(OriginReply {
+        status: 503,
+        userinfo: None,
+        body: "",
+    });
+    let state = state_with_providers(&decl, dir.path()).await;
+    assert_eq!(listed_subscription_info(&state, "usage").await, None);
 }

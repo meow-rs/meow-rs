@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use meow_common::{
-    AdapterType, ChainHealth, ChainTarget, DelayHistory, MeowError, Metadata, ProviderSlot, Proxy,
-    ProxyAdapter, ProxyConn, ProxyHealth, ProxyPacketConn, Result,
+    AdapterType, ChainHealth, ChainTarget, DelayHistory, GroupDisplay, MeowError, Metadata,
+    ProviderSlot, Proxy, ProxyAdapter, ProxyConn, ProxyHealth, ProxyPacketConn, Result,
 };
 use smol_str::SmolStr;
 use std::net::IpAddr;
@@ -35,6 +35,7 @@ pub struct LoadBalanceGroup {
     test_url: String,
     expected_status: String,
     health: ProxyHealth,
+    display: GroupDisplay,
     usage: UsageTracker,
     /// mihomo `GroupBase.onDialFailed` escalation: repeated member dial
     /// failures mark the member dead between sweeps — an additional
@@ -64,6 +65,7 @@ impl LoadBalanceGroup {
             test_url: "https://www.gstatic.com/generate_204".to_string(),
             expected_status: String::new(),
             health: ProxyHealth::new(),
+            display: GroupDisplay::default(),
             usage: UsageTracker::new(),
             dial_failures: DialFailureTracker::new(),
             chain_health: Arc::default(),
@@ -142,6 +144,14 @@ impl LoadBalanceGroup {
     #[must_use]
     pub fn with_expected_status(mut self, expected_status: String) -> Self {
         self.expected_status = expected_status;
+        self
+    }
+
+    /// Attach the group's `hidden:` / `icon:` keys, which `GET /proxies`
+    /// reports on the group.
+    #[must_use]
+    pub fn with_display(mut self, display: GroupDisplay) -> Self {
+        self.display = display;
         self
     }
 
@@ -456,6 +466,10 @@ impl Proxy for LoadBalanceGroup {
         Some(&self.expected_status)
     }
 
+    fn group_display(&self) -> Option<&GroupDisplay> {
+        Some(&self.display)
+    }
+
     fn usage_generation(&self) -> u64 {
         self.usage.generation()
     }
@@ -686,6 +700,7 @@ mod tests {
             test_url: "https://www.gstatic.com/generate_204".to_string(),
             expected_status: String::new(),
             health: ProxyHealth::new(),
+            display: GroupDisplay::default(),
             usage: super::UsageTracker::new(),
             dial_failures: DialFailureTracker::new(),
             chain_health: Arc::default(),

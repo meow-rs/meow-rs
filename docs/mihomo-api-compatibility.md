@@ -17,7 +17,7 @@ Status meanings:
 |---|---|---|
 | `GET /` | Partial | Keeps the meow-rs identity response `{"hello":"meow"}` by project decision. |
 | `GET /version` | Compatible | Returns the meow-rs version with `meta: true`. |
-| `GET /proxies[/{name}]` | Compatible | Includes group `all`, `now`, `fixed`, test URL, health, history, and UDP fields. |
+| `GET /proxies[/{name}]` | Compatible | Includes group `all`, `now`, `fixed`, test URL, health, history, and UDP fields. Every proxy carries `provider-name` (`""` outside a provider); every group carries `hidden` and `icon`. The listing holds route-table entries only, as in mihomo; provider nodes are listed under `/providers/proxies`. |
 | `PUT /proxies/{name}` | Compatible | Supports Selector, URLTest, and Fallback groups. |
 | `DELETE /proxies/{name}` | Compatible | Unfixes URLTest/Fallback; Selector and leaf adapters return 400. |
 | `GET /proxies/{name}/delay` | Compatible | Implements mihomo delay/error semantics. |
@@ -30,9 +30,9 @@ Status meanings:
 | `GET /memory` | Compatible | HTTP/WebSocket; each client starts with the mihomo-compatible zero frame. |
 | `GET /dns/query` | Compatible | Supports address and generic RR types with the mihomo DNS JSON shape. |
 | `GET /rules` | Partial | `index`, `type`, `payload`, `proxy`, and `size` are present; rule-wrapper hit/miss data is unavailable. |
-| `GET/PUT /providers/proxies[/{name}]` | Compatible | Refresh failures return 503. |
+| `GET/PUT /providers/proxies[/{name}]` | Compatible | Refresh failures return 503. HTTP providers report `subscriptionInfo` from the `subscription-userinfo` response header. |
 | `GET /providers/proxies/{name}/healthcheck` | Compatible | Uses provider health-check configuration and returns 204. |
-| `GET /providers/proxies/{provider}/{proxy}[/healthcheck]` | Compatible | Provider member detail and delay probe. |
+| `GET /providers/proxies/{provider}/{proxy}[/healthcheck]` | Compatible | Provider member detail and delay probe; members carry `provider-name`. |
 | `GET/PUT /providers/rules[/{name}]` | Compatible | Includes format, vehicle type, rule count, and RFC 3339 update time. |
 | `GET/PATCH /configs` | Partial | Mode, log level and `tun` are mutable. A `tun` patch is merged over the current section and the TUN listener is started, stopped or restarted from the result, matching mihomo, with two differences: an omitted `enable` keeps the current state instead of turning TUN off, and a TUN that fails to start answers 500 instead of 204. Only the `tun` keys meow implements apply; the rest are ignored. `GET` reports `tun` with `enable` as the running state. Ports, `allow-lan`, `bind-address`, `ipv6`, `sniffing`, `tcp-concurrent`, `find-process-mode`, `interface-name`, TUIC and the other dynamic listeners are unavailable. |
 | `PUT /configs` | Partial | Reloads proxies/rules/mode while retaining providers and selection persistence; the DNS runtime is republished on input changes and the TUN listener restarts on `tun:` diffs, but ordinary listener hot replacement is unavailable. |
@@ -59,14 +59,18 @@ provide and are not represented by fake-success stubs:
 | Configurable DoH controller route | No external-controller DoH mount. |
 | `/debug/*` | No Go pprof equivalent. |
 
-Provider `subscriptionInfo`, UDP connection entries, and rule hit/miss
-counters are also intentionally omitted until their underlying state exists.
+UDP connection entries and rule hit/miss counters are also intentionally
+omitted until their underlying state exists.
 
 ## Meow-rs extensions
 
 The following routes are retained and do not collide with the mihomo surface:
 
 - `GET /metrics`
+- `GET /proxies/{name}` and `GET /proxies/{name}/delay` also resolve a
+  proxy-provider node by name, where mihomo returns 404. A route-table entry
+  wins over a provider node of the same name; between providers, the first
+  by provider name wins. The provider route reaches any one of them
 - `/api/subscriptions/*`
 - `/api/proxy-groups/*`
 - `/api/config/save`

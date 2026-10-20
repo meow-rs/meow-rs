@@ -1,6 +1,7 @@
 use crate::dropped_providers::DroppedProviders;
 use crate::proxy_parser;
 use crate::raw::{RawHealthCheck, RawProxyProvider};
+use crate::subscription_userinfo::{self, SubscriptionUserinfo};
 use dashmap::DashMap;
 use meow_common::atomic::AtomicU;
 use meow_common::logbook::{self, Level};
@@ -31,6 +32,10 @@ pub(crate) const BACKGROUND_RETRY_MAX: Duration = Duration::from_millis(80);
 /// production backoff — long enough to outlast a mobile VPN that has no
 /// network until its tunnel is up.
 pub(crate) const MAX_REVALIDATION_ATTEMPTS: u32 = 5;
+/// Appended to an HTTP provider's cache path to name the file that keeps
+/// the plan usage its server reported (see
+/// [`ProxyProvider::subscription_userinfo`]).
+const USERINFO_SUFFIX: &str = ".subscription-userinfo";
 
 pub struct HealthCheckConfig {
     pub url: String,
@@ -130,6 +135,12 @@ pub struct ProxyProvider {
     /// `strict`-flip still re-parses the same payload under the new
     /// strictness (issue #625 review).
     content_hash: Mutex<Option<(u64, bool)>>,
+    /// Plan usage reported with the payload this provider serves: the
+    /// `subscription-userinfo` header of the last fetch it accepted (`None`
+    /// when that fetch carried none), or, for a payload loaded from the
+    /// on-disk cache, the usage persisted next to it. Kept from the last
+    /// accepted fetch across failed ones, like the payload itself.
+    subscription_userinfo: Mutex<Option<SubscriptionUserinfo>>,
 }
 
 /// Weak counterpart of [`ProviderSlot`].
@@ -425,6 +436,7 @@ impl ProxyProvider {
             derived: RwLock::new(Vec::new()),
             def: Self::def_identity(raw),
             content_hash: Mutex::new(None), // see field docs
+            subscription_userinfo: Mutex::new(None),
         })
     }
 
@@ -507,15 +519,21 @@ impl ProxyProvider {
     /// for content that *parses* ([`Self::ingest`]), matching upstream's
     /// `loadBuf` order (`vehicle.Write` runs after `parser` succeeds), so
     /// a 200-OK garbage body can't durably poison the fallback cache.
-    async fn fetch_source(&self) -> Result<String, String> {
+    ///
+    /// An HTTP fetch also returns the plan usage the response reported in
+    /// its `subscription-userinfo` header.
+    async fn fetch_source(&self) -> Result<(String, Option<SubscriptionUserinfo>), String> {
         let registry = &self.dialer_registry;
         match &self.vehicle {
-            Vehicle::File(path) => tokio::fs::read_to_string(path).await.map_err(|e| {
-                format!(
-                    "proxy-provider '{}': failed to read {:?}: {}",
-                    self.name, path, e
-                )
-            }),
+            Vehicle::File(path) => tokio::fs::read_to_string(path)
+                .await
+                .map(|text| (text, None))
+                .map_err(|e| {
+                    format!(
+                        "proxy-provider '{}': failed to read {:?}: {}",
+                        self.name, path, e
+                    )
+                }),
             Vehicle::Http { url, .. } => {
                 let download_proxy = match crate::internal_http::resolve_download_proxy(
                     registry,
@@ -536,27 +554,33 @@ impl ProxyProvider {
                         return Err(format!("proxy-provider '{}': {e:#}", self.name));
                     }
                 };
-                crate::internal_http::fetch(url, download_proxy.as_ref(), &self.header)
-                    .await
-                    .and_then(|bytes| {
-                        String::from_utf8(bytes)
-                            .map_err(|e| anyhow::anyhow!("response body is not UTF-8: {e}"))
-                    })
-                    .map_err(|e| e.to_string())
+                let response = crate::internal_http::fetch_response(
+                    url,
+                    download_proxy.as_ref(),
+                    &self.header,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+                let userinfo = response
+                    .header(subscription_userinfo::HEADER)
+                    .and_then(SubscriptionUserinfo::parse);
+                let text = String::from_utf8(response.body)
+                    .map_err(|e| format!("response body is not UTF-8: {e}"))?;
+                Ok((text, userinfo))
             }
         }
     }
 
     /// Initial-load acquisition: [`Self::fetch_source`] with an on-disk
     /// cache fallback for HTTP providers — the offline bootstrap path.
-    /// The returned flag is `false` when the payload came from the cache
+    /// The returned [`Source`] says whether the payload came from the cache
     /// (no point rewriting it). Deliberately NOT used by refresh ticks:
     /// a failed refresh keeps the in-memory last-good set (upstream
     /// `Update` semantics) instead of rewinding the slot to whatever
     /// generation the disk happens to hold.
-    async fn fetch_content(&self) -> Result<(String, bool), String> {
+    async fn fetch_content(&self) -> Result<(String, Source), String> {
         let e = match self.fetch_source().await {
-            Ok(text) => return Ok((text, true)),
+            Ok((text, userinfo)) => return Ok((text, Source::Fetched(userinfo))),
             Err(e) => e,
         };
         // Before the first route map is published a `proxy:` name cannot
@@ -569,69 +593,104 @@ impl ProxyProvider {
                 warn!(provider = %self.name, error = %e, "HTTP provider fetch failed, trying cache");
                 read_cache(cache_path.as_deref(), &self.name)
                     .await
-                    .map(|text| (text, false))
+                    .map(|text| (text, Source::Cache))
             }
             Vehicle::File(_) => Err(e),
         }
     }
 
-    /// Persist a parsed-and-committed HTTP payload for offline fallback —
-    /// atomic write-then-rename on a unique scratch: the manual-refresh
-    /// endpoint, an interval tick, and a detached initial fetch can race
-    /// this write unlaned, and a torn cache would poison the next
-    /// fallback read (issue #543 review).
+    /// Persist a parsed-and-committed HTTP payload for offline fallback,
+    /// atomically ([`write_atomic`]).
     async fn write_cache(&self, text: &str) {
+        if let Vehicle::Http {
+            cache_path: Some(cache_path),
+            ..
+        } = &self.vehicle
+        {
+            write_atomic(cache_path, text.as_bytes()).await;
+        }
+    }
+
+    /// The file next to the on-disk cache that keeps the plan usage, so a
+    /// restart serving the cache reports it before the first refetch.
+    /// `None` without an on-disk cache.
+    fn userinfo_path(&self) -> Option<PathBuf> {
         let Vehicle::Http {
             cache_path: Some(cache_path),
             ..
         } = &self.vehicle
         else {
+            return None;
+        };
+        let mut name = cache_path.as_os_str().to_os_string();
+        name.push(USERINFO_SUFFIX);
+        Some(PathBuf::from(name))
+    }
+
+    /// Take the plan usage an accepted fetch reported (`None`: it reported
+    /// none). `true` when that changed it.
+    fn set_userinfo(&self, userinfo: Option<SubscriptionUserinfo>) -> bool {
+        std::mem::replace(&mut *self.subscription_userinfo.lock(), userinfo) != userinfo
+    }
+
+    /// Keep the file next to the on-disk cache in step with `userinfo`,
+    /// removing it when there is none.
+    async fn persist_userinfo(&self, userinfo: Option<SubscriptionUserinfo>) {
+        let Some(path) = self.userinfo_path() else {
             return;
         };
-        if let Some(parent) = cache_path.parent() {
-            let _ = tokio::fs::create_dir_all(parent).await;
+        match userinfo {
+            Some(userinfo) => write_atomic(&path, userinfo.to_string().as_bytes()).await,
+            None => {
+                let _ = tokio::fs::remove_file(&path).await;
+            }
         }
-        // Sweep scratch siblings a crashed writer left behind
-        // (issue #621) — on the blocking pool so the dir walk never
-        // stalls the worker.
-        {
-            let sweep_target = cache_path.clone();
-            let _ = crate::spawn_blocking_with_current_dispatcher(move || {
-                meow_common::fs_util::sweep_scratch_siblings(
-                    &sweep_target,
-                    meow_common::fs_util::SCRATCH_STALE_AGE,
-                );
-            })
-            .await;
-        }
-        let tmp = crate::unique_scratch_path(cache_path);
-        let saved = match tokio::fs::write(&tmp, text).await {
-            Ok(()) => tokio::fs::rename(&tmp, cache_path).await.is_ok(),
-            Err(_) => false,
+    }
+
+    /// Read back the plan usage persisted with the on-disk cache, for a
+    /// payload just loaded from it. `None` when nothing was persisted.
+    async fn load_cached_userinfo(&self) {
+        let Some(path) = self.userinfo_path() else {
+            return;
         };
-        if !saved {
-            let _ = tokio::fs::remove_file(&tmp).await;
-        }
+        let userinfo = tokio::fs::read_to_string(&path)
+            .await
+            .ok()
+            .and_then(|text| SubscriptionUserinfo::parse(&text));
+        *self.subscription_userinfo.lock() = userinfo;
     }
 
     /// Shared acquisition tail: dedup → parse → persist cache → commit.
     /// `Ok(false)` when the payload is byte-identical to the last commit
     /// (upstream's hash early-return — `updated_at` only advances on real
-    /// content changes). `from_remote` distinguishes a live fetch from an
-    /// on-disk cache read — cache content is never written back.
-    async fn ingest(&self, content: String, from_remote: bool) -> Result<bool, anyhow::Error> {
+    /// content changes). `source` distinguishes a live fetch from an
+    /// on-disk cache read — cache content is never written back. A fetch
+    /// the provider accepts, changed or not, also sets the plan usage.
+    async fn ingest(&self, content: String, source: Source) -> Result<bool, anyhow::Error> {
         let strict = self.strict.load(Ordering::Relaxed);
         let hash = content_hash(&content);
+        let from_remote = matches!(source, Source::Fetched(_));
         if *self.content_hash.lock() == Some((hash, strict)) {
-            if from_remote {
+            if let Source::Fetched(userinfo) = source {
                 self.fetched_remote.store(true, Ordering::Relaxed);
+                // The usage moves on most fetches, the payload on few.
+                if self.set_userinfo(userinfo) {
+                    self.persist_userinfo(userinfo).await;
+                }
                 self.logbook_updated(Payload::Unchanged);
             }
             return Ok(false);
         }
         let proxies = self.parse_proxies(&content).await?;
-        if from_remote {
-            self.write_cache(&content).await;
+        match source {
+            Source::Fetched(userinfo) => {
+                self.write_cache(&content).await;
+                // Rewritten with the cache whether it changed or not, so
+                // the two on disk always come from the same fetch.
+                self.set_userinfo(userinfo);
+                self.persist_userinfo(userinfo).await;
+            }
+            Source::Cache => self.load_cached_userinfo().await,
         }
         let payload = if self.has_content() {
             Payload::Replaced(self.slot.read().len())
@@ -714,7 +773,7 @@ impl ProxyProvider {
                 return false;
             }
         };
-        if let Err(e) = self.ingest(content, false).await {
+        if let Err(e) = self.ingest(content, Source::Cache).await {
             warn!(provider = %self.name, path = ?path, error = %e, "ignoring unparseable provider cache");
             return false;
         }
@@ -746,14 +805,14 @@ impl ProxyProvider {
     /// hand its operator a daemon-wide kill switch that re-fires every tick.
     async fn initial_load(&self, strict: bool) -> anyhow::Result<bool> {
         let _generation = self.refresh_lock.lock().await;
-        let (content, from_remote) = match self.fetch_content().await {
+        let (content, source) = match self.fetch_content().await {
             Ok(fetched) => fetched,
             Err(e) => {
                 warn_initial_load_failure(self, &e);
                 return Ok(false);
             }
         };
-        match self.ingest(content, from_remote).await {
+        match self.ingest(content, source).await {
             Ok(_) => Ok(true),
             Err(e) => {
                 self.logbook_failed(&e.to_string());
@@ -777,8 +836,8 @@ impl ProxyProvider {
             return Ok(());
         }
         let result = match self.fetch_source().await {
-            Ok(content) => self
-                .ingest(content, true)
+            Ok((content, userinfo)) => self
+                .ingest(content, Source::Fetched(userinfo))
                 .await
                 .map(|_| ())
                 .map_err(|e| e.to_string()),
@@ -1081,16 +1140,18 @@ impl ProxyProvider {
         // from different payloads.
         let _generation = self.refresh_lock.lock().await;
         match self.fetch_source().await {
-            Ok(content) => match self.ingest(content, true).await {
-                Ok(_) => Ok(()),
-                Err(e) => {
-                    // A torn payload keeps the last-good set instead of
-                    // replacing it with nothing.
-                    warn!(provider = %self.name, error = %e, "proxy-provider refresh failed");
-                    self.logbook_failed(&e.to_string());
-                    Err(e.to_string())
+            Ok((content, userinfo)) => {
+                match self.ingest(content, Source::Fetched(userinfo)).await {
+                    Ok(_) => Ok(()),
+                    Err(e) => {
+                        // A torn payload keeps the last-good set instead of
+                        // replacing it with nothing.
+                        warn!(provider = %self.name, error = %e, "proxy-provider refresh failed");
+                        self.logbook_failed(&e.to_string());
+                        Err(e.to_string())
+                    }
                 }
-            },
+            }
             Err(e) => {
                 warn!(provider = %self.name, error = %e, "proxy-provider refresh failed");
                 self.logbook_failed(&e);
@@ -1106,8 +1167,8 @@ impl ProxyProvider {
     /// `declared_dialers` from different payloads.
     pub async fn acquire_initial(&self) -> anyhow::Result<()> {
         let _generation = self.refresh_lock.lock().await;
-        let (content, from_remote) = self.fetch_content().await.map_err(anyhow::Error::msg)?;
-        self.ingest(content, from_remote)
+        let (content, source) = self.fetch_content().await.map_err(anyhow::Error::msg)?;
+        self.ingest(content, source)
             .await
             .map(|_| ())
             .inspect_err(|e| self.logbook_failed(&e.to_string()))
@@ -1137,6 +1198,15 @@ impl ProxyProvider {
     #[cfg(test)]
     fn derived_len(&self) -> usize {
         self.derived.read().len()
+    }
+
+    /// The plan usage the subscription server reported with the payload
+    /// this provider serves, from the `subscription-userinfo` response
+    /// header; persisted next to the on-disk cache, so a restart serving
+    /// the cache reports it too. `None` when the server reported none, and
+    /// always for a `file` provider.
+    pub fn subscription_userinfo(&self) -> Option<SubscriptionUserinfo> {
+        *self.subscription_userinfo.lock()
     }
 
     pub fn updated_at_secs(&self) -> u64 {
@@ -1335,6 +1405,16 @@ pub(crate) fn record_failure(name: &str, error: &str) {
     .record();
 }
 
+/// Where a payload handed to [`ProxyProvider::ingest`] came from.
+#[derive(Clone, Copy)]
+enum Source {
+    /// Read from the provider's source, with the plan usage an HTTP
+    /// response reported.
+    Fetched(Option<SubscriptionUserinfo>),
+    /// The on-disk cache of an HTTP provider.
+    Cache,
+}
+
 /// What a parsed fetch did to the provider's payload, for the logbook.
 #[derive(Clone, Copy)]
 enum Payload {
@@ -1425,6 +1505,36 @@ fn content_hash(content: &str) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     content.hash(&mut h);
     h.finish()
+}
+
+/// Write `bytes` to `path` atomically: write-then-rename on a unique
+/// scratch, since the manual-refresh endpoint, an interval tick, and a
+/// detached initial fetch can race these writes unlaned, and a torn file
+/// would poison the next read (issue #543 review). Best-effort.
+async fn write_atomic(path: &Path, bytes: &[u8]) {
+    if let Some(parent) = path.parent() {
+        let _ = tokio::fs::create_dir_all(parent).await;
+    }
+    // Sweep scratch siblings a crashed writer left behind (issue #621) — on
+    // the blocking pool so the dir walk never stalls the worker.
+    {
+        let sweep_target = path.to_path_buf();
+        let _ = crate::spawn_blocking_with_current_dispatcher(move || {
+            meow_common::fs_util::sweep_scratch_siblings(
+                &sweep_target,
+                meow_common::fs_util::SCRATCH_STALE_AGE,
+            );
+        })
+        .await;
+    }
+    let tmp = crate::unique_scratch_path(path);
+    let saved = match tokio::fs::write(&tmp, bytes).await {
+        Ok(()) => tokio::fs::rename(&tmp, path).await.is_ok(),
+        Err(_) => false,
+    };
+    if !saved {
+        let _ = tokio::fs::remove_file(&tmp).await;
+    }
 }
 
 async fn read_cache(path: Option<&Path>, name: &str) -> Result<String, String> {
@@ -3267,5 +3377,79 @@ header:
             .await
             .expect("the retry loop must end with its provider")
             .unwrap();
+    }
+
+    fn usage(upload: u64, total: u64) -> SubscriptionUserinfo {
+        SubscriptionUserinfo {
+            upload,
+            total,
+            ..SubscriptionUserinfo::default()
+        }
+    }
+
+    /// Startup serves the usage persisted with the cache, and the
+    /// background revalidation — whose payload is unchanged — replaces it
+    /// with the usage the feed now reports, on disk too.
+    #[tokio::test]
+    async fn revalidation_of_an_unchanged_payload_updates_the_usage() {
+        let origin = Origin::spawn(Some(ONE_NODE), true).await;
+        *origin.userinfo.lock() = Some("upload=8; total=100");
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("provider_p.yaml"), ONE_NODE).unwrap();
+        let sidecar = dir.path().join("provider_p.yaml.subscription-userinfo");
+        std::fs::write(&sidecar, "upload=7; total=100").unwrap();
+
+        let providers = load_within(&[("p", &origin.url)], dir.path(), None).await;
+        let p = &providers["p"];
+        assert_eq!(origin.hits(), 0);
+        assert_eq!(p.subscription_userinfo(), Some(usage(7, 100)));
+
+        spawn_deferred_initial_fetches(&registry_of(&providers));
+        eventually("the revalidated usage", || {
+            p.subscription_userinfo() == Some(usage(8, 100))
+        })
+        .await;
+        eventually("the persisted usage", || {
+            std::fs::read_to_string(&sidecar).ok().as_deref()
+                == Some("upload=8; download=0; total=100; expire=0")
+        })
+        .await;
+    }
+
+    /// A fetched payload is persisted together with its usage: a usage
+    /// file left from an earlier payload never outlives a cache write it
+    /// did not come with, and a cache-backed provider without one reports
+    /// no usage.
+    #[tokio::test]
+    async fn a_cache_write_replaces_the_usage_left_by_an_earlier_payload() {
+        let origin = Origin::spawn(Some(ONE_NODE), true).await;
+        let dir = tempfile::tempdir().unwrap();
+        // An unparseable cache is skipped, so startup fetches; the usage
+        // file next to it is not read.
+        std::fs::write(dir.path().join("provider_p.yaml"), "proxies: [").unwrap();
+        let sidecar = dir.path().join("provider_p.yaml.subscription-userinfo");
+        std::fs::write(&sidecar, "upload=1; total=2").unwrap();
+
+        let providers = load_within(&[("p", &origin.url)], dir.path(), None).await;
+        let p = &providers["p"];
+        assert_eq!(origin.hits(), 1);
+        assert_eq!(p.proxies().len(), 1);
+        assert_eq!(p.subscription_userinfo(), None);
+        assert!(!sidecar.exists(), "the stale usage went with the old cache");
+
+        *origin.userinfo.lock() = Some("upload=3; total=4");
+        *origin.body.lock() = Some(TWO_NODES);
+        p.refresh().await.unwrap();
+        assert_eq!(p.subscription_userinfo(), Some(usage(3, 4)));
+        assert_eq!(
+            std::fs::read_to_string(&sidecar).unwrap(),
+            "upload=3; download=0; total=4; expire=0"
+        );
+
+        // Without an on-disk cache the usage lives in memory only.
+        let raw = raw_http_provider(&origin.url, None);
+        let memory = ProxyProvider::new("m", &raw, None, false, false, Default::default()).unwrap();
+        memory.refresh().await.unwrap();
+        assert_eq!(memory.subscription_userinfo(), Some(usage(3, 4)));
     }
 }
