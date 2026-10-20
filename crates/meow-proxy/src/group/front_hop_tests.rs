@@ -291,8 +291,8 @@ async fn a_chained_outbound_its_dials_take_down_is_in_the_logbook() {
     );
     assert_eq!(
         entries[0].message,
-        "'daniel-dials' is down until its next health check: its dials from '风之谷' failed \
-         (connection refused) through 'SG-01' of 'fast'"
+        "'daniel-dials' is down: its dials from '风之谷' failed (connection refused) through \
+         'SG-01' of 'fast'"
     );
     let fields = &entries[0].fields;
     assert_eq!(

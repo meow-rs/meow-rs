@@ -781,7 +781,10 @@ The following are unsupported or intentionally rejected:
   own pick stands, and its failures count against the chained outbound.
   When a 4th member in a row fails the same server, none reaching it in
   between, the server is taken for the fault too: its chains count against
-  the chained outbound and block no member until one reaches it again. There is no config change and `select` groups are
+  the chained outbound and block no member until one reaches it again. A
+  chained outbound that is down comes back as soon as a chain probe reaches
+  its server through any member, without waiting for the health check of
+  the group holding it. There is no config change and `select` groups are
   untouched. Not
   covered: UDP chains, and outbounds on the relay-based fallback wrapper
   (`anytls`, `hysteria2`, `ss` with an external plugin), whose front hop

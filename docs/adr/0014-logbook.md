@@ -55,7 +55,7 @@ once released, because clients filter, label and translate by kind.
 | `listener.start` | error | listener (`tun` for TUN) | A listener did not start |
 | `network.interface` | info | | The interface outbound sockets bind to (TUN `auto-route: global`) changed, or they no longer bind to one. Recorded for a binding once its TUN listener is up: a reload candidate's binding, installed for the validation's dials, records nothing until then, and nothing at all when the candidate is rejected |
 | `dialer-proxy.switch` | info | chained outbound | The member of a `dialer-proxy` group carrying the outbound's chains to its server changed (`group`, `from`, `to`; `reason` when `from` is blocked for that server, or `down` when a chain probe took over from it while its group had it down) |
-| `dialer-proxy.check` | info / error | chained outbound | A health check of the outbound failed through every member of its `dialer-proxy` group tried (`group`, `reason`, `tried`); a group's dial failures took the outbound down between health checks (`group`, `reason`, `member`, the group dialling it as `by`); or a health check passed again |
+| `dialer-proxy.check` | info / error | chained outbound | A health check of the outbound failed through every member of its `dialer-proxy` group tried (`group`, `reason`, `tried`); a group's dial failures took the outbound down between health checks (`group`, `reason`, `member`, the group dialling it as `by`); or it passed a health check again, or a chain probe of its `dialer-proxy` group reached its server again (`group`, `member`) |
 
 Failure reasons in these entries come from a fixed vocabulary
 (`timed out`, `connection refused`, `closed before any reply`, ...), not
@@ -78,7 +78,8 @@ which for a chained outbound `dialer-proxy.check` records with the members
 tried. A chained outbound that a group's dial failures take down between
 sweeps is recorded under that kind when it happens, with the member of
 the `dialer-proxy` group the dials went through: no health check sees it,
-and it stays down until the next one passes. Whether a success ends a
+and it stays down until the next one passes, or a chain probe of that
+group reaches its server. Whether a success ends a
 failure is read from the logbook itself (`logbook::failing`): the
 subject's latest entry of the kind is an error.
 A recovery is then recorded even when the provider object that failed was

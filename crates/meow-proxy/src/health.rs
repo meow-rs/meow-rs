@@ -255,6 +255,12 @@ pub struct ChainProbeReport {
 /// fault and the round records nothing. When `owner` cannot run over a
 /// relayed stream, the round records nothing either. A carrier the group
 /// has down hands over to the first member that reached the target.
+///
+/// An `owner` that is down when a member reaches the target is up again:
+/// the probe ran its protocol end to end, so its delay through the first
+/// member that reached the target is recorded, and the groups that hold it
+/// take it back now rather than at their next health check. The logbook
+/// records the recovery (`dialer-proxy.check`).
 pub async fn probe_chain_target(
     group: &Arc<dyn Proxy>,
     target: &ChainTarget,
@@ -274,10 +280,52 @@ pub async fn probe_chain_target(
         hold,
         tried: None,
     };
-    round
+    let report = round
         .run(CHAIN_PROBE_PASSES, CHAIN_PROBE_LIMIT, false)
         .await
-        .unwrap_or_default()
+        .unwrap_or_default();
+    if let Some((member, delay)) = report.reached.first() {
+        if !owner.alive() {
+            revive_owner(group.name(), owner, member, *delay);
+        }
+    }
+    report
+}
+
+/// `owner`, a chained outbound that is down, reached its server through
+/// `member` of `group` in a chain probe: record the probe's `delay` as its
+/// own, which marks it alive, and the recovery in the logbook. Only a
+/// health check marked it down, or its dial failures did, and either
+/// recorded that in the logbook.
+fn revive_owner(group: &str, owner: &Arc<dyn Proxy>, member: &str, delay: u16) {
+    let name = owner.name();
+    info!(
+        "proxy-group '{group}': chained outbound '{name}' reached its server through \
+         '{member}' in a chain probe; marking it alive"
+    );
+    owner.health().record_delay(delay);
+    record_passing(name, Some((group, member)));
+}
+
+/// Record that `name`, a chained outbound, passes again, when its latest
+/// `dialer-proxy.check` entry is a failure: its own health check passed, or
+/// a chain probe through `via`, a group and its member, reached its server.
+fn record_passing(name: &str, via: Option<(&str, &str)>) {
+    if !logbook::failing(logbook::kind::DIALER_PROXY_CHECK, name) {
+        return;
+    }
+    let message = match via {
+        Some((group, member)) => {
+            format!("'{name}' reaches its server again through '{member}' of '{group}'")
+        }
+        None => format!("'{name}' passes its health check again"),
+    };
+    let mut event =
+        logbook::event(logbook::kind::DIALER_PROXY_CHECK, Level::Info, message).subject(name);
+    if let Some((group, member)) = via {
+        event = event.field("group", group).field("member", member);
+    }
+    event.record();
 }
 
 /// One round of chain probes; see [`probe_chain_target`].
@@ -508,14 +556,8 @@ async fn sweep_member(
         }
     };
     proxy.health().record_delay(delay);
-    if delay > 0 && logbook::failing(logbook::kind::DIALER_PROXY_CHECK, &name) {
-        logbook::event(
-            logbook::kind::DIALER_PROXY_CHECK,
-            Level::Info,
-            format!("'{name}' passes its health check again"),
-        )
-        .subject(name.as_str())
-        .record();
+    if delay > 0 {
+        record_passing(&name, None);
     }
     SweptMember { name, delay }
 }
@@ -1219,6 +1261,63 @@ mod tests {
 
         /// An outbound that cannot run over a relayed stream says nothing
         /// about the members: the round records nothing.
+        /// An outbound that is down comes back up as soon as a chain probe
+        /// reaches its server: its delay through the first member that
+        /// reached it is recorded, and so is the recovery, in the logbook.
+        #[tokio::test]
+        async fn a_probe_that_reaches_the_server_revives_a_down_owner() {
+            let book = TestLogbook::install();
+            let audited = StreamProxy::auditing("SG-01", "10.0.0.1:443", 8443);
+            audited.set_delay(10);
+            let clean = StreamProxy::new("HK-01", "10.0.0.2:443");
+            clean.set_delay(20);
+            let group = fallback(&[Arc::clone(&audited), Arc::clone(&clean)]);
+            let owner: Arc<dyn Proxy> =
+                StreamProxy::new("daniel-revived", "snell.example.com:8443");
+            owner.health().record_delay(0);
+            logbook::event(kind::DIALER_PROXY_CHECK, Level::Error, "down")
+                .subject("daniel-revived")
+                .record();
+
+            let report = probe(&group, &owner).await;
+            assert_eq!(reached(&report), names(&["HK-01"]));
+            assert!(owner.alive());
+            assert_eq!(owner.last_delay(), report.reached[0].1);
+            let entries = book.entries("daniel-revived");
+            assert_eq!(entries.len(), 2, "{entries:?}");
+            assert_eq!(
+                (entries[0].kind.as_str(), entries[0].level),
+                (kind::DIALER_PROXY_CHECK, Level::Info)
+            );
+            assert_eq!(
+                entries[0].message,
+                "'daniel-revived' reaches its server again through 'HK-01' of 'fast'"
+            );
+            let fields = &entries[0].fields;
+            assert_eq!(
+                (&fields["group"], &fields["member"]),
+                (&"fast".into(), &"HK-01".into())
+            );
+
+            // Up already, the next probe leaves its delay to its own checks.
+            let history = owner.delay_history().len();
+            probe(&group, &owner).await;
+            assert_eq!(owner.delay_history().len(), history);
+            assert_eq!(book.entries("daniel-revived").len(), 2);
+        }
+
+        /// A probe that reaches no member leaves a down outbound down.
+        #[tokio::test]
+        async fn a_probe_that_reaches_no_member_leaves_a_down_owner_down() {
+            let audited = StreamProxy::auditing("SG-01", "10.0.0.1:443", 8443);
+            audited.set_delay(10);
+            let group = fallback(&[audited]);
+            let owner = daniel();
+            owner.health().record_delay(0);
+            assert!(probe(&group, &owner).await.reached.is_empty());
+            assert!(!owner.alive());
+        }
+
         #[tokio::test]
         async fn an_owner_without_relay_support_records_nothing() {
             let audited = StreamProxy::auditing("SG-01", "10.0.0.1:443", 8443);

@@ -98,6 +98,11 @@ the canonical, in-repo source a release is cut from.
     blocked for the server too, so a passing probe clears a block early;
     one that fails again stays blocked without its backoff growing each
     round.
+  - A chained outbound that is down comes back as soon as a chain probe
+    of its `dialer-proxy` group reaches its server through any member:
+    the probe ran the outbound's own protocol to the test URL, so its
+    delay is recorded and the groups holding the outbound take it back,
+    rather than at their own next health check.
 
 ### Fixed
 

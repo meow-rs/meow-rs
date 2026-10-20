@@ -216,8 +216,9 @@ pub(super) struct ChainedDial {
 }
 
 /// Record that `group`'s dial failures took `owner`, a chained outbound,
-/// down. No health check saw it fail, and until its next one passes, which
-/// records the recovery, the outbound is out of every group that holds it.
+/// down. No health check saw it fail, and the outbound is out of every
+/// group that holds it until its next one passes, or a chain probe of its
+/// `dialer-proxy` group reaches its server; either records the recovery.
 /// The reason is [`failure_reason`]'s, so no error text reaches the
 /// logbook.
 fn record_chained_down(group: &str, owner: &str, err: &MeowError, chain: &ChainedDial) {
@@ -230,10 +231,7 @@ fn record_chained_down(group: &str, owner: &str, err: &MeowError, chain: &Chaine
     let mut event = logbook::event(
         logbook::kind::DIALER_PROXY_CHECK,
         Level::Error,
-        format!(
-            "'{owner}' is down until its next health check: its dials from '{group}' failed \
-             ({reason}) through {path}"
-        ),
+        format!("'{owner}' is down: its dials from '{group}' failed ({reason}) through {path}"),
     )
     .subject(owner)
     .field("group", front)
