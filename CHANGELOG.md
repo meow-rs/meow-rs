@@ -106,6 +106,16 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **Windows TUN works as soon as it reports ready**: Windows kept a new
+  Wintun address tentative while it checked the address for duplicates, and
+  a tentative address cannot send packets, so DNS and traffic right after
+  startup or a configuration reload could fail. meow now turns that check
+  off on its own adapter and creates the addresses ready to use. An adapter
+  reopened after an unclean shutdown has the stale addresses it still
+  carries replaced, IPv6 ones included even when no IPv6 address is
+  configured. An address another adapter still holds now fails the attempt
+  instead of leaving the device half-configured, and later retries move to
+  other IPv4 and IPv6 addresses.
 - **Another resolver's fake IP dials the sniffed name**: when a phone on a
   LAN with a Surge (or Clash) gateway resolves a name while the VPN is down,
   the app caches the gateway's fake IP from 198.18.0.0/15. Once the VPN is
@@ -149,17 +159,6 @@ the canonical, in-repo source a release is cut from.
   unchanged and still matches mihomo.
 
 ### Fixed
-
-- **Windows TUN works as soon as it reports ready**: Windows kept a new
-  Wintun address tentative while it checked the address for duplicates, and
-  a tentative address cannot send packets, so DNS and traffic right after
-  startup or a configuration reload could fail. meow now turns that check
-  off on its own adapter and creates the addresses ready to use, replacing
-  the stale ones an adapter reopened after an unclean shutdown still
-  carries — of both families, IPv6 included, and even when no IPv6 address
-  is configured. An address another adapter still holds fails the attempt
-  loudly instead of leaving the device half-configured, and is retried on
-  a different one of both families.
 
 - **UDP traffic counts toward the totals**: only TCP relays added to the
   upload and download totals, so `/traffic`, the `/connections` totals and
