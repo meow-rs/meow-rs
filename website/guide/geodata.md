@@ -34,6 +34,11 @@ $HOME/.config/meow/<file>
 
 The `-d` / home directory flag also influences where resources are looked up.
 
+The country database is found under any capitalisation of `Country.mmdb`, and `ASN.mmdb`
+stands in for a missing `GeoLite2-ASN.mmdb`, so the copies a mihomo GUI such as Clash Party
+puts in the home directory are used rather than downloaded again. A database meow-rs
+downloads itself is saved as `Country.mmdb` / `GeoLite2-ASN.mmdb`.
+
 ## Auto-update
 
 On startup meow-rs downloads any missing database. With `auto-update: true`, a background

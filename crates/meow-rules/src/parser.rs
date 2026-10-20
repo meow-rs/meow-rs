@@ -206,9 +206,9 @@ fn parse_rule_depth(
         }
         "IP-ASN" => {
             let index = ctx.asn.clone().ok_or_else(|| {
-                "IP-ASN rule requires an ASN database (GeoLite2-ASN.mmdb); drop the file at \
-                 $XDG_CONFIG_HOME/meow/GeoLite2-ASN.mmdb, $HOME/.config/meow/GeoLite2-ASN.mmdb, \
-                 or ./meow/GeoLite2-ASN.mmdb"
+                "IP-ASN rule requires an ASN database (GeoLite2-ASN.mmdb or ASN.mmdb); \
+                 drop the file at $XDG_CONFIG_HOME/meow/GeoLite2-ASN.mmdb, \
+                 $HOME/.config/meow/GeoLite2-ASN.mmdb, or ./meow/GeoLite2-ASN.mmdb"
                     .to_string()
             })?;
             let asn = parse_asn_payload(payload)?;
@@ -225,9 +225,9 @@ fn parse_rule_depth(
         }
         "SRC-IP-ASN" => {
             let index = ctx.asn.clone().ok_or_else(|| {
-                "SRC-IP-ASN rule requires an ASN database (GeoLite2-ASN.mmdb); drop the file at \
-                 $XDG_CONFIG_HOME/meow/GeoLite2-ASN.mmdb, $HOME/.config/meow/GeoLite2-ASN.mmdb, \
-                 or ./meow/GeoLite2-ASN.mmdb"
+                "SRC-IP-ASN rule requires an ASN database (GeoLite2-ASN.mmdb or ASN.mmdb); \
+                 drop the file at $XDG_CONFIG_HOME/meow/GeoLite2-ASN.mmdb, \
+                 $HOME/.config/meow/GeoLite2-ASN.mmdb, or ./meow/GeoLite2-ASN.mmdb"
                     .to_string()
             })?;
             let asn = parse_asn_payload(payload)?;

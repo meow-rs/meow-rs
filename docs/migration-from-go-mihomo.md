@@ -433,6 +433,9 @@ $HOME/.config/meow/Country.mmdb
 ./meow/Country.mmdb
 ```
 
+The file name is matched ignoring case, so a `country.mmdb` is picked up too;
+for `IP-ASN`, an `ASN.mmdb` is used when there is no `GeoLite2-ASN.mmdb`.
+
 ### GEOSITE
 
 Supported (M1.D-2), **mrs format only**. If you have a `.dat` geosite file,

@@ -84,6 +84,16 @@ the canonical, in-repo source a release is cut from.
   maps each member whose probe passed within `timeout` to its delay and
   leaves the rest out, as mihomo does; it is a 504 only when no member
   passed, an empty group included.
+- **A GUI's own GeoIP and ASN databases are used**: mihomo GUIs such as
+  Clash Party copy the country database into the home directory as
+  `country.mmdb` and the ASN database as `ASN.mmdb`, while meow looked
+  only for `Country.mmdb` and `GeoLite2-ASN.mmdb`. It downloaded its own
+  copy of each at startup instead (the country database only on a
+  case-sensitive filesystem such as Linux's), and when that download failed
+  a config with a `GEOIP` or `IP-ASN` rule did not load. The country
+  database is now found under any capitalisation of `Country.mmdb`, and
+  `ASN.mmdb` stands in for a missing `GeoLite2-ASN.mmdb`; a database meow
+  downloads keeps meow's names.
 
 ## [0.25.0] - 2026-10-20
 

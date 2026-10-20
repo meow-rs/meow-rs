@@ -3413,15 +3413,41 @@ fn collect_geo_scan_lines(
 
 /// Default path for the GeoIP Country MMDB.
 /// Honours `-d` (set via `meow_common::set_home_dir`), then `$XDG_CONFIG_HOME`,
-/// then `$HOME/.config/meow`.
+/// then `$HOME/.config/meow`. An existing file is matched ignoring case, so
+/// the `country.mmdb` a mihomo GUI copies into the home directory is used
+/// rather than downloaded again.
 pub fn default_geoip_path() -> PathBuf {
-    meow_config_dir().join("Country.mmdb")
+    existing_or_first(&meow_config_dir(), &["Country.mmdb"])
 }
 
 /// Default path for the GeoLite2-ASN MMDB. Same discovery chain as GeoIP,
-/// with the upstream-compatible filename `GeoLite2-ASN.mmdb`.
+/// with the upstream-compatible filename `GeoLite2-ASN.mmdb`; an existing
+/// `ASN.mmdb`, the name mihomo GUIs copy the same database under, is used
+/// when there is no `GeoLite2-ASN.mmdb`.
 pub fn default_asn_path() -> PathBuf {
-    meow_config_dir().join("GeoLite2-ASN.mmdb")
+    existing_or_first(&meow_config_dir(), &["GeoLite2-ASN.mmdb", "ASN.mmdb"])
+}
+
+/// The first of `names`, in order, that exists in `dir` as a file, matched
+/// exactly and then ignoring ASCII case; `dir/names[0]` when none does, which
+/// is where the geodata downloader puts a missing database.
+fn existing_or_first(dir: &Path, names: &[&str]) -> PathBuf {
+    let files: Vec<String> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| dir.join(name).is_file())
+        .collect();
+    names
+        .iter()
+        .find_map(|want| {
+            files
+                .iter()
+                .find(|name| name == want)
+                .or_else(|| files.iter().find(|name| name.eq_ignore_ascii_case(want)))
+        })
+        .map_or_else(|| dir.join(names[0]), |name| dir.join(name))
 }
 
 /// Default on-disk path for the geosite DB used by the geodata downloader.
@@ -7661,6 +7687,87 @@ mod dns_provider_sharing_tests {
         assert!(
             result.prefetched_payloads.is_empty(),
             "a shared rebuild carries no payload snapshot"
+        );
+    }
+}
+
+#[cfg(test)]
+mod default_geo_path_tests {
+    //! The default GeoIP / ASN paths take the database a mihomo GUI copies
+    //! into the home directory (`country.mmdb`, `ASN.mmdb`) instead of
+    //! downloading a second copy under meow's own names.
+    use super::*;
+
+    const GEOIP: &[&str] = &["Country.mmdb"];
+    const ASN: &[&str] = &["GeoLite2-ASN.mmdb", "ASN.mmdb"];
+
+    fn touch(dir: &Path, name: &str) {
+        std::fs::write(dir.join(name), b"mmdb").unwrap();
+    }
+
+    #[test]
+    fn missing_database_falls_back_to_the_download_name() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            existing_or_first(dir.path(), GEOIP),
+            dir.path().join("Country.mmdb")
+        );
+        assert_eq!(
+            existing_or_first(dir.path(), ASN),
+            dir.path().join("GeoLite2-ASN.mmdb")
+        );
+        let gone = dir.path().join("not-there");
+        assert_eq!(existing_or_first(&gone, GEOIP), gone.join("Country.mmdb"));
+    }
+
+    #[test]
+    fn existing_database_is_matched_ignoring_case() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(dir.path(), "country.mmdb");
+        touch(dir.path(), "asn.mmdb");
+        assert_eq!(
+            existing_or_first(dir.path(), GEOIP),
+            dir.path().join("country.mmdb")
+        );
+        assert_eq!(
+            existing_or_first(dir.path(), ASN),
+            dir.path().join("asn.mmdb")
+        );
+    }
+
+    #[test]
+    fn earlier_name_wins_over_a_later_one() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(dir.path(), "ASN.mmdb");
+        touch(dir.path(), "GeoLite2-ASN.mmdb");
+        assert_eq!(
+            existing_or_first(dir.path(), ASN),
+            dir.path().join("GeoLite2-ASN.mmdb")
+        );
+    }
+
+    #[test]
+    fn exact_name_wins_over_a_case_variant() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(dir.path(), "country.mmdb");
+        touch(dir.path(), "Country.mmdb");
+        // On a case-insensitive filesystem the second write lands on the
+        // first file, leaving nothing to choose between.
+        if std::fs::read_dir(dir.path()).unwrap().count() == 2 {
+            assert_eq!(
+                existing_or_first(dir.path(), GEOIP),
+                dir.path().join("Country.mmdb")
+            );
+        }
+    }
+
+    #[test]
+    fn a_directory_is_not_a_database() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("asn.mmdb")).unwrap();
+        assert_eq!(
+            existing_or_first(dir.path(), ASN),
+            dir.path().join("GeoLite2-ASN.mmdb")
         );
     }
 }
