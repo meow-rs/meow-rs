@@ -8,6 +8,20 @@ the canonical, in-repo source a release is cut from.
 
 ## [Unreleased]
 
+### Added
+
+- **Proxy providers report their plan usage** (`subscriptionInfo`):
+  `GET /providers/proxies` and `GET /providers/proxies/{name}` include the
+  traffic and expiry an `http` provider's server sends in its
+  `subscription-userinfo` response header, as
+  `"subscriptionInfo": {"Upload", "Download", "Total", "Expire"}`, the way
+  mihomo does, so dashboards such as Clash Party, zashboard and metacubexd
+  show how much of a plan is used and when it ends. The last fetch the
+  provider accepted decides: one without the header drops the field, a
+  failed one keeps it. The usage is kept next to the provider cache
+  (`<path>.subscription-userinfo`), so a restart that starts from the cache
+  reports it before the first refetch. `file` providers have none.
+
 ## [0.25.0] - 2026-10-20
 
 ### Added

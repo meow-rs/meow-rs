@@ -30,7 +30,7 @@ Status meanings:
 | `GET /memory` | Compatible | HTTP/WebSocket; each client starts with the mihomo-compatible zero frame. |
 | `GET /dns/query` | Compatible | Supports address and generic RR types with the mihomo DNS JSON shape. |
 | `GET /rules` | Partial | `index`, `type`, `payload`, `proxy`, and `size` are present; rule-wrapper hit/miss data is unavailable. |
-| `GET/PUT /providers/proxies[/{name}]` | Compatible | Refresh failures return 503. |
+| `GET/PUT /providers/proxies[/{name}]` | Compatible | Refresh failures return 503. HTTP providers report `subscriptionInfo` from the `subscription-userinfo` response header. |
 | `GET /providers/proxies/{name}/healthcheck` | Compatible | Uses provider health-check configuration and returns 204. |
 | `GET /providers/proxies/{provider}/{proxy}[/healthcheck]` | Compatible | Provider member detail and delay probe. |
 | `GET/PUT /providers/rules[/{name}]` | Compatible | Includes format, vehicle type, rule count, and RFC 3339 update time. |
@@ -59,8 +59,8 @@ provide and are not represented by fake-success stubs:
 | Configurable DoH controller route | No external-controller DoH mount. |
 | `/debug/*` | No Go pprof equivalent. |
 
-Provider `subscriptionInfo`, UDP connection entries, and rule hit/miss
-counters are also intentionally omitted until their underlying state exists.
+UDP connection entries and rule hit/miss counters are also intentionally
+omitted until their underlying state exists.
 
 ## Meow-rs extensions
 

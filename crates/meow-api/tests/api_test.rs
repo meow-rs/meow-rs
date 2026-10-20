@@ -6135,3 +6135,274 @@ async fn logbook_lists_filters_and_clears_entries() {
     logbook::uninstall();
     assert_eq!(body_json(get("/logbook").await).await["enabled"], false);
 }
+
+// ── Proxy-provider subscriptionInfo ──────────────────────────────
+
+/// What [`UserinfoOrigin`] answers every request with.
+#[derive(Clone, Copy)]
+struct OriginReply {
+    status: u16,
+    /// The `subscription-userinfo` header value, sent when `Some`.
+    userinfo: Option<&'static str>,
+    body: &'static str,
+}
+
+const USERINFO_PAYLOAD: &str = "proxies:\n  - {name: n1, type: direct}\n";
+
+/// A proxy-provider origin the test steers: counts requests and answers
+/// each with the current [`OriginReply`].
+struct UserinfoOrigin {
+    url: String,
+    reply: Arc<parking_lot::Mutex<OriginReply>>,
+    hits: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl UserinfoOrigin {
+    async fn spawn(reply: OriginReply) -> Self {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/sub.yaml", listener.local_addr().unwrap());
+        let reply = Arc::new(parking_lot::Mutex::new(reply));
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (task_reply, task_hits) = (Arc::clone(&reply), Arc::clone(&hits));
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                task_hits.fetch_add(1, Ordering::SeqCst);
+                let reply = *task_reply.lock();
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => head.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    // Mixed case on purpose: the header name is
+                    // case-insensitive.
+                    let userinfo = reply
+                        .userinfo
+                        .map(|value| format!("Subscription-Userinfo: {value}\r\n"))
+                        .unwrap_or_default();
+                    let response = format!(
+                        "HTTP/1.1 {} X\r\nContent-Length: {}\r\nConnection: close\r\n{userinfo}\r\n{}",
+                        reply.status,
+                        reply.body.len(),
+                        reply.body
+                    );
+                    let _ = sock.write_all(response.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        Self { url, reply, hits }
+    }
+
+    fn set(&self, reply: OriginReply) {
+        *self.reply.lock() = reply;
+    }
+
+    fn hits(&self) -> usize {
+        self.hits.load(Ordering::SeqCst)
+    }
+}
+
+/// Load `providers` (name → YAML declaration) the way startup does, with
+/// `dir` as the provider cache directory, and serve them from a fresh
+/// [`AppState`].
+async fn state_with_providers(
+    providers: &[(&str, String)],
+    dir: &std::path::Path,
+) -> Arc<AppState> {
+    let raw: HashMap<String, meow_config::raw::RawProxyProvider> = providers
+        .iter()
+        .map(|(name, yaml)| ((*name).to_string(), serde_yaml::from_str(yaml).unwrap()))
+        .collect();
+    let loaded = meow_config::proxy_provider::load_proxy_providers_within(
+        &raw,
+        Some(dir),
+        false,
+        false,
+        &Default::default(),
+        None,
+        &mut meow_config::DroppedProviders::default(),
+    )
+    .await
+    .unwrap();
+    let state = test_state_default();
+    for (name, provider) in loaded {
+        state.proxy_providers.insert(name, provider);
+    }
+    state
+}
+
+async fn api_call(state: &Arc<AppState>, method: &str, uri: &str) -> axum::response::Response {
+    create_router(Arc::clone(state))
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+/// `subscriptionInfo` of provider `name` as `GET /providers/proxies` lists
+/// it, checked against `GET /providers/proxies/{name}`; `None` when absent.
+async fn listed_subscription_info(state: &Arc<AppState>, name: &str) -> Option<serde_json::Value> {
+    let list = body_json(api_call(state, "GET", "/providers/proxies").await).await;
+    let one = api_call(state, "GET", &format!("/providers/proxies/{name}")).await;
+    assert_eq!(one.status(), StatusCode::OK);
+    let one = body_json(one).await;
+    assert_eq!(list["providers"][name], one, "list and detail agree");
+    assert_eq!(
+        one["proxies"].as_array().map(Vec::len),
+        Some(1),
+        "the payload loaded: {one}"
+    );
+    one.as_object().unwrap().get("subscriptionInfo").cloned()
+}
+
+/// An HTTP provider whose response carries `subscription-userinfo` reports
+/// it as mihomo's `subscriptionInfo`; one without the header, and a `file`
+/// provider, leave the field out.
+#[tokio::test]
+async fn proxy_providers_report_subscription_userinfo() {
+    let with = UserinfoOrigin::spawn(OriginReply {
+        status: 200,
+        userinfo: Some("upload=1234; download=5678; total=1073741824; expire=1700000000"),
+        body: USERINFO_PAYLOAD,
+    })
+    .await;
+    let without = UserinfoOrigin::spawn(OriginReply {
+        status: 200,
+        userinfo: None,
+        body: USERINFO_PAYLOAD,
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("local.yaml"), USERINFO_PAYLOAD).unwrap();
+    let state = state_with_providers(
+        &[
+            ("usage", format!("type: http\nurl: {}\n", with.url)),
+            ("plain", format!("type: http\nurl: {}\n", without.url)),
+            ("local", "type: file\npath: local.yaml\n".to_string()),
+        ],
+        dir.path(),
+    )
+    .await;
+
+    assert_eq!(
+        listed_subscription_info(&state, "usage").await,
+        Some(serde_json::json!({
+            "Upload": 1234,
+            "Download": 5678,
+            "Total": 1_073_741_824_u64,
+            "Expire": 1_700_000_000_u64,
+        }))
+    );
+    assert_eq!(listed_subscription_info(&state, "plain").await, None);
+    assert_eq!(listed_subscription_info(&state, "local").await, None);
+}
+
+/// The usage is persisted next to the provider cache, so a restart that
+/// serves the cache without touching the network reports it at once; each
+/// later fetch the provider accepts replaces it, even when the payload is
+/// unchanged, a failed fetch keeps it, and a fetch without the header
+/// clears it.
+#[tokio::test]
+async fn proxy_provider_subscription_info_survives_restart_and_follows_fetches() {
+    let origin = UserinfoOrigin::spawn(OriginReply {
+        status: 200,
+        userinfo: Some("upload=1; download=2; total=1000"),
+        body: USERINFO_PAYLOAD,
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let decl = [("usage", format!("type: http\nurl: {}\n", origin.url))];
+    let sidecar = dir.path().join("provider_usage.yaml.subscription-userinfo");
+    let first = serde_json::json!({"Upload": 1, "Download": 2, "Total": 1000, "Expire": 0});
+
+    let state = state_with_providers(&decl, dir.path()).await;
+    assert_eq!(
+        listed_subscription_info(&state, "usage").await,
+        Some(first.clone())
+    );
+    assert!(sidecar.exists(), "persisted next to the cache");
+    drop(state);
+
+    // Restart with the feed down: the cache and its usage are served
+    // before (and without) any request.
+    origin.set(OriginReply {
+        status: 503,
+        userinfo: None,
+        body: "",
+    });
+    let hits = origin.hits();
+    let state = state_with_providers(&decl, dir.path()).await;
+    assert_eq!(
+        origin.hits(),
+        hits,
+        "a cached provider starts without a fetch"
+    );
+    assert_eq!(
+        listed_subscription_info(&state, "usage").await,
+        Some(first.clone())
+    );
+
+    // The usage moved; the payload did not.
+    origin.set(OriginReply {
+        status: 200,
+        userinfo: Some("upload=10; download=20; total=1000; expire=1800000000"),
+        body: USERINFO_PAYLOAD,
+    });
+    let refreshed = api_call(&state, "PUT", "/providers/proxies/usage").await;
+    assert_eq!(refreshed.status(), StatusCode::NO_CONTENT);
+    let second = serde_json::json!({"Upload": 10, "Download": 20, "Total": 1000, "Expire": 1_800_000_000_u64});
+    assert_eq!(
+        listed_subscription_info(&state, "usage").await,
+        Some(second.clone())
+    );
+
+    origin.set(OriginReply {
+        status: 503,
+        userinfo: Some("upload=99; download=99; total=99"),
+        body: "",
+    });
+    let failed = api_call(&state, "PUT", "/providers/proxies/usage").await;
+    assert_eq!(failed.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        listed_subscription_info(&state, "usage").await,
+        Some(second.clone()),
+        "a failed fetch keeps the last accepted usage"
+    );
+
+    // A restart now reports the refetched usage, not the first one.
+    drop(state);
+    let state = state_with_providers(&decl, dir.path()).await;
+    assert_eq!(
+        listed_subscription_info(&state, "usage").await,
+        Some(second)
+    );
+
+    origin.set(OriginReply {
+        status: 200,
+        userinfo: None,
+        body: USERINFO_PAYLOAD,
+    });
+    let cleared = api_call(&state, "PUT", "/providers/proxies/usage").await;
+    assert_eq!(cleared.status(), StatusCode::NO_CONTENT);
+    assert_eq!(listed_subscription_info(&state, "usage").await, None);
+    assert!(!sidecar.exists(), "nothing left to restore");
+    drop(state);
+
+    origin.set(OriginReply {
+        status: 503,
+        userinfo: None,
+        body: "",
+    });
+    let state = state_with_providers(&decl, dir.path()).await;
+    assert_eq!(listed_subscription_info(&state, "usage").await, None);
+}

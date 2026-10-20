@@ -106,6 +106,22 @@ bookkeeping fields does not orphan the subscription's tracked content.
 | `GET` | `/providers/rules/{name}` | One rule provider |
 | `PUT` | `/providers/rules/{name}` | Refresh a rule provider |
 
+An `http` proxy provider whose server sends a `subscription-userinfo`
+response header (`upload=…; download=…; total=…; expire=…`) carries the
+plan usage as `subscriptionInfo` in `GET /providers/proxies[/{name}]`, the
+way mihomo reports it:
+
+```json
+{ "subscriptionInfo": { "Upload": 1234, "Download": 5678, "Total": 1073741824, "Expire": 1700000000 } }
+```
+
+Bytes, and Unix seconds for `Expire`; a key the header leaves out reads 0
+(an `Expire` of 0 is a plan without an end date). The last fetch the
+provider accepted decides: one without the header drops the field, a failed
+one keeps it. The usage is kept next to the provider cache, in
+`<path>.subscription-userinfo`, so a restart that starts from the cache
+reports it before the first refetch. `file` providers have none.
+
 ## Proxy groups
 
 | Method | Path | Description |
