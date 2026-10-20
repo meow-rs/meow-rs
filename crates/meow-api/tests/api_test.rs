@@ -5978,6 +5978,266 @@ async fn put_configs_tun_fake_ip_change_restarts_listener() {
     );
     assert!(state.tunnel.resolver().fake_ip_v4_net().is_some());
 }
+
+/// `PATCH /configs` with `body`, as a GUI's TUN switch sends it.
+async fn patch_configs(state: &Arc<AppState>, body: serde_json::Value) -> axum::response::Response {
+    create_router(Arc::clone(state))
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+async fn get_configs_json(state: &Arc<AppState>) -> serde_json::Value {
+    let resp = create_router(Arc::clone(state))
+        .oneshot(
+            Request::get("/configs")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    body_json(resp).await
+}
+
+/// A GUI's TUN switch (Clash Party, zashboard, …) sends
+/// `PATCH /configs {"tun":{"enable":false}}` and never restarts the core:
+/// the patch must stop the running listener, land in the committed config
+/// and show in `GET /configs`, where those GUIs read the switch from.
+/// Deterministic under both feature sets — `stop_tun` needs no device.
+#[tokio::test]
+async fn patch_configs_tun_disable_stops_listener_and_round_trips() {
+    let mut raw = test_raw_config();
+    raw.tun = Some(serde_yaml::from_str("enable: true\nmtu: 1500").unwrap());
+    let state = test_state(raw);
+    let (handle, stopped) = fake_tun_handle();
+    state.tunnel.set_tun_handle(handle).await;
+    // Let the stand-in listener start: its drop flag exists only once polled.
+    tokio::task::yield_now().await;
+
+    let before = get_configs_json(&state).await;
+    assert_eq!(
+        before["tun"],
+        serde_json::json!({"enable": true, "mtu": 1500})
+    );
+    assert_eq!(before["tun-enable"], true);
+
+    // Re-sending the current state is a no-op: the listener keeps running.
+    let resp = patch_configs(&state, serde_json::json!({"tun": {"enable": true}})).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert!(!stopped.load(Ordering::SeqCst));
+    assert!(state.tunnel.has_tun());
+
+    let resp = patch_configs(&state, serde_json::json!({"tun": {"enable": false}})).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert!(
+        stopped.load(Ordering::SeqCst),
+        "disabling TUN must reap the running listener"
+    );
+    assert!(!state.tunnel.has_tun());
+    let tun = state.raw_config.read().tun.clone().unwrap();
+    assert!(!tun.enable, "the committed config must say TUN is off");
+    assert_eq!(tun.mtu, Some(1500), "keys the patch omits are kept");
+
+    let after = get_configs_json(&state).await;
+    assert_eq!(
+        after["tun"],
+        serde_json::json!({"enable": false, "mtu": 1500})
+    );
+    assert_eq!(after["tun-enable"], false);
+}
+
+/// Without the `listener-tun` feature a `tun` patch turning TUN on fails
+/// the way `PUT /configs` does — `enable` rolls back, the other patched
+/// keys stay — but the PATCH answers with an error instead of 204, since
+/// the TUN change was the request. Mode is not applied either.
+#[cfg(not(feature = "listener-tun"))]
+#[tokio::test]
+async fn patch_configs_tun_enable_without_listener_tun_fails_and_rolls_back() {
+    let state = test_state(test_raw_config());
+    assert_eq!(
+        get_configs_json(&state).await["tun"],
+        serde_json::json!({"enable": false}),
+        "no tun: section still reports the switch"
+    );
+
+    let resp = patch_configs(
+        &state,
+        serde_json::json!({"mode": "direct", "tun": {"enable": true, "mtu": 1400}}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let message = body_json(resp).await["message"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        message.contains("listener-tun"),
+        "the error must say why TUN did not start: {message}"
+    );
+    assert!(!state.tunnel.has_tun());
+    let tun = state.raw_config.read().tun.clone().unwrap();
+    assert!(!tun.enable, "a failed start must roll `enable` back");
+    assert_eq!(tun.mtu, Some(1400));
+    let configs = get_configs_json(&state).await;
+    assert_eq!(configs["tun"]["enable"], false);
+    assert_eq!(
+        configs["mode"], "rule",
+        "a failed TUN patch must not apply the rest of the body"
+    );
+}
+
+/// A patch without `enable` keeps the current state, so a parameter change
+/// under a running listener restarts it like a `PUT /configs` `tun:` diff;
+/// without the feature the respawn fails, which rolls `enable` back and
+/// fails the PATCH.
+#[cfg(not(feature = "listener-tun"))]
+#[tokio::test]
+async fn patch_configs_tun_param_change_restarts_running_listener() {
+    let mut raw = test_raw_config();
+    raw.tun = Some(serde_yaml::from_str("enable: true\nmtu: 1500").unwrap());
+    let state = test_state(raw);
+    let (handle, stopped) = fake_tun_handle();
+    state.tunnel.set_tun_handle(handle).await;
+    // Let the stand-in listener start: its drop flag exists only once polled.
+    tokio::task::yield_now().await;
+
+    let resp = patch_configs(&state, serde_json::json!({"tun": {"mtu": 9000}})).await;
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        stopped.load(Ordering::SeqCst),
+        "the restart must reap the old listener handle"
+    );
+    assert!(!state.tunnel.has_tun());
+    let tun = state.raw_config.read().tun.clone().unwrap();
+    assert!(!tun.enable);
+    assert_eq!(tun.mtu, Some(9000));
+}
+
+/// Keys are merged over the committed section: a key the patch omits, or
+/// sends as `null`, keeps its value.
+#[tokio::test]
+async fn patch_configs_tun_merges_over_committed_section() {
+    let mut raw = test_raw_config();
+    raw.tun = Some(
+        serde_yaml::from_str("enable: false\ndevice: utun9\nmtu: 1500\ndns-hijack: [any:53]")
+            .unwrap(),
+    );
+    let state = test_state(raw);
+
+    let resp = patch_configs(
+        &state,
+        serde_json::json!({"tun": {"mtu": 1400, "device": null, "auto-route": "global"}}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let tun = state.raw_config.read().tun.clone().unwrap();
+    assert!(!tun.enable, "an omitted `enable` keeps TUN off");
+    assert_eq!(tun.device.as_deref(), Some("utun9"));
+    assert_eq!(tun.mtu, Some(1400));
+    assert_eq!(tun.dns_hijack, Some(vec!["any:53".to_string()]));
+    assert_eq!(
+        get_configs_json(&state).await["tun"],
+        serde_json::json!({
+            "enable": false,
+            "device": "utun9",
+            "mtu": 1400,
+            "auto-route": "global",
+            "dns-hijack": ["any:53"],
+        })
+    );
+}
+
+/// Unknown keys — mihomo's upstream-only `tun` keys and other top-level
+/// sections (Clash Party sends `dns` with its TUN switch) — are ignored,
+/// not stored and not rejected.
+#[tokio::test]
+async fn patch_configs_tun_ignores_unknown_keys() {
+    let state = test_state(test_raw_config());
+
+    let resp = patch_configs(
+        &state,
+        serde_json::json!({
+            "tun": {
+                "enable": false,
+                "device": "utun9",
+                "stack": "gvisor",
+                "strict-route": true,
+                "auto-detect-interface": true,
+                "not-a-key": 1,
+            },
+            "dns": {"enable": true},
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let tun = state.raw_config.read().tun.clone().unwrap();
+    assert_eq!(tun.device.as_deref(), Some("utun9"));
+    assert!(tun.stack.is_none());
+    assert!(tun.strict_route.is_none());
+    assert!(tun.auto_detect_interface.is_none());
+    assert!(state.raw_config.read().dns.is_none());
+}
+
+/// A patch without `tun` leaves the section and the running listener
+/// alone.
+#[tokio::test]
+async fn patch_configs_without_tun_leaves_tun_untouched() {
+    let mut raw = test_raw_config();
+    raw.tun = Some(serde_yaml::from_str("enable: true\nmtu: 1500").unwrap());
+    let state = test_state(raw);
+    let before = state.raw_config.read().tun.clone();
+    let (handle, stopped) = fake_tun_handle();
+    state.tunnel.set_tun_handle(handle).await;
+    // Let the stand-in listener start: its drop flag exists only once polled.
+    tokio::task::yield_now().await;
+
+    let resp = patch_configs(&state, serde_json::json!({"mode": "direct"})).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(state.raw_config.read().tun, before);
+    assert!(!stopped.load(Ordering::SeqCst));
+    assert!(state.tunnel.has_tun());
+    assert_eq!(get_configs_json(&state).await["mode"], "direct");
+}
+
+/// A `tun` section the listener cannot parse is rejected before anything
+/// is applied, like a `PUT /configs` one: the running listener, the
+/// committed section and the rest of the body stay as they were.
+#[tokio::test]
+async fn patch_configs_tun_rejects_invalid_section() {
+    let mut raw = test_raw_config();
+    raw.tun = Some(serde_yaml::from_str("enable: true\nmtu: 1500").unwrap());
+    let state = test_state(raw);
+    let before = state.raw_config.read().tun.clone();
+    let (handle, stopped) = fake_tun_handle();
+    state.tunnel.set_tun_handle(handle).await;
+    // Let the stand-in listener start: its drop flag exists only once polled.
+    tokio::task::yield_now().await;
+
+    let resp = patch_configs(
+        &state,
+        serde_json::json!({"mode": "direct", "tun": {"mtu": 1000}}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let message = body_json(resp).await["message"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(message.contains("tun.mtu"), "{message}");
+    assert_eq!(state.raw_config.read().tun, before);
+    assert!(!stopped.load(Ordering::SeqCst));
+    assert!(state.tunnel.has_tun());
+    assert_eq!(get_configs_json(&state).await["mode"], "rule");
+}
+
 /// A newly declared provider whose origin never answers must not hold the
 /// `CONFIG_MUTATION` lane. The commit lands on its own, the initial fetch
 /// runs detached, and the next writer is not queued behind a blackholed

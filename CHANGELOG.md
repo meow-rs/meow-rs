@@ -8,6 +8,27 @@ the canonical, in-repo source a release is cut from.
 
 ## [Unreleased]
 
+### Added
+
+- **`PATCH /configs` turns TUN on and off without a restart**: a mihomo
+  GUI's TUN switch, Clash Party's for one, sends
+  `PATCH /configs {"tun": {"enable": true}}` and never restarts the core,
+  but the PATCH only took `mode` and `log-level`, so the switch did nothing
+  and still answered 204. A `tun` object is now merged over the committed
+  `tun:` section and the listener is started, stopped or restarted from the
+  result, the same way `PUT /configs` applies a `tun:` change, matching
+  mihomo. It takes the keys meow implements (`enable`, `device`, `mtu`,
+  `inet4-address`, `inet6-address`, `auto-route`, `outbound-interface`,
+  `dns-hijack`, `udp-timeout`) and ignores the others, such as `stack` and
+  `strict-route`; unlike mihomo, an omitted `enable` keeps the current state
+  rather than turning TUN off. A section the listener cannot parse answers
+  400 and applies nothing. A TUN that fails to start, for lack of
+  permission to create the device or in a build without TUN, is turned off
+  again as on a reload, and the PATCH answers 500 with the reason.
+  `GET /configs` now reports `tun` as well, with `enable` saying whether
+  the listener runs. Like a patched `mode`, the change is kept in memory
+  until the config is saved.
+
 ## [0.25.0] - 2026-10-20
 
 ### Added

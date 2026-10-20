@@ -66,10 +66,22 @@ static files instead.
 
 | Method | Path | Description |
 | --- | --- | --- |
-| `GET` | `/configs` | Current `mode`, `log-level`, ports, controller |
-| `PATCH` | `/configs` | Update `mode` and/or `log-level` → 204 |
+| `GET` | `/configs` | Current `mode`, `log-level`, ports, controller, `tun` |
+| `PATCH` | `/configs` | Update `mode`, `log-level` and/or `tun` → 204 (below) |
 | `PUT` | `/configs` | Hot-reload the whole config (below) |
 | `POST` | `/api/config/save` | Persist the current config to disk (400 when the daemon was started via `--config-string` — there is no backing file) |
+
+`PATCH /configs` with `{ "tun": { "enable": true } }` turns TUN on without a restart,
+as a mihomo GUI's TUN switch expects. The `tun` keys (`enable`, `device`, `mtu`,
+`inet4-address`, `inet6-address`, `auto-route`, `outbound-interface`, `dns-hijack`,
+`udp-timeout`) are merged over the current `tun:` section, so an omitted key, `enable`
+included, keeps its value; other keys are ignored. The listener is then started, stopped
+or restarted the way a `PUT /configs` `tun:` change does it. A section the listener
+cannot parse returns 400 and applies nothing; a TUN that fails to start (no permission to
+create the device, or a build without the `listener-tun` feature) is turned off again and
+the PATCH returns 500 `{ message }`. `GET /configs` reports `tun`, where `enable` is
+whether the listener runs. Like `mode`, the change lives in memory until the config is
+saved.
 
 `PUT /configs` accepts `{ "path": "/path/to/config.yaml" }` or
 `{ "payload": "<base64-yaml>" }`. Add `?force=true` to apply despite validation errors

@@ -34,7 +34,7 @@ Status meanings:
 | `GET /providers/proxies/{name}/healthcheck` | Compatible | Uses provider health-check configuration and returns 204. |
 | `GET /providers/proxies/{provider}/{proxy}[/healthcheck]` | Compatible | Provider member detail and delay probe. |
 | `GET/PUT /providers/rules[/{name}]` | Compatible | Includes format, vehicle type, rule count, and RFC 3339 update time. |
-| `GET/PATCH /configs` | Partial | Runtime mode and log level are mutable. Dynamic listeners, TUN/TUIC, and interface changes are unavailable. |
+| `GET/PATCH /configs` | Partial | Mode, log level and `tun` are mutable. A `tun` patch is merged over the current section and the TUN listener is started, stopped or restarted from the result, matching mihomo, with two differences: an omitted `enable` keeps the current state instead of turning TUN off, and a TUN that fails to start answers 500 instead of 204. Only the `tun` keys meow implements apply; the rest are ignored. `GET` reports `tun` with `enable` as the running state. Ports, `allow-lan`, `bind-address`, `ipv6`, `sniffing`, `tcp-concurrent`, `find-process-mode`, `interface-name`, TUIC and the other dynamic listeners are unavailable. |
 | `PUT /configs` | Partial | Reloads proxies/rules/mode while retaining providers and selection persistence; the DNS runtime is republished on input changes and the TUN listener restarts on `tun:` diffs, but ordinary listener hot replacement is unavailable. |
 | `POST /cache/dns/flush` | Compatible | Clears resolver cache. |
 | `POST /cache/fakeip/flush` | Compatible | Clears fake-IP allocations. |
