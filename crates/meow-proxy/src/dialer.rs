@@ -9,6 +9,7 @@
 //!
 //! upstream: mihomo `component/proxydialer` + `BasicOption.NewDialer`.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::fmt;
 use std::io;
@@ -1005,7 +1006,9 @@ impl NamedProxyDialer {
 /// member it took, and say who it is put down to
 /// ([`meow_common::ChainHealth::blame`]). The member, unless the group
 /// keeps verdicts and the hop has a target: not over UDP, and not through a
-/// member that is an automatic group itself, which keeps its own.
+/// member that is an automatic group itself, which keeps its own. A member
+/// the group took with every usable one blocked for the target
+/// ([`FrontHop::last_resort`]) puts it down to the target.
 fn blame_front_hop(front: &Arc<dyn Proxy>) -> Blame {
     let (Some(health), Some(member)) = (front.chain_health(), crate::group::last_pick()) else {
         return Blame::Member;
@@ -1014,7 +1017,14 @@ fn blame_front_hop(front: &Arc<dyn Proxy>) -> Blame {
         return Blame::Member;
     }
     FRONT_HOP
-        .try_with(|hop| health.blame(&hop.target, member.name()))
+        .try_with(|hop| {
+            let blame = health.blame(&hop.target, member.name());
+            if hop.last_resort.get() {
+                Blame::Target
+            } else {
+                blame
+            }
+        })
         .unwrap_or(Blame::Member)
 }
 
@@ -1047,6 +1057,12 @@ pub(crate) struct FrontHop {
     pub(crate) target: ChainTarget,
     /// The outbound dialling through the front, when known.
     pub(crate) owner: Option<SmolStr>,
+    /// The group dialling the front hop took a member blocked for the
+    /// target, which it does only with every usable member blocked
+    /// (`front_hop_pick` in the group module). The target is the likelier
+    /// fault then, so a failure through that member counts against the
+    /// chained outbound. Set by [`note_last_resort`].
+    last_resort: Cell<bool>,
 }
 
 /// The front hop in flight, when a dial for `metadata` is one: a group on
@@ -1061,6 +1077,20 @@ pub(crate) fn front_hop_for(metadata: &Metadata) -> Option<FrontHop> {
         })
         .ok()
         .flatten()
+}
+
+/// Note whether the member a group took for the front hop in flight is its
+/// last resort ([`FrontHop::last_resort`]).
+pub(crate) fn note_last_resort(last_resort: bool) {
+    let _ = FRONT_HOP.try_with(|hop| hop.last_resort.set(last_resort));
+}
+
+/// Whether the member a group took for the front hop in flight is its last
+/// resort ([`FrontHop::last_resort`]).
+pub(crate) fn front_hop_last_resort() -> bool {
+    FRONT_HOP
+        .try_with(|hop| hop.last_resort.get())
+        .unwrap_or(false)
 }
 
 /// Run `f`, a front-hop dial, with [`FRONT_HOP`] set to `hop`.
@@ -1162,6 +1192,7 @@ impl NamedProxyDialer {
                 let hop = ChainTarget::from_metadata(&meta).map(|target| FrontHop {
                     target,
                     owner: self.owner.clone(),
+                    last_resort: Cell::new(false),
                 });
                 scoped_front_hop(hop, self.dial_front(meta)).await
             },

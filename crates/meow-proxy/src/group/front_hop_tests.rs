@@ -319,10 +319,13 @@ async fn a_url_test_front_keeps_chains_on_their_carrier() {
 /// A burst of dials through a front member that closes the server's port
 /// before any reply, a member that never carried a chain there: each fails
 /// for the member, so `风之谷` keeps `daniel`, and the next dial goes
-/// through the next member.
+/// through the next member. The member is blocked while the rest of the
+/// burst is in flight, which makes none of them a last resort: `fast` took
+/// it unblocked.
 #[tokio::test]
 async fn a_burst_through_an_unproven_front_member_keeps_the_outbound() {
     use super::test_support::StreamProxy;
+    use meow_common::chain_health::PASSIVE_STRIKES;
     let audited = StreamProxy::auditing("SG-01", "10.0.0.1:443", 8443);
     audited.set_delay(10);
     let clean = StreamProxy::new("HK-01", "10.0.0.2:443");
@@ -332,14 +335,16 @@ async fn a_burst_through_an_unproven_front_member_keeps_the_outbound() {
         Arc::clone(&clean) as Arc<dyn Proxy>,
     ]);
 
+    // Enough that the failures after the block would take `daniel` down.
+    let size = usize::from(PASSIVE_STRIKES) + DIAL_FAILURE_THRESHOLD as usize;
     let metadata = Metadata::default();
-    let burst = (0..6).map(|_| w.wind.dial_tcp(&metadata));
+    let burst = (0..size).map(|_| w.wind.dial_tcp(&metadata));
     let failed = futures::future::join_all(burst)
         .await
         .iter()
         .filter(|r| r.is_err())
         .count();
-    assert_eq!((failed, audited.dials()), (6, 6));
+    assert_eq!((failed, audited.dials()), (size, size));
     assert!(w.daniel.alive());
     assert!(w.wind.dial_tcp(&metadata).await.is_ok());
     assert_eq!(clean.dials(), 1);
@@ -551,4 +556,77 @@ async fn a_server_that_refuses_every_chain_takes_the_outbound_down() {
     assert_eq!(dials, BLAMED_MEMBERS + 1);
     let alive = members.iter().filter(|m| m.alive()).count();
     assert_eq!(alive, members.len() - dials);
+}
+
+/// Block `names` for [`target`] in `fast`'s chain health, as an earlier
+/// outage of the server would have.
+fn blocked_before(w: &Wind, names: &[&str]) {
+    let health = w.fast.chain_health().unwrap();
+    for name in names {
+        for _ in 0..meow_common::chain_health::PASSIVE_STRIKES {
+            health.record_failed(&target(), name, ChainVerdict::Passive, CLOSED_BEFORE_REPLY);
+        }
+        assert!(health.is_blocked(&target(), name));
+    }
+}
+
+/// The server closing every chain again while a member is still blocked
+/// from its last outage: once the other members are blocked too, `fast`
+/// dials its own pick with nowhere else to go, and those failures count
+/// against `daniel`, although no 4th member failed it in a row.
+#[tokio::test]
+async fn a_server_that_closes_every_chain_takes_the_outbound_down_with_members_left_blocked() {
+    use super::test_support::StreamProxy;
+    use meow_common::chain_health::{BLAMED_MEMBERS, PASSIVE_STRIKES};
+    let members: Vec<Arc<StreamProxy>> = (0..=BLAMED_MEMBERS as u16)
+        .map(|i| {
+            let member =
+                StreamProxy::auditing(&format!("M{i}"), &format!("10.0.0.{}:443", i + 1), 8443);
+            member.set_delay(10 + i);
+            member
+        })
+        .collect();
+    let w = wind_over(
+        members
+            .iter()
+            .map(|m| Arc::clone(m) as Arc<dyn Proxy>)
+            .collect(),
+    );
+    blocked_before(&w, &[&format!("M{BLAMED_MEMBERS}")]);
+
+    let dials = dials_until_daniel_is_down(&w, 32).await;
+    assert_eq!(
+        dials,
+        BLAMED_MEMBERS * usize::from(PASSIVE_STRIKES) + DIAL_FAILURE_THRESHOLD as usize
+    );
+    assert_eq!(
+        members[BLAMED_MEMBERS].dials(),
+        0,
+        "the member blocked before is not dialled"
+    );
+}
+
+/// Every member of `fast` blocked for the server, and the server's chains
+/// failing in the dial: the member `fast` takes anyway is its last resort,
+/// so the failures count against `daniel` at once rather than after
+/// `fast` marks members dead one by one.
+#[tokio::test]
+async fn a_failed_dial_through_a_last_resort_member_counts_against_the_outbound() {
+    let members: Vec<Arc<MockProxy>> = (0..4u16)
+        .map(|i| {
+            let member = MockProxy::new_failing(&format!("M{i}"), AdapterType::Vless, "early eof");
+            member.set_delay(10 + i);
+            member
+        })
+        .collect();
+    let w = wind_over(
+        members
+            .iter()
+            .map(|m| Arc::clone(m) as Arc<dyn Proxy>)
+            .collect(),
+    );
+    blocked_before(&w, &["M0", "M1", "M2", "M3"]);
+
+    let dials = dials_until_daniel_is_down(&w, 12).await;
+    assert_eq!(dials, DIAL_FAILURE_THRESHOLD as usize);
 }

@@ -337,6 +337,9 @@ impl ProxyAdapter for UrlTestGroup {
         let (proxy, front_hop) = self
             .pick_for(metadata, true)
             .ok_or_else(|| MeowError::Proxy("no proxy available".into()))?;
+        if let Some(target) = &front_hop {
+            super::note_front_hop_member(&self.chain_health, target, &proxy);
+        }
         let attempt = super::DialAttempt::new(&self.name, &self.dial_failures, &proxy);
         let conn = attempt.run(proxy.dial_tcp(metadata)).await?;
         Ok(match front_hop {

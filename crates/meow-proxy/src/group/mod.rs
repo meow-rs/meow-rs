@@ -232,7 +232,9 @@ struct MemberDial {
 /// [`meow_common::chain_health::BLAMED_MEMBERS`] have failed the server in
 /// a row ([`ChainHealth::blame`]): a server that is down would otherwise
 /// fail through each member of the group in turn before the outbound
-/// counted it.
+/// counted it. And so does a member the group took with every usable one
+/// blocked for the server ([`note_front_hop_member`]), which no other
+/// member can stand in for.
 pub(crate) fn front_hop_failed() {
     let _ = MEMBER_DIAL.try_with(|dial| dial.front_failed.set(true));
 }
@@ -374,8 +376,9 @@ pub(super) fn front_hop_target(
 /// `members` that `usable` accepts and that is not blocked. `members` comes
 /// in the group's preference order. With every usable member blocked the
 /// target itself is the likelier fault, so the group's own pick stands
-/// rather than a dial with nowhere to go. A dial (`dial`) notes a member
-/// other than `pick` on the connection.
+/// rather than a dial with nowhere to go, and a failure through it counts
+/// against the chained outbound ([`note_front_hop_member`]). A dial
+/// (`dial`) notes a member other than `pick` on the connection.
 #[allow(
     clippy::too_many_arguments,
     reason = "one call per group kind; a struct would only name the same values"
@@ -421,6 +424,24 @@ pub(super) fn front_hop_pick(
     alternative
 }
 
+/// Note on the front hop in flight whether `member`, the member a group is
+/// about to dial for it, is blocked for `target`. A group takes a blocked
+/// member only with every usable one blocked ([`front_hop_pick`]), and then
+/// the target is the likelier fault: a failure through the member counts
+/// against the chained outbound, on a dial error and on a chain closed
+/// before any reply alike, and strikes no member. Without this, a group
+/// with members blocked before the server went down, or with no more
+/// members than [`meow_common::chain_health::BLAMED_MEMBERS`], had too few
+/// left to fail it in a row, and the outbound was excused for as long as
+/// the server stayed down.
+pub(super) fn note_front_hop_member(
+    health: &ChainHealth,
+    target: &ChainTarget,
+    member: &Arc<dyn Proxy>,
+) {
+    crate::dialer::note_last_resort(health.is_blocked(target, member.name()));
+}
+
 /// Judge `conn`, a front hop to `target` through `member`, on its first
 /// read (see [`meow_common::chain_health`]). A member that is an automatic
 /// group itself judges its own pick, so it is not wrapped again.
@@ -443,6 +464,7 @@ pub(super) fn watch_front_hop(
             target,
             member: Arc::clone(member),
             carrier,
+            last_resort: crate::dialer::front_hop_last_resort(),
             wrote: false,
             shut: false,
         }),
@@ -487,7 +509,9 @@ pub(crate) fn carrier_changed(
 /// dial's deadline, once the chained protocol has written. EOF before any
 /// write, or after our own shutdown, says nothing about the member. A
 /// failure the table puts down to the target ([`ChainHealth::blame`])
-/// strikes no member and counts against the chained outbound.
+/// strikes no member and counts against the chained outbound, as does one
+/// through a member the group took as its last resort
+/// ([`note_front_hop_member`]).
 struct FrontHopConn {
     conn: Box<dyn ProxyConn>,
     /// `None` once the verdict is in.
@@ -501,6 +525,9 @@ struct PendingVerdict {
     member: Arc<dyn Proxy>,
     /// The member carried the target's chains when this one started.
     carrier: bool,
+    /// The group took the member with every usable one blocked for the
+    /// target ([`note_front_hop_member`]).
+    last_resort: bool,
     wrote: bool,
     shut: bool,
 }
@@ -518,10 +545,12 @@ impl FrontHopConn {
             }
             return;
         };
-        if verdict.health.blame(&verdict.target, member) == Blame::Target {
+        let blame = verdict.health.blame(&verdict.target, member);
+        if blame == Blame::Target || verdict.last_resort {
             debug!(
-                "proxy-group '{}': dialer-proxy chains to {} fail through member after member \
-                 ({reason} through '{member}'); counting it against the chained outbound",
+                "proxy-group '{}': dialer-proxy chain to {} failed through '{member}' \
+                 ({reason}), the likelier fault of that server; counting it against the \
+                 chained outbound",
                 verdict.group, verdict.target
             );
             return;

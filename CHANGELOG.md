@@ -80,7 +80,11 @@ the canonical, in-repo source a release is cut from.
     no member, until a member reaches it again. Without the bound, a
     server that was down struck every member of the front group in turn,
     and a front member that reports the refusal in its dial (hysteria2)
-    was marked dead, all before the outbound left its group.
+    was marked dead, all before the outbound left its group. A member the
+    group dials with every usable one blocked for the server is its last
+    resort, and its failures count against the outbound too: blocks left
+    from an earlier outage, or a group of 3 members or fewer, no longer
+    leave too few members to fail the server in a row.
   - The 5 s dial deadline is judged the same way: a front member whose
     dial hangs times out inside its own group's dial, which counts it, and
     a chained handshake left unanswered until the deadline (a member that
