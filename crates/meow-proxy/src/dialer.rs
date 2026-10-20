@@ -22,7 +22,7 @@ use meow_common::atomic::Int;
 use meow_common::conn_note;
 use meow_common::traffic::{ProxyTraffic, ProxyTrafficSource};
 use meow_common::{
-    AdapterType, ChainTarget, ConnType, MeowError, Metadata, Network, Proxy, ProxyConn,
+    AdapterType, Blame, ChainTarget, ConnType, MeowError, Metadata, Network, Proxy, ProxyConn,
     ProxyPacketConn,
 };
 use meow_transport::Stream;
@@ -988,17 +988,34 @@ impl NamedProxyDialer {
     /// still has a live member besides the one it took is the group's
     /// failure, not the outbound's; see [`crate::group::front_hop_failed`].
     /// A single front, or a group with nothing else left alive, is the
-    /// outbound's only way out.
+    /// outbound's only way out. A failure the group puts down to the
+    /// server (see [`blame_front_hop`]) is the outbound's too.
     fn judge_front<T>(&self, result: &io::Result<T>) {
         if result.is_err()
-            && self
-                .target
-                .resolve()
-                .is_some_and(|front| has_live_member(&front))
+            && self.target.resolve().is_some_and(|front| {
+                blame_front_hop(&front) == Blame::Member && has_live_member(&front)
+            })
         {
             crate::group::front_hop_failed();
         }
     }
+}
+
+/// Record a failed front hop through `front` in its chain health, for the
+/// member it took, and say who it is put down to
+/// ([`meow_common::ChainHealth::blame`]). The member, unless the group
+/// keeps verdicts and the hop has a target: not over UDP, and not through a
+/// member that is an automatic group itself, which keeps its own.
+fn blame_front_hop(front: &Arc<dyn Proxy>) -> Blame {
+    let (Some(health), Some(member)) = (front.chain_health(), crate::group::last_pick()) else {
+        return Blame::Member;
+    };
+    if member.chain_health().is_some() {
+        return Blame::Member;
+    }
+    FRONT_HOP
+        .try_with(|hop| health.blame(&hop.target, member.name()))
+        .unwrap_or(Blame::Member)
 }
 
 /// Whether `front` is an automatic group with a live member other than the

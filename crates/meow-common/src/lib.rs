@@ -46,7 +46,8 @@ pub use adapter_type::{AdapterType, ConnType};
 pub use auth::{AuthConfig, Credentials};
 pub use backoff::ErrorBackoff;
 pub use chain_health::{
-    failure_reason, CarrierChange, ChainHealth, ChainTarget, ChainVerdict, CLOSED_BEFORE_REPLY,
+    failure_reason, Blame, CarrierChange, ChainHealth, ChainTarget, ChainVerdict,
+    CLOSED_BEFORE_REPLY,
 };
 pub use conn::{ProxyConn, ProxyPacketConn, UdpPacket};
 pub use dial::{with_dial_timeout, DIAL_TIMEOUT};

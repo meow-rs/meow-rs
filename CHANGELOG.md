@@ -74,6 +74,13 @@ the canonical, in-repo source a release is cut from.
     since its server is then the likelier fault, and so does the failure
     of the front group's last live member, at once rather than after that
     member is given up on.
+  - At most 3 members take the blame for one server in a row. When a 4th
+    member fails it too, with none reaching it in between, the server is
+    the likelier fault: its failures count against the outbound and block
+    no member, until a member reaches it again. Without the bound, a
+    server that was down struck every member of the front group in turn,
+    and a front member that reports the refusal in its dial (hysteria2)
+    was marked dead, all before the outbound left its group.
   - The 5 s dial deadline is judged the same way: a front member whose
     dial hangs times out inside its own group's dial, which counts it, and
     a chained handshake left unanswered until the deadline (a member that

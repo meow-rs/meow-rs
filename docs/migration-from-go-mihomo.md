@@ -778,7 +778,10 @@ The following are unsupported or intentionally rejected:
   The skip holds for that server only, and other traffic through the group
   still uses its normal pick. Blocks back off from 5 minutes to 6 hours,
   and any success clears them. With every live member blocked, the group's
-  own pick stands. There is no config change and `select` groups are
+  own pick stands. When a 4th member in a row fails the same server, none
+  reaching it in between, the server is taken for the fault: its chains
+  count against the chained outbound and block no member until one
+  reaches it again. There is no config change and `select` groups are
   untouched. Not
   covered: UDP chains, and outbounds on the relay-based fallback wrapper
   (`anytls`, `hysteria2`, `ss` with an external plugin), whose front hop

@@ -217,7 +217,8 @@ pub const CHAIN_PROBE_LIMIT: usize = 12;
 
 /// Members a sweep's [chain check](sweep_members) tries at most before it
 /// takes a chained outbound for down, besides the one the outbound's own
-/// probe went through.
+/// probe went through. Dials take the server for down after as many
+/// members ([`meow_common::chain_health::BLAMED_MEMBERS`]).
 pub const CHAIN_CHECK_LIMIT: usize = 3;
 
 /// What one chain probe round found, by member name.

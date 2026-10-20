@@ -30,6 +30,15 @@
 //! it, and one more failure blocks it again for twice as long. Any success
 //! clears the member.
 //!
+//! A failed front hop is put down to its member only while few members
+//! fail the target in a row ([`ChainHealth::blame`]). Once more than
+//! [`BLAMED_MEMBERS`] have failed it with none reaching it between, the
+//! target's server is the likelier fault: its failures count against the
+//! chained outbound and block no member, until a member reaches it again.
+//! Without this, a server that is down took a strike for every member of
+//! the group in turn, and the outbound stayed in its own groups until each
+//! member was blocked.
+//!
 //! A table that tracks carriers ([`ChainHealth::tracking_carriers`]) also
 //! remembers, per target, the member that last carried a chain there. A
 //! url-test group keeps a target's front hops on its carrier while that
@@ -65,6 +74,12 @@ pub const BASE_BLOCK: Duration = Duration::from_secs(5 * 60);
 /// block that runs out costs a user connection to find the member still
 /// failing, while a passing probe clears a block whatever its length.
 pub const MAX_BLOCK: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// Members a target's failed front hops are put down to, in a row with none
+/// reaching it between ([`ChainHealth::blame`]). The health check's chain
+/// check likewise takes a chained outbound for down after the member its
+/// probe went through and three more (`CHAIN_CHECK_LIMIT` in meow-proxy).
+pub const BLAMED_MEMBERS: usize = 3;
 
 /// Targets one group remembers. A chain target is a proxy server, so a real
 /// config has a handful; the bound only caps a provider that churns server
@@ -139,11 +154,24 @@ pub enum ChainVerdict {
     Probe { hold: Duration },
 }
 
-/// A target's entry: outbounds seen dialling it, members with a record and
-/// the member carrying its chains.
+/// Who a failed front hop is put down to ([`ChainHealth::blame`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Blame {
+    /// The member it went through.
+    Member,
+    /// The target: more than [`BLAMED_MEMBERS`] members failed it with none
+    /// reaching it between, so its server is the likelier fault.
+    Target,
+}
+
+/// A target's entry: outbounds seen dialling it, members with a record,
+/// the members failing it and the member carrying its chains.
 struct TargetState {
     owners: Vec<SmolStr>,
     members: HashMap<SmolStr, MemberState>,
+    /// Members whose front hops failed the target since one last reached
+    /// it, one past [`BLAMED_MEMBERS`] at most.
+    failing: Vec<SmolStr>,
     carrier: Option<SmolStr>,
     used: Instant,
 }
@@ -153,6 +181,7 @@ impl TargetState {
         Self {
             owners: Vec::new(),
             members: HashMap::new(),
+            failing: Vec::new(),
             carrier: None,
             used: now,
         }
@@ -160,6 +189,17 @@ impl TargetState {
 
     fn is_blocked_at(&self, member: &str, now: Instant) -> bool {
         self.members.get(member).is_some_and(|m| m.blocked_at(now))
+    }
+
+    fn blame(&mut self, member: &str) -> Blame {
+        if self.failing.len() <= BLAMED_MEMBERS && !self.failing.iter().any(|m| m == member) {
+            self.failing.push(SmolStr::new(member));
+        }
+        if self.failing.len() > BLAMED_MEMBERS {
+            Blame::Target
+        } else {
+            Blame::Member
+        }
     }
 }
 
@@ -309,7 +349,8 @@ impl ChainHealth {
     }
 
     /// A front hop to `target` through `member` worked: forget the member's
-    /// record. A table tracking carriers makes `member` the target's
+    /// record, and the members failing the target ([`Self::blame`]). A
+    /// table tracking carriers makes `member` the target's
     /// carrier, as the dial chose it; returns the change when it replaced
     /// another member.
     pub fn record_reached(&self, target: &ChainTarget, member: &str) -> Option<CarrierChange> {
@@ -317,7 +358,8 @@ impl ChainHealth {
     }
 
     /// A chain probe to `target` through `member` worked: forget the
-    /// member's record. It becomes the carrier only when the target has
+    /// member's record, as [`Self::record_reached`] does. It becomes the
+    /// carrier only when the target has
     /// none, or its carrier is blocked or, as the caller sees it
     /// (`carrier_down`), no longer a live member of the group: a probe round
     /// reaches through several members, and the carrier stays while it
@@ -346,14 +388,16 @@ impl ChainHealth {
         {
             let targets = self.targets.read();
             let state = targets.get(target);
-            let known = state.is_some_and(|state| state.members.contains_key(member));
+            let recorded = state.is_some_and(|state| {
+                state.members.contains_key(member) || !state.failing.is_empty()
+            });
             let settled = !self.carriers
                 || state.is_some_and(|state| match &state.carrier {
                     Some(carrier) if carrier == member => true,
                     Some(carrier) => reach == Reach::Probe && !state.is_blocked_at(carrier, now),
                     None => false,
                 });
-            if !known && settled {
+            if !recorded && settled {
                 return None;
             }
         }
@@ -364,6 +408,7 @@ impl ChainHealth {
             targets.get_mut(target)?
         };
         state.members.remove(member);
+        state.failing.clear();
         if !self.carriers || state.carrier.as_deref() == Some(member) {
             return None;
         }
@@ -401,6 +446,19 @@ impl ChainHealth {
         reason: &'static str,
     ) -> Option<Duration> {
         self.failed_at(target, member, verdict, reason, Instant::now())
+    }
+
+    /// Who a failed front hop to `target` through `member` is put down to:
+    /// the member while it is one of the first [`BLAMED_MEMBERS`] to fail
+    /// the target since a member last reached it, and the target from the
+    /// next one on, until a member reaches it again. A target whose server
+    /// is down fails through every member, and its failures are its own:
+    /// they count against the chained outbound, and should block no member
+    /// ([`Self::record_failed`]), or the members would all be blocked when
+    /// it comes back.
+    pub fn blame(&self, target: &ChainTarget, member: &str) -> Blame {
+        let mut targets = self.targets.write();
+        entry(&mut targets, target, Instant::now()).blame(member)
     }
 
     #[cfg(test)]
@@ -799,6 +857,57 @@ mod tests {
         health.failed_at(&t, "HK-01", ChainVerdict::Passive, "closed", now);
         let change = health.reached_at(&t, "HK-02", Reach::Dial, now).unwrap();
         assert_eq!(change.reason, None, "one strike does not block");
+    }
+
+    #[test]
+    fn members_take_the_blame_until_too_many_fail_in_a_row() {
+        let health = ChainHealth::tracking_carriers();
+        let t = target();
+        let members: Vec<String> = (0..=BLAMED_MEMBERS).map(|i| format!("m{i}")).collect();
+        for member in &members[..BLAMED_MEMBERS] {
+            assert_eq!(health.blame(&t, member), Blame::Member);
+            assert_eq!(
+                health.blame(&t, member),
+                Blame::Member,
+                "a member failing again is no new member"
+            );
+        }
+        let last = &members[BLAMED_MEMBERS];
+        assert_eq!(health.blame(&t, last), Blame::Target);
+        assert_eq!(
+            health.blame(&t, &members[0]),
+            Blame::Target,
+            "the target stays at fault until a member reaches it"
+        );
+        let other = ChainTarget::Host {
+            host: "other.example.com".into(),
+            port: 8443,
+        };
+        assert_eq!(
+            health.blame(&other, last),
+            Blame::Member,
+            "that target only"
+        );
+
+        health.record_reached(&t, last);
+        assert_eq!(health.blame(&t, &members[0]), Blame::Member);
+    }
+
+    #[test]
+    fn any_reach_clears_the_failing_members() {
+        // A probe through a member with no record of its own, while the
+        // carrier works, and in a table without carriers.
+        let with_carrier = ChainHealth::tracking_carriers();
+        with_carrier.record_reached(&target(), "carrier");
+        for health in [with_carrier, ChainHealth::new()] {
+            let t = target();
+            for i in 0..=BLAMED_MEMBERS {
+                health.blame(&t, &format!("m{i}"));
+            }
+            assert_eq!(health.blame(&t, "m0"), Blame::Target);
+            assert_eq!(health.record_probe_reached(&t, "clean", false), None);
+            assert_eq!(health.blame(&t, "m0"), Blame::Member);
+        }
     }
 
     #[test]

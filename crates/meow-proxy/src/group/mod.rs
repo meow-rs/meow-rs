@@ -1,8 +1,8 @@
 use meow_common::atomic::AtomicU;
 use meow_common::logbook::{self, Level};
 use meow_common::{
-    conn_note, failure_reason, AdapterType, CarrierChange, ChainHealth, ChainTarget, ChainVerdict,
-    MeowError, Metadata, Proxy, ProxyConn, CLOSED_BEFORE_REPLY,
+    conn_note, failure_reason, AdapterType, Blame, CarrierChange, ChainHealth, ChainTarget,
+    ChainVerdict, MeowError, Metadata, Proxy, ProxyConn, CLOSED_BEFORE_REPLY,
 };
 use parking_lot::Mutex;
 use smol_str::SmolStr;
@@ -228,9 +228,21 @@ struct MemberDial {
 /// drops the server's port would mark it dead after five
 /// (`DialFailureTracker`). A carrier that fails still counts against the
 /// outbound: a member known to reach the server failing is the likelier
-/// sign that the server is down.
+/// sign that the server is down. So does any member once more than
+/// [`meow_common::chain_health::BLAMED_MEMBERS`] have failed the server in
+/// a row ([`ChainHealth::blame`]): a server that is down would otherwise
+/// fail through each member of the group in turn before the outbound
+/// counted it.
 pub(crate) fn front_hop_failed() {
     let _ = MEMBER_DIAL.try_with(|dial| dial.front_failed.set(true));
+}
+
+/// The member the last group dialled on the current member dial took.
+pub(crate) fn last_pick() -> Option<Arc<dyn Proxy>> {
+    MEMBER_DIAL
+        .try_with(|dial| dial.pick.borrow().clone())
+        .ok()
+        .flatten()
 }
 
 /// Whether the last group dialled on the current member dial took the
@@ -473,7 +485,9 @@ pub(crate) fn carrier_changed(
 /// A front-hop stream that settles one verdict for its member: reached on
 /// the first byte read; failed on EOF or an error before that, or on the
 /// dial's deadline, once the chained protocol has written. EOF before any
-/// write, or after our own shutdown, says nothing about the member.
+/// write, or after our own shutdown, says nothing about the member. A
+/// failure the table puts down to the target ([`ChainHealth::blame`])
+/// strikes no member and counts against the chained outbound.
 struct FrontHopConn {
     conn: Box<dyn ProxyConn>,
     /// `None` once the verdict is in.
@@ -504,6 +518,14 @@ impl FrontHopConn {
             }
             return;
         };
+        if verdict.health.blame(&verdict.target, member) == Blame::Target {
+            debug!(
+                "proxy-group '{}': dialer-proxy chains to {} fail through member after member \
+                 ({reason} through '{member}'); counting it against the chained outbound",
+                verdict.group, verdict.target
+            );
+            return;
+        }
         if !verdict.carrier {
             front_hop_failed();
         }

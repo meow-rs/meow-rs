@@ -465,3 +465,90 @@ async fn a_carrier_that_black_holes_the_server_counts_against_the_outbound() {
     futures::future::join_all(burst).await;
     assert!(!w.daniel.alive());
 }
+
+/// `风之谷`'s dials until it gives up on `daniel`, each one failing, at most
+/// `limit`.
+async fn dials_until_daniel_is_down(w: &Wind, limit: usize) -> usize {
+    let mut dials = 0;
+    while w.daniel.alive() {
+        assert!(
+            dials < limit,
+            "daniel is still up after {dials} failed dials"
+        );
+        assert!(w.wind.dial_tcp(&Metadata::default()).await.is_err());
+        dials += 1;
+    }
+    dials
+}
+
+/// `daniel`'s server is down and closes every chain, through any member of
+/// `fast`. The first members to fail it take the blame, each blocked after
+/// two strikes; the next one makes the server the likelier fault, so its
+/// failures count against `daniel` and block no member, and `风之谷` gives
+/// up on `daniel` however many members `fast` has.
+#[tokio::test]
+async fn a_server_that_closes_every_chain_takes_the_outbound_down() {
+    use super::test_support::StreamProxy;
+    use meow_common::chain_health::{BLAMED_MEMBERS, PASSIVE_STRIKES};
+    let members: Vec<Arc<StreamProxy>> = (0..8u16)
+        .map(|i| {
+            let member =
+                StreamProxy::auditing(&format!("M{i}"), &format!("10.0.0.{}:443", i + 1), 8443);
+            member.set_delay(10 + i);
+            member
+        })
+        .collect();
+    let w = wind_over(
+        members
+            .iter()
+            .map(|m| Arc::clone(m) as Arc<dyn Proxy>)
+            .collect(),
+    );
+
+    let dials = dials_until_daniel_is_down(&w, 32).await;
+    assert_eq!(
+        dials,
+        BLAMED_MEMBERS * usize::from(PASSIVE_STRIKES) + DIAL_FAILURE_THRESHOLD as usize
+    );
+    let health = w.fast.chain_health().unwrap();
+    let blocked: Vec<String> = (0..members.len())
+        .map(|i| format!("M{i}"))
+        .filter(|name| health.is_blocked(&target(), name))
+        .collect();
+    assert_eq!(blocked, ["M0", "M1", "M2"]);
+    let front_dials = || members.iter().map(|m| m.dials()).sum::<usize>();
+    let before = front_dials();
+    let _ = w.wind.dial_tcp(&Metadata::default()).await;
+    assert_eq!(front_dials(), before, "风之谷 dials daniel-eu now");
+}
+
+/// The same server refusing every chain, through front members that report
+/// it in the dial, as hysteria2 does: `fast` marks each member dead, and
+/// once the server is the likelier fault, the refusal takes `daniel` down at
+/// once, rather than after every member of `fast` is gone.
+#[tokio::test]
+async fn a_server_that_refuses_every_chain_takes_the_outbound_down() {
+    use meow_common::chain_health::BLAMED_MEMBERS;
+    let members: Vec<Arc<MockProxy>> = (0..8u16)
+        .map(|i| {
+            let member = MockProxy::new_failing(
+                &format!("M{i}"),
+                AdapterType::Hysteria2,
+                "remote TCP error: connection refused",
+            );
+            member.set_delay(10 + i);
+            member
+        })
+        .collect();
+    let w = wind_over(
+        members
+            .iter()
+            .map(|m| Arc::clone(m) as Arc<dyn Proxy>)
+            .collect(),
+    );
+
+    let dials = dials_until_daniel_is_down(&w, 16).await;
+    assert_eq!(dials, BLAMED_MEMBERS + 1);
+    let alive = members.iter().filter(|m| m.alive()).count();
+    assert_eq!(alive, members.len() - dials);
+}
