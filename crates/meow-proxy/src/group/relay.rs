@@ -45,8 +45,8 @@ use super::dialer_proxy::DialerProxyAdapter;
 use async_trait::async_trait;
 use meow_common::traffic::ProxyTraffic;
 use meow_common::{
-    AdapterType, MeowError, Metadata, Proxy, ProxyAdapter, ProxyConn, ProxyHealth, ProxyPacketConn,
-    Result,
+    AdapterType, GroupDisplay, MeowError, Metadata, Proxy, ProxyAdapter, ProxyConn, ProxyHealth,
+    ProxyPacketConn, Result,
 };
 use smol_str::SmolStr;
 use std::sync::Arc;
@@ -452,6 +452,7 @@ pub struct RelayGroup {
     name: SmolStr,
     proxies: Vec<Arc<dyn Proxy>>,
     health: ProxyHealth, // for API surface; relay has no self-health-check
+    display: GroupDisplay,
 }
 
 impl RelayGroup {
@@ -469,7 +470,16 @@ impl RelayGroup {
             name: SmolStr::from(name),
             proxies,
             health: ProxyHealth::new(),
+            display: GroupDisplay::default(),
         }
+    }
+
+    /// Attach the group's `hidden:` / `icon:` keys, which `GET /proxies`
+    /// reports on the group.
+    #[must_use]
+    pub fn with_display(mut self, display: GroupDisplay) -> Self {
+        self.display = display;
+        self
     }
 }
 
@@ -572,6 +582,10 @@ impl Proxy for RelayGroup {
 
     fn member_proxies(&self) -> Option<Vec<Arc<dyn Proxy>>> {
         Some(self.proxies.clone())
+    }
+
+    fn group_display(&self) -> Option<&GroupDisplay> {
+        Some(&self.display)
     }
 }
 

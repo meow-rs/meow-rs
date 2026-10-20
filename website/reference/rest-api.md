@@ -38,11 +38,25 @@ static files instead.
 
 | Method | Path | Description |
 | --- | --- | --- |
-| `GET` | `/proxies` | All proxies and groups |
-| `GET` | `/proxies/{name}` | One proxy/group (name, type, alive, history, udp, `all`, `now`) |
+| `GET` | `/proxies` | All proxies and groups (provider nodes are listed under `/providers/proxies`) |
+| `GET` | `/proxies/{name}` | One proxy/group (name, type, alive, history, udp, `provider-name`; groups add `all`, `now`, `hidden`, `icon`); also finds a provider node |
 | `PUT` | `/proxies/{name}` | Select a member in a group — body `{ "name": "member" }` → 204 |
-| `GET` | `/proxies/{name}/delay` | Probe delay — query `url`, `timeout`, `expected` |
+| `GET` | `/proxies/{name}/delay` | Probe delay — query `url`, `timeout`, `expected`; also probes a provider node |
 | `GET` | `/group/{name}/delay` | Probe every member of a group |
+
+Every proxy object carries `provider-name`: the name of the proxy-provider
+that supplied the node, or `""` for `proxies:` entries, groups and the
+built-ins. Every group object carries `hidden` and `icon`, the group's
+`hidden:` / `icon:` keys (`false` / `""` when unset); GUIs use them to leave a
+group out of their list and to draw its icon.
+
+`GET /proxies` lists the route table, as mihomo does, so the nodes a
+proxy-provider supplies appear there only by name, in their groups' `all`.
+`GET /proxies/{name}` and `GET /proxies/{name}/delay` still resolve such a
+node (mihomo returns 404 there). When a name is both a `proxies:` entry and
+a provider node, the `proxies:` entry wins; when two providers supply it,
+the first provider by name wins. `/providers/proxies/{provider}/{name}`
+reaches each of them.
 
 ## Rules
 
@@ -102,6 +116,8 @@ bookkeeping fields does not orphan the subscription's tracked content.
 | `GET` | `/providers/proxies/{name}` | One proxy provider |
 | `PUT` | `/providers/proxies/{name}` | Refresh (re-fetch) → 204 |
 | `GET` | `/providers/proxies/{name}/healthcheck` | Health-check all proxies in it |
+| `GET` | `/providers/proxies/{provider}/{proxy}` | One node of a proxy provider |
+| `GET` | `/providers/proxies/{provider}/{proxy}/healthcheck` | Probe one provider node's delay — query `url`, `timeout`, `expected` |
 | `GET` | `/providers/rules` | List rule providers |
 | `GET` | `/providers/rules/{name}` | One rule provider |
 | `PUT` | `/providers/rules/{name}` | Refresh a rule provider |

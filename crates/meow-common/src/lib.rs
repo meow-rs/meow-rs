@@ -39,8 +39,8 @@ pub mod traffic;
 pub mod tunnel_mode;
 
 pub use adapter::{
-    reset_sessions_reachable, DelayHistory, ProviderSlot, Proxy, ProxyAdapter, ProxyHealth,
-    ProxySelection, ProxyState,
+    reset_sessions_reachable, DelayHistory, GroupDisplay, ProviderSlot, Proxy, ProxyAdapter,
+    ProxyHealth, ProxySelection, ProxyState,
 };
 pub use adapter_type::{AdapterType, ConnType};
 pub use auth::{AuthConfig, Credentials};

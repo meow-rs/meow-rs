@@ -357,12 +357,31 @@ struct ProxyInfo {
     /// Last measured delay in ms; omitted until a probe has succeeded.
     #[serde(skip_serializing_if = "Option::is_none")]
     delay: Option<u16>,
+    /// The proxy-provider the proxy came from; `""` for inline proxies,
+    /// groups and built-ins. Present on every entry, as in mihomo, and GUIs
+    /// key on it: Clash Party probes a node whose `provider-name` is set
+    /// through `/providers/proxies/{provider}/{name}/healthcheck`.
+    #[serde(rename = "provider-name")]
+    provider_name: String,
+    /// Group-only: the group's `hidden:` key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hidden: Option<bool>,
+    /// Group-only: the group's `icon:` key, `""` when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    icon: Option<String>,
 }
 
 impl ProxyInfo {
-    fn from_proxy(proxy: &Arc<dyn meow_common::Proxy>) -> Self {
+    /// `provider` names the proxy-provider `proxy` was read from; pass `""`
+    /// for route-table entries, which never come from one.
+    fn from_proxy(proxy: &Arc<dyn meow_common::Proxy>, provider: &str) -> Self {
         let members = proxy.members();
         let current = proxy.current();
+        // mihomo reports both keys on every group, `false` / `""` when the
+        // config leaves them out.
+        let display = members
+            .is_some()
+            .then(|| proxy.group_display().cloned().unwrap_or_default());
         debug!(
             name = proxy.name(),
             proxy_type = %proxy.adapter_type(),
@@ -385,6 +404,9 @@ impl ProxyInfo {
             test_url: proxy.test_url().map(str::to_string),
             expected_status: proxy.expected_status().map(str::to_string),
             delay,
+            provider_name: provider.to_string(),
+            hidden: display.as_ref().map(|d| d.hidden),
+            icon: display.map(|d| d.icon.into_string()),
         }
     }
 }
@@ -398,9 +420,45 @@ async fn get_proxies(State(state): State<Arc<AppState>>) -> Json<ProxiesResponse
     let route = state.tunnel.route_snapshot();
     let mut result = std::collections::HashMap::new();
     for (name, proxy) in route.proxies.iter() {
-        result.insert(name.to_string(), ProxyInfo::from_proxy(proxy));
+        result.insert(name.to_string(), ProxyInfo::from_proxy(proxy, ""));
     }
     Json(ProxiesResponse { proxies: result })
+}
+
+/// The proxy a `GET /proxies/{name}[/delay]` path names, with the
+/// proxy-provider it came from (`""` for a route-table entry).
+///
+/// Route-table keys come first: inline proxies, groups and built-ins, the
+/// set mihomo answers there. A miss falls back to the proxy-providers'
+/// members, where mihomo answers 404: a client that probes each member of
+/// a `use:` group through this route would otherwise see every provider
+/// node as down. Providers are searched in name order, the order
+/// `include-all` lists them in, so when two providers ship the same name
+/// the first one answers; `/providers/proxies/{provider}/{name}` reaches
+/// either.
+fn find_proxy(
+    state: &AppState,
+    proxies: &HashMap<smol_str::SmolStr, Arc<dyn meow_common::Proxy>>,
+    name: &str,
+) -> Option<(Arc<dyn meow_common::Proxy>, String)> {
+    if let Some(proxy) = proxies.get(name) {
+        return Some((Arc::clone(proxy), String::new()));
+    }
+    let mut providers: Vec<(String, Arc<ProxyProvider>)> = state
+        .proxy_providers
+        .iter()
+        .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
+        .collect();
+    providers.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    providers.into_iter().find_map(|(provider_name, provider)| {
+        let member = provider
+            .slot
+            .read()
+            .iter()
+            .find(|proxy| proxy.name() == name)
+            .cloned()?;
+        Some((member, provider_name))
+    })
 }
 
 async fn get_proxy(
@@ -408,11 +466,9 @@ async fn get_proxy(
     Path(name): Path<String>,
 ) -> Result<Json<ProxyInfo>, StatusCode> {
     let route = state.tunnel.route_snapshot();
-    let proxy = route
-        .proxies
-        .get(name.as_str())
-        .ok_or(StatusCode::NOT_FOUND)?;
-    Ok(Json(ProxyInfo::from_proxy(proxy)))
+    let (proxy, provider) =
+        find_proxy(&state, &route.proxies, &name).ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(ProxyInfo::from_proxy(&proxy, &provider)))
 }
 
 #[derive(Deserialize)]
@@ -469,7 +525,7 @@ async fn get_groups(State(state): State<Arc<AppState>>) -> Json<ProxiesResponse>
         .proxies
         .iter()
         .filter(|(_, proxy)| proxy.members().is_some())
-        .map(|(name, proxy)| (name.to_string(), ProxyInfo::from_proxy(proxy)))
+        .map(|(name, proxy)| (name.to_string(), ProxyInfo::from_proxy(proxy, "")))
         .collect();
     Json(ProxiesResponse { proxies })
 }
@@ -478,7 +534,7 @@ async fn get_group(State(state): State<Arc<AppState>>, Path(name): Path<String>)
     let route = state.tunnel.route_snapshot();
     match route.proxies.get(name.as_str()) {
         Some(proxy) if proxy.members().is_some() => {
-            Json(ProxyInfo::from_proxy(proxy)).into_response()
+            Json(ProxyInfo::from_proxy(proxy, "")).into_response()
         }
         _ => msg_err(StatusCode::NOT_FOUND, "Resource not found"),
     }
@@ -2445,8 +2501,9 @@ async fn get_proxy_delay(
     let expected = params.expected.clone();
 
     let route = state.tunnel.route_snapshot();
-    // upstream: hub/route/proxies.go::getProxyDelay — findProxyByName middleware
-    let Some(proxy) = route.proxies.get(name.as_str()).cloned() else {
+    // upstream: hub/route/proxies.go::getProxyDelay — findProxyByName
+    // middleware; provider members also resolve here (see `find_proxy`).
+    let Some((proxy, _)) = find_proxy(&state, &route.proxies, &name) else {
         return msg_err(StatusCode::NOT_FOUND, "resource not found");
     };
     // `route` stays alive across the probe — it owns this generation's
@@ -3809,7 +3866,7 @@ fn provider_to_info(name: &str, provider: &ProxyProvider) -> ProviderInfo {
     let proxies = provider
         .proxies()
         .iter()
-        .map(ProxyInfo::from_proxy)
+        .map(|proxy| ProxyInfo::from_proxy(proxy, name))
         .collect();
     ProviderInfo {
         name: name.to_string(),
@@ -3913,7 +3970,7 @@ async fn get_provider_proxy(
         .into_iter()
         .find(|p| p.name() == proxy_name)
     {
-        Some(proxy) => Json(ProxyInfo::from_proxy(&proxy)).into_response(),
+        Some(proxy) => Json(ProxyInfo::from_proxy(&proxy, &provider_name)).into_response(),
         None => msg_err(StatusCode::NOT_FOUND, "Resource not found"),
     }
 }

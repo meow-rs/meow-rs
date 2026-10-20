@@ -2,8 +2,9 @@ use super::selector_store::SelectorStore;
 use super::{DialFailureTracker, UsageTracker};
 use async_trait::async_trait;
 use meow_common::{
-    AdapterType, ChainHealth, ChainTarget, DelayHistory, MeowError, Metadata, ProviderSlot, Proxy,
-    ProxyAdapter, ProxyConn, ProxyHealth, ProxyPacketConn, ProxySelection, Result,
+    AdapterType, ChainHealth, ChainTarget, DelayHistory, GroupDisplay, MeowError, Metadata,
+    ProviderSlot, Proxy, ProxyAdapter, ProxyConn, ProxyHealth, ProxyPacketConn, ProxySelection,
+    Result,
 };
 use parking_lot::RwLock;
 use smol_str::SmolStr;
@@ -18,6 +19,7 @@ pub struct FallbackGroup {
     test_url: String,
     expected_status: String,
     health: ProxyHealth,
+    display: GroupDisplay,
     usage: UsageTracker,
     dial_failures: DialFailureTracker,
     chain_health: Arc<ChainHealth>,
@@ -34,6 +36,7 @@ impl FallbackGroup {
             test_url: "https://www.gstatic.com/generate_204".to_string(),
             expected_status: String::new(),
             health: ProxyHealth::new(),
+            display: GroupDisplay::default(),
             usage: UsageTracker::new(),
             dial_failures: DialFailureTracker::new(),
             chain_health: Arc::new(ChainHealth::tracking_carriers()),
@@ -54,6 +57,7 @@ impl FallbackGroup {
             test_url: "https://www.gstatic.com/generate_204".to_string(),
             expected_status: String::new(),
             health: ProxyHealth::new(),
+            display: GroupDisplay::default(),
             usage: UsageTracker::new(),
             dial_failures: DialFailureTracker::new(),
             chain_health: Arc::new(ChainHealth::tracking_carriers()),
@@ -75,6 +79,14 @@ impl FallbackGroup {
             }
             self.store = Some(store);
         }
+        self
+    }
+
+    /// Attach the group's `hidden:` / `icon:` keys, which `GET /proxies`
+    /// reports on the group.
+    #[must_use]
+    pub fn with_display(mut self, display: GroupDisplay) -> Self {
+        self.display = display;
         self
     }
 
@@ -297,6 +309,10 @@ impl Proxy for FallbackGroup {
 
     fn expected_status(&self) -> Option<&str> {
         Some(&self.expected_status)
+    }
+
+    fn group_display(&self) -> Option<&GroupDisplay> {
+        Some(&self.display)
     }
 
     fn usage_generation(&self) -> u64 {

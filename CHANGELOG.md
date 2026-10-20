@@ -8,6 +8,25 @@ the canonical, in-repo source a release is cut from.
 
 ## [Unreleased]
 
+### Added
+
+- **`provider-name` on every proxy in the API**: `GET /proxies`, the group
+  routes and `GET /providers/proxies` now report, on each proxy, the
+  proxy-provider that supplied it, or `""` for `proxies:` entries, groups
+  and the built-ins, matching mihomo. GUIs such as Clash Party read it to
+  send a provider node's delay test to the provider route; without it they
+  probed `/proxies/{name}/delay`, got a 404 and showed every provider node
+  as timed out. `GET /proxies/{name}` and `GET /proxies/{name}/delay` also
+  resolve a provider node now (a meow extension; mihomo returns 404), so
+  clients that probe each member of a `use:` group there, like meow-android
+  and meow-ios, get a real delay. A `proxies:` entry wins over a provider
+  node of the same name, and between providers the first by name wins.
+
+- **Proxy-group `hidden:` and `icon:`**: both keys are parsed and reported
+  on every group in `GET /proxies` (`false` / `""` when unset), matching
+  mihomo, so GUIs can leave hidden groups out of their list and show a
+  group's icon. Routing ignores both.
+
 ## [0.25.0] - 2026-10-20
 
 ### Added
