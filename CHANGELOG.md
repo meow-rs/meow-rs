@@ -8,6 +8,13 @@ the canonical, in-repo source a release is cut from.
 
 ## [Unreleased]
 
+### Changed
+
+- **Dependency refresh**: `Cargo.lock` re-resolved to the latest
+  semver-compatible versions of all dependencies, including BoringSSL
+  bindings `boring` / `boring-sys` 5.3.0, so release binaries pick up
+  upstream bug and security fixes.
+
 ## [0.26.0] - 2026-10-21
 
 ### Added
