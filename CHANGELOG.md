@@ -95,6 +95,26 @@ the canonical, in-repo source a release is cut from.
   `ASN.mmdb` stands in for a missing `GeoLite2-ASN.mmdb`; a database meow
   downloads keeps meow's names.
 
+### Security
+
+- **emSign ECC Root CA - G3 is no longer trusted**: the private keys of
+  eight eMudhra intermediates (EM DV/OV/EV TLS CA - G3B and G3C, and their
+  code-signing siblings) can be recovered from the certificates themselves,
+  so anyone could issue a certificate for any name under them
+  ([eMudhra incident](https://emudhra.we-have-a-problem.com/), Mozilla bug
+  2083449). meow trusted them through emSign ECC Root CA - G3, which
+  cross-signs emSign Root TLS CA - G3. Every certificate check uses the
+  Mozilla roots built into the binary, never the operating system's store,
+  and checks neither Certificate Transparency nor revocation, so the browser
+  and OS fixes did not reach it. An attacker on the path could impersonate
+  a TLS proxy server (Trojan, VLESS, VMess, AnyTLS, Hysteria2, TrustTunnel,
+  HTTP or SOCKS5 over TLS, the v2ray and gost plugins), a subscription,
+  rule-provider or geodata URL, or a DoH/DoT upstream. Connections that use
+  REALITY, pin a certificate `fingerprint`, or don't use TLS were not
+  affected. meow now requires `webpki-root-certs` 1.0.10, which drops that
+  root. The other root the compromised intermediates chain to, Sectigo's
+  AAA Certificate Services, was never in meow's store.
+
 ## [0.25.0] - 2026-10-20
 
 ### Added

@@ -202,7 +202,7 @@ foreign-types      = { workspace = true, optional = true }
 # Seeding the same Mozilla root list rustls uses gives the boring path
 # parity with rustls and makes verification work uniformly across
 # platforms. Adds ~150 KB of DER blobs to the .rlib.
-webpki-root-certs  = { version = "1", optional = true }
+webpki-root-certs  = { workspace = true, optional = true }
 
 [dev-dependencies]
 # `test-util` enables paused-time tests (start_paused / time::advance) —
