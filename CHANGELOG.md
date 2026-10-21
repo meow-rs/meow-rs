@@ -13,9 +13,10 @@ the canonical, in-repo source a release is cut from.
 ### Changed
 
 - **Dependency refresh**: `Cargo.lock` re-resolved to the latest
-  semver-compatible versions of all dependencies, including BoringSSL
-  bindings `boring` / `boring-sys` 5.3.0, so release binaries pick up
-  upstream bug and security fixes.
+  semver-compatible versions of its dependencies, so release binaries
+  pick up upstream bug and security fixes. `boring` / `boring-sys` /
+  `tokio-boring` stay at 5.2.0: 5.3 deprecates the AEAD in-place API the
+  VMess, VLESS-encryption and Snell ciphers use.
 
 ## [0.26.0] - 2026-10-21
 
