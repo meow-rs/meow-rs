@@ -8,6 +8,8 @@ the canonical, in-repo source a release is cut from.
 
 ## [Unreleased]
 
+## [0.26.1] - 2026-10-21
+
 ### Changed
 
 - **Dependency refresh**: `Cargo.lock` re-resolved to the latest
