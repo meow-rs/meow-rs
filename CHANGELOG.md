@@ -113,7 +113,9 @@ the canonical, in-repo source a release is cut from.
   REALITY, pin a certificate `fingerprint`, or don't use TLS were not
   affected. meow now requires `webpki-root-certs` 1.0.10, which drops that
   root. The other root the compromised intermediates chain to, Sectigo's
-  AAA Certificate Services, was never in meow's store.
+  AAA Certificate Services, was never in meow's store. `rustls-webpki`
+  moves to 0.103.16 for RUSTSEC-2026-0382, the same incident; only the
+  test TLS servers link it, so no release shipped it.
 
 ## [0.25.0] - 2026-10-20
 
