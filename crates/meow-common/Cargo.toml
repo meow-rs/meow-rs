@@ -22,11 +22,11 @@ tracing = { workspace = true }
 httparse = { version = "1", default-features = false }
 ipnet = { workspace = true }
 subtle = { workspace = true }
-# The logbook's database (ADR-0014). The bundled SQLite is compiled in, so
-# every platform runs the same version; behind `logbook`, which the
-# `minimal` bundle leaves out (ADR-0007 binary-size caps).
+# The logbook's database (ADR-0014), behind `logbook`, which the `minimal`
+# bundle leaves out (ADR-0007 binary-size caps). The SQLite comes bundled
+# (below) everywhere but iOS/tvOS, which link the system libsqlite3 the OS
+# already ships rather than grow the size-capped Network Extension.
 rusqlite = { version = "0.40", default-features = false, features = [
-    "bundled",
     "fallible_uint",
 ], optional = true }
 
@@ -34,6 +34,11 @@ rusqlite = { version = "0.40", default-features = false, features = [
 # Persistent logbook (`meow_common::logbook`, ADR-0014). Off, the logbook
 # API stays and records nothing.
 logbook = ["dep:rusqlite"]
+
+[target.'cfg(not(any(target_os = "ios", target_os = "tvos")))'.dependencies]
+rusqlite = { version = "0.40", default-features = false, features = [
+    "bundled",
+], optional = true }
 
 # fs_util's dead-pid scratch sweep uses `kill(pid, 0)`; the per-OS entries
 # below keep libc on their platforms for other modules.

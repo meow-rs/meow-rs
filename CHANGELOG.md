@@ -8,6 +8,16 @@ the canonical, in-repo source a release is cut from.
 
 ## [Unreleased]
 
+### Changed
+
+- **The logbook links the system SQLite on iOS and tvOS**: with the
+  `logbook` feature, meow-common compiled its own SQLite (about 1 MiB) into
+  every build. iOS and tvOS ship libsqlite3, and there the engine runs in a
+  Network Extension with a binary size cap, so on those targets it now
+  links the system library instead. An iOS or tvOS embedder that enables
+  `logbook` adds `-lsqlite3` to its app's link. Every other target still
+  bundles SQLite.
+
 ## [0.26.1] - 2026-10-21
 
 ### Changed

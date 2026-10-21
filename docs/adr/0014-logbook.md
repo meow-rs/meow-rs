@@ -107,9 +107,10 @@ new one.
 ### Storage
 
 `<home>/logbook/logbook.db` is an SQLite database that one writer thread
-owns. SQLite is bundled (`rusqlite` with `bundled`), so every platform runs
-the same version, and any platform's SQLite bindings and tools read the
-file. Schema version 1, in `PRAGMA user_version`:
+owns. SQLite is bundled (`rusqlite` with `bundled`) everywhere but iOS and
+tvOS, which link the libsqlite3 the OS ships (see SQLite over JSON Lines),
+and any platform's SQLite bindings and tools read the file. Schema version
+1, in `PRAGMA user_version`:
 
 ```sql
 CREATE TABLE entries (
@@ -212,7 +213,9 @@ language reads the schema above. Every reader:
 - uses one SQLite library per process for this file. Two copies in one
   process (the one bundled in meow's library and the platform's) do not
   see each other's POSIX locks, and closing a handle in one drops the
-  other's locks. A process that links meow reads through `logbook::read`;
+  other's locks. A process that links meow reads through `logbook::read`.
+  On iOS and tvOS meow links the system library, so the app's own SQLite
+  and meow's are one;
 - on iOS, does not hold the database open while the app is suspended: an
   app that holds an SQLite lock in an App Group container at suspension is
   killed (`0xdead10cc`);
@@ -232,6 +235,12 @@ binary size: the bundled SQLite adds about 1 MiB (x86_64 release). The
 out, since the aarch64 minimal binary has about 0.5 MiB left under its
 8 MiB hard cap (ADR-0007). Built without the feature, the logbook API
 stays, records nothing, and `GET /logbook` reports `enabled: false`.
+
+iOS and tvOS ship libsqlite3, and there the engine runs in a Network
+Extension that has a binary size cap of its own, so on those targets
+meow-common does not enable `bundled` and links the system library: the
+whole logbook grew the meow-ios PacketTunnel by about 0.26 MB. The
+schema and queries use nothing that those OS releases' SQLite lacks.
 
 ### API
 
@@ -282,13 +291,16 @@ embedder that runs a config from `meow_config::load_config` calls
 `config.dropped_providers.record()` once it runs it, after committing its
 rule providers. An
 embedder that wants the logbook enables `meow-common/logbook`; the `full`
-bundle of `meow` does.
+bundle of `meow` does. On iOS and tvOS the logbook links the system
+libsqlite3, so an embedder that builds meow into a static library adds
+`-lsqlite3` to its app's link.
 
 ## Consequences
 
 - One more writer thread, and up to 2 MiB under `<home>/logbook/` plus a
   write-ahead log of up to 256 KiB while the logbook is open.
-- About 1 MiB of bundled SQLite in `full` builds; none in `minimal`.
+- About 1 MiB of bundled SQLite in `full` builds; none in `minimal`, nor
+  on iOS and tvOS, which link the system's.
 - Producers call `event(...).record()`, which does nothing when no logbook
   is installed: no cost for headless embedders and tests.
 - Messages are English sentences. Clients that localize key off `kind`,
