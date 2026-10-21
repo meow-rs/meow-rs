@@ -14,9 +14,12 @@ the canonical, in-repo source a release is cut from.
 
 - **Dependency refresh**: `Cargo.lock` re-resolved to the latest
   semver-compatible versions of its dependencies, so release binaries
-  pick up upstream bug and security fixes. `boring` / `boring-sys` /
-  `tokio-boring` stay at 5.2.0: 5.3 deprecates the AEAD in-place API the
-  VMess, VLESS-encryption and Snell ciphers use.
+  pick up upstream bug and security fixes. Held back: `boring` /
+  `boring-sys` / `tokio-boring` at 5.2.0 (5.3 deprecates the AEAD in-place
+  API the VMess, VLESS-encryption and Snell ciphers use), `shadowsocks` at
+  1.24.0 (1.25 needs rustc 1.91 and pulls in a second crypto library,
+  aws-lc), and `h2` at 0.4.18 (0.4.19 breaks TrustTunnel's empty-frame
+  handling on reused sessions).
 
 ## [0.26.0] - 2026-10-21
 
