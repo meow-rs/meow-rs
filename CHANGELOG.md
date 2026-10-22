@@ -45,6 +45,23 @@ the canonical, in-repo source a release is cut from.
   `logbook` adds `-lsqlite3` to its app's link. Every other target still
   bundles SQLite.
 
+### Security
+
+- **Distrust the compromised eMudhra intermediates by key**: every
+  chain-verifying TLS client (`TlsLayer` for TLS proxies, DoH/DoT,
+  subscriptions and rule/geodata fetches; the hysteria2 and TrustTunnel
+  QUIC configs; restls) now rejects a chain containing any of the eight
+  eMudhra "G3B" / "G3C" intermediate keys whose private keys can be
+  recovered from the certificates (Mozilla bug 2083449), with
+  `X509_V_ERR_CERT_REVOKED`. 0.26.0 removed their browser-trusted root,
+  emSign ECC Root CA - G3; this also closes the paths that root removal
+  does not, such as a `ca` / `ca-str` bundle that still carries that root
+  or Sectigo's AAA Certificate Services (which cross-signed the same keys).
+  meow checks no OCSP, CRLs or CT, so this list plays the role of Firefox's
+  OneCRL and Chrome's CRLSets. Matching is on the SubjectPublicKeyInfo, so
+  cross-signs and re-issues of those keys are covered. A pinned certificate
+  `fingerprint` still replaces CA validation and is not filtered.
+
 ## [0.26.1] - 2026-10-21
 
 ### Changed

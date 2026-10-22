@@ -52,6 +52,7 @@ use crate::{Result, Stream, Transport, TransportError};
 
 pub(crate) mod boring_backend;
 pub(crate) mod boring_stream;
+pub mod distrust;
 
 use boring_backend::{BoringInner, LazyBoringInner};
 

@@ -34,7 +34,10 @@ pub fn build_quiche_config(config: &Config) -> Result<quiche::Config> {
         CertVerifier::Insecure => ssl.set_verify(SslVerifyMode::NONE),
         CertVerifier::WebPki => {
             seed_roots(&mut ssl)?;
-            ssl.set_verify(SslVerifyMode::PEER);
+            ssl.set_verify_callback(
+                SslVerifyMode::PEER,
+                meow_transport::tls::distrust::verify_callback,
+            );
         }
     }
 

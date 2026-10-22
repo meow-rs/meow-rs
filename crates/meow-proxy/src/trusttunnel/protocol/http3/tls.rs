@@ -71,7 +71,10 @@ pub(super) fn build(
                 .map_err(|e| io::Error::other(format!("TrustTunnel verify address: {e}")))?;
         }
         ssl.set_cert_store_builder(store);
-        ssl.set_verify(SslVerifyMode::PEER);
+        ssl.set_verify_callback(
+            SslVerifyMode::PEER,
+            meow_transport::tls::distrust::verify_callback,
+        );
     }
 
     let mut config = quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, ssl)

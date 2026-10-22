@@ -878,7 +878,15 @@ pub(crate) fn verify_certificate_chain(
         X509StoreContext::new().map_err(|e| TransportError::Tls(format!("tls13: ctx: {e}")))?;
     let (verified, err) = ctx
         .init(&store, &leaf, &chain, |c| {
-            c.verify_cert().map(|ok| (ok, c.verify_result().err()))
+            c.verify_cert().map(|ok| {
+                if ok
+                    && c.chain()
+                        .is_some_and(crate::tls::distrust::chain_is_distrusted)
+                {
+                    return (false, Some(boring::x509::X509VerifyError::CERT_REVOKED));
+                }
+                (ok, c.verify_result().err())
+            })
         })
         .map_err(|e| TransportError::Tls(format!("tls13: verify: {e}")))?;
     if !verified {

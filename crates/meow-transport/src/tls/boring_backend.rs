@@ -578,7 +578,10 @@ impl BoringInner {
             // Warned about once per proxy in `TlsLayer::new`.
             b.set_verify(boring::ssl::SslVerifyMode::NONE);
         } else {
-            b.set_verify(boring::ssl::SslVerifyMode::PEER);
+            b.set_verify_callback(
+                boring::ssl::SslVerifyMode::PEER,
+                super::distrust::verify_callback,
+            );
             // Mozilla CA bundle (plus any `additional_roots`) as the verify
             // store, rebuilt per distinct connector cache key from the shared,
             // pre-parsed root certs. `set_cert_store_builder` hands over the
