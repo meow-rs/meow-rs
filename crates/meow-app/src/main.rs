@@ -1471,6 +1471,7 @@ async fn run(
     // Start REST API if configured. Runs after the listener bind phase so the
     // `GET /listeners` snapshot reports OS-assigned ports for `port: 0`
     // (ephemeral) listeners rather than the configured `0`.
+    let mut controller_file = None;
     if let Some(api_addr) = config.api.external_controller {
         // `external-ui-url` auto-download is gated behind the optional
         // `external-ui-download` feature (it pulls in the `zip` crate, against
@@ -1524,6 +1525,11 @@ async fn run(
         let socket = tokio::net::TcpListener::bind(api_addr)
             .await
             .map_err(|e| anyhow::anyhow!("external-controller {api_addr}: {e}"))?;
+        controller_file = publish_controller(
+            &socket,
+            config.api.secret.as_deref(),
+            config_path.as_deref(),
+        );
         tokio::spawn(async move {
             if let Err(e) = api_server.run_on(socket).await {
                 error!("API server error: {}", e);
@@ -1633,8 +1639,29 @@ async fn run(
     let by = shutdown.wait().await?;
     info!("Shutting down ({by})...");
     meow_common::logbook::engine_stopped(meow_common::logbook::Stop::Requested(by));
+    drop(controller_file);
 
     Ok(())
+}
+
+/// Tell `meow-cli` where this meow's API is, in a file only this user can
+/// read (`meow_common::controller_file`); it stays until the returned
+/// guard drops. Failing costs meow-cli only its lookup without options.
+fn publish_controller(
+    socket: &tokio::net::TcpListener,
+    secret: Option<&str>,
+    config_path: Option<&str>,
+) -> Option<meow_common::controller_file::Published> {
+    let published = socket.local_addr().and_then(|addr| {
+        meow_common::controller_file::publish(addr, secret, config_path.map(std::path::Path::new))
+    });
+    match published {
+        Ok(published) => published,
+        Err(e) => {
+            warn!("cannot publish the external-controller for meow-cli: {e}");
+            None
+        }
+    }
 }
 
 /// A listener that did not start: logged, recorded in the logbook, and

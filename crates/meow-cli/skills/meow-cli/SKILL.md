@@ -8,26 +8,30 @@ compatibility: Needs the meow-cli binary on PATH and a running meow with externa
 # meow-cli
 
 `meow-cli` talks to a running meow over its REST API (the `external-controller`).
-It never starts or stops meow and links none of the engine; every command is one
-or a few HTTP requests. `meow-cli --help` and `meow-cli <command> --help` list
-every option.
+It never starts or stops meow; every command is one or a few HTTP requests.
+`meow-cli --help` and `meow-cli <command> --help` list every option.
 
 ## Connecting
 
-meow serves the API only when its config sets `external-controller`. meow-cli
-finds it in this order:
+meow serves the API only when its config sets `external-controller`. Once the
+API is up, meow writes its address and secret to a file that only the user
+meow runs as can read. On that machine, as that user, meow-cli needs no
+options, whoever started meow: a service, a terminal, or a desktop GUI that
+passed the secret on meow's command line.
+
+meow-cli finds the controller in this order:
 
 1. `--controller host:port` or `MEOW_CONTROLLER`
 2. `external-controller` in the config given with `--config FILE` or `MEOW_CONFIG`
-3. `127.0.0.1:9090`
+3. the meow running as this user, from its file
+4. `127.0.0.1:9090`
 
-The API secret comes from `--secret-stdin`, else `MEOW_SECRET`, else `secret` in
-that config. Prefer `--config` pointing at the config meow runs: it supplies the
-address and the secret without anyone handling the secret.
+The API secret comes from `--secret-stdin`, else `MEOW_SECRET`, else the file
+of the meow at that address, else `secret` in the `--config` file.
 
 ```bash
+meow-cli status                                 # the meow running as this user
 meow-cli --config /etc/meow/config.yaml status
-MEOW_CONTROLLER=127.0.0.1:9090 meow-cli status
 meow-cli --controller 192.168.1.1:9090 status   # a meow on another host
 printf '%s\n' "$SECRET_FROM_A_VAULT" | meow-cli --secret-stdin status
 ```
@@ -36,14 +40,16 @@ Rules for the secret:
 
 - Never print, echo, log or paste the secret, and never put it on a command
   line: there is no `--secret` flag on purpose.
-- Do not read the config file to show it to the user; it holds the secret and
-  node passwords. Let meow-cli read it.
+- Do not open the config file or meow's controller file to show them to the
+  user; they hold the secret, and the config holds node passwords. Let
+  meow-cli read them.
 - A `401` means the secret is missing or wrong. Ask the user how to supply it.
 
-A desktop GUI that runs meow as its core may give meow the controller address
-and secret on its command line rather than in the config, and then `--config`
-finds the wrong ones. Ask the user for the address, and to put the secret in
-`MEOW_SECRET` themselves.
+When several meows run as this user, meow-cli lists them and asks for
+`--controller`; ask the user which one they mean. A meow running as root (a
+system service, or one started with sudo for TUN) or as another user writes
+its file for that user only: meow-cli then has to run as that user too, such
+as `sudo meow-cli status`. Ask before using sudo.
 
 If meow-cli cannot connect, meow is not running, or it runs without
 `external-controller`, or on another address. Say so; do not start meow
@@ -141,7 +147,7 @@ meow-cli provider update airport
 meow-cli provider update reject-list --kind rule
 meow-cli provider check airport      # health-check a provider's nodes
 meow-cli subscription update airport
-meow-cli reload                      # the --config file
+meow-cli reload                      # the --config file, else the one meow loaded
 meow-cli reload /etc/meow/config.yaml
 meow-cli reload --force              # only when the user asks for it, see below
 meow-cli log-level debug

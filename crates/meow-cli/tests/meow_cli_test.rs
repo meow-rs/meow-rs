@@ -11,7 +11,7 @@ use std::time::Duration;
 use dashmap::DashMap;
 use meow_api::log_stream::{LogLevel, LogMessage};
 use meow_api::routes::{create_router, AppState};
-use meow_common::DnsMode;
+use meow_common::{controller_file, DnsMode};
 use meow_dns::Resolver;
 use meow_trie::DomainTrie;
 use meow_tunnel::Tunnel;
@@ -123,7 +123,8 @@ impl Meow {
     }
 }
 
-/// `meow-cli` with none of the caller's `MEOW_*` settings.
+/// `meow-cli` with none of the caller's `MEOW_*` settings, and blind to
+/// any meow running on this machine.
 fn bare_cli(args: &[&str]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_meow-cli"));
     command
@@ -131,6 +132,10 @@ fn bare_cli(args: &[&str]) -> Command {
         .env_remove("MEOW_CONTROLLER")
         .env_remove("MEOW_CONFIG")
         .env_remove("MEOW_SECRET")
+        .env(
+            controller_file::DIR_ENV,
+            Path::new(env!("CARGO_TARGET_TMPDIR")).join("no-meow-running"),
+        )
         .stdin(Stdio::null())
         .kill_on_drop(true);
     command
@@ -347,6 +352,56 @@ async fn a_config_without_a_controller_is_refused() {
     )
     .await;
     assert!(stderr.contains("sets no external-controller"), "{stderr}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_running_meow_is_found_without_options() {
+    let meow = Meow::start().await;
+    let config = meow.config_file(&["DOMAIN-SUFFIX,example.org,Auto", "MATCH,DIRECT"]);
+    // What meow publishes once its external-controller is bound.
+    let runtime = meow.dir.path().join("controllers");
+    let _published =
+        controller_file::publish_in(&runtime, meow.addr, Some(SECRET), Some(&config)).unwrap();
+    let found = |args: &[&str]| {
+        let mut command = bare_cli(args);
+        command.env(controller_file::DIR_ENV, &runtime);
+        command
+    };
+
+    let text = succeeds(found(&["status"]), &["status"]).await;
+    assert!(text.contains(&format!(" at {}", meow.addr)), "{text}");
+
+    // `reload` loads the config that meow loaded.
+    let text = succeeds(found(&["reload"]), &["reload"]).await;
+    assert_eq!(text, format!("reloaded {}\n", config.display()));
+    let rules = meow.run(&["rule", "list", "--filter", "example.org"]).await;
+    assert!(
+        rules.contains("DOMAIN-SUFFIX  example.org  Auto"),
+        "{rules}"
+    );
+
+    // An address given by hand gets the secret meow published for it.
+    let mut command = found(&["mode"]);
+    command.env("MEOW_CONTROLLER", meow.addr.to_string());
+    assert_eq!(succeeds(command, &["mode"]).await, "rule\n");
+
+    // With a second meow running, meow-cli names both and picks neither.
+    let other = runtime.join("1.json");
+    std::fs::write(&other, r#"{"pid":1,"controller":"127.0.0.1:9"}"#).unwrap();
+    let lock = std::fs::File::open(&other).unwrap();
+    lock.lock_shared().unwrap();
+    let stderr = fails(found(&["status"]), &["status"]).await;
+    assert!(
+        stderr.contains("2 meows are running; choose one with --controller"),
+        "{stderr}"
+    );
+    assert!(stderr.contains(&meow.addr.to_string()), "{stderr}");
+    assert!(!stderr.contains(SECRET), "{stderr}");
+
+    // Once that meow is gone its lock is too, and its file is swept.
+    drop(lock);
+    succeeds(found(&["status"]), &["status"]).await;
+    assert!(!other.exists());
 }
 
 #[tokio::test(flavor = "multi_thread")]

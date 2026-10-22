@@ -18,9 +18,15 @@ the canonical, in-repo source a release is cut from.
   members, delay-tests groups and proxies, lists rules, lists, inspects and
   closes connections, queries and flushes DNS, updates providers and
   subscriptions, reads the logbook, follows the log and traffic, and
-  reloads a config file. It finds the controller and the API secret in the
-  config meow runs (`--config`), or in `MEOW_CONTROLLER` / `MEOW_SECRET`;
-  there is no secret flag, so the secret never lands in shell history.
+  reloads a config file. On the machine meow runs on, as the same user, it
+  needs no options: once its `external-controller` is up, meow writes the
+  address and the API secret to a file only that user can read, and
+  removes it on exit, so meow-cli also finds a meow that a desktop GUI
+  started with the secret on its command line. `--config`,
+  `MEOW_CONTROLLER` and `MEOW_SECRET` override it; there is no secret flag,
+  so the secret never lands in shell history. A meow running as root
+  publishes in `/var/run/meow`, for root; the systemd unit `meow install`
+  writes now creates that directory (`RuntimeDirectory=meow`).
   `--json` prints the API's answers for scripts. The same archives carry
   an agent skill in `skills/meow-cli/`, in the Agent Skills format, that
   teaches a coding agent to use it, including which commands change state;

@@ -22,6 +22,8 @@ clap = { workspace = true, features = ["env"] }
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
+# Only for `controller_file`, which meow writes and meow-cli reads.
+meow-common = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
@@ -33,7 +35,6 @@ tokio = { workspace = true }
 axum = { workspace = true }
 dashmap = { workspace = true }
 meow-api = { workspace = true }
-meow-common = { workspace = true }
 meow-config = { workspace = true, default-features = false }
 meow-dns = { workspace = true, default-features = false }
 meow-trie = { workspace = true }

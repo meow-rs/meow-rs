@@ -106,7 +106,8 @@ enum Command {
     Listeners,
     /// Reload the config from a file
     Reload {
-        /// Config to load [default: --config]
+        /// Config to load [default: --config, else the one the running meow
+        /// loaded]
         path: Option<PathBuf>,
         /// Apply the config even when its strict checks, TUN, listeners or
         /// DNS fail
@@ -419,6 +420,7 @@ fn main() -> ExitCode {
 
 async fn run(cli: Cli) -> anyhow::Result<()> {
     let endpoint = cli.target.resolve()?;
+    let config = endpoint.config.clone();
     let ctx = Ctx {
         client: Client::new(endpoint, Duration::from_secs(cli.target.timeout.max(1))),
         json: cli.json,
@@ -475,7 +477,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Listeners => engine::listeners(&ctx).await,
         Command::Reload { path, force } => {
             let path = path
-                .or_else(|| cli.target.config.clone())
+                .or(config)
                 .context("name the config to load: meow-cli reload <PATH>, or pass --config")?;
             engine::reload(&ctx, &path, force).await
         }

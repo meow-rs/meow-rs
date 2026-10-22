@@ -3,7 +3,7 @@
 `meow-cli` controls a running meow from a shell or a script. It talks to the
 [REST API](../reference/rest-api) that `external-controller` serves, so it
 works with any meow that has the API on: a service, a desktop GUI's core, a
-router. It starts and stops nothing and links none of the engine.
+router. It starts and stops nothing.
 
 The desktop release archives (Windows, macOS, and Linux glibc on x86_64 and
 aarch64) ship it beside `meow`, with its [agent skill](#agent-skill) in
@@ -16,27 +16,60 @@ cargo build --release -p meow-cli
 
 ## Connecting
 
+On the machine meow runs on, as the user it runs as, meow-cli needs no
+options:
+
+```bash
+meow-cli status
+```
+
+Once its `external-controller` is up, meow writes the address a local client
+dials, the API secret and its config path to a file only that user can
+read, and removes it when it exits. meow-cli reads it, so it also finds a
+meow that a desktop GUI started with the secret and the address on meow's
+command line, or on a random port (`external-controller: 127.0.0.1:0`).
+
 meow-cli looks for the controller in this order:
 
 1. `--controller host:port` (`-c`), or `MEOW_CONTROLLER`
 2. `external-controller` in the config named by `--config` (`-f`), or `MEOW_CONFIG`
-3. `127.0.0.1:9090`
+3. the meow running as this user, from its file
+4. `127.0.0.1:9090`
 
-The API secret comes from `--secret-stdin` (the first line of standard input),
-else `MEOW_SECRET`, else `secret` in that config. There is no `--secret` flag,
+When several meows run as this user, meow-cli lists them and asks for
+`--controller`. The API secret comes from `--secret-stdin` (the first line
+of standard input), else `MEOW_SECRET`, else the file of the meow at that
+address, else `secret` in the `--config` file. There is no `--secret` flag,
 so the secret never lands in shell history or the process list.
-
-The simplest way is to point it at the config meow runs:
 
 ```bash
 meow-cli -f /etc/meow/config.yaml status
+meow-cli -c 192.168.1.1:9090 status    # another host: MEOW_SECRET or --secret-stdin
 ```
 
-A desktop GUI that runs meow as its core may pass the controller address and
-secret on meow's command line instead; then give them with `--controller` and
-`MEOW_SECRET`. `external-controller: :9090` and `0.0.0.0:9090` reach the
-controller on the loopback. The controller serves plain HTTP only, so meow-cli refuses an
+`external-controller: :9090` and `0.0.0.0:9090` reach the controller on the
+loopback. The controller serves plain HTTP only, so meow-cli refuses an
 `https://` address.
+
+### Where the file lives
+
+| meow runs as | Directory |
+| --- | --- |
+| root (Linux, macOS) | `/var/run/meow/controllers` |
+| a user, Linux | `~/.cache/meow/controllers` |
+| a user, macOS | `~/Library/Caches/meow/controllers` |
+| a user, Windows | `%LOCALAPPDATA%\meow\controllers` |
+
+Each running meow has a `<pid>.json` there, mode 0600 in a 0700 directory.
+meow holds a lock on it while it runs; a file left by a meow that was
+killed is not locked, and the next meow or meow-cli to look removes it.
+`MEOW_RUNTIME_DIR` replaces the directory, for meow and meow-cli alike.
+
+A meow running as root, or as a Windows service, publishes for that account
+only: run `sudo meow-cli`, or pass `--controller` and `MEOW_SECRET`. The
+systemd unit `meow install` writes has `RuntimeDirectory=meow`, as its
+`ProtectSystem=strict` leaves the rest of `/run` read-only; reinstall an
+older unit for meow to publish there.
 
 ## Commands
 
@@ -63,7 +96,7 @@ controller on the loopback. The controller serves plain HTTP only, so meow-cli r
 | `traffic [--count N]` | Follow upload and download rates |
 | `stats` | Bytes each proxy carried since meow started |
 | `listeners` | Configured named listeners |
-| `reload [PATH] [--force]` | Load a config file: the `--config` one by default |
+| `reload [PATH] [--force]` | Load a config file: by default the `--config` one, else the one meow loaded |
 | `skill` | Print the agent skill, see below |
 
 `--filter` narrows `proxy list`, `rule list` and `conn list` to entries that

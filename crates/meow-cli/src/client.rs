@@ -181,7 +181,8 @@ impl std::fmt::Display for ApiError {
         if self.status == StatusCode::UNAUTHORIZED {
             return f.write_str(
                 "meow wants the API secret (401): set MEOW_SECRET, pass --secret-stdin, or \
-                 point --config at its config",
+                 point --config at its config; a meow running as another user, root \
+                 included, publishes it for that user only",
             );
         }
         if self.message.is_empty() {

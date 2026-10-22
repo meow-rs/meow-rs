@@ -290,6 +290,10 @@ WorkingDirectory={work_dir_raw}
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=1048576
+# /run/meow, for the file meow-cli finds the controller through;
+# ProtectSystem=strict leaves the rest of /run read-only.
+RuntimeDirectory=meow
+RuntimeDirectoryMode=0700
 
 # Hardening
 NoNewPrivileges=true

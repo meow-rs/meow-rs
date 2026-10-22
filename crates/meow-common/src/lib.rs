@@ -21,6 +21,7 @@ pub mod backoff;
 pub mod chain_health;
 pub mod conn;
 pub mod conn_notes;
+pub mod controller_file;
 pub mod dial;
 pub mod dns_mode;
 pub mod error;

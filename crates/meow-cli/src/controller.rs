@@ -2,16 +2,20 @@
 //!
 //! The address comes from `--controller` / `MEOW_CONTROLLER`, else from the
 //! `external-controller` of the config given with `--config` / `MEOW_CONFIG`,
-//! else `127.0.0.1:9090`. The secret comes from `--secret-stdin`, else
-//! `MEOW_SECRET`, else the config's `secret`. There is deliberately no
-//! `--secret` flag: a secret on the command line lands in shell history and
-//! in every other user's process list.
+//! else from the controller file of the one meow running as this user (see
+//! `meow_common::controller_file`), else `127.0.0.1:9090`. The secret comes
+//! from `--secret-stdin`, else `MEOW_SECRET`, else the controller file of the
+//! meow at that address, else the config's `secret`. There is deliberately
+//! no `--secret` flag: a secret on the command line lands in shell history
+//! and in every other user's process list.
 
+use std::fmt::Write as _;
 use std::io::BufRead;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context as _};
+use meow_common::controller_file;
 
 /// The address meow's `external-controller` examples use.
 const DEFAULT_CONTROLLER: &str = "127.0.0.1:9090";
@@ -19,7 +23,8 @@ const DEFAULT_CONTROLLER: &str = "127.0.0.1:9090";
 #[derive(clap::Args)]
 pub struct Target {
     /// Controller address, host:port [default: the config's
-    /// external-controller, else 127.0.0.1:9090]
+    /// external-controller, else the meow running as this user, else
+    /// 127.0.0.1:9090]
     #[arg(short = 'c', long, env = "MEOW_CONTROLLER", global = true)]
     pub controller: Option<String>,
 
@@ -28,7 +33,8 @@ pub struct Target {
     pub config: Option<PathBuf>,
 
     /// Read the API secret from the first line of stdin [default:
-    /// MEOW_SECRET, else the config's secret]
+    /// MEOW_SECRET, else what the running meow published, else the config's
+    /// secret]
     #[arg(long, global = true)]
     pub secret_stdin: bool,
 
@@ -37,11 +43,13 @@ pub struct Target {
     pub timeout: u64,
 }
 
-/// A resolved controller: `host:port` and the secret, if any.
+/// A resolved controller: `host:port`, the secret, and the config file
+/// `reload` loads by default.
 #[derive(Clone)]
 pub struct Endpoint {
     pub authority: String,
     pub secret: Option<String>,
+    pub config: Option<PathBuf>,
 }
 
 /// The two keys meow-cli reads from a meow config.
@@ -58,28 +66,84 @@ impl Target {
             None => None,
         };
         let address = match (&self.controller, &self.config, &keys) {
-            (Some(address), _, _) => address.clone(),
-            (None, Some(path), Some(keys)) => keys.controller.clone().ok_or_else(|| {
-                anyhow!(
-                    "{} sets no external-controller, so that meow serves no API",
-                    path.display()
-                )
-            })?,
-            _ => DEFAULT_CONTROLLER.to_string(),
+            (Some(address), _, _) => Some(normalize_address(address)?),
+            (None, Some(path), Some(keys)) => {
+                let address = keys.controller.as_deref().ok_or_else(|| {
+                    anyhow!(
+                        "{} sets no external-controller, so that meow serves no API",
+                        path.display()
+                    )
+                })?;
+                Some(normalize_address(address)?)
+            }
+            _ => None,
+        };
+        let running = controller_file::running();
+        let (authority, published) = match address {
+            Some(address) => {
+                let published = running
+                    .into_iter()
+                    .find(|meow| same_controller(&address, meow.controller));
+                (address, published)
+            }
+            None => match <[_; 1]>::try_from(running) {
+                Ok([meow]) => (meow.controller.to_string(), Some(meow)),
+                Err(running) if running.is_empty() => (DEFAULT_CONTROLLER.to_string(), None),
+                Err(running) => bail!(several_running(&running)),
+            },
         };
         let secret = if self.secret_stdin {
             Some(read_secret_line(std::io::stdin().lock())?)
         } else {
-            match std::env::var("MEOW_SECRET") {
-                Ok(secret) if !secret.is_empty() => Some(secret),
-                _ => keys.and_then(|keys| keys.secret),
-            }
+            std::env::var("MEOW_SECRET")
+                .ok()
+                .filter(|secret| !secret.is_empty())
+                .or_else(|| published.as_ref().and_then(|meow| meow.secret.clone()))
+                .or_else(|| keys.and_then(|keys| keys.secret))
         };
         Ok(Endpoint {
-            authority: normalize_address(&address)?,
+            authority,
             secret: secret.filter(|secret| !secret.is_empty()),
+            config: self
+                .config
+                .clone()
+                .or_else(|| published.and_then(|meow| meow.config)),
         })
     }
+}
+
+/// Whether `address`, as `normalize_address` gives it, is the controller a
+/// meow published: the same socket address, or the same port on this
+/// host's loopback, whichever name the loopback goes by.
+fn same_controller(address: &str, published: SocketAddr) -> bool {
+    let Some((host, port)) = address.rsplit_once(':') else {
+        return false;
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback());
+    address.parse() == Ok(published)
+        || (loopback && published.ip().is_loopback() && port.parse() == Ok(published.port()))
+}
+
+fn several_running(running: &[controller_file::Entry]) -> String {
+    let mut text = format!(
+        "{} meows are running; choose one with --controller:",
+        running.len()
+    );
+    for meow in running {
+        let config = meow
+            .config
+            .as_deref()
+            .map_or_else(|| "--config-string".into(), Path::to_string_lossy);
+        let _ = write!(
+            text,
+            "\n  {:<21}  pid {:<7}  {config}",
+            meow.controller.to_string(),
+            meow.pid
+        );
+    }
+    text
 }
 
 /// `host:port` to connect to for an `external-controller` value: `:9090`
@@ -182,6 +246,25 @@ mod tests {
 
         let keys = parse_config("external-controller: ''\n").unwrap();
         assert!(keys.controller.is_none() && keys.secret.is_none());
+    }
+
+    #[test]
+    fn a_published_controller_matches_by_address() {
+        let published: SocketAddr = "127.0.0.1:9090".parse().unwrap();
+        for address in [
+            "127.0.0.1:9090",
+            "localhost:9090",
+            "[::1]:9090",
+            "127.0.0.2:9090",
+        ] {
+            assert!(same_controller(address, published), "{address}");
+        }
+        for address in ["127.0.0.1:9091", "192.168.1.2:9090", "router.lan:9090"] {
+            assert!(!same_controller(address, published), "{address}");
+        }
+        let lan: SocketAddr = "192.168.1.2:9090".parse().unwrap();
+        assert!(same_controller("192.168.1.2:9090", lan));
+        assert!(!same_controller("127.0.0.1:9090", lan));
     }
 
     #[test]

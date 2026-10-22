@@ -48,6 +48,12 @@ fn systemd_unit_generation_table() {
             &["ProtectSystem=strict"],
         ),
         (
+            "runtime directory for the controller file",
+            "/usr/bin/meow",
+            "/etc/meow/config.yaml",
+            &["RuntimeDirectory=meow", "RuntimeDirectoryMode=0700"],
+        ),
+        (
             "working directory matches config parent",
             "/usr/bin/meow",
             "/opt/meow/config.yaml",
