@@ -2,7 +2,7 @@
 name: meow-cli
 description: Inspect and control a running meow (meow-rs, the Rust mihomo / Clash Meta kernel) from the shell with meow-cli. Use when the user asks why traffic goes where it goes, which node a proxy group uses, to switch a group's node or the routing mode, to look at or close connections, to test node delays, to query or flush DNS, to update providers or subscriptions, to read the logbook or follow the log, or to reload the config.
 license: MIT
-compatibility: Needs the meow-cli binary on PATH and a running meow with external-controller set.
+compatibility: Needs the meow-cli binary and a running meow with external-controller set.
 ---
 
 # meow-cli
@@ -10,6 +10,11 @@ compatibility: Needs the meow-cli binary on PATH and a running meow with externa
 `meow-cli` talks to a running meow over its REST API (the `external-controller`).
 It never starts or stops meow; every command is one or a few HTTP requests.
 `meow-cli --help` and `meow-cli <command> --help` list every option.
+
+If `meow-cli` is not on PATH, use the one that ships with this skill, two
+directories above its folder: `<dir>/meow-cli` (`meow-cli.exe` on Windows)
+beside `<dir>/skills/meow-cli/`. The folder may be a link; go up from its
+real path (`cd <folder> && pwd -P`), not from the link.
 
 ## Connecting
 
