@@ -28,6 +28,7 @@ address and the secret without anyone handling the secret.
 ```bash
 meow-cli --config /etc/meow/config.yaml status
 MEOW_CONTROLLER=127.0.0.1:9090 meow-cli status
+meow-cli --controller 192.168.1.1:9090 status   # a meow on another host
 printf '%s\n' "$SECRET_FROM_A_VAULT" | meow-cli --secret-stdin status
 ```
 
@@ -54,6 +55,9 @@ These commands change nothing; run them freely.
 
 ```bash
 meow-cli status                      # version, mode, log level, TUN, ports, traffic totals
+meow-cli mode                        # without an argument these three only read
+meow-cli log-level
+meow-cli tun
 meow-cli group list                  # every group and the member it routes through
 meow-cli group show "Proxy"       # one group's members with their last delay
 meow-cli proxy list                  # every proxy, provider members too
@@ -65,7 +69,7 @@ meow-cli conn list --filter youtube
 meow-cli conn show 1a2b3c4d          # one connection with its notes; an id prefix works
 meow-cli dns query example.com
 meow-cli dns query example.com --type AAAA
-meow-cli dns cache --search example
+meow-cli dns cache --search example --limit 20
 meow-cli provider list               # proxy and rule providers, usage and expiry
 meow-cli subscription list
 meow-cli logbook                     # notable engine events, newest first
@@ -108,6 +112,13 @@ dialer-proxy chain changes, each with how often it repeated. `--level warning`
 keeps only the failures. The logbook survives restarts, unlike
 `meow-cli log`.
 
+```bash
+meow-cli --timeout 5 status          # is meow up and answering at all?
+meow-cli logbook --level warning     # what failed, newest first
+meow-cli logbook --subject airport   # one provider, group or listener
+meow-cli logbook --before 812        # older entries; a full page prints this line
+```
+
 ## Changing state
 
 These change how meow routes or what it keeps. Tell the user what you are
@@ -119,6 +130,7 @@ meow-cli mode global                 # rule | global | direct
 meow-cli group select "Proxy" "HK 01"
 meow-cli group unfix Auto            # url-test / fallback back to automatic
 meow-cli group test Auto             # delay-test every member
+meow-cli group test Auto --url https://cp.cloudflare.com --probe-timeout 3000
 meow-cli proxy test "HK 01"
 meow-cli proxy test "HK 01" --url https://cp.cloudflare.com --probe-timeout 3000
 meow-cli conn close 1a2b3c4d
@@ -131,6 +143,7 @@ meow-cli provider check airport      # health-check a provider's nodes
 meow-cli subscription update airport
 meow-cli reload                      # the --config file
 meow-cli reload /etc/meow/config.yaml
+meow-cli reload --force              # only when the user asks for it, see below
 meow-cli log-level debug
 meow-cli tun on
 meow-cli logbook clear

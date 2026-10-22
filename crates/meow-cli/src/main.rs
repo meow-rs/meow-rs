@@ -108,7 +108,8 @@ enum Command {
     Reload {
         /// Config to load [default: --config]
         path: Option<PathBuf>,
-        /// Apply the config even when parts of it fail to build
+        /// Apply the config even when its strict checks, TUN, listeners or
+        /// DNS fail
         #[arg(long)]
         force: bool,
     },
@@ -122,8 +123,8 @@ enum GroupCommand {
     List,
     /// A group's members with their last delay
     Show { group: String },
-    /// Route a group through one member; a url-test or fallback group keeps
-    /// it as a pin until `unfix`
+    /// Route a group through one member; a url-test group keeps it as a pin
+    /// until `unfix`, a fallback group while the member is up
     Select { group: String, member: String },
     /// Return a url-test or fallback group to its automatic choice
     Unfix { group: String },
@@ -191,8 +192,10 @@ enum ConnCommand {
     Show { id: String },
     /// Close connections by id (or a unique id prefix), or all of them
     Close {
+        /// Ids, or unique starts of ids
         #[arg(required_unless_present = "all", conflicts_with = "all")]
         ids: Vec<String>,
+        /// Close every connection
         #[arg(long)]
         all: bool,
     },
@@ -212,6 +215,7 @@ enum DnsCommand {
         /// Only names containing this text
         #[arg(long)]
         search: Option<String>,
+        /// Answers to show
         #[arg(long, default_value_t = 256)]
         limit: usize,
     },
@@ -481,8 +485,12 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::collections::BTreeSet;
+
+    use clap::parser::ValueSource;
     use clap::CommandFactory as _;
+
+    use super::*;
 
     #[test]
     fn the_cli_definition_is_consistent() {
@@ -532,24 +540,98 @@ mod tests {
     /// skill cannot teach an agent a command that does not exist.
     #[test]
     fn every_skill_example_parses() {
-        let mut checked = 0;
+        let examples = skill_examples();
+        for words in &examples {
+            if let Err(e) = Cli::try_parse_from(words) {
+                panic!("skill example does not parse: {}\n{e}", words.join(" "));
+            }
+        }
+        assert!(
+            examples.len() >= 20,
+            "only {} examples in SKILL.md",
+            examples.len()
+        );
+    }
+
+    /// Every command and every option shows up in an example, so an agent
+    /// that reads only the skill knows all of meow-cli.
+    #[test]
+    fn the_skill_teaches_every_command_and_option() {
+        let mut taught = BTreeSet::new();
+        for words in skill_examples() {
+            let matches = Cli::command()
+                .try_get_matches_from(&words)
+                .unwrap_or_else(|e| panic!("{}: {e}", words.join(" ")));
+            let mut level = &matches;
+            let mut path = Vec::new();
+            loop {
+                for id in level.ids() {
+                    if level.value_source(id.as_str()) == Some(ValueSource::CommandLine) {
+                        taught.insert(format!("--{id}"));
+                        taught.insert(format!("{} --{id}", path.join(" ")));
+                    }
+                }
+                let Some((name, sub)) = level.subcommand() else {
+                    break;
+                };
+                path.push(name);
+                level = sub;
+            }
+            taught.insert(path.join(" "));
+        }
+        let mut missing = Vec::new();
+        untaught(&Cli::command(), "", &taught, &mut missing);
+        assert!(
+            missing.is_empty(),
+            "SKILL.md has no example of: {missing:?}"
+        );
+    }
+
+    /// What `taught` lacks of `command` and its subcommands: the command
+    /// itself when it runs on its own, and each of its options.
+    fn untaught(
+        command: &clap::Command,
+        path: &str,
+        taught: &BTreeSet<String>,
+        missing: &mut Vec<String>,
+    ) {
+        let runs_alone = !command.has_subcommands() || !command.is_subcommand_required_set();
+        if !path.is_empty() && runs_alone && !taught.contains(path) {
+            missing.push(path.to_string());
+        }
+        for arg in command.get_arguments() {
+            let id = arg.get_id().as_str();
+            // A global option counts wherever an example gives it.
+            let key = if arg.is_global_set() {
+                format!("--{id}")
+            } else {
+                format!("{path} --{id}")
+            };
+            if !taught.contains(&key) {
+                let name = arg
+                    .get_long()
+                    .map_or_else(|| format!("<{id}>"), |long| format!("--{long}"));
+                missing.push(format!("{path} {name}").trim().to_string());
+            }
+        }
+        for sub in command.get_subcommands() {
+            let sub_path = format!("{path} {}", sub.get_name());
+            untaught(sub, sub_path.trim(), taught, missing);
+        }
+    }
+
+    /// The `meow-cli` invocations in the skill's code blocks.
+    fn skill_examples() -> Vec<Vec<String>> {
+        let mut examples = Vec::new();
         let mut in_code = false;
         for line in SKILL.lines() {
             if line.trim_start().starts_with("```") {
                 in_code = !in_code;
-                continue;
-            }
-            if !in_code {
-                continue;
-            }
-            for words in commands_in(line) {
-                if let Err(e) = Cli::try_parse_from(&words) {
-                    panic!("skill example does not parse: {line}\n{e}");
-                }
-                checked += 1;
+            } else if in_code {
+                examples.extend(commands_in(line));
             }
         }
-        assert!(checked >= 20, "only {checked} examples found in SKILL.md");
+        examples
     }
 
     /// The `meow-cli` invocations on a shell line: split into words, with
