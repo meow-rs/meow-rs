@@ -5,7 +5,9 @@
 works with any meow that has the API on: a service, a desktop GUI's core, a
 router. It starts and stops nothing and links none of the engine.
 
-The release archives ship it beside `meow`. From a checkout:
+The desktop release archives (Windows, macOS, and Linux glibc on x86_64 and
+aarch64) ship it beside `meow`, with its [agent skill](#agent-skill) in
+`skills/meow-cli/`. From a checkout:
 
 ```bash
 cargo build --release -p meow-cli
@@ -30,8 +32,10 @@ The simplest way is to point it at the config meow runs:
 meow-cli -f /etc/meow/config.yaml status
 ```
 
-`external-controller: :9090` and `0.0.0.0:9090` reach the controller on the
-loopback. The controller serves plain HTTP only, so meow-cli refuses an
+A desktop GUI that runs meow as its core may pass the controller address and
+secret on meow's command line instead; then give them with `--controller` and
+`MEOW_SECRET`. `external-controller: :9090` and `0.0.0.0:9090` reach the
+controller on the loopback. The controller serves plain HTTP only, so meow-cli refuses an
 `https://` address.
 
 ## Commands
@@ -66,7 +70,7 @@ loopback. The controller serves plain HTTP only, so meow-cli refuses an
 contain a word, ignoring case. `meow-cli <command> --help` lists every option.
 
 ```bash
-meow-cli group select "🚀 Proxy" "HK 01"
+meow-cli group select "Proxy" "HK 01"
 meow-cli conn list --filter youtube
 meow-cli logbook --level warning --limit 20
 meow-cli log --level warning --count 50
@@ -75,15 +79,24 @@ meow-cli log --level warning --count 50
 What a change does:
 
 - `group select` on a `select` group switches it, and meow keeps the choice
-  across restarts. On a `url-test` or `fallback` group it pins the member
-  until `group unfix`; `group test` on such a group clears the pin, as in
-  mihomo.
-- `mode`, `log-level` and `tun` change the running meow only. The config
-  file keeps its values, and a restart or a reload returns to them.
+  across restarts. On a `url-test` group it pins the member until
+  `group unfix`. On a `fallback` group the pin holds while the member is up:
+  meow drops it once it sees the member down. `group test` on either clears
+  the pin, as in mihomo.
+- `mode`, `log-level` and `tun` change the running meow, not the config
+  file. meow keeps them in its in-memory copy of the config, so whatever
+  saves that copy writes them into the file: a subscription update, by hand
+  or on its timer, or a GUI saving the config. A `reload` returns
+  `log-level` and `tun` to the file's values, and `mode` when the file sets
+  `mode:`.
 - `reload` sends the file's contents, so meow need not be able to read the
-  path (another host, another user). meow keeps the running config when the
-  new one fails to load; `--force` applies it even when parts of it fail to
-  build.
+  path (another host, another user). It closes every open connection. meow
+  refuses a file that does not parse; otherwise it skips broken proxies,
+  groups and rules with a warning and applies the rest, unless the config
+  sets `strict: true`. `--force` also applies a config whose strict checks,
+  TUN, listeners or DNS fail.
+- `provider check` runs the provider's `health-check:` and refuses a
+  provider without one.
 - `subscription list` shows only the scheme and host of each URL: the rest
   usually carries an access token.
 
@@ -107,10 +120,12 @@ meow-cli proxy test "HK 01" --probe-timeout 3000 || echo "HK 01 is down"
 
 ## Agent skill
 
-`meow-cli skill` prints a `SKILL.md` that teaches a coding agent to use
-meow-cli: which commands only read, which change routing and need the user's
-yes first, and how to keep the API secret out of the conversation. For
-Claude Code:
+meow-cli comes with an [Agent Skills](https://agentskills.io) skill that
+teaches a coding agent to use it: which commands only read, which change
+routing and need the user's yes first, and how to keep the API secret out of
+the conversation. The desktop archives carry it as `skills/meow-cli/`; copy
+that folder into the agent's skills directory. `meow-cli skill` prints its
+`SKILL.md`, for a meow-cli built or installed another way. For Claude Code:
 
 ```bash
 mkdir -p ~/.claude/skills/meow-cli

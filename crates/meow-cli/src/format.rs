@@ -104,11 +104,11 @@ mod tests {
     #[test]
     fn the_name_column_is_never_padded() {
         let mut table = Table::new(&["TYPE", "NAME"]);
-        table.row(vec!["Selector".into(), "🚀 节点选择".into()]);
+        table.row(vec!["Selector".into(), "节点选择".into()]);
         table.row(vec!["URLTest".into(), "Auto".into()]);
         assert_eq!(
             table.render(),
-            "TYPE      NAME\nSelector  🚀 节点选择\nURLTest   Auto\n"
+            "TYPE      NAME\nSelector  节点选择\nURLTest   Auto\n"
         );
     }
 

@@ -1,6 +1,8 @@
 ---
 name: meow-cli
 description: Inspect and control a running meow (meow-rs, the Rust mihomo / Clash Meta kernel) from the shell with meow-cli. Use when the user asks why traffic goes where it goes, which node a proxy group uses, to switch a group's node or the routing mode, to look at or close connections, to test node delays, to query or flush DNS, to update providers or subscriptions, to read the logbook or follow the log, or to reload the config.
+license: MIT
+compatibility: Needs the meow-cli binary on PATH and a running meow with external-controller set.
 ---
 
 # meow-cli
@@ -37,6 +39,11 @@ Rules for the secret:
   node passwords. Let meow-cli read it.
 - A `401` means the secret is missing or wrong. Ask the user how to supply it.
 
+A desktop GUI that runs meow as its core may give meow the controller address
+and secret on its command line rather than in the config, and then `--config`
+finds the wrong ones. Ask the user for the address, and to put the secret in
+`MEOW_SECRET` themselves.
+
 If meow-cli cannot connect, meow is not running, or it runs without
 `external-controller`, or on another address. Say so; do not start meow
 yourself unless the user asks.
@@ -48,7 +55,7 @@ These commands change nothing; run them freely.
 ```bash
 meow-cli status                      # version, mode, log level, TUN, ports, traffic totals
 meow-cli group list                  # every group and the member it routes through
-meow-cli group show "🚀 Proxy"       # one group's members with their last delay
+meow-cli group show "Proxy"       # one group's members with their last delay
 meow-cli proxy list                  # every proxy, provider members too
 meow-cli proxy list --filter HK
 meow-cli proxy show "HK 01"          # type, UDP, delay history
@@ -73,14 +80,14 @@ meow-cli traffic --count 5                # one sample per second
 Add `--json` to any command to get what the API answered, for parsing:
 
 ```bash
-meow-cli --json group show "🚀 Proxy"
+meow-cli --json group show "Proxy"
 meow-cli conn list --json
 meow-cli proxy list --json --filter JP
 ```
 
 Text output puts names last, so names with CJK or emoji do not break the
 columns. In `conn list` the route reads from the rule's target to the node that
-dials: `🚀 Proxy > Auto > HK 01`. `delay` shows `-` before a first successful
+dials: `Proxy > Auto > HK 01`. `delay` shows `-` before a first successful
 test and `down` for a node that failed its last one.
 
 ### Answering "why does this go there?"
@@ -95,10 +102,11 @@ test and `down` for a node that failed its last one.
 
 ### Answering "is something broken?"
 
-`meow-cli logbook --level warning` lists failed reloads and provider or
-subscription updates, listeners that did not start, interface changes and
-dialer-proxy chain changes, with how often each repeated. It survives
-restarts, unlike `meow-cli log`.
+`meow-cli logbook` lists notable events, newest first: reloads, provider and
+subscription updates, listener starts, network interface changes and
+dialer-proxy chain changes, each with how often it repeated. `--level warning`
+keeps only the failures. The logbook survives restarts, unlike
+`meow-cli log`.
 
 ## Changing state
 
@@ -108,7 +116,7 @@ change.
 
 ```bash
 meow-cli mode global                 # rule | global | direct
-meow-cli group select "🚀 Proxy" "HK 01"
+meow-cli group select "Proxy" "HK 01"
 meow-cli group unfix Auto            # url-test / fallback back to automatic
 meow-cli group test Auto             # delay-test every member
 meow-cli proxy test "HK 01"
@@ -131,23 +139,34 @@ meow-cli logbook clear
 What to know before changing things:
 
 - `group select` on a `select` group switches it and meow remembers the pick
-  across restarts. On a `url-test` or `fallback` group it pins that member:
-  the group stops choosing on its own until `group unfix`. A pinned url-test
-  member that goes down is routed around but stays pinned.
+  across restarts. On a `url-test` group it pins that member: the group stops
+  choosing on its own until `group unfix`, and a pinned member that goes down
+  is routed around but stays pinned. On a `fallback` group the pin holds only
+  while the member is up; meow drops it once it sees the member down.
 - `group test` on a `url-test` or `fallback` group clears its pin first, as
   mihomo does. To measure without unpinning, test members one by one with
   `proxy test`.
 - `select` groups have nothing to unfix; `load-balance` and `relay` groups
   cannot be selected.
-- `mode`, `log-level` and `tun` change the running meow only; the config file
-  keeps its values, and a restart or `reload` returns to them.
-- `reload` sends the file's text to meow; meow validates it and keeps the old
-  config when it fails. Use `--force` only when the user wants a config with
-  failing parts applied anyway.
+- `mode`, `log-level` and `tun` change the running meow, not the config file.
+  meow keeps them in its in-memory copy of the config, though, and whatever
+  saves that copy writes them into the file: a subscription update (by hand
+  or on its timer), or a GUI saving the config. Until then a restart returns
+  to the file's values. `reload` returns `log-level` and `tun` to the file's
+  values, and `mode` only when the file sets `mode:`.
+- `reload` sends the file's text to meow and closes every open connection,
+  like `conn close --all`. meow refuses a file that does not parse. Otherwise
+  it skips broken proxies, groups and rules with a warning and applies the
+  rest, unless the config sets `strict: true`; check
+  `meow-cli logbook --kind config` afterwards. `--force` also applies a config
+  whose strict checks, TUN, listeners or DNS fail; use it only when the user
+  wants that.
 - `conn close --all` drops every connection, the user's current calls and
   downloads included. `dns flush-fakeip` breaks open fake-IP flows.
 - Provider and subscription updates fetch over the network and can take a
-  minute.
+  minute. `provider check` runs the provider's `health-check:`; a provider
+  without one (or with it disabled) is refused, so test its nodes with
+  `proxy test`.
 - `logbook clear` deletes the record for good.
 - Subscription URLs carry access tokens: `subscription list` shows only their
   host. Never ask for or print the full URL.
@@ -166,7 +185,10 @@ meow-cli exits 0 on success and 1 on any failure, with the reason on stderr:
 
 ## Installing this skill
 
-`meow-cli skill` prints this file:
+The desktop release archives (Windows, macOS, and Linux glibc on x86_64 and
+aarch64) carry this skill as `skills/meow-cli/`: copy that folder into the
+agent's skills directory. `meow-cli skill` prints this file, for a meow-cli
+installed another way:
 
 ```bash
 mkdir -p ~/.claude/skills/meow-cli

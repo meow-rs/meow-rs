@@ -202,7 +202,8 @@ pub async fn close(ctx: &Ctx, ids: &[String], all: bool) -> anyhow::Result<()> {
         return ctx.done("closed every connection");
     }
     for id in ids {
-        let id = resolve_id(ctx, id).await?;
+        // meow answers 204 for any well-formed id, so look it up first.
+        let id = open_id(ctx, id).await?;
         ctx.client
             .call(
                 Method::DELETE,
@@ -215,10 +216,19 @@ pub async fn close(ctx: &Ctx, ids: &[String], all: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A full id as given; a prefix matched against the open connections.
+/// A full id as given, as meow still shows a connection that closed a
+/// moment ago; a prefix matched against the open connections.
 async fn resolve_id(ctx: &Ctx, id: &str) -> anyhow::Result<String> {
     if id.len() == FULL_ID {
         return Ok(id.to_string());
+    }
+    open_id(ctx, id).await
+}
+
+/// The open connection whose id is `id` or starts with it.
+async fn open_id(ctx: &Ctx, id: &str) -> anyhow::Result<String> {
+    if id.is_empty() {
+        bail!("give a connection id, or the start of one");
     }
     let open = open_connections(ctx).await?;
     let mut matching = open

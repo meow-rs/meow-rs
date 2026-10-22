@@ -101,10 +101,37 @@ pub async fn logbook(ctx: &Ctx, query: &LogbookQuery) -> anyhow::Result<()> {
         }
         let mut text = table.render();
         if page.more {
-            writeln!(text, "older entries: meow-cli logbook --before {oldest}")?;
+            writeln!(text, "older entries: {}", older_page(query, oldest))?;
         }
         Ok(text)
     })
+}
+
+/// The command for the entries before `oldest`, with the same filters.
+fn older_page(query: &LogbookQuery, oldest: u64) -> String {
+    let mut command = format!("meow-cli logbook --before {oldest}");
+    if query.limit != crate::LOGBOOK_LIMIT {
+        let _ = write!(command, " --limit {}", query.limit);
+    }
+    if let Some(level) = query.level {
+        let _ = write!(command, " --level {}", level.as_str());
+    }
+    for (flag, value) in [("--kind", &query.kind), ("--subject", &query.subject)] {
+        if let Some(value) = value {
+            let _ = write!(command, " {flag} {}", shell_word(value));
+        }
+    }
+    command
+}
+
+/// `word` as a POSIX shell reads it back.
+fn shell_word(word: &str) -> String {
+    let plain = |byte: u8| byte.is_ascii_alphanumeric() || b"-._/:@".contains(&byte);
+    if !word.is_empty() && word.bytes().all(plain) {
+        word.to_string()
+    } else {
+        format!("'{}'", word.replace('\'', r"'\''"))
+    }
 }
 
 pub async fn logbook_clear(ctx: &Ctx) -> anyhow::Result<()> {
@@ -201,5 +228,34 @@ fn count_down(left: &mut Option<usize>) -> bool {
             *left > 0
         }
         None => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_older_page_keeps_the_filters() {
+        let query = LogbookQuery {
+            limit: 20,
+            level: Some(crate::EventLevel::Warning),
+            kind: Some("config".into()),
+            subject: Some("节点 it's".into()),
+            before: Some(900),
+        };
+        assert_eq!(
+            older_page(&query, 812),
+            "meow-cli logbook --before 812 --limit 20 --level warning --kind config \
+             --subject '节点 it'\\''s'"
+        );
+        let query = LogbookQuery {
+            limit: crate::LOGBOOK_LIMIT,
+            level: None,
+            kind: None,
+            subject: None,
+            before: None,
+        };
+        assert_eq!(older_page(&query, 7), "meow-cli logbook --before 7");
     }
 }

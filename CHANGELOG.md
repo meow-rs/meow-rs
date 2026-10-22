@@ -11,7 +11,8 @@ the canonical, in-repo source a release is cut from.
 ### Added
 
 - **`meow-cli`, a command-line controller for a running meow**: a second
-  binary, shipped beside `meow` in the release archives, that drives the
+  binary, shipped beside `meow` in the desktop release archives (Windows,
+  macOS, Linux glibc on x86_64 and aarch64), that drives the
   REST API from a shell or a script. It shows status, switches the mode,
   log level and TUN, lists groups and switches, pins or unpins their
   members, delay-tests groups and proxies, lists rules, lists, inspects and
@@ -20,9 +21,10 @@ the canonical, in-repo source a release is cut from.
   reloads a config file. It finds the controller and the API secret in the
   config meow runs (`--config`), or in `MEOW_CONTROLLER` / `MEOW_SECRET`;
   there is no secret flag, so the secret never lands in shell history.
-  `--json` prints the API's answers for scripts. `meow-cli skill` prints an
-  agent skill (`SKILL.md`) that teaches a coding agent to use it, including
-  which commands change state. The crate is not published on crates.io,
+  `--json` prints the API's answers for scripts. The same archives carry
+  an agent skill in `skills/meow-cli/`, in the Agent Skills format, that
+  teaches a coding agent to use it, including which commands change state;
+  `meow-cli skill` prints its `SKILL.md`. The crate is not published on crates.io,
   where the name belongs to an unrelated crate.
 
 ### Changed

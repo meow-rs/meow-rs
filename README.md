@@ -404,15 +404,15 @@ From the **Subscriptions** tab you can add a Clash subscription URL to import pr
 
 ### Control it from the shell
 
-`meow-cli` ships beside `meow` in the release archives and drives the same REST API. Point it at the config meow runs; it reads `external-controller` and `secret` from there:
+`meow-cli` ships beside `meow` in the desktop release archives (Windows, macOS, Linux glibc) and drives the same REST API. Point it at the config meow runs; it reads `external-controller` and `secret` from there:
 
 ```bash
 ./target/release/meow-cli -f config.yaml status
-./target/release/meow-cli -f config.yaml group select "🚀 Proxy" "HK 01"
+./target/release/meow-cli -f config.yaml group select "Proxy" "HK 01"
 ./target/release/meow-cli -f config.yaml conn list --filter youtube
 ```
 
-`--json` prints the API's answers for scripts, and `meow-cli skill` prints an agent skill (`SKILL.md`) that teaches a coding agent to use it. See the [meow-cli guide](https://meow-rs.github.io/meow-rs/guide/meow-cli).
+`--json` prints the API's answers for scripts. Those archives also carry an agent skill in `skills/meow-cli/` that teaches a coding agent to use it; `meow-cli skill` prints its `SKILL.md`. See the [meow-cli guide](https://meow-rs.github.io/meow-rs/guide/meow-cli).
 
 ### Use the Proxy
 

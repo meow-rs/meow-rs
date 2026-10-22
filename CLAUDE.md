@@ -80,7 +80,7 @@ The workspace has 15 crates (see also [ADR-0009](docs/adr/0009-cleanup-scope.md)
 | `meow-config` | YAML configuration parsing into typed structs |
 | `meow-api` | REST API server (Axum) for proxies, rules, connections, configs, traffic, DNS query |
 | `meow-app` | CLI entry point (`main.rs`) — wires config → tunnel → listeners → DNS → API → health checks → subscription refresh |
-| `meow-cli` | `meow-cli` binary: controls a running meow over its REST API (plain HTTP client, no engine crates); ships its agent skill at `skills/meow-cli/SKILL.md`. Unpublished: the crates.io name belongs to an unrelated crate |
+| `meow-cli` | `meow-cli` binary: controls a running meow over its REST API (plain HTTP client, no engine crates); ships its agent skill at `skills/meow-cli/SKILL.md`, which the desktop release archives carry as `skills/meow-cli/` (`desktop: true` in `build.yml`). Unpublished: the crates.io name belongs to an unrelated crate |
 | `meow-bench` | Standalone benchmark binary (throughput, latency, connection-rate, DNS, memory, binary-size, config-reload, idle/steady footprint, proxied-outbound via sing-box) |
 
 ### Startup Flow

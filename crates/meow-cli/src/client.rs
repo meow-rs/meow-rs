@@ -246,7 +246,10 @@ mod tests {
 
     #[test]
     fn names_are_encoded_whole() {
-        assert_eq!(encode("🚀 Proxy/HK#1"), "%F0%9F%9A%80%20Proxy%2FHK%231");
+        assert_eq!(
+            encode("节点 Proxy/HK#1"),
+            "%E8%8A%82%E7%82%B9%20Proxy%2FHK%231"
+        );
         assert_eq!(encode("Auto-1_a.b~"), "Auto-1_a.b~");
         assert_eq!(
             with_query(

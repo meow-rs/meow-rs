@@ -26,7 +26,7 @@ const CONFIG: &str = r#"
 mode: rule
 log-level: info
 proxy-groups:
-  - name: "🚀 Proxy"
+  - name: "节点选择"
     type: select
     proxies: [DIRECT, REJECT]
   - name: Auto
@@ -35,7 +35,7 @@ proxy-groups:
     url: https://www.gstatic.com/generate_204
     interval: 300
 rules:
-  - DOMAIN,example.com,🚀 Proxy
+  - DOMAIN,example.com,节点选择
   - MATCH,DIRECT
 "#;
 
@@ -239,18 +239,18 @@ async fn an_unreachable_controller_is_named() {
 async fn a_selector_switches_and_shows_its_choice() {
     let meow = Meow::start().await;
     let list = meow.run(&["group", "list"]).await;
-    assert!(list.contains("🚀 Proxy -> DIRECT"), "{list}");
+    assert!(list.contains("节点选择 -> DIRECT"), "{list}");
 
-    let text = meow.run(&["group", "select", "🚀 Proxy", "REJECT"]).await;
-    assert_eq!(text, "🚀 Proxy -> REJECT\n");
-    let show = json(&meow.run(&["--json", "group", "show", "🚀 Proxy"]).await);
+    let text = meow.run(&["group", "select", "节点选择", "REJECT"]).await;
+    assert_eq!(text, "节点选择 -> REJECT\n");
+    let show = json(&meow.run(&["--json", "group", "show", "节点选择"]).await);
     assert_eq!(show["now"], "REJECT");
-    let show = meow.run(&["group", "show", "🚀 Proxy"]).await;
+    let show = meow.run(&["group", "show", "节点选择"]).await;
     assert!(show.contains("*  "), "{show}");
 
-    let stderr = meow.fails(&["group", "select", "🚀 Proxy", "nope"]).await;
+    let stderr = meow.fails(&["group", "select", "节点选择", "nope"]).await;
     assert!(stderr.contains("meow answered 400"), "{stderr}");
-    let stderr = meow.fails(&["group", "unfix", "🚀 Proxy"]).await;
+    let stderr = meow.fails(&["group", "unfix", "节点选择"]).await;
     assert!(
         stderr.contains("only url-test and fallback groups"),
         "{stderr}"
@@ -295,7 +295,7 @@ async fn rules_list_in_match_order() {
     let text = meow.run(&["rule", "list"]).await;
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(lines.len(), 3, "{text}");
-    assert!(lines[1].contains("example.com") && lines[1].ends_with("🚀 Proxy"));
+    assert!(lines[1].contains("example.com") && lines[1].ends_with("节点选择"));
     assert!(lines[2].starts_with("1 "), "{text}");
 
     let filtered = meow.run(&["rule", "list", "--filter", "EXAMPLE"]).await;
@@ -308,7 +308,7 @@ async fn rules_list_in_match_order() {
 async fn a_config_file_names_the_controller_and_reloads() {
     let meow = Meow::start().await;
     let config = meow.config_file(&[
-        "DOMAIN,example.com,🚀 Proxy",
+        "DOMAIN,example.com,节点选择",
         "DOMAIN-SUFFIX,example.org,Auto",
         "MATCH,DIRECT",
     ]);
@@ -361,6 +361,12 @@ async fn connections_list_and_close() {
     );
     let stderr = meow.fails(&["conn", "show", "1a2b"]).await;
     assert!(stderr.contains("1a2b"), "{stderr}");
+    // meow answers 204 to closing any well-formed id: meow-cli checks first.
+    let gone = "0f8e2b1c-5d4a-4c3b-9a2e-7f6d5c4b3a21";
+    let stderr = meow.fails(&["conn", "close", gone]).await;
+    assert!(stderr.contains(gone), "{stderr}");
+    let stderr = meow.fails(&["conn", "close", ""]).await;
+    assert!(stderr.contains("connection id"), "{stderr}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

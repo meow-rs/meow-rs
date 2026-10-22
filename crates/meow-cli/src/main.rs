@@ -158,9 +158,14 @@ struct Probe {
     /// URL to fetch through the proxy
     #[arg(long, default_value = "https://www.gstatic.com/generate_204")]
     url: String,
-    /// Milliseconds before a member counts as failed
-    #[arg(long, default_value_t = 5000, value_name = "MS")]
-    probe_timeout: u64,
+    /// Milliseconds before a member counts as failed, up to 65535
+    #[arg(
+        long,
+        default_value_t = 5000,
+        value_name = "MS",
+        value_parser = clap::value_parser!(u16).range(1..)
+    )]
+    probe_timeout: u16,
 }
 
 #[derive(Subcommand)]
@@ -254,10 +259,12 @@ enum LogbookAction {
     Clear,
 }
 
+const LOGBOOK_LIMIT: usize = 50;
+
 #[derive(Args)]
 struct LogbookQuery {
     /// Entries to show
-    #[arg(long, default_value_t = 50)]
+    #[arg(long, default_value_t = LOGBOOK_LIMIT)]
     limit: usize,
     /// Lowest level to show
     #[arg(long, value_enum)]
@@ -480,6 +487,45 @@ mod tests {
     #[test]
     fn the_cli_definition_is_consistent() {
         Cli::command().debug_assert();
+    }
+
+    /// The skill keeps to the Agent Skills format (agentskills.io/specification):
+    /// frontmatter with only the spec's fields, a `name` that matches its
+    /// directory, a bounded `description`, and a body small enough to load
+    /// whole.
+    #[test]
+    fn the_skill_follows_the_agent_skills_format() {
+        const FIELDS: [&str; 6] = [
+            "name",
+            "description",
+            "license",
+            "compatibility",
+            "metadata",
+            "allowed-tools",
+        ];
+        // A Windows checkout may turn the newlines into CRLF.
+        let text = SKILL.replace("\r\n", "\n");
+        let (front, _body) = text
+            .strip_prefix("---\n")
+            .and_then(|rest| rest.split_once("\n---\n"))
+            .expect("SKILL.md opens with a `---` frontmatter block");
+        let front: serde_yaml::Mapping = serde_yaml::from_str(front).unwrap();
+        for key in front.keys() {
+            let key = key.as_str().unwrap_or_default();
+            assert!(
+                FIELDS.contains(&key),
+                "`{key}` is not an Agent Skills field"
+            );
+        }
+        let field = |key: &str| front.get(key).and_then(serde_yaml::Value::as_str);
+
+        // The directory: crates/meow-cli/skills/meow-cli/.
+        assert_eq!(field("name"), Some("meow-cli"));
+        let description = field("description").unwrap_or_default();
+        assert!((1..=1024).contains(&description.chars().count()));
+        let compatibility = field("compatibility").unwrap_or("x");
+        assert!((1..=500).contains(&compatibility.chars().count()));
+        assert!(text.lines().count() < 500, "keep SKILL.md under 500 lines");
     }
 
     /// Every `meow-cli …` line in the skill's code blocks must parse, so the

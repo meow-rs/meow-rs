@@ -192,9 +192,9 @@ pub async fn group_test(ctx: &Ctx, name: &str, probe: &Probe) -> anyhow::Result<
         &format!("/group/{}/delay", encode(name)),
         &[("url", Some(&probe.url)), ("timeout", Some(&timeout))],
     );
-    let client = ctx
-        .client
-        .waiting_at_least(Duration::from_millis(probe.probe_timeout) + Duration::from_secs(10));
+    let client = ctx.client.waiting_at_least(
+        Duration::from_millis(probe.probe_timeout.into()) + Duration::from_secs(10),
+    );
     // 504: no member passed before the deadline.
     let delays = match client.call(Method::GET, &path, None).await {
         Ok(answer) => answer.unwrap_or_else(|| json!({})),
@@ -302,9 +302,9 @@ pub async fn proxy_test(ctx: &Ctx, name: &str, probe: &Probe) -> anyhow::Result<
         &format!("/proxies/{}/delay", encode(name)),
         &[("url", Some(&probe.url)), ("timeout", Some(&timeout))],
     );
-    let client = ctx
-        .client
-        .waiting_at_least(Duration::from_millis(probe.probe_timeout) + Duration::from_secs(10));
+    let client = ctx.client.waiting_at_least(
+        Duration::from_millis(probe.probe_timeout.into()) + Duration::from_secs(10),
+    );
     let answer = match client.call(Method::GET, &path, None).await {
         Ok(answer) => answer.unwrap_or_default(),
         Err(e) if refused_with(&e) == Some(StatusCode::GATEWAY_TIMEOUT) => {

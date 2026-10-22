@@ -54,6 +54,9 @@ jobs:
           # (`full`; TLS is BoringSSL). Targets that cannot link boring-sys
           # (MIPS, 32-bit musl, windows-gnu) are not shipped and — since the
           # rustls backend was removed — cannot be built with TLS at all.
+          # `desktop: true` targets also ship meow-cli and its agent skill
+          # (skills/meow-cli/) beside meow; router and board targets ship
+          # meow alone.
           # Linux musl
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-latest
@@ -77,6 +80,7 @@ jobs:
           # Linux GNU
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-latest
+            desktop: true
             minimal_budget_bytes: 0
             minimal_soft_gate: true
           - target: armv7-unknown-linux-gnueabihf
@@ -85,6 +89,7 @@ jobs:
             minimal_soft_gate: true
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
+            desktop: true
             minimal_budget_bytes: 0
             minimal_soft_gate: true
           - target: riscv64gc-unknown-linux-musl
@@ -94,23 +99,28 @@ jobs:
           # Windows
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
+            desktop: true
             minimal_budget_bytes: 0
             minimal_soft_gate: true
           - target: aarch64-pc-windows-msvc
             runner: windows-latest
+            desktop: true
             minimal_budget_bytes: 0
             minimal_soft_gate: true
           - target: i686-pc-windows-msvc
             runner: windows-latest
+            desktop: true
             minimal_budget_bytes: 0
             minimal_soft_gate: true
           # macOS
           - target: x86_64-apple-darwin
             runner: macos-latest
+            desktop: true
             minimal_budget_bytes: 0
             minimal_soft_gate: true
           - target: aarch64-apple-darwin
             runner: macos-latest
+            desktop: true
             minimal_budget_bytes: 0
             minimal_soft_gate: true
     steps:
@@ -157,6 +167,7 @@ jobs:
           fi
 
       - name: Build meow-cli
+        if: matrix.desktop
         shell: bash
         run: |
           # A build of its own: meow-cli links none of the engine, and
@@ -218,11 +229,19 @@ jobs:
           ref="${{ inputs.ref }}"
           name="meow-${ref}-${{ matrix.target }}"
           staging="dist/${name}"
+          exe=""
+          if [ "${{ runner.os }}" = "Windows" ]; then exe=".exe"; fi
           mkdir -p "${staging}"
+          if [ "${{ matrix.desktop }}" = "true" ]; then
+            # meow-cli, and its agent skill as a folder an agent's skills
+            # directory takes as is.
+            cp "target/${{ matrix.target }}/release/meow-cli${exe}" "${staging}/"
+            mkdir -p "${staging}/skills"
+            cp -R crates/meow-cli/skills/meow-cli "${staging}/skills/"
+          fi
 
           if [ "${{ runner.os }}" = "Windows" ]; then
             cp "target/${{ matrix.target }}/release/meow.exe" "${staging}/"
-            cp "target/${{ matrix.target }}/release/meow-cli.exe" "${staging}/"
             cp dist/wintun/wintun.dll "${staging}/"
             if [ -f dist/wintun/LICENSE.txt ]; then
               cp dist/wintun/LICENSE.txt "${staging}/LICENSE.wintun.txt"
@@ -234,7 +253,6 @@ jobs:
             echo "checksum=${name}.zip.sha256" >> "$GITHUB_OUTPUT"
           else
             cp "target/${{ matrix.target }}/release/meow" "${staging}/"
-            cp "target/${{ matrix.target }}/release/meow-cli" "${staging}/"
             cp README.md LICENSE "${staging}/" 2>/dev/null || true
             tar -C dist -czf "${name}.tar.gz" "${name}"
             sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256"

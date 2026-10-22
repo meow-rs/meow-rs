@@ -9,7 +9,7 @@ use hyper::Method;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::client::encode;
+use crate::client::{encode, ApiError};
 use crate::format::{self, Table};
 use crate::proxies::ProxyInfo;
 use crate::{print, print_json, Ctx, ProviderKind};
@@ -26,6 +26,8 @@ struct Providers<T> {
 #[serde(default, rename_all = "camelCase")]
 struct ProxyProvider {
     vehicle_type: String,
+    /// Empty when the provider has no health check to run.
+    test_url: String,
     proxies: Vec<ProxyInfo>,
     updated_at: Option<String>,
     subscription_info: Option<Usage>,
@@ -139,12 +141,21 @@ pub async fn update(ctx: &Ctx, name: &str, kind: Option<ProviderKind>) -> anyhow
     ctx.client
         .waiting_at_least(FETCH_TIMEOUT)
         .call(Method::PUT, &path, None)
-        .await?;
+        .await
+        .map_err(without_urls)?;
     ctx.done(&format!("updated {label} provider {name}"))
 }
 
 pub async fn check(ctx: &Ctx, name: &str) -> anyhow::Result<()> {
     let path = format!("/providers/proxies/{}", encode(name));
+    let provider: ProxyProvider = serde_json::from_value(ctx.client.get(&path).await?)?;
+    // meow answers 204 without testing anything then.
+    if provider.test_url.is_empty() {
+        bail!(
+            "{name} has no health-check in the config, or it is disabled; test its nodes one \
+             by one with `meow-cli proxy test`"
+        );
+    }
     ctx.client
         .waiting_at_least(FETCH_TIMEOUT)
         .call(Method::GET, &format!("{path}/healthcheck"), None)
@@ -197,7 +208,8 @@ pub async fn subscription_update(ctx: &Ctx, name: &str) -> anyhow::Result<()> {
         .client
         .waiting_at_least(FETCH_TIMEOUT)
         .call(Method::POST, &path, None)
-        .await?
+        .await
+        .map_err(without_urls)?
         .unwrap_or_default();
     ctx.show(answer, |refreshed: Refreshed| {
         let mut text = format!(
@@ -228,6 +240,38 @@ fn usage_text(usage: &Usage) -> String {
     text
 }
 
+/// A failed fetch can quote the URL, access token and all: keep its host.
+fn without_urls(error: anyhow::Error) -> anyhow::Error {
+    match error.downcast::<ApiError>() {
+        Ok(mut refused) => {
+            refused.message = hide_urls(&refused.message);
+            refused.into()
+        }
+        Err(error) => error,
+    }
+}
+
+/// `text` with each `scheme://…` in it cut down by [`url_host`].
+fn hide_urls(text: &str) -> String {
+    let mut hidden = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("://") {
+        let scheme = rest[..at]
+            .bytes()
+            .rev()
+            .take_while(|byte| byte.is_ascii_alphanumeric() || b"+-.".contains(byte))
+            .count();
+        let end = rest[at..]
+            .find(|c: char| c.is_whitespace() || "'\"`<>()".contains(c))
+            .map_or(rest.len(), |len| at + len);
+        hidden.push_str(&rest[..at - scheme]);
+        hidden.push_str(&url_host(&rest[at - scheme..end]));
+        rest = &rest[end..];
+    }
+    hidden.push_str(rest);
+    hidden
+}
+
 /// `https://sub.example.com/…` for any URL: its scheme and host only.
 fn url_host(url: &str) -> String {
     let (scheme, rest) = url.split_once("://").unwrap_or(("", url));
@@ -252,6 +296,23 @@ mod tests {
             "https://sub.example.com/…"
         );
         assert_eq!(url_host("sub.example.com/x"), "sub.example.com/…");
+    }
+
+    #[test]
+    fn fetch_errors_lose_their_urls() {
+        assert_eq!(
+            hide_urls(
+                "invalid URL 'https://sub.example.com/s?token=abc': x; \
+                 too many redirects (> 5) starting from http://a.example/t/abc"
+            ),
+            "invalid URL 'https://sub.example.com/…': x; \
+             too many redirects (> 5) starting from http://a.example/…"
+        );
+        assert_eq!(
+            hide_urls("节点 https://x.example/k"),
+            "节点 https://x.example/…"
+        );
+        assert_eq!(hide_urls("no url here"), "no url here");
     }
 
     #[test]
