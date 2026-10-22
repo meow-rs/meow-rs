@@ -28,7 +28,7 @@ const PUBLISHABLE: &[&str] = &[
     "meow-app",
 ];
 
-const UNPUBLISHED: &[&str] = &["meow-bench"];
+const UNPUBLISHED: &[&str] = &["meow-bench", "meow-cli"];
 
 fn workspace_root() -> PathBuf {
     let mut dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));

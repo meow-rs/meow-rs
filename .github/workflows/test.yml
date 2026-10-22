@@ -257,7 +257,7 @@ jobs:
           # And for kcptun_e2e's all-real-peer suite.
           KCPTUN_SERVER_BIN: ${{ runner.temp }}/kcptun-server
         run: |
-          cargo nextest run --lib --bin meow --bin meow-bench \
+          cargo nextest run --lib --bin meow --bin meow-bench --bin meow-cli \
             --test common_test \
             --test socks5_udp_user \
             --test dns_cache_test \
@@ -267,6 +267,7 @@ jobs:
             --test statistics_test \
             --test rules_test \
             --test api_test \
+            --test meow_cli_test \
             --test raii_guard_test \
             --test http_connection_close \
             --test config_persistence_test \
@@ -483,11 +484,12 @@ jobs:
       - name: Unit + integration tests (windows)
         shell: bash
         run: |
-          cargo nextest run --lib --bin meow --bin meow-bench \
+          cargo nextest run --lib --bin meow --bin meow-bench --bin meow-cli \
             --test common_test \
             --test config_test \
             --test rules_test \
             --test api_test \
+            --test meow_cli_test \
             --test trojan_integration \
             --test tls_test \
             --test boring_tls_test \
@@ -553,11 +555,12 @@ jobs:
 
       - name: Core smoke tests
         run: |
-          cargo nextest run --lib --bin meow --bin meow-bench \
+          cargo nextest run --lib --bin meow --bin meow-bench --bin meow-cli \
             --test common_test \
             --test config_test \
             --test rules_test \
             --test api_test \
+            --test meow_cli_test \
             --test trojan_integration \
             --test tls_test \
             --test boring_tls_test \

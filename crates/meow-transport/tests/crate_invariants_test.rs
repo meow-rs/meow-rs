@@ -620,6 +620,13 @@ const RAW_SOCKET_ALLOWLIST: &[(&str, &str, usize, &str)] = &[
         1,
         "AF_PACKET ARP frame on an explicit interface; not IP-routed",
     ),
+    // A separate process, never inside the engine.
+    (
+        "crates/meow-cli/src/client.rs",
+        "TcpStream::connect(",
+        1,
+        "meow-cli dialing meow's external-controller, as any API client does",
+    ),
 ];
 
 /// No production source in the workspace creates an outbound socket with a

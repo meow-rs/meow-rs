@@ -1,0 +1,45 @@
+[package]
+name = "meow-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Command-line control for a running meow-rs proxy kernel over its REST API."
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+# The `meow-cli` name on crates.io belongs to an unrelated crate: the binary
+# ships in the release archives instead.
+publish = false
+
+[[bin]]
+name = "meow-cli"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+base64 = { workspace = true }
+clap = { workspace = true, features = ["env"] }
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+# meow_cli_test serves the real meow-api router to the built binary.
+axum = { workspace = true }
+dashmap = { workspace = true }
+meow-api = { workspace = true }
+meow-common = { workspace = true }
+meow-config = { workspace = true, default-features = false }
+meow-dns = { workspace = true, default-features = false }
+meow-trie = { workspace = true }
+meow-tunnel = { workspace = true }
+parking_lot = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

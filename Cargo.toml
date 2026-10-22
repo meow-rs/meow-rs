@@ -15,6 +15,7 @@ members = [
     "crates/meow-config",
     "crates/meow-app",
     "crates/meow-bench",
+    "crates/meow-cli",
 ]
 
 [profile.release]

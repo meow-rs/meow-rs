@@ -19,6 +19,9 @@ cargo build --release
 # Test config validity
 ./target/release/meow -f config.yaml -t
 
+# Control the running meow over its REST API (`meow-cli --help`)
+./target/release/meow-cli -f config.yaml status
+
 # Run all unit tests
 cargo test --lib
 
@@ -60,7 +63,7 @@ Listeners (HTTP/SOCKS5/Mixed/TProxy/TUN)
 
 ### Workspace Crates
 
-The workspace has 14 crates (see also [ADR-0009](docs/adr/0009-cleanup-scope.md) for crate-boundary policy):
+The workspace has 15 crates (see also [ADR-0009](docs/adr/0009-cleanup-scope.md) for crate-boundary policy):
 
 | Crate | Purpose |
 |-------|---------|
@@ -77,6 +80,7 @@ The workspace has 14 crates (see also [ADR-0009](docs/adr/0009-cleanup-scope.md)
 | `meow-config` | YAML configuration parsing into typed structs |
 | `meow-api` | REST API server (Axum) for proxies, rules, connections, configs, traffic, DNS query |
 | `meow-app` | CLI entry point (`main.rs`) — wires config → tunnel → listeners → DNS → API → health checks → subscription refresh |
+| `meow-cli` | `meow-cli` binary: controls a running meow over its REST API (plain HTTP client, no engine crates); ships its agent skill at `skills/meow-cli/SKILL.md`. Unpublished: the crates.io name belongs to an unrelated crate |
 | `meow-bench` | Standalone benchmark binary (throughput, latency, connection-rate, DNS, memory, binary-size, config-reload, idle/steady footprint, proxied-outbound via sing-box) |
 
 ### Startup Flow
@@ -181,11 +185,11 @@ cargo test -p meow-config --features trusttunnel-h3 --lib
 # alone is not enough: it skips every `--test` target, so a broken integration
 # test (e.g. the ADR-0001 guard in `crate_invariants_test`) passes locally and
 # lands `main` red.
-cargo test --lib --bin meow --bin meow-bench \
+cargo test --lib --bin meow --bin meow-bench --bin meow-cli \
   --test socks5_udp_user \
   --test common_test --test dns_cache_test --test config_test \
   --test tun_config_test --test dialer_proxy_group \
-  --test statistics_test --test rules_test --test api_test \
+  --test statistics_test --test rules_test --test api_test --test meow_cli_test \
   --test raii_guard_test --test http_connection_close \
   --test config_persistence_test --test systemd_config_test \
   --test launchd_config_test \

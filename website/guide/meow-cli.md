@@ -1,0 +1,121 @@
+# meow-cli
+
+`meow-cli` controls a running meow from a shell or a script. It talks to the
+[REST API](../reference/rest-api) that `external-controller` serves, so it
+works with any meow that has the API on: a service, a desktop GUI's core, a
+router. It starts and stops nothing and links none of the engine.
+
+The release archives ship it beside `meow`. From a checkout:
+
+```bash
+cargo build --release -p meow-cli
+./target/release/meow-cli --help
+```
+
+## Connecting
+
+meow-cli looks for the controller in this order:
+
+1. `--controller host:port` (`-c`), or `MEOW_CONTROLLER`
+2. `external-controller` in the config named by `--config` (`-f`), or `MEOW_CONFIG`
+3. `127.0.0.1:9090`
+
+The API secret comes from `--secret-stdin` (the first line of standard input),
+else `MEOW_SECRET`, else `secret` in that config. There is no `--secret` flag,
+so the secret never lands in shell history or the process list.
+
+The simplest way is to point it at the config meow runs:
+
+```bash
+meow-cli -f /etc/meow/config.yaml status
+```
+
+`external-controller: :9090` and `0.0.0.0:9090` reach the controller on the
+loopback. The controller serves plain HTTP only, so meow-cli refuses an
+`https://` address.
+
+## Commands
+
+| Command | What it does |
+| --- | --- |
+| `status` | Version, mode, log level, TUN, ports, connection and traffic totals |
+| `mode [rule\|global\|direct]` | Show the routing mode, or switch it |
+| `log-level [LEVEL]` | Show the log level, or change it |
+| `tun [on\|off]` | Show whether the TUN inbound runs, or turn it on or off |
+| `group list` / `show G` | Groups with the member each routes through; one group's members and delays |
+| `group select G MEMBER` | Route a group through one member |
+| `group unfix G` | Return a url-test or fallback group to its automatic choice |
+| `group test G` | Delay-test every member of a group |
+| `proxy list` / `show P` / `test P` | Proxies, provider members included; one proxy's delay history; a delay test |
+| `rule list` | Rules in match order, with their index |
+| `conn list` / `show ID` | Open connections with the rule and route; one connection with its notes |
+| `conn close ID…` / `--all` | Close connections by id or unique id prefix, or all of them |
+| `dns query NAME [-t TYPE]` | Resolve through meow's resolver |
+| `dns cache` / `flush` / `flush-fakeip` | The DNS cache, and the flushes |
+| `provider list` / `update NAME` / `check NAME` | Proxy and rule providers, with subscription usage |
+| `subscription list` / `update NAME` | Config subscriptions |
+| `logbook [clear]` | The logbook, meow's persistent record of notable events: reloads, update failures, listener and network events |
+| `log [--level L] [--count N]` | Follow the log |
+| `traffic [--count N]` | Follow upload and download rates |
+| `stats` | Bytes each proxy carried since meow started |
+| `listeners` | Configured named listeners |
+| `reload [PATH] [--force]` | Load a config file: the `--config` one by default |
+| `skill` | Print the agent skill, see below |
+
+`--filter` narrows `proxy list`, `rule list` and `conn list` to entries that
+contain a word, ignoring case. `meow-cli <command> --help` lists every option.
+
+```bash
+meow-cli group select "🚀 Proxy" "HK 01"
+meow-cli conn list --filter youtube
+meow-cli logbook --level warning --limit 20
+meow-cli log --level warning --count 50
+```
+
+What a change does:
+
+- `group select` on a `select` group switches it, and meow keeps the choice
+  across restarts. On a `url-test` or `fallback` group it pins the member
+  until `group unfix`; `group test` on such a group clears the pin, as in
+  mihomo.
+- `mode`, `log-level` and `tun` change the running meow only. The config
+  file keeps its values, and a restart or a reload returns to them.
+- `reload` sends the file's contents, so meow need not be able to read the
+  path (another host, another user). meow keeps the running config when the
+  new one fails to load; `--force` applies it even when parts of it fail to
+  build.
+- `subscription list` shows only the scheme and host of each URL: the rest
+  usually carries an access token.
+
+## Scripting
+
+`--json` prints what the API answered instead of the text tables, for `jq`
+and scripts. `log` and `traffic` print one JSON object per line.
+
+```bash
+meow-cli --json group show Auto | jq -r .now
+meow-cli traffic --json --count 1 | jq .down
+```
+
+meow-cli exits 0 on success and 1 on any failure, with the reason on
+standard error. `proxy test` fails when the proxy does, so it works as a
+check:
+
+```bash
+meow-cli proxy test "HK 01" --probe-timeout 3000 || echo "HK 01 is down"
+```
+
+## Agent skill
+
+`meow-cli skill` prints a `SKILL.md` that teaches a coding agent to use
+meow-cli: which commands only read, which change routing and need the user's
+yes first, and how to keep the API secret out of the conversation. For
+Claude Code:
+
+```bash
+mkdir -p ~/.claude/skills/meow-cli
+meow-cli skill > ~/.claude/skills/meow-cli/SKILL.md
+```
+
+The skill matches the meow-cli that printed it, so print it again after an
+upgrade.
