@@ -80,12 +80,11 @@ impl Target {
         };
         let running = controller_file::running();
         let (authority, published) = match address {
-            Some(address) => {
-                let published = running
-                    .into_iter()
-                    .find(|meow| same_controller(&address, meow.controller));
-                (address, published)
-            }
+            Some(address) => match serving(&address, running) {
+                // Dial the address meow bound, which `localhost` only names.
+                Some(meow) => (meow.controller.to_string(), Some(meow)),
+                None => (address, None),
+            },
             None => match <[_; 1]>::try_from(running) {
                 Ok([meow]) => (meow.controller.to_string(), Some(meow)),
                 Err(running) if running.is_empty() => (DEFAULT_CONTROLLER.to_string(), None),
@@ -112,18 +111,23 @@ impl Target {
     }
 }
 
-/// Whether `address`, as `normalize_address` gives it, is the controller a
-/// meow published: the same socket address, or the same port on this
-/// host's loopback, whichever name the loopback goes by.
-fn same_controller(address: &str, published: SocketAddr) -> bool {
-    let Some((host, port)) = address.rsplit_once(':') else {
-        return false;
-    };
-    let host = host.trim_start_matches('[').trim_end_matches(']');
-    let loopback = host.eq_ignore_ascii_case("localhost")
-        || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback());
-    address.parse() == Ok(published)
-        || (loopback && published.ip().is_loopback() && port.parse() == Ok(published.port()))
+/// The running meow that serves `address`, as `normalize_address` gives
+/// it: the one that bound exactly that address, or for `localhost:PORT` one
+/// on the loopback at that port. Never one on another loopback address: a
+/// meow on `127.0.0.1:9090` does not own `[::1]:9090`, and whoever does must
+/// not get its secret.
+fn serving(address: &str, running: Vec<controller_file::Entry>) -> Option<controller_file::Entry> {
+    if let Ok(address) = address.parse::<SocketAddr>() {
+        return running.into_iter().find(|meow| meow.controller == address);
+    }
+    let (host, port) = address.rsplit_once(':')?;
+    let port = port.parse::<u16>().ok()?;
+    if !host.eq_ignore_ascii_case("localhost") {
+        return None;
+    }
+    running
+        .into_iter()
+        .find(|meow| meow.controller.ip().is_loopback() && meow.controller.port() == port)
 }
 
 fn several_running(running: &[controller_file::Entry]) -> String {
@@ -249,22 +253,36 @@ mod tests {
     }
 
     #[test]
-    fn a_published_controller_matches_by_address() {
-        let published: SocketAddr = "127.0.0.1:9090".parse().unwrap();
-        for address in [
-            "127.0.0.1:9090",
-            "localhost:9090",
-            "[::1]:9090",
-            "127.0.0.2:9090",
-        ] {
-            assert!(same_controller(address, published), "{address}");
+    fn a_published_secret_goes_only_to_its_own_address() {
+        let meow = |pid: u32, controller: &str| controller_file::Entry {
+            pid,
+            controller: controller.parse().unwrap(),
+            secret: Some(format!("secret {pid}")),
+            config: None,
+        };
+        let running = || {
+            vec![
+                meow(1, "127.0.0.1:9090"),
+                meow(2, "[::1]:9091"),
+                meow(3, "192.168.1.2:9092"),
+            ]
+        };
+        let cases = [
+            ("127.0.0.1:9090", Some(1)),
+            ("localhost:9090", Some(1)),
+            ("LOCALHOST:9091", Some(2)),
+            ("192.168.1.2:9092", Some(3)),
+            // Free for any local user to bind.
+            ("[::1]:9090", None),
+            ("127.0.0.2:9090", None),
+            ("127.0.0.1:9091", None),
+            ("router.lan:9092", None),
+            ("localhost:9092", None),
+        ];
+        for (address, pid) in cases {
+            let found = serving(address, running()).map(|meow| meow.pid);
+            assert_eq!(found, pid, "{address}");
         }
-        for address in ["127.0.0.1:9091", "192.168.1.2:9090", "router.lan:9090"] {
-            assert!(!same_controller(address, published), "{address}");
-        }
-        let lan: SocketAddr = "192.168.1.2:9090".parse().unwrap();
-        assert!(same_controller("192.168.1.2:9090", lan));
-        assert!(!same_controller("127.0.0.1:9090", lan));
     }
 
     #[test]

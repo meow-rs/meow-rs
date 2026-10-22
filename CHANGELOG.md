@@ -22,9 +22,11 @@ the canonical, in-repo source a release is cut from.
   needs no options: once its `external-controller` is up, meow writes the
   address and the API secret to a file only that user can read, and
   removes it on exit, so meow-cli also finds a meow that a desktop GUI
-  started with the secret on its command line. `--config`,
-  `MEOW_CONTROLLER` and `MEOW_SECRET` override it; there is no secret flag,
-  so the secret never lands in shell history. A meow running as root
+  started with the secret on its command line. `--controller` and
+  `--config` name another address, and that meow's file still supplies the
+  secret when it bound exactly that address; `MEOW_SECRET` and
+  `--secret-stdin` override it. There is no secret flag, so the secret
+  never lands in shell history. A meow running as root
   publishes in `/var/run/meow`, for root; the systemd unit `meow install`
   writes now creates that directory (`RuntimeDirectory=meow`).
   `--json` prints the API's answers for scripts. The same archives carry

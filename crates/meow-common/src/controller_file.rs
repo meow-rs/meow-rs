@@ -12,15 +12,20 @@
 //! that died; whoever lists the directory next removes it. The lock, not the
 //! pid, is the liveness test, so a reused pid cannot pass for a live meow.
 
-use std::fs::{self, File, OpenOptions, TryLockError};
+use std::fs::{self, DirEntry, File, OpenOptions, TryLockError};
 use std::io::{self, Read as _, Write as _};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 /// Environment variable that overrides [`dir`].
 pub const DIR_ENV: &str = "MEOW_RUNTIME_DIR";
+
+/// How long a scratch file may sit before it counts as a dead writer's: a
+/// live one renames it within milliseconds.
+const SCRATCH_STALE_AGE: Duration = Duration::from_secs(60);
 
 /// One running meow, as its controller file describes it.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -178,23 +183,36 @@ pub fn running_in(dir: &Path) -> Vec<Entry> {
     let mut entries = Vec::new();
     for item in listing.flatten() {
         let path = item.path();
-        // Regular files only: opening a FIFO would block, and a symlink
-        // could stand in for a file this user does not own.
-        if path.extension().is_none_or(|extension| extension != "json")
-            || !item.file_type().is_ok_and(|kind| kind.is_file())
-        {
-            continue;
+        let named_by_pid = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .is_some_and(|stem| !stem.is_empty() && stem.bytes().all(|b| b.is_ascii_digit()));
+        match path.extension().and_then(|extension| extension.to_str()) {
+            Some("json") if named_by_pid => {}
+            Some("tmp") if named_by_pid => {
+                if is_stale_scratch(&item) {
+                    let _ = fs::remove_file(&path);
+                }
+                continue;
+            }
+            _ => continue,
         }
-        let Ok(mut file) = File::open(&path) else {
+        let Ok(mut file) = open_entry(&path) else {
             continue;
         };
-        if !owned_by_this_user(&file) {
+        // Checked on the open file, so nothing can be swapped in after the
+        // check: a FIFO would block the read, and only a file this user
+        // owns may point meow-cli at a controller and hand it a secret.
+        if !file.metadata().is_ok_and(|metadata| metadata.is_file()) || !owned_by_this_user(&file) {
             continue;
         }
         match file.try_lock() {
-            // Nobody holds it: its meow is gone.
+            // Nobody holds it: its meow is gone. Unless a meow that reused
+            // the pid has just renamed its own file into place.
             Ok(()) => {
-                let _ = fs::remove_file(&path);
+                if still_at(&file, &path) {
+                    let _ = fs::remove_file(&path);
+                }
             }
             Err(TryLockError::WouldBlock) => {
                 let mut text = String::new();
@@ -211,6 +229,17 @@ pub fn running_in(dir: &Path) -> Vec<Entry> {
     }
     entries.sort_by_key(|entry: &Entry| entry.pid);
     entries
+}
+
+fn is_stale_scratch(item: &DirEntry) -> bool {
+    item.metadata().is_ok_and(|metadata| {
+        metadata.is_file()
+            && metadata
+                .modified()
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age > SCRATCH_STALE_AGE)
+    })
 }
 
 /// The address a client on this host dials for a listener bound to `addr`.
@@ -244,10 +273,14 @@ fn create_private_dir(dir: &Path) -> io::Result<()> {
     fs::create_dir_all(dir)
 }
 
+// Files open for reading and writing on both sides: where flock is
+// emulated with fcntl (NFS), a shared lock needs a readable descriptor and
+// an exclusive one a writable descriptor.
 #[cfg(unix)]
 fn create_private_file(path: &Path) -> io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt as _;
     OpenOptions::new()
+        .read(true)
         .write(true)
         .create_new(true)
         .mode(0o600)
@@ -256,7 +289,43 @@ fn create_private_file(path: &Path) -> io::Result<File> {
 
 #[cfg(not(unix))]
 fn create_private_file(path: &Path) -> io::Result<File> {
-    OpenOptions::new().write(true).create_new(true).open(path)
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(path)
+}
+
+/// Opens a controller file without following a symlink or blocking on a
+/// FIFO.
+#[cfg(unix)]
+fn open_entry(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_entry(path: &Path) -> io::Result<File> {
+    OpenOptions::new().read(true).write(true).open(path)
+}
+
+/// Whether `path` still names the open `file`.
+#[cfg(unix)]
+fn still_at(file: &File, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    match (file.metadata(), fs::symlink_metadata(path)) {
+        (Ok(open), Ok(named)) => open.dev() == named.dev() && open.ino() == named.ino(),
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn still_at(_file: &File, _path: &Path) -> bool {
+    true
 }
 
 /// Only a file this user owns can point meow-cli at a controller and hand
@@ -335,9 +404,40 @@ mod tests {
         let other = dir.path().join("gateway.nft");
         fs::write(&other, "table inet meow {}").unwrap();
 
+        // A scratch file its writer died before renaming, and one that a
+        // live writer may still rename.
+        let old_scratch = dir.path().join("4243.tmp");
+        fs::write(&old_scratch, "{").unwrap();
+        File::options()
+            .write(true)
+            .open(&old_scratch)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - 2 * SCRATCH_STALE_AGE)
+            .unwrap();
+        let new_scratch = dir.path().join("4244.tmp");
+        fs::write(&new_scratch, "{").unwrap();
+
         assert!(running_in(dir.path()).is_empty());
-        assert!(!stale.exists());
+        assert!(!stale.exists() && !old_scratch.exists());
+        assert!(new_scratch.exists());
         assert!(other.exists(), "only controller files are swept");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_or_a_symlink_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("4242.json");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `name` is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let target = dir.path().join("elsewhere");
+        fs::write(&target, r#"{"pid":4243,"controller":"127.0.0.1:9091"}"#).unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join("4243.json")).unwrap();
+
+        // Returns at all: opening the FIFO does not wait for a writer.
+        assert!(running_in(dir.path()).is_empty());
+        assert!(target.exists());
     }
 
     #[test]

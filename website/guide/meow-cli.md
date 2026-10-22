@@ -38,8 +38,9 @@ meow-cli looks for the controller in this order:
 
 When several meows run as this user, meow-cli lists them and asks for
 `--controller`. The API secret comes from `--secret-stdin` (the first line
-of standard input), else `MEOW_SECRET`, else the file of the meow at that
-address, else `secret` in the `--config` file. There is no `--secret` flag,
+of standard input), else `MEOW_SECRET`, else the file of the meow that
+bound exactly that address (`localhost:PORT` names one on the loopback),
+else `secret` in the `--config` file. There is no `--secret` flag,
 so the secret never lands in shell history or the process list.
 
 ```bash
@@ -63,7 +64,9 @@ loopback. The controller serves plain HTTP only, so meow-cli refuses an
 Each running meow has a `<pid>.json` there, mode 0600 in a 0700 directory.
 meow holds a lock on it while it runs; a file left by a meow that was
 killed is not locked, and the next meow or meow-cli to look removes it.
-`MEOW_RUNTIME_DIR` replaces the directory, for meow and meow-cli alike.
+`MEOW_RUNTIME_DIR` replaces the directory, for meow and meow-cli alike;
+point it only at a directory no other user can write to. On unix meow-cli
+skips files another user owns, but on Windows it cannot tell who wrote one.
 
 A meow running as root, or as a Windows service, publishes for that account
 only: run `sudo meow-cli`, or pass `--controller` and `MEOW_SECRET`. The
