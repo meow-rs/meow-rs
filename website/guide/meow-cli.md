@@ -5,8 +5,8 @@
 works with any meow that has the API on: a service, a desktop GUI's core, a
 router. It starts and stops nothing.
 
-The desktop release archives (Windows, macOS, and Linux glibc on x86_64 and
-aarch64) ship it beside `meow`, with its [agent skill](#agent-skill) in
+The desktop release archives (Windows, macOS, and Linux glibc and musl on x86_64
+and aarch64) ship it beside `meow`, with its [agent skill](#agent-skill) in
 `skills/meow-cli/`. From a checkout:
 
 ```bash

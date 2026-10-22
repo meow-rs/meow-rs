@@ -411,7 +411,7 @@ From the **Subscriptions** tab you can add a Clash subscription URL to import pr
 
 ### Control it from the shell
 
-`meow-cli` ships beside `meow` in the desktop release archives (Windows, macOS, Linux glibc) and drives the same REST API. On the machine meow runs on, as the same user, it needs no options: once `external-controller` is up, meow writes its address and secret to a file only that user can read, and meow-cli reads it.
+`meow-cli` ships beside `meow` in the desktop release archives (Windows, macOS, Linux on x86_64 and aarch64) and drives the same REST API. On the machine meow runs on, as the same user, it needs no options: once `external-controller` is up, meow writes its address and secret to a file only that user can read, and meow-cli reads it.
 
 ```bash
 ./target/release/meow-cli status

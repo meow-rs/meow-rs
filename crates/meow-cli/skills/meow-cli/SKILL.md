@@ -204,8 +204,8 @@ meow-cli exits 0 on success and 1 on any failure, with the reason on stderr:
 
 ## Installing this skill
 
-The desktop release archives (Windows, macOS, and Linux glibc on x86_64 and
-aarch64) carry this skill as `skills/meow-cli/`: copy that folder into the
+The desktop release archives (Windows, macOS, and Linux glibc and musl on x86_64
+and aarch64) carry this skill as `skills/meow-cli/`: copy that folder into the
 agent's skills directory. `meow-cli skill` prints this file, for a meow-cli
 installed another way:
 

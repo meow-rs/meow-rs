@@ -55,11 +55,14 @@ jobs:
           # (MIPS, 32-bit musl, windows-gnu) are not shipped and — since the
           # rustls backend was removed — cannot be built with TLS at all.
           # `desktop: true` targets also ship meow-cli and its agent skill
-          # (skills/meow-cli/) beside meow; router and board targets ship
-          # meow alone.
+          # (skills/meow-cli/) beside meow; armv7 and riscv64, router and
+          # board targets, ship meow alone. x86_64 and aarch64 musl count as
+          # desktop: Linux GUIs that ship meow as their core take the static
+          # musl build.
           # Linux musl
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-latest
+            desktop: true
             # x86_64: informational only, no size gate
             minimal_budget_bytes: 0
             minimal_soft_gate: true
@@ -68,6 +71,7 @@ jobs:
             openwrt_archs: x86_64
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-latest
+            desktop: true
             # aarch64: hard gate — release fails if minimal binary exceeds 8 MiB
             minimal_budget_bytes: 8388608
             minimal_soft_gate: false

@@ -12,7 +12,7 @@ the canonical, in-repo source a release is cut from.
 
 - **`meow-cli`, a command-line controller for a running meow**: a second
   binary, shipped beside `meow` in the desktop release archives (Windows,
-  macOS, Linux glibc on x86_64 and aarch64), that drives the
+  macOS, Linux glibc and musl on x86_64 and aarch64), that drives the
   REST API from a shell or a script. It shows status, switches the mode,
   log level and TUN, lists groups and switches, pins or unpins their
   members, delay-tests groups and proxies, lists rules, lists, inspects and
