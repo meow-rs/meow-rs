@@ -708,7 +708,7 @@ fn install_anytls_bridges() {
         }
         anytls_rs::set_tcp_dialer(Arc::new(DialBridge));
 
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_env = "ohos"))]
         {
             struct Bridge;
             impl anytls_rs::SocketProtector for Bridge {

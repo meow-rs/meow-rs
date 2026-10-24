@@ -71,7 +71,7 @@ pub use socket_protect::{bind_udp, connect_tcp, connect_tcp_host, resolve_host, 
 // Host-resolver hook is cross-platform (iOS installs it without a protector).
 pub use socket_protect::{clear_host_resolver, host_resolver, set_host_resolver, HostResolver};
 // Socket protector is Android-only (raw-fd `VpnService.protect`).
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 pub use socket_protect::{
     clear_socket_protector, set_socket_protector, socket_protector, SocketProtector,
 };

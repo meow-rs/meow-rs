@@ -59,10 +59,14 @@ where
         }
         send.send_data(Bytes::new(), true)
             .expect("push server: end of stream");
-        // The request body stays alive (unread) until here so h2 never
-        // resets the stream from under the response.
-        drop(request);
         let _ = done_tx.send(total);
+        // Sending DATA only queues it. Retain the open request body while
+        // the client consumes the response: dropping it here can send an
+        // RST_STREAM(NO_ERROR) before the queued response has been read.
+        let mut request_body = request.into_body();
+        while let Some(Ok(data)) = request_body.data().await {
+            let _ = request_body.flow_control().release_capacity(data.len());
+        }
     });
     done_rx
 }
