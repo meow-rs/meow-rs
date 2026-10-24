@@ -152,12 +152,8 @@ cargo clippy -p meow-common --all-targets -- -D warnings
 cargo test -p meow-common --lib logbook
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 cargo test -p meow-listener --all-features --lib udp_port_53
-# `listener-shadowsocks` is opt-in: the default-features suite never compiles
-# the SS listener tests, so they need their own feature-gated runs.
-cargo test -p meow-listener --features listener-shadowsocks --lib shadowsocks
-cargo test -p meow-listener --features listener-shadowsocks --test ss_listener_integration
-# Same class: the `anytls` feature is opt-in too — the adapter's uot/desync
-# tests never compile under default features.
+# The `anytls` feature is opt-in in meow-proxy — the adapter's uot/desync
+# tests never compile under its default features.
 cargo test -p meow-proxy --features anytls --lib
 
 # TrustTunnel is opt-in; its wire tests and parser/adapter integration need
@@ -187,7 +183,7 @@ cargo test -p meow-config --features trusttunnel-h3 --lib
 # test (e.g. the ADR-0001 guard in `crate_invariants_test`) passes locally and
 # lands `main` red.
 cargo test --lib --bin meow --bin meow-bench --bin meow-cli \
-  --test socks5_udp_user \
+  --test socks5_udp_user --test ss_listener_integration \
   --test common_test --test dns_cache_test --test config_test \
   --test tun_config_test --test dialer_proxy_group \
   --test statistics_test --test rules_test --test api_test --test meow_cli_test \

@@ -29,8 +29,8 @@ listener-tun = [
 # Shadowsocks encrypted-server inbound. Reuses the `shadowsocks` crate's
 # server-side ProxyListener/ProxySocket (the same crate already used by the
 # outbound `ss` adapter) and the shared simple-obfs codec from meow-transport.
-# Off by default (server scenario); excluded from the app's `full`/`minimal`
-# bundles — enable with an explicit `--features listener-shadowsocks`.
+# Off by default in this crate; the app's `full` bundle (the release
+# binaries) turns it on, `minimal` leaves it out.
 listener-shadowsocks = [
     "dep:shadowsocks",
     "dep:meow-transport",

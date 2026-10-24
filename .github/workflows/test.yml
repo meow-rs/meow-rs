@@ -260,6 +260,7 @@ jobs:
           cargo nextest run --lib --bin meow --bin meow-bench --bin meow-cli \
             --test common_test \
             --test socks5_udp_user \
+            --test ss_listener_integration \
             --test dns_cache_test \
             --test config_test \
             --test tun_config_test \
@@ -308,15 +309,6 @@ jobs:
 
       - name: UDP routing regression (SOCKS5, Shadowsocks, TUN)
         run: cargo nextest run -p meow-listener --all-features --lib udp_port_53 --retries 2 --no-fail-fast
-
-      # `ss_listener_integration` is `required-features = ["listener-shadowsocks"]`,
-      # which is opt-in (excluded from the app bundles and default features), so
-      # the default-features suite above never compiles it. The `--lib` leg runs
-      # the whole `shadowsocks::tests` module; the `--test` leg runs the suite.
-      - name: Shadowsocks listener tests (SIP022 UDP)
-        run: |
-          cargo nextest run -p meow-listener --features listener-shadowsocks --lib shadowsocks --retries 2 --no-fail-fast
-          cargo nextest run -p meow-listener --features listener-shadowsocks --test ss_listener_integration --retries 2 --no-fail-fast
 
       # ADR-0008 allocation-count gates. Release build: the thresholds are
       # calibrated against release codegen. The provider-backed pressure

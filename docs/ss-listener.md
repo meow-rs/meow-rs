@@ -40,17 +40,11 @@ listeners:
     udp: true                # default true (upstream parity)
 ```
 
-Run (the feature is not part of any app bundle — build with it explicitly):
+Run it with a release binary, or any default build (the feature is in the
+app's `full` bundle):
 
 ```bash
-cargo run -p meow-app --features listener-shadowsocks -- -f config.yaml
-```
-
-or for a release build:
-
-```bash
-cargo build --release --features listener-shadowsocks
-./target/release/meow -f config.yaml
+./meow -f config.yaml
 ```
 
 Any SS client (`sslocal`, the `shadowsocks` crate, or meow-rs's own outbound
@@ -73,6 +67,12 @@ tunnels through meow-rs's rules.
 ¹ `port` is optional when `listen` is a `host:port` socket address; `0` (or
 omitted with no port in `listen`) means the OS assigns an ephemeral port at
 bind time. The TCP and UDP relays bind the *same* resolved port.
+
+The listener keeps the `shadowsocks` crate's default replay policy, which is
+also `ssserver`'s default: a replayed request is rejected under an AEAD-2022
+cipher and not checked under the classic AEAD ciphers (`aes-*-gcm`,
+`chacha20-ietf-poly1305`). A listener reachable from the internet should
+use a `2022-blake3-*` cipher.
 
 ## simple-obfs (HTTP / TLS)
 
@@ -167,11 +167,16 @@ take the replay window down inside the 30 s header-timestamp tolerance).
 
 ## Feature gating
 
-`listener-shadowsocks` is fully opt-in: off by default (server scenario;
-ADR-0007 binary-size caps) and excluded from both the app `full` and
-`minimal` bundles, so release binaries do not include it — build with an
-explicit `--features listener-shadowsocks`. Enabling it pulls in the
-`shadowsocks` workspace dep and `meow-transport/simple-obfs`.
+`listener-shadowsocks` is part of the app's `full` bundle, so the default
+build and the release binaries include it. It costs about 200 KiB of a
+stripped x86_64 binary, since `full` already links the `shadowsocks` crate
+for the `ss` outbound. The `minimal` bundle leaves it out: there it would
+take half the room left under the 8 MiB aarch64 cap (ADR-0007). A build
+without the feature, such as `minimal`, fails `-t` and startup on a
+`type: shadowsocks` listener and names the feature;
+`--no-default-features --features minimal,listener-shadowsocks` adds it
+back. On meow-listener itself the feature stays off by default and pulls
+in the `shadowsocks` workspace dep and `meow-transport/simple-obfs`.
 
 ## Differences from the other inbounds
 

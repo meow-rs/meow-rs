@@ -1781,7 +1781,7 @@ mod tests {
 
     /// The spawn-loop feature mapping is `listener-mixed` for
     /// mixed/http/socks5, `listener-tproxy` for tproxy, and
-    /// `listener-shadowsocks` for shadowsocks (opt-in, outside `full`).
+    /// `listener-shadowsocks` for shadowsocks (in `full`, not `minimal`).
     /// Asserting the exact feature *name* (not just polarity) catches a
     /// typo'd or drifted mapping.
     #[test]
@@ -1829,20 +1829,29 @@ mod tests {
 
     /// `listener-shadowsocks` is the regression case behind this gate: a
     /// `type: shadowsocks` listener used to warn-and-skip, leaving the
-    /// port dead while `-t` still passed.
-    #[cfg(not(feature = "listener-shadowsocks"))]
+    /// port dead while `-t` still passed. `full` now compiles the listener,
+    /// so the uncompiled case is played by a gate that reports it missing;
+    /// `listener_gate_matches_spawn_arms` pins the real gate's mapping.
     #[test]
     fn ensure_rejects_uncompiled_shadowsocks_listener() {
-        let named = meow_config::NamedListener {
+        fn without_shadowsocks(spec: &meow_config::ListenerSpec) -> Option<&'static str> {
+            matches!(spec, meow_config::ListenerSpec::Shadowsocks(_))
+                .then_some("listener-shadowsocks")
+        }
+        let named = [meow_config::NamedListener {
             name: "ss-in".into(),
             spec: ss_spec(),
             port: 23300,
             listen: "0.0.0.0".into(),
             max_connections: 256,
-        };
-        let err = meow_api::ensure_listeners_supported(&[named], super::listener_feature_gate)
+        }];
+        let err = meow_api::ensure_listeners_supported(&named, without_shadowsocks)
             .expect_err("ss listener must fail on a feature-less build");
         assert!(err.to_string().contains("listener-shadowsocks"), "{err}");
+        assert_eq!(
+            meow_api::ensure_listeners_supported(&named, super::listener_feature_gate).is_ok(),
+            cfg!(feature = "listener-shadowsocks")
+        );
     }
 
     #[cfg(target_os = "windows")]

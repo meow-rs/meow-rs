@@ -69,6 +69,13 @@ the canonical, in-repo source a release is cut from.
 
 ### Changed
 
+- **The release binaries serve `type: shadowsocks` listeners**: the
+  Shadowsocks inbound (`listener-shadowsocks`) joins the `full` bundle, so a
+  config that declares one, as mihomo's release builds accept, now starts
+  instead of failing with the missing feature named. It adds about 200 KiB
+  to a stripped x86_64 binary (14.80 MB to 15.01 MB), because `full`
+  already links the `shadowsocks` crate for the `ss` outbound. The
+  `minimal` bundle still leaves it out.
 - **The logbook links the system SQLite on iOS and tvOS**: with the
   `logbook` feature, meow-common compiled its own SQLite (about 1 MiB) into
   every build. iOS and tvOS ship libsqlite3, and there the engine runs in a
