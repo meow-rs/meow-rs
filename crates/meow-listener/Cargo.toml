@@ -25,6 +25,9 @@ listener-tun = [
     "dep:meow-dns",
     "dep:ipnet",
     "dep:windows-sys",
+    "dep:netlink-packet-core",
+    "dep:netlink-packet-route",
+    "dep:netlink-sys",
 ]
 # Shadowsocks encrypted-server inbound. Reuses the `shadowsocks` crate's
 # server-side ProxyListener/ProxySocket (the same crate already used by the
@@ -79,6 +82,14 @@ windows-sys = { version = "0.60", optional = true, features = [
     "Win32_NetworkManagement_Ndis",
     "Win32_Networking_WinSock",
 ] }
+
+# listener-tun: global auto-route installs policy rules and a routing table
+# of its own over rtnetlink (`tun/policy_route.rs`). The same versions
+# route_manager already pulls in on Linux.
+[target.'cfg(target_os = "linux")'.dependencies]
+netlink-packet-core = { version = "0.9", optional = true }
+netlink-packet-route = { version = "0.33", optional = true }
+netlink-sys = { version = "0.8", optional = true }
 
 [[test]]
 name = "ss_listener_integration"

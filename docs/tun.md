@@ -1,6 +1,6 @@
 # TUN inbound — transparent proxy on Windows (and everywhere else)
 
-Last updated: 2026-10-19. Tracks the `listener-tun` feature (issue
+Last updated: 2026-10-26. Tracks the `listener-tun` feature (issue
 [#326](https://github.com/madeye/meow-rs/issues/326)).
 Audience: users who want system-wide transparent proxying on a platform
 without a tproxy/REDIRECT firewall — Windows first and foremost. The same
@@ -22,16 +22,13 @@ mode: rule
 
 dns:
   enable: true
-  enhanced-mode: fake-ip          # REQUIRED for the v1 TUN flow (see below)
+  enhanced-mode: fake-ip          # recommended: domain rules match TUN traffic
   fake-ip-range: 198.18.0.1/16
   nameserver:
     - https://1.1.1.1/dns-query
 
 tun:
-  enable: true
-  auto-route: true                # routes the fake-ip range into the device
-  dns-hijack:
-    - any:53                      # answer DNS entering the tun in-process
+  enable: true                    # captures all traffic, DNS included
 
 proxies:
   # ... your outbounds ...
@@ -48,18 +45,18 @@ Then:
    fetch a sidecar with `scripts/fetch-wintun.sh --target x86_64-pc-windows-msvc --outdir .`.
    Run the shell elevated ("Run as administrator"). **Linux/macOS**: run as root
    or grant `CAP_NET_ADMIN`.
-2. Point the OS resolver at an address **inside the fake-ip range**, e.g.
-   `198.18.0.2`. On Windows:
+2. Start meow. With `auto-route` and `dns-hijack` left at their defaults,
+   everything the host sends goes through the device (global route scope,
+   below) — IPv4, and IPv6 too once the device has an `inet6-address` —
+   and DNS is answered in-process: in fake-ip mode meow points the OS
+   resolver at an address inside the fake-ip range (`198.18.0.2`; the
+   loopback DNS server on Windows) and restores it on stop, and a UDP :53
+   query to any other server that enters the device is answered too.
+   Connections to the fake IPs route into the device, and rules match on
+   the recovered domain.
 
-   ```
-   netsh interface ip set dns name="meow" static 198.18.0.2
-   ```
-
-   (The adapter is named after `tun.device`, default platform-chosen.) On
-   Linux/macOS set the DNS server for your active connection the same way.
-3. Start meow. DNS queries route into the tun (the range is on-link/routed),
-   `dns-hijack` answers them with fake IPs, connections to those fake IPs
-   route into the tun, and rules match on the recovered domain.
+`auto-route: fake-ip` narrows the capture to the fake-ip range,
+`dns-hijack: []` turns the in-process DNS off — see *Route scopes*.
 
 ## Windows: address setup, adapter reuse, and conflicts
 
@@ -89,32 +86,32 @@ address cannot send packets. Three consequences of how that is done:
   adapter is left as it was found — and the listener moves on to the
   next one.
 
-## How v1 stays loop-free (and what it doesn't capture)
+## Route scopes
 
-The classic TUN failure mode is the routing loop: with a global default
-route into the device, meow's *own* outbound dials (proxy upstreams and
-DIRECT traffic alike) re-enter the tun and recurse. mihomo solves this with
-platform-specific socket tricks (SO_MARK, interface binding). meow v1
-side-steps the entire problem class:
+The classic TUN failure mode is the routing loop: with a default route
+into the device, meow's *own* outbound dials (proxy upstreams and DIRECT
+traffic alike) re-enter the tun and recurse. `auto-route` picks one of
+two scopes, which rule the loop out differently:
 
-- **Only the fake-ip range is routed into the device** (`auto-route` installs
-  exactly that route; the device's own subnet is on-link anyway if you assign
-  it inside the range).
-- Outbound dials always target **real** IPs, which are never inside the fake
-  range — so they take the physical route and cannot loop. No marks, no
-  interface binding, no bypass routes.
+- **`true` (the default) — global scope.** Everything the host sends is
+  routed into the device, IP literals included; meow's own sockets are
+  bound to the physical interface so they cannot loop (*Global route
+  scope* below). Linux, macOS and Windows; on other targets `true` means
+  fake-ip scope. `global` is an explicit spelling of the same.
+- **`fake-ip` — the fake-ip range only.** Loop-free by construction:
+  outbound dials always target **real** IPs, which are never inside the
+  fake range, so they take the physical route. No interface binding, no
+  routes beyond the one range. The trade-off: **traffic that never does a
+  DNS lookup (IP-literal connections) is not captured**, and
+  `dns.enhanced-mode: fake-ip` is required — with `redir-host` there is no
+  range to route, so `auto-route` warns and installs nothing; you can
+  still add routes to the device manually, but you are then responsible
+  for loop avoidance.
+- **`false`** — no routes; add your own.
 
-The trade-off: **traffic that never does a DNS lookup (IP-literal
-connections) is not captured.** For domain-based traffic — the overwhelming
-majority — capture is complete. Global capture ("route everything") is the
-opt-in `auto-route: global` mode below (#375).
+Flow handling is the same in both scopes:
 
-Consequences:
-
-- `dns.enhanced-mode: fake-ip` is effectively required. With `redir-host`,
-  `auto-route` has nothing safe to route and warns; you can still add routes
-  to the device manually, but you are then responsible for loop avoidance.
-- UDP flows (including QUIC) to fake IPs are captured and routed per-rule.
+- UDP flows (including QUIC) are captured and routed per-rule.
   The flow table is bounded at 1024 live entries — at capacity the
   least-recently-active flow is evicted — and `dns-hijack` runs at most 64
   concurrent in-process answers (queries it cannot decide locally past
@@ -139,21 +136,19 @@ Consequences:
   stack itself — `ping` to a fake IP confirms the tun is up, but is not an
   end-to-end probe of the remote host.
 
-## Global route mode — `auto-route: global` (experimental)
+## Global route scope — the default
 
 Tracked on [#375](https://github.com/madeye/meow-rs/issues/375). Routes
-**all IPv4 traffic** into the device instead of just the fake-ip range, so
-IP-literal connections are captured too — and all IPv6 traffic as well when
-the device is given an `inet6-address`:
+**all IPv4 traffic** the host sends into the device, not just the fake-ip
+range, so IP-literal connections are captured too — and all IPv6 traffic
+as well when the device is given an `inet6-address`:
 
 ```yaml
 tun:
   enable: true
-  auto-route: global
-  # outbound-interface: eth0   # optional; auto-detected from the default route
+  # auto-route: true                       # the default; `global` is the same
+  # outbound-interface: eth0               # optional; auto-detected from the default route
   # inet6-address: fdfe:dcba:9876::1/126   # optional; also capture IPv6
-  dns-hijack:
-    - any:53
 ```
 
 Status per platform — "implemented" means the code path exists, compiles
@@ -162,7 +157,7 @@ scope of each run is in the table):
 
 | Platform | Outbound binding | Interface auto-detection | Status |
 |----------|------------------|--------------------------|--------|
-| Linux | `SO_BINDTODEVICE` (by name) | `/proc/net/route` | **Verified** for IPv4 and IPv6 with real routes in privileged containers (Linux 6.8, aarch64, musl build) — see *What was verified on Linux* below. Not yet run on a bare host. |
+| Linux | `SO_BINDTODEVICE` (by name) | `/proc/net/route` | **Verified** for IPv4 and IPv6 with real routes and policy rules in containers (Linux 6.8 aarch64, Linux 7.0 x86_64) — see *What was verified on Linux* below. Not yet run on a bare host. |
 | macOS | `IP_BOUND_IF` / `IPV6_BOUND_IF` (by index) | routing table, unscoped `0.0.0.0/0` | Experimental. IPv4 and IPv6 exercised in a macOS 26.6 VM (arm64, single interface, DIRECT outbound) — see *Verified on macOS* below; not yet on a multi-interface host or through a proxy outbound. |
 | Windows | `IP_UNICAST_IF` / `IPV6_UNICAST_IF` (by index) | routing table, lowest route + interface metric | Experimental. IPv4 and IPv6 exercised on Windows 11 arm64 with a Wintun adapter and one physical NIC (DIRECT outbound): auto-detected and explicit alias, TCP + UDP, runtime reload, teardown. Choosing between several default routes by metric is unit-tested only. |
 
@@ -174,13 +169,49 @@ Linux lab had no IPv6 uplink.
 
 How each loop-avoidance piece works:
 
-1. **Split default routes.** `auto-route: global` installs `0.0.0.0/1` and
+1. **Routes into the device.** On Linux the device's default routes go in
+   a routing table of meow's own (`1835364215`, "meow" in ASCII), and
+   policy rules send the host's own traffic there while leaving the
+   replies on connections it accepted, and traffic it forwards, on the
+   main table:
+
+   | pref | IPv4 | IPv6 |
+   |------|------|------|
+   | 9200 | `not dport 53 lookup main suppress_prefixlength 0` | same |
+   | 9201 | `iif lo from <device subnet> lookup 1835364215` | same |
+   | 9202 | `iif lo from 0.0.0.0 lookup 1835364215` | `iif lo from ::/1 goto 9205` |
+   | 9203 | | `iif lo from 8000::/1 goto 9205` |
+   | 9204 | | `iif lo lookup 1835364215` |
+   | 9205 | | `nop` |
+
+   - 9200: a main-table route more specific than the default — the LAN, a
+     Docker bridge, a static route, the fake-ip range — keeps winning,
+     except for DNS: a query to a LAN resolver still reaches `dns-hijack`.
+   - A socket that has not chosen a source address yet (`connect` /
+     `sendto` on an unbound socket, the common case) goes to the device
+     and takes the device's address as its source; the flow's later
+     packets match 9201.
+   - A flow that already has another source — the reply on a connection
+     accepted on the physical interface, a socket bound to a physical
+     address — falls through to the main table. IPv6 rules cannot match
+     "no source", so IPv6 skips every flow that has one (9202, 9203) and
+     sends the rest to the device.
+   - `iif lo` limits all of this to the host's own traffic: forwarded
+     traffic (containers, VMs, a gateway's LAN clients) keeps the main
+     table, where meow routes the fake-ip range into the device, so their
+     domain flows are still captured.
+
+   The rules need a kernel with policy routing (`CONFIG_IP_MULTIPLE_TABLES`)
+   and the `dport` selector (Linux 4.17); without them meow warns and falls
+   back to the split routes below.
+
+   **macOS and Windows install split default routes**: `0.0.0.0/1` and
    `128.0.0.0/1` into the device. The two /1s are more specific than the
    physical `0.0.0.0/0`, so the original default route is never touched and
    teardown is a plain route delete — no restore step that can be lost to a
    crash. With `inet6-address` set, `::/1` and `8000::/1` are installed the
-   same way; without it no IPv6 route is installed and IPv6 traffic keeps
-   bypassing the device.
+   same way. On every platform, without `inet6-address` no IPv6 route is
+   installed and IPv6 traffic keeps bypassing the device.
 
    **macOS installs a different set**, because a route whose destination
    is the all-zero address breaks the outbound binding there: a socket
@@ -224,8 +255,9 @@ How each loop-avoidance piece works:
 
 Scope and caveats:
 
-- **Linux, macOS and Windows.** Any other target fails at startup rather
-  than install default routes it cannot protect.
+- **Linux, macOS and Windows.** Elsewhere `auto-route: true` means
+  fake-ip scope, and an explicit `auto-route: global` fails at startup
+  rather than install default routes it cannot protect.
 - **macOS and Windows bind by interface index**, resolved once when the
   binding is installed. If the physical interface is destroyed and
   re-created (not a plain link flap), the index changes and outbound dials
@@ -245,61 +277,71 @@ Scope and caveats:
   the *IPv4* default route. If that interface has no IPv6 connectivity,
   DIRECT dials to IPv6 destinations fail (clients fall back to IPv4);
   proxied ones are unaffected. `inet6-address` is ignored, with a warning,
-  outside `auto-route: global`: the fake-ip scope has no IPv6 range to
-  route.
+  in fake-ip scope: it has no IPv6 range to route.
 - `fake-ip` DNS mode is still recommended so domain rules match; global
-  mode adds IP-literal capture on top rather than replacing the DNS flow.
+  scope adds IP-literal capture on top rather than replacing the DNS flow.
 - Requires root/`CAP_NET_ADMIN` (Administrator on Windows) like the rest
   of the TUN inbound.
-- **Only traffic that follows the default route is captured.** The `/1`
-  routes lose to anything more specific, so destinations on a directly
-  connected subnet (the LAN, a Docker bridge) and any static route you
-  added keep using their own interface and never reach meow.
-- **Inbound connections from outside the local subnet break while global
-  mode is on.** The reply to a connection accepted on the physical
-  interface is routed like any other outgoing packet — into the device —
-  and never reaches the peer (observed on Linux: a remote client times
-  out; with TUN off it connects). That covers an SSH session from another
-  subnet, a server on the host, and meow's own `allow-lan` listeners and
-  `external-controller`. Peers on the directly connected subnet are
-  unaffected (more-specific route). meow does not install policy-routing
-  rules to exempt reply traffic; do not enable global mode on a machine
-  you only reach from a remote network.
+- **Only traffic that follows the default route is captured.** Anything
+  more specific wins: destinations on a directly connected subnet (the
+  LAN, a Docker bridge) and any static route you added keep using their
+  own interface and never reach meow — on Linux except DNS (rule 9200).
+- **Traffic the host forwards** (containers, VMs, LAN clients of a
+  gateway) is captured only when it goes to a fake IP. On Linux it is
+  never sent to meow's table; making a host a gateway for other devices
+  is covered in [tproxy-gateway.md](tproxy-gateway.md).
+- **Inbound connections from other networks.** On Linux the replies on
+  connections the host accepted keep the physical route (policy rules
+  above): an SSH session from another subnet, a server on the host, and
+  meow's own `allow-lan` listeners and `external-controller` keep working.
+  Before the policy rules — and still on a Linux kernel that falls back to
+  split routes — such a reply was routed into the device and never
+  reached the peer. On macOS and Windows the split routes are in the main
+  table, and whether a reply follows them into the device has not been
+  verified; source-address-based route selection on both should keep it
+  on the physical interface. Peers on the directly connected subnet are
+  unaffected everywhere (more-specific route). Please report results on
+  #375 before relying on remote access to a macOS or Windows machine with
+  TUN on.
 - **`ping` proves nothing.** The userspace stack answers ICMP echo itself
   for *every* address routed into the device, so `ping 203.0.113.77`
   "succeeds" for a host that does not exist. Probe with TCP or UDP.
 - **Teardown.** A normal stop (SIGINT/SIGTERM, or a reload that disables
-  TUN) removes the `/1` routes and the device and restores
-  `/etc/resolv.conf`. After a `kill -9` on Linux the kernel destroys the
-  device and with it the device address and every route through it — no
-  `/1` route is left and IP connectivity is back at once — but the
-  `dns-hijack` resolver redirect survives: `/etc/resolv.conf` still names
-  an address in the fake-ip range, so name resolution fails until meow starts again
-  (it recovers the original from `/etc/resolv.conf.meow-backup`) or you
-  restore that file by hand.
+  TUN) removes the policy rules (or the `/1` routes), the device and the
+  routes through it, and restores `/etc/resolv.conf`. After a `kill -9` on
+  Linux the kernel destroys the device and with it the device address and
+  every route through it, so IP connectivity is back at once; the policy
+  rules stay but point at an empty table, which lookups fall through, and
+  the next start replaces them. The `dns-hijack` resolver redirect
+  survives too: `/etc/resolv.conf` still names an address in the fake-ip
+  range, so name resolution fails until meow starts again (it recovers
+  the original from `/etc/resolv.conf.meow-backup`) or you restore that
+  file by hand.
 
 Verification on a Linux host (or VM). Pick targets *off* the local subnet
 (see above), and make sure `curl` is not itself configured to use a proxy
 (`http_proxy` / `https_proxy` in the environment bypass the TUN):
 
 ```bash
-sudo ./meow -f config.yaml            # global mode active; the log shows
-                                      #   outbound sockets bound to interface 'eth0' (SO_BINDTODEVICE)
-ip route | grep '/1 dev'              # 0.0.0.0/1 and 128.0.0.0/1 on the tun device
-ip route get 1.1.1.1                  # shows the tun device
+sudo ./meow -f config.yaml            # global scope active; the log shows
+                                      #   outbound sockets bound to 'eth0'
+ip rule | grep '^92'                  # the policy rules (9200-9202)
+ip route show table 1835364215        # default dev meow-tun
+ip route get 1.1.1.1                  # dev meow-tun table 1835364215
 curl 1.1.1.1                          # IP literal — captured (check meow logs)
 curl https://example.com              # domain flow — still captured
 dig @9.9.9.9 example.com              # UDP: answered by dns-hijack with a fake IP
 # no loop: meow's own dials leave by the physical interface, never the tun
 sudo tcpdump -ni eth0 'tcp[tcpflags] & tcp-syn != 0'       # the outbound SYNs
 sudo tcpdump -ni meow-tun src host <eth0 address>          # stays empty
+# inbound: from another network, ssh / curl to the host still connects
 # with tun.inet6-address set:
 ip -6 addr show dev meow-tun          # the configured address
-ip -6 route | grep '/1 dev'           # ::/1 and 8000::/1 on the tun device
+ip -6 rule | grep '^92'               # 9200-9205
 curl 'http://[2606:4700:4700::1111]/' # IPv6 literal — captured (the reply needs
                                       #   IPv6 connectivity on the physical interface)
-# teardown: stop meow, then confirm all /1 routes are gone:
-{ ip route; ip -6 route; } | grep -c '/1 dev' # → 0
+# teardown: stop meow, then confirm the rules are gone:
+{ ip rule; ip -6 rule; } | grep -c '^92'   # → 0
 ```
 
 ### What was verified on Linux
@@ -309,7 +351,28 @@ Run for #375 in privileged containers (Docker on a Linux 6.8 aarch64 VM,
 container whose default route points at a router container, and a server
 container behind that router, so the test targets are reached through the
 default route rather than an on-link one. Not run on a bare host, and not
-with systemd-resolved or NetworkManager managing the resolver.
+with systemd-resolved or NetworkManager managing the resolver. That run
+predates the policy rules: it used the split `/1` routes, which the
+fallback still installs.
+
+The policy rules were run in the same topology (Docker on Linux 7.0
+x86_64, `CAP_NET_ADMIN` only, debug build), with a `tun:` section of just
+`enable: true` and `inet6-address`:
+
+- the rules, the table's default routes and the fake-ip route in the main
+  table go in; IPv4 and IPv6 literals to the server are captured, and
+  `curl` to a domain through the system resolver (redirected by meow) is
+  captured with its domain;
+- connections from the router's far-side address (another subnet) and
+  from the LAN reach a server on the host, IPv4 and IPv6;
+- DNS to an on-link LAN resolver and to a remote one is answered with
+  fake IPs, with no `dns-hijack` key in the config;
+- a second container using the host as its gateway reaches a fake IP
+  through meow, and an IP literal past it, untouched;
+- `PATCH /configs` restarts (`mtu`, `auto-route: fake-ip` and back) leave
+  exactly one set of rules; SIGTERM removes them all; after `kill -9` the
+  host's direct connectivity works with the rules left behind, and the
+  next start replaces them.
 
 - **Startup**: the interface is auto-detected (`eth0`), the binding is
   logged before the first dial, `0.0.0.0/1` + `128.0.0.0/1` go into the
@@ -426,10 +489,10 @@ Get-NetRoute -DestinationPrefix 0.0.0.0/1, 128.0.0.0/1   # after stopping meow: 
 | `device` | platform-chosen | Adapter name. macOS always auto-assigns `utunN`. On Windows a same-named leftover adapter is reopened — or recreated, when the driver has orphaned it — and reconfigured either way (see *Windows: address setup, adapter reuse, and conflicts*). |
 | `mtu` | `1500` | Hard error below 1280 (userspace-stack minimum). |
 | `inet4-address` | first /30 of `dns.fake-ip-range` (`198.18.0.1/30`) | CIDR assigned to the device. Like mihomo, the default takes an address the fake-IP pool never hands out, outside LAN and Docker networks. A fixed private subnet can collide with one: a device on a Docker network's gateway address cuts the host off from that network's containers. |
-| `inet6-address` | none | IPv6 CIDR assigned to the device, e.g. `fdfe:dcba:9876::1/126` — a string, or mihomo's list form (only the first entry is used). Only honoured with `auto-route: global`, where it also adds the IPv6 split default routes (experimental, see above); ignored with a warning otherwise. An invalid CIDR is a hard error. |
-| `auto-route` | `true` | What to route into the device at startup (removed on shutdown): `true`/`fake-ip` = the fake-ip range; `global` = all IPv4, plus all IPv6 with `inet6-address` (experimental, see above); `false` = nothing. |
-| `outbound-interface` | auto-detect | Physical interface outbound sockets bind to in `global` mode — the interface name on Linux/macOS (`eth0`, `en0`), the interface alias on Windows (`Ethernet`). Ignored otherwise. |
-| `dns-hijack` | off | List of targets; any `:53` entry turns on in-process answering of UDP :53 flows entering the device. Non-`:53` entries warn and are ignored. |
+| `inet6-address` | none | IPv6 CIDR assigned to the device, e.g. `fdfe:dcba:9876::1/126` — a string, or mihomo's list form (only the first entry is used). Only honoured in global scope, where it also captures IPv6 (experimental, see above); ignored with a warning otherwise. An invalid CIDR is a hard error. |
+| `auto-route` | `true` | What to route into the device at startup (removed on shutdown): `true` = everything the host sends, IPv6 too with `inet6-address` (global scope; Linux, macOS and Windows, fake-ip scope elsewhere); `global` = the same; `fake-ip` = the fake-ip range only; `false` = nothing. See *Route scopes*. |
+| `outbound-interface` | auto-detect | Physical interface outbound sockets bind to in global scope — the interface name on Linux/macOS (`eth0`, `en0`), the interface alias on Windows (`Ethernet`). Ignored otherwise. |
+| `dns-hijack` | on | In-process answering of UDP :53 flows entering the device, and in fake-ip mode the OS resolver redirect. Absent = on; a list with any `:53` entry = on; `[]` = off. Non-`:53` entries warn and are ignored. |
 | `udp-timeout` | `60` | Seconds of idle before a UDP flow is evicted. |
 | `max-connections` | `256` | Inherited from the top-level `max-connections` (`0` = unlimited); bounds **TCP** flows (a flow takes its slot when it leaves the 200 ms sniff window, so one that closes inside it never occupies one) — a change while TUN runs restarts the listener. The UDP flow table has its own fixed bound (1024 live flows, least-recently-active eviction) that `max-connections` does not adjust. |
 
@@ -459,9 +522,9 @@ A section that fails to parse is rejected with 400 and nothing applied;
 a failed (re)start rolls `enable` back as above, but the PATCH answers
 500 with the reason instead of 204.
 
-In global route mode a reload binds outbound sockets before its first dial,
-exactly like startup (#695). A `PUT /configs` whose candidate has
-`auto-route: global` installs the candidate's binding right after taking
+In global route scope a reload binds outbound sockets before its first dial,
+exactly like startup (#695). A `PUT /configs` whose candidate selects
+global scope installs the candidate's binding right after taking
 the config-mutation lane — before the ECH pre-resolve, the config build's
 provider fetches and the health checks the swap restarts — and hands it to
 the (re)spawned listener. (The proxy / group / subscription commits that
@@ -499,7 +562,7 @@ resolvers other than the live one are retired but only closed on their
 pool's next use (an idle socket sends nothing). TLS session and
 VLESS-encryption ticket caches hold no sockets and are kept.
 
-Non-global candidates (`auto-route: true`/`fake-ip`/`false`, TUN disabled)
+Non-global candidates (`auto-route: fake-ip`/`false`, TUN disabled)
 install nothing. A pre-install failure is not fatal — it is logged at
 debug and the listener retries before installing routes, failing closed as
 at startup.

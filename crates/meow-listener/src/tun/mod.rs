@@ -20,11 +20,33 @@
 //! SSH) wait for the server's banner and would otherwise never get one
 //! (#695).
 //!
-//! ## Loop freedom (v1: fake-IP-scoped capture)
+//! ## Route scope
 //!
-//! The classic TUN failure mode is the routing loop: a global default route
-//! into the device makes meow's *own* outbound dials re-enter the tun. v1
-//! avoids the whole problem class by capturing only the fake-IP range:
+//! `auto-route` installs one of two scopes ([`TunRouteScope`]). The
+//! classic TUN failure mode is the routing loop: a route into the device
+//! that meow's *own* outbound dials also follow. Each scope rules it out
+//! differently.
+//!
+//! **Global** (#375; the default on Linux, macOS and Windows) captures
+//! everything the host originates, IPv6 too when the device has an
+//! `inet6-address`. Loop freedom lives on the outbound path: every socket
+//! meow creates is bound to the physical interface
+//! (`meow_common::install_outbound_interface`: `SO_BINDTODEVICE` on Linux,
+//! `IP_BOUND_IF` on macOS, `IP_UNICAST_IF` on Windows) before
+//! connect/bind, and hostname dials resolve through meow's own resolver
+//! hook. Startup fails closed if the binding cannot be installed.
+//!
+//! On Linux the device's default routes live in a routing table of their
+//! own, which policy rules send only the flows the host originates to
+//! (`policy_route.rs`): the replies on connections the host accepted from
+//! another network keep the physical route, and traffic the host forwards
+//! keeps the main table, where the fake-IP range is routed into the
+//! device. Elsewhere — and on a Linux kernel without policy routing —
+//! split default routes go in the main table: `0.0.0.0/1` + `128.0.0.0/1`
+//! (on macOS an equivalent set that avoids the all-zero destination),
+//! plus `::/1` + `8000::/1`.
+//!
+//! **Fake-IP** captures only the fake-IP range, loop-free by construction:
 //!
 //! 1. The OS resolver is pointed at an address inside the routed range, so
 //!    DNS queries enter the tun and `dns-hijack` answers them with fake IPs.
@@ -35,19 +57,6 @@
 //!    cannot loop. No SO_MARK, interface binding, or bypass routes needed.
 //!
 //! The trade-off: IP-literal traffic (no DNS lookup) is not captured.
-//!
-//! ## Global route scope (#375, experimental)
-//!
-//! [`TunRouteScope::Global`] opts into capturing everything: `auto-route`
-//! installs split default routes (`0.0.0.0/1` + `128.0.0.0/1`, plus
-//! `::/1` + `8000::/1` when the device has an `inet6-address`; on macOS an
-//! equivalent set that avoids the all-zero destination), and loop
-//! freedom moves from route scoping to the outbound path — every socket
-//! meow creates is bound to the physical interface
-//! (`meow_common::install_outbound_interface`: `SO_BINDTODEVICE` on Linux,
-//! `IP_BOUND_IF` on macOS, `IP_UNICAST_IF` on Windows) before
-//! connect/bind, and hostname dials resolve through meow's own resolver
-//! hook. Startup fails closed if the binding cannot be installed.
 //!
 //! On Windows the device is a Wintun adapter. `wintun.dll` is resolved next
 //! to the executable (official Windows zips ship it there), then the working
@@ -60,6 +69,8 @@ mod dns;
 #[cfg(target_os = "windows")]
 mod local_dns;
 mod outbound_binding;
+#[cfg(target_os = "linux")]
+mod policy_route;
 mod route;
 mod udp;
 #[cfg(target_os = "windows")]
@@ -219,16 +230,15 @@ pub struct TunListenerConfig {
     pub max_connections: usize,
 }
 
-/// Which routes `auto_route` installs (#375).
+/// Which routes `auto_route` installs (#375; see the module docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TunRouteScope {
-    /// v1: route only the fake-IP range — loop-free by construction.
+    /// Route only the fake-IP range — loop-free by construction.
     #[default]
     FakeIp,
-    /// Route all IPv4 (split defaults `0.0.0.0/1` + `128.0.0.0/1`) — and
-    /// all IPv6 (`::/1` + `8000::/1`) when the device has an IPv6 address —
-    /// into the device; outbound sockets bind to the physical interface
-    /// for loop avoidance. Experimental.
+    /// Route everything the host originates — IPv4, and IPv6 when the
+    /// device has an IPv6 address — into the device; outbound sockets bind
+    /// to the physical interface for loop avoidance.
     Global,
 }
 
@@ -312,6 +322,11 @@ impl Drop for ReadyNotifier {
 /// away — ensuring route deletion always succeeds because the adapter is
 /// still alive.
 struct TunDevice {
+    /// Global scope's policy routing on Linux, removed first: while its
+    /// rules stand, the outbound binding (`iface_guard`) must hold.
+    #[cfg(target_os = "linux")]
+    #[allow(dead_code, reason = "held only for its Drop side effect")]
+    policy_routes: Option<policy_route::PolicyRoutes>,
     /// Held only for its `Drop` side effect — routes are deleted when
     /// this field is dropped, before `device` is destroyed.
     #[allow(dead_code)]
@@ -581,66 +596,105 @@ impl TunListener {
             None
         };
 
-        // auto-route: install the scope's routes (see module docs).
-        //
-        // RouteManager::add() calls into OS routing APIs that may block
-        // (PowerShell on Windows), so it runs on a blocking thread. The
-        // outer TUN_STARTUP_TIMEOUT guards the overall startup.
-        let route_nets: Option<Vec<ipnet::IpNet>> = if cfg.auto_route {
-            match cfg.route_scope {
-                // Split defaults: two /1s (macOS: eight routes that avoid
-                // the all-zero key) cover all IPv4 while staying more
-                // specific than the physical 0/0 default, so the original
-                // route survives untouched and restore-on-drop is trivial.
-                // The device's own /30 and the fake-IP range (if any) are
-                // inside the /1s already.
-                TunRouteScope::Global => Some(global_route_nets(cfg.inet6_address.is_some())),
-                TunRouteScope::FakeIp => self.tunnel.resolver().fake_ip_v4_net().map(|n| vec![n]),
-            }
-        } else {
-            None
+        // The subnet of the address the device took: a retry can step
+        // off the configured one (`rotate_v4`). The IPv6 one stays inside
+        // the configured subnet (`rotate_v6`).
+        let tun_net = udp::TunNets {
+            v4: Ipv4Net::new_assert(used_addr, prefix),
+            v6: cfg.inet6_address,
         };
+        let fake_ip_net = self.tunnel.resolver().fake_ip_v4_net();
 
-        let route_guard = if cfg.auto_route {
-            match route_nets {
-                Some(nets) => {
-                    let t_route = Instant::now();
-
-                    let result =
-                        tokio::task::spawn_blocking(move || RouteGuard::setup(if_index, &nets))
-                            .await;
-
-                    match result {
-                        Ok(Ok(g)) => {
-                            let route_ms = t_route.elapsed().as_secs_f64() * 1000.0;
-                            info!("auto-route installed in {route_ms:.0}ms");
-                            Some(g)
-                        }
-                        Ok(Err(e)) => {
-                            return Err(Box::new(io::Error::other(format!(
-                                "failed to install auto-route: {e}"
-                            ))));
-                        }
-                        Err(join_err) => {
-                            return Err(Box::new(io::Error::other(format!(
-                                "auto-route spawn_blocking panicked: {join_err}"
-                            ))));
-                        }
-                    }
-                }
-                None => {
+        // Global scope on Linux: the device's default routes go in a table
+        // of their own, which policy rules send only the flows this host
+        // originates to (see `policy_route.rs`). Without policy routing
+        // the split defaults below go in the main table instead.
+        #[cfg(target_os = "linux")]
+        let policy_routes = if cfg.auto_route && cfg.route_scope == TunRouteScope::Global {
+            let (v4, v6) = (tun_net.v4, tun_net.v6);
+            match tokio::task::spawn_blocking(move || {
+                policy_route::PolicyRoutes::setup(if_index, v4, v6)
+            })
+            .await
+            {
+                Ok(Ok(routes)) => Some(routes),
+                Ok(Err(e)) => {
                     warn!(
-                        "tun '{}': auto-route currently only routes the fake-IP range, but \
-                         DNS is not in fake-ip mode — no routes installed. Add routes to \
-                         '{dev_name}' manually (and make sure outbound traffic cannot loop \
-                         back into the device).",
+                        "tun '{}': policy routing unavailable ({e}); routing everything \
+                         through the main table instead, which also sends the replies on \
+                         connections accepted from other networks into '{dev_name}'",
                         self.name
                     );
                     None
                 }
+                Err(join_err) => {
+                    return Err(Box::new(io::Error::other(format!(
+                        "policy-route spawn_blocking panicked: {join_err}"
+                    ))));
+                }
             }
         } else {
             None
+        };
+        #[cfg(target_os = "linux")]
+        let policy_routed = policy_routes.is_some();
+        #[cfg(not(target_os = "linux"))]
+        let policy_routed = false;
+
+        // auto-route: install the scope's routes in the main table (see
+        // module docs).
+        let route_nets: Vec<ipnet::IpNet> = match (cfg.auto_route, cfg.route_scope) {
+            (false, _) => Vec::new(),
+            // The policy rules leave traffic the host forwards
+            // (containers, VMs, a gateway's LAN clients) to the main table,
+            // where the fake-IP range still catches its domain flows.
+            (true, TunRouteScope::Global) if policy_routed => fake_ip_net.into_iter().collect(),
+            // Split defaults: two /1s (macOS: eight routes that avoid the
+            // all-zero key) cover all IPv4 while staying more specific
+            // than the physical 0/0 default, so the original route
+            // survives untouched and restore-on-drop is trivial. The
+            // device's own /30 and the fake-IP range (if any) are inside
+            // the /1s already.
+            (true, TunRouteScope::Global) => global_route_nets(cfg.inet6_address.is_some()),
+            (true, TunRouteScope::FakeIp) => {
+                if fake_ip_net.is_none() {
+                    warn!(
+                        "tun '{}': 'auto-route: fake-ip' only routes the fake-IP range, but \
+                         DNS is not in fake-ip mode — no routes installed. Use \
+                         'auto-route: true', or add routes to '{dev_name}' manually.",
+                        self.name
+                    );
+                }
+                fake_ip_net.into_iter().collect()
+            }
+        };
+
+        // RouteManager::add() calls into OS routing APIs that may block
+        // (PowerShell on Windows), so it runs on a blocking thread. The
+        // outer TUN_STARTUP_TIMEOUT guards the overall startup.
+        let route_guard = if route_nets.is_empty() {
+            None
+        } else {
+            let t_route = Instant::now();
+            match tokio::task::spawn_blocking(move || RouteGuard::setup(if_index, &route_nets))
+                .await
+            {
+                Ok(Ok(g)) => {
+                    let route_ms = t_route.elapsed().as_secs_f64() * 1000.0;
+                    info!("auto-route installed in {route_ms:.0}ms");
+                    Some(g)
+                }
+                Ok(Err(e)) => {
+                    return Err(Box::new(io::Error::other(format!(
+                        "failed to install auto-route: {e}"
+                    ))));
+                }
+                Err(join_err) => {
+                    return Err(Box::new(io::Error::other(format!(
+                        "auto-route spawn_blocking panicked: {join_err}"
+                    ))));
+                }
+            }
         };
 
         // Wrap the device and its route guard in a single `Arc` so they share
@@ -649,6 +703,8 @@ impl TunListener {
         // when the last `Arc` clone goes away — ensuring route deletion always
         // succeeds because the adapter is still alive.
         let device = Arc::new(TunDevice {
+            #[cfg(target_os = "linux")]
+            policy_routes,
             route_guard,
             iface_guard,
             device,
@@ -766,13 +822,6 @@ impl TunListener {
             });
         }
 
-        // The subnet of the address the device took: a retry can step
-        // off the configured one (`rotate_v4`). The IPv6 one stays inside
-        // the configured subnet (`rotate_v6`).
-        let tun_net = udp::TunNets {
-            v4: Ipv4Net::new_assert(used_addr, prefix),
-            v6: cfg.inet6_address,
-        };
         // Nothing past here fails: the listener is up, and its binding is
         // the running one.
         if let Some(binding) = &device.iface_guard {

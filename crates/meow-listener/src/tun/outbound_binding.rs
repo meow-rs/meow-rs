@@ -1,13 +1,14 @@
 //! Outbound-interface binding for global route scope (#375, issue #695).
 //!
-//! `auto-route: global` steers all traffic into the TUN, so every socket
+//! Global route scope (`auto-route: true`, or `global`) steers all traffic
+//! into the TUN, so every socket
 //! meow opens must be bound to the physical interface (via
 //! `meow_common::install_outbound_interface`: `SO_BINDTODEVICE` on Linux,
 //! `IP_BOUND_IF` on macOS, `IP_UNICAST_IF` on Windows) or it loops back
 //! into the device.
 //! The binding is per-socket and applied at creation: a socket created
 //! before it is installed stays unbound for its whole life, and once the
-//! split default routes go in its traffic re-enters the TUN — a QUIC or mux
+//! routes into the device go in its traffic re-enters the TUN — a QUIC or mux
 //! session opened by an early startup dial (geodata download, provider
 //! fetch, health probe) then loops until it times out.
 //!
@@ -61,7 +62,7 @@ impl OutboundBinding {
         )) {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "tun auto-route: global is only implemented on Linux, macOS and \
+                "tun auto-route: global scope is only implemented on Linux, macOS and \
                  Windows (#375); use auto-route: fake-ip on this platform",
             ));
         }
@@ -69,21 +70,18 @@ impl OutboundBinding {
             Some(name) => name.to_owned(),
             None => super::route::default_interface().map_err(|e| {
                 io::Error::other(format!(
-                    "tun auto-route: global: could not auto-detect the physical \
+                    "tun auto-route (global scope): could not auto-detect the physical \
                      interface ({e}); set tun.outbound-interface explicitly"
                 ))
             })?,
         };
         let guard = meow_common::install_outbound_interface(&iface).map_err(|e| {
             io::Error::other(format!(
-                "tun auto-route: global: outbound interface binding failed ({e}); \
+                "tun auto-route (global scope): outbound interface binding failed ({e}); \
                  refusing to install default routes without loop avoidance"
             ))
         })?;
-        info!(
-            "tun: global route scope — outbound sockets bound to '{iface}' \
-             (experimental, #375)"
-        );
+        info!("tun: global route scope — outbound sockets bound to '{iface}' (#375)");
         Ok(Self(guard))
     }
 

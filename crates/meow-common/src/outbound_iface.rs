@@ -1,7 +1,7 @@
 //! Outbound-socket interface binding for TUN global-route mode (#375).
 //!
-//! With `tun.auto-route: global` the split default routes send *all*
-//! traffic into the TUN device — including, without countermeasures, meow's
+//! In TUN global route scope (`tun.auto-route: true`, or `global`) the
+//! routes into the device send *all* traffic into the TUN device — including, without countermeasures, meow's
 //! own dials to proxy upstreams and DIRECT destinations, which would re-enter
 //! the device and loop. The countermeasure is per-socket: every outbound
 //! socket meow creates is bound to the physical interface **before**

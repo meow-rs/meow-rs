@@ -650,9 +650,10 @@ Most common format from public providers. Typical issues:
 
 ### Type 3: Transparent proxy (tproxy, Linux)
 
-1. **TUN users** — meow-rs has a `tun:` section (feature `listener-tun`,
-   fake-ip-scoped; see `docs/tun.md`), or use `tproxy-port` with nftables
-   `TPROXY`/`REDIRECT` rules.
+1. **TUN users** — meow-rs has a `tun:` section (feature `listener-tun`;
+   `auto-route: true` captures all traffic and `dns-hijack` defaults on, no
+   `auto-redirect` / `strict-route` needed; see `docs/tun.md`), or use
+   `tproxy-port` with nftables `TPROXY`/`REDIRECT` rules.
 2. **`redir-port`** — not supported. Use `tproxy-port`.
 3. **PROCESS-NAME / PROCESS-PATH rules** — platform lookup wired (Linux netlink,
    macOS libproc) via M1.D-1. Elsewhere (Android, iOS) they stay dead unless

@@ -288,8 +288,8 @@ pub struct TunConfig {
     /// range's first /30 ([`default_tun_inet4_address`]).
     pub inet4_address: ipnet::Ipv4Net,
     /// IPv6 address + prefix assigned to the device (`inet6-address`).
-    /// Only ever `Some` in global route mode, where it also adds the IPv6
-    /// split default routes (#375); `None` = the device is IPv4-only.
+    /// Only ever `Some` in global route mode, where it also captures IPv6
+    /// (#375); `None` = the device is IPv4-only.
     pub inet6_address: Option<ipnet::Ipv6Net>,
     pub auto_route: bool,
     /// Which routes `auto-route` installs (#375). Only meaningful when
@@ -298,7 +298,8 @@ pub struct TunConfig {
     /// Physical interface outbound sockets bind to in global mode; `None`
     /// = auto-detect from the default route at listener startup.
     pub outbound_interface: Option<String>,
-    /// True when `dns-hijack` contains at least one usable (`:53`) entry.
+    /// True when `dns-hijack` is absent or contains at least one usable
+    /// (`:53`) entry; an empty list turns it off.
     pub dns_hijack: bool,
     pub udp_timeout: std::time::Duration,
     /// Cap on concurrent TUN TCP flows. Inherited from the top-level
@@ -309,17 +310,34 @@ pub struct TunConfig {
 }
 
 /// Scope of the routes `tun.auto-route` installs (#375).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TunRouteMode {
-    /// v1 behavior: route only the fake-IP range into the device. Loop-free
-    /// by construction; IP-literal traffic is not captured.
-    #[default]
+    /// `auto-route: fake-ip`: route only the fake-IP range into the
+    /// device. Loop-free by construction; IP-literal traffic is not
+    /// captured.
     FakeIp,
-    /// Route all IPv4 traffic — and all IPv6 traffic when `inet6-address`
-    /// is set — into the device (split default routes) and bind outbound
-    /// sockets to the physical interface for loop avoidance. Experimental;
-    /// Linux, macOS and Windows.
+    /// `auto-route: true` (or `global`): route all traffic the host
+    /// originates — IPv4, and IPv6 when `inet6-address` is set — into the
+    /// device, and bind outbound sockets to the physical interface for
+    /// loop avoidance. Linux, macOS and Windows.
     Global,
+}
+
+impl Default for TunRouteMode {
+    /// What `auto-route: true`, and an unset `auto-route`, select: global
+    /// where outbound sockets can be bound to the physical interface,
+    /// fake-IP elsewhere.
+    fn default() -> Self {
+        if cfg!(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "windows"
+        )) {
+            Self::Global
+        } else {
+            Self::FakeIp
+        }
+    }
 }
 
 impl Default for TunConfig {
@@ -331,9 +349,9 @@ impl Default for TunConfig {
             inet4_address: default_tun_inet4_address(None),
             inet6_address: None,
             auto_route: true,
-            route_mode: TunRouteMode::FakeIp,
+            route_mode: TunRouteMode::default(),
             outbound_interface: None,
-            dns_hijack: false,
+            dns_hijack: true,
             udp_timeout: std::time::Duration::from_secs(60),
             max_connections: 256,
         }
@@ -426,8 +444,9 @@ pub fn parse_tun_config(
         None => default_tun_inet4_address(fake_ip_range),
     };
 
-    // v1 hijacks all UDP :53 flows when any usable entry is present.
-    let mut dns_hijack = false;
+    // Absent: on. An empty list turns it off. Any usable entry hijacks
+    // every UDP :53 flow.
+    let mut dns_hijack = r.dns_hijack.is_none();
     for entry in r.dns_hijack.as_deref().unwrap_or(&[]) {
         let port = entry.rsplit(':').next().and_then(|p| p.parse::<u16>().ok());
         match port {
@@ -458,12 +477,13 @@ pub fn parse_tun_config(
     });
 
     let (auto_route, route_mode) = parse_auto_route(r)?;
+    let global = auto_route && route_mode == TunRouteMode::Global;
 
     let outbound_interface = raw_outbound_interface(r);
-    if outbound_interface.is_some() && route_mode != TunRouteMode::Global {
+    if outbound_interface.is_some() && !global {
         warn!(
-            "tun.outbound-interface: only used with 'auto-route: global'; \
-             ignored in fake-ip mode"
+            "tun.outbound-interface: only used when auto-route captures all traffic \
+             ('auto-route: true'); ignored"
         );
     }
     // Normalise the ignored value out: the commit path diffs parsed
@@ -471,18 +491,17 @@ pub fn parse_tun_config(
     // must not trigger one — a PUT touching only `outbound-interface`
     // under fake-ip scope would otherwise bounce a healthy listener
     // (issue #543 review).
-    let outbound_interface = outbound_interface.filter(|_| route_mode == TunRouteMode::Global);
+    let outbound_interface = outbound_interface.filter(|_| global);
 
     // `inet6-address` is validated in every mode, but only global mode has
     // IPv6 routes to send into the device — elsewhere an address on the
     // device would capture nothing, so it is normalised out for the same
     // restart-diff reason as `outbound-interface` above.
     let inet6_address = parse_inet6_address(r.inet6_address.as_ref())?;
-    let global = auto_route && route_mode == TunRouteMode::Global;
     if inet6_address.is_some() && !global {
         warn!(
-            "tun.inet6-address: only used with 'auto-route: global'; \
-             ignored (the device stays IPv4-only)"
+            "tun.inet6-address: only used when auto-route captures all traffic \
+             ('auto-route: true'); ignored (the device stays IPv4-only)"
         );
     }
     let inet6_address = inet6_address.filter(|_| global);
@@ -544,14 +563,16 @@ fn parse_inet6_address(
 }
 
 /// `auto-route` (#375): mihomo boolean, or a mode string selecting what
-/// gets routed. `true` keeps the loop-free v1 fake-IP scope. Shared by
+/// gets routed. `true` (and unset) captures all traffic where that is
+/// supported ([`TunRouteMode::default`]); `fake-ip` opts into the narrower
+/// loop-free scope, and `global` names the full one explicitly. Shared by
 /// [`parse_tun_config`] and [`global_route_outbound_interface`] so the two
 /// can never disagree on what selects global scope.
 fn parse_auto_route(r: &raw::RawTun) -> Result<(bool, TunRouteMode), anyhow::Error> {
     let defaults = TunConfig::default();
     Ok(match r.auto_route.as_ref() {
         None => (defaults.auto_route, defaults.route_mode),
-        Some(raw::RawAutoRoute::Enabled(on)) => (*on, TunRouteMode::FakeIp),
+        Some(raw::RawAutoRoute::Enabled(on)) => (*on, defaults.route_mode),
         Some(raw::RawAutoRoute::Mode(s)) => match s.as_str() {
             "fake-ip" => (true, TunRouteMode::FakeIp),
             "global" => (true, TunRouteMode::Global),
@@ -570,8 +591,8 @@ fn raw_outbound_interface(r: &raw::RawTun) -> Option<String> {
     r.outbound_interface.clone().filter(|s| !s.is_empty())
 }
 
-/// Whether `raw` selects an enabled TUN with `auto-route: global`, and if
-/// so the configured `outbound-interface` (`Some(None)` = auto-detect).
+/// Whether `raw` selects an enabled TUN in global route scope, and if so
+/// the configured `outbound-interface` (`Some(None)` = auto-detect).
 /// `None` for a disabled TUN, fake-IP scope, `auto-route: false`, or a
 /// section [`parse_tun_config`] would reject.
 ///

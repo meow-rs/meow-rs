@@ -615,6 +615,12 @@ const RAW_SOCKET_ALLOWLIST: &[(&str, &str, usize, &str)] = &[
         "loopback DNS listener (127.0.0.1:53 / [::1]:53)",
     ),
     (
+        "crates/meow-listener/src/tun/policy_route.rs",
+        "Socket::new(",
+        1,
+        "NETLINK_ROUTE socket installing the TUN policy rules; not IP-routed",
+    ),
+    (
         "crates/meow-app/src/arp.rs",
         "libc::socket(",
         1,

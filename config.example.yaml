@@ -18,15 +18,14 @@ mixed-port: 7890
 # enables UDP TPROXY on the same port (requires `firewall: false`, an IPv4
 # listen, and deployer-owned fwmark/policy routing). See docs/tproxy-gateway.md.
 #
-# Windows: Wintun TUN inbound (the transparent-proxy path). Requires an
-# elevated process. Official zips ship wintun.dll next to meow.exe; if it
-# is missing the official DLL embedded in the binary is extracted. Also
-# needs dns.enhanced-mode: fake-ip. See docs/tun.md.
+# TUN inbound (the transparent-proxy path on Windows; also Linux/macOS).
+# `enable: true` alone captures all traffic and answers DNS in-process;
+# `auto-route: fake-ip` narrows it to the fake-ip range, `dns-hijack: []`
+# turns the DNS answering off. Needs root / an elevated process. Official
+# Windows zips ship wintun.dll next to meow.exe; if it is missing the
+# official DLL embedded in the binary is extracted. See docs/tun.md.
 # tun:
 #   enable: true
-#   auto-route: true
-#   dns-hijack:
-#     - any:53
 
 allow-lan: false
 bind-address: "127.0.0.1"

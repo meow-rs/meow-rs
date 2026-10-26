@@ -1,7 +1,8 @@
 //! RAII route installation for the TUN inbound's `auto-route`.
 //!
-//! v1 deliberately routes only the fake-IP range into the device (see the
-//! module docs in `mod.rs` for the loop-freedom argument). Routes are added
+//! Main-table routes into the device: the fake-IP range, or global scope's
+//! split defaults (see the module docs in `mod.rs` for which and why;
+//! Linux global scope uses `policy_route.rs` instead). Routes are added
 //! with the blocking `route_manager` API at listener startup and removed on
 //! drop; a failed add is a warning, not a fatal error, because the device
 //! subnet's own on-link route frequently already covers the range (in which

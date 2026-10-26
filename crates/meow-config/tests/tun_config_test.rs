@@ -13,11 +13,13 @@
 //! | T3  | full section → every typed field lands                             |
 //! | T4  | `mtu` below 1280 → hard error                                      |
 //! | T5  | invalid `inet4-address` CIDR → hard error                          |
-//! | T6  | `dns-hijack: [any:53]` → hijack on                                 |
+//! | T6  | `dns-hijack: [any:53]` → hijack on; absent → on; `[]` → off        |
 //! | T7  | `dns-hijack` with only non-53 entries → hijack off (warn-only)     |
 //! | T8  | upstream-only fields (`stack`, `strict-route`, …) → warn, not err  |
-//! | T8b | `inet6-address` (#375): honoured only under `auto-route: global`,  |
+//! | T8b | `inet6-address` (#375): honoured only in global route scope,       |
 //! |     | string or list form, invalid CIDR → hard error                     |
+//! | T11 | `auto-route` unset / `true` → global scope on Linux, macOS and     |
+//! |     | Windows; `fake-ip` opts out                                        |
 //! | T9  | `udp-timeout: 0` → hard error                                      |
 //! | T10 | `enable: false` with other fields set → parsed but disabled        |
 //! | T16 | `TunConfig` semantic equality — the PUT reconcile diff boundary    |
@@ -50,7 +52,7 @@ async fn t1_no_tun_block_yields_default_disabled() {
     // out, like mihomo.
     assert_eq!(cfg.tun.inet4_address.to_string(), "198.18.0.1/30");
     assert!(cfg.tun.auto_route, "auto-route defaults on");
-    assert!(!cfg.tun.dns_hijack, "dns-hijack defaults off");
+    assert!(cfg.tun.dns_hijack, "dns-hijack defaults on");
     assert_eq!(
         cfg.tun.max_connections, 256,
         "TUN inherits the global max-connections default"
@@ -143,6 +145,22 @@ tun:
     assert!(cfg.tun.dns_hijack);
 }
 
+/// Capturing the traffic includes its DNS: no `dns-hijack` key is needed,
+/// and an empty list is the way to turn it off.
+#[tokio::test]
+async fn t6b_dns_hijack_defaults_on_and_empty_list_disables() {
+    let hijack = |yaml: &'static str| async move {
+        load_config_from_str(yaml)
+            .await
+            .expect("config must load")
+            .tun
+            .dns_hijack
+    };
+    assert!(hijack("tun:\n  enable: true\n").await);
+    assert!(hijack("tun:\n  enable: true\n  dns-hijack:\n").await);
+    assert!(!hijack("tun:\n  enable: true\n  dns-hijack: []\n").await);
+}
+
 #[tokio::test]
 async fn t7_dns_hijack_non_53_entries_warn_and_disable() {
     let yaml = r#"
@@ -177,7 +195,7 @@ tun:
 
 // ─── T8b: inet6-address (#375) ────────────────────────────────────────────
 // Opt-in IPv6 capture for global route mode: string or mihomo list form,
-// honoured only under `auto-route: global`, validated everywhere.
+// honoured only in global route scope, validated everywhere.
 
 #[tokio::test]
 async fn t8b_inet6_address_is_honoured_only_in_global_mode() {
@@ -218,15 +236,19 @@ async fn t8b_inet6_address_is_honoured_only_in_global_mode() {
     assert_eq!(v6(&format!("{global}  inet6-address: ''\n")).await, None);
     assert_eq!(v6(&format!("{global}  inet6-address: []\n")).await, None);
 
+    // Global scope is also what an unset `auto-route` and `true` select.
+    if meow_config::TunRouteMode::default() == meow_config::TunRouteMode::Global {
+        for mode in ["", "  auto-route: true\n"] {
+            let yaml =
+                format!("tun:\n  enable: true\n{mode}  inet6-address: fdfe:dcba:9876::1/126\n");
+            assert_eq!(v6(&yaml).await, Some(want), "{yaml}");
+        }
+    }
+
     // Every other mode has no IPv6 routes to send into the device: the
     // address is ignored (with a warning), and normalised out so it cannot
     // trigger a listener restart on reload.
-    for mode in [
-        "",
-        "  auto-route: true\n",
-        "  auto-route: fake-ip\n",
-        "  auto-route: false\n",
-    ] {
+    for mode in ["  auto-route: fake-ip\n", "  auto-route: false\n"] {
         let yaml = format!("tun:\n  enable: true\n{mode}  inet6-address: fdfe:dcba:9876::1/126\n");
         assert_eq!(v6(&yaml).await, None, "{yaml}");
     }
@@ -279,27 +301,39 @@ tun:
 // ─── T11–T14: auto-route modes (#375) ─────────────────────────────────────
 
 #[tokio::test]
-async fn t11_auto_route_bool_compat_maps_to_fake_ip() {
+async fn t11_auto_route_bool_maps_to_the_default_scope() {
     use meow_config::TunRouteMode;
 
-    // mihomo's boolean forms keep working: true = fake-IP scope, false = off.
+    // mihomo's boolean forms: true = capture everything that can be, false
+    // = off.
     let on = load_config_from_str("tun:\n  enable: true\n  auto-route: true\n")
         .await
         .expect("config must load");
     assert!(on.tun.auto_route);
-    assert_eq!(on.tun.route_mode, TunRouteMode::FakeIp);
+    assert_eq!(on.tun.route_mode, TunRouteMode::default());
 
     let off = load_config_from_str("tun:\n  enable: true\n  auto-route: false\n")
         .await
         .expect("config must load");
     assert!(!off.tun.auto_route);
 
-    // Absent → default on, fake-IP scope.
+    // Absent → on, in the same scope as `true`.
     let default = load_config_from_str("tun:\n  enable: true\n")
         .await
         .expect("config must load");
     assert!(default.tun.auto_route);
-    assert_eq!(default.tun.route_mode, TunRouteMode::FakeIp);
+    assert_eq!(default.tun.route_mode, TunRouteMode::default());
+}
+
+/// `auto-route: true` captures all traffic wherever outbound sockets can be
+/// bound to the physical interface.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[test]
+fn t11b_default_scope_is_global_where_supported() {
+    assert_eq!(
+        meow_config::TunRouteMode::default(),
+        meow_config::TunRouteMode::Global
+    );
 }
 
 #[tokio::test]
@@ -379,11 +413,18 @@ async fn t16_tun_config_semantic_equality_boundary() {
             .tun
     }
 
+    use meow_config::TunRouteMode;
+
     let explicit_bool = tun("tun:\n  enable: true\n  auto-route: true\n").await;
     let fake_ip_mode = tun("tun:\n  enable: true\n  auto-route: fake-ip\n").await;
+    let global_mode = tun("tun:\n  enable: true\n  auto-route: global\n").await;
     let omitted = tun("tun:\n  enable: true\n").await;
-    assert_eq!(explicit_bool, fake_ip_mode, "`true` ≡ `fake-ip` mode");
-    assert_eq!(explicit_bool, omitted, "omitted ≡ default fake-ip scope");
+    let (default_mode, other_mode) = match TunRouteMode::default() {
+        TunRouteMode::Global => (&global_mode, "fake-ip"),
+        TunRouteMode::FakeIp => (&fake_ip_mode, "global"),
+    };
+    assert_eq!(&explicit_bool, default_mode, "`true` ≡ the default scope");
+    assert_eq!(explicit_bool, omitted, "omitted ≡ `true`");
 
     let ignored_fields = tun("tun:\n  enable: true\n  stack: gvisor\n  strict-route: true\n").await;
     assert_eq!(
@@ -399,9 +440,14 @@ async fn t16_tun_config_semantic_equality_boundary() {
         tun("tun:\n  enable: true\n  mtu: 9000\n").await,
         "a real mtu change must differ"
     );
-    assert_ne!(
+    assert_eq!(
         omitted,
         tun("tun:\n  enable: true\n  dns-hijack:\n    - any:53\n").await,
+        "dns-hijack: [any:53] ≡ omitted"
+    );
+    assert_ne!(
+        omitted,
+        tun("tun:\n  enable: true\n  dns-hijack: []\n").await,
         "a real dns-hijack change must differ"
     );
     assert_ne!(
@@ -410,13 +456,13 @@ async fn t16_tun_config_semantic_equality_boundary() {
         "inherited max-connections must differ"
     );
 
-    // `outbound-interface` is ignored outside `auto-route: global` — a
-    // value that does nothing must not reach the diff, or a PUT touching
-    // only it would bounce a healthy fake-ip listener (issue #543
-    // review).
-    let ignored_iface = tun("tun:\n  enable: true\n  outbound-interface: eth9\n").await;
+    // `outbound-interface` is ignored outside global scope — a value that
+    // does nothing must not reach the diff, or a PUT touching only it
+    // would bounce a healthy fake-ip listener (issue #543 review).
+    let ignored_iface =
+        tun("tun:\n  enable: true\n  auto-route: fake-ip\n  outbound-interface: eth9\n").await;
     assert_eq!(
-        omitted, ignored_iface,
+        fake_ip_mode, ignored_iface,
         "outbound-interface under fake-ip scope must not change the diff"
     );
     assert_ne!(
@@ -428,6 +474,7 @@ async fn t16_tun_config_semantic_equality_boundary() {
     // Remaining listener inputs are covered by the derived PartialEq —
     // pin a representative from each family so the diff can't silently
     // stop noticing a field (issue #543 review).
+    let other_mode = format!("tun:\n  enable: true\n  auto-route: {other_mode}\n");
     for (yaml, what) in [
         ("tun:\n  enable: true\n  device: tun7\n", "device"),
         (
@@ -435,7 +482,7 @@ async fn t16_tun_config_semantic_equality_boundary() {
             "inet4-address",
         ),
         ("tun:\n  enable: true\n  udp-timeout: 30\n", "udp-timeout"),
-        ("tun:\n  enable: true\n  auto-route: global\n", "route_mode"),
+        (other_mode.as_str(), "route_mode"),
     ] {
         assert_ne!(omitted, tun(yaml).await, "a real {what} change must differ");
     }
@@ -494,6 +541,13 @@ async fn t17_global_route_gate_matches_parsed_config() {
         Some(None),
         "no outbound-interface → auto-detect"
     );
+    if TunRouteMode::default() == TunRouteMode::Global {
+        assert_eq!(
+            gate("tun:\n  enable: true\n  auto-route: true\n  outbound-interface: eth0\n"),
+            Some(Some("eth0".to_owned()))
+        );
+        assert_eq!(gate("tun:\n  enable: true\n"), Some(None));
+    }
 }
 
 // ─── T18: the default address follows the fake-IP range ──────────────────

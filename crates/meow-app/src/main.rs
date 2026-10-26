@@ -639,8 +639,8 @@ type EarlyOutboundBinding = Option<std::convert::Infallible>;
 ///
 /// Shares [`meow_api::preinstall_global_route_binding`] with the config
 /// reload paths, so startup and reload agree on when a binding is due: a
-/// no-op (`None`) unless the raw config selects an enabled TUN with
-/// `auto-route: global` — TUN-off and fake-IP-scope startups are untouched.
+/// no-op (`None`) unless the raw config selects an enabled TUN in global
+/// route scope — TUN-off and fake-IP-scope startups are untouched.
 /// An install failure is not fatal here: the listener retries before it
 /// touches any route and fails closed with the same error, exactly as
 /// before, and until then no global route exists for a socket to loop on.
@@ -2170,9 +2170,9 @@ mod tests {
     }
 
     /// #695: the global-route binding is installed from the raw config,
-    /// ahead of the build's first dial, only for an enabled TUN in
-    /// `auto-route: global` — TUN-off and fake-IP startups never touch the
-    /// process-global registry.
+    /// ahead of the build's first dial, only for an enabled TUN in global
+    /// route scope (`auto-route` unset, `true` or `global`) — TUN-off and
+    /// fake-IP startups never touch the process-global registry.
     #[cfg(all(
         feature = "listener-tun",
         any(target_os = "linux", target_os = "macos")
@@ -2202,8 +2202,6 @@ mod tests {
             for yaml in [
                 "port: 7890\n",
                 "tun:\n  enable: false\n  auto-route: global\n  outbound-interface: LO\n",
-                "tun:\n  enable: true\n  outbound-interface: LO\n",
-                "tun:\n  enable: true\n  auto-route: true\n  outbound-interface: LO\n",
                 "tun:\n  enable: true\n  auto-route: fake-ip\n  outbound-interface: LO\n",
                 "tun:\n  enable: true\n  auto-route: false\n",
                 // Rejected later by `build_config`; never pre-installs.
@@ -2223,12 +2221,21 @@ mod tests {
             assert!(preinstall_global_route_binding(&raw(missing)).is_none());
             assert!(meow_common::outbound_interface().is_none());
 
-            let global = "tun:\n  enable: true\n  auto-route: global\n  outbound-interface: LO\n";
-            let binding = preinstall_global_route_binding(&raw(global))
-                .expect("global route scope pre-installs the binding");
-            assert_eq!(meow_common::outbound_interface().as_deref(), Some(LO));
-            drop(binding);
-            assert!(meow_common::outbound_interface().is_none());
+            for global in [
+                "tun:\n  enable: true\n  outbound-interface: LO\n",
+                "tun:\n  enable: true\n  auto-route: true\n  outbound-interface: LO\n",
+                "tun:\n  enable: true\n  auto-route: global\n  outbound-interface: LO\n",
+            ] {
+                let binding = preinstall_global_route_binding(&raw(global))
+                    .expect("global route scope pre-installs the binding");
+                assert_eq!(
+                    meow_common::outbound_interface().as_deref(),
+                    Some(LO),
+                    "{global}"
+                );
+                drop(binding);
+                assert!(meow_common::outbound_interface().is_none(), "{global}");
+            }
         }
     }
 }

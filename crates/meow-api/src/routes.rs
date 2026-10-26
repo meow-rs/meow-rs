@@ -5250,7 +5250,6 @@ mod global_route_binding_tests {
         for yaml in [
             "port: 7890\n",
             "tun:\n  enable: false\n  auto-route: global\n  outbound-interface: lo\n",
-            "tun:\n  enable: true\n  outbound-interface: lo\n",
             "tun:\n  enable: true\n  auto-route: fake-ip\n  outbound-interface: lo\n",
             "tun:\n  enable: true\n  auto-route: false\n",
             "tun:\n  enable: true\n  auto-route: bogus\n  outbound-interface: lo\n",
@@ -5275,6 +5274,17 @@ mod global_route_binding_tests {
         assert_eq!(iface().as_deref(), Some("lo"), "first owner restored");
         drop(first);
         assert_eq!(iface(), None);
+        // `auto-route` unset or `true` selects global scope as well.
+        for yaml in [
+            "tun:\n  enable: true\n  outbound-interface: lo\n",
+            "tun:\n  enable: true\n  auto-route: true\n  outbound-interface: lo\n",
+        ] {
+            let p = preinstall_global_route_binding(&raw(yaml));
+            assert!(p.is_installed() && p.interface_changed(), "{yaml}");
+            assert_eq!(iface().as_deref(), Some("lo"), "{yaml}");
+            drop(p);
+            assert_eq!(iface(), None, "{yaml}");
+        }
 
         let origin = RecordingOrigin::start();
         let state = test_state(raw("mode: rule\nrules:\n  - MATCH,DIRECT\n"));

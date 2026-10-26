@@ -331,22 +331,22 @@ pub struct RawTun {
     /// `dns.fake-ip-range` (`198.18.0.1/30`), like mihomo.
     pub inet4_address: Option<String>,
     /// Route installation on startup. Accepts the mihomo boolean
-    /// (`true` = fake-IP scope, `false` = off) plus the #375 mode strings
-    /// `fake-ip` and `global`. Default true (fake-IP scope).
+    /// (`true` = capture all traffic where supported, `false` = off) plus
+    /// the #375 mode strings `fake-ip` and `global`. Default true.
     pub auto_route: Option<RawAutoRoute>,
-    /// Physical interface outbound sockets bind to in `auto-route: global`
-    /// mode (loop avoidance, #375). Auto-detected from the default route
-    /// when omitted. Ignored outside global mode.
+    /// Physical interface outbound sockets bind to in global route scope
+    /// (loop avoidance, #375). Auto-detected from the default route when
+    /// omitted. Ignored in fake-IP scope.
     pub outbound_interface: Option<String>,
-    /// DNS hijack targets. meow-rs v1 hijacks all UDP :53 flows entering
-    /// the device whenever this list is non-empty; entries with a port
-    /// other than 53 warn and are ignored.
+    /// DNS hijack targets. meow-rs hijacks all UDP :53 flows entering the
+    /// device when this is absent or lists a `:53` target; `[]` turns it
+    /// off, and entries with a port other than 53 warn and are ignored.
     pub dns_hijack: Option<Vec<String>>,
     /// UDP NAT idle timeout in seconds. Default 60.
     pub udp_timeout: Option<u64>,
     /// IPv6 CIDR assigned to the device, e.g. `fdfe:dcba:9876::1/126` —
     /// a string, or mihomo's list form (the first entry is used). Opts
-    /// `auto-route: global` into IPv6 capture (#375); ignored with a
+    /// global route scope into IPv6 capture (#375); ignored with a
     /// warning in every other mode. Default: none (IPv4 only).
     pub inet6_address: Option<serde_json::Value>,
     // Upstream-only fields accepted for forward-compat; warn and ignore.

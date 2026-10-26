@@ -228,6 +228,28 @@ the canonical, in-repo source a release is cut from.
   `meow_config::parse_tun_config` takes the fake-IP range as a third
   argument (`RawConfig::fake_ip_range`), and
   `meow_config::default_tun_inet4_address` derives the default.
+- **`tun.auto-route: true` captures all traffic, DNS included** (#375):
+  with `auto-route` unset or `true`, the TUN routed only the fake-IP range
+  into the device and `dns-hijack` was off, so `tun.enable: true` alone
+  captured nothing until `dns-hijack` was added and the system resolver
+  pointed into the range, and IP-literal traffic was never captured. On
+  Linux, macOS and Windows `true` now does what `auto-route: global` did:
+  everything the host sends goes into the device (IPv6 too with
+  `inet6-address`), and meow's own sockets are bound to the physical
+  interface. `dns-hijack` is on unless set to `[]`, so in fake-ip mode
+  meow also points the system resolver into the fake-IP range; on Windows
+  that binds a loopback DNS server on port 53, and startup fails if
+  something else holds the port. `auto-route: fake-ip` keeps the old
+  scope. On Linux the device's default routes now live in a routing table
+  of meow's own, and policy rules (priorities 9200 to 9205) send it only
+  the traffic the host originates: replies on connections the host
+  accepted from other networks (SSH, `allow-lan` listeners,
+  `external-controller`) no longer vanish into the device, DNS to a LAN
+  resolver is still captured, and forwarded traffic keeps the main table,
+  where the fake-IP range is routed into the device. A kernel without
+  policy routing gets the split default routes as before. For embedders,
+  `TunRouteMode::default()` is the platform's `true` scope and
+  `TunConfig::default()` has `dns_hijack: true`.
 
 ### Removed
 

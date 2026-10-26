@@ -143,9 +143,9 @@ impl PreinstalledBinding {
 /// listener's binding is back in effect; if it commits a restart, the old
 /// listener's teardown does not disturb this one.
 ///
-/// A no-op (default value) unless `raw` selects an enabled TUN with
-/// `auto-route: global` — TUN-off, fake-IP-scope and `auto-route: false`
-/// configs are untouched. An install failure is not fatal here: the
+/// A no-op (default value) unless `raw` selects an enabled TUN in global
+/// route scope (`auto-route` unset, `true` or `global`) — TUN-off,
+/// fake-IP-scope and `auto-route: false` configs are untouched. An install failure is not fatal here: the
 /// listener retries before it touches any route and fails closed with the
 /// same error, exactly as before, and until then no global route exists for
 /// a socket to loop on. API callers must hold the `CONFIG_MUTATION` lane
