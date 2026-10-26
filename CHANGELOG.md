@@ -107,6 +107,13 @@ the canonical, in-repo source a release is cut from.
   `tls://`/`https://` entries behaves the same). A locally unresolvable
   or poisoned upstream name no longer fails the config load, and no
   bootstrap IP is pinned into the client.
+- **DoT and DoH upstreams reuse their connections** (#813): a `tls://` or
+  `https://` nameserver used to pay a fresh connect and TLS handshake on
+  every query that missed the cache, through a `?proxy=` adapter as well.
+  Each upstream now keeps up to four idle sessions for reuse, closing one
+  after 30 s idle or when the network changes. A reused session that
+  fails or stalls is retried once on a fresh connection, and DoH requests
+  no longer send `Connection: close`.
 - **The logbook links the system SQLite on iOS and tvOS**: with the
   `logbook` feature, meow-common compiled its own SQLite (about 1 MiB) into
   every build. iOS and tvOS ship libsqlite3, and there the engine runs in a
