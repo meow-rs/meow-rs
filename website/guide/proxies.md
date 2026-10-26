@@ -331,7 +331,7 @@ AEAD VMess outbound (legacy `alterId` header mode is gone — `alterId` is coerc
 
 ## Hysteria2 — `hysteria2`
 
-QUIC-based, with Salamander obfuscation and port hopping.
+QUIC-based, with Salamander or Gecko obfuscation and port hopping.
 
 | Field | Type | Required | Default | Notes |
 | --- | --- | --- | --- | --- |
@@ -342,8 +342,10 @@ QUIC-based, with Salamander obfuscation and port hopping.
 | `skip-cert-verify` | bool | | `false` | |
 | `udp` | bool | | `true` | |
 | `up` / `down` | string \| u64 | | `0` | Bandwidth, e.g. `"30 Mbps"` |
-| `obfs` | string | | — | `salamander` (`gecko` errors) |
+| `obfs` | string | | — | `salamander` or `gecko` |
 | `obfs-password` | string | | — | Required when `obfs` is set |
+| `obfs-min-packet-size` | u16 | | `512` | Gecko only: smallest padded handshake datagram, in bytes |
+| `obfs-max-packet-size` | u16 | | `1200` | Gecko only: largest padded handshake datagram, at most `2048` |
 | `ports` | string | | — | Port-hop set, e.g. `443`, `443-445`, `all` |
 | `hop-interval` | string \| u64 | | — | Seconds, e.g. `5` or `5-30` |
 | `fingerprint` | string | | — | Pinned cert SHA-256 (hex or base64) |

@@ -1,9 +1,10 @@
 //! Hysteria2 outbound proxy adapter.
 //!
 //! The wire protocol, HTTP/3 authentication, TCP stream framing, UDP datagrams,
-//! Salamander obfuscation and port hopping live in the in-tree `hysteria2`
+//! Salamander / Gecko obfuscation and port hopping live in the in-tree `hysteria2`
 //! module. This module adapts that client to meow-rs' `ProxyAdapter` contracts.
 
+use crate::hysteria2::{gecko_packet_sizes, ObfsConfig};
 use async_trait::async_trait;
 use bytes::Bytes;
 use meow_common::{
@@ -24,6 +25,12 @@ const UDP_PACKET_QUEUE: usize = 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Hy2Obfs {
     Salamander,
+    /// `obfs: gecko`, with `obfs-min-packet-size` / `obfs-max-packet-size`;
+    /// `0` keeps the default (512 / 1200 bytes).
+    Gecko {
+        min_packet_size: u16,
+        max_packet_size: u16,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,9 +83,30 @@ impl Hy2Options {
             );
         }
 
-        let obfs_password = match self.obfs {
-            Some(Hy2Obfs::Salamander) => self.obfs_password.unwrap_or_default(),
-            None => String::new(),
+        let obfs = match self.obfs {
+            None => None,
+            Some(kind) => {
+                let password = self
+                    .obfs_password
+                    .filter(|password| !password.is_empty())
+                    .ok_or_else(|| format!("hysteria2[{}]: missing obfs-password", self.name))?;
+                Some(match kind {
+                    Hy2Obfs::Salamander => ObfsConfig::Salamander { password },
+                    Hy2Obfs::Gecko {
+                        min_packet_size,
+                        max_packet_size,
+                    } => {
+                        let (min_packet_size, max_packet_size) =
+                            gecko_packet_sizes(min_packet_size, max_packet_size)
+                                .map_err(|e| format!("hysteria2[{}]: {e}", self.name))?;
+                        ObfsConfig::Gecko {
+                            password,
+                            min_packet_size,
+                            max_packet_size,
+                        }
+                    }
+                })
+            }
         };
         let hop_interval = self.hop_interval.unwrap_or(Hy2HopInterval {
             min_secs: 0,
@@ -91,7 +119,7 @@ impl Hy2Options {
             auth: self.password,
             insecure: self.skip_cert_verify,
             rx_bps: self.down_bps,
-            obfs_password,
+            obfs,
             hop_ports: self.ports.unwrap_or_default(),
             hop_interval_min_secs: hop_interval.min_secs,
             hop_interval_max_secs: hop_interval.max_secs,
@@ -488,6 +516,54 @@ mod tests {
         assert_eq!(adapter.name(), "hy2");
         assert_eq!(adapter.addr(), "127.0.0.1:443");
         assert!(adapter.support_udp());
+    }
+
+    #[test]
+    fn adapter_constructor_resolves_gecko_packet_sizes() {
+        let gecko = |min_packet_size, max_packet_size| Hy2Options {
+            obfs: Some(Hy2Obfs::Gecko {
+                min_packet_size,
+                max_packet_size,
+            }),
+            obfs_password: Some("obfs-secret".into()),
+            ..base_options()
+        };
+        let (_, _, cfg) = gecko(0, 900).into_hysteria_config().unwrap();
+        let Some(ObfsConfig::Gecko {
+            password,
+            min_packet_size,
+            max_packet_size,
+        }) = cfg.obfs
+        else {
+            panic!("gecko obfs expected, got {:?}", cfg.obfs);
+        };
+        assert_eq!(password, "obfs-secret");
+        assert_eq!((min_packet_size, max_packet_size), (512, 900));
+
+        let Err(err) = gecko(1000, 900).into_hysteria_config() else {
+            panic!("an inverted size range must fail");
+        };
+        assert!(err.contains("min <= max"), "{err}");
+    }
+
+    #[test]
+    fn adapter_constructor_rejects_obfs_without_password() {
+        for obfs in [
+            Hy2Obfs::Salamander,
+            Hy2Obfs::Gecko {
+                min_packet_size: 0,
+                max_packet_size: 0,
+            },
+        ] {
+            let Err(err) = Hy2Adapter::new(Hy2Options {
+                obfs: Some(obfs),
+                obfs_password: Some(String::new()),
+                ..base_options()
+            }) else {
+                panic!("{obfs:?} without a password must fail");
+            };
+            assert!(err.contains("missing obfs-password"), "{err}");
+        }
     }
 
     #[test]

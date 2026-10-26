@@ -11,7 +11,7 @@
 //! the driver when a handle drains its channel.
 
 use super::auth::Auth;
-use super::obfs::{HopState, Salamander};
+use super::obfs::{HopState, Obfs};
 use super::proto::{self, UdpMessage};
 use super::tcp::{DuplexStream, WRITE_BUFFER_BYTES};
 use super::{Config, Error, Result};
@@ -178,7 +178,7 @@ impl Drop for StreamState {
 struct State {
     socket: UdpSocket,
     local: SocketAddr,
-    obfs: Option<Salamander>,
+    obfs: Option<Obfs>,
     hop: Option<HopState>,
     cmd_tx: mpsc::WeakSender<Cmd>,
     cmd_rx: mpsc::Receiver<Cmd>,
@@ -208,8 +208,7 @@ pub(crate) async fn spawn(
     let (cmd_tx, cmd_rx) = mpsc::channel(CMD_CHANNEL_CAP);
     let read_notify = Arc::new(Notify::new());
     let closed = Arc::new(AtomicBool::new(false));
-    let obfs =
-        (!cfg.obfs_password.is_empty()).then(|| Salamander::new(cfg.obfs_password.as_bytes()));
+    let obfs = cfg.obfs.as_ref().map(Obfs::new);
     let hop = HopState::new(
         peer,
         &cfg.hop_ports,
@@ -289,8 +288,8 @@ async fn run(
             r = st.socket.recv_from(&mut recv_buf) => {
                 match r {
                     Ok((n, from)) => {
-                        if let Some(mut dgram) = deobfs(&st, &recv_buf[..n]) {
-                            let from = st.hop.as_ref().map_or(from, |h| h.normalize_source(from));
+                        let from = st.hop.as_ref().map_or(from, |h| h.normalize_source(from));
+                        if let Some(mut dgram) = deobfs(&mut st, &recv_buf[..n], from) {
                             let info = quiche::RecvInfo { from, to: st.local };
                             if let Err(e) = conn.recv(&mut dgram, info) {
                                 tracing::debug!("hysteria2 could not receive QUIC packet: {e}");
@@ -724,22 +723,28 @@ async fn flush_send(
             Some(hop) => hop.outgoing(),
             None => info.to,
         };
-        let payload = match st.obfs.as_ref() {
-            Some(obfs) => obfs.encode(&out[..write]),
-            None => out[..write].to_vec(),
-        };
         tracing::trace!(
-            bytes = payload.len(),
+            bytes = write,
             queued = conn.dgram_send_queue_len(),
             "hysteria2 transmitting QUIC packet"
         );
-        st.socket.send_to(&payload, dest).await?;
+        let packet = &out[..write];
+        match st.obfs.as_mut() {
+            Some(obfs) => {
+                for datagram in obfs.encode(packet).datagrams() {
+                    st.socket.send_to(datagram, dest).await?;
+                }
+            }
+            None => {
+                st.socket.send_to(packet, dest).await?;
+            }
+        }
     }
 }
 
-fn deobfs(st: &State, raw: &[u8]) -> Option<Vec<u8>> {
-    match st.obfs.as_ref() {
-        Some(obfs) => obfs.decode(raw),
+fn deobfs(st: &mut State, raw: &[u8], from: SocketAddr) -> Option<Vec<u8>> {
+    match st.obfs.as_mut() {
+        Some(obfs) => obfs.decode(raw, from),
         None => Some(raw.to_vec()),
     }
 }

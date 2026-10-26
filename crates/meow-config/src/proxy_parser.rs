@@ -1144,7 +1144,8 @@ fn parse_anytls(
 /// or a concrete `ports` hopping range (mihomo accepts either, and airport
 /// subscriptions commonly omit `port` when `ports` is set; issue #377).
 /// Optional fields follow the mihomo surface supported by the in-tree Rust
-/// backend: `up`, `down`, `obfs: salamander`, `obfs-password`, `ports`,
+/// backend: `up`, `down`, `obfs: salamander | gecko`, `obfs-password`,
+/// `obfs-min-packet-size` / `obfs-max-packet-size` (gecko only), `ports`,
 /// `hop-interval`, `sni`, `skip-cert-verify`, `fingerprint`, `udp`, and
 /// `fast-open`.
 ///
@@ -1154,7 +1155,8 @@ fn parse_anytls(
 /// - no usable port: `port` absent (or 0) and `ports` absent or wildcard.
 /// - `port == 0` with no `ports` (mihomo: "invalid port").
 /// - empty `password` — caught downstream by `Hy2Adapter::new`.
-/// - unsupported security/transport options (`gecko`, mTLS, ECH, realm).
+/// - gecko packet sizes outside `min <= max <= 2048`.
+/// - unsupported security/transport options (mTLS, ECH, realm).
 ///
 /// upstream: `adapter/outbound/hysteria2.go`
 #[cfg(feature = "hysteria2")]
@@ -1162,7 +1164,7 @@ fn parse_hysteria2(
     name: &str,
     config: &HashMap<String, serde_json::Value>,
 ) -> std::result::Result<meow_proxy::Hy2Adapter, String> {
-    use meow_proxy::{Hy2HopInterval, Hy2Obfs, Hy2Options};
+    use meow_proxy::{Hy2HopInterval, Hy2Options};
 
     let server = config
         .get("server")
@@ -1189,17 +1191,7 @@ fn parse_hysteria2(
     let up_bps = parse_hy2_bandwidth_field(name, "up", config.get("up"))?;
     let down_bps = parse_hy2_bandwidth_field(name, "down", config.get("down"))?;
 
-    let obfs_raw = optional_nonempty_str(config, "obfs");
-    let obfs = match obfs_raw.as_deref() {
-        None => None,
-        Some("salamander") => Some(Hy2Obfs::Salamander),
-        Some("gecko") => {
-            return Err(format!(
-                "hysteria2[{name}]: obfs 'gecko' is not supported by the Rust backend"
-            ));
-        }
-        Some(other) => return Err(format!("hysteria2[{name}]: unknown obfs type: {other}")),
-    };
+    let obfs = parse_hy2_obfs(name, config)?;
     let obfs_password = optional_nonempty_str(config, "obfs-password");
     if obfs.is_some() && obfs_password.is_none() {
         return Err(format!("hysteria2[{name}]: missing obfs-password"));
@@ -1232,6 +1224,41 @@ fn parse_hysteria2(
         fingerprint,
         fast_open,
     })
+}
+
+#[cfg(feature = "hysteria2")]
+fn parse_hy2_obfs(
+    name: &str,
+    config: &HashMap<String, serde_json::Value>,
+) -> std::result::Result<Option<meow_proxy::Hy2Obfs>, String> {
+    use meow_proxy::Hy2Obfs;
+
+    match optional_nonempty_str(config, "obfs").as_deref() {
+        None => Ok(None),
+        Some("salamander") => Ok(Some(Hy2Obfs::Salamander)),
+        Some("gecko") => Ok(Some(Hy2Obfs::Gecko {
+            min_packet_size: parse_hy2_packet_size(name, config, "obfs-min-packet-size")?,
+            max_packet_size: parse_hy2_packet_size(name, config, "obfs-max-packet-size")?,
+        })),
+        Some(other) => Err(format!("hysteria2[{name}]: unknown obfs type: {other}")),
+    }
+}
+
+/// `obfs-min-packet-size` / `obfs-max-packet-size`: absent or `0` keeps the
+/// default; `Hy2Adapter::new` resolves and range-checks the pair.
+#[cfg(feature = "hysteria2")]
+fn parse_hy2_packet_size(
+    name: &str,
+    config: &HashMap<String, serde_json::Value>,
+    key: &str,
+) -> std::result::Result<u16, String> {
+    match config.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(0),
+        Some(value) => value
+            .as_u64()
+            .and_then(|size| u16::try_from(size).ok())
+            .ok_or_else(|| format!("hysteria2[{name}]: {key} must be a byte count, got {value}")),
+    }
 }
 
 #[cfg(feature = "hysteria2")]
@@ -1543,12 +1570,7 @@ fn reject_unsupported_hy2_options(
     name: &str,
     config: &HashMap<String, serde_json::Value>,
 ) -> std::result::Result<(), String> {
-    for key in [
-        "certificate",
-        "private-key",
-        "obfs-min-packet-size",
-        "obfs-max-packet-size",
-    ] {
+    for key in ["certificate", "private-key"] {
         if config.contains_key(key) {
             return Err(format!(
                 "hysteria2[{name}]: '{key}' is not supported by the Rust backend"
@@ -4085,15 +4107,51 @@ tls: true
                 "password must not be empty",
             ),
             (
-                "gecko obfs (mihomo divergence: unsupported)",
+                "gecko without obfs-password",
+                "name: jp-hy2\n\
+                 type: hysteria2\n\
+                 server: 1.2.3.4\n\
+                 port: 443\n\
+                 password: secret\n\
+                 obfs: gecko\n",
+                "missing obfs-password",
+            ),
+            (
+                "gecko min above max",
                 "name: jp-hy2\n\
                  type: hysteria2\n\
                  server: 1.2.3.4\n\
                  port: 443\n\
                  password: secret\n\
                  obfs: gecko\n\
-                 obfs-password: secret\n",
-                "gecko",
+                 obfs-password: secret\n\
+                 obfs-min-packet-size: 1000\n\
+                 obfs-max-packet-size: 900\n",
+                "min <= max",
+            ),
+            (
+                "gecko max above 2048",
+                "name: jp-hy2\n\
+                 type: hysteria2\n\
+                 server: 1.2.3.4\n\
+                 port: 443\n\
+                 password: secret\n\
+                 obfs: gecko\n\
+                 obfs-password: secret\n\
+                 obfs-max-packet-size: 4096\n",
+                "<= 2048",
+            ),
+            (
+                "gecko non-numeric packet size",
+                "name: jp-hy2\n\
+                 type: hysteria2\n\
+                 server: 1.2.3.4\n\
+                 port: 443\n\
+                 password: secret\n\
+                 obfs: gecko\n\
+                 obfs-password: secret\n\
+                 obfs-min-packet-size: big\n",
+                "obfs-min-packet-size must be a byte count",
             ),
             (
                 "obfs without obfs-password",
@@ -4177,6 +4235,48 @@ tls: true
                - h3\n",
         );
         assert!(parse_proxy(&cfg).is_ok());
+    }
+
+    #[cfg(feature = "hysteria2")]
+    #[test]
+    fn parse_hysteria2_obfs_gecko() {
+        use meow_proxy::Hy2Obfs;
+
+        let base = "name: jp-hy2\n\
+                    type: hysteria2\n\
+                    server: 1.2.3.4\n\
+                    port: 443\n\
+                    password: secret\n\
+                    obfs-password: obfs-secret\n";
+        let obfs = |extra: &str| parse_hy2_obfs("jp-hy2", &hy2_config(&format!("{base}{extra}")));
+
+        assert_eq!(
+            obfs("obfs: gecko\n"),
+            Ok(Some(Hy2Obfs::Gecko {
+                min_packet_size: 0,
+                max_packet_size: 0,
+            }))
+        );
+        assert_eq!(
+            obfs("obfs: gecko\nobfs-min-packet-size: 600\nobfs-max-packet-size: 900\n"),
+            Ok(Some(Hy2Obfs::Gecko {
+                min_packet_size: 600,
+                max_packet_size: 900,
+            }))
+        );
+        // mihomo reads the sizes only for gecko.
+        assert_eq!(
+            obfs("obfs: salamander\nobfs-min-packet-size: 600\n"),
+            Ok(Some(Hy2Obfs::Salamander))
+        );
+
+        for extra in [
+            "obfs: gecko\n",
+            "obfs: gecko\nobfs-min-packet-size: 600\nobfs-max-packet-size: 900\n",
+        ] {
+            let cfg = hy2_config(&format!("{base}{extra}"));
+            assert!(parse_proxy(&cfg).is_ok(), "{extra}");
+        }
     }
 
     #[cfg(feature = "hysteria2")]

@@ -81,6 +81,14 @@ the canonical, in-repo source a release is cut from.
   migrated mihomo-style `tls://8.8.8.8#PROXY` configs should switch to
   `?proxy=PROXY`. Plain DNS keeps `#PROXY`; `?` sections on unencrypted
   entries are rejected.
+- **Gecko obfuscation for Hysteria2** (`obfs: gecko`): Hysteria2 nodes
+  configured with Gecko used to fail to load; they now connect. Gecko is
+  the official Hysteria 2 obfuscation (v2.10.0+) that mihomo, Surge and
+  sing-box also support: Salamander, plus splitting each QUIC handshake
+  packet into 2–8 randomly padded datagrams. `obfs-min-packet-size` and
+  `obfs-max-packet-size` set the padded size range (defaults 512 and
+  1200, at most 2048). Both ends must use Gecko; a Salamander server does
+  not accept a Gecko client, nor the other way round.
 
 ### Changed
 

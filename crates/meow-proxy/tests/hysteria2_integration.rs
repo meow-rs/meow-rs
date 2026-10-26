@@ -1,18 +1,22 @@
 #![cfg(feature = "hysteria2")]
 
 use meow_common::{Metadata, Network, ProxyAdapter, ProxyPacketConn};
-use meow_proxy::{Hy2Adapter, Hy2Options};
+use meow_proxy::{Hy2Adapter, Hy2Obfs, Hy2Options};
+use std::fmt::Write as _;
 use std::fs::File;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::time::{sleep, timeout, Duration, Instant};
 
-const IMAGE_HYSTERIA: &str = "tobyxdd/hysteria:v2.9.2";
+// Gecko obfs needs v2.10.0+.
+const IMAGE_HYSTERIA: &str = "tobyxdd/hysteria:v2.13.0";
 const PASSWORD: &str = "test-hysteria2-password";
+const OBFS_PASSWORD: &str = "test-hysteria2-obfs-password";
 const T: Duration = Duration::from_secs(30);
 
 fn docker_required() -> bool {
@@ -60,7 +64,7 @@ impl Drop for HysteriaServer {
     }
 }
 
-fn write_server_files(dir: &Path, port: u16) -> PathBuf {
+fn write_server_files(dir: &Path, port: u16, obfs: Option<Hy2Obfs>) -> PathBuf {
     let status = Command::new("openssl")
         .args([
             "req",
@@ -89,7 +93,7 @@ fn write_server_files(dir: &Path, port: u16) -> PathBuf {
     let cert = dir.join("server.crt");
     let key = dir.join("server.key");
     let config_path = dir.join("config.yaml");
-    let config = format!(
+    let mut config = format!(
         concat!(
             "listen: 127.0.0.1:{port}\n",
             "tls:\n",
@@ -112,6 +116,23 @@ fn write_server_files(dir: &Path, port: u16) -> PathBuf {
         key = key.display(),
         password = PASSWORD,
     );
+    match obfs {
+        None => {}
+        Some(Hy2Obfs::Salamander) => write!(
+            config,
+            "obfs:\n  type: salamander\n  salamander:\n    password: {OBFS_PASSWORD}\n"
+        )
+        .unwrap(),
+        Some(Hy2Obfs::Gecko {
+            min_packet_size,
+            max_packet_size,
+        }) => write!(
+            config,
+            "obfs:\n  type: gecko\n  gecko:\n    password: {OBFS_PASSWORD}\n    \
+             minPacketSize: {min_packet_size}\n    maxPacketSize: {max_packet_size}\n"
+        )
+        .unwrap(),
+    }
     std::fs::write(&config_path, config).unwrap();
     config_path
 }
@@ -137,7 +158,14 @@ fn ensure_hysteria_binary(dir: &Path) -> Option<PathBuf> {
         return None;
     }
 
-    let extract_name = format!("meow-hy2-extract-{}", std::process::id());
+    // Unique per call: `cargo test` runs this file's tests on parallel threads
+    // of one process.
+    static EXTRACTS: AtomicUsize = AtomicUsize::new(0);
+    let extract_name = format!(
+        "meow-hy2-extract-{}-{}",
+        std::process::id(),
+        EXTRACTS.fetch_add(1, Ordering::Relaxed)
+    );
     let _ = Command::new("docker")
         .args(["rm", "-f", &extract_name])
         .stdout(Stdio::null())
@@ -179,7 +207,7 @@ fn ensure_hysteria_binary(dir: &Path) -> Option<PathBuf> {
     Some(bin)
 }
 
-fn start_hysteria_server(port: u16) -> Option<HysteriaServer> {
+fn start_hysteria_server(port: u16, obfs: Option<Hy2Obfs>) -> Option<HysteriaServer> {
     // The Docker image only yields a Linux binary; any platform can run with a
     // native binary supplied through MEOW_HYSTERIA_BIN.
     if !cfg!(target_os = "linux") && std::env::var_os("MEOW_HYSTERIA_BIN").is_none() {
@@ -196,7 +224,7 @@ fn start_hysteria_server(port: u16) -> Option<HysteriaServer> {
         skip_or_panic("failed to locate hysteria server binary");
         return None;
     };
-    let config_path = write_server_files(dir.path(), port);
+    let config_path = write_server_files(dir.path(), port, obfs);
     let log_path = dir.path().join("server.log");
     let log_file = match File::create(&log_path) {
         Ok(file) => file,
@@ -286,7 +314,7 @@ async fn start_udp_echo_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
     (addr, handle)
 }
 
-fn adapter(port: u16) -> Hy2Adapter {
+fn adapter(port: u16, obfs: Option<Hy2Obfs>) -> Hy2Adapter {
     Hy2Adapter::new(Hy2Options {
         name: "docker-hy2".into(),
         server: "127.0.0.1".into(),
@@ -297,8 +325,8 @@ fn adapter(port: u16) -> Hy2Adapter {
         udp: true,
         up_bps: 10_000_000,
         down_bps: 10_000_000,
-        obfs: None,
-        obfs_password: None,
+        obfs,
+        obfs_password: obfs.map(|_| OBFS_PASSWORD.into()),
         ports: None,
         hop_interval: None,
         fingerprint: None,
@@ -333,19 +361,46 @@ async fn dial_tcp_with_retry(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hysteria2_docker_tcp_and_udp_round_trip() {
+    round_trip(None, None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hysteria2_docker_salamander_round_trip() {
+    round_trip(Some(Hy2Obfs::Salamander), Some(Hy2Obfs::Salamander)).await;
+}
+
+/// Both ends fragment their handshake packets, so a connection proves the
+/// Gecko framing in each direction. The packet sizes are sender-local: the
+/// client pads to its own range while the server keeps the defaults.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hysteria2_docker_gecko_round_trip() {
+    round_trip(
+        Some(Hy2Obfs::Gecko {
+            min_packet_size: 0,
+            max_packet_size: 0,
+        }),
+        Some(Hy2Obfs::Gecko {
+            min_packet_size: 600,
+            max_packet_size: 900,
+        }),
+    )
+    .await;
+}
+
+async fn round_trip(server_obfs: Option<Hy2Obfs>, client_obfs: Option<Hy2Obfs>) {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_test_writer()
         .try_init();
     let server_port = free_udp_port();
-    let Some(server) = start_hysteria_server(server_port) else {
+    let Some(server) = start_hysteria_server(server_port, server_obfs) else {
         return;
     };
     sleep(Duration::from_millis(500)).await;
     let (tcp_echo, _tcp_h) = start_tcp_echo_server().await;
     let (tcp_banner, _tcp_banner_h) = start_tcp_banner_server().await;
     let (udp_echo, _udp_h) = start_udp_echo_server().await;
-    let adapter = adapter(server_port);
+    let adapter = adapter(server_port, client_obfs);
 
     // Fast Open must send the TCP request while dialing, even when the local
     // client has no bytes to write. Otherwise server-speaks-first protocols
