@@ -41,7 +41,10 @@ jobs:
         run: bash tests/test_luci_meow.sh
 
   dashboard:
-    runs-on: ubuntu-latest
+    # Playwright 1.58.2 (tests/dashboard/package.json) cannot install its
+    # browser dependencies on ubuntu-26.04, which `ubuntu-latest` is moving
+    # to; return to `ubuntu-latest` with a Playwright that supports it.
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: tests/dashboard
