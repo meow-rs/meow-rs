@@ -72,8 +72,9 @@ jobs:
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-latest
             desktop: true
-            # aarch64: hard gate — release fails if minimal binary exceeds 8 MiB
-            minimal_budget_bytes: 8388608
+            # aarch64: hard gate — release fails if minimal binary exceeds
+            # 8.5 MiB (ADR-0007 §2, amendment A1)
+            minimal_budget_bytes: 8912896
             minimal_soft_gate: false
             # Static musl binary → one build serves several OpenWrt arch
             # labels; the .ipk/.apk differ only in the architecture field

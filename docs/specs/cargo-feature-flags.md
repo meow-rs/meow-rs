@@ -90,7 +90,7 @@ Per ADR-0007 §2 (confirmed). Target = stripped binary, no UPX, `minimal` featur
 
 | Target | Default build | Minimal build | Gate |
 |--------|--------------|---------------|------|
-| `aarch64-unknown-linux-musl` | ≤ 20 MiB | ≤ 8 MiB | **hard** — release fails if exceeded |
+| `aarch64-unknown-linux-musl` | ≤ 20 MiB | ≤ 8.5 MiB | **hard** — release fails if exceeded |
 | `mipsel-unknown-linux-musl` | ≤ 20 MiB | ≤ 7 MiB | **soft** — release emits warning, does not fail |
 | `x86_64-unknown-linux-musl` | ≤ 20 MiB | not gated | informational only |
 
@@ -99,6 +99,8 @@ Per ADR-0007 §2 (confirmed). Target = stripped binary, no UPX, `minimal` featur
   after OpenWRT base; 7 MiB fits with overlayfs + config + logs.
 - aarch64 8 MiB: ~8% codegen headroom vs mipsel; aarch64 routers have ≥ 64 MiB
   storage, leaving room for one additional small-protocol addition before amendment.
+  Raised to 8.5 MiB by ADR-0007 amendment A1 (2026-10-27) after the YAML backend
+  migration.
 - Default 16–20 MiB: no hard cap on full builds today; track via informational step.
 
 **Step 0 prerequisite (ADR-0007 §Migration step 0):** these budgets are only
@@ -140,7 +142,7 @@ None — new capability.
 
 1. `cargo build --no-default-features --features minimal --target aarch64-unknown-linux-musl`
    compiles without errors.
-2. Stripped minimal binary for `aarch64-musl` is ≤ 8 MiB (hard gate — CI fails if exceeded).
+2. Stripped minimal binary for `aarch64-musl` is ≤ 8.5 MiB (hard gate — CI fails if exceeded).
 3. Stripped minimal binary for `mipsel-musl` is ≤ 7 MiB (soft gate — CI emits warning, does not fail).
 4. `cargo test --lib` passes for both `full` (default) and `minimal` feature sets.
 5. `cargo hack --feature-powerset check` passes for `meow-proxy`,

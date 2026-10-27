@@ -125,9 +125,11 @@ targets) after release build with the workspace defaults from §3.
 
 | Target | `minimal` cap | `default` cap |
 |--------|--------------:|--------------:|
-| `aarch64-unknown-linux-musl` | **8 MiB** (8 388 608 B) | **18 MiB** (18 874 368 B) |
+| `aarch64-unknown-linux-musl` | **8.5 MiB** (8 912 896 B)¹ | **18 MiB** (18 874 368 B) |
 | `mipsel-unknown-linux-musl` | **7 MiB** (7 340 032 B) | **16 MiB** (16 777 216 B) |
 | `x86_64-unknown-linux-musl` | **8 MiB** (8 388 608 B) | **20 MiB** (20 971 520 B) |
+
+¹ 8 MiB (8 388 608 B) until [amendment A1](#a1--2026-10-27-aarch64-minimal-8-mib--85-mib).
 
 Also: **default-build `x86_64-linux-musl` MUST be ≤ the current Go mihomo
 release for the same target** (ADR-0006 §5 "Binary size" row — we ship one
@@ -144,7 +146,8 @@ headroom across M2 feature growth.
 - **aarch64 `minimal` = 8 MiB.** Slightly looser — aarch64 codegen is ~8%
   fatter than mipsel on the same LLVM IR, and most aarch64 routers have
   ≥ 64 MiB storage. 8 MiB is headroom for one new small protocol in M2+
-  without a budget amendment.
+  without a budget amendment. Raised to 8.5 MiB by amendment A1 after the
+  YAML backend migration.
 - **`default` = 16–20 MiB.** M1 current binary is ~14–17 MiB across
   x86_64 targets (engineer-b to measure and fill into
   `docs/benchmarks/hardware.md`). Budgets sit 10–20% above M1 tip to
@@ -377,6 +380,30 @@ architect commitment, the `Cargo.toml` flags are the implementation.
 - **Dynamic linking option** (bring-your-own-libc for glibc targets).
   We are explicitly static-musl in M2; revisit if a distro packager
   asks.
+
+## Amendment log
+
+### A1 — 2026-10-27: aarch64 `minimal` 8 MiB → 8.5 MiB
+
+[#802](https://github.com/meow-rs/meow-rs/pull/802) replaced
+`serde_norway` and `unsafe-libyaml-norway` with `serde-saphyr` 2.0, a
+pure-Rust parser (`#![forbid(unsafe_code)]`) that rejects duplicate keys
+and enforces a depth budget. It took the stripped aarch64-musl `minimal`
+binary from 8 062 264 B (989a46f) to 8 626 368 B (45a78dd).
+[#827](https://github.com/meow-rs/meow-rs/pull/827) won back 198 152 B by
+walking `RawConfig` through a small handwritten deserializer over a
+span-carrying tree, instead of saphyr's state machines monomorphized per
+`Raw*` type. That leaves 8 428 216 B at 4201881 (Alpha run 40520346639),
+39 608 B (0.47%) over 8 MiB. Of what the migration still adds (about
+516 KB stripped on x86_64), the biggest blocks are saphyr's parser
+(`granit-parser`, ~100 KB) and its error renderer (`annotate-snippets`,
+~66 KB). Saphyr reaches both from its own code paths, so meow cannot drop
+them. Cuts left on the meow side each cost something: routing provider and rule-set
+payloads through the tree raises their transient memory, and saving configs
+through `serde_json::Value` loses key order. 8.5 MiB leaves 484 680 B
+free at 4201881, against 326 344 B before #802, which keeps the §2 promise
+of room for one new small protocol. The storage argument still holds:
+0.5 MiB is under 1% of the ≥ 64 MiB that these routers carry.
 
 ## References
 

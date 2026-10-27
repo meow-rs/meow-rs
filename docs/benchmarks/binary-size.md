@@ -26,9 +26,12 @@ Feature set measured:
 
 | Target | Feature set | Budget | Gate |
 |--------|------------|--------|------|
-| `aarch64-unknown-linux-musl` | minimal | ≤ 8 MiB (8,388,608 B) | **hard** (CI fails) |
+| `aarch64-unknown-linux-musl` | minimal | ≤ 8.5 MiB (8,912,896 B)¹ | **hard** (CI fails) |
 | `mipsel-unknown-linux-musl` | minimal | ≤ 7 MiB (7,340,032 B) | **soft** (CI warns) |
 | `x86_64-unknown-linux-musl` | minimal | — | informational |
+
+¹ 8 MiB (8,388,608 B) until ADR-0007 amendment A1 (2026-10-27); the
+measurements below were taken against that budget.
 
 ## Measurements
 
