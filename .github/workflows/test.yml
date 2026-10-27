@@ -615,7 +615,8 @@ jobs:
         with:
           version: 0.13.0
 
-      - run: cargo install --locked cargo-zigbuild
+      # Same pin as build.yml (see the comment there).
+      - run: cargo install --locked cargo-zigbuild --version 0.23.2
 
       - name: OpenWrt Docker e2e tests
         env:
