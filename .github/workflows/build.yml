@@ -39,6 +39,12 @@ on:
 permissions:
   contents: read
 
+env:
+  # Pinned; see the install step for why. The rust-cache key carries it:
+  # boring-sys's cached CMake build records the wrappers' versioned path
+  # (~/.cache/cargo-zigbuild/<version>/...), which a version change removes.
+  CARGO_ZIGBUILD_VERSION: "0.23.2"
+
 jobs:
   build:
     name: Build ${{ matrix.target }}
@@ -149,7 +155,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-          key: release-${{ matrix.target }}
+          key: release-${{ matrix.target }}-zigbuild-${{ env.CARGO_ZIGBUILD_VERSION }}
 
       - name: Install cargo-zigbuild and zig
         if: runner.os == 'Linux'
@@ -163,7 +169,7 @@ jobs:
       # first compiles of it race in zig's cache (`FileNotFound`), which
       # intermittently fails boring-sys's CMake compiler check on armv7.
       # Lift the pin once upstream builds the shim race-free.
-      - run: cargo install --locked cargo-zigbuild --version 0.23.2
+      - run: cargo install --locked cargo-zigbuild --version "$CARGO_ZIGBUILD_VERSION"
         if: runner.os == 'Linux'
 
       - name: Build release binary

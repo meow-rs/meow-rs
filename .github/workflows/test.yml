@@ -21,6 +21,9 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Same pin as build.yml (see the comments there); the openwrt job's
+  # rust-cache key carries it for the same reason.
+  CARGO_ZIGBUILD_VERSION: "0.23.2"
 
 jobs:
   luci:
@@ -108,7 +111,10 @@ jobs:
         run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 
   test:
-    runs-on: ubuntu-latest
+    # Ubuntu 26.04 (where `ubuntu-latest` is moving) no longer packages
+    # simple-obfs, which the shadowsocks_integration obfs tests need. The
+    # cache key keeps this job off caches built against 26.04's newer glibc.
+    runs-on: ubuntu-24.04
     needs: lint
     steps:
       - uses: actions/checkout@v5
@@ -118,6 +124,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+          key: ubuntu-24.04
 
       # cargo-nextest: per-test process isolation + `--retries 2 --no-fail-fast` absorbs
       # the tail-latency/UDP-drop flakes these real-I/O suites are prone to
@@ -611,15 +618,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-          key: openwrt-e2e
+          key: openwrt-e2e-zigbuild-${{ env.CARGO_ZIGBUILD_VERSION }}
 
       - name: Install cargo-zigbuild and zig
         uses: mlugg/setup-zig@v1
         with:
           version: 0.13.0
 
-      # Same pin as build.yml (see the comment there).
-      - run: cargo install --locked cargo-zigbuild --version 0.23.2
+      - run: cargo install --locked cargo-zigbuild --version "$CARGO_ZIGBUILD_VERSION"
 
       - name: OpenWrt Docker e2e tests
         env:
