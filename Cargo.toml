@@ -203,7 +203,7 @@ regex = "1"
 bytes = "1"
 
 # Compression (mrs geosite / rule-provider binary format)
-zstd = "0.13"
+zstd = "0.14"
 
 # Randomness
 rand = "0.9"

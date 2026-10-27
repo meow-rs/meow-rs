@@ -334,6 +334,15 @@ the canonical, in-repo source a release is cut from.
 
 ### Security
 
+- **`zstd` 0.14.3 for `.mrs` rule sets and geosite**: meow-rules moves from
+  zstd 0.13.3 / zstd-safe 7.3.0 to 0.14.3 / 8.2.0, which are patched for
+  RUSTSEC-2026-0391 and RUSTSEC-2026-0395 to -0406. None of them is
+  reachable here: meow decodes each payload with a fresh
+  `zstd::stream::read::Decoder`, which the one decoding-side flaw (-0403,
+  legacy frames) spares, and never uses context reuse (`with_context`),
+  dictionaries, the seekable format, multithreaded compression or
+  dictionary training. The bundled libzstd stays 1.5.7, and no code
+  changes.
 - **Distrust the compromised eMudhra intermediates by key**: every
   chain-verifying TLS client (`TlsLayer` for TLS proxies, DoH/DoT,
   subscriptions and rule/geodata fetches; the hysteria2 and TrustTunnel
