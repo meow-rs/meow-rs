@@ -19,7 +19,8 @@ a `tracing` layer that fans events to connected clients (for logs) and a
 periodic memory poll (for memory). G-7, G-8, G-9 are each under 10 LOC.
 
 All five are compatible with the existing `AppState` shape — no new
-crate deps beyond `axum-extra` (WebSocket) and `sysinfo` (RSS), both
+crate deps beyond `axum-extra` (WebSocket) and `sysinfo` (RSS,
+non-Linux only), both
 of which already appear in the Rust ecosystem and are zero-unsafe-code
 wrappers.
 

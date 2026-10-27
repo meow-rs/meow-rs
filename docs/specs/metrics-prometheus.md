@@ -5,7 +5,7 @@ Owner: pm
 Tracks roadmap item: **M1.H-2**
 Depends on: none beyond existing `Statistics` struct and Axum router.
 See also: [`docs/specs/api-logs-websocket.md`](api-logs-websocket.md) —
-shares `sysinfo` RSS probe added in M1.G-4.
+shares the platform-split RSS probe added in M1.G-4.
 Upstream reference: `hub/server.go` (exposes `/debug/vars` + `expvar`);
 note that upstream Go mihomo does NOT expose a native Prometheus `/metrics`
 endpoint — Prometheus scraping is done via `clashtui` or separate exporters.
