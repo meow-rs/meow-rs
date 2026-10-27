@@ -146,10 +146,14 @@ jobs:
           rustup toolchain install "$tc" --profile minimal --no-self-update
           rustup target add --toolchain "$tc" "${{ matrix.target }}"
 
+      # The key carries the cargo-zigbuild pin below: boring-sys's CMake
+      # cache records the zigbuild wrapper paths, which are versioned, so a
+      # cache built by another zigbuild points CMAKE_ASM_COMPILER at a
+      # wrapper that no longer exists. Bump both together.
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-          key: release-${{ matrix.target }}
+          key: release-${{ matrix.target }}-zigbuild-0.23.2
 
       - name: Install cargo-zigbuild and zig
         if: runner.os == 'Linux'
