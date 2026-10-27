@@ -33,7 +33,6 @@ dashmap = { workspace = true }
 futures = { workspace = true }
 parking_lot = { workspace = true }
 subtle = "2"
-sysinfo = "0.32"
 uuid = { workspace = true }
 time = { workspace = true }
 base64 = "0.22"
@@ -43,6 +42,9 @@ smol_str = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 
 [dev-dependencies]
 serde-saphyr = { workspace = true }

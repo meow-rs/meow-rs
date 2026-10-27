@@ -34,7 +34,8 @@ In scope:
    - Active connection count.
    - Per-proxy health (`alive`, `last_delay_ms`).
    - Rule-match counters by `rule_type` and `action` label.
-   - Runtime RSS memory (reusing sysinfo from M1.G-4).
+   - Runtime RSS memory (reusing the M1.G-4 RSS read — `/proc/self/status`
+     `VmRSS:` on Linux, `sysinfo` on other platforms).
 3. `prometheus-client` crate for encoding. No global registry — use a
    per-request scrape that reads current state from `AppState`.
 4. Auth: same `require_auth` middleware as all other REST routes. Prometheus
@@ -81,7 +82,7 @@ All metrics are prefixed `meow_`.
 | `meow_proxy_alive` | gauge | `proxy_name`, `adapter_type` | 1 = alive, 0 = dead. One series per configured proxy/group. |
 | `meow_proxy_delay_ms` | gauge | `proxy_name`, `adapter_type` | Last measured round-trip delay in milliseconds. **Omitted entirely when `last_delay = None`** (no health check has run). NOT -1. |
 | `meow_rules_matched_total` | counter | `rule_type`, `action` | Cumulative rule matches by type and action. |
-| `meow_memory_rss_bytes` | gauge | — | Current process RSS in bytes (from sysinfo). |
+| `meow_memory_rss_bytes` | gauge | — | Current process RSS in bytes (Linux: `/proc/self/status` `VmRSS:`; other platforms: `sysinfo`). |
 | `meow_info` | gauge | `version`, `mode` | Always 1; carries build-time labels (version string, tunnel mode). |
 
 **Label value constraints:**

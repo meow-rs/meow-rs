@@ -4111,6 +4111,29 @@ async fn get_memory(
         .expect("valid memory stream response")
 }
 
+#[cfg(target_os = "linux")]
+async fn read_rss_bytes() -> u64 {
+    // VmRSS is the same kernel counter sysinfo's Process::memory() exposes;
+    // reading /proc directly keeps sysinfo (and its rayon/disk/network
+    // default features) out of the shipped Linux binary. Deliberately not
+    // /proc/self/statm: its fields are page counts and the page size is a
+    // kernel-config variable, not a constant.
+    let Ok(status) = tokio::fs::read_to_string("/proc/self/status").await else {
+        return 0;
+    };
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            return rest
+                .split_whitespace()
+                .next()
+                .and_then(|kb| kb.parse::<u64>().ok())
+                .map_or(0, |kb| kb * 1024);
+        }
+    }
+    0
+}
+
+#[cfg(not(target_os = "linux"))]
 async fn read_rss_bytes() -> u64 {
     tokio::task::spawn_blocking(|| {
         use sysinfo::{Pid, ProcessesToUpdate, System};

@@ -258,3 +258,40 @@ the node reports `plugin 'gost-plugin' is not compiled into this build;
 rebuild with \`--features gost-plugin\``; all built-in names stay reserved in
 `is_builtin_sip003_plugin` so they can never fall through to the external
 SIP003 subprocess path.
+
+## RSS via /proc on Linux — sysinfo leaves the Linux dep graph (U2)
+
+Measured 2026-10-28 on macOS/Apple Silicon (`arm64`), rustc 1.98.1
+(`aarch64-apple-darwin`), workspace release profile (`lto = true,
+strip = true, codegen-units = 1, panic = "abort", opt-level = "z"`).
+`meow-api`'s `read_rss_bytes` now reads `VmRSS:` from `/proc/self/status`
+on Linux and keeps `sysinfo` only under
+`[target.'cfg(not(target_os = "linux"))'.dependencies]` with
+`default-features = false, features = ["system"]` — dropping `rayon` (and
+its `crossbeam-deque`/`crossbeam-epoch`/`either`/`rayon-core` subtree)
+plus sysinfo's disk/network/component code from every shipped binary.
+
+Host `default` (full) feature-set A/B, same commit-parent vs. patched
+worktree, `cargo build --locked --release -p meow-app`, `wc -c`:
+
+| Target | Feature set | Before | After | Delta |
+|--------|------------|--------|-------|-------|
+| `aarch64-apple-darwin` | default (full) | 9,967,584 B (~9.50 MiB) | 9,950,880 B (~9.49 MiB) | −16,704 B |
+
+The non-zero host delta is expected, not noise: `sysinfo` stays in the
+non-Linux graph but loses its default features, so `rayon` + the
+crossbeam subtree drops out of the macOS binary as well.
+
+| Target | Feature set | Before | After | Delta |
+|--------|------------|--------|-------|-------|
+| `x86_64-unknown-linux-musl` | default (full) | not measured — cross-link toolchain lands in U3 (`cargo zigbuild` + zig 0.13.0, see spec §4.3) | — | — |
+
+Dep-graph evidence in place of a musl binary measurement
+(`cargo tree --target x86_64-unknown-linux-musl -e normal -p meow-api`,
+before→after package-set diff): **removed** `sysinfo v0.32.1`,
+`rayon v1.12.0`, `rayon-core v1.13.0`, `crossbeam-deque v0.8.8`,
+`crossbeam-epoch v0.9.21`, `either v1.19.0`; **added** none. On
+`aarch64-apple-darwin` the same diff removes the rayon subtree but keeps
+`sysinfo v0.32.1` (now `system` component only). `Cargo.lock` is
+byte-identical — `rayon` remains locked via `criterion` (dev-dep) and
+`meow-dns`'s sysinfo dev-dep, and the lock records no target-cfg edges.
