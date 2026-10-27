@@ -699,6 +699,67 @@ mod tests {
         }
     }
 
+    /// `Proxy` whose `dial_tcp` hangs only after moving the paused clock past
+    /// `CONNECT_TIMEOUT` and resuming it. A plain `HangingProxy` under
+    /// `start_paused` would also expire the direct fallback's real loopback
+    /// connect, since tokio auto-advances while that connect waits on I/O.
+    struct ExpiringProxy {
+        health: meow_common::ProxyHealth,
+    }
+
+    #[async_trait::async_trait]
+    impl meow_common::ProxyAdapter for ExpiringProxy {
+        fn name(&self) -> &str {
+            "expire"
+        }
+        fn adapter_type(&self) -> meow_common::AdapterType {
+            meow_common::AdapterType::Direct
+        }
+        fn addr(&self) -> &str {
+            ""
+        }
+        fn support_udp(&self) -> bool {
+            false
+        }
+        async fn dial_tcp(
+            &self,
+            _m: &Metadata,
+        ) -> meow_common::Result<Box<dyn meow_common::ProxyConn>> {
+            tokio::time::advance(CONNECT_TIMEOUT + Duration::from_secs(1)).await;
+            tokio::time::resume();
+            std::future::pending().await
+        }
+        async fn dial_udp(
+            &self,
+            _m: &Metadata,
+        ) -> meow_common::Result<Box<dyn meow_common::ProxyPacketConn>> {
+            Err(meow_common::MeowError::NotSupported(
+                "expire: dial_udp".into(),
+            ))
+        }
+        fn health(&self) -> &meow_common::ProxyHealth {
+            &self.health
+        }
+    }
+
+    impl Proxy for ExpiringProxy {
+        fn alive(&self) -> bool {
+            true
+        }
+        fn alive_for_url(&self, _url: &str) -> bool {
+            true
+        }
+        fn last_delay(&self) -> u16 {
+            0
+        }
+        fn last_delay_for_url(&self, _url: &str) -> u16 {
+            0
+        }
+        fn delay_history(&self) -> Vec<meow_common::DelayHistory> {
+            Vec::new()
+        }
+    }
+
     // start_paused: tokio auto-advances the clock when every task is idle, so
     // the CONNECT_TIMEOUT fires immediately instead of after a real 15 s.
     #[tokio::test(start_paused = true)]
@@ -1348,7 +1409,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn fetch_or_direct_falls_back_on_dial_timeout() {
         let url = spawn_raw_http_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await;
-        let proxy: Arc<dyn Proxy> = Arc::new(HangingProxy {
+        let proxy: Arc<dyn Proxy> = Arc::new(ExpiringProxy {
             health: meow_common::ProxyHealth::new(),
         });
         let body = fetch_or_direct(&url, Some(&proxy), &[]).await.unwrap();
