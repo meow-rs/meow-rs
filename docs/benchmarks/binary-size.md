@@ -282,11 +282,20 @@ The non-zero host delta is expected, not noise: `sysinfo` stays in the
 non-Linux graph but loses its default features, so `rayon` + the
 crossbeam subtree drops out of the macOS binary as well.
 
+Cross-link musl A/B (zig 0.13.0 + cargo-zigbuild 0.23.2, same recipe on
+the base commit), `cargo zigbuild --release --locked --target
+<triple> --bin meow`, `wc -c`:
+
 | Target | Feature set | Before | After | Delta |
 |--------|------------|--------|-------|-------|
-| `x86_64-unknown-linux-musl` | default (full) | not measured — cross-link toolchain lands in U3 (`cargo zigbuild` + zig 0.13.0, see spec §4.3) | — | — |
+| `x86_64-unknown-linux-musl` | default (full) | 15,153,992 B (~14.45 MiB) | 15,080,984 B (~14.38 MiB) | −73,008 B |
+| `aarch64-unknown-linux-musl` | default (full) | 12,529,688 B (~11.95 MiB) | 12,469,280 B (~11.89 MiB) | −60,408 B |
 
-Dep-graph evidence in place of a musl binary measurement
+The musl deltas land below early estimates because `opt-level="z"` + fat
+LTO already strips most unreachable `sysinfo`/`rayon` code; what leaves
+is the reachable procfs-parsing and work-stealing surface.
+
+Dep-graph evidence
 (`cargo tree --target x86_64-unknown-linux-musl -e normal -p meow-api`,
 before→after package-set diff): **removed** `sysinfo v0.32.1`,
 `rayon v1.12.0`, `rayon-core v1.13.0`, `crossbeam-deque v0.8.8`,
