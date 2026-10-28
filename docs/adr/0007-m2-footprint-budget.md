@@ -213,7 +213,9 @@ A soft-target overrun is a signal, not a block.
 
 Per-PR CI also measures and posts for all three targets, but does NOT
 fail the build (same as perf — feature PRs can carry temporary size
-regressions that land after an optimisation PR follows).
+regressions that land after an optimisation PR follows). *Amended
+2026-10-28: per-PR CI now fails on a hard-cap overrun; see the addendum
+at the end.*
 
 ### 5. Size attribution — `cargo-bloat` on every release
 
@@ -329,7 +331,7 @@ risk. Soft caps rot into "fail next release" every release.
 
 Fail every PR that grows any cap. **Rejected.** Legitimate refactors
 briefly grow size before a follow-up optimisation lands. Release-tag gate
-is the right level (§4).
+is the right level (§4). *Reversed by the 2026-10-28 addendum.*
 
 ## Migration
 
@@ -377,6 +379,29 @@ architect commitment, the `Cargo.toml` flags are the implementation.
 - **Dynamic linking option** (bring-your-own-libc for glibc targets).
   We are explicitly static-musl in M2; revisit if a distro packager
   asks.
+
+## Addendum (2026-10-28): the hard gate also runs on pull requests
+
+§4 put the gate on the release workflow and A.6 rejected a per-PR gate.
+In practice the gate already runs on every merge: `alpha.yml` runs
+`build.yml`, which holds the size check, on each push to `main`. A PR
+that crosses a hard cap therefore turns `main` red right after it
+merges, not at the next tag. #802 did this on 2026-10-26: it took the
+aarch64-musl `minimal` binary past 8,388,608 B, and Alpha on `main`
+stayed red, blocking the release, until #833 brought the binary to
+7,875,512 B on 2026-10-28.
+
+The `size` job in `test.yml` now runs the same `minimal` build on each
+pull request's merge commit and applies the same check. It reads the
+cap and gate class from the target's entry in `build.yml`, so the two
+checks cannot drift apart. It covers aarch64-unknown-linux-musl, the
+only target `build.yml` gates today. The PR check rejects nothing new:
+a PR it fails would have broken `main`. It only moves the failure
+before the merge.
+
+A.6's case, a change that grows the binary before a follow-up shrinks
+it, goes through §6: the PR carries a cap amendment, and the follow-up
+can bring the cap back down with a reduction amendment.
 
 ## References
 

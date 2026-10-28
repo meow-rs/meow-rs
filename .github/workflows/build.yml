@@ -74,7 +74,9 @@ jobs:
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-latest
             desktop: true
-            # aarch64: hard gate — release fails if minimal binary exceeds 8 MiB
+            # aarch64: hard gate — release fails if minimal binary exceeds 8 MiB.
+            # test.yml's `size` job reads this entry's budget and gate class
+            # to run the same check on pull requests.
             minimal_budget_bytes: 8388608
             minimal_soft_gate: false
             # Static musl binary → one build serves several OpenWrt arch

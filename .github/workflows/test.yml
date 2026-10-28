@@ -654,3 +654,83 @@ jobs:
           MEOW_REQUIRE_DOCKER: "1"
         run: |
           APK="$HOME/.cache/apk-tools/apk" bash tests/test_openwrt_apk.sh
+
+  # ADR-0007 size gate before merge (see the 2026-10-28 addendum there).
+  # Alpha runs build.yml on every push to main, and build.yml fails when the
+  # aarch64-musl `minimal` binary is over its cap, so a PR that crosses the
+  # cap used to turn main red only after merging (#802). This job runs the
+  # same build on the PR's merge commit and the same check against the cap
+  # it reads from build.yml.
+  size:
+    runs-on: ubuntu-latest
+    needs: lint
+    env:
+      TARGET: aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v5
+
+      # Same reasoning as the openwrt job: add the target to the pinned
+      # toolchain, not to `@stable`.
+      - name: Read pinned toolchain channel
+        id: tc
+        run: |
+          tc=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n1)
+          if [ -z "$tc" ]; then
+            echo "::error::could not parse channel from rust-toolchain.toml"
+            exit 1
+          fi
+          echo "channel=$tc" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.tc.outputs.channel }}
+          targets: ${{ env.TARGET }}
+
+      # Keyed on the cargo-zigbuild pin, as in build.yml (see the comment
+      # there).
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          key: size-${{ env.TARGET }}-zigbuild-0.23.2
+
+      - name: Install cargo-zigbuild and zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.13.0
+
+      # Same pin as build.yml (see the comment there).
+      - run: cargo install --locked cargo-zigbuild --version 0.23.2
+
+      - name: Build minimal release binary
+        run: |
+          cargo zigbuild --release --locked \
+            --no-default-features --features minimal \
+            --target "$TARGET" \
+            --bin meow
+
+      - name: Minimal binary size check
+        run: |
+          # The cap and its gate class live on the target's matrix entry in
+          # build.yml; read them from there so the two checks cannot drift.
+          read -r cap soft < <(awk -v t="$TARGET" '
+            $1 == "-" && $2 == "target:" { f = ($3 == t); next }
+            f && $1 == "minimal_budget_bytes:" { cap = $2 }
+            f && $1 == "minimal_soft_gate:" { soft = $2 }
+            END { print cap, soft }
+          ' .github/workflows/build.yml)
+          case "$cap" in
+            "" | 0 | *[!0-9]*)
+              echo "::error::no minimal_budget_bytes for $TARGET in build.yml"
+              exit 1
+              ;;
+          esac
+          size=$(stat -c%s "target/$TARGET/release/meow")
+          echo "$TARGET minimal: $size bytes, cap $cap bytes, headroom $((cap - size)) bytes" | tee -a "$GITHUB_STEP_SUMMARY"
+          if [ "$size" -gt "$cap" ]; then
+            if [ "$soft" = "true" ]; then
+              echo "::warning::$TARGET minimal binary $size bytes exceeds soft budget $cap bytes (ADR-0007 §1)"
+            else
+              echo "::error::$TARGET minimal binary $size bytes exceeds hard budget $cap bytes by $((size - cap)) bytes (ADR-0007 §2)"
+              exit 1
+            fi
+          fi
