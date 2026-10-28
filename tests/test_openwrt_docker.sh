@@ -370,6 +370,12 @@ rexec "uci add_list meow.tproxy.bypass_mac=$CLIENT_MAC_UC; uci commit meow; /usr
 check "bypass MAC loaded into nft set" "$CLIENT_MAC" rexec 'nft list set inet meow_gateway bypass_src'
 check "bypass precedes DNS hijack" "BYPASS_FIRST" rexec 'nft list chain inet meow_gateway dstnat | awk "/bypass_src/{b=NR} /dport 53/{d=NR} END{if (b && d && b < d) print \"BYPASS_FIRST\"}"'
 check "bypass skips UDP tproxy" "bypass_src" rexec 'nft list chain inet meow_gateway mangle_tproxy'
+# Issue #743: UDP/53 bypasses UDP TPROXY even with DNS hijacking off.
+rexec "uci set meow.tproxy.dns_hijack=0; uci commit meow; /usr/share/meow/gateway.sh up"
+check "UDP/53 skips tproxy without dns_hijack" "dport 53 return" rexec 'nft list chain inet meow_gateway mangle_tproxy'
+check "no DNS redirect without dns_hijack" "NO_REDIRECT" rexec 'nft list chain inet meow_gateway dstnat | grep -q "dport 53 redirect" || echo NO_REDIRECT'
+rexec "uci set meow.tproxy.dns_hijack=1; uci commit meow; /usr/share/meow/gateway.sh up"
+check "UDP/53 skips tproxy with dns_hijack" "dport 53 return" rexec 'nft list chain inet meow_gateway mangle_tproxy'
 rexec 'uci del_list meow.tproxy.bypass_mac="'"$CLIENT_MAC_UC"'"; uci add_list meow.tproxy.bypass_mac="aa:bb:cc:dd:ee:ff; flush ruleset"; uci commit meow'
 check "raw UCI bypass MAC injection rejected" "REJECTED" rexec 'if /usr/share/meow/gateway.sh up; then exit 1; else echo REJECTED; fi'
 rexec 'uci delete meow.tproxy.bypass_mac; uci commit meow; /usr/share/meow/gateway.sh up'

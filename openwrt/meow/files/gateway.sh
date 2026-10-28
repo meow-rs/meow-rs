@@ -137,7 +137,12 @@ gen_rules() {
 			meta mark $ROUTING_MARK return
 			ether saddr @bypass_src return
 		NFT
-		[ "$dns_hijack" -eq 1 ] && echo "		meta l4proto udp th dport 53 return"
+		# UDP/53 never enters TPROXY: with dns_hijack on, the dstnat
+		# redirect above handles it; with it off, DNS is left alone and
+		# follows normal routing, so a query to the router's own dnsmasq
+		# is not stolen by a transparent reply socket that cannot bind
+		# :53 (issue #743).
+		echo "		meta l4proto udp th dport 53 return"
 		[ "$ipv6" -eq 1 ] || echo "		meta nfproto ipv6 return"
 		cat <<-NFT
 			fib daddr type local return
