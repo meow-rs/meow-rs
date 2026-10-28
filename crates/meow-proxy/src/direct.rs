@@ -289,6 +289,11 @@ async fn connect_with_mark(
 
         let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
         socket.set_mark(mark)?;
+        #[cfg(any(target_os = "android", target_env = "ohos"))]
+        if let Some(protector) = meow_common::socket_protector() {
+            use std::os::fd::AsRawFd;
+            protector.protect(socket.as_raw_fd())?;
+        }
         // TUN global-route loop avoidance (#375): this branch bypasses
         // `meow_common::connect_tcp`, so apply the outbound-interface
         // binding here too (no-op when none is installed).

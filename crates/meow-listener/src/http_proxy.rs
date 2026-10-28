@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, warn, Instrument};
 
 pub async fn handle_http(
     tunnel: &Tunnel,
@@ -166,6 +166,23 @@ async fn handle_http_inner(
     let target = request.target;
 
     if method.eq_ignore_ascii_case("CONNECT") {
+        let diagnostic_probe = if option_env!("PAWS_RAW_ENGINE_DIAGNOSTIC") == Some("1")
+            && in_name == "paws-meow-benchmark"
+            && src_addr.ip().is_loopback()
+        {
+            crate::benchmark_probe::extract_probe_id(
+                request.headers.iter().map(|h| (h.name, h.value)),
+            )
+        } else {
+            None
+        };
+        if let Some(probe_id) = diagnostic_probe {
+            info!(
+                probe_id,
+                source_port = src_addr.port(),
+                "socket-trace event=benchmark-probe"
+            );
+        }
         // HTTPS CONNECT
         let (host, port) = parse_host_port(target, 443);
         if !meow_common::is_valid_host(host) {
@@ -209,7 +226,14 @@ async fn handle_http_inner(
         // 200 OK (RFC 7230 forbids this but real clients do it); the shared
         // path re-emits them to the remote before the bidirectional copy.
         let inner = tunnel.inner();
-        route_inbound_tcp(inner, stream, metadata, &leftover).await;
+        let route = route_inbound_tcp(inner, stream, metadata, &leftover);
+        if let Some(probe_id) = diagnostic_probe {
+            route
+                .instrument(tracing::info_span!("paws_flow", probe_id))
+                .await;
+        } else {
+            route.await;
+        }
     } else {
         // Plain HTTP proxy (GET/POST/etc via proxy)
         let url = target;
