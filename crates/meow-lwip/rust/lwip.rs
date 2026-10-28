@@ -11,6 +11,15 @@
     unnecessary_transmutes,
     reason = "bindgen's signed-bitfield accessors; generated code"
 )]
+// Rust 1.99 checks extern declarations of the allocator symbols std uses:
+// bindgen declares libc's `malloc`/`realloc` with `c_ulong` sizes, which
+// are `usize`-sized on the Unix targets lwIP builds for. `unknown_lints`
+// keeps the pinned toolchain, which predates the lint, quiet.
+#![allow(unknown_lints, reason = "the lint below is new in Rust 1.99")]
+#![allow(
+    suspicious_runtime_symbol_definitions,
+    reason = "bindgen's libc malloc/realloc declarations; generated code"
+)]
 
 // Note the bindings are generated on macOS.
 // This shouldn't be problematic since we only use lwip functions from

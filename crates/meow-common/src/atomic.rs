@@ -41,25 +41,26 @@ pub type Int = i32;
 /// unreachable; on 32-bit fallback targets it is u32 and `None` is the
 /// end-of-session signal (the caller re-keys or re-dials) rather than
 /// wrapping onto IDs the peer's window has already spent.
+///
+/// A hand-written compare-exchange loop rather than `fetch_update`, which
+/// Rust 1.99 deprecates in favour of `try_update` — newer than the MSRV.
 #[inline]
 pub fn checked_increment(counter: &AtomicU) -> Option<u64> {
-    counter
-        .fetch_update(
-            std::sync::atomic::Ordering::Relaxed,
-            std::sync::atomic::Ordering::Relaxed,
-            |x| x.checked_add(1).filter(|&n| n != Uint::MAX),
-        )
-        .ok()
-        .map(|prev| {
-            // `prev + 1` cannot overflow: the filter above guarantees the
-            // stored value stayed below `Uint::MAX`.
-            #[allow(
-                clippy::useless_conversion,
-                reason = "identity on 64-bit; u32→u64 widening on mips32"
-            )]
-            let widened = u64::from(prev);
-            widened + 1
-        })
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut current = counter.load(Relaxed);
+    loop {
+        let next = current.checked_add(1).filter(|&n| n != Uint::MAX)?;
+        match counter.compare_exchange_weak(current, next, Relaxed, Relaxed) {
+            Ok(_) => {
+                #[allow(
+                    clippy::useless_conversion,
+                    reason = "identity on 64-bit; u32→u64 widening on mips32"
+                )]
+                return Some(u64::from(next));
+            }
+            Err(actual) => current = actual,
+        }
+    }
 }
 
 #[cfg(test)]
