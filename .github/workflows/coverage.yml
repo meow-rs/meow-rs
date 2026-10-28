@@ -87,9 +87,47 @@ jobs:
           sudo install -m 755 "/tmp/sing-box-${SINGBOX_VERSION}-linux-amd64/sing-box" /usr/local/bin/sing-box
           command -v sing-box
 
+      # The real-peer e2e suites (restls_e2e, jls_e2e, kcptun_e2e,
+      # trusttunnel_e2e) fail rather than skip without their peers, so build
+      # and fetch them as test.yml does. Without them `--all-features`
+      # coverage fails on every night.
+      - name: Set up Go (restls interop harness)
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: crates/meow-transport/tests/support/restls-server/go.mod
+          cache: false
+
+      - name: Build restls-server harness
+        run: go build -C crates/meow-transport/tests/support/restls-server -o "$RUNNER_TEMP/restls-server" .
+
+      - name: Set up Go (jls interop harness)
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: crates/meow-transport/tests/support/jls-server/go.mod
+          cache: false
+
+      - name: Build jls-server harness
+        run: go build -C crates/meow-transport/tests/support/jls-server -o "$RUNNER_TEMP/jls-server" .
+
+      - name: Set up Go (kcptun harness)
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: crates/meow-proxy/tests/support/kcptun-server/go.mod
+
+      - name: Build kcptun interop harness
+        working-directory: crates/meow-proxy/tests/support/kcptun-server
+        run: go build -o "$RUNNER_TEMP/kcptun-server" .
+
+      - name: Fetch official TrustTunnel endpoint (pinned, SHA256 verified)
+        run: bash scripts/fetch-trusttunnel-endpoint.sh "$RUNNER_TEMP/trusttunnel"
+
       - name: Collect coverage
         env:
           MIHOMO_REQUIRE_INTEGRATION_BINS: "1"
+          RESTLS_SERVER_BIN: ${{ runner.temp }}/restls-server
+          JLS_SERVER_BIN: ${{ runner.temp }}/jls-server
+          KCPTUN_SERVER_BIN: ${{ runner.temp }}/kcptun-server
+          TRUSTTUNNEL_SERVER_BIN: ${{ runner.temp }}/trusttunnel/trusttunnel_endpoint
         run: |
           # `--include-ignored` runs local-process integration tests (ssserver,
           # simple-obfs, embedded mock servers). Tests in

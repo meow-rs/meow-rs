@@ -3430,21 +3430,28 @@ fn classify_download_target(name: &str, map: &HashMap<SmolStr, Arc<dyn Proxy>>) 
 /// 3. **`first_named_proxy`** — the legacy `proxies[0]` behavior, kept as
 ///    the no-MATCH/no-override fallback.
 ///
-/// Only the step-3 guess may retry direct after a failed first dial: an
-/// egress from 1 or 2 is where the config routes this traffic, so its
-/// failure stays loud like a provider `proxy:` (#625) — in a region where
-/// the CDN is blocked, a dead route must not become direct egress. A
-/// `proxies[0]` that declares `dialer-proxy` is a deliberate chain, so it
-/// gets no fallback either.
+/// An egress from 2 or 3 is implied, not named for the download, so a failed
+/// first dial through it may retry direct — on first boot a MATCH group fed
+/// by proxy-providers has no members yet (their fetches are detached), and
+/// without the retry every GeoIP config would fail to start. Two cases are
+/// deliberate egress and never fall back, failing loudly like a provider
+/// `proxy:` (#625): an explicit `geodata.proxy`, and a static proxy that
+/// declares `dialer-proxy` — in a region where the CDN is blocked, a dead
+/// chain must not become direct egress. A chain behind a group cannot be
+/// seen from the raw config and keeps the group's fallback.
 pub fn resolve_geodata_egress(
     raw: &raw::RawConfig,
     geo: &GeoDataConfig,
     mode: TunnelMode,
     map: &HashMap<SmolStr, Arc<dyn Proxy>>,
 ) -> GeodataEgress {
-    let routed = |proxy: Arc<dyn Proxy>| GeodataEgress::Proxy {
+    let named = |proxy: Arc<dyn Proxy>| GeodataEgress::Proxy {
         proxy,
         direct_fallback: false,
+    };
+    let implied = |name: &str, proxy: Arc<dyn Proxy>| GeodataEgress::Proxy {
+        proxy,
+        direct_fallback: !declares_dialer_proxy(raw, name),
     };
 
     // 1. Explicit `geodata.proxy`.
@@ -3455,7 +3462,7 @@ pub fn resolve_geodata_egress(
         } else {
             match classify_download_target(name, map) {
                 DownloadTarget::Builtin(egress) => return egress,
-                DownloadTarget::Proxy(proxy) => return routed(proxy),
+                DownloadTarget::Proxy(proxy) => return named(proxy),
                 DownloadTarget::Unknown => warn!(
                     "geodata.proxy '{name}' is not a known proxy or group; \
                      falling back to the default egress"
@@ -3470,13 +3477,13 @@ pub fn resolve_geodata_egress(
         TunnelMode::Global => {
             return map
                 .get("GLOBAL")
-                .map_or(GeodataEgress::Direct, |p| routed(Arc::clone(p)));
+                .map_or(GeodataEgress::Direct, |p| implied("GLOBAL", Arc::clone(p)));
         }
         TunnelMode::Rule => {
             if let Some(target) = last_match_target(raw) {
                 match classify_download_target(target, map) {
                     DownloadTarget::Builtin(egress) => return egress,
-                    DownloadTarget::Proxy(proxy) => return routed(proxy),
+                    DownloadTarget::Proxy(proxy) => return implied(target, proxy),
                     DownloadTarget::Unknown => warn!(
                         "geodata download: MATCH target '{target}' is not a known proxy \
                          or group; falling back to the first named proxy"
@@ -3486,22 +3493,29 @@ pub fn resolve_geodata_egress(
         }
     }
 
-    // 3. Legacy default — first `proxies:` entry, a guess that may fall
-    // back direct unless it is a deliberate `dialer-proxy` chain.
-    let chained = raw
+    // 3. Legacy default — first `proxies:` entry.
+    let first = raw
         .proxies
         .as_deref()
         .and_then(<[_]>::first)
+        .and_then(|p| p.get("name"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    internal_http::first_named_proxy(raw.proxies.as_deref(), map)
+        .map_or(GeodataEgress::Direct, |proxy| implied(first, proxy))
+}
+
+/// Whether the static `proxies:` entry `name` declares a non-blank
+/// `dialer-proxy` — a deliberate chain.
+fn declares_dialer_proxy(raw: &raw::RawConfig, name: &str) -> bool {
+    raw.proxies
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .find(|p| p.get("name").and_then(serde_json::Value::as_str) == Some(name))
         .and_then(|p| p.get("dialer-proxy"))
         .and_then(serde_json::Value::as_str)
-        .is_some_and(|d| !d.trim().is_empty());
-    internal_http::first_named_proxy(raw.proxies.as_deref(), map).map_or(
-        GeodataEgress::Direct,
-        |proxy| GeodataEgress::Proxy {
-            proxy,
-            direct_fallback: !chained,
-        },
-    )
+        .is_some_and(|d| !d.trim().is_empty())
 }
 
 /// The tunnel mode a config starts in — `mode:`, `rule` when absent or
@@ -6709,7 +6723,7 @@ mod geoip_context_tests {
             "proxies:\n  - {name: pass, type: direct}\nrules:\n  - MATCH,pass\n",
             &["pass", "PASS"],
         );
-        assert_rides(&e, &map, "pass", false);
+        assert_rides(&e, &map, "pass", true);
         let (e, map) = egress("geodata:\n  proxy: pass\n", &["pass"]);
         assert_rides(&e, &map, "pass", false);
         let (e, _) = egress("rules:\n  - MATCH,PASS\n", &["pass", "PASS"]);
@@ -6733,8 +6747,8 @@ mod geoip_context_tests {
         }
     }
 
-    /// No explicit override → the LAST top-level `MATCH` target wins. It is
-    /// where the config routes traffic, so it never falls back direct.
+    /// No explicit override → the LAST top-level `MATCH` target wins, and
+    /// being implied it may fall back direct.
     #[test]
     fn geodata_proxy_match_target_is_default_egress() {
         let (e, map) = egress(
@@ -6742,7 +6756,7 @@ mod geoip_context_tests {
              rules:\n  - MATCH,early\n  - GEOIP,CN,out\n  - MATCH,out\n",
             &["p", "early", "out"],
         );
-        assert_rides(&e, &map, "out", false);
+        assert_rides(&e, &map, "out", true);
     }
 
     /// `MATCH,<built-in>` follows the built-in; `MATCH` vs `match` is
@@ -6778,8 +6792,8 @@ mod geoip_context_tests {
         assert_rides(&e, &map, "p", true);
     }
 
-    /// A guessed `proxies[0]` that is a `dialer-proxy` chain keeps its
-    /// chain: no direct fallback.
+    /// A static `dialer-proxy` chain is deliberate egress: no direct
+    /// fallback, whether it is the guessed `proxies[0]` or the MATCH target.
     #[test]
     fn geodata_proxy_chained_first_named_does_not_fall_back() {
         let (e, map) = egress(
@@ -6788,10 +6802,15 @@ mod geoip_context_tests {
             &["p", "front"],
         );
         assert_rides(&e, &map, "p", false);
+        let (e, map) = egress(
+            "proxies:\n  - {name: front, type: direct}\n  \
+             - {name: p, type: direct, dialer-proxy: front}\nrules:\n  - MATCH,p\n",
+            &["p", "front"],
+        );
+        assert_rides(&e, &map, "p", false);
     }
 
-    /// No override and no MATCH → `proxies[0]` (the legacy default), the
-    /// one guessed egress that may fall back direct.
+    /// No override and no MATCH → `proxies[0]` (the legacy default).
     #[test]
     fn geodata_proxy_no_match_uses_first_named() {
         let (e, map) = egress(
@@ -6823,11 +6842,11 @@ mod geoip_context_tests {
         let (e, _) = egress_in(yaml, TunnelMode::Direct, &["out", "GLOBAL"]);
         assert!(matches!(e, GeodataEgress::Direct), "{e:?}");
         let (e, map) = egress_in(yaml, TunnelMode::Global, &["out", "GLOBAL"]);
-        assert_rides(&e, &map, "GLOBAL", false);
+        assert_rides(&e, &map, "GLOBAL", true);
 
         let yaml = "proxies:\n  - {name: out, type: direct}\nrules:\n  - MATCH,DIRECT\n";
         let (e, map) = egress_in(yaml, TunnelMode::Global, &["out", "GLOBAL"]);
-        assert_rides(&e, &map, "GLOBAL", false);
+        assert_rides(&e, &map, "GLOBAL", true);
         let (e, _) = egress_in(yaml, TunnelMode::Global, &["out"]);
         assert!(matches!(e, GeodataEgress::Direct), "{e:?}");
 

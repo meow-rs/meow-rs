@@ -769,7 +769,9 @@ async fn refresh_without_backing_file_applies_in_memory_only() {
 /// on a timer.
 #[tokio::test]
 async fn refreshed_trusttunnel_provider_commits_with_a_dead_placeholder() {
-    let provider_address = spawn_origin("proxies:\n  - {name: invalid, type: trusttunnel, server: vpn.example.test, port: 443, username: fixture, password: test-only, quic: true}\n").await;
+    // `invalid` lacks `username`, so every feature set rejects it: a
+    // `quic: true` node alone parses under `trusttunnel-h3`.
+    let provider_address = spawn_origin("proxies:\n  - {name: invalid, type: trusttunnel, server: vpn.example.test, port: 443, password: test-only}\n").await;
     let fx = fixture("proxies: []\nproxy-groups:\n  - {name: front, type: select, proxies: [DIRECT]}\n  - {name: new-group, type: select, use: [prov]}\nrules: ['MATCH,new-group']\n").await;
     let original = Arc::clone(fx.proxy_providers.get("prov").unwrap().value());
     let live: HashMap<_, _> = fx
