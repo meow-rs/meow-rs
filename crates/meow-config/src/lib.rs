@@ -3435,10 +3435,10 @@ fn classify_download_target(name: &str, map: &HashMap<SmolStr, Arc<dyn Proxy>>) 
 /// by proxy-providers has no members yet (their fetches are detached), and
 /// without the retry every GeoIP config would fail to start. Two cases are
 /// deliberate egress and never fall back, failing loudly like a provider
-/// `proxy:` (#625): an explicit `geodata.proxy`, and a static proxy that
-/// declares `dialer-proxy` — in a region where the CDN is blocked, a dead
-/// chain must not become direct egress. A chain behind a group cannot be
-/// seen from the raw config and keeps the group's fallback.
+/// `proxy:` (#625): an explicit `geodata.proxy`, and an egress that can
+/// reach a static `dialer-proxy` chain, itself or through a group
+/// (`reaches_dialer_chain`) — in a region where the CDN is blocked, a dead
+/// chain must not become direct egress.
 pub fn resolve_geodata_egress(
     raw: &raw::RawConfig,
     geo: &GeoDataConfig,
@@ -3451,7 +3451,7 @@ pub fn resolve_geodata_egress(
     };
     let implied = |name: &str, proxy: Arc<dyn Proxy>| GeodataEgress::Proxy {
         proxy,
-        direct_fallback: !declares_dialer_proxy(raw, name),
+        direct_fallback: !reaches_dialer_chain(raw, name),
     };
 
     // 1. Explicit `geodata.proxy`.
@@ -3505,17 +3505,55 @@ pub fn resolve_geodata_egress(
         .map_or(GeodataEgress::Direct, |proxy| implied(first, proxy))
 }
 
-/// Whether the static `proxies:` entry `name` declares a non-blank
-/// `dialer-proxy` — a deliberate chain.
-fn declares_dialer_proxy(raw: &raw::RawConfig, name: &str) -> bool {
-    raw.proxies
-        .as_deref()
-        .unwrap_or(&[])
-        .iter()
-        .find(|p| p.get("name").and_then(serde_json::Value::as_str) == Some(name))
-        .and_then(|p| p.get("dialer-proxy"))
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|d| !d.trim().is_empty())
+/// Whether the outbound `name` can dial through a static `dialer-proxy`
+/// chain: a `proxies:` entry declaring a non-blank `dialer-proxy`, or a
+/// `proxy-groups:` entry that can reach one — through its `proxies:` list
+/// (recursively), or through `include-all`/`include-all-proxies`, which pull
+/// in every static proxy (counted regardless of `filter`, erring towards no
+/// fallback). A `GLOBAL` the config does not declare is synthesized over
+/// every proxy, so it counts any static chain. Nodes from proxy-providers
+/// are fetched content, not in the raw config, and are not seen.
+fn reaches_dialer_chain(raw: &raw::RawConfig, name: &str) -> bool {
+    let statics = raw.proxies.as_deref().unwrap_or(&[]);
+    let groups = raw.proxy_groups.as_deref().unwrap_or(&[]);
+    let chained = |p: &HashMap<String, serde_json::Value>| {
+        p.get("dialer-proxy")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|d| !d.trim().is_empty())
+    };
+    let any_static_chain = || statics.iter().any(chained);
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = vec![name];
+    while let Some(name) = stack.pop() {
+        if !seen.insert(name) {
+            continue;
+        }
+        if let Some(group) = groups.iter().find(|g| g.name == name) {
+            let pulls_statics =
+                group.include_all.unwrap_or(false) || group.include_all_proxies.unwrap_or(false);
+            if pulls_statics && any_static_chain() {
+                return true;
+            }
+            stack.extend(
+                group
+                    .proxies
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(String::as_str),
+            );
+        } else if let Some(p) = statics
+            .iter()
+            .find(|p| p.get("name").and_then(serde_json::Value::as_str) == Some(name))
+        {
+            if chained(p) {
+                return true;
+            }
+        } else if name == "GLOBAL" && any_static_chain() {
+            return true;
+        }
+    }
+    false
 }
 
 /// The tunnel mode a config starts in — `mode:`, `rule` when absent or
@@ -6808,6 +6846,38 @@ mod geoip_context_tests {
             &["p", "front"],
         );
         assert_rides(&e, &map, "p", false);
+    }
+
+    /// A group that can reach a static chain — a member, a nested group's
+    /// member, `include-all`, or the synthesized `GLOBAL` — gets no direct
+    /// fallback; a group of plain members keeps it.
+    #[test]
+    fn geodata_proxy_group_reaching_a_chain_does_not_fall_back() {
+        let proxies = "proxies:\n  - {name: front, type: direct}\n  \
+                       - {name: c, type: direct, dialer-proxy: front}\n  \
+                       - {name: plain, type: direct}\n";
+        let names = ["front", "c", "plain", "G", "H", "GLOBAL"];
+        for (groups, fallback) in [
+            ("  - {name: G, type: select, proxies: [plain, c]}\n", false),
+            (
+                "  - {name: H, type: select, proxies: [c]}\n  \
+                 - {name: G, type: select, proxies: [plain, H]}\n",
+                false,
+            ),
+            ("  - {name: G, type: select, include-all: true}\n", false),
+            ("  - {name: G, type: select, proxies: [plain]}\n", true),
+            (
+                "  - {name: G, type: select, proxies: [plain, G2]}\n  \
+                 - {name: G2, type: select, proxies: [G]}\n",
+                true,
+            ),
+        ] {
+            let yaml = format!("{proxies}proxy-groups:\n{groups}rules:\n  - MATCH,G\n");
+            let (e, map) = egress(&yaml, &names);
+            assert_rides(&e, &map, "G", fallback);
+        }
+        let (e, map) = egress_in(proxies, TunnelMode::Global, &names);
+        assert_rides(&e, &map, "GLOBAL", false);
     }
 
     /// No override and no MATCH → `proxies[0]` (the legacy default).

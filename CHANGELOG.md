@@ -61,8 +61,9 @@ the canonical, in-repo source a release is cut from.
   provider-fed group has no members yet), the fetch warns and retries
   once direct, a geodata-only fallback that provider and subscription
   downloads deliberately do not share. A proxy named in `geodata.proxy`,
-  and any proxy that declares `dialer-proxy`, never falls back: its
-  failure is reported instead.
+  and a route that can reach a `dialer-proxy` chain (the proxy itself,
+  or a group with such a member), never falls back: its failure is
+  reported instead.
 - **The top-level `geox-url` alias**: mihomo's flat spelling of
   `geodata.url.*` is now read too, merged per key below the explicit
   block — `geodata.url.mmdb` beats `geox-url.mmdb`, which beats the

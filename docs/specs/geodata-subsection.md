@@ -177,11 +177,13 @@ on disk.
 *Direct fallback (geodata-only opt-in):* for an implied egress from (2)
 or (3) — on first boot a MATCH group fed by proxy-providers has no members
 yet, since their fetches are detached. Never for an explicit
-`geodata.proxy`, nor for a static proxy that declares `dialer-proxy`:
-those are deliberate egress and fail loudly like a provider `proxy:`
-(#625), so where the CDN is blocked a dead chain cannot become direct
-egress. (A chain behind a group cannot be seen from the raw config and
-keeps the group's fallback.) When the FIRST request's proxy dial fails (connect phase only,
+`geodata.proxy`, nor for an egress that can reach a static `dialer-proxy`
+chain — the proxy itself, a group listing one (recursively), an
+`include-all`/`include-all-proxies` group, or a synthesized `GLOBAL` over
+a config that has one (`reaches_dialer_chain`): those are deliberate
+egress and fail loudly like a provider `proxy:` (#625), so where the CDN
+is blocked a dead chain cannot become direct egress. Nodes from
+proxy-providers are fetched content and are not seen. When the FIRST request's proxy dial fails (connect phase only,
 `CONNECT_TIMEOUT` included), `internal_http::fetch_or_direct` warns and
 restarts the fetch with no proxy. Post-dial failures (TLS, HTTP status,
 body) and redirect-hop dials never fall back — a mid-chain failure must not
