@@ -70,9 +70,14 @@ pub const INITIAL_CONNECTION_WINDOW: u32 = 16 * 1024 * 1024;
 /// client-side h2 handshake in the workspace (gRPC, h2, xhttp, sing-h2mux)
 /// goes through this so the windows cannot silently fall back to the
 /// 64 KiB default at one site but not another.
+///
+/// Server push is disabled (`SETTINGS_ENABLE_PUSH = 0`, issue #736): no
+/// client here consumes pushed streams, and left enabled a peer could park
+/// unread `PUSH_PROMISE` streams on the shared connection window.
 pub fn client_builder() -> h2::client::Builder {
     let mut builder = h2::client::Builder::new();
     builder
+        .enable_push(false)
         .initial_window_size(INITIAL_STREAM_WINDOW)
         .initial_connection_window_size(INITIAL_CONNECTION_WINDOW);
     builder
@@ -996,6 +1001,46 @@ mod io_preserve_tests {
         fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
             Poll::Ready(Err(io::Error::from_raw_os_error(self.0)))
         }
+    }
+
+    /// Decode the SETTINGS entries of a client's initial frame (issue #736).
+    async fn initial_settings(builder: h2::client::Builder) -> Vec<(u16, u32)> {
+        use tokio::io::AsyncReadExt;
+        let (client_io, mut server_io) = tokio::io::duplex(64 * 1024);
+        let handshake = tokio::spawn(async move {
+            let (_send, conn) = builder.handshake::<_, Bytes>(client_io).await.unwrap();
+            let _ = conn.await;
+        });
+        let mut preface = [0u8; 24];
+        server_io.read_exact(&mut preface).await.unwrap();
+        assert_eq!(&preface, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+        let mut head = [0u8; 9];
+        server_io.read_exact(&mut head).await.unwrap();
+        assert_eq!(head[3], 4, "first frame must be SETTINGS");
+        let len = u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize;
+        let mut payload = vec![0u8; len];
+        server_io.read_exact(&mut payload).await.unwrap();
+        handshake.abort();
+        payload
+            .as_chunks::<6>()
+            .0
+            .iter()
+            .map(|e| {
+                (
+                    u16::from_be_bytes([e[0], e[1]]),
+                    u32::from_be_bytes([e[2], e[3], e[4], e[5]]),
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn client_builder_disables_server_push() {
+        let settings = initial_settings(client_builder()).await;
+        assert!(
+            settings.contains(&(0x2, 0)),
+            "initial SETTINGS must carry ENABLE_PUSH = 0, got {settings:?}"
+        );
     }
 
     async fn handshake_errno_error() -> h2::Error {

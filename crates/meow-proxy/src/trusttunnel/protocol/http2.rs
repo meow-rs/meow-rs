@@ -27,6 +27,18 @@ pub trait StreamConnector: Send + Sync {
     async fn connect(&self) -> io::Result<Box<dyn IoStream>>;
 }
 
+/// TrustTunnel's HTTP/2 client builder. Server push is disabled
+/// (`SETTINGS_ENABLE_PUSH = 0`, issue #736): nothing consumes pushed streams.
+fn client_builder() -> h2::client::Builder {
+    let mut builder = h2::client::Builder::new();
+    builder
+        .enable_push(false)
+        .initial_window_size(131_072)
+        .initial_connection_window_size(2 * 1024 * 1024)
+        .max_send_buffer_size(128 * 1024);
+    builder
+}
+
 /// Turns a TLS stream into a pooled HTTP/2 connection.
 pub struct H2Connector(Arc<dyn StreamConnector>);
 
@@ -40,13 +52,7 @@ impl H2Connector {
 impl super::Connector for H2Connector {
     async fn connect(&self, cancel: CancellationToken) -> io::Result<Box<dyn Connection>> {
         let io = self.0.connect().await?;
-        let (sender, connection) = h2::client::Builder::new()
-            .initial_window_size(131_072)
-            .initial_connection_window_size(2 * 1024 * 1024)
-            .max_send_buffer_size(128 * 1024)
-            .handshake(io)
-            .await
-            .map_err(h2_error)?;
+        let (sender, connection) = client_builder().handshake(io).await.map_err(h2_error)?;
         let peer_limit = Arc::new(AtomicUsize::new(usize::MAX));
         let sampler = Arc::clone(&peer_limit);
         let canceled = cancel;
@@ -239,5 +245,45 @@ impl Drop for H2Stream {
         if !self.recv.is_end_stream() || !self.shutdown {
             self.send.send_reset(h2::Reason::CANCEL);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    /// Issue #736: the initial SETTINGS frame must carry ENABLE_PUSH = 0.
+    #[tokio::test]
+    async fn client_builder_disables_server_push() {
+        let (client_io, mut server_io) = tokio::io::duplex(64 * 1024);
+        let task = tokio::spawn(async move {
+            let (_send, conn) = client_builder()
+                .handshake::<_, Bytes>(client_io)
+                .await
+                .unwrap();
+            let _ = conn.await;
+        });
+        let mut preface = [0u8; 24];
+        server_io.read_exact(&mut preface).await.unwrap();
+        let mut head = [0u8; 9];
+        server_io.read_exact(&mut head).await.unwrap();
+        assert_eq!(head[3], 4, "first frame must be SETTINGS");
+        let len = u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize;
+        let mut payload = vec![0u8; len];
+        server_io.read_exact(&mut payload).await.unwrap();
+        task.abort();
+        let entries: Vec<(u16, u32)> = payload
+            .as_chunks::<6>()
+            .0
+            .iter()
+            .map(|e| {
+                (
+                    u16::from_be_bytes([e[0], e[1]]),
+                    u32::from_be_bytes([e[2], e[3], e[4], e[5]]),
+                )
+            })
+            .collect();
+        assert!(entries.contains(&(0x2, 0)), "got {entries:?}");
     }
 }
