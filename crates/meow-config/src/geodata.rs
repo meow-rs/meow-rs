@@ -158,9 +158,10 @@ pub enum GeodataEgress {
     Direct,
     /// Fetch through `proxy` (needed where the CDN is blocked; issue #533).
     /// `direct_fallback`: a failed FIRST dial retries direct (see
-    /// `internal_http::fetch_or_direct`). Set only for an egress the config
-    /// implies — the default route or `proxies[0]` — never for an explicit
-    /// `geodata.proxy`, which fails loudly like a provider `proxy:` (#625).
+    /// `internal_http::fetch_or_direct`). Set only for the legacy
+    /// `proxies[0]` guess (unless it is a `dialer-proxy` chain) — never for
+    /// `geodata.proxy` or the mode's default route, where the config sends
+    /// this traffic: those fail loudly like a provider `proxy:` (#625).
     Proxy {
         proxy: Arc<dyn Proxy>,
         direct_fallback: bool,
@@ -481,7 +482,7 @@ mod tests {
 
     use crate::test_support::{serve_body, Dial, ScriptedProxy};
 
-    /// Integration pin for the geodata-only opt-in: an implied download
+    /// Integration pin for the geodata-only opt-in: a guessed download
     /// proxy whose connect phase fails must NOT sink the download — the
     /// fetch retries direct (`internal_http::fetch_or_direct`) and the
     /// file lands on disk.
@@ -501,8 +502,8 @@ mod tests {
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
-    /// An explicit `geodata.proxy` (no fallback) whose dial fails is a
-    /// loud error, never a direct fetch.
+    /// A routed egress (no fallback) whose dial fails is a loud error,
+    /// never a direct fetch.
     #[tokio::test]
     async fn download_and_replace_explicit_proxy_does_not_fall_back() {
         let (addr, hits) = serve_body(b"abc").await;

@@ -160,8 +160,7 @@ on disk.
 
 1. `geodata.proxy` — a `proxies:`/`proxy-groups:` name resolves against the
    built proxy map as-is (a `select` group dials its persisted-or-first
-   member; no leaf-stripping), with **no** direct fallback: an explicit
-   egress fails loudly, like a provider `proxy:` (#625). Built-in names:
+   member; no leaf-stripping). Built-in names:
    `DIRECT`/`COMPATIBLE`/`PASS`/`PASS-RULE` mean direct,
    `REJECT`/`REJECT-DROP` mean no download. An exact built-in spelling is
    the built-in; otherwise a name present in the map is that node (a user
@@ -175,13 +174,16 @@ on disk.
    semantics, a miss warning and falling through to (3).
 3. `proxies[0]` — the legacy `first_named_proxy` fallback.
 
-*Direct fallback (geodata-only opt-in):* for an egress from (2) or (3),
-when the FIRST request's proxy dial fails (connect phase only,
+*Direct fallback (geodata-only opt-in):* only for the guessed (3), and not
+when that `proxies[0]` declares `dialer-proxy`. An egress from (1) or (2)
+is where the config routes this traffic, so it fails loudly like a
+provider `proxy:` (#625) — where the CDN is blocked, a dead route must not
+become direct egress. When the FIRST request's proxy dial fails (connect phase only,
 `CONNECT_TIMEOUT` included), `internal_http::fetch_or_direct` warns and
 restarts the fetch with no proxy. Post-dial failures (TLS, HTTP status,
 body) and redirect-hop dials never fall back — a mid-chain failure must not
 silently leak egress. Provider/subscription fetches deliberately do NOT get
-this fallback, and neither does an explicit `geodata.proxy`.
+this fallback.
 
 ### Auto-update task — *As shipped*
 
