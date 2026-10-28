@@ -82,6 +82,11 @@ fn parse_sni_extension(data: &[u8]) -> Option<SmolStr> {
         if name_type == 0x00 {
             let name_bytes = list.get(pos..pos + name_len)?;
             let s = std::str::from_utf8(name_bytes).ok()?;
+            // A server_name that is not a hostname would steer the rules by
+            // a name no peer dials the same way (issue #734).
+            if !crate::is_valid_host(s) {
+                return None;
+            }
             // Hostnames are usually already lowercase — only pay for a
             // char-mapped rebuild when one actually contains uppercase.
             return Some(if s.bytes().any(|b| b.is_ascii_uppercase()) {
@@ -162,6 +167,14 @@ mod tests {
                 Some(host),
                 "SNI extraction failed for hostname {host:?}"
             );
+        }
+    }
+
+    /// Issue #734: an SNI that is not a hostname is not a sniffed name.
+    #[test]
+    fn sniff_tls_rejects_non_hostname_sni() {
+        for host in ["a@evil.com", "evil.com:443", "evil.com/x", "ev il.com"] {
+            assert_eq!(sniff_tls(&build_client_hello(host)), None, "{host:?}");
         }
     }
 

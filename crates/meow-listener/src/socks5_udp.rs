@@ -663,8 +663,14 @@ fn parse_udp_request(buf: &[u8]) -> Result<(Option<IpAddr>, String, u16, usize),
                 return Err("truncated domain UDP request".into());
             }
             let host = std::str::from_utf8(&buf[pos..pos + dlen])
-                .map_err(|_| "non-utf8 domain".to_string())?
-                .to_string();
+                .map_err(|_| "non-utf8 domain".to_string())?;
+            // A name the rules match differently from how a peer parses
+            // it (`a@evil.com`, `evil.com/x`) is dropped here, before it
+            // can claim the association or spawn a session (issue #734).
+            if !meow_common::is_valid_host(host) {
+                return Err(format!("domain {host:?} is not a hostname"));
+            }
+            let host = host.to_string();
             pos += dlen;
             (None, host)
         }
@@ -1176,6 +1182,23 @@ mod tests {
     fn parse_udp_request_rejects_fragment_and_short() {
         assert!(parse_udp_request(&[0, 0, 1, ATYP_IPV4, 1, 2, 3, 4, 0, 80]).is_err());
         assert!(parse_udp_request(&[0, 0]).is_err());
+        // Issue #734: a domain that is not a hostname is refused.
+        for bad in [
+            &b"a@evil.com"[..],
+            b"evil.com/x",
+            b"evil.com:1",
+            b"ev il",
+            b"",
+        ] {
+            let mut dg = vec![0, 0, 0, ATYP_DOMAIN, bad.len() as u8];
+            dg.extend_from_slice(bad);
+            dg.extend_from_slice(&[0x01, 0xBB, b'x']);
+            assert!(
+                parse_udp_request(&dg).is_err(),
+                "{:?} must be refused",
+                String::from_utf8_lossy(bad)
+            );
+        }
     }
 
     /// Fake-IP datagrams must rejoin the single `Host`-keyed session via the

@@ -198,6 +198,15 @@ impl ProxyAdapter for TrustTunnelAdapter {
         self.client.reset();
     }
     async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
+        // The destination travels as an h2 `:authority`, which the endpoint
+        // parses as a URI authority: `a@evil.com:443` would read as host
+        // `evil.com` while the rules matched `a@evil.com` (issue #734).
+        if !metadata.host.is_empty() && !meow_common::is_valid_host(&metadata.host) {
+            return Err(MeowError::Proxy(format!(
+                "TrustTunnel: destination host {:?} is not a hostname",
+                metadata.host
+            )));
+        }
         let stream = self
             .client
             .tcp(&metadata.remote_address().to_string())

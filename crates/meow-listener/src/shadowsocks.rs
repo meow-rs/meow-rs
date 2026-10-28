@@ -348,6 +348,15 @@ async fn handle_ss_conn<S: AsyncRead + AsyncWrite + Unpin + Send + Sync>(
         }
     };
 
+    // No reply channel exists before the relay, so a target name that is
+    // not a hostname just closes the connection, undialed (issue #734).
+    if let Address::DomainNameAddress(d, _) = &target {
+        if !meow_common::is_valid_host(d) {
+            debug!("ss listener from {peer}: target {d:?} is not a hostname");
+            return;
+        }
+    }
+
     let metadata = build_metadata(peer, &target, &in_name, in_port);
     debug!("ss listener {} -> {}", peer, metadata.remote_address());
 
@@ -915,6 +924,14 @@ where
         }
     }
 
+    // A target name the rules would match differently from how an outbound
+    // peer parses it is dropped before it can spawn a flow (issue #734).
+    if let Address::DomainNameAddress(d, _) = target {
+        if !meow_common::is_valid_host(d) {
+            return Err(format!("target {d:?} is not a hostname"));
+        }
+    }
+
     let (host, dst_ip, dst_port) = match target {
         // Lowercase only when needed — `SmolStr::from` on an
         // already-lowercase name is inline (≤22 B) with no String
@@ -1385,6 +1402,49 @@ mod tests {
                 "must use REJECT, not DIRECT"
             );
         }
+    }
+
+    /// Issue #734: a UDP target name that is not a hostname is dropped
+    /// before any flow is created; a real name still opens one.
+    #[tokio::test]
+    async fn udp_non_hostname_target_is_dropped_before_any_flow() {
+        let tunnel = direct_rule_tunnel();
+        let (sock, session_ids) = server_sock_and_ids("aes-256-gcm").await;
+        let mut state = UdpRelayState::default();
+        let peer = "127.0.0.1:12345".parse().unwrap();
+        for host in ["a@evil.com", "evil.com/x", "evil.com:1", "ev il.com"] {
+            let err = handle_ss_udp_datagram(
+                tunnel.inner(),
+                &sock,
+                &mut state,
+                b"payload",
+                peer,
+                &Address::DomainNameAddress(host.to_owned(), 443),
+                None,
+                &session_ids,
+                "ss",
+                8388,
+                8,
+            )
+            .expect_err(host);
+            assert!(err.contains("not a hostname"), "{host:?}: {err}");
+        }
+        assert!(state.flows.is_empty(), "no flow may be spawned");
+        assert!(handle_ss_udp_datagram(
+            tunnel.inner(),
+            &sock,
+            &mut state,
+            b"payload",
+            peer,
+            &Address::DomainNameAddress("localhost".to_owned(), 443),
+            None,
+            &session_ids,
+            "ss",
+            8388,
+            8,
+        )
+        .unwrap());
+        assert_eq!(state.flows.len(), 1);
     }
 
     /// Regression (SIP022 §3.2.2/§3.2.3): the control attached to a new flow's

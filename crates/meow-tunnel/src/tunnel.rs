@@ -5,8 +5,8 @@ use crate::udp::{self, NatTable};
 use meow_common::conn_note;
 use meow_common::conn_notes::ConnNotes;
 use meow_common::{
-    metadata_ip_literal, AdapterType, Metadata, Network, Proxy, ProxyAdapter, Rule, TargetCheck,
-    TargetProbe, TunnelMode,
+    is_valid_host, metadata_ip_literal, AdapterType, Metadata, Network, Proxy, ProxyAdapter, Rule,
+    TargetCheck, TargetProbe, TunnelMode,
 };
 use meow_dns::Resolver;
 use meow_proxy::DirectAdapter;
@@ -262,6 +262,17 @@ impl TunnelInner {
     /// self-saturates `max-connections`; every caller must honour the
     /// verdict (issue #618, mihomo's "fake DNS record missing").
     ///
+    /// Also returns [`PreHandleVerdict::Drop`] when the flow's name is not
+    /// a hostname ([`is_valid_host`]): `host` as the inbound filled it, or
+    /// the name a fake IP maps back to (a DNS query name is raw label
+    /// bytes). Such a name matches rules differently from how an
+    /// authority-shaped outbound peer parses it (`a@evil.com` misses
+    /// `DOMAIN,evil.com` but reads as `evil.com` in a CONNECT line,
+    /// issue #734). The listeners refuse these at ingress with their own
+    /// protocol error; this is the backstop for every path that reaches
+    /// the tunnel. A snooped or sniffed name that is not a hostname is
+    /// simply not used.
+    ///
     /// Deliberate divergences from upstream `preHandleMetadata`:
     /// - an IP literal in `host` is folded into `dst_ip` first
     ///   (`fixMetadata` parity), so a domain-typed literal (SOCKS5
@@ -294,6 +305,18 @@ impl TunnelInner {
             }
             metadata.host = SmolStr::default();
         }
+        if !metadata.host.is_empty() && !is_valid_host(&metadata.host) {
+            debug!(
+                "pre_handle_metadata: drop non-hostname host {:?}",
+                metadata.host
+            );
+            conn_note!(
+                Connection,
+                "Destination {:?} is not a hostname; dropped",
+                metadata.host
+            );
+            return PreHandleVerdict::Drop;
+        }
         // Unmap `::ffff:a.b.c.d` so a mapped literal still hits the
         // fake-IP range check and v4 rules (`fixMetadata` parity).
         let Some(ip) = metadata.dst_ip.map(|ip| ip.to_canonical()) else {
@@ -303,6 +326,14 @@ impl TunnelInner {
         let resolver = self.resolver();
         if resolver.in_fake_ip_range(ip) {
             match resolver.reverse_lookup(ip) {
+                Some(host) if !is_valid_host(&host) => {
+                    debug!("pre_handle_metadata: drop fake-ip {ip} → non-hostname {host:?}");
+                    conn_note!(
+                        Dns,
+                        "Fake IP {ip} maps to {host:?}, which is not a hostname; dropped"
+                    );
+                    return PreHandleVerdict::Drop;
+                }
                 Some(host) => {
                     debug!("pre_handle_metadata: fake-ip {ip} → {host}");
                     conn_note!(Dns, "Fake IP {ip} maps to {host}");
@@ -318,9 +349,7 @@ impl TunnelInner {
                     // failure). An IP literal is the stale address in
                     // disguise and was already folded out above, so a
                     // surviving `host` here is a genuine name.
-                    if metadata.host.is_empty()
-                        && metadata_ip_literal(&metadata.sniff_host).is_none()
-                    {
+                    if metadata.host.is_empty() && is_sniffed_name(metadata) {
                         metadata.host = metadata.sniff_host.clone();
                     }
                     if metadata.host.is_empty() {
@@ -347,7 +376,7 @@ impl TunnelInner {
         // `DNSMapping` mode contract used by the tproxy listener.
         let mut snooped = false;
         if metadata.host.is_empty() {
-            if let Some(host) = resolver.reverse_lookup(ip) {
+            if let Some(host) = resolver.reverse_lookup(ip).filter(|h| is_valid_host(h)) {
                 conn_note!(Dns, "{ip} was resolved earlier for {host}; using that name");
                 metadata.host = host;
                 snooped = true;
@@ -745,6 +774,7 @@ pub enum PreHandleVerdict {
     /// fake IP. Dialing it loops the packet back into a fake-IP-routed
     /// inbound (TUN `auto-route`) and self-saturates `max-connections`
     /// (issue #618); mihomo drops the same class in `preHandleMetadata`.
+    /// Also returned when the flow's name is not a hostname (issue #734).
     Drop,
 }
 
@@ -1303,7 +1333,9 @@ fn is_benchmarking_ip(ip: std::net::IpAddr) -> bool {
 /// The inbound sniffed a name (not an IP literal) from the flow's first
 /// bytes.
 fn is_sniffed_name(metadata: &Metadata) -> bool {
-    !metadata.sniff_host.is_empty() && metadata_ip_literal(&metadata.sniff_host).is_none()
+    !metadata.sniff_host.is_empty()
+        && metadata_ip_literal(&metadata.sniff_host).is_none()
+        && is_valid_host(&metadata.sniff_host)
 }
 
 #[cfg(test)]
@@ -2349,6 +2381,98 @@ mod tests {
             sniff_host: sniff_host.into(),
             ..Default::default()
         }
+    }
+
+    /// Issue #734: a name that is not a hostname never reaches rule
+    /// matching or a dial — whether the inbound put it in `host`, a fake IP
+    /// maps back to it (DNS query names are raw label bytes), or a sniffer
+    /// produced it.
+    #[test]
+    fn non_hostname_names_are_dropped_or_ignored() {
+        let tunnel = test_tunnel();
+        let inner = tunnel.inner();
+        for host in [
+            "a@evil.com",
+            "user:pass@evil.com",
+            "evil.com/x",
+            "evil.com?q",
+        ] {
+            let mut md = Metadata {
+                network: Network::Tcp,
+                host: host.into(),
+                dst_port: 443,
+                ..Default::default()
+            };
+            assert_eq!(
+                inner.pre_handle_metadata(&mut md),
+                PreHandleVerdict::Drop,
+                "{host:?}"
+            );
+        }
+        // Hostnames and literals still pass.
+        for host in ["evil.com", "_sip._tcp.example.com", "xn--fiqs8s", "[::1]"] {
+            let mut md = Metadata {
+                network: Network::Tcp,
+                host: host.into(),
+                dst_port: 443,
+                ..Default::default()
+            };
+            assert_eq!(
+                inner.pre_handle_metadata(&mut md),
+                PreHandleVerdict::Continue,
+                "{host:?}"
+            );
+        }
+
+        // A fake IP allocated for a non-hostname query name.
+        let mut resolver = Resolver::new(
+            vec![],
+            vec![],
+            DnsMode::FakeIp,
+            DomainTrie::new(),
+            true,
+            true,
+        );
+        let pool = Arc::new(
+            meow_dns::fakeip::Pool::new(
+                "198.18.0.1/16".parse().unwrap(),
+                Arc::new(meow_dns::fakeip::MemoryStore::new(1024)),
+            )
+            .unwrap(),
+        );
+        let bad_fake = pool.lookup("a@evil.com");
+        let good_fake = pool.lookup("good.example");
+        resolver.set_fakeip_v4(pool);
+        let tunnel = Tunnel::new(Arc::new(resolver));
+        let inner = tunnel.inner();
+        let mut md = Metadata {
+            network: Network::Tcp,
+            dst_ip: Some(bad_fake),
+            dst_port: 443,
+            ..Default::default()
+        };
+        assert_eq!(inner.pre_handle_metadata(&mut md), PreHandleVerdict::Drop);
+        let mut md = Metadata {
+            network: Network::Tcp,
+            dst_ip: Some(good_fake),
+            dst_port: 443,
+            ..Default::default()
+        };
+        assert_eq!(
+            inner.pre_handle_metadata(&mut md),
+            PreHandleVerdict::Continue
+        );
+        assert_eq!(md.host, "good.example");
+
+        // A non-hostname sniffed name is not a rescue for a foreign fake IP.
+        let tunnel = fake_ip_tunnel("28.0.0.0/8");
+        let mut md = tcp_flow([198, 18, 1, 220], "a@evil.com");
+        assert_eq!(
+            tunnel.inner().pre_handle_metadata(&mut md),
+            PreHandleVerdict::Continue
+        );
+        assert_eq!(md.host, "");
+        assert_eq!(md.dst_ip, Some([198, 18, 1, 220].into()));
     }
 
     #[test]

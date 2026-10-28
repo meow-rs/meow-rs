@@ -93,3 +93,65 @@ pub async fn spawn_echo_server() -> std::net::SocketAddr {
     });
     addr
 }
+
+/// Spawn the upstream HTTP proxy mock: counts accepts, answers every
+/// CONNECT with 200, then echoes.
+pub async fn spawn_counting_http_upstream(
+) -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let accepts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = Arc::clone(&accepts);
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                let mut len = 0;
+                while !buf[..len].windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf[len..]).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => len += n,
+                    }
+                }
+                if stream
+                    .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                loop {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => {
+                            if stream.write_all(&buf[..n]).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+    (addr, accepts)
+}
+
+/// Issue #734 harness: the issue's config (`DOMAIN,evil.com,REJECT`, then
+/// `MATCH,proxy` where `proxy` is an `http` upstream), routed at a local
+/// mock whose accept count shows whether any flow reached the upstream.
+pub async fn issue_734_tunnel() -> (meow_tunnel::Tunnel, Arc<std::sync::atomic::AtomicUsize>) {
+    let (upstream, accepts) = spawn_counting_http_upstream().await;
+    let yaml = format!(
+        "proxies:\n  - name: proxy\n    type: http\n    server: 127.0.0.1\n    port: {}\n\
+         rules:\n  - DOMAIN,evil.com,REJECT\n  - MATCH,proxy\n",
+        upstream.port()
+    );
+    let raw = meow_config::parse_raw_yaml(&yaml).unwrap();
+    let res = meow_config::rebuild_from_raw(&raw).unwrap();
+    let tunnel = direct_tunnel();
+    tunnel.set_mode(meow_common::TunnelMode::Rule);
+    tunnel.update_proxies(res.proxies, res.dialer_registry);
+    tunnel.update_rules(res.rules);
+    (tunnel, accepts)
+}

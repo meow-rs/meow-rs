@@ -192,6 +192,70 @@ async fn ss_tcp_listener_relays_to_direct_echo() {
     assert_eq!(&buf[..n], payload, "echoed payload must match");
 }
 
+/// Issue #734: an SS target name that is not a hostname closes the
+/// connection undialed. Routed through the issue's config, a real name
+/// reaches the `http` upstream (MATCH,proxy) while `a@evil.com` must not;
+/// before the fix it missed `DOMAIN,evil.com,REJECT` and was CONNECTed
+/// upstream as an authority the peer reads as `evil.com`.
+#[tokio::test]
+async fn ss_tcp_non_hostname_target_is_closed_undialed() {
+    use std::sync::atomic::Ordering;
+
+    async fn exchange(ss_addr: std::net::SocketAddr, host: &str) -> Vec<u8> {
+        let ctx = Context::new_shared(ServerType::Local);
+        let cfg = client_cfg(ss_addr);
+        let target = Address::DomainNameAddress(host.to_owned(), 443);
+        let mut stream =
+            tokio::time::timeout(TIMEOUT, ProxyClientStream::connect(ctx, &cfg, target))
+                .await
+                .expect("client connect timed out")
+                .expect("client connect failed");
+        let _ = stream.write_all(b"ping").await;
+        let mut buf = [0u8; 64];
+        match tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf)).await {
+            Ok(Ok(n)) => buf[..n].to_vec(),
+            Ok(Err(_)) => Vec::new(),
+            Err(_) => panic!("read timed out for {host:?}"),
+        }
+    }
+
+    let (tunnel, accepts) = common::issue_734_tunnel().await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ss_addr = listener.local_addr().unwrap();
+    let ss = ShadowsocksListener::new(
+        tunnel,
+        ss_addr,
+        "ss-test".into(),
+        CIPHER,
+        PASSWORD,
+        false,
+        None,
+    )
+    .unwrap();
+    tokio::spawn(async move {
+        let _ = ss.run_on(listener).await;
+    });
+
+    // Positive control: echoed by the upstream mock after its 200.
+    assert_eq!(exchange(ss_addr, "good.example").await, b"ping");
+    assert_eq!(accepts.load(Ordering::SeqCst), 1);
+
+    for host in [
+        "a@evil.com",
+        "user:pass@evil.com",
+        "evil.com/x",
+        "evil.com?q",
+    ] {
+        assert!(exchange(ss_addr, host).await.is_empty(), "{host:?} relayed");
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        accepts.load(Ordering::SeqCst),
+        1,
+        "no non-hostname SS target may reach the upstream"
+    );
+}
+
 #[tokio::test]
 async fn ss_tcp_listener_rejects_wrong_password() {
     let echo = spawn_echo_server().await;

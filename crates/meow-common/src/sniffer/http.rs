@@ -25,7 +25,9 @@ pub fn sniff_http(buf: &[u8]) -> Option<SmolStr> {
             } else {
                 s.split(':').next()?
             };
-            if host.is_empty() {
+            // `a@evil.com`, `evil.com/x`, ... would steer the rules by a
+            // name the peer parses differently (issue #734).
+            if host.is_empty() || !crate::is_valid_host(host) {
                 return None;
             }
             // Hostnames are usually already lowercase — only pay for a
@@ -107,5 +109,23 @@ mod tests {
         // Field-value LWS must be trimmed.
         let buf = b"GET / HTTP/1.1\r\nHost:    example.com   \r\n\r\n";
         assert_eq!(sniff_http(buf).as_deref(), Some("example.com"));
+    }
+
+    /// Issue #734: a Host header carrying userinfo, a path or other
+    /// non-hostname bytes is not a sniffed name.
+    #[test]
+    fn sniff_http_rejects_non_hostname_host_header() {
+        for host in [
+            "a@evil.com",
+            "evil.com/x",
+            "evil.com?q",
+            "evil%2ecom",
+            "ev il.com",
+        ] {
+            let buf = format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n");
+            assert_eq!(sniff_http(buf.as_bytes()), None, "{host:?}");
+        }
+        let buf = b"GET / HTTP/1.1\r\nHost: a@evil.com:443\r\n\r\n";
+        assert_eq!(sniff_http(buf), None);
     }
 }

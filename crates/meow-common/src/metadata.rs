@@ -348,6 +348,43 @@ pub fn metadata_ip_literal(s: &str) -> Option<IpAddr> {
     })
 }
 
+/// Whether `host` is a destination the outbound side renders exactly as
+/// the rule engine matched it: an IP literal (plain, or `[v6]` as the HTTP
+/// listeners keep it) or a syntactically valid DNS hostname.
+///
+/// A hostname is ASCII letters, digits, `-` and `_` (mihomo and real-world
+/// SRV/DKIM-style names use underscores), in dot-separated labels of 1-63
+/// bytes, at most 253 bytes in total plus one optional trailing dot.
+/// Punycode (`xn--`) IDNs pass as ordinary labels; raw non-ASCII does not.
+///
+/// Everything else is refused — in particular `@`, `/`, `?`, `#`, `:`,
+/// `%`, whitespace, control bytes and NUL. Those bytes make the name the
+/// rules see differ from the one a peer parses out of an authority-shaped
+/// destination: `a@evil.com` misses `DOMAIN,evil.com,REJECT`, yet an HTTP
+/// `CONNECT a@evil.com:443` or an h2 `:authority` reads as host
+/// `evil.com` on the far side (issue #734). Every ingress that fills
+/// [`Metadata::host`] from client-supplied bytes checks this before the
+/// flow is routed.
+///
+/// The empty string is not a host; callers treat it as "no name" before
+/// asking.
+pub fn is_valid_host(host: &str) -> bool {
+    if metadata_ip_literal(host).is_some() {
+        return true;
+    }
+    let name = host.strip_suffix('.').unwrap_or(host);
+    if name.is_empty() || name.len() > 253 {
+        return false;
+    }
+    name.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -412,5 +449,92 @@ mod tests {
         assert_eq!(m.dst_ip, before.dst_ip);
         assert_eq!(m.src_port, before.src_port);
         assert_eq!(m.dst_port, before.dst_port);
+    }
+
+    #[test]
+    fn is_valid_host_accepts_hostnames_and_ip_literals() {
+        for host in [
+            "example.com",
+            "EXAMPLE.COM",
+            "localhost",
+            "a.b.c.d.example.co.uk",
+            "example.com.",
+            "xn--bcher-kva.example",
+            "xn--fiqs8s",
+            "_dmarc.example.com",
+            "_sip._tcp.example.com",
+            "my_host-1.example",
+            "-leading-hyphen.example",
+            "1.2.3.4",
+            "255.255.255.255",
+            "::1",
+            "2606:2800:220:1:248:1893:25c8:1946",
+            "[::1]",
+            "[2606:2800:220:1:248:1893:25c8:1946]",
+            "::ffff:1.2.3.4",
+        ] {
+            assert!(is_valid_host(host), "{host:?} must be accepted");
+        }
+        let label63 = "a".repeat(63);
+        assert!(is_valid_host(&format!("{label63}.example")));
+        // 253 bytes exactly (4 × 63 + 3 dots = 255 is over; build 253).
+        let max = format!(
+            "{}.{}.{}.{}",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(61)
+        );
+        assert_eq!(max.len(), 253);
+        assert!(is_valid_host(&max));
+        assert!(
+            is_valid_host(&format!("{max}.")),
+            "trailing dot is not counted"
+        );
+    }
+
+    /// Issue #734: bytes that make an authority-shaped destination parse to
+    /// a different host than the rule engine saw are refused.
+    #[test]
+    fn is_valid_host_rejects_authority_and_garbage_bytes() {
+        for host in [
+            "",
+            ".",
+            "a@evil.com",
+            "user:pass@evil.com",
+            "evil.com:443",
+            "evil.com/x",
+            "evil.com?q=1",
+            "evil.com#frag",
+            "evil%2ecom",
+            "evil.com\\",
+            "evil com",
+            "evil.com\t",
+            "evil.com\r\nHost: x",
+            "evil\0.com",
+            "evil\x7f.com",
+            "bücher.example",
+            "a..b",
+            ".example.com",
+            "example.com..",
+            "*.example.com",
+            "[::1",
+            "::1]",
+            "[evil.com]",
+            "fe80::1%eth0",
+            "[fe80::1%25eth0]",
+        ] {
+            assert!(!is_valid_host(host), "{host:?} must be rejected");
+        }
+        assert!(!is_valid_host(&format!("{}.example", "a".repeat(64))));
+        let long = format!(
+            "{}.{}.{}.{}",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(62)
+        );
+        assert_eq!(long.len(), 254);
+        assert!(!is_valid_host(&long));
     }
 }

@@ -16,6 +16,8 @@ const ATYP_IPV4: u8 = 0x01;
 const ATYP_DOMAIN: u8 = 0x03;
 const ATYP_IPV6: u8 = 0x04;
 const REP_SUCCESS: u8 = 0x00;
+/// RFC 1928 `X'01'` general SOCKS server failure.
+const REP_GENERAL_FAILURE: u8 = 0x01;
 
 pub async fn handle_socks5(
     tunnel: &Tunnel,
@@ -182,6 +184,28 @@ async fn handle_socks5_inner(
         let reply = [SOCKS5_VERSION, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
         stream.write_all(&reply).await?;
         return Err(format!("unsupported SOCKS5 command: {cmd}").into());
+    }
+
+    // A domain the rules would match differently from how an outbound peer
+    // parses it (`a@evil.com` misses `DOMAIN,evil.com,REJECT` yet reads as
+    // `evil.com` in a CONNECT authority) is refused before any dial
+    // (issue #734).
+    // An empty `ATYP_DOMAIN` name names nothing and is refused the same way.
+    if dst_ip.is_none() && !meow_common::is_valid_host(&host) {
+        let reply = [
+            SOCKS5_VERSION,
+            REP_GENERAL_FAILURE,
+            0x00,
+            ATYP_IPV4,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
+        stream.write_all(&reply).await?;
+        return Err(format!("SOCKS5 CONNECT to non-hostname {host:?}").into());
     }
 
     // 3. Send success reply

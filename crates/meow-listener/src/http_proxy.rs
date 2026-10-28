@@ -168,6 +168,10 @@ async fn handle_http_inner(
     if method.eq_ignore_ascii_case("CONNECT") {
         // HTTPS CONNECT
         let (host, port) = parse_host_port(target, 443);
+        if !meow_common::is_valid_host(host) {
+            write_bad_request(stream).await?;
+            return Err(format!("CONNECT target {target:?} is not host:port").into());
+        }
 
         let mut metadata = Metadata {
             network: Network::Tcp,
@@ -210,6 +214,10 @@ async fn handle_http_inner(
         // Plain HTTP proxy (GET/POST/etc via proxy)
         let url = target;
         let (host, port) = parse_url_host_port(url);
+        if !meow_common::is_valid_host(host) {
+            write_bad_request(stream).await?;
+            return Err(format!("request target {url:?} has no valid host").into());
+        }
 
         let mut metadata = Metadata {
             network: Network::Tcp,
@@ -1906,8 +1914,13 @@ fn parse_url_host_port(url: &str) -> (&str, u16) {
         .or_else(|| url.strip_prefix("ws://"))
         .or_else(|| url.strip_prefix("https://"))
         .unwrap_or(url);
-    // Take the authority part (before first /)
-    let authority = without_scheme.split('/').next().unwrap_or(without_scheme);
+    // Take the authority part: RFC 3986 ends it at the first `/`, `?` or
+    // `#`, so `http://evil.com?x` names `evil.com` exactly as the origin
+    // and any upstream read it (issue #734).
+    let authority = without_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(without_scheme);
     let default_port = if url.starts_with("https://") { 443 } else { 80 };
     parse_host_port(authority, default_port)
 }

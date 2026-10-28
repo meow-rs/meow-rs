@@ -266,6 +266,7 @@ jobs:
           cargo nextest run --lib --bin meow --bin meow-bench --bin meow-cli \
             --test common_test \
             --test socks5_udp_user \
+            --test host_validation \
             --test ss_listener_integration \
             --test dns_cache_test \
             --test config_test \

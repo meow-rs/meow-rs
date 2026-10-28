@@ -555,7 +555,13 @@ async fn handle_tproxy_flow(
 
     let mut hostname = metadata.sniff_host.clone();
     if hostname.is_empty() {
-        if let Some(domain) = tunnel.resolver().reverse_lookup(orig_dst.ip()) {
+        // A snooped name that is not a hostname is not used (issue #734);
+        // the flow keeps its IP literal.
+        if let Some(domain) = tunnel
+            .resolver()
+            .reverse_lookup(orig_dst.ip())
+            .filter(|d| meow_common::is_valid_host(d))
+        {
             hostname = domain;
         }
     }

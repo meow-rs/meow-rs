@@ -241,7 +241,7 @@ impl ProxyAdapter for HttpAdapter {
     }
 
     async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
-        let target = connect_target(metadata);
+        let target = connect_target(metadata)?;
         debug!(
             "http proxy: CONNECT {} via {}:{}",
             target, self.server, self.port
@@ -271,7 +271,7 @@ impl ProxyAdapter for HttpAdapter {
         stream: Box<dyn ProxyConn>,
         metadata: &Metadata,
     ) -> Result<Box<dyn ProxyConn>> {
-        let target = connect_target(metadata);
+        let target = connect_target(metadata)?;
         debug!(
             "http proxy: CONNECT (relay) {} over existing stream",
             target
@@ -292,8 +292,20 @@ impl ProxyAdapter for HttpAdapter {
 ///
 /// Prefers `metadata.host` (domain name) over raw IP; this preserves the
 /// domain name for SNI and logging on the upstream proxy.
-fn connect_target(metadata: &Metadata) -> meow_common::AddrDisplay<'_> {
-    metadata.remote_address()
+///
+/// Refuses a `host` that is not a hostname or IP literal: the CONNECT
+/// authority is parsed by the peer, which reads `a@evil.com:443` as host
+/// `evil.com` while the rules matched `a@evil.com` (issue #734). The
+/// inbound side already refuses such names; this keeps the authority
+/// honest for any path that bypasses it.
+fn connect_target(metadata: &Metadata) -> Result<meow_common::AddrDisplay<'_>> {
+    if !metadata.host.is_empty() && !meow_common::is_valid_host(&metadata.host) {
+        return Err(MeowError::Proxy(format!(
+            "http proxy: CONNECT host {:?} is not a hostname",
+            metadata.host
+        )));
+    }
+    Ok(metadata.remote_address())
 }
 
 /// Parse `"HTTP/1.x NNN ..."` → status code as `u16`.
@@ -450,6 +462,35 @@ mod tests {
             vec![],
             Arc::new(crate::dialer::DirectDialer),
         )
+    }
+
+    /// Issue #734: a host the peer would parse as `userinfo@host` (or with a
+    /// path / query) never reaches the CONNECT line; the dial fails before
+    /// the upstream sees a byte.
+    #[tokio::test]
+    async fn http_connect_refuses_non_hostname_host() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let adapter = make_adapter_no_auth("127.0.0.1", port);
+        for host in [
+            "a@evil.com",
+            "user:pass@evil.com",
+            "evil.com/x",
+            "evil.com?q",
+        ] {
+            let err = adapter
+                .dial_tcp(&make_metadata(host, 443))
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{host:?} must not dial"));
+            assert!(
+                err.to_string().contains("not a hostname"),
+                "{host:?}: {err}"
+            );
+        }
+        let accepted =
+            tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept()).await;
+        assert!(accepted.is_err(), "the upstream must never be dialed");
     }
 
     // ─── http_connect_no_auth_succeeds ────────────────────────────────────────
