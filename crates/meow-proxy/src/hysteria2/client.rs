@@ -206,6 +206,7 @@ async fn connect_addr(
     // otherwise the datagrams follow the TUN's split default routes back
     // into the device and loop (issue #695).
     let socket = meow_common::bind_udp(bind_addr).await.map_err(Error::Io)?;
+    enlarge_recv_buffer(&socket);
     let local = socket.local_addr().map_err(Error::Io)?;
 
     let mut config = super::tls::build_quiche_config(cfg)?;
@@ -218,6 +219,54 @@ async fn connect_addr(
         .map_err(|e| Error::Quic(format!("connect start: {e}")))?;
 
     driver::spawn(cfg, socket, local, server_addr, conn).await
+}
+
+/// The receive buffer quic-go asks for. The OS default (about 208 KiB on
+/// Linux) overflows whenever the driver falls a few milliseconds behind a
+/// fast download, and each dropped datagram is a loss the server must
+/// detect and resend.
+const RECV_BUFFER_BYTES: usize = 7 << 20;
+
+/// Grow the QUIC socket's receive buffer, best effort. Linux caps the
+/// request at `net.core.rmem_max`, so a privileged meow forces it past the
+/// cap as quic-go does; macOS rejects a size above `kern.ipc.maxsockbuf`, so
+/// the request halves until one is taken. The send buffer keeps the OS
+/// default: the driver does not pace, and a full send buffer is what holds
+/// its bursts back from the interface queue.
+fn enlarge_recv_buffer(socket: &tokio::net::UdpSocket) {
+    let sock = socket2::SockRef::from(socket);
+    let mut size = RECV_BUFFER_BYTES;
+    while size >= 1 << 20 && sock.set_recv_buffer_size(size).is_err() {
+        size /= 2;
+    }
+    // getsockopt reports twice the size taken on Linux.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if sock
+        .recv_buffer_size()
+        .is_ok_and(|got| got < 2 * RECV_BUFFER_BYTES)
+    {
+        force_recv_buffer(socket);
+    }
+    tracing::debug!(size = ?sock.recv_buffer_size(), "hysteria2 socket receive buffer");
+}
+
+/// `SO_RCVBUFFORCE` needs `CAP_NET_ADMIN`, so it fails harmlessly (EPERM)
+/// for an unprivileged meow.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn force_recv_buffer(socket: &tokio::net::UdpSocket) {
+    use std::os::fd::AsRawFd;
+    let size = RECV_BUFFER_BYTES as libc::c_int;
+    // SAFETY: the socket stays open for the call, and the option value is a
+    // c_int of the size passed.
+    unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUFFORCE,
+            std::ptr::addr_of!(size).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
 }
 
 struct ServerTarget {

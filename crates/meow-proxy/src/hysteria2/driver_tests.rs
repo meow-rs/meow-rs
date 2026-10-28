@@ -265,6 +265,13 @@ fn peer_on(
     }
 }
 
+async fn sleep_opt(timeout: Option<Duration>) {
+    match timeout {
+        Some(d) => sleep(d).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
 async fn round_trip(stream: &mut DuplexStream) {
     timeout(TEST_TIMEOUT, async {
         stream.write_all(b"hello").await.unwrap();

@@ -83,6 +83,15 @@ const CMD_CHANNEL_CAP: usize = 256;
 const STREAM_READ_CHANNEL_CAP: usize = 16;
 const UDP_SESSION_QUEUE: usize = 64;
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
+/// Datagrams fed to quiche per socket wakeup before the driver flushes. One
+/// flush then acknowledges the whole batch, where a flush per datagram sent
+/// an ACK (and a syscall) for every packet of a download.
+const RECV_BATCH: usize = 32;
+/// Commands handled per wakeup, for the same reason on the upload side.
+const CMD_BATCH: usize = 64;
+/// Largest payload chunk handed to a stream's reader in one channel item;
+/// with [`STREAM_READ_CHANNEL_CAP`] it bounds what a slow reader holds.
+const READ_CHUNK_BYTES: usize = 16 * 1024;
 /// Id 0 is the HTTP/3 auth request; proxy bidi streams start at 4, step 4.
 const FIRST_PROXY_STREAM_ID: u64 = 4;
 
@@ -264,13 +273,20 @@ async fn run(
     let mut ready_tx = Some(ready_tx);
     let mut handshake: Option<Auth> = None;
     let mut auth_done = false;
-    let mut recv_buf = vec![0u8; 65535];
+    // Scratch for received datagrams, stream reads and QUIC datagrams in
+    // turn; it holds any UDP payload.
+    let mut buf = vec![0u8; 65535];
     let mut send_buf = vec![0u8; 1500];
     let mut keep_alive = tokio::time::interval_at(
         tokio::time::Instant::now() + KEEP_ALIVE_INTERVAL,
         KEEP_ALIVE_INTERVAL,
     );
     keep_alive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // quiche's timer, re-armed only when its deadline moves rather than
+    // rebuilt on every wakeup.
+    let timer = tokio::time::sleep(Duration::ZERO);
+    tokio::pin!(timer);
+    let mut armed = None;
 
     if let Err(e) = flush_send(&mut st, &mut conn, &mut send_buf).await {
         // `Io` carries the socket errno through `hy2_error` →
@@ -283,29 +299,36 @@ async fn run(
 
     let mut exit = Error::Closed;
     loop {
-        let timeout = conn.timeout();
+        let deadline = conn.timeout_instant();
+        if deadline != armed {
+            if let Some(after) = conn.timeout() {
+                timer.as_mut().reset(tokio::time::Instant::now() + after);
+            }
+            armed = deadline;
+        }
         tokio::select! {
-            r = st.socket.recv_from(&mut recv_buf) => {
-                match r {
-                    Ok((n, from)) => {
-                        let from = st.hop.as_ref().map_or(from, |h| h.normalize_source(from));
-                        if let Some(mut dgram) = deobfs(&mut st, &recv_buf[..n], from) {
-                            let info = quiche::RecvInfo { from, to: st.local };
-                            if let Err(e) = conn.recv(&mut dgram, info) {
-                                tracing::debug!("hysteria2 could not receive QUIC packet: {e}");
-                            }
-                        }
-                    }
-                    Err(e) => { fail(&mut ready_tx, &mut st, Error::Io(e)); break; }
+            r = st.socket.readable() => {
+                if let Err(e) = r.and_then(|()| recv_batch(&mut st, &mut conn, &mut buf)) {
+                    fail(&mut ready_tx, &mut st, Error::Io(e));
+                    break;
                 }
             }
             maybe = st.cmd_rx.recv() => {
                 match maybe {
-                    Some(cmd) => handle_cmd(&mut st, &mut conn, cmd),
+                    Some(cmd) => {
+                        handle_cmd(&mut st, &mut conn, cmd);
+                        for _ in 1..CMD_BATCH {
+                            let Ok(cmd) = st.cmd_rx.try_recv() else { break };
+                            handle_cmd(&mut st, &mut conn, cmd);
+                        }
+                    }
                     None => { let _ = conn.close(true, 0x0, b"done"); }
                 }
             }
-            _ = sleep_opt(timeout) => { conn.on_timeout(); }
+            () = &mut timer, if armed.is_some() => {
+                armed = None;
+                conn.on_timeout();
+            }
             _ = st.read_notify.notified() => {}
             _ = keep_alive.tick(), if auth_done => {
                 let _ = conn.send_ack_eliciting();
@@ -344,8 +367,8 @@ async fn run(
 
         cleanup_streams(&mut st, &mut conn);
         if auth_done {
-            pump_reads(&mut st, &mut conn);
-            pump_datagrams(&mut st, &mut conn);
+            pump_reads(&mut st, &mut conn, &mut buf);
+            pump_datagrams(&mut st, &mut conn, &mut buf);
         }
         pump_writes(&mut st, &mut conn);
         cleanup_streams(&mut st, &mut conn);
@@ -483,19 +506,19 @@ fn pump_writes(st: &mut State, conn: &mut quiche::Connection) {
     }
 }
 
-fn pump_reads(st: &mut State, conn: &mut quiche::Connection) {
+fn pump_reads(st: &mut State, conn: &mut quiche::Connection, buf: &mut [u8]) {
     for s in st.streams.values_mut() {
         let _ = flush_pending(s);
     }
     let ids: Vec<u64> = conn.readable().collect();
-    let mut buf = [0u8; 16384];
+    let buf = &mut buf[..READ_CHUNK_BYTES];
     for id in ids {
         if let Some(s) = st.streams.get_mut(&id) {
             if !flush_pending(s) || s.failure.is_some() {
                 continue;
             }
             loop {
-                match conn.stream_recv(id, &mut buf) {
+                match conn.stream_recv(id, buf) {
                     Ok((n, fin)) => {
                         if n > 0 {
                             ingest(s, &buf[..n]);
@@ -532,7 +555,7 @@ fn pump_reads(st: &mut State, conn: &mut quiche::Connection) {
             // Unknown / uni stream (e.g. an h3 control stream): drain and drop
             // so flow control keeps moving. We no longer drive h3 post-auth.
             loop {
-                match conn.stream_recv(id, &mut buf) {
+                match conn.stream_recv(id, buf) {
                     Ok((_, fin)) if !fin => {}
                     _ => break,
                 }
@@ -597,9 +620,8 @@ fn flush_pending(s: &mut StreamState) -> bool {
     true
 }
 
-fn pump_datagrams(st: &mut State, conn: &mut quiche::Connection) {
-    let mut buf = [0u8; 65535];
-    while let Ok(n) = conn.dgram_recv(&mut buf) {
+fn pump_datagrams(st: &mut State, conn: &mut quiche::Connection, buf: &mut [u8]) {
+    while let Ok(n) = conn.dgram_recv(buf) {
         tracing::trace!(bytes = n, "hysteria2 received QUIC datagram");
         match proto::decode_udp_message(&buf[..n]) {
             Ok(msg) => {
@@ -742,18 +764,33 @@ async fn flush_send(
     }
 }
 
-fn deobfs(st: &mut State, raw: &[u8], from: SocketAddr) -> Option<Vec<u8>> {
-    match st.obfs.as_mut() {
-        Some(obfs) => obfs.decode(raw, from),
-        None => Some(raw.to_vec()),
+/// Feed the datagrams queued on the socket to quiche, at most
+/// [`RECV_BATCH`] of them, undoing obfs and port-hopping.
+fn recv_batch(
+    st: &mut State,
+    conn: &mut quiche::Connection,
+    buf: &mut [u8],
+) -> std::io::Result<()> {
+    for _ in 0..RECV_BATCH {
+        let (n, from) = match st.socket.try_recv_from(buf) {
+            Ok(v) => v,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let from = st.hop.as_ref().map_or(from, |h| h.normalize_source(from));
+        let info = quiche::RecvInfo { from, to: st.local };
+        let received = match st.obfs.as_mut() {
+            Some(obfs) => match obfs.decode(&buf[..n], from) {
+                Some(mut dgram) => conn.recv(&mut dgram, info),
+                None => continue,
+            },
+            None => conn.recv(&mut buf[..n], info),
+        };
+        if let Err(e) = received {
+            tracing::debug!("hysteria2 could not receive QUIC packet: {e}");
+        }
     }
-}
-
-async fn sleep_opt(timeout: Option<Duration>) {
-    match timeout {
-        Some(d) => tokio::time::sleep(d).await,
-        None => std::future::pending::<()>().await,
-    }
+    Ok(())
 }
 
 fn fail(ready_tx: &mut Option<oneshot::Sender<Result<bool>>>, _st: &mut State, err: Error) {
