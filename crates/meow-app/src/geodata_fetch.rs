@@ -307,8 +307,17 @@ async fn auto_update_tick(
     let mut updated = Vec::new();
 
     let route = tunnel.route_snapshot();
-    let egress =
-        meow_config::resolve_geodata_egress(&raw_config.read(), geo, tunnel.mode(), &route.proxies);
+    let egress = meow_config::resolve_geodata_egress(
+        &raw_config.read(),
+        geo,
+        tunnel.mode(),
+        &route.proxies,
+        &proxy_providers
+            .iter()
+            .filter(|e| !e.value().declared_dialer_names().is_empty())
+            .map(|e| e.key().clone())
+            .collect(),
+    );
 
     if needs.asn {
         if let Err(e) = download_and_replace(&geo.asn_url, asn_target, &egress).await {

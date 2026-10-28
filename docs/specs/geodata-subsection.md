@@ -182,8 +182,11 @@ chain — the proxy itself, a group listing one (recursively), an
 `include-all`/`include-all-proxies` group, or a synthesized `GLOBAL` over
 a config that has one (`reaches_dialer_chain`): those are deliberate
 egress and fail loudly like a provider `proxy:` (#625), so where the CDN
-is blocked a dead chain cannot become direct egress. Nodes from
-proxy-providers are fetched content and are not seen. When the FIRST request's proxy dial fails (connect phase only,
+is blocked a dead chain cannot become direct egress. Provider nodes count
+through the provider: a group whose `use:` names a proxy-provider with
+`dialer-proxy` nodes, or that pulls in every provider (`include-all`,
+`include-all-providers`, a synthesized `GLOBAL`) while one has them.
+Provider contents are judged as loaded when the download starts. When the FIRST request's proxy dial fails (connect phase only,
 `CONNECT_TIMEOUT` included), `internal_http::fetch_or_direct` warns and
 restarts the fetch with no proxy. Post-dial failures (TLS, HTTP status,
 body) and redirect-hop dials never fall back — a mid-chain failure must not

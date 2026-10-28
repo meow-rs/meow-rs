@@ -2942,6 +2942,7 @@ fn rebuild_from_raw_impl(
                     &geo,
                     &collect_geo_scan_lines(raw, &payloads),
                     &proxies,
+                    &chained_provider_names(&candidate_providers),
                 );
             }
             owned_ctx = build_parser_context_with_geo(raw, &geo, &payloads)?;
@@ -3412,7 +3413,8 @@ fn classify_download_target(name: &str, map: &HashMap<SmolStr, Arc<dyn Proxy>>) 
 /// `map.get(name)` is already "the selector_store choice or first member".
 /// `mode` is the tunnel mode the download should follow — the config's
 /// `mode:` at startup, the live one (which `PATCH /configs` can change)
-/// afterwards.
+/// afterwards. `chained_providers` names the proxy-providers whose current
+/// nodes declare `dialer-proxy` ([`chained_provider_names`]).
 ///
 /// Order — first hit wins:
 ///
@@ -3444,6 +3446,7 @@ pub fn resolve_geodata_egress(
     geo: &GeoDataConfig,
     mode: TunnelMode,
     map: &HashMap<SmolStr, Arc<dyn Proxy>>,
+    chained_providers: &std::collections::HashSet<String>,
 ) -> GeodataEgress {
     let named = |proxy: Arc<dyn Proxy>| GeodataEgress::Proxy {
         proxy,
@@ -3451,7 +3454,7 @@ pub fn resolve_geodata_egress(
     };
     let implied = |name: &str, proxy: Arc<dyn Proxy>| GeodataEgress::Proxy {
         proxy,
-        direct_fallback: !reaches_dialer_chain(raw, name),
+        direct_fallback: !reaches_dialer_chain(raw, name, chained_providers),
     };
 
     // 1. Explicit `geodata.proxy`.
@@ -3511,9 +3514,16 @@ pub fn resolve_geodata_egress(
 /// (recursively), or through `include-all`/`include-all-proxies`, which pull
 /// in every static proxy (counted regardless of `filter`, erring towards no
 /// fallback). A `GLOBAL` the config does not declare is synthesized over
-/// every proxy, so it counts any static chain. Nodes from proxy-providers
-/// are fetched content, not in the raw config, and are not seen.
-fn reaches_dialer_chain(raw: &raw::RawConfig, name: &str) -> bool {
+/// every proxy, so it counts any static chain. Provider nodes are fetched
+/// content, not in the raw config: a group reaches a chain through a
+/// provider in `chained_providers` it names in `use:`, or through any of
+/// them when `include-all`/`include-all-providers` pulls every provider in
+/// (as does a synthesized `GLOBAL`).
+fn reaches_dialer_chain(
+    raw: &raw::RawConfig,
+    name: &str,
+    chained_providers: &std::collections::HashSet<String>,
+) -> bool {
     let statics = raw.proxies.as_deref().unwrap_or(&[]);
     let groups = raw.proxy_groups.as_deref().unwrap_or(&[]);
     let chained = |p: &HashMap<String, serde_json::Value>| {
@@ -3529,9 +3539,20 @@ fn reaches_dialer_chain(raw: &raw::RawConfig, name: &str) -> bool {
             continue;
         }
         if let Some(group) = groups.iter().find(|g| g.name == name) {
-            let pulls_statics =
-                group.include_all.unwrap_or(false) || group.include_all_proxies.unwrap_or(false);
+            let include_all = group.include_all.unwrap_or(false);
+            let pulls_statics = include_all || group.include_all_proxies.unwrap_or(false);
             if pulls_statics && any_static_chain() {
+                return true;
+            }
+            let pulls_providers = include_all || group.include_all_providers.unwrap_or(false);
+            if (pulls_providers && !chained_providers.is_empty())
+                || group
+                    .use_providers
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .any(|p| chained_providers.contains(p))
+            {
                 return true;
             }
             stack.extend(
@@ -3549,11 +3570,23 @@ fn reaches_dialer_chain(raw: &raw::RawConfig, name: &str) -> bool {
             if chained(p) {
                 return true;
             }
-        } else if name == "GLOBAL" && any_static_chain() {
+        } else if name == "GLOBAL" && (any_static_chain() || !chained_providers.is_empty()) {
             return true;
         }
     }
     false
+}
+
+/// The proxy-providers whose current nodes declare `dialer-proxy` — the
+/// `chained_providers` argument of [`resolve_geodata_egress`].
+pub fn chained_provider_names<'a>(
+    providers: impl IntoIterator<Item = (&'a String, &'a Arc<ProxyProvider>)>,
+) -> std::collections::HashSet<String> {
+    providers
+        .into_iter()
+        .filter(|(_, p)| !p.declared_dialer_names().is_empty())
+        .map(|(name, _)| name.clone())
+        .collect()
 }
 
 /// The tunnel mode a config starts in — `mode:`, `rule` when absent or
@@ -3614,6 +3647,7 @@ async fn ensure_geodata(
     geo: &GeoDataConfig,
     scan_lines: &[String],
     map: Option<&HashMap<SmolStr, Arc<dyn Proxy>>>,
+    chained_providers: &std::collections::HashSet<String>,
 ) {
     if is_offline_validate() {
         // Validate local databases when present; missing databases use empty
@@ -3626,7 +3660,7 @@ async fn ensure_geodata(
     }
 
     let egress = map.map_or(GeodataEgress::Direct, |m| {
-        resolve_geodata_egress(raw, geo, configured_mode(raw), m)
+        resolve_geodata_egress(raw, geo, configured_mode(raw), m, chained_providers)
     });
 
     for (url, dest) in downloads {
@@ -3649,6 +3683,7 @@ fn ensure_geodata_blocking(
     geo: &GeoDataConfig,
     scan_lines: &[String],
     map: &HashMap<SmolStr, Arc<dyn Proxy>>,
+    chained_providers: &std::collections::HashSet<String>,
 ) {
     if is_offline_validate()
         || missing_geodata_downloads(geo, geo_references(raw, scan_lines)).is_empty()
@@ -3661,7 +3696,13 @@ fn ensure_geodata_blocking(
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()?;
-                rt.block_on(ensure_geodata(raw, geo, scan_lines, Some(map)));
+                rt.block_on(ensure_geodata(
+                    raw,
+                    geo,
+                    scan_lines,
+                    Some(map),
+                    chained_providers,
+                ));
                 Ok::<(), std::io::Error>(())
             })
             .join()
@@ -4643,6 +4684,7 @@ pub async fn build_config(
         &geodata,
         &geo_scan_lines,
         prefetch_proxies.as_deref().map(|p| &p.map),
+        &chained_provider_names(&proxy_providers),
     )
     .await;
     drop(geo_scan_lines);
@@ -5077,7 +5119,13 @@ mod dialer_proxy_tests {
         let geo = geodata::parse_geodata(raw.geodata.as_ref(), raw.geox_url.as_ref()).unwrap();
         let GeodataEgress::Proxy {
             proxy: resolved, ..
-        } = super::resolve_geodata_egress(&raw, &geo, TunnelMode::Rule, &layer.map)
+        } = super::resolve_geodata_egress(
+            &raw,
+            &geo,
+            TunnelMode::Rule,
+            &layer.map,
+            &std::collections::HashSet::new(),
+        )
         else {
             panic!("MATCH target resolves");
         };
@@ -5097,7 +5145,13 @@ mod dialer_proxy_tests {
         let geo = geodata::parse_geodata(raw.geodata.as_ref(), raw.geox_url.as_ref()).unwrap();
         let GeodataEgress::Proxy {
             proxy: resolved, ..
-        } = super::resolve_geodata_egress(&raw, &geo, TunnelMode::Rule, &layer.map)
+        } = super::resolve_geodata_egress(
+            &raw,
+            &geo,
+            TunnelMode::Rule,
+            &layer.map,
+            &std::collections::HashSet::new(),
+        )
         else {
             panic!("MATCH target resolves");
         };
@@ -6607,7 +6661,7 @@ mod geoip_context_tests {
             "both DBs are referenced and missing"
         );
 
-        super::ensure_geodata(&raw, &geo, &scan, None).await;
+        super::ensure_geodata(&raw, &geo, &scan, None, &std::collections::HashSet::new()).await;
 
         assert!(
             asn_hits.load(std::sync::atomic::Ordering::SeqCst) >= 1,
@@ -6688,10 +6742,25 @@ mod geoip_context_tests {
         mode: TunnelMode,
         names: &[&str],
     ) -> (GeodataEgress, HashMap<SmolStr, Arc<dyn Proxy>>) {
+        egress_with(yaml, mode, names, &[])
+    }
+
+    /// [`egress_in`] with the proxy-providers in `chained` carrying
+    /// `dialer-proxy` nodes.
+    fn egress_with(
+        yaml: &str,
+        mode: TunnelMode,
+        names: &[&str],
+        chained: &[&str],
+    ) -> (GeodataEgress, HashMap<SmolStr, Arc<dyn Proxy>>) {
         let raw: raw::RawConfig = serde_saphyr::from_str(yaml).unwrap();
         let geo = geodata::parse_geodata(raw.geodata.as_ref(), raw.geox_url.as_ref()).unwrap();
         let map = proxy_map(names);
-        (super::resolve_geodata_egress(&raw, &geo, mode, &map), map)
+        let chained = chained.iter().map(ToString::to_string).collect();
+        (
+            super::resolve_geodata_egress(&raw, &geo, mode, &map, &chained),
+            map,
+        )
     }
 
     fn egress(yaml: &str, names: &[&str]) -> (GeodataEgress, HashMap<SmolStr, Arc<dyn Proxy>>) {
@@ -6877,6 +6946,48 @@ mod geoip_context_tests {
             assert_rides(&e, &map, "G", fallback);
         }
         let (e, map) = egress_in(proxies, TunnelMode::Global, &names);
+        assert_rides(&e, &map, "GLOBAL", false);
+    }
+
+    /// A group fed by a proxy-provider whose nodes declare `dialer-proxy` —
+    /// named in `use:`, or pulled in by `include-all`/`include-all-providers`
+    /// or a synthesized `GLOBAL` — gets no direct fallback; a group using
+    /// only chain-free providers keeps it.
+    #[test]
+    fn geodata_proxy_group_using_a_chained_provider_does_not_fall_back() {
+        let names = ["G", "GLOBAL"];
+        for (group, chained, fallback) in [
+            (
+                "{name: G, type: select, use: [chain]}",
+                &["chain"][..],
+                false,
+            ),
+            (
+                "{name: G, type: select, use: [plain]}",
+                &["chain"][..],
+                true,
+            ),
+            (
+                "{name: G, type: select, include-all-providers: true}",
+                &["chain"][..],
+                false,
+            ),
+            (
+                "{name: G, type: select, include-all: true}",
+                &["chain"][..],
+                false,
+            ),
+            (
+                "{name: G, type: select, include-all-providers: true}",
+                &[][..],
+                true,
+            ),
+        ] {
+            let yaml = format!("proxy-groups:\n  - {group}\nrules:\n  - MATCH,G\n");
+            let (e, map) = egress_with(&yaml, TunnelMode::Rule, &names, chained);
+            assert_rides(&e, &map, "G", fallback);
+        }
+        let (e, map) = egress_with("mode: global\n", TunnelMode::Global, &names, &["chain"]);
         assert_rides(&e, &map, "GLOBAL", false);
     }
 
