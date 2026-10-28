@@ -8,9 +8,12 @@
 //! background refresh loop and the rebuild/republish choreography a
 //! successful refresh commits through.
 //!
-//! `auto_update_loop` is `pub` so downstream FFI callers that build a
-//! `Tunnel` directly — bypassing `main.rs` — can wire the same behavior in
-//! without reimplementing it.
+//! It also owns the retry for a referenced geosite DB that startup could
+//! not download (`missing_geosite_retry_loop`).
+//!
+//! `auto_update_loop` and `missing_geosite_retry_loop` are `pub` so
+//! downstream FFI callers that build a `Tunnel` directly — bypassing
+//! `main.rs` — can wire the same behavior in without reimplementing it.
 
 use meow_common::logbook::{self, Level};
 use meow_config::geodata::download_and_replace;
@@ -112,8 +115,9 @@ async fn republish_dns_for_geo_dbs(
 /// `needs` is the `GeoDataNeeds` snapshot `build_config` computes from the
 /// rule/sub-rule/provider-payload scan plus the DNS consumers (see
 /// `meow_config::geo_references`). It is a STARTUP SNAPSHOT — a later
-/// `PUT /configs` that adds a geo reference does not widen it, matching the
-/// rebuild path's own freeze on geo downloads.
+/// `PUT /configs` that adds a geo reference does not widen it: that
+/// rebuild downloads the newly referenced DB once if it is missing
+/// (`rebuild_from_raw_runtime`), but this loop does not refresh it.
 ///
 /// The GeoIP MMDB is intentionally NOT refreshed here — country-code → CIDR
 /// mappings change infrequently and skipping the rebuild keeps the
@@ -197,6 +201,84 @@ pub async fn auto_update_loop(
     }
 }
 
+/// First and last pause between [`missing_geosite_retry_loop`] attempts.
+const GEOSITE_RETRY_FIRST: std::time::Duration = std::time::Duration::from_secs(60);
+const GEOSITE_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Background retry for a geosite DB the startup config references but
+/// `build_config` could not download. Geosite is tolerated absent, so the
+/// build succeeds, but until the DB lands every GEOSITE rule and
+/// `geosite:` nameserver-policy key no-matches — and with
+/// `geodata.auto-update` off nothing else would fetch it. Spawn it when
+/// `config.geo_needs.geosite` holds and [`meow_config::geosite_db_present`]
+/// does not.
+///
+/// Each attempt is an `auto_update_tick` scoped to geosite, so a
+/// successful download rebuilds the rules and republishes the resolver
+/// exactly as a scheduled refresh does. Attempts back off from one minute,
+/// doubling to an hour. The loop ends once the DB is on disk — downloaded
+/// here, by the auto-update loop, or put there by the operator — or when
+/// every `Tunnel` handle is dropped (the tunnel is held weakly, as in
+/// [`auto_update_loop`]). Arguments are [`auto_update_loop`]'s.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the same shared registries `auto_update_loop` takes"
+)]
+pub async fn missing_geosite_retry_loop(
+    geo: GeoDataConfig,
+    tunnel: Tunnel,
+    raw_config: Arc<RwLock<RawConfig>>,
+    rule_providers: Arc<RwLock<std::collections::HashMap<String, Arc<RuleProvider>>>>,
+    proxy_providers: Arc<dashmap::DashMap<String, Arc<ProxyProvider>>>,
+    dns_server: Arc<RwLock<Option<meow_api::routes::DnsServerHandle>>>,
+    cache_dir: Option<std::path::PathBuf>,
+) {
+    let weak = tunnel.weak_inner();
+    drop(tunnel);
+    let asn_target = geo
+        .asn_path
+        .clone()
+        .unwrap_or_else(meow_config::default_asn_path);
+    let geosite_target = geo
+        .geosite_path
+        .clone()
+        .unwrap_or_else(meow_config::default_geosite_path);
+    let needs = meow_config::GeoDataNeeds {
+        geosite: true,
+        ..Default::default()
+    };
+
+    let mut delay = GEOSITE_RETRY_FIRST;
+    loop {
+        tokio::time::sleep(delay).await;
+        if meow_config::geosite_db_present(&geo) {
+            return;
+        }
+        let Some(inner) = weak.upgrade() else {
+            return;
+        };
+        let tunnel = Tunnel::from_inner(inner);
+        info!("geodata: retrying the geosite download startup could not complete");
+        auto_update_tick(
+            &geo,
+            needs,
+            &tunnel,
+            &raw_config,
+            Arc::clone(&rule_providers),
+            &proxy_providers,
+            &dns_server,
+            cache_dir.as_deref(),
+            &asn_target,
+            &geosite_target,
+        )
+        .await;
+        if meow_config::geosite_db_present(&geo) {
+            return;
+        }
+        delay = (delay * 2).min(GEOSITE_RETRY_MAX);
+    }
+}
+
 /// One auto-update round: download each DB the startup `needs` snapshot
 /// marks as referenced (each failure is logged and skipped — a partial
 /// update still commits), then serialize through the config lane to
@@ -225,13 +307,11 @@ async fn auto_update_tick(
     let mut updated = Vec::new();
 
     let route = tunnel.route_snapshot();
-    let proxies = &route.proxies;
-    let download_proxy = meow_config::resolve_geodata_download_proxy(&raw_config.read(), proxies);
+    let egress =
+        meow_config::resolve_geodata_egress(&raw_config.read(), geo, tunnel.mode(), &route.proxies);
 
     if needs.asn {
-        if let Err(e) =
-            download_and_replace(&geo.asn_url, asn_target, download_proxy.as_ref()).await
-        {
+        if let Err(e) = download_and_replace(&geo.asn_url, asn_target, &egress).await {
             warn!("geodata auto-update: ASN MMDB download failed: {:#}", e);
             download_failed("ASN MMDB", &e);
         } else {
@@ -240,9 +320,7 @@ async fn auto_update_tick(
     }
 
     if needs.geosite {
-        if let Err(e) =
-            download_and_replace(&geo.geosite_url, geosite_target, download_proxy.as_ref()).await
-        {
+        if let Err(e) = download_and_replace(&geo.geosite_url, geosite_target, &egress).await {
             warn!("geodata auto-update: geosite download failed: {:#}", e);
             download_failed("geosite", &e);
         } else {
@@ -1010,16 +1088,21 @@ mod tests {
 
     /// The tick refreshes only the DBs the startup `needs` snapshot marks
     /// referenced — a `false` flag must not even dial that DB's URL
-    /// (observable: zero hits on its origin, no file on disk) even though
-    /// the sibling download proceeds.
+    /// (observable: zero hits on its origin, no file on disk) while the
+    /// referenced sibling is downloaded and replaced.
     #[tokio::test]
     async fn auto_update_tick_downloads_only_referenced_dbs() {
-        let (asn_addr, asn_hits, stop) = spawn_body_server(b"asn");
+        let (asn_addr, asn_hits, asn_stop) = spawn_body_server(b"asn");
+        let v2 =
+            meow_rules::mrs_parser::write_geosite_mrs(&meow_rules::mrs_parser::GeositePayload {
+                categories: vec![("testcat".to_string(), vec!["hit.example".to_string()])],
+            })
+            .unwrap();
+        let (geosite_addr, geosite_hits, geosite_stop) = spawn_body_server(v2.clone().leak());
         let dir = tempfile::tempdir().unwrap();
         let asn_target = dir.path().join("asn.mmdb");
         let geosite_path = dir.path().join("geosite.mrs");
-        // v1 on disk so the geosite download (needs.geosite=true below)
-        // writes a real replacement.
+        // v1 on disk, so the referenced download is a replacement.
         let v1 = meow_rules::mrs_parser::GeositePayload {
             categories: vec![("testcat".to_string(), vec![])],
         };
@@ -1045,9 +1128,8 @@ mod tests {
         let tunnel = Tunnel::new(resolver);
         let geo = GeoDataConfig {
             asn_url: format!("http://{asn_addr}/asn.mmdb"),
-            // Unreachable — the referenced-geosite download is what the
-            // test does NOT exercise here (kept off-network entirely).
-            geosite_url: "http://127.0.0.1:1/geosite.mrs".to_string(),
+            geosite_url: format!("http://{geosite_addr}/geosite.mrs"),
+            geosite_path: Some(geosite_path.clone()),
             ..GeoDataConfig::default()
         };
         let dns_server: Arc<RwLock<Option<meow_api::routes::DnsServerHandle>>> =
@@ -1056,8 +1138,6 @@ mod tests {
         auto_update_tick(
             &geo,
             // ASN is NOT referenced — its reachable URL must not be dialed.
-            // Geosite is referenced but unreachable → tolerated failure →
-            // `updated` stays empty and no rebuild runs.
             meow_config::GeoDataNeeds {
                 geosite: true,
                 ..meow_config::GeoDataNeeds::default()
@@ -1079,6 +1159,72 @@ mod tests {
             "an unreferenced DB's URL must not be dialed"
         );
         assert!(!asn_target.exists(), "no ASN file may be written");
+        assert_eq!(
+            geosite_hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the referenced DB is fetched once"
+        );
+        assert_eq!(
+            std::fs::read(&geosite_path).unwrap(),
+            v2,
+            "the referenced DB is replaced with the served generation"
+        );
+        asn_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        geosite_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// A referenced geosite DB missing after startup is retried in the
+    /// background: the first attempt (one minute in, on the paused clock)
+    /// downloads it, and the loop then ends on its own.
+    #[tokio::test(start_paused = true)]
+    async fn missing_geosite_retry_loop_downloads_then_stops() {
+        let body =
+            meow_rules::mrs_parser::write_geosite_mrs(&meow_rules::mrs_parser::GeositePayload {
+                categories: vec![("testcat".to_string(), vec!["hit.example".to_string()])],
+            })
+            .unwrap();
+        let (addr, hits, stop) = spawn_body_server(body.clone().leak());
+        let dir = tempfile::tempdir().unwrap();
+        let geosite_path = dir.path().join("geosite.mrs");
+        let raw: RawConfig = serde_saphyr::from_str("rules:\n  - MATCH,DIRECT\n").unwrap();
+        let resolver = Arc::new(meow_dns::Resolver::new(
+            vec!["127.0.0.1:53".parse().unwrap()],
+            vec![],
+            meow_common::DnsMode::Normal,
+            meow_trie::DomainTrie::new(),
+            true,
+            true,
+        ));
+        let tunnel = Tunnel::new(resolver);
+        let geo = GeoDataConfig {
+            geosite_url: format!("http://{addr}/geosite.mrs"),
+            geosite_path: Some(geosite_path.clone()),
+            ..GeoDataConfig::default()
+        };
+        assert!(!meow_config::geosite_db_present(&geo));
+
+        // Skip the first back-off on the paused clock, then let the
+        // download's real socket I/O run on the real one.
+        let retry = tokio::spawn(missing_geosite_retry_loop(
+            geo,
+            tunnel.clone(),
+            Arc::new(RwLock::new(raw)),
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(dashmap::DashMap::new()),
+            Arc::new(RwLock::new(None)),
+            Some(dir.path().to_path_buf()),
+        ));
+        // Let the loop reach its first sleep before moving the clock.
+        tokio::task::yield_now().await;
+        tokio::time::advance(GEOSITE_RETRY_FIRST).await;
+        tokio::time::resume();
+        tokio::time::timeout(std::time::Duration::from_secs(10), retry)
+            .await
+            .expect("the loop ends once the DB is on disk")
+            .unwrap();
+
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(std::fs::read(&geosite_path).unwrap(), body);
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 

@@ -270,9 +270,10 @@ enum Outcome {
 /// Marker wrapping a proxy-dial failure from `fetch_one`. It exists so the
 /// [`fetch_or_direct`] opt-in can distinguish "the connect phase through
 /// the configured proxy never got a socket" (eligible for a direct retry)
-/// from every later failure, which stays loud. Display/`source` forward to
-/// the wrapped error, so error messages and downcast chains are unchanged
-/// for callers that never opt in.
+/// from every later failure, which stays loud. Display forwards to the
+/// wrapped error's message and `source` to ITS source, so the marker adds
+/// no link of its own: `{e:#}` prints each message once and error
+/// messages are unchanged for callers that never opt in.
 #[derive(Debug)]
 struct ProxyDialFailed(anyhow::Error);
 
@@ -284,7 +285,7 @@ impl std::fmt::Display for ProxyDialFailed {
 
 impl std::error::Error for ProxyDialFailed {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&*self.0)
+        self.0.source()
     }
 }
 
@@ -601,6 +602,7 @@ pub fn first_named_proxy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{Dial, ScriptedProxy};
 
     #[test]
     fn parse_response_decodes_chunked_body_and_extensions() {
@@ -642,131 +644,11 @@ mod tests {
         assert!(parse_response(response, MAX_BODY_BYTES).is_err());
     }
 
-    /// `Proxy` whose `dial_tcp` never completes — models an adapter dialing an
-    /// unreachable upstream with no protocol-level connect timeout.
-    struct HangingProxy {
-        health: meow_common::ProxyHealth,
-    }
-
-    #[async_trait::async_trait]
-    impl meow_common::ProxyAdapter for HangingProxy {
-        fn name(&self) -> &str {
-            "hang"
-        }
-        fn adapter_type(&self) -> meow_common::AdapterType {
-            meow_common::AdapterType::Direct
-        }
-        fn addr(&self) -> &str {
-            ""
-        }
-        fn support_udp(&self) -> bool {
-            false
-        }
-        async fn dial_tcp(
-            &self,
-            _m: &Metadata,
-        ) -> meow_common::Result<Box<dyn meow_common::ProxyConn>> {
-            std::future::pending().await
-        }
-        async fn dial_udp(
-            &self,
-            _m: &Metadata,
-        ) -> meow_common::Result<Box<dyn meow_common::ProxyPacketConn>> {
-            Err(meow_common::MeowError::NotSupported(
-                "hang: dial_udp".into(),
-            ))
-        }
-        fn health(&self) -> &meow_common::ProxyHealth {
-            &self.health
-        }
-    }
-
-    impl Proxy for HangingProxy {
-        fn alive(&self) -> bool {
-            true
-        }
-        fn alive_for_url(&self, _url: &str) -> bool {
-            true
-        }
-        fn last_delay(&self) -> u16 {
-            0
-        }
-        fn last_delay_for_url(&self, _url: &str) -> u16 {
-            0
-        }
-        fn delay_history(&self) -> Vec<meow_common::DelayHistory> {
-            Vec::new()
-        }
-    }
-
-    /// `Proxy` whose `dial_tcp` hangs only after moving the paused clock past
-    /// `CONNECT_TIMEOUT` and resuming it. A plain `HangingProxy` under
-    /// `start_paused` would also expire the direct fallback's real loopback
-    /// connect, since tokio auto-advances while that connect waits on I/O.
-    struct ExpiringProxy {
-        health: meow_common::ProxyHealth,
-    }
-
-    #[async_trait::async_trait]
-    impl meow_common::ProxyAdapter for ExpiringProxy {
-        fn name(&self) -> &str {
-            "expire"
-        }
-        fn adapter_type(&self) -> meow_common::AdapterType {
-            meow_common::AdapterType::Direct
-        }
-        fn addr(&self) -> &str {
-            ""
-        }
-        fn support_udp(&self) -> bool {
-            false
-        }
-        async fn dial_tcp(
-            &self,
-            _m: &Metadata,
-        ) -> meow_common::Result<Box<dyn meow_common::ProxyConn>> {
-            tokio::time::advance(CONNECT_TIMEOUT + Duration::from_secs(1)).await;
-            tokio::time::resume();
-            std::future::pending().await
-        }
-        async fn dial_udp(
-            &self,
-            _m: &Metadata,
-        ) -> meow_common::Result<Box<dyn meow_common::ProxyPacketConn>> {
-            Err(meow_common::MeowError::NotSupported(
-                "expire: dial_udp".into(),
-            ))
-        }
-        fn health(&self) -> &meow_common::ProxyHealth {
-            &self.health
-        }
-    }
-
-    impl Proxy for ExpiringProxy {
-        fn alive(&self) -> bool {
-            true
-        }
-        fn alive_for_url(&self, _url: &str) -> bool {
-            true
-        }
-        fn last_delay(&self) -> u16 {
-            0
-        }
-        fn last_delay_for_url(&self, _url: &str) -> u16 {
-            0
-        }
-        fn delay_history(&self) -> Vec<meow_common::DelayHistory> {
-            Vec::new()
-        }
-    }
-
     // start_paused: tokio auto-advances the clock when every task is idle, so
     // the CONNECT_TIMEOUT fires immediately instead of after a real 15 s.
     #[tokio::test(start_paused = true)]
     async fn connect_timeout_bounds_hung_dial() {
-        let proxy: Arc<dyn Proxy> = Arc::new(HangingProxy {
-            health: meow_common::ProxyHealth::new(),
-        });
+        let proxy: Arc<dyn Proxy> = ScriptedProxy::arc("hang", Dial::Hang);
         let err = fetch_via_proxy("http://192.0.2.1/rules.yaml", &proxy)
             .await
             .unwrap_err();
@@ -1209,65 +1091,6 @@ mod tests {
         assert!(resolve_download_proxy(&registry, Some("missing")).is_err());
     }
 
-    /// `Proxy` whose `dial_tcp` fails immediately — models an adapter whose
-    /// upstream is unreachable so the connect phase itself errors.
-    struct FailingDialProxy {
-        health: meow_common::ProxyHealth,
-    }
-
-    #[async_trait::async_trait]
-    impl meow_common::ProxyAdapter for FailingDialProxy {
-        fn name(&self) -> &str {
-            "failing"
-        }
-        fn adapter_type(&self) -> meow_common::AdapterType {
-            meow_common::AdapterType::Direct
-        }
-        fn addr(&self) -> &str {
-            ""
-        }
-        fn support_udp(&self) -> bool {
-            false
-        }
-        async fn dial_tcp(
-            &self,
-            _m: &Metadata,
-        ) -> meow_common::Result<Box<dyn meow_common::ProxyConn>> {
-            Err(meow_common::MeowError::NotSupported(
-                "failing: connect refused".into(),
-            ))
-        }
-        async fn dial_udp(
-            &self,
-            _m: &Metadata,
-        ) -> meow_common::Result<Box<dyn meow_common::ProxyPacketConn>> {
-            Err(meow_common::MeowError::NotSupported(
-                "failing: dial_udp".into(),
-            ))
-        }
-        fn health(&self) -> &meow_common::ProxyHealth {
-            &self.health
-        }
-    }
-
-    impl Proxy for FailingDialProxy {
-        fn alive(&self) -> bool {
-            true
-        }
-        fn alive_for_url(&self, _url: &str) -> bool {
-            true
-        }
-        fn last_delay(&self) -> u16 {
-            0
-        }
-        fn last_delay_for_url(&self, _url: &str) -> u16 {
-            0
-        }
-        fn delay_history(&self) -> Vec<meow_common::DelayHistory> {
-            Vec::new()
-        }
-    }
-
     /// `Proxy` that succeeds the first `dial_tcp` and fails the second —
     /// pins "only the first hop's dial failure may fall back": a mid-chain
     /// (redirect-hop) dial error must NOT retry the fetch direct.
@@ -1355,9 +1178,7 @@ mod tests {
     #[tokio::test]
     async fn fetch_or_direct_falls_back_on_initial_dial_failure() {
         let url = spawn_raw_http_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await;
-        let proxy: Arc<dyn Proxy> = Arc::new(FailingDialProxy {
-            health: meow_common::ProxyHealth::new(),
-        });
+        let proxy: Arc<dyn Proxy> = ScriptedProxy::arc("failing", Dial::Fail);
         let body = tokio::time::timeout(
             Duration::from_secs(5),
             fetch_or_direct(&url, Some(&proxy), &[]),
@@ -1372,14 +1193,16 @@ mod tests {
     #[tokio::test]
     async fn fetch_does_not_fall_back_without_opt_in() {
         let url = spawn_raw_http_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await;
-        let proxy: Arc<dyn Proxy> = Arc::new(FailingDialProxy {
-            health: meow_common::ProxyHealth::new(),
-        });
+        let proxy: Arc<dyn Proxy> = ScriptedProxy::arc("failing", Dial::Fail);
         let err = fetch(&url, Some(&proxy), &[]).await.unwrap_err();
         assert!(
             err.to_string().contains("dial via proxy"),
             "unexpected error: {err}"
         );
+        // The `ProxyDialFailed` marker adds no link of its own to the
+        // chain, so the alternate format names the failure once.
+        let chain = format!("{err:#}");
+        assert_eq!(chain.matches("dial via proxy").count(), 1, "{chain}");
     }
 
     /// A dial failure on a REDIRECT hop is mid-chain — it must surface as
@@ -1409,9 +1232,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn fetch_or_direct_falls_back_on_dial_timeout() {
         let url = spawn_raw_http_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await;
-        let proxy: Arc<dyn Proxy> = Arc::new(ExpiringProxy {
-            health: meow_common::ProxyHealth::new(),
-        });
+        let proxy: Arc<dyn Proxy> = ScriptedProxy::arc(
+            "expire",
+            Dial::Expire {
+                by: CONNECT_TIMEOUT + Duration::from_secs(1),
+            },
+        );
         let body = fetch_or_direct(&url, Some(&proxy), &[]).await.unwrap();
         assert_eq!(body, b"ok");
     }

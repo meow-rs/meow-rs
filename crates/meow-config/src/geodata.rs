@@ -27,8 +27,8 @@ pub struct GeoDataConfig {
     pub asn_url: String,
     pub geosite_url: String,
     /// `geodata.proxy` verbatim — resolved against the built proxy map by
-    /// `resolve_geodata_download_proxy` at download time (`DIRECT` and the
-    /// other built-in terminal names mean "fetch direct").
+    /// `resolve_geodata_egress` at download time (`DIRECT`/`COMPATIBLE`/
+    /// `PASS` mean "fetch direct", `REJECT`/`REJECT-DROP` "don't fetch").
     pub proxy: Option<String>,
 }
 
@@ -150,19 +150,61 @@ pub fn parse_geodata(
     })
 }
 
+/// The outbound a geodata download takes, as `resolve_geodata_egress`
+/// picks it from the config.
+#[derive(Clone)]
+pub enum GeodataEgress {
+    /// Fetch directly.
+    Direct,
+    /// Fetch through `proxy` (needed where the CDN is blocked; issue #533).
+    /// `direct_fallback`: a failed FIRST dial retries direct (see
+    /// `internal_http::fetch_or_direct`). Set only for an egress the config
+    /// implies — the default route or `proxies[0]` — never for an explicit
+    /// `geodata.proxy`, which fails loudly like a provider `proxy:` (#625).
+    Proxy {
+        proxy: Arc<dyn Proxy>,
+        direct_fallback: bool,
+    },
+    /// The config sends the download to `REJECT`/`REJECT-DROP` (named here):
+    /// skip it rather than dial out.
+    Rejected(&'static str),
+}
+
+impl std::fmt::Debug for GeodataEgress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Direct => f.write_str("Direct"),
+            Self::Proxy {
+                proxy,
+                direct_fallback,
+            } => f
+                .debug_struct("Proxy")
+                .field("proxy", &proxy.name())
+                .field("direct_fallback", direct_fallback)
+                .finish(),
+            Self::Rejected(name) => f.debug_tuple("Rejected").field(name).finish(),
+        }
+    }
+}
+
 /// Download `url` and atomically replace `dest` via a `.tmp` sibling.
 ///
-/// When `proxy` is `Some`, the HTTP fetch is tunneled through that proxy
-/// adapter (used so GFW-blocked CDNs stay reachable on background refresh);
-/// otherwise the OS handles connectivity directly.
+/// `egress` picks the outbound: through a proxy adapter (so GFW-blocked
+/// CDNs stay reachable), directly, or — for a `REJECT` egress — not at all,
+/// which is an error so callers log it like any failed download.
 ///
 /// Returns `Ok(())` on success. On failure the temp file is removed (best-
 /// effort) and the original `dest` is untouched.
 pub async fn download_and_replace(
     url: &str,
     dest: &Path,
-    proxy: Option<&Arc<dyn Proxy>>,
+    egress: &GeodataEgress,
 ) -> Result<(), anyhow::Error> {
+    if let GeodataEgress::Rejected(name) = egress {
+        return Err(anyhow!(
+            "not fetching {url}: the config routes geodata downloads to {name}"
+        ));
+    }
     // Unique scratch, not `with_extension("tmp")` — same-stem targets
     // (`Country.mmdb`/`Country.yaml` → `Country.tmp`) and concurrent
     // downloaders (auto-update vs rebuild-time `ensure_geodata`) must not
@@ -196,22 +238,32 @@ pub async fn download_and_replace(
     }
     let tmp = crate::unique_scratch_path(dest);
 
-    if let Some(p) = proxy {
-        info!(
-            "auto-update: downloading {} from {} via proxy '{}'",
-            dest.display(),
-            url,
-            p.name()
-        );
-    } else {
-        info!("auto-update: downloading {} from {}", dest.display(), url);
-    }
-
-    // Geodata-only opt-in: a failed proxy dial retries direct — see
-    // `internal_http::fetch_or_direct` for the connect-phase-only contract.
-    let bytes = internal_http::fetch_or_direct(url, proxy, &[])
-        .await
-        .map_err(|e| anyhow!("fetching {url}: {e}"))?;
+    let fetched = match egress {
+        GeodataEgress::Proxy {
+            proxy,
+            direct_fallback,
+        } => {
+            info!(
+                "auto-update: downloading {} from {} via proxy '{}'",
+                dest.display(),
+                url,
+                proxy.name()
+            );
+            if *direct_fallback {
+                // A failed proxy dial retries direct — see
+                // `internal_http::fetch_or_direct` for the
+                // connect-phase-only contract.
+                internal_http::fetch_or_direct(url, Some(proxy), &[]).await
+            } else {
+                internal_http::fetch(url, Some(proxy), &[]).await
+            }
+        }
+        _ => {
+            info!("auto-update: downloading {} from {}", dest.display(), url);
+            internal_http::fetch(url, None, &[]).await
+        }
+    };
+    let bytes = fetched.map_err(|e| anyhow!("fetching {url}: {e}"))?;
 
     if let Some(parent) = dest.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -427,109 +479,78 @@ mod tests {
 
     // ── download_and_replace (geodata-only direct fallback) ────────────
 
-    /// A `Proxy` whose `dial_tcp` always fails — models an unreachable
-    /// upstream so the connect phase itself errors.
-    struct FailingDialProxy {
-        health: meow_common::ProxyHealth,
-    }
+    use crate::test_support::{serve_body, Dial, ScriptedProxy};
 
-    #[async_trait::async_trait]
-    impl meow_common::ProxyAdapter for FailingDialProxy {
-        fn name(&self) -> &str {
-            "failing"
-        }
-        fn adapter_type(&self) -> meow_common::AdapterType {
-            meow_common::AdapterType::Direct
-        }
-        fn addr(&self) -> &str {
-            ""
-        }
-        fn support_udp(&self) -> bool {
-            false
-        }
-        async fn dial_tcp(
-            &self,
-            _m: &meow_common::Metadata,
-        ) -> meow_common::Result<Box<dyn meow_common::ProxyConn>> {
-            Err(meow_common::MeowError::NotSupported(
-                "failing: connect refused".into(),
-            ))
-        }
-        async fn dial_udp(
-            &self,
-            _m: &meow_common::Metadata,
-        ) -> meow_common::Result<Box<dyn meow_common::ProxyPacketConn>> {
-            Err(meow_common::MeowError::NotSupported(
-                "failing: dial_udp".into(),
-            ))
-        }
-        fn health(&self) -> &meow_common::ProxyHealth {
-            &self.health
-        }
-    }
-
-    impl Proxy for FailingDialProxy {
-        fn alive(&self) -> bool {
-            true
-        }
-        fn alive_for_url(&self, _url: &str) -> bool {
-            true
-        }
-        fn last_delay(&self) -> u16 {
-            0
-        }
-        fn last_delay_for_url(&self, _url: &str) -> u16 {
-            0
-        }
-        fn delay_history(&self) -> Vec<meow_common::DelayHistory> {
-            Vec::new()
-        }
-    }
-
-    /// Serve `response` to every accepted connection — the geodata direct
-    /// fallback dials a second time after the proxy dial fails, so the
-    /// origin must accept more than once.
-    async fn spawn_test_origin(response: &'static [u8]) -> String {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            while let Ok((mut stream, _)) = listener.accept().await {
-                tokio::spawn(async move {
-                    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-                    let mut buf = [0u8; 2048];
-                    let _ = stream.read(&mut buf).await;
-                    let _ = stream.write_all(response).await;
-                });
-            }
-        });
-        format!("http://{addr}/Country.mmdb")
-    }
-
-    /// Integration pin for the geodata-only opt-in: a configured download
+    /// Integration pin for the geodata-only opt-in: an implied download
     /// proxy whose connect phase fails must NOT sink the download — the
     /// fetch retries direct (`internal_http::fetch_or_direct`) and the
     /// file lands on disk.
     #[tokio::test]
     async fn download_and_replace_falls_back_to_direct_after_dial_failure() {
-        let url = spawn_test_origin(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc").await;
-        let proxy: Arc<dyn Proxy> = Arc::new(FailingDialProxy {
-            health: meow_common::ProxyHealth::new(),
-        });
+        let (addr, hits) = serve_body(b"abc").await;
+        let egress = GeodataEgress::Proxy {
+            proxy: ScriptedProxy::arc("failing", Dial::Fail),
+            direct_fallback: true,
+        };
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("Country.mmdb");
-        download_and_replace(&url, &dest, Some(&proxy))
+        download_and_replace(&format!("http://{addr}/Country.mmdb"), &dest, &egress)
             .await
             .unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), b"abc");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// An explicit `geodata.proxy` (no fallback) whose dial fails is a
+    /// loud error, never a direct fetch.
+    #[tokio::test]
+    async fn download_and_replace_explicit_proxy_does_not_fall_back() {
+        let (addr, hits) = serve_body(b"abc").await;
+        let egress = GeodataEgress::Proxy {
+            proxy: ScriptedProxy::arc("failing", Dial::Fail),
+            direct_fallback: false,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("Country.mmdb");
+        let err = download_and_replace(&format!("http://{addr}/Country.mmdb"), &dest, &egress)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("dial via proxy"), "{err:#}");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(!dest.exists());
+    }
+
+    /// A `REJECT` egress downloads nothing and dials nothing.
+    #[tokio::test]
+    async fn download_and_replace_rejected_does_not_dial() {
+        let (addr, hits) = serve_body(b"abc").await;
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("Country.mmdb");
+        let err = download_and_replace(
+            &format!("http://{addr}/Country.mmdb"),
+            &dest,
+            &GeodataEgress::Rejected("REJECT"),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("REJECT"), "{err}");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(!dest.exists());
     }
 
     /// A working direct fetch still lands without any proxy configured.
     #[tokio::test]
     async fn download_and_replace_direct_writes_file() {
-        let url = spawn_test_origin(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nxy").await;
+        let (addr, _) = serve_body(b"xy").await;
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("geosite.dat");
-        download_and_replace(&url, &dest, None).await.unwrap();
+        download_and_replace(
+            &format!("http://{addr}/geosite.dat"),
+            &dest,
+            &GeodataEgress::Direct,
+        )
+        .await
+        .unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), b"xy");
     }
 }

@@ -50,14 +50,17 @@ the canonical, in-repo source a release is cut from.
 - **`geodata.proxy`, an egress override for database downloads**: names
   the outbound geodata fetches ride — a `proxies:` entry or a
   `proxy-groups:` name (a `select` group dials its persisted or first
-  member), or a built-in terminal name (`DIRECT`, `REJECT`,
-  `REJECT-DROP`, `COMPATIBLE`, `PASS`, `PASS-RULE`, case-insensitive)
-  for direct. Unset, the download takes the config's default egress —
-  the last top-level `MATCH` target — then the first `proxies:` entry;
-  a blank or unknown name warns and falls through to the same default.
-  When the first dial through that proxy fails, the fetch warns and
-  retries once direct — a geodata-only fallback provider and
-  subscription downloads deliberately do not share.
+  member), or a built-in name: `DIRECT`, `COMPATIBLE`, `PASS` or
+  `PASS-RULE` for direct, `REJECT` or `REJECT-DROP` for no download at
+  all (case-insensitive, unless a proxy of exactly that name exists).
+  Unset, the download takes the config's default route — direct in
+  `mode: direct`, the `GLOBAL` group in `mode: global`, otherwise the
+  last top-level `MATCH` target — then the first `proxies:` entry; a
+  blank or unknown name warns and falls through to the same default.
+  When the first dial through that default fails, the fetch warns and
+  retries once direct, a geodata-only fallback that provider and
+  subscription downloads deliberately do not share. A proxy named in
+  `geodata.proxy` never falls back: its failure is reported instead.
 - **The top-level `geox-url` alias**: mihomo's flat spelling of
   `geodata.url.*` is now read too, merged per key below the explicit
   block — `geodata.url.mmdb` beats `geox-url.mmdb`, which beats the
@@ -162,7 +165,12 @@ the canonical, in-repo source a release is cut from.
   likewise re-downloads only the databases the startup config
   referenced — the referenced set is a startup snapshot a `PUT
   /configs` does not widen, the Country MMDB is still never a tick
-  target, and an all-false set leaves the tick a no-op.
+  target, and an all-false set leaves the tick a no-op. A `PUT /configs`
+  or subscription refresh that references a database the disk lacks
+  downloads it before the reload is applied, so a newly added `GEOIP`
+  rule no longer fails the reload. A referenced geosite database that
+  startup could not download is retried in the background, from one
+  minute apart up to hourly, instead of no-matching until restart.
 - **The YAML parser is `serde-saphyr`**: the config parser links
   `serde-saphyr` 2.0.0 — a pure-Rust serde YAML implementation over the
   `granit-parser` event parser with `#![forbid(unsafe_code)]` — instead of

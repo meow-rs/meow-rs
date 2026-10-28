@@ -140,30 +140,48 @@ at its own load point as before.
 The verdict (`GeoDataNeeds`) is computed once by `geo_references` — the
 same helper `missing_geodata_downloads` consumes — and stored on
 `Config.geo_needs` for the auto-update loop. It is a **startup snapshot**:
-a later `PUT /configs` that adds a geo reference does not widen it,
-matching the rebuild path's own freeze on geo downloads.
+a later `PUT /configs` that adds a geo reference does not widen it. That
+reload's rebuild (`rebuild_from_raw_runtime`, also behind subscription
+refresh) downloads the newly referenced DB once when it is missing — the
+GeoIP/ASN parser context would otherwise hard-error and reject the reload —
+but the auto-update loop does not refresh it.
 
-### Download egress — *As shipped*: `resolve_geodata_download_proxy`
+A referenced geosite DB that startup failed to download (tolerated absent,
+so the build succeeds) is retried in the background by
+`missing_geosite_retry_loop`: back-off from one minute, doubling to an
+hour, each attempt an auto-update tick scoped to geosite, until the DB is
+on disk.
 
-`geodata.proxy` overrides which outbound downloads ride; resolution order:
+### Download egress — *As shipped*: `resolve_geodata_egress`
+
+`geodata.proxy` overrides which outbound downloads ride. The result is a
+`GeodataEgress`: `Direct`, `Proxy { proxy, direct_fallback }`, or
+`Rejected` (no download at all). Resolution order:
 
 1. `geodata.proxy` — a `proxies:`/`proxy-groups:` name resolves against the
    built proxy map as-is (a `select` group dials its persisted-or-first
-   member; no leaf-stripping). A built-in terminal name
-   (`DIRECT`/`REJECT`/`REJECT-DROP`/`COMPATIBLE`/`PASS`/`PASS-RULE`,
-   case-insensitive) means direct. Blank warns and is ignored; an unknown
-   name warns and falls through to (2).
-2. Last top-level `MATCH,<target>` — the config's default egress — with
-   the same terminal-name/`map.get` semantics; a miss warns and falls
-   through to (3).
+   member; no leaf-stripping), with **no** direct fallback: an explicit
+   egress fails loudly, like a provider `proxy:` (#625). Built-in names:
+   `DIRECT`/`COMPATIBLE`/`PASS`/`PASS-RULE` mean direct,
+   `REJECT`/`REJECT-DROP` mean no download. An exact built-in spelling is
+   the built-in; otherwise a name present in the map is that node (a user
+   proxy named `pass` is not `PASS`, as the tunnel binds it); only then does
+   a case-insensitive built-in spelling count. Blank warns and is ignored;
+   an unknown name warns and falls through to (2).
+2. The tunnel mode's default route — the config's `mode:` at startup, the
+   live mode on an auto-update tick. `direct` → direct; `global` → the
+   `GLOBAL` group (direct without one, as the tunnel routes); `rule` → the
+   last top-level `MATCH,<target>`, with the same built-in/`map.get`
+   semantics, a miss warning and falling through to (3).
 3. `proxies[0]` — the legacy `first_named_proxy` fallback.
 
-*Direct fallback (geodata-only opt-in):* when the FIRST request's proxy
-dial fails (connect phase only, `CONNECT_TIMEOUT` included),
-`internal_http::fetch_or_direct` warns and restarts the fetch with no
-proxy. Post-dial failures (TLS, HTTP status, body) and redirect-hop dials
-never fall back — a mid-chain failure must not silently leak egress.
-Provider/subscription fetches deliberately do NOT get this fallback.
+*Direct fallback (geodata-only opt-in):* for an egress from (2) or (3),
+when the FIRST request's proxy dial fails (connect phase only,
+`CONNECT_TIMEOUT` included), `internal_http::fetch_or_direct` warns and
+restarts the fetch with no proxy. Post-dial failures (TLS, HTTP status,
+body) and redirect-hop dials never fall back — a mid-chain failure must not
+silently leak egress. Provider/subscription fetches deliberately do NOT get
+this fallback, and neither does an explicit `geodata.proxy`.
 
 ### Auto-update task — *As shipped*
 

@@ -1235,6 +1235,40 @@ async fn run(
         });
     }
 
+    // Rebuild context mirrors startup: a `--config-string` run had no
+    // backing file, so provider `path:`/fakeip resolution must see the
+    // same `cache_dir: None` here (issue #717). Geodata download targets
+    // resolve under the `-d`/XDG home independently.
+    let geodata_cache_dir = config_path
+        .as_deref()
+        .filter(|p| !p.is_empty())
+        .map(meow_config::resource_cache_dir_for_config_path);
+
+    // A referenced geosite DB that `build_config` failed to download is
+    // tolerated absent (its rules no-match); keep retrying it in the
+    // background so a transient CDN error does not last until restart.
+    if config.geo_needs.geosite && !meow_config::geosite_db_present(&config.geodata) {
+        let geodata = config.geodata.clone();
+        let tunnel = tunnel.clone();
+        let raw_config = Arc::clone(&raw_config);
+        let rule_providers = Arc::clone(&rule_providers);
+        let proxy_providers = Arc::clone(&proxy_providers);
+        let dns_server = Arc::clone(&dns_server_handle);
+        let cache_dir = geodata_cache_dir.clone();
+        tokio::spawn(async move {
+            meow_app::geodata_fetch::missing_geosite_retry_loop(
+                geodata,
+                tunnel,
+                raw_config,
+                rule_providers,
+                proxy_providers,
+                dns_server,
+                cache_dir,
+            )
+            .await;
+        });
+    }
+
     // Spawn geodata auto-update task if enabled. `geo_needs` is the
     // startup snapshot of which DBs the config references — the tick
     // refreshes only those.
@@ -1246,14 +1280,7 @@ async fn run(
         let rule_providers = Arc::clone(&rule_providers);
         let proxy_providers = Arc::clone(&proxy_providers);
         let dns_server = Arc::clone(&dns_server_handle);
-        // Rebuild context mirrors startup: a `--config-string` run had no
-        // backing file, so provider `path:`/fakeip resolution must see the
-        // same `cache_dir: None` here (issue #717). Geodata download
-        // targets resolve under the `-d`/XDG home independently.
-        let cache_dir = config_path
-            .as_deref()
-            .filter(|p| !p.is_empty())
-            .map(meow_config::resource_cache_dir_for_config_path);
+        let cache_dir = geodata_cache_dir;
         tokio::spawn(async move {
             meow_app::geodata_fetch::auto_update_loop(
                 geodata,

@@ -1,10 +1,13 @@
-//! Test helpers shared by the provider modules.
+//! Test helpers shared by this crate's unit tests.
 
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use meow_common::adapter::Proxy;
 use meow_common::logbook::{self, Entry, Query};
+use meow_common::Metadata;
 use parking_lot::{Mutex, MutexGuard};
 
 /// A provider origin the test steers: counts requests, answers with the
@@ -148,4 +151,131 @@ impl Drop for TestLogbook {
 pub(crate) fn ech_dns_serial() -> &'static tokio::sync::Mutex<()> {
     static SERIAL: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
     SERIAL.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+/// How a [`ScriptedProxy`]'s `dial_tcp` behaves.
+#[derive(Clone, Copy)]
+pub(crate) enum Dial {
+    /// Fails at once — an unreachable upstream refusing the connect.
+    Fail,
+    /// Never completes — an upstream with no protocol-level connect timeout.
+    Hang,
+    /// Moves the paused clock `by`, resumes it, then hangs. Under
+    /// `start_paused` that expires a dial timeout of `by` or less at once,
+    /// while any later real socket I/O runs on the real clock: with a plain
+    /// [`Dial::Hang`], tokio's auto-advance would also expire timeouts that
+    /// wait on real I/O (a direct fallback's loopback connect).
+    Expire { by: Duration },
+}
+
+/// A `Proxy` whose TCP dial follows a [`Dial`] script. It counts dials.
+pub(crate) struct ScriptedProxy {
+    name: &'static str,
+    dial: Dial,
+    dials: AtomicUsize,
+    health: meow_common::ProxyHealth,
+}
+
+impl ScriptedProxy {
+    pub(crate) fn arc(name: &'static str, dial: Dial) -> Arc<dyn Proxy> {
+        Arc::new(Self {
+            name,
+            dial,
+            dials: AtomicUsize::new(0),
+            health: meow_common::ProxyHealth::new(),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl meow_common::ProxyAdapter for ScriptedProxy {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn adapter_type(&self) -> meow_common::AdapterType {
+        meow_common::AdapterType::Direct
+    }
+    fn addr(&self) -> &str {
+        ""
+    }
+    fn support_udp(&self) -> bool {
+        false
+    }
+    async fn dial_tcp(
+        &self,
+        _m: &Metadata,
+    ) -> meow_common::Result<Box<dyn meow_common::ProxyConn>> {
+        self.dials.fetch_add(1, Ordering::SeqCst);
+        match self.dial {
+            Dial::Fail => Err(meow_common::MeowError::NotSupported(format!(
+                "{}: connect refused",
+                self.name
+            ))),
+            Dial::Hang => std::future::pending().await,
+            Dial::Expire { by } => {
+                tokio::time::advance(by).await;
+                tokio::time::resume();
+                std::future::pending().await
+            }
+        }
+    }
+    async fn dial_udp(
+        &self,
+        _m: &Metadata,
+    ) -> meow_common::Result<Box<dyn meow_common::ProxyPacketConn>> {
+        Err(meow_common::MeowError::NotSupported(format!(
+            "{}: dial_udp",
+            self.name
+        )))
+    }
+    fn health(&self) -> &meow_common::ProxyHealth {
+        &self.health
+    }
+}
+
+impl Proxy for ScriptedProxy {
+    fn alive(&self) -> bool {
+        true
+    }
+    fn alive_for_url(&self, _url: &str) -> bool {
+        true
+    }
+    fn last_delay(&self) -> u16 {
+        0
+    }
+    fn last_delay_for_url(&self, _url: &str) -> u16 {
+        0
+    }
+    fn delay_history(&self) -> Vec<meow_common::DelayHistory> {
+        Vec::new()
+    }
+}
+
+/// Serve a `200 OK` carrying `body` to every connection accepted on
+/// `127.0.0.1`, counting them — a direct fallback or a multi-DB download
+/// dials more than once, and "this URL was never dialed" is a zero count.
+pub(crate) async fn serve_body(body: &'static [u8]) -> (SocketAddr, Arc<AtomicUsize>) {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let hits = Arc::new(AtomicUsize::new(0));
+    tokio::spawn({
+        let hits = Arc::clone(&hits);
+        async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                hits.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let _ = stream.read(&mut buf).await;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.write_all(body).await;
+                });
+            }
+        }
+    });
+    (addr, hits)
 }
