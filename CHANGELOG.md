@@ -8,6 +8,8 @@ the canonical, in-repo source a release is cut from.
 
 ## [Unreleased]
 
+## [0.27.0] - 2026-10-28
+
 ### Added
 
 - **`meow-cli`, a command-line controller for a running meow**: a second
