@@ -138,11 +138,13 @@ let rss = sys.process(Pid::from_u32(std::process::id()))
     .unwrap_or(0);
 ```
 
-The RSS read is called once per tick inside the per-connection
-task — no shared `System` instance (avoids locking across many WS
-connections). The overhead of one `/proc` read (Linux) or a fresh
-`System` (non-Linux) per connection per second is negligible; optimize
-only if profiling shows cost.
+The RSS read runs in a single shared sampler task, not per connection:
+the first `/memory` subscriber spawns it, it reads RSS once per second —
+one `/proc/self/status` read on Linux, a fresh `System` on non-Linux —
+and broadcasts the frame to every connected socket; when the last socket
+disconnects, the sampler exits and cleans up after itself. The total cost
+is one read per second no matter how many WS connections are open;
+optimize only if profiling shows cost.
 
 `oslimit`: On Linux, read `/proc/self/cgroup` or `rlimit(RLIMIT_RSS)`.
 On other platforms, return `0`. A helper `fn process_memory_limit() ->

@@ -213,6 +213,9 @@ Unit tests on the `LogMessage` and `LogLevel` types directly — no WS server ne
 
 Uses real server + WS client. Wall time with slack.
 
+Status: planned — not yet implemented in `crates/meow-api/tests/` as of
+2026-10-28 (that directory currently has no `/memory` WebSocket cases).
+
 | # | Case | Asserts |
 |---|------|---------|
 | F1 | `memory_ws_emits_frame_within_1500ms` | Connect WS to `/memory`; wait up to 1 500 ms; assert at least one text frame received. Frame parses as JSON. Upstream: `hub/route/memory.go` — 1 Hz stream. |
@@ -273,7 +276,10 @@ that are easy to violate silently.
 
 ## Divergence table cross-reference
 
-All 6 spec divergence rows have test coverage. Summary:
+Acceptance mapping for the 6 spec divergence rows. Note: the row-4 cases
+F2/F3 — like all section-F `/memory` WebSocket cases — are planned but
+not yet implemented; `crates/meow-api/tests/` currently has no `/memory`
+WebSocket cases. Summary:
 
 | Spec row | Class | Test cases |
 |----------|:-----:|------------|
