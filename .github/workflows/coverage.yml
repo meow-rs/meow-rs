@@ -14,7 +14,9 @@ permissions:
 
 jobs:
   coverage:
-    runs-on: ubuntu-latest
+    # Ubuntu 26.04, which `ubuntu-latest` is moving to, no longer packages
+    # simple-obfs (installed below), as in test.yml's `test` job.
+    runs-on: ubuntu-24.04
     # Nightly schedule also fires on forks that enable Actions — don't burn
     # fork owners' minutes on a run that cannot upload without upstream's
     # Codecov token anyway.
@@ -96,7 +98,9 @@ jobs:
           # GitHub-hosted runners — skip them by name. The mux `live_singbox_*`
           # interop probes require a manually started sing-box server
           # (127.0.0.1:4411, see target/e2e/mux-interop/) — also skip.
-          cargo llvm-cov --workspace --all-features --lcov --output-path lcov.info \
+          # --no-fail-fast: one failing test binary must not hide the rest of
+          # the nightly run's failures.
+          cargo llvm-cov --workspace --all-features --no-fail-fast --lcov --output-path lcov.info \
             -- --include-ignored \
                --skip dot_resolves_example_com \
                --skip doh_resolves_example_com \

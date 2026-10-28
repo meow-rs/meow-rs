@@ -5875,7 +5875,10 @@ async fn put_configs_trusttunnel_provider_binds_a_placeholder_instead_of_rejecti
     )
     .unwrap();
     let bad_path = directory.path().join("bad.yaml");
-    std::fs::write(&bad_path, "proxies:\n  - {name: sibling, type: direct}\n  - {name: bad, type: trusttunnel, server: vpn.example.test, port: 443, username: fixture, password: test-only, quic: true}\n").unwrap();
+    // `bad` lacks `username`, so every feature set rejects it: a
+    // `quic: true` node alone parses under `trusttunnel-h3`, which the
+    // `--all-features` coverage run enables.
+    std::fs::write(&bad_path, "proxies:\n  - {name: sibling, type: direct}\n  - {name: bad, type: trusttunnel, server: vpn.example.test, port: 443, password: test-only}\n").unwrap();
     let document = format!("mode: rule\nproxy-providers:\n  p:\n    type: file\n    path: {}\nproxy-groups:\n  - name: PROXY\n    type: select\n    use: [p]\nrules: ['MATCH,PROXY']\n", bad_path.display());
     let response = create_router(Arc::clone(&state))
         .oneshot(
