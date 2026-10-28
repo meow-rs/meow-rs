@@ -60,7 +60,17 @@ struct Endpoint {
     directory: tempfile::TempDir,
     port: u16,
     certificate: Vec<u8>,
+    // Held for the endpoint's life; fields drop after `Drop::drop` has
+    // killed the child, so the next test starts on a free port.
+    _serial: Option<tokio::sync::MutexGuard<'static, ()>>,
 }
+
+/// Runs one official endpoint at a time in this process. Each reserves its
+/// port by binding and dropping it, so two starting in parallel can pick the
+/// same port: the loser fails to bind, but its readiness probe connects to
+/// the winner and passes, and its dials are refused once the winner's test
+/// ends (seen in the `--all-features` coverage run).
+static ENDPOINT_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 impl Drop for Endpoint {
     fn drop(&mut self) {
@@ -79,12 +89,14 @@ impl Drop for Endpoint {
 impl Endpoint {
     async fn start() -> Option<Self> {
         let binary = endpoint_binary()?;
+        let serial = ENDPOINT_SERIAL.lock().await;
         // The official process binds its own socket, so an ephemeral-port
         // reservation cannot be inherited. Retry only an explicit bind
         // collision, never authentication/protocol/startup failures.
         for attempt in 0..3 {
-            let (endpoint, ready) = Self::start_once(&binary).await;
+            let (mut endpoint, ready) = Self::start_once(&binary).await;
             if ready {
+                endpoint._serial = Some(serial);
                 return Some(endpoint);
             }
             let diagnostic = endpoint.log();
@@ -160,6 +172,7 @@ impl Endpoint {
             directory,
             port,
             certificate: generated.cert.der().to_vec(),
+            _serial: None,
         };
         let ready = timeout(WAIT, async {
             loop {
@@ -170,7 +183,11 @@ impl Endpoint {
                     .await
                     .is_ok()
                 {
-                    return true;
+                    // Another process may own the port (a reservation
+                    // collision across test binaries): only a child that
+                    // is still running after the probe bound it.
+                    sleep(Duration::from_millis(200)).await;
+                    return endpoint.child.try_wait().unwrap().is_none();
                 }
                 sleep(Duration::from_millis(25)).await;
             }
