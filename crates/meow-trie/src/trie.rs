@@ -464,10 +464,9 @@ impl<T: Clone + 'static> DomainTrie<T> {
     /// Insert `data` under `domain`; when a key lands on an
     /// already-occupied (node, kind) slot the FIRST insert wins.
     ///
-    /// Trailing dots are not stripped on the insert side (`search`
-    /// trims them from queries): a key like `x.` builds an empty-label
-    /// node no query can ever reach — normalize it away if trailing
-    /// dots can appear.
+    /// Trailing dots are stripped, as `search` strips them from queries,
+    /// so a fully qualified key like `example.com.` is stored and matched
+    /// as `example.com`. A key that is only dots is rejected (`false`).
     ///
     /// Insert-side case folding is `str::to_lowercase` (full Unicode),
     /// while `search`'s case-insensitive path folds ASCII only — a key
@@ -505,8 +504,12 @@ impl<T: Clone + 'static> DomainTrie<T> {
         } else {
             Cow::Borrowed(trimmed)
         };
+        // Trailing dots go from the base domain, as `search` drops them
+        // from queries: `example.com.` would otherwise end in an empty
+        // label no query can reach (issue #822). The prefix forms below
+        // are parsed first, so `+.`/`*.`/`.` stay rejected.
         let domain = &*lowered;
-        if domain.is_empty() {
+        if domain.trim_end_matches('.').is_empty() {
             return false;
         }
 
@@ -515,6 +518,7 @@ impl<T: Clone + 'static> DomainTrie<T> {
         // dot-wildcard path. Exact + Dot reproduces that; a Star entry would
         // be redundant because Dot already covers depth >= 1.
         if let Some(rest) = domain.strip_prefix("+.") {
+            let rest = rest.trim_end_matches('.');
             if rest.is_empty() {
                 return false;
             }
@@ -525,6 +529,7 @@ impl<T: Clone + 'static> DomainTrie<T> {
         }
 
         if let Some(rest) = domain.strip_prefix("*.") {
+            let rest = rest.trim_end_matches('.');
             if rest.is_empty() {
                 return false;
             }
@@ -534,6 +539,7 @@ impl<T: Clone + 'static> DomainTrie<T> {
         }
 
         if let Some(rest) = domain.strip_prefix('.') {
+            let rest = rest.trim_end_matches('.');
             if rest.is_empty() {
                 return false;
             }
@@ -542,7 +548,7 @@ impl<T: Clone + 'static> DomainTrie<T> {
             return true;
         }
 
-        self.insert_into_tree(domain, data, MatchKind::Exact, mode);
+        self.insert_into_tree(domain.trim_end_matches('.'), data, MatchKind::Exact, mode);
         self.len += 1;
         true
     }
@@ -905,6 +911,25 @@ mod tests {
         assert_eq!(trie.search("example.com"), Some(&1));
         assert_eq!(trie.search("www.example.com"), None);
         assert_eq!(trie.search("foo.com"), None);
+    }
+
+    /// Issue #822: a fully qualified key (`example.com.`) is reachable, in
+    /// every key form, and a dots-only key is rejected.
+    #[test]
+    fn trailing_dot_keys_are_reachable() {
+        let mut trie = DomainTrie::new();
+        assert!(trie.insert("exact.test.", 1));
+        assert!(trie.insert("*.star.test.", 2));
+        assert!(trie.insert("+.plus.test..", 3));
+        assert_eq!(trie.search("exact.test"), Some(&1));
+        assert_eq!(trie.search("exact.test."), Some(&1));
+        assert_eq!(trie.search("a.star.test"), Some(&2));
+        assert_eq!(trie.search("plus.test"), Some(&3));
+        assert_eq!(trie.search("a.b.plus.test."), Some(&3));
+        assert!(!trie.insert(".", 4));
+        assert!(!trie.insert("...", 4));
+        trie.seal();
+        assert_eq!(trie.search("exact.test"), Some(&1));
     }
 
     #[test]
