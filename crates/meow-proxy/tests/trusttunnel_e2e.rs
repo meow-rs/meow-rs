@@ -28,6 +28,66 @@ use tokio::{
 };
 
 const WAIT: Duration = Duration::from_secs(10);
+const PROCESS_LOCK_FILE: &str = "meow-trusttunnel-e2e.lock";
+
+#[cfg(unix)]
+struct ProcessLock {
+    _file: fs::File,
+}
+
+#[cfg(unix)]
+impl ProcessLock {
+    fn acquire() -> Self {
+        use std::os::fd::AsRawFd;
+
+        let path = std::env::temp_dir().join(PROCESS_LOCK_FILE);
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)
+            .expect("open TrustTunnel E2E process lock");
+        loop {
+            // SAFETY: the file descriptor remains open for the lifetime of the lock.
+            let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+            if result == 0 {
+                return Self { _file: file };
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                panic!("acquire TrustTunnel E2E process lock: {error}");
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn process_lock_excludes_a_second_open_file_description() {
+    use std::os::fd::AsRawFd;
+
+    let _lock = ProcessLock::acquire();
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(std::env::temp_dir().join(PROCESS_LOCK_FILE))
+        .unwrap();
+    // SAFETY: the file descriptor remains open for the duration of this call.
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    assert_eq!(result, -1);
+    assert_eq!(io::Error::last_os_error().kind(), io::ErrorKind::WouldBlock);
+}
+
+#[cfg(not(unix))]
+struct ProcessLock;
+
+#[cfg(not(unix))]
+impl ProcessLock {
+    fn acquire() -> Self {
+        Self
+    }
+}
 
 fn endpoint_binary() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("TRUSTTUNNEL_SERVER_BIN") {
@@ -63,13 +123,12 @@ struct Endpoint {
     // Held for the endpoint's life; fields drop after `Drop::drop` has
     // killed the child, so the next test starts on a free port.
     _serial: Option<tokio::sync::MutexGuard<'static, ()>>,
+    _process_serial: Option<ProcessLock>,
 }
 
-/// Runs one official endpoint at a time in this process. Each reserves its
-/// port by binding and dropping it, so two starting in parallel can pick the
-/// same port: the loser fails to bind, but its readiness probe connects to
-/// the winner and passes, and its dials are refused once the winner's test
-/// ends (seen in the `--all-features` coverage run).
+/// Runs one official endpoint at a time; the process-shared Unix lock also
+/// serializes concurrently launched test executables. Each reserves its port
+/// by binding and dropping it.
 static ENDPOINT_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 impl Drop for Endpoint {
@@ -90,6 +149,9 @@ impl Endpoint {
     async fn start() -> Option<Self> {
         let binary = endpoint_binary()?;
         let serial = ENDPOINT_SERIAL.lock().await;
+        let process_serial = tokio::task::spawn_blocking(ProcessLock::acquire)
+            .await
+            .expect("acquire TrustTunnel E2E process lock");
         // The official process binds its own socket, so an ephemeral-port
         // reservation cannot be inherited. Retry only an explicit bind
         // collision, never authentication/protocol/startup failures.
@@ -97,6 +159,7 @@ impl Endpoint {
             let (mut endpoint, ready) = Self::start_once(&binary).await;
             if ready {
                 endpoint._serial = Some(serial);
+                endpoint._process_serial = Some(process_serial);
                 return Some(endpoint);
             }
             let diagnostic = endpoint.log();
@@ -173,6 +236,7 @@ impl Endpoint {
             port,
             certificate: generated.cert.der().to_vec(),
             _serial: None,
+            _process_serial: None,
         };
         let ready = timeout(WAIT, async {
             loop {
