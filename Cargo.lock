@@ -2459,6 +2459,7 @@ dependencies = [
  "dashmap",
  "dhat",
  "libc",
+ "log",
  "maxminddb",
  "meow-api",
  "meow-common",

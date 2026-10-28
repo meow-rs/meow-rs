@@ -266,17 +266,20 @@ fn init_logging(target: &LogTarget) -> Result<Logging> {
         LogTarget::Console => {
             let (tx, _) = broadcast::channel(128);
             let log_layer = LogBroadcastLayer { tx: tx.clone() }.with_filter(LevelFilter::TRACE);
-            let (filter_layer, reload_handle) =
-                tracing_subscriber::reload::Layer::new(env_filter());
+            let filter = env_filter();
+            let log_level = log_max_level(&filter);
+            let (filter_layer, reload_handle) = tracing_subscriber::reload::Layer::new(filter);
             tracing_subscriber::registry()
                 .with(tracing_subscriber::fmt::layer().with_filter(filter_layer))
                 .with(log_layer)
                 .init();
+            log::set_max_level(log_level);
             meow_api::log_stream::install_log_reloader(move |level| {
-                let normalized = normalize_level(level);
-                reload_handle
-                    .reload(tracing_subscriber::EnvFilter::new(&normalized))
-                    .map_err(|e| e.to_string())
+                let filter = tracing_subscriber::EnvFilter::new(normalize_level(level));
+                let log_level = log_max_level(&filter);
+                reload_handle.reload(filter).map_err(|e| e.to_string())?;
+                log::set_max_level(log_level);
+                Ok(())
             });
             Ok(Logging {
                 tx,
@@ -307,8 +310,9 @@ fn init_logging(target: &LogTarget) -> Result<Logging> {
             let (writer, guard) = tracing_appender::non_blocking(appender);
             let (tx, _) = broadcast::channel(128);
             let log_layer = LogBroadcastLayer { tx: tx.clone() }.with_filter(LevelFilter::TRACE);
-            let (filter_layer, reload_handle) =
-                tracing_subscriber::reload::Layer::new(env_filter());
+            let filter = env_filter();
+            let log_level = log_max_level(&filter);
+            let (filter_layer, reload_handle) = tracing_subscriber::reload::Layer::new(filter);
             tracing_subscriber::registry()
                 .with(
                     tracing_subscriber::fmt::layer()
@@ -318,17 +322,37 @@ fn init_logging(target: &LogTarget) -> Result<Logging> {
                 )
                 .with(log_layer)
                 .init();
+            log::set_max_level(log_level);
             meow_api::log_stream::install_log_reloader(move |level| {
-                let normalized = normalize_level(level);
-                reload_handle
-                    .reload(tracing_subscriber::EnvFilter::new(&normalized))
-                    .map_err(|e| e.to_string())
+                let filter = tracing_subscriber::EnvFilter::new(normalize_level(level));
+                let log_level = log_max_level(&filter);
+                reload_handle.reload(filter).map_err(|e| e.to_string())?;
+                log::set_max_level(log_level);
+                Ok(())
             });
             Ok(Logging {
                 tx,
                 _file_guard: Some(guard),
             })
         }
+    }
+}
+
+/// The `log` facade's max level under a console filter: DEBUG, or TRACE when
+/// the filter asks for it (RUST_LOG). `init()` leaves it at the subscriber's
+/// max level, which the broadcast layer's TRACE filter pins at TRACE, so every
+/// `log` record crossed into tracing only to be dropped there. quiche writes
+/// one per QUIC packet and frame, an eighth of a hysteria2 download's CPU. The
+/// DEBUG floor keeps `log` debug records for GET /logs?level=debug.
+fn log_max_level(filter: &tracing_subscriber::EnvFilter) -> log::LevelFilter {
+    use tracing_subscriber::filter::LevelFilter;
+    if filter
+        .max_level_hint()
+        .is_none_or(|level| level == LevelFilter::TRACE)
+    {
+        log::LevelFilter::Trace
+    } else {
+        log::LevelFilter::Debug
     }
 }
 
@@ -1799,6 +1823,19 @@ mod tests {
     #[test]
     fn invalid_bind_address_errors() {
         assert!(bind_socket_addr("not-an-ip", 80).is_err());
+    }
+
+    #[test]
+    fn log_facade_stops_at_debug_unless_the_filter_traces() {
+        use tracing_subscriber::EnvFilter;
+        for directives in ["off", "warn", "info", "debug", "info,meow_proxy=debug"] {
+            let level = super::log_max_level(&EnvFilter::new(directives));
+            assert_eq!(level, log::LevelFilter::Debug, "{directives}");
+        }
+        for directives in ["trace", "info,quiche=trace"] {
+            let level = super::log_max_level(&EnvFilter::new(directives));
+            assert_eq!(level, log::LevelFilter::Trace, "{directives}");
+        }
     }
 
     fn ss_spec() -> meow_config::ListenerSpec {
