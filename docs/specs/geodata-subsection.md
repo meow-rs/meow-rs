@@ -174,11 +174,14 @@ on disk.
    semantics, a miss warning and falling through to (3).
 3. `proxies[0]` — the legacy `first_named_proxy` fallback.
 
-*Direct fallback (geodata-only opt-in):* only for the guessed (3), and not
-when that `proxies[0]` declares `dialer-proxy`. An egress from (1) or (2)
-is where the config routes this traffic, so it fails loudly like a
-provider `proxy:` (#625) — where the CDN is blocked, a dead route must not
-become direct egress. When the FIRST request's proxy dial fails (connect phase only,
+*Direct fallback (geodata-only opt-in):* for an implied egress from (2)
+or (3) — on first boot a MATCH group fed by proxy-providers has no members
+yet, since their fetches are detached. Never for an explicit
+`geodata.proxy`, nor for a static proxy that declares `dialer-proxy`:
+those are deliberate egress and fail loudly like a provider `proxy:`
+(#625), so where the CDN is blocked a dead chain cannot become direct
+egress. (A chain behind a group cannot be seen from the raw config and
+keeps the group's fallback.) When the FIRST request's proxy dial fails (connect phase only,
 `CONNECT_TIMEOUT` included), `internal_http::fetch_or_direct` warns and
 restarts the fetch with no proxy. Post-dial failures (TLS, HTTP status,
 body) and redirect-hop dials never fall back — a mid-chain failure must not

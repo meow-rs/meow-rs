@@ -57,11 +57,12 @@ the canonical, in-repo source a release is cut from.
   `mode: direct`, the `GLOBAL` group in `mode: global`, otherwise the
   last top-level `MATCH` target — then the first `proxies:` entry; a
   blank or unknown name warns and falls through to the same default.
-  A proxy the config routes the download through (`geodata.proxy`,
-  `GLOBAL` or the `MATCH` target) never falls back to direct: its
-  failure is reported, as for provider downloads. Only the guessed
-  first `proxies:` entry, when it is not a `dialer-proxy` chain, retries
-  once direct after its first dial fails.
+  When the first dial through that default fails (on first boot a
+  provider-fed group has no members yet), the fetch warns and retries
+  once direct, a geodata-only fallback that provider and subscription
+  downloads deliberately do not share. A proxy named in `geodata.proxy`,
+  and any proxy that declares `dialer-proxy`, never falls back: its
+  failure is reported instead.
 - **The top-level `geox-url` alias**: mihomo's flat spelling of
   `geodata.url.*` is now read too, merged per key below the explicit
   block — `geodata.url.mmdb` beats `geox-url.mmdb`, which beats the
