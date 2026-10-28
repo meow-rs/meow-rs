@@ -229,6 +229,16 @@ the canonical, in-repo source a release is cut from.
   yaml.v3/mihomo are `1_000` reading as a number and the map-form
   external-tag enum (a `tproxy:` block), both of which yaml.v3 accepts
   as saphyr does.
+- **Quote a number-like `password` in proxy entries**: `proxies:`
+  entries, proxy-provider payloads and subscriptions are read as untyped
+  YAML values, and the new parser reads an unquoted `password: 000000` as
+  a number, where 0.26.1 kept it as the string `000000`. A node whose
+  `password`, `psk` or other string field holds a number is skipped with
+  a warning (in `proxies:` under `strict: true`, it fails the config), as
+  a node with `password: 123456` already was; an HTTP or SOCKS5 node
+  whose username and password are both numbers connects without
+  authentication instead. Write `password: "000000"`. Typed fields of the
+  config document, such as `secret`, keep the value as written.
 - **`nameserver-policy` key order is now the lookup priority** (mihomo
   `parseNameServerPolicy`/`makePolicy` parity): the policy is a
   document-ordered arm list — a run of consecutive domain keys (`bare`,
@@ -311,6 +321,21 @@ the canonical, in-repo source a release is cut from.
   policy routing gets the split default routes as before. For embedders,
   `TunRouteMode::default()` is the platform's `true` scope and
   `TunConfig::default()` has `dns_hijack: true`.
+- **`strict: true` no longer lets a remote feed stop meow from starting**
+  (#825): under `strict: true`, a malformed payload from an `http:`
+  proxy-provider, a subscription or their on-disk cache failed startup,
+  while a failed download of the same provider only warned, so a
+  third-party feed decided whether meow started, and the fetch deadline
+  made the outcome depend on timing. Such a provider now registers empty,
+  warns and retries in the background, as a failed download already did.
+  Defects in what the operator wrote stay fatal: the config document
+  itself and `file:` or `inline:` provider payloads. `-t` now loads
+  `file:` proxy-providers too, so it fails exactly when startup would,
+  and `PUT /configs` answers 400 and commits nothing when a new `file:`
+  provider's payload fails strict validation (`?force=true` still applies
+  it, with that provider empty). Without `strict`, a remote rule-provider
+  whose payload is malformed now stays registered, empty, and retries,
+  where it used to be dropped.
 
 ### Removed
 
@@ -334,8 +359,10 @@ the canonical, in-repo source a release is cut from.
   lost: `hosts:` and `dns.nameserver-policy:` keep YAML document order
   (the overlay could only re-read them for a narrow field list), scalar
   coercions like `port: "7890"` and `secret: 123456` apply again, an
-  unquoted number-like value reaches a string field as written
-  (`password: 000000` stays `000000`, `filter: 01` stays `01`), typed
+  unquoted number-like value reaches a typed string field as written
+  (`secret: 000000` stays `000000`, a proxy-provider's `filter: 01`
+  stays `01`; `proxies:` entries are untyped, see the quoting note under
+  Changed), typed
   errors carry `line N column M` plus a `dns.fallback-filter.geoip`-style
   field path, non-finite floats reach typed `f64` fields instead of
   collapsing to `null`, and a top-level sequence can no longer fill
