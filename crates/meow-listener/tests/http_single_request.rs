@@ -12,6 +12,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 
+/// Real time the half-close tests give the relay to read the client's FIN
+/// and arm its linger before they pause the clock.
+const SETTLE: Duration = Duration::from_millis(200);
+
 async fn loopback_pair() -> (TcpStream, TcpStream) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -305,7 +309,7 @@ async fn final_response_stops_an_incomplete_request_upload() {
         .unwrap();
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn client_eof_reaps_a_silent_origin_without_half_closing_it_early() {
     let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin_addr = origin.local_addr().unwrap();
@@ -339,28 +343,32 @@ async fn client_eof_reaps_a_silent_origin_without_half_closing_it_early() {
         .unwrap();
     request_seen_rx.await.unwrap();
     // Keep the client write half open until the origin has received the
-    // request. Otherwise Tokio's paused clock can auto-advance to the relay
-    // timer while this task is still waiting on the oneshot.
+    // request.
     client.shutdown().await.unwrap();
+    let fin = tokio::time::Instant::now();
 
-    // Drive the socket-read wakeup through the HTTP adapter and relay before
-    // moving the paused clock; the linger deadline is created only after that
-    // direction reports `Done`.
-    for _ in 0..10 {
-        tokio::task::yield_now().await;
-    }
+    // The I/O runs on the real clock: paused from the start, Tokio would
+    // auto-advance while the proxy's dial or the relay's FIN read waits on
+    // a real socket, firing the dial timeout or the linger early (seen as
+    // an occasional hang). Give the relay real time to read the FIN and
+    // arm the linger, then pause and move the clock relative to `fin`; the
+    // deadline lies between `fin + LINGER` and `fin + SETTLE + LINGER`.
+    tokio::time::sleep(SETTLE).await;
+    tokio::time::pause();
     assert!(
         !handler.is_finished(),
         "client EOF half-closed the upstream before it could respond"
     );
-    tokio::time::advance(meow_tunnel::relay::RELAY_HALF_CLOSE_LINGER - Duration::from_millis(1))
-        .await;
+    tokio::time::advance(
+        meow_tunnel::relay::RELAY_HALF_CLOSE_LINGER - Duration::from_millis(1) - fin.elapsed(),
+    )
+    .await;
     tokio::task::yield_now().await;
     assert!(
         !handler.is_finished(),
         "silent upstream was reaped before the half-close linger"
     );
-    tokio::time::advance(Duration::from_millis(1)).await;
+    tokio::time::advance(SETTLE + Duration::from_millis(2)).await;
     tokio::time::timeout(Duration::from_secs(1), &mut handler)
         .await
         .expect("client EOF did not arm the half-close linger")
@@ -758,7 +766,7 @@ async fn interim_response_hop_by_hop_headers_are_stripped() {
     handler.await.unwrap();
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn abandoned_upgrade_is_reaped_by_the_half_close_linger() {
     let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin_addr = origin.local_addr().unwrap();
@@ -798,27 +806,32 @@ async fn abandoned_upgrade_is_reaped_by_the_half_close_linger() {
     client.write_all(b"early-protocol-bytes").await.unwrap();
     request_seen_rx.await.unwrap();
     // Keep the client write half open until the origin has received the
-    // request, mirroring client_eof_reaps_a_silent_origin: the paused clock
-    // must not auto-advance to the relay timer before the handshake lands.
+    // request, as in client_eof_reaps_a_silent_origin.
     client.shutdown().await.unwrap();
+    let fin = tokio::time::Instant::now();
 
-    // Drive the hold reads and the relay before moving the paused clock; the
-    // linger deadline is created only after the upload direction reports Done.
-    for _ in 0..10 {
-        tokio::task::yield_now().await;
-    }
+    // The I/O runs on the real clock: paused from the start, Tokio would
+    // auto-advance while the proxy's dial or the relay's FIN read waits on
+    // a real socket, firing the dial timeout or the linger early (seen as
+    // an occasional hang). Give the relay real time to read the FIN and
+    // arm the linger, then pause and move the clock relative to `fin`; the
+    // deadline lies between `fin + LINGER` and `fin + SETTLE + LINGER`.
+    tokio::time::sleep(SETTLE).await;
+    tokio::time::pause();
     assert!(
         !handler.is_finished(),
         "client EOF closed the connection before the half-close linger"
     );
-    tokio::time::advance(meow_tunnel::relay::RELAY_HALF_CLOSE_LINGER - Duration::from_millis(1))
-        .await;
+    tokio::time::advance(
+        meow_tunnel::relay::RELAY_HALF_CLOSE_LINGER - Duration::from_millis(1) - fin.elapsed(),
+    )
+    .await;
     tokio::task::yield_now().await;
     assert!(
         !handler.is_finished(),
         "the silent origin was reaped before the half-close linger"
     );
-    tokio::time::advance(Duration::from_millis(1)).await;
+    tokio::time::advance(SETTLE + Duration::from_millis(2)).await;
     tokio::time::timeout(Duration::from_secs(1), &mut handler)
         .await
         .expect("an abandoned upgrade handshake did not arm the half-close linger")
