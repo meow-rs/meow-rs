@@ -2,15 +2,17 @@ use std::{
     collections::VecDeque,
     io,
     pin::Pin,
-    task::{Context, Poll},
+    task::{ready, Context, Poll},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(test)]
+use aes_gcm::Tag;
 use aes_gcm::{
     aead::{AeadInPlace, KeyInit},
-    Aes128Gcm, Aes256Gcm, Nonce, Tag,
+    Aes256Gcm, Nonce,
 };
-use chacha20poly1305::ChaCha20Poly1305;
+use boring::aead::{AeadCtx, Algorithm};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256, Sha384, Sha512};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -308,12 +310,35 @@ pub(crate) struct RealityTlsStream {
     write_key: RecordKey,
     read_raw_passthrough: bool,
     write_raw_passthrough: bool,
-    read_plain: VecDeque<u8>,
+    /// The record being read and, once opened in place, its plaintext.
+    /// Reused for every record, so a steady stream allocates nothing.
+    read_buf: Vec<u8>,
+    /// Plaintext not yet handed to the caller: `read_buf[plain_pos..plain_end]`.
+    plain_pos: usize,
+    plain_end: usize,
     read_state: StreamReadState,
     write_pending: Option<StreamPendingWrite>,
 }
 
 impl RealityTlsStream {
+    fn new(inner: Box<dyn Stream>, read_key: RecordKey, write_key: RecordKey) -> Self {
+        Self {
+            inner,
+            read_key,
+            write_key,
+            read_raw_passthrough: false,
+            write_raw_passthrough: false,
+            read_buf: Vec::new(),
+            plain_pos: 0,
+            plain_end: 0,
+            read_state: StreamReadState::Header {
+                buf: [0; 5],
+                pos: 0,
+            },
+            write_pending: None,
+        }
+    }
+
     pub(crate) fn enable_raw_read_passthrough(&mut self) {
         self.read_raw_passthrough = true;
         tracing::debug!("Reality TLS raw read passthrough enabled");
@@ -325,13 +350,12 @@ impl RealityTlsStream {
     }
 
     fn drain_read_plain(&mut self, buf: &mut ReadBuf<'_>) -> bool {
-        if self.read_plain.is_empty() {
+        if self.plain_pos == self.plain_end {
             return false;
         }
-        let n = buf.remaining().min(self.read_plain.len());
-        for b in self.read_plain.drain(..n) {
-            buf.put_slice(&[b]);
-        }
+        let n = buf.remaining().min(self.plain_end - self.plain_pos);
+        buf.put_slice(&self.read_buf[self.plain_pos..self.plain_pos + n]);
+        self.plain_pos += n;
         true
     }
 
@@ -363,10 +387,9 @@ enum StreamReadState {
         buf: [u8; 5],
         pos: usize,
     },
+    /// The record body is being read into `read_buf[pos..]`.
     Payload {
         header: [u8; 5],
-        typ: u8,
-        payload: Vec<u8>,
         pos: usize,
     },
 }
@@ -378,134 +401,81 @@ struct StreamPendingWrite {
 
 impl AsyncRead for RealityTlsStream {
     fn poll_read(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
         // Plaintext already opened from the last record comes before any
         // raw byte, so it must drain first even after the raw switch.
-        if self.drain_read_plain(buf) {
+        if this.drain_read_plain(buf) {
             return Poll::Ready(Ok(()));
         }
-        if self.read_raw_passthrough {
-            return Pin::new(&mut self.inner).poll_read(cx, buf);
+        if this.read_raw_passthrough {
+            return Pin::new(&mut this.inner).poll_read(cx, buf);
         }
 
         loop {
-            let state = std::mem::replace(
-                &mut self.read_state,
-                StreamReadState::Header {
-                    buf: [0; 5],
-                    pos: 0,
-                },
-            );
-            match state {
-                StreamReadState::Header {
-                    buf: mut h,
-                    mut pos,
-                } => {
-                    while pos < h.len() {
-                        let mut rb = ReadBuf::new(&mut h[pos..]);
-                        match Pin::new(&mut self.inner).poll_read(cx, &mut rb) {
-                            Poll::Pending => {
-                                self.read_state = StreamReadState::Header { buf: h, pos };
-                                return Poll::Pending;
-                            }
-                            Poll::Ready(Err(e)) => {
-                                self.read_state = StreamReadState::Header { buf: h, pos };
-                                return Poll::Ready(Err(e));
-                            }
-                            Poll::Ready(Ok(())) => {
-                                let n = rb.filled().len();
-                                if n == 0 {
-                                    self.read_state = StreamReadState::Header { buf: h, pos };
-                                    return Poll::Ready(Ok(()));
-                                }
-                                pos += n;
-                            }
+            match &mut this.read_state {
+                StreamReadState::Header { buf: h, pos } => {
+                    while *pos < h.len() {
+                        let mut rb = ReadBuf::new(&mut h[*pos..]);
+                        ready!(Pin::new(&mut this.inner).poll_read(cx, &mut rb))?;
+                        let n = rb.filled().len();
+                        if n == 0 {
+                            return Poll::Ready(Ok(()));
                         }
+                        *pos += n;
                     }
 
-                    let len = u16::from_be_bytes([h[3], h[4]]) as usize;
+                    let header = *h;
+                    let len = u16::from_be_bytes([header[3], header[4]]) as usize;
                     if len > 18 * 1024 {
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             format!("TLS record too large: {len}"),
                         )));
                     }
-                    self.read_state = StreamReadState::Payload {
-                        header: h,
-                        typ: h[0],
-                        payload: vec![0; len],
-                        pos: 0,
-                    };
+                    // The last record's plaintext is fully delivered (it
+                    // drains before any read), so its buffer is free.
+                    this.read_buf.resize(len, 0);
+                    this.read_state = StreamReadState::Payload { header, pos: 0 };
                 }
-                StreamReadState::Payload {
-                    header,
-                    typ,
-                    mut payload,
-                    mut pos,
-                } => {
-                    while pos < payload.len() {
-                        let mut rb = ReadBuf::new(&mut payload[pos..]);
-                        match Pin::new(&mut self.inner).poll_read(cx, &mut rb) {
-                            Poll::Pending => {
-                                self.read_state = StreamReadState::Payload {
-                                    header,
-                                    typ,
-                                    payload,
-                                    pos,
-                                };
-                                return Poll::Pending;
-                            }
-                            Poll::Ready(Err(e)) => {
-                                self.read_state = StreamReadState::Payload {
-                                    header,
-                                    typ,
-                                    payload,
-                                    pos,
-                                };
-                                return Poll::Ready(Err(e));
-                            }
-                            Poll::Ready(Ok(())) => {
-                                let n = rb.filled().len();
-                                if n == 0 {
-                                    self.read_state = StreamReadState::Payload {
-                                        header,
-                                        typ,
-                                        payload,
-                                        pos,
-                                    };
-                                    return Poll::Ready(Ok(()));
-                                }
-                                pos += n;
-                            }
+                StreamReadState::Payload { header, pos } => {
+                    while *pos < this.read_buf.len() {
+                        let mut rb = ReadBuf::new(&mut this.read_buf[*pos..]);
+                        ready!(Pin::new(&mut this.inner).poll_read(cx, &mut rb))?;
+                        let n = rb.filled().len();
+                        if n == 0 {
+                            return Poll::Ready(Ok(()));
                         }
+                        *pos += n;
                     }
 
-                    self.read_state = StreamReadState::Header {
+                    let header = *header;
+                    this.read_state = StreamReadState::Header {
                         buf: [0; 5],
                         pos: 0,
                     };
-                    if typ != TLS_RECORD_APPLICATION_DATA {
+                    if header[0] != TLS_RECORD_APPLICATION_DATA {
                         continue;
                     }
-                    let (inner_type, plaintext) = self
+                    let (inner_type, len) = this
                         .read_key
-                        .open(&header, &payload)
+                        .open_in_place(&header, &mut this.read_buf)
                         .map_err(transport_io_error)?;
                     match inner_type {
                         TLS_RECORD_APPLICATION_DATA => {
-                            self.read_plain.extend(plaintext);
-                            if self.drain_read_plain(buf) {
+                            this.plain_pos = 0;
+                            this.plain_end = len;
+                            if this.drain_read_plain(buf) {
                                 return Poll::Ready(Ok(()));
                             }
                         }
-                        TLS_RECORD_HANDSHAKE => {
-                            continue;
-                        }
                         TLS_RECORD_ALERT => return Poll::Ready(Ok(())),
-                        _ => continue,
+                        // Post-handshake messages (NewSessionTicket) carry
+                        // nothing for the stream.
+                        _ => {}
                     }
                 }
             }
@@ -544,18 +514,22 @@ impl AsyncWrite for RealityTlsStream {
 
         // TLS records carry a u16 length: chunk large writes into
         // standard 16 KiB records instead of letting the length field
-        // wrap (which would desynchronise the peer's TLS reader).
-        let chunk_len = buf.len().min(16 * 1024);
-        let frame = self
-            .write_key
-            .seal(TLS_RECORD_APPLICATION_DATA, &buf[..chunk_len])
-            .map_err(transport_io_error)?;
+        // wrap (which would desynchronise the peer's TLS reader).  Up to
+        // `MAX_WRITE_BATCH` of plaintext is sealed into one buffer.
+        let chunk_len = buf.len().min(MAX_WRITE_BATCH);
+        let records = chunk_len.div_ceil(MAX_RECORD_PLAINTEXT);
+        let mut frame = Vec::with_capacity(chunk_len + records * RECORD_OVERHEAD);
+        for record in buf[..chunk_len].chunks(MAX_RECORD_PLAINTEXT) {
+            self.write_key
+                .seal_into(&mut frame, TLS_RECORD_APPLICATION_DATA, record)
+                .map_err(transport_io_error)?;
+        }
         self.write_pending = Some(StreamPendingWrite { frame, pos: 0 });
-        // The record is buffered; report chunk_len immediately whether
+        // The records are buffered; report chunk_len immediately whether
         // or not the drain completes now.  The next poll_write /
-        // poll_flush / poll_shutdown drains it.  Returning Pending here
-        // would be unsafe: the sealed record's plaintext length would
-        // be reported against whatever buffer arrives on the next poll.
+        // poll_flush / poll_shutdown drains them.  Returning Pending here
+        // would be unsafe: the sealed plaintext length would be reported
+        // against whatever buffer arrives on the next poll.
         match self.drain_pending_write(cx) {
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             _ => Poll::Ready(Ok(chunk_len)),
@@ -582,19 +556,11 @@ impl AsyncWrite for RealityTlsStream {
 }
 
 fn spawn_reality_stream(state: RealityConnected) -> Box<dyn Stream> {
-    Box::new(RealityTlsStream {
-        inner: state.inner,
-        read_key: state.read_key,
-        write_key: state.write_key,
-        read_raw_passthrough: false,
-        write_raw_passthrough: false,
-        read_plain: VecDeque::new(),
-        read_state: StreamReadState::Header {
-            buf: [0; 5],
-            pos: 0,
-        },
-        write_pending: None,
-    })
+    Box::new(RealityTlsStream::new(
+        state.inner,
+        state.read_key,
+        state.write_key,
+    ))
 }
 
 fn transport_io_error(e: TransportError) -> io::Error {
@@ -1204,14 +1170,22 @@ impl ApplicationKeys {
     }
 }
 
-enum AeadCipher {
-    Aes128(Box<Aes128Gcm>),
-    Aes256(Box<Aes256Gcm>),
-    ChaCha20(Box<ChaCha20Poly1305>),
-}
+/// TLS 1.3 AEAD tag length (all three suites).
+const RECORD_TAG_LEN: usize = 16;
+/// Bytes a sealed record adds to its plaintext: header, inner type, tag.
+const RECORD_OVERHEAD: usize = 5 + 1 + RECORD_TAG_LEN;
+/// Largest plaintext sealed into one record (the TLS maximum, 2^14).
+const MAX_RECORD_PLAINTEXT: usize = 16 * 1024;
+/// Most plaintext one `poll_write` seals: a bulk relay write (32 KiB) goes
+/// out as one transport write instead of one per record.
+const MAX_WRITE_BATCH: usize = 4 * MAX_RECORD_PLAINTEXT;
 
+/// One direction's TLS 1.3 record protection.  The AEAD is BoringSSL's: every
+/// byte relayed over REALITY passes through here, and generic Rust cipher
+/// code compiled at the release profile's `opt-level = "z"` runs an order of
+/// magnitude behind BoringSSL's assembly (see `meow-proxy`'s `aead` module).
 struct RecordKey {
-    cipher: AeadCipher,
+    aead: AeadCtx,
     iv: [u8; 12],
     seq: u64,
 }
@@ -1224,65 +1198,77 @@ impl RecordKey {
         let iv = hkdf_expand_label(hash, secret, b"iv", &[], 12);
         let mut iv_arr = [0u8; 12];
         iv_arr.copy_from_slice(&iv);
-        let cipher = match cipher_suite {
-            CipherSuite::Aes128GcmSha256 => AeadCipher::Aes128(Box::new(
-                Aes128Gcm::new_from_slice(&key).expect("AES-128 key"),
-            )),
-            CipherSuite::Aes256GcmSha384 => AeadCipher::Aes256(Box::new(
-                Aes256Gcm::new_from_slice(&key).expect("AES-256 key"),
-            )),
-            CipherSuite::ChaCha20Poly1305Sha256 => AeadCipher::ChaCha20(Box::new(
-                ChaCha20Poly1305::new_from_slice(&key).expect("ChaCha20 key"),
-            )),
+        let algorithm = match cipher_suite {
+            CipherSuite::Aes128GcmSha256 => Algorithm::aes_128_gcm(),
+            CipherSuite::Aes256GcmSha384 => Algorithm::aes_256_gcm(),
+            CipherSuite::ChaCha20Poly1305Sha256 => Algorithm::chacha20_poly1305(),
         };
         Self {
-            cipher,
+            aead: AeadCtx::new_default_tag(&algorithm, &key)
+                .expect("TLS 1.3 key length matches the suite"),
             iv: iv_arr,
             seq: 0,
         }
     }
 
+    /// Seal `plaintext` as one TLS 1.3 record: header, ciphertext, tag.
     fn seal(&mut self, inner_type: u8, plaintext: &[u8]) -> Result<Vec<u8>> {
-        let mut body = Vec::with_capacity(plaintext.len() + 1 + 16);
-        body.extend_from_slice(plaintext);
-        body.push(inner_type);
-
-        let record_len = body.len() + 16;
-        if record_len > u16::MAX as usize {
-            return Err(TransportError::Tls(format!(
-                "TLS record exceeds u16 length: {record_len}"
-            )));
-        }
-        let mut header = Vec::with_capacity(5);
-        header.push(TLS_RECORD_APPLICATION_DATA);
-        header.extend_from_slice(&[0x03, 0x03]);
-        put_u16(record_len as u16, &mut header);
-        let nonce = self.next_nonce();
-        let tag = self.encrypt_detached(&nonce, &header, &mut body)?;
-        let mut out = header;
-        out.extend_from_slice(&body);
-        out.extend_from_slice(&tag);
+        let mut out = Vec::with_capacity(RECORD_OVERHEAD + plaintext.len());
+        self.seal_into(&mut out, inner_type, plaintext)?;
         Ok(out)
     }
 
-    fn open(&mut self, header: &[u8; 5], ciphertext: &[u8]) -> Result<(u8, Vec<u8>)> {
-        if ciphertext.len() < 16 {
-            return Err(TransportError::Tls("TLS ciphertext too short".into()));
-        }
-        let split = ciphertext.len() - 16;
-        let mut body = ciphertext[..split].to_vec();
-        let tag = Tag::from_slice(&ciphertext[split..]);
+    /// Append `plaintext`, sealed as one TLS 1.3 record, to `out`.
+    fn seal_into(&mut self, out: &mut Vec<u8>, inner_type: u8, plaintext: &[u8]) -> Result<()> {
+        let body_len = plaintext.len() + 1;
+        let record_len = body_len + RECORD_TAG_LEN;
+        let Ok(record_len16) = u16::try_from(record_len) else {
+            return Err(TransportError::Tls(format!(
+                "TLS record exceeds u16 length: {record_len}"
+            )));
+        };
+        let start = out.len();
+        out.extend_from_slice(&[TLS_RECORD_APPLICATION_DATA, 0x03, 0x03]);
+        out.extend_from_slice(&record_len16.to_be_bytes());
+        out.extend_from_slice(plaintext);
+        out.push(inner_type);
+        out.resize(start + 5 + record_len, 0);
         let nonce = self.next_nonce();
-        self.decrypt_detached(&nonce, header, &mut body, tag)?;
+        let (header, body) = out[start..].split_at_mut(5);
+        let (data, tag) = body.split_at_mut(body_len);
+        self.aead
+            .seal_in_place(&nonce, data, tag, header)
+            .map(|_| ())
+            .map_err(|e| TransportError::Tls(format!("TLS record encrypt: {e}")))
+    }
 
-        let Some(pos) = body.iter().rposition(|b| *b != 0) else {
+    /// Open a record's `ciphertext || tag` into a fresh plaintext buffer.
+    fn open(&mut self, header: &[u8; 5], ciphertext: &[u8]) -> Result<(u8, Vec<u8>)> {
+        let mut body = ciphertext.to_vec();
+        let (inner_type, len) = self.open_in_place(header, &mut body)?;
+        body.truncate(len);
+        Ok((inner_type, body))
+    }
+
+    /// Open a record's `ciphertext || tag` in place.  Returns the inner
+    /// content type and the plaintext length; the plaintext is
+    /// `payload[..len]`.
+    fn open_in_place(&mut self, header: &[u8; 5], payload: &mut [u8]) -> Result<(u8, usize)> {
+        let Some(split) = payload.len().checked_sub(RECORD_TAG_LEN) else {
+            return Err(TransportError::Tls("TLS ciphertext too short".into()));
+        };
+        let nonce = self.next_nonce();
+        let (data, tag) = payload.split_at_mut(split);
+        self.aead
+            .open_in_place(&nonce, data, tag, header)
+            .map_err(|e| TransportError::Tls(format!("TLS record decrypt: {e}")))?;
+
+        let Some(pos) = data.iter().rposition(|b| *b != 0) else {
             return Err(TransportError::Tls(
                 "TLS inner plaintext missing type".into(),
             ));
         };
-        let inner_type = body[pos];
-        body.truncate(pos);
-        Ok((inner_type, body))
+        Ok((data[pos], pos))
     }
 
     fn next_nonce(&mut self) -> [u8; 12] {
@@ -1293,32 +1279,6 @@ impl RecordKey {
         }
         self.seq += 1;
         nonce
-    }
-
-    fn encrypt_detached(&self, nonce: &[u8; 12], aad: &[u8], body: &mut [u8]) -> Result<Tag> {
-        let nonce = Nonce::from_slice(nonce);
-        match &self.cipher {
-            AeadCipher::Aes128(c) => c.encrypt_in_place_detached(nonce, aad, body),
-            AeadCipher::Aes256(c) => c.encrypt_in_place_detached(nonce, aad, body),
-            AeadCipher::ChaCha20(c) => c.encrypt_in_place_detached(nonce, aad, body),
-        }
-        .map_err(|e| TransportError::Tls(format!("TLS record encrypt: {e}")))
-    }
-
-    fn decrypt_detached(
-        &self,
-        nonce: &[u8; 12],
-        aad: &[u8],
-        body: &mut [u8],
-        tag: &Tag,
-    ) -> Result<()> {
-        let nonce = Nonce::from_slice(nonce);
-        match &self.cipher {
-            AeadCipher::Aes128(c) => c.decrypt_in_place_detached(nonce, aad, body, tag),
-            AeadCipher::Aes256(c) => c.decrypt_in_place_detached(nonce, aad, body, tag),
-            AeadCipher::ChaCha20(c) => c.decrypt_in_place_detached(nonce, aad, body, tag),
-        }
-        .map_err(|e| TransportError::Tls(format!("TLS record decrypt: {e}")))
     }
 }
 
@@ -1527,6 +1487,104 @@ mod tests {
         assert!(receiver.open(&header, &record[5..]).is_err());
     }
 
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex"))
+            .collect()
+    }
+
+    /// RFC 8448 §3 (TLS_AES_128_GCM_SHA256): the application-data record
+    /// each side sends, from its traffic secret. The server's is its second
+    /// record under that key (the NewSessionTicket went first). Pins key and
+    /// IV derivation, the per-record nonce, the header as AAD and the inner
+    /// content type against an independent trace.
+    #[test]
+    fn record_key_matches_rfc8448_application_data() {
+        let payload: Vec<u8> = (0u8..50).collect();
+        let cases = [
+            (
+                "9e40646ce79a7f9dc05af8889bce6552875afa0b06df0087f792ebb7c17504a5",
+                0,
+                "1703030043a23f7054b62c94d0affafe8228ba55cbefacea42f914aa66bcab3f2b\
+                 9819a8a5b46b395bd54a9a20441e2b62974e1f5a6292a2977014bd1e3deae63aee\
+                 bb21694915e4",
+            ),
+            (
+                "a11af9f05531f856ad47116b45a950328204b4f44bfb6b3a4b4f1f3fcb631643",
+                1,
+                "17030300432e937e11ef4ac740e538ad36005fc4a46932fc3225d05f82aa1b36e3\
+                 0efaf97d90e6dffc602dcb501a59a8fcc49c4bf2e5f0a21c0047c2abf332540dd0\
+                 32e167c2955d",
+            ),
+        ];
+        for (secret, seq, record) in cases {
+            let secret = unhex(secret);
+            let record = unhex(record);
+            let mut sender = RecordKey::new(CipherSuite::Aes128GcmSha256, &secret);
+            sender.seq = seq;
+            let sealed = sender
+                .seal(TLS_RECORD_APPLICATION_DATA, &payload)
+                .expect("seal");
+            assert_eq!(sealed, record);
+
+            let mut receiver = RecordKey::new(CipherSuite::Aes128GcmSha256, &secret);
+            receiver.seq = seq;
+            let header: [u8; 5] = record[..5].try_into().unwrap();
+            let (inner_type, plaintext) = receiver.open(&header, &record[5..]).expect("open");
+            assert_eq!(inner_type, TLS_RECORD_APPLICATION_DATA);
+            assert_eq!(plaintext, payload);
+        }
+    }
+
+    /// Seal with `RecordKey` and open with an independent AEAD holding the
+    /// same derived key and IV, then the other way round, for two records.
+    fn assert_record_key_interoperates<A: KeyInit + AeadInPlace>(suite: CipherSuite) {
+        let secret = vec![0x5au8; suite.hash().len()];
+        let key = hkdf_expand_label(suite.hash(), &secret, b"key", &[], suite.key_len());
+        let iv = hkdf_expand_label(suite.hash(), &secret, b"iv", &[], 12);
+        let reference = A::new_from_slice(&key).expect("key length");
+        let mut sender = RecordKey::new(suite, &secret);
+        let mut receiver = RecordKey::new(suite, &secret);
+        for seq in 0u8..2 {
+            let mut nonce = [0u8; 12];
+            nonce.copy_from_slice(&iv);
+            nonce[11] ^= seq;
+            let nonce = aes_gcm::aead::Nonce::<A>::from_slice(&nonce);
+
+            let record = sender
+                .seal(TLS_RECORD_APPLICATION_DATA, b"to the reference")
+                .expect("seal");
+            let mut body = record[5..].to_vec();
+            reference
+                .decrypt_in_place(nonce, &record[..5], &mut body)
+                .expect("reference opens the record");
+            assert_eq!(body, b"to the reference\x17");
+
+            let mut body = b"from the reference\x17".to_vec();
+            let mut header = [TLS_RECORD_APPLICATION_DATA, 0x03, 0x03, 0, 0];
+            header[3..].copy_from_slice(&u16::try_from(body.len() + 16).unwrap().to_be_bytes());
+            reference
+                .encrypt_in_place(nonce, &header, &mut body)
+                .expect("reference seals");
+            let (inner_type, plaintext) = receiver.open(&header, &body).expect("open");
+            assert_eq!(inner_type, TLS_RECORD_APPLICATION_DATA);
+            assert_eq!(plaintext, b"from the reference");
+        }
+    }
+
+    /// AES-256-GCM and ChaCha20-Poly1305 both take 32-byte keys, so a
+    /// swapped algorithm would still round-trip against itself; checking
+    /// each suite against RustCrypto pins it to its cipher.
+    #[test]
+    fn record_key_interoperates_for_every_suite() {
+        assert_record_key_interoperates::<aes_gcm::Aes128Gcm>(CipherSuite::Aes128GcmSha256);
+        assert_record_key_interoperates::<Aes256Gcm>(CipherSuite::Aes256GcmSha384);
+        assert_record_key_interoperates::<chacha20poly1305::ChaCha20Poly1305>(
+            CipherSuite::ChaCha20Poly1305Sha256,
+        );
+    }
+
     // ─── Reality certificate authentication (anti-MITM gate) ──────────────────
 
     /// Minimal DER TLV writer (definite length, short or long form).
@@ -1656,32 +1714,16 @@ mod tests {
         let (client_io, server_io) = tokio::io::duplex(512 * 1024);
         let secret = [0x5Au8; 32];
 
-        let client_stream = RealityTlsStream {
-            inner: Box::new(client_io),
-            read_key: RecordKey::new(CipherSuite::Aes128GcmSha256, &secret),
-            write_key: RecordKey::new(CipherSuite::Aes128GcmSha256, &secret),
-            read_raw_passthrough: false,
-            write_raw_passthrough: false,
-            read_plain: VecDeque::new(),
-            read_state: StreamReadState::Header {
-                buf: [0; 5],
-                pos: 0,
-            },
-            write_pending: None,
-        };
-        let server_stream = RealityTlsStream {
-            inner: Box::new(server_io),
-            read_key: RecordKey::new(CipherSuite::Aes128GcmSha256, &secret),
-            write_key: RecordKey::new(CipherSuite::Aes128GcmSha256, &secret),
-            read_raw_passthrough: false,
-            write_raw_passthrough: false,
-            read_plain: VecDeque::new(),
-            read_state: StreamReadState::Header {
-                buf: [0; 5],
-                pos: 0,
-            },
-            write_pending: None,
-        };
+        let client_stream = RealityTlsStream::new(
+            Box::new(client_io),
+            RecordKey::new(CipherSuite::Aes128GcmSha256, &secret),
+            RecordKey::new(CipherSuite::Aes128GcmSha256, &secret),
+        );
+        let server_stream = RealityTlsStream::new(
+            Box::new(server_io),
+            RecordKey::new(CipherSuite::Aes128GcmSha256, &secret),
+            RecordKey::new(CipherSuite::Aes128GcmSha256, &secret),
+        );
 
         // Server: read [u32 LE len][data] plaintext frames, echo them back.
         tokio::spawn(async move {
@@ -1896,22 +1938,14 @@ mod tests {
     #[test]
     fn poll_write_reports_new_chunk_len_after_pending_drain() {
         let secret = [0x5Au8; 32];
-        let mut stream = RealityTlsStream {
-            inner: Box::new(PendingOnce {
+        let mut stream = RealityTlsStream::new(
+            Box::new(PendingOnce {
                 pending: true,
                 written: Vec::new(),
             }),
-            read_key: RecordKey::new(CipherSuite::Aes128GcmSha256, &secret),
-            write_key: RecordKey::new(CipherSuite::Aes128GcmSha256, &secret),
-            read_raw_passthrough: false,
-            write_raw_passthrough: false,
-            read_plain: VecDeque::new(),
-            read_state: StreamReadState::Header {
-                buf: [0; 5],
-                pos: 0,
-            },
-            write_pending: None,
-        };
+            RecordKey::new(CipherSuite::Aes128GcmSha256, &secret),
+            RecordKey::new(CipherSuite::Aes128GcmSha256, &secret),
+        );
 
         use tokio::io::AsyncWriteExt;
 
