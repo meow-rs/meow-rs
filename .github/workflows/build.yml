@@ -24,7 +24,9 @@ on:
       apk_version:
         description: >-
           OpenWrt apk package version before the "-r1" revision (apk syntax:
-          no "-", suffixes like "_git<digits>"). Empty = derive from `ref`.
+          no "-", suffixes like "_git<digits>"). Empty = derive from `ref`
+          (strip a leading "v"); a ref that is not a release version gets
+          `<workspace version>_git<commit stamp>`, as Alpha uses.
         required: false
         type: string
         default: ""
@@ -309,7 +311,20 @@ jobs:
           version="${{ inputs.apk_version }}"
           if [ -z "${version}" ]; then
             version="${ref#v}"
-            version="${version//\//-}"
+            # A ref that is not a release version (a workflow_dispatch
+            # from a branch, e.g. a release dry run) is no apk version:
+            # apk rejects "-" and letters outside its suffixes. Use the
+            # Alpha convention instead, the workspace version plus a
+            # `_git<commit stamp>` post-release suffix.
+            if ! [[ "${version}" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
+              base=$(sed -nE '/^\[workspace\.package\]/,/^\[/ s/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' Cargo.toml | head -n1)
+              stamp=$(TZ=UTC git show -s --format=%cd --date=format-local:%Y%m%d%H%M HEAD)
+              if [ -z "${base}" ] || [ -z "${stamp}" ]; then
+                echo "::error::could not derive an apk version for ref '${ref}'"
+                exit 1
+              fi
+              version="${base}_git${stamp}"
+            fi
           fi
           for arch in ${{ matrix.openwrt_archs }}; do
             # root so the payload is owned by root:root inside the apk
