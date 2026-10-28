@@ -92,6 +92,13 @@ the canonical, in-repo source a release is cut from.
 
 ### Changed
 
+- **The `minimal` build leaves out the public-suffix list**: it was about
+  570 KB of the aarch64 musl `minimal` binary, which had grown past its
+  8 MiB hard cap (ADR-0007) after the YAML backend migration (#802). The
+  list now sits behind a `public-suffix` feature in `full`. Without it,
+  load-balance `consistent-hashing` keys a domain on its last two labels
+  instead of its eTLD+1, so every `*.co.uk` host lands on one member.
+  The release binaries, all built with `full`, are unchanged.
 - **The release binaries serve `type: shadowsocks` listeners**: the
   Shadowsocks inbound (`listener-shadowsocks`) joins the `full` bundle, so a
   config that declares one, as mihomo's release builds accept, now starts

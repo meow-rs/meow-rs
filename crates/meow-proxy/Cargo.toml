@@ -9,7 +9,12 @@ repository.workspace = true
 homepage.workspace = true
 
 [features]
-default = ["ss", "trojan", "vless", "vless-vision", "vless-encryption", "ech-tls-tunnel", "vmess", "snell", "hysteria2", "mux", "kcptun"]
+default = ["ss", "trojan", "vless", "vless-vision", "vless-encryption", "ech-tls-tunnel", "vmess", "snell", "hysteria2", "mux", "kcptun", "public-suffix"]
+# The embedded public-suffix list (`psl`) behind load-balance
+# `consistent-hashing`'s eTLD+1 key — about 500 KB of lookup tables, so it
+# is in the app `full` profile and kept out of `minimal` (ADR-0007
+# binary-size caps), where the key falls back to the last two labels.
+public-suffix = ["dep:psl"]
 ss = ["dep:shadowsocks", "meow-transport/simple-obfs", "meow-transport/shadow-tls", "meow-transport/restls", "meow-transport/jls"]
 trojan = []
 vless = []
@@ -117,7 +122,7 @@ ctr = { workspace = true, optional = true }
 # Pinned exactly: `psl` republishes the embedded public-suffix list on a
 # near-daily cadence, so a caret range would auto-resolve to releases only
 # hours old. Bump deliberately.
-psl = "=2.1.232"
+psl = { version = "=2.1.232", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

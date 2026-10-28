@@ -58,6 +58,9 @@ ech-tls-tunnel = [
 ]
 # sing-mux multiplexing (in `full`; excluded from `minimal` per ADR-0007).
 mux = ["meow-config/mux", "meow-proxy/mux"]
+# Public-suffix-list eTLD+1 keys for load-balance `consistent-hashing`
+# (~500 KB); `minimal` keys on the last two labels instead (ADR-0007).
+public-suffix = ["meow-proxy/public-suffix"]
 # In-process kcptun SS-plugin client (issue #533) — in `full`; excluded
 # from `minimal` alongside `mux` (ADR-0007 binary-size caps).
 kcptun = ["meow-config/kcptun", "meow-proxy/kcptun"]
@@ -88,6 +91,7 @@ full = [
     "listener-http", "listener-socks5", "listener-tproxy", "listener-mixed", "listener-tun",
     "listener-shadowsocks",
     "logbook",
+    "public-suffix",
 ]
 
 [[bin]]

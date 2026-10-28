@@ -269,6 +269,10 @@ impl LoadBalanceGroup {
 /// so all of a registrable domain's hosts share one member), and anything
 /// else falls back to `dst_ip` (empty when neither exists — every such
 /// connection then lands on the same member, deterministic not random).
+///
+/// Without the `public-suffix` feature (the `minimal` profile) the eTLD+1
+/// is approximated by the last two labels, so every `*.co.uk` host shares
+/// one key: the mapping stays deterministic, only less evenly spread.
 fn get_key(metadata: &Metadata) -> String {
     if !metadata.host.is_empty() {
         if metadata.host.parse::<IpAddr>().is_ok() {
@@ -290,12 +294,30 @@ fn get_key(metadata: &Metadata) -> String {
         // leaves a port in `host` today.
         let lower = metadata.host.to_ascii_lowercase();
         if !lower.contains(':') {
-            if let Some(domain) = psl::domain_str(&lower) {
+            if let Some(domain) = registrable_domain(&lower) {
                 return domain.to_string();
             }
         }
     }
     metadata.dst_ip.map(|ip| ip.to_string()).unwrap_or_default()
+}
+
+#[cfg(feature = "public-suffix")]
+fn registrable_domain(host: &str) -> Option<&str> {
+    psl::domain_str(host)
+}
+
+/// The last two labels of `host` (a trailing dot trimmed, like psl), or
+/// `None` for a single label, which has no registrable domain.
+#[cfg(not(feature = "public-suffix"))]
+fn registrable_domain(host: &str) -> Option<&str> {
+    let host = host.strip_suffix('.').unwrap_or(host);
+    let mut dots = host.rmatch_indices('.').map(|(i, _)| i);
+    let last = dots.next()?;
+    if last == 0 || last + 1 == host.len() {
+        return None;
+    }
+    Some(dots.next().map_or(host, |i| &host[i + 1..]))
 }
 
 /// FNV-1a 64-bit over the destination key. Upstream hashes with
@@ -591,6 +613,7 @@ mod tests {
     #[test]
     fn get_key_domain_reduces_to_etld_plus_one() {
         // All hosts under one registrable domain share a member.
+        #[cfg(feature = "public-suffix")]
         assert_eq!(
             get_key(&meta_dst_host("a.b.example.co.uk")),
             "example.co.uk"
@@ -603,8 +626,12 @@ mod tests {
 
     #[test]
     fn get_key_falls_back_to_dst_ip_then_empty() {
-        // A host that IS a public suffix has no eTLD+1 → dst_ip.
+        // A host with no eTLD+1 → dst_ip: a public suffix under psl, a
+        // single label either way.
+        #[cfg(feature = "public-suffix")]
         let mut m = meta_dst_host("co.uk");
+        #[cfg(not(feature = "public-suffix"))]
+        let mut m = meta_dst_host("localhost");
         m.dst_ip = Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2)));
         assert_eq!(get_key(&m), "198.51.100.2");
         // No host → dst_ip; neither → "" (deterministic, not random).
@@ -629,6 +656,20 @@ mod tests {
         let mut m = meta_dst_host("example.com:443");
         m.dst_ip = Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)));
         assert_eq!(get_key(&m), "203.0.113.9");
+    }
+
+    /// Without the public-suffix list the key is the last two labels.
+    #[cfg(not(feature = "public-suffix"))]
+    #[test]
+    fn get_key_without_psl_uses_last_two_labels() {
+        assert_eq!(get_key(&meta_dst_host("a.b.example.co.uk")), "co.uk");
+        assert_eq!(get_key(&meta_dst_host("example.com")), "example.com");
+        assert_eq!(get_key(&meta_dst_host("www.example.com.")), "example.com");
+        for host in ["localhost", "localhost.", ".com", "com."] {
+            let mut m = meta_dst_host(host);
+            m.dst_ip = Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 3)));
+            assert_eq!(get_key(&m), "198.51.100.3", "{host}");
+        }
     }
 
     // ─── A. Round-robin strategy ──────────────────────────────────────────────

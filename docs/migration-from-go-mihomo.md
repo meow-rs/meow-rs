@@ -313,7 +313,9 @@ sweeps static members of every group type since v1.18.4).
 
 Supported in M1.C-1. Two strategies: `round-robin` (default) and
 `consistent-hashing` (sticky by destination — mihomo `getKey`: IP-literal
-host verbatim, domain reduced to eTLD+1, else `dst_ip`). Periodic
+host verbatim, domain reduced to eTLD+1, else `dst_ip`). The `minimal`
+build leaves out the public-suffix list and keys a domain on its last two
+labels instead, so every `*.co.uk` host shares one member. Periodic
 health-check using the same URL-probe mechanism as `url-test`.
 
 ```yaml

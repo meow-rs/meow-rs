@@ -32,6 +32,7 @@ exist yet.
 | `socks5-outbound` | `meow-proxy` | SOCKS5 outbound |
 | `load-balance` | `meow-proxy` | Load-balance group |
 | `relay` | `meow-proxy` | Relay group |
+| `public-suffix` | `meow-proxy` | Public-suffix list (`psl`, ~500 KB) for load-balance `consistent-hashing` eTLD+1 keys; in `full`, not `minimal`, which keys on the last two labels |
 
 ### Transport features
 
