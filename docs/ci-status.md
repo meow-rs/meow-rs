@@ -111,7 +111,7 @@ Runs on Ubuntu after `lint`:
 | Trojan protocol | `crates/meow-proxy/tests/trojan_integration.rs` | Yes (Ubuntu + macOS) |
 | Hysteria2 Docker integration | `crates/meow-proxy/tests/hysteria2_integration.rs` | Yes (Ubuntu) |
 | Snell Docker integration | `crates/meow-proxy/tests/snell_server_docker_integration.rs` | Yes (Ubuntu) |
-| v2ray-plugin integration | `crates/meow-proxy/tests/v2ray_plugin_integration.rs` | Yes (Ubuntu + macOS) |
+| v2ray-plugin integration | `crates/meow-proxy/tests/v2ray_plugin_integration.rs` | Yes (Ubuntu, pinned official v2ray-plugin peer) |
 | VLESS parser/integration | `crates/meow-config/tests/vless_config_test.rs`, `vless_integration` | Yes |
 | Transport layers | `meow-transport` TLS/WS/gRPC/H2/HTTPUpgrade tests | Yes |
 | Feature powersets | `cargo hack check` for transport/proxy/listener crates | Yes |

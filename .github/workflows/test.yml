@@ -179,6 +179,13 @@ jobs:
           sudo install -m 755 /tmp/gost /usr/local/bin/gost
           command -v gost
 
+      # v2ray_plugin_integration runs ssserver with this official
+      # v2ray-plugin as its server plugin (default options, so Mux.Cool,
+      # plus `mux=0` legs); V2RAY_PLUGIN_BIN on the test step points the
+      # suite at it, and the suite fails when it is unset (no silent skip).
+      - name: Fetch official v2ray-plugin (pinned, SHA256 verified)
+        run: bash scripts/fetch-v2ray-plugin.sh "$RUNNER_TEMP/v2ray-plugin"
+
       # The restls upstream-interop leg runs against a real
       # metacubex/restls-client-go server built from the committed Go
       # harness; RESTLS_SERVER_BIN on the test step tells the suite where
@@ -262,6 +269,8 @@ jobs:
           JLS_SERVER_BIN: ${{ runner.temp }}/jls-server
           # And for kcptun_e2e's all-real-peer suite.
           KCPTUN_SERVER_BIN: ${{ runner.temp }}/kcptun-server
+          # And for v2ray_plugin_integration's official server plugin.
+          V2RAY_PLUGIN_BIN: ${{ runner.temp }}/v2ray-plugin/v2ray-plugin
         run: |
           cargo nextest run --lib --bin meow --bin meow-bench --bin meow-cli \
             --test common_test \

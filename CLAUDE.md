@@ -241,6 +241,14 @@ is unset — build the harness from
 `MEOW_KCPTUN_E2E_ALLOW_SKIP=1` prints a loud explicit skip for local runs
 only — CI builds the harness via `actions/setup-go` and never sets it.
 
+`v2ray_plugin_integration` runs `ssserver` with an official v2ray-plugin
+release as its server plugin (default options, so Mux.Cool, plus `mux=0`
+legs) and **fails** when `V2RAY_PLUGIN_BIN` is unset — fetch the pinned
+release with `bash scripts/fetch-v2ray-plugin.sh /tmp/meow-v2rp` and export
+`V2RAY_PLUGIN_BIN=/tmp/meow-v2rp/v2ray-plugin` (`ssserver` must be on
+`PATH`); `MEOW_V2RAY_PLUGIN_E2E_ALLOW_SKIP=1` prints a loud explicit skip
+for local runs only — CI fetches it the same way and never sets it.
+
 Keep the target list in sync with `.github/workflows/test.yml`; a new `tests/`
 file that CI runs but this list omits is invisible to the local bar.
 

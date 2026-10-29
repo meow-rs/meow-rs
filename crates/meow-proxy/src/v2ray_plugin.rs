@@ -4,8 +4,10 @@
 //! `v2ray-plugin` SIP003 plugin for Shadowsocks, natively in Rust.
 //!
 //! TLS is provided by `meow_transport::tls::TlsLayer`; WebSocket by
-//! `meow_transport::ws::WsLayer`.  Protocol logic (SIP003 option parsing,
-//! `mux` pass-through) remains here unchanged.
+//! `meow_transport::ws::WsLayer`. With `mux` on (the default, as in the
+//! upstream plugin) the WebSocket carries Mux.Cool frames (`mux_cool`);
+//! with `mux` off it carries the Shadowsocks stream raw, which only a
+//! server started with `mux=0` accepts.
 //!
 //! Entry points:
 //! - [`parse_opts`] converts a SIP003 `k=v;k=v` opts string into a
@@ -27,6 +29,8 @@ use tracing::{debug, warn};
 use crate::plugin_util::{parse_bool, sip003_opts};
 use crate::transport_to_proxy_err;
 
+mod mux_cool;
+
 /// Transport mode.  Only WebSocket is supported.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
@@ -45,11 +49,12 @@ pub struct V2rayPluginConfig {
     pub path: String,
     pub headers: HashMap<String, String>,
     pub skip_cert_verify: bool,
-    /// Parsed but not acted on (matches Go mihomo's built-in plugin behaviour).
-    /// NOTE: setting `mux=1` on the *server* side requires `mux=0` (the
-    /// default) in the client opts; the v2ray-plugin server expects plain
-    /// WebSocket frames, not real SMUX streams.  Leaving `mux=false` here is
-    /// the correct default for `mode=websocket` without a real MUX engine.
+    /// Frame the stream as Mux.Cool, one sub-connection per WebSocket
+    /// connection. Must match the server: v2ray-plugin's `mux` defaults
+    /// to 1 on both ends, and a server started that way rejects a raw
+    /// stream (`common/mux: invalid metalen`), while a `mux=0` server
+    /// expects one. Defaults to `true`, as upstream; set `mux: false` for a
+    /// `mux=0` server.
     pub mux: bool,
 }
 
@@ -62,7 +67,24 @@ impl Default for V2rayPluginConfig {
             path: "/".to_string(),
             headers: HashMap::new(),
             skip_cert_verify: false,
-            mux: false,
+            mux: true,
+        }
+    }
+}
+
+/// Parse `mux`: upstream takes a connection count (`0` off, anything else
+/// on; a single sub-connection per connection is all we open), mihomo a
+/// bool. Anything else keeps the default, as upstream does.
+fn parse_mux(value: &str) -> bool {
+    if let Ok(count) = value.parse::<u32>() {
+        return count != 0;
+    }
+    match value.to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" => true,
+        "false" | "no" | "off" => false,
+        other => {
+            warn!("v2ray-plugin: unrecognised mux value '{other}', keeping the default (on)");
+            true
         }
     }
 }
@@ -88,7 +110,7 @@ pub fn parse_opts(s: &str) -> Result<V2rayPluginConfig> {
             "tls" => cfg.tls = parse_bool(&value, "v2ray-plugin", "tls"),
             "host" => cfg.host = value,
             "path" => cfg.path = value,
-            "mux" => cfg.mux = parse_bool(&value, "v2ray-plugin", "mux"),
+            "mux" => cfg.mux = parse_mux(&value),
             "skip-cert-verify" => {
                 cfg.skip_cert_verify = parse_bool(&value, "v2ray-plugin", "skip-cert-verify");
             }
@@ -206,10 +228,17 @@ pub async fn handshake_over(
         ..WsConfig::default()
     };
     let ws_layer = WsLayer::new(ws_config).map_err(transport_to_proxy_err)?;
-    ws_layer
+    let ws = ws_layer
         .connect(stream)
         .await
-        .map_err(transport_to_proxy_err)
+        .map_err(transport_to_proxy_err)?;
+
+    // 4) Mux.Cool framing, one sub-connection per WebSocket connection.
+    if cfg.mux {
+        Ok(Box::new(mux_cool::MuxCoolStream::new(ws)))
+    } else {
+        Ok(ws)
+    }
 }
 
 #[cfg(test)]
@@ -284,7 +313,7 @@ mod tests {
                     path: "/".to_string(),
                     headers: Default::default(),
                     skip_cert_verify: false,
-                    mux: false,
+                    mux: true,
                 }),
             },
             Case {
@@ -310,7 +339,7 @@ mod tests {
                     path: "/ws".to_string(),
                     headers: Default::default(),
                     skip_cert_verify: false,
-                    mux: false,
+                    mux: true,
                 }),
             },
             Case {
@@ -325,7 +354,7 @@ mod tests {
                         .into_iter()
                         .collect(),
                     skip_cert_verify: false,
-                    mux: false,
+                    mux: true,
                 }),
             },
             Case {
@@ -365,5 +394,27 @@ mod tests {
             "parse_opts case failures:\n{}",
             failures.join("\n")
         );
+    }
+
+    /// `mux` is upstream's connection count or mihomo's bool; absent or
+    /// unparseable, it is on, as upstream.
+    #[test]
+    fn parse_opts_mux_values() {
+        for (opts, want) in [
+            ("", true),
+            ("mux", true),
+            ("mux=1", true),
+            ("mux=8", true),
+            ("mux=true", true),
+            ("mux=On", true),
+            ("mux=bogus", true),
+            ("mux=", true),
+            ("mux=0", false),
+            ("mux=false", false),
+            ("mux=no", false),
+            ("mux=OFF", false),
+        ] {
+            assert_eq!(parse_opts(opts).unwrap().mux, want, "opts {opts:?}");
+        }
     }
 }

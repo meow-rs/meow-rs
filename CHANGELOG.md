@@ -8,6 +8,25 @@ the canonical, in-repo source a release is cut from.
 
 ## [Unreleased]
 
+### Changed
+
+- **`v2ray-plugin`'s `mux` now defaults to on**, as in the upstream
+  client (`-mux` defaults to 1) and mihomo; it used to default to off.
+  A node without a `mux` key now speaks Mux.Cool, which a server on
+  default options requires; set `mux: false` (or `mux=0` in SIP003
+  `plugin-opts`) for a server started with `mux=0`. A number counts as
+  on unless it is 0, as upstream reads it.
+
+### Fixed
+
+- **The built-in `v2ray-plugin` client works with servers on default
+  options**: an official v2ray-plugin server multiplexes with Mux.Cool
+  unless it runs with `mux=0`, but meow parsed `mux` and then sent the
+  Shadowsocks stream raw, so the server dropped every connection
+  (`common/mux: invalid metalen`) and only `mux=0` servers worked. meow
+  now frames the stream as Mux.Cool, one sub-connection per WebSocket
+  connection, sending the same session target as the upstream client.
+
 ## [0.27.0] - 2026-10-28
 
 ### Added
