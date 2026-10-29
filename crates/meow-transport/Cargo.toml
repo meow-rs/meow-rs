@@ -79,9 +79,9 @@ simple-obfs = ["dep:base64", "dep:rand"]
 # shadow-tls client transport (v1/v2/v3) — a real cover TLS handshake over
 # a sniffer/patcher shim, then record-framed data. Dedicated feature so
 # `tls`-only consumers (meow-dns et al.) don't compile ~1.7k lines they
-# can't use; sha1/subtle are its deps alone (hmac/sha2 stay unconditional
-# for the REALITY backend).
-shadow-tls = ["tls", "dep:sha1", "dep:subtle"]
+# can't use; subtle is its dep alone (sha2 stays unconditional for the
+# REALITY backend, and the record HMAC-SHA1 runs on BoringSSL's SHA-1).
+shadow-tls = ["tls", "dep:subtle"]
 # restls client transport — a record-level TLS client whose session_id
 # authenticates the relay and whose post-handshake records carry blake3
 # MACs + masks; `tls` supplies BoringSSL for the cover-handshake
@@ -223,6 +223,9 @@ base64 = { workspace = true }
 blake3 = { workspace = true }
 # Reference AEAD for the REALITY record layer's ChaCha20-Poly1305 suite test.
 chacha20poly1305 = { workspace = true }
+# Reference SHA-1 for the shadow-tls e2e server's record HMACs, independent of
+# the client's BoringSSL-backed HMAC-SHA1.
+sha1 = { workspace = true }
 
 [[test]]
 name = "boring_tls_test"

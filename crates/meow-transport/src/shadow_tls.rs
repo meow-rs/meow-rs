@@ -56,8 +56,7 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use hmac::{Hmac, Mac};
-use sha1::Sha1;
+use boring::sha::Sha1;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -65,8 +64,6 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use crate::record_io::{poll_drain_outbox, serve_pending, RecordAssembler};
 use crate::tls::{ConnectTypedError, TlsLayer};
 use crate::{Result, Stream, TransportError};
-
-type HmacSha1 = Hmac<Sha1>;
 
 /// Upstream `DefaultALPN` for the cover handshake.
 pub const DEFAULT_ALPN: [&str; 2] = ["h2", "http/1.1"];
@@ -105,15 +102,57 @@ const SERVER_RANDOM_INDEX: usize = RECORD_HDR + 4 + 2;
 /// ClientHello-bearing record: + client_random(32).
 const CH_SID_LEN_INDEX: usize = SERVER_RANDOM_INDEX + TLS_RANDOM_LEN;
 
+/// HMAC-SHA1 (RFC 2104) on BoringSSL's assembly SHA-1.  Every v3 data
+/// record is tagged or verified with it, so it runs over every byte
+/// relayed; the RustCrypto software SHA-1 managed about a quarter of the
+/// speed in the size-optimised release profile on CPUs without SHA-NI.
+/// The key-padded inner and outer blocks are absorbed once, and `Clone`
+/// copies a plain `SHA_CTX`, so the rolling `Sum` stays alloc-free.
+#[derive(Clone)]
+struct HmacSha1 {
+    inner: Sha1,
+    outer: Sha1,
+}
+
+impl HmacSha1 {
+    const BLOCK: usize = 64;
+
+    fn new(key: &[u8]) -> Self {
+        let mut block = [0u8; Self::BLOCK];
+        if key.len() > Self::BLOCK {
+            let mut h = Sha1::new();
+            h.update(key);
+            block[..20].copy_from_slice(&h.finish());
+        } else {
+            block[..key.len()].copy_from_slice(key);
+        }
+        let mut inner = Sha1::new();
+        inner.update(&block.map(|b| b ^ 0x36));
+        let mut outer = Sha1::new();
+        outer.update(&block.map(|b| b ^ 0x5c));
+        Self { inner, outer }
+    }
+
+    fn update(&mut self, data: &[u8]) {
+        self.inner.update(data);
+    }
+
+    fn sum(&self) -> [u8; 20] {
+        let mut outer = self.outer.clone();
+        outer.update(&self.inner.clone().finish());
+        outer.finish()
+    }
+}
+
 fn sha1_hmac(key: &[u8]) -> HmacSha1 {
-    HmacSha1::new_from_slice(key).expect("HMAC accepts any key length")
+    HmacSha1::new(key)
 }
 
 /// Go `hash.Hash.Sum` equivalent — finalize a clone, leaving the chain
 /// state untouched for further `update`s.  Returns a stack array: the
 /// tag sizes are fixed constants, so the data path stays alloc-free.
 fn hmac_sum<const N: usize>(chain: &HmacSha1) -> [u8; N] {
-    let sum = chain.clone().finalize().into_bytes();
+    let sum = chain.sum();
     let mut out = [0u8; N];
     out.copy_from_slice(&sum[..N]);
     out
@@ -826,7 +865,7 @@ impl AsyncRead for HandshakeShim {
                             if let Mode::V2 { hasher } = &mut self.mode {
                                 hasher.update(filled);
                             }
-                            self.pending.extend(filled.iter().copied());
+                            self.pending.extend(filled);
                         }
                     }
                 }
@@ -995,9 +1034,9 @@ impl FramedStream {
             .extend([RECORD_APPDATA, RECORD_VER[0], RECORD_VER[1]]);
         self.outbox.extend(len.to_be_bytes());
         if let Some(p) = prefix {
-            self.outbox.extend(p.iter().copied());
+            self.outbox.extend(p);
         }
-        self.outbox.extend(payload.iter().copied());
+        self.outbox.extend(payload);
         Ok(())
     }
 }
@@ -1300,8 +1339,8 @@ impl AsyncWrite for VerifiedStream {
                 .extend([RECORD_APPDATA, RECORD_VER[0], RECORD_VER[1]]);
             self.outbox
                 .extend(((chunk.len() + HMAC_LEN) as u16).to_be_bytes());
-            self.outbox.extend(tag.iter().copied());
-            self.outbox.extend(chunk.iter().copied());
+            self.outbox.extend(&tag);
+            self.outbox.extend(chunk);
         }
         match self.poll_drain(cx) {
             Poll::Pending | Poll::Ready(Ok(())) => Poll::Ready(Ok(buf.len())),
@@ -1363,6 +1402,37 @@ mod tests {
         chain.update(&[0u8; HMAC_LEN]);
         chain.update(&record[sid_end..]);
         hmac_sum::<HMAC_LEN>(&chain)
+    }
+
+    /// RFC 2202 HMAC-SHA1 vectors, including a key longer than the block,
+    /// and a mid-stream `hmac_sum` that must not disturb the chain.
+    #[test]
+    fn hmac_sha1_matches_rfc2202() {
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        for (key, data, want) in [
+            (
+                &[0x0bu8; 20][..],
+                &b"Hi There"[..],
+                "b617318655057264e28bc0b6fb378c8ef146be00",
+            ),
+            (
+                b"Jefe",
+                b"what do ya want for nothing?",
+                "effcdf6ae5eb2fa2d27416d5f184df9c259a7c79",
+            ),
+            (
+                &[0xaau8; 80][..],
+                b"Test Using Larger Than Block-Size Key - Hash Key First",
+                "aa4ae5e15272d00e95705637ce8a3b55ed402112",
+            ),
+        ] {
+            let mut chain = sha1_hmac(key);
+            let (head, tail) = data.split_at(data.len() / 2);
+            chain.update(head);
+            let _ = hmac_sum::<HMAC_LEN>(&chain);
+            chain.update(tail);
+            assert_eq!(hex(&hmac_sum::<20>(&chain)), want);
+        }
     }
 
     #[test]

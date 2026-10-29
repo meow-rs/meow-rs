@@ -267,7 +267,7 @@ impl<S> RestlsStream<S> {
         };
         // The Finished record binds into the *first* tagged record only.
         let record = wire::build_tagged_record(&self.secret, &self.server_random, &spec, rand_pad);
-        self.outbox.extend(record.iter().copied());
+        self.outbox.extend(&record);
         self.to_server_ctr += 1;
         if command.need_interrupt() && !fake {
             self.write_pending = true;
@@ -316,7 +316,7 @@ impl<S> RestlsStream<S> {
                     wire::build_tagged_record(&self.secret, &self.server_random, &spec, rand_pad);
                 (data_len, command, record)
             };
-            self.outbox.extend(staged.2.iter().copied());
+            self.outbox.extend(&staged.2);
             self.to_server_ctr += 1;
             emitted = true;
             self.send_buf.drain(..staged.0);
@@ -467,7 +467,7 @@ impl<S> RestlsStream<S> {
                 if msg[4] == 1 {
                     if let Some(write) = &mut self.cover_write {
                         if let Some(record) = write.seal_key_update_response() {
-                            self.outbox.extend(record.iter().copied());
+                            self.outbox.extend(&record);
                         }
                     }
                 }
@@ -650,7 +650,7 @@ where
                             continue;
                         }
                         this.useless_records = 0;
-                        this.inbox.extend(plain.iter().copied());
+                        this.inbox.extend(&plain[..]);
                         serve_pending(&mut this.inbox, buf);
                         return Poll::Ready(Ok(()));
                     }
@@ -762,7 +762,7 @@ where
                     "restls: cover seal failed",
                 )));
             }
-            self.outbox.extend(record.iter().copied());
+            self.outbox.extend(&record);
             // Once sealed the bytes are consumed — reporting `Pending` here
             // would make a retry seal the same `buf` again (duplicate data
             // under bumped record sequence numbers).
@@ -779,7 +779,7 @@ where
                 self.blocked_write_waker = Some(cx.waker().clone());
                 return Poll::Pending;
             }
-            self.send_buf.extend(buf.iter().copied());
+            self.send_buf.extend(buf);
             return Poll::Ready(Ok(buf.len()));
         }
         match self.poll_drain(cx) {
@@ -787,7 +787,7 @@ where
             Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
             Poll::Pending => return Poll::Pending,
         }
-        self.send_buf.extend(buf.iter().copied());
+        self.send_buf.extend(buf);
         self.flush_send_buf();
         if let Poll::Ready(Err(e)) = self.poll_drain(cx) {
             return Poll::Ready(Err(e));
@@ -813,7 +813,7 @@ where
             this.sent_close_notify = true;
             if let Some(cover) = &mut this.cover_write {
                 let rec = cover.seal_close_notify();
-                this.outbox.extend(rec.iter().copied());
+                this.outbox.extend(&rec);
             }
         }
         match this.poll_drain(cx) {

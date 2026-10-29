@@ -258,7 +258,7 @@ where
                     continue;
                 }
                 this.useless_records = 0;
-                this.inbox.extend(body.iter().copied());
+                this.inbox.extend(&body[..]);
                 continue;
             }
             let consumed = match this.handle_inner(typ, &body) {
