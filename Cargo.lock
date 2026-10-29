@@ -2796,6 +2796,7 @@ dependencies = [
  "criterion",
  "dashmap",
  "ipnet",
+ "libc",
  "meow-common",
  "meow-config",
  "meow-dns",

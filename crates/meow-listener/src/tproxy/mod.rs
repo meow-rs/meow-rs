@@ -6,7 +6,8 @@ use crate::sniffer::SnifferRuntime;
 use firewall::FirewallGuard;
 use meow_common::{with_dial_timeout, ConnType, Metadata, Network};
 use meow_tunnel::{
-    copy_bidirectional_buf_tracked, MatchedRule, ResolvedTarget, Tunnel, RELAY_BUF_SIZE,
+    copy_bidirectional_buf_tracked_splice, proxy_conn_tcp_view, tcp_view, MatchedRule,
+    ResolvedTarget, Tunnel, RELAY_BUF_SIZE,
 };
 use std::collections::HashSet;
 use std::future::Future;
@@ -636,11 +637,12 @@ async fn handle_tproxy_flow(
                 Ok(mut remote) => {
                     let up = Arc::clone(_guard.counters());
                     let dn = Arc::clone(_guard.counters());
-                    match copy_bidirectional_buf_tracked(
+                    match copy_bidirectional_buf_tracked_splice(
                         &mut stream,
-                        &mut remote,
+                        &mut *remote,
                         &mut relay_buf_up,
                         &mut relay_buf_dn,
+                        (tcp_view, proxy_conn_tcp_view),
                         |n| {
                             inner
                                 .stats

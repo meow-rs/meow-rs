@@ -27,6 +27,10 @@ smol_str = { workspace = true }
 smallvec = { workspace = true }
 time = { workspace = true }
 
+# The relay splices socket-to-socket traffic (`relay::splice`).
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+libc = "0.2"
+
 [[bench]]
 name = "udp_bench"
 harness = false

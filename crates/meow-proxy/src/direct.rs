@@ -205,7 +205,11 @@ impl tokio::io::AsyncWrite for DirectConn {
 }
 
 impl Unpin for DirectConn {}
-impl ProxyConn for DirectConn {}
+impl ProxyConn for DirectConn {
+    fn tcp_stream(&self) -> Option<&TcpStream> {
+        Some(&self.0)
+    }
+}
 
 // UDP wrapper
 struct DirectPacketConn {
@@ -533,6 +537,8 @@ mod tests {
             .dial_tcp(&tcp_metadata("127.0.0.1", port))
             .await
             .expect("COMPATIBLE must dial direct");
+        // The relay splices a direct connection through this socket.
+        assert!(conn.tcp_stream().is_some());
         conn.write_all(b"ping").await.unwrap();
         let mut buf = [0u8; 4];
         conn.read_exact(&mut buf).await.unwrap();

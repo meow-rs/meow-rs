@@ -24,13 +24,23 @@
 //   `RELAY_CYCLES_PER_POLL` additionally bounds total work per poll so the
 //   relay yields to sibling tasks even on streams that don't participate in
 //   tokio's coop budget.
+//
+// Kernel splice (Linux / Android):
+//   When both endpoints of a direction are bare TCP sockets (a SOCKS5 /
+//   HTTP CONNECT / TProxy client relayed to DIRECT), the bulk tier is a pipe
+//   instead of the 32 KiB buffer: `splice(2)` moves the bytes socket to
+//   pipe to socket without copying them through userspace, which is how the
+//   Go runtime relays TCP to TCP. Callers opt in through
+//   [`copy_bidirectional_buf_tracked_splice`] and a [`TcpView`] per endpoint.
 
+use meow_common::ProxyConn;
 use std::future::{poll_fn, Future};
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::TcpStream;
 
 /// Buffer size used for each relay direction at connection setup.
 /// 4 KiB halves the tokio default (8 KiB) to save 8 KiB/conn at the
@@ -112,27 +122,63 @@ enum Cycle {
     Pending,
 }
 
+/// The kernel TCP socket behind a relay endpoint, when the endpoint reads
+/// and writes it byte for byte. A direction whose reader and writer both
+/// have one relays its bulk traffic with `splice(2)` on Linux and Android.
+pub type TcpView<T> = for<'x> fn(&'x T) -> Option<&'x TcpStream>;
+
+/// [`TcpView`] of a bare socket.
+pub fn tcp_view(stream: &TcpStream) -> Option<&TcpStream> {
+    Some(stream)
+}
+
+/// [`TcpView`] of a dialed connection: `Some` only when the adapter hands
+/// back the socket itself (DIRECT), see [`ProxyConn::tcp_stream`].
+pub fn proxy_conn_tcp_view(conn: &dyn ProxyConn) -> Option<&TcpStream> {
+    conn.tcp_stream()
+}
+
 /// Per-direction scratch storage: the caller's stack array until the
-/// direction proves bulk, then a one-time owned upgrade (#386).
+/// direction proves bulk, then a one-time owned upgrade (#386), or a splice
+/// pipe when both of its endpoints are bare sockets.
 enum Scratch<'buf> {
     Borrowed(&'buf mut [u8]),
     Owned(Box<[u8]>),
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    Pipe(splice::Pipe),
 }
 
-impl Scratch<'_> {
-    fn slice(&mut self) -> &mut [u8] {
-        match self {
-            Scratch::Borrowed(b) => b,
-            Scratch::Owned(b) => b,
+/// The bulk tier for a direction (#386): a splice pipe when the platform
+/// has `splice(2)` and both endpoints are bare sockets, otherwise (or when
+/// the pipe cannot be created, e.g. at the fd limit) the owned
+/// [`RELAY_BULK_BUF_SIZE`] buffer.
+fn bulk_scratch<'buf, R: ?Sized, W: ?Sized>(
+    reader: &R,
+    writer: &W,
+    views: Option<(TcpView<R>, TcpView<W>)>,
+) -> Scratch<'buf> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if let Some((reader_tcp, writer_tcp)) = views {
+        if reader_tcp(reader).is_some() && writer_tcp(writer).is_some() {
+            if let Some(pipe) = splice::Pipe::new() {
+                return Scratch::Pipe(pipe);
+            }
         }
     }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let _ = (reader, writer, views);
+    Scratch::Owned(vec![0u8; RELAY_BULK_BUF_SIZE].into_boxed_slice())
+}
 
-    fn len(&self) -> usize {
-        match self {
-            Scratch::Borrowed(b) => b.len(),
-            Scratch::Owned(b) => b.len(),
-        }
-    }
+fn poll_read_into<R: AsyncRead + Unpin + ?Sized>(
+    cx: &mut Context<'_>,
+    reader: &mut R,
+    buf: &mut [u8],
+) -> Poll<io::Result<usize>> {
+    let mut rb = ReadBuf::new(buf);
+    Pin::new(reader)
+        .poll_read(cx, &mut rb)
+        .map_ok(|()| rb.filled().len())
 }
 
 /// Whether a direction that has relayed `amt` bytes through a `buf_len`-byte
@@ -170,43 +216,53 @@ impl<'buf> HalfCopy<'buf> {
     /// each turn at a single cycle lets the caller interleave the two
     /// directions fairly; the caller loops as long as either side reports
     /// [`Cycle::Progress`].
+    ///
+    /// `views` find the reader's and writer's sockets for the splice tier;
+    /// in pipe mode `pos..cap` counts the bytes sitting in the pipe.
     fn poll_cycle<R, W, F>(
         &mut self,
         cx: &mut Context<'_>,
-        mut reader: Pin<&mut R>,
-        mut writer: Pin<&mut W>,
+        reader: &mut R,
+        writer: &mut W,
+        views: Option<(TcpView<R>, TcpView<W>)>,
         on_progress: &mut F,
     ) -> io::Result<Cycle>
     where
-        R: AsyncRead + ?Sized,
-        W: AsyncWrite + ?Sized,
+        R: AsyncRead + Unpin + ?Sized,
+        W: AsyncWrite + Unpin + ?Sized,
         F: FnMut(u64),
     {
         // Refill the buffer when empty — at most one read per cycle.
         if self.pos == self.cap && !self.read_done {
             // Tiered upgrade (#386): the buffer is empty, so swapping it is
-            // safe — no buffered bytes to carry over. One allocation per bulk
-            // direction for the connection's remaining lifetime.
-            if wants_bulk_upgrade(self.amt, self.buf.len()) {
-                self.buf = Scratch::Owned(vec![0u8; RELAY_BULK_BUF_SIZE].into_boxed_slice());
+            // safe — no buffered bytes to carry over. One allocation (or one
+            // pipe) per bulk direction for the connection's remaining lifetime.
+            if let Scratch::Borrowed(buf) = &self.buf {
+                if wants_bulk_upgrade(self.amt, buf.len()) {
+                    self.buf = bulk_scratch(&*reader, &*writer, views);
+                }
             }
-            let mut rb = ReadBuf::new(self.buf.slice());
-            match reader.as_mut().poll_read(cx, &mut rb) {
-                Poll::Ready(Ok(())) => {
-                    let filled = rb.filled().len();
-                    if filled == 0 {
-                        self.read_done = true;
-                    } else {
-                        self.pos = 0;
-                        self.cap = filled;
-                    }
+            let read = match &mut self.buf {
+                Scratch::Borrowed(buf) => poll_read_into(cx, reader, buf),
+                Scratch::Owned(buf) => poll_read_into(cx, reader, buf),
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                Scratch::Pipe(pipe) => match views.and_then(|(reader_tcp, _)| reader_tcp(reader)) {
+                    Some(src) => pipe.poll_fill(cx, src),
+                    None => Poll::Ready(Err(splice::lost_socket())),
+                },
+            };
+            match read {
+                Poll::Ready(Ok(0)) => self.read_done = true,
+                Poll::Ready(Ok(filled)) => {
+                    self.pos = 0;
+                    self.cap = filled;
                 }
                 Poll::Ready(Err(e)) => return Err(e),
                 Poll::Pending => {
                     // Nothing buffered and the reader is idle: push written
                     // bytes to the peer before parking this direction.
                     if self.need_flush {
-                        match writer.as_mut().poll_flush(cx) {
+                        match Pin::new(&mut *writer).poll_flush(cx) {
                             Poll::Ready(Ok(())) => self.need_flush = false,
                             Poll::Ready(Err(e)) => return Err(e),
                             Poll::Pending => return Ok(Cycle::Pending),
@@ -219,8 +275,20 @@ impl<'buf> HalfCopy<'buf> {
 
         // Drain buffered data to the writer.
         while self.pos < self.cap {
-            let data = &self.buf.slice()[self.pos..self.cap];
-            match writer.as_mut().poll_write(cx, data) {
+            let written = match &mut self.buf {
+                Scratch::Borrowed(buf) => {
+                    Pin::new(&mut *writer).poll_write(cx, &buf[self.pos..self.cap])
+                }
+                Scratch::Owned(buf) => {
+                    Pin::new(&mut *writer).poll_write(cx, &buf[self.pos..self.cap])
+                }
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                Scratch::Pipe(pipe) => match views.and_then(|(_, writer_tcp)| writer_tcp(writer)) {
+                    Some(dst) => pipe.poll_drain(cx, dst, self.cap - self.pos),
+                    None => Poll::Ready(Err(splice::lost_socket())),
+                },
+            };
+            match written {
                 Poll::Ready(Ok(0)) => {
                     return Err(io::Error::new(
                         io::ErrorKind::WriteZero,
@@ -241,7 +309,7 @@ impl<'buf> HalfCopy<'buf> {
         }
 
         if self.read_done {
-            return match writer.as_mut().poll_shutdown(cx) {
+            return match Pin::new(&mut *writer).poll_shutdown(cx) {
                 Poll::Ready(Ok(())) => Ok(Cycle::Done),
                 Poll::Ready(Err(e)) => Err(e),
                 Poll::Pending => Ok(Cycle::Pending),
@@ -288,6 +356,58 @@ pub async fn copy_bidirectional_buf_tracked<A, B, FA, FB>(
     b: &mut B,
     buf_a_to_b: &mut [u8],
     buf_b_to_a: &mut [u8],
+    on_a_to_b: FA,
+    on_b_to_a: FB,
+) -> io::Result<(u64, u64)>
+where
+    A: AsyncRead + AsyncWrite + Unpin + ?Sized,
+    B: AsyncRead + AsyncWrite + Unpin + ?Sized,
+    FA: FnMut(u64),
+    FB: FnMut(u64),
+{
+    relay(a, b, buf_a_to_b, buf_b_to_a, None, on_a_to_b, on_b_to_a).await
+}
+
+/// [`copy_bidirectional_buf_tracked`] for endpoints that may be bare TCP
+/// sockets: `views` (for `a`, then `b`) find each endpoint's socket. A
+/// direction whose two endpoints both have one switches to `splice(2)` at
+/// the bulk tier on Linux and Android, so its bytes never cross into
+/// userspace; elsewhere, and for any other direction, this is
+/// [`copy_bidirectional_buf_tracked`]. The callbacks see the same byte
+/// counts either way.
+pub async fn copy_bidirectional_buf_tracked_splice<A, B, FA, FB>(
+    a: &mut A,
+    b: &mut B,
+    buf_a_to_b: &mut [u8],
+    buf_b_to_a: &mut [u8],
+    views: (TcpView<A>, TcpView<B>),
+    on_a_to_b: FA,
+    on_b_to_a: FB,
+) -> io::Result<(u64, u64)>
+where
+    A: AsyncRead + AsyncWrite + Unpin + ?Sized,
+    B: AsyncRead + AsyncWrite + Unpin + ?Sized,
+    FA: FnMut(u64),
+    FB: FnMut(u64),
+{
+    relay(
+        a,
+        b,
+        buf_a_to_b,
+        buf_b_to_a,
+        Some(views),
+        on_a_to_b,
+        on_b_to_a,
+    )
+    .await
+}
+
+async fn relay<A, B, FA, FB>(
+    a: &mut A,
+    b: &mut B,
+    buf_a_to_b: &mut [u8],
+    buf_b_to_a: &mut [u8],
+    views: Option<(TcpView<A>, TcpView<B>)>,
     mut on_a_to_b: FA,
     mut on_b_to_a: FB,
 ) -> io::Result<(u64, u64)>
@@ -297,6 +417,7 @@ where
     FA: FnMut(u64),
     FB: FnMut(u64),
 {
+    let views_b_to_a = views.map(|(a_tcp, b_tcp)| (b_tcp, a_tcp));
     let mut a_to_b = HalfCopy::new(buf_a_to_b);
     let mut b_to_a = HalfCopy::new(buf_b_to_a);
     let mut a_done = false;
@@ -336,9 +457,7 @@ where
             let mut progressed = false;
 
             if !a_done && !a_parked {
-                let a_pin = Pin::new(&mut *a);
-                let b_pin = Pin::new(&mut *b);
-                match a_to_b.poll_cycle(cx, a_pin, b_pin, &mut on_a_to_b) {
+                match a_to_b.poll_cycle(cx, &mut *a, &mut *b, views, &mut on_a_to_b) {
                     Ok(Cycle::Done) => a_done = true,
                     Ok(Cycle::Progress) => {
                         progressed = true;
@@ -350,9 +469,7 @@ where
             }
 
             if !b_done && !b_parked {
-                let a_pin = Pin::new(&mut *a);
-                let b_pin = Pin::new(&mut *b);
-                match b_to_a.poll_cycle(cx, b_pin, a_pin, &mut on_b_to_a) {
+                match b_to_a.poll_cycle(cx, &mut *b, &mut *a, views_b_to_a, &mut on_b_to_a) {
                     Ok(Cycle::Done) => b_done = true,
                     Ok(Cycle::Progress) => {
                         progressed = true;
@@ -407,6 +524,154 @@ where
         Poll::Pending
     })
     .await
+}
+
+/// `splice(2)` plumbing for the bulk tier: socket to pipe to socket, all in
+/// the kernel. One pipe per bulk direction, created at the tier upgrade and
+/// closed with the relay.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) mod splice {
+    use std::io;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+    use std::task::{ready, Context, Poll};
+    use tokio::io::Interest;
+    use tokio::net::TcpStream;
+
+    /// Pipe capacity asked for at creation; the default is 64 KiB.
+    const PIPE_SIZE: libc::c_int = 1 << 20;
+
+    #[cfg(test)]
+    thread_local! {
+        /// Pipes this thread opened, for the tests to tell which tier ran.
+        pub(crate) static OPENED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Upper bound per `splice(2)` call; the kernel stops earlier at the
+    /// pipe's capacity or at what the socket has queued.
+    const MAX_SPLICE: usize = 1 << 20;
+
+    pub(super) struct Pipe {
+        rd: OwnedFd,
+        wr: OwnedFd,
+    }
+
+    impl Pipe {
+        /// `None` when splicing could kill the process (see
+        /// [`sigpipe_is_handled`]), when it is out of descriptors, or when
+        /// the kernel hands out a pipe smaller than the bulk buffer: past
+        /// `fs.pipe-user-pages-soft` an unprivileged user's new pipes get
+        /// two pages, which would move less per call than the copy.
+        pub(super) fn new() -> Option<Self> {
+            if !sigpipe_is_handled() {
+                return None;
+            }
+            let mut fds: [libc::c_int; 2] = [-1; 2];
+            // SAFETY: `fds` is a valid two-element out-array for pipe2.
+            if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
+                return None;
+            }
+            // SAFETY: pipe2 succeeded, so both fds are open and owned by
+            // nothing else.
+            let (rd, wr) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+            // Growing the pipe is best effort, like the Go runtime: past
+            // the quota or `fs.pipe-max-size` it keeps its 64 KiB.
+            // SAFETY: fcntl on an fd we own.
+            unsafe { libc::fcntl(wr.as_raw_fd(), libc::F_SETPIPE_SZ, PIPE_SIZE) };
+            // SAFETY: fcntl on an fd we own.
+            let size = unsafe { libc::fcntl(wr.as_raw_fd(), libc::F_GETPIPE_SZ) };
+            if usize::try_from(size).map_or(true, |size| size < super::RELAY_BULK_BUF_SIZE) {
+                return None;
+            }
+            #[cfg(test)]
+            OPENED.with(|n| n.set(n.get() + 1));
+            Some(Self { rd, wr })
+        }
+
+        /// Move what `src` has queued into this empty pipe; `Ok(0)` is EOF.
+        pub(super) fn poll_fill(
+            &self,
+            cx: &mut Context<'_>,
+            src: &TcpStream,
+        ) -> Poll<io::Result<usize>> {
+            let wr = self.wr.as_raw_fd();
+            loop {
+                ready!(src.poll_read_ready(cx))?;
+                // The pipe is empty, so `WouldBlock` can only mean the
+                // socket ran dry: `try_io` clears its readiness and the
+                // next `poll_read_ready` parks the task.
+                match src.try_io(Interest::READABLE, || {
+                    splice(src.as_raw_fd(), wr, MAX_SPLICE)
+                }) {
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                        ) => {}
+                    res => return Poll::Ready(res),
+                }
+            }
+        }
+
+        /// Move up to `len` of the pipe's bytes (all of them, by the
+        /// caller's count) into `dst`.
+        pub(super) fn poll_drain(
+            &self,
+            cx: &mut Context<'_>,
+            dst: &TcpStream,
+            len: usize,
+        ) -> Poll<io::Result<usize>> {
+            let rd = self.rd.as_raw_fd();
+            loop {
+                ready!(dst.poll_write_ready(cx))?;
+                // The pipe holds `len` bytes, so `WouldBlock` can only mean
+                // the socket's send buffer is full.
+                match dst.try_io(Interest::WRITABLE, || splice(rd, dst.as_raw_fd(), len)) {
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                        ) => {}
+                    res => return Poll::Ready(res),
+                }
+            }
+        }
+    }
+
+    /// `splice(2)` into a socket whose peer is gone raises `SIGPIPE`, as
+    /// it takes no `MSG_NOSIGNAL`. The meow binary ignores the signal (the
+    /// Rust runtime does so before `main`); a process that embeds the
+    /// engine may not, and there the relay keeps to the copy rather than
+    /// risk the signal's default action.
+    fn sigpipe_is_handled() -> bool {
+        let mut current = std::mem::MaybeUninit::<libc::sigaction>::zeroed();
+        // SAFETY: a null new action makes this a pure query into `current`.
+        if unsafe { libc::sigaction(libc::SIGPIPE, std::ptr::null(), current.as_mut_ptr()) } != 0 {
+            return false;
+        }
+        // SAFETY: sigaction succeeded and filled `current`.
+        unsafe { current.assume_init() }.sa_sigaction != libc::SIG_DFL
+    }
+
+    fn splice(from: RawFd, to: RawFd, len: usize) -> io::Result<usize> {
+        // SAFETY: both fds are borrowed from live owners for the call; pipes
+        // and sockets take no offsets.
+        let n = unsafe {
+            libc::splice(
+                from,
+                std::ptr::null_mut(),
+                to,
+                std::ptr::null_mut(),
+                len,
+                libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK,
+            )
+        };
+        usize::try_from(n).map_err(|_| io::Error::last_os_error())
+    }
+
+    /// A `TcpView` that found a socket at the tier upgrade lost it later.
+    pub(super) fn lost_socket() -> io::Error {
+        io::Error::other("relay: a spliced endpoint no longer exposes its socket")
+    }
 }
 
 #[cfg(test)]
@@ -682,5 +947,177 @@ mod tests {
             .unwrap();
         assert_eq!(up, 0);
         assert_eq!(down, 0);
+    }
+
+    /// The splice tier, driven over real loopback sockets. The tests run
+    /// on a current-thread runtime, so the relay's pipes show up in this
+    /// thread's `splice::OPENED`.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    mod spliced {
+        use super::super::splice::OPENED;
+        use super::*;
+        use std::cell::Cell;
+        use std::rc::Rc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        async fn tcp_pair() -> (TcpStream, TcpStream) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (dialed, accepted) = tokio::join!(TcpStream::connect(addr), listener.accept());
+            (dialed.unwrap(), accepted.unwrap().0)
+        }
+
+        fn pattern(len: usize, seed: u8) -> Vec<u8> {
+            (0..len).map(|i| (i % 251) as u8 ^ seed).collect()
+        }
+
+        fn no_socket(_: &tokio::io::DuplexStream) -> Option<&TcpStream> {
+            None
+        }
+
+        /// Write `data` and half-close; read the peer to EOF meanwhile.
+        async fn exchange(stream: TcpStream, data: &[u8]) -> Vec<u8> {
+            let (mut rd, mut wr) = stream.into_split();
+            let send = async {
+                wr.write_all(data).await.unwrap();
+                wr.shutdown().await.unwrap();
+            };
+            let mut got = Vec::new();
+            let recv = rd.read_to_end(&mut got);
+            let ((), n) = tokio::join!(send, recv);
+            n.unwrap();
+            got
+        }
+
+        // Both directions at once, many multiples of the upgrade
+        // threshold, through a DIRECT-shaped `dyn ProxyConn` remote: every
+        // byte arrives in order, each direction opens one pipe, and the
+        // callbacks see the same totals as the result.
+        #[tokio::test]
+        async fn bulk_both_ways_goes_through_pipes() {
+            const TOTAL: usize = 8 << 20;
+            let (client, mut a) = tcp_pair().await;
+            let (b, upstream) = tcp_pair().await;
+            let mut b: Box<dyn ProxyConn> = Box::new(b);
+            let before = OPENED.with(Cell::get);
+
+            let up_seen = Rc::new(Cell::new(0u64));
+            let down_seen = Rc::new(Cell::new(0u64));
+            let (up_cb, down_cb) = (Rc::clone(&up_seen), Rc::clone(&down_seen));
+            let relay = async {
+                let mut buf1 = [0u8; RELAY_BUF_SIZE];
+                let mut buf2 = [0u8; RELAY_BUF_SIZE];
+                copy_bidirectional_buf_tracked_splice(
+                    &mut a,
+                    &mut *b,
+                    &mut buf1,
+                    &mut buf2,
+                    (tcp_view, proxy_conn_tcp_view),
+                    |n| up_cb.set(up_cb.get() + n),
+                    |n| down_cb.set(down_cb.get() + n),
+                )
+                .await
+            };
+            let (up_data, down_data) = (pattern(TOTAL, 0), pattern(TOTAL, 0x5a));
+            let (relayed, at_upstream, at_client) = tokio::join!(
+                relay,
+                exchange(upstream, &down_data),
+                exchange(client, &up_data)
+            );
+
+            assert!(at_upstream == up_data, "client to upstream bytes differ");
+            assert!(at_client == down_data, "upstream to client bytes differ");
+            assert_eq!(relayed.unwrap(), (TOTAL as u64, TOTAL as u64));
+            assert_eq!(
+                (up_seen.get(), down_seen.get()),
+                (TOTAL as u64, TOTAL as u64)
+            );
+            assert_eq!(OPENED.with(Cell::get) - before, 2);
+        }
+
+        // A spliced direction's EOF reaches the peer as a FIN while the
+        // other direction keeps flowing: the request side half-closes
+        // first and the reply still arrives in full.
+        #[tokio::test]
+        async fn half_close_crosses_the_pipe() {
+            const LEN: usize = 1 << 20;
+            let (client, mut a) = tcp_pair().await;
+            let (mut b, upstream) = tcp_pair().await;
+            let before = OPENED.with(Cell::get);
+
+            let relay = async {
+                let mut buf1 = [0u8; RELAY_BUF_SIZE];
+                let mut buf2 = [0u8; RELAY_BUF_SIZE];
+                copy_bidirectional_buf_tracked_splice(
+                    &mut a,
+                    &mut b,
+                    &mut buf1,
+                    &mut buf2,
+                    (tcp_view, tcp_view),
+                    |_| {},
+                    |_| {},
+                )
+                .await
+            };
+            let request = pattern(LEN, 1);
+            let reply = pattern(LEN, 2);
+            let server = async {
+                let (mut rd, mut wr) = upstream.into_split();
+                let mut got = Vec::new();
+                rd.read_to_end(&mut got).await.unwrap();
+                wr.write_all(&reply).await.unwrap();
+                wr.shutdown().await.unwrap();
+                got
+            };
+            let (relayed, at_upstream, at_client) =
+                tokio::join!(relay, server, exchange(client, &request));
+
+            assert!(at_upstream == request, "request bytes differ");
+            assert!(at_client == reply, "reply bytes differ");
+            assert_eq!(relayed.unwrap(), (LEN as u64, LEN as u64));
+            assert_eq!(OPENED.with(Cell::get) - before, 2);
+        }
+
+        // An endpoint without a socket keeps both directions on the
+        // userspace buffers.
+        #[tokio::test]
+        async fn socketless_endpoint_keeps_the_buffer_copy() {
+            const LEN: usize = 1 << 20;
+            let (client, mut a) = tcp_pair().await;
+            let (mut b, mut upstream) = duplex(64 * 1024);
+            let before = OPENED.with(Cell::get);
+
+            let relay = async {
+                let mut buf1 = [0u8; RELAY_BUF_SIZE];
+                let mut buf2 = [0u8; RELAY_BUF_SIZE];
+                copy_bidirectional_buf_tracked_splice(
+                    &mut a,
+                    &mut b,
+                    &mut buf1,
+                    &mut buf2,
+                    (tcp_view, no_socket),
+                    |_| {},
+                    |_| {},
+                )
+                .await
+            };
+            let request = pattern(LEN, 3);
+            let reply = pattern(LEN, 4);
+            let server = async {
+                let mut got = vec![0u8; LEN];
+                upstream.read_exact(&mut got).await.unwrap();
+                upstream.write_all(&reply).await.unwrap();
+                upstream.shutdown().await.unwrap();
+                got
+            };
+            let (relayed, at_upstream, at_client) =
+                tokio::join!(relay, server, exchange(client, &request));
+
+            assert!(at_upstream == request, "request bytes differ");
+            assert!(at_client == reply, "reply bytes differ");
+            assert_eq!(relayed.unwrap(), (LEN as u64, LEN as u64));
+            assert_eq!(OPENED.with(Cell::get), before);
+        }
     }
 }

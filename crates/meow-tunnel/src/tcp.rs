@@ -1,4 +1,4 @@
-use crate::relay::{copy_bidirectional_buf_tracked, RELAY_BUF_SIZE};
+use crate::relay::{copy_bidirectional_buf_tracked_splice, proxy_conn_tcp_view, RELAY_BUF_SIZE};
 use crate::statistics::Statistics;
 use crate::tunnel::{MatchedRule, ResolvedTarget, TunnelInner};
 use meow_common::conn_note;
@@ -319,6 +319,11 @@ pub async fn handle_tcp(
 /// When the tunnel records connection notes, the whole lifetime runs inside
 /// the connection's [`ConnNotes`] scope, so the resolver and adapters note
 /// into it too.
+///
+/// A bare `TcpStream` inbound relayed to a DIRECT remote is spliced in the
+/// kernel on Linux and Android (see [`copy_bidirectional_buf_tracked_splice`]).
+///
+/// [`copy_bidirectional_buf_tracked_splice`]: crate::copy_bidirectional_buf_tracked_splice
 #[doc(hidden)]
 pub async fn route_inbound_tcp<C>(
     inner: &TunnelInner,
@@ -326,7 +331,7 @@ pub async fn route_inbound_tcp<C>(
     metadata: Metadata,
     prefix: &[u8],
 ) where
-    C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+    C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let notes = inner.connection_notes();
     ConnNotes::scope(
@@ -336,13 +341,18 @@ pub async fn route_inbound_tcp<C>(
     .await;
 }
 
+/// The inbound's socket when the listener hands over a bare `TcpStream`.
+fn inbound_tcp_view<C: std::any::Any>(conn: &C) -> Option<&tokio::net::TcpStream> {
+    (conn as &dyn std::any::Any).downcast_ref()
+}
+
 async fn route_inbound_tcp_scoped<C>(
     inner: &TunnelInner,
     conn: &mut C,
     mut metadata: Metadata,
     prefix: &[u8],
 ) where
-    C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+    C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     if conn_notes::recording() {
         note_inbound(&metadata);
@@ -453,11 +463,12 @@ async fn route_inbound_tcp_scoped<C>(
                             .stats
                             .record_upload(&up, prefix.len() as meow_common::atomic::Int);
                     }
-                    match copy_bidirectional_buf_tracked(
+                    match copy_bidirectional_buf_tracked_splice(
                         conn,
-                        &mut remote,
+                        &mut *remote,
                         &mut buf_up,
                         &mut buf_dn,
+                        (inbound_tcp_view, proxy_conn_tcp_view),
                         |n| {
                             inner
                                 .stats
@@ -920,6 +931,57 @@ mod tests {
             socket.write_all(&buf).await.unwrap();
         });
         addr
+    }
+
+    /// A bare socket inbound relayed to DIRECT moves its bulk in the
+    /// kernel: both directions open a splice pipe, and the echo comes back
+    /// intact.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[tokio::test]
+    async fn socket_inbound_to_direct_is_spliced() {
+        use crate::relay::splice::OPENED;
+        use tokio::io::AsyncReadExt;
+        const LEN: usize = 1 << 20;
+
+        let tunnel = test_tunnel();
+        tunnel.update_routing(
+            Default::default(),
+            vec![rule("MATCH,DIRECT")],
+            Default::default(),
+        );
+        let server = echo_server().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (client, inbound) = tokio::join!(
+            tokio::net::TcpStream::connect(listener.local_addr().unwrap()),
+            listener.accept()
+        );
+        let (mut client, mut inbound) = (client.unwrap(), inbound.unwrap().0);
+        let before = OPENED.with(std::cell::Cell::get);
+
+        let sent: Vec<u8> = (0..LEN).map(|i| (i % 251) as u8).collect();
+        let client_side = async {
+            let (mut rd, mut wr) = client.split();
+            let send = async {
+                wr.write_all(&sent).await.unwrap();
+                wr.shutdown().await.unwrap();
+            };
+            let mut echoed = Vec::new();
+            let ((), read) = tokio::join!(send, rd.read_to_end(&mut echoed));
+            read.unwrap();
+            echoed
+        };
+        let meta = Metadata {
+            dst_ip: Some(server.ip()),
+            dst_port: server.port(),
+            ..metadata()
+        };
+        let ((), echoed) = tokio::join!(
+            route_inbound_tcp(tunnel.inner(), &mut inbound, meta, &[]),
+            client_side
+        );
+
+        assert!(echoed == sent, "echoed bytes differ");
+        assert_eq!(OPENED.with(std::cell::Cell::get) - before, 2);
     }
 
     fn only_closed_notes(tunnel: &crate::Tunnel) -> Vec<String> {

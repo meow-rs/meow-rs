@@ -326,7 +326,7 @@ impl ShadowsocksListener {
 /// Per-connection handler: SS handshake (decrypt + read target address) then
 /// route+relay. Generic over the inner stream type `S` (bare `TcpStream` or
 /// an obfs wrapper) so the relay is monomorphised per concrete type.
-async fn handle_ss_conn<S: AsyncRead + AsyncWrite + Unpin + Send + Sync>(
+async fn handle_ss_conn<S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static>(
     mut ss: ProxyServerStream<S>,
     peer: SocketAddr,
     tunnel: Tunnel,
