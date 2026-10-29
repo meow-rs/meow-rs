@@ -4111,6 +4111,36 @@ async fn get_memory(
         .expect("valid memory stream response")
 }
 
+/// Parse the `VmRSS:` value (KiB, per procfs) out of a `/proc/self/status`
+/// payload and return it in bytes. `None` if the line is missing/malformed.
+#[cfg(any(target_os = "linux", test))]
+fn parse_vmrss_bytes(status: &str) -> Option<u64> {
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            return rest
+                .split_whitespace()
+                .next()
+                .and_then(|kb| kb.parse::<u64>().ok())
+                .map(|kb| kb.saturating_mul(1024));
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+async fn read_rss_bytes() -> u64 {
+    // VmRSS is the same kernel counter sysinfo's Process::memory() exposes;
+    // reading /proc directly keeps sysinfo (and its rayon/disk/network
+    // default features) out of the shipped Linux binary. Deliberately not
+    // /proc/self/statm: its fields are page counts and the page size is a
+    // kernel-config variable, not a constant.
+    let Ok(status) = tokio::fs::read_to_string("/proc/self/status").await else {
+        return 0;
+    };
+    parse_vmrss_bytes(&status).unwrap_or(0)
+}
+
+#[cfg(not(target_os = "linux"))]
 async fn read_rss_bytes() -> u64 {
     tokio::task::spawn_blocking(|| {
         use sysinfo::{Pid, ProcessesToUpdate, System};
@@ -5018,6 +5048,42 @@ mod tests {
             provider.proxies().len(),
             1,
             "the commit must consume deferred_initial and refresh through the now-resolvable proxy"
+        );
+    }
+
+    /// The real `/proc/self/status` line shape: tab, space-padded KiB value.
+    /// 12345 KiB × 1024 = 12,641,280 B.
+    #[test]
+    fn parse_vmrss_bytes_parses_real_proc_line() {
+        assert_eq!(parse_vmrss_bytes("VmRSS:\t   12345 kB\n"), Some(12_641_280));
+    }
+
+    #[test]
+    fn parse_vmrss_bytes_missing_line_is_none() {
+        assert_eq!(parse_vmrss_bytes("Name:\tmeow\nVmHWM:\t   123 kB\n"), None);
+        assert_eq!(parse_vmrss_bytes(""), None);
+    }
+
+    #[test]
+    fn parse_vmrss_bytes_malformed_value_is_none() {
+        assert_eq!(parse_vmrss_bytes("VmRSS:\tabc kB\n"), None);
+        assert_eq!(parse_vmrss_bytes("VmRSS:\t\n"), None);
+    }
+
+    /// The prefix must be exactly `VmRSS:` — `VmHWM:` or `VmRSS ` don't match.
+    #[test]
+    fn parse_vmrss_bytes_requires_exact_prefix() {
+        assert_eq!(parse_vmrss_bytes("VmRSS  123 kB\n"), None);
+        assert_eq!(parse_vmrss_bytes("VmHWM:\t   123 kB\n"), None);
+    }
+
+    /// F-03: a KiB value that would overflow `u64` on `× 1024` saturates
+    /// instead of panicking (debug) or wrapping (release).
+    #[test]
+    fn parse_vmrss_bytes_saturates_instead_of_overflow() {
+        assert_eq!(
+            parse_vmrss_bytes("VmRSS:\t18446744073709551615 kB\n"),
+            Some(u64::MAX)
         );
     }
 }

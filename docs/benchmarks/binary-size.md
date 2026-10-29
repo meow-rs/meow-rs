@@ -203,3 +203,49 @@ contributor than mux). None of those were measured against `default` at
 the time they landed either; this section only closes the mux-specific gap
 that issue #426 asked for. A follow-up audit to re-baseline `default` size
 against the full feature history is out of scope here.
+
+## RSS via /proc on Linux — sysinfo leaves the Linux dep graph (U2)
+
+Measured 2026-10-28 on macOS/Apple Silicon (`arm64`), rustc 1.98.1
+(`aarch64-apple-darwin`), workspace release profile (`lto = true,
+strip = true, codegen-units = 1, panic = "abort", opt-level = "z"`).
+`meow-api`'s `read_rss_bytes` now reads `VmRSS:` from `/proc/self/status`
+on Linux and keeps `sysinfo` only under
+`[target.'cfg(not(target_os = "linux"))'.dependencies]` with
+`default-features = false, features = ["system"]` — dropping `rayon` (and
+its `crossbeam-deque`/`crossbeam-epoch`/`either`/`rayon-core` subtree)
+plus sysinfo's disk/network/component code from every shipped binary.
+
+Host `default` (full) feature-set A/B, same commit-parent vs. patched
+worktree, `cargo build --locked --release -p meow-app`, `wc -c`:
+
+| Target | Feature set | Before | After | Delta |
+|--------|------------|--------|-------|-------|
+| `aarch64-apple-darwin` | default (full) | 9,967,584 B (~9.50 MiB) | 9,950,880 B (~9.49 MiB) | −16,704 B |
+
+The non-zero host delta is expected, not noise: `sysinfo` stays in the
+non-Linux graph but loses its default features, so `rayon` + the
+crossbeam subtree drops out of the macOS binary as well.
+
+Cross-link musl A/B (zig 0.13.0 + cargo-zigbuild 0.23.2, same recipe on
+the base commit), `cargo zigbuild --release --locked --target
+<triple> --bin meow`, `wc -c`:
+
+| Target | Feature set | Before | After | Delta |
+|--------|------------|--------|-------|-------|
+| `x86_64-unknown-linux-musl` | default (full) | 15,153,992 B (~14.45 MiB) | 15,080,984 B (~14.38 MiB) | −73,008 B |
+| `aarch64-unknown-linux-musl` | default (full) | 12,529,688 B (~11.95 MiB) | 12,469,280 B (~11.89 MiB) | −60,408 B |
+
+The musl deltas land below early estimates because `opt-level="z"` + fat
+LTO already strips most unreachable `sysinfo`/`rayon` code; what leaves
+is the reachable procfs-parsing and work-stealing surface.
+
+Dep-graph evidence
+(`cargo tree --target x86_64-unknown-linux-musl -e normal -p meow-api`,
+before→after package-set diff): **removed** `sysinfo v0.32.1`,
+`rayon v1.12.0`, `rayon-core v1.13.0`, `crossbeam-deque v0.8.8`,
+`crossbeam-epoch v0.9.21`, `either v1.19.0`; **added** none. On
+`aarch64-apple-darwin` the same diff removes the rayon subtree but keeps
+`sysinfo v0.32.1` (now `system` component only). `Cargo.lock` is
+byte-identical — `rayon` remains locked via `criterion` (dev-dep) and
+`meow-dns`'s sysinfo dev-dep, and the lock records no target-cfg edges.

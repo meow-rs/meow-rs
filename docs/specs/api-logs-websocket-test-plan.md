@@ -213,12 +213,15 @@ Unit tests on the `LogMessage` and `LogLevel` types directly — no WS server ne
 
 Uses real server + WS client. Wall time with slack.
 
+Status: planned — not yet implemented in `crates/meow-api/tests/` as of
+2026-10-28 (that directory currently has no `/memory` WebSocket cases).
+
 | # | Case | Asserts |
 |---|------|---------|
 | F1 | `memory_ws_emits_frame_within_1500ms` | Connect WS to `/memory`; wait up to 1 500 ms; assert at least one text frame received. Frame parses as JSON. Upstream: `hub/route/memory.go` — 1 Hz stream. |
-| F2 | `memory_ws_inuse_is_positive` | `frame["inuse"]` is an integer > 0. The process is consuming memory; `sysinfo` should not return 0 for a running process. |
+| F2 | `memory_ws_inuse_is_positive` | `frame["inuse"]` is an integer > 0. The process is consuming memory; the RSS read (Linux: `/proc/self/status` `VmRSS:`; other platforms: `sysinfo`) should not return 0 for a running process. |
 | F3 | `memory_ws_oslimit_is_non_negative` | `frame["oslimit"]` is an integer ≥ 0. `0` is valid (platform doesn't expose limit or read failed). |
-| F4 | `memory_ws_no_extra_fields` **[guard-rail]** | Frame JSON contains exactly `"inuse"` and `"oslimit"` — no other fields. Guards against accidentally serializing internal `sysinfo` data. |
+| F4 | `memory_ws_no_extra_fields` **[guard-rail]** | Frame JSON contains exactly `"inuse"` and `"oslimit"` — no other fields. Guards against accidentally serializing internals of the RSS source (`sysinfo` on non-Linux platforms). |
 | F5 | `memory_ws_auth_same_as_logs` **[guard-rail]** | `/memory` with no auth + secret configured → 401. `/memory?token=<secret>` → 101. Same `require_auth_ws` middleware. |
 
 ---
@@ -273,13 +276,16 @@ that are easy to violate silently.
 
 ## Divergence table cross-reference
 
-All 6 spec divergence rows have test coverage. Summary:
+Acceptance mapping for the 6 spec divergence rows. Note: the row-4 cases
+F2/F3 — like all section-F `/memory` WebSocket cases — are planned but
+not yet implemented; `crates/meow-api/tests/` currently has no `/memory`
+WebSocket cases. Summary:
 
 | Spec row | Class | Test cases |
 |----------|:-----:|------------|
 | 1 — No historical ring-buffer | B | (architectural; no acceptance test needed) |
 | 2 — POST /dns/query kept alongside GET | B | H2 |
 | 3 — TRACE collapsed to `"debug"` | B | E3 |
-| 4 — `sysinfo` RSS vs Go `runtime.ReadMemStats` | B | F2, F3 |
+| 4 — Platform-split RSS (Linux `/proc/self/status`; `sysinfo` elsewhere) vs Go `runtime.ReadMemStats` | B | F2, F3 |
 | 5 — Broadcast layer upstream of EnvFilter | B | C1 (RUST_LOG-independent), C4 |
 | 6 — WS accepts `?token=`; REST does not | B | A2, A4 |
