@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use meow_common::{metadata_ip_literal, ConnType, Metadata, Network};
-use meow_tunnel::{ResolvedTarget, Tunnel, TunnelInner};
+use meow_tunnel::{MatchedRule, ResolvedTarget, Tunnel, TunnelInner};
 use smallvec::SmallVec;
 use smol_str::SmolStr;
 use tokio::io::AsyncReadExt;
@@ -511,11 +511,10 @@ async fn run_session(
             ));
         };
         info!(
-            "UDP {} --> {} match {}({}) using {}",
+            "UDP {} --> {} match {} using {}",
             client,
             metadata.remote_address(),
-            rule_name,
-            rule_payload,
+            MatchedRule::new(&rule_name, &rule_payload, proxy.name()),
             proxy.name()
         );
 

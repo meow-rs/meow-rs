@@ -418,7 +418,7 @@ fn build_metadata(peer: SocketAddr, target: &Address, in_name: &str, in_port: u1
 use meow_common::atomic::{checked_increment, AtomicU, Uint};
 use meow_common::{ProxyPacketConn, ReplayWindow};
 use meow_tunnel::udp::DEFAULT_UDP_IDLE;
-use meow_tunnel::TunnelInner;
+use meow_tunnel::{MatchedRule, TunnelInner};
 use shadowsocks::context::SharedContext;
 use shadowsocks::relay::udprelay::options::UdpSocketControlData;
 use shadowsocks::relay::udprelay::proxy_socket::ProxySocketError;
@@ -1173,8 +1173,9 @@ async fn run_ss_udp_flow<S>(
             return;
         };
         info!(
-            "UDP {peer} --> {} match {rule_name}({rule_payload}) using {}",
+            "UDP {peer} --> {} match {} using {}",
             metadata.remote_address(),
+            MatchedRule::new(&rule_name, &rule_payload, proxy.name()),
             proxy.name()
         );
         match inner.dial_udp(proxy.as_ref(), &metadata).await {

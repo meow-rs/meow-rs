@@ -5,7 +5,9 @@ mod udp;
 use crate::sniffer::SnifferRuntime;
 use firewall::FirewallGuard;
 use meow_common::{with_dial_timeout, ConnType, Metadata, Network};
-use meow_tunnel::{copy_bidirectional_buf_tracked, ResolvedTarget, Tunnel, RELAY_BUF_SIZE};
+use meow_tunnel::{
+    copy_bidirectional_buf_tracked, MatchedRule, ResolvedTarget, Tunnel, RELAY_BUF_SIZE,
+};
 use std::collections::HashSet;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
@@ -610,11 +612,10 @@ async fn handle_tproxy_flow(
     let mut route = Some(route);
 
     info!(
-        "{} --> {} match {}({}) using {}",
+        "{} --> {} match {} using {}",
         metadata.source_address(),
         metadata.remote_address(),
-        rule_name,
-        rule_payload,
+        MatchedRule::new(&rule_name, &rule_payload, proxy.name()),
         proxy.name()
     );
 

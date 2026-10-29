@@ -2,7 +2,8 @@ use crate::sniffer::SnifferRuntime;
 use base64::Engine;
 use meow_common::{with_dial_timeout, AuthConfig, ConnType, Metadata, Network};
 use meow_tunnel::{
-    copy_bidirectional_buf_tracked, route_inbound_tcp, ResolvedTarget, Tunnel, RELAY_BUF_SIZE,
+    copy_bidirectional_buf_tracked, route_inbound_tcp, MatchedRule, ResolvedTarget, Tunnel,
+    RELAY_BUF_SIZE,
 };
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -260,11 +261,14 @@ async fn handle_http_inner(
         };
 
         info!(
-            "{} --> {} match {}({}) using {}",
+            "{} --> {} match {} using {}",
             metadata.source_address(),
             metadata.remote_address(),
-            target.rule_name,
-            target.rule_payload,
+            MatchedRule::new(
+                &target.rule_name,
+                &target.rule_payload,
+                target.adapter.name()
+            ),
             target.adapter.name()
         );
 

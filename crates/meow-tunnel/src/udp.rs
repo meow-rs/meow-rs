@@ -1,5 +1,5 @@
 use crate::statistics::{ProxyTraffic, Statistics};
-use crate::tunnel::{ResolvedTarget, TunnelInner};
+use crate::tunnel::{MatchedRule, ResolvedTarget, TunnelInner};
 use dashmap::DashMap;
 use meow_common::atomic::{AtomicU, Int};
 use meow_common::{with_dial_timeout, AdapterType, Metadata, ProxyAdapter, ProxyPacketConn};
@@ -349,11 +349,10 @@ pub async fn handle_udp(
     };
 
     info!(
-        "UDP {} --> {} match {}({}) using {}",
+        "UDP {} --> {} match {} using {}",
         src,
         dst_addr,
-        rule_name,
-        rule_payload,
+        MatchedRule::new(&rule_name, &rule_payload, proxy.name()),
         proxy.name()
     );
 

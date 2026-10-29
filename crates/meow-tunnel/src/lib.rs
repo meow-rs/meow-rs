@@ -18,6 +18,7 @@ pub use relay::{copy_bidirectional_buf, copy_bidirectional_buf_tracked, RELAY_BU
 pub use statistics::{ProxyTraffic, Statistics};
 pub use tcp::{route_inbound_tcp, ConnectionGuard};
 pub use tunnel::{
-    OutboundFlush, PreHandleVerdict, ResolvedTarget, TrackedTcp, TunHandle, Tunnel, TunnelInner,
+    MatchedRule, OutboundFlush, PreHandleVerdict, ResolvedTarget, TrackedTcp, TunHandle, Tunnel,
+    TunnelInner,
 };
 pub use udp::UdpFlushWatch;

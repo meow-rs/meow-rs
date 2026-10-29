@@ -740,6 +740,40 @@ impl std::fmt::Display for RuleText<'_> {
     }
 }
 
+/// A routing decision's rule as the per-connection `match` log line prints
+/// it: `TYPE(payload)`, or `TYPE(target)` when the rule has no payload, so
+/// `MATCH,DIRECT` logs `MATCH(DIRECT)` rather than an empty `MATCH()`. The
+/// tunnel's own decisions read the same way, e.g. `Final(DIRECT)` when no
+/// rule matched.
+pub struct MatchedRule<'a> {
+    rule: &'a str,
+    payload: &'a str,
+    target: &'a str,
+}
+
+impl<'a> MatchedRule<'a> {
+    /// `rule` and `payload` as [`ResolvedTarget`] carries them; `target` is
+    /// the name of the adapter the decision picked.
+    pub fn new(rule: &'a str, payload: &'a str, target: &'a str) -> Self {
+        Self {
+            rule,
+            payload,
+            target,
+        }
+    }
+}
+
+impl std::fmt::Display for MatchedRule<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let detail = if self.payload.is_empty() {
+            self.target
+        } else {
+            self.payload
+        };
+        write!(f, "{}({detail})", self.rule)
+    }
+}
+
 /// The outcome of [`TunnelInner::resolve_proxy`] /
 /// [`TunnelInner::resolve_proxy_lazy`]:
 /// the adapter to dial, the rule that produced it, and the route-table

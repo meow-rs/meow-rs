@@ -158,7 +158,7 @@ anchor loaded, `curl http://1.1.1.1/` from a non-root shell returns normally
 and meow logs
 
 ```
-INFO meow_listener::tproxy: 192.168.x.x:49219 --> 1.1.1.1:80 match MATCH() using DIRECT
+INFO meow_listener::tproxy: 192.168.x.x:49219 --> 1.1.1.1:80 match MATCH(DIRECT) using DIRECT
 ```
 
 ## Limitations

@@ -1,6 +1,6 @@
 use crate::relay::{copy_bidirectional_buf_tracked, RELAY_BUF_SIZE};
 use crate::statistics::Statistics;
-use crate::tunnel::{ResolvedTarget, TunnelInner};
+use crate::tunnel::{MatchedRule, ResolvedTarget, TunnelInner};
 use meow_common::conn_note;
 use meow_common::conn_notes::{self, ConnNotes};
 use meow_common::{with_dial_timeout, Metadata, ProxyAdapter, ProxyConn};
@@ -373,11 +373,14 @@ async fn route_inbound_tcp_scoped<C>(
     };
 
     info!(
-        "{} --> {} match {}({}) using {}",
+        "{} --> {} match {} using {}",
         metadata.source_address(),
         metadata.remote_address(),
-        target.rule_name,
-        target.rule_payload,
+        MatchedRule::new(
+            &target.rule_name,
+            &target.rule_payload,
+            target.adapter.name()
+        ),
         target.adapter.name()
     );
 
@@ -972,6 +975,82 @@ mod tests {
         };
         route_one(&tunnel, meta).await;
         assert!(tunnel.statistics().recently_closed().is_empty());
+    }
+
+    /// Run `f` on a current-thread runtime and return what it logged at
+    /// INFO and above. `with_default` is thread-local, so parallel tests in
+    /// this binary don't see each other's lines.
+    fn capture_info(f: impl std::future::Future<Output = ()>) -> String {
+        #[derive(Clone)]
+        struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+            type Writer = Sink;
+            fn make_writer(&'a self) -> Sink {
+                self.clone()
+            }
+        }
+        let sink = Sink(Arc::new(std::sync::Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(f);
+        });
+        let captured = sink.0.lock().unwrap();
+        String::from_utf8_lossy(&captured).into_owned()
+    }
+
+    /// The per-connection `match` line puts a payload-less rule's target in
+    /// the parentheses, the way `MATCH,DIRECT` reads in the config, rather
+    /// than leaving them empty; a rule with a payload shows the payload.
+    #[test]
+    fn match_log_line_names_the_target_of_a_rule_without_payload() {
+        let logs = capture_info(async {
+            let tunnel = test_tunnel();
+            tunnel.update_routing(
+                Default::default(),
+                vec![
+                    rule("DOMAIN-SUFFIX,cats.invalid,DIRECT"),
+                    rule("MATCH,DIRECT"),
+                ],
+                Default::default(),
+            );
+            for host in ["cats.invalid", "dogs.invalid"] {
+                let meta = Metadata {
+                    host: host.into(),
+                    ..metadata()
+                };
+                route_one(&tunnel, meta).await;
+            }
+            // No rules at all: the tunnel's own fallback decision.
+            let meta = Metadata {
+                host: "birds.invalid".into(),
+                ..metadata()
+            };
+            route_one(&test_tunnel(), meta).await;
+        });
+        for line in [
+            "cats.invalid:443 match DOMAIN-SUFFIX(cats.invalid) using DIRECT",
+            "dogs.invalid:443 match MATCH(DIRECT) using DIRECT",
+            "birds.invalid:443 match Final(DIRECT) using DIRECT",
+        ] {
+            assert!(logs.contains(line), "no {line:?} in:\n{logs}");
+        }
     }
 
     /// The case that motivated notes: an IP rule needs the destination IP,
