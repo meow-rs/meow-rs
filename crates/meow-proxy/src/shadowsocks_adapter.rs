@@ -429,18 +429,21 @@ impl ShadowsocksAdapter {
 impl SsCore {
     /// Layer the SS crypto codec for `addr` over `transport`, an established
     /// (possibly plugin-wrapped) stream to this server. Every TCP dial goes
-    /// through here, so every SS connection gets [`SsConn`]'s
-    /// server-first handling of the deferred request header.
+    /// through here, so every SS connection gets [`SsConn`]'s handling of
+    /// the deferred request header.
     fn ss_conn<T>(&self, transport: T, addr: Address) -> Box<dyn ProxyConn>
     where
         T: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static,
     {
-        Box::new(SsConn::new(ProxyClientStream::from_stream(
-            Arc::clone(&self.context),
-            transport,
-            &self.server_config,
-            addr,
-        )))
+        Box::new(SsConn::new(
+            ProxyClientStream::from_stream(
+                Arc::clone(&self.context),
+                transport,
+                &self.server_config,
+                addr,
+            ),
+            self.server_config.method(),
+        ))
     }
 
     /// Dial a raw (or plugin-transported) TCP stream to the SS server and
@@ -830,6 +833,22 @@ pub(crate) fn parse_obfs_opts(plugin_opts: Option<&str>, server: &str) -> Result
 /// client that writes inside the window keeps the coalesced header.
 const SS_HEADER_WINDOW: Duration = Duration::from_millis(200);
 
+/// Most of the caller's first payload that [`SsConn`] hands the crate to
+/// coalesce with the request header.
+///
+/// shadowsocks 1.24 writes `header ‖ payload` with one encrypted-write
+/// call, which seals at most one chunk (0x3FFF bytes for AEAD, 0xFFFF for
+/// AEAD-2022), and then reports the whole payload written
+/// (`relay/tcprelay/proxy_stream/client.rs:308-324`): release builds drop
+/// the tail of a longer first write without an error. Under this cap the
+/// coalesced chunk always fits, and the caller's next write carries the
+/// rest. The relay's first write (4 KiB) and the TUN sniff prefix (at most
+/// 8 KiB) fit under it, so they still leave in one chunk.
+const FIRST_PAYLOAD_MAX: usize = 8 * 1024;
+// The longest request header is a 255-byte domain: ATYP + length + name +
+// port. Its padding exists only on AEAD-2022, whose chunk is 0xFFFF.
+const _: () = assert!(FIRST_PAYLOAD_MAX + 1 + 1 + 255 + 2 <= 0x3FFF);
+
 /// Progress of the request header that `ProxyClientStream` defers to the
 /// first `poll_write`.
 enum HeaderState {
@@ -838,6 +857,12 @@ enum HeaderState {
     /// [`SsConn`] stays `Unpin`; a connection that writes first never
     /// allocates it.
     Deferred(Option<Pin<Box<Sleep>>>),
+    /// The header and the first `len` payload bytes went to the crate in
+    /// one write that returned `Pending`. The crate keeps them in its own
+    /// buffer, finishes that buffer on the next call whatever it is handed,
+    /// and reports the length of what it is handed, so the retry must hand
+    /// it the same `len` bytes.
+    Coalescing(usize),
     /// Header-only write (`poll_write(&[])`) in flight. Under backpressure
     /// the crate keeps the encrypted header in its own `Connecting` buffer
     /// and the next call resumes it.
@@ -860,13 +885,21 @@ enum HeaderState {
 struct SsConn<T> {
     inner: ProxyClientStream<T>,
     header: HeaderState,
+    /// Whether the first payload rides in the header's write. Not with the
+    /// `none` cipher: the crate hands `header ‖ payload` to the transport
+    /// in a single `poll_write` and reports it all written however little
+    /// the transport took, and a framing transport (v2ray-plugin's 8 KiB
+    /// Mux.Cool frames) takes less than a large first payload. The header
+    /// alone is short enough for any transport to take whole.
+    coalesce: bool,
 }
 
 impl<T: AsyncRead + AsyncWrite + Unpin> SsConn<T> {
-    fn new(inner: ProxyClientStream<T>) -> Self {
+    fn new(inner: ProxyClientStream<T>, method: CipherKind) -> Self {
         Self {
             inner,
             header: HeaderState::Deferred(None),
+            coalesce: method != CipherKind::NONE,
         }
     }
 
@@ -890,7 +923,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin> SsConn<T> {
                     ready!(Pin::new(&mut self.inner).poll_flush(cx))?;
                     self.header = HeaderState::Done;
                 }
-                HeaderState::Deferred(_) | HeaderState::Done => return Poll::Ready(Ok(())),
+                HeaderState::Deferred(_) | HeaderState::Coalescing(_) | HeaderState::Done => {
+                    return Poll::Ready(Ok(()));
+                }
             }
         }
     }
@@ -905,7 +940,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncRead for SsConn<T> {
         let this = &mut *self;
         loop {
             match &mut this.header {
-                HeaderState::Done => break,
+                HeaderState::Coalescing(_) | HeaderState::Done => break,
                 HeaderState::Deferred(timer) => {
                     let timer =
                         timer.get_or_insert_with(|| Box::pin(tokio::time::sleep(SS_HEADER_WINDOW)));
@@ -940,18 +975,25 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncWrite for SsConn<T> {
     ) -> Poll<std::io::Result<usize>> {
         let this = &mut *self;
         if let HeaderState::Deferred(_) = this.header {
-            if !buf.is_empty() {
+            this.header = if buf.is_empty() || !this.coalesce {
+                // An explicit empty write asks for the header now, and
+                // without coalescing the payload follows the header.
+                HeaderState::Writing
+            } else {
                 // First payload: the crate coalesces the header with it.
                 // Leave `Deferred` before the call, because the crate commits
                 // the header to this write even when it returns `Pending`.
                 // A timer-driven empty write after that would complete the
                 // crate's buffered `header ‖ buf` and report 0, and the
                 // caller's retry would send `buf` a second time.
-                this.header = HeaderState::Done;
-                return Pin::new(&mut this.inner).poll_write(cx, buf);
-            }
-            // An explicit empty write asks for the header now.
-            this.header = HeaderState::Writing;
+                HeaderState::Coalescing(buf.len().min(FIRST_PAYLOAD_MAX))
+            };
+        }
+        if let HeaderState::Coalescing(len) = this.header {
+            // A retry after `Pending` repeats the same bytes, maybe more.
+            let res = ready!(Pin::new(&mut this.inner).poll_write(cx, &buf[..len.min(buf.len())]));
+            this.header = HeaderState::Done;
+            return Poll::Ready(res);
         }
         // Finish a header-only write first: until it completes the crate
         // ignores `buf` and would report it written.
@@ -2912,6 +2954,7 @@ mod ss_conn_tests {
     const AEAD: Cipher = ("aes-128-gcm", "server-first-test");
     /// 16-byte iPSK ("1234567890123456"), base64.
     const AEAD_2022: Cipher = ("2022-blake3-aes-128-gcm", "MTIzNDU2Nzg5MDEyMzQ1Ng==");
+    const NONE: Cipher = ("none", "unused");
     const BANNER: &[u8] = b"220 smtp.test ESMTP ready\r\n";
     /// Virtual-time bound for an exchange: without a header the client
     /// waits forever, and the paused clock jumps straight to this.
@@ -2995,12 +3038,16 @@ mod ss_conn_tests {
             inner: c,
             writes: Arc::clone(&writes),
         };
-        let client = SsConn::new(ProxyClientStream::from_stream(
-            Context::new_shared(ServerType::Local),
-            transport,
-            &server_config(cipher),
-            target(),
-        ));
+        let cfg = server_config(cipher);
+        let client = SsConn::new(
+            ProxyClientStream::from_stream(
+                Context::new_shared(ServerType::Local),
+                transport,
+                &cfg,
+                target(),
+            ),
+            cfg.method(),
+        );
         Pair {
             client,
             writes,
@@ -3245,6 +3292,87 @@ mod ss_conn_tests {
             .unwrap();
         assert_eq!(addr, target());
         assert_eq!(&got, b"payload");
+    }
+
+    /// A first write longer than one chunk (0x3FFF bytes for AEAD, 0xFFFF
+    /// for AEAD-2022) arrives whole. Over the small pipe the write also
+    /// returns `Pending` and the caller retries it with its whole buffer,
+    /// and with `none` the pipe takes less than `header ‖ payload` at once.
+    /// Returns the transport's recorded writes.
+    async fn large_first_write(cipher: Cipher) -> Vec<usize> {
+        let Pair {
+            mut client,
+            writes,
+            mut server,
+        } = pair(cipher, 4 * 1024);
+        let data: Vec<u8> = (0..96 * 1024).map(|i| (i % 251) as u8).collect();
+        let len = data.len();
+        let srv = tokio::spawn(async move {
+            assert_eq!(server.handshake().await?, target());
+            let mut got = vec![0u8; len];
+            server.read_exact(&mut got).await?;
+            io::Result::Ok(got)
+        });
+        client.write_all(&data).await.unwrap();
+        client.flush().await.unwrap();
+        let got = timeout(DEADLINE, srv)
+            .await
+            .expect("part of the first write never arrived")
+            .unwrap()
+            .unwrap();
+        assert!(got == data, "the first write arrived corrupted");
+        recorded(&writes)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn large_first_write_arrives_whole_aead() {
+        large_first_write(AEAD).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn large_first_write_arrives_whole_aead_2022() {
+        large_first_write(AEAD_2022).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn large_first_write_arrives_whole_none() {
+        let writes = large_first_write(NONE).await;
+        // ATYP + length + "smtp.test" + port.
+        assert_eq!(writes[0], 1 + 1 + 9 + 2, "the header must leave alone");
+    }
+
+    /// A first write that returned `Pending` and is retried with a longer
+    /// buffer reports only the bytes that went to the crate with the
+    /// header; the crate itself would report the longer buffer written.
+    #[tokio::test(start_paused = true)]
+    async fn pending_first_write_retried_longer_reports_committed_bytes() {
+        // 16 bytes cannot hold even the AEAD salt plus the length chunk.
+        let Pair {
+            mut client,
+            mut server,
+            ..
+        } = pair(AEAD, 16);
+        let data: Vec<u8> = (0..200u8).collect();
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(Pin::new(&mut client)
+            .poll_write(&mut cx, &data[..100])
+            .is_pending());
+
+        let srv = tokio::spawn(async move {
+            assert_eq!(server.handshake().await?, target());
+            let mut got = vec![0u8; 200];
+            server.read_exact(&mut got).await?;
+            io::Result::Ok(got)
+        });
+        assert_eq!(client.write(&data).await.unwrap(), 100);
+        client.write_all(&data[100..]).await.unwrap();
+        client.flush().await.unwrap();
+        let got = timeout(DEADLINE, srv)
+            .await
+            .expect("part of the first write never arrived")
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, data);
     }
 
     /// A caller that closes without writing sends no header, as before, and

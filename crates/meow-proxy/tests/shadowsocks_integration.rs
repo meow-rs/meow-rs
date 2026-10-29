@@ -987,3 +987,74 @@ async fn test_ss_server_first_banner_without_client_bytes_2022() {
     // 16-byte base64 iPSK ("1234567890123456"), as in test_ss_udp_relay_2022.
     ss_server_first("2022-blake3-aes-128-gcm", "MTIzNDU2Nzg5MDEyMzQ1Ng==").await;
 }
+
+/// A first write longer than one chunk (0x3FFF bytes for AEAD, 0xFFFF for
+/// AEAD-2022) reaches the target whole through ssserver: shadowsocks 1.24
+/// seals one chunk of the coalesced `header ‖ payload` and reports all of it
+/// written. With `none` the header goes out alone first, which ssserver must
+/// accept.
+async fn ss_large_first_write(cipher: &str, key: &str) {
+    if !ssserver_available() {
+        skip_or_fail("ssserver not found in PATH");
+        return;
+    }
+
+    let (echo_addr, _echo_handle) = start_tcp_echo_server().await;
+    let ss_port = free_port().await;
+    let _ssserver = start_ssserver_with_cipher(ss_port, cipher, key).await;
+
+    let adapter = ShadowsocksAdapter::new(
+        "test-ss-large-first-write",
+        "127.0.0.1",
+        ss_port,
+        key,
+        cipher,
+        false,
+        None,
+        None,
+        None,
+        Arc::new(DirectDialer),
+    )
+    .unwrap();
+    let metadata = Metadata {
+        network: Network::Tcp,
+        dst_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        dst_port: echo_addr.port(),
+        ..Default::default()
+    };
+    let conn = timeout(TIMEOUT, adapter.dial_tcp(&metadata))
+        .await
+        .expect("TCP dial timed out")
+        .expect("TCP dial failed");
+
+    let payload: Vec<u8> = (0..96 * 1024).map(|i| (i % 251) as u8).collect();
+    let len = payload.len();
+    let (mut rd, mut wr) = tokio::io::split(conn);
+    let echo = tokio::spawn(async move {
+        let mut back = vec![0u8; len];
+        rd.read_exact(&mut back).await.map(|_| back)
+    });
+    wr.write_all(&payload).await.expect("first write failed");
+    wr.flush().await.expect("flush failed");
+    let back = timeout(TIMEOUT, echo)
+        .await
+        .unwrap_or_else(|_| panic!("echo through SS ({cipher}) lost part of the first write"))
+        .unwrap()
+        .expect("echo read failed");
+    assert!(back == payload, "echo through SS ({cipher}) corrupted");
+}
+
+#[tokio::test]
+async fn test_ss_large_first_write() {
+    ss_large_first_write(SS_CIPHER, SS_PASSWORD).await;
+}
+
+#[tokio::test]
+async fn test_ss_large_first_write_2022() {
+    ss_large_first_write("2022-blake3-aes-128-gcm", "MTIzNDU2Nzg5MDEyMzQ1Ng==").await;
+}
+
+#[tokio::test]
+async fn test_ss_large_first_write_none() {
+    ss_large_first_write("none", SS_PASSWORD).await;
+}

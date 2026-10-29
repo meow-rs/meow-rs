@@ -26,6 +26,14 @@ the canonical, in-repo source a release is cut from.
   (`common/mux: invalid metalen`) and only `mux=0` servers worked. meow
   now frames the stream as Mux.Cool, one sub-connection per WebSocket
   connection, sending the same session target as the upstream client.
+- **A Shadowsocks connection no longer loses the tail of a large first
+  write**: the `shadowsocks` crate seals the request header and the first
+  payload into a single chunk (16 KiB for AEAD, 64 KiB for AEAD-2022) and
+  reports the whole payload sent, so any first write past that limit
+  dropped its tail silently. With the `none` cipher it reported everything
+  sent however little the transport took, which v2ray-plugin's 8 KiB
+  Mux.Cool frames could hit. meow now caps the payload coalesced with the
+  header at 8 KiB and, with `none`, sends the header on its own.
 
 ## [0.27.0] - 2026-10-28
 
