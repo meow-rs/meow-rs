@@ -106,7 +106,7 @@ pub use vmess::VmessAdapter;
 // ─── Stream-desync poison ────────────────────────────────────────────────────
 
 /// Drop guard shared by stream-framed UDP packet conns (trojan, vless,
-/// anytls-uot, kcptun-uot, snell).
+/// vmess, anytls-uot, kcptun-uot, snell).
 /// Unless `complete` is set, dropping the guard — via an early `?` return
 /// OR the future being cancelled mid-frame — marks the conn desynced:
 /// consumed read bytes cannot be un-read and a partially written frame
@@ -118,7 +118,8 @@ pub use vmess::VmessAdapter;
     feature = "vless",
     feature = "anytls",
     feature = "kcptun",
-    feature = "snell"
+    feature = "snell",
+    feature = "vmess"
 ))]
 pub(crate) struct PoisonOnIncomplete<'a> {
     flag: &'a std::sync::atomic::AtomicBool,
@@ -130,7 +131,8 @@ pub(crate) struct PoisonOnIncomplete<'a> {
     feature = "vless",
     feature = "anytls",
     feature = "kcptun",
-    feature = "snell"
+    feature = "snell",
+    feature = "vmess"
 ))]
 impl<'a> PoisonOnIncomplete<'a> {
     pub(crate) fn new(flag: &'a std::sync::atomic::AtomicBool) -> Self {
@@ -146,7 +148,8 @@ impl<'a> PoisonOnIncomplete<'a> {
     feature = "vless",
     feature = "anytls",
     feature = "kcptun",
-    feature = "snell"
+    feature = "snell",
+    feature = "vmess"
 ))]
 impl Drop for PoisonOnIncomplete<'_> {
     fn drop(&mut self) {
@@ -167,7 +170,8 @@ impl Drop for PoisonOnIncomplete<'_> {
     feature = "vless",
     feature = "anytls",
     feature = "kcptun",
-    feature = "snell"
+    feature = "snell",
+    feature = "vmess"
 ))]
 pub(crate) fn check_not_desynced(
     flag: &std::sync::atomic::AtomicBool,

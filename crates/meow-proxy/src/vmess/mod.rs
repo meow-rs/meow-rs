@@ -2,6 +2,7 @@ mod body;
 mod conn;
 pub mod header;
 mod kdf;
+mod packet;
 
 use async_trait::async_trait;
 use meow_common::{
@@ -172,6 +173,27 @@ async fn vmess_over(
     sealed: header::SealedHeader,
     security: Security,
 ) -> Result<Box<dyn ProxyConn>> {
+    let stream = send_request(transport, stream, &sealed).await?;
+
+    // The relay builds each half's body cipher internally — one AEAD key
+    // schedule per direction, and a swapped pairing is unrepresentable
+    // (issue #533).
+    let duplex = conn::spawn_vmess_relay(
+        stream,
+        security,
+        sealed.req_key,
+        sealed.req_iv,
+        sealed.resp_v,
+    );
+    Ok(Box::new(crate::stream_conn::StreamConn(Box::new(duplex))))
+}
+
+/// Apply the transport chain and write the sealed VMess request header.
+async fn send_request(
+    transport: &TransportChain,
+    stream: Box<dyn meow_transport::Stream>,
+    sealed: &header::SealedHeader,
+) -> Result<Box<dyn meow_transport::Stream>> {
     use tokio::io::AsyncWriteExt;
 
     let mut stream = transport.connect(stream).await.map_err(|e| match e {
@@ -185,18 +207,7 @@ async fn vmess_over(
         .write_all(&sealed.bytes)
         .await
         .map_err(MeowError::Io)?;
-
-    // The relay builds each half's body cipher internally — one AEAD key
-    // schedule per direction, and a swapped pairing is unrepresentable
-    // (issue #533).
-    let duplex = conn::spawn_vmess_relay(
-        stream,
-        security,
-        sealed.req_key,
-        sealed.req_iv,
-        sealed.resp_v,
-    );
-    Ok(Box::new(crate::stream_conn::StreamConn(Box::new(duplex))))
+    Ok(stream)
 }
 
 #[async_trait]
@@ -214,17 +225,17 @@ impl ProxyAdapter for VmessAdapter {
     }
 
     fn support_udp(&self) -> bool {
-        // Plain VMess UDP relay is unimplemented — `dial_udp` fails
-        // closed — so the config's `udp: true` request alone must not
-        // advertise capability (issue #662). Only a mux session that
-        // actually carries UDP counts.
-        #[cfg(feature = "mux")]
-        {
-            self.mux.as_ref().is_some_and(|mux| mux.supports_udp())
-        }
-        #[cfg(not(feature = "mux"))]
-        {
-            false
+        // Mirrors `dial_udp`: a UDP-capable mux session, else the native
+        // CommandUDP path gated by the config's `udp:` flag.
+        self.udp || {
+            #[cfg(feature = "mux")]
+            {
+                self.mux.as_ref().is_some_and(|mux| mux.supports_udp())
+            }
+            #[cfg(not(feature = "mux"))]
+            {
+                false
+            }
         }
     }
 
@@ -275,13 +286,36 @@ impl ProxyAdapter for VmessAdapter {
             }
         }
 
-        Err(MeowError::NotSupported(if self.udp {
-            "vmess `udp: true` configured but plain UDP relay is not implemented; \
-             enable a UDP-capable mux or use another adapter"
-                .into()
-        } else {
-            "vmess UDP relay not yet implemented".into()
-        }))
+        if !self.udp {
+            return Err(MeowError::NotSupported(
+                "vmess UDP is disabled for this proxy (set `udp: true`)".into(),
+            ));
+        }
+        debug!(
+            "VMess native UDP to {} via {}",
+            metadata.remote_address(),
+            self.addr_str
+        );
+        let sealed = header::seal_request_header(&self.cmd_key, self.security, metadata, true)
+            .map_err(MeowError::Proxy)?;
+        let stream = self
+            .dialer
+            .dial(&self.server, self.port, metadata.is_internal())
+            .await
+            .map_err(MeowError::Io)?;
+        let stream = send_request(&self.transport, stream, &sealed).await?;
+        let remote = std::net::SocketAddr::new(
+            metadata
+                .dst_ip
+                .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+            metadata.dst_port,
+        );
+        Ok(Box::new(packet::VmessPacketConn::new(
+            stream,
+            &sealed,
+            self.security,
+            remote,
+        )))
     }
 
     /// Issue #695: close every pooled mux session so the next dial opens a
@@ -510,64 +544,229 @@ mod tests {
             .expect("server echo task panicked");
     }
 
-    /// `udp: true` without a UDP-capable mux must not advertise support —
-    /// plain VMess UDP relay is unimplemented and `dial_udp` fails closed,
-    /// so `support_udp` reports only real mux capability (issue #662).
-    #[tokio::test]
-    async fn support_udp_reports_only_implemented_udp() {
-        const UUID: [u8; 16] = [
-            0xb8, 0x31, 0x38, 0x1d, 0x63, 0x24, 0x4d, 0x53, 0xad, 0x4f, 0x8c, 0xda, 0x48, 0xb3,
-            0x08, 0x11,
-        ];
-        let adapter = VmessAdapter::new(
-            "vmess-no-mux",
+    const TEST_UUID: [u8; 16] = [
+        0xb8, 0x31, 0x38, 0x1d, 0x63, 0x24, 0x4d, 0x53, 0xad, 0x4f, 0x8c, 0xda, 0x48, 0xb3, 0x08,
+        0x11,
+    ];
+
+    fn test_adapter(port: u16, security: Security, udp: bool) -> VmessAdapter {
+        VmessAdapter::new(
+            "vmess-udp",
             "127.0.0.1",
-            10086,
-            UUID,
-            Security::Aes128Gcm,
-            true, // udp: true configured
+            port,
+            TEST_UUID,
+            security,
+            udp,
             TransportChain::empty(),
             Arc::new(DirectDialer),
-        );
-        assert!(
-            !adapter.support_udp(),
-            "`udp: true` alone must not advertise capability (issue #662)"
-        );
-        let Err(e) = adapter.dial_udp(&Metadata::default()).await else {
-            panic!("plain vmess UDP dial must fail closed");
+        )
+    }
+
+    /// Without `udp: true` (and no mux) the adapter neither advertises UDP
+    /// nor dials it; with it, `support_udp` is true (native CommandUDP).
+    #[tokio::test]
+    async fn support_udp_follows_udp_flag() {
+        let off = test_adapter(10086, Security::Aes128Gcm, false);
+        assert!(!off.support_udp());
+        let Err(e) = off.dial_udp(&Metadata::default()).await else {
+            panic!("udp: false must not dial UDP");
         };
         assert!(
             matches!(e, MeowError::NotSupported(_)),
             "expected NotSupported, got {e:?}"
         );
-        assert!(
-            e.to_string().contains("`udp: true`"),
-            "the configured-flag diagnostic should name the cause: {e}"
-        );
-
-        let adapter = VmessAdapter::new(
-            "vmess-udp-off",
-            "127.0.0.1",
-            10086,
-            UUID,
-            Security::Aes128Gcm,
-            false,
-            TransportChain::empty(),
-            Arc::new(DirectDialer),
-        );
-        assert!(!adapter.support_udp());
-        let Err(e) = adapter.dial_udp(&Metadata::default()).await else {
-            panic!("plain vmess UDP dial must fail closed");
-        };
-        assert!(
-            !e.to_string().contains("`udp: true`"),
-            "unconfigured adapter keeps the plain message: {e}"
-        );
+        assert!(test_adapter(10086, Security::Aes128Gcm, true).support_udp());
     }
 
-    /// A UDP-capable mux session is the one real capability source:
-    /// `support_udp` advertises it even with `udp` unset, and `only-tcp`
-    /// mux still declines (issue #662).
+    /// Native UDP over a real loopback TCP server that parses the request
+    /// like a conformant VMess server: the header carries CommandUDP and the
+    /// destination, and every datagram is exactly one body record in both
+    /// directions. Datagrams differ in content and length and are sent
+    /// back-to-back (replies too, so TCP coalesces them): a byte-stream
+    /// relay that merges or splits records fails the per-datagram asserts.
+    #[tokio::test]
+    async fn native_udp_round_trips_datagrams_with_boundaries() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for security in [
+            Security::Aes128Gcm,
+            Security::ChaCha20Poly1305,
+            Security::None,
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let adapter = test_adapter(port, security, true);
+            let cmd_key = adapter.cmd_key;
+            let datagrams: Vec<Vec<u8>> = (0..5u8)
+                .map(|i| {
+                    (0..(3 + usize::from(i) * 37))
+                        .map(|j| i ^ (j as u8))
+                        .collect()
+                })
+                .collect();
+            let expected = datagrams.clone();
+
+            let server = tokio::spawn(async move {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut prefix = [0u8; 42];
+                sock.read_exact(&mut prefix).await.unwrap();
+                let frame_len = header::tests::request_header_frame_len(&cmd_key, &prefix).unwrap();
+                let mut frame = prefix.to_vec();
+                frame.resize(frame_len, 0);
+                sock.read_exact(&mut frame[42..]).await.unwrap();
+                let pt = header::tests::server_open_request_header(&cmd_key, &frame).unwrap();
+                assert_eq!(pt[37], 0x02, "cmd must be CommandUDP");
+                assert_eq!(u16::from_be_bytes([pt[38], pt[39]]), 5353);
+                assert_eq!((pt[40], &pt[41..45]), (0x01, &[1u8, 2, 3, 4][..]));
+
+                let req_iv: [u8; 16] = pt[1..17].try_into().unwrap();
+                let req_key: [u8; 16] = pt[17..33].try_into().unwrap();
+                sock.write_all(&header::tests::seal_response_header(
+                    &req_key, &req_iv, pt[33],
+                ))
+                .await
+                .unwrap();
+                let mut cipher = body::BodyCipher::server_mirror(security, &req_key, &req_iv);
+                let mut got = Vec::new();
+                for _ in 0..expected.len() {
+                    got.push(
+                        cipher
+                            .read_record(&mut sock)
+                            .await
+                            .unwrap()
+                            .expect("record"),
+                    );
+                }
+                assert_eq!(got, expected, "one datagram per record, boundaries kept");
+                // Reply burst: reversed payloads, one record each.
+                let mut burst = Vec::new();
+                for d in &got {
+                    let rev: Vec<u8> = d.iter().rev().copied().collect();
+                    cipher.write_record(&mut burst, &rev).await.unwrap();
+                }
+                sock.write_all(&burst).await.unwrap();
+                // Hold the socket open until the client is done.
+                let _ = sock.read(&mut [0u8; 1]).await;
+            });
+
+            let metadata = Metadata {
+                network: meow_common::Network::Udp,
+                dst_ip: Some("1.2.3.4".parse().unwrap()),
+                dst_port: 5353,
+                ..Default::default()
+            };
+            let conn = adapter.dial_udp(&metadata).await.expect("dial_udp");
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            let peer: std::net::SocketAddr = "1.2.3.4:5353".parse().unwrap();
+            // An empty datagram must not reach the wire (zero-length record = EOF).
+            assert_eq!(conn.write_packet(&[], &peer).await.unwrap(), 0);
+            for d in &datagrams {
+                let n = tokio::time::timeout_at(deadline, conn.write_packet(d, &peer))
+                    .await
+                    .expect("write timed out")
+                    .unwrap();
+                assert_eq!(n, d.len());
+            }
+            let mut buf = [0u8; 2048];
+            for d in &datagrams {
+                let (n, from) = tokio::time::timeout_at(deadline, conn.read_packet(&mut buf))
+                    .await
+                    .expect("read timed out")
+                    .unwrap();
+                let rev: Vec<u8> = d.iter().rev().copied().collect();
+                assert_eq!(&buf[..n], &rev[..], "{security:?}: reply boundary/content");
+                assert_eq!(from, peer);
+            }
+            drop(conn);
+            tokio::time::timeout_at(deadline, server)
+                .await
+                .expect("server timed out")
+                .expect("server task panicked");
+        }
+    }
+
+    /// More than 65536 datagrams on one association: the u16 record counter
+    /// wraps in both directions, as it does in Xray / sing-box / mihomo, and
+    /// every datagram still arrives intact and in order.
+    #[tokio::test]
+    async fn native_udp_survives_record_counter_wrap() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        const N: u32 = 65_536 + 64;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let adapter = test_adapter(
+            listener.local_addr().unwrap().port(),
+            Security::Aes128Gcm,
+            true,
+        );
+        let cmd_key = adapter.cmd_key;
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut prefix = [0u8; 42];
+            sock.read_exact(&mut prefix).await.unwrap();
+            let frame_len = header::tests::request_header_frame_len(&cmd_key, &prefix).unwrap();
+            let mut frame = prefix.to_vec();
+            frame.resize(frame_len, 0);
+            sock.read_exact(&mut frame[42..]).await.unwrap();
+            let pt = header::tests::server_open_request_header(&cmd_key, &frame).unwrap();
+            let req_iv: [u8; 16] = pt[1..17].try_into().unwrap();
+            let req_key: [u8; 16] = pt[17..33].try_into().unwrap();
+            sock.write_all(&header::tests::seal_response_header(
+                &req_key, &req_iv, pt[33],
+            ))
+            .await
+            .unwrap();
+            let mut cipher =
+                body::BodyCipher::server_mirror(Security::Aes128Gcm, &req_key, &req_iv);
+            let mut out = Vec::new();
+            for i in 0..N {
+                let rec = cipher
+                    .read_record(&mut sock)
+                    .await
+                    .unwrap()
+                    .expect("record");
+                assert_eq!(rec, i.to_be_bytes(), "upload record {i}");
+                cipher
+                    .write_record(&mut out, &(!i).to_be_bytes())
+                    .await
+                    .unwrap();
+            }
+            sock.write_all(&out).await.unwrap();
+            let _ = sock.read(&mut [0u8; 1]).await;
+        });
+
+        let metadata = Metadata {
+            network: meow_common::Network::Udp,
+            dst_ip: Some("1.2.3.4".parse().unwrap()),
+            dst_port: 53,
+            ..Default::default()
+        };
+        let conn = adapter.dial_udp(&metadata).await.expect("dial_udp");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let peer: std::net::SocketAddr = "1.2.3.4:53".parse().unwrap();
+        for i in 0..N {
+            tokio::time::timeout_at(deadline, conn.write_packet(&i.to_be_bytes(), &peer))
+                .await
+                .expect("write timed out")
+                .unwrap_or_else(|e| panic!("write {i}: {e}"));
+        }
+        let mut buf = [0u8; 16];
+        for i in 0..N {
+            let (n, _) = tokio::time::timeout_at(deadline, conn.read_packet(&mut buf))
+                .await
+                .expect("read timed out")
+                .unwrap_or_else(|e| panic!("read {i}: {e}"));
+            assert_eq!(&buf[..n], (!i).to_be_bytes(), "download record {i}");
+        }
+        drop(conn);
+        tokio::time::timeout_at(deadline, server)
+            .await
+            .expect("server timed out")
+            .expect("server task panicked");
+    }
+
+    /// A UDP-capable mux session advertises UDP even with `udp` unset;
+    /// `only-tcp` mux declines unless native UDP (`udp: true`) covers it.
     #[cfg(feature = "mux")]
     #[tokio::test]
     async fn support_udp_follows_mux_capability() {
@@ -590,13 +789,19 @@ mod tests {
         let muxed = mk(false).with_mux(crate::mux::MuxOptions::default());
         assert!(muxed.support_udp(), "UDP-capable mux advertises");
 
-        let only_tcp = mk(true).with_mux(crate::mux::MuxOptions {
-            only_tcp: true,
-            ..Default::default()
-        });
+        let only_tcp = |udp: bool| {
+            mk(udp).with_mux(crate::mux::MuxOptions {
+                only_tcp: true,
+                ..Default::default()
+            })
+        };
         assert!(
-            !only_tcp.support_udp(),
-            "only-tcp mux carries no UDP; the `udp` flag must not rescue it"
+            !only_tcp(false).support_udp(),
+            "only-tcp mux carries no UDP"
+        );
+        assert!(
+            only_tcp(true).support_udp(),
+            "only-tcp mux with `udp: true` falls back to native UDP"
         );
     }
 }

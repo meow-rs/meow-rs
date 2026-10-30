@@ -15,7 +15,6 @@ use crate::aead::{Aead, TAG_LEN};
 const VMESS_MAGIC: &[u8] = b"c48619fe-8f02-49e0-b9e9-edf763e17e21";
 
 const CMD_TCP: u8 = 0x01;
-#[allow(dead_code)]
 const CMD_UDP: u8 = 0x02;
 
 const ADDR_IPV4: u8 = 0x01;
