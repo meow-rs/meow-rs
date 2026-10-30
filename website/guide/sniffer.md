@@ -21,10 +21,10 @@ sniffer:
 | --- | --- | --- | --- |
 | `enable` | bool | `false` | Turn the sniffer on |
 | `timeout` | u64 (ms) | `100` | Max wait for app-layer bytes (1–60000) |
-| `parse-pure-ip` | bool | `true` | Only accept a sniffed name when the destination isn't a bare IP |
-| `override-destination` | bool | `false` | Replace the destination with the sniffed domain for rule matching |
+| `parse-pure-ip` | bool | `true` | Only sniff flows whose destination has no domain name — empty or a bare IP literal — unless the domain is in `force-domain` |
+| `override-destination` | bool | `false` | Rewrite the destination itself with the sniffed domain, keeping rule matching and dialing consistent |
 | `sniff` | block | — | Per-protocol port lists (**required** when `enable: true`) |
-| `force-domain` | list | `[]` | Glob patterns that bypass the `parse-pure-ip` guard |
+| `force-domain` | list | `[]` | Glob patterns that bypass the `parse-pure-ip` guard and opt a domain authority into routing by the sniffed name |
 | `skip-domain` | list | `[]` | Glob patterns whose sniffed results are discarded |
 
 ### `sniff` block
@@ -47,13 +47,31 @@ QUIC and other protocols are parsed but ignored (warning).
 ## How matching uses it
 
 1. A connection arrives; meow-rs peeks up to `timeout` ms for the handshake/request.
-2. If a domain is found and passes the `parse-pure-ip` confidence check (and isn't in
-   `skip-domain`), it's attached to the connection metadata.
-3. With `override-destination: true`, that domain becomes the destination used for rule
-   matching; otherwise it's recorded alongside the original target.
+2. If a domain is found and isn't in `skip-domain`, the sniffed name may be adopted —
+   see the adoption priority below.
+3. With `override-destination: true`, that domain also becomes the destination, so
+   rule matching and dialing stay consistent; otherwise it's recorded alongside the
+   original target for rule matching only.
 
-`force-domain` lets you accept a sniffed name even when the destination is a bare IP —
-useful for CDNs you know are reached by IP.
+## Which name wins
+
+A sniffed name is adopted only when the flow has no routing name of its own — the
+destination is empty or a bare IP literal. When the destination already carries an
+explicit domain (a CONNECT target, an absolute-form URI, a SOCKS5 domain), that
+authority wins and the sniff is discarded. This keeps rules and dialing consistent:
+rules match on the sniffed name while the dial uses the destination, so adopting a
+conflicting name would route by one host and dial the other — `GET http://evil.com/`
+with `Host: good.example` would miss `DOMAIN,evil.com,REJECT` yet still dial
+`evil.com`.
+
+Two opt-ins beat that priority:
+
+- `override-destination: true` rewrites the destination with the sniffed name —
+  unconditional, and the setting most sniffer users want (it also gives outbound TLS
+  adapters a real SNI instead of an IP literal).
+- `force-domain` matching the destination adopts the sniffed name for rule matching
+  anyway, while the dial keeps the authority — the CDN-front contract: route by the
+  SNI/Host seen on the wire, dial the domain the client asked for.
 
 ## Deprecated `tproxy-sni`
 

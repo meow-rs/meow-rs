@@ -8,7 +8,7 @@ use meow_dns::resolver::{
 };
 use meow_dns::upstream::{NameServerEntry, NameServerUrl};
 use meow_dns::{DnsClient, HostOrIp, Resolver};
-use meow_rules::{RuleSet, RuleSetBehavior};
+use meow_rules::{DomainKeyDefect, RuleSet, RuleSetBehavior};
 use meow_trie::DomainTrie;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -195,7 +195,7 @@ pub async fn parse_dns(
     // silently fall back to the upstream resolver, which is a user-surprising
     // privacy regression.
     if mode == DnsMode::FakeIp {
-        install_fakeip(&mut resolver, dns, cache_dir, prior).await?;
+        install_fakeip(&mut resolver, dns, cache_dir, prior, strict).await?;
     }
 
     let resolver = Arc::new(resolver);
@@ -213,6 +213,7 @@ async fn install_fakeip(
     dns: &crate::raw::RawDns,
     cache_dir: Option<&std::path::Path>,
     prior: Option<&Resolver>,
+    strict: bool,
 ) -> Result<(), anyhow::Error> {
     let range_str = dns
         .fake_ip_range
@@ -288,6 +289,13 @@ async fn install_fakeip(
 
     // Skipper: fake-ip-filter patterns + optional fake-ip-filter-mode.
     let patterns = dns.fake_ip_filter.clone().unwrap_or_default();
+    for p in &patterns {
+        // Dead trie keys by the same shape as `hosts:` — an empty label
+        // strands an unreachable node, and an all-dots/prefix-only body is
+        // refused by `Skipper`'s own insert (issue #822 shape). Surface
+        // both rather than let the entry sit silently dead.
+        check_domain_key("dns.fake-ip-filter", p, strict)?;
+    }
     let skipper_mode = match dns.fake_ip_filter_mode.as_deref() {
         Some("whitelist") | Some("white-list") => SkipperMode::WhiteList,
         Some("blacklist") | Some("black-list") | None => SkipperMode::BlackList,
@@ -567,6 +575,11 @@ async fn build_nameserver_policy(
             // rest (`+.`), and a mid-string `*` (e.g. `a.*.b`) is a literal
             // label only an identical query matches (DR-B F4/F15 unchanged).
             if !key_lower.is_empty() {
+                // As in `hosts:` — the arm still gets the pattern (its
+                // node is simply unreachable, or refused outright); the
+                // warn only surfaces the dead key. Strict mirrors the
+                // prefixed-key rule.
+                check_domain_key("nameserver-policy", &expanded_key, strict)?;
                 patterns.push(PolicyPattern::Domain(key_lower));
             }
         }
@@ -961,7 +974,24 @@ fn build_fallback_filter(
 
     let mut domain: DomainTrie<()> = DomainTrie::new();
     for s in domain_strs {
-        domain.insert(s, ());
+        // Same dead-key shapes as `hosts:` — an empty label inserts but
+        // can never match a query name, and an all-dots/prefix-only body
+        // (`"."`, `"+."`) is refused by the insert below; surface both
+        // rather than swallow them (issue #822 shape).
+        check_domain_key("fallback-filter.domain", s, strict)?;
+        if !domain.insert(s, ()) {
+            // Unreachable for a config key today — every refused shape is
+            // `DomainKeyDefect::NotInsertable` and already surfaced by
+            // `check_domain_key` — kept as the insert's own verdict should
+            // the trie's refusal set ever grow past the predicate.
+            if strict {
+                return Err(anyhow::anyhow!(
+                    "fallback-filter.domain: '{s}' is not a valid domain pattern \
+                     (strict mode)"
+                ));
+            }
+            warn!("fallback-filter.domain: failed to insert '{s}' into trie");
+        }
     }
 
     // Attempt to load GeoIP MMDB for the geoip gate.
@@ -1012,16 +1042,19 @@ fn build_fallback_filter(
 /// slot — `sub.x` still resolves through `+.x`'s Dot slot.
 ///
 /// Known pre-existing validation divergences from mihomo, kept as-is: a key
-/// with a trailing dot (`x.com.`) or an empty mid-label (`a..b`) is accepted
-/// into a trie slot no query can reach (silently dead, even under `strict:`),
-/// where mihomo's `ValidAndSplitDomain` would reject it; whitespace-padded
-/// keys are trimmed and accepted where mihomo rejects; a mid-path `*`
-/// segment (`sub.*.x`) is stored as a literal label where mihomo treats it
-/// as a wildcard; an alias value trims only trailing dots where mihomo
-/// trims both ends (`.foo.com` differs); and mihomo seeds an implicit
-/// `localhost → 127.0.0.1` and accepts the `lan` magic value
-/// (interface addresses), neither of which exists here — `hosts: {x: lan}`
-/// is a hard error.
+/// with a trailing dot (`x.com.`) is accepted and normalized onto the same
+/// live slot as `x.com` where mihomo's `ValidAndSplitDomain` rejects it;
+/// an empty mid-label (`a..b`) or an all-dots/prefix-only key (`"."`,
+/// `"+."`) is likewise accepted into a slot no query can reach — or no
+/// slot at all — where mihomo rejects it, but both are now surfaced as a
+/// warn in lenient mode and an error under `strict:` rather than sitting
+/// silently dead; whitespace-padded keys are trimmed and accepted where
+/// mihomo rejects; a mid-path `*` segment (`sub.*.x`) is stored as a
+/// literal label where mihomo treats it as a wildcard; an alias value
+/// trims only trailing dots where mihomo trims both ends (`.foo.com`
+/// differs); and mihomo seeds an implicit `localhost → 127.0.0.1` and
+/// accepts the `lan` magic value (interface addresses), neither of which
+/// exists here — `hosts: {x: lan}` is a hard error.
 fn build_hosts_trie(
     hosts: Option<&RawHosts>,
     strict: bool,
@@ -1069,7 +1102,15 @@ fn build_hosts_trie(
         };
         // Keys go in as written: `*.foo` is a single-label wildcard, `+.foo`
         // covers the apex plus any-depth subdomains, a bare key is exact.
-        if !trie.insert_overwrite(host.trim(), host_entry) {
+        let key = host.trim();
+        // An empty label strands a node no query can reach (queries never
+        // carry one); an all-dots/prefix-only body is refused by the insert
+        // below — both surfaced, never silently dead (issue #822 shape).
+        check_domain_key("hosts", key, strict)?;
+        if !trie.insert_overwrite(key, host_entry) {
+            // As at `fallback-filter.domain`: unreachable for a config key
+            // today — `DomainKeyDefect::NotInsertable` covers every refused
+            // shape — kept as the insert's own verdict.
             if strict {
                 return Err(anyhow::anyhow!(
                     "hosts: '{}' is not a valid domain pattern (strict mode)",
@@ -1081,6 +1122,30 @@ fn build_hosts_trie(
     }
     reject_host_alias_cycles(&trie, &aliases)?;
     Ok(trie)
+}
+
+/// Surface a dead domain key on a `DomainTrie`-backed config surface:
+/// lenient mode warns naming the key, `strict:` hard-errors — the same
+/// warn/error split every domain-list consumer applies. The caller keeps
+/// the entry either way (observability only, never a semantics change).
+///
+/// The predicate lives in `meow_rules::domain_key` so the `rules:` parser
+/// and every trie surface share one dead-key definition; `match_engine`'s
+/// `indexable_pattern` is the same concept's third encoding.
+pub(crate) fn check_domain_key(field: &str, key: &str, strict: bool) -> Result<(), anyhow::Error> {
+    let Some(defect) = meow_rules::domain_key_defect(key) else {
+        return Ok(());
+    };
+    let why = match defect {
+        DomainKeyDefect::DeadLabel => "contains an empty label",
+        DomainKeyDefect::NotInsertable => "is not a valid domain pattern",
+    };
+    if strict {
+        Err(anyhow::anyhow!("{field}: '{key}' {why} (strict mode)"))
+    } else {
+        warn!("{field}: '{key}' {why}; it can never match");
+        Ok(())
+    }
 }
 
 fn parse_host_alias(value: &str, host: &str) -> Result<String, anyhow::Error> {
@@ -1217,54 +1282,7 @@ mod tests {
             .collect()
     }
 
-    /// Captures WARN lines while held. `set_default` is thread-local, so the
-    /// guard spans the awaits of a current-thread `#[tokio::test]` and never
-    /// sees a parallel test's lines.
-    struct WarnCapture {
-        sink: WarnSink,
-        _guard: tracing::subscriber::DefaultGuard,
-    }
-
-    #[derive(Clone)]
-    struct WarnSink(Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for WarnSink {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for WarnSink {
-        type Writer = WarnSink;
-        fn make_writer(&'a self) -> WarnSink {
-            self.clone()
-        }
-    }
-
-    impl WarnCapture {
-        fn start() -> Self {
-            let sink = WarnSink(Arc::default());
-            let subscriber = tracing_subscriber::fmt()
-                .with_writer(sink.clone())
-                .with_ansi(false)
-                .with_max_level(tracing::Level::WARN)
-                .finish();
-            Self {
-                sink,
-                _guard: tracing::subscriber::set_default(subscriber),
-            }
-        }
-
-        /// The lines captured since the last call.
-        fn take(&self) -> String {
-            let captured = std::mem::take(&mut *self.sink.0.lock().unwrap());
-            String::from_utf8_lossy(&captured).into_owned()
-        }
-    }
+    use crate::test_support::WarnCapture;
 
     fn addresses(entry: &HostEntry) -> &[IpAddr] {
         match entry {
@@ -1749,6 +1767,30 @@ mod tests {
         assert!(err.to_string().contains("alias cycle"));
     }
 
+    /// The dead-key classification matrix itself lives with the predicate
+    /// in `meow_rules::domain_key`'s tests; this pins that `hosts:` drives
+    /// it through `check_domain_key` — lenient warns and still loads the
+    /// dead entry, strict hard-errors.
+    #[test]
+    fn build_hosts_trie_empty_label_key_warns_lenient_errors_strict() {
+        let mut map = RawHosts::new();
+        map.insert("a..b".to_string(), one("1.2.3.4"));
+        // Lenient: warns, still inserts the (unreachable) node — no query
+        // may ever see it, and `a.b` in particular must not leak to it.
+        let cap = WarnCapture::start();
+        let trie = build_hosts_trie(Some(&map), false).unwrap();
+        let warns = cap.take();
+        assert!(
+            warns.contains("a..b") && warns.contains("empty label"),
+            "the dead key must be surfaced, got: {warns}"
+        );
+        assert!(trie.search("a.b").is_none(), "a..b must not leak to a.b");
+        let err = build_hosts_trie(Some(&map), true)
+            .err()
+            .expect("strict must hard-error on an empty label");
+        assert!(err.to_string().contains("empty label"));
+    }
+
     #[test]
     fn build_hosts_trie_rejects_domain_in_multi_value_list() {
         let mut map = RawHosts::new();
@@ -2105,6 +2147,34 @@ mod tests {
             pol.lookup("anything.cn").is_none(),
             "skipped geosite entry must not match"
         );
+    }
+
+    /// A domain key with an empty label (`a..b`) is an unreachable trie
+    /// node: lenient mode warns and keeps the (dead) arm, strict mode
+    /// hard-errors like it does for unsupported prefixed keys.
+    #[tokio::test]
+    async fn parse_nameserver_policy_empty_label_key_warns_lenient_errors_strict() {
+        use crate::raw::RawNspValue;
+        let map = nsp_map(&[("a..b", RawNspValue::One("rcode://success".to_string()))]);
+        let cap = WarnCapture::start();
+        let pol = build_nameserver_policy(&map, None, &[], &HashMap::new(), &HashMap::new(), false)
+            .await
+            .expect("empty-label key must stay lenient");
+        let warns = cap.take();
+        assert!(
+            warns.contains("a..b") && warns.contains("empty label"),
+            "the dead key must be surfaced, got: {warns}"
+        );
+        assert!(
+            pol.lookup("a.b").is_none(),
+            "the dead node must not leak to a.b"
+        );
+        let result =
+            build_nameserver_policy(&map, None, &[], &HashMap::new(), &HashMap::new(), true).await;
+        let Err(err) = result else {
+            panic!("strict must hard-error on an empty-label key")
+        };
+        assert!(err.to_string().contains("empty label"));
     }
 
     #[tokio::test]
@@ -2723,6 +2793,109 @@ mod tests {
             !ff.domain_gated("a.b.fb.test"),
             "deep subdomain must not match *.fb.test"
         );
+    }
+
+    // An empty-label `fallback-filter.domain` entry inserts a trie node no
+    // query name can ever match — the same dead-node shape as `hosts:`
+    // (issue #822). Lenient surfaces it; strict rejects it.
+    #[test]
+    fn build_fallback_filter_empty_label_domain_warns_lenient_errors_strict() {
+        use crate::raw::RawFallbackFilter;
+        let raw = RawFallbackFilter {
+            geoip: Some(false),
+            geoip_code: None,
+            ipcidr: None,
+            domain: Some(vec!["a..b".to_string(), "fine.example".to_string()]),
+        };
+        let cap = WarnCapture::start();
+        let ff = build_fallback_filter(Some(&raw), None, false).unwrap();
+        let warns = cap.take();
+        assert!(
+            warns.contains("a..b") && warns.contains("empty label"),
+            "the dead entry must be surfaced, got: {warns}"
+        );
+        assert!(
+            ff.domain_gated("fine.example"),
+            "the good entry must still gate"
+        );
+        assert!(!ff.domain_gated("a.b"), "a..b must not leak to a.b");
+        let err = build_fallback_filter(Some(&raw), None, true)
+            .err()
+            .expect("strict must hard-error on an empty label");
+        assert!(err.to_string().contains("empty label"));
+    }
+
+    /// An all-dots/prefix-only `fallback-filter.domain` entry is refused by
+    /// the trie outright (`DomainKeyDefect::NotInsertable`): it takes the
+    /// same lenient-warn / strict-error split as an empty label instead of
+    /// the old warn-only insert failure.
+    #[test]
+    fn build_fallback_filter_all_dots_domain_warns_lenient_errors_strict() {
+        use crate::raw::RawFallbackFilter;
+        for dead in [".", "..", "+.", "*."] {
+            let raw = RawFallbackFilter {
+                geoip: Some(false),
+                geoip_code: None,
+                ipcidr: None,
+                domain: Some(vec![dead.to_string()]),
+            };
+            let cap = WarnCapture::start();
+            build_fallback_filter(Some(&raw), None, false)
+                .unwrap_or_else(|_| panic!("{dead:?} must load in lenient mode"));
+            let warns = cap.take();
+            assert!(
+                warns.contains("not a valid domain pattern"),
+                "{dead:?}: the refused entry must be surfaced, got: {warns}"
+            );
+            let err = build_fallback_filter(Some(&raw), None, true)
+                .err()
+                .expect("strict must hard-error on a refused domain key");
+            assert!(
+                err.to_string().contains("not a valid domain pattern"),
+                "{dead:?}: {err}"
+            );
+        }
+    }
+
+    // Same dead-node observability for `dns.fake-ip-filter`: lenient warns,
+    // strict hard-errors — both through the `parse_dns` fake-IP path.
+    #[tokio::test]
+    async fn install_fakeip_empty_label_pattern_warns_lenient_errors_strict() {
+        let lenient_yaml = "dns:\n  enable: true\n  enhanced-mode: fake-ip\n  nameserver:\n    - 1.1.1.1\n  fake-ip-filter:\n    - a..b\n    - fine.example\n";
+        let raw: RawConfig = serde_saphyr::from_str(lenient_yaml).unwrap();
+        let cap = WarnCapture::start();
+        parse_dns(
+            &raw,
+            None,
+            None,
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+            None,
+        )
+        .await
+        .expect("lenient fake-ip-filter dead label must still load");
+        let warns = cap.take();
+        assert!(
+            warns.contains("a..b") && warns.contains("empty label"),
+            "the dead entry must be surfaced, got: {warns}"
+        );
+
+        let strict_yaml = format!("strict: true\n{lenient_yaml}");
+        let raw: RawConfig = serde_saphyr::from_str(&strict_yaml).unwrap();
+        let err = parse_dns(
+            &raw,
+            None,
+            None,
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+            None,
+        )
+        .await
+        .err()
+        .expect("strict must hard-error on an empty label");
+        assert!(err.to_string().contains("empty label"), "got: {err}");
     }
 
     // --- nameserver-policy `#PROXY` fragments -----------------------------

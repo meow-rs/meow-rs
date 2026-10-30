@@ -109,6 +109,12 @@ pub fn star_wildcard_indexable(payload: &str) -> bool {
 /// True iff `payload` is a plain hostname pattern whose trie insertion
 /// matches exactly the hosts the corresponding DOMAIN / DOMAIN-SUFFIX
 /// predicate matches.
+///
+/// This is the runtime side of the dead-key concept `meow_rules::domain_key`
+/// classifies at config load (`domain_rule_payload_is_dead` warns/errs on the
+/// same shapes): an empty label, a leading wildcard marker, or a trailing
+/// dot can never equal a normalized `rule_host()`, so the shape is kept on
+/// the linear scan instead of owning a trie slot it could never fill.
 fn indexable_pattern(payload: &str) -> bool {
     !payload.is_empty()
         && payload.is_ascii()

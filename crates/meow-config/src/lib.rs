@@ -3285,6 +3285,20 @@ fn parse_sniffer_config(
                 anyhow::bail!("sniffer.enable is true but sniffer.sniff map is absent or empty");
             }
 
+            // skip-domain / force-domain feed `DomainTrie`s in the sniffer
+            // runtime; a dead key — an empty label that can never match a
+            // query name, or an all-dots/prefix-only body the runtime's
+            // insert silently refuses — is the same dead-key shape as
+            // `hosts:` (issue #822). Surface it rather than swallow it.
+            for (field, list) in [
+                ("sniffer.skip-domain", &rs.skip_domain),
+                ("sniffer.force-domain", &rs.force_domain),
+            ] {
+                for s in list.iter().flatten() {
+                    crate::dns_parser::check_domain_key(field, s, strict)?;
+                }
+            }
+
             Ok(SnifferConfig {
                 enable,
                 timeout: std::time::Duration::from_millis(timeout_ms),

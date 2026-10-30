@@ -8,6 +8,67 @@ the canonical, in-repo source a release is cut from.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Plain-HTTP origin-form requests work again.** `GET /path` + a `Host:`
+  header — the request shape every browser sends a plain-HTTP proxy —
+  was refused with 400 by the #734 hostname gate, which only looked at
+  the request target's (empty) authority. The listener now takes the
+  authority from the `Host:` header for `/`-leading request targets and
+  runs it through the same gate: `Host: example.com` routes by rules, an
+  IP literal folds into `dst_ip`, an explicit `:port` is honoured (a `:0`
+  port names no socket and is refused), and a non-hostname or duplicated
+  `Host` value is refused with 400 like any bad authority.
+- **A sniffed name no longer outvotes an explicit destination.** With
+  `sniffer.enable: true` and `override-destination: false`, a request
+  like `GET http://evil.com/` carrying `Host: good.example` landed the
+  sniffed name in `sniff_host`: DOMAIN rules matched `good.example` and
+  let the flow fall to `MATCH`, while the dial still went to `evil.com` —
+  a `DOMAIN,evil.com,REJECT` rule was bypassed. A sniffed name is now
+  adopted only when the destination carries no routing name of its own —
+  an empty host or an IP literal; an explicit domain authority (CONNECT
+  target, absolute-form URI, SOCKS5 domain) always wins. Two opt-ins
+  override the priority: `override-destination: true` rewrites the
+  destination with the sniffed name, keeping rules and dial consistent,
+  and a `force-domain` entry matching the destination adopts the sniffed
+  name into `sniff_host` anyway — the CDN-front contract, routing by the
+  name on the wire while dialing the authority.
+- **All-digit address spellings no longer pass `is_valid_host`.** A name
+  made only of digits and dots (`2130706433`, `0177.0.0.1`, `123.456`)
+  is an `inet_aton` address form a libc dial path would fold into an IP —
+  not a hostname the DOMAIN rules checked. Go's `isDomainName` parity: at
+  least one byte must be non-numeric (`-`/`_` count, so `123-456` still
+  passes). Letter-bearing `inet_aton` spellings (`0x7f000001`,
+  `0x7f.0.0.1`) still pass, as under Go — a known residual on dial paths
+  that never touch the injected resolver: a user-built `type: direct`
+  node with no `dns:` section still folds them through libc.
+- **A trailing-dot destination now hits its DOMAIN rules.** A client
+  naming `evil.com.` — the fully-qualified spelling — used to slip past
+  `DOMAIN,evil.com,REJECT` because rule matching compared the host
+  verbatim. `Metadata::rule_host()` now strips trailing dots on both the
+  `host` and `sniff_host` paths, on the origin-form `Host:`, CONNECT, and
+  absolute-form targets alike; the stored `host` keeps its verbatim form,
+  so dialing and upstream CONNECT lines are unchanged.
+- **Dead domain entries in static config are surfaced.** An empty-label
+  key (`a..b`, `..x`) builds a `DomainTrie` node no query can reach, a
+  `DOMAIN`/`DOMAIN-SUFFIX` rule payload with an empty label, a leading or
+  trailing dot (`.x.com`, `x.com.`), or a `*`/`+` byte (`DOMAIN,*.x.com`
+  compares verbatim and can never equal a host) can never match the
+  normalized rule host it is compared against, a `DOMAIN-WILDCARD`
+  payload with a literal `+` (its matcher globs `*` only, so `+.x.com`
+  is dead there too) or a dead literal label (`*.foo.`, `a..b`) anchors
+  a match no host satisfies, and a `DOMAIN-KEYWORD` needle containing
+  `..` names a substring no host holds — while an all-dots or
+  prefix-only key (`"."`, `"+."`) is refused by the trie outright.
+  `hosts:`, `nameserver-policy`, `fallback-filter.domain`,
+  `fake-ip-filter`, sniffer `skip-domain`/`force-domain`, and `rules:`
+  domain payloads now warn naming the entry in lenient mode and hard
+  error in strict mode; a flagged entry that still loads matches
+  exactly as before — the check changes the load outcome (lenient
+  warning vs strict refusal), not what the entry matches.
+  `DOMAIN-REGEX` stays unchecked: whether an arbitrary pattern can match
+  a normalized host is not decidable by label inspection.
+
 ## [0.28.0] - 2026-10-30
 
 ### Changed

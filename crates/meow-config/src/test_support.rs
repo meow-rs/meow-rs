@@ -86,6 +86,55 @@ pub(crate) async fn eventually(what: &str, mut done: impl FnMut() -> bool) {
     panic!("timed out waiting for: {what}");
 }
 
+/// Captures WARN lines while held. `set_default` is thread-local, so the
+/// guard spans the awaits of a current-thread `#[tokio::test]` and never
+/// sees a parallel test's lines.
+pub(crate) struct WarnCapture {
+    sink: WarnSink,
+    _guard: tracing::subscriber::DefaultGuard,
+}
+
+#[derive(Clone)]
+struct WarnSink(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for WarnSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for WarnSink {
+    type Writer = WarnSink;
+    fn make_writer(&'a self) -> WarnSink {
+        self.clone()
+    }
+}
+
+impl WarnCapture {
+    pub(crate) fn start() -> Self {
+        let sink = WarnSink(Arc::default());
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        Self {
+            sink,
+            _guard: tracing::subscriber::set_default(subscriber),
+        }
+    }
+
+    /// The lines captured since the last call.
+    pub(crate) fn take(&self) -> String {
+        let captured = std::mem::take(&mut *self.sink.0.lock().unwrap());
+        String::from_utf8_lossy(&captured).into_owned()
+    }
+}
+
 /// `tracing` caches per-callsite `Interest` process-globally, and any
 /// `with_default` enter/exit rebuilds that cache. A `warn!` evaluated on
 /// a parallel test thread while no subscriber is active then caches

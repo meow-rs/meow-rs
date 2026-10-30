@@ -52,6 +52,22 @@ Always end the list with a catch-all `MATCH` rule so every connection has a dest
 | `DOMAIN-REGEX` | `DOMAIN-REGEX,^ads?\.,Proxy` | Hostname matches a Rust regex |
 | `DOMAIN-WILDCARD` | `DOMAIN-WILDCARD,*.example.com,Proxy` | Glob where `*` spans one DNS label |
 
+A domain payload that can never match a normalized hostname is logged as a
+warning (and fails the load under `strict: true`): an empty label (`a..b`),
+a leading or trailing dot (`.x.com`, `x.com.`), or a `*`/`+` spelling on
+`DOMAIN`/`DOMAIN-SUFFIX` — `DOMAIN,*.x.com` compares verbatim and can never
+equal a host, so use `DOMAIN-WILDCARD` instead. On `DOMAIN-WILDCARD`, `*`
+is the only glob — a `+` is a literal byte no host carries, so `+.x.com`
+is dead here too; only dead literal labels are otherwise flagged.
+`DOMAIN-KEYWORD` is flagged only on `..` — a substring needle like `foo.`
+can still match `foo.bar`. `DOMAIN-REGEX` is not checked.
+
+One residual to know: hosts are normalized before matching (trailing dots
+are stripped), so a `DOMAIN-KEYWORD,foo.` needle no longer hits the bare
+`foo` — only superstrings like `foo.bar` — and an anchored
+`DOMAIN-REGEX,^foo\.$` pattern can never match. These load without a
+warning; write the needle/pattern against the normalized name.
+
 ## IP rules
 
 All IP rules accept `no-resolve`. `IP-CIDR` and `IP-CIDR6` are interchangeable.

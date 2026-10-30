@@ -554,6 +554,33 @@ the same trie slot (`x` vs `+.x`, `.x` vs `+.x`, or spellings that
 normalize together), the document-last writer wins — mihomo's `setData`
 parity — and the document order round-trips through config saves.
 
+Dead keys are surfaced, not rejected outright: a key whose body still holds
+an empty label (`a..b`, `..x`, `+..x`) builds a trie node no query can
+reach, and an all-dots or prefix-only body (`"."`, `"+."`) is refused by
+the insert — meow warns naming the key in lenient mode and fails the load
+under `strict: true`, where mihomo's `ValidAndSplitDomain` rejects both
+classes outright. Trailing-dot spellings (`x.com.`, `x.com..`) stay legal:
+they normalize onto the same slot as `x.com`. The check covers config
+`hosts:` keys only — the system hosts file merged in by `use-system-hosts`
+is out of scope: it is parsed leniently line-by-line and its entries never
+pass through the dead-key validation. Before turning on `strict: true`,
+run `meow -t` once in lenient mode — the warnings name every dead key the
+strict load would refuse, so you can fix the list first.
+
+The same dead-key concept reaches the `rules:` list per rule type, judged
+against the normalized host rules compare with: `DOMAIN`/`DOMAIN-SUFFIX`
+flag an empty label, a leading or trailing dot, or a verbatim-dead `*`/`+`
+spelling (`DOMAIN,*.x.com` can never equal a host — `*` belongs on
+`DOMAIN-WILDCARD`, and `DOMAIN-SUFFIX,x.com` already covers apex plus
+subdomains, so `+.` adds nothing);
+`DOMAIN-WILDCARD` flags a literal `+` — its matcher globs `*` only, so
+`+.x.com` is dead there too — plus dead literal labels; `DOMAIN-KEYWORD`
+flags `..` only (a `foo.` needle still matches `foo.bar` as a substring,
+though it no longer hits the bare `foo` under trailing-dot
+normalization — the same residual applies to an anchored
+`DOMAIN-REGEX` like `^foo\.$`, which is otherwise not checked: an
+arbitrary pattern's reachability is not decidable by label inspection).
+
 ---
 
 ## Inbound authentication

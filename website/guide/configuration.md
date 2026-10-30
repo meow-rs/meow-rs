@@ -85,6 +85,11 @@ hosts:
   "+.internal.corp": 10.0.0.254
 ```
 
+Keys a domain query can never match — an empty label (`a..b`, `..x`) or an
+all-dots/prefix-only body (`"."`, `"+."`) — are logged as warnings and become
+errors under `strict: true`. Trailing-dot spellings (`x.com.`) are legal and
+land on the same entry as `x.com`.
+
 ## Subscriptions
 
 `subscriptions` declares named remote Clash-format configs to pull on a

@@ -139,8 +139,11 @@ impl DirectAdapter {
                 };
             }
 
-            // Legacy fallback: let tokio use getaddrinfo. Only reachable when
-            // no resolver was injected — production code paths always inject.
+            // Legacy fallback: let tokio use getaddrinfo. Reachable whenever
+            // no resolver was injected — the built-in DIRECT always injects,
+            // but a `type: direct` user node without `dns:` does not, so this
+            // path is live in production and libc folds inet_aton spellings
+            // (`0x7f000001`) into IPs here.
             let addrs: Vec<SocketAddr> =
                 tokio::net::lookup_host((&*metadata.host, metadata.dst_port))
                     .await

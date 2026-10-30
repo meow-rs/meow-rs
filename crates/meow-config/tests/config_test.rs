@@ -465,6 +465,43 @@ proxy-groups:
     );
 }
 
+/// `strict: true` must not false-positive on legal `hosts:` keys: a
+/// trailing-dot spelling (`x.com.`, `x.com..`, `+.z.com.`) normalizes
+/// onto the same live trie slot as `x.com` — only genuinely dead keys
+/// (empty labels, refused bodies) are flagged.
+#[tokio::test]
+async fn test_strict_hosts_accepts_trailing_dot_keys() {
+    let yaml = r#"
+strict: true
+hosts:
+  "x.com.": "1.2.3.4"
+  "y.com..": "1.2.3.5"
+  "+.z.com.": "1.2.3.6"
+"#;
+    load_config_from_str(yaml)
+        .await
+        .expect("trailing-dot hosts keys are live keys — strict must not flag them");
+}
+
+/// The same strict run must still catch a key that is actually dead: an
+/// empty-label `hosts:` key builds a trie node no query can reach.
+#[tokio::test]
+async fn test_strict_hosts_rejects_empty_label_key() {
+    let yaml = r#"
+strict: true
+hosts:
+  "a..b": "1.2.3.4"
+"#;
+    let err = load_config_from_str(yaml)
+        .await
+        .err()
+        .expect("strict mode must reject a dead hosts key");
+    assert!(
+        err.to_string().contains("empty label"),
+        "unexpected error: {err}"
+    );
+}
+
 /// The check is unconditional — `strict: true` rejects the same cycle
 /// (the registry split it prevents is structural, not a parse defect).
 #[tokio::test]

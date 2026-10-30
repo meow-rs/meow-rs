@@ -252,6 +252,16 @@ fn test_metadata_rule_host_cases() {
             "",
             "original.com",
         ),
+        // A fully-qualified spelling normalizes for rules on both paths —
+        // the stored fields stay verbatim (`evil.com.` still dials).
+        ("trailing-dot host normalizes", "evil.com.", "", "evil.com"),
+        (
+            "trailing-dot sniff normalizes",
+            "evil.com.",
+            "sniffed.com.",
+            "sniffed.com",
+        ),
+        ("dot-only names collapse to empty", "..", "", ""),
     ];
     for (label, host, sniff_host, expected) in cases {
         let m = Metadata {
