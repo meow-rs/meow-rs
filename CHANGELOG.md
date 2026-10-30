@@ -8,6 +8,8 @@ the canonical, in-repo source a release is cut from.
 
 ## [Unreleased]
 
+## [0.28.0] - 2026-10-30
+
 ### Changed
 
 - **`v2ray-plugin`'s `mux` now defaults to on**, as in the upstream
