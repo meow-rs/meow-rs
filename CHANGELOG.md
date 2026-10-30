@@ -41,6 +41,60 @@ the canonical, in-repo source a release is cut from.
   previously could reach the external-plugin path. `gost-plugin`
   implies the `mux` Cargo feature, so its `mux: true` default always
   works.
+- **DIRECT relays splice on Linux and Android**: when both ends of a
+  relay direction are plain TCP sockets (a SOCKS5, HTTP CONNECT, mixed
+  or TProxy client going DIRECT), the bytes now move socket to pipe to
+  socket inside the kernel with `splice(2)` instead of through the relay
+  buffer. The pipe replaces the 32 KiB buffer once a flow passes
+  128 KiB, so short flows and relay setup are unchanged; a direction
+  keeps the buffer copy when the pipe cannot be created or comes out
+  smaller than the buffer, or when `SIGPIPE` is not ignored in the
+  embedding process. Every proxy protocol and the TUN netstack keep the
+  copy. In a LAN lab, CPU per GB fell from 1.04 s to 0.30 s on download
+  and from 1.56 s to 0.70 s on upload. For embedders,
+  `meow_tunnel::route_inbound_tcp` now requires a `'static` inbound
+  stream type, and `ProxyConn` gained `tcp_stream()` (default `None`).
+- **hysteria2 downloads run up to four times faster**: the QUIC driver
+  drains up to 32 queued datagrams per wakeup and acknowledges them with
+  one flush, where it used to take one datagram, flush and send an ACK
+  for every packet. Its socket asks for a 7 MiB receive buffer, the size
+  quic-go uses (forced with `SO_RCVBUFFORCE` when meow runs privileged
+  on Linux, halved until accepted on macOS); the OS default of about
+  208 KiB overflowed on long paths, about 30,000 dropped datagrams per
+  300 MB at 170 ms. Against the official hysteria v2.13.0 server, an
+  unshaped lab link went from 223 to 986 Mbps and a 170 ms / 300 Mbit
+  path from 141 to 279 Mbps (mihomo: 1488 and 286 Mbps), at 9 s instead
+  of 43 s of CPU per GB.
+- **VLESS REALITY records run on BoringSSL**: REALITY's TLS 1.3 record
+  layer sealed and opened records with RustCrypto's `aes-gcm` and
+  `chacha20poly1305`, which no build ran with the ARMv8 AES instructions,
+  and handed plaintext to the reader a byte at a time. Records are now
+  opened in place with BoringSSL and a write seals up to four records in
+  one frame. This covers REALITY without `flow`, and Vision connections
+  that keep REALITY's records (a non-TLS inner stream, or a server that
+  never switches to direct copy). Against Xray 26.3.27, a REALITY
+  download went from 388 to 3271 Mbps and an upload from 783 to
+  2755 Mbps. The `reality` feature no longer pulls in
+  `chacha20poly1305`. No wire change.
+- **shadow-tls v3 halves its CPU per GB**: the per-record HMAC-SHA1 runs
+  on BoringSSL's SHA-1 instead of RustCrypto's (189 to 705 MB/s at the
+  release profile's `opt-level = "z"`), and shadow-tls, restls and jls
+  queue record bytes with a memcpy instead of a per-byte loop. Upload
+  through a shadow-tls v3 server went from 828 Mbps at 9.85 s/GB to
+  1683 Mbps at 4.23 s/GB. The `shadow-tls` feature no longer pulls in
+  the `sha1` crate.
+- **Dependencies' trace-level `log` records are no longer built**: the
+  `log` facade's maximum level used to stay at TRACE whatever level meow
+  ran at, so every `log::trace!` in a dependency (quiche writes one per
+  QUIC packet) was formatted and then discarded. It is now DEBUG, or
+  TRACE when the console filter enables TRACE (`RUST_LOG=trace`,
+  `RUST_LOG=info,quiche=trace`), and follows log-level reloads.
+- **The match log names the target of a rule without a payload**:
+  `MATCH,DIRECT` now logs `match MATCH(DIRECT) using DIRECT` instead of
+  `match MATCH() using DIRECT`, and a flow no rule matched logs
+  `Final(DIRECT)`. Rules with a payload log as before, and
+  `/connections` still reports `rule: "MATCH"` with an empty
+  `rulePayload`.
 
 ### Fixed
 
@@ -59,6 +113,42 @@ the canonical, in-repo source a release is cut from.
   sent however little the transport took, which v2ray-plugin's 8 KiB
   Mux.Cool frames could hit. meow now caps the payload coalesced with the
   header at 8 KiB and, with `none`, sends the header on its own.
+- **A `hosts:` key with a trailing dot takes effect**: a fully qualified
+  key such as `example.com.` landed in a trie slot no query could reach,
+  with no warning, since lookups trim the dot and inserts kept it.
+  Inserts now strip trailing dots too, for exact, `*.` and `+.` keys; a
+  key that is only dots is rejected.
+- **HTTP/2 clients refuse server push**: the gRPC, h2, xhttp and
+  sing-h2mux transports and TrustTunnel's HTTP/2 client left
+  `SETTINGS_ENABLE_PUSH` at its default of 1 but never read pushed
+  streams, so a peer could park them on the shared connection window.
+  Every client now sends `ENABLE_PUSH = 0`.
+- **OpenWrt: LAN DNS reaches dnsmasq with DNS hijacking off**: in tproxy
+  mode with `dns_hijack='0'`, a LAN client's UDP query to the router
+  entered meow's UDP TPROXY listener, whose reply could not bind the
+  address dnsmasq holds (`Address in use (os error 98)`), so it was
+  dropped. UDP/53 now always skips TPROXY: with hijacking on, the dstnat
+  redirect still answers it; with hijacking off, it follows normal
+  routing, so UDP DNS to public resolvers is no longer proxied either.
+  TCP DNS is unchanged.
+
+### Security
+
+- **Destination hosts that are not hostnames are refused**: listeners
+  copied client-supplied destination bytes into the connection's host
+  unchecked, so a host such as `a@evil.com` missed
+  `DOMAIN,evil.com,REJECT` while the upstream proxy, reading the HTTP
+  `CONNECT` line or the h2 `:authority`, connected to `evil.com`. A host
+  must now be an IP literal or a DNS hostname (ASCII letters, digits,
+  `-` and `_`, labels of 1-63 bytes, at most 253 bytes, one optional
+  trailing dot). HTTP CONNECT and absolute-form requests answer 400,
+  SOCKS5 CONNECT replies `0x01`, SOCKS5 and Shadowsocks UDP drop the
+  datagram, the Shadowsocks inbound closes the connection, and the TLS
+  SNI and HTTP Host sniffers and DNS snooping ignore such a name. The
+  tunnel also drops a flow whose fake IP maps back to such a name, and
+  the HTTP and TrustTunnel outbounds refuse to send one. A raw non-ASCII
+  name, such as UTF-8 `bücher.de` over SOCKS5, is refused rather than
+  converted to punycode.
 
 ## [0.27.0] - 2026-10-28
 
