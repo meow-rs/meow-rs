@@ -89,6 +89,15 @@ const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const RECV_BATCH: usize = 32;
 /// Commands handled per wakeup, for the same reason on the upload side.
 const CMD_BATCH: usize = 64;
+/// An ACK-only flush is held back until this many datagrams have arrived since
+/// the last flush...
+const ACK_COALESCE_PKTS: u32 = 8;
+/// ...or the first of them is this old, whichever comes first. Far below the
+/// 25 ms default `max_ack_delay`, so loss recovery is unaffected.
+const ACK_COALESCE_DELAY: Duration = Duration::from_micros(200);
+/// An ACK may ride on upstream data, so nothing is held back while the
+/// application wrote within this window (request/response, uploads).
+const ACK_COALESCE_APP_QUIET: Duration = Duration::from_millis(1);
 /// Largest payload chunk handed to a stream's reader in one channel item;
 /// with [`STREAM_READ_CHANNEL_CAP`] it bounds what a slow reader holds.
 const READ_CHUNK_BYTES: usize = 16 * 1024;
@@ -287,6 +296,13 @@ async fn run(
     let timer = tokio::time::sleep(Duration::ZERO);
     tokio::pin!(timer);
     let mut armed = None;
+    // ACK coalescing: datagrams received (and when the first arrived) since
+    // the last flush, and its own deadline timer.
+    let mut ack_pending: u32 = 0;
+    let mut ack_since: Option<tokio::time::Instant> = None;
+    let ack_timer = tokio::time::sleep(Duration::ZERO);
+    tokio::pin!(ack_timer);
+    let mut last_app_cmd = tokio::time::Instant::now() - ACK_COALESCE_APP_QUIET;
 
     if let Err(e) = flush_send(&mut st, &mut conn, &mut send_buf).await {
         // `Io` carries the socket errno through `hy2_error` →
@@ -306,14 +322,21 @@ async fn run(
             }
             armed = deadline;
         }
+        let mut received = 0u32;
+        let mut woke_on_cmd = false;
+        let mut woke_on_notify = false;
         tokio::select! {
             r = st.socket.readable() => {
-                if let Err(e) = r.and_then(|()| recv_batch(&mut st, &mut conn, &mut buf)) {
-                    fail(&mut ready_tx, &mut st, Error::Io(e));
-                    break;
+                match r.and_then(|()| recv_batch(&mut st, &mut conn, &mut buf)) {
+                    Ok(n) => received = n,
+                    Err(e) => {
+                        fail(&mut ready_tx, &mut st, Error::Io(e));
+                        break;
+                    }
                 }
             }
             maybe = st.cmd_rx.recv() => {
+                woke_on_cmd = true;
                 match maybe {
                     Some(cmd) => {
                         handle_cmd(&mut st, &mut conn, cmd);
@@ -329,7 +352,8 @@ async fn run(
                 armed = None;
                 conn.on_timeout();
             }
-            _ = st.read_notify.notified() => {}
+            () = &mut ack_timer, if ack_since.is_some() => {}
+            _ = st.read_notify.notified() => { woke_on_notify = true; }
             _ = keep_alive.tick(), if auth_done => {
                 let _ = conn.send_ack_eliciting();
             }
@@ -372,6 +396,32 @@ async fn run(
         }
         pump_writes(&mut st, &mut conn);
         cleanup_streams(&mut st, &mut conn);
+
+        // Only a receive or read-notify wakeup may skip the flush; commands,
+        // quiche's timer, keep-alive and the coalescing deadline always send.
+        let now = tokio::time::Instant::now();
+        if woke_on_cmd {
+            last_app_cmd = now;
+        }
+        if auth_done && now.duration_since(last_app_cmd) >= ACK_COALESCE_APP_QUIET {
+            if received > 0 {
+                ack_pending += received;
+                if ack_since.is_none() {
+                    ack_since = Some(now);
+                    ack_timer.as_mut().reset(now + ACK_COALESCE_DELAY);
+                }
+            }
+            if let Some(since) = ack_since {
+                if (received > 0 || woke_on_notify)
+                    && ack_pending < ACK_COALESCE_PKTS
+                    && now.duration_since(since) < ACK_COALESCE_DELAY
+                {
+                    continue;
+                }
+            }
+        }
+        ack_pending = 0;
+        ack_since = None;
 
         if let Err(e) = flush_send(&mut st, &mut conn, &mut send_buf).await {
             tracing::debug!("hysteria2 quiche send failed: {e}");
@@ -765,18 +815,21 @@ async fn flush_send(
 }
 
 /// Feed the datagrams queued on the socket to quiche, at most
-/// [`RECV_BATCH`] of them, undoing obfs and port-hopping.
+/// [`RECV_BATCH`] of them, undoing obfs and port-hopping. Returns how many
+/// datagrams were read.
 fn recv_batch(
     st: &mut State,
     conn: &mut quiche::Connection,
     buf: &mut [u8],
-) -> std::io::Result<()> {
+) -> std::io::Result<u32> {
+    let mut received = 0;
     for _ in 0..RECV_BATCH {
         let (n, from) = match st.socket.try_recv_from(buf) {
             Ok(v) => v,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(received),
             Err(e) => return Err(e),
         };
+        received += 1;
         let from = st.hop.as_ref().map_or(from, |h| h.normalize_source(from));
         let info = quiche::RecvInfo { from, to: st.local };
         let received = match st.obfs.as_mut() {
@@ -790,7 +843,7 @@ fn recv_batch(
             tracing::debug!("hysteria2 could not receive QUIC packet: {e}");
         }
     }
-    Ok(())
+    Ok(received)
 }
 
 fn fail(ready_tx: &mut Option<oneshot::Sender<Result<bool>>>, _st: &mut State, err: Error) {
