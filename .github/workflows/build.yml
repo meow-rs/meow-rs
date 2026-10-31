@@ -54,13 +54,26 @@ jobs:
         include:
           # Every release target builds with the meow-app default feature set
           # (`full`; TLS is BoringSSL). Targets that cannot link boring-sys
-          # (MIPS, 32-bit musl, windows-gnu) are not shipped and — since the
-          # rustls backend was removed — cannot be built with TLS at all.
+          # (MIPS, windows-gnu) are not shipped and — since the rustls backend
+          # was removed — cannot be built with TLS at all.
           # `desktop: true` targets also ship meow-cli and its agent skill
           # (skills/meow-cli/) beside meow; armv7 and riscv64, router and
           # board targets, ship meow alone. x86_64 and aarch64 musl count as
           # desktop: Linux GUIs that ship meow as their core take the static
           # musl build.
+          #
+          # 32-bit musl used to be on that list too. The blocker is not the
+          # 32-bit width itself: musl 1.2.x headers declare time_t as 64-bit
+          # on 32-bit targets (time64/Y2038) while Rust's libc crate types it
+          # as i32, so bindgen emits a 64-bit X509_VERIFY_PARAM_set_time and
+          # `boring` fails to compile. cargo-zigbuild hits the same headers
+          # and also needs their internals patched to get past it, and
+          # zig-linked static armv7 binaries were unreliable under QEMU in
+          # our testing — so this target builds in a real musl cross
+          # toolchain container (scripts/build-armv7-musl.sh) instead. The
+          # container hits the same time64-vs-libc disagreement; the script
+          # bridges it with a one-line cast in `boring`. Such targets carry
+          # `toolchain:` and skip the zig steps below.
           # Linux musl
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-latest
@@ -95,6 +108,36 @@ jobs:
             runner: ubuntu-latest
             minimal_budget_bytes: 0
             minimal_soft_gate: true
+          # Static musl for 32-bit ARM routers (MikroTik hEX/ARM, older
+          # OpenWrt devices). The gnu build above is dynamically linked and
+          # needs GLIBC_2.28, which Alpine's armhf gcompat does not provide,
+          # so `execve` fails with ENOENT on a file that exists; this one has
+          # neither dependency. No OpenWrt arch labels yet — the maintainers
+          # pick the CPU baselines (arm_cortex-a7_neon-vfp4 and friends), see
+          # ADR-0007 for the armv7-musl status.
+          - target: armv7-unknown-linux-musleabihf
+            runner: ubuntu-latest
+            minimal_budget_bytes: 0
+            minimal_soft_gate: true
+            openwrt_archs: ''
+            # Suffix is the RUNNER's architecture, not the target's
+            # (ubuntu-latest is x86_64 today). ghcr mirror, not Docker Hub:
+            # anonymous Hub pulls are rate-limited and this image is the
+            # entire compile chain for this leg.
+            # tag@sha256 pins that compile chain: a retagged or hijacked
+            # image would otherwise silently change the released binary.
+            # Nothing auto-bumps this (no renovate/dependabot here) — to
+            # update, resolve the tag's digest with
+            # `docker buildx imagetools inspect <tag>` and re-run the leg
+            # on a branch first.
+            toolchain: ghcr.io/rust-cross/rust-musl-cross:armv7-musleabihf-amd64@sha256:c2603200841eac1a6681d7beef44816c9954b0f59952ae7ae96652788287e16f
+            # Every `toolchain:` leg names its in-container build script
+            # here — the container step fails fast on a leg that forgets,
+            # instead of building the wrong target for 15 min.
+            toolchain_script: scripts/build-armv7-musl.sh
+            # qemu-user binary used to smoke-run the produced binary on the
+            # runner (see the QEMU step below); empty = no smoke.
+            qemu: qemu-arm-static
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             desktop: true
@@ -135,6 +178,11 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Setup Rust toolchain
+        # Toolchain legs build inside their container (which installs its own
+        # pinned toolchain); a host-side rustup install would be dead time.
+        # rust-cache stays on every leg: the container writes target/ on the
+        # host mount, so it caches the expensive part for toolchain legs too.
+        if: matrix.toolchain == ''
         shell: bash
         run: |
           # rust-toolchain.toml overrides `rustup default` inside the
@@ -160,7 +208,7 @@ jobs:
           key: release-${{ matrix.target }}-zigbuild-0.23.2
 
       - name: Install cargo-zigbuild and zig
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && matrix.toolchain == ''
         uses: mlugg/setup-zig@v1
         with:
           version: 0.13.0
@@ -172,9 +220,36 @@ jobs:
       # intermittently fails boring-sys's CMake compiler check on armv7.
       # Lift the pin once upstream builds the shim race-free.
       - run: cargo install --locked cargo-zigbuild --version 0.23.2
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && matrix.toolchain == ''
+
+      # Targets with a `toolchain:` image build inside it, with the checkout
+      # bind-mounted at /src. The script writes target/<triple>/release/meow
+      # on the host, so the packaging steps below are unchanged — and so
+      # rust-cache above keeps caching the expensive part across runs. Only
+      # the crate registry is re-fetched inside the container each run
+      # (~500 crates, 1-3 min). The script comes from `toolchain_script:`,
+      # not a hardcoded name, so a leg that sets `toolchain:` but forgets
+      # it fails at step start instead of mid-build.
+      - name: Build release binary in toolchain container
+        if: matrix.toolchain != ''
+        shell: bash
+        env:
+          TOOLCHAIN_IMAGE: ${{ matrix.toolchain }}
+          BUILD_SCRIPT: ${{ matrix.toolchain_script }}
+        run: |
+          set -euo pipefail
+          if [ -z "$BUILD_SCRIPT" ]; then
+            echo "::error::matrix leg ${{ matrix.target }} sets toolchain: but no toolchain_script:"
+            exit 1
+          fi
+          # -e forwards the job env: without it MEOW_VERSION_SUFFIX is empty
+          # inside the container and alpha builds would report a bare
+          # version (CI stays green, nobody notices).
+          docker run --rm -e MEOW_VERSION_SUFFIX -v "$PWD:/src" -w /src \
+            "$TOOLCHAIN_IMAGE" bash "$BUILD_SCRIPT"
 
       - name: Build release binary
+        if: matrix.toolchain == ''
         shell: bash
         run: |
           # Default features = full (meow-app/Cargo.toml); TLS is BoringSSL.
@@ -197,8 +272,33 @@ jobs:
             cargo build --release --locked --target ${{ matrix.target }} -p meow-cli
           fi
 
+      # Runs the produced binary — the `file` assert proves linkage, not
+      # that it executes. Legs opt in via `qemu:` (the qemu-user binary
+      # name from qemu-user-static): -v exercises exec + init, -t exercises
+      # the offline config path (main.rs sets offline_validate; no
+      # network). QEMU user-mode is a proxy for real hardware, not proof —
+      # if it ever false-fails a good binary, demote this step with
+      # `continue-on-error: true` rather than deleting the coverage.
+      # `qemu:` on a leg promises its artifact already exists here — a
+      # toolchain leg's container step above produced it, a host-built
+      # leg's `Build release binary` just did — so this step sits after
+      # both producers.
+      - name: Smoke-test built binary under QEMU
+        if: matrix.qemu != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-user-static
+          bin="target/${{ matrix.target }}/release/meow"
+          "${{ matrix.qemu }}" "$bin" -v
+          "${{ matrix.qemu }}" "$bin" -t -d "$(mktemp -d)" -f "$PWD/config.example.yaml"
+
       - name: Build minimal release binary (stripped, for size check)
-        if: matrix.minimal_budget_bytes != 0 && runner.os == 'Linux'
+        # Unreachable on toolchain legs today (budget 0), but the first leg
+        # that ever gets a non-zero budget must not fall back to host
+        # zigbuild, which cannot build the target.
+        if: matrix.minimal_budget_bytes != 0 && runner.os == 'Linux' && matrix.toolchain == ''
         env:
           # Keep the size-check build separate from the full release artifact.
           # Cargo otherwise reuses target/<triple>/release/meow and the

@@ -60,6 +60,35 @@ secret beyond `CARGO_REGISTRY_TOKEN` is involved.
    - opens `## [X.Y.Z] - YYYY-MM-DD` directly under `## [Unreleased]`, which
      stays as an empty heading.
 
+   That `cargo update -w` can move `boring`, `boring-sys` or `tokio-boring`
+   (they move together — see the note in `Cargo.toml`). If it does, check the
+   `armv7-unknown-linux-musleabihf` leg's patch target before tagging: that leg
+   sed-patches `boring`'s vendored `src/x509/verify.rs`
+   ([`scripts/build-armv7-musl.sh`](../scripts/build-armv7-musl.sh)) and fails
+   the leg — blocking the whole release — when the patched line is gone. The
+   sources are unpacked by then (`cargo check` below does it), so:
+
+   ```bash
+   ver=$(awk '/^\[\[package\]\]/{pkg=""} /^name = "boring"$/{pkg="boring"} pkg=="boring" && /^version = /{gsub(/"/,"",$3); print $3; exit}' Cargo.lock)
+   grep -l 'X509_VERIFY_PARAM_set_time(self\.as_ptr(), time)' \
+     "${CARGO_HOME:-$HOME/.cargo}"/registry/src/*/boring-"$ver"/src/x509/verify.rs 2>/dev/null
+   ```
+
+   Expected: prints the vendored `verify.rs` path. Empty output means the leg
+   will fail on the release run — update the script or revert the bump first.
+   The build script now checks the locked version itself and stops with that
+   message before the compile, so a moved call is reported as a patch problem
+   rather than as a type mismatch inside `boring`.
+   For the definitive check, run the leg itself, with the same digest-pinned
+   image `build.yml` uses:
+
+   ```bash
+   cargo check --workspace
+   docker run --rm -v "$PWD:/src" -w /src \
+     ghcr.io/rust-cross/rust-musl-cross:armv7-musleabihf-amd64@sha256:c2603200841eac1a6681d7beef44816c9954b0f59952ae7ae96652788287e16f \
+     bash scripts/build-armv7-musl.sh
+   ```
+
    The workflow commits that as `chore(release): X.Y.Z` and pushes branch
    `release/vX.Y.Z`. The same script works locally
    (`scripts/release/prepare.sh [X.Y.Z]` in a clean checkout with tags).
