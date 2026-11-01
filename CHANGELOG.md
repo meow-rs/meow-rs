@@ -8,6 +8,22 @@ the canonical, in-repo source a release is cut from.
 
 ## [Unreleased]
 
+### Added
+
+- **`dns.direct-nameserver`**: `DIRECT` outbounds now resolve their
+  destination through `direct-nameserver` when it is set, as mihomo does,
+  instead of always using the main `nameserver` list. With
+  `direct-nameserver-follow-policy: true` the `nameserver-policy` applies
+  to those lookups too. A named destination is resolved through it even
+  when rule matching already resolved it through the main nameservers.
+  This covers UDP (QUIC included): a DIRECT UDP flow sends to the
+  direct-resolved address, and one the main nameservers cannot resolve
+  falls back to `direct-nameserver` instead of being dropped; a UDP flow
+  whose name was only snooped back from its address (redir-host) keeps
+  that address, as in mihomo. User-declared
+  `type: direct` proxies follow it too unless they set their own `dns:`.
+  Configs without `direct-nameserver` behave as before.
+
 ### Fixed
 
 - **Plain-HTTP origin-form requests work again.** `GET /path` + a `Host:`

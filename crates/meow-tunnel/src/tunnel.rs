@@ -379,6 +379,11 @@ impl TunnelInner {
             if let Some(host) = resolver.reverse_lookup(ip).filter(|h| is_valid_host(h)) {
                 conn_note!(Dns, "{ip} was resolved earlier for {host}; using that name");
                 metadata.host = host;
+                // mihomo `DNSMapping`: the name is only a label for the
+                // client-chosen address, so a DIRECT UDP dial keeps
+                // `dst_ip` rather than re-resolving it via
+                // `dns.direct-nameserver` (upstream `Metadata.Pure()`).
+                metadata.dns_mode = meow_common::DnsMode::Mapping;
                 snooped = true;
             }
         }
@@ -455,6 +460,44 @@ impl TunnelInner {
         if let Some(real_ip) = self.resolver().resolve_ip_real(&metadata.host).await {
             debug!("pre_resolve: {} -> {}", metadata.host, real_ip);
             metadata.dst_ip = Some(real_ip);
+        }
+    }
+
+    /// Fill the real `dst_ip` UDP needs for its NAT key and outbound packet
+    /// API, after [`Self::pre_resolve`] (which only runs when rules demand
+    /// an IP).
+    ///
+    /// The main nameservers answer first. When they cannot and
+    /// `dns.direct-nameserver` is configured, a flow whose route ends at a
+    /// DIRECT/COMPATIBLE hop resolves through the direct resolver instead:
+    /// its dial never consults the main nameservers (mihomo's direct
+    /// `ListenPacketContext` resolves via `DirectHostResolver`), so a
+    /// main-side failure must not drop it. Other routes never reach the
+    /// direct resolver, which keeps proxied names off that upstream.
+    pub async fn resolve_udp_dst(&self, metadata: &mut Metadata) {
+        if metadata.dst_ip.is_some() || metadata.host.is_empty() {
+            return;
+        }
+        let resolver = self.resolver();
+        metadata.dst_ip = resolver.resolve_ip_real(&metadata.host).await;
+        if metadata.dst_ip.is_some() {
+            return;
+        }
+        let Some(direct) = resolver.direct_resolver().map(Arc::clone) else {
+            return;
+        };
+        let Some(target) = self.resolve_proxy(metadata).await else {
+            return;
+        };
+        if !routes_direct(target.adapter.as_ref(), metadata) {
+            return;
+        }
+        metadata.dst_ip = direct.resolve_ip_real(&metadata.host).await;
+        if let Some(ip) = metadata.dst_ip {
+            debug!(
+                "resolve_udp_dst: {} -> {} via direct-nameserver",
+                metadata.host, ip
+            );
         }
     }
 
@@ -816,6 +859,29 @@ pub enum PreHandleVerdict {
 struct RouteTargetProbe<'a> {
     route: &'a RouteTable,
     metadata: &'a Metadata,
+}
+
+/// `true` when `adapter` dials through a DIRECT/COMPATIBLE hop for
+/// `metadata` — the adapter itself or the member its group chain selects.
+/// Peeks with `unwrap_proxy(metadata, false)`, like
+/// [`RouteTargetProbe::unwraps_to`], so no round-robin counter advances.
+fn routes_direct(adapter: &dyn ProxyAdapter, metadata: &Metadata) -> bool {
+    const MAX_UNWRAP_HOPS: usize = 16;
+    let is_direct = |t: AdapterType| matches!(t, AdapterType::Direct | AdapterType::Compatible);
+    if is_direct(adapter.adapter_type()) {
+        return true;
+    }
+    let mut next = adapter.unwrap_proxy(metadata, false);
+    for _ in 0..MAX_UNWRAP_HOPS {
+        let Some(hop) = next else {
+            return false;
+        };
+        if is_direct(hop.adapter_type()) {
+            return true;
+        }
+        next = hop.unwrap_proxy(metadata, false);
+    }
+    false
 }
 
 impl RouteTargetProbe<'_> {
@@ -2031,6 +2097,62 @@ mod tests {
         );
     }
 
+    /// UDP needs a concrete address before routing. When the main
+    /// nameservers cannot answer, a DIRECT-routed flow falls back to
+    /// `dns.direct-nameserver`; any other route never reaches it.
+    #[tokio::test]
+    async fn resolve_udp_dst_falls_back_to_direct_resolver_for_direct_routes() {
+        use meow_dns::HostEntry;
+        use meow_rules::{domain_suffix::DomainSuffixRule, final_rule::FinalRule};
+        use std::net::IpAddr;
+
+        let direct_ip = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 2));
+        let mut hosts: DomainTrie<HostEntry> = DomainTrie::new();
+        hosts.insert("direct.test", vec![direct_ip].into());
+        hosts.insert("proxied.test", vec![direct_ip].into());
+        let direct = Resolver::new(vec![], vec![], DnsMode::Normal, hosts, true, true);
+        // No upstreams and no hosts: every main lookup fails.
+        let mut main = Resolver::new(
+            vec![],
+            vec![],
+            DnsMode::Normal,
+            DomainTrie::new(),
+            false,
+            true,
+        );
+        main.set_direct_resolver(Arc::new(direct));
+        let tunnel = Tunnel::new(Arc::new(main));
+
+        let proxies = meow_config::rebuild_from_raw(&Default::default())
+            .unwrap()
+            .proxies;
+        tunnel.update_routing(
+            proxies,
+            vec![
+                Box::new(DomainSuffixRule::new("direct.test", "DIRECT")),
+                Box::new(FinalRule::new("REJECT")),
+            ],
+            Default::default(),
+        );
+
+        let udp = |host: &str| Metadata {
+            network: Network::Udp,
+            host: host.into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+        let mut routed_direct = udp("direct.test");
+        tunnel.inner().resolve_udp_dst(&mut routed_direct).await;
+        assert_eq!(routed_direct.dst_ip, Some(direct_ip));
+
+        let mut proxied = udp("proxied.test");
+        tunnel.inner().resolve_udp_dst(&mut proxied).await;
+        assert_eq!(
+            proxied.dst_ip, None,
+            "non-DIRECT routes stay off direct-nameserver"
+        );
+    }
+
     /// Front-hop mock for the provider-dialer e2e: records every
     /// `dial_tcp`'s metadata and refuses the connection — observing the
     /// dial proves the provider node's `dialer-proxy` chain resolved.
@@ -2626,7 +2748,13 @@ mod tests {
             );
             assert_eq!(snooped.host, "snooped.example.com", "{sniffed}");
             assert_eq!(snooped.dst_ip, Some([198, 18, 1, 220].into()), "{sniffed}");
+            assert_eq!(
+                snooped.dns_mode,
+                DnsMode::Mapping,
+                "a snooped name is tagged like upstream `DNSMapping` ({sniffed})"
+            );
         }
+        assert_eq!(real.dns_mode, DnsMode::Normal, "no snoop, no tag");
     }
 
     /// The sniff gate mirrors the rescue paths: an unmapped address in our

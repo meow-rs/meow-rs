@@ -115,6 +115,28 @@ pub fn parse_proxy(
     parse_proxy_with_dialer(config, &dialer, ipv6)
 }
 
+/// [`parse_proxy`] for a static `proxies:` entry. A `type: direct` entry
+/// without its own `dns:` also follows `resolver`'s
+/// `dns.direct-nameserver`, like the built-in DIRECT
+/// ([`DirectAdapter::with_direct_resolver_slot`]).
+pub(crate) fn parse_static_proxy(
+    config: &HashMap<String, serde_json::Value>,
+    ipv6: bool,
+    resolver: Option<&meow_dns::ResolverSlot>,
+) -> std::result::Result<Arc<dyn Proxy>, String> {
+    match (config.get("type").and_then(|v| v.as_str()), resolver) {
+        (Some("direct"), Some(slot)) => {
+            let name = config
+                .get("name")
+                .and_then(|v| v.as_str())
+                .ok_or("missing proxy name")?;
+            let adapter = parse_direct(name, config, ipv6, Some(slot))?;
+            Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
+        }
+        _ => parse_proxy(config, ipv6),
+    }
+}
+
 /// A TT node that fails to parse must stay *bound* even in lenient mode —
 /// to a dead placeholder, never dropped. Dropping the requested transport
 /// can make a group select DIRECT, i.e. send the flow out in plaintext.
@@ -409,7 +431,7 @@ pub fn parse_proxy_with_dialer(
         }
         "direct" => {
             reject_unthreaded_dialer(name, "direct", dialer)?;
-            let adapter = parse_direct(name, config, ipv6)?;
+            let adapter = parse_direct(name, config, ipv6, None)?;
             Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
         }
         #[cfg(feature = "anytls")]
@@ -861,6 +883,7 @@ fn parse_direct(
     name: &str,
     config: &HashMap<String, serde_json::Value>,
     ipv6: bool,
+    direct_slot: Option<&meow_dns::ResolverSlot>,
 ) -> std::result::Result<DirectAdapter, String> {
     use meow_common::DnsMode;
     use meow_dns::Resolver;
@@ -935,6 +958,9 @@ fn parse_direct(
             ipv6,
         ));
         adapter = adapter.with_resolver(resolver);
+    } else if let Some(slot) = direct_slot {
+        // No per-proxy `dns:` override — follow `dns.direct-nameserver`.
+        adapter = adapter.with_direct_resolver_slot(Arc::clone(slot));
     }
 
     Ok(adapter)
@@ -3997,17 +4023,70 @@ tls: true
     #[test]
     fn parse_direct_with_connect_timeout_wires_adapter() {
         let cfg = direct_config("name: d\ntype: direct\nconnect-timeout: 7\n");
-        let adapter = parse_direct("d", &cfg, true).unwrap();
+        let adapter = parse_direct("d", &cfg, true, None).unwrap();
         assert_eq!(
             adapter.connect_timeout(),
             Some(std::time::Duration::from_secs(7))
         );
     }
 
+    /// A static `type: direct` entry without `dns:` follows the tunnel's
+    /// `dns.direct-nameserver`: its UDP socket connects to the
+    /// direct-resolved address, not the caller's main-resolved one.
+    #[tokio::test]
+    async fn static_direct_proxy_follows_direct_nameserver() {
+        use meow_common::DnsMode;
+        use meow_dns::{HostEntry, Resolver};
+        use meow_trie::DomainTrie;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = echo.local_addr().unwrap().port();
+        let echo_task = tokio::spawn(async move {
+            let mut buf = [0u8; 16];
+            let (n, src) = echo.recv_from(&mut buf).await.unwrap();
+            echo.send_to(&buf[..n], src).await.unwrap();
+        });
+
+        let hosts_only = |ip: IpAddr| {
+            let mut hosts: DomainTrie<HostEntry> = DomainTrie::new();
+            hosts.insert("node.test", vec![ip].into());
+            Resolver::new(vec![], vec![], DnsMode::Normal, hosts, true, true)
+        };
+        let main_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let mut main = hosts_only(main_ip);
+        main.set_direct_resolver(Arc::new(hosts_only(IpAddr::V4(Ipv4Addr::LOCALHOST))));
+        let slot = meow_dns::new_resolver_slot(Arc::new(main));
+
+        let cfg = direct_config("name: 直连\ntype: direct\n");
+        let proxy = parse_static_proxy(&cfg, true, Some(&slot)).unwrap();
+        let meta = Metadata {
+            network: meow_common::Network::Udp,
+            host: "node.test".into(),
+            dst_ip: Some(main_ip),
+            dst_port: port,
+            ..Default::default()
+        };
+        let conn = proxy.dial_udp(&meta).await.expect("dial_udp");
+        conn.write_packet(b"ping", &SocketAddr::new(main_ip, port))
+            .await
+            .expect("write");
+        let mut buf = [0u8; 16];
+        let (n, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            conn.read_packet(&mut buf),
+        )
+        .await
+        .expect("reply from the direct-resolved address")
+        .expect("read");
+        assert_eq!(&buf[..n], b"ping");
+        echo_task.await.unwrap();
+    }
+
     #[test]
     fn parse_direct_without_connect_timeout_is_unbounded() {
         let cfg = direct_config("name: d\ntype: direct\n");
-        let adapter = parse_direct("d", &cfg, true).unwrap();
+        let adapter = parse_direct("d", &cfg, true, None).unwrap();
         assert_eq!(adapter.connect_timeout(), None);
     }
 

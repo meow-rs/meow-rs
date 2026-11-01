@@ -1689,23 +1689,24 @@ fn dns_uses_proxy_refs(raw: &RawConfig) -> bool {
     let Some(dns) = raw.dns.as_ref() else {
         return false;
     };
-    // A proxy reference is a `#name` tag on plain entries or `?proxy=name`
-    // on tls:///https:// entries — both capture `Arc<dyn Proxy>` at build
-    // time (issue #67 phase 2), so either spelling must force the rebuild.
-    let tagged = |s: &String| s.contains('#') || s.contains("?proxy=");
-    let urls_tagged =
-        |urls: &Option<Vec<String>>| urls.as_deref().is_some_and(|us| us.iter().any(tagged));
+    // Decide from the parsed entry, not a raw `#`: on `tls://` / `https://`
+    // the fragment is SNI (`tls://1.1.1.1#dns.google`), not a proxy tag. An
+    // unparseable entry fails the DNS build itself, so it is no ref here.
+    let tagged =
+        |s: &str| meow_dns::NameServerEntry::parse(s).is_ok_and(|entry| entry.proxy.is_some());
+    let urls_tagged = |urls: &Option<Vec<String>>| {
+        urls.as_deref()
+            .is_some_and(|us| us.iter().any(|u| tagged(u)))
+    };
     urls_tagged(&dns.nameserver)
         || urls_tagged(&dns.fallback)
         || urls_tagged(&dns.default_nameserver)
         || urls_tagged(&dns.proxy_server_nameserver)
-        || dns.nameserver_policy.as_ref().is_some_and(|m| {
-            m.iter().any(|(_k, v)| {
-                v.as_urls()
-                    .iter()
-                    .any(|u| u.contains('#') || u.contains("?proxy="))
-            })
-        })
+        || urls_tagged(&dns.direct_nameserver)
+        || dns
+            .nameserver_policy
+            .as_ref()
+            .is_some_and(|m| m.iter().any(|(_k, v)| v.as_urls().into_iter().any(tagged)))
 }
 
 /// `true` when two raw configs carry identical DNS-relevant inputs —
@@ -4554,6 +4555,32 @@ mod tests {
         assert_eq!(parse_connections_interval(Some("101")), Some(101));
         assert_eq!(parse_connections_interval(Some("5000")), Some(5000));
         assert_eq!(parse_connections_interval(None), Some(1000));
+    }
+
+    /// On `tls://` / `https://` the `#` fragment is SNI, not a proxy tag —
+    /// it must not force a DNS rebuild on every commit. A plain-form
+    /// `#name` in any list (including `direct-nameserver`) still does.
+    #[test]
+    fn sni_fragment_is_not_a_dns_proxy_ref() {
+        let raw = |yaml: &str| -> RawConfig { serde_saphyr::from_str(yaml).unwrap() };
+        for list in ["nameserver", "direct-nameserver", "proxy-server-nameserver"] {
+            assert!(
+                !dns_uses_proxy_refs(&raw(&format!(
+                    "dns:\n  {list}:\n    - tls://1.1.1.1#dns.google\n    - https://1.1.1.1/dns-query#cloudflare-dns.com\n"
+                ))),
+                "{list}: SNI fragment counted as a proxy ref"
+            );
+            assert!(
+                dns_uses_proxy_refs(&raw(&format!("dns:\n  {list}:\n    - 8.8.8.8#P\n"))),
+                "{list}: plain `#name` must count as a proxy ref"
+            );
+        }
+        assert!(!dns_uses_proxy_refs(&raw(
+            "dns:\n  nameserver-policy:\n    'example.com': tls://1.1.1.1#dns.google\n"
+        )));
+        assert!(dns_uses_proxy_refs(&raw(
+            "dns:\n  nameserver-policy:\n    'example.com': [tcp://1.1.1.1#P]\n"
+        )));
     }
 
     /// Issue #533: a `#name` nameserver captures adapters whose registry
