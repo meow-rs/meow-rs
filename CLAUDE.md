@@ -192,6 +192,7 @@ cargo test -p meow-proxy --no-default-features --features ss --lib
 # lands `main` red.
 cargo test --lib --bin meow --bin meow-bench --bin meow-cli \
   --test socks5_udp_user --test ss_listener_integration --test host_validation \
+  --test direct_udp_binding \
   --test common_test --test dns_cache_test --test config_test \
   --test tun_config_test --test dialer_proxy_group \
   --test statistics_test --test rules_test --test api_test --test meow_cli_test \
@@ -215,6 +216,12 @@ cargo test --lib --bin meow --bin meow-bench --bin meow-cli \
 # compiles them out via feature unification.
 cargo test -p meow-api --test api_test
 ```
+
+`direct_udp_binding` installs the TUN outbound-interface binding only when
+`MEOW_TEST_OUTBOUND_INTERFACE` names the default-route interface (CI sets
+it; locally e.g. `MEOW_TEST_OUTBOUND_INTERFACE=$(route -n get default |
+awk '/interface:/ {print $2}')` on macOS) — unset, it passes without
+exercising the regression and says so on stderr.
 
 `smux_singbox_integration` runs the full stack (config → mixed listener →
 tunnel → VLESS adapter + smux) against a real sing-box server and **fails**

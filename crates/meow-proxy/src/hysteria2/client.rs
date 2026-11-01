@@ -9,7 +9,7 @@ use super::tcp::DuplexStream;
 use super::udp::UdpSession;
 use super::{Error, Result};
 use meow_common::atomic::{AtomicU, Uint};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::sync::{oneshot, Mutex};
@@ -195,17 +195,17 @@ async fn connect_addr(
     server_addr: SocketAddr,
     server_name: &str,
 ) -> Result<ConnHandle> {
-    let bind_addr = if server_addr.is_ipv4() {
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
-    } else {
-        SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
-    };
+    // The socket's family follows the canonical server address.
+    let server_addr = meow_common::canonical_socket_addr(server_addr);
     // Through the outbound-socket chokepoint, never a raw bind: it applies
     // the TUN global-route interface binding (`meow_common::outbound_iface`)
     // and the Android `protect()` hook before the first QUIC Initial leaves —
     // otherwise the datagrams follow the TUN's split default routes back
-    // into the device and loop (issue #695).
-    let socket = meow_common::bind_udp(bind_addr).await.map_err(Error::Io)?;
+    // into the device and loop (issue #695). A loopback server is left
+    // unbound, where the binding would make every send fail.
+    let socket = meow_common::bind_udp_for_peer(server_addr.ip())
+        .await
+        .map_err(Error::Io)?;
     enlarge_recv_buffer(&socket);
     let local = socket.local_addr().map_err(Error::Io)?;
 
