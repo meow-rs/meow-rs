@@ -218,6 +218,17 @@ impl FirstFlight {
         self.flight = Vec::new();
         self.recovery_timer = None;
     }
+    /// The live connection once recovery is off for good. Every path that
+    /// disables while a connection is live leaves no redial pending, so the
+    /// conn is then a plain passthrough: no waker bookkeeping and no
+    /// classification on the relay's hot path.
+    fn settled(&mut self) -> Option<&mut Conn> {
+        if self.disabled {
+            self.inner.as_mut()
+        } else {
+            None
+        }
+    }
     fn wake_waiters(&mut self) {
         if let Some(w) = self.read_waker.take() {
             w.wake();
@@ -293,6 +304,9 @@ impl AsyncRead for FirstFlight {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let s = self.get_mut();
+        if let Some(inner) = s.settled() {
+            return Pin::new(inner).poll_read(cx, buf);
+        }
         s.read_waker = Some(cx.waker().clone());
         if buf.remaining() == 0 {
             return Poll::Ready(Ok(()));
@@ -352,6 +366,9 @@ impl AsyncWrite for FirstFlight {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let s = self.get_mut();
+        if let Some(inner) = s.settled() {
+            return Pin::new(inner).poll_write(cx, buf);
+        }
         s.write_waker = Some(cx.waker().clone());
         // A codec may already emit part of this write before returning Pending
         // or an error. Never move those additional bytes to a fresh session.
@@ -375,6 +392,9 @@ impl AsyncWrite for FirstFlight {
     }
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let s = self.get_mut();
+        if let Some(inner) = s.settled() {
+            return Pin::new(inner).poll_flush(cx);
+        }
         s.write_waker = Some(cx.waker().clone());
         match s.connected(cx) {
             Poll::Pending => Poll::Pending,
