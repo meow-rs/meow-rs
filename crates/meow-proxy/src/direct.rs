@@ -339,8 +339,9 @@ where
 
 /// Create a TCP socket with an optional routing mark (SO_MARK on Linux)
 /// set BEFORE connecting, so the SYN packet is already marked. On Android
+/// (via `meow_common::connect_tcp`, the mark is Linux-only) and OpenHarmony
 /// the installed `meow_common::SocketProtector` is applied to the socket
-/// fd (also pre-connect) so the dial bypasses VpnService when meow-rs runs
+/// fd (also pre-connect) so the dial bypasses the VPN when meow-rs runs
 /// inside a VPN app.
 async fn connect_with_mark(
     dest: SocketAddr,
@@ -358,6 +359,20 @@ async fn connect_with_mark(
 
         let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
         socket.set_mark(mark)?;
+        // Android is not `target_os = "linux"`, so in this branch the
+        // protector only exists on OpenHarmony. Fail closed like
+        // `meow_common::connect_tcp` does there when none is installed.
+        #[cfg(target_env = "ohos")]
+        {
+            use std::os::fd::AsRawFd;
+            let protector = meow_common::socket_protector().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "OpenHarmony socket protector is not initialized",
+                )
+            })?;
+            protector.protect(socket.as_raw_fd())?;
+        }
         // TUN global-route loop avoidance (#375): this branch bypasses
         // `meow_common::connect_tcp`, so apply the outbound-interface
         // binding here too (no-op when none is installed).

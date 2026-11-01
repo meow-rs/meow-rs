@@ -494,10 +494,13 @@ async fn route_inbound_tcp_scoped<C>(
                         }
                         Err(e) => {
                             debug!(
-                                "{} {} relay error: {}",
+                                "{} {} relay error ({:?}): {} (up={} down={})",
                                 metadata.conn_type,
                                 metadata.remote_address(),
-                                e
+                                e.kind(),
+                                e,
+                                guard.counters().upload_bytes(),
+                                guard.counters().download_bytes(),
                             );
                             conn_note!(Relay, "Ended with an error: {e}");
                         }
