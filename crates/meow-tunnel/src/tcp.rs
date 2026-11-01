@@ -11,7 +11,7 @@ use smallvec::{smallvec, SmallVec};
 use smol_str::SmolStr;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
-use tracing::{debug, info, warn, Instrument};
+use tracing::{debug, info, warn};
 
 /// RAII wrapper around `Statistics::track_connection` /
 /// `close_connection`. The previous implementation called
@@ -521,17 +521,6 @@ async fn route_inbound_tcp_scoped<C>(
     let mut buf_up = [0u8; RELAY_BUF_SIZE];
     let mut buf_dn = [0u8; RELAY_BUF_SIZE];
 
-    // Keep listener probe identity while attaching the routed connection ID.
-    let flow_span = tracing::info_span!(
-        "paws_flow",
-        connection = tracing::field::Empty,
-        source = %metadata.source_address(),
-        target = %metadata.remote_address()
-    );
-    if let Some(id) = guard.id() {
-        flow_span.record("connection", tracing::field::display(id));
-    }
-
     // Dial the remote via proxy, bounded like mihomo's `C.DefaultTCPTimeout`:
     // a server that accepts and then stalls mid-handshake would otherwise pin
     // this task, its inbound socket and its stats entry forever.
@@ -546,8 +535,7 @@ async fn route_inbound_tcp_scoped<C>(
             );
             let started = std::time::Instant::now();
             let (dial, pick) = meow_proxy::group::watch_dial_pick(
-                with_dial_timeout(proxy.name(), proxy.dial_tcp(&metadata))
-                    .instrument(flow_span.clone()),
+                with_dial_timeout(proxy.name(), proxy.dial_tcp(&metadata)),
             )
             .await;
             // All chained front hops resolved during the dial — release the
@@ -598,7 +586,6 @@ async fn route_inbound_tcp_scoped<C>(
                         },
                         inner.tcp_idle_timeout(),
                     )
-                    .instrument(flow_span.clone())
                     .await
                     {
                         Ok((up, down)) => {
@@ -613,14 +600,13 @@ async fn route_inbound_tcp_scoped<C>(
                         }
                         Err(e) => {
                             debug!(
-                                "{} {} relay ended: kind={:?} operation={} up={} down={} source={}",
+                                "{} {} relay error ({:?}): {} (up={} down={})",
                                 metadata.conn_type,
                                 metadata.remote_address(),
                                 e.kind(),
                                 e,
                                 guard.counters().upload_bytes(),
                                 guard.counters().download_bytes(),
-                                metadata.source_address()
                             );
                             conn_note!(Relay, "Ended with an error: {e}");
                         }

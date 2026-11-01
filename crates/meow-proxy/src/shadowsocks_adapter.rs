@@ -533,7 +533,13 @@ impl SsCore {
                             .map_err(|e| MeowError::Config(format!("ss obfs: {e}")))?;
                         let mut stream = self.ss_conn(wrapped, addr);
                         use tokio::io::AsyncWriteExt;
-                        // HTTP-obfs matches Mihomo: send encrypted destination before ClientHello.
+                        // Like mihomo, send the SS salt + target address as
+                        // the fake request's whole body at dial time rather
+                        // than coalescing it with the client's first bytes:
+                        // the client's first flight (e.g. a TLS ClientHello)
+                        // then follows as passthrough, which is what
+                        // `FirstFlight` records and can replay on a redial.
+                        // An empty write is `SsConn`'s "header now" request.
                         let _ = stream.write(&[]).await?;
                         stream.flush().await?;
                         Ok(stream)
@@ -1637,29 +1643,20 @@ impl ProxyAdapter for ShadowsocksAdapter {
         }
 
         let internal = metadata.is_internal();
-        static FLOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        let flow = FLOW.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let span = tracing::info_span!("paws_flow", connection = flow, source = %metadata.source_address(), target = %addr);
-        let conn = self
-            .core
-            .dial_tcp_stream(addr.clone(), internal)
-            .instrument(span.clone())
-            .await?;
+        let conn = self.core.dial_tcp_stream(addr.clone(), internal).await?;
         if matches!(self.core.plugin, PluginKind::Obfs(BuiltinObfs::Http { .. })) {
             let core = Arc::clone(&self.core);
             let redial: crate::first_flight::Redial = Arc::new(move || {
                 let core = Arc::clone(&core);
                 let addr = addr.clone();
-                let span = span.clone();
                 Box::pin(async move {
                     core.dial_tcp_stream(addr, internal)
-                        .instrument(span)
                         .await
-                        .map_err(|e| std::io::Error::other(e.to_string()))
+                        .map_err(|e| e.into_io_error("ss obfs redial"))
                 })
             });
             return Ok(Box::new(crate::first_flight::FirstFlight::new(
-                conn, redial, flow,
+                conn, redial,
             )));
         }
         Ok(conn)
