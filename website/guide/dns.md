@@ -32,6 +32,7 @@ still used internally so rules and proxies can resolve names.
 | `fake-ip-range` | string | `198.18.0.1/16` | Fake-IP CIDR pool |
 | `fake-ip-filter` | list | `[]` | Domains excluded/included from FakeIP |
 | `fake-ip-filter-mode` | string | `blacklist` | `blacklist` or `whitelist` |
+| `prefer-h3` | bool | `false` | Let every `https://` upstream prefer HTTP/3, falling back to HTTP/1.1 |
 | `store-fake-ip` | bool | `false` | Persist the fake-IP map across restarts |
 | `use-hosts` | bool | `true` | Honor the top-level `hosts:` map |
 | `use-system-hosts` | bool | `true` | Merge the OS hosts file (`/etc/hosts`, or `%SystemRoot%\System32\drivers\etc\hosts` on Windows) |
@@ -45,13 +46,50 @@ Each `nameserver` / `fallback` entry is a server URL:
 | `8.8.8.8` or `udp://8.8.8.8:53` | DNS over UDP | 53 |
 | `tcp://8.8.8.8:53` | DNS over TCP | 53 |
 | `tls://1.1.1.1:853#cloudflare-dns.com` | DoT (SNI after `#`) | 853 |
-| `https://1.1.1.1/dns-query#cloudflare-dns.com` | DoH | 443 |
+| `https://1.1.1.1/dns-query#cloudflare-dns.com` | DoH (HTTP/1.1) | 443 |
+| `https://dns.google/dns-query?h3=true` | DoH over HTTP/3 only | 443 |
+| `quic://dns.adguard.com#dns.adguard.com` | DoQ (RFC 9250) | 853 |
 | `rcode://REFUSED` | Synthetic error (testing) | — |
 
-::: warning DoQ not yet supported
-DNS-over-QUIC (`quic://`) is not implemented and is rejected at parse time. Use DoT or
-DoH instead.
-:::
+An encrypted entry takes `?proxy=NAME` to tunnel the exchange through a proxy, and
+`?h3=` on `https://` entries. `#` is the SNI override, as everywhere in meow-rs.
+
+## DoQ and DoH over HTTP/3
+
+Both ride `quiche` on the same vendored BoringSSL as the rest of the process, so there is
+no second crypto library and the certificate decision is the shared one (Mozilla roots,
+`additional-roots`-free in production).
+
+```yaml
+dns:
+  enable: true
+  # Preferred: one flag for every HTTPS upstream.
+  prefer-h3: true
+  nameserver:
+    - quic://dns.adguard.com            # DoQ, port 853
+    - https://1.1.1.1/dns-query         # h3 first (prefer-h3), HTTP/1.1 fallback
+    - https://dns.google/dns-query?h3=true   # h3 only, no fallback
+    - https://cloudflare-dns.com/dns-query?h3=false  # opts out of prefer-h3
+```
+
+- **DoQ** follows RFC 9250: one bidirectional stream per query, the message
+  length-prefixed like DNS over TCP, and the transaction ID set to `0` on the wire. One
+  QUIC connection serves every query and is re-dialed transparently after an idle
+  timeout, a peer close or `POST /cache/dns/flush`-adjacent connection resets.
+- **DoH3** is RFC 8484 over HTTP/3: one `POST` per query, `application/dns-message` both
+  ways, `:status 200` required.
+- **`prefer-h3` vs `?h3=true`.** The global flag means *prefer*: HTTP/3 is tried first
+  and the query falls back to HTTP/1.1 DoH when the QUIC exchange fails, with the failed
+  handshake parked for ten minutes so a server without HTTP/3 does not cost a handshake
+  timeout per query. `?h3=true` is mihomo's per-entry spelling and means *HTTP/3 only* —
+  no fallback. `?h3=prefer` opts a single entry into the fallback behaviour without the
+  global flag, and `?h3=false` turns the entry back off.
+- **`?proxy=`.** A proxied DoQ/DoH3 upstream dials the adapter's UDP association; an
+  adapter that cannot carry UDP fails the exchange instead of leaking around the chain.
+- **Builds.** The transports live behind the `dns-quic` Cargo feature (in the `full`
+  bundle, out of `minimal` for binary size). A config that asks for `quic://`, `?h3=` or
+  `prefer-h3` on a build without it is a load error naming the feature — never a silent
+  downgrade to plain DoH.
 
 ## Enhanced modes
 

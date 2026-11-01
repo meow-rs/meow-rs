@@ -10,6 +10,24 @@ the canonical, in-repo source a release is cut from.
 
 ### Added
 
+- **DNS over QUIC (`quic://`)**: RFC 9250 on `quiche` (the vendored BoringSSL
+  the rest of the process uses): one bidirectional stream per query, the
+  two-octet length prefix, the transaction ID zeroed on the wire and restored
+  before validation, and one multiplexed connection per upstream that re-dials
+  by itself after an idle timeout or a connection reset. `?proxy=NAME` tunnels
+  the exchange through an adapter's UDP association. Behind the new `dns-quic`
+  feature (in the `full` bundle); without it the scheme is a hard config error
+  naming the feature, never a silent drop.
+- **DoH over HTTP/3 (`dns.prefer-h3`, `?h3=`)**: an `https://` nameserver can
+  speak HTTP/3 instead of HTTP/1.1. `prefer-h3: true` marks every `https://`
+  entry, `?h3=true` is mihomo's per-entry "HTTP/3 only", and `?h3=prefer` /
+  `?h3=false` opt a single entry in or out. The preference is real: the h3
+  attempt gets half the per-query timeout, a failure falls back to the HTTP/1.1
+  DoH path (same proxy tag, roots and session pool), and the failed handshake
+  parks HTTP/3 for ten minutes so a server without it does not cost a
+  handshake timeout per query. A build without `dns-quic` refuses a config that
+  asks for HTTP/3 (ADR-0002 Class A).
+
 - **`dns.direct-nameserver`**: `DIRECT` outbounds now resolve their
   destination through `direct-nameserver` when it is set, as mihomo does,
   instead of always using the main `nameserver` list. With

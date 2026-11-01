@@ -79,7 +79,8 @@ cause problems; items marked ~ work with caveats; items marked ✓ work.
 | `dns:` — udp, tcp nameservers | ✓ | Fully supported. |
 | `dns:` — DoH (`https://`) | ✓ | See §DNS. |
 | `dns:` — DoT (`tls://`) | ✓ | See §DNS. |
-| `dns:` — DoQ (`quic://`) | ✗ | Deferred to M1.E-6/M2. Hard error (not silent). |
+| `dns:` — DoQ (`quic://`) | ✓ | RFC 9250 on quiche, behind the `dns-quic` feature (in `full`). Without the feature it is a hard error naming it. |
+| `dns:` — `prefer-h3` / `?h3=` | ✓ | Global flag = h3 with HTTP/1.1 fallback; `?h3=true` = HTTP/3 only (mihomo's meaning); `?h3=prefer` / `?h3=false` are meow-rs's per-entry opt-in/opt-out. |
 | `dns:` — `default-nameserver` | ✓ | Bootstrap resolver for encrypted upstream hostnames. |
 | `dns:` — `nameserver-policy` | ✓ | Exact, `+.`/`*.`/`.` wildcard, `geosite:`/`rule-set:` policy keys. Key order is the lookup priority (document order = first match wins); a matcher key shadows domain keys written after it, and same-slot collisions resolve to the document-last key. |
 | `dns:` — `fallback-filter` | ✓ | GeoIP/IP-CIDR/domain gates. |
@@ -105,7 +106,9 @@ These fields parse without error but behave differently from Go mihomo:
 | `authentication: ["user:"]` (empty password) | Accepted silently | Accepted; warn-once | B |
 | `skip-auth-prefixes` | Defaults to `[]` | Always includes `127.0.0.1/32` + `::1/128` | A |
 | `skip-auth-prefixes` with invalid CIDR | Silently dropped | Hard parse error | A |
-| `dns.nameserver: quic://...` | Supported | Hard error with roadmap pointer | A |
+| `dns.nameserver: quic://...` | Supported | Supported (same scheme, same 853 default) when built with `dns-quic`; otherwise a hard error naming the feature | — |
+| `dns.nameserver: https://…#h3=true` (params in the fragment) | Supported | Hard error with the fix spelled out — `#` is SNI in meow-rs, so parameters belong in `?h3=true` | A |
+| `dns.prefer-h3` on a build without `dns-quic` | n/a | Hard load error, never a silent downgrade to HTTP/1.1 | A |
 | `dns.nameserver: sdns://...` | Warn-drop (silent) | Hard error | A |
 | `dns.nameserver: tls://…#NAME` / `https://…#NAME` | `#` is SNI | Same — `#` is SNI. When `NAME` matches a configured proxy, a warning points out the routing intent was probably `?proxy=NAME` (lowercase `proxy` only), the spelling that tunnels the exchange through that adapter (`tls://8.8.8.8#dns.google?proxy=JP` for SNI + proxy together). | — |
 | `dns.nameserver: udp/tcp entry with ?…` | Accepted — `url.Parse` keeps the query and it is silently ignored (semantic drift, not a rejection) | Hard error (`InvalidParams`) — `?` sections exist only on `tls://`/`https://`; plain entries keep `#PROXY`. | A |
