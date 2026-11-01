@@ -39,9 +39,9 @@ use std::task::{ready, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::time::Sleep;
+use tracing::debug;
 #[cfg(any(feature = "restls", feature = "jls"))]
 use tracing::warn;
-use tracing::{debug, Instrument};
 
 /// Built-in (native, no external process) simple-obfs configuration.
 #[derive(Debug, Clone)]
