@@ -234,11 +234,13 @@ impl ProxyPacketConn for DirectPacketConn {
             // send_to() with the caller's placeholder arg would fail with
             // EISCONN on a connected socket.
             Some(_) => self.socket.send(buf).await.map_err(MeowError::Io),
-            None => {
-                let mut addr = *addr;
-                addr.set_ip(addr.ip().to_canonical());
-                self.socket.send_to(buf, addr).await.map_err(MeowError::Io)
-            }
+            // The socket's family follows the canonical peer
+            // (`bind_udp_for_peer`), so a mapped destination is sent as IPv4.
+            None => self
+                .socket
+                .send_to(buf, meow_common::canonical_socket_addr(*addr))
+                .await
+                .map_err(MeowError::Io),
         }
     }
 
@@ -386,8 +388,8 @@ impl ProxyAdapter for DirectAdapter {
         // placeholder.
         if metadata.domain_udp_target().is_some() {
             let mut last_err = None;
-            for mut addr in self.resolve_targets(metadata).await? {
-                addr.set_ip(addr.ip().to_canonical());
+            for addr in self.resolve_targets(metadata).await? {
+                let addr = meow_common::canonical_socket_addr(addr);
                 let socket = match meow_common::bind_udp_for_peer(addr.ip()).await {
                     Ok(s) => s,
                     Err(e) => {

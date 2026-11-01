@@ -1804,12 +1804,8 @@ impl ProxyAdapter for ShadowsocksAdapter {
         let mut connected = None;
         let mut last_err: Option<MeowError> = None;
         for remote in candidates {
-            let bind_addr: SocketAddr = if remote.is_ipv4() {
-                "0.0.0.0:0".parse().expect("static")
-            } else {
-                "[::]:0".parse().expect("static")
-            };
-            let udp = match meow_common::bind_udp(bind_addr).await {
+            let remote = meow_common::canonical_socket_addr(remote);
+            let udp = match meow_common::bind_udp_for_peer(remote.ip()).await {
                 Ok(udp) => udp,
                 Err(e) => {
                     last_err = MeowError::prefer_errno(

@@ -786,13 +786,10 @@ impl ProxyAdapter for Socks5Adapter {
             }));
         }
 
-        let relay_addr = self.resolve_relay(&relay).await?;
-        let bind: SocketAddr = if relay_addr.is_ipv4() {
-            "0.0.0.0:0".parse().expect("static")
-        } else {
-            "[::]:0".parse().expect("static")
-        };
-        let socket = meow_common::bind_udp(bind).await.map_err(MeowError::Io)?;
+        let relay_addr = meow_common::canonical_socket_addr(self.resolve_relay(&relay).await?);
+        let socket = meow_common::bind_udp_for_peer(relay_addr.ip())
+            .await
+            .map_err(MeowError::Io)?;
         socket.connect(relay_addr).await.map_err(MeowError::Io)?;
 
         Ok(Box::new(Socks5UdpConn {

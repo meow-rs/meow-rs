@@ -217,6 +217,12 @@ cargo test --lib --bin meow --bin meow-bench --bin meow-cli \
 cargo test -p meow-api --test api_test
 ```
 
+`direct_udp_binding` installs the TUN outbound-interface binding only when
+`MEOW_TEST_OUTBOUND_INTERFACE` names the default-route interface (CI sets
+it; locally e.g. `MEOW_TEST_OUTBOUND_INTERFACE=$(route -n get default |
+awk '/interface:/ {print $2}')` on macOS) — unset, it passes without
+exercising the regression and says so on stderr.
+
 `smux_singbox_integration` runs the full stack (config → mixed listener →
 tunnel → VLESS adapter + smux) against a real sing-box server and **fails**
 (never silently skips) when the binary is missing: install the pinned

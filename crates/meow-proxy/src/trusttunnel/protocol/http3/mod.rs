@@ -22,7 +22,7 @@ use http::{Request, StatusCode};
 use quiche::h3;
 use std::{
     io,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::SocketAddr,
     sync::{atomic::Ordering, Arc},
     time::Duration,
 };
@@ -87,12 +87,10 @@ impl QuicConnector {
         peer: SocketAddr,
         cancel: CancellationToken,
     ) -> io::Result<Box<dyn Connection>> {
-        let bind = if peer.is_ipv4() {
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
-        } else {
-            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
-        };
-        let socket = meow_common::bind_udp(bind).await?;
+        // The socket's family follows the canonical peer; a loopback peer is
+        // left outside the TUN global-route interface binding.
+        let peer = meow_common::canonical_socket_addr(peer);
+        let socket = meow_common::bind_udp_for_peer(peer.ip()).await?;
         let local = socket.local_addr()?;
         let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
         for byte in &mut scid {

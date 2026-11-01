@@ -12,9 +12,19 @@ use tokio::net::UdpSocket;
 #[tokio::test]
 async fn direct_udp_loopback_works_with_outbound_interface_binding() {
     // A separate test binary isolates the process-global binding registry.
-    let _binding = std::env::var("MEOW_TEST_OUTBOUND_INTERFACE")
-        .ok()
-        .map(|interface| meow_common::install_outbound_interface(&interface).unwrap());
+    // CI points MEOW_TEST_OUTBOUND_INTERFACE at the runner's default-route
+    // interface; without it the binding is never installed and only the
+    // unbound datagram path runs.
+    let _binding = match std::env::var("MEOW_TEST_OUTBOUND_INTERFACE") {
+        Ok(interface) => Some(meow_common::install_outbound_interface(&interface).unwrap()),
+        Err(_) => {
+            eprintln!(
+                "direct_udp_binding: MEOW_TEST_OUTBOUND_INTERFACE unset — no outbound \
+                 interface binding installed, the regression is NOT exercised"
+            );
+            None
+        }
+    };
     for ip in ["127.0.0.1", "::1", "::ffff:127.0.0.1"] {
         let ip: IpAddr = ip.parse().unwrap();
         let echo = UdpSocket::bind((ip.to_canonical(), 0)).await.unwrap();

@@ -68,9 +68,18 @@ the canonical, in-repo source a release is cut from.
   warning vs strict refusal), not what the entry matches.
   `DOMAIN-REGEX` stays unchecked: whether an arbitrary pattern can match
   a normalized host is not decidable by label inspection.
-- **Outbound interface binding**: exempt loopback and multicast destinations
-  on Linux, macOS and Windows, using the actual UDP peer rather than the local
-  wildcard address. Preserve mapped IPv4 targets and IPv6 scope IDs.
+- **UDP to a loopback destination works under TUN global route scope.**
+  With `tun.auto-route: true` (or `global`) meow binds its own sockets to
+  the physical interface against routing loops, and decided that for UDP
+  by the socket's wildcard *local* address — so every UDP socket was
+  bound, and DIRECT UDP to `127.0.0.1` / `::1` (or a name resolving to
+  one) failed (`WSAEADDRNOTAVAIL` on Windows), as did UDP to a proxy
+  server or chained hop on loopback (Shadowsocks, SOCKS5, Hysteria2,
+  TrustTunnel QUIC, kcptun, dialer-proxy). The binding is now decided by
+  the destination: loopback peers are left unbound on Linux, macOS and
+  Windows (Linux bound loopback TCP too), everything else — LAN,
+  link-local and multicast included — keeps it. IPv4-mapped destinations
+  get an IPv4 socket; native IPv6 keeps its scope id.
 
 ## [0.28.0] - 2026-10-30
 

@@ -19,10 +19,17 @@
 //! new index, which the binding does not follow until it is re-installed
 //! (a TUN listener restart).
 //!
-//! Loopback and multicast destinations are left unbound on every platform,
-//! matching sing's interface-binding policy. UDP callers with a known peer
-//! use that destination, rather than their wildcard local address, to decide
-//! whether binding is necessary.
+//! Loopback destinations (`127.0.0.0/8`, `::1`, and the IPv4-mapped form)
+//! are left unbound on every platform (`binds_peer`): loopback traffic never
+//! follows the TUN's routes — the local table (Linux), the `lo0` route
+//! (macOS) and the loopback pseudo-interface (Windows) all win over them —
+//! while a socket scoped to a physical interface cannot reach a loopback
+//! peer at all (`EADDRNOTAVAIL` on macOS, `WSAEADDRNOTAVAIL` on Windows).
+//! Every other destination is bound, multicast and link-local included:
+//! unbound multicast on Linux has no main-table route and would follow the
+//! device's default into the TUN, whose ingress drops it. UDP callers that
+//! know their peer ([`crate::bind_udp_for_peer`]) classify that destination
+//! rather than their wildcard local address.
 //!
 //! This module is the process-global registry for that interface, mirroring
 //! the `SocketProtector` pattern in [`crate::socket_protect`]: the owners of
@@ -340,15 +347,17 @@ pub fn outbound_interface() -> Option<Arc<str>> {
     OWNERS.read().last().map(|o| Arc::clone(&o.iface))
 }
 
-/// Whether traffic to `peer` takes the physical-interface binding.
+/// Whether traffic to `peer` takes the physical-interface binding: every
+/// destination but loopback (see the [module docs](self)), including the
+/// IPv4-mapped loopback form a dual-stack socket dials.
 #[cfg(any(test, target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub(crate) fn binds_peer(peer: IpAddr) -> bool {
-    let peer = peer.to_canonical();
-    !peer.is_loopback() && !peer.is_multicast()
+    !peer.to_canonical().is_loopback()
 }
 
-/// Apply the installed binding for a destination, leaving loopback and
-/// multicast traffic to the OS routing policy on every platform.
+/// Apply the installed binding to a socket that will talk to `peer`,
+/// leaving loopback traffic to the OS (see the [module docs](self)). No-op when
+/// no binding is installed.
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub fn apply_outbound_interface_for_peer(
     socket: &socket2::Socket,
@@ -463,25 +472,54 @@ mod pure_tests {
     }
 
     #[test]
-    fn local_peers_bypass_binding_including_mapped_ipv4() {
+    fn only_loopback_peers_bypass_binding() {
+        // Loopback, in every spelling a socket can be handed.
         for ip in [
             "127.0.0.1",
             "127.8.9.10",
+            "127.255.255.255",
             "::1",
             "::ffff:127.0.0.1",
-            "224.0.0.1",
-            "ff01::1",
-            "ff02::1",
-            "::ffff:224.0.0.1",
+            "::ffff:127.1.2.3",
         ] {
             assert!(!binds_peer(ip.parse().unwrap()), "{ip}");
         }
+        // Everything else keeps the binding: an unbound socket to any of
+        // these could follow the TUN routes back into the device.
         for ip in [
+            // Public / documentation unicast.
             "192.0.2.1",
+            "8.8.8.8",
+            "2001:db8::1",
+            "2606:4700::1111",
+            "::ffff:192.0.2.1",
+            // Private and shared ranges: LAN reachability is the route
+            // table's business, the binding only pins the interface.
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.1.1",
+            "100.64.0.1",
+            "fd00::1",
+            // Link-local (an IPv6 one's scope travels in the SocketAddr).
+            "169.254.1.1",
+            "fe80::1",
+            // Multicast and broadcast: unbound Linux multicast has no
+            // main-table route and would be caught by the TUN default.
+            "224.0.0.1",
+            "224.0.0.251",
+            "239.255.255.250",
+            "ff01::1",
+            "ff02::1",
+            "ff02::fb",
+            "::ffff:224.0.0.1",
+            "255.255.255.255",
+            // Unspecified: the fallback when a caller has no peer.
             "0.0.0.0",
             "::",
-            "2001:db8::1",
-            "::ffff:192.0.2.1",
+            // Not loopback despite the shape: IPv4-compatible (deprecated)
+            // and NAT64 embeddings of 127.0.0.1 are ordinary IPv6.
+            "::127.0.0.1",
+            "64:ff9b::7f00:1",
         ] {
             assert!(binds_peer(ip.parse().unwrap()), "{ip}");
         }
@@ -769,12 +807,15 @@ mod tests {
                 bind_udp_iface_bound(wildcard6, wildcard6.ip()).expect("v6 wildcard bind");
             assert_bound_to_loopback(&SockRef::from(&socket6), Domain::IPV6);
 
-            for (local, peer) in [
-                (wildcard, "127.0.0.1"),
-                (wildcard, "224.0.0.1"),
-                (wildcard6, "::1"),
-                (wildcard6, "ff01::1"),
-                (wildcard6, "ff02::1"),
+            // The peer, not the wildcard local address, decides: loopback
+            // peers are left unbound, everything else is bound.
+            for (local, peer, bound) in [
+                (wildcard, "127.0.0.1", false),
+                (wildcard6, "::1", false),
+                (wildcard6, "::ffff:127.0.0.1", false),
+                (wildcard, "224.0.0.1", true),
+                (wildcard6, "ff02::1", true),
+                (wildcard, "192.0.2.1", true),
             ] {
                 let socket = bind_udp_iface_bound(local, peer.parse().unwrap()).unwrap();
                 let domain = if local.is_ipv4() {
@@ -782,7 +823,11 @@ mod tests {
                 } else {
                     Domain::IPV6
                 };
-                assert_unbound(&SockRef::from(&socket), domain);
+                if bound {
+                    assert_bound_to_loopback(&SockRef::from(&socket), domain);
+                } else {
+                    assert_unbound(&SockRef::from(&socket), domain);
+                }
             }
 
             let pinned: SocketAddr = "127.0.0.1:0".parse().unwrap();

@@ -276,14 +276,11 @@ impl TcpDialer for DirectDialer {
         let mut last_err: Option<io::Error> = None;
         for remote in candidates {
             // Same bind-family + protect-hook dance as the SS UDP relay
-            // path: `bind_udp` routes the fd through the installed
-            // SocketProtector (Android VpnService.protect) before connect.
-            let bind_addr: SocketAddr = if remote.is_ipv4() {
-                "0.0.0.0:0".parse().expect("static")
-            } else {
-                "[::]:0".parse().expect("static")
-            };
-            let udp = match meow_common::bind_udp(bind_addr).await {
+            // path: `bind_udp_for_peer` routes the fd through the installed
+            // SocketProtector (Android VpnService.protect) before connect,
+            // and leaves a loopback server outside the TUN interface binding.
+            let remote = meow_common::canonical_socket_addr(remote);
+            let udp = match meow_common::bind_udp_for_peer(remote.ip()).await {
                 Ok(udp) => udp,
                 Err(e) => {
                     // An errno-backed failure (e.g. EMFILE on socket())
@@ -319,12 +316,8 @@ impl TcpDialer for DirectDialer {
         // Not shared with `dial_udp_conn` above: kcptun needs the raw
         // `UdpSocket` for `SocketIo::apply_socket_options` (sockbuf/DSCP),
         // which `ProxyPacketConn` does not expose.
-        let bind_addr: SocketAddr = if remote.is_ipv4() {
-            "0.0.0.0:0".parse().expect("static")
-        } else {
-            "[::]:0".parse().expect("static")
-        };
-        let udp = meow_common::bind_udp(bind_addr).await?;
+        let remote = meow_common::canonical_socket_addr(remote);
+        let udp = meow_common::bind_udp_for_peer(remote.ip()).await?;
         udp.connect(remote).await?;
         Ok(Box::new(udp))
     }
