@@ -3,7 +3,7 @@ use crate::statistics::Statistics;
 use crate::tunnel::{MatchedRule, ResolvedTarget, TunnelInner};
 use meow_common::conn_note;
 use meow_common::conn_notes::{self, ConnNotes};
-use meow_common::{with_dial_timeout, Metadata, ProxyAdapter, ProxyConn};
+use meow_common::{with_dial_timeout, Metadata, Proxy, ProxyAdapter, ProxyConn};
 use smallvec::{smallvec, SmallVec};
 use smol_str::SmolStr;
 use std::sync::Arc;
@@ -84,6 +84,46 @@ impl std::fmt::Display for PolicyPath<'_> {
                 f.write_str(" → ")?;
             }
             f.write_str(hop)?;
+        }
+        Ok(())
+    }
+}
+
+/// What a dial-error line names: the rule's target and, behind a group,
+/// the node its chain dials through — `Proxy → HK-01` — since the group's
+/// name alone hides which member failed. The leaf is peeked before the
+/// dial, the way [`connection_chain`] peeks it, so it is the member the
+/// dial's committing pick takes, not one a failure or a round-robin
+/// rotation moves the group to afterwards.
+struct DialVia<'a> {
+    target: &'a str,
+    leaf: Option<Arc<dyn Proxy>>,
+}
+
+impl<'a> DialVia<'a> {
+    fn peek(adapter: &'a dyn ProxyAdapter, metadata: &Metadata) -> Self {
+        let mut leaf = adapter.unwrap_proxy(metadata, false);
+        if let Some(mut hop) = leaf.take() {
+            for _ in 1..MAX_CHAIN_HOPS {
+                match hop.unwrap_proxy(metadata, false) {
+                    Some(next) => hop = next,
+                    None => break,
+                }
+            }
+            leaf = Some(hop);
+        }
+        Self {
+            target: adapter.name(),
+            leaf,
+        }
+    }
+}
+
+impl std::fmt::Display for DialVia<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.target)?;
+        if let Some(leaf) = &self.leaf {
+            write!(f, " → {}", leaf.name())?;
         }
         Ok(())
     }
@@ -431,6 +471,7 @@ async fn route_inbound_tcp_scoped<C>(
                 proxy.name(),
                 proxy.adapter_type()
             );
+            let via = DialVia::peek(proxy.as_ref(), &metadata);
             let started = std::time::Instant::now();
             let dial = with_dial_timeout(proxy.name(), proxy.dial_tcp(&metadata)).await;
             // All chained front hops resolved during the dial — release the
@@ -505,9 +546,10 @@ async fn route_inbound_tcp_scoped<C>(
                 }
                 Err(e) => {
                     warn!(
-                        "{} {} dial error: {}",
+                        "{} {} dial error using {}: {}",
                         metadata.conn_type,
                         metadata.remote_address(),
+                        via,
                         e
                     );
                     conn_note!(
@@ -1185,6 +1227,49 @@ mod tests {
 
     /// Route through the tunnel and register the flow the way
     /// `route_inbound_tcp` does, returning the API-visible chain.
+    /// A failed dial names the node behind the rule's group, not only the
+    /// group; a leaf target is named once.
+    #[test]
+    fn dial_error_names_the_node_a_group_dialed_through() {
+        let logs = capture_info(async {
+            let raw: meow_config::raw::RawConfig = serde_saphyr::from_str(
+                "proxies:
+  - {name: HK-01, type: socks5, server: 127.0.0.1, port: 1}
+  - {name: JP-01, type: socks5, server: 127.0.0.1, port: 1}
+proxy-groups:
+  - {name: Auto, type: fallback, proxies: [HK-01, JP-01], url: 'http://probe.test/204', interval: 300}
+  - {name: Proxy, type: select, proxies: [Auto, JP-01]}
+",
+            )
+            .unwrap();
+            let proxies = meow_config::rebuild_from_raw(&raw).unwrap().proxies;
+            let tunnel = test_tunnel();
+            tunnel.update_routing(
+                proxies.clone(),
+                vec![
+                    rule("DOMAIN,leaf.invalid,JP-01"),
+                    Box::new(meow_rules::final_rule::FinalRule::new("Proxy")),
+                ],
+                Default::default(),
+            );
+            for host in ["group.invalid", "leaf.invalid"] {
+                let meta = Metadata {
+                    host: host.into(),
+                    ..metadata()
+                };
+                route_one(&tunnel, meta).await;
+            }
+        });
+        assert!(
+            logs.contains("group.invalid:443 dial error using Proxy → HK-01: "),
+            "{logs}"
+        );
+        assert!(
+            logs.contains("leaf.invalid:443 dial error using JP-01: "),
+            "{logs}"
+        );
+    }
+
     async fn tracked_chain(tunnel: &crate::Tunnel) -> Vec<String> {
         let meta = metadata();
         let target = tunnel.inner().resolve_proxy(&meta).await.unwrap();
