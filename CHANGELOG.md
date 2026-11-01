@@ -18,7 +18,9 @@ the canonical, in-repo source a release is cut from.
   when rule matching already resolved it through the main nameservers.
   This covers UDP (QUIC included): a DIRECT UDP flow sends to the
   direct-resolved address, and one the main nameservers cannot resolve
-  falls back to `direct-nameserver` instead of being dropped. User-declared
+  falls back to `direct-nameserver` instead of being dropped; a UDP flow
+  whose name was only snooped back from its address (redir-host) keeps
+  that address, as in mihomo. User-declared
   `type: direct` proxies follow it too unless they set their own `dns:`.
   Configs without `direct-nameserver` behave as before.
 

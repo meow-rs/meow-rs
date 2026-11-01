@@ -379,6 +379,11 @@ impl TunnelInner {
             if let Some(host) = resolver.reverse_lookup(ip).filter(|h| is_valid_host(h)) {
                 conn_note!(Dns, "{ip} was resolved earlier for {host}; using that name");
                 metadata.host = host;
+                // mihomo `DNSMapping`: the name is only a label for the
+                // client-chosen address, so a DIRECT UDP dial keeps
+                // `dst_ip` rather than re-resolving it via
+                // `dns.direct-nameserver` (upstream `Metadata.Pure()`).
+                metadata.dns_mode = meow_common::DnsMode::Mapping;
                 snooped = true;
             }
         }
@@ -2743,7 +2748,13 @@ mod tests {
             );
             assert_eq!(snooped.host, "snooped.example.com", "{sniffed}");
             assert_eq!(snooped.dst_ip, Some([198, 18, 1, 220].into()), "{sniffed}");
+            assert_eq!(
+                snooped.dns_mode,
+                DnsMode::Mapping,
+                "a snooped name is tagged like upstream `DNSMapping` ({sniffed})"
+            );
         }
+        assert_eq!(real.dns_mode, DnsMode::Normal, "no snoop, no tag");
     }
 
     /// The sniff gate mirrors the rescue paths: an unmapped address in our

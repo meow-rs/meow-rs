@@ -185,8 +185,19 @@ impl DirectAdapter {
         Self::is_named(metadata) && self.direct_resolver().is_some()
     }
 
+    /// `true` when `metadata` names a host the `dns.direct-nameserver`
+    /// resolver should answer for: a real name (not an IP literal), except
+    /// a UDP flow whose name was only snooped back from the destination IP
+    /// (`DnsMode::Mapping`, redir-host). mihomo's UDP dial drops that host
+    /// (`Metadata.Pure()`) and sends to the address the client chose; TCP
+    /// keeps the host and re-resolves it, so it stays covered here.
     fn is_named(metadata: &Metadata) -> bool {
-        !metadata.host.is_empty() && meow_common::metadata_ip_literal(&metadata.host).is_none()
+        let snooped_udp = metadata.network == meow_common::Network::Udp
+            && metadata.dns_mode == meow_common::DnsMode::Mapping
+            && metadata.dst_ip.is_some();
+        !snooped_udp
+            && !metadata.host.is_empty()
+            && meow_common::metadata_ip_literal(&metadata.host).is_none()
     }
 
     async fn resolve_host_with(
@@ -912,6 +923,41 @@ mod tests {
         assert_eq!(&buf[..n], b"ping");
         assert_eq!(src, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port));
         echo_task.await.unwrap();
+    }
+
+    /// A redir-host snooped name on UDP is only a label for the address
+    /// the client chose (upstream `DNSMapping` + `Metadata.Pure()`): the
+    /// direct resolver must not re-resolve it, so the socket keeps sending
+    /// to `dst_ip`. TCP still re-resolves the name, as upstream does.
+    #[tokio::test]
+    async fn snooped_udp_name_keeps_client_destination() {
+        let main_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let direct_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2));
+        let mut main = hosts_only_resolver("node.test", main_ip);
+        main.set_direct_resolver(Arc::new(hosts_only_resolver("node.test", direct_ip)));
+        let adapter = DirectAdapter::new().with_resolver(Arc::new(main));
+
+        let snooped = |network| Metadata {
+            network,
+            host: "node.test".into(),
+            dst_ip: Some(main_ip),
+            dst_port: 443,
+            dns_mode: DnsMode::Mapping,
+            ..Default::default()
+        };
+        let udp = snooped(meow_common::Network::Udp);
+        assert!(!adapter.direct_resolver_applies(&udp));
+        assert_eq!(
+            adapter.resolve_targets(&udp).await.unwrap(),
+            vec![SocketAddr::new(main_ip, 443)]
+        );
+        assert_eq!(
+            adapter
+                .resolve_targets(&snooped(meow_common::Network::Tcp))
+                .await
+                .unwrap(),
+            vec![SocketAddr::new(direct_ip, 443)]
+        );
     }
 
     /// A user-declared direct proxy shares the tunnel slot for
