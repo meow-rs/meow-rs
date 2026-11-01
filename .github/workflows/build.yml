@@ -137,7 +137,7 @@ jobs:
             toolchain_script: scripts/build-armv7-musl.sh
             # qemu-user binary used to smoke-run the produced binary on the
             # runner (see the QEMU step below); empty = no smoke.
-            qemu: qemu-arm-static
+            qemu: qemu-arm
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             desktop: true
@@ -274,7 +274,9 @@ jobs:
 
       # Runs the produced binary — the `file` assert proves linkage, not
       # that it executes. Legs opt in via `qemu:` (the qemu-user binary
-      # name from qemu-user-static): -v exercises exec + init, -t exercises
+      # name from the qemu-user package; Ubuntu 26.04 dropped
+      # qemu-user-static, and a dynamic qemu runs a static guest fine):
+      # -v exercises exec + init, -t exercises
       # the offline config path (main.rs sets offline_validate; no
       # network). QEMU user-mode is a proxy for real hardware, not proof —
       # if it ever false-fails a good binary, demote this step with
@@ -289,7 +291,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends qemu-user-static
+          sudo apt-get install -y --no-install-recommends qemu-user
           bin="target/${{ matrix.target }}/release/meow"
           "${{ matrix.qemu }}" "$bin" -v
           "${{ matrix.qemu }}" "$bin" -t -d "$(mktemp -d)" -f "$PWD/config.example.yaml"
