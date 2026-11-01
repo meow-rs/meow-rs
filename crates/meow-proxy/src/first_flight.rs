@@ -1,5 +1,20 @@
-//! Recover once after EOF/reset, before any decrypted reply, for a fresh ClientHello.
-//! No HTTP payload, TLS application record, or established TLS session is replayed.
+//! One-shot redial for Shadowsocks over simple-obfs HTTP (`FirstFlight`).
+//!
+//! Wraps a freshly dialed SS-over-obfs-http connection and records what the
+//! client writes while — and only while — it is a prefix of a single TLS
+//! ClientHello record. If the server then ends the connection (EOF,
+//! `UnexpectedEof` or `ConnectionReset`) before a single reply byte has
+//! been read, and the recorded bytes are exactly one complete ClientHello
+//! that [`classify`] judges fresh (no legacy session id, no PSK /
+//! early_data / session-ticket / ECH extension, a known non-PSK suite),
+//! the conn redials once and replays that ClientHello on the new
+//! connection.
+//!
+//! Replay is safe because such a ClientHello carries no application data:
+//! a duplicate only starts a second handshake. Anything else (plaintext,
+//! a second record, a byte past the ClientHello, any reply byte) disables
+//! recovery for good and frees the recording. At most one retry, bounded
+//! by a recovery budget covering dial, replay and the first reply byte.
 use meow_common::ProxyConn;
 use std::{
     future::Future,
@@ -157,7 +172,6 @@ pub(crate) fn classify(b: &[u8]) -> Flight {
 pub(crate) struct FirstFlight {
     inner: Option<Conn>,
     redial: Redial,
-    flow: u64,
     flight: Vec<u8>,
     disabled: bool,
     retried: bool,
@@ -168,11 +182,10 @@ pub(crate) struct FirstFlight {
     write_waker: Option<Waker>,
 }
 impl FirstFlight {
-    pub(crate) fn new(inner: Conn, redial: Redial, flow: u64) -> Self {
+    pub(crate) fn new(inner: Conn, redial: Redial) -> Self {
         Self {
             inner: Some(inner),
             redial,
-            flow,
             flight: Vec::new(),
             disabled: false,
             retried: false,
@@ -199,7 +212,10 @@ impl FirstFlight {
     }
     fn disable(&mut self) {
         self.disabled = true;
-        self.flight.clear();
+        // Release the allocation, not just the length: a disabled flight is
+        // never recorded again, and the relay keeps this conn for the
+        // lifetime of the connection (up to `CAP` bytes each).
+        self.flight = Vec::new();
         self.recovery_timer = None;
     }
     fn wake_waiters(&mut self) {
@@ -221,11 +237,10 @@ impl FirstFlight {
         // read event starts this budget, including dial, replay and first reply.
         let deadline = tokio::time::Instant::now() + self.recovery_timeout;
         drop(self.inner.take());
-        tracing::info!(
-            flow = self.flow,
+        tracing::debug!(
             reason,
             bytes = flight.len(),
-            "socket-trace event=tls-first-flight-retry fresh_cipher=true maximum_retries=1"
+            "ss obfs-http: redialing once to replay a fresh TLS ClientHello"
         );
         *self.pending.get_mut().unwrap() = Some(Box::pin(async move {
             let attempt = async move {
@@ -409,11 +424,7 @@ mod tests {
             calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move { Ok(Box::new(TcpStream::connect(addr).await?) as Conn) })
         });
-        (
-            FirstFlight::new(Box::new(initial), redial, 0),
-            listener,
-            count,
-        )
+        (FirstFlight::new(Box::new(initial), redial), listener, count)
     }
     #[derive(Clone, Copy)]
     enum ExtraWrite {
@@ -504,7 +515,7 @@ mod tests {
             })
         });
         let (inner, _) = mock_conn(ExtraWrite::Pending, usize::MAX);
-        let mut conn = FirstFlight::new(inner, redial, 0);
+        let mut conn = FirstFlight::new(inner, redial);
         conn.write_all(&hello()).await.unwrap();
         (conn, release)
     }
@@ -518,7 +529,7 @@ mod tests {
                 Box::pin(async { Err(io::Error::other("unexpected redial")) })
             });
             let (inner, extra_calls) = mock_conn(extra_write, usize::MAX);
-            let mut conn = FirstFlight::new(inner, redial, 0);
+            let mut conn = FirstFlight::new(inner, redial);
             conn.write_all(&hello()).await.unwrap();
             let waker = Waker::from(Arc::new(CountWake::default()));
             let mut cx = Context::from_waker(&waker);
@@ -544,7 +555,7 @@ mod tests {
             Box::pin(async { Err(io::Error::other("unexpected redial")) })
         });
         let (inner, _) = mock_conn(ExtraWrite::Pending, usize::MAX);
-        let mut conn = FirstFlight::new(inner, redial, 0);
+        let mut conn = FirstFlight::new(inner, redial);
         let mut wire = hello();
         wire.extend([23, 3, 3, 0, 1, 0]);
         assert_eq!(conn.write(&wire).await.unwrap(), hello().len());
@@ -553,11 +564,33 @@ mod tests {
         assert_eq!(conn.read(&mut [0; 1]).await.unwrap(), 0);
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
+    /// Once the first reply byte commits the session the recorded flight is
+    /// dead weight for the rest of the connection: its allocation must go,
+    /// not just its length.
+    #[tokio::test]
+    async fn committed_session_releases_the_recorded_flight() {
+        let (mut conn, listener, calls) = setup().await;
+        let h = hello();
+        let size = h.len();
+        let server = tokio::spawn(async move {
+            let (mut peer, _) = listener.accept().await.unwrap();
+            peer.read_exact(&mut vec![0; size]).await.unwrap();
+            peer.write_all(b"S").await.unwrap();
+            peer
+        });
+        conn.write_all(&h).await.unwrap();
+        assert!(conn.flight.capacity() >= size);
+        assert_eq!(conn.read(&mut [0; 1]).await.unwrap(), 1);
+        assert!(conn.disabled);
+        assert_eq!(conn.flight.capacity(), 0, "flight buffer still held");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        drop(server.await.unwrap());
+    }
     #[tokio::test]
     async fn partial_hello_writes_and_empty_writes_keep_recovery_eligible() {
         let (inner, extra_calls) = mock_conn(ExtraWrite::Pending, 7);
         let redial: Redial = Arc::new(|| Box::pin(async { Err(io::Error::other("unused")) }));
-        let mut conn = FirstFlight::new(inner, redial, 0);
+        let mut conn = FirstFlight::new(inner, redial);
         conn.write_all(&hello()).await.unwrap();
         assert_eq!(conn.write(&[]).await.unwrap(), 0);
         assert!(!conn.disabled);
@@ -852,7 +885,7 @@ mod tests {
                 extra_calls: Arc::new(AtomicUsize::new(0)),
                 read_error: Some(kind),
             };
-            let mut conn = FirstFlight::new(Box::new(inner), redial, 0);
+            let mut conn = FirstFlight::new(Box::new(inner), redial);
             conn.write_all(&hello()).await.unwrap();
             assert_eq!(conn.read(&mut [0; 1]).await.unwrap_err().kind(), kind);
             assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -874,7 +907,7 @@ mod tests {
                 extra_calls: Arc::new(AtomicUsize::new(0)),
                 read_error: Some(kind),
             };
-            let mut conn = FirstFlight::new(Box::new(inner), redial, 0);
+            let mut conn = FirstFlight::new(Box::new(inner), redial);
             conn.write_all(&hello()).await.unwrap();
             assert!(conn.read(&mut [0; 1]).await.is_err());
             assert!(conn.read(&mut [0; 1]).await.is_err());
