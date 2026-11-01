@@ -253,6 +253,13 @@ jobs:
           # this scope compiles them with every TrustTunnel transport on.
           cargo nextest run -p meow-config --features trusttunnel-h3 --lib --retries 2 --no-fail-fast
 
+      # The QUIC DNS transports live behind meow-dns's `quic-dns` feature
+      # (meow-app's `dns-quic` forwards it, and `full` carries that), so no
+      # default-features invocation compiles them. The peer is an in-process
+      # quiche server, so this needs no network.
+      - name: DNS over QUIC / DoH3 (in-process QUIC peer)
+        run: cargo nextest run -p meow-dns --features quic-dns --test quic_dns_integration --retries 2 --no-fail-fast
+
       # One workspace-scoped invocation for every default-features test
       # target. A single invocation keeps a single feature-resolution scope,
       # so default targets share artifacts within this invocation instead
@@ -260,12 +267,6 @@ jobs:
       # TrustTunnel checks deliberately use separate feature scopes.
       # `cargo test -p meow-dns --lib` was folded in: `--lib` already
       # runs every crate's lib tests, meow-dns included.
-      # The QUIC DNS transports are behind `dns-quic` (in `full`), so no
-      # default-features invocation above compiles them. The peer is an
-      # in-process quiche server, so this needs no network.
-      - name: DNS over QUIC / DoH3 (in-process QUIC peer)
-        run: cargo nextest run -p meow-dns --features quic-dns --test quic_dns_integration --retries 2 --no-fail-fast
-
       - name: Unit + integration tests (default features)
         env:
           # Points restls_e2e's upstream-interop leg at the Go harness

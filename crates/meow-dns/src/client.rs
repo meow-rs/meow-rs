@@ -976,9 +976,21 @@ impl DnsClient {
         if let Some(quic) = self.quic.as_ref() {
             quic.mark_stale();
         }
+        // A DoH3 client's own pools are unused — the fallback's DoH TLS
+        // sessions are what carries a parked h3 entry, so a reset must reach
+        // them too (network change, proxy switch, `Resolver::reset_connections`).
+        #[cfg(feature = "quic-dns")]
+        let quic_fallback_reset = self.doh_h1.as_ref().map_or(0, |h1| h1.reset_connections());
         #[cfg(feature = "encrypted")]
         {
-            self.tcp_pool.reset() + self.tls_pool.reset()
+            #[cfg(feature = "quic-dns")]
+            {
+                self.tcp_pool.reset() + self.tls_pool.reset() + quic_fallback_reset
+            }
+            #[cfg(not(feature = "quic-dns"))]
+            {
+                self.tcp_pool.reset() + self.tls_pool.reset()
+            }
         }
         #[cfg(not(feature = "encrypted"))]
         {
@@ -1699,7 +1711,14 @@ impl DnsClient {
                 error = %failure,
                 "DoH3 exchange failed; retrying over HTTP/1.1"
             );
-            upstream.park_h3(true);
+            // Park only for connectivity/handshake verdicts. A per-query
+            // protocol answer on a healthy HTTP/3 connection (non-200 status,
+            // empty body, peer reset) is not evidence that the server lacks
+            // HTTP/3, and parking would send the next ten minutes of queries
+            // over HTTP/1.1 for no reason.
+            if matches!(failure, ClientError::Io(_) | ClientError::Timeout(_)) {
+                upstream.park_h3(true);
+            }
             // Boxed: `exchange` recursing through this helper would otherwise
             // make the async fn infinitely sized. The fallback client is a
             // plain DoH client, so the recursion is one level deep.
@@ -2457,7 +2476,7 @@ async fn tls_conn_alive(stream: &mut TlsConn) -> bool {
 /// headers; a well-formed DoH answer always fits while an oversized response
 /// is rejected.
 #[cfg(feature = "encrypted")]
-const MAX_DOH_RESPONSE_BYTES: usize = 65535 + 16 * 1024;
+pub(crate) const MAX_DOH_RESPONSE_BYTES: usize = 65535 + 16 * 1024;
 
 /// Read a stream to EOF, rejecting responses whose total size exceeds
 /// [`MAX_DOH_RESPONSE_BYTES`]. This is the close-delimited body arm of

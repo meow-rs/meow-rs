@@ -86,6 +86,9 @@ dns:
   global flag, and `?h3=false` turns the entry back off.
 - **`?proxy=`.** A proxied DoQ/DoH3 upstream dials the adapter's UDP association; an
   adapter that cannot carry UDP fails the exchange instead of leaking around the chain.
+  The `server` must be an **IP literal** in that case: a proxied hostname is resolved by
+  the adapter, so the QUIC peer address is unknown until after the handshake — the config
+  is refused at load rather than hanging every query.
 - **Builds.** The transports live behind the `dns-quic` Cargo feature (in the `full`
   bundle, out of `minimal` for binary size). A config that asks for `quic://`, `?h3=` or
   `prefer-h3` on a build without it is a load error naming the feature — never a silent

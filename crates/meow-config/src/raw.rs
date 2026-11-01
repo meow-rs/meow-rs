@@ -505,7 +505,8 @@ pub struct RawDns {
     /// `?h3=true` overrides it (HTTP/3 only), `?h3=false` turns it off, and
     /// `?h3=prefer` opts a single entry in without the global flag.
     ///
-    /// Requires a build with the `quic-dns` feature; without it, a config
+    /// Requires a build with the `dns-quic` feature (meow-config forwards it
+    /// to `meow-dns/quic-dns`); without it, a config
     /// that asks for HTTP/3 is a hard load error rather than a silent
     /// downgrade (ADR-0002 Class A).
     pub prefer_h3: Option<bool>,

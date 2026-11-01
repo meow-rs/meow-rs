@@ -1,4 +1,8 @@
-#![cfg(feature = "quic-dns")]
+// `DnsClient::with_tls_additional_roots` — the hook that trusts the peer's
+// self-signed chain without disabling verification — exists only when
+// `debug_assertions` is on (the library is not built with `cfg(test)` here),
+// which is also how the sibling `proxy_routed_dns` suite gates its TLS tests.
+#![cfg(all(feature = "quic-dns", debug_assertions))]
 
 //! DNS over QUIC and DoH-over-HTTP/3 against a real in-process QUIC server.
 //!
@@ -58,6 +62,10 @@ struct Endpoint {
     cert: Vec<u8>,
     observed: Arc<Mutex<Observed>>,
     connections: Arc<AtomicUsize>,
+    /// UDP datagrams that reached this port. The `prefer-h3` fallback test
+    /// binds a silent UDP socket so "did the second query try QUIC again?"
+    /// becomes observable instead of inferred.
+    datagrams: Arc<AtomicUsize>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -78,6 +86,10 @@ impl Endpoint {
 
     fn connections(&self) -> usize {
         self.connections.load(Ordering::SeqCst)
+    }
+
+    fn datagrams(&self) -> usize {
+        self.datagrams.load(Ordering::SeqCst)
     }
 }
 
@@ -104,10 +116,8 @@ fn answer(query: &[u8], id: u16) -> Vec<u8> {
     response.to_bytes().unwrap()
 }
 
-/// Start a QUIC endpoint. `h1` additionally serves DoH over HTTP/1.1 on the
-/// same port over TCP (for the `prefer-h3` fallback); `proto` selects the
-/// QUIC ALPN, and `alpn` may override it to model a server without HTTP/3.
-async fn spawn(proto: Proto, h1: bool) -> Endpoint {
+/// Start a QUIC endpoint. `proto` selects the ALPN (`doq` or `h3`).
+async fn spawn(proto: Proto) -> Endpoint {
     let (cert, key) = identity();
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let addr = socket.local_addr().unwrap();
@@ -121,14 +131,12 @@ async fn spawn(proto: Proto, h1: bool) -> Endpoint {
         Arc::clone(&observed),
         Arc::clone(&connections),
     ));
-    if h1 {
-        tokio::spawn(serve_h1(addr, Arc::clone(&observed)));
-    }
     Endpoint {
         addr,
         cert,
         observed,
         connections,
+        datagrams: Arc::new(AtomicUsize::new(0)),
         task,
     }
 }
@@ -146,11 +154,26 @@ async fn spawn_h1_only() -> Endpoint {
         Arc::clone(&observed),
         (cert.clone(), key),
     ));
+    // A silent UDP socket on the same port: any QUIC attempt shows up here as
+    // a datagram and is never answered (so the attempt fails at its budget).
+    let datagrams = Arc::new(AtomicUsize::new(0));
+    if let Ok(udp) = UdpSocket::bind(addr).await {
+        let datagrams = Arc::clone(&datagrams);
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 65_535];
+            while let Ok((n, _)) = udp.recv_from(&mut buf).await {
+                if n > 0 {
+                    datagrams.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        });
+    }
     Endpoint {
         addr,
         cert,
         observed,
         connections,
+        datagrams,
         task: tokio::spawn(std::future::pending()),
     }
 }
@@ -352,11 +375,6 @@ fn header(list: &[h3::Header], name: &[u8]) -> String {
         .unwrap_or_default()
 }
 
-async fn serve_h1(addr: SocketAddr, observed: Arc<Mutex<Observed>>) {
-    let listener = TcpListener::bind(addr).await.expect("h1 bind");
-    serve_h1_listener(listener, observed, identity()).await;
-}
-
 /// Minimal DoH-over-HTTP/1.1 responder: one TLS POST per connection.
 async fn serve_h1_listener(
     listener: TcpListener,
@@ -413,15 +431,14 @@ async fn serve_h1_listener(
                 if filled < header_len + content_length {
                     continue;
                 }
-                let body = &buf[header_len..header_len + content_length];
-                if filled > 2 {
-                    observed
-                        .lock()
-                        .unwrap()
-                        .ids
-                        .push(u16::from_be_bytes([body[0], body[1]]));
+                if content_length < 2 {
+                    // Not a DNS message; nothing to answer.
+                    return;
                 }
-                let response = answer(body, u16::from_be_bytes([body[0], body[1]]));
+                let body = &buf[header_len..header_len + content_length];
+                let request_id = u16::from_be_bytes([body[0], body[1]]);
+                observed.lock().unwrap().ids.push(request_id);
+                let response = answer(body, request_id);
                 let head = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\n\
                      Content-Length: {}\r\nConnection: close\r\n\r\n",
@@ -453,7 +470,7 @@ fn client_addr(endpoint: &Endpoint) -> SocketAddr {
 /// reused by the second query.
 #[tokio::test]
 async fn doq_queries_round_trip_and_reuse_one_connection() {
-    let endpoint = spawn(Proto::Doq, false).await;
+    let endpoint = spawn(Proto::Doq).await;
     let client = DnsClient::doq(client_addr(&endpoint), "localhost")
         .with_timeout(Duration::from_secs(5))
         .with_tls_additional_roots(endpoint.cert.clone());
@@ -487,7 +504,7 @@ async fn doq_queries_round_trip_and_reuse_one_connection() {
 /// client returns carries the ID it asked with, or validation would fail.
 #[tokio::test]
 async fn doq_restores_the_caller_transaction_id() {
-    let endpoint = spawn(Proto::Doq, false).await;
+    let endpoint = spawn(Proto::Doq).await;
     let client = DnsClient::doq(client_addr(&endpoint), "localhost")
         .with_timeout(Duration::from_secs(5))
         .with_tls_additional_roots(endpoint.cert.clone());
@@ -502,7 +519,7 @@ async fn doq_restores_the_caller_transaction_id() {
 /// fresh one instead of failing.
 #[tokio::test]
 async fn doq_redials_after_reset_connections() {
-    let endpoint = spawn(Proto::Doq, false).await;
+    let endpoint = spawn(Proto::Doq).await;
     let client = DnsClient::doq(client_addr(&endpoint), "localhost")
         .with_timeout(Duration::from_secs(5))
         .with_tls_additional_roots(endpoint.cert.clone());
@@ -521,7 +538,7 @@ async fn doq_redials_after_reset_connections() {
 /// collapsed into an empty answer.
 #[tokio::test]
 async fn doq_relays_negative_rcodes() {
-    let endpoint = spawn(Proto::Doq, false).await;
+    let endpoint = spawn(Proto::Doq).await;
     let client = DnsClient::doq(client_addr(&endpoint), "localhost")
         .with_timeout(Duration::from_secs(5))
         .with_tls_additional_roots(endpoint.cert.clone());
@@ -534,7 +551,7 @@ async fn doq_relays_negative_rcodes() {
 /// retries or hides.
 #[tokio::test]
 async fn doq_rejects_an_untrusted_certificate() {
-    let endpoint = spawn(Proto::Doq, false).await;
+    let endpoint = spawn(Proto::Doq).await;
     let client =
         DnsClient::doq(client_addr(&endpoint), "localhost").with_timeout(Duration::from_secs(5));
     let err = client.query("a.test", RecordType::A).await.unwrap_err();
@@ -547,7 +564,7 @@ async fn doq_rejects_an_untrusted_certificate() {
 /// DoH3: a real HTTP/3 POST with the RFC 8484 media type both ways.
 #[tokio::test]
 async fn doh3_posts_dns_messages_over_http3() {
-    let endpoint = spawn(Proto::H3, false).await;
+    let endpoint = spawn(Proto::H3).await;
     let client = DnsClient::doh3(client_addr(&endpoint), "localhost", "/dns-query")
         .with_timeout(Duration::from_secs(5))
         .with_tls_additional_roots(endpoint.cert.clone());
@@ -577,11 +594,20 @@ async fn doh3_falls_back_to_http1_and_parks_h3() {
 
     let first = client.query("a.test", RecordType::A).await.unwrap();
     assert_eq!(first.answers.len(), 1);
+    let attempts = endpoint.datagrams();
+    assert!(attempts > 0, "the first query must try QUIC once");
 
     let second = client.query("b.test", RecordType::A).await.unwrap();
     assert_eq!(second.answers.len(), 1);
     // Both answers came from the HTTP/1.1 fallback (the only listener).
     assert_eq!(endpoint.ids().len(), 2);
+    // …and the failed handshake is parked: the second query goes straight to
+    // HTTP/1.1 instead of paying another QUIC attempt.
+    assert_eq!(
+        endpoint.datagrams(),
+        attempts,
+        "HTTP/3 must stay parked after a failed handshake"
+    );
 }
 
 /// `?h3=true` / mihomo's per-entry form means HTTP/3 only: no HTTP/1.1
@@ -593,8 +619,9 @@ async fn doh3_force_reports_the_quic_failure() {
         .with_timeout(Duration::from_secs(2))
         .with_tls_additional_roots(endpoint.cert.clone());
     let err = client.query("a.test", RecordType::A).await.unwrap_err();
+    // HTTP/3 only: no fallback, so the QUIC failure is the answer.
     assert!(
-        !matches!(err, ClientError::Protocol("empty DoH3 response body")),
+        matches!(err, ClientError::Io(_) | ClientError::Timeout(_)),
         "force must report the transport failure, got {err:?}"
     );
     assert!(endpoint.ids().is_empty(), "h1 must not be touched");
@@ -613,13 +640,6 @@ async fn doh3_fallback_answers_a_wire_name() {
     let name = Name::from_ascii("c.test.").unwrap();
     let response = client.query_name(&name, RecordType::A).await.unwrap();
     assert_eq!(response.queries[0].name().to_string(), "c.test.");
-}
-
-/// `io` is used by the helper signatures above; keep the import meaningful
-/// for the fallback assertions.
-#[allow(dead_code)]
-fn _assert_io_error_type(e: io::Error) -> io::Error {
-    e
 }
 
 /// A proxy adapter that carries datagrams itself: what `?proxy=` gives a QUIC
@@ -713,7 +733,7 @@ impl ProxyPacketConn for RelayPacketConn {
 /// association (recorded here), not a direct socket.
 #[tokio::test]
 async fn doq_routes_through_a_proxy_datagram() {
-    let endpoint = spawn(Proto::Doq, false).await;
+    let endpoint = spawn(Proto::Doq).await;
     let dialed = Arc::new(Mutex::new(Vec::<Metadata>::new()));
     let proxy: Arc<dyn Proxy> = Arc::new(UdpRelayProxy {
         dialed: Arc::clone(&dialed),

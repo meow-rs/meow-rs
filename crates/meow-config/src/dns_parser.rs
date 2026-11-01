@@ -91,6 +91,16 @@ pub async fn parse_dns(
         prefer_h3,
     ))?;
 
+    // The same `prefer-h3` rewrite for `nameserver-policy` values, which are
+    // URL strings until the policy builder parses them. Computed *before* the
+    // capability guard below: a policy-only config (`prefer-h3` with every DoH
+    // upstream under `nameserver-policy`) is exactly the case the raw strings
+    // would miss.
+    let effective_policy = dns
+        .nameserver_policy
+        .as_ref()
+        .map(|map| prefer_h3_policy_map(map, prefer_h3));
+
     // A `prefer-h3` / `?h3=` entry needs a build that can speak QUIC. Reject
     // the config here — client construction would otherwise panic, which is a
     // process abort rather than a config error (ADR-0002 Class A).
@@ -100,11 +110,16 @@ pub async fn parse_dns(
                 |e| matches!(&e.url, meow_dns::NameServerUrl::Https { h3, .. } if h3.is_enabled()),
             )
         };
-        let policy_asks_h3 = dns.nameserver_policy.as_ref().is_some_and(|map| {
+        // Parse the effective values instead of matching substrings: the
+        // parser trims the `h3` value, so a hand-written list drifts (and a
+        // miss here reaches the panic in `build_single_resolver_with_proxy`).
+        let policy_asks_h3 = effective_policy.as_ref().is_some_and(|map| {
             map.values().any(|v| {
-                v.as_urls()
-                    .iter()
-                    .any(|s| s.contains("h3=true") || s.contains("h3=prefer"))
+                v.as_urls().iter().any(|s| {
+                    NameServerEntry::parse(s).is_ok_and(|e| {
+                        matches!(&e.url, meow_dns::NameServerUrl::Https { h3, .. } if h3.is_enabled())
+                    })
+                })
             })
         });
         if asks_h3(&main_urls)
@@ -121,12 +136,27 @@ pub async fn parse_dns(
         }
     }
 
-    // The same `prefer-h3` rewrite for `nameserver-policy` values, which are
-    // URL strings until the policy builder parses them.
-    let effective_policy = dns
-        .nameserver_policy
-        .as_ref()
-        .map(|map| prefer_h3_policy_map(map, prefer_h3));
+    // QUIC needs the peer address before the handshake, so a proxied QUIC
+    // upstream cannot be resolved remotely by the adapter — refuse it at load
+    // rather than hanging every query on an unanswerable handshake.
+    for entry in main_urls
+        .iter()
+        .chain(fallback_urls.iter())
+        .chain(default_ns_urls.iter())
+        .chain(proxy_ns_urls.iter())
+        .chain(direct_ns_urls.iter())
+    {
+        reject_proxied_quic_hostname(entry)?;
+    }
+    if let Some(map) = &effective_policy {
+        for value in map.values() {
+            for url in value.as_urls() {
+                if let Ok(entry) = NameServerEntry::parse(url) {
+                    reject_proxied_quic_hostname(&entry)?;
+                }
+            }
+        }
+    }
 
     let mode = match dns.enhanced_mode.as_deref() {
         Some("fake-ip") => DnsMode::FakeIp,
@@ -490,6 +520,33 @@ fn is_ip_literal_addr(addr: &str) -> bool {
     host.parse::<IpAddr>().is_ok()
 }
 
+/// Refuse a `?proxy=`-tagged QUIC entry whose server is a hostname.
+///
+/// A proxied hostname upstream is resolved by the adapter, so the QUIC peer
+/// address is unknown until after the handshake — but quiche must know it
+/// before, and drops packets from a path it did not dial. The failure mode is
+/// a hung query, so the config is refused instead.
+fn reject_proxied_quic_hostname(entry: &NameServerEntry) -> Result<(), anyhow::Error> {
+    if entry.proxy.is_none() || entry.url.needs_bootstrap().is_none() {
+        return Ok(());
+    }
+    let quic = match &entry.url {
+        meow_dns::NameServerUrl::Quic { .. } => true,
+        meow_dns::NameServerUrl::Https { h3, .. } => h3.is_enabled(),
+        _ => false,
+    };
+    if !quic {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "nameserver '{}': a QUIC upstream (quic:// or ?h3=) dialed through a proxy needs \
+         an IP-literal server address — the QUIC peer must be known before the handshake, \
+         and a proxied hostname is resolved by the adapter. Use the IP, or drop the proxy \
+         tag",
+        entry.url
+    )
+}
+
 /// Append `?h3=prefer` to one nameserver URL when `prefer_h3` is on.
 ///
 /// Only `https://` entries are touched, and only when the entry does not
@@ -512,7 +569,7 @@ fn prefer_h3_url(raw: &str, prefer_h3: bool) -> String {
     };
     // Extend an existing parameter section, or open one.
     let separator = match head.rfind('?') {
-        Some(idx) if head[idx + 1..].split('&').any(is_h3_parameter_segment) => '&',
+        Some(idx) if head[idx + 1..].split('&').any(is_param_key_segment) => '&',
         _ => '?',
     };
     format!("{head}{separator}h3=prefer{fragment}")
@@ -528,7 +585,7 @@ fn has_h3_parameter(url: &str) -> bool {
 }
 
 /// A `k=v` segment names a nameserver parameter key (`proxy` / `h3`).
-fn is_h3_parameter_segment(kv: &str) -> bool {
+fn is_param_key_segment(kv: &str) -> bool {
     kv.split_once('=').is_some_and(|(k, _)| {
         let k = k.trim();
         k.eq_ignore_ascii_case("proxy") || k.eq_ignore_ascii_case("h3")
@@ -1486,6 +1543,13 @@ mod tests {
                 "https://1.1.1.1/dns-query?h3=true",
                 "https://1.1.1.1/dns-query?h3=true",
             ),
+            // A DoH path with its own query string: another `?` would be a
+            // second parameter section, so the policy joins with `&`… the
+            // parse below keeps one section and the path intact.
+            (
+                "https://1.1.1.1/dns-query?x=1",
+                "https://1.1.1.1/dns-query?x=1?h3=prefer",
+            ),
             // Everything that is not DoH is left alone.
             ("tls://8.8.8.8#dns.google", "tls://8.8.8.8#dns.google"),
             ("quic://dns.adguard.com", "quic://dns.adguard.com"),
@@ -1507,6 +1571,20 @@ mod tests {
             meow_dns::NameServerUrl::Https { h3, sni, .. } => {
                 assert_eq!(h3, meow_dns::H3Policy::Prefer);
                 assert_eq!(sni, "cloudflare-dns.com");
+            }
+            other => panic!("expected Https, got {other:?}"),
+        }
+    }
+
+    /// A DoH URL whose path carries a query string survives the rewrite: the
+    /// path stays intact and the policy lands on the entry.
+    #[test]
+    fn prefer_h3_rewrite_keeps_a_query_path() {
+        let rewritten = prefer_h3_url("https://1.1.1.1/dns-query?x=1", true);
+        match meow_dns::NameServerEntry::parse(&rewritten).unwrap().url {
+            meow_dns::NameServerUrl::Https { path, h3, .. } => {
+                assert_eq!(path, "/dns-query?x=1");
+                assert_eq!(h3, meow_dns::H3Policy::Prefer);
             }
             other => panic!("expected Https, got {other:?}"),
         }

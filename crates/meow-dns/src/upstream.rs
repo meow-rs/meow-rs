@@ -107,10 +107,15 @@ impl fmt::Display for NameServerUrl {
             } => {
                 let param = match h3 {
                     H3Policy::Off => "",
-                    H3Policy::Prefer => "?h3=prefer",
-                    H3Policy::Force => "?h3=true",
+                    H3Policy::Prefer => "h3=prefer",
+                    H3Policy::Force => "h3=true",
                 };
-                write!(f, "https://{addr}:{port}{path}{param}#{sni}")
+                if param.is_empty() {
+                    write!(f, "https://{addr}:{port}{path}#{sni}")
+                } else {
+                    let separator = h3_parameter_separator(path);
+                    write!(f, "https://{addr}:{port}{path}{separator}{param}#{sni}")
+                }
             }
             NameServerUrl::Quic { addr, port, sni } => write!(f, "quic://{addr}:{port}#{sni}"),
             NameServerUrl::RCode { label, .. } => write!(f, "rcode://{label}"),
@@ -570,6 +575,21 @@ impl NameServerUrl {
     #[cfg(not(feature = "quic-dns"))]
     fn parse_quic(_rest: &str, _fragment: Option<&str>) -> Result<Self, NameServerParseError> {
         Err(NameServerParseError::QuicNotSupported)
+    }
+}
+
+/// Which separator appends an `h3=` parameter to `path` without changing what
+/// the path means.
+///
+/// The parser reads the entry's **last** `?` section as the parameter section,
+/// and only when one of its segments is a known key. So a DoH path that
+/// already carries a query string (`/dns-query?x=1`) needs a *new* `?`
+/// section — `&` would fold `x=1` into the parameter list, where it is an
+/// unknown key and a hard parse error.
+pub(crate) fn h3_parameter_separator(path: &str) -> &'static str {
+    match path.rsplit_once('?').map(|(_, tail)| tail) {
+        Some(tail) if tail.split('&').any(is_param_key_segment) => "&",
+        _ => "?",
     }
 }
 
@@ -1175,11 +1195,22 @@ mod tests {
                 "https://1.1.1.1/dns-query",
                 "https://1.1.1.1:443/dns-query#1.1.1.1",
             ),
+            // A DoH path that carries its own query string needs a *new* `?`
+            // section — the parser reads the last `?` tail as the parameter
+            // section, and `&` would fold `x=1` into it as an unknown key.
+            (
+                "https://1.1.1.1/dns-query?x=1?h3=prefer",
+                "https://1.1.1.1:443/dns-query?x=1?h3=prefer#1.1.1.1",
+            ),
         ] {
+            let url = NameServerEntry::parse(raw).unwrap().url;
+            assert_eq!(url.to_string(), shown, "{raw}");
+            // Display is what warning messages and the API report, so it must
+            // re-parse to the same entry.
             assert_eq!(
-                NameServerEntry::parse(raw).unwrap().url.to_string(),
-                shown,
-                "{raw}"
+                NameServerEntry::parse(&url.to_string()).unwrap().url,
+                url,
+                "Display must round-trip: {raw}"
             );
         }
     }

@@ -709,8 +709,14 @@ fn encrypted_upstream_label(url: &NameServerUrl) -> Option<String> {
             let mut label = format!("https://{}{}", authority_label(addr, *port, 443), path);
             match h3 {
                 H3Policy::Off => {}
-                H3Policy::Prefer => label.push_str("?h3=prefer"),
-                H3Policy::Force => label.push_str("?h3=true"),
+                H3Policy::Prefer => {
+                    label.push_str(crate::upstream::h3_parameter_separator(path));
+                    label.push_str("h3=prefer");
+                }
+                H3Policy::Force => {
+                    label.push_str(crate::upstream::h3_parameter_separator(path));
+                    label.push_str("h3=true");
+                }
             }
             if sni != &addr.to_string() {
                 label.push('#');

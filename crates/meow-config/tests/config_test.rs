@@ -1248,6 +1248,58 @@ dns:
     }
 }
 
+/// The capability gate must read the *post-rewrite* policy map: with
+/// `prefer-h3` and DoH upstreams only under `nameserver-policy`, inspecting
+/// the raw strings misses the rewrite and a panic reaches client
+/// construction on a build without `dns-quic`.
+#[tokio::test]
+async fn test_dns_prefer_h3_policy_only_is_gated() {
+    let yaml = r#"
+dns:
+  enable: true
+  prefer-h3: true
+  default-nameserver: [223.5.5.5]
+  nameserver: [8.8.8.8]
+  nameserver-policy:
+    "geosite:cn":
+      - https://1.1.1.1/dns-query
+"#;
+    match load_config_from_str(yaml).await {
+        Ok(_) if cfg!(feature = "dns-quic") => {}
+        Ok(_) => panic!("a policy-only prefer-h3 config must be refused without the feature"),
+        Err(err) if cfg!(feature = "dns-quic") => panic!("{err}"),
+        Err(err) => {
+            let err = err.to_string();
+            assert!(
+                err.contains("dns-quic"),
+                "the error must name the missing feature: {err}"
+            );
+        }
+    }
+}
+
+/// A `?proxy=`-tagged QUIC upstream whose server is a hostname cannot work —
+/// QUIC must know the peer before the handshake, and a proxied hostname is
+/// resolved by the adapter. Refused at load rather than hanging.
+#[tokio::test]
+#[cfg(feature = "dns-quic")]
+async fn test_dns_proxied_quic_hostname_is_refused() {
+    let yaml = r#"
+dns:
+  enable: true
+  default-nameserver: [223.5.5.5]
+  nameserver:
+    - quic://dns.adguard.com?proxy=DIRECT
+"#;
+    match load_config_from_str(yaml).await {
+        Ok(_) => panic!("proxied QUIC hostname must be refused"),
+        Err(err) => {
+            let err = err.to_string();
+            assert!(err.contains("IP-literal"), "unexpected error: {err}");
+        }
+    }
+}
+
 /// `quic://` nameservers parse only on a QUIC-capable build; the error names
 /// the feature rather than dropping the entry.
 #[tokio::test]

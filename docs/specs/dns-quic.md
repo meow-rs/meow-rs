@@ -31,7 +31,8 @@ In scope:
 1. `quic://host[:port][#sni]` nameserver entries, RFC 9250 DoQ, default port 853.
 2. `dns.prefer-h3` (mihomo key) — every `https://` entry prefers HTTP/3.
 3. Per-entry `?h3=true|prefer|false` on `https://` entries.
-4. `?proxy=NAME` on `quic://` entries (datagram through the adapter).
+- `?proxy=NAME` on `quic://` / `?h3=` entries (datagram through the adapter), with an
+  IP-literal server address — see the divergence table.
 5. One connection per upstream, multiplexed, re-dialed transparently.
 
 Out of scope (unchanged by this work): DoQ/DoH3 as *server* listeners (meow-rs is
@@ -104,6 +105,7 @@ and absent from `minimal` for the ADR-0007 size caps). Without it:
 | `prefer-h3` | Allowed alongside h1/h2 | Prefer, with a 10-minute park after a failed handshake | B |
 | `?h3=prefer` / `?h3=false` | Not a key | Per-entry opt-in / opt-out of `prefer-h3` | — |
 | `#h3=true` (mihomo writes params in the fragment) | Parameter | Hard error: `#` is SNI in meow-rs; the fix is `?h3=true` | A |
+| `?proxy=` on a QUIC entry whose server is a hostname | Works (the adapter resolves it) | Hard load error: quiche must know the peer before the handshake, and a proxied hostname hides it — a hung query otherwise | A |
 
 ## Testing
 

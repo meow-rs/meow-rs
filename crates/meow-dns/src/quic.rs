@@ -50,7 +50,7 @@ use rand::RngCore;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, Mutex};
 
-use crate::client::{ClientError, DnsProxy};
+use crate::client::{ClientError, DnsProxy, MAX_DOH_RESPONSE_BYTES};
 
 /// Largest UDP datagram we build for one QUIC packet.
 const MAX_DATAGRAM_SIZE: usize = 1350;
@@ -89,11 +89,23 @@ impl QuicMode {
 enum Cmd {
     Query {
         wire: Vec<u8>,
-        reply: oneshot::Sender<Result<Vec<u8>, ClientError>>,
+        reply: ReplySender,
     },
     /// Close the live connection; the next query re-dials.
-    Reset { ack: oneshot::Sender<()> },
+    Reset {
+        ack: oneshot::Sender<()>,
+    },
 }
+
+/// The channel a dispatched query answers on.
+type ReplySender = oneshot::Sender<Result<Vec<u8>, ClientError>>;
+
+/// A stream id plus the exchange it now carries.
+type Dispatched = (u64, Pending);
+
+/// A dispatch failure together with the reply channel it still owns: the
+/// caller fails that one query and leaves the connection running.
+type DispatchError = (ClientError, ReplySender);
 
 /// In-flight exchange waiting on the driver task.
 struct Pending {
@@ -102,7 +114,7 @@ struct Pending {
 }
 
 impl Pending {
-    fn new(reply: oneshot::Sender<Result<Vec<u8>, ClientError>>) -> Self {
+    fn new(reply: ReplySender) -> Self {
         Self {
             reply,
             buf: Vec::new(),
@@ -110,33 +122,41 @@ impl Pending {
     }
 }
 
-/// One UDP socket's worth of packet I/O: a connected socket for a direct
-/// upstream, or the proxy's datagram association for `?proxy=`.
-enum Io {
+enum IoKind {
+    /// A connected UDP socket.
     Udp(UdpSocket),
-    Proxied {
-        conn: Box<dyn meow_common::ProxyPacketConn>,
-        peer: SocketAddr,
-    },
+    /// The proxy's UDP association for `?proxy=`.
+    Proxied(Box<dyn meow_common::ProxyPacketConn>),
+}
+
+/// One socket's worth of packet I/O for a QUIC connection: a connected UDP
+/// socket for a direct upstream, or the proxy's datagram association for
+/// `?proxy=`.
+struct Io {
+    kind: IoKind,
+    /// The dial target — also the only source a reply may come from. Both
+    /// sides are canonicalised (`bind_udp_for_peer`'s contract), so an
+    /// IPv4-mapped reply is not filtered out and quiche sees one path.
+    peer: SocketAddr,
 }
 
 impl Io {
     fn local_addr(&self) -> SocketAddr {
-        match self {
-            Self::Udp(socket) => socket
+        match &self.kind {
+            IoKind::Udp(socket) => socket
                 .local_addr()
                 .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0))),
-            Self::Proxied { conn, .. } => conn
+            IoKind::Proxied(conn) => conn
                 .local_addr()
                 .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0))),
         }
     }
 
     async fn send(&self, buf: &[u8]) -> io::Result<()> {
-        match self {
-            Self::Udp(socket) => socket.send(buf).await.map(|_| ()),
-            Self::Proxied { conn, peer } => conn
-                .write_packet(buf, peer)
+        match &self.kind {
+            IoKind::Udp(socket) => socket.send(buf).await.map(|_| ()),
+            IoKind::Proxied(conn) => conn
+                .write_packet(buf, &self.peer)
                 .await
                 .map(|_| ())
                 // An adapter's `MeowError` carries the transport detail; the
@@ -145,19 +165,24 @@ impl Io {
         }
     }
 
-    async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
-        match self {
-            Self::Udp(socket) => socket.recv(buf).await,
-            Self::Proxied { conn, peer } => loop {
+    /// Read one datagram and report its source. quiche drops packets whose
+    /// source is not a known path, so the real source — not the dial target —
+    /// is what the caller must pass to `RecvInfo`.
+    async fn recv(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        match &self.kind {
+            IoKind::Udp(socket) => socket.recv(buf).await.map(|n| (n, self.peer)),
+            IoKind::Proxied(conn) => loop {
                 let (n, from) = conn
                     .read_packet(buf)
                     .await
                     .map_err(|e| io::Error::other(e.to_string()))?;
-                // Per-packet conns report the real wire source; bound conns an
-                // unspecified address. Any other source is another peer's
-                // datagram and must not reach this connection.
-                if from.ip().is_unspecified() || from == *peer {
-                    return Ok(n);
+                // Per-packet conns report the real wire source (the address we
+                // asked the proxy for); bound conns report an unspecified
+                // address. Anything else belongs to another peer and must not
+                // reach this connection.
+                let mapped_unspecified = from.ip().to_canonical().is_unspecified();
+                if mapped_unspecified || meow_common::canonical_socket_addr(from) == self.peer {
+                    return Ok((n, from));
                 }
             },
         }
@@ -208,6 +233,12 @@ impl std::fmt::Debug for QuicUpstream {
 
 impl QuicUpstream {
     pub(crate) fn new(mode: QuicMode, server: SocketAddr, sni: Arc<str>) -> Self {
+        // `bind_udp_for_peer` canonicalises its peer and expects the caller to
+        // `connect()` the canonical form; keeping one canonical address here
+        // means the socket, `quiche::connect` and the reply filter agree (an
+        // IPv4-mapped upstream would otherwise get an IPv4 socket dialled at a
+        // V6-mapped address).
+        let server = meow_common::canonical_socket_addr(server);
         Self {
             mode,
             server,
@@ -343,6 +374,15 @@ impl QuicUpstream {
         let mut slot = self.driver.lock().await;
         if let Some(driver) = slot.take() {
             driver.closed.store(true, Ordering::Release);
+            // Tell the task to close its connection and exit. Without this the
+            // old task keeps its socket and `quiche::Connection` alive while a
+            // retry spawns a second one — two connections for one upstream.
+            driver
+                .tx
+                .send(Cmd::Reset {
+                    ack: oneshot::channel().0,
+                })
+                .ok();
         }
     }
 
@@ -476,6 +516,9 @@ impl DriverTask {
         let mut next_stream_id: u64 = 0;
         let mut buf = vec![0u8; 65_535];
         let mut out = vec![0u8; MAX_DATAGRAM_SIZE];
+        // Shared read scratch for stream bodies: the driver's hot loop must
+        // not allocate per datagram batch.
+        let mut tmp = vec![0u8; 4096];
         backlog.push_back(first);
 
         loop {
@@ -512,20 +555,38 @@ impl DriverTask {
                                     .map_err(h3_error)?,
                             );
                         }
-                        let dispatched = match h3_conn.as_mut() {
-                            Some(h3_conn) => send_h3_request(
+                        // A dispatch failure means "no stream capacity right
+                        // now" (`Error::Done` / `StreamLimit`), not a broken
+                        // connection: fail only this query. Propagating it
+                        // with `?` would tear the generation down and fail up
+                        // to 255 unrelated in-flight exchanges.
+                        match h3_conn.as_mut() {
+                            Some(h3_conn) => match send_h3_request(
                                 &self.mode, &self.sni, h3_conn, &mut conn, wire, reply,
-                            )
-                            .map_err(h3_error)?,
-                            None => send_doq_query(&mut conn, &mut next_stream_id, &wire, reply)?,
+                            ) {
+                                Ok((id, entry)) => pending.insert(id, entry),
+                                Err((err, reply)) => {
+                                    let _ = reply.send(Err(err));
+                                    None
+                                }
+                            },
+                            None => {
+                                match send_doq_query(&mut conn, &mut next_stream_id, &wire, reply) {
+                                    Ok((id, entry)) => pending.insert(id, entry),
+                                    Err((err, reply)) => {
+                                        let _ = reply.send(Err(err));
+                                        None
+                                    }
+                                }
+                            }
                         };
-                        pending.insert(dispatched.0, dispatched.1);
                     }
                 }
             }
 
             flush(&mut conn, &io, &mut out).await?;
-            drain(&self.mode, &mut conn, h3_conn.as_mut(), pending);
+            drain(&self.mode, &mut conn, h3_conn.as_mut(), pending, &mut tmp);
+            prune_abandoned(&self.mode, &mut conn, pending);
 
             if conn.is_closed() || conn.is_timed_out() {
                 // A verdict, not a redial: report it so queued queries get
@@ -555,8 +616,11 @@ impl DriverTask {
                     }
                 },
                 r = io.recv(&mut buf) => {
-                    let n = r?;
-                    let info = quiche::RecvInfo { to: local, from: self.server };
+                    // The real source, not the dial target: quiche drops
+                    // packets whose path it does not know, and a proxied
+                    // association may answer from the address it resolved.
+                    let (n, from) = r?;
+                    let info = quiche::RecvInfo { to: local, from };
                     match conn.recv(&mut buf[..n], info) {
                         Ok(_) | Err(quiche::Error::Done) => {}
                         Err(e) => {
@@ -579,19 +643,27 @@ impl DriverTask {
         match &self.proxy {
             Some(proxy) => {
                 use meow_common::{ConnType, Metadata, Network};
-                let (host, dst_ip, dst_port) = match &self.proxy_target {
-                    Some((host, port)) => (smol_str::SmolStr::from(host.as_ref()), None, *port),
-                    None => (
-                        smol_str::SmolStr::from(self.server.ip().to_string()),
-                        Some(self.server.ip()),
-                        self.server.port(),
-                    ),
-                };
+                // A proxied *hostname* upstream is resolved by the proxy, so
+                // the peer address is unknown until after the handshake — but
+                // quiche needs it *before* (it drops packets from an unknown
+                // path), so this combination cannot work. Refuse it instead of
+                // hanging until the query timeout; the config layer rejects it
+                // at load, this is the belt-and-braces guard.
+                if self.proxy_target.is_some() {
+                    return Err(ClientError::Protocol(
+                        "DNS over QUIC through a proxy needs an IP-literal server address: \
+                         the QUIC peer must be known before the handshake, and a proxied \
+                         hostname is resolved remotely",
+                    ));
+                }
+                let dst_ip = self.server.ip();
+                let host = smol_str::SmolStr::from(dst_ip.to_string());
+                let dst_port = self.server.port();
                 let metadata = Metadata {
                     network: Network::Udp,
                     conn_type: ConnType::Inner,
                     host,
-                    dst_ip,
+                    dst_ip: Some(dst_ip),
                     dst_port,
                     // Resolver housekeeping: a `lazy` group serving this dial
                     // must not count it as use (ADR-0012).
@@ -603,15 +675,18 @@ impl DriverTask {
                 )
                 .await
                 .map_err(|e| ClientError::Io(e.into_io_error("dns-via-proxy udp dial")))?;
-                Ok(Io::Proxied {
-                    conn,
+                Ok(Io {
+                    kind: IoKind::Proxied(conn),
                     peer: self.server,
                 })
             }
             None => {
                 let socket = meow_common::bind_udp_for_peer(self.server.ip()).await?;
                 socket.connect(self.server).await?;
-                Ok(Io::Udp(socket))
+                Ok(Io {
+                    kind: IoKind::Udp(socket),
+                    peer: self.server,
+                })
             }
         }
     }
@@ -644,22 +719,30 @@ async fn flush(conn: &mut quiche::Connection, io: &Io, out: &mut [u8]) -> Result
 }
 
 /// Put one DoQ query on a fresh bidirectional stream, length-prefixed.
+///
+/// The error arm hands the reply channel back so the caller can fail *that*
+/// query without touching the connection.
 fn send_doq_query(
     conn: &mut quiche::Connection,
     next_stream_id: &mut u64,
     wire: &[u8],
-    reply: oneshot::Sender<Result<Vec<u8>, ClientError>>,
-) -> Result<(u64, Pending), ClientError> {
+    reply: ReplySender,
+) -> Result<Dispatched, DispatchError> {
     if wire.len() > u16::MAX as usize {
-        return Err(ClientError::Protocol("query larger than 65535 octets"));
+        return Err((
+            ClientError::Protocol("query larger than 65535 octets"),
+            reply,
+        ));
     }
     let id = *next_stream_id;
     *next_stream_id += 4; // next client-initiated bidirectional stream
     let mut framed = Vec::with_capacity(wire.len() + 2);
     framed.extend_from_slice(&(wire.len() as u16).to_be_bytes());
     framed.extend_from_slice(wire);
-    conn.stream_send(id, &framed, true).map_err(quic_error)?;
-    Ok((id, Pending::new(reply)))
+    match conn.stream_send(id, &framed, true) {
+        Ok(_) => Ok((id, Pending::new(reply))),
+        Err(e) => Err((quic_error(e), reply)),
+    }
 }
 
 /// Put one DoH3 query on its own request stream.
@@ -669,8 +752,8 @@ fn send_h3_request(
     h3_conn: &mut h3::Connection,
     conn: &mut quiche::Connection,
     wire: Vec<u8>,
-    reply: oneshot::Sender<Result<Vec<u8>, ClientError>>,
-) -> Result<(u64, Pending), h3::Error> {
+    reply: ReplySender,
+) -> Result<Dispatched, DispatchError> {
     let QuicMode::Doh3 { path } = mode else {
         unreachable!("send_h3_request on a non-HTTP/3 mode");
     };
@@ -683,7 +766,10 @@ fn send_h3_request(
         h3::Header::new(b"content-type", b"application/dns-message"),
         h3::Header::new(b"user-agent", b"meow-rs"),
     ];
-    let id = h3_conn.send_request(conn, &headers, false)?;
+    let id = match h3_conn.send_request(conn, &headers, false) {
+        Ok(id) => id,
+        Err(e) => return Err((h3_error(e), reply)),
+    };
     let mut body = wire;
     loop {
         match h3_conn.send_body(conn, id, &body, true) {
@@ -694,7 +780,10 @@ fn send_h3_request(
                 }
             }
             Err(h3::Error::Done) => break,
-            Err(e) => return Err(e),
+            // The request is already on the stream; a body-level failure is
+            // this query's verdict, and the stream is left for the peer to
+            // reset (`drain_h3` reports it).
+            Err(e) => return Err((h3_error(e), reply)),
         }
     }
     Ok((id, Pending::new(reply)))
@@ -707,24 +796,46 @@ fn drain(
     conn: &mut quiche::Connection,
     mut h3_conn: Option<&mut h3::Connection>,
     pending: &mut HashMap<u64, Pending>,
+    tmp: &mut [u8],
 ) {
     if pending.is_empty() {
         return;
     }
     match (mode, h3_conn.as_mut()) {
-        (QuicMode::Doq, _) => drain_doq(conn, pending),
-        (QuicMode::Doh3 { .. }, Some(h3_conn)) => drain_h3(conn, h3_conn, pending),
+        (QuicMode::Doq, _) => drain_doq(conn, pending, tmp),
+        (QuicMode::Doh3 { .. }, Some(h3_conn)) => drain_h3(conn, h3_conn, pending, tmp),
         (QuicMode::Doh3 { .. }, None) => {}
     }
 }
 
-fn drain_doq(conn: &mut quiche::Connection, pending: &mut HashMap<u64, Pending>) {
+/// Drop exchanges the caller abandoned (outer timeout, dropped future) and
+/// release their streams. A long-lived connection would otherwise accumulate
+/// one entry per timed-out query until `MAX_CONCURRENT_STREAMS` is exhausted.
+fn prune_abandoned(
+    mode: &QuicMode,
+    conn: &mut quiche::Connection,
+    pending: &mut HashMap<u64, Pending>,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    pending.retain(|id, entry| {
+        if !entry.reply.is_closed() {
+            return true;
+        }
+        if matches!(mode, QuicMode::Doq) {
+            let _ = conn.stream_shutdown(*id, quiche::Shutdown::Read, 0);
+        }
+        false
+    });
+}
+
+fn drain_doq(conn: &mut quiche::Connection, pending: &mut HashMap<u64, Pending>, tmp: &mut [u8]) {
     let mut finished: Vec<u64> = Vec::new();
-    let mut tmp = vec![0u8; 4096];
     for (id, entry) in pending.iter_mut() {
         let mut broken = false;
         loop {
-            match conn.stream_recv(*id, &mut tmp) {
+            match conn.stream_recv(*id, tmp) {
                 Ok((n, fin)) => {
                     entry.buf.extend_from_slice(&tmp[..n]);
                     if fin || doq_frame_complete(&entry.buf) {
@@ -779,6 +890,7 @@ fn drain_h3(
     conn: &mut quiche::Connection,
     h3_conn: &mut h3::Connection,
     pending: &mut HashMap<u64, Pending>,
+    tmp: &mut [u8],
 ) {
     loop {
         let (stream_id, event) = match h3_conn.poll(conn) {
@@ -807,11 +919,26 @@ fn drain_h3(
                 }
             }
             h3::Event::Data => {
-                let mut tmp = vec![0u8; 4096];
+                let mut overflowed = false;
                 while let Some(entry) = pending.get_mut(&stream_id) {
-                    match h3_conn.recv_body(conn, stream_id, &mut tmp) {
-                        Ok(n) => entry.buf.extend_from_slice(&tmp[..n]),
+                    match h3_conn.recv_body(conn, stream_id, tmp) {
+                        Ok(n) => {
+                            entry.buf.extend_from_slice(&tmp[..n]);
+                            // Same bound as the HTTP/1.1 DoH path: a hostile
+                            // upstream must not drive unbounded growth.
+                            if entry.buf.len() > MAX_DOH_RESPONSE_BYTES {
+                                overflowed = true;
+                                break;
+                            }
+                        }
                         Err(_) => break,
+                    }
+                }
+                if overflowed {
+                    if let Some(entry) = pending.remove(&stream_id) {
+                        let _ = entry.reply.send(Err(ClientError::Protocol(
+                            "DoH3 response exceeds the maximum DNS message size",
+                        )));
                     }
                 }
             }
@@ -819,7 +946,11 @@ fn drain_h3(
                 let Some(entry) = pending.remove(&stream_id) else {
                     continue;
                 };
-                if entry.buf.is_empty() {
+                if entry.buf.len() > MAX_DOH_RESPONSE_BYTES {
+                    let _ = entry.reply.send(Err(ClientError::Protocol(
+                        "DoH3 response exceeds the maximum DNS message size",
+                    )));
+                } else if entry.buf.is_empty() {
                     let _ = entry
                         .reply
                         .send(Err(ClientError::Protocol("empty DoH3 response body")));
