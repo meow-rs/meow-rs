@@ -882,6 +882,53 @@ mod tests {
         assert_eq!(&got, b"HELLO");
     }
 
+    /// The simple-obfs C server sends its response headers with an empty
+    /// body (`send_empty_response_upon_connection`); a peer that then
+    /// closes is a clean EOF after the headers, not an error.
+    #[tokio::test]
+    async fn http_obfs_header_only_response_then_close_is_clean_eof() {
+        let (client, mut server) = tokio::io::duplex(8192);
+        let mut obfs = HttpObfs::new(client, "example.com".to_string(), 80).unwrap();
+        server
+            .write_all(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n")
+            .await
+            .unwrap();
+        drop(server);
+        let mut got = Vec::new();
+        obfs.read_to_end(&mut got).await.unwrap();
+        assert!(got.is_empty());
+    }
+
+    #[tokio::test]
+    async fn http_obfs_close_before_response_headers_is_unexpected_eof() {
+        for partial in [&b""[..], b"HTTP/1.1 101 Switching", b"HTTP/1.1 101 OK\r\n"] {
+            let (client, mut server) = tokio::io::duplex(8192);
+            let mut obfs = HttpObfs::new(client, "example.com".to_string(), 80).unwrap();
+            server.write_all(partial).await.unwrap();
+            drop(server);
+            let err = obfs.read(&mut [0u8; 16]).await.unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof, "{partial:?}");
+        }
+    }
+
+    /// Headers dribbled in one byte per segment (and the terminator split
+    /// across reads) are still found, and the body after them is intact.
+    #[tokio::test]
+    async fn http_obfs_reassembles_response_headers_split_across_reads() {
+        let (client, mut server) = tokio::io::duplex(8192);
+        let mut obfs = HttpObfs::new(client, "example.com".to_string(), 80).unwrap();
+        let sender = tokio::spawn(async move {
+            for b in b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\nBODY" {
+                server.write_all(&[*b]).await.unwrap();
+                tokio::task::yield_now().await;
+            }
+        });
+        let mut got = [0u8; 4];
+        obfs.read_exact(&mut got).await.unwrap();
+        sender.await.unwrap();
+        assert_eq!(&got, b"BODY");
+    }
+
     // ---- TlsObfs round-trip ----
 
     #[tokio::test]
