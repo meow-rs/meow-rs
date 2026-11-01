@@ -5086,6 +5086,21 @@ mod tests {
             Some(u64::MAX)
         );
     }
+
+    /// End-to-end over whichever branch this target compiles: on Linux the
+    /// real `/proc/self/status` read + `VmRSS:` parse, elsewhere `sysinfo`.
+    /// A running test process always has resident pages, so `0` (the
+    /// failure sentinel) means the probe is broken on this platform. The
+    /// upper bound catches a unit mix-up (KiB not scaled, or scaled twice).
+    #[tokio::test]
+    async fn read_rss_bytes_reports_live_process_rss() {
+        let rss = read_rss_bytes().await;
+        assert!(rss > 0, "RSS probe returned the failure sentinel 0");
+        assert!(
+            (1 << 20..1 << 40).contains(&rss),
+            "RSS {rss} B is outside a plausible 1 MiB..1 TiB range"
+        );
+    }
 }
 
 /// Issue #695: the post-spawn flush hook (`outbound_binding_adopted`).
