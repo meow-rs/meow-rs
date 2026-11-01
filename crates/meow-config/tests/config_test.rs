@@ -1178,6 +1178,97 @@ dns:
     );
 }
 
+/// `dns.prefer-h3` and `?h3=` need a QUIC-capable build. Without the feature
+/// the config is refused (ADR-0002 Class A) instead of silently serving plain
+/// HTTP/1.1 DoH; with it, `https://` entries carry the policy into the
+/// resolver's labels.
+#[tokio::test]
+async fn test_dns_prefer_h3_requires_the_feature_and_applies() {
+    let yaml = r#"
+dns:
+  enable: true
+  prefer-h3: true
+  nameserver:
+    - https://1.1.1.1/dns-query
+    - https://dns.google/dns-query?h3=false
+  default-nameserver:
+    - 223.5.5.5
+"#;
+    if cfg!(feature = "dns-quic") {
+        let config = load_config_from_str(yaml).await.unwrap();
+        let labels: Vec<String> = config
+            .dns
+            .resolver
+            .main_nameservers()
+            .iter()
+            .map(|client| client.upstream_label())
+            .collect();
+        assert!(
+            labels.iter().any(|label| label.contains("h3=prefer")),
+            "prefer-h3 must mark the https entry: {labels:?}"
+        );
+        assert!(
+            labels
+                .iter()
+                .any(|label| label.contains("dns.google") && !label.contains("h3=")),
+            "an explicit ?h3=false must win over prefer-h3: {labels:?}"
+        );
+    } else {
+        match load_config_from_str(yaml).await {
+            Ok(_) => panic!("prefer-h3 must be refused without the dns-quic feature"),
+            Err(err) => {
+                let err = err.to_string();
+                assert!(
+                    err.contains("dns-quic"),
+                    "the error must name the missing feature: {err}"
+                );
+            }
+        }
+    }
+}
+
+/// A bare `?h3=true` entry is the same verdict as `prefer-h3`: no silent
+/// downgrade to HTTP/1.1 on a build without the feature.
+#[tokio::test]
+async fn test_dns_per_entry_h3_requires_the_feature() {
+    let yaml = r#"
+dns:
+  enable: true
+  nameserver:
+    - https://1.1.1.1/dns-query?h3=true
+"#;
+    match load_config_from_str(yaml).await {
+        Ok(_) if cfg!(feature = "dns-quic") => {}
+        Ok(_) => panic!("this entry must be refused without the dns-quic feature"),
+        Err(err) if cfg!(feature = "dns-quic") => panic!("{err}"),
+        Err(err) => {
+            let err = err.to_string();
+            assert!(err.contains("dns-quic"), "{err}");
+        }
+    }
+}
+
+/// `quic://` nameservers parse only on a QUIC-capable build; the error names
+/// the feature rather than dropping the entry.
+#[tokio::test]
+async fn test_dns_quic_scheme_requires_the_feature() {
+    let yaml = r#"
+dns:
+  enable: true
+  nameserver:
+    - quic://dns.adguard.com
+"#;
+    match load_config_from_str(yaml).await {
+        Ok(_) if cfg!(feature = "dns-quic") => {}
+        Ok(_) => panic!("this entry must be refused without the dns-quic feature"),
+        Err(err) if cfg!(feature = "dns-quic") => panic!("{err}"),
+        Err(err) => {
+            let err = err.to_string();
+            assert!(err.contains("quic-dns"), "{err}");
+        }
+    }
+}
+
 #[tokio::test]
 async fn test_dns_config_disabled() {
     let yaml = r#"
