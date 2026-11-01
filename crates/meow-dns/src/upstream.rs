@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fmt;
 use std::net::IpAddr;
 
@@ -25,11 +26,54 @@ pub enum NameServerUrl {
         port: u16,
         path: String,
         sni: String,
+        /// HTTP/3 policy for this entry: mihomo `prefer-h3` (global) and the
+        /// per-entry `?h3=` parameter both land here.
+        h3: H3Policy,
+    },
+    /// DNS over QUIC (RFC 9250) — `quic://host[:port][#sni]`.
+    Quic {
+        addr: HostOrIp,
+        port: u16,
+        sni: String,
     },
     RCode {
         code: ResponseCode,
         label: String,
     },
+}
+
+/// How a `https://` nameserver uses HTTP/3.
+///
+/// mihomo spells this two ways: the global `dns.prefer-h3` flag ("allow HTTP/3
+/// alongside HTTP/2 and HTTP/1.1") and the per-entry `&h3=true` parameter
+/// ("HTTP/3 only"). meow-rs keeps both meanings apart, and adds the explicit
+/// `?h3=prefer` spelling so a config can opt one entry into the preference
+/// without the global flag:
+///
+/// | YAML | policy |
+/// | --- | --- |
+/// | (nothing) | [`H3Policy::Off`] |
+/// | `dns.prefer-h3: true` | [`H3Policy::Prefer`] on every `https://` entry |
+/// | `?h3=prefer` | [`H3Policy::Prefer`] on that entry |
+/// | `?h3=true` (mihomo spelling) | [`H3Policy::Force`], like mihomo |
+///
+/// `?h3=false` turns the entry back off, overriding `dns.prefer-h3`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum H3Policy {
+    /// Never attempt HTTP/3 (the default).
+    #[default]
+    Off,
+    /// Try HTTP/3 first and fall back to HTTP/2 / HTTP/1.1 when the QUIC
+    /// exchange fails. This is what mihomo's `prefer-h3` asks for.
+    Prefer,
+    /// HTTP/3 only, no fallback — mihomo's per-entry `&h3=true`.
+    Force,
+}
+
+impl H3Policy {
+    pub fn is_enabled(self) -> bool {
+        !matches!(self, Self::Off)
+    }
 }
 
 /// Either a resolved IP address or a hostname that requires bootstrap resolution.
@@ -59,9 +103,16 @@ impl fmt::Display for NameServerUrl {
                 port,
                 path,
                 sni,
+                h3,
             } => {
-                write!(f, "https://{addr}:{port}{path}#{sni}")
+                let param = match h3 {
+                    H3Policy::Off => "",
+                    H3Policy::Prefer => "?h3=prefer",
+                    H3Policy::Force => "?h3=true",
+                };
+                write!(f, "https://{addr}:{port}{path}{param}#{sni}")
             }
+            NameServerUrl::Quic { addr, port, sni } => write!(f, "quic://{addr}:{port}#{sni}"),
             NameServerUrl::RCode { label, .. } => write!(f, "rcode://{label}"),
         }
     }
@@ -119,80 +170,133 @@ impl NameServerEntry {
             return Err(NameServerParseError::EmptyInput);
         }
 
-        // Only `tls://` / `https://` entries may carry a `?` parameter
-        // section; strip it here so the `#` fragment dispatch below —
-        // and `NameServerUrl::parse`'s hostname/path consumption — sees
-        // the remainder untouched. On plain forms any `?` at all is a
+        // Only encrypted entries (`tls://`, `https://`, `quic://`) may carry
+        // a `?` parameter section; strip it here so the `#` fragment dispatch
+        // below — and `NameServerUrl::parse`'s hostname/path consumption —
+        // sees the remainder untouched. On plain forms any `?` at all is a
         // config bug (previously it was silently swallowed into the
         // hostname).
-        let is_encrypted_form = s.starts_with("tls://") || s.starts_with("https://");
-        let mut head = s;
+        let is_encrypted_form =
+            s.starts_with("tls://") || s.starts_with("https://") || s.starts_with("quic://");
+        let mut head: Cow<'_, str> = Cow::Borrowed(s);
         let mut query_proxy: Option<String> = None;
+        let mut query_h3: Option<H3Policy> = None;
         if is_encrypted_form {
             if let Some(qidx) = s.rfind('?') {
-                let tail = &s[qidx + 1..];
+                // mihomo writes parameters into the `#` fragment, meow-rs
+                // writes them into a `?` section — a URL can therefore carry
+                // its SNI *after* the parameters (`?h3=true#dns.google`).
+                // Split the fragment off the section before validating keys,
+                // then re-attach it ahead of the `?` so the fragment rules
+                // below see it as SNI.
+                let after = &s[qidx + 1..];
+                let (tail, trailing_frag) = match after.find('#') {
+                    Some(idx) => (&after[..idx], Some(&after[idx..])),
+                    None => (after, None),
+                };
                 // The tail is a parameter section when ANY `&`-separated
-                // segment is a `proxy=` key — `?a=b&proxy=P` must hard-
-                // error on the unknown `a` key below, not silently lose
-                // the proxy tag inside the path (r15 review I1). The
+                // segment is a known parameter key — `?a=b&proxy=P` must
+                // hard-error on the unknown `a` key below, not silently
+                // lose the proxy tag inside the path (r15 review I1). The
                 // shared key predicate trims whitespace and is ASCII
                 // case-insensitive, so `? proxy=P` / `?Proxy=P` mark the
                 // section too — and then fail validation below as
                 // non-canonical spellings.
-                if tail.split('&').any(is_proxy_key_segment) {
+                if tail.split('&').any(is_param_key_segment) {
                     // The tail is a parameter section: an `&`-separated
-                    // `k=v` list. `proxy` is the only legal key.
-                    let mut value: Option<&str> = None;
+                    // `k=v` list of `proxy` and `h3`.
+                    let mut proxy_value: Option<&str> = None;
                     for kv in tail.split('&') {
                         let (key, val) = kv.split_once('=').unwrap_or((kv, ""));
-                        // Case-variant keys reached this section through
-                        // the case-insensitive detection above — name the
-                        // canonical spelling instead of reporting `Proxy`
-                        // as just another unknown key.
-                        if key.eq_ignore_ascii_case("proxy") && key != "proxy" {
-                            return Err(NameServerParseError::InvalidParams(format!(
-                                "nameserver parameter '{key}' must be spelled \
-                                 lowercase 'proxy' in '{s}'"
-                            )));
-                        }
-                        if key != "proxy" {
-                            // Whitespace-padded `proxy` keys marked this a
-                            // parameter section above; give the key its own
-                            // hint — the generic arm would print `' proxy'`
-                            // with the defect invisible.
-                            if key.trim().eq_ignore_ascii_case("proxy") {
+                        if key.eq_ignore_ascii_case("proxy") {
+                            // Case-variant keys reached this section through
+                            // the case-insensitive detection above — name the
+                            // canonical spelling instead of reporting `Proxy`
+                            // as just another unknown key.
+                            if key != "proxy" {
                                 return Err(NameServerParseError::InvalidParams(format!(
-                                    "whitespace is not allowed in the 'proxy' \
-                                     parameter name in '{s}' — spell it exactly \
-                                     'proxy'"
+                                    "nameserver parameter '{key}' must be spelled \
+                                     lowercase 'proxy' in '{s}'"
                                 )));
                             }
+                            if proxy_value.is_some() {
+                                return Err(NameServerParseError::InvalidParams(format!(
+                                    "duplicate 'proxy' parameter in '{s}'"
+                                )));
+                            }
+                            // Same trim as the `#PROXY` slot below:
+                            // `?proxy= P` means the proxy named `P`.
+                            let val = val.trim();
+                            if val.is_empty() || val.contains('#') {
+                                return Err(NameServerParseError::InvalidParams(format!(
+                                    "invalid proxy name '{val}' in '{s}'"
+                                )));
+                            }
+                            proxy_value = Some(val);
+                            continue;
+                        }
+                        if key.eq_ignore_ascii_case("h3") {
+                            if key != "h3" {
+                                return Err(NameServerParseError::InvalidParams(format!(
+                                    "nameserver parameter '{key}' must be spelled \
+                                     lowercase 'h3' in '{s}'"
+                                )));
+                            }
+                            if !s.starts_with("https://") {
+                                return Err(NameServerParseError::InvalidParams(format!(
+                                    "'h3' is only valid on https:// nameserver entries \
+                                     (it selects HTTP/3 for DoH), got '{s}'"
+                                )));
+                            }
+                            if query_h3.is_some() {
+                                return Err(NameServerParseError::InvalidParams(format!(
+                                    "duplicate 'h3' parameter in '{s}'"
+                                )));
+                            }
+                            query_h3 = Some(match val.trim() {
+                                // mihomo spells the per-entry form `&h3=true`
+                                // and means "HTTP/3 only".
+                                "true" => H3Policy::Force,
+                                "false" => H3Policy::Off,
+                                // meow-rs addition: prefer without forcing, so
+                                // one entry can opt into the global behaviour.
+                                "prefer" => H3Policy::Prefer,
+                                other => {
+                                    return Err(NameServerParseError::InvalidParams(format!(
+                                        "invalid 'h3' value '{other}' in '{s}' (expected \
+                                         'true', 'false' or 'prefer')"
+                                    )));
+                                }
+                            });
+                            continue;
+                        }
+                        // Whitespace-padded known keys marked this a parameter
+                        // section above; give the key its own hint — the
+                        // generic arm would print `' proxy'` with the defect
+                        // invisible.
+                        if key.trim().eq_ignore_ascii_case("proxy")
+                            || key.trim().eq_ignore_ascii_case("h3")
+                        {
                             return Err(NameServerParseError::InvalidParams(format!(
-                                "unknown nameserver parameter '{key}' in '{s}' \
-                                 (only 'proxy' is supported)"
+                                "whitespace is not allowed in the '{key}' parameter \
+                                 name in '{s}' — spell it exactly '{stripped}'",
+                                stripped = key.trim()
                             )));
                         }
-                        if value.is_some() {
-                            return Err(NameServerParseError::InvalidParams(format!(
-                                "duplicate 'proxy' parameter in '{s}'"
-                            )));
-                        }
-                        // Same trim as the `#PROXY` slot below:
-                        // `?proxy= P` means the proxy named `P`.
-                        let val = val.trim();
-                        if val.is_empty() || val.contains('#') {
-                            return Err(NameServerParseError::InvalidParams(format!(
-                                "invalid proxy name '{val}' in '{s}'"
-                            )));
-                        }
-                        value = Some(val);
+                        return Err(NameServerParseError::InvalidParams(format!(
+                            "unknown nameserver parameter '{key}' in '{s}' \
+                             (only 'proxy' and 'h3' are supported)"
+                        )));
                     }
-                    query_proxy = value.map(str::to_string);
-                    head = &s[..qidx];
+                    query_proxy = proxy_value.map(str::to_string);
+                    head = match trailing_frag {
+                        Some(frag) => Cow::Owned(format!("{}{frag}", &s[..qidx])),
+                        None => Cow::Borrowed(&s[..qidx]),
+                    };
                 }
             }
             // Every `?` section still standing (post-strip on either
-            // branch — `head` is final here) must be proxy-key-free: a
+            // branch — `head` is final here) must be parameter-key-free: a
             // `proxy=` key stranded in an earlier `?` section — the
             // `?proxy=P?x=1` double-`?` typo, or `?proxy=A?proxy=B`
             // where the last `?` still tagged — would travel inside the
@@ -200,13 +304,14 @@ impl NameServerEntry {
             // Key-level per `?`-section, `skip(1)` so `&` inside the
             // path (`/p&proxy=P?x=1`) stays path material.
             if head
+                .as_ref()
                 .split('?')
                 .skip(1)
                 .flat_map(|sec| sec.split('&'))
-                .any(is_proxy_key_segment)
+                .any(is_param_key_segment)
             {
                 return Err(NameServerParseError::InvalidParams(format!(
-                    "'proxy=' must be the last query parameter in '{s}'"
+                    "the parameter section must be the last '?' section in '{s}'"
                 )));
             }
             // The fragment that survives `?`-section stripping must be
@@ -214,11 +319,22 @@ impl NameServerEntry {
             // `#sni&proxy=P` migration typo — under our `#`=SNI
             // divergence it is a garbage SNI that would only fail at
             // handshake time, so refuse it at parse time instead.
-            if let Some(hidx) = head.find('#') {
-                let frag = &head[hidx + 1..];
+            if let Some(hidx) = head.as_ref().find('#') {
+                let frag = &head.as_ref()[hidx + 1..];
                 if frag.contains('&') || frag.contains('?') {
                     return Err(NameServerParseError::InvalidParams(format!(
                         "invalid SNI fragment '#{frag}' in '{s}'"
+                    )));
+                }
+                // A DNS name never contains '=', so a fragment that does is
+                // the mihomo spelling of a per-entry parameter (`#h3=true`).
+                // `#` is SNI in meow-rs: say so instead of failing the TLS
+                // handshake on a nonsense server name later.
+                if frag.contains('=') {
+                    return Err(NameServerParseError::InvalidParams(format!(
+                        "invalid SNI fragment '#{frag}' in '{s}' — '#' is SNI on \
+                         tls://, https:// and quic:// entries; parameters go in the \
+                         '?' section (e.g. '?h3=true')"
                     )));
                 }
                 // `#P?proxy=Q` would be read by a mihomo migrant as a
@@ -237,8 +353,8 @@ impl NameServerEntry {
             }
         } else if s.contains('?') {
             return Err(NameServerParseError::InvalidParams(format!(
-                "'?' parameters are only valid on tls:// / https:// nameserver \
-                 entries, got '{s}'"
+                "'?' parameters are only valid on tls:// / https:// / quic:// \
+                 nameserver entries, got '{s}'"
             )));
         }
 
@@ -247,20 +363,48 @@ impl NameServerEntry {
         // fragment is SNI — leave it intact and let NameServerUrl::parse
         // consume it normally.
         if !is_encrypted_form {
-            if let Some(idx) = head.find('#') {
-                let proxy = head[idx + 1..].trim();
+            if let Some(idx) = head.as_ref().find('#') {
+                let proxy = head.as_ref()[idx + 1..].trim();
                 if proxy.is_empty() {
                     return Err(NameServerParseError::InvalidHost(s.to_string()));
                 }
-                let url = NameServerUrl::parse(&head[..idx])?;
+                let url = NameServerUrl::parse(&head.as_ref()[..idx])?;
                 return Ok(Self {
                     url,
                     proxy: Some(proxy.to_string()),
                 });
             }
         }
+        let url = NameServerUrl::parse(head.as_ref())?;
+        // `?h3=` only reaches here on `https://` (validated above); apply it
+        // to the parsed entry. `None` leaves the entry at `H3Policy::Off` —
+        // `dns.prefer-h3` is applied later, by the config layer, so an
+        // explicit `?h3=false` keeps overriding it.
+        let url = match query_h3 {
+            None => url,
+            Some(h3) => match url {
+                NameServerUrl::Https {
+                    addr,
+                    port,
+                    path,
+                    sni,
+                    ..
+                } => NameServerUrl::Https {
+                    addr,
+                    port,
+                    path,
+                    sni,
+                    h3,
+                },
+                other => {
+                    return Err(NameServerParseError::InvalidParams(format!(
+                        "'h3' is only valid on https:// nameserver entries, got '{other}'"
+                    )));
+                }
+            },
+        };
         Ok(Self {
-            url: NameServerUrl::parse(head)?,
+            url,
             proxy: query_proxy,
         })
     }
@@ -280,7 +424,8 @@ impl NameServerUrl {
             NameServerUrl::Udp { addr, .. }
             | NameServerUrl::Tcp { addr, .. }
             | NameServerUrl::Tls { addr, .. }
-            | NameServerUrl::Https { addr, .. } => addr,
+            | NameServerUrl::Https { addr, .. }
+            | NameServerUrl::Quic { addr, .. } => addr,
             NameServerUrl::RCode { .. } => return None,
         };
         match addr {
@@ -306,6 +451,7 @@ impl NameServerUrl {
     /// - `tcp://host[:port]`
     /// - `tls://host[:port][#sni]`
     /// - `https://host[:port][/path][#sni]`
+    /// - `quic://host[:port][#sni]`
     pub fn parse(s: &str) -> Result<Self, NameServerParseError> {
         let s = s.trim();
         if s.is_empty() {
@@ -334,11 +480,11 @@ impl NameServerUrl {
             let (addr, port) = parse_host_port(rest, 53)?;
             return Ok(NameServerUrl::Tcp { addr, port });
         }
+        if let Some(rest) = s_no_frag.strip_prefix("quic://") {
+            return Self::parse_quic(rest, fragment);
+        }
         if let Some(rest) = s_no_frag.strip_prefix("rcode://") {
             return parse_rcode(rest);
-        }
-        if s_no_frag.starts_with("quic://") {
-            return Err(NameServerParseError::QuicNotSupported);
         }
         // Any other explicit scheme → unsupported
         if let Some(colon) = s_no_frag.find("://") {
@@ -398,6 +544,9 @@ impl NameServerUrl {
             port,
             path,
             sni,
+            // `?h3=` / `dns.prefer-h3` are applied by `NameServerEntry::parse`
+            // and the config layer; a bare `https://` entry is HTTP/1.1 DoH.
+            h3: H3Policy::Off,
         })
     }
 
@@ -405,26 +554,37 @@ impl NameServerUrl {
     fn parse_https(_rest: &str, _fragment: Option<&str>) -> Result<Self, NameServerParseError> {
         Err(NameServerParseError::EncryptedFeatureDisabled)
     }
+
+    #[cfg(feature = "quic-dns")]
+    fn parse_quic(rest: &str, fragment: Option<&str>) -> Result<Self, NameServerParseError> {
+        // RFC 9250 does not fix a port; 853 is the DoQ default the ecosystem
+        // uses (and mihomo's `quic://` default).
+        let (addr, port) = parse_host_port(rest, 853)?;
+        let sni = match fragment {
+            Some(f) if !f.is_empty() => f.to_string(),
+            _ => addr.to_string(),
+        };
+        Ok(NameServerUrl::Quic { addr, port, sni })
+    }
+
+    #[cfg(not(feature = "quic-dns"))]
+    fn parse_quic(_rest: &str, _fragment: Option<&str>) -> Result<Self, NameServerParseError> {
+        Err(NameServerParseError::QuicNotSupported)
+    }
 }
 
-/// A `k=v` segment IS a `proxy=` key when its key — the bytes before
-/// the first `=` — trims to `proxy` in any ASCII case. Whitespace
-/// *around* the key (`? proxy=`, `?proxy =`, `?\tproxy\t=`, NBSP) and
-/// case flips (`?Proxy=`) are the same typo/leak class as the canonical
-/// spelling — left in the path they would leak the proxy name upstream.
-/// The `=` is required by the key shape, so `proxy` *values*
-/// (`?x=proxy=P`), bare keys (`?Proxy`, `? proxy `), and look-alikes
-/// (`?proxyx=`, `?aproxy=`) never match; whitespace *inside* a key
-/// (`?p roxy=`) is not collapsed, and percent-spellings (`?%20proxy=`,
-/// `?%70roxy=`) stay literal path material. `trim()` is
-/// `char::is_whitespace` — the full White_Space set — so keys prefixed
-/// with *non*-White_Space invisible characters (ZWSP U+200B, BOM
-/// U+FEFF, soft hyphen U+00AD, word joiner U+2060, ZWNJ/ZWJ, …) are NOT
-/// caught: a recorded residual of the invisible-key class (the
-/// upstream 400s on them anyway).
-fn is_proxy_key_segment(kv: &str) -> bool {
+/// A `k=v` segment names a *known* nameserver parameter when its key trims to
+/// `proxy` or `h3` in any ASCII case. Used to decide whether the `?` tail is a
+/// parameter section at all; validation of the exact spelling happens after
+/// the decision (so `? proxy=P` is reported as a padded `proxy` key rather
+/// than as an unknown one).
+fn is_param_key_segment(kv: &str) -> bool {
     kv.split_once('=')
-        .is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case("proxy"))
+        .is_some_and(|(k, _)| is_param_name(k.trim()))
+}
+
+fn is_param_name(key: &str) -> bool {
+    key.eq_ignore_ascii_case("proxy") || key.eq_ignore_ascii_case("h3")
 }
 
 fn parse_rcode(s: &str) -> Result<NameServerUrl, NameServerParseError> {
@@ -518,7 +678,7 @@ pub enum NameServerParseError {
     #[error("nameserver string is empty")]
     EmptyInput,
     #[error(
-        "nameserver uses the 'quic' scheme which is not yet supported; tracked as roadmap M1.E-6 / M2. Use 'tls://' or 'https://' for now."
+        "nameserver uses the 'quic' scheme which requires the 'quic-dns' Cargo feature; rebuild with --features quic-dns (or use 'tls://' / 'https://')"
     )]
     QuicNotSupported,
     #[error("nameserver uses unsupported scheme '{0}'")]
@@ -611,7 +771,8 @@ mod tests {
                     addr,
                     port: 443,
                     path: "/dns-query".into(),
-                    sni
+                    sni,
+                    h3: H3Policy::Off,
                 },
             );
         }
@@ -770,6 +931,7 @@ mod tests {
                 port: 443,
                 path: "/dns-query".to_string(),
                 sni: "cloudflare-dns.com".to_string(),
+                h3: H3Policy::Off,
             }
         );
     }
@@ -797,6 +959,7 @@ mod tests {
                 port: 8443,
                 path: "/custom-path".to_string(),
                 sni: "1.1.1.1".to_string(),
+                h3: H3Policy::Off,
             }
         );
     }
@@ -815,6 +978,7 @@ mod tests {
                 port: 443,
                 path: "/dns-query".to_string(),
                 sni: "cloudflare-dns.com".to_string(),
+                h3: H3Policy::Off,
             }
         );
     }
@@ -862,15 +1026,174 @@ mod tests {
         }
     }
 
-    // A17 — Class A per ADR-0002: user assumes encrypted DNS, gets nothing.
-    // Upstream: DoQ supported since Go mihomo ~1.15. NOT silent drop.
+    // A17 — DoQ (RFC 9250) is supported behind the `quic-dns` feature.
     #[test]
-    fn parse_quic_rejected() {
+    #[cfg(feature = "quic-dns")]
+    fn parse_quic() {
+        assert_eq!(
+            NameServerUrl::parse("quic://dns.adguard.com").unwrap(),
+            NameServerUrl::Quic {
+                addr: host("dns.adguard.com"),
+                port: 853,
+                sni: "dns.adguard.com".to_string(),
+            }
+        );
+        // Explicit port + SNI override, mirroring the DoT/DoH spelling.
+        assert_eq!(
+            NameServerUrl::parse("quic://[::1]:8853#dns.adguard.com").unwrap(),
+            NameServerUrl::Quic {
+                addr: HostOrIp::Ip(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+                port: 8853,
+                sni: "dns.adguard.com".to_string(),
+            }
+        );
+    }
+
+    /// `?h3=` — mihomo's per-entry spelling (`true`) plus meow-rs's
+    /// `prefer`/`false`, which let one entry override `dns.prefer-h3`.
+    #[test]
+    #[cfg(feature = "encrypted")]
+    fn entry_h3_parameter_forms() {
+        let h3_of = |s: &str| match NameServerEntry::parse(s) {
+            Ok(entry) => match entry.url {
+                NameServerUrl::Https { h3, .. } => h3,
+                other => panic!("{s} parsed as {other:?}, expected Https"),
+            },
+            Err(e) => panic!("{s} failed to parse: {e}"),
+        };
+        assert_eq!(
+            h3_of("https://dns.google/dns-query?h3=true"),
+            H3Policy::Force
+        );
+        assert_eq!(
+            h3_of("https://dns.google/dns-query?h3=prefer"),
+            H3Policy::Prefer
+        );
+        assert_eq!(
+            h3_of("https://dns.google/dns-query?h3=false"),
+            H3Policy::Off
+        );
+        // No parameter section at all → no policy of its own.
+        assert_eq!(h3_of("https://dns.google/dns-query"), H3Policy::Off);
+        // `proxy` and `h3` coexist in one section, in either order.
+        let entry =
+            NameServerEntry::parse("https://dns.google/dns-query?h3=true&proxy=JP").unwrap();
+        assert_eq!(entry.proxy.as_deref(), Some("JP"));
+        assert!(matches!(
+            entry.url,
+            NameServerUrl::Https {
+                h3: H3Policy::Force,
+                ..
+            }
+        ));
+        let entry =
+            NameServerEntry::parse("https://dns.google/dns-query?proxy=JP&h3=prefer").unwrap();
+        assert_eq!(entry.proxy.as_deref(), Some("JP"));
+        assert!(matches!(
+            entry.url,
+            NameServerUrl::Https {
+                h3: H3Policy::Prefer,
+                ..
+            }
+        ));
+    }
+
+    /// `h3` only names an HTTP/3 preference, so it is refused where there is
+    /// no HTTP: `tls://` / `quic://` entries and bad values.
+    #[test]
+    #[cfg(feature = "quic-dns")]
+    fn entry_h3_parameter_rejected_off_https() {
+        for s in [
+            "tls://8.8.8.8?h3=true",
+            "quic://dns.adguard.com?h3=true",
+            "https://dns.google/dns-query?h3=maybe",
+            "https://dns.google/dns-query?h3=true&h3=false",
+            "https://dns.google/dns-query?h3 =true",
+        ] {
+            match NameServerEntry::parse(s) {
+                Err(NameServerParseError::InvalidParams(msg)) => {
+                    assert!(
+                        msg.contains("h3") || msg.contains("parameter"),
+                        "{s}: message must name the offending parameter; got {msg}"
+                    );
+                }
+                other => panic!("{s} must be InvalidParams, got {other:?}"),
+            }
+        }
+    }
+
+    /// `#h3=true` is the mihomo spelling of a per-entry parameter; `#` is SNI
+    /// here, so the fragment is refused with the fix spelled out.
+    #[test]
+    #[cfg(feature = "encrypted")]
+    fn entry_h3_in_fragment_is_refused() {
+        match NameServerEntry::parse("https://dns.google/dns-query#h3=true") {
+            Err(NameServerParseError::InvalidParams(msg)) => {
+                assert!(msg.contains("'?' section"), "got: {msg}");
+            }
+            other => panic!("must be InvalidParams, got {other:?}"),
+        }
+    }
+
+    /// `quic://` carries the same proxy tag and SNI slot as the other
+    /// encrypted forms.
+    #[test]
+    #[cfg(feature = "quic-dns")]
+    fn entry_quic_proxy_and_sni() {
+        let entry = NameServerEntry::parse("quic://dns.adguard.com?proxy=JP").unwrap();
+        assert_eq!(entry.proxy.as_deref(), Some("JP"));
+        assert_eq!(
+            entry.url,
+            NameServerUrl::Quic {
+                addr: host("dns.adguard.com"),
+                port: 853,
+                sni: "dns.adguard.com".to_string(),
+            }
+        );
+        let entry = NameServerEntry::parse("quic://1.1.1.1:8853#cloudflare-dns.com").unwrap();
+        assert_eq!(entry.proxy, None);
+        assert_eq!(
+            entry.url.to_string(),
+            "quic://1.1.1.1:8853#cloudflare-dns.com"
+        );
+    }
+
+    /// Display renders the h3 policy, so labels and API output keep it.
+    #[test]
+    #[cfg(feature = "encrypted")]
+    fn display_renders_h3_policy() {
+        for (raw, shown) in [
+            (
+                "https://1.1.1.1/dns-query?h3=true#cloudflare-dns.com",
+                "https://1.1.1.1:443/dns-query?h3=true#cloudflare-dns.com",
+            ),
+            (
+                "https://1.1.1.1/dns-query?h3=prefer",
+                "https://1.1.1.1:443/dns-query?h3=prefer#1.1.1.1",
+            ),
+            (
+                "https://1.1.1.1/dns-query",
+                "https://1.1.1.1:443/dns-query#1.1.1.1",
+            ),
+        ] {
+            assert_eq!(
+                NameServerEntry::parse(raw).unwrap().url.to_string(),
+                shown,
+                "{raw}"
+            );
+        }
+    }
+
+    /// Without the feature the scheme stays a hard config error (never a
+    /// silent drop): the message names the feature to rebuild with.
+    #[test]
+    #[cfg(not(feature = "quic-dns"))]
+    fn parse_quic_rejected_without_feature() {
         let err = NameServerUrl::parse("quic://dns.adguard.com").unwrap_err();
         assert!(matches!(err, NameServerParseError::QuicNotSupported));
         assert!(
-            err.to_string().contains("M1.E-6"),
-            "error message must cite M1.E-6 roadmap item"
+            err.to_string().contains("quic-dns"),
+            "error message must name the Cargo feature"
         );
     }
 
@@ -1142,6 +1465,7 @@ mod tests {
                 port: 443,
                 path: "/dns-query".to_string(),
                 sni: "cloudflare-dns.com".to_string(),
+                h3: H3Policy::Off,
             }
         );
     }
@@ -1158,6 +1482,7 @@ mod tests {
                 port: 443,
                 path: "/dns-query".to_string(),
                 sni: "1.1.1.1".to_string(),
+                h3: H3Policy::Off,
             }
         );
     }
@@ -1176,6 +1501,7 @@ mod tests {
                 port: 443,
                 path: "/dns-query?x=1".to_string(),
                 sni: "h".to_string(),
+                h3: H3Policy::Off,
             }
         );
     }
@@ -1468,7 +1794,7 @@ mod tests {
         ] {
             match NameServerEntry::parse(s) {
                 Err(NameServerParseError::InvalidParams(msg)) => assert!(
-                    msg.contains("last query parameter"),
+                    msg.contains("last '?' section"),
                     "{s} error must name the fix; got: {msg}"
                 ),
                 other => panic!("{s} must be InvalidParams, got {other:?}"),

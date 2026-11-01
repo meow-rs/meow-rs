@@ -2599,6 +2599,7 @@ dependencies = [
  "meow-transport",
  "meow-trie",
  "parking_lot",
+ "quiche",
  "rand 0.9.5",
  "rcgen 0.13.2",
  "serde",
@@ -2610,6 +2611,7 @@ dependencies = [
  "tokio",
  "tokio-boring",
  "tracing",
+ "webpki-root-certs",
 ]
 
 [[package]]

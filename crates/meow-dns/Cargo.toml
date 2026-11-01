@@ -15,6 +15,13 @@ default = ["encrypted", "dns-server"]
 # `boring-tls` — the default — rustls otherwise) instead of carrying its own
 # rustls client config.
 encrypted = ["dep:meow-transport", "dep:tokio-boring"]
+# DNS over QUIC (RFC 9250) and DNS over HTTPS over HTTP/3 (`prefer-h3`).
+# quiche links the same vendored BoringSSL as `meow-transport` (the
+# `boringssl-boring-crate` backend the workspace already pins), so this
+# feature adds no second crypto library. It implies `encrypted`: the DoH3
+# fallback rides the HTTP/1.1 DoH path and both share one certificate
+# decision.
+quic-dns = ["encrypted", "dep:quiche", "dep:boring", "dep:webpki-root-certs"]
 # `dns-server` historically gated hickory-server; the in-tree server now uses
 # only `hickory-proto`, so the feature is a no-op kept for API stability.
 dns-server = []
@@ -29,6 +36,13 @@ meow-transport = { workspace = true, features = ["tls"], optional = true }
 # public signature — naming the type (DoT/DoH over `ProxyConn`) needs the
 # crate itself, not just the transport wrapper.
 tokio-boring = { workspace = true, optional = true }
+# QUIC transport for `quic://` and `prefer-h3` (feature `quic-dns`).
+quiche = { workspace = true, optional = true }
+# BoringSSL `SslContextBuilder` for the quiche TLS config (one shared verify
+# store with the DoT/DoH path).
+boring = { workspace = true, optional = true }
+# Mozilla CA roots for the quiche verify store, same bundle as meow-transport.
+webpki-root-certs = { workspace = true, optional = true }
 rand = { workspace = true }
 lru = { workspace = true }
 dashmap = { workspace = true }

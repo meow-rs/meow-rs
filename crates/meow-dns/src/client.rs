@@ -6,6 +6,8 @@
 //! ships its own DNS client instead of relying on `hickory-resolver`.
 
 use crate::cache::QueryFamilies;
+#[cfg(feature = "quic-dns")]
+use crate::quic::{QuicMode, QuicUpstream};
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
@@ -290,6 +292,16 @@ pub struct DnsClient {
     /// granularity, distinguishable here (review M4).
     #[cfg(all(feature = "encrypted", any(test, debug_assertions)))]
     probe_dead: std::sync::atomic::AtomicUsize,
+    /// The QUIC connection for `quic://` / `prefer-h3` entries. `None` for
+    /// every other transport; the driver task is spawned on first use and
+    /// re-dials by itself, so one client owns one connection per upstream.
+    #[cfg(feature = "quic-dns")]
+    quic: Option<Arc<QuicUpstream>>,
+    /// The HTTP/1.1 DoH client a `prefer-h3` entry falls back to when the
+    /// QUIC exchange fails. Built at construction so the fallback keeps its
+    /// own TLS session pool, proxy tag and certificate roots.
+    #[cfg(feature = "quic-dns")]
+    doh_h1: Option<Box<DnsClient>>,
 }
 
 /// What the pool does to an element it discards while an async context
@@ -555,6 +567,20 @@ enum Transport {
         sni: Arc<str>,
         path: Arc<str>,
     },
+    /// DNS over QUIC (RFC 9250).
+    #[cfg(feature = "quic-dns")]
+    Doq {
+        addr: SocketAddr,
+        sni: Arc<str>,
+    },
+    /// DNS over HTTPS over HTTP/3 — mihomo `prefer-h3`, with the HTTP/1.1
+    /// DoH path as the fallback (`self.doh_h1`).
+    #[cfg(feature = "quic-dns")]
+    Doh3 {
+        addr: SocketAddr,
+        sni: Arc<str>,
+        path: Arc<str>,
+    },
     RCode {
         code: ResponseCode,
     },
@@ -570,6 +596,8 @@ impl Transport {
             Self::Udp { addr } | Self::Tcp { addr } => *addr,
             #[cfg(feature = "encrypted")]
             Self::Dot { addr, .. } | Self::Doh { addr, .. } => *addr,
+            #[cfg(feature = "quic-dns")]
+            Self::Doq { addr, .. } | Self::Doh3 { addr, .. } => *addr,
             Self::RCode { .. } => unreachable!("rcode transport has no dial address"),
         }
     }
@@ -593,6 +621,10 @@ impl DnsClient {
             tls_pool_disabled: false,
             #[cfg(all(feature = "encrypted", any(test, debug_assertions)))]
             probe_dead: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(feature = "quic-dns")]
+            quic: None,
+            #[cfg(feature = "quic-dns")]
+            doh_h1: None,
         }
     }
 
@@ -613,6 +645,10 @@ impl DnsClient {
             tls_pool_disabled: false,
             #[cfg(all(feature = "encrypted", any(test, debug_assertions)))]
             probe_dead: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(feature = "quic-dns")]
+            quic: None,
+            #[cfg(feature = "quic-dns")]
+            doh_h1: None,
         }
     }
 
@@ -633,6 +669,10 @@ impl DnsClient {
             tls_pool_disabled: false,
             #[cfg(all(feature = "encrypted", any(test, debug_assertions)))]
             probe_dead: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(feature = "quic-dns")]
+            quic: None,
+            #[cfg(feature = "quic-dns")]
+            doh_h1: None,
         }
     }
 
@@ -657,6 +697,10 @@ impl DnsClient {
             tls_pool_disabled: false,
             #[cfg(all(feature = "encrypted", any(test, debug_assertions)))]
             probe_dead: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(feature = "quic-dns")]
+            quic: None,
+            #[cfg(feature = "quic-dns")]
+            doh_h1: None,
         }
     }
 
@@ -682,12 +726,111 @@ impl DnsClient {
             tls_pool_disabled: false,
             #[cfg(all(feature = "encrypted", any(test, debug_assertions)))]
             probe_dead: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(feature = "quic-dns")]
+            quic: None,
+            #[cfg(feature = "quic-dns")]
+            doh_h1: None,
+        }
+    }
+
+    /// DNS over QUIC (RFC 9250) — `quic://host[:port][#sni]`.
+    ///
+    /// One bidi stream per query, length-prefixed per RFC 9250 §4.2, with the
+    /// DNS transaction ID zeroed on the wire (the peer MUST answer with ID 0;
+    /// the caller's ID is restored before validation).
+    #[cfg(feature = "quic-dns")]
+    pub fn doq(addr: SocketAddr, sni: &str) -> Self {
+        Self::with_quic(
+            Transport::Doq {
+                addr,
+                sni: Arc::from(sni),
+            },
+            QuicMode::Doq,
+            addr,
+            sni,
+            None,
+        )
+    }
+
+    /// DNS over HTTPS over HTTP/3 — the `prefer-h3` form of a `https://`
+    /// entry.
+    ///
+    /// The HTTP/1.1 DoH client built here is the fallback: when the QUIC
+    /// exchange fails (no h3 support, UDP blocked, connection loss) the
+    /// exchange is retried over HTTP/1.1, and a failed handshake parks h3 for
+    /// this upstream so the next query does not pay a second timeout. The
+    /// fallback shares this client's timeout, proxy tag, certificate roots and
+    /// TLS session pool.
+    #[cfg(feature = "quic-dns")]
+    pub fn doh3(addr: SocketAddr, sni: &str, path: &str) -> Self {
+        let h1 = DnsClient::doh(addr, sni, path);
+        Self::with_quic(
+            Transport::Doh3 {
+                addr,
+                sni: Arc::from(sni),
+                path: Arc::from(path),
+            },
+            QuicMode::Doh3 {
+                path: Arc::from(path),
+            },
+            addr,
+            sni,
+            Some(Box::new(h1)),
+        )
+    }
+
+    /// DoH3 in mihomo's per-entry form (`?h3=true`): HTTP/3 only, with no
+    /// HTTP/1.1 fallback. A failure is reported as-is.
+    #[cfg(feature = "quic-dns")]
+    pub fn doh3_force(addr: SocketAddr, sni: &str, path: &str) -> Self {
+        Self::with_quic(
+            Transport::Doh3 {
+                addr,
+                sni: Arc::from(sni),
+                path: Arc::from(path),
+            },
+            QuicMode::Doh3 {
+                path: Arc::from(path),
+            },
+            addr,
+            sni,
+            None,
+        )
+    }
+
+    /// Shared tail of the two QUIC constructors.
+    #[cfg(feature = "quic-dns")]
+    fn with_quic(
+        transport: Transport,
+        mode: QuicMode,
+        addr: SocketAddr,
+        sni: &str,
+        doh_h1: Option<Box<DnsClient>>,
+    ) -> Self {
+        Self {
+            transport,
+            timeout: DEFAULT_QUERY_TIMEOUT,
+            proxy: None,
+            proxy_target: None,
+            tls_extra_roots: Vec::new(),
+            label: None,
+            tcp_pool: Pool::new(TCP_POOL_CAPACITY, TCP_POOL_IDLE_TIMEOUT),
+            tls_pool: Pool::new(TLS_POOL_CAPACITY, TLS_POOL_IDLE_TIMEOUT),
+            tls_pool_disabled: false,
+            #[cfg(all(feature = "encrypted", any(test, debug_assertions)))]
+            probe_dead: std::sync::atomic::AtomicUsize::new(0),
+            quic: Some(Arc::new(QuicUpstream::new(mode, addr, Arc::from(sni)))),
+            doh_h1,
         }
     }
 
     /// Override the per-query timeout.
     pub fn with_timeout(mut self, t: Duration) -> Self {
         self.timeout = t;
+        #[cfg(feature = "quic-dns")]
+        if let Some(h1) = self.doh_h1.as_mut() {
+            h1.timeout = t;
+        }
         self
     }
 
@@ -703,6 +846,15 @@ impl DnsClient {
     ///   adapters can't relay arbitrary UDP. The fallback matches the
     ///   semantics in ADR-0012.
     pub fn with_proxy(mut self, proxy: DnsProxy) -> Self {
+        #[cfg(feature = "quic-dns")]
+        {
+            if let Some(quic) = self.quic.as_ref() {
+                quic.set_proxy(Arc::clone(&proxy));
+            }
+            if let Some(h1) = self.doh_h1.as_mut() {
+                h1.proxy = Some(Arc::clone(&proxy));
+            }
+        }
         self.proxy = Some(proxy);
         self
     }
@@ -713,6 +865,15 @@ impl DnsClient {
     /// lookup of the upstream name is needed (mihomo `newDNSDialer`
     /// semantics). Only meaningful together with [`Self::with_proxy`].
     pub(crate) fn with_proxy_target(mut self, host: Arc<str>, port: u16) -> Self {
+        #[cfg(feature = "quic-dns")]
+        {
+            if let Some(quic) = self.quic.as_ref() {
+                quic.set_proxy_target(Arc::clone(&host), port);
+            }
+            if let Some(h1) = self.doh_h1.as_mut() {
+                h1.proxy_target = Some((Arc::clone(&host), port));
+            }
+        }
         self.proxy_target = Some((host, port));
         self
     }
@@ -729,6 +890,19 @@ impl DnsClient {
     #[cfg(all(feature = "encrypted", any(test, debug_assertions)))]
     #[doc(hidden)]
     pub fn with_tls_additional_roots(mut self, der: Vec<u8>) -> Self {
+        #[cfg(feature = "quic-dns")]
+        {
+            // The QUIC handshake uses the same trust set, so a test upstream
+            // that presents a self-signed chain is reachable over DoQ/DoH3
+            // too. Adding a root retires the live connection (it was
+            // verified against the old store).
+            if let Some(quic) = self.quic.as_ref() {
+                quic.add_extra_root(der.clone());
+            }
+            if let Some(h1) = self.doh_h1.as_mut() {
+                h1.tls_extra_roots.push(der.clone());
+            }
+        }
         self.tls_extra_roots.push(der);
         self
     }
@@ -743,6 +917,10 @@ impl DnsClient {
     #[doc(hidden)]
     pub fn with_tls_pool_disabled(mut self) -> Self {
         self.tls_pool_disabled = true;
+        #[cfg(feature = "quic-dns")]
+        if let Some(h1) = self.doh_h1.as_mut() {
+            h1.tls_pool_disabled = true;
+        }
         self
     }
 
@@ -760,7 +938,12 @@ impl DnsClient {
 
     /// Override the API/UI label used to report this upstream in DNS results.
     pub fn with_upstream_label(mut self, label: impl Into<String>) -> Self {
-        self.label = Some(Arc::from(label.into()));
+        let label: Arc<str> = Arc::from(label.into());
+        #[cfg(feature = "quic-dns")]
+        if let Some(h1) = self.doh_h1.as_mut() {
+            h1.label = Some(Arc::clone(&label));
+        }
+        self.label = Some(label);
         self
     }
 
@@ -787,6 +970,12 @@ impl DnsClient {
     /// Non-blocking. Returns the idle conns closed now. UDP opens a socket
     /// per query and pools nothing.
     pub fn reset_connections(&self) -> usize {
+        // The QUIC driver re-dials on its next query; the connection itself
+        // is closed by the task, so this stays non-blocking.
+        #[cfg(feature = "quic-dns")]
+        if let Some(quic) = self.quic.as_ref() {
+            quic.mark_stale();
+        }
         #[cfg(feature = "encrypted")]
         {
             self.tcp_pool.reset() + self.tls_pool.reset()
@@ -829,21 +1018,24 @@ impl DnsClient {
                 #[cfg(feature = "encrypted")]
                 Transport::Doh {
                     addr, sni, path, ..
-                } => {
+                } => doh_label(addr, sni, path),
+                #[cfg(feature = "quic-dns")]
+                Transport::Doq { addr, sni, .. } => {
                     if sni.is_empty() {
-                        format!("https://{}", socket_label(*addr, 443))
-                    } else if path.as_ref() == "/dns-query" {
-                        if addr.port() == 443 {
-                            format!("https://{sni}")
-                        } else {
-                            format!("https://{sni}:{}", addr.port())
-                        }
-                    } else if addr.port() == 443 {
-                        format!("https://{sni}{path}")
+                        format!("quic://{}", socket_label(*addr, 853))
+                    } else if addr.port() == 853 {
+                        format!("quic://{sni}")
                     } else {
-                        format!("https://{sni}:{}{path}", addr.port())
+                        format!("quic://{sni}:{}", addr.port())
                     }
                 }
+                // A DoH3 entry is the same URL as its HTTP/1.1 fallback, so
+                // the label stays `https://…` — the transport is an
+                // implementation detail of one upstream, not its identity.
+                #[cfg(feature = "quic-dns")]
+                Transport::Doh3 {
+                    addr, sni, path, ..
+                } => doh_label(addr, sni, path),
             }
         };
         if let Some(proxy) = &self.proxy {
@@ -1430,6 +1622,12 @@ impl DnsClient {
                 Transport::Dot { .. } | Transport::Doh { .. } => {
                     return self.tls_exchange_pooled(wire, expected).await;
                 }
+                // A `?proxy=` QUIC entry dials the adapter's own datagram
+                // association, so it takes the same path as a direct one.
+                #[cfg(feature = "quic-dns")]
+                Transport::Doq { .. } => return self.quic_exchange(wire, expected).await,
+                #[cfg(feature = "quic-dns")]
+                Transport::Doh3 { .. } => return self.doh3_exchange(wire, expected).await,
             }
         }
         match &self.transport {
@@ -1442,7 +1640,80 @@ impl DnsClient {
             Transport::Dot { .. } | Transport::Doh { .. } => {
                 self.tls_exchange_pooled(wire, expected).await
             }
+            #[cfg(feature = "quic-dns")]
+            Transport::Doq { .. } => self.quic_exchange(wire, expected).await,
+            #[cfg(feature = "quic-dns")]
+            Transport::Doh3 { .. } => self.doh3_exchange(wire, expected).await,
         }
+    }
+
+    /// One DoQ exchange through the per-upstream connection driver.
+    #[cfg(feature = "quic-dns")]
+    async fn quic_exchange(
+        &self,
+        wire: &[u8],
+        expected: &ExpectedResponse,
+    ) -> Result<Message, ClientError> {
+        let upstream = self.quic.as_ref().ok_or(ClientError::Protocol(
+            "QUIC transport without an upstream driver",
+        ))?;
+        let response = upstream.exchange(wire).await?;
+        decode_validated_response(&response, expected)
+    }
+
+    /// One DoH3 exchange, falling back to the HTTP/1.1 DoH path — the
+    /// semantics `prefer-h3` names: h3 is preferred, not required.
+    #[cfg(feature = "quic-dns")]
+    async fn doh3_exchange(
+        &self,
+        wire: &[u8],
+        expected: &ExpectedResponse,
+    ) -> Result<Message, ClientError> {
+        let upstream = self.quic.as_ref().ok_or(ClientError::Protocol(
+            "prefer-h3 transport without an upstream driver",
+        ))?;
+        if upstream.h3_available() {
+            // Half the budget. A hung QUIC handshake must leave the HTTP/1.1
+            // fallback enough time to answer, or `prefer-h3` would turn a
+            // dead UDP path into a dead resolver.
+            let budget = self.timeout / 2;
+            let failure = match tokio::time::timeout(budget, upstream.exchange(wire)).await {
+                Ok(Ok(response)) => {
+                    upstream.park_h3(false);
+                    return decode_validated_response(&response, expected);
+                }
+                // A certificate failure is a verdict, not a transport
+                // preference: the fallback would fail identically and the
+                // silent retry would only hide it.
+                Ok(Err(err @ ClientError::Tls(_))) => return Err(err),
+                Ok(Err(err)) => err,
+                Err(_elapsed) => ClientError::Timeout(budget),
+            };
+            // `?h3=true` (mihomo's per-entry form) means HTTP/3 only: there
+            // is no fallback client to retry on.
+            let Some(h1) = self.doh_h1.as_ref() else {
+                return Err(failure);
+            };
+            tracing::debug!(
+                upstream = %self.upstream_label(),
+                error = %failure,
+                "DoH3 exchange failed; retrying over HTTP/1.1"
+            );
+            upstream.park_h3(true);
+            // Boxed: `exchange` recursing through this helper would otherwise
+            // make the async fn infinitely sized. The fallback client is a
+            // plain DoH client, so the recursion is one level deep.
+            return Box::pin(h1.exchange(wire, expected)).await;
+        }
+        let Some(h1) = self.doh_h1.as_ref() else {
+            // Parked HTTP/3 on a force-only entry: the cooldown is
+            // meaningless without a fallback, so retry QUIC instead of
+            // failing a query that a fresh connection could answer.
+            upstream.park_h3(false);
+            let response = upstream.exchange(wire).await?;
+            return decode_validated_response(&response, expected);
+        };
+        Box::pin(h1.exchange(wire, expected)).await
     }
 }
 
@@ -1493,6 +1764,25 @@ fn validate_response(response: &Message, expected: &ExpectedResponse) -> Result<
         return Err(ClientError::Protocol("response question class mismatch"));
     }
     Ok(())
+}
+
+/// `https://host[:port][path]` — the label DoH and its HTTP/3 form share,
+/// since both name the same upstream URL.
+#[cfg(feature = "encrypted")]
+fn doh_label(addr: &SocketAddr, sni: &str, path: &str) -> String {
+    if sni.is_empty() {
+        format!("https://{}", socket_label(*addr, 443))
+    } else if path == "/dns-query" {
+        if addr.port() == 443 {
+            format!("https://{sni}")
+        } else {
+            format!("https://{sni}:{}", addr.port())
+        }
+    } else if addr.port() == 443 {
+        format!("https://{sni}{path}")
+    } else {
+        format!("https://{sni}:{}{path}", addr.port())
+    }
 }
 
 fn socket_label(addr: SocketAddr, default_port: u16) -> String {

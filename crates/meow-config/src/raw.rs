@@ -500,6 +500,15 @@ pub struct RawDns {
     pub nameserver_policy: Option<RawNameserverPolicy>,
     /// Controls when the `fallback:` nameservers replace the primary result.
     pub fallback_filter: Option<RawFallbackFilter>,
+    /// mihomo `prefer-h3`: every `https://` nameserver prefers HTTP/3 and
+    /// falls back to HTTP/1.1 when the QUIC exchange fails. A per-entry
+    /// `?h3=true` overrides it (HTTP/3 only), `?h3=false` turns it off, and
+    /// `?h3=prefer` opts a single entry in without the global flag.
+    ///
+    /// Requires a build with the `quic-dns` feature; without it, a config
+    /// that asks for HTTP/3 is a hard load error rather than a silent
+    /// downgrade (ADR-0002 Class A).
+    pub prefer_h3: Option<bool>,
 }
 
 /// A nameserver-policy value: either a single URL string or a list of URLs.

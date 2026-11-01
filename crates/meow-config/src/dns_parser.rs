@@ -67,13 +67,66 @@ pub async fn parse_dns(
     let use_hosts = dns.use_hosts.unwrap_or(true);
     let use_system_hosts = dns.use_system_hosts.unwrap_or(true);
 
-    let main_urls = parse_nameserver_entries(dns.nameserver.as_deref().unwrap_or(&[]))?;
-    let fallback_urls = parse_nameserver_entries(dns.fallback.as_deref().unwrap_or(&[]))?;
-    let default_ns_urls =
-        parse_nameserver_entries(dns.default_nameserver.as_deref().unwrap_or(&[]))?;
-    let proxy_ns_urls =
-        parse_nameserver_entries(dns.proxy_server_nameserver.as_deref().unwrap_or(&[]))?;
-    let direct_ns_urls = parse_nameserver_entries(dns.direct_nameserver.as_deref().unwrap_or(&[]))?;
+    // mihomo `prefer-h3`: applied to every `https://` entry before parsing,
+    // so an entry that spells its own `?h3=` keeps the last word.
+    let prefer_h3 = dns.prefer_h3.unwrap_or(false);
+    let main_urls = parse_nameserver_entries(&prefer_h3_list(
+        dns.nameserver.as_deref().unwrap_or(&[]),
+        prefer_h3,
+    ))?;
+    let fallback_urls = parse_nameserver_entries(&prefer_h3_list(
+        dns.fallback.as_deref().unwrap_or(&[]),
+        prefer_h3,
+    ))?;
+    let default_ns_urls = parse_nameserver_entries(&prefer_h3_list(
+        dns.default_nameserver.as_deref().unwrap_or(&[]),
+        prefer_h3,
+    ))?;
+    let proxy_ns_urls = parse_nameserver_entries(&prefer_h3_list(
+        dns.proxy_server_nameserver.as_deref().unwrap_or(&[]),
+        prefer_h3,
+    ))?;
+    let direct_ns_urls = parse_nameserver_entries(&prefer_h3_list(
+        dns.direct_nameserver.as_deref().unwrap_or(&[]),
+        prefer_h3,
+    ))?;
+
+    // A `prefer-h3` / `?h3=` entry needs a build that can speak QUIC. Reject
+    // the config here — client construction would otherwise panic, which is a
+    // process abort rather than a config error (ADR-0002 Class A).
+    if !cfg!(feature = "dns-quic") {
+        let asks_h3 = |entries: &[NameServerEntry]| {
+            entries.iter().any(
+                |e| matches!(&e.url, meow_dns::NameServerUrl::Https { h3, .. } if h3.is_enabled()),
+            )
+        };
+        let policy_asks_h3 = dns.nameserver_policy.as_ref().is_some_and(|map| {
+            map.values().any(|v| {
+                v.as_urls()
+                    .iter()
+                    .any(|s| s.contains("h3=true") || s.contains("h3=prefer"))
+            })
+        });
+        if asks_h3(&main_urls)
+            || asks_h3(&fallback_urls)
+            || asks_h3(&default_ns_urls)
+            || asks_h3(&proxy_ns_urls)
+            || asks_h3(&direct_ns_urls)
+            || policy_asks_h3
+        {
+            anyhow::bail!(
+                "dns.prefer-h3 / '?h3=' asks for DNS over HTTP/3, which requires a build \
+                 with the 'dns-quic' feature; this binary was built without it"
+            );
+        }
+    }
+
+    // The same `prefer-h3` rewrite for `nameserver-policy` values, which are
+    // URL strings until the policy builder parses them.
+    let effective_policy = dns
+        .nameserver_policy
+        .as_ref()
+        .map(|map| prefer_h3_policy_map(map, prefer_h3));
 
     let mode = match dns.enhanced_mode.as_deref() {
         Some("fake-ip") => DnsMode::FakeIp,
@@ -139,7 +192,7 @@ pub async fn parse_dns(
     };
 
     // Build nameserver-policy if configured.
-    let policy = if let Some(nsp_map) = &dns.nameserver_policy {
+    let policy = if let Some(nsp_map) = &effective_policy {
         if nsp_map.is_empty() {
             None
         } else {
@@ -170,7 +223,7 @@ pub async fn parse_dns(
     let direct_resolver = if direct_ns_urls.is_empty() {
         None
     } else {
-        let direct_policy = match &dns.nameserver_policy {
+        let direct_policy = match &effective_policy {
             Some(nsp_map)
                 if !nsp_map.is_empty() && dns.direct_nameserver_follow_policy.unwrap_or(false) =>
             {
@@ -435,6 +488,80 @@ fn is_ip_literal_addr(addr: &str) -> bool {
     let host = host.strip_prefix('[').unwrap_or(host);
     let host = host.strip_suffix(']').unwrap_or(host);
     host.parse::<IpAddr>().is_ok()
+}
+
+/// Append `?h3=prefer` to one nameserver URL when `prefer_h3` is on.
+///
+/// Only `https://` entries are touched, and only when the entry does not
+/// already carry an `h3=` decision of its own — the same "global flag, local
+/// override" rule mihomo applies, expressed **before** parsing so
+/// `nameserver-policy` values (still strings at that point) get it too.
+fn prefer_h3_url(raw: &str, prefer_h3: bool) -> String {
+    if !prefer_h3 {
+        return raw.to_string();
+    }
+    let trimmed = raw.trim();
+    if !trimmed.starts_with("https://") || has_h3_parameter(trimmed) {
+        return raw.to_string();
+    }
+    // Keep the `#sni` fragment last: the parameter section belongs to the
+    // URL, the fragment to meow-rs's SNI override.
+    let (head, fragment) = match trimmed.find('#') {
+        Some(idx) => (&trimmed[..idx], &trimmed[idx..]),
+        None => (trimmed, ""),
+    };
+    // Extend an existing parameter section, or open one.
+    let separator = match head.rfind('?') {
+        Some(idx) if head[idx + 1..].split('&').any(is_h3_parameter_segment) => '&',
+        _ => '?',
+    };
+    format!("{head}{separator}h3=prefer{fragment}")
+}
+
+/// `true` when any `?` section of `url` already sets an `h3` key.
+fn has_h3_parameter(url: &str) -> bool {
+    url.split('?')
+        .skip(1)
+        .flat_map(|section| section.split('&'))
+        .filter_map(|kv| kv.split_once('='))
+        .any(|(k, _)| k.trim().eq_ignore_ascii_case("h3"))
+}
+
+/// A `k=v` segment names a nameserver parameter key (`proxy` / `h3`).
+fn is_h3_parameter_segment(kv: &str) -> bool {
+    kv.split_once('=').is_some_and(|(k, _)| {
+        let k = k.trim();
+        k.eq_ignore_ascii_case("proxy") || k.eq_ignore_ascii_case("h3")
+    })
+}
+
+fn prefer_h3_list(servers: &[String], prefer_h3: bool) -> Vec<String> {
+    servers
+        .iter()
+        .map(|s| prefer_h3_url(s, prefer_h3))
+        .collect()
+}
+
+fn prefer_h3_policy_map(
+    map: &crate::raw::RawNameserverPolicy,
+    prefer_h3: bool,
+) -> crate::raw::RawNameserverPolicy {
+    if !prefer_h3 {
+        return map.clone();
+    }
+    map.iter()
+        .map(|(key, value)| {
+            let value = match value {
+                crate::raw::RawNspValue::One(s) => {
+                    crate::raw::RawNspValue::One(prefer_h3_url(s, true))
+                }
+                crate::raw::RawNspValue::Many(list) => crate::raw::RawNspValue::Many(
+                    list.iter().map(|s| prefer_h3_url(s, true)).collect(),
+                ),
+            };
+            (key.clone(), value)
+        })
+        .collect()
 }
 
 /// Parse nameserver strings into `NameServerEntry`s — every entry must
@@ -921,12 +1048,25 @@ async fn resolve_policy_hostname_url(
             port,
             path,
             sni,
+            h3,
         } => resolve_policy_host(key, url_str, &host, bootstrap_clients)
             .await
             .map(|ip| NameServerUrl::Https {
                 addr: HostOrIp::Ip(ip),
                 port,
                 path,
+                sni,
+                h3,
+            }),
+        NameServerUrl::Quic {
+            addr: HostOrIp::Host(host),
+            port,
+            sni,
+        } => resolve_policy_host(key, url_str, &host, bootstrap_clients)
+            .await
+            .map(|ip| NameServerUrl::Quic {
+                addr: HostOrIp::Ip(ip),
+                port,
                 sni,
             }),
         other => Some(other),
@@ -1319,6 +1459,80 @@ async fn parse_system_hosts() -> Vec<(String, Vec<IpAddr>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `dns.prefer-h3` adds the parameter only to `https://` entries, and an
+    /// entry that already decided keeps its own answer.
+    #[test]
+    fn prefer_h3_rewrite_rules() {
+        for (raw, expected) in [
+            (
+                "https://1.1.1.1/dns-query",
+                "https://1.1.1.1/dns-query?h3=prefer",
+            ),
+            (
+                "https://1.1.1.1/dns-query#cloudflare-dns.com",
+                "https://1.1.1.1/dns-query?h3=prefer#cloudflare-dns.com",
+            ),
+            (
+                "https://1.1.1.1/dns-query?proxy=JP",
+                "https://1.1.1.1/dns-query?proxy=JP&h3=prefer",
+            ),
+            // A per-entry decision is not overwritten.
+            (
+                "https://1.1.1.1/dns-query?h3=false",
+                "https://1.1.1.1/dns-query?h3=false",
+            ),
+            (
+                "https://1.1.1.1/dns-query?h3=true",
+                "https://1.1.1.1/dns-query?h3=true",
+            ),
+            // Everything that is not DoH is left alone.
+            ("tls://8.8.8.8#dns.google", "tls://8.8.8.8#dns.google"),
+            ("quic://dns.adguard.com", "quic://dns.adguard.com"),
+            ("223.5.5.5", "223.5.5.5"),
+        ] {
+            assert_eq!(prefer_h3_url(raw, true), expected, "{raw}");
+            // Off: verbatim.
+            assert_eq!(prefer_h3_url(raw, false), raw, "{raw} (off)");
+        }
+    }
+
+    /// The rewritten URL must parse back into the `Prefer` policy — the flag
+    /// has to survive the parse, not just the string.
+    #[test]
+    fn prefer_h3_rewrite_parses_as_prefer() {
+        let rewritten = prefer_h3_url("https://1.1.1.1/dns-query#cloudflare-dns.com", true);
+        let entry = meow_dns::NameServerEntry::parse(&rewritten).unwrap();
+        match entry.url {
+            meow_dns::NameServerUrl::Https { h3, sni, .. } => {
+                assert_eq!(h3, meow_dns::H3Policy::Prefer);
+                assert_eq!(sni, "cloudflare-dns.com");
+            }
+            other => panic!("expected Https, got {other:?}"),
+        }
+    }
+
+    /// `prefer-h3` reaches `nameserver-policy` values too, which are still
+    /// strings when the policy map is built.
+    #[test]
+    fn prefer_h3_rewrites_policy_values() {
+        let mut map = crate::raw::RawNameserverPolicy::new();
+        map.insert(
+            "geosite:cn".to_string(),
+            crate::raw::RawNspValue::Many(vec![
+                "https://1.1.1.1/dns-query".to_string(),
+                "223.5.5.5".to_string(),
+            ]),
+        );
+        let rewritten = prefer_h3_policy_map(&map, true);
+        let value = rewritten.get("geosite:cn").unwrap();
+        assert_eq!(
+            value.as_urls(),
+            vec!["https://1.1.1.1/dns-query?h3=prefer", "223.5.5.5"]
+        );
+        // `false` returns the map unchanged.
+        assert_eq!(prefer_h3_policy_map(&map, false), map);
+    }
     use crate::raw::HostsValue;
     use std::net::Ipv4Addr;
 
@@ -2211,13 +2425,27 @@ mod tests {
         );
     }
 
-    // C4: quic:// in nameserver produces an error citing M1.E-6.
+    // C4: quic:// is accepted with the `dns-quic` feature and refused (naming
+    // the feature) without it — never a silent drop.
     #[test]
-    fn parse_nameserver_urls_quic_errors() {
+    fn parse_nameserver_urls_quic_requires_the_feature() {
         let result = parse_nameserver_urls(&["quic://dns.adguard.com".to_string()]);
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("M1.E-6"), "error must cite M1.E-6, got: {msg}");
+        if cfg!(feature = "dns-quic") {
+            assert_eq!(
+                result.unwrap(),
+                vec![meow_dns::NameServerUrl::Quic {
+                    addr: meow_dns::HostOrIp::Host("dns.adguard.com".to_string()),
+                    port: 853,
+                    sni: "dns.adguard.com".to_string(),
+                }]
+            );
+        } else {
+            let msg = result.unwrap_err().to_string();
+            assert!(
+                msg.contains("quic-dns"),
+                "error must cite the feature, got: {msg}"
+            );
+        }
     }
 
     // C5: unknown scheme errors, not warns.
