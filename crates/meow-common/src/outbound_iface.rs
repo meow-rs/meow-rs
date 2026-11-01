@@ -64,6 +64,13 @@
 
 use crate::logbook;
 use std::io;
+#[cfg(any(
+    test,
+    all(
+        not(target_env = "ohos"),
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    )
+))]
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -348,13 +355,23 @@ pub fn outbound_interface() -> Option<Arc<str>> {
 /// Loopback is exempt on the index-keyed platforms (see the
 /// [module docs](self)): the traffic never follows the TUN's routes, and
 /// macOS refuses an IPv4 loopback connect from an interface-scoped socket.
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+// Only `socket_protect`'s interface-bound dials ask, and OpenHarmony has none.
+#[cfg(all(
+    not(target_env = "ohos"),
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
 pub(crate) fn binds_peer(peer: IpAddr) -> bool {
     cfg!(target_os = "linux") || !is_loopback(peer)
 }
 
 /// Loopback including the IPv4-mapped form a dual-stack socket dials.
-#[cfg(any(test, target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[cfg(any(
+    test,
+    all(
+        not(target_env = "ohos"),
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    )
+))]
 fn is_loopback(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => v4.is_loopback(),

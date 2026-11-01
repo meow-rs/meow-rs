@@ -74,11 +74,14 @@ pub use sniffer::SnifferConfig;
 pub use socket_protect::{bind_udp, connect_tcp, connect_tcp_host, resolve_host, resolve_host_all};
 // Host-resolver hook is cross-platform (iOS installs it without a protector).
 pub use socket_protect::{clear_host_resolver, host_resolver, set_host_resolver, HostResolver};
-// Socket protector is Android-only (raw-fd `VpnService.protect`).
+// Socket protector is Android / OpenHarmony only (raw-fd `protect(fd)`).
 #[cfg(any(target_os = "android", target_env = "ohos"))]
 pub use socket_protect::{
     clear_socket_protector, set_socket_protector, socket_protector, SocketProtector,
 };
+// OpenHarmony has no protectable system resolver; the embedder supplies one.
+#[cfg(target_env = "ohos")]
+pub use socket_protect::{clear_bootstrap_host_resolver, set_bootstrap_host_resolver};
 pub use traffic::{ProxyTraffic, ProxyTrafficSource};
 pub use tunnel_mode::TunnelMode;
 
