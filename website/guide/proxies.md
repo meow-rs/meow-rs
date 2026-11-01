@@ -382,7 +382,11 @@ Obfuscated-TLS outbound (requires the `anytls` feature).
 | `port` | u16 | ✓ | — | |
 | `password` | string | ✓ | — | |
 | `sni` | string | | — | |
-| `skip-cert-verify` | bool | | `false` | |
+| `skip-cert-verify` | bool | | `false` | Ignored when `fingerprint` or `name-cert-verify` is set |
+| `fingerprint` | string | | — | Pinned cert SHA-256 of the DER (hex, `:` separators and case optional). A leaf match is the identity; a CA match verifies the leaf under it plus the name |
+| `name-cert-verify` | string | | — | Verify the certificate for this name instead of `sni` (SNI unchanged) |
+| `client-fingerprint` | string | | — | uTLS profile shaping the ClientHello (`none` = default) |
+| `alpn` | list | | — | ALPN protocols, offered in order |
 | `udp` | bool | | `false` | Enable UDP relay (sing-box udp-over-tcp v2) |
 
 ---

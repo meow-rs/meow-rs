@@ -1227,13 +1227,13 @@ fn parse_anytls(
         .unwrap_or(false);
 
     let optional_string = |field: &str| match config.get(field) {
-        Some(serde_yaml::Value::String(value)) => Ok(Some(value.clone())),
-        None | Some(serde_yaml::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(value)) => Ok(Some(value.clone())),
+        None | Some(serde_json::Value::Null) => Ok(None),
         Some(_) => Err(format!("anytls[{name}]: {field} must be a string")),
     };
     let alpn = match config.get("alpn") {
-        None | Some(serde_yaml::Value::Null) => Vec::new(),
-        Some(serde_yaml::Value::Sequence(values)) => values
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(serde_json::Value::Array(values)) => values
             .iter()
             .map(|value| {
                 value

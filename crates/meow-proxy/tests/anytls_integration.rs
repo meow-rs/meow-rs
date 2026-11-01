@@ -613,6 +613,58 @@ async fn anytls_udp_round_trip_through_upstream_server() {
     assert_eq!(from, echo_addr, "reply must carry the peer address");
 }
 
+/// UDP-over-TCP rides the same `TlsConnect` hook as TCP, so a certificate
+/// pin must gate it too: a mismatched pin fails `dial_udp` even with
+/// `skip-cert-verify: true`, a matching one relays datagrams.
+#[tokio::test]
+async fn anytls_udp_enforces_certificate_pin() {
+    install_crypto_provider();
+
+    let (echo_addr, _echo_h) = start_udp_echo_server().await;
+    let (cert, key) = self_signed_cert();
+    let pin = Sha256::digest(cert.as_ref());
+    let mut wrong = pin;
+    wrong[31] ^= 0x80;
+    let (server_addr, _server_h) = start_anytls_server(cert, key).await;
+
+    for (fingerprint, accepted) in [(hex::encode(wrong), false), (hex::encode(pin), true)] {
+        let options = AnytlsTlsOptions {
+            sni: Some("localhost".into()),
+            skip_cert_verify: true,
+            fingerprint: Some(fingerprint),
+            ..Default::default()
+        };
+        let adapter = AnytlsAdapter::new_with_tls(
+            "udp-pin",
+            &server_addr.ip().to_string(),
+            server_addr.port(),
+            PASSWORD,
+            &options,
+            true,
+        )
+        .expect("adapter must build");
+        let result = timeout(T, adapter.dial_udp(&udp_metadata(echo_addr)))
+            .await
+            .expect("dial_udp must not stall");
+        if !accepted {
+            assert!(result.is_err(), "mismatched pin must fail the UoT dial");
+            continue;
+        }
+        let conn = result.expect("matching pin must dial");
+        let payload = b"pinned anytls udp";
+        timeout(T, conn.write_packet(payload, &echo_addr))
+            .await
+            .expect("write_packet must not stall")
+            .expect("write_packet must succeed");
+        let mut buf = vec![0u8; 2048];
+        let (n, _) = timeout(T, conn.read_packet(&mut buf))
+            .await
+            .expect("read_packet must not stall")
+            .expect("read_packet must succeed");
+        assert_eq!(&buf[..n], payload);
+    }
+}
+
 #[tokio::test]
 async fn anytls_udp_routes_each_packet_to_its_own_destination() {
     // Bind format (isConnect=0) means the destination travels with every

@@ -65,9 +65,9 @@ impl AnytlsTlsOptions {
             .name_cert_verify
             .as_deref()
             .filter(|s| !s.is_empty())
-            .map(normalize_server_name)
+            .map(|value| normalize_name(value, "name-cert-verify"))
             .transpose()
-            .map_err(|e| format!("anytls[{name}]: name-cert-verify: {e}"))?;
+            .map_err(|e| format!("anytls[{name}]: {e}"))?;
         let cert_pin = self
             .fingerprint
             .as_deref()
@@ -75,14 +75,25 @@ impl AnytlsTlsOptions {
             .map(|value| parse_cert_pin(value, &format!("anytls[{name}]")))
             .transpose()
             .map_err(|e| e.to_string())?;
+        // Profile names are matched case-insensitively (upstream lowercases
+        // before its lookup); `Chrome` must not silently fall back to the
+        // default ClientHello.
         let fingerprint = self
             .client_fingerprint
-            .as_ref()
-            .filter(|s| !s.is_empty() && s.as_str() != "none")
-            .cloned();
+            .as_deref()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty() && s != "none");
         // Mihomo's explicit verification name overrides skip-cert-verify;
         // a configured pin owns verification independently of that flag.
         let skip_cert_verify = self.skip_cert_verify && verify_name.is_none() && cert_pin.is_none();
+        if self.skip_cert_verify && !skip_cert_verify {
+            // Say so once at load rather than let a user believe
+            // verification is off when it is not (hysteria2 parity).
+            tracing::warn!(
+                "anytls[{name}]: skip-cert-verify is ignored because fingerprint \
+                 or name-cert-verify is set; the server certificate is verified"
+            );
+        }
         Ok(TlsConfig {
             verify_name,
             cert_pin,
@@ -716,9 +727,14 @@ impl Drop for AnytlsPacketConn {
 /// an IP literal is verified against the certificate's `iPAddress` SAN and
 /// (per RFC 6066 §3) not sent as SNI — `TlsLayer` handles both.
 fn normalize_server_name(value: &str) -> std::result::Result<String, String> {
+    normalize_name(value, "SNI")
+}
+
+/// [`normalize_server_name`] with the field named in the error.
+fn normalize_name(value: &str, field: &str) -> std::result::Result<String, String> {
     let normalized = value.trim().trim_start_matches('[').trim_end_matches(']');
     if normalized.is_empty() {
-        return Err("SNI cannot be empty".to_string());
+        return Err(format!("{field} cannot be empty"));
     }
     Ok(normalized.to_string())
 }
@@ -751,7 +767,7 @@ impl TlsConnect for MeowTlsConnect {
 //
 // `anytls_rs` can't depend on `meow_common` (or vice-versa), so each ships
 // its own outbound-socket hook registries. These bridges — installed exactly
-// once via the `Once` guard inside `AnytlsAdapter::new` — re-publish
+// once via the `Once` guard reached from `AnytlsAdapter::build` — re-publish
 // meow_common's hooks into the `anytls-rs` registries:
 //
 // - `TcpDialer` (all targets): routes the client-side session dial through
@@ -813,6 +829,84 @@ mod tests {
     use meow_common::Network;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+
+    #[test]
+    fn tls_options_absent_keep_legacy_defaults() {
+        let cfg = AnytlsTlsOptions {
+            skip_cert_verify: true,
+            ..Default::default()
+        }
+        .tls_config("n", "example.com")
+        .unwrap();
+        assert_eq!(cfg.sni.as_deref(), Some("example.com"));
+        assert!(cfg.skip_cert_verify, "no pin/name: skip-cert-verify kept");
+        assert!(cfg.cert_pin.is_none());
+        assert!(cfg.verify_name.is_none());
+        assert!(cfg.fingerprint.is_none());
+        assert!(cfg.alpn.is_empty());
+    }
+
+    #[test]
+    fn tls_options_pin_and_name_override_skip_cert_verify() {
+        let pin = "AB:".repeat(32);
+        let cfg = AnytlsTlsOptions {
+            skip_cert_verify: true,
+            fingerprint: Some(pin[..95].to_string()),
+            ..Default::default()
+        }
+        .tls_config("n", "example.com")
+        .unwrap();
+        assert_eq!(cfg.cert_pin, Some([0xab; 32]));
+        assert!(!cfg.skip_cert_verify, "a pin must not be bypassed");
+
+        let cfg = AnytlsTlsOptions {
+            skip_cert_verify: true,
+            name_cert_verify: Some("real.example.com".into()),
+            ..Default::default()
+        }
+        .tls_config("n", "example.com")
+        .unwrap();
+        assert_eq!(cfg.verify_name.as_deref(), Some("real.example.com"));
+        assert!(
+            !cfg.skip_cert_verify,
+            "name-cert-verify forces verification"
+        );
+    }
+
+    #[test]
+    fn tls_options_reject_bad_values_and_normalize_profile() {
+        for bad in ["chrome", "zz", "  "] {
+            let err = AnytlsTlsOptions {
+                fingerprint: Some(bad.into()),
+                ..Default::default()
+            }
+            .tls_config("n", "example.com")
+            .unwrap_err();
+            assert!(err.contains("fingerprint"), "{bad:?}: {err}");
+        }
+        let err = AnytlsTlsOptions {
+            name_cert_verify: Some(" ".into()),
+            ..Default::default()
+        }
+        .tls_config("n", "example.com")
+        .unwrap_err();
+        assert!(err.contains("name-cert-verify"), "{err}");
+
+        let cfg = AnytlsTlsOptions {
+            client_fingerprint: Some(" Chrome ".into()),
+            ..Default::default()
+        }
+        .tls_config("n", "example.com")
+        .unwrap();
+        assert_eq!(cfg.fingerprint.as_deref(), Some("chrome"));
+        let cfg = AnytlsTlsOptions {
+            client_fingerprint: Some("NONE".into()),
+            ..Default::default()
+        }
+        .tls_config("n", "example.com")
+        .unwrap();
+        assert!(cfg.fingerprint.is_none());
+    }
 
     async fn test_session() -> (Arc<Session>, DuplexStream) {
         let (io, peer) = tokio::io::duplex(64);
