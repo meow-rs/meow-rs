@@ -1008,9 +1008,9 @@ mod linux {
                 std::ptr::write(
                     hdr,
                     libc::cmsghdr {
-                        // libc models musl's size_t as u32 on 32-bit targets
-                        // while this helper takes a usize; `as _` bridges the
-                        // two on every width.
+                        // libc types musl's `cmsg_len` as `socklen_t` (u32 on
+                        // every width) while glibc's is `size_t`; this helper
+                        // takes a usize, and `as _` fits both.
                         cmsg_len: cmsg_len as _,
                         cmsg_level: level,
                         cmsg_type: ty,

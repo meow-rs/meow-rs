@@ -37,9 +37,9 @@ Feature note: release binaries use the default meow-app feature set
 32-bit arm / MIPS OpenWrt `.ipk`/`.apk` packages are not published
 (`openwrt_archs` is empty for those targets in the release matrix). The
 static `meow-<ref>-armv7-unknown-linux-musleabihf.tar.gz` release tarball
-works on 32-bit arm as-is; for MIPS, cross-build from source with
-`--no-default-features --features full` if you need a build without
-BoringSSL.
+works on 32-bit arm as-is. MIPS has no release artifact: `boring-sys`,
+which every feature bundle (`full` and `minimal` alike) requires, does not
+build there.
 
 Find your device's architecture with:
 
@@ -372,6 +372,5 @@ bash tests/test_luci_meow.sh
 - An apk repository/feed (per-release `.apk` files only; they are unsigned).
 - 32-bit arm / mips release ipks — the static armv7 tarball
   (`meow-<ref>-armv7-unknown-linux-musleabihf.tar.gz`) covers 32-bit arm
-  without a package; mips has no release artifact (boring-sys does not
-  build there). Build from source with
-  `--no-default-features --features full` if needed.
+  without a package; mips has no release artifact (boring-sys, required
+  by every feature bundle, does not build there).

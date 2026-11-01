@@ -46,6 +46,7 @@ if [ -n "$missing" ]; then
     echo "::warning::toolchain image missing build packages:$missing — installing via apt"
     apt-get update
     # Deliberate word-splitting: $missing is a package list.
+    # shellcheck disable=SC2086
     apt-get install -y --no-install-recommends $missing
     rm -rf /var/lib/apt/lists/*
 else
