@@ -69,6 +69,13 @@
 
 use crate::logbook;
 use std::io;
+#[cfg(any(
+    test,
+    all(
+        not(target_env = "ohos"),
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    )
+))]
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -350,15 +357,21 @@ pub fn outbound_interface() -> Option<Arc<str>> {
 /// Whether traffic to `peer` takes the physical-interface binding: every
 /// destination but loopback (see the [module docs](self)), including the
 /// IPv4-mapped loopback form a dual-stack socket dials.
-#[cfg(any(test, target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[cfg(all(
+    not(target_env = "ohos"),
+    any(test, target_os = "linux", target_os = "macos", target_os = "windows")
+))]
 pub(crate) fn binds_peer(peer: IpAddr) -> bool {
     !peer.to_canonical().is_loopback()
 }
 
+#[cfg(all(
+    not(target_env = "ohos"),
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
 /// Apply the installed binding to a socket that will talk to `peer`,
 /// leaving loopback traffic to the OS (see the [module docs](self)). No-op when
 /// no binding is installed.
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub fn apply_outbound_interface_for_peer(
     socket: &socket2::Socket,
     domain: socket2::Domain,

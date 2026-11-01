@@ -534,9 +534,10 @@ async fn route_inbound_tcp_scoped<C>(
                 proxy.adapter_type()
             );
             let started = std::time::Instant::now();
-            let (dial, pick) = meow_proxy::group::watch_dial_pick(
-                with_dial_timeout(proxy.name(), proxy.dial_tcp(&metadata)),
-            )
+            let (dial, pick) = meow_proxy::group::watch_dial_pick(with_dial_timeout(
+                proxy.name(),
+                proxy.dial_tcp(&metadata),
+            ))
             .await;
             // All chained front hops resolved during the dial — release the
             // generation pin before entering the relay loop.
