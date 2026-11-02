@@ -36,6 +36,7 @@ pub mod home_dir;
 pub mod logbook;
 pub mod metadata;
 pub mod network;
+pub mod nftset;
 pub mod outbound_iface;
 pub mod process_lookup;
 pub mod replay_window;

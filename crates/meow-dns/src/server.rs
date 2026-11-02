@@ -209,15 +209,23 @@ impl DnsServer {
                 all_ips.iter().find(|ip| ip.is_ipv6()).copied()
             };
             return Ok(match ip {
-                Some(addr) => Self::build_response(
-                    id,
-                    data,
-                    flags,
-                    question_len,
-                    qtype,
-                    addr,
-                    DEFAULT_ANSWER_TTL_SECS,
-                ),
+                Some(addr) => {
+                    crate::answer_hook::notify(
+                        resolver,
+                        &domain,
+                        addr,
+                        std::time::Duration::from_secs(u64::from(DEFAULT_ANSWER_TTL_SECS)),
+                    );
+                    Self::build_response(
+                        id,
+                        data,
+                        flags,
+                        question_len,
+                        qtype,
+                        addr,
+                        DEFAULT_ANSWER_TTL_SECS,
+                    )
+                }
                 None => Self::build_noerror_empty(id, data, flags, question_len),
             });
         }
@@ -245,6 +253,7 @@ impl DnsServer {
 
         Ok(match lookup {
             AddressLookupResult::Answer(addr, ttl) => {
+                crate::answer_hook::notify(resolver, &domain, addr, ttl);
                 // Sub-second remainders round up to 1 — a 0-TTL answer means
                 // "never cache", which is stricter than the entry deserves.
                 let ttl_secs = ttl.as_secs().clamp(1, u64::from(u32::MAX)) as u32;
@@ -331,15 +340,23 @@ impl DnsServer {
                     all_ips.iter().find(|ip| ip.is_ipv6()).copied()
                 };
                 LocalAnswer::Answer(match ip {
-                    Some(addr) => Self::build_response(
-                        id,
-                        data,
-                        flags,
-                        question_len,
-                        qtype,
-                        addr,
-                        DEFAULT_ANSWER_TTL_SECS,
-                    ),
+                    Some(addr) => {
+                        crate::answer_hook::notify(
+                            resolver,
+                            &domain,
+                            addr,
+                            std::time::Duration::from_secs(u64::from(DEFAULT_ANSWER_TTL_SECS)),
+                        );
+                        Self::build_response(
+                            id,
+                            data,
+                            flags,
+                            question_len,
+                            qtype,
+                            addr,
+                            DEFAULT_ANSWER_TTL_SECS,
+                        )
+                    }
                     None => Self::build_noerror_empty(id, data, flags, question_len),
                 })
             } else if qtype == 28 && !resolver.ipv6_enabled() {
@@ -357,6 +374,7 @@ impl DnsServer {
                     crate::resolver::LocalLookup::Decided(lookup) => {
                         LocalAnswer::Answer(match lookup {
                             AddressLookupResult::Answer(addr, ttl) => {
+                                crate::answer_hook::notify(resolver, &domain, addr, ttl);
                                 let ttl_secs = ttl.as_secs().clamp(1, u64::from(u32::MAX)) as u32;
                                 Self::build_response(
                                     id,

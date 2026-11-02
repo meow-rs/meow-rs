@@ -6,6 +6,7 @@
 mod app_lookup;
 pub mod health_check;
 pub mod match_engine;
+pub mod nftset;
 pub mod relay;
 pub mod rule_ir;
 pub mod rule_stats;

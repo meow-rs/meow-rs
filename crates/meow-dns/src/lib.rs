@@ -3,6 +3,7 @@
 //! Caching resolver with IP-to-domain reverse mapping, optional FakeIP
 //! allocation, and a DNS server used by transparent proxy and TUN.
 
+pub mod answer_hook;
 pub mod cache;
 pub mod client;
 pub mod fakeip;
