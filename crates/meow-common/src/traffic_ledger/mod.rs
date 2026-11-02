@@ -33,9 +33,9 @@
 //! counters, and the tunnel, a [`Source`], hands the ledger what its
 //! connections carried since the last time — every [`FLUSH_INTERVAL`], at
 //! local midnight, before the interface label changes, at a query and at a
-//! stop — and what a connection carried last as it closes. The writer
-//! thread commits it all in one transaction under the current day and
-//! interface label.
+//! stop — and what a connection carried last as it closes. What it hands
+//! over is counted under the interface label of the moment, and the writer
+//! thread commits it all in one transaction under the current day.
 
 #[cfg_attr(not(feature = "traffic-ledger"), path = "disabled.rs")]
 mod store;
@@ -245,14 +245,23 @@ pub trait Source: Send + Sync {
     fn settle(&self);
 }
 
-/// Bytes and requests not yet written, by host, app and policy.
-type Pending = HashMap<(SmolStr, SmolStr, Arc<str>), Counts>;
+/// Bytes and requests not yet written, by host, app, policy and interface
+/// label.
+type Pending = HashMap<(SmolStr, SmolStr, Arc<str>, SmolStr), Counts>;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct Counts {
     upload: u64,
     download: u64,
     requests: u64,
+}
+
+impl Counts {
+    fn merge(&mut self, other: Self) {
+        self.upload = self.upload.saturating_add(other.upload);
+        self.download = self.download.saturating_add(other.download);
+        self.requests = self.requests.saturating_add(other.requests);
+    }
 }
 
 static CURRENT: RwLock<Option<Arc<Ledger>>> = RwLock::new(None);
@@ -308,9 +317,9 @@ pub fn epoch() -> u32 {
 
 /// Count traffic toward `host` (a domain or an IP address as text, empty
 /// for none) from `app` (see [`GroupBy::App`], empty for none) through the
-/// leaf proxy `policy`. Called once per connection with its `requests`,
-/// then with its bytes as the tunnel settles. Does nothing while no ledger
-/// is installed.
+/// leaf proxy `policy`, on the interface label set now. Called once per
+/// connection with its `requests`, then with its bytes as the tunnel
+/// settles. Does nothing while no ledger is installed.
 pub fn add(
     host: &SmolStr,
     app: &SmolStr,
@@ -322,15 +331,18 @@ pub fn add(
     if !enabled() || (upload == 0 && download == 0 && requests == 0) {
         return;
     }
+    let interface = interface();
     let held = {
         let mut pending = PENDING.lock().unwrap_or_else(PoisonError::into_inner);
         let pending = pending.get_or_insert_with(HashMap::new);
-        let counts = pending
-            .entry((host.clone(), app.clone(), Arc::clone(policy)))
-            .or_default();
-        counts.upload = counts.upload.saturating_add(upload);
-        counts.download = counts.download.saturating_add(download);
-        counts.requests = counts.requests.saturating_add(requests);
+        pending
+            .entry((host.clone(), app.clone(), Arc::clone(policy), interface))
+            .or_default()
+            .merge(Counts {
+                upload,
+                download,
+                requests,
+            });
         pending.len()
     };
     if held == EARLY_FLUSH {
@@ -346,8 +358,8 @@ pub fn add(
 /// while the flush runs.
 const EARLY_FLUSH: usize = 4096;
 
-/// Take what is pending, after asking every live [`Source`] to settle.
-fn take_pending() -> Pending {
+/// Ask every live [`Source`] to settle.
+fn settle_sources() {
     let sources: Vec<Arc<dyn Source>> = {
         let mut sources = SOURCES.lock().unwrap_or_else(PoisonError::into_inner);
         sources.retain(|source| source.strong_count() > 0);
@@ -356,6 +368,11 @@ fn take_pending() -> Pending {
     for source in sources {
         source.settle();
     }
+}
+
+/// Take what is pending, after asking every live [`Source`] to settle.
+fn take_pending() -> Pending {
+    settle_sources();
     PENDING
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -377,20 +394,22 @@ pub fn register(source: Weak<dyn Source>) {
         .push(source);
 }
 
-/// Held across a change of [`INTERFACE`] or [`ZONE`] and the flush before
-/// it, so a change racing another cannot be lost to it.
+/// Held across a change of [`INTERFACE`] or [`ZONE`] and the settle or
+/// flush before it, so a change racing another cannot be lost to it.
 static CHANGING: Mutex<()> = Mutex::new(());
 
 /// Set the label the platform gives the network the engine's traffic goes
-/// out on (`Wi-Fi`, `Cellular`, `en0`). What was counted under the previous
-/// label is written under it first. Kept across installs.
+/// out on (`Wi-Fi`, `Cellular`, `en0`). What the flows carried until now
+/// is counted under the previous label first, here rather than by the
+/// writer, so a writer held up by the disk cannot file it under the new
+/// one. Kept across installs.
 pub fn set_interface(label: &str) {
     let _changing = CHANGING.lock().unwrap_or_else(PoisonError::into_inner);
     if *INTERFACE.lock().unwrap_or_else(PoisonError::into_inner) == label {
         return;
     }
-    if let Some(ledger) = current() {
-        ledger.flush();
+    if enabled() {
+        settle_sources();
     }
     *INTERFACE.lock().unwrap_or_else(PoisonError::into_inner) = SmolStr::new(label);
 }
@@ -407,7 +426,9 @@ fn interface() -> SmolStr {
 /// under; UTC until set. An embedder sets it before it starts the engine
 /// and whenever the zone changes. What was counted is written under the
 /// previous zone's day first, and the writer then waits for the new zone's
-/// midnight.
+/// midnight. A writer held up past [`flush`]'s wait files that under the
+/// new zone's day instead: unlike the interface label, the day is decided
+/// as the writer takes what is pending.
 pub fn set_time_zone(zone: TimeZone) {
     let _changing = CHANGING.lock().unwrap_or_else(PoisonError::into_inner);
     if *ZONE.lock().unwrap_or_else(PoisonError::into_inner) == zone {
@@ -456,7 +477,13 @@ pub fn install(dir: &Path, options: Options) -> io::Result<()> {
         return Ok(());
     }
     let ledger = Arc::new(Ledger::open(dir)?);
-    if !enabled() {
+    if enabled() {
+        // What was counted goes to the ledger it was counted for, under its
+        // options, before this one takes over.
+        if let Some(previous) = current() {
+            previous.flush();
+        }
+    } else {
         // Flows that outlived an earlier ledger carried traffic while none
         // recorded; dropping it keeps it out of this one.
         discard_pending();
@@ -465,14 +492,11 @@ pub fn install(dir: &Path, options: Options) -> io::Result<()> {
         .write()
         .unwrap_or_else(PoisonError::into_inner)
         .replace(ledger);
-    if let Some(previous) = previous {
-        // What was counted goes to the ledger it was counted for, under
-        // its options.
-        previous.flush();
-    }
     HOSTS.store(options.hosts, Ordering::Relaxed);
     APPS.store(options.apps, Ordering::Relaxed);
     ENABLED.store(true, Ordering::Relaxed);
+    // Its writer writes what arrived since as it stops.
+    drop(previous);
     Ok(())
 }
 
@@ -574,49 +598,69 @@ pub fn reconfigure(enable: bool, options: Options) {
     }
 }
 
-/// The rows written at a flush: pending counts keyed by host (reduced to
-/// its registrable domain), app, policy and interface, on one day.
+/// The key of a row: host (reduced to its registrable domain), app,
+/// policy and interface label.
+type RowKey = (String, SmolStr, Arc<str>, SmolStr);
+
+/// The rows written at a flush: pending counts by [`RowKey`], on one day.
 #[cfg_attr(not(feature = "traffic-ledger"), allow(dead_code))]
 struct Batch {
     day: i32,
-    interface: SmolStr,
-    rows: HashMap<(String, SmolStr, Arc<str>), Counts>,
+    rows: HashMap<RowKey, Counts>,
 }
 
 #[cfg_attr(not(feature = "traffic-ledger"), allow(dead_code))]
 impl Batch {
     /// What is pending, keyed for the rows. With hosts (apps) off, no host
     /// (app) is kept, even one a flow opened before they were turned off
-    /// counted. A batch keeps at most [`MAX_IP_HOSTS`] addresses itself, so
-    /// batches a failing disk holds for a retry stay small.
-    fn take(day: i32) -> Self {
+    /// counted. A batch keeps every address `known` (the day's on disk) and
+    /// new ones up to [`MAX_IP_HOSTS`] in all, the busiest first; the rest
+    /// fold into [`OTHER_IPS`], so batches a failing disk holds for a retry
+    /// stay small.
+    fn take(day: i32, known: &HashSet<String>) -> Self {
         let (hosts, apps) = (hosts(), apps());
-        let mut ips = HashSet::new();
-        let mut rows: HashMap<(String, SmolStr, Arc<str>), Counts> = HashMap::new();
-        for ((host, app, policy), counts) in take_pending() {
-            let mut host = if hosts {
+        let mut rows: HashMap<RowKey, Counts> = HashMap::new();
+        for ((host, app, policy, interface), counts) in take_pending() {
+            let host = if hosts {
                 host_key(&host)
             } else {
                 String::new()
             };
-            if host.parse::<std::net::IpAddr>().is_ok() && !ips.contains(&host) {
-                if ips.len() < MAX_IP_HOSTS {
-                    ips.insert(host.clone());
-                } else {
-                    host = OTHER_IPS.to_owned();
-                }
-            }
             let app = if apps { app } else { SmolStr::default() };
-            let row = rows.entry((host, app, policy)).or_default();
-            row.upload = row.upload.saturating_add(counts.upload);
-            row.download = row.download.saturating_add(counts.download);
-            row.requests = row.requests.saturating_add(counts.requests);
+            rows.entry((host, app, policy, interface))
+                .or_default()
+                .merge(counts);
         }
-        Self {
-            day,
-            interface: interface(),
-            rows,
+        let mut new_ips: HashMap<&str, u64> = HashMap::new();
+        for ((host, ..), counts) in &rows {
+            if !known.contains(host) && host.parse::<std::net::IpAddr>().is_ok() {
+                let bytes = new_ips.entry(host.as_str()).or_default();
+                *bytes = bytes.saturating_add(counts.upload.saturating_add(counts.download));
+            }
         }
+        let room = MAX_IP_HOSTS.saturating_sub(known.len());
+        if new_ips.len() > room {
+            let mut busiest: Vec<_> = new_ips.into_iter().collect();
+            busiest.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+            let folded: HashSet<String> = busiest[room..]
+                .iter()
+                .map(|(host, _)| (*host).to_owned())
+                .collect();
+            let mut capped: HashMap<RowKey, Counts> = HashMap::new();
+            for ((host, app, policy, interface), counts) in rows {
+                let host = if folded.contains(&host) {
+                    OTHER_IPS.to_owned()
+                } else {
+                    host
+                };
+                capped
+                    .entry((host, app, policy, interface))
+                    .or_default()
+                    .merge(counts);
+            }
+            rows = capped;
+        }
+        Self { day, rows }
     }
 }
 

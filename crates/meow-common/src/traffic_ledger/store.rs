@@ -248,12 +248,17 @@ impl Writer {
                 .min(to_midnight);
             match rx.recv_timeout(wait) {
                 Ok(Op::Flush(ack)) => {
-                    self.flush(&mut day_end);
+                    let _ = self.flush(&mut day_end);
                     let _ = ack.send(());
                 }
                 Ok(Op::Query(query, reply)) => {
-                    self.flush(&mut day_end);
-                    let _ = reply.send(report(&self.conn, &query).map_err(io::Error::other));
+                    // A report without what could not be written is not
+                    // current; the caller hears why instead.
+                    let result = self
+                        .flush(&mut day_end)
+                        .and_then(|()| report(&self.conn, &query))
+                        .map_err(io::Error::other);
+                    let _ = reply.send(result);
                 }
                 Ok(Op::Clear(ack)) => {
                     super::discard_pending();
@@ -266,11 +271,16 @@ impl Writer {
                     let _ = ack.send(result);
                 }
                 Err(RecvTimeoutError::Timeout) => {
-                    self.flush(&mut day_end);
+                    let _ = self.flush(&mut day_end);
                     due = Instant::now() + super::FLUSH_INTERVAL;
                 }
                 Err(RecvTimeoutError::Disconnected) => {
-                    self.flush(&mut day_end);
+                    if let Err(e) = self.flush(&mut day_end) {
+                        warn!(
+                            "traffic ledger: stopped with {} flushes not written: {e}",
+                            self.backlog.len()
+                        );
+                    }
                     return;
                 }
             }
@@ -278,19 +288,23 @@ impl Writer {
     }
 
     /// Take what is pending and commit it, with what failed before, under
-    /// the day [`flush_day`] picks.
-    fn flush(&mut self, day_end: &mut i64) {
+    /// the day [`flush_day`] picks; the commit's error when it failed, and
+    /// what it held is kept for the next flush.
+    fn flush(&mut self, day_end: &mut i64) -> rusqlite::Result<()> {
         let now = unix_now();
         let zone = zone();
         let day = flush_day(zone, now, *day_end);
         *day_end = zone.next_midnight(now);
-        let batch = Batch::take(day);
+        let none = HashSet::new();
+        let known = ip_hosts_of(&self.conn, &mut self.ip_hosts, day).map_or(&none, |known| &*known);
+        let batch = Batch::take(day, known);
         if !batch.rows.is_empty() {
             if self.backlog.len() == BACKLOG {
                 self.backlog.remove(0);
             }
             self.backlog.push(batch);
         }
+        let mut result = Ok(());
         if !self.backlog.is_empty() {
             match self.commit() {
                 Ok(()) => {
@@ -304,10 +318,12 @@ impl Writer {
                     self.failing = true;
                     // The IP hosts counted toward the cap may not be on disk.
                     self.ip_hosts = None;
+                    result = Err(e);
                 }
             }
         }
         self.prune(zone.day(now));
+        result
     }
 
     /// Write the backlog in one transaction. Hosts (apps) turned off since a
@@ -319,7 +335,7 @@ impl Writer {
         {
             let mut upsert = tx.prepare(UPSERT)?;
             for batch in &self.backlog {
-                for ((host, app, policy), counts) in &batch.rows {
+                for ((host, app, policy, interface), counts) in &batch.rows {
                     let host = if hosts { host.as_str() } else { "" };
                     let host = cap_ip_host(&tx, &mut self.ip_hosts, batch.day, host)?;
                     upsert.execute(params![
@@ -327,7 +343,7 @@ impl Writer {
                         host,
                         if apps { app.as_str() } else { "" },
                         &**policy,
-                        batch.interface.as_str(),
+                        interface.as_str(),
                         int(counts.upload),
                         int(counts.download),
                         int(counts.requests),
@@ -363,15 +379,13 @@ fn flush_day(zone: TimeZone, now: i64, day_end: i64) -> i32 {
 
 /// `host`, or [`OTHER_IPS`] for an IP address past `day`'s
 /// [`MAX_IP_HOSTS`].
-fn cap_ip_host<'a>(
+/// The IP-address hosts `day` has on disk, read once per day into
+/// `ip_hosts`.
+fn ip_hosts_of<'a>(
     conn: &Connection,
-    ip_hosts: &mut Option<(i32, HashSet<String>)>,
+    ip_hosts: &'a mut Option<(i32, HashSet<String>)>,
     day: i32,
-    host: &'a str,
-) -> rusqlite::Result<&'a str> {
-    if host.parse::<std::net::IpAddr>().is_err() {
-        return Ok(host);
-    }
+) -> rusqlite::Result<&'a mut HashSet<String>> {
     if ip_hosts.as_ref().is_none_or(|(loaded, _)| *loaded != day) {
         let mut statement = conn.prepare("SELECT DISTINCT host FROM traffic WHERE day = ?1")?;
         let hosts = statement
@@ -381,9 +395,19 @@ fn cap_ip_host<'a>(
             .collect();
         *ip_hosts = Some((day, hosts));
     }
-    let Some((_, hosts)) = ip_hosts.as_mut() else {
+    Ok(&mut ip_hosts.get_or_insert_with(|| (day, HashSet::new())).1)
+}
+
+fn cap_ip_host<'a>(
+    conn: &Connection,
+    ip_hosts: &mut Option<(i32, HashSet<String>)>,
+    day: i32,
+    host: &'a str,
+) -> rusqlite::Result<&'a str> {
+    if host.parse::<std::net::IpAddr>().is_err() {
         return Ok(host);
-    };
+    }
+    let hosts = ip_hosts_of(conn, ip_hosts, day)?;
     if hosts.contains(host) {
         return Ok(host);
     }
@@ -405,8 +429,19 @@ fn prune(conn: &Connection, today: i32) -> rusqlite::Result<()> {
 fn clear(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute("DELETE FROM traffic", [])?;
     vacuum(conn)?;
-    // The deleted hosts leave the write-ahead log too.
-    conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+    // The deleted hosts leave the database file and the write-ahead log
+    // once a checkpoint copies the log back whole and truncates it. A
+    // reader in another process can hold it off past the busy timeout:
+    // SQLite then reports it busy rather than failing, and so does this.
+    let busy: i64 = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+    if busy == 0 {
+        Ok(())
+    } else {
+        Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            Some("a reader holds the deleted traffic on disk; clear again".into()),
+        ))
+    }
 }
 
 /// Hand the free pages back to the file system.
@@ -845,6 +880,87 @@ mod tests {
             "192.0.2.9"
         );
         drop(conn);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_batch_keeps_the_days_addresses_and_the_busiest_new_ones() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = dir("batch-cap");
+        ledger::install(&dir, Options::default()).unwrap();
+        let direct: Arc<str> = Arc::from("DIRECT");
+        let none = SmolStr::default();
+        let hosts_of = |batch: &Batch| {
+            let mut hosts: Vec<_> = batch.rows.keys().map(|(host, ..)| host.clone()).collect();
+            hosts.sort();
+            hosts
+        };
+        // Room for one more address on a day that has the rest.
+        let mut known: HashSet<String> = (0..MAX_IP_HOSTS - 1)
+            .map(|i| format!("10.0.{}.{}", i / 256, i % 256))
+            .collect();
+        add(&SmolStr::new("10.0.0.1"), &none, &direct, 1, 0, 1);
+        add(&SmolStr::new("192.0.2.1"), &none, &direct, 100, 0, 1);
+        add(&SmolStr::new("192.0.2.2"), &none, &direct, 10, 0, 1);
+        let batch = Batch::take(20_000, &known);
+        assert_eq!(hosts_of(&batch), [OTHER_IPS, "10.0.0.1", "192.0.2.1"]);
+        // A full day folds every new address, never one it has.
+        known.insert("10.0.255.255".into());
+        add(&SmolStr::new("10.0.0.1"), &none, &direct, 1, 0, 1);
+        for i in 0..MAX_IP_HOSTS {
+            let host = SmolStr::new(format!("172.16.{}.{}", i / 256, i % 256));
+            add(&host, &none, &direct, 1_000, 0, 1);
+        }
+        let batch = Batch::take(20_000, &known);
+        assert_eq!(hosts_of(&batch), [OTHER_IPS, "10.0.0.1"]);
+        ledger::uninstall();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_query_or_clear_the_disk_refuses_fails() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = dir("refused");
+        ledger::install(&dir, Options::default()).unwrap();
+        let proxy: Arc<str> = Arc::from("Node A");
+        add(
+            &SmolStr::new("example.com"),
+            &SmolStr::default(),
+            &proxy,
+            1,
+            2,
+            1,
+        );
+        // Another process holds the write lock past the busy timeout: the
+        // query is not current, and says so.
+        let other = Connection::open(dir.join(DB_FILE)).unwrap();
+        other.execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert!(ledger::query(&query(GroupBy::Host)).unwrap().is_err());
+        other.execute_batch("COMMIT").unwrap();
+        // What it could not write is written with the next flush.
+        let report = ledger::query(&query(GroupBy::Host)).unwrap().unwrap();
+        assert_eq!((report.upload, report.download, report.requests), (1, 2, 1));
+
+        // A reader holding a snapshot past the busy timeout keeps the
+        // deleted traffic on disk: the clear fails, and a later one does it.
+        other.execute_batch("BEGIN").unwrap();
+        let rows: i64 = other
+            .query_row("SELECT COUNT(*) FROM traffic", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 1);
+        assert!(ledger::clear().is_err());
+        other.execute_batch("COMMIT").unwrap();
+        ledger::clear().unwrap();
+        assert_eq!(
+            fs::metadata(dir.join("traffic.db-wal")).map_or(0, |m| m.len()),
+            0
+        );
+        drop(other);
+        ledger::uninstall();
         let _ = fs::remove_dir_all(&dir);
     }
 

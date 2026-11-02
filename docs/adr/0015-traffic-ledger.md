@@ -29,8 +29,10 @@ flows that sent something (`requests`).
   `example.co.uk`, via the public-suffix list), lowercased; an IP address
   is kept in its canonical form. A day keeps at most `MAX_IP_HOSTS`
   (1024) distinct addresses; past it, that day's other bare-address flows
-  (peer-to-peer swarms, a scan) fold into the host `*`. No paths, ports
-  or times finer than a day.
+  (peer-to-peer swarms, a scan) fold into the host `*`. An address the
+  day has keeps its row, and a flush with more new addresses than the
+  day has room for keeps the busiest. No paths, ports or times finer than
+  a day.
 - **App** is the app that opened the flow: the package name an Android
   VPN supplies in `Metadata::process`; elsewhere the owner of a flow from
   this host, found with the socket lookup PROCESS-NAME rules use, named
@@ -63,7 +65,11 @@ the ledger when the tunnel, a `traffic_ledger::Source`, settles every
 live connection, headless connection and UDP flow: every 60 s, at local
 midnight, before the interface label changes, at a query and at a stop. A
 flow settles once more as it is closed, and once more as its last handle
-drops, for bytes still in flight at the close. Settling is a `fetch_max`
+drops, for bytes still in flight at the close. What a settle hands over
+is counted under the interface label of that moment, so a label change
+settles the flows on the caller's thread and switches, without waiting
+for the writer: a writer held up by the disk still files what came
+before under the label it came under. Settling is a `fetch_max`
 on two atomics per flow, so racing settlers take disjoint parts. A burst
 of flows to distinct hosts (a scan) asks the writer for a flush early, at
 4096 pending rows, so pending counts stay bounded in memory.
@@ -110,8 +116,11 @@ A day is a local calendar day, numbered from 1970-01-01. The embedder
 pushes the UTC offset and its next change (`set_time_zone`) before it
 starts the engine and whenever it changes, so a phone that crosses a DST
 change or a time zone files traffic under the day the user sees; what was
-counted under the previous zone is written under its day first. Without
-one, meow uses UTC. A flush up to two minutes past midnight files what is
+counted under the previous zone is written under its day first. The day
+is decided as the writer takes what is pending, so a writer held up past
+the change's 5 s wait files that under the new zone's day; this takes a
+change of zone that moves the date while the disk stalls. Without one,
+meow uses UTC. A flush up to two minutes past midnight files what is
 pending under the day that ended; a later one, after the clock jumped (a
 resume from sleep, a clock set at boot), under today. Retention is 62
 days, today included, which always covers last month in full. Older days
@@ -151,10 +160,16 @@ the traffic of the local days `from` to `to` (`YYYY-MM-DD`, both
 included, today by default; `from` after `to` is a 400), grouped `by`
 `host` (the default), `app`, `policy` or `interface`, rows largest first,
 plus their sums. `host`, `app`, `policy` and `interface` narrow it to one
-group, for drill-down. A query settles the live flows first, so it is
-current. Off, or in a `minimal` build, it answers `enabled: false` with
-no rows. `DELETE /traffic/ledger` deletes everything, from the database
-on disk too while the ledger is off; a failure is a 503.
+group, for drill-down. A query settles the live flows first and writes
+them, so it is current; when the write fails (a full disk), it is a 503,
+and what was pending is kept for the next flush. Off, or in a `minimal`
+build, it answers `enabled: false` with no rows. `DELETE /traffic/ledger`
+deletes everything, from the database on disk too while the ledger is
+off; a failure is a 503. That includes a reader in another process
+holding the deleted traffic on disk past the busy timeout (1 s): the
+write-ahead log cannot be checkpointed and truncated under it, so the
+clear says so, and a later one finishes it. What was pending is dropped
+either way, as the clear asked.
 
 ### Config
 
