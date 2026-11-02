@@ -42,6 +42,12 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **`anytls` no longer silently ignores `ech-opts`** (#870): an enabled
+  `ech-opts` or a `certificate`/`private-key` client certificate is now a
+  config-load error, as for hysteria2, instead of connecting with the SNI in
+  the clear. The other ignored mihomo fields (`shadow-tls-opts`,
+  `restls-opts`, `jls-opts`, `client-metadata`, `idle-session-*`,
+  `min-idle-session`, `disable-reuse`) now log one load-time warning.
 - **Plain-HTTP origin-form requests work again.** `GET /path` + a `Host:`
   header — the request shape every browser sends a plain-HTTP proxy —
   was refused with 400 by the #734 hostname gate, which only looked at

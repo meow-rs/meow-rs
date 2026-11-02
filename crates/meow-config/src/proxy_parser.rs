@@ -1225,6 +1225,7 @@ fn parse_anytls(
         .get("udp")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
+    reject_unsupported_anytls_options(name, config)?;
 
     let optional_string = |field: &str| match config.get(field) {
         Some(serde_json::Value::String(value)) => Ok(Some(value.clone())),
@@ -1253,6 +1254,59 @@ fn parse_anytls(
         alpn,
     };
     meow_proxy::AnytlsAdapter::new_with_tls(name, server, port, password, &options, udp)
+}
+
+/// Refuse the AnyTLS options that change security properties and that the
+/// Rust backend cannot honour (issue #870), and warn once about the purely
+/// behavioural mihomo fields it ignores. Mirrors hysteria2: an enabled
+/// `ech-opts` or any `certificate`/`private-key` is a load error (silently
+/// dropping them would leak the SNI / send no client certificate).
+#[cfg(feature = "anytls")]
+fn reject_unsupported_anytls_options(
+    name: &str,
+    config: &HashMap<String, serde_json::Value>,
+) -> std::result::Result<(), String> {
+    if let Some(value) = config.get("ech-opts") {
+        let enabled = value
+            .as_object()
+            .and_then(|map| map.get("enable"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true);
+        if enabled {
+            return Err(format!(
+                "anytls[{name}]: 'ech-opts' is not supported by the Rust backend \
+                 (the SNI would be sent in the clear)"
+            ));
+        }
+    }
+    for key in ["certificate", "private-key"] {
+        if config.contains_key(key) {
+            return Err(format!(
+                "anytls[{name}]: '{key}' is not supported by the Rust backend"
+            ));
+        }
+    }
+    let ignored: Vec<&str> = [
+        "shadow-tls-opts",
+        "restls-opts",
+        "jls-opts",
+        "client-metadata",
+        "idle-session-check-interval",
+        "idle-session-timeout",
+        "min-idle-session",
+        "disable-reuse",
+    ]
+    .into_iter()
+    .filter(|key| config.get(*key).is_some_and(|v| !v.is_null()))
+    .collect();
+    if !ignored.is_empty() {
+        tracing::warn!(
+            name,
+            ignored = %ignored.join(", "),
+            "anytls: ignoring options not supported by the Rust backend"
+        );
+    }
+    Ok(())
 }
 
 /// Parse a `type: hysteria2` proxy block.
@@ -4208,6 +4262,49 @@ tls: true
             "name: jp\ntype: anytls\nserver: 1.2.3.4\nport: 443\npassword: secret\nudp: true\n",
         );
         assert!(parse_proxy(&on).unwrap().support_udp());
+    }
+
+    #[cfg(feature = "anytls")]
+    const ANYTLS_BASE: &str =
+        "name: jp\ntype: anytls\nserver: 1.2.3.4\nport: 443\npassword: secret\n";
+
+    /// Issue #870: ECH would be silently dropped, leaking the SNI.
+    #[cfg(feature = "anytls")]
+    #[tokio::test]
+    async fn parse_anytls_rejects_enabled_ech_opts() {
+        for extra in ["ech-opts: {enable: true}\n", "ech-opts: {config: QUJD}\n"] {
+            let cfg = anytls_config(&format!("{ANYTLS_BASE}{extra}"));
+            let err = parse_proxy(&cfg).err().expect("must reject").to_string();
+            assert!(err.contains("ech-opts"), "{err}");
+        }
+    }
+
+    #[cfg(feature = "anytls")]
+    #[tokio::test]
+    async fn parse_anytls_allows_disabled_ech_opts() {
+        let cfg = anytls_config(&format!("{ANYTLS_BASE}ech-opts: {{enable: false}}\n"));
+        assert!(parse_proxy(&cfg).is_ok());
+    }
+
+    #[cfg(feature = "anytls")]
+    #[tokio::test]
+    async fn parse_anytls_rejects_client_certificate() {
+        for key in ["certificate", "private-key"] {
+            let cfg = anytls_config(&format!("{ANYTLS_BASE}{key}: abc\n"));
+            let err = parse_proxy(&cfg).err().expect("must reject").to_string();
+            assert!(err.contains(key), "{err}");
+        }
+    }
+
+    #[cfg(feature = "anytls")]
+    #[tokio::test]
+    async fn parse_anytls_ignored_options_still_parse() {
+        let cfg = anytls_config(&format!(
+            "{ANYTLS_BASE}shadow-tls-opts: {{}}\nrestls-opts: {{}}\njls-opts: {{}}\n\
+             client-metadata: {{a: b}}\nidle-session-check-interval: 30\n\
+             idle-session-timeout: 30\nmin-idle-session: 1\ndisable-reuse: true\n"
+        ));
+        assert!(parse_proxy(&cfg).is_ok());
     }
 
     #[cfg(feature = "anytls")]
