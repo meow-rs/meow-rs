@@ -156,11 +156,20 @@ async fn dial_vmess(
     security: Security,
     internal: bool,
 ) -> Result<Box<dyn ProxyConn>> {
+    // A user dial straight to the server shares a multiplexed (gRPC/xhttp)
+    // connection; probes and `dialer-proxy` chains keep their own.
+    let shared = !internal && !dialer.is_proxy();
+    if shared {
+        if let Some(stream) = transport.reuse().await {
+            let stream = write_header(stream, &sealed).await?;
+            return Ok(relay(stream, sealed, security));
+        }
+    }
     let stream = dialer
         .dial(server, port, internal)
         .await
         .map_err(MeowError::Io)?;
-    vmess_over(transport, stream, sealed, security).await
+    vmess_over(transport, stream, sealed, security, shared).await
 }
 
 /// Apply the transport chain and run the VMess request exchange on
@@ -172,9 +181,18 @@ async fn vmess_over(
     stream: Box<dyn meow_transport::Stream>,
     sealed: header::SealedHeader,
     security: Security,
+    shared: bool,
 ) -> Result<Box<dyn ProxyConn>> {
-    let stream = send_request(transport, stream, &sealed).await?;
+    let stream = send_request(transport, stream, &sealed, shared).await?;
+    Ok(relay(stream, sealed, security))
+}
 
+/// The encrypted duplex over a stream the request header went out on.
+fn relay(
+    stream: Box<dyn meow_transport::Stream>,
+    sealed: header::SealedHeader,
+    security: Security,
+) -> Box<dyn ProxyConn> {
     // The relay builds each half's body cipher internally — one AEAD key
     // schedule per direction, and a swapped pairing is unrepresentable
     // (issue #533).
@@ -185,23 +203,36 @@ async fn vmess_over(
         sealed.req_iv,
         sealed.resp_v,
     );
-    Ok(Box::new(crate::stream_conn::StreamConn(Box::new(duplex))))
+    Box::new(crate::stream_conn::StreamConn(Box::new(duplex)))
 }
 
 /// Apply the transport chain and write the sealed VMess request header.
+/// `shared` offers a multiplexed connection the chain opens for reuse.
 async fn send_request(
     transport: &TransportChain,
     stream: Box<dyn meow_transport::Stream>,
     sealed: &header::SealedHeader,
+    shared: bool,
 ) -> Result<Box<dyn meow_transport::Stream>> {
-    use tokio::io::AsyncWriteExt;
-
-    let mut stream = transport.connect(stream).await.map_err(|e| match e {
+    let connected = if shared {
+        transport.connect_shared(stream).await
+    } else {
+        transport.connect(stream).await
+    };
+    let stream = connected.map_err(|e| match e {
         // Io/RelayHop chains carry errno + capability classification that
         // dead-marking reads — do not stringify them away (issue #668).
         e @ (MeowError::Io(_) | MeowError::RelayHopFailed { .. }) => e,
         e => MeowError::Proxy(format!("vmess transport: {e}")),
     })?;
+    write_header(stream, sealed).await
+}
+
+async fn write_header(
+    mut stream: Box<dyn meow_transport::Stream>,
+    sealed: &header::SealedHeader,
+) -> Result<Box<dyn meow_transport::Stream>> {
+    use tokio::io::AsyncWriteExt;
 
     stream
         .write_all(&sealed.bytes)
@@ -269,7 +300,7 @@ impl ProxyAdapter for VmessAdapter {
         }
         let sealed = header::seal_request_header(&self.cmd_key, self.security, metadata, false)
             .map_err(MeowError::Proxy)?;
-        vmess_over(&self.transport, Box::new(stream), sealed, self.security).await
+        vmess_over(&self.transport, Box::new(stream), sealed, self.security, false).await
     }
 
     #[cfg_attr(not(feature = "mux"), allow(unused_variables))]
@@ -303,7 +334,7 @@ impl ProxyAdapter for VmessAdapter {
             .dial(&self.server, self.port, metadata.is_internal())
             .await
             .map_err(MeowError::Io)?;
-        let stream = send_request(&self.transport, stream, &sealed).await?;
+        let stream = send_request(&self.transport, stream, &sealed, false).await?;
         let remote = std::net::SocketAddr::new(
             metadata
                 .dst_ip
@@ -318,13 +349,15 @@ impl ProxyAdapter for VmessAdapter {
         )))
     }
 
-    /// Issue #695: close every pooled mux session so the next dial opens a
-    /// fresh physical connection (see `MuxClient::reset`).
-    #[cfg(feature = "mux")]
+    /// Issue #695: close every pooled mux session and forget the shared
+    /// gRPC/xhttp connection, so the next dial opens a fresh physical one
+    /// (see `MuxClient::reset`, `TransportChain::reset`).
     fn reset_sessions(&self) {
+        #[cfg(feature = "mux")]
         if let Some(mux) = &self.mux {
             mux.reset();
         }
+        self.transport.reset();
     }
 
     fn health(&self) -> &ProxyHealth {

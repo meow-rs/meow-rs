@@ -224,12 +224,37 @@ impl VlessAdapter {
     /// Dial a raw TCP + transport-chain stream to the VLESS server, then run the
     /// VLESS Encryption handshake if one is configured.
     async fn dial_stream(&self, internal: bool) -> Result<Box<dyn meow_transport::Stream>> {
+        // A user dial straight to the server shares a multiplexed
+        // (gRPC/xhttp) connection; probes and `dialer-proxy` chains keep
+        // their own.
+        let shared = !internal && !self.dialer.is_proxy();
+        if shared {
+            if let Some(stream) = self.transport.reuse().await {
+                return self.encrypt(stream).await;
+            }
+        }
         let stream = self
             .dialer
             .dial(&self.server, self.port, internal)
             .await
             .map_err(MeowError::Io)?;
+        if shared {
+            let stream = self.transport.connect_shared(stream).await?;
+            return self.encrypt(stream).await;
+        }
         self.wrap_stream(stream).await
+    }
+
+    /// The VLESS Encryption handshake, when one is configured.
+    async fn encrypt(
+        &self,
+        stream: Box<dyn meow_transport::Stream>,
+    ) -> Result<Box<dyn meow_transport::Stream>> {
+        #[cfg(feature = "vless-encryption")]
+        if let Some(encryption) = &self.encryption {
+            return encryption.handshake(stream).await;
+        }
+        Ok(stream)
     }
 
     /// Apply the configured transport chain (TLS → WS → …) and the VLESS
@@ -241,11 +266,7 @@ impl VlessAdapter {
         stream: Box<dyn meow_transport::Stream>,
     ) -> Result<Box<dyn meow_transport::Stream>> {
         let stream = self.transport.connect(stream).await?;
-        #[cfg(feature = "vless-encryption")]
-        if let Some(encryption) = &self.encryption {
-            return encryption.handshake(stream).await;
-        }
-        Ok(stream)
+        self.encrypt(stream).await
     }
 
     /// Run the VLESS request exchange targeting `metadata` on `stream`
@@ -412,13 +433,15 @@ impl ProxyAdapter for VlessAdapter {
         Ok(Box::new(conn))
     }
 
-    /// Issue #695: close every pooled mux session so the next dial opens a
-    /// fresh physical connection (see `MuxClient::reset`).
-    #[cfg(feature = "mux")]
+    /// Issue #695: close every pooled mux session and forget the shared
+    /// gRPC/xhttp connection, so the next dial opens a fresh physical one
+    /// (see `MuxClient::reset`, `TransportChain::reset`).
     fn reset_sessions(&self) {
+        #[cfg(feature = "mux")]
         if let Some(mux) = &self.mux {
             mux.reset();
         }
+        self.transport.reset();
     }
 
     fn health(&self) -> &ProxyHealth {

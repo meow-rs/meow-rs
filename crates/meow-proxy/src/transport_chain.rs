@@ -56,4 +56,37 @@ impl TransportChain {
         }
         Ok(stream)
     }
+
+    /// [`Self::connect`], offering the multiplexed connection the outermost
+    /// layer opens (gRPC, xhttp) to later [`Self::reuse`] calls. Only for a
+    /// user dial straight to the server: a stream over a relay chain or a
+    /// `dialer-proxy`, or a probe, must not be shared.
+    pub async fn connect_shared(&self, raw: Box<dyn Stream>) -> Result<Box<dyn Stream>> {
+        let Some((last, inner)) = self.layers.split_last() else {
+            return Ok(raw);
+        };
+        let mut stream = raw;
+        for layer in inner {
+            stream = layer
+                .connect(stream)
+                .await
+                .map_err(crate::transport_to_proxy_err)?;
+        }
+        last.connect_shared(stream)
+            .await
+            .map_err(crate::transport_to_proxy_err)
+    }
+
+    /// Forget the shared multiplexed connection, if any (`reset_sessions`).
+    pub fn reset(&self) {
+        if let Some(last) = self.layers.last() {
+            last.reset();
+        }
+    }
+
+    /// A new stream on a connection the outermost layer multiplexes (gRPC),
+    /// with no dial; `None` when there is nothing to reuse.
+    pub async fn reuse(&self) -> Option<Box<dyn Stream>> {
+        self.layers.last()?.reuse().await
+    }
 }

@@ -30,7 +30,9 @@
 
 use std::io;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -74,34 +76,115 @@ impl Default for GrpcConfig {
 /// Transport layer that wraps an inner stream with gRPC (gun) framing over HTTP/2.
 pub struct GrpcLayer {
     config: GrpcConfig,
+    /// The last h2 connection `connect` opened: later tunnels open a new
+    /// stream on it (`reuse`) instead of a new TCP + TLS/REALITY session,
+    /// as mihomo/Xray gRPC clients do. Each REALITY
+    /// handshake makes the server fetch `dest`, so per-tunnel connections
+    /// cost a dest round trip every time.
+    session: std::sync::Mutex<Option<Session>>,
 }
+
+/// A live h2 connection shared by the gun streams opened on it.
+#[derive(Clone)]
+struct Session {
+    h2: h2::client::SendRequest<Bytes>,
+    driver: Arc<ConnDriver>,
+    /// Liveness probe for a connection idle longer than [`REUSE_IDLE_PING`]
+    /// (a NAT or the server may have dropped it silently).
+    ping: Arc<tokio::sync::Mutex<Option<h2::PingPong>>>,
+    last_open: Arc<std::sync::Mutex<std::time::Instant>>,
+}
+
+/// After this long without a new stream, a reused connection is PINGed
+/// first.
+const REUSE_IDLE_PING: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long a reused connection may take to accept one more stream (its
+/// concurrent-stream limit) before a fresh connection is dialed instead.
+const REUSE_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl GrpcLayer {
     /// Create a `GrpcLayer` from the given configuration.
     pub fn new(config: GrpcConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            session: std::sync::Mutex::new(None),
+        }
     }
-}
 
-#[async_trait]
-impl Transport for GrpcLayer {
-    async fn connect(&self, inner: Box<dyn Stream>) -> Result<Box<dyn Stream>> {
+    fn request(&self) -> Result<http::Request<()>> {
         let path = format!("/{}/Tun", self.config.service_name);
-
-        // Build and validate the request before opening the h2 connection.
         // Invalid service names or authorities are configuration errors, not
         // transport-handshake failures.
-        let request = http::Request::builder()
+        http::Request::builder()
             .method(http::Method::POST)
             .uri(format!("http://{}{}", self.config.authority, path))
             .header(http::header::CONTENT_TYPE, "application/grpc")
             .header("te", "trailers")
             .body(())
-            .map_err(|e| TransportError::Config(format!("grpc: invalid request config: {e}")))?;
+            .map_err(|e| TransportError::Config(format!("grpc: invalid request config: {e}")))
+    }
+
+    /// Open one tunnel stream on `session`.
+    async fn open(&self, session: &Session, wait: bool) -> Result<Box<dyn Stream>> {
+        let request = self.request()?;
+        let h2 = session.h2.clone();
+        let mut h2 = if wait {
+            h2.ready()
+                .await
+                .map_err(|e| crate::h2_common::h2_to_transport(e, TransportError::Grpc))?
+        } else {
+            tokio::time::timeout(REUSE_READY_TIMEOUT, h2.ready())
+                .await
+                .map_err(|_| TransportError::Grpc("grpc: connection busy".into()))?
+                .map_err(|e| crate::h2_common::h2_to_transport(e, TransportError::Grpc))?
+        };
+        // `end_of_stream = false` — we will stream data.
+        let (response_future, send_stream) = h2
+            .send_request(request, false)
+            .map_err(|e| crate::h2_common::h2_to_transport(e, TransportError::Grpc))?;
+        if let Ok(mut last) = session.last_open.lock() {
+            *last = std::time::Instant::now();
+        }
+        // Do NOT await the response here: upstream's `Tun` handler reads the
+        // client's first hunk before it writes anything, and grpc-go only
+        // flushes response headers on the first `SendMsg`. Awaiting would
+        // deadlock the tunnel (issue #377). The response is resolved on the
+        // first read instead — see `h2_common::RecvState`.
+        Ok(Box::new(GunStream::new(
+            send_stream,
+            RecvState::new(response_future),
+            Arc::clone(&session.driver),
+        )))
+    }
+}
+
+#[async_trait]
+impl Transport for GrpcLayer {
+    async fn reuse(&self) -> Option<Box<dyn Stream>> {
+        let session = self.session.lock().ok()?.clone()?;
+        if session.driver.is_finished() || !session.alive().await {
+            self.forget(&session);
+            return None;
+        }
+        match self.open(&session, false).await {
+            Ok(stream) => Some(stream),
+            Err(_) => {
+                // Closed or saturated: the caller dials a fresh connection,
+                // which then becomes the shared one.
+                self.forget(&session);
+                None
+            }
+        }
+    }
+
+    async fn connect(&self, inner: Box<dyn Stream>) -> Result<Box<dyn Stream>> {
+        // Validate the request before opening the h2 connection.
+        self.request()?;
 
         // Perform the HTTP/2 client handshake over the inner stream, with
         // the proxy-sized receive windows (see `h2_common::client_builder`).
-        let (mut h2, conn) = crate::h2_common::client_builder()
+        let (h2, mut conn) = crate::h2_common::client_builder()
             .handshake::<_, Bytes>(inner)
             .await
             .map_err(|e| crate::h2_common::h2_to_transport(e, TransportError::Grpc))?;
@@ -111,31 +194,96 @@ impl Transport for GrpcLayer {
         // WINDOW_UPDATE, PING, etc.).  Keep the JoinHandle on the stream so
         // drop can bound the driver's shutdown flush — a wedged send buffer
         // would otherwise pin the inner fd indefinitely (issue #669).
+        let ping = conn.ping_pong();
         let conn_driver = tokio::spawn(async move {
             let _ = conn.await;
         });
-
-        // Open the h2 stream.  `end_of_stream = false` — we will stream data.
-        let (response_future, send_stream) = match h2.send_request(request, false) {
-            Ok(pair) => pair,
-            Err(e) => {
-                // Dropping the JoinHandle would detach the driver with an
-                // unbounded shutdown flush; abort it explicitly (issue #669).
-                conn_driver.abort();
-                return Err(crate::h2_common::h2_to_transport(e, TransportError::Grpc));
-            }
+        let session = Session {
+            h2,
+            driver: Arc::new(ConnDriver(Some(conn_driver))),
+            ping: Arc::new(tokio::sync::Mutex::new(ping)),
+            last_open: Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
         };
+        // A failed first stream drops `session`, whose driver aborts
+        // (issue #669); only a working connection is offered for reuse.
+        let stream = self.open(&session, true).await?;
+        if let Ok(mut slot) = self.session.lock() {
+            *slot = Some(session);
+        }
+        Ok(stream)
+    }
+}
 
-        // Do NOT await the response here: upstream's `Tun` handler reads the
-        // client's first hunk before it writes anything, and grpc-go only
-        // flushes response headers on the first `SendMsg`. Awaiting would
-        // deadlock the tunnel (issue #377). The response is resolved on the
-        // first read instead — see `h2_common::RecvState`.
-        Ok(Box::new(GunStream::new(
-            send_stream,
-            RecvState::new(response_future),
-            conn_driver,
-        )))
+impl GrpcLayer {
+    /// Drop the shared session if it is still `stale`.
+    fn forget(&self, stale: &Session) {
+        if let Ok(mut slot) = self.session.lock() {
+            if slot
+                .as_ref()
+                .is_some_and(|s| Arc::ptr_eq(&s.driver, &stale.driver))
+            {
+                *slot = None;
+            }
+        }
+    }
+}
+
+impl Session {
+    /// False when an idle connection does not answer a PING in time.
+    async fn alive(&self) -> bool {
+        let idle = self
+            .last_open
+            .lock()
+            .map_or(Duration::ZERO, |last| last.elapsed());
+        if idle < REUSE_IDLE_PING {
+            return true;
+        }
+        let mut ping = self.ping.lock().await;
+        let Some(ping) = ping.as_mut() else {
+            return true;
+        };
+        matches!(
+            tokio::time::timeout(REUSE_READY_TIMEOUT, ping.ping(h2::Ping::opaque())).await,
+            Ok(Ok(_))
+        )
+    }
+}
+
+/// The h2 connection driver task, shared by the session and its streams.
+/// The conn owns the inner stream's fd: once every send/recv ref is gone
+/// the driver self-terminates, but only if its closing flush can make
+/// progress — so the last owner bounds that wait (issue #669).
+struct ConnDriver(Option<tokio::task::JoinHandle<()>>);
+
+impl ConnDriver {
+    fn is_finished(&self) -> bool {
+        self.0
+            .as_ref()
+            .is_none_or(tokio::task::JoinHandle::is_finished)
+    }
+}
+
+impl Drop for ConnDriver {
+    fn drop(&mut self) {
+        let Some(mut driver) = self.0.take() else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            driver.abort();
+            return;
+        };
+        runtime.spawn(async move {
+            // Once the last stream's refs are gone the conn closes on its
+            // own; bound that wait so a wedged shutdown flush cannot pin the
+            // fd.
+            if tokio::time::timeout(crate::h2_common::DRIVER_DRAIN_TIMEOUT, &mut driver)
+                .await
+                .is_err()
+            {
+                driver.abort();
+                let _ = driver.await;
+            }
+        });
     }
 }
 
@@ -307,46 +455,19 @@ struct GunStream {
     /// this stream's send/recv refs makes the driver self-terminate, but
     /// only if its closing flush can make progress — the handle lets Drop
     /// bound that wait (issue #669).
-    conn_driver: Option<tokio::task::JoinHandle<()>>,
+    _conn_driver: Arc<ConnDriver>,
 }
 
 impl GunStream {
-    fn new(
-        send: h2::SendStream<Bytes>,
-        recv: RecvState,
-        conn_driver: tokio::task::JoinHandle<()>,
-    ) -> Self {
+    fn new(send: h2::SendStream<Bytes>, recv: RecvState, conn_driver: Arc<ConnDriver>) -> Self {
         Self {
             send,
             recv,
             read_buf: Bytes::new(),
             pending_frame: Vec::new(),
             pending_write: None,
-            conn_driver: Some(conn_driver),
+            _conn_driver: conn_driver,
         }
-    }
-}
-
-impl Drop for GunStream {
-    fn drop(&mut self) {
-        let Some(mut driver) = self.conn_driver.take() else {
-            return;
-        };
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            driver.abort();
-            return;
-        };
-        runtime.spawn(async move {
-            // Once this stream's refs are gone the conn closes on its own;
-            // bound that wait so a wedged shutdown flush cannot pin the fd.
-            if tokio::time::timeout(crate::h2_common::DRIVER_DRAIN_TIMEOUT, &mut driver)
-                .await
-                .is_err()
-            {
-                driver.abort();
-                let _ = driver.await;
-            }
-        });
     }
 }
 
