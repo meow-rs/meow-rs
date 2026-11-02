@@ -739,6 +739,8 @@ struct ConfigResponse {
     bind_address: String,
     #[serde(rename = "ipv6")]
     ipv6: bool,
+    #[serde(rename = "routing-mark")]
+    routing_mark: u32,
     /// Whether the TUN listener is currently running (issue #326).
     /// Mirrors `tun.enable` from the raw config and reflects actual
     /// runtime state so nyanpasu can correctly render its toggle.
@@ -759,7 +761,7 @@ async fn get_configs(State(state): State<Arc<AppState>>) -> Json<ConfigResponse>
         mixed_port: raw.mixed_port,
         socks_port: raw.socks_port,
         http_port: raw.port,
-        redir_port: 0,
+        redir_port: raw.redir_port.unwrap_or(0),
         tproxy_port: raw.tproxy_port.unwrap_or(0),
         external_controller: raw.external_controller.clone(),
         allow_lan: raw.allow_lan.unwrap_or(false),
@@ -768,6 +770,7 @@ async fn get_configs(State(state): State<Arc<AppState>>) -> Json<ConfigResponse>
             .clone()
             .unwrap_or_else(|| "0.0.0.0".to_string()),
         ipv6: meow_config::effective_ipv6(raw.ipv6),
+        routing_mark: raw.routing_mark.unwrap_or(0),
         tun_enable: tun_running,
         tun: TunFields::reported(raw.tun.as_ref(), tun_running),
     })

@@ -204,6 +204,7 @@ async fn listeners_endpoint_discloses_tproxy_firewall_mode() {
                 firewall: false,
                 udp: true,
                 udp_timeout: 30,
+                transparent: false,
             },
             port: 7894,
             listen: "127.0.0.1".into(),
