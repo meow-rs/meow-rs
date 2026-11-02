@@ -551,8 +551,8 @@ fn uint(n: i64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{self as ledger, add, Options, Query, OTHER_IPS};
     use super::*;
+    use crate::traffic_ledger::{self as ledger, add, Options, Query, OTHER_IPS};
     use smol_str::SmolStr;
     use std::sync::{Arc, Mutex as StdMutex};
 
