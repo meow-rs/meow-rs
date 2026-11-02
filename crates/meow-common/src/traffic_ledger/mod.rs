@@ -1,25 +1,26 @@
-//! Traffic ledger: how much each host, policy and network interface carried,
-//! day by day, kept across restarts.
+//! Traffic ledger: how much each host, app, policy and network interface
+//! carried, day by day, kept across restarts.
 //!
 //! [`crate::traffic`] counts what each proxy carried since the engine
 //! started and forgets it at a stop. The ledger keeps, for every local day,
 //! the bytes sent and received and the connections opened (and UDP flows
-//! that sent something) per registrable domain, leaf proxy and interface
-//! label, for [`RETENTION_DAYS`] — enough for a client to show today, this
-//! month and last month, grouped any of the three ways. A meow extension;
-//! mihomo has no equivalent.
+//! that sent something) per registrable domain, app, leaf proxy and
+//! interface label, for [`RETENTION_DAYS`] — enough for a client to show
+//! today, this month and last month, grouped any of the four ways. A meow
+//! extension; mihomo has no equivalent.
 //!
 //! Unlike the logbook (ADR-0014), the ledger records destinations: with
 //! hosts on, it is a coarse browsing history (registrable domains, no
-//! paths, no times finer than a day). It never leaves the device; a config
-//! turns it off (`traffic-ledger.enable: false`) or keeps the policies and
-//! interfaces without hosts (`hosts: false`), and [`clear`] empties it.
+//! paths, no times finer than a day), and with apps on, one by app. It never
+//! leaves the device; a config turns it off (`traffic-ledger.enable:
+//! false`), keeps no hosts (`hosts: false`) or no apps (`apps: false`),
+//! and [`clear`] empties it.
 //!
 //! # Storage
 //!
 //! `<home>/traffic/traffic.db` is an SQLite database (bundled SQLite, WAL
-//! mode) with one row per day, host, policy and interface; readers in other
-//! processes ([`read`]) rely on its schema. A database that cannot be read
+//! mode) with one row per day, host, app, policy and interface; readers in
+//! other processes ([`read`]) rely on its schema. A database that cannot be read
 //! is set aside and the ledger starts over, and a lock file keeps a second
 //! meow process off the directory, as for the logbook.
 //!
@@ -44,7 +45,7 @@ use smol_str::SmolStr;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -76,6 +77,10 @@ pub enum GroupBy {
     /// the address for a flow to a bare IP, empty with hosts off.
     #[default]
     Host,
+    /// The app that opened the flow: the package name on Android, the
+    /// `.app` bundle on macOS, the process name elsewhere; empty when the
+    /// platform cannot tell or with apps off.
+    App,
     /// The leaf proxy that carried the traffic, as `/statistics` counts
     /// it: a group's member, never the group; `DIRECT` and `REJECT` too.
     Policy,
@@ -88,6 +93,7 @@ impl GroupBy {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Host => "host",
+            Self::App => "app",
             Self::Policy => "policy",
             Self::Interface => "interface",
         }
@@ -100,10 +106,11 @@ impl std::str::FromStr for GroupBy {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "host" => Ok(Self::Host),
+            "app" => Ok(Self::App),
             "policy" => Ok(Self::Policy),
             "interface" => Ok(Self::Interface),
             _ => Err(format!(
-                "unknown grouping {s:?}: expected host, policy or interface"
+                "unknown grouping {s:?}: expected host, app, policy or interface"
             )),
         }
     }
@@ -119,6 +126,7 @@ pub struct Query {
     pub to: i32,
     pub by: GroupBy,
     pub host: Option<String>,
+    pub app: Option<String>,
     pub policy: Option<String>,
     pub interface: Option<String>,
 }
@@ -152,11 +160,17 @@ pub struct Report {
 pub struct Options {
     /// Record hosts; off, every row's host is empty.
     pub hosts: bool,
+    /// Record the app that opened each flow; off, every row's app is
+    /// empty, and no platform lookup runs for it.
+    pub apps: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Self { hosts: true }
+        Self {
+            hosts: true,
+            apps: true,
+        }
     }
 }
 
@@ -231,8 +245,8 @@ pub trait Source: Send + Sync {
     fn settle(&self);
 }
 
-/// Bytes and requests not yet written, by host and policy.
-type Pending = HashMap<(SmolStr, Arc<str>), Counts>;
+/// Bytes and requests not yet written, by host, app and policy.
+type Pending = HashMap<(SmolStr, SmolStr, Arc<str>), Counts>;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct Counts {
@@ -246,6 +260,11 @@ static CURRENT: RwLock<Option<Arc<Ledger>>> = RwLock::new(None);
 static ENABLED: AtomicBool = AtomicBool::new(false);
 /// [`Options::hosts`] of the installed ledger.
 static HOSTS: AtomicBool = AtomicBool::new(true);
+/// [`Options::apps`] of the installed ledger.
+static APPS: AtomicBool = AtomicBool::new(true);
+/// Moved on as the ledger drops what every flow carried so far (see
+/// [`epoch`]).
+static EPOCH: AtomicU32 = AtomicU32::new(0);
 static PENDING: Mutex<Option<Pending>> = Mutex::new(None);
 static SOURCES: Mutex<Vec<Weak<dyn Source>>> = Mutex::new(Vec::new());
 static INTERFACE: Mutex<SmolStr> = Mutex::new(SmolStr::new_inline(""));
@@ -272,11 +291,34 @@ pub fn hosts() -> bool {
     HOSTS.load(Ordering::Relaxed)
 }
 
+/// Whether apps are recorded; when not, a producer passes an empty app and
+/// looks none up.
+pub fn apps() -> bool {
+    APPS.load(Ordering::Relaxed)
+}
+
+/// Moves on as the ledger drops what every flow carried so far: at a
+/// [`clear`], and as a ledger is installed while none recorded. A flow
+/// that settles under an older epoch than its last settle drops what it
+/// carried until then, and the request it has not counted, as a flow whose
+/// app was still being looked up was not settled by the drop.
+pub fn epoch() -> u32 {
+    EPOCH.load(Ordering::Relaxed)
+}
+
 /// Count traffic toward `host` (a domain or an IP address as text, empty
-/// for none) through the leaf proxy `policy`. Called once per connection
-/// with its `requests`, then with its bytes as the tunnel settles. Does
-/// nothing while no ledger is installed.
-pub fn add(host: &SmolStr, policy: &Arc<str>, upload: u64, download: u64, requests: u64) {
+/// for none) from `app` (see [`GroupBy::App`], empty for none) through the
+/// leaf proxy `policy`. Called once per connection with its `requests`,
+/// then with its bytes as the tunnel settles. Does nothing while no ledger
+/// is installed.
+pub fn add(
+    host: &SmolStr,
+    app: &SmolStr,
+    policy: &Arc<str>,
+    upload: u64,
+    download: u64,
+    requests: u64,
+) {
     if !enabled() || (upload == 0 && download == 0 && requests == 0) {
         return;
     }
@@ -284,7 +326,7 @@ pub fn add(host: &SmolStr, policy: &Arc<str>, upload: u64, download: u64, reques
         let mut pending = PENDING.lock().unwrap_or_else(PoisonError::into_inner);
         let pending = pending.get_or_insert_with(HashMap::new);
         let counts = pending
-            .entry((host.clone(), Arc::clone(policy)))
+            .entry((host.clone(), app.clone(), Arc::clone(policy)))
             .or_default();
         counts.upload = counts.upload.saturating_add(upload);
         counts.download = counts.download.saturating_add(download);
@@ -298,7 +340,7 @@ pub fn add(host: &SmolStr, policy: &Arc<str>, upload: u64, download: u64, reques
     }
 }
 
-/// Distinct hosts and policies pending at which the writer is asked for a
+/// Distinct hosts, apps and policies pending at which the writer is asked for a
 /// flush ahead of [`FLUSH_INTERVAL`]: a burst of flows to distinct hosts (a
 /// scan) does not hold more in memory than this, give or take what arrives
 /// while the flush runs.
@@ -319,6 +361,12 @@ fn take_pending() -> Pending {
         .unwrap_or_else(PoisonError::into_inner)
         .take()
         .unwrap_or_default()
+}
+
+/// Drop what is pending and what every flow carried so far.
+fn discard_pending() {
+    EPOCH.fetch_add(1, Ordering::Relaxed);
+    drop(take_pending());
 }
 
 /// Register `source`; it is asked to settle until it is dropped.
@@ -397,26 +445,34 @@ pub fn today() -> i32 {
 /// [`io::ErrorKind::Unsupported`] when built without the `traffic-ledger`
 /// feature.
 pub fn install(dir: &Path, options: Options) -> io::Result<()> {
-    if current().is_some_and(|ledger| ledger.dir() == dir) {
-        HOSTS.store(options.hosts, Ordering::Relaxed);
+    if let Some(ledger) = current().filter(|ledger| ledger.dir() == dir) {
+        if (options.hosts, options.apps) != (hosts(), apps()) {
+            // What was counted is written under the options it was
+            // counted with.
+            ledger.flush();
+            HOSTS.store(options.hosts, Ordering::Relaxed);
+            APPS.store(options.apps, Ordering::Relaxed);
+        }
         return Ok(());
     }
     let ledger = Arc::new(Ledger::open(dir)?);
     if !enabled() {
         // Flows that outlived an earlier ledger carried traffic while none
-        // recorded; settling them now (into nothing, as `add` is off) keeps
-        // it out of this one.
-        drop(take_pending());
+        // recorded; dropping it keeps it out of this one.
+        discard_pending();
     }
     let previous = CURRENT
         .write()
         .unwrap_or_else(PoisonError::into_inner)
         .replace(ledger);
-    HOSTS.store(options.hosts, Ordering::Relaxed);
-    ENABLED.store(true, Ordering::Relaxed);
     if let Some(previous) = previous {
+        // What was counted goes to the ledger it was counted for, under
+        // its options.
         previous.flush();
     }
+    HOSTS.store(options.hosts, Ordering::Relaxed);
+    APPS.store(options.apps, Ordering::Relaxed);
+    ENABLED.store(true, Ordering::Relaxed);
     Ok(())
 }
 
@@ -519,25 +575,25 @@ pub fn reconfigure(enable: bool, options: Options) {
 }
 
 /// The rows written at a flush: pending counts keyed by host (reduced to
-/// its registrable domain), policy and interface, on one day.
+/// its registrable domain), app, policy and interface, on one day.
 #[cfg_attr(not(feature = "traffic-ledger"), allow(dead_code))]
 struct Batch {
     day: i32,
     interface: SmolStr,
-    rows: HashMap<(String, Arc<str>), Counts>,
+    rows: HashMap<(String, SmolStr, Arc<str>), Counts>,
 }
 
 #[cfg_attr(not(feature = "traffic-ledger"), allow(dead_code))]
 impl Batch {
-    /// What is pending, keyed for the rows. With hosts off, no host is kept,
-    /// even one a flow opened before they were turned off counted. A batch
-    /// keeps at most [`MAX_IP_HOSTS`] addresses itself, so batches a failing
-    /// disk holds for a retry stay small.
+    /// What is pending, keyed for the rows. With hosts (apps) off, no host
+    /// (app) is kept, even one a flow opened before they were turned off
+    /// counted. A batch keeps at most [`MAX_IP_HOSTS`] addresses itself, so
+    /// batches a failing disk holds for a retry stay small.
     fn take(day: i32) -> Self {
-        let hosts = hosts();
+        let (hosts, apps) = (hosts(), apps());
         let mut ips = HashSet::new();
-        let mut rows: HashMap<(String, Arc<str>), Counts> = HashMap::new();
-        for ((host, policy), counts) in take_pending() {
+        let mut rows: HashMap<(String, SmolStr, Arc<str>), Counts> = HashMap::new();
+        for ((host, app, policy), counts) in take_pending() {
             let mut host = if hosts {
                 host_key(&host)
             } else {
@@ -550,7 +606,8 @@ impl Batch {
                     host = OTHER_IPS.to_owned();
                 }
             }
-            let row = rows.entry((host, policy)).or_default();
+            let app = if apps { app } else { SmolStr::default() };
+            let row = rows.entry((host, app, policy)).or_default();
             row.upload = row.upload.saturating_add(counts.upload);
             row.download = row.download.saturating_add(counts.download);
             row.requests = row.requests.saturating_add(counts.requests);
@@ -581,6 +638,25 @@ fn host_key(host: &str) -> String {
     match registrable_domain(&lower) {
         Some(domain) => domain.to_owned(),
         None => lower,
+    }
+}
+
+/// The app of a flow whose owner the platform named: the outermost app
+/// bundle on `path` (`/Applications/Safari.app/Contents/...` is `Safari`,
+/// so a browser's helper processes count as the browser), else the process
+/// name, else the last component of `path`.
+pub fn app_name(process: &str, path: &str) -> SmolStr {
+    let mut parts = path.split(['/', '\\']).peekable();
+    while let Some(part) = parts.next() {
+        let bundle = part.strip_suffix(".app").filter(|name| !name.is_empty());
+        if let Some(bundle) = bundle.filter(|_| parts.peek() == Some(&"Contents")) {
+            return bundle.into();
+        }
+    }
+    if process.is_empty() {
+        path.rsplit(['/', '\\']).next().unwrap_or_default().into()
+    } else {
+        process.into()
     }
 }
 
@@ -707,8 +783,42 @@ mod tests {
     }
 
     #[test]
+    fn apps_are_bundles_or_processes() {
+        let helper = "/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome \
+                      Framework.framework/Helpers/Google Chrome Helper.app/Contents/MacOS/\
+                      Google Chrome Helper";
+        assert_eq!(app_name("Google Chrome Helper", helper), "Google Chrome");
+        assert_eq!(app_name("curl", "/usr/bin/curl"), "curl");
+        assert_eq!(app_name("org.example.browser", ""), "org.example.browser");
+        assert_eq!(
+            app_name("", r"C:\Program Files\Example\example.exe"),
+            "example.exe"
+        );
+        assert_eq!(app_name("", "/opt/.app/tool"), "tool");
+        // Only a bundle's layout names the app, never a directory that
+        // happens to end in `.app`, nor more than one path component.
+        assert_eq!(
+            app_name(
+                "esbuild",
+                "/home/alice/my-site.app/node_modules/.bin/esbuild"
+            ),
+            "esbuild"
+        );
+        assert_eq!(
+            app_name("tool", r"C:\Users\Alice\Tools\tool.app\bin\tool.exe"),
+            "tool"
+        );
+        assert_eq!(
+            app_name("", r"D:\Apps\Example.app\Contents\MacOS\Example"),
+            "Example"
+        );
+        assert_eq!(app_name("", ""), "");
+    }
+
+    #[test]
     fn group_by_parses() {
         assert_eq!("policy".parse::<GroupBy>(), Ok(GroupBy::Policy));
+        assert_eq!("app".parse::<GroupBy>(), Ok(GroupBy::App));
         assert!("nodes".parse::<GroupBy>().is_err());
         assert_eq!(GroupBy::Interface.as_str(), "interface");
     }

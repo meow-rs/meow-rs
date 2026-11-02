@@ -3,6 +3,7 @@
 //! TCP/UDP relay, rule-matching dispatch, and connection statistics.
 //! [`Tunnel`] is the shared engine listeners hand connections to.
 
+mod app_lookup;
 pub mod health_check;
 pub mod match_engine;
 pub mod relay;

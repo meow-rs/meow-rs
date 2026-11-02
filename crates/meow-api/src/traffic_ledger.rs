@@ -1,6 +1,6 @@
 //! `GET /traffic/ledger` and `DELETE /traffic/ledger` (meow extension, no
-//! mihomo equivalent): the per-day traffic by host, policy and interface
-//! kept by [`meow_common::traffic_ledger`].
+//! mihomo equivalent): the per-day traffic by host, app, policy and
+//! interface kept by [`meow_common::traffic_ledger`].
 
 use axum::{
     extract::Query,
@@ -16,6 +16,7 @@ pub(crate) struct LedgerParams {
     to: Option<String>,
     by: Option<String>,
     host: Option<String>,
+    app: Option<String>,
     policy: Option<String>,
     interface: Option<String>,
 }
@@ -37,11 +38,11 @@ fn bad_request(message: &str) -> Response {
         .into_response()
 }
 
-/// `GET /traffic/ledger?from=&to=&by=&host=&policy=&interface=`: the
+/// `GET /traffic/ledger?from=&to=&by=&host=&app=&policy=&interface=`: the
 /// traffic of the local days `from` to `to` (`YYYY-MM-DD`, both included,
-/// today by default), grouped `by` `host` (the default), `policy` or
-/// `interface`, largest first. `host`, `policy` and `interface` keep the
-/// rows matching them, to drill into one group.
+/// today by default), grouped `by` `host` (the default), `app`, `policy`
+/// or `interface`, largest first. `host`, `app`, `policy` and `interface`
+/// keep the rows matching them, to drill into one group.
 pub(crate) async fn get_ledger(Query(params): Query<LedgerParams>) -> Response {
     let today = traffic_ledger::today();
     let day = |date: Option<&str>| match date {
@@ -69,6 +70,7 @@ pub(crate) async fn get_ledger(Query(params): Query<LedgerParams>) -> Response {
         to,
         by,
         host: params.host,
+        app: params.app,
         policy: params.policy,
         interface: params.interface,
     };

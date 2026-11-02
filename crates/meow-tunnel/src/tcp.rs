@@ -1,5 +1,5 @@
 use crate::relay::{copy_bidirectional_buf_tracked_splice, proxy_conn_tcp_view, RELAY_BUF_SIZE};
-use crate::statistics::{LedgerTag, Statistics};
+use crate::statistics::Statistics;
 use crate::tunnel::{MatchedRule, ResolvedTarget, TunnelInner};
 use meow_common::conn_note;
 use meow_common::conn_notes::{self, ConnNotes};
@@ -116,13 +116,11 @@ impl<'a> ConnectionGuard<'a> {
         rule_payload: SmolStr,
         adapter: &dyn ProxyAdapter,
     ) -> Self {
-        let ledger = || {
-            LedgerTag::new(metadata, || {
-                let leaf = leaf_proxy(adapter, metadata);
-                Some(stats.proxy_name(leaf.as_deref().map_or(adapter.name(), |hop| hop.name())))
-            })
+        let policy = || {
+            let leaf = leaf_proxy(adapter, metadata);
+            Some(stats.proxy_name(leaf.as_deref().map_or(adapter.name(), |hop| hop.name())))
         };
-        if let Some(counters) = stats.begin_headless_connection(ledger) {
+        if let Some(counters) = stats.begin_headless_connection(metadata, policy) {
             return Self {
                 stats,
                 key: ConnectionKey::Headless,
@@ -158,8 +156,8 @@ impl<'a> ConnectionGuard<'a> {
     ) -> Self {
         // Obtain the handle before publishing the entry. A concurrent DELETE
         // must cancel this exact handle, even before its first poll.
-        let ledger = || LedgerTag::new(&metadata, || chains.first().cloned());
-        let (key, counters) = if let Some(counters) = stats.begin_headless_connection(ledger) {
+        let headless = stats.begin_headless_connection(&metadata, || chains.first().cloned());
+        let (key, counters) = if let Some(counters) = headless {
             (ConnectionKey::Headless, counters)
         } else {
             let (id, counters) = stats.track_connection_with_counters(

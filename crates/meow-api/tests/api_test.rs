@@ -7397,8 +7397,23 @@ async fn traffic_ledger_groups_drills_and_clears() {
     traffic_ledger::install(dir.path(), traffic_ledger::Options::default()).unwrap();
     let direct: Arc<str> = Arc::from("DIRECT");
     let node: Arc<str> = Arc::from("Ledger API Node");
-    traffic_ledger::add(&"www.ledger-api.example".into(), &direct, 10, 100, 1);
-    traffic_ledger::add(&"cdn.ledger-api.example".into(), &node, 20, 2000, 2);
+    let browser = "org.example.browser".into();
+    traffic_ledger::add(
+        &"www.ledger-api.example".into(),
+        &browser,
+        &direct,
+        10,
+        100,
+        1,
+    );
+    traffic_ledger::add(
+        &"cdn.ledger-api.example".into(),
+        &"".into(),
+        &node,
+        20,
+        2000,
+        2,
+    );
 
     let hosts = body_json(get("/traffic/ledger?host=ledger-api.example").await).await;
     assert_eq!(hosts["enabled"], true);
@@ -7424,6 +7439,17 @@ async fn traffic_ledger_groups_drills_and_clears() {
             .await;
     assert_eq!(drilled["upload"], 10);
     assert_eq!(drilled["download"], 100);
+
+    let apps = body_json(get("/traffic/ledger?by=app&host=ledger-api.example").await).await;
+    assert_eq!(apps["by"], "app");
+    let rows = apps["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "{apps}");
+    assert_eq!(rows[0]["name"], "", "flows of no known app");
+    assert_eq!(rows[1]["name"], "org.example.browser");
+    let browser = body_json(get("/traffic/ledger?by=policy&app=org.example.browser").await).await;
+    let rows = browser["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{browser}");
+    assert_eq!(rows[0]["name"], "DIRECT");
 
     let today = traffic_ledger::date_of_day(traffic_ledger::today());
     let span = body_json(

@@ -21,23 +21,26 @@ const CORRUPT_FILE: &str = "traffic.db.corrupt";
 const LOCK_FILE: &str = "traffic.lock";
 
 /// `PRAGMA user_version` of [`SCHEMA`]. A database from a newer meow is
-/// left alone, neither read nor rewritten.
-const SCHEMA_VERSION: i64 = 1;
+/// left alone, neither read nor rewritten. Schema 1, without `app`, was
+/// only written by test builds before the ledger shipped; one is set aside.
+const SCHEMA_VERSION: i64 = 2;
 
 /// A contract with readers in other processes. `day` counts local days
 /// since 1970-01-01; `host` is a registrable domain, an IP address,
-/// [`OTHER_IPS`] or empty; `interface` is empty when the platform set no
+/// [`OTHER_IPS`] or empty; `app` is a package name, an app bundle or a
+/// process name, or empty; `interface` is empty when the platform set no
 /// label.
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS traffic (
     day       INTEGER NOT NULL,
     host      TEXT NOT NULL,
+    app       TEXT NOT NULL,
     policy    TEXT NOT NULL,
     interface TEXT NOT NULL,
     upload    INTEGER NOT NULL,
     download  INTEGER NOT NULL,
     requests  INTEGER NOT NULL,
-    PRIMARY KEY (day, host, policy, interface)
+    PRIMARY KEY (day, host, app, policy, interface)
 ) WITHOUT ROWID;
 ";
 
@@ -52,9 +55,9 @@ PRAGMA cache_size = -256;
 ";
 
 const UPSERT: &str = "
-INSERT INTO traffic (day, host, policy, interface, upload, download, requests)
-VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-ON CONFLICT (day, host, policy, interface) DO UPDATE SET
+INSERT INTO traffic (day, host, app, policy, interface, upload, download, requests)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+ON CONFLICT (day, host, app, policy, interface) DO UPDATE SET
     upload = upload + excluded.upload,
     download = download + excluded.download,
     requests = requests + excluded.requests
@@ -253,7 +256,7 @@ impl Writer {
                     let _ = reply.send(report(&self.conn, &query).map_err(io::Error::other));
                 }
                 Ok(Op::Clear(ack)) => {
-                    drop(super::take_pending());
+                    super::discard_pending();
                     self.backlog.clear();
                     self.ip_hosts = None;
                     let result = clear(&self.conn).map_err(|e| {
@@ -307,16 +310,22 @@ impl Writer {
         self.prune(zone.day(now));
     }
 
+    /// Write the backlog in one transaction. Hosts (apps) turned off since a
+    /// batch was taken are not written either; the rows they merge into add
+    /// up.
     fn commit(&mut self) -> rusqlite::Result<()> {
+        let (hosts, apps) = (super::hosts(), super::apps());
         let tx = self.conn.unchecked_transaction()?;
         {
             let mut upsert = tx.prepare(UPSERT)?;
             for batch in &self.backlog {
-                for ((host, policy), counts) in &batch.rows {
+                for ((host, app, policy), counts) in &batch.rows {
+                    let host = if hosts { host.as_str() } else { "" };
                     let host = cap_ip_host(&tx, &mut self.ip_hosts, batch.day, host)?;
                     upsert.execute(params![
                         batch.day,
                         host,
+                        if apps { app.as_str() } else { "" },
                         &**policy,
                         batch.interface.as_str(),
                         int(counts.upload),
@@ -412,6 +421,7 @@ fn vacuum(conn: &Connection) -> rusqlite::Result<()> {
 fn report(conn: &Connection, query: &Query) -> rusqlite::Result<Report> {
     let column = match query.by {
         GroupBy::Host => "host",
+        GroupBy::App => "app",
         GroupBy::Policy => "policy",
         GroupBy::Interface => "interface",
     };
@@ -419,8 +429,9 @@ fn report(conn: &Connection, query: &Query) -> rusqlite::Result<Report> {
         "SELECT {column}, SUM(upload), SUM(download), SUM(requests) FROM traffic \
          WHERE day BETWEEN ?1 AND ?2 \
          AND (?3 IS NULL OR host = ?3) \
-         AND (?4 IS NULL OR policy = ?4) \
-         AND (?5 IS NULL OR interface = ?5) \
+         AND (?4 IS NULL OR app = ?4) \
+         AND (?5 IS NULL OR policy = ?5) \
+         AND (?6 IS NULL OR interface = ?6) \
          GROUP BY {column} \
          ORDER BY SUM(upload) + SUM(download) DESC, SUM(requests) DESC, {column}"
     );
@@ -431,6 +442,7 @@ fn report(conn: &Connection, query: &Query) -> rusqlite::Result<Report> {
                 query.from,
                 query.to,
                 query.host,
+                query.app,
                 query.policy,
                 query.interface
             ],
@@ -576,6 +588,11 @@ fn schema_version(conn: &Connection) -> Result<i64, Unusable> {
     if version < 0 {
         return Err(Unusable::Damaged(format!("unknown schema {version}")));
     }
+    if (1..SCHEMA_VERSION).contains(&version) {
+        return Err(Unusable::Damaged(format!(
+            "schema {version} of a test build"
+        )));
+    }
     if version > SCHEMA_VERSION {
         return Err(Unusable::Failed(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -647,7 +664,7 @@ mod tests {
     }
 
     #[test]
-    fn traffic_is_kept_by_host_policy_and_interface() {
+    fn traffic_is_kept_by_host_app_policy_and_interface() {
         let _serial = SERIAL
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -655,12 +672,21 @@ mod tests {
         ledger::install(&dir, Options::default()).unwrap();
         let proxy: Arc<str> = Arc::from("Node A");
         let direct: Arc<str> = Arc::from("DIRECT");
+        let browser = SmolStr::new("org.example.browser");
+        let none = SmolStr::default();
         ledger::set_interface("Wi-Fi");
-        add(&SmolStr::new("www.example.com"), &proxy, 100, 1000, 1);
-        add(&SmolStr::new("api.example.com"), &proxy, 10, 100, 1);
-        add(&SmolStr::new("192.0.2.1"), &direct, 5, 5, 1);
+        add(
+            &SmolStr::new("www.example.com"),
+            &browser,
+            &proxy,
+            100,
+            1000,
+            1,
+        );
+        add(&SmolStr::new("api.example.com"), &none, &proxy, 10, 100, 1);
+        add(&SmolStr::new("192.0.2.1"), &none, &direct, 5, 5, 1);
         ledger::set_interface("Cellular");
-        add(&SmolStr::new("example.org"), &direct, 1, 2, 1);
+        add(&SmolStr::new("example.org"), &browser, &direct, 1, 2, 1);
 
         let hosts = ledger::query(&query(GroupBy::Host)).unwrap().unwrap();
         let names: Vec<_> = hosts.rows.iter().map(|row| row.name.as_str()).collect();
@@ -678,6 +704,25 @@ mod tests {
             .map(|row| row.name.as_str())
             .collect();
         assert_eq!(names, ["Wi-Fi", "Cellular"]);
+
+        let apps = ledger::query(&query(GroupBy::App)).unwrap().unwrap();
+        let apps: Vec<_> = apps
+            .rows
+            .iter()
+            .map(|row| (row.name.as_str(), row.upload + row.download))
+            .collect();
+        assert_eq!(apps, [("org.example.browser", 1103), ("", 120)]);
+
+        // Drilling into an app.
+        let mut drill = query(GroupBy::Host);
+        drill.app = Some("org.example.browser".into());
+        let browser_hosts = ledger::query(&drill).unwrap().unwrap();
+        let names: Vec<_> = browser_hosts
+            .rows
+            .iter()
+            .map(|row| row.name.as_str())
+            .collect();
+        assert_eq!(names, ["example.com", "example.org"]);
 
         // Drilling into a policy.
         let mut drill = query(GroupBy::Host);
@@ -708,7 +753,7 @@ mod tests {
             .is_empty());
         ledger::uninstall();
         ledger::set_interface("");
-        add(&SmolStr::new("example.com"), &proxy, 1, 1, 1);
+        add(&SmolStr::new("example.com"), &none, &proxy, 1, 1, 1);
         assert!(ledger::read(&dir, &query(GroupBy::Host))
             .unwrap()
             .rows
@@ -723,11 +768,12 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = dir("restart");
         let proxy: Arc<str> = Arc::from("Node B");
+        let none = SmolStr::default();
         ledger::install(&dir, Options::default()).unwrap();
-        add(&SmolStr::new("example.com"), &proxy, 1, 2, 1);
+        add(&SmolStr::new("example.com"), &none, &proxy, 1, 2, 1);
         ledger::uninstall();
         ledger::install(&dir, Options::default()).unwrap();
-        add(&SmolStr::new("example.com"), &proxy, 3, 4, 1);
+        add(&SmolStr::new("example.com"), &none, &proxy, 3, 4, 1);
         let report = ledger::query(&query(GroupBy::Host)).unwrap().unwrap();
         assert_eq!(report.rows.len(), 1);
         assert_eq!((report.upload, report.download, report.requests), (4, 6, 2));
@@ -763,8 +809,11 @@ mod tests {
         let conn = connect(&dir.join(DB_FILE)).ok().unwrap();
         let today = 20_000;
         for day in [today - RETENTION_DAYS, today - RETENTION_DAYS + 1, today] {
-            conn.execute(UPSERT, params![day, "example.com", "DIRECT", "", 1, 1, 1])
-                .unwrap();
+            conn.execute(
+                UPSERT,
+                params![day, "example.com", "", "DIRECT", "", 1, 1, 1],
+            )
+            .unwrap();
         }
         prune(&conn, today).unwrap();
         assert_eq!(rows_of_day(&conn, today - RETENTION_DAYS), 0);
@@ -800,20 +849,38 @@ mod tests {
     }
 
     #[test]
-    fn hosts_off_keeps_no_host_counted_before() {
+    fn hosts_and_apps_off_keep_none_counted_after() {
         let _serial = SERIAL
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = dir("hosts-off");
         ledger::install(&dir, Options::default()).unwrap();
         let proxy: Arc<str> = Arc::from("Node A");
-        // Counted by a flow that opened with hosts on, settled after they
-        // went off.
-        add(&SmolStr::new("www.example.com"), &proxy, 1, 2, 1);
-        ledger::install(&dir, Options { hosts: false }).unwrap();
-        let report = ledger::query(&query(GroupBy::Host)).unwrap().unwrap();
-        let names: Vec<_> = report.rows.iter().map(|row| row.name.as_str()).collect();
-        assert_eq!(names, [""]);
+        let host = SmolStr::new("www.example.com");
+        let browser = SmolStr::new("org.example.browser");
+        add(&host, &browser, &proxy, 1, 2, 1);
+        ledger::install(
+            &dir,
+            Options {
+                hosts: false,
+                apps: false,
+            },
+        )
+        .unwrap();
+        // Counted after they went off, by a flow that opened with them on.
+        add(&host, &browser, &proxy, 10, 20, 0);
+        for (by, name) in [
+            (GroupBy::Host, "example.com"),
+            (GroupBy::App, "org.example.browser"),
+        ] {
+            let report = ledger::query(&query(by)).unwrap().unwrap();
+            let rows: Vec<_> = report
+                .rows
+                .iter()
+                .map(|row| (row.name.as_str(), row.upload))
+                .collect();
+            assert_eq!(rows, [("", 10), (name, 1)], "by {by:?}");
+        }
         ledger::uninstall();
         let _ = fs::remove_dir_all(&dir);
     }
@@ -837,17 +904,28 @@ mod tests {
         let _serial = SERIAL
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let dir = dir("schema");
-        fs::create_dir_all(&dir).unwrap();
-        let conn = Connection::open(dir.join(DB_FILE)).unwrap();
-        conn.pragma_update(None, "user_version", -1).unwrap();
-        drop(conn);
-        ledger::install(&dir, Options::default()).unwrap();
-        assert!(dir.join(CORRUPT_FILE).exists());
-        add(&SmolStr::new("example.com"), &Arc::from("DIRECT"), 1, 1, 1);
-        let report = ledger::query(&query(GroupBy::Host)).unwrap().unwrap();
-        assert_eq!(report.requests, 1);
-        ledger::uninstall();
-        let _ = fs::remove_dir_all(&dir);
+        // Unknown, and the schema without `app` of test builds.
+        for version in [-1, 1] {
+            let dir = dir("schema");
+            fs::create_dir_all(&dir).unwrap();
+            let conn = Connection::open(dir.join(DB_FILE)).unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+            drop(conn);
+            ledger::install(&dir, Options::default()).unwrap();
+            assert!(dir.join(CORRUPT_FILE).exists(), "schema {version}");
+            let direct: Arc<str> = Arc::from("DIRECT");
+            add(
+                &SmolStr::new("example.com"),
+                &SmolStr::default(),
+                &direct,
+                1,
+                1,
+                1,
+            );
+            let report = ledger::query(&query(GroupBy::Host)).unwrap().unwrap();
+            assert_eq!(report.requests, 1);
+            ledger::uninstall();
+            let _ = fs::remove_dir_all(&dir);
+        }
     }
 }

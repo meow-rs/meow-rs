@@ -603,6 +603,14 @@ const RAW_SOCKET_ALLOWLIST: &[(&str, &str, usize, &str)] = &[
         "inbound SOCKS5 UDP relay socket facing the client",
     ),
     (
+        "crates/meow-tunnel/src/app_lookup.rs",
+        "UdpSocket::bind(",
+        1,
+        "local-address probe for the traffic ledger's app lookup (macOS, \
+         Windows): bound to a flow's source address and dropped unused, never \
+         sends",
+    ),
+    (
         "crates/meow-listener/src/tproxy/udp.rs",
         "libc::socket(",
         1,

@@ -12,13 +12,17 @@ the canonical, in-repo source a release is cut from.
 
 - **Traffic ledger** ([ADR-0015](docs/adr/0015-traffic-ledger.md)): meow
   now keeps, for every local day, the bytes and connections per host
-  (registrable domain), leaf policy and interface label, for 62 days in
-  `<home>/traffic/traffic.db`, so a client can show today, this month and
-  last month grouped any of the three ways. `GET /traffic/ledger` serves
-  it (`from`, `to`, `by`, and `host` / `policy` / `interface` to drill
-  down); `DELETE /traffic/ledger` empties it. On by default:
-  `traffic-ledger: {enable: false}` turns it off and `hosts: false`
-  keeps only policies and interfaces. In `full` builds, not `minimal`.
+  (registrable domain), app, leaf policy and interface label, for 62 days
+  in `<home>/traffic/traffic.db`, so a client can show today, this month
+  and last month grouped any of the four ways. The app is the package
+  name on Android and, on Linux, macOS and Windows, the owner of a flow
+  from this host (a loopback client, or the host's own traffic through
+  TUN or a transparent listener), looked up off the connection's path.
+  `GET /traffic/ledger` serves it (`from`, `to`, `by`, and `host` /
+  `app` / `policy` / `interface` to drill down); `DELETE /traffic/ledger`
+  empties it. On by default: `traffic-ledger: {enable: false}` turns it
+  off, and `hosts: false` / `apps: false` keep no hosts / apps (no
+  lookups). In `full` builds, not `minimal`.
 - **`dns.direct-nameserver`**: `DIRECT` outbounds now resolve their
   destination through `direct-nameserver` when it is set, as mihomo does,
   instead of always using the main `nameserver` list. With
@@ -51,6 +55,10 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **PROCESS-NAME, PROCESS-PATH and UID rules match IPv4 clients of a
+  dual-stack listener** (`bind-address: "::"`): the process lookup ran on
+  the client's IPv4-mapped address, which Linux, macOS and Windows do not
+  file an IPv4 socket under, so those rules never matched them.
 - **`anytls` no longer silently ignores `ech-opts`** (#870): an enabled
   `ech-opts` or a `certificate`/`private-key` client certificate is now a
   config-load error, as for hysteria2, instead of connecting with the SNI in

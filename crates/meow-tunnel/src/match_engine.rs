@@ -242,7 +242,9 @@ pub async fn maybe_enrich_with_process_async(metadata: &Metadata) -> Option<Meta
     if !metadata.process.is_empty() {
         return None;
     }
-    let src_ip = metadata.src_ip?;
+    // An IPv4 client of a dual-stack listener is found under its IPv4
+    // address.
+    let src_ip = metadata.src_ip?.to_canonical();
     if metadata.src_port == 0 {
         return None;
     }
@@ -259,7 +261,9 @@ pub fn maybe_enrich_with_process(metadata: &Metadata) -> Option<Metadata> {
     if !metadata.process.is_empty() {
         return None;
     }
-    let src_ip = metadata.src_ip?;
+    // An IPv4 client of a dual-stack listener is found under its IPv4
+    // address.
+    let src_ip = metadata.src_ip?.to_canonical();
     if metadata.src_port == 0 {
         return None;
     }
@@ -343,6 +347,24 @@ mod tests {
             .expect("engine must return a match");
         assert_eq!(result.adapter_name, "Proxy");
         assert_eq!(result.rule_type.as_str(), "PROCESS-NAME");
+    }
+
+    #[test]
+    fn an_ipv4_client_of_a_dual_stack_listener_is_found() {
+        // A listener bound to `[::]` sees an IPv4 client as
+        // `::ffff:127.0.0.1`; the client's socket is an IPv4 one.
+        meow_common::disable_socket_table_cache();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let local = listener.local_addr().unwrap();
+        let std::net::IpAddr::V4(ip) = local.ip() else {
+            unreachable!("bound to an IPv4 address")
+        };
+        let mapped = SocketAddr::new(ip.to_ipv6_mapped().into(), local.port());
+        let enriched = maybe_enrich_with_process(&base_metadata(mapped));
+        assert_eq!(
+            enriched.map(|meta| meta.process.to_string()),
+            Some(current_process_name())
+        );
     }
 
     #[tokio::test]
