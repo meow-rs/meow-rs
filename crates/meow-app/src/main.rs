@@ -123,6 +123,18 @@ enum Command {
         #[arg(short = 'f', long = "config")]
         config: Option<String>,
     },
+    /// Convert a rule-set file, as mihomo's `convert-ruleset`: an upstream
+    /// `.mrs` (`domain` or `ipcidr`) to text, one entry per line. OpenWrt
+    /// front ends (clashwrt) read `.mrs` providers through it.
+    ConvertRuleset {
+        /// `domain` or `ipcidr`
+        behavior: String,
+        /// Source format; only `mrs` is read
+        format: String,
+        source: std::path::PathBuf,
+        /// Output file (default: the source path with `.txt`)
+        target: Option<std::path::PathBuf>,
+    },
     /// Uninstall the system service
     Uninstall,
     /// Show service status
@@ -763,11 +775,72 @@ fn handle_service_command(cmd: &Command, args: &Args) -> Result<()> {
             }
             install_service(config.as_deref(), args)
         }
+        Command::ConvertRuleset {
+            behavior,
+            format,
+            source,
+            target,
+        } => convert_ruleset(behavior, format, source, target.as_deref()),
         Command::Uninstall => uninstall_service(),
         Command::Status => service_status(),
         #[cfg(target_os = "windows")]
         Command::RunService => windows_service::dispatch(),
     }
+}
+
+/// `meow convert-ruleset <behavior> mrs <source> [<target>]`.
+fn convert_ruleset(
+    behavior: &str,
+    format: &str,
+    source: &std::path::Path,
+    target: Option<&std::path::Path>,
+) -> Result<()> {
+    use meow_rules::mrs_parser::UpstreamRuleSetReader;
+    use std::io::Write;
+
+    if !format.eq_ignore_ascii_case("mrs") {
+        anyhow::bail!("convert-ruleset: only the mrs format is read (got `{format}`)");
+    }
+    let want = match behavior.to_ascii_lowercase().as_str() {
+        "domain" => 0,
+        "ipcidr" => 1,
+        other => {
+            anyhow::bail!("convert-ruleset: behavior must be domain or ipcidr (got `{other}`)")
+        }
+    };
+    let bytes = std::fs::read(source)?;
+    let reader = UpstreamRuleSetReader::open(&bytes)
+        .map_err(|e| anyhow::anyhow!("convert-ruleset: {}: {e}", source.display()))?;
+    if reader.behavior() != want {
+        anyhow::bail!(
+            "convert-ruleset: {} is not a {behavior} rule-set",
+            source.display()
+        );
+    }
+    let target = target.map_or_else(
+        || source.with_extension("txt"),
+        std::path::Path::to_path_buf,
+    );
+    let mut out = std::io::BufWriter::new(std::fs::File::create(&target)?);
+    let mut io_err = None;
+    let mut line = |s: &dyn std::fmt::Display| {
+        if io_err.is_none() {
+            if let Err(e) = writeln!(out, "{s}") {
+                io_err = Some(e);
+            }
+        }
+    };
+    let walked = if want == 0 {
+        reader.for_each_domain(|d| line(&d))
+    } else {
+        reader.for_each_net(|n| line(&n))
+    };
+    walked.map_err(|e| anyhow::anyhow!("convert-ruleset: {}: {e}", source.display()))?;
+    if let Some(e) = io_err {
+        return Err(e.into());
+    }
+    out.flush()?;
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
