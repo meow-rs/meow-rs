@@ -65,6 +65,7 @@
 //! creating the device requires root (CAP_NET_ADMIN).
 
 mod device;
+mod direct_udp;
 mod dns;
 #[cfg(target_os = "windows")]
 mod local_dns;
@@ -882,8 +883,30 @@ impl TunListener {
                 }
             });
         }
-        let (mut pump_in, mut pump_out) =
-            device::spawn_pumps(device, stack, system.as_ref().map(|s| Arc::clone(&s.nat)));
+        // System stack: UDP skips lwIP too — the pumps parse and build it.
+        let (udp_io, direct_udp) = if system.is_some() {
+            drop(udp_socket);
+            let (in_tx, in_rx) = tokio::sync::mpsc::channel(udp::DIRECT_QUEUE);
+            let (reply_tx, reply_rx) = tokio::sync::mpsc::channel(udp::DIRECT_REPLY_QUEUE);
+            (
+                udp::UdpIo::Direct {
+                    incoming: in_rx,
+                    replies: reply_tx,
+                },
+                Some(device::DirectUdp {
+                    incoming: in_tx,
+                    replies: reply_rx,
+                }),
+            )
+        } else {
+            (udp::UdpIo::Lwip(udp_socket), None)
+        };
+        let (mut pump_in, mut pump_out) = device::spawn_pumps(
+            device,
+            stack,
+            system.as_ref().map(|s| Arc::clone(&s.nat)),
+            direct_udp,
+        );
         tasks.push(&pump_in);
         tasks.push(&pump_out);
         // Live UDP flow-table occupancy, readable via `TunReady::Ready` →
@@ -891,7 +914,7 @@ impl TunListener {
         let udp_flows = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         tasks.spawn(udp::run_udp(
             self.tunnel.clone(),
-            udp_socket,
+            udp_io,
             cfg.dns_hijack,
             cfg.udp_timeout,
             self.name.clone(),

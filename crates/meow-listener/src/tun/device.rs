@@ -13,7 +13,11 @@ use futures::{SinkExt, StreamExt};
 use lwip::NetStack;
 use tokio::task::JoinHandle;
 
+use tokio::sync::mpsc;
+
+use super::direct_udp;
 use super::system::{Nat, Verdict};
+use super::udp::{ReplyMsg, UdpPkt};
 use super::vnet;
 use super::TunDevice;
 
@@ -40,21 +44,32 @@ struct PumpEnd<D, H> {
     half: H,
 }
 
+/// UDP carried between the pumps and the flow table without lwIP
+/// (`tun.stack: system`).
+pub(super) struct DirectUdp {
+    pub(super) incoming: mpsc::Sender<UdpPkt>,
+    pub(super) replies: mpsc::Receiver<ReplyMsg>,
+}
+
 /// `nat` (`tun.stack: system`) translates TCP in place and writes it back
-/// to the device; everything it passes on goes to lwIP as before.
+/// to the device; with `udp` UDP goes straight to the flow table and its
+/// replies straight to the device. Everything else goes to lwIP as before.
 pub(super) fn spawn_pumps(
     device: Arc<TunDevice>,
     stack: NetStack,
     nat: Option<Arc<Nat>>,
+    udp: Option<DirectUdp>,
 ) -> (JoinHandle<io::Result<()>>, JoinHandle<io::Result<()>>) {
     let vnet = vnet_framing(&device);
     let (stack_sink, stack_stream) = stack.split();
+    let (udp_in, udp_replies) = udp.map_or((None, None), |u| (Some(u.incoming), Some(u.replies)));
     let inbound = tokio::spawn(device_to_stack(
         PumpEnd {
             device: Arc::clone(&device),
             half: stack_sink,
         },
         nat,
+        udp_in,
         vnet,
     ));
     let outbound = tokio::spawn(stack_to_device(
@@ -62,6 +77,7 @@ pub(super) fn spawn_pumps(
             device,
             half: stack_stream,
         },
+        udp_replies,
         vnet,
     ));
     (inbound, outbound)
@@ -97,6 +113,7 @@ fn vnet_framing(device: &TunDevice) -> bool {
 async fn device_to_stack(
     mut end: PumpEnd<Arc<TunDevice>, SplitSink<NetStack, Vec<u8>>>,
     nat: Option<Arc<Nat>>,
+    udp: Option<mpsc::Sender<UdpPkt>>,
     vnet: bool,
 ) -> io::Result<()> {
     let hdr_len = if vnet { vnet::HDR_LEN } else { 0 };
@@ -121,6 +138,18 @@ async fn device_to_stack(
                 Verdict::Stack => {}
             }
         }
+        if let Some(udp) = &udp {
+            if direct_udp::is_udp(&buf[hdr_len..n]) {
+                if !vnet || vnet::is_single(&buf[..hdr_len]) {
+                    deliver_udp(udp, &buf[hdr_len..n]);
+                } else {
+                    for pkt in vnet::to_plain(&mut buf[..n]) {
+                        deliver_udp(udp, &pkt);
+                    }
+                }
+                continue;
+            }
+        }
         if vnet {
             for pkt in vnet::to_plain(&mut buf[..n]) {
                 end.half
@@ -137,23 +166,59 @@ async fn device_to_stack(
     }
 }
 
+/// Hand one plain UDP packet to the flow table; a full queue drops it, as
+/// a socket buffer would.
+fn deliver_udp(udp: &mpsc::Sender<UdpPkt>, pkt: &[u8]) {
+    if let direct_udp::Parsed::Udp(d) = direct_udp::parse(pkt) {
+        let _ = udp.try_send(d);
+    }
+}
+
 /// stack → device. Borrows `end` for the same reason as [`device_to_stack`].
-/// With `vnet` each packet goes out behind an all-zero virtio-net header
-/// (no GSO, checksum complete).
+/// With `vnet` each packet goes out behind a virtio-net header (no GSO;
+/// lwIP's checksums complete, direct UDP's left to the kernel). `udp`
+/// carries the flow table's replies (system stack), built into packets
+/// here.
 async fn stack_to_device(
     mut end: PumpEnd<Arc<TunDevice>, SplitStream<NetStack>>,
+    mut udp: Option<mpsc::Receiver<ReplyMsg>>,
     vnet: bool,
 ) -> io::Result<()> {
     let mut framed = Vec::new();
-    while let Some(pkt) = end.half.next().await {
-        let pkt = pkt?;
-        if vnet {
-            framed.clear();
-            framed.resize(vnet::HDR_LEN, 0);
-            framed.extend_from_slice(&pkt);
-            end.device.device.send(&framed).await?;
-        } else {
-            end.device.device.send(&pkt).await?;
+    let mut ip_id = 0u16;
+    loop {
+        let reply = async {
+            match udp.as_mut() {
+                Some(rx) => rx.recv().await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            pkt = end.half.next() => {
+                let Some(pkt) = pkt else { break };
+                let pkt = pkt?;
+                if vnet {
+                    framed.clear();
+                    framed.resize(vnet::HDR_LEN, 0);
+                    framed.extend_from_slice(&pkt);
+                    end.device.device.send(&framed).await?;
+                } else {
+                    end.device.device.send(&pkt).await?;
+                }
+            }
+            reply = reply => {
+                // `(payload, src, dst)`: appear as `src`, deliver to `dst`.
+                let Some((data, src, dst)) = reply else {
+                    udp = None;
+                    continue;
+                };
+                if direct_udp::build(&mut framed, vnet, &data, src, dst, &mut ip_id) {
+                    // A full device queue drops the datagram (UDP semantics).
+                    if let Err(e) = end.device.device.send(&framed).await {
+                        tracing::debug!("tun UDP: device write failed: {e}");
+                    }
+                }
+            }
         }
     }
     Err(io::Error::other("netstack egress closed"))

@@ -10,6 +10,25 @@ pub(super) const HDR_LEN: usize = 10;
 /// pseudo-header sum; the rest is summed from `csum_start` on.
 const F_NEEDS_CSUM: u8 = 1;
 
+/// Whether a framed read is one packet (no GSO aggregate).
+pub(super) fn is_single(hdr: &[u8]) -> bool {
+    hdr.get(1) == Some(&0)
+}
+
+/// Fill `hdr` for a single UDP packet whose checksum field holds the
+/// pseudo-header sum: the kernel finishes it from `ip_len` on. The fields
+/// are native-endian (legacy virtio, no `TUNSETVNETLE`).
+pub(super) fn encode_partial_udp(hdr: &mut [u8], ip_len: usize) {
+    hdr.fill(0);
+    hdr[0] = F_NEEDS_CSUM;
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "an IP header is 20 or 40 bytes"
+    )]
+    hdr[6..8].copy_from_slice(&(ip_len as u16).to_ne_bytes());
+    hdr[8..10].copy_from_slice(&6u16.to_ne_bytes());
+}
+
 /// Whether a framed read's transport checksum is partial.
 pub(super) fn needs_csum(hdr: &[u8]) -> bool {
     hdr.first().is_some_and(|f| f & F_NEEDS_CSUM != 0)
