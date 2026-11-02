@@ -72,6 +72,7 @@ mod outbound_binding;
 #[cfg(target_os = "linux")]
 mod policy_route;
 mod route;
+mod system;
 mod udp;
 #[cfg(target_os = "windows")]
 mod windows_device;
@@ -228,6 +229,21 @@ pub struct TunListenerConfig {
     /// Cap on concurrent TUN TCP handler tasks. Inherited from the
     /// top-level `max-connections` key (default 256; `0` = unlimited).
     pub max_connections: usize,
+    /// Which stack terminates TCP (see [`TunStack`]).
+    pub stack: TunStack,
+}
+
+/// Which stack terminates the device's TCP flows (`tun.stack`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TunStack {
+    /// The userspace lwIP stack, for every protocol.
+    #[default]
+    Lwip,
+    /// TCP goes to the host kernel's stack through an address rewrite in
+    /// the packet pump (`system.rs`), as mihomo's system stack does; UDP
+    /// and ICMP stay on lwIP. Linux only — elsewhere it falls back to
+    /// [`TunStack::Lwip`].
+    System,
 }
 
 /// Which routes `auto_route` installs (#375; see the module docs).
@@ -827,7 +843,37 @@ impl TunListener {
         if let Some(binding) = &device.iface_guard {
             binding.commit();
         }
-        let (mut pump_in, mut pump_out) = device::spawn_pumps(device, stack);
+        // `tun.stack: system`: TCP to the kernel through the pump's NAT.
+        // Built before the pumps so the first SYN is already translated.
+        let system = if cfg.stack == TunStack::System {
+            if cfg!(target_os = "linux") {
+                match system::SystemStack::bind(tun_net, used_addr, used_addr6).await {
+                    Ok(sys) => Some(sys),
+                    Err(e) => {
+                        warn!("tun.stack system unavailable ({e}); TCP stays on lwIP");
+                        None
+                    }
+                }
+            } else {
+                warn!("tun.stack system is implemented on Linux only; TCP stays on lwIP");
+                None
+            }
+        } else {
+            None
+        };
+        let stack_name = if system.is_some() { "system" } else { "lwip" };
+        if let Some(sys) = &system {
+            let nat = Arc::clone(&sys.nat);
+            tasks.spawn(async move {
+                let mut tick = tokio::time::interval(system::SWEEP_EVERY);
+                loop {
+                    tick.tick().await;
+                    nat.sweep();
+                }
+            });
+        }
+        let (mut pump_in, mut pump_out) =
+            device::spawn_pumps(device, stack, system.as_ref().map(|s| Arc::clone(&s.nat)));
         tasks.push(&pump_in);
         tasks.push(&pump_out);
         // Live UDP flow-table occupancy, readable via `TunReady::Ready` →
@@ -847,7 +893,7 @@ impl TunListener {
         let max_conn = cfg.max_connections;
         info!(
             "TUN listener '{}' started on device '{dev_name}' ({}/{}{}, mtu {}, auto-route: {}, \
-             dns-hijack: {}, max-connections: {}, stack: lwip, total startup {total_ms:.0}ms)",
+             dns-hijack: {}, max-connections: {}, stack: {stack_name}, total startup {total_ms:.0}ms)",
             self.name,
             used_addr,
             prefix,
@@ -930,32 +976,56 @@ impl TunListener {
                             // slot for its lifetime, exactly as on the other
                             // inbounds. Flows queued here at saturation are
                             // bounded by lwIP's MEMP_NUM_TCP_PCB.
-                            let permit = if let Some(sem) = sem {
-                                if sem.available_permits() == 0
-                                    && !warned.swap(true, Ordering::Relaxed)
-                                {
-                                    warn!(
-                                        "TUN listener '{name}' saturated at max-connections; \
-                                         new flows will wait for a free slot before dialing"
-                                    );
-                                }
-                                match Arc::clone(&sem).acquire_owned().await {
-                                    Ok(p) => {
-                                        if sem.available_permits() > 0 {
-                                            warned.store(false, Ordering::Relaxed);
-                                        }
-                                        Some(p)
-                                    }
-                                    Err(_) => return,
-                                }
-                            } else {
-                                None
+                            let Ok(_permit) = flow_slot(sem, &warned, &name).await else {
+                                return;
                             };
-                            let _permit = permit;
                             handle_tcp_flow(tunnel, stream, prefix, src, dst, &name).await;
                         });
                     }
                     None => break Err("netstack TCP listener closed".into()),
+                },
+                accepted = accept_system(system.as_ref()) => match accepted {
+                    Ok((stream, src, dst, guard)) => {
+                        let tunnel = self.tunnel.clone();
+                        let name = self.name.clone();
+                        let sem = conn_limit.clone();
+                        let warned = Arc::clone(&warned_saturated);
+                        tasks.spawn(async move {
+                            let _guard = guard;
+                            // The same post-handshake window as the lwIP
+                            // path, peeked so the bytes stay queued: a
+                            // close or reset before any payload drops the
+                            // flow, silence dials it (server-first, #695).
+                            let mut probe = [0u8; 1];
+                            match timeout(TUN_SNIFF_WINDOW, stream.peek(&mut probe)).await {
+                                Ok(Ok(0)) => {
+                                    debug!("tun TCP: dropping {src} -> {dst}: closed before payload");
+                                    return;
+                                }
+                                Ok(Err(e)) => {
+                                    debug!("tun TCP: dropping {src} -> {dst} before payload: {e}");
+                                    return;
+                                }
+                                Ok(Ok(_)) | Err(_) => {}
+                            }
+                            let Ok(_permit) = flow_slot(sem, &warned, &name).await else {
+                                return;
+                            };
+                            let metadata = Metadata {
+                                network: Network::Tcp,
+                                conn_type: ConnType::Tun,
+                                src_ip: Some(src.ip()),
+                                src_port: src.port(),
+                                dst_ip: Some(dst.ip()),
+                                dst_port: dst.port(),
+                                in_name: name.as_str().into(),
+                                ..Default::default()
+                            };
+                            meow_tunnel::tcp::handle_tcp_socket(tunnel.inner(), stream, metadata)
+                                .await;
+                        });
+                    }
+                    Err(e) => break Err(format!("system stack TCP listener failed: {e}").into()),
                 },
                 joined = &mut pump_in => {
                     break Err(pump_error("device→stack", joined).into());
@@ -990,6 +1060,46 @@ impl TunListener {
         drop(tcp_listener);
         result
     }
+}
+
+/// The next kernel-terminated TCP flow, or never when the system stack is
+/// off (a `select!` arm that stays pending).
+async fn accept_system(
+    system: Option<&system::SystemStack>,
+) -> io::Result<(
+    tokio::net::TcpStream,
+    SocketAddr,
+    SocketAddr,
+    system::FlowGuard,
+)> {
+    match system {
+        Some(sys) => sys.accept().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// A `max-connections` slot for a flow leaving its sniff window (`Ok(None)`
+/// when unlimited; `Err` when the limit is gone with the listener). Warns
+/// once per saturation episode.
+async fn flow_slot(
+    sem: Option<Arc<Semaphore>>,
+    warned: &AtomicBool,
+    name: &str,
+) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, ()> {
+    let Some(sem) = sem else {
+        return Ok(None);
+    };
+    if sem.available_permits() == 0 && !warned.swap(true, Ordering::Relaxed) {
+        warn!(
+            "TUN listener '{name}' saturated at max-connections; \
+             new flows will wait for a free slot before dialing"
+        );
+    }
+    let permit = Arc::clone(&sem).acquire_owned().await.map_err(|_| ())?;
+    if sem.available_permits() > 0 {
+        warned.store(false, Ordering::Relaxed);
+    }
+    Ok(Some(permit))
 }
 
 /// The split default routes of global route scope (#375): more specific

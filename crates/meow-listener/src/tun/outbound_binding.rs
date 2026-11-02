@@ -170,6 +170,7 @@ mod tests {
                 dns_hijack: false,
                 udp_timeout: std::time::Duration::from_secs(60),
                 max_connections: 0,
+                stack: super::super::TunStack::Lwip,
             },
             "meow-tun-test".into(),
         )
