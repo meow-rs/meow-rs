@@ -81,7 +81,7 @@ pub use rule::{Rule, RuleMatchHelper, RuleType, TargetCheck, TargetProbe};
 pub use sniffer::SnifferConfig;
 pub use socket_protect::{
     bind_udp, bind_udp_for_peer, canonical_socket_addr, connect_tcp, connect_tcp_host,
-    resolve_host, resolve_host_all,
+    resolve_host, resolve_host_all, set_routing_mark,
 };
 pub use tcp_opts::TcpKeepaliveConfig;
 // Host-resolver hook is cross-platform (iOS installs it without a protector).

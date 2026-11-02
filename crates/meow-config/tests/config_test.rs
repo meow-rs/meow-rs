@@ -2266,13 +2266,14 @@ tproxy-sni: true
         tproxy.spec,
         ListenerSpec::TProxy {
             sni: true,
-            firewall: true,
-            udp: false,
+            firewall: false,
+            udp: true,
             udp_timeout: 60,
+            transparent: true,
         },
         "shorthand tproxy-port should inherit the global tproxy-sni default"
     );
-    // TProxy always hard-binds 127.0.0.1
+    // mihomo binds the shorthand like the others: loopback without allow-lan.
     assert_eq!(tproxy.listen, "127.0.0.1");
 }
 
@@ -2293,9 +2294,10 @@ tproxy-sni: false
         tproxy.spec,
         ListenerSpec::TProxy {
             sni: false,
-            firewall: true,
-            udp: false,
+            firewall: false,
+            udp: true,
             udp_timeout: 60,
+            transparent: true,
         },
         "shorthand tproxy-port with global tproxy-sni: false"
     );
@@ -2325,6 +2327,7 @@ listeners:
             firewall: true,
             udp: false,
             udp_timeout: 60,
+            transparent: false,
         },
         "per-listener tproxy-sni: true must override the global false default"
     );
@@ -2358,6 +2361,7 @@ listeners:
             firewall: true,
             udp: false,
             udp_timeout: 60,
+            transparent: false,
         },
         "omitted firewall must default to managed"
     );
@@ -2390,16 +2394,17 @@ listeners:
                 firewall: expected,
                 udp: false,
                 udp_timeout: 60,
+                transparent: false,
             },
             "firewall: {value} must round-trip"
         );
     }
 }
 
-/// `tproxy-port` shorthand cannot opt out — external management is an
-/// explicit `listeners:`-only feature.
+/// `tproxy-port` is mihomo's — a real TPROXY inbound (TCP +
+/// IPv4 UDP) for the deployer's rules, never managed.
 #[tokio::test]
-async fn test_tproxy_shorthand_keeps_managed_firewall() {
+async fn test_tproxy_shorthand_is_mihomo_tproxy() {
     let yaml = "tproxy-port: 7893\n";
     let config = load_config_from_str(yaml).await.unwrap();
     let tproxy = config
@@ -2412,11 +2417,12 @@ async fn test_tproxy_shorthand_keeps_managed_firewall() {
         tproxy.spec,
         ListenerSpec::TProxy {
             sni: true,
-            firewall: true,
-            udp: false,
+            firewall: false,
+            udp: true,
             udp_timeout: 60,
+            transparent: true,
         },
-        "shorthand tproxy-port must keep the managed-firewall default"
+        "shorthand tproxy-port is mihomo's TPROXY inbound"
     );
 }
 
@@ -2432,6 +2438,7 @@ fn test_tproxy_spec_deserialization_defaults_firewall_true() {
             firewall: true,
             udp: false,
             udp_timeout: 60,
+            transparent: false,
         },
         "legacy spec without `firewall` must default to managed"
     );
@@ -2453,6 +2460,7 @@ fn test_tproxy_spec_deserialization_round_trips_udp() {
             firewall: false,
             udp: true,
             udp_timeout: 30,
+            transparent: false,
         },
         "spec with `udp`/`udp_timeout` must deserialize"
     );
@@ -2565,7 +2573,7 @@ tproxy-port: 7893
         "expected a top-level `firewall:` warning, got: {logs}"
     );
 
-    // The shorthand listener stays managed (firewall: true).
+    // The shorthand is never managed (mihomo semantics).
     let tproxy = config
         .listeners
         .named
@@ -2574,10 +2582,7 @@ tproxy-port: 7893
         .expect("tproxy shorthand listener must exist");
     match &tproxy.spec {
         ListenerSpec::TProxy { firewall, .. } => {
-            assert!(
-                *firewall,
-                "top-level `firewall:` must not reach the shorthand"
-            );
+            assert!(!*firewall, "the tproxy-port shorthand installs no rules");
         }
         other => panic!("expected a tproxy listener, got {other:?}"),
     }
@@ -2680,6 +2685,7 @@ listeners:
             firewall: false,
             udp: true,
             udp_timeout: 60,
+            transparent: false,
         },
         "udp: true + firewall: false must produce the UDP-enabled spec with the default timeout"
     );
@@ -2971,6 +2977,7 @@ listeners:
             firewall: true,
             udp: false,
             udp_timeout: 60,
+            transparent: false,
         },
         "named tproxy without per-listener tproxy-sni should fall back to global true"
     );
@@ -3051,6 +3058,7 @@ async fn test_listener_type_name() {
             firewall: true,
             udp: false,
             udp_timeout: 60,
+            transparent: false,
         }
         .type_name(),
         "tproxy"
@@ -3061,6 +3069,7 @@ async fn test_listener_type_name() {
             firewall: true,
             udp: false,
             udp_timeout: 60,
+            transparent: false,
         }
         .type_name(),
         "tproxy"
@@ -3454,4 +3463,30 @@ mixed-port: 7890
     assert_eq!(ka.idle, std::time::Duration::from_secs(300));
     assert_eq!(ka.interval, std::time::Duration::from_secs(30));
     assert_eq!(ka.probes, 5);
+}
+
+/// `redir-port` is mihomo's REDIRECT inbound — meow's tproxy
+/// TCP path, no managed rules, bound per allow-lan / bind-address.
+#[tokio::test]
+async fn test_redir_port_is_mihomo_redirect() {
+    let yaml = "redir-port: 7892\nallow-lan: true\nbind-address: '*'\n";
+    let config = load_config_from_str(yaml).await.unwrap();
+    let redir = config
+        .listeners
+        .named
+        .iter()
+        .find(|nl| nl.name == "redir")
+        .expect("redir shorthand listener must exist");
+    assert_eq!(
+        redir.spec,
+        ListenerSpec::TProxy {
+            sni: true,
+            firewall: false,
+            udp: false,
+            udp_timeout: 60,
+            transparent: false,
+        }
+    );
+    assert_eq!(redir.listen, "0.0.0.0");
+    assert_eq!(redir.port, 7892);
 }

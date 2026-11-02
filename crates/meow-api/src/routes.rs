@@ -859,6 +859,8 @@ struct ConfigResponse {
     sniffing: bool,
     #[serde(rename = "skip-auth-prefixes")]
     skip_auth_prefixes: Vec<String>,
+    #[serde(rename = "routing-mark")]
+    routing_mark: u32,
     /// Whether the TUN listener is currently running (issue #326).
     /// Mirrors `tun.enable` from the raw config and reflects actual
     /// runtime state so nyanpasu can correctly render its toggle.
@@ -879,7 +881,7 @@ async fn get_configs(State(state): State<Arc<AppState>>) -> Json<ConfigResponse>
         mixed_port: raw.mixed_port.unwrap_or(0),
         socks_port: raw.socks_port.unwrap_or(0),
         http_port: raw.port.unwrap_or(0),
-        redir_port: 0,
+        redir_port: raw.redir_port.unwrap_or(0),
         tproxy_port: raw.tproxy_port.unwrap_or(0),
         external_controller: raw.external_controller.clone(),
         allow_lan: raw.allow_lan.unwrap_or(false),
@@ -902,6 +904,7 @@ async fn get_configs(State(state): State<Arc<AppState>>) -> Json<ConfigResponse>
             .and_then(|s| s.enable)
             .unwrap_or_else(|| raw.tproxy_sni.unwrap_or(false)),
         skip_auth_prefixes: raw.skip_auth_prefixes.clone().unwrap_or_default(),
+        routing_mark: raw.routing_mark.unwrap_or(0),
         tun_enable: tun_running,
         tun: TunFields::reported(raw.tun.as_ref(), tun_running),
     })
