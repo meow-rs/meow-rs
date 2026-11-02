@@ -187,6 +187,47 @@ async fn require_auth_ws(
     }
 }
 
+/// mihomo decodes request bodies as JSON whatever their `Content-Type`
+/// (`render.DecodeJSON`), and dashboards rely on it: some send a selection
+/// PUT as `text/plain` or with no type at all. axum's `Json` extractor
+/// answers anything but a JSON media type with 415, so every body that is
+/// not typed JSON (absent, empty, unreadable or any other media type) is
+/// relabelled `application/json` before it reaches a handler. No handler
+/// reads the request type, so this only turns 415s into what mihomo does.
+async fn assume_json_body(mut req: Request) -> Request {
+    let relabel = match req.headers().get(header::CONTENT_TYPE) {
+        None => !matches!(
+            *req.method(),
+            axum::http::Method::GET | axum::http::Method::HEAD
+        ),
+        Some(v) => !v.to_str().is_ok_and(is_json_media_type),
+    };
+    if relabel {
+        req.headers_mut().insert(
+            header::CONTENT_TYPE,
+            header::HeaderValue::from_static("application/json"),
+        );
+    }
+    req
+}
+
+/// `application/json` or a `+json` suffix type, parameters ignored, as
+/// axum's `Json` accepts them.
+fn is_json_media_type(t: &str) -> bool {
+    let media = t.split(';').next().unwrap_or("").trim();
+    let Some((ty, sub)) = media.split_once('/') else {
+        return false;
+    };
+    ty.eq_ignore_ascii_case("application")
+        && (sub.eq_ignore_ascii_case("json")
+            || sub
+                .len()
+                .checked_sub(5)
+                .filter(|&n| n > 0)
+                .and_then(|n| sub.get(n..))
+                .is_some_and(|tail| tail.eq_ignore_ascii_case("+json")))
+}
+
 pub fn create_router(state: Arc<AppState>) -> Router {
     // WS routes — accept header or ?token= query param for browser dashboard compat.
     // REST API routes gated behind the Bearer middleware (header-only).
@@ -311,7 +352,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             .route("/ui/{*rest}", get(ui::serve_ui))
     };
 
-    router.layer(CorsLayer::permissive()).with_state(state)
+    router
+        .layer(middleware::map_request(assume_json_body))
+        .layer(CorsLayer::permissive())
+        .with_state(state)
 }
 
 // ── Basic endpoints ──────────────────────────────────────────────────
