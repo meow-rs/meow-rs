@@ -13,6 +13,7 @@ use futures::{SinkExt, StreamExt};
 use lwip::NetStack;
 use tokio::task::JoinHandle;
 
+use super::system::{Nat, Verdict};
 use super::TunDevice;
 
 /// One IP packet. UDP/TCP over IPv4/v6 tops out below 64 KiB regardless of
@@ -38,15 +39,21 @@ struct PumpEnd<D, H> {
     half: H,
 }
 
+/// `nat` (`tun.stack: system`) translates TCP in place and writes it back
+/// to the device; everything it passes on goes to lwIP as before.
 pub(super) fn spawn_pumps(
     device: Arc<TunDevice>,
     stack: NetStack,
+    nat: Option<Arc<Nat>>,
 ) -> (JoinHandle<io::Result<()>>, JoinHandle<io::Result<()>>) {
     let (stack_sink, stack_stream) = stack.split();
-    let inbound = tokio::spawn(device_to_stack(PumpEnd {
-        device: Arc::clone(&device),
-        half: stack_sink,
-    }));
+    let inbound = tokio::spawn(device_to_stack(
+        PumpEnd {
+            device: Arc::clone(&device),
+            half: stack_sink,
+        },
+        nat,
+    ));
     let outbound = tokio::spawn(stack_to_device(PumpEnd {
         device,
         half: stack_stream,
@@ -63,12 +70,27 @@ pub(super) fn spawn_pumps(
 /// [`PumpEnd`]'s ordering.
 async fn device_to_stack(
     mut end: PumpEnd<Arc<TunDevice>, SplitSink<NetStack, Vec<u8>>>,
+    nat: Option<Arc<Nat>>,
 ) -> io::Result<()> {
     let mut buf = vec![0u8; PACKET_BUF];
     loop {
         let n = end.device.device.recv(&mut buf).await?;
         if n == 0 {
             continue;
+        }
+        if let Some(nat) = &nat {
+            match nat.translate(&mut buf[..n]) {
+                Verdict::Write => {
+                    // A full device queue drops the packet, as a NIC would;
+                    // TCP retransmits it.
+                    if let Err(e) = end.device.device.send(&buf[..n]).await {
+                        tracing::debug!("tun system stack: device write failed: {e}");
+                    }
+                    continue;
+                }
+                Verdict::Drop => continue,
+                Verdict::Stack => {}
+            }
         }
         end.half
             .send(buf[..n].to_vec())
