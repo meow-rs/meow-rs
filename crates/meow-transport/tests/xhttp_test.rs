@@ -348,3 +348,68 @@ async fn xhttp_receive_window_absorbs_1mib_before_first_read() {
         .expect("read_to_end 1 MiB");
     assert_eq!(recv_buf, payload, "pushed bytes must arrive intact");
 }
+
+/// stream-one tunnels share one h2 connection, as Xray's
+/// xmux does: later tunnels open a new request stream with no dial and no
+/// TLS/REALITY handshake. The server sees one TCP connection for all.
+#[tokio::test]
+async fn xhttp_reuse_multiplexes_streams_on_one_connection() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let accepted_srv = Arc::clone(&accepted);
+    tokio::spawn(async move {
+        while let Ok((tcp, _)) = listener.accept().await {
+            accepted_srv.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let Ok(mut conn) = h2::server::handshake(tcp).await else {
+                    return;
+                };
+                while let Some(Ok((request, mut respond))) = conn.accept().await {
+                    tokio::spawn(async move {
+                        let mut body = request.into_body();
+                        let response = http::Response::builder().status(200).body(()).unwrap();
+                        let mut send = respond.send_response(response, false).unwrap();
+                        while let Some(Ok(chunk)) = body.data().await {
+                            let _ = body.flow_control().release_capacity(chunk.len());
+                            if send.send_data(chunk, false).is_err() {
+                                return;
+                            }
+                        }
+                        let _ = send.send_data(bytes::Bytes::new(), true);
+                    });
+                }
+            });
+        }
+    });
+
+    let layer = XhttpLayer::new(XhttpConfig {
+        scheme: "http".into(),
+        ..XhttpConfig::default()
+    });
+    assert!(
+        layer.reuse().await.is_none(),
+        "nothing to reuse before connect"
+    );
+    let tcp = tokio::net::TcpStream::connect(addr).await.expect("tcp");
+    let mut streams = vec![layer.connect(Box::new(tcp)).await.expect("connect")];
+    for _ in 0..3 {
+        streams.push(layer.reuse().await.expect("reuse the live connection"));
+    }
+    for (i, stream) in streams.iter_mut().enumerate() {
+        let msg = format!("tunnel {i}");
+        stream.write_all(msg.as_bytes()).await.expect("write");
+        let mut buf = vec![0u8; msg.len()];
+        tokio::time::timeout(Duration::from_secs(3), stream.read_exact(&mut buf))
+            .await
+            .expect("echo in time")
+            .expect("read");
+        assert_eq!(buf, msg.as_bytes());
+    }
+    assert_eq!(accepted.load(Ordering::SeqCst), 1, "one TCP connection");
+}

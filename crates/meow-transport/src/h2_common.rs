@@ -5,8 +5,9 @@ use http::StatusCode;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::TransportError;
@@ -218,6 +219,178 @@ impl RecvState {
 /// default window keep their single-poll behaviour.
 const WRITE_STASH_CAP: usize = 64 * 1024;
 
+// ─── Shared client connection ─────────────────────────────────
+
+/// After this long without a new stream, a reused connection is PINGed
+/// first (a NAT or the server may have dropped it silently).
+const REUSE_IDLE_PING: Duration = Duration::from_secs(30);
+/// How long a reused connection may take to accept one more stream (its
+/// concurrent-stream limit) before a fresh connection is dialed instead.
+const REUSE_READY_TIMEOUT: Duration = Duration::from_secs(2);
+/// New streams stop going to a connection this old (Xray's xmux rotates
+/// connections after 30-50 min); streams already on it run to completion.
+const REUSE_MAX_AGE: Duration = Duration::from_secs(30 * 60);
+
+/// The h2 connection driver task, shared by a [`SharedH2`] and the streams
+/// opened on it. The conn owns the inner stream's fd: once every send/recv
+/// ref is gone the driver self-terminates, but only if its closing flush
+/// can make progress — so the last owner bounds that wait (issue #669).
+pub(crate) struct ConnDriver(Option<tokio::task::JoinHandle<()>>);
+
+impl ConnDriver {
+    fn is_finished(&self) -> bool {
+        self.0
+            .as_ref()
+            .is_none_or(tokio::task::JoinHandle::is_finished)
+    }
+}
+
+impl Drop for ConnDriver {
+    fn drop(&mut self) {
+        let Some(mut driver) = self.0.take() else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            driver.abort();
+            return;
+        };
+        runtime.spawn(async move {
+            if tokio::time::timeout(DRIVER_DRAIN_TIMEOUT, &mut driver)
+                .await
+                .is_err()
+            {
+                driver.abort();
+                let _ = driver.await;
+            }
+        });
+    }
+}
+
+/// One client h2 connection that a multiplexing layer (gRPC, XHTTP) opens
+/// every tunnel of a proxy on, as mihomo/Xray clients do — instead of a new
+/// TCP + TLS/REALITY session per tunnel.
+#[derive(Clone)]
+pub(crate) struct SharedH2 {
+    h2: h2::client::SendRequest<Bytes>,
+    driver: Arc<ConnDriver>,
+    ping: Arc<tokio::sync::Mutex<Option<h2::PingPong>>>,
+    last_open: Arc<std::sync::Mutex<Instant>>,
+    born: Instant,
+}
+
+impl SharedH2 {
+    /// Spawn the driver for a fresh connection.
+    pub(crate) fn spawn<T>(
+        h2: h2::client::SendRequest<Bytes>,
+        mut conn: h2::client::Connection<T, Bytes>,
+    ) -> Self
+    where
+        T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let ping = conn.ping_pong();
+        let driver = tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        Self {
+            h2,
+            driver: Arc::new(ConnDriver(Some(driver))),
+            ping: Arc::new(tokio::sync::Mutex::new(ping)),
+            last_open: Arc::new(std::sync::Mutex::new(Instant::now())),
+            born: Instant::now(),
+        }
+    }
+
+    /// A keep-alive handle on the connection for a stream opened on it.
+    pub(crate) fn driver(&self) -> Arc<ConnDriver> {
+        Arc::clone(&self.driver)
+    }
+
+    /// Open a request stream. `wait`: block for send readiness (a fresh
+    /// connection's first stream); otherwise give up after
+    /// [`REUSE_READY_TIMEOUT`] so a saturated connection is replaced.
+    pub(crate) async fn send_request(
+        &self,
+        request: http::Request<()>,
+        wait: bool,
+        tag: fn(String) -> TransportError,
+    ) -> Result<(h2::client::ResponseFuture, h2::SendStream<Bytes>), TransportError> {
+        let ready = self.h2.clone().ready();
+        let mut h2 = if wait {
+            ready.await.map_err(|e| h2_to_transport(e, tag))?
+        } else {
+            tokio::time::timeout(REUSE_READY_TIMEOUT, ready)
+                .await
+                .map_err(|_| tag("connection busy".into()))?
+                .map_err(|e| h2_to_transport(e, tag))?
+        };
+        let pair = h2
+            .send_request(request, false)
+            .map_err(|e| h2_to_transport(e, tag))?;
+        if let Ok(mut last) = self.last_open.lock() {
+            *last = Instant::now();
+        }
+        Ok(pair)
+    }
+
+    /// False when the connection ended, is too old to take new streams, or
+    /// — idle for a while — does not answer a PING in time.
+    async fn alive(&self) -> bool {
+        if self.driver.is_finished() || self.born.elapsed() > REUSE_MAX_AGE {
+            return false;
+        }
+        let idle = self
+            .last_open
+            .lock()
+            .map_or(Duration::ZERO, |last| last.elapsed());
+        if idle < REUSE_IDLE_PING {
+            return true;
+        }
+        let mut ping = self.ping.lock().await;
+        let Some(ping) = ping.as_mut() else {
+            return true;
+        };
+        matches!(
+            tokio::time::timeout(REUSE_READY_TIMEOUT, ping.ping(h2::Ping::opaque())).await,
+            Ok(Ok(_))
+        )
+    }
+}
+
+/// The connection a layer currently shares (the last one it opened).
+#[derive(Default)]
+pub(crate) struct SharedH2Slot(std::sync::Mutex<Option<SharedH2>>);
+
+impl SharedH2Slot {
+    /// The shared connection if it is still usable; a dead one is dropped.
+    pub(crate) async fn live(&self) -> Option<SharedH2> {
+        let session = self.0.lock().ok()?.clone()?;
+        if session.alive().await {
+            Some(session)
+        } else {
+            self.forget(&session);
+            None
+        }
+    }
+
+    pub(crate) fn set(&self, session: SharedH2) {
+        if let Ok(mut slot) = self.0.lock() {
+            *slot = Some(session);
+        }
+    }
+
+    /// Drop the shared connection if it is still `stale`.
+    pub(crate) fn forget(&self, stale: &SharedH2) {
+        if let Ok(mut slot) = self.0.lock() {
+            if slot
+                .as_ref()
+                .is_some_and(|s| Arc::ptr_eq(&s.driver, &stale.driver))
+            {
+                *slot = None;
+            }
+        }
+    }
+}
+
 /// Raw bidirectional bytes over one HTTP/2 request/response pair.
 pub struct H2Stream {
     send: h2::SendStream<Bytes>,
@@ -240,6 +413,8 @@ pub struct H2Stream {
     remote_no_error_is_eof: bool,
     eos_sent: bool,
     conn_driver: Option<tokio::task::JoinHandle<()>>,
+    /// Keep-alive on a [`SharedH2`] connection other streams may use too.
+    shared_driver: Option<Arc<ConnDriver>>,
 }
 
 impl H2Stream {
@@ -252,7 +427,16 @@ impl H2Stream {
             remote_no_error_is_eof: false,
             eos_sent: false,
             conn_driver: None,
+            shared_driver: None,
         }
+    }
+
+    /// Keep a shared connection alive while this stream lives; on drop the
+    /// response is drained (bounded) so its flow-control window returns to
+    /// the connection the other streams keep using.
+    pub(crate) fn with_shared_driver(mut self, driver: Arc<ConnDriver>) -> Self {
+        self.shared_driver = Some(driver);
+        self
     }
 
     pub fn with_conn_driver(mut self, driver: tokio::task::JoinHandle<()>) -> Self {
@@ -287,6 +471,16 @@ impl H2Stream {
 impl Drop for H2Stream {
     fn drop(&mut self) {
         self.best_effort_eos();
+        if let Some(shared) = self.shared_driver.take() {
+            let recv = self.recv.take();
+            if let (Some(recv), Ok(runtime)) = (recv, tokio::runtime::Handle::try_current()) {
+                runtime.spawn(async move {
+                    let _ = tokio::time::timeout(DRIVER_DRAIN_TIMEOUT, recv.drain()).await;
+                    drop(shared);
+                });
+            }
+            return;
+        }
         let Some(mut driver) = self.conn_driver.take() else {
             return;
         };
