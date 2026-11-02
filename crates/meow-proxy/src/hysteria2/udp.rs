@@ -37,13 +37,19 @@ impl UdpSession {
         if data.len() > MAX_UDP_SIZE {
             return Err(Error::protocol("UDP payload is too large"));
         }
-        self.cmd_tx
-            .try_send(Cmd::SendUdp {
-                session_id: self.session_id,
-                addr: addr.to_string(),
-                data: data.to_vec(),
-            })
-            .map_err(|_| Error::Closed)
+        match self.cmd_tx.try_send(Cmd::SendUdp {
+            session_id: self.session_id,
+            addr: addr.to_string(),
+            data: data.to_vec(),
+        }) {
+            // A full driver queue is congestion, not a dead session: drop
+            // the datagram as UDP would (meow-openwrt). Reporting `Closed`
+            // made the caller tear the association down and open a new one
+            // — a new server-side socket and source port mid-flow, which
+            // connected UDP peers (iperf3, QUIC, games) then ignore.
+            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(Error::Closed),
+        }
     }
 
     pub async fn recv(&mut self) -> Result<(Vec<u8>, String)> {
@@ -167,6 +173,20 @@ fn reassemble(item: FragmentPacket) -> Result<UdpMessage> {
 
 #[cfg(test)]
 mod tests {
+    /// A full driver queue drops the datagram; only a gone driver fails.
+    #[test]
+    fn send_drops_on_full_queue_and_fails_only_when_closed() {
+        let (tx, rx) = mpsc::channel(1);
+        let (_ptx, prx) = mpsc::channel(1);
+        let session = super::UdpSession::new(7, tx, prx);
+        session.send(b"a", "1.2.3.4:5").expect("queued");
+        session
+            .send(b"b", "1.2.3.4:5")
+            .expect("full queue drops, session stays up");
+        drop(rx);
+        assert!(session.send(b"c", "1.2.3.4:5").is_err(), "driver gone");
+    }
+
     use super::*;
 
     #[test]
