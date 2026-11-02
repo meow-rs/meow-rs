@@ -56,7 +56,7 @@ snell = ["dep:argon2", "dep:boring", "dep:blake2", "meow-transport/simple-obfs"]
 anytls = ["dep:meow-anytls"]
 # Hysteria2 outbound implemented in-tree on top of quiche (BoringSSL-native
 # QUIC + HTTP/3), so it links no rustls and no second crypto library.
-hysteria2 = ["dep:quiche", "dep:boring", "dep:blake2", "dep:webpki-root-certs", "dep:tokio-util"]
+hysteria2 = ["dep:quiche", "dep:boring", "dep:blake2", "dep:tokio-util"]
 # TrustTunnel H2 client outbound; opt-in pending upstream profile review (#727).
 trusttunnel = ["dep:h2", "dep:tokio-util"]
 # The HTTP/3 transport for that outbound (`quic: true`). Rides quiche on the
