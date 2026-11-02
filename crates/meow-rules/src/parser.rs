@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use meow_common::Rule;
@@ -26,6 +27,8 @@ use crate::network::NetworkRule;
 use crate::port::PortRule;
 use crate::process::ProcessRule;
 use crate::process_path::ProcessPathRule;
+use crate::rule_set::RuleSet;
+use crate::rule_set_rule::RuleSetRule;
 use crate::src_geoip::SrcGeoIpRule;
 use crate::uid::UidRule;
 
@@ -81,13 +84,27 @@ impl ParserContext {
 const MAX_LOGIC_DEPTH: usize = 64;
 const MAX_RULE_LINE_LEN: usize = 64 * 1024;
 
+/// Named rule-providers a `RULE-SET,<name>` sub-rule can reference.
+pub type RuleSets = HashMap<String, Arc<dyn RuleSet>>;
+
 pub fn parse_rule(line: &str, ctx: &ParserContext) -> Result<Box<dyn Rule>, String> {
-    parse_rule_depth(line, ctx, 0)
+    parse_rule_depth(line, ctx, &RuleSets::new(), 0)
+}
+
+/// [`parse_rule`] that also resolves `RULE-SET,<name>` — at the top level
+/// and inside `AND`/`OR`/`NOT` groups (mihomo parity) — against `rule_sets`.
+pub fn parse_rule_with_rule_sets(
+    line: &str,
+    ctx: &ParserContext,
+    rule_sets: &RuleSets,
+) -> Result<Box<dyn Rule>, String> {
+    parse_rule_depth(line, ctx, rule_sets, 0)
 }
 
 fn parse_rule_depth(
     line: &str,
     ctx: &ParserContext,
+    rule_sets: &RuleSets,
     logic_depth: usize,
 ) -> Result<Box<dyn Rule>, String> {
     if line.len() > MAX_RULE_LINE_LEN {
@@ -99,7 +116,7 @@ fn parse_rule_depth(
     if let Some((ty, rest)) = split_once_trimmed(line, ',') {
         let upper = ty.to_ascii_uppercase();
         if matches!(upper.as_str(), "AND" | "OR" | "NOT") {
-            return parse_logic_rule(&upper, rest, ctx, logic_depth);
+            return parse_logic_rule(&upper, rest, ctx, rule_sets, logic_depth);
         }
     }
 
@@ -125,6 +142,17 @@ fn parse_rule_depth(
     let extra = parts.get(3).map(|s| s.trim());
 
     match rule_type {
+        "RULE-SET" => {
+            let set = rule_sets
+                .get(payload)
+                .ok_or_else(|| format!("unknown rule-provider '{payload}'"))?;
+            Ok(Box::new(RuleSetRule::new(
+                payload,
+                Arc::clone(set),
+                adapter,
+                parse_rule_flags(extra),
+            )))
+        }
         "DOMAIN" => Ok(Box::new(DomainRule::new(payload, adapter))),
         "DOMAIN-SUFFIX" => Ok(Box::new(DomainSuffixRule::new(payload, adapter))),
         "DOMAIN-KEYWORD" => Ok(Box::new(DomainKeywordRule::new(payload, adapter))),
@@ -293,6 +321,7 @@ fn parse_logic_rule(
     rule_type: &str,
     rest: &str,
     ctx: &ParserContext,
+    rule_sets: &RuleSets,
     logic_depth: usize,
 ) -> Result<Box<dyn Rule>, String> {
     if logic_depth >= MAX_LOGIC_DEPTH {
@@ -379,7 +408,7 @@ fn parse_logic_rule(
             ));
         }
         let patched = splice_inner_adapter(g.trim());
-        inner_rules.push(parse_rule_depth(&patched, ctx, logic_depth + 1)?);
+        inner_rules.push(parse_rule_depth(&patched, ctx, rule_sets, logic_depth + 1)?);
     }
 
     match rule_type {

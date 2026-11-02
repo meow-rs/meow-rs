@@ -1696,8 +1696,9 @@ fn parse_text_payload(raw: &str) -> Vec<String> {
 /// - provider types that never read a path (`inline`) ignore a stray `path:`
 ///   entirely — mihomo parity: a harmless leftover field must not fail a
 ///   whole rebuild;
-/// - with a `cache_dir`, the resolved path (absolute or relative, `..` and
-///   symlinks included) must stay inside it — anything else is a hard error;
+/// - with a `cache_dir`, the lexically resolved path (absolute or relative,
+///   `..` folded; symlinks followed, mihomo parity) must stay inside it —
+///   anything else is a hard error;
 /// - without a `cache_dir` (runtime rebuilds such as `PUT /configs` or
 ///   `--config-string`) there is no containment root, so a `path:` is never
 ///   honoured: http providers fall back to fetching into memory, file
