@@ -28,6 +28,10 @@ external-ui-download = ["meow-config/external-ui-download"]
 # Persistent logbook (ADR-0014): bundles SQLite. In `full`; excluded from
 # `minimal` (ADR-0007 binary-size caps), where `GET /logbook` reports it off.
 logbook = ["meow-common/logbook"]
+# Persistent per-day traffic by host, policy and interface (`GET
+# /traffic/ledger`, ADR-0015): the logbook's SQLite plus the public-suffix
+# list. In `full`; excluded from `minimal` (ADR-0007 binary-size caps).
+traffic-ledger = ["meow-common/traffic-ledger"]
 # Heap profiling via dhat crate — swaps global allocator; never enable in production.
 dhat-heap = ["dhat"]
 
@@ -99,6 +103,7 @@ full = [
     "listener-http", "listener-socks5", "listener-tproxy", "listener-mixed", "listener-tun",
     "listener-shadowsocks",
     "logbook",
+    "traffic-ledger",
     "public-suffix",
 ]
 

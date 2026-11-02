@@ -958,6 +958,9 @@ impl Tunnel {
     /// `inner.direct` observe `set_resolver` swaps identically.
     pub fn new_with_slot(resolver: meow_dns::ResolverSlot) -> Self {
         let direct = Arc::new(DirectAdapter::new().with_resolver_slot(Arc::clone(&resolver)));
+        let stats = Arc::new(Statistics::new());
+        let source: Arc<dyn meow_common::traffic_ledger::Source> = Arc::clone(&stats) as _;
+        meow_common::traffic_ledger::register(Arc::downgrade(&source));
         Self {
             inner: Arc::new(TunnelInner {
                 mode: RwLock::new(TunnelMode::Rule),
@@ -966,7 +969,7 @@ impl Tunnel {
                 direct,
                 reject: Arc::new(meow_proxy::RejectAdapter::new(false)),
                 nat_table: udp::new_nat_table(),
-                stats: Arc::new(Statistics::new()),
+                stats,
                 tcp_generation: RwLock::new(0),
                 health_checks: Mutex::new(crate::health_check::HealthCheckSupervisor::default()),
                 needs_ip_resolution: AtomicBool::new(false),

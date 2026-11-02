@@ -105,6 +105,7 @@ The `tun:` config section (issue #326, feature `listener-tun`, in the `full` bun
 - **Proxy groups** (`meow-proxy/src/group/`) — Selector, URLTest, Fallback wrap multiple adapters with selection strategies
 - **Tunnel** (`meow-tunnel/src/tunnel.rs`) — central `Arc`-shared routing engine; holds proxies, rules, DNS resolver, connection stats
 - **Logbook** (`meow-common/src/logbook/`) — persistent record of notable engine events (`GET /logbook`), an SQLite database behind the `logbook` feature (`rusqlite`, bundled except on iOS/tvOS, which link the system libsqlite3; in `full`, not `minimal`, where `disabled.rs` stands in); producers call `logbook::event(kind, level, message).subject(..).record()`, a no-op when none is installed. New kinds go in `logbook::kind` and the [ADR-0014](docs/adr/0014-logbook.md) table; never record traffic destinations, and reference rules by index
+- **Traffic ledger** (`meow-common/src/traffic_ledger/`) — per-day bytes and connections by host (registrable domain), leaf policy and interface label, kept 62 days in `<home>/traffic/traffic.db` (`GET|DELETE /traffic/ledger`, [ADR-0015](docs/adr/0015-traffic-ledger.md)); behind the `traffic-ledger` feature (in `full`, not `minimal`). The relay path never touches it: a flow's `ConnCounters` carry a `LedgerTag`, and the tunnel (a `traffic_ledger::Source`) settles live flows every minute and at close. Unlike the logbook it records destinations, deliberately
 
 ### Adding New Proxy Protocols
 

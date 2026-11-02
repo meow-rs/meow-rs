@@ -21,6 +21,7 @@ use meow_common::atomic::{AtomicI, Int};
 use meow_common::conn_notes::ConnNotes;
 pub use meow_common::traffic::ProxyTraffic;
 use meow_common::traffic::ProxyTrafficSource;
+use meow_common::traffic_ledger;
 use meow_common::Metadata;
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -81,9 +82,88 @@ pub struct ConnCounters {
     notes: Option<ConnNotes>,
     /// The leaf proxy's totals (`chains[0]`), bumped alongside these.
     proxy: Option<Arc<ProxyTraffic>>,
+    /// Where the traffic ledger files this flow, while it records.
+    ledger: Option<LedgerTag>,
+}
+
+/// A flow's row in the traffic ledger (`meow_common::traffic_ledger`): its
+/// host and leaf proxy, and how much of its counters the ledger has had.
+/// The ledger takes the rest every minute and as the flow ends, never per
+/// chunk.
+#[derive(Debug)]
+pub(crate) struct LedgerTag {
+    host: SmolStr,
+    policy: Arc<str>,
+    settled_upload: AtomicI,
+    settled_download: AtomicI,
+}
+
+impl LedgerTag {
+    /// The tag of a flow to `metadata`'s destination through `policy`
+    /// (the leaf proxy's name), or `None` while the ledger is off or the
+    /// flow has no leaf.
+    pub(crate) fn new(
+        metadata: &Metadata,
+        policy: impl FnOnce() -> Option<Arc<str>>,
+    ) -> Option<Self> {
+        if !traffic_ledger::enabled() {
+            return None;
+        }
+        let host = if !traffic_ledger::hosts() {
+            SmolStr::default()
+        } else if !metadata.host.is_empty() {
+            metadata.host.clone()
+        } else if let Some(ip) = metadata.dst_ip {
+            smol_str::format_smolstr!("{ip}")
+        } else {
+            SmolStr::default()
+        };
+        Some(Self {
+            host,
+            policy: policy()?,
+            settled_upload: AtomicI::new(0),
+            settled_download: AtomicI::new(0),
+        })
+    }
+}
+
+/// What `count` gained since `settled`, marking it settled. Racing
+/// settlers each take a disjoint part.
+fn unsettled(count: &AtomicI, settled: &AtomicI) -> u64 {
+    let now = count.load(Ordering::Relaxed);
+    let before = settled.fetch_max(now, Ordering::Relaxed);
+    u64::try_from(now.saturating_sub(before)).unwrap_or(0)
 }
 
 impl ConnCounters {
+    fn new(
+        notes: Option<ConnNotes>,
+        proxy: Option<Arc<ProxyTraffic>>,
+        ledger: Option<LedgerTag>,
+    ) -> Self {
+        if let Some(tag) = &ledger {
+            traffic_ledger::add(&tag.host, &tag.policy, 0, 0, 1);
+        }
+        Self {
+            upload: AtomicI::new(0),
+            download: AtomicI::new(0),
+            closed: AtomicBool::new(false),
+            close_notify: tokio::sync::Notify::new(),
+            notes,
+            proxy,
+            ledger,
+        }
+    }
+
+    /// Hand the traffic ledger what this flow carried since it last did.
+    fn settle_ledger(&self) {
+        if let Some(tag) = &self.ledger {
+            let upload = unsettled(&self.upload, &tag.settled_upload);
+            let download = unsettled(&self.download, &tag.settled_download);
+            traffic_ledger::add(&tag.host, &tag.policy, upload, download, 0);
+        }
+    }
+
     fn close(&self) {
         self.closed.store(true, Ordering::Release);
         self.close_notify.notify_waiters();
@@ -110,6 +190,14 @@ impl ConnCounters {
 
     pub fn notes(&self) -> Option<&ConnNotes> {
         self.notes.as_ref()
+    }
+}
+
+impl Drop for ConnCounters {
+    /// What the flow carried after it left the tables (bytes still in
+    /// flight as it was closed) reaches the ledger as the last handle goes.
+    fn drop(&mut self) {
+        self.settle_ledger();
     }
 }
 
@@ -193,6 +281,12 @@ pub struct Statistics {
     /// so a proxy a reload removed still shows what it carried. Empty while
     /// headless, which keeps only the totals.
     proxy_traffic: DashMap<Arc<str>, Arc<ProxyTraffic>>,
+    /// Live UDP flows the traffic ledger files, by counters address, so a
+    /// settle reaches them as it reaches the connections.
+    udp_flows: DashMap<usize, Arc<ConnCounters>>,
+    /// Leaf proxy names the traffic ledger filed while headless, which
+    /// keeps no [`Self::proxy_traffic`] to share them from.
+    ledger_names: DashMap<Arc<str>, ()>,
 }
 
 /// How many closed connections with notes [`Statistics`] keeps.
@@ -250,6 +344,8 @@ impl Statistics {
             recently_closed: Mutex::new(VecDeque::new()),
             rule_match: Arc::new(RuleMatchCounters::new()),
             proxy_traffic: DashMap::new(),
+            udp_flows: DashMap::new(),
+            ledger_names: DashMap::new(),
         }
     }
 
@@ -305,6 +401,40 @@ impl Statistics {
         }
         let entry = self.proxy_traffic.entry(Arc::from(proxy)).or_default();
         Some(Arc::clone(entry.value()))
+    }
+
+    /// `proxy`'s name as one shared allocation — its totals' key, or while
+    /// headless a copy kept for the ledger — so a flow's ledger tag
+    /// allocates nothing of its own.
+    pub(crate) fn proxy_name(&self, proxy: &str) -> Arc<str> {
+        if let Some(entry) = self.proxy_traffic.get(proxy) {
+            return Arc::clone(entry.key());
+        }
+        if let Some(entry) = self.ledger_names.get(proxy) {
+            return Arc::clone(entry.key());
+        }
+        Arc::clone(self.ledger_names.entry(Arc::from(proxy)).or_default().key())
+    }
+
+    /// Counters for a UDP flow through the leaf proxy `leaf`: the proxy's
+    /// totals, and the flow's row in the traffic ledger while it records.
+    /// End it with [`Self::end_udp_flow`].
+    pub(crate) fn begin_udp_flow(&self, leaf: &str, metadata: &Metadata) -> Arc<ConnCounters> {
+        let proxy = self.proxy_counters(leaf);
+        let ledger = LedgerTag::new(metadata, || Some(self.proxy_name(leaf)));
+        let filed = ledger.is_some();
+        let counters = Arc::new(ConnCounters::new(None, proxy, ledger));
+        if filed {
+            self.udp_flows
+                .insert(Arc::as_ptr(&counters).addr(), Arc::clone(&counters));
+        }
+        counters
+    }
+
+    /// See [`Self::begin_udp_flow`].
+    pub(crate) fn end_udp_flow(&self, counters: &Arc<ConnCounters>) {
+        self.udp_flows.remove(&Arc::as_ptr(counters).addr());
+        counters.settle_ledger();
     }
 
     /// Every proxy that carried a flow, with its `(upload, download)` bytes
@@ -383,11 +513,12 @@ impl Statistics {
         notes: Option<ConnNotes>,
     ) -> (Uuid, Arc<ConnCounters>) {
         let uuid = Uuid::new_v4();
-        let counters = Arc::new(ConnCounters {
+        let ledger = LedgerTag::new(&metadata, || chains.first().cloned());
+        let counters = Arc::new(ConnCounters::new(
             notes,
-            proxy: chains.first().and_then(|leaf| self.proxy_counters(leaf)),
-            ..ConnCounters::default()
-        });
+            chains.first().and_then(|leaf| self.proxy_counters(leaf)),
+            ledger,
+        ));
         let info = ConnectionInfo {
             id: uuid,
             metadata: Arc::new(metadata),
@@ -413,9 +544,14 @@ impl Statistics {
         self.headless_connections.get().is_some()
     }
 
-    pub(crate) fn begin_headless_connection(&self) -> Option<Arc<ConnCounters>> {
+    /// Register a headless connection, filed in the traffic ledger by
+    /// `ledger`; `None` when not headless.
+    pub(crate) fn begin_headless_connection(
+        &self,
+        ledger: impl FnOnce() -> Option<LedgerTag>,
+    ) -> Option<Arc<ConnCounters>> {
         let connections = self.headless_connections.get()?;
-        let counters = Arc::new(ConnCounters::default());
+        let counters = Arc::new(ConnCounters::new(None, None, ledger()));
         // The guard pins this allocation until after its Drop unregisters it.
         // Even after a reload drains the map, a stale guard keeps its address
         // from being reused by a new connection. The address is only a private
@@ -433,6 +569,7 @@ impl Statistics {
             .and_then(|connections| connections.remove(&key))
         {
             counters.close();
+            counters.settle_ledger();
         }
     }
 
@@ -440,6 +577,7 @@ impl Statistics {
     pub fn close_connection(&self, id: Uuid) {
         if let Some((_, info)) = self.connections.remove(&id) {
             info.counters.close();
+            info.counters.settle_ledger();
             self.remember_closed(info);
         }
     }
@@ -547,6 +685,7 @@ impl Statistics {
         let mut noted = Vec::new();
         self.connections.retain(|_, info| {
             info.counters.close();
+            info.counters.settle_ledger();
             closed += 1;
             if info.counters.notes.is_some() {
                 noted.push(info.clone());
@@ -559,6 +698,7 @@ impl Statistics {
         if let Some(connections) = self.headless_connections.get() {
             connections.retain(|_, counters| {
                 counters.close();
+                counters.settle_ledger();
                 closed += 1;
                 false
             });
@@ -579,6 +719,24 @@ impl Default for Statistics {
 impl ProxyTrafficSource for Statistics {
     fn proxy_counters(&self, proxy: &str) -> Option<Arc<ProxyTraffic>> {
         Statistics::proxy_counters(self, proxy)
+    }
+}
+
+/// The ledger settles the connections and UDP flows of every live tunnel
+/// before it writes.
+impl traffic_ledger::Source for Statistics {
+    fn settle(&self) {
+        for entry in &self.connections {
+            entry.counters.settle_ledger();
+        }
+        if let Some(connections) = self.headless_connections.get() {
+            for entry in connections {
+                entry.value().settle_ledger();
+            }
+        }
+        for entry in &self.udp_flows {
+            entry.value().settle_ledger();
+        }
     }
 }
 
@@ -642,5 +800,71 @@ impl std::io::Write for TimestampBuffer {
 
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod ledger_tests {
+    use super::*;
+    use meow_common::traffic_ledger::{self, GroupBy, Options, Query};
+
+    fn report(host: &str, by: GroupBy) -> traffic_ledger::Report {
+        let today = traffic_ledger::today();
+        traffic_ledger::query(&Query {
+            from: today - 1,
+            to: today,
+            by,
+            host: Some(host.into()),
+            ..Query::default()
+        })
+        .unwrap()
+        .unwrap()
+    }
+
+    #[test]
+    fn connections_and_udp_flows_reach_the_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        traffic_ledger::install(dir.path(), Options::default()).unwrap();
+        let stats = Arc::new(Statistics::new());
+        let source: Arc<dyn traffic_ledger::Source> = Arc::clone(&stats) as _;
+        traffic_ledger::register(Arc::downgrade(&source));
+
+        let metadata = Metadata {
+            host: "video.ledger-test.example".into(),
+            ..Metadata::default()
+        };
+        let chains: SmallVec<[Arc<str>; 1]> =
+            smallvec::smallvec![Arc::from("Ledger Node"), Arc::from("Auto")];
+        let (id, counters) =
+            stats.track_connection_with_counters(metadata, "MATCH".into(), "".into(), chains, None);
+        stats.record_upload(&counters, 100);
+        stats.record_download(&counters, 1000);
+        // A query settles the live connection.
+        let live = report("ledger-test.example", GroupBy::Policy);
+        assert_eq!(live.rows.len(), 1);
+        assert_eq!(live.rows[0].name, "Ledger Node");
+        assert_eq!((live.upload, live.download, live.requests), (100, 1000, 1));
+
+        // Bytes after the close still reach it as the last handle goes.
+        stats.close_connection(id);
+        stats.record_download(&counters, 24);
+        drop(counters);
+
+        let udp = Metadata {
+            dst_ip: Some("198.51.100.7".parse().unwrap()),
+            ..Metadata::default()
+        };
+        let flow = stats.begin_udp_flow("DIRECT", &udp);
+        stats.record_upload(&flow, 7);
+        stats.end_udp_flow(&flow);
+        drop(flow);
+
+        let tcp = report("ledger-test.example", GroupBy::Host);
+        assert_eq!((tcp.upload, tcp.download, tcp.requests), (100, 1024, 1));
+        let udp = report("198.51.100.7", GroupBy::Policy);
+        assert_eq!(udp.rows[0].name, "DIRECT");
+        assert_eq!((udp.upload, udp.download, udp.requests), (7, 0, 1));
+        assert!(stats.udp_flows.is_empty());
+        traffic_ledger::uninstall();
     }
 }

@@ -7374,6 +7374,97 @@ async fn logbook_lists_filters_and_clears_entries() {
     assert_eq!(body_json(get("/logbook").await).await["enabled"], false);
 }
 
+/// `GET /traffic/ledger` and `DELETE /traffic/ledger`. The ledger is
+/// process-global and other tests in this binary may record into it while
+/// it is installed, so every read narrows to this test's host.
+#[tokio::test]
+async fn traffic_ledger_groups_drills_and_clears() {
+    use meow_common::traffic_ledger;
+
+    let state = test_state_default();
+    let app = create_router(Arc::clone(&state));
+    let get = |uri: &str| {
+        let app = app.clone();
+        let request = Request::get(uri).body(axum::body::Body::empty()).unwrap();
+        async move { app.oneshot(request).await.unwrap() }
+    };
+
+    let off = body_json(get("/traffic/ledger").await).await;
+    assert_eq!(off["enabled"], false);
+    assert_eq!(off["rows"], serde_json::json!([]));
+
+    let dir = tempfile::tempdir().unwrap();
+    traffic_ledger::install(dir.path(), traffic_ledger::Options::default()).unwrap();
+    let direct: Arc<str> = Arc::from("DIRECT");
+    let node: Arc<str> = Arc::from("Ledger API Node");
+    traffic_ledger::add(&"www.ledger-api.example".into(), &direct, 10, 100, 1);
+    traffic_ledger::add(&"cdn.ledger-api.example".into(), &node, 20, 2000, 2);
+
+    let hosts = body_json(get("/traffic/ledger?host=ledger-api.example").await).await;
+    assert_eq!(hosts["enabled"], true);
+    assert_eq!(hosts["by"], "host");
+    let rows = hosts["rows"].as_array().unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "subdomains fold into the registrable domain: {hosts}"
+    );
+    assert_eq!(rows[0]["name"], "ledger-api.example");
+    assert_eq!(rows[0]["requests"], 3);
+
+    let policies = body_json(get("/traffic/ledger?by=policy&host=ledger-api.example").await).await;
+    let rows = policies["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "{policies}");
+    assert_eq!(rows[0]["name"], "Ledger API Node", "largest first");
+    assert_eq!(rows[0]["download"], 2000);
+    assert_eq!(rows[1]["name"], "DIRECT");
+
+    let drilled =
+        body_json(get("/traffic/ledger?by=interface&host=ledger-api.example&policy=DIRECT").await)
+            .await;
+    assert_eq!(drilled["upload"], 10);
+    assert_eq!(drilled["download"], 100);
+
+    let today = traffic_ledger::date_of_day(traffic_ledger::today());
+    let span = body_json(
+        get(&format!(
+            "/traffic/ledger?from={today}&to={today}&host=ledger-api.example"
+        ))
+        .await,
+    )
+    .await;
+    assert_eq!(span["from"], today.as_str());
+    assert_eq!(span["requests"], 3);
+
+    assert_eq!(
+        get("/traffic/ledger?from=yesterday").await.status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        get("/traffic/ledger?by=port").await.status(),
+        StatusCode::BAD_REQUEST
+    );
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::delete("/traffic/ledger")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let cleared = body_json(get("/traffic/ledger?host=ledger-api.example").await).await;
+    assert_eq!(cleared["rows"], serde_json::json!([]));
+
+    traffic_ledger::uninstall();
+    assert_eq!(
+        body_json(get("/traffic/ledger").await).await["enabled"],
+        false
+    );
+}
+
 // ── Proxy-provider subscriptionInfo ──────────────────────────────
 
 /// What [`UserinfoOrigin`] answers every request with.

@@ -10,6 +10,15 @@ the canonical, in-repo source a release is cut from.
 
 ### Added
 
+- **Traffic ledger** ([ADR-0015](docs/adr/0015-traffic-ledger.md)): meow
+  now keeps, for every local day, the bytes and connections per host
+  (registrable domain), leaf policy and interface label, for 62 days in
+  `<home>/traffic/traffic.db`, so a client can show today, this month and
+  last month grouped any of the three ways. `GET /traffic/ledger` serves
+  it (`from`, `to`, `by`, and `host` / `policy` / `interface` to drill
+  down); `DELETE /traffic/ledger` empties it. On by default:
+  `traffic-ledger: {enable: false}` turns it off and `hosts: false`
+  keeps only policies and interfaces. In `full` builds, not `minimal`.
 - **`dns.direct-nameserver`**: `DIRECT` outbounds now resolve their
   destination through `direct-nameserver` when it is set, as mihomo does,
   instead of always using the main `nameserver` list. With
