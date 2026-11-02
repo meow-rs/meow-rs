@@ -466,14 +466,13 @@ fn find_proxy(
     })
 }
 
-async fn get_proxy(
-    State(state): State<Arc<AppState>>,
-    Path(name): Path<String>,
-) -> Result<Json<ProxyInfo>, StatusCode> {
+async fn get_proxy(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
     let route = state.tunnel.route_snapshot();
-    let (proxy, provider) =
-        find_proxy(&state, &route.proxies, &name).ok_or(StatusCode::NOT_FOUND)?;
-    Ok(Json(ProxyInfo::from_proxy(&proxy, &provider)))
+    // mihomo answers an unknown name with `{"message": ...}`, not an empty body.
+    let Some((proxy, provider)) = find_proxy(&state, &route.proxies, &name) else {
+        return msg_err(StatusCode::NOT_FOUND, "Resource not found");
+    };
+    Json(ProxyInfo::from_proxy(&proxy, &provider)).into_response()
 }
 
 #[derive(Deserialize)]
@@ -718,12 +717,14 @@ struct ConfigResponse {
     mode: String,
     #[serde(rename = "log-level")]
     log_level: String,
-    #[serde(rename = "mixed-port", skip_serializing_if = "Option::is_none")]
-    mixed_port: Option<u16>,
-    #[serde(rename = "socks-port", skip_serializing_if = "Option::is_none")]
-    socks_port: Option<u16>,
-    #[serde(rename = "port", skip_serializing_if = "Option::is_none")]
-    http_port: Option<u16>,
+    // Ports are always numbers, `0` when unset, as in mihomo: dashboards
+    // bind their port inputs to these keys.
+    #[serde(rename = "mixed-port")]
+    mixed_port: u16,
+    #[serde(rename = "socks-port")]
+    socks_port: u16,
+    #[serde(rename = "port")]
+    http_port: u16,
     #[serde(rename = "redir-port")]
     redir_port: u16,
     #[serde(rename = "tproxy-port")]
@@ -739,6 +740,12 @@ struct ConfigResponse {
     bind_address: String,
     #[serde(rename = "ipv6")]
     ipv6: bool,
+    #[serde(rename = "routing-mark")]
+    routing_mark: u32,
+    /// `sniffer.enable`, under mihomo's name for it.
+    sniffing: bool,
+    #[serde(rename = "skip-auth-prefixes")]
+    skip_auth_prefixes: Vec<String>,
     /// Whether the TUN listener is currently running (issue #326).
     /// Mirrors `tun.enable` from the raw config and reflects actual
     /// runtime state so nyanpasu can correctly render its toggle.
@@ -756,9 +763,9 @@ async fn get_configs(State(state): State<Arc<AppState>>) -> Json<ConfigResponse>
     Json(ConfigResponse {
         mode: state.tunnel.mode().to_string(),
         log_level: raw.log_level.clone().unwrap_or_else(|| "info".to_string()),
-        mixed_port: raw.mixed_port,
-        socks_port: raw.socks_port,
-        http_port: raw.port,
+        mixed_port: raw.mixed_port.unwrap_or(0),
+        socks_port: raw.socks_port.unwrap_or(0),
+        http_port: raw.port.unwrap_or(0),
         redir_port: 0,
         tproxy_port: raw.tproxy_port.unwrap_or(0),
         external_controller: raw.external_controller.clone(),
@@ -768,6 +775,9 @@ async fn get_configs(State(state): State<Arc<AppState>>) -> Json<ConfigResponse>
             .clone()
             .unwrap_or_else(|| "0.0.0.0".to_string()),
         ipv6: meow_config::effective_ipv6(raw.ipv6),
+        routing_mark: raw.routing_mark.unwrap_or(0),
+        sniffing: raw.sniffer.as_ref().and_then(|s| s.enable).unwrap_or(false),
+        skip_auth_prefixes: raw.skip_auth_prefixes.clone().unwrap_or_default(),
         tun_enable: tun_running,
         tun: TunFields::reported(raw.tun.as_ref(), tun_running),
     })
