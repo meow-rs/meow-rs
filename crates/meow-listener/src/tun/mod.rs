@@ -74,6 +74,7 @@ mod policy_route;
 mod route;
 mod system;
 mod udp;
+mod vnet;
 #[cfg(target_os = "windows")]
 mod windows_device;
 #[cfg(any(test, target_os = "windows"))]
@@ -496,8 +497,17 @@ impl TunListener {
                 MAX_TUN_RETRIES,
             );
 
+            let offload = cfg.stack == TunStack::System;
             match tokio::task::spawn_blocking(move || -> io::Result<(tun_rs::AsyncDevice, u32)> {
                 let mut builder = tun_rs::DeviceBuilder::new().mtu(mtu);
+                // The system stack takes TSO/GRO aggregates: one NAT
+                // rewrite and one write per up-to-64 KiB segment.
+                #[cfg(target_os = "linux")]
+                if offload {
+                    builder = builder.offload(true);
+                }
+                #[cfg(not(target_os = "linux"))]
+                let _ = offload;
                 // On Windows the listener assigns the addresses itself
                 // once the adapter exists: the ones the builder sets
                 // would start out tentative.

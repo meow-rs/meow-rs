@@ -14,6 +14,7 @@ use lwip::NetStack;
 use tokio::task::JoinHandle;
 
 use super::system::{Nat, Verdict};
+use super::vnet;
 use super::TunDevice;
 
 /// One IP packet. UDP/TCP over IPv4/v6 tops out below 64 KiB regardless of
@@ -46,6 +47,7 @@ pub(super) fn spawn_pumps(
     stack: NetStack,
     nat: Option<Arc<Nat>>,
 ) -> (JoinHandle<io::Result<()>>, JoinHandle<io::Result<()>>) {
+    let vnet = vnet_framing(&device);
     let (stack_sink, stack_stream) = stack.split();
     let inbound = tokio::spawn(device_to_stack(
         PumpEnd {
@@ -53,17 +55,41 @@ pub(super) fn spawn_pumps(
             half: stack_sink,
         },
         nat,
+        vnet,
     ));
-    let outbound = tokio::spawn(stack_to_device(PumpEnd {
-        device,
-        half: stack_stream,
-    }));
+    let outbound = tokio::spawn(stack_to_device(
+        PumpEnd {
+            device,
+            half: stack_stream,
+        },
+        vnet,
+    ));
     (inbound, outbound)
+}
+
+/// Whether the device frames every packet with a virtio-net header
+/// (`IFF_VNET_HDR`, opened with offload for the system stack).
+fn vnet_framing(device: &TunDevice) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        device.device.tcp_gso()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = device;
+        false
+    }
 }
 
 /// device → stack. The per-packet `to_vec` is imposed by the netstack's
 /// `Sink<Vec<u8>>` API; this path is not covered by the zero-alloc relay
 /// invariant (ADR-0008), which starts at the terminated TCP stream.
+///
+/// With `nat` (`tun.stack: system`) TCP is translated in place and written
+/// straight back to the device. With `vnet` every read carries a
+/// virtio-net header: a translated packet goes back with its header as is
+/// — a TSO/GRO aggregate stays one write — while lwIP gets plain packets,
+/// segmented and checksummed ([`vnet::to_plain`]).
 ///
 /// `end` is only ever borrowed: moving its fields out into locals would
 /// give them the locals' drop order (reverse of declaration) and undo
@@ -71,15 +97,18 @@ pub(super) fn spawn_pumps(
 async fn device_to_stack(
     mut end: PumpEnd<Arc<TunDevice>, SplitSink<NetStack, Vec<u8>>>,
     nat: Option<Arc<Nat>>,
+    vnet: bool,
 ) -> io::Result<()> {
-    let mut buf = vec![0u8; PACKET_BUF];
+    let hdr_len = if vnet { vnet::HDR_LEN } else { 0 };
+    let mut buf = vec![0u8; hdr_len + PACKET_BUF];
     loop {
         let n = end.device.device.recv(&mut buf).await?;
-        if n == 0 {
+        if n <= hdr_len {
             continue;
         }
+        let partial = vnet && vnet::needs_csum(&buf[..hdr_len]);
         if let Some(nat) = &nat {
-            match nat.translate(&mut buf[..n]) {
+            match nat.translate(&mut buf[hdr_len..n], partial) {
                 Verdict::Write => {
                     // A full device queue drops the packet, as a NIC would;
                     // TCP retransmits it.
@@ -92,6 +121,15 @@ async fn device_to_stack(
                 Verdict::Stack => {}
             }
         }
+        if vnet {
+            for pkt in vnet::to_plain(&mut buf[..n]) {
+                end.half
+                    .send(pkt)
+                    .await
+                    .map_err(|e| io::Error::other(format!("netstack ingress closed: {e}")))?;
+            }
+            continue;
+        }
         end.half
             .send(buf[..n].to_vec())
             .await
@@ -100,11 +138,23 @@ async fn device_to_stack(
 }
 
 /// stack → device. Borrows `end` for the same reason as [`device_to_stack`].
+/// With `vnet` each packet goes out behind an all-zero virtio-net header
+/// (no GSO, checksum complete).
 async fn stack_to_device(
     mut end: PumpEnd<Arc<TunDevice>, SplitStream<NetStack>>,
+    vnet: bool,
 ) -> io::Result<()> {
+    let mut framed = Vec::new();
     while let Some(pkt) = end.half.next().await {
-        end.device.device.send(&pkt?).await?;
+        let pkt = pkt?;
+        if vnet {
+            framed.clear();
+            framed.resize(vnet::HDR_LEN, 0);
+            framed.extend_from_slice(&pkt);
+            end.device.device.send(&framed).await?;
+        } else {
+            end.device.device.send(&pkt).await?;
+        }
     }
     Err(io::Error::other("netstack egress closed"))
 }
