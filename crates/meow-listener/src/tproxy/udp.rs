@@ -1008,7 +1008,10 @@ mod linux {
                 std::ptr::write(
                     hdr,
                     libc::cmsghdr {
-                        cmsg_len,
+                        // libc types musl's `cmsg_len` as `socklen_t` (u32 on
+                        // every width) while glibc's is `size_t`; this helper
+                        // takes a usize, and `as _` fits both.
+                        cmsg_len: cmsg_len as _,
                         cmsg_level: level,
                         cmsg_type: ty,
                     },
