@@ -10,6 +10,11 @@ the canonical, in-repo source a release is cut from.
 
 ### Added
 
+- **hysteria2:** mihomo's `initial-stream-receive-window`, `max-stream-receive-window`,
+  `initial-connection-receive-window` and `max-connection-receive-window` are honoured
+  (they used to fail the node). Unset, the connection window ceiling is MemTotal/16
+  (4-24 MiB), so a slow reader cannot park ~24 MiB per connection on a small router;
+  4 GB+ hosts keep the stock windows.
 - `dns.proxy-server-nameserver-policy` selects nameservers for node domains
   without changing ordinary DNS. It preserves policy order on reload and uses
   the existing `nameserver-policy-exclusive` flag. Node-policy dependencies

@@ -75,6 +75,7 @@ mod hysteria2;
 #[cfg(feature = "hysteria2")]
 pub mod hysteria2_adapter;
 #[cfg(feature = "hysteria2")]
+pub use hysteria2::ReceiveWindows as Hy2ReceiveWindows;
 pub use hysteria2_adapter::{Hy2Adapter, Hy2HopInterval, Hy2Obfs, Hy2Options};
 
 #[cfg(feature = "vless")]

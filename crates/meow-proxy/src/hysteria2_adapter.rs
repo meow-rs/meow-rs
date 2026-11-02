@@ -56,6 +56,7 @@ pub struct Hy2Options {
     pub hop_interval: Option<Hy2HopInterval>,
     pub fingerprint: Option<String>,
     pub fast_open: bool,
+    pub windows: crate::hysteria2::ReceiveWindows,
 }
 
 impl Hy2Options {
@@ -125,6 +126,7 @@ impl Hy2Options {
             hop_interval_max_secs: hop_interval.max_secs,
             pin_sha256: self.fingerprint.unwrap_or_default(),
             fast_open: self.fast_open,
+            windows: self.windows,
         };
         Ok((addr, self.udp, cfg))
     }
@@ -486,6 +488,7 @@ mod tests {
             hop_interval: None,
             fingerprint: None,
             fast_open: true,
+            windows: Default::default(),
         }
     }
 

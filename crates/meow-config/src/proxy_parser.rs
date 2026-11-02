@@ -1451,6 +1451,18 @@ fn parse_hysteria2(
         .unwrap_or(true);
     validate_hy2_alpn(name, config.get("alpn"))?;
     reject_unsupported_hy2_options(name, config)?;
+    let window = |key: &str| {
+        config
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .filter(|&v| v > 0)
+    };
+    let windows = meow_proxy::Hy2ReceiveWindows {
+        initial_stream: window("initial-stream-receive-window"),
+        max_stream: window("max-stream-receive-window"),
+        initial_conn: window("initial-connection-receive-window"),
+        max_conn: window("max-connection-receive-window"),
+    };
 
     meow_proxy::Hy2Adapter::new(Hy2Options {
         name: name.to_string(),
@@ -1469,6 +1481,7 @@ fn parse_hysteria2(
             .map(|(min_secs, max_secs)| Hy2HopInterval { min_secs, max_secs }),
         fingerprint,
         fast_open,
+        windows,
     })
 }
 
@@ -1827,10 +1840,6 @@ fn reject_unsupported_hy2_options(
     reject_enabled_hy2_map(name, config, "realm-opts")?;
     reject_nonzero_hy2_option(name, config, "cwnd")?;
     reject_nonzero_hy2_option(name, config, "udp-mtu")?;
-    reject_nonzero_hy2_option(name, config, "initial-stream-receive-window")?;
-    reject_nonzero_hy2_option(name, config, "max-stream-receive-window")?;
-    reject_nonzero_hy2_option(name, config, "initial-connection-receive-window")?;
-    reject_nonzero_hy2_option(name, config, "max-connection-receive-window")?;
     if optional_nonempty_str(config, "bbr-profile").is_some() {
         return Err(format!(
             "hysteria2[{name}]: 'bbr-profile' is not supported by the Rust backend"
