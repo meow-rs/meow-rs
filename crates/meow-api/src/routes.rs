@@ -2960,6 +2960,12 @@ async fn spawn_tun_from_raw(
         "meow-tun".to_string(),
     )
     .with_readiness_signal(ready_tx);
+    match meow_config::sniffer_config_from_raw(raw) {
+        Ok(cfg) => {
+            listener = listener.with_sniffer(Arc::new(meow_listener::SnifferRuntime::new(cfg)));
+        }
+        Err(e) => warn!("tun: sniffer config ignored: {e}"),
+    }
     if let Some(binding) = binding {
         listener = listener.with_outbound_binding(binding);
     }

@@ -52,25 +52,7 @@ impl SnifferRuntime {
     /// failure, skip-domain discard) collapse to a silent no-op that leaves
     /// `metadata` unchanged.
     pub async fn sniff(&self, stream: &TcpStream, metadata: &mut Metadata) {
-        if !self.cfg.enable {
-            return;
-        }
-
-        // parse-pure-ip gate: skip if host is already a non-IP domain name,
-        // unless that domain is in the force list. The IP test is the same
-        // `metadata_ip_literal` the apply side uses — a `IpAddr::parse`
-        // check would miss bracketed IPv6 (`[::1]` reads as a "domain" and
-        // the destination would never be sniffed).
-        if self.cfg.parse_pure_ip
-            && !metadata.host.is_empty()
-            && meow_common::metadata_ip_literal(&metadata.host).is_none()
-            && self.force.search(&metadata.host).is_none()
-        {
-            return;
-        }
-
-        // Per-port protocol dispatch.
-        let Some(proto) = self.port_map.get(&metadata.dst_port) else {
+        let Some(proto) = self.wanted_proto(metadata) else {
             return;
         };
 
@@ -121,6 +103,43 @@ impl SnifferRuntime {
             Proto::Http => sniff_http(&buf[..n]),
         };
 
+        if let Some(host) = sniffed {
+            self.maybe_apply_sniff(&host, metadata);
+        }
+    }
+
+    /// The protocol to sniff `metadata`'s flow for, or `None` when the
+    /// sniffer is off, the flow already has a domain (`parse-pure-ip`), or
+    /// its port is not listed.
+    fn wanted_proto(&self, metadata: &Metadata) -> Option<&Proto> {
+        if !self.cfg.enable {
+            return None;
+        }
+        // parse-pure-ip gate: skip if host is already a non-IP domain name,
+        // unless that domain is in the force list. The IP test is the same
+        // `metadata_ip_literal` the apply side uses — a `IpAddr::parse`
+        // check would miss bracketed IPv6 (`[::1]` reads as a "domain" and
+        // the destination would never be sniffed).
+        if self.cfg.parse_pure_ip
+            && !metadata.host.is_empty()
+            && meow_common::metadata_ip_literal(&metadata.host).is_none()
+            && self.force.search(&metadata.host).is_none()
+        {
+            return None;
+        }
+        self.port_map.get(&metadata.dst_port)
+    }
+
+    /// [`Self::sniff`] over bytes the inbound already read (the TUN lwIP
+    /// path's sniff-window prefix).
+    pub fn sniff_bytes(&self, buf: &[u8], metadata: &mut Metadata) {
+        let Some(proto) = self.wanted_proto(metadata) else {
+            return;
+        };
+        let sniffed = match proto {
+            Proto::Tls => sniff_tls(buf),
+            Proto::Http => sniff_http(buf),
+        };
         if let Some(host) = sniffed {
             self.maybe_apply_sniff(&host, metadata);
         }

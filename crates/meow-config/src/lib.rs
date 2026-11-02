@@ -3270,6 +3270,12 @@ async fn load_rule_providers_async(
     .map_err(|e| anyhow::anyhow!("rule-provider load task failed: {e}"))?
 }
 
+/// The `sniffer:` block of a raw config (a TUN rebuilt on an API config
+/// change needs it).
+pub fn sniffer_config_from_raw(raw: &raw::RawConfig) -> Result<SnifferConfig, anyhow::Error> {
+    parse_sniffer_config(raw, raw.strict.unwrap_or(false))
+}
+
 fn parse_sniffer_config(
     raw: &raw::RawConfig,
     strict: bool,

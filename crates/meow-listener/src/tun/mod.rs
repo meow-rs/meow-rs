@@ -372,6 +372,9 @@ pub struct TunListener {
     /// Global-scope binding installed by the caller before this listener
     /// was built (see [`Self::with_outbound_binding`]).
     outbound_binding: Option<OutboundBinding>,
+    /// The top-level `sniffer:` (TLS SNI / HTTP Host), as mihomo applies it
+    /// to TUN flows too.
+    sniffer: Option<Arc<crate::sniffer::SnifferRuntime>>,
 }
 
 impl TunListener {
@@ -382,7 +385,16 @@ impl TunListener {
             name,
             ready: None,
             outbound_binding: None,
+            sniffer: None,
         }
+    }
+
+    /// Name TCP flows with the configured sniffer (ignored when disabled).
+    pub fn with_sniffer(mut self, sniffer: Arc<crate::sniffer::SnifferRuntime>) -> Self {
+        if sniffer.is_enabled() {
+            self.sniffer = Some(sniffer);
+        }
+        self
     }
 
     /// Hand over an [`OutboundBinding`] the caller installed early — the
@@ -1004,6 +1016,7 @@ impl TunListener {
                         let name = self.name.clone();
                         let sem = conn_limit.clone();
                         let warned = Arc::clone(&warned_saturated);
+                        let sniffer = self.sniffer.clone();
                         tasks.spawn(async move {
                             // lwIP only delivers this stream after the
                             // handshake. Sniff the client's first bytes for
@@ -1040,7 +1053,8 @@ impl TunListener {
                             let Ok(_permit) = flow_slot(sem, &warned, &name).await else {
                                 return;
                             };
-                            handle_tcp_flow(tunnel, stream, prefix, src, dst, &name).await;
+                            handle_tcp_flow(tunnel, stream, prefix, src, dst, &name, sniffer.as_deref())
+                                .await;
                         });
                     }
                     None => break Err("netstack TCP listener closed".into()),
@@ -1055,6 +1069,7 @@ impl TunListener {
                     Some((permit, stream, src, dst, guard)) => {
                         let tunnel = self.tunnel.clone();
                         let name = self.name.clone();
+                        let sniffer = self.sniffer.clone();
                         tasks.spawn(async move {
                             let _guard = guard;
                             // The same post-handshake window as the lwIP
@@ -1074,7 +1089,7 @@ impl TunListener {
                                 Ok(Ok(_)) | Err(_) => {}
                             }
                             let _permit = permit;
-                            let metadata = Metadata {
+                            let mut metadata = Metadata {
                                 network: Network::Tcp,
                                 conn_type: ConnType::Tun,
                                 src_ip: Some(src.ip()),
@@ -1084,6 +1099,9 @@ impl TunListener {
                                 in_name: name.as_str().into(),
                                 ..Default::default()
                             };
+                            if let Some(rt) = sniffer.as_deref() {
+                                rt.sniff(&stream, &mut metadata).await;
+                            }
                             meow_tunnel::tcp::handle_tcp_socket(tunnel.inner(), stream, metadata)
                                 .await;
                         });
@@ -1387,8 +1405,9 @@ async fn handle_tcp_flow(
     src: SocketAddr, // client behind the tun
     dst: SocketAddr, // original destination
     in_name: &str,
+    sniffer: Option<&crate::sniffer::SnifferRuntime>,
 ) {
-    let metadata = Metadata {
+    let mut metadata = Metadata {
         network: Network::Tcp,
         conn_type: ConnType::Tun,
         src_ip: Some(src.ip()),
@@ -1398,6 +1417,9 @@ async fn handle_tcp_flow(
         in_name: in_name.into(),
         ..Default::default()
     };
+    if let Some(rt) = sniffer {
+        rt.sniff_bytes(&prefix, &mut metadata);
+    }
 
     // handle_tcp does the rest: name sniff for an unmapped fake IP,
     // fake-IP rewrite, lazy rule match, stats guard, dial, zero-alloc
