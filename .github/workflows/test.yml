@@ -329,11 +329,11 @@ jobs:
       - name: YAML boundary contract tests (meow-config)
         run: cargo nextest run -p meow-config --test yaml_boundary_test --retries 2 --no-fail-fast
 
-      # `minimal` leaves out `logbook`, which every run above unifies on;
-      # `-p meow-common` alone builds the stub that stands in for it
-      # (`meow-common/src/logbook/disabled.rs`).
-      - name: Logbook stub tests (meow-common without logbook)
-        run: cargo nextest run -p meow-common --lib logbook --retries 2 --no-fail-fast
+      # `minimal` leaves out `logbook` and `traffic-ledger`, which every run
+      # above unifies on; `-p meow-common` alone builds the stubs that stand
+      # in for them (`meow-common/src/{logbook,traffic_ledger}/disabled.rs`).
+      - name: Logbook and traffic ledger stub tests (meow-common without them)
+        run: cargo nextest run -p meow-common --lib logbook traffic_ledger --retries 2 --no-fail-fast
 
       - name: UDP routing regression (SOCKS5, Shadowsocks, TUN)
         run: cargo nextest run -p meow-listener --all-features --lib udp_port_53 --retries 2 --no-fail-fast

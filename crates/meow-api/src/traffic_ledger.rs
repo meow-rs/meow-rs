@@ -53,6 +53,13 @@ pub(crate) async fn get_ledger(Query(params): Query<LedgerParams>) -> Response {
         (Ok(from), Ok(to)) => (from, to),
         (Err(message), _) | (_, Err(message)) => return bad_request(&message),
     };
+    if from > to {
+        return bad_request(&format!(
+            "from {} is after to {}",
+            traffic_ledger::date_of_day(from),
+            traffic_ledger::date_of_day(to)
+        ));
+    }
     let by = match params.by.as_deref().map(str::parse::<GroupBy>).transpose() {
         Ok(by) => by.unwrap_or_default(),
         Err(message) => return bad_request(&message),
@@ -97,8 +104,19 @@ pub(crate) async fn get_ledger(Query(params): Query<LedgerParams>) -> Response {
     }
 }
 
-/// `DELETE /traffic/ledger`: delete everything the ledger holds.
-pub(crate) async fn clear_ledger() -> StatusCode {
-    let _ = tokio::task::spawn_blocking(traffic_ledger::clear).await;
-    StatusCode::NO_CONTENT
+/// `DELETE /traffic/ledger`: delete everything the ledger holds, on disk
+/// too while `traffic-ledger.enable` is off.
+pub(crate) async fn clear_ledger() -> Response {
+    let failed = |e: &dyn std::fmt::Display| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "message": format!("traffic ledger clear failed: {e}") })),
+        )
+            .into_response()
+    };
+    match tokio::task::spawn_blocking(traffic_ledger::clear).await {
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(e)) => failed(&e),
+        Err(e) => failed(&e),
+    }
 }

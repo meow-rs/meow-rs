@@ -3,11 +3,11 @@
 //!
 //! [`crate::traffic`] counts what each proxy carried since the engine
 //! started and forgets it at a stop. The ledger keeps, for every local day,
-//! the bytes sent and received and the connections (and UDP flows) opened
-//! per registrable domain, leaf proxy and interface label, for
-//! [`RETENTION_DAYS`] — enough for a client to show today, this month and
-//! last month, grouped any of the three ways. A meow extension; mihomo has
-//! no equivalent.
+//! the bytes sent and received and the connections opened (and UDP flows
+//! that sent something) per registrable domain, leaf proxy and interface
+//! label, for [`RETENTION_DAYS`] — enough for a client to show today, this
+//! month and last month, grouped any of the three ways. A meow extension;
+//! mihomo has no equivalent.
 //!
 //! Unlike the logbook (ADR-0014), the ledger records destinations: with
 //! hosts on, it is a coarse browsing history (registrable domains, no
@@ -41,7 +41,7 @@ mod store;
 
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -186,12 +186,17 @@ impl TimeZone {
         i32::try_from(local.div_euclid(86_400)).unwrap_or(i32::MAX)
     }
 
-    /// The Unix second the local day after `unix`'s begins. A change of
-    /// offset inside the day moves it by at most the change.
+    /// The Unix second the local day after `unix`'s begins: midnight on the
+    /// offset in force then, or the change of offset itself when it skips
+    /// past midnight (a zone that springs forward at 00:00).
     #[cfg_attr(not(feature = "traffic-ledger"), allow(dead_code))]
     fn next_midnight(&self, unix: i64) -> i64 {
         let start = (i64::from(self.day(unix)) + 1) * 86_400;
-        start - i64::from(self.offset_at(start - i64::from(self.offset_at(unix))))
+        let midnight = start - i64::from(self.offset_at(unix));
+        match self.next {
+            Some((at, offset)) if at <= midnight => (start - i64::from(offset)).max(at),
+            _ => midnight,
+        }
     }
 }
 
@@ -275,15 +280,29 @@ pub fn add(host: &SmolStr, policy: &Arc<str>, upload: u64, download: u64, reques
     if !enabled() || (upload == 0 && download == 0 && requests == 0) {
         return;
     }
-    let mut pending = PENDING.lock().unwrap_or_else(PoisonError::into_inner);
-    let counts = pending
-        .get_or_insert_with(HashMap::new)
-        .entry((host.clone(), Arc::clone(policy)))
-        .or_default();
-    counts.upload = counts.upload.saturating_add(upload);
-    counts.download = counts.download.saturating_add(download);
-    counts.requests = counts.requests.saturating_add(requests);
+    let held = {
+        let mut pending = PENDING.lock().unwrap_or_else(PoisonError::into_inner);
+        let pending = pending.get_or_insert_with(HashMap::new);
+        let counts = pending
+            .entry((host.clone(), Arc::clone(policy)))
+            .or_default();
+        counts.upload = counts.upload.saturating_add(upload);
+        counts.download = counts.download.saturating_add(download);
+        counts.requests = counts.requests.saturating_add(requests);
+        pending.len()
+    };
+    if held == EARLY_FLUSH {
+        if let Some(ledger) = current() {
+            ledger.nudge();
+        }
+    }
 }
+
+/// Distinct hosts and policies pending at which the writer is asked for a
+/// flush ahead of [`FLUSH_INTERVAL`]: a burst of flows to distinct hosts (a
+/// scan) does not hold more in memory than this, give or take what arrives
+/// while the flush runs.
+const EARLY_FLUSH: usize = 4096;
 
 /// Take what is pending, after asking every live [`Source`] to settle.
 fn take_pending() -> Pending {
@@ -310,10 +329,15 @@ pub fn register(source: Weak<dyn Source>) {
         .push(source);
 }
 
+/// Held across a change of [`INTERFACE`] or [`ZONE`] and the flush before
+/// it, so a change racing another cannot be lost to it.
+static CHANGING: Mutex<()> = Mutex::new(());
+
 /// Set the label the platform gives the network the engine's traffic goes
 /// out on (`Wi-Fi`, `Cellular`, `en0`). What was counted under the previous
 /// label is written under it first. Kept across installs.
 pub fn set_interface(label: &str) {
+    let _changing = CHANGING.lock().unwrap_or_else(PoisonError::into_inner);
     if *INTERFACE.lock().unwrap_or_else(PoisonError::into_inner) == label {
         return;
     }
@@ -332,10 +356,23 @@ fn interface() -> SmolStr {
 }
 
 /// Set the device's time zone, which decides the day traffic is written
-/// under; UTC until set. An embedder sets it at start and whenever the zone
-/// changes.
+/// under; UTC until set. An embedder sets it before it starts the engine
+/// and whenever the zone changes. What was counted is written under the
+/// previous zone's day first, and the writer then waits for the new zone's
+/// midnight.
 pub fn set_time_zone(zone: TimeZone) {
+    let _changing = CHANGING.lock().unwrap_or_else(PoisonError::into_inner);
+    if *ZONE.lock().unwrap_or_else(PoisonError::into_inner) == zone {
+        return;
+    }
+    let ledger = current();
+    if let Some(ledger) = &ledger {
+        ledger.flush();
+    }
     *ZONE.lock().unwrap_or_else(PoisonError::into_inner) = zone;
+    if let Some(ledger) = &ledger {
+        ledger.flush();
+    }
 }
 
 fn zone() -> TimeZone {
@@ -365,6 +402,12 @@ pub fn install(dir: &Path, options: Options) -> io::Result<()> {
         return Ok(());
     }
     let ledger = Arc::new(Ledger::open(dir)?);
+    if !enabled() {
+        // Flows that outlived an earlier ledger carried traffic while none
+        // recorded; settling them now (into nothing, as `add` is off) keeps
+        // it out of this one.
+        drop(take_pending());
+    }
     let previous = CURRENT
         .write()
         .unwrap_or_else(PoisonError::into_inner)
@@ -408,11 +451,20 @@ pub fn query(query: &Query) -> Option<io::Result<Report>> {
     Some(current()?.query(query))
 }
 
-/// Delete everything the installed ledger holds, and what is pending.
-/// Waits on the disk.
-pub fn clear() {
-    if let Some(ledger) = current() {
-        ledger.clear();
+/// Delete everything the installed ledger holds, and what is pending; with
+/// none installed, the database a process that called [`apply`] keeps
+/// under the meow home, as a config that turned the ledger off leaves it
+/// on disk. Waits on the disk.
+pub fn clear() -> io::Result<()> {
+    match current() {
+        Some(ledger) => ledger.clear(),
+        None if MANAGED.load(Ordering::Relaxed) => {
+            match clear_at(&crate::resolved_home_dir().join(DIR_NAME)) {
+                Err(e) if e.kind() == io::ErrorKind::Unsupported => Ok(()),
+                result => result,
+            }
+        }
+        None => Ok(()),
     }
 }
 
@@ -477,10 +529,28 @@ struct Batch {
 
 #[cfg_attr(not(feature = "traffic-ledger"), allow(dead_code))]
 impl Batch {
+    /// What is pending, keyed for the rows. With hosts off, no host is kept,
+    /// even one a flow opened before they were turned off counted. A batch
+    /// keeps at most [`MAX_IP_HOSTS`] addresses itself, so batches a failing
+    /// disk holds for a retry stay small.
     fn take(day: i32) -> Self {
+        let hosts = hosts();
+        let mut ips = HashSet::new();
         let mut rows: HashMap<(String, Arc<str>), Counts> = HashMap::new();
         for ((host, policy), counts) in take_pending() {
-            let row = rows.entry((host_key(&host), policy)).or_default();
+            let mut host = if hosts {
+                host_key(&host)
+            } else {
+                String::new()
+            };
+            if host.parse::<std::net::IpAddr>().is_ok() && !ips.contains(&host) {
+                if ips.len() < MAX_IP_HOSTS {
+                    ips.insert(host.clone());
+                } else {
+                    host = OTHER_IPS.to_owned();
+                }
+            }
+            let row = rows.entry((host, policy)).or_default();
             row.upload = row.upload.saturating_add(counts.upload);
             row.download = row.download.saturating_add(counts.download);
             row.requests = row.requests.saturating_add(counts.requests);
@@ -493,14 +563,19 @@ impl Batch {
     }
 }
 
-/// The host a row keeps: an IP address as it is, a domain as its
-/// registrable domain (`www.example.co.uk` → `example.co.uk`), lowercased
-/// and without a trailing dot. A name with no registrable domain
-/// (`localhost`, a bare public suffix) stays whole.
+/// The host a row keeps: an IP address in its canonical form (no
+/// brackets, lowercase, shortest IPv6), a domain as its registrable domain
+/// (`www.example.co.uk` → `example.co.uk`), lowercased and without a
+/// trailing dot. A name with no registrable domain (`localhost`, a bare
+/// public suffix) stays whole.
 fn host_key(host: &str) -> String {
     let host = host.strip_suffix('.').unwrap_or(host);
-    if host.parse::<std::net::IpAddr>().is_ok() {
-        return host.to_owned();
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        return ip.to_string();
     }
     let lower = host.to_ascii_lowercase();
     match registrable_domain(&lower) {
@@ -568,10 +643,60 @@ mod tests {
         assert_eq!(pacific.next_midnight(unix), 1_793_606_400);
     }
 
+    /// Every second up to the midnight reported falls on the same day, and
+    /// that midnight starts the next one.
+    fn assert_midnight(zone: TimeZone, unix: i64) {
+        let midnight = zone.next_midnight(unix);
+        assert!(
+            midnight > unix,
+            "{zone:?} at {unix}: {midnight} is not ahead"
+        );
+        assert_eq!(zone.day(midnight - 1), zone.day(unix), "{zone:?} at {unix}");
+        assert!(zone.day(midnight) > zone.day(unix), "{zone:?} at {unix}");
+    }
+
+    #[test]
+    fn midnight_is_ahead_across_a_change_of_offset() {
+        // 00:00 → 01:00 at midnight (Havana, Santiago, Beirut, Cairo): the
+        // change starts the day; midnight on the new offset is already past.
+        let forward = TimeZone {
+            offset: 0,
+            next: Some((86_400, 3600)),
+        };
+        assert_eq!(forward.next_midnight(84_600), 86_400);
+        // 00:00 → 23:00 the evening before: the day runs 25 hours.
+        let back = TimeZone {
+            offset: 3600,
+            next: Some((86_400 - 3600, 0)),
+        };
+        assert_eq!(back.next_midnight(84_600 - 3600), 86_400);
+        for zone in [
+            forward,
+            back,
+            TimeZone {
+                offset: -7 * 3600,
+                next: Some((1_793_523_600, -8 * 3600)),
+            },
+            TimeZone {
+                offset: 8 * 3600,
+                next: None,
+            },
+        ] {
+            for unix in (0..4 * 86_400).step_by(900) {
+                assert_midnight(zone, unix);
+            }
+            for unix in (1_793_400_000..1_793_800_000).step_by(900) {
+                assert_midnight(zone, unix);
+            }
+        }
+    }
+
     #[test]
     fn hosts_reduce_to_registrable_domains() {
         assert_eq!(host_key("192.0.2.1"), "192.0.2.1");
         assert_eq!(host_key("2001:db8::1"), "2001:db8::1");
+        assert_eq!(host_key("2001:0DB8:0::1"), "2001:db8::1");
+        assert_eq!(host_key("[2001:db8::1]"), "2001:db8::1");
         assert_eq!(host_key("localhost"), "localhost");
         assert_eq!(host_key(""), "");
         #[cfg(feature = "traffic-ledger")]

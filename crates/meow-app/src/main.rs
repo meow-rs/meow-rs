@@ -374,6 +374,9 @@ fn run_application(
         meow_common::logbook::engine_stopped(meow_common::logbook::Stop::Failed(&format!(
             "{error:#}"
         )));
+        // The ledger opened at startup; a run that failed later still
+        // writes out what it counted and lets the directory go.
+        meow_common::traffic_ledger::uninstall();
     }
     drop(logging);
     result

@@ -147,10 +147,11 @@ cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo clippy --all-targets --no-default-features -- -D warnings
 cargo clippy --all-targets --all-features -- -D warnings
-# `minimal` leaves out `logbook`, which every run above unifies on; its
-# stub (`logbook/disabled.rs`) only compiles here.
+# `minimal` leaves out `logbook` and `traffic-ledger`, which every run above
+# unifies on; their stubs (`logbook/disabled.rs`, `traffic_ledger/disabled.rs`)
+# only compile here.
 cargo clippy -p meow-common --all-targets -- -D warnings
-cargo test -p meow-common --lib logbook
+cargo test -p meow-common --lib -- logbook traffic_ledger
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 cargo test -p meow-listener --all-features --lib udp_port_53
 # The `anytls` feature is opt-in in meow-proxy — the adapter's uot/desync

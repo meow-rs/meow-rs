@@ -2,15 +2,15 @@
 //! the tunnel counted to an SQLite database.
 
 use super::{
-    date_of_day, unix_now, zone, Batch, GroupBy, Query, Report, Row, MAX_IP_HOSTS, OTHER_IPS,
-    RETENTION_DAYS,
+    date_of_day, unix_now, zone, Batch, GroupBy, Query, Report, Row, TimeZone, MAX_IP_HOSTS,
+    OTHER_IPS, RETENTION_DAYS,
 };
 use rusqlite::{params, Connection, ErrorCode, OpenFlags};
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use tracing::warn;
@@ -60,8 +60,15 @@ ON CONFLICT (day, host, policy, interface) DO UPDATE SET
     requests = requests + excluded.requests
 ";
 
-/// How long a flush or a query waits for the writer.
+/// How long a flush, a query or a clear waits for the writer, queueing
+/// included.
 const WAIT: Duration = Duration::from_secs(5);
+
+/// How late past midnight a flush still files what is pending under the
+/// day that ended: the writer wakes at midnight, give or take its timers.
+/// Later, the clock jumped (a resume from sleep, a clock set at boot) and
+/// the pending traffic goes under today.
+const LATE_FLUSH: i64 = 2 * super::FLUSH_INTERVAL.as_secs() as i64;
 
 /// How long a connection waits for a lock held by another.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(1);
@@ -81,7 +88,7 @@ pub struct Ledger {
 enum Op {
     Flush(SyncSender<()>),
     Query(Box<Query>, SyncSender<io::Result<Report>>),
-    Clear(SyncSender<()>),
+    Clear(SyncSender<io::Result<()>>),
 }
 
 impl Ledger {
@@ -117,14 +124,15 @@ impl Ledger {
             }
             Err(Unusable::Failed(e)) => return Err(e),
         };
-        let mut writer = Writer {
+        let writer = Writer {
             conn,
             pruned: i32::MIN,
             ip_hosts: None,
             backlog: Vec::new(),
             failing: false,
         };
-        writer.prune(zone().day(unix_now()));
+        // Expired days go at the first flush, by when the embedder has set
+        // the time zone.
         let (tx, rx) = mpsc::sync_channel(16);
         let thread = std::thread::Builder::new()
             .name("meow-traffic".into())
@@ -143,32 +151,65 @@ impl Ledger {
 
     /// Write out what is pending, waiting at most [`WAIT`].
     pub fn flush(&self) {
+        let deadline = Instant::now() + WAIT;
         let (ack, done) = mpsc::sync_channel(1);
-        if self.send(Op::Flush(ack)) {
-            let _ = done.recv_timeout(WAIT);
+        if self.send_by(Op::Flush(ack), deadline).is_ok() {
+            let _ = done.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+        }
+    }
+
+    /// Ask the writer for a flush without waiting for it, unless one is
+    /// queued already.
+    pub fn nudge(&self) {
+        let (ack, _done) = mpsc::sync_channel(1);
+        if let Some(tx) = &self.tx {
+            let _ = tx.try_send(Op::Flush(ack));
         }
     }
 
     pub fn query(&self, query: &Query) -> io::Result<Report> {
+        let deadline = Instant::now() + WAIT;
         let (reply, answer) = mpsc::sync_channel(1);
-        if !self.send(Op::Query(Box::new(query.clone()), reply)) {
-            return Err(io::Error::other("the traffic ledger writer stopped"));
-        }
+        self.send_by(Op::Query(Box::new(query.clone()), reply), deadline)?;
         answer
-            .recv_timeout(WAIT)
-            .unwrap_or_else(|_| Err(io::Error::new(io::ErrorKind::TimedOut, "busy")))
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or_else(|_| Err(busy()))
     }
 
-    pub fn clear(&self) {
+    pub fn clear(&self) -> io::Result<()> {
+        let deadline = Instant::now() + WAIT;
         let (ack, done) = mpsc::sync_channel(1);
-        if self.send(Op::Clear(ack)) {
-            let _ = done.recv_timeout(WAIT);
+        self.send_by(Op::Clear(ack), deadline)?;
+        done.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or_else(|_| Err(busy()))
+    }
+
+    /// Queue `op` for the writer, waiting for room until `deadline`: a
+    /// writer stuck on the disk never blocks the caller for longer.
+    fn send_by(&self, mut op: Op, deadline: Instant) -> io::Result<()> {
+        let Some(tx) = &self.tx else {
+            return Err(stopped());
+        };
+        loop {
+            match tx.try_send(op) {
+                Ok(()) => return Ok(()),
+                Err(TrySendError::Full(back)) if Instant::now() < deadline => {
+                    op = back;
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(TrySendError::Full(_)) => return Err(busy()),
+                Err(TrySendError::Disconnected(_)) => return Err(stopped()),
+            }
         }
     }
+}
 
-    fn send(&self, op: Op) -> bool {
-        self.tx.as_ref().is_some_and(|tx| tx.send(op).is_ok())
-    }
+fn busy() -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, "the traffic ledger is busy")
+}
+
+fn stopped() -> io::Error {
+    io::Error::other("the traffic ledger writer stopped")
 }
 
 impl Drop for Ledger {
@@ -214,11 +255,12 @@ impl Writer {
                 Ok(Op::Clear(ack)) => {
                     drop(super::take_pending());
                     self.backlog.clear();
-                    if let Err(e) = clear(&self.conn) {
-                        warn!("traffic ledger: cannot clear: {e}");
-                    }
                     self.ip_hosts = None;
-                    let _ = ack.send(());
+                    let result = clear(&self.conn).map_err(|e| {
+                        warn!("traffic ledger: cannot clear: {e}");
+                        io::Error::other(e)
+                    });
+                    let _ = ack.send(result);
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     self.flush(&mut day_end);
@@ -233,12 +275,11 @@ impl Writer {
     }
 
     /// Take what is pending and commit it, with what failed before, under
-    /// today — or under the day that ended at `day_end`, for a flush that
-    /// comes late for it: what is pending was counted before it ended.
+    /// the day [`flush_day`] picks.
     fn flush(&mut self, day_end: &mut i64) {
         let now = unix_now();
         let zone = zone();
-        let day = zone.day(now.min(*day_end - 1));
+        let day = flush_day(zone, now, *day_end);
         *day_end = zone.next_midnight(now);
         let batch = Batch::take(day);
         if !batch.rows.is_empty() {
@@ -300,6 +341,17 @@ impl Writer {
     }
 }
 
+/// The day a flush at `now` files what is pending under: today, or the
+/// day that ended at `day_end` for a flush that comes up to [`LATE_FLUSH`]
+/// late for it, as what is pending was counted before it ended.
+fn flush_day(zone: TimeZone, now: i64, day_end: i64) -> i32 {
+    if (0..=LATE_FLUSH).contains(&(now - day_end)) {
+        zone.day(day_end - 1)
+    } else {
+        zone.day(now)
+    }
+}
+
 /// `host`, or [`OTHER_IPS`] for an IP address past `day`'s
 /// [`MAX_IP_HOSTS`].
 fn cap_ip_host<'a>(
@@ -343,7 +395,9 @@ fn prune(conn: &Connection, today: i32) -> rusqlite::Result<()> {
 
 fn clear(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute("DELETE FROM traffic", [])?;
-    vacuum(conn)
+    vacuum(conn)?;
+    // The deleted hosts leave the write-ahead log too.
+    conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
 }
 
 /// Hand the free pages back to the file system.
@@ -515,9 +569,13 @@ fn connect(path: &Path) -> Result<Connection, Unusable> {
     Ok(conn)
 }
 
-/// The database's `user_version`; one from a newer meow is an error.
+/// The database's `user_version`; one from a newer meow is an error, and
+/// one no meow writes marks a database that is not the ledger's.
 fn schema_version(conn: &Connection) -> Result<i64, Unusable> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version < 0 {
+        return Err(Unusable::Damaged(format!("unknown schema {version}")));
+    }
     if version > SCHEMA_VERSION {
         return Err(Unusable::Failed(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -637,7 +695,12 @@ mod tests {
         let names: Vec<_> = read.rows.iter().map(|row| row.name.as_str()).collect();
         assert_eq!(names, ["Node A", "DIRECT"]);
 
-        ledger::clear();
+        ledger::clear().unwrap();
+        // The deleted hosts are not left in the write-ahead log.
+        assert_eq!(
+            fs::metadata(dir.join("traffic.db-wal")).map_or(0, |m| m.len()),
+            0
+        );
         assert!(ledger::query(&query(GroupBy::Host))
             .unwrap()
             .unwrap()
@@ -733,6 +796,58 @@ mod tests {
             "192.0.2.9"
         );
         drop(conn);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hosts_off_keeps_no_host_counted_before() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = dir("hosts-off");
+        ledger::install(&dir, Options::default()).unwrap();
+        let proxy: Arc<str> = Arc::from("Node A");
+        // Counted by a flow that opened with hosts on, settled after they
+        // went off.
+        add(&SmolStr::new("www.example.com"), &proxy, 1, 2, 1);
+        ledger::install(&dir, Options { hosts: false }).unwrap();
+        let report = ledger::query(&query(GroupBy::Host)).unwrap().unwrap();
+        let names: Vec<_> = report.rows.iter().map(|row| row.name.as_str()).collect();
+        assert_eq!(names, [""]);
+        ledger::uninstall();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_late_flush_files_under_the_day_that_ended_unless_the_clock_jumped() {
+        let zone = TimeZone::default();
+        let midnight = 20_000 * 86_400;
+        assert_eq!(flush_day(zone, midnight - 30, midnight), 19_999);
+        assert_eq!(flush_day(zone, midnight + 1, midnight), 19_999);
+        assert_eq!(flush_day(zone, midnight + LATE_FLUSH, midnight), 19_999);
+        // A resume the next morning, a clock set from 1970 at boot.
+        assert_eq!(flush_day(zone, midnight + 9 * 3600, midnight), 20_000);
+        assert_eq!(flush_day(zone, midnight, 86_400), 20_000);
+        // A clock set back.
+        assert_eq!(flush_day(zone, midnight - 86_400 - 1, midnight), 19_998);
+    }
+
+    #[test]
+    fn a_database_of_no_known_schema_is_set_aside() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = dir("schema");
+        fs::create_dir_all(&dir).unwrap();
+        let conn = Connection::open(dir.join(DB_FILE)).unwrap();
+        conn.pragma_update(None, "user_version", -1).unwrap();
+        drop(conn);
+        ledger::install(&dir, Options::default()).unwrap();
+        assert!(dir.join(CORRUPT_FILE).exists());
+        add(&SmolStr::new("example.com"), &Arc::from("DIRECT"), 1, 1, 1);
+        let report = ledger::query(&query(GroupBy::Host)).unwrap().unwrap();
+        assert_eq!(report.requests, 1);
+        ledger::uninstall();
         let _ = fs::remove_dir_all(&dir);
     }
 }

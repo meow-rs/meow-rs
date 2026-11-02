@@ -7444,6 +7444,11 @@ async fn traffic_ledger_groups_drills_and_clears() {
         get("/traffic/ledger?by=port").await.status(),
         StatusCode::BAD_REQUEST
     );
+    // Only `to`, before today: `from` (today) comes after it.
+    assert_eq!(
+        get("/traffic/ledger?to=2026-01-01").await.status(),
+        StatusCode::BAD_REQUEST
+    );
 
     let resp = app
         .clone()

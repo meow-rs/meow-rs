@@ -41,7 +41,11 @@ impl Ledger {
         match *self {}
     }
 
-    pub fn clear(&self) {
+    pub fn nudge(&self) {
+        match *self {}
+    }
+
+    pub fn clear(&self) -> io::Result<()> {
         match *self {}
     }
 }
@@ -61,7 +65,7 @@ mod tests {
         assert!(traffic_ledger::query(&Query::default()).is_none());
         let error = traffic_ledger::read(&dir, &Query::default()).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Unsupported);
-        traffic_ledger::clear();
+        traffic_ledger::clear().unwrap();
         traffic_ledger::flush();
         traffic_ledger::uninstall();
     }

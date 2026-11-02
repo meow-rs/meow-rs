@@ -127,21 +127,29 @@ impl LedgerTag {
     }
 }
 
-/// What `count` gained since `settled`, marking it settled. Racing
-/// settlers each take a disjoint part.
-fn unsettled(count: &AtomicI, settled: &AtomicI) -> u64 {
+/// What `count` gained since `settled`, marking it settled, and whether
+/// this is the settle that took its first bytes. Racing settlers each take
+/// a disjoint part; one alone takes the first bytes.
+fn unsettled(count: &AtomicI, settled: &AtomicI) -> (u64, bool) {
     let now = count.load(Ordering::Relaxed);
     let before = settled.fetch_max(now, Ordering::Relaxed);
-    u64::try_from(now.saturating_sub(before)).unwrap_or(0)
+    (
+        u64::try_from(now.saturating_sub(before)).unwrap_or(0),
+        before == 0 && now > 0,
+    )
 }
 
 impl ConnCounters {
+    /// A connection is a request in the ledger as it opens; a UDP flow
+    /// (`!opened`) once it sends, at [`Self::settle_udp_ledger`], so a dial
+    /// that lost the race for its NAT entry, or was flushed, is none.
     fn new(
         notes: Option<ConnNotes>,
         proxy: Option<Arc<ProxyTraffic>>,
         ledger: Option<LedgerTag>,
+        opened: bool,
     ) -> Self {
-        if let Some(tag) = &ledger {
+        if let Some(tag) = ledger.as_ref().filter(|_| opened) {
             traffic_ledger::add(&tag.host, &tag.policy, 0, 0, 1);
         }
         Self {
@@ -155,12 +163,24 @@ impl ConnCounters {
         }
     }
 
-    /// Hand the traffic ledger what this flow carried since it last did.
+    /// Hand the traffic ledger what this connection carried since it last
+    /// did.
     fn settle_ledger(&self) {
+        self.settle(false);
+    }
+
+    /// [`Self::settle_ledger`] for a UDP flow, which becomes a request
+    /// with its first bytes sent.
+    fn settle_udp_ledger(&self) {
+        self.settle(true);
+    }
+
+    fn settle(&self, udp: bool) {
         if let Some(tag) = &self.ledger {
-            let upload = unsettled(&self.upload, &tag.settled_upload);
-            let download = unsettled(&self.download, &tag.settled_download);
-            traffic_ledger::add(&tag.host, &tag.policy, upload, download, 0);
+            let (upload, sent) = unsettled(&self.upload, &tag.settled_upload);
+            let (download, _) = unsettled(&self.download, &tag.settled_download);
+            let requests = u64::from(udp && sent);
+            traffic_ledger::add(&tag.host, &tag.policy, upload, download, requests);
         }
     }
 
@@ -423,7 +443,7 @@ impl Statistics {
         let proxy = self.proxy_counters(leaf);
         let ledger = LedgerTag::new(metadata, || Some(self.proxy_name(leaf)));
         let filed = ledger.is_some();
-        let counters = Arc::new(ConnCounters::new(None, proxy, ledger));
+        let counters = Arc::new(ConnCounters::new(None, proxy, ledger, false));
         if filed {
             self.udp_flows
                 .insert(Arc::as_ptr(&counters).addr(), Arc::clone(&counters));
@@ -434,7 +454,7 @@ impl Statistics {
     /// See [`Self::begin_udp_flow`].
     pub(crate) fn end_udp_flow(&self, counters: &Arc<ConnCounters>) {
         self.udp_flows.remove(&Arc::as_ptr(counters).addr());
-        counters.settle_ledger();
+        counters.settle_udp_ledger();
     }
 
     /// Every proxy that carried a flow, with its `(upload, download)` bytes
@@ -518,6 +538,7 @@ impl Statistics {
             notes,
             chains.first().and_then(|leaf| self.proxy_counters(leaf)),
             ledger,
+            true,
         ));
         let info = ConnectionInfo {
             id: uuid,
@@ -551,7 +572,7 @@ impl Statistics {
         ledger: impl FnOnce() -> Option<LedgerTag>,
     ) -> Option<Arc<ConnCounters>> {
         let connections = self.headless_connections.get()?;
-        let counters = Arc::new(ConnCounters::new(None, None, ledger()));
+        let counters = Arc::new(ConnCounters::new(None, None, ledger(), true));
         // The guard pins this allocation until after its Drop unregisters it.
         // Even after a reload drains the map, a stale guard keeps its address
         // from being reused by a new connection. The address is only a private
@@ -735,7 +756,7 @@ impl traffic_ledger::Source for Statistics {
             }
         }
         for entry in &self.udp_flows {
-            entry.value().settle_ledger();
+            entry.value().settle_udp_ledger();
         }
     }
 }
@@ -855,9 +876,22 @@ mod ledger_tests {
             ..Metadata::default()
         };
         let flow = stats.begin_udp_flow("DIRECT", &udp);
-        stats.record_upload(&flow, 7);
+        stats.record_upload(&flow, 4);
+        // A UDP flow is one request however often it settles.
+        assert_eq!(report("198.51.100.7", GroupBy::Host).requests, 1);
+        stats.record_upload(&flow, 3);
         stats.end_udp_flow(&flow);
         drop(flow);
+        // One that never sent (a dial that lost the race for its NAT entry)
+        // is none.
+        let idle = Metadata {
+            dst_ip: Some("198.51.100.8".parse().unwrap()),
+            ..Metadata::default()
+        };
+        let lost = stats.begin_udp_flow("DIRECT", &idle);
+        stats.end_udp_flow(&lost);
+        drop(lost);
+        assert!(report("198.51.100.8", GroupBy::Host).rows.is_empty());
 
         let tcp = report("ledger-test.example", GroupBy::Host);
         assert_eq!((tcp.upload, tcp.download, tcp.requests), (100, 1024, 1));

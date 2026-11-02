@@ -3141,7 +3141,11 @@ async fn swap_config_and_reconcile_tun(
         )
     };
     logbook::reconfigure(logbook_enable);
-    meow_common::traffic_ledger::reconfigure(ledger.0, ledger.1);
+    // Opening or closing the ledger waits on its database.
+    let _ = tokio::task::spawn_blocking(move || {
+        meow_common::traffic_ledger::reconfigure(ledger.0, ledger.1);
+    })
+    .await;
 
     if let Some(new_log_level) = new_log_level {
         let level = new_log_level.as_deref().unwrap_or("info");
