@@ -52,6 +52,9 @@ const MAX_FLOWS: usize = 1024;
 /// tasks here (issue #515).
 const HIJACK_IN_FLIGHT: usize = 64;
 
+/// Most client datagrams a QUIC sniff holds back before routing the flow.
+const QUIC_SNIFF_PACKETS: usize = 4;
+
 /// Sweep dead flow-table entries every this many datagrams.
 const SWEEP_INTERVAL: u32 = 256;
 
@@ -191,6 +194,10 @@ impl Drop for FlowTable {
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the listener's UDP knobs, passed once"
+)]
 pub(super) async fn run_udp(
     tunnel: Tunnel,
     io: UdpIo,
@@ -199,6 +206,7 @@ pub(super) async fn run_udp(
     in_name: String,
     tun_net: TunNets,
     live_flows: Arc<AtomicUsize>,
+    sniffer: Option<Arc<crate::sniffer::SnifferRuntime>>,
 ) {
     let (reply_tx, mut incoming) = match io {
         UdpIo::Lwip(socket) => {
@@ -384,6 +392,7 @@ pub(super) async fn run_udp(
                 udp_timeout,
                 in_name: in_name.clone(),
                 last_activity,
+                sniffer: sniffer.clone(),
             },
         ));
     }
@@ -400,6 +409,9 @@ struct FlowSpec {
     udp_timeout: Duration,
     in_name: String,
     last_activity: Arc<AtomicU64>,
+    /// The configured sniffer; its QUIC ports name a flow from the
+    /// client's Initials before it is routed.
+    sniffer: Option<Arc<crate::sniffer::SnifferRuntime>>,
 }
 
 /// Count a dropped hijack response and warn on a power-of-two cadence so
@@ -457,6 +469,7 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
         udp_timeout,
         in_name,
         last_activity,
+        sniffer,
     } = spec;
     let mut metadata = Metadata {
         network: Network::Udp,
@@ -468,6 +481,30 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
         in_name: in_name.into(),
         ..Default::default()
     };
+
+    // QUIC sniff: hold the first datagrams until their Initials yield the
+    // server name, at most `sniffer.timeout` and a few packets; they are
+    // sent upstream first once the flow is dialed.
+    let mut held: Vec<Vec<u8>> = Vec::new();
+    if let Some(rt) = sniffer.as_deref().filter(|rt| rt.wants_quic(&metadata)) {
+        let deadline = Instant::now() + rt.timeout();
+        let mut quic = crate::sniffer_quic::QuicSniffer::default();
+        while held.len() < QUIC_SNIFF_PACKETS {
+            let Ok(Some(data)) = tokio::time::timeout_at(deadline, rx.recv()).await else {
+                break;
+            };
+            let step = quic.feed(&data);
+            held.push(data);
+            match step {
+                crate::sniffer_quic::QuicSniffStep::Name(name) => {
+                    rt.maybe_apply_sniff(&name, &mut metadata);
+                    break;
+                }
+                crate::sniffer_quic::QuicSniffStep::More => {}
+                crate::sniffer_quic::QuicSniffStep::Done => break,
+            }
+        }
+    }
 
     let inner = tunnel.inner();
     if matches!(
@@ -553,6 +590,12 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
     // replies, and the idle deadline. Reply source addresses are not
     // rewritten: the tun flow is locked to one (src, dst) tuple, so every
     // reply is delivered as coming from `dst`.
+    for data in held {
+        conn.write_packet(&data, &dst_addr)
+            .await
+            .map_err(|e| format!("upstream write {dst_addr}: {e}"))?;
+    }
+
     let idle = sleep_until(next_deadline(udp_timeout));
     tokio::pin!(idle);
     let result = loop {
@@ -913,6 +956,7 @@ mod tests {
                     udp_timeout: std::time::Duration::from_millis(100),
                     in_name: "tun".to_string(),
                     last_activity: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                    sniffer: None,
                 },
             )
             .await;

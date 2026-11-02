@@ -130,6 +130,21 @@ impl SnifferRuntime {
         self.port_map.get(&metadata.dst_port)
     }
 
+    /// Whether a UDP flow to `metadata` is to be sniffed as QUIC.
+    pub fn wants_quic(&self, metadata: &Metadata) -> bool {
+        self.cfg.enable
+            && self.cfg.quic_ports.contains(&metadata.dst_port)
+            && !(self.cfg.parse_pure_ip
+                && !metadata.host.is_empty()
+                && meow_common::metadata_ip_literal(&metadata.host).is_none()
+                && self.force.search(&metadata.host).is_none())
+    }
+
+    /// The sniff deadline from the config (`sniffer.timeout`).
+    pub fn timeout(&self) -> std::time::Duration {
+        self.cfg.timeout
+    }
+
     /// [`Self::sniff`] over bytes the inbound already read (the TUN lwIP
     /// path's sniff-window prefix).
     pub fn sniff_bytes(&self, buf: &[u8], metadata: &mut Metadata) {
