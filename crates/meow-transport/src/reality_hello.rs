@@ -24,6 +24,9 @@ const GREASE: u16 = 0x0a0a;
 
 const GROUP_X25519: u16 = 0x001d;
 const GROUP_P256: u16 = 0x0017;
+/// Hybrid post-quantum group (draft-ietf-tls-ecdhe-mlkem); share =
+/// ML-KEM-768 encapsulation key (1184) || X25519 public key (32).
+pub(crate) const GROUP_X25519_MLKEM768: u16 = 0x11ec;
 
 const EXT_PADDING: u16 = 21;
 
@@ -436,6 +439,11 @@ pub(crate) struct HelloParams<'a> {
     pub(crate) alpn: &'a [String],
     pub(crate) random: &'a [u8; 32],
     pub(crate) x25519_public: &'a [u8; 32],
+    /// ML-KEM-768 encapsulation key: when set, X25519MLKEM768 is offered
+    /// first in `supported_groups` and as the first real `key_share`
+    /// (before X25519, sharing its X25519 key) — as current Chrome does,
+    /// and as current Xray REALITY servers require.
+    pub(crate) mlkem768_public: Option<&'a [u8]>,
 }
 
 /// Encode a framed ClientHello handshake message shaped like `profile`.
@@ -480,8 +488,18 @@ pub(crate) fn build_client_hello(
             Ext::ExtendedMasterSecret => (23, Vec::new()),
             Ext::RenegotiationInfo => (0xff01, vec![0]),
             Ext::SupportedGroups(groups) => {
-                let mut data = Vec::with_capacity(2 + groups.len() * 2);
-                put_u16_list(groups, grease.group, &mut data);
+                let mut data = Vec::with_capacity(4 + groups.len() * 2);
+                if params.mlkem768_public.is_some() {
+                    // Hybrid right after the leading GREASE (if any).
+                    let mut with_pq = Vec::with_capacity(groups.len() + 1);
+                    let lead = usize::from(groups.first() == Some(&GREASE));
+                    with_pq.extend_from_slice(&groups[..lead]);
+                    with_pq.push(GROUP_X25519_MLKEM768);
+                    with_pq.extend_from_slice(&groups[lead..]);
+                    put_u16_list(&with_pq, grease.group, &mut data);
+                } else {
+                    put_u16_list(groups, grease.group, &mut data);
+                }
                 (10, data)
             }
             Ext::PointFormats => (11, vec![1, 0]),
@@ -510,6 +528,12 @@ pub(crate) fn build_client_hello(
                     put_u16(grease.group, &mut shares);
                     put_u16(1, &mut shares);
                     shares.push(0);
+                }
+                if let Some(mlkem) = params.mlkem768_public {
+                    put_u16(GROUP_X25519_MLKEM768, &mut shares);
+                    put_u16((mlkem.len() + 32) as u16, &mut shares);
+                    shares.extend_from_slice(mlkem);
+                    shares.extend_from_slice(params.x25519_public);
                 }
                 put_u16(GROUP_X25519, &mut shares);
                 put_u16(32, &mut shares);
@@ -660,6 +684,7 @@ mod tests {
                 alpn,
                 random: &[7u8; 32],
                 x25519_public: &[3u8; 32],
+                mlkem768_public: None,
             },
         )
         .expect("client hello")

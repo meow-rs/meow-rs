@@ -78,8 +78,6 @@ Out of scope:
 
 - VLESS inbound / server mode.
 - Vision UDP splice. UDP still uses plain VLESS and logs a config warning.
-- Hybrid `support-x25519mlkem768` key share. The config field is retained, but
-  the current ClientHello only sends X25519.
 - Mux.Cool.
 - Committing the test sample or subscription nodes as repository fixtures.
 
@@ -125,7 +123,9 @@ Handshake flow:
 3. Build a TLS 1.3 ClientHello:
    - SNI comes from `servername`, falling back to `server`.
    - ALPN comes from YAML `alpn`.
-   - `key_share` currently sends X25519.
+   - `key_share` sends X25519; with `support-x25519mlkem768: true` an
+     X25519MLKEM768 share (sharing the X25519 key) goes first, as current Xray
+     REALITY servers require.
    - `session_id` contains Reality auth data: version, timestamp, and short-id,
      sealed with an AES-GCM key derived from the auth key.
 4. Send the plaintext TLS handshake record.

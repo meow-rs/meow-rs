@@ -42,6 +42,7 @@ boring-tls = ["tls", "reality"]
 # share of the `firefox` profile.
 reality = [
     "tls",
+    "boring/mlkem",
     "dep:rand",
     "dep:x25519-dalek",
 ]
