@@ -132,16 +132,18 @@ impl Nat {
         }
     }
 
-    /// Rewrite a packet read from the device in place.
-    pub(super) fn translate(&self, pkt: &mut [u8]) -> Verdict {
+    /// Rewrite a packet read from the device in place. `partial`: its TCP
+    /// checksum is a virtio `NEEDS_CSUM` one (the field holds only the
+    /// pseudo-header sum; whoever receives the packet sums the segment).
+    pub(super) fn translate(&self, pkt: &mut [u8], partial: bool) -> Verdict {
         match pkt.first().map(|b| b >> 4) {
-            Some(4) => self.translate_v4(pkt),
-            Some(6) => self.translate_v6(pkt),
+            Some(4) => self.translate_v4(pkt, partial),
+            Some(6) => self.translate_v6(pkt, partial),
             _ => Verdict::Stack,
         }
     }
 
-    fn translate_v4(&self, pkt: &mut [u8]) -> Verdict {
+    fn translate_v4(&self, pkt: &mut [u8], partial: bool) -> Verdict {
         if pkt.len() < 20 || pkt[9] != 6 {
             return Verdict::Stack;
         }
@@ -189,12 +191,20 @@ impl Nat {
         addrs[4..].copy_from_slice(&new_dst.ip().octets());
         let ip_check = csum_adjust(read16(pkt, 10), &pkt[12..20], &addrs);
         write16(pkt, 10, ip_check);
-        rewrite_tcp(pkt, ihl, 12..20, &addrs, new_src.port(), new_dst.port());
+        rewrite_tcp(
+            pkt,
+            ihl,
+            12..20,
+            &addrs,
+            new_src.port(),
+            new_dst.port(),
+            partial,
+        );
         pkt[12..20].copy_from_slice(&addrs);
         Verdict::Write
     }
 
-    fn translate_v6(&self, pkt: &mut [u8]) -> Verdict {
+    fn translate_v6(&self, pkt: &mut [u8], partial: bool) -> Verdict {
         // Extension headers before TCP are left to lwIP.
         if pkt.len() < 40 || pkt[6] != 6 {
             return Verdict::Stack;
@@ -237,7 +247,15 @@ impl Nat {
         let mut addrs = [0u8; 32];
         addrs[..16].copy_from_slice(&new_src.ip().octets());
         addrs[16..].copy_from_slice(&new_dst.ip().octets());
-        rewrite_tcp(pkt, 40, 8..40, &addrs, new_src.port(), new_dst.port());
+        rewrite_tcp(
+            pkt,
+            40,
+            8..40,
+            &addrs,
+            new_src.port(),
+            new_dst.port(),
+            partial,
+        );
         pkt[8..40].copy_from_slice(&addrs);
         Verdict::Write
     }
@@ -429,6 +447,10 @@ fn write16(pkt: &mut [u8], at: usize, v: u16) {
 
 /// Rewrite the TCP ports at `tcp_off` and fix the TCP checksum for them and
 /// for the pseudo-header addresses at `addr_range` becoming `new_addrs`.
+///
+/// A `partial` field holds the uncomplemented pseudo-header sum: only the
+/// addresses are adjusted there, without complementing, and the ports are
+/// left to the final sum over the segment.
 fn rewrite_tcp(
     pkt: &mut [u8],
     tcp_off: usize,
@@ -436,13 +458,19 @@ fn rewrite_tcp(
     new_addrs: &[u8],
     sport: u16,
     dport: u16,
+    partial: bool,
 ) {
     let mut ports = [0u8; 4];
     ports[..2].copy_from_slice(&sport.to_be_bytes());
     ports[2..].copy_from_slice(&dport.to_be_bytes());
     let check_at = tcp_off + 16;
-    let mut check = csum_adjust(read16(pkt, check_at), &pkt[addr_range], new_addrs);
-    check = csum_adjust(check, &pkt[tcp_off..tcp_off + 4], &ports);
+    let check = read16(pkt, check_at);
+    let check = if partial {
+        !csum_adjust(!check, &pkt[addr_range], new_addrs)
+    } else {
+        let c = csum_adjust(check, &pkt[addr_range], new_addrs);
+        csum_adjust(c, &pkt[tcp_off..tcp_off + 4], &ports)
+    };
     write16(pkt, check_at, check);
     pkt[tcp_off..tcp_off + 4].copy_from_slice(&ports);
 }
@@ -588,7 +616,7 @@ mod tests {
     fn v4_round_trip_keeps_checksums_valid() {
         let nat = nat();
         let mut syn = v4_packet([192, 168, 1, 10], 51000, [1, 1, 1, 1], 443, TCP_SYN);
-        assert_eq!(nat.translate(&mut syn), Verdict::Write);
+        assert_eq!(nat.translate(&mut syn, false), Verdict::Write);
         assert_eq!(addr4(&syn, 16), "172.31.0.1:40000".parse().unwrap());
         let peer = addr4(&syn, 12);
         assert_eq!(
@@ -606,7 +634,7 @@ mod tests {
             peer.port(),
             TCP_SYN | TCP_ACK,
         );
-        assert_eq!(nat.translate(&mut reply), Verdict::Write);
+        assert_eq!(nat.translate(&mut reply, false), Verdict::Write);
         assert_eq!(addr4(&reply, 12), "1.1.1.1:443".parse().unwrap());
         assert_eq!(addr4(&reply, 16), "192.168.1.10:51000".parse().unwrap());
         assert_eq!(read16(&reply, 10), ip_check(&reply));
@@ -614,7 +642,7 @@ mod tests {
 
         // The client's next segment reuses the entry.
         let mut ack = v4_packet([192, 168, 1, 10], 51000, [1, 1, 1, 1], 443, TCP_ACK);
-        assert_eq!(nat.translate(&mut ack), Verdict::Write);
+        assert_eq!(nat.translate(&mut ack, false), Verdict::Write);
         assert_eq!(addr4(&ack, 12), peer);
 
         assert_eq!(
@@ -632,13 +660,13 @@ mod tests {
         let c: Ipv6Addr = "2001:db8::10".parse().unwrap();
         let d: Ipv6Addr = "2606:4700::1111".parse().unwrap();
         let mut syn = v6_packet(c, 40500, d, 443, TCP_SYN);
-        assert_eq!(nat.translate(&mut syn), Verdict::Write);
+        assert_eq!(nat.translate(&mut syn, false), Verdict::Write);
         assert_eq!(read16(&syn, 56), tcp_check(&syn));
         let port = read16(&syn, 40);
         let a6: Ipv6Addr = "fdfe:dcba:9876::1".parse().unwrap();
         let b6: Ipv6Addr = "fdfe:dcba:9876::2".parse().unwrap();
         let mut reply = v6_packet(a6, 40001, b6, port, TCP_SYN | TCP_ACK);
-        assert_eq!(nat.translate(&mut reply), Verdict::Write);
+        assert_eq!(nat.translate(&mut reply, false), Verdict::Write);
         assert_eq!(&reply[8..24], &d.octets());
         assert_eq!(&reply[24..40], &c.octets());
         assert_eq!(read16(&reply, 40), 443);
@@ -651,18 +679,18 @@ mod tests {
         let nat = nat();
         // A mid-flow segment nobody opened.
         let mut ack = v4_packet([192, 168, 1, 10], 1, [1, 1, 1, 1], 443, TCP_ACK);
-        assert_eq!(nat.translate(&mut ack), Verdict::Drop);
+        assert_eq!(nat.translate(&mut ack, false), Verdict::Drop);
         // A reply to a NAT port with no entry.
         let mut reply = v4_packet([172, 31, 0, 1], 40000, [172, 31, 0, 2], 12345, TCP_ACK);
-        assert_eq!(nat.translate(&mut reply), Verdict::Drop);
+        assert_eq!(nat.translate(&mut reply, false), Verdict::Drop);
         // Into the device's own subnet: would loop.
         let mut lp = v4_packet([192, 168, 1, 10], 2, [172, 31, 0, 3], 80, TCP_SYN);
-        assert_eq!(nat.translate(&mut lp), Verdict::Drop);
+        assert_eq!(nat.translate(&mut lp, false), Verdict::Drop);
         // UDP goes to lwIP untouched.
         let mut udp = v4_packet([192, 168, 1, 10], 3, [1, 1, 1, 1], 53, 0);
         udp[9] = 17;
         let before = udp.clone();
-        assert_eq!(nat.translate(&mut udp), Verdict::Stack);
+        assert_eq!(nat.translate(&mut udp, false), Verdict::Stack);
         assert_eq!(udp, before);
         assert_eq!(nat.len(), 0);
     }
@@ -671,14 +699,14 @@ mod tests {
     fn entries_expire_and_closing_flows_get_a_fresh_port() {
         let nat = nat();
         let mut syn = v4_packet([10, 0, 0, 5], 5000, [8, 8, 8, 8], 80, TCP_SYN);
-        nat.translate(&mut syn);
+        nat.translate(&mut syn, false);
         let first = read16(&syn, 20);
         let peer = SocketAddr::from((Ipv4Addr::new(172, 31, 0, 2), first));
         assert!(nat.accepted(peer).is_some());
         nat.closed(first);
         // A new SYN on the same 4-tuple while the old one closes.
         let mut syn2 = v4_packet([10, 0, 0, 5], 5000, [8, 8, 8, 8], 80, TCP_SYN);
-        nat.translate(&mut syn2);
+        nat.translate(&mut syn2, false);
         let second = read16(&syn2, 20);
         assert_ne!(first, second);
         assert_eq!(nat.len(), 2);
@@ -692,6 +720,26 @@ mod tests {
         nat.sweep();
         assert_eq!(nat.len(), 0);
         assert!(nat.table.lock().by_flow.is_empty());
+    }
+
+    /// A TSO/GRO packet from an offload device: the TCP field holds the
+    /// partial pseudo-header sum. After translation, completing the sum the
+    /// way the kernel does must give the full checksum of the new packet.
+    #[test]
+    fn partial_checksum_survives_translation() {
+        let nat = nat();
+        let mut syn = v4_packet([192, 168, 1, 10], 51000, [1, 1, 1, 1], 443, TCP_SYN);
+        // Turn the full checksum into the partial one: the pseudo-header
+        // sum, uncomplemented.
+        let seg_len = (syn.len() - 20) as u16;
+        let mut pseudo = syn[12..20].to_vec();
+        pseudo.extend_from_slice(&[0, 6]);
+        pseudo.extend_from_slice(&seg_len.to_be_bytes());
+        write16(&mut syn, 36, !fold(ones_complement_sum(&pseudo, 0)));
+        assert_eq!(nat.translate(&mut syn, true), Verdict::Write);
+        crate::tun::vnet::complete_checksum_for_test(&mut syn, 20, 16);
+        assert_eq!(read16(&syn, 36), tcp_check(&syn));
+        assert_eq!(read16(&syn, 10), ip_check(&syn));
     }
 
     #[test]
