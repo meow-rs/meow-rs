@@ -37,6 +37,16 @@ pub enum UrlTestError {
     Transport(String),
 }
 
+static UNIFIED_DELAY: AtomicBool = AtomicBool::new(false);
+
+/// mihomo `unified-delay`: when set, a probe sends a second request on the
+/// same warm connection and reports only that one, so the delay is one
+/// round trip through the proxy rather than dial + handshakes + request.
+/// Applied on every config load.
+pub fn set_unified_delay(on: bool) {
+    UNIFIED_DELAY.store(on, Ordering::Relaxed);
+}
+
 /// Probe a proxy by dialing the target, issuing an HTTP/1.1 `GET`, and
 /// reading the status line. Returns the total elapsed milliseconds on
 /// success (status within `expected`), otherwise a classified error.
@@ -82,10 +92,15 @@ pub async fn url_test(
         ..Default::default()
     };
 
-    let fut = probe_once(adapter, metadata, parsed, ranges);
+    let unified = UNIFIED_DELAY.load(Ordering::Relaxed);
+    let fut = probe_once(adapter, metadata, parsed, ranges, unified);
     match tokio::time::timeout(timeout, fut).await {
-        Ok(Ok(())) => {
-            let delay = start.elapsed().as_millis().min(u16::MAX as u128) as u16;
+        Ok(Ok(second)) => {
+            let delay = second
+                .unwrap_or(start)
+                .elapsed()
+                .as_millis()
+                .min(u16::MAX as u128) as u16;
             // Collapse sub-millisecond probes to 1 so callers can treat 0 as
             // the "probe did not complete" sentinel when they choose to.
             let delay = delay.max(1);
@@ -849,7 +864,8 @@ async fn probe_once(
     metadata: meow_common::Metadata,
     parsed: ParsedUrl,
     ranges: Vec<(u16, u16)>,
-) -> Result<(), String> {
+    unified: bool,
+) -> Result<Option<Instant>, String> {
     let conn = adapter
         .dial_tcp(&metadata)
         .await
@@ -865,10 +881,75 @@ async fn probe_once(
             .connect(Box::new(conn))
             .await
             .map_err(|e| format!("tls: {e}"))?;
-        send_get_and_check(tls, &parsed, &ranges).await
+        check_maybe_twice(tls, &parsed, &ranges, unified).await
     } else {
-        send_get_and_check(conn, &parsed, &ranges).await
+        check_maybe_twice(conn, &parsed, &ranges, unified).await
     }
+}
+
+/// One `GET` — or, for `unified-delay`, two keep-alive `HEAD`s as mihomo
+/// sends them, returning when the second started. A failed second request
+/// keeps the first, full measurement (mihomo does the same).
+async fn check_maybe_twice<S>(
+    mut stream: S,
+    parsed: &ParsedUrl,
+    ranges: &[(u16, u16)],
+    unified: bool,
+) -> Result<Option<Instant>, String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    if !unified {
+        return send_get_and_check(stream, parsed, ranges)
+            .await
+            .map(|()| None);
+    }
+    send_request(&mut stream, parsed, "HEAD", "keep-alive").await?;
+    check_status(read_head(&mut stream).await?, ranges)?;
+    let second = Instant::now();
+    let warm = async {
+        send_request(&mut stream, parsed, "HEAD", "close").await?;
+        check_status(read_status_line(&mut stream).await?, ranges)
+    };
+    Ok(warm.await.ok().map(|()| second))
+}
+
+fn check_status(status: u16, ranges: &[(u16, u16)]) -> Result<(), String> {
+    trace!(status, "url_test: received status");
+    if ranges.iter().any(|(lo, hi)| status >= *lo && status <= *hi) {
+        Ok(())
+    } else {
+        Err(format!("unexpected status {status}"))
+    }
+}
+
+/// Read a response head (status line + headers) and return its status; a
+/// `HEAD` response has no body, so the connection is then ready for the
+/// next request.
+async fn read_head<S>(stream: &mut S) -> Result<u16, String>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    let status = read_status_line(stream).await?;
+    // Status line consumed with its CRLF; the head ends at an empty line.
+    let mut tail = [0u8; 4];
+    tail[2..].copy_from_slice(b"\r\n");
+    let mut byte = [0u8; 1];
+    for _ in 0..16 * 1024 {
+        let n = stream
+            .read(&mut byte)
+            .await
+            .map_err(|e| format!("read: {e}"))?;
+        if n == 0 {
+            return Err("eof in response headers".into());
+        }
+        tail.rotate_left(1);
+        tail[3] = byte[0];
+        if &tail == b"\r\n\r\n" {
+            return Ok(status);
+        }
+    }
+    Err("response headers too large".into())
 }
 
 async fn send_get_and_check<S>(
@@ -879,6 +960,19 @@ async fn send_get_and_check<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    send_request(&mut stream, parsed, "GET", "close").await?;
+    check_status(read_status_line(&mut stream).await?, ranges)
+}
+
+async fn send_request<S>(
+    stream: &mut S,
+    parsed: &ParsedUrl,
+    method: &str,
+    connection: &str,
+) -> Result<(), String>
+where
+    S: tokio::io::AsyncWrite + Unpin,
+{
     // Host header includes the non-default port so virtual-hosted origins
     // route correctly; mirrors Go net/http's default behaviour.
     use std::io::Write as _;
@@ -888,8 +982,8 @@ where
     if parsed.port == default_port {
         write!(
             cursor,
-            "GET {path} HTTP/1.1\r\nHost: {host}\r\n\
-             User-Agent: clash.meta/{ver}\r\nAccept: */*\r\nConnection: close\r\n\r\n",
+            "{method} {path} HTTP/1.1\r\nHost: {host}\r\n\
+             User-Agent: clash.meta/{ver}\r\nAccept: */*\r\nConnection: {connection}\r\n\r\n",
             path = parsed.path,
             host = parsed.host,
             ver = env!("CARGO_PKG_VERSION"),
@@ -897,8 +991,8 @@ where
     } else {
         write!(
             cursor,
-            "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\n\
-             User-Agent: clash.meta/{ver}\r\nAccept: */*\r\nConnection: close\r\n\r\n",
+            "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\n\
+             User-Agent: clash.meta/{ver}\r\nAccept: */*\r\nConnection: {connection}\r\n\r\n",
             path = parsed.path,
             host = parsed.host,
             port = parsed.port,
@@ -912,15 +1006,7 @@ where
         .write_all(&buf[..written])
         .await
         .map_err(|e| format!("write: {e}"))?;
-    stream.flush().await.map_err(|e| format!("flush: {e}"))?;
-
-    let status = read_status_line(&mut stream).await?;
-    trace!(status, "url_test: received status");
-    if ranges.iter().any(|(lo, hi)| status >= *lo && status <= *hi) {
-        Ok(())
-    } else {
-        Err(format!("unexpected status {status}"))
-    }
+    stream.flush().await.map_err(|e| format!("flush: {e}"))
 }
 
 async fn read_status_line<S>(stream: &mut S) -> Result<u16, String>
@@ -1060,6 +1146,46 @@ fn parse_expected(spec: Option<&str>) -> Result<Vec<(u16, u16)>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `unified-delay`: two HEADs on one connection, the first keep-alive;
+    /// the second's start is reported. A peer closing after the first
+    /// keeps the full measurement (None), as mihomo does.
+    #[tokio::test]
+    async fn unified_delay_times_the_second_request_on_a_warm_connection() {
+        let parsed = ParsedUrl::parse("http://probe.test/generate_204").unwrap();
+        let ranges = parse_expected(None).unwrap();
+        for second_answered in [true, false] {
+            let (client, mut server) = tokio::io::duplex(4096);
+            let srv = tokio::spawn(async move {
+                let mut seen = Vec::new();
+                let mut buf = [0u8; 1024];
+                let mut answered = 0;
+                while answered < if second_answered { 2 } else { 1 } {
+                    let n = server.read(&mut buf).await.unwrap();
+                    seen.extend_from_slice(&buf[..n]);
+                    let requests = seen.windows(4).filter(|w| w == b"\r\n\r\n").count();
+                    while answered < requests {
+                        server
+                            .write_all(b"HTTP/1.1 204 No Content\r\nServer: t\r\n\r\n")
+                            .await
+                            .unwrap();
+                        answered += 1;
+                    }
+                }
+                String::from_utf8(seen).unwrap()
+            });
+            let warm = check_maybe_twice(client, &parsed, &ranges, true)
+                .await
+                .expect("first request passes");
+            let seen = srv.await.unwrap();
+            assert!(seen.starts_with("HEAD /generate_204 HTTP/1.1\r\n"));
+            assert!(seen.contains("Connection: keep-alive\r\n"));
+            assert_eq!(warm.is_some(), second_answered);
+            if second_answered {
+                assert_eq!(seen.matches("HEAD ").count(), 2);
+            }
+        }
+    }
 
     #[test]
     fn parsed_url_cases() {

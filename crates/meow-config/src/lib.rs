@@ -4781,6 +4781,8 @@ pub async fn build_config(
     // sync `parse_proxy` path that follows can stay sync. Failures warn
     // and leave the map unchanged — except the `enable: true` with no
     // query-source defect, which `strict` promotes to an error.
+    // Global like mihomo's: every delay probe (API, groups, providers).
+    meow_proxy::health::set_unified_delay(raw.unified_delay.unwrap_or(false));
     if let Some(ps) = raw.proxies.as_mut() {
         ech_dns::preresolve_ech(ps, raw.strict.unwrap_or(false))
             .await

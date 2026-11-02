@@ -272,7 +272,6 @@ Upstream config keys documented at https://wiki.metacubex.one/. Checking `crates
 | `keep-alive-interval` | TCP keepalive (upstream's knob tunes *inbound listeners AND outbound dials*; meow-rs parses it only to warn — the inbound-socket equivalent is `tcp-keepalive*` + `tcp-idle-timeout`, see `config.example.yaml`; the outbound-dialer tuning is the residual gap) |
 | `find-process-mode` | `off` / `strict` / `always` |
 | `tcp-concurrent` | Happy Eyeballs fast-open |
-| `unified-delay` | Delay histogram normalization |
 | `external-ui-url` auto-download | `external-ui` / `external-ui-name` serve a static dir; the zip auto-download is not implemented (avoids an unzip dependency vs. ADR-0007 size caps) |
 | `listeners` | Upstream's generic named-listener list (replaces per-port shortcuts) |
 | `sub-rules` | Named rule subsets referenced from main rules |
