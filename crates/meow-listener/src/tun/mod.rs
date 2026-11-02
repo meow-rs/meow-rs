@@ -946,6 +946,7 @@ impl TunListener {
             self.name.clone(),
             tun_net,
             std::sync::Arc::clone(&udp_flows),
+            self.sniffer.clone(),
         ));
         if let Some(socket) = lwip_udp {
             tasks.spawn(udp::run_udp(
