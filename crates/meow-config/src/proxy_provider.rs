@@ -308,20 +308,8 @@ impl ProxyProvider {
         let exclude_filter = compile_opt_regex(&raw.exclude_filter, "exclude-filter")?;
         let exclude_type = split_exclude_types(raw.exclude_type.as_deref());
 
+        // Probed every `interval` by `ProxyProviderRefreshSupervisor`.
         let health_check = build_health_check_config(raw.health_check.as_ref());
-        if health_check.is_some() {
-            // The config is honoured by the manual
-            // `GET /providers/proxies/{name}/healthcheck` endpoint, but
-            // nothing probes provider members on a timer (mihomo schedules
-            // the provider health-check alongside `interval`). Warn once
-            // per build so the config isn't silently half-wired.
-            warn!(
-                provider = %name,
-                "proxy-provider 'health-check' is stored but not periodically \
-                 scheduled — members are probed only via the manual \
-                 healthcheck endpoint or a group's own health check"
-            );
-        }
         let header = raw
             .header
             .as_ref()

@@ -14,6 +14,11 @@
 //! carries its *source* identity (`ProxyProvider::def` deliberately excludes
 //! `interval`), so an interval-only change must respawn the task without
 //! rebuilding the provider or refetching its payload.
+//!
+//! The same supervisor runs each provider's `health-check` on its own
+//! `interval` (mihomo parity): members are probed like the
+//! manual `GET /providers/proxies/{name}/healthcheck`. meow tracks no
+//! per-provider traffic, so `lazy` does not skip ticks here.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
@@ -42,6 +47,8 @@ const MAX_REFRESH_INTERVAL_SECS: u64 = meow_common::MAX_DURATION_SECS;
 #[derive(Default)]
 pub struct ProxyProviderRefreshSupervisor {
     tasks: Mutex<HashMap<String, (u64, JoinHandle<()>)>>,
+    /// `health-check` loops, keyed like `tasks` on (name, interval secs).
+    health: Mutex<HashMap<String, (u64, JoinHandle<()>)>>,
 }
 
 impl ProxyProviderRefreshSupervisor {
@@ -122,6 +129,43 @@ impl ProxyProviderRefreshSupervisor {
             ));
             tasks.insert(name, (interval, task));
         }
+        drop(tasks);
+
+        let wanted_health: HashMap<String, u64> = registry
+            .iter()
+            .filter_map(|e| {
+                let hc = e.value().health_check.as_ref()?;
+                Some((
+                    e.key().clone(),
+                    hc.interval.clamp(1, MAX_REFRESH_INTERVAL_SECS),
+                ))
+            })
+            .collect();
+        let mut health = self.health.lock();
+        health.retain(|name, (interval, task)| {
+            let keep = wanted_health.get(name) == Some(interval) && !task.is_finished();
+            if !keep {
+                task.abort();
+            }
+            keep
+        });
+        for (name, interval) in wanted_health {
+            if health.contains_key(&name) {
+                continue;
+            }
+            let task = tokio::spawn(health_check_loop(
+                name.clone(),
+                interval,
+                Arc::downgrade(registry),
+            ));
+            health.insert(name, (interval, task));
+        }
+    }
+
+    /// Interval of a running health-check task (test introspection).
+    #[cfg(test)]
+    fn health_interval(&self, name: &str) -> Option<u64> {
+        self.health.lock().get(name).map(|(iv, _)| *iv)
     }
 
     /// Number of running refresh tasks (test introspection).
@@ -164,6 +208,9 @@ impl Drop for ProxyProviderRefreshSupervisor {
         for (_, (_, task)) in self.tasks.get_mut().drain() {
             task.abort();
         }
+        for (_, (_, task)) in self.health.get_mut().drain() {
+            task.abort();
+        }
     }
 }
 
@@ -198,6 +245,49 @@ async fn refresh_loop(
         if let Err(e) = provider.refresh().await {
             error!(provider = %provider.name, "background refresh failed: {e}");
         }
+    }
+}
+
+/// Probe a provider's members every `interval_secs`, starting right away
+/// (mihomo checks a provider on load). The provider and its `health-check`
+/// settings are re-read by name each tick, like [`refresh_loop`].
+async fn health_check_loop(
+    name: String,
+    interval_secs: u64,
+    registry: Weak<DashMap<String, Arc<ProxyProvider>>>,
+) {
+    let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        let Some(registry) = registry.upgrade() else {
+            return;
+        };
+        let Some(provider) = registry.get(&name).map(|e| Arc::clone(e.value())) else {
+            continue;
+        };
+        drop(registry);
+        let Some(hc) = provider.health_check.as_ref() else {
+            continue;
+        };
+        let members: Vec<_> = provider
+            .proxies()
+            .into_iter()
+            .map(|proxy| (proxy.name().to_string(), proxy))
+            .collect();
+        if members.is_empty() {
+            continue;
+        }
+        let expected = (!hc.expected_status.is_empty()).then_some(hc.expected_status.as_str());
+        debug!(provider = %name, members = members.len(), "proxy-provider health-check");
+        let _ = meow_proxy::health::probe_many_bounded(
+            members,
+            &hc.url,
+            expected,
+            Duration::from_millis(hc.timeout.max(1)),
+            meow_proxy::health::PROVIDER_HEALTHCHECK_CONCURRENCY,
+        )
+        .await;
     }
 }
 
@@ -436,5 +526,50 @@ mod tests {
             Some(want),
             "the tick must have refreshed the file provider"
         );
+    }
+
+    /// A provider with `health-check` gets its own probe loop at the
+    /// health-check interval (independent of the refresh `interval`); a
+    /// reload that drops the provider aborts it.
+    #[tokio::test]
+    async fn reconcile_spawns_and_aborts_health_check_loops() {
+        let sup = ProxyProviderRefreshSupervisor::default();
+        let dir = tempfile::tempdir().unwrap();
+        let raw = RawProxyProvider {
+            provider_type: "file".to_string(),
+            url: None,
+            path: Some(dir.path().join("hc.yaml").display().to_string()),
+            health_check: Some(crate::raw::RawHealthCheck {
+                enable: Some(true),
+                url: None,
+                interval: Some(120),
+                timeout: None,
+                expected_status: None,
+                lazy: None,
+            }),
+            ..raw_provider(None)
+        };
+        let hc = Arc::new(
+            ProxyProvider::new(
+                "hc",
+                &raw,
+                Some(dir.path()),
+                true,
+                false,
+                Default::default(),
+            )
+            .expect("file provider must build"),
+        );
+        let reg = registry(&["plain"], dir.path());
+        reg.insert("hc".to_string(), hc);
+        let declared = raws(&[("hc", None), ("plain", None)]);
+        sup.reconcile(&reg, Some(&declared));
+        assert_eq!(sup.health_interval("hc"), Some(120));
+        assert_eq!(sup.health_interval("plain"), None);
+        assert_eq!(sup.task_count(), 0, "no refresh interval, no refresh task");
+
+        reg.remove("hc");
+        sup.reconcile(&reg, Some(&raws(&[("plain", None)])));
+        assert_eq!(sup.health_interval("hc"), None);
     }
 }
