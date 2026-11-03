@@ -73,6 +73,25 @@ fn connection_chain(adapter: &dyn ProxyAdapter, metadata: &Metadata) -> SmallVec
     chain
 }
 
+/// The leaf proxy `adapter` dials through for `metadata` — the
+/// `chains[0]` [`connection_chain`] would record, without building it —
+/// or `None` when `adapter` is no group and dials itself.
+pub(crate) fn leaf_proxy(
+    adapter: &dyn ProxyAdapter,
+    metadata: &Metadata,
+) -> Option<Arc<dyn meow_common::Proxy>> {
+    let mut leaf = None;
+    let mut next = adapter.unwrap_proxy(metadata, false);
+    for _ in 0..MAX_CHAIN_HOPS {
+        let Some(hop) = next else {
+            break;
+        };
+        next = hop.unwrap_proxy(metadata, false);
+        leaf = Some(hop);
+    }
+    leaf
+}
+
 /// A `chains` list read the way it was decided — rule target first, the
 /// leaf that dials last: `Proxy → Auto → HK-01`.
 struct PolicyPath<'a>(&'a [Arc<str>]);
@@ -97,7 +116,11 @@ impl<'a> ConnectionGuard<'a> {
         rule_payload: SmolStr,
         adapter: &dyn ProxyAdapter,
     ) -> Self {
-        if let Some(counters) = stats.begin_headless_connection() {
+        let policy = || {
+            let leaf = leaf_proxy(adapter, metadata);
+            Some(stats.proxy_name(leaf.as_deref().map_or(adapter.name(), |hop| hop.name())))
+        };
+        if let Some(counters) = stats.begin_headless_connection(metadata, policy) {
             return Self {
                 stats,
                 key: ConnectionKey::Headless,
@@ -133,7 +156,8 @@ impl<'a> ConnectionGuard<'a> {
     ) -> Self {
         // Obtain the handle before publishing the entry. A concurrent DELETE
         // must cancel this exact handle, even before its first poll.
-        let (key, counters) = if let Some(counters) = stats.begin_headless_connection() {
+        let headless = stats.begin_headless_connection(&metadata, || chains.first().cloned());
+        let (key, counters) = if let Some(counters) = headless {
             (ConnectionKey::Headless, counters)
         } else {
             let (id, counters) = stats.track_connection_with_counters(

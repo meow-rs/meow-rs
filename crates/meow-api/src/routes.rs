@@ -221,6 +221,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         )
         .route("/metrics", get(get_metrics))
         .route("/traffic", get(get_traffic))
+        .route(
+            "/traffic/ledger",
+            get(crate::traffic_ledger::get_ledger).delete(crate::traffic_ledger::clear_ledger),
+        )
         .route("/statistics", get(get_statistics))
         .route("/logs", get(get_logs))
         .route(
@@ -3060,7 +3064,7 @@ async fn swap_config_and_reconcile_tun(
     // Snapshot the candidate (only on an off→on transition, before it is
     // moved into the lock) so the parking_lot write guard — which is
     // !Send — is dropped before the first .await below.
-    let (old_enable, tun_changed, snapshot, specs, new_log_level, logbook_enable) = {
+    let (old_enable, tun_changed, snapshot, specs, new_log_level, (logbook_enable, ledger)) = {
         let mut guard = state.raw_config.write();
         let old = guard.tun.as_ref().is_some_and(|t| t.enable);
         // Semantic diff (issue #543): compare the PARSED `TunConfig`s so
@@ -3121,6 +3125,11 @@ async fn swap_config_and_reconcile_tun(
         let new_log_level =
             (guard.log_level != candidate.log_level).then(|| candidate.log_level.clone());
         let logbook_enable = meow_config::raw::RawLogbook::enabled(candidate.logbook.as_ref());
+        let ledger = candidate.traffic_ledger.as_ref();
+        let ledger = (
+            meow_config::raw::RawTrafficLedger::enabled(ledger),
+            meow_config::raw::RawTrafficLedger::options(ledger),
+        );
         *guard = candidate;
         (
             old,
@@ -3128,10 +3137,15 @@ async fn swap_config_and_reconcile_tun(
             snapshot,
             specs,
             new_log_level,
-            logbook_enable,
+            (logbook_enable, ledger),
         )
     };
     logbook::reconfigure(logbook_enable);
+    // Opening or closing the ledger waits on its database.
+    let _ = tokio::task::spawn_blocking(move || {
+        meow_common::traffic_ledger::reconfigure(ledger.0, ledger.1);
+    })
+    .await;
 
     if let Some(new_log_level) = new_log_level {
         let level = new_log_level.as_deref().unwrap_or("info");

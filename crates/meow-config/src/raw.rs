@@ -251,6 +251,10 @@ pub struct RawConfig {
     /// by `GET /logbook` (see `meow_common::logbook`). A meow extension; on
     /// by default.
     pub logbook: Option<RawLogbook>,
+    /// `traffic-ledger:` — per-day traffic by host, app, policy and
+    /// interface, served by `GET /traffic/ledger` (see
+    /// `meow_common::traffic_ledger`). A meow extension; on by default.
+    pub traffic_ledger: Option<RawTrafficLedger>,
     /// Static host mappings, preferred over upstream DNS lookups. Values may
     /// be a single IP, a list of IPs, or one domain-name alias. **Document
     /// order decides same-slot collision winners** and round-trips through
@@ -682,6 +686,35 @@ pub struct RawRuleProvider {
     pub header: Option<HashMap<String, StringOrList>>,
     /// Inline payload: list of rule strings (only for type=inline).
     pub payload: Option<Vec<String>>,
+}
+
+/// `traffic-ledger:` section.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub struct RawTrafficLedger {
+    /// Record traffic under `<home>/traffic/`. Default true.
+    pub enable: Option<bool>,
+    /// Record the hosts traffic went to. Default true.
+    pub hosts: Option<bool>,
+    /// Record the app that opened each flow: the package name on Android,
+    /// the owning process of a flow from this host elsewhere, looked up
+    /// for every such flow. Default true.
+    pub apps: Option<bool>,
+}
+
+impl RawTrafficLedger {
+    /// The effective `traffic-ledger.enable` of a config.
+    pub fn enabled(raw: Option<&Self>) -> bool {
+        raw.and_then(|ledger| ledger.enable).unwrap_or(true)
+    }
+
+    /// The ledger options of a config.
+    pub fn options(raw: Option<&Self>) -> meow_common::traffic_ledger::Options {
+        meow_common::traffic_ledger::Options {
+            hosts: raw.and_then(|ledger| ledger.hosts).unwrap_or(true),
+            apps: raw.and_then(|ledger| ledger.apps).unwrap_or(true),
+        }
+    }
 }
 
 /// `logbook:` section.

@@ -374,6 +374,9 @@ fn run_application(
         meow_common::logbook::engine_stopped(meow_common::logbook::Stop::Failed(&format!(
             "{error:#}"
         )));
+        // The ledger opened at startup; a run that failed later still
+        // writes out what it counted and lets the directory go.
+        meow_common::traffic_ledger::uninstall();
     }
     drop(logging);
     result
@@ -585,6 +588,10 @@ fn run_application_inner(
         // the startup's own events (a provider that fails to load) are
         // recorded; the run is marked started once it is up.
         meow_common::logbook::apply(meow_config::raw::RawLogbook::enabled(raw.logbook.as_ref()));
+        meow_common::traffic_ledger::apply(
+            meow_config::raw::RawTrafficLedger::enabled(raw.traffic_ledger.as_ref()),
+            meow_config::raw::RawTrafficLedger::options(raw.traffic_ledger.as_ref()),
+        );
 
         let mut config = if args.config_string.is_some() {
             early_binding = preinstall_global_route_binding(&raw);
@@ -1660,6 +1667,7 @@ async fn run(
     let by = shutdown.wait().await?;
     info!("Shutting down ({by})...");
     meow_common::logbook::engine_stopped(meow_common::logbook::Stop::Requested(by));
+    meow_common::traffic_ledger::uninstall();
     drop(controller_file);
 
     Ok(())
