@@ -366,3 +366,75 @@ rules:
     );
     assert!(proxies["pick"].chain_health().is_none());
 }
+
+/// The traffic ledger files a chained outbound's flow under the member that
+/// carries its hop too, so every outbound names that member before any dial:
+/// one with the dialer injected (`daniel`, `tw`) and one behind the relay
+/// wrapper (`relay`, a type that cannot take it). A group names none (the
+/// tunnel asks its leaf), nor does an outbound without a `dialer-proxy`.
+#[test]
+fn a_chained_outbound_names_the_member_that_carries_its_hop() {
+    let raw: RawConfig = serde_saphyr::from_str(
+        r#"
+mixed-port: 17890
+proxies:
+  - name: daniel
+    type: trojan
+    server: snell.example.com
+    port: 8443
+    password: ledger-via
+    dialer-proxy: fast
+  - name: tw
+    type: trojan
+    server: 203.0.113.7
+    port: 443
+    password: ledger-via
+    dialer-proxy: HK-02
+  - name: relay
+    type: direct
+    dialer-proxy: fast
+  - name: HK-01
+    type: trojan
+    server: 127.0.0.1
+    port: 1
+    password: ledger-via
+  - name: HK-02
+    type: trojan
+    server: 127.0.0.1
+    port: 2
+    password: ledger-via
+proxy-groups:
+  - name: fast
+    type: select
+    proxies: [HK-01, HK-02]
+  - name: Proxy
+    type: select
+    proxies: [daniel]
+rules:
+  - MATCH,DIRECT
+"#,
+    )
+    .unwrap();
+    let meow_config::RebuildResult {
+        proxies,
+        dialer_registry,
+        ..
+    } = meow_config::rebuild_from_raw(&raw).expect("rebuild ok");
+    let metadata = Metadata {
+        network: Network::Tcp,
+        host: "example.com".into(),
+        dst_port: 443,
+        ..Default::default()
+    };
+    let hop = |name: &str| {
+        proxies[name]
+            .dialer_hop(&metadata)
+            .map(|hop| hop.name().to_owned())
+    };
+    assert_eq!(hop("daniel").as_deref(), Some("HK-01"));
+    assert_eq!(hop("tw").as_deref(), Some("HK-02"));
+    assert_eq!(hop("relay").as_deref(), Some("HK-01"));
+    assert_eq!(hop("Proxy"), None);
+    assert_eq!(hop("HK-01"), None);
+    drop(dialer_registry);
+}

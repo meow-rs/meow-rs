@@ -3,6 +3,7 @@ use crate::statistics::Statistics;
 use crate::tunnel::{MatchedRule, ResolvedTarget, TunnelInner};
 use meow_common::conn_note;
 use meow_common::conn_notes::{self, ConnNotes};
+use meow_common::traffic_ledger::Route;
 use meow_common::{with_dial_timeout, Metadata, ProxyAdapter, ProxyConn};
 use smallvec::{smallvec, SmallVec};
 use smol_str::SmolStr;
@@ -92,6 +93,18 @@ pub(crate) fn leaf_proxy(
     leaf
 }
 
+/// The member that carries the `dialer-proxy` hop of the leaf `adapter`
+/// dials through for `metadata` (see [`ProxyAdapter::dialer_hop`]).
+pub(crate) fn dialer_hop(
+    adapter: &dyn ProxyAdapter,
+    metadata: &Metadata,
+) -> Option<Arc<dyn meow_common::Proxy>> {
+    match leaf_proxy(adapter, metadata) {
+        Some(leaf) => leaf.dialer_hop(metadata),
+        None => adapter.dialer_hop(metadata),
+    }
+}
+
 /// A `chains` list read the way it was decided — rule target first, the
 /// leaf that dials last: `Proxy → Auto → HK-01`.
 struct PolicyPath<'a>(&'a [Arc<str>]);
@@ -116,11 +129,15 @@ impl<'a> ConnectionGuard<'a> {
         rule_payload: SmolStr,
         adapter: &dyn ProxyAdapter,
     ) -> Self {
-        let policy = || {
+        let route = || {
             let leaf = leaf_proxy(adapter, metadata);
-            Some(stats.proxy_name(leaf.as_deref().map_or(adapter.name(), |hop| hop.name())))
+            let leaf: &dyn ProxyAdapter = match &leaf {
+                Some(leaf) => leaf.as_ref(),
+                None => adapter,
+            };
+            Some(stats.route(stats.proxy_name(leaf.name()), leaf.dialer_hop(metadata)))
         };
-        if let Some(counters) = stats.begin_headless_connection(metadata, policy) {
+        if let Some(counters) = stats.begin_headless_connection(metadata, route) {
             return Self {
                 stats,
                 key: ConnectionKey::Headless,
@@ -137,6 +154,7 @@ impl<'a> ConnectionGuard<'a> {
             rule_payload,
             chains,
             ConnNotes::current(),
+            || dialer_hop(adapter, metadata),
         );
         Self {
             stats,
@@ -156,7 +174,12 @@ impl<'a> ConnectionGuard<'a> {
     ) -> Self {
         // Obtain the handle before publishing the entry. A concurrent DELETE
         // must cancel this exact handle, even before its first poll.
-        let headless = stats.begin_headless_connection(&metadata, || chains.first().cloned());
+        let headless = stats.begin_headless_connection(&metadata, || {
+            Some(Route {
+                policy: Arc::clone(chains.first()?),
+                via: None,
+            })
+        });
         let (key, counters) = if let Some(counters) = headless {
             (ConnectionKey::Headless, counters)
         } else {
@@ -166,6 +189,7 @@ impl<'a> ConnectionGuard<'a> {
                 rule_payload,
                 chains,
                 ConnNotes::current(),
+                || None,
             );
             (ConnectionKey::Api(id), counters)
         };
@@ -1278,5 +1302,43 @@ proxy-groups:
         // A leaf selection records just the leaf behind the group.
         selector.set("DIRECT").await.unwrap();
         assert_eq!(tracked_chain(&tunnel).await, ["DIRECT", "Proxy"]);
+    }
+
+    /// The traffic ledger asks the leaf a flow's groups pick for the
+    /// member carrying its `dialer-proxy` hop, and that member follows the
+    /// front's own pick.
+    #[tokio::test]
+    async fn the_dialer_hop_is_the_leafs_front_member() {
+        let raw: meow_config::raw::RawConfig = serde_saphyr::from_str(
+            "proxies:
+  - {name: daniel, type: socks5, server: 192.0.2.1, port: 1080, dialer-proxy: fast}
+  - {name: HK-01, type: socks5, server: 127.0.0.1, port: 1}
+  - {name: HK-02, type: socks5, server: 127.0.0.1, port: 2}
+proxy-groups:
+  - {name: fast, type: select, proxies: [HK-01, HK-02]}
+  - {name: Proxy, type: select, proxies: [daniel, HK-01]}
+",
+        )
+        .unwrap();
+        let built = meow_config::rebuild_from_raw(&raw).unwrap();
+        let proxies = built.proxies;
+        let hop =
+            || dialer_hop(proxies["Proxy"].as_ref(), &metadata()).map(|hop| hop.name().to_owned());
+        assert_eq!(hop().as_deref(), Some("HK-01"));
+        proxies["fast"]
+            .selection()
+            .unwrap()
+            .set("HK-02")
+            .await
+            .unwrap();
+        assert_eq!(hop().as_deref(), Some("HK-02"));
+        proxies["Proxy"]
+            .selection()
+            .unwrap()
+            .set("HK-01")
+            .await
+            .unwrap();
+        assert_eq!(hop(), None);
+        drop(built.dialer_registry);
     }
 }

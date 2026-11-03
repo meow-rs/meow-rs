@@ -14,7 +14,10 @@ the canonical, in-repo source a release is cut from.
   now keeps, for every local day, the bytes and connections per host
   (registrable domain), app, leaf policy and interface label, for 62 days
   in `<home>/traffic/traffic.db`, so a client can show today, this month
-  and last month grouped any of the four ways. The app is the package
+  and last month grouped any of the four ways. A node that carries
+  another outbound's `dialer-proxy` hop counts that traffic in its policy
+  row too, apart in `via_upload` / `via_download` / `via_requests`; the
+  other views and the totals count each flow once. The app is the package
   name on Android and, on Linux, macOS and Windows, the owner of a flow
   from this host (a loopback client, or the host's own traffic through
   TUN or a transparent listener), looked up off the connection's path.

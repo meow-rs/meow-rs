@@ -23,12 +23,16 @@ const LOCK_FILE: &str = "traffic.lock";
 /// `PRAGMA user_version` of [`SCHEMA`]. A database from a newer meow is
 /// left alone, neither read nor rewritten. Schema 1, without `app`, was
 /// only written by test builds before the ledger shipped; one is set aside.
-const SCHEMA_VERSION: i64 = 2;
+/// Schema 2, without `via`, is moved to this one as the ledger opens it,
+/// and read as it is until then.
+const SCHEMA_VERSION: i64 = 3;
 
 /// A contract with readers in other processes. `day` counts local days
 /// since 1970-01-01; `host` is a registrable domain, an IP address,
 /// [`OTHER_IPS`] or empty; `app` is a package name, an app bundle or a
-/// process name, or empty; `interface` is empty when the platform set no
+/// process name, or empty; `policy` is the leaf proxy and `via` the
+/// member that carried its `dialer-proxy` hop, or empty
+/// ([`super::Route`]); `interface` is empty when the platform set no
 /// label.
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS traffic (
@@ -36,13 +40,25 @@ CREATE TABLE IF NOT EXISTS traffic (
     host      TEXT NOT NULL,
     app       TEXT NOT NULL,
     policy    TEXT NOT NULL,
+    via       TEXT NOT NULL,
     interface TEXT NOT NULL,
     upload    INTEGER NOT NULL,
     download  INTEGER NOT NULL,
     requests  INTEGER NOT NULL,
-    PRIMARY KEY (day, host, app, policy, interface)
+    PRIMARY KEY (day, host, app, policy, via, interface)
 ) WITHOUT ROWID;
 ";
+
+/// Schema 2's rows, each with no `via`, after it was renamed out of the way.
+const FROM_SCHEMA_2: &str = "
+INSERT INTO traffic (day, host, app, policy, via, interface, upload, download, requests)
+SELECT day, host, app, policy, '', interface, upload, download, requests FROM traffic_2;
+DROP TABLE traffic_2;
+";
+
+/// The table of a database in [`SCHEMA_VERSION`] 2, as a reader sees it
+/// until the ledger opens it.
+const SCHEMA_2_TABLE: &str = "(SELECT *, '' AS via FROM traffic)";
 
 /// As the logbook's: commits survive a killed process, a power cut loses at
 /// most the last ones, and the log and cache stay small for an iOS network
@@ -55,9 +71,9 @@ PRAGMA cache_size = -256;
 ";
 
 const UPSERT: &str = "
-INSERT INTO traffic (day, host, app, policy, interface, upload, download, requests)
-VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-ON CONFLICT (day, host, app, policy, interface) DO UPDATE SET
+INSERT INTO traffic (day, host, app, policy, via, interface, upload, download, requests)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+ON CONFLICT (day, host, app, policy, via, interface) DO UPDATE SET
     upload = upload + excluded.upload,
     download = download + excluded.download,
     requests = requests + excluded.requests
@@ -263,7 +279,7 @@ impl Writer {
                     // current; the caller hears why instead.
                     let result = self
                         .flush(&mut day_end)
-                        .and_then(|()| report(&self.conn, &query))
+                        .and_then(|()| report(&self.conn, &query, "traffic"))
                         .map_err(io::Error::other);
                     let _ = reply.send(result);
                 }
@@ -350,14 +366,15 @@ impl Writer {
         {
             let mut upsert = tx.prepare(UPSERT)?;
             for batch in &self.backlog {
-                for ((host, app, policy, interface), counts) in &batch.rows {
+                for ((host, app, route, interface), counts) in &batch.rows {
                     let host = if hosts { host.as_str() } else { "" };
                     let host = cap_ip_host(&tx, &mut self.ip_hosts, batch.day, host)?;
                     upsert.execute(params![
                         batch.day,
                         host,
                         if apps { app.as_str() } else { "" },
-                        &**policy,
+                        &*route.policy,
+                        route.via.as_deref().unwrap_or_default(),
                         interface.as_str(),
                         int(counts.upload),
                         int(counts.download),
@@ -482,23 +499,39 @@ fn vacuum(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// `query` answered from `conn`.
-fn report(conn: &Connection, query: &Query) -> rusqlite::Result<Report> {
+/// `query` answered from `conn`, whose rows are in `table`.
+fn report(conn: &Connection, query: &Query, table: &str) -> rusqlite::Result<Report> {
+    // A policy filter keeps the flows a Policy row of that proxy counts:
+    // the ones it left through and the ones whose hop it carried.
+    let filter = "day BETWEEN ?1 AND ?2 \
+         AND (?3 IS NULL OR host = ?3) \
+         AND (?4 IS NULL OR app = ?4) \
+         AND (?5 IS NULL OR policy = ?5 OR (via = ?5 AND via != '')) \
+         AND (?6 IS NULL OR interface = ?6)";
     let column = match query.by {
         GroupBy::Host => "host",
         GroupBy::App => "app",
         GroupBy::Policy => "policy",
         GroupBy::Interface => "interface",
     };
+    // Each flow once under its group, and by Policy once more under the
+    // member that carried its hop, as that member's `via_*`.
+    let mut flows = format!(
+        "SELECT {column} AS name, upload, download, requests, \
+         0 AS hop_up, 0 AS hop_down, 0 AS hop_requests FROM {table} WHERE {filter}"
+    );
+    if query.by == GroupBy::Policy {
+        flows = format!(
+            "{flows} UNION ALL \
+             SELECT via, upload, download, requests, upload, download, requests \
+             FROM {table} WHERE via != '' AND {filter}"
+        );
+    }
     let sql = format!(
-        "SELECT {column}, SUM(upload), SUM(download), SUM(requests) FROM traffic \
-         WHERE day BETWEEN ?1 AND ?2 \
-         AND (?3 IS NULL OR host = ?3) \
-         AND (?4 IS NULL OR app = ?4) \
-         AND (?5 IS NULL OR policy = ?5) \
-         AND (?6 IS NULL OR interface = ?6) \
-         GROUP BY {column} \
-         ORDER BY SUM(upload) + SUM(download) DESC, SUM(requests) DESC, {column}"
+        "SELECT name, SUM(upload), SUM(download), SUM(requests), \
+         SUM(hop_up), SUM(hop_down), SUM(hop_requests) FROM ({flows}) \
+         GROUP BY name \
+         ORDER BY SUM(upload) + SUM(download) DESC, SUM(requests) DESC, name"
     );
     let mut statement = conn.prepare(&sql)?;
     let rows = statement
@@ -517,15 +550,24 @@ fn report(conn: &Connection, query: &Query) -> rusqlite::Result<Report> {
                     upload: uint(row.get(1)?),
                     download: uint(row.get(2)?),
                     requests: uint(row.get(3)?),
+                    via_upload: uint(row.get(4)?),
+                    via_download: uint(row.get(5)?),
+                    via_requests: uint(row.get(6)?),
                 })
             },
         )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut report = empty_report(query);
     for row in &rows {
-        report.upload = report.upload.saturating_add(row.upload);
-        report.download = report.download.saturating_add(row.download);
-        report.requests = report.requests.saturating_add(row.requests);
+        // A hop's flow is counted once already, under its leaf proxy.
+        let flows = (
+            row.upload.saturating_sub(row.via_upload),
+            row.download.saturating_sub(row.via_download),
+            row.requests.saturating_sub(row.via_requests),
+        );
+        report.upload = report.upload.saturating_add(flows.0);
+        report.download = report.download.saturating_add(flows.1);
+        report.requests = report.requests.saturating_add(flows.2);
     }
     report.rows = rows;
     Ok(report)
@@ -552,11 +594,13 @@ pub fn read(dir: &Path, query: &Query) -> io::Result<Report> {
     )
     .map_err(io::Error::other)?;
     conn.busy_timeout(BUSY_TIMEOUT).map_err(io::Error::other)?;
-    if schema_version(&conn).map_err(Unusable::into_io)? == 0 {
+    let table = match schema_version(&conn).map_err(Unusable::into_io)? {
         // Created, and the schema not committed yet.
-        return Ok(empty_report(query));
-    }
-    report(&conn, query).map_err(io::Error::other)
+        0 => return Ok(empty_report(query)),
+        2 => SCHEMA_2_TABLE,
+        _ => "traffic",
+    };
+    report(&conn, query, table).map_err(io::Error::other)
 }
 
 /// Empty the ledger in `dir` from another process (see [`super::clear_at`]).
@@ -642,6 +686,14 @@ fn connect(path: &Path) -> Result<Connection, Unusable> {
         tx.execute_batch(SCHEMA)?;
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
+    } else if version == 2 {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch("ALTER TABLE traffic RENAME TO traffic_2")?;
+        tx.execute_batch(SCHEMA)?;
+        tx.execute_batch(FROM_SCHEMA_2)?;
+        tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        tx.commit()?;
+        vacuum(&conn)?;
     }
     Ok(conn)
 }
@@ -658,7 +710,7 @@ fn schema_version(conn: &Connection) -> Result<i64, Unusable> {
     if version < 0 {
         return Err(Unusable::Damaged(format!("unknown schema {version}")));
     }
-    if (1..SCHEMA_VERSION).contains(&version) {
+    if version == 1 {
         return Err(Unusable::Damaged(format!(
             "schema {version} of a test build"
         )));
@@ -697,7 +749,7 @@ fn uint(n: i64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::traffic_ledger::{self as ledger, add, Options, Query, OTHER_IPS};
+    use crate::traffic_ledger::{self as ledger, add, Options, Query, Route, OTHER_IPS};
     use smol_str::SmolStr;
     use std::sync::{Arc, Mutex as StdMutex};
 
@@ -740,8 +792,8 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = dir("groups");
         ledger::install(&dir, Options::default()).unwrap();
-        let proxy: Arc<str> = Arc::from("Node A");
-        let direct: Arc<str> = Arc::from("DIRECT");
+        let proxy = Route::from("Node A");
+        let direct = Route::from("DIRECT");
         let browser = SmolStr::new("org.example.browser");
         let none = SmolStr::default();
         ledger::set_interface("Wi-Fi");
@@ -831,13 +883,191 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// `(name, upload, download, requests, via_upload, via_requests)` of
+    /// each row.
+    fn rows(report: &Report) -> Vec<(&str, u64, u64, u64, u64, u64)> {
+        report
+            .rows
+            .iter()
+            .map(|row| {
+                assert_eq!(row.via_download, row.via_upload * 10, "{}", row.name);
+                (
+                    row.name.as_str(),
+                    row.upload,
+                    row.download,
+                    row.requests,
+                    row.via_upload,
+                    row.via_requests,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_dialer_proxy_hop_counts_under_its_carrier_by_policy_only() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = dir("via");
+        ledger::install(&dir, Options::default()).unwrap();
+        let through = |policy: &str, via: &str| Route {
+            policy: Arc::from(policy),
+            via: Some(Arc::from(via)),
+        };
+        let none = SmolStr::default();
+        let (a, b, c) = (
+            SmolStr::new("a.example"),
+            SmolStr::new("b.example"),
+            SmolStr::new("c.example"),
+        );
+        // A chained node through two members of its front group in turn,
+        // one of them also an exit of its own, and a direct flow.
+        add(&a, &none, &through("Chained", "Front 1"), 3, 30, 1);
+        add(&a, &none, &through("Chained", "Front 2"), 1, 10, 1);
+        add(&b, &none, &Route::from("Front 1"), 2, 20, 1);
+        add(&c, &none, &Route::from("DIRECT"), 5, 50, 1);
+
+        let policies = ledger::query(&query(GroupBy::Policy)).unwrap().unwrap();
+        assert_eq!(
+            rows(&policies),
+            [
+                ("Front 1", 5, 50, 2, 3, 1),
+                ("DIRECT", 5, 50, 1, 0, 0),
+                ("Chained", 4, 40, 2, 0, 0),
+                ("Front 2", 1, 10, 1, 1, 1),
+            ]
+        );
+        // Every flow once, though the rows add up to more.
+        let totals = (policies.upload, policies.download, policies.requests);
+        assert_eq!(totals, (11, 110, 4));
+
+        // Any other grouping counts a flow in one row.
+        let hosts = ledger::query(&query(GroupBy::Host)).unwrap().unwrap();
+        assert_eq!(
+            rows(&hosts),
+            [
+                ("c.example", 5, 50, 1, 0, 0),
+                ("a.example", 4, 40, 2, 0, 0),
+                ("b.example", 2, 20, 1, 0, 0),
+            ]
+        );
+        assert_eq!((hosts.upload, hosts.download, hosts.requests), totals);
+
+        // A member's row drills into what it carried, hops included.
+        let mut drill = query(GroupBy::Host);
+        drill.policy = Some("Front 1".into());
+        let carried = ledger::query(&drill).unwrap().unwrap();
+        assert_eq!(
+            rows(&carried),
+            [("a.example", 3, 30, 1, 0, 0), ("b.example", 2, 20, 1, 0, 0)]
+        );
+        assert_eq!(
+            (carried.upload, carried.download, carried.requests),
+            (5, 50, 2)
+        );
+
+        // A chained node's drills into the members that carried its hops.
+        drill.by = GroupBy::Policy;
+        drill.policy = Some("Chained".into());
+        let fronts = ledger::query(&drill).unwrap().unwrap();
+        assert_eq!(
+            rows(&fronts),
+            [
+                ("Chained", 4, 40, 2, 0, 0),
+                ("Front 1", 3, 30, 1, 3, 1),
+                ("Front 2", 1, 10, 1, 1, 1),
+            ]
+        );
+        assert_eq!(
+            (fronts.upload, fronts.download, fronts.requests),
+            (4, 40, 2)
+        );
+
+        // No hop matches an empty policy.
+        drill.policy = Some(String::new());
+        assert!(ledger::query(&drill).unwrap().unwrap().rows.is_empty());
+
+        // Another process reads them alike.
+        assert_eq!(
+            ledger::read(&dir, &query(GroupBy::Policy)).unwrap(),
+            policies
+        );
+        ledger::uninstall();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_schema_2_database_is_read_as_it_is_and_moved_on_as_the_ledger_opens() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = dir("schema-2");
+        fs::create_dir_all(&dir).unwrap();
+        let today = ledger::today();
+        let conn = Connection::open(dir.join(DB_FILE)).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             CREATE TABLE traffic (
+                 day INTEGER NOT NULL, host TEXT NOT NULL, app TEXT NOT NULL,
+                 policy TEXT NOT NULL, interface TEXT NOT NULL,
+                 upload INTEGER NOT NULL, download INTEGER NOT NULL,
+                 requests INTEGER NOT NULL,
+                 PRIMARY KEY (day, host, app, policy, interface)
+             ) WITHOUT ROWID;
+             PRAGMA user_version = 2;",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO traffic VALUES (?1, 'example.com', '', 'Node A', 'Wi-Fi', 1, 10, 1)",
+            [today],
+        )
+        .unwrap();
+        drop(conn);
+        let before = (
+            ledger::read(&dir, &query(GroupBy::Host)).unwrap(),
+            ledger::read(&dir, &query(GroupBy::Policy)).unwrap(),
+        );
+        assert_eq!(rows(&before.0), [("example.com", 1, 10, 1, 0, 0)]);
+        assert_eq!(rows(&before.1), [("Node A", 1, 10, 1, 0, 0)]);
+
+        ledger::install(&dir, Options::default()).unwrap();
+        assert!(!dir.join(CORRUPT_FILE).exists());
+        let route = Route {
+            policy: Arc::from("Node A"),
+            via: Some(Arc::from("Front")),
+        };
+        ledger::set_interface("Wi-Fi");
+        add(
+            &SmolStr::new("example.com"),
+            &SmolStr::default(),
+            &route,
+            2,
+            20,
+            1,
+        );
+        let policies = ledger::query(&query(GroupBy::Policy)).unwrap().unwrap();
+        assert_eq!(
+            rows(&policies),
+            [("Node A", 3, 30, 2, 0, 0), ("Front", 2, 20, 1, 2, 1)]
+        );
+        ledger::uninstall();
+        ledger::set_interface("");
+        let conn = Connection::open(dir.join(DB_FILE)).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        drop(conn);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn counts_survive_a_restart_and_another_process_clears_them() {
         let _serial = SERIAL
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = dir("restart");
-        let proxy: Arc<str> = Arc::from("Node B");
+        let proxy = Route::from("Node B");
         let none = SmolStr::default();
         ledger::install(&dir, Options::default()).unwrap();
         add(&SmolStr::new("example.com"), &none, &proxy, 1, 2, 1);
@@ -862,7 +1092,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = dir("cleared-elsewhere");
-        let proxy: Arc<str> = Arc::from("Node C");
+        let proxy = Route::from("Node C");
         let none = SmolStr::default();
         ledger::install(&dir, Options::default()).unwrap();
         // A day full of addresses on disk, and more counted, not written.
@@ -895,7 +1125,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = dir("mark");
-        let proxy: Arc<str> = Arc::from("Node D");
+        let proxy = Route::from("Node D");
         let none = SmolStr::default();
         let host = SmolStr::new("example.com");
         ledger::install(&dir, Options::default()).unwrap();
@@ -956,7 +1186,7 @@ mod tests {
         for day in [today - RETENTION_DAYS, today - RETENTION_DAYS + 1, today] {
             conn.execute(
                 UPSERT,
-                params![day, "example.com", "", "DIRECT", "", 1, 1, 1],
+                params![day, "example.com", "", "DIRECT", "", "", 1, 1, 1],
             )
             .unwrap();
         }
@@ -1000,7 +1230,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = dir("batch-cap");
         ledger::install(&dir, Options::default()).unwrap();
-        let direct: Arc<str> = Arc::from("DIRECT");
+        let direct = Route::from("DIRECT");
         let none = SmolStr::default();
         let hosts_of = |batch: &Batch| {
             let mut hosts: Vec<_> = batch.rows.keys().map(|(host, ..)| host.clone()).collect();
@@ -1036,7 +1266,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = dir("refused");
         ledger::install(&dir, Options::default()).unwrap();
-        let proxy: Arc<str> = Arc::from("Node A");
+        let proxy = Route::from("Node A");
         add(
             &SmolStr::new("example.com"),
             &SmolStr::default(),
@@ -1081,7 +1311,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = dir("hosts-off");
         ledger::install(&dir, Options::default()).unwrap();
-        let proxy: Arc<str> = Arc::from("Node A");
+        let proxy = Route::from("Node A");
         let host = SmolStr::new("www.example.com");
         let browser = SmolStr::new("org.example.browser");
         add(&host, &browser, &proxy, 1, 2, 1);
@@ -1139,7 +1369,7 @@ mod tests {
             drop(conn);
             ledger::install(&dir, Options::default()).unwrap();
             assert!(dir.join(CORRUPT_FILE).exists(), "schema {version}");
-            let direct: Arc<str> = Arc::from("DIRECT");
+            let direct = Route::from("DIRECT");
             add(
                 &SmolStr::new("example.com"),
                 &SmolStr::default(),

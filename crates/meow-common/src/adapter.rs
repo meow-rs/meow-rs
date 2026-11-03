@@ -170,6 +170,15 @@ pub trait ProxyAdapter: Send + Sync {
     fn unwrap_proxy(&self, _metadata: &Metadata, _touch: bool) -> Option<Arc<dyn Proxy>> {
         None
     }
+    /// For an outbound that reaches its server through a `dialer-proxy`,
+    /// the member that carries that hop on the next dial for `metadata`:
+    /// the front's pick, peeked as [`Self::unwrap_proxy`] peeks, or the
+    /// front when it is no group. `None` for an outbound that dials its
+    /// server itself, and for a group: its leaf answers. Transparent
+    /// wrappers (the config layer's `WrappedProxy`) must forward it.
+    fn dialer_hop(&self, _metadata: &Metadata) -> Option<Arc<dyn Proxy>> {
+        None
+    }
     /// Drop every transport session this adapter caches across dials (mux
     /// session pools, a hysteria2 QUIC connection, pooled Snell/anytls
     /// sessions, a kcptun KCP session, …) so the next dial opens fresh

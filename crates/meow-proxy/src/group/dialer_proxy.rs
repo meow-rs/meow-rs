@@ -151,6 +151,11 @@ impl ProxyAdapter for DialerProxyAdapter {
         self.inner.unwrap_proxy(metadata, touch)
     }
 
+    /// The front's pick for the final target, as `dial_tcp` relays to it.
+    fn dialer_hop(&self, metadata: &Metadata) -> Option<Arc<dyn Proxy>> {
+        crate::dialer::front_hop_carrier(&self.dialer.resolve()?, metadata)
+    }
+
     /// Forward the session flush (issue #695): `member_proxies` exposes the
     /// inner adapter's members, never the inner adapter itself, so the
     /// reachability walk would otherwise miss its pools. A wrapper chain is

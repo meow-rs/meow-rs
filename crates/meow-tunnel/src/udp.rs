@@ -138,11 +138,18 @@ impl TunnelInner {
         let Some(leaf) = counted else {
             return Ok(conn);
         };
-        let name = leaf.as_deref().map_or(proxy.name(), |hop| hop.name());
+        let leaf: &dyn ProxyAdapter = match &leaf {
+            Some(leaf) => leaf.as_ref(),
+            None => proxy,
+        };
         Ok(Box::new(CountedPacketConn {
             conn,
             stats: Arc::clone(&self.stats),
-            counters: self.stats.begin_udp_flow(name, metadata),
+            counters: self.stats.begin_udp_flow(
+                leaf.name(),
+                || leaf.dialer_hop(metadata),
+                metadata,
+            ),
         }))
     }
 }

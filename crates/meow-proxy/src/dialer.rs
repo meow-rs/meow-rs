@@ -170,6 +170,14 @@ pub trait TcpDialer: Send + Sync {
         false
     }
 
+    /// The member that carries a dial to `host:port` through this
+    /// dialer's front, as the next such dial picks it (see
+    /// `ProxyAdapter::dialer_hop`); `None` for a dialer that dials
+    /// itself, and for a pick that sends nothing.
+    fn front_hop(&self, _host: &str, _port: u16) -> Option<Arc<dyn Proxy>> {
+        None
+    }
+
     /// UDP association to `remote` — mihomo's `dialer.ListenPacket`.
     ///
     /// A direct dialer binds a real socket; a proxy dialer asks its front
@@ -602,6 +610,17 @@ pub(crate) fn front_hop_counters(
     traffic: Option<&dyn ProxyTrafficSource>,
 ) -> Option<Arc<ProxyTraffic>> {
     let traffic = traffic?;
+    traffic.proxy_counters(front_hop_carrier(front, metadata)?.name())
+}
+
+/// The member a hop dialed through `front` for `metadata` takes, the one
+/// [`note_front_hop`] names: the last pick of `front`'s groups, or `front`
+/// when it is no group. `None` for a pick that sends nothing (REJECT,
+/// PASS).
+pub(crate) fn front_hop_carrier(
+    front: &Arc<dyn Proxy>,
+    metadata: &Metadata,
+) -> Option<Arc<dyn Proxy>> {
     let leaf = front_hop_picks(front, metadata)
         .last()
         .unwrap_or_else(|| Arc::clone(front));
@@ -610,7 +629,7 @@ pub(crate) fn front_hop_counters(
         | AdapterType::RejectDrop
         | AdapterType::Pass
         | AdapterType::PassRule => None,
-        _ => traffic.proxy_counters(leaf.name()),
+        _ => Some(leaf),
     }
 }
 
@@ -692,6 +711,10 @@ impl TcpDialer for ProxyDialer {
 
     fn is_proxy(&self) -> bool {
         true
+    }
+
+    fn front_hop(&self, host: &str, port: u16) -> Option<Arc<dyn Proxy>> {
+        front_hop_carrier(&self.proxy, &inner_dial_metadata(host, port, false))
     }
 
     async fn dial_udp_conn(
@@ -1210,6 +1233,11 @@ impl TcpDialer for NamedProxyDialer {
 
     fn is_proxy(&self) -> bool {
         true
+    }
+
+    fn front_hop(&self, host: &str, port: u16) -> Option<Arc<dyn Proxy>> {
+        let front = self.target.resolve()?;
+        front_hop_carrier(&front, &inner_dial_metadata(host, port, false))
     }
 
     async fn dial_udp_conn(
@@ -2884,6 +2912,47 @@ mod tests {
             None,
             "the tunnel counts the chained outbound itself"
         );
+    }
+
+    /// The traffic ledger files a chained outbound's flow under the member
+    /// that carries its hop too: both paths to the front name the member a
+    /// dial would take, before any dial, and a front that sends nothing
+    /// names none.
+    #[test]
+    fn the_front_hop_names_the_member_that_carries_it() {
+        let registry = fast_group_registry();
+        let dialer = NamedProxyDialer::new(DialerTarget::new("fast", &registry));
+        let hop = dialer.front_hop("ss.example.com", 8443).unwrap();
+        assert_eq!(hop.name(), "HK-01");
+
+        let daniel: Arc<dyn Proxy> = PipeProxy::new("daniel", "ss.example.com:8443");
+        let dpa = crate::DialerProxyAdapter::new(daniel, DialerTarget::new("fast", &registry));
+        let target = Metadata {
+            host: "example.com".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+        assert_eq!(dpa.dialer_hop(&target).unwrap().name(), "HK-01");
+
+        // A front that is no group carries the hop itself.
+        let plain: Arc<dyn Proxy> = PipeProxy::new("JP-02", "10.0.0.2:443");
+        let plain = registry_of(&plain);
+        let dialer = NamedProxyDialer::new(DialerTarget::new("fast", &plain));
+        assert_eq!(
+            dialer.front_hop("ss.example.com", 8443).unwrap().name(),
+            "JP-02"
+        );
+
+        let reject: Arc<dyn Proxy> = crate::group::test_support::MockProxy::new_failing(
+            "REJECT",
+            AdapterType::Reject,
+            "rejected",
+        );
+        let reject = registry_of(&reject);
+        let dialer = NamedProxyDialer::new(DialerTarget::new("fast", &reject));
+        assert!(dialer.front_hop("ss.example.com", 8443).is_none());
+        // A dialer that is no proxy has no hop.
+        assert!(DirectDialer.front_hop("ss.example.com", 8443).is_none());
     }
 
     /// The registry with `fast` as the only entry.

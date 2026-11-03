@@ -7395,8 +7395,12 @@ async fn traffic_ledger_groups_drills_and_clears() {
 
     let dir = tempfile::tempdir().unwrap();
     traffic_ledger::install(dir.path(), traffic_ledger::Options::default()).unwrap();
-    let direct: Arc<str> = Arc::from("DIRECT");
-    let node: Arc<str> = Arc::from("Ledger API Node");
+    let direct = traffic_ledger::Route::from("DIRECT");
+    // A node that reaches its server through a `dialer-proxy`.
+    let node = traffic_ledger::Route {
+        policy: Arc::from("Ledger API Node"),
+        via: Some(Arc::from("Ledger API Front")),
+    };
     let browser = "org.example.browser".into();
     traffic_ledger::add(
         &"www.ledger-api.example".into(),
@@ -7429,10 +7433,24 @@ async fn traffic_ledger_groups_drills_and_clears() {
 
     let policies = body_json(get("/traffic/ledger?by=policy&host=ledger-api.example").await).await;
     let rows = policies["rows"].as_array().unwrap();
-    assert_eq!(rows.len(), 2, "{policies}");
-    assert_eq!(rows[0]["name"], "Ledger API Node", "largest first");
+    assert_eq!(rows.len(), 3, "{policies}");
+    // The front member counts the hop it carried, the node its flows.
+    assert_eq!(rows[0]["name"], "Ledger API Front", "largest first");
     assert_eq!(rows[0]["download"], 2000);
-    assert_eq!(rows[1]["name"], "DIRECT");
+    assert_eq!(rows[0]["via_download"], 2000);
+    assert_eq!(rows[0]["via_requests"], 2);
+    assert_eq!(rows[1]["name"], "Ledger API Node");
+    assert_eq!(rows[1]["download"], 2000);
+    assert_eq!(rows[1]["via_download"], 0);
+    assert_eq!(rows[2]["name"], "DIRECT");
+    // Each flow once in the totals.
+    assert_eq!(policies["download"], 2100);
+    assert_eq!(policies["requests"], 3);
+
+    let carried =
+        body_json(get("/traffic/ledger?host=ledger-api.example&policy=Ledger%20API%20Front").await)
+            .await;
+    assert_eq!(carried["download"], 2000, "{carried}");
 
     let drilled =
         body_json(get("/traffic/ledger?by=interface&host=ledger-api.example&policy=DIRECT").await)
