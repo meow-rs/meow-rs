@@ -66,10 +66,15 @@ live connection, headless connection and UDP flow: every 60 s, at local
 midnight, before the interface label changes, at a query and at a stop. A
 flow settles once more as it is closed, and once more as its last handle
 drops, for bytes still in flight at the close. What a settle hands over
-is counted under the interface label of that moment, so a label change
-settles the flows on the caller's thread and switches, without waiting
-for the writer: a writer held up by the disk still files what came
-before under the label it came under. Settling is a `fetch_max`
+is counted under the interface label it read before it took the bytes,
+with the ledger's epoch (see the apps section below): a label change
+racing a settle leaves what came before it under the label it came on, and
+a clear racing one drops what it took. A label change settles the flows
+on the caller's thread and switches, without waiting for the writer: a
+writer held up by the disk still files what came before under the label
+it came under. A stop settles them on the caller's thread too, while the
+ledger still records, and the writer writes what is pending as it stops,
+however long the disk holds it. Settling is a `fetch_max`
 on two atomics per flow, so racing settlers take disjoint parts. A burst
 of flows to distinct hosts (a scan) asks the writer for a flush early, at
 4096 pending rows, so pending counts stay bounded in memory.
@@ -92,9 +97,14 @@ Windows), for flows from a loopback address, and for flows through the
 TUN device or a transparent listener (redir, tproxy) whose source
 address is one of this host's: the host's own traffic, not a LAN
 client's, which costs no scan. Linux reads the interface addresses
-(again on a miss, at most once a second), as a bind there takes any
+(again on a miss after a second, and on a hit after ten, as an address
+the host gave up may be a LAN client's now), as a bind there takes any
 address with `ip_nonlocal_bind` set, which some gateways set; macOS and
-Windows bind to the address. An Android VPN supplies the package with
+Windows bind to the address. A dual-stack listener sees an IPv4 client as
+`::ffff:a.b.c.d`; it is looked up under the IPv4 address, in the IPv4
+socket table and then the IPv6 one, which lists an AF_INET6 socket on an
+IPv4 address (Java's default) under the mapped address. PROCESS-NAME,
+PROCESS-PATH and UID rules share the lookup. An Android VPN supplies the package with
 every flow and needs none. A flow whose rules looked its process up
 already is looked up again: rule matching keeps its enriched metadata to
 itself, so `/connections` stays as it was.
@@ -169,7 +179,14 @@ off; a failure is a 503. That includes a reader in another process
 holding the deleted traffic on disk past the busy timeout (1 s): the
 write-ahead log cannot be checkpointed and truncated under it, so the
 clear says so, and a later one finishes it. What was pending is dropped
-either way, as the clear asked.
+either way, as the clear asked. A clear from another process
+(`traffic_ledger::clear_at`, which the Android UI process calls while the
+engine runs in the VPN's) commits on a connection of its own. The engine's
+writer sees SQLite's `data_version` move at its next write (within a
+minute, or at a query) and drops what it counted until then, its backlog
+and the day's addresses toward the IP cap, as a clear of its own would,
+rather than write them over the clear. The process lock leaves
+`clear_at` the only other connection that commits.
 
 ### Config
 
@@ -205,7 +222,9 @@ API and records nothing.
   past 23 bytes). Off, a connection pays one relaxed load.
 - With apps on, on Linux, macOS and Windows every flow from this host
   costs a platform socket lookup on the lookup thread: Linux serves most
-  from its short-TTL caches, macOS scans every process's sockets. A
+  from its short-TTL caches, macOS scans every process's sockets. On
+  Linux and Windows, an IPv4 socket not in the IPv4 table is looked for
+  in the IPv6 one too. A
   host's own flows reach the ledger a little later than the rest, by the
   lookup queue's length, and what one carried before its app is known is
   lost if the ledger stops first. `apps: false` stops the lookups.

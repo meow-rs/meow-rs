@@ -127,8 +127,10 @@ impl Ledger {
             }
             Err(Unusable::Failed(e)) => return Err(e),
         };
+        let data_version = data_version(&conn).map_err(io::Error::other)?;
         let writer = Writer {
             conn,
+            data_version,
             pruned: i32::MIN,
             ip_hosts: None,
             backlog: Vec::new(),
@@ -227,6 +229,11 @@ impl Drop for Ledger {
 
 struct Writer {
     conn: Connection,
+    /// The database's `data_version` as this writer last saw it. It moves
+    /// as another connection commits, and the one that can is a
+    /// [`clear_at`] from another process: the process lock keeps out any
+    /// other writer.
+    data_version: i64,
     /// The day expired rows were last deleted on.
     pruned: i32,
     /// The IP-address hosts of one day, toward [`MAX_IP_HOSTS`].
@@ -291,6 +298,14 @@ impl Writer {
     /// the day [`flush_day`] picks; the commit's error when it failed, and
     /// what it held is kept for the next flush.
     fn flush(&mut self, day_end: &mut i64) -> rusqlite::Result<()> {
+        if self.cleared_elsewhere() {
+            // What this process counted before an app's UI emptied the
+            // database is not written over it, nor are the day's
+            // addresses it held toward the cap.
+            super::discard_pending();
+            self.backlog.clear();
+            self.ip_hosts = None;
+        }
         let now = unix_now();
         let zone = zone();
         let day = flush_day(zone, now, *day_end);
@@ -354,6 +369,21 @@ impl Writer {
         tx.commit()
     }
 
+    /// Whether another process emptied the database since the last flush.
+    fn cleared_elsewhere(&mut self) -> bool {
+        match data_version(&self.conn) {
+            Ok(version) if version != self.data_version => {
+                self.data_version = version;
+                true
+            }
+            Ok(_) => false,
+            Err(e) => {
+                warn!("traffic ledger: cannot tell whether it was cleared: {e}");
+                false
+            }
+        }
+    }
+
     /// Delete the days past [`RETENTION_DAYS`], once a day.
     fn prune(&mut self, today: i32) {
         if self.pruned == today {
@@ -377,8 +407,6 @@ fn flush_day(zone: TimeZone, now: i64, day_end: i64) -> i32 {
     }
 }
 
-/// `host`, or [`OTHER_IPS`] for an IP address past `day`'s
-/// [`MAX_IP_HOSTS`].
 /// The IP-address hosts `day` has on disk, read once per day into
 /// `ip_hosts`.
 fn ip_hosts_of<'a>(
@@ -398,6 +426,8 @@ fn ip_hosts_of<'a>(
     Ok(&mut ip_hosts.get_or_insert_with(|| (day, HashSet::new())).1)
 }
 
+/// `host`, or [`OTHER_IPS`] for an IP address past `day`'s
+/// [`MAX_IP_HOSTS`].
 fn cap_ip_host<'a>(
     conn: &Connection,
     ip_hosts: &mut Option<(i32, HashSet<String>)>,
@@ -618,6 +648,11 @@ fn connect(path: &Path) -> Result<Connection, Unusable> {
 
 /// The database's `user_version`; one from a newer meow is an error, and
 /// one no meow writes marks a database that is not the ledger's.
+/// A value SQLite moves as other connections commit to the database.
+fn data_version(conn: &Connection) -> rusqlite::Result<i64> {
+    conn.query_row("PRAGMA data_version", [], |row| row.get(0))
+}
+
 fn schema_version(conn: &Connection) -> Result<i64, Unusable> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version < 0 {
@@ -818,6 +853,81 @@ mod tests {
             .rows
             .is_empty());
         ledger::uninstall();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_clear_from_another_process_drops_what_was_counted_before_it() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = dir("cleared-elsewhere");
+        let proxy: Arc<str> = Arc::from("Node C");
+        let none = SmolStr::default();
+        ledger::install(&dir, Options::default()).unwrap();
+        // A day full of addresses on disk, and more counted, not written.
+        for i in 0..MAX_IP_HOSTS {
+            let ip = SmolStr::new(format!("10.0.{}.{}", i / 256, i % 256));
+            add(&ip, &none, &proxy, 1, 1, 1);
+        }
+        ledger::flush();
+        add(&SmolStr::new("example.com"), &none, &proxy, 5, 5, 1);
+
+        // An app's UI empties it while the engine runs.
+        ledger::clear_at(&dir).unwrap();
+        let hosts = |by| ledger::query(&query(by)).unwrap().unwrap();
+        assert!(
+            hosts(GroupBy::Host).rows.is_empty(),
+            "what was counted before is not written over the clear"
+        );
+        // Nor do the addresses it deleted count toward the cap.
+        add(&SmolStr::new("192.0.2.1"), &none, &proxy, 7, 7, 1);
+        let report = hosts(GroupBy::Host);
+        let names: Vec<_> = report.rows.iter().map(|row| row.name.as_str()).collect();
+        assert_eq!(names, ["192.0.2.1"]);
+        ledger::uninstall();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bytes_taken_across_a_clear_or_a_label_change_count_before_it() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = dir("mark");
+        let proxy: Arc<str> = Arc::from("Node D");
+        let none = SmolStr::default();
+        let host = SmolStr::new("example.com");
+        ledger::install(&dir, Options::default()).unwrap();
+        ledger::set_interface("Wi-Fi");
+
+        // A settle reads its mark, a clear lands, then it adds what it took.
+        let mark = ledger::mark();
+        ledger::clear().unwrap();
+        mark.add(&host, &none, &proxy, 1, 1, 1);
+        assert!(
+            ledger::query(&query(GroupBy::Host))
+                .unwrap()
+                .unwrap()
+                .rows
+                .is_empty(),
+            "carried before the clear"
+        );
+
+        // A label change lands instead.
+        let mark = ledger::mark();
+        ledger::set_interface("Cellular");
+        mark.add(&host, &none, &proxy, 2, 2, 1);
+        add(&host, &none, &proxy, 3, 3, 1);
+        let report = ledger::query(&query(GroupBy::Interface)).unwrap().unwrap();
+        let rows: Vec<_> = report
+            .rows
+            .iter()
+            .map(|row| (row.name.as_str(), row.upload))
+            .collect();
+        assert_eq!(rows, [("Cellular", 3), ("Wi-Fi", 2)]);
+        ledger::uninstall();
+        ledger::set_interface("");
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -242,9 +242,7 @@ pub async fn maybe_enrich_with_process_async(metadata: &Metadata) -> Option<Meta
     if !metadata.process.is_empty() {
         return None;
     }
-    // An IPv4 client of a dual-stack listener is found under its IPv4
-    // address.
-    let src_ip = metadata.src_ip?.to_canonical();
+    let src_ip = metadata.src_ip?;
     if metadata.src_port == 0 {
         return None;
     }
@@ -261,9 +259,7 @@ pub fn maybe_enrich_with_process(metadata: &Metadata) -> Option<Metadata> {
     if !metadata.process.is_empty() {
         return None;
     }
-    // An IPv4 client of a dual-stack listener is found under its IPv4
-    // address.
-    let src_ip = metadata.src_ip?.to_canonical();
+    let src_ip = metadata.src_ip?;
     if metadata.src_port == 0 {
         return None;
     }
