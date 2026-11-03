@@ -72,11 +72,17 @@ pub struct ProcessInfo {
 /// is the socket endpoint as seen by meow-rs's inbound — i.e. the client's
 /// source address when it connected to the proxy listener.
 ///
+/// An IPv4-mapped `local_addr` (`::ffff:a.b.c.d`, how a dual-stack
+/// listener sees an IPv4 client) is looked up as the IPv4 address it maps,
+/// which finds the client's socket whether it is an AF_INET one or an
+/// AF_INET6 one connected from that address.
+///
 /// This is a synchronous scan of OS tables (`/proc`, `libproc`,
 /// `GetExtended*Table`); callers on an async runtime should prefer
 /// [`find_process_async`], which offloads it to the blocking pool.
 pub fn find_process(network: Network, local_addr: SocketAddr) -> Option<ProcessInfo> {
-    platform::find_process(network, local_addr)
+    let local = SocketAddr::new(local_addr.ip().to_canonical(), local_addr.port());
+    platform::find_process(network, local)
 }
 
 /// Async counterpart of [`find_process`]: the platform scan is synchronous
@@ -184,20 +190,27 @@ mod platform {
     static INODE_MAP: OnceLock<Mutex<InodeCache>> = OnceLock::new();
 
     pub fn find_process(network: Network, local: SocketAddr) -> Option<ProcessInfo> {
-        let (table_idx, path, ipv6) = match (network, local.is_ipv4()) {
-            (Network::Tcp, true) => (0, "/proc/net/tcp", false),
-            (Network::Tcp, false) => (0, "/proc/net/tcp6", true),
-            (Network::Udp, true) => (1, "/proc/net/udp", false),
-            (Network::Udp, false) => (1, "/proc/net/udp6", true),
+        let (table_idx, v4, v6) = match network {
+            Network::Tcp => (0, "/proc/net/tcp", "/proc/net/tcp6"),
+            Network::Udp => (1, "/proc/net/udp", "/proc/net/udp6"),
+        };
+        // An AF_INET6 socket on an IPv4 address (a client of a dual-stack
+        // listener that opened one, as Java does by default) is listed in
+        // the IPv6 table, under the IPv4-mapped address.
+        let tables: &[(&str, bool)] = if local.is_ipv4() {
+            &[(v4, false), (v6, true)]
+        } else {
+            &[(v6, true)]
         };
 
-        let table = sock_table(table_idx, path, ipv6);
-        let (inode, uid) = table
-            .get(&local.port())
-            .into_iter()
-            .flatten()
-            .find(|(addr, _, _)| addr_matches(*addr, local.ip()))
-            .map(|(_, inode, uid)| (*inode, *uid))?;
+        let (inode, uid) = tables.iter().find_map(|&(path, ipv6)| {
+            sock_table(table_idx, path, ipv6)
+                .get(&local.port())
+                .into_iter()
+                .flatten()
+                .find(|(addr, _, _)| addr_matches(*addr, local.ip()))
+                .map(|(_, inode, uid)| (*inode, *uid))
+        })?;
         trace!(inode, uid, "process_lookup: matched /proc/net entry");
         let (_pid, name, exe) = find_pid_by_inode_cached(inode)?;
         Some(ProcessInfo {
@@ -568,10 +581,14 @@ mod platform {
     const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 
     pub fn find_process(network: Network, local: SocketAddr) -> Option<ProcessInfo> {
+        // A dual-mode AF_INET6 socket on an IPv4 address is listed in the
+        // IPv6 table, under the IPv4-mapped address.
         let pid = match (network, local.is_ipv4()) {
-            (Network::Tcp, true) => walk_tcp_table::<MIB_TCPROW_OWNER_PID>(AF_INET, local),
+            (Network::Tcp, true) => walk_tcp_table::<MIB_TCPROW_OWNER_PID>(AF_INET, local)
+                .or_else(|| walk_tcp_table::<MIB_TCP6ROW_OWNER_PID>(AF_INET6, local)),
             (Network::Tcp, false) => walk_tcp_table::<MIB_TCP6ROW_OWNER_PID>(AF_INET6, local),
-            (Network::Udp, true) => walk_udp_table::<MIB_UDPROW_OWNER_PID>(AF_INET, local),
+            (Network::Udp, true) => walk_udp_table::<MIB_UDPROW_OWNER_PID>(AF_INET, local)
+                .or_else(|| walk_udp_table::<MIB_UDP6ROW_OWNER_PID>(AF_INET6, local)),
             (Network::Udp, false) => walk_udp_table::<MIB_UDP6ROW_OWNER_PID>(AF_INET6, local),
         };
         let pid = pid?;
@@ -867,6 +884,31 @@ mod tests {
         let info =
             find_process(Network::Udp, addr).expect("UDP IPv6 process lookup should succeed");
         assert!(!info.name.is_empty());
+    }
+
+    /// A dual-stack listener sees both kinds of IPv4 client as
+    /// `::ffff:127.0.0.1`: an AF_INET socket, and an AF_INET6 one
+    /// connected to the mapped address (Java's default). Each is found under
+    /// the IPv4 address and under the mapped one. (Windows sockets are not
+    /// dual-mode unless asked, so the AF_INET6 client cannot connect there.)
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn both_kinds_of_ipv4_client_are_found() {
+        use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
+        let listener = TcpListener::bind("[::]:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let loopback = Ipv4Addr::LOCALHOST;
+        let ipv4 = TcpStream::connect((loopback, port)).unwrap();
+        let ipv6 = TcpStream::connect((loopback.to_ipv6_mapped(), port)).unwrap();
+        for (kind, client) in [("AF_INET", &ipv4), ("AF_INET6", &ipv6)] {
+            let port = client.local_addr().unwrap().port();
+            for ip in [IpAddr::V4(loopback), IpAddr::V6(loopback.to_ipv6_mapped())] {
+                assert!(
+                    find_process(Network::Tcp, SocketAddr::new(ip, port)).is_some(),
+                    "{kind} client looked up as {ip}"
+                );
+            }
+        }
     }
 
     #[test]

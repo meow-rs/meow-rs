@@ -40,8 +40,8 @@ pub(crate) fn local_socket(metadata: &Metadata) -> Option<SocketAddr> {
     if !PROCESS_LOOKUP_SUPPORTED || metadata.src_port == 0 {
         return None;
     }
-    // The platform lookups find an IPv4 client of a dual-stack listener
-    // under its IPv4 address.
+    // A dual-stack listener sees an IPv4 client as `::ffff:a.b.c.d`, which
+    // is no loopback or interface address until it is mapped back.
     let ip = metadata.src_ip?.to_canonical();
     let maybe_local = ip.is_loopback()
         || matches!(
@@ -55,11 +55,18 @@ pub(crate) fn local_socket(metadata: &Metadata) -> Option<SocketAddr> {
 /// thread tells a flow of this host's from a LAN client's.
 #[derive(Default)]
 struct LocalAddresses {
-    /// The interfaces' addresses, read again on a miss at most once a
-    /// second, as they change with the network.
+    /// The interfaces' addresses, read again as they change with the
+    /// network: on a miss past [`MISS_AGE`] (an address just assigned),
+    /// on a hit past [`HIT_AGE`] (an address given up, which a LAN client
+    /// may hold now).
     #[cfg(target_os = "linux")]
     read: Option<(std::time::Instant, Vec<IpAddr>)>,
 }
+
+#[cfg(target_os = "linux")]
+const MISS_AGE: std::time::Duration = std::time::Duration::from_secs(1);
+#[cfg(target_os = "linux")]
+const HIT_AGE: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl LocalAddresses {
     fn contains(&mut self, ip: IpAddr) -> bool {
@@ -70,22 +77,16 @@ impl LocalAddresses {
     /// with `ip_nonlocal_bind` set, as on some gateways.
     #[cfg(target_os = "linux")]
     fn assigned(&mut self, ip: IpAddr) -> bool {
-        use std::time::{Duration, Instant};
-        if let Some((_, addresses)) = &self.read {
-            if addresses.contains(&ip) {
-                return true;
+        if let Some((at, addresses)) = &self.read {
+            let listed = addresses.contains(&ip);
+            let max_age = if listed { HIT_AGE } else { MISS_AGE };
+            if at.elapsed() < max_age {
+                return listed;
             }
-        }
-        let fresh = self
-            .read
-            .as_ref()
-            .is_some_and(|(at, _)| at.elapsed() < Duration::from_secs(1));
-        if fresh {
-            return false;
         }
         let addresses = interface_addresses();
         let assigned = addresses.contains(&ip);
-        self.read = Some((Instant::now(), addresses));
+        self.read = Some((std::time::Instant::now(), addresses));
         assigned
     }
 
@@ -236,5 +237,22 @@ mod tests {
         );
         let unbound = Metadata { src_port: 0, ..tun };
         assert_eq!(local_socket(&unbound), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_address_given_up_stops_counting_as_this_hosts() {
+        use std::time::Instant;
+        // TEST-NET-3: assigned to no host, as if this one gave it up.
+        let given_up: IpAddr = "203.0.113.9".parse().unwrap();
+        let mut addresses = LocalAddresses {
+            read: Some((Instant::now(), vec![given_up])),
+        };
+        assert!(addresses.contains(given_up), "read just now");
+        let Some(read_at) = Instant::now().checked_sub(HIT_AGE) else {
+            return;
+        };
+        addresses.read = Some((read_at, vec![given_up]));
+        assert!(!addresses.contains(given_up), "read again");
     }
 }

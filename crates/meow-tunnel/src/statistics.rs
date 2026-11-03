@@ -228,7 +228,10 @@ impl ConnCounters {
         let Some(tag) = &self.ledger else {
             return;
         };
-        let epoch = traffic_ledger::epoch();
+        // Read before the bytes are taken, so a clear or a label change
+        // landing meanwhile cannot file them as carried after it.
+        let mark = traffic_ledger::mark();
+        let epoch = mark.epoch();
         if tag.epoch.swap(epoch, Ordering::Relaxed) != epoch {
             unsettled(&self.upload, &tag.settled_upload);
             unsettled(&self.download, &tag.settled_download);
@@ -245,7 +248,7 @@ impl ConnCounters {
         } else {
             tag.owed.swap(false, Ordering::Relaxed)
         };
-        traffic_ledger::add(
+        mark.add(
             &tag.host,
             app,
             &tag.policy,

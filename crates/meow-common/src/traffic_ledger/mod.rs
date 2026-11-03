@@ -34,8 +34,9 @@
 //! connections carried since the last time — every [`FLUSH_INTERVAL`], at
 //! local midnight, before the interface label changes, at a query and at a
 //! stop — and what a connection carried last as it closes. What it hands
-//! over is counted under the interface label of the moment, and the writer
-//! thread commits it all in one transaction under the current day.
+//! over is counted under the interface label read as it takes it (a
+//! [`Mark`]), and the writer thread commits it all in one transaction under
+//! the current day.
 
 #[cfg_attr(not(feature = "traffic-ledger"), path = "disabled.rs")]
 mod store;
@@ -317,9 +318,8 @@ pub fn epoch() -> u32 {
 
 /// Count traffic toward `host` (a domain or an IP address as text, empty
 /// for none) from `app` (see [`GroupBy::App`], empty for none) through the
-/// leaf proxy `policy`, on the interface label set now. Called once per
-/// connection with its `requests`, then with its bytes as the tunnel
-/// settles. Does nothing while no ledger is installed.
+/// leaf proxy `policy`, on the interface label set now: [`Mark::add`]
+/// with a [`mark`] read now. Does nothing while no ledger is installed.
 pub fn add(
     host: &SmolStr,
     app: &SmolStr,
@@ -328,26 +328,76 @@ pub fn add(
     download: u64,
     requests: u64,
 ) {
-    if !enabled() || (upload == 0 && download == 0 && requests == 0) {
-        return;
+    mark().add(host, app, policy, upload, download, requests);
+}
+
+/// The [`epoch`] and the interface label traffic counts under, as a
+/// settle reads them before it takes the bytes a flow carried. A clear or
+/// a label change that lands while it takes them then cannot file them as
+/// carried after it: a clear drops them, and a label change leaves them
+/// under the label they were carried on.
+pub struct Mark {
+    epoch: u32,
+    interface: SmolStr,
+}
+
+/// The [`Mark`] of this moment.
+pub fn mark() -> Mark {
+    Mark {
+        epoch: epoch(),
+        interface: interface(),
     }
-    let interface = interface();
-    let held = {
-        let mut pending = PENDING.lock().unwrap_or_else(PoisonError::into_inner);
-        let pending = pending.get_or_insert_with(HashMap::new);
-        pending
-            .entry((host.clone(), app.clone(), Arc::clone(policy), interface))
-            .or_default()
-            .merge(Counts {
-                upload,
-                download,
-                requests,
-            });
-        pending.len()
-    };
-    if held == EARLY_FLUSH {
-        if let Some(ledger) = current() {
-            ledger.nudge();
+}
+
+impl Mark {
+    pub fn epoch(&self) -> u32 {
+        self.epoch
+    }
+
+    /// Count traffic carried up to this mark, as [`add`] does: once per
+    /// connection with its `requests`, then with its bytes as the tunnel
+    /// settles. Dropped when the ledger dropped what flows carried since
+    /// (a [`clear`]).
+    pub fn add(
+        self,
+        host: &SmolStr,
+        app: &SmolStr,
+        policy: &Arc<str>,
+        upload: u64,
+        download: u64,
+        requests: u64,
+    ) {
+        if !enabled() || (upload == 0 && download == 0 && requests == 0) {
+            return;
+        }
+        let held = {
+            let mut pending = PENDING.lock().unwrap_or_else(PoisonError::into_inner);
+            // Read under the lock a clear takes what is pending under: a
+            // clear moves the epoch on before it takes, so what is added
+            // after its take sees the new epoch.
+            if EPOCH.load(Ordering::Relaxed) != self.epoch {
+                return;
+            }
+            let pending = pending.get_or_insert_with(HashMap::new);
+            pending
+                .entry((
+                    host.clone(),
+                    app.clone(),
+                    Arc::clone(policy),
+                    self.interface,
+                ))
+                .or_default()
+                .merge(Counts {
+                    upload,
+                    download,
+                    requests,
+                });
+            pending.len()
+        };
+        if held == EARLY_FLUSH {
+            if let Some(ledger) = current() {
+                ledger.nudge();
+            }
         }
     }
 }
@@ -507,12 +557,13 @@ pub fn uninstall() {
         .unwrap_or_else(PoisonError::into_inner)
         .take();
     if let Some(ledger) = previous {
-        ledger.flush();
+        // What the flows carried is counted while the ledger still
+        // records, here rather than by a writer the disk may hold up past
+        // a flush's wait.
+        settle_sources();
         ENABLED.store(false, Ordering::Relaxed);
-        PENDING
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
+        // Hanging up, its writer writes what is pending as it stops.
+        drop(ledger);
     }
 }
 
@@ -558,8 +609,10 @@ pub fn read(dir: &Path, query: &Query) -> io::Result<Report> {
 }
 
 /// Delete everything in the ledger in `dir` from a process that does not
-/// write it. An engine running in another process keeps what it counted
-/// since its last flush, and writes it later.
+/// write it. An engine running in another process notices at its next
+/// write (at most [`FLUSH_INTERVAL`] later, or at a query) and drops what
+/// it counted until then, as a [`clear`] there would, instead of writing
+/// it over the clear.
 pub fn clear_at(dir: &Path) -> io::Result<()> {
     store::clear_at(dir)
 }

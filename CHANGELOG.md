@@ -55,10 +55,13 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
-- **PROCESS-NAME, PROCESS-PATH and UID rules match IPv4 clients of a
-  dual-stack listener** (`bind-address: "::"`): the process lookup ran on
-  the client's IPv4-mapped address, which Linux, macOS and Windows do not
-  file an IPv4 socket under, so those rules never matched them.
+- **PROCESS-NAME, PROCESS-PATH and UID rules match every IPv4 client of
+  a dual-stack listener** (`bind-address: "::"`). The process lookup ran
+  on the client's IPv4-mapped address, so it missed clients with an
+  AF_INET socket, the usual kind (curl, browsers). It now looks the IPv4
+  address up, in the IPv4 socket table and then (Linux, Windows) the IPv6
+  one, so it finds AF_INET clients and AF_INET6 ones on an IPv4 address
+  (Java's default) alike.
 - **`anytls` no longer silently ignores `ech-opts`** (#870): an enabled
   `ech-opts` or a `certificate`/`private-key` client certificate is now a
   config-load error, as for hysteria2, instead of connecting with the SNI in
