@@ -10,8 +10,9 @@
 //   and are paid for at task-spawn time (one allocation per task, shared with
 //   everything else in the future), not at relay-call time.
 //
-//   Public API: `copy_bidirectional_buf` and `RELAY_BUF_SIZE`.
-//   No new public types exposed — no M2 API break.
+//   Public API: `copy_bidirectional_buf`, `copy_bidirectional_buf_tracked`,
+//   `copy_bidirectional_buf_tracked_idle`, `RELAY_BUF_SIZE` and
+//   `RELAY_HALF_CLOSE_LINGER`. No new public types exposed — no M2 API break.
 //
 // Direction fairness (#345):
 //   The two directions are driven by ONE future, so they can never run on two

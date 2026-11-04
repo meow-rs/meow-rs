@@ -1017,6 +1017,11 @@ impl Tunnel {
     /// `None` or a zero duration disables the bound (pre-change relay
     /// behaviour). Applied to relays that start after the call, like every
     /// per-connection knob.
+    ///
+    /// The bound is stored in whole seconds via `Duration::as_secs`, so a
+    /// non-zero sub-second `Some(d)` truncates to `0` and *disables* the
+    /// bound — programmatic callers must round up themselves if that is
+    /// not the intent (config resolution only ever yields whole seconds).
     pub fn set_tcp_idle_timeout(&self, d: Option<std::time::Duration>) {
         self.inner
             .tcp_idle_timeout
