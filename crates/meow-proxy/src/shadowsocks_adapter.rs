@@ -15,7 +15,8 @@ use crate::v2ray_plugin::{self, V2rayPluginConfig};
 use async_trait::async_trait;
 use meow_common::atomic::{checked_increment, AtomicU};
 use meow_common::{
-    AdapterType, MeowError, Metadata, ProxyAdapter, ProxyConn, ProxyHealth, ProxyPacketConn, Result,
+    AdapterType, MeowError, Metadata, Network, ProxyAdapter, ProxyConn, ProxyHealth,
+    ProxyPacketConn, Result,
 };
 use meow_transport::simple_obfs::client::{HttpObfs, TlsObfs};
 use meow_transport::tls::TlsLayer;
@@ -1603,6 +1604,21 @@ impl ProxyAdapter for ShadowsocksAdapter {
                 false
             }
         }
+    }
+
+    /// kcptun's KCP datagrams carry every flow, TCP included; a mux session
+    /// carries UDP over its TCP stream; otherwise UDP goes as the plain SS
+    /// association, the way `dial_udp` reaches the server.
+    fn dialer_hop_network(&self, flow: Network) -> Network {
+        #[cfg(feature = "kcptun")]
+        if matches!(self.core.plugin, PluginKind::Kcptun(_)) {
+            return Network::Udp;
+        }
+        #[cfg(feature = "mux")]
+        if self.mux.as_ref().is_some_and(|mux| mux.supports_udp()) {
+            return Network::Tcp;
+        }
+        flow
     }
 
     async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {

@@ -134,15 +134,25 @@ impl TunnelInner {
         metadata: &Metadata,
     ) -> meow_common::Result<Box<dyn ProxyPacketConn>> {
         let counted = udp_leaf(proxy, metadata);
+        // The member carrying the leaf's dialer-proxy hop is peeked before
+        // the dial, as the leaf is: the dial commits the front's pick, and
+        // a round-robin front has moved on to the next member after it.
+        let via = match &counted {
+            Some(leaf) if meow_common::traffic_ledger::enabled() => match leaf {
+                Some(leaf) => leaf.dialer_hop(metadata),
+                None => proxy.dialer_hop(metadata),
+            },
+            _ => None,
+        };
         let conn = with_dial_timeout(proxy.name(), proxy.dial_udp(metadata)).await?;
         let Some(leaf) = counted else {
             return Ok(conn);
         };
-        let name = leaf.as_deref().map_or(proxy.name(), |hop| hop.name());
+        let leaf = leaf.as_deref().map_or(proxy.name(), |leaf| leaf.name());
         Ok(Box::new(CountedPacketConn {
             conn,
             stats: Arc::clone(&self.stats),
-            counters: self.stats.begin_udp_flow(name, metadata),
+            counters: self.stats.begin_udp_flow(leaf, || via, metadata),
         }))
     }
 }

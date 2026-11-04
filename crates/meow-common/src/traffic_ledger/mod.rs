@@ -4,10 +4,11 @@
 //! [`crate::traffic`] counts what each proxy carried since the engine
 //! started and forgets it at a stop. The ledger keeps, for every local day,
 //! the bytes sent and received and the connections opened (and UDP flows
-//! that sent something) per registrable domain, app, leaf proxy and
-//! interface label, for [`RETENTION_DAYS`] — enough for a client to show
-//! today, this month and last month, grouped any of the four ways. A meow
-//! extension; mihomo has no equivalent.
+//! that sent something) per registrable domain, app, leaf proxy (and the
+//! member that carried its `dialer-proxy` hop) and interface label, for
+//! [`RETENTION_DAYS`] — enough for a client to show today, this month and
+//! last month, grouped any of the four ways. A meow extension; mihomo has
+//! no equivalent.
 //!
 //! Unlike the logbook (ADR-0014), the ledger records destinations: with
 //! hosts on, it is a coarse browsing history (registrable domains, no
@@ -19,7 +20,8 @@
 //! # Storage
 //!
 //! `<home>/traffic/traffic.db` is an SQLite database (bundled SQLite, WAL
-//! mode) with one row per day, host, app, policy and interface; readers in
+//! mode) with one row per day, host, app, policy, `dialer-proxy` hop and
+//! interface; readers in
 //! other processes ([`read`]) rely on its schema. A database that cannot be read
 //! is set aside and the ledger starts over, and a lock file keeps a second
 //! meow process off the directory, as for the logbook.
@@ -82,8 +84,13 @@ pub enum GroupBy {
     /// `.app` bundle on macOS, the process name elsewhere; empty when the
     /// platform cannot tell or with apps off.
     App,
-    /// The leaf proxy that carried the traffic, as `/statistics` counts
-    /// it: a group's member, never the group; `DIRECT` and `REJECT` too.
+    /// The proxy that carried the traffic, as `/statistics` counts it: a
+    /// group's member, never the group; `DIRECT` and `REJECT` too. A flow
+    /// counts under the leaf proxy it left through and, when that proxy
+    /// reaches its server through a `dialer-proxy`, under the member that
+    /// carried that hop as well ([`Route::via`], [`Row::via_upload`]). The
+    /// rows then add up to more than the [`Report`], which counts each flow
+    /// once; the other groupings count each flow in one row.
     Policy,
     /// The label the platform set with [`set_interface`] when the traffic
     /// reached the ledger: `Wi-Fi`, `Cellular`; empty when none was set.
@@ -128,6 +135,8 @@ pub struct Query {
     pub by: GroupBy,
     pub host: Option<String>,
     pub app: Option<String>,
+    /// The flows a [`GroupBy::Policy`] row of this proxy counts: the ones
+    /// it left through and the ones whose `dialer-proxy` hop it carried.
     pub policy: Option<String>,
     pub interface: Option<String>,
 }
@@ -139,10 +148,20 @@ pub struct Row {
     pub upload: u64,
     pub download: u64,
     pub requests: u64,
+    /// Of the above, what this proxy carried as another one's
+    /// `dialer-proxy` hop ([`GroupBy::Policy`]; zero in the other
+    /// groupings).
+    #[serde(default)]
+    pub via_upload: u64,
+    #[serde(default)]
+    pub via_download: u64,
+    #[serde(default)]
+    pub via_requests: u64,
 }
 
-/// A [`Query`] answered: its rows by total bytes, largest first, and their
-/// sums.
+/// A [`Query`] answered: its rows by total bytes, largest first, and the
+/// sums of the flows they cover, each counted once. Those are the sums of
+/// the rows, but for [`GroupBy::Policy`] rows that carried hops.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Report {
     /// `YYYY-MM-DD`.
@@ -246,9 +265,31 @@ pub trait Source: Send + Sync {
     fn settle(&self);
 }
 
-/// Bytes and requests not yet written, by host, app, policy and interface
+/// The proxies a flow is counted under ([`GroupBy::Policy`]).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Route {
+    /// The leaf proxy the flow left through: a group's member, never the
+    /// group.
+    pub policy: Arc<str>,
+    /// When `policy` reaches its server through a `dialer-proxy`, the
+    /// member that carries that hop: the front's pick, or the front when it
+    /// is no group.
+    pub via: Option<Arc<str>>,
+}
+
+/// A flow through `policy` and no `dialer-proxy`.
+impl From<&str> for Route {
+    fn from(policy: &str) -> Self {
+        Self {
+            policy: Arc::from(policy),
+            via: None,
+        }
+    }
+}
+
+/// Bytes and requests not yet written, by host, app, route and interface
 /// label.
-type Pending = HashMap<(SmolStr, SmolStr, Arc<str>, SmolStr), Counts>;
+type Pending = HashMap<(SmolStr, SmolStr, Route, SmolStr), Counts>;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct Counts {
@@ -317,18 +358,18 @@ pub fn epoch() -> u32 {
 }
 
 /// Count traffic toward `host` (a domain or an IP address as text, empty
-/// for none) from `app` (see [`GroupBy::App`], empty for none) through the
-/// leaf proxy `policy`, on the interface label set now: [`Mark::add`]
-/// with a [`mark`] read now. Does nothing while no ledger is installed.
+/// for none) from `app` (see [`GroupBy::App`], empty for none) through
+/// `route`, on the interface label set now: [`Mark::add`] with a [`mark`]
+/// read now. Does nothing while no ledger is installed.
 pub fn add(
     host: &SmolStr,
     app: &SmolStr,
-    policy: &Arc<str>,
+    route: &Route,
     upload: u64,
     download: u64,
     requests: u64,
 ) {
-    mark().add(host, app, policy, upload, download, requests);
+    mark().add(host, app, route, upload, download, requests);
 }
 
 /// The [`epoch`] and the interface label traffic counts under, as a
@@ -362,7 +403,7 @@ impl Mark {
         self,
         host: &SmolStr,
         app: &SmolStr,
-        policy: &Arc<str>,
+        route: &Route,
         upload: u64,
         download: u64,
         requests: u64,
@@ -380,12 +421,7 @@ impl Mark {
             }
             let pending = pending.get_or_insert_with(HashMap::new);
             pending
-                .entry((
-                    host.clone(),
-                    app.clone(),
-                    Arc::clone(policy),
-                    self.interface,
-                ))
+                .entry((host.clone(), app.clone(), route.clone(), self.interface))
                 .or_default()
                 .merge(Counts {
                     upload,
@@ -652,8 +688,8 @@ pub fn reconfigure(enable: bool, options: Options) {
 }
 
 /// The key of a row: host (reduced to its registrable domain), app,
-/// policy and interface label.
-type RowKey = (String, SmolStr, Arc<str>, SmolStr);
+/// route and interface label.
+type RowKey = (String, SmolStr, Route, SmolStr);
 
 /// The rows written at a flush: pending counts by [`RowKey`], on one day.
 #[cfg_attr(not(feature = "traffic-ledger"), allow(dead_code))]
@@ -673,14 +709,14 @@ impl Batch {
     fn take(day: i32, known: &HashSet<String>) -> Self {
         let (hosts, apps) = (hosts(), apps());
         let mut rows: HashMap<RowKey, Counts> = HashMap::new();
-        for ((host, app, policy, interface), counts) in take_pending() {
+        for ((host, app, route, interface), counts) in take_pending() {
             let host = if hosts {
                 host_key(&host)
             } else {
                 String::new()
             };
             let app = if apps { app } else { SmolStr::default() };
-            rows.entry((host, app, policy, interface))
+            rows.entry((host, app, route, interface))
                 .or_default()
                 .merge(counts);
         }
@@ -700,14 +736,14 @@ impl Batch {
                 .map(|(host, _)| (*host).to_owned())
                 .collect();
             let mut capped: HashMap<RowKey, Counts> = HashMap::new();
-            for ((host, app, policy, interface), counts) in rows {
+            for ((host, app, route, interface), counts) in rows {
                 let host = if folded.contains(&host) {
                     OTHER_IPS.to_owned()
                 } else {
                     host
                 };
                 capped
-                    .entry((host, app, policy, interface))
+                    .entry((host, app, route, interface))
                     .or_default()
                     .merge(counts);
             }

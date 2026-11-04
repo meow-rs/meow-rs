@@ -21,7 +21,8 @@ mihomo has no equivalent, so this is a meow extension (ADR-0002).
 
 ### What is recorded
 
-For every local day, per host, app, leaf policy and interface label:
+For every local day, per host, app, leaf policy, dialer-proxy carrier
+and interface label:
 bytes sent, bytes received and the number of connections opened and UDP
 flows that sent something (`requests`).
 
@@ -42,7 +43,33 @@ flows that sent something (`requests`).
   hosts (a LAN gateway, a remote listener client).
 - **Policy** is the leaf proxy's name, the `chains[0]` a connection
   records, by name only: a renamed node starts a new row, and no server
-  fingerprint is kept. A dialer-proxy front hop is not counted twice.
+  fingerprint is kept.
+- **Via** is, for a leaf that dials its server through a `dialer-proxy`,
+  the member that carries that hop: the last pick of the front's groups,
+  or the front itself. It is named as the flow is tracked, with the same
+  peek its chains use, so a flow over a pooled or multiplexed session (a
+  Snell pool) has one too; a UDP flow's is named before its dial, as its
+  leaf is, since the dial commits the front's pick and a round-robin front
+  moves on after it. The front is asked on the network the hop takes,
+  which the leaf names (`dialer_hop_network`): a Shadowsocks or SOCKS5 UDP
+  flow goes to its server as datagrams and kcptun sends every flow as
+  them, while UDP over TCP (Trojan, VLESS, a mux session) rides a TCP hop;
+  a load-balance front picks a UDP hop among its UDP-capable members only.
+  The peek predicts the dial, and a front that rotates or hashes can still
+  carry the hop over another member: a flow on a session opened earlier
+  (kcptun, a pool) took that session's pick; a SOCKS5 UDP flow's control
+  connection takes a round-robin pick before its datagrams' hop does; and
+  a consistent-hashing front hashes the relay address a SOCKS5 server
+  returns, or the IP a kcptun dial (or a Shadowsocks UDP one whose front
+  cannot carry a name) resolves the server to, where the peek hashed the
+  server's name. Only the nearest hop is named; a front that chains on
+  through a dialer of its own is not followed. Empty for every other flow.
+  It counts in the policy view only: there a flow counts under its leaf
+  and under its carrier, its request included, so a node's row is what it
+  carried as an exit plus what it carried as a front, and the rows add up
+  to more than the totals. The host, app and interface views and the
+  totals count each flow once. The bytes are the flow's payload, not the
+  hop's wire bytes `/statistics` counts for the member.
 - **Interface** is a label the embedder pushes (`set_interface`), such as
   `Wi-Fi` or `Cellular` on mobile; empty when none was given.
 
@@ -56,7 +83,7 @@ is counted from then on (by flows that opened with them on too), and
 ### Recording
 
 The relay path is untouched. A flow's counters (`ConnCounters`) carry a
-`LedgerTag` — its host, app and leaf name, shared with the connection
+`LedgerTag` — its host, app, leaf name and carrier, shared with the connection
 rather than copied — while the ledger records, and nothing when it does
 not; `ConnectionInfo` does not change size. A connection counts as a
 request as it is tracked, a UDP flow as it first sends, so a dial that
@@ -144,10 +171,10 @@ SQLite, iOS/tvOS linking the system library), one table:
 ```sql
 CREATE TABLE traffic (
     day INTEGER NOT NULL, host TEXT NOT NULL, app TEXT NOT NULL,
-    policy TEXT NOT NULL, interface TEXT NOT NULL,
+    policy TEXT NOT NULL, via TEXT NOT NULL, interface TEXT NOT NULL,
     upload INTEGER NOT NULL, download INTEGER NOT NULL,
     requests INTEGER NOT NULL,
-    PRIMARY KEY (day, host, app, policy, interface)
+    PRIMARY KEY (day, host, app, policy, via, interface)
 ) WITHOUT ROWID;
 ```
 
@@ -158,10 +185,13 @@ keeps a second meow process off the directory, and a database that cannot
 be read (or carries a schema no meow writes) is set aside and started
 over, as for the logbook. One from a newer meow is left alone, neither
 read nor rewritten, and the ledger stays off. `PRAGMA user_version` is
-the schema version (2); readers in other processes
+the schema version (3); readers in other processes
 (`traffic_ledger::read`, used by the Android UI process) rely on it.
 Schema 1, without `app`, was only written by test builds before the
-ledger shipped and is set aside like a damaged one.
+ledger shipped and is set aside like a damaged one. Schema 2, without
+`via`, was written by builds of `main` before it; the writer moves it on
+in place as the ledger opens (its rows keep an empty `via`), and a reader
+in another process reads it as it is until then.
 
 ### API
 
@@ -169,8 +199,14 @@ ledger shipped and is set aside like a damaged one.
 the traffic of the local days `from` to `to` (`YYYY-MM-DD`, both
 included, today by default; `from` after `to` is a 400), grouped `by`
 `host` (the default), `app`, `policy` or `interface`, rows largest first,
-plus their sums. `host`, `app`, `policy` and `interface` narrow it to one
-group, for drill-down. A query settles the live flows first and writes
+plus the totals, each flow counted once. A row also gives `via_upload`,
+`via_download` and `via_requests`: the part of a policy row the node
+carried as a dialer-proxy front, zero in the other views. `host`, `app`,
+`policy` and `interface` narrow it to one group, for drill-down;
+`policy` to the flows that policy's row counts, those it was the leaf of
+and those it carried the hop of, so drilling into a node by policy shows
+the outbounds that chained through it. There is no `via` grouping or
+filter of its own. A query settles the live flows first and writes
 them, so it is current; when the write fails (a full disk), it is a 503,
 and what was pending is kept for the next flush. Off, or in a `minimal`
 build, it answers `enabled: false` with no rows. `DELETE /traffic/ledger`
@@ -216,8 +252,8 @@ API and records nothing.
   table.
 - With the ledger on, each connection takes the ledger's pending-counts
   mutex once as it opens, and each flow pays for two more atomics plus a
-  settle a minute. `ConnCounters` grows by the tag (96 B with the app
-  slot, one allocation per flow either way). A UDP flow allocates its own
+  settle a minute. `ConnCounters` grows by the tag (112 B with the app
+  slot and the carrier, one allocation per flow either way). A UDP flow allocates its own
   counters, and a flow to a bare IPv6 address formats it (an allocation
   past 23 bytes). Off, a connection pays one relaxed load.
 - With apps on, on Linux, macOS and Windows every flow from this host

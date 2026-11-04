@@ -22,8 +22,8 @@ use meow_common::atomic::{AtomicI, Int};
 use meow_common::conn_notes::ConnNotes;
 pub use meow_common::traffic::ProxyTraffic;
 use meow_common::traffic::ProxyTrafficSource;
-use meow_common::traffic_ledger;
-use meow_common::Metadata;
+use meow_common::traffic_ledger::{self, Route};
+use meow_common::{Metadata, Proxy};
 use parking_lot::Mutex;
 use serde::Serialize;
 use smallvec::SmallVec;
@@ -89,13 +89,13 @@ pub struct ConnCounters {
 }
 
 /// A flow's row in the traffic ledger (`meow_common::traffic_ledger`): its
-/// host, app and leaf proxy, and how much of its counters the ledger has
-/// had. The ledger takes the rest every minute and as the flow ends, never
-/// per chunk.
+/// host, app and route (leaf proxy and `dialer-proxy` hop), and how much
+/// of its counters the ledger has had. The ledger takes the rest every
+/// minute and as the flow ends, never per chunk.
 #[derive(Debug)]
 struct LedgerTag {
     host: SmolStr,
-    policy: Arc<str>,
+    route: Route,
     /// Unset while the app of a flow from this host is looked up off its
     /// path ([`crate::app_lookup`]): the counters keep what it carries
     /// until then.
@@ -112,14 +112,13 @@ struct LedgerTag {
 }
 
 impl LedgerTag {
-    /// The tag of a flow to `metadata`'s destination through `policy`
-    /// (the leaf proxy's name), or `None` while the ledger is off or the
-    /// flow has no leaf; with the socket whose owner names its app when
-    /// that takes a lookup.
+    /// The tag of a flow to `metadata`'s destination through `route`, or
+    /// `None` while the ledger is off or the flow has no leaf; with the
+    /// socket whose owner names its app when that takes a lookup.
     fn new(
         metadata: &Metadata,
         udp: bool,
-        policy: impl FnOnce() -> Option<Arc<str>>,
+        route: impl FnOnce() -> Option<Route>,
     ) -> Option<(Self, Option<SocketAddr>)> {
         if !traffic_ledger::enabled() {
             return None;
@@ -150,7 +149,7 @@ impl LedgerTag {
         }
         let tag = Self {
             host,
-            policy: policy()?,
+            route: route()?,
             app,
             udp,
             owed: AtomicBool::new(!udp),
@@ -176,7 +175,7 @@ fn unsettled(count: &AtomicI, settled: &AtomicI) -> (u64, bool) {
 
 impl ConnCounters {
     /// The counters of a flow to `metadata`'s destination, filed in the
-    /// traffic ledger through `policy` while it records (see
+    /// traffic ledger through `route` while it records (see
     /// [`LedgerTag::new`]). A connection is a request there as it opens
     /// and its app is known, a UDP flow once it sends.
     fn filed(
@@ -184,9 +183,9 @@ impl ConnCounters {
         proxy: Option<Arc<ProxyTraffic>>,
         metadata: &Metadata,
         udp: bool,
-        policy: impl FnOnce() -> Option<Arc<str>>,
+        route: impl FnOnce() -> Option<Route>,
     ) -> Arc<Self> {
-        let (ledger, lookup) = LedgerTag::new(metadata, udp, policy)
+        let (ledger, lookup) = LedgerTag::new(metadata, udp, route)
             .map_or((None, None), |(tag, lookup)| (Some(tag), lookup));
         let counters = Arc::new(Self {
             upload: AtomicI::new(0),
@@ -251,7 +250,7 @@ impl ConnCounters {
         mark.add(
             &tag.host,
             app,
-            &tag.policy,
+            &tag.route,
             upload,
             download,
             u64::from(requests),
@@ -378,8 +377,9 @@ pub struct Statistics {
     /// Live UDP flows the traffic ledger files, by counters address, so a
     /// settle reaches them as it reaches the connections.
     udp_flows: DashMap<usize, Arc<ConnCounters>>,
-    /// Leaf proxy names the traffic ledger filed while headless, which
-    /// keeps no [`Self::proxy_traffic`] to share them from.
+    /// Proxy names the traffic ledger filed with no
+    /// [`Self::proxy_traffic`] entry to share them from: every one while
+    /// headless, and `dialer-proxy` members yet to carry a hop.
     ledger_names: DashMap<Arc<str>, ()>,
 }
 
@@ -510,13 +510,29 @@ impl Statistics {
         Arc::clone(self.ledger_names.entry(Arc::from(proxy)).or_default().key())
     }
 
-    /// Counters for a UDP flow through the leaf proxy `leaf`: the proxy's
-    /// totals, and the flow's row in the traffic ledger while it records.
-    /// End it with [`Self::end_udp_flow`].
-    pub(crate) fn begin_udp_flow(&self, leaf: &str, metadata: &Metadata) -> Arc<ConnCounters> {
+    /// The ledger route of a flow through the leaf proxy `policy` whose
+    /// `dialer-proxy` hop `via` carries.
+    pub(crate) fn route(&self, policy: Arc<str>, via: Option<Arc<dyn Proxy>>) -> Route {
+        Route {
+            policy,
+            via: via.map(|hop| self.proxy_name(hop.name())),
+        }
+    }
+
+    /// Counters for a UDP flow through the leaf proxy `leaf`, whose
+    /// `dialer-proxy` hop `via` carries: the proxy's totals, and the
+    /// flow's row in the traffic ledger while it records. End it with
+    /// [`Self::end_udp_flow`].
+    pub(crate) fn begin_udp_flow(
+        &self,
+        leaf: &str,
+        via: impl FnOnce() -> Option<Arc<dyn Proxy>>,
+        metadata: &Metadata,
+    ) -> Arc<ConnCounters> {
         let proxy = self.proxy_counters(leaf);
-        let counters =
-            ConnCounters::filed(None, proxy, metadata, true, || Some(self.proxy_name(leaf)));
+        let counters = ConnCounters::filed(None, proxy, metadata, true, || {
+            Some(self.route(self.proxy_name(leaf), via()))
+        });
         if counters.ledger.is_some() {
             self.udp_flows
                 .insert(Arc::as_ptr(&counters).addr(), Arc::clone(&counters));
@@ -593,7 +609,7 @@ impl Statistics {
         rule_payload: SmolStr,
         chains: SmallVec<[Arc<str>; 1]>,
     ) -> Uuid {
-        self.track_connection_with_counters(metadata, rule, rule_payload, chains, None)
+        self.track_connection_with_counters(metadata, rule, rule_payload, chains, None, || None)
             .0
     }
 
@@ -604,6 +620,7 @@ impl Statistics {
         rule_payload: SmolStr,
         chains: SmallVec<[Arc<str>; 1]>,
         notes: Option<ConnNotes>,
+        via: impl FnOnce() -> Option<Arc<dyn Proxy>>,
     ) -> (Uuid, Arc<ConnCounters>) {
         let uuid = Uuid::new_v4();
         let counters = ConnCounters::filed(
@@ -611,7 +628,7 @@ impl Statistics {
             chains.first().and_then(|leaf| self.proxy_counters(leaf)),
             &metadata,
             false,
-            || chains.first().cloned(),
+            || Some(self.route(Arc::clone(chains.first()?), via())),
         );
         let info = ConnectionInfo {
             id: uuid,
@@ -639,14 +656,14 @@ impl Statistics {
     }
 
     /// Register a headless connection to `metadata`'s destination, filed in
-    /// the traffic ledger through `policy`; `None` when not headless.
+    /// the traffic ledger through `route`; `None` when not headless.
     pub(crate) fn begin_headless_connection(
         &self,
         metadata: &Metadata,
-        policy: impl FnOnce() -> Option<Arc<str>>,
+        route: impl FnOnce() -> Option<Route>,
     ) -> Option<Arc<ConnCounters>> {
         let connections = self.headless_connections.get()?;
-        let counters = ConnCounters::filed(None, None, metadata, false, policy);
+        let counters = ConnCounters::filed(None, None, metadata, false, route);
         // The guard pins this allocation until after its Drop unregisters it.
         // Even after a reload drains the map, a stale guard keeps its address
         // from being reused by a new connection. The address is only a private
@@ -910,7 +927,8 @@ mod ledger_tests {
             host: host.into(),
             ..Metadata::default()
         };
-        let (mut tag, _) = LedgerTag::new(&metadata, false, || Some(Arc::from("DIRECT"))).unwrap();
+        let (mut tag, _) =
+            LedgerTag::new(&metadata, false, || Some(Route::from("DIRECT"))).unwrap();
         tag.app = OnceLock::new();
         Arc::new(ConnCounters {
             upload: AtomicI::new(0),
@@ -944,6 +962,53 @@ mod ledger_tests {
         .unwrap()
     }
 
+    /// A round-robin front in miniature: a dial commits the member
+    /// `dialer_hop` peeks, so the next peek names the next one.
+    struct RoundRobinHop {
+        picks: std::sync::atomic::AtomicUsize,
+        members: [Arc<dyn Proxy>; 2],
+        health: meow_common::ProxyHealth,
+    }
+
+    #[async_trait::async_trait]
+    impl meow_common::ProxyAdapter for RoundRobinHop {
+        fn name(&self) -> &str {
+            "Ledger Round Robin"
+        }
+        fn adapter_type(&self) -> meow_common::AdapterType {
+            meow_common::AdapterType::Shadowsocks
+        }
+        fn addr(&self) -> &str {
+            ""
+        }
+        fn support_udp(&self) -> bool {
+            true
+        }
+        async fn dial_tcp(
+            &self,
+            _metadata: &Metadata,
+        ) -> meow_common::Result<Box<dyn meow_common::ProxyConn>> {
+            Err(meow_common::MeowError::NotSupported("tcp".into()))
+        }
+        async fn dial_udp(
+            &self,
+            metadata: &Metadata,
+        ) -> meow_common::Result<Box<dyn meow_common::ProxyPacketConn>> {
+            self.picks.fetch_add(1, Ordering::Relaxed);
+            // REJECT's conn reports each write sent.
+            meow_proxy::RejectAdapter::new(false)
+                .dial_udp(metadata)
+                .await
+        }
+        fn health(&self) -> &meow_common::ProxyHealth {
+            &self.health
+        }
+        fn dialer_hop(&self, _metadata: &Metadata) -> Option<Arc<dyn Proxy>> {
+            let pick = self.picks.load(Ordering::Relaxed) % self.members.len();
+            Some(Arc::clone(&self.members[pick]))
+        }
+    }
+
     #[test]
     fn connections_and_udp_flows_reach_the_ledger() {
         let dir = tempfile::tempdir().unwrap();
@@ -958,8 +1023,14 @@ mod ledger_tests {
         };
         let chains: SmallVec<[Arc<str>; 1]> =
             smallvec::smallvec![Arc::from("Ledger Node"), Arc::from("Auto")];
-        let (id, counters) =
-            stats.track_connection_with_counters(metadata, "MATCH".into(), "".into(), chains, None);
+        let (id, counters) = stats.track_connection_with_counters(
+            metadata,
+            "MATCH".into(),
+            "".into(),
+            chains,
+            None,
+            || None,
+        );
         stats.record_upload(&counters, 100);
         stats.record_download(&counters, 1000);
         // A query settles the live connection.
@@ -977,7 +1048,7 @@ mod ledger_tests {
             dst_ip: Some("198.51.100.7".parse().unwrap()),
             ..Metadata::default()
         };
-        let flow = stats.begin_udp_flow("DIRECT", &udp);
+        let flow = stats.begin_udp_flow("DIRECT", || None, &udp);
         stats.record_upload(&flow, 4);
         // A UDP flow is one request however often it settles.
         assert_eq!(report("198.51.100.7", GroupBy::Host).requests, 1);
@@ -990,10 +1061,151 @@ mod ledger_tests {
             dst_ip: Some("198.51.100.8".parse().unwrap()),
             ..Metadata::default()
         };
-        let lost = stats.begin_udp_flow("DIRECT", &idle);
+        let lost = stats.begin_udp_flow("DIRECT", || None, &idle);
         stats.end_udp_flow(&lost);
         drop(lost);
         assert!(report("198.51.100.8", GroupBy::Host).rows.is_empty());
+
+        // A chained outbound's flows count under the member that carried the
+        // hop too, by policy only.
+        let front: Arc<dyn Proxy> = Arc::new(meow_config::proxy_parser::WrappedProxy::new(
+            Box::new(meow_proxy::HttpAdapter::new(
+                "Ledger Front",
+                "127.0.0.1",
+                1,
+                None,
+                false,
+                false,
+                vec![],
+                Arc::new(meow_proxy::dialer::DirectDialer),
+            )),
+        ));
+        let chained = Metadata {
+            host: "video.chained-ledger-test.example".into(),
+            ..Metadata::default()
+        };
+        let chains: SmallVec<[Arc<str>; 1]> = smallvec::smallvec![Arc::from("Ledger Chained")];
+        let (id, counters) = stats.track_connection_with_counters(
+            chained,
+            "MATCH".into(),
+            "".into(),
+            chains,
+            None,
+            || Some(Arc::clone(&front)),
+        );
+        stats.record_upload(&counters, 10);
+        stats.record_download(&counters, 100);
+        stats.close_connection(id);
+        drop(counters);
+        let chained_udp = Metadata {
+            dst_ip: Some("198.51.100.9".parse().unwrap()),
+            ..Metadata::default()
+        };
+        let flow =
+            stats.begin_udp_flow("Ledger Chained", || Some(Arc::clone(&front)), &chained_udp);
+        stats.record_upload(&flow, 2);
+        stats.end_udp_flow(&flow);
+        drop(flow);
+        let policies = |host: &str| {
+            let report = report(host, GroupBy::Policy);
+            let rows: Vec<_> = report
+                .rows
+                .iter()
+                .map(|row| {
+                    (
+                        row.name.clone(),
+                        row.upload,
+                        row.download,
+                        row.via_upload,
+                        row.via_requests,
+                    )
+                })
+                .collect();
+            (rows, (report.upload, report.download, report.requests))
+        };
+        assert_eq!(
+            policies("chained-ledger-test.example"),
+            (
+                vec![
+                    ("Ledger Chained".to_owned(), 10, 100, 0, 0),
+                    ("Ledger Front".to_owned(), 10, 100, 10, 1),
+                ],
+                (10, 100, 1)
+            )
+        );
+        assert_eq!(
+            policies("198.51.100.9"),
+            (
+                vec![
+                    ("Ledger Chained".to_owned(), 2, 0, 0, 0),
+                    ("Ledger Front".to_owned(), 2, 0, 2, 1),
+                ],
+                (2, 0, 1)
+            )
+        );
+        let hosts = report("chained-ledger-test.example", GroupBy::Host);
+        assert_eq!(hosts.rows.len(), 1);
+        assert_eq!((hosts.rows[0].upload, hosts.rows[0].via_upload), (10, 0));
+
+        // A UDP flow names the member its dial took, not the one a
+        // round-robin front has moved on to by the time the dial returns.
+        let node = |name: &str| -> Arc<dyn Proxy> {
+            Arc::new(meow_config::proxy_parser::WrappedProxy::new(Box::new(
+                meow_proxy::HttpAdapter::new(
+                    name,
+                    "127.0.0.1",
+                    1,
+                    None,
+                    false,
+                    false,
+                    vec![],
+                    Arc::new(meow_proxy::dialer::DirectDialer),
+                ),
+            )))
+        };
+        let round_robin = RoundRobinHop {
+            picks: std::sync::atomic::AtomicUsize::new(0),
+            members: [node("Ledger RR-1"), node("Ledger RR-2")],
+            health: meow_common::ProxyHealth::new(),
+        };
+        let tunnel = crate::Tunnel::new(Arc::new(meow_dns::Resolver::new(
+            vec![],
+            vec![],
+            meow_common::DnsMode::Normal,
+            meow_trie::DomainTrie::new(),
+            false,
+            true,
+        )));
+        let target: SocketAddr = "198.51.100.10:443".parse().unwrap();
+        let round_robin_udp = Metadata {
+            network: meow_common::Network::Udp,
+            dst_ip: Some(target.ip()),
+            dst_port: target.port(),
+            ..Metadata::default()
+        };
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let conn = tunnel
+                    .inner()
+                    .dial_udp(&round_robin, &round_robin_udp)
+                    .await
+                    .unwrap();
+                conn.write_packet(b"rr!", &target).await.unwrap();
+            });
+        assert_eq!(round_robin.picks.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            policies("198.51.100.10"),
+            (
+                vec![
+                    ("Ledger RR-1".to_owned(), 3, 0, 3, 1),
+                    ("Ledger Round Robin".to_owned(), 3, 0, 0, 0),
+                ],
+                (3, 0, 1)
+            )
+        );
 
         let tcp = report("ledger-test.example", GroupBy::Host);
         assert_eq!((tcp.upload, tcp.download, tcp.requests), (100, 1024, 1));
@@ -1022,6 +1234,7 @@ mod ledger_tests {
                 "".into(),
                 chains,
                 None,
+                || None,
             );
             stats.record_upload(&counters, 5);
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);

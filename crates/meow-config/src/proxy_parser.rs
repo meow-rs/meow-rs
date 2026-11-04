@@ -35,11 +35,44 @@ fn required_port(
 /// Wraps a ProxyAdapter to implement the full Proxy trait
 pub struct WrappedProxy {
     adapter: Box<dyn ProxyAdapter>,
+    /// The `dialer-proxy` the adapter dials its server through.
+    hop: Option<DialerHop>,
+}
+
+/// An outbound's injected `dialer-proxy` dialer, and the server it dials
+/// through it.
+struct DialerHop {
+    dialer: Arc<dyn meow_proxy::dialer::TcpDialer>,
+    host: SmolStr,
+    port: u16,
 }
 
 impl WrappedProxy {
     pub fn new(adapter: Box<dyn ProxyAdapter>) -> Self {
-        Self { adapter }
+        Self { adapter, hop: None }
+    }
+
+    /// `self`, whose adapter the block `config` built with `dialer`
+    /// injected, so [`ProxyAdapter::dialer_hop`] can name the member a
+    /// `dialer-proxy` front takes.
+    fn dialing_through(
+        mut self,
+        config: &HashMap<String, serde_json::Value>,
+        dialer: &Arc<dyn meow_proxy::dialer::TcpDialer>,
+    ) -> Self {
+        let host = config.get("server").and_then(serde_json::Value::as_str);
+        let port = config
+            .get("port")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|port| u16::try_from(port).ok());
+        if let (true, Some(host), Some(port)) = (dialer.is_proxy(), host, port) {
+            self.hop = Some(DialerHop {
+                dialer: Arc::clone(dialer),
+                host: host.into(),
+                port,
+            });
+        }
+        self
     }
 }
 
@@ -75,6 +108,23 @@ impl ProxyAdapter for WrappedProxy {
     /// otherwise hide PASS/PASS-RULE members from the match-time probe.
     fn unwrap_proxy(&self, metadata: &Metadata, touch: bool) -> Option<Arc<dyn Proxy>> {
         self.adapter.unwrap_proxy(metadata, touch)
+    }
+
+    /// The pick of the front the injected dialer dials the server through,
+    /// over the network the adapter takes there for this flow.
+    fn dialer_hop(&self, metadata: &Metadata) -> Option<Arc<dyn Proxy>> {
+        match &self.hop {
+            Some(hop) => hop.dialer.front_hop(
+                &hop.host,
+                hop.port,
+                self.adapter.dialer_hop_network(metadata.network),
+            ),
+            None => self.adapter.dialer_hop(metadata),
+        }
+    }
+
+    fn dialer_hop_network(&self, flow: meow_common::Network) -> meow_common::Network {
+        self.adapter.dialer_hop_network(flow)
     }
 
     /// Forward the session flush (issue #695) — every parsed leaf sits behind
@@ -365,7 +415,9 @@ pub fn parse_proxy_with_dialer(
             }
             #[cfg(not(feature = "mux"))]
             parse_mux_options(name, config)?;
-            Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
+            Ok(Arc::new(
+                WrappedProxy::new(Box::new(adapter)).dialing_through(config, dialer),
+            ))
         }
         #[cfg(feature = "trojan")]
         "trojan" => {
@@ -414,20 +466,28 @@ pub fn parse_proxy_with_dialer(
             }
             #[cfg(not(feature = "mux"))]
             parse_mux_options(name, config)?;
-            Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
+            Ok(Arc::new(
+                WrappedProxy::new(Box::new(adapter)).dialing_through(config, dialer),
+            ))
         }
         #[cfg(feature = "vless")]
         "vless" => {
             let adapter = parse_vless(name, config, dialer)?;
-            Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
+            Ok(Arc::new(
+                WrappedProxy::new(Box::new(adapter)).dialing_through(config, dialer),
+            ))
         }
         "http" => {
             let adapter = parse_http(name, config, dialer)?;
-            Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
+            Ok(Arc::new(
+                WrappedProxy::new(Box::new(adapter)).dialing_through(config, dialer),
+            ))
         }
         "socks5" => {
             let adapter = parse_socks5(name, config, dialer)?;
-            Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
+            Ok(Arc::new(
+                WrappedProxy::new(Box::new(adapter)).dialing_through(config, dialer),
+            ))
         }
         "direct" => {
             reject_unthreaded_dialer(name, "direct", dialer)?;
@@ -449,12 +509,16 @@ pub fn parse_proxy_with_dialer(
         #[cfg(feature = "vmess")]
         "vmess" => {
             let adapter = parse_vmess(name, config, dialer)?;
-            Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
+            Ok(Arc::new(
+                WrappedProxy::new(Box::new(adapter)).dialing_through(config, dialer),
+            ))
         }
         #[cfg(feature = "snell")]
         "snell" => {
             let adapter = parse_snell(name, config, dialer)?;
-            Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
+            Ok(Arc::new(
+                WrappedProxy::new(Box::new(adapter)).dialing_through(config, dialer),
+            ))
         }
         #[cfg(not(feature = "trusttunnel"))]
         "trusttunnel" => Err(feature_gated_proxy_type("trusttunnel")),
@@ -1183,7 +1247,9 @@ fn parse_trusttunnel(
         Arc::clone(dialer),
     )
     .map_err(|error| error.to_string())?;
-    Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
+    Ok(Arc::new(
+        WrappedProxy::new(Box::new(adapter)).dialing_through(config, dialer),
+    ))
 }
 
 /// Parse a `type: anytls` proxy block into an [`AnytlsAdapter`].
