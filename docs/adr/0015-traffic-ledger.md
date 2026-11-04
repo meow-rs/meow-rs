@@ -47,15 +47,29 @@ flows that sent something (`requests`).
 - **Via** is, for a leaf that dials its server through a `dialer-proxy`,
   the member that carries that hop: the last pick of the front's groups,
   or the front itself. It is named as the flow is tracked, with the same
-  peek its chains use, so a flow over a pooled or multiplexed session
-  (a Snell pool) has one too. Only the nearest hop is named; a front that
-  chains on through a dialer of its own is not followed. Empty for every
-  other flow. It counts in the policy view only: there a flow counts under
-  its leaf and under its carrier, its request included, so a node's row is
-  what it carried as an exit plus what it carried as a front, and the rows
-  add up to more than the totals. The host, app and interface views and
-  the totals count each flow once. The bytes are the flow's payload, not
-  the hop's wire bytes `/statistics` counts for the member.
+  peek its chains use, so a flow over a pooled or multiplexed session (a
+  Snell pool) has one too; a UDP flow's is named before its dial, as its
+  leaf is, since the dial commits the front's pick and a round-robin front
+  moves on after it. The front is asked on the network the hop takes,
+  which the leaf names (`dialer_hop_network`): a Shadowsocks or SOCKS5 UDP
+  flow goes to its server as datagrams and kcptun sends every flow as
+  them, while UDP over TCP (Trojan, VLESS, a mux session) rides a TCP hop;
+  a load-balance front picks a UDP hop among its UDP-capable members only.
+  The peek predicts the dial, and a front that rotates or hashes can still
+  carry the hop over another member: a flow on a session opened earlier
+  (kcptun, a pool) took that session's pick; a SOCKS5 UDP flow's control
+  connection takes a round-robin pick before its datagrams' hop does; and
+  a consistent-hashing front hashes the relay address a SOCKS5 server
+  returns, or the IP a kcptun dial (or a Shadowsocks UDP one whose front
+  cannot carry a name) resolves the server to, where the peek hashed the
+  server's name. Only the nearest hop is named; a front that chains on
+  through a dialer of its own is not followed. Empty for every other flow.
+  It counts in the policy view only: there a flow counts under its leaf
+  and under its carrier, its request included, so a node's row is what it
+  carried as an exit plus what it carried as a front, and the rows add up
+  to more than the totals. The host, app and interface views and the
+  totals count each flow once. The bytes are the flow's payload, not the
+  hop's wire bytes `/statistics` counts for the member.
 - **Interface** is a label the embedder pushes (`set_interface`), such as
   `Wi-Fi` or `Cellular` on mobile; empty when none was given.
 

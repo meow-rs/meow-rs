@@ -110,12 +110,21 @@ impl ProxyAdapter for WrappedProxy {
         self.adapter.unwrap_proxy(metadata, touch)
     }
 
-    /// The pick of the front the injected dialer dials the server through.
+    /// The pick of the front the injected dialer dials the server through,
+    /// over the network the adapter takes there for this flow.
     fn dialer_hop(&self, metadata: &Metadata) -> Option<Arc<dyn Proxy>> {
         match &self.hop {
-            Some(hop) => hop.dialer.front_hop(&hop.host, hop.port),
+            Some(hop) => hop.dialer.front_hop(
+                &hop.host,
+                hop.port,
+                self.adapter.dialer_hop_network(metadata.network),
+            ),
             None => self.adapter.dialer_hop(metadata),
         }
+    }
+
+    fn dialer_hop_network(&self, flow: meow_common::Network) -> meow_common::Network {
+        self.adapter.dialer_hop_network(flow)
     }
 
     /// Forward the session flush (issue #695) — every parsed leaf sits behind

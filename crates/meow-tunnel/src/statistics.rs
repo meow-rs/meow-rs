@@ -962,6 +962,53 @@ mod ledger_tests {
         .unwrap()
     }
 
+    /// A round-robin front in miniature: a dial commits the member
+    /// `dialer_hop` peeks, so the next peek names the next one.
+    struct RoundRobinHop {
+        picks: std::sync::atomic::AtomicUsize,
+        members: [Arc<dyn Proxy>; 2],
+        health: meow_common::ProxyHealth,
+    }
+
+    #[async_trait::async_trait]
+    impl meow_common::ProxyAdapter for RoundRobinHop {
+        fn name(&self) -> &str {
+            "Ledger Round Robin"
+        }
+        fn adapter_type(&self) -> meow_common::AdapterType {
+            meow_common::AdapterType::Shadowsocks
+        }
+        fn addr(&self) -> &str {
+            ""
+        }
+        fn support_udp(&self) -> bool {
+            true
+        }
+        async fn dial_tcp(
+            &self,
+            _metadata: &Metadata,
+        ) -> meow_common::Result<Box<dyn meow_common::ProxyConn>> {
+            Err(meow_common::MeowError::NotSupported("tcp".into()))
+        }
+        async fn dial_udp(
+            &self,
+            metadata: &Metadata,
+        ) -> meow_common::Result<Box<dyn meow_common::ProxyPacketConn>> {
+            self.picks.fetch_add(1, Ordering::Relaxed);
+            // REJECT's conn reports each write sent.
+            meow_proxy::RejectAdapter::new(false)
+                .dial_udp(metadata)
+                .await
+        }
+        fn health(&self) -> &meow_common::ProxyHealth {
+            &self.health
+        }
+        fn dialer_hop(&self, _metadata: &Metadata) -> Option<Arc<dyn Proxy>> {
+            let pick = self.picks.load(Ordering::Relaxed) % self.members.len();
+            Some(Arc::clone(&self.members[pick]))
+        }
+    }
+
     #[test]
     fn connections_and_udp_flows_reach_the_ledger() {
         let dir = tempfile::tempdir().unwrap();
@@ -1099,6 +1146,66 @@ mod ledger_tests {
         let hosts = report("chained-ledger-test.example", GroupBy::Host);
         assert_eq!(hosts.rows.len(), 1);
         assert_eq!((hosts.rows[0].upload, hosts.rows[0].via_upload), (10, 0));
+
+        // A UDP flow names the member its dial took, not the one a
+        // round-robin front has moved on to by the time the dial returns.
+        let node = |name: &str| -> Arc<dyn Proxy> {
+            Arc::new(meow_config::proxy_parser::WrappedProxy::new(Box::new(
+                meow_proxy::HttpAdapter::new(
+                    name,
+                    "127.0.0.1",
+                    1,
+                    None,
+                    false,
+                    false,
+                    vec![],
+                    Arc::new(meow_proxy::dialer::DirectDialer),
+                ),
+            )))
+        };
+        let round_robin = RoundRobinHop {
+            picks: std::sync::atomic::AtomicUsize::new(0),
+            members: [node("Ledger RR-1"), node("Ledger RR-2")],
+            health: meow_common::ProxyHealth::new(),
+        };
+        let tunnel = crate::Tunnel::new(Arc::new(meow_dns::Resolver::new(
+            vec![],
+            vec![],
+            meow_common::DnsMode::Normal,
+            meow_trie::DomainTrie::new(),
+            false,
+            true,
+        )));
+        let target: SocketAddr = "198.51.100.10:443".parse().unwrap();
+        let round_robin_udp = Metadata {
+            network: meow_common::Network::Udp,
+            dst_ip: Some(target.ip()),
+            dst_port: target.port(),
+            ..Metadata::default()
+        };
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let conn = tunnel
+                    .inner()
+                    .dial_udp(&round_robin, &round_robin_udp)
+                    .await
+                    .unwrap();
+                conn.write_packet(b"rr!", &target).await.unwrap();
+            });
+        assert_eq!(round_robin.picks.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            policies("198.51.100.10"),
+            (
+                vec![
+                    ("Ledger RR-1".to_owned(), 3, 0, 3, 1),
+                    ("Ledger Round Robin".to_owned(), 3, 0, 0, 0),
+                ],
+                (3, 0, 1)
+            )
+        );
 
         let tcp = report("ledger-test.example", GroupBy::Host);
         assert_eq!((tcp.upload, tcp.download, tcp.requests), (100, 1024, 1));
