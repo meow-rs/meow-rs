@@ -11,9 +11,15 @@
 //! degradation, not a misconfiguration.
 
 /// Apply `cfg`'s keepalive posture to an accepted inbound `stream`.
-/// `cfg.enabled == false` performs no `setsockopt` at all.
+/// `cfg.enabled == false` performs no `setsockopt` at all. `listener`
+/// names the owning listener so a multi-inbound failure log stays
+/// attributable.
 #[cfg(any(unix, windows))]
-pub(crate) fn apply(stream: &tokio::net::TcpStream, cfg: meow_common::TcpKeepaliveConfig) {
+pub(crate) fn apply(
+    stream: &tokio::net::TcpStream,
+    cfg: meow_common::TcpKeepaliveConfig,
+    listener: &str,
+) {
     if !cfg.enabled {
         return;
     }
@@ -60,7 +66,7 @@ pub(crate) fn apply(stream: &tokio::net::TcpStream, cfg: meow_common::TcpKeepali
     ))]
     let ka = ka.with_retries(cfg.probes);
     if let Err(e) = socket2::SockRef::from(stream).set_tcp_keepalive(&ka) {
-        tracing::debug!("inbound TCP keepalive setsockopt failed: {e}");
+        tracing::debug!("listener '{listener}': inbound TCP keepalive setsockopt failed: {e}");
     }
 }
 
@@ -68,7 +74,12 @@ pub(crate) fn apply(stream: &tokio::net::TcpStream, cfg: meow_common::TcpKeepali
 /// silently to no keepalive — the relay idle timeout still bounds the
 /// connection.
 #[cfg(not(any(unix, windows)))]
-pub(crate) fn apply(_stream: &tokio::net::TcpStream, _cfg: meow_common::TcpKeepaliveConfig) {}
+pub(crate) fn apply(
+    _stream: &tokio::net::TcpStream,
+    _cfg: meow_common::TcpKeepaliveConfig,
+    _listener: &str,
+) {
+}
 
 #[cfg(test)]
 mod tests {
@@ -83,7 +94,11 @@ mod tests {
         let _client = TcpStream::connect(addr).await.unwrap();
         let (accepted, _) = listener.accept().await.unwrap();
 
-        apply(&accepted, meow_common::TcpKeepaliveConfig::default());
+        apply(
+            &accepted,
+            meow_common::TcpKeepaliveConfig::default(),
+            "test",
+        );
 
         let sock = socket2::SockRef::from(&accepted);
         assert!(
@@ -128,6 +143,7 @@ mod tests {
                 enabled: false,
                 ..Default::default()
             },
+            "test",
         );
 
         assert!(

@@ -373,7 +373,7 @@ impl TProxyListener {
                     // First thing on the accepted socket — before orig-dest
                     // recovery, sniffer peek, or relay — so a dead peer is
                     // reaped even if the conn stalls mid-handshake.
-                    crate::keepalive::apply(&stream, tcp_keepalive);
+                    crate::keepalive::apply(&stream, tcp_keepalive, &name);
                     if let Err(e) =
                         handle_tproxy_conn(tunnel, stream, src_addr, bound_addr, sniffer, name)
                             .await

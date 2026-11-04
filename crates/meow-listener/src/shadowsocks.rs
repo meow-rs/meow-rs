@@ -280,12 +280,13 @@ impl ShadowsocksListener {
         // Wrap the codec `map` once so keepalive lands on the raw accepted
         // socket — before obfs wrapping and SS decryption, the earliest
         // point this listener sees the TcpStream. `ka` is Copy; the closure
-        // stays `Clone` because both captures are.
+        // stays `Clone` because every capture is.
         let map = {
             let ka = self.tcp_keepalive;
+            let name = self.name.clone();
             let inner = map;
             move |t: TcpStream| {
-                crate::keepalive::apply(&t, ka);
+                crate::keepalive::apply(&t, ka, &name);
                 inner(t)
             }
         };

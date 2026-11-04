@@ -158,7 +158,7 @@ impl MixedListener {
             // Earliest point in the accepted socket's life: keepalive must
             // be set before protocol peek/handshake/relay so a dead peer is
             // reaped even if the conn stalls mid-handshake.
-            crate::keepalive::apply(&stream, self.tcp_keepalive);
+            crate::keepalive::apply(&stream, self.tcp_keepalive, &self.name);
 
             let tunnel = self.tunnel.clone();
             let sniffer = self.sniffer.clone();
