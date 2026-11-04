@@ -121,6 +121,11 @@ pub struct GeneralConfig {
     pub connection_notes: bool,
     /// `logbook.enable` — see `meow_common::logbook::apply`.
     pub logbook: bool,
+    /// `tcp-idle-timeout` — whole-connection relay idle bound handed to
+    /// `Tunnel::set_tcp_idle_timeout`: an established relay silent in both
+    /// directions for this long is torn down. `None` disables the bound
+    /// (`tcp-idle-timeout: 0`).
+    pub tcp_idle_timeout: Option<std::time::Duration>,
 }
 
 /// Single source of truth for the effective `ipv6` setting of a config
@@ -619,6 +624,11 @@ pub struct ListenerConfig {
     pub tproxy_port: Option<u16>,
     pub tproxy_sni: bool,
     pub routing_mark: Option<u32>,
+    /// `tcp-keepalive*` — the keepalive posture every inbound listener
+    /// applies to its accepted sockets (see
+    /// [`meow_common::TcpKeepaliveConfig`]). Engine-wide: per-listener
+    /// overrides are deliberately not offered.
+    pub tcp_keepalive: meow_common::TcpKeepaliveConfig,
     /// All active listeners (shorthand + named), deduplicated and validated.
     pub named: Vec<NamedListener>,
 }
@@ -4659,6 +4669,23 @@ pub async fn build_config(
         Some(addr) => addr.to_string(),
     };
 
+    // `tcp-idle-timeout` seconds feed `Instant::now() + d` inside the
+    // relay — the same Instant+Duration overflow class as
+    // `tcp-connect-timeout` (issue #648), so it gets the same ceiling.
+    // `0` disables the bound entirely (the relay then behaves exactly as
+    // before this knob existed); absent means the default bound applies.
+    let tcp_idle_timeout = match raw.tcp_idle_timeout {
+        Some(0) => None,
+        Some(secs) if secs > meow_common::MAX_DURATION_SECS => anyhow::bail!(
+            "tcp-idle-timeout: {secs}s exceeds the {}s ceiling",
+            meow_common::MAX_DURATION_SECS
+        ),
+        Some(secs) => Some(std::time::Duration::from_secs(secs)),
+        None => Some(std::time::Duration::from_secs(
+            meow_common::tcp_opts::DEFAULT_TCP_IDLE_TIMEOUT_SECS,
+        )),
+    };
+
     let general = GeneralConfig {
         mode,
         log_level,
@@ -4667,6 +4694,7 @@ pub async fn build_config(
         bind_address,
         connection_notes: raw.connection_notes.unwrap_or(false),
         logbook: raw::RawLogbook::enabled(raw.logbook.as_ref()),
+        tcp_idle_timeout,
     };
 
     // Registry the provider nodes' `dialer-proxy` targets resolve against
@@ -4855,6 +4883,59 @@ pub async fn build_config(
     // Build the named-listener list, checking for duplicate ports/names.
     let named_listeners = build_named_listeners(&raw, &bind_addr, global_tproxy_sni)?;
 
+    // `tcp-keepalive*` — the keepalive posture every inbound listener
+    // applies to accepted sockets. The two seconds knobs feed OS keepalive
+    // timers, so they get the same `Instant + Duration` ceiling as
+    // `tcp-connect-timeout`/`udp-timeout` (issue #648); `tcp-keepalive-probes`
+    // is bounded at Linux's `TCP_KEEPCNT` clamp of 127 rather than silently
+    // truncated. `tcp-keepalive: false` turns the whole feature off — any
+    // parameter key still set then is dead config (loud, never fatal).
+    let tcp_keepalive_enabled = raw.tcp_keepalive.unwrap_or(true);
+    let tcp_keepalive = meow_common::TcpKeepaliveConfig {
+        enabled: tcp_keepalive_enabled,
+        idle: std::time::Duration::from_secs(match raw.tcp_keepalive_idle {
+            Some(0) => anyhow::bail!("tcp-keepalive-idle: must be at least 1 second"),
+            Some(secs) if secs > meow_common::MAX_DURATION_SECS => anyhow::bail!(
+                "tcp-keepalive-idle: {secs}s exceeds the {}s ceiling",
+                meow_common::MAX_DURATION_SECS
+            ),
+            Some(secs) => secs,
+            None => meow_common::tcp_opts::DEFAULT_TCP_KEEPALIVE_IDLE_SECS,
+        }),
+        interval: std::time::Duration::from_secs(match raw.tcp_keepalive_interval {
+            Some(0) => anyhow::bail!("tcp-keepalive-interval: must be at least 1 second"),
+            Some(secs) if secs > meow_common::MAX_DURATION_SECS => anyhow::bail!(
+                "tcp-keepalive-interval: {secs}s exceeds the {}s ceiling",
+                meow_common::MAX_DURATION_SECS
+            ),
+            Some(secs) => secs,
+            None => meow_common::tcp_opts::DEFAULT_TCP_KEEPALIVE_INTERVAL_SECS,
+        }),
+        probes: match raw.tcp_keepalive_probes {
+            Some(0) => anyhow::bail!("tcp-keepalive-probes: must be at least 1"),
+            Some(n) if n > 127 => anyhow::bail!("tcp-keepalive-probes: must be at most 127"),
+            Some(n) => n,
+            None => meow_common::tcp_opts::DEFAULT_TCP_KEEPALIVE_PROBES,
+        },
+    };
+    if !tcp_keepalive_enabled {
+        for (key, present) in [
+            ("tcp-keepalive-idle", raw.tcp_keepalive_idle.is_some()),
+            (
+                "tcp-keepalive-interval",
+                raw.tcp_keepalive_interval.is_some(),
+            ),
+            ("tcp-keepalive-probes", raw.tcp_keepalive_probes.is_some()),
+        ] {
+            if present {
+                warn!(
+                    "{key}: has no effect while tcp-keepalive is false; \
+                     remove it to suppress this warning"
+                );
+            }
+        }
+    }
+
     let listeners = ListenerConfig {
         mixed_port: raw.mixed_port,
         socks_port: raw.socks_port,
@@ -4863,6 +4944,7 @@ pub async fn build_config(
         tproxy_port: raw.tproxy_port,
         tproxy_sni: global_tproxy_sni,
         routing_mark: raw.routing_mark,
+        tcp_keepalive,
         named: named_listeners,
     };
 

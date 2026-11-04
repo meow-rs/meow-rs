@@ -278,6 +278,43 @@ pub struct RawConfig {
     /// listener. The default is 256; explicit `0` disables the cap. Individual `listeners:`
     /// entries can override this with their own `max-connections` field.
     pub max_connections: Option<usize>,
+    /// `tcp-keepalive` — apply `SO_KEEPALIVE` plus the keepalive timing
+    /// knobs below to every *accepted inbound* socket (mixed/http/socks5/
+    /// tproxy/shadowsocks listeners; TUN netstack flows have no host
+    /// socket). Default `true`. These govern *inbound* sockets — they are
+    /// deliberately NOT upstream mihomo's `keep-alive-*` names, which tune
+    /// outbound sockets. `false` performs no keepalive `setsockopt` at all
+    /// (config-level kill switch).
+    pub tcp_keepalive: Option<bool>,
+    /// `tcp-keepalive-idle` — seconds of socket silence before the first
+    /// keepalive probe. Linux/Android/musl: `TCP_KEEPIDLE`; macOS/iOS:
+    /// `TCP_KEEPALIVE`; Windows: `SIO_KEEPALIVE_VALS.keepalivetime`;
+    /// OpenBSD/Haiku: not settable — keepalive still engages, timing falls
+    /// back to OS defaults. Default
+    /// [`meow_common::tcp_opts::DEFAULT_TCP_KEEPALIVE_IDLE_SECS`]; ≥ 1.
+    pub tcp_keepalive_idle: Option<u64>,
+    /// `tcp-keepalive-interval` — seconds between keepalive probes
+    /// (`TCP_KEEPINTVL` / `SIO_KEEPALIVE_VALS.keepaliveinterval`;
+    /// unsupported on OpenBSD/Haiku). Default
+    /// [`meow_common::tcp_opts::DEFAULT_TCP_KEEPALIVE_INTERVAL_SECS`]; ≥ 1.
+    pub tcp_keepalive_interval: Option<u64>,
+    /// `tcp-keepalive-probes` — unanswered probes before the kernel
+    /// declares the peer dead (`TCP_KEEPCNT`). Not settable on Windows
+    /// (`SIO_KEEPALIVE_VALS` has no probe-count field; the OS default
+    /// applies). Default
+    /// [`meow_common::tcp_opts::DEFAULT_TCP_KEEPALIVE_PROBES`]; 1–127 —
+    /// Linux clamps above 127, so the config errors early instead of
+    /// silently clamping.
+    pub tcp_keepalive_probes: Option<u32>,
+    /// `tcp-idle-timeout` — whole-connection relay idle bound in seconds:
+    /// an established relay that moves zero bytes in EITHER direction for
+    /// this long is torn down with a `TimedOut` error, releasing its
+    /// listener permit and stats entry. Covers flows keepalive cannot see
+    /// (TUN netstack streams, dead-but-still-ACKing upstreams). Default
+    /// [`meow_common::tcp_opts::DEFAULT_TCP_IDLE_TIMEOUT_SECS`]; `0`
+    /// disables the bound entirely (pre-change behaviour — a silent relay
+    /// then has no timer of its own).
+    pub tcp_idle_timeout: Option<u64>,
     /// No top-level `firewall` key exists — captured only to warn on the
     /// plausible mistake (`firewall:` belongs on a `listeners:` tproxy
     /// entry, issue #563).

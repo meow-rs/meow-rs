@@ -36,6 +36,7 @@ pub mod replay_window;
 pub mod rule;
 pub mod sniffer;
 pub mod socket_protect;
+pub mod tcp_opts;
 pub mod traffic;
 pub mod traffic_ledger;
 pub mod tunnel_mode;
@@ -76,6 +77,7 @@ pub use socket_protect::{
     bind_udp, bind_udp_for_peer, canonical_socket_addr, connect_tcp, connect_tcp_host,
     resolve_host, resolve_host_all,
 };
+pub use tcp_opts::TcpKeepaliveConfig;
 // Host-resolver hook is cross-platform (iOS installs it without a protector).
 pub use socket_protect::{clear_host_resolver, host_resolver, set_host_resolver, HostResolver};
 // Socket protector is Android-only (raw-fd `VpnService.protect`).

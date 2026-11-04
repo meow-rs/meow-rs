@@ -2638,6 +2638,7 @@ dependencies = [
  "shadowsocks",
  "smallvec",
  "smol_str",
+ "socket2 0.5.10",
  "tokio",
  "tracing",
  "tracing-subscriber",

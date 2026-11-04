@@ -3117,3 +3117,98 @@ geox-url:
     );
     assert_eq!(config.geodata.geosite_url, "https://alias.test/geosite.dat");
 }
+
+// ─── tcp-keepalive* / tcp-idle-timeout (zombie-connection bound) ───────────
+
+/// Keys absent: the defaults resolve — keepalive on at 300 s/30 s/5 probes,
+/// relay idle bound at 600 s.
+#[tokio::test]
+async fn test_tcp_keepalive_defaults() {
+    let config = load_config_from_str("mixed-port: 7890\n").await.unwrap();
+    let ka = config.listeners.tcp_keepalive;
+    assert!(ka.enabled);
+    assert_eq!(ka.idle, std::time::Duration::from_secs(300));
+    assert_eq!(ka.interval, std::time::Duration::from_secs(30));
+    assert_eq!(ka.probes, 5);
+    assert_eq!(
+        config.general.tcp_idle_timeout,
+        Some(std::time::Duration::from_secs(600))
+    );
+}
+
+/// Explicit values round-trip into the resolved structs.
+#[tokio::test]
+async fn test_tcp_keepalive_explicit_values() {
+    let yaml = r#"
+tcp-keepalive: true
+tcp-keepalive-idle: 120
+tcp-keepalive-interval: 15
+tcp-keepalive-probes: 9
+tcp-idle-timeout: 1800
+"#;
+    let config = load_config_from_str(yaml).await.unwrap();
+    let ka = config.listeners.tcp_keepalive;
+    assert!(ka.enabled);
+    assert_eq!(ka.idle, std::time::Duration::from_secs(120));
+    assert_eq!(ka.interval, std::time::Duration::from_secs(15));
+    assert_eq!(ka.probes, 9);
+    assert_eq!(
+        config.general.tcp_idle_timeout,
+        Some(std::time::Duration::from_secs(1800))
+    );
+}
+
+/// `tcp-idle-timeout: 0` is the documented off-switch: resolves to `None`.
+#[tokio::test]
+async fn test_tcp_idle_timeout_zero_disables() {
+    let config = load_config_from_str("tcp-idle-timeout: 0\n").await.unwrap();
+    assert_eq!(config.general.tcp_idle_timeout, None);
+}
+
+/// `tcp-keepalive: false` resolves `enabled: false` (the config-level kill
+/// switch); parameter keys set alongside it take the warn path but still
+/// resolve to the configured values.
+#[tokio::test]
+async fn test_tcp_keepalive_false_resolves_disabled() {
+    let yaml = r#"
+tcp-keepalive: false
+tcp-keepalive-idle: 120
+"#;
+    let config = load_config_from_str(yaml).await.unwrap();
+    let ka = config.listeners.tcp_keepalive;
+    assert!(!ka.enabled);
+    assert_eq!(ka.idle, std::time::Duration::from_secs(120));
+}
+
+/// Validation matrix: zero/overflow seconds and out-of-range probe counts
+/// are hard config errors.
+#[tokio::test]
+async fn test_tcp_keepalive_validation_rejects_bad_values() {
+    for (yaml, needle) in [
+        ("tcp-keepalive-idle: 0\n", "tcp-keepalive-idle"),
+        ("tcp-keepalive-interval: 0\n", "tcp-keepalive-interval"),
+        ("tcp-keepalive-probes: 0\n", "tcp-keepalive-probes"),
+        ("tcp-keepalive-probes: 128\n", "tcp-keepalive-probes"),
+        (
+            "tcp-keepalive-idle: 18446744073709551615\n",
+            "tcp-keepalive-idle",
+        ),
+        (
+            "tcp-keepalive-interval: 18446744073709551615\n",
+            "tcp-keepalive-interval",
+        ),
+        (
+            "tcp-idle-timeout: 18446744073709551615\n",
+            "tcp-idle-timeout",
+        ),
+    ] {
+        let err = load_config_from_str(yaml)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{yaml} must be rejected"));
+        assert!(
+            err.to_string().contains(needle),
+            "{yaml} — unexpected error: {err}"
+        );
+    }
+}

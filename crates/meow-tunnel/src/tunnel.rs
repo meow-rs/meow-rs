@@ -13,7 +13,7 @@ use meow_proxy::DirectAdapter;
 use parking_lot::{Mutex, RwLock};
 use smol_str::SmolStr;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use tracing::{debug, info, warn};
 
@@ -157,6 +157,11 @@ pub struct TunnelInner {
     udp_flush: tokio::sync::watch::Sender<u64>,
     /// Record per-connection notes — see [`Tunnel::set_connection_notes`].
     connection_notes: AtomicBool,
+    /// Whole-connection relay idle timeout in seconds — see
+    /// [`Tunnel::set_tcp_idle_timeout`]. `0` disables the bound. Read once
+    /// per relay setup; relays already in flight keep the bound they
+    /// started with (same per-connection semantics as every per-conn knob).
+    tcp_idle_timeout: AtomicU64,
 }
 
 /// A running TUN listener: the task plus the signal resolving once its
@@ -233,6 +238,16 @@ impl TunnelInner {
     /// [`udp::UdpFlushWatch`].
     pub fn udp_flush_watch(&self) -> udp::UdpFlushWatch {
         udp::UdpFlushWatch::new(self.udp_flush.subscribe())
+    }
+
+    /// The whole-connection relay idle bound [`Tunnel::set_tcp_idle_timeout`]
+    /// installed, resolved for one relay's use: `None` when the bound is
+    /// disabled (`tcp-idle-timeout: 0` or never set programmatically).
+    pub fn tcp_idle_timeout(&self) -> Option<std::time::Duration> {
+        match self.tcp_idle_timeout.load(Ordering::Relaxed) {
+            0 => None,
+            secs => Some(std::time::Duration::from_secs(secs)),
+        }
     }
 
     /// The note log a new connection should record into: the inbound's own
@@ -978,6 +993,7 @@ impl Tunnel {
                 dialer_registry: std::sync::OnceLock::new(),
                 udp_flush: tokio::sync::watch::Sender::new(0),
                 connection_notes: AtomicBool::new(false),
+                tcp_idle_timeout: AtomicU64::new(0),
             }),
         }
     }
@@ -992,6 +1008,19 @@ impl Tunnel {
         self.inner
             .connection_notes
             .store(enabled, Ordering::Relaxed);
+    }
+
+    /// Bound how long an established TCP relay may stay silent in BOTH
+    /// directions before it is torn down with a `TimedOut` error — the
+    /// zombie-connection bound for the case where the peer neither sends
+    /// nor closes (dead LAN device, stalled netstack flow, dead upstream).
+    /// `None` or a zero duration disables the bound (pre-change relay
+    /// behaviour). Applied to relays that start after the call, like every
+    /// per-connection knob.
+    pub fn set_tcp_idle_timeout(&self, d: Option<std::time::Duration>) {
+        self.inner
+            .tcp_idle_timeout
+            .store(d.map_or(0, |d| d.as_secs()), Ordering::Relaxed);
     }
 
     pub fn inner(&self) -> &Arc<TunnelInner> {
