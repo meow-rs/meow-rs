@@ -29,7 +29,7 @@ flows that sent something (`requests`).
 - **Host** is the registrable domain (`www.example.co.uk` →
   `example.co.uk`, via the public-suffix list), lowercased; an IP address
   is kept in its canonical form. A day keeps at most `MAX_IP_HOSTS`
-  (1024) distinct addresses; past it, that day's other bare-address flows
+  (8192) distinct addresses; past it, that day's other bare-address flows
   (peer-to-peer swarms, a scan) fold into the host `*`. An address the
   day has keeps its row, and a flush with more new addresses than the
   day has room for keeps the busiest. No paths, ports or times finer than
@@ -265,7 +265,15 @@ API and records nothing.
   lookup queue's length, and what one carried before its app is known is
   lost if the ledger stops first. `apps: false` stops the lookups.
 - The database grows with distinct hosts and apps per day: IP hosts are
-  capped, registrable domains and apps are not, and days go after 62.
+  capped, registrable domains and apps are not, and days go after 62. A
+  row takes about 74 B on disk, so a day at the IP cap adds about 600 KB
+  and 62 of them about 36 MiB; the writer holds the day's addresses in
+  memory, under 1 MB at the cap. The cap was 1024 at first, which a
+  phone's apps that dial bare addresses (peer-to-peer, CDNs picked by
+  address) filled within a day.
+- A report lists every group: a month by host can run to the IP cap
+  times its days (about 254,000 rows and 0.8 s to read on a desktop when
+  every day is full of new addresses).
 - The standalone `meow` sets no time zone, so its days are UTC days.
 - iOS and tvOS name no app: a packet tunnel does not see a flow's owner.
 
@@ -273,6 +281,8 @@ API and records nothing.
 
 - An in-app switch and per-host deletion in the mobile apps.
 - `meow-cli` support.
+- A row limit on reports (the largest rows and a count of the rest), so
+  a month by host stays small for a phone's UI.
 - The standalone `meow` reads the system time zone (UTC today).
 - A cheaper macOS socket lookup (one `net.inet.tcp.pcblist_n` read
   instead of a walk of every process), which PROCESS-NAME rules would

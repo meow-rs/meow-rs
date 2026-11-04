@@ -1246,11 +1246,13 @@ mod tests {
         add(&SmolStr::new("192.0.2.2"), &none, &direct, 10, 0, 1);
         let batch = Batch::take(20_000, &known);
         assert_eq!(hosts_of(&batch), [OTHER_IPS, "10.0.0.1", "192.0.2.1"]);
-        // A full day folds every new address, never one it has.
+        // A full day folds every new address, never one it has, however
+        // much busier the new ones are. A few stand for many: past
+        // `EARLY_FLUSH` pending rows the writer would take them first.
         known.insert("10.0.255.255".into());
         add(&SmolStr::new("10.0.0.1"), &none, &direct, 1, 0, 1);
-        for i in 0..MAX_IP_HOSTS {
-            let host = SmolStr::new(format!("172.16.{}.{}", i / 256, i % 256));
+        for i in 0..16 {
+            let host = SmolStr::new(format!("172.16.0.{i}"));
             add(&host, &none, &direct, 1_000, 0, 1);
         }
         let batch = Batch::take(20_000, &known);

@@ -67,7 +67,7 @@ pub const DIR_NAME: &str = "traffic";
 
 /// Distinct IP-address hosts kept per day; past it, a day's other flows to
 /// bare addresses (peer-to-peer swarms, a scan) fold into [`OTHER_IPS`].
-pub const MAX_IP_HOSTS: usize = 1024;
+pub const MAX_IP_HOSTS: usize = 8192;
 
 /// The host of flows to bare IP addresses past a day's [`MAX_IP_HOSTS`].
 pub const OTHER_IPS: &str = "*";
