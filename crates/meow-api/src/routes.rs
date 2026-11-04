@@ -1336,6 +1336,27 @@ async fn save_config(
 
 // ── Helper: rebuild proxies/rules from raw and apply to tunnel ───────
 
+/// Resolve a candidate's `tcp-idle-timeout` into the relay idle bound
+/// [`Tunnel::set_tcp_idle_timeout`] applies, using `build_config`'s rules:
+/// `0` disables the bound, absent means the default bound applies. The
+/// rebuild passes never see general fields (`RebuildResult` carries none),
+/// so each commit resolves the raw value itself and replays it beside
+/// `set_connection_notes` — otherwise the committed document and the
+/// running bound silently diverge until restart.
+fn resolve_tcp_idle_timeout(raw: &RawConfig) -> Result<Option<Duration>, String> {
+    match raw.tcp_idle_timeout {
+        Some(0) => Ok(None),
+        Some(secs) if secs > meow_common::MAX_DURATION_SECS => Err(format!(
+            "tcp-idle-timeout: {secs}s exceeds the {}s ceiling",
+            meow_common::MAX_DURATION_SECS
+        )),
+        Some(secs) => Ok(Some(Duration::from_secs(secs))),
+        None => Ok(Some(Duration::from_secs(
+            meow_common::tcp_opts::DEFAULT_TCP_IDLE_TIMEOUT_SECS,
+        ))),
+    }
+}
+
 /// Pre-resolve DNS-sourced ECH then rebuild proxies/rules from `raw` and
 /// apply to the live tunnel. Takes the config *by value* so callers
 /// clone-and-drop their `parking_lot` guard before awaiting — those guards
@@ -1356,6 +1377,11 @@ async fn apply_raw_to_tunnel(
         "caller must hold the CONFIG_MUTATION lane"
     );
     let connection_notes = raw.connection_notes.unwrap_or(false);
+    // Same ceiling `build_config` enforces at startup — a candidate that
+    // fails it is rejected before the rebuild runs (400 like the bails
+    // below); the resolved bound is replayed at the commit point.
+    let tcp_idle_timeout =
+        resolve_tcp_idle_timeout(&raw).map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
     let expected_groups: Vec<String> = raw
         .proxy_groups
         .as_deref()
@@ -1453,6 +1479,7 @@ async fn apply_raw_to_tunnel(
     }
     state.tunnel.update_routing(proxies, rules, dialer_registry);
     state.tunnel.set_connection_notes(connection_notes);
+    state.tunnel.set_tcp_idle_timeout(tcp_idle_timeout);
     // Commit point reached: every fallible check passed. The candidate's
     // provider sets become the live registries — the rules and DNS
     // `rule-set:` matchers installed above already reference these Arcs
@@ -3634,6 +3661,24 @@ async fn put_configs(
         }
     }
 
+    // Same admission contract for `tcp-idle-timeout`: the rebuild never
+    // sees general fields either, so its ceiling must gate persistence
+    // here — committed unchecked, the next boot's `build_config` would
+    // hard-error on a value this PUT accepted. `force` keeps the running
+    // bound, the same degrade the dns arm applies below.
+    let tcp_idle_timeout = match resolve_tcp_idle_timeout(&raw_config) {
+        Ok(timeout) => timeout,
+        Err(msg) => {
+            if force {
+                tracing::error!("config reload forced despite {msg}");
+                forced.push(msg);
+                state.tunnel.inner().tcp_idle_timeout()
+            } else {
+                return reload_rejected(StatusCode::BAD_REQUEST, &msg);
+            }
+        }
+    };
+
     // Issue #514: rebuild the DNS runtime too when its inputs changed —
     // failing here rejects the PUT before `reload_routing` publishes
     // anything (under `force` a broken dns section degrades to warn +
@@ -3715,6 +3760,7 @@ async fn put_configs(
     state
         .tunnel
         .set_connection_notes(raw_config.connection_notes.unwrap_or(false));
+    state.tunnel.set_tcp_idle_timeout(tcp_idle_timeout);
     if dropped > 0 {
         tracing::warn!(
             connections_dropped = dropped,
