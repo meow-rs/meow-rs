@@ -3679,6 +3679,22 @@ async fn put_configs(
         }
     };
 
+    // Same admission contract for `tcp-keepalive*`: the rebuild never sees
+    // general fields either, so their semantic validation must gate
+    // persistence here — committed unchecked, the next boot's
+    // `build_config` would hard-error on a value this PUT accepted. The
+    // resolved posture is a startup snapshot like `listeners:` (no
+    // hot-apply), so under `force` there is no running value to keep —
+    // the degrade is warn + commit, matching the listeners arm.
+    if let Err(e) = meow_config::resolve_tcp_keepalive(&raw_config) {
+        if force {
+            tracing::error!("config reload forced despite {e}");
+            forced.push(e.to_string());
+        } else {
+            return reload_rejected(StatusCode::BAD_REQUEST, &e.to_string());
+        }
+    }
+
     // Issue #514: rebuild the DNS runtime too when its inputs changed —
     // failing here rejects the PUT before `reload_routing` publishes
     // anything (under `force` a broken dns section degrades to warn +

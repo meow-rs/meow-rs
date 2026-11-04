@@ -4426,6 +4426,70 @@ pub fn resolve_named_listeners(raw: &raw::RawConfig) -> Result<Vec<NamedListener
     build_named_listeners(raw, &bind_addr, global_tproxy_sni)
 }
 
+/// Resolve `tcp-keepalive*` into the [`meow_common::TcpKeepaliveConfig`]
+/// every inbound listener applies to its accepted sockets, enforcing
+/// `build_config`'s semantics: the two seconds knobs feed OS keepalive
+/// timers, so they get the same `Instant + Duration` ceiling as
+/// `tcp-connect-timeout`/`udp-timeout` (issue #648); `tcp-keepalive-probes`
+/// is bounded at Linux's `TCP_KEEPCNT` clamp of 127 rather than silently
+/// truncated. `tcp-keepalive: false` turns the whole feature off — any
+/// parameter key still set then is dead config (loud, never fatal).
+///
+/// `PUT /configs` calls this for validation only — the resolved posture is
+/// a startup snapshot like `listeners:`, never hot-applied — so a
+/// committed document cannot carry a value the next boot's `build_config`
+/// would hard-error on.
+pub fn resolve_tcp_keepalive(
+    raw: &raw::RawConfig,
+) -> Result<meow_common::TcpKeepaliveConfig, anyhow::Error> {
+    let enabled = raw.tcp_keepalive.unwrap_or(true);
+    let config = meow_common::TcpKeepaliveConfig {
+        enabled,
+        idle: std::time::Duration::from_secs(match raw.tcp_keepalive_idle {
+            Some(0) => anyhow::bail!("tcp-keepalive-idle: must be at least 1 second"),
+            Some(secs) if secs > meow_common::MAX_DURATION_SECS => anyhow::bail!(
+                "tcp-keepalive-idle: {secs}s exceeds the {}s ceiling",
+                meow_common::MAX_DURATION_SECS
+            ),
+            Some(secs) => secs,
+            None => meow_common::tcp_opts::DEFAULT_TCP_KEEPALIVE_IDLE_SECS,
+        }),
+        interval: std::time::Duration::from_secs(match raw.tcp_keepalive_interval {
+            Some(0) => anyhow::bail!("tcp-keepalive-interval: must be at least 1 second"),
+            Some(secs) if secs > meow_common::MAX_DURATION_SECS => anyhow::bail!(
+                "tcp-keepalive-interval: {secs}s exceeds the {}s ceiling",
+                meow_common::MAX_DURATION_SECS
+            ),
+            Some(secs) => secs,
+            None => meow_common::tcp_opts::DEFAULT_TCP_KEEPALIVE_INTERVAL_SECS,
+        }),
+        probes: match raw.tcp_keepalive_probes {
+            Some(0) => anyhow::bail!("tcp-keepalive-probes: must be at least 1"),
+            Some(n) if n > 127 => anyhow::bail!("tcp-keepalive-probes: must be at most 127"),
+            Some(n) => n,
+            None => meow_common::tcp_opts::DEFAULT_TCP_KEEPALIVE_PROBES,
+        },
+    };
+    if !enabled {
+        for (key, present) in [
+            ("tcp-keepalive-idle", raw.tcp_keepalive_idle.is_some()),
+            (
+                "tcp-keepalive-interval",
+                raw.tcp_keepalive_interval.is_some(),
+            ),
+            ("tcp-keepalive-probes", raw.tcp_keepalive_probes.is_some()),
+        ] {
+            if present {
+                warn!(
+                    "{key}: has no effect while tcp-keepalive is false; \
+                     remove it to suppress this warning"
+                );
+            }
+        }
+    }
+    Ok(config)
+}
+
 /// Build the authoritative list of named listeners from the raw config.
 /// Merges shorthand fields with the `listeners:` array and validates:
 ///   - No duplicate ports (Class A per ADR-0002)
@@ -4884,57 +4948,10 @@ pub async fn build_config(
     let named_listeners = build_named_listeners(&raw, &bind_addr, global_tproxy_sni)?;
 
     // `tcp-keepalive*` — the keepalive posture every inbound listener
-    // applies to accepted sockets. The two seconds knobs feed OS keepalive
-    // timers, so they get the same `Instant + Duration` ceiling as
-    // `tcp-connect-timeout`/`udp-timeout` (issue #648); `tcp-keepalive-probes`
-    // is bounded at Linux's `TCP_KEEPCNT` clamp of 127 rather than silently
-    // truncated. `tcp-keepalive: false` turns the whole feature off — any
-    // parameter key still set then is dead config (loud, never fatal).
-    let tcp_keepalive_enabled = raw.tcp_keepalive.unwrap_or(true);
-    let tcp_keepalive = meow_common::TcpKeepaliveConfig {
-        enabled: tcp_keepalive_enabled,
-        idle: std::time::Duration::from_secs(match raw.tcp_keepalive_idle {
-            Some(0) => anyhow::bail!("tcp-keepalive-idle: must be at least 1 second"),
-            Some(secs) if secs > meow_common::MAX_DURATION_SECS => anyhow::bail!(
-                "tcp-keepalive-idle: {secs}s exceeds the {}s ceiling",
-                meow_common::MAX_DURATION_SECS
-            ),
-            Some(secs) => secs,
-            None => meow_common::tcp_opts::DEFAULT_TCP_KEEPALIVE_IDLE_SECS,
-        }),
-        interval: std::time::Duration::from_secs(match raw.tcp_keepalive_interval {
-            Some(0) => anyhow::bail!("tcp-keepalive-interval: must be at least 1 second"),
-            Some(secs) if secs > meow_common::MAX_DURATION_SECS => anyhow::bail!(
-                "tcp-keepalive-interval: {secs}s exceeds the {}s ceiling",
-                meow_common::MAX_DURATION_SECS
-            ),
-            Some(secs) => secs,
-            None => meow_common::tcp_opts::DEFAULT_TCP_KEEPALIVE_INTERVAL_SECS,
-        }),
-        probes: match raw.tcp_keepalive_probes {
-            Some(0) => anyhow::bail!("tcp-keepalive-probes: must be at least 1"),
-            Some(n) if n > 127 => anyhow::bail!("tcp-keepalive-probes: must be at most 127"),
-            Some(n) => n,
-            None => meow_common::tcp_opts::DEFAULT_TCP_KEEPALIVE_PROBES,
-        },
-    };
-    if !tcp_keepalive_enabled {
-        for (key, present) in [
-            ("tcp-keepalive-idle", raw.tcp_keepalive_idle.is_some()),
-            (
-                "tcp-keepalive-interval",
-                raw.tcp_keepalive_interval.is_some(),
-            ),
-            ("tcp-keepalive-probes", raw.tcp_keepalive_probes.is_some()),
-        ] {
-            if present {
-                warn!(
-                    "{key}: has no effect while tcp-keepalive is false; \
-                     remove it to suppress this warning"
-                );
-            }
-        }
-    }
+    // applies to accepted sockets. Resolution and validation live in
+    // [`resolve_tcp_keepalive`], which `PUT /configs` also gates
+    // persistence on so a committed document cannot fail this boot path.
+    let tcp_keepalive = resolve_tcp_keepalive(&raw)?;
 
     let listeners = ListenerConfig {
         mixed_port: raw.mixed_port,
