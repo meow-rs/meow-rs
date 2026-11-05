@@ -2628,11 +2628,35 @@ fn parse_vless_xhttp_config(
     if hosts.is_empty() {
         return Err("vless: xhttp-opts.host must not be empty".into());
     }
-    let mode = xhttp_opts
+    let mut mode = xhttp_opts
         .and_then(|o| o.get("mode"))
         .and_then(|v| v.as_str())
         .unwrap_or("stream-one")
         .to_string();
+    // Xray treats an empty mode as auto.
+    if mode.is_empty() || mode.eq_ignore_ascii_case("auto") {
+        // Xray's client resolution (splithttp/dialer.go): REALITY without
+        // `download-settings` is stream-one; with them stream-up, and
+        // without REALITY packet-up — neither of which meow implements.
+        let reality = config.contains_key("reality-opts");
+        // `null` is no download-settings; Xray's JSON spells it camelCase.
+        let split = xhttp_opts.is_some_and(|o| {
+            ["download-settings", "downloadSettings"]
+                .iter()
+                .any(|k| o.get(*k).is_some_and(|v| !v.is_null()))
+        });
+        mode = match (reality, split) {
+            (true, false) => "stream-one".into(),
+            (true, true) => "stream-up".into(),
+            (false, _) => "packet-up".into(),
+        };
+        if mode != "stream-one" {
+            return Err(format!(
+                "vless: xhttp mode 'auto' resolves to '{mode}' here (as in Xray); only \
+                 'stream-one' is implemented"
+            ));
+        }
+    }
     if !mode.eq_ignore_ascii_case("stream-one") {
         return Err(format!(
             "vless: unsupported xhttp mode '{mode}'; only 'stream-one' is implemented"
@@ -3711,6 +3735,51 @@ mod tests {
             .expect("h2c xhttp config");
         assert_eq!(parsed.hosts, ["2001:db8::1"]);
         assert_eq!(parsed.scheme, "http");
+    }
+
+    /// `mode: auto` resolves as Xray's client does: stream-one under REALITY
+    /// without download-settings; stream-up / packet-up are refused.
+    #[cfg(feature = "vless")]
+    #[test]
+    fn xhttp_auto_mode_resolves_like_xray() {
+        let reality =
+            proxy_config("reality-opts:\n  public-key: k\nxhttp-opts:\n  path: /x\n  mode: auto\n");
+        let parsed = parse_vless_xhttp_config(&reality, "203.0.113.7", "cdn.example.com", true)
+            .expect("auto + REALITY is stream-one");
+        assert_eq!(parsed.mode, "stream-one");
+
+        let split = proxy_config(
+            "reality-opts:\n  public-key: k\nxhttp-opts:\n  mode: auto\n  download-settings:\n    path: /d\n",
+        );
+        let err = parse_vless_xhttp_config(&split, "203.0.113.7", "cdn.example.com", true)
+            .expect_err("auto + download-settings is stream-up");
+        assert!(err.contains("stream-up"), "{err}");
+
+        for edge in [
+            "reality-opts:\n  public-key: k\nxhttp-opts:\n  mode: ''\n",
+            "reality-opts:\n  public-key: k\nxhttp-opts:\n  mode: auto\n  download-settings: null\n",
+        ] {
+            let parsed = parse_vless_xhttp_config(
+                &proxy_config(edge),
+                "203.0.113.7",
+                "cdn.example.com",
+                true,
+            )
+            .expect("empty mode / null download-settings is stream-one");
+            assert_eq!(parsed.mode, "stream-one");
+        }
+        let camel = proxy_config(
+            "reality-opts:\n  public-key: k\nxhttp-opts:\n  mode: auto\n  downloadSettings:\n    path: /d\n",
+        );
+        assert!(
+            parse_vless_xhttp_config(&camel, "203.0.113.7", "cdn.example.com", true).is_err(),
+            "camelCase downloadSettings is stream-up"
+        );
+
+        let tls = proxy_config("xhttp-opts:\n  mode: auto\n");
+        let err = parse_vless_xhttp_config(&tls, "203.0.113.7", "cdn.example.com", true)
+            .expect_err("auto without REALITY is packet-up");
+        assert!(err.contains("packet-up"), "{err}");
     }
 
     #[cfg(feature = "vless")]
