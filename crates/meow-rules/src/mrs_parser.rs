@@ -519,9 +519,8 @@ fn walk_upstream_domain_set(data: &[u8], on_domain: &mut dyn FnMut(&str)) -> Res
 
     // A well-formed trie has exactly one terminator bit per node and every
     // non-root node owns one incoming label edge, so #ones <= labels + 1.
-    // Enforce the correlation *before* DomainSetIndex materializes one `usize`
-    // per set bit — a mostly-ones bitmap would otherwise amplify the input
-    // ~64x into memory (issue #513).
+    // A bitmap that breaks the correlation is a malformed trie: reject it
+    // before the walk (issue #513).
     let node_count: usize = label_bitmap
         .iter()
         .map(|word| word.count_ones() as usize)
@@ -748,6 +747,7 @@ impl DomainSetIndex {
 
     /// Bit index of the `nth` (0-based) set bit.
     fn select_one(&self, bits: &[u64], nth: usize) -> Option<usize> {
+        debug_assert_eq!(bits.len() + 1, self.rank_ones_by_word.len());
         // Last word whose preceding-ones count is <= nth.
         let word = self
             .rank_ones_by_word
@@ -1409,6 +1409,9 @@ mod tests {
             assert_eq!(index.select_one(&bits, nth), Some(want), "nth {nth}");
         }
         assert_eq!(index.select_one(&bits, ones.len()), None);
+        assert_eq!(index.select_one(&bits, usize::MAX), None);
+        let empty = DomainSetIndex::new(&[]);
+        assert_eq!(empty.select_one(&[], 0), None);
     }
 
     /// A mostly-ones bitmap once made `DomainSetIndex` allocate one `usize`
