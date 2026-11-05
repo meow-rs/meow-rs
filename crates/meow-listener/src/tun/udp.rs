@@ -428,7 +428,16 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
             () = flush.flushed() => break Ok(()),
             queued = rx.recv() => match queued {
                 Some(data) => {
-                    if let Err(e) = conn.write_packet(&data, &dst_addr).await {
+                    // Drive write_packet in a nested select! so idle expiry
+                    // and flush can cancel a blocked write (issue #893
+                    // pattern: write_packet must not park the flow's
+                    // termination signals).
+                    let write_result = tokio::select! {
+                        () = &mut idle => break Ok(()), // idle-timeout during write
+                        () = flush.flushed() => break Ok(()), // flush during write
+                        r = conn.write_packet(&data, &dst_addr) => r,
+                    };
+                    if let Err(e) = write_result {
                         break Err(format!("upstream write {dst_addr}: {e}"));
                     }
                     idle.as_mut().reset(Instant::now() + udp_timeout);
@@ -437,11 +446,23 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
             },
             received = up_rx.recv() => match received {
                 Some(data) => {
-                    if reply_tx.send((data, dst, src)).await.is_err() {
-                        break Ok(()); // stack writer gone — listener shutdown
+                    // UDP drop semantics on backpressure: a full reply queue
+                    // drops the datagram rather than parking the flow (and
+                    // its idle timer) on a slow lwIP stack writer — same
+                    // policy as tproxy (which already used try_send).
+                    match reply_tx.try_send((data, dst, src)) {
+                        Ok(()) => {
+                            last_activity.store(activity_ms(), Ordering::Relaxed);
+                            idle.as_mut().reset(Instant::now() + udp_timeout);
+                        }
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            // Drop this reply; the client will retransmit if
+                            // it needs the data.
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            break Ok(()); // stack writer gone — listener shutdown
+                        }
                     }
-                    last_activity.store(activity_ms(), Ordering::Relaxed);
-                    idle.as_mut().reset(Instant::now() + udp_timeout);
                 }
                 // The reader task exited — it owns the only `up_tx`. The
                 // borrow-await keeps the handle usable for the abort below.

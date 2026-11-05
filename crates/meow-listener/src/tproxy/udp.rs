@@ -201,7 +201,16 @@ pub(super) mod flow {
                 queued = rx.recv() => match queued {
                     Some(data) => {
                         queued_bytes.fetch_sub(data.len(), Ordering::Relaxed);
-                        if let Err(e) = conn.write_packet(&data, &dst_addr).await {
+                        // Drive write_packet in a nested select! so idle
+                        // expiry and flush can cancel a blocked write
+                        // (issue #893 pattern: write_packet must not park
+                        // the flow's termination signals).
+                        let write_result = tokio::select! {
+                            () = &mut idle => break Ok(()), // idle-timeout during write
+                            () = flush.flushed() => break Ok(()), // flush during write
+                            r = conn.write_packet(&data, &dst_addr) => r,
+                        };
+                        if let Err(e) = write_result {
                             break Err(format!("upstream write {dst_addr}: {e}"));
                         }
                         idle.as_mut().reset(next_deadline(udp_timeout));
