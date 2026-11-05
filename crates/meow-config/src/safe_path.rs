@@ -4,11 +4,6 @@
 //! config document arrives over the REST API (`PUT /configs`), so every path
 //! read or written on behalf of a provider must stay inside the provider
 //! cache directory — mirroring mihomo's `C.Path.IsSafePath` guard.
-//!
-//! the check is lexical only, exactly like mihomo's. Symlinks
-//! already present under the provider directory are followed: only the
-//! administrator can create them (a config cannot), and OpenWrt front-ends
-//! (router front ends) point provider dirs at tmpfs through such links.
 
 use std::path::{Component, Path, PathBuf};
 use tracing::warn;
@@ -28,6 +23,21 @@ fn skip_safe_path_check() -> bool {
     std::env::var(SKIP_ENV).is_ok_and(|v| go_parse_bool_truthy(&v))
 }
 
+/// mihomo's `SAFE_PATHS`: extra roots, separated like `PATH`, that provider
+/// paths may live under besides the provider directory — the sanctioned way
+/// to point providers at, e.g., a tmpfs (OpenWrt) without dropping the
+/// guard. Compared lexically and, for symlinks, on resolved forms.
+fn safe_paths() -> Vec<PathBuf> {
+    std::env::var_os("SAFE_PATHS")
+        .map(|v| {
+            std::env::split_paths(&v)
+                .filter(|p| p.is_absolute())
+                .filter_map(|p| normalize_absolute(&p).ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// The truthy half of Go's `strconv.ParseBool` accepted values.
 fn go_parse_bool_truthy(value: &str) -> bool {
     matches!(value, "1" | "t" | "T" | "true" | "TRUE" | "True")
@@ -37,8 +47,9 @@ fn go_parse_bool_truthy(value: &str) -> bool {
 /// `base`.
 ///
 /// Robust to `..` traversal (paths are lexically normalized before the prefix
-/// check) and absolute paths (allowed only when they already point inside
-/// `base`). Symlinks are not resolved (mihomo parity, see the module docs).
+/// check), absolute paths (allowed only when they already point inside
+/// `base`), and symlink tricks (the deepest existing ancestor of both sides
+/// is canonicalized and containment is re-checked on the resolved forms).
 ///
 /// Escape hatch (mihomo parity): setting `SKIP_SAFE_PATH_CHECK=1` in the
 /// environment downgrades a containment failure to a prominent `warn!` and
@@ -50,13 +61,14 @@ fn go_parse_bool_truthy(value: &str) -> bool {
 /// Returns the normalized absolute path that callers must use for the actual
 /// I/O, so the checked path and the opened path cannot diverge lexically.
 pub(crate) fn resolve_contained(base: &Path, requested: &Path) -> Result<PathBuf, String> {
-    resolve_contained_impl(base, requested, skip_safe_path_check())
+    resolve_contained_impl(base, requested, skip_safe_path_check(), &safe_paths())
 }
 
 fn resolve_contained_impl(
     base: &Path,
     requested: &Path,
     skip_check: bool,
+    safe: &[PathBuf],
 ) -> Result<PathBuf, String> {
     let abs_base = normalize_absolute(base)?;
     let joined = if requested.is_absolute() {
@@ -65,13 +77,37 @@ fn resolve_contained_impl(
         abs_base.join(requested)
     };
     let abs_joined = normalize_absolute(&joined)?;
-    if !abs_joined.starts_with(&abs_base) {
+    let in_safe = |p: &Path, canon: bool| {
+        safe.iter().any(|root| {
+            if canon {
+                p.starts_with(canonicalize_existing_prefix(root))
+            } else {
+                p.starts_with(root)
+            }
+        })
+    };
+    if !abs_joined.starts_with(&abs_base) && !in_safe(&abs_joined, false) {
         if skip_check {
             warn_skip_active(requested, base, "");
             return Ok(abs_joined);
         }
         return Err(format!(
             "path '{}' escapes the provider directory '{}'",
+            requested.display(),
+            base.display()
+        ));
+    }
+    // A symlink already present under `base` could still redirect the I/O
+    // outside of it; compare the symlink-resolved forms as well.
+    let canon_base = canonicalize_existing_prefix(&abs_base);
+    let canon_joined = canonicalize_existing_prefix(&abs_joined);
+    if !canon_joined.starts_with(&canon_base) && !in_safe(&canon_joined, true) {
+        if skip_check {
+            warn_skip_active(requested, base, " via a symlink");
+            return Ok(abs_joined);
+        }
+        return Err(format!(
+            "path '{}' escapes the provider directory '{}' via a symlink",
             requested.display(),
             base.display()
         ));
@@ -114,6 +150,33 @@ fn normalize_absolute(path: &Path) -> Result<PathBuf, String> {
         }
     }
     Ok(out)
+}
+
+/// Canonicalize the deepest existing ancestor of `path` (resolving symlinks)
+/// and re-append the — already lexically normalized — non-existing remainder.
+fn canonicalize_existing_prefix(path: &Path) -> PathBuf {
+    let mut existing = path;
+    let mut suffix: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        match existing.canonicalize() {
+            Ok(canon) => {
+                let mut out = canon;
+                for c in suffix.iter().rev() {
+                    out.push(c);
+                }
+                return out;
+            }
+            Err(_) => match existing.parent() {
+                Some(parent) => {
+                    if let Some(name) = existing.file_name() {
+                        suffix.push(name.to_os_string());
+                    }
+                    existing = parent;
+                }
+                None => return path.to_path_buf(),
+            },
+        }
+    }
 }
 
 #[cfg(test)]
@@ -167,18 +230,12 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn symlink_under_base_is_followed() {
-        // mihomo parity: an administrator's symlink (e.g. providers -> tmpfs)
-        // is a lexically contained path and stays accepted.
+    fn symlink_escape_is_rejected() {
         let outside = tempfile::tempdir().unwrap();
         let base = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink(outside.path(), base.path().join("link")).unwrap();
-        let got = resolve_contained(base.path(), Path::new("link/rules.yaml")).unwrap();
-        assert!(
-            got.ends_with("link/rules.yaml"),
-            "unexpected: {}",
-            got.display()
-        );
+        let err = resolve_contained(base.path(), Path::new("link/pwned")).unwrap_err();
+        assert!(err.contains("symlink"), "unexpected: {err}");
     }
 
     // -- SKIP_SAFE_PATH_CHECK escape hatch (mihomo parity) ------------------
@@ -192,7 +249,7 @@ mod tests {
     fn escape_hatch_off_rejects_out_of_root_paths() {
         let dir = tempfile::tempdir().unwrap();
         for p in ["../../etc/pwned", "/etc/cron.d/pwned"] {
-            let err = resolve_contained_impl(dir.path(), Path::new(p), false)
+            let err = resolve_contained_impl(dir.path(), Path::new(p), false, &[])
                 .expect_err("skip=false must keep the containment guarantee");
             assert!(err.contains("escapes"), "path {p}: unexpected: {err}");
         }
@@ -201,7 +258,7 @@ mod tests {
     #[test]
     fn escape_hatch_on_allows_out_of_root_paths_with_warning() {
         let dir = tempfile::tempdir().unwrap();
-        let got = resolve_contained_impl(dir.path(), Path::new("/etc/cron.d/pwned"), true)
+        let got = resolve_contained_impl(dir.path(), Path::new("/etc/cron.d/pwned"), true, &[])
             .expect("skip=true must allow the out-of-root path");
         // `/etc/...` is root-relative rather than absolute on Windows (no
         // drive prefix), so the impl anchors it on the base's drive and the
@@ -220,8 +277,41 @@ mod tests {
             got.display()
         );
         // Traversal is still lexically normalized before being handed back.
-        let got = resolve_contained_impl(dir.path(), Path::new("sub/../../outside"), true).unwrap();
+        let got =
+            resolve_contained_impl(dir.path(), Path::new("sub/../../outside"), true, &[]).unwrap();
         assert!(!got.to_string_lossy().contains(".."));
+    }
+
+    /// mihomo `SAFE_PATHS`: a symlink (or an absolute path) into a listed
+    /// root is accepted; one elsewhere is still refused.
+    #[cfg(unix)]
+    #[test]
+    fn safe_paths_admit_a_symlinked_root() {
+        let tmpfs = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let base = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(tmpfs.path(), base.path().join("ram")).unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), base.path().join("other")).unwrap();
+        let safe = [tmpfs.path().to_path_buf()];
+        resolve_contained_impl(base.path(), Path::new("ram/rules.mrs"), false, &safe)
+            .expect("symlink into a SAFE_PATHS root");
+        resolve_contained_impl(base.path(), &tmpfs.path().join("x.yaml"), false, &safe)
+            .expect("absolute path under a SAFE_PATHS root");
+        resolve_contained_impl(base.path(), Path::new("other/pwned"), false, &safe)
+            .expect_err("symlink outside every root");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn escape_hatch_on_allows_symlink_escape() {
+        let outside = tempfile::tempdir().unwrap();
+        let base = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), base.path().join("link")).unwrap();
+        resolve_contained_impl(base.path(), Path::new("link/pwned"), true, &[])
+            .expect("skip=true must allow the symlink escape");
+        // …and skip=false still rejects the very same layout.
+        resolve_contained_impl(base.path(), Path::new("link/pwned"), false, &[])
+            .expect_err("skip=false must reject the symlink escape");
     }
 
     #[test]
