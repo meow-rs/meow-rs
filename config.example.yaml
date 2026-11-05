@@ -46,8 +46,6 @@ ipv6: false
 # Inbound-socket TCP keepalive — detects silently-dead LAN peers that
 # neither send nor close (e.g. devices that leave Wi-Fi without FIN/RST),
 # freeing their relay tasks and max-connections permits.
-# Applied at listener startup only: PUT /configs validates these keys but
-# does not re-apply them to running listeners (restart to change).
 # tcp-keepalive: true               # set SO_KEEPALIVE on every accepted socket (default: true)
 # tcp-keepalive-idle: 300           # seconds of silence before the first probe (default: 300)
 # tcp-keepalive-interval: 30        # seconds between probes (default: 30)
@@ -59,8 +57,8 @@ ipv6: false
 # silent in BOTH directions for this many seconds (Err(TimedOut)).
 # Covers cases keepalive cannot: TUN netstack flows (no host socket),
 # dead-but-still-ACKing upstreams, stalled netstack flows.
-# `0` disables the bound (pre-894 behaviour). Hot-applied by PUT /configs.
-# tcp-idle-timeout: 600             # seconds; 0 = disabled (default: 600)
+# `0` disables the bound (pre-894 behaviour).
+# tcp-idle-timeout: 600             # seconds; 0 = disabled (default: disabled)
 
 # REST API
 external-controller: 127.0.0.1:9090

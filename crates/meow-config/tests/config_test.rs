@@ -3121,7 +3121,7 @@ geox-url:
 // ─── tcp-keepalive* / tcp-idle-timeout (zombie-connection bound) ───────────
 
 /// Keys absent: the defaults resolve — keepalive on at 300 s/30 s/5 probes,
-/// relay idle bound at 600 s.
+/// relay idle bound disabled (None; pre-894 behaviour preserved).
 #[tokio::test]
 async fn test_tcp_keepalive_defaults() {
     let config = load_config_from_str("mixed-port: 7890\n").await.unwrap();
@@ -3130,10 +3130,7 @@ async fn test_tcp_keepalive_defaults() {
     assert_eq!(ka.idle, std::time::Duration::from_secs(300));
     assert_eq!(ka.interval, std::time::Duration::from_secs(30));
     assert_eq!(ka.probes, 5);
-    assert_eq!(
-        config.general.tcp_idle_timeout,
-        Some(std::time::Duration::from_secs(600))
-    );
+    assert_eq!(config.general.tcp_idle_timeout, None);
 }
 
 /// Explicit values round-trip into the resolved structs.

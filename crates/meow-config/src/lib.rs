@@ -4511,9 +4511,9 @@ pub fn resolve_tcp_keepalive(
 
 /// Resolve `tcp-idle-timeout` into the whole-connection relay idle bound,
 /// enforcing `build_config`'s semantics: `0` disables the bound entirely,
-/// absent applies the [`meow_common::tcp_opts::DEFAULT_TCP_IDLE_TIMEOUT_SECS`]
-/// default, and the seconds feed `Instant + Duration` inside the relay so
-/// they get the same ceiling as `tcp-connect-timeout` (issue #648).
+/// absent also disables it (preserving pre-894 behaviour — no idle bound
+/// by default), and explicit seconds feed `Instant + Duration` inside the
+/// relay so they get the same ceiling as `tcp-connect-timeout` (issue #648).
 ///
 /// `PUT /configs` calls this for both validation and hot-apply (the bound
 /// is replayed into `Tunnel::set_tcp_idle_timeout` at the commit point),
@@ -4522,15 +4522,12 @@ pub fn resolve_tcp_idle_timeout(
     raw: &raw::RawConfig,
 ) -> Result<Option<std::time::Duration>, anyhow::Error> {
     match raw.tcp_idle_timeout {
-        Some(0) => Ok(None),
+        Some(0) | None => Ok(None),
         Some(secs) if secs > meow_common::MAX_DURATION_SECS => anyhow::bail!(
             "tcp-idle-timeout: {secs}s exceeds the {}s ceiling",
             meow_common::MAX_DURATION_SECS
         ),
         Some(secs) => Ok(Some(std::time::Duration::from_secs(secs))),
-        None => Ok(Some(std::time::Duration::from_secs(
-            meow_common::tcp_opts::DEFAULT_TCP_IDLE_TIMEOUT_SECS,
-        ))),
     }
 }
 

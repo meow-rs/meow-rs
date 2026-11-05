@@ -21,10 +21,11 @@ pub const DEFAULT_TCP_KEEPALIVE_INTERVAL_SECS: u64 = 30;
 /// field; the OS default applies there).
 pub const DEFAULT_TCP_KEEPALIVE_PROBES: u32 = 5;
 
-/// Whole-connection relay idle bound applied when `tcp-idle-timeout` is
-/// unset, in seconds. An established relay silent in BOTH directions for
-/// this long is torn down; `tcp-idle-timeout: 0` disables the bound
-/// instead of using this default.
+/// Fallback used by the REST API's `PUT /configs` validator to guard the
+/// running bound against an implicit `None` during a partial reload. Not
+/// used as the config parse default — an absent `tcp-idle-timeout` key
+/// resolves to `None` (disabled) rather than this value, preserving
+/// pre-894 behaviour (no idle bound by default).
 pub const DEFAULT_TCP_IDLE_TIMEOUT_SECS: u64 = 600;
 
 /// Resolved keepalive posture applied to every TCP socket a listener
