@@ -30,6 +30,7 @@ pub(crate) fn tls_record_incomplete(buf: &[u8]) -> bool {
 /// fake-IP / mapped host before `TCPSniff`: a mapped destination keeps its
 /// DNS name (a sniffed SNI cannot override it, `parse-pure-ip` skips it),
 /// an unmapped one is still sniffed.
+#[cfg(feature = "listener-tun")]
 pub(crate) fn prefill_host(resolver: &meow_dns::Resolver, metadata: &mut Metadata) {
     if !metadata.host.is_empty() {
         return;
