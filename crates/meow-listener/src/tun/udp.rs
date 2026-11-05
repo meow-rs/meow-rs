@@ -486,6 +486,9 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
     // server name, at most `sniffer.timeout` and a few packets; they are
     // sent upstream first once the flow is dialed.
     let mut held: Vec<Vec<u8>> = Vec::new();
+    if sniffer.is_some() {
+        crate::sniffer::prefill_host(&tunnel.inner().resolver(), &mut metadata);
+    }
     if let Some(rt) = sniffer.as_deref().filter(|rt| rt.wants_quic(&metadata)) {
         let deadline = Instant::now() + rt.timeout();
         let mut quic = crate::sniffer_quic::QuicSniffer::default();

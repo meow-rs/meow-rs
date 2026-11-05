@@ -3344,7 +3344,8 @@ fn parse_sniffer_config(
                             http_ports = proto.ports.clone().unwrap_or_default();
                         }
                         "QUIC" => {
-                            quic_ports = proto.ports.clone().unwrap_or_default();
+                            // Upstream's default port for QUIC.
+                            quic_ports = proto.ports.clone().unwrap_or_else(|| vec![443]);
                         }
                         // An unrecognized key is a typo'd/dead declaration —
                         // a defect under strict (issue #533 review), unlike
@@ -3364,7 +3365,7 @@ fn parse_sniffer_config(
                 {
                     anyhow::bail!(
                         "sniffer.sniff is present and enable: true, but no ports are configured \
-                        for any supported protocol (TLS/HTTP)"
+                        for any supported protocol (TLS/HTTP/QUIC)"
                     );
                 }
             } else if enable {

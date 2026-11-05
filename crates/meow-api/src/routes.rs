@@ -3180,6 +3180,8 @@ async fn swap_config_and_reconcile_tun(
         // → `enable` rolls back.
         let tun_changed = if guard.tun == candidate.tun
             && guard.max_connections == candidate.max_connections
+            // The TUN carries the sniffer it was spawned with.
+            && guard.sniffer == candidate.sniffer
             // The default device address derives from it.
             && guard.fake_ip_range() == candidate.fake_ip_range()
         {
