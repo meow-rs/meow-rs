@@ -1022,7 +1022,17 @@ impl Tunnel {
     /// non-zero sub-second `Some(d)` truncates to `0` and *disables* the
     /// bound — programmatic callers must round up themselves if that is
     /// not the intent (config resolution only ever yields whole seconds).
+    ///
+    /// # Panics (debug builds only)
+    /// Asserts that a `Some` duration carries at least one whole second, so
+    /// the "non-zero duration that silently becomes zero" footgun surfaces
+    /// immediately in tests rather than silently disabling the bound.
     pub fn set_tcp_idle_timeout(&self, d: Option<std::time::Duration>) {
+        debug_assert!(
+            d.map_or(true, |d| d.as_secs() > 0),
+            "set_tcp_idle_timeout: Some(d) with d < 1 s truncates to 0 and \
+             disables the bound; round up to Duration::from_secs(1) minimum"
+        );
         self.inner
             .tcp_idle_timeout
             .store(d.map_or(0, |d| d.as_secs()), Ordering::Relaxed);

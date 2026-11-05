@@ -445,7 +445,7 @@ where
 
 /// [`copy_bidirectional_buf_tracked_splice`] plus the whole-connection
 /// `idle_timeout` bound of [`copy_bidirectional_buf_tracked_idle`].
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, reason = "mirrors copy_bidirectional_buf_tracked_splice's existing signature; idle_timeout cannot be folded into views")]
 pub async fn copy_bidirectional_buf_tracked_splice_idle<A, B, FA, FB>(
     a: &mut A,
     b: &mut B,
@@ -475,7 +475,7 @@ where
     .await
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, reason = "idle_timeout added this PR; a relay-options struct would be the right refactor but is out of scope here")]
 async fn relay<A, B, FA, FB>(
     a: &mut A,
     b: &mut B,
