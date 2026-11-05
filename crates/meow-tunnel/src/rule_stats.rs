@@ -2,8 +2,10 @@
 //! `PATCH /rules/disable` (`constant.RuleWrapper`): a hit counter, the last
 //! hit time, and the disabled switch dashboards toggle.
 //!
-//! One instance per rule list: a rebuilt rule list starts fresh, as
-//! mihomo's wrappers do on reload. Misses are not counted — the compiled
+//! One instance per rule list. A rebuilt list (any config commit,
+//! subscription refresh) carries each rule's state over by (type, payload,
+//! target), the n-th equal rule taking the n-th one's, so a disabled rule
+//! stays disabled. Misses are not counted — the compiled
 //! matcher never visits most rules, so a miss count would mean evaluating
 //! every rule per connection; `/rules` reports zero for them.
 
@@ -42,6 +44,52 @@ impl RuleStats {
             entries: (0..rule_count).map(|_| RuleStat::default()).collect(),
             any_disabled: AtomicBool::new(false),
         }
+    }
+
+    /// Stats for `new_rules`, carrying over the state of equal rules
+    /// (type, payload, target; the n-th equal one takes the n-th's) from
+    /// `old_rules` / `old`.
+    pub fn carried<'a>(
+        old_rules: &'a [Box<dyn meow_common::Rule>],
+        old: &Self,
+        new_rules: &'a [Box<dyn meow_common::Rule>],
+    ) -> Self {
+        let fresh = Self::new(new_rules.len());
+        if old.is_empty() || new_rules.is_empty() {
+            return fresh;
+        }
+        type Key<'a> = (meow_common::RuleType, &'a str, &'a str);
+        fn key(r: &dyn meow_common::Rule) -> Key<'_> {
+            (r.rule_type(), r.payload(), r.adapter())
+        }
+        let mut by_key: std::collections::HashMap<Key<'a>, std::collections::VecDeque<usize>> =
+            std::collections::HashMap::new();
+        for (i, r) in old_rules.iter().enumerate() {
+            by_key.entry(key(r.as_ref())).or_default().push_back(i);
+        }
+        for (i, r) in new_rules.iter().enumerate() {
+            let Some(j) = by_key
+                .get_mut(&key(r.as_ref()))
+                .and_then(std::collections::VecDeque::pop_front)
+            else {
+                continue;
+            };
+            let (Some(from), Some(to)) = (old.entries.get(j), fresh.entries.get(i)) else {
+                continue;
+            };
+            to.hits.store(from.hits.load(Relaxed), Relaxed);
+            to.hit_at.store(from.hit_at.load(Relaxed), Relaxed);
+            if from.disabled.load(Relaxed) {
+                to.disabled.store(true, Relaxed);
+                fresh.any_disabled.store(true, Relaxed);
+            }
+        }
+        fresh
+    }
+
+    /// Whether rule `index` is switched off.
+    pub fn is_disabled(&self, index: usize) -> bool {
+        !self.is_enabled(index)
     }
 
     pub fn len(&self) -> usize {
@@ -120,5 +168,31 @@ mod tests {
         assert!(s.view(1).disabled);
         assert!(s.set_disabled(1, false));
         assert!(s.is_enabled(1));
+    }
+
+    /// A rebuilt list keeps the switch of an equal rule, the n-th equal
+    /// rule taking the n-th one's; new rules start enabled.
+    #[test]
+    fn carried_follows_equal_rules() {
+        use meow_rules::domain_suffix::DomainSuffixRule;
+        let r = |p: &str, t: &str| -> Box<dyn meow_common::Rule> {
+            Box::new(DomainSuffixRule::new(p, t))
+        };
+        let old = vec![r("a.com", "P"), r("b.com", "P"), r("b.com", "P")];
+        let stats = RuleStats::new(old.len());
+        stats.set_disabled(0, true);
+        stats.set_disabled(2, true);
+        stats.record_hit(1);
+        let new = vec![
+            r("new.com", "P"),
+            r("b.com", "P"),
+            r("a.com", "P"),
+            r("b.com", "P"),
+        ];
+        let c = RuleStats::carried(&old, &stats, &new);
+        assert!(c.is_enabled(0));
+        assert!(c.is_enabled(1) && c.view(1).hits == 1);
+        assert!(c.is_disabled(2));
+        assert!(c.is_disabled(3));
     }
 }

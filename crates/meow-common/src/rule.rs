@@ -112,6 +112,45 @@ impl RuleType {
             RuleType::Not => "NOT",
         }
     }
+
+    /// The type for a mihomo API name ([`Self::mihomo_name`]), so a rule
+    /// read back from `GET /rules` (`DomainSuffix,…`) parses again.
+    pub fn from_mihomo_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "Domain" => RuleType::Domain,
+            "DomainSuffix" => RuleType::DomainSuffix,
+            "DomainKeyword" => RuleType::DomainKeyword,
+            "DomainRegex" => RuleType::DomainRegex,
+            "DomainWildcard" => RuleType::DomainWildcard,
+            "GeoSite" => RuleType::GeoSite,
+            "GeoIP" => RuleType::GeoIp,
+            "SrcGeoIP" => RuleType::SrcGeoIp,
+            "IPASN" => RuleType::IpAsn,
+            "SrcIPASN" => RuleType::SrcIpAsn,
+            "IPCIDR" => RuleType::IpCidr,
+            "SrcIPCIDR" => RuleType::SrcIpCidr,
+            "IPSuffix" => RuleType::IpSuffix,
+            "SrcIPSuffix" => RuleType::SrcIpSuffix,
+            "SrcPort" => RuleType::SrcPort,
+            "DstPort" => RuleType::DstPort,
+            "InPort" => RuleType::InPort,
+            "InUser" => RuleType::InUser,
+            "InName" => RuleType::InName,
+            "InType" => RuleType::InType,
+            "ProcessName" => RuleType::ProcessName,
+            "ProcessPath" => RuleType::ProcessPath,
+            "Match" => RuleType::Match,
+            "RuleSet" => RuleType::RuleSet,
+            "Network" => RuleType::Network,
+            "DSCP" => RuleType::Dscp,
+            "Uid" => RuleType::Uid,
+            "SubRules" => RuleType::SubRule,
+            "AND" => RuleType::And,
+            "OR" => RuleType::Or,
+            "NOT" => RuleType::Not,
+            _ => return None,
+        })
+    }
 }
 
 impl fmt::Display for RuleType {

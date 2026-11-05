@@ -10,6 +10,12 @@ the canonical, in-repo source a release is cut from.
 
 ### Added
 
+- **mihomo dashboard parity** (#882): `GET /rules` reports mihomo's type
+  names and the `extra` object (`disabled`, `hitCount`, `hitAt`);
+  `PATCH /rules/disable` switches rules off, the switch following its rule
+  across reloads; `GET/PUT/DELETE /storage/{key}` keeps dashboard settings
+  (zashboard's sync); `POST /rules/append`. Rule lines in mihomo's API
+  spelling (`DomainSuffix,a.com,DIRECT`) parse through `/rules`.
 - **DNS over QUIC (`quic://`)**: RFC 9250 on `quiche` (the vendored BoringSSL
   the rest of the process uses): one bidirectional stream per query, the
   two-octet length prefix, the transaction ID zeroed on the wire and restored

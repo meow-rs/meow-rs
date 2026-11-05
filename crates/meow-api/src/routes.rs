@@ -108,6 +108,8 @@ pub struct AppState {
     /// after spawning the server; `PUT /configs` hot-swaps the resolver
     /// slot or rebinds the socket on a `dns.listen` change (issue #514).
     pub dns_server: Arc<RwLock<Option<DnsServerHandle>>>,
+    /// `/storage/{key}`, opened on first use (`crate::storage`).
+    pub ui_storage: crate::storage::UiStorageSlot,
 }
 
 /// Handle to the running standalone DNS server (config `dns.listen`).
@@ -207,6 +209,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             "/rules",
             get(get_rules).post(replace_rules).put(update_rule_at_index),
         )
+        .route("/rules/append", post(append_rule))
         .route("/rules/{index}", delete(delete_rule))
         .route("/rules/disable", patch(disable_rules))
         .route("/rules/reorder", post(reorder_rules))
@@ -615,22 +618,23 @@ async fn get_rules(State(state): State<Arc<AppState>>) -> Response {
 }
 
 /// `PATCH /rules/disable` — mihomo's `disableRules`: a JSON object of rule
-/// index → disabled. Indexes past the end are skipped; the switches live
-/// with the current rule list and reset when it is rebuilt, as upstream.
+/// index → disabled. Indexes past the end are skipped. A switch follows
+/// its rule across rebuilds (config commits, subscription refreshes) by
+/// type, payload and target.
 ///
 /// The body is read as JSON whatever its `Content-Type`, as upstream's
 /// `render.DecodeJSON` does — panels do not all send the header.
 async fn disable_rules(State(state): State<Arc<AppState>>, body: axum::body::Bytes) -> Response {
-    let Ok(body) = serde_json::from_slice::<HashMap<String, bool>>(&body) else {
+    // Decoded whole before anything applies, as upstream's `map[int]bool`:
+    // a bad key fails the request with nothing changed; an index outside
+    // the list (negative included) is skipped.
+    let Ok(body) = serde_json::from_slice::<HashMap<i64, bool>>(&body) else {
         return msg_err(StatusCode::BAD_REQUEST, "Body invalid");
     };
-    let route = state.tunnel.route_snapshot();
-    for (index, disabled) in body {
-        let Ok(index) = index.parse::<usize>() else {
-            return msg_err(StatusCode::BAD_REQUEST, "Body invalid");
-        };
-        route.rule_stats.set_disabled(index, disabled);
-    }
+    state.tunnel.set_rules_disabled(
+        body.into_iter()
+            .filter_map(|(index, disabled)| Some((usize::try_from(index).ok()?, disabled))),
+    );
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -2640,6 +2644,27 @@ async fn update_rule_at_index(
     };
     let change = config_change(format!("Changed rule {}", body.index)).field("index", body.index);
     commit_raw_candidate(&state, snapshot, change).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct AppendRuleRequest {
+    rule: String,
+}
+
+/// `POST /rules/append` (meow): add one line after the config's rules.
+async fn append_rule(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<AppendRuleRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let _mutation = CONFIG_MUTATION.lock().await;
+    let snapshot = {
+        let mut raw = state.raw_config.read().clone();
+        raw.rules.get_or_insert_with(Vec::new).push(body.rule);
+        meow_config::subscription::reconcile_contribution_claims(&mut raw);
+        raw
+    };
+    commit_raw_candidate(&state, snapshot, config_change("Appended a rule".into())).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -5321,6 +5346,7 @@ mod outbound_flush_tests {
             external_ui: None,
             traffic_feed: TrafficFeed::default(),
             dns_server: Default::default(),
+            ui_storage: Default::default(),
         })
     }
 
@@ -5465,6 +5491,7 @@ mod global_route_binding_tests {
             external_ui: None,
             traffic_feed: TrafficFeed::default(),
             dns_server: Default::default(),
+            ui_storage: Default::default(),
         })
     }
 

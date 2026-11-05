@@ -353,6 +353,14 @@ impl CompiledRuleSet {
     }
 
     pub fn build(rules: &[Box<dyn Rule>]) -> Self {
+        Self::build_masked(rules, |_| false)
+    }
+
+    /// [`Self::build`] with the rules `disabled` reports (`PATCH
+    /// /rules/disable`) left out before the prune passes: a duplicate or a
+    /// rule shadowed by a disabled one then keeps its slot and matches, as
+    /// upstream's per-rule wrappers do.
+    pub fn build_masked(rules: &[Box<dyn Rule>], disabled: impl Fn(usize) -> bool) -> Self {
         let mut slots = Vec::with_capacity(rules.len());
         let mut adapter_names = Vec::new();
         let mut adapter_lookup = HashMap::new();
@@ -382,6 +390,10 @@ impl CompiledRuleSet {
             let payload = rule.payload();
             let mut demands_ip = rule.should_resolve_ip();
             let mut demands_process = rule.should_find_process();
+
+            if disabled(rule_index) {
+                continue;
+            }
 
             // Constant-false pruning: drop rules that can never match, so
             // they neither occupy scan slots nor force metadata enrichment.
@@ -3574,6 +3586,31 @@ mod tests {
     /// `PATCH /rules/disable`: a disabled rule is skipped like a PASS
     /// target, in the linear scan and in the indexed plan's trie-hit arm,
     /// and a later rule for the same domain still matches.
+    #[test]
+    fn disabling_a_rule_keeps_its_pruned_duplicate() {
+        let rules: Vec<Box<dyn Rule>> = vec![
+            Box::new(DomainSuffixRule::new("example.com", "PROXY")),
+            Box::new(DomainSuffixRule::new("example.com", "PROXY")),
+            Box::new(FinalRule::new("DIRECT")),
+        ];
+        let meta = Metadata {
+            host: "a.example.com".into(),
+            ..Default::default()
+        };
+        let probe = |_: &str| true;
+        let set = CompiledRuleSet::build_masked(&rules, |i| i == 0);
+        let m = set.match_rules(&meta, &rules, &probe).unwrap();
+        assert_eq!((m.adapter_name, m.rule_index), ("PROXY", 1));
+        // Disabling MATCH revives the dead tail behind it.
+        let tail: Vec<Box<dyn Rule>> = vec![
+            Box::new(FinalRule::new("DIRECT")),
+            Box::new(DomainSuffixRule::new("example.com", "PROXY")),
+        ];
+        let set = CompiledRuleSet::build_masked(&tail, |i| i == 0);
+        let m = set.match_rules(&meta, &tail, &probe).unwrap();
+        assert_eq!(m.adapter_name, "PROXY");
+    }
+
     #[test]
     fn disabled_rule_is_skipped_in_both_plans() {
         struct Disabled(usize);

@@ -517,10 +517,9 @@ async function addRule() {
     ruleStr = `${type},${payload},${target}`;
   }
   try {
-    const data = await api('/rules');
-    const rawRules = data.rules.map(r => r.payload ? `${r.type},${r.payload},${r.proxy}` : `${r.type},${r.proxy}`);
-    rawRules.push(ruleStr);
-    await api('/rules', { method: 'POST', body: JSON.stringify({ rules: rawRules }) });
+    // Appended to the config's own rule lines: rebuilding them from
+    // GET /rules would lose flags, logic payloads and dropped lines.
+    await api('/rules/append', { method: 'POST', body: JSON.stringify({ rule: ruleStr }) });
     toast('Rule added', 'success');
     document.getElementById('rule-payload').value = '';
     loadRules();

@@ -4,6 +4,8 @@
 //! syncs its settings through it after login and logs an error when the
 //! route is missing. GET answers the stored JSON (`null` when unset), PUT
 //! stores a body that must be valid JSON of at most 1 MB, DELETE removes it.
+//! Keys are at most 64 bytes and the store keeps at most 16384 of them,
+//! evicting an existing key for a new one past that — upstream's limits.
 //!
 //! Persisted as one JSON file in the home directory (`ui-storage.json`, a
 //! map of key → JSON text) next to `selector-cache.json`, written through
@@ -11,6 +13,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use axum::body::Bytes;
@@ -24,14 +27,24 @@ use crate::routes::{msg_err, AppState};
 
 /// mihomo's per-value cap.
 const MAX_VALUE: usize = 1 << 20;
+/// mihomo's `storageKeySizeLimit`.
+const MAX_KEY: usize = 64;
+/// mihomo's `maxStorageEntries`.
+const MAX_ENTRIES: usize = 16384;
 const FILE_NAME: &str = "ui-storage.json";
 
-pub(crate) struct UiStorage {
+pub struct UiStorage {
     path: PathBuf,
     map: Mutex<HashMap<String, String>>,
     /// Serializes the disk writes so the last rename carries the newest map.
     write_lock: Mutex<()>,
+    /// The file is behind the map (a write failed): the next PUT or DELETE
+    /// persists even when it changes nothing.
+    dirty: AtomicBool,
 }
+
+/// Per-router slot for the store, filled on first use.
+pub type UiStorageSlot = Arc<OnceLock<Arc<UiStorage>>>;
 
 impl UiStorage {
     fn open(path: PathBuf) -> Self {
@@ -50,6 +63,7 @@ impl UiStorage {
             path,
             map: Mutex::new(map),
             write_lock: Mutex::new(()),
+            dirty: AtomicBool::new(false),
         }
     }
 
@@ -63,6 +77,11 @@ impl UiStorage {
         match value {
             Some(v) if map.get(key) == Some(&v) => false,
             Some(v) => {
+                if map.len() >= MAX_ENTRIES && !map.contains_key(key) {
+                    if let Some(old) = map.keys().next().cloned() {
+                        map.remove(&old);
+                    }
+                }
                 map.insert(key.to_string(), v);
                 true
             }
@@ -73,9 +92,11 @@ impl UiStorage {
     fn persist(&self) {
         let _write = self.write_lock.lock();
         let snapshot = self.map.lock().clone();
-        if let Err(e) = write_atomic(&self.path, &snapshot) {
+        let failed = write_atomic(&self.path, &snapshot).is_err_and(|e| {
             warn!(path = %self.path.display(), error = %e, "ui storage: persist failed");
-        }
+            true
+        });
+        self.dirty.store(failed, Ordering::Relaxed);
     }
 }
 
@@ -94,11 +115,10 @@ fn write_atomic(path: &Path, map: &HashMap<String, String>) -> std::io::Result<(
     result
 }
 
-/// One store per process, opened on first use in the directory the
-/// selector cache lives in.
+/// The router's store, opened on first use in the directory the selector
+/// cache lives in.
 fn storage(state: &AppState) -> Arc<UiStorage> {
-    static STORE: OnceLock<Arc<UiStorage>> = OnceLock::new();
-    Arc::clone(STORE.get_or_init(|| {
+    Arc::clone(state.ui_storage.get_or_init(|| {
         let dir = state.config_path.as_deref().map_or_else(
             meow_common::resolved_home_dir,
             meow_config::resource_cache_dir_for_config_path,
@@ -123,11 +143,15 @@ pub(crate) async fn set_storage(
     UrlPath(key): UrlPath<String>,
     body: Bytes,
 ) -> Response {
-    if body.len() > MAX_VALUE {
-        return msg_err(StatusCode::PAYLOAD_TOO_LARGE, "payload exceeds 1MB limit");
+    // Upstream's order: key, JSON validity, then size.
+    if key.len() > MAX_KEY {
+        return msg_err(StatusCode::BAD_REQUEST, "key too long");
     }
     if serde_json::from_slice::<serde::de::IgnoredAny>(&body).is_err() {
         return msg_err(StatusCode::BAD_REQUEST, "Body invalid");
+    }
+    if body.len() > MAX_VALUE {
+        return msg_err(StatusCode::PAYLOAD_TOO_LARGE, "payload exceeds 1MB limit");
     }
     let Ok(value) = String::from_utf8(body.to_vec()) else {
         return msg_err(StatusCode::BAD_REQUEST, "Body invalid");
@@ -144,7 +168,7 @@ pub(crate) async fn delete_storage(
 
 async fn update(state: &AppState, key: &str, value: Option<String>) -> Response {
     let store = storage(state);
-    if store.set(key, value) {
+    if store.set(key, value) | store.dirty.load(Ordering::Relaxed) {
         let _ = tokio::task::spawn_blocking(move || store.persist()).await;
     }
     StatusCode::NO_CONTENT.into_response()
@@ -167,5 +191,19 @@ mod tests {
         assert!(s.set("zashboard", None));
         s.persist();
         assert_eq!(UiStorage::open(path).get("zashboard"), None);
+    }
+
+    #[test]
+    fn a_full_store_evicts_for_a_new_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = UiStorage::open(dir.path().join(FILE_NAME));
+        for i in 0..MAX_ENTRIES {
+            s.set(&i.to_string(), Some("1".into()));
+        }
+        assert!(s.set("0", Some("2".into())), "an existing key replaces");
+        assert_eq!(s.map.lock().len(), MAX_ENTRIES);
+        assert!(s.set("new", Some("1".into())));
+        assert_eq!(s.map.lock().len(), MAX_ENTRIES);
+        assert_eq!(s.get("new").as_deref(), Some("1"));
     }
 }

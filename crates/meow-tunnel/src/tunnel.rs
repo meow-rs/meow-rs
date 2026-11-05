@@ -55,15 +55,23 @@ pub struct RouteTable {
 }
 
 impl RouteTable {
+    /// A table for `rules`, carrying the per-rule state (disabled switch,
+    /// hits) of equal rules over from `prior` — a commit or subscription
+    /// refresh must not re-enable what a dashboard turned off.
     fn new(
         proxies: HashMap<SmolStr, Arc<dyn Proxy>>,
         rules: Vec<Box<dyn Rule>>,
         dialer_registry: meow_proxy::dialer::ProxyRegistry,
+        prior: Option<&RouteTable>,
     ) -> Self {
+        let rule_stats = prior.map_or_else(
+            || crate::rule_stats::RuleStats::new(rules.len()),
+            |p| crate::rule_stats::RuleStats::carried(&p.rules, &p.rule_stats, &rules),
+        );
         let domain_index = DomainIndex::build(&rules);
-        let compiled_rules = CompiledRuleSet::build(&rules);
+        let compiled_rules = CompiledRuleSet::build_masked(&rules, |i| rule_stats.is_disabled(i));
         Self {
-            rule_stats: Arc::new(crate::rule_stats::RuleStats::new(rules.len())),
+            rule_stats: Arc::new(rule_stats),
             rules: Arc::new(rules),
             domain_index: Arc::new(domain_index),
             compiled_rules: Arc::new(compiled_rules),
@@ -806,7 +814,7 @@ impl std::fmt::Display for RuleText<'_> {
 
 /// A routing decision's rule as the per-connection `match` log line prints
 /// it: `TYPE(payload)`, or `TYPE(target)` when the rule has no payload, so
-/// `MATCH,DIRECT` logs `MATCH(DIRECT)` rather than an empty `MATCH()`. The
+/// `MATCH,DIRECT` logs `Match(DIRECT)` rather than an empty `Match()`. The
 /// tunnel's own decisions read the same way, e.g. `Final(DIRECT)` when no
 /// rule matched.
 pub struct MatchedRule<'a> {
@@ -1156,8 +1164,12 @@ impl Tunnel {
     }
 
     pub fn update_rules(&self, rules: Vec<Box<dyn Rule>>) {
+        let rule_stats = {
+            let prior = self.route_snapshot();
+            crate::rule_stats::RuleStats::carried(&prior.rules, &prior.rule_stats, &rules)
+        };
         let new_index = DomainIndex::build(&rules);
-        let compiled_rules = CompiledRuleSet::build(&rules);
+        let compiled_rules = CompiledRuleSet::build_masked(&rules, |i| rule_stats.is_disabled(i));
         // Take the enrichment flags from the compiled plan rather than the
         // raw rule list: rules pruned by the IR clean-up passes (dead after
         // MATCH, provable never-match) must not force per-connection DNS
@@ -1172,7 +1184,7 @@ impl Tunnel {
         let old = {
             let mut route = self.inner.route.write();
             let new_route = RouteTable {
-                rule_stats: Arc::new(crate::rule_stats::RuleStats::new(rules.len())),
+                rule_stats: Arc::new(rule_stats),
                 rules: Arc::new(rules),
                 domain_index: Arc::new(new_index),
                 compiled_rules: Arc::new(compiled_rules),
@@ -1215,6 +1227,41 @@ impl Tunnel {
     /// `proxies` into — the route table must own it, or the map's
     /// `dialer-proxy` chains lose their cell and fail closed (issue #533
     /// review).
+    /// `PATCH /rules/disable`: switch rules on or off by index (indexes past
+    /// the end are skipped) and recompile the plan without the disabled
+    /// ones, so the prune passes never fold a live rule into a disabled one.
+    pub fn set_rules_disabled(&self, changes: impl IntoIterator<Item = (usize, bool)>) {
+        let old = {
+            let mut route = self.inner.route.write();
+            let mut changed = false;
+            for (index, disabled) in changes {
+                changed |= route.rule_stats.is_disabled(index) != disabled
+                    && route.rule_stats.set_disabled(index, disabled);
+            }
+            if !changed {
+                return;
+            }
+            let stats = Arc::clone(&route.rule_stats);
+            let compiled = CompiledRuleSet::build_masked(&route.rules, |i| stats.is_disabled(i));
+            self.inner
+                .needs_ip_resolution
+                .store(compiled.needs_ip_resolution(), Ordering::Relaxed);
+            self.inner
+                .needs_process_lookup
+                .store(compiled.needs_process_lookup(), Ordering::Relaxed);
+            let new_route = RouteTable {
+                rules: Arc::clone(&route.rules),
+                domain_index: Arc::clone(&route.domain_index),
+                compiled_rules: Arc::new(compiled),
+                proxies: Arc::clone(&route.proxies),
+                dialer_registry: route.dialer_registry.clone(),
+                rule_stats: stats,
+            };
+            std::mem::replace(&mut *route, Arc::new(new_route))
+        };
+        drop(old);
+    }
+
     pub fn update_proxies(
         &self,
         proxies: HashMap<SmolStr, Arc<dyn Proxy>>,
@@ -1254,7 +1301,13 @@ impl Tunnel {
         rules: Vec<Box<dyn Rule>>,
         dialer_registry: meow_proxy::dialer::ProxyRegistry,
     ) {
-        drop(self.install_routing(Arc::new(RouteTable::new(proxies, rules, dialer_registry))));
+        let route = RouteTable::new(
+            proxies,
+            rules,
+            dialer_registry,
+            Some(&self.route_snapshot()),
+        );
+        drop(self.install_routing(Arc::new(route)));
         info!("Routing configuration updated");
     }
 
@@ -1277,7 +1330,12 @@ impl Tunnel {
         mode: Option<TunnelMode>,
         dialer_registry: meow_proxy::dialer::ProxyRegistry,
     ) -> usize {
-        let route = Arc::new(RouteTable::new(proxies, rules, dialer_registry));
+        let route = Arc::new(RouteTable::new(
+            proxies,
+            rules,
+            dialer_registry,
+            Some(&self.route_snapshot()),
+        ));
         let mut generation = self.inner.tcp_generation.write();
         *generation = generation.checked_add(1).expect("TCP generation exhausted");
         let closed = self.inner.stats.close_all_connections_counted();
