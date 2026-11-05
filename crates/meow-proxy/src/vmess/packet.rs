@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use meow_common::{MeowError, ProxyPacketConn, Result};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use tokio::io::{ReadHalf, WriteHalf};
 use tokio::sync::Mutex;
 
@@ -37,7 +38,7 @@ struct Reader {
 
 pub(super) struct VmessPacketConn {
     reader: Mutex<Reader>,
-    writer: Mutex<(WriteHalf<Half>, BodyCipher)>,
+    writer_arc: Arc<Mutex<(WriteHalf<Half>, BodyCipher)>>,
     poisoned: AtomicBool,
     remote: SocketAddr,
 }
@@ -62,10 +63,10 @@ impl VmessPacketConn {
                 resp_v: sealed.resp_v,
                 buf: Vec::new(),
             }),
-            writer: Mutex::new((
+            writer_arc: Arc::new(Mutex::new((
                 wr,
                 BodyCipher::new_writer(security, &sealed.req_key, &sealed.req_iv),
-            )),
+            ))),
             poisoned: AtomicBool::new(false),
             remote,
         }
@@ -89,7 +90,8 @@ impl ProxyPacketConn for VmessPacketConn {
                 .map_err(MeowError::Io)?;
             r.header_pending = false;
         }
-        // A truncated datagram is still one datagram: copy what fits.
+        // A truncated datagram is still one datagram: copy what fits and log
+        // the drop so callers can diagnose buffer-sizing issues.
         match r
             .cipher
             .read_record_into(&mut r.half, &mut r.buf)
@@ -98,6 +100,13 @@ impl ProxyPacketConn for VmessPacketConn {
         {
             Some(()) => {
                 let n = r.buf.len().min(buf.len());
+                if r.buf.len() > buf.len() {
+                    tracing::debug!(
+                        datagram_len = r.buf.len(),
+                        caller_buf = buf.len(),
+                        "vmess udp: datagram truncated to caller's buffer size"
+                    );
+                }
                 buf[..n].copy_from_slice(&r.buf[..n]);
                 guard.complete = true;
                 Ok((n, self.remote))
@@ -123,7 +132,7 @@ impl ProxyPacketConn for VmessPacketConn {
         if buf.is_empty() {
             return Ok(0);
         }
-        let mut w = self.writer.lock().await;
+        let mut w = self.writer_arc.lock().await;
         crate::check_not_desynced(&self.poisoned)?;
         let mut guard = crate::PoisonOnIncomplete::new(&self.poisoned);
         let (half, cipher) = &mut *w;
@@ -140,6 +149,24 @@ impl ProxyPacketConn for VmessPacketConn {
     }
 
     fn close(&self) -> Result<()> {
+        // Signal a clean close to the peer by sending the chunk-stream
+        // terminator (a zero-length record).  write_record is async, so
+        // we spawn a best-effort task; the writer lock will be released
+        // promptly since write_packet is bounded by a single record.
+        //
+        // xray and sing-vmess treat a zero-length record as EOF on the
+        // association — without it a peer waiting for more datagrams hangs
+        // until its idle timeout fires.
+        let writer = Arc::clone(&self.writer_arc);
+        let poisoned = self.poisoned.load(std::sync::atomic::Ordering::Relaxed);
+        if !poisoned {
+            tokio::spawn(async move {
+                let mut w = writer.lock().await;
+                let (half, cipher) = &mut *w;
+                // A zero-length record is the chunk-stream terminator.
+                let _ = cipher.write_record(half, b"").await;
+            });
+        }
         Ok(())
     }
 }
