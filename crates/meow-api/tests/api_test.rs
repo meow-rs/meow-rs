@@ -971,10 +971,48 @@ async fn get_rules_returns_initial() {
     let json = body_json(resp).await;
     let rules = json["rules"].as_array().unwrap();
     assert_eq!(rules.len(), 2);
-    assert_eq!(rules[0]["type"], "DOMAIN");
+    assert_eq!(rules[0]["type"], "Domain");
     assert_eq!(rules[0]["payload"], "example.com");
     assert_eq!(rules[0]["proxy"], "DIRECT");
-    assert_eq!(rules[1]["type"], "MATCH");
+    assert_eq!(rules[1]["type"], "Match");
+}
+
+/// mihomo's `PATCH /rules/disable` (`{index: disabled}`, any content type)
+/// and the `extra` object `/rules` reports it through.
+#[tokio::test]
+async fn disable_rules_sets_extra_disabled() {
+    let state = test_state_default();
+    let patch = |body: &'static str| {
+        create_router(Arc::clone(&state)).oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/rules/disable")
+                .body(axum::body::Body::from(body))
+                .unwrap(),
+        )
+    };
+    assert_eq!(
+        patch(r#"{"1":true,"9":true}"#).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        patch(r#"{"x":true}"#).await.unwrap().status(),
+        StatusCode::BAD_REQUEST
+    );
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::get("/rules")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let json = body_json(resp).await;
+    let rules = json["rules"].as_array().unwrap();
+    assert_eq!(rules[0]["extra"]["disabled"], false);
+    assert_eq!(rules[1]["extra"]["disabled"], true);
+    assert_eq!(rules[1]["extra"]["hitCount"], 0);
+    assert_eq!(rules[1]["extra"]["hitAt"], "1970-01-01T00:00:00Z");
 }
 
 #[tokio::test]
@@ -1009,7 +1047,7 @@ async fn replace_rules() {
     let json = body_json(resp2).await;
     let rules = json["rules"].as_array().unwrap();
     assert_eq!(rules.len(), 2);
-    assert_eq!(rules[0]["type"], "DOMAIN-SUFFIX");
+    assert_eq!(rules[0]["type"], "DomainSuffix");
 
     // Also verify raw_config was updated
     let raw = state.raw_config.read();
@@ -6021,7 +6059,7 @@ async fn unavailable_trusttunnel_node_fails_udp_closed_through_rule_resolution()
             adapter, rule_name, ..
         } = state.tunnel.inner().resolve_proxy(&metadata).await.unwrap();
         assert_eq!(
-            rule_name, "MATCH",
+            rule_name, "Match",
             "{target}: the UDP flow was skipped past the unavailable node"
         );
         assert_eq!(adapter.name(), target);

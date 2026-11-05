@@ -5,7 +5,7 @@ use axum::{
     http::{header, request::Parts, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Json, Response},
-    routing::{delete, get, post, put},
+    routing::{delete, get, patch, post, put},
     Router,
 };
 use dashmap::DashMap;
@@ -208,6 +208,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             get(get_rules).post(replace_rules).put(update_rule_at_index),
         )
         .route("/rules/{index}", delete(delete_rule))
+        .route("/rules/disable", patch(disable_rules))
         .route("/rules/reorder", post(reorder_rules))
         .route("/connections", get(get_connections))
         .route(
@@ -232,6 +233,13 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             get(crate::logbook::get_logbook).delete(crate::logbook::clear_logbook),
         )
         .route("/memory", get(get_memory))
+        // Dashboard settings sync (zashboard), as mihomo's cache.db store.
+        .route(
+            "/storage/{key}",
+            get(crate::storage::get_storage)
+                .put(crate::storage::set_storage)
+                .delete(crate::storage::delete_storage),
+        )
         .route("/dns/results", get(get_dns_results))
         .route("/dns/query", get(dns_query_get).post(dns_query))
         .route("/cache/dns/flush", post(flush_dns_cache))
@@ -547,12 +555,29 @@ async fn get_group(State(state): State<Arc<AppState>>, Path(name): Path<String>)
 #[derive(Serialize)]
 struct RuleInfo<'a> {
     index: usize,
+    /// mihomo's type name (`DomainSuffix`), which dashboards show.
     #[serde(rename = "type")]
     rule_type: &'static str,
     payload: &'a str,
     proxy: &'a str,
     size: i64,
+    extra: RuleExtra,
 }
+
+/// mihomo's `RuleExtra` (`hub/route/rules.go`): dashboards draw the
+/// enable switch and hit statistics from it. Misses are not counted
+/// (see `meow_tunnel::rule_stats`), so they stay zero / the epoch.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RuleExtra {
+    disabled: bool,
+    hit_count: u64,
+    hit_at: String,
+    miss_count: u64,
+    miss_at: &'static str,
+}
+
+const EPOCH_RFC3339: &str = "1970-01-01T00:00:00Z";
 
 #[derive(Serialize)]
 struct RulesResponse<'a> {
@@ -567,15 +592,46 @@ async fn get_rules(State(state): State<Arc<AppState>>) -> Response {
         .rules
         .iter()
         .enumerate()
-        .map(|(index, r)| RuleInfo {
-            index,
-            rule_type: r.rule_type().as_str(),
-            payload: r.payload(),
-            proxy: r.adapter(),
-            size: -1,
+        .map(|(index, r)| {
+            let stat = route.rule_stats.view(index);
+            RuleInfo {
+                index,
+                rule_type: r.rule_type().mihomo_name(),
+                payload: r.payload(),
+                proxy: r.adapter(),
+                size: -1,
+                extra: RuleExtra {
+                    disabled: stat.disabled,
+                    hit_count: stat.hits,
+                    hit_at: unix_rfc3339(u64::from(stat.hit_at))
+                        .unwrap_or_else(|| EPOCH_RFC3339.to_string()),
+                    miss_count: 0,
+                    miss_at: EPOCH_RFC3339,
+                },
+            }
         })
         .collect();
     Json(RulesResponse { rules: result }).into_response()
+}
+
+/// `PATCH /rules/disable` — mihomo's `disableRules`: a JSON object of rule
+/// index → disabled. Indexes past the end are skipped; the switches live
+/// with the current rule list and reset when it is rebuilt, as upstream.
+///
+/// The body is read as JSON whatever its `Content-Type`, as upstream's
+/// `render.DecodeJSON` does — panels do not all send the header.
+async fn disable_rules(State(state): State<Arc<AppState>>, body: axum::body::Bytes) -> Response {
+    let Ok(body) = serde_json::from_slice::<HashMap<String, bool>>(&body) else {
+        return msg_err(StatusCode::BAD_REQUEST, "Body invalid");
+    };
+    let route = state.tunnel.route_snapshot();
+    for (index, disabled) in body {
+        let Ok(index) = index.parse::<usize>() else {
+            return msg_err(StatusCode::BAD_REQUEST, "Body invalid");
+        };
+        route.rule_stats.set_disabled(index, disabled);
+    }
+    StatusCode::NO_CONTENT.into_response()
 }
 
 #[derive(Serialize)]
@@ -740,8 +796,6 @@ struct ConfigResponse {
     bind_address: String,
     #[serde(rename = "ipv6")]
     ipv6: bool,
-    #[serde(rename = "routing-mark")]
-    routing_mark: u32,
     /// `sniffer.enable`, under mihomo's name for it.
     sniffing: bool,
     #[serde(rename = "skip-auth-prefixes")]
@@ -775,7 +829,6 @@ async fn get_configs(State(state): State<Arc<AppState>>) -> Json<ConfigResponse>
             .clone()
             .unwrap_or_else(|| "0.0.0.0".to_string()),
         ipv6: meow_config::effective_ipv6(raw.ipv6),
-        routing_mark: raw.routing_mark.unwrap_or(0),
         sniffing: raw.sniffer.as_ref().and_then(|s| s.enable).unwrap_or(false),
         skip_auth_prefixes: raw.skip_auth_prefixes.clone().unwrap_or_default(),
         tun_enable: tun_running,
@@ -2658,7 +2711,7 @@ struct DelayResp {
 }
 
 /// `{"message": "..."}` body matching upstream's error render.
-fn msg_err(status: StatusCode, message: &str) -> Response {
+pub(crate) fn msg_err(status: StatusCode, message: &str) -> Response {
     (status, Json(serde_json::json!({ "message": message }))).into_response()
 }
 

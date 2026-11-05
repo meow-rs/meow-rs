@@ -317,6 +317,17 @@ fn warn_missing_target(m: &CompiledMatchResult<'_>) {
     );
 }
 
+/// The probe's verdict on a match, with a disabled rule reading as
+/// [`TargetCheck::Pass`]: skipped silently, the scan continuing after it.
+#[inline]
+fn check_target(probe: &dyn TargetProbe, m: &CompiledMatchResult<'_>) -> TargetCheck {
+    if probe.rule_enabled(m.rule_index) {
+        probe.check(m.adapter_name)
+    } else {
+        TargetCheck::Pass
+    }
+}
+
 /// One borrowed result from a compiled rule-set match.
 #[derive(Clone, Copy)]
 pub struct CompiledMatchResult<'a> {
@@ -646,7 +657,7 @@ impl CompiledRuleSet {
         let mut tail_start = scan_end;
         if let Some(slot) = hit_slot {
             let m = self.static_match(slot, rules);
-            match probe.check(m.adapter_name) {
+            match check_target(probe, &m) {
                 TargetCheck::Usable => return Some(m),
                 TargetCheck::Pass => debug!("{} match Pass rule", m.adapter_name),
                 TargetCheck::Missing => on_missing(m),
@@ -757,7 +768,7 @@ impl CompiledRuleSet {
                 let mut tail_start = scan_end;
                 if let Some(slot) = hit_slot {
                     let m = self.static_match(slot, rules);
-                    match probe.check(m.adapter_name) {
+                    match check_target(probe, &m) {
                         TargetCheck::Usable => {
                             break 'scan LazyMatchOutcome::Matched(m);
                         }
@@ -932,7 +943,7 @@ impl CompiledRuleSet {
                 op => matches_op(op, input, helper).then(|| self.static_match(slot, rules)),
             };
             if let Some(m) = matched {
-                match probe.check(m.adapter_name) {
+                match check_target(probe, &m) {
                     TargetCheck::Usable => return ScanOutcome::Matched(m),
                     // A PASS-typed target silently skips the rule — the
                     // match loop's `continue GetRules` upstream. Distinct
@@ -3558,6 +3569,49 @@ mod tests {
             !logs.contains("PASS"),
             "PASS skip must never warn, got: {logs}"
         );
+    }
+
+    /// `PATCH /rules/disable`: a disabled rule is skipped like a PASS
+    /// target, in the linear scan and in the indexed plan's trie-hit arm,
+    /// and a later rule for the same domain still matches.
+    #[test]
+    fn disabled_rule_is_skipped_in_both_plans() {
+        struct Disabled(usize);
+        impl TargetProbe for Disabled {
+            fn check(&self, _: &str) -> TargetCheck {
+                TargetCheck::Usable
+            }
+            fn rule_enabled(&self, rule_index: usize) -> bool {
+                rule_index != self.0
+            }
+        }
+        let meta = Metadata {
+            host: "x.example.com".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+        for filler in [0, 70] {
+            let mut rules = filler_suffix_rules(filler);
+            rules.push(Box::new(DomainSuffixRule::new("example.com", "REJECT")));
+            rules.push(Box::new(DomainSuffixRule::new("x.example.com", "PROXY")));
+            rules.push(Box::new(FinalRule::new("DIRECT")));
+            let set = CompiledRuleSet::build(&rules);
+            let hit = |probe: &dyn TargetProbe| {
+                set.match_rules(&meta, &rules, probe)
+                    .map(|m| m.adapter_name)
+            };
+            assert_eq!(
+                hit(&Disabled(usize::MAX)),
+                Some("REJECT"),
+                "filler {filler}"
+            );
+            assert_eq!(hit(&Disabled(filler)), Some("PROXY"), "filler {filler}");
+            assert_eq!(
+                hit(&Disabled(filler + 1)),
+                Some("REJECT"),
+                "filler {filler}"
+            );
+        }
     }
 
     // The indexed plan's hit-slot arm must honour Pass the same way.

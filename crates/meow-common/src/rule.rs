@@ -73,6 +73,45 @@ impl RuleType {
             RuleType::InUser => "IN-USER",
         }
     }
+
+    /// mihomo's `RuleType.String()` (`constant/rule.go`): the name the
+    /// REST API reports in `/rules` and a connection's `rule`, and which
+    /// dashboards display and filter on.
+    pub fn mihomo_name(self) -> &'static str {
+        match self {
+            RuleType::Domain => "Domain",
+            RuleType::DomainSuffix => "DomainSuffix",
+            RuleType::DomainKeyword => "DomainKeyword",
+            RuleType::DomainRegex => "DomainRegex",
+            RuleType::DomainWildcard => "DomainWildcard",
+            RuleType::GeoSite => "GeoSite",
+            RuleType::GeoIp => "GeoIP",
+            RuleType::SrcGeoIp => "SrcGeoIP",
+            RuleType::IpAsn => "IPASN",
+            RuleType::SrcIpAsn => "SrcIPASN",
+            RuleType::IpCidr => "IPCIDR",
+            RuleType::SrcIpCidr => "SrcIPCIDR",
+            RuleType::IpSuffix => "IPSuffix",
+            RuleType::SrcIpSuffix => "SrcIPSuffix",
+            RuleType::SrcPort => "SrcPort",
+            RuleType::DstPort => "DstPort",
+            RuleType::InPort => "InPort",
+            RuleType::InUser => "InUser",
+            RuleType::InName => "InName",
+            RuleType::InType => "InType",
+            RuleType::ProcessName => "ProcessName",
+            RuleType::ProcessPath => "ProcessPath",
+            RuleType::Match => "Match",
+            RuleType::RuleSet => "RuleSet",
+            RuleType::Network => "Network",
+            RuleType::Dscp => "DSCP",
+            RuleType::Uid => "Uid",
+            RuleType::SubRule => "SubRules",
+            RuleType::And => "AND",
+            RuleType::Or => "OR",
+            RuleType::Not => "NOT",
+        }
+    }
 }
 
 impl fmt::Display for RuleType {
@@ -156,6 +195,12 @@ pub trait TargetProbe {
     /// SUB-RULE inner scans (upstream `matchSubRules`' `CheckPassRule`).
     fn is_pass_rule(&self, _name: &str) -> bool {
         false
+    }
+    /// Whether rule `rule_index` takes part in matching. A disabled rule
+    /// (mihomo `PATCH /rules/disable`) is skipped like a PASS target:
+    /// silently, and the scan continues with the next rule.
+    fn rule_enabled(&self, _rule_index: usize) -> bool {
+        true
     }
 }
 

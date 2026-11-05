@@ -49,6 +49,9 @@ pub struct RouteTable {
     /// hold the registry cell weakly (issue #533), so without this owner the
     /// snapshot would drop while the adapters are still dialable.
     pub dialer_registry: meow_proxy::dialer::ProxyRegistry,
+    /// Hit counters and disabled switches for `rules`, index for index;
+    /// replaced together with `rules`, kept across a proxies-only swap.
+    pub rule_stats: Arc<crate::rule_stats::RuleStats>,
 }
 
 impl RouteTable {
@@ -60,6 +63,7 @@ impl RouteTable {
         let domain_index = DomainIndex::build(&rules);
         let compiled_rules = CompiledRuleSet::build(&rules);
         Self {
+            rule_stats: Arc::new(crate::rule_stats::RuleStats::new(rules.len())),
             rules: Arc::new(rules),
             domain_index: Arc::new(domain_index),
             compiled_rules: Arc::new(compiled_rules),
@@ -75,6 +79,7 @@ impl RouteTable {
             compiled_rules: Arc::new(CompiledRuleSet::empty()),
             proxies: Arc::new(HashMap::new()),
             dialer_registry: meow_proxy::dialer::ProxyRegistry::default(),
+            rule_stats: Arc::default(),
         }
     }
 }
@@ -742,6 +747,7 @@ impl TunnelInner {
                         Arc::clone(&self.reject) as Arc<dyn ProxyAdapter>
                     }
                 };
+                route.rule_stats.record_hit(m.rule_index);
                 self.stats
                     .rule_match
                     .increment(m.rule_type.as_str(), action);
@@ -751,11 +757,11 @@ impl TunnelInner {
                     m.rule_index + 1,
                     RuleText::parts(m.rule_type.as_str(), m.rule_payload)
                 );
-                // `rule_type.as_str()` is a `&'static str` — wrap it
-                // inline without heap.
+                // mihomo's type name (`DomainSuffix`), a `&'static str` —
+                // wrapped inline without heap.
                 ResolvedTarget {
                     adapter: proxy,
-                    rule_name: SmolStr::new_static(m.rule_type.as_str()),
+                    rule_name: SmolStr::new_static(m.rule_type.mihomo_name()),
                     rule_payload: SmolStr::from(m.rule_payload),
                     route: Arc::clone(route),
                 }
@@ -967,6 +973,10 @@ impl RouteTargetProbe<'_> {
 }
 
 impl TargetProbe for RouteTargetProbe<'_> {
+    fn rule_enabled(&self, rule_index: usize) -> bool {
+        self.route.rule_stats.is_enabled(rule_index)
+    }
+
     fn check(&self, name: &str) -> TargetCheck {
         // `DIRECT` resolves without a registry entry: route snapshots may
         // lack it (hand-built tables), and user entries cannot shadow it
@@ -1162,6 +1172,7 @@ impl Tunnel {
         let old = {
             let mut route = self.inner.route.write();
             let new_route = RouteTable {
+                rule_stats: Arc::new(crate::rule_stats::RuleStats::new(rules.len())),
                 rules: Arc::new(rules),
                 domain_index: Arc::new(new_index),
                 compiled_rules: Arc::new(compiled_rules),
@@ -1220,6 +1231,7 @@ impl Tunnel {
                 compiled_rules: Arc::clone(&route.compiled_rules),
                 proxies: Arc::new(proxies),
                 dialer_registry,
+                rule_stats: Arc::clone(&route.rule_stats),
             };
             self.publish_dialer_registry(&new_route);
             std::mem::replace(&mut *route, Arc::new(new_route))
@@ -2435,7 +2447,7 @@ mod tests {
         // instance, so `adapter.name()` stays "DIRECT" — pin the matched
         // rule instead, which is what proves the enrichment ran.
         assert_eq!(
-            resolved.rule_name, "PROCESS-NAME",
+            resolved.rule_name, "ProcessName",
             "PROCESS-NAME rule must match the enrichment done inside resolve_proxy"
         );
     }

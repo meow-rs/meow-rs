@@ -3,6 +3,17 @@ use meow_common::{Metadata, Rule, RuleMatchHelper, RuleType};
 use crate::adapter::{intern_adapter, Adapter};
 use smol_str::SmolStr;
 
+/// mihomo's display payload of a logic rule (`rules/logic/logic.go`
+/// `Payload()`): `((Type,payload) && (Type,payload))`, which `/rules` and a
+/// connection's `rulePayload` report and dashboards show.
+fn logic_payload(rules: &[Box<dyn Rule>], sep: &str) -> SmolStr {
+    let parts: Vec<String> = rules
+        .iter()
+        .map(|r| format!("({},{})", r.rule_type().mihomo_name(), r.payload()))
+        .collect();
+    format!("({})", parts.join(sep)).into()
+}
+
 pub struct AndRule {
     rules: Vec<Box<dyn Rule>>,
     adapter: Adapter,
@@ -11,12 +22,7 @@ pub struct AndRule {
 
 impl AndRule {
     pub fn new(rules: Vec<Box<dyn Rule>>, adapter: &str) -> Self {
-        let payload = rules
-            .iter()
-            .map(|r| r.payload().to_string())
-            .collect::<Vec<_>>()
-            .join(" AND ")
-            .into();
+        let payload = logic_payload(&rules, " && ");
         Self {
             rules,
             adapter: intern_adapter(adapter),
@@ -81,12 +87,7 @@ pub struct OrRule {
 
 impl OrRule {
     pub fn new(rules: Vec<Box<dyn Rule>>, adapter: &str) -> Self {
-        let payload = rules
-            .iter()
-            .map(|r| r.payload().to_string())
-            .collect::<Vec<_>>()
-            .join(" OR ")
-            .into();
+        let payload = logic_payload(&rules, " || ");
         Self {
             rules,
             adapter: intern_adapter(adapter),
@@ -150,7 +151,7 @@ pub struct NotRule {
 
 impl NotRule {
     pub fn new(rule: Box<dyn Rule>, adapter: &str) -> Self {
-        let payload = format!("NOT {}", rule.payload()).into();
+        let payload = format!("(!({},{}))", rule.rule_type().mihomo_name(), rule.payload()).into();
         Self {
             rule,
             adapter: intern_adapter(adapter),
