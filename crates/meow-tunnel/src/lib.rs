@@ -24,6 +24,6 @@ pub use statistics::{ProxyTraffic, Statistics};
 pub use tcp::{route_inbound_tcp, ConnectionGuard};
 pub use tunnel::{
     MatchedRule, OutboundFlush, PreHandleVerdict, ResolvedTarget, TrackedTcp, TunHandle, Tunnel,
-    TunnelInner,
+    TunnelInner, UsingProxy,
 };
 pub use udp::UdpFlushWatch;

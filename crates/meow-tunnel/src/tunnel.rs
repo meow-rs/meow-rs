@@ -832,6 +832,46 @@ impl std::fmt::Display for MatchedRule<'_> {
     }
 }
 
+/// The `using` part of the per-connection `match` log line: the decision's
+/// adapter, followed by the member the flow dials through in brackets when
+/// that adapter is a group, e.g. `Proxy[HK-01]`. Like upstream's
+/// `Chain.String()`, nested groups print only the outer group and the
+/// final member.
+///
+/// meow logs this line before the dial (upstream logs it after), so the
+/// member is the one the dial will take, peeked with
+/// `unwrap_proxy(metadata, false)` the way the `/connections` `chains`
+/// entry is. The peek runs only when the line is formatted, so it costs
+/// nothing while INFO is off. A round-robin load-balance pick is a
+/// prediction: another flow's dial may commit in between.
+///
+/// A relay group prints as itself, since it resolves its hops per dial and
+/// offers nothing to peek (see `RelayGroup`'s `Proxy` impl). An outbound's
+/// `dialer-proxy` front is not part of the line either: the brackets name
+/// the outbound that reaches the destination, not the hop it dials its
+/// server through.
+pub struct UsingProxy<'a> {
+    adapter: &'a dyn ProxyAdapter,
+    metadata: &'a Metadata,
+}
+
+impl<'a> UsingProxy<'a> {
+    /// `adapter` is the one the decision picked; `metadata` is the flow's.
+    pub fn new(adapter: &'a dyn ProxyAdapter, metadata: &'a Metadata) -> Self {
+        Self { adapter, metadata }
+    }
+}
+
+impl std::fmt::Display for UsingProxy<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.adapter.name())?;
+        if let Some(leaf) = crate::tcp::leaf_proxy(self.adapter, self.metadata) {
+            write!(f, "[{}]", leaf.name())?;
+        }
+        Ok(())
+    }
+}
+
 /// The outcome of [`TunnelInner::resolve_proxy`] /
 /// [`TunnelInner::resolve_proxy_lazy`]:
 /// the adapter to dial, the rule that produced it, and the route-table

@@ -2,7 +2,7 @@ use crate::relay::{
     copy_bidirectional_buf_tracked_splice_idle, proxy_conn_tcp_view, RELAY_BUF_SIZE,
 };
 use crate::statistics::Statistics;
-use crate::tunnel::{MatchedRule, ResolvedTarget, TunnelInner};
+use crate::tunnel::{MatchedRule, ResolvedTarget, TunnelInner, UsingProxy};
 use meow_common::conn_note;
 use meow_common::conn_notes::{self, ConnNotes};
 use meow_common::traffic_ledger::Route;
@@ -441,7 +441,7 @@ async fn route_inbound_tcp_scoped<C>(
             &target.rule_payload,
             target.adapter.name()
         ),
-        target.adapter.name()
+        UsingProxy::new(target.adapter.as_ref(), &metadata)
     );
 
     // `route` pins this generation's dialer registry across the dial —
@@ -1161,6 +1161,46 @@ mod tests {
             "cats.invalid:443 match DOMAIN-SUFFIX(cats.invalid) using DIRECT",
             "dogs.invalid:443 match MATCH(DIRECT) using DIRECT",
             "birds.invalid:443 match Final(DIRECT) using DIRECT",
+        ] {
+            assert!(logs.contains(line), "no {line:?} in:\n{logs}");
+        }
+    }
+
+    /// A group target names the member the flow dials through in brackets,
+    /// as upstream's `Chain.String()` does: the outer group and the final
+    /// member, so `Proxy → Auto → DIRECT` logs `Proxy[DIRECT]`. The rule
+    /// part keeps the rule's own target.
+    #[test]
+    fn match_log_line_names_the_member_a_group_dials_through() {
+        let logs = capture_info(async {
+            let tunnel = test_tunnel();
+            let mut proxies = meow_config::rebuild_from_raw(&Default::default())
+                .unwrap()
+                .proxies;
+            let direct = Arc::clone(&proxies["DIRECT"]);
+            let auto: Arc<dyn meow_common::Proxy> =
+                Arc::new(meow_proxy::SelectorGroup::new("Auto", vec![direct]));
+            proxies.insert("Auto".into(), Arc::clone(&auto));
+            proxies.insert(
+                "Proxy".into(),
+                Arc::new(meow_proxy::SelectorGroup::new("Proxy", vec![auto])),
+            );
+            tunnel.update_routing(
+                proxies,
+                vec![rule("DOMAIN-SUFFIX,cats.invalid,Proxy"), rule("MATCH,Auto")],
+                Default::default(),
+            );
+            for host in ["cats.invalid", "dogs.invalid"] {
+                let meta = Metadata {
+                    host: host.into(),
+                    ..metadata()
+                };
+                route_one(&tunnel, meta).await;
+            }
+        });
+        for line in [
+            "cats.invalid:443 match DOMAIN-SUFFIX(cats.invalid) using Proxy[DIRECT]",
+            "dogs.invalid:443 match MATCH(Auto) using Auto[DIRECT]",
         ] {
             assert!(logs.contains(line), "no {line:?} in:\n{logs}");
         }

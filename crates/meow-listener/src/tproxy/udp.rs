@@ -45,7 +45,7 @@ pub(super) mod flow {
     use std::time::Duration;
 
     use meow_common::{ConnType, Metadata, Network};
-    use meow_tunnel::{MatchedRule, Tunnel};
+    use meow_tunnel::{MatchedRule, Tunnel, UsingProxy};
     use tokio::sync::mpsc;
     use tokio::time::{sleep_until, Instant};
     use tracing::{debug, info};
@@ -150,7 +150,7 @@ pub(super) mod flow {
         info!(
             "UDP {client} --> {orig_dst} match {} using {}",
             MatchedRule::new(&rule_name, &rule_payload, proxy.name()),
-            proxy.name()
+            UsingProxy::new(proxy.as_ref(), &metadata)
         );
 
         // Taken before the dial so a flush landing mid-dial still ends the

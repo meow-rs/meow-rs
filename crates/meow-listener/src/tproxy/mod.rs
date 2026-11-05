@@ -7,7 +7,7 @@ use firewall::FirewallGuard;
 use meow_common::{with_dial_timeout, ConnType, Metadata, Network, TcpKeepaliveConfig};
 use meow_tunnel::{
     copy_bidirectional_buf_tracked_splice_idle, proxy_conn_tcp_view, tcp_view, MatchedRule,
-    ResolvedTarget, Tunnel, RELAY_BUF_SIZE,
+    ResolvedTarget, Tunnel, UsingProxy, RELAY_BUF_SIZE,
 };
 use std::collections::HashSet;
 use std::future::Future;
@@ -636,7 +636,7 @@ async fn handle_tproxy_flow(
         metadata.source_address(),
         metadata.remote_address(),
         MatchedRule::new(&rule_name, &rule_payload, proxy.name()),
-        proxy.name()
+        UsingProxy::new(proxy.as_ref(), &metadata)
     );
 
     let Some(_guard) = admission.track_named(&metadata, rule_name, rule_payload, proxy.as_ref())

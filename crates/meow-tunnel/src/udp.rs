@@ -1,5 +1,5 @@
 use crate::statistics::{ConnCounters, Statistics};
-use crate::tunnel::{MatchedRule, ResolvedTarget, TunnelInner};
+use crate::tunnel::{MatchedRule, ResolvedTarget, TunnelInner, UsingProxy};
 use dashmap::DashMap;
 use meow_common::atomic::{AtomicU, Int};
 use meow_common::{with_dial_timeout, AdapterType, Metadata, ProxyAdapter, ProxyPacketConn};
@@ -357,7 +357,7 @@ pub async fn handle_udp(
         src,
         dst_addr,
         MatchedRule::new(&rule_name, &rule_payload, proxy.name()),
-        proxy.name()
+        UsingProxy::new(proxy.as_ref(), &metadata)
     );
 
     // Taken before the dial: a session dialled across a flush may sit on a

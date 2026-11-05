@@ -27,7 +27,7 @@ use ipnet::{Ipv4Net, Ipv6Net};
 use lwip::UdpSocket;
 use meow_common::{ConnType, Metadata, Network};
 use meow_dns::server::{hex_prefix, DnsServer, LocalAnswer};
-use meow_tunnel::{MatchedRule, ResolvedTarget, Tunnel};
+use meow_tunnel::{MatchedRule, ResolvedTarget, Tunnel, UsingProxy};
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Instant};
 use tracing::{debug, info, warn};
@@ -372,7 +372,7 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
         src,
         metadata.remote_address(),
         MatchedRule::new(&rule_name, &rule_payload, proxy.name()),
-        proxy.name()
+        UsingProxy::new(proxy.as_ref(), &metadata)
     );
 
     // Taken before the dial so a flush landing mid-dial still ends the flow
