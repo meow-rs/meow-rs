@@ -2853,9 +2853,8 @@ fn default_transport_alpn(network: &str, alpn: Vec<String>) -> Vec<String> {
 ///
 /// Matches mihomo's wire-facing fields: `public-key` is base64 RawURL X25519,
 /// `short-id` is hex-decoded and zero-padded to eight bytes, and
-/// `support-x25519mlkem768` is a capability flag. The TLS layer currently
-/// offers X25519 only; keeping the flag in config preserves the public surface
-/// for future fingerprint-specific ClientHello work.
+/// `support-x25519mlkem768` offers an X25519MLKEM768 key share ahead of
+/// X25519 (required by Xray REALITY servers >= 26.9.8).
 #[cfg(feature = "vless")]
 fn parse_vless_reality_opts(
     name: &str,

@@ -89,8 +89,8 @@ Out of scope:
   32-byte X25519 public key.
 - `short-id`: hex string up to 8 bytes. The decoded value is zero-padded to
   8 bytes.
-- `support-x25519mlkem768`: boolean. It is stored in `RealityConfig`, but does
-  not change ClientHello generation yet.
+- `support-x25519mlkem768`: boolean. Offers an X25519MLKEM768 key share (with
+  its own X25519 key) ahead of X25519; Xray REALITY servers >= 26.9.8 require it.
 
 Config constraints:
 
@@ -132,7 +132,7 @@ Handshake flow:
 5. Read ServerHello and validate:
    - The server echoed the ClientHello `session_id`.
    - TLS 1.3 was negotiated.
-   - `key_share` is X25519.
+   - `key_share` is X25519, or X25519MLKEM768 when it was offered.
    - The current supported cipher suite is `TLS_AES_128_GCM_SHA256`.
 6. Run the handwritten TLS 1.3 handshake/application key schedule.
 7. Decrypt EncryptedExtensions, Certificate, CertificateVerify, and Finished.

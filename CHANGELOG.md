@@ -10,6 +10,10 @@ the canonical, in-repo source a release is cut from.
 
 ### Added
 
+- REALITY: `support-x25519mlkem768` now offers an X25519MLKEM768 key share
+  (its own X25519 key) ahead of X25519, which Xray REALITY servers ≥ 26.9.8
+  require; the REALITY ClientVer is a current Xray release, so servers with
+  a `minClientVer` floor accept it.
 - **`unified-delay: true`** — mihomo's global switch, re-applied on
   every config load and reported by `GET /configs`. A delay probe then
   sends two keep-alive `HEAD` requests on one connection and reports

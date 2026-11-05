@@ -13,8 +13,10 @@
 //! ships) and deliberately match the versions the BoringSSL backend parrots
 //! for plain TLS (`tls/boring_backend.rs`): `chrome` is Chrome 120,
 //! `firefox` Firefox 120, `safari` Safari 16.0, `ios` iOS 14, `edge`
-//! Edge 85.  None of them offers a hybrid post-quantum share, so the
-//! handshake only ever has to complete X25519.
+//! Edge 85.  None of those browsers offered a hybrid post-quantum share;
+//! with `support-x25519mlkem768` every profile gets an X25519MLKEM768 share
+//! ahead of X25519 anyway (current Xray REALITY servers require it) — a
+//! deliberate deviation from the pre-PQ firefox/safari/ios parrots.
 
 use crate::{Result, TransportError};
 
@@ -50,8 +52,8 @@ enum Ext {
     StatusRequest,
     SignatureAlgorithms(&'static [u16]),
     Sct,
-    /// `key_share`: an optional GREASE entry, X25519, then optionally a
-    /// decoy P-256 entry (Firefox sends both).
+    /// `key_share`: an optional GREASE entry, X25519MLKEM768 when offered,
+    /// X25519, then optionally a decoy P-256 entry (Firefox sends both).
     KeyShare {
         grease: bool,
         p256: bool,
@@ -439,11 +441,11 @@ pub(crate) struct HelloParams<'a> {
     pub(crate) alpn: &'a [String],
     pub(crate) random: &'a [u8; 32],
     pub(crate) x25519_public: &'a [u8; 32],
-    /// ML-KEM-768 encapsulation key: when set, X25519MLKEM768 is offered
-    /// first in `supported_groups` and as the first real `key_share`
-    /// (before X25519, sharing its X25519 key) — as current Chrome does,
-    /// and as current Xray REALITY servers require.
-    pub(crate) mlkem768_public: Option<&'a [u8]>,
+    /// ML-KEM-768 encapsulation key and the hybrid's own X25519 public key:
+    /// when set, X25519MLKEM768 is offered first in `supported_groups` and
+    /// as the first real `key_share` (before X25519) — as current Chrome
+    /// does, and as current Xray REALITY servers require.
+    pub(crate) x25519_mlkem768: Option<(&'a [u8], &'a [u8; 32])>,
 }
 
 /// Encode a framed ClientHello handshake message shaped like `profile`.
@@ -489,7 +491,7 @@ pub(crate) fn build_client_hello(
             Ext::RenegotiationInfo => (0xff01, vec![0]),
             Ext::SupportedGroups(groups) => {
                 let mut data = Vec::with_capacity(4 + groups.len() * 2);
-                if params.mlkem768_public.is_some() {
+                if params.x25519_mlkem768.is_some() {
                     // Hybrid right after the leading GREASE (if any).
                     let mut with_pq = Vec::with_capacity(groups.len() + 1);
                     let lead = usize::from(groups.first() == Some(&GREASE));
@@ -529,11 +531,11 @@ pub(crate) fn build_client_hello(
                     put_u16(1, &mut shares);
                     shares.push(0);
                 }
-                if let Some(mlkem) = params.mlkem768_public {
+                if let Some((mlkem, x25519)) = params.x25519_mlkem768 {
                     put_u16(GROUP_X25519_MLKEM768, &mut shares);
                     put_u16((mlkem.len() + 32) as u16, &mut shares);
                     shares.extend_from_slice(mlkem);
-                    shares.extend_from_slice(params.x25519_public);
+                    shares.extend_from_slice(x25519);
                 }
                 put_u16(GROUP_X25519, &mut shares);
                 put_u16(32, &mut shares);
@@ -684,7 +686,7 @@ mod tests {
                 alpn,
                 random: &[7u8; 32],
                 x25519_public: &[3u8; 32],
-                mlkem768_public: None,
+                x25519_mlkem768: None,
             },
         )
         .expect("client hello")

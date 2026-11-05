@@ -258,7 +258,7 @@ The most feature-rich protocol: TLS, REALITY, XTLS-Vision flow, and five transpo
 | --- | --- | --- | --- |
 | `public-key` | string | ✓ | Base64url X25519 public key (32 bytes) |
 | `short-id` | string | | Hex, ≤ 8 bytes (zero-padded) |
-| `support-x25519mlkem768` | bool | | Hybrid key-agreement flag |
+| `support-x25519mlkem768` | bool | | Offer an X25519MLKEM768 key share ahead of X25519. **Required by Xray REALITY servers ≥ 26.9.8** (they divert a hello without it to `dest`) |
 
 ```yaml
 - name: vless-reality
