@@ -92,6 +92,10 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- SOCKS5 UDP sessions now stop on outbound flush or reply-reader failure even
+  while a packet write is pending. A short write retires the session without
+  retrying any part of the datagram.
+
 - **PROCESS-NAME, PROCESS-PATH and UID rules match every IPv4 client of
   a dual-stack listener** (`bind-address: "::"`). The process lookup ran
   on the client's IPv4-mapped address, so it missed clients with an
