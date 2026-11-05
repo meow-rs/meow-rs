@@ -150,21 +150,26 @@ impl ProxyPacketConn for VmessPacketConn {
 
     fn close(&self) -> Result<()> {
         // Signal a clean close to the peer by sending the chunk-stream
-        // terminator (a zero-length record).  write_record is async, so
-        // we spawn a best-effort task; the writer lock will be released
-        // promptly since write_packet is bounded by a single record.
-        //
-        // xray and sing-vmess treat a zero-length record as EOF on the
-        // association — without it a peer waiting for more datagrams hangs
+        // terminator: a literal two-byte `[0x00, 0x00]` length prefix with
+        // no body.  `write_record(b"")` would produce a 16-byte AEAD record
+        // (empty plaintext + authentication tag) — that is not the terminator
+        // the wire format defines.  xray and sing-vmess stop reading on
+        // `[0x00, 0x00]`; without it a peer waiting for more datagrams hangs
         // until its idle timeout fires.
+        //
+        // write_record is async, so we spawn a best-effort task; the writer
+        // lock will be released promptly since write_packet is bounded by a
+        // single record.
         let writer = Arc::clone(&self.writer_arc);
         let poisoned = self.poisoned.load(std::sync::atomic::Ordering::Relaxed);
         if !poisoned {
             tokio::spawn(async move {
                 let mut w = writer.lock().await;
-                let (half, cipher) = &mut *w;
-                // A zero-length record is the chunk-stream terminator.
-                let _ = cipher.write_record(half, b"").await;
+                let (half, _cipher) = &mut *w;
+                // Raw two-byte chunk-stream terminator — security-type agnostic.
+                use tokio::io::AsyncWriteExt as _;
+                let _ = half.write_all(&[0x00, 0x00]).await;
+                let _ = half.flush().await;
             });
         }
         Ok(())

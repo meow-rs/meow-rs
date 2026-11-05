@@ -765,6 +765,94 @@ mod tests {
             .expect("server task panicked");
     }
 
+    /// close() on a native UDP conn sends a zero-length chunk-stream terminator
+    /// record.  The peer reads it as `Ok(None)` — a clean close — rather than
+    /// hanging on its idle timeout.
+    #[tokio::test]
+    async fn close_sends_chunk_stream_terminator() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for security in [
+            Security::Aes128Gcm,
+            Security::ChaCha20Poly1305,
+            Security::None,
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let adapter = test_adapter(port, security, true);
+            let cmd_key = adapter.cmd_key;
+
+            let server = tokio::spawn(async move {
+                let (mut sock, _) = listener.accept().await.unwrap();
+
+                // Read and parse the request header.
+                let mut prefix = [0u8; 42];
+                sock.read_exact(&mut prefix).await.unwrap();
+                let frame_len = header::tests::request_header_frame_len(&cmd_key, &prefix).unwrap();
+                let mut frame = prefix.to_vec();
+                frame.resize(frame_len, 0);
+                sock.read_exact(&mut frame[42..]).await.unwrap();
+                let pt = header::tests::server_open_request_header(&cmd_key, &frame).unwrap();
+
+                let req_iv: [u8; 16] = pt[1..17].try_into().unwrap();
+                let req_key: [u8; 16] = pt[17..33].try_into().unwrap();
+
+                // Send the response header so the client can start reading.
+                sock.write_all(&header::tests::seal_response_header(
+                    &req_key, &req_iv, pt[33],
+                ))
+                .await
+                .unwrap();
+
+                // Send one data record so the client can read the response
+                // header (it is consumed lazily on the first read_packet).
+                let mut cipher = body::BodyCipher::server_mirror(security, &req_key, &req_iv);
+                cipher.write_record(&mut sock, b"ping").await.unwrap();
+
+                // Now read what the client sends — it should be a single
+                // zero-length terminator record (the close() call), not a
+                // data record.  read_record returns Ok(None) on a terminator.
+                let result = cipher.read_record(&mut sock).await.unwrap();
+                assert_eq!(
+                    result, None,
+                    "{security:?}: expected zero-length terminator, got Some(_)"
+                );
+            });
+
+            let metadata = Metadata {
+                network: meow_common::Network::Udp,
+                dst_ip: Some("1.2.3.4".parse().unwrap()),
+                dst_port: 5353,
+                ..Default::default()
+            };
+            let conn = adapter.dial_udp(&metadata).await.expect("dial_udp");
+            let peer: std::net::SocketAddr = "1.2.3.4:5353".parse().unwrap();
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+
+            // Consume the one data record so the response header is resolved.
+            let mut buf = [0u8; 64];
+            tokio::time::timeout_at(deadline, conn.read_packet(&mut buf))
+                .await
+                .expect("read timed out")
+                .expect("read_packet failed");
+
+            // Drop the conn (calls close()) and wait for the terminator task
+            // to flush.  Give it up to the test deadline.
+            conn.close().expect("close returned error");
+            drop(conn);
+
+            // Yield to let the spawned task run and flush before the server
+            // tries to read_record.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let _ = peer; // used above
+
+            tokio::time::timeout_at(deadline, server)
+                .await
+                .expect("server timed out")
+                .expect("server task panicked");
+        }
+    }
+
     /// A UDP-capable mux session advertises UDP even with `udp` unset;
     /// `only-tcp` mux declines unless native UDP (`udp: true`) covers it.
     #[cfg(feature = "mux")]
