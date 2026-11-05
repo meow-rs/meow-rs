@@ -69,8 +69,7 @@ pub fn spawn_vmess_relay(
                 Ok(None) => break true,
                 // Everything else is a corrupt session: FIN mid-record
                 // (partial length prefix or short body), decrypt failure,
-                // nonce-budget exhaustion (issue #513 — otherwise an
-                // unexplained ~1 GiB disconnect), or a transport error.
+                // or a transport error.
                 // Fatal: the write side is stopped too.
                 Err(e) => {
                     tracing::warn!("vmess: read side closed: {e}");
@@ -91,8 +90,7 @@ pub fn spawn_vmess_relay(
                 Ok(n) => n,
             };
             if let Err(e) = write_cipher.write_record(&mut wr, &buf[..n]).await {
-                // Same visibility: seal failure or nonce-budget
-                // exhaustion (issue #513).
+                // Same visibility: seal failure or a transport error.
                 tracing::warn!("vmess: write side closed: {e}");
                 break;
             }
@@ -104,7 +102,7 @@ pub fn spawn_vmess_relay(
     let write_abort = write_task.abort_handle();
 
     // When the read side ends on a FATAL path — decode failure, transport
-    // error, nonce budget — the exchange is over: stop the write side too.
+    // error — the exchange is over: stop the write side too.
     // A clean EOF (peer FIN at a record boundary) only half-closes the
     // exchange: the client may still be uploading, so the write side keeps
     // running until the caller half-closes or drops the endpoint (issue
