@@ -8,46 +8,11 @@ the canonical, in-repo source a release is cut from.
 
 ## [Unreleased]
 
-### Added
-
-- **DNS over QUIC (`quic://`)**: RFC 9250 on `quiche` (the vendored BoringSSL
-  the rest of the process uses): one bidirectional stream per query, the
-  two-octet length prefix, the transaction ID zeroed on the wire and restored
-  before validation, and one multiplexed connection per upstream that re-dials
-  by itself after an idle timeout or a connection reset. `?proxy=NAME` tunnels
-  the exchange through an adapter's UDP association. Behind the new `dns-quic`
-  feature (in the `full` bundle); without it the scheme is a hard config error
-  naming the feature, never a silent drop.
-- **DoH over HTTP/3 (`dns.prefer-h3`, `?h3=`)**: an `https://` nameserver can
-  speak HTTP/3 instead of HTTP/1.1. `prefer-h3: true` marks every `https://`
-  entry, `?h3=true` is mihomo's per-entry "HTTP/3 only", and `?h3=prefer` /
-  `?h3=false` opt a single entry in or out. The preference is real: the h3
-  attempt gets half the per-query timeout, a failure falls back to the HTTP/1.1
-  DoH path (same proxy tag, roots and session pool), and the failed handshake
-  parks HTTP/3 for ten minutes so a server without it does not cost a
-  handshake timeout per query. A build without `dns-quic` refuses a config that
-  asks for HTTP/3 (ADR-0002 Class A).
-
-- **`dns.direct-nameserver`**: `DIRECT` outbounds now resolve their
-  destination through `direct-nameserver` when it is set, as mihomo does,
-  instead of always using the main `nameserver` list. With
-  `direct-nameserver-follow-policy: true` the `nameserver-policy` applies
-  to those lookups too. A named destination is resolved through it even
-  when rule matching already resolved it through the main nameservers.
-  This covers UDP (QUIC included): a DIRECT UDP flow sends to the
-  direct-resolved address, and one the main nameservers cannot resolve
-  falls back to `direct-nameserver` instead of being dropped; a UDP flow
-  whose name was only snooped back from its address (redir-host) keeps
-  that address, as in mihomo. User-declared
-  `type: direct` proxies follow it too unless they set their own `dns:`.
-  Configs without `direct-nameserver` behave as before.
-- **AnyTLS TLS options**: support certificate SHA-256 `fingerprint` pinning,
-  `name-cert-verify`, `alpn`, and existing `client-fingerprint` profiles for
-  direct and relay connections. Explicit verification remains mandatory
-  with `skip-cert-verify`; malformed pins fail configuration validation.
-
 ### Fixed
 
+- API: request bodies decode as JSON whatever their `Content-Type`, as
+  mihomo does — dashboards that PUT a selection as `text/plain` or untyped
+  no longer get 415.
 - **UDP flows on the tproxy, TUN and Shadowsocks inbounds now stop on
   termination signals even while an upstream write is pending** (extends
   #893): `write_packet` races the idle timeout, outbound-session flush and

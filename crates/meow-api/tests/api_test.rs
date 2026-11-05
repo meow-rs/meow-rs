@@ -2419,7 +2419,17 @@ async fn put_proxy_selector_switch_without_json_content_type() {
         ..Default::default()
     }]);
     let state = test_state(raw);
-    for content_type in [None, Some("text/plain;charset=UTF-8")] {
+    for content_type in [
+        None,
+        Some("text/plain;charset=UTF-8"),
+        Some("application/x-www-form-urlencoded"),
+        Some("application/octet-stream"),
+        Some(""),
+        Some("application/merge-patch+json"),
+        // Malformed "+json" with no subtype before the suffix — must be
+        // relabelled (not treated as JSON), otherwise axum 422s a non-JSON body.
+        Some("application/+json"),
+    ] {
         let mut req = Request::builder().method("PUT").uri("/proxies/MySelector");
         if let Some(t) = content_type {
             req = req.header("content-type", t);
