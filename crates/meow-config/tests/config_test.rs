@@ -2266,14 +2266,14 @@ tproxy-sni: true
         tproxy.spec,
         ListenerSpec::TProxy {
             sni: true,
-            firewall: false,
-            udp: true,
+            firewall: true,
+            udp: false,
             udp_timeout: 60,
-            transparent: true,
+            transparent: false,
         },
         "shorthand tproxy-port should inherit the global tproxy-sni default"
     );
-    // mihomo binds the shorthand like the others: loopback without allow-lan.
+    // TProxy always hard-binds 127.0.0.1
     assert_eq!(tproxy.listen, "127.0.0.1");
 }
 
@@ -2294,10 +2294,10 @@ tproxy-sni: false
         tproxy.spec,
         ListenerSpec::TProxy {
             sni: false,
-            firewall: false,
-            udp: true,
+            firewall: true,
+            udp: false,
             udp_timeout: 60,
-            transparent: true,
+            transparent: false,
         },
         "shorthand tproxy-port with global tproxy-sni: false"
     );
@@ -2401,10 +2401,10 @@ listeners:
     }
 }
 
-/// `tproxy-port` is mihomo's — a real TPROXY inbound (TCP +
-/// IPv4 UDP) for the deployer's rules, never managed.
+/// `tproxy-port` shorthand cannot opt out — external management is an
+/// explicit `listeners:`-only feature.
 #[tokio::test]
-async fn test_tproxy_shorthand_is_mihomo_tproxy() {
+async fn test_tproxy_shorthand_keeps_managed_firewall() {
     let yaml = "tproxy-port: 7893\n";
     let config = load_config_from_str(yaml).await.unwrap();
     let tproxy = config
@@ -2417,12 +2417,12 @@ async fn test_tproxy_shorthand_is_mihomo_tproxy() {
         tproxy.spec,
         ListenerSpec::TProxy {
             sni: true,
-            firewall: false,
-            udp: true,
+            firewall: true,
+            udp: false,
             udp_timeout: 60,
-            transparent: true,
+            transparent: false,
         },
-        "shorthand tproxy-port is mihomo's TPROXY inbound"
+        "shorthand tproxy-port must keep the managed-firewall default"
     );
 }
 
@@ -2573,7 +2573,7 @@ tproxy-port: 7893
         "expected a top-level `firewall:` warning, got: {logs}"
     );
 
-    // The shorthand is never managed (mihomo semantics).
+    // The shorthand listener stays managed (firewall: true).
     let tproxy = config
         .listeners
         .named
@@ -2582,7 +2582,10 @@ tproxy-port: 7893
         .expect("tproxy shorthand listener must exist");
     match &tproxy.spec {
         ListenerSpec::TProxy { firewall, .. } => {
-            assert!(!*firewall, "the tproxy-port shorthand installs no rules");
+            assert!(
+                *firewall,
+                "top-level `firewall:` must not reach the shorthand"
+            );
         }
         other => panic!("expected a tproxy listener, got {other:?}"),
     }
@@ -3489,4 +3492,35 @@ async fn test_redir_port_is_mihomo_redirect() {
     );
     assert_eq!(redir.listen, "0.0.0.0");
     assert_eq!(redir.port, 7892);
+}
+
+/// mihomo's `type: tproxy` is real TPROXY: `listeners:` takes
+/// `transparent`, which needs `firewall: false`.
+#[tokio::test]
+async fn test_listener_transparent_tproxy() {
+    let yaml = "listeners:\n  - name: tp\n    type: tproxy\n    port: 7893\n    listen: 0.0.0.0\n    firewall: false\n    udp: true\n    transparent: true\n";
+    let result = load_config_from_str(yaml).await;
+    if cfg!(target_os = "linux") {
+        let config = result.unwrap();
+        let tp = &config.listeners.named[0];
+        assert!(matches!(
+            tp.spec,
+            ListenerSpec::TProxy {
+                transparent: true,
+                firewall: false,
+                udp: true,
+                ..
+            }
+        ));
+    } else {
+        assert!(result.is_err(), "transparent is Linux-only");
+    }
+    let managed =
+        "listeners:\n  - name: tp\n    type: tproxy\n    port: 7893\n    transparent: true\n";
+    let err = load_config_from_str(managed)
+        .await
+        .err()
+        .expect("transparent with the managed firewall is rejected")
+        .to_string();
+    assert!(err.contains("firewall: false"), "{err}");
 }

@@ -348,15 +348,56 @@ pub fn set_routing_mark(mark: Option<u32>) {
     #[cfg(target_os = "linux")]
     ROUTING_MARK.store(mark.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
     #[cfg(not(target_os = "linux"))]
-    let _ = mark;
+    if mark.is_some_and(|m| m != 0) {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!("routing-mark (SO_MARK) is Linux-only; ignored on this platform");
+        });
+    }
+}
+
+/// The live routing mark (`0` = unset; always `0` off Linux).
+pub fn routing_mark() -> u32 {
+    #[cfg(target_os = "linux")]
+    {
+        ROUTING_MARK.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        0
+    }
+}
+
+/// Holders of firewall rules that exempt the current routing mark (meow's
+/// managed tproxy tables): while any is alive the mark cannot change at
+/// runtime, or meow's own traffic would stop matching the exemption.
+static ROUTING_MARK_PINS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Keeps the routing mark pinned until dropped (see [`routing_mark_pinned`]).
+#[must_use = "the mark is pinned only while the guard lives"]
+pub struct RoutingMarkPin(());
+
+/// Pin the routing mark for the lifetime of the returned guard.
+pub fn pin_routing_mark() -> RoutingMarkPin {
+    ROUTING_MARK_PINS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    RoutingMarkPin(())
+}
+
+impl Drop for RoutingMarkPin {
+    fn drop(&mut self) {
+        ROUTING_MARK_PINS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Whether installed firewall rules exempt the current mark, so it must
+/// not change before a restart.
+pub fn routing_mark_pinned() -> bool {
+    ROUTING_MARK_PINS.load(std::sync::atomic::Ordering::Relaxed) > 0
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn routing_mark_set() -> bool {
-    #[cfg(target_os = "linux")]
-    return ROUTING_MARK.load(std::sync::atomic::Ordering::Relaxed) != 0;
-    #[cfg(not(target_os = "linux"))]
-    false
+    routing_mark() != 0
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]

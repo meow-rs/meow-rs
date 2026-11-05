@@ -13,7 +13,6 @@ pub struct DirectAdapter {
     /// adapter (upstream `outbound.NewCompatible()` — a `*Direct` with the
     /// `C.Compatible` type tag, used as GLOBAL's default member).
     adapter_type: AdapterType,
-    routing_mark: Option<u32>,
     /// Optional internal DNS resolver. When set, `dial_tcp` resolves
     /// hostnames via this resolver instead of the OS resolver — this is
     /// important when meow-rs *is* the system DNS, because routing a direct
@@ -45,7 +44,6 @@ impl DirectAdapter {
     pub fn new() -> Self {
         Self {
             adapter_type: AdapterType::Direct,
-            routing_mark: None,
             resolver: None,
             direct_slot: None,
             connect_timeout: None,
@@ -55,18 +53,13 @@ impl DirectAdapter {
 
     /// `COMPATIBLE` built-in — a direct dialer carrying the `Compatible`
     /// type tag, like upstream `NewCompatible`. Receives the same
-    /// routing-mark/resolver/timeout options as `DIRECT` via the `with_*`
+    /// resolver/timeout options as `DIRECT` via the `with_*`
     /// builders.
     pub fn compatible() -> Self {
         Self {
             adapter_type: AdapterType::Compatible,
             ..Self::new()
         }
-    }
-
-    pub fn with_routing_mark(mut self, routing_mark: u32) -> Self {
-        self.routing_mark = Some(routing_mark);
-        self
     }
 
     /// Wrap `resolver` in a fresh private slot — this adapter will not
@@ -343,49 +336,6 @@ where
     }
 }
 
-/// Create a TCP socket with an optional routing mark (SO_MARK on Linux)
-/// set BEFORE connecting, so the SYN packet is already marked. On Android
-/// the installed `meow_common::SocketProtector` is applied to the socket
-/// fd (also pre-connect) so the dial bypasses VpnService when meow-rs runs
-/// inside a VPN app.
-async fn connect_with_mark(
-    dest: SocketAddr,
-    routing_mark: Option<u32>,
-) -> std::io::Result<TcpStream> {
-    #[cfg(target_os = "linux")]
-    if let Some(mark) = routing_mark {
-        use socket2::{Domain, Protocol, Socket, Type};
-
-        let domain = if dest.is_ipv4() {
-            Domain::IPV4
-        } else {
-            Domain::IPV6
-        };
-
-        let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
-        socket.set_mark(mark)?;
-        // TUN global-route loop avoidance (#375): this branch bypasses
-        // `meow_common::connect_tcp`, so apply the outbound-interface
-        // binding here too (no-op when none is installed).
-        meow_common::apply_outbound_interface_for_peer(&socket, domain, dest.ip())?;
-        socket.set_nonblocking(true)?;
-
-        match socket.connect(&dest.into()) {
-            Ok(()) => {}
-            Err(e) if e.raw_os_error() == Some(libc::EINPROGRESS) => {}
-            Err(e) => return Err(e),
-        }
-
-        let std_stream: std::net::TcpStream = socket.into();
-        return TcpStream::from_std(std_stream);
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    let _ = routing_mark;
-
-    meow_common::connect_tcp(dest).await
-}
-
 #[async_trait]
 impl ProxyAdapter for DirectAdapter {
     fn name(&self) -> &str {
@@ -413,7 +363,9 @@ impl ProxyAdapter for DirectAdapter {
 
         for dest in dests {
             match apply_connect_timeout(
-                connect_with_mark(dest, self.routing_mark),
+                // `routing-mark` and the outbound-interface binding are applied
+                // here, as on every other outbound socket.
+                meow_common::connect_tcp(dest),
                 self.connect_timeout,
                 dest,
             )

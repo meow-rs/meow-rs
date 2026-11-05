@@ -2342,9 +2342,6 @@ fn build_proxy_layer(
         } else {
             meow_proxy::DirectAdapter::new()
         };
-        if let Some(mark) = raw.routing_mark {
-            direct = direct.with_routing_mark(mark);
-        }
         if let Some(slot) = resolver.cloned() {
             direct = direct.with_resolver_slot(slot);
         }
@@ -4281,13 +4278,29 @@ fn parse_listener_spec(
         "socks5" => Ok(ListenerSpec::Socks5),
         // mihomo's REDIRECT inbound: meow's tproxy TCP path without managed
         // rules — the deployer's REDIRECT rules steer traffic here.
-        "redir" => Ok(ListenerSpec::TProxy {
-            sni: raw_l.tproxy_sni.unwrap_or(global_tproxy_sni),
-            firewall: false,
-            udp: false,
-            udp_timeout: default_udp_timeout_secs(),
-            transparent: false,
-        }),
+        "redir" => {
+            for (key, set) in [
+                ("firewall", raw_l.firewall.is_some()),
+                ("udp", raw_l.udp.is_some()),
+                ("udp-timeout", raw_l.udp_timeout.is_some()),
+                ("transparent", raw_l.transparent.is_some()),
+            ] {
+                if set {
+                    warn!(
+                        "listeners[{}]: `{key}` is ignored on `type: redir` \
+                         (REDIRECT TCP, rules owned by the deployer)",
+                        raw_l.name
+                    );
+                }
+            }
+            Ok(ListenerSpec::TProxy {
+                sni: raw_l.tproxy_sni.unwrap_or(global_tproxy_sni),
+                firewall: false,
+                udp: false,
+                udp_timeout: default_udp_timeout_secs(),
+                transparent: false,
+            })
+        }
         "tproxy" => {
             // #564: `udp` is opt-in and IPv4-only in this release, and the
             // managed firewall only produces host TCP OUTPUT REDIRECT rules —
@@ -4295,6 +4308,21 @@ fn parse_listener_spec(
             // combination is rejected rather than silently TCP-only.
             let udp = raw_l.udp.unwrap_or(false);
             let firewall = raw_l.firewall.unwrap_or_else(default_tproxy_firewall);
+            // mihomo's `type: tproxy` is real TPROXY: `transparent: true`.
+            let transparent = raw_l.transparent.unwrap_or(false);
+            if transparent && firewall {
+                anyhow::bail!(
+                    "listeners[{}]: `transparent: true` (TCP by TPROXY) requires \
+                     `firewall: false` — meow's managed rules are REDIRECT",
+                    raw_l.name
+                );
+            }
+            if transparent && !cfg!(target_os = "linux") {
+                anyhow::bail!(
+                    "listeners[{}]: `transparent: true` (TPROXY) is Linux-only",
+                    raw_l.name
+                );
+            }
             if udp && firewall {
                 anyhow::bail!(
                     "listeners[{}]: `udp: true` requires `firewall: false` — meow does \
@@ -4325,7 +4353,7 @@ fn parse_listener_spec(
                 firewall,
                 udp,
                 udp_timeout,
-                transparent: false,
+                transparent,
             })
         }
         "shadowsocks" | "ss" => Ok(ListenerSpec::Shadowsocks(SsListenerConfig {
@@ -4645,8 +4673,8 @@ fn build_named_listeners(
     if raw.firewall.is_some() {
         warn!(
             "firewall: only meaningful under a `listeners:` tproxy entry; \
-             the top-level key is ignored — the `tproxy-port` / `redir-port` \
-             shorthands never install rules (mihomo semantics)"
+             the top-level key is ignored — the `tproxy-port` shorthand \
+             always stays managed (issue #563); `redir-port` never installs rules"
         );
     }
     if raw.udp.is_some() {
@@ -4661,11 +4689,9 @@ fn build_named_listeners(
              the top-level key is ignored (issue #564)"
         );
     }
-    // `redir-port` / `tproxy-port` mean what they mean in
-    // mihomo — inbounds for the deployer's own REDIRECT / TPROXY rules
-    // (OpenWrt front-ends generate them), bound like the other shorthands.
-    // Upstream meow's `tproxy-port` instead installs managed host REDIRECT
-    // rules on loopback; that mode stays available via `listeners:`.
+    // `redir-port` means what it means in mihomo — an inbound for the
+    // deployer's own REDIRECT rules (OpenWrt front-ends generate it), bound
+    // like the other shorthands.
     if let Some(port) = raw.redir_port.filter(|p| *p != 0) {
         add(
             "redir",
@@ -4682,21 +4708,22 @@ fn build_named_listeners(
         )?;
     }
     if let Some(port) = raw.tproxy_port.filter(|p| *p != 0) {
-        // UDP TPROXY is IPv4-only here; a v6 `bind-address` keeps TCP.
-        let udp = default_bind
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_ipv4());
         add(
             "tproxy",
             ListenerSpec::TProxy {
                 sni: global_tproxy_sni,
-                firewall: false,
-                udp,
+                // The shorthand keeps the managed-firewall default (issue
+                // #563): external management is an explicit `listeners:`
+                // opt-in only. UDP likewise stays opt-in (issue #564).
+                // mihomo's real-TPROXY `tproxy-port` is `listeners:` with
+                // `transparent: true` here.
+                firewall: true,
+                udp: false,
                 udp_timeout: default_udp_timeout_secs(),
-                transparent: true,
+                transparent: false,
             },
             port,
-            default_bind,
+            "127.0.0.1",
             global_max_conns,
         )?;
     }

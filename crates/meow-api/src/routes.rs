@@ -770,7 +770,8 @@ async fn get_configs(State(state): State<Arc<AppState>>) -> Json<ConfigResponse>
             .clone()
             .unwrap_or_else(|| "0.0.0.0".to_string()),
         ipv6: meow_config::effective_ipv6(raw.ipv6),
-        routing_mark: raw.routing_mark.unwrap_or(0),
+        // The live mark (what outbound sockets carry), not the document's.
+        routing_mark: meow_common::routing_mark(),
         tun_enable: tun_running,
         tun: TunFields::reported(raw.tun.as_ref(), tun_running),
     })
@@ -1515,6 +1516,9 @@ async fn commit_raw_candidate(
         CONFIG_MUTATION.try_lock().is_err(),
         "caller must hold the CONFIG_MUTATION lane"
     );
+    if let Some(msg) = routing_mark_change_refused(&candidate) {
+        return Err((StatusCode::BAD_REQUEST, msg));
+    }
     let preinstalled = preinstall_global_route_binding(&candidate);
     let (dns, prior_resolver) = apply_raw_to_tunnel(candidate.clone(), state).await?;
     // `apply_raw_to_tunnel` publishes through `update_routing`, which keeps
@@ -1534,6 +1538,20 @@ async fn commit_raw_candidate(
         change.record();
     }
     Ok(())
+}
+
+/// A candidate that changes `routing-mark` while meow's managed tproxy
+/// rules exempt the current one: applying it would mark meow's own
+/// traffic with a mark nothing exempts, and the rules recapture it.
+fn routing_mark_change_refused(candidate: &RawConfig) -> Option<String> {
+    let new = candidate.routing_mark.unwrap_or(0);
+    (meow_common::routing_mark_pinned() && new != meow_common::routing_mark()).then(|| {
+        format!(
+            "routing-mark cannot change to {new} at runtime: meow's managed tproxy \
+             rules exempt mark {}; restart meow to apply it",
+            meow_common::routing_mark()
+        )
+    })
 }
 
 /// A `config.change` logbook event, for [`commit_raw_candidate`].
@@ -3145,6 +3163,9 @@ async fn swap_config_and_reconcile_tun(
         let new_log_level =
             (guard.log_level != candidate.log_level).then(|| candidate.log_level.clone());
         let logbook_enable = meow_config::raw::RawLogbook::enabled(candidate.logbook.as_ref());
+        // Commit point (mihomo re-applies `routing-mark` on every load); a
+        // change under pinned managed rules was refused before this.
+        meow_common::set_routing_mark(candidate.routing_mark);
         let ledger = candidate.traffic_ledger.as_ref();
         let ledger = (
             meow_config::raw::RawTrafficLedger::enabled(ledger),
@@ -3441,6 +3462,9 @@ async fn put_configs(
     let _mutation = CONFIG_MUTATION.lock().await;
     // Dropped on every rejection below, restoring the running listener's
     // binding; a TUN (re)spawn in the reconcile adopts it instead.
+    if let Some(msg) = routing_mark_change_refused(&raw_config) {
+        return reload_rejected(StatusCode::BAD_REQUEST, &msg);
+    }
     let preinstalled = preinstall_global_route_binding(&raw_config);
     // Errors `force` pushed past, for the logbook.
     let mut forced: Vec<String> = Vec::new();
@@ -4599,14 +4623,19 @@ async fn get_listeners(State(state): State<Arc<AppState>>) -> Json<serde_json::V
             // (issue #563). `udp`/`udp-timeout` are disclosed for the same
             // reason: external TPROXY rules are only useful if the UDP
             // path is actually enabled (issue #564).
+            // `transparent`: TCP by real TPROXY rather than REDIRECT
+            // (mihomo `type: tproxy`); a `redir` entry is a tproxy listener
+            // with both off.
             if let meow_config::ListenerSpec::TProxy {
                 firewall,
                 udp,
                 udp_timeout,
+                transparent,
                 ..
             } = &l.spec
             {
                 item["firewall"] = serde_json::json!(firewall);
+                item["transparent"] = serde_json::json!(transparent);
                 item["udp"] = serde_json::json!(udp);
                 item["udp-timeout"] = serde_json::json!(udp_timeout);
             }

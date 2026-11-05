@@ -123,6 +123,8 @@ fn managed_suffix(rest: &str, sep: char) -> Option<(u32, u32)> {
 /// and tears them down on drop.
 pub struct FirewallGuard {
     inner: PlatformGuard,
+    /// The rules exempt this mark: it stays fixed while they are installed.
+    _mark_pin: Option<meow_common::RoutingMarkPin>,
     /// This instance counted itself in `LIVE_MANAGED` at setup.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     managed_live: bool,
@@ -164,6 +166,7 @@ impl FirewallGuard {
         }
         Ok(FirewallGuard {
             inner,
+            _mark_pin: routing_mark.map(|_| meow_common::pin_routing_mark()),
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             managed_live: true,
         })
