@@ -162,7 +162,7 @@ async fn dial_vmess(
     if shared {
         if let Some(stream) = transport.reuse().await {
             let stream = write_header(stream, &sealed).await?;
-            return Ok(relay(stream, sealed, security));
+            return Ok(relay(stream, &sealed, security));
         }
     }
     let stream = dialer
@@ -184,13 +184,13 @@ async fn vmess_over(
     shared: bool,
 ) -> Result<Box<dyn ProxyConn>> {
     let stream = send_request(transport, stream, &sealed, shared).await?;
-    Ok(relay(stream, sealed, security))
+    Ok(relay(stream, &sealed, security))
 }
 
 /// The encrypted duplex over a stream the request header went out on.
 fn relay(
     stream: Box<dyn meow_transport::Stream>,
-    sealed: header::SealedHeader,
+    sealed: &header::SealedHeader,
     security: Security,
 ) -> Box<dyn ProxyConn> {
     // The relay builds each half's body cipher internally — one AEAD key
@@ -300,7 +300,14 @@ impl ProxyAdapter for VmessAdapter {
         }
         let sealed = header::seal_request_header(&self.cmd_key, self.security, metadata, false)
             .map_err(MeowError::Proxy)?;
-        vmess_over(&self.transport, Box::new(stream), sealed, self.security, false).await
+        vmess_over(
+            &self.transport,
+            Box::new(stream),
+            sealed,
+            self.security,
+            false,
+        )
+        .await
     }
 
     #[cfg_attr(not(feature = "mux"), allow(unused_variables))]

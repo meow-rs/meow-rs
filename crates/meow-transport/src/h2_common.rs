@@ -273,9 +273,26 @@ impl Drop for ConnDriver {
 pub(crate) struct SharedH2 {
     h2: h2::client::SendRequest<Bytes>,
     driver: Arc<ConnDriver>,
+    /// Tunnels open on the connection ([`StreamLease`]s alive), checked
+    /// against the peer's `SETTINGS_MAX_CONCURRENT_STREAMS` so a full
+    /// connection is passed over at once rather than after a ready timeout.
+    open: Arc<std::sync::atomic::AtomicUsize>,
     ping: Arc<tokio::sync::Mutex<Option<h2::PingPong>>>,
     last_open: Arc<std::sync::Mutex<Instant>>,
     born: Instant,
+}
+
+/// A tunnel's hold on a [`SharedH2`] connection: keeps the driver alive
+/// and counts as one open stream until dropped.
+pub(crate) struct StreamLease {
+    _driver: Arc<ConnDriver>,
+    open: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Drop for StreamLease {
+    fn drop(&mut self) {
+        self.open.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 impl SharedH2 {
@@ -294,15 +311,25 @@ impl SharedH2 {
         Self {
             h2,
             driver: Arc::new(ConnDriver(Some(driver))),
+            open: Arc::default(),
             ping: Arc::new(tokio::sync::Mutex::new(ping)),
             last_open: Arc::new(std::sync::Mutex::new(Instant::now())),
             born: Instant::now(),
         }
     }
 
-    /// A keep-alive handle on the connection for a stream opened on it.
-    pub(crate) fn driver(&self) -> Arc<ConnDriver> {
-        Arc::clone(&self.driver)
+    /// The hold a stream opened on the connection keeps on it.
+    pub(crate) fn lease(&self) -> StreamLease {
+        self.open.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        StreamLease {
+            _driver: Arc::clone(&self.driver),
+            open: Arc::clone(&self.open),
+        }
+    }
+
+    /// Whether the peer's concurrent-stream limit leaves room for one more.
+    fn has_room(&self) -> bool {
+        self.open.load(std::sync::atomic::Ordering::Relaxed) < self.h2.current_max_send_streams()
     }
 
     /// Open a request stream. `wait`: block for send readiness (a fresh
@@ -314,6 +341,9 @@ impl SharedH2 {
         wait: bool,
         tag: fn(String) -> TransportError,
     ) -> Result<(h2::client::ResponseFuture, h2::SendStream<Bytes>), TransportError> {
+        if !wait && !self.has_room() {
+            return Err(tag("connection full".into()));
+        }
         let ready = self.h2.clone().ready();
         let mut h2 = if wait {
             ready.await.map_err(|e| h2_to_transport(e, tag))?
@@ -378,6 +408,13 @@ impl SharedH2Slot {
         }
     }
 
+    /// Drop the shared connection; streams open on it keep it alive.
+    pub(crate) fn clear(&self) {
+        if let Ok(mut slot) = self.0.lock() {
+            *slot = None;
+        }
+    }
+
     /// Drop the shared connection if it is still `stale`.
     pub(crate) fn forget(&self, stale: &SharedH2) {
         if let Ok(mut slot) = self.0.lock() {
@@ -414,7 +451,7 @@ pub struct H2Stream {
     eos_sent: bool,
     conn_driver: Option<tokio::task::JoinHandle<()>>,
     /// Keep-alive on a [`SharedH2`] connection other streams may use too.
-    shared_driver: Option<Arc<ConnDriver>>,
+    shared_driver: Option<StreamLease>,
 }
 
 impl H2Stream {
@@ -434,7 +471,7 @@ impl H2Stream {
     /// Keep a shared connection alive while this stream lives; on drop the
     /// response is drained (bounded) so its flow-control window returns to
     /// the connection the other streams keep using.
-    pub(crate) fn with_shared_driver(mut self, driver: Arc<ConnDriver>) -> Self {
+    pub(crate) fn with_shared_driver(mut self, driver: StreamLease) -> Self {
         self.shared_driver = Some(driver);
         self
     }

@@ -151,7 +151,7 @@ impl XhttpLayer {
                     "xhttp",
                 ),
             )
-            .with_shared_driver(session.driver()),
+            .with_shared_driver(session.lease()),
         ))
     }
 
@@ -238,6 +238,22 @@ impl Transport for XhttpLayer {
     }
 
     async fn connect(&self, inner: Box<dyn Stream>) -> Result<Box<dyn Stream>> {
+        self.dial(inner, false).await
+    }
+
+    async fn connect_shared(&self, inner: Box<dyn Stream>) -> Result<Box<dyn Stream>> {
+        self.dial(inner, true).await
+    }
+
+    fn reset(&self) {
+        self.session.clear();
+    }
+}
+
+impl XhttpLayer {
+    /// Open the h2 connection and its first stream; `share` keeps the
+    /// connection for [`Transport::reuse`].
+    async fn dial(&self, inner: Box<dyn Stream>, share: bool) -> Result<Box<dyn Stream>> {
         // Configuration errors surface before the h2 handshake.
         self.request()?;
 
@@ -251,7 +267,9 @@ impl Transport for XhttpLayer {
         // (issue #669); only a working connection is offered for reuse.
         let session = SharedH2::spawn(h2, conn);
         let stream = self.open(&session, true).await?;
-        self.session.set(session);
+        if share {
+            self.session.set(session);
+        }
         Ok(stream)
     }
 }

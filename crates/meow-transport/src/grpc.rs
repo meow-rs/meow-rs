@@ -30,14 +30,13 @@
 
 use std::io;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use crate::h2_common::{ConnDriver, RecvState, SharedH2, SharedH2Slot};
+use crate::h2_common::{RecvState, SharedH2, SharedH2Slot, StreamLease};
 use crate::{Result, Stream, Transport, TransportError};
 
 // ─── Public types ─────────────────────────────────────────────────────────────
@@ -120,7 +119,7 @@ impl GrpcLayer {
         Ok(Box::new(GunStream::new(
             send_stream,
             RecvState::new(response_future),
-            session.driver(),
+            session.lease(),
         )))
     }
 }
@@ -141,6 +140,22 @@ impl Transport for GrpcLayer {
     }
 
     async fn connect(&self, inner: Box<dyn Stream>) -> Result<Box<dyn Stream>> {
+        self.dial(inner, false).await
+    }
+
+    async fn connect_shared(&self, inner: Box<dyn Stream>) -> Result<Box<dyn Stream>> {
+        self.dial(inner, true).await
+    }
+
+    fn reset(&self) {
+        self.session.clear();
+    }
+}
+
+impl GrpcLayer {
+    /// Open the h2 connection and its first stream; `share` keeps the
+    /// connection for [`Transport::reuse`].
+    async fn dial(&self, inner: Box<dyn Stream>, share: bool) -> Result<Box<dyn Stream>> {
         // Validate the request before opening the h2 connection.
         self.request()?;
 
@@ -157,7 +172,9 @@ impl Transport for GrpcLayer {
         // A failed first stream drops `session`, whose driver aborts
         // (issue #669); only a working connection is offered for reuse.
         let stream = self.open(&session, true).await?;
-        self.session.set(session);
+        if share {
+            self.session.set(session);
+        }
         Ok(stream)
     }
 }
@@ -330,11 +347,11 @@ struct GunStream {
     /// this stream's send/recv refs makes the driver self-terminate, but
     /// only if its closing flush can make progress — the handle lets Drop
     /// bound that wait (issue #669).
-    _conn_driver: Arc<ConnDriver>,
+    _conn_driver: StreamLease,
 }
 
 impl GunStream {
-    fn new(send: h2::SendStream<Bytes>, recv: RecvState, conn_driver: Arc<ConnDriver>) -> Self {
+    fn new(send: h2::SendStream<Bytes>, recv: RecvState, conn_driver: StreamLease) -> Self {
         Self {
             send,
             recv,

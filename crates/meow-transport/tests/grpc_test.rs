@@ -735,7 +735,12 @@ async fn grpc_reuse_multiplexes_streams_on_one_connection() {
         while let Ok((tcp, _)) = listener.accept().await {
             accepted_srv.fetch_add(1, Ordering::SeqCst);
             tokio::spawn(async move {
-                let Ok(mut conn) = h2::server::handshake(tcp).await else {
+                // Four concurrent streams: the fifth tunnel must not wait.
+                let Ok(mut conn) = h2::server::Builder::new()
+                    .max_concurrent_streams(4)
+                    .handshake(tcp)
+                    .await
+                else {
                     return;
                 };
                 while let Some(Ok((request, mut respond))) = conn.accept().await {
@@ -763,8 +768,14 @@ async fn grpc_reuse_multiplexes_streams_on_one_connection() {
         "nothing to reuse before connect"
     );
 
+    // A plain `connect` (relay chain, dialer-proxy, probe) is never shared.
     let tcp = tokio::net::TcpStream::connect(addr).await.expect("tcp");
-    let mut streams = vec![layer.connect(Box::new(tcp)).await.expect("connect")];
+    let private = layer.connect(Box::new(tcp)).await.expect("connect");
+    assert!(layer.reuse().await.is_none(), "plain connect is not shared");
+    drop(private);
+
+    let tcp = tokio::net::TcpStream::connect(addr).await.expect("tcp");
+    let mut streams = vec![layer.connect_shared(Box::new(tcp)).await.expect("connect")];
     for _ in 0..3 {
         streams.push(layer.reuse().await.expect("reuse the live connection"));
     }
@@ -778,5 +789,28 @@ async fn grpc_reuse_multiplexes_streams_on_one_connection() {
             .expect("read");
         assert_eq!(buf, msg.as_bytes());
     }
-    assert_eq!(accepted.load(Ordering::SeqCst), 1, "one TCP connection");
+    // The peer's limit is reached (its SETTINGS arrived with the echoes): the next tunnel is
+    // refused at once (the caller dials anew), not after a ready timeout.
+    let started = std::time::Instant::now();
+    assert!(
+        layer.reuse().await.is_none(),
+        "a full connection is skipped"
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "no ready wait"
+    );
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        2,
+        "one shared TCP connection"
+    );
+
+    // `reset_sessions` forgets the shared connection.
+    drop(streams);
+    let tcp = tokio::net::TcpStream::connect(addr).await.expect("tcp");
+    let _s = layer.connect_shared(Box::new(tcp)).await.expect("connect");
+    assert!(layer.reuse().await.is_some());
+    layer.reset();
+    assert!(layer.reuse().await.is_none(), "reset clears the slot");
 }

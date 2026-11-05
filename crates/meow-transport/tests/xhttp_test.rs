@@ -394,10 +394,10 @@ async fn xhttp_reuse_multiplexes_streams_on_one_connection() {
     });
     assert!(
         layer.reuse().await.is_none(),
-        "nothing to reuse before connect"
+        "nothing to reuse before connect_shared"
     );
     let tcp = tokio::net::TcpStream::connect(addr).await.expect("tcp");
-    let mut streams = vec![layer.connect(Box::new(tcp)).await.expect("connect")];
+    let mut streams = vec![layer.connect_shared(Box::new(tcp)).await.expect("connect")];
     for _ in 0..3 {
         streams.push(layer.reuse().await.expect("reuse the live connection"));
     }
