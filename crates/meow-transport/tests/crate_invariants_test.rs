@@ -543,12 +543,6 @@ const RAW_SOCKET_ALLOWLIST: &[(&str, &str, usize, &str)] = &[
         1,
         "bind_udp's fall-through when no binding/protector is installed",
     ),
-    (
-        "crates/meow-proxy/src/direct.rs",
-        "Socket::new(",
-        1,
-        "routing-mark dial; applies meow_common::apply_outbound_interface_for_peer itself",
-    ),
     // Vendored anytls: its own protect helper and its server side.
     (
         "crates/meow-anytls/src/util/socket_protect.rs",
@@ -609,6 +603,18 @@ const RAW_SOCKET_ALLOWLIST: &[(&str, &str, usize, &str)] = &[
         "local-address probe for the traffic ledger's app lookup (macOS, \
          Windows): bound to a flow's source address and dropped unused, never \
          sends",
+    ),
+    (
+        "crates/meow-listener/src/tproxy/mod.rs",
+        "TcpSocket::new_v4(",
+        1,
+        "inbound tproxy listening socket (IP_TRANSPARENT before bind), never dials",
+    ),
+    (
+        "crates/meow-listener/src/tproxy/mod.rs",
+        "TcpSocket::new_v6(",
+        1,
+        "inbound tproxy listening socket (IPV6_TRANSPARENT before bind), never dials",
     ),
     (
         "crates/meow-listener/src/tproxy/udp.rs",

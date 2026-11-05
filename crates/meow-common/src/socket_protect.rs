@@ -334,6 +334,84 @@ pub use android::{
 /// is `SocketAddr`, not `ToSocketAddrs`). That split exists to prevent
 /// silent regressions back into the system resolver; see the module docs
 /// for the loop-routing failure mode.
+/// mihomo's `routing-mark` — `SO_MARK` on every outbound
+/// socket meow opens through this module (proxy servers, DIRECT, DNS,
+/// health checks, provider fetches, TCP and UDP), so the deployer's
+/// TPROXY/REDIRECT rules can exempt meow's own traffic. `0` = unset.
+#[cfg(target_os = "linux")]
+static ROUTING_MARK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Install (or clear with `None` / `Some(0)`) the global routing mark.
+/// Setting `SO_MARK` needs `CAP_NET_ADMIN`; without it outbound sockets
+/// fail to open, as in mihomo. Linux only; a no-op elsewhere.
+pub fn set_routing_mark(mark: Option<u32>) {
+    #[cfg(target_os = "linux")]
+    ROUTING_MARK.store(mark.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(target_os = "linux"))]
+    if mark.is_some_and(|m| m != 0) {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!("routing-mark (SO_MARK) is Linux-only; ignored on this platform");
+        });
+    }
+}
+
+/// The live routing mark (`0` = unset; always `0` off Linux).
+pub fn routing_mark() -> u32 {
+    #[cfg(target_os = "linux")]
+    {
+        ROUTING_MARK.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        0
+    }
+}
+
+/// Holders of firewall rules that exempt the current routing mark (meow's
+/// managed tproxy tables): while any is alive the mark cannot change at
+/// runtime, or meow's own traffic would stop matching the exemption.
+static ROUTING_MARK_PINS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Keeps the routing mark pinned until dropped (see [`routing_mark_pinned`]).
+#[must_use = "the mark is pinned only while the guard lives"]
+pub struct RoutingMarkPin(());
+
+/// Pin the routing mark for the lifetime of the returned guard.
+pub fn pin_routing_mark() -> RoutingMarkPin {
+    ROUTING_MARK_PINS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    RoutingMarkPin(())
+}
+
+impl Drop for RoutingMarkPin {
+    fn drop(&mut self) {
+        ROUTING_MARK_PINS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Whether installed firewall rules exempt the current mark, so it must
+/// not change before a restart.
+pub fn routing_mark_pinned() -> bool {
+    ROUTING_MARK_PINS.load(std::sync::atomic::Ordering::Relaxed) > 0
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn routing_mark_set() -> bool {
+    routing_mark() != 0
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn apply_routing_mark(socket: &socket2::Socket) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    match ROUTING_MARK.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => {}
+        mark => socket.set_mark(mark)?,
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = socket;
+    Ok(())
+}
+
 pub async fn connect_tcp(addr: SocketAddr) -> io::Result<TcpStream> {
     #[cfg(any(target_os = "android", all(test, unix)))]
     {
@@ -346,8 +424,9 @@ pub async fn connect_tcp(addr: SocketAddr) -> io::Result<TcpStream> {
     // takes the physical route past the TUN default routes.
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     {
-        if crate::outbound_iface::binds_peer(addr.ip())
-            && crate::outbound_iface::outbound_interface().is_some()
+        if routing_mark_set()
+            || (crate::outbound_iface::binds_peer(addr.ip())
+                && crate::outbound_iface::outbound_interface().is_some())
         {
             return connect_tcp_iface_bound(addr).await;
         }
@@ -367,6 +446,7 @@ pub(crate) async fn connect_tcp_iface_bound(addr: SocketAddr) -> io::Result<TcpS
         socket2::Domain::IPV6
     };
     let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+    apply_routing_mark(&socket)?;
     crate::outbound_iface::apply_outbound_interface_for_peer(&socket, domain, addr.ip())?;
     socket.set_nonblocking(true)?;
     let tokio_socket = tokio::net::TcpSocket::from_std_stream(socket.into());
@@ -582,7 +662,7 @@ async fn bind_udp_with_peer<A: ToSocketAddrs>(
     // `connect_tcp` — so the first datagram already bypasses the TUN routes.
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     {
-        if crate::outbound_iface::outbound_interface().is_some() {
+        if routing_mark_set() || crate::outbound_iface::outbound_interface().is_some() {
             let resolved = tokio::net::lookup_host(local)
                 .await?
                 .next()
@@ -606,6 +686,7 @@ pub(crate) fn bind_udp_iface_bound(local: SocketAddr, peer: IpAddr) -> io::Resul
         socket2::Domain::IPV6
     };
     let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
+    apply_routing_mark(&socket)?;
     crate::outbound_iface::apply_outbound_interface_for_peer(&socket, domain, peer)?;
     socket.bind(&local.into())?;
     socket.set_nonblocking(true)?;

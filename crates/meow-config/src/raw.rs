@@ -230,7 +230,11 @@ pub struct RawConfig {
     /// rejects real-world mihomo subscriptions that mix in node types
     /// meow-rs does not support.
     pub strict: Option<bool>,
+    /// mihomo semantics: a real TPROXY inbound, TCP and
+    /// IPv4 UDP, rules owned by the deployer (OpenWrt front-end).
     pub tproxy_port: Option<u16>,
+    /// mihomo's REDIRECT inbound (TCP), rules owned by the deployer.
+    pub redir_port: Option<u16>,
     pub tproxy_sni: Option<bool>,
     pub routing_mark: Option<u32>,
     /// Wall-clock bound, in seconds, on the built-in DIRECT adapter's
@@ -488,6 +492,9 @@ pub struct RawListener {
     #[serde(default)]
     pub udp: Option<bool>,
     pub simple_obfs: Option<RawSimpleObfs>,
+    /// `tproxy`: take TCP by real TPROXY (`IP_TRANSPARENT`; mihomo's
+    /// `type: tproxy`) instead of REDIRECT. Requires `firewall: false`.
+    pub transparent: Option<bool>,
 
     // ── upstream sub-options not yet supported by meow-rs ──
     // Captured as opaque `Value`s so their mere presence can be warned about
