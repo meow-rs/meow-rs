@@ -56,7 +56,7 @@ pub const TYPE_CLASSICAL: u8 = 2;
 
 #[derive(Debug, thiserror::Error)]
 pub enum MrsError {
-    #[error("mrs: wrong format (not an mrs file — first 4 bytes are not 'MRS!')")]
+    #[error("mrs: wrong format (not an mrs file — unexpected magic bytes)")]
     WrongFormat,
     #[error("mrs: unsupported version {0} (expected 1)")]
     UnsupportedVersion(u8),

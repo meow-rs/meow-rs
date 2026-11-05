@@ -795,20 +795,30 @@ fn convert_ruleset(
     source: &std::path::Path,
     target: Option<&std::path::Path>,
 ) -> Result<()> {
-    use meow_rules::mrs_parser::UpstreamRuleSetReader;
-    use std::io::Write;
+    use meow_rules::mrs_parser::{UpstreamRuleSetReader, TYPE_DOMAIN, TYPE_IPCIDR};
 
     if !format.eq_ignore_ascii_case("mrs") {
         anyhow::bail!("convert-ruleset: only the mrs format is read (got `{format}`)");
     }
     let want = match behavior.to_ascii_lowercase().as_str() {
-        "domain" => 0,
-        "ipcidr" => 1,
+        "domain" => TYPE_DOMAIN,
+        "ipcidr" => TYPE_IPCIDR,
         other => {
             anyhow::bail!("convert-ruleset: behavior must be domain or ipcidr (got `{other}`)")
         }
     };
-    let bytes = std::fs::read(source)?;
+    let target = target.map_or_else(
+        || source.with_extension("txt"),
+        std::path::Path::to_path_buf,
+    );
+    if target == source {
+        anyhow::bail!(
+            "convert-ruleset: output {} would overwrite the source; name a target",
+            target.display()
+        );
+    }
+    let bytes = std::fs::read(source)
+        .map_err(|e| anyhow::anyhow!("convert-ruleset: read {}: {e}", source.display()))?;
     let reader = UpstreamRuleSetReader::open(&bytes)
         .map_err(|e| anyhow::anyhow!("convert-ruleset: {}: {e}", source.display()))?;
     if reader.behavior() != want {
@@ -817,11 +827,30 @@ fn convert_ruleset(
             source.display()
         );
     }
-    let target = target.map_or_else(
-        || source.with_extension("txt"),
-        std::path::Path::to_path_buf,
-    );
-    let mut out = std::io::BufWriter::new(std::fs::File::create(&target)?);
+    // Decode fully into a sibling temp file and rename over the target, so a
+    // corrupt body never leaves a truncated output (or clobbers an old one).
+    let mut part = target.clone().into_os_string();
+    part.push(".part");
+    let part = std::path::PathBuf::from(part);
+    let written = write_rule_set_text(&reader, want == TYPE_DOMAIN, &part).and_then(|()| {
+        std::fs::rename(&part, &target)
+            .map_err(|e| anyhow::anyhow!("convert-ruleset: rename to {}: {e}", target.display()))
+    });
+    if written.is_err() {
+        let _ = std::fs::remove_file(&part);
+    }
+    written.map_err(|e| anyhow::anyhow!("{e} ({})", source.display()))
+}
+
+fn write_rule_set_text(
+    reader: &meow_rules::mrs_parser::UpstreamRuleSetReader,
+    domains: bool,
+    path: &std::path::Path,
+) -> Result<()> {
+    use std::io::Write;
+    let file = std::fs::File::create(path)
+        .map_err(|e| anyhow::anyhow!("convert-ruleset: create {}: {e}", path.display()))?;
+    let mut out = std::io::BufWriter::new(file);
     let mut io_err = None;
     let mut line = |s: &dyn std::fmt::Display| {
         if io_err.is_none() {
@@ -830,17 +859,17 @@ fn convert_ruleset(
             }
         }
     };
-    let walked = if want == 0 {
+    let walked = if domains {
         reader.for_each_domain(|d| line(&d))
     } else {
         reader.for_each_net(|n| line(&n))
     };
-    walked.map_err(|e| anyhow::anyhow!("convert-ruleset: {}: {e}", source.display()))?;
+    walked.map_err(|e| anyhow::anyhow!("convert-ruleset: {e}"))?;
     if let Some(e) = io_err {
-        return Err(e.into());
+        anyhow::bail!("convert-ruleset: write {}: {e}", path.display());
     }
-    out.flush()?;
-    Ok(())
+    out.flush()
+        .map_err(|e| anyhow::anyhow!("convert-ruleset: write {}: {e}", path.display()))
 }
 
 #[cfg(target_os = "linux")]
@@ -1876,6 +1905,23 @@ async fn publish_tun_if_committed(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn convert_ruleset_refuses_clobbering_and_leaves_no_partial_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("set.txt");
+        std::fs::write(&src, b"not an mrs").unwrap();
+        // Default target of a `.txt` source is the source itself.
+        assert!(super::convert_ruleset("domain", "mrs", &src, None).is_err());
+        assert_eq!(std::fs::read(&src).unwrap(), b"not an mrs");
+        let out = dir.path().join("out.txt");
+        std::fs::write(&out, b"old").unwrap();
+        assert!(super::convert_ruleset("domain", "mrs", &src, Some(&out)).is_err());
+        assert_eq!(std::fs::read(&out).unwrap(), b"old", "old output untouched");
+        assert!(!dir.path().join("out.txt.part").exists());
+        assert!(super::convert_ruleset("classical", "mrs", &src, Some(&out)).is_err());
+        assert!(super::convert_ruleset("domain", "yaml", &src, Some(&out)).is_err());
+    }
+
     use super::bind_socket_addr;
     #[cfg(target_os = "windows")]
     use super::{run_application, Args, LogTarget, ShutdownSignal};
