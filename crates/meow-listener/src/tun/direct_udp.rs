@@ -85,7 +85,14 @@ fn datagram(udp: &[u8], src: IpAddr, dst: IpAddr) -> Parsed {
 /// Whether a packet carries UDP (an aggregate is split before [`parse`]).
 pub(super) fn is_udp(pkt: &[u8]) -> bool {
     match pkt.first().map(|b| b >> 4) {
-        Some(4) => pkt.get(9) == Some(&17),
+        // A fragment goes to lwIP, which reassembles it.
+        Some(4) => {
+            pkt.get(9) == Some(&17)
+                && pkt
+                    .get(6..8)
+                    .is_some_and(|f| u16::from_be_bytes([f[0], f[1]]) & 0x3fff == 0)
+        }
+        // Extension headers (fragments included) go to lwIP too.
         Some(6) => pkt.get(6) == Some(&17),
         _ => false,
     }
@@ -196,6 +203,19 @@ fn fold(mut sum: u64) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fragments_are_not_direct_udp() {
+        let mut pkt = vec![0u8; 28];
+        pkt[0] = 0x45;
+        pkt[9] = 17;
+        assert!(is_udp(&pkt));
+        pkt[6] = 0x20; // MF
+        assert!(!is_udp(&pkt));
+        pkt[6] = 0;
+        pkt[7] = 1; // offset
+        assert!(!is_udp(&pkt));
+    }
 
     fn udp_check_ok(pkt: &[u8]) -> bool {
         let v4 = pkt[0] >> 4 == 4;

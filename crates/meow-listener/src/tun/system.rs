@@ -41,7 +41,11 @@ const CLOSING_TTL: Duration = Duration::from_secs(30);
 pub(super) const SWEEP_EVERY: Duration = Duration::from_secs(10);
 /// NAT ports handed out, cycled through; 55 536 concurrent flows.
 const PORT_FIRST: u16 = 10_000;
+/// Half-open entries allowed at once: a port scan of IP literals must not
+/// take the port space from established flows.
+const PENDING_MAX: usize = 4096;
 
+const IPV6_FRAGMENT: u8 = 44;
 const TCP_FIN: u8 = 0x01;
 const TCP_SYN: u8 = 0x02;
 const TCP_RST: u8 = 0x04;
@@ -76,11 +80,12 @@ struct Table {
     by_flow: HashMap<(SocketAddr, SocketAddr), u16>,
     by_port: HashMap<u16, Entry>,
     next: u16,
+    pending: usize,
 }
 
 impl Table {
     fn alloc(&mut self, client: SocketAddr, dst: SocketAddr, now: Instant) -> Option<u16> {
-        if self.by_port.len() > usize::from(u16::MAX - PORT_FIRST) {
+        if self.by_port.len() > usize::from(u16::MAX - PORT_FIRST) || self.pending >= PENDING_MAX {
             return None;
         }
         loop {
@@ -92,6 +97,7 @@ impl Table {
                     dst,
                     state: State::Pending(now),
                 });
+                self.pending += 1;
                 self.by_flow.insert((client, dst), port);
                 return Some(port);
             }
@@ -100,6 +106,9 @@ impl Table {
 
     fn remove(&mut self, port: u16) {
         if let Some(e) = self.by_port.remove(&port) {
+            if matches!(e.state, State::Pending(_)) {
+                self.pending -= 1;
+            }
             let key = (e.client, e.dst);
             if self.by_flow.get(&key) == Some(&port) {
                 self.by_flow.remove(&key);
@@ -172,7 +181,7 @@ impl Nat {
                 _ => return Verdict::Drop,
             }
         } else {
-            if self.nets.v4.contains(&dst) {
+            if super::udp::is_looping_dst(std::net::IpAddr::V4(dst), self.nets) {
                 return Verdict::Drop;
             }
             let client = SocketAddr::V4(SocketAddrV4::new(src, sport));
@@ -205,7 +214,12 @@ impl Nat {
     }
 
     fn translate_v6(&self, pkt: &mut [u8], partial: bool) -> Verdict {
-        // Extension headers before TCP are left to lwIP.
+        // TCP fragments are dropped as on IPv4: lwIP would reassemble them
+        // into a flow the kernel owns and reset it.
+        if pkt.len() >= 48 && pkt[6] == IPV6_FRAGMENT && pkt[40] == 6 {
+            return Verdict::Drop;
+        }
+        // Other extension headers before TCP are left to lwIP.
         if pkt.len() < 40 || pkt[6] != 6 {
             return Verdict::Stack;
         }
@@ -230,7 +244,7 @@ impl Nat {
                 _ => return Verdict::Drop,
             }
         } else {
-            if self.nets.v6.is_some_and(|net| net.contains(&dst)) {
+            if super::udp::is_looping_dst(std::net::IpAddr::V6(dst), self.nets) {
                 return Verdict::Drop;
             }
             let client = SocketAddr::V6(SocketAddrV6::new(src, sport, 0, 0));
@@ -300,14 +314,24 @@ impl Nat {
         }
         let mut t = self.table.lock();
         let e = t.by_port.get_mut(&peer.port())?;
+        let was_pending = matches!(e.state, State::Pending(_));
         e.state = State::Open;
-        Some((e.client, e.dst))
+        let flow = (e.client, e.dst);
+        if was_pending {
+            t.pending -= 1;
+        }
+        Some(flow)
     }
 
     /// The flow's handler ended.
     pub(super) fn closed(&self, port: u16) {
-        if let Some(e) = self.table.lock().by_port.get_mut(&port) {
+        let mut t = self.table.lock();
+        if let Some(e) = t.by_port.get_mut(&port) {
+            let was_pending = matches!(e.state, State::Pending(_));
             e.state = State::Closing(Instant::now());
+            if was_pending {
+                t.pending -= 1;
+            }
         }
     }
 
@@ -367,7 +391,7 @@ impl SystemStack {
         let b4 = nets.v4.hosts().find(|h| *h != a4).ok_or_else(|| {
             io::Error::other(format!(
                 "inet4-address {} leaves no second host address for the NAT peer \
-                 (use a /30 or wider)",
+                 (use a /31 or wider)",
                 nets.v4
             ))
         })?;
@@ -426,6 +450,8 @@ impl SystemStack {
                 None => self.v4.accept().await?,
             };
             if let Some((client, dst)) = self.nat.accepted(peer) {
+                // Small writes go out at once, as lwIP sends them.
+                let _ = stream.set_nodelay(true);
                 let guard = FlowGuard {
                     nat: Arc::clone(&self.nat),
                     port: peer.port(),
@@ -695,6 +721,29 @@ mod tests {
         assert_eq!(nat.len(), 0);
     }
 
+    /// Multicast and broadcast SYNs get no NAT entry; half-open entries
+    /// are capped, and an accepted one frees its place.
+    #[test]
+    fn junk_syns_are_dropped_and_half_open_entries_capped() {
+        let nat = nat();
+        for dst in [[224, 0, 0, 251], [255, 255, 255, 255]] {
+            let mut syn = v4_packet([192, 168, 1, 10], 1, dst, 139, TCP_SYN);
+            assert_eq!(nat.translate(&mut syn, false), Verdict::Drop);
+        }
+        assert_eq!(nat.len(), 0);
+        for i in 0..PENDING_MAX {
+            let port = u16::try_from(i).unwrap() + 1;
+            let mut syn = v4_packet([192, 168, 1, 10], port, [1, 1, 1, 1], 80, TCP_SYN);
+            assert_eq!(nat.translate(&mut syn, false), Verdict::Write);
+        }
+        let mut over = v4_packet([192, 168, 1, 11], 1, [1, 1, 1, 1], 80, TCP_SYN);
+        assert_eq!(nat.translate(&mut over, false), Verdict::Drop);
+        let first = nat.table.lock().by_flow.values().copied().min().unwrap();
+        let peer = SocketAddr::V4(SocketAddrV4::new(nat.addrs.b4, first));
+        assert!(nat.accepted(peer).is_some());
+        assert_eq!(nat.translate(&mut over, false), Verdict::Write);
+    }
+
     #[test]
     fn entries_expire_and_closing_flows_get_a_fresh_port() {
         let nat = nat();
@@ -713,7 +762,9 @@ mod tests {
         // Age both past their TTLs.
         {
             let mut t = nat.table.lock();
-            let old = Instant::now() - PENDING_TTL - Duration::from_secs(1);
+            let Some(old) = Instant::now().checked_sub(PENDING_TTL + Duration::from_secs(1)) else {
+                return; // host up for under 31 s
+            };
             t.by_port.get_mut(&first).unwrap().state = State::Closing(old);
             t.by_port.get_mut(&second).unwrap().state = State::Pending(old);
         }

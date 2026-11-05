@@ -117,7 +117,8 @@ async fn device_to_stack(
     vnet: bool,
 ) -> io::Result<()> {
     let hdr_len = if vnet { vnet::HDR_LEN } else { 0 };
-    let mut buf = vec![0u8; hdr_len + PACKET_BUF];
+    // A virtio frame is the header plus up to 64 KiB.
+    let mut buf = vec![0u8; hdr_len + PACKET_BUF + usize::from(vnet)];
     loop {
         let n = end.device.device.recv(&mut buf).await?;
         if n <= hdr_len {
