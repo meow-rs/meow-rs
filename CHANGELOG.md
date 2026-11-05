@@ -8,22 +8,6 @@ the canonical, in-repo source a release is cut from.
 
 ## [Unreleased]
 
-### Added
-
-- **VMess relays UDP natively when `mux` is off**: `udp: true` on a VMess
-  node used to fail every UDP dial unless a UDP-capable mux was enabled.
-  meow now sends the request with `CommandUDP` and carries one datagram
-  per body record, as sing-vmess and mihomo do. A UDP-capable mux is still
-  preferred when configured.
-
-### Fixed
-
-- **VMess no longer drops a connection after 65536 body records per
-  direction**: the AEAD record counter is a u16 on the wire, and Xray,
-  sing-vmess and mihomo all let it wrap. meow-rs errored instead, which cut
-  off any TCP transfer past about 1 GiB and would end a busy UDP
-  association after 65536 datagrams. The counter now wraps like the peers.
-
 ## [0.29.0] - 2026-11-05
 
 ### Added
