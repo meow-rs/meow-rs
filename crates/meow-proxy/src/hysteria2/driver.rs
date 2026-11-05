@@ -276,7 +276,9 @@ async fn run(
     // Scratch for received datagrams, stream reads and QUIC datagrams in
     // turn; it holds any UDP payload.
     let mut buf = vec![0u8; 65535];
-    let mut send_buf = vec![0u8; 1500];
+    // Exactly the send cap: a larger cap with a smaller buffer would emit
+    // unvalidated sizes and starve PMTUD probes.
+    let mut send_buf = vec![0u8; super::tls::MAX_SEND_UDP_PAYLOAD];
     let mut keep_alive = tokio::time::interval_at(
         tokio::time::Instant::now() + KEEP_ALIVE_INTERVAL,
         KEEP_ALIVE_INTERVAL,

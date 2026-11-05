@@ -19,7 +19,7 @@ const MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_CONCURRENT_STREAMS: u64 = 1024;
 const DGRAM_QUEUE_LEN: usize = 1024;
 /// quic-go's ceiling (1500 − IPv6 40 − UDP 8); PMTUD finds the path's.
-const MAX_SEND_UDP_PAYLOAD: usize = 1452;
+pub(super) const MAX_SEND_UDP_PAYLOAD: usize = 1452;
 
 /// Build a client `quiche::Config` for the given hysteria2 config.
 pub fn build_quiche_config(config: &Config) -> Result<quiche::Config> {
@@ -62,8 +62,8 @@ pub fn build_quiche_config(config: &Config) -> Result<quiche::Config> {
     quic.grease(false);
     // UDP relay rides QUIC datagrams.
     quic.enable_dgram(true, DGRAM_QUEUE_LEN, DGRAM_QUEUE_LEN);
-    // Hysteria 2 clients run BBR (Brutal when a bandwidth is set), never a
-    // loss-driven CC: quiche's default CUBIC collapses its window on the
+    // Hysteria 2 clients run BBR or, with a bandwidth set, Brutal — which
+    // quiche lacks, so meow always runs BBRv2 — never a loss-driven CC: quiche's default CUBIC collapses its window on the
     // datagram loss a saturated UDP relay sees, and the upload rate with
     // it (meow-openwrt, openwrt-fork/bench/tunbench.sh: 0.5 Mbit/s at
     // 300 Mbit/s offered).

@@ -35,7 +35,10 @@ impl UdpSession {
 
     pub fn send(&self, data: &[u8], addr: &str) -> Result<()> {
         if data.len() > MAX_UDP_SIZE {
-            return Err(Error::protocol("UDP payload is too large"));
+            // Too big for the protocol: drop it as a link would, rather
+            // than fail the whole association (same teardown as `Full`).
+            note_drop("oversized UDP payload");
+            return Ok(());
         }
         match self.cmd_tx.try_send(Cmd::SendUdp {
             session_id: self.session_id,
@@ -47,7 +50,11 @@ impl UdpSession {
             // made the caller tear the association down and open a new one
             // — a new server-side socket and source port mid-flow, which
             // connected UDP peers (iperf3, QUIC, games) then ignore.
-            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                note_drop("driver queue full");
+                Ok(())
+            }
             Err(mpsc::error::TrySendError::Closed(_)) => Err(Error::Closed),
         }
     }
@@ -55,10 +62,25 @@ impl UdpSession {
     pub async fn recv(&mut self) -> Result<(Vec<u8>, String)> {
         loop {
             let message = self.packets.recv().await.ok_or(Error::Closed)?;
-            if let Some(message) = self.defragger.feed(message)? {
-                return Ok((message.data, message.addr));
+            match self.defragger.feed(message) {
+                Ok(Some(message)) => return Ok((message.data, message.addr)),
+                Ok(None) => {}
+                // A bad fragment set is per-datagram junk, not a dead
+                // session: drop it and keep reading.
+                Err(_) => note_drop("bad UDP fragment set"),
             }
         }
+    }
+}
+
+/// Datagrams dropped on the session paths, process-wide; logged at
+/// powers of two so a saturated relay stays observable without flooding.
+static DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn note_drop(reason: &str) {
+    let n = DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        tracing::debug!(dropped = n, "hysteria2 udp: datagram dropped ({reason})");
     }
 }
 
@@ -173,6 +195,8 @@ fn reassemble(item: FragmentPacket) -> Result<UdpMessage> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     /// A full driver queue drops the datagram; only a gone driver fails.
     #[test]
     fn send_drops_on_full_queue_and_fails_only_when_closed() {
@@ -186,8 +210,6 @@ mod tests {
         drop(rx);
         assert!(session.send(b"c", "1.2.3.4:5").is_err(), "driver gone");
     }
-
-    use super::*;
 
     #[test]
     fn defragger_reassembles_in_order() {
