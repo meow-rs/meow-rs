@@ -17,6 +17,31 @@ pub struct SnifferRuntime {
     port_map: HashMap<u16, Proto>,
 }
 
+/// Whether `buf` is the start of a TLS handshake record not yet complete:
+/// record type 0x16, version major 0x03 (filters junk starting with 0x16),
+/// and a short header or record.
+pub(crate) fn tls_record_incomplete(buf: &[u8]) -> bool {
+    buf.first() == Some(&0x16)
+        && buf.get(1).is_none_or(|&b| b == 0x03)
+        && (buf.len() < 5 || buf.len() < 5 + usize::from(u16::from_be_bytes([buf[3], buf[4]])))
+}
+
+/// Name the flow from the DNS before any sniff, as upstream restores the
+/// fake-IP / mapped host before `TCPSniff`: a mapped destination keeps its
+/// DNS name (a sniffed SNI cannot override it, `parse-pure-ip` skips it),
+/// an unmapped one is still sniffed.
+pub(crate) fn prefill_host(resolver: &meow_dns::Resolver, metadata: &mut Metadata) {
+    if !metadata.host.is_empty() {
+        return;
+    }
+    if let Some(host) = metadata
+        .dst_ip
+        .and_then(|ip| resolver.reverse_lookup(ip.to_canonical()))
+    {
+        metadata.host = host;
+    }
+}
+
 impl SnifferRuntime {
     pub fn new(cfg: SnifferConfig) -> Self {
         let mut skip = DomainTrie::new();
@@ -77,9 +102,7 @@ impl SnifferRuntime {
                         // Anything else parses on the first chunk.
                         let need_more = matches!(proto, Proto::Tls)
                             && n < buf.len()
-                            && buf[0] == 0x16
-                            && (n < 2 || buf[1] == 0x03)
-                            && (n < 5 || n < 5 + u16::from_be_bytes([buf[3], buf[4]]) as usize);
+                            && tls_record_incomplete(&buf[..n]);
                         if !need_more {
                             return Some(n);
                         }

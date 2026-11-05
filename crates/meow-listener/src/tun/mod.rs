@@ -98,6 +98,9 @@ use tokio::sync::Semaphore;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
+/// Bound on the first bytes gathered for a TLS sniff on lwIP flows.
+const TUN_SNIFF_GATHER_MAX: usize = 16 * 1024;
+
 /// Post-handshake sniff window: how long an accepted TUN TCP flow may stay
 /// silent before it is dialed anyway with an empty prefix (#695).
 ///
@@ -957,6 +960,7 @@ impl TunListener {
                 self.name.clone(),
                 tun_net,
                 std::sync::Arc::clone(&udp_flows),
+                self.sniffer.clone(),
             ));
         }
 
@@ -1101,6 +1105,10 @@ impl TunListener {
                                 ..Default::default()
                             };
                             if let Some(rt) = sniffer.as_deref() {
+                                crate::sniffer::prefill_host(
+                                    &tunnel.inner().resolver(),
+                                    &mut metadata,
+                                );
                                 rt.sniff(&stream, &mut metadata).await;
                             }
                             meow_tunnel::tcp::handle_tcp_socket(tunnel.inner(), stream, metadata)
@@ -1418,7 +1426,22 @@ async fn handle_tcp_flow(
         in_name: in_name.into(),
         ..Default::default()
     };
+    let mut tcp = tcp;
+    let mut prefix = prefix;
     if let Some(rt) = sniffer {
+        crate::sniffer::prefill_host(&tunnel.inner().resolver(), &mut metadata);
+        // A ClientHello (often 1.5–2 KB) outgrows the first read: gather
+        // the whole record within the sniff window; the extra bytes only
+        // extend the replayed prefix.
+        let deadline = tokio::time::Instant::now() + TUN_SNIFF_WINDOW;
+        let mut chunk = [0u8; 2048];
+        while prefix.len() < TUN_SNIFF_GATHER_MAX && crate::sniffer::tls_record_incomplete(&prefix)
+        {
+            match tokio::time::timeout_at(deadline, tcp.read(&mut chunk)).await {
+                Ok(Ok(n)) if n > 0 => prefix.extend_from_slice(&chunk[..n]),
+                _ => break,
+            }
+        }
         rt.sniff_bytes(&prefix, &mut metadata);
     }
 

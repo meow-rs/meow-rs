@@ -583,3 +583,14 @@ On Linux, tproxy remains the lighter-weight choice for host-only TCP
 proxying; tun adds UDP and works without firewall integration. On Windows,
 tun is the only transparent option. For LAN-gateway setups, see
 [tproxy-gateway.md](tproxy-gateway.md).
+
+## Sniffing
+
+The top-level `sniffer:` applies to TUN flows as mihomo applies it to
+every inbound. TCP flows get TLS SNI / HTTP `Host`; on the lwIP stack the
+first bytes are gathered within the 200 ms sniff window until the TLS
+record is complete. UDP flows to `sniff.QUIC` ports get the server name
+from the client's Initial packets. A destination the DNS already names
+(a fake IP or a mapped address) keeps that name: the sniffed one cannot
+override it unless `force-domain` lists it. A `sniffer:`-only
+`PUT /configs` restarts the TUN so it takes the new settings.

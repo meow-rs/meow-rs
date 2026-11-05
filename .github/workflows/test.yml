@@ -282,7 +282,7 @@ jobs:
             --test ss_listener_integration \
             --test dns_cache_test \
             --test config_test \
-            --test tun_config_test \
+            --test tun_config_test --test sniffer_config_test \
             --test dialer_proxy_group \
             --test statistics_test \
             --test rules_test \
