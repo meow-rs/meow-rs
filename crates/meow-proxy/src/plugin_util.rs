@@ -2,6 +2,15 @@
 //! `v2ray_plugin`, `gost_plugin`, `shadow_tls_plugin`, `restls_plugin`,
 //! `jls_plugin`, `kcptun_plugin`, `ech_tls_tunnel`.
 
+// `MeowError`/`Result` are only needed by the helpers whose consumers sit
+// behind the per-plugin features — under an `ss`-only build (v2ray-plugin +
+// simple-obfs) nothing here returns `Result`.
+#[cfg(any(
+    feature = "gost-plugin",
+    feature = "shadow-tls",
+    feature = "restls",
+    feature = "kcptun"
+))]
 use meow_common::error::{MeowError, Result};
 use tracing::warn;
 
@@ -22,7 +31,7 @@ pub(crate) fn sip003_opts(s: &str) -> impl Iterator<Item = (String, String)> + '
 /// SIP003 boolean convention: `1`/`true`/`yes`/`on` (case-insensitive).
 /// Unknown non-empty values warn and coerce to false — the lenient
 /// stance `v2ray-plugin`/`ech-tls-tunnel` have always taken; keep it
-/// there for compatibility and use [`parse_bool_strict`] for knobs
+/// there for compatibility and use `parse_bool_strict` for knobs
 /// where a typo would silently weaken security (enabling TLS,
 /// skipping verification).
 pub(crate) fn parse_bool(s: &str, plugin: &str, key: &str) -> bool {
@@ -39,6 +48,12 @@ pub(crate) fn parse_bool(s: &str, plugin: &str, key: &str) -> bool {
 /// Strict bool for security-relevant knobs: an unrecognized value is a
 /// config error — silently coercing `tls=bogus` to `false` would produce
 /// a plaintext transport the operator believes is TLS.
+#[cfg(any(
+    feature = "gost-plugin",
+    feature = "shadow-tls",
+    feature = "restls",
+    feature = "kcptun"
+))]
 pub(crate) fn parse_bool_strict(s: &str, plugin: &str, key: &str) -> Result<bool> {
     match s.to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Ok(true),
@@ -49,154 +64,158 @@ pub(crate) fn parse_bool_strict(s: &str, plugin: &str, key: &str) -> Result<bool
     }
 }
 
-/// Parse a `fingerprint` option value: `:`-separated hex of the 32-byte
-/// SHA-256 of the pinned certificate (upstream
-/// `ca.NewFingerprintVerifier`).  uTLS profile names are rejected,
-/// mirroring upstream's explicit check.
-pub(crate) fn parse_cert_pin(s: &str, plugin: &str) -> Result<[u8; 32]> {
-    // Upstream guards against the easy confusion between this pin and a
-    // uTLS ClientHello profile name.
-    const UTLS_NAMES: &[&str] = &[
-        "chrome",
-        "firefox",
-        "safari",
-        "ios",
-        "android",
-        "edge",
-        "360",
-        "qq",
-        "random",
-        "randomized",
-    ];
-    if UTLS_NAMES.contains(&s.to_ascii_lowercase().as_str()) {
-        // No pointer at `client-fingerprint` here: that node-level option
-        // is only honoured by plugins that wire it into their TLS layer
-        // (shadow-tls's cover handshake) — a hint that is silently ignored
-        // elsewhere is worse than none.
-        return Err(MeowError::Config(format!(
-            "{plugin}: 'fingerprint' is a TLS certificate pin (SHA-256 hex), \
-             not a uTLS ClientHello profile name"
-        )));
-    }
-    let stripped: String = s.trim().replace(':', "");
-    let bytes = hex::decode(&stripped)
-        .map_err(|e| MeowError::Config(format!("{plugin}: fingerprint hex decode failed: {e}")))?;
-    <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
-        MeowError::Config(format!(
-            "{plugin}: fingerprint must be a SHA-256 hash (32 bytes), got {}",
-            bytes.len()
-        ))
-    })
-}
+/// Certificate-pin parsing lives in [`crate::certificate_pin`] so the
+/// anytls adapter can share it without the `ss` feature.
+#[cfg(any(feature = "gost-plugin", feature = "shadow-tls", feature = "restls"))]
+pub(crate) use crate::certificate_pin::parse_cert_pin;
 
-/// Upstream `NewTLSKeyPairLoader` accepts PEM content or a file path for
-/// `certificate`/`private-key`.  A `-----BEGIN` marker means inline PEM;
-/// anything else is read from the filesystem once at config load —
-/// callers that want upstream's fswatch-style reload (gost-plugin) use
-/// [`pem_source`] to keep the resolved path.
-///
-/// Note: provider/subscription nodes reach this too (in-process plugins
-/// are not gated by `allow-external-plugin`), so a remote feed can point
-/// `certificate`/`private-key` at a local path — a file-existence oracle
-/// and a way to plant a cert into the TLS config.  That is upstream's
-/// semantics verbatim (`NewTLSKeyPairLoader` behaves identically); a
-/// deployment accepting untrusted providers should treat these two opts
-/// accordingly.  Only the certificate is ever transmitted — private key
-/// bytes never leave the host — and the value must still parse as PEM.
-/// Relative paths resolve against the meow home dir (upstream `C.Path`),
-/// not the process CWD — `resolved_home_dir` carries the `-d` override or
-/// the shared XDG config-dir default when no home is set.
-pub(crate) fn load_pem_or_path(value: &str, opt: &str, plugin: &str) -> Result<Vec<u8>> {
-    match pem_source(value) {
-        PemSource::Inline => Ok(value.as_bytes().to_vec()),
-        PemSource::File(resolved) => {
-            // Never read a non-regular file — a FIFO or device would
-            // block the read indefinitely, and a subscription-supplied
-            // opt reaches this path (issue #621 review).
-            if !resolved.is_file() {
-                return Err(MeowError::Config(format!(
-                    "{plugin}: '{opt}' is neither inline PEM nor a readable file ({}): \
-                     not a regular file",
-                    resolved.display()
-                )));
+/// PEM cert/key loading shared by the gost-plugin and shadow-tls parsers.
+/// One cfg for the whole cluster: every consumer sits behind
+/// `any(feature = "gost-plugin", feature = "shadow-tls")`.
+#[cfg(any(feature = "gost-plugin", feature = "shadow-tls"))]
+mod pem {
+    use meow_common::error::{MeowError, Result};
+
+    /// Upstream `NewTLSKeyPairLoader` accepts PEM content or a file path for
+    /// `certificate`/`private-key`.  A `-----BEGIN` marker means inline PEM;
+    /// anything else is read from the filesystem once at config load —
+    /// callers that want upstream's fswatch-style reload (gost-plugin) use
+    /// [`pem_source`] to keep the resolved path.
+    ///
+    /// Note: provider/subscription nodes reach this too (in-process plugins
+    /// are not gated by `allow-external-plugin`), so a remote feed can point
+    /// `certificate`/`private-key` at a local path — a file-existence oracle
+    /// and a way to plant a cert into the TLS config.  That is upstream's
+    /// semantics verbatim (`NewTLSKeyPairLoader` behaves identically); a
+    /// deployment accepting untrusted providers should treat these two opts
+    /// accordingly.  Only the certificate is ever transmitted — private key
+    /// bytes never leave the host — and the value must still parse as PEM.
+    /// Relative paths resolve against the meow home dir (upstream `C.Path`),
+    /// not the process CWD — `resolved_home_dir` carries the `-d` override or
+    /// the shared XDG config-dir default when no home is set.
+    pub(crate) fn load_pem_or_path(value: &str, opt: &str, plugin: &str) -> Result<Vec<u8>> {
+        match pem_source(value) {
+            PemSource::Inline => Ok(value.as_bytes().to_vec()),
+            PemSource::File(resolved) => {
+                // Never read a non-regular file — a FIFO or device would
+                // block the read indefinitely, and a subscription-supplied
+                // opt reaches this path (issue #621 review).
+                if !resolved.is_file() {
+                    return Err(MeowError::Config(format!(
+                        "{plugin}: '{opt}' is neither inline PEM nor a readable file ({}): \
+                         not a regular file",
+                        resolved.display()
+                    )));
+                }
+                read_cert_file(&resolved).map_err(|e| {
+                    MeowError::Config(format!(
+                        "{plugin}: '{opt}' is neither inline PEM nor a readable file ({}): {e}",
+                        resolved.display()
+                    ))
+                })
             }
-            read_cert_file(&resolved).map_err(|e| {
-                MeowError::Config(format!(
-                    "{plugin}: '{opt}' is neither inline PEM nor a readable file ({}): {e}",
-                    resolved.display()
-                ))
+        }
+    }
+
+    /// Bound on PEM cert/key file reads — provider-controlled paths reach this
+    /// (issue #648), and a PEM bundle is a few KiB in practice. 1 MiB leaves
+    /// generous headroom for stacked chains while capping a swapped-in huge
+    /// regular file.
+    const MAX_PEM_FILE_BYTES: u64 = 1024 * 1024;
+
+    /// Read a cert/key file that an `is_file` check already proved regular.
+    /// On unix the open carries `O_NONBLOCK` — a path swapped to a FIFO
+    /// between the stat and this read can't wedge the caller (a nonblocking
+    /// FIFO read errors instead of blocking; regular files ignore the flag).
+    /// Reads are capped at [`MAX_PEM_FILE_BYTES`].
+    pub(crate) fn read_cert_file(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.custom_flags(libc::O_NONBLOCK);
+        }
+        let f = opts.open(path)?;
+        let mut buf = Vec::new();
+        let mut take = std::io::Read::take(f, MAX_PEM_FILE_BYTES + 1);
+        let read = std::io::Read::read_to_end(&mut take, &mut buf)?;
+        if read as u64 > MAX_PEM_FILE_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("file exceeds {MAX_PEM_FILE_BYTES} bytes"),
+            ));
+        }
+        Ok(buf)
+    }
+
+    /// Where a `certificate`/`private-key` opt value's PEM bytes live —
+    /// classified by the same `-----BEGIN` rule [`load_pem_or_path`] uses.
+    /// Consumers that support hot reload (gost-plugin; upstream
+    /// `NewTLSKeyPairLoader` + fswatch) keep the [`PemSource::File`] path so
+    /// they can re-stat and re-read it per dial.
+    pub(crate) enum PemSource {
+        /// PEM content inline in the opt value — immutable.
+        Inline,
+        /// Filesystem path, already resolved against the meow home dir.
+        File(std::path::PathBuf),
+    }
+
+    impl PemSource {
+        /// The resolved path when the value named a file, else `None`.
+        /// Only gost-plugin keeps the path (for its per-dial re-stat reload).
+        #[cfg(feature = "gost-plugin")]
+        pub(crate) fn into_path(self) -> Option<std::path::PathBuf> {
+            match self {
+                PemSource::File(p) => Some(p),
+                PemSource::Inline => None,
+            }
+        }
+    }
+
+    /// Classify a PEM opt value without reading it (see [`PemSource`]).
+    pub(crate) fn pem_source(value: &str) -> PemSource {
+        if value.contains("-----BEGIN") {
+            PemSource::Inline
+        } else {
+            let path = std::path::Path::new(value);
+            PemSource::File(if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                meow_common::resolved_home_dir().join(path)
             })
         }
     }
-}
 
-/// Bound on PEM cert/key file reads — provider-controlled paths reach this
-/// (issue #648), and a PEM bundle is a few KiB in practice. 1 MiB leaves
-/// generous headroom for stacked chains while capping a swapped-in huge
-/// regular file.
-const MAX_PEM_FILE_BYTES: u64 = 1024 * 1024;
+    #[cfg(test)]
+    mod tests {
+        use super::*;
 
-/// Read a cert/key file that an `is_file` check already proved regular.
-/// On unix the open carries `O_NONBLOCK` — a path swapped to a FIFO
-/// between the stat and this read can't wedge the caller (a nonblocking
-/// FIFO read errors instead of blocking; regular files ignore the flag).
-/// Reads are capped at [`MAX_PEM_FILE_BYTES`].
-pub(crate) fn read_cert_file(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
-    let mut opts = std::fs::OpenOptions::new();
-    opts.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NONBLOCK);
-    }
-    let f = opts.open(path)?;
-    let mut buf = Vec::new();
-    let mut take = std::io::Read::take(f, MAX_PEM_FILE_BYTES + 1);
-    let read = std::io::Read::read_to_end(&mut take, &mut buf)?;
-    if read as u64 > MAX_PEM_FILE_BYTES {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("file exceeds {MAX_PEM_FILE_BYTES} bytes"),
-        ));
-    }
-    Ok(buf)
-}
-
-/// Where a `certificate`/`private-key` opt value's PEM bytes live —
-/// classified by the same `-----BEGIN` rule [`load_pem_or_path`] uses.
-/// Consumers that support hot reload (gost-plugin; upstream
-/// `NewTLSKeyPairLoader` + fswatch) keep the [`PemSource::File`] path so
-/// they can re-stat and re-read it per dial.
-pub(crate) enum PemSource {
-    /// PEM content inline in the opt value — immutable.
-    Inline,
-    /// Filesystem path, already resolved against the meow home dir.
-    File(std::path::PathBuf),
-}
-
-impl PemSource {
-    /// The resolved path when the value named a file, else `None`.
-    pub(crate) fn into_path(self) -> Option<std::path::PathBuf> {
-        match self {
-            PemSource::File(p) => Some(p),
-            PemSource::Inline => None,
+        #[test]
+        fn read_cert_file_caps_oversized_files() {
+            // A provider-controlled `certificate`/`private-key` path reaches this
+            // read — a swapped-in huge regular file must not exhaust memory
+            // (issue #648).
+            let dir =
+                std::env::temp_dir().join(format!("meow-pem-cap-test-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let big = dir.join("big.pem");
+            std::fs::write(&big, vec![b'x'; (MAX_PEM_FILE_BYTES + 1) as usize]).unwrap();
+            assert!(read_cert_file(&big).is_err());
+            let small = dir.join("small.pem");
+            std::fs::write(
+                &small,
+                b"-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n",
+            )
+            .unwrap();
+            assert!(read_cert_file(&small).is_ok());
+            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 }
 
-/// Classify a PEM opt value without reading it (see [`PemSource`]).
-pub(crate) fn pem_source(value: &str) -> PemSource {
-    if value.contains("-----BEGIN") {
-        PemSource::Inline
-    } else {
-        let path = std::path::Path::new(value);
-        PemSource::File(if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            meow_common::resolved_home_dir().join(path)
-        })
-    }
-}
+#[cfg(any(feature = "gost-plugin", feature = "shadow-tls"))]
+pub(crate) use pem::*;
 
 #[cfg(test)]
 mod tests {
@@ -221,6 +240,12 @@ mod tests {
         assert_eq!(sip003_opts("  ;; ").next(), None);
     }
 
+    #[cfg(any(
+        feature = "gost-plugin",
+        feature = "shadow-tls",
+        feature = "restls",
+        feature = "kcptun"
+    ))]
     #[test]
     fn parse_bool_lenient_vs_strict() {
         assert!(parse_bool("YES", "p", "k"));
@@ -231,26 +256,7 @@ mod tests {
         assert!(parse_bool_strict("", "p", "k").is_err());
     }
 
-    #[test]
-    fn read_cert_file_caps_oversized_files() {
-        // A provider-controlled `certificate`/`private-key` path reaches this
-        // read — a swapped-in huge regular file must not exhaust memory
-        // (issue #648).
-        let dir = std::env::temp_dir().join(format!("meow-pem-cap-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let big = dir.join("big.pem");
-        std::fs::write(&big, vec![b'x'; (MAX_PEM_FILE_BYTES + 1) as usize]).unwrap();
-        assert!(read_cert_file(&big).is_err());
-        let small = dir.join("small.pem");
-        std::fs::write(
-            &small,
-            b"-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n",
-        )
-        .unwrap();
-        assert!(read_cert_file(&small).is_ok());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
+    #[cfg(any(feature = "gost-plugin", feature = "shadow-tls", feature = "restls"))]
     #[test]
     fn cert_pin_rejects_utls_names_and_bad_hex() {
         assert!(parse_cert_pin("chrome", "p").is_err());

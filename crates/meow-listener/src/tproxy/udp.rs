@@ -45,7 +45,7 @@ pub(super) mod flow {
     use std::time::Duration;
 
     use meow_common::{ConnType, Metadata, Network};
-    use meow_tunnel::{MatchedRule, Tunnel};
+    use meow_tunnel::{MatchedRule, Tunnel, UsingProxy};
     use tokio::sync::mpsc;
     use tokio::time::{sleep_until, Instant};
     use tracing::{debug, info};
@@ -119,9 +119,7 @@ pub(super) mod flow {
         // packet API needs a resolved dst_ip regardless of what the rules
         // demand — including after a fake-IP was rewritten back to a hostname.
         inner.pre_resolve(&mut metadata).await;
-        if metadata.dst_ip.is_none() && !metadata.host.is_empty() {
-            metadata.dst_ip = inner.resolver().resolve_ip_real(&metadata.host).await;
-        }
+        inner.resolve_udp_dst(&mut metadata).await;
         let Some(dst_ip) = metadata.dst_ip else {
             return Err(format!(
                 "dst_ip not resolved for {}",
@@ -152,7 +150,7 @@ pub(super) mod flow {
         info!(
             "UDP {client} --> {orig_dst} match {} using {}",
             MatchedRule::new(&rule_name, &rule_payload, proxy.name()),
-            proxy.name()
+            UsingProxy::new(proxy.as_ref(), &metadata)
         );
 
         // Taken before the dial so a flush landing mid-dial still ends the
@@ -1010,7 +1008,10 @@ mod linux {
                 std::ptr::write(
                     hdr,
                     libc::cmsghdr {
-                        cmsg_len,
+                        // libc types musl's `cmsg_len` as `socklen_t` (u32 on
+                        // every width) while glibc's is `size_t`; this helper
+                        // takes a usize, and `as _` fits both.
+                        cmsg_len: cmsg_len as _,
                         cmsg_level: level,
                         cmsg_type: ty,
                     },

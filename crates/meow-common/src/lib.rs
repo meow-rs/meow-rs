@@ -36,7 +36,9 @@ pub mod replay_window;
 pub mod rule;
 pub mod sniffer;
 pub mod socket_protect;
+pub mod tcp_opts;
 pub mod traffic;
+pub mod traffic_ledger;
 pub mod tunnel_mode;
 // Shared YAML-ingest guard used by meow-config and meow-cli — internal
 // plumbing, not part of this published crate's documented API surface.
@@ -63,7 +65,7 @@ pub use home_dir::{meow_home_dir, resolved_home_dir, set_home_dir, xdg_home_dir}
 pub use metadata::{is_valid_host, metadata_ip_literal, AddrDisplay, Metadata};
 pub use network::Network;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-pub use outbound_iface::apply_outbound_interface;
+pub use outbound_iface::{apply_outbound_interface, apply_outbound_interface_for_peer};
 pub use outbound_iface::{install_outbound_interface, outbound_interface, OutboundIfaceGuard};
 pub use process_lookup::{
     disable_socket_table_cache, find_process, find_process_async, ProcessInfo,
@@ -71,7 +73,11 @@ pub use process_lookup::{
 pub use replay_window::ReplayWindow;
 pub use rule::{Rule, RuleMatchHelper, RuleType, TargetCheck, TargetProbe};
 pub use sniffer::SnifferConfig;
-pub use socket_protect::{bind_udp, connect_tcp, connect_tcp_host, resolve_host, resolve_host_all};
+pub use socket_protect::{
+    bind_udp, bind_udp_for_peer, canonical_socket_addr, connect_tcp, connect_tcp_host,
+    resolve_host, resolve_host_all,
+};
+pub use tcp_opts::TcpKeepaliveConfig;
 // Host-resolver hook is cross-platform (iOS installs it without a protector).
 pub use socket_protect::{clear_host_resolver, host_resolver, set_host_resolver, HostResolver};
 // Socket protector is Android-only (raw-fd `VpnService.protect`).

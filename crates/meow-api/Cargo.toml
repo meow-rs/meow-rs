@@ -33,7 +33,6 @@ dashmap = { workspace = true }
 futures = { workspace = true }
 parking_lot = { workspace = true }
 subtle = "2"
-sysinfo = "0.32"
 uuid = { workspace = true }
 time = { workspace = true }
 base64 = "0.22"
@@ -44,11 +43,14 @@ smol_str = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+sysinfo = { version = "0.32", default-features = false, features = ["system"] }
+
 [dev-dependencies]
 serde-saphyr = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 # api_test opens a logbook.
-meow-common = { workspace = true, features = ["logbook"] }
+meow-common = { workspace = true, features = ["logbook", "traffic-ledger"] }
 meow-trie = { workspace = true }
 tower = { workspace = true }
 http-body-util = "0.1"

@@ -9,8 +9,17 @@ repository.workspace = true
 homepage.workspace = true
 
 [features]
-default = ["ss", "trojan", "vless", "vless-vision", "vless-encryption", "ech-tls-tunnel", "vmess", "snell", "hysteria2", "mux", "kcptun"]
+default = ["ss", "trojan", "vless", "vless-vision", "vless-encryption", "ech-tls-tunnel", "vmess", "snell", "hysteria2", "mux", "kcptun", "shadow-tls", "restls", "jls", "gost-plugin"]
 ss = ["meow-proxy/ss"]
+# Built-in SIP003 plugin transports on the `ss` outbound — opt-in, each
+# implies `ss`; `ss` alone keeps only simple-obfs + v2ray-plugin.
+shadow-tls = ["ss", "meow-proxy/shadow-tls"]
+restls = ["ss", "meow-proxy/restls"]
+jls = ["ss", "meow-proxy/jls"]
+# gost-plugin's `mux:` plugin-opt defaults to true and rides the `mux`
+# feature (same shape as kcptun below): keep the config-layer `smux:`/
+# `mux:` node blocks usable on any build that carries the plugin.
+gost-plugin = ["ss", "mux", "meow-proxy/gost-plugin"]
 trojan = ["meow-proxy/trojan"]
 # `meow-transport/reality` rides along with vless: `reality-opts` is only
 # reachable from the vless parser, and REALITY must not depend on boring-tls

@@ -272,7 +272,10 @@ jobs:
           # And for v2ray_plugin_integration's official server plugin.
           V2RAY_PLUGIN_BIN: ${{ runner.temp }}/v2ray-plugin/v2ray-plugin
         run: |
+          export MEOW_TEST_OUTBOUND_INTERFACE="$(ip -4 route get 1.1.1.1 | awk '{for (i=1;i<NF;i++) if ($i=="dev") {print $(i+1); exit}}')"
+          test -n "$MEOW_TEST_OUTBOUND_INTERFACE"
           cargo nextest run --lib --bin meow --bin meow-bench --bin meow-cli \
+            --test direct_udp_binding \
             --test common_test \
             --test socks5_udp_user \
             --test host_validation \
@@ -326,11 +329,11 @@ jobs:
       - name: YAML boundary contract tests (meow-config)
         run: cargo nextest run -p meow-config --test yaml_boundary_test --retries 2 --no-fail-fast
 
-      # `minimal` leaves out `logbook`, which every run above unifies on;
-      # `-p meow-common` alone builds the stub that stands in for it
-      # (`meow-common/src/logbook/disabled.rs`).
-      - name: Logbook stub tests (meow-common without logbook)
-        run: cargo nextest run -p meow-common --lib logbook --retries 2 --no-fail-fast
+      # `minimal` leaves out `logbook` and `traffic-ledger`, which every run
+      # above unifies on; `-p meow-common` alone builds the stubs that stand
+      # in for them (`meow-common/src/{logbook,traffic_ledger}/disabled.rs`).
+      - name: Logbook and traffic ledger stub tests (meow-common without them)
+        run: cargo nextest run -p meow-common --lib logbook traffic_ledger --retries 2 --no-fail-fast
 
       - name: UDP routing regression (SOCKS5, Shadowsocks, TUN)
         run: cargo nextest run -p meow-listener --all-features --lib udp_port_53 --retries 2 --no-fail-fast
@@ -396,10 +399,15 @@ jobs:
       - name: Install cargo-hack
         uses: taiki-e/install-action@cargo-hack
 
+      # The ss-only meow-config leg below runs its reserved-plugin contract
+      # tests through nextest like every other test step.
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
       # Capped powerset: --depth 2 covers the empty set, every single feature,
       # and every pair — enough for the real-world cfg-interaction bugs while
-      # keeping the leg count ~n^2 instead of ~2^n (meow-proxy: 66 legs,
-      # ~129 across the four crates — cargo-hack dedups subsets that resolve
+      # keeping the leg count ~n^2 instead of ~2^n (meow-proxy: 184 legs,
+      # ~297 across the four crates — cargo-hack dedups subsets that resolve
       # to identical builds). Same trade-off tokio (--depth 2 --keep-going)
       # and quinn (--depth 3 --no-dev-deps) make in their PR CI.
       # --no-dev-deps: dev-dependencies are irrelevant to a compile check and
@@ -414,6 +422,14 @@ jobs:
 
       - name: Feature powerset (depth 2) — meow-proxy
         run: cargo hack check -p meow-proxy --feature-powerset --depth 2 --no-dev-deps
+
+      # `ss`-only meow-config: the reserved-plugin contract tests (built-in
+      # SIP003 names never fall back to the external spawn path, compiled-out
+      # names bind a dead placeholder instead of dropping the node) compile
+      # only under this feature set — none of the four plugin features on —
+      # and the trojan-fixture dialer/prefetch tests are cfg'd out of it.
+      - name: meow-config ss-only unit tests
+        run: cargo nextest run -p meow-config --no-default-features --features ss --lib --retries 2 --no-fail-fast
 
       - name: Feature powerset (depth 2) — meow-listener
         run: cargo hack check -p meow-listener --feature-powerset --depth 2 --no-dev-deps
@@ -501,7 +517,10 @@ jobs:
       - name: Unit + integration tests (windows)
         shell: bash
         run: |
+          export MEOW_TEST_OUTBOUND_INTERFACE="$(powershell.exe -NoProfile -Command '(Find-NetRoute -RemoteIPAddress 1.1.1.1 | Select-Object -First 1).InterfaceAlias' | tr -d '\r')"
+          test -n "$MEOW_TEST_OUTBOUND_INTERFACE"
           cargo nextest run --lib --bin meow --bin meow-bench --bin meow-cli \
+            --test direct_udp_binding \
             --test common_test \
             --test config_test \
             --test rules_test \
@@ -573,7 +592,10 @@ jobs:
 
       - name: Core smoke tests
         run: |
+          export MEOW_TEST_OUTBOUND_INTERFACE="$(route -n get default | awk '/interface:/ {print $2}')"
+          test -n "$MEOW_TEST_OUTBOUND_INTERFACE"
           cargo nextest run --lib --bin meow --bin meow-bench --bin meow-cli \
+            --test direct_udp_binding \
             --test common_test \
             --test config_test \
             --test rules_test \

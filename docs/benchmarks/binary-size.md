@@ -203,3 +203,104 @@ contributor than mux). None of those were measured against `default` at
 the time they landed either; this section only closes the mux-specific gap
 that issue #426 asked for. A follow-up audit to re-baseline `default` size
 against the full feature history is out of scope here.
+
+## SS built-in plugin transports split (perf/ss-plugin-features, U4)
+
+Measured 2026-10-28 on macOS/Apple Silicon (`uname -m` = arm64, `rustc 1.98.1
+aarch64-apple-darwin`). A/B against the unit base commit `4201881b` (built in a
+scratch checkout with the identical recipe). Release profile unchanged:
+`lto=fat, strip=true, codegen-units=1, panic=abort, opt-level="z"`.
+
+Attribution caveat: the A/B spans `4201881b..f5a1b4ca` — 25 `main`
+commits, not this PR alone — so the −254 KiB delta below is the
+*cumulative* effect of everything that landed in the window (this split
+plus upstream work such as the BoringSSL record layer, splice relay and
+v2ray-plugin Mux.Cool framing); it is not a clean per-PR measurement.
+
+The change splits the four heavier built-in SIP003 transports
+(`gost-plugin`, `shadow-tls`, `restls`, `jls`) out of `ss` into their own
+opt-in features. `minimal`'s `ss` contract narrows to simple-obfs +
+v2ray-plugin; `default`/`full` still bundle all four, so release binaries
+are expected ~unchanged. `kcptun`/`ech-tls-tunnel` were already separate
+features and only gained explicit disabled-name error arms.
+
+Build commands:
+
+```bash
+# minimal A/B
+cargo zigbuild --release --no-default-features --features minimal \
+  --target x86_64-unknown-linux-musl --bin meow      # musl
+cargo build --release --no-default-features --features minimal --bin meow   # host
+# default A/B
+cargo zigbuild --release --target x86_64-unknown-linux-musl --bin meow      # musl
+cargo build --release --bin meow                                           # host
+```
+
+| Target | Profile | Before (`4201881b`) | After (U4) | Delta |
+|--------|---------|--------------------:|-----------:|------:|
+| `x86_64-unknown-linux-musl` | minimal | 10,263,808 B (~9.79 MiB) | 10,003,680 B (~9.54 MiB) | **−260,128 B (~−254 KiB, −2.5%)** |
+| `x86_64-unknown-linux-musl` | default | 15,153,992 B (~14.45 MiB) | 15,153,928 B (~14.45 MiB) | −64 B (≈0, as expected) |
+| `aarch64-apple-darwin` (host) | minimal | 7,038,432 B (~6.71 MiB) | 6,871,744 B (~6.55 MiB) | **−166,688 B (~−163 KiB, −2.4%)** |
+| `aarch64-apple-darwin` (host) | default | 9,967,584 B (~9.51 MiB) | 9,967,616 B (~9.51 MiB) | +32 B (≈0, as expected) |
+| `aarch64-unknown-linux-musl` | minimal | not measured (only the x86_64 leg was built) | | — |
+
+Dep-tree evidence (`cargo tree -p meow-proxy -e normal
+--no-default-features --features ss`, base vs branch): `ss`-only drops
+`curve25519-dalek` and `x25519-dalek` (the x25519 key-exchange chain used
+by the restls transport, also reached transitively via jls); identical
+at the `meow-app` level. `Cargo.lock` is unchanged — every plugin dep
+was already declared optional, so feature rewiring moves no packages.
+
+Behavior: a `plugin: gost-plugin` ss node under an `ss`-without-`gost-plugin`
+build stays bound as an unavailable placeholder — `meow -f <yml> -t`
+accepts the config (verified in both directions) and every dial through
+the node reports `plugin 'gost-plugin' is not compiled into this build;
+rebuild with \`--features gost-plugin\``; all built-in names stay reserved in
+`is_builtin_sip003_plugin` so they can never fall through to the external
+SIP003 subprocess path.
+
+## RSS via /proc on Linux — sysinfo leaves the Linux dep graph (U2)
+
+Measured 2026-10-28 on macOS/Apple Silicon (`arm64`), rustc 1.98.1
+(`aarch64-apple-darwin`), workspace release profile (`lto = true,
+strip = true, codegen-units = 1, panic = "abort", opt-level = "z"`).
+`meow-api`'s `read_rss_bytes` now reads `VmRSS:` from `/proc/self/status`
+on Linux and keeps `sysinfo` only under
+`[target.'cfg(not(target_os = "linux"))'.dependencies]` with
+`default-features = false, features = ["system"]` — dropping `rayon` (and
+its `crossbeam-deque`/`crossbeam-epoch`/`either`/`rayon-core` subtree)
+plus sysinfo's disk/network/component code from every shipped binary.
+
+Host `default` (full) feature-set A/B, same commit-parent vs. patched
+worktree, `cargo build --locked --release -p meow-app`, `wc -c`:
+
+| Target | Feature set | Before | After | Delta |
+|--------|------------|--------|-------|-------|
+| `aarch64-apple-darwin` | default (full) | 9,967,584 B (~9.50 MiB) | 9,950,880 B (~9.49 MiB) | −16,704 B |
+
+The non-zero host delta is expected, not noise: `sysinfo` stays in the
+non-Linux graph but loses its default features, so `rayon` + the
+crossbeam subtree drops out of the macOS binary as well.
+
+Cross-link musl A/B (zig 0.13.0 + cargo-zigbuild 0.23.2, same recipe on
+the base commit), `cargo zigbuild --release --locked --target
+<triple> --bin meow`, `wc -c`:
+
+| Target | Feature set | Before | After | Delta |
+|--------|------------|--------|-------|-------|
+| `x86_64-unknown-linux-musl` | default (full) | 15,153,992 B (~14.45 MiB) | 15,080,984 B (~14.38 MiB) | −73,008 B |
+| `aarch64-unknown-linux-musl` | default (full) | 12,529,688 B (~11.95 MiB) | 12,469,280 B (~11.89 MiB) | −60,408 B |
+
+The musl deltas land below early estimates because `opt-level="z"` + fat
+LTO already strips most unreachable `sysinfo`/`rayon` code; what leaves
+is the reachable procfs-parsing and work-stealing surface.
+
+Dep-graph evidence
+(`cargo tree --target x86_64-unknown-linux-musl -e normal -p meow-api`,
+before→after package-set diff): **removed** `sysinfo v0.32.1`,
+`rayon v1.12.0`, `rayon-core v1.13.0`, `crossbeam-deque v0.8.8`,
+`crossbeam-epoch v0.9.21`, `either v1.19.0`; **added** none. On
+`aarch64-apple-darwin` the same diff removes the rayon subtree but keeps
+`sysinfo v0.32.1` (now `system` component only). `Cargo.lock` is
+byte-identical — `rayon` remains locked via `criterion` (dev-dep) and
+`meow-dns`'s sysinfo dev-dep, and the lock records no target-cfg edges.

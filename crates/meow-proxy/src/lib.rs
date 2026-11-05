@@ -7,6 +7,13 @@
 /// BoringSSL record-layer AEAD shared by Snell, VMess and VLESS encryption.
 #[cfg(any(feature = "snell", feature = "vmess", feature = "vless-encryption"))]
 mod aead;
+#[cfg(any(
+    feature = "gost-plugin",
+    feature = "shadow-tls",
+    feature = "restls",
+    feature = "anytls"
+))]
+mod certificate_pin;
 pub mod dialer;
 pub mod direct;
 pub mod group;
@@ -26,17 +33,17 @@ pub mod unavailable;
 
 #[cfg(feature = "ech-tls-tunnel")]
 pub mod ech_tls_tunnel;
-#[cfg(feature = "ss")]
+#[cfg(feature = "gost-plugin")]
 pub mod gost_plugin;
-#[cfg(feature = "ss")]
+#[cfg(feature = "jls")]
 pub mod jls_plugin;
 #[cfg(feature = "kcptun")]
 pub mod kcptun_plugin;
 #[cfg(feature = "ss")]
 mod plugin_util;
-#[cfg(feature = "ss")]
+#[cfg(feature = "restls")]
 pub mod restls_plugin;
-#[cfg(feature = "ss")]
+#[cfg(feature = "shadow-tls")]
 pub mod shadow_tls_plugin;
 #[cfg(feature = "ss")]
 pub mod shadowsocks_adapter;
@@ -59,7 +66,7 @@ pub use snell::{SnellAdapter, SnellObfs, SnellV6Mode, SnellVersion};
 #[cfg(feature = "anytls")]
 pub mod anytls_adapter;
 #[cfg(feature = "anytls")]
-pub use anytls_adapter::AnytlsAdapter;
+pub use anytls_adapter::{AnytlsAdapter, AnytlsTlsOptions};
 
 #[cfg(feature = "hysteria2")]
 mod hysteria2;

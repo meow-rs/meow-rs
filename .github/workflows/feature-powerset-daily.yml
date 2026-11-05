@@ -10,15 +10,19 @@
 # what cargo-hack actually reports after deduplicating subsets that resolve
 # to identical builds (feature implication collapses many of them, e.g.
 # vless-vision -> vless, listener-mixed -> listener-http + listener-socks5):
-#   meow-proxy      depth 4 = 437 legs
-#   meow-transport  depth 4 = 167 legs (boring-tls excluded)
-#   meow-listener   full powerset = 22 legs
+#   meow-proxy      depth 4 = 1788 legs (the four split-out ss plugin
+#                   features are grouped — see the matrix leg below;
+#                   ungrouped they would blow the count up to 3676)
+#   meow-transport  depth 4 = 747 legs (boring-tls excluded)
+#   meow-listener   full powerset = 44 legs
 #   meow-dns        full powerset = 5 legs
-# With a warm cache each leg costs ~10-15s of incremental `cargo check`, so
-# the heaviest job (meow-proxy) lands around ~2h worst case — inside the
-# 180-minute timeout and well under the 360-minute hosted-runner cap. An
-# unbounded powerset of meow-proxy (4096 nominal legs) cannot fit a hosted
-# runner at all, which is why depth is capped even on the nightly.
+# With a warm cache each leg costs ~5-10s of incremental `cargo check`, so
+# the heaviest job (meow-proxy, 1788 legs) lands around ~2.5-5h — inside
+# the 360-minute hosted-runner cap the timeout below uses; a cold cache
+# can run past it and get the job cancelled mid-powerset (legs already
+# checked still report). An unbounded powerset of meow-proxy (2^20 ≈ 1M
+# nominal legs) cannot fit a hosted runner at all, which is why depth is
+# capped even on the nightly.
 name: Feature Powerset (daily)
 
 on:
@@ -46,7 +50,9 @@ jobs:
     # Scheduled workflows also fire on forks that enable Actions — the
     # powerset is the heaviest job in the repo; skip it on forks.
     if: github.event.repository.fork == false
-    # Generous per-crate cap; the leg budgets above target well under this.
+    # ~2.59s per leg on the GitHub runner: grouped meow-proxy is 1788 legs
+    # ≈ 77 min, and even ungrouped (3676 legs ≈ 159 min) still fits 180 —
+    # keep the margin for machine variance, not for leg count.
     timeout-minutes: 180
     strategy:
       # One crate failing must not cancel the others: the point of the daily
@@ -55,7 +61,15 @@ jobs:
       matrix:
         include:
           - crate: meow-proxy
-            hack_args: --depth 4
+            # The four opt-in ss plugin features are independent on/off
+            # knobs by design, and no pair of them gates shared code —
+            # each only gates its own `PluginKind` arm (they do share the
+            # `plugin_util`/adapter cfg cluster with `ss` and `mux`, which
+            # the ungrouped legs still explore). Treating them as one unit
+            # drops the inter-plugin Cartesian product: the depth-4 leg
+            # count falls 3676 -> 1788 (~2x) while still covering every
+            # (plugin group, other feature) combination.
+            hack_args: --depth 4 --group-features shadow-tls,restls,jls,gost-plugin
           - crate: meow-transport
             # `boring-tls` is a no-op alias of `tls` (BoringSSL is the only
             # backend); skip the duplicate leg.

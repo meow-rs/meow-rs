@@ -2,8 +2,8 @@ use crate::sniffer::SnifferRuntime;
 use base64::Engine;
 use meow_common::{with_dial_timeout, AuthConfig, ConnType, Metadata, Network};
 use meow_tunnel::{
-    copy_bidirectional_buf_tracked, route_inbound_tcp, MatchedRule, ResolvedTarget, Tunnel,
-    RELAY_BUF_SIZE,
+    copy_bidirectional_buf_tracked_idle, route_inbound_tcp, MatchedRule, ResolvedTarget, Tunnel,
+    UsingProxy, RELAY_BUF_SIZE,
 };
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -215,6 +215,25 @@ async fn handle_http_inner(
         // Plain HTTP proxy (GET/POST/etc via proxy)
         let url = target;
         let (host, port) = parse_url_host_port(url);
+        // An origin-form request target carries no authority: RFC 9112
+        // §3.2.2 names the Host header the effective destination. Restore
+        // it before the hostname gate so `GET /` + `Host: example.com` —
+        // the shape every browser sends a plain-HTTP proxy — reaches the
+        // gate instead of dying on the empty authority (the #734 gate
+        // predates this case and refused every such request with 400).
+        // The `/` guard keeps the fallback to genuine origin-form targets:
+        // `?x`, `*` and other non-authority targets keep their 400.
+        let (host, port) = if host.is_empty() && url.starts_with('/') {
+            // `parse_host_port` hands a port-0 authority (`Host: x:0`)
+            // back with an empty host, so it dies on the hostname gate
+            // like any other bad Host value.
+            match host_header(&request) {
+                Some(authority) => parse_host_port(authority, 80),
+                None => (host, port),
+            }
+        } else {
+            (host, port)
+        };
         if !meow_common::is_valid_host(host) {
             write_bad_request(stream).await?;
             return Err(format!("request target {url:?} has no valid host").into());
@@ -269,7 +288,7 @@ async fn handle_http_inner(
                 &target.rule_payload,
                 target.adapter.name()
             ),
-            target.adapter.name()
+            UsingProxy::new(target.adapter.as_ref(), &metadata)
         );
 
         // `route` pins this generation's dialer registry across the dial
@@ -332,7 +351,7 @@ async fn handle_http_inner(
                         // half-close semantics.
                         let mut remote = ShutdownGate::new(remote, &pass_upstream_shutdown);
 
-                        match copy_bidirectional_buf_tracked(
+                        match copy_bidirectional_buf_tracked_idle(
                             &mut *client,
                             &mut remote,
                             &mut relay_buf_up,
@@ -347,6 +366,7 @@ async fn handle_http_inner(
                                     .stats
                                     .record_download(&dn, n as meow_common::atomic::Int);
                             },
+                            inner.tcp_idle_timeout(),
                         )
                         .await
                         {
@@ -1904,10 +1924,36 @@ fn host_to_ip(host: &str) -> Option<IpAddr> {
 fn parse_host_port(target: &str, default_port: u16) -> (&str, u16) {
     if let Some((host, port_str)) = target.rsplit_once(':') {
         if let Ok(port) = port_str.parse::<u16>() {
+            // Port 0 names no socket — return an empty host so every
+            // caller's hostname gate refuses the authority (`CONNECT x:0`,
+            // `http://x:0/`, `Host: x:0`) instead of dialing port 0.
+            if port == 0 {
+                return ("", 0);
+            }
             return (host, port);
         }
     }
     (target, default_port)
+}
+
+/// The `Host:` header of a plain request — the authority an origin-form
+/// request target omits (RFC 9112 §3.2.2). Only a single UTF-8, non-empty
+/// value counts: a duplicated header makes the authority ambiguous (RFC
+/// 9110 §5.4 permits refusing it outright), and anything else falls
+/// through to the caller's hostname gate, which refuses as before.
+fn host_header<'a>(request: &'a RequestHead<'_>) -> Option<&'a str> {
+    let mut hosts = request
+        .headers
+        .iter()
+        .filter(|h| h.name.eq_ignore_ascii_case(b"host"));
+    let first = hosts.next()?;
+    if hosts.next().is_some() {
+        return None;
+    }
+    std::str::from_utf8(first.value)
+        .ok()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
 }
 
 /// Parse host and port from an absolute HTTP or WebSocket URL.

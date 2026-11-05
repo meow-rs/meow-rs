@@ -9,13 +9,23 @@ repository.workspace = true
 homepage.workspace = true
 
 [features]
-default = ["ss", "trojan", "vless", "vless-vision", "vless-encryption", "ech-tls-tunnel", "vmess", "snell", "hysteria2", "mux", "kcptun", "public-suffix"]
+default = ["ss", "trojan", "vless", "vless-vision", "vless-encryption", "ech-tls-tunnel", "vmess", "snell", "hysteria2", "mux", "kcptun", "public-suffix", "shadow-tls", "restls", "jls", "gost-plugin"]
 # The embedded public-suffix list (`psl`) behind load-balance
 # `consistent-hashing`'s eTLD+1 key — about 500 KB of lookup tables, so it
 # is in the app `full` profile and kept out of `minimal` (ADR-0007
 # binary-size caps), where the key falls back to the last two labels.
 public-suffix = ["dep:psl"]
-ss = ["dep:shadowsocks", "meow-transport/simple-obfs", "meow-transport/shadow-tls", "meow-transport/restls", "meow-transport/jls"]
+ss = ["dep:shadowsocks", "meow-transport/simple-obfs"]
+# Built-in SIP003 plugin transports on the `ss` adapter. `minimal` keeps
+# only simple-obfs + v2ray-plugin (bundled in `ss`); these four are opt-in
+# and re-bundled into `default`/`full` so release binaries are unchanged
+# (ADR-0007 binary-size caps). Each implies `ss` and its meow-transport
+# layer; gost-plugin rides the always-on ws/tls transports and pulls `mux`
+# because its `mux:` option defaults to true.
+shadow-tls = ["ss", "meow-transport/shadow-tls"]
+restls = ["ss", "meow-transport/restls"]
+jls = ["ss", "meow-transport/jls"]
+gost-plugin = ["ss", "mux"]
 trojan = []
 vless = []
 vmess = ["dep:md-5", "dep:hmac", "dep:aes", "dep:boring", "dep:crc32fast"]

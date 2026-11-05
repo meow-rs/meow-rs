@@ -94,6 +94,34 @@ pub async fn spawn_echo_server() -> std::net::SocketAddr {
     addr
 }
 
+/// Spawn a minimal HTTP origin that reads one request head through
+/// `\r\n\r\n` and answers a fixed `200 OK`. Unlike `spawn_echo_server`
+/// (which reflects the forwarded `GET` request line — bytes that are not
+/// a response status line), this lets a plain-HTTP relay test assert a
+/// real `200` round-trip.
+pub async fn spawn_http_ok_server() -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                let mut len = 0;
+                while !buf[..len].windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf[len..]).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => len += n,
+                    }
+                }
+                let _ = stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .await;
+            });
+        }
+    });
+    addr
+}
+
 /// Spawn the upstream HTTP proxy mock: counts accepts, answers every
 /// CONNECT with 200, then echoes.
 pub async fn spawn_counting_http_upstream(

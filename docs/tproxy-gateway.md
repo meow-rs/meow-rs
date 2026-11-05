@@ -505,10 +505,11 @@ On the gateway, meow logs each connection with the recovered host and matched
 rule — confirm the client's source IP appears:
 
 ```
-[::ffff:192.168.1.50]:54321 --> www.google.com:443 match DOMAIN-SUFFIX(google.com) using Proxies
+[::ffff:192.168.1.50]:54321 --> www.google.com:443 match DOMAIN-SUFFIX(google.com) using Proxies[HK-01]
 ```
 
-(`::ffff:` prefix is the v4-mapped form when the listener binds `::`.)
+(`::ffff:` prefix is the v4-mapped form when the listener binds `::`. The
+brackets name the node the `Proxies` group dials through.)
 
 ---
 

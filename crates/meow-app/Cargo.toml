@@ -28,6 +28,10 @@ external-ui-download = ["meow-config/external-ui-download"]
 # Persistent logbook (ADR-0014): bundles SQLite. In `full`; excluded from
 # `minimal` (ADR-0007 binary-size caps), where `GET /logbook` reports it off.
 logbook = ["meow-common/logbook"]
+# Persistent per-day traffic by host, policy and interface (`GET
+# /traffic/ledger`, ADR-0015): the logbook's SQLite plus the public-suffix
+# list. In `full`; excluded from `minimal` (ADR-0007 binary-size caps).
+traffic-ledger = ["meow-common/traffic-ledger"]
 # Heap profiling via dhat crate — swaps global allocator; never enable in production.
 dhat-heap = ["dhat"]
 
@@ -64,6 +68,13 @@ public-suffix = ["meow-proxy/public-suffix"]
 # In-process kcptun SS-plugin client (issue #533) — in `full`; excluded
 # from `minimal` alongside `mux` (ADR-0007 binary-size caps).
 kcptun = ["meow-config/kcptun", "meow-proxy/kcptun"]
+# Built-in SIP003 plugin transports on the `ss` outbound — each implies
+# `ss`; in `full`/`default`, excluded from `minimal` (ADR-0007
+# binary-size caps), where `ss` keeps only simple-obfs + v2ray-plugin.
+shadow-tls = ["ss", "meow-config/shadow-tls", "meow-proxy/shadow-tls"]
+restls = ["ss", "meow-config/restls", "meow-proxy/restls"]
+jls = ["ss", "meow-config/jls", "meow-proxy/jls"]
+gost-plugin = ["ss", "meow-config/gost-plugin", "meow-proxy/gost-plugin"]
 
 # DNS
 dns-server = ["meow-dns/dns-server"]
@@ -87,10 +98,12 @@ listener-shadowsocks = ["meow-listener/listener-shadowsocks"]
 minimal = ["ss", "trojan", "dns-server", "listener-mixed"]
 full = [
     "ss", "trojan", "vless", "vless-vision", "vless-encryption", "vmess", "snell", "hysteria2", "anytls", "ech-tls-tunnel", "mux", "kcptun",
+    "shadow-tls", "restls", "jls", "gost-plugin",
     "dns-server", "dns-encrypted",
     "listener-http", "listener-socks5", "listener-tproxy", "listener-mixed", "listener-tun",
     "listener-shadowsocks",
     "logbook",
+    "traffic-ledger",
     "public-suffix",
 ]
 

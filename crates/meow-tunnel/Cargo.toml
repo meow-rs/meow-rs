@@ -54,6 +54,8 @@ meow-rules = { workspace = true }
 serde-saphyr = { workspace = true }
 tempfile = { workspace = true }
 tracing-subscriber = { workspace = true }
+# The statistics tests record into a real traffic ledger.
+meow-common = { workspace = true, features = ["traffic-ledger"] }
 
 [lints]
 workspace = true

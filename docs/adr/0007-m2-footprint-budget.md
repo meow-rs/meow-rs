@@ -107,6 +107,20 @@ Not shipping in M2 (explicitly): `armv7-musl` (covered by aarch64 for M2
 priorities), `mips-musl` (big-endian is vanishing), Windows,
 macOS-universal, any glibc target. Those are future releases.
 
+**Amendment — `armv7-musl` now ships** (PR #744, 2026-10).
+`armv7-unknown-linux-musleabihf` is built and published as a static musl
+binary. The M2 reason above was prioritization, but the "cannot be built
+with TLS at all" note in `build.yml` did hold for the `cargo zigbuild`
+path: musl 1.2.x headers declare `time_t` 64-bit on 32-bit targets
+(time64/Y2038) while Rust's `libc` crate types it as `i32`, so bindgen
+emits 64-bit signatures and `boring` fails to compile (E0308) — and
+zig-linked static armv7 binaries were unreliable under QEMU in testing.
+A real musl cross toolchain container builds the target statically; the
+same time64-vs-`libc` disagreement there is bridged by a one-line cast in
+`boring` (`meow-rs` never calls `set_time`). It carries no cap here —
+`minimal_budget_bytes` is 0 (informational) until someone measures the
+`minimal` feature set on it; if a cap is wanted, §6 applies as usual.
+
 **Why mipsel is soft for M2:** roadmap §M2 item 3 names mipsel-musl
 explicitly, but the current tree has zero mipsel build infrastructure
 and no way to functionally validate a mipsel binary (no QEMU runner,
@@ -402,6 +416,57 @@ before the merge.
 A.6's case, a change that grows the binary before a follow-up shrinks
 it, goes through §6: the PR carries a cap amendment, and the follow-up
 can bring the cap back down with a reduction amendment.
+
+## Addendum (2026-10-29): `ss` built-in SIP003 plugins split into per-plugin features
+
+`meow-proxy`'s `ss` feature used to enable every in-process SIP003 plugin
+transport at once: `simple-obfs`/`obfs`, `v2ray-plugin`, `gost-plugin`,
+`shadow-tls`, `restls`, `jls` (plus the already-separate `kcptun` and
+`ech-tls-tunnel` features). The `minimal` bundle exists to satisfy this
+ADR's binary-size caps, and its `ss` contract only needs the two
+transports that cover the dominant deployments — `simple-obfs` and
+`v2ray-plugin` (§1 names the SS + `v2ray-plugin` story; `simple-obfs`
+ships inside `ss` as the second transport). Carrying `gost-plugin`
+(ws+TLS+smux), `shadow-tls`, `restls` and `jls` (each a `meow-transport`
+layer plus its parser and tests) in `minimal` spends size budget on
+plugins a minimal operator never configures.
+
+The `ss` built-in-plugin contract therefore narrows to `simple-obfs`/`obfs`
++ `v2ray-plugin`. The four heavier built-in SIP003 transports become
+opt-in cargo features — `gost-plugin`, `shadow-tls`, `restls`, `jls` —
+each implying `ss` (and its `meow-transport` layer for the TLS ones;
+`gost-plugin` also implies `mux` because its `mux:` option defaults to
+true), and each re-bundled into `default`/`full` so release binaries are
+unchanged.
+
+Disabled plugin names stay **reserved**: `is_builtin_sip003_plugin` lists
+every built-in name unconditionally, and `ShadowsocksAdapter::new` answers
+a compiled-out name with a clean `Config` error ("not compiled into this
+build; rebuild with `--features <feat>`") instead of falling through to
+the external `Plugin::start` subprocess path. `kcptun` and
+`ech-tls-tunnel` get the same explicit error arm, closing their
+pre-existing fallthrough (a disabled `kcptun`/`ech-tls-tunnel` used to
+reach the external SIP003 spawn path). At config load the failing node
+keeps its slot as an unavailable placeholder — the same contract the
+compiled-out `trusttunnel` type already keeps — so `-t`, boot,
+`PUT /configs` and provider refreshes all read the file identically, and
+a `select` group, an explicit `MATCH` target or a `dialer-proxy` chain
+naming the node fails its dials with the feature-named error rather than
+sliding traffic to a sibling or DIRECT. Liveness-checked groups
+(`fallback`, `url-test`, `load-balance`) skip the dead entry like any
+unavailable member — the placeholder deliberately does not pin those.
+
+Consequences:
+
+- `minimal` (`ss` + `trojan` + `dns-server` + `listener-mixed`) no longer
+  compiles the four plugin transports — a `plugin: gost-plugin` node in a
+  minimal build stays bound dead and every dial through it reports the
+  feature-named error.
+- `default`/`full` feature sets are unchanged: every release binary keeps
+  all built-in plugins, so the default-build measurements carry over.
+- The nightly feature-powerset job groups the four new features
+  (`--group-features`), keeping the meow-proxy depth-4 leg count at 1788
+  instead of 3676.
 
 ## References
 

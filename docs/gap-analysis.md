@@ -55,15 +55,18 @@ Upstream lives in `adapter/outbound/`. Current Rust adapters live in `crates/meo
 
 Upstream `adapter/outbound` supports these pluggable transports layered on top of adapters: `tls`, `ws`, `h2`, `http`, `grpc`, `httpupgrade`, `shadowtls`, `v2ray-plugin`, `simple-obfs`, `restls`, `mux/smux`.
 
-Rust port currently supports:
+Rust port currently supports (each SS plugin sits behind its same-named
+cargo feature; `simple-obfs`/`v2ray-plugin` ride `ss` itself, the rest are
+opt-in and re-bundled into `default`/`full` but excluded from `minimal`):
 
-- `v2ray-plugin` (websocket + TLS) — `crates/meow-proxy/src/v2ray_plugin.rs`
-- `gost-plugin` (websocket + TLS + smux) — `crates/meow-proxy/src/gost_plugin.rs`
-- `shadow-tls` (cover-TLS record transport, v1/v2/v3) — `crates/meow-proxy/src/shadow_tls_plugin.rs`
-- `restls` (record-level TLS client + tagged records, tls12/tls13) — `crates/meow-proxy/src/restls_plugin.rs`
-- `jls` (record-level TLS 1.3 client with hello-random auth) — `crates/meow-proxy/src/jls_plugin.rs`
-- `kcptun` (KCP ARQ + crypt/FEC/snappy over UDP, smux v1 pool, UDP-over-TCP relay) — `crates/meow-proxy/src/kcptun_plugin.rs`
-- `simple-obfs` — `crates/meow-proxy/src/shadowsocks_adapter.rs` (`BuiltinObfs`)
+- `v2ray-plugin` (websocket + TLS) — `crates/meow-proxy/src/v2ray_plugin.rs` (`ss`)
+- `gost-plugin` (websocket + TLS + smux) — `crates/meow-proxy/src/gost_plugin.rs` (`gost-plugin`)
+- `shadow-tls` (cover-TLS record transport, v1/v2/v3) — `crates/meow-proxy/src/shadow_tls_plugin.rs` (`shadow-tls`)
+- `restls` (record-level TLS client + tagged records, tls12/tls13) — `crates/meow-proxy/src/restls_plugin.rs` (`restls`)
+- `jls` (record-level TLS 1.3 client with hello-random auth) — `crates/meow-proxy/src/jls_plugin.rs` (`jls`)
+- `kcptun` (KCP ARQ + crypt/FEC/snappy over UDP, smux v1 pool, UDP-over-TCP relay) — `crates/meow-proxy/src/kcptun_plugin.rs` (`kcptun`)
+- `ech-tls-tunnel` (TLS-in-TLS with ECH) — `crates/meow-proxy/src/ech_tls_tunnel.rs` (`ech-tls-tunnel`)
+- `simple-obfs` — `crates/meow-proxy/src/shadowsocks_adapter.rs` (`BuiltinObfs`) (`ss`)
 
 | Transport        | Upstream | Rust | Status |
 |------------------|:--------:|:----:|--------|
@@ -266,7 +269,7 @@ Upstream config keys documented at https://wiki.metacubex.one/. Checking `crates
 | `geodata-mode`, `geo-auto-update`, `geodata-loader` | GeoIP/GeoSite DB management |
 | `global-client-fingerprint` | Reality/uTLS fingerprint |
 | `global-ua` | User-Agent override for subscription fetch |
-| `keep-alive-interval` | TCP keepalive |
+| `keep-alive-interval` | TCP keepalive (upstream's knob tunes *inbound listeners AND outbound dials*; meow-rs parses it only to warn — the inbound-socket equivalent is `tcp-keepalive*` + `tcp-idle-timeout`, see `config.example.yaml`; the outbound-dialer tuning is the residual gap) |
 | `find-process-mode` | `off` / `strict` / `always` |
 | `tcp-concurrent` | Happy Eyeballs fast-open |
 | `unified-delay` | Delay histogram normalization |

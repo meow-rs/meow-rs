@@ -547,7 +547,7 @@ const RAW_SOCKET_ALLOWLIST: &[(&str, &str, usize, &str)] = &[
         "crates/meow-proxy/src/direct.rs",
         "Socket::new(",
         1,
-        "routing-mark dial; applies meow_common::apply_outbound_interface itself",
+        "routing-mark dial; applies meow_common::apply_outbound_interface_for_peer itself",
     ),
     // Vendored anytls: its own protect helper and its server side.
     (
@@ -601,6 +601,14 @@ const RAW_SOCKET_ALLOWLIST: &[(&str, &str, usize, &str)] = &[
         "UdpSocket::bind(",
         1,
         "inbound SOCKS5 UDP relay socket facing the client",
+    ),
+    (
+        "crates/meow-tunnel/src/app_lookup.rs",
+        "UdpSocket::bind(",
+        1,
+        "local-address probe for the traffic ledger's app lookup (macOS, \
+         Windows): bound to a flow's source address and dropped unused, never \
+         sends",
     ),
     (
         "crates/meow-listener/src/tproxy/udp.rs",

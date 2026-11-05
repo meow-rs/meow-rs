@@ -1129,28 +1129,28 @@ impl ProxyProvider {
                     ));
                 }
                 // Keep the slot entry as a dead placeholder instead of
-                // dropping it, so a group that lists this node can neither
-                // shift its traffic onto a sibling member nor degrade to a
-                // direct dial. Scoped to the node on purpose: this payload
-                // is third-party and refetched on a timer, so rejecting the
-                // whole feed would let its operator empty the registry on
-                // every refresh — and, for a protocol missing from this
-                // build, stop the daemon from starting at all.
-                Err(e) if proxy_parser::node_is_trusttunnel(raw_map) => {
-                    let label = if raw_name.is_empty() {
-                        "<unnamed>"
-                    } else {
-                        raw_name
-                    };
-                    warn!(provider = %self.name, proxy = label, error = %e, "keeping an unavailable trusttunnel node so nothing can dial past it");
-                    result.push(crate::unavailable_placeholder(
-                        label,
-                        &e,
-                        meow_common::AdapterType::TrustTunnel,
-                    ));
-                }
+                // dropping it: a `select` group, an explicit `MATCH` target
+                // or a `dialer-proxy` chain that names this node fails the
+                // dial rather than shifting the traffic to a sibling member
+                // or DIRECT (liveness-checked groups skip it like any
+                // unavailable member). Scoped to the node on purpose: this
+                // payload is third-party and refetched on a timer, so
+                // rejecting the whole feed would let its operator empty the
+                // registry on every refresh — and, for a protocol or
+                // built-in plugin transport missing from this build, stop
+                // the daemon from starting at all.
                 Err(e) => {
-                    warn!(provider = %self.name, proxy = raw_name, error = %e, "failed to parse proxy");
+                    if let Some(declared) = proxy_parser::placeholder_adapter_type(raw_map) {
+                        let label = if raw_name.is_empty() {
+                            "<unnamed>"
+                        } else {
+                            raw_name
+                        };
+                        warn!(provider = %self.name, proxy = label, error = %e, "keeping an unavailable node so nothing can dial past it");
+                        result.push(crate::unavailable_placeholder(label, &e, declared));
+                    } else {
+                        warn!(provider = %self.name, proxy = raw_name, error = %e, "failed to parse proxy");
+                    }
                 }
             }
         }
@@ -3260,6 +3260,106 @@ header:
             .to_string();
         assert!(error.contains("bad"), "{error}");
         assert!(!error.contains("test-only"), "{error}");
+    }
+
+    /// Same contract as the trusttunnel placeholder above, for an `ss` node
+    /// whose reserved built-in plugin's cargo feature is compiled out: the
+    /// payload still loads, the node keeps its slot bound dead as
+    /// `Shadowsocks`, and its dial reason is the "not compiled into this
+    /// build" error — no warn-drop, no feed rejection.
+    #[cfg(all(feature = "ss", not(feature = "gost-plugin")))]
+    #[tokio::test]
+    async fn missing_plugin_node_becomes_a_dead_ss_placeholder_not_a_payload_rejection() {
+        let url = spawn_payload_server(
+            "proxies:\n  - {name: good, type: direct}\n  - {name: dead-ss, type: ss, server: 1.2.3.4, port: 8388, password: p, cipher: aes-128-gcm, plugin: gost-plugin}\n",
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let provider = ProxyProvider::new(
+            "p",
+            &raw_http_provider(&url, None),
+            Some(dir.path()),
+            false,
+            false,
+            ProxyRegistry::default(),
+        )
+        .unwrap();
+        provider
+            .acquire_initial()
+            .await
+            .expect("a missing-plugin node must not reject the whole payload");
+
+        let nodes = provider.proxies();
+        assert_eq!(nodes.len(), 2, "the dead node keeps its slot entry");
+        let dead = nodes
+            .iter()
+            .find(|proxy| proxy.name() == "dead-ss")
+            .expect("the unbuildable node stays addressable by name");
+        assert!(!dead.alive(), "a placeholder must never look usable");
+        assert_eq!(
+            dead.adapter_type(),
+            meow_common::AdapterType::Shadowsocks,
+            "a placeholder must keep the node's own type"
+        );
+        let error = dead
+            .dial_tcp(&meow_common::Metadata::default())
+            .await
+            .err()
+            .expect("a placeholder must fail the dial, not leak it direct")
+            .to_string();
+        assert!(error.contains("dead-ss"), "{error}");
+        assert!(
+            error.contains("not compiled into this build"),
+            "the placeholder's reason must be the plugin gate error: {error}"
+        );
+    }
+
+    /// The placeholder is not a one-shot of the initial load: a `refresh`
+    /// re-parses the same payload through the same arm, so the dead node
+    /// must still be bound dead after the second ingest — never dropped on
+    /// the refresh path (which would let a `use:` group quietly shrink).
+    #[cfg(all(feature = "ss", not(feature = "gost-plugin")))]
+    #[tokio::test]
+    async fn missing_plugin_placeholder_survives_a_second_ingest() {
+        let url = spawn_payload_server(
+            "proxies:\n  - {name: good, type: direct}\n  - {name: dead-ss, type: ss, server: 1.2.3.4, port: 8388, password: p, cipher: aes-128-gcm, plugin: gost-plugin}\n",
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let provider = ProxyProvider::new(
+            "p",
+            &raw_http_provider(&url, None),
+            Some(dir.path()),
+            false,
+            false,
+            ProxyRegistry::default(),
+        )
+        .unwrap();
+        provider
+            .acquire_initial()
+            .await
+            .expect("a missing-plugin node must not reject the whole payload");
+        provider
+            .refresh()
+            .await
+            .expect("a refresh re-parsing the same payload must keep succeeding");
+
+        let nodes = provider.proxies();
+        assert_eq!(nodes.len(), 2, "the dead node keeps its slot on refresh");
+        let dead = nodes
+            .iter()
+            .find(|proxy| proxy.name() == "dead-ss")
+            .expect("the unbuildable node stays addressable after a refresh");
+        let error = dead
+            .dial_tcp(&meow_common::Metadata::default())
+            .await
+            .err()
+            .expect("the refreshed placeholder must still fail the dial")
+            .to_string();
+        assert!(
+            error.contains("not compiled into this build"),
+            "the second ingest binds the same placeholder: {error}"
+        );
     }
 
     /// `proxy: <name>` routes the provider fetch through that registry

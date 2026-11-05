@@ -27,7 +27,7 @@ use ipnet::{Ipv4Net, Ipv6Net};
 use lwip::UdpSocket;
 use meow_common::{ConnType, Metadata, Network};
 use meow_dns::server::{hex_prefix, DnsServer, LocalAnswer};
-use meow_tunnel::{MatchedRule, ResolvedTarget, Tunnel};
+use meow_tunnel::{MatchedRule, ResolvedTarget, Tunnel, UsingProxy};
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Instant};
 use tracing::{debug, info, warn};
@@ -345,9 +345,7 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
     // packet API below needs a resolved dst_ip regardless of what the rules
     // demand — including after a fake-IP was rewritten back to a hostname.
     inner.pre_resolve(&mut metadata).await;
-    if metadata.dst_ip.is_none() && !metadata.host.is_empty() {
-        metadata.dst_ip = inner.resolver().resolve_ip_real(&metadata.host).await;
-    }
+    inner.resolve_udp_dst(&mut metadata).await;
     let Some(dst_ip) = metadata.dst_ip else {
         return Err(format!(
             "dst_ip not resolved for {}",
@@ -374,7 +372,7 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
         src,
         metadata.remote_address(),
         MatchedRule::new(&rule_name, &rule_payload, proxy.name()),
-        proxy.name()
+        UsingProxy::new(proxy.as_ref(), &metadata)
     );
 
     // Taken before the dial so a flush landing mid-dial still ends the flow

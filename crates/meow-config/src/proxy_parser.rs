@@ -35,11 +35,44 @@ fn required_port(
 /// Wraps a ProxyAdapter to implement the full Proxy trait
 pub struct WrappedProxy {
     adapter: Box<dyn ProxyAdapter>,
+    /// The `dialer-proxy` the adapter dials its server through.
+    hop: Option<DialerHop>,
+}
+
+/// An outbound's injected `dialer-proxy` dialer, and the server it dials
+/// through it.
+struct DialerHop {
+    dialer: Arc<dyn meow_proxy::dialer::TcpDialer>,
+    host: SmolStr,
+    port: u16,
 }
 
 impl WrappedProxy {
     pub fn new(adapter: Box<dyn ProxyAdapter>) -> Self {
-        Self { adapter }
+        Self { adapter, hop: None }
+    }
+
+    /// `self`, whose adapter the block `config` built with `dialer`
+    /// injected, so [`ProxyAdapter::dialer_hop`] can name the member a
+    /// `dialer-proxy` front takes.
+    fn dialing_through(
+        mut self,
+        config: &HashMap<String, serde_json::Value>,
+        dialer: &Arc<dyn meow_proxy::dialer::TcpDialer>,
+    ) -> Self {
+        let host = config.get("server").and_then(serde_json::Value::as_str);
+        let port = config
+            .get("port")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|port| u16::try_from(port).ok());
+        if let (true, Some(host), Some(port)) = (dialer.is_proxy(), host, port) {
+            self.hop = Some(DialerHop {
+                dialer: Arc::clone(dialer),
+                host: host.into(),
+                port,
+            });
+        }
+        self
     }
 }
 
@@ -75,6 +108,23 @@ impl ProxyAdapter for WrappedProxy {
     /// otherwise hide PASS/PASS-RULE members from the match-time probe.
     fn unwrap_proxy(&self, metadata: &Metadata, touch: bool) -> Option<Arc<dyn Proxy>> {
         self.adapter.unwrap_proxy(metadata, touch)
+    }
+
+    /// The pick of the front the injected dialer dials the server through,
+    /// over the network the adapter takes there for this flow.
+    fn dialer_hop(&self, metadata: &Metadata) -> Option<Arc<dyn Proxy>> {
+        match &self.hop {
+            Some(hop) => hop.dialer.front_hop(
+                &hop.host,
+                hop.port,
+                self.adapter.dialer_hop_network(metadata.network),
+            ),
+            None => self.adapter.dialer_hop(metadata),
+        }
+    }
+
+    fn dialer_hop_network(&self, flow: meow_common::Network) -> meow_common::Network {
+        self.adapter.dialer_hop_network(flow)
     }
 
     /// Forward the session flush (issue #695) — every parsed leaf sits behind
@@ -115,6 +165,28 @@ pub fn parse_proxy(
     parse_proxy_with_dialer(config, &dialer, ipv6)
 }
 
+/// [`parse_proxy`] for a static `proxies:` entry. A `type: direct` entry
+/// without its own `dns:` also follows `resolver`'s
+/// `dns.direct-nameserver`, like the built-in DIRECT
+/// ([`DirectAdapter::with_direct_resolver_slot`]).
+pub(crate) fn parse_static_proxy(
+    config: &HashMap<String, serde_json::Value>,
+    ipv6: bool,
+    resolver: Option<&meow_dns::ResolverSlot>,
+) -> std::result::Result<Arc<dyn Proxy>, String> {
+    match (config.get("type").and_then(|v| v.as_str()), resolver) {
+        (Some("direct"), Some(slot)) => {
+            let name = config
+                .get("name")
+                .and_then(|v| v.as_str())
+                .ok_or("missing proxy name")?;
+            let adapter = parse_direct(name, config, ipv6, Some(slot))?;
+            Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
+        }
+        _ => parse_proxy(config, ipv6),
+    }
+}
+
 /// A TT node that fails to parse must stay *bound* even in lenient mode —
 /// to a dead placeholder, never dropped. Dropping the requested transport
 /// can make a group select DIRECT, i.e. send the flow out in plaintext.
@@ -124,6 +196,58 @@ pub(crate) fn node_is_trusttunnel(config: &HashMap<String, serde_json::Value>) -
         .get("type")
         .and_then(serde_json::Value::as_str)
         .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("trusttunnel"))
+}
+
+/// Whether `config` describes an `ss` node whose reserved built-in `plugin:`
+/// names a cargo feature this build lacks — same class of failure as
+/// [`node_is_trusttunnel`]: the node can never parse, but dropping it would
+/// let a `select` group or an explicit `MATCH`/`dialer-proxy` reference
+/// shift that traffic to a sibling or DIRECT, so callers keep it bound to a
+/// dead placeholder instead (liveness-checked groups skip the dead entry
+/// like any unavailable member). The adapter's "not compiled into this
+/// build" error becomes the placeholder's reason. This check
+/// deliberately remains available when the feature is disabled — it reads
+/// the raw node, so it needs no error identity across the `String` boundary.
+pub(crate) fn node_needs_missing_plugin(config: &HashMap<String, serde_json::Value>) -> bool {
+    #[cfg(feature = "ss")]
+    {
+        // `type` is lenient like `node_is_trusttunnel`'s — the dispatch is
+        // exact, so a `"Ss "`/`"SS"` node fails parsing anyway; keeping the
+        // classifier forgiving lets the placeholder still cover the group
+        // fallback hole instead of warn-dropping the node.
+        config
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("ss"))
+            && config
+                .get("plugin")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|plugin| {
+                    meow_proxy::shadowsocks_adapter::missing_plugin_feature(plugin).is_some()
+                })
+    }
+    #[cfg(not(feature = "ss"))]
+    {
+        let _ = config;
+        false
+    }
+}
+
+/// The [`AdapterType`] a failed node's dead placeholder must keep, when
+/// dropping the node would silently reroute its group's traffic: trusttunnel
+/// nodes ([`node_is_trusttunnel`]) and `ss` nodes whose built-in plugin's
+/// cargo feature is compiled out ([`node_needs_missing_plugin`]). `None`
+/// for ordinary parse failures, which stay warn-and-drop.
+pub(crate) fn placeholder_adapter_type(
+    config: &HashMap<String, serde_json::Value>,
+) -> Option<AdapterType> {
+    if node_is_trusttunnel(config) {
+        Some(AdapterType::TrustTunnel)
+    } else if node_needs_missing_plugin(config) {
+        Some(AdapterType::Shadowsocks)
+    } else {
+        None
+    }
 }
 
 /// Whether `config` describes an `ss` node whose `plugin:` names an external
@@ -151,7 +275,10 @@ pub fn node_selects_external_plugin(config: &HashMap<String, serde_json::Value>)
 /// binary (issue #513). Built-in/in-process plugins (`obfs`,
 /// `simple-obfs`, `v2ray-plugin`, `gost-plugin`, `shadow-tls`, `restls`, `jls`,
 /// `kcptun`, `ech-tls-tunnel`) stay allowed — mihomo
-/// implements those in-process too, so gating them would diverge.
+/// implements those in-process too, so gating them would diverge.  A built-in
+/// name whose cargo feature is compiled out still counts as built-in here
+/// (reserved name): the adapter then fails construction with a clean
+/// "not compiled into this build" error instead of spawning an executable.
 ///
 /// `dialer` is the pluggable TCP dialer the node's adapter dials its server
 /// through — [`meow_proxy::dialer::DirectDialer`] for an unchained node, or a
@@ -218,7 +345,16 @@ pub fn parse_proxy_with_dialer(
                 .get("udp")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
-            let plugin = config.get("plugin").and_then(|v| v.as_str());
+            // A present-but-non-string `plugin:` is a malformed node, not
+            // "no plugin": silently treating it as absent would dial a
+            // plain SS while the operator asked for a transport plugin.
+            // `null` is the exception — Go's `Plugin string` field
+            // unmarshals null to the zero value, so `plugin: null` means
+            // unset exactly like an absent key (mihomo parity).
+            let plugin = match config.get("plugin") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(value) => Some(value.as_str().ok_or("ss: `plugin` must be a string")?),
+            };
             let plugin_opts_str = config.get("plugin-opts").and_then(serialize_plugin_opts);
             let client_fingerprint = config.get("client-fingerprint").and_then(|v| v.as_str());
 
@@ -279,7 +415,9 @@ pub fn parse_proxy_with_dialer(
             }
             #[cfg(not(feature = "mux"))]
             parse_mux_options(name, config)?;
-            Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
+            Ok(Arc::new(
+                WrappedProxy::new(Box::new(adapter)).dialing_through(config, dialer),
+            ))
         }
         #[cfg(feature = "trojan")]
         "trojan" => {
@@ -328,24 +466,32 @@ pub fn parse_proxy_with_dialer(
             }
             #[cfg(not(feature = "mux"))]
             parse_mux_options(name, config)?;
-            Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
+            Ok(Arc::new(
+                WrappedProxy::new(Box::new(adapter)).dialing_through(config, dialer),
+            ))
         }
         #[cfg(feature = "vless")]
         "vless" => {
             let adapter = parse_vless(name, config, dialer)?;
-            Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
+            Ok(Arc::new(
+                WrappedProxy::new(Box::new(adapter)).dialing_through(config, dialer),
+            ))
         }
         "http" => {
             let adapter = parse_http(name, config, dialer)?;
-            Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
+            Ok(Arc::new(
+                WrappedProxy::new(Box::new(adapter)).dialing_through(config, dialer),
+            ))
         }
         "socks5" => {
             let adapter = parse_socks5(name, config, dialer)?;
-            Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
+            Ok(Arc::new(
+                WrappedProxy::new(Box::new(adapter)).dialing_through(config, dialer),
+            ))
         }
         "direct" => {
             reject_unthreaded_dialer(name, "direct", dialer)?;
-            let adapter = parse_direct(name, config, ipv6)?;
+            let adapter = parse_direct(name, config, ipv6, None)?;
             Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
         }
         #[cfg(feature = "anytls")]
@@ -363,12 +509,16 @@ pub fn parse_proxy_with_dialer(
         #[cfg(feature = "vmess")]
         "vmess" => {
             let adapter = parse_vmess(name, config, dialer)?;
-            Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
+            Ok(Arc::new(
+                WrappedProxy::new(Box::new(adapter)).dialing_through(config, dialer),
+            ))
         }
         #[cfg(feature = "snell")]
         "snell" => {
             let adapter = parse_snell(name, config, dialer)?;
-            Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
+            Ok(Arc::new(
+                WrappedProxy::new(Box::new(adapter)).dialing_through(config, dialer),
+            ))
         }
         #[cfg(not(feature = "trusttunnel"))]
         "trusttunnel" => Err(feature_gated_proxy_type("trusttunnel")),
@@ -797,6 +947,7 @@ fn parse_direct(
     name: &str,
     config: &HashMap<String, serde_json::Value>,
     ipv6: bool,
+    direct_slot: Option<&meow_dns::ResolverSlot>,
 ) -> std::result::Result<DirectAdapter, String> {
     use meow_common::DnsMode;
     use meow_dns::Resolver;
@@ -871,6 +1022,9 @@ fn parse_direct(
             ipv6,
         ));
         adapter = adapter.with_resolver(resolver);
+    } else if let Some(slot) = direct_slot {
+        // No per-proxy `dns:` override — follow `dns.direct-nameserver`.
+        adapter = adapter.with_direct_resolver_slot(Arc::clone(slot));
     }
 
     Ok(adapter)
@@ -1093,14 +1247,17 @@ fn parse_trusttunnel(
         Arc::clone(dialer),
     )
     .map_err(|error| error.to_string())?;
-    Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
+    Ok(Arc::new(
+        WrappedProxy::new(Box::new(adapter)).dialing_through(config, dialer),
+    ))
 }
 
 /// Parse a `type: anytls` proxy block into an [`AnytlsAdapter`].
 ///
 /// Required fields: `server`, `port`, `password`. Optional: `sni`,
-/// `skip-cert-verify`, `udp`. Closes the parser side of issue #75; the wire
-/// protocol itself is provided by the `anytls-rs` crate.
+/// `skip-cert-verify`, `fingerprint`, `name-cert-verify`, `client-fingerprint`,
+/// `alpn`, `udp`. The wire protocol itself is
+/// provided by the `anytls-rs` crate.
 ///
 /// `udp` defaults to `false`, matching mihomo's `AnyTLSOption.UDP` (the
 /// adapter then relays datagrams over udp-over-tcp v2).
@@ -1134,8 +1291,88 @@ fn parse_anytls(
         .get("udp")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
+    reject_unsupported_anytls_options(name, config)?;
 
-    meow_proxy::AnytlsAdapter::new(name, server, port, password, sni, skip_cert_verify, udp)
+    let optional_string = |field: &str| match config.get(field) {
+        Some(serde_json::Value::String(value)) => Ok(Some(value.clone())),
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(_) => Err(format!("anytls[{name}]: {field} must be a string")),
+    };
+    let alpn = match config.get("alpn") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(serde_json::Value::Array(values)) => values
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| format!("anytls[{name}]: alpn entries must be strings"))
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?,
+        Some(_) => return Err(format!("anytls[{name}]: alpn must be a string list")),
+    };
+    let options = meow_proxy::AnytlsTlsOptions {
+        sni: sni.map(str::to_string),
+        skip_cert_verify,
+        fingerprint: optional_string("fingerprint")?,
+        name_cert_verify: optional_string("name-cert-verify")?,
+        client_fingerprint: optional_string("client-fingerprint")?,
+        alpn,
+    };
+    meow_proxy::AnytlsAdapter::new_with_tls(name, server, port, password, &options, udp)
+}
+
+/// Refuse the AnyTLS options that change security properties and that the
+/// Rust backend cannot honour (issue #870), and warn once about the purely
+/// behavioural mihomo fields it ignores. Mirrors hysteria2: an enabled
+/// `ech-opts` or any `certificate`/`private-key` is a load error (silently
+/// dropping them would leak the SNI / send no client certificate).
+#[cfg(feature = "anytls")]
+fn reject_unsupported_anytls_options(
+    name: &str,
+    config: &HashMap<String, serde_json::Value>,
+) -> std::result::Result<(), String> {
+    if let Some(value) = config.get("ech-opts") {
+        let enabled = value
+            .as_object()
+            .and_then(|map| map.get("enable"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true);
+        if enabled {
+            return Err(format!(
+                "anytls[{name}]: 'ech-opts' is not supported by the Rust backend \
+                 (the SNI would be sent in the clear)"
+            ));
+        }
+    }
+    for key in ["certificate", "private-key"] {
+        if config.contains_key(key) {
+            return Err(format!(
+                "anytls[{name}]: '{key}' is not supported by the Rust backend"
+            ));
+        }
+    }
+    let ignored: Vec<&str> = [
+        "shadow-tls-opts",
+        "restls-opts",
+        "jls-opts",
+        "client-metadata",
+        "idle-session-check-interval",
+        "idle-session-timeout",
+        "min-idle-session",
+        "disable-reuse",
+    ]
+    .into_iter()
+    .filter(|key| config.get(*key).is_some_and(|v| !v.is_null()))
+    .collect();
+    if !ignored.is_empty() {
+        tracing::warn!(
+            name,
+            ignored = %ignored.join(", "),
+            "anytls: ignoring options not supported by the Rust backend"
+        );
+    }
+    Ok(())
 }
 
 /// Parse a `type: hysteria2` proxy block.
@@ -3725,7 +3962,7 @@ tls: true
     /// End-to-end junction: `plugin-opts` map → SIP003 serialization →
     /// the in-process shadow-tls parser → adapter construction, incl.
     /// the `alpn` sequence and node-level `client-fingerprint` plumbing.
-    #[cfg(feature = "ss")]
+    #[cfg(feature = "shadow-tls")]
     #[test]
     fn test_shadow_tls_node_parse_e2e() {
         let cfg = proxy_config(
@@ -3756,7 +3993,7 @@ tls: true
 
     /// End-to-end junction: `plugin-opts` map → SIP003 serialization →
     /// the in-process restls parser → adapter construction.
-    #[cfg(feature = "ss")]
+    #[cfg(feature = "restls")]
     #[test]
     fn test_restls_node_parse_e2e() {
         let cfg = proxy_config(
@@ -3788,7 +4025,7 @@ tls: true
 
     /// End-to-end junction: `plugin-opts` map → SIP003 serialization →
     /// the in-process jls parser → adapter construction.
-    #[cfg(feature = "ss")]
+    #[cfg(feature = "jls")]
     #[test]
     fn test_jls_node_parse_e2e() {
         let cfg = proxy_config(
@@ -3933,17 +4170,70 @@ tls: true
     #[test]
     fn parse_direct_with_connect_timeout_wires_adapter() {
         let cfg = direct_config("name: d\ntype: direct\nconnect-timeout: 7\n");
-        let adapter = parse_direct("d", &cfg, true).unwrap();
+        let adapter = parse_direct("d", &cfg, true, None).unwrap();
         assert_eq!(
             adapter.connect_timeout(),
             Some(std::time::Duration::from_secs(7))
         );
     }
 
+    /// A static `type: direct` entry without `dns:` follows the tunnel's
+    /// `dns.direct-nameserver`: its UDP socket connects to the
+    /// direct-resolved address, not the caller's main-resolved one.
+    #[tokio::test]
+    async fn static_direct_proxy_follows_direct_nameserver() {
+        use meow_common::DnsMode;
+        use meow_dns::{HostEntry, Resolver};
+        use meow_trie::DomainTrie;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = echo.local_addr().unwrap().port();
+        let echo_task = tokio::spawn(async move {
+            let mut buf = [0u8; 16];
+            let (n, src) = echo.recv_from(&mut buf).await.unwrap();
+            echo.send_to(&buf[..n], src).await.unwrap();
+        });
+
+        let hosts_only = |ip: IpAddr| {
+            let mut hosts: DomainTrie<HostEntry> = DomainTrie::new();
+            hosts.insert("node.test", vec![ip].into());
+            Resolver::new(vec![], vec![], DnsMode::Normal, hosts, true, true)
+        };
+        let main_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let mut main = hosts_only(main_ip);
+        main.set_direct_resolver(Arc::new(hosts_only(IpAddr::V4(Ipv4Addr::LOCALHOST))));
+        let slot = meow_dns::new_resolver_slot(Arc::new(main));
+
+        let cfg = direct_config("name: 直连\ntype: direct\n");
+        let proxy = parse_static_proxy(&cfg, true, Some(&slot)).unwrap();
+        let meta = Metadata {
+            network: meow_common::Network::Udp,
+            host: "node.test".into(),
+            dst_ip: Some(main_ip),
+            dst_port: port,
+            ..Default::default()
+        };
+        let conn = proxy.dial_udp(&meta).await.expect("dial_udp");
+        conn.write_packet(b"ping", &SocketAddr::new(main_ip, port))
+            .await
+            .expect("write");
+        let mut buf = [0u8; 16];
+        let (n, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            conn.read_packet(&mut buf),
+        )
+        .await
+        .expect("reply from the direct-resolved address")
+        .expect("read");
+        assert_eq!(&buf[..n], b"ping");
+        echo_task.await.unwrap();
+    }
+
     #[test]
     fn parse_direct_without_connect_timeout_is_unbounded() {
         let cfg = direct_config("name: d\ntype: direct\n");
-        let adapter = parse_direct("d", &cfg, true).unwrap();
+        let adapter = parse_direct("d", &cfg, true, None).unwrap();
         assert_eq!(adapter.connect_timeout(), None);
     }
 
@@ -4041,6 +4331,49 @@ tls: true
     }
 
     #[cfg(feature = "anytls")]
+    const ANYTLS_BASE: &str =
+        "name: jp\ntype: anytls\nserver: 1.2.3.4\nport: 443\npassword: secret\n";
+
+    /// Issue #870: ECH would be silently dropped, leaking the SNI.
+    #[cfg(feature = "anytls")]
+    #[tokio::test]
+    async fn parse_anytls_rejects_enabled_ech_opts() {
+        for extra in ["ech-opts: {enable: true}\n", "ech-opts: {config: QUJD}\n"] {
+            let cfg = anytls_config(&format!("{ANYTLS_BASE}{extra}"));
+            let err = parse_proxy(&cfg).err().expect("must reject").to_string();
+            assert!(err.contains("ech-opts"), "{err}");
+        }
+    }
+
+    #[cfg(feature = "anytls")]
+    #[tokio::test]
+    async fn parse_anytls_allows_disabled_ech_opts() {
+        let cfg = anytls_config(&format!("{ANYTLS_BASE}ech-opts: {{enable: false}}\n"));
+        assert!(parse_proxy(&cfg).is_ok());
+    }
+
+    #[cfg(feature = "anytls")]
+    #[tokio::test]
+    async fn parse_anytls_rejects_client_certificate() {
+        for key in ["certificate", "private-key"] {
+            let cfg = anytls_config(&format!("{ANYTLS_BASE}{key}: abc\n"));
+            let err = parse_proxy(&cfg).err().expect("must reject").to_string();
+            assert!(err.contains(key), "{err}");
+        }
+    }
+
+    #[cfg(feature = "anytls")]
+    #[tokio::test]
+    async fn parse_anytls_ignored_options_still_parse() {
+        let cfg = anytls_config(&format!(
+            "{ANYTLS_BASE}shadow-tls-opts: {{}}\nrestls-opts: {{}}\njls-opts: {{}}\n\
+             client-metadata: {{a: b}}\nidle-session-check-interval: 30\n\
+             idle-session-timeout: 30\nmin-idle-session: 1\ndisable-reuse: true\n"
+        ));
+        assert!(parse_proxy(&cfg).is_ok());
+    }
+
+    #[cfg(feature = "anytls")]
     #[tokio::test]
     async fn parse_anytls_rejects_missing_password() {
         let cfg = anytls_config("name: jp\ntype: anytls\nserver: 1.2.3.4\nport: 443\n");
@@ -4059,6 +4392,59 @@ tls: true
             panic!("zero port must hard-error (Class A)");
         };
         assert!(err.contains("port must be non-zero"), "msg: {err}");
+    }
+
+    #[cfg(feature = "anytls")]
+    #[tokio::test]
+    async fn parse_anytls_rejects_invalid_fingerprint() {
+        for value in ["chrome", "not-hex", "abcd", "true", "[abc]", "{pin: abc}"] {
+            let cfg = anytls_config(&format!(
+                "name: jp\ntype: anytls\nserver: 127.0.0.1\nport: 443\npassword: secret\nfingerprint: {value}\nskip-cert-verify: true\n"
+            ));
+            let Err(err) = parse_proxy(&cfg) else {
+                panic!("invalid fingerprint {value} must not be ignored");
+            };
+            assert!(err.contains("fingerprint"), "msg: {err}");
+        }
+    }
+
+    #[cfg(feature = "anytls")]
+    #[tokio::test]
+    async fn parse_anytls_optional_fingerprint_formats() {
+        for value in [
+            "null".to_string(),
+            "''".to_string(),
+            format!("'{}'", "ab".repeat(32)),
+            format!("' {} '", ["AB"; 32].join(":")),
+        ] {
+            for skip_cert_verify in [false, true] {
+                let cfg = anytls_config(&format!(
+                    "name: jp\ntype: anytls\nserver: 127.0.0.1\nport: 443\npassword: secret\nfingerprint: {value}\nskip-cert-verify: {skip_cert_verify}\nname-cert-verify: localhost\nalpn: [h2, http/1.1]\nclient-fingerprint: chrome\n"
+                ));
+                assert!(parse_proxy(&cfg).is_ok(), "fingerprint: {value}");
+            }
+        }
+    }
+
+    #[cfg(feature = "anytls")]
+    #[tokio::test]
+    async fn parse_anytls_rejects_malformed_tls_options() {
+        for (field, value) in [
+            ("name-cert-verify", "true"),
+            ("name-cert-verify", "[localhost]"),
+            ("client-fingerprint", "[chrome]"),
+            ("alpn", "h2"),
+            ("alpn", "[h2, 42]"),
+            ("alpn", "['']"),
+        ] {
+            let cfg = anytls_config(&format!(
+                "name: jp\ntype: anytls\nserver: 127.0.0.1\nport: 443\npassword: secret\n{field}: {value}\n"
+            ));
+            let Err(err) = parse_proxy(&cfg) else {
+                panic!("malformed {field}: {value} must not be ignored");
+            };
+            assert!(err.contains(field), "msg: {err}");
+        }
     }
 
     // ─── hysteria2 parser ────────────────────────────────────────────────────
@@ -5465,7 +5851,7 @@ tls: true
     }
 
     /// Built-in in-process plugins and non-ss nodes are untouched by the gate.
-    #[cfg(feature = "ss")]
+    #[cfg(all(feature = "ss", feature = "trojan"))]
     #[test]
     fn provider_node_allows_builtin_plugins_and_other_types() {
         let cfg = proxy_config(
@@ -5498,7 +5884,7 @@ tls: true
     /// reject it on provider nodes, and `is_external_sip003_plugin` must
     /// agree (a misclassification would silently drop subscription nodes).
     /// `mux: false` keeps the fixture valid under a `ss`-without-`mux` build.
-    #[cfg(feature = "ss")]
+    #[cfg(feature = "gost-plugin")]
     #[test]
     fn provider_node_allows_gost_plugin() {
         assert!(!is_external_sip003_plugin(Some("gost-plugin")));
@@ -5518,7 +5904,7 @@ tls: true
 
     /// shadow-tls is a built-in in-process plugin too — the provider gate
     /// must route it through without `allow-external-plugin`.
-    #[cfg(feature = "ss")]
+    #[cfg(feature = "shadow-tls")]
     #[test]
     fn provider_node_allows_shadow_tls_plugin() {
         assert!(!is_external_sip003_plugin(Some("shadow-tls")));
@@ -5566,5 +5952,129 @@ tls: true
             .filter_map(|p| p.get("name").and_then(|v| v.as_str()))
             .collect();
         assert_eq!(names, ["ok", "plain"], "dropped: {names:?}");
+    }
+
+    // ─── feature-gated built-in plugins: disabled names fail cleanly ─────────
+    //
+    // Every name `is_builtin_sip003_plugin` lists is reserved: when its
+    // feature is compiled out the adapter must return a clean Config error
+    // ("not compiled into this build" — the same message that becomes the
+    // runtime placeholder's dial reason), never fall through to the external
+    // SIP003 `Plugin::start` spawn path. `is_external_sip003_plugin` must
+    // agree — a misclassified reserved name would be treated as external
+    // (spawned, or rejected/dropped by the provider gates).
+    #[cfg(feature = "ss")]
+    #[test]
+    fn disabled_builtin_plugins_error_cleanly_and_stay_reserved() {
+        for name in [
+            "gost-plugin",
+            "shadow-tls",
+            "restls",
+            "jls",
+            "kcptun",
+            "ech-tls-tunnel",
+        ] {
+            assert!(
+                !is_external_sip003_plugin(Some(name)),
+                "{name} stays a reserved built-in name when its feature is off"
+            );
+            let cfg = proxy_config(&format!(
+                "name: s\ntype: ss\nserver: 1.2.3.4\nport: 8388\npassword: p\ncipher: aes-128-gcm\n\
+                 plugin: {name}\n"
+            ));
+            match meow_proxy::shadowsocks_adapter::missing_plugin_feature(name) {
+                Some(feature) => {
+                    // Compiled out: the parse itself errors — that message is
+                    // what the runtime placeholder renders into every dial —
+                    // and the raw node must classify for the placeholder arm.
+                    let Err(err) = parse_proxy(&cfg) else {
+                        panic!("compiled-out {name} must not parse")
+                    };
+                    assert!(
+                        err.contains("not compiled into this build"),
+                        "{name}: msg: {err}"
+                    );
+                    assert!(err.contains(name), "{name}: msg: {err}");
+                    assert!(err.contains(feature), "{name}: msg: {err}");
+                    assert_eq!(
+                        placeholder_adapter_type(&cfg),
+                        Some(meow_common::AdapterType::Shadowsocks),
+                        "a missing-plugin node must classify as an ss placeholder"
+                    );
+                }
+                None => {
+                    // Compiled in: construction may succeed outright (kcptun
+                    // defaults suffice) or fail on the plugin's own opts
+                    // validation — either way it must never report the
+                    // missing-feature error or classify for the placeholder.
+                    assert_eq!(placeholder_adapter_type(&cfg), None);
+                    if let Err(err) = parse_proxy(&cfg) {
+                        assert!(
+                            !err.contains("not compiled into this build"),
+                            "compiled-in {name} must not report the missing-feature error: {err}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A `plugin:` value that is not a string is a malformed node — never
+    /// silently treated as "no plugin" (that would dial plain SS while the
+    /// operator configured a transport plugin). `null` is the exception:
+    /// Go's `Plugin string` unmarshals it to the zero value, so the key
+    /// counts as unset exactly like an absent one (mihomo parity).
+    #[cfg(feature = "ss")]
+    #[test]
+    fn non_string_plugin_value_is_a_parse_error() {
+        for plugin in ["123", "true", "{mode: http}", "[obfs]"] {
+            let cfg = proxy_config(&format!(
+                "name: s\ntype: ss\nserver: 1.2.3.4\nport: 8388\npassword: p\ncipher: aes-128-gcm\n\
+                 plugin: {plugin}\n"
+            ));
+            let Err(err) = parse_proxy(&cfg) else {
+                panic!("plugin: {plugin} must not parse as plain ss")
+            };
+            assert!(
+                err.contains("`plugin` must be a string"),
+                "plugin: {plugin}: {err}"
+            );
+        }
+    }
+
+    /// `plugin: null` is Go's zero value — the node parses as plain SS
+    /// with no plugin, exactly like an absent `plugin:` key.
+    #[cfg(feature = "ss")]
+    #[test]
+    fn null_plugin_value_means_no_plugin() {
+        let cfg = proxy_config(
+            "name: s\ntype: ss\nserver: 1.2.3.4\nport: 8388\npassword: p\ncipher: aes-128-gcm\n\
+             plugin: null\n",
+        );
+        let proxy = parse_proxy(&cfg).expect("plugin: null parses as plain ss");
+        assert_eq!(proxy.name(), "s");
+    }
+
+    /// The dispatch is exact (`"ss"` only, like mihomo) while
+    /// [`node_needs_missing_plugin`] is forgiving like
+    /// [`node_is_trusttunnel`]: a misspelled `type` plus a compiled-out
+    /// plugin still classifies for the dead placeholder, so a group that
+    /// names the node keeps it bound instead of warn-dropping.
+    #[cfg(all(feature = "ss", not(feature = "gost-plugin")))]
+    #[test]
+    fn misspelled_ss_type_with_missing_plugin_still_classifies() {
+        let cfg = proxy_config(
+            "name: s\ntype: 'Ss '\nserver: 1.2.3.4\nport: 8388\npassword: p\ncipher: aes-128-gcm\n\
+             plugin: gost-plugin\n",
+        );
+        assert!(
+            parse_proxy(&cfg).is_err(),
+            "the exact dispatch still rejects the misspelled type"
+        );
+        assert_eq!(
+            placeholder_adapter_type(&cfg),
+            Some(meow_common::AdapterType::Shadowsocks),
+            "the lenient classifier still lands the node on the placeholder arm"
+        );
     }
 }

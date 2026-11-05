@@ -135,6 +135,27 @@ Glob matcher: reuse `meow-trie::DomainTrie` for `skip-domain` and
 `force-domain`. The existing trie already handles `+.example.com`,
 `*.example.com`, and literal matches. No new matcher code.
 
+### Sniffed-name adoption priority
+
+A sniffed name is adopted into `Metadata.sniff_host` only when the flow
+has no routing name of its own — `Metadata.host` empty or an IP literal.
+When `host` already carries an explicit domain authority (a CONNECT
+target, an absolute-form URI authority, a SOCKS5 domain), that authority
+wins and the sniff is discarded: rule matching reads `sniff_host` while
+the dial uses `host`, so adopting a conflicting name would route by one
+host yet dial the other — `GET http://evil.com/` + `Host: good.example`
+would miss `DOMAIN,evil.com,REJECT` and still dial evil.com.
+
+Two opt-ins beat that priority. `override-destination: true` rewrites
+`host` itself with the sniffed name, keeping rules and dial consistent,
+and stays unconditional. And a `force-domain` entry matching
+`metadata.host` adopts the sniffed name into `sniff_host` even against a
+domain authority — that is exactly what the list is for: "route this
+authority by the name on the wire" (a CDN front whose real SNI the
+authority hides). `force-domain` therefore still does something under
+`override-destination: false`: rules see the sniffed name, the dial
+keeps the authority — the CDN-front contract.
+
 ### Trojan cert-validation gotcha (documented loudly)
 
 With `override-destination: false` (the default, matching upstream), a

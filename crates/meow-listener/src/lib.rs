@@ -5,6 +5,16 @@
 
 pub mod sniffer;
 
+// Inbound-socket TCP keepalive applied at accept time — compiled only when
+// at least one TCP listener that calls it is enabled (a listener-less
+// build would otherwise trip dead-code lints on it).
+#[cfg(any(
+    feature = "listener-mixed",
+    feature = "listener-tproxy",
+    feature = "listener-shadowsocks"
+))]
+mod keepalive;
+
 pub const DEFAULT_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Process-wide monotonic timestamp in milliseconds. Used by UDP flow tables

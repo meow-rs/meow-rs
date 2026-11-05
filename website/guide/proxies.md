@@ -50,7 +50,7 @@ Several protocols are gated behind Cargo features (`ss`, `trojan`, `vless`, `vme
 | `password` | string | ✓ | — | |
 | `cipher` | string | ✓ | — | e.g. `aes-256-gcm`, `chacha20-ietf-poly1305` |
 | `udp` | bool | | `false` | Enable UDP relay |
-| `plugin` | string | | — | `obfs`, `v2ray-plugin`, `gost-plugin`, `shadow-tls`, `restls`, `jls`, `kcptun`, `ech-tls-tunnel` (built-in, no external binary) |
+| `plugin` | string | | — | `obfs`/`simple-obfs`, `v2ray-plugin` (bundled with `ss`); `gost-plugin`, `shadow-tls`, `restls`, `jls`, `kcptun`, `ech-tls-tunnel` (built-in, no external binary — each behind its same-named Cargo feature: all ship in `full`/default builds, none in `minimal`; enable with `--features <name>`, see the [feature-flags table](https://github.com/madeye/meow-rs/blob/main/docs/specs/cargo-feature-flags.md). A name the build lacks still loads, but the node stays unavailable and every dial through it fails with "not compiled into this build") |
 | `plugin-opts` | string \| map | | — | Plugin options |
 
 ```yaml
@@ -69,7 +69,8 @@ Several protocols are gated behind Cargo features (`ss`, `trojan`, `vless`, `vme
 
 `gost-plugin` runs in-process too — a WebSocket transport with optional
 TLS and smux. Upstream defaults apply: `host` defaults to `bing.com` and
-`mux` to `true` (a fresh smux session per connection).
+`mux` to `true` (a fresh smux session per connection; the `gost-plugin`
+feature pulls `mux` in, so that default always works).
 
 ```yaml
 - name: ss-gost
@@ -381,8 +382,20 @@ Obfuscated-TLS outbound (requires the `anytls` feature).
 | `port` | u16 | ✓ | — | |
 | `password` | string | ✓ | — | |
 | `sni` | string | | — | |
-| `skip-cert-verify` | bool | | `false` | |
+| `skip-cert-verify` | bool | | `false` | Ignored when `fingerprint` or `name-cert-verify` is set |
+| `fingerprint` | string | | — | Pinned cert SHA-256 of the DER (hex, `:` separators and case optional). A leaf match is the identity; a CA match verifies the leaf under it plus the name |
+| `name-cert-verify` | string | | — | Verify the certificate for this name instead of `sni` (SNI unchanged) |
+| `client-fingerprint` | string | | — | uTLS profile shaping the ClientHello (`none` = default) |
+| `alpn` | list | | — | ALPN protocols, offered in order |
 | `udp` | bool | | `false` | Enable UDP relay (sing-box udp-over-tcp v2) |
+
+Unsupported mihomo options: an enabled `ech-opts` and `certificate` /
+`private-key` (client certificate) are refused at config load, since
+ignoring them would send the SNI in the clear or skip client auth
+(`ech-opts: {enable: false}` is accepted). `shadow-tls-opts`, `restls-opts`,
+`jls-opts`, `client-metadata`, `idle-session-check-interval`,
+`idle-session-timeout`, `min-idle-session` and `disable-reuse` are ignored
+with a load-time warning naming them.
 
 ---
 
