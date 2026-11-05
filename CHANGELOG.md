@@ -10,6 +10,14 @@ the canonical, in-repo source a release is cut from.
 
 ### Added
 
+- `redir-port` / `listeners: type: redir`: mihomo's REDIRECT inbound, rules
+  owned by the deployer. `listeners: type: tproxy` takes `transparent: true`
+  for TCP by real TPROXY (`IP_TRANSPARENT`, Linux, needs `firewall: false`).
+- `routing-mark` sets `SO_MARK` on every outbound socket meow opens (proxy
+  servers, DIRECT TCP/UDP, DNS, health checks, provider fetches), as mihomo;
+  `PUT /configs` applies a new mark, and refuses one while meow's managed
+  tproxy rules exempt the current mark. `GET /configs` reports the live mark.
+  Not marked: inbound/reply sockets and SIP003 plugin subprocesses.
 - **mihomo dashboard parity** (#882): `GET /rules` reports mihomo's type
   names and the `extra` object (`disabled`, `hitCount`, `hitAt`);
   `PATCH /rules/disable` switches rules off, the switch following its rule

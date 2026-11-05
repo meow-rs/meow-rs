@@ -805,29 +805,7 @@ mod linux {
         SocketAddr::new(IpAddr::V4(ip), u16::from_be(sa.sin_port))
     }
 
-    /// Whether a kernel-recovered `orig_dst` is a plausible client
-    /// destination. Self-targeting: a datagram aimed at the listener's
-    /// own endpoint (stray direct traffic, or a deployer who also
-    /// steers OUTPUT) would otherwise self-reinject — the outbound
-    /// write lands back in this socket and each round spawns a fresh
-    /// flow until the cap. On a wildcard listen we cannot enumerate
-    /// local addresses, so ANY orig_dst sharing the listener port is
-    /// treated as self — a conservative over-block: a remote UDP
-    /// service on the same port number is unreachable through a
-    /// `0.0.0.0`-bound `udp: true` listener. Port 0, unspecified,
-    /// loopback, multicast, and broadcast can never be a real
-    /// LAN-client destination either.
-    fn is_safe_orig_dst(orig_dst: SocketAddr, local_addr: SocketAddr) -> bool {
-        let dst_ip = orig_dst.ip();
-        let self_target = orig_dst.port() == local_addr.port()
-            && (orig_dst == local_addr || local_addr.ip().is_unspecified());
-        !(orig_dst.port() == 0
-            || self_target
-            || dst_ip.is_unspecified()
-            || dst_ip.is_loopback()
-            || dst_ip.is_multicast()
-            || dst_ip == IpAddr::V4(Ipv4Addr::BROADCAST))
-    }
+    use super::super::is_safe_orig_dst;
 
     /// Binds a spawned task's lifetime to a scope: when the owning task's
     /// frame is dropped (abort/cancellation — `run_udp` itself never

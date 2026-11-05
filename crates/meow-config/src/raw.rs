@@ -499,6 +499,9 @@ pub struct RawListener {
     #[serde(default)]
     pub udp: Option<bool>,
     pub simple_obfs: Option<RawSimpleObfs>,
+    /// `tproxy`: take TCP by real TPROXY (`IP_TRANSPARENT`; mihomo's
+    /// `type: tproxy`) instead of REDIRECT. Requires `firewall: false`.
+    pub transparent: Option<bool>,
 
     // ── upstream sub-options not yet supported by meow-rs ──
     // Captured as opaque `Value`s so their mere presence can be warned about

@@ -355,9 +355,14 @@ impl TProxyListener {
         if !self.firewall {
             info!(
                 "TProxy listener '{}': external firewall management — no rules \
-                 installed or cleaned up; TCP REDIRECT (and loop-prevention \
+                 installed or cleaned up; TCP {} (and loop-prevention \
                  bypass) is the deployer's responsibility",
-                self.name
+                self.name,
+                if self.transparent {
+                    "TPROXY"
+                } else {
+                    "REDIRECT"
+                }
             );
         }
 
@@ -574,7 +579,14 @@ pub fn bind_tcp(addr: SocketAddr, transparent: bool) -> std::io::Result<TcpListe
                 )
             };
             if ret != 0 {
-                return Err(std::io::Error::last_os_error());
+                let e = std::io::Error::last_os_error();
+                if e.raw_os_error() == Some(libc::EPERM) {
+                    return Err(std::io::Error::new(
+                        e.kind(),
+                        format!("IP_TRANSPARENT: {e} (needs CAP_NET_ADMIN)"),
+                    ));
+                }
+                return Err(e);
             }
         }
         #[cfg(not(target_os = "linux"))]
@@ -585,6 +597,30 @@ pub fn bind_tcp(addr: SocketAddr, transparent: bool) -> std::io::Result<TcpListe
     }
     socket.bind(addr)?;
     socket.listen(1024)
+}
+
+/// Whether a kernel-recovered `orig_dst` is a plausible client
+/// destination. Self-targeting: a datagram aimed at the listener's
+/// own endpoint (stray direct traffic, or a deployer who also
+/// steers OUTPUT) would otherwise self-reinject — the outbound
+/// write lands back in this socket and each round spawns a fresh
+/// flow until the cap. On a wildcard listen we cannot enumerate
+/// local addresses, so ANY orig_dst sharing the listener port is
+/// treated as self — a conservative over-block: a remote UDP
+/// service on the same port number is unreachable through a
+/// `0.0.0.0`-bound `udp: true` listener (or TCP port, for the TCP path). Port 0, unspecified,
+/// loopback, multicast, and broadcast can never be a real
+/// LAN-client destination either.
+pub(super) fn is_safe_orig_dst(orig_dst: SocketAddr, local_addr: SocketAddr) -> bool {
+    let dst_ip = orig_dst.ip();
+    let self_target = orig_dst.port() == local_addr.port()
+        && (orig_dst == local_addr || local_addr.ip().is_unspecified());
+    !(orig_dst.port() == 0
+        || self_target
+        || dst_ip.is_unspecified()
+        || dst_ip.is_loopback()
+        || dst_ip.is_multicast()
+        || dst_ip == IpAddr::V4(std::net::Ipv4Addr::BROADCAST))
 }
 
 async fn handle_tproxy_conn(
@@ -605,9 +641,12 @@ async fn handle_tproxy_conn(
         orig_dest::get_original_dst(&stream, listen_addr)?
     };
 
-    // Skip connections where original dest equals listen addr (self-connection)
-    if orig_dst == listen_addr {
-        return Err("original destination is the listen address (loop detected)".into());
+    // Self-connection and junk destinations, as on the UDP path: on a
+    // wildcard bind any same-port destination is the listener itself (a
+    // stray connect would otherwise dial back in and loop until the
+    // connection cap).
+    if !is_safe_orig_dst(orig_dst, listen_addr) {
+        return Err(format!("original destination {orig_dst} is not routable (loop guard)").into());
     }
 
     handle_tproxy_flow(
