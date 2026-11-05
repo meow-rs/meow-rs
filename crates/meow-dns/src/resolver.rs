@@ -1,7 +1,7 @@
 use crate::cache::{DnsCache, DnsCacheSnapshotEntry, FamilyCacheHit, FamilyNeg, QueryFamilies};
 use crate::client::{prefer_errno, ClientError, DnsClient, FamilyAnswer, FamilySet};
 use crate::fakeip::{Pool, Skipper};
-use crate::upstream::{HostOrIp, NameServerEntry, NameServerUrl};
+use crate::upstream::{H3Policy, HostOrIp, NameServerEntry, NameServerUrl};
 use dashmap::DashMap;
 use futures::stream::{FuturesUnordered, StreamExt};
 use hickory_proto::op::Message;
@@ -371,7 +371,9 @@ fn url_to_plain_socketaddr(url: &NameServerUrl) -> SocketAddr {
             };
             SocketAddr::new(ip, *port)
         }
-        NameServerUrl::Tls { addr, .. } | NameServerUrl::Https { addr, .. } => {
+        NameServerUrl::Tls { addr, .. }
+        | NameServerUrl::Https { addr, .. }
+        | NameServerUrl::Quic { addr, .. } => {
             let ip = match addr {
                 HostOrIp::Ip(ip) => *ip,
                 HostOrIp::Host(_) => {
@@ -702,8 +704,28 @@ fn encrypted_upstream_label(url: &NameServerUrl) -> Option<String> {
             port,
             path,
             sni,
+            h3,
         } => {
             let mut label = format!("https://{}{}", authority_label(addr, *port, 443), path);
+            match h3 {
+                H3Policy::Off => {}
+                H3Policy::Prefer => {
+                    label.push_str(crate::upstream::h3_parameter_separator(path));
+                    label.push_str("h3=prefer");
+                }
+                H3Policy::Force => {
+                    label.push_str(crate::upstream::h3_parameter_separator(path));
+                    label.push_str("h3=true");
+                }
+            }
+            if sni != &addr.to_string() {
+                label.push('#');
+                label.push_str(sni);
+            }
+            Some(label)
+        }
+        NameServerUrl::Quic { addr, port, sni } => {
+            let mut label = format!("quic://{}", authority_label(addr, *port, 853));
             if sni != &addr.to_string() {
                 label.push('#');
                 label.push_str(sni);
@@ -919,7 +941,9 @@ impl Resolver {
             // when `X` happens to be a real proxy name. Warn loudly so the
             // user can switch to `?proxy=X`.
             let sni = match &entry.url {
-                NameServerUrl::Tls { sni, .. } | NameServerUrl::Https { sni, .. } => sni.as_str(),
+                NameServerUrl::Tls { sni, .. }
+                | NameServerUrl::Https { sni, .. }
+                | NameServerUrl::Quic { sni, .. } => sni.as_str(),
                 _ => continue,
             };
             if proxy_registry.contains_key(sni) {
@@ -979,7 +1003,12 @@ impl Resolver {
                     continue;
                 }
                 if first_encrypted_with_hostname.is_none()
-                    && matches!(url, NameServerUrl::Tls { .. } | NameServerUrl::Https { .. })
+                    && matches!(
+                        url,
+                        NameServerUrl::Tls { .. }
+                            | NameServerUrl::Https { .. }
+                            | NameServerUrl::Quic { .. }
+                    )
                 {
                     first_encrypted_with_hostname = Some(url.to_string());
                 }
@@ -1150,7 +1179,8 @@ impl Resolver {
             NameServerUrl::Udp { addr, port }
             | NameServerUrl::Tcp { addr, port }
             | NameServerUrl::Tls { addr, port, .. }
-            | NameServerUrl::Https { addr, port, .. } => {
+            | NameServerUrl::Https { addr, port, .. }
+            | NameServerUrl::Quic { addr, port, .. } => {
                 let proxy_target = match (addr, proxy.is_some()) {
                     (HostOrIp::Host(host), true) => Some((Arc::from(host.as_str()), *port)),
                     _ => None,
@@ -1210,17 +1240,46 @@ impl Resolver {
                     )
                 }
             }
-            NameServerUrl::Https { sni, path, .. } => {
-                #[cfg(feature = "encrypted")]
+            NameServerUrl::Https { sni, path, h3, .. } => {
+                #[cfg(feature = "quic-dns")]
                 {
+                    match h3 {
+                        H3Policy::Off => DnsClient::doh(socket_addr, sni, path),
+                        H3Policy::Prefer => DnsClient::doh3(socket_addr, sni, path),
+                        H3Policy::Force => DnsClient::doh3_force(socket_addr, sni, path),
+                    }
+                }
+                #[cfg(all(feature = "encrypted", not(feature = "quic-dns")))]
+                {
+                    let _ = h3;
+                    if h3.is_enabled() {
+                        panic!(
+                            "nameserver requests HTTP/3 (prefer-h3 / ?h3=) which requires \
+                            the 'quic-dns' Cargo feature; rebuild with --features quic-dns"
+                        );
+                    }
                     DnsClient::doh(socket_addr, sni, path)
                 }
                 #[cfg(not(feature = "encrypted"))]
                 {
-                    let _ = (sni, path);
+                    let _ = (sni, path, h3);
                     panic!(
                         "nameserver uses scheme 'https' which requires the 'encrypted' \
                         Cargo feature; rebuild with --features encrypted"
+                    )
+                }
+            }
+            NameServerUrl::Quic { sni, .. } => {
+                #[cfg(feature = "quic-dns")]
+                {
+                    DnsClient::doq(socket_addr, sni)
+                }
+                #[cfg(not(feature = "quic-dns"))]
+                {
+                    let _ = sni;
+                    panic!(
+                        "nameserver uses scheme 'quic' which requires the 'quic-dns' \
+                        Cargo feature; rebuild with --features quic-dns"
                     )
                 }
             }

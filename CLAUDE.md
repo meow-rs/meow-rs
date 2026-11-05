@@ -157,6 +157,9 @@ cargo test -p meow-listener --all-features --lib udp_port_53
 # The `anytls` feature is opt-in in meow-proxy — the adapter's uot/desync
 # tests never compile under its default features.
 cargo test -p meow-proxy --features anytls --lib
+# DNS over QUIC / DoH3 are behind `dns-quic`; the peer is an in-process quiche
+# server, so this suite needs no network.
+cargo test -p meow-dns --features quic-dns --test quic_dns_integration
 
 # TrustTunnel is opt-in; its wire tests and parser/adapter integration need
 # explicit feature runs, including the disabled-feature parser contract.

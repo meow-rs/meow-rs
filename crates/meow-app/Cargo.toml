@@ -79,6 +79,9 @@ gost-plugin = ["ss", "meow-config/gost-plugin", "meow-proxy/gost-plugin"]
 # DNS
 dns-server = ["meow-dns/dns-server"]
 dns-encrypted = ["meow-dns/encrypted"]
+# DNS over QUIC (`quic://`) and DoH over HTTP/3 (`dns.prefer-h3` / `?h3=`).
+# In the `full` bundle; `minimal` leaves quiche out (ADR-0007 size caps).
+dns-quic = ["meow-config/dns-quic", "meow-dns/quic-dns"]
 
 # Listener features — forwarded to meow-listener
 listener-http = ["meow-listener/listener-http"]
@@ -99,7 +102,7 @@ minimal = ["ss", "trojan", "dns-server", "listener-mixed"]
 full = [
     "ss", "trojan", "vless", "vless-vision", "vless-encryption", "vmess", "snell", "hysteria2", "anytls", "ech-tls-tunnel", "mux", "kcptun",
     "shadow-tls", "restls", "jls", "gost-plugin",
-    "dns-server", "dns-encrypted",
+    "dns-server", "dns-encrypted", "dns-quic",
     "listener-http", "listener-socks5", "listener-tproxy", "listener-mixed", "listener-tun",
     "listener-shadowsocks",
     "logbook",
