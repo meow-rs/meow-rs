@@ -57,7 +57,44 @@ const SWEEP_INTERVAL: u32 = 256;
 
 /// `(payload, packet source, packet destination)` — the netstack `UdpMsg`
 /// layout, so a reply to a flow is sent as `(payload, dst, src)`.
-type ReplyMsg = (Vec<u8>, SocketAddr, SocketAddr);
+pub(super) type ReplyMsg = (Vec<u8>, SocketAddr, SocketAddr);
+
+/// A client datagram: `(payload, client source, destination)`.
+pub(super) type UdpPkt = lwip::UdpPkt;
+
+/// Where the TUN's UDP comes from and its replies go.
+pub(super) enum UdpIo {
+    /// lwIP's packet-level UDP socket.
+    Lwip(Box<UdpSocket>),
+    /// Straight from and to the device pumps (`tun.stack: system`): the
+    /// inbound pump parses each datagram off the device, the outbound pump
+    /// builds the reply packets — no netstack in between.
+    Direct {
+        incoming: mpsc::Receiver<UdpPkt>,
+        replies: mpsc::Sender<ReplyMsg>,
+    },
+}
+
+/// The datagram source of [`run_udp`].
+enum Incoming {
+    Lwip(lwip::UdpRecvHalf),
+    Direct(mpsc::Receiver<UdpPkt>),
+}
+
+impl Incoming {
+    async fn next(&mut self) -> Option<UdpPkt> {
+        match self {
+            Self::Lwip(r) => r.next().await,
+            Self::Direct(r) => r.recv().await,
+        }
+    }
+}
+
+/// Capacity of the pump → [`run_udp`] datagram queue (system stack); a
+/// full queue drops the datagram, as a socket buffer would.
+pub(super) const DIRECT_QUEUE: usize = 1024;
+/// Capacity of the [`run_udp`] → pump reply queue (system stack).
+pub(super) const DIRECT_REPLY_QUEUE: usize = REPLY_QUEUE;
 
 /// `(client source, packet destination)` — the flow-table key.
 type FlowKey = (SocketAddr, SocketAddr);
@@ -84,28 +121,33 @@ struct FlowEntry {
 
 pub(super) async fn run_udp(
     tunnel: Tunnel,
-    socket: Box<UdpSocket>,
+    io: UdpIo,
     dns_hijack: bool,
     udp_timeout: Duration,
     in_name: String,
     tun_net: TunNets,
     live_flows: Arc<AtomicUsize>,
 ) {
-    let (write_half, mut read_half) = socket.split();
-
-    let (reply_tx, mut reply_rx) = mpsc::channel::<ReplyMsg>(REPLY_QUEUE);
-    tokio::spawn(async move {
-        while let Some((data, src, dst)) = reply_rx.recv().await {
-            // `send_to(data, src, dst)`: appear as `src`, deliver to `dst`.
-            if let Err(e) = write_half.send_to(&data, &src, &dst) {
-                if e.kind() == std::io::ErrorKind::WouldBlock {
-                    continue;
+    let (reply_tx, mut incoming) = match io {
+        UdpIo::Lwip(socket) => {
+            let (write_half, read_half) = socket.split();
+            let (reply_tx, mut reply_rx) = mpsc::channel::<ReplyMsg>(REPLY_QUEUE);
+            tokio::spawn(async move {
+                while let Some((data, src, dst)) = reply_rx.recv().await {
+                    // `send_to(data, src, dst)`: appear as `src`, deliver to `dst`.
+                    if let Err(e) = write_half.send_to(&data, &src, &dst) {
+                        if e.kind() == std::io::ErrorKind::WouldBlock {
+                            continue;
+                        }
+                        debug!("tun UDP write half closed: {e}");
+                        break;
+                    }
                 }
-                debug!("tun UDP write half closed: {e}");
-                break;
-            }
+            });
+            (reply_tx, Incoming::Lwip(read_half))
         }
-    });
+        UdpIo::Direct { incoming, replies } => (replies, Incoming::Direct(incoming)),
+    };
 
     // Flow table, touched only by this loop. A flow task signals its own
     // death by closing its queue; the entry is evicted lazily — on the next
@@ -116,7 +158,7 @@ pub(super) async fn run_udp(
     let hijack_permits = Arc::new(tokio::sync::Semaphore::new(HIJACK_IN_FLIGHT));
     let hijack_dropped = AtomicU64::new(0);
 
-    while let Some((data, src, dst)) = read_half.next().await {
+    while let Some((data, src, dst)) = incoming.next().await {
         if dns_hijack && dst.port() == 53 {
             let resolver = tunnel.resolver();
             debug!(

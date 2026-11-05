@@ -320,6 +320,19 @@ pub async fn handle_tcp(
     route_inbound_tcp(tunnel, &mut conn, metadata, &prefix).await;
 }
 
+/// [`handle_tcp`] for an inbound that hands over a kernel socket with a
+/// known original destination (the TUN's system stack). The
+/// name sniff peeks instead of reading, so no prefix is replayed and a
+/// DIRECT relay splices in the kernel.
+pub async fn handle_tcp_socket(
+    tunnel: &TunnelInner,
+    mut conn: tokio::net::TcpStream,
+    mut metadata: Metadata,
+) {
+    crate::sniff::sniff_unnamed_peek(tunnel, &conn, &mut metadata).await;
+    route_inbound_tcp(tunnel, &mut conn, metadata, &[]).await;
+}
+
 /// Route a decrypted inbound TCP connection through the rule engine and relay
 /// it to the matched proxy.
 ///

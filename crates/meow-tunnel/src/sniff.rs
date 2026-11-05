@@ -53,6 +53,43 @@ where
     prefix
 }
 
+/// [`sniff_unnamed`] for a kernel socket: the first bytes
+/// are peeked, not read, so they stay queued in the socket — nothing has to
+/// be replayed and a DIRECT relay can still splice. A ClientHello split
+/// across segments is re-peeked until it is whole or the window ends.
+pub(crate) async fn sniff_unnamed_peek(
+    tunnel: &TunnelInner,
+    conn: &tokio::net::TcpStream,
+    metadata: &mut Metadata,
+) {
+    if !tunnel.needs_sniffed_name(metadata) {
+        return;
+    }
+    let deadline = tokio::time::Instant::now() + SNIFF_WINDOW;
+    let mut buf = vec![0u8; SNIFF_CAP];
+    let mut n = 0;
+    loop {
+        match tokio::time::timeout_at(deadline, conn.peek(&mut buf)).await {
+            Ok(Ok(read)) if read > 0 => n = read,
+            _ => break,
+        }
+        if n == buf.len() || !tls_record_incomplete(&buf[..n]) {
+            break;
+        }
+        // More of the record is on its way; peek returns at once while any
+        // data is queued, so pace the retries.
+        if tokio::time::timeout_at(deadline, tokio::time::sleep(Duration::from_millis(5)))
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+    if let Some(name) = sniff_tls(&buf[..n]).or_else(|| sniff_http(&buf[..n])) {
+        metadata.sniff_host = name;
+    }
+}
+
 /// Read the client's first bytes within `window`. Keeps reading while the
 /// buffer holds the start of a TLS record that is not complete yet; any
 /// other payload parses on the first chunk. A read dropped at the deadline
@@ -221,6 +258,28 @@ mod tests {
         assert_eq!(md.sniff_host, "split.example.com");
         assert_eq!(prefix, hello);
         assert_eq!(prefix.capacity(), prefix.len(), "sniff buffer trimmed");
+    }
+
+    /// The kernel-socket variant (TUN system stack) peeks: the name is
+    /// found, a split ClientHello is gathered, and every byte is still
+    /// queued for the relay.
+    #[tokio::test]
+    async fn peek_sniff_names_the_flow_and_leaves_the_bytes_queued() {
+        let tunnel = mobile_tunnel();
+        let (mut client, mut server) = stream_pair().await;
+        let hello = client_hello("peek.example.com");
+        let (head, tail) = hello.split_at(10);
+        client.write_all(head).await.unwrap();
+        let tail = tail.to_vec();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            client.write_all(&tail).await.unwrap();
+        });
+
+        let mut md = tcp_to(SURGE_FAKE_IP, 443);
+        sniff_unnamed_peek(tunnel.inner(), &server, &mut md).await;
+        assert_eq!(md.sniff_host, "peek.example.com");
+        assert_eq!(relayed(Vec::new(), &mut server, hello.len()).await, hello);
     }
 
     #[tokio::test]

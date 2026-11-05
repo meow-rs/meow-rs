@@ -313,6 +313,20 @@ pub struct TunConfig {
     /// loop has no listen-queue back-pressure of its own — this is what
     /// stops a reconnect storm from spawning unbounded `handle_tcp` tasks.
     pub max_connections: usize,
+    /// Which stack terminates the TUN's TCP (`tun.stack`).
+    pub stack: TunStack,
+}
+
+/// `tun.stack`. `system` and `mixed` hand TCP to the host
+/// kernel's stack, as mihomo's system stack does (Linux; elsewhere the
+/// listener falls back to lwIP); anything else (`gvisor`, `lwip`, unset)
+/// keeps the userspace lwIP stack. Under `system` UDP is handled in the
+/// pump (fragments and ICMP still go to lwIP).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TunStack {
+    #[default]
+    Lwip,
+    System,
 }
 
 /// Scope of the routes `tun.auto-route` installs (#375).
@@ -360,6 +374,7 @@ impl Default for TunConfig {
             dns_hijack: true,
             udp_timeout: std::time::Duration::from_secs(60),
             max_connections: 256,
+            stack: TunStack::Lwip,
         }
     }
 }
@@ -415,7 +430,6 @@ pub fn parse_tun_config(
     // Warn on upstream-only fields (Class B per ADR-0002; policy of #328:
     // never silently ignore a mihomo flag).
     for (name, val) in [
-        ("stack", &r.stack),
         ("strict-route", &r.strict_route),
         ("auto-detect-interface", &r.auto_detect_interface),
         ("auto-redirect", &r.auto_redirect),
@@ -524,7 +538,33 @@ pub fn parse_tun_config(
         dns_hijack,
         udp_timeout,
         max_connections: global_max_connections.unwrap_or(defaults.max_connections),
+        stack: parse_tun_stack(r.stack.as_ref()),
     })
+}
+
+fn parse_tun_stack(raw: Option<&serde_json::Value>) -> TunStack {
+    let Some(value) = raw else {
+        return TunStack::Lwip;
+    };
+    match value.as_str().map(str::to_ascii_lowercase).as_deref() {
+        Some("system") => TunStack::System,
+        Some("mixed") => {
+            warn!(
+                "tun.stack: mixed is system here — kernel TCP, and UDP parsed in \
+                 the pump rather than by a userspace stack"
+            );
+            TunStack::System
+        }
+        Some("gvisor") => {
+            warn!("tun.stack: gvisor is not available; using the userspace (lwip) stack");
+            TunStack::Lwip
+        }
+        Some("lwip" | "") => TunStack::Lwip,
+        _ => {
+            warn!("tun.stack: unknown value {value}; using the userspace (lwip) stack");
+            TunStack::Lwip
+        }
+    }
 }
 
 /// `tun.inet6-address` (#375): one IPv6 CIDR, as a string or as mihomo's
