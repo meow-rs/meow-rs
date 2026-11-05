@@ -568,34 +568,55 @@ async fn run_session(
     });
     let _reply_guard = AbortOnDrop(reply_task.abort_handle());
 
-    // Select on the whole writer: a pending packet write must still lose
-    // to a flush or a failed reply reader. The reader owns its read future
-    // across writes, including reads of partially consumed stream frames.
+    // The writer owns the send side. Selecting on the whole future (rather
+    // than awaiting write_packet inside the select! arms) ensures that a
+    // pending write is cancelled — and the poisoned conn is closed — when
+    // either external condition fires first. Any payloads still queued in
+    // `rx` are discarded along with the session; UDP callers retry on the
+    // next datagram. The reader owns its read future across writes,
+    // including reads of partially consumed stream frames.
     let writer = async {
-        while let Some(payload) = rx.recv().await {
-            match conn.write_packet(&payload, &dst_addr).await {
-                Ok(n) if n == payload.len() => {
-                    last_activity_ms.store(
-                        monotonic_ms() as meow_common::atomic::Uint,
-                        Ordering::Relaxed,
-                    );
-                }
-                Ok(n) => {
+        loop {
+            match rx.recv().await {
+                None => {
+                    // All senders dropped — session evicted from the NAT
+                    // table. Normal exit; no re-dial needed.
                     debug!(
-                        "SOCKS5 UDP session to {dst_addr}: short upstream write {n}/{}",
-                        payload.len()
+                        "SOCKS5 UDP session to {dst_addr}: sender queue closed; session evicted"
                     );
                     break;
                 }
-                Err(e) => {
-                    debug!("SOCKS5 UDP session to {dst_addr}: upstream write: {e}");
-                    break;
-                }
+                Some(payload) => match conn.write_packet(&payload, &dst_addr).await {
+                    Ok(n) if n == payload.len() => {
+                        last_activity_ms.store(
+                            monotonic_ms() as meow_common::atomic::Uint,
+                            Ordering::Relaxed,
+                        );
+                    }
+                    Ok(n) => {
+                        // Short writes are not expected from any current
+                        // ProxyPacketConn implementation (datagram
+                        // semantics: the frame is either accepted whole or
+                        // rejected), but the trait contract allows it.
+                        // Retire the session; the next datagram re-dials.
+                        debug!(
+                            "SOCKS5 UDP session to {dst_addr}: short upstream write {n}/{}; next datagram re-dials",
+                            payload.len()
+                        );
+                        break;
+                    }
+                    Err(e) => {
+                        debug!("SOCKS5 UDP session to {dst_addr}: upstream write: {e}; next datagram re-dials");
+                        break;
+                    }
+                },
             }
         }
     };
+    // No `biased;`: flush and reply_task failures are equally urgent and
+    // neither should starve the other. The writer arm completes naturally
+    // once the queue drains or a write error/short-write retires it.
     tokio::select! {
-        biased;
         () = flush.flushed() => {
             debug!("SOCKS5 UDP session to {dst_addr}: outbound sessions flushed; next datagram re-dials");
         }
@@ -608,6 +629,12 @@ async fn run_session(
         }
         () = writer => {}
     }
+    // Close the conn regardless of which arm fired. If the writer arm was
+    // cancelled mid-write, stream-framed conns (snell, vless, trojan, …)
+    // have already set their `poisoned` flag via `PoisonOnIncomplete`, so
+    // subsequent reads from the reply task fail fast; `close` then tears
+    // down the socket. `_reply_guard` (AbortOnDrop) aborts the reply task
+    // after this point.
     let _ = conn.close();
 }
 
