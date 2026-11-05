@@ -619,6 +619,10 @@ fn run_application_inner(
             config
         };
 
+        // Global like mihomo's: every delay probe (API, groups, providers).
+        // Set once the config built; PUT /configs re-applies it on commit.
+        meow_proxy::health::set_unified_delay(config.raw.unified_delay.unwrap_or(false));
+
         // Apply CLI overrides to the loaded config.
         if let Some(ref s) = args.secret {
             config.api.secret = Some(s.clone());

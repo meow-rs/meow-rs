@@ -47,7 +47,13 @@ pub fn set_unified_delay(on: bool) {
     UNIFIED_DELAY.store(on, Ordering::Relaxed);
 }
 
-/// Probe a proxy by dialing the target, issuing an HTTP/1.1 `GET`, and
+/// The live `unified-delay` setting.
+pub fn unified_delay() -> bool {
+    UNIFIED_DELAY.load(Ordering::Relaxed)
+}
+
+/// Probe a proxy by dialing the target, issuing an HTTP/1.1 `GET` (two
+/// keep-alive `HEAD`s under `unified-delay`, timing the second), and
 /// reading the status line. Returns the total elapsed milliseconds on
 /// success (status within `expected`), otherwise a classified error.
 ///
@@ -888,8 +894,10 @@ async fn probe_once(
 }
 
 /// One `GET` — or, for `unified-delay`, two keep-alive `HEAD`s as mihomo
-/// sends them, returning when the second started. A failed second request
-/// keeps the first, full measurement (mihomo does the same).
+/// sends them, returning when the second started. As in mihomo's
+/// `URLTest`, the first response gates on transport only and the status
+/// check applies to the response kept: the second's, or — when the second
+/// request fails in transport — the first's, with the full measurement.
 async fn check_maybe_twice<S>(
     mut stream: S,
     parsed: &ParsedUrl,
@@ -905,13 +913,22 @@ where
             .map(|()| None);
     }
     send_request(&mut stream, parsed, "HEAD", "keep-alive").await?;
-    check_status(read_head(&mut stream).await?, ranges)?;
+    let first = read_head(&mut stream).await?;
     let second = Instant::now();
     let warm = async {
         send_request(&mut stream, parsed, "HEAD", "close").await?;
-        check_status(read_status_line(&mut stream).await?, ranges)
+        read_status_line(&mut stream).await
     };
-    Ok(warm.await.ok().map(|()| second))
+    match warm.await {
+        Ok(status) => check_status(status, ranges).map(|()| Some(second)),
+        Err(e) => {
+            warn!(
+                "url_test: unified-delay second request failed ({e}); \
+                 reporting the full first measurement"
+            );
+            check_status(first, ranges).map(|()| None)
+        }
+    }
 }
 
 fn check_status(status: u16, ranges: &[(u16, u16)]) -> Result<(), String> {
@@ -1150,6 +1167,39 @@ mod tests {
     /// `unified-delay`: two HEADs on one connection, the first keep-alive;
     /// the second's start is reported. A peer closing after the first
     /// keeps the full measurement (None), as mihomo does.
+    /// The status that decides is the kept response's: first 503 then 204
+    /// is alive, first 204 then 302 is dead (mihomo `URLTest`).
+    #[tokio::test]
+    async fn unified_delay_checks_the_kept_response_status() {
+        let parsed = ParsedUrl::parse("http://probe.test/generate_204").unwrap();
+        let ranges = parse_expected(None).unwrap();
+        for (first, second, alive) in [("503", "204", true), ("204", "302", false)] {
+            let (client, mut server) = tokio::io::duplex(4096);
+            let srv = tokio::spawn(async move {
+                let mut seen = Vec::new();
+                let mut buf = [0u8; 1024];
+                let mut answered = 0;
+                while answered < 2 {
+                    let n = server.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    seen.extend_from_slice(&buf[..n]);
+                    let requests = seen.windows(4).filter(|w| w == b"\r\n\r\n").count();
+                    while answered < requests {
+                        let code = if answered == 0 { first } else { second };
+                        let resp = format!("HTTP/1.1 {code} X\r\nServer: t\r\n\r\n");
+                        server.write_all(resp.as_bytes()).await.unwrap();
+                        answered += 1;
+                    }
+                }
+            });
+            let got = check_maybe_twice(client, &parsed, &ranges, true).await;
+            srv.await.unwrap();
+            assert_eq!(got.is_ok(), alive, "{first} then {second}");
+        }
+    }
+
     #[tokio::test]
     async fn unified_delay_times_the_second_request_on_a_warm_connection() {
         let parsed = ParsedUrl::parse("http://probe.test/generate_204").unwrap();
