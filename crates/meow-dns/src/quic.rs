@@ -110,7 +110,13 @@ type DispatchError = (ClientError, ReplySender);
 /// In-flight exchange waiting on the driver task.
 struct Pending {
     reply: oneshot::Sender<Result<Vec<u8>, ClientError>>,
+    /// Accumulates incoming response bytes (DoQ stream body / HTTP/3 DATA
+    /// frames) until the stream finishes.
     buf: Vec<u8>,
+    /// Bytes of the outgoing POST body not yet accepted by quiche (flow-control
+    /// limited).  Non-empty only between a `send_body` → `h3::Error::Done`
+    /// and the next successful flush of the connection.  Empty for DoQ entries.
+    unsent: Vec<u8>,
 }
 
 impl Pending {
@@ -118,6 +124,7 @@ impl Pending {
         Self {
             reply,
             buf: Vec::new(),
+            unsent: Vec::new(),
         }
     }
 }
@@ -585,6 +592,34 @@ impl DriverTask {
             }
 
             flush(&mut conn, &io, &mut out).await?;
+            // Retry any DoH3 body bytes that were flow-control limited in
+            // send_h3_request or a previous iteration.  After flush, quiche
+            // has drained the send buffer and may accept more data.
+            if let Some(h3) = h3_conn.as_mut() {
+                for (id, entry) in pending.iter_mut() {
+                    if entry.unsent.is_empty() {
+                        continue;
+                    }
+                    loop {
+                        match h3.send_body(&mut conn, *id, &entry.unsent, true) {
+                            Ok(written) => {
+                                entry.unsent.drain(..written);
+                                if entry.unsent.is_empty() {
+                                    break;
+                                }
+                            }
+                            Err(h3::Error::Done) => break,
+                            Err(_) => {
+                                // Stream-level error: poison the entry so
+                                // drain_h3 will pick up the Reset event and
+                                // fail the query.
+                                entry.unsent.clear();
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
             drain(&self.mode, &mut conn, h3_conn.as_mut(), pending, &mut tmp);
             prune_abandoned(&self.mode, &mut conn, pending);
 
@@ -779,7 +814,15 @@ fn send_h3_request(
                     break;
                 }
             }
-            Err(h3::Error::Done) => break,
+            // Flow-control: quiche cannot accept more data right now.  Store
+            // the remaining bytes so the driver loop can retry after the next
+            // flush drains the congestion window.  This is not EOF — the
+            // stream is still open and the peer has not seen the FIN yet.
+            Err(h3::Error::Done) => {
+                let mut entry = Pending::new(reply);
+                entry.unsent = body;
+                return Ok((id, entry));
+            }
             // The request is already on the stream; a body-level failure is
             // this query's verdict, and the stream is left for the peer to
             // reset (`drain_h3` reports it).
