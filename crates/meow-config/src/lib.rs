@@ -4428,14 +4428,15 @@ pub fn resolve_named_listeners(raw: &raw::RawConfig) -> Result<Vec<NamedListener
 
 /// Resolve `tcp-keepalive*` into the [`meow_common::TcpKeepaliveConfig`]
 /// every inbound listener applies to its accepted sockets, enforcing
-/// `build_config`'s semantics: the two seconds knobs feed OS keepalive
-/// timers, so they get the same `Instant + Duration` ceiling as
-/// `tcp-connect-timeout`/`udp-timeout` (issue #648); `tcp-keepalive-probes`
-/// is bounded at Linux's `TCP_KEEPCNT` limit of 127 — the kernel rejects
-/// (`EINVAL`) anything above, so the config errors early instead of
-/// relying on the syscall. `tcp-keepalive: false` turns the whole feature
-/// off — a parameter key still set then is dead config (loud, never
-/// fatal), though an *invalid* value still errors even when disabled.
+/// `build_config`'s semantics: all three knobs are bounded at the limits
+/// the strictest kernel enforces — Linux rejects (`EINVAL`)
+/// `TCP_KEEPIDLE`/`TCP_KEEPINTVL` above 32767 s and `TCP_KEEPCNT` above
+/// 127 — because a `setsockopt` that EINVALs is only logged at debug by
+/// `keepalive::apply`, silently running with OS-default timing instead
+/// of the configured posture. `tcp-keepalive: false` turns the whole
+/// feature off — a parameter key still set then is dead config (loud,
+/// never fatal), though an *invalid* value still errors even when
+/// disabled.
 ///
 /// `PUT /configs` calls this for validation only — the resolved posture is
 /// a startup snapshot like `listeners:`, never hot-applied — so a
@@ -4449,19 +4450,23 @@ pub fn resolve_tcp_keepalive(
         enabled,
         idle: std::time::Duration::from_secs(match raw.tcp_keepalive_idle {
             Some(0) => anyhow::bail!("tcp-keepalive-idle: must be at least 1 second"),
-            Some(secs) if secs > meow_common::MAX_DURATION_SECS => anyhow::bail!(
-                "tcp-keepalive-idle: {secs}s exceeds the {}s ceiling",
-                meow_common::MAX_DURATION_SECS
-            ),
+            Some(secs) if secs > meow_common::tcp_opts::MAX_TCP_KEEPALIVE_SECS => {
+                anyhow::bail!(
+                    "tcp-keepalive-idle: {secs}s exceeds the {}s ceiling",
+                    meow_common::tcp_opts::MAX_TCP_KEEPALIVE_SECS
+                )
+            }
             Some(secs) => secs,
             None => meow_common::tcp_opts::DEFAULT_TCP_KEEPALIVE_IDLE_SECS,
         }),
         interval: std::time::Duration::from_secs(match raw.tcp_keepalive_interval {
             Some(0) => anyhow::bail!("tcp-keepalive-interval: must be at least 1 second"),
-            Some(secs) if secs > meow_common::MAX_DURATION_SECS => anyhow::bail!(
-                "tcp-keepalive-interval: {secs}s exceeds the {}s ceiling",
-                meow_common::MAX_DURATION_SECS
-            ),
+            Some(secs) if secs > meow_common::tcp_opts::MAX_TCP_KEEPALIVE_SECS => {
+                anyhow::bail!(
+                    "tcp-keepalive-interval: {secs}s exceeds the {}s ceiling",
+                    meow_common::tcp_opts::MAX_TCP_KEEPALIVE_SECS
+                )
+            }
             Some(secs) => secs,
             None => meow_common::tcp_opts::DEFAULT_TCP_KEEPALIVE_INTERVAL_SECS,
         }),
@@ -4489,20 +4494,35 @@ pub fn resolve_tcp_keepalive(
             }
         }
     }
-    // Upstream mihomo's `keep-alive-*` keys tune *outbound* sockets and are
-    // deliberately not honored here (`tcp-keepalive*` is the inbound
-    // analog). Captured only to warn on the plausible migration mistake —
+    // Upstream mihomo applies `keep-alive-*` to BOTH inbound listeners
+    // (`net.ListenConfig.KeepAliveConfig` on accepted sockets) and
+    // outbound dials; `tcp-keepalive*` here covers the inbound side only
+    // — outbound dials carry no configurable keepalive (the residual
+    // gap). Captured only to warn on the plausible migration mistake —
     // without this the keys are silently ignored by serde.
-    for (key, present) in [
-        ("keep-alive-idle", raw.keep_alive_idle.is_some()),
-        ("keep-alive-interval", raw.keep_alive_interval.is_some()),
-        ("disable-keep-alive", raw.disable_keep_alive.is_some()),
+    for (key, present, inbound_equivalent) in [
+        (
+            "keep-alive-idle",
+            raw.keep_alive_idle.is_some(),
+            "`tcp-keepalive-idle`",
+        ),
+        (
+            "keep-alive-interval",
+            raw.keep_alive_interval.is_some(),
+            "`tcp-keepalive-interval`",
+        ),
+        (
+            "disable-keep-alive",
+            raw.disable_keep_alive.is_some(),
+            "`tcp-keepalive: false`",
+        ),
     ] {
         if present {
             warn!(
-                "{key}: tunes upstream's outbound sockets and is ignored; \
-                 the inbound-socket equivalent here is `tcp-keepalive-idle` \
-                 / `tcp-keepalive-interval` / `tcp-keepalive`"
+                "{key}: tunes inbound AND outbound sockets upstream and is \
+                 ignored; the inbound-socket equivalent here is \
+                 {inbound_equivalent} (outbound dials keep no keepalive \
+                 tuning)"
             );
         }
     }

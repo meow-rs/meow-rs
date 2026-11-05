@@ -3194,6 +3194,10 @@ async fn test_tcp_keepalive_validation_rejects_bad_values() {
             "tcp-keepalive-interval: 18446744073709551615\n",
             "tcp-keepalive-interval",
         ),
+        // One past the setsockopt (EINVAL) ceiling must be a config
+        // error, not a silent runtime fallback to OS-default timing.
+        ("tcp-keepalive-idle: 32768\n", "tcp-keepalive-idle"),
+        ("tcp-keepalive-interval: 32768\n", "tcp-keepalive-interval"),
         (
             "tcp-idle-timeout: 18446744073709551615\n",
             "tcp-idle-timeout",
@@ -3237,6 +3241,23 @@ tcp-idle-timeout: 1
             meow_common::MAX_DURATION_SECS
         ))
     );
+
+    // `tcp-keepalive-idle`/`-interval` top out at the setsockopt
+    // (EINVAL) ceiling, not the timer ceiling — Linux rejects
+    // TCP_KEEPIDLE/TCP_KEEPINTVL above 32767.
+    let yaml = format!(
+        "tcp-keepalive-idle: {0}\ntcp-keepalive-interval: {0}\n",
+        meow_common::tcp_opts::MAX_TCP_KEEPALIVE_SECS
+    );
+    let config = load_config_from_str(&yaml).await.unwrap();
+    assert_eq!(
+        config.listeners.tcp_keepalive.idle,
+        std::time::Duration::from_secs(meow_common::tcp_opts::MAX_TCP_KEEPALIVE_SECS)
+    );
+    assert_eq!(
+        config.listeners.tcp_keepalive.interval,
+        std::time::Duration::from_secs(meow_common::tcp_opts::MAX_TCP_KEEPALIVE_SECS)
+    );
 }
 
 /// `tcp-keepalive: false` silences *valid* parameter keys with a warn —
@@ -3248,6 +3269,8 @@ async fn test_tcp_keepalive_disabled_still_rejects_invalid() {
         "tcp-keepalive-probes: 0\n",
         "tcp-keepalive-probes: 128\n",
         "tcp-keepalive-idle: 0\n",
+        "tcp-keepalive-interval: 0\n",
+        "tcp-keepalive-idle: 32768\n",
     ] {
         let yaml = format!("tcp-keepalive: false\n{line}");
         let err = load_config_from_str(&yaml)
@@ -3261,8 +3284,10 @@ async fn test_tcp_keepalive_disabled_still_rejects_invalid() {
     }
 }
 
-/// Upstream mihomo's outbound `keep-alive-*` keys are captured and warned
-/// (never honored), not silently dropped: they must not fail the load.
+/// Upstream mihomo's `keep-alive-*` keys (which tune inbound listeners
+/// AND outbound dials there) are captured and warned (never honored),
+/// not silently dropped: they must land in the `RawConfig` capture
+/// fields AND not fail the load.
 #[tokio::test]
 async fn test_upstream_keepalive_keys_warn_but_parse() {
     let yaml = r#"
@@ -3271,6 +3296,14 @@ keep-alive-interval: 30
 disable-keep-alive: false
 mixed-port: 7890
 "#;
+    // The keys must be captured, not dropped as unknown fields — a
+    // misnamed serde field would leave `keep-alive-idle` silently
+    // ignored while this test's load assertions still pass.
+    let raw = meow_config::parse_raw_yaml(yaml).unwrap();
+    assert!(raw.keep_alive_idle.is_some());
+    assert!(raw.keep_alive_interval.is_some());
+    assert!(raw.disable_keep_alive.is_some());
+
     let config = load_config_from_str(yaml).await.unwrap();
     // Ignored upstream keys never reach the resolved inbound posture.
     let ka = config.listeners.tcp_keepalive;

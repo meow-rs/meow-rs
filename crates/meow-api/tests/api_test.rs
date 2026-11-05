@@ -6748,6 +6748,84 @@ async fn put_configs_force_tcp_idle_timeout_normalizes_commit() {
         StatusCode::NO_CONTENT,
         "a forced commit must not poison later warm-path mutations"
     );
+
+    // Running bound disabled → committed `Some(0)`, which re-resolves to
+    // `None` — the same disabled bound an absent key resolves to, kept
+    // explicit so the committed doc says what it means.
+    state.tunnel.set_tcp_idle_timeout(None);
+    let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs?force=true")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        state.raw_config.read().tcp_idle_timeout,
+        Some(0),
+        "a disabled running bound normalizes to explicit 0, not absent"
+    );
+    assert_eq!(state.tunnel.inner().tcp_idle_timeout(), None);
+}
+
+/// The force early-return arm — the rebuild failing under BOTH strict
+/// and lenient modes — also commits `raw_config`; the normalize must
+/// have run before it or the verbatim invalid value lands in the
+/// committed document anyway (sniffer.timeout is rejected
+/// unconditionally, so it fails the lenient retry too).
+#[tokio::test]
+async fn put_configs_force_early_return_still_normalizes_tcp_idle_timeout() {
+    use base64::Engine as _;
+    let state = test_state(test_raw_config());
+    state
+        .tunnel
+        .set_tcp_idle_timeout(Some(std::time::Duration::from_secs(1800)));
+
+    let yaml = "mode: rule\ntcp-idle-timeout: 315360001\nsniffer:\n  timeout: 0\nrules:\n  - MATCH,DIRECT\n";
+    let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs?force=true")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    {
+        let committed = state.raw_config.read();
+        assert_eq!(
+            committed.tcp_idle_timeout,
+            Some(1800),
+            "the early-return arm commits the normalized field too"
+        );
+        // Proof the unbuildable document committed verbatim apart from
+        // the normalize — i.e. the early-return arm really ran (a normal
+        // commit would have rebuilt and this assertion is moot).
+        assert_eq!(
+            committed.sniffer.as_ref().unwrap().timeout,
+            Some(0),
+            "the unbuildable sniffer section still committed verbatim"
+        );
+    }
+    assert_eq!(
+        state.tunnel.inner().tcp_idle_timeout(),
+        Some(std::time::Duration::from_secs(1800)),
+        "the early-return arm never reapplies, so the running bound is kept"
+    );
 }
 
 /// `?force` degrades the `tun:` admission check to a warn: the unparsable

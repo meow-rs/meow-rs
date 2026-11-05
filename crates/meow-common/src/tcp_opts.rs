@@ -21,11 +21,18 @@ pub const DEFAULT_TCP_KEEPALIVE_INTERVAL_SECS: u64 = 30;
 /// field; the OS default applies there).
 pub const DEFAULT_TCP_KEEPALIVE_PROBES: u32 = 5;
 
-/// Fallback used by the REST API's `PUT /configs` validator to guard the
-/// running bound against an implicit `None` during a partial reload. Not
-/// used as the config parse default — an absent `tcp-idle-timeout` key
-/// resolves to `None` (disabled) rather than this value, preserving
-/// pre-894 behaviour (no idle bound by default).
+/// Ceiling for `tcp-keepalive-idle` / `tcp-keepalive-interval`, in
+/// seconds: Linux's `MAX_TCP_KEEPIDLE`/`MAX_TCP_KEEPINTVL` — the kernel
+/// rejects (`EINVAL`) values above it, and config validation applies the
+/// strictest-platform bound uniformly so an accepted value can never
+/// `EINVAL` at `setsockopt` time on any target.
+pub const MAX_TCP_KEEPALIVE_SECS: u64 = 32767;
+
+/// Reference bound for `tcp-idle-timeout`, in seconds. Not used as the
+/// config parse default — an absent `tcp-idle-timeout` key resolves to
+/// `None` (disabled) rather than this value, preserving pre-894
+/// behaviour (no idle bound by default). Retained for callers and docs
+/// that want the canonical opt-in value.
 pub const DEFAULT_TCP_IDLE_TIMEOUT_SECS: u64 = 600;
 
 /// Resolved keepalive posture applied to every TCP socket a listener
@@ -51,8 +58,8 @@ pub struct TcpKeepaliveConfig {
     /// `tcp-keepalive-interval` — spacing between probes.
     pub interval: Duration,
     /// `tcp-keepalive-probes` — unanswered probes before the kernel drops
-    /// the connection. Capped at 127 by config validation (Linux's
-    /// `TCP_KEEPCNT` clamp).
+    /// the connection. Capped at 127 by config validation (Linux rejects
+    /// higher `TCP_KEEPCNT` with `EINVAL`).
     pub probes: u32,
 }
 

@@ -1026,14 +1026,18 @@ impl Tunnel {
     ///
     /// # Panics (debug builds only)
     /// Asserts that a `Some` duration is either exactly zero (the
-    /// documented disable) or carries at least one whole second, so the
-    /// "non-zero duration that silently becomes zero" footgun surfaces
-    /// immediately in tests rather than silently disabling the bound.
+    /// documented disable) or carries at least one whole second (and no
+    /// more than `MAX_DURATION_SECS`, past which the relay's
+    /// `Instant + Duration` arithmetic could overflow), so both footguns
+    /// surface immediately in tests rather than silently at runtime.
     pub fn set_tcp_idle_timeout(&self, d: Option<std::time::Duration>) {
         debug_assert!(
-            d.is_none_or(|d| d.is_zero() || d.as_secs() > 0),
+            d.is_none_or(|d| d.is_zero()
+                || (d.as_secs() > 0 && d.as_secs() <= meow_common::MAX_DURATION_SECS)),
             "set_tcp_idle_timeout: Some(d) with 0 < d < 1 s truncates to 0 and \
-             disables the bound; round up to Duration::from_secs(1) minimum"
+             disables the bound (round up to Duration::from_secs(1) minimum), \
+             and a Some(d) above MAX_DURATION_SECS can overflow Instant + \
+             Duration in the relay's idle timer"
         );
         self.inner
             .tcp_idle_timeout

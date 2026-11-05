@@ -32,10 +32,10 @@ Use it as a pre-flight check.
 | `routing-mark` | u32 | — | Linux `SO_MARK` for transparent-proxy loop avoidance |
 | `max-connections` | usize | `256` | Global cap on concurrent inbound connections (`0` = unlimited); inherited by the TUN listener |
 | `tcp-keepalive` | bool | `true` | `SO_KEEPALIVE` on every accepted inbound socket (listener-startup snapshot) |
-| `tcp-keepalive-idle` | u64 (s) | `300` | Socket silence before the first keepalive probe (`≥ 1`) |
-| `tcp-keepalive-interval` | u64 (s) | `30` | Interval between keepalive probes (`≥ 1`) |
+| `tcp-keepalive-idle` | u64 (s) | `300` | Socket silence before the first keepalive probe (`1`–`32767`) |
+| `tcp-keepalive-interval` | u64 (s) | `30` | Interval between keepalive probes (`1`–`32767`) |
 | `tcp-keepalive-probes` | u32 | `5` | Unanswered probes before the peer is declared dead (`1`–`127`; not settable on Windows) |
-| `tcp-idle-timeout` | u64 (s) | `600` | Whole-connection relay idle bound: a relay silent in both directions this long is torn down (`0` = disabled; hot-applied by `PUT /configs`) |
+| `tcp-idle-timeout` | u64 (s) | — | Whole-connection relay idle bound: a relay silent in both directions this long is torn down (absent or `0` = disabled — opt-in; `PUT /configs` applies it to relays started after the commit) |
 | `authentication` | list | `[]` | Inbound `user:pass` credentials for HTTP/SOCKS5 |
 | `skip-auth-prefixes` | list | `[]` | CIDRs exempt from inbound auth |
 | `hosts` | map | — | Static host → IP(s) mappings |

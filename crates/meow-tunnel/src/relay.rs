@@ -380,7 +380,8 @@ where
 /// cannot provide, since the linger only arms once one direction has
 /// already reached EOF. `None` behaves exactly like
 /// [`copy_bidirectional_buf_tracked`]; `Some(Duration::ZERO)` is treated
-/// as `None` (a zero deadline would otherwise fire on the first poll).
+/// as `None` (a zero deadline would arm an already-elapsed timer that
+/// kills the relay the first time the idle check is polled).
 pub async fn copy_bidirectional_buf_tracked_idle<A, B, FA, FB>(
     a: &mut A,
     b: &mut B,
@@ -1249,6 +1250,8 @@ mod tests {
         // TCP pairs held open-and-silent resolve to `Err(TimedOut)` at the
         // window. Paused time auto-advances once the relay is genuinely
         // stalled, so the error proves the timer — not a peer event — fired.
+        // (Zero bytes move, so no splice pipe ever opens — this covers the
+        // entry-point plumbing only, not a stall mid-splice.)
         #[tokio::test(start_paused = true)]
         async fn idle_timeout_reaps_silent_spliced_relay() {
             const IDLE: Duration = Duration::from_secs(30);

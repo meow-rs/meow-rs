@@ -3494,6 +3494,58 @@ async fn put_configs(
     // made it into the PUT.
     meow_config::subscription::reconcile_contribution_claims(&mut raw_config);
 
+    // Same admission contract for `tcp-idle-timeout`: the rebuild never
+    // sees general fields either, so its ceiling must gate persistence
+    // here — committed unchecked, the next boot's `build_config` would
+    // hard-error on a value this PUT accepted. `force` keeps the running
+    // bound, the same degrade the dns arm applies below — AND normalizes
+    // the committed field to that bound: the warm-path commits
+    // (`commit_raw_candidate` → `apply_raw_to_tunnel`) re-resolve this
+    // field on every mutation, so persisting the invalid value would make
+    // every later unrelated PATCH fail with this same error. This gate
+    // must run BEFORE the rebuild — the force early-return below commits
+    // `raw_config` when nothing builds, so a check placed after that arm
+    // would leave the verbatim poison in the committed document.
+    let tcp_idle_timeout = match resolve_tcp_idle_timeout(&raw_config) {
+        Ok(timeout) => timeout,
+        Err(msg) => {
+            if force {
+                tracing::error!("config reload forced despite {msg}");
+                forced.push(msg);
+                let running = state.tunnel.inner().tcp_idle_timeout();
+                // Rewrite the invalid value to what is actually running —
+                // semantically equivalent for the next boot's
+                // `build_config` (0 = disabled) and boot-valid by
+                // construction.
+                raw_config.tcp_idle_timeout = Some(running.map_or(0, |d| d.as_secs()));
+                running
+            } else {
+                return reload_rejected(StatusCode::BAD_REQUEST, &msg);
+            }
+        }
+    };
+
+    // Same admission contract for `tcp-keepalive*`: the rebuild never sees
+    // general fields either, so their semantic validation must gate
+    // persistence here — committed unchecked, the next boot's
+    // `build_config` would hard-error on a value this PUT accepted. The
+    // resolved posture is a startup snapshot like `listeners:` (no
+    // hot-apply), so under `force` there is no running value to keep —
+    // the degrade is warn + commit, matching the listeners arm. Unlike
+    // `tcp-idle-timeout` the committed value is NOT normalized (nothing
+    // running to normalize to): a forced bad value can still reach
+    // `save_config` and hard-error the next boot, the same exposure
+    // `listeners:`/`tun:` already carry — but hoisting the check above
+    // the rebuild at least records it in `forced` on every commit path.
+    if let Err(e) = meow_config::resolve_tcp_keepalive(&raw_config) {
+        if force {
+            tracing::error!("config reload forced despite {e}");
+            forced.push(e.to_string());
+        } else {
+            return reload_rejected(StatusCode::BAD_REQUEST, &e.to_string());
+        }
+    }
+
     // Semantic rebuild (proxy/rule parsing). Share the tunnel's resolver
     // slot so the rebuilt map's DIRECT adapter tracks later
     // `set_resolver` swaps (issue #514).
@@ -3648,50 +3700,6 @@ async fn put_configs(
                 StatusCode::BAD_REQUEST,
                 &format!("listeners config error: {e}"),
             );
-        }
-    }
-
-    // Same admission contract for `tcp-idle-timeout`: the rebuild never
-    // sees general fields either, so its ceiling must gate persistence
-    // here — committed unchecked, the next boot's `build_config` would
-    // hard-error on a value this PUT accepted. `force` keeps the running
-    // bound, the same degrade the dns arm applies below — AND normalizes
-    // the committed field to that bound: the warm-path commits
-    // (`commit_raw_candidate` → `apply_raw_to_tunnel`) re-resolve this
-    // field on every mutation, so persisting the invalid value would make
-    // every later unrelated PATCH fail with this same error.
-    let tcp_idle_timeout = match resolve_tcp_idle_timeout(&raw_config) {
-        Ok(timeout) => timeout,
-        Err(msg) => {
-            if force {
-                tracing::error!("config reload forced despite {msg}");
-                forced.push(msg);
-                let running = state.tunnel.inner().tcp_idle_timeout();
-                // Rewrite the invalid value to what is actually running —
-                // semantically equivalent for the next boot's
-                // `build_config` (0 = disabled) and boot-valid by
-                // construction.
-                raw_config.tcp_idle_timeout = Some(running.map_or(0, |d| d.as_secs()));
-                running
-            } else {
-                return reload_rejected(StatusCode::BAD_REQUEST, &msg);
-            }
-        }
-    };
-
-    // Same admission contract for `tcp-keepalive*`: the rebuild never sees
-    // general fields either, so their semantic validation must gate
-    // persistence here — committed unchecked, the next boot's
-    // `build_config` would hard-error on a value this PUT accepted. The
-    // resolved posture is a startup snapshot like `listeners:` (no
-    // hot-apply), so under `force` there is no running value to keep —
-    // the degrade is warn + commit, matching the listeners arm.
-    if let Err(e) = meow_config::resolve_tcp_keepalive(&raw_config) {
-        if force {
-            tracing::error!("config reload forced despite {e}");
-            forced.push(e.to_string());
-        } else {
-            return reload_rejected(StatusCode::BAD_REQUEST, &e.to_string());
         }
     }
 
