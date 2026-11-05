@@ -8,6 +8,16 @@ the canonical, in-repo source a release is cut from.
 
 ## [Unreleased]
 
+### Fixed
+
+- **UDP flows on the tproxy, TUN and Shadowsocks inbounds now stop on
+  termination signals even while an upstream write is pending** (extends
+  #893): `write_packet` races the idle timeout, outbound-session flush and
+  reply-reader exit everywhere it is awaited, so a stalled upstream can no
+  longer pin a flow. A full TUN reply queue drops the reply with a debug
+  log instead of parking the flow, and a short upstream write retires the
+  flow without a partial retry on every path.
+
 ## [0.29.0] - 2026-11-05
 
 ### Added
