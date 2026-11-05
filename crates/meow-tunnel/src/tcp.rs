@@ -1,4 +1,6 @@
-use crate::relay::{copy_bidirectional_buf_tracked_splice, proxy_conn_tcp_view, RELAY_BUF_SIZE};
+use crate::relay::{
+    copy_bidirectional_buf_tracked_splice_idle, proxy_conn_tcp_view, RELAY_BUF_SIZE,
+};
 use crate::statistics::Statistics;
 use crate::tunnel::{MatchedRule, ResolvedTarget, TunnelInner};
 use meow_common::conn_note;
@@ -511,7 +513,7 @@ async fn route_inbound_tcp_scoped<C>(
                             .stats
                             .record_upload(&up, prefix.len() as meow_common::atomic::Int);
                     }
-                    match copy_bidirectional_buf_tracked_splice(
+                    match copy_bidirectional_buf_tracked_splice_idle(
                         conn,
                         &mut *remote,
                         &mut buf_up,
@@ -527,6 +529,7 @@ async fn route_inbound_tcp_scoped<C>(
                                 .stats
                                 .record_download(&dn, n as meow_common::atomic::Int);
                         },
+                        inner.tcp_idle_timeout(),
                     )
                     .await
                     {

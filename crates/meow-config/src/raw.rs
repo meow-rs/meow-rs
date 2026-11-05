@@ -278,6 +278,48 @@ pub struct RawConfig {
     /// listener. The default is 256; explicit `0` disables the cap. Individual `listeners:`
     /// entries can override this with their own `max-connections` field.
     pub max_connections: Option<usize>,
+    /// `tcp-keepalive` — apply `SO_KEEPALIVE` plus the keepalive timing
+    /// knobs below to every *accepted inbound* socket (mixed/http/socks5/
+    /// tproxy/shadowsocks listeners; TUN netstack flows have no host
+    /// socket). Default `true`. These govern *inbound* sockets — they are
+    /// deliberately NOT upstream mihomo's `keep-alive-*` names, which tune
+    /// both inbound listeners and outbound dials there (the keys below
+    /// cover the inbound side only). `false` performs no keepalive
+    /// `setsockopt` at all (config-level kill switch).
+    pub tcp_keepalive: Option<bool>,
+    /// `tcp-keepalive-idle` — seconds of socket silence before the first
+    /// keepalive probe. Linux/Android/musl: `TCP_KEEPIDLE`; macOS/iOS:
+    /// `TCP_KEEPALIVE`; Windows: `SIO_KEEPALIVE_VALS.keepalivetime`;
+    /// OpenBSD/Haiku: not settable — keepalive still engages, timing falls
+    /// back to OS defaults. Default
+    /// [`meow_common::tcp_opts::DEFAULT_TCP_KEEPALIVE_IDLE_SECS`]; 1–32767 —
+    /// Linux rejects (`EINVAL`) `TCP_KEEPIDLE` above 32767, so the config
+    /// errors early instead of relying on the syscall.
+    pub tcp_keepalive_idle: Option<u64>,
+    /// `tcp-keepalive-interval` — seconds between keepalive probes
+    /// (`TCP_KEEPINTVL` / `SIO_KEEPALIVE_VALS.keepaliveinterval`;
+    /// unsupported on OpenBSD/Haiku). Default
+    /// [`meow_common::tcp_opts::DEFAULT_TCP_KEEPALIVE_INTERVAL_SECS`];
+    /// 1–32767 — Linux rejects (`EINVAL`) `TCP_KEEPINTVL` above 32767.
+    pub tcp_keepalive_interval: Option<u64>,
+    /// `tcp-keepalive-probes` — unanswered probes before the kernel
+    /// declares the peer dead (`TCP_KEEPCNT`). Not settable on Windows
+    /// (`SIO_KEEPALIVE_VALS` has no probe-count field; the OS default
+    /// applies). Default
+    /// [`meow_common::tcp_opts::DEFAULT_TCP_KEEPALIVE_PROBES`]; 1–127 —
+    /// Linux rejects (`EINVAL`) counts above 127, so the config errors
+    /// early instead of relying on the syscall.
+    pub tcp_keepalive_probes: Option<u32>,
+    /// `tcp-idle-timeout` — whole-connection relay idle bound in seconds:
+    /// an established relay that moves zero bytes in EITHER direction for
+    /// this long is torn down with a `TimedOut` error, releasing its
+    /// listener permit and stats entry. Covers flows keepalive cannot see
+    /// (TUN netstack streams, dead-but-still-ACKing upstreams). Absent
+    /// also leaves the bound disabled (pre-894 behaviour — the feature is
+    /// opt-in; [`meow_common::tcp_opts::DEFAULT_TCP_IDLE_TIMEOUT_SECS`]
+    /// is the canonical opt-in value); `0` is the explicit off-switch —
+    /// a silent relay then has no timer of its own.
+    pub tcp_idle_timeout: Option<u64>,
     /// No top-level `firewall` key exists — captured only to warn on the
     /// plausible mistake (`firewall:` belongs on a `listeners:` tproxy
     /// entry, issue #563).
@@ -287,6 +329,13 @@ pub struct RawConfig {
     /// tproxy entry; `udp-timeout` on `listeners:`/`tun:`, issue #564).
     pub udp: Option<serde_json::Value>,
     pub udp_timeout: Option<serde_json::Value>,
+    /// Upstream mihomo's `keep-alive-*` keys tune BOTH inbound listeners
+    /// and outbound dials — captured only to warn on the plausible
+    /// migration mistake (`tcp-keepalive*` above covers the inbound
+    /// side; the outbound-dialer tuning is not honored).
+    pub keep_alive_idle: Option<serde_json::Value>,
+    pub keep_alive_interval: Option<serde_json::Value>,
+    pub disable_keep_alive: Option<serde_json::Value>,
 }
 
 impl RawConfig {

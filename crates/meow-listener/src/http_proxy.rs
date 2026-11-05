@@ -2,7 +2,7 @@ use crate::sniffer::SnifferRuntime;
 use base64::Engine;
 use meow_common::{with_dial_timeout, AuthConfig, ConnType, Metadata, Network};
 use meow_tunnel::{
-    copy_bidirectional_buf_tracked, route_inbound_tcp, MatchedRule, ResolvedTarget, Tunnel,
+    copy_bidirectional_buf_tracked_idle, route_inbound_tcp, MatchedRule, ResolvedTarget, Tunnel,
     RELAY_BUF_SIZE,
 };
 use std::io;
@@ -351,7 +351,7 @@ async fn handle_http_inner(
                         // half-close semantics.
                         let mut remote = ShutdownGate::new(remote, &pass_upstream_shutdown);
 
-                        match copy_bidirectional_buf_tracked(
+                        match copy_bidirectional_buf_tracked_idle(
                             &mut *client,
                             &mut remote,
                             &mut relay_buf_up,
@@ -366,6 +366,7 @@ async fn handle_http_inner(
                                     .stats
                                     .record_download(&dn, n as meow_common::atomic::Int);
                             },
+                            inner.tcp_idle_timeout(),
                         )
                         .await
                         {

@@ -123,6 +123,7 @@ These fields parse without error but behave differently from Go mihomo:
 | `geodata-mode`, `geodata-loader`, `geoip-matcher` | Valid fields | Ignored with warn-once (M2+) | B |
 | `dns.listen` / `external-controller` bind failure at startup | Logs error, daemon keeps running | Hard startup error (process exits non-zero) — no prior listener exists to fall back to (the `dns.listen` half keeps its tolerant keep-old semantics on runtime `PUT /configs` rebind; `external-controller` has no runtime rebind) | A |
 | `dns.listen` set while `dns.enable: false` | Silently ignored | Warn-once that no listener is started | B |
+| `keep-alive-idle` / `keep-alive-interval` / `disable-keep-alive` | Tune keepalive on inbound listeners AND outbound dials | Parsed and ignored with a warn pointing to `tcp-keepalive*` — which covers the inbound half only; the outbound-dialer keepalive tuning is not honored | B |
 
 ### Fields that are silently ignored in Go mihomo but error in meow-rs
 
@@ -627,6 +628,7 @@ tools built for Go mihomo will ignore them.
 | Rule CRUD API | `POST\|PUT\|DELETE /rules[/:index]` | Runtime rule editing |
 | Logbook | `GET\|DELETE /logbook`, `logbook: {enable: true}` | Persistent record of notable engine events, kept 7 days in `<home>/logbook/logbook.db`; not in `minimal` builds ([ADR-0014](adr/0014-logbook.md)) |
 | Traffic ledger | `GET\|DELETE /traffic/ledger`, `traffic-ledger: {enable: true, hosts: true, apps: true}` | Per-day traffic by host, app, policy and interface, kept 62 days in `<home>/traffic/traffic.db`; not in `minimal` builds ([ADR-0015](adr/0015-traffic-ledger.md)) |
+| Inbound socket keepalive + relay idle bound | `tcp-keepalive`, `tcp-keepalive-idle`/`interval`/`probes`, `tcp-idle-timeout` | `SO_KEEPALIVE` + timing on every accepted inbound socket, and an opt-in whole-connection idle bound that reaps relays silent in both directions for `tcp-idle-timeout` seconds (off when absent or `0` — kernel keepalive probes are not relay bytes, so a live-but-silent flow like IMAP `IDLE` is still reaped once opted in); keepalive is a listener-startup snapshot, the idle bound is applied by `PUT /configs` to relays started after the commit |
 
 Keep these under the `/api/` prefix so they do not collide with
 Clash-compatible paths.

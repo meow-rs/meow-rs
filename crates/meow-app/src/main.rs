@@ -1172,6 +1172,7 @@ async fn run(
     tunnel.set_dialer_registry(config.provider_dialer_registry.clone());
     tunnel.set_mode(config.general.mode);
     tunnel.set_connection_notes(config.general.connection_notes);
+    tunnel.set_tcp_idle_timeout(config.general.tcp_idle_timeout);
     tunnel.update_routing(config.proxies, config.rules, config.dialer_registry);
     tunnel.spawn_background_tasks();
 
@@ -1363,7 +1364,8 @@ async fn run(
                     let listener = MixedListener::new(tunnel.clone(), bound, nl.name.clone())
                         .with_sniffer(Arc::clone(&sniffer_runtime))
                         .with_auth(Arc::clone(&auth))
-                        .with_max_connections(nl.max_connections);
+                        .with_max_connections(nl.max_connections)
+                        .with_tcp_keepalive(config.listeners.tcp_keepalive);
                     tokio::spawn(async move {
                         if let Err(e) = listener.run_on(socket).await {
                             error!("Listener error: {}", e);
@@ -1404,7 +1406,8 @@ async fn run(
                     .with_sniffer(Arc::clone(&sniffer_runtime))
                     .with_max_connections(nl.max_connections)
                     .with_firewall(*firewall)
-                    .with_udp(*udp, std::time::Duration::from_secs(*udp_timeout));
+                    .with_udp(*udp, std::time::Duration::from_secs(*udp_timeout))
+                    .with_tcp_keepalive(config.listeners.tcp_keepalive);
                     // Firewall rules and the UDP TPROXY socket are fallible
                     // setup — run them eagerly so a failure can't drop the
                     // bound TCP socket inside a detached task (issue #641).
@@ -1462,7 +1465,9 @@ async fn run(
                         cfg.udp,
                         obfs,
                     ) {
-                        Ok(l) => l.with_max_connections(nl.max_connections),
+                        Ok(l) => l
+                            .with_max_connections(nl.max_connections)
+                            .with_tcp_keepalive(config.listeners.tcp_keepalive),
                         Err(e) => {
                             listener_failed(&nl.name, &format!("invalid shadowsocks config: {e}"));
                             continue;
