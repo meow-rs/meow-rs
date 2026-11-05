@@ -121,6 +121,11 @@ pub struct GeneralConfig {
     pub connection_notes: bool,
     /// `logbook.enable` — see `meow_common::logbook::apply`.
     pub logbook: bool,
+    /// `tcp-idle-timeout` — whole-connection relay idle bound handed to
+    /// `Tunnel::set_tcp_idle_timeout`: an established relay silent in both
+    /// directions for this long is torn down. `None` disables the bound
+    /// (`tcp-idle-timeout: 0`).
+    pub tcp_idle_timeout: Option<std::time::Duration>,
 }
 
 /// Single source of truth for the effective `ipv6` setting of a config
@@ -619,6 +624,11 @@ pub struct ListenerConfig {
     pub tproxy_port: Option<u16>,
     pub tproxy_sni: bool,
     pub routing_mark: Option<u32>,
+    /// `tcp-keepalive*` — the keepalive posture every inbound listener
+    /// applies to its accepted sockets (see
+    /// [`meow_common::TcpKeepaliveConfig`]). Engine-wide: per-listener
+    /// overrides are deliberately not offered.
+    pub tcp_keepalive: meow_common::TcpKeepaliveConfig,
     /// All active listeners (shorthand + named), deduplicated and validated.
     pub named: Vec<NamedListener>,
 }
@@ -4416,6 +4426,131 @@ pub fn resolve_named_listeners(raw: &raw::RawConfig) -> Result<Vec<NamedListener
     build_named_listeners(raw, &bind_addr, global_tproxy_sni)
 }
 
+/// Resolve `tcp-keepalive*` into the [`meow_common::TcpKeepaliveConfig`]
+/// every inbound listener applies to its accepted sockets, enforcing
+/// `build_config`'s semantics: all three knobs are bounded at the limits
+/// the strictest kernel enforces — Linux rejects (`EINVAL`)
+/// `TCP_KEEPIDLE`/`TCP_KEEPINTVL` above 32767 s and `TCP_KEEPCNT` above
+/// 127 — because a `setsockopt` that EINVALs is only logged at debug by
+/// `keepalive::apply`, silently running with OS-default timing instead
+/// of the configured posture. `tcp-keepalive: false` turns the whole
+/// feature off — a parameter key still set then is dead config (loud,
+/// never fatal), though an *invalid* value still errors even when
+/// disabled.
+///
+/// `PUT /configs` calls this for validation only — the resolved posture is
+/// a startup snapshot like `listeners:`, never hot-applied — so a
+/// committed document cannot carry a value the next boot's `build_config`
+/// would hard-error on.
+pub fn resolve_tcp_keepalive(
+    raw: &raw::RawConfig,
+) -> Result<meow_common::TcpKeepaliveConfig, anyhow::Error> {
+    let enabled = raw.tcp_keepalive.unwrap_or(true);
+    let config = meow_common::TcpKeepaliveConfig {
+        enabled,
+        idle: std::time::Duration::from_secs(match raw.tcp_keepalive_idle {
+            Some(0) => anyhow::bail!("tcp-keepalive-idle: must be at least 1 second"),
+            Some(secs) if secs > meow_common::tcp_opts::MAX_TCP_KEEPALIVE_SECS => {
+                anyhow::bail!(
+                    "tcp-keepalive-idle: {secs}s exceeds the {}s ceiling",
+                    meow_common::tcp_opts::MAX_TCP_KEEPALIVE_SECS
+                )
+            }
+            Some(secs) => secs,
+            None => meow_common::tcp_opts::DEFAULT_TCP_KEEPALIVE_IDLE_SECS,
+        }),
+        interval: std::time::Duration::from_secs(match raw.tcp_keepalive_interval {
+            Some(0) => anyhow::bail!("tcp-keepalive-interval: must be at least 1 second"),
+            Some(secs) if secs > meow_common::tcp_opts::MAX_TCP_KEEPALIVE_SECS => {
+                anyhow::bail!(
+                    "tcp-keepalive-interval: {secs}s exceeds the {}s ceiling",
+                    meow_common::tcp_opts::MAX_TCP_KEEPALIVE_SECS
+                )
+            }
+            Some(secs) => secs,
+            None => meow_common::tcp_opts::DEFAULT_TCP_KEEPALIVE_INTERVAL_SECS,
+        }),
+        probes: match raw.tcp_keepalive_probes {
+            Some(0) => anyhow::bail!("tcp-keepalive-probes: must be at least 1"),
+            Some(n) if n > 127 => anyhow::bail!("tcp-keepalive-probes: must be at most 127"),
+            Some(n) => n,
+            None => meow_common::tcp_opts::DEFAULT_TCP_KEEPALIVE_PROBES,
+        },
+    };
+    if !enabled {
+        for (key, present) in [
+            ("tcp-keepalive-idle", raw.tcp_keepalive_idle.is_some()),
+            (
+                "tcp-keepalive-interval",
+                raw.tcp_keepalive_interval.is_some(),
+            ),
+            ("tcp-keepalive-probes", raw.tcp_keepalive_probes.is_some()),
+        ] {
+            if present {
+                warn!(
+                    "{key}: has no effect while tcp-keepalive is false; \
+                     remove it to suppress this warning"
+                );
+            }
+        }
+    }
+    // Upstream mihomo applies `keep-alive-*` to BOTH inbound listeners
+    // (`net.ListenConfig.KeepAliveConfig` on accepted sockets) and
+    // outbound dials; `tcp-keepalive*` here covers the inbound side only
+    // — outbound dials carry no configurable keepalive (the residual
+    // gap). Captured only to warn on the plausible migration mistake —
+    // without this the keys are silently ignored by serde.
+    for (key, present, inbound_equivalent) in [
+        (
+            "keep-alive-idle",
+            raw.keep_alive_idle.is_some(),
+            "`tcp-keepalive-idle`",
+        ),
+        (
+            "keep-alive-interval",
+            raw.keep_alive_interval.is_some(),
+            "`tcp-keepalive-interval`",
+        ),
+        (
+            "disable-keep-alive",
+            raw.disable_keep_alive.is_some(),
+            "`tcp-keepalive: false`",
+        ),
+    ] {
+        if present {
+            warn!(
+                "{key}: tunes inbound AND outbound sockets upstream and is \
+                 ignored; the inbound-socket equivalent here is \
+                 {inbound_equivalent} (outbound dials keep no keepalive \
+                 tuning)"
+            );
+        }
+    }
+    Ok(config)
+}
+
+/// Resolve `tcp-idle-timeout` into the whole-connection relay idle bound,
+/// enforcing `build_config`'s semantics: `0` disables the bound entirely,
+/// absent also disables it (preserving pre-894 behaviour — no idle bound
+/// by default), and explicit seconds feed `Instant + Duration` inside the
+/// relay so they get the same ceiling as `tcp-connect-timeout` (issue #648).
+///
+/// `PUT /configs` calls this for both validation and hot-apply (the bound
+/// is replayed into `Tunnel::set_tcp_idle_timeout` at the commit point),
+/// so boot and reload can never diverge on the value.
+pub fn resolve_tcp_idle_timeout(
+    raw: &raw::RawConfig,
+) -> Result<Option<std::time::Duration>, anyhow::Error> {
+    match raw.tcp_idle_timeout {
+        Some(0) | None => Ok(None),
+        Some(secs) if secs > meow_common::MAX_DURATION_SECS => anyhow::bail!(
+            "tcp-idle-timeout: {secs}s exceeds the {}s ceiling",
+            meow_common::MAX_DURATION_SECS
+        ),
+        Some(secs) => Ok(Some(std::time::Duration::from_secs(secs))),
+    }
+}
+
 /// Build the authoritative list of named listeners from the raw config.
 /// Merges shorthand fields with the `listeners:` array and validates:
 ///   - No duplicate ports (Class A per ADR-0002)
@@ -4659,6 +4794,12 @@ pub async fn build_config(
         Some(addr) => addr.to_string(),
     };
 
+    // `tcp-idle-timeout` — resolution and validation live in
+    // [`resolve_tcp_idle_timeout`], which `PUT /configs` also gates
+    // persistence and hot-apply on so a committed document cannot fail
+    // this boot path.
+    let tcp_idle_timeout = resolve_tcp_idle_timeout(&raw)?;
+
     let general = GeneralConfig {
         mode,
         log_level,
@@ -4667,6 +4808,7 @@ pub async fn build_config(
         bind_address,
         connection_notes: raw.connection_notes.unwrap_or(false),
         logbook: raw::RawLogbook::enabled(raw.logbook.as_ref()),
+        tcp_idle_timeout,
     };
 
     // Registry the provider nodes' `dialer-proxy` targets resolve against
@@ -4855,6 +4997,12 @@ pub async fn build_config(
     // Build the named-listener list, checking for duplicate ports/names.
     let named_listeners = build_named_listeners(&raw, &bind_addr, global_tproxy_sni)?;
 
+    // `tcp-keepalive*` — the keepalive posture every inbound listener
+    // applies to accepted sockets. Resolution and validation live in
+    // [`resolve_tcp_keepalive`], which `PUT /configs` also gates
+    // persistence on so a committed document cannot fail this boot path.
+    let tcp_keepalive = resolve_tcp_keepalive(&raw)?;
+
     let listeners = ListenerConfig {
         mixed_port: raw.mixed_port,
         socks_port: raw.socks_port,
@@ -4863,6 +5011,7 @@ pub async fn build_config(
         tproxy_port: raw.tproxy_port,
         tproxy_sni: global_tproxy_sni,
         routing_mark: raw.routing_mark,
+        tcp_keepalive,
         named: named_listeners,
     };
 

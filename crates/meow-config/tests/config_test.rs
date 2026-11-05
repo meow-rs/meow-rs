@@ -3260,3 +3260,198 @@ geox-url:
     );
     assert_eq!(config.geodata.geosite_url, "https://alias.test/geosite.dat");
 }
+
+// ─── tcp-keepalive* / tcp-idle-timeout (zombie-connection bound) ───────────
+
+/// Keys absent: the defaults resolve — keepalive on at 300 s/30 s/5 probes,
+/// relay idle bound disabled (None; pre-894 behaviour preserved).
+#[tokio::test]
+async fn test_tcp_keepalive_defaults() {
+    let config = load_config_from_str("mixed-port: 7890\n").await.unwrap();
+    let ka = config.listeners.tcp_keepalive;
+    assert!(ka.enabled);
+    assert_eq!(ka.idle, std::time::Duration::from_secs(300));
+    assert_eq!(ka.interval, std::time::Duration::from_secs(30));
+    assert_eq!(ka.probes, 5);
+    assert_eq!(config.general.tcp_idle_timeout, None);
+}
+
+/// Explicit values round-trip into the resolved structs.
+#[tokio::test]
+async fn test_tcp_keepalive_explicit_values() {
+    let yaml = r#"
+tcp-keepalive: true
+tcp-keepalive-idle: 120
+tcp-keepalive-interval: 15
+tcp-keepalive-probes: 9
+tcp-idle-timeout: 1800
+"#;
+    let config = load_config_from_str(yaml).await.unwrap();
+    let ka = config.listeners.tcp_keepalive;
+    assert!(ka.enabled);
+    assert_eq!(ka.idle, std::time::Duration::from_secs(120));
+    assert_eq!(ka.interval, std::time::Duration::from_secs(15));
+    assert_eq!(ka.probes, 9);
+    assert_eq!(
+        config.general.tcp_idle_timeout,
+        Some(std::time::Duration::from_secs(1800))
+    );
+}
+
+/// `tcp-idle-timeout: 0` is the documented off-switch: resolves to `None`.
+#[tokio::test]
+async fn test_tcp_idle_timeout_zero_disables() {
+    let config = load_config_from_str("tcp-idle-timeout: 0\n").await.unwrap();
+    assert_eq!(config.general.tcp_idle_timeout, None);
+}
+
+/// `tcp-keepalive: false` resolves `enabled: false` (the config-level kill
+/// switch); parameter keys set alongside it take the warn path but still
+/// resolve to the configured values.
+#[tokio::test]
+async fn test_tcp_keepalive_false_resolves_disabled() {
+    let yaml = r#"
+tcp-keepalive: false
+tcp-keepalive-idle: 120
+"#;
+    let config = load_config_from_str(yaml).await.unwrap();
+    let ka = config.listeners.tcp_keepalive;
+    assert!(!ka.enabled);
+    assert_eq!(ka.idle, std::time::Duration::from_secs(120));
+}
+
+/// Validation matrix: zero/overflow seconds and out-of-range probe counts
+/// are hard config errors.
+#[tokio::test]
+async fn test_tcp_keepalive_validation_rejects_bad_values() {
+    for (yaml, needle) in [
+        ("tcp-keepalive-idle: 0\n", "tcp-keepalive-idle"),
+        ("tcp-keepalive-interval: 0\n", "tcp-keepalive-interval"),
+        ("tcp-keepalive-probes: 0\n", "tcp-keepalive-probes"),
+        ("tcp-keepalive-probes: 128\n", "tcp-keepalive-probes"),
+        (
+            "tcp-keepalive-idle: 18446744073709551615\n",
+            "tcp-keepalive-idle",
+        ),
+        (
+            "tcp-keepalive-interval: 18446744073709551615\n",
+            "tcp-keepalive-interval",
+        ),
+        // One past the setsockopt (EINVAL) ceiling must be a config
+        // error, not a silent runtime fallback to OS-default timing.
+        ("tcp-keepalive-idle: 32768\n", "tcp-keepalive-idle"),
+        ("tcp-keepalive-interval: 32768\n", "tcp-keepalive-interval"),
+        (
+            "tcp-idle-timeout: 18446744073709551615\n",
+            "tcp-idle-timeout",
+        ),
+    ] {
+        let err = load_config_from_str(yaml)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{yaml} must be rejected"));
+        assert!(
+            err.to_string().contains(needle),
+            "{yaml} — unexpected error: {err}"
+        );
+    }
+}
+
+/// Boundary accepts: the inclusive ends of each range and the exact
+/// `Instant + Duration` ceiling all resolve.
+#[tokio::test]
+async fn test_tcp_keepalive_boundaries_accept() {
+    let yaml = r#"
+tcp-keepalive-probes: 1
+tcp-idle-timeout: 1
+"#;
+    let config = load_config_from_str(yaml).await.unwrap();
+    assert_eq!(config.listeners.tcp_keepalive.probes, 1);
+    assert_eq!(
+        config.general.tcp_idle_timeout,
+        Some(std::time::Duration::from_secs(1))
+    );
+
+    let yaml = format!(
+        "tcp-keepalive-probes: 127\ntcp-idle-timeout: {}\n",
+        meow_common::MAX_DURATION_SECS
+    );
+    let config = load_config_from_str(&yaml).await.unwrap();
+    assert_eq!(config.listeners.tcp_keepalive.probes, 127);
+    assert_eq!(
+        config.general.tcp_idle_timeout,
+        Some(std::time::Duration::from_secs(
+            meow_common::MAX_DURATION_SECS
+        ))
+    );
+
+    // `tcp-keepalive-idle`/`-interval` top out at the setsockopt
+    // (EINVAL) ceiling, not the timer ceiling — Linux rejects
+    // TCP_KEEPIDLE/TCP_KEEPINTVL above 32767.
+    let yaml = format!(
+        "tcp-keepalive-idle: {0}\ntcp-keepalive-interval: {0}\n",
+        meow_common::tcp_opts::MAX_TCP_KEEPALIVE_SECS
+    );
+    let config = load_config_from_str(&yaml).await.unwrap();
+    assert_eq!(
+        config.listeners.tcp_keepalive.idle,
+        std::time::Duration::from_secs(meow_common::tcp_opts::MAX_TCP_KEEPALIVE_SECS)
+    );
+    assert_eq!(
+        config.listeners.tcp_keepalive.interval,
+        std::time::Duration::from_secs(meow_common::tcp_opts::MAX_TCP_KEEPALIVE_SECS)
+    );
+}
+
+/// `tcp-keepalive: false` silences *valid* parameter keys with a warn —
+/// but an invalid value is still a hard error even while disabled (dead
+/// config is tolerated, defective config is not).
+#[tokio::test]
+async fn test_tcp_keepalive_disabled_still_rejects_invalid() {
+    for line in [
+        "tcp-keepalive-probes: 0\n",
+        "tcp-keepalive-probes: 128\n",
+        "tcp-keepalive-idle: 0\n",
+        "tcp-keepalive-interval: 0\n",
+        "tcp-keepalive-idle: 32768\n",
+    ] {
+        let yaml = format!("tcp-keepalive: false\n{line}");
+        let err = load_config_from_str(&yaml)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{line} under tcp-keepalive: false must still be rejected"));
+        assert!(
+            err.to_string().contains("tcp-keepalive"),
+            "{line} — unexpected error: {err}"
+        );
+    }
+}
+
+/// Upstream mihomo's `keep-alive-*` keys (which tune inbound listeners
+/// AND outbound dials there) are captured and warned (never honored),
+/// not silently dropped: they must land in the `RawConfig` capture
+/// fields AND not fail the load.
+#[tokio::test]
+async fn test_upstream_keepalive_keys_warn_but_parse() {
+    let yaml = r#"
+keep-alive-idle: 15
+keep-alive-interval: 30
+disable-keep-alive: false
+mixed-port: 7890
+"#;
+    // The keys must be captured, not dropped as unknown fields — a
+    // misnamed serde field would leave `keep-alive-idle` silently
+    // ignored while this test's load assertions still pass.
+    let raw = meow_config::parse_raw_yaml(yaml).unwrap();
+    assert!(raw.keep_alive_idle.is_some());
+    assert!(raw.keep_alive_interval.is_some());
+    assert!(raw.disable_keep_alive.is_some());
+
+    let config = load_config_from_str(yaml).await.unwrap();
+    // Ignored upstream keys never reach the resolved inbound posture.
+    let ka = config.listeners.tcp_keepalive;
+    assert!(ka.enabled);
+    assert_eq!(ka.idle, std::time::Duration::from_secs(300));
+    assert_eq!(ka.interval, std::time::Duration::from_secs(30));
+    assert_eq!(ka.probes, 5);
+}

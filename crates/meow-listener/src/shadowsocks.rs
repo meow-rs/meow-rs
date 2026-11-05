@@ -21,7 +21,7 @@
 //! concrete stream type (`TcpStream` / `HttpObfsServer` / `TlsObfsServer`)
 //! rather than type-erased, keeping the relay hot path dispatch-free.
 
-use meow_common::{metadata_ip_literal, ConnType, Metadata, Network};
+use meow_common::{metadata_ip_literal, ConnType, Metadata, Network, TcpKeepaliveConfig};
 use meow_transport::simple_obfs::server::{HttpObfsServer, TlsObfsServer};
 use meow_tunnel::{route_inbound_tcp, ResolvedTarget, Tunnel};
 use shadowsocks::config::{ServerConfig, ServerType};
@@ -73,6 +73,9 @@ pub struct ShadowsocksListener {
     udp: bool,
     obfs: ObfsKind,
     max_connections: usize,
+    /// Keepalive posture applied to every accepted socket (see
+    /// [`crate::keepalive`]); `enabled: false` writes no sockopts.
+    tcp_keepalive: TcpKeepaliveConfig,
 }
 
 impl ShadowsocksListener {
@@ -106,6 +109,7 @@ impl ShadowsocksListener {
             udp,
             obfs,
             max_connections: DEFAULT_MAX_CONNECTIONS,
+            tcp_keepalive: TcpKeepaliveConfig::default(),
         })
     }
 
@@ -114,6 +118,14 @@ impl ShadowsocksListener {
     /// caps the UDP relay's concurrent `(peer, target)` flows.
     pub fn with_max_connections(mut self, max: usize) -> Self {
         self.max_connections = max;
+        self
+    }
+
+    /// Override the TCP keepalive posture applied to every accepted socket
+    /// (default [`TcpKeepaliveConfig::default`]). `enabled: false` performs
+    /// no keepalive `setsockopt` at all.
+    pub fn with_tcp_keepalive(mut self, cfg: TcpKeepaliveConfig) -> Self {
+        self.tcp_keepalive = cfg;
         self
     }
 
@@ -265,6 +277,20 @@ impl ShadowsocksListener {
         S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static,
         F: Fn(TcpStream) -> S + Clone + Send + Sync + 'static,
     {
+        // Wrap the codec `map` once so keepalive lands on the raw accepted
+        // socket — before obfs wrapping and SS decryption, the earliest
+        // point this listener sees the TcpStream. `ka` is Copy; `name` is
+        // an `Arc<str>` so `accept_map`'s per-connection `map.clone()` costs
+        // a refcount bump, not a heap alloc.
+        let map = {
+            let ka = self.tcp_keepalive;
+            let name: Arc<str> = self.name.as_str().into();
+            let inner = map;
+            move |t: TcpStream| {
+                crate::keepalive::apply(&t, ka, &name);
+                inner(t)
+            }
+        };
         let mut warned_saturated = false;
         // A persistent accept failure (fd exhaustion) must not spin the loop
         // or flood the log; a transient one must not be delayed meaningfully.
@@ -418,7 +444,7 @@ fn build_metadata(peer: SocketAddr, target: &Address, in_name: &str, in_port: u1
 use meow_common::atomic::{checked_increment, AtomicU, Uint};
 use meow_common::{ProxyPacketConn, ReplayWindow};
 use meow_tunnel::udp::DEFAULT_UDP_IDLE;
-use meow_tunnel::{MatchedRule, TunnelInner};
+use meow_tunnel::{MatchedRule, TunnelInner, UsingProxy};
 use shadowsocks::context::SharedContext;
 use shadowsocks::relay::udprelay::options::UdpSocketControlData;
 use shadowsocks::relay::udprelay::proxy_socket::ProxySocketError;
@@ -1174,7 +1200,7 @@ async fn run_ss_udp_flow<S>(
             "UDP {peer} --> {} match {} using {}",
             metadata.remote_address(),
             MatchedRule::new(&rule_name, &rule_payload, proxy.name()),
-            proxy.name()
+            UsingProxy::new(proxy.as_ref(), &metadata)
         );
         match inner.dial_udp(proxy.as_ref(), &metadata).await {
             Ok(conn) => Arc::from(conn),

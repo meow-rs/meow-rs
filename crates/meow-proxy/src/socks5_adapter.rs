@@ -20,7 +20,8 @@ use std::net::{IpAddr, SocketAddr};
 
 use async_trait::async_trait;
 use meow_common::{
-    AdapterType, MeowError, Metadata, ProxyAdapter, ProxyConn, ProxyHealth, ProxyPacketConn, Result,
+    AdapterType, MeowError, Metadata, Network, ProxyAdapter, ProxyConn, ProxyHealth,
+    ProxyPacketConn, Result,
 };
 use smallvec::SmallVec;
 use smol_str::SmolStr;
@@ -668,6 +669,12 @@ impl ProxyAdapter for Socks5Adapter {
         // point — `dial_udp` refuses on its own, so a stale optimistic
         // snapshot cannot open a raw socket.
         self.udp && (!self.dialer.is_proxy() || self.dialer.supports_udp())
+    }
+
+    /// A UDP flow's datagrams go to the server's relay as datagrams (the
+    /// TCP control connection beside them carries none of its bytes).
+    fn dialer_hop_network(&self, flow: Network) -> Network {
+        flow
     }
 
     async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {

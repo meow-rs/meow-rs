@@ -1,5 +1,5 @@
-use crate::statistics::{ProxyTraffic, Statistics};
-use crate::tunnel::{MatchedRule, ResolvedTarget, TunnelInner};
+use crate::statistics::{ConnCounters, Statistics};
+use crate::tunnel::{MatchedRule, ResolvedTarget, TunnelInner, UsingProxy};
 use dashmap::DashMap;
 use meow_common::atomic::{AtomicU, Int};
 use meow_common::{with_dial_timeout, AdapterType, Metadata, ProxyAdapter, ProxyPacketConn};
@@ -81,29 +81,28 @@ pub fn new_nat_table() -> NatTable {
 }
 
 /// A UDP flow's outbound, counting the payload it carries into the tunnel
-/// totals and its proxy's, as the TCP relay counts a stream. Wraps the
-/// conn rather than the relay loops because the NAT table's replies are
-/// read outside the crate (the mobile FFIs read `UdpSession::conn`). Costs
-/// each datagram one more boxed future (`async_trait`) than the bare conn.
+/// totals, its proxy's and the traffic ledger's, as the TCP relay counts a
+/// stream. Wraps the conn rather than the relay loops because the NAT
+/// table's replies are read outside the crate (the mobile FFIs read
+/// `UdpSession::conn`). Costs each datagram one more boxed future
+/// (`async_trait`) than the bare conn.
 struct CountedPacketConn {
     conn: Box<dyn ProxyPacketConn>,
     stats: Arc<Statistics>,
-    proxy: Option<Arc<ProxyTraffic>>,
+    counters: Arc<ConnCounters>,
 }
 
 #[async_trait::async_trait]
 impl ProxyPacketConn for CountedPacketConn {
     async fn read_packet(&self, buf: &mut [u8]) -> meow_common::Result<(usize, SocketAddr)> {
         let (n, from) = self.conn.read_packet(buf).await?;
-        self.stats
-            .record_packet_download(self.proxy.as_deref(), n as Int);
+        self.stats.record_download(&self.counters, n as Int);
         Ok((n, from))
     }
 
     async fn write_packet(&self, buf: &[u8], addr: &SocketAddr) -> meow_common::Result<usize> {
         let n = self.conn.write_packet(buf, addr).await?;
-        self.stats
-            .record_packet_upload(self.proxy.as_deref(), n as Int);
+        self.stats.record_upload(&self.counters, n as Int);
         Ok(n)
     }
 
@@ -116,59 +115,66 @@ impl ProxyPacketConn for CountedPacketConn {
     }
 }
 
+impl Drop for CountedPacketConn {
+    fn drop(&mut self) {
+        self.stats.end_udp_flow(&self.counters);
+    }
+}
+
 impl TunnelInner {
     /// Dial a UDP flow through `proxy`, bounded like mihomo's
-    /// `C.DefaultUDPTimeout`, and count what it carries toward the totals and
-    /// the proxy it ends at: a group's current member, the `chains[0]` a TCP
-    /// connection records. Every inbound dials its UDP flows here. A flow
-    /// ending at REJECT or PASS is not counted: those swallow each write and
-    /// report it sent.
+    /// `C.DefaultUDPTimeout`, and count what it carries toward the totals,
+    /// the proxy it ends at (a group's current member, the `chains[0]` a
+    /// TCP connection records) and the traffic ledger. Every inbound dials
+    /// its UDP flows here. A flow ending at REJECT or PASS is not counted:
+    /// those swallow each write and report it sent.
     pub async fn dial_udp(
         &self,
         proxy: &dyn ProxyAdapter,
         metadata: &Metadata,
     ) -> meow_common::Result<Box<dyn ProxyPacketConn>> {
-        let counted = udp_leaf_counters(&self.stats, proxy, metadata);
+        let counted = udp_leaf(proxy, metadata);
+        // The member carrying the leaf's dialer-proxy hop is peeked before
+        // the dial, as the leaf is: the dial commits the front's pick, and
+        // a round-robin front has moved on to the next member after it.
+        let via = match &counted {
+            Some(leaf) if meow_common::traffic_ledger::enabled() => match leaf {
+                Some(leaf) => leaf.dialer_hop(metadata),
+                None => proxy.dialer_hop(metadata),
+            },
+            _ => None,
+        };
         let conn = with_dial_timeout(proxy.name(), proxy.dial_udp(metadata)).await?;
         let Some(leaf) = counted else {
             return Ok(conn);
         };
+        let leaf = leaf.as_deref().map_or(proxy.name(), |leaf| leaf.name());
         Ok(Box::new(CountedPacketConn {
             conn,
             stats: Arc::clone(&self.stats),
-            proxy: leaf,
+            counters: self.stats.begin_udp_flow(leaf, || via, metadata),
         }))
     }
 }
 
-/// How a UDP flow through `adapter` is counted: `None` when it ends at an
-/// adapter that sends nothing, else the counters of the leaf it ends at
-/// (themselves `None` while headless, which keeps only the totals).
-fn udp_leaf_counters(
-    stats: &Statistics,
+/// The leaf a UDP flow through `adapter` ends at ([`crate::tcp::leaf_proxy`],
+/// `None` inside for `adapter` itself), or `None` when that leaf sends
+/// nothing.
+fn udp_leaf(
     adapter: &dyn ProxyAdapter,
     metadata: &Metadata,
-) -> Option<Option<Arc<ProxyTraffic>>> {
-    let mut leaf = None;
-    let mut next = adapter.unwrap_proxy(metadata, false);
-    for _ in 0..crate::tcp::MAX_CHAIN_HOPS {
-        let Some(hop) = next else {
-            break;
-        };
-        next = hop.unwrap_proxy(metadata, false);
-        leaf = Some(hop);
-    }
-    let (name, kind) = leaf
-        .as_deref()
-        .map_or((adapter.name(), adapter.adapter_type()), |hop| {
-            (hop.name(), hop.adapter_type())
-        });
+) -> Option<Option<Arc<dyn meow_common::Proxy>>> {
+    let leaf = crate::tcp::leaf_proxy(adapter, metadata);
+    let kind = leaf.as_deref().map_or(
+        adapter.adapter_type(),
+        meow_common::ProxyAdapter::adapter_type,
+    );
     match kind {
         AdapterType::Reject
         | AdapterType::RejectDrop
         | AdapterType::Pass
         | AdapterType::PassRule => None,
-        _ => Some(stats.proxy_counters(name)),
+        _ => Some(leaf),
     }
 }
 
@@ -351,7 +357,7 @@ pub async fn handle_udp(
         src,
         dst_addr,
         MatchedRule::new(&rule_name, &rule_payload, proxy.name()),
-        proxy.name()
+        UsingProxy::new(proxy.as_ref(), &metadata)
     );
 
     // Taken before the dial: a session dialled across a flush may sit on a

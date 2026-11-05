@@ -6,6 +6,7 @@
 pub mod log_stream;
 mod logbook;
 pub mod routes;
+mod traffic_ledger;
 pub mod ui;
 
 use dashmap::DashMap;

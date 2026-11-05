@@ -47,6 +47,9 @@ meow-tunnel = { workspace = true }
 base64 = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+# Accepted-socket TCP keepalive (`keepalive::apply`) — unconditional: the
+# helper is `#[cfg]`-gated internally per platform, not dep-gated.
+socket2 = { workspace = true }
 libc = "0.2"
 smallvec = { workspace = true }
 smol_str = { workspace = true }

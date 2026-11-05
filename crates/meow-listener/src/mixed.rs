@@ -1,7 +1,7 @@
 use crate::http_proxy;
 use crate::sniffer::SnifferRuntime;
 use crate::socks5;
-use meow_common::AuthConfig;
+use meow_common::{AuthConfig, TcpKeepaliveConfig};
 use meow_tunnel::Tunnel;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -24,6 +24,9 @@ pub struct MixedListener {
     name: String,
     auth: Option<Arc<AuthConfig>>,
     max_connections: usize,
+    /// Keepalive posture applied to every accepted socket (see
+    /// [`crate::keepalive`]); `enabled: false` writes no sockopts.
+    tcp_keepalive: TcpKeepaliveConfig,
 }
 
 impl MixedListener {
@@ -35,6 +38,7 @@ impl MixedListener {
             name,
             auth: None,
             max_connections: DEFAULT_MAX_CONNECTIONS,
+            tcp_keepalive: TcpKeepaliveConfig::default(),
         }
     }
 
@@ -42,6 +46,14 @@ impl MixedListener {
     /// [`DEFAULT_MAX_CONNECTIONS`]). `0` disables the cap.
     pub fn with_max_connections(mut self, max: usize) -> Self {
         self.max_connections = max;
+        self
+    }
+
+    /// Override the TCP keepalive posture applied to every accepted socket
+    /// (default [`TcpKeepaliveConfig::default`]). `enabled: false` performs
+    /// no keepalive `setsockopt` at all.
+    pub fn with_tcp_keepalive(mut self, cfg: TcpKeepaliveConfig) -> Self {
+        self.tcp_keepalive = cfg;
         self
     }
 
@@ -142,6 +154,11 @@ impl MixedListener {
                     continue;
                 }
             };
+
+            // Earliest point in the accepted socket's life: keepalive must
+            // be set before protocol peek/handshake/relay so a dead peer is
+            // reaped even if the conn stalls mid-handshake.
+            crate::keepalive::apply(&stream, self.tcp_keepalive, &self.name);
 
             let tunnel = self.tunnel.clone();
             let sniffer = self.sniffer.clone();
