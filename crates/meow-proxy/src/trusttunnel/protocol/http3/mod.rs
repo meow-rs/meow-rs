@@ -40,7 +40,7 @@ pub struct QuicConnector {
     /// [`tls::build`]) — the same split the HTTP/2 path's `TlsLayer` makes.
     server_name: Option<String>,
     /// Built once, as the H2 path builds its `TlsLayer` once at config load:
-    /// seeding the verify store parses the whole webpki root bundle (~140 DER
+    /// seeding the verify store parses the whole webpki root bundle (~120 DER
     /// certificates) into a fresh `X509Store`, which is not work a dial
     /// should repeat. `quiche::connect` needs `&mut Config` but holds no
     /// reference afterwards, so one mutex over the whole call is enough.

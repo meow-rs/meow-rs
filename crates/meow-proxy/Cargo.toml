@@ -100,7 +100,7 @@ quiche = { workspace = true, optional = true }
 # and the Snell / VMess / VLESS-encryption record AEAD (`src/aead.rs`). Same
 # `boring` crate (and vendored library) meow-transport links.
 boring = { workspace = true, optional = true }
-# Mozilla CA roots for the hysteria2 quiche verify store (mirrors meow-transport).
+# Mozilla CA roots for the trusttunnel-h3 quiche verify store (mirrors meow-transport).
 webpki-root-certs = { workspace = true, optional = true }
 blake2 = { workspace = true, optional = true }
 shadowsocks = { workspace = true, optional = true }
