@@ -9,6 +9,16 @@ pub(super) const HDR_LEN: usize = 10;
 /// `VIRTIO_NET_HDR_F_NEEDS_CSUM`: the transport checksum field holds the
 /// pseudo-header sum; the rest is summed from `csum_start` on.
 const F_NEEDS_CSUM: u8 = 1;
+#[cfg(target_os = "linux")]
+const GSO_TCPV4: u8 = 1;
+#[cfg(target_os = "linux")]
+const GSO_UDP: u8 = 3;
+#[cfg(target_os = "linux")]
+const GSO_TCPV6: u8 = 4;
+#[cfg(target_os = "linux")]
+const GSO_UDP_L4: u8 = 5;
+#[cfg(target_os = "linux")]
+const GSO_ECN: u8 = 0x80;
 
 /// Whether a framed read is one packet (no GSO aggregate).
 pub(super) fn is_single(hdr: &[u8]) -> bool {
@@ -39,7 +49,7 @@ pub(super) fn needs_csum(hdr: &[u8]) -> bool {
 /// Malformed framing yields nothing — the packet is dropped.
 #[cfg(target_os = "linux")]
 pub(super) fn to_plain(framed: &mut [u8]) -> Vec<Vec<u8>> {
-    let Ok(hdr) = tun_rs::VirtioNetHdr::decode(&framed[..HDR_LEN]) else {
+    let Ok(mut hdr) = tun_rs::VirtioNetHdr::decode(&framed[..HDR_LEN]) else {
         return Vec::new();
     };
     let pkt = &mut framed[HDR_LEN..];
@@ -49,18 +59,31 @@ pub(super) fn to_plain(framed: &mut [u8]) -> Vec<Vec<u8>> {
         }
         return vec![pkt.to_vec()];
     }
-    if hdr.gso_size == 0 {
+    // The kernel's `hdr_len` is not trusted (on the FORWARD path it can be
+    // the whole first packet): recompute it from the transport header, as
+    // tun-rs and wireguard-go do, before it shapes every segment.
+    let start = usize::from(hdr.csum_start);
+    let l4 = match hdr.gso_type & !GSO_ECN {
+        GSO_TCPV4 | GSO_TCPV6 => pkt
+            .get(start + 12)
+            .map(|b| usize::from(b >> 4) * 4)
+            .filter(|&l| l >= 20),
+        GSO_UDP | GSO_UDP_L4 => Some(8),
+        _ => None,
+    };
+    let Some(head) = l4.map(|l| start + l).filter(|&h| h < pkt.len()) else {
+        return Vec::new();
+    };
+    let Ok(head16) = u16::try_from(head) else {
+        return Vec::new();
+    };
+    hdr.hdr_len = head16;
+    let gso = usize::from(hdr.gso_size);
+    if gso == 0 || gso > pkt.len() {
         return Vec::new();
     }
-    let head = usize::from(hdr.hdr_len);
-    let count = pkt
-        .len()
-        .saturating_sub(head)
-        .div_ceil(usize::from(hdr.gso_size))
-        .max(1);
-    let mut out: Vec<Vec<u8>> = (0..count)
-        .map(|_| vec![0u8; head + usize::from(hdr.gso_size)])
-        .collect();
+    let count = pkt.len().saturating_sub(head).div_ceil(gso).max(1);
+    let mut out: Vec<Vec<u8>> = (0..count).map(|_| vec![0u8; head + gso]).collect();
     let mut sizes = vec![0usize; count];
     let is_v6 = pkt.first().is_some_and(|b| b >> 4 == 6);
     match tun_rs::gso_split(pkt, hdr, &mut out, &mut sizes, 0, is_v6) {
@@ -81,7 +104,11 @@ pub(super) fn to_plain(framed: &mut [u8]) -> Vec<Vec<u8>> {
 /// Without offload framing (off Linux) there is nothing to undo.
 #[cfg(not(target_os = "linux"))]
 pub(super) fn to_plain(framed: &mut [u8]) -> Vec<Vec<u8>> {
-    vec![framed[HDR_LEN..].to_vec()]
+    framed
+        .get(HDR_LEN..)
+        .map(<[u8]>::to_vec)
+        .into_iter()
+        .collect()
 }
 
 /// Finish a `NEEDS_CSUM` checksum: sum from `csum_start` on, seeded with the
