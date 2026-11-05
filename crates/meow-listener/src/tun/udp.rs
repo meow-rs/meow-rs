@@ -52,12 +52,52 @@ const MAX_FLOWS: usize = 1024;
 /// tasks here (issue #515).
 const HIJACK_IN_FLIGHT: usize = 64;
 
+/// Most client datagrams a QUIC sniff holds back before routing the flow.
+const QUIC_SNIFF_PACKETS: usize = 4;
+
 /// Sweep dead flow-table entries every this many datagrams.
 const SWEEP_INTERVAL: u32 = 256;
 
 /// `(payload, packet source, packet destination)` — the netstack `UdpMsg`
 /// layout, so a reply to a flow is sent as `(payload, dst, src)`.
-type ReplyMsg = (Vec<u8>, SocketAddr, SocketAddr);
+pub(super) type ReplyMsg = (Vec<u8>, SocketAddr, SocketAddr);
+
+/// A client datagram: `(payload, client source, destination)`.
+pub(super) type UdpPkt = lwip::UdpPkt;
+
+/// Where the TUN's UDP comes from and its replies go.
+pub(super) enum UdpIo {
+    /// lwIP's packet-level UDP socket.
+    Lwip(Box<UdpSocket>),
+    /// Straight from and to the device pumps (`tun.stack: system`): the
+    /// inbound pump parses each datagram off the device, the outbound pump
+    /// builds the reply packets — no netstack in between.
+    Direct {
+        incoming: mpsc::Receiver<UdpPkt>,
+        replies: mpsc::Sender<ReplyMsg>,
+    },
+}
+
+/// The datagram source of [`run_udp`].
+enum Incoming {
+    Lwip(lwip::UdpRecvHalf),
+    Direct(mpsc::Receiver<UdpPkt>),
+}
+
+impl Incoming {
+    async fn next(&mut self) -> Option<UdpPkt> {
+        match self {
+            Self::Lwip(r) => r.next().await,
+            Self::Direct(r) => r.recv().await,
+        }
+    }
+}
+
+/// Capacity of the pump → [`run_udp`] datagram queue (system stack); a
+/// full queue drops the datagram, as a socket buffer would.
+pub(super) const DIRECT_QUEUE: usize = 1024;
+/// Capacity of the [`run_udp`] → pump reply queue (system stack).
+pub(super) const DIRECT_REPLY_QUEUE: usize = REPLY_QUEUE;
 
 /// `(client source, packet destination)` — the flow-table key.
 type FlowKey = (SocketAddr, SocketAddr);
@@ -82,30 +122,40 @@ struct FlowEntry {
     last_activity: Arc<AtomicU64>,
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the listener's UDP knobs, passed once"
+)]
 pub(super) async fn run_udp(
     tunnel: Tunnel,
-    socket: Box<UdpSocket>,
+    io: UdpIo,
     dns_hijack: bool,
     udp_timeout: Duration,
     in_name: String,
     tun_net: TunNets,
     live_flows: Arc<AtomicUsize>,
+    sniffer: Option<Arc<crate::sniffer::SnifferRuntime>>,
 ) {
-    let (write_half, mut read_half) = socket.split();
-
-    let (reply_tx, mut reply_rx) = mpsc::channel::<ReplyMsg>(REPLY_QUEUE);
-    tokio::spawn(async move {
-        while let Some((data, src, dst)) = reply_rx.recv().await {
-            // `send_to(data, src, dst)`: appear as `src`, deliver to `dst`.
-            if let Err(e) = write_half.send_to(&data, &src, &dst) {
-                if e.kind() == std::io::ErrorKind::WouldBlock {
-                    continue;
+    let (reply_tx, mut incoming) = match io {
+        UdpIo::Lwip(socket) => {
+            let (write_half, read_half) = socket.split();
+            let (reply_tx, mut reply_rx) = mpsc::channel::<ReplyMsg>(REPLY_QUEUE);
+            tokio::spawn(async move {
+                while let Some((data, src, dst)) = reply_rx.recv().await {
+                    // `send_to(data, src, dst)`: appear as `src`, deliver to `dst`.
+                    if let Err(e) = write_half.send_to(&data, &src, &dst) {
+                        if e.kind() == std::io::ErrorKind::WouldBlock {
+                            continue;
+                        }
+                        debug!("tun UDP write half closed: {e}");
+                        break;
+                    }
                 }
-                debug!("tun UDP write half closed: {e}");
-                break;
-            }
+            });
+            (reply_tx, Incoming::Lwip(read_half))
         }
-    });
+        UdpIo::Direct { incoming, replies } => (replies, Incoming::Direct(incoming)),
+    };
 
     // Flow table, touched only by this loop. A flow task signals its own
     // death by closing its queue; the entry is evicted lazily — on the next
@@ -116,7 +166,7 @@ pub(super) async fn run_udp(
     let hijack_permits = Arc::new(tokio::sync::Semaphore::new(HIJACK_IN_FLIGHT));
     let hijack_dropped = AtomicU64::new(0);
 
-    while let Some((data, src, dst)) = read_half.next().await {
+    while let Some((data, src, dst)) = incoming.next().await {
         if dns_hijack && dst.port() == 53 {
             let resolver = tunnel.resolver();
             debug!(
@@ -253,6 +303,7 @@ pub(super) async fn run_udp(
                 udp_timeout,
                 in_name: in_name.clone(),
                 last_activity,
+                sniffer: sniffer.clone(),
             },
         ));
     }
@@ -268,6 +319,9 @@ struct FlowSpec {
     udp_timeout: Duration,
     in_name: String,
     last_activity: Arc<AtomicU64>,
+    /// The configured sniffer; its QUIC ports name a flow from the
+    /// client's Initials before it is routed.
+    sniffer: Option<Arc<crate::sniffer::SnifferRuntime>>,
 }
 
 /// Count a dropped hijack response and warn on a power-of-two cadence so
@@ -322,6 +376,7 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
         udp_timeout,
         in_name,
         last_activity,
+        sniffer,
     } = spec;
     let mut metadata = Metadata {
         network: Network::Udp,
@@ -333,6 +388,33 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
         in_name: in_name.into(),
         ..Default::default()
     };
+
+    // QUIC sniff: hold the first datagrams until their Initials yield the
+    // server name, at most `sniffer.timeout` and a few packets; they are
+    // sent upstream first once the flow is dialed.
+    let mut held: Vec<Vec<u8>> = Vec::new();
+    if sniffer.is_some() {
+        crate::sniffer::prefill_host(&tunnel.inner().resolver(), &mut metadata);
+    }
+    if let Some(rt) = sniffer.as_deref().filter(|rt| rt.wants_quic(&metadata)) {
+        let deadline = Instant::now() + rt.timeout();
+        let mut quic = crate::sniffer_quic::QuicSniffer::default();
+        while held.len() < QUIC_SNIFF_PACKETS {
+            let Ok(Some(data)) = tokio::time::timeout_at(deadline, rx.recv()).await else {
+                break;
+            };
+            let step = quic.feed(&data);
+            held.push(data);
+            match step {
+                crate::sniffer_quic::QuicSniffStep::Name(name) => {
+                    rt.maybe_apply_sniff(&name, &mut metadata);
+                    break;
+                }
+                crate::sniffer_quic::QuicSniffStep::More => {}
+                crate::sniffer_quic::QuicSniffStep::Done => break,
+            }
+        }
+    }
 
     let inner = tunnel.inner();
     if matches!(
@@ -418,6 +500,12 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
     // replies, and the idle deadline. Reply source addresses are not
     // rewritten: the tun flow is locked to one (src, dst) tuple, so every
     // reply is delivered as coming from `dst`.
+    for data in held {
+        conn.write_packet(&data, &dst_addr)
+            .await
+            .map_err(|e| format!("upstream write {dst_addr}: {e}"))?;
+    }
+
     let idle = sleep(udp_timeout);
     tokio::pin!(idle);
     let result = loop {
@@ -594,6 +682,7 @@ mod tests {
                     udp_timeout: std::time::Duration::from_millis(100),
                     in_name: "tun".to_string(),
                     last_activity: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                    sniffer: None,
                 },
             )
             .await;

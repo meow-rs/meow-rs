@@ -791,7 +791,7 @@ impl RawLogbook {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub struct RawSniffer {
     pub enable: Option<bool>,
@@ -805,14 +805,15 @@ pub struct RawSniffer {
     /// `pre_handle_metadata` always consults the reverse map regardless), so
     /// this flag is parsed and ignored for upstream-config compatibility.
     pub force_dns_mapping: Option<bool>,
-    /// Protocol → port list map. Recognised keys: `TLS`, `HTTP`.
+    /// Protocol → port list map. Recognised keys: `TLS`, `HTTP`, `QUIC`
+    /// (TUN UDP flows; v1 and v2, no draft-29).
     #[serde(default, deserialize_with = "deserialize_sniff_map")]
     pub sniff: Option<HashMap<String, RawSniffProtocol>>,
     pub force_domain: Option<Vec<String>>,
     pub skip_domain: Option<Vec<String>>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub struct RawSniffProtocol {
     #[serde(default, deserialize_with = "deserialize_port_list")]

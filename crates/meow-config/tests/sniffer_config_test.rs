@@ -76,8 +76,6 @@ async fn s3_enable_true_with_only_unknown_protocols_errors() {
 sniffer:
   enable: true
   sniff:
-    QUIC:
-      ports: [443]
     SOMETHING:
       ports: [9999]
 "#;
@@ -158,10 +156,10 @@ sniffer:
     assert_eq!(cfg.sniffer.http_ports, vec![80]);
 }
 
-// ─── S8: QUIC is ignored (warn-only) ─────────────────────────────────────
+// ─── S8: QUIC ports parse (sniffed on TUN UDP flows) ─────────────────────
 
 #[tokio::test]
-async fn s8_quic_protocol_ignored_with_other_proto_present() {
+async fn s8_quic_protocol_parses_its_ports() {
     let yaml = r#"
 sniffer:
   enable: true
@@ -172,9 +170,13 @@ sniffer:
       ports: [443]
 "#;
     let cfg = load_config_from_str(yaml).await.expect("must load");
-    // QUIC entry is silently dropped — we don't synthesise a quic_ports field.
     assert_eq!(cfg.sniffer.tls_ports, vec![443]);
     assert_eq!(cfg.sniffer.http_ports, Vec::<u16>::new());
+    assert_eq!(cfg.sniffer.quic_ports, vec![443]);
+    // Alone it is enough to enable the sniffer; no ports means 443.
+    let only = "sniffer:\n  enable: true\n  sniff:\n    QUIC: {}\n";
+    let cfg = load_config_from_str(only).await.expect("QUIC alone loads");
+    assert_eq!(cfg.sniffer.quic_ports, vec![443]);
 }
 
 // ─── S9: unknown protocol key is ignored ─────────────────────────────────

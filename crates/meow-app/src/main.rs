@@ -1584,7 +1584,8 @@ async fn run(
                 tun_config_to_listener_config(&config.tun),
                 "meow-tun".to_string(),
             )
-            .with_readiness_signal(ready_tx);
+            .with_readiness_signal(ready_tx)
+            .with_sniffer(Arc::clone(&sniffer_runtime));
             // The global-route binding installed before the config build
             // moves into the listener, which clears it with its routes —
             // or right away if startup fails (issue #695).

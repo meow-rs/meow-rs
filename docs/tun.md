@@ -493,10 +493,11 @@ Get-NetRoute -DestinationPrefix 0.0.0.0/1, 128.0.0.0/1   # after stopping meow: 
 | `auto-route` | `true` | What to route into the device at startup (removed on shutdown): `true` = everything the host sends, IPv6 too with `inet6-address` (global scope; Linux, macOS and Windows, fake-ip scope elsewhere); `global` = the same; `fake-ip` = the fake-ip range only; `false` = nothing. See *Route scopes*. |
 | `outbound-interface` | auto-detect | Physical interface outbound sockets bind to in global scope — the interface name on Linux/macOS (`eth0`, `en0`), the interface alias on Windows (`Ethernet`). Ignored otherwise. |
 | `dns-hijack` | on | In-process answering of UDP :53 flows entering the device, and in fake-ip mode the OS resolver redirect. Absent = on; a list with any `:53` entry = on; `[]` = off. Non-`:53` entries warn and are ignored. |
+| `stack` | `lwip` | `system` (or `mixed`): TCP is terminated by the host kernel — the pump rewrites each TCP packet's addresses to a kernel listener on the device address and back (a NAT inside the device subnet, so `inet4-address` needs a /31 or wider) — like mihomo's system stack; several times the throughput per CPU, and DIRECT flows splice in the kernel. UDP is parsed and built in the pump (mihomo's `mixed` uses gVisor for it; here `mixed` is `system`, with a warning); IP fragments and IPv6 extension headers go to lwIP, which reassembles UDP, while fragmented TCP is dropped. Without TSO on TUN the device opens without offload. Linux only (Windows and macOS keep lwIP); `gvisor` falls back to `lwip` with a warning. |
 | `udp-timeout` | `60` | Seconds of idle before a UDP flow is evicted. |
 | `max-connections` | `256` | Inherited from the top-level `max-connections` (`0` = unlimited); bounds **TCP** flows (a flow takes its slot when it leaves the 200 ms sniff window, so one that closes inside it never occupies one) — a change while TUN runs restarts the listener. The UDP flow table has its own fixed bound (1024 live flows, least-recently-active eviction) that `max-connections` does not adjust. |
 
-mihomo fields meow does not implement (`stack`, `strict-route`,
+mihomo fields meow does not implement (`strict-route`,
 `auto-detect-interface`, `mtu-v6`, `endpoint-independent-nat`,
 UID filters, …) are accepted with a startup warning and ignored — same
 forward-compat policy as the rest of the config surface.
@@ -582,3 +583,14 @@ On Linux, tproxy remains the lighter-weight choice for host-only TCP
 proxying; tun adds UDP and works without firewall integration. On Windows,
 tun is the only transparent option. For LAN-gateway setups, see
 [tproxy-gateway.md](tproxy-gateway.md).
+
+## Sniffing
+
+The top-level `sniffer:` applies to TUN flows as mihomo applies it to
+every inbound. TCP flows get TLS SNI / HTTP `Host`; on the lwIP stack the
+first bytes are gathered within the 200 ms sniff window until the TLS
+record is complete. UDP flows to `sniff.QUIC` ports get the server name
+from the client's Initial packets. A destination the DNS already names
+(a fake IP or a mapped address) keeps that name: the sniffed one cannot
+override it unless `force-domain` lists it. A `sniffer:`-only
+`PUT /configs` restarts the TUN so it takes the new settings.

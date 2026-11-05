@@ -76,12 +76,10 @@ In scope:
 
 Out of scope (defer):
 
-- QUIC / HTTP/3 sniffing (upstream has a `QUIC` sniffer; we skip until
-  QUIC ever gets a listener on our side).
 - `tls-fingerprint`-based sniffer bypass for detected probe traffic.
 - A runtime toggle via REST API — `sniffer.enable` is load-time only.
-- Sniffing on UDP flows (upstream reserves `sniff.QUIC` for this; out of
-  scope per bullet 1).
+- Sniffing UDP flows other than TUN's (`sniff.QUIC` names TUN UDP flows
+  from the client's Initials, QUIC v1 and v2; draft-29 is not read).
 
 ## Non-goals
 
@@ -209,8 +207,9 @@ warn-and-ignore vs hard-error on an unimplemented upstream knob.
    their hostnames downstream of sniffing, before rule matching and the
    dial — so the reverse table is applied regardless of the sniff result.
    Parser emits a single `tracing::warn!` at load time and continues.
-2. **No `QUIC` sniffer.** Upstream ships one; we do not. Parser warns
-   and ignores `sniff.QUIC.ports` if present.
+2. **`QUIC` on TUN only.** `sniff.QUIC.ports` (default `[443]`, as
+   upstream) names TUN UDP flows from their Initial packets — v1 and v2;
+   upstream also reads draft-29. Other inbounds carry no sniffed UDP.
 3. **No `tls-fingerprint` key.** Upstream has an undocumented feature
    gate that meow-rs does not implement. Rejected at parse time with
    a clear error (not silent) so users don't assume it's active.

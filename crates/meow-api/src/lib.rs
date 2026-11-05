@@ -64,6 +64,10 @@ pub fn tun_config_to_listener_config(
         dns_hijack: tun.dns_hijack,
         udp_timeout: tun.udp_timeout,
         max_connections: tun.max_connections,
+        stack: match tun.stack {
+            meow_config::TunStack::Lwip => meow_listener::TunStack::Lwip,
+            meow_config::TunStack::System => meow_listener::TunStack::System,
+        },
     }
 }
 

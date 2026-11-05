@@ -49,10 +49,12 @@ pub use mixed::MixedListener;
 #[cfg(feature = "listener-shadowsocks")]
 pub use shadowsocks::{ShadowsocksListener, SsObfsMode};
 pub use sniffer::SnifferRuntime;
+#[cfg(feature = "listener-tun")]
+pub(crate) mod sniffer_quic;
 #[cfg(feature = "listener-tproxy")]
 pub use tproxy::TProxyListener;
 #[cfg(feature = "listener-tun")]
-pub use tun::{OutboundBinding, TunListener, TunListenerConfig, TunReady, TunRouteScope};
+pub use tun::{OutboundBinding, TunListener, TunListenerConfig, TunReady, TunRouteScope, TunStack};
 
 #[cfg(all(
     test,

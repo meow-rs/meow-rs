@@ -313,6 +313,20 @@ pub struct TunConfig {
     /// loop has no listen-queue back-pressure of its own — this is what
     /// stops a reconnect storm from spawning unbounded `handle_tcp` tasks.
     pub max_connections: usize,
+    /// Which stack terminates the TUN's TCP (`tun.stack`).
+    pub stack: TunStack,
+}
+
+/// `tun.stack`. `system` and `mixed` hand TCP to the host
+/// kernel's stack, as mihomo's system stack does (Linux; elsewhere the
+/// listener falls back to lwIP); anything else (`gvisor`, `lwip`, unset)
+/// keeps the userspace lwIP stack. Under `system` UDP is handled in the
+/// pump (fragments and ICMP still go to lwIP).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TunStack {
+    #[default]
+    Lwip,
+    System,
 }
 
 /// Scope of the routes `tun.auto-route` installs (#375).
@@ -360,6 +374,7 @@ impl Default for TunConfig {
             dns_hijack: true,
             udp_timeout: std::time::Duration::from_secs(60),
             max_connections: 256,
+            stack: TunStack::Lwip,
         }
     }
 }
@@ -415,7 +430,6 @@ pub fn parse_tun_config(
     // Warn on upstream-only fields (Class B per ADR-0002; policy of #328:
     // never silently ignore a mihomo flag).
     for (name, val) in [
-        ("stack", &r.stack),
         ("strict-route", &r.strict_route),
         ("auto-detect-interface", &r.auto_detect_interface),
         ("auto-redirect", &r.auto_redirect),
@@ -524,7 +538,33 @@ pub fn parse_tun_config(
         dns_hijack,
         udp_timeout,
         max_connections: global_max_connections.unwrap_or(defaults.max_connections),
+        stack: parse_tun_stack(r.stack.as_ref()),
     })
+}
+
+fn parse_tun_stack(raw: Option<&serde_json::Value>) -> TunStack {
+    let Some(value) = raw else {
+        return TunStack::Lwip;
+    };
+    match value.as_str().map(str::to_ascii_lowercase).as_deref() {
+        Some("system") => TunStack::System,
+        Some("mixed") => {
+            warn!(
+                "tun.stack: mixed is system here — kernel TCP, and UDP parsed in \
+                 the pump rather than by a userspace stack"
+            );
+            TunStack::System
+        }
+        Some("gvisor") => {
+            warn!("tun.stack: gvisor is not available; using the userspace (lwip) stack");
+            TunStack::Lwip
+        }
+        Some("lwip" | "") => TunStack::Lwip,
+        _ => {
+            warn!("tun.stack: unknown value {value}; using the userspace (lwip) stack");
+            TunStack::Lwip
+        }
+    }
 }
 
 /// `tun.inet6-address` (#375): one IPv6 CIDR, as a string or as mihomo's
@@ -3230,6 +3270,12 @@ async fn load_rule_providers_async(
     .map_err(|e| anyhow::anyhow!("rule-provider load task failed: {e}"))?
 }
 
+/// The `sniffer:` block of a raw config (a TUN rebuilt on an API config
+/// change needs it).
+pub fn sniffer_config_from_raw(raw: &raw::RawConfig) -> Result<SnifferConfig, anyhow::Error> {
+    parse_sniffer_config(raw, raw.strict.unwrap_or(false))
+}
+
 fn parse_sniffer_config(
     raw: &raw::RawConfig,
     strict: bool,
@@ -3262,6 +3308,7 @@ fn parse_sniffer_config(
             // Parse per-protocol port lists.
             let mut tls_ports: Vec<u16> = Vec::new();
             let mut http_ports: Vec<u16> = Vec::new();
+            let mut quic_ports: Vec<u16> = Vec::new();
             if let Some(sniff_map) = rs.sniff.as_ref() {
                 for (key, proto) in sniff_map {
                     match key.to_uppercase().as_str() {
@@ -3272,7 +3319,8 @@ fn parse_sniffer_config(
                             http_ports = proto.ports.clone().unwrap_or_default();
                         }
                         "QUIC" => {
-                            warn!("sniffer.sniff.QUIC is not implemented in meow-rs; ignoring");
+                            // Upstream's default port for QUIC.
+                            quic_ports = proto.ports.clone().unwrap_or_else(|| vec![443]);
                         }
                         // An unrecognized key is a typo'd/dead declaration —
                         // a defect under strict (issue #533 review), unlike
@@ -3288,10 +3336,11 @@ fn parse_sniffer_config(
                         }
                     }
                 }
-                if enable && tls_ports.is_empty() && http_ports.is_empty() {
+                if enable && tls_ports.is_empty() && http_ports.is_empty() && quic_ports.is_empty()
+                {
                     anyhow::bail!(
                         "sniffer.sniff is present and enable: true, but no ports are configured \
-                        for any supported protocol (TLS/HTTP)"
+                        for any supported protocol (TLS/HTTP/QUIC)"
                     );
                 }
             } else if enable {
@@ -3319,6 +3368,7 @@ fn parse_sniffer_config(
                 override_destination: rs.override_destination.unwrap_or(false),
                 tls_ports,
                 http_ports,
+                quic_ports,
                 skip_domain: rs
                     .skip_domain
                     .iter()
@@ -3346,6 +3396,7 @@ fn parse_sniffer_config(
                 override_destination: false,
                 tls_ports: vec![443],
                 http_ports: Vec::new(),
+                quic_ports: Vec::new(),
                 skip_domain: Vec::new(),
                 force_domain: Vec::new(),
             })
