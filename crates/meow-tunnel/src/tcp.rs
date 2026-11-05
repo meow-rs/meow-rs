@@ -1158,8 +1158,8 @@ mod tests {
             route_one(&test_tunnel(), meta).await;
         });
         for line in [
-            "cats.invalid:443 match DOMAIN-SUFFIX(cats.invalid) using DIRECT",
-            "dogs.invalid:443 match MATCH(DIRECT) using DIRECT",
+            "cats.invalid:443 match DomainSuffix(cats.invalid) using DIRECT",
+            "dogs.invalid:443 match Match(DIRECT) using DIRECT",
             "birds.invalid:443 match Final(DIRECT) using DIRECT",
         ] {
             assert!(logs.contains(line), "no {line:?} in:\n{logs}");
@@ -1199,8 +1199,8 @@ mod tests {
             }
         });
         for line in [
-            "cats.invalid:443 match DOMAIN-SUFFIX(cats.invalid) using Proxy[DIRECT]",
-            "dogs.invalid:443 match MATCH(Auto) using Auto[DIRECT]",
+            "cats.invalid:443 match DomainSuffix(cats.invalid) using Proxy[DIRECT]",
+            "dogs.invalid:443 match Match(Auto) using Auto[DIRECT]",
         ] {
             assert!(logs.contains(line), "no {line:?} in:\n{logs}");
         }

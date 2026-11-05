@@ -60,7 +60,7 @@ async fn pre_resolve_populates_dst_ip_for_ipcidr_rule() {
         .resolve_proxy(&md)
         .await
         .expect("rule should match");
-    assert_eq!(rule_name, "IP-CIDR");
+    assert_eq!(rule_name, "IPCIDR");
 }
 
 #[tokio::test]

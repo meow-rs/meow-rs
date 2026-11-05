@@ -70,7 +70,7 @@ async fn lazy_resolves_ip_when_scan_reaches_ipcidr_rule() {
         .resolve_proxy_lazy(&mut md)
         .await
         .expect("rule should match");
-    assert_eq!(rule_name, "IP-CIDR");
+    assert_eq!(rule_name, "IPCIDR");
     assert_eq!(
         md.dst_ip,
         Some(real_ip),
@@ -107,7 +107,7 @@ async fn lazy_skips_dns_when_domain_rule_matches_first() {
         .resolve_proxy_lazy(&mut md)
         .await
         .expect("rule should match");
-    assert_eq!(rule_name, "DOMAIN-SUFFIX");
+    assert_eq!(rule_name, "DomainSuffix");
     assert!(
         md.dst_ip.is_none(),
         "domain match must not trigger DNS resolution",
@@ -145,5 +145,5 @@ async fn lazy_falls_through_to_final_when_nothing_matches() {
     // Resolution happened (9.9.9.9 does not match the CIDR), then the
     // strict re-match fell through to FINAL.
     assert_eq!(md.dst_ip, Some(real_ip));
-    assert_eq!(rule_name, "MATCH");
+    assert_eq!(rule_name, "Match");
 }

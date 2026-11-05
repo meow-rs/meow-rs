@@ -73,6 +73,84 @@ impl RuleType {
             RuleType::InUser => "IN-USER",
         }
     }
+
+    /// mihomo's `RuleType.String()` (`constant/rule.go`): the name the
+    /// REST API reports in `/rules` and a connection's `rule`, and which
+    /// dashboards display and filter on.
+    pub fn mihomo_name(self) -> &'static str {
+        match self {
+            RuleType::Domain => "Domain",
+            RuleType::DomainSuffix => "DomainSuffix",
+            RuleType::DomainKeyword => "DomainKeyword",
+            RuleType::DomainRegex => "DomainRegex",
+            RuleType::DomainWildcard => "DomainWildcard",
+            RuleType::GeoSite => "GeoSite",
+            RuleType::GeoIp => "GeoIP",
+            RuleType::SrcGeoIp => "SrcGeoIP",
+            RuleType::IpAsn => "IPASN",
+            RuleType::SrcIpAsn => "SrcIPASN",
+            RuleType::IpCidr => "IPCIDR",
+            RuleType::SrcIpCidr => "SrcIPCIDR",
+            RuleType::IpSuffix => "IPSuffix",
+            RuleType::SrcIpSuffix => "SrcIPSuffix",
+            RuleType::SrcPort => "SrcPort",
+            RuleType::DstPort => "DstPort",
+            RuleType::InPort => "InPort",
+            RuleType::InUser => "InUser",
+            RuleType::InName => "InName",
+            RuleType::InType => "InType",
+            RuleType::ProcessName => "ProcessName",
+            RuleType::ProcessPath => "ProcessPath",
+            RuleType::Match => "Match",
+            RuleType::RuleSet => "RuleSet",
+            RuleType::Network => "Network",
+            RuleType::Dscp => "DSCP",
+            RuleType::Uid => "Uid",
+            RuleType::SubRule => "SubRules",
+            RuleType::And => "AND",
+            RuleType::Or => "OR",
+            RuleType::Not => "NOT",
+        }
+    }
+
+    /// The type for a mihomo API name ([`Self::mihomo_name`]), so a rule
+    /// read back from `GET /rules` (`DomainSuffix,…`) parses again.
+    pub fn from_mihomo_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "Domain" => RuleType::Domain,
+            "DomainSuffix" => RuleType::DomainSuffix,
+            "DomainKeyword" => RuleType::DomainKeyword,
+            "DomainRegex" => RuleType::DomainRegex,
+            "DomainWildcard" => RuleType::DomainWildcard,
+            "GeoSite" => RuleType::GeoSite,
+            "GeoIP" => RuleType::GeoIp,
+            "SrcGeoIP" => RuleType::SrcGeoIp,
+            "IPASN" => RuleType::IpAsn,
+            "SrcIPASN" => RuleType::SrcIpAsn,
+            "IPCIDR" => RuleType::IpCidr,
+            "SrcIPCIDR" => RuleType::SrcIpCidr,
+            "IPSuffix" => RuleType::IpSuffix,
+            "SrcIPSuffix" => RuleType::SrcIpSuffix,
+            "SrcPort" => RuleType::SrcPort,
+            "DstPort" => RuleType::DstPort,
+            "InPort" => RuleType::InPort,
+            "InUser" => RuleType::InUser,
+            "InName" => RuleType::InName,
+            "InType" => RuleType::InType,
+            "ProcessName" => RuleType::ProcessName,
+            "ProcessPath" => RuleType::ProcessPath,
+            "Match" => RuleType::Match,
+            "RuleSet" => RuleType::RuleSet,
+            "Network" => RuleType::Network,
+            "DSCP" => RuleType::Dscp,
+            "Uid" => RuleType::Uid,
+            "SubRules" => RuleType::SubRule,
+            "AND" => RuleType::And,
+            "OR" => RuleType::Or,
+            "NOT" => RuleType::Not,
+            _ => return None,
+        })
+    }
 }
 
 impl fmt::Display for RuleType {
@@ -156,6 +234,12 @@ pub trait TargetProbe {
     /// SUB-RULE inner scans (upstream `matchSubRules`' `CheckPassRule`).
     fn is_pass_rule(&self, _name: &str) -> bool {
         false
+    }
+    /// Whether rule `rule_index` takes part in matching. A disabled rule
+    /// (mihomo `PATCH /rules/disable`) is skipped like a PASS target:
+    /// silently, and the scan continues with the next rule.
+    fn rule_enabled(&self, _rule_index: usize) -> bool {
+        true
     }
 }
 

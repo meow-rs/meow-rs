@@ -29,12 +29,14 @@ Status meanings:
 | `GET /logs` | Compatible | HTTP/WebSocket and plain/structured formats are supported. |
 | `GET /memory` | Compatible | HTTP/WebSocket; each client starts with the mihomo-compatible zero frame. |
 | `GET /dns/query` | Compatible | Supports address and generic RR types with the mihomo DNS JSON shape. |
-| `GET /rules` | Partial | `index`, `type`, `payload`, `proxy`, and `size` are present; rule-wrapper hit/miss data is unavailable. |
+| `GET /rules` | Compatible | `type` is mihomo's name (`DomainSuffix`); `extra` carries `disabled`, `hitCount` and `hitAt` (connections routed by the rule since it entered the list, and the last one's time; the epoch when none). `missCount` is always `0` and `missAt` the epoch: the compiled matcher never visits most rules, so misses are not counted. Lines a client rebuilds from `type,payload,proxy` parse back through `POST`/`PUT /rules`. |
+| `PATCH /rules/disable` | Compatible | `{index: disabled}`, any content type. A disabled rule is skipped and the plan recompiled without it, so a duplicate or shadowed rule behind it matches. Negative and out-of-range indexes are skipped; a key that is not an integer fails the request with nothing applied. The switch and hit counter follow a rule across config commits and subscription refreshes by type, payload and target. |
+| `GET/PUT/DELETE /storage/{key}` | Compatible | `null` when unset; a value is valid JSON of at most 1 MB (400 / 413, checked in that order); keys are at most 64 bytes; at most 16384 keys, a new one evicting an existing one past that. Kept in `ui-storage.json` beside the selector cache. |
 | `GET/PUT /providers/proxies[/{name}]` | Compatible | Refresh failures return 503. HTTP providers report `subscriptionInfo` from the `subscription-userinfo` response header. |
 | `GET /providers/proxies/{name}/healthcheck` | Compatible | Uses provider health-check configuration and returns 204. |
 | `GET /providers/proxies/{provider}/{proxy}[/healthcheck]` | Compatible | Provider member detail and delay probe; members carry `provider-name`. |
 | `GET/PUT /providers/rules[/{name}]` | Compatible | Includes format (`YamlRule`, `TextRule` or `MrsRule`: what the payload parsed as), vehicle type, rule count, and RFC 3339 update time. |
-| `GET/PATCH /configs` | Partial | Mode, log level and `tun` are mutable. A `tun` patch is merged over the current section and the TUN listener is started, stopped or restarted from the result, matching mihomo, with two differences: an omitted `enable` keeps the current state instead of turning TUN off, and a TUN that fails to start answers 500 instead of 204. Only the `tun` keys meow implements apply; the rest are ignored. `GET` reports `tun` with `enable` as the running state. Ports, `allow-lan`, `bind-address`, `ipv6`, `sniffing`, `tcp-concurrent`, `find-process-mode`, `interface-name`, TUIC and the other dynamic listeners are unavailable. |
+| `GET/PATCH /configs` | Partial | Mode, log level and `tun` are mutable. A `tun` patch is merged over the current section and the TUN listener is started, stopped or restarted from the result, matching mihomo, with two differences: an omitted `enable` keeps the current state instead of turning TUN off, and a TUN that fails to start answers 500 instead of 204. Only the `tun` keys meow implements apply; the rest are ignored. `GET` reports `tun` with `enable` as the running state. `GET` reports `sniffing` and `skip-auth-prefixes`, but a `PATCH` of them is ignored: both are wired into the listeners at startup. Ports, `allow-lan`, `bind-address`, `ipv6`, `tcp-concurrent`, `find-process-mode`, `interface-name`, TUIC and the other dynamic listeners are unavailable. |
 | `PUT /configs` | Partial | Reloads proxies/rules/mode while retaining providers and selection persistence; the DNS runtime is republished on input changes and the TUN listener restarts on `tun:` diffs, but ordinary listener hot replacement is unavailable. A JSON config document is legal YAML 1.2 input, but map order then comes from the submitted text's literal order — meow-rs never re-sorts, so clients needing deterministic `nameserver-policy`/`hosts` order should submit YAML. |
 | `POST /cache/dns/flush` | Compatible | Clears resolver cache. |
 | `POST /cache/fakeip/flush` | Compatible | Clears fake-IP allocations. |
@@ -51,9 +53,7 @@ provide and are not represented by fake-success stubs:
 
 | Route | Reason |
 |---|---|
-| `PATCH /rules/disable` | No rule-wrapper disable/hit-count runtime. |
 | `POST /configs/geo` | No hot geodata replacement transaction. |
-| `GET/PUT/DELETE /storage/{key}` | No controller storage database. |
 | `POST /restart` | Process lifecycle belongs to the service manager. |
 | `POST /upgrade`, `/upgrade/ui`, `/upgrade/geo` | No self-updater. |
 | Configurable DoH controller route | No external-controller DoH mount. |
@@ -78,7 +78,8 @@ The following routes are retained and do not collide with the mihomo surface:
 - `/api/subscriptions/*`
 - `/api/proxy-groups/*`
 - `/api/config/save`
-- rule CRUD extensions on `/rules`
+- rule CRUD extensions on `/rules`, including `POST /rules/append`
+  (`{"rule": "<line>"}`: one line after the config's rules)
 - `GET /dns/results` and `POST /dns/query`
 - `GET /listeners`
 - `GET /statistics`: `uploadTotal` / `downloadTotal` (the `/traffic`
