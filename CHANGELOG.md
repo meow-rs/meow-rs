@@ -71,6 +71,23 @@ the canonical, in-repo source a release is cut from.
   `boring` fails to compile; a real cross toolchain plus a one-line cast in
   `boring` gets past both.
 
+### Changed
+
+- **The routing log names the node a group dials through.** The
+  per-connection `match` line used to name only the rule's adapter, so a
+  flow through a group read `using my-ss`. It now adds the member in
+  brackets, as mihomo prints its chain: `using my-ss[HK-01]`. Nested
+  groups print the outer group and the final member (`Proxy[HK-01]`). A
+  plain proxy, DIRECT and REJECT print as before. The member is the one
+  the dial will take, the same one `/connections` lists in `chains`; a
+  relay group prints as itself (#895).
+- **Memory reporting on Linux reads `/proc/self/status`**: `meow-api`
+  takes `VmRSS` from procfs on Linux and no longer links `sysinfo` there;
+  other platforms keep `sysinfo` with its default features off, which
+  drops rayon too. The reported number is the same kernel counter. Default
+  musl binaries shrink by about 73 KB on x86_64 and 60 KB on aarch64
+  (#835).
+
 ### Fixed
 
 - **PROCESS-NAME, PROCESS-PATH and UID rules match every IPv4 client of
