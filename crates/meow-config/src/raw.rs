@@ -411,8 +411,9 @@ pub struct RawTun {
     /// userspace stack's minimum, RFC 8200 §5).
     pub mtu: Option<u16>,
     /// CIDR assigned to the device. Default: the first /30 of
-    /// `dns.fake-ip-range` (`198.18.0.1/30`), like mihomo.
-    pub inet4_address: Option<String>,
+    /// `dns.fake-ip-range` (`198.18.0.1/30`), like mihomo. A string, or
+    /// mihomo's list form (`[]netip.Prefix`; only the first entry is used).
+    pub inet4_address: Option<serde_json::Value>,
     /// Route installation on startup. Accepts the mihomo boolean
     /// (`true` = capture all traffic where supported, `false` = off) plus
     /// the #375 mode strings `fake-ip` and `global`. Default true.

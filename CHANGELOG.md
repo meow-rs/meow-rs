@@ -10,6 +10,9 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- `tun.inet4-address` accepts mihomo's list form (`[198.18.0.1/30]`, the
+  only form mihomo itself accepts) — the first entry is used, with a
+  warning when there are more — in the config and in `PATCH /configs`.
 - API: request bodies decode as JSON whatever their `Content-Type`, as
   mihomo does — dashboards that PUT a selection as `text/plain` or untyped
   no longer get 415.

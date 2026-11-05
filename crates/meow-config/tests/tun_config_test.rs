@@ -620,3 +620,27 @@ fn t18b_unusable_fake_ip_ranges_fall_back_to_the_default_range() {
         );
     }
 }
+
+// ─── T19: inet4-address list form (mihomo `[]netip.Prefix`) ──────────────
+
+#[tokio::test]
+async fn t19_inet4_address_list_form_uses_the_first_entry() {
+    let load = |v: &'static str| async move {
+        let yaml = format!("tun:\n  enable: true\n  inet4-address: {v}\n");
+        load_config_from_str(&yaml)
+            .await
+            .map(|c| c.tun.inet4_address.to_string())
+    };
+    assert_eq!(load("[10.9.0.1/30]").await.unwrap(), "10.9.0.1/30");
+    assert_eq!(
+        load("[10.9.0.1/30, 10.8.0.1/30]").await.unwrap(),
+        "10.9.0.1/30",
+        "first entry wins"
+    );
+    assert_eq!(load("[]").await.unwrap(), "198.18.0.1/30", "[] is unset");
+    assert_eq!(load("''").await.unwrap(), "198.18.0.1/30", "'' is unset");
+    for bad in ["[7]", "[not-a-cidr]", "{a: 1}"] {
+        let err = load(bad).await.expect_err(bad).to_string();
+        assert!(err.contains("inet4-address"), "{bad}: {err}");
+    }
+}

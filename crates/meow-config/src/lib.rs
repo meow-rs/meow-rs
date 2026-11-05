@@ -443,7 +443,7 @@ pub fn parse_tun_config(
         ));
     }
 
-    let inet4_address = match r.inet4_address.as_deref() {
+    let inet4_address = match first_cidr("inet4-address", "IPv4", r.inet4_address.as_ref())? {
         Some(s) => s
             .parse::<ipnet::Ipv4Net>()
             .map_err(|e| anyhow::anyhow!("tun.inet4-address: invalid CIDR '{s}': {e}"))?,
@@ -530,16 +530,21 @@ pub fn parse_tun_config(
 /// `tun.inet6-address` (#375): one IPv6 CIDR, as a string or as mihomo's
 /// list form. The device takes a single IPv6 address, so of a list only
 /// the first entry is used; an empty list or empty string is "unset".
-fn parse_inet6_address(
-    raw: Option<&serde_json::Value>,
-) -> Result<Option<ipnet::Ipv6Net>, anyhow::Error> {
+/// The CIDR string of a `tun.inet{4,6}-address`: a string or mihomo's list
+/// form, of which the first entry is used (with a warning when there are
+/// more). Unset, null, `''` and `[]` are `None`.
+fn first_cidr<'a>(
+    key: &str,
+    family: &str,
+    raw: Option<&'a serde_json::Value>,
+) -> Result<Option<&'a str>, anyhow::Error> {
     let cidr = match raw {
         None | Some(serde_json::Value::Null) => return Ok(None),
         Some(serde_json::Value::String(s)) => s.as_str(),
         Some(serde_json::Value::Array(entries)) => {
             if entries.len() > 1 {
                 warn!(
-                    "tun.inet6-address: {} entries given; meow-rs assigns one IPv6 \
+                    "tun.{key}: {} entries given; meow-rs assigns one {family} \
                      address to the device — only the first is used",
                     entries.len()
                 );
@@ -549,20 +554,26 @@ fn parse_inet6_address(
                 Some(serde_json::Value::String(s)) => s.as_str(),
                 Some(other) => {
                     return Err(anyhow::anyhow!(
-                        "tun.inet6-address: expected a CIDR string, got {other:?}"
+                        "tun.{key}: expected a CIDR string, got {other:?}"
                     ));
                 }
             }
         }
         Some(other) => {
             return Err(anyhow::anyhow!(
-                "tun.inet6-address: expected a CIDR string or a list of them, got {other:?}"
+                "tun.{key}: expected a CIDR string or a list of them, got {other:?}"
             ));
         }
     };
-    if cidr.is_empty() {
+    Ok((!cidr.is_empty()).then_some(cidr))
+}
+
+fn parse_inet6_address(
+    raw: Option<&serde_json::Value>,
+) -> Result<Option<ipnet::Ipv6Net>, anyhow::Error> {
+    let Some(cidr) = first_cidr("inet6-address", "IPv6", raw)? else {
         return Ok(None);
-    }
+    };
     cidr.parse::<ipnet::Ipv6Net>()
         .map(Some)
         .map_err(|e| anyhow::anyhow!("tun.inet6-address: invalid CIDR '{cidr}': {e}"))

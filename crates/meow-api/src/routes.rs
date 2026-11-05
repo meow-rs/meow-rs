@@ -835,7 +835,7 @@ struct TunFields {
     #[serde(skip_serializing_if = "Option::is_none")]
     mtu: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    inet4_address: Option<String>,
+    inet4_address: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     inet6_address: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
