@@ -1020,13 +1020,24 @@ impl ParsedUrl {
 
 /// Parse an `expected` query-param value into inclusive status-code ranges.
 /// Empty / `None` defaults to `[200..=299]`, matching upstream.
+/// Validate an `expected-status` spec at config load (mihomo fails the
+/// provider build on a bad one rather than every probe at run time).
+pub fn validate_expected_status(spec: &str) -> Result<(), String> {
+    parse_expected(Some(spec)).map(drop)
+}
+
+/// Codes and `lo-hi` ranges separated by `,` or `/` (mihomo's spelling,
+/// `200/302`), or `*` for any status.
 fn parse_expected(spec: Option<&str>) -> Result<Vec<(u16, u16)>, String> {
     let s = spec.unwrap_or("").trim();
     if s.is_empty() {
         return Ok(vec![(200, 299)]);
     }
+    if s == "*" {
+        return Ok(vec![(0, u16::MAX)]);
+    }
     let mut out = Vec::new();
-    for piece in s.split(',') {
+    for piece in s.split([',', '/']) {
         let piece = piece.trim();
         if piece.is_empty() {
             continue;
@@ -1138,6 +1149,12 @@ mod tests {
         );
         let cases: &[Case] = &[
             ("default: None is 2xx", None, Some(&[(200, 299)])),
+            (
+                "mihomo slash list",
+                Some("200/204"),
+                Some(&[(200, 200), (204, 204)]),
+            ),
+            ("mihomo any", Some("*"), Some(&[(0, u16::MAX)])),
             (
                 "default: empty string is 2xx",
                 Some(""),
