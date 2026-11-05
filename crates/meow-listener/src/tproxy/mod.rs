@@ -369,11 +369,13 @@ impl TProxyListener {
                 let tunnel = tunnel.clone();
                 let sniffer = sniffer.clone();
                 let name = name.clone();
+                // First thing on the accepted socket — before orig-dest
+                // recovery, sniffer peek, or relay, and in the accept loop
+                // itself rather than the spawned task (matching mixed and
+                // shadowsocks) — so a dead peer is reaped even if the conn
+                // stalls before its task is ever polled.
+                crate::keepalive::apply(&stream, tcp_keepalive, &name);
                 async move {
-                    // First thing on the accepted socket — before orig-dest
-                    // recovery, sniffer peek, or relay — so a dead peer is
-                    // reaped even if the conn stalls mid-handshake.
-                    crate::keepalive::apply(&stream, tcp_keepalive, &name);
                     if let Err(e) =
                         handle_tproxy_conn(tunnel, stream, src_addr, bound_addr, sniffer, name)
                             .await

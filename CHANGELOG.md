@@ -10,6 +10,22 @@ the canonical, in-repo source a release is cut from.
 
 ### Added
 
+- **Inbound zombie-connection reaping** (`tcp-keepalive*` +
+  `tcp-idle-timeout`): every accepted TCP socket on the
+  mixed/http/socks5/tproxy/shadowsocks inbounds now gets `SO_KEEPALIVE`
+  plus configurable `TCP_KEEPIDLE`/`TCP_KEEPINTVL`/`TCP_KEEPCNT`
+  (`tcp-keepalive`, `tcp-keepalive-idle: 300`, `tcp-keepalive-interval: 30`,
+  `tcp-keepalive-probes: 5` — ~450 s to detect a peer that leaves Wi-Fi
+  without FIN/RST), and established relays silent in **both** directions
+  for `tcp-idle-timeout` seconds (default 600) are torn down instead of
+  pinning a `max-connections` permit forever — covering what keepalive
+  cannot see (TUN netstack flows, dead-but-still-ACKing upstreams).
+  `tcp-keepalive: false` performs no setsockopt; `tcp-idle-timeout: 0`
+  disables the bound. `PUT /configs` validates all five keys and
+  hot-applies the idle bound; the keepalive posture is a listener-startup
+  snapshot. Note the idle bound is a behavioral divergence from mihomo:
+  a live-but-silent connection (idle SSH, IMAP IDLE, long-poll) is reaped
+  at the window where upstream waits forever.
 - **Traffic ledger** ([ADR-0015](docs/adr/0015-traffic-ledger.md)): meow
   now keeps, for every local day, the bytes and connections per host
   (registrable domain), app, leaf policy and interface label, for 62 days

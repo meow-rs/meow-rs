@@ -3212,3 +3212,73 @@ async fn test_tcp_keepalive_validation_rejects_bad_values() {
         );
     }
 }
+
+/// Boundary accepts: the inclusive ends of each range and the exact
+/// `Instant + Duration` ceiling all resolve.
+#[tokio::test]
+async fn test_tcp_keepalive_boundaries_accept() {
+    let yaml = r#"
+tcp-keepalive-probes: 1
+tcp-idle-timeout: 1
+"#;
+    let config = load_config_from_str(yaml).await.unwrap();
+    assert_eq!(config.listeners.tcp_keepalive.probes, 1);
+    assert_eq!(
+        config.general.tcp_idle_timeout,
+        Some(std::time::Duration::from_secs(1))
+    );
+
+    let yaml = format!(
+        "tcp-keepalive-probes: 127\ntcp-idle-timeout: {}\n",
+        meow_common::MAX_DURATION_SECS
+    );
+    let config = load_config_from_str(&yaml).await.unwrap();
+    assert_eq!(config.listeners.tcp_keepalive.probes, 127);
+    assert_eq!(
+        config.general.tcp_idle_timeout,
+        Some(std::time::Duration::from_secs(
+            meow_common::MAX_DURATION_SECS
+        ))
+    );
+}
+
+/// `tcp-keepalive: false` silences *valid* parameter keys with a warn —
+/// but an invalid value is still a hard error even while disabled (dead
+/// config is tolerated, defective config is not).
+#[tokio::test]
+async fn test_tcp_keepalive_disabled_still_rejects_invalid() {
+    for line in [
+        "tcp-keepalive-probes: 0\n",
+        "tcp-keepalive-probes: 128\n",
+        "tcp-keepalive-idle: 0\n",
+    ] {
+        let yaml = format!("tcp-keepalive: false\n{line}");
+        let err = load_config_from_str(&yaml)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{line} under tcp-keepalive: false must still be rejected"));
+        assert!(
+            err.to_string().contains("tcp-keepalive"),
+            "{line} — unexpected error: {err}"
+        );
+    }
+}
+
+/// Upstream mihomo's outbound `keep-alive-*` keys are captured and warned
+/// (never honored), not silently dropped: they must not fail the load.
+#[tokio::test]
+async fn test_upstream_keepalive_keys_warn_but_parse() {
+    let yaml = r#"
+keep-alive-idle: 15
+keep-alive-interval: 30
+disable-keep-alive: false
+mixed-port: 7890
+"#;
+    let config = load_config_from_str(yaml).await.unwrap();
+    // Ignored upstream keys never reach the resolved inbound posture.
+    let ka = config.listeners.tcp_keepalive;
+    assert!(ka.enabled);
+    assert_eq!(ka.idle, std::time::Duration::from_secs(300));
+    assert_eq!(ka.interval, std::time::Duration::from_secs(30));
+    assert_eq!(ka.probes, 5);
+}

@@ -123,6 +123,8 @@ These fields parse without error but behave differently from Go mihomo:
 | `geodata-mode`, `geodata-loader`, `geoip-matcher` | Valid fields | Ignored with warn-once (M2+) | B |
 | `dns.listen` / `external-controller` bind failure at startup | Logs error, daemon keeps running | Hard startup error (process exits non-zero) — no prior listener exists to fall back to (the `dns.listen` half keeps its tolerant keep-old semantics on runtime `PUT /configs` rebind; `external-controller` has no runtime rebind) | A |
 | `dns.listen` set while `dns.enable: false` | Silently ignored | Warn-once that no listener is started | B |
+| `keep-alive-idle` / `keep-alive-interval` / `disable-keep-alive` | Tune outbound socket keepalive | Parsed and ignored with a warn-once pointing to `tcp-keepalive*` — those upstream knobs never applied to inbound sockets, whose keepalive is a separate meow-rs feature | B |
+| silent long-lived inbound relay | Lives forever | Torn down after `tcp-idle-timeout` (default 600 s) of zero bytes in **both** directions — kernel keepalive probes are not relay bytes, so a live-but-silent flow (idle SSH without `ServerAliveInterval`, IMAP `IDLE`, long-poll) is still reaped; `tcp-idle-timeout: 0` restores upstream behaviour | B |
 
 ### Fields that are silently ignored in Go mihomo but error in meow-rs
 
@@ -627,6 +629,7 @@ tools built for Go mihomo will ignore them.
 | Rule CRUD API | `POST\|PUT\|DELETE /rules[/:index]` | Runtime rule editing |
 | Logbook | `GET\|DELETE /logbook`, `logbook: {enable: true}` | Persistent record of notable engine events, kept 7 days in `<home>/logbook/logbook.db`; not in `minimal` builds ([ADR-0014](adr/0014-logbook.md)) |
 | Traffic ledger | `GET\|DELETE /traffic/ledger`, `traffic-ledger: {enable: true, hosts: true, apps: true}` | Per-day traffic by host, app, policy and interface, kept 62 days in `<home>/traffic/traffic.db`; not in `minimal` builds ([ADR-0015](adr/0015-traffic-ledger.md)) |
+| Inbound socket keepalive + relay idle bound | `tcp-keepalive`, `tcp-keepalive-idle`/`interval`/`probes`, `tcp-idle-timeout` | `SO_KEEPALIVE` + timing on every accepted inbound socket, and a whole-connection idle bound that reaps relays silent in both directions (default 600 s, `0` disables); keepalive is a listener-startup snapshot, the idle bound is hot-applied by `PUT /configs` |
 
 Keep these under the `/api/` prefix so they do not collide with
 Clash-compatible paths.

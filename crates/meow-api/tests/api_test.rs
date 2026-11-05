@@ -6612,6 +6612,144 @@ async fn put_configs_invalid_tcp_keepalive_rejected_before_commit() {
     );
 }
 
+/// Same admission contract for `tcp-idle-timeout`: a value over the
+/// `Instant + Duration` ceiling `build_config` enforces must be rejected
+/// before commit — the rebuild never sees general fields, so without the
+/// gate a PUT could persist a config the next `load_config` refuses.
+#[tokio::test]
+async fn put_configs_invalid_tcp_idle_timeout_rejected_before_commit() {
+    use base64::Engine as _;
+    let state = test_state(test_raw_config());
+
+    let yaml = "mode: rule\ntcp-idle-timeout: 315360001\nrules:\n  - MATCH,DIRECT\n";
+    let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("tcp-idle-timeout")),
+        "the 400 must name the rejected key, got: {body}"
+    );
+    assert!(
+        state.raw_config.read().tcp_idle_timeout.is_none(),
+        "the rejected value must not have been committed"
+    );
+}
+
+/// `tcp-idle-timeout` is the one `tcp-*` knob that IS hot-applied: a PUT
+/// commits the document AND replays the resolved bound into the running
+/// tunnel (`set_tcp_idle_timeout`), where `0` disables it.
+#[tokio::test]
+async fn put_configs_tcp_idle_timeout_hot_applies() {
+    use base64::Engine as _;
+    let state = test_state(test_raw_config());
+
+    for (line, expected) in [
+        (
+            "tcp-idle-timeout: 1800\n",
+            Some(std::time::Duration::from_secs(1800)),
+        ),
+        ("tcp-idle-timeout: 0\n", None),
+    ] {
+        let yaml = format!("mode: rule\n{line}rules:\n  - MATCH,DIRECT\n");
+        let payload = base64::engine::general_purpose::STANDARD.encode(&yaml);
+        let resp = create_router(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/configs")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({"payload": payload}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT, "{line}must commit");
+        assert_eq!(
+            state.tunnel.inner().tcp_idle_timeout(),
+            expected,
+            "{line}must replay into the running bound"
+        );
+    }
+}
+
+/// `?force` keeps the running bound on an invalid `tcp-idle-timeout` —
+/// and rewrites the committed field to that bound. The warm-path commits
+/// (`commit_raw_candidate`) re-resolve the field on every mutation, so
+/// persisting the invalid value would 400 every later unrelated PATCH.
+#[tokio::test]
+async fn put_configs_force_tcp_idle_timeout_normalizes_commit() {
+    use base64::Engine as _;
+    let state = test_state(test_raw_config());
+    state
+        .tunnel
+        .set_tcp_idle_timeout(Some(std::time::Duration::from_secs(1800)));
+
+    let yaml = "mode: rule\ntcp-idle-timeout: 315360001\nrules:\n  - MATCH,DIRECT\n";
+    let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs?force=true")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        state.raw_config.read().tcp_idle_timeout,
+        Some(1800),
+        "the committed field is normalized to the running bound, not the invalid value"
+    );
+    assert_eq!(
+        state.tunnel.inner().tcp_idle_timeout(),
+        Some(std::time::Duration::from_secs(1800)),
+        "the running bound is kept"
+    );
+
+    // The poison check: a warm-path mutation on the committed document
+    // must succeed — the normalized value re-resolves cleanly.
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/rules")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    r#"{"rules":["DOMAIN-SUFFIX,example.com,DIRECT","MATCH,REJECT"]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NO_CONTENT,
+        "a forced commit must not poison later warm-path mutations"
+    );
+}
+
 /// `?force` degrades the `tun:` admission check to a warn: the unparsable
 /// section commits, the reconcile restart hits the spawn-side parse
 /// error, and `enable` rolls back — a 204 that still tears the healthy

@@ -1336,25 +1336,15 @@ async fn save_config(
 
 // ── Helper: rebuild proxies/rules from raw and apply to tunnel ───────
 
-/// Resolve a candidate's `tcp-idle-timeout` into the relay idle bound
-/// [`Tunnel::set_tcp_idle_timeout`] applies, using `build_config`'s rules:
-/// `0` disables the bound, absent means the default bound applies. The
-/// rebuild passes never see general fields (`RebuildResult` carries none),
-/// so each commit resolves the raw value itself and replays it beside
-/// `set_connection_notes` — otherwise the committed document and the
-/// running bound silently diverge until restart.
+/// Resolve a candidate's `tcp-idle-timeout` via
+/// [`meow_config::resolve_tcp_idle_timeout`] — the same `build_config`
+/// rules the boot path enforces — flattening the error to the response
+/// `String`. The rebuild passes never see general fields (`RebuildResult`
+/// carries none), so each commit resolves the raw value itself and
+/// replays it beside `set_connection_notes` — otherwise the committed
+/// document and the running bound silently diverge until restart.
 fn resolve_tcp_idle_timeout(raw: &RawConfig) -> Result<Option<Duration>, String> {
-    match raw.tcp_idle_timeout {
-        Some(0) => Ok(None),
-        Some(secs) if secs > meow_common::MAX_DURATION_SECS => Err(format!(
-            "tcp-idle-timeout: {secs}s exceeds the {}s ceiling",
-            meow_common::MAX_DURATION_SECS
-        )),
-        Some(secs) => Ok(Some(Duration::from_secs(secs))),
-        None => Ok(Some(Duration::from_secs(
-            meow_common::tcp_opts::DEFAULT_TCP_IDLE_TIMEOUT_SECS,
-        ))),
-    }
+    meow_config::resolve_tcp_idle_timeout(raw).map_err(|e| e.to_string())
 }
 
 /// Pre-resolve DNS-sourced ECH then rebuild proxies/rules from `raw` and
@@ -3665,14 +3655,24 @@ async fn put_configs(
     // sees general fields either, so its ceiling must gate persistence
     // here — committed unchecked, the next boot's `build_config` would
     // hard-error on a value this PUT accepted. `force` keeps the running
-    // bound, the same degrade the dns arm applies below.
+    // bound, the same degrade the dns arm applies below — AND normalizes
+    // the committed field to that bound: the warm-path commits
+    // (`commit_raw_candidate` → `apply_raw_to_tunnel`) re-resolve this
+    // field on every mutation, so persisting the invalid value would make
+    // every later unrelated PATCH fail with this same error.
     let tcp_idle_timeout = match resolve_tcp_idle_timeout(&raw_config) {
         Ok(timeout) => timeout,
         Err(msg) => {
             if force {
                 tracing::error!("config reload forced despite {msg}");
                 forced.push(msg);
-                state.tunnel.inner().tcp_idle_timeout()
+                let running = state.tunnel.inner().tcp_idle_timeout();
+                // Rewrite the invalid value to what is actually running —
+                // semantically equivalent for the next boot's
+                // `build_config` (0 = disabled) and boot-valid by
+                // construction.
+                raw_config.tcp_idle_timeout = Some(running.map_or(0, |d| d.as_secs()));
+                running
             } else {
                 return reload_rejected(StatusCode::BAD_REQUEST, &msg);
             }

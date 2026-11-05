@@ -4431,9 +4431,11 @@ pub fn resolve_named_listeners(raw: &raw::RawConfig) -> Result<Vec<NamedListener
 /// `build_config`'s semantics: the two seconds knobs feed OS keepalive
 /// timers, so they get the same `Instant + Duration` ceiling as
 /// `tcp-connect-timeout`/`udp-timeout` (issue #648); `tcp-keepalive-probes`
-/// is bounded at Linux's `TCP_KEEPCNT` clamp of 127 rather than silently
-/// truncated. `tcp-keepalive: false` turns the whole feature off — any
-/// parameter key still set then is dead config (loud, never fatal).
+/// is bounded at Linux's `TCP_KEEPCNT` limit of 127 — the kernel rejects
+/// (`EINVAL`) anything above, so the config errors early instead of
+/// relying on the syscall. `tcp-keepalive: false` turns the whole feature
+/// off — a parameter key still set then is dead config (loud, never
+/// fatal), though an *invalid* value still errors even when disabled.
 ///
 /// `PUT /configs` calls this for validation only — the resolved posture is
 /// a startup snapshot like `listeners:`, never hot-applied — so a
@@ -4487,7 +4489,49 @@ pub fn resolve_tcp_keepalive(
             }
         }
     }
+    // Upstream mihomo's `keep-alive-*` keys tune *outbound* sockets and are
+    // deliberately not honored here (`tcp-keepalive*` is the inbound
+    // analog). Captured only to warn on the plausible migration mistake —
+    // without this the keys are silently ignored by serde.
+    for (key, present) in [
+        ("keep-alive-idle", raw.keep_alive_idle.is_some()),
+        ("keep-alive-interval", raw.keep_alive_interval.is_some()),
+        ("disable-keep-alive", raw.disable_keep_alive.is_some()),
+    ] {
+        if present {
+            warn!(
+                "{key}: tunes upstream's outbound sockets and is ignored; \
+                 the inbound-socket equivalent here is `tcp-keepalive-idle` \
+                 / `tcp-keepalive-interval` / `tcp-keepalive`"
+            );
+        }
+    }
     Ok(config)
+}
+
+/// Resolve `tcp-idle-timeout` into the whole-connection relay idle bound,
+/// enforcing `build_config`'s semantics: `0` disables the bound entirely,
+/// absent applies the [`meow_common::tcp_opts::DEFAULT_TCP_IDLE_TIMEOUT_SECS`]
+/// default, and the seconds feed `Instant + Duration` inside the relay so
+/// they get the same ceiling as `tcp-connect-timeout` (issue #648).
+///
+/// `PUT /configs` calls this for both validation and hot-apply (the bound
+/// is replayed into `Tunnel::set_tcp_idle_timeout` at the commit point),
+/// so boot and reload can never diverge on the value.
+pub fn resolve_tcp_idle_timeout(
+    raw: &raw::RawConfig,
+) -> Result<Option<std::time::Duration>, anyhow::Error> {
+    match raw.tcp_idle_timeout {
+        Some(0) => Ok(None),
+        Some(secs) if secs > meow_common::MAX_DURATION_SECS => anyhow::bail!(
+            "tcp-idle-timeout: {secs}s exceeds the {}s ceiling",
+            meow_common::MAX_DURATION_SECS
+        ),
+        Some(secs) => Ok(Some(std::time::Duration::from_secs(secs))),
+        None => Ok(Some(std::time::Duration::from_secs(
+            meow_common::tcp_opts::DEFAULT_TCP_IDLE_TIMEOUT_SECS,
+        ))),
+    }
 }
 
 /// Build the authoritative list of named listeners from the raw config.
@@ -4733,22 +4777,11 @@ pub async fn build_config(
         Some(addr) => addr.to_string(),
     };
 
-    // `tcp-idle-timeout` seconds feed `Instant::now() + d` inside the
-    // relay — the same Instant+Duration overflow class as
-    // `tcp-connect-timeout` (issue #648), so it gets the same ceiling.
-    // `0` disables the bound entirely (the relay then behaves exactly as
-    // before this knob existed); absent means the default bound applies.
-    let tcp_idle_timeout = match raw.tcp_idle_timeout {
-        Some(0) => None,
-        Some(secs) if secs > meow_common::MAX_DURATION_SECS => anyhow::bail!(
-            "tcp-idle-timeout: {secs}s exceeds the {}s ceiling",
-            meow_common::MAX_DURATION_SECS
-        ),
-        Some(secs) => Some(std::time::Duration::from_secs(secs)),
-        None => Some(std::time::Duration::from_secs(
-            meow_common::tcp_opts::DEFAULT_TCP_IDLE_TIMEOUT_SECS,
-        )),
-    };
+    // `tcp-idle-timeout` — resolution and validation live in
+    // [`resolve_tcp_idle_timeout`], which `PUT /configs` also gates
+    // persistence and hot-apply on so a committed document cannot fail
+    // this boot path.
+    let tcp_idle_timeout = resolve_tcp_idle_timeout(&raw)?;
 
     let general = GeneralConfig {
         mode,

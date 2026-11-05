@@ -379,7 +379,8 @@ where
 /// zombie-connection bound the half-close [`RELAY_HALF_CLOSE_LINGER`]
 /// cannot provide, since the linger only arms once one direction has
 /// already reached EOF. `None` behaves exactly like
-/// [`copy_bidirectional_buf_tracked`].
+/// [`copy_bidirectional_buf_tracked`]; `Some(Duration::ZERO)` is treated
+/// as `None` (a zero deadline would otherwise fire on the first poll).
 pub async fn copy_bidirectional_buf_tracked_idle<A, B, FA, FB>(
     a: &mut A,
     b: &mut B,
@@ -444,8 +445,12 @@ where
 }
 
 /// [`copy_bidirectional_buf_tracked_splice`] plus the whole-connection
-/// `idle_timeout` bound of [`copy_bidirectional_buf_tracked_idle`].
-#[allow(clippy::too_many_arguments, reason = "mirrors copy_bidirectional_buf_tracked_splice's existing signature; idle_timeout cannot be folded into views")]
+/// `idle_timeout` bound of [`copy_bidirectional_buf_tracked_idle`]
+/// (`Some(Duration::ZERO)` likewise treated as `None`).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors copy_bidirectional_buf_tracked_splice's existing signature; idle_timeout cannot be folded into views"
+)]
 pub async fn copy_bidirectional_buf_tracked_splice_idle<A, B, FA, FB>(
     a: &mut A,
     b: &mut B,
@@ -475,7 +480,10 @@ where
     .await
 }
 
-#[allow(clippy::too_many_arguments, reason = "idle_timeout added this PR; a relay-options struct would be the right refactor but is out of scope here")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "idle_timeout added this PR; a relay-options struct would be the right refactor but is out of scope here"
+)]
 async fn relay<A, B, FA, FB>(
     a: &mut A,
     b: &mut B,
@@ -518,6 +526,10 @@ where
     // never sends another byte and never errors (dead LAN device, stalled
     // netstack flow, dead upstream) pins no task/socket/permit past the
     // window. `None` leaves the relay byte-for-byte identical to before.
+    // `Some(0)` is normalized away too: the tunnel-level contract for 0 is
+    // "disabled", while a literal zero deadline here would arm an
+    // already-elapsed timer that kills a healthy relay on its first poll.
+    let idle_timeout = idle_timeout.filter(|d| !d.is_zero());
     let idle = idle_timeout.map(tokio::time::sleep);
     tokio::pin!(idle);
     // Bytes relayed in both directions when the idle deadline was last
@@ -1232,6 +1244,40 @@ mod tests {
             assert_eq!(relayed.unwrap(), (LEN as u64, LEN as u64));
             assert_eq!(OPENED.with(Cell::get), before);
         }
+
+        // The splice entry point must carry the idle bound too: two real
+        // TCP pairs held open-and-silent resolve to `Err(TimedOut)` at the
+        // window. Paused time auto-advances once the relay is genuinely
+        // stalled, so the error proves the timer — not a peer event — fired.
+        #[tokio::test(start_paused = true)]
+        async fn idle_timeout_reaps_silent_spliced_relay() {
+            const IDLE: Duration = Duration::from_secs(30);
+
+            let (_client, mut a) = tcp_pair().await;
+            let (mut b, _upstream) = tcp_pair().await;
+
+            let mut buf1 = [0u8; RELAY_BUF_SIZE];
+            let mut buf2 = [0u8; RELAY_BUF_SIZE];
+            let err = tokio::time::timeout(
+                IDLE * 4,
+                copy_bidirectional_buf_tracked_splice_idle(
+                    &mut a,
+                    &mut b,
+                    &mut buf1,
+                    &mut buf2,
+                    (tcp_view, tcp_view),
+                    |_| {},
+                    |_| {},
+                    Some(IDLE),
+                ),
+            )
+            .await
+            .expect("spliced relay must resolve within the idle window")
+            .expect_err("a fully silent spliced relay must fail with the idle timeout");
+
+            assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+            assert_eq!(err.to_string(), "relay idle timeout");
+        }
     }
 
     // Zombie-connection bound: a relay on which NEITHER direction ever moves
@@ -1330,5 +1376,41 @@ mod tests {
         assert_eq!(up, 12, "every client byte was relayed");
         assert_eq!(drained, 12, "upstream received the full client stream");
         assert_eq!(down, 0, "upstream never sent anything");
+    }
+
+    // `Some(Duration::ZERO)` follows the tunnel-level contract ("0 disables
+    // the bound"), not a literal already-elapsed deadline: without the
+    // normalization in `relay()` this exchange would die with
+    // `Err(TimedOut)` on the first poll instead of completing cleanly.
+    #[tokio::test]
+    async fn idle_timeout_zero_is_disabled() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut client, mut a) = duplex(64);
+        let (mut b, mut upstream) = duplex(64);
+
+        let peer = tokio::spawn(async move {
+            upstream.read_exact(&mut [0u8; 4]).await.unwrap();
+            upstream.shutdown().await.unwrap();
+        });
+        client.write_all(b"pong").await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let mut buf1 = [0u8; RELAY_BUF_SIZE];
+        let mut buf2 = [0u8; RELAY_BUF_SIZE];
+        let (up, down) = copy_bidirectional_buf_tracked_idle(
+            &mut a,
+            &mut b,
+            &mut buf1,
+            &mut buf2,
+            |_| {},
+            |_| {},
+            Some(Duration::ZERO),
+        )
+        .await
+        .expect("a zero bound must disable the timer, not fire it instantly");
+
+        peer.await.unwrap();
+        assert_eq!((up, down), (4, 0));
     }
 }

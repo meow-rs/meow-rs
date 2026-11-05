@@ -303,8 +303,8 @@ pub struct RawConfig {
     /// (`SIO_KEEPALIVE_VALS` has no probe-count field; the OS default
     /// applies). Default
     /// [`meow_common::tcp_opts::DEFAULT_TCP_KEEPALIVE_PROBES`]; 1–127 —
-    /// Linux clamps above 127, so the config errors early instead of
-    /// silently clamping.
+    /// Linux rejects (`EINVAL`) counts above 127, so the config errors
+    /// early instead of relying on the syscall.
     pub tcp_keepalive_probes: Option<u32>,
     /// `tcp-idle-timeout` — whole-connection relay idle bound in seconds:
     /// an established relay that moves zero bytes in EITHER direction for
@@ -324,6 +324,12 @@ pub struct RawConfig {
     /// tproxy entry; `udp-timeout` on `listeners:`/`tun:`, issue #564).
     pub udp: Option<serde_json::Value>,
     pub udp_timeout: Option<serde_json::Value>,
+    /// Upstream mihomo's `keep-alive-*` keys tune *outbound* sockets and
+    /// are not honored — captured only to warn on the plausible migration
+    /// mistake (`tcp-keepalive*` above is the inbound-socket analog).
+    pub keep_alive_idle: Option<serde_json::Value>,
+    pub keep_alive_interval: Option<serde_json::Value>,
+    pub disable_keep_alive: Option<serde_json::Value>,
 }
 
 impl RawConfig {
