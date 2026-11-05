@@ -8,6 +8,8 @@ the canonical, in-repo source a release is cut from.
 
 ## [Unreleased]
 
+## [0.29.0] - 2026-11-05
+
 ### Added
 
 - **Inbound zombie-connection reaping** (`tcp-keepalive*` +
