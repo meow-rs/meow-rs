@@ -41,7 +41,9 @@ impl From<Vec<IpAddr>> for HostEntry {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum BootstrapError {
-    #[error("default-nameserver entry '{entry}' must be a plain UDP/TCP nameserver (tls:// and https:// are not allowed here because they would create a bootstrap loop)")]
+    #[error(
+        "default-nameserver entry '{entry}' must be a plain UDP/TCP nameserver (tls:// and https:// are not allowed here because they would create a bootstrap loop)"
+    )]
     DefaultNameserverNotPlain { entry: String },
     #[error("cannot resolve '{host}' via bootstrap nameserver: {source}")]
     CannotResolve { host: String, source: BoxError },
@@ -137,6 +139,7 @@ pub struct NameserverPolicy {
     /// Whether the next domain key may join a trailing `Domains` arm;
     /// [`Self::close_domain_arm`] clears it so the next one opens a new arm.
     domain_arm_open: bool,
+    exclusive: bool,
 }
 
 impl Default for NameserverPolicy {
@@ -151,7 +154,14 @@ impl NameserverPolicy {
             arms: Vec::new(),
             clients: Vec::new(),
             domain_arm_open: false,
+            exclusive: false,
         }
+    }
+
+    /// Make a matched policy the sole source for this query.
+    pub fn with_exclusive(mut self, exclusive: bool) -> Self {
+        self.exclusive = exclusive;
+        self
     }
 
     /// End the open domain arm without adding a matcher: the next domain
@@ -1879,6 +1889,13 @@ impl Resolver {
         debug!(host, ?want, "DNS lookup");
 
         // Domain-gate: skip primary entirely, go straight to fallback.
+        let matched = self
+            .policy
+            .as_ref()
+            .and_then(|p| p.lookup(host).map(|entry| (entry, p.exclusive)));
+        if let Some((entry, true)) = matched {
+            return query_pool_set(&entry.nameservers, host, want, self.ipv6).await;
+        }
         if let Some(ff) = &self.fallback_filter {
             if ff.domain_gated(host) {
                 conn_note!(Dns, "fallback-filter sends {host} to the fallback servers");
@@ -1894,34 +1911,32 @@ impl Resolver {
         let mut upstream_err: Option<ClientError> = None;
 
         // Nameserver-policy lookup.
-        if let Some(policy) = &self.policy {
-            if let Some(entry) = policy.lookup(host) {
-                conn_note!(Dns, "nameserver-policy matched {host}");
-                let (set, err) = query_pool_set(&entry.nameservers, host, want, self.ipv6).await;
-                upstream_err = prefer_errno(upstream_err, err);
-                if let Some(set) = set {
-                    if set.has_positive() {
-                        if self
-                            .fallback_filter
-                            .as_ref()
-                            .is_some_and(|ff| ff.ip_gated(&set.positive_ips()))
-                        {
-                            conn_note!(
-                                Dns,
-                                "fallback-filter rejects {}; asking the fallback servers",
-                                IpList(&set.positive_ips())
-                            );
-                            let (set, err) = self.query_fallback_set(host, want).await;
-                            return (set, prefer_errno(err, upstream_err));
-                        }
-                        return (Some(set), upstream_err);
+        if let Some((entry, _)) = matched {
+            conn_note!(Dns, "nameserver-policy matched {host}");
+            let (set, err) = query_pool_set(&entry.nameservers, host, want, self.ipv6).await;
+            upstream_err = prefer_errno(upstream_err, err);
+            if let Some(set) = set {
+                if set.has_positive() {
+                    if self
+                        .fallback_filter
+                        .as_ref()
+                        .is_some_and(|ff| ff.ip_gated(&set.positive_ips()))
+                    {
+                        conn_note!(
+                            Dns,
+                            "fallback-filter rejects {}; asking the fallback servers",
+                            IpList(&set.positive_ips())
+                        );
+                        let (set, err) = self.query_fallback_set(host, want).await;
+                        return (set, prefer_errno(err, upstream_err));
                     }
-                    if negative.is_none() {
-                        negative = Some(set);
-                    }
+                    return (Some(set), upstream_err);
                 }
-                // Policy negative: fall through to global nameservers.
+                if negative.is_none() {
+                    negative = Some(set);
+                }
             }
+            // Policy negative: fall through to global nameservers.
         }
 
         // Global nameservers (parallel, first-positive / first-definitive-negative).
@@ -2050,18 +2065,21 @@ impl Resolver {
         query_name: &Name,
         record_type: RecordType,
     ) -> Option<Message> {
+        let matched = self
+            .policy
+            .as_ref()
+            .and_then(|p| p.lookup(domain).map(|entry| (entry, p.exclusive)));
+        if let Some((entry, true)) = matched {
+            return query_pool_generic(&entry.nameservers, query_name, record_type).await;
+        }
         if let Some(ff) = &self.fallback_filter {
             if ff.domain_gated(domain) {
                 return self.try_fallback_generic(query_name, record_type).await;
             }
         }
-        if let Some(policy) = &self.policy {
-            if let Some(entry) = policy.lookup(domain) {
-                if let Some(l) =
-                    query_pool_generic(&entry.nameservers, query_name, record_type).await
-                {
-                    return Some(l);
-                }
+        if let Some((entry, _)) = matched {
+            if let Some(l) = query_pool_generic(&entry.nameservers, query_name, record_type).await {
+                return Some(l);
             }
         }
         if let Some(l) = query_pool_generic(&self.main, query_name, record_type).await {
@@ -4333,6 +4351,33 @@ mod tests {
             })),
         )];
         (resolver, dials)
+    }
+
+    #[tokio::test]
+    async fn exclusive_policy_confines_address_and_generic_queries() {
+        let host = "internal.example";
+        let name = Name::from_ascii(host).unwrap();
+        for exclusive in [true, false] {
+            let (mut resolver, main_dials) = emfile_resolver_gated(None);
+            let mut policy = NameserverPolicy::new().with_exclusive(exclusive);
+            policy.insert_exact(
+                host.into(),
+                PolicyEntry {
+                    nameservers: vec![],
+                },
+            );
+            resolver.policy = Some(policy);
+            resolver.pipeline_inner(host, QueryFamilies::IPV4).await;
+            resolver.forward_generic(host, &name, RecordType::TXT).await;
+            assert_eq!(
+                main_dials.load(std::sync::atomic::Ordering::SeqCst) == 0,
+                exclusive
+            );
+            resolver
+                .pipeline_inner("unmatched.example", QueryFamilies::IPV4)
+                .await;
+            assert!(main_dials.load(std::sync::atomic::Ordering::SeqCst) > 0);
+        }
     }
 
     fn emfile_resolver() -> Resolver {

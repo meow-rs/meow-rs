@@ -552,6 +552,9 @@ pub struct RawDns {
     /// value is a single server URL or a list of URLs. **Document order is
     /// the lookup priority** — see [`RawNameserverPolicy`].
     pub nameserver_policy: Option<RawNameserverPolicy>,
+    /// Confine matched queries to their assigned nameservers, even if they
+    /// fail or a fallback filter matches. Defaults to false.
+    pub nameserver_policy_exclusive: Option<bool>,
     /// Controls when the `fallback:` nameservers replace the primary result.
     pub fallback_filter: Option<RawFallbackFilter>,
     /// mihomo `prefer-h3`: every `https://` nameserver prefers HTTP/3 and

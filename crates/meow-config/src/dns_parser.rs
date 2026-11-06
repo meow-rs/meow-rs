@@ -236,7 +236,8 @@ pub async fn parse_dns(
                     rule_providers,
                     strict,
                 )
-                .await?,
+                .await?
+                .with_exclusive(dns.nameserver_policy_exclusive.unwrap_or(false)),
             )
         }
     } else {
@@ -268,7 +269,8 @@ pub async fn parse_dns(
                         rule_providers,
                         strict,
                     )
-                    .await?,
+                    .await?
+                    .with_exclusive(dns.nameserver_policy_exclusive.unwrap_or(false)),
                 )
             }
             _ => None,
