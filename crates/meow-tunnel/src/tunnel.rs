@@ -352,6 +352,11 @@ impl TunnelInner {
                 Some(host) => {
                     debug!("pre_handle_metadata: fake-ip {ip} → {host}");
                     conn_note!(Dns, "Fake IP {ip} maps to {host}");
+                    // A live allocation determines the dial target. A conflicting
+                    // sniffed name must not select another domain's routing rule.
+                    if metadata.sniff_host != host {
+                        metadata.sniff_host = Default::default();
+                    }
                     metadata.host = host;
                     metadata.dst_ip = None;
                 }

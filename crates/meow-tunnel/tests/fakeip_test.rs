@@ -68,6 +68,42 @@ async fn fakeip_destination_rewritten_to_hostname() {
 }
 
 #[tokio::test]
+async fn live_fakeip_routes_and_dials_by_the_mapped_name() {
+    let resolver = build_fakeip_resolver();
+    let fake = resolver.lookup_ipv4("mapped.test").await.unwrap();
+    let tunnel = Tunnel::new(resolver);
+    let cfg = meow_config::rebuild_from_raw(&Default::default()).unwrap();
+    tunnel.update_proxies(cfg.proxies, cfg.dialer_registry);
+    tunnel.update_rules(vec![
+        Box::new(meow_rules::domain_suffix::DomainSuffixRule::new(
+            "sniffed.test",
+            "REJECT",
+        )),
+        Box::new(meow_rules::domain_suffix::DomainSuffixRule::new(
+            "mapped.test",
+            "DIRECT",
+        )),
+    ]);
+    for network in [Network::Tcp, Network::Udp] {
+        let mut md = Metadata {
+            network,
+            dst_ip: Some(fake),
+            dst_port: 443,
+            sniff_host: "sniffed.test".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            tunnel.inner().pre_handle_metadata(&mut md),
+            PreHandleVerdict::Continue
+        );
+        let target = tunnel.inner().resolve_proxy_lazy(&mut md).await.unwrap();
+        assert_eq!(target.rule_payload, "mapped.test");
+        assert_eq!(target.adapter.name(), "DIRECT");
+        assert_eq!(md.remote_address().to_string(), "mapped.test:443");
+    }
+}
+
+#[tokio::test]
 async fn non_fakeip_destination_passes_through() {
     // Same resolver, but the incoming connection arrives with a real IP
     // (e.g. a SOCKS5 client dialed directly). pre_handle_metadata must
