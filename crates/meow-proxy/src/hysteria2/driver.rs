@@ -14,10 +14,11 @@ use super::auth::Auth;
 use super::obfs::{HopState, Obfs};
 use super::proto::{self, UdpMessage};
 use super::tcp::{DuplexStream, WRITE_BUFFER_BYTES};
+use super::udp::note_drop;
 use super::{Config, Error, Result};
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
@@ -197,6 +198,10 @@ struct State {
     udp_sessions: HashMap<u32, mpsc::Sender<UdpMessage>>,
     next_udp_session_id: u32,
     next_packet_id: u16,
+    /// Datagrams dropped on this connection's UDP path — send-side
+    /// backpressure, encode/queue failures and full per-session
+    /// queues. Per connection, per [`note_drop`]'s scoping rule.
+    dropped_udp: AtomicU64,
     closed: Arc<AtomicBool>,
 }
 
@@ -238,6 +243,7 @@ pub(crate) async fn spawn(
         udp_sessions: HashMap::new(),
         next_udp_session_id: 0,
         next_packet_id: 0,
+        dropped_udp: AtomicU64::new(0),
         closed: Arc::clone(&closed),
     };
 
@@ -277,7 +283,9 @@ async fn run(
     // turn; it holds any UDP payload.
     let mut buf = vec![0u8; 65535];
     // Exactly the send cap: a larger cap with a smaller buffer would emit
-    // unvalidated sizes and starve PMTUD probes.
+    // unvalidated sizes and starve PMTUD probes — which are themselves
+    // capped at the send cap (quiche's maximum_supported_mtu is the min
+    // of it and the advertised max_udp_payload_size), so the cap suffices.
     let mut send_buf = vec![0u8; super::tls::MAX_SEND_UDP_PAYLOAD];
     let mut keep_alive = tokio::time::interval_at(
         tokio::time::Instant::now() + KEEP_ALIVE_INTERVAL,
@@ -635,7 +643,9 @@ fn pump_datagrams(st: &mut State, conn: &mut quiche::Connection, buf: &mut [u8])
                     "hysteria2 decoded UDP fragment"
                 );
                 if let Some(tx) = st.udp_sessions.get(&msg.session_id) {
-                    let _ = tx.try_send(msg);
+                    if tx.try_send(msg).is_err() {
+                        note_drop(&st.dropped_udp, "session queue full");
+                    }
                 }
             }
             Err(e) => tracing::debug!("dropping malformed hysteria2 UDP datagram: {e}"),
@@ -658,10 +668,14 @@ fn send_udp(
         "hysteria2 sending UDP packet"
     );
     let Ok(header) = proto::udp_header_len(addr) else {
+        note_drop(&st.dropped_udp, "unencodable UDP address");
         return;
     };
     let payload_limit = max.saturating_sub(header);
     if payload_limit == 0 {
+        // No datagram capacity (quiche's send queue is full or
+        // datagrams are not writable yet): congestion as a drop.
+        note_drop(&st.dropped_udp, "datagram queue full");
         return;
     }
     let packet_id = st.next_packet_id;
@@ -669,6 +683,7 @@ fn send_udp(
 
     if data.len() <= payload_limit {
         send_one_udp(
+            &st.dropped_udp,
             conn,
             &UdpMessage {
                 session_id,
@@ -683,10 +698,12 @@ fn send_udp(
     }
     let frag_count = data.len().div_ceil(payload_limit);
     if frag_count > u8::MAX as usize {
+        note_drop(&st.dropped_udp, "fragment count overflow");
         return;
     }
     for (i, chunk) in data.chunks(payload_limit).enumerate() {
         send_one_udp(
+            &st.dropped_udp,
             conn,
             &UdpMessage {
                 session_id,
@@ -700,11 +717,14 @@ fn send_udp(
     }
 }
 
-fn send_one_udp(conn: &mut quiche::Connection, msg: &UdpMessage) {
-    if let Ok(encoded) = proto::encode_udp_message(msg) {
-        if let Err(e) = conn.dgram_send(&encoded) {
-            tracing::debug!("hysteria2 could not queue UDP datagram: {e}");
+fn send_one_udp(dropped: &AtomicU64, conn: &mut quiche::Connection, msg: &UdpMessage) {
+    match proto::encode_udp_message(msg) {
+        Ok(encoded) => {
+            if let Err(e) = conn.dgram_send(&encoded) {
+                note_drop(dropped, format_args!("dgram_send: {e}"));
+            }
         }
+        Err(e) => note_drop(dropped, format_args!("dgram encode: {e}")),
     }
 }
 

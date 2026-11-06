@@ -7,6 +7,7 @@ use super::driver::Cmd;
 use super::proto::{UdpMessage, MAX_UDP_SIZE};
 use super::{Error, Result};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
@@ -17,6 +18,8 @@ pub struct UdpSession {
     cmd_tx: mpsc::Sender<Cmd>,
     packets: mpsc::Receiver<UdpMessage>,
     defragger: UdpDefragger,
+    /// This session's dropped-datagram count — see [`note_drop`].
+    dropped: AtomicU64,
 }
 
 impl UdpSession {
@@ -30,6 +33,7 @@ impl UdpSession {
             cmd_tx,
             packets,
             defragger: UdpDefragger::new(),
+            dropped: AtomicU64::new(0),
         }
     }
 
@@ -37,7 +41,7 @@ impl UdpSession {
         if data.len() > MAX_UDP_SIZE {
             // Too big for the protocol: drop it as a link would, rather
             // than fail the whole association (same teardown as `Full`).
-            note_drop("oversized UDP payload");
+            note_drop(&self.dropped, "oversized UDP payload");
             return Ok(());
         }
         match self.cmd_tx.try_send(Cmd::SendUdp {
@@ -52,7 +56,7 @@ impl UdpSession {
             // connected UDP peers (iperf3, QUIC, games) then ignore.
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(_)) => {
-                note_drop("driver queue full");
+                note_drop(&self.dropped, "driver queue full");
                 Ok(())
             }
             Err(mpsc::error::TrySendError::Closed(_)) => Err(Error::Closed),
@@ -67,18 +71,19 @@ impl UdpSession {
                 Ok(None) => {}
                 // A bad fragment set is per-datagram junk, not a dead
                 // session: drop it and keep reading.
-                Err(_) => note_drop("bad UDP fragment set"),
+                Err(_) => note_drop(&self.dropped, "bad UDP fragment set"),
             }
         }
     }
 }
 
-/// Datagrams dropped on the session paths, process-wide; logged at
-/// powers of two so a saturated relay stays observable without flooding.
-static DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-fn note_drop(reason: &str) {
-    let n = DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+/// Count a dropped datagram, logging at powers of two so a saturated
+/// relay stays observable without flooding. The counter is scoped to
+/// one session or one connection — never process-wide, or one busy
+/// flow pushes it past the powers of two that would log a quiet
+/// flow's first drops.
+pub(super) fn note_drop(dropped: &AtomicU64, reason: impl std::fmt::Display) {
+    let n = dropped.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
     if n.is_power_of_two() {
         tracing::debug!(dropped = n, "hysteria2 udp: datagram dropped ({reason})");
     }

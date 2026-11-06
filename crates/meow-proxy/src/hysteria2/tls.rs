@@ -62,11 +62,12 @@ pub fn build_quiche_config(config: &Config) -> Result<quiche::Config> {
     quic.grease(false);
     // UDP relay rides QUIC datagrams.
     quic.enable_dgram(true, DGRAM_QUEUE_LEN, DGRAM_QUEUE_LEN);
-    // Hysteria 2 clients run BBR or, with a bandwidth set, Brutal — which
-    // quiche lacks, so meow always runs BBRv2 — never a loss-driven CC: quiche's default CUBIC collapses its window on the
-    // datagram loss a saturated UDP relay sees, and the upload rate with
-    // it (meow-openwrt, openwrt-fork/bench/tunbench.sh: 0.5 Mbit/s at
-    // 300 Mbit/s offered).
+    // Hysteria 2 clients run BBR or, with a bandwidth set, Brutal —
+    // which quiche lacks, so meow always runs BBRv2, never a
+    // loss-driven CC: quiche's default CUBIC collapses its window on
+    // the datagram loss a saturated UDP relay sees, and the upload rate
+    // with it (meow-openwrt, openwrt-fork/bench/tunbench.sh: 0.5 Mbit/s
+    // at 300 Mbit/s offered).
     quic.set_cc_algorithm(quiche::CongestionControlAlgorithm::Bbr2Gcongestion);
     // quiche sends 1200-byte packets by default: a 1200-byte UDP payload
     // plus the Hysteria 2 header then no longer fits one DATAGRAM frame and
