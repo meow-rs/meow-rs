@@ -1148,6 +1148,11 @@ tokio::task_local! {
 /// stack. 16 is far above any sane front-hop depth.
 pub(crate) const MAX_DIALER_CHAIN_DEPTH: usize = 16;
 
+/// How many `dialer-proxy` hops the current dial is nested in.
+pub(crate) fn chain_depth() -> usize {
+    DIALER_CHAIN_DEPTH.try_with(|d| *d).unwrap_or(0)
+}
+
 std::thread_local! {
     /// Depth of nested `supports_udp` resolution on the current thread —
     /// the synchronous counterpart of `DIALER_CHAIN_DEPTH`. A dynamic
@@ -1200,7 +1205,7 @@ pub(crate) async fn scoped_chain_dial<F, T, E>(
 where
     F: std::future::Future<Output = Result<T, E>>,
 {
-    let depth = DIALER_CHAIN_DEPTH.try_with(|d| *d).unwrap_or(0);
+    let depth = chain_depth();
     if depth >= MAX_DIALER_CHAIN_DEPTH {
         return Err(over_limit(target_name));
     }

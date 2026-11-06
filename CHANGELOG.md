@@ -48,6 +48,12 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **Dial errors name the node behind a group.** A failed dial through a
+  proxy group logged only the rule's target (`dial error: …`), which hides
+  which member failed. The line now reads `dial error using Proxy → HK-01:
+  …`, naming the member the dial itself went through (a concurrent dial
+  moving a round-robin group on does not change it); a leaf target is
+  named once.
 - **Plain-HTTP origin-form requests work again.** `GET /path` + a `Host:`
   header — the request shape every browser sends a plain-HTTP proxy —
   was refused with 400 by the #734 hostname gate, which only looked at
