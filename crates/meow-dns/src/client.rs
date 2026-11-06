@@ -139,10 +139,29 @@ pub trait SocketFactory: Send + Sync + 'static {
     /// `0.0.0.0:0`.
     fn bind_udp(&self) -> BoxFuture<'_, io::Result<UdpSocket>>;
 
-    /// Bind for a known upstream. Existing custom factories keep their
-    /// socket creation and protection hooks unless they opt into peer selection.
-    fn bind_udp_for_peer(&self, _peer: IpAddr) -> BoxFuture<'_, io::Result<UdpSocket>> {
-        self.bind_udp()
+    /// Bind for a known upstream. The socket must be able to reach `peer`:
+    /// an IPv4-bound socket can never reach a native IPv6 peer, so a
+    /// factory whose [`bind_udp`](Self::bind_udp) yields a single-family
+    /// socket **must** override this to bind in `peer`'s family — without
+    /// that override IPv6 upstreams still fail, the bug this hook fixes.
+    ///
+    /// The default delegates to [`bind_udp`](Self::bind_udp), so custom
+    /// factories keep their socket creation and protection hooks, then
+    /// refuses the provably-unreachable pairing — IPv4-bound socket for a
+    /// native IPv6 peer — with `AddrNotAvailable` up front instead of a
+    /// late, opaque `connect()` failure.
+    fn bind_udp_for_peer(&self, peer: IpAddr) -> BoxFuture<'_, io::Result<UdpSocket>> {
+        Box::pin(async move {
+            let socket = self.bind_udp().await?;
+            if socket.local_addr()?.is_ipv4() && peer.to_canonical().is_ipv6() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrNotAvailable,
+                    "SocketFactory::bind_udp returned an IPv4 socket for an \
+                     IPv6 peer; override bind_udp_for_peer",
+                ));
+            }
+            Ok(socket)
+        })
     }
 
     /// Open an outbound TCP connection to `addr`.
@@ -3136,8 +3155,43 @@ mod tests {
         assert_eq!(relevant_ip_answers(&message), (Vec::new(), None));
     }
 
+    /// A factory that overrides only `bind_udp` with a single-family IPv4
+    /// socket must get an explicit error — not a late `connect()`
+    /// `EAFNOSUPPORT` — when an IPv6 peer asks for a socket it can never
+    /// reach.
+    #[tokio::test]
+    async fn bind_udp_for_peer_default_rejects_v4_socket_for_v6_peer() {
+        struct V4Only;
+        impl SocketFactory for V4Only {
+            fn bind_udp(&self) -> BoxFuture<'_, io::Result<UdpSocket>> {
+                Box::pin(async { UdpSocket::bind("0.0.0.0:0").await })
+            }
+            fn connect_tcp(&self, _addr: SocketAddr) -> BoxFuture<'_, io::Result<TcpStream>> {
+                unreachable!("udp-only test factory")
+            }
+        }
+        let err = V4Only
+            .bind_udp_for_peer("2001:db8::53".parse().unwrap())
+            .await
+            .expect_err("an IPv4-bound socket cannot reach an IPv6 peer");
+        assert_eq!(err.kind(), io::ErrorKind::AddrNotAvailable);
+        // The same default keeps delegating for a peer the socket can reach.
+        let socket = V4Only
+            .bind_udp_for_peer("192.0.2.53".parse().unwrap())
+            .await
+            .expect("IPv4 peer keeps the delegated bind_udp socket");
+        assert!(socket.local_addr().unwrap().is_ipv4());
+    }
+
+    /// Probe first so a kernel with IPv6 disabled (e.g. `ipv6.disable=1`
+    /// sandboxes) skips instead of failing on `EADDRNOTAVAIL`; the
+    /// `unwrap` below still fails on a real `bind_udp_for_peer` regression.
     #[tokio::test]
     async fn default_udp_socket_matches_native_ipv6_nameserver_family() {
+        if UdpSocket::bind("[::1]:0").await.is_err() {
+            eprintln!("no IPv6 loopback; skipping v6 nameserver family test");
+            return;
+        }
         let socket = DefaultSocketFactory
             .bind_udp_for_peer("2001:db8::53".parse().unwrap())
             .await
@@ -3150,7 +3204,7 @@ mod tests {
         let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let port = server.local_addr().unwrap().port();
         let addr = SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.to_ipv6_mapped().into(), port);
-        tokio::spawn(async move {
+        let server_task = tokio::spawn(async move {
             let mut buf = [0u8; 512];
             let (len, peer) = server.recv_from(&mut buf).await.unwrap();
             let request = Message::from_bytes(&buf[..len]).unwrap();
@@ -3166,6 +3220,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.queries[0].query_type, RecordType::AAAA);
+        // Propagate a panic inside the server task (e.g. a failed
+        // `Message::from_bytes`) instead of swallowing it behind the
+        // client query's timeout.
+        server_task.await.unwrap();
+    }
+
+    /// A native IPv6 loopback nameserver (`[::1]:53`) takes the same
+    /// loopback branch as the v4-mapped case above and must be dialed
+    /// from an `[::1]`-bound socket. Skipped when the host has no IPv6
+    /// loopback (minimal CI sandboxes).
+    #[tokio::test]
+    async fn udp_accepts_native_ipv6_loopback_nameserver() {
+        let Ok(server) = UdpSocket::bind("[::1]:0").await else {
+            eprintln!("no IPv6 loopback; skipping v6 loopback exchange test");
+            return;
+        };
+        let addr = server.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (len, peer) = server.recv_from(&mut buf).await.unwrap();
+            let request = Message::from_bytes(&buf[..len]).unwrap();
+            let reply = response_for(&request, request.metadata.id);
+            server
+                .send_to(&reply.to_bytes().unwrap(), peer)
+                .await
+                .unwrap();
+        });
+        let response = DnsClient::udp(addr)
+            .with_timeout(Duration::from_secs(1))
+            .query("example.test", RecordType::AAAA)
+            .await
+            .unwrap();
+        assert_eq!(response.queries[0].query_type, RecordType::AAAA);
+        server_task.await.unwrap();
     }
 
     #[tokio::test]
