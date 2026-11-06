@@ -5,10 +5,8 @@ use crate::statistics::Statistics;
 use crate::tunnel::{MatchedRule, ResolvedTarget, TunnelInner, UsingProxy};
 use meow_common::conn_note;
 use meow_common::conn_notes::{self, ConnNotes};
-
 use meow_common::traffic_ledger::Route;
 use meow_common::{with_dial_timeout, Metadata, Proxy, ProxyAdapter, ProxyConn};
-
 use smallvec::{smallvec, SmallVec};
 use smol_str::SmolStr;
 use std::sync::Arc;
@@ -126,28 +124,27 @@ impl std::fmt::Display for PolicyPath<'_> {
 }
 
 /// What a dial-error line names: the rule's target and, behind a group,
-/// the node its chain dials through — `Proxy → HK-01` — since the group's
-/// name alone hides which member failed. The leaf is peeked before the
-/// dial, the way [`connection_chain`] peeks it, so it is the member the
-/// dial's committing pick takes, not one a failure or a round-robin
-/// rotation moves the group to afterwards.
+/// the node its dial went through (`Proxy → HK-01`), since the group's
+/// name alone hides which member failed.
 struct DialVia<'a> {
     target: &'a str,
     leaf: Option<Arc<dyn Proxy>>,
 }
 
 impl<'a> DialVia<'a> {
-    fn peek(adapter: &'a dyn ProxyAdapter, metadata: &Metadata) -> Self {
-        let mut leaf = adapter.unwrap_proxy(metadata, false);
-        if let Some(mut hop) = leaf.take() {
-            for _ in 1..MAX_CHAIN_HOPS {
-                match hop.unwrap_proxy(metadata, false) {
-                    Some(next) => hop = next,
-                    None => break,
-                }
-            }
-            leaf = Some(hop);
-        }
+    /// `pick` is the member the dial's automatic group committed to
+    /// ([`meow_proxy::group::watch_dial_pick`]); without one (a selector
+    /// over a node, or no group at all) the leaf is read the way
+    /// [`connection_chain`] reads it.
+    fn new(
+        adapter: &'a dyn ProxyAdapter,
+        pick: Option<Arc<dyn Proxy>>,
+        metadata: &Metadata,
+    ) -> Self {
+        let leaf = match pick {
+            Some(pick) => leaf_proxy(pick.as_ref(), metadata).or(Some(pick)),
+            None => leaf_proxy(adapter, metadata),
+        };
         Self {
             target: adapter.name(),
             leaf,
@@ -523,9 +520,12 @@ async fn route_inbound_tcp_scoped<C>(
                 proxy.name(),
                 proxy.adapter_type()
             );
-            let via = DialVia::peek(proxy.as_ref(), &metadata);
             let started = std::time::Instant::now();
-            let dial = with_dial_timeout(proxy.name(), proxy.dial_tcp(&metadata)).await;
+            let (dial, pick) = meow_proxy::group::watch_dial_pick(with_dial_timeout(
+                proxy.name(),
+                proxy.dial_tcp(&metadata),
+            ))
+            .await;
             // All chained front hops resolved during the dial — release the
             // generation pin before entering the relay loop.
             drop(route.take());
@@ -602,7 +602,7 @@ async fn route_inbound_tcp_scoped<C>(
                         "{} {} dial error using {}: {}",
                         metadata.conn_type,
                         metadata.remote_address(),
-                        via,
+                        DialVia::new(proxy.as_ref(), pick, &metadata),
                         e
                     );
                     conn_note!(
@@ -1320,8 +1320,6 @@ mod tests {
         );
     }
 
-    /// Route through the tunnel and register the flow the way
-    /// `route_inbound_tcp` does, returning the API-visible chain.
     /// A failed dial names the node behind the rule's group, not only the
     /// group; a leaf target is named once.
     #[test]
@@ -1365,6 +1363,8 @@ proxy-groups:
         );
     }
 
+    /// Route through the tunnel and register the flow the way
+    /// `route_inbound_tcp` does, returning the API-visible chain.
     async fn tracked_chain(tunnel: &crate::Tunnel) -> Vec<String> {
         let meta = metadata();
         let target = tunnel.inner().resolve_proxy(&meta).await.unwrap();

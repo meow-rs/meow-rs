@@ -325,6 +325,55 @@ pub(crate) fn last_pick_is(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+tokio::task_local! {
+    /// Set by [`watch_dial_pick`] for one connection's dial.
+    static DIAL_PICK: DialPick;
+}
+
+struct DialPick {
+    /// The `dialer-proxy` nesting depth the dial started at. Groups dialled
+    /// deeper are on a front hop's path, not the connection's.
+    depth: usize,
+    /// The member the last group dialled on the connection's path took.
+    pick: RefCell<Option<Arc<dyn Proxy>>>,
+}
+
+/// Run `dial`, a connection's dial through its rule's outbound, and name the
+/// member the last automatic group on the connection's path committed to:
+/// the member the dial went through, where an `unwrap_proxy` peek beforehand
+/// can name another (a concurrent dial moves a round-robin load-balance
+/// group on between the peek and the dial). Groups on a `dialer-proxy`
+/// front hop's path leave it as it is. `None` when no automatic group
+/// dialled: the outbound is a node or a selector over one, or the dial
+/// failed before a group picked.
+///
+/// A separate scope from `MEMBER_DIAL`, which a group's own member dial
+/// and a front hop's blame read: setting that one for a whole connection
+/// would change whom a top-level chained outbound's failed front hop is
+/// put down to.
+pub async fn watch_dial_pick<T>(dial: impl Future<Output = T>) -> (T, Option<Arc<dyn Proxy>>) {
+    let watch = DialPick {
+        depth: crate::dialer::chain_depth(),
+        pick: RefCell::new(None),
+    };
+    DIAL_PICK
+        .scope(watch, async {
+            let output = dial.await;
+            (output, DIAL_PICK.with(|watch| watch.pick.take()))
+        })
+        .await
+}
+
+/// A group on the watched connection's path took `member`
+/// ([`watch_dial_pick`]).
+fn note_dial_pick(member: &Arc<dyn Proxy>) {
+    let _ = DIAL_PICK.try_with(|watch| {
+        if watch.depth == crate::dialer::chain_depth() {
+            watch.pick.replace(Some(Arc::clone(member)));
+        }
+    });
+}
+
 /// Run `dial`, a dial or probe of a member, and name the member that the
 /// last group dialled on its path took: a chained outbound's front hop.
 pub(crate) async fn watch_member_dial<T>(
@@ -375,6 +424,7 @@ impl<'a> DialAttempt<'a> {
     ) -> meow_common::Result<T> {
         // The member dial enclosing this one learns which member was taken.
         let _ = MEMBER_DIAL.try_with(|outer| outer.pick.replace(Some(Arc::clone(self.member))));
+        note_dial_pick(self.member);
         let deadline = self.deadline;
         let member = self.member.name();
         let (result, (front_failed, chain)) = MEMBER_DIAL
@@ -788,6 +838,35 @@ mod tests {
 
     fn proxy_err(msg: &str) -> MeowError {
         MeowError::Proxy(msg.into())
+    }
+
+    /// The watched pick is the member the dial took, not the one a peek
+    /// before it named: a dial in between moves round-robin on.
+    #[tokio::test]
+    async fn dial_pick_names_the_member_the_dial_took() {
+        use crate::group::load_balance::{LbStrategy, LoadBalanceGroup};
+        use crate::group::test_support::MockProxy;
+        use meow_common::ProxyAdapter;
+        let members: Vec<Arc<dyn Proxy>> = vec![MockProxy::new("A"), MockProxy::new("B")];
+        let rr = LoadBalanceGroup::new("RR", members, LbStrategy::RoundRobin);
+        let meta = Metadata::default();
+        let peeked = rr.unwrap_proxy(&meta, false).unwrap();
+        let _ = rr.dial_tcp(&meta).await;
+        let (result, pick) = watch_dial_pick(rr.dial_tcp(&meta)).await;
+        assert!(result.is_err());
+        let pick = pick.expect("the group's dial is watched");
+        assert_ne!(pick.name(), peeked.name());
+
+        // A group nested in another records its own member, the node.
+        let rr: Arc<dyn Proxy> = Arc::new(rr);
+        let outer = crate::group::fallback::FallbackGroup::new("Auto", vec![rr]);
+        let (_, pick) = watch_dial_pick(outer.dial_tcp(&meta)).await;
+        assert!(["A", "B"].contains(&pick.unwrap().name()));
+
+        // A node dials no group.
+        let node = MockProxy::new("C");
+        let (_, pick) = watch_dial_pick(node.dial_tcp(&meta)).await;
+        assert!(pick.is_none());
     }
 
     #[test]
