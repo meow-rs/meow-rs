@@ -10,6 +10,12 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- VLESS `xhttp-opts.mode: auto` resolves like Xray's client —
+  `stream-one` under REALITY without `download-settings` — so nodes
+  carrying it (3x-ui subscriptions ship it verbatim) load instead of
+  being dropped; resolutions to the unimplemented `stream-up` /
+  `packet-up` are refused naming the resolved mode, and an empty
+  `mode: ''` counts as `auto`.
 - A DNS upstream named by an IPv6 or IPv4-mapped address is now dialed
   from a socket of the peer's address family: a native `2001:db8::53`
   nameserver previously got an IPv4-bound UDP socket and failed at
