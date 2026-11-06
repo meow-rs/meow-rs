@@ -118,16 +118,17 @@ fn leaf_matches_pin(ctx: &mut X509StoreContextRef, expected: &[u8; 32]) -> bool 
     Sha256::digest(&der).as_slice() == expected
 }
 
-/// Seed the BoringSSL verify store with the Mozilla CA bundle (mirrors
-/// `meow-transport`'s BoringSSL backend). The default store is empty.
+/// Seed the BoringSSL verify store with the Mozilla CA bundle. The default
+/// store is empty. A context is built per QUIC connection, so the roots come
+/// pre-parsed and shared (`meow_transport::tls::mozilla_roots`): parsing
+/// ~120 certificates each time cost CPU per connect and kept a private copy
+/// alive with every connection.
 fn seed_roots(ssl: &mut SslContextBuilder) -> Result<()> {
     let mut store = boring::x509::store::X509StoreBuilder::new()
         .map_err(|e| Error::tls(format!("X509StoreBuilder: {e}")))?;
-    for cert in webpki_root_certs::TLS_SERVER_ROOT_CERTS {
-        let x509 = boring::x509::X509::from_der(cert.as_ref())
-            .map_err(|e| Error::tls(format!("root cert parse: {e}")))?;
+    for x509 in meow_transport::tls::mozilla_roots() {
         store
-            .add_cert(x509)
+            .add_cert(x509.clone())
             .map_err(|e| Error::tls(format!("root store add_cert: {e}")))?;
     }
     ssl.set_cert_store_builder(store);

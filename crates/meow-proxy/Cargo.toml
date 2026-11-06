@@ -56,7 +56,7 @@ snell = ["dep:argon2", "dep:boring", "dep:blake2", "meow-transport/simple-obfs"]
 anytls = ["dep:meow-anytls"]
 # Hysteria2 outbound implemented in-tree on top of quiche (BoringSSL-native
 # QUIC + HTTP/3), so it links no rustls and no second crypto library.
-hysteria2 = ["dep:quiche", "dep:boring", "dep:blake2", "dep:webpki-root-certs", "dep:tokio-util"]
+hysteria2 = ["dep:quiche", "dep:boring", "dep:blake2", "dep:tokio-util", "meow-transport/tls"]
 # TrustTunnel H2 client outbound; opt-in pending upstream profile review (#727).
 trusttunnel = ["dep:h2", "dep:tokio-util"]
 # The HTTP/3 transport for that outbound (`quic: true`). Rides quiche on the
@@ -67,7 +67,7 @@ trusttunnel-h3 = [
     "trusttunnel",
     "dep:quiche",
     "dep:boring",
-    "dep:webpki-root-certs",
+    "meow-transport/tls",
 ]
 # sing-mux connection multiplexing for VLESS/Trojan/Shadowsocks/VMess. Pulls h2 + yamux +
 # tokio-util/compat — opt-out in `minimal` builds (ADR-0007 binary-size caps).
@@ -100,8 +100,6 @@ quiche = { workspace = true, optional = true }
 # and the Snell / VMess / VLESS-encryption record AEAD (`src/aead.rs`). Same
 # `boring` crate (and vendored library) meow-transport links.
 boring = { workspace = true, optional = true }
-# Mozilla CA roots for the hysteria2 quiche verify store (mirrors meow-transport).
-webpki-root-certs = { workspace = true, optional = true }
 blake2 = { workspace = true, optional = true }
 shadowsocks = { workspace = true, optional = true }
 argon2 = { workspace = true, optional = true }

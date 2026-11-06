@@ -43,14 +43,18 @@ pub(super) fn build(
         ssl.set_verify(SslVerifyMode::NONE);
     } else {
         // BoringSSL's default store is empty, so the roots must be seeded
-        // explicitly or every chain fails.
+        // explicitly or every chain fails. The roots come pre-parsed and
+        // shared (meow_transport::tls::mozilla_roots): parsing ~120
+        // certificates each time cost CPU per connect and kept a private copy
+        // alive with every connection.
         let mut store = boring::x509::store::X509StoreBuilder::new()
             .map_err(|e| io::Error::other(format!("TrustTunnel X509StoreBuilder: {e}")))?;
-        let roots = webpki_root_certs::TLS_SERVER_ROOT_CERTS
-            .iter()
-            .map(AsRef::as_ref)
-            .chain(extra_roots.iter().map(Vec::as_slice));
-        for cert in roots {
+        for x509 in meow_transport::tls::mozilla_roots() {
+            store
+                .add_cert(x509.clone())
+                .map_err(|e| io::Error::other(format!("TrustTunnel root store: {e}")))?;
+        }
+        for cert in extra_roots {
             let parsed = boring::x509::X509::from_der(cert)
                 .map_err(|e| io::Error::other(format!("TrustTunnel root cert: {e}")))?;
             store
