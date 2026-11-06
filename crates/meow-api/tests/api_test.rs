@@ -8019,6 +8019,10 @@ async fn proxy_provider_subscription_info_survives_restart_and_follows_fetches()
     let failed = api_call(&state, "PUT", "/providers/proxies/usage").await;
     assert_eq!(failed.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
+        body_json(failed).await["message"],
+        "Proxy provider refresh failed; the last valid proxies are unchanged"
+    );
+    assert_eq!(
         listed_subscription_info(&state, "usage").await,
         Some(second.clone()),
         "a failed fetch keeps the last accepted usage"
@@ -8233,4 +8237,69 @@ async fn put_configs_strict_remote_payload_defect_commits_empty() {
     })
     .await
     .expect("the committed provider must retry the bad payload in background");
+}
+
+/// Missing/malformed provider content must not erase last-good rules, and
+/// the failure response must not disclose its private source or payload.
+#[tokio::test]
+async fn rule_provider_refresh_failure_is_readable_and_preserves_last_good() {
+    use meow_config::raw::RawRuleProvider;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("private-source-token.yaml");
+    let good = "payload:\n  - '+.example.com'\n";
+    std::fs::write(&path, good).unwrap();
+    let raw = HashMap::from([(
+        "fixture".into(),
+        RawRuleProvider {
+            provider_type: "file".into(),
+            behavior: "domain".into(),
+            format: Some("yaml".into()),
+            url: None,
+            path: Some(path.to_string_lossy().into_owned()),
+            interval: None,
+            proxy: None,
+            header: None,
+            payload: None,
+        },
+    )]);
+    let state = test_state_default();
+    *state.rule_providers.write() = meow_config::rule_provider::load_providers(
+        &raw,
+        Some(dir.path()),
+        &meow_rules::ParserContext::default(),
+        None,
+        true,
+    )
+    .unwrap();
+    let before = body_json(api_call(&state, "GET", "/providers/rules/fixture").await).await;
+    for malformed in [false, true] {
+        if malformed {
+            std::fs::write(&path, "payload: [private-payload-secret").unwrap();
+        } else {
+            std::fs::remove_file(&path).unwrap();
+        }
+        let failed = api_call(&state, "PUT", "/providers/rules/fixture").await;
+        assert_eq!(failed.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let message = body_json(failed).await;
+        assert_eq!(
+            message["message"],
+            "Rule provider refresh failed; the last valid rules are unchanged"
+        );
+        assert!(!message.to_string().contains("private-"));
+        let after = body_json(api_call(&state, "GET", "/providers/rules/fixture").await).await;
+        assert_eq!(
+            before, after,
+            "failed refresh must retain last-good metadata"
+        );
+    }
+    std::fs::write(
+        &path,
+        "payload:\n  - '+.example.com'\n  - '+.second.test'\n",
+    )
+    .unwrap();
+    let recovered = api_call(&state, "PUT", "/providers/rules/fixture").await;
+    assert_eq!(recovered.status(), StatusCode::NO_CONTENT);
+    assert_eq!(state.rule_providers.read()["fixture"].rule_count(), 2);
+    let missing = api_call(&state, "PUT", "/providers/rules/missing").await;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
 }
