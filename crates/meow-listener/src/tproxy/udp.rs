@@ -201,10 +201,34 @@ pub(super) mod flow {
                 queued = rx.recv() => match queued {
                     Some(data) => {
                         queued_bytes.fetch_sub(data.len(), Ordering::Relaxed);
-                        if let Err(e) = conn.write_packet(&data, &dst_addr).await {
-                            break Err(format!("upstream write {dst_addr}: {e}"));
+                        // Drive write_packet in a nested select! so idle
+                        // expiry, flush and a dead reply reader can cancel
+                        // a blocked write (PR #893 pattern: write_packet
+                        // must not park the flow's termination signals).
+                        let write_result = tokio::select! {
+                            () = &mut idle => break Ok(()), // idle-timeout during write
+                            () = flush.flushed() => break Ok(()), // flush during write
+                            done = &mut reply_task => break Err(match done {
+                                Ok(Err(e)) => e,
+                                Ok(Ok(())) => "downstream reader exited".into(),
+                                Err(e) => format!("downstream reader task: {e}"),
+                            }),
+                            r = conn.write_packet(&data, &dst_addr) => r,
+                        };
+                        match write_result {
+                            Ok(n) if n == data.len() => {
+                                idle.as_mut().reset(next_deadline(udp_timeout));
+                            }
+                            Ok(n) => {
+                                break Err(format!(
+                                    "upstream write {dst_addr}: short write {n}/{}",
+                                    data.len()
+                                ));
+                            }
+                            Err(e) => {
+                                break Err(format!("upstream write {dst_addr}: {e}"));
+                            }
                         }
-                        idle.as_mut().reset(next_deadline(udp_timeout));
                     }
                     // recv loop gone — listener shutdown.
                     None => break Ok(()),
@@ -1177,31 +1201,53 @@ mod tests {
         reply_tx: mpsc::Sender<Vec<u8>>,
     }
 
+    /// Optional stalls on a produced conn: `write` parks `write_packet`
+    /// (a stalled upstream), `fail_read` fails `read_packet` (a dead
+    /// reply reader) — both wait on `Notify`s the test fires at will.
+    #[derive(Default, Clone)]
+    pub(super) struct ConnGates {
+        write: Option<Arc<Notify>>,
+        fail_read: Option<Arc<Notify>>,
+    }
+
     struct RecordingConn {
         writes: WriteLog,
         wrote: Arc<Notify>,
         closed: Arc<AtomicBool>,
         replies: tokio::sync::Mutex<mpsc::Receiver<Vec<u8>>>,
+        gates: ConnGates,
     }
 
     #[async_trait]
     impl ProxyPacketConn for RecordingConn {
         async fn read_packet(&self, buf: &mut [u8]) -> MeowResult<(usize, SocketAddr)> {
-            let mut rx = self.replies.lock().await;
-            match rx.recv().await {
-                Some(data) => {
-                    let n = data.len().min(buf.len());
-                    buf[..n].copy_from_slice(&data[..n]);
-                    Ok((n, "0.0.0.0:0".parse().unwrap()))
+            let recv = async {
+                let mut rx = self.replies.lock().await;
+                match rx.recv().await {
+                    Some(data) => {
+                        let n = data.len().min(buf.len());
+                        buf[..n].copy_from_slice(&data[..n]);
+                        Ok((n, "0.0.0.0:0".parse().unwrap()))
+                    }
+                    // The test stopped scripting replies — park until the
+                    // flow aborts this reader, never spin into an error storm.
+                    None => std::future::pending().await,
                 }
-                // The test stopped scripting replies — park until the flow
-                // aborts this reader, never spin into an error storm.
-                None => std::future::pending().await,
+            };
+            match &self.gates.fail_read {
+                None => recv.await,
+                Some(gate) => tokio::select! {
+                    v = recv => v,
+                    () = gate.notified() => Err(MeowError::Proxy("injected read failure".into())),
+                },
             }
         }
         async fn write_packet(&self, buf: &[u8], addr: &SocketAddr) -> MeowResult<usize> {
             self.writes.lock().unwrap().push((buf.to_vec(), *addr));
             self.wrote.notify_one();
+            if let Some(gate) = &self.gates.write {
+                gate.notified().await;
+            }
             Ok(buf.len())
         }
         fn local_addr(&self) -> MeowResult<SocketAddr> {
@@ -1223,16 +1269,27 @@ mod tests {
         meta_log: Mutex<Vec<String>>,
         health: ProxyHealth,
         fail_dial: bool,
+        gates: ConnGates,
     }
 
     impl RecordingProxy {
         pub(super) fn new(fail_dial: bool) -> Arc<Self> {
+            Self::build(fail_dial, ConnGates::default())
+        }
+
+        /// Same as [`Self::new`] but produced conns honour `gates`.
+        pub(super) fn new_gated(fail_dial: bool, gates: ConnGates) -> Arc<Self> {
+            Self::build(fail_dial, gates)
+        }
+
+        fn build(fail_dial: bool, gates: ConnGates) -> Arc<Self> {
             Arc::new(Self {
                 dials: AtomicUsize::new(0),
                 conns: Mutex::new(Vec::new()),
                 meta_log: Mutex::new(Vec::new()),
                 health: ProxyHealth::new(),
                 fail_dial,
+                gates,
             })
         }
     }
@@ -1275,6 +1332,7 @@ mod tests {
                 wrote: Arc::clone(&conn.wrote),
                 closed: Arc::clone(&conn.closed),
                 replies: tokio::sync::Mutex::new(replies),
+                gates: self.gates.clone(),
             };
             self.conns.lock().unwrap().push(conn);
             Ok(Box::new(packet_conn))
@@ -1590,5 +1648,166 @@ mod tests {
         )
         .await
         .expect("idle eviction is a clean exit");
+    }
+
+    /// PR #900 review: a `write_packet` that never completes must not park
+    /// the flow's termination signals — an outbound-session flush ends the
+    /// flow immediately and closes the conn.
+    #[tokio::test(start_paused = true)]
+    async fn pending_write_does_not_block_flush() {
+        let gate = Arc::new(Notify::new());
+        let proxy = RecordingProxy::new_gated(
+            false,
+            ConnGates {
+                write: Some(Arc::clone(&gate)),
+                ..Default::default()
+            },
+        );
+        let tunnel = mk_tunnel(Some(Arc::clone(&proxy)));
+        let (flow_tx, flow_rx) = mpsc::channel::<Vec<u8>>(flow::FLOW_QUEUE);
+        let (reply_tx, _reply_rx) = mpsc::channel::<flow::ReplyMsg>(8);
+        let queued = Arc::new(AtomicUsize::new(0));
+        let task = tokio::spawn(flow::relay_udp_flow(
+            tunnel.clone(),
+            flow_rx,
+            Arc::clone(&queued),
+            reply_tx,
+            ctx(3600),
+        ));
+
+        queued.fetch_add(6, Ordering::SeqCst);
+        flow_tx.send(b"parked".to_vec()).await.unwrap();
+        let conn = loop {
+            if let Some(c) = proxy.conns.lock().unwrap().first() {
+                break ConnHandle {
+                    writes: Arc::clone(&c.writes),
+                    wrote: Arc::clone(&c.wrote),
+                    closed: Arc::clone(&c.closed),
+                    reply_tx: c.reply_tx.clone(),
+                };
+            }
+            tokio::time::timeout(Duration::from_secs(2), tokio::task::yield_now())
+                .await
+                .expect("dial_udp never ran");
+        };
+        tokio::time::timeout(Duration::from_secs(2), conn.wrote.notified())
+            .await
+            .expect("write_packet never entered");
+
+        assert_eq!(tunnel.close_all_udp_sessions(), 1);
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("flush did not end the parked-write flow")
+            .expect("flow task panicked")
+            .expect("flow returned error");
+        assert!(conn.closed.load(Ordering::SeqCst));
+    }
+
+    /// Same gate, opposite signal: advancing the clock past `udp_timeout`
+    /// must evict the flow while `write_packet` is still parked.
+    #[tokio::test(start_paused = true)]
+    async fn pending_write_does_not_block_idle_eviction() {
+        let gate = Arc::new(Notify::new());
+        let proxy = RecordingProxy::new_gated(
+            false,
+            ConnGates {
+                write: Some(Arc::clone(&gate)),
+                ..Default::default()
+            },
+        );
+        let tunnel = mk_tunnel(Some(Arc::clone(&proxy)));
+        let (flow_tx, flow_rx) = mpsc::channel::<Vec<u8>>(flow::FLOW_QUEUE);
+        let (reply_tx, _reply_rx) = mpsc::channel::<flow::ReplyMsg>(8);
+        let queued = Arc::new(AtomicUsize::new(0));
+        let task = tokio::spawn(flow::relay_udp_flow(
+            tunnel,
+            flow_rx,
+            Arc::clone(&queued),
+            reply_tx,
+            ctx(30),
+        ));
+
+        queued.fetch_add(6, Ordering::SeqCst);
+        flow_tx.send(b"parked".to_vec()).await.unwrap();
+        let conn = loop {
+            if let Some(c) = proxy.conns.lock().unwrap().first() {
+                break ConnHandle {
+                    writes: Arc::clone(&c.writes),
+                    wrote: Arc::clone(&c.wrote),
+                    closed: Arc::clone(&c.closed),
+                    reply_tx: c.reply_tx.clone(),
+                };
+            }
+            tokio::time::timeout(Duration::from_secs(2), tokio::task::yield_now())
+                .await
+                .expect("dial_udp never ran");
+        };
+        tokio::time::timeout(Duration::from_secs(2), conn.wrote.notified())
+            .await
+            .expect("write_packet never entered");
+
+        // Paused clock auto-advances: idle eviction fires during the parked
+        // write; regression (write holds the loop) shows up as the timeout.
+        tokio::time::timeout(Duration::from_secs(120), task)
+            .await
+            .expect("idle eviction did not end the parked-write flow")
+            .expect("flow task panicked")
+            .expect("flow returned error");
+        assert!(conn.closed.load(Ordering::SeqCst));
+    }
+
+    /// The `done = &mut reply_task` arm added in this batch: a dead
+    /// downstream reader during a parked write must surface immediately
+    /// (same error text the `up_rx` `None` arm produces), not on idle.
+    #[tokio::test(start_paused = true)]
+    async fn pending_write_does_not_block_reader_death() {
+        let gate = Arc::new(Notify::new());
+        let fail_read = Arc::new(Notify::new());
+        let proxy = RecordingProxy::new_gated(
+            false,
+            ConnGates {
+                write: Some(Arc::clone(&gate)),
+                fail_read: Some(Arc::clone(&fail_read)),
+            },
+        );
+        let tunnel = mk_tunnel(Some(Arc::clone(&proxy)));
+        let (flow_tx, flow_rx) = mpsc::channel::<Vec<u8>>(flow::FLOW_QUEUE);
+        let (reply_tx, _reply_rx) = mpsc::channel::<flow::ReplyMsg>(8);
+        let queued = Arc::new(AtomicUsize::new(0));
+        let task = tokio::spawn(flow::relay_udp_flow(
+            tunnel,
+            flow_rx,
+            Arc::clone(&queued),
+            reply_tx,
+            ctx(3600),
+        ));
+
+        queued.fetch_add(6, Ordering::SeqCst);
+        flow_tx.send(b"parked".to_vec()).await.unwrap();
+        let conn = loop {
+            if let Some(c) = proxy.conns.lock().unwrap().first() {
+                break ConnHandle {
+                    writes: Arc::clone(&c.writes),
+                    wrote: Arc::clone(&c.wrote),
+                    closed: Arc::clone(&c.closed),
+                    reply_tx: c.reply_tx.clone(),
+                };
+            }
+            tokio::time::timeout(Duration::from_secs(2), tokio::task::yield_now())
+                .await
+                .expect("dial_udp never ran");
+        };
+        tokio::time::timeout(Duration::from_secs(2), conn.wrote.notified())
+            .await
+            .expect("write_packet never entered");
+
+        fail_read.notify_one();
+        let err = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("reader death did not end the parked-write flow")
+            .expect("flow task panicked")
+            .expect_err("a dead reader must surface as an error");
+        assert!(err.contains("downstream read"), "unexpected: {err}");
+        assert!(conn.closed.load(Ordering::SeqCst));
     }
 }

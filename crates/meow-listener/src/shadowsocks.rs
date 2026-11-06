@@ -1285,37 +1285,66 @@ async fn run_ss_udp_flow<S>(
     // are being pumped".
     let _ = established.set(Arc::clone(&conn));
 
-    // Writer loop: drain the queue in FIFO order until the flow is evicted
-    // (all senders gone), the upstream write fails, or the reply pump dies
-    // (one-way conn — re-dial on next datagram, issue #514).
-    loop {
-        tokio::select! {
-            queued = rx.recv() => match queued {
-                Some(payload) => {
-                    if let Err(e) = conn.write_packet(&payload, &dst_addr).await {
-                        debug!("ss udp flow to {dst_addr}: upstream write: {e}");
-                        return;
-                    }
-                    last_activity_ms
-                        .store(monotonic_ms() as Uint, std::sync::atomic::Ordering::Relaxed);
+    // Select on the whole writer future so a pending write_packet is
+    // cancelled when flush or reply-pump failure fires. Any payloads still
+    // queued in `rx` are discarded with the flow; SS UDP callers retry on
+    // the next datagram. Pattern mirrors the socks5_udp writer (PR #893).
+    let writer = async {
+        loop {
+            match rx.recv().await {
+                None => {
+                    // All senders dropped — flow evicted from the NAT table.
+                    debug!("ss udp flow to {dst_addr}: sender queue closed; flow evicted");
+                    break;
                 }
-                None => return, // all senders dropped — flow evicted
-            },
-            done = &mut reply_task => {
-                let reason = match done {
-                    Ok(()) => "reply pump exited".to_string(),
-                    Err(e) => format!("reply pump task: {e}"),
-                };
-                debug!("ss udp flow to {dst_addr}: {reason}; next datagram re-dials");
-                return;
-            }
-            () = flush.flushed() => {
-                debug!("ss udp flow to {dst_addr}: outbound sessions flushed; next datagram re-dials");
-                let _ = conn.close();
-                return;
+                Some(payload) => match conn.write_packet(&payload, &dst_addr).await {
+                    Ok(n) if n == payload.len() => {
+                        last_activity_ms
+                            .store(monotonic_ms() as Uint, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Ok(n) => {
+                        // Short writes are not expected from any current
+                        // ProxyPacketConn implementation (datagram
+                        // semantics: the frame is either accepted whole or
+                        // rejected), but the trait contract allows it.
+                        // Retire the flow; the next datagram re-dials.
+                        debug!(
+                            "ss udp flow to {dst_addr}: short upstream write {n}/{}; next datagram re-dials",
+                            payload.len()
+                        );
+                        break;
+                    }
+                    Err(e) => {
+                        debug!("ss udp flow to {dst_addr}: upstream write: {e}; next datagram re-dials");
+                        break;
+                    }
+                },
             }
         }
+    };
+    // No `biased;`: flush and reply_task failures are equally urgent and
+    // neither should starve the other. The writer arm completes naturally
+    // once the queue drains or a write error/short-write retires it.
+    tokio::select! {
+        () = flush.flushed() => {
+            debug!("ss udp flow to {dst_addr}: outbound sessions flushed; next datagram re-dials");
+        }
+        done = &mut reply_task => {
+            let reason = match done {
+                Ok(()) => "reply pump exited".to_string(),
+                Err(e) => format!("reply pump task: {e}"),
+            };
+            debug!("ss udp flow to {dst_addr}: {reason}; next datagram re-dials");
+        }
+        () = writer => {}
     }
+    // Close the conn regardless of which arm fired. If the writer arm was
+    // cancelled mid-write, stream-framed conns (snell, vless, trojan, …)
+    // have already set their `poisoned` flag via `PoisonOnIncomplete`, so
+    // subsequent reads from the reply task fail fast; `close` then tears
+    // down the socket. `_reply_guard` (AbortOnDrop) aborts the reply task
+    // after this point.
+    let _ = conn.close();
 }
 
 #[cfg(test)]

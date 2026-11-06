@@ -29,7 +29,7 @@ use meow_common::{ConnType, Metadata, Network};
 use meow_dns::server::{hex_prefix, DnsServer, LocalAnswer};
 use meow_tunnel::{MatchedRule, ResolvedTarget, Tunnel, UsingProxy};
 use tokio::sync::mpsc;
-use tokio::time::{sleep, Instant};
+use tokio::time::{sleep_until, Instant};
 use tracing::{debug, info, warn};
 
 /// One datagram payload cap. UDP over IPv4 tops out below 64 KiB.
@@ -74,9 +74,10 @@ fn activity_ms() -> u64 {
 }
 
 /// Live flow-table entry. `last_activity` is stamped by the reader loop on
-/// every client datagram AND by the flow task on every upstream reply —
-/// a reply-mostly flow (e.g. a QUIC download mid-stream) must not look
-/// idle to the LRU eviction at `MAX_FLOWS`.
+/// every client datagram AND by the flow task on each upstream reply it
+/// successfully enqueues — a reply-mostly flow (e.g. a QUIC download
+/// mid-stream) must not look idle to the LRU eviction at `MAX_FLOWS`.
+/// A reply dropped on a full queue does not stamp.
 struct FlowEntry {
     tx: mpsc::Sender<Vec<u8>>,
     last_activity: Arc<AtomicU64>,
@@ -114,7 +115,7 @@ pub(super) async fn run_udp(
     let mut flows: HashMap<FlowKey, FlowEntry> = HashMap::new();
     let mut sweep_countdown = SWEEP_INTERVAL;
     let hijack_permits = Arc::new(tokio::sync::Semaphore::new(HIJACK_IN_FLIGHT));
-    let hijack_dropped = AtomicU64::new(0);
+    let hijack_dropped = Arc::new(AtomicU64::new(0));
 
     while let Some((data, src, dst)) = read_half.next().await {
         if dns_hijack && dst.port() == 53 {
@@ -142,6 +143,7 @@ pub(super) async fn run_udp(
             match Arc::clone(&hijack_permits).try_acquire_owned() {
                 Ok(permit) => {
                     let reply_tx = reply_tx.clone();
+                    let hijack_dropped = Arc::clone(&hijack_dropped);
                     tokio::spawn(async move {
                         let _permit = permit;
                         // Panic guard — parity with the serve loop in
@@ -157,7 +159,14 @@ pub(super) async fn run_udp(
                                     response.len(),
                                     hex_prefix(&response, 48),
                                 );
-                                let _ = reply_tx.send((response, dst, src)).await;
+                                match reply_tx.try_send((response, dst, src)) {
+                                    Err(mpsc::error::TrySendError::Full(_)) => {
+                                        note_hijack_drop(&hijack_dropped);
+                                    }
+                                    // A closed queue means the stack writer is gone (listener
+                                    // shutdown); the task ends here either way.
+                                    Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+                                }
                             }
                             Ok(Err(e)) => {
                                 debug!("tun dns-hijack: unanswerable query from {src}: {e}");
@@ -312,8 +321,10 @@ async fn flow_task(tunnel: Tunnel, spec: FlowSpec) {
 
 /// Route the flow, dial the outbound, then pump datagrams both ways until
 /// `udp_timeout` passes with no traffic in either direction. `last_activity`
-/// is the table entry's shared stamp — every upstream reply refreshes it so
-/// a reply-mostly flow is not mistaken for idle by LRU eviction.
+/// is the table entry's shared stamp — upstream replies it successfully
+/// enqueues onto `reply_tx` refresh it so a reply-mostly flow is not
+/// mistaken for idle by LRU eviction (a reply dropped on a full queue does
+/// not stamp).
 async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
     let FlowSpec {
         mut rx,
@@ -418,7 +429,7 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
     // replies, and the idle deadline. Reply source addresses are not
     // rewritten: the tun flow is locked to one (src, dst) tuple, so every
     // reply is delivered as coming from `dst`.
-    let idle = sleep(udp_timeout);
+    let idle = sleep_until(next_deadline(udp_timeout));
     tokio::pin!(idle);
     let result = loop {
         tokio::select! {
@@ -428,20 +439,57 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
             () = flush.flushed() => break Ok(()),
             queued = rx.recv() => match queued {
                 Some(data) => {
-                    if let Err(e) = conn.write_packet(&data, &dst_addr).await {
-                        break Err(format!("upstream write {dst_addr}: {e}"));
+                    // Drive write_packet in a nested select! so idle
+                    // expiry, flush and a dead reply reader can cancel
+                    // a blocked write (PR #893 pattern: write_packet
+                    // must not park the flow's termination signals).
+                    let write_result = tokio::select! {
+                        () = &mut idle => break Ok(()), // idle-timeout during write
+                        () = flush.flushed() => break Ok(()), // flush during write
+                        done = &mut reply_task => break Err(match done {
+                            Ok(Err(e)) => e,
+                            Ok(Ok(())) => "downstream reader exited".into(),
+                            Err(e) => format!("downstream reader task: {e}"),
+                        }),
+                        r = conn.write_packet(&data, &dst_addr) => r,
+                    };
+                    match write_result {
+                        Ok(n) if n == data.len() => {
+                            idle.as_mut().reset(next_deadline(udp_timeout));
+                        }
+                        Ok(n) => {
+                            break Err(format!(
+                                "upstream write {dst_addr}: short write {n}/{}",
+                                data.len()
+                            ));
+                        }
+                        Err(e) => {
+                            break Err(format!("upstream write {dst_addr}: {e}"));
+                        }
                     }
-                    idle.as_mut().reset(Instant::now() + udp_timeout);
                 }
                 None => break Ok(()), // reader loop gone — listener shutdown
             },
             received = up_rx.recv() => match received {
                 Some(data) => {
-                    if reply_tx.send((data, dst, src)).await.is_err() {
-                        break Ok(()); // stack writer gone — listener shutdown
+                    // UDP drop semantics on backpressure: a full reply queue
+                    // drops the datagram rather than parking the flow (and
+                    // its idle timer) on a slow lwIP stack writer — same
+                    // policy as tproxy (which already used try_send).
+                    match reply_tx.try_send((data, dst, src)) {
+                        Ok(()) => {
+                            last_activity.store(activity_ms(), Ordering::Relaxed);
+                            idle.as_mut().reset(next_deadline(udp_timeout));
+                        }
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            // Drop this reply; the client will retransmit if
+                            // it needs the data.
+                            debug!("tun UDP reply queue full: dropping reply to {src} (from {dst})");
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            break Ok(()); // stack writer gone — listener shutdown
+                        }
                     }
-                    last_activity.store(activity_ms(), Ordering::Relaxed);
-                    idle.as_mut().reset(Instant::now() + udp_timeout);
                 }
                 // The reader task exited — it owns the only `up_tx`. The
                 // borrow-await keeps the handle usable for the abort below.
@@ -457,6 +505,15 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
     reply_task.abort();
     let _ = conn.close();
     result
+}
+
+/// `Instant + Duration` panics when the deadline leaves the
+/// representable range — clamp absurd `udp-timeout` values to a
+/// far-future deadline instead of crashing the flow task.
+fn next_deadline(udp_timeout: Duration) -> Instant {
+    Instant::now()
+        .checked_add(udp_timeout)
+        .unwrap_or_else(|| Instant::now() + Duration::from_secs(86400 * 30))
 }
 
 /// The subnets assigned to the TUN device: `inet4-address`, plus
