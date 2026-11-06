@@ -2635,6 +2635,13 @@ fn parse_vless_xhttp_config(
         .to_string();
     // Xray treats an empty mode as auto.
     if mode.is_empty() || mode.eq_ignore_ascii_case("auto") {
+        // `mode` is reassigned to the resolved value below; keep the user's
+        // spelling so `mode: ''` is not reported as 'auto' in the error.
+        let requested = if mode.is_empty() {
+            "'' (treated as 'auto')".to_string()
+        } else {
+            format!("'{mode}'")
+        };
         // Xray's client resolution (splithttp/dialer.go): REALITY without
         // `download-settings` is stream-one; with them stream-up, and
         // without REALITY packet-up — neither of which meow implements.
@@ -2652,8 +2659,8 @@ fn parse_vless_xhttp_config(
         };
         if mode != "stream-one" {
             return Err(format!(
-                "vless: xhttp mode 'auto' resolves to '{mode}' here (as in Xray); only \
-                 'stream-one' is implemented"
+                "vless: xhttp mode {requested} resolves to '{mode}' here (as in Xray); \
+                 only 'stream-one' is implemented"
             ));
         }
     }
@@ -3780,6 +3787,15 @@ mod tests {
         let err = parse_vless_xhttp_config(&tls, "203.0.113.7", "cdn.example.com", true)
             .expect_err("auto without REALITY is packet-up");
         assert!(err.contains("packet-up"), "{err}");
+
+        // `mode: ''` resolves the same way, but the error must name the
+        // user's own (empty) spelling, not 'auto'.
+        let empty = proxy_config("xhttp-opts:\n  mode: ''\n");
+        let err = parse_vless_xhttp_config(&empty, "203.0.113.7", "cdn.example.com", true)
+            .expect_err("empty mode without REALITY is packet-up");
+        assert!(err.contains("mode '' (treated as 'auto')"), "{err}");
+        assert!(err.contains("packet-up"), "{err}");
+        assert!(!err.contains("mode 'auto'"), "{err}");
     }
 
     #[cfg(feature = "vless")]
