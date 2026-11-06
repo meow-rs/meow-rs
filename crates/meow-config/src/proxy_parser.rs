@@ -6042,17 +6042,18 @@ tls: true
         }
     }
 
-    /// `plugin: null` is Go's zero value — the node parses as plain SS
-    /// with no plugin, exactly like an absent `plugin:` key.
+    /// Both YAML representations of an empty plugin select plain Shadowsocks.
     #[cfg(feature = "ss")]
     #[test]
-    fn null_plugin_value_means_no_plugin() {
-        let cfg = proxy_config(
-            "name: s\ntype: ss\nserver: 1.2.3.4\nport: 8388\npassword: p\ncipher: aes-128-gcm\n\
-             plugin: null\n",
-        );
-        let proxy = parse_proxy(&cfg).expect("plugin: null parses as plain ss");
-        assert_eq!(proxy.name(), "s");
+    fn empty_or_null_plugin_value_means_no_plugin() {
+        for value in ["null", "''"] {
+            let cfg = proxy_config(&format!(
+                "name: s\ntype: ss\nserver: 192.0.2.1\nport: 8388\npassword: p\ncipher: aes-128-gcm\nplugin: {value}\n"
+            ));
+            assert!(!node_selects_external_plugin(&cfg));
+            let proxy = parse_proxy(&cfg).expect("empty plugin parses as plain ss");
+            assert_eq!(proxy.name(), "s");
+        }
     }
 
     /// The dispatch is exact (`"ss"` only, like mihomo) while
