@@ -857,7 +857,7 @@ impl TunFields {
             enable: Some(running),
             device: tun.device,
             mtu: tun.mtu,
-            inet4_address: tun.inet4_address,
+            inet4_address: reported_inet4(tun.inet4_address),
             inet6_address: tun.inet6_address,
             auto_route: tun.auto_route,
             outbound_interface: tun.outbound_interface,
@@ -885,6 +885,26 @@ impl TunFields {
         merge(&mut tun.dns_hijack, self.dns_hijack);
         merge(&mut tun.udp_timeout, self.udp_timeout);
     }
+}
+
+/// `GET /configs`'s `tun.inet4-address` is a plain CIDR string — or absent
+/// — no matter which spelling the committed `tun:` section uses: `RawTun`
+/// keeps the user's form, which may be mihomo's list (`[]netip.Prefix`).
+/// Reporting the first list entry — the one `parse_tun_config` assigns the
+/// device — restores the `string | absent` contract list-typed clients
+/// broke on; `[]` and `null` report absent, while `""` reports `""`,
+/// exactly as the `Option<String>` field behaved before.
+/// A client that echoes the report back through `PATCH /configs` commits
+/// the string spelling — the parsed address is identical, so the
+/// reconcile's parsed-`TunConfig` diff does not restart the listener.
+/// `inet6-address` keeps echoing its committed form: a raw `Value` there
+/// is its shipped contract, not a regression.
+fn reported_inet4(raw: Option<serde_json::Value>) -> Option<serde_json::Value> {
+    let first = match raw {
+        Some(serde_json::Value::Array(entries)) => entries.into_iter().next(),
+        other => other,
+    };
+    first.filter(serde_json::Value::is_string)
 }
 
 #[derive(Deserialize)]

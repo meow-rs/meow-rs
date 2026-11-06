@@ -644,3 +644,24 @@ async fn t19_inet4_address_list_form_uses_the_first_entry() {
         assert!(err.contains("inet4-address"), "{bad}: {err}");
     }
 }
+
+/// Non-finite YAML floats deserialize through `serde_json::Value` as
+/// `Null` — not a string — so they were silently "unset" under the
+/// `Value` field. With the old `Option<String>` the spelling reached the
+/// CIDR parse as text and was a hard error; keep it one.
+#[tokio::test]
+async fn t19b_inet4_address_non_finite_float_errors() {
+    let load = |v: &'static str| async move {
+        let yaml = format!("tun:\n  enable: true\n  inet4-address: {v}\n");
+        load_config_from_str(&yaml)
+            .await
+            .map(|c| c.tun.inet4_address.to_string())
+    };
+    for bad in [".nan", ".inf", "-.inf", "1e999"] {
+        let err = load(bad).await.expect_err(bad).to_string();
+        assert!(err.contains("inet4-address"), "{bad}: {err}");
+    }
+    // The same hole through the list spelling.
+    let err = load("[.nan]").await.expect_err("[.nan]").to_string();
+    assert!(err.contains("inet4-address"), "[.nan]: {err}");
+}

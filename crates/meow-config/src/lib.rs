@@ -527,19 +527,28 @@ pub fn parse_tun_config(
     })
 }
 
-/// `tun.inet6-address` (#375): one IPv6 CIDR, as a string or as mihomo's
-/// list form. The device takes a single IPv6 address, so of a list only
-/// the first entry is used; an empty list or empty string is "unset".
 /// The CIDR string of a `tun.inet{4,6}-address`: a string or mihomo's list
-/// form, of which the first entry is used (with a warning when there are
-/// more). Unset, null, `''` and `[]` are `None`.
+/// form (`[]netip.Prefix`), of which the first entry is used — with a
+/// warning when there are more — since the device takes a single address.
+/// `''` and `[]` are "unset". A `Value::Null` is an error, not unset:
+/// YAML `null` lands in the `None` arm (the `Option` layer's `visit_none`),
+/// so only a non-finite float (`.nan`, `.inf`, `1e999`) — which
+/// `serde_json::Value` maps to `Null` — reaches it, and those were a hard
+/// error when `inet4-address` was `Option<String>` (the spelling reached
+/// the CIDR parse as text).
 fn first_cidr<'a>(
     key: &str,
     family: &str,
     raw: Option<&'a serde_json::Value>,
 ) -> Result<Option<&'a str>, anyhow::Error> {
     let cidr = match raw {
-        None | Some(serde_json::Value::Null) => return Ok(None),
+        None => return Ok(None),
+        Some(serde_json::Value::Null) => {
+            return Err(anyhow::anyhow!(
+                "tun.{key}: expected a CIDR string or a list of them, got a \
+                 non-finite number (e.g. .nan, .inf)"
+            ));
+        }
         Some(serde_json::Value::String(s)) => s.as_str(),
         Some(serde_json::Value::Array(entries)) => {
             if entries.len() > 1 {

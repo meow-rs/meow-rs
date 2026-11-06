@@ -7385,6 +7385,152 @@ async fn patch_configs_tun_merges_over_committed_section() {
     );
 }
 
+/// `inet4-address` may be committed in mihomo's list form (#885), but
+/// `GET /configs` always reports the string form the field's contract
+/// declares — the first entry, the one `parse_tun_config` assigns the
+/// device. Echoing the committed array would break `string | null`
+/// clients; `[]` is unset and reports absent, not an empty array.
+#[tokio::test]
+async fn get_configs_tun_inet4_address_reports_the_string_form() {
+    let mut raw = test_raw_config();
+    raw.tun = Some(
+        serde_saphyr::from_str("enable: false\ninet4-address: [10.9.0.1/30, 10.8.0.1/30]").unwrap(),
+    );
+    let state = test_state(raw);
+    assert_eq!(
+        get_configs_json(&state).await["tun"]["inet4-address"],
+        serde_json::json!("10.9.0.1/30"),
+        "the list form must report its first entry as a string"
+    );
+
+    let mut raw = test_raw_config();
+    raw.tun = Some(serde_saphyr::from_str("enable: false\ninet4-address: []").unwrap());
+    let state = test_state(raw);
+    let tun = get_configs_json(&state).await["tun"].clone();
+    assert!(
+        tun.get("inet4-address").is_none(),
+        "[] is unset: the key must be absent, got {tun}"
+    );
+}
+
+/// PATCH accepts the list form too: the committed section keeps the
+/// spelling the client sent while `GET /configs` still reports a string.
+#[tokio::test]
+async fn patch_configs_tun_inet4_address_accepts_string_and_list_forms() {
+    let mut raw = test_raw_config();
+    raw.tun = Some(serde_saphyr::from_str("enable: false").unwrap());
+    let state = test_state(raw);
+
+    let resp = patch_configs(
+        &state,
+        serde_json::json!({"tun": {"inet4-address": ["10.9.0.1/30", "10.8.0.1/30"]}}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        state.raw_config.read().tun.as_ref().unwrap().inet4_address,
+        Some(serde_json::json!(["10.9.0.1/30", "10.8.0.1/30"])),
+        "the committed section keeps the list spelling"
+    );
+    assert_eq!(
+        get_configs_json(&state).await["tun"]["inet4-address"],
+        serde_json::json!("10.9.0.1/30"),
+    );
+
+    let resp = patch_configs(
+        &state,
+        serde_json::json!({"tun": {"inet4-address": "10.7.0.1/30"}}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        get_configs_json(&state).await["tun"]["inet4-address"],
+        serde_json::json!("10.7.0.1/30"),
+    );
+}
+
+/// A `PUT /configs` document in the list form commits and reports the
+/// string, like a config file load would.
+#[tokio::test]
+async fn put_configs_tun_inet4_address_list_form_reports_the_string_form() {
+    use base64::Engine as _;
+    let state = test_state(test_raw_config());
+    let yaml = concat!(
+        "mode: rule\n",
+        "tun:\n",
+        "  enable: false\n",
+        "  inet4-address: [10.9.0.1/30]\n",
+        "rules:\n",
+        "  - MATCH,DIRECT\n",
+    );
+    let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        get_configs_json(&state).await["tun"]["inet4-address"],
+        serde_json::json!("10.9.0.1/30"),
+    );
+}
+
+/// `?force` commits a `tun:` section `parse_tun_config` rejected, garbage
+/// `inet4-address` included — and `GET /configs` still never reports a
+/// non-string: an unreportable committed value is absent, while a
+/// committed string (invalid CIDR or not) is echoed verbatim as a string.
+#[tokio::test]
+async fn put_configs_force_garbage_inet4_address_never_reports_non_string() {
+    use base64::Engine as _;
+    let put = |inet4: &str| {
+        let yaml = format!(
+            "mode: rule\ntun:\n  enable: false\n  inet4-address: {inet4}\nrules:\n  - MATCH,DIRECT\n"
+        );
+        base64::engine::general_purpose::STANDARD.encode(yaml)
+    };
+    let state = test_state(test_raw_config());
+    for (payload, want) in [
+        (put("[7]"), serde_json::Value::Null),
+        (put("{a: 1}"), serde_json::Value::Null),
+        // A committed string reports verbatim — the contract is
+        // `string | absent`, not `valid CIDR | absent`.
+        (put("not-a-cidr"), serde_json::json!("not-a-cidr")),
+    ] {
+        let resp = create_router(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/configs?force=true")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({"payload": payload}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let tun = get_configs_json(&state).await["tun"].clone();
+        if want.is_null() {
+            assert!(
+                tun.get("inet4-address").is_none(),
+                "an unreportable committed value must be absent, got {tun}"
+            );
+        } else {
+            assert_eq!(tun["inet4-address"], want);
+        }
+    }
+}
+
 /// Unknown keys — mihomo's upstream-only `tun` keys and other top-level
 /// sections (Clash Party sends `dns` with its TUN switch) — are ignored,
 /// not stored and not rejected.

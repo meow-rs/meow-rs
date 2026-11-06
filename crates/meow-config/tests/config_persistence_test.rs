@@ -1,4 +1,4 @@
-use meow_config::raw::{RawConfig, RawProxyGroup, RawSubscription};
+use meow_config::raw::{RawConfig, RawProxyGroup, RawSubscription, RawTun};
 use meow_config::{rebuild_from_raw, save_raw_config};
 use std::collections::HashMap;
 
@@ -156,6 +156,34 @@ fn save_overwrites_previous_backup() {
     let first_save = std::fs::read_to_string(&path).unwrap();
     save_raw_config(path_str, &minimal_raw_config()).unwrap();
     assert_eq!(std::fs::read_to_string(&bak_path).unwrap(), first_save);
+}
+
+/// `RawTun::inet4_address` is `Option<serde_json::Value>` (mihomo's list
+/// form, #885): a committed list must save back as a list and reload —
+/// the save path writes the committed spelling verbatim, so a reload
+/// lands on the same list arm it came in on.
+#[test]
+fn save_roundtrips_tun_inet4_address_list_form() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.yaml");
+    let path_str = path.to_str().unwrap();
+
+    let mut raw = minimal_raw_config();
+    raw.tun = Some(
+        serde_saphyr::from_str::<RawTun>(
+            "enable: false\ninet4-address: [10.9.0.1/30, 10.8.0.1/30]",
+        )
+        .unwrap(),
+    );
+    save_raw_config(path_str, &raw).unwrap();
+
+    let content = std::fs::read_to_string(&path).unwrap();
+    let loaded: RawConfig = serde_saphyr::from_str(&content).unwrap();
+    assert_eq!(
+        loaded.tun.unwrap().inet4_address,
+        Some(serde_json::json!(["10.9.0.1/30", "10.8.0.1/30"])),
+        "the saved file must keep the list spelling reloadably"
+    );
 }
 
 // ── rebuild_from_raw tests ───────────────────────────────────────
