@@ -143,12 +143,15 @@ pub trait SocketFactory: Send + Sync + 'static {
 
     /// Bind for a known upstream. The socket is `connect()`ed to the
     /// canonical form of `peer` — an IPv4-mapped peer dials plain IPv4 —
-    /// so its family must match `peer`'s: an IPv4-bound socket can never
-    /// reach a native IPv6 peer, and an IPv6-bound socket cannot take a
-    /// plain `sockaddr_in` either. A factory whose
-    /// [`bind_udp`](Self::bind_udp) yields a single-family socket **must**
-    /// override this to bind in `peer`'s family — without that override
-    /// mismatched upstreams still fail, the bug this hook fixes.
+    /// so its family must match the canonical `peer`'s: an IPv4-bound
+    /// socket can never reach a native IPv6 peer, and an IPv6-bound
+    /// socket cannot be relied on to take a plain `sockaddr_in` either
+    /// (dual-stack Linux happens to translate a mapped connect; the
+    /// contract is deliberately stricter than that leniency). A factory
+    /// whose [`bind_udp`](Self::bind_udp) yields a single-family socket
+    /// **must** override this to bind in the canonical `peer`'s family —
+    /// without that override mismatched upstreams still fail, the bug
+    /// this hook fixes.
     ///
     /// The default delegates to [`bind_udp`](Self::bind_udp), so custom
     /// factories keep their socket creation and protection hooks, then
@@ -168,7 +171,11 @@ pub trait SocketFactory: Send + Sync + 'static {
         })
     }
 
-    /// Open an outbound TCP connection to `addr`.
+    /// Open an outbound TCP connection to `addr`. Call sites pass the
+    /// [`meow_common::canonical_socket_addr`] of the upstream, so the
+    /// IPv4-mapped form never reaches the impl — an implementation that
+    /// picks its socket family from `addr.is_ipv6()` sees the real dial
+    /// family.
     fn connect_tcp(&self, addr: SocketAddr) -> BoxFuture<'_, io::Result<TcpStream>>;
 }
 
@@ -1408,7 +1415,12 @@ impl DnsClient {
         let (host, dst_ip, dst_port) = match &self.proxy_target {
             Some((host, port)) => (smol_str::SmolStr::from(host.as_ref()), None, *port),
             None => {
-                let addr = self.transport.dial_addr();
+                // Same canonicalisation as `tcp_exchange_pooled` /
+                // `dial_tls_inner`: a v4-mapped upstream is advertised
+                // to the adapter as plain IPv4 — an adapter that dials
+                // `dst_ip` verbatim (DirectAdapter) hits the mapped-form
+                // connect() failure this PR fixes.
+                let addr = meow_common::canonical_socket_addr(self.transport.dial_addr());
                 (
                     smol_str::SmolStr::from(addr.ip().to_string()),
                     Some(addr.ip()),
@@ -1477,6 +1489,9 @@ impl DnsClient {
         if let Some(proxy) = self.proxy.as_ref() {
             self.proxy_dial(proxy).await
         } else {
+            // Same canonicalisation as `tcp_exchange_pooled`: a
+            // v4-mapped `tls://`/`https://` upstream is dialed as plain
+            // IPv4 — the mapped form fails connect() on a v6-only socket.
             let addr = meow_common::canonical_socket_addr(self.transport.dial_addr());
             let tcp = factory().connect_tcp(addr).await?;
             Ok(Box::new(tcp))
@@ -3302,7 +3317,10 @@ mod tests {
     /// A v4-mapped `tcp://` nameserver is canonicalised to plain IPv4
     /// before `connect_tcp` — the TCP counterpart of
     /// `udp_accepts_ipv4_mapped_nameserver`. Without it the mapped form
-    /// fails connect() where a fresh v6 socket defaults to v6-only.
+    /// fails connect() where a fresh v6 socket defaults to v6-only; on
+    /// dual-stack Linux/macOS the kernel maps the connect, so the test
+    /// is a real guard only on v6-only platforms (it passed elsewhere
+    /// even before the fix).
     #[tokio::test]
     async fn tcp_accepts_ipv4_mapped_nameserver() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3323,6 +3341,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.queries[0].query_type, RecordType::A);
+        // Same as the `udp_accepts_*` siblings above: report a
+        // server-task panic instead of dropping it with the JoinHandle.
         server_task.await.unwrap();
     }
 

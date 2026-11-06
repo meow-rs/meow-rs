@@ -14,10 +14,11 @@ the canonical, in-repo source a release is cut from.
   from a socket of the peer's address family: a native `2001:db8::53`
   nameserver previously got an IPv4-bound UDP socket and failed at
   `connect()`, and a `[::ffff:8.8.8.8]` entry is canonicalised to plain
-  IPv4 for `udp://`, `tcp://`, `tls://` and `https://` alike. A custom
-  `SocketFactory` whose `bind_udp` returns a single-family socket must
-  now override `bind_udp_for_peer`; the default rejects a
-  family-mismatched pairing with `AddrNotAvailable` up front.
+  IPv4 for `udp://`, `tcp://`, `tls://` and `https://` alike, including
+  `?proxy=` forwards. A custom `SocketFactory` whose `bind_udp` returns
+  a single-family socket must now override `bind_udp_for_peer`; the
+  default `bind_udp_for_peer` method rejects a family-mismatched
+  pairing with `AddrNotAvailable` up front.
 - `tun.inet4-address` accepts mihomo's list form (`[198.18.0.1/30]`, the
   only form mihomo itself accepts) — the first entry is used, with a
   warning when there are more — in the config and in `PATCH /configs`.
