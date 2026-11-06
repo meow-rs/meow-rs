@@ -139,6 +139,12 @@ pub trait SocketFactory: Send + Sync + 'static {
     /// `0.0.0.0:0`.
     fn bind_udp(&self) -> BoxFuture<'_, io::Result<UdpSocket>>;
 
+    /// Bind for a known upstream. Existing custom factories keep their
+    /// socket creation and protection hooks unless they opt into peer selection.
+    fn bind_udp_for_peer(&self, _peer: IpAddr) -> BoxFuture<'_, io::Result<UdpSocket>> {
+        self.bind_udp()
+    }
+
     /// Open an outbound TCP connection to `addr`.
     fn connect_tcp(&self, addr: SocketAddr) -> BoxFuture<'_, io::Result<TcpStream>>;
 }
@@ -150,12 +156,11 @@ struct DefaultSocketFactory;
 
 impl SocketFactory for DefaultSocketFactory {
     fn bind_udp(&self) -> BoxFuture<'_, io::Result<UdpSocket>> {
-        Box::pin(async {
-            // Bind to v4 unspecified; this is fine because we always
-            // `connect()` the socket before sending, and connect() will
-            // re-resolve the local address family.
-            meow_common::bind_udp(SocketAddr::from(([0u8; 4], 0))).await
-        })
+        Box::pin(meow_common::bind_udp(SocketAddr::from(([0u8; 4], 0))))
+    }
+
+    fn bind_udp_for_peer(&self, peer: IpAddr) -> BoxFuture<'_, io::Result<UdpSocket>> {
+        Box::pin(meow_common::bind_udp_for_peer(peer))
     }
 
     fn connect_tcp(&self, addr: SocketAddr) -> BoxFuture<'_, io::Result<TcpStream>> {
@@ -2059,6 +2064,7 @@ async fn udp_exchange(
     // Binding to the loopback address selects `lo0` explicitly; it also
     // needs no VPN `protect()` on Android because loopback is never routed
     // into the tunnel.
+    let addr = meow_common::canonical_socket_addr(addr);
     let sock = if addr.ip().is_loopback() {
         let local: SocketAddr = match addr {
             SocketAddr::V4(_) => SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -2066,7 +2072,7 @@ async fn udp_exchange(
         };
         UdpSocket::bind(local).await?
     } else {
-        factory().bind_udp().await?
+        factory().bind_udp_for_peer(addr.ip()).await?
     };
     sock.connect(addr).await?;
     sock.send(wire).await?;
@@ -3128,6 +3134,38 @@ mod tests {
         message.add_answer(a_record("second.example", 300, [192, 0, 2, 11]));
 
         assert_eq!(relevant_ip_answers(&message), (Vec::new(), None));
+    }
+
+    #[tokio::test]
+    async fn default_udp_socket_matches_native_ipv6_nameserver_family() {
+        let socket = DefaultSocketFactory
+            .bind_udp_for_peer("2001:db8::53".parse().unwrap())
+            .await
+            .unwrap();
+        assert!(socket.local_addr().unwrap().is_ipv6());
+    }
+
+    #[tokio::test]
+    async fn udp_accepts_ipv4_mapped_nameserver() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = server.local_addr().unwrap().port();
+        let addr = SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.to_ipv6_mapped().into(), port);
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (len, peer) = server.recv_from(&mut buf).await.unwrap();
+            let request = Message::from_bytes(&buf[..len]).unwrap();
+            let reply = response_for(&request, request.metadata.id);
+            server
+                .send_to(&reply.to_bytes().unwrap(), peer)
+                .await
+                .unwrap();
+        });
+        let response = DnsClient::udp(addr)
+            .with_timeout(Duration::from_secs(1))
+            .query("example.test", RecordType::AAAA)
+            .await
+            .unwrap();
+        assert_eq!(response.queries[0].query_type, RecordType::AAAA);
     }
 
     #[tokio::test]
