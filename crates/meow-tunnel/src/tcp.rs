@@ -6,7 +6,7 @@ use crate::tunnel::{MatchedRule, ResolvedTarget, TunnelInner, UsingProxy};
 use meow_common::conn_note;
 use meow_common::conn_notes::{self, ConnNotes};
 use meow_common::traffic_ledger::Route;
-use meow_common::{with_dial_timeout, Metadata, ProxyAdapter, ProxyConn};
+use meow_common::{with_dial_timeout, Metadata, Proxy, ProxyAdapter, ProxyConn};
 use smallvec::{smallvec, SmallVec};
 use smol_str::SmolStr;
 use std::sync::Arc;
@@ -118,6 +118,45 @@ impl std::fmt::Display for PolicyPath<'_> {
                 f.write_str(" → ")?;
             }
             f.write_str(hop)?;
+        }
+        Ok(())
+    }
+}
+
+/// What a dial-error line names: the rule's target and, behind a group,
+/// the node its dial went through (`Proxy → HK-01`), since the group's
+/// name alone hides which member failed.
+struct DialVia<'a> {
+    target: &'a str,
+    leaf: Option<Arc<dyn Proxy>>,
+}
+
+impl<'a> DialVia<'a> {
+    /// `pick` is the member the dial's automatic group committed to
+    /// ([`meow_proxy::group::watch_dial_pick`]); without one (a selector
+    /// over a node, or no group at all) the leaf is read the way
+    /// [`connection_chain`] reads it.
+    fn new(
+        adapter: &'a dyn ProxyAdapter,
+        pick: Option<Arc<dyn Proxy>>,
+        metadata: &Metadata,
+    ) -> Self {
+        let leaf = match pick {
+            Some(pick) => leaf_proxy(pick.as_ref(), metadata).or(Some(pick)),
+            None => leaf_proxy(adapter, metadata),
+        };
+        Self {
+            target: adapter.name(),
+            leaf,
+        }
+    }
+}
+
+impl std::fmt::Display for DialVia<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.target)?;
+        if let Some(leaf) = &self.leaf {
+            write!(f, " → {}", leaf.name())?;
         }
         Ok(())
     }
@@ -482,7 +521,11 @@ async fn route_inbound_tcp_scoped<C>(
                 proxy.adapter_type()
             );
             let started = std::time::Instant::now();
-            let dial = with_dial_timeout(proxy.name(), proxy.dial_tcp(&metadata)).await;
+            let (dial, pick) = meow_proxy::group::watch_dial_pick(with_dial_timeout(
+                proxy.name(),
+                proxy.dial_tcp(&metadata),
+            ))
+            .await;
             // All chained front hops resolved during the dial — release the
             // generation pin before entering the relay loop.
             drop(route.take());
@@ -556,9 +599,10 @@ async fn route_inbound_tcp_scoped<C>(
                 }
                 Err(e) => {
                     warn!(
-                        "{} {} dial error: {}",
+                        "{} {} dial error using {}: {}",
                         metadata.conn_type,
                         metadata.remote_address(),
+                        DialVia::new(proxy.as_ref(), pick, &metadata),
                         e
                     );
                     conn_note!(
@@ -1273,6 +1317,49 @@ mod tests {
         assert!(
             notes.contains(&format!("Fake IP {fake} maps to notes.test")),
             "{notes:?}"
+        );
+    }
+
+    /// A failed dial names the node behind the rule's group, not only the
+    /// group; a leaf target is named once.
+    #[test]
+    fn dial_error_names_the_node_a_group_dialed_through() {
+        let logs = capture_info(async {
+            let raw: meow_config::raw::RawConfig = serde_saphyr::from_str(
+                "proxies:
+  - {name: HK-01, type: socks5, server: 127.0.0.1, port: 1}
+  - {name: JP-01, type: socks5, server: 127.0.0.1, port: 1}
+proxy-groups:
+  - {name: Auto, type: fallback, proxies: [HK-01, JP-01], url: 'http://probe.test/204', interval: 300}
+  - {name: Proxy, type: select, proxies: [Auto, JP-01]}
+",
+            )
+            .unwrap();
+            let proxies = meow_config::rebuild_from_raw(&raw).unwrap().proxies;
+            let tunnel = test_tunnel();
+            tunnel.update_routing(
+                proxies.clone(),
+                vec![
+                    rule("DOMAIN,leaf.invalid,JP-01"),
+                    Box::new(meow_rules::final_rule::FinalRule::new("Proxy")),
+                ],
+                Default::default(),
+            );
+            for host in ["group.invalid", "leaf.invalid"] {
+                let meta = Metadata {
+                    host: host.into(),
+                    ..metadata()
+                };
+                route_one(&tunnel, meta).await;
+            }
+        });
+        assert!(
+            logs.contains("group.invalid:443 dial error using Proxy → HK-01: "),
+            "{logs}"
+        );
+        assert!(
+            logs.contains("leaf.invalid:443 dial error using JP-01: "),
+            "{logs}"
         );
     }
 
