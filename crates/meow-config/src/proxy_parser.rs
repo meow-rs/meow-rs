@@ -2628,36 +2628,42 @@ fn parse_vless_xhttp_config(
     if hosts.is_empty() {
         return Err("vless: xhttp-opts.host must not be empty".into());
     }
-    let mut mode = xhttp_opts
+    // An absent `mode` keeps meow's historical stream-one default (existing
+    // non-REALITY nodes carry no mode key); an explicitly empty `mode: ''`
+    // is Xray's `auto` and resolves below — the two deliberately differ.
+    let mut mode: &str = xhttp_opts
         .and_then(|o| o.get("mode"))
         .and_then(|v| v.as_str())
-        .unwrap_or("stream-one")
-        .to_string();
+        .unwrap_or("stream-one");
     // Xray treats an empty mode as auto.
     if mode.is_empty() || mode.eq_ignore_ascii_case("auto") {
-        // `mode` is reassigned to the resolved value below; keep the user's
-        // spelling so `mode: ''` is not reported as 'auto' in the error.
-        let requested = if mode.is_empty() {
-            "'' (treated as 'auto')".to_string()
-        } else {
-            format!("'{mode}'")
-        };
+        // `mode` is reassigned to the resolved value below; `requested`
+        // keeps the user's spelling so `mode: ''` is not reported as 'auto'.
+        let requested = mode;
         // Xray's client resolution (splithttp/dialer.go): REALITY without
         // `download-settings` is stream-one; with them stream-up, and
         // without REALITY packet-up — neither of which meow implements.
+        //
+        // Caller contract: parse_vless already ran parse_vless_reality_opts
+        // upstream, so a present `reality-opts` key here is usable REALITY.
         let reality = config.contains_key("reality-opts");
         // `null` is no download-settings; Xray's JSON spells it camelCase.
         let split = xhttp_opts.is_some_and(|o| {
             ["download-settings", "downloadSettings"]
-                .iter()
-                .any(|k| o.get(*k).is_some_and(|v| !v.is_null()))
+                .into_iter()
+                .any(|k| o.get(k).is_some_and(|v| !v.is_null()))
         });
         mode = match (reality, split) {
-            (true, false) => "stream-one".into(),
-            (true, true) => "stream-up".into(),
-            (false, _) => "packet-up".into(),
+            (true, false) => "stream-one",
+            (true, true) => "stream-up",
+            (false, _) => "packet-up",
         };
         if mode != "stream-one" {
+            let requested = if requested.is_empty() {
+                "'' (treated as 'auto')".to_string()
+            } else {
+                format!("'{requested}'")
+            };
             return Err(format!(
                 "vless: xhttp mode {requested} resolves to '{mode}' here (as in Xray); \
                  only 'stream-one' is implemented"
@@ -2769,7 +2775,7 @@ fn parse_vless_xhttp_config(
         hosts,
         scheme: if tls { "https" } else { "http" }.to_string(),
         extra_headers,
-        mode,
+        mode: mode.to_string(),
         no_grpc_header,
         x_padding_bytes,
     })

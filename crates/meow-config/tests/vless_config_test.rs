@@ -1619,6 +1619,9 @@ proxies:
 }
 #[tokio::test]
 async fn parse_vless_xhttp_unsupported_mode_skipped() {
+    // `stream-up` is a named XHTTP mode meow does not implement, so it hits
+    // the generic "unsupported xhttp mode" rejection — `auto` no longer
+    // reaches that branch (it resolves like Xray first).
     let yaml = r#"
 proxies:
   - name: vless-xhttp-bad-mode
@@ -1629,14 +1632,14 @@ proxies:
     tls: true
     network: xhttp
     xhttp-opts:
-      mode: auto
+      mode: stream-up
 "#;
     let config = load_config_from_str(yaml)
         .await
         .expect("config load must succeed (warn-and-skip)");
     assert!(
         !config.proxies.contains_key("vless-xhttp-bad-mode"),
-        "proxy with unsupported xhttp mode must be skipped"
+        "proxy with unimplemented xhttp mode must be skipped"
     );
 }
 
