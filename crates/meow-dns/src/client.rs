@@ -136,28 +136,32 @@ type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// the local VPN tunnel.
 pub trait SocketFactory: Send + Sync + 'static {
     /// Bind an unconnected UDP socket. Implementations typically bind to
-    /// `0.0.0.0:0`.
+    /// `0.0.0.0:0`; a single-family socket like that must be paired with a
+    /// [`bind_udp_for_peer`](Self::bind_udp_for_peer) override or upstreams
+    /// of the other family stay unreachable.
     fn bind_udp(&self) -> BoxFuture<'_, io::Result<UdpSocket>>;
 
-    /// Bind for a known upstream. The socket must be able to reach `peer`:
-    /// an IPv4-bound socket can never reach a native IPv6 peer, so a
-    /// factory whose [`bind_udp`](Self::bind_udp) yields a single-family
-    /// socket **must** override this to bind in `peer`'s family — without
-    /// that override IPv6 upstreams still fail, the bug this hook fixes.
+    /// Bind for a known upstream. The socket is `connect()`ed to the
+    /// canonical form of `peer` — an IPv4-mapped peer dials plain IPv4 —
+    /// so its family must match `peer`'s: an IPv4-bound socket can never
+    /// reach a native IPv6 peer, and an IPv6-bound socket cannot take a
+    /// plain `sockaddr_in` either. A factory whose
+    /// [`bind_udp`](Self::bind_udp) yields a single-family socket **must**
+    /// override this to bind in `peer`'s family — without that override
+    /// mismatched upstreams still fail, the bug this hook fixes.
     ///
     /// The default delegates to [`bind_udp`](Self::bind_udp), so custom
     /// factories keep their socket creation and protection hooks, then
-    /// refuses the provably-unreachable pairing — IPv4-bound socket for a
-    /// native IPv6 peer — with `AddrNotAvailable` up front instead of a
-    /// late, opaque `connect()` failure.
+    /// refuses a family-mismatched pairing up front with
+    /// `AddrNotAvailable` instead of a late, opaque `connect()` failure.
     fn bind_udp_for_peer(&self, peer: IpAddr) -> BoxFuture<'_, io::Result<UdpSocket>> {
         Box::pin(async move {
             let socket = self.bind_udp().await?;
-            if socket.local_addr()?.is_ipv4() && peer.to_canonical().is_ipv6() {
+            if socket.local_addr()?.is_ipv4() != peer.to_canonical().is_ipv4() {
                 return Err(io::Error::new(
                     io::ErrorKind::AddrNotAvailable,
-                    "SocketFactory::bind_udp returned an IPv4 socket for an \
-                     IPv6 peer; override bind_udp_for_peer",
+                    "SocketFactory::bind_udp returned a socket whose family \
+                     cannot reach the peer; override bind_udp_for_peer",
                 ));
             }
             Ok(socket)
@@ -1362,6 +1366,10 @@ impl DnsClient {
             // to the pool.
         }
 
+        // Same canonicalisation as `udp_exchange`: a v4-mapped `tcp://`
+        // upstream is dialed as plain IPv4 — the mapped form fails
+        // connect() where a fresh v6 socket defaults to v6-only.
+        let addr = meow_common::canonical_socket_addr(addr);
         // Captured before the socket exists: a reset racing the connect
         // must retire this stream too (issue #695).
         let generation = self.tcp_pool.generation();
@@ -1469,7 +1477,8 @@ impl DnsClient {
         if let Some(proxy) = self.proxy.as_ref() {
             self.proxy_dial(proxy).await
         } else {
-            let tcp = factory().connect_tcp(self.transport.dial_addr()).await?;
+            let addr = meow_common::canonical_socket_addr(self.transport.dial_addr());
+            let tcp = factory().connect_tcp(addr).await?;
             Ok(Box::new(tcp))
         }
     }
@@ -3183,6 +3192,37 @@ mod tests {
         assert!(socket.local_addr().unwrap().is_ipv4());
     }
 
+    /// The mirror-image pairing is just as unreachable: an IPv6-bound
+    /// socket cannot `connect()` a plain IPv4 `sockaddr_in`, so the
+    /// default refuses it too. Skipped when the host has no IPv6.
+    #[tokio::test]
+    async fn bind_udp_for_peer_default_rejects_v6_socket_for_v4_peer() {
+        if UdpSocket::bind("[::1]:0").await.is_err() {
+            eprintln!("no IPv6 loopback; skipping v6-socket reject test");
+            return;
+        }
+        struct V6Only;
+        impl SocketFactory for V6Only {
+            fn bind_udp(&self) -> BoxFuture<'_, io::Result<UdpSocket>> {
+                Box::pin(async { UdpSocket::bind("[::]:0").await })
+            }
+            fn connect_tcp(&self, _addr: SocketAddr) -> BoxFuture<'_, io::Result<TcpStream>> {
+                unreachable!("udp-only test factory")
+            }
+        }
+        let err = V6Only
+            .bind_udp_for_peer("192.0.2.53".parse().unwrap())
+            .await
+            .expect_err("an IPv6-bound socket cannot connect() a plain IPv4 peer");
+        assert_eq!(err.kind(), io::ErrorKind::AddrNotAvailable);
+        // Same-family peers keep the delegated bind_udp socket.
+        let socket = V6Only
+            .bind_udp_for_peer("2001:db8::53".parse().unwrap())
+            .await
+            .expect("IPv6 peer keeps the delegated bind_udp socket");
+        assert!(socket.local_addr().unwrap().is_ipv6());
+    }
+
     /// Probe first so a kernel with IPv6 disabled (e.g. `ipv6.disable=1`
     /// sandboxes) skips instead of failing on `EADDRNOTAVAIL`; the
     /// `unwrap` below still fails on a real `bind_udp_for_peer` regression.
@@ -3220,9 +3260,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.queries[0].query_type, RecordType::AAAA);
-        // Propagate a panic inside the server task (e.g. a failed
-        // `Message::from_bytes`) instead of swallowing it behind the
-        // client query's timeout.
+        // Await the server task so a panic on the passing path is
+        // reported instead of dropped with the JoinHandle; a panic
+        // before the reply already fails the test via the client
+        // timeout above.
         server_task.await.unwrap();
     }
 
@@ -3253,6 +3294,35 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.queries[0].query_type, RecordType::AAAA);
+        // Same reason as the v4-mapped test above: report a server-task
+        // panic instead of dropping it with the JoinHandle.
+        server_task.await.unwrap();
+    }
+
+    /// A v4-mapped `tcp://` nameserver is canonicalised to plain IPv4
+    /// before `connect_tcp` — the TCP counterpart of
+    /// `udp_accepts_ipv4_mapped_nameserver`. Without it the mapped form
+    /// fails connect() where a fresh v6 socket defaults to v6-only.
+    #[tokio::test]
+    async fn tcp_accepts_ipv4_mapped_nameserver() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let addr = SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.to_ipv6_mapped().into(), port);
+        let server_task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_lp(&mut stream).await.unwrap();
+            let request = Message::from_bytes(&request).unwrap();
+            let reply = response_for(&request, request.metadata.id);
+            write_lp(&mut stream, &reply.to_bytes().unwrap())
+                .await
+                .unwrap();
+        });
+        let response = DnsClient::tcp(addr)
+            .with_timeout(Duration::from_secs(1))
+            .query("example.test", RecordType::A)
+            .await
+            .unwrap();
+        assert_eq!(response.queries[0].query_type, RecordType::A);
         server_task.await.unwrap();
     }
 
