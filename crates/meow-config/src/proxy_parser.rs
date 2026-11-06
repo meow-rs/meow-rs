@@ -35,11 +35,44 @@ fn required_port(
 /// Wraps a ProxyAdapter to implement the full Proxy trait
 pub struct WrappedProxy {
     adapter: Box<dyn ProxyAdapter>,
+    /// The `dialer-proxy` the adapter dials its server through.
+    hop: Option<DialerHop>,
+}
+
+/// An outbound's injected `dialer-proxy` dialer, and the server it dials
+/// through it.
+struct DialerHop {
+    dialer: Arc<dyn meow_proxy::dialer::TcpDialer>,
+    host: SmolStr,
+    port: u16,
 }
 
 impl WrappedProxy {
     pub fn new(adapter: Box<dyn ProxyAdapter>) -> Self {
-        Self { adapter }
+        Self { adapter, hop: None }
+    }
+
+    /// `self`, whose adapter the block `config` built with `dialer`
+    /// injected, so [`ProxyAdapter::dialer_hop`] can name the member a
+    /// `dialer-proxy` front takes.
+    fn dialing_through(
+        mut self,
+        config: &HashMap<String, serde_json::Value>,
+        dialer: &Arc<dyn meow_proxy::dialer::TcpDialer>,
+    ) -> Self {
+        let host = config.get("server").and_then(serde_json::Value::as_str);
+        let port = config
+            .get("port")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|port| u16::try_from(port).ok());
+        if let (true, Some(host), Some(port)) = (dialer.is_proxy(), host, port) {
+            self.hop = Some(DialerHop {
+                dialer: Arc::clone(dialer),
+                host: host.into(),
+                port,
+            });
+        }
+        self
     }
 }
 
@@ -75,6 +108,23 @@ impl ProxyAdapter for WrappedProxy {
     /// otherwise hide PASS/PASS-RULE members from the match-time probe.
     fn unwrap_proxy(&self, metadata: &Metadata, touch: bool) -> Option<Arc<dyn Proxy>> {
         self.adapter.unwrap_proxy(metadata, touch)
+    }
+
+    /// The pick of the front the injected dialer dials the server through,
+    /// over the network the adapter takes there for this flow.
+    fn dialer_hop(&self, metadata: &Metadata) -> Option<Arc<dyn Proxy>> {
+        match &self.hop {
+            Some(hop) => hop.dialer.front_hop(
+                &hop.host,
+                hop.port,
+                self.adapter.dialer_hop_network(metadata.network),
+            ),
+            None => self.adapter.dialer_hop(metadata),
+        }
+    }
+
+    fn dialer_hop_network(&self, flow: meow_common::Network) -> meow_common::Network {
+        self.adapter.dialer_hop_network(flow)
     }
 
     /// Forward the session flush (issue #695) — every parsed leaf sits behind
@@ -365,7 +415,9 @@ pub fn parse_proxy_with_dialer(
             }
             #[cfg(not(feature = "mux"))]
             parse_mux_options(name, config)?;
-            Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
+            Ok(Arc::new(
+                WrappedProxy::new(Box::new(adapter)).dialing_through(config, dialer),
+            ))
         }
         #[cfg(feature = "trojan")]
         "trojan" => {
@@ -414,20 +466,28 @@ pub fn parse_proxy_with_dialer(
             }
             #[cfg(not(feature = "mux"))]
             parse_mux_options(name, config)?;
-            Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
+            Ok(Arc::new(
+                WrappedProxy::new(Box::new(adapter)).dialing_through(config, dialer),
+            ))
         }
         #[cfg(feature = "vless")]
         "vless" => {
             let adapter = parse_vless(name, config, dialer)?;
-            Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
+            Ok(Arc::new(
+                WrappedProxy::new(Box::new(adapter)).dialing_through(config, dialer),
+            ))
         }
         "http" => {
             let adapter = parse_http(name, config, dialer)?;
-            Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
+            Ok(Arc::new(
+                WrappedProxy::new(Box::new(adapter)).dialing_through(config, dialer),
+            ))
         }
         "socks5" => {
             let adapter = parse_socks5(name, config, dialer)?;
-            Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
+            Ok(Arc::new(
+                WrappedProxy::new(Box::new(adapter)).dialing_through(config, dialer),
+            ))
         }
         "direct" => {
             reject_unthreaded_dialer(name, "direct", dialer)?;
@@ -449,12 +509,16 @@ pub fn parse_proxy_with_dialer(
         #[cfg(feature = "vmess")]
         "vmess" => {
             let adapter = parse_vmess(name, config, dialer)?;
-            Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
+            Ok(Arc::new(
+                WrappedProxy::new(Box::new(adapter)).dialing_through(config, dialer),
+            ))
         }
         #[cfg(feature = "snell")]
         "snell" => {
             let adapter = parse_snell(name, config, dialer)?;
-            Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
+            Ok(Arc::new(
+                WrappedProxy::new(Box::new(adapter)).dialing_through(config, dialer),
+            ))
         }
         #[cfg(not(feature = "trusttunnel"))]
         "trusttunnel" => Err(feature_gated_proxy_type("trusttunnel")),
@@ -1183,7 +1247,9 @@ fn parse_trusttunnel(
         Arc::clone(dialer),
     )
     .map_err(|error| error.to_string())?;
-    Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
+    Ok(Arc::new(
+        WrappedProxy::new(Box::new(adapter)).dialing_through(config, dialer),
+    ))
 }
 
 /// Parse a `type: anytls` proxy block into an [`AnytlsAdapter`].
@@ -1225,6 +1291,7 @@ fn parse_anytls(
         .get("udp")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
+    reject_unsupported_anytls_options(name, config)?;
 
     let optional_string = |field: &str| match config.get(field) {
         Some(serde_json::Value::String(value)) => Ok(Some(value.clone())),
@@ -1253,6 +1320,59 @@ fn parse_anytls(
         alpn,
     };
     meow_proxy::AnytlsAdapter::new_with_tls(name, server, port, password, &options, udp)
+}
+
+/// Refuse the AnyTLS options that change security properties and that the
+/// Rust backend cannot honour (issue #870), and warn once about the purely
+/// behavioural mihomo fields it ignores. Mirrors hysteria2: an enabled
+/// `ech-opts` or any `certificate`/`private-key` is a load error (silently
+/// dropping them would leak the SNI / send no client certificate).
+#[cfg(feature = "anytls")]
+fn reject_unsupported_anytls_options(
+    name: &str,
+    config: &HashMap<String, serde_json::Value>,
+) -> std::result::Result<(), String> {
+    if let Some(value) = config.get("ech-opts") {
+        let enabled = value
+            .as_object()
+            .and_then(|map| map.get("enable"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true);
+        if enabled {
+            return Err(format!(
+                "anytls[{name}]: 'ech-opts' is not supported by the Rust backend \
+                 (the SNI would be sent in the clear)"
+            ));
+        }
+    }
+    for key in ["certificate", "private-key"] {
+        if config.contains_key(key) {
+            return Err(format!(
+                "anytls[{name}]: '{key}' is not supported by the Rust backend"
+            ));
+        }
+    }
+    let ignored: Vec<&str> = [
+        "shadow-tls-opts",
+        "restls-opts",
+        "jls-opts",
+        "client-metadata",
+        "idle-session-check-interval",
+        "idle-session-timeout",
+        "min-idle-session",
+        "disable-reuse",
+    ]
+    .into_iter()
+    .filter(|key| config.get(*key).is_some_and(|v| !v.is_null()))
+    .collect();
+    if !ignored.is_empty() {
+        tracing::warn!(
+            name,
+            ignored = %ignored.join(", "),
+            "anytls: ignoring options not supported by the Rust backend"
+        );
+    }
+    Ok(())
 }
 
 /// Parse a `type: hysteria2` proxy block.
@@ -4208,6 +4328,49 @@ tls: true
             "name: jp\ntype: anytls\nserver: 1.2.3.4\nport: 443\npassword: secret\nudp: true\n",
         );
         assert!(parse_proxy(&on).unwrap().support_udp());
+    }
+
+    #[cfg(feature = "anytls")]
+    const ANYTLS_BASE: &str =
+        "name: jp\ntype: anytls\nserver: 1.2.3.4\nport: 443\npassword: secret\n";
+
+    /// Issue #870: ECH would be silently dropped, leaking the SNI.
+    #[cfg(feature = "anytls")]
+    #[tokio::test]
+    async fn parse_anytls_rejects_enabled_ech_opts() {
+        for extra in ["ech-opts: {enable: true}\n", "ech-opts: {config: QUJD}\n"] {
+            let cfg = anytls_config(&format!("{ANYTLS_BASE}{extra}"));
+            let err = parse_proxy(&cfg).err().expect("must reject").to_string();
+            assert!(err.contains("ech-opts"), "{err}");
+        }
+    }
+
+    #[cfg(feature = "anytls")]
+    #[tokio::test]
+    async fn parse_anytls_allows_disabled_ech_opts() {
+        let cfg = anytls_config(&format!("{ANYTLS_BASE}ech-opts: {{enable: false}}\n"));
+        assert!(parse_proxy(&cfg).is_ok());
+    }
+
+    #[cfg(feature = "anytls")]
+    #[tokio::test]
+    async fn parse_anytls_rejects_client_certificate() {
+        for key in ["certificate", "private-key"] {
+            let cfg = anytls_config(&format!("{ANYTLS_BASE}{key}: abc\n"));
+            let err = parse_proxy(&cfg).err().expect("must reject").to_string();
+            assert!(err.contains(key), "{err}");
+        }
+    }
+
+    #[cfg(feature = "anytls")]
+    #[tokio::test]
+    async fn parse_anytls_ignored_options_still_parse() {
+        let cfg = anytls_config(&format!(
+            "{ANYTLS_BASE}shadow-tls-opts: {{}}\nrestls-opts: {{}}\njls-opts: {{}}\n\
+             client-metadata: {{a: b}}\nidle-session-check-interval: 30\n\
+             idle-session-timeout: 30\nmin-idle-session: 1\ndisable-reuse: true\n"
+        ));
+        assert!(parse_proxy(&cfg).is_ok());
     }
 
     #[cfg(feature = "anytls")]

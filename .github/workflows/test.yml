@@ -253,6 +253,13 @@ jobs:
           # this scope compiles them with every TrustTunnel transport on.
           cargo nextest run -p meow-config --features trusttunnel-h3 --lib --retries 2 --no-fail-fast
 
+      # The QUIC DNS transports live behind meow-dns's `quic-dns` feature
+      # (meow-app's `dns-quic` forwards it, and `full` carries that), so no
+      # default-features invocation compiles them. The peer is an in-process
+      # quiche server, so this needs no network.
+      - name: DNS over QUIC / DoH3 (in-process QUIC peer)
+        run: cargo nextest run -p meow-dns --features quic-dns --test quic_dns_integration --retries 2 --no-fail-fast
+
       # One workspace-scoped invocation for every default-features test
       # target. A single invocation keeps a single feature-resolution scope,
       # so default targets share artifacts within this invocation instead
@@ -329,11 +336,11 @@ jobs:
       - name: YAML boundary contract tests (meow-config)
         run: cargo nextest run -p meow-config --test yaml_boundary_test --retries 2 --no-fail-fast
 
-      # `minimal` leaves out `logbook`, which every run above unifies on;
-      # `-p meow-common` alone builds the stub that stands in for it
-      # (`meow-common/src/logbook/disabled.rs`).
-      - name: Logbook stub tests (meow-common without logbook)
-        run: cargo nextest run -p meow-common --lib logbook --retries 2 --no-fail-fast
+      # `minimal` leaves out `logbook` and `traffic-ledger`, which every run
+      # above unifies on; `-p meow-common` alone builds the stubs that stand
+      # in for them (`meow-common/src/{logbook,traffic_ledger}/disabled.rs`).
+      - name: Logbook and traffic ledger stub tests (meow-common without them)
+        run: cargo nextest run -p meow-common --lib logbook traffic_ledger --retries 2 --no-fail-fast
 
       - name: UDP routing regression (SOCKS5, Shadowsocks, TUN)
         run: cargo nextest run -p meow-listener --all-features --lib udp_port_53 --retries 2 --no-fail-fast

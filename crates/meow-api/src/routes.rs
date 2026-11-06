@@ -221,6 +221,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         )
         .route("/metrics", get(get_metrics))
         .route("/traffic", get(get_traffic))
+        .route(
+            "/traffic/ledger",
+            get(crate::traffic_ledger::get_ledger).delete(crate::traffic_ledger::clear_ledger),
+        )
         .route("/statistics", get(get_statistics))
         .route("/logs", get(get_logs))
         .route(
@@ -1332,6 +1336,17 @@ async fn save_config(
 
 // ── Helper: rebuild proxies/rules from raw and apply to tunnel ───────
 
+/// Resolve a candidate's `tcp-idle-timeout` via
+/// [`meow_config::resolve_tcp_idle_timeout`] — the same `build_config`
+/// rules the boot path enforces — flattening the error to the response
+/// `String`. The rebuild passes never see general fields (`RebuildResult`
+/// carries none), so each commit resolves the raw value itself and
+/// replays it beside `set_connection_notes` — otherwise the committed
+/// document and the running bound silently diverge until restart.
+fn resolve_tcp_idle_timeout(raw: &RawConfig) -> Result<Option<Duration>, String> {
+    meow_config::resolve_tcp_idle_timeout(raw).map_err(|e| e.to_string())
+}
+
 /// Pre-resolve DNS-sourced ECH then rebuild proxies/rules from `raw` and
 /// apply to the live tunnel. Takes the config *by value* so callers
 /// clone-and-drop their `parking_lot` guard before awaiting — those guards
@@ -1352,6 +1367,11 @@ async fn apply_raw_to_tunnel(
         "caller must hold the CONFIG_MUTATION lane"
     );
     let connection_notes = raw.connection_notes.unwrap_or(false);
+    // Same ceiling `build_config` enforces at startup — a candidate that
+    // fails it is rejected before the rebuild runs (400 like the bails
+    // below); the resolved bound is replayed at the commit point.
+    let tcp_idle_timeout =
+        resolve_tcp_idle_timeout(&raw).map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
     let expected_groups: Vec<String> = raw
         .proxy_groups
         .as_deref()
@@ -1449,6 +1469,7 @@ async fn apply_raw_to_tunnel(
     }
     state.tunnel.update_routing(proxies, rules, dialer_registry);
     state.tunnel.set_connection_notes(connection_notes);
+    state.tunnel.set_tcp_idle_timeout(tcp_idle_timeout);
     // Commit point reached: every fallible check passed. The candidate's
     // provider sets become the live registries — the rules and DNS
     // `rule-set:` matchers installed above already reference these Arcs
@@ -3060,7 +3081,7 @@ async fn swap_config_and_reconcile_tun(
     // Snapshot the candidate (only on an off→on transition, before it is
     // moved into the lock) so the parking_lot write guard — which is
     // !Send — is dropped before the first .await below.
-    let (old_enable, tun_changed, snapshot, specs, new_log_level, logbook_enable) = {
+    let (old_enable, tun_changed, snapshot, specs, new_log_level, (logbook_enable, ledger)) = {
         let mut guard = state.raw_config.write();
         let old = guard.tun.as_ref().is_some_and(|t| t.enable);
         // Semantic diff (issue #543): compare the PARSED `TunConfig`s so
@@ -3121,6 +3142,11 @@ async fn swap_config_and_reconcile_tun(
         let new_log_level =
             (guard.log_level != candidate.log_level).then(|| candidate.log_level.clone());
         let logbook_enable = meow_config::raw::RawLogbook::enabled(candidate.logbook.as_ref());
+        let ledger = candidate.traffic_ledger.as_ref();
+        let ledger = (
+            meow_config::raw::RawTrafficLedger::enabled(ledger),
+            meow_config::raw::RawTrafficLedger::options(ledger),
+        );
         *guard = candidate;
         (
             old,
@@ -3128,10 +3154,15 @@ async fn swap_config_and_reconcile_tun(
             snapshot,
             specs,
             new_log_level,
-            logbook_enable,
+            (logbook_enable, ledger),
         )
     };
     logbook::reconfigure(logbook_enable);
+    // Opening or closing the ledger waits on its database.
+    let _ = tokio::task::spawn_blocking(move || {
+        meow_common::traffic_ledger::reconfigure(ledger.0, ledger.1);
+    })
+    .await;
 
     if let Some(new_log_level) = new_log_level {
         let level = new_log_level.as_deref().unwrap_or("info");
@@ -3463,6 +3494,58 @@ async fn put_configs(
     // made it into the PUT.
     meow_config::subscription::reconcile_contribution_claims(&mut raw_config);
 
+    // Same admission contract for `tcp-idle-timeout`: the rebuild never
+    // sees general fields either, so its ceiling must gate persistence
+    // here — committed unchecked, the next boot's `build_config` would
+    // hard-error on a value this PUT accepted. `force` keeps the running
+    // bound, the same degrade the dns arm applies below — AND normalizes
+    // the committed field to that bound: the warm-path commits
+    // (`commit_raw_candidate` → `apply_raw_to_tunnel`) re-resolve this
+    // field on every mutation, so persisting the invalid value would make
+    // every later unrelated PATCH fail with this same error. This gate
+    // must run BEFORE the rebuild — the force early-return below commits
+    // `raw_config` when nothing builds, so a check placed after that arm
+    // would leave the verbatim poison in the committed document.
+    let tcp_idle_timeout = match resolve_tcp_idle_timeout(&raw_config) {
+        Ok(timeout) => timeout,
+        Err(msg) => {
+            if force {
+                tracing::error!("config reload forced despite {msg}");
+                forced.push(msg);
+                let running = state.tunnel.inner().tcp_idle_timeout();
+                // Rewrite the invalid value to what is actually running —
+                // semantically equivalent for the next boot's
+                // `build_config` (0 = disabled) and boot-valid by
+                // construction.
+                raw_config.tcp_idle_timeout = Some(running.map_or(0, |d| d.as_secs()));
+                running
+            } else {
+                return reload_rejected(StatusCode::BAD_REQUEST, &msg);
+            }
+        }
+    };
+
+    // Same admission contract for `tcp-keepalive*`: the rebuild never sees
+    // general fields either, so their semantic validation must gate
+    // persistence here — committed unchecked, the next boot's
+    // `build_config` would hard-error on a value this PUT accepted. The
+    // resolved posture is a startup snapshot like `listeners:` (no
+    // hot-apply), so under `force` there is no running value to keep —
+    // the degrade is warn + commit, matching the listeners arm. Unlike
+    // `tcp-idle-timeout` the committed value is NOT normalized (nothing
+    // running to normalize to): a forced bad value can still reach
+    // `save_config` and hard-error the next boot, the same exposure
+    // `listeners:`/`tun:` already carry — but hoisting the check above
+    // the rebuild at least records it in `forced` on every commit path.
+    if let Err(e) = meow_config::resolve_tcp_keepalive(&raw_config) {
+        if force {
+            tracing::error!("config reload forced despite {e}");
+            forced.push(e.to_string());
+        } else {
+            return reload_rejected(StatusCode::BAD_REQUEST, &e.to_string());
+        }
+    }
+
     // Semantic rebuild (proxy/rule parsing). Share the tunnel's resolver
     // slot so the rebuilt map's DIRECT adapter tracks later
     // `set_resolver` swaps (issue #514).
@@ -3701,6 +3784,7 @@ async fn put_configs(
     state
         .tunnel
         .set_connection_notes(raw_config.connection_notes.unwrap_or(false));
+    state.tunnel.set_tcp_idle_timeout(tcp_idle_timeout);
     if dropped > 0 {
         tracing::warn!(
             connections_dropped = dropped,
@@ -4299,11 +4383,11 @@ async fn refresh_provider(
     };
     match provider.refresh().await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => (
+        // Fetch/parser errors can include private URLs, headers or payloads.
+        Err(_) => msg_err(
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"message": e})),
-        )
-            .into_response(),
+            "Proxy provider refresh failed; the last valid proxies are unchanged",
+        ),
     }
 }
 
@@ -4473,22 +4557,27 @@ async fn get_rule_provider(
 async fn refresh_rule_provider(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
-) -> StatusCode {
+) -> Response {
     let provider = {
         let providers = state.rule_providers.read();
         providers.get(&name).cloned()
     };
     let Some(p) = provider else {
-        return StatusCode::NOT_FOUND;
+        return msg_err(StatusCode::NOT_FOUND, "resource not found");
     };
     // The provider re-parses in its own load-time ParserContext, so a
     // classical payload with GEOIP/GEOSITE entries survives the refresh
     // (issue #533 review).
     match p.refresh().await {
-        Ok(()) => StatusCode::NO_CONTENT,
-        Err(e) => {
-            tracing::warn!(provider = %name, "rule-provider refresh failed: {:#}", e);
-            StatusCode::SERVICE_UNAVAILABLE
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        // Keep the existing last-good owner; only the response changes. Do
+        // not echo the error chain, which may contain a private URL/payload.
+        Err(_) => {
+            tracing::warn!(provider = %name, "rule-provider refresh failed");
+            msg_err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Rule provider refresh failed; the last valid rules are unchanged",
+            )
         }
     }
 }

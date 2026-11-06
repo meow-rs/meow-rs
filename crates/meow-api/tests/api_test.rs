@@ -6561,6 +6561,273 @@ async fn put_configs_invalid_listeners_rejected_before_commit() {
     );
 }
 
+/// Same admission contract for `tcp-keepalive*`: values `build_config`
+/// would hard-error on at boot (0 / >127 probes / over-ceiling seconds)
+/// must be rejected before commit — the rebuild never sees general
+/// fields, so without the gate a PUT could persist a config the next
+/// `load_config` refuses.
+#[tokio::test]
+async fn put_configs_invalid_tcp_keepalive_rejected_before_commit() {
+    use base64::Engine as _;
+    let state = test_state(test_raw_config());
+
+    for (line, needle) in [
+        ("tcp-keepalive-probes: 0\n", "tcp-keepalive-probes"),
+        ("tcp-keepalive-probes: 128\n", "tcp-keepalive-probes"),
+        ("tcp-keepalive-idle: 0\n", "tcp-keepalive-idle"),
+        ("tcp-keepalive-interval: 0\n", "tcp-keepalive-interval"),
+    ] {
+        let yaml = format!("mode: rule\n{line}rules:\n  - MATCH,DIRECT\n");
+        let payload = base64::engine::general_purpose::STANDARD.encode(&yaml);
+        let resp = create_router(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/configs")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({"payload": payload}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "{line}must be rejected"
+        );
+        let body = body_json(resp).await;
+        assert!(
+            body["message"].as_str().is_some_and(|m| m.contains(needle)),
+            "{line}— the 400 must name the rejected key, got: {body}"
+        );
+    }
+    let raw = state.raw_config.read();
+    assert!(
+        raw.tcp_keepalive_idle.is_none()
+            && raw.tcp_keepalive_interval.is_none()
+            && raw.tcp_keepalive_probes.is_none(),
+        "no rejected keepalive key may have been committed"
+    );
+}
+
+/// Same admission contract for `tcp-idle-timeout`: a value over the
+/// `Instant + Duration` ceiling `build_config` enforces must be rejected
+/// before commit — the rebuild never sees general fields, so without the
+/// gate a PUT could persist a config the next `load_config` refuses.
+#[tokio::test]
+async fn put_configs_invalid_tcp_idle_timeout_rejected_before_commit() {
+    use base64::Engine as _;
+    let state = test_state(test_raw_config());
+
+    let yaml = "mode: rule\ntcp-idle-timeout: 315360001\nrules:\n  - MATCH,DIRECT\n";
+    let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("tcp-idle-timeout")),
+        "the 400 must name the rejected key, got: {body}"
+    );
+    assert!(
+        state.raw_config.read().tcp_idle_timeout.is_none(),
+        "the rejected value must not have been committed"
+    );
+}
+
+/// `tcp-idle-timeout` is the one `tcp-*` knob that IS hot-applied: a PUT
+/// commits the document AND replays the resolved bound into the running
+/// tunnel (`set_tcp_idle_timeout`), where `0` disables it.
+#[tokio::test]
+async fn put_configs_tcp_idle_timeout_hot_applies() {
+    use base64::Engine as _;
+    let state = test_state(test_raw_config());
+
+    for (line, expected) in [
+        (
+            "tcp-idle-timeout: 1800\n",
+            Some(std::time::Duration::from_secs(1800)),
+        ),
+        ("tcp-idle-timeout: 0\n", None),
+    ] {
+        let yaml = format!("mode: rule\n{line}rules:\n  - MATCH,DIRECT\n");
+        let payload = base64::engine::general_purpose::STANDARD.encode(&yaml);
+        let resp = create_router(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/configs")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({"payload": payload}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT, "{line}must commit");
+        assert_eq!(
+            state.tunnel.inner().tcp_idle_timeout(),
+            expected,
+            "{line}must replay into the running bound"
+        );
+    }
+}
+
+/// `?force` keeps the running bound on an invalid `tcp-idle-timeout` —
+/// and rewrites the committed field to that bound. The warm-path commits
+/// (`commit_raw_candidate`) re-resolve the field on every mutation, so
+/// persisting the invalid value would 400 every later unrelated PATCH.
+#[tokio::test]
+async fn put_configs_force_tcp_idle_timeout_normalizes_commit() {
+    use base64::Engine as _;
+    let state = test_state(test_raw_config());
+    state
+        .tunnel
+        .set_tcp_idle_timeout(Some(std::time::Duration::from_secs(1800)));
+
+    let yaml = "mode: rule\ntcp-idle-timeout: 315360001\nrules:\n  - MATCH,DIRECT\n";
+    let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs?force=true")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        state.raw_config.read().tcp_idle_timeout,
+        Some(1800),
+        "the committed field is normalized to the running bound, not the invalid value"
+    );
+    assert_eq!(
+        state.tunnel.inner().tcp_idle_timeout(),
+        Some(std::time::Duration::from_secs(1800)),
+        "the running bound is kept"
+    );
+
+    // The poison check: a warm-path mutation on the committed document
+    // must succeed — the normalized value re-resolves cleanly.
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/rules")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    r#"{"rules":["DOMAIN-SUFFIX,example.com,DIRECT","MATCH,REJECT"]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NO_CONTENT,
+        "a forced commit must not poison later warm-path mutations"
+    );
+
+    // Running bound disabled → committed `Some(0)`, which re-resolves to
+    // `None` — the same disabled bound an absent key resolves to, kept
+    // explicit so the committed doc says what it means.
+    state.tunnel.set_tcp_idle_timeout(None);
+    let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs?force=true")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        state.raw_config.read().tcp_idle_timeout,
+        Some(0),
+        "a disabled running bound normalizes to explicit 0, not absent"
+    );
+    assert_eq!(state.tunnel.inner().tcp_idle_timeout(), None);
+}
+
+/// The force early-return arm — the rebuild failing under BOTH strict
+/// and lenient modes — also commits `raw_config`; the normalize must
+/// have run before it or the verbatim invalid value lands in the
+/// committed document anyway (sniffer.timeout is rejected
+/// unconditionally, so it fails the lenient retry too).
+#[tokio::test]
+async fn put_configs_force_early_return_still_normalizes_tcp_idle_timeout() {
+    use base64::Engine as _;
+    let state = test_state(test_raw_config());
+    state
+        .tunnel
+        .set_tcp_idle_timeout(Some(std::time::Duration::from_secs(1800)));
+
+    let yaml = "mode: rule\ntcp-idle-timeout: 315360001\nsniffer:\n  timeout: 0\nrules:\n  - MATCH,DIRECT\n";
+    let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs?force=true")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    {
+        let committed = state.raw_config.read();
+        assert_eq!(
+            committed.tcp_idle_timeout,
+            Some(1800),
+            "the early-return arm commits the normalized field too"
+        );
+        // Proof the unbuildable document committed verbatim apart from
+        // the normalize — i.e. the early-return arm really ran (a normal
+        // commit would have rebuilt and this assertion is moot).
+        assert_eq!(
+            committed.sniffer.as_ref().unwrap().timeout,
+            Some(0),
+            "the unbuildable sniffer section still committed verbatim"
+        );
+    }
+    assert_eq!(
+        state.tunnel.inner().tcp_idle_timeout(),
+        Some(std::time::Duration::from_secs(1800)),
+        "the early-return arm never reapplies, so the running bound is kept"
+    );
+}
+
 /// `?force` degrades the `tun:` admission check to a warn: the unparsable
 /// section commits, the reconcile restart hits the spawn-side parse
 /// error, and `enable` rolls back — a 204 that still tears the healthy
@@ -7374,6 +7641,146 @@ async fn logbook_lists_filters_and_clears_entries() {
     assert_eq!(body_json(get("/logbook").await).await["enabled"], false);
 }
 
+/// `GET /traffic/ledger` and `DELETE /traffic/ledger`. The ledger is
+/// process-global and other tests in this binary may record into it while
+/// it is installed, so every read narrows to this test's host.
+#[tokio::test]
+async fn traffic_ledger_groups_drills_and_clears() {
+    use meow_common::traffic_ledger;
+
+    let state = test_state_default();
+    let app = create_router(Arc::clone(&state));
+    let get = |uri: &str| {
+        let app = app.clone();
+        let request = Request::get(uri).body(axum::body::Body::empty()).unwrap();
+        async move { app.oneshot(request).await.unwrap() }
+    };
+
+    let off = body_json(get("/traffic/ledger").await).await;
+    assert_eq!(off["enabled"], false);
+    assert_eq!(off["rows"], serde_json::json!([]));
+
+    let dir = tempfile::tempdir().unwrap();
+    traffic_ledger::install(dir.path(), traffic_ledger::Options::default()).unwrap();
+    let direct = traffic_ledger::Route::from("DIRECT");
+    // A node that reaches its server through a `dialer-proxy`.
+    let node = traffic_ledger::Route {
+        policy: Arc::from("Ledger API Node"),
+        via: Some(Arc::from("Ledger API Front")),
+    };
+    let browser = "org.example.browser".into();
+    traffic_ledger::add(
+        &"www.ledger-api.example".into(),
+        &browser,
+        &direct,
+        10,
+        100,
+        1,
+    );
+    traffic_ledger::add(
+        &"cdn.ledger-api.example".into(),
+        &"".into(),
+        &node,
+        20,
+        2000,
+        2,
+    );
+
+    let hosts = body_json(get("/traffic/ledger?host=ledger-api.example").await).await;
+    assert_eq!(hosts["enabled"], true);
+    assert_eq!(hosts["by"], "host");
+    let rows = hosts["rows"].as_array().unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "subdomains fold into the registrable domain: {hosts}"
+    );
+    assert_eq!(rows[0]["name"], "ledger-api.example");
+    assert_eq!(rows[0]["requests"], 3);
+
+    let policies = body_json(get("/traffic/ledger?by=policy&host=ledger-api.example").await).await;
+    let rows = policies["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 3, "{policies}");
+    // The front member counts the hop it carried, the node its flows.
+    assert_eq!(rows[0]["name"], "Ledger API Front", "largest first");
+    assert_eq!(rows[0]["download"], 2000);
+    assert_eq!(rows[0]["via_download"], 2000);
+    assert_eq!(rows[0]["via_requests"], 2);
+    assert_eq!(rows[1]["name"], "Ledger API Node");
+    assert_eq!(rows[1]["download"], 2000);
+    assert_eq!(rows[1]["via_download"], 0);
+    assert_eq!(rows[2]["name"], "DIRECT");
+    // Each flow once in the totals.
+    assert_eq!(policies["download"], 2100);
+    assert_eq!(policies["requests"], 3);
+
+    let carried =
+        body_json(get("/traffic/ledger?host=ledger-api.example&policy=Ledger%20API%20Front").await)
+            .await;
+    assert_eq!(carried["download"], 2000, "{carried}");
+
+    let drilled =
+        body_json(get("/traffic/ledger?by=interface&host=ledger-api.example&policy=DIRECT").await)
+            .await;
+    assert_eq!(drilled["upload"], 10);
+    assert_eq!(drilled["download"], 100);
+
+    let apps = body_json(get("/traffic/ledger?by=app&host=ledger-api.example").await).await;
+    assert_eq!(apps["by"], "app");
+    let rows = apps["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "{apps}");
+    assert_eq!(rows[0]["name"], "", "flows of no known app");
+    assert_eq!(rows[1]["name"], "org.example.browser");
+    let browser = body_json(get("/traffic/ledger?by=policy&app=org.example.browser").await).await;
+    let rows = browser["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{browser}");
+    assert_eq!(rows[0]["name"], "DIRECT");
+
+    let today = traffic_ledger::date_of_day(traffic_ledger::today());
+    let span = body_json(
+        get(&format!(
+            "/traffic/ledger?from={today}&to={today}&host=ledger-api.example"
+        ))
+        .await,
+    )
+    .await;
+    assert_eq!(span["from"], today.as_str());
+    assert_eq!(span["requests"], 3);
+
+    assert_eq!(
+        get("/traffic/ledger?from=yesterday").await.status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        get("/traffic/ledger?by=port").await.status(),
+        StatusCode::BAD_REQUEST
+    );
+    // Only `to`, before today: `from` (today) comes after it.
+    assert_eq!(
+        get("/traffic/ledger?to=2026-01-01").await.status(),
+        StatusCode::BAD_REQUEST
+    );
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::delete("/traffic/ledger")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let cleared = body_json(get("/traffic/ledger?host=ledger-api.example").await).await;
+    assert_eq!(cleared["rows"], serde_json::json!([]));
+
+    traffic_ledger::uninstall();
+    assert_eq!(
+        body_json(get("/traffic/ledger").await).await["enabled"],
+        false
+    );
+}
+
 // ── Proxy-provider subscriptionInfo ──────────────────────────────
 
 /// What [`UserinfoOrigin`] answers every request with.
@@ -7612,6 +8019,10 @@ async fn proxy_provider_subscription_info_survives_restart_and_follows_fetches()
     let failed = api_call(&state, "PUT", "/providers/proxies/usage").await;
     assert_eq!(failed.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
+        body_json(failed).await["message"],
+        "Proxy provider refresh failed; the last valid proxies are unchanged"
+    );
+    assert_eq!(
         listed_subscription_info(&state, "usage").await,
         Some(second.clone()),
         "a failed fetch keeps the last accepted usage"
@@ -7826,4 +8237,69 @@ async fn put_configs_strict_remote_payload_defect_commits_empty() {
     })
     .await
     .expect("the committed provider must retry the bad payload in background");
+}
+
+/// Missing/malformed provider content must not erase last-good rules, and
+/// the failure response must not disclose its private source or payload.
+#[tokio::test]
+async fn rule_provider_refresh_failure_is_readable_and_preserves_last_good() {
+    use meow_config::raw::RawRuleProvider;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("private-source-token.yaml");
+    let good = "payload:\n  - '+.example.com'\n";
+    std::fs::write(&path, good).unwrap();
+    let raw = HashMap::from([(
+        "fixture".into(),
+        RawRuleProvider {
+            provider_type: "file".into(),
+            behavior: "domain".into(),
+            format: Some("yaml".into()),
+            url: None,
+            path: Some(path.to_string_lossy().into_owned()),
+            interval: None,
+            proxy: None,
+            header: None,
+            payload: None,
+        },
+    )]);
+    let state = test_state_default();
+    *state.rule_providers.write() = meow_config::rule_provider::load_providers(
+        &raw,
+        Some(dir.path()),
+        &meow_rules::ParserContext::default(),
+        None,
+        true,
+    )
+    .unwrap();
+    let before = body_json(api_call(&state, "GET", "/providers/rules/fixture").await).await;
+    for malformed in [false, true] {
+        if malformed {
+            std::fs::write(&path, "payload: [private-payload-secret").unwrap();
+        } else {
+            std::fs::remove_file(&path).unwrap();
+        }
+        let failed = api_call(&state, "PUT", "/providers/rules/fixture").await;
+        assert_eq!(failed.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let message = body_json(failed).await;
+        assert_eq!(
+            message["message"],
+            "Rule provider refresh failed; the last valid rules are unchanged"
+        );
+        assert!(!message.to_string().contains("private-"));
+        let after = body_json(api_call(&state, "GET", "/providers/rules/fixture").await).await;
+        assert_eq!(
+            before, after,
+            "failed refresh must retain last-good metadata"
+        );
+    }
+    std::fs::write(
+        &path,
+        "payload:\n  - '+.example.com'\n  - '+.second.test'\n",
+    )
+    .unwrap();
+    let recovered = api_call(&state, "PUT", "/providers/rules/fixture").await;
+    assert_eq!(recovered.status(), StatusCode::NO_CONTENT);
+    assert_eq!(state.rule_providers.read()["fixture"].rule_count(), 2);
+    let missing = api_call(&state, "PUT", "/providers/rules/missing").await;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
 }

@@ -79,7 +79,8 @@ cause problems; items marked ~ work with caveats; items marked ✓ work.
 | `dns:` — udp, tcp nameservers | ✓ | Fully supported. |
 | `dns:` — DoH (`https://`) | ✓ | See §DNS. |
 | `dns:` — DoT (`tls://`) | ✓ | See §DNS. |
-| `dns:` — DoQ (`quic://`) | ✗ | Deferred to M1.E-6/M2. Hard error (not silent). |
+| `dns:` — DoQ (`quic://`) | ✓ | RFC 9250 on quiche, behind the `dns-quic` feature (in `full`). Without the feature it is a hard error naming it. |
+| `dns:` — `prefer-h3` / `?h3=` | ✓ | Global flag = h3 with HTTP/1.1 fallback; `?h3=true` = HTTP/3 only (mihomo's meaning); `?h3=prefer` / `?h3=false` are meow-rs's per-entry opt-in/opt-out. |
 | `dns:` — `default-nameserver` | ✓ | Bootstrap resolver for encrypted upstream hostnames. |
 | `dns:` — `nameserver-policy` | ✓ | Exact, `+.`/`*.`/`.` wildcard, `geosite:`/`rule-set:` policy keys. Key order is the lookup priority (document order = first match wins); a matcher key shadows domain keys written after it, and same-slot collisions resolve to the document-last key. |
 | `dns:` — `fallback-filter` | ✓ | GeoIP/IP-CIDR/domain gates. |
@@ -105,7 +106,9 @@ These fields parse without error but behave differently from Go mihomo:
 | `authentication: ["user:"]` (empty password) | Accepted silently | Accepted; warn-once | B |
 | `skip-auth-prefixes` | Defaults to `[]` | Always includes `127.0.0.1/32` + `::1/128` | A |
 | `skip-auth-prefixes` with invalid CIDR | Silently dropped | Hard parse error | A |
-| `dns.nameserver: quic://...` | Supported | Hard error with roadmap pointer | A |
+| `dns.nameserver: quic://...` | Supported | Supported (same scheme, same 853 default) when built with `dns-quic`; otherwise a hard error naming the feature | — |
+| `dns.nameserver: https://…#h3=true` (params in the fragment) | Supported | Hard error with the fix spelled out — `#` is SNI in meow-rs, so parameters belong in `?h3=true` | A |
+| `dns.prefer-h3` on a build without `dns-quic` | n/a | Hard load error, never a silent downgrade to HTTP/1.1 | A |
 | `dns.nameserver: sdns://...` | Warn-drop (silent) | Hard error | A |
 | `dns.nameserver: tls://…#NAME` / `https://…#NAME` | `#` is SNI | Same — `#` is SNI. When `NAME` matches a configured proxy, a warning points out the routing intent was probably `?proxy=NAME` (lowercase `proxy` only), the spelling that tunnels the exchange through that adapter (`tls://8.8.8.8#dns.google?proxy=JP` for SNI + proxy together). | — |
 | `dns.nameserver: udp/tcp entry with ?…` | Accepted — `url.Parse` keeps the query and it is silently ignored (semantic drift, not a rejection) | Hard error (`InvalidParams`) — `?` sections exist only on `tls://`/`https://`; plain entries keep `#PROXY`. | A |
@@ -123,6 +126,7 @@ These fields parse without error but behave differently from Go mihomo:
 | `geodata-mode`, `geodata-loader`, `geoip-matcher` | Valid fields | Ignored with warn-once (M2+) | B |
 | `dns.listen` / `external-controller` bind failure at startup | Logs error, daemon keeps running | Hard startup error (process exits non-zero) — no prior listener exists to fall back to (the `dns.listen` half keeps its tolerant keep-old semantics on runtime `PUT /configs` rebind; `external-controller` has no runtime rebind) | A |
 | `dns.listen` set while `dns.enable: false` | Silently ignored | Warn-once that no listener is started | B |
+| `keep-alive-idle` / `keep-alive-interval` / `disable-keep-alive` | Tune keepalive on inbound listeners AND outbound dials | Parsed and ignored with a warn pointing to `tcp-keepalive*` — which covers the inbound half only; the outbound-dialer keepalive tuning is not honored | B |
 
 ### Fields that are silently ignored in Go mihomo but error in meow-rs
 
@@ -626,6 +630,8 @@ tools built for Go mihomo will ignore them.
 | Extended proxy group API | `GET\|POST\|PUT\|DELETE /api/proxy-groups[/:name]` | meow-rs-specific |
 | Rule CRUD API | `POST\|PUT\|DELETE /rules[/:index]` | Runtime rule editing |
 | Logbook | `GET\|DELETE /logbook`, `logbook: {enable: true}` | Persistent record of notable engine events, kept 7 days in `<home>/logbook/logbook.db`; not in `minimal` builds ([ADR-0014](adr/0014-logbook.md)) |
+| Traffic ledger | `GET\|DELETE /traffic/ledger`, `traffic-ledger: {enable: true, hosts: true, apps: true}` | Per-day traffic by host, app, policy and interface, kept 62 days in `<home>/traffic/traffic.db`; not in `minimal` builds ([ADR-0015](adr/0015-traffic-ledger.md)) |
+| Inbound socket keepalive + relay idle bound | `tcp-keepalive`, `tcp-keepalive-idle`/`interval`/`probes`, `tcp-idle-timeout` | `SO_KEEPALIVE` + timing on every accepted inbound socket, and an opt-in whole-connection idle bound that reaps relays silent in both directions for `tcp-idle-timeout` seconds (off when absent or `0` — kernel keepalive probes are not relay bytes, so a live-but-silent flow like IMAP `IDLE` is still reaped once opted in); keepalive is a listener-startup snapshot, the idle bound is applied by `PUT /configs` to relays started after the commit |
 
 Keep these under the `/api/` prefix so they do not collide with
 Clash-compatible paths.
@@ -644,6 +650,7 @@ meow-rs uses Cargo feature flags where Go mihomo uses build tags:
 | Minimal app bundle | `meow-app/minimal` | off |
 | AnyTLS outbound | `meow-app/anytls` (in `full`, not in `minimal`) | on |
 | Logbook (bundles SQLite) | `meow-app/logbook` (in `full`, not in `minimal`) | on |
+| Traffic ledger (SQLite + public-suffix list) | `meow-app/traffic-ledger` (in `full`, not in `minimal`) | on |
 | Shadowsocks inbound (`listeners:` `type: shadowsocks`) | `meow-app/listener-shadowsocks` (in `full`, not in `minimal`) | on |
 
 To build without encrypted DNS (smaller binary):

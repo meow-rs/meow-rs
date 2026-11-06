@@ -13,7 +13,7 @@ use meow_proxy::DirectAdapter;
 use parking_lot::{Mutex, RwLock};
 use smol_str::SmolStr;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use tracing::{debug, info, warn};
 
@@ -157,6 +157,11 @@ pub struct TunnelInner {
     udp_flush: tokio::sync::watch::Sender<u64>,
     /// Record per-connection notes — see [`Tunnel::set_connection_notes`].
     connection_notes: AtomicBool,
+    /// Whole-connection relay idle timeout in seconds — see
+    /// [`Tunnel::set_tcp_idle_timeout`]. `0` disables the bound. Read once
+    /// per relay setup; relays already in flight keep the bound they
+    /// started with (same per-connection semantics as every per-conn knob).
+    tcp_idle_timeout: AtomicU64,
 }
 
 /// A running TUN listener: the task plus the signal resolving once its
@@ -233,6 +238,16 @@ impl TunnelInner {
     /// [`udp::UdpFlushWatch`].
     pub fn udp_flush_watch(&self) -> udp::UdpFlushWatch {
         udp::UdpFlushWatch::new(self.udp_flush.subscribe())
+    }
+
+    /// The whole-connection relay idle bound [`Tunnel::set_tcp_idle_timeout`]
+    /// installed, resolved for one relay's use: `None` when the bound is
+    /// disabled (`tcp-idle-timeout: 0` or never set programmatically).
+    pub fn tcp_idle_timeout(&self) -> Option<std::time::Duration> {
+        match self.tcp_idle_timeout.load(Ordering::Relaxed) {
+            0 => None,
+            secs => Some(std::time::Duration::from_secs(secs)),
+        }
     }
 
     /// The note log a new connection should record into: the inbound's own
@@ -817,6 +832,46 @@ impl std::fmt::Display for MatchedRule<'_> {
     }
 }
 
+/// The `using` part of the per-connection `match` log line: the decision's
+/// adapter, followed by the member the flow dials through in brackets when
+/// that adapter is a group, e.g. `Proxy[HK-01]`. Like upstream's
+/// `Chain.String()`, nested groups print only the outer group and the
+/// final member.
+///
+/// meow logs this line before the dial (upstream logs it after), so the
+/// member is the one the dial will take, peeked with
+/// `unwrap_proxy(metadata, false)` the way the `/connections` `chains`
+/// entry is. The peek runs only when the line is formatted, so it costs
+/// nothing while INFO is off. A round-robin load-balance pick is a
+/// prediction: another flow's dial may commit in between.
+///
+/// A relay group prints as itself, since it resolves its hops per dial and
+/// offers nothing to peek (see `RelayGroup`'s `Proxy` impl). An outbound's
+/// `dialer-proxy` front is not part of the line either: the brackets name
+/// the outbound that reaches the destination, not the hop it dials its
+/// server through.
+pub struct UsingProxy<'a> {
+    adapter: &'a dyn ProxyAdapter,
+    metadata: &'a Metadata,
+}
+
+impl<'a> UsingProxy<'a> {
+    /// `adapter` is the one the decision picked; `metadata` is the flow's.
+    pub fn new(adapter: &'a dyn ProxyAdapter, metadata: &'a Metadata) -> Self {
+        Self { adapter, metadata }
+    }
+}
+
+impl std::fmt::Display for UsingProxy<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.adapter.name())?;
+        if let Some(leaf) = crate::tcp::leaf_proxy(self.adapter, self.metadata) {
+            write!(f, "[{}]", leaf.name())?;
+        }
+        Ok(())
+    }
+}
+
 /// The outcome of [`TunnelInner::resolve_proxy`] /
 /// [`TunnelInner::resolve_proxy_lazy`]:
 /// the adapter to dial, the rule that produced it, and the route-table
@@ -958,6 +1013,9 @@ impl Tunnel {
     /// `inner.direct` observe `set_resolver` swaps identically.
     pub fn new_with_slot(resolver: meow_dns::ResolverSlot) -> Self {
         let direct = Arc::new(DirectAdapter::new().with_resolver_slot(Arc::clone(&resolver)));
+        let stats = Arc::new(Statistics::new());
+        let source: Arc<dyn meow_common::traffic_ledger::Source> = Arc::clone(&stats) as _;
+        meow_common::traffic_ledger::register(Arc::downgrade(&source));
         Self {
             inner: Arc::new(TunnelInner {
                 mode: RwLock::new(TunnelMode::Rule),
@@ -966,7 +1024,7 @@ impl Tunnel {
                 direct,
                 reject: Arc::new(meow_proxy::RejectAdapter::new(false)),
                 nat_table: udp::new_nat_table(),
-                stats: Arc::new(Statistics::new()),
+                stats,
                 tcp_generation: RwLock::new(0),
                 health_checks: Mutex::new(crate::health_check::HealthCheckSupervisor::default()),
                 needs_ip_resolution: AtomicBool::new(false),
@@ -975,6 +1033,7 @@ impl Tunnel {
                 dialer_registry: std::sync::OnceLock::new(),
                 udp_flush: tokio::sync::watch::Sender::new(0),
                 connection_notes: AtomicBool::new(false),
+                tcp_idle_timeout: AtomicU64::new(0),
             }),
         }
     }
@@ -989,6 +1048,40 @@ impl Tunnel {
         self.inner
             .connection_notes
             .store(enabled, Ordering::Relaxed);
+    }
+
+    /// Bound how long an established TCP relay may stay silent in BOTH
+    /// directions before it is torn down with a `TimedOut` error — the
+    /// zombie-connection bound for the case where the peer neither sends
+    /// nor closes (dead LAN device, stalled netstack flow, dead upstream).
+    /// `None` or a zero duration disables the bound (pre-change relay
+    /// behaviour). Applied to relays that start after the call, like every
+    /// per-connection knob.
+    ///
+    /// The bound is stored in whole seconds via `Duration::as_secs`, so a
+    /// non-zero sub-second `Some(d)` truncates to `0` and *disables* the
+    /// bound — programmatic callers must round up themselves if that is
+    /// not the intent (config resolution only ever yields whole seconds).
+    /// Any fractional part beyond whole seconds is dropped silently.
+    ///
+    /// # Panics (debug builds only)
+    /// Asserts that a `Some` duration is either exactly zero (the
+    /// documented disable) or carries at least one whole second (and no
+    /// more than `MAX_DURATION_SECS`, past which the relay's
+    /// `Instant + Duration` arithmetic could overflow), so both footguns
+    /// surface immediately in tests rather than silently at runtime.
+    pub fn set_tcp_idle_timeout(&self, d: Option<std::time::Duration>) {
+        debug_assert!(
+            d.is_none_or(|d| d.is_zero()
+                || (d.as_secs() > 0 && d.as_secs() <= meow_common::MAX_DURATION_SECS)),
+            "set_tcp_idle_timeout: Some(d) with 0 < d < 1 s truncates to 0 and \
+             disables the bound (round up to Duration::from_secs(1) minimum), \
+             and a Some(d) above MAX_DURATION_SECS can overflow Instant + \
+             Duration in the relay's idle timer"
+        );
+        self.inner
+            .tcp_idle_timeout
+            .store(d.map_or(0, |d| d.as_secs()), Ordering::Relaxed);
     }
 
     pub fn inner(&self) -> &Arc<TunnelInner> {

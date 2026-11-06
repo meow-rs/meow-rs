@@ -2,6 +2,7 @@ use crate::adapter_type::AdapterType;
 use crate::conn::{ProxyConn, ProxyPacketConn};
 use crate::error::Result;
 use crate::metadata::Metadata;
+use crate::network::Network;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -169,6 +170,25 @@ pub trait ProxyAdapter: Send + Sync {
     /// next dial.
     fn unwrap_proxy(&self, _metadata: &Metadata, _touch: bool) -> Option<Arc<dyn Proxy>> {
         None
+    }
+    /// For an outbound that reaches its server through a `dialer-proxy`,
+    /// the member that carries that hop on the next dial for `metadata`:
+    /// the front's pick, peeked as [`Self::unwrap_proxy`] peeks, or the
+    /// front when it is no group. `None` for an outbound that dials its
+    /// server itself, and for a group: its leaf answers. Transparent
+    /// wrappers (the config layer's `WrappedProxy`) must forward it.
+    fn dialer_hop(&self, _metadata: &Metadata) -> Option<Arc<dyn Proxy>> {
+        None
+    }
+    /// The network an injected dialer's hop to the server takes for a
+    /// flow over `flow`, which a group front may pick for differently (a
+    /// load-balance front picks a UDP hop among its UDP-capable members).
+    /// TCP, the default, for an outbound that carries every flow over its
+    /// own connection to the server (UDP over TCP, a mux session); UDP for
+    /// one whose datagrams, or whose whole transport (kcptun), go to the
+    /// server as datagrams.
+    fn dialer_hop_network(&self, _flow: Network) -> Network {
+        Network::Tcp
     }
     /// Drop every transport session this adapter caches across dials (mux
     /// session pools, a hysteria2 QUIC connection, pooled Snell/anytls

@@ -99,6 +99,16 @@ The following routes are retained and do not collide with the mihomo surface:
   with `before=<id>`, polls with `since=<rev>`. `logbook: {enable: false}`
   turns it off; a `minimal` build reports `enabled: false`. See
   [ADR-0014](adr/0014-logbook.md) for the event kinds
+- `GET /traffic/ledger` and `DELETE /traffic/ledger`: the traffic of
+  local days by host (registrable domain), app, leaf policy or interface
+  label, kept for 62 days across restarts. `from` and `to` (`YYYY-MM-DD`,
+  today by default), `by` (`host`, `app`, `policy`, `interface`), and
+  `host`, `app`, `policy`, `interface` to drill into one group. A
+  policy row counts what the node carried as a `dialer-proxy` front too
+  (`via_upload`, `via_download`, `via_requests`), so `policy=` takes in
+  those flows as well. `traffic-ledger: {enable: false}` turns it off;
+  a `minimal` build reports `enabled: false`. See
+  [ADR-0015](adr/0015-traffic-ledger.md)
 
 When the mihomo baseline changes, compare `hub/route` and the outbound-group
 JSON marshalers against this table before marking a new release compatible.

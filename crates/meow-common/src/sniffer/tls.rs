@@ -18,7 +18,7 @@ pub fn sniff_tls(buf: &[u8]) -> Option<SmolStr> {
     let record = buf.get(5..5 + record_len)?;
 
     // Handshake header: type(1) + length(3)
-    if record.is_empty() || record[0] != 0x01 {
+    if record.len() < 4 || record[0] != 0x01 {
         return None;
     }
     let handshake_len =
@@ -304,5 +304,17 @@ mod tests {
         record.extend_from_slice(&handshake);
 
         assert_eq!(sniff_tls(&record).as_deref(), Some("target.example.com"));
+    }
+}
+
+#[cfg(test)]
+mod truncated_handshake_regression {
+    #[test]
+    fn incomplete_handshake_header_never_panics() {
+        for length in 0..4 {
+            let mut packet = vec![0x16, 3, 3, 0, length];
+            packet.extend(std::iter::repeat_n(1, length as usize));
+            assert!(super::sniff_tls(&packet).is_none());
+        }
     }
 }

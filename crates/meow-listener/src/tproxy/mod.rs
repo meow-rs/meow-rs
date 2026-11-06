@@ -4,10 +4,10 @@ mod udp;
 
 use crate::sniffer::SnifferRuntime;
 use firewall::FirewallGuard;
-use meow_common::{with_dial_timeout, ConnType, Metadata, Network};
+use meow_common::{with_dial_timeout, ConnType, Metadata, Network, TcpKeepaliveConfig};
 use meow_tunnel::{
-    copy_bidirectional_buf_tracked_splice, proxy_conn_tcp_view, tcp_view, MatchedRule,
-    ResolvedTarget, Tunnel, RELAY_BUF_SIZE,
+    copy_bidirectional_buf_tracked_splice_idle, proxy_conn_tcp_view, tcp_view, MatchedRule,
+    ResolvedTarget, Tunnel, UsingProxy, RELAY_BUF_SIZE,
 };
 use std::collections::HashSet;
 use std::future::Future;
@@ -42,6 +42,9 @@ pub struct TProxyListener {
     udp: bool,
     /// Per-flow UDP idle timeout (both directions refresh it).
     udp_timeout: std::time::Duration,
+    /// Keepalive posture applied to every accepted socket (see
+    /// [`crate::keepalive`]); `enabled: false` writes no sockopts.
+    tcp_keepalive: TcpKeepaliveConfig,
     /// Fallible setup performed by [`Self::prepare`] — carried so `run_on`
     /// spawns nothing that can fail inside a detached task (issue #641).
     prepared: Option<Prepared>,
@@ -97,6 +100,7 @@ impl TProxyListener {
             firewall: true,
             udp: false,
             udp_timeout: std::time::Duration::from_secs(60),
+            tcp_keepalive: TcpKeepaliveConfig::default(),
             prepared: None,
         }
     }
@@ -136,6 +140,14 @@ impl TProxyListener {
         self.udp = enabled;
         self.udp_timeout = udp_timeout;
         self.prepared = None;
+        self
+    }
+
+    /// Override the TCP keepalive posture applied to every accepted socket
+    /// (default [`TcpKeepaliveConfig::default`]). `enabled: false` performs
+    /// no keepalive `setsockopt` at all.
+    pub fn with_tcp_keepalive(mut self, cfg: TcpKeepaliveConfig) -> Self {
+        self.tcp_keepalive = cfg;
         self
     }
 
@@ -351,11 +363,18 @@ impl TProxyListener {
         let sniffer = self.sniffer;
         let name = self.name;
         let max_connections = self.max_connections;
+        let tcp_keepalive = self.tcp_keepalive;
         bounded_accept_loop(listener, max_connections, name.clone(), {
             move |stream, src_addr| {
                 let tunnel = tunnel.clone();
                 let sniffer = sniffer.clone();
                 let name = name.clone();
+                // First thing on the accepted socket — before orig-dest
+                // recovery, sniffer peek, or relay, and in the accept loop
+                // itself rather than the spawned task (matching mixed and
+                // shadowsocks) — so a dead peer is reaped even if the conn
+                // stalls before its task is ever polled.
+                crate::keepalive::apply(&stream, tcp_keepalive, &name);
                 async move {
                     if let Err(e) =
                         handle_tproxy_conn(tunnel, stream, src_addr, bound_addr, sniffer, name)
@@ -617,7 +636,7 @@ async fn handle_tproxy_flow(
         metadata.source_address(),
         metadata.remote_address(),
         MatchedRule::new(&rule_name, &rule_payload, proxy.name()),
-        proxy.name()
+        UsingProxy::new(proxy.as_ref(), &metadata)
     );
 
     let Some(_guard) = admission.track_named(&metadata, rule_name, rule_payload, proxy.as_ref())
@@ -637,7 +656,7 @@ async fn handle_tproxy_flow(
                 Ok(mut remote) => {
                     let up = Arc::clone(_guard.counters());
                     let dn = Arc::clone(_guard.counters());
-                    match copy_bidirectional_buf_tracked_splice(
+                    match copy_bidirectional_buf_tracked_splice_idle(
                         &mut stream,
                         &mut *remote,
                         &mut relay_buf_up,
@@ -653,6 +672,7 @@ async fn handle_tproxy_flow(
                                 .stats
                                 .record_download(&dn, n as meow_common::atomic::Int);
                         },
+                        inner.tcp_idle_timeout(),
                     )
                     .await
                     {

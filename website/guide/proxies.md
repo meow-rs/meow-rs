@@ -389,6 +389,14 @@ Obfuscated-TLS outbound (requires the `anytls` feature).
 | `alpn` | list | | — | ALPN protocols, offered in order |
 | `udp` | bool | | `false` | Enable UDP relay (sing-box udp-over-tcp v2) |
 
+Unsupported mihomo options: an enabled `ech-opts` and `certificate` /
+`private-key` (client certificate) are refused at config load, since
+ignoring them would send the SNI in the clear or skip client auth
+(`ech-opts: {enable: false}` is accepted). `shadow-tls-opts`, `restls-opts`,
+`jls-opts`, `client-metadata`, `idle-session-check-interval`,
+`idle-session-timeout`, `min-idle-session` and `disable-reuse` are ignored
+with a load-time warning naming them.
+
 ---
 
 ## HTTP — `http`

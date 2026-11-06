@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use meow_common::{metadata_ip_literal, ConnType, Metadata, Network};
-use meow_tunnel::{MatchedRule, ResolvedTarget, Tunnel, TunnelInner};
+use meow_tunnel::{MatchedRule, ResolvedTarget, Tunnel, TunnelInner, UsingProxy};
 use smallvec::SmallVec;
 use smol_str::SmolStr;
 use tokio::io::AsyncReadExt;
@@ -513,7 +513,7 @@ async fn run_session(
             client,
             metadata.remote_address(),
             MatchedRule::new(&rule_name, &rule_payload, proxy.name()),
-            proxy.name()
+            UsingProxy::new(proxy.as_ref(), &metadata)
         );
 
         let conn: Arc<dyn meow_common::ProxyPacketConn> = Arc::from(
@@ -568,39 +568,74 @@ async fn run_session(
     });
     let _reply_guard = AbortOnDrop(reply_task.abort_handle());
 
-    // Writer loop: drain the queue in FIFO order until the session is
-    // evicted (all senders gone), the upstream write fails, or the reply
-    // reader dies (one-way conn — re-dial on next datagram, issue #514).
-    loop {
-        tokio::select! {
-            queued = rx.recv() => match queued {
-                Some(payload) => {
-                    if let Err(e) = conn.write_packet(&payload, &dst_addr).await {
-                        debug!("SOCKS5 UDP session to {dst_addr}: upstream write: {e}");
-                        return;
-                    }
-                    last_activity_ms.store(
-                        monotonic_ms() as meow_common::atomic::Uint,
-                        Ordering::Relaxed,
+    // The writer owns the send side. Selecting on the whole future (rather
+    // than awaiting write_packet inside the select! arms) ensures that a
+    // pending write is cancelled — and the poisoned conn is closed — when
+    // either external condition fires first. Any payloads still queued in
+    // `rx` are discarded along with the session; UDP callers retry on the
+    // next datagram. The reader owns its read future across writes,
+    // including reads of partially consumed stream frames.
+    let writer = async {
+        loop {
+            match rx.recv().await {
+                None => {
+                    // All senders dropped — session evicted from the NAT
+                    // table. Normal exit; no re-dial needed.
+                    debug!(
+                        "SOCKS5 UDP session to {dst_addr}: sender queue closed; session evicted"
                     );
+                    break;
                 }
-                None => return, // all senders dropped — session evicted
-            },
-            done = &mut reply_task => {
-                let reason = match done {
-                    Ok(()) => "reply reader exited".to_string(),
-                    Err(e) => format!("reply reader task: {e}"),
-                };
-                debug!("SOCKS5 UDP session to {dst_addr}: {reason}; next datagram re-dials");
-                return;
-            }
-            () = flush.flushed() => {
-                debug!("SOCKS5 UDP session to {dst_addr}: outbound sessions flushed; next datagram re-dials");
-                let _ = conn.close();
-                return;
+                Some(payload) => match conn.write_packet(&payload, &dst_addr).await {
+                    Ok(n) if n == payload.len() => {
+                        last_activity_ms.store(
+                            monotonic_ms() as meow_common::atomic::Uint,
+                            Ordering::Relaxed,
+                        );
+                    }
+                    Ok(n) => {
+                        // Short writes are not expected from any current
+                        // ProxyPacketConn implementation (datagram
+                        // semantics: the frame is either accepted whole or
+                        // rejected), but the trait contract allows it.
+                        // Retire the session; the next datagram re-dials.
+                        debug!(
+                            "SOCKS5 UDP session to {dst_addr}: short upstream write {n}/{}; next datagram re-dials",
+                            payload.len()
+                        );
+                        break;
+                    }
+                    Err(e) => {
+                        debug!("SOCKS5 UDP session to {dst_addr}: upstream write: {e}; next datagram re-dials");
+                        break;
+                    }
+                },
             }
         }
+    };
+    // No `biased;`: flush and reply_task failures are equally urgent and
+    // neither should starve the other. The writer arm completes naturally
+    // once the queue drains or a write error/short-write retires it.
+    tokio::select! {
+        () = flush.flushed() => {
+            debug!("SOCKS5 UDP session to {dst_addr}: outbound sessions flushed; next datagram re-dials");
+        }
+        done = &mut reply_task => {
+            let reason = match done {
+                Ok(()) => "reply reader exited".to_string(),
+                Err(e) => format!("reply reader task: {e}"),
+            };
+            debug!("SOCKS5 UDP session to {dst_addr}: {reason}; next datagram re-dials");
+        }
+        () = writer => {}
     }
+    // Close the conn regardless of which arm fired. If the writer arm was
+    // cancelled mid-write, stream-framed conns (snell, vless, trojan, …)
+    // have already set their `poisoned` flag via `PoisonOnIncomplete`, so
+    // subsequent reads from the reply task fail fast; `close` then tears
+    // down the socket. `_reply_guard` (AbortOnDrop) aborts the reply task
+    // after this point.
+    let _ = conn.close();
 }
 
 /// Write the `CMD UDP ASSOCIATE` success reply carrying the relay endpoint.
@@ -708,18 +743,43 @@ mod tests {
 
     struct DeadReadConn;
 
-    /// Reply reader that parks forever — keeps the session alive so tests
-    /// can assert identity (`Arc::ptr_eq` on `dead`) instead of tolerating
-    /// the re-dial a dead conn legitimately triggers.
-    struct ParkedReadConn;
+    /// Control the two halves of a mock packet connection independently.
+    #[derive(Default)]
+    struct PacketGates {
+        reading: tokio::sync::Notify,
+        complete_reply: tokio::sync::Notify,
+        reads: std::sync::atomic::AtomicUsize,
+        writing: tokio::sync::Notify,
+        complete_write: tokio::sync::Notify,
+        reader_exit: tokio::sync::Notify,
+        short_write: tokio::sync::Notify,
+        writes: std::sync::atomic::AtomicUsize,
+    }
+
+    struct ParkedReadConn(Arc<PacketGates>);
 
     #[async_trait::async_trait]
     impl meow_common::ProxyPacketConn for ParkedReadConn {
-        async fn read_packet(&self, _buf: &mut [u8]) -> meow_common::Result<(usize, SocketAddr)> {
-            std::future::pending().await
+        async fn read_packet(&self, buf: &mut [u8]) -> meow_common::Result<(usize, SocketAddr)> {
+            // Stand in for a stream-framed reader that has consumed one byte.
+            self.0.reads.fetch_add(1, Ordering::Relaxed);
+            buf[0] = b'a';
+            self.0.reading.notify_one();
+            tokio::select! {
+                () = self.0.reader_exit.notified() => Err(meow_common::MeowError::Proxy("reader stopped".into())),
+                () = self.0.complete_reply.notified() => {
+                    buf[1] = b'b';
+                    Ok((2, "127.0.0.1:81".parse().unwrap()))
+                }
+            }
         }
         async fn write_packet(&self, buf: &[u8], _addr: &SocketAddr) -> meow_common::Result<usize> {
-            Ok(buf.len())
+            self.0.writes.fetch_add(1, Ordering::Relaxed);
+            self.0.writing.notify_one();
+            tokio::select! {
+                () = self.0.short_write.notified() => Ok(1),
+                () = self.0.complete_write.notified() => Ok(buf.len()),
+            }
         }
         fn local_addr(&self) -> meow_common::Result<SocketAddr> {
             Ok("127.0.0.1:0".parse().unwrap())
@@ -731,6 +791,7 @@ mod tests {
 
     /// Proxy whose sessions stay alive — dial once, park the read.
     struct ParkedUdpProxy {
+        gates: Arc<PacketGates>,
         dials: std::sync::atomic::AtomicUsize,
         health: meow_common::ProxyHealth,
     }
@@ -760,7 +821,7 @@ mod tests {
             _metadata: &Metadata,
         ) -> meow_common::Result<Box<dyn meow_common::ProxyPacketConn>> {
             self.dials.fetch_add(1, Ordering::Relaxed);
-            Ok(Box::new(ParkedReadConn))
+            Ok(Box::new(ParkedReadConn(Arc::clone(&self.gates))))
         }
         fn health(&self) -> &meow_common::ProxyHealth {
             &self.health
@@ -1209,6 +1270,7 @@ mod tests {
         // Parked conn keeps the session alive — a FlakyUdpProxy-style conn
         // that dies instantly would let a respawn masquerade as a rejoin.
         let proxy = Arc::new(ParkedUdpProxy {
+            gates: Arc::default(),
             dials: std::sync::atomic::AtomicUsize::new(0),
             health: meow_common::ProxyHealth::new(),
         });
@@ -1749,8 +1811,29 @@ mod tests {
     /// next datagram to the same destination redials.
     #[tokio::test]
     async fn outbound_flush_ends_the_session_and_the_next_datagram_redials() {
+        pending_write_ends_and_redials(Stop::Flush).await;
+    }
+
+    #[tokio::test]
+    async fn reply_reader_exit_during_pending_write_redials() {
+        pending_write_ends_and_redials(Stop::ReaderExit).await;
+    }
+
+    #[tokio::test]
+    async fn short_udp_write_ends_session_without_retry() {
+        pending_write_ends_and_redials(Stop::ShortWrite).await;
+    }
+
+    enum Stop {
+        Flush,
+        ReaderExit,
+        ShortWrite,
+    }
+
+    async fn pending_write_ends_and_redials(stop: Stop) {
         tokio::time::timeout(Duration::from_secs(5), async {
             let proxy = Arc::new(ParkedUdpProxy {
+                gates: Arc::default(),
                 dials: std::sync::atomic::AtomicUsize::new(0),
                 health: meow_common::ProxyHealth::new(),
             });
@@ -1777,7 +1860,8 @@ mod tests {
             let relay = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
             let inner = Arc::clone(tunnel.inner());
             let mut nat: HashMap<SessionKey, Session> = HashMap::new();
-            let client: SocketAddr = "127.0.0.1:40001".parse().unwrap();
+            let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let client = client_socket.local_addr().unwrap();
             let inbound = Metadata::default();
             let dst: SocketAddr = "203.0.113.10:5353".parse().unwrap();
             let key = SessionKey::Addr(dst);
@@ -1796,11 +1880,31 @@ mod tests {
             let dead = Arc::clone(&nat[&key].dead);
             assert!(!dead.load(Ordering::Relaxed), "a parked session stays up");
 
-            assert_eq!(tunnel.close_all_udp_sessions(), 1, "the session's flow");
+            proxy.gates.reading.notified().await;
+            proxy.gates.writing.notified().await;
+            proxy.gates.complete_write.notify_one();
+            handle_client_datagram(&inner, &relay, &mut nat, &packet, client, &inbound).unwrap();
+            proxy.gates.writing.notified().await;
+            assert_eq!(
+                proxy.gates.reads.load(Ordering::Relaxed),
+                1,
+                "a write must not restart the partial read"
+            );
+            proxy.gates.complete_reply.notify_one();
+            let mut reply = [0; 32];
+            let n = client_socket.recv(&mut reply).await.unwrap();
+            assert_eq!(&reply[10..n], b"ab");
+            proxy.gates.reading.notified().await;
+            match stop {
+                Stop::Flush => assert_eq!(tunnel.close_all_udp_sessions(), 1, "the session's flow"),
+                Stop::ReaderExit => proxy.gates.reader_exit.notify_one(),
+                Stop::ShortWrite => proxy.gates.short_write.notify_one(),
+            }
             assert!(
                 eventually(Duration::from_secs(2), || dead.load(Ordering::Relaxed)).await,
-                "the flush must end the session"
+                "the pending write must not keep the session alive"
             );
+            assert_eq!(proxy.gates.writes.load(Ordering::Relaxed), 2);
 
             handle_client_datagram(&inner, &relay, &mut nat, &packet, client, &inbound).unwrap();
             assert!(
@@ -1813,6 +1917,6 @@ mod tests {
             assert!(!Arc::ptr_eq(&nat[&key].dead, &dead));
         })
         .await
-        .expect("flush test timed out");
+        .expect("session termination test timed out");
     }
 }
