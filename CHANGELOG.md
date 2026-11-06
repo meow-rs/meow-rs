@@ -19,7 +19,11 @@ the canonical, in-repo source a release is cut from.
   powers of two. The QUIC layer also runs BBRv2 — quiche's default
   CUBIC shrank its window on datagram loss — and probes the path MTU
   at a 1452-byte send cap, matching quic-go, instead of splitting
-  large datagrams across two 1200-byte packets.
+  large datagrams across two 1200-byte packets. The congestion
+  control is connection-level, so TCP upload through the node moves
+  off CUBIC with it; and a node that sets `up:` now warns at load
+  that the field is ignored — quiche has no Brutal, the upload
+  congestion control a bandwidth hint would select.
 - VLESS `xhttp-opts.mode: auto` resolves like Xray's client —
   `stream-one` under REALITY without `download-settings` — so nodes
   carrying it (3x-ui subscriptions ship it verbatim) load instead of

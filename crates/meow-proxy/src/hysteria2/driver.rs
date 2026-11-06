@@ -642,13 +642,20 @@ fn pump_datagrams(st: &mut State, conn: &mut quiche::Connection, buf: &mut [u8])
                     frag_count = msg.frag_count,
                     "hysteria2 decoded UDP fragment"
                 );
-                if let Some(tx) = st.udp_sessions.get(&msg.session_id) {
-                    if tx.try_send(msg).is_err() {
-                        note_drop(&st.dropped_udp, "session queue full");
-                    }
+                match st.udp_sessions.get(&msg.session_id) {
+                    Some(tx) => match tx.try_send(msg) {
+                        Ok(()) => {}
+                        Err(TrySendError::Full(_)) => {
+                            note_drop(&st.dropped_udp, "session queue full");
+                        }
+                        Err(TrySendError::Closed(_)) => note_drop(&st.dropped_udp, "session gone"),
+                    },
+                    // A datagram routed to a session already unregistered
+                    // (or never known): per-datagram junk, counted.
+                    None => note_drop(&st.dropped_udp, "unknown UDP session"),
                 }
             }
-            Err(e) => tracing::debug!("dropping malformed hysteria2 UDP datagram: {e}"),
+            Err(e) => note_drop(&st.dropped_udp, format_args!("decode UDP message: {e}")),
         }
     }
 }
@@ -673,9 +680,16 @@ fn send_udp(
     };
     let payload_limit = max.saturating_sub(header);
     if payload_limit == 0 {
-        // No datagram capacity (quiche's send queue is full or
-        // datagrams are not writable yet): congestion as a drop.
-        note_drop(&st.dropped_udp, "datagram queue full");
+        // `dgram_max_writable_len` is the frame bound — packet cap minus
+        // header/crypto overhead, clamped to the peer's DATAGRAM frame
+        // size; `None` means the peer never advertised DATAGRAM at all.
+        // Zero left means the hysteria2 address header alone meets the
+        // bound. Queue depth is NOT read here: a full send queue fails
+        // at `dgram_send` below, counted as `dgram_send: Done`.
+        note_drop(
+            &st.dropped_udp,
+            "datagrams unnegotiated or header over limit",
+        );
         return;
     }
     let packet_id = st.next_packet_id;
@@ -702,7 +716,7 @@ fn send_udp(
         return;
     }
     for (i, chunk) in data.chunks(payload_limit).enumerate() {
-        send_one_udp(
+        if !send_one_udp(
             &st.dropped_udp,
             conn,
             &UdpMessage {
@@ -713,19 +727,31 @@ fn send_udp(
                 addr: addr.to_string(),
                 data: chunk.to_vec(),
             },
-        );
+        ) {
+            // Later fragments meet the same queue state — the datagram
+            // is already incomplete, so stop spending encode and count
+            // passes on it.
+            break;
+        }
     }
 }
 
-fn send_one_udp(dropped: &AtomicU64, conn: &mut quiche::Connection, msg: &UdpMessage) {
+/// Queue one encoded datagram; `false` means it was dropped and the
+/// caller's fragment loop should give up on the datagram.
+fn send_one_udp(dropped: &AtomicU64, conn: &mut quiche::Connection, msg: &UdpMessage) -> bool {
     match proto::encode_udp_message(msg) {
         Ok(encoded) => {
             if let Err(e) = conn.dgram_send(&encoded) {
                 note_drop(dropped, format_args!("dgram_send: {e}"));
+                return false;
             }
         }
-        Err(e) => note_drop(dropped, format_args!("dgram encode: {e}")),
+        Err(e) => {
+            note_drop(dropped, format_args!("dgram encode: {e}"));
+            return false;
+        }
     }
+    true
 }
 
 fn cleanup_streams(st: &mut State, conn: &mut quiche::Connection) {

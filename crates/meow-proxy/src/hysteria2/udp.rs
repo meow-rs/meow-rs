@@ -44,16 +44,25 @@ impl UdpSession {
             note_drop(&self.dropped, "oversized UDP payload");
             return Ok(());
         }
+        // Skip the per-datagram allocations when the queue is a known
+        // full — the common drop under sustained congestion. `capacity`
+        // reads 0 on a closed channel too, so gate on `is_closed` to
+        // keep reporting a dead driver.
+        if self.cmd_tx.capacity() == 0 && !self.cmd_tx.is_closed() {
+            note_drop(&self.dropped, "driver queue full");
+            return Ok(());
+        }
         match self.cmd_tx.try_send(Cmd::SendUdp {
             session_id: self.session_id,
             addr: addr.to_string(),
             data: data.to_vec(),
         }) {
             // A full driver queue is congestion, not a dead session: drop
-            // the datagram as UDP would (meow-openwrt). Reporting `Closed`
-            // made the caller tear the association down and open a new one
-            // — a new server-side socket and source port mid-flow, which
-            // connected UDP peers (iperf3, QUIC, games) then ignore.
+            // the datagram as UDP would (reported on OpenWrt). Reporting
+            // `Closed` made the caller tear the association down and open
+            // a new one — a new server-side socket and source port
+            // mid-flow, which connected UDP peers (iperf3, QUIC, games)
+            // then ignore.
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(_)) => {
                 note_drop(&self.dropped, "driver queue full");
@@ -66,7 +75,7 @@ impl UdpSession {
     pub async fn recv(&mut self) -> Result<(Vec<u8>, String)> {
         loop {
             let message = self.packets.recv().await.ok_or(Error::Closed)?;
-            match self.defragger.feed(message) {
+            match self.defragger.feed(message, &self.dropped) {
                 Ok(Some(message)) => return Ok((message.data, message.addr)),
                 Ok(None) => {}
                 // A bad fragment set is per-datagram junk, not a dead
@@ -108,12 +117,13 @@ impl UdpDefragger {
         }
     }
 
-    fn feed(&mut self, message: UdpMessage) -> Result<Option<UdpMessage>> {
+    fn feed(&mut self, message: UdpMessage, dropped: &AtomicU64) -> Result<Option<UdpMessage>> {
         self.evict_stale();
         if message.frag_count <= 1 {
             return Ok(Some(message));
         }
         if message.frag_id >= message.frag_count {
+            note_drop(dropped, "out-of-range UDP fragment");
             return Ok(None);
         }
 
@@ -128,6 +138,7 @@ impl UdpDefragger {
 
         let index = usize::from(message.frag_id);
         if item.fragments[index].is_some() {
+            note_drop(dropped, "duplicate UDP fragment");
             return Ok(None);
         }
         item.fragments[index] = Some(message);
@@ -207,7 +218,7 @@ mod tests {
     fn send_drops_on_full_queue_and_fails_only_when_closed() {
         let (tx, rx) = mpsc::channel(1);
         let (_ptx, prx) = mpsc::channel(1);
-        let session = super::UdpSession::new(7, tx, prx);
+        let session = UdpSession::new(7, tx, prx);
         session.send(b"a", "1.2.3.4:5").expect("queued");
         session
             .send(b"b", "1.2.3.4:5")
@@ -232,8 +243,9 @@ mod tests {
             data: b"llo".to_vec(),
             ..first.clone()
         };
-        assert!(defragger.feed(first).unwrap().is_none());
-        let complete = defragger.feed(second).unwrap().unwrap();
+        let dropped = AtomicU64::new(0);
+        assert!(defragger.feed(first, &dropped).unwrap().is_none());
+        let complete = defragger.feed(second, &dropped).unwrap().unwrap();
         assert_eq!(complete.data, b"hello");
     }
 }
