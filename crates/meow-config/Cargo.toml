@@ -53,6 +53,10 @@ mux = ["meow-proxy/mux"]
 # against the ADR-0007 size caps. Even when enabled, the code path is
 # force-disabled on iOS/Android targets (see `src/lib.rs`).
 external-ui-download = ["dep:zip"]
+# DNS over QUIC (`quic://`) and DoH over HTTP/3 (`dns.prefer-h3`, `?h3=`),
+# forwarded to meow-dns. Off by default: quiche adds build time and binary
+# size against the ADR-0007 caps, and only the `full` bundle ships it.
+dns-quic = ["meow-dns/quic-dns"]
 
 [dependencies]
 meow-common = { workspace = true }

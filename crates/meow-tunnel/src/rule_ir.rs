@@ -3254,8 +3254,10 @@ mod tests {
     }
 
     /// Scoped WARN capture — `with_default` is thread-local, so parallel tests
-    /// in this binary don't see each other's lines.
+    /// in this binary don't see each other's lines; see
+    /// [`crate::install_capture_fallback`] for the process-wide part.
     fn capture_warns<R>(f: impl FnOnce() -> R) -> (R, String) {
+        crate::install_capture_fallback();
         #[derive(Clone)]
         struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
         impl std::io::Write for Sink {

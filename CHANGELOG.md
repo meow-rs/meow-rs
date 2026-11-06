@@ -8,6 +8,44 @@ the canonical, in-repo source a release is cut from.
 
 ## [Unreleased]
 
+### Added
+
+- **DNS over QUIC (`quic://`)**: RFC 9250 on `quiche` (the vendored BoringSSL
+  the rest of the process uses): one bidirectional stream per query, the
+  two-octet length prefix, the transaction ID zeroed on the wire and restored
+  before validation, and one multiplexed connection per upstream that re-dials
+  by itself after an idle timeout or a connection reset. `?proxy=NAME` tunnels
+  the exchange through an adapter's UDP association. Behind the new `dns-quic`
+  feature (in the `full` bundle); without it the scheme is a hard config error
+  naming the feature, never a silent drop.
+- **DoH over HTTP/3 (`dns.prefer-h3`, `?h3=`)**: an `https://` nameserver can
+  speak HTTP/3 instead of HTTP/1.1. `prefer-h3: true` marks every `https://`
+  entry, `?h3=true` is mihomo's per-entry "HTTP/3 only", and `?h3=prefer` /
+  `?h3=false` opt a single entry in or out. The preference is real: the h3
+  attempt gets half the per-query timeout, a failure falls back to the HTTP/1.1
+  DoH path (same proxy tag, roots and session pool), and the failed handshake
+  parks HTTP/3 for ten minutes so a server without it does not cost a
+  handshake timeout per query. A build without `dns-quic` refuses a config that
+  asks for HTTP/3 (ADR-0002 Class A).
+
+- **`dns.direct-nameserver`**: `DIRECT` outbounds now resolve their
+  destination through `direct-nameserver` when it is set, as mihomo does,
+  instead of always using the main `nameserver` list. With
+  `direct-nameserver-follow-policy: true` the `nameserver-policy` applies
+  to those lookups too. A named destination is resolved through it even
+  when rule matching already resolved it through the main nameservers.
+  This covers UDP (QUIC included): a DIRECT UDP flow sends to the
+  direct-resolved address, and one the main nameservers cannot resolve
+  falls back to `direct-nameserver` instead of being dropped; a UDP flow
+  whose name was only snooped back from its address (redir-host) keeps
+  that address, as in mihomo. User-declared
+  `type: direct` proxies follow it too unless they set their own `dns:`.
+  Configs without `direct-nameserver` behave as before.
+- **AnyTLS TLS options**: support certificate SHA-256 `fingerprint` pinning,
+  `name-cert-verify`, `alpn`, and existing `client-fingerprint` profiles for
+  direct and relay connections. Explicit verification remains mandatory
+  with `skip-cert-verify`; malformed pins fail configuration validation.
+
 ### Fixed
 
 - **UDP flows on the tproxy, TUN and Shadowsocks inbounds now stop on
@@ -17,6 +55,77 @@ the canonical, in-repo source a release is cut from.
   longer pin a flow. A full TUN reply queue drops the reply with a debug
   log instead of parking the flow, and a short upstream write retires the
   flow without a partial retry on every path.
+
+- **Plain-HTTP origin-form requests work again.** `GET /path` + a `Host:`
+  header — the request shape every browser sends a plain-HTTP proxy —
+  was refused with 400 by the #734 hostname gate, which only looked at
+  the request target's (empty) authority. The listener now takes the
+  authority from the `Host:` header for `/`-leading request targets and
+  runs it through the same gate: `Host: example.com` routes by rules, an
+  IP literal folds into `dst_ip`, an explicit `:port` is honoured (a `:0`
+  port names no socket and is refused), and a non-hostname or duplicated
+  `Host` value is refused with 400 like any bad authority.
+- **A sniffed name no longer outvotes an explicit destination.** With
+  `sniffer.enable: true` and `override-destination: false`, a request
+  like `GET http://evil.com/` carrying `Host: good.example` landed the
+  sniffed name in `sniff_host`: DOMAIN rules matched `good.example` and
+  let the flow fall to `MATCH`, while the dial still went to `evil.com` —
+  a `DOMAIN,evil.com,REJECT` rule was bypassed. A sniffed name is now
+  adopted only when the destination carries no routing name of its own —
+  an empty host or an IP literal; an explicit domain authority (CONNECT
+  target, absolute-form URI, SOCKS5 domain) always wins. Two opt-ins
+  override the priority: `override-destination: true` rewrites the
+  destination with the sniffed name, keeping rules and dial consistent,
+  and a `force-domain` entry matching the destination adopts the sniffed
+  name into `sniff_host` anyway — the CDN-front contract, routing by the
+  name on the wire while dialing the authority.
+- **All-digit address spellings no longer pass `is_valid_host`.** A name
+  made only of digits and dots (`2130706433`, `0177.0.0.1`, `123.456`)
+  is an `inet_aton` address form a libc dial path would fold into an IP —
+  not a hostname the DOMAIN rules checked. Go's `isDomainName` parity: at
+  least one byte must be non-numeric (`-`/`_` count, so `123-456` still
+  passes). Letter-bearing `inet_aton` spellings (`0x7f000001`,
+  `0x7f.0.0.1`) still pass, as under Go — a known residual on dial paths
+  that never touch the injected resolver: a user-built `type: direct`
+  node with no `dns:` section still folds them through libc.
+- **A trailing-dot destination now hits its DOMAIN rules.** A client
+  naming `evil.com.` — the fully-qualified spelling — used to slip past
+  `DOMAIN,evil.com,REJECT` because rule matching compared the host
+  verbatim. `Metadata::rule_host()` now strips trailing dots on both the
+  `host` and `sniff_host` paths, on the origin-form `Host:`, CONNECT, and
+  absolute-form targets alike; the stored `host` keeps its verbatim form,
+  so dialing and upstream CONNECT lines are unchanged.
+- **Dead domain entries in static config are surfaced.** An empty-label
+  key (`a..b`, `..x`) builds a `DomainTrie` node no query can reach, a
+  `DOMAIN`/`DOMAIN-SUFFIX` rule payload with an empty label, a leading or
+  trailing dot (`.x.com`, `x.com.`), or a `*`/`+` byte (`DOMAIN,*.x.com`
+  compares verbatim and can never equal a host) can never match the
+  normalized rule host it is compared against, a `DOMAIN-WILDCARD`
+  payload with a literal `+` (its matcher globs `*` only, so `+.x.com`
+  is dead there too) or a dead literal label (`*.foo.`, `a..b`) anchors
+  a match no host satisfies, and a `DOMAIN-KEYWORD` needle containing
+  `..` names a substring no host holds — while an all-dots or
+  prefix-only key (`"."`, `"+."`) is refused by the trie outright.
+  `hosts:`, `nameserver-policy`, `fallback-filter.domain`,
+  `fake-ip-filter`, sniffer `skip-domain`/`force-domain`, and `rules:`
+  domain payloads now warn naming the entry in lenient mode and hard
+  error in strict mode; a flagged entry that still loads matches
+  exactly as before — the check changes the load outcome (lenient
+  warning vs strict refusal), not what the entry matches.
+  `DOMAIN-REGEX` stays unchecked: whether an arbitrary pattern can match
+  a normalized host is not decidable by label inspection.
+- **UDP to a loopback destination works under TUN global route scope.**
+  With `tun.auto-route: true` (or `global`) meow binds its own sockets to
+  the physical interface against routing loops, and decided that for UDP
+  by the socket's wildcard *local* address — so every UDP socket was
+  bound, and DIRECT UDP to `127.0.0.1` / `::1` (or a name resolving to
+  one) failed (`WSAEADDRNOTAVAIL` on Windows), as did UDP to a proxy
+  server or chained hop on loopback (Shadowsocks, SOCKS5, Hysteria2,
+  TrustTunnel QUIC, kcptun, dialer-proxy). The binding is now decided by
+  the destination: loopback peers are left unbound on Linux, macOS and
+  Windows (Linux bound loopback TCP too), everything else — LAN,
+  link-local and multicast included — keeps it. IPv4-mapped destinations
+  get an IPv4 socket; native IPv6 keeps its scope id.
 
 ## [0.29.0] - 2026-11-05
 
