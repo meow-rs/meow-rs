@@ -10,6 +10,24 @@ the canonical, in-repo source a release is cut from.
 
 ### Added
 
+- **DNS over QUIC (`quic://`)**: RFC 9250 on `quiche` (the vendored BoringSSL
+  the rest of the process uses): one bidirectional stream per query, the
+  two-octet length prefix, the transaction ID zeroed on the wire and restored
+  before validation, and one multiplexed connection per upstream that re-dials
+  by itself after an idle timeout or a connection reset. `?proxy=NAME` tunnels
+  the exchange through an adapter's UDP association. Behind the new `dns-quic`
+  feature (in the `full` bundle); without it the scheme is a hard config error
+  naming the feature, never a silent drop.
+- **DoH over HTTP/3 (`dns.prefer-h3`, `?h3=`)**: an `https://` nameserver can
+  speak HTTP/3 instead of HTTP/1.1. `prefer-h3: true` marks every `https://`
+  entry, `?h3=true` is mihomo's per-entry "HTTP/3 only", and `?h3=prefer` /
+  `?h3=false` opt a single entry in or out. The preference is real: the h3
+  attempt gets half the per-query timeout, a failure falls back to the HTTP/1.1
+  DoH path (same proxy tag, roots and session pool), and the failed handshake
+  parks HTTP/3 for ten minutes so a server without it does not cost a
+  handshake timeout per query. A build without `dns-quic` refuses a config that
+  asks for HTTP/3 (ADR-0002 Class A).
+
 - **`dns.direct-nameserver`**: `DIRECT` outbounds now resolve their
   destination through `direct-nameserver` when it is set, as mihomo does,
   instead of always using the main `nameserver` list. With
@@ -34,6 +52,178 @@ the canonical, in-repo source a release is cut from.
   proxy group logged only the rule's target (`dial error: …`), which hides
   which member failed. The line now reads `dial error using Proxy → HK-01:
   …`; a leaf target is named once.
+- **Plain-HTTP origin-form requests work again.** `GET /path` + a `Host:`
+  header — the request shape every browser sends a plain-HTTP proxy —
+  was refused with 400 by the #734 hostname gate, which only looked at
+  the request target's (empty) authority. The listener now takes the
+  authority from the `Host:` header for `/`-leading request targets and
+  runs it through the same gate: `Host: example.com` routes by rules, an
+  IP literal folds into `dst_ip`, an explicit `:port` is honoured (a `:0`
+  port names no socket and is refused), and a non-hostname or duplicated
+  `Host` value is refused with 400 like any bad authority.
+- **A sniffed name no longer outvotes an explicit destination.** With
+  `sniffer.enable: true` and `override-destination: false`, a request
+  like `GET http://evil.com/` carrying `Host: good.example` landed the
+  sniffed name in `sniff_host`: DOMAIN rules matched `good.example` and
+  let the flow fall to `MATCH`, while the dial still went to `evil.com` —
+  a `DOMAIN,evil.com,REJECT` rule was bypassed. A sniffed name is now
+  adopted only when the destination carries no routing name of its own —
+  an empty host or an IP literal; an explicit domain authority (CONNECT
+  target, absolute-form URI, SOCKS5 domain) always wins. Two opt-ins
+  override the priority: `override-destination: true` rewrites the
+  destination with the sniffed name, keeping rules and dial consistent,
+  and a `force-domain` entry matching the destination adopts the sniffed
+  name into `sniff_host` anyway — the CDN-front contract, routing by the
+  name on the wire while dialing the authority.
+- **All-digit address spellings no longer pass `is_valid_host`.** A name
+  made only of digits and dots (`2130706433`, `0177.0.0.1`, `123.456`)
+  is an `inet_aton` address form a libc dial path would fold into an IP —
+  not a hostname the DOMAIN rules checked. Go's `isDomainName` parity: at
+  least one byte must be non-numeric (`-`/`_` count, so `123-456` still
+  passes). Letter-bearing `inet_aton` spellings (`0x7f000001`,
+  `0x7f.0.0.1`) still pass, as under Go — a known residual on dial paths
+  that never touch the injected resolver: a user-built `type: direct`
+  node with no `dns:` section still folds them through libc.
+- **A trailing-dot destination now hits its DOMAIN rules.** A client
+  naming `evil.com.` — the fully-qualified spelling — used to slip past
+  `DOMAIN,evil.com,REJECT` because rule matching compared the host
+  verbatim. `Metadata::rule_host()` now strips trailing dots on both the
+  `host` and `sniff_host` paths, on the origin-form `Host:`, CONNECT, and
+  absolute-form targets alike; the stored `host` keeps its verbatim form,
+  so dialing and upstream CONNECT lines are unchanged.
+- **Dead domain entries in static config are surfaced.** An empty-label
+  key (`a..b`, `..x`) builds a `DomainTrie` node no query can reach, a
+  `DOMAIN`/`DOMAIN-SUFFIX` rule payload with an empty label, a leading or
+  trailing dot (`.x.com`, `x.com.`), or a `*`/`+` byte (`DOMAIN,*.x.com`
+  compares verbatim and can never equal a host) can never match the
+  normalized rule host it is compared against, a `DOMAIN-WILDCARD`
+  payload with a literal `+` (its matcher globs `*` only, so `+.x.com`
+  is dead there too) or a dead literal label (`*.foo.`, `a..b`) anchors
+  a match no host satisfies, and a `DOMAIN-KEYWORD` needle containing
+  `..` names a substring no host holds — while an all-dots or
+  prefix-only key (`"."`, `"+."`) is refused by the trie outright.
+  `hosts:`, `nameserver-policy`, `fallback-filter.domain`,
+  `fake-ip-filter`, sniffer `skip-domain`/`force-domain`, and `rules:`
+  domain payloads now warn naming the entry in lenient mode and hard
+  error in strict mode; a flagged entry that still loads matches
+  exactly as before — the check changes the load outcome (lenient
+  warning vs strict refusal), not what the entry matches.
+  `DOMAIN-REGEX` stays unchecked: whether an arbitrary pattern can match
+  a normalized host is not decidable by label inspection.
+- **UDP to a loopback destination works under TUN global route scope.**
+  With `tun.auto-route: true` (or `global`) meow binds its own sockets to
+  the physical interface against routing loops, and decided that for UDP
+  by the socket's wildcard *local* address — so every UDP socket was
+  bound, and DIRECT UDP to `127.0.0.1` / `::1` (or a name resolving to
+  one) failed (`WSAEADDRNOTAVAIL` on Windows), as did UDP to a proxy
+  server or chained hop on loopback (Shadowsocks, SOCKS5, Hysteria2,
+  TrustTunnel QUIC, kcptun, dialer-proxy). The binding is now decided by
+  the destination: loopback peers are left unbound on Linux, macOS and
+  Windows (Linux bound loopback TCP too), everything else — LAN,
+  link-local and multicast included — keeps it. IPv4-mapped destinations
+  get an IPv4 socket; native IPv6 keeps its scope id.
+
+## [0.29.0] - 2026-11-05
+
+### Added
+
+- **Inbound zombie-connection reaping** (`tcp-keepalive*` +
+  `tcp-idle-timeout`): every accepted TCP socket on the
+  mixed/http/socks5/tproxy/shadowsocks inbounds now gets `SO_KEEPALIVE`
+  plus configurable `TCP_KEEPIDLE`/`TCP_KEEPINTVL`/`TCP_KEEPCNT`
+  (`tcp-keepalive`, `tcp-keepalive-idle: 300`, `tcp-keepalive-interval: 30`,
+  `tcp-keepalive-probes: 5` — ~450 s to detect a peer that leaves Wi-Fi
+  without FIN/RST), and an opt-in `tcp-idle-timeout` (off by default —
+  no behaviour change without the key) tears down established relays
+  silent in **both** directions for that many seconds instead of letting
+  them pin a `max-connections` permit forever — covering what keepalive
+  cannot see (TUN netstack flows, dead-but-still-ACKing upstreams).
+  `tcp-keepalive: false` performs no setsockopt; `tcp-idle-timeout: 0`
+  (or absent) leaves the bound off. `PUT /configs` validates all five
+  keys and applies the idle bound to relays started after the commit;
+  the keepalive posture is a listener-startup snapshot.
+- **Traffic ledger** ([ADR-0015](docs/adr/0015-traffic-ledger.md)): meow
+  now keeps, for every local day, the bytes and connections per host
+  (registrable domain), app, leaf policy and interface label, for 62 days
+  in `<home>/traffic/traffic.db`, so a client can show today, this month
+  and last month grouped any of the four ways. A node that carries
+  another outbound's `dialer-proxy` hop counts that traffic in its policy
+  row too, apart in `via_upload` / `via_download` / `via_requests`; the
+  other views and the totals count each flow once. The app is the package
+  name on Android and, on Linux, macOS and Windows, the owner of a flow
+  from this host (a loopback client, or the host's own traffic through
+  TUN or a transparent listener), looked up off the connection's path.
+  `GET /traffic/ledger` serves it (`from`, `to`, `by`, and `host` /
+  `app` / `policy` / `interface` to drill down); `DELETE /traffic/ledger`
+  empties it. On by default: `traffic-ledger: {enable: false}` turns it
+  off, and `hosts: false` / `apps: false` keep no hosts / apps (no
+  lookups). In `full` builds, not `minimal`.
+- **`dns.direct-nameserver`**: `DIRECT` outbounds now resolve their
+  destination through `direct-nameserver` when it is set, as mihomo does,
+  instead of always using the main `nameserver` list. With
+  `direct-nameserver-follow-policy: true` the `nameserver-policy` applies
+  to those lookups too. A named destination is resolved through it even
+  when rule matching already resolved it through the main nameservers.
+  This covers UDP (QUIC included): a DIRECT UDP flow sends to the
+  direct-resolved address, and one the main nameservers cannot resolve
+  falls back to `direct-nameserver` instead of being dropped; a UDP flow
+  whose name was only snooped back from its address (redir-host) keeps
+  that address, as in mihomo. User-declared
+  `type: direct` proxies follow it too unless they set their own `dns:`.
+  Configs without `direct-nameserver` behave as before.
+- **AnyTLS TLS options**: support certificate SHA-256 `fingerprint` pinning,
+  `name-cert-verify`, `alpn`, and existing `client-fingerprint` profiles for
+  direct and relay connections. Explicit verification remains mandatory
+  with `skip-cert-verify`; malformed pins fail configuration validation.
+- **Static 32-bit ARM musl release target** — releases and alpha
+  prereleases now ship `meow-<ref>-armv7-unknown-linux-musleabihf.tar.gz`,
+  a statically linked musl binary for 32-bit ARM routers. The existing
+  `armv7-unknown-linux-gnueabihf` build is dynamically linked and needs
+  `GLIBC_2.28`, which Alpine's armhf `gcompat` does not provide, so
+  `execve` fails with `ENOENT` on a file that exists. The target builds in a
+  musl cross toolchain container (`scripts/build-armv7-musl.sh`) instead of
+  via `cargo zigbuild`: musl 1.2.x headers declare `time_t` as 64-bit on
+  32-bit targets (time64/Y2038 hardening) while Rust's `libc` crate types it
+  as `i32`, so bindgen emits a 64-bit `X509_VERIFY_PARAM_set_time` and
+  `boring` fails to compile; a real cross toolchain plus a one-line cast in
+  `boring` gets past both.
+
+### Changed
+
+- **The routing log names the node a group dials through.** The
+  per-connection `match` line used to name only the rule's adapter, so a
+  flow through a group read `using my-ss`. It now adds the member in
+  brackets, as mihomo prints its chain: `using my-ss[HK-01]`. Nested
+  groups print the outer group and the final member (`Proxy[HK-01]`). A
+  plain proxy, DIRECT and REJECT print as before. The member is the one
+  the dial will take, the same one `/connections` lists in `chains`; a
+  relay group prints as itself (#895).
+- **Memory reporting on Linux reads `/proc/self/status`**: `meow-api`
+  takes `VmRSS` from procfs on Linux and no longer links `sysinfo` there;
+  other platforms keep `sysinfo` with its default features off, which
+  drops rayon too. The reported number is the same kernel counter. Default
+  musl binaries shrink by about 73 KB on x86_64 and 60 KB on aarch64
+  (#835).
+
+### Fixed
+
+- SOCKS5 UDP sessions now stop on outbound flush or reply-reader failure even
+  while a packet write is pending. A short write retires the session without
+  retrying any part of the datagram.
+
+- **PROCESS-NAME, PROCESS-PATH and UID rules match every IPv4 client of
+  a dual-stack listener** (`bind-address: "::"`). The process lookup ran
+  on the client's IPv4-mapped address, so it missed clients with an
+  AF_INET socket, the usual kind (curl, browsers). It now looks the IPv4
+  address up, in the IPv4 socket table and then (Linux, Windows) the IPv6
+  one, so it finds AF_INET clients and AF_INET6 ones on an IPv4 address
+  (Java's default) alike.
+- **`anytls` no longer silently ignores `ech-opts`** (#870): an enabled
+  `ech-opts` or a `certificate`/`private-key` client certificate is now a
+  config-load error, as for hysteria2, instead of connecting with the SNI in
+  the clear. The other ignored mihomo fields (`shadow-tls-opts`,
+  `restls-opts`, `jls-opts`, `client-metadata`, `idle-session-*`,
+  `min-idle-session`, `disable-reuse`) now log one load-time warning.
 - **Plain-HTTP origin-form requests work again.** `GET /path` + a `Host:`
   header — the request shape every browser sends a plain-HTTP proxy —
   was refused with 400 by the #734 hostname gate, which only looked at
