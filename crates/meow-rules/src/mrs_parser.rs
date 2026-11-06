@@ -519,9 +519,8 @@ fn walk_upstream_domain_set(data: &[u8], on_domain: &mut dyn FnMut(&str)) -> Res
 
     // A well-formed trie has exactly one terminator bit per node and every
     // non-root node owns one incoming label edge, so #ones <= labels + 1.
-    // Enforce the correlation *before* DomainSetIndex materializes one `usize`
-    // per set bit — a mostly-ones bitmap would otherwise amplify the input
-    // ~64x into memory (issue #513).
+    // A bitmap that breaks the correlation is a malformed trie: reject it
+    // before the walk (issue #513).
     let node_count: usize = label_bitmap
         .iter()
         .map(|word| word.count_ones() as usize)
@@ -674,7 +673,10 @@ impl DomainSetTraversal<'_> {
                 self.labels
                     .get(label_idx)
                     .copied()
-                    .zip(self.label_index.select_one(next_node_id.saturating_sub(1)))
+                    .zip(
+                        self.label_index
+                            .select_one(self.label_bitmap, next_node_id.saturating_sub(1)),
+                    )
                     .map(|(label, prev_terminator)| (label, next_node_id, prev_terminator + 1))
             };
             let Some((label, next_node_id, next_bm_idx)) = child else {
@@ -709,31 +711,23 @@ impl DomainSetTraversal<'_> {
     }
 }
 
+/// Rank over the label bitmap: ones before each word. `select` binary-
+/// searches it instead of keeping one `usize` per set bit — on a large
+/// upstream set (~1M nodes) that table alone was the load's peak.
 struct DomainSetIndex {
     rank_ones_by_word: Vec<usize>,
-    select_ones: Vec<usize>,
 }
 
 impl DomainSetIndex {
     fn new(bits: &[u64]) -> Self {
         let mut rank_ones_by_word = Vec::with_capacity(bits.len() + 1);
-        let mut select_ones = Vec::new();
         let mut seen_ones = 0usize;
-        for (word_idx, word) in bits.iter().copied().enumerate() {
+        for word in bits {
             rank_ones_by_word.push(seen_ones);
-            let mut remaining = word;
-            while remaining != 0 {
-                let bit = remaining.trailing_zeros() as usize;
-                select_ones.push(word_idx * 64 + bit);
-                remaining &= remaining - 1;
-            }
             seen_ones += word.count_ones() as usize;
         }
         rank_ones_by_word.push(seen_ones);
-        Self {
-            rank_ones_by_word,
-            select_ones,
-        }
+        Self { rank_ones_by_word }
     }
 
     fn count_zeros(&self, bits: &[u64], upto: usize) -> usize {
@@ -751,8 +745,19 @@ impl DomainSetIndex {
         upto - ones
     }
 
-    fn select_one(&self, nth: usize) -> Option<usize> {
-        self.select_ones.get(nth).copied()
+    /// Bit index of the `nth` (0-based) set bit.
+    fn select_one(&self, bits: &[u64], nth: usize) -> Option<usize> {
+        debug_assert_eq!(bits.len() + 1, self.rank_ones_by_word.len());
+        // Last word whose preceding-ones count is <= nth.
+        let word = self
+            .rank_ones_by_word
+            .partition_point(|&ones| ones <= nth)
+            .checked_sub(1)?;
+        let mut remaining = *bits.get(word)?;
+        for _ in 0..nth - self.rank_ones_by_word[word] {
+            remaining &= remaining.wrapping_sub(1);
+        }
+        (remaining != 0).then(|| word * 64 + remaining.trailing_zeros() as usize)
     }
 }
 
@@ -1380,8 +1385,37 @@ mod tests {
         assert_eq!(parsed.entries.len(), n);
     }
 
-    /// A mostly-ones bitmap makes `DomainSetIndex` allocate one `usize` per
-    /// set bit — ~64x input amplification. A well-formed trie has one
+    /// `select_one` (rank + in-word scan) agrees with a plain scan.
+    #[test]
+    fn domain_set_select_matches_a_scan() {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let bits: Vec<u64> = (0..40)
+            .map(|i| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                match i % 5 {
+                    0 => 0,
+                    1 => u64::MAX,
+                    _ => x,
+                }
+            })
+            .collect();
+        let ones: Vec<usize> = (0..bits.len() * 64)
+            .filter(|&i| bits[i / 64] >> (i % 64) & 1 == 1)
+            .collect();
+        let index = DomainSetIndex::new(&bits);
+        for (nth, &want) in ones.iter().enumerate() {
+            assert_eq!(index.select_one(&bits, nth), Some(want), "nth {nth}");
+        }
+        assert_eq!(index.select_one(&bits, ones.len()), None);
+        assert_eq!(index.select_one(&bits, usize::MAX), None);
+        let empty = DomainSetIndex::new(&[]);
+        assert_eq!(empty.select_one(&[], 0), None);
+    }
+
+    /// A mostly-ones bitmap once made `DomainSetIndex` allocate one `usize`
+    /// per set bit — ~64x input amplification; the bound still stands. A well-formed trie has one
     /// terminator per node and one incoming label edge per non-root node, so
     /// #ones <= labels + 1 is rejected before the index is built.
     #[test]
