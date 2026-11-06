@@ -10,6 +10,20 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **Hysteria 2 UDP relay no longer collapses under load.** A full
+  driver queue reported `Closed`, so the tunnel tore the association
+  down and re-dialled per datagram — a fresh server-side socket and
+  source port mid-flow that connected UDP peers (iperf3, QUIC, games)
+  then ignore. Congestion, oversized payloads and malformed fragment
+  sets are now dropped as a UDP link would, counted and logged at
+  powers of two. The QUIC layer also runs BBRv2 — quiche's default
+  CUBIC shrank its window on datagram loss — and probes the path MTU
+  at a 1452-byte send cap, matching quic-go, instead of splitting
+  large datagrams across two 1200-byte packets. The congestion
+  control is connection-level, so TCP upload through the node moves
+  off CUBIC with it; and a node that sets `up:` now warns at load
+  that the field is ignored — quiche has no Brutal, the upload
+  congestion control a bandwidth hint would select.
 - VLESS `xhttp-opts.mode: auto` resolves like Xray's client —
   `stream-one` under REALITY without `download-settings` — so nodes
   carrying it (3x-ui subscriptions ship it verbatim) load instead of

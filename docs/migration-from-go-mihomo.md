@@ -57,7 +57,7 @@ cause problems; items marked ~ work with caveats; items marked ✓ work.
 | `proxies:` — HTTP CONNECT outbound | ✓ | Full parity (M1.B-3). |
 | `proxies:` — SOCKS5 outbound | ✓ | Full parity (M1.B-4). |
 | `proxies:` — Snell | ✓ | v3/v4/v5/v6, UDP-over-TCP, optional HTTP/TLS obfs (v3–v5), v6 `mode` (`default` / `unshaped` / `unsafe-raw`). |
-| `proxies:` — Hysteria2 | ✓ | QUIC TCP/UDP, Salamander obfs, port hopping, bandwidth hints. |
+| `proxies:` — Hysteria2 | ✓ | QUIC TCP/UDP, Salamander obfs, port hopping; `down` bandwidth hint only (`up` is parsed but ignored — warns at load). |
 | `proxies:` — AnyTLS | ✓ | TCP + UDP (udp-over-tcp v2, opt in with `udp: true`). In the `full` bundle, and therefore in the release binaries; excluded from `minimal`. |
 | `proxies:` — TUIC / WireGuard / SSH | ✗ | Not implemented. |
 | `proxy-groups:` — selector, url-test, fallback | ✓ | Fully supported. |

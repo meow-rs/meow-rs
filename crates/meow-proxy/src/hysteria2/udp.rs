@@ -7,6 +7,7 @@ use super::driver::Cmd;
 use super::proto::{UdpMessage, MAX_UDP_SIZE};
 use super::{Error, Result};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
@@ -17,6 +18,8 @@ pub struct UdpSession {
     cmd_tx: mpsc::Sender<Cmd>,
     packets: mpsc::Receiver<UdpMessage>,
     defragger: UdpDefragger,
+    /// This session's dropped-datagram count — see [`note_drop`].
+    dropped: AtomicU64,
 }
 
 impl UdpSession {
@@ -30,29 +33,72 @@ impl UdpSession {
             cmd_tx,
             packets,
             defragger: UdpDefragger::new(),
+            dropped: AtomicU64::new(0),
         }
     }
 
     pub fn send(&self, data: &[u8], addr: &str) -> Result<()> {
         if data.len() > MAX_UDP_SIZE {
-            return Err(Error::protocol("UDP payload is too large"));
+            // Too big for the protocol: drop it as a link would, rather
+            // than fail the whole association (same teardown as `Full`).
+            note_drop(&self.dropped, "oversized UDP payload");
+            return Ok(());
         }
-        self.cmd_tx
-            .try_send(Cmd::SendUdp {
-                session_id: self.session_id,
-                addr: addr.to_string(),
-                data: data.to_vec(),
-            })
-            .map_err(|_| Error::Closed)
+        // Skip the per-datagram allocations when the queue is a known
+        // full — the common drop under sustained congestion. A dropped
+        // receiver drains its queue and returns the permits, so
+        // `capacity()` does not read 0 for a dead driver — it still
+        // reaches `try_send` below and reports `Closed`. `!is_closed`
+        // covers the other window: `Receiver::close()` marks the channel
+        // without draining, so a close()d-but-still-full channel must
+        // not take the drop path either.
+        if self.cmd_tx.capacity() == 0 && !self.cmd_tx.is_closed() {
+            note_drop(&self.dropped, "driver queue full");
+            return Ok(());
+        }
+        match self.cmd_tx.try_send(Cmd::SendUdp {
+            session_id: self.session_id,
+            addr: addr.to_string(),
+            data: data.to_vec(),
+        }) {
+            // A full driver queue is congestion, not a dead session: drop
+            // the datagram as UDP would (reported on OpenWrt). Reporting
+            // `Closed` made the caller tear the association down and open
+            // a new one — a new server-side socket and source port
+            // mid-flow, which connected UDP peers (iperf3, QUIC, games)
+            // then ignore.
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                note_drop(&self.dropped, "driver queue full");
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(Error::Closed),
+        }
     }
 
     pub async fn recv(&mut self) -> Result<(Vec<u8>, String)> {
         loop {
             let message = self.packets.recv().await.ok_or(Error::Closed)?;
-            if let Some(message) = self.defragger.feed(message)? {
-                return Ok((message.data, message.addr));
+            match self.defragger.feed(message, &self.dropped) {
+                Ok(Some(message)) => return Ok((message.data, message.addr)),
+                Ok(None) => {}
+                // A bad fragment set is per-datagram junk, not a dead
+                // session: drop it and keep reading.
+                Err(_) => note_drop(&self.dropped, "bad UDP fragment set"),
             }
         }
+    }
+}
+
+/// Count a dropped datagram, logging at powers of two so a saturated
+/// relay stays observable without flooding. The counter is scoped to
+/// one session or one connection — never process-wide, or one busy
+/// flow pushes it past the powers of two that would log a quiet
+/// flow's first drops.
+pub(super) fn note_drop(dropped: &AtomicU64, reason: impl std::fmt::Display) {
+    let n = dropped.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    if n.is_power_of_two() {
+        tracing::debug!(dropped = n, "hysteria2 udp: datagram dropped ({reason})");
     }
 }
 
@@ -75,12 +121,13 @@ impl UdpDefragger {
         }
     }
 
-    fn feed(&mut self, message: UdpMessage) -> Result<Option<UdpMessage>> {
+    fn feed(&mut self, message: UdpMessage, dropped: &AtomicU64) -> Result<Option<UdpMessage>> {
         self.evict_stale();
         if message.frag_count <= 1 {
             return Ok(Some(message));
         }
         if message.frag_id >= message.frag_count {
+            note_drop(dropped, "out-of-range UDP fragment");
             return Ok(None);
         }
 
@@ -95,6 +142,7 @@ impl UdpDefragger {
 
         let index = usize::from(message.frag_id);
         if item.fragments[index].is_some() {
+            note_drop(dropped, "duplicate UDP fragment");
             return Ok(None);
         }
         item.fragments[index] = Some(message);
@@ -169,6 +217,20 @@ fn reassemble(item: FragmentPacket) -> Result<UdpMessage> {
 mod tests {
     use super::*;
 
+    /// A full driver queue drops the datagram; only a gone driver fails.
+    #[test]
+    fn send_drops_on_full_queue_and_fails_only_when_closed() {
+        let (tx, rx) = mpsc::channel(1);
+        let (_ptx, prx) = mpsc::channel(1);
+        let session = UdpSession::new(7, tx, prx);
+        session.send(b"a", "1.2.3.4:5").expect("queued");
+        session
+            .send(b"b", "1.2.3.4:5")
+            .expect("full queue drops, session stays up");
+        drop(rx);
+        assert!(session.send(b"c", "1.2.3.4:5").is_err(), "driver gone");
+    }
+
     #[test]
     fn defragger_reassembles_in_order() {
         let mut defragger = UdpDefragger::new();
@@ -185,8 +247,9 @@ mod tests {
             data: b"llo".to_vec(),
             ..first.clone()
         };
-        assert!(defragger.feed(first).unwrap().is_none());
-        let complete = defragger.feed(second).unwrap().unwrap();
+        let dropped = AtomicU64::new(0);
+        assert!(defragger.feed(first, &dropped).unwrap().is_none());
+        let complete = defragger.feed(second, &dropped).unwrap().unwrap();
         assert_eq!(complete.data, b"hello");
     }
 }
