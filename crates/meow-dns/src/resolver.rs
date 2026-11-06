@@ -4368,15 +4368,30 @@ mod tests {
             );
             resolver.policy = Some(policy);
             resolver.pipeline_inner(host, QueryFamilies::IPV4).await;
+            assert_eq!(main_dials.swap(0, Ordering::SeqCst) == 0, exclusive);
             resolver.forward_generic(host, &name, RecordType::TXT).await;
-            assert_eq!(
-                main_dials.load(std::sync::atomic::Ordering::SeqCst) == 0,
-                exclusive
-            );
+            assert_eq!(main_dials.swap(0, Ordering::SeqCst) == 0, exclusive);
+
+            let (fallback, fallback_dials) = emfile_resolver_gated(None);
+            resolver.fallback = Some(fallback.main);
+            let mut domain = DomainTrie::new();
+            domain.insert(host, ());
+            resolver.fallback_filter = Some(FallbackFilter {
+                geoip_enabled: false,
+                geoip_code: String::new(),
+                ipcidr: vec![],
+                domain,
+                geoip_reader: None,
+            });
+            resolver.pipeline_inner(host, QueryFamilies::IPV4).await;
+            assert_eq!(fallback_dials.swap(0, Ordering::SeqCst) == 0, exclusive);
+            resolver.forward_generic(host, &name, RecordType::TXT).await;
+            assert_eq!(fallback_dials.swap(0, Ordering::SeqCst) == 0, exclusive);
+
             resolver
                 .pipeline_inner("unmatched.example", QueryFamilies::IPV4)
                 .await;
-            assert!(main_dials.load(std::sync::atomic::Ordering::SeqCst) > 0);
+            assert!(main_dials.load(Ordering::SeqCst) > 0);
         }
     }
 
