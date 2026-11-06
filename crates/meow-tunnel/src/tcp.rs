@@ -1092,8 +1092,10 @@ mod tests {
 
     /// Run `f` on a current-thread runtime and return what it logged at
     /// INFO and above. `with_default` is thread-local, so parallel tests in
-    /// this binary don't see each other's lines.
+    /// this binary don't see each other's lines; see
+    /// [`crate::install_capture_fallback`] for the process-wide part.
     fn capture_info(f: impl std::future::Future<Output = ()>) -> String {
+        crate::install_capture_fallback();
         #[derive(Clone)]
         struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
         impl std::io::Write for Sink {
