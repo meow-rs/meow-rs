@@ -160,16 +160,12 @@ pub(super) async fn run_udp(
                                     hex_prefix(&response, 48),
                                 );
                                 match reply_tx.try_send((response, dst, src)) {
-                                    Ok(()) => {}
                                     Err(mpsc::error::TrySendError::Full(_)) => {
                                         note_hijack_drop(&hijack_dropped);
                                     }
-                                    // Stack writer gone — listener shutdown.
-                                    #[allow(
-                                        clippy::needless_return,
-                                        reason = "the spawned task exits early on a closed reply queue; `return` documents that exit even at tail position"
-                                    )]
-                                    Err(mpsc::error::TrySendError::Closed(_)) => return,
+                                    // A closed queue means the stack writer is gone (listener
+                                    // shutdown); the task ends here either way.
+                                    Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
                                 }
                             }
                             Ok(Err(e)) => {
