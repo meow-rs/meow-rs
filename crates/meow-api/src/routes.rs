@@ -5678,4 +5678,3 @@ mod global_route_binding_tests {
         assert_eq!(iface(), None, "nothing runs, so nothing stays bound");
     }
 }
-
