@@ -2628,14 +2628,14 @@ fn parse_vless_xhttp_config(
     if hosts.is_empty() {
         return Err("vless: xhttp-opts.host must not be empty".into());
     }
-    // An absent `mode` keeps meow's historical stream-one default (existing
-    // non-REALITY nodes carry no mode key); an explicitly empty `mode: ''`
-    // is Xray's `auto` and resolves below — the two deliberately differ.
+    // An absent `mode` keeps meow's historical stream-one default — most
+    // existing xhttp nodes (non-REALITY included) carry no mode key.
     let mut mode: &str = xhttp_opts
         .and_then(|o| o.get("mode"))
         .and_then(|v| v.as_str())
         .unwrap_or("stream-one");
-    // Xray treats an empty mode as auto.
+    // Xray treats an empty mode as auto, so an explicit `mode: ''`
+    // resolves like `auto` below — deliberately unlike an absent mode.
     if mode.is_empty() || mode.eq_ignore_ascii_case("auto") {
         // `mode` is reassigned to the resolved value below; `requested`
         // keeps the user's spelling so `mode: ''` is not reported as 'auto'.

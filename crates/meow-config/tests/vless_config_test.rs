@@ -1639,7 +1639,7 @@ proxies:
         .expect("config load must succeed (warn-and-skip)");
     assert!(
         !config.proxies.contains_key("vless-xhttp-bad-mode"),
-        "proxy with unimplemented xhttp mode must be skipped"
+        "proxy with unsupported xhttp mode must be skipped"
     );
 }
 
