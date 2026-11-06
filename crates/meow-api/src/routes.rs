@@ -4383,11 +4383,11 @@ async fn refresh_provider(
     };
     match provider.refresh().await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => (
+        // Fetch/parser errors can include private URLs, headers or payloads.
+        Err(_) => msg_err(
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"message": e})),
-        )
-            .into_response(),
+            "Proxy provider refresh failed; the last valid proxies are unchanged",
+        ),
     }
 }
 
@@ -4557,23 +4557,25 @@ async fn get_rule_provider(
 async fn refresh_rule_provider(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
-) -> StatusCode {
+) -> Response {
     let provider = {
         let providers = state.rule_providers.read();
         providers.get(&name).cloned()
     };
     let Some(p) = provider else {
-        return StatusCode::NOT_FOUND;
+        return msg_err(StatusCode::NOT_FOUND, "resource not found");
     };
     // The provider re-parses in its own load-time ParserContext, so a
     // classical payload with GEOIP/GEOSITE entries survives the refresh
     // (issue #533 review).
     match p.refresh().await {
-        Ok(()) => StatusCode::NO_CONTENT,
-        Err(e) => {
-            tracing::warn!(provider = %name, "rule-provider refresh failed: {:#}", e);
-            StatusCode::SERVICE_UNAVAILABLE
-        }
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        // Keep the existing last-good owner; only the response changes. Do
+        // not echo the error chain, which may contain a private URL/payload.
+        Err(_) => msg_err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Rule provider refresh failed; the last valid rules are unchanged",
+        ),
     }
 }
 
