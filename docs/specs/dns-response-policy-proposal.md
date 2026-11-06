@@ -45,6 +45,7 @@ path and the stream listener where enabled.
 | --- | --- |
 | No response rules, HTTPS in FakeIP mode | Existing ADR 0013 result, retaining ALPN/ECH |
 | First rule returns empty for HTTPS/SVCB under example.test, later rule refuses the same domain | HTTPS and SVCB return NOERROR with no records or upstream traffic. A returns REFUSED |
+| A-only NODATA rule followed by a dual-stack FakeIP rule for the same domain | A returns NODATA. AAAA returns a synthetic IPv6 address, and an HTTPS answer cannot expose a real IPv6 hint for that owner |
 | Swap those rules on reload | HTTPS now returns REFUSED |
 | A override for host.example.test with address 192.0.2.7 and TTL 42 | A contains exactly that address with TTL 42. An all-types override returns NODATA for AAAA and TXT |
 | Earlier forwarding exception, later suffix FakeIP rule | The exception receives a real answer. Its siblings receive synthetic addresses for the enabled families |
