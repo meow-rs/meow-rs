@@ -45,9 +45,13 @@ impl UdpSession {
             return Ok(());
         }
         // Skip the per-datagram allocations when the queue is a known
-        // full — the common drop under sustained congestion. `capacity`
-        // reads 0 on a closed channel too, so gate on `is_closed` to
-        // keep reporting a dead driver.
+        // full — the common drop under sustained congestion. A dropped
+        // receiver drains its queue and returns the permits, so
+        // `capacity()` does not read 0 for a dead driver — it still
+        // reaches `try_send` below and reports `Closed`. `!is_closed`
+        // covers the other window: `Receiver::close()` marks the channel
+        // without draining, so a close()d-but-still-full channel must
+        // not take the drop path either.
         if self.cmd_tx.capacity() == 0 && !self.cmd_tx.is_closed() {
             note_drop(&self.dropped, "driver queue full");
             return Ok(());
