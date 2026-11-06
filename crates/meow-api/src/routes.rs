@@ -4572,10 +4572,13 @@ async fn refresh_rule_provider(
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         // Keep the existing last-good owner; only the response changes. Do
         // not echo the error chain, which may contain a private URL/payload.
-        Err(_) => msg_err(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Rule provider refresh failed; the last valid rules are unchanged",
-        ),
+        Err(_) => {
+            tracing::warn!(provider = %name, "rule-provider refresh failed");
+            msg_err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Rule provider refresh failed; the last valid rules are unchanged",
+            )
+        }
     }
 }
 
@@ -5675,3 +5678,4 @@ mod global_route_binding_tests {
         assert_eq!(iface(), None, "nothing runs, so nothing stays bound");
     }
 }
+
