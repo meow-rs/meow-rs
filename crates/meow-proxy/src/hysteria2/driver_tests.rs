@@ -1,6 +1,7 @@
 //! Portable QUIC peer for lifecycle, flow-control and TCP response regressions.
 use super::*;
 use crate::hysteria2::ReconnectableClient;
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::{sleep, timeout};
 
@@ -26,6 +27,20 @@ struct Peer {
     read_payload: Arc<AtomicBool>,
     stop_writes: Arc<AtomicBool>,
     auth_seen: mpsc::UnboundedReceiver<SocketAddr>,
+    /// Datagrams the peer received that are too small to carry payload (ACK-only).
+    small_rx: Arc<AtomicUsize>,
+    /// Datagrams the peer sent that are big enough to carry payload.
+    big_tx: Arc<AtomicUsize>,
+    /// Bytes to push down every established stream, taken (reset to 0) by the peer.
+    flood: Arc<AtomicUsize>,
+    /// Yield to the client after every datagram sent, so it sees packets one
+    /// at a time like a paced network instead of one loopback burst.
+    trickle: Arc<AtomicBool>,
+    /// Set to make the peer send one lone QUIC datagram (taken by the peer).
+    lone_dgram: Arc<AtomicBool>,
+    /// Microseconds from the peer's last payload datagram to the next ACK-only
+    /// datagram it received; `u64::MAX` until that ACK arrives.
+    ack_lag_us: Arc<AtomicU64>,
     task: DriverTask,
 }
 
@@ -98,6 +113,17 @@ fn peer_on(
     let stop_writes = Arc::new(AtomicBool::new(false));
     let stop_requested = Arc::clone(&stop_writes);
     let (auth_tx, auth_seen) = mpsc::unbounded_channel();
+    let small_rx = Arc::new(AtomicUsize::new(0));
+    let big_tx = Arc::new(AtomicUsize::new(0));
+    let (small_rx_task, big_tx_task) = (Arc::clone(&small_rx), Arc::clone(&big_tx));
+    let flood = Arc::new(AtomicUsize::new(0));
+    let flood_task = Arc::clone(&flood);
+    let trickle = Arc::new(AtomicBool::new(false));
+    let trickle_task = Arc::clone(&trickle);
+    let lone_dgram = Arc::new(AtomicBool::new(false));
+    let lone_dgram_task = Arc::clone(&lone_dgram);
+    let ack_lag_us = Arc::new(AtomicU64::new(u64::MAX));
+    let ack_lag_task = Arc::clone(&ack_lag_us);
     let task = DriverTask(tokio::spawn(async move {
         let mut incoming = vec![0; 65535];
         let (n, remote) = socket.recv_from(&mut incoming).await.unwrap();
@@ -119,6 +145,7 @@ fn peer_on(
         let mut pending: HashMap<u64, VecDeque<u8>> = HashMap::new();
         let mut finished = std::collections::HashSet::new();
         let mut out = [0; 1500];
+        let mut last_data_tx = std::time::Instant::now();
         loop {
             if conn.is_established() && h3.is_none() {
                 h3 = Some(
@@ -221,6 +248,15 @@ fn peer_on(
                         }
                     }
                 }
+                if lone_dgram_task.swap(false, Ordering::Relaxed) {
+                    conn.dgram_send(&[0x55; 300]).unwrap();
+                }
+                let flooded = flood_task.swap(0, Ordering::Relaxed);
+                if flooded > 0 {
+                    for &id in &established {
+                        pending.entry(id).or_default().extend(vec![0x37; flooded]);
+                    }
+                }
                 for (&id, data) in &mut pending {
                     while !data.is_empty() {
                         match conn.stream_send(id, data.make_contiguous(), false) {
@@ -241,7 +277,16 @@ fn peer_on(
                 }
             }
             while let Ok((n, info)) = conn.send(&mut out) {
+                if n > 1000 {
+                    big_tx_task.fetch_add(1, Ordering::Relaxed);
+                }
+                if n >= 100 {
+                    last_data_tx = std::time::Instant::now();
+                }
                 socket.send_to(&out[..n], info.to).await.unwrap();
+                if trickle_task.load(Ordering::Relaxed) {
+                    tokio::task::yield_now().await;
+                }
             }
             if conn.is_closed() {
                 break;
@@ -249,6 +294,13 @@ fn peer_on(
             tokio::select! {
                 packet = socket.recv_from(&mut incoming) => {
                     let (n, from) = packet.unwrap();
+                    if n < 100 {
+                        small_rx_task.fetch_add(1, Ordering::Relaxed);
+                        if ack_lag_task.load(Ordering::Relaxed) == u64::MAX {
+                            ack_lag_task
+                                .store(last_data_tx.elapsed().as_micros() as u64, Ordering::Relaxed);
+                        }
+                    }
                     let _ = conn.recv(&mut incoming[..n], quiche::RecvInfo { from, to: local });
                 }
                 _ = sleep_opt(conn.timeout()) => conn.on_timeout(),
@@ -261,6 +313,12 @@ fn peer_on(
         read_payload,
         stop_writes,
         auth_seen,
+        small_rx,
+        big_tx,
+        flood,
+        trickle,
+        lone_dgram,
+        ack_lag_us,
         task,
     }
 }
@@ -558,4 +616,76 @@ async fn reset_releases_the_cached_connection_and_reconnects() {
         .unwrap()
         .expect("the post-reset dial authenticated on a new connection");
     assert!(client.reset(), "the reconnected connection was cached");
+}
+
+/// A pure download: the client writes nothing, so no upstream data carries its
+/// ACKs. With the peer's datagrams arriving one at a time, held-back ACKs must
+/// cut the ACK-only packets well below one per payload packet (a driver that
+/// flushes on every wakeup answers more than half of them).
+#[tokio::test]
+async fn download_acks_are_coalesced_across_bursts() {
+    let peer = peer(true, Some(0), 16).await;
+    let client = peer.client(false);
+    let mut stream = timeout(TEST_TIMEOUT, client.tcp_connect(TARGET))
+        .await
+        .unwrap()
+        .unwrap();
+    round_trip(&mut stream).await;
+    // Let the application-write quiet window pass and the handshake ACKs drain.
+    sleep(Duration::from_millis(50)).await;
+    let (small0, big0) = (
+        peer.small_rx.load(Ordering::Relaxed),
+        peer.big_tx.load(Ordering::Relaxed),
+    );
+    let size = 4 * 1024 * 1024;
+    peer.trickle.store(true, Ordering::Relaxed);
+    peer.flood.store(size, Ordering::Relaxed);
+    let mut got = vec![0u8; size];
+    timeout(Duration::from_secs(15), stream.read_exact(&mut got))
+        .await
+        .unwrap()
+        .unwrap();
+    let (small, big) = (
+        peer.small_rx.load(Ordering::Relaxed) - small0,
+        peer.big_tx.load(Ordering::Relaxed) - big0,
+    );
+    eprintln!("DOWNLOAD_ACK_RATIO small_rx={small} big_tx={big}");
+    assert!(big > 1000, "peer sent only {big} payload packets");
+    assert!(
+        small * 3 < big,
+        "{small} ACK-only packets for {big} payload packets"
+    );
+}
+
+/// A lone packet (a single QUIC datagram, nothing for a reader to wake the
+/// driver with) must not wait for more packets: its ACK leaves within the
+/// coalescing deadline, not at quiche's 25 ms ACK timer.
+#[tokio::test]
+async fn lone_packet_is_acked_within_the_coalescing_deadline() {
+    let peer = peer(true, Some(0), 16).await;
+    let client = peer.client(false);
+    let mut stream = timeout(TEST_TIMEOUT, client.tcp_connect(TARGET))
+        .await
+        .unwrap()
+        .unwrap();
+    round_trip(&mut stream).await;
+    sleep(Duration::from_millis(50)).await;
+    let mut lags = Vec::new();
+    for _ in 0..10 {
+        peer.ack_lag_us.store(u64::MAX, Ordering::Relaxed);
+        peer.lone_dgram.store(true, Ordering::Relaxed);
+        timeout(TEST_TIMEOUT, async {
+            while peer.ack_lag_us.load(Ordering::Relaxed) == u64::MAX {
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the lone packet was never acknowledged");
+        lags.push(peer.ack_lag_us.load(Ordering::Relaxed));
+        sleep(Duration::from_millis(50)).await;
+    }
+    lags.sort_unstable();
+    let median = lags[lags.len() / 2];
+    eprintln!("LONE_ACK_LAG_US {lags:?}");
+    assert!(median < 12_000, "median ACK lag {median} us: {lags:?}");
 }
