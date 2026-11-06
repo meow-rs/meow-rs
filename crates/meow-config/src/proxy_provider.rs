@@ -308,20 +308,9 @@ impl ProxyProvider {
         let exclude_filter = compile_opt_regex(&raw.exclude_filter, "exclude-filter")?;
         let exclude_type = split_exclude_types(raw.exclude_type.as_deref());
 
-        let health_check = build_health_check_config(raw.health_check.as_ref());
-        if health_check.is_some() {
-            // The config is honoured by the manual
-            // `GET /providers/proxies/{name}/healthcheck` endpoint, but
-            // nothing probes provider members on a timer (mihomo schedules
-            // the provider health-check alongside `interval`). Warn once
-            // per build so the config isn't silently half-wired.
-            warn!(
-                provider = %name,
-                "proxy-provider 'health-check' is stored but not periodically \
-                 scheduled — members are probed only via the manual \
-                 healthcheck endpoint or a group's own health check"
-            );
-        }
+        // Probed every `interval` by `ProxyProviderRefreshSupervisor`.
+        let health_check = build_health_check_config(raw.health_check.as_ref())
+            .map_err(|e| format!("proxy-provider '{name}': health-check {e}"))?;
         let header = raw
             .header
             .as_ref()
@@ -1781,17 +1770,33 @@ async fn read_cache(path: Option<&Path>, name: &str) -> Result<String, String> {
         .map_err(|e| format!("proxy-provider '{name}': no cache at {path:?}: {e}"))
 }
 
-fn build_health_check_config(raw: Option<&RawHealthCheck>) -> Option<HealthCheckConfig> {
-    let hc = raw?;
-    if !hc.enable.unwrap_or(true) {
-        return None;
+fn build_health_check_config(
+    raw: Option<&RawHealthCheck>,
+) -> Result<Option<HealthCheckConfig>, String> {
+    let Some(hc) = raw else { return Ok(None) };
+    // mihomo's `Enable` has no default: a bare block does not probe.
+    if !hc.enable.unwrap_or(false) {
+        return Ok(None);
     }
-    Some(HealthCheckConfig {
+    if let Some(spec) = hc.expected_status.as_deref() {
+        meow_proxy::health::validate_expected_status(spec)?;
+    }
+    if hc.lazy == Some(true) {
+        static LAZY: std::sync::Once = std::sync::Once::new();
+        LAZY.call_once(|| {
+            warn!("proxy-provider health-check `lazy` is not honoured: members are probed every interval");
+        });
+    }
+    Ok(Some(HealthCheckConfig {
         url: hc
             .url
             .clone()
             .unwrap_or_else(|| "https://www.gstatic.com/generate_204".to_string()),
-        interval: hc.interval.unwrap_or(300),
+        // mihomo maps an explicit 0 to the default, never to "every tick".
+        interval: match hc.interval {
+            None | Some(0) => 300,
+            Some(v) => v,
+        },
         // `timeout` is milliseconds consumed by `tokio::time::timeout`
         // (provider healthcheck API) — clamp to the shared duration
         // ceiling so an absurd value degrades to "probe never fires"
@@ -1802,7 +1807,7 @@ fn build_health_check_config(raw: Option<&RawHealthCheck>) -> Option<HealthCheck
             .min(meow_common::MAX_DURATION_SECS.saturating_mul(1000)),
         expected_status: hc.expected_status.clone().unwrap_or_default(),
         lazy: hc.lazy.unwrap_or(false),
-    })
+    }))
 }
 
 #[cfg(test)]
