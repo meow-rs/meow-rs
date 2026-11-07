@@ -124,8 +124,10 @@ Handshake flow:
    - SNI comes from `servername`, falling back to `server`.
    - ALPN comes from YAML `alpn`.
    - `key_share` sends X25519; with `support-x25519mlkem768: true` an
-     X25519MLKEM768 share (sharing the X25519 key) goes first, as current Xray
-     REALITY servers require.
+     X25519MLKEM768 share goes first — the ML-KEM-768 encapsulation key
+     concatenated with a dedicated X25519 key of its own (not the REALITY
+     auth share's; one key in both shares is a "not Xray" fingerprint
+     tell), as current Xray REALITY servers require.
    - `session_id` contains Reality auth data: version, timestamp, and short-id,
      sealed with an AES-GCM key derived from the auth key.
 4. Send the plaintext TLS handshake record.

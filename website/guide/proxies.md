@@ -274,6 +274,11 @@ The most feature-rich protocol: TLS, REALITY, XTLS-Vision flow, and five transpo
     short-id: "0123abcd"
 ```
 
+meow reports a `ClientVer` tracking a current Xray release (26.10.31). A
+server pinning `maxClientVer` below that — or `minClientVer` above it —
+diverts the handshake to `dest`; the dial then fails with a REALITY
+authentication error rather than silently connecting to the wrong target.
+
 ### Transport options
 
 These sub-blocks apply to VLESS (and, where noted, VMess) when `network` selects them:

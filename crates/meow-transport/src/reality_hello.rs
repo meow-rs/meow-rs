@@ -31,6 +31,8 @@ const GROUP_P256: u16 = 0x0017;
 pub(crate) const GROUP_X25519_MLKEM768: u16 = 0x11ec;
 
 const EXT_PADDING: u16 = 21;
+/// `key_share` extension id; shared with `reality_tls`'s ServerHello parse.
+pub(crate) const EXT_KEY_SHARE: u16 = 51;
 
 /// HPKE AEAD ids offered by a GREASE `encrypted_client_hello`.
 const HPKE_AEAD_AES_128_GCM: u16 = 0x0001;
@@ -353,7 +355,8 @@ fn put_u16(value: u16, out: &mut Vec<u8>) {
 }
 
 /// Append `values` as a `u16`-length-prefixed list, swapping the GREASE
-/// placeholder for `grease`.
+/// placeholder for `grease`. `values` are the profiles' static tables (a
+/// few entries each), so the `* 2` length always fits a u16.
 fn put_u16_list(values: &[u16], grease: u16, out: &mut Vec<u8>) {
     put_u16((values.len() * 2) as u16, out);
     for &value in values {
@@ -490,15 +493,28 @@ pub(crate) fn build_client_hello(
             Ext::ExtendedMasterSecret => (23, Vec::new()),
             Ext::RenegotiationInfo => (0xff01, vec![0]),
             Ext::SupportedGroups(groups) => {
-                let mut data = Vec::with_capacity(4 + groups.len() * 2);
+                let mut data = Vec::with_capacity(4 + (groups.len() + 1) * 2);
                 if params.x25519_mlkem768.is_some() {
-                    // Hybrid right after the leading GREASE (if any).
-                    let mut with_pq = Vec::with_capacity(groups.len() + 1);
+                    // Hybrid right after the leading GREASE (if any),
+                    // emitted in place — no intermediate group list.
+                    let list_len = u16::try_from((groups.len() + 1) * 2).map_err(|_| {
+                        TransportError::Config("supported_groups list is too long".into())
+                    })?;
+                    put_u16(list_len, &mut data);
                     let lead = usize::from(groups.first() == Some(&GREASE));
-                    with_pq.extend_from_slice(&groups[..lead]);
-                    with_pq.push(GROUP_X25519_MLKEM768);
-                    with_pq.extend_from_slice(&groups[lead..]);
-                    put_u16_list(&with_pq, grease.group, &mut data);
+                    let mut put = |group: u16| {
+                        put_u16(
+                            if group == GREASE { grease.group } else { group },
+                            &mut data,
+                        );
+                    };
+                    for &group in &groups[..lead] {
+                        put(group);
+                    }
+                    put(GROUP_X25519_MLKEM768);
+                    for &group in &groups[lead..] {
+                        put(group);
+                    }
                 } else {
                     put_u16_list(groups, grease.group, &mut data);
                 }
@@ -532,8 +548,11 @@ pub(crate) fn build_client_hello(
                     shares.push(0);
                 }
                 if let Some((mlkem, x25519)) = params.x25519_mlkem768 {
+                    let share_len = u16::try_from(mlkem.len() + 32).map_err(|_| {
+                        TransportError::Config("X25519MLKEM768 key share is too long".into())
+                    })?;
                     put_u16(GROUP_X25519_MLKEM768, &mut shares);
-                    put_u16((mlkem.len() + 32) as u16, &mut shares);
+                    put_u16(share_len, &mut shares);
                     shares.extend_from_slice(mlkem);
                     shares.extend_from_slice(x25519);
                 }
@@ -546,10 +565,13 @@ pub(crate) fn build_client_hello(
                     put_u16(point.len() as u16, &mut shares);
                     shares.extend_from_slice(&point);
                 }
+                let shares_len = u16::try_from(shares.len()).map_err(|_| {
+                    TransportError::Config("ClientHello key_share list is too long".into())
+                })?;
                 let mut data = Vec::with_capacity(2 + shares.len());
-                put_u16(shares.len() as u16, &mut data);
+                put_u16(shares_len, &mut data);
                 data.extend_from_slice(&shares);
-                (51, data)
+                (EXT_KEY_SHARE, data)
             }
             Ext::PskModes => (45, vec![1, 1]),
             Ext::SupportedVersions(versions) => {
@@ -727,25 +749,84 @@ mod tests {
             (
                 HelloProfile::Firefox,
                 &[
-                    0, 23, 0xff01, 10, 11, 35, 16, 5, 34, 51, 43, 13, 45, 28, 0xfe0d,
+                    0,
+                    23,
+                    0xff01,
+                    10,
+                    11,
+                    35,
+                    16,
+                    5,
+                    34,
+                    EXT_KEY_SHARE,
+                    43,
+                    13,
+                    45,
+                    28,
+                    0xfe0d,
                 ],
             ),
             (
                 HelloProfile::Safari,
                 &[
-                    GREASE, 0, 23, 0xff01, 10, 11, 16, 5, 13, 18, 51, 45, 43, 27, GREASE, 21,
+                    GREASE,
+                    0,
+                    23,
+                    0xff01,
+                    10,
+                    11,
+                    16,
+                    5,
+                    13,
+                    18,
+                    EXT_KEY_SHARE,
+                    45,
+                    43,
+                    27,
+                    GREASE,
+                    21,
                 ],
             ),
             (
                 HelloProfile::Ios,
                 &[
-                    GREASE, 0, 23, 0xff01, 10, 11, 16, 5, 13, 18, 51, 45, 43, GREASE, 21,
+                    GREASE,
+                    0,
+                    23,
+                    0xff01,
+                    10,
+                    11,
+                    16,
+                    5,
+                    13,
+                    18,
+                    EXT_KEY_SHARE,
+                    45,
+                    43,
+                    GREASE,
+                    21,
                 ],
             ),
             (
                 HelloProfile::Edge,
                 &[
-                    GREASE, 0, 23, 0xff01, 10, 11, 35, 16, 5, 13, 18, 51, 45, 43, 27, GREASE, 21,
+                    GREASE,
+                    0,
+                    23,
+                    0xff01,
+                    10,
+                    11,
+                    35,
+                    16,
+                    5,
+                    13,
+                    18,
+                    EXT_KEY_SHARE,
+                    45,
+                    43,
+                    27,
+                    GREASE,
+                    21,
                 ],
             ),
         ];
@@ -782,7 +863,7 @@ mod tests {
             assert!(is_grease(u16_at(versions, 1)));
             // key_share: GREASE entry (same value as the group list's),
             // then the real X25519 share.
-            let shares = ext(&parsed, 51);
+            let shares = ext(&parsed, EXT_KEY_SHARE);
             assert_eq!(u16_at(shares, 2), u16_at(groups, 2));
             assert_eq!(&shares[4..7], &[0, 1, 0]);
             assert_eq!(u16_at(shares, 7), GROUP_X25519);
@@ -795,7 +876,24 @@ mod tests {
     #[test]
     fn chrome_shuffles_extensions_but_keeps_the_set() {
         let mut expected: Vec<u16> = vec![
-            GREASE, 0, 23, 0xff01, 10, 11, 35, 16, 5, 13, 18, 51, 45, 43, 27, 17513, 0xfe0d, GREASE,
+            GREASE,
+            0,
+            23,
+            0xff01,
+            10,
+            11,
+            35,
+            16,
+            5,
+            13,
+            18,
+            EXT_KEY_SHARE,
+            45,
+            43,
+            27,
+            17513,
+            0xfe0d,
+            GREASE,
         ];
         expected.sort_unstable();
 
@@ -838,7 +936,7 @@ mod tests {
     #[test]
     fn firefox_sends_x25519_and_a_valid_p256_share() {
         let parsed = parse(&build(HelloProfile::Firefox, &[]));
-        let shares = ext(&parsed, 51);
+        let shares = ext(&parsed, EXT_KEY_SHARE);
         assert_eq!(usize::from(u16_at(shares, 0)), shares.len() - 2);
         assert_eq!(u16_at(shares, 2), GROUP_X25519);
         assert_eq!(&shares[6..38], &[3u8; 32]);
@@ -847,6 +945,46 @@ mod tests {
         assert_eq!(shares[42], 0x04, "uncompressed point");
         assert_eq!(shares.len(), 42 + 65);
         assert!(!parsed.cipher_suites.iter().any(|c| is_grease(*c)));
+    }
+
+    /// With `x25519_mlkem768` set, the three-part share order is
+    /// hybrid || X25519 || P-256 (Firefox's decoy comes last), and the
+    /// hybrid group leads `supported_groups` (Firefox sends no GREASE).
+    #[test]
+    fn firefox_hybrid_share_precedes_x25519_and_p256() {
+        let ek = [0xABu8; 1184];
+        let hybrid_x = [0xCDu8; 32];
+        let hello = build_client_hello(
+            HelloProfile::Firefox,
+            &HelloParams {
+                server_name: "example.com",
+                alpn: &[],
+                random: &[7u8; 32],
+                x25519_public: &[3u8; 32],
+                x25519_mlkem768: Some((&ek, &hybrid_x)),
+            },
+        )
+        .expect("client hello");
+        let parsed = parse(&hello);
+
+        let shares = ext(&parsed, EXT_KEY_SHARE);
+        assert_eq!(usize::from(u16_at(shares, 0)), shares.len() - 2);
+        assert_eq!(u16_at(shares, 2), GROUP_X25519_MLKEM768);
+        assert_eq!(u16_at(shares, 4), 1184 + 32);
+        assert_eq!(&shares[6..6 + 1184], &ek);
+        let mut pos = 6 + 1184;
+        assert_eq!(&shares[pos..pos + 32], &hybrid_x);
+        pos += 32;
+        assert_eq!(u16_at(shares, pos), GROUP_X25519);
+        assert_eq!(&shares[pos + 4..pos + 36], &[3u8; 32]);
+        pos += 36;
+        assert_eq!(u16_at(shares, pos), GROUP_P256);
+        assert_eq!(u16_at(shares, pos + 2), 65);
+        assert_eq!(shares.len(), pos + 4 + 65);
+
+        let groups = ext(&parsed, 10);
+        assert_eq!(u16_at(groups, 2), GROUP_X25519_MLKEM768);
+        assert_eq!(u16_at(groups, 4), GROUP_X25519);
     }
 
     #[test]

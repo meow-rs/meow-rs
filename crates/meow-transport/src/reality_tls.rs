@@ -46,7 +46,7 @@ const TLS_AES_256_GCM_SHA384: u16 = 0x1302;
 const TLS_CHACHA20_POLY1305_SHA256: u16 = 0x1303;
 
 const GROUP_X25519: u16 = 0x001d;
-use crate::reality_hello::GROUP_X25519_MLKEM768;
+use crate::reality_hello::{EXT_KEY_SHARE, GROUP_X25519_MLKEM768};
 const MLKEM768_CIPHERTEXT_BYTES: usize = 1088;
 /// REALITY ClientVer sent in the auth payload: the Xray-core release an
 /// up-to-date Xray client reports (checked against Xray
@@ -183,6 +183,60 @@ struct RealityConnected {
     write_key: RecordKey,
 }
 
+/// Key material for the X25519MLKEM768 hybrid key share: the ML-KEM-768
+/// key pair plus the hybrid's own X25519 pair — uTLS keeps `Ecdhe` and
+/// `MlkemEcdhe` apart, so reusing the REALITY auth key in the hybrid
+/// share is a keyless "not Xray" tell. Named fields, not a tuple: a
+/// reorder is a compile error.
+///
+/// The struct must outlive the ClientHello write and the ServerHello
+/// read (the shares are sent before the peer picks a group), so the
+/// private halves unavoidably span those awaits — but `Drop` runs as
+/// soon as the struct is dropped right after the shared secret is
+/// extracted, before the encrypted-flight loop's awaits. `x_private`
+/// is erased here; boring's own `Drop` cleanses `pq_private`'s seed and
+/// expanded key (`OPENSSL_cleanse` in boring's `mlkem.rs`), so dropping
+/// early is what bounds its exposure.
+struct HybridKeyMaterial {
+    pq_public: boring::mlkem::MlKemPublicKey,
+    pq_private: boring::mlkem::MlKemPrivateKey,
+    x_private: [u8; 32],
+    x_public: [u8; 32],
+}
+
+impl Drop for HybridKeyMaterial {
+    fn drop(&mut self) {
+        self.x_private.fill(0);
+    }
+}
+
+/// TLS 1.3 key-exchange shared secret: a fixed-size X25519 secret, or
+/// the hybrid's ML-KEM-768 || X25519 concat. Keeping X25519 on the
+/// stack means the common (non-PQ) handshake allocates nothing extra.
+/// `Drop` erases whichever half holds secret bytes.
+enum SharedSecret {
+    X25519([u8; 32]),
+    Hybrid(Vec<u8>),
+}
+
+impl SharedSecret {
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::X25519(secret) => secret,
+            Self::Hybrid(secret) => secret,
+        }
+    }
+}
+
+impl Drop for SharedSecret {
+    fn drop(&mut self) {
+        match self {
+            Self::X25519(secret) => secret.fill(0),
+            Self::Hybrid(secret) => secret.fill(0),
+        }
+    }
+}
+
 async fn reality_handshake(
     mut inner: Box<dyn Stream>,
     server_name: &str,
@@ -195,18 +249,21 @@ async fn reality_handshake(
     let client_public = x25519_public_from_private(&client_private);
     let auth_key = x25519(&client_private, &reality.public_key)?;
     // `support-x25519mlkem768`: offer the hybrid share (current Xray REALITY
-    // servers reject a ClientHello without it).
-    // The hybrid's X25519 half is a key of its own, as uTLS keeps
-    // `Ecdhe` and `MlkemEcdhe` apart: one key in both shares is a keyless
-    // "not Xray" tell. The REALITY auth stays on the standalone X25519 key.
-    let mut hybrid = if reality.support_x25519_mlkem768 {
+    // servers reject a ClientHello without it). The REALITY auth stays on
+    // the standalone X25519 key.
+    let hybrid = if reality.support_x25519_mlkem768 {
         let (pq_public, pq_private) =
             boring::mlkem::MlKemPrivateKey::generate(boring::mlkem::Algorithm::MlKem768)
                 .map_err(|e| TransportError::Tls(format!("ML-KEM-768 keygen: {e}")))?;
         let mut x_private = rand::random::<[u8; 32]>();
         clamp_x25519_private(&mut x_private);
         let x_public = x25519_public_from_private(&x_private);
-        Some((pq_public, pq_private, x_private, x_public))
+        Some(HybridKeyMaterial {
+            pq_public,
+            pq_private,
+            x_private,
+            x_public,
+        })
     } else {
         None
     };
@@ -219,7 +276,7 @@ async fn reality_handshake(
         &client_public,
         hybrid
             .as_ref()
-            .map(|(pq_public, _, _, x_public)| (pq_public.as_bytes(), x_public)),
+            .map(|h| (h.pq_public.as_bytes(), &h.x_public)),
         &auth_key,
         reality,
         profile,
@@ -239,21 +296,21 @@ async fn reality_handshake(
         session_id_len = parsed_server_hello.session_id.len(),
         "Reality TLS received ServerHello"
     );
-    if parsed_server_hello.session_id != client_hello[39..71] {
+    if parsed_server_hello.session_id != &client_hello[39..71] {
         return Err(TransportError::Tls(
             "Reality TLS: server did not echo ClientHello session_id".into(),
         ));
     }
-    let shared_secret: Vec<u8> = match parsed_server_hello.group {
+    let shared_secret = match parsed_server_hello.group {
         GROUP_X25519 => {
             let mut share = [0u8; 32];
-            share.copy_from_slice(&parsed_server_hello.key_share);
-            x25519(&client_private, &share)?.to_vec()
+            share.copy_from_slice(parsed_server_hello.key_share);
+            SharedSecret::X25519(x25519(&client_private, &share)?)
         }
         // X25519MLKEM768: server share = ML-KEM ciphertext || X25519;
         // shared secret = ML-KEM secret || X25519 secret.
         GROUP_X25519_MLKEM768 => {
-            let Some((_, pq_private, x_private, _)) = hybrid.as_ref() else {
+            let Some(hybrid) = hybrid.as_ref() else {
                 return Err(TransportError::Tls(
                     "Reality TLS: server picked X25519MLKEM768, which was not offered".into(),
                 ));
@@ -267,12 +324,15 @@ async fn reality_handshake(
                 })?;
             let mut share = [0u8; 32];
             share.copy_from_slice(x_pub);
-            let pq = pq_private
+            let mut pq = hybrid
+                .pq_private
                 .decapsulate(ct)
                 .map_err(|e| TransportError::Tls(format!("ML-KEM-768 decapsulation: {e}")))?;
-            let mut secret = pq.to_vec();
-            secret.extend_from_slice(&x25519(x_private, &share)?);
-            secret
+            let mut secret = Vec::with_capacity(pq.len() + 32);
+            secret.extend_from_slice(&pq);
+            pq.fill(0);
+            secret.extend_from_slice(&x25519(&hybrid.x_private, &share)?);
+            SharedSecret::Hybrid(secret)
         }
         other => {
             return Err(TransportError::Tls(format!(
@@ -280,13 +340,15 @@ async fn reality_handshake(
             )))
         }
     };
-    if let Some((_, _, x_private, _)) = hybrid.as_mut() {
-        x_private.fill(0);
-    }
+    // Key exchange is done: drop the hybrid private material now — its
+    // `Drop` erases the X25519 half and boring cleanses the ML-KEM half —
+    // instead of keeping it alive across the flight loop's awaits.
+    drop(hybrid);
     transcript.extend_from_slice(&server_hello);
 
     let cipher = CipherSuite::try_from(parsed_server_hello.cipher_suite)?;
-    let hs = HandshakeKeys::derive(cipher, &shared_secret, &transcript);
+    let hs = HandshakeKeys::derive(cipher, shared_secret.as_bytes(), &transcript);
+    drop(shared_secret);
     let mut server_hs = hs.server;
     let mut client_hs = hs.client;
 
@@ -806,16 +868,17 @@ async fn read_record<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<TlsRecord
     }))
 }
 
-struct ParsedServerHello {
+/// All fields borrow the raw ServerHello: parsing allocates nothing.
+struct ParsedServerHello<'a> {
     cipher_suite: u16,
-    session_id: Vec<u8>,
+    session_id: &'a [u8],
     /// `GROUP_X25519` (32-byte share) or `GROUP_X25519_MLKEM768`
     /// (ML-KEM-768 ciphertext || X25519 share).
     group: u16,
-    key_share: Vec<u8>,
+    key_share: &'a [u8],
 }
 
-fn parse_server_hello(raw: &[u8]) -> Result<ParsedServerHello> {
+fn parse_server_hello(raw: &[u8]) -> Result<ParsedServerHello<'_>> {
     if raw.len() < 42 || raw[0] != HS_SERVER_HELLO {
         return Err(TransportError::Tls("invalid ServerHello".into()));
     }
@@ -842,7 +905,7 @@ fn parse_server_hello(raw: &[u8]) -> Result<ParsedServerHello> {
     }
     let mut pos = 34;
     let sid_len = take_u8(body, &mut pos)? as usize;
-    let session_id = take(body, &mut pos, sid_len)?.to_vec();
+    let session_id = take(body, &mut pos, sid_len)?;
     let cipher_suite = take_u16(body, &mut pos)?;
     let compression = take_u8(body, &mut pos)?;
     if compression != 0 {
@@ -861,7 +924,7 @@ fn parse_server_hello(raw: &[u8]) -> Result<ParsedServerHello> {
         let data = take(exts, &mut epos, len)?;
         match typ {
             43 => tls13 = data == [0x03, 0x04],
-            51 => {
+            EXT_KEY_SHARE => {
                 let mut p = 0;
                 let group = take_u16(data, &mut p)?;
                 let klen = take_u16(data, &mut p)? as usize;
@@ -886,7 +949,7 @@ fn parse_server_hello(raw: &[u8]) -> Result<ParsedServerHello> {
                         bytes.len()
                     )));
                 }
-                key_share = Some((group, bytes.to_vec()));
+                key_share = Some((group, bytes));
             }
             _ => {}
         }
@@ -2195,45 +2258,86 @@ mod tests {
 
     // ─── Full handshake: unbounded pre-auth flood is rejected (issue #430) ────
 
-    /// Extract the client's X25519 key share from a raw (framed) ClientHello,
-    /// mirroring the layout `build_reality_client_hello` writes, so the fake
-    /// server below can complete the ECDH and derive matching handshake keys.
-    fn extract_client_key_share(client_hello: &[u8]) -> [u8; 32] {
-        assert_eq!(client_hello[0], HS_CLIENT_HELLO);
-        let mut pos = 4 + 2 + 32; // header + legacy_version + random
-        let sid_len = client_hello[pos] as usize;
-        pos += 1 + sid_len;
-        let cs_len = u16::from_be_bytes([client_hello[pos], client_hello[pos + 1]]) as usize;
-        pos += 2 + cs_len;
-        let cm_len = client_hello[pos] as usize;
-        pos += 1 + cm_len;
-        let ext_len = u16::from_be_bytes([client_hello[pos], client_hello[pos + 1]]) as usize;
-        pos += 2;
-        let exts_end = pos + ext_len;
-        while pos < exts_end {
-            let typ = u16::from_be_bytes([client_hello[pos], client_hello[pos + 1]]);
-            let len = u16::from_be_bytes([client_hello[pos + 2], client_hello[pos + 3]]) as usize;
-            let data = &client_hello[pos + 4..pos + 4 + len];
-            if typ == 51 {
-                // ClientHello key_share carries a 2-byte list length, then
-                // KeyShareEntry items (group u16, len u16, key bytes); a
-                // browser profile may put a GREASE entry ahead of X25519.
-                let mut p = 2;
-                while p < data.len() {
-                    let group = u16::from_be_bytes([data[p], data[p + 1]]);
-                    let klen = u16::from_be_bytes([data[p + 2], data[p + 3]]) as usize;
-                    if group == GROUP_X25519 {
-                        let mut key = [0u8; 32];
-                        key.copy_from_slice(&data[p + 4..p + 4 + klen]);
-                        return key;
-                    }
-                    p += 4 + klen;
-                }
-                panic!("key_share carried no X25519 entry");
-            }
-            pos += 4 + len;
+    /// `(type, data)` of every extension in a framed ClientHello, in wire
+    /// order. Every read is checked (`take`/`take_u16`), so a malformed
+    /// hello fails the test on a parse error instead of panicking inside
+    /// the helper on a stray index.
+    fn client_extensions(client_hello: &[u8]) -> Result<Vec<(u16, &[u8])>> {
+        let mut pos = 0;
+        if take_u8(client_hello, &mut pos)? != HS_CLIENT_HELLO {
+            return Err(TransportError::Tls("test: not a ClientHello".into()));
         }
-        panic!("ClientHello carried no key_share extension");
+        take_u24(client_hello, &mut pos)?; // handshake length
+        take(client_hello, &mut pos, 2 + 32)?; // legacy_version + random
+        let sid_len = take_u8(client_hello, &mut pos)? as usize;
+        take(client_hello, &mut pos, sid_len)?;
+        let cs_len = take_u16(client_hello, &mut pos)? as usize;
+        take(client_hello, &mut pos, cs_len)?;
+        let cm_len = take_u8(client_hello, &mut pos)? as usize;
+        take(client_hello, &mut pos, cm_len)?;
+        let exts_len = take_u16(client_hello, &mut pos)? as usize;
+        let exts = take(client_hello, &mut pos, exts_len)?;
+        let mut out = Vec::new();
+        let mut epos = 0;
+        while epos < exts.len() {
+            let typ = take_u16(exts, &mut epos)?;
+            let len = take_u16(exts, &mut epos)? as usize;
+            out.push((typ, take(exts, &mut epos, len)?));
+        }
+        Ok(out)
+    }
+
+    /// The body of extension `typ` in a framed ClientHello.
+    fn client_extension(client_hello: &[u8], typ: u16) -> Result<Option<Vec<u8>>> {
+        Ok(client_extensions(client_hello)?
+            .into_iter()
+            .find(|(t, _)| *t == typ)
+            .map(|(_, data)| data.to_vec()))
+    }
+
+    /// Key-share entries of a ClientHello, in order: (group, key bytes).
+    fn client_key_shares(client_hello: &[u8]) -> Result<Vec<(u16, Vec<u8>)>> {
+        let mut out = Vec::new();
+        for (typ, data) in client_extensions(client_hello)? {
+            if typ != EXT_KEY_SHARE {
+                continue;
+            }
+            // ClientHello key_share is a u16-length-prefixed list of
+            // KeyShareEntry items (group u16, len u16, key bytes); a
+            // browser profile may put a GREASE entry ahead of X25519.
+            let mut p = 0;
+            let list_len = take_u16(data, &mut p)? as usize;
+            let list = take(data, &mut p, list_len)?;
+            if p != data.len() {
+                return Err(TransportError::Tls(
+                    "test: trailing bytes after key_share list".into(),
+                ));
+            }
+            let mut q = 0;
+            while q < list.len() {
+                let group = take_u16(list, &mut q)?;
+                let klen = take_u16(list, &mut q)? as usize;
+                out.push((group, take(list, &mut q, klen)?.to_vec()));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Extract the client's X25519 key share from a raw (framed) ClientHello,
+    /// so the fake server below can complete the ECDH and derive matching
+    /// handshake keys.
+    fn extract_client_key_share(client_hello: &[u8]) -> Result<[u8; 32]> {
+        let shares = client_key_shares(client_hello)?;
+        let Some((_, key)) = shares.iter().find(|(g, _)| *g == GROUP_X25519) else {
+            return Err(TransportError::Tls(
+                "test: key_share carried no X25519 entry".into(),
+            ));
+        };
+        let key: &[u8; 32] = key
+            .as_slice()
+            .try_into()
+            .map_err(|_| TransportError::Tls("test: X25519 share is not 32 bytes".into()))?;
+        Ok(*key)
     }
 
     /// Build a minimal, well-formed plaintext ServerHello: TLS 1.3, echoes
@@ -2278,7 +2382,7 @@ mod tests {
         put_u16(group, &mut key_share_entry);
         put_u16(server_public.len() as u16, &mut key_share_entry);
         key_share_entry.extend_from_slice(server_public);
-        push_ext(&mut exts, 51, &key_share_entry);
+        push_ext(&mut exts, EXT_KEY_SHARE, &key_share_entry);
 
         put_u16(exts.len() as u16, &mut body);
         body.extend_from_slice(&exts);
@@ -2315,7 +2419,8 @@ mod tests {
                 .expect("read ClientHello")
                 .expect("ClientHello present");
             let client_hello = client_hello_record.payload;
-            let client_public = extract_client_key_share(&client_hello);
+            let client_public =
+                extract_client_key_share(&client_hello).expect("client X25519 key share");
             let session_id = client_hello[39..71].to_vec();
 
             let mut server_eph_private = rand::random::<[u8; 32]>();
@@ -2426,54 +2531,6 @@ mod tests {
         }
     }
 
-    /// The body of extension `typ` in a framed ClientHello.
-    fn client_extension(client_hello: &[u8], typ: u16) -> Option<Vec<u8>> {
-        let mut pos = 4 + 2 + 32;
-        pos += 1 + client_hello[pos] as usize;
-        pos += 2 + u16::from_be_bytes([client_hello[pos], client_hello[pos + 1]]) as usize;
-        pos += 1 + client_hello[pos] as usize;
-        let ext_len = u16::from_be_bytes([client_hello[pos], client_hello[pos + 1]]) as usize;
-        pos += 2;
-        let exts_end = pos + ext_len;
-        while pos < exts_end {
-            let t = u16::from_be_bytes([client_hello[pos], client_hello[pos + 1]]);
-            let len = u16::from_be_bytes([client_hello[pos + 2], client_hello[pos + 3]]) as usize;
-            if t == typ {
-                return Some(client_hello[pos + 4..pos + 4 + len].to_vec());
-            }
-            pos += 4 + len;
-        }
-        None
-    }
-
-    /// Key-share entries of a ClientHello, in order: (group, key bytes).
-    fn client_key_shares(client_hello: &[u8]) -> Vec<(u16, Vec<u8>)> {
-        let mut pos = 4 + 2 + 32;
-        pos += 1 + client_hello[pos] as usize;
-        pos += 2 + u16::from_be_bytes([client_hello[pos], client_hello[pos + 1]]) as usize;
-        pos += 1 + client_hello[pos] as usize;
-        let ext_len = u16::from_be_bytes([client_hello[pos], client_hello[pos + 1]]) as usize;
-        pos += 2;
-        let exts_end = pos + ext_len;
-        let mut out = Vec::new();
-        while pos < exts_end {
-            let typ = u16::from_be_bytes([client_hello[pos], client_hello[pos + 1]]);
-            let len = u16::from_be_bytes([client_hello[pos + 2], client_hello[pos + 3]]) as usize;
-            let data = &client_hello[pos + 4..pos + 4 + len];
-            if typ == 51 {
-                let mut p = 2;
-                while p < data.len() {
-                    let group = u16::from_be_bytes([data[p], data[p + 1]]);
-                    let klen = u16::from_be_bytes([data[p + 2], data[p + 3]]) as usize;
-                    out.push((group, data[p + 4..p + 4 + klen].to_vec()));
-                    p += 4 + klen;
-                }
-            }
-            pos += 4 + len;
-        }
-        out
-    }
-
     /// `hybrid`: the client offers X25519MLKEM768 and the server picks it
     /// (an Xray REALITY server mirroring a PQ-capable dest).
     async fn full_handshake_round_trip(
@@ -2499,7 +2556,8 @@ mod tests {
                 .expect("read ClientHello")
                 .expect("ClientHello present")
                 .payload;
-            let client_public = extract_client_key_share(&client_hello);
+            let client_public =
+                extract_client_key_share(&client_hello).expect("client X25519 key share");
 
             // Authenticate like a REALITY server: AuthKey from the static
             // key and the client's share, session_id opened with the hello
@@ -2525,14 +2583,18 @@ mod tests {
             clamp_x25519_private(&mut eph_private);
             let x_secret = x25519(&eph_private, &client_public).expect("ECDH");
             let eph_public = x25519_public_from_private(&eph_private);
-            let shares = client_key_shares(&client_hello);
+            let shares = client_key_shares(&client_hello).expect("parse ClientHello key shares");
             let hybrid_at = shares.iter().position(|(g, _)| *g == GROUP_X25519_MLKEM768);
             let x25519_at = shares.iter().position(|(g, _)| *g == GROUP_X25519);
             if hybrid {
-                let groups = client_extension(&client_hello, 10).expect("supported_groups");
+                let groups = client_extension(&client_hello, 10)
+                    .expect("parse ClientHello extensions")
+                    .expect("supported_groups");
                 let groups: Vec<u16> = groups[2..]
-                    .chunks(2)
-                    .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|c| u16::from_be_bytes(*c))
                     .filter(|g| g & 0x0f0f != 0x0a0a)
                     .collect();
                 assert_eq!(
@@ -2657,6 +2719,73 @@ mod tests {
         let mut pong = [0u8; 4];
         stream.read_exact(&mut pong).await.unwrap();
         assert_eq!(&pong, b"pong", "{profile:?} / 0x{suite:04x}");
+
+        server_task.await.expect("server task must not panic");
+    }
+
+    /// The mirror of `pick_hybrid` in the round-trip matrix: with
+    /// `support_x25519_mlkem768` off the client offers no hybrid share, so
+    /// a server (or on-path peer) that answers with one must be rejected —
+    /// the client holds no ML-KEM private key to decapsulate it with, and
+    /// silently continuing is not an option.
+    #[tokio::test]
+    async fn reality_handshake_rejects_hybrid_pick_when_not_offered() {
+        let (client_io, mut server_io) = tokio::io::duplex(1024 * 1024);
+
+        let reality = RealityConfig {
+            public_key: [0x11u8; 32],
+            short_id: [1, 2, 3, 4, 5, 6, 7, 8],
+            support_x25519_mlkem768: false,
+        };
+
+        let server_task = tokio::spawn(async move {
+            let client_hello = read_record(&mut server_io)
+                .await
+                .expect("read ClientHello")
+                .expect("ClientHello present")
+                .payload;
+            let shares = client_key_shares(&client_hello).expect("parse ClientHello key shares");
+            assert!(
+                shares.iter().all(|(g, _)| *g != GROUP_X25519_MLKEM768),
+                "client must not offer the hybrid share"
+            );
+            // A well-formed hybrid share: the group-shape check in
+            // `parse_server_hello` passes, so the "was not offered" guard
+            // is what rejects the handshake.
+            let share = vec![0xCCu8; MLKEM768_CIPHERTEXT_BYTES + 32];
+            let server_hello = build_fake_server_hello_group(
+                &client_hello[39..71],
+                GROUP_X25519_MLKEM768,
+                &share,
+                TLS_AES_128_GCM_SHA256,
+            );
+            server_io
+                .write_all(&wrap_plain_record(TLS_RECORD_HANDSHAKE, &server_hello).unwrap())
+                .await
+                .expect("write ServerHello");
+            server_io.flush().await.expect("flush ServerHello");
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            reality_handshake(
+                Box::new(client_io),
+                "example.com",
+                &[],
+                &reality,
+                HelloProfile::Chrome,
+            ),
+        )
+        .await
+        .expect("handshake must not hang");
+
+        let Err(err) = result else {
+            panic!("an unoffered X25519MLKEM768 pick must be rejected, not accepted");
+        };
+        assert!(
+            matches!(&err, TransportError::Tls(msg) if msg.contains("was not offered")),
+            "unexpected error: {err:?}"
+        );
 
         server_task.await.expect("server task must not panic");
     }
