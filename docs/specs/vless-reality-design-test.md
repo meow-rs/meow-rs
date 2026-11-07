@@ -2,7 +2,7 @@
 
 **Status:** draft for issue #225  
 **Branch:** `fix/vless-reality`  
-**Last updated:** 2026-06-16  
+**Last updated:** 2026-11-07  
 
 This document records the local implementation design and validation method for
 VLESS + Reality + XTLS-Vision. The runtime test sample is
@@ -124,10 +124,11 @@ Handshake flow:
    - SNI comes from `servername`, falling back to `server`.
    - ALPN comes from YAML `alpn`.
    - `key_share` sends X25519; with `support-x25519mlkem768: true` an
-     X25519MLKEM768 share goes first — the ML-KEM-768 encapsulation key
-     concatenated with a dedicated X25519 key of its own (not the REALITY
-     auth share's; one key in both shares is a "not Xray" fingerprint
-     tell), as current Xray REALITY servers require.
+     X25519MLKEM768 share is the first real share, ahead of X25519 (a
+     GREASE entry may still lead the list) — the ML-KEM-768 encapsulation
+     key concatenated with a dedicated X25519 key of its own (not the
+     REALITY auth share's; one key in both shares is a "not Xray"
+     fingerprint tell), as current Xray REALITY servers require.
    - `session_id` contains Reality auth data: version, timestamp, and short-id,
      sealed with an AES-GCM key derived from the auth key.
 4. Send the plaintext TLS handshake record.
@@ -135,7 +136,8 @@ Handshake flow:
    - The server echoed the ClientHello `session_id`.
    - TLS 1.3 was negotiated.
    - `key_share` is X25519, or X25519MLKEM768 when it was offered.
-   - The current supported cipher suite is `TLS_AES_128_GCM_SHA256`.
+   - The picked cipher suite is one of `TLS_AES_128_GCM_SHA256`,
+     `TLS_AES_256_GCM_SHA384` or `TLS_CHACHA20_POLY1305_SHA256`.
 6. Run the handwritten TLS 1.3 handshake/application key schedule.
 7. Decrypt EncryptedExtensions, Certificate, CertificateVerify, and Finished.
 8. Verify the Reality certificate signature HMAC with the Reality auth key.

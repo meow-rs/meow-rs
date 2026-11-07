@@ -34,12 +34,13 @@ tls = [
 # implied) so existing `--features boring-tls` invocations and downstream
 # manifests keep building. New code should enable `tls`.
 boring-tls = ["tls", "reality"]
-# reality: xray REALITY client handshake (issue #377). The record layer, the
-# X25519 / HKDF crypto (ML-KEM-768 for the hybrid share comes from boring) and the browser-shaped ClientHello builder
-# (`reality_hello.rs`, issue #708) are all in-tree (`reality_tls.rs`) on top
-# of the always-present aes-gcm/hmac/sha2 deps. BoringSSL (`tls`) seals and
-# opens the records, all three TLS 1.3 suites, and mints the decoy P-256 key
-# share of the `firefox` profile.
+# reality: xray REALITY client handshake (issue #377). The record layer,
+# the X25519 / HKDF crypto (the hybrid share's ML-KEM-768 comes from
+# boring) and the browser-shaped ClientHello builder (`reality_hello.rs`,
+# issue #708) are all in-tree (`reality_tls.rs`) on top of the
+# always-present aes-gcm/hmac/sha2 deps. BoringSSL (`tls`) seals and
+# opens the records, all three TLS 1.3 suites, and mints the decoy P-256
+# key share of the `firefox` profile.
 reality = [
     "tls",
     "boring/mlkem",

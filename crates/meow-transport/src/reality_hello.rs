@@ -24,7 +24,8 @@ use crate::{Result, TransportError};
 /// (RFC 8701); which value depends on the list the slot sits in.
 const GREASE: u16 = 0x0a0a;
 
-const GROUP_X25519: u16 = 0x001d;
+/// Shared with `reality_tls`'s ServerHello parse.
+pub(crate) const GROUP_X25519: u16 = 0x001d;
 const GROUP_P256: u16 = 0x0017;
 /// Hybrid post-quantum group (draft-ietf-tls-ecdhe-mlkem); share =
 /// ML-KEM-768 encapsulation key (1184) || X25519 public key (32).
@@ -37,6 +38,12 @@ pub(crate) const EXT_KEY_SHARE: u16 = 51;
 /// HPKE AEAD ids offered by a GREASE `encrypted_client_hello`.
 const HPKE_AEAD_AES_128_GCM: u16 = 0x0001;
 const HPKE_AEAD_CHACHA20_POLY1305: u16 = 0x0003;
+
+/// Rough size the hybrid offer adds to a ClientHello — extension
+/// header(4) + key_share entry (group 2 + len 2 + ML-KEM-768 ek 1184 +
+/// X25519 32) + a `supported_groups` slot(2). Used only to pre-size
+/// buffers; the encoders below stay exact.
+const HYBRID_HELLO_OVERHEAD: usize = 4 + (2 + 2 + 1184 + 32) + 2;
 
 /// One ClientHello extension, in the shape the profile tables need.
 #[derive(Clone, Copy)]
@@ -463,12 +470,20 @@ pub(crate) fn build_client_hello(
     let spec = profile.spec();
     let grease = GreaseValues::random();
 
+    // The hybrid share adds ~1.2 KiB of key material; sizing the buffers
+    // for it up front avoids a chain of doublings when it is appended.
+    let hybrid_overhead = if params.x25519_mlkem768.is_some() {
+        HYBRID_HELLO_OVERHEAD
+    } else {
+        0
+    };
+
     let mut order: Vec<Ext> = spec.extensions.to_vec();
     if spec.shuffle {
         shuffle_unpinned(&mut order);
     }
 
-    let mut body = Vec::with_capacity(1024);
+    let mut body = Vec::with_capacity(1024 + hybrid_overhead);
     body.extend_from_slice(&[0x03, 0x03]);
     body.extend_from_slice(params.random);
     body.push(32);
@@ -476,7 +491,7 @@ pub(crate) fn build_client_hello(
     put_u16_list(spec.cipher_suites, grease.cipher, &mut body);
     body.extend_from_slice(&[1, 0]); // compression: null only
 
-    let mut exts = Vec::with_capacity(768);
+    let mut exts = Vec::with_capacity(768 + hybrid_overhead);
     let mut grease_seen = false;
     for ext in order {
         let (typ, data): (u16, Vec<u8>) = match ext {
@@ -541,7 +556,7 @@ pub(crate) fn build_client_hello(
                 grease: with_grease,
                 p256,
             } => {
-                let mut shares = Vec::with_capacity(128);
+                let mut shares = Vec::with_capacity(128 + hybrid_overhead);
                 if with_grease {
                     put_u16(grease.group, &mut shares);
                     put_u16(1, &mut shares);
@@ -562,7 +577,10 @@ pub(crate) fn build_client_hello(
                 if p256 {
                     let point = p256_decoy_share()?;
                     put_u16(GROUP_P256, &mut shares);
-                    put_u16(point.len() as u16, &mut shares);
+                    let point_len = u16::try_from(point.len()).map_err(|_| {
+                        TransportError::Config("P-256 key share is too long".into())
+                    })?;
+                    put_u16(point_len, &mut shares);
                     shares.extend_from_slice(&point);
                 }
                 let shares_len = u16::try_from(shares.len()).map_err(|_| {
@@ -617,7 +635,10 @@ pub(crate) fn build_client_hello(
             }
         };
         put_u16(typ, &mut exts);
-        put_u16(data.len() as u16, &mut exts);
+        let data_len = u16::try_from(data.len()).map_err(|_| {
+            TransportError::Config(format!("ClientHello extension {typ} is too long"))
+        })?;
+        put_u16(data_len, &mut exts);
         exts.extend_from_slice(&data);
     }
 

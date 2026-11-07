@@ -18,7 +18,10 @@ use sha2::{Digest, Sha256, Sha384, Sha512};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::{
-    reality_hello::{build_client_hello, HelloParams, HelloProfile},
+    reality_hello::{
+        build_client_hello, HelloParams, HelloProfile, EXT_KEY_SHARE, GROUP_X25519,
+        GROUP_X25519_MLKEM768,
+    },
     tls::{RealityConfig, TlsConfig},
     Result, Stream, Transport, TransportError,
 };
@@ -45,8 +48,6 @@ const TLS_AES_128_GCM_SHA256: u16 = 0x1301;
 const TLS_AES_256_GCM_SHA384: u16 = 0x1302;
 const TLS_CHACHA20_POLY1305_SHA256: u16 = 0x1303;
 
-const GROUP_X25519: u16 = 0x001d;
-use crate::reality_hello::{EXT_KEY_SHARE, GROUP_X25519_MLKEM768};
 const MLKEM768_CIPHERTEXT_BYTES: usize = 1088;
 /// REALITY ClientVer sent in the auth payload: the Xray-core release an
 /// up-to-date Xray client reports (checked against Xray
@@ -211,12 +212,12 @@ impl Drop for HybridKeyMaterial {
 }
 
 /// TLS 1.3 key-exchange shared secret: a fixed-size X25519 secret, or
-/// the hybrid's ML-KEM-768 || X25519 concat. Keeping X25519 on the
-/// stack means the common (non-PQ) handshake allocates nothing extra.
-/// `Drop` erases whichever half holds secret bytes.
+/// the hybrid's ML-KEM-768 || X25519 concat (32 + 32 bytes). Both halves
+/// live on the stack, so neither handshake path allocates for the
+/// secret. `Drop` erases whichever half holds secret bytes.
 enum SharedSecret {
     X25519([u8; 32]),
-    Hybrid(Vec<u8>),
+    Hybrid([u8; 64]),
 }
 
 impl SharedSecret {
@@ -286,6 +287,9 @@ async fn reality_handshake(
         .await?;
     inner.flush().await?;
 
+    // CH + SH is ~1 KiB with a plain X25519 share, ~3.1 KiB with the
+    // hybrid — 4 KiB covers both plus the head of the server flight
+    // before the first growth.
     let mut transcript = Vec::with_capacity(4096);
     transcript.extend_from_slice(&client_hello);
 
@@ -328,11 +332,18 @@ async fn reality_handshake(
                 .pq_private
                 .decapsulate(ct)
                 .map_err(|e| TransportError::Tls(format!("ML-KEM-768 decapsulation: {e}")))?;
-            let mut secret = Vec::with_capacity(pq.len() + 32);
-            secret.extend_from_slice(&pq);
+            // Construct the secret before the fallible X25519 exchange:
+            // if the peer's share is a low-order point, `?` returns with
+            // the object live and `Drop` still erases the ML-KEM half —
+            // a bare buffer built up in pieces would leak it unwiped.
+            let mut secret = SharedSecret::Hybrid([0u8; 64]);
+            let SharedSecret::Hybrid(bytes) = &mut secret else {
+                unreachable!("just constructed as Hybrid")
+            };
+            bytes[..32].copy_from_slice(&pq);
             pq.fill(0);
-            secret.extend_from_slice(&x25519(&hybrid.x_private, &share)?);
-            SharedSecret::Hybrid(secret)
+            bytes[32..].copy_from_slice(&x25519(&hybrid.x_private, &share)?);
+            secret
         }
         other => {
             return Err(TransportError::Tls(format!(
@@ -929,6 +940,13 @@ fn parse_server_hello(raw: &[u8]) -> Result<ParsedServerHello<'_>> {
                 let group = take_u16(data, &mut p)?;
                 let klen = take_u16(data, &mut p)? as usize;
                 let bytes = take(data, &mut p, klen)?;
+                // The ServerHello KeyShareEntry is the whole extension
+                // body; a trailing byte means the peer's framing is off.
+                if p != data.len() {
+                    return Err(TransportError::Tls(
+                        "Reality TLS: trailing bytes in server key_share".into(),
+                    ));
+                }
                 tracing::debug!(
                     group = format_args!("0x{group:04x}"),
                     key_len = bytes.len(),
@@ -937,15 +955,21 @@ fn parse_server_hello(raw: &[u8]) -> Result<ParsedServerHello<'_>> {
                 // The browser profiles advertise more groups than the
                 // handshake can complete; a peer that picks one of them
                 // must fail loudly, not degrade.
-                let ok = match group {
-                    GROUP_X25519 => bytes.len() == 32,
-                    GROUP_X25519_MLKEM768 => bytes.len() == MLKEM768_CIPHERTEXT_BYTES + 32,
-                    _ => false,
+                let expected = match group {
+                    GROUP_X25519 => Some(32),
+                    GROUP_X25519_MLKEM768 => Some(MLKEM768_CIPHERTEXT_BYTES + 32),
+                    _ => None,
                 };
-                if !ok {
+                let Some(expected) = expected else {
                     return Err(TransportError::Tls(format!(
-                        "Reality TLS: server selected key-share group 0x{group:04x} \
-                         ({} bytes); only X25519 and X25519MLKEM768 are supported",
+                        "Reality TLS: server selected key-share group 0x{group:04x}; \
+                         only X25519 and X25519MLKEM768 are supported"
+                    )));
+                };
+                if bytes.len() != expected {
+                    return Err(TransportError::Tls(format!(
+                        "Reality TLS: server key-share group 0x{group:04x} carried \
+                         {} bytes, expected {expected}",
                         bytes.len()
                     )));
                 }
@@ -1950,8 +1974,9 @@ mod tests {
 
     /// The 32-byte session_id must decrypt, under the key/nonce/AAD a real
     /// Reality server reconstructs, to the authentication payload
-    /// (`[1, 8, 1, 0] || timestamp || short_id`). Asserting the plaintext —
-    /// not just the length — is what proves the server could authenticate us.
+    /// (`REALITY_CLIENT_VERSION || 0 || timestamp || short_id`). Asserting
+    /// the plaintext — not just the length — is what proves the server
+    /// could authenticate us.
     #[test]
     fn reality_client_hello_session_id_decrypts_to_auth_payload() {
         let reality = RealityConfig {

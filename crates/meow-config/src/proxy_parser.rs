@@ -3686,6 +3686,33 @@ mod tests {
         assert!(decode_raw_url_base64_lenient("!!!not base64!!!").is_none());
     }
 
+    /// `support-x25519mlkem768` reaches `RealityConfig` verbatim; absent
+    /// or non-bool stays off — the `as_bool` fail-closed convention the
+    /// other weakly-typed opts follow.
+    #[cfg(feature = "vless")]
+    #[test]
+    fn reality_opts_support_x25519mlkem768_maps_to_config_flag() {
+        const KEY: &str = "public-key: AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE";
+        for (line, expected) in [
+            ("support-x25519mlkem768: true", true),
+            ("support-x25519mlkem768: false", false),
+            // `as_bool` on a non-bool yields None — off, not an error.
+            ("support-x25519mlkem768: \"yes\"", false),
+            ("support-x25519mlkem768: 1", false),
+        ] {
+            let config = proxy_config(&format!("reality-opts:\n  {KEY}\n  {line}\n"));
+            let reality = parse_vless_reality_opts("v", &config)
+                .expect("reality-opts must parse")
+                .expect("reality-opts present");
+            assert_eq!(reality.support_x25519_mlkem768, expected, "{line}");
+        }
+        let config = proxy_config(&format!("reality-opts:\n  {KEY}\n"));
+        let reality = parse_vless_reality_opts("v", &config)
+            .expect("reality-opts must parse")
+            .expect("reality-opts present");
+        assert!(!reality.support_x25519_mlkem768, "flag defaults to off");
+    }
+
     #[cfg(any(feature = "vless", feature = "vmess"))]
     #[test]
     fn default_alpn_follows_transport() {
