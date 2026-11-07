@@ -233,6 +233,9 @@ pub struct RawConfig {
     pub tproxy_port: Option<u16>,
     pub tproxy_sni: Option<bool>,
     pub routing_mark: Option<u32>,
+    /// mihomo `unified-delay`: delay probes report the second
+    /// request on a warm connection, without the dial/handshake cost.
+    pub unified_delay: Option<bool>,
     /// Wall-clock bound, in seconds, on the built-in DIRECT adapter's
     /// `TcpStream::connect`. Unset = unbounded (legacy behaviour, subject
     /// only to the OS connect timeout). Motivated by iOS/macOS

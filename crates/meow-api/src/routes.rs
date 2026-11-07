@@ -783,6 +783,8 @@ struct ConfigResponse {
     bind_address: String,
     #[serde(rename = "ipv6")]
     ipv6: bool,
+    #[serde(rename = "unified-delay")]
+    unified_delay: bool,
     /// Whether the TUN listener is currently running (issue #326).
     /// Mirrors `tun.enable` from the raw config and reflects actual
     /// runtime state so nyanpasu can correctly render its toggle.
@@ -812,6 +814,8 @@ async fn get_configs(State(state): State<Arc<AppState>>) -> Json<ConfigResponse>
             .clone()
             .unwrap_or_else(|| "0.0.0.0".to_string()),
         ipv6: meow_config::effective_ipv6(raw.ipv6),
+        // The live setting, as mihomo reports `UnifiedDelay.Load()`.
+        unified_delay: meow_proxy::health::unified_delay(),
         tun_enable: tun_running,
         tun: TunFields::reported(raw.tun.as_ref(), tun_running),
     })
@@ -3206,6 +3210,8 @@ async fn swap_config_and_reconcile_tun(
         let new_log_level =
             (guard.log_level != candidate.log_level).then(|| candidate.log_level.clone());
         let logbook_enable = meow_config::raw::RawLogbook::enabled(candidate.logbook.as_ref());
+        // Commit point: a rejected candidate never reaches here.
+        meow_proxy::health::set_unified_delay(candidate.unified_delay.unwrap_or(false));
         let ledger = candidate.traffic_ledger.as_ref();
         let ledger = (
             meow_config::raw::RawTrafficLedger::enabled(ledger),
