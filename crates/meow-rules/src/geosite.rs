@@ -274,7 +274,7 @@ impl GeositeDB {
                     keywords: HashMap::new(),
                 })
             }
-            Err(MrsError::WrongFormat) => {
+            Err(MrsError::WrongFormat(_)) => {
                 // Try the V2Ray .dat protobuf format. On any dat-parse
                 // error, surface `WrongFormat` so the callsite can log a
                 // single actionable message without internal noise.

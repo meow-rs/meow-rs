@@ -230,6 +230,10 @@ tokio-tungstenite = { version = "0.29", default-features = false, features = ["c
 # HTTP types
 http = "1"
 
+# Same-file detection (dev+ino / volume+file-index) — convert-ruleset's
+# source/output guard; already in the lock via walkdir.
+same-file = "1"
+
 # Temporary files (tests)
 tempfile = "3"
 

@@ -2471,6 +2471,7 @@ dependencies = [
  "meow-trie",
  "meow-tunnel",
  "parking_lot",
+ "same-file",
  "serde-saphyr",
  "serde_json",
  "smol_str",
@@ -2481,6 +2482,7 @@ dependencies = [
  "tracing-subscriber",
  "windows-service",
  "windows-sys 0.61.2",
+ "zstd",
 ]
 
 [[package]]

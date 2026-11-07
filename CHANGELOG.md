@@ -8,6 +8,29 @@ the canonical, in-repo source a release is cut from.
 
 ## [Unreleased]
 
+### Added
+
+- **`meow convert-ruleset <domain|ipcidr> mrs <source.mrs> [out.txt]`** —
+  the `.mrs` → text direction of mihomo's `convert-ruleset`, e.g. for
+  inspecting or hand-editing the `.mrs` rule-providers OpenWrt frontends
+  ship. The text matches upstream's dump: a domain stored as both
+  apex and subdomains collapses to one `+.domain` line, a suffix-only
+  entry stays `.domain`, `ipcidr` ranges split into aligned CIDRs.
+  Output goes through a unique `.pid.n.tmp` scratch renamed into place —
+  never a truncated half-file, never a clobbered source behind a `..`
+  path, a symlink, or a hard link — and decode failures name the file
+  that failed. Keys that aren't valid UTF-8 are skipped with a count
+  printed as a warning.
+
+### Changed
+
+- **meow-rules public API:** `MrsError::WrongFormat` carries the
+  expected magic (`'MRS!'` vs `'MRS\x01'`) instead of being a unit
+  variant, and `UpstreamRuleSetReader::for_each_domain` returns
+  `Result<usize>` — the number of non-UTF-8 keys skipped during the
+  walk. meow-common gains `sweep_scratch_siblings_excluding`, a
+  keep-file variant of the stale-scratch sweep.
+
 ### Fixed
 
 - **Hysteria 2 UDP relay no longer collapses under load.** A full
