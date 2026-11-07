@@ -39,11 +39,12 @@ pub(crate) const EXT_KEY_SHARE: u16 = 51;
 const HPKE_AEAD_AES_128_GCM: u16 = 0x0001;
 const HPKE_AEAD_CHACHA20_POLY1305: u16 = 0x0003;
 
-/// Rough size the hybrid offer adds to a ClientHello — extension
-/// header(4) + key_share entry (group 2 + len 2 + ML-KEM-768 ek 1184 +
-/// X25519 32) + a `supported_groups` slot(2). Used only to pre-size
-/// buffers; the encoders below stay exact.
-const HYBRID_HELLO_OVERHEAD: usize = 4 + (2 + 2 + 1184 + 32) + 2;
+/// Rough size the hybrid offer adds to a ClientHello — key_share entry
+/// (group 2 + len 2 + ML-KEM-768 ek 1184 + X25519 32) + a
+/// `supported_groups` slot(2) + 4 slack bytes: the key_share extension
+/// is already in the hello, so no new extension header goes on the
+/// wire.  Used only to pre-size buffers; the encoders below stay exact.
+const HYBRID_HELLO_OVERHEAD: usize = (2 + 2 + 1184 + 32) + 2 + 4;
 
 /// One ClientHello extension, in the shape the profile tables need.
 #[derive(Clone, Copy)]
@@ -452,8 +453,9 @@ pub(crate) struct HelloParams<'a> {
     pub(crate) random: &'a [u8; 32],
     pub(crate) x25519_public: &'a [u8; 32],
     /// ML-KEM-768 encapsulation key and the hybrid's own X25519 public key:
-    /// when set, X25519MLKEM768 is offered first in `supported_groups` and
-    /// as the first real `key_share` (before X25519) — as current Chrome
+    /// when set, X25519MLKEM768 is the first real group in
+    /// `supported_groups` (right after the leading GREASE, if any) and
+    /// the first real `key_share`, ahead of X25519 — as current Chrome
     /// does, and as current Xray REALITY servers require.
     pub(crate) x25519_mlkem768: Option<(&'a [u8], &'a [u8; 32])>,
 }

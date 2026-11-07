@@ -2049,6 +2049,51 @@ mod tests {
         assert!(parse_server_hello(&buf).is_err());
     }
 
+    /// The ServerHello KeyShareEntry is the whole extension body: one
+    /// byte past it is a framing error, not a longer share.
+    #[test]
+    fn parse_server_hello_rejects_key_share_trailing_byte() {
+        let mut share_ext = Vec::new();
+        put_u16(GROUP_X25519, &mut share_ext);
+        put_u16(32, &mut share_ext);
+        share_ext.extend_from_slice(&[0xBBu8; 32]);
+        share_ext.push(0);
+        let hello =
+            build_fake_server_hello_key_share(&[0xAAu8; 32], &share_ext, TLS_AES_128_GCM_SHA256);
+        let Err(err) = parse_server_hello(&hello) else {
+            panic!("a key_share trailing byte must be rejected");
+        };
+        assert!(
+            matches!(&err, TransportError::Tls(msg) if msg.contains("trailing")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    /// A known group whose share is not the group's size is rejected on
+    /// length, for plain X25519 and the hybrid alike.
+    #[test]
+    fn parse_server_hello_rejects_wrong_key_share_len() {
+        for (group, share_len) in [
+            (GROUP_X25519, 31),
+            (GROUP_X25519_MLKEM768, MLKEM768_CIPHERTEXT_BYTES + 31),
+        ] {
+            let hello = build_fake_server_hello_group(
+                &[0xAAu8; 32],
+                group,
+                &vec![0xBBu8; share_len],
+                TLS_AES_128_GCM_SHA256,
+            );
+            let Err(err) = parse_server_hello(&hello) else {
+                panic!("group 0x{group:04x}: a short share must be rejected");
+            };
+            assert!(
+                matches!(&err, TransportError::Tls(msg)
+                    if msg.contains("carried") && msg.contains("expected")),
+                "group 0x{group:04x}: unexpected error: {err:?}"
+            );
+        }
+    }
+
     // ─── poll_write changed-buffer safety ─────────────────────────────────────
 
     /// A mock inner stream whose first `poll_write` returns `Pending`
@@ -2393,6 +2438,21 @@ mod tests {
         server_public: &[u8],
         cipher_suite: u16,
     ) -> Vec<u8> {
+        let mut key_share_entry = Vec::new();
+        put_u16(group, &mut key_share_entry);
+        put_u16(server_public.len() as u16, &mut key_share_entry);
+        key_share_entry.extend_from_slice(server_public);
+        build_fake_server_hello_key_share(session_id, &key_share_entry, cipher_suite)
+    }
+
+    /// `key_share_ext` is the key_share extension body verbatim, so a
+    /// test can corrupt the KeyShareEntry framing itself (trailing
+    /// bytes) rather than only the group or share it carries.
+    fn build_fake_server_hello_key_share(
+        session_id: &[u8],
+        key_share_ext: &[u8],
+        cipher_suite: u16,
+    ) -> Vec<u8> {
         let mut body = Vec::new();
         body.extend_from_slice(&[0x03, 0x03]);
         body.extend_from_slice(&[0xAAu8; 32]); // random; must not be the HRR magic
@@ -2403,11 +2463,7 @@ mod tests {
 
         let mut exts = Vec::new();
         push_ext(&mut exts, 43, &[0x03, 0x04]); // supported_versions: TLS 1.3
-        let mut key_share_entry = Vec::new();
-        put_u16(group, &mut key_share_entry);
-        put_u16(server_public.len() as u16, &mut key_share_entry);
-        key_share_entry.extend_from_slice(server_public);
-        push_ext(&mut exts, EXT_KEY_SHARE, &key_share_entry);
+        push_ext(&mut exts, EXT_KEY_SHARE, key_share_ext);
 
         put_u16(exts.len() as u16, &mut body);
         body.extend_from_slice(&exts);
