@@ -44,7 +44,9 @@ pub use domain_key::{
     domain_keyword_payload_is_dead, domain_rule_payload_is_dead, domain_wildcard_payload_is_dead,
     DomainKeyDefect,
 };
-pub use parser::{parse_rule, parse_rule_flags, ParserContext, RuleFlags};
+pub use parser::{
+    parse_rule, parse_rule_flags, parse_rule_with_rule_sets, ParserContext, RuleFlags, RuleSets,
+};
 pub use rule_set::{
     build_rule_set, build_rule_set_checked, build_rule_set_from_mrs,
     build_rule_set_from_mrs_with_behavior, is_mrs_bytes, ClassicalRuleSet, DomainRuleSet,

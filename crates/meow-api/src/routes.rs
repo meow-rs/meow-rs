@@ -4461,8 +4461,10 @@ async fn refresh_provider(
     }
 }
 
-/// Trigger a health check for all proxies in the named provider.
-/// Accepts the same `url` and `timeout` query params as `GET /proxies/:name/delay`.
+/// Trigger a health check for all proxies in the named provider, using the
+/// provider's own `health-check` url/timeout/expected-status. Query params
+/// are not accepted — per-proxy overrides live on
+/// `/providers/proxies/{provider}/{name}/healthcheck`.
 async fn provider_healthcheck(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
@@ -4472,7 +4474,15 @@ async fn provider_healthcheck(
         None => return msg_err(StatusCode::NOT_FOUND, "resource not found"),
     };
 
-    let Some(health) = provider.health_check.as_ref() else {
+    // mihomo's `execute` skips an empty testUrl ("Health Check has been
+    // skipped due to testUrl is empty") — no block or no url both answer
+    // 204 without probing. `enable` deliberately does not gate this: a
+    // manual request is not the periodic sweep it disables.
+    let Some(health) = provider
+        .health_check
+        .as_ref()
+        .filter(|hc| !hc.url.is_empty())
+    else {
         return StatusCode::NO_CONTENT.into_response();
     };
     let timeout = Duration::from_millis(health.timeout.max(1));

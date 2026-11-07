@@ -133,7 +133,8 @@ What a change does:
   sets `strict: true`. `--force` also applies a config whose strict checks,
   TUN, listeners or DNS fail.
 - `provider check` runs the provider's `health-check:` and refuses a
-  provider without one.
+  provider with no `health-check:` block or no `url` in it — there is
+  nothing to probe with (test its nodes one by one with `proxy test`).
 - `subscription list` shows only the scheme and host of each URL: the rest
   usually carries an access token.
 

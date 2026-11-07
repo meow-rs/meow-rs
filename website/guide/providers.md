@@ -36,7 +36,7 @@ proxy-groups:
 | `filter` | regex | — | Keep only proxies whose name matches |
 | `exclude-filter` | regex | — | Drop proxies whose name matches |
 | `exclude-type` | string \| list | `[]` | Drop proxy types, e.g. `[ss]` |
-| `health-check` | block | — | Probe defaults for the manual `GET /providers/proxies/{name}/healthcheck` endpoint — **not periodically scheduled**; members are otherwise probed by a `use:`ing group's own health check |
+| `health-check` | block | — | Member reachability probes: scheduled every `interval` when `enable: true` and a `url` is set, and always the settings the manual `GET /providers/proxies/{name}/healthcheck` endpoint probes with. Members are also probed by a `use:`ing group's own health check |
 | `header` | map | `{}` | Extra HTTP request headers (`http` only) |
 | `dialer-proxy` | string | — | Chain every node through the named `proxies:`/`proxy-groups:` entry. Overrides node-level `dialer-proxy` fields (mihomo writes it into each node unconditionally) |
 | `override` | map | — | Provider-level node defaults (mihomo `OverrideSchema`). Only `dialer-proxy` is honoured — it chains every node **unconditionally**, outranking both provider-level and node-level values; an empty string clears the chain (the node dials direct), and a non-string value rejects the provider. Other keys log a warning |
@@ -76,17 +76,19 @@ is reported as the provider's `subscriptionInfo` in
 
 ### Health check
 
-| Field | Type | Default |
-| --- | --- | --- |
-| `enable` | bool | `true` |
-| `url` | string | `https://www.gstatic.com/generate_204` |
-| `interval` | u64 | `300` |
-| `timeout` | u64 (ms) | `5000` |
-| `lazy` | bool | `false` |
+| Field | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `enable` | bool | `false` | `true` schedules a sweep every `interval` — but only when `url` is also set. A block without `enable: true` runs no sweep yet still feeds the manual endpoint and the `testUrl`/`expectedStatus` API echo; it logs a warning naming the provider |
+| `url` | string | `""` | Probe target, stored trimmed — no built-in default. Empty, whitespace-only or absent means **no probes**: no sweep, and the manual endpoint returns 204 without checking anything |
+| `interval` | u64 (s) | `300` | Sweep period in seconds; `0` maps to `300`, never to "every tick" |
+| `timeout` | u64 (ms) | `5000` | Per-probe timeout; `0` maps to `5000` like an absent value |
+| `expected-status` | string or int | `200-299` | Status that counts as healthy: `204`, `"200-299"`, `"200/204"`, or `*` for any. Validated at load whenever the block is present — a bad value fails the provider even with `enable: false`. (Upstream treats empty as `*` — diverges deliberately) |
+| `lazy` | bool | `false` | Upstream skips sweeps while the provider is idle. **Not honoured** — meow tracks no per-provider traffic, so sweeps run every interval; an explicit `lazy: true` warns at load |
 
-These fields configure probes for the **manual** healthcheck endpoint and are
-stored on the provider — unlike the provider-level `interval` above, the
-health-check `interval`/`lazy` are not periodically scheduled.
+With `enable: true` and a `url`, members are probed every `interval`
+**and** as soon as a refreshed payload lands — the same behaviour as
+upstream's `setProxies` check — while a group `use:`ing the provider
+keeps running its own health check independently.
 
 ## Rule providers
 
@@ -157,6 +159,24 @@ subscription refresh gains a task, a removed one loses it, and a changed
 task (and countdown). Manual refresh (`PUT /providers/proxies/{name}`)
 works regardless of `interval`, and a failed refresh keeps the last-good
 node list.
+
+## Provider paths on disk
+
+Every `path:` a provider reads or writes must stay inside the provider
+cache directory — the containment guard exists because a config arriving
+over the REST API could otherwise point providers at arbitrary files.
+Two environment variables tune it, matching mihomo:
+
+| Variable | Meaning |
+| --- | --- |
+| `SAFE_PATHS` | Extra roots provider paths may live under besides the provider directory — a `PATH`-style list (`:`-separated on Unix, `;` on Windows). Each entry is trimmed; empty and relative entries are ignored. The sanctioned way to point providers at, e.g., a tmpfs — the guard itself stays on. |
+| `SKIP_SAFE_PATH_CHECK` | Truthy per Go's `strconv.ParseBool` (`1`, `t`, `T`, `true`, `TRUE`, `True`): a containment failure is downgraded to a loud `warn!` and the out-of-root path is allowed — the guard is then **off** for every provider. A migration hatch, not a configuration knob; prefer `SAFE_PATHS`, which widens the guard without dropping it. |
+
+The difference matters operationally: a `path:` outside every allowed
+root *fails the provider build* (fatal under `strict: true`), while
+`SKIP_SAFE_PATH_CHECK` keeps it loading and only warns — a config that
+silently routes through the wrong file is worse than one that refuses
+to start.
 
 ## Subscriptions
 

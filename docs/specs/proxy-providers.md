@@ -110,7 +110,8 @@ proxy-providers:
       enable: true
       url: https://www.gstatic.com/generate_204
       interval: 300      # seconds between health-check sweeps
-      lazy: true         # if true, don't probe until first use
+      lazy: true         # upstream: skip sweeps while the provider is idle;
+                         # NOT honoured here (warns at load)
       expected-status: 204  # HTTP status code that counts as healthy
     override:            # optional; applied to every proxy in this provider
       skip-cert-verify: true
@@ -156,11 +157,12 @@ proxy-groups:
 | `url` | string | if `http` | — | Subscription URL. |
 | `path` | string | yes | — | Local cache path. For `http`: write fetched YAML here. For `file`: read from here. Relative paths resolved from the config file's directory. |
 | `interval` | integer | no | `0` | Refresh interval in seconds, scheduled by the refresh supervisor on every config commit. `0` or absent = no background refresh (manual `PUT /providers/proxies/{name}` still works). `file` providers re-read their file each tick — upstream instead fs-watchers file providers, so an un-`interval`ed `file` provider does not auto-reload here (divergence #2). |
-| `health-check.enable` | bool | no | `false` | Enable periodic health-check probes. |
-| `health-check.url` | string | if `enable` | — | URL used for reachability probes. |
-| `health-check.interval` | integer | no | `300` | Health-check sweep interval in seconds. |
-| `health-check.lazy` | bool | no | `false` | If true, defer first probe until the proxy is first used by a connection. (Note: provider health checks run only via the manual `/providers/proxies/{name}/healthcheck` endpoint today — nothing schedules them.) |
-| `health-check.expected-status` | integer or string | no | any 2xx | HTTP status that counts as healthy: a bare code (`204`) or a range string (`"200-299"`, `"200,204"`). |
+| `health-check.enable` | bool | no | `false` | Enable periodic health-check probes. A `health-check:` block with `enable` absent or not `true` runs no sweep but is still kept — the manual `GET .../healthcheck` endpoint and the `testUrl`/`expectedStatus` API echo honour it — and logs a `warn!` naming the provider (upstream likewise builds `HealthCheck` unconditionally; `Enable` only zeroes the ticker interval). |
+| `health-check.url` | string | no | `""` | URL used for reachability probes, stored trimmed (upstream `strings.TrimSpace`s it in `execute()`/`registerHealthCheckTask`) — no gstatic default. Empty, whitespace-only or absent means **no probes**: upstream's `NewHealthCheck` zeroes the interval on an empty url, so no sweep runs and the manual endpoint skips too (204). `enable: true` with no url additionally logs a `warn!` naming the provider. |
+| `health-check.interval` | integer | no | `300` | Health-check sweep interval in seconds, run by the refresh supervisor; `0` maps to the default `300`, never to "every tick" (mihomo). Applies only when `enable` and a non-empty `url` both hold. |
+| `health-check.timeout` | integer | no | `5000` | Per-probe timeout in milliseconds; `0` maps to `5000` like an absent value (mihomo `NewHealthCheck`), never to a 1 ms dead probe. |
+| `health-check.lazy` | bool | no | `false` | Upstream (schema default `true`) *skips* a sweep when the provider saw no traffic during the last interval — idle providers stay quiet. **Not honoured**: meow tracks no per-provider last-touch, so sweeps run every interval regardless (same precedent as group `lazy` — #555, ADR-0002); an explicit `lazy: true` logs a `warn!` naming the provider. |
+| `health-check.expected-status` | integer or string | no | any 2xx | HTTP status that counts as healthy: a bare code (`204`), codes and ranges separated by `,` or `/` (`"200-299"`, `"200/204"`), or `*` for any. Validated at load whenever the block is present — a bad spec fails the provider even with `enable: false` (upstream `NewUnsignedRanges` runs before `Enable` is read). |
 | `override` | map | no | `{}` | Key-value overrides applied to every proxy. See §Override. |
 | `filter` | string | no | `""` | Regex. Include only proxies whose `name` matches. Empty = include all. |
 | `exclude-filter` | string | no | `""` | Regex. Exclude proxies whose `name` matches. Applied after `filter`. |
@@ -292,9 +294,15 @@ pub struct ProxyProvider {
     pub config: ProviderConfig,
     /// Current proxy list; updated atomically on refresh.
     pub proxies: Arc<RwLock<Vec<Arc<dyn ProxyAdapter>>>>,
-    /// Latest health-check results, keyed by proxy name.
-    pub health: Arc<RwLock<HashMap<String, ProxyHealth>>>,
 }
+```
+
+> **As shipped:** there is no `health` map on the provider — probe
+> results are recorded on each member's own `ProxyHealth`
+> (`proxy.health().record_delay`), the struct the group and delay
+> probe paths already share. See §Health-check task.
+
+```rust
 
 pub enum ProviderConfig {
     Http {
@@ -355,7 +363,8 @@ load_config() {
   4. Build Tunnel with resolved groups + provider map in AppState.
   5. Spawn background tasks:
      - One refresh task per http provider with interval > 0.
-     - One health-check sweep task per provider with health-check.enable.
+     - One health-check sweep task per provider whose health-check has
+       `enable: true` *and* a non-empty `url` (upstream `auto()`).
 }
 ```
 
@@ -381,19 +390,22 @@ impl ProxyProvider {
         // 2. Write to cache path (atomic: write tmp, rename)
         // 3. Parse into new Vec<Arc<dyn ProxyAdapter>>
         // 4. Apply filters + overrides
-        // 5. Acquire write lock on both proxies and health
-        // 6. Swap proxy list
-        // 7. Prune health map: drop entries for proxies no longer in
-        //    the new list; preserve entries for surviving proxies.
-        //    Prevents unbounded map growth and stale data on GET.
-        // 8. Release locks — groups read through Arc on next dial/sweep
+        // 5. Acquire write lock on proxies
+        // 6. Swap proxy list — as shipped there is no per-provider
+        //    health map to prune: results live on each member's own
+        //    `ProxyHealth`, so a swapped-out node's history goes with it
+        //    and a carried-over `Arc` member keeps its own.
+        // 7. Release locks — groups read through Arc on next dial/sweep
     }
 }
 ```
 
 Step 6 is intentionally passive — groups hold `Arc<ProxyProvider>` and
-read on each dial (or on URLTest/Fallback health-check sweep). There is
-no explicit notification bus. Groups that cache their resolved proxy
+read on each dial (or on URLTest/Fallback health-check sweep). Nothing
+pushes the new list to groups; the only notification lives inside the
+provider — a `members_changed` `Notify` signalled on each commit, which
+the provider's own health-check sweep waits on so a landed payload is
+probed on arrival. Groups that cache their resolved proxy
 list locally (e.g. for a Selector's current selection) need to detect
 when their selected proxy disappears after a refresh and fall back to
 the first available. **Engineer: add a `selected_still_present()` check
@@ -405,13 +417,22 @@ longer in the provider's list.** Document this with a comment.
 ```rust
 async fn health_check_loop(provider: Arc<ProxyProvider>) {
     let mut ticker = tokio::time::interval(health_check_interval);
-    if lazy {
-        // first tick waits for a connection to use a proxy from this provider
-        // (simplified: just sleep the first interval, do not track first-use)
-        ticker.tick().await;
-    }
     loop {
-        ticker.tick().await;
+        // As shipped (mihomo `setProxies` → `go hc.check()` parity): the
+        // wait also listens on the provider's member-commit Notify, so a
+        // payload landing mid-interval is probed on arrival instead of
+        // one interval late. `lazy` is not honoured — upstream skips a
+        // tick when the provider saw no traffic during the last interval,
+        // and meow tracks no per-provider last-touch (same precedent as
+        // group `lazy` — #555, ADR-0002); an explicit `lazy: true` warns
+        // at load.
+        tokio::select! {
+            _ = ticker.tick() => {}
+            _ = provider.members_changed().notified() => {}
+        }
+        if provider.proxies.is_empty() || hc.url.is_empty() {
+            continue; // upstream check()/execute() skip both cases
+        }
         probe_all_proxies(&provider).await;
     }
 }
@@ -423,11 +444,19 @@ async fn probe_all_proxies(provider: &ProxyProvider) {
 }
 ```
 
-Health results are stored in `provider.health: Arc<RwLock<HashMap<String, ProxyHealth>>>`.
-The API handler for `GET /providers/proxies/:name/healthcheck` reads
-from this map. The `ProxyHealth` struct already defined by the
-api-delay-endpoints spec is reused here — providers populate it via
-the same URL probe mechanism as the delay endpoint.
+A sweep exists only where upstream's `auto()` says so — `enable` **and**
+a non-empty `url`. The rest of the block (`url`, `timeout`,
+`expected-status`) is kept either way for the manual
+`GET /providers/proxies/:name/healthcheck` endpoint and the
+`testUrl`/`expectedStatus` API echo, which upstream serves
+unconditionally (its `Enable` only zeroes the ticker interval).
+
+Health results live on each member's own `ProxyHealth`
+(`proxy.health().record_delay`) — the struct the api-delay-endpoints
+spec already defines, shared with the group and delay probe paths.
+There is no per-provider health map: the sweep records on the member
+adapters directly, so `GET /providers/proxies/:name` reads each node's
+`history` the same way `/proxies/{name}` does.
 
 ### reqwest dependency
 
@@ -489,13 +518,16 @@ GET  /providers/proxies/:name
 → Same shape, single provider. 404 if unknown.
 
 PUT  /providers/proxies/:name
-→ Trigger async refresh. Returns 204 immediately; refresh happens in background.
-  If provider is type=file, still returns 204 but refresh is a file re-read
-  (useful after the user has manually updated the file).
+→ Run the refresh in the handler and answer 204 once it completes — 503
+  when the fetch/parse failed, with the last-good list kept in place
+  (upstream likewise awaits `Update()`). For type=file the refresh is a
+  file re-read (useful after the user has manually updated the file).
 
 GET  /providers/proxies/:name/healthcheck
-→ Trigger an immediate health-check sweep for this provider. Returns 204;
-  sweep runs in background. Results visible on next GET /providers/proxies/:name.
+→ Run the sweep in the handler and answer 204 once it completes; the
+  results are already on the member `history` fields of the next
+  GET /providers/proxies/:name. A provider with no health-check `url`
+  204s without probing (upstream `execute` skips an empty testUrl).
 ```
 
 `AppState` grows a `proxy_providers: HashMap<String, Arc<ProxyProvider>>`
@@ -516,6 +548,12 @@ handlers access providers through `State<Arc<AppState>>` as today.
 | 5 | Proxy-providers feature disabled, providers in config — upstream N/A (always enabled) | A | Hard-error per provider entry instead of silent empty group. Class A: silently skipping all provider proxies causes misrouting without diagnostic. |
 | 6 | HTTP fetch failure at startup — upstream skips provider silently | B | We warn-once with the URL and error; matching the rule-provider "best-effort keep running" pattern but with a visible warn. No hard-error at startup because the cache path may still satisfy the load. |
 | 7 | Duplicate proxy name across providers — upstream last-write-wins silently | B | We warn-once per collision naming both source providers and the winning entry. Config-file order (`proxy-providers:` key order) is the deterministic iteration order; last definition wins. Warn text: `"proxy name '<name>' is defined in both provider '<A>' and provider '<B>'; using the entry from '<B>' (later in config). Rename one to disambiguate."` Once per collision per load; new collisions introduced by a refresh also warn. |
+| 8 | `RULE-SET` inside a rule-provider payload — upstream parses it and resolves the name lazily through `tunnel.RuleProviders()` at match time (a payload may reference a provider declared later; references may even cycle — the recursion just never matches) | B | We resolve eagerly against the scoped provider map, so a payload `RULE-SET` fails "unknown rule-provider". Stricter, deliberately: payloads stay self-contained and cycles are impossible. |
+| 9 | `health-check.lazy` — upstream skips a sweep when the provider saw no traffic during the last interval (schema default `true`, `lastTouch` gating) | B | We probe every interval regardless — meow tracks no per-provider last-touch (same precedent as group `lazy`, #555). An explicit `lazy: true` warns at load. |
+| 10 | Empty/absent `health-check.expected-status` — upstream means `*` (any status) | B | We mean 2xx, the shared `parse_expected` default every delay endpoint also uses. Changing it would flip group/delay semantics beyond this PR; recorded as a deliberate divergence. The API echo diverges with it: upstream reports `expectedStatus: "*"` (even for a provider with no block at all), we echo the configured string verbatim — `""` when unset or the block is absent. |
+| 11 | `expected-status` grammar — upstream also tolerates bracketed entries (`[200]`) and inverted bounds, and caps the list at 28 ranges | B | We reject brackets and inverted ranges (the stricter direction is safe there), but enforce no range cap — the divergence runs both ways: a 29+-entry list that upstream's `NewUnsignedRanges` rejects parses fine here, so not everything we accept is upstream-legal. |
+| 12 | A `use:`ing group's own health-check registration onto the provider — upstream `registerHealthCheckTask` lets a group's url/expected-status/filter/interval extend the provider's sweep set (and inherits `testUrl`/`expectedStatus` onto the group when unset) | B | Not implemented: group and provider sweeps are independent. Wiring the provider map into group parsing is out of scope. |
+| 13 | `health-check.url` absent — upstream `NewHealthCheck` zeroes the interval (no sweep; `execute` skips an empty testUrl) | B | Same observable behaviour (no sweep, manual endpoint 204s), but reached differently: we keep the url trimmed (upstream `strings.TrimSpace`s it before the empty check and the probe; no gstatic default) and filter the sweep at spawn. `enable: true` with no url additionally warns, naming the provider. |
 
 ## Acceptance criteria
 
@@ -560,10 +598,12 @@ A PR implementing this spec must:
     `PUT /proxies/:selector_name` allows selecting any proxy currently
     in the provider's list (not a cached snapshot from before the
     refresh).
-16. Health HashMap is pruned on refresh: entries for proxies removed
-    from the subscription are dropped; entries for surviving proxies
-    are preserved. Assert `GET /providers/proxies/:name` contains no
-    stale health entries after a refresh that removes a proxy.
+16. ~~Health HashMap is pruned on refresh~~ — superseded as shipped:
+    there is no per-provider health map; probe history lives on each
+    member's `ProxyHealth`, so a refresh that drops a node drops its
+    history with it (see §Health-check task). Assert
+    `GET /providers/proxies/:name` contains no stale health entries
+    after a refresh that removes a proxy.
 17. URLTest and Fallback groups that reference providers via `use:`
     re-resolve from `provider.proxies.read()` on each sweep cycle —
     they do NOT cache the proxy list locally. Assert:
@@ -621,11 +661,11 @@ A PR implementing this spec must:
   fallback name matches for both refresh cycles.
   Upstream: upstream Selector fallback is also "first proxy"; we
   match. NOT arbitrary — must be YAML-order-stable.
-- `health_map_pruned_on_refresh` — provider with proxy A + B, health
-  data for both recorded; refresh removes proxy B; assert health map
-  contains only proxy A's entry. NOT stale data for B.
-  Upstream: no equivalent — upstream stores health by proxy name
-  without pruning. Our explicit prune prevents unbounded map growth.
+- `health_map_pruned_on_refresh` — superseded as shipped: no
+  per-provider health map exists (results live on each member's
+  `ProxyHealth`, dropped with the swapped-out adapter), so the shipped
+  analogue asserts a refresh that removes proxy B leaves no stale
+  health entry on `GET /providers/proxies/:name`.
 - `urltest_sweep_picks_up_refreshed_provider_list` — URLTest group
   references a provider; provider refreshes with a new proxy list;
   next URLTest sweep probes the new proxies. Assert sweep uses the

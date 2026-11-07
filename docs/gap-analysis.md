@@ -231,6 +231,13 @@ Upstream `hub/route/` mounts these sub-routers, and Clash Dashboard / Yacd expec
 | CORS                         | Yes | Yes | OK (permissive) |
 | `/ui` static                 | Yes | Yes | OK |
 
+> **Since landed** (this table keeps the 2026-04-11 baseline): `/logs`,
+> `/memory`, `/proxies/:name/delay`, `/group/:name/delay`,
+> `DELETE /connections` (bulk), `PUT /configs`, `/cache/dns/flush`,
+> `GET /dns/query`, and the `/providers/proxies*` + `/providers/rules*`
+> rows are all implemented — [mihomo-api-compatibility.md](mihomo-api-compatibility.md)
+> is the current endpoint matrix.
+
 ### Non-standard endpoints (meow-rs additions)
 
 These are unique to this port; document them for API consumers:

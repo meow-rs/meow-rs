@@ -14,6 +14,15 @@
 //! carries its *source* identity (`ProxyProvider::def` deliberately excludes
 //! `interval`), so an interval-only change must respawn the task without
 //! rebuilding the provider or refetching its payload.
+//!
+//! The same supervisor runs each provider's `health-check` on its own
+//! `interval` (mihomo parity): members are probed like the
+//! manual `GET /providers/proxies/{name}/healthcheck`. A sweep exists
+//! only for `enable: true` plus a non-empty `url` — upstream's `auto()`
+//! (`NewHealthCheck` zeroes the interval when either is missing) —
+//! and between ticks the loop also wakes on member commits, like
+//! upstream's `setProxies` → `hc.check()`. meow tracks no per-provider
+//! traffic, so `lazy` does not skip ticks here.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
@@ -42,6 +51,8 @@ const MAX_REFRESH_INTERVAL_SECS: u64 = meow_common::MAX_DURATION_SECS;
 #[derive(Default)]
 pub struct ProxyProviderRefreshSupervisor {
     tasks: Mutex<HashMap<String, (u64, JoinHandle<()>)>>,
+    /// `health-check` loops, keyed like `tasks` on (name, interval secs).
+    health: Mutex<HashMap<String, (u64, JoinHandle<()>)>>,
 }
 
 impl ProxyProviderRefreshSupervisor {
@@ -103,25 +114,62 @@ impl ProxyProviderRefreshSupervisor {
             })
             .collect();
 
-        let mut tasks = self.tasks.lock();
-        tasks.retain(|name, (interval, task)| {
-            let keep = wanted.get(name) == Some(interval) && !task.is_finished();
-            if !keep {
-                task.abort();
-            }
-            keep
-        });
-        for (name, interval) in wanted {
-            if tasks.contains_key(&name) {
-                continue;
-            }
-            let task = tokio::spawn(refresh_loop(
-                name.clone(),
+        reconcile_map(&self.tasks, wanted, |name, interval| {
+            tokio::spawn(refresh_loop(
+                name.to_string(),
                 interval,
                 Arc::downgrade(registry),
-            ));
-            tasks.insert(name, (interval, task));
-        }
+            ))
+        });
+
+        // A periodic sweep exists only where upstream's `auto()` would
+        // say so: `enable` set the interval and `NewHealthCheck` zeroes
+        // it again on an empty url — both must hold, or there is nothing
+        // scheduled to probe. The block's url/timeout/expected-status
+        // still feed the manual endpoint and the API echo either way.
+        let wanted_health: HashMap<String, u64> = registry
+            .iter()
+            .filter_map(|e| {
+                let hc = e.value().health_check.as_ref()?;
+                if !hc.enable || hc.url.is_empty() {
+                    return None;
+                }
+                // `interval` is already ≥1 (`build_health_check_config`
+                // maps 0 to the 300 s default); over the ceiling the
+                // block is non-schedulable — dropped with a warn like
+                // the refresh `wanted` set rather than silently clamped.
+                if hc.interval > MAX_REFRESH_INTERVAL_SECS {
+                    warn!(
+                        provider = %e.key(),
+                        interval = hc.interval,
+                        "proxy-provider health-check interval exceeds the maximum; not scheduling probes"
+                    );
+                    return None;
+                }
+                Some((e.key().clone(), hc.interval))
+            })
+            .collect();
+        reconcile_map(&self.health, wanted_health, |name, interval| {
+            tokio::spawn(health_check_loop(
+                name.to_string(),
+                interval,
+                Arc::downgrade(registry),
+            ))
+        });
+    }
+
+    /// Interval of a running health-check task (test introspection).
+    #[cfg(test)]
+    fn health_interval(&self, name: &str) -> Option<u64> {
+        self.health.lock().get(name).map(|(iv, _)| *iv)
+    }
+
+    /// `AbortHandle` of a running health-check task (test introspection) —
+    /// lets a test confirm reconcile's `abort()` terminated the loop, not
+    /// merely dropped it from the map.
+    #[cfg(test)]
+    fn health_abort_handle(&self, name: &str) -> Option<tokio::task::AbortHandle> {
+        self.health.lock().get(name).map(|(_, t)| t.abort_handle())
     }
 
     /// Number of running refresh tasks (test introspection).
@@ -164,6 +212,36 @@ impl Drop for ProxyProviderRefreshSupervisor {
         for (_, (_, task)) in self.tasks.get_mut().drain() {
             task.abort();
         }
+        for (_, (_, task)) in self.health.get_mut().drain() {
+            task.abort();
+        }
+    }
+}
+
+/// Diff `wanted` (provider name → loop interval) against the supervised
+/// `map`: abort entries that fell out of the wanted set or changed
+/// interval, reap finished ones, and `spawn` a loop for each new name.
+/// Shared by the refresh-`interval` and `health-check.interval` task
+/// sets — they differ only in their wanted-set source and the loop they
+/// spawn.
+fn reconcile_map(
+    map: &Mutex<HashMap<String, (u64, JoinHandle<()>)>>,
+    wanted: HashMap<String, u64>,
+    spawn: impl Fn(&str, u64) -> JoinHandle<()>,
+) {
+    let mut tasks = map.lock();
+    tasks.retain(|name, (interval, task)| {
+        let keep = wanted.get(name) == Some(interval) && !task.is_finished();
+        if !keep {
+            task.abort();
+        }
+        keep
+    });
+    for (name, interval) in wanted {
+        if tasks.contains_key(&name) {
+            continue;
+        }
+        tasks.insert(name.clone(), (interval, spawn(&name, interval)));
     }
 }
 
@@ -183,11 +261,15 @@ async fn refresh_loop(
         // Weak like the rule-provider loop: a supervisor that outlives its
         // embedder's registry must not pin the map (and transitively a
         // provider's whole slot + dialer registry) forever — the task exits
-        // and reconcile will not respawn it.
+        // and reconcile will not respawn it. Release the upgraded `Arc`
+        // before the refresh await for the same reason: a swapped-out
+        // registry generation must not stay pinned through a fetch.
         let Some(registry) = registry.upgrade() else {
             return;
         };
-        let Some(provider) = registry.get(&name).map(|e| Arc::clone(e.value())) else {
+        let provider = registry.get(&name).map(|e| Arc::clone(e.value()));
+        drop(registry);
+        let Some(provider) = provider else {
             debug!(provider = %name, "proxy-provider gone; refresh task idle until reconcile aborts it");
             continue;
         };
@@ -198,6 +280,79 @@ async fn refresh_loop(
         if let Err(e) = provider.refresh().await {
             error!(provider = %provider.name, "background refresh failed: {e}");
         }
+    }
+}
+
+/// Probe a provider's members every `interval_secs`, starting right away
+/// (mihomo checks a provider on load) *and* whenever a payload commit
+/// lands between ticks (mihomo's `setProxies` fires `go hc.check()`).
+/// The provider and its `health-check` settings are re-read by name each
+/// iteration, like [`refresh_loop`].
+async fn health_check_loop(
+    name: String,
+    interval_secs: u64,
+    registry: Weak<DashMap<String, Arc<ProxyProvider>>>,
+) {
+    let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        // Resolve this iteration's generation *before* the wait: the
+        // sleep listens on that provider's member-commit Notify, so a
+        // registry swap rebinds the wait to the live provider — parked on
+        // a retired one's Notify the loop would only ever wake on ticks.
+        let Some(registry) = registry.upgrade() else {
+            return;
+        };
+        let provider = registry.get(&name).map(|e| Arc::clone(e.value()));
+        // Release the registry `Arc` before the long wait/probe — same
+        // swapped-generation pinning concern as [`refresh_loop`].
+        drop(registry);
+        let Some(provider) = provider else {
+            debug!(provider = %name, "proxy-provider gone; health-check task idle until reconcile aborts it");
+            ticker.tick().await;
+            continue;
+        };
+        // `health_check` is fixed at provider build — once absent it can
+        // never reappear on this object (a reload that adds one rebuilds
+        // the provider, and reconcile respawns the loop from its wanted
+        // set) — so the task has nothing left to do: exit instead of
+        // ticking dead until reconcile's abort lands.
+        let Some(hc) = provider.health_check.as_ref() else {
+            return;
+        };
+        // Sleep until the next interval tick or the next member commit —
+        // a payload landing between ticks is probed on arrival, not an
+        // interval late (a commit made before this wait left a stored
+        // permit and fires the first `notified()` immediately). The
+        // generation parked on may swap out mid-sleep; the probe below
+        // still runs on it — harmless — and the next iteration rebinds.
+        tokio::select! {
+            _ = ticker.tick() => {}
+            _ = provider.members_changed().notified() => {}
+        }
+        let members: Vec<_> = provider
+            .proxies()
+            .into_iter()
+            .map(|proxy| (proxy.name().to_string(), proxy))
+            .collect();
+        // Nothing to probe, the url went empty, or `enable` flipped off
+        // on a same-name swap the spawn filter never saw (reconcile's
+        // abort lands on the next commit; until then don't run a sweep
+        // the current config disabled): upstream's `check()`/`execute()`
+        // skip — wait for the next wake.
+        if members.is_empty() || hc.url.is_empty() || !hc.enable {
+            continue;
+        }
+        let expected = (!hc.expected_status.is_empty()).then_some(hc.expected_status.as_str());
+        debug!(provider = %name, members = members.len(), "proxy-provider health-check");
+        let _ = meow_proxy::health::probe_many_bounded(
+            members,
+            &hc.url,
+            expected,
+            Duration::from_millis(hc.timeout.max(1)),
+            meow_proxy::health::PROVIDER_HEALTHCHECK_CONCURRENCY,
+        )
+        .await;
     }
 }
 
@@ -436,5 +591,164 @@ mod tests {
             Some(want),
             "the tick must have refreshed the file provider"
         );
+    }
+
+    /// A provider with `health-check` gets its own probe loop at the
+    /// health-check interval (independent of the refresh `interval`); a
+    /// reload that drops the provider aborts it.
+    #[tokio::test]
+    async fn reconcile_spawns_and_aborts_health_check_loops() {
+        let sup = ProxyProviderRefreshSupervisor::default();
+        let dir = tempfile::tempdir().unwrap();
+        let raw = RawProxyProvider {
+            provider_type: "file".to_string(),
+            url: None,
+            path: Some(dir.path().join("hc.yaml").display().to_string()),
+            health_check: Some(crate::raw::RawHealthCheck {
+                enable: Some(true),
+                url: Some("https://www.gstatic.com/generate_204".to_string()),
+                interval: Some(120),
+                timeout: None,
+                expected_status: None,
+                lazy: None,
+            }),
+            ..raw_provider(None)
+        };
+        let hc = Arc::new(
+            ProxyProvider::new(
+                "hc",
+                &raw,
+                Some(dir.path()),
+                true,
+                false,
+                Default::default(),
+            )
+            .expect("file provider must build"),
+        );
+        let reg = registry(&["plain"], dir.path());
+        reg.insert("hc".to_string(), hc);
+        let declared = raws(&[("hc", None), ("plain", None)]);
+        sup.reconcile(&reg, Some(&declared));
+        assert_eq!(sup.health_interval("hc"), Some(120));
+        assert_eq!(sup.health_interval("plain"), None);
+        assert_eq!(sup.task_count(), 0, "no refresh interval, no refresh task");
+        let handle = sup
+            .health_abort_handle("hc")
+            .expect("hc health task must be running");
+        assert!(!handle.is_finished());
+
+        reg.remove("hc");
+        sup.reconcile(&reg, Some(&raws(&[("plain", None)])));
+        assert_eq!(sup.health_interval("hc"), None);
+        // `abort()` is asynchronous — poll until the runtime reports the
+        // task finished, proving reconcile terminated the loop rather
+        // than merely unmapping it (a leaked task would keep probing a
+        // provider no config wants).
+        for _ in 0..100 {
+            if handle.is_finished() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            handle.is_finished(),
+            "reconcile must abort a dropped provider's health-check task"
+        );
+    }
+
+    /// mihomo `NewHealthCheck` zeroes the interval when `Enable` is unset
+    /// or the url is empty — the sweep exists only for `enable: true`
+    /// *and* a non-empty url. The block itself stays on the provider
+    /// either way (manual endpoint + `testUrl` echo keep working).
+    #[tokio::test]
+    async fn health_check_loops_require_enable_and_url() {
+        let sup = ProxyProviderRefreshSupervisor::default();
+        let dir = tempfile::tempdir().unwrap();
+        let build = |name: &str, hc: crate::raw::RawHealthCheck| {
+            let raw = RawProxyProvider {
+                provider_type: "file".to_string(),
+                url: None,
+                path: Some(
+                    dir.path()
+                        .join(format!("{name}.yaml"))
+                        .display()
+                        .to_string(),
+                ),
+                health_check: Some(hc),
+                ..raw_provider(None)
+            };
+            Arc::new(
+                ProxyProvider::new(
+                    name,
+                    &raw,
+                    Some(dir.path()),
+                    true,
+                    false,
+                    Default::default(),
+                )
+                .expect("file provider must build"),
+            )
+        };
+        let url = || Some("https://www.gstatic.com/generate_204".to_string());
+        let reg: Arc<DashMap<String, Arc<ProxyProvider>>> = Arc::new(DashMap::new());
+        for (name, hc) in [
+            (
+                "enabled",
+                crate::raw::RawHealthCheck {
+                    enable: Some(true),
+                    url: url(),
+                    interval: Some(60),
+                    timeout: None,
+                    expected_status: None,
+                    lazy: None,
+                },
+            ),
+            (
+                "disabled",
+                crate::raw::RawHealthCheck {
+                    enable: Some(false),
+                    url: url(),
+                    interval: Some(60),
+                    timeout: None,
+                    expected_status: None,
+                    lazy: None,
+                },
+            ),
+            (
+                "no-enable",
+                crate::raw::RawHealthCheck {
+                    enable: None,
+                    url: url(),
+                    interval: Some(60),
+                    timeout: None,
+                    expected_status: None,
+                    lazy: None,
+                },
+            ),
+            (
+                "empty-url",
+                crate::raw::RawHealthCheck {
+                    enable: Some(true),
+                    url: None,
+                    interval: Some(60),
+                    timeout: None,
+                    expected_status: None,
+                    lazy: None,
+                },
+            ),
+        ] {
+            reg.insert(name.to_string(), build(name, hc));
+        }
+        sup.reconcile(&reg, Some(&HashMap::new()));
+        assert_eq!(sup.health_interval("enabled"), Some(60));
+        // The rest keep their `health_check` block (for the manual
+        // endpoint) but spawn no periodic sweep.
+        for name in ["disabled", "no-enable", "empty-url"] {
+            assert_eq!(sup.health_interval(name), None, "{name} must not sweep");
+            assert!(
+                reg.get(name).unwrap().health_check.is_some(),
+                "{name} must keep the block for the manual endpoint"
+            );
+        }
     }
 }

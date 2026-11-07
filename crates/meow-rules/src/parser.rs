@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use meow_common::Rule;
@@ -26,6 +27,8 @@ use crate::network::NetworkRule;
 use crate::port::PortRule;
 use crate::process::ProcessRule;
 use crate::process_path::ProcessPathRule;
+use crate::rule_set::RuleSet;
+use crate::rule_set_rule::RuleSetRule;
 use crate::src_geoip::SrcGeoIpRule;
 use crate::uid::UidRule;
 
@@ -81,13 +84,44 @@ impl ParserContext {
 const MAX_LOGIC_DEPTH: usize = 64;
 const MAX_RULE_LINE_LEN: usize = 64 * 1024;
 
+/// Named rule-providers a `RULE-SET,<name>` sub-rule can reference.
+pub type RuleSets = HashMap<String, Arc<dyn RuleSet>>;
+
+/// Shared empty provider map for `parse_rule` — `HashMap::new` is not
+/// `const`, so a `OnceLock` builds it once instead of per line parsed.
+static NO_RULE_SETS: std::sync::OnceLock<RuleSets> = std::sync::OnceLock::new();
+
+/// Parse a rule line with **no rule-provider scope**: a `RULE-SET` entry
+/// (top-level or inside a logic group) always fails as unknown-provider.
+/// That is the scope provider payloads get — deliberately stricter than
+/// mihomo, whose `RULE-SET` parses anywhere and resolves the name lazily
+/// through `tunnel.RuleProviders()` at match time (a payload may even
+/// reference a provider declared later, and references may cycle — the
+/// recursion just never matches). Eager resolution against a scoped map
+/// keeps a payload self-contained and makes cycles impossible (Class B,
+/// ADR-0002). Config `rules:` blocks that must resolve `RULE-SET` use
+/// [`parse_rule_with_rule_sets`].
 pub fn parse_rule(line: &str, ctx: &ParserContext) -> Result<Box<dyn Rule>, String> {
-    parse_rule_depth(line, ctx, 0)
+    parse_rule_depth(line, ctx, NO_RULE_SETS.get_or_init(RuleSets::new), 0)
+}
+
+/// [`parse_rule`] that also resolves `RULE-SET,<name>` — at the top level
+/// and inside `AND`/`OR`/`NOT` groups (mihomo parity) — against `rule_sets`.
+/// `rule_sets` is the only scope `RULE-SET` resolves against; it is for
+/// the top-level `rules:` block, never for a provider's own payload (see
+/// [`parse_rule`]).
+pub fn parse_rule_with_rule_sets(
+    line: &str,
+    ctx: &ParserContext,
+    rule_sets: &RuleSets,
+) -> Result<Box<dyn Rule>, String> {
+    parse_rule_depth(line, ctx, rule_sets, 0)
 }
 
 fn parse_rule_depth(
     line: &str,
     ctx: &ParserContext,
+    rule_sets: &RuleSets,
     logic_depth: usize,
 ) -> Result<Box<dyn Rule>, String> {
     if line.len() > MAX_RULE_LINE_LEN {
@@ -99,7 +133,7 @@ fn parse_rule_depth(
     if let Some((ty, rest)) = split_once_trimmed(line, ',') {
         let upper = ty.to_ascii_uppercase();
         if matches!(upper.as_str(), "AND" | "OR" | "NOT") {
-            return parse_logic_rule(&upper, rest, ctx, logic_depth);
+            return parse_logic_rule(&upper, rest, ctx, rule_sets, logic_depth);
         }
     }
 
@@ -125,6 +159,17 @@ fn parse_rule_depth(
     let extra = parts.get(3).map(|s| s.trim());
 
     match rule_type {
+        "RULE-SET" => {
+            let set = rule_sets
+                .get(payload)
+                .ok_or_else(|| format!("unknown rule-provider '{payload}'"))?;
+            Ok(Box::new(RuleSetRule::new(
+                payload,
+                Arc::clone(set),
+                adapter,
+                parse_rule_flags(extra),
+            )))
+        }
         "DOMAIN" => Ok(Box::new(DomainRule::new(payload, adapter))),
         "DOMAIN-SUFFIX" => Ok(Box::new(DomainSuffixRule::new(payload, adapter))),
         "DOMAIN-KEYWORD" => Ok(Box::new(DomainKeywordRule::new(payload, adapter))),
@@ -293,6 +338,7 @@ fn parse_logic_rule(
     rule_type: &str,
     rest: &str,
     ctx: &ParserContext,
+    rule_sets: &RuleSets,
     logic_depth: usize,
 ) -> Result<Box<dyn Rule>, String> {
     if logic_depth >= MAX_LOGIC_DEPTH {
@@ -379,7 +425,7 @@ fn parse_logic_rule(
             ));
         }
         let patched = splice_inner_adapter(g.trim());
-        inner_rules.push(parse_rule_depth(&patched, ctx, logic_depth + 1)?);
+        inner_rules.push(parse_rule_depth(&patched, ctx, rule_sets, logic_depth + 1)?);
     }
 
     match rule_type {
@@ -442,28 +488,39 @@ fn split_logic_groups(inner: &str) -> Result<Vec<String>, String> {
     Ok(groups)
 }
 
+/// Adapter slot filler spliced into logic sub-rules by
+/// [`splice_inner_adapter`]. The owning logic/rule-set wrapper carries
+/// the real adapter; the placeholder is discarded at match time.
+/// `pub(crate)` so warn paths can recognise the sentinel instead of
+/// printing it where a user-written adapter name would go.
+pub(crate) const LOGIC_INNER_PLACEHOLDER: &str = "LOGIC-INNER-PLACEHOLDER";
+
 /// Splice a placeholder adapter into `TYPE,PAYLOAD[,extra]` so the inner rule
 /// satisfies `parse_rule`'s `TYPE,PAYLOAD,ADAPTER[,extra]` shape. The owning
 /// logic/rule-set wrapper carries the real adapter; the placeholder is
 /// discarded at match time.
 fn splice_inner_adapter(entry: &str) -> String {
-    const PLACEHOLDER: &str = "LOGIC-INNER-PLACEHOLDER";
     // Logic sub-rules carry their own parenthesised payload that must not be
     // split on commas — their "adapter" slot is appended at the end.
     if let Some((ty, _)) = entry.split_once(',') {
         let upper = ty.trim().to_ascii_uppercase();
         if matches!(upper.as_str(), "AND" | "OR" | "NOT") {
-            return format!("{entry},{PLACEHOLDER}");
+            return format!("{entry},{LOGIC_INNER_PLACEHOLDER}");
         }
     }
     let parts: Vec<&str> = entry.splitn(3, ',').collect();
     match parts.as_slice() {
-        [ty, payload] => format!("{},{},{}", ty.trim(), payload.trim(), PLACEHOLDER),
+        [ty, payload] => format!(
+            "{},{},{}",
+            ty.trim(),
+            payload.trim(),
+            LOGIC_INNER_PLACEHOLDER
+        ),
         [ty, payload, rest] => format!(
             "{},{},{},{}",
             ty.trim(),
             payload.trim(),
-            PLACEHOLDER,
+            LOGIC_INNER_PLACEHOLDER,
             rest.trim()
         ),
         _ => entry.to_string(),
