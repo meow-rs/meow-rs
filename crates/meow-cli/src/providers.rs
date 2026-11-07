@@ -149,11 +149,13 @@ pub async fn update(ctx: &Ctx, name: &str, kind: Option<ProviderKind>) -> anyhow
 pub async fn check(ctx: &Ctx, name: &str) -> anyhow::Result<()> {
     let path = format!("/providers/proxies/{}", encode(name));
     let provider: ProxyProvider = serde_json::from_value(ctx.client.get(&path).await?)?;
-    // meow answers 204 without testing anything then.
+    // testUrl echoes the block's url even with `enable: false` — the
+    // bail condition is "no health-check block, or a block without url":
+    // meow answers both 204 without testing anything.
     if provider.test_url.is_empty() {
         bail!(
-            "{name} has no health-check in the config, or it is disabled; test its nodes one \
-             by one with `meow-cli proxy test`"
+            "{name} has no health-check url in the config; test its nodes one by one \
+             with `meow-cli proxy test`"
         );
     }
     ctx.client

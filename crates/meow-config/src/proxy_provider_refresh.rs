@@ -134,10 +134,19 @@ impl ProxyProviderRefreshSupervisor {
                 if !hc.enable || hc.url.is_empty() {
                     return None;
                 }
-                Some((
-                    e.key().clone(),
-                    hc.interval.clamp(1, MAX_REFRESH_INTERVAL_SECS),
-                ))
+                // `interval` is already ≥1 (`build_health_check_config`
+                // maps 0 to the 300 s default); over the ceiling the
+                // block is non-schedulable — dropped with a warn like
+                // the refresh `wanted` set rather than silently clamped.
+                if hc.interval > MAX_REFRESH_INTERVAL_SECS {
+                    warn!(
+                        provider = %e.key(),
+                        interval = hc.interval,
+                        "proxy-provider health-check interval exceeds the maximum; not scheduling probes"
+                    );
+                    return None;
+                }
+                Some((e.key().clone(), hc.interval))
             })
             .collect();
         reconcile_map(&self.health, wanted_health, |name, interval| {
@@ -326,10 +335,12 @@ async fn health_check_loop(
             .into_iter()
             .map(|proxy| (proxy.name().to_string(), proxy))
             .collect();
-        // Nothing to probe, or the url went empty on a same-name swap the
-        // spawn filter never saw: upstream's `check()`/`execute()` skip
-        // both — wait for the next wake.
-        if members.is_empty() || hc.url.is_empty() {
+        // Nothing to probe, the url went empty, or `enable` flipped off
+        // on a same-name swap the spawn filter never saw (reconcile's
+        // abort lands on the next commit; until then don't run a sweep
+        // the current config disabled): upstream's `check()`/`execute()`
+        // skip — wait for the next wake.
+        if members.is_empty() || hc.url.is_empty() || !hc.enable {
             continue;
         }
         let expected = (!hc.expected_status.is_empty()).then_some(hc.expected_status.as_str());

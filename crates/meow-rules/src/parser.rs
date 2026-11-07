@@ -488,28 +488,39 @@ fn split_logic_groups(inner: &str) -> Result<Vec<String>, String> {
     Ok(groups)
 }
 
+/// Adapter slot filler spliced into logic sub-rules by
+/// [`splice_inner_adapter`]. The owning logic/rule-set wrapper carries
+/// the real adapter; the placeholder is discarded at match time.
+/// `pub(crate)` so warn paths can recognise the sentinel instead of
+/// printing it where a user-written adapter name would go.
+pub(crate) const LOGIC_INNER_PLACEHOLDER: &str = "LOGIC-INNER-PLACEHOLDER";
+
 /// Splice a placeholder adapter into `TYPE,PAYLOAD[,extra]` so the inner rule
 /// satisfies `parse_rule`'s `TYPE,PAYLOAD,ADAPTER[,extra]` shape. The owning
 /// logic/rule-set wrapper carries the real adapter; the placeholder is
 /// discarded at match time.
 fn splice_inner_adapter(entry: &str) -> String {
-    const PLACEHOLDER: &str = "LOGIC-INNER-PLACEHOLDER";
     // Logic sub-rules carry their own parenthesised payload that must not be
     // split on commas — their "adapter" slot is appended at the end.
     if let Some((ty, _)) = entry.split_once(',') {
         let upper = ty.trim().to_ascii_uppercase();
         if matches!(upper.as_str(), "AND" | "OR" | "NOT") {
-            return format!("{entry},{PLACEHOLDER}");
+            return format!("{entry},{LOGIC_INNER_PLACEHOLDER}");
         }
     }
     let parts: Vec<&str> = entry.splitn(3, ',').collect();
     match parts.as_slice() {
-        [ty, payload] => format!("{},{},{}", ty.trim(), payload.trim(), PLACEHOLDER),
+        [ty, payload] => format!(
+            "{},{},{}",
+            ty.trim(),
+            payload.trim(),
+            LOGIC_INNER_PLACEHOLDER
+        ),
         [ty, payload, rest] => format!(
             "{},{},{},{}",
             ty.trim(),
             payload.trim(),
-            PLACEHOLDER,
+            LOGIC_INNER_PLACEHOLDER,
             rest.trim()
         ),
         _ => entry.to_string(),

@@ -79,10 +79,10 @@ is reported as the provider's `subscriptionInfo` in
 | Field | Type | Default | Notes |
 | --- | --- | --- | --- |
 | `enable` | bool | `false` | `true` schedules a sweep every `interval` — but only when `url` is also set. A block without `enable: true` runs no sweep yet still feeds the manual endpoint and the `testUrl`/`expectedStatus` API echo; it logs a warning naming the provider |
-| `url` | string | `""` | Probe target, stored verbatim — no built-in default. Empty (or absent) means **no probes**: no sweep, and the manual endpoint returns 204 without checking anything |
+| `url` | string | `""` | Probe target, stored trimmed — no built-in default. Empty, whitespace-only or absent means **no probes**: no sweep, and the manual endpoint returns 204 without checking anything |
 | `interval` | u64 (s) | `300` | Sweep period in seconds; `0` maps to `300`, never to "every tick" |
 | `timeout` | u64 (ms) | `5000` | Per-probe timeout; `0` maps to `5000` like an absent value |
-| `expected-status` | string | `200-299` | Status that counts as healthy: `204`, `"200-299"`, `"200/204"`, or `*` for any. Validated at load whenever the block is present — a bad value fails the provider even with `enable: false`. (Upstream treats empty as `*` — diverges deliberately) |
+| `expected-status` | string or int | `200-299` | Status that counts as healthy: `204`, `"200-299"`, `"200/204"`, or `*` for any. Validated at load whenever the block is present — a bad value fails the provider even with `enable: false`. (Upstream treats empty as `*` — diverges deliberately) |
 | `lazy` | bool | `false` | Upstream skips sweeps while the provider is idle. **Not honoured** — meow tracks no per-provider traffic, so sweeps run every interval; an explicit `lazy: true` warns at load |
 
 With `enable: true` and a `url`, members are probed every `interval`

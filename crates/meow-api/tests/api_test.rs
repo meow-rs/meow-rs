@@ -681,6 +681,78 @@ rules: ['MATCH,PROXY']
     assert_eq!(beta["provider-name"], "beta");
 }
 
+/// `enable` gates only the scheduled sweep: the manual
+/// `/providers/proxies/{name}/healthcheck` probes with the block's url
+/// either way (mihomo `execute` ignores `Enable`), while a block with no
+/// url — like a missing block — answers 204 without probing anything
+/// (upstream's empty-testUrl skip).
+#[tokio::test]
+async fn provider_healthcheck_ignores_enable_and_skips_empty_url() {
+    let relay = spawn_socks5_relay().await;
+    let origin = spawn_sub_origin("").await;
+    let nodes = socks5_nodes(&["hk-01"], relay);
+    let config = format!(
+        "mode: rule
+proxies:
+  - {{name: home, type: socks5, server: 127.0.0.1, port: 1}}
+proxy-providers:
+  disabled-hc:
+    type: file
+    path: {{dir}}/disabled-hc.yaml
+    health-check:
+      enable: false
+      url: http://{origin}/generate_204
+      timeout: 5000
+  no-url:
+    type: file
+    path: {{dir}}/no-url.yaml
+    health-check:
+      enable: true
+proxy-groups:
+  - {{name: PROXY, type: select, proxies: [home], use: [disabled-hc, no-url]}}
+rules: ['MATCH,PROXY']
+"
+    );
+    let state = state_with_file_providers(
+        &config,
+        &[("disabled-hc", nodes.as_str()), ("no-url", nodes.as_str())],
+    )
+    .await;
+    let node = |name: &str| {
+        let provider = Arc::clone(state.proxy_providers.get(name).unwrap().value());
+        provider
+            .proxies()
+            .into_iter()
+            .find(|proxy| proxy.name() == "hk-01")
+            .unwrap()
+    };
+    let disabled_node = node("disabled-hc");
+    assert!(
+        disabled_node.delay_history().is_empty(),
+        "enable: false spawns no sweep — nothing may have probed yet"
+    );
+
+    // A manual request probes anyway: `enable` disables the timer, not
+    // the endpoint.
+    let (status, _) = get_json(&state, "/providers/proxies/disabled-hc/healthcheck").await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        disabled_node.delay_history().len(),
+        1,
+        "the manual probe records on the member's own ProxyHealth"
+    );
+
+    // No url: 204 without probing (upstream `execute` skips an empty
+    // testUrl); `enable: true` does not conjure a probe target.
+    let no_url_node = node("no-url");
+    let (status, _) = get_json(&state, "/providers/proxies/no-url/healthcheck").await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(
+        no_url_node.delay_history().is_empty(),
+        "an empty url must probe nothing"
+    );
+}
+
 /// mihomo reports `hidden` and `icon` on every group (`false` / `""` when
 /// unset) and on no leaf proxy. Clash Party leaves hidden groups out of its
 /// list and draws the icon on the group's header.

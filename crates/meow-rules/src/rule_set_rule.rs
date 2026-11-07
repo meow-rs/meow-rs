@@ -30,8 +30,16 @@ impl RuleSetRule {
         // parse path — the top-level `rules:` entry and a sub-rule inside
         // `AND`/`OR`/`NOT` — warns identically.
         if flags.is_src && set.behavior() == RuleSetBehavior::Domain {
+            // Inside `AND`/`OR`/`NOT` the adapter slot holds the parser's
+            // splice placeholder — the enclosing logic group owns the real
+            // target. Name it rather than echoing the sentinel.
+            let shown = if adapter == crate::parser::LOGIC_INNER_PLACEHOLDER {
+                "<enclosing logic group's target>"
+            } else {
+                adapter
+            };
             tracing::warn!(
-                "RULE-SET,{name},{adapter},src: `src` has no effect on a \
+                "RULE-SET,{name},{shown},src: `src` has no effect on a \
                  domain-behavior rule-provider (it is meaningful only for \
                  ipcidr/classical behavior)"
             );

@@ -215,8 +215,8 @@ What to know before changing things:
   downloads included. `dns flush-fakeip` breaks open fake-IP flows.
 - Provider and subscription updates fetch over the network and can take a
   minute. `provider check` runs the provider's `health-check:`; a provider
-  without one (or with it disabled) is refused, so test its nodes with
-  `proxy test`.
+  with no block, or a block without `url`, is refused (there is nothing to
+  probe with), so test its nodes with `proxy test`.
 - `logbook clear` deletes the record for good.
 - Subscription URLs carry access tokens: `subscription list` shows only their
   host. Never ask for or print the full URL.

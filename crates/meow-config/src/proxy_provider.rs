@@ -38,10 +38,12 @@ pub(crate) const MAX_REVALIDATION_ATTEMPTS: u32 = 5;
 const USERINFO_SUFFIX: &str = ".subscription-userinfo";
 
 pub struct HealthCheckConfig {
-    /// mihomo `healthCheckSchema.URL` verbatim — empty means "no probe
-    /// URL configured": upstream zeroes the interval (`NewHealthCheck`),
-    /// so no periodic sweep runs and both the scheduled loop and the
-    /// manual healthcheck endpoint skip probing.
+    /// mihomo `healthCheckSchema.URL`, stored trimmed (upstream
+    /// `strings.TrimSpace`s it in `execute()`/`registerHealthCheckTask`)
+    /// — empty means "no probe URL configured": upstream zeroes the
+    /// interval (`NewHealthCheck`), so no periodic sweep runs and both
+    /// the scheduled loop and the manual healthcheck endpoint skip
+    /// probing.
     pub url: String,
     /// mihomo `healthCheckSchema.Enable` — gates only the periodic
     /// sweep; the block still feeds the manual healthcheck endpoint and
@@ -52,9 +54,10 @@ pub struct HealthCheckConfig {
     pub timeout: u64,
     pub expected_status: String,
     /// Upstream `Lazy` skips a tick when the provider saw no traffic in
-    /// the last interval. Not honoured: meow tracks no per-provider
-    /// last-touch, so ticks are never skipped (same precedent as group
-    /// `lazy` — #555, ADR-0002). Parsed so a ported config can declare it.
+    /// the last interval. Parsed for config compatibility only, never
+    /// read: meow tracks no per-provider last-touch, so ticks are never
+    /// skipped (same precedent as group `lazy` — #555, ADR-0002; an
+    /// explicit `lazy: true` warns at build).
     pub lazy: bool,
 }
 
@@ -1186,9 +1189,10 @@ impl ProxyProvider {
         );
         // Wake the health-check sweep: upstream probes on `setProxies`,
         // so a committed payload is checked on arrival instead of one
-        // full interval later. Only *changed* content reaches here — an
-        // unchanged refetch dedups earlier (`ingest`), slightly fewer
-        // probes than upstream's per-update check.
+        // full interval later. Probe coverage matches upstream — its
+        // `loadBuf` hash-dedups an unchanged payload before `setProxies`
+        // (and the attached `hc.check()`) ever runs, the same early
+        // return `ingest` takes ahead of this commit.
         self.members_changed.notify_one();
     }
 
@@ -1827,10 +1831,14 @@ fn build_health_check_config(
              members will not be probed periodically"
         );
     }
-    // mihomo stores the URL verbatim and zeroes the interval when it is
-    // empty (`NewHealthCheck`) — no gstatic default: an undeclared url
-    // must mean "no probes", and the manual endpoint skips it too.
-    let url = hc.url.clone().unwrap_or_default();
+    // mihomo keeps no gstatic default and zeroes the interval when the
+    // url is empty (`NewHealthCheck`): an undeclared url must mean "no
+    // probes", and the manual endpoint skips it too. Upstream also
+    // `strings.TrimSpace`s the url in `execute()`/`registerHealthCheckTask`
+    // before the empty check and the probe, so store it trimmed: a
+    // whitespace-only value degrades to the empty-url path instead of a
+    // sweep whose every probe fails URL parsing (all members marked dead).
+    let url = hc.url.as_deref().unwrap_or_default().trim().to_string();
     if enable && url.is_empty() {
         warn!(
             provider = %name,
@@ -2181,17 +2189,52 @@ mod tests {
         assert_eq!(cfg.timeout, 250);
     }
 
-    /// The url is stored verbatim — no gstatic fallback: mihomo zeroes
+    /// The url is stored trimmed — no gstatic fallback: mihomo zeroes
     /// the interval on an empty url, so "not declared" must mean "no
     /// probes" rather than "probe the default".
     #[test]
-    fn health_check_url_keeps_empty_verbatim() {
+    fn health_check_url_keeps_empty() {
         for url in [None, Some("")] {
             let cfg =
                 build_health_check_config("p", Some(&hc(Some(true), url, None, None, None, None)))
                     .unwrap()
                     .unwrap();
             assert!(cfg.url.is_empty(), "no implicit probe url: {:?}", cfg.url);
+        }
+    }
+
+    /// Upstream `strings.TrimSpace`s the url in `execute()`/
+    /// `registerHealthCheckTask` — the build stores it already trimmed
+    /// so surrounding padding cannot reach the probe, and a
+    /// whitespace-only value folds into the empty-url path (no sweep,
+    /// manual endpoint 204s) instead of spawning a sweep whose every
+    /// probe fails URL parsing and dead-marks every member.
+    #[test]
+    fn health_check_url_is_trimmed() {
+        let cfg = build_health_check_config(
+            "p",
+            Some(&hc(
+                Some(true),
+                Some("  https://probe.test/204  "),
+                None,
+                None,
+                None,
+                None,
+            )),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(cfg.url, "https://probe.test/204");
+        for url in [Some("   "), Some("\t \n")] {
+            let cfg =
+                build_health_check_config("p", Some(&hc(Some(true), url, None, None, None, None)))
+                    .unwrap()
+                    .unwrap();
+            assert!(
+                cfg.url.is_empty(),
+                "whitespace-only must normalise to empty: {:?}",
+                cfg.url
+            );
         }
     }
 
