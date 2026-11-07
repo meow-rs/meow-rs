@@ -227,17 +227,19 @@ pub async fn parse_dns(
             None
         } else {
             let bootstrap_clients = build_policy_bootstrap_clients(&default_ns_urls, &main_urls);
-            Some(
-                build_nameserver_policy(
-                    nsp_map,
-                    geosite.as_ref(),
-                    &bootstrap_clients,
-                    proxy_registry,
-                    rule_providers,
-                    strict,
-                )
-                .await?,
+            let mut policy = build_nameserver_policy(
+                nsp_map,
+                geosite.as_ref(),
+                &bootstrap_clients,
+                proxy_registry,
+                rule_providers,
+                strict,
             )
+            .await?;
+            if let Some(exclusive) = dns.nameserver_policy_exclusive {
+                policy = policy.with_exclusive(exclusive);
+            }
+            Some(policy)
         }
     } else {
         None
@@ -259,17 +261,19 @@ pub async fn parse_dns(
             {
                 let bootstrap_clients =
                     build_policy_bootstrap_clients(&default_ns_urls, &main_urls);
-                Some(
-                    build_nameserver_policy(
-                        nsp_map,
-                        geosite.as_ref(),
-                        &bootstrap_clients,
-                        proxy_registry,
-                        rule_providers,
-                        strict,
-                    )
-                    .await?,
+                let mut policy = build_nameserver_policy(
+                    nsp_map,
+                    geosite.as_ref(),
+                    &bootstrap_clients,
+                    proxy_registry,
+                    rule_providers,
+                    strict,
                 )
+                .await?;
+                if let Some(exclusive) = dns.nameserver_policy_exclusive {
+                    policy = policy.with_exclusive(exclusive);
+                }
+                Some(policy)
             }
             _ => None,
         };
@@ -1728,6 +1732,99 @@ mod tests {
         .await
         .unwrap();
         assert!(cfg.resolver.direct_resolver().is_none());
+    }
+
+    /// `nameserver-policy-exclusive` reaches the built resolver: a matched
+    /// domain answers from its policy nameservers ahead of the
+    /// fallback-filter domain gate, and the flag defaults to off. Every
+    /// tier is an `rcode://` transport — no sockets — so the returned
+    /// rcode names the tier that answered.
+    #[tokio::test]
+    async fn nameserver_policy_exclusive_wires_through_parse_dns() {
+        use hickory_proto::op::ResponseCode;
+        use hickory_proto::rr::{Name, RecordType};
+        for (yaml_flag, expected) in [
+            ("true", ResponseCode::NXDomain),
+            ("false", ResponseCode::Refused),
+        ] {
+            let raw: RawConfig = serde_saphyr::from_str(&format!(
+                "dns:\n  enable: true\n  nameserver:\n    - rcode://success\n  fallback:\n    - rcode://refused\n  fallback-filter:\n    geoip: false\n    domain:\n      - 'confined.test'\n  nameserver-policy-exclusive: {yaml_flag}\n  nameserver-policy:\n    'confined.test': rcode://name_error\n"
+            ))
+            .unwrap();
+            let cfg = parse_dns(
+                &raw,
+                None,
+                None,
+                &HashMap::new(),
+                None,
+                &HashMap::new(),
+                None,
+            )
+            .await
+            .unwrap();
+            let name = Name::from_ascii("confined.test").unwrap();
+            let msg = cfg
+                .resolver
+                .forward_generic("confined.test", &name, RecordType::TXT)
+                .await
+                .expect("every tier is an rcode transport — one must answer");
+            assert_eq!(msg.metadata.response_code, expected, "flag {yaml_flag}");
+
+            // A domain the policy does not cover still reaches the main
+            // pool, flag or no flag.
+            let other = Name::from_ascii("other.test").unwrap();
+            let msg = cfg
+                .resolver
+                .forward_generic("other.test", &other, RecordType::TXT)
+                .await
+                .unwrap();
+            assert_eq!(
+                msg.metadata.response_code,
+                ResponseCode::NoError,
+                "flag {yaml_flag}"
+            );
+        }
+    }
+
+    /// `direct-nameserver-follow-policy` inherits `nameserver-policy-exclusive`:
+    /// the flag reaches the direct resolver's own policy copy, not just the
+    /// main resolver's. (The direct resolver runs no fallback filter, so the
+    /// flag itself is the observable wiring here.)
+    #[tokio::test]
+    async fn nameserver_policy_exclusive_reaches_direct_resolver() {
+        let raw: RawConfig = serde_saphyr::from_str(
+            "dns:\n  enable: true\n  nameserver:\n    - rcode://success\n  direct-nameserver:\n    - rcode://success\n  direct-nameserver-follow-policy: true\n  nameserver-policy-exclusive: true\n  nameserver-policy:\n    'confined.test': rcode://name_error\n",
+        )
+        .unwrap();
+        let cfg = parse_dns(
+            &raw,
+            None,
+            None,
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            cfg.resolver
+                .nameserver_policy()
+                .map(meow_dns::NameserverPolicy::is_exclusive),
+            Some(true),
+            "the main resolver's policy must carry the flag"
+        );
+        let direct = cfg
+            .resolver
+            .direct_resolver()
+            .expect("direct-nameserver must install a direct resolver");
+        assert_eq!(
+            direct
+                .nameserver_policy()
+                .map(meow_dns::NameserverPolicy::is_exclusive),
+            Some(true),
+            "the direct resolver's policy copy must inherit the flag"
+        );
     }
 
     #[tokio::test]

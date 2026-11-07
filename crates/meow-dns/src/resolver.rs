@@ -41,7 +41,9 @@ impl From<Vec<IpAddr>> for HostEntry {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum BootstrapError {
-    #[error("default-nameserver entry '{entry}' must be a plain UDP/TCP nameserver (tls:// and https:// are not allowed here because they would create a bootstrap loop)")]
+    #[error(
+        "default-nameserver entry '{entry}' must be a plain UDP/TCP nameserver (tls:// and https:// are not allowed here because they would create a bootstrap loop)"
+    )]
     DefaultNameserverNotPlain { entry: String },
     #[error("cannot resolve '{host}' via bootstrap nameserver: {source}")]
     CannotResolve { host: String, source: BoxError },
@@ -137,6 +139,9 @@ pub struct NameserverPolicy {
     /// Whether the next domain key may join a trailing `Domains` arm;
     /// [`Self::close_domain_arm`] clears it so the next one opens a new arm.
     domain_arm_open: bool,
+    /// `nameserver-policy-exclusive`: a matched entry owns its query
+    /// end-to-end — see [`Self::with_exclusive`].
+    exclusive: bool,
 }
 
 impl Default for NameserverPolicy {
@@ -151,7 +156,22 @@ impl NameserverPolicy {
             arms: Vec::new(),
             clients: Vec::new(),
             domain_arm_open: false,
+            exclusive: false,
         }
+    }
+
+    /// Make a matched policy the sole source for a query
+    /// (`nameserver-policy-exclusive`): the matched entry's nameservers
+    /// answer or the query fails — the fallback-filter domain gate, its
+    /// `ipcidr`/geoip rejection, and the main/fallback tiers are all
+    /// skipped. This is mihomo `ipExchange` parity: upstream returns
+    /// right after `matchPolicy`, so a matched domain's answer is never
+    /// filtered either. The flag is policy-wide (per-key exclusivity is
+    /// not offered); confining a zone to a private upstream means
+    /// trusting that upstream's answers as-is.
+    pub fn with_exclusive(mut self, exclusive: bool) -> Self {
+        self.exclusive = exclusive;
+        self
     }
 
     /// End the open domain arm without adding a matcher: the next domain
@@ -227,6 +247,12 @@ impl NameserverPolicy {
         self.track_clients(&entry);
         self.arms
             .push(PolicyArm::Matcher(MatcherPolicyEntry { matcher, entry }));
+    }
+
+    /// Whether a matched entry confines its query to its own nameservers
+    /// (`nameserver-policy-exclusive`) — see [`Self::with_exclusive`].
+    pub fn is_exclusive(&self) -> bool {
+        self.exclusive
     }
 
     /// First-match-wins scan over the document-ordered arms: a `Domains`
@@ -1867,16 +1893,61 @@ impl Resolver {
         }
     }
 
-    /// The tier chain's raw outcome: the best `FamilySet` seen (always
-    /// non-positive at the return boundary — positives exit early) paired
-    /// with the most informative upstream failure observed anywhere along
-    /// the chain. `run_pipeline` caches the set and collapses the pair.
+    /// First-match-wins nameserver-policy lookup shared by the address
+    /// and generic pipelines: the matched entry plus the policy-wide
+    /// `exclusive` flag. Holding the returned `&PolicyEntry` across the
+    /// query awaits below is sound: policy entries are immutable for the
+    /// resolver's lifetime — a config reload swaps the whole `Resolver`
+    /// generation rather than mutating one — and the entry is `Sync`,
+    /// which `Arc<Resolver>` sharing across tasks already requires.
+    fn policy_match(&self, host: &str) -> Option<(&PolicyEntry, bool)> {
+        self.policy
+            .as_ref()
+            .and_then(|p| p.lookup(host).map(|entry| (entry, p.exclusive)))
+    }
+
+    /// A `debug!`/`conn_note!` pair for an exclusive match on a pool-less
+    /// entry: `query_pool_*` on an empty slice returns no answer and no
+    /// error, so without this line the query vanishes silently. Only
+    /// reachable through a programmatically-built policy — the config
+    /// builder hard-errors an entry with no valid nameservers (ADR-0002
+    /// Class A), and the non-exclusive arm needs no note: an empty pool
+    /// there is just a negative that falls through to the global tier.
+    fn note_empty_exclusive_pool(host: &str) {
+        debug!(
+            host,
+            "exclusive nameserver-policy entry has no nameservers; dropping the query"
+        );
+        conn_note!(
+            Dns,
+            "exclusive nameserver-policy for {host} has no nameservers — query dropped"
+        );
+    }
+
+    /// The tier chain's raw outcome: the best `FamilySet` seen paired
+    /// with the most informative upstream failure observed anywhere
+    /// along the chain — `run_pipeline` caches the set and collapses the
+    /// pair. The fall-through return below is always non-positive since
+    /// positives exit early; an `exclusive` policy match exits before
+    /// the chain even starts and may return a positive set directly.
     async fn pipeline_inner(
         &self,
         host: &str,
         want: QueryFamilies,
     ) -> (Option<FamilySet>, Option<ClientError>) {
         debug!(host, ?want, "DNS lookup");
+
+        // An exclusive policy match owns the query end-to-end (mihomo
+        // `ipExchange` parity — upstream returns right after `matchPolicy`):
+        // no domain gate, no IP gate on its answers, no other tier.
+        let matched = self.policy_match(host);
+        if let Some((entry, true)) = matched {
+            conn_note!(Dns, "nameserver-policy exclusively handles {host}");
+            if entry.nameservers.is_empty() {
+                Self::note_empty_exclusive_pool(host);
+            }
+            return query_pool_set(&entry.nameservers, host, want, self.ipv6).await;
+        }
 
         // Domain-gate: skip primary entirely, go straight to fallback.
         if let Some(ff) = &self.fallback_filter {
@@ -1894,34 +1965,32 @@ impl Resolver {
         let mut upstream_err: Option<ClientError> = None;
 
         // Nameserver-policy lookup.
-        if let Some(policy) = &self.policy {
-            if let Some(entry) = policy.lookup(host) {
-                conn_note!(Dns, "nameserver-policy matched {host}");
-                let (set, err) = query_pool_set(&entry.nameservers, host, want, self.ipv6).await;
-                upstream_err = prefer_errno(upstream_err, err);
-                if let Some(set) = set {
-                    if set.has_positive() {
-                        if self
-                            .fallback_filter
-                            .as_ref()
-                            .is_some_and(|ff| ff.ip_gated(&set.positive_ips()))
-                        {
-                            conn_note!(
-                                Dns,
-                                "fallback-filter rejects {}; asking the fallback servers",
-                                IpList(&set.positive_ips())
-                            );
-                            let (set, err) = self.query_fallback_set(host, want).await;
-                            return (set, prefer_errno(err, upstream_err));
-                        }
-                        return (Some(set), upstream_err);
+        if let Some((entry, _)) = matched {
+            conn_note!(Dns, "nameserver-policy matched {host}");
+            let (set, err) = query_pool_set(&entry.nameservers, host, want, self.ipv6).await;
+            upstream_err = prefer_errno(upstream_err, err);
+            if let Some(set) = set {
+                if set.has_positive() {
+                    if self
+                        .fallback_filter
+                        .as_ref()
+                        .is_some_and(|ff| ff.ip_gated(&set.positive_ips()))
+                    {
+                        conn_note!(
+                            Dns,
+                            "fallback-filter rejects {}; asking the fallback servers",
+                            IpList(&set.positive_ips())
+                        );
+                        let (set, err) = self.query_fallback_set(host, want).await;
+                        return (set, prefer_errno(err, upstream_err));
                     }
-                    if negative.is_none() {
-                        negative = Some(set);
-                    }
+                    return (Some(set), upstream_err);
                 }
-                // Policy negative: fall through to global nameservers.
+                if negative.is_none() {
+                    negative = Some(set);
+                }
             }
+            // Policy negative: fall through to global nameservers.
         }
 
         // Global nameservers (parallel, first-positive / first-definitive-negative).
@@ -2042,6 +2111,9 @@ impl Resolver {
     /// first pool answer wins outright — a negative rcode from a gated
     /// tier does not escalate to the next tier.
     ///
+    /// An `exclusive` policy match short-circuits all of it — domain gate
+    /// included — exactly like the address pipeline.
+    ///
     /// Skips the `ip_gated` fallback hop — the fallback-filter's IP-CIDR /
     /// GeoIP gates only apply to address records.
     pub async fn forward_generic(
@@ -2050,18 +2122,21 @@ impl Resolver {
         query_name: &Name,
         record_type: RecordType,
     ) -> Option<Message> {
+        let matched = self.policy_match(domain);
+        if let Some((entry, true)) = matched {
+            if entry.nameservers.is_empty() {
+                Self::note_empty_exclusive_pool(domain);
+            }
+            return query_pool_generic(&entry.nameservers, query_name, record_type).await;
+        }
         if let Some(ff) = &self.fallback_filter {
             if ff.domain_gated(domain) {
                 return self.try_fallback_generic(query_name, record_type).await;
             }
         }
-        if let Some(policy) = &self.policy {
-            if let Some(entry) = policy.lookup(domain) {
-                if let Some(l) =
-                    query_pool_generic(&entry.nameservers, query_name, record_type).await
-                {
-                    return Some(l);
-                }
+        if let Some((entry, _)) = matched {
+            if let Some(l) = query_pool_generic(&entry.nameservers, query_name, record_type).await {
+                return Some(l);
             }
         }
         if let Some(l) = query_pool_generic(&self.main, query_name, record_type).await {
@@ -4333,6 +4408,107 @@ mod tests {
             })),
         )];
         (resolver, dials)
+    }
+
+    /// An `exclusive` policy confines a matched query to the entry's pool
+    /// on both pipelines — the fallback-filter domain gate, the global
+    /// main pool and the fallback pool are all skipped (the empty entry
+    /// can never answer, so confinement shows up purely as an absence of
+    /// dials). Shared mode still reaches every tier, and a non-matching
+    /// host always reaches the main pool.
+    #[tokio::test]
+    async fn exclusive_policy_confines_address_and_generic_queries() {
+        let host = "internal.example";
+        let name = Name::from_ascii(host).unwrap();
+        for exclusive in [true, false] {
+            let (mut resolver, main_dials) = emfile_resolver_gated(None);
+            let mut policy = NameserverPolicy::new().with_exclusive(exclusive);
+            policy.insert_exact(
+                host.into(),
+                PolicyEntry {
+                    nameservers: vec![],
+                },
+            );
+            resolver.policy = Some(policy);
+            resolver.pipeline_inner(host, QueryFamilies::IPV4).await;
+            assert_eq!(main_dials.swap(0, Ordering::SeqCst) == 0, exclusive);
+            resolver.forward_generic(host, &name, RecordType::TXT).await;
+            assert_eq!(main_dials.swap(0, Ordering::SeqCst) == 0, exclusive);
+
+            let (fallback, fallback_dials) = emfile_resolver_gated(None);
+            resolver.fallback = Some(fallback.main);
+            let mut domain = DomainTrie::new();
+            domain.insert(host, ());
+            resolver.fallback_filter = Some(FallbackFilter {
+                geoip_enabled: false,
+                geoip_code: String::new(),
+                ipcidr: vec![],
+                domain,
+                geoip_reader: None,
+            });
+            resolver.pipeline_inner(host, QueryFamilies::IPV4).await;
+            assert_eq!(fallback_dials.swap(0, Ordering::SeqCst) == 0, exclusive);
+            // The domain gate skips the main pool entirely — either
+            // because the query went straight to the fallback (shared)
+            // or straight to the policy (exclusive); a regression that
+            // lets the main pool run shows up here for either flag.
+            assert_eq!(main_dials.swap(0, Ordering::SeqCst), 0);
+            resolver.forward_generic(host, &name, RecordType::TXT).await;
+            assert_eq!(fallback_dials.swap(0, Ordering::SeqCst) == 0, exclusive);
+            assert_eq!(main_dials.swap(0, Ordering::SeqCst), 0);
+
+            resolver
+                .pipeline_inner("unmatched.example", QueryFamilies::IPV4)
+                .await;
+            assert!(main_dials.load(Ordering::SeqCst) > 0);
+        }
+    }
+
+    /// `exclusive` owns a matched query end-to-end — mihomo `ipExchange`
+    /// parity — so the fallback-filter IP gate never sees its answer: a
+    /// positive reply is the verdict even when `ipcidr` would reject it.
+    /// The shared (non-exclusive) path escalates the same answer to the
+    /// fallback pool instead.
+    #[tokio::test]
+    async fn exclusive_policy_answer_ignores_fallback_ip_gate() {
+        let host = "internal.example";
+        let policy_ip = Ipv4Addr::new(10, 9, 9, 9);
+        let fallback_ip = Ipv4Addr::new(192, 0, 2, 9);
+        for exclusive in [true, false] {
+            let policy_upstream = one_shot_a_upstream(ResponseCode::NoError, Some(policy_ip)).await;
+            let fallback_upstream =
+                one_shot_a_upstream(ResponseCode::NoError, Some(fallback_ip)).await;
+            let (mut resolver, main_dials) = emfile_resolver_gated(None);
+            let mut policy = NameserverPolicy::new().with_exclusive(exclusive);
+            policy.insert_exact(
+                host.into(),
+                PolicyEntry {
+                    nameservers: vec![Arc::new(DnsClient::udp(policy_upstream))],
+                },
+            );
+            resolver.policy = Some(policy);
+            resolver.fallback = Some(vec![Arc::new(DnsClient::udp(fallback_upstream))]);
+            resolver.fallback_filter = Some(FallbackFilter {
+                geoip_enabled: false,
+                geoip_code: String::new(),
+                // The policy answer sits inside the gate — shared mode
+                // must discard it, exclusive must not.
+                ipcidr: vec!["10.0.0.0/8".parse().unwrap()],
+                domain: DomainTrie::new(),
+                geoip_reader: None,
+            });
+            let (set, err) = resolver.pipeline_inner(host, QueryFamilies::IPV4).await;
+            let ips = set
+                .unwrap_or_else(|| panic!("a tier must answer the query: {err:?}"))
+                .positive_ips();
+            let expected = if exclusive { policy_ip } else { fallback_ip };
+            assert_eq!(ips, vec![IpAddr::V4(expected)], "exclusive={exclusive}");
+            assert_eq!(
+                main_dials.swap(0, Ordering::SeqCst),
+                0,
+                "the global tier must not run for a matched policy host"
+            );
+        }
     }
 
     fn emfile_resolver() -> Resolver {

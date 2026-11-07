@@ -83,6 +83,7 @@ cause problems; items marked ~ work with caveats; items marked ✓ work.
 | `dns:` — `prefer-h3` / `?h3=` | ✓ | Global flag = h3 with HTTP/1.1 fallback; `?h3=true` = HTTP/3 only (mihomo's meaning); `?h3=prefer` / `?h3=false` are meow-rs's per-entry opt-in/opt-out. |
 | `dns:` — `default-nameserver` | ✓ | Bootstrap resolver for encrypted upstream hostnames. |
 | `dns:` — `nameserver-policy` | ✓ | Exact, `+.`/`*.`/`.` wildcard, `geosite:`/`rule-set:` policy keys. Key order is the lookup priority (document order = first match wins); a matcher key shadows domain keys written after it, and same-slot collisions resolve to the document-last key. |
+| `dns:` — `nameserver-policy-exclusive` | ✓ | meow-rs opt-in for upstream's ordering: a policy match is terminal — no `fallback-filter` domain/IP gate, no main/`fallback:` tiers. Off by default (meow's default tiers defer to `fallback-filter`). |
 | `dns:` — `fallback-filter` | ✓ | GeoIP/IP-CIDR/domain gates. |
 | `hosts:` (top level) + `dns:` `use-system-hosts` | ✓ | M1.E-5, wildcards supported. |
 | `dns:` — `fake-ip` mode | ✓ | v4/v6 pools, `fake-ip-filter`, `fake-ip-filter-mode`, `store-fake-ip` JSON persistence. See §fake-ip mode. |
