@@ -156,10 +156,10 @@ proxy-groups:
 | `url` | string | if `http` | — | Subscription URL. |
 | `path` | string | yes | — | Local cache path. For `http`: write fetched YAML here. For `file`: read from here. Relative paths resolved from the config file's directory. |
 | `interval` | integer | no | `0` | Refresh interval in seconds, scheduled by the refresh supervisor on every config commit. `0` or absent = no background refresh (manual `PUT /providers/proxies/{name}` still works). `file` providers re-read their file each tick — upstream instead fs-watchers file providers, so an un-`interval`ed `file` provider does not auto-reload here (divergence #2). |
-| `health-check.enable` | bool | no | `false` | Enable periodic health-check probes. |
+| `health-check.enable` | bool | no | `false` | Enable periodic health-check probes. A `health-check:` block with `enable` absent or not `true` is inert but logs a `warn!` naming the provider. |
 | `health-check.url` | string | if `enable` | — | URL used for reachability probes. |
 | `health-check.interval` | integer | no | `300` | Health-check sweep interval in seconds, run by the refresh supervisor; `0` means the default `300` (mihomo). |
-| `health-check.lazy` | bool | no | `false` | If true, defer first probe until the proxy is first used by a connection. Not honoured: meow tracks no per-provider traffic, so members are probed every interval (a warning is logged once). |
+| `health-check.lazy` | bool | no | `false` | If true, defer first probe until the proxy is first used by a connection. Not honoured: meow tracks no per-provider traffic, so members are probed every interval (a warning is logged per provider at load). |
 | `health-check.expected-status` | integer or string | no | any 2xx | HTTP status that counts as healthy: a bare code (`204`), codes and ranges separated by `,` or `/` (`"200-299"`, `"200/204"`), or `*` for any. Validated at load: a bad spec fails the provider. |
 | `override` | map | no | `{}` | Key-value overrides applied to every proxy. See §Override. |
 | `filter` | string | no | `""` | Regex. Include only proxies whose `name` matches. Empty = include all. |

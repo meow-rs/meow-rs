@@ -87,12 +87,26 @@ const MAX_RULE_LINE_LEN: usize = 64 * 1024;
 /// Named rule-providers a `RULE-SET,<name>` sub-rule can reference.
 pub type RuleSets = HashMap<String, Arc<dyn RuleSet>>;
 
+/// Shared empty provider map for `parse_rule` — `HashMap::new` is not
+/// `const`, so a `OnceLock` builds it once instead of per line parsed.
+static NO_RULE_SETS: std::sync::OnceLock<RuleSets> = std::sync::OnceLock::new();
+
+/// Parse a rule line with **no rule-provider scope**: a `RULE-SET` entry
+/// (top-level or inside a logic group) always fails as unknown-provider.
+/// That is the scope provider payloads get — a classical rule-set file
+/// cannot reference sibling providers, matching mihomo, whose
+/// `payloadToRule` parses provider content with no provider context.
+/// Config `rules:` blocks that must resolve `RULE-SET` use
+/// [`parse_rule_with_rule_sets`].
 pub fn parse_rule(line: &str, ctx: &ParserContext) -> Result<Box<dyn Rule>, String> {
-    parse_rule_depth(line, ctx, &RuleSets::new(), 0)
+    parse_rule_depth(line, ctx, NO_RULE_SETS.get_or_init(RuleSets::new), 0)
 }
 
 /// [`parse_rule`] that also resolves `RULE-SET,<name>` — at the top level
 /// and inside `AND`/`OR`/`NOT` groups (mihomo parity) — against `rule_sets`.
+/// `rule_sets` is the only scope `RULE-SET` resolves against; it is for
+/// the top-level `rules:` block, never for a provider's own payload (see
+/// [`parse_rule`]).
 pub fn parse_rule_with_rule_sets(
     line: &str,
     ctx: &ParserContext,

@@ -1228,6 +1228,9 @@ impl ParsedUrl {
 /// Empty / `None` defaults to `[200..=299]`, matching upstream.
 /// Validate an `expected-status` spec at config load (mihomo fails the
 /// provider build on a bad one rather than every probe at run time).
+/// `pub` for that one caller — `meow-config`'s provider build; it lives
+/// in `meow-proxy` because the spec it validates is this crate's
+/// probe-domain syntax.
 pub fn validate_expected_status(spec: &str) -> Result<(), String> {
     parse_expected(Some(spec)).map(drop)
 }
@@ -1247,6 +1250,13 @@ fn parse_expected(spec: Option<&str>) -> Result<Vec<(u16, u16)>, String> {
         let piece = piece.trim();
         if piece.is_empty() {
             continue;
+        }
+        if piece == "*" {
+            return Err(
+                "expected: `*` (any status) must stand alone — it cannot be combined \
+                 in a list"
+                    .into(),
+            );
         }
         if let Some((lo, hi)) = piece.split_once('-') {
             let lo: u16 = lo
@@ -1514,6 +1524,8 @@ mod tests {
             ),
             ("inverted range is rejected", Some("300-200"), None),
             ("garbage is rejected", Some("abc"), None),
+            ("star in a list is rejected", Some("*,200"), None),
+            ("star in a slash list is rejected", Some("200/*"), None),
         ];
 
         // Every case runs even if an earlier one fails, so one bad input does
@@ -1546,6 +1558,14 @@ mod tests {
             "parse_expected mismatches:\n{}",
             failures.join("\n")
         );
+    }
+
+    /// `*` mixed into a list must not surface as an opaque `bad code "*"` —
+    /// the error names the standalone-only rule.
+    #[test]
+    fn expected_status_star_in_list_explains_standalone() {
+        let err = validate_expected_status("*,200").unwrap_err();
+        assert!(err.contains("stand alone"), "unexpected: {err}");
     }
 
     mod chain_probe {

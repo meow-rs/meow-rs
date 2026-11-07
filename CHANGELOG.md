@@ -48,6 +48,10 @@ the canonical, in-repo source a release is cut from.
   `Result<usize>` — the number of non-UTF-8 keys skipped during the
   walk. meow-common gains `sweep_scratch_siblings_excluding`, a
   keep-file variant of the stale-scratch sweep.
+- A `proxy-providers:` `health-check:` block whose `enable:` is absent
+  or not `true` now logs a `warn!` naming the provider. The block is
+  still inert (mihomo's `Enable` has no default), but the disable is no
+  longer silent.
 
 ### Fixed
 

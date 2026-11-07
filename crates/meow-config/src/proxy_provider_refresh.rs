@@ -110,26 +110,13 @@ impl ProxyProviderRefreshSupervisor {
             })
             .collect();
 
-        let mut tasks = self.tasks.lock();
-        tasks.retain(|name, (interval, task)| {
-            let keep = wanted.get(name) == Some(interval) && !task.is_finished();
-            if !keep {
-                task.abort();
-            }
-            keep
-        });
-        for (name, interval) in wanted {
-            if tasks.contains_key(&name) {
-                continue;
-            }
-            let task = tokio::spawn(refresh_loop(
-                name.clone(),
+        reconcile_map(&self.tasks, wanted, |name, interval| {
+            tokio::spawn(refresh_loop(
+                name.to_string(),
                 interval,
                 Arc::downgrade(registry),
-            ));
-            tasks.insert(name, (interval, task));
-        }
-        drop(tasks);
+            ))
+        });
 
         let wanted_health: HashMap<String, u64> = registry
             .iter()
@@ -141,31 +128,27 @@ impl ProxyProviderRefreshSupervisor {
                 ))
             })
             .collect();
-        let mut health = self.health.lock();
-        health.retain(|name, (interval, task)| {
-            let keep = wanted_health.get(name) == Some(interval) && !task.is_finished();
-            if !keep {
-                task.abort();
-            }
-            keep
-        });
-        for (name, interval) in wanted_health {
-            if health.contains_key(&name) {
-                continue;
-            }
-            let task = tokio::spawn(health_check_loop(
-                name.clone(),
+        reconcile_map(&self.health, wanted_health, |name, interval| {
+            tokio::spawn(health_check_loop(
+                name.to_string(),
                 interval,
                 Arc::downgrade(registry),
-            ));
-            health.insert(name, (interval, task));
-        }
+            ))
+        });
     }
 
     /// Interval of a running health-check task (test introspection).
     #[cfg(test)]
     fn health_interval(&self, name: &str) -> Option<u64> {
         self.health.lock().get(name).map(|(iv, _)| *iv)
+    }
+
+    /// `AbortHandle` of a running health-check task (test introspection) —
+    /// lets a test confirm reconcile's `abort()` terminated the loop, not
+    /// merely dropped it from the map.
+    #[cfg(test)]
+    fn health_abort_handle(&self, name: &str) -> Option<tokio::task::AbortHandle> {
+        self.health.lock().get(name).map(|(_, t)| t.abort_handle())
     }
 
     /// Number of running refresh tasks (test introspection).
@@ -214,6 +197,33 @@ impl Drop for ProxyProviderRefreshSupervisor {
     }
 }
 
+/// Diff `wanted` (provider name → loop interval) against the supervised
+/// `map`: abort entries that fell out of the wanted set or changed
+/// interval, reap finished ones, and `spawn` a loop for each new name.
+/// Shared by the refresh-`interval` and `health-check.interval` task
+/// sets — they differ only in their wanted-set source and the loop they
+/// spawn.
+fn reconcile_map(
+    map: &Mutex<HashMap<String, (u64, JoinHandle<()>)>>,
+    wanted: HashMap<String, u64>,
+    spawn: impl Fn(&str, u64) -> JoinHandle<()>,
+) {
+    let mut tasks = map.lock();
+    tasks.retain(|name, (interval, task)| {
+        let keep = wanted.get(name) == Some(interval) && !task.is_finished();
+        if !keep {
+            task.abort();
+        }
+        keep
+    });
+    for (name, interval) in wanted {
+        if tasks.contains_key(&name) {
+            continue;
+        }
+        tasks.insert(name.clone(), (interval, spawn(&name, interval)));
+    }
+}
+
 async fn refresh_loop(
     name: String,
     interval_secs: u64,
@@ -230,11 +240,15 @@ async fn refresh_loop(
         // Weak like the rule-provider loop: a supervisor that outlives its
         // embedder's registry must not pin the map (and transitively a
         // provider's whole slot + dialer registry) forever — the task exits
-        // and reconcile will not respawn it.
+        // and reconcile will not respawn it. Release the upgraded `Arc`
+        // before the refresh await for the same reason: a swapped-out
+        // registry generation must not stay pinned through a fetch.
         let Some(registry) = registry.upgrade() else {
             return;
         };
-        let Some(provider) = registry.get(&name).map(|e| Arc::clone(e.value())) else {
+        let provider = registry.get(&name).map(|e| Arc::clone(e.value()));
+        drop(registry);
+        let Some(provider) = provider else {
             debug!(provider = %name, "proxy-provider gone; refresh task idle until reconcile aborts it");
             continue;
         };
@@ -263,12 +277,22 @@ async fn health_check_loop(
         let Some(registry) = registry.upgrade() else {
             return;
         };
-        let Some(provider) = registry.get(&name).map(|e| Arc::clone(e.value())) else {
+        // Drop the registry `Arc` before the probe — a long await —
+        // rather than holding it into the next tick on every branch
+        // (same swapped-generation pinning concern as [`refresh_loop`]).
+        let provider = registry.get(&name).map(|e| Arc::clone(e.value()));
+        drop(registry);
+        let Some(provider) = provider else {
+            debug!(provider = %name, "proxy-provider gone; health-check task idle until reconcile aborts it");
             continue;
         };
-        drop(registry);
+        // `health_check` is fixed at provider build — once absent it can
+        // never reappear on this object (a reload that adds one rebuilds
+        // the provider, and reconcile respawns the loop from its wanted
+        // set) — so the task has nothing left to do: exit instead of
+        // ticking dead until reconcile's abort lands.
         let Some(hc) = provider.health_check.as_ref() else {
-            continue;
+            return;
         };
         let members: Vec<_> = provider
             .proxies()
@@ -567,9 +591,27 @@ mod tests {
         assert_eq!(sup.health_interval("hc"), Some(120));
         assert_eq!(sup.health_interval("plain"), None);
         assert_eq!(sup.task_count(), 0, "no refresh interval, no refresh task");
+        let handle = sup
+            .health_abort_handle("hc")
+            .expect("hc health task must be running");
+        assert!(!handle.is_finished());
 
         reg.remove("hc");
         sup.reconcile(&reg, Some(&raws(&[("plain", None)])));
         assert_eq!(sup.health_interval("hc"), None);
+        // `abort()` is asynchronous — poll until the runtime reports the
+        // task finished, proving reconcile terminated the loop rather
+        // than merely unmapping it (a leaked task would keep probing a
+        // provider no config wants).
+        for _ in 0..100 {
+            if handle.is_finished() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            handle.is_finished(),
+            "reconcile must abort a dropped provider's health-check task"
+        );
     }
 }

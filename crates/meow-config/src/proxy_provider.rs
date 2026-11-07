@@ -309,7 +309,7 @@ impl ProxyProvider {
         let exclude_type = split_exclude_types(raw.exclude_type.as_deref());
 
         // Probed every `interval` by `ProxyProviderRefreshSupervisor`.
-        let health_check = build_health_check_config(raw.health_check.as_ref())
+        let health_check = build_health_check_config(name, raw.health_check.as_ref())
             .map_err(|e| format!("proxy-provider '{name}': health-check {e}"))?;
         let header = raw
             .header
@@ -1771,21 +1771,31 @@ async fn read_cache(path: Option<&Path>, name: &str) -> Result<String, String> {
 }
 
 fn build_health_check_config(
+    name: &str,
     raw: Option<&RawHealthCheck>,
 ) -> Result<Option<HealthCheckConfig>, String> {
     let Some(hc) = raw else { return Ok(None) };
-    // mihomo's `Enable` has no default: a bare block does not probe.
+    // mihomo's `Enable` has no default: a bare block does not probe. The
+    // disable is surfaced rather than silent — a health-check block whose
+    // probes never run is almost always a config mistake.
     if !hc.enable.unwrap_or(false) {
+        warn!(
+            provider = %name,
+            "proxy-provider health-check present but `enable` is not true; \
+             members will not be probed"
+        );
         return Ok(None);
     }
     if let Some(spec) = hc.expected_status.as_deref() {
         meow_proxy::health::validate_expected_status(spec)?;
     }
     if hc.lazy == Some(true) {
-        static LAZY: std::sync::Once = std::sync::Once::new();
-        LAZY.call_once(|| {
-            warn!("proxy-provider health-check `lazy` is not honoured: members are probed every interval");
-        });
+        // Per provider per build — a process-global `Once` would hide
+        // every offender's name but the first's.
+        warn!(
+            provider = %name,
+            "proxy-provider health-check `lazy` is not honoured: members are probed every interval"
+        );
     }
     Ok(Some(HealthCheckConfig {
         url: hc
