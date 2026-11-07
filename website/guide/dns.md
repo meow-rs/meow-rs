@@ -28,6 +28,7 @@ still used internally so rules and proxies can resolve names.
 | `default-nameserver` | list | `[]` | Bootstrap servers to resolve DoT/DoH hostnames |
 | `proxy-server-nameserver` | list | `[]` | Dedicated upstreams for proxy server hostnames; when unset they use `nameserver` |
 | `nameserver-policy` | map | — | Per-domain upstream routing |
+| `nameserver-policy-exclusive` | bool | `false` | Confine policy-matched queries to that entry's upstreams |
 | `fallback-filter` | block | — | When to use `fallback` |
 | `fake-ip-range` | string | `198.18.0.1/16` | Fake-IP CIDR pool |
 | `fake-ip-filter` | list | `[]` | Domains excluded/included from FakeIP |
@@ -125,6 +126,14 @@ dns:
 (or `classical`, in which case only its domain rules are matched); an `ipcidr` provider or
 a missing provider is a config error. The matcher reads the provider live, so background
 refreshes apply automatically.
+
+`nameserver-policy-exclusive: true` makes a match terminal: the entry's upstreams
+answer or the query fails — no `fallback-filter` gates (including the `ipcidr`/GeoIP
+answer check) and no `nameserver`/`fallback:` escalation, the same ordering mihomo
+gives a policy hit. It also applies to `direct-nameserver` lookups when
+`direct-nameserver-follow-policy` is on. The default `false` keeps the tiered
+behaviour: a policy negative falls through to `nameserver`, and a policy answer the
+fallback filter rejects goes to `fallback:`.
 
 ## Fallback filter
 

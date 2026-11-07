@@ -139,6 +139,8 @@ pub struct NameserverPolicy {
     /// Whether the next domain key may join a trailing `Domains` arm;
     /// [`Self::close_domain_arm`] clears it so the next one opens a new arm.
     domain_arm_open: bool,
+    /// `nameserver-policy-exclusive`: a matched entry owns its query
+    /// end-to-end — see [`Self::with_exclusive`].
     exclusive: bool,
 }
 
@@ -245,6 +247,12 @@ impl NameserverPolicy {
         self.track_clients(&entry);
         self.arms
             .push(PolicyArm::Matcher(MatcherPolicyEntry { matcher, entry }));
+    }
+
+    /// Whether a matched entry confines its query to its own nameservers
+    /// (`nameserver-policy-exclusive`) — see [`Self::with_exclusive`].
+    pub fn is_exclusive(&self) -> bool {
+        self.exclusive
     }
 
     /// First-match-wins scan over the document-ordered arms: a `Domains`
@@ -1886,14 +1894,16 @@ impl Resolver {
     }
 
     /// First-match-wins nameserver-policy lookup shared by the address
-    /// and generic pipelines: the matched entry's nameserver pool plus
-    /// the policy-wide `exclusive` flag. The pool is cloned out of the
-    /// policy — a `Vec` of `Arc` clients, so a refcount bump per server —
-    /// which keeps no `&self.policy` borrow alive across the query awaits.
-    fn policy_match(&self, host: &str) -> Option<(Vec<Arc<DnsClient>>, bool)> {
+    /// and generic pipelines: the matched entry plus the policy-wide
+    /// `exclusive` flag. Holding the returned `&PolicyEntry` across the
+    /// query awaits below is sound: policy entries are immutable for the
+    /// resolver's lifetime — a config reload swaps the whole `Resolver`
+    /// generation rather than mutating one — and the entry is `Sync`,
+    /// which `Arc<Resolver>` sharing across tasks already requires.
+    fn policy_match(&self, host: &str) -> Option<(&PolicyEntry, bool)> {
         self.policy
             .as_ref()
-            .and_then(|p| p.lookup(host).map(|e| (e.nameservers.clone(), p.exclusive)))
+            .and_then(|p| p.lookup(host).map(|entry| (entry, p.exclusive)))
     }
 
     /// A `debug!`/`conn_note!` pair for an exclusive match on a pool-less
@@ -1914,10 +1924,12 @@ impl Resolver {
         );
     }
 
-    /// The tier chain's raw outcome: the best `FamilySet` seen (always
-    /// non-positive at the return boundary — positives exit early) paired
-    /// with the most informative upstream failure observed anywhere along
-    /// the chain. `run_pipeline` caches the set and collapses the pair.
+    /// The tier chain's raw outcome: the best `FamilySet` seen paired
+    /// with the most informative upstream failure observed anywhere
+    /// along the chain — `run_pipeline` caches the set and collapses the
+    /// pair. The fall-through return below is always non-positive since
+    /// positives exit early; an `exclusive` policy match exits before
+    /// the chain even starts and may return a positive set directly.
     async fn pipeline_inner(
         &self,
         host: &str,
@@ -1929,11 +1941,12 @@ impl Resolver {
         // `ipExchange` parity — upstream returns right after `matchPolicy`):
         // no domain gate, no IP gate on its answers, no other tier.
         let matched = self.policy_match(host);
-        if let Some((nameservers, true)) = matched.as_ref() {
-            if nameservers.is_empty() {
+        if let Some((entry, true)) = matched {
+            conn_note!(Dns, "nameserver-policy exclusively handles {host}");
+            if entry.nameservers.is_empty() {
                 Self::note_empty_exclusive_pool(host);
             }
-            return query_pool_set(nameservers, host, want, self.ipv6).await;
+            return query_pool_set(&entry.nameservers, host, want, self.ipv6).await;
         }
 
         // Domain-gate: skip primary entirely, go straight to fallback.
@@ -1952,9 +1965,9 @@ impl Resolver {
         let mut upstream_err: Option<ClientError> = None;
 
         // Nameserver-policy lookup.
-        if let Some((nameservers, _)) = matched.as_ref() {
+        if let Some((entry, _)) = matched {
             conn_note!(Dns, "nameserver-policy matched {host}");
-            let (set, err) = query_pool_set(nameservers, host, want, self.ipv6).await;
+            let (set, err) = query_pool_set(&entry.nameservers, host, want, self.ipv6).await;
             upstream_err = prefer_errno(upstream_err, err);
             if let Some(set) = set {
                 if set.has_positive() {
@@ -2110,19 +2123,19 @@ impl Resolver {
         record_type: RecordType,
     ) -> Option<Message> {
         let matched = self.policy_match(domain);
-        if let Some((nameservers, true)) = matched.as_ref() {
-            if nameservers.is_empty() {
+        if let Some((entry, true)) = matched {
+            if entry.nameservers.is_empty() {
                 Self::note_empty_exclusive_pool(domain);
             }
-            return query_pool_generic(nameservers, query_name, record_type).await;
+            return query_pool_generic(&entry.nameservers, query_name, record_type).await;
         }
         if let Some(ff) = &self.fallback_filter {
             if ff.domain_gated(domain) {
                 return self.try_fallback_generic(query_name, record_type).await;
             }
         }
-        if let Some((nameservers, _)) = matched.as_ref() {
-            if let Some(l) = query_pool_generic(nameservers, query_name, record_type).await {
+        if let Some((entry, _)) = matched {
+            if let Some(l) = query_pool_generic(&entry.nameservers, query_name, record_type).await {
                 return Some(l);
             }
         }
@@ -4397,6 +4410,12 @@ mod tests {
         (resolver, dials)
     }
 
+    /// An `exclusive` policy confines a matched query to the entry's pool
+    /// on both pipelines — the fallback-filter domain gate, the global
+    /// main pool and the fallback pool are all skipped (the empty entry
+    /// can never answer, so confinement shows up purely as an absence of
+    /// dials). Shared mode still reaches every tier, and a non-matching
+    /// host always reaches the main pool.
     #[tokio::test]
     async fn exclusive_policy_confines_address_and_generic_queries() {
         let host = "internal.example";

@@ -1786,6 +1786,47 @@ mod tests {
         }
     }
 
+    /// `direct-nameserver-follow-policy` inherits `nameserver-policy-exclusive`:
+    /// the flag reaches the direct resolver's own policy copy, not just the
+    /// main resolver's. (The direct resolver runs no fallback filter, so the
+    /// flag itself is the observable wiring here.)
+    #[tokio::test]
+    async fn nameserver_policy_exclusive_reaches_direct_resolver() {
+        let raw: RawConfig = serde_saphyr::from_str(
+            "dns:\n  enable: true\n  nameserver:\n    - rcode://success\n  direct-nameserver:\n    - rcode://success\n  direct-nameserver-follow-policy: true\n  nameserver-policy-exclusive: true\n  nameserver-policy:\n    'confined.test': rcode://name_error\n",
+        )
+        .unwrap();
+        let cfg = parse_dns(
+            &raw,
+            None,
+            None,
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            cfg.resolver
+                .nameserver_policy()
+                .map(meow_dns::NameserverPolicy::is_exclusive),
+            Some(true),
+            "the main resolver's policy must carry the flag"
+        );
+        let direct = cfg
+            .resolver
+            .direct_resolver()
+            .expect("direct-nameserver must install a direct resolver");
+        assert_eq!(
+            direct
+                .nameserver_policy()
+                .map(meow_dns::NameserverPolicy::is_exclusive),
+            Some(true),
+            "the direct resolver's policy copy must inherit the flag"
+        );
+    }
+
     #[tokio::test]
     async fn proxy_server_nameserver_ignored_when_dns_disabled() {
         // mihomo: ProxyServerHostResolver is nil whenever the DNS section is
