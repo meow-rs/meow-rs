@@ -10,6 +10,17 @@ the canonical, in-repo source a release is cut from.
 
 ### Changed
 
+- **Hysteria 2 sends far fewer ACK-only packets on downloads.** The
+  connection driver flushed after every receive wakeup, answering a
+  network-paced stream with one small ACK-only datagram per 2-3
+  received packets — in a local profile that was ~70% of the driver's
+  busy time. Flushes that would carry only an ACK are now held until
+  eight datagrams have been accepted or the first unacknowledged one is
+  200 µs old — a dedicated timer enforces the deadline, and any wakeup
+  carrying commands, quiche timeouts, or freshly queued stream frames
+  still flushes at once — and never while an application command
+  arrived within the last millisecond, so an ACK can still ride on
+  upstream data.
 - **`v2ray-plugin`'s `mux` now defaults to on**, as in the upstream
   client (`-mux` defaults to 1) and mihomo; it used to default to off.
   A node without a `mux` key now speaks Mux.Cool, which a server on

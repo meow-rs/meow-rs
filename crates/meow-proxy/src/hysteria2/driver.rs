@@ -89,14 +89,18 @@ const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const RECV_BATCH: usize = 32;
 /// Commands handled per wakeup, for the same reason on the upload side.
 const CMD_BATCH: usize = 64;
-/// An ACK-only flush is held back until this many datagrams have arrived since
-/// the last flush...
+/// An ACK-only flush is held back until this many datagrams have been accepted
+/// by quiche since the last flush...
 const ACK_COALESCE_PKTS: u32 = 8;
-/// ...or the first of them is this old, whichever comes first. Far below the
-/// 25 ms default `max_ack_delay`, so loss recovery is unaffected.
+/// ...or the first of them is this old, whichever comes first. tokio's ~1 ms
+/// timer granularity is the effective floor — still far below the 25 ms
+/// default `max_ack_delay`, so loss recovery is unaffected. With
+/// [`ACK_COALESCE_PKTS`] this is a deliberate RFC 9000 §13.2.2 deviation —
+/// fewer ACKs than one-per-two during bursts, bounded by the delay.
 const ACK_COALESCE_DELAY: Duration = Duration::from_micros(200);
-/// An ACK may ride on upstream data, so nothing is held back while the
-/// application wrote within this window (request/response, uploads).
+/// An ACK may ride on upstream data, so nothing is held back while an
+/// application command arrived within this window (request/response,
+/// uploads).
 const ACK_COALESCE_APP_QUIET: Duration = Duration::from_millis(1);
 /// Largest payload chunk handed to a stream's reader in one channel item;
 /// with [`STREAM_READ_CHANNEL_CAP`] it bounds what a slow reader holds.
@@ -302,7 +306,8 @@ async fn run(
     let mut ack_since: Option<tokio::time::Instant> = None;
     let ack_timer = tokio::time::sleep(Duration::ZERO);
     tokio::pin!(ack_timer);
-    let mut last_app_cmd = tokio::time::Instant::now() - ACK_COALESCE_APP_QUIET;
+    // `None` means no application command yet — the app counts as quiet.
+    let mut last_app_cmd: Option<tokio::time::Instant> = None;
 
     if let Err(e) = flush_send(&mut st, &mut conn, &mut send_buf).await {
         // `Io` carries the socket errno through `hy2_error` →
@@ -389,21 +394,30 @@ async fn run(
             }
         }
 
-        cleanup_streams(&mut st, &mut conn);
+        // A wakeup that explicitly queued outbound frames — STREAM data/FIN,
+        // RESET or STOP_SENDING — must not wait on the coalescing deadline.
+        // (Frames quiche queues internally still can — they wait at most the
+        // delay below.)
+        let mut queued = cleanup_streams(&mut st, &mut conn);
         if auth_done {
             pump_reads(&mut st, &mut conn, &mut buf);
             pump_datagrams(&mut st, &mut conn, &mut buf);
         }
-        pump_writes(&mut st, &mut conn);
-        cleanup_streams(&mut st, &mut conn);
+        queued |= pump_writes(&mut st, &mut conn);
+        queued |= cleanup_streams(&mut st, &mut conn);
 
-        // Only a receive or read-notify wakeup may skip the flush; commands,
-        // quiche's timer, keep-alive and the coalescing deadline always send.
+        // Only a receive or read-notify wakeup may skip the flush, and only
+        // while it queued nothing explicitly; commands, quiche's timer,
+        // keep-alive, a closed connection and the coalescing deadline always
+        // send. The hold is bounded regardless: a skipped flush may still
+        // carry flow-control frames quiche queued internally — they wait at
+        // most ACK_COALESCE_DELAY.
         let now = tokio::time::Instant::now();
         if woke_on_cmd {
-            last_app_cmd = now;
+            last_app_cmd = Some(now);
         }
-        if auth_done && now.duration_since(last_app_cmd) >= ACK_COALESCE_APP_QUIET {
+        if auth_done && last_app_cmd.is_none_or(|t| now.duration_since(t) >= ACK_COALESCE_APP_QUIET)
+        {
             if received > 0 {
                 ack_pending += received;
                 if ack_since.is_none() {
@@ -413,6 +427,8 @@ async fn run(
             }
             if let Some(since) = ack_since {
                 if (received > 0 || woke_on_notify)
+                    && !queued
+                    && !conn.is_closed()
                     && ack_pending < ACK_COALESCE_PKTS
                     && now.duration_since(since) < ACK_COALESCE_DELAY
                 {
@@ -512,7 +528,12 @@ fn handle_cmd(st: &mut State, conn: &mut quiche::Connection, cmd: Cmd) {
     }
 }
 
-fn pump_writes(st: &mut State, conn: &mut quiche::Connection) {
+/// Returns `true` when a frame was queued into quiche's send buffer — the
+/// wakeup's flush is then not ACK-only and must not be held back. A
+/// `stream_shutdown` that reports `Ok` without queueing counts too; that
+/// errs toward an early flush — the safe direction.
+fn pump_writes(st: &mut State, conn: &mut quiche::Connection) -> bool {
+    let mut queued = false;
     for (&id, s) in &mut st.streams {
         // Do NOT pre-check `stream_capacity`: a stream is not created until the
         // first `stream_send`, and capacity on an unopened stream is 0. Send
@@ -522,6 +543,7 @@ fn pump_writes(st: &mut State, conn: &mut quiche::Connection) {
             match conn.stream_send(id, &chunk.data[chunk.offset..], false) {
                 Ok(0) | Err(quiche::Error::Done | quiche::Error::StreamLimit) => break,
                 Ok(w) => {
+                    queued = true;
                     chunk.offset += w;
                     if chunk.offset == chunk.data.len() {
                         s.out_buf.pop_front();
@@ -533,8 +555,8 @@ fn pump_writes(st: &mut State, conn: &mut quiche::Connection) {
                         std::io::ErrorKind::BrokenPipe,
                         Error::Quic(format!("stream send: {e}")),
                     );
-                    let _ = conn.stream_shutdown(id, quiche::Shutdown::Read, 0);
-                    let _ = conn.stream_shutdown(id, quiche::Shutdown::Write, 0);
+                    queued |= conn.stream_shutdown(id, quiche::Shutdown::Read, 0).is_ok();
+                    queued |= conn.stream_shutdown(id, quiche::Shutdown::Write, 0).is_ok();
                     break;
                 }
             }
@@ -545,7 +567,10 @@ fn pump_writes(st: &mut State, conn: &mut quiche::Connection) {
         if s.out_buf.is_empty() && s.shutdown.load(Ordering::Acquire) && !s.out_fin_sent {
             match conn.stream_send(id, &[], true) {
                 Err(quiche::Error::Done | quiche::Error::StreamLimit) => {}
-                Ok(_) => s.out_fin_sent = true,
+                Ok(_) => {
+                    s.out_fin_sent = true;
+                    queued = true;
+                }
                 Err(e) => s.fail(
                     std::io::ErrorKind::BrokenPipe,
                     Error::Quic(format!("stream finish: {e}")),
@@ -554,6 +579,7 @@ fn pump_writes(st: &mut State, conn: &mut quiche::Connection) {
         }
         let _ = flush_pending(s);
     }
+    queued
 }
 
 fn pump_reads(st: &mut State, conn: &mut quiche::Connection, buf: &mut [u8]) {
@@ -756,7 +782,11 @@ fn send_one_udp(conn: &mut quiche::Connection, msg: &UdpMessage) {
     }
 }
 
-fn cleanup_streams(st: &mut State, conn: &mut quiche::Connection) {
+/// Returns `true` when a RESET_STREAM/STOP_SENDING was queued into quiche —
+/// same flush rule as [`pump_writes`]. Read-direction `stream_shutdown` may
+/// report `Ok` without queueing; that errs toward an early flush — the safe
+/// direction.
+fn cleanup_streams(st: &mut State, conn: &mut quiche::Connection) -> bool {
     let done: Vec<u64> = st
         .streams
         .iter()
@@ -767,14 +797,16 @@ fn cleanup_streams(st: &mut State, conn: &mut quiche::Connection) {
         })
         .map(|(&id, _)| id)
         .collect();
+    let mut queued = false;
     for id in done {
         if let Some(s) = st.streams.remove(&id) {
             if !s.shutdown.load(Ordering::Acquire) || s.failure.is_some() {
-                let _ = conn.stream_shutdown(id, quiche::Shutdown::Write, 0);
+                queued |= conn.stream_shutdown(id, quiche::Shutdown::Write, 0).is_ok();
             }
         }
-        let _ = conn.stream_shutdown(id, quiche::Shutdown::Read, 0);
+        queued |= conn.stream_shutdown(id, quiche::Shutdown::Read, 0).is_ok();
     }
+    queued
 }
 
 /// Drain quiche's send queue to the socket, applying obfs and port-hopping.
@@ -816,7 +848,8 @@ async fn flush_send(
 
 /// Feed the datagrams queued on the socket to quiche, at most
 /// [`RECV_BATCH`] of them, undoing obfs and port-hopping. Returns how many
-/// datagrams were read.
+/// datagrams quiche accepted — obfs rejects and packets `conn.recv` refuses
+/// owe no ACK, so they don't count toward coalescing.
 fn recv_batch(
     st: &mut State,
     conn: &mut quiche::Connection,
@@ -829,18 +862,18 @@ fn recv_batch(
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(received),
             Err(e) => return Err(e),
         };
-        received += 1;
         let from = st.hop.as_ref().map_or(from, |h| h.normalize_source(from));
         let info = quiche::RecvInfo { from, to: st.local };
-        let received = match st.obfs.as_mut() {
+        let accepted = match st.obfs.as_mut() {
             Some(obfs) => match obfs.decode(&buf[..n], from) {
                 Some(mut dgram) => conn.recv(&mut dgram, info),
                 None => continue,
             },
             None => conn.recv(&mut buf[..n], info),
         };
-        if let Err(e) = received {
-            tracing::debug!("hysteria2 could not receive QUIC packet: {e}");
+        match accepted {
+            Ok(_) => received += 1,
+            Err(e) => tracing::debug!("hysteria2 could not receive QUIC packet: {e}"),
         }
     }
     Ok(received)

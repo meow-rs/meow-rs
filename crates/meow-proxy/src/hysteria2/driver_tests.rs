@@ -27,7 +27,8 @@ struct Peer {
     read_payload: Arc<AtomicBool>,
     stop_writes: Arc<AtomicBool>,
     auth_seen: mpsc::UnboundedReceiver<SocketAddr>,
-    /// Datagrams the peer received that are too small to carry payload (ACK-only).
+    /// Datagrams the peer received that are too small to carry payload —
+    /// ACK-only packets plus any other sub-100-byte control traffic.
     small_rx: Arc<AtomicUsize>,
     /// Datagrams the peer sent that are big enough to carry payload.
     big_tx: Arc<AtomicUsize>,
@@ -249,6 +250,11 @@ fn peer_on(
                     }
                 }
                 if lone_dgram_task.swap(false, Ordering::Relaxed) {
+                    // Re-arm the measurement baseline here: a ≥100-byte
+                    // packet sent long ago (handshake, round trip) must not
+                    // leave a stale `last_data_tx` inflating a sample should
+                    // a stray small packet arrive before this datagram's ACK.
+                    last_data_tx = std::time::Instant::now();
                     conn.dgram_send(&[0x55; 300]).unwrap();
                 }
                 let flooded = flood_task.swap(0, Ordering::Relaxed);
@@ -619,11 +625,11 @@ async fn reset_releases_the_cached_connection_and_reconnects() {
 }
 
 /// A pure download: the client writes nothing, so no upstream data carries its
-/// ACKs. With the peer's datagrams arriving one at a time, held-back ACKs must
-/// cut the ACK-only packets well below one per payload packet (a driver that
-/// flushes on every wakeup answers more than half of them).
+/// ACKs. With the peer's datagrams arriving one per receive wakeup, held-back
+/// ACKs must cut the ACK-only packets well below one per payload packet (a
+/// driver that flushes on every wakeup answers more than half of them).
 #[tokio::test]
-async fn download_acks_are_coalesced_across_bursts() {
+async fn download_acks_are_coalesced_across_wakeups() {
     let peer = peer(true, Some(0), 16).await;
     let client = peer.client(false);
     let mut stream = timeout(TEST_TIMEOUT, client.tcp_connect(TARGET))
@@ -687,5 +693,7 @@ async fn lone_packet_is_acked_within_the_coalescing_deadline() {
     lags.sort_unstable();
     let median = lags[lags.len() / 2];
     eprintln!("LONE_ACK_LAG_US {lags:?}");
+    // 200 µs coalescing deadline + tokio's ~1 ms timer granularity + CI
+    // slack — still well under quiche's 25 ms ACK timer this guards against.
     assert!(median < 12_000, "median ACK lag {median} us: {lags:?}");
 }
