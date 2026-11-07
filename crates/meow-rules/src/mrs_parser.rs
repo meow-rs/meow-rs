@@ -56,8 +56,11 @@ pub const TYPE_CLASSICAL: u8 = 2;
 
 #[derive(Debug, thiserror::Error)]
 pub enum MrsError {
-    #[error("mrs: wrong format (not an mrs file — unexpected magic bytes)")]
-    WrongFormat,
+    /// The first bytes are not the magic the site was parsing for — named
+    /// because the geosite frame (`MRS!`) and the upstream rule-provider
+    /// frame (`MRS\x01`) differ and "wrong format" alone misleads.
+    #[error("mrs: wrong format (not an mrs file — first 4 bytes are not {0})")]
+    WrongFormat(&'static str),
     #[error("mrs: unsupported version {0} (expected 1)")]
     UnsupportedVersion(u8),
     #[error("mrs: unsupported type {0}")]
@@ -98,10 +101,10 @@ pub struct MrsHeader {
 /// call `decompress_payload()` on the returned slice.
 pub fn parse_header(data: &[u8]) -> Result<(MrsHeader, &[u8]), MrsError> {
     if data.len() < 4 {
-        return Err(MrsError::WrongFormat);
+        return Err(MrsError::WrongFormat("'MRS!'"));
     }
     if data[..4] != MRS_MAGIC {
-        return Err(MrsError::WrongFormat);
+        return Err(MrsError::WrongFormat("'MRS!'"));
     }
     // magic(4) + version(1) + type(1) + count(4) = 10 bytes
     if data.len() < 10 {
@@ -387,7 +390,9 @@ pub fn parse_upstream_ruleset_mrs(bytes: &[u8]) -> Result<UpstreamRuleSetPayload
     let reader = UpstreamRuleSetReader::open(bytes)?;
     let mut entries = Vec::new();
     match reader.behavior() {
-        TYPE_DOMAIN => reader.for_each_domain(|d| entries.push(d.to_string()))?,
+        TYPE_DOMAIN => {
+            reader.for_each_domain(|d| entries.push(d.to_string()))?;
+        }
         TYPE_IPCIDR => reader.for_each_net(|net| entries.push(net.to_string()))?,
         other => return Err(MrsError::InvalidBehavior(other)),
     }
@@ -413,7 +418,7 @@ impl UpstreamRuleSetReader {
         let mut r = ByteReader::new(&decompressed);
         let magic = r.read_array::<4>("upstream_magic")?;
         if magic != UPSTREAM_MRS_MAGIC {
-            return Err(MrsError::WrongFormat);
+            return Err(MrsError::WrongFormat("'MRS\\x01'"));
         }
 
         let behavior = r.read_u8("behavior")?;
@@ -456,8 +461,11 @@ impl UpstreamRuleSetReader {
     }
 
     /// Walk every domain of a `domain` body. Each domain is handed over as
-    /// a borrowed `&str` from one reused buffer.
-    pub fn for_each_domain(&self, mut on_domain: impl FnMut(&str)) -> Result<(), MrsError> {
+    /// a borrowed `&str` from one reused buffer. Returns the number of
+    /// stored keys skipped for not being valid UTF-8 — a corrupt set can
+    /// carry bytes no domain could be, and a silent drop would make the
+    /// walk yield fewer entries than the file declares.
+    pub fn for_each_domain(&self, mut on_domain: impl FnMut(&str)) -> Result<usize, MrsError> {
         if self.behavior != TYPE_DOMAIN {
             return Err(MrsError::InvalidBehavior(self.behavior));
         }
@@ -501,7 +509,12 @@ impl UpstreamRuleSetReader {
 
 /// Decode a succinct domain set, calling `on_domain` once per domain
 /// (forward byte order, reused buffer).
-fn walk_upstream_domain_set(data: &[u8], on_domain: &mut dyn FnMut(&str)) -> Result<(), MrsError> {
+/// Returns the number of keys skipped for not being valid UTF-8 (see
+/// [`UpstreamRuleSetReader::for_each_domain`]).
+fn walk_upstream_domain_set(
+    data: &[u8],
+    on_domain: &mut dyn FnMut(&str),
+) -> Result<usize, MrsError> {
     let mut r = ByteReader::new(data);
     let version = r.read_u8("domain_set_version")?;
     if version != 1 {
@@ -540,6 +553,7 @@ fn walk_upstream_domain_set(data: &[u8], on_domain: &mut dyn FnMut(&str)) -> Res
     };
     let mut current = Vec::new();
     let mut forward = String::new();
+    let mut skipped = 0usize;
     traversal.traverse(0, 0, &mut current, &mut |reversed: &[u8]| {
         forward.clear();
         // Internal keys are reversed domain bytes; a trailing '+' byte is
@@ -563,12 +577,17 @@ fn walk_upstream_domain_set(data: &[u8], on_domain: &mut dyn FnMut(&str)) -> Res
         // validate UTF-8 on the stored key, then reverse `char`s.
         // Byte-reversing a multi-byte UTF-8 label produces invalid UTF-8,
         // which is exactly why non-ASCII (IDN) entries were silently
-        // dropped here by `.ok()`.
+        // dropped here by `.ok()`. A key that still fails validation is
+        // corrupt, not non-ASCII — count it so callers can surface the
+        // shortfall instead of dropping it silently.
         if let Ok(key) = std::str::from_utf8(stored) {
             forward.extend(key.chars().rev());
             on_domain(&forward);
+        } else {
+            skipped += 1;
         }
-    })
+    })?;
+    Ok(skipped)
 }
 
 #[cfg(test)]
@@ -1166,7 +1185,7 @@ mod tests {
     fn mrs_wrong_format_rejected() {
         let bytes = b"NOTMRS...";
         match parse_header(bytes) {
-            Err(MrsError::WrongFormat) => {}
+            Err(MrsError::WrongFormat(_)) => {}
             other => panic!("expected WrongFormat, got {other:?}"),
         }
     }

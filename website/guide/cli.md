@@ -89,9 +89,11 @@ meow convert-ruleset ipcidr mrs geoip-ru.mrs out/ru.txt
 ```
 
 As mihomo's `convert-ruleset`, for the `.mrs` → text direction: an upstream
-`domain` or `ipcidr` `.mrs` becomes one entry per line (the entries the
-engine itself would match). The output is written whole or not at all; a
-`.txt` source needs an explicit target.
+`domain` or `ipcidr` `.mrs` becomes one entry per line in the same compacted
+form mihomo writes — a domain stored with both its apex and its subdomains
+comes out as a single `+.domain` line, a suffix-only entry stays `.domain`,
+and `ipcidr` ranges split into aligned CIDRs. The output is written whole
+or not at all; a `.txt` source needs an explicit target.
 
 ## Hot reload
 

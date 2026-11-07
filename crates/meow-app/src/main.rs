@@ -4,7 +4,6 @@
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 use anyhow::Context as _;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -811,65 +810,196 @@ fn convert_ruleset(
         || source.with_extension("txt"),
         std::path::Path::to_path_buf,
     );
-    if target == source {
+    // `Path` equality is lexical: `dir/sub/../set.mrs` or a symlink names the
+    // source without comparing equal to it, and the final rename would
+    // happily replace it (issue #877 review).
+    let source_resolved = resolved_path(source);
+    if resolved_path(&target) == source_resolved {
         anyhow::bail!(
             "convert-ruleset: output {} would overwrite the source; name a target",
             target.display()
         );
     }
     let bytes = std::fs::read(source)
-        .map_err(|e| anyhow::anyhow!("convert-ruleset: read {}: {e}", source.display()))?;
+        .with_context(|| format!("convert-ruleset: read {}", source.display()))?;
     let reader = UpstreamRuleSetReader::open(&bytes)
-        .map_err(|e| anyhow::anyhow!("convert-ruleset: {}: {e}", source.display()))?;
+        .with_context(|| format!("convert-ruleset: decode {}", source.display()))?;
     if reader.behavior() != want {
         anyhow::bail!(
             "convert-ruleset: {} is not a {behavior} rule-set",
             source.display()
         );
     }
-    // Decode fully into a sibling temp file and rename over the target, so a
+    // Decode fully into a sibling scratch and rename over the target, so a
     // corrupt body never leaves a truncated output (or clobbers an old one).
-    let mut part = target.clone().into_os_string();
-    part.push(".part");
-    let part = std::path::PathBuf::from(part);
-    let written = write_rule_set_text(&reader, want == TYPE_DOMAIN, &part).and_then(|()| {
-        std::fs::rename(&part, &target)
-            .map_err(|e| anyhow::anyhow!("convert-ruleset: rename to {}: {e}", target.display()))
-    });
-    if written.is_err() {
-        let _ = std::fs::remove_file(&part);
+    meow_common::fs_util::sweep_scratch_siblings(&target, meow_common::fs_util::SCRATCH_STALE_AGE);
+    let part = convert_scratch_path(&target);
+    if resolved_path(&part) == source_resolved {
+        anyhow::bail!(
+            "convert-ruleset: scratch path {} would overwrite the source; name a different target",
+            part.display()
+        );
     }
-    written.map_err(|e| anyhow::anyhow!("{e} ({})", source.display()))
+    let written =
+        write_rule_set_text(&reader, want == TYPE_DOMAIN, source, &part).and_then(|skipped| {
+            std::fs::rename(&part, &target)
+                .with_context(|| format!("convert-ruleset: rename to {}", target.display()))
+                .map(|()| skipped)
+        });
+    let skipped = match written {
+        Ok(skipped) => skipped,
+        Err(e) => {
+            let _ = std::fs::remove_file(&part);
+            return Err(e);
+        }
+    };
+    if skipped > 0 {
+        eprintln!(
+            "warning: convert-ruleset: {}: {skipped} entr{} skipped (stored keys are not valid UTF-8)",
+            source.display(),
+            if skipped == 1 { "y" } else { "ies" },
+        );
+    }
+    Ok(())
 }
 
+/// The path `path` resolves to, for clobber-guard comparisons: `Path`
+/// equality is lexical, so `./x`, `d/sub/../x` and symlinked parents all
+/// alias the same file. Canonicalize the deepest ancestor that exists
+/// (handles `.`/`..` and symlinks) and re-append the not-yet-existing tail;
+/// when nothing on the path exists at all, fold `.`/`..` lexically over the
+/// absolute path. An over-eager result only trips the guard — the safe
+/// direction.
+fn resolved_path(path: &std::path::Path) -> std::path::PathBuf {
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cursor = path;
+    loop {
+        if let Ok(canon) = cursor.canonicalize() {
+            let mut resolved = canon;
+            for comp in tail.iter().rev() {
+                resolved.push(comp);
+            }
+            return resolved;
+        }
+        let (Some(parent), Some(name)) = (cursor.parent(), cursor.file_name()) else {
+            break;
+        };
+        tail.push(name.to_os_string());
+        cursor = parent;
+    }
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
+    };
+    let mut folded = std::path::PathBuf::new();
+    for comp in absolute.components() {
+        match comp {
+            std::path::Component::CurDir => {}
+            // `..` at the root pops nothing — correct for an absolute path.
+            std::path::Component::ParentDir => {
+                folded.pop();
+            }
+            _ => folded.push(comp.as_os_str()),
+        }
+    }
+    folded
+}
+
+/// Unique scratch sibling of `target` — the same `{path}.{pid}.{n}.tmp`
+/// scheme as `meow_config::unique_scratch_path` (pub(crate), unreachable
+/// from this crate) so `meow_common::fs_util::sweep_scratch_siblings`
+/// recognises leftovers of a killed run, and a fixed `.part` name can
+/// neither alias the source nor be spliced by a concurrent convert.
+fn convert_scratch_path(target: &std::path::Path) -> std::path::PathBuf {
+    static COUNTER: meow_common::atomic::AtomicU = meow_common::atomic::AtomicU::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut name = target.as_os_str().to_os_string();
+    name.push(format!(".{}.{}.tmp", std::process::id(), n));
+    std::path::PathBuf::from(name)
+}
+
+/// Writes the decoded set, one entry per line. `source` only names decode
+/// errors; write errors carry `path`. Returns the number of stored domain
+/// keys skipped as invalid UTF-8 (0 for `ipcidr`).
 fn write_rule_set_text(
     reader: &meow_rules::mrs_parser::UpstreamRuleSetReader,
     domains: bool,
+    source: &std::path::Path,
     path: &std::path::Path,
-) -> Result<()> {
+) -> Result<usize> {
     use std::io::Write;
     let file = std::fs::File::create(path)
-        .map_err(|e| anyhow::anyhow!("convert-ruleset: create {}: {e}", path.display()))?;
+        .with_context(|| format!("convert-ruleset: create {}", path.display()))?;
     let mut out = std::io::BufWriter::new(file);
     let mut io_err = None;
-    let mut line = |s: &dyn std::fmt::Display| {
+    let mut emit = |s: &dyn std::fmt::Display| {
         if io_err.is_none() {
             if let Err(e) = writeln!(out, "{s}") {
                 io_err = Some(e);
             }
         }
     };
-    let walked = if domains {
-        reader.for_each_domain(|d| line(&d))
+    let mut skipped = 0usize;
+    if domains {
+        // Upstream `domainStrategy.DumpMrs` compacts an exact entry and its
+        // suffix-only twin (`x.com` + `.x.com`) into one `+.x.com` line and
+        // emits the list sorted — mirror it so the text matches `mihomo
+        // convert-ruleset` output. The merge needs every key up front, so
+        // unlike the ipcidr walk below this collects first; the io_err
+        // side-channel is unneeded until the writes begin.
+        let mut keys = Vec::new();
+        skipped = reader
+            .for_each_domain(|d| keys.push(d.to_string()))
+            .with_context(|| format!("convert-ruleset: decode {}", source.display()))?;
+        for line in dump_domain_lines(keys) {
+            emit(&line);
+        }
     } else {
-        reader.for_each_net(|n| line(&n))
-    };
-    walked.map_err(|e| anyhow::anyhow!("convert-ruleset: {e}"))?;
+        let walked = reader.for_each_net(|n| emit(&n));
+        // A failed write is the actionable failure even when the walk then
+        // also trips a decode error — the decode keeps draining into emit
+        // no-ops meanwhile, so report io_err first.
+        if let Some(e) = io_err {
+            return Err(e).with_context(|| format!("convert-ruleset: write {}", path.display()));
+        }
+        walked.with_context(|| format!("convert-ruleset: decode {}", source.display()))?;
+    }
     if let Some(e) = io_err {
-        anyhow::bail!("convert-ruleset: write {}: {e}", path.display());
+        return Err(e).with_context(|| format!("convert-ruleset: write {}", path.display()));
     }
     out.flush()
-        .map_err(|e| anyhow::anyhow!("convert-ruleset: write {}: {e}", path.display()))
+        .with_context(|| format!("convert-ruleset: write {}", path.display()))?;
+    Ok(skipped)
+}
+
+/// Upstream `domainStrategy.DumpMrs` (`rules/provider/domain_strategy.go`)
+/// compaction: entries are already decoded to `x` / `.x` / `+.x` forms —
+/// an `x` adjacent to its `.x` twin (after a sort that ignores the leading
+/// dot) collapses into `+.x`, and the final list is emitted in byte order.
+fn dump_domain_lines(mut keys: Vec<String>) -> Vec<String> {
+    keys.sort_by(|a, b| {
+        a.strip_prefix('.')
+            .unwrap_or(a)
+            .cmp(b.strip_prefix('.').unwrap_or(b))
+    });
+    let mut merged = Vec::with_capacity(keys.len());
+    let mut i = 0;
+    while i < keys.len() {
+        let domain = keys[i].strip_prefix('.').unwrap_or(&keys[i]);
+        if keys
+            .get(i + 1)
+            .is_some_and(|next| next.strip_prefix('.').unwrap_or(next) == domain)
+        {
+            merged.push(format!("+.{domain}"));
+            i += 2;
+        } else {
+            merged.push(std::mem::take(&mut keys[i]));
+            i += 1;
+        }
+    }
+    merged.sort();
+    merged
 }
 
 #[cfg(target_os = "linux")]
@@ -1905,21 +2035,208 @@ async fn publish_tun_if_committed(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    // Upstream `MRS\x01` fixture writers — the same shapes the
+    // `meow_rules::mrs_parser` tests build (their encoders are
+    // `#[cfg(test)]` and unreachable across crates).
+    fn i64be(out: &mut Vec<u8>, v: i64) {
+        out.extend_from_slice(&v.to_be_bytes());
+    }
+
+    fn u64be(out: &mut Vec<u8>, v: u64) {
+        out.extend_from_slice(&v.to_be_bytes());
+    }
+
+    fn set_bit(bits: &mut Vec<u64>, idx: usize) {
+        let word = idx / 64;
+        if bits.len() <= word {
+            bits.resize(word + 1, 0);
+        }
+        bits[word] |= 1u64 << (idx % 64);
+    }
+
+    fn upstream_mrs(behavior: u8, count: i64, body: &[u8]) -> Vec<u8> {
+        let mut inner = b"MRS\x01".to_vec();
+        inner.push(behavior);
+        i64be(&mut inner, count);
+        i64be(&mut inner, 0); // extra_len
+        inner.extend_from_slice(body);
+        zstd::encode_all(std::io::Cursor::new(inner), 0).unwrap()
+    }
+
+    /// Domain-set body: internal keys are each entry reversed byte-wise
+    /// (`"+.x.com"` stores the single suffix key `moc.x.+`).
+    fn domain_set_body(entries: &[&str]) -> Vec<u8> {
+        let mut keys: Vec<Vec<u8>> = entries.iter().map(|e| e.bytes().rev().collect()).collect();
+        keys.sort();
+        let (mut leaves, mut label_bitmap, mut labels) = (Vec::new(), Vec::new(), Vec::new());
+        let mut label_idx = 0usize;
+        let mut queue = vec![(0usize, keys.len(), 0usize)];
+        let mut idx = 0usize;
+        while idx < queue.len() {
+            let (mut start, end, col) = queue[idx];
+            if col == keys[start].len() {
+                start += 1;
+                set_bit(&mut leaves, idx);
+            }
+            let mut j = start;
+            while j < end {
+                let from = j;
+                while j < end && keys[j][col] == keys[from][col] {
+                    j += 1;
+                }
+                queue.push((from, j, col + 1));
+                labels.push(keys[from][col]);
+                label_idx += 1;
+            }
+            set_bit(&mut label_bitmap, label_idx);
+            label_idx += 1;
+            idx += 1;
+        }
+        let mut out = vec![1u8]; // domain_set version
+        i64be(&mut out, leaves.len() as i64);
+        for word in leaves {
+            u64be(&mut out, word);
+        }
+        i64be(&mut out, label_bitmap.len() as i64);
+        for word in label_bitmap {
+            u64be(&mut out, word);
+        }
+        i64be(&mut out, labels.len() as i64);
+        out.extend_from_slice(&labels);
+        out
+    }
+
+    fn domain_mrs(entries: &[&str]) -> Vec<u8> {
+        upstream_mrs(
+            meow_rules::mrs_parser::TYPE_DOMAIN,
+            entries.len() as i64,
+            &domain_set_body(entries),
+        )
+    }
+
+    fn scratch_siblings(dir: &tempfile::TempDir, base: &str) -> Vec<std::ffi::OsString> {
+        std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .filter(|n| {
+                n.to_str()
+                    .is_some_and(|s| s.starts_with(base) && s.ends_with(".tmp"))
+            })
+            .collect()
+    }
+
     #[test]
     fn convert_ruleset_refuses_clobbering_and_leaves_no_partial_output() {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("set.txt");
         std::fs::write(&src, b"not an mrs").unwrap();
         // Default target of a `.txt` source is the source itself.
-        assert!(super::convert_ruleset("domain", "mrs", &src, None).is_err());
+        assert!(convert_ruleset("domain", "mrs", &src, None).is_err());
         assert_eq!(std::fs::read(&src).unwrap(), b"not an mrs");
         let out = dir.path().join("out.txt");
         std::fs::write(&out, b"old").unwrap();
-        assert!(super::convert_ruleset("domain", "mrs", &src, Some(&out)).is_err());
+        assert!(convert_ruleset("domain", "mrs", &src, Some(&out)).is_err());
         assert_eq!(std::fs::read(&out).unwrap(), b"old", "old output untouched");
-        assert!(!dir.path().join("out.txt.part").exists());
-        assert!(super::convert_ruleset("classical", "mrs", &src, Some(&out)).is_err());
-        assert!(super::convert_ruleset("domain", "yaml", &src, Some(&out)).is_err());
+        assert!(scratch_siblings(&dir, "out.txt").is_empty());
+        assert!(convert_ruleset("classical", "mrs", &src, Some(&out)).is_err());
+        assert!(convert_ruleset("domain", "yaml", &src, Some(&out)).is_err());
+    }
+
+    #[test]
+    fn convert_ruleset_domain_dumps_upstream_compacted_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("set.mrs");
+        // `+.a.com` byte-reverses into the single suffix key `moc.a.+`;
+        // decoded next to `a.com`'s `moc.a` the pair is upstream's `+.a.com`
+        // entry — DumpMrs collapses it back to one `+.a.com` line, while a
+        // lone suffix key (`.only.com`) stays suffix-only, and the dump is
+        // sorted over the merged list.
+        std::fs::write(
+            &src,
+            domain_mrs(&["b.com", "a.com", "+.a.com", "+.only.com"]),
+        )
+        .unwrap();
+        convert_ruleset("domain", "mrs", &src, None).unwrap();
+        let out = dir.path().join("set.txt");
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap(),
+            "+.a.com\n.only.com\nb.com\n"
+        );
+        assert!(scratch_siblings(&dir, "set.txt").is_empty());
+    }
+
+    #[test]
+    fn convert_ruleset_ipcidr_dumps_cidrs() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("ip.mrs");
+        let mut body = vec![1u8]; // ipcidr_set version
+        i64be(&mut body, 1);
+        body.extend_from_slice(
+            &std::net::Ipv4Addr::new(192, 168, 0, 0)
+                .to_ipv6_mapped()
+                .octets(),
+        );
+        body.extend_from_slice(
+            &std::net::Ipv4Addr::new(192, 168, 0, 255)
+                .to_ipv6_mapped()
+                .octets(),
+        );
+        std::fs::write(
+            &src,
+            upstream_mrs(meow_rules::mrs_parser::TYPE_IPCIDR, 1, &body),
+        )
+        .unwrap();
+        let out = dir.path().join("ip.txt");
+        convert_ruleset("ipcidr", "mrs", &src, Some(&out)).unwrap();
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "192.168.0.0/24\n");
+        assert!(scratch_siblings(&dir, "ip.txt").is_empty());
+    }
+
+    #[test]
+    fn convert_ruleset_refuses_dotdot_target_naming_the_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("set.mrs");
+        let bytes = domain_mrs(&["a.com"]);
+        std::fs::write(&src, &bytes).unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        // Lexically different from the source yet names the same file —
+        // the old `target == source` guard let it through and the rename
+        // replaced the source.
+        let tricky = dir.path().join("sub/../set.mrs");
+        assert!(convert_ruleset("domain", "mrs", &src, Some(&tricky)).is_err());
+        assert_eq!(std::fs::read(&src).unwrap(), bytes, "source untouched");
+        assert!(scratch_siblings(&dir, "set.mrs").is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn convert_ruleset_refuses_target_symlink_to_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("real.mrs");
+        let bytes = domain_mrs(&["a.com"]);
+        std::fs::write(&src, &bytes).unwrap();
+        let link = dir.path().join("out.txt");
+        std::os::unix::fs::symlink(&src, &link).unwrap();
+        assert!(convert_ruleset("domain", "mrs", &src, Some(&link)).is_err());
+        assert!(link.is_symlink(), "symlink itself left alone");
+        assert_eq!(std::fs::read(&src).unwrap(), bytes, "source untouched");
+    }
+
+    /// The scratch must be removed even when the rename itself fails —
+    /// here because the target is a directory, which a file rename cannot
+    /// replace on any platform.
+    #[test]
+    fn convert_ruleset_failed_rename_removes_the_scratch() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("set.mrs");
+        std::fs::write(&src, domain_mrs(&["a.com"])).unwrap();
+        let out = dir.path().join("out.txt");
+        std::fs::create_dir(&out).unwrap();
+        assert!(convert_ruleset("domain", "mrs", &src, Some(&out)).is_err());
+        assert!(scratch_siblings(&dir, "out.txt").is_empty());
     }
 
     use super::bind_socket_addr;

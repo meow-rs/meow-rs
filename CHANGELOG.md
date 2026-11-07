@@ -8,6 +8,19 @@ the canonical, in-repo source a release is cut from.
 
 ## [Unreleased]
 
+### Added
+
+- **`meow convert-ruleset <domain|ipcidr> mrs <source.mrs> [out.txt]`** —
+  the `.mrs` → text direction of mihomo's `convert-ruleset`, for
+  inspecting or hand-editing upstream binary rule-sets (OpenWrt front
+  ends such as clashwrt consume `.mrs` providers through it). The text
+  matches upstream's dump: a domain stored as both apex and subdomains
+  collapses to one `+.domain` line, a suffix-only entry stays `.domain`,
+  `ipcidr` ranges split into aligned CIDRs. Output goes through a
+  unique `.pid.n.tmp` scratch renamed into place — never a truncated
+  half-file, never a clobbered source behind a `..` path or a symlink —
+  and decode failures name the file that failed.
+
 ### Fixed
 
 - **Hysteria 2 UDP relay no longer collapses under load.** A full
