@@ -42,7 +42,11 @@ static UNIFIED_DELAY: AtomicBool = AtomicBool::new(false);
 /// mihomo `unified-delay`: when set, a probe sends a second request on the
 /// same warm connection and reports only that one, so the delay is one
 /// round trip through the proxy rather than dial + handshakes + request.
-/// Applied on every config load.
+/// Applied on every config load. A probe batch ([`sweep_members`],
+/// [`probe_stream_bounded`], [`probe_chain_target`], [`diagnose_chain`])
+/// reads it once at entry, so a `PUT /configs` flipping the flag mid-sweep
+/// cannot mix dial-inclusive and warm-only measurements inside one
+/// ranking — a tighter bound than upstream, which loads it per probe.
 pub fn set_unified_delay(on: bool) {
     UNIFIED_DELAY.store(on, Ordering::Relaxed);
 }
@@ -71,6 +75,18 @@ pub async fn url_test(
     expected: Option<&str>,
     timeout: Duration,
 ) -> Result<u16, UrlTestError> {
+    url_test_with(adapter, url, expected, timeout, unified_delay()).await
+}
+
+/// [`url_test`] under the caller's `unified-delay` mode, so a probe batch
+/// can read the flag once at entry and keep every probe in it comparable.
+async fn url_test_with(
+    adapter: &dyn ProxyAdapter,
+    url: &str,
+    expected: Option<&str>,
+    timeout: Duration,
+    unified: bool,
+) -> Result<u16, UrlTestError> {
     let Some(parsed) = ParsedUrl::parse(url) else {
         return Err(UrlTestError::Transport(format!("invalid url: {url}")));
     };
@@ -98,7 +114,6 @@ pub async fn url_test(
         ..Default::default()
     };
 
-    let unified = UNIFIED_DELAY.load(Ordering::Relaxed);
     let fut = probe_once(adapter, metadata, parsed, ranges, unified);
     match tokio::time::timeout(timeout, fut).await {
         Ok(Ok(second)) => {
@@ -134,12 +149,24 @@ pub async fn probe_and_record(
     expected: Option<&str>,
     timeout: Duration,
 ) -> Result<u16, UrlTestError> {
+    probe_and_record_with(proxy, url, expected, timeout, unified_delay()).await
+}
+
+/// [`probe_and_record`] under the caller's `unified-delay` mode; see
+/// [`url_test_with`].
+async fn probe_and_record_with(
+    proxy: &Arc<dyn Proxy>,
+    url: &str,
+    expected: Option<&str>,
+    timeout: Duration,
+    unified: bool,
+) -> Result<u16, UrlTestError> {
     let _permit = global_delay_probe_limiter()
         .acquire()
         .await
         .expect("global delay probe semaphore is never closed");
     let adapter: &dyn ProxyAdapter = proxy.as_ref();
-    let result = url_test(adapter, url, expected, timeout).await;
+    let result = url_test_with(adapter, url, expected, timeout, unified).await;
     match &result {
         Ok(d) => proxy.health().record_delay(*d),
         Err(_) => proxy.health().record_delay(0),
@@ -186,9 +213,20 @@ pub fn probe_stream_bounded(
 ) -> impl Stream<Item = NamedProbeResult> + Send + 'static {
     let url = Arc::<str>::from(url.to_owned());
     let expected = expected.map(|s| Arc::<str>::from(s.to_owned()));
+    // One `unified-delay` mode for the whole batch: a `PUT /configs`
+    // flipping the flag mid-stream must not mix dial-inclusive and
+    // warm-only measurements the caller compares.
+    let unified = unified_delay();
     futures::stream::iter(probes)
         .map(move |(name, proxy)| {
-            named_probe_future(name, proxy, Arc::clone(&url), expected.clone(), timeout)
+            named_probe_future(
+                name,
+                proxy,
+                Arc::clone(&url),
+                expected.clone(),
+                timeout,
+                unified,
+            )
         })
         .buffer_unordered(concurrency.max(1))
 }
@@ -199,9 +237,12 @@ fn named_probe_future(
     url: Arc<str>,
     expected: Option<Arc<str>>,
     timeout: Duration,
+    unified: bool,
 ) -> BoxFuture<'static, NamedProbeResult> {
     async move {
-        match probe_and_record(&proxy, url.as_ref(), expected.as_deref(), timeout).await {
+        match probe_and_record_with(&proxy, url.as_ref(), expected.as_deref(), timeout, unified)
+            .await
+        {
             Ok(delay) => NamedProbeResult {
                 name,
                 delay,
@@ -288,6 +329,7 @@ pub async fn probe_chain_target(
         expected,
         timeout,
         hold,
+        unified: unified_delay(),
         tried: None,
     };
     let report = round
@@ -347,6 +389,8 @@ struct ChainRound<'a> {
     expected: Option<&'a str>,
     timeout: Duration,
     hold: Duration,
+    /// The `unified-delay` mode the caller's batch runs under.
+    unified: bool,
     /// The member a probe of the owner itself went through and failed, for
     /// the reason given: a check counts it as tried rather than dialling it
     /// again.
@@ -412,7 +456,9 @@ impl ChainRound<'_> {
                     .acquire()
                     .await
                     .expect("global delay probe semaphore is never closed");
-                let result = url_test(&probe, self.url, self.expected, self.timeout).await;
+                let result =
+                    url_test_with(&probe, self.url, self.expected, self.timeout, self.unified)
+                        .await;
                 (*member, result, probe.unsupported.load(Ordering::Relaxed))
             });
             for (member, result, unsupported) in futures::future::join_all(probes).await {
@@ -516,9 +562,15 @@ pub async fn sweep_members(
     concurrency: usize,
     hold: Duration,
 ) -> Vec<SweptMember> {
+    // One `unified-delay` mode for the whole sweep: a `PUT /configs`
+    // flipping the flag mid-sweep must not mix dial-inclusive and
+    // warm-only measurements the group ranks members by.
+    let unified = unified_delay();
     let sweeps: Vec<_> = members
         .into_iter()
-        .map(|(name, proxy)| sweep_member(name, proxy, fronts, url, expected, timeout, hold))
+        .map(|(name, proxy)| {
+            sweep_member(name, proxy, fronts, url, expected, timeout, hold, unified)
+        })
         .collect();
     futures::stream::iter(sweeps)
         .buffer_unordered(concurrency.max(1))
@@ -527,6 +579,10 @@ pub async fn sweep_members(
 }
 
 /// [`sweep_members`] for one member.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one probe spec per member; a struct would only rename the same values"
+)]
 async fn sweep_member(
     name: String,
     proxy: Arc<dyn Proxy>,
@@ -535,13 +591,21 @@ async fn sweep_member(
     expected: Option<&str>,
     timeout: Duration,
     hold: Duration,
+    unified: bool,
 ) -> SweptMember {
     let (result, front_pick) = {
         let _permit = global_delay_probe_limiter()
             .acquire()
             .await
             .expect("global delay probe semaphore is never closed");
-        crate::group::watch_member_dial(url_test(proxy.as_ref(), url, expected, timeout)).await
+        crate::group::watch_member_dial(url_test_with(
+            proxy.as_ref(),
+            url,
+            expected,
+            timeout,
+            unified,
+        ))
+        .await
     };
     let delay = match result {
         Ok(delay) => delay,
@@ -557,6 +621,7 @@ async fn sweep_member(
                         expected,
                         timeout,
                         hold,
+                        unified,
                         tried: front_pick.as_ref().map(|member| (member.name(), reason)),
                     };
                     check_chain(&round, &name, reason).await
@@ -701,9 +766,10 @@ pub async fn diagnose_chain(
     if ChainTarget::from_server_addr(owner.addr()).is_none() {
         return Err(ChainDiagnosisError::NoServer);
     }
+    let unified = unified_delay();
     let probes: Vec<_> = members
         .iter()
-        .map(|member| diagnose_member(owner, member, url, expected, timeout))
+        .map(|member| diagnose_member(owner, member, url, expected, timeout, unified))
         .collect();
     let mut found: Vec<MemberDiagnosis> = futures::stream::iter(probes)
         .buffered(GROUP_DELAY_CONCURRENCY)
@@ -737,6 +803,7 @@ async fn diagnose_member(
     url: &str,
     expected: Option<&str>,
     timeout: Duration,
+    unified: bool,
 ) -> Result<MemberDiagnosis, ChainDiagnosisError> {
     let name = member.name().to_owned();
     let skipped = if member.member_proxies().is_some() {
@@ -754,8 +821,8 @@ async fn diagnose_member(
     }
     let probe = ChainProbe::new(member, owner);
     let (chain, alone) = tokio::join!(
-        limited_url_test(&probe, url, expected, timeout),
-        limited_url_test(member.as_ref(), url, expected, timeout),
+        limited_url_test(&probe, url, expected, timeout, unified),
+        limited_url_test(member.as_ref(), url, expected, timeout, unified),
     );
     if probe.unsupported.load(Ordering::Relaxed) {
         return Err(ChainDiagnosisError::Unsupported);
@@ -782,12 +849,13 @@ async fn limited_url_test(
     url: &str,
     expected: Option<&str>,
     timeout: Duration,
+    unified: bool,
 ) -> Result<u16, UrlTestError> {
     let _permit = global_delay_probe_limiter()
         .acquire()
         .await
         .expect("global delay probe semaphore is never closed");
-    url_test(adapter, url, expected, timeout).await
+    url_test_with(adapter, url, expected, timeout, unified).await
 }
 
 /// `'a', 'b', 'c'`.
@@ -914,18 +982,19 @@ where
     }
     send_request(&mut stream, parsed, "HEAD", "keep-alive").await?;
     let first = read_head(&mut stream).await?;
+    // As in mihomo's `URLTest`: the second timer starts once the first
+    // response is fully read, before the warm request goes on the wire.
     let second = Instant::now();
-    let warm = async {
-        send_request(&mut stream, parsed, "HEAD", "close").await?;
-        read_status_line(&mut stream).await
+    let warm = match send_request(&mut stream, parsed, "HEAD", "close").await {
+        Err(e) => Err(format!("second request not sent: {e}")),
+        Ok(()) => read_status_line(&mut stream)
+            .await
+            .map_err(|e| format!("second response not read: {e}")),
     };
-    match warm.await {
+    match warm {
         Ok(status) => check_status(status, ranges).map(|()| Some(second)),
         Err(e) => {
-            warn!(
-                "url_test: unified-delay second request failed ({e}); \
-                 reporting the full first measurement"
-            );
+            warn!("url_test: unified-delay {e}; reporting the full first measurement");
             check_status(first, ranges).map(|()| None)
         }
     }
@@ -991,14 +1060,15 @@ where
     S: tokio::io::AsyncWrite + Unpin,
 {
     // Host header includes the non-default port so virtual-hosted origins
-    // route correctly; mirrors Go net/http's default behaviour.
+    // route correctly; mirrors Go net/http's default behaviour. Built in a
+    // Vec so no fixed cap splits the two request shapes — the unified-delay
+    // HEAD with `keep-alive` runs 6 bytes longer than the plain GET.
     use std::io::Write as _;
-    let mut buf = [0u8; 512];
     let default_port = if parsed.https { 443 } else { 80 };
-    let mut cursor: &mut [u8] = &mut buf;
+    let mut buf = Vec::with_capacity(512);
     if parsed.port == default_port {
         write!(
-            cursor,
+            buf,
             "{method} {path} HTTP/1.1\r\nHost: {host}\r\n\
              User-Agent: clash.meta/{ver}\r\nAccept: */*\r\nConnection: {connection}\r\n\r\n",
             path = parsed.path,
@@ -1007,7 +1077,7 @@ where
         )
     } else {
         write!(
-            cursor,
+            buf,
             "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\n\
              User-Agent: clash.meta/{ver}\r\nAccept: */*\r\nConnection: {connection}\r\n\r\n",
             path = parsed.path,
@@ -1016,11 +1086,9 @@ where
             ver = env!("CARGO_PKG_VERSION"),
         )
     }
-    .map_err(|_| "request too large for buffer".to_string())?;
-    let remaining = cursor.len();
-    let written = buf.len() - remaining;
+    .expect("writing to a Vec cannot fail");
     stream
-        .write_all(&buf[..written])
+        .write_all(&buf)
         .await
         .map_err(|e| format!("write: {e}"))?;
     stream.flush().await.map_err(|e| format!("flush: {e}"))
@@ -1031,8 +1099,13 @@ where
     S: tokio::io::AsyncRead + Unpin,
 {
     let mut buf = [0u8; 1024];
+    // `len` counts bytes past `buf` too: a status line longer than the
+    // buffer keeps draining to its CRLF so a following `read_head` still
+    // finds the headers where they start; `buf` then holds the truncated
+    // line, whose version and code are intact.
     let mut len = 0usize;
     let mut byte = [0u8; 1];
+    let mut prev = 0u8;
     loop {
         let n = stream
             .read(&mut byte)
@@ -1043,13 +1116,19 @@ where
         }
         if len < buf.len() {
             buf[len] = byte[0];
-            len += 1;
         }
-        if buf[..len].ends_with(b"\r\n") || len >= buf.len() {
+        len += 1;
+        let end = prev == b'\r' && byte[0] == b'\n';
+        prev = byte[0];
+        if end {
             break;
         }
+        if len > buf.len() + 16 * 1024 {
+            return Err("status line too long".into());
+        }
     }
-    let line = std::str::from_utf8(&buf[..len]).map_err(|_| "status line not utf-8".to_string())?;
+    let line = std::str::from_utf8(&buf[..len.min(buf.len())])
+        .map_err(|_| "status line not utf-8".to_string())?;
     // HTTP/1.x status line: "HTTP/1.1 204 No Content\r\n"
     let mut parts = line.split_whitespace();
     let version = parts.next().unwrap_or("");
@@ -1205,21 +1284,31 @@ mod tests {
         let parsed = ParsedUrl::parse("http://probe.test/generate_204").unwrap();
         let ranges = parse_expected(None).unwrap();
         for second_answered in [true, false] {
+            // When `second_answered` is false the server still reads the
+            // second HEAD before hanging up, so the client sees the
+            // exchange as a failed response, not a dead connection.
+            let cap = if second_answered { 2 } else { 1 };
             let (client, mut server) = tokio::io::duplex(4096);
             let srv = tokio::spawn(async move {
                 let mut seen = Vec::new();
                 let mut buf = [0u8; 1024];
                 let mut answered = 0;
-                while answered < if second_answered { 2 } else { 1 } {
+                loop {
                     let n = server.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
                     seen.extend_from_slice(&buf[..n]);
                     let requests = seen.windows(4).filter(|w| w == b"\r\n\r\n").count();
-                    while answered < requests {
+                    while answered < requests.min(cap) {
                         server
                             .write_all(b"HTTP/1.1 204 No Content\r\nServer: t\r\n\r\n")
                             .await
                             .unwrap();
                         answered += 1;
+                    }
+                    if requests >= 2 {
+                        break;
                     }
                 }
                 String::from_utf8(seen).unwrap()
@@ -1229,12 +1318,30 @@ mod tests {
                 .expect("first request passes");
             let seen = srv.await.unwrap();
             assert!(seen.starts_with("HEAD /generate_204 HTTP/1.1\r\n"));
-            assert!(seen.contains("Connection: keep-alive\r\n"));
+            // Both HEADs go out in either branch; `second_answered=false`
+            // fails on the second response, not on sending it.
+            assert_eq!(seen.matches("HEAD ").count(), 2, "{seen}");
+            assert_eq!(seen.matches("Connection: keep-alive").count(), 1);
+            assert_eq!(seen.matches("Connection: close").count(), 1);
             assert_eq!(warm.is_some(), second_answered);
-            if second_answered {
-                assert_eq!(seen.matches("HEAD ").count(), 2);
-            }
         }
+    }
+
+    /// A status line longer than the read buffer drains to its CRLF
+    /// instead of leaving the tail for `read_head` to scan as headers:
+    /// the truncated copy still carries version and code, and the head
+    /// after it lines up.
+    #[tokio::test]
+    async fn over_long_status_line_drains_to_its_crlf() {
+        let reason = "x".repeat(4 * 1024);
+        let wire = format!("HTTP/1.1 204 {reason}\r\nServer: t\r\n\r\n");
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let srv = tokio::spawn(async move {
+            server.write_all(wire.as_bytes()).await.unwrap();
+        });
+        let status = read_head(&mut client).await.expect("status parses");
+        srv.await.unwrap();
+        assert_eq!(status, 204);
     }
 
     #[test]

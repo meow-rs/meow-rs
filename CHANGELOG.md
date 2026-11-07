@@ -10,6 +10,12 @@ the canonical, in-repo source a release is cut from.
 
 ### Added
 
+- **`unified-delay: true`** — mihomo's global switch, re-applied on
+  every config load and reported by `GET /configs`. A delay probe then
+  sends two keep-alive `HEAD` requests on one connection and reports
+  only the second: one round trip through the proxy instead of
+  dial + proxy/TLS handshakes + request. A second request that fails
+  in transport keeps the full first measurement, as upstream does.
 - **`dns.nameserver-policy-exclusive: true`** — a `nameserver-policy`
   match then owns the query end-to-end: its nameservers answer, or the
   query fails, with no `fallback-filter` domain gate, no
