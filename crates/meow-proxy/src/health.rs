@@ -114,7 +114,11 @@ async fn url_test_with(
         ..Default::default()
     };
 
-    let fut = probe_once(adapter, metadata, parsed, ranges, unified);
+    // The deadline the warm second request of a unified probe is bounded
+    // by, so a peer that accepts one HEAD but never answers the next is
+    // the slow node mihomo reports, not a `Timeout`.
+    let deadline = tokio::time::Instant::now() + timeout;
+    let fut = probe_once(adapter, metadata, parsed, ranges, unified, deadline);
     match tokio::time::timeout(timeout, fut).await {
         Ok(Ok(second)) => {
             let delay = second
@@ -939,6 +943,7 @@ async fn probe_once(
     parsed: ParsedUrl,
     ranges: Vec<(u16, u16)>,
     unified: bool,
+    deadline: tokio::time::Instant,
 ) -> Result<Option<Instant>, String> {
     let conn = adapter
         .dial_tcp(&metadata)
@@ -955,9 +960,9 @@ async fn probe_once(
             .connect(Box::new(conn))
             .await
             .map_err(|e| format!("tls: {e}"))?;
-        check_maybe_twice(tls, &parsed, &ranges, unified).await
+        check_maybe_twice(tls, &parsed, &ranges, unified, deadline).await
     } else {
-        check_maybe_twice(conn, &parsed, &ranges, unified).await
+        check_maybe_twice(conn, &parsed, &ranges, unified, deadline).await
     }
 }
 
@@ -965,12 +970,14 @@ async fn probe_once(
 /// sends them, returning when the second started. As in mihomo's
 /// `URLTest`, the first response gates on transport only and the status
 /// check applies to the response kept: the second's, or — when the second
-/// request fails in transport — the first's, with the full measurement.
+/// request fails in transport or runs past `deadline` — the first's,
+/// with the full measurement.
 async fn check_maybe_twice<S>(
     mut stream: S,
     parsed: &ParsedUrl,
     ranges: &[(u16, u16)],
     unified: bool,
+    deadline: tokio::time::Instant,
 ) -> Result<Option<Instant>, String>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -985,16 +992,33 @@ where
     // As in mihomo's `URLTest`: the second timer starts once the first
     // response is fully read, before the warm request goes on the wire.
     let second = Instant::now();
-    let warm = match send_request(&mut stream, parsed, "HEAD", "close").await {
-        Err(e) => Err(format!("second request not sent: {e}")),
-        Ok(()) => read_status_line(&mut stream)
-            .await
-            .map_err(|e| format!("second response not read: {e}")),
+    let warm = async {
+        match send_request(&mut stream, parsed, "HEAD", "close").await {
+            Err(e) => Err(format!("second request not sent: {e}")),
+            Ok(()) => read_status_line(&mut stream)
+                .await
+                .map_err(|e| format!("second response not read: {e}")),
+        }
     };
+    // A second exchange that hangs — write wedged on a half-open
+    // connection, or a peer that accepts the HEAD but never answers —
+    // must not escalate to the probe's outer `timeout`, which would
+    // report a dead node. mihomo lets the second `client.Do` fail with
+    // the context deadline and keeps the first measurement, so the warm
+    // exchange is bounded by the same deadline here. `Timeout::poll`
+    // polls the inner future before checking its own deadline: when this
+    // `timeout_at` fires, the fallback below completes synchronously
+    // inside that poll and the outer `timeout` sees `Ready`, not
+    // `Elapsed` — no same-deadline race.
+    let warm = tokio::time::timeout_at(deadline, warm)
+        .await
+        .unwrap_or_else(|_| {
+            Err("second request did not complete within the probe deadline".to_string())
+        });
     match warm {
         Ok(status) => check_status(status, ranges).map(|()| Some(second)),
         Err(e) => {
-            warn!("url_test: unified-delay {e}; reporting the full first measurement");
+            warn!("url_test: unified-delay {e}; falling back to the first measurement");
             check_status(first, ranges).map(|()| None)
         }
     }
@@ -1273,7 +1297,14 @@ mod tests {
                     }
                 }
             });
-            let got = check_maybe_twice(client, &parsed, &ranges, true).await;
+            let got = check_maybe_twice(
+                client,
+                &parsed,
+                &ranges,
+                true,
+                tokio::time::Instant::now() + Duration::from_secs(5),
+            )
+            .await;
             srv.await.unwrap();
             assert_eq!(got.is_ok(), alive, "{first} then {second}");
         }
@@ -1313,9 +1344,15 @@ mod tests {
                 }
                 String::from_utf8(seen).unwrap()
             });
-            let warm = check_maybe_twice(client, &parsed, &ranges, true)
-                .await
-                .expect("first request passes");
+            let warm = check_maybe_twice(
+                client,
+                &parsed,
+                &ranges,
+                true,
+                tokio::time::Instant::now() + Duration::from_secs(5),
+            )
+            .await
+            .expect("first request passes");
             let seen = srv.await.unwrap();
             assert!(seen.starts_with("HEAD /generate_204 HTTP/1.1\r\n"));
             // Both HEADs go out in either branch; `second_answered=false`
@@ -1325,6 +1362,33 @@ mod tests {
             assert_eq!(seen.matches("Connection: close").count(), 1);
             assert_eq!(warm.is_some(), second_answered);
         }
+    }
+
+    /// A second HEAD the server receives but never answers falls back to
+    /// the first measurement at the probe deadline — mihomo's behaviour
+    /// on a hijacked test URL that cannot take repeated HEADs: the node
+    /// reports alive with the deadline's delay, not `Timeout`.
+    #[tokio::test]
+    async fn unified_delay_a_silent_second_exchange_keeps_the_first_measurement() {
+        // `Serves::Everything` answers one REPLY then only drains reads:
+        // the second HEAD goes out and is never answered while the
+        // connection stays open.
+        let proxy = crate::group::test_support::StreamProxy::new("slow", "probe.test:80");
+        let timeout = Duration::from_millis(200);
+        let delay = url_test_with(
+            proxy.as_ref(),
+            "http://probe.test/generate_204",
+            None,
+            timeout,
+            true,
+        )
+        .await
+        .expect("the first measurement keeps the node alive");
+        assert!(
+            delay as u64 >= timeout.as_millis() as u64
+                && (delay as u64) < timeout.as_millis() as u64 + 1000,
+            "delay ≈ the probe deadline, got {delay}"
+        );
     }
 
     /// A status line longer than the read buffer drains to its CRLF
