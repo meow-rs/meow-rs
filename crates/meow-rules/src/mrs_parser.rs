@@ -43,7 +43,7 @@
 //! confirm the parser reverses its own encoder.
 
 use std::io::{Cursor, Read};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 pub const MRS_MAGIC: [u8; 4] = *b"MRS!";
 pub const MRS_VERSION: u8 = 1;
@@ -491,8 +491,8 @@ impl UpstreamRuleSetReader {
         for _ in 0..len {
             let from = r.read_array::<16>("ipcidr_from")?;
             let to = r.read_array::<16>("ipcidr_to")?;
-            let from = IpAddr::from(Ipv6Addr::from(from));
-            let to = IpAddr::from(Ipv6Addr::from(to));
+            let from = Ipv6Addr::from(from);
+            let to = Ipv6Addr::from(to);
             push_range_prefixes(from, to, &mut |net| {
                 emitted += 1;
                 on_net(net);
@@ -785,19 +785,16 @@ fn get_bit(bits: &[u64], idx: usize) -> bool {
         .is_some_and(|word| (word & (1u64 << (idx % 64))) != 0)
 }
 
-fn push_range_prefixes(from: IpAddr, to: IpAddr, out: &mut dyn FnMut(ipnet::IpNet)) {
-    match (from, to) {
-        (IpAddr::V4(a), IpAddr::V4(b)) => push_v4_range(a, b, out),
-        (IpAddr::V6(a), IpAddr::V6(b))
-            if a.to_ipv4_mapped().is_some() && b.to_ipv4_mapped().is_some() =>
-        {
-            push_v4_range(
-                a.to_ipv4_mapped().unwrap(),
-                b.to_ipv4_mapped().unwrap(),
-                out,
-            );
-        }
-        (IpAddr::V6(a), IpAddr::V6(b)) => push_v6_range(a, b, out),
+/// `from`/`to` arrive as the 16-byte wire form, i.e. always `Ipv6Addr` —
+/// v4 ranges travel v4-mapped (upstream `ReadIpCidrSet` stores the same
+/// shape). A mapped pair un-maps into a v4 walk; a genuinely v6 pair
+/// walks v6. A mixed pair — or `from > to`, which the range walkers
+/// silently no-op — describes no real CIDR and drops the record, as
+/// upstream's invalid `netipx.IPRange` likewise emits no prefixes.
+fn push_range_prefixes(from: Ipv6Addr, to: Ipv6Addr, out: &mut dyn FnMut(ipnet::IpNet)) {
+    match (from.to_ipv4_mapped(), to.to_ipv4_mapped()) {
+        (Some(a), Some(b)) => push_v4_range(a, b, out),
+        (None, None) => push_v6_range(from, to, out),
         _ => {}
     }
 }
@@ -1583,6 +1580,28 @@ mod tests {
                 .collect();
             assert_eq!(parsed.entries, expected, "case {}", case.name);
         }
+    }
+
+    // `for_each_domain` counts the non-UTF-8 keys it skips so callers can
+    // surface the shortfall (convert warns; the rule-set loader warns too).
+    #[test]
+    fn upstream_domain_set_non_utf8_keys_are_counted_not_dropped_silently() {
+        let body = encode_domain_set_bytes(&[b"\xff.com", b"ok.com", b"\xfe\xad.org"]);
+        let bytes = encode_upstream_mrs(TYPE_DOMAIN, 3, &body);
+        let reader = UpstreamRuleSetReader::open(&bytes).unwrap();
+        let mut seen = Vec::new();
+        let skipped = reader
+            .for_each_domain(|d| seen.push(d.to_string()))
+            .unwrap();
+        assert_eq!(skipped, 2);
+        assert_eq!(seen, vec!["ok.com".to_string()]);
+
+        let mut seen = Vec::new();
+        let skipped = reader
+            .for_each_domain(|d| seen.push(d.to_string()))
+            .unwrap();
+        assert_eq!(skipped, 2, "repeat walk counts the same skips");
+        assert_eq!(seen, vec!["ok.com".to_string()]);
     }
 
     // A bare `+` key strips to the empty string; `DomainRuleSet::from_entries`

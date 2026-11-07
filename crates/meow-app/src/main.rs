@@ -123,8 +123,8 @@ enum Command {
         config: Option<String>,
     },
     /// Convert a rule-set file, as mihomo's `convert-ruleset`: an upstream
-    /// `.mrs` (`domain` or `ipcidr`) to text, one entry per line. OpenWrt
-    /// front ends (clashwrt) read `.mrs` providers through it.
+    /// `.mrs` (`domain` or `ipcidr`) to text, one entry per line — e.g. for
+    /// inspecting the `.mrs` rule-providers OpenWrt front ends ship.
     ConvertRuleset {
         /// `domain` or `ipcidr`
         behavior: String,
@@ -240,7 +240,7 @@ fn main() -> Result<()> {
 
     // Handle subcommands before initializing logging/runtime
     if let Some(cmd) = &args.command {
-        return handle_service_command(cmd, &args);
+        return handle_subcommand(cmd, &args);
     }
 
     run_application(args, &LogTarget::Console, ShutdownSignal::Console, None)
@@ -756,7 +756,7 @@ fn tun_feature_gate(enable: bool) -> Option<&'static str> {
     (enable && !cfg!(feature = "listener-tun")).then_some("listener-tun")
 }
 
-fn handle_service_command(cmd: &Command, args: &Args) -> Result<()> {
+fn handle_subcommand(cmd: &Command, args: &Args) -> Result<()> {
     match cmd {
         #[cfg(target_os = "linux")]
         Command::ArpReply {
@@ -812,9 +812,12 @@ fn convert_ruleset(
     );
     // `Path` equality is lexical: `dir/sub/../set.mrs` or a symlink names the
     // source without comparing equal to it, and the final rename would
-    // happily replace it (issue #877 review).
+    // happily replace it (issue #877 review). Where the spelling exists on
+    // disk, dev+ino is checked too — a hard link or a case-insensitive
+    // (APFS/NTFS) spelling of the source aliases it without sharing a
+    // resolved path.
     let source_resolved = resolved_path(source);
-    if resolved_path(&target) == source_resolved {
+    if resolved_path(&target) == source_resolved || same_file_on_disk(source, &target) {
         anyhow::bail!(
             "convert-ruleset: output {} would overwrite the source; name a target",
             target.display()
@@ -824,6 +827,8 @@ fn convert_ruleset(
         .with_context(|| format!("convert-ruleset: read {}", source.display()))?;
     let reader = UpstreamRuleSetReader::open(&bytes)
         .with_context(|| format!("convert-ruleset: decode {}", source.display()))?;
+    // `reader` owns the decompressed body; the wire bytes are dead weight.
+    drop(bytes);
     if reader.behavior() != want {
         anyhow::bail!(
             "convert-ruleset: {} is not a {behavior} rule-set",
@@ -832,16 +837,20 @@ fn convert_ruleset(
     }
     // Decode fully into a sibling scratch and rename over the target, so a
     // corrupt body never leaves a truncated output (or clobbers an old one).
-    meow_common::fs_util::sweep_scratch_siblings(&target, meow_common::fs_util::SCRATCH_STALE_AGE);
+    meow_common::fs_util::sweep_scratch_siblings_excluding(
+        &target,
+        meow_common::fs_util::SCRATCH_STALE_AGE,
+        source,
+    );
     let part = convert_scratch_path(&target);
-    if resolved_path(&part) == source_resolved {
+    if resolved_path(&part) == source_resolved || same_file_on_disk(source, &part) {
         anyhow::bail!(
             "convert-ruleset: scratch path {} would overwrite the source; name a different target",
             part.display()
         );
     }
     let written =
-        write_rule_set_text(&reader, want == TYPE_DOMAIN, source, &part).and_then(|skipped| {
+        write_rule_set_text(reader, want == TYPE_DOMAIN, source, &part).and_then(|skipped| {
             std::fs::rename(&part, &target)
                 .with_context(|| format!("convert-ruleset: rename to {}", target.display()))
                 .map(|()| skipped)
@@ -906,6 +915,31 @@ fn resolved_path(path: &std::path::Path) -> std::path::PathBuf {
     folded
 }
 
+/// Whether two on-disk paths are the same file — catches hard links and
+/// case-insensitive (APFS/NTFS) spellings that a canonical-path comparison
+/// reports distinct. `false` when either side can't be stat'ed (e.g. a
+/// not-yet-created target or scratch), where `resolved_path` still stands.
+fn same_file_on_disk(a: &std::path::Path, b: &std::path::Path) -> bool {
+    let (Ok(ma), Ok(mb)) = (std::fs::metadata(a), std::fs::metadata(b)) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        ma.dev() == mb.dev() && ma.ino() == mb.ino()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        ma.volume_serial_number() == mb.volume_serial_number() && ma.file_index() == mb.file_index()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (ma, mb);
+        false
+    }
+}
+
 /// Unique scratch sibling of `target` — the same `{path}.{pid}.{n}.tmp`
 /// scheme as `meow_config::unique_scratch_path` (pub(crate), unreachable
 /// from this crate) so `meow_common::fs_util::sweep_scratch_siblings`
@@ -920,10 +954,12 @@ fn convert_scratch_path(target: &std::path::Path) -> std::path::PathBuf {
 }
 
 /// Writes the decoded set, one entry per line. `source` only names decode
-/// errors; write errors carry `path`. Returns the number of stored domain
-/// keys skipped as invalid UTF-8 (0 for `ipcidr`).
+/// errors; write errors carry `path`. `reader` is consumed so its decoded
+/// body can drop as soon as the (collecting) domain walk finishes.
+/// Returns the number of stored domain keys skipped as invalid UTF-8
+/// (0 for `ipcidr`).
 fn write_rule_set_text(
-    reader: &meow_rules::mrs_parser::UpstreamRuleSetReader,
+    reader: meow_rules::mrs_parser::UpstreamRuleSetReader,
     domains: bool,
     source: &std::path::Path,
     path: &std::path::Path,
@@ -952,11 +988,15 @@ fn write_rule_set_text(
         skipped = reader
             .for_each_domain(|d| keys.push(d.to_string()))
             .with_context(|| format!("convert-ruleset: decode {}", source.display()))?;
+        // The decoded body is dead once the keys are collected.
+        drop(reader);
         for line in dump_domain_lines(keys) {
             emit(&line);
         }
     } else {
         let walked = reader.for_each_net(|n| emit(&n));
+        // The walk drained the decoded body; flush can run without it.
+        drop(reader);
         // A failed write is the actionable failure even when the walk then
         // also trips a decode error — the decode keeps draining into emit
         // no-ops meanwhile, so report io_err first.
@@ -974,31 +1014,36 @@ fn write_rule_set_text(
 }
 
 /// Upstream `domainStrategy.DumpMrs` (`rules/provider/domain_strategy.go`)
-/// compaction: entries are already decoded to `x` / `.x` / `+.x` forms —
-/// an `x` adjacent to its `.x` twin (after a sort that ignores the leading
-/// dot) collapses into `+.x`, and the final list is emitted in byte order.
+/// compaction, tightened to the canonical twin forms: an exact entry `x`
+/// and its suffix-only twin `.x` collapse into `+.x`. Upstream merges any
+/// pair equal after `TrimPrefix(".")` — which also folds `x`+`x` or
+/// `.x`+`.x` (distinct internal keys CAN decode to the same form, e.g.
+/// `moc.x.` and `moc.x.+` both yield `.x`) into coverage the set never
+/// had — so only `x` followed by `.x` merges, and the merge sort keys on
+/// (trimmed, has-dot) for a deterministic bare-first order.
 fn dump_domain_lines(mut keys: Vec<String>) -> Vec<String> {
-    keys.sort_by(|a, b| {
+    keys.sort_unstable_by(|a, b| {
         a.strip_prefix('.')
             .unwrap_or(a)
             .cmp(b.strip_prefix('.').unwrap_or(b))
+            .then(a.starts_with('.').cmp(&b.starts_with('.')))
     });
     let mut merged = Vec::with_capacity(keys.len());
     let mut i = 0;
     while i < keys.len() {
-        let domain = keys[i].strip_prefix('.').unwrap_or(&keys[i]);
-        if keys
-            .get(i + 1)
-            .is_some_and(|next| next.strip_prefix('.').unwrap_or(next) == domain)
+        if !keys[i].starts_with('.')
+            && keys
+                .get(i + 1)
+                .is_some_and(|next| next.strip_prefix('.') == Some(keys[i].as_str()))
         {
-            merged.push(format!("+.{domain}"));
+            merged.push(format!("+.{}", keys[i]));
             i += 2;
         } else {
             merged.push(std::mem::take(&mut keys[i]));
             i += 1;
         }
     }
-    merged.sort();
+    merged.sort_unstable();
     merged
 }
 
@@ -2168,6 +2213,43 @@ mod tests {
         assert!(scratch_siblings(&dir, "set.txt").is_empty());
     }
 
+    /// Distinct internal keys can decode to the same form — `moc.a.` and
+    /// `moc.a.+` both yield `.a.com` — and upstream's loose trimmed-equal
+    /// merge would fold that duplicate (or `x`+`x`) into coverage the set
+    /// never had. Only the canonical `x` + `.x` twin may collapse.
+    #[test]
+    fn convert_ruleset_domain_dump_merges_only_canonical_twins() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("set.mrs");
+        std::fs::write(
+            &src,
+            domain_mrs(&["a.com", "+.a.com", ".a.com", "+.x.com", ".x.com"]),
+        )
+        .unwrap();
+        let out = dir.path().join("set.txt");
+        convert_ruleset("domain", "mrs", &src, Some(&out)).unwrap();
+        // `a.com` + one `.a.com` merge; the second `.a.com` and the
+        // `.x.com` + `.x.com` pair stay unfolded.
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap(),
+            "+.a.com\n.a.com\n.x.com\n.x.com\n"
+        );
+        assert!(scratch_siblings(&dir, "set.txt").is_empty());
+    }
+
+    /// A `domain` .mrs fed to the `ipcidr` convert is refused on the
+    /// behavior guard before anything is written.
+    #[test]
+    fn convert_ruleset_refuses_behavior_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("set.mrs");
+        std::fs::write(&src, domain_mrs(&["a.com"])).unwrap();
+        let out = dir.path().join("out.txt");
+        assert!(convert_ruleset("ipcidr", "mrs", &src, Some(&out)).is_err());
+        assert!(!out.exists());
+        assert!(scratch_siblings(&dir, "out.txt").is_empty());
+    }
+
     #[test]
     fn convert_ruleset_ipcidr_dumps_cidrs() {
         let dir = tempfile::tempdir().unwrap();
@@ -2209,6 +2291,21 @@ mod tests {
         assert!(convert_ruleset("domain", "mrs", &src, Some(&tricky)).is_err());
         assert_eq!(std::fs::read(&src).unwrap(), bytes, "source untouched");
         assert!(scratch_siblings(&dir, "set.mrs").is_empty());
+    }
+
+    /// A hard link has its own resolved path — only the dev+ino check
+    /// sees that it *is* the source.
+    #[cfg(unix)]
+    #[test]
+    fn convert_ruleset_refuses_target_hardlink_to_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("real.mrs");
+        let bytes = domain_mrs(&["a.com"]);
+        std::fs::write(&src, &bytes).unwrap();
+        let link = dir.path().join("out.txt");
+        std::fs::hard_link(&src, &link).unwrap();
+        assert!(convert_ruleset("domain", "mrs", &src, Some(&link)).is_err());
+        assert_eq!(std::fs::read(&src).unwrap(), bytes, "source untouched");
     }
 
     #[cfg(unix)]

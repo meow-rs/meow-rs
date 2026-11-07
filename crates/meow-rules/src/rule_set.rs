@@ -197,7 +197,7 @@ pub fn build_rule_set_from_mrs_with_behavior(
             RuleSetBehavior::Domain => {
                 let mut builder = DomainRuleSetBuilder::new();
                 let mut first_err = None;
-                reader
+                let skipped = reader
                     .for_each_domain(|d| {
                         if first_err.is_none() {
                             if strict {
@@ -210,6 +210,9 @@ pub fn build_rule_set_from_mrs_with_behavior(
                         }
                     })
                     .map_err(|e| e.to_string())?;
+                if skipped > 0 {
+                    warn!("mrs: {skipped} stored keys skipped (not valid UTF-8)");
+                }
                 if let Some(e) = first_err {
                     return Err(e);
                 }

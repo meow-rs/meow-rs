@@ -93,7 +93,9 @@ As mihomo's `convert-ruleset`, for the `.mrs` → text direction: an upstream
 form mihomo writes — a domain stored with both its apex and its subdomains
 comes out as a single `+.domain` line, a suffix-only entry stays `.domain`,
 and `ipcidr` ranges split into aligned CIDRs. The output is written whole
-or not at all; a `.txt` source needs an explicit target.
+or not at all; a `.txt` source needs an explicit target. Stored keys that
+aren't valid UTF-8 (a corrupt set, not an IDN — punycode/Unicode entries
+decode fine) are skipped and reported as a warning with the count.
 
 ## Hot reload
 
