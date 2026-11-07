@@ -10,6 +10,14 @@ the canonical, in-repo source a release is cut from.
 
 ### Added
 
+- **`dns.nameserver-policy-exclusive: true`** — a `nameserver-policy`
+  match then owns the query end-to-end: its nameservers answer, or the
+  query fails, with no `fallback-filter` domain gate, no
+  `ipcidr`/geoip rejection of its answers and no main/`fallback:`
+  escalation — mihomo's `ipExchange` ordering, where a `matchPolicy`
+  hit returns before every fallback check. `direct-nameserver`
+  inherits the flag when `direct-nameserver-follow-policy` is on.
+  Default `false` keeps the tiered behaviour.
 - **`meow convert-ruleset <domain|ipcidr> mrs <source.mrs> [out.txt]`** —
   the `.mrs` → text direction of mihomo's `convert-ruleset`, e.g. for
   inspecting or hand-editing the `.mrs` rule-providers OpenWrt frontends

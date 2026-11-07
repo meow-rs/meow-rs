@@ -552,8 +552,17 @@ pub struct RawDns {
     /// value is a single server URL or a list of URLs. **Document order is
     /// the lookup priority** — see [`RawNameserverPolicy`].
     pub nameserver_policy: Option<RawNameserverPolicy>,
-    /// Confine matched queries to their assigned nameservers, even if they
-    /// fail or a fallback filter matches. Defaults to false.
+    /// Confine queries matching a `nameserver-policy` key to that entry's
+    /// nameservers: their answer is used as-is — or the query fails —
+    /// instead of escalating through the `fallback-filter` domain gate,
+    /// its `ipcidr`/geoip rejection, or the main/`fallback:` tiers
+    /// (mihomo `ipExchange` parity, which returns right after a
+    /// `matchPolicy` hit). A matched domain therefore also bypasses the
+    /// fallback-filter's poisoned-answer checks — confining a zone to a
+    /// private upstream means trusting that upstream's answers. The flag
+    /// is policy-wide (per-key exclusivity is not offered) and also
+    /// constrains `direct-nameserver` lookups when
+    /// `direct-nameserver-follow-policy` is on. Defaults to false.
     pub nameserver_policy_exclusive: Option<bool>,
     /// Controls when the `fallback:` nameservers replace the primary result.
     pub fallback_filter: Option<RawFallbackFilter>,
