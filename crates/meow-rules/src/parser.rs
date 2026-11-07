@@ -93,10 +93,13 @@ static NO_RULE_SETS: std::sync::OnceLock<RuleSets> = std::sync::OnceLock::new();
 
 /// Parse a rule line with **no rule-provider scope**: a `RULE-SET` entry
 /// (top-level or inside a logic group) always fails as unknown-provider.
-/// That is the scope provider payloads get — a classical rule-set file
-/// cannot reference sibling providers, matching mihomo, whose
-/// `payloadToRule` parses provider content with no provider context.
-/// Config `rules:` blocks that must resolve `RULE-SET` use
+/// That is the scope provider payloads get — deliberately stricter than
+/// mihomo, whose `RULE-SET` parses anywhere and resolves the name lazily
+/// through `tunnel.RuleProviders()` at match time (a payload may even
+/// reference a provider declared later, and references may cycle — the
+/// recursion just never matches). Eager resolution against a scoped map
+/// keeps a payload self-contained and makes cycles impossible (Class B,
+/// ADR-0002). Config `rules:` blocks that must resolve `RULE-SET` use
 /// [`parse_rule_with_rule_sets`].
 pub fn parse_rule(line: &str, ctx: &ParserContext) -> Result<Box<dyn Rule>, String> {
     parse_rule_depth(line, ctx, NO_RULE_SETS.get_or_init(RuleSets::new), 0)

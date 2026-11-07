@@ -39,6 +39,34 @@ the canonical, in-repo source a release is cut from.
   path, a symlink, or a hard link — and decode failures name the file
   that failed. Keys that aren't valid UTF-8 are skipped with a count
   printed as a warning.
+- **Scheduled `proxy-providers:` `health-check:` sweeps** — a provider
+  with `enable: true` and a `url` now probes its members every
+  `interval` (seconds, `0`→`300`; `timeout` in ms, `0`→`5000`), the same
+  sweep `GET /providers/proxies/{name}/healthcheck` runs on demand. The
+  first probe lands when the payload does — a commit between ticks wakes
+  the loop like upstream's `setProxies` → `hc.check()` instead of
+  waiting out the interval. An absent/empty `url` means no probes at all
+  (upstream zeroes the interval there), and upstream's `lazy` —
+  skipping sweeps while the provider is idle — is **not** honoured: meow
+  tracks no per-provider last-touch, so an explicit `lazy: true` warns
+  at load (same precedent as group `lazy`, #555). `expected-status`
+  validates at load whenever the block is present, and a block with
+  `enable` absent or `false` still feeds the manual endpoint and the
+  `testUrl`/`expectedStatus` API echo.
+- **`SAFE_PATHS` / `SKIP_SAFE_PATH_CHECK` environment variables** —
+  mihomo's escape hatches around the provider path-containment guard.
+  `SAFE_PATHS` is a `PATH`-style list of extra roots provider `path:`
+  values may live under besides the provider cache directory (entries
+  are trimmed, relative ones ignored); `SKIP_SAFE_PATH_CHECK` parses
+  like Go's `strconv.ParseBool` and, when truthy, downgrades a
+  containment failure to a loud `warn!` instead of rejecting the path.
+- **`RULE-SET` inside `AND`/`OR`/`NOT` logic rules** —
+  `AND,((NETWORK,udp),(RULE-SET,cn)),ProxyUDP` now resolves the provider
+  reference inside the group, as mihomo does — the same provider map the
+  top-level `RULE-SET` arm already used, plus the `src`-on-domain warn
+  the top level had. In a rule-provider's own payload `RULE-SET` is
+  still rejected eagerly — stricter than upstream, which resolves the
+  name lazily at match time and tolerates cycles.
 
 ### Changed
 
@@ -48,10 +76,14 @@ the canonical, in-repo source a release is cut from.
   `Result<usize>` — the number of non-UTF-8 keys skipped during the
   walk. meow-common gains `sweep_scratch_siblings_excluding`, a
   keep-file variant of the stale-scratch sweep.
-- A `proxy-providers:` `health-check:` block whose `enable:` is absent
-  or not `true` now logs a `warn!` naming the provider. The block is
-  still inert (mihomo's `Enable` has no default), but the disable is no
-  longer silent.
+- **A `proxy-providers:` `health-check:` block whose `enable:` is absent
+  or not `true` now logs a `warn!` naming the provider.** mihomo's
+  `Enable` has no schema default, so a bare block runs no periodic
+  sweep — but the block is no longer dropped: its `url`/`timeout`/
+  `expected-status` still drive `GET /providers/proxies/{name}/
+  healthcheck` and the `testUrl`/`expectedStatus` API echo, as upstream's
+  unconditionally built `HealthCheck` does. An `enable: true` block with
+  no `url` warns too (no probes upstream either).
 
 ### Fixed
 

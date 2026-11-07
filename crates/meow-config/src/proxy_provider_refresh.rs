@@ -17,8 +17,12 @@
 //!
 //! The same supervisor runs each provider's `health-check` on its own
 //! `interval` (mihomo parity): members are probed like the
-//! manual `GET /providers/proxies/{name}/healthcheck`. meow tracks no
-//! per-provider traffic, so `lazy` does not skip ticks here.
+//! manual `GET /providers/proxies/{name}/healthcheck`. A sweep exists
+//! only for `enable: true` plus a non-empty `url` — upstream's `auto()`
+//! (`NewHealthCheck` zeroes the interval when either is missing) —
+//! and between ticks the loop also wakes on member commits, like
+//! upstream's `setProxies` → `hc.check()`. meow tracks no per-provider
+//! traffic, so `lazy` does not skip ticks here.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
@@ -118,10 +122,18 @@ impl ProxyProviderRefreshSupervisor {
             ))
         });
 
+        // A periodic sweep exists only where upstream's `auto()` would
+        // say so: `enable` set the interval and `NewHealthCheck` zeroes
+        // it again on an empty url — both must hold, or there is nothing
+        // scheduled to probe. The block's url/timeout/expected-status
+        // still feed the manual endpoint and the API echo either way.
         let wanted_health: HashMap<String, u64> = registry
             .iter()
             .filter_map(|e| {
                 let hc = e.value().health_check.as_ref()?;
+                if !hc.enable || hc.url.is_empty() {
+                    return None;
+                }
                 Some((
                     e.key().clone(),
                     hc.interval.clamp(1, MAX_REFRESH_INTERVAL_SECS),
@@ -263,8 +275,10 @@ async fn refresh_loop(
 }
 
 /// Probe a provider's members every `interval_secs`, starting right away
-/// (mihomo checks a provider on load). The provider and its `health-check`
-/// settings are re-read by name each tick, like [`refresh_loop`].
+/// (mihomo checks a provider on load) *and* whenever a payload commit
+/// lands between ticks (mihomo's `setProxies` fires `go hc.check()`).
+/// The provider and its `health-check` settings are re-read by name each
+/// iteration, like [`refresh_loop`].
 async fn health_check_loop(
     name: String,
     interval_secs: u64,
@@ -273,17 +287,20 @@ async fn health_check_loop(
     let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        ticker.tick().await;
+        // Resolve this iteration's generation *before* the wait: the
+        // sleep listens on that provider's member-commit Notify, so a
+        // registry swap rebinds the wait to the live provider — parked on
+        // a retired one's Notify the loop would only ever wake on ticks.
         let Some(registry) = registry.upgrade() else {
             return;
         };
-        // Drop the registry `Arc` before the probe — a long await —
-        // rather than holding it into the next tick on every branch
-        // (same swapped-generation pinning concern as [`refresh_loop`]).
         let provider = registry.get(&name).map(|e| Arc::clone(e.value()));
+        // Release the registry `Arc` before the long wait/probe — same
+        // swapped-generation pinning concern as [`refresh_loop`].
         drop(registry);
         let Some(provider) = provider else {
             debug!(provider = %name, "proxy-provider gone; health-check task idle until reconcile aborts it");
+            ticker.tick().await;
             continue;
         };
         // `health_check` is fixed at provider build — once absent it can
@@ -294,12 +311,25 @@ async fn health_check_loop(
         let Some(hc) = provider.health_check.as_ref() else {
             return;
         };
+        // Sleep until the next interval tick or the next member commit —
+        // a payload landing between ticks is probed on arrival, not an
+        // interval late (a commit made before this wait left a stored
+        // permit and fires the first `notified()` immediately). The
+        // generation parked on may swap out mid-sleep; the probe below
+        // still runs on it — harmless — and the next iteration rebinds.
+        tokio::select! {
+            _ = ticker.tick() => {}
+            _ = provider.members_changed().notified() => {}
+        }
         let members: Vec<_> = provider
             .proxies()
             .into_iter()
             .map(|proxy| (proxy.name().to_string(), proxy))
             .collect();
-        if members.is_empty() {
+        // Nothing to probe, or the url went empty on a same-name swap the
+        // spawn filter never saw: upstream's `check()`/`execute()` skip
+        // both — wait for the next wake.
+        if members.is_empty() || hc.url.is_empty() {
             continue;
         }
         let expected = (!hc.expected_status.is_empty()).then_some(hc.expected_status.as_str());
@@ -565,7 +595,7 @@ mod tests {
             path: Some(dir.path().join("hc.yaml").display().to_string()),
             health_check: Some(crate::raw::RawHealthCheck {
                 enable: Some(true),
-                url: None,
+                url: Some("https://www.gstatic.com/generate_204".to_string()),
                 interval: Some(120),
                 timeout: None,
                 expected_status: None,
@@ -613,5 +643,101 @@ mod tests {
             handle.is_finished(),
             "reconcile must abort a dropped provider's health-check task"
         );
+    }
+
+    /// mihomo `NewHealthCheck` zeroes the interval when `Enable` is unset
+    /// or the url is empty — the sweep exists only for `enable: true`
+    /// *and* a non-empty url. The block itself stays on the provider
+    /// either way (manual endpoint + `testUrl` echo keep working).
+    #[tokio::test]
+    async fn health_check_loops_require_enable_and_url() {
+        let sup = ProxyProviderRefreshSupervisor::default();
+        let dir = tempfile::tempdir().unwrap();
+        let build = |name: &str, hc: crate::raw::RawHealthCheck| {
+            let raw = RawProxyProvider {
+                provider_type: "file".to_string(),
+                url: None,
+                path: Some(
+                    dir.path()
+                        .join(format!("{name}.yaml"))
+                        .display()
+                        .to_string(),
+                ),
+                health_check: Some(hc),
+                ..raw_provider(None)
+            };
+            Arc::new(
+                ProxyProvider::new(
+                    name,
+                    &raw,
+                    Some(dir.path()),
+                    true,
+                    false,
+                    Default::default(),
+                )
+                .expect("file provider must build"),
+            )
+        };
+        let url = || Some("https://www.gstatic.com/generate_204".to_string());
+        let reg: Arc<DashMap<String, Arc<ProxyProvider>>> = Arc::new(DashMap::new());
+        for (name, hc) in [
+            (
+                "enabled",
+                crate::raw::RawHealthCheck {
+                    enable: Some(true),
+                    url: url(),
+                    interval: Some(60),
+                    timeout: None,
+                    expected_status: None,
+                    lazy: None,
+                },
+            ),
+            (
+                "disabled",
+                crate::raw::RawHealthCheck {
+                    enable: Some(false),
+                    url: url(),
+                    interval: Some(60),
+                    timeout: None,
+                    expected_status: None,
+                    lazy: None,
+                },
+            ),
+            (
+                "no-enable",
+                crate::raw::RawHealthCheck {
+                    enable: None,
+                    url: url(),
+                    interval: Some(60),
+                    timeout: None,
+                    expected_status: None,
+                    lazy: None,
+                },
+            ),
+            (
+                "empty-url",
+                crate::raw::RawHealthCheck {
+                    enable: Some(true),
+                    url: None,
+                    interval: Some(60),
+                    timeout: None,
+                    expected_status: None,
+                    lazy: None,
+                },
+            ),
+        ] {
+            reg.insert(name.to_string(), build(name, hc));
+        }
+        sup.reconcile(&reg, Some(&HashMap::new()));
+        assert_eq!(sup.health_interval("enabled"), Some(60));
+        // The rest keep their `health_check` block (for the manual
+        // endpoint) but spawn no periodic sweep.
+        for name in ["disabled", "no-enable", "empty-url"] {
+            assert_eq!(sup.health_interval(name), None, "{name} must not sweep");
+            assert!(
+                reg.get(name).unwrap().health_check.is_some(),
+                "{name} must keep the block for the manual endpoint"
+            );
+        }
     }
 }

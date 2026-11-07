@@ -110,7 +110,8 @@ proxy-providers:
       enable: true
       url: https://www.gstatic.com/generate_204
       interval: 300      # seconds between health-check sweeps
-      lazy: true         # if true, don't probe until first use
+      lazy: true         # upstream: skip sweeps while the provider is idle;
+                         # NOT honoured here (warns at load)
       expected-status: 204  # HTTP status code that counts as healthy
     override:            # optional; applied to every proxy in this provider
       skip-cert-verify: true
@@ -156,11 +157,12 @@ proxy-groups:
 | `url` | string | if `http` | — | Subscription URL. |
 | `path` | string | yes | — | Local cache path. For `http`: write fetched YAML here. For `file`: read from here. Relative paths resolved from the config file's directory. |
 | `interval` | integer | no | `0` | Refresh interval in seconds, scheduled by the refresh supervisor on every config commit. `0` or absent = no background refresh (manual `PUT /providers/proxies/{name}` still works). `file` providers re-read their file each tick — upstream instead fs-watchers file providers, so an un-`interval`ed `file` provider does not auto-reload here (divergence #2). |
-| `health-check.enable` | bool | no | `false` | Enable periodic health-check probes. A `health-check:` block with `enable` absent or not `true` is inert but logs a `warn!` naming the provider. |
-| `health-check.url` | string | if `enable` | — | URL used for reachability probes. |
-| `health-check.interval` | integer | no | `300` | Health-check sweep interval in seconds, run by the refresh supervisor; `0` means the default `300` (mihomo). |
-| `health-check.lazy` | bool | no | `false` | If true, defer first probe until the proxy is first used by a connection. Not honoured: meow tracks no per-provider traffic, so members are probed every interval (a warning is logged per provider at load). |
-| `health-check.expected-status` | integer or string | no | any 2xx | HTTP status that counts as healthy: a bare code (`204`), codes and ranges separated by `,` or `/` (`"200-299"`, `"200/204"`), or `*` for any. Validated at load: a bad spec fails the provider. |
+| `health-check.enable` | bool | no | `false` | Enable periodic health-check probes. A `health-check:` block with `enable` absent or not `true` runs no sweep but is still kept — the manual `GET .../healthcheck` endpoint and the `testUrl`/`expectedStatus` API echo honour it — and logs a `warn!` naming the provider (upstream likewise builds `HealthCheck` unconditionally; `Enable` only zeroes the ticker interval). |
+| `health-check.url` | string | no | `""` | URL used for reachability probes, stored verbatim — no gstatic default. Empty (or absent) means **no probes**: upstream's `NewHealthCheck` zeroes the interval on an empty url, so no sweep runs and the manual endpoint skips too (204). `enable: true` with no url additionally logs a `warn!` naming the provider. |
+| `health-check.interval` | integer | no | `300` | Health-check sweep interval in seconds, run by the refresh supervisor; `0` maps to the default `300`, never to "every tick" (mihomo). Applies only when `enable` and a non-empty `url` both hold. |
+| `health-check.timeout` | integer | no | `5000` | Per-probe timeout in milliseconds; `0` maps to `5000` like an absent value (mihomo `NewHealthCheck`), never to a 1 ms dead probe. |
+| `health-check.lazy` | bool | no | `false` | Upstream (schema default `true`) *skips* a sweep when the provider saw no traffic during the last interval — idle providers stay quiet. **Not honoured**: meow tracks no per-provider last-touch, so sweeps run every interval regardless (same precedent as group `lazy` — #555, ADR-0002); an explicit `lazy: true` logs a `warn!` naming the provider. |
+| `health-check.expected-status` | integer or string | no | any 2xx | HTTP status that counts as healthy: a bare code (`204`), codes and ranges separated by `,` or `/` (`"200-299"`, `"200/204"`), or `*` for any. Validated at load whenever the block is present — a bad spec fails the provider even with `enable: false` (upstream `NewUnsignedRanges` runs before `Enable` is read). |
 | `override` | map | no | `{}` | Key-value overrides applied to every proxy. See §Override. |
 | `filter` | string | no | `""` | Regex. Include only proxies whose `name` matches. Empty = include all. |
 | `exclude-filter` | string | no | `""` | Regex. Exclude proxies whose `name` matches. Applied after `filter`. |
@@ -355,7 +357,8 @@ load_config() {
   4. Build Tunnel with resolved groups + provider map in AppState.
   5. Spawn background tasks:
      - One refresh task per http provider with interval > 0.
-     - One health-check sweep task per provider with health-check.enable.
+     - One health-check sweep task per provider whose health-check has
+       `enable: true` *and* a non-empty `url` (upstream `auto()`).
 }
 ```
 
@@ -405,13 +408,22 @@ longer in the provider's list.** Document this with a comment.
 ```rust
 async fn health_check_loop(provider: Arc<ProxyProvider>) {
     let mut ticker = tokio::time::interval(health_check_interval);
-    if lazy {
-        // first tick waits for a connection to use a proxy from this provider
-        // (simplified: just sleep the first interval, do not track first-use)
-        ticker.tick().await;
-    }
     loop {
-        ticker.tick().await;
+        // As shipped (mihomo `setProxies` → `go hc.check()` parity): the
+        // wait also listens on the provider's member-commit Notify, so a
+        // payload landing mid-interval is probed on arrival instead of
+        // one interval late. `lazy` is not honoured — upstream skips a
+        // tick when the provider saw no traffic during the last interval,
+        // and meow tracks no per-provider last-touch (same precedent as
+        // group `lazy` — #555, ADR-0002); an explicit `lazy: true` warns
+        // at load.
+        tokio::select! {
+            _ = ticker.tick() => {}
+            _ = provider.members_changed().notified() => {}
+        }
+        if provider.proxies.is_empty() || hc.url.is_empty() {
+            continue; // upstream check()/execute() skip both cases
+        }
         probe_all_proxies(&provider).await;
     }
 }
@@ -422,6 +434,13 @@ async fn probe_all_proxies(provider: &ProxyProvider) {
     // update provider.health on each result
 }
 ```
+
+A sweep exists only where upstream's `auto()` says so — `enable` **and**
+a non-empty `url`. The rest of the block (`url`, `timeout`,
+`expected-status`) is kept either way for the manual
+`GET /providers/proxies/:name/healthcheck` endpoint and the
+`testUrl`/`expectedStatus` API echo, which upstream serves
+unconditionally (its `Enable` only zeroes the ticker interval).
 
 Health results are stored in `provider.health: Arc<RwLock<HashMap<String, ProxyHealth>>>`.
 The API handler for `GET /providers/proxies/:name/healthcheck` reads
@@ -516,6 +535,12 @@ handlers access providers through `State<Arc<AppState>>` as today.
 | 5 | Proxy-providers feature disabled, providers in config — upstream N/A (always enabled) | A | Hard-error per provider entry instead of silent empty group. Class A: silently skipping all provider proxies causes misrouting without diagnostic. |
 | 6 | HTTP fetch failure at startup — upstream skips provider silently | B | We warn-once with the URL and error; matching the rule-provider "best-effort keep running" pattern but with a visible warn. No hard-error at startup because the cache path may still satisfy the load. |
 | 7 | Duplicate proxy name across providers — upstream last-write-wins silently | B | We warn-once per collision naming both source providers and the winning entry. Config-file order (`proxy-providers:` key order) is the deterministic iteration order; last definition wins. Warn text: `"proxy name '<name>' is defined in both provider '<A>' and provider '<B>'; using the entry from '<B>' (later in config). Rename one to disambiguate."` Once per collision per load; new collisions introduced by a refresh also warn. |
+| 8 | `RULE-SET` inside a rule-provider payload — upstream parses it and resolves the name lazily through `tunnel.RuleProviders()` at match time (a payload may reference a provider declared later; references may even cycle — the recursion just never matches) | B | We resolve eagerly against the scoped provider map, so a payload `RULE-SET` fails "unknown rule-provider". Stricter, deliberately: payloads stay self-contained and cycles are impossible. |
+| 9 | `health-check.lazy` — upstream skips a sweep when the provider saw no traffic during the last interval (schema default `true`, `lastTouch` gating) | B | We probe every interval regardless — meow tracks no per-provider last-touch (same precedent as group `lazy`, #555). An explicit `lazy: true` warns at load. |
+| 10 | Empty/absent `health-check.expected-status` — upstream means `*` (any status) | B | We mean 2xx, the shared `parse_expected` default every delay endpoint also uses. Changing it would flip group/delay semantics beyond this PR; recorded as a deliberate divergence. |
+| 11 | `expected-status` grammar — upstream also tolerates bracketed entries (`[200]`) and inverted bounds, and caps the list at 28 ranges | B | We reject brackets and inverted ranges; the stricter direction is safe — anything we accept parses identically upstream. |
+| 12 | A `use:`ing group's own health-check registration onto the provider — upstream `registerHealthCheckTask` lets a group's url/expected-status/filter/interval extend the provider's sweep set (and inherits `testUrl`/`expectedStatus` onto the group when unset) | B | Not implemented: group and provider sweeps are independent. Wiring the provider map into group parsing is out of scope. |
+| 13 | `health-check.url` absent — upstream `NewHealthCheck` zeroes the interval (no sweep; `execute` skips an empty testUrl) | B | Same observable behaviour (no sweep, manual endpoint 204s), but reached differently: we keep the url verbatim (no gstatic default) and filter the sweep at spawn. `enable: true` with no url additionally warns, naming the provider. |
 
 ## Acceptance criteria
 

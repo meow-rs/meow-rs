@@ -35,24 +35,40 @@ fn skip_safe_path_check() -> bool {
 fn safe_paths() -> &'static SafePaths {
     static SAFE_PATHS: std::sync::OnceLock<SafePaths> = std::sync::OnceLock::new();
     SAFE_PATHS.get_or_init(|| {
-        let lexical = std::env::var_os("SAFE_PATHS")
-            .map(|v| {
-                std::env::split_paths(&v)
-                    .filter(|p| p.is_absolute())
-                    .filter_map(|p| normalize_absolute(&p).ok())
-                    .collect()
-            })
-            .unwrap_or_default();
-        SafePaths::from_lexical(lexical)
+        SafePaths::from_lexical(
+            std::env::var_os("SAFE_PATHS")
+                .map(|v| split_safe_paths(&v))
+                .unwrap_or_default(),
+        )
     })
+}
+
+/// Parse the `SAFE_PATHS` list into normalized absolute roots: split like
+/// `PATH`, then — matching mihomo's per-entry `strings.TrimSpace` — a
+/// padded entry is honoured trimmed and an empty one dropped, as is any
+/// non-absolute one (a relative root could never contain the absolute
+/// target it is compared against).
+fn split_safe_paths(v: &std::ffi::OsStr) -> Vec<PathBuf> {
+    std::env::split_paths(v)
+        .map(|p| match p.to_str() {
+            Some(s) => PathBuf::from(s.trim()),
+            None => p,
+        })
+        .filter(|p| !p.as_os_str().is_empty() && p.is_absolute())
+        .filter_map(|p| normalize_absolute(&p).ok())
+        .collect()
 }
 
 /// The two views of `SAFE_PATHS` one check needs: `lexical` roots for the
 /// normalized-form comparison, and each root's canonicalized form for the
-/// resolved-form comparison. Pre-resolving matters on, e.g., macOS where
-/// `/tmp` → `/private/tmp`: a target spelled through the resolved side of
-/// a symlinked root misses the lexical check and is only caught by the
-/// canonical one.
+/// resolved-form comparison. The resolved-form stage runs second and sees
+/// only targets the lexical stage already admitted: it *rejects* a
+/// symlink — under `base` or under a listed root — pointing outside every
+/// root, and it *admits* a symlink under `base` that resolves into a
+/// listed root. A target *spelled* through the resolved side of a
+/// symlinked root (`/private/tmp/…` for a `/tmp` entry) never reaches it:
+/// the lexical stage rejects first, and canonical comparison cannot
+/// rescue what that check already refused.
 #[derive(Default)]
 struct SafePaths {
     lexical: Vec<PathBuf>,
@@ -321,6 +337,30 @@ mod tests {
         )
         .unwrap();
         assert!(!got.to_string_lossy().contains(".."));
+    }
+
+    /// mihomo `strings.TrimSpace` per `SplitList` entry: padded roots are
+    /// honoured trimmed, empty and relative entries dropped, `..` folded.
+    #[test]
+    fn safe_paths_entries_are_trimmed_and_filtered() {
+        let abs_a = tempfile::tempdir().unwrap();
+        let abs_b = tempfile::tempdir().unwrap();
+        let joined = std::env::join_paths([
+            PathBuf::from(format!("  {}  ", abs_a.path().display())),
+            PathBuf::from("relative/dir"),
+            abs_b
+                .path()
+                .join("..")
+                .join(abs_b.path().file_name().unwrap()),
+        ])
+        .unwrap();
+        let got = split_safe_paths(&joined);
+        assert_eq!(
+            got,
+            vec![abs_a.path().to_path_buf(), abs_b.path().to_path_buf()],
+            "the padded entry must survive trimmed, `..` must fold, the \
+             relative entry must drop"
+        );
     }
 
     /// mihomo `SAFE_PATHS`: a symlink (or an absolute path) into a listed

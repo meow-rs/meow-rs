@@ -38,10 +38,23 @@ pub(crate) const MAX_REVALIDATION_ATTEMPTS: u32 = 5;
 const USERINFO_SUFFIX: &str = ".subscription-userinfo";
 
 pub struct HealthCheckConfig {
+    /// mihomo `healthCheckSchema.URL` verbatim — empty means "no probe
+    /// URL configured": upstream zeroes the interval (`NewHealthCheck`),
+    /// so no periodic sweep runs and both the scheduled loop and the
+    /// manual healthcheck endpoint skip probing.
     pub url: String,
+    /// mihomo `healthCheckSchema.Enable` — gates only the periodic
+    /// sweep; the block still feeds the manual healthcheck endpoint and
+    /// the `testUrl`/`expectedStatus` API echo when false (upstream
+    /// builds `HealthCheck` unconditionally).
+    pub enable: bool,
     pub interval: u64,
     pub timeout: u64,
     pub expected_status: String,
+    /// Upstream `Lazy` skips a tick when the provider saw no traffic in
+    /// the last interval. Not honoured: meow tracks no per-provider
+    /// last-touch, so ticks are never skipped (same precedent as group
+    /// `lazy` — #555, ADR-0002). Parsed so a ported config can declare it.
     pub lazy: bool,
 }
 
@@ -98,6 +111,13 @@ pub struct ProxyProvider {
     /// at least once — lets a queued background attempt skip the fetch a
     /// straggling startup fetch just completed.
     fetched_remote: AtomicBool,
+    /// Signalled by [`Self::commit`] whenever the member set is replaced —
+    /// the health-check sweep sleeps on it between interval ticks so a
+    /// payload landing mid-interval is probed on arrival, the way
+    /// mihomo's `setProxies` fires `go hc.check()` on every commit.
+    /// `notify_one` leaves a stored permit when nobody is waiting, so a
+    /// commit made before the sweep's first wait still wakes it.
+    members_changed: tokio::sync::Notify,
     /// The committed payload was parsed without its ECH DNS preresolve —
     /// the config-mutation lane's check-only load must not look anything
     /// up, so the detached post-commit fetch owes the slot one off-lane
@@ -424,6 +444,7 @@ impl ProxyProvider {
             deferred_initial: AtomicBool::new(false),
             background_pending: AtomicBool::new(false),
             fetched_remote: AtomicBool::new(false),
+            members_changed: tokio::sync::Notify::new(),
             ech_pending: AtomicBool::new(false),
             declared_dialers: RwLock::new(Vec::new()),
             provider_dialer,
@@ -1163,6 +1184,19 @@ impl ProxyProvider {
                 .as_secs() as meow_common::atomic::Uint,
             Ordering::Relaxed,
         );
+        // Wake the health-check sweep: upstream probes on `setProxies`,
+        // so a committed payload is checked on arrival instead of one
+        // full interval later. Only *changed* content reaches here — an
+        // unchanged refetch dedups earlier (`ingest`), slightly fewer
+        // probes than upstream's per-update check.
+        self.members_changed.notify_one();
+    }
+
+    /// Waitable signalled on every [`commit`](Self::commit) — the
+    /// health-check sweep uses it to probe a landed payload without
+    /// waiting out the rest of the current interval.
+    pub(crate) fn members_changed(&self) -> &tokio::sync::Notify {
+        &self.members_changed
     }
 
     /// Parse one provider node, honouring a declared `dialer-proxy` chain
@@ -1775,19 +1809,34 @@ fn build_health_check_config(
     raw: Option<&RawHealthCheck>,
 ) -> Result<Option<HealthCheckConfig>, String> {
     let Some(hc) = raw else { return Ok(None) };
-    // mihomo's `Enable` has no default: a bare block does not probe. The
-    // disable is surfaced rather than silent — a health-check block whose
-    // probes never run is almost always a config mistake.
-    if !hc.enable.unwrap_or(false) {
+    // mihomo's `NewUnsignedRanges` runs before `Enable` is even read —
+    // a malformed spec fails the provider build whether or not the
+    // block ever probes.
+    if let Some(spec) = hc.expected_status.as_deref() {
+        meow_proxy::health::validate_expected_status(spec)?;
+    }
+    let enable = hc.enable.unwrap_or(false);
+    // mihomo's `Enable` has no schema default: a bare block does not
+    // probe. The disable is surfaced rather than silent — a
+    // health-check block whose probes never run is almost always a
+    // config mistake.
+    if !enable {
         warn!(
             provider = %name,
             "proxy-provider health-check present but `enable` is not true; \
+             members will not be probed periodically"
+        );
+    }
+    // mihomo stores the URL verbatim and zeroes the interval when it is
+    // empty (`NewHealthCheck`) — no gstatic default: an undeclared url
+    // must mean "no probes", and the manual endpoint skips it too.
+    let url = hc.url.clone().unwrap_or_default();
+    if enable && url.is_empty() {
+        warn!(
+            provider = %name,
+            "proxy-provider health-check `enable` but no `url`; \
              members will not be probed"
         );
-        return Ok(None);
-    }
-    if let Some(spec) = hc.expected_status.as_deref() {
-        meow_proxy::health::validate_expected_status(spec)?;
     }
     if hc.lazy == Some(true) {
         // Per provider per build — a process-global `Once` would hide
@@ -1798,24 +1847,29 @@ fn build_health_check_config(
         );
     }
     Ok(Some(HealthCheckConfig {
-        url: hc
-            .url
-            .clone()
-            .unwrap_or_else(|| "https://www.gstatic.com/generate_204".to_string()),
+        url,
+        enable,
         // mihomo maps an explicit 0 to the default, never to "every tick".
         interval: match hc.interval {
             None | Some(0) => 300,
             Some(v) => v,
         },
         // `timeout` is milliseconds consumed by `tokio::time::timeout`
-        // (provider healthcheck API) — clamp to the shared duration
-        // ceiling so an absurd value degrades to "probe never fires"
-        // instead of wrapping Instant arithmetic (issue #648 review).
-        timeout: hc
-            .timeout
-            .unwrap_or(5000)
-            .min(meow_common::MAX_DURATION_SECS.saturating_mul(1000)),
+        // (provider healthcheck API) — mihomo's `NewHealthCheck` maps an
+        // explicit 0 to 5000 like an absent one, and the value is clamped
+        // to the shared duration ceiling so an absurd value degrades to
+        // "probe never fires" instead of wrapping Instant arithmetic
+        // (issue #648 review).
+        timeout: match hc.timeout {
+            None | Some(0) => 5000,
+            Some(v) => v.min(meow_common::MAX_DURATION_SECS.saturating_mul(1000)),
+        },
         expected_status: hc.expected_status.clone().unwrap_or_default(),
+        // Upstream defaults `lazy: true` (`healthCheckSchema{Lazy: true}`,
+        // parser.go) and skips ticks the provider saw no traffic during.
+        // We keep `false`: meow tracks no per-provider last-touch, so
+        // `lazy` could only ever mean "never probe" — parsed for compat,
+        // not honoured (same precedent as group `lazy` — #555, ADR-0002).
         lazy: hc.lazy.unwrap_or(false),
     }))
 }
@@ -2036,6 +2090,140 @@ mod tests {
                 ("User-Agent".to_string(), "mihomo/1.18.3".to_string()),
             ]
         );
+    }
+
+    // -- health-check block parsing (mihomo `healthCheckSchema` parity) --
+
+    fn hc(
+        enable: Option<bool>,
+        url: Option<&str>,
+        interval: Option<u64>,
+        timeout: Option<u64>,
+        expected_status: Option<&str>,
+        lazy: Option<bool>,
+    ) -> crate::raw::RawHealthCheck {
+        crate::raw::RawHealthCheck {
+            enable,
+            url: url.map(str::to_string),
+            interval,
+            timeout,
+            expected_status: expected_status.map(str::to_string),
+            lazy,
+        }
+    }
+
+    /// No `health-check:` block at all → no config (the `None` early
+    /// return the rest of the build depends on).
+    #[test]
+    fn health_check_absent_block_is_none() {
+        assert!(build_health_check_config("p", None)
+            .expect("absent block")
+            .is_none());
+    }
+
+    /// mihomo builds `HealthCheck` unconditionally — `Enable` only zeroes
+    /// the ticker interval — so an `enable: false` (or absent) block must
+    /// still materialise for the manual endpoint and the `testUrl` echo.
+    #[test]
+    fn health_check_disabled_block_still_builds() {
+        for enable in [None, Some(false)] {
+            let cfg = build_health_check_config(
+                "p",
+                Some(&hc(
+                    enable,
+                    Some("https://probe.test/204"),
+                    Some(60),
+                    None,
+                    None,
+                    None,
+                )),
+            )
+            .expect("block must parse")
+            .expect("the block is kept, not dropped");
+            assert!(!cfg.enable);
+            assert_eq!(cfg.url, "https://probe.test/204");
+        }
+    }
+
+    /// `interval`/`timeout` share mihomo's `== 0 → default` mapping —
+    /// an explicit 0 never means "every tick"/"no wait".
+    #[test]
+    fn health_check_zero_values_map_to_defaults() {
+        let cfg = build_health_check_config(
+            "p",
+            Some(&hc(
+                Some(true),
+                Some("https://probe.test/204"),
+                Some(0),
+                Some(0),
+                None,
+                None,
+            )),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(cfg.interval, 300);
+        assert_eq!(cfg.timeout, 5000);
+        let cfg = build_health_check_config(
+            "p",
+            Some(&hc(
+                Some(true),
+                Some("https://probe.test/204"),
+                Some(42),
+                Some(250),
+                None,
+                None,
+            )),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(cfg.interval, 42);
+        assert_eq!(cfg.timeout, 250);
+    }
+
+    /// The url is stored verbatim — no gstatic fallback: mihomo zeroes
+    /// the interval on an empty url, so "not declared" must mean "no
+    /// probes" rather than "probe the default".
+    #[test]
+    fn health_check_url_keeps_empty_verbatim() {
+        for url in [None, Some("")] {
+            let cfg =
+                build_health_check_config("p", Some(&hc(Some(true), url, None, None, None, None)))
+                    .unwrap()
+                    .unwrap();
+            assert!(cfg.url.is_empty(), "no implicit probe url: {:?}", cfg.url);
+        }
+    }
+
+    /// `expected-status` validates like upstream's `NewUnsignedRanges`,
+    /// which runs before `Enable` is even read — a bad spec fails the
+    /// provider build on an `enable: false` block too.
+    #[test]
+    fn health_check_expected_status_validates_even_when_disabled() {
+        for enable in [None, Some(false), Some(true)] {
+            let Err(err) = build_health_check_config(
+                "p",
+                Some(&hc(
+                    enable,
+                    Some("https://probe.test/204"),
+                    None,
+                    None,
+                    Some("garbage"),
+                    None,
+                )),
+            ) else {
+                panic!("a malformed expected-status must fail the build")
+            };
+            assert!(err.contains("expected"), "unexpected: {err}");
+        }
+        // …and a good spec is echoed verbatim for the probe path.
+        let cfg = build_health_check_config(
+            "p",
+            Some(&hc(None, None, None, None, Some("200-299"), None)),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(cfg.expected_status, "200-299");
     }
 
     #[test]

@@ -1224,13 +1224,17 @@ impl ParsedUrl {
     }
 }
 
-/// Parse an `expected` query-param value into inclusive status-code ranges.
-/// Empty / `None` defaults to `[200..=299]`, matching upstream.
 /// Validate an `expected-status` spec at config load (mihomo fails the
 /// provider build on a bad one rather than every probe at run time).
 /// `pub` for that one caller — `meow-config`'s provider build; it lives
 /// in `meow-proxy` because the spec it validates is this crate's
 /// probe-domain syntax.
+///
+/// Note the shared `parse_expected` default under it: an empty spec is
+/// `[200..=299]` — a deliberate divergence from upstream, where empty
+/// parses to `nil` ranges matching *any* status. It feeds the
+/// group/delay probe paths too, so changing it for providers alone
+/// would flip them all.
 pub fn validate_expected_status(spec: &str) -> Result<(), String> {
     parse_expected(Some(spec)).map(drop)
 }

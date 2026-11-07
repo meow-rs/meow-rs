@@ -196,7 +196,12 @@ async fn refresh_loop(
         let Some(registry) = registry.upgrade() else {
             return;
         };
-        let Some(provider) = registry.read().get(&name).cloned() else {
+        // Release the upgraded `Arc` before the refresh await: a swapped
+        // registry generation must not stay pinned through a fetch (same
+        // pinning concern as the proxy-provider loops).
+        let provider = registry.read().get(&name).cloned();
+        drop(registry);
+        let Some(provider) = provider else {
             debug!(provider = %name, "rule-provider gone; refresh task idle until reconcile aborts it");
             continue;
         };
