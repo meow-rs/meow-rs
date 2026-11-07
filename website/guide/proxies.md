@@ -258,7 +258,7 @@ The most feature-rich protocol: TLS, REALITY, XTLS-Vision flow, and five transpo
 | --- | --- | --- | --- |
 | `public-key` | string | ✓ | Base64url X25519 public key (32 bytes) |
 | `short-id` | string | | Hex, ≤ 8 bytes (zero-padded) |
-| `support-x25519mlkem768` | bool | | Hybrid key-agreement flag |
+| `support-x25519mlkem768` | bool | | Default `false`. Offer an X25519MLKEM768 key share ahead of X25519. **Required by Xray REALITY servers ≥ 26.9.8** (they divert a hello without it to `dest`) |
 
 ```yaml
 - name: vless-reality
@@ -273,6 +273,11 @@ The most feature-rich protocol: TLS, REALITY, XTLS-Vision flow, and five transpo
     public-key: "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
     short-id: "0123abcd"
 ```
+
+meow reports a `ClientVer` tracking a current Xray release (26.10.31). A
+server pinning `maxClientVer` below that — or `minClientVer` above it —
+diverts the handshake to `dest`; the dial then fails with a REALITY
+authentication error rather than silently connecting to the wrong target.
 
 ### Transport options
 

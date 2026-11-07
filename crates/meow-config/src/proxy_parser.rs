@@ -2853,9 +2853,8 @@ fn default_transport_alpn(network: &str, alpn: Vec<String>) -> Vec<String> {
 ///
 /// Matches mihomo's wire-facing fields: `public-key` is base64 RawURL X25519,
 /// `short-id` is hex-decoded and zero-padded to eight bytes, and
-/// `support-x25519mlkem768` is a capability flag. The TLS layer currently
-/// offers X25519 only; keeping the flag in config preserves the public surface
-/// for future fingerprint-specific ClientHello work.
+/// `support-x25519mlkem768` offers an X25519MLKEM768 key share ahead of
+/// X25519 (required by Xray REALITY servers >= 26.9.8).
 #[cfg(feature = "vless")]
 fn parse_vless_reality_opts(
     name: &str,
@@ -3685,6 +3684,33 @@ mod tests {
         assert_eq!(decoded.len(), 32);
         // Garbage is still rejected.
         assert!(decode_raw_url_base64_lenient("!!!not base64!!!").is_none());
+    }
+
+    /// `support-x25519mlkem768` reaches `RealityConfig` verbatim; absent
+    /// or non-bool stays off — the `as_bool` fail-closed convention the
+    /// other weakly-typed opts follow.
+    #[cfg(feature = "vless")]
+    #[test]
+    fn reality_opts_support_x25519mlkem768_maps_to_config_flag() {
+        const KEY: &str = "public-key: AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE";
+        for (line, expected) in [
+            ("support-x25519mlkem768: true", true),
+            ("support-x25519mlkem768: false", false),
+            // `as_bool` on a non-bool yields None — off, not an error.
+            ("support-x25519mlkem768: \"yes\"", false),
+            ("support-x25519mlkem768: 1", false),
+        ] {
+            let config = proxy_config(&format!("reality-opts:\n  {KEY}\n  {line}\n"));
+            let reality = parse_vless_reality_opts("v", &config)
+                .expect("reality-opts must parse")
+                .expect("reality-opts present");
+            assert_eq!(reality.support_x25519_mlkem768, expected, "{line}");
+        }
+        let config = proxy_config(&format!("reality-opts:\n  {KEY}\n"));
+        let reality = parse_vless_reality_opts("v", &config)
+            .expect("reality-opts must parse")
+            .expect("reality-opts present");
+        assert!(!reality.support_x25519_mlkem768, "flag defaults to off");
     }
 
     #[cfg(any(feature = "vless", feature = "vmess"))]
