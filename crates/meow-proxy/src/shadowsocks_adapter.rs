@@ -215,7 +215,7 @@ impl ShadowsocksAdapter {
         let context = Context::new_shared(ServerType::Local);
         let addr_str = SmolStr::from(format!("{server}:{port}"));
 
-        let plugin = match plugin_name {
+        let plugin = match plugin_name.filter(|name| !name.is_empty()) {
             Some(p) if is_builtin_obfs_plugin(p) => {
                 let cfg = parse_obfs_opts(plugin_opts, server)?;
                 debug!("SS '{}' using built-in simple-obfs ({:?})", name, cfg);
