@@ -124,7 +124,7 @@ enum Command {
     },
     /// Convert a rule-set file, as mihomo's `convert-ruleset`: an upstream
     /// `.mrs` (`domain` or `ipcidr`) to text, one entry per line — e.g. for
-    /// inspecting the `.mrs` rule-providers OpenWrt front ends ship.
+    /// inspecting the `.mrs` rule-providers OpenWrt frontends ship.
     ConvertRuleset {
         /// `domain` or `ipcidr`
         behavior: String,
@@ -842,15 +842,32 @@ fn convert_ruleset(
         meow_common::fs_util::SCRATCH_STALE_AGE,
         source,
     );
-    let part = convert_scratch_path(&target);
-    if resolved_path(&part) == source_resolved || same_file_on_disk(source, &part) {
-        anyhow::bail!(
-            "convert-ruleset: scratch path {} would overwrite the source; name a different target",
-            part.display()
-        );
-    }
+    // `create_new` refuses to follow or truncate a pre-planted file or
+    // symlink at the scratch name — bump the counter and take the next
+    // one instead of writing through it.
+    let (part, file) = loop {
+        let part = convert_scratch_path(&target);
+        if resolved_path(&part) == source_resolved || same_file_on_disk(source, &part) {
+            anyhow::bail!(
+                "convert-ruleset: scratch path {} would overwrite the source; name a different target",
+                part.display()
+            );
+        }
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&part)
+        {
+            Ok(file) => break (part, file),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("convert-ruleset: create {}", part.display()));
+            }
+        }
+    };
     let written =
-        write_rule_set_text(reader, want == TYPE_DOMAIN, source, &part).and_then(|skipped| {
+        write_rule_set_text(reader, want == TYPE_DOMAIN, source, file, &part).and_then(|skipped| {
             std::fs::rename(&part, &target)
                 .with_context(|| format!("convert-ruleset: rename to {}", target.display()))
                 .map(|()| skipped)
@@ -878,7 +895,8 @@ fn convert_ruleset(
 /// (handles `.`/`..` and symlinks) and re-append the not-yet-existing tail;
 /// when nothing on the path exists at all, fold `.`/`..` lexically over the
 /// absolute path. An over-eager result only trips the guard — the safe
-/// direction.
+/// direction. Existing-path-only callers can use the lib crate's
+/// `meow_app::same_resolved_path` instead (canonicalize-and-compare).
 fn resolved_path(path: &std::path::Path) -> std::path::PathBuf {
     let mut tail: Vec<std::ffi::OsString> = Vec::new();
     let mut cursor = path;
@@ -919,25 +937,11 @@ fn resolved_path(path: &std::path::Path) -> std::path::PathBuf {
 /// case-insensitive (APFS/NTFS) spellings that a canonical-path comparison
 /// reports distinct. `false` when either side can't be stat'ed (e.g. a
 /// not-yet-created target or scratch), where `resolved_path` still stands.
+/// `same-file` owns the dev+ino vs `GetFileInformationByHandle` split —
+/// `MetadataExt::{volume_serial_number,file_index}` is still
+/// `windows_by_handle`-gated nightly, not stable.
 fn same_file_on_disk(a: &std::path::Path, b: &std::path::Path) -> bool {
-    let (Ok(ma), Ok(mb)) = (std::fs::metadata(a), std::fs::metadata(b)) else {
-        return false;
-    };
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        ma.dev() == mb.dev() && ma.ino() == mb.ino()
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        ma.volume_serial_number() == mb.volume_serial_number() && ma.file_index() == mb.file_index()
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = (ma, mb);
-        false
-    }
+    same_file::is_same_file(a, b).unwrap_or(false)
 }
 
 /// Unique scratch sibling of `target` — the same `{path}.{pid}.{n}.tmp`
@@ -953,20 +957,20 @@ fn convert_scratch_path(target: &std::path::Path) -> std::path::PathBuf {
     std::path::PathBuf::from(name)
 }
 
-/// Writes the decoded set, one entry per line. `source` only names decode
-/// errors; write errors carry `path`. `reader` is consumed so its decoded
-/// body can drop as soon as the (collecting) domain walk finishes.
-/// Returns the number of stored domain keys skipped as invalid UTF-8
-/// (0 for `ipcidr`).
+/// Writes the decoded set, one entry per line. `file` is the scratch
+/// already opened `create_new` at `path`; `source` only names decode
+/// errors and write errors carry `path`. `reader` is consumed so its
+/// decoded body can drop as soon as the (collecting) domain walk
+/// finishes. Returns the number of stored domain keys skipped as
+/// invalid UTF-8 (0 for `ipcidr`).
 fn write_rule_set_text(
     reader: meow_rules::mrs_parser::UpstreamRuleSetReader,
     domains: bool,
     source: &std::path::Path,
+    file: std::fs::File,
     path: &std::path::Path,
 ) -> Result<usize> {
     use std::io::Write;
-    let file = std::fs::File::create(path)
-        .with_context(|| format!("convert-ruleset: create {}", path.display()))?;
     let mut out = std::io::BufWriter::new(file);
     let mut io_err = None;
     let mut emit = |s: &dyn std::fmt::Display| {
@@ -2294,8 +2298,9 @@ mod tests {
     }
 
     /// A hard link has its own resolved path — only the dev+ino check
-    /// sees that it *is* the source.
-    #[cfg(unix)]
+    /// sees that it *is* the source. `std::fs::hard_link` needs no
+    /// privilege on NTFS either, so this runs on every platform
+    /// (unlike the symlink test below).
     #[test]
     fn convert_ruleset_refuses_target_hardlink_to_source() {
         let dir = tempfile::tempdir().unwrap();

@@ -385,7 +385,10 @@ pub struct UpstreamRuleSetPayload {
 
 /// Materialise every entry of an upstream `.mrs` payload as text. Kept for
 /// tests and tooling; the rule-set loader streams through
-/// [`UpstreamRuleSetReader`] instead so no per-entry `String` list is built.
+/// [`UpstreamRuleSetReader`] instead so no per-entry `String` list is
+/// built. The skipped-non-UTF-8 count that
+/// [`UpstreamRuleSetReader::for_each_domain`] reports is discarded — a
+/// caller that wants it should stream through the reader directly.
 pub fn parse_upstream_ruleset_mrs(bytes: &[u8]) -> Result<UpstreamRuleSetPayload, MrsError> {
     let reader = UpstreamRuleSetReader::open(bytes)?;
     let mut entries = Vec::new();
@@ -842,7 +845,7 @@ fn push_v6_range(from: Ipv6Addr, to: Ipv6Addr, out: &mut dyn FnMut(ipnet::IpNet)
             out(ipnet::IpNet::V6(net));
         }
         let step = 1u128 << block_bits;
-        if end - start + 1 == step {
+        if remaining == step {
             break;
         }
         start = start.saturating_add(step);

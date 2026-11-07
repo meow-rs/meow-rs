@@ -18,7 +18,9 @@ pub const LAUNCHD_LABEL: &str = "com.meow.proxy";
 /// normalized away. Returns false when either path cannot be resolved.
 /// Used by the macOS `uninstall` guard to admit only a literal
 /// `$HOME` == `/var/root` without a prefix-match bypass like
-/// `/var/root/../Users/x` (issue #678).
+/// `/var/root/../Users/x` (issue #678). The binary's clobber guards in
+/// `main.rs` (`resolved_path` + `same_file_on_disk`) generalise this
+/// idea to paths that don't exist yet and hard links.
 pub fn same_resolved_path(a: &std::path::Path, b: &std::path::Path) -> bool {
     matches!(
         (std::fs::canonicalize(a), std::fs::canonicalize(b)),

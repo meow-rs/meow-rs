@@ -140,6 +140,7 @@ dashmap = { workspace = true }
 libc = "0.2"
 log = "0.4"
 dhat = { workspace = true, optional = true }
+same-file = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 tracing-appender = "0.2.5"

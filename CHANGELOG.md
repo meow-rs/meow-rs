@@ -12,8 +12,8 @@ the canonical, in-repo source a release is cut from.
 
 - **`meow convert-ruleset <domain|ipcidr> mrs <source.mrs> [out.txt]`** —
   the `.mrs` → text direction of mihomo's `convert-ruleset`, e.g. for
-  inspecting or hand-editing the `.mrs` rule-providers OpenWrt front
-  ends ship. The text matches upstream's dump: a domain stored as both
+  inspecting or hand-editing the `.mrs` rule-providers OpenWrt frontends
+  ship. The text matches upstream's dump: a domain stored as both
   apex and subdomains collapses to one `+.domain` line, a suffix-only
   entry stays `.domain`, `ipcidr` ranges split into aligned CIDRs.
   Output goes through a unique `.pid.n.tmp` scratch renamed into place —
@@ -24,10 +24,12 @@ the canonical, in-repo source a release is cut from.
 
 ### Changed
 
-- meow-rules public API: `MrsError::WrongFormat` carries the expected
-  magic (`'MRS!'` vs `'MRS\x01'`) instead of being a unit variant, and
-  `UpstreamRuleSetReader::for_each_domain` returns `Result<usize>` — the
-  number of non-UTF-8 keys skipped during the walk.
+- **meow-rules public API:** `MrsError::WrongFormat` carries the
+  expected magic (`'MRS!'` vs `'MRS\x01'`) instead of being a unit
+  variant, and `UpstreamRuleSetReader::for_each_domain` returns
+  `Result<usize>` — the number of non-UTF-8 keys skipped during the
+  walk. meow-common gains `sweep_scratch_siblings_excluding`, a
+  keep-file variant of the stale-scratch sweep.
 
 ### Fixed
 

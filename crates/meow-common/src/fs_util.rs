@@ -1,7 +1,7 @@
 //! Shared cleanup for the `{name}.{pid}.{n}.tmp` scratch siblings that
 //! atomic write-then-rename producers (`meow_config::unique_scratch_path`,
-//! `SelectorStore`, fake-IP `FileStore`) leave behind when the process
-//! dies between create and rename (issue #621).
+//! `SelectorStore`, fake-IP `FileStore`, `meow convert-ruleset`) leave
+//! behind when the process dies between create and rename (issue #621).
 //!
 //! Ordinary failures remove their own scratch; only a crash or SIGKILL can
 //! orphan one — which is why cleanup is a best-effort sweep at the next
