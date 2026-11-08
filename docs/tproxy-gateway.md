@@ -24,9 +24,13 @@ meow that way (`up`/`down`/`status`) and confirm the auto-created firewall. Read
 Understand this before configuring — it explains every step below.
 
 - **It accepts both `REDIRECT` and kernel TPROXY.** For redirected TCP, meow
-  recovers the original destination with `getsockopt(SO_ORIGINAL_DST)`. On
-  Linux only the UDP socket is `IP_TRANSPARENT` (when meow has
-  `CAP_NET_ADMIN`). TCP uses REDIRECT; an nftables `tproxy` rule can hand
+  recovers the original destination with `getsockopt(SO_ORIGINAL_DST)`; a
+  `listeners:` `type: tproxy` entry with `transparent: true` (Linux only,
+  `firewall: false` required) instead accepts **real TCP TPROXY** — the
+  accepted socket's local address is the original destination. On Linux only
+  the UDP socket is `IP_TRANSPARENT` (when meow has
+  `CAP_NET_ADMIN`). TCP uses REDIRECT unless `transparent: true`; an nftables
+  `tproxy` rule can hand
   the transparent UDP socket forwarded **UDP** datagrams. The
   UDP original destination comes from `IP_RECVORIGDSTADDR`, and replies are
   sent from that address. The recipe below uses `REDIRECT`. The OpenWrt
@@ -118,6 +122,51 @@ management requires declaring the listener under `listeners:` as above.
 This is the mode to reach for when nftables is unavailable, when another
 privileged service (or iptables) owns redirect policy, or when you want custom
 output-chain behaviour the built-in table doesn't express.
+
+### `type: redir` / `redir-port` — REDIRECT-only, deployer-owned rules
+
+mihomo's `redir-port` inbound is a narrower form of the above: REDIRECT for
+TCP, nothing else, and meow owns no rules. The top-level `redir-port:` key is
+a shorthand for a `listeners:` `type: redir` entry — `firewall`, `udp`,
+`udp-timeout`, `transparent`, and the Shadowsocks keys all warn and are
+ignored on it:
+
+```yaml
+redir-port: 7893
+# or equivalently:
+listeners:
+  - name: redir-gw
+    type: redir
+    listen: '0.0.0.0'   # non-loopback — the prerouting REDIRECT rewrites to
+    port: 7893          # the inbound interface's address, not 127.0.0.1
+```
+
+Same obligations as `firewall: false`: you own the `meta mark`
+(`routing-mark`) exemption, the loopback exemption, and the catch-all
+`redirect` — plus UDP is not an option.
+
+### `transparent: true` — real TCP TPROXY (Linux only)
+
+A `type: tproxy` entry with `transparent: true` switches TCP from REDIRECT
+to real kernel TPROXY: the listener socket is created with
+`IP_TRANSPARENT`/`IPV6_TRANSPARENT` (needs `CAP_NET_ADMIN`) and the accepted
+connection's *local* address is the original destination — no
+`SO_ORIGINAL_DST` call. It requires `firewall: false` (the deployer owns the
+mangle `tproxy` rule and the fwmark→`local` policy route) and errors at
+startup on a non-Linux build. `transparent: false` — the default — keeps the
+REDIRECT semantic for backward compatibility, and the `tproxy-port` /
+`redir-port` shorthands never set it.
+
+```yaml
+listeners:
+  - name: tproxy-gw
+    type: tproxy
+    listen: '::'
+    port: 7893
+    firewall: false
+    transparent: true
+    udp: true            # optional: UDP TPROXY on the same port
+```
 
 ### `udp: true` — UDP TPROXY on the same port (Linux only)
 

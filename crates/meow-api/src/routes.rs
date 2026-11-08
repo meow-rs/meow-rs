@@ -1015,6 +1015,8 @@ struct UpdateConfigRequest {
     mode: Option<String>,
     #[serde(rename = "log-level")]
     log_level: Option<String>,
+    #[serde(rename = "routing-mark")]
+    routing_mark: Option<u32>,
     tun: Option<TunFields>,
 }
 
@@ -1037,6 +1039,21 @@ async fn update_configs(
     // `raw_config.write()` here would race a concurrent PUT /configs,
     // whose candidate swap would clobber the patched fields (issue #514).
     let _mutation = CONFIG_MUTATION.lock().await;
+    // The routing-mark refusal gate runs before ANY mutation below —
+    // under pinned managed tproxy rules a change rejects the whole PATCH
+    // rather than partially apply it (same refusal `PUT /configs`
+    // enforces at commit).
+    if body.routing_mark.is_some() {
+        let mut candidate = state.raw_config.read().clone();
+        candidate.routing_mark = body.routing_mark;
+        if let Some(msg) = routing_mark_change_refused(&candidate) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "message": msg })),
+            )
+                .into_response();
+        }
+    }
     // The patched `tun:` section, checked like a `PUT /configs` one before
     // anything is applied; `None` when the patch leaves it as it is.
     let tun = match body.tun {
@@ -1084,6 +1101,12 @@ async fn update_configs(
     if let Some(tun) = tun {
         let mut candidate = state.raw_config.read().clone();
         candidate.tun = Some(tun);
+        // Carry a patched routing-mark through the same commit path
+        // (`set_routing_mark` inside the swap applies it; the write below
+        // re-asserts it so a mark-only PATCH also lands).
+        if body.routing_mark.is_some() {
+            candidate.routing_mark = body.routing_mark;
+        }
         let preinstalled = preinstall_global_route_binding(&candidate);
         // No routing publish runs here, so tracked TCP predating a
         // pre-installed global-route binding is still live.
@@ -1121,6 +1144,14 @@ async fn update_configs(
     }
     if let Some(level) = body.log_level {
         raw.log_level = Some(level);
+    }
+    if let Some(mark) = body.routing_mark {
+        // Commit point: the refusal gate passed before any mutation above.
+        // `set_routing_mark` treats `Some(0)` as unset, like PUT's
+        // `routing-mark: 0`.
+        meow_common::set_routing_mark(Some(mark));
+        raw.routing_mark = Some(mark);
+        info!("routing-mark changed to {mark}");
     }
     StatusCode::NO_CONTENT.into_response()
 }

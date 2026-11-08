@@ -87,7 +87,9 @@ cause problems; items marked ~ work with caveats; items marked ✓ work.
 | `dns:` — `fallback-filter` | ✓ | GeoIP/IP-CIDR/domain gates. |
 | `hosts:` (top level) + `dns:` `use-system-hosts` | ✓ | M1.E-5, wildcards supported. |
 | `dns:` — `fake-ip` mode | ✓ | v4/v6 pools, `fake-ip-filter`, `fake-ip-filter-mode`, `store-fake-ip` JSON persistence. See §fake-ip mode. |
-| `tproxy-port` | ✓ | Linux nftables / macOS pf. |
+| `tproxy-port` | ✓ | Linux nftables / macOS pf. Managed-REDIRECT semantic (TCP, host `output` chain) — mihomo's real-TPROXY shorthand maps to `listeners:` `type: tproxy transparent: true` instead. |
+| `redir-port` | ✓ | Deployer-REDIRECT listener, meow owns no rules. Same as `listeners:` `type: redir`. |
+| `routing-mark` | ✓ | Linux only. `SO_MARK` on every outbound socket; the deployer's rules exempt meow's own traffic. |
 | `proxy-providers:` | ✓ | http/file sources, provider filters, health checks, and group `use:`. |
 | `geodata:` | ✓ | Path overrides, auto-update, interval, and download URL overrides. |
 | `/metrics` Prometheus endpoint | ✓ | meow-rs enhancement (no Go upstream equiv). |
@@ -139,7 +141,7 @@ security gaps and typo-likely mistakes become hard errors (Class A).
 |---------|-----------|-------------|
 | Duplicate listener port | Silently overwrites last | Hard parse error naming both conflicting listeners |
 | Duplicate listener name | Silently overwrites last | Hard parse error |
-| Unknown listener type (e.g. `type: redir`) | Silently ignored | Hard parse error |
+| Unknown listener type | Silently ignored | Hard parse error (`redir` is a valid type) |
 | Shorthand port + `listeners:` entry on same port | Both accepted | Hard parse error (same as duplicate port) |
 | `authentication` entry with no `:` | Silently stored with empty password | Hard parse error |
 | `authentication` entry with empty username (`:pass`) | Silently accepted | Hard parse error |
@@ -705,7 +707,17 @@ Most common format from public providers. Typical issues:
    `auto-route: true` captures all traffic and `dns-hijack` defaults on, no
    `auto-redirect` / `strict-route` needed; see `docs/tun.md`), or use
    `tproxy-port` with nftables `TPROXY`/`REDIRECT` rules.
-2. **`redir-port`** — not supported. Use `tproxy-port`.
+2. **`redir-port`** — supported: a `type: redir` REDIRECT inbound whose
+   rules the deployer owns entirely (meow installs nothing). Upstream's
+   `tproxy-port` real-TPROXY semantic is a `listeners:` `type: tproxy`
+   entry with `transparent: true` (Linux only, `firewall: false`
+   required) — meow's `tproxy-port` shorthand keeps the managed-REDIRECT
+   behaviour the crate has always had. `routing-mark` is also supported
+   (Linux only) — `SO_MARK` on all outbound sockets so the deployer's
+   nftables `meta mark` accept rule keeps meow's own traffic out of its
+   TPROXY/REDIRECT rules; meow's managed firewall installs the matching
+   exemption itself and refuses runtime `routing-mark` changes while it
+   is up.
 3. **PROCESS-NAME / PROCESS-PATH rules** — platform lookup wired (Linux netlink,
    macOS libproc) via M1.D-1. Elsewhere (Android, iOS) they stay dead unless
    the embedder's inbound names each flow's owner itself and calls

@@ -324,16 +324,6 @@ pub use android::{
     clear_socket_protector, set_socket_protector, socket_protector, SocketProtector,
 };
 
-/// Dial an outbound TCP stream to an already-resolved [`SocketAddr`]. On
-/// Android, applies the installed `SocketProtector` (if any) to the
-/// socket fd before `connect()` so the connection bypasses the VPN.
-/// Desktop targets apply the installed outbound-interface policy.
-///
-/// Callers that only have a hostname must use [`connect_tcp_host`] —
-/// passing a hostname here is a compile error by construction (the type
-/// is `SocketAddr`, not `ToSocketAddrs`). That split exists to prevent
-/// silent regressions back into the system resolver; see the module docs
-/// for the loop-routing failure mode.
 /// mihomo's `routing-mark` — `SO_MARK` on every outbound
 /// socket meow opens through this module (proxy servers, DIRECT, DNS,
 /// health checks, provider fetches, TCP and UDP), so the deployer's
@@ -400,18 +390,29 @@ fn routing_mark_set() -> bool {
     routing_mark() != 0
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+/// `SO_MARK` on a `socket2` socket per [`ROUTING_MARK`] (`0` = unset).
+/// Linux-only by definition — `set_mark` exists on no other cfg target —
+/// so callers wrap the call in `#[cfg(target_os = "linux")]`.
+#[cfg(target_os = "linux")]
 fn apply_routing_mark(socket: &socket2::Socket) -> io::Result<()> {
-    #[cfg(target_os = "linux")]
     match ROUTING_MARK.load(std::sync::atomic::Ordering::Relaxed) {
         0 => {}
         mark => socket.set_mark(mark)?,
     }
-    #[cfg(not(target_os = "linux"))]
-    let _ = socket;
     Ok(())
 }
 
+/// Dial an outbound TCP stream to an already-resolved [`SocketAddr`]. On
+/// Android, applies the installed `SocketProtector` (if any) to the
+/// socket fd before `connect()` so the connection bypasses the VPN.
+/// Desktop targets apply the installed outbound-interface policy, and on
+/// Linux the `routing-mark` `SO_MARK` (see [`set_routing_mark`]).
+///
+/// Callers that only have a hostname must use [`connect_tcp_host`] —
+/// passing a hostname here is a compile error by construction (the type
+/// is `SocketAddr`, not `ToSocketAddrs`). That split exists to prevent
+/// silent regressions back into the system resolver; see the module docs
+/// for the loop-routing failure mode.
 pub async fn connect_tcp(addr: SocketAddr) -> io::Result<TcpStream> {
     #[cfg(any(target_os = "android", all(test, unix)))]
     {
@@ -446,6 +447,7 @@ pub(crate) async fn connect_tcp_iface_bound(addr: SocketAddr) -> io::Result<TcpS
         socket2::Domain::IPV6
     };
     let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+    #[cfg(target_os = "linux")]
     apply_routing_mark(&socket)?;
     crate::outbound_iface::apply_outbound_interface_for_peer(&socket, domain, addr.ip())?;
     socket.set_nonblocking(true)?;
@@ -686,6 +688,7 @@ pub(crate) fn bind_udp_iface_bound(local: SocketAddr, peer: IpAddr) -> io::Resul
         socket2::Domain::IPV6
     };
     let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
+    #[cfg(target_os = "linux")]
     apply_routing_mark(&socket)?;
     crate::outbound_iface::apply_outbound_interface_for_peer(&socket, domain, peer)?;
     socket.bind(&local.into())?;

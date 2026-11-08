@@ -12,7 +12,8 @@ The quickest setup. Each opens one listener bound to `bind-address`:
 | `mixed-port` | Mixed HTTP + SOCKS5 (auto-detects from the first byte) |
 | `port` | HTTP proxy only |
 | `socks-port` | SOCKS5 only |
-| `tproxy-port` | Transparent proxy (binds `127.0.0.1`) |
+| `tproxy-port` | Transparent proxy, managed REDIRECT rules (binds `127.0.0.1`) |
+| `redir-port` | REDIRECT inbound, deployer-owned rules |
 
 ```yaml
 mixed-port: 7890
@@ -47,16 +48,17 @@ listeners:
 | Field | Type | Required | Default | Notes |
 | --- | --- | --- | --- | --- |
 | `name` | string | ✓ | — | Unique; appears in logs, the API, and `IN-NAME` rules |
-| `type` | string | ✓ | — | `mixed` · `http` · `socks5` · `tproxy` · `shadowsocks` |
+| `type` | string | ✓ | — | `mixed` · `http` · `socks5` · `tproxy` · `redir` · `shadowsocks` |
 | `port` | u16 | | — | Unique across listeners; omit or `0` to let the OS assign an ephemeral port |
 | `listen` | string | | per type | Bind IP literal, or `host:port` (e.g. `127.0.0.1:0`) |
 | `tproxy-sni` | bool | | global | (tproxy) deprecated SNI shorthand — prefer [`sniffer`](./sniffer) |
 | `firewall` | bool | | `true` | (tproxy) `false` = external firewall management — no nft/pfctl calls, no cleanup; see [Transparent Proxy](./transparent-proxy) |
 | `udp` | bool | | `false` | (tproxy, Linux/IPv4 only) UDP TPROXY on the same port; requires `firewall: false`; see [Transparent Proxy](./transparent-proxy) |
 | `udp-timeout` | secs | | `60` | (tproxy) UDP flow idle timeout; `0` is an error |
+| `transparent` | bool | | `false` | (tproxy, Linux only) real TCP TPROXY — the accepted socket's local address is the original destination; requires `firewall: false` |
 | `max-connections` | usize | | global | Per-listener concurrency cap; `0` = unlimited |
 
-`listen` defaults to `127.0.0.1` for `tproxy` and to the global `bind-address` otherwise.
+`listen` defaults to `127.0.0.1` for `tproxy` and to the global `bind-address` otherwise; a `redir` listener or a `tproxy` listener with `transparent: true` also defaults to the global `bind-address` (a loopback default would be dead — deployer `prerouting` rules rewrite to the inbound interface's address).
 
 ### Ephemeral ports
 
@@ -86,6 +88,7 @@ own OS-assigned port.
 - **`http`** — HTTP CONNECT proxy.
 - **`socks5`** — SOCKS5 proxy; supports inbound auth.
 - **`tproxy`** — firewall transparent proxy (Linux / experimental macOS); see [Transparent Proxy](./transparent-proxy).
+- **`redir`** — mihomo's REDIRECT inbound: TCP only, meow owns no firewall rules (the deployer's `REDIRECT` rules steer traffic in); see [Transparent Proxy](./transparent-proxy).
 - **`shadowsocks`** — Shadowsocks server inbound; its `udp` field gates the
   SS UDP relay (default `true`) and is unrelated to tproxy's `udp`.
   Included in the release binaries (the `listener-shadowsocks` cargo

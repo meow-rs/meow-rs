@@ -13,7 +13,8 @@ the canonical, in-repo source a release is cut from.
 - `redir-port` / `listeners: type: redir`: mihomo's REDIRECT inbound, rules
   owned by the deployer. `listeners: type: tproxy` takes `transparent: true`
   for TCP by real TPROXY (`IP_TRANSPARENT`, Linux, needs `firewall: false`).
-- `routing-mark` sets `SO_MARK` on every outbound socket meow opens (proxy
+- `routing-mark` (Linux only) sets `SO_MARK` on every outbound socket meow
+  opens (proxy
   servers, DIRECT TCP/UDP, DNS, health checks, provider fetches), as mihomo;
   `PUT /configs` applies a new mark, and refuses one while meow's managed
   tproxy rules exempt the current mark. `GET /configs` reports the live mark.
@@ -138,6 +139,13 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **The tproxy/redir listener drops unsafe original destinations.** A
+  REDIRECT'd or TPROXY'd TCP flow whose recovered destination is port 0,
+  unspecified, loopback, multicast or broadcast is refused before routing,
+  as is a same-port flow aimed at one of the host's own interface
+  addresses — the only genuine self-target on a wildcard bind, which
+  previously refused every same-port destination. IPv4-mapped IPv6
+  destinations are canonicalised before the checks.
 - **Hysteria 2 UDP relay no longer collapses under load.** A full
   driver queue reported `Closed`, so the tunnel tore the association
   down and re-dialled per datagram — a fresh server-side socket and
