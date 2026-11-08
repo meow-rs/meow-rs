@@ -3348,12 +3348,11 @@ fn parse_sniffer_config(
                             quic_ports = proto.ports.clone().unwrap_or_else(|| vec![443]);
                         }
                         // An unrecognized key is a typo'd/dead declaration —
-                        // a defect under strict (issue #533 review), unlike
-                        // the valid-but-unimplemented `QUIC` Class-B shim.
+                        // a defect under strict (issue #533 review).
                         other if strict => {
                             anyhow::bail!(
                                 "sniffer.sniff.{other}: unknown protocol (strict mode); \
-                                 supported: TLS, HTTP"
+                                 supported: TLS, HTTP, QUIC"
                             );
                         }
                         other => {

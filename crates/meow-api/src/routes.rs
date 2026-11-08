@@ -3037,12 +3037,16 @@ async fn spawn_tun_from_raw(
         "meow-tun".to_string(),
     )
     .with_readiness_signal(ready_tx);
-    match meow_config::sniffer_config_from_raw(raw) {
-        Ok(cfg) => {
-            listener = listener.with_sniffer(Arc::new(meow_listener::SnifferRuntime::new(cfg)));
+    // A broken `sniffer:` section is a parse error like `tun:`'s above,
+    // not a warn-and-continue — silently spawning a snifferless TUN while
+    // the API still reports success hides the defect (review #887).
+    let sniffer_cfg = match meow_config::sniffer_config_from_raw(raw) {
+        Ok(c) => c,
+        Err(e) => {
+            return Err(format!("sniffer config parse error: {e}"));
         }
-        Err(e) => warn!("tun: sniffer config ignored: {e}"),
-    }
+    };
+    listener = listener.with_sniffer(Arc::new(meow_listener::SnifferRuntime::new(sniffer_cfg)));
     if let Some(binding) = binding {
         listener = listener.with_outbound_binding(binding);
     }
@@ -3204,7 +3208,20 @@ async fn swap_config_and_reconcile_tun(
                     candidate.fake_ip_range(),
                 ),
             ) {
-                (Ok(o), Ok(n)) => o != n,
+                // The TUN also carries the sniffer it was spawned with:
+                // a sniffer-only diff must restart it too — compared
+                // semantically, like `TunConfig`, so a no-op respelling
+                // does not (review #887).
+                (Ok(o), Ok(n)) => {
+                    o != n
+                        || match (
+                            meow_config::sniffer_config_from_raw(&guard),
+                            meow_config::sniffer_config_from_raw(&candidate),
+                        ) {
+                            (Ok(a), Ok(b)) => a != b,
+                            _ => guard.sniffer != candidate.sniffer,
+                        }
+                }
                 // Raw sections already known to differ — a broken
                 // candidate stays conservative: restart → spawn fails
                 // → `enable` rolls back.

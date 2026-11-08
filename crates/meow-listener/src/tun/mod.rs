@@ -1509,9 +1509,9 @@ async fn handle_tcp_flow(
     if let Some(rt) = sniffer {
         crate::sniffer::prefill_host(&tunnel.inner().resolver(), &mut metadata);
         // A ClientHello (often 1.5–2 KB) outgrows the first read: gather
-        // the whole record within the sniff window; the extra bytes only
-        // extend the replayed prefix.
-        let deadline = tokio::time::Instant::now() + TUN_SNIFF_WINDOW;
+        // the whole record within the sniffer's own timeout; the extra
+        // bytes only extend the replayed prefix.
+        let deadline = tokio::time::Instant::now() + rt.timeout();
         let mut chunk = [0u8; 2048];
         while prefix.len() < TUN_SNIFF_GATHER_MAX && crate::sniffer::tls_record_incomplete(&prefix)
         {

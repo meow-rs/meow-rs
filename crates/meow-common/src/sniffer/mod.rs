@@ -10,7 +10,7 @@ use std::time::Duration;
 /// Processed sniffer configuration, built by `meow-config` from the
 /// `sniffer:` YAML block and stored in `Config`. Consumed by `SnifferRuntime`
 /// in `meow-listener`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SnifferConfig {
     pub enable: bool,
     pub timeout: Duration,

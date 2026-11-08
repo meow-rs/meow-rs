@@ -41,8 +41,10 @@ pub enum QuicSniffStep {
 /// Reassembles a client's CRYPTO stream across Initial datagrams.
 #[derive(Default)]
 pub struct QuicSniffer {
-    /// `(offset, bytes)` chunks of the Initial CRYPTO stream.
+    /// `(offset, bytes)` chunks of the Initial CRYPTO stream — disjoint
+    /// by construction: a retransmission stores only the ranges it adds.
     chunks: Vec<(usize, Vec<u8>)>,
+    /// Bytes of stream `chunks` covers; bounded at `4 * MAX_CRYPTO`.
     total: usize,
 }
 
@@ -102,7 +104,10 @@ impl QuicSniffer {
     }
 
     /// Add the CRYPTO frames of a decrypted payload; `false` on a frame
-    /// that cannot be skipped or a stream over the bound.
+    /// that cannot be skipped or a stream over the bound. Frames of every
+    /// other type [`skip_frame`] knows are stepped over, so a CRYPTO
+    /// frame later in the same packet is still found; a type whose
+    /// layout is unknown to us ends the walk keeping what was collected.
     fn collect(&mut self, mut p: &[u8]) -> bool {
         while let Some(&ty) = p.first() {
             match ty {
@@ -139,20 +144,60 @@ impl QuicSniffer {
                     let (Ok(off), Ok(len)) = (usize::try_from(off), usize::try_from(len)) else {
                         return false;
                     };
-                    if len > q.len() || off + len > MAX_CRYPTO {
+                    let Some(end) = off.checked_add(len) else {
+                        return false;
+                    };
+                    if len > q.len() || end > MAX_CRYPTO {
                         return false;
                     }
-                    self.total += len;
+                    // A retransmitted segment must not pay the stream bound
+                    // twice: store only the ranges no earlier chunk covers
+                    // (keeping `chunks` disjoint and `total` the unique
+                    // coverage the guard means to bound), and skip the
+                    // frame's bytes whatever their overlap.
+                    for (o, l) in self.uncovered(off, len) {
+                        self.chunks.push((o, q[o - off..o - off + l].to_vec()));
+                        self.total += l;
+                    }
                     if self.total > 4 * MAX_CRYPTO {
                         return false;
                     }
-                    self.chunks.push((off, q[..len].to_vec()));
                     p = &q[len..];
                 }
-                _ => return true, // anything else: keep what was collected
+                _ => match skip_frame(p) {
+                    Some(rest) => p = rest,
+                    None => return true,
+                },
             }
         }
         true
+    }
+
+    /// The `(offset, len)` sub-ranges of `[off, off + len)` no stored
+    /// chunk covers. Chunks are few — an Initial's CRYPTO frames across
+    /// a handful of datagrams — so a sort per arrival is cheap.
+    fn uncovered(&self, off: usize, len: usize) -> Vec<(usize, usize)> {
+        let mut ranges: Vec<(usize, usize)> =
+            self.chunks.iter().map(|(o, d)| (*o, o + d.len())).collect();
+        ranges.sort_unstable();
+        let mut out = Vec::new();
+        let (mut start, end) = (off, off + len);
+        for (s, e) in ranges {
+            if e <= start {
+                continue;
+            }
+            if s >= end {
+                break;
+            }
+            if s > start {
+                out.push((start, s - start));
+            }
+            start = start.max(e);
+        }
+        if start < end {
+            out.push((start, end - start));
+        }
+        out
     }
 
     /// The CRYPTO stream from offset 0 up to the first gap.
@@ -172,6 +217,9 @@ impl QuicSniffer {
     }
 }
 
+/// QUIC varint decode. The same primitive lives privately in meow-proxy's
+/// `hysteria2::proto::read_varint`; deduplicating them would need a
+/// cross-crate home, so it is repeated here.
 fn varint(p: &mut &[u8]) -> Option<u64> {
     let first = *p.first()?;
     let len = 1usize << (first >> 6);
@@ -186,8 +234,87 @@ fn varint(p: &mut &[u8]) -> Option<u64> {
     Some(v)
 }
 
+/// Advance `p` past `n` varints; `None` on truncation.
+fn skip_varints(p: &mut &[u8], n: usize) -> Option<()> {
+    for _ in 0..n {
+        varint(p)?;
+    }
+    Some(())
+}
+
+/// Advance past a non-CRYPTO frame (`p` starts at its type byte) by the
+/// layout RFC 9000 §19 gives it — RFC 9221's for DATAGRAM. `None` when
+/// the type is unknown to us (its length cannot be derived) or the frame
+/// is truncated.
+fn skip_frame(p: &[u8]) -> Option<&[u8]> {
+    let ty = *p.first()?;
+    let mut q = &p[1..];
+    match ty {
+        // RESET_STREAM: stream id, error code, final size.
+        0x04 => skip_varints(&mut q, 3)?,
+        // NEW_TOKEN: token length + token.
+        0x07 => {
+            let l = usize::try_from(varint(&mut q)?).ok()?;
+            q = q.get(l..)?;
+        }
+        // STREAM: id, offset when 0x04 set, length+data when 0x02 set —
+        // without 0x02 the data runs to the packet's end.
+        0x08..=0x0f => {
+            varint(&mut q)?;
+            if ty & 0x04 != 0 {
+                varint(&mut q)?;
+            }
+            if ty & 0x02 != 0 {
+                let l = usize::try_from(varint(&mut q)?).ok()?;
+                q = q.get(l..)?;
+            } else {
+                q = &[];
+            }
+        }
+        // MAX_DATA, MAX_STREAMS (bidi/uni), DATA_BLOCKED, STREAMS_BLOCKED
+        // (bidi/uni), RETIRE_CONNECTION_ID: a lone varint.
+        0x10 | 0x12 | 0x13 | 0x14 | 0x16 | 0x17 | 0x19 => skip_varints(&mut q, 1)?,
+        // STOP_SENDING, MAX_STREAM_DATA, STREAM_DATA_BLOCKED: two
+        // varints.
+        0x05 | 0x11 | 0x15 => skip_varints(&mut q, 2)?,
+        // NEW_CONNECTION_ID: sequence, retire-prior-to, a 1-byte cid
+        // length + cid, then the 16-byte stateless reset token.
+        0x18 => {
+            skip_varints(&mut q, 2)?;
+            let l = usize::from(*q.first()?);
+            q = q.get(1 + l + 16..)?;
+        }
+        // PATH_CHALLENGE, PATH_RESPONSE: 8 fixed bytes.
+        0x1a | 0x1b => q = q.get(8..)?,
+        // CONNECTION_CLOSE: error code, offending frame type (0x1c only),
+        // reason length + reason.
+        0x1c | 0x1d => {
+            varint(&mut q)?;
+            if ty == 0x1c {
+                varint(&mut q)?;
+            }
+            let l = usize::try_from(varint(&mut q)?).ok()?;
+            q = q.get(l..)?;
+        }
+        // HANDSHAKE_DONE: no fields.
+        0x1e => {}
+        // DATAGRAM (RFC 9221): length + data when 0x01 set, else the data
+        // runs to the packet's end.
+        0x30 | 0x31 => {
+            if ty == 0x31 {
+                let l = usize::try_from(varint(&mut q)?).ok()?;
+                q = q.get(l..)?;
+            } else {
+                q = &[];
+            }
+        }
+        _ => return None,
+    }
+    Some(q)
+}
+
 fn hkdf_expand_label(secret: &[u8], label: &str, len: usize) -> Option<Vec<u8>> {
-    let full = format!("tls13 {label}");
+    let full = ["tls13 ", label].concat();
     let mut info = Vec::with_capacity(4 + full.len());
     #[allow(clippy::cast_possible_truncation, reason = "lengths of 32 or less")]
     {
@@ -296,9 +423,9 @@ fn decrypt_initial(
 ) -> Option<Vec<u8>> {
     let initial = hmac_sha256(salt, dcid).ok()?;
     let client = hkdf_expand_label(&initial, "client in", 32)?;
-    let key = hkdf_expand_label(&client, &format!("{prefix} key"), 16)?;
-    let iv = hkdf_expand_label(&client, &format!("{prefix} iv"), 12)?;
-    let hp = hkdf_expand_label(&client, &format!("{prefix} hp"), 16)?;
+    let key = hkdf_expand_label(&client, &[prefix, " key"].concat(), 16)?;
+    let iv = hkdf_expand_label(&client, &[prefix, " iv"].concat(), 12)?;
+    let hp = hkdf_expand_label(&client, &[prefix, " hp"].concat(), 16)?;
 
     let sample = &d[pn_offset + 4..pn_offset + 20];
     let mask = encrypt(Cipher::aes_128_ecb(), &hp, None, sample).ok()?;
@@ -476,5 +603,70 @@ mod tests {
         let mut s = QuicSniffer::default();
         assert_eq!(s.feed(b"\x00\x01dns-ish"), QuicSniffStep::Done);
         assert_eq!(s.feed(&[0xc0, 0, 0, 0, 9, 0, 0]), QuicSniffStep::Done);
+    }
+
+    /// The stream bound counts unique coverage, not arrivals: CRYPTO
+    /// segments retransmitted on a lossy path store only the bytes they
+    /// add, so a legitimate flow is never pushed past `4 * MAX_CRYPTO`.
+    #[test]
+    fn retransmissions_count_only_fresh_bytes() {
+        let mut s = QuicSniffer::default();
+        assert!(s.collect(&crypto(0, b"abcdefghij")));
+        assert_eq!(s.total, 10);
+        for _ in 0..5 {
+            assert!(s.collect(&crypto(0, b"abcdefghij")));
+        }
+        assert_eq!(s.total, 10, "a full retransmission adds nothing");
+        // [5, 15) overlaps [0, 10): only its five fresh bytes count.
+        assert!(s.collect(&crypto(5, b"FGHIJKLMNO")));
+        assert_eq!(s.total, 15);
+        let mut want = b"abcdefghij".to_vec();
+        want.extend_from_slice(b"KLMNO");
+        assert_eq!(s.contiguous(), want);
+    }
+
+    /// End to end through `feed`: five copies of a 15 KB segment pushed
+    /// the pre-fix raw-sum accounting past the bound and aborted the
+    /// sniff; unique-coverage accounting still names the flow.
+    #[test]
+    fn retransmitted_initials_still_yield_the_name() {
+        let dcid = hex("8394c8f03e515708");
+        let ch = client_hello("retransmit.example.org");
+        // Filler beyond the ClientHello's end — repeated five times it
+        // would have summed to 75 KB > `4 * MAX_CRYPTO`.
+        let pad = vec![0u8; 15000 - ch.len() - 100];
+        let filler = crypto(ch.len() + 100, &pad);
+        let mut s = QuicSniffer::default();
+        for pn in 0..5 {
+            assert_eq!(
+                s.feed(&seal_initial(&dcid, pn, &filler)),
+                QuicSniffStep::More
+            );
+        }
+        assert_eq!(
+            s.feed(&seal_initial(&dcid, 5, &crypto(0, &ch))),
+            QuicSniffStep::Name("retransmit.example.org".into())
+        );
+    }
+
+    /// Defined non-CRYPTO frames are stepped over by their RFC 9000 §19
+    /// layout, so a CRYPTO frame later in the packet is still read; a
+    /// type whose layout cannot be derived ends the walk keeping what
+    /// was collected.
+    #[test]
+    fn defined_frames_are_skipped_not_aborted() {
+        // MAX_DATA 0; NEW_CONNECTION_ID (seq 1, retire 0, cid len 2 +
+        // cid, 16-byte reset token); PATH_CHALLENGE; then CRYPTO "abc".
+        let mut p = vec![0x10, 0x00, 0x18, 0x01, 0x00, 0x02, 0xaa, 0xbb];
+        p.extend_from_slice(&[0; 16]);
+        p.extend_from_slice(&[0x1a, 0, 0, 0, 0, 0, 0, 0, 0]);
+        p.extend_from_slice(&[0x06, 0x00, 0x03, b'a', b'b', b'c']);
+        let mut s = QuicSniffer::default();
+        assert!(s.collect(&p));
+        assert_eq!(s.contiguous(), b"abc");
+        // 0x7f's length is not derivable — the walk stops there, but the
+        // collected stream stays usable.
+        assert!(s.collect(&[0x06, 0x03, 0x03, b'd', b'e', b'f', 0x7f]));
+        assert_eq!(s.contiguous(), b"abcdef");
     }
 }

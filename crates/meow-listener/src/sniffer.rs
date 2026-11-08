@@ -136,19 +136,7 @@ impl SnifferRuntime {
     /// sniffer is off, the flow already has a domain (`parse-pure-ip`), or
     /// its port is not listed.
     fn wanted_proto(&self, metadata: &Metadata) -> Option<&Proto> {
-        if !self.cfg.enable {
-            return None;
-        }
-        // parse-pure-ip gate: skip if host is already a non-IP domain name,
-        // unless that domain is in the force list. The IP test is the same
-        // `metadata_ip_literal` the apply side uses — a `IpAddr::parse`
-        // check would miss bracketed IPv6 (`[::1]` reads as a "domain" and
-        // the destination would never be sniffed).
-        if self.cfg.parse_pure_ip
-            && !metadata.host.is_empty()
-            && meow_common::metadata_ip_literal(&metadata.host).is_none()
-            && self.force.search(&metadata.host).is_none()
-        {
+        if !self.cfg.enable || !self.is_sniff_eligible(metadata) {
             return None;
         }
         self.port_map.get(&metadata.dst_port)
@@ -158,10 +146,20 @@ impl SnifferRuntime {
     pub fn wants_quic(&self, metadata: &Metadata) -> bool {
         self.cfg.enable
             && self.cfg.quic_ports.contains(&metadata.dst_port)
-            && !(self.cfg.parse_pure_ip
-                && !metadata.host.is_empty()
-                && meow_common::metadata_ip_literal(&metadata.host).is_none()
-                && self.force.search(&metadata.host).is_none())
+            && self.is_sniff_eligible(metadata)
+    }
+
+    /// `parse-pure-ip` gate, shared by the TCP and QUIC paths so they can
+    /// never diverge: a flow whose host is already a non-IP domain name
+    /// is not sniffed, unless that domain is in the force list. The IP
+    /// test is the same `metadata_ip_literal` the apply side uses — an
+    /// `IpAddr::parse` check would miss bracketed IPv6 (`[::1]` reads as
+    /// a "domain" and the destination would never be sniffed).
+    fn is_sniff_eligible(&self, metadata: &Metadata) -> bool {
+        !(self.cfg.parse_pure_ip
+            && !metadata.host.is_empty()
+            && meow_common::metadata_ip_literal(&metadata.host).is_none()
+            && self.force.search(&metadata.host).is_none())
     }
 
     /// The sniff deadline from the config (`sniffer.timeout`).
