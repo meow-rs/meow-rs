@@ -16,7 +16,10 @@
 //! addresses, ports and checksums change (RFC 1624 incremental updates).
 //! The accepted socket is a plain `TcpStream`: the kernel does the TCP work
 //! (segmentation, ACKs, retransmits, window scaling) and a DIRECT relay
-//! splices it. UDP, ICMP and anything that is not plain TCP go to lwIP.
+//! splices it. UDP is parsed off the device by the pump
+//! (`direct_udp.rs`); ICMP, UDP fragments and IPv6 extension headers go
+//! to lwIP, and TCP fragments are dropped (lwIP would reassemble a flow
+//! the kernel owns and reset it).
 //!
 //! A NAT entry is made by the client's SYN and lives until the flow's
 //! handler ends (then [`CLOSING_TTL`] for the FIN/ACK tail), or for
@@ -159,8 +162,20 @@ pub(super) struct NatAddrs {
     pub v6: Option<(Ipv6Addr, Ipv6Addr, u16)>,
 }
 
+impl NatAddrs {
+    /// Whether `ip` is one of the NAT's peer addresses (B4 or B6) —
+    /// assigned to nothing, so nothing can legitimately source packets
+    /// from it (the trust-boundary comment in `translate_v4`).
+    pub(super) fn is_peer(&self, ip: std::net::IpAddr) -> bool {
+        match ip {
+            std::net::IpAddr::V4(v4) => v4 == self.b4,
+            std::net::IpAddr::V6(v6) => self.v6.is_some_and(|(_, b6, _)| v6 == b6),
+        }
+    }
+}
+
 pub(super) struct Nat {
-    addrs: NatAddrs,
+    pub(super) addrs: NatAddrs,
     nets: TunNets,
     table: Mutex<Table>,
 }
@@ -205,10 +220,14 @@ impl Nat {
         let flags = tcp[13];
         let a = self.addrs;
 
-        let (new_src, new_dst) = if src == a.a4 && sport == a.port4 {
-            if dst != a.b4 {
-                return Verdict::Drop;
-            }
+        // `src == A && sport == port4` does not alone prove a kernel
+        // reply: A is an ordinary client source (see below), and its
+        // `port4` can sit on a host socket — bound before the listener
+        // was, or held across a netns boundary — so a dial `A:port4 →
+        // D:d` exists and must take the client arm like any other
+        // A-source rather than be dropped. What proves the reply is the
+        // peer: the kernel's listener only ever talks to B.
+        let (new_src, new_dst) = if src == a.a4 && sport == a.port4 && dst == a.b4 {
             match self.reply_target(dport) {
                 Some((SocketAddr::V4(orig_dst), SocketAddr::V4(client))) => (orig_dst, client),
                 _ => return Verdict::Drop,
@@ -281,10 +300,10 @@ impl Nat {
         let dport = read16(pkt, 42);
         let flags = pkt[40 + 13];
 
-        let (new_src, new_dst) = if src == a6 && sport == port6 {
-            if dst != b6 {
-                return Verdict::Drop;
-            }
+        // As on IPv4: a reply always aims at the NAT peer, so `dst ==
+        // b6` is part of the match — anything else from `a6:port6` is a
+        // client flow whose source port collided with the listener's.
+        let (new_src, new_dst) = if src == a6 && sport == port6 && dst == b6 {
             match self.reply_target(dport) {
                 Some((SocketAddr::V6(orig_dst), SocketAddr::V6(client))) => (orig_dst, client),
                 _ => return Verdict::Drop,
@@ -358,11 +377,7 @@ impl Nat {
     /// The kernel accepted a connection from `peer` (B:n): mark the entry
     /// open and return (client, original destination).
     pub(super) fn accepted(&self, peer: SocketAddr) -> Option<(SocketAddr, SocketAddr)> {
-        let b_matches = match peer {
-            SocketAddr::V4(p) => *p.ip() == self.addrs.b4,
-            SocketAddr::V6(p) => self.addrs.v6.is_some_and(|(_, b6, _)| *p.ip() == b6),
-        };
-        if !b_matches {
+        if !self.addrs.is_peer(peer.ip()) {
             return None;
         }
         let mut t = self.table.lock();
@@ -741,6 +756,7 @@ mod tests {
             TunNets {
                 v4: "172.31.0.1/30".parse::<Ipv4Net>().unwrap(),
                 v6: Some("fdfe:dcba:9876::1/126".parse::<Ipv6Net>().unwrap()),
+                nat: None,
             },
         )
     }
@@ -858,6 +874,48 @@ mod tests {
         let a6: Ipv6Addr = "fdfe:dcba:9876::1".parse().unwrap();
         let mut own6 = v6_packet(a6, 51000, d, 443, TCP_SYN);
         assert_eq!(nat.translate(&mut own6, false), Verdict::Write);
+    }
+
+    /// `A:port4` alone does not prove a kernel reply — a host dial can
+    /// legitimately source the device address on the listener's own port
+    /// (a socket bound before the listener was, an ephemeral collision,
+    /// or forged like any A-source). Only a packet aimed at the NAT peer
+    /// is a reply; anything else from `A:port4` takes the client arm —
+    /// dropping it would blackhole a real flow.
+    #[test]
+    fn reply_arm_only_claims_packets_aimed_at_the_nat_peer() {
+        let nat = nat();
+        // A host dial whose source port collides with the listener's.
+        let mut syn = v4_packet([172, 31, 0, 1], 40000, [1, 1, 1, 1], 443, TCP_SYN);
+        assert_eq!(nat.translate(&mut syn, false), Verdict::Write);
+        assert_eq!(addr4(&syn, 16), "172.31.0.1:40000".parse().unwrap());
+        assert_eq!(nat.len(), 1);
+        // And the kernel's replies to that flow un-translate back to it.
+        let n = read16(&syn, 20);
+        let mut reply = v4_packet([172, 31, 0, 1], 40000, [172, 31, 0, 2], n, TCP_ACK);
+        assert_eq!(nat.translate(&mut reply, false), Verdict::Write);
+        assert_eq!(addr4(&reply, 12), "1.1.1.1:443".parse().unwrap());
+        assert_eq!(addr4(&reply, 16), "172.31.0.1:40000".parse().unwrap());
+
+        // Same on IPv6.
+        let a6: Ipv6Addr = "fdfe:dcba:9876::1".parse().unwrap();
+        let b6: Ipv6Addr = "fdfe:dcba:9876::2".parse().unwrap();
+        let d: Ipv6Addr = "2606:4700::1111".parse().unwrap();
+        let mut syn6 = v6_packet(a6, 40001, d, 443, TCP_SYN);
+        assert_eq!(nat.translate(&mut syn6, false), Verdict::Write);
+        let n6 = read16(&syn6, 40);
+        let mut reply6 = v6_packet(a6, 40001, b6, n6, TCP_ACK);
+        assert_eq!(nat.translate(&mut reply6, false), Verdict::Write);
+        assert_eq!(read16(&reply6, 40), 443);
+        assert_eq!(read16(&reply6, 42), 40001);
+
+        // Aimed at the peer without a NAT entry: still the reply arm,
+        // still a drop — stale kernel segments (a swept entry's RST)
+        // must not mint a client flow to an on-link address.
+        let mut stale = v4_packet([172, 31, 0, 1], 40000, [172, 31, 0, 2], 9, TCP_ACK);
+        assert_eq!(nat.translate(&mut stale, false), Verdict::Drop);
+        let mut stale6 = v6_packet(a6, 40001, b6, 9, TCP_ACK);
+        assert_eq!(nat.translate(&mut stale6, false), Verdict::Drop);
     }
 
     /// Multicast and broadcast SYNs get no NAT entry; at the half-open

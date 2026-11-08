@@ -73,9 +73,10 @@ the canonical, in-repo source a release is cut from.
   mihomo's `system` stack does), translating TSO/GRO aggregates whole, so
   a DIRECT relay splices and TCP throughput per CPU multiplies. UDP is
   parsed and built in the pump rather than by a userspace stack;
-  fragments, IPv6 extension headers and ICMP stay on lwIP. `mixed` maps
-  to `system` with a warning (its UDP is not gVisor's here); `gvisor`,
-  `mips` and non-Linux `system` fall back to `lwip` with a warning.
+  UDP fragments, IPv6 extension headers and ICMP stay on lwIP
+  (fragmented TCP is dropped). `mixed` maps to `system` with a warning
+  (its UDP is not gVisor's here); `gvisor`, `mips` and non-Linux
+  `system` fall back to `lwip` with a warning.
 
 ### Changed
 

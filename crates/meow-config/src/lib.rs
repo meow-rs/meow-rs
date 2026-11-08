@@ -321,7 +321,8 @@ pub struct TunConfig {
 /// kernel's stack, as mihomo's system stack does (Linux; elsewhere the
 /// listener falls back to lwIP); anything else (`gvisor`, `mips`, `lwip`,
 /// unset) keeps the userspace lwIP stack. Under `system` UDP is handled
-/// in the pump (fragments and ICMP still go to lwIP).
+/// in the pump (UDP fragments and ICMP still go to lwIP; fragmented TCP
+/// is dropped).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TunStack {
     #[default]

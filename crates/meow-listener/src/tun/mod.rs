@@ -649,10 +649,12 @@ impl TunListener {
 
         // The subnet of the address the device took: a retry can step
         // off the configured one (`rotate_v4`). The IPv6 one stays inside
-        // the configured subnet (`rotate_v6`).
-        let tun_net = udp::TunNets {
+        // the configured subnet (`rotate_v6`). `nat` is filled in once
+        // the system stack binds and picks its peer addresses.
+        let mut tun_net = udp::TunNets {
             v4: Ipv4Net::new_assert(used_addr, prefix),
             v6: cfg.inet6_address,
+            nat: None,
         };
         let fake_ip_net = self.tunnel.resolver().fake_ip_v4_net();
 
@@ -897,6 +899,9 @@ impl TunListener {
             None
         };
         let stack_name = if system.is_some() { "system" } else { "lwip" };
+        // The NAT peer addresses join the device's address plan so both
+        // UDP loops can drop forged peer-sourced datagrams.
+        tun_net.nat = system.as_ref().map(|s| s.nat.addrs);
         if let Some(sys) = &system {
             let nat = Arc::clone(&sys.nat);
             tasks.spawn(async move {

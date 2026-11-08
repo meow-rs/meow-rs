@@ -7616,7 +7616,6 @@ async fn patch_configs_tun_ignores_unknown_keys() {
             "tun": {
                 "enable": false,
                 "device": "utun9",
-                "stack": "gvisor",
                 "strict-route": true,
                 "auto-detect-interface": true,
                 "not-a-key": 1,
@@ -7628,10 +7627,64 @@ async fn patch_configs_tun_ignores_unknown_keys() {
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     let tun = state.raw_config.read().tun.clone().unwrap();
     assert_eq!(tun.device.as_deref(), Some("utun9"));
-    assert!(tun.stack.is_none());
     assert!(tun.strict_route.is_none());
     assert!(tun.auto_detect_interface.is_none());
     assert!(state.raw_config.read().dns.is_none());
+}
+
+/// `stack` is an implemented `tun:` key, not an upstream-only leftover:
+/// a PATCH carrying it commits the value and `GET /configs` echoes it.
+/// A fallback spelling (`gvisor` → lwIP) commits verbatim like the file
+/// section — on a running listener it parses to the stack already
+/// running, so the parsed diff does not restart it. Deterministic under
+/// both feature sets: no `enable` transition, no respawn.
+#[tokio::test]
+async fn patch_configs_tun_stack_commits_and_echoes() {
+    let mut raw = test_raw_config();
+    raw.tun = Some(serde_saphyr::from_str("enable: true\nmtu: 1500").unwrap());
+    let state = test_state(raw);
+    let (handle, stopped) = fake_tun_handle();
+    state.tunnel.set_tun_handle(handle).await;
+    // Let the stand-in listener start: its drop flag exists only once polled.
+    tokio::task::yield_now().await;
+
+    // `gvisor` warns and parses to lwIP — the committed section gains the
+    // key while the running listener is left alone.
+    let resp = patch_configs(&state, serde_json::json!({"tun": {"stack": "gvisor"}})).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert!(
+        !stopped.load(Ordering::SeqCst),
+        "a stack spelling that parses to the running one must not restart"
+    );
+    assert!(state.tunnel.has_tun());
+    assert_eq!(
+        state.raw_config.read().tun.as_ref().unwrap().stack,
+        Some(serde_json::json!("gvisor")),
+        "the committed section keeps the client's spelling"
+    );
+    assert_eq!(
+        get_configs_json(&state).await["tun"]["stack"],
+        "gvisor",
+        "GET /configs echoes the committed value"
+    );
+
+    // Turning TUN off while switching `stack` commits both keys and
+    // stops the listener — no spawn is attempted on an on→off.
+    let resp = patch_configs(
+        &state,
+        serde_json::json!({"tun": {"enable": false, "stack": "system"}}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert!(stopped.load(Ordering::SeqCst));
+    assert!(!state.tunnel.has_tun());
+    let tun = state.raw_config.read().tun.clone().unwrap();
+    assert!(!tun.enable);
+    assert_eq!(tun.stack, Some(serde_json::json!("system")));
+    assert_eq!(
+        get_configs_json(&state).await["tun"],
+        serde_json::json!({"enable": false, "mtu": 1500, "stack": "system"}),
+    );
 }
 
 /// A patch without `tun` leaves the section and the running listener

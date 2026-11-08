@@ -232,6 +232,15 @@ pub(super) async fn run_udp(
     let hijack_dropped = Arc::new(AtomicU64::new(0));
 
     while let Some((data, src, dst)) = incoming.next().await {
+        // The TCP NAT's trust boundary holds for UDP too: the peer
+        // addresses are assigned to nothing, so a datagram claiming one
+        // as its source is forged (a LAN peer forwarded in under loose
+        // rp_filter) and must not mint a flow — its replies would only
+        // route back into the device and die on `is_looping_dst` anyway.
+        if tun_net.nat.is_some_and(|a| a.is_peer(src.ip())) {
+            debug!("tun UDP: dropping datagram forged from NAT peer {src} -> {dst}");
+            continue;
+        }
         if dns_hijack && dst.port() == 53 {
             let resolver = tunnel.resolver();
             debug!(
@@ -633,10 +642,14 @@ fn next_deadline(udp_timeout: Duration) -> Instant {
 
 /// The subnets assigned to the TUN device: `inet4-address`, plus
 /// `inet6-address` when the device carries IPv6 (global route scope).
+/// `nat` is the system stack's peer set (`tun.stack: system`), filled in
+/// once the stack binds — the forged-source drop in [`run_udp`]; `None`
+/// under the plain lwIP stack, where no NAT peer exists.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct TunNets {
     pub(super) v4: Ipv4Net,
     pub(super) v6: Option<Ipv6Net>,
+    pub(super) nat: Option<super::system::NatAddrs>,
 }
 
 /// True when a dial to `dst` could only route back into the TUN device —
@@ -811,6 +824,77 @@ mod tests {
         assert_eq!(gauge.load(Ordering::Relaxed), 0);
     }
 
+    /// The TCP NAT's trust boundary holds on the UDP side too
+    /// (`system.rs`): the peer addresses are assigned to nothing, so a
+    /// datagram claiming one as its source is forged and must not mint
+    /// a flow — however it arrived (direct pump, or lwIP behind the
+    /// fragments / extension headers the direct path does not carry).
+    #[tokio::test]
+    async fn udp_forged_nat_peer_source_mints_no_flow() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let net = TunNets {
+            v4: "172.31.0.1/30".parse().unwrap(),
+            v6: Some("fdfe:dcba:9876::1/126".parse().unwrap()),
+            nat: Some(crate::tun::system::NatAddrs {
+                a4: "172.31.0.1".parse().unwrap(),
+                b4: "172.31.0.2".parse().unwrap(),
+                port4: 40000,
+                v6: Some((
+                    "fdfe:dcba:9876::1".parse().unwrap(),
+                    "fdfe:dcba:9876::2".parse().unwrap(),
+                    40001,
+                )),
+            }),
+        };
+        let gauge = Arc::new(AtomicUsize::new(0));
+        let (tx, incoming) = tokio::sync::mpsc::channel(4);
+        let (replies, _rx) = tokio::sync::mpsc::channel(4);
+        let task = tokio::spawn(super::run_udp(
+            crate::test_rule_tunnel(),
+            super::UdpIo::Direct { incoming, replies },
+            false,
+            Duration::from_secs(60),
+            "tun".to_string(),
+            net,
+            Arc::clone(&gauge),
+        ));
+
+        let pkt = |src: SocketAddr| (b"x".to_vec(), src, SocketAddr::from(([8, 8, 8, 8], 1234)));
+        // Forged peer sources, v4 and v6. The channel is FIFO, so the
+        // legit datagram below is always processed after them.
+        tx.send(pkt("172.31.0.2:1234".parse().unwrap()))
+            .await
+            .unwrap();
+        tx.send(pkt("[fdfe:dcba:9876::2]:1234".parse().unwrap()))
+            .await
+            .unwrap();
+        // The device's own address is a legal client source and mints
+        // the loop's one and only flow — had a forged datagram minted
+        // one too, the gauge would land above 1.
+        tx.send(pkt("192.168.1.10:5000".parse().unwrap()))
+            .await
+            .unwrap();
+        let polled = tokio::time::timeout(Duration::from_secs(5), async {
+            while gauge.load(Ordering::Relaxed) < 1 {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await;
+        assert!(polled.is_ok(), "the legit flow never minted");
+        tokio::task::yield_now().await;
+        assert_eq!(
+            gauge.load(Ordering::Relaxed),
+            1,
+            "a forged peer-sourced datagram must not mint a flow"
+        );
+        drop(tx);
+        task.await.unwrap();
+        assert_eq!(gauge.load(Ordering::Relaxed), 0);
+    }
+
     #[tokio::test]
     async fn udp_port_53_obeys_reject_rule_without_hijack() {
         let tunnel = crate::test_rule_tunnel();
@@ -841,6 +925,7 @@ mod tests {
         TunNets {
             v4: "198.18.0.1/30".parse().unwrap(),
             v6: None,
+            nat: None,
         }
     }
 
