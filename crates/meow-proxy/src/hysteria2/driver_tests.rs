@@ -1,6 +1,7 @@
 //! Portable QUIC peer for lifecycle, flow-control and TCP response regressions.
 use super::*;
 use crate::hysteria2::ReconnectableClient;
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::{sleep, timeout};
 
@@ -32,6 +33,24 @@ struct Peer {
     read_payload: Arc<AtomicBool>,
     stop_writes: Arc<AtomicBool>,
     auth_seen: mpsc::UnboundedReceiver<SocketAddr>,
+    /// Datagrams the peer received that are too small to carry payload —
+    /// ACK-only packets plus any other sub-100-byte control traffic.
+    small_rx: Arc<AtomicUsize>,
+    /// Datagrams the peer sent that are big enough to carry payload.
+    big_tx: Arc<AtomicUsize>,
+    /// Bytes to push down every established stream, taken (reset to 0) by the peer.
+    flood: Arc<AtomicUsize>,
+    /// Yield to the client after every datagram sent, so it sees packets one
+    /// at a time like a paced network instead of one loopback burst.
+    trickle: Arc<AtomicBool>,
+    /// Set to make the peer send one lone QUIC datagram (taken by the peer).
+    lone_dgram: Arc<AtomicBool>,
+    /// Set to make the peer send a lone PING — a sub-100-byte packet that
+    /// carries no stream or datagram payload (taken by the peer).
+    ping: Arc<AtomicBool>,
+    /// Microseconds from the peer's last payload datagram to the next ACK-only
+    /// datagram it received; `u64::MAX` until that ACK arrives.
+    ack_lag_us: Arc<AtomicU64>,
     task: DriverTask,
 }
 
@@ -102,6 +121,19 @@ fn peer_on(
     let stop_writes = Arc::new(AtomicBool::new(false));
     let stop_requested = Arc::clone(&stop_writes);
     let (auth_tx, auth_seen) = mpsc::unbounded_channel();
+    let small_rx = Arc::new(AtomicUsize::new(0));
+    let big_tx = Arc::new(AtomicUsize::new(0));
+    let (small_rx_task, big_tx_task) = (Arc::clone(&small_rx), Arc::clone(&big_tx));
+    let flood = Arc::new(AtomicUsize::new(0));
+    let flood_task = Arc::clone(&flood);
+    let trickle = Arc::new(AtomicBool::new(false));
+    let trickle_task = Arc::clone(&trickle);
+    let lone_dgram = Arc::new(AtomicBool::new(false));
+    let lone_dgram_task = Arc::clone(&lone_dgram);
+    let ping = Arc::new(AtomicBool::new(false));
+    let ping_task = Arc::clone(&ping);
+    let ack_lag_us = Arc::new(AtomicU64::new(u64::MAX));
+    let ack_lag_task = Arc::clone(&ack_lag_us);
     let task = DriverTask(tokio::spawn(async move {
         let mut incoming = vec![0; 65535];
         let (n, remote) = socket.recv_from(&mut incoming).await.unwrap();
@@ -123,6 +155,7 @@ fn peer_on(
         let mut pending: HashMap<u64, VecDeque<u8>> = HashMap::new();
         let mut finished = std::collections::HashSet::new();
         let mut out = [0; PEER_SEND_CAP];
+        let mut last_data_tx = std::time::Instant::now();
         loop {
             if conn.is_established() && h3.is_none() {
                 h3 = Some(
@@ -225,6 +258,23 @@ fn peer_on(
                         }
                     }
                 }
+                if lone_dgram_task.swap(false, Ordering::Relaxed) {
+                    // Re-arm the measurement baseline here: a ≥100-byte
+                    // packet sent long ago (handshake, round trip) must not
+                    // leave a stale `last_data_tx` inflating a sample should
+                    // a stray small packet arrive before this datagram's ACK.
+                    last_data_tx = std::time::Instant::now();
+                    conn.dgram_send(&[0x55; 300]).unwrap();
+                }
+                if ping_task.swap(false, Ordering::Relaxed) {
+                    conn.send_ack_eliciting().unwrap();
+                }
+                let flooded = flood_task.swap(0, Ordering::Relaxed);
+                if flooded > 0 {
+                    for &id in &established {
+                        pending.entry(id).or_default().extend(vec![0x37; flooded]);
+                    }
+                }
                 for (&id, data) in &mut pending {
                     while !data.is_empty() {
                         match conn.stream_send(id, data.make_contiguous(), false) {
@@ -245,7 +295,16 @@ fn peer_on(
                 }
             }
             while let Ok((n, info)) = conn.send(&mut out) {
+                if n > 1000 {
+                    big_tx_task.fetch_add(1, Ordering::Relaxed);
+                }
+                if n >= 100 {
+                    last_data_tx = std::time::Instant::now();
+                }
                 socket.send_to(&out[..n], info.to).await.unwrap();
+                if trickle_task.load(Ordering::Relaxed) {
+                    tokio::task::yield_now().await;
+                }
             }
             if conn.is_closed() {
                 break;
@@ -253,6 +312,13 @@ fn peer_on(
             tokio::select! {
                 packet = socket.recv_from(&mut incoming) => {
                     let (n, from) = packet.unwrap();
+                    if n < 100 {
+                        small_rx_task.fetch_add(1, Ordering::Relaxed);
+                        if ack_lag_task.load(Ordering::Relaxed) == u64::MAX {
+                            ack_lag_task
+                                .store(last_data_tx.elapsed().as_micros() as u64, Ordering::Relaxed);
+                        }
+                    }
                     let _ = conn.recv(&mut incoming[..n], quiche::RecvInfo { from, to: local });
                 }
                 _ = sleep_opt(conn.timeout()) => conn.on_timeout(),
@@ -265,6 +331,13 @@ fn peer_on(
         read_payload,
         stop_writes,
         auth_seen,
+        small_rx,
+        big_tx,
+        flood,
+        trickle,
+        lone_dgram,
+        ping,
+        ack_lag_us,
         task,
     }
 }
@@ -562,4 +635,185 @@ async fn reset_releases_the_cached_connection_and_reconnects() {
         .unwrap()
         .expect("the post-reset dial authenticated on a new connection");
     assert!(client.reset(), "the reconnected connection was cached");
+}
+
+/// Dial `addr` straight into a driver with non-default [`AckCoalesce`]
+/// thresholds — `ReconnectableClient` always takes the defaults, so the
+/// coalescing tests drive the raw [`ConnHandle`]. The returned handle must
+/// outlive the stream: dropping it aborts the driver task.
+async fn dial_with_coalesce(addr: SocketAddr, coalesce: AckCoalesce) -> (ConnHandle, DuplexStream) {
+    let cfg = Config {
+        server_name: "localhost".into(),
+        insecure: true,
+        ..Config::default()
+    };
+    let handle = crate::hysteria2::client::connect_addr(&cfg, addr, "localhost", coalesce)
+        .await
+        .unwrap();
+    let (reply_tx, reply_rx) = oneshot::channel();
+    handle
+        .cmd_tx
+        .send(Cmd::OpenTcp {
+            first_frame: proto::encode_tcp_request(TARGET, &[]).unwrap(),
+            fast_open: false,
+            reply: reply_tx,
+        })
+        .await
+        .unwrap();
+    let mut stream = reply_rx.await.unwrap().unwrap();
+    stream.wait_connected().await.unwrap();
+    (handle, stream)
+}
+
+/// A pure download: the client writes nothing, so no upstream data carries its
+/// ACKs. With the peer's datagrams arriving one per receive wakeup, held-back
+/// ACKs must cut the ACK-only packets well below one per payload packet (a
+/// driver that flushes on every wakeup answers more than half of them).
+/// The hold's wall-clock deadline would tie the ratio to the runner's speed —
+/// a slow machine drains one datagram per wakeup slower than the deadline —
+/// so the test pins a deadline longer than the transfer itself and leaves the
+/// 8-datagram rule the only hold-ender. Deadline semantics stay with
+/// [`lone_packet_is_acked_within_the_coalescing_deadline`].
+#[tokio::test]
+async fn download_acks_are_coalesced_across_wakeups() {
+    let peer = peer(true, Some(0), 16).await;
+    // Longer than the read timeout below: `delay` can never end a hold, so
+    // at most one ACK-only packet leaves per ACK_COALESCE_PKTS payload
+    // packets — ratio 1/8 against the asserted 1/3, on a runner of any speed.
+    let (_handle, mut stream) = timeout(
+        TEST_TIMEOUT,
+        dial_with_coalesce(
+            peer.addr,
+            AckCoalesce {
+                delay: Duration::from_secs(60),
+                ..AckCoalesce::default()
+            },
+        ),
+    )
+    .await
+    .unwrap();
+    round_trip(&mut stream).await;
+    // Let the application-write quiet window pass and the handshake ACKs drain.
+    sleep(Duration::from_millis(50)).await;
+    let (small0, big0) = (
+        peer.small_rx.load(Ordering::Relaxed),
+        peer.big_tx.load(Ordering::Relaxed),
+    );
+    let size = 4 * 1024 * 1024;
+    peer.trickle.store(true, Ordering::Relaxed);
+    peer.flood.store(size, Ordering::Relaxed);
+    let mut got = vec![0u8; size];
+    timeout(Duration::from_secs(15), stream.read_exact(&mut got))
+        .await
+        .unwrap()
+        .unwrap();
+    let (small, big) = (
+        peer.small_rx.load(Ordering::Relaxed) - small0,
+        peer.big_tx.load(Ordering::Relaxed) - big0,
+    );
+    eprintln!("DOWNLOAD_ACK_RATIO small_rx={small} big_tx={big}");
+    assert!(big > 1000, "peer sent only {big} payload packets");
+    assert!(
+        small * 3 < big,
+        "{small} ACK-only packets for {big} payload packets"
+    );
+}
+
+/// A lone packet (a single QUIC datagram, nothing for a reader to wake the
+/// driver with) must not wait for more packets: its ACK leaves within the
+/// coalescing deadline. quiche keeps no delayed-ACK timer — an ACK rides on
+/// whatever the next `send()` emits — so the fallback this test rules out is
+/// the ACK leaving only when the peer's next PTO probe wakes the driver
+/// (~35 ms here).
+#[tokio::test]
+async fn lone_packet_is_acked_within_the_coalescing_deadline() {
+    let peer = peer(true, Some(0), 16).await;
+    let client = peer.client(false);
+    let mut stream = timeout(TEST_TIMEOUT, client.tcp_connect(TARGET))
+        .await
+        .unwrap()
+        .unwrap();
+    round_trip(&mut stream).await;
+    sleep(Duration::from_millis(50)).await;
+    let mut lags = Vec::new();
+    for _ in 0..10 {
+        peer.ack_lag_us.store(u64::MAX, Ordering::Relaxed);
+        peer.lone_dgram.store(true, Ordering::Relaxed);
+        timeout(TEST_TIMEOUT, async {
+            while peer.ack_lag_us.load(Ordering::Relaxed) == u64::MAX {
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the lone packet was never acknowledged");
+        lags.push(peer.ack_lag_us.load(Ordering::Relaxed));
+        sleep(Duration::from_millis(50)).await;
+    }
+    lags.sort_unstable();
+    let median = lags[lags.len() / 2];
+    eprintln!("LONE_ACK_LAG_US {lags:?}");
+    // The ACK must ride our deadline timer, not the peer's ~35 ms PTO probe.
+    // The real bound is the OS timer tick: ~1 ms on Linux, up to ~16 ms at
+    // Windows' default 15.6 ms resolution. 22 ms clears that with slack
+    // while staying under the 25 ms `max_ack_delay` and the PTO path.
+    assert!(median < 22_000, "median ACK lag {median} us: {lags:?}");
+}
+
+/// The `delivered` gate, pinned with an unreachable hold: `pkts` and `delay`
+/// are set beyond anything the test can wait out, so a hold can end only
+/// through the safety gates — a wakeup that delivered no payload, queued
+/// frames, a command or a closed connection. A lone PING from the peer
+/// carries no payload (nothing for `pump_reads`/`pump_datagrams` to move):
+/// it must end the hold and flush the held ACK, not feed the hold. That is
+/// the gate the upload regression depends on — an upload's inbound
+/// bare-ACK stream is exactly such traffic, and if it could keep a hold
+/// alive the ACK would wait out the deadline (here, the full 60 s).
+#[tokio::test]
+async fn non_delivery_wakeup_ends_the_ack_hold() {
+    let peer = peer(true, Some(0), 16).await;
+    let (_handle, mut stream) = timeout(
+        TEST_TIMEOUT,
+        dial_with_coalesce(
+            peer.addr,
+            AckCoalesce {
+                pkts: u32::MAX,
+                delay: Duration::from_secs(60),
+            },
+        ),
+    )
+    .await
+    .unwrap();
+    round_trip(&mut stream).await;
+    // Past the 1 ms application-quiet window, with handshake ACKs drained.
+    sleep(Duration::from_millis(50)).await;
+
+    // A delivered datagram opens a hold whose count and deadline rules
+    // cannot end it inside the test window. `ack_lag_us` records the first
+    // sub-100-byte packet the peer sees after it: the held ACK leaving.
+    peer.ack_lag_us.store(u64::MAX, Ordering::Relaxed);
+    peer.lone_dgram.store(true, Ordering::Relaxed);
+    // Let the hold take — and the peer's PTO probes come and go — then land
+    // a wakeup that is guaranteed to deliver no payload.
+    sleep(Duration::from_millis(80)).await;
+    peer.ping.store(true, Ordering::Relaxed);
+    timeout(TEST_TIMEOUT, async {
+        while peer.ack_lag_us.load(Ordering::Relaxed) == u64::MAX {
+            sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("a wakeup with no delivered payload must end the hold, not feed it");
+
+    // The complementary gate: queued application bytes never wait on a
+    // hold. Open a second hold, then write — the echo returns promptly,
+    // not after `delay`.
+    peer.lone_dgram.store(true, Ordering::Relaxed);
+    sleep(Duration::from_millis(80)).await;
+    stream.write_all(b"hi").await.unwrap();
+    let mut echoed = [0; 2];
+    timeout(TEST_TIMEOUT, stream.read_exact(&mut echoed))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&echoed, b"hi");
 }

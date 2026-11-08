@@ -94,6 +94,21 @@ the canonical, in-repo source a release is cut from.
   healthcheck` and the `testUrl`/`expectedStatus` API echo, as upstream's
   unconditionally built `HealthCheck` does. An `enable: true` block with
   no `url` warns too (no probes upstream either).
+- **Hysteria 2 sends far fewer ACK-only packets on downloads.** The
+  connection driver flushed after every receive wakeup, answering a
+  network-paced stream with one small ACK-only datagram per 2-3
+  received packets — in a local profile that was ~70% of the driver's
+  busy time. Flushes that would carry only an ACK are now held until
+  eight datagrams have been accepted or the first unacknowledged one is
+  200 µs old — a dedicated timer enforces the deadline, and any wakeup
+  carrying commands, quiche timeouts, or freshly queued stream frames
+  still flushes at once — and never while an application command
+  arrived within the last millisecond, so an ACK can still ride on
+  upstream data. Wakeups that delivered no payload — the bare-ACK
+  traffic an upload receives — neither start nor keep a hold alive:
+  one arriving mid-hold ends it rather than waiting out the deadline
+  (read-progress wakeups still may), so an upload's own stream data
+  never waits on it.
 
 ### Fixed
 

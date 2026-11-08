@@ -90,6 +90,48 @@ const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const RECV_BATCH: usize = 32;
 /// Commands handled per wakeup, for the same reason on the upload side.
 const CMD_BATCH: usize = 64;
+/// An ACK-only flush is held back until this many datagrams have been
+/// accepted by quiche across payload-delivering wakeups since the last
+/// flush: a pure ACK-only wakeup owes no ACK, so it neither starts a
+/// hold nor keeps one alive — though a wakeup that also delivered
+/// payload counts every datagram it accepted...
+const ACK_COALESCE_PKTS: u32 = 8;
+/// ...or the first of them is this old, whichever comes first. The real
+/// bound adds the OS timer tick — ~1 ms on Linux, up to ~16 ms at
+/// Windows' default 15.6 ms resolution — and still lands far below the
+/// 25 ms default `max_ack_delay`, so loss recovery is unaffected. With
+/// [`ACK_COALESCE_PKTS`] this is a deliberate RFC 9000 §13.2.2 deviation —
+/// fewer ACKs than one-per-two during bursts, bounded by the delay.
+const ACK_COALESCE_DELAY: Duration = Duration::from_micros(200);
+/// An ACK may ride on upstream data, so nothing is held back while an
+/// application command arrived within this window (request/response,
+/// uploads).
+const ACK_COALESCE_APP_QUIET: Duration = Duration::from_millis(1);
+/// A `Sleep` cannot be disarmed, so a hold that ends early parks
+/// `ack_timer` this far out instead of leaving the old deadline armed —
+/// armed it would fire a wakeup the `ack_since.is_some()` arm guard just
+/// discards, an empty loop iteration per hold. The next hold re-arms it.
+const ACK_TIMER_PARKED: Duration = Duration::from_secs(86400);
+
+/// The ACK-coalescing thresholds a [`State`] runs with — a parameter rather
+/// than the raw constants so a test can pin them: `driver_tests`'s download
+/// test holds `delay` open for a whole transfer, leaving [`ACK_COALESCE_PKTS`]
+/// the only hold-ender and the measured ACK ratio independent of how fast
+/// the runner's timer is. Production always takes `Self::default()`.
+pub(crate) struct AckCoalesce {
+    pkts: u32,
+    delay: Duration,
+}
+
+impl Default for AckCoalesce {
+    fn default() -> Self {
+        Self {
+            pkts: ACK_COALESCE_PKTS,
+            delay: ACK_COALESCE_DELAY,
+        }
+    }
+}
+
 /// Largest payload chunk handed to a stream's reader in one channel item;
 /// with [`STREAM_READ_CHANNEL_CAP`] it bounds what a slow reader holds.
 const READ_CHUNK_BYTES: usize = 16 * 1024;
@@ -202,6 +244,8 @@ struct State {
     /// backpressure, encode/queue failures and full per-session
     /// queues. Per connection, per [`note_drop`]'s scoping rule.
     dropped_udp: AtomicU64,
+    /// ACK-coalescing thresholds — see [`AckCoalesce`].
+    coalesce: AckCoalesce,
     closed: Arc<AtomicBool>,
 }
 
@@ -218,6 +262,7 @@ pub(crate) async fn spawn(
     local: SocketAddr,
     peer: SocketAddr,
     conn: quiche::Connection,
+    coalesce: AckCoalesce,
 ) -> Result<ConnHandle> {
     let (cmd_tx, cmd_rx) = mpsc::channel(CMD_CHANNEL_CAP);
     let read_notify = Arc::new(Notify::new());
@@ -244,6 +289,7 @@ pub(crate) async fn spawn(
         next_udp_session_id: 0,
         next_packet_id: 0,
         dropped_udp: AtomicU64::new(0),
+        coalesce,
         closed: Arc::clone(&closed),
     };
 
@@ -297,6 +343,17 @@ async fn run(
     let timer = tokio::time::sleep(Duration::ZERO);
     tokio::pin!(timer);
     let mut armed = None;
+    // ACK coalescing: datagrams received (and when the first arrived) since
+    // the last flush, and its own deadline timer. The timer is load-bearing:
+    // quiche keeps no delayed-ACK timer of its own — an ACK rides on whatever
+    // the next `send()` emits — so without it a lone datagram's ACK would
+    // leave only when the peer's next PTO probe woke the driver.
+    let mut ack_pending: u32 = 0;
+    let mut ack_since: Option<tokio::time::Instant> = None;
+    let ack_timer = tokio::time::sleep(Duration::ZERO);
+    tokio::pin!(ack_timer);
+    // `None` means no application command yet — the app counts as quiet.
+    let mut last_app_cmd: Option<tokio::time::Instant> = None;
 
     if let Err(e) = flush_send(&mut st, &mut conn, &mut send_buf).await {
         // `Io` carries the socket errno through `hy2_error` →
@@ -316,14 +373,21 @@ async fn run(
             }
             armed = deadline;
         }
+        let mut received = 0u32;
+        let mut woke_on_cmd = false;
+        let mut woke_on_notify = false;
         tokio::select! {
             r = st.socket.readable() => {
-                if let Err(e) = r.and_then(|()| recv_batch(&mut st, &mut conn, &mut buf)) {
-                    fail(&mut ready_tx, &mut st, Error::Io(e));
-                    break;
+                match r.and_then(|()| recv_batch(&mut st, &mut conn, &mut buf)) {
+                    Ok(n) => received = n,
+                    Err(e) => {
+                        fail(&mut ready_tx, &mut st, Error::Io(e));
+                        break;
+                    }
                 }
             }
             maybe = st.cmd_rx.recv() => {
+                woke_on_cmd = true;
                 match maybe {
                     Some(cmd) => {
                         handle_cmd(&mut st, &mut conn, cmd);
@@ -339,7 +403,8 @@ async fn run(
                 armed = None;
                 conn.on_timeout();
             }
-            _ = st.read_notify.notified() => {}
+            () = &mut ack_timer, if ack_since.is_some() => {}
+            _ = st.read_notify.notified() => { woke_on_notify = true; }
             _ = keep_alive.tick(), if auth_done => {
                 let _ = conn.send_ack_eliciting();
             }
@@ -375,13 +440,65 @@ async fn run(
             }
         }
 
-        cleanup_streams(&mut st, &mut conn);
+        // A wakeup that explicitly queued outbound frames — STREAM data/FIN,
+        // RESET or STOP_SENDING — must not wait on the coalescing deadline.
+        // (Frames quiche queues internally still can — they wait at most the
+        // delay below, plus the OS timer tick.)
+        let mut queued = cleanup_streams(&mut st, &mut conn);
+        // Payload this wakeup pulled out of quiche for the app — stream
+        // bytes/FIN or a QUIC datagram — is the only receive work that may
+        // feed a hold: pure ACK-only packets owe no ACK, so a wakeup that
+        // delivers none ends a hold instead of feeding it, and an
+        // upload's inbound ACK stream never delays its own stream data
+        // behind the deadline.
+        let mut delivered = false;
         if auth_done {
-            pump_reads(&mut st, &mut conn, &mut buf);
-            pump_datagrams(&mut st, &mut conn, &mut buf);
+            delivered |= pump_reads(&mut st, &mut conn, &mut buf);
+            delivered |= pump_datagrams(&mut st, &mut conn, &mut buf);
         }
-        pump_writes(&mut st, &mut conn);
-        cleanup_streams(&mut st, &mut conn);
+        queued |= pump_writes(&mut st, &mut conn);
+        queued |= cleanup_streams(&mut st, &mut conn);
+
+        // Only a payload-delivering or read-notify wakeup may skip the
+        // flush, and only while it queued nothing explicitly; commands,
+        // quiche's timer, keep-alive, a closed or draining connection and
+        // the coalescing deadline always send. The hold is bounded
+        // regardless: a skipped flush may still carry flow-control frames
+        // quiche queued internally — they wait at most `coalesce.delay`
+        // plus the OS timer tick (see [`ACK_COALESCE_DELAY`]).
+        let now = tokio::time::Instant::now();
+        if woke_on_cmd {
+            last_app_cmd = Some(now);
+        }
+        if auth_done && last_app_cmd.is_none_or(|t| now.duration_since(t) >= ACK_COALESCE_APP_QUIET)
+        {
+            let delivered_payload = received > 0 && delivered;
+            if delivered_payload {
+                ack_pending += received;
+                if ack_since.is_none() {
+                    ack_since = Some(now);
+                    ack_timer.as_mut().reset(now + st.coalesce.delay);
+                }
+            }
+            if let Some(since) = ack_since {
+                if (delivered_payload || woke_on_notify)
+                    && !queued
+                    && !conn.is_closed()
+                    && !conn.is_draining()
+                    && ack_pending < st.coalesce.pkts
+                    && now.duration_since(since) < st.coalesce.delay
+                {
+                    continue;
+                }
+            }
+        }
+        ack_pending = 0;
+        if ack_since.take().is_some() {
+            // Park the timer with its flag — see [`ACK_TIMER_PARKED`].
+            ack_timer
+                .as_mut()
+                .reset(tokio::time::Instant::now() + ACK_TIMER_PARKED);
+        }
 
         if let Err(e) = flush_send(&mut st, &mut conn, &mut send_buf).await {
             tracing::debug!("hysteria2 quiche send failed: {e}");
@@ -472,7 +589,12 @@ fn handle_cmd(st: &mut State, conn: &mut quiche::Connection, cmd: Cmd) {
     }
 }
 
-fn pump_writes(st: &mut State, conn: &mut quiche::Connection) {
+/// Returns `true` when a frame was queued into quiche's send buffer — the
+/// wakeup's flush is then not ACK-only and must not be held back. A
+/// `stream_shutdown` that reports `Ok` without queueing counts too; that
+/// errs toward an early flush — the safe direction.
+fn pump_writes(st: &mut State, conn: &mut quiche::Connection) -> bool {
+    let mut queued = false;
     for (&id, s) in &mut st.streams {
         // Do NOT pre-check `stream_capacity`: a stream is not created until the
         // first `stream_send`, and capacity on an unopened stream is 0. Send
@@ -482,6 +604,7 @@ fn pump_writes(st: &mut State, conn: &mut quiche::Connection) {
             match conn.stream_send(id, &chunk.data[chunk.offset..], false) {
                 Ok(0) | Err(quiche::Error::Done | quiche::Error::StreamLimit) => break,
                 Ok(w) => {
+                    queued = true;
                     chunk.offset += w;
                     if chunk.offset == chunk.data.len() {
                         s.out_buf.pop_front();
@@ -493,8 +616,8 @@ fn pump_writes(st: &mut State, conn: &mut quiche::Connection) {
                         std::io::ErrorKind::BrokenPipe,
                         Error::Quic(format!("stream send: {e}")),
                     );
-                    let _ = conn.stream_shutdown(id, quiche::Shutdown::Read, 0);
-                    let _ = conn.stream_shutdown(id, quiche::Shutdown::Write, 0);
+                    queued |= conn.stream_shutdown(id, quiche::Shutdown::Read, 0).is_ok();
+                    queued |= conn.stream_shutdown(id, quiche::Shutdown::Write, 0).is_ok();
                     break;
                 }
             }
@@ -505,7 +628,10 @@ fn pump_writes(st: &mut State, conn: &mut quiche::Connection) {
         if s.out_buf.is_empty() && s.shutdown.load(Ordering::Acquire) && !s.out_fin_sent {
             match conn.stream_send(id, &[], true) {
                 Err(quiche::Error::Done | quiche::Error::StreamLimit) => {}
-                Ok(_) => s.out_fin_sent = true,
+                Ok(_) => {
+                    s.out_fin_sent = true;
+                    queued = true;
+                }
                 Err(e) => s.fail(
                     std::io::ErrorKind::BrokenPipe,
                     Error::Quic(format!("stream finish: {e}")),
@@ -514,9 +640,15 @@ fn pump_writes(st: &mut State, conn: &mut quiche::Connection) {
         }
         let _ = flush_pending(s);
     }
+    queued
 }
 
-fn pump_reads(st: &mut State, conn: &mut quiche::Connection, buf: &mut [u8]) {
+/// Returns `true` when the wakeup moved stream payload — bytes or a FIN —
+/// out of quiche: the only inbound work that owes the peer an ACK worth
+/// coalescing. Draining unclaimed streams does not count — no reader ever
+/// sees those bytes.
+fn pump_reads(st: &mut State, conn: &mut quiche::Connection, buf: &mut [u8]) -> bool {
+    let mut delivered = false;
     for s in st.streams.values_mut() {
         let _ = flush_pending(s);
     }
@@ -530,6 +662,7 @@ fn pump_reads(st: &mut State, conn: &mut quiche::Connection, buf: &mut [u8]) {
             loop {
                 match conn.stream_recv(id, buf) {
                     Ok((n, fin)) => {
+                        delivered |= n > 0 || fin;
                         if n > 0 {
                             ingest(s, &buf[..n]);
                         }
@@ -572,6 +705,7 @@ fn pump_reads(st: &mut State, conn: &mut quiche::Connection, buf: &mut [u8]) {
             }
         }
     }
+    delivered
 }
 
 /// Feed received stream bytes into a proxy stream, parsing the hysteria2 TCP
@@ -630,8 +764,14 @@ fn flush_pending(s: &mut StreamState) -> bool {
     true
 }
 
-fn pump_datagrams(st: &mut State, conn: &mut quiche::Connection, buf: &mut [u8]) {
+/// Returns `true` when the wakeup carried QUIC datagram payload —
+/// [`pump_reads`]'s sibling for the ACK-coalescing rule.
+fn pump_datagrams(st: &mut State, conn: &mut quiche::Connection, buf: &mut [u8]) -> bool {
+    let mut delivered = false;
     while let Ok(n) = conn.dgram_recv(buf) {
+        // Ahead of decode on purpose: even an undecodable datagram is
+        // payload the peer sent and owes an ACK all the same.
+        delivered = true;
         tracing::trace!(bytes = n, "hysteria2 received QUIC datagram");
         match proto::decode_udp_message(&buf[..n]) {
             Ok(msg) => {
@@ -658,6 +798,7 @@ fn pump_datagrams(st: &mut State, conn: &mut quiche::Connection, buf: &mut [u8])
             Err(e) => note_drop(&st.dropped_udp, format_args!("decode UDP message: {e}")),
         }
     }
+    delivered
 }
 
 fn send_udp(
@@ -754,7 +895,11 @@ fn send_one_udp(dropped: &AtomicU64, conn: &mut quiche::Connection, msg: &UdpMes
     true
 }
 
-fn cleanup_streams(st: &mut State, conn: &mut quiche::Connection) {
+/// Returns `true` when a RESET_STREAM/STOP_SENDING was queued into quiche —
+/// same flush rule as [`pump_writes`]. Read-direction `stream_shutdown` may
+/// report `Ok` without queueing; that errs toward an early flush — the safe
+/// direction.
+fn cleanup_streams(st: &mut State, conn: &mut quiche::Connection) -> bool {
     let done: Vec<u64> = st
         .streams
         .iter()
@@ -765,14 +910,16 @@ fn cleanup_streams(st: &mut State, conn: &mut quiche::Connection) {
         })
         .map(|(&id, _)| id)
         .collect();
+    let mut queued = false;
     for id in done {
         if let Some(s) = st.streams.remove(&id) {
             if !s.shutdown.load(Ordering::Acquire) || s.failure.is_some() {
-                let _ = conn.stream_shutdown(id, quiche::Shutdown::Write, 0);
+                queued |= conn.stream_shutdown(id, quiche::Shutdown::Write, 0).is_ok();
             }
         }
-        let _ = conn.stream_shutdown(id, quiche::Shutdown::Read, 0);
+        queued |= conn.stream_shutdown(id, quiche::Shutdown::Read, 0).is_ok();
     }
+    queued
 }
 
 /// Drain quiche's send queue to the socket, applying obfs and port-hopping.
@@ -813,32 +960,36 @@ async fn flush_send(
 }
 
 /// Feed the datagrams queued on the socket to quiche, at most
-/// [`RECV_BATCH`] of them, undoing obfs and port-hopping.
+/// [`RECV_BATCH`] of them, undoing obfs and port-hopping. Returns how many
+/// datagrams quiche accepted — obfs rejects and packets `conn.recv` refuses
+/// owe no ACK, so they don't count toward coalescing.
 fn recv_batch(
     st: &mut State,
     conn: &mut quiche::Connection,
     buf: &mut [u8],
-) -> std::io::Result<()> {
+) -> std::io::Result<u32> {
+    let mut received = 0;
     for _ in 0..RECV_BATCH {
         let (n, from) = match st.socket.try_recv_from(buf) {
             Ok(v) => v,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(received),
             Err(e) => return Err(e),
         };
         let from = st.hop.as_ref().map_or(from, |h| h.normalize_source(from));
         let info = quiche::RecvInfo { from, to: st.local };
-        let received = match st.obfs.as_mut() {
+        let accepted = match st.obfs.as_mut() {
             Some(obfs) => match obfs.decode(&buf[..n], from) {
                 Some(mut dgram) => conn.recv(&mut dgram, info),
                 None => continue,
             },
             None => conn.recv(&mut buf[..n], info),
         };
-        if let Err(e) = received {
-            tracing::debug!("hysteria2 could not receive QUIC packet: {e}");
+        match accepted {
+            Ok(_) => received += 1,
+            Err(e) => tracing::debug!("hysteria2 could not receive QUIC packet: {e}"),
         }
     }
-    Ok(())
+    Ok(received)
 }
 
 fn fail(ready_tx: &mut Option<oneshot::Sender<Result<bool>>>, _st: &mut State, err: Error) {
