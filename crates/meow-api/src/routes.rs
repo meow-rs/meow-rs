@@ -828,7 +828,8 @@ async fn get_configs(State(state): State<Arc<AppState>>) -> Json<ConfigResponse>
 /// it carries are merged over the committed section and the rest keep
 /// their value, `enable` included (mihomo reads an omitted `enable` as
 /// `false`). Any other key is ignored, mihomo's upstream-only ones
-/// (`stack`, `strict-route`, `auto-detect-interface`, …) included.
+/// (`strict-route`, `auto-detect-interface`, `auto-redirect`, …)
+/// included.
 #[derive(Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 struct TunFields {
@@ -850,6 +851,12 @@ struct TunFields {
     dns_hijack: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     udp_timeout: Option<u64>,
+    /// `stack` is free-form like `RawTun`'s: `system`/`mixed` select the
+    /// kernel TCP stack, anything else commits verbatim and warns at
+    /// parse — the same contract the `tun:` file section gets, rather
+    /// than a 400 for the whole PATCH.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stack: Option<serde_json::Value>,
 }
 
 impl TunFields {
@@ -867,6 +874,7 @@ impl TunFields {
             outbound_interface: tun.outbound_interface,
             dns_hijack: tun.dns_hijack,
             udp_timeout: tun.udp_timeout,
+            stack: tun.stack,
         }
     }
 
@@ -888,6 +896,7 @@ impl TunFields {
         merge(&mut tun.outbound_interface, self.outbound_interface);
         merge(&mut tun.dns_hijack, self.dns_hijack);
         merge(&mut tun.udp_timeout, self.udp_timeout);
+        merge(&mut tun.stack, self.stack);
     }
 }
 
@@ -3154,10 +3163,12 @@ async fn swap_config_and_reconcile_tun(
         let old = guard.tun.as_ref().is_some_and(|t| t.enable);
         // Semantic diff (issue #543): compare the PARSED `TunConfig`s so
         // any real listener-parameter change (`mtu`, `auto-route`,
-        // `dns-hijack`, addresses, inherited `max-connections`, …)
-        // restarts a running listener while no-op respellings
-        // (`auto-route: true` vs `fake-ip`, explicit defaults) and
-        // warn-only ignored fields (`stack`, `strict-route`, …) do not.
+        // `dns-hijack`, addresses, `stack`, inherited `max-connections`,
+        // …) restarts a running listener while no-op respellings
+        // (`auto-route: true` vs `fake-ip`, explicit defaults, `stack`
+        // spellings that parse to the same `TunStack`) and warn-only
+        // ignored fields (`strict-route`, `auto-detect-interface`, …)
+        // do not.
         // When either side fails to parse, fall back to the raw diff —
         // a broken candidate stays conservative: restart → spawn fails
         // → `enable` rolls back.
@@ -3168,8 +3179,9 @@ async fn swap_config_and_reconcile_tun(
         {
             // Fast path: identical raw sections cannot differ
             // semantically — and skipping the parse avoids re-warn!ing
-            // on upstream-only fields (`stack:`, `strict-route:`, …) on
-            // every commit that never touched `tun:`.
+            // on every commit that never touched `tun:` (upstream-only
+            // fields like `strict-route:` and `stack:`'s warn-and-fall-
+            // back spellings all warn at parse).
             false
         } else {
             match (

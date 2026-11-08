@@ -67,6 +67,16 @@ the canonical, in-repo source a release is cut from.
   the top level had. In a rule-provider's own payload `RULE-SET` is
   still rejected eagerly — stricter than upstream, which resolves the
   name lazily at match time and tolerates cycles.
+- **`tun.stack: system`** — on Linux the TUN's TCP is terminated by the
+  host kernel instead of lwIP: the packet pump rewrites each connection
+  to a kernel listener on the device address (an in-device NAT, as
+  mihomo's `system` stack does), translating TSO/GRO aggregates whole, so
+  a DIRECT relay splices and TCP throughput per CPU multiplies. UDP is
+  parsed and built in the pump rather than by a userspace stack;
+  UDP fragments, IPv6 extension headers and ICMP stay on lwIP
+  (fragmented TCP is dropped). `mixed` maps to `system` with a warning
+  (its UDP is not gVisor's here); `gvisor`, `mips` and non-Linux
+  `system` fall back to `lwip` with a warning.
 
 ### Changed
 
