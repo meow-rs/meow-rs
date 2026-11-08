@@ -77,6 +77,18 @@ the canonical, in-repo source a release is cut from.
   (fragmented TCP is dropped). `mixed` maps to `system` with a warning
   (its UDP is not gVisor's here); `gvisor`, `mips` and non-Linux
   `system` fall back to `lwip` with a warning.
+- **`sniff.QUIC` on TUN UDP flows** — the `sniffer:` block's `QUIC`
+  protocol key now names a TUN UDP flow from the SNI inside the
+  client's Initial packets (QUIC v1 and v2; draft-29 is not read),
+  applying `skip-domain`/`force-domain`/`override-destination` the same
+  way a TCP sniff does. Initials derive their keys from the client
+  DCID alone (RFC 9001 §5.2), so the packet opens on-path: a UDP flow
+  to a `QUIC` port holds back its first datagrams — at most
+  `sniffer.timeout` and four packets, a tighter budget than upstream's
+  ~3-second unbounded hold — until an Initial yields the name, then
+  dials and forwards them upstream first. TCP flows on the same
+  listeners keep the existing TLS/HTTP sniff; non-TUN inbounds carry
+  no sniffed UDP.
 
 ### Changed
 

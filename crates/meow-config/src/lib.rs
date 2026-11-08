@@ -3295,6 +3295,12 @@ async fn load_rule_providers_async(
     .map_err(|e| anyhow::anyhow!("rule-provider load task failed: {e}"))?
 }
 
+/// The `sniffer:` block of a raw config (a TUN rebuilt on an API config
+/// change needs it).
+pub fn sniffer_config_from_raw(raw: &raw::RawConfig) -> Result<SnifferConfig, anyhow::Error> {
+    parse_sniffer_config(raw, raw.strict.unwrap_or(false))
+}
+
 fn parse_sniffer_config(
     raw: &raw::RawConfig,
     strict: bool,
@@ -3327,6 +3333,7 @@ fn parse_sniffer_config(
             // Parse per-protocol port lists.
             let mut tls_ports: Vec<u16> = Vec::new();
             let mut http_ports: Vec<u16> = Vec::new();
+            let mut quic_ports: Vec<u16> = Vec::new();
             if let Some(sniff_map) = rs.sniff.as_ref() {
                 for (key, proto) in sniff_map {
                     match key.to_uppercase().as_str() {
@@ -3337,15 +3344,15 @@ fn parse_sniffer_config(
                             http_ports = proto.ports.clone().unwrap_or_default();
                         }
                         "QUIC" => {
-                            warn!("sniffer.sniff.QUIC is not implemented in meow-rs; ignoring");
+                            // Upstream's default port for QUIC.
+                            quic_ports = proto.ports.clone().unwrap_or_else(|| vec![443]);
                         }
                         // An unrecognized key is a typo'd/dead declaration —
-                        // a defect under strict (issue #533 review), unlike
-                        // the valid-but-unimplemented `QUIC` Class-B shim.
+                        // a defect under strict (issue #533 review).
                         other if strict => {
                             anyhow::bail!(
                                 "sniffer.sniff.{other}: unknown protocol (strict mode); \
-                                 supported: TLS, HTTP"
+                                 supported: TLS, HTTP, QUIC"
                             );
                         }
                         other => {
@@ -3353,10 +3360,11 @@ fn parse_sniffer_config(
                         }
                     }
                 }
-                if enable && tls_ports.is_empty() && http_ports.is_empty() {
+                if enable && tls_ports.is_empty() && http_ports.is_empty() && quic_ports.is_empty()
+                {
                     anyhow::bail!(
                         "sniffer.sniff is present and enable: true, but no ports are configured \
-                        for any supported protocol (TLS/HTTP)"
+                        for any supported protocol (TLS/HTTP/QUIC)"
                     );
                 }
             } else if enable {
@@ -3377,6 +3385,27 @@ fn parse_sniffer_config(
                 }
             }
 
+            // Canonical order for the semantic `SnifferConfig` diff the
+            // TUN reconcile runs on a config change: the runtime dedups
+            // every list into a `HashMap`/`DomainTrie` anyway, so
+            // `[443, 8443]` and `[8443, 443]` are the same config — sort
+            // + dedup keeps a port-or-domain respelling from restarting
+            // the listener (review #887).
+            for ports in [&mut tls_ports, &mut http_ports, &mut quic_ports] {
+                ports.sort_unstable();
+                ports.dedup();
+            }
+            let normalize_domains = |list: &Option<Vec<String>>| {
+                let mut v: Vec<SmolStr> = list
+                    .iter()
+                    .flatten()
+                    .map(|s| SmolStr::from(s.as_str()))
+                    .collect();
+                v.sort_unstable();
+                v.dedup();
+                v
+            };
+
             Ok(SnifferConfig {
                 enable,
                 timeout: std::time::Duration::from_millis(timeout_ms),
@@ -3384,18 +3413,9 @@ fn parse_sniffer_config(
                 override_destination: rs.override_destination.unwrap_or(false),
                 tls_ports,
                 http_ports,
-                skip_domain: rs
-                    .skip_domain
-                    .iter()
-                    .flatten()
-                    .map(|s| SmolStr::from(s.as_str()))
-                    .collect(),
-                force_domain: rs
-                    .force_domain
-                    .iter()
-                    .flatten()
-                    .map(|s| SmolStr::from(s.as_str()))
-                    .collect(),
+                quic_ports,
+                skip_domain: normalize_domains(&rs.skip_domain),
+                force_domain: normalize_domains(&rs.force_domain),
             })
         }
         None if has_tproxy_sni => {
@@ -3411,6 +3431,7 @@ fn parse_sniffer_config(
                 override_destination: false,
                 tls_ports: vec![443],
                 http_ports: Vec::new(),
+                quic_ports: Vec::new(),
                 skip_domain: Vec::new(),
                 force_domain: Vec::new(),
             })

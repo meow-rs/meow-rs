@@ -52,6 +52,9 @@ const MAX_FLOWS: usize = 1024;
 /// tasks here (issue #515).
 const HIJACK_IN_FLIGHT: usize = 64;
 
+/// Most client datagrams a QUIC sniff holds back before routing the flow.
+const QUIC_SNIFF_PACKETS: usize = 4;
+
 /// Sweep dead flow-table entries every this many datagrams.
 const SWEEP_INTERVAL: u32 = 256;
 
@@ -191,6 +194,10 @@ impl Drop for FlowTable {
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the listener's UDP knobs, passed once"
+)]
 pub(super) async fn run_udp(
     tunnel: Tunnel,
     io: UdpIo,
@@ -199,6 +206,7 @@ pub(super) async fn run_udp(
     in_name: String,
     tun_net: TunNets,
     live_flows: Arc<AtomicUsize>,
+    sniffer: Option<Arc<crate::sniffer::SnifferRuntime>>,
 ) {
     let (reply_tx, mut incoming) = match io {
         UdpIo::Lwip(socket) => {
@@ -384,6 +392,7 @@ pub(super) async fn run_udp(
                 udp_timeout,
                 in_name: in_name.clone(),
                 last_activity,
+                sniffer: sniffer.clone(),
             },
         ));
     }
@@ -400,6 +409,9 @@ struct FlowSpec {
     udp_timeout: Duration,
     in_name: String,
     last_activity: Arc<AtomicU64>,
+    /// The configured sniffer; its QUIC ports name a flow from the
+    /// client's Initials before it is routed.
+    sniffer: Option<Arc<crate::sniffer::SnifferRuntime>>,
 }
 
 /// Count a dropped hijack response and warn on a power-of-two cadence so
@@ -457,6 +469,7 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
         udp_timeout,
         in_name,
         last_activity,
+        sniffer,
     } = spec;
     let mut metadata = Metadata {
         network: Network::Udp,
@@ -469,11 +482,52 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
         ..Default::default()
     };
 
+    // QUIC sniff: hold the first datagrams until their Initials yield the
+    // server name, at most `sniffer.timeout` and a few packets; they are
+    // sent upstream first once the flow is dialed.
+    let mut held: Vec<Vec<u8>> = Vec::new();
+    if sniffer.is_some() {
+        crate::sniffer::prefill_host(&tunnel.inner().resolver(), &mut metadata);
+    }
+    if let Some(rt) = sniffer.as_deref().filter(|rt| rt.wants_quic(&metadata)) {
+        let deadline = Instant::now() + rt.timeout();
+        let mut quic = crate::sniffer_quic::QuicSniffer::default();
+        while held.len() < QUIC_SNIFF_PACKETS {
+            let Ok(Some(data)) = tokio::time::timeout_at(deadline, rx.recv()).await else {
+                break;
+            };
+            let step = quic.feed(&data);
+            held.push(data);
+            match step {
+                crate::sniffer_quic::QuicSniffStep::Name(name) => {
+                    rt.maybe_apply_sniff(&name, &mut metadata);
+                    break;
+                }
+                crate::sniffer_quic::QuicSniffStep::More => {}
+                crate::sniffer_quic::QuicSniffStep::Done => break,
+            }
+        }
+    }
+
+    // Routing or dial failures below return before `held` is flushed to
+    // the conn: say so when that drops datagrams — the client sent its
+    // Initials and otherwise waits out its idle timeout for answers that
+    // were never forwarded.
+    let drop_held = |held: &[Vec<u8>]| {
+        if !held.is_empty() {
+            debug!(
+                "tun UDP {src} -> {dst}: dropping {} held QUIC Initial datagram(s) unsent",
+                held.len()
+            );
+        }
+    };
+
     let inner = tunnel.inner();
     if matches!(
         inner.pre_handle_metadata(&mut metadata),
         meow_tunnel::PreHandleVerdict::Drop
     ) {
+        drop_held(&held);
         return Err("unmapped fake-ip destination".into());
     }
     // UDP keeps the eager pre_resolve (no lazy enrichment): the outbound
@@ -482,6 +536,7 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
     inner.pre_resolve(&mut metadata).await;
     inner.resolve_udp_dst(&mut metadata).await;
     let Some(dst_ip) = metadata.dst_ip else {
+        drop_held(&held);
         return Err(format!(
             "dst_ip not resolved for {}",
             metadata.remote_address()
@@ -497,6 +552,7 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
         route: _route,
     }) = inner.resolve_proxy(&metadata).await
     else {
+        drop_held(&held);
         return Err(format!(
             "no matching rule for {}",
             metadata.remote_address()
@@ -513,12 +569,14 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
     // Taken before the dial so a flush landing mid-dial still ends the flow
     // (issue #695): its socket may predate the new outbound binding.
     let mut flush = inner.udp_flush_watch();
-    let conn: std::sync::Arc<dyn meow_common::ProxyPacketConn> = std::sync::Arc::from(
-        inner
-            .dial_udp(proxy.as_ref(), &metadata)
-            .await
-            .map_err(|e| format!("dial_udp via {}: {e}", proxy.name()))?,
-    );
+    let conn: std::sync::Arc<dyn meow_common::ProxyPacketConn> =
+        match inner.dial_udp(proxy.as_ref(), &metadata).await {
+            Ok(conn) => std::sync::Arc::from(conn),
+            Err(e) => {
+                drop_held(&held);
+                return Err(format!("dial_udp via {}: {e}", proxy.name()));
+            }
+        };
     // `_route` exists to pin the route-table generation across the dial
     // only — a long-lived flow must not keep its dial-time generation
     // alive across config reloads.
@@ -555,74 +613,107 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
     // reply is delivered as coming from `dst`.
     let idle = sleep_until(next_deadline(udp_timeout));
     tokio::pin!(idle);
-    let result = loop {
-        tokio::select! {
-            () = &mut idle => break Ok(()), // idle-timeout eviction
-            // Outbound sessions flushed (issue #695): end the flow; the
-            // client's next datagram opens a fresh one with a fresh dial.
-            () = flush.flushed() => break Ok(()),
-            queued = rx.recv() => match queued {
-                Some(data) => {
-                    // Drive write_packet in a nested select! so idle
-                    // expiry, flush and a dead reply reader can cancel
-                    // a blocked write (PR #893 pattern: write_packet
-                    // must not park the flow's termination signals).
-                    let write_result = tokio::select! {
-                        () = &mut idle => break Ok(()), // idle-timeout during write
-                        () = flush.flushed() => break Ok(()), // flush during write
-                        done = &mut reply_task => break Err(match done {
-                            Ok(Err(e)) => e,
-                            Ok(Ok(())) => "downstream reader exited".into(),
-                            Err(e) => format!("downstream reader task: {e}"),
-                        }),
-                        r = conn.write_packet(&data, &dst_addr) => r,
-                    };
-                    match write_result {
-                        Ok(n) if n == data.len() => {
-                            idle.as_mut().reset(next_deadline(udp_timeout));
-                        }
-                        Ok(n) => {
-                            break Err(format!(
-                                "upstream write {dst_addr}: short write {n}/{}",
-                                data.len()
-                            ));
-                        }
-                        Err(e) => {
-                            break Err(format!("upstream write {dst_addr}: {e}"));
-                        }
-                    }
-                }
-                None => break Ok(()), // reader loop gone — listener shutdown
-            },
-            received = up_rx.recv() => match received {
-                Some(data) => {
-                    // UDP drop semantics on backpressure: a full reply queue
-                    // drops the datagram rather than parking the flow (and
-                    // its idle timer) on a slow lwIP stack writer — same
-                    // policy as tproxy (which already used try_send).
-                    match reply_tx.try_send((data, dst, src)) {
-                        Ok(()) => {
-                            last_activity.store(activity_ms(), Ordering::Relaxed);
-                            idle.as_mut().reset(next_deadline(udp_timeout));
-                        }
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            // Drop this reply; the client will retransmit if
-                            // it needs the data.
-                            debug!("tun UDP reply queue full: dropping reply to {src} (from {dst})");
-                        }
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                            break Ok(()); // stack writer gone — listener shutdown
-                        }
-                    }
-                }
-                // The reader task exited — it owns the only `up_tx`. The
-                // borrow-await keeps the handle usable for the abort below.
-                None => break Err(match (&mut reply_task).await {
+    let result = 'flow: {
+        // The held Initials go upstream first — through the same nested
+        // select! the steady-state loop below uses: a stream-framed conn
+        // (Trojan/VLESS UoT) can park write_packet for up to
+        // `connection_timeout`, and idle expiry, a config-reload flush or
+        // a dead reply reader must still be able to end the flow.
+        for data in held {
+            let write_result = tokio::select! {
+                () = &mut idle => break 'flow Ok(()), // idle-timeout during write
+                () = flush.flushed() => break 'flow Ok(()), // flush during write
+                done = &mut reply_task => break 'flow Err(match done {
                     Ok(Err(e)) => e,
                     Ok(Ok(())) => "downstream reader exited".into(),
                     Err(e) => format!("downstream reader task: {e}"),
                 }),
-            },
+                r = conn.write_packet(&data, &dst_addr) => r,
+            };
+            match write_result {
+                Ok(n) if n == data.len() => {
+                    idle.as_mut().reset(next_deadline(udp_timeout));
+                }
+                Ok(n) => {
+                    break 'flow Err(format!(
+                        "upstream write {dst_addr}: short write {n}/{}",
+                        data.len()
+                    ));
+                }
+                Err(e) => {
+                    break 'flow Err(format!("upstream write {dst_addr}: {e}"));
+                }
+            }
+        }
+        loop {
+            tokio::select! {
+                () = &mut idle => break Ok(()), // idle-timeout eviction
+                // Outbound sessions flushed (issue #695): end the flow; the
+                // client's next datagram opens a fresh one with a fresh dial.
+                () = flush.flushed() => break Ok(()),
+                queued = rx.recv() => match queued {
+                    Some(data) => {
+                        // Drive write_packet in a nested select! so idle
+                        // expiry, flush and a dead reply reader can cancel
+                        // a blocked write (PR #893 pattern: write_packet
+                        // must not park the flow's termination signals).
+                        let write_result = tokio::select! {
+                            () = &mut idle => break Ok(()), // idle-timeout during write
+                            () = flush.flushed() => break Ok(()), // flush during write
+                            done = &mut reply_task => break Err(match done {
+                                Ok(Err(e)) => e,
+                                Ok(Ok(())) => "downstream reader exited".into(),
+                                Err(e) => format!("downstream reader task: {e}"),
+                            }),
+                            r = conn.write_packet(&data, &dst_addr) => r,
+                        };
+                        match write_result {
+                            Ok(n) if n == data.len() => {
+                                idle.as_mut().reset(next_deadline(udp_timeout));
+                            }
+                            Ok(n) => {
+                                break Err(format!(
+                                    "upstream write {dst_addr}: short write {n}/{}",
+                                    data.len()
+                                ));
+                            }
+                            Err(e) => {
+                                break Err(format!("upstream write {dst_addr}: {e}"));
+                            }
+                        }
+                    }
+                    None => break Ok(()), // reader loop gone — listener shutdown
+                },
+                received = up_rx.recv() => match received {
+                    Some(data) => {
+                        // UDP drop semantics on backpressure: a full reply queue
+                        // drops the datagram rather than parking the flow (and
+                        // its idle timer) on a slow lwIP stack writer — same
+                        // policy as tproxy (which already used try_send).
+                        match reply_tx.try_send((data, dst, src)) {
+                            Ok(()) => {
+                                last_activity.store(activity_ms(), Ordering::Relaxed);
+                                idle.as_mut().reset(next_deadline(udp_timeout));
+                            }
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                // Drop this reply; the client will retransmit if
+                                // it needs the data.
+                                debug!("tun UDP reply queue full: dropping reply to {src} (from {dst})");
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                break Ok(()); // stack writer gone — listener shutdown
+                            }
+                        }
+                    }
+                    // The reader task exited — it owns the only `up_tx`. The
+                    // borrow-await keeps the handle usable for the abort below.
+                    None => break Err(match (&mut reply_task).await {
+                        Ok(Err(e)) => e,
+                        Ok(Ok(())) => "downstream reader exited".into(),
+                        Err(e) => format!("downstream reader task: {e}"),
+                    }),
+                },
+            }
         }
     };
 
@@ -778,6 +869,7 @@ mod tests {
                 "tun".to_string(),
                 net(),
                 Arc::clone(&gauge),
+                None,
             ));
             (tx, task)
         };
@@ -860,6 +952,7 @@ mod tests {
             "tun".to_string(),
             net,
             Arc::clone(&gauge),
+            None,
         ));
 
         let pkt = |src: SocketAddr| (b"x".to_vec(), src, SocketAddr::from(([8, 8, 8, 8], 1234)));
@@ -913,6 +1006,7 @@ mod tests {
                     udp_timeout: std::time::Duration::from_millis(100),
                     in_name: "tun".to_string(),
                     last_activity: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                    sniffer: None,
                 },
             )
             .await;

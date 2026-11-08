@@ -964,6 +964,25 @@ async fn update_configs(
                 )
                     .into_response();
             }
+            // A merged section that differs and stays enabled runs the
+            // reconcile's stop → spawn — the same spawn-side sniffer
+            // parse `PUT /configs` gates at admission (review #887). A
+            // committed `sniffer:` the parser rejects (only a forced
+            // earlier PUT can have committed one) would otherwise tear
+            // the running listener down here and answer 500; reject the
+            // PATCH instead and keep the listener up. A disable or
+            // no-change patch never spawns, so it is not gated.
+            if tun.enable && raw.tun.as_ref() != Some(&tun) {
+                if let Err(e) = meow_config::sniffer_config_from_raw(&raw) {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(
+                            serde_json::json!({ "message": format!("sniffer config error: {e}") }),
+                        ),
+                    )
+                        .into_response();
+                }
+            }
             (raw.tun.as_ref() != Some(&tun)).then_some(tun)
         }
     };
@@ -1589,6 +1608,41 @@ async fn commit_raw_candidate(
         CONFIG_MUTATION.try_lock().is_err(),
         "caller must hold the CONFIG_MUTATION lane"
     );
+    // The `PUT /configs` admission gates, conditionally (review #887): a
+    // caller that rewrites a `tun:`-reconcile input fires the restart in
+    // `swap_config_and_reconcile_tun` below, whose spawn re-parses `tun:`
+    // and `sniffer:` — a section that fails must be rejected here, before
+    // `stop_tun` can tear a healthy listener down. The tuple is the
+    // fast-path's plus the DNS inputs `fake_ip_changed` watches — a
+    // rebuilt resolver whose fake-IP pool moved restarts too. Today's
+    // callers only touch proxies/groups/rules/subscriptions, so it always
+    // compares equal and the gate never fires — including when a forced
+    // PUT committed an invalid section (mutations that cannot restart
+    // must not be blocked by it).
+    let restarts_tun = {
+        let committed = state.raw_config.read();
+        candidate.tun.as_ref().is_some_and(|t| t.enable)
+            && (committed.tun != candidate.tun
+                || committed.max_connections != candidate.max_connections
+                || committed.sniffer != candidate.sniffer
+                || committed.tproxy_sni != candidate.tproxy_sni
+                || committed.fake_ip_range() != candidate.fake_ip_range()
+                || !dns_inputs_equal(&committed, &candidate))
+    };
+    if restarts_tun {
+        meow_config::parse_tun_config(
+            candidate.tun.as_ref(),
+            candidate.max_connections,
+            candidate.fake_ip_range(),
+        )
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("tun config error: {e}")))?;
+        meow_config::sniffer_config_from_raw(&candidate).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("sniffer config error: {e}"),
+            )
+        })?;
+    }
     let preinstalled = preinstall_global_route_binding(&candidate);
     let (dns, prior_resolver) = apply_raw_to_tunnel(candidate.clone(), state).await?;
     // `apply_raw_to_tunnel` publishes through `update_routing`, which keeps
@@ -3002,8 +3056,10 @@ async fn get_chain_health(
 /// Returns `Ok(Some(handle))` on success — the [`TunHandle`] carries the
 /// lwIP core's done signal so `stop_tun` can await real teardown
 /// (issue #514) — `Ok(None)` when `tun.enable` is false, or `Err(msg)`
-/// when startup fails (permission denied, device-name conflict, timeout,
-/// or the `listener-tun` feature is not compiled in).
+/// when startup fails: an unparsable `tun:` or `sniffer:` section (the
+/// listener carries the parsed `SnifferConfig`; review #887), permission
+/// denied, device-name conflict, timeout, or the `listener-tun` feature
+/// not compiled in.
 ///
 /// `binding` is the global-route binding the mutation pre-installed for
 /// `raw` ([`preinstall_global_route_binding`], issue #695); the listener
@@ -3037,6 +3093,16 @@ async fn spawn_tun_from_raw(
         "meow-tun".to_string(),
     )
     .with_readiness_signal(ready_tx);
+    // A broken `sniffer:` section is a parse error like `tun:`'s above,
+    // not a warn-and-continue — silently spawning a snifferless TUN while
+    // the API still reports success hides the defect (review #887).
+    let sniffer_cfg = match meow_config::sniffer_config_from_raw(raw) {
+        Ok(c) => c,
+        Err(e) => {
+            return Err(format!("sniffer config parse error: {e}"));
+        }
+    };
+    listener = listener.with_sniffer(Arc::new(meow_listener::SnifferRuntime::new(sniffer_cfg)));
     if let Some(binding) = binding {
         listener = listener.with_outbound_binding(binding);
     }
@@ -3174,6 +3240,13 @@ async fn swap_config_and_reconcile_tun(
         // → `enable` rolls back.
         let tun_changed = if guard.tun == candidate.tun
             && guard.max_connections == candidate.max_connections
+            // The TUN carries the sniffer it was spawned with — and the
+            // deprecated `tproxy-sni` alias feeds the same parse, so it
+            // belongs to this tuple too: an alias flip is a real sniffer
+            // change (synthesised-enable ↔ default-disabled) that must
+            // reach the slow path (review #887).
+            && guard.sniffer == candidate.sniffer
+            && guard.tproxy_sni == candidate.tproxy_sni
             // The default device address derives from it.
             && guard.fake_ip_range() == candidate.fake_ip_range()
         {
@@ -3196,7 +3269,25 @@ async fn swap_config_and_reconcile_tun(
                     candidate.fake_ip_range(),
                 ),
             ) {
-                (Ok(o), Ok(n)) => o != n,
+                // The TUN also carries the sniffer it was spawned with:
+                // a sniffer-only diff must restart it too — compared
+                // semantically, like `TunConfig`, so a no-op respelling
+                // does not (review #887).
+                (Ok(o), Ok(n)) => {
+                    o != n
+                        || match (
+                            meow_config::sniffer_config_from_raw(&guard),
+                            meow_config::sniffer_config_from_raw(&candidate),
+                        ) {
+                            // A disabled sniffer's remaining fields are
+                            // dead config — `enable: false` with a
+                            // different timeout or port list is the same
+                            // off state, not a restart-worthy change
+                            // (review #887).
+                            (Ok(a), Ok(b)) => a.enable != b.enable || (a.enable && a != b),
+                            _ => guard.sniffer != candidate.sniffer,
+                        }
+                }
                 // Raw sections already known to differ — a broken
                 // candidate stays conservative: restart → spawn fails
                 // → `enable` rolls back.
@@ -3760,6 +3851,27 @@ async fn put_configs(
             forced.push(format!("tun config error: {e}"));
         } else {
             return reload_rejected(StatusCode::BAD_REQUEST, &format!("tun config error: {e}"));
+        }
+    }
+
+    // Same admission contract for `sniffer:` (review #887): the TUN
+    // carries the parsed `SnifferConfig` it was spawned with, and a
+    // section `spawn_tun_from_raw` cannot parse fails the same restart a
+    // sniffer diff triggers — tearing a healthy listener down on a 204
+    // exactly as an unparsable `tun:` did before the gate above. `force`
+    // degrades the same way; the restart's rollback still prevents a
+    // false `enable`. The rebuild never sees this section either, so it
+    // must gate here — committed unchecked, the next boot's
+    // `build_config` would hard-error on a value this PUT accepted.
+    if let Err(e) = meow_config::sniffer_config_from_raw(&raw_config) {
+        if force {
+            tracing::error!("config reload forced despite sniffer config error: {e}");
+            forced.push(format!("sniffer config error: {e}"));
+        } else {
+            return reload_rejected(
+                StatusCode::BAD_REQUEST,
+                &format!("sniffer config error: {e}"),
+            );
         }
     }
 

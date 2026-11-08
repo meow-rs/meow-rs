@@ -28,6 +28,8 @@
 //! | S18 | `parse-pure-ip` / `override-destination` overrides apply               |
 //! | S19 | strict mode promotes an unknown protocol key to a hard error           |
 //! | S20 | empty-label `skip-domain`/`force-domain`: lenient loads, strict errs   |
+//! | S21 | refused-shape `skip-domain`/`force-domain`: lenient loads, strict errs |
+//! | S22 | Ports and domain lists come out sorted + deduplicated                |
 
 use meow_config::load_config_from_str;
 
@@ -76,8 +78,6 @@ async fn s3_enable_true_with_only_unknown_protocols_errors() {
 sniffer:
   enable: true
   sniff:
-    QUIC:
-      ports: [443]
     SOMETHING:
       ports: [9999]
 "#;
@@ -158,10 +158,10 @@ sniffer:
     assert_eq!(cfg.sniffer.http_ports, vec![80]);
 }
 
-// ─── S8: QUIC is ignored (warn-only) ─────────────────────────────────────
+// ─── S8: QUIC ports parse (sniffed on TUN UDP flows) ─────────────────────
 
 #[tokio::test]
-async fn s8_quic_protocol_ignored_with_other_proto_present() {
+async fn s8_quic_protocol_parses_its_ports() {
     let yaml = r#"
 sniffer:
   enable: true
@@ -172,9 +172,13 @@ sniffer:
       ports: [443]
 "#;
     let cfg = load_config_from_str(yaml).await.expect("must load");
-    // QUIC entry is silently dropped — we don't synthesise a quic_ports field.
     assert_eq!(cfg.sniffer.tls_ports, vec![443]);
     assert_eq!(cfg.sniffer.http_ports, Vec::<u16>::new());
+    assert_eq!(cfg.sniffer.quic_ports, vec![443]);
+    // Alone it is enough to enable the sniffer; no ports means 443.
+    let only = "sniffer:\n  enable: true\n  sniff:\n    QUIC: {}\n";
+    let cfg = load_config_from_str(only).await.expect("QUIC alone loads");
+    assert_eq!(cfg.sniffer.quic_ports, vec![443]);
 }
 
 // ─── S9: unknown protocol key is ignored ─────────────────────────────────
@@ -437,4 +441,39 @@ async fn s21_refused_domain_lists_lenient_loads_strict_errors() {
             );
         }
     }
+}
+
+// ─── S22: port/domain lists normalise to a canonical order ─────────────
+//
+// `PUT /configs` diffs the parsed `SnifferConfig` when deciding whether a
+// reload must restart the TUN listener — the runtime dedups every list
+// into a `HashMap`/`DomainTrie` anyway, so a port or domain respelling
+// must parse to the same value, not read as a change (review #887).
+#[tokio::test]
+async fn s22_ports_and_domains_are_sorted_and_deduplicated() {
+    let yaml = r#"
+sniffer:
+  enable: true
+  sniff:
+    TLS:
+      ports: [8443, 443, 8443]
+    HTTP:
+      ports: [8080, 80]
+    QUIC:
+      ports: [443, 443]
+  skip-domain: [b.example, a.example, a.example]
+  force-domain: [+.z.example, +.y.example]
+"#;
+    let cfg = load_config_from_str(yaml).await.expect("must load");
+    assert_eq!(cfg.sniffer.tls_ports, vec![443, 8443]);
+    assert_eq!(cfg.sniffer.http_ports, vec![80, 8080]);
+    assert_eq!(cfg.sniffer.quic_ports, vec![443]);
+    assert_eq!(
+        cfg.sniffer.skip_domain,
+        vec!["a.example".to_string(), "b.example".to_string()]
+    );
+    assert_eq!(
+        cfg.sniffer.force_domain,
+        vec!["+.y.example".to_string(), "+.z.example".to_string()]
+    );
 }

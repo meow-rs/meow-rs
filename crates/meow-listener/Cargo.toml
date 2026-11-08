@@ -19,6 +19,7 @@ listener-mixed = ["listener-http", "listener-socks5"]
 # userspace-stack, and route-control deps below.
 listener-tun = [
     "dep:tun-rs",
+    "dep:boring",
     "dep:lwip",
     "dep:futures",
     "dep:route_manager",
@@ -61,6 +62,9 @@ meow-dns = { workspace = true, optional = true }
 ipnet = { workspace = true, optional = true }
 # listener-shadowsocks
 shadowsocks = { workspace = true, optional = true }
+# listener-tun: QUIC Initial decryption for the QUIC sniffer (the same
+# BoringSSL every TLS path links).
+boring = { workspace = true, optional = true }
 meow-transport = { workspace = true, optional = true }
 parking_lot.workspace = true
 
