@@ -8,12 +8,15 @@
 //! upstream ahead of the rest of the stream. Only flows the tunnel cannot
 //! otherwise name are read: every other flow keeps its routing and timing.
 
+#[cfg(unix)]
 use std::io;
 use std::time::Duration;
 
 use meow_common::sniffer::{sniff_http, sniff_tls};
 use meow_common::Metadata;
-use tokio::io::{AsyncRead, AsyncReadExt, Interest};
+#[cfg(unix)]
+use tokio::io::Interest;
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::TunnelInner;
 
@@ -25,6 +28,21 @@ const SNIFF_WINDOW: Duration = Duration::from_millis(200);
 /// Most bytes gathered while waiting for a ClientHello split across
 /// segments. Matches the listener sniffer's peek buffer.
 const SNIFF_CAP: usize = 8192;
+/// Poll cadence of the non-unix [`wait_for_more`] arm.
+#[cfg(not(unix))]
+const PEEK_POLL: Duration = Duration::from_millis(5);
+/// Re-peeks that see no new bytes before the wait gives up. On unix a
+/// stall follows a real readiness edge, so a stalled pair means a
+/// persistent non-data readiness — the peer closed while bytes are
+/// still queued, a state clearing cannot suppress. Other platforms
+/// poll instead (see [`wait_for_more`]): a stall is one `PEEK_POLL` of
+/// silence, and the budget — half the window — leaves a slow split
+/// record ample time while still ending a closed-mid-record wait well
+/// before the deadline.
+#[cfg(unix)]
+const STALL_LIMIT: u8 = 2;
+#[cfg(not(unix))]
+const STALL_LIMIT: u8 = (SNIFF_WINDOW.as_millis() / 2 / PEEK_POLL.as_millis()) as u8;
 
 /// Recover a name for a flow whose destination the tunnel cannot map back
 /// (a stale address in our fake-IP range, or another resolver's fake IP in
@@ -69,10 +87,9 @@ pub(crate) async fn sniff_unnamed_peek(
     let deadline = tokio::time::Instant::now() + SNIFF_WINDOW;
     let mut buf = vec![0u8; SNIFF_CAP];
     let mut n = 0;
-    // Re-peeks that saw no new bytes, bounded: a persistent non-data
-    // readiness (the peer closed while bytes are still queued — a state
-    // clearing cannot suppress) would otherwise keep the wait instantly
-    // woken until the deadline.
+    // Re-peeks that saw no new bytes, bounded — on unix a stall follows
+    // a real readiness edge, elsewhere one `PEEK_POLL` of silence
+    // (`STALL_LIMIT` documents the two budgets).
     let mut stalls = 0u8;
     loop {
         match tokio::time::timeout_at(deadline, conn.peek(&mut buf)).await {
@@ -80,7 +97,7 @@ pub(crate) async fn sniff_unnamed_peek(
             Ok(Ok(read)) => {
                 if read <= n {
                     stalls += 1;
-                    if stalls >= 2 {
+                    if stalls >= STALL_LIMIT {
                         break;
                     }
                 } else {
@@ -92,27 +109,46 @@ pub(crate) async fn sniff_unnamed_peek(
         if n == buf.len() || !tls_record_incomplete(&buf[..n]) {
             break;
         }
-        // More of the record is on its way and `peek` left every byte
-        // queued, so the socket still reports READABLE — a bare
-        // `readable()` or `peek` returns at once and only a fixed sleep
-        // paced this loop before (up to ~40 wakeups per window). Report a
-        // deliberate `try_io` WouldBlock instead: tokio clears the
-        // readiness bit only when no newer event landed, so `readable()`
-        // below parks until the next real arrival — one wakeup per
-        // segment, like the `read` variant gets for free.
-        let _ = conn.try_io(Interest::READABLE, || {
-            Err::<usize, _>(io::Error::from(io::ErrorKind::WouldBlock))
-        });
-        if tokio::time::timeout_at(deadline, conn.readable())
-            .await
-            .is_err()
-        {
+        if !wait_for_more(conn, deadline).await {
             break;
         }
     }
     if let Some(name) = sniff_tls(&buf[..n]).or_else(|| sniff_http(&buf[..n])) {
         metadata.sniff_host = name;
     }
+}
+
+/// Park until the next segment of an incomplete record may have arrived;
+/// `false` ends the sniff loop when the window closes first.
+///
+/// More of the record is on its way and `peek` left every byte queued,
+/// so the socket still reports READABLE — a bare `readable()` or `peek`
+/// returns at once and only a fixed sleep paced this loop before (up to
+/// ~40 wakeups per window). Report a deliberate `try_io` WouldBlock
+/// instead: tokio clears the readiness bit only when no newer event
+/// landed, so `readable()` below parks until the next real arrival —
+/// one wakeup per segment, like the `read` variant gets for free.
+#[cfg(unix)]
+async fn wait_for_more(conn: &tokio::net::TcpStream, deadline: tokio::time::Instant) -> bool {
+    let _ = conn.try_io(Interest::READABLE, || {
+        Err::<usize, _>(io::Error::from(io::ErrorKind::WouldBlock))
+    });
+    tokio::time::timeout_at(deadline, conn.readable())
+        .await
+        .is_ok()
+}
+
+/// Non-unix arm. Under IOCP readiness is only a hint — `readable()` and
+/// `try_io` can report a socket ready while a `peek` still finds nothing
+/// new (tokio documents both as lossy), so the clear-and-wait above may
+/// return instantly and burn the stall budget long before a slow tail
+/// segment lands. Poll on a fixed cadence instead; `STALL_LIMIT` scales
+/// how much silence is tolerated.
+#[cfg(not(unix))]
+async fn wait_for_more(_conn: &tokio::net::TcpStream, deadline: tokio::time::Instant) -> bool {
+    tokio::time::timeout_at(deadline, tokio::time::sleep(PEEK_POLL))
+        .await
+        .is_ok()
 }
 
 /// Read the client's first bytes within `window`. Keeps reading while the
@@ -307,10 +343,10 @@ mod tests {
         assert_eq!(relayed(Vec::new(), &mut server, hello.len()).await, hello);
     }
 
-    /// A peer that half-closes mid-record is itself a fresh edge: the
-    /// wait ends promptly with the partial bytes, not after the whole
-    /// window (nor in a spin — the readiness a close leaves behind is
-    /// bounded by the stall guard).
+    /// A peer that half-closes mid-record ends the wait promptly with
+    /// the partial bytes, not after the whole window (nor in a spin —
+    /// the readiness a close leaves behind is bounded by the stall
+    /// guard; on unix the close is itself a fresh edge).
     #[tokio::test]
     async fn peek_sniff_ends_early_when_the_peer_closes_mid_record() {
         let tunnel = mobile_tunnel();
