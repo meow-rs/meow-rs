@@ -104,7 +104,9 @@ the canonical, in-repo source a release is cut from.
   carrying commands, quiche timeouts, or freshly queued stream frames
   still flushes at once — and never while an application command
   arrived within the last millisecond, so an ACK can still ride on
-  upstream data.
+  upstream data. Wakeups that delivered no payload — the bare-ACK
+  traffic an upload receives — neither start nor extend a hold, so an
+  upload's own stream data never waits on the deadline.
 
 ### Fixed
 

@@ -90,12 +90,16 @@ const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const RECV_BATCH: usize = 32;
 /// Commands handled per wakeup, for the same reason on the upload side.
 const CMD_BATCH: usize = 64;
-/// An ACK-only flush is held back until this many datagrams have been accepted
-/// by quiche since the last flush...
+/// An ACK-only flush is held back until this many datagrams have been
+/// accepted by quiche across payload-delivering wakeups since the last
+/// flush: a pure ACK-only wakeup owes no ACK, so it neither starts nor
+/// extends a hold — though a wakeup that also delivered payload counts
+/// every datagram it accepted...
 const ACK_COALESCE_PKTS: u32 = 8;
-/// ...or the first of them is this old, whichever comes first. tokio's ~1 ms
-/// timer granularity is the effective floor — still far below the 25 ms
-/// default `max_ack_delay`, so loss recovery is unaffected. With
+/// ...or the first of them is this old, whichever comes first. The real
+/// bound adds the OS timer tick — ~1 ms on Linux, up to ~16 ms at
+/// Windows' default 15.6 ms resolution — and still lands far below the
+/// 25 ms default `max_ack_delay`, so loss recovery is unaffected. With
 /// [`ACK_COALESCE_PKTS`] this is a deliberate RFC 9000 §13.2.2 deviation —
 /// fewer ACKs than one-per-two during bursts, bounded by the delay.
 const ACK_COALESCE_DELAY: Duration = Duration::from_micros(200);
@@ -451,10 +455,10 @@ async fn run(
 
         // Only a payload-delivering or read-notify wakeup may skip the
         // flush, and only while it queued nothing explicitly; commands,
-        // quiche's timer, keep-alive, a closed connection and the
-        // coalescing deadline always send. The hold is bounded regardless:
-        // a skipped flush may still carry flow-control frames quiche queued
-        // internally — they wait at most `coalesce.delay`.
+        // quiche's timer, keep-alive, a closed or draining connection and
+        // the coalescing deadline always send. The hold is bounded
+        // regardless: a skipped flush may still carry flow-control frames
+        // quiche queued internally — they wait at most `coalesce.delay`.
         let now = tokio::time::Instant::now();
         if woke_on_cmd {
             last_app_cmd = Some(now);
@@ -473,6 +477,7 @@ async fn run(
                 if (delivered_payload || woke_on_notify)
                     && !queued
                     && !conn.is_closed()
+                    && !conn.is_draining()
                     && ack_pending < st.coalesce.pkts
                     && now.duration_since(since) < st.coalesce.delay
                 {
@@ -752,6 +757,8 @@ fn flush_pending(s: &mut StreamState) -> bool {
 fn pump_datagrams(st: &mut State, conn: &mut quiche::Connection, buf: &mut [u8]) -> bool {
     let mut delivered = false;
     while let Ok(n) = conn.dgram_recv(buf) {
+        // Ahead of decode on purpose: even an undecodable datagram is
+        // payload the peer sent and owes an ACK all the same.
         delivered = true;
         tracing::trace!(bytes = n, "hysteria2 received QUIC datagram");
         match proto::decode_udp_message(&buf[..n]) {
