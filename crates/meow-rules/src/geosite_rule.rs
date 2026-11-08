@@ -77,6 +77,16 @@ impl Rule for GeoSiteRule {
         &self.payload_raw
     }
 
+    /// The category's domain count in the loaded DB — mihomo's
+    /// `GetRecodeSize`. `-1` when no DB loaded or the category is absent
+    /// from it (an `@attr` combination has no single stored count).
+    fn size(&self) -> i64 {
+        self.db
+            .as_ref()
+            .and_then(|db| db.domain_count(&self.category))
+            .map_or(-1, |n| n as i64)
+    }
+
     fn should_resolve_ip(&self) -> bool {
         // Upstream GEOSITE never calls `helper.ResolveIP` — it matches the
         // domain only, so demanding a local resolution per connection would

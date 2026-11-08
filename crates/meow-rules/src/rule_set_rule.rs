@@ -90,6 +90,12 @@ impl Rule for RuleSetRule {
         &self.name
     }
 
+    /// The provider set's live rule count — mihomo's `GetRecodeSize`.
+    /// `RuleSet` is a live view: a refresh moves the number with it.
+    fn size(&self) -> i64 {
+        self.set.len() as i64
+    }
+
     fn should_resolve_ip(&self) -> bool {
         // `src` implies `no-resolve` upstream (ParseParams): a source-axis
         // match never reads `dst_ip`, so it must not demand a resolution.

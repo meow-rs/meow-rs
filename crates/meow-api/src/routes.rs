@@ -5,12 +5,12 @@ use axum::{
     http::{header, request::Parts, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Json, Response},
-    routing::{delete, get, post, put},
+    routing::{delete, get, patch, post, put},
     Router,
 };
 use dashmap::DashMap;
 use meow_common::logbook::{self, Level};
-use meow_common::TunnelMode;
+use meow_common::{TunnelMode, EPOCH_RFC3339};
 use meow_config::{
     proxy_provider::ProxyProvider,
     raw::{RawAutoRoute, RawConfig, RawProxyGroup, RawSubscription, RawTun},
@@ -108,6 +108,8 @@ pub struct AppState {
     /// after spawning the server; `PUT /configs` hot-swaps the resolver
     /// slot or rebinds the socket on a `dns.listen` change (issue #514).
     pub dns_server: Arc<RwLock<Option<DnsServerHandle>>>,
+    /// `/storage/{key}`, opened on first use (`crate::storage`).
+    pub ui_storage: crate::storage::UiStorageSlot,
 }
 
 /// Handle to the running standalone DNS server (config `dns.listen`).
@@ -248,7 +250,9 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             "/rules",
             get(get_rules).post(replace_rules).put(update_rule_at_index),
         )
+        .route("/rules/append", post(append_rule))
         .route("/rules/{index}", delete(delete_rule))
+        .route("/rules/disable", patch(disable_rules))
         .route("/rules/reorder", post(reorder_rules))
         .route("/connections", get(get_connections))
         .route(
@@ -273,6 +277,13 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             get(crate::logbook::get_logbook).delete(crate::logbook::clear_logbook),
         )
         .route("/memory", get(get_memory))
+        // Dashboard settings sync (zashboard), as mihomo's cache.db store.
+        .route(
+            "/storage/{key}",
+            get(crate::storage::get_storage)
+                .put(crate::storage::set_storage)
+                .delete(crate::storage::delete_storage),
+        )
         .route("/dns/results", get(get_dns_results))
         .route("/dns/query", get(dns_query_get).post(dns_query))
         .route("/cache/dns/flush", post(flush_dns_cache))
@@ -510,14 +521,13 @@ fn find_proxy(
     })
 }
 
-async fn get_proxy(
-    State(state): State<Arc<AppState>>,
-    Path(name): Path<String>,
-) -> Result<Json<ProxyInfo>, StatusCode> {
+async fn get_proxy(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
     let route = state.tunnel.route_snapshot();
-    let (proxy, provider) =
-        find_proxy(&state, &route.proxies, &name).ok_or(StatusCode::NOT_FOUND)?;
-    Ok(Json(ProxyInfo::from_proxy(&proxy, &provider)))
+    // mihomo answers an unknown name with `{"message": ...}`, not an empty body.
+    let Some((proxy, provider)) = find_proxy(&state, &route.proxies, &name) else {
+        return msg_err(StatusCode::NOT_FOUND, "Resource not found");
+    };
+    Json(ProxyInfo::from_proxy(&proxy, &provider)).into_response()
 }
 
 #[derive(Deserialize)]
@@ -592,11 +602,28 @@ async fn get_group(State(state): State<Arc<AppState>>, Path(name): Path<String>)
 #[derive(Serialize)]
 struct RuleInfo<'a> {
     index: usize,
+    /// mihomo's type name (`DomainSuffix`), which dashboards show.
     #[serde(rename = "type")]
     rule_type: &'static str,
     payload: &'a str,
     proxy: &'a str,
     size: i64,
+    extra: RuleExtra,
+}
+
+/// mihomo's `RuleExtra` (`hub/route/rules.go`): dashboards draw the
+/// enable switch and hit statistics from it. Misses are not counted
+/// (see `meow_tunnel::rule_stats`), so they stay zero / the epoch.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RuleExtra {
+    disabled: bool,
+    hit_count: u64,
+    /// `Cow` so the never-hit epoch answer stays one shared constant
+    /// instead of an allocation per rule.
+    hit_at: std::borrow::Cow<'static, str>,
+    miss_count: u64,
+    miss_at: &'static str,
 }
 
 #[derive(Serialize)]
@@ -612,15 +639,56 @@ async fn get_rules(State(state): State<Arc<AppState>>) -> Response {
         .rules
         .iter()
         .enumerate()
-        .map(|(index, r)| RuleInfo {
-            index,
-            rule_type: r.rule_type().as_str(),
-            payload: r.payload(),
-            proxy: r.adapter(),
-            size: -1,
+        .map(|(index, r)| {
+            let stat = route.rule_stats.view(index);
+            RuleInfo {
+                index,
+                rule_type: r.rule_type().mihomo_name(),
+                payload: r.payload(),
+                proxy: r.adapter(),
+                size: r.size(),
+                extra: RuleExtra {
+                    disabled: stat.disabled,
+                    hit_count: stat.hits,
+                    hit_at: unix_rfc3339(u64::from(stat.hit_at))
+                        .map_or(std::borrow::Cow::Borrowed(EPOCH_RFC3339), |s| {
+                            std::borrow::Cow::Owned(s)
+                        }),
+                    miss_count: 0,
+                    miss_at: EPOCH_RFC3339,
+                },
+            }
         })
         .collect();
     Json(RulesResponse { rules: result }).into_response()
+}
+
+/// `PATCH /rules/disable` — mihomo's `disableRules`: a JSON object of rule
+/// index → disabled. Indexes past the end are skipped. A switch follows
+/// its rule across rebuilds (config commits, subscription refreshes) by
+/// type, payload and target.
+///
+/// The body is read as JSON whatever its `Content-Type`, as upstream's
+/// `render.DecodeJSON` does — panels do not all send the header.
+async fn disable_rules(State(state): State<Arc<AppState>>, body: axum::body::Bytes) -> Response {
+    // The rule-mutation lane every sibling handler takes: `update_rules`
+    // /`update_routing` compute `RuleStats::carried` from a snapshot taken
+    // before their route write, so a disable landing between the snapshot
+    // and the install would be silently reverted despite answering 204.
+    let _mutation = CONFIG_MUTATION.lock().await;
+    // Decoded whole before anything applies, as upstream's `map[int]bool`:
+    // a bad key fails the request with nothing changed; an index outside
+    // the list (negative included) is skipped. `null` decodes to the nil
+    // map upstream — an empty patch, 204; `{"0":null}` is a `false`.
+    let Ok(body) = serde_json::from_slice::<Option<HashMap<i64, Option<bool>>>>(&body) else {
+        return msg_err(StatusCode::BAD_REQUEST, "Body invalid");
+    };
+    state
+        .tunnel
+        .set_rules_disabled(body.unwrap_or_default().into_iter().filter_map(
+            |(index, disabled)| Some((usize::try_from(index).ok()?, disabled.unwrap_or(false))),
+        ));
+    StatusCode::NO_CONTENT.into_response()
 }
 
 #[derive(Serialize)]
@@ -762,12 +830,14 @@ struct ConfigResponse {
     mode: String,
     #[serde(rename = "log-level")]
     log_level: String,
-    #[serde(rename = "mixed-port", skip_serializing_if = "Option::is_none")]
-    mixed_port: Option<u16>,
-    #[serde(rename = "socks-port", skip_serializing_if = "Option::is_none")]
-    socks_port: Option<u16>,
-    #[serde(rename = "port", skip_serializing_if = "Option::is_none")]
-    http_port: Option<u16>,
+    // Ports are always numbers, `0` when unset, as in mihomo: dashboards
+    // bind their port inputs to these keys.
+    #[serde(rename = "mixed-port")]
+    mixed_port: u16,
+    #[serde(rename = "socks-port")]
+    socks_port: u16,
+    #[serde(rename = "port")]
+    http_port: u16,
     #[serde(rename = "redir-port")]
     redir_port: u16,
     #[serde(rename = "tproxy-port")]
@@ -785,6 +855,10 @@ struct ConfigResponse {
     ipv6: bool,
     #[serde(rename = "unified-delay")]
     unified_delay: bool,
+    /// `sniffer.enable`, under mihomo's name for it.
+    sniffing: bool,
+    #[serde(rename = "skip-auth-prefixes")]
+    skip_auth_prefixes: Vec<String>,
     /// Whether the TUN listener is currently running (issue #326).
     /// Mirrors `tun.enable` from the raw config and reflects actual
     /// runtime state so nyanpasu can correctly render its toggle.
@@ -802,9 +876,9 @@ async fn get_configs(State(state): State<Arc<AppState>>) -> Json<ConfigResponse>
     Json(ConfigResponse {
         mode: state.tunnel.mode().to_string(),
         log_level: raw.log_level.clone().unwrap_or_else(|| "info".to_string()),
-        mixed_port: raw.mixed_port,
-        socks_port: raw.socks_port,
-        http_port: raw.port,
+        mixed_port: raw.mixed_port.unwrap_or(0),
+        socks_port: raw.socks_port.unwrap_or(0),
+        http_port: raw.port.unwrap_or(0),
         redir_port: 0,
         tproxy_port: raw.tproxy_port.unwrap_or(0),
         external_controller: raw.external_controller.clone(),
@@ -816,6 +890,18 @@ async fn get_configs(State(state): State<Arc<AppState>>) -> Json<ConfigResponse>
         ipv6: meow_config::effective_ipv6(raw.ipv6),
         // The live setting, as mihomo reports `UnifiedDelay.Load()`.
         unified_delay: meow_proxy::health::unified_delay(),
+        // The field echoes the committed config's intent: `sniffer.enable`
+        // when the block is present, else the deprecated `tproxy-sni`
+        // alias that synthesises an enabled sniffer. Read directly from
+        // `raw` — re-running `sniffer_config_from_raw` per poll would
+        // re-emit that parser's deprecation/force-dns-mapping warns on
+        // every dashboard GET.
+        sniffing: raw
+            .sniffer
+            .as_ref()
+            .and_then(|s| s.enable)
+            .unwrap_or_else(|| raw.tproxy_sni.unwrap_or(false)),
+        skip_auth_prefixes: raw.skip_auth_prefixes.clone().unwrap_or_default(),
         tun_enable: tun_running,
         tun: TunFields::reported(raw.tun.as_ref(), tun_running),
     })
@@ -2676,6 +2762,19 @@ async fn replace_rules(
     let _mutation = CONFIG_MUTATION.lock().await;
     let snapshot = {
         let mut raw = state.raw_config.read().clone();
+        // Same contract as `append_rule`: a line the reload would warn
+        // and skip fails here — first bad line wins, all-or-nothing.
+        for line in &body.rules {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                if let Err(e) = dry_parse_rule_line(&state, &raw, trimmed) {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        format!("rule '{trimmed}' failed to parse: {e}"),
+                    ));
+                }
+            }
+        }
         raw.rules = Some(body.rules);
         meow_config::subscription::reconcile_contribution_claims(&mut raw);
         raw
@@ -2698,6 +2797,17 @@ async fn update_rule_at_index(
     let _mutation = CONFIG_MUTATION.lock().await;
     let snapshot = {
         let mut raw = state.raw_config.read().clone();
+        // Same contract as `append_rule`: a line the reload would warn
+        // and skip fails here instead of answering 204 to a no-op.
+        let trimmed = body.rule.trim();
+        if !trimmed.is_empty() && !trimmed.starts_with('#') {
+            if let Err(e) = dry_parse_rule_line(&state, &raw, trimmed) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("rule '{trimmed}' failed to parse: {e}"),
+                ));
+            }
+        }
         let rules = raw.rules.get_or_insert_with(Vec::new);
         if body.index >= rules.len() {
             return Err((StatusCode::BAD_REQUEST, "index out of range".into()));
@@ -2709,6 +2819,68 @@ async fn update_rule_at_index(
     let change = config_change(format!("Changed rule {}", body.index)).field("index", body.index);
     commit_raw_candidate(&state, snapshot, change).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct AppendRuleRequest {
+    rule: String,
+}
+
+/// `POST /rules/append` (meow): add one line after the config's rules.
+async fn append_rule(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<AppendRuleRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let _mutation = CONFIG_MUTATION.lock().await;
+    let snapshot = {
+        let mut raw = state.raw_config.read().clone();
+        // `parse_rules_full` warns and skips a line that fails — an append
+        // would answer 204 while the rule never lands (a logic rule's
+        // display payload, e.g. `((T,p) && (T,p))`, is one such line).
+        // Dry-parse first so the caller hears about it; comments and blank
+        // lines parse as nothing by config-file convention and pass.
+        let trimmed = body.rule.trim();
+        if !trimmed.is_empty() && !trimmed.starts_with('#') {
+            if let Err(e) = dry_parse_rule_line(&state, &raw, trimmed) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("rule '{trimmed}' failed to parse: {e}"),
+                ));
+            }
+        }
+        raw.rules.get_or_insert_with(Vec::new).push(body.rule);
+        meow_config::subscription::reconcile_contribution_claims(&mut raw);
+        raw
+    };
+    commit_raw_candidate(&state, snapshot, config_change("Appended a rule".into())).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Dry-run one `rules:` line through [`meow_config::rule_parser`]'s
+/// per-line path against the inputs the commit's rebuild will use — the
+/// live rule-provider sets and the config's sub-rule blocks. The geo
+/// context carries empty indexes, the same stand-in the offline `-t`
+/// validation uses: a GEOIP/IP-ASN line still parses, and were the real
+/// MMDB unreadable the rebuild's own context load would fail the commit
+/// anyway.
+fn dry_parse_rule_line(state: &AppState, raw: &RawConfig, line: &str) -> Result<(), String> {
+    let providers = meow_config::rule_provider::live_ruleset_map(&state.rule_providers.read());
+    let ctx = meow_rules::ParserContext {
+        geoip: Some(Arc::new(meow_rules::country_index::CountryIndex::default())),
+        asn: Some(Arc::new(meow_rules::asn_index::AsnIndex::default())),
+        geosite: None,
+    };
+    let sub_rules = match raw.sub_rules.as_ref() {
+        // A committed `sub-rules:` section always parses — on defect the
+        // rebuild errors louder than this check, so an empty map stands in.
+        Some(map) if !map.is_empty() => {
+            meow_config::sub_rules_parser::parse_sub_rules(map, &providers, &ctx)
+                .unwrap_or_default()
+        }
+        _ => Default::default(),
+    };
+    meow_config::rule_parser::parse_one_rule_or_subrule(line, &providers, &ctx, &sub_rules)
+        .map(|_| ())
 }
 
 async fn delete_rule(
@@ -2779,7 +2951,7 @@ struct DelayResp {
 }
 
 /// `{"message": "..."}` body matching upstream's error render.
-fn msg_err(status: StatusCode, message: &str) -> Response {
+pub(crate) fn msg_err(status: StatusCode, message: &str) -> Response {
     (status, Json(serde_json::json!({ "message": message }))).into_response()
 }
 
@@ -5467,6 +5639,7 @@ mod outbound_flush_tests {
             external_ui: None,
             traffic_feed: TrafficFeed::default(),
             dns_server: Default::default(),
+            ui_storage: Default::default(),
         })
     }
 
@@ -5611,6 +5784,7 @@ mod global_route_binding_tests {
             external_ui: None,
             traffic_feed: TrafficFeed::default(),
             dns_server: Default::default(),
+            ui_storage: Default::default(),
         })
     }
 

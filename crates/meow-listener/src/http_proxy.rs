@@ -325,6 +325,11 @@ async fn handle_http_inner(
                         // pipelined request back, and marks the final response close.
                         remote.write_all(&rewritten).await?;
                         let up = Arc::clone(_guard.counters());
+                        // The request head is upload too: written here, not
+                        // by the relay below (mihomo counts it as well).
+                        inner
+                            .stats
+                            .record_upload(&up, rewritten.len() as meow_common::atomic::Int);
                         let dn = Arc::clone(_guard.counters());
                         // Relay scratch buffers live on this plain-HTTP path's stack —
                         // zero per-relay heap allocation (ADR-0008). Declared here

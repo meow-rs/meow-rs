@@ -118,7 +118,7 @@ async fn a_later_rule_still_matches_after_a_skipped_dead_target() {
         .await
         .expect("the FINAL rule resolves");
 
-    assert_eq!(rule, "MATCH");
+    assert_eq!(rule, "Match");
     assert_eq!(
         proxy.adapter_type(),
         AdapterType::Reject,
@@ -266,7 +266,7 @@ async fn udp_flow_skips_a_target_without_udp_support() {
 
     // TCP flow still lands on the http adapter; UDP flow skips to REJECT —
     // exactly upstream's `!adapter.SupportUDP()` continue.
-    assert_eq!(rule, "MATCH");
+    assert_eq!(rule, "Match");
     assert_eq!(proxy.adapter_type(), AdapterType::Reject);
 
     let ResolvedTarget {

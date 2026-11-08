@@ -8,6 +8,7 @@ pub mod health_check;
 pub mod match_engine;
 pub mod relay;
 pub mod rule_ir;
+pub mod rule_stats;
 mod sniff;
 pub mod statistics;
 pub mod tcp;

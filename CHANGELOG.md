@@ -10,6 +10,12 @@ the canonical, in-repo source a release is cut from.
 
 ### Added
 
+- **mihomo dashboard parity** (#882): `GET /rules` reports mihomo's type
+  names and the `extra` object (`disabled`, `hitCount`, `hitAt`);
+  `PATCH /rules/disable` switches rules off, the switch following its rule
+  across reloads; `GET/PUT/DELETE /storage/{key}` keeps dashboard settings
+  (zashboard's sync); `POST /rules/append`. Rule lines in mihomo's API
+  spelling (`DomainSuffix,a.com,DIRECT`) parse through `/rules`.
 - **`support-x25519mlkem768: true`** — REALITY now offers an
   X25519MLKEM768 key share (its own X25519 key) ahead of X25519, which
   Xray REALITY servers >= 26.9.8 require; the REALITY ClientVer is a

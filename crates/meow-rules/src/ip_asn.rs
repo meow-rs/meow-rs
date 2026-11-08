@@ -77,6 +77,13 @@ impl Rule for IpAsnRule {
         &self.raw
     }
 
+    /// The ASN's coalesced IPv4+IPv6 range count — mihomo's
+    /// `GetRecodeSize` for `GET /rules`'s `size`.
+    fn size(&self) -> i64 {
+        let (v4, v6) = self.ranges.interval_counts();
+        (v4 + v6) as i64
+    }
+
     fn should_resolve_ip(&self) -> bool {
         // Src-axis rules match `src_ip`, which every inbound already
         // carries — demanding a dst_ip resolution the match never reads

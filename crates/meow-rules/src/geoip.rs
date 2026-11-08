@@ -54,6 +54,13 @@ impl Rule for GeoIpRule {
         &self.country
     }
 
+    /// The country's coalesced IPv4+IPv6 range count — mihomo's
+    /// `GetRecodeSize` for `GET /rules`'s `size`.
+    fn size(&self) -> i64 {
+        let (v4, v6) = self.ranges.interval_counts();
+        (v4 + v6) as i64
+    }
+
     fn should_resolve_ip(&self) -> bool {
         !self.no_resolve
     }

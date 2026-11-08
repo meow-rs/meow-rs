@@ -99,11 +99,28 @@ hysteria2, found once a member reaches its server. TCP only.
 
 | Method | Path | Description |
 | --- | --- | --- |
-| `GET` | `/rules` | List active rules (`type`, `payload`, `proxy`) |
+| `GET` | `/rules` | List active rules (`type`, `payload`, `proxy`, `size`, and `extra`: `disabled`, `hitCount`, `hitAt` — hits count the applied rule only, misses stay `0`/epoch) |
 | `POST` | `/rules` | Replace all rules — body `{ "rules": ["...", ...] }` → 204 |
 | `PUT` | `/rules` | Update one rule — body `{ "index": n, "rule": "..." }` → 204 |
 | `DELETE` | `/rules/{index}` | Delete the rule at an index → 204 |
 | `POST` | `/rules/reorder` | Move a rule — body `{ "from": i, "to": j }` → 204 |
+| `POST` | `/rules/append` | Append one rule line — body `{ "rule": "..." }` → 204; 400 naming the line when it fails to parse |
+| `PATCH` | `/rules/disable` | Toggle rules — body `{ "<index>": true|false }` (`null` body or `null` values allowed) → 204 |
+
+## Storage (dashboard KV)
+
+mihomo's `/storage/{key}` JSON store, persisted in `ui-storage.json` beside
+the selector cache.
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `GET` | `/storage/{key}` | Stored JSON value, or `null` when unset |
+| `PUT` | `/storage/{key}` | Store the body — must be valid JSON ≤ 1 MB (400 invalid, 413 too large) → 204 |
+| `DELETE` | `/storage/{key}` | Remove the key → 204 |
+
+Keys longer than 64 bytes are silently accepted but never stored (PUT →
+204, GET → `null`); the store holds at most 16384 keys / ~1 MiB total,
+evicting the least recently written first.
 
 ## Connections
 
@@ -117,7 +134,7 @@ hysteria2, found once a member reaches its server. TCP only.
 
 | Method | Path | Description |
 | --- | --- | --- |
-| `GET` | `/configs` | Current `mode`, `log-level`, ports, controller, `tun` |
+| `GET` | `/configs` | Current `mode`, `log-level`, ports, controller, `tun`, `sniffing` (resolved — the deprecated `tproxy-sni` alias counts as enabled), `skip-auth-prefixes` |
 | `PATCH` | `/configs` | Update `mode`, `log-level` and/or `tun` → 204 (below) |
 | `PUT` | `/configs` | Hot-reload the whole config (below) |
 | `POST` | `/api/config/save` | Persist the current config to disk (400 when the daemon was started via `--config-string` — there is no backing file) |
