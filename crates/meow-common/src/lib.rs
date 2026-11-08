@@ -14,8 +14,9 @@
 pub const MAX_DURATION_SECS: u64 = 10 * 365 * 24 * 60 * 60;
 
 /// RFC 3339 rendering of the Unix epoch — the "never happened" timestamp
-/// the API reports for unset times, the way mihomo serializes its zero
-/// `time.Time` (e.g. a never-hit rule's `hitAt`).
+/// the API reports for unset times (e.g. a never-hit rule's `hitAt`).
+/// Deliberately the Unix epoch, not mihomo's `"0001-01-01T00:00:00Z"`
+/// (Go's zero `time.Time`) — see the compat doc.
 pub const EPOCH_RFC3339: &str = "1970-01-01T00:00:00Z";
 
 pub mod adapter;

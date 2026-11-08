@@ -6,8 +6,11 @@
 //! stores a body that must be valid JSON of at most 1 MB, DELETE removes it.
 //! A key past 64 bytes is silently accepted but never stored — upstream's
 //! quirk: PUT still answers 204 and GET still returns `null`.
-//! The store keeps at most 16384 keys and about 1 MiB of them in all,
-//! evicting the least recently WRITTEN first — upstream's limits.
+//! The store keeps at most 16384 keys and about 1 MiB of *values* in all,
+//! evicting the least recently WRITTEN first — upstream's limits, with one
+//! divergence: write order is only tracked in memory, so a restart
+//! reshuffles eviction order arbitrarily (upstream's per-entry `Time`
+//! survives in bbolt).
 //!
 //! Persisted as one JSON file in the home directory (`ui-storage.json`, a
 //! map of key → JSON text) next to `selector-cache.json`. Writes coalesce:
@@ -34,8 +37,8 @@ const MAX_VALUE: usize = 1 << 20;
 const MAX_KEY: usize = 64;
 /// mihomo's `maxStorageEntries`.
 const MAX_ENTRIES: usize = 16384;
-/// The ~1 MiB aggregate budget (`key.len() + value.len()` over the map)
-/// upstream evicts under alongside the entry cap.
+/// The ~1 MiB aggregate budget upstream evicts under alongside the entry
+/// cap — counted on value bytes only, as upstream's `usedSize` does.
 const MAX_TOTAL_BYTES: usize = 1 << 20;
 const FILE_NAME: &str = "ui-storage.json";
 
@@ -56,8 +59,8 @@ pub struct UiStorage {
 #[derive(Default)]
 struct Store {
     map: HashMap<String, Entry>,
-    /// `key.len() + value.len()` over the whole map — what the
-    /// [`MAX_TOTAL_BYTES`] budget counts.
+    /// `value.len()` over the whole map — what the [`MAX_TOTAL_BYTES`]
+    /// budget counts (upstream's `usedSize` ignores key bytes).
     total_bytes: usize,
     /// Last-write sequence: eviction order, oldest write first.
     seq: u64,
@@ -88,7 +91,7 @@ impl UiStorage {
         let mut store = Store::default();
         for (key, value) in map {
             store.seq += 1;
-            store.total_bytes += key.len() + value.len();
+            store.total_bytes += value.len();
             store.map.insert(
                 key,
                 Entry {
@@ -119,11 +122,21 @@ impl UiStorage {
         }
         let mut store = self.store.lock();
         match value {
-            Some(v) if store.map.get(key).is_some_and(|e| e.value == v) => false,
+            Some(v) if store.map.get(key).is_some_and(|e| e.value == v) => {
+                // No content change, but upstream stamps every write —
+                // refreshing the seq keeps a just-rewritten key from
+                // evicting as "oldest". Nothing to persist either way.
+                store.seq += 1;
+                let seq = store.seq;
+                if let Some(e) = store.map.get_mut(key) {
+                    e.seq = seq;
+                }
+                false
+            }
             Some(v) => {
                 let exists = store.map.contains_key(key);
-                let old_len = store.map.get(key).map_or(0, |e| key.len() + e.value.len());
-                let new_len = key.len() + v.len();
+                let old_len = store.map.get(key).map_or(0, |e| e.value.len());
+                let new_len = v.len();
                 // A new key must fit the entry cap; every write must fit
                 // the byte budget — evict oldest-written entries (never
                 // the key being written) until both hold.
@@ -142,20 +155,20 @@ impl UiStorage {
                         break;
                     };
                     if let Some(evicted) = store.map.remove(&oldest) {
-                        store.total_bytes -= oldest.len() + evicted.value.len();
+                        store.total_bytes -= evicted.value.len();
                     }
                 }
                 store.seq += 1;
                 let seq = store.seq;
                 if let Some(old) = store.map.insert(key.to_string(), Entry { value: v, seq }) {
-                    store.total_bytes -= key.len() + old.value.len();
+                    store.total_bytes -= old.value.len();
                 }
                 store.total_bytes += new_len;
                 true
             }
             None => match store.map.remove(key) {
                 Some(old) => {
-                    store.total_bytes -= key.len() + old.value.len();
+                    store.total_bytes -= old.value.len();
                     true
                 }
                 None => false,
@@ -193,7 +206,17 @@ impl UiStorage {
             return;
         }
         let store = Arc::clone(self);
-        tokio::task::spawn_blocking(move || store.persist_run());
+        tokio::task::spawn_blocking(move || {
+            // A panicking pass must hand the flag back or the store
+            // wedges: every later update would see "in flight" forever.
+            // The normal exit paths handle the flag themselves — this is
+            // only the panic path.
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| store.persist_run()))
+                .is_err()
+            {
+                store.persist_in_flight.store(false, Ordering::Release);
+            }
+        });
     }
 
     /// The detached drain: write while dirty, then hand the flag back.
@@ -219,6 +242,17 @@ impl UiStorage {
             {
                 return;
             }
+        }
+    }
+}
+
+impl Drop for UiStorage {
+    /// The drain is best-effort while requests flow; at teardown the last
+    /// holder (the detached pass keeps an `Arc`) flushes whatever the map
+    /// is still owed synchronously.
+    fn drop(&mut self) {
+        if self.dirty.load(Ordering::Relaxed) {
+            self.write_now();
         }
     }
 }
@@ -266,11 +300,9 @@ pub(crate) async fn set_storage(
     UrlPath(key): UrlPath<String>,
     body: Bytes,
 ) -> Response {
-    // Upstream's order: key, JSON validity, then size. An overlong key is
-    // a silent no-op — accepted, nothing stored.
-    if key.len() > MAX_KEY {
-        return StatusCode::NO_CONTENT.into_response();
-    }
+    // Upstream's order: JSON validity (400), then size (413), then the
+    // overlong key — upstream drops those inside `SetStorage` after both
+    // checks, so an overlong key still sees the 400/413 a short key would.
     if serde_json::from_slice::<serde::de::IgnoredAny>(&body).is_err() {
         return msg_err(StatusCode::BAD_REQUEST, "Body invalid");
     }

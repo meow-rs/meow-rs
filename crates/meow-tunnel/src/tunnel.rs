@@ -1232,18 +1232,21 @@ impl Tunnel {
                 ..route.inherit()
             };
             self.publish_dialer_registry(&new_route);
+            // Published inside the write section like `install_routing`
+            // and `set_rules_disabled`: a reader between install and
+            // store would otherwise see the new plan with stale hints.
+            self.inner
+                .needs_ip_resolution
+                .store(needs_ip, Ordering::Relaxed);
+            self.inner
+                .needs_process_lookup
+                .store(needs_proc, Ordering::Relaxed);
             std::mem::replace(&mut *route, Arc::new(new_route))
         };
         // The superseded table's destructor cascade (rules, adapters,
         // possibly the last registry cell) runs outside the lock so
         // `route()` readers are never stalled by it.
         drop(old);
-        self.inner
-            .needs_ip_resolution
-            .store(needs_ip, Ordering::Relaxed);
-        self.inner
-            .needs_process_lookup
-            .store(needs_proc, Ordering::Relaxed);
         info!(
             "Rules updated (needs_ip_resolution={}, needs_process_lookup={})",
             needs_ip, needs_proc

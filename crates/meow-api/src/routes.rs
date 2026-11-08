@@ -890,11 +890,17 @@ async fn get_configs(State(state): State<Arc<AppState>>) -> Json<ConfigResponse>
         ipv6: meow_config::effective_ipv6(raw.ipv6),
         // The live setting, as mihomo reports `UnifiedDelay.Load()`.
         unified_delay: meow_proxy::health::unified_delay(),
-        // The resolved value, not just the `sniffer:` block: the deprecated
-        // `tproxy-sni` alias synthesises an enabled sniffer when the block
-        // is absent — `sniffer_config_from_raw` is the same resolution the
-        // config build uses (and `sniffer:` wins when both are present).
-        sniffing: meow_config::sniffer_config_from_raw(&raw).is_ok_and(|c| c.enable),
+        // The field echoes the committed config's intent: `sniffer.enable`
+        // when the block is present, else the deprecated `tproxy-sni`
+        // alias that synthesises an enabled sniffer. Read directly from
+        // `raw` — re-running `sniffer_config_from_raw` per poll would
+        // re-emit that parser's deprecation/force-dns-mapping warns on
+        // every dashboard GET.
+        sniffing: raw
+            .sniffer
+            .as_ref()
+            .and_then(|s| s.enable)
+            .unwrap_or_else(|| raw.tproxy_sni.unwrap_or(false)),
         skip_auth_prefixes: raw.skip_auth_prefixes.clone().unwrap_or_default(),
         tun_enable: tun_running,
         tun: TunFields::reported(raw.tun.as_ref(), tun_running),
@@ -2756,6 +2762,19 @@ async fn replace_rules(
     let _mutation = CONFIG_MUTATION.lock().await;
     let snapshot = {
         let mut raw = state.raw_config.read().clone();
+        // Same contract as `append_rule`: a line the reload would warn
+        // and skip fails here — first bad line wins, all-or-nothing.
+        for line in &body.rules {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                if let Err(e) = dry_parse_rule_line(&state, &raw, trimmed) {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        format!("rule '{trimmed}' failed to parse: {e}"),
+                    ));
+                }
+            }
+        }
         raw.rules = Some(body.rules);
         meow_config::subscription::reconcile_contribution_claims(&mut raw);
         raw
@@ -2778,6 +2797,17 @@ async fn update_rule_at_index(
     let _mutation = CONFIG_MUTATION.lock().await;
     let snapshot = {
         let mut raw = state.raw_config.read().clone();
+        // Same contract as `append_rule`: a line the reload would warn
+        // and skip fails here instead of answering 204 to a no-op.
+        let trimmed = body.rule.trim();
+        if !trimmed.is_empty() && !trimmed.starts_with('#') {
+            if let Err(e) = dry_parse_rule_line(&state, &raw, trimmed) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("rule '{trimmed}' failed to parse: {e}"),
+                ));
+            }
+        }
         let rules = raw.rules.get_or_insert_with(Vec::new);
         if body.index >= rules.len() {
             return Err((StatusCode::BAD_REQUEST, "index out of range".into()));
