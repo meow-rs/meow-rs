@@ -258,10 +258,12 @@ notes:
   `CAP_NET_ADMIN` does not imply. Reply sockets also do **not** carry
   `routing-mark`/SO_MARK — mark-based policy rules must not steer reply
   packets (whose source is the forged destination) toward the local table.
-- A `0.0.0.0`-bound listener conservatively drops any flow whose recovered
-  `orig_dst` shares the listener port (self-reinjection guard) — remote UDP
-  services on that same port number are unreachable through it. Bind a
-  specific address, or pick a listener port that doesn't collide.
+- A `0.0.0.0`-bound listener drops a flow whose recovered `orig_dst` aims at
+  the listener's port on one of the host's own addresses (the self-reinjection
+  guard, checked against a `getifaddrs` snapshot taken when the listener
+  starts) — remote services that merely share the port number pass through.
+  If the interface table cannot be enumerated the listener falls back to the
+  conservative rule (any same-port destination is self) and warns once.
 - The sniffer is TCP-only: UDP flows carry no recovered SNI, so under
   redir-host they route by IP. Point LAN clients at fake-ip (or the snoop
   table) if UDP domains matter.

@@ -893,16 +893,16 @@ async fn get_configs(State(state): State<Arc<AppState>>) -> Json<ConfigResponse>
         // The live setting, as mihomo reports `UnifiedDelay.Load()`.
         unified_delay: meow_proxy::health::unified_delay(),
         // The field echoes the committed config's intent: `sniffer.enable`
-        // when the block is present, else the deprecated `tproxy-sni`
-        // alias that synthesises an enabled sniffer. Read directly from
-        // `raw` — re-running `sniffer_config_from_raw` per poll would
-        // re-emit that parser's deprecation/force-dns-mapping warns on
-        // every dashboard GET.
-        sniffing: raw
-            .sniffer
-            .as_ref()
-            .and_then(|s| s.enable)
-            .unwrap_or_else(|| raw.tproxy_sni.unwrap_or(false)),
+        // when the block is present — an explicit block wins over the
+        // deprecated `tproxy-sni` alias even without an `enable:` key
+        // (absent `enable` means off, matching the listener synthesis).
+        // Read directly from `raw` — re-running `sniffer_config_from_raw`
+        // per poll would re-emit that parser's deprecation/force-dns-mapping
+        // warns on every dashboard GET.
+        sniffing: raw.sniffer.as_ref().map_or_else(
+            || raw.tproxy_sni.unwrap_or(false),
+            |s| s.enable.unwrap_or(false),
+        ),
         skip_auth_prefixes: raw.skip_auth_prefixes.clone().unwrap_or_default(),
         // The live mark (what outbound sockets carry), not the document's.
         routing_mark: meow_common::routing_mark(),

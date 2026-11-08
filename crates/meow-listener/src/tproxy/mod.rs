@@ -632,6 +632,11 @@ pub fn bind_tcp(addr: SocketAddr, transparent: bool) -> std::io::Result<TcpListe
 /// self-target check: the `getifaddrs` table on unix; `{bound addr,
 /// loopbacks}` elsewhere. `None` means enumeration failed — the caller
 /// then keeps the conservative same-port rule.
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the Option is load-bearing on unix (enumeration can fail); \
+              the non-unix arm is infallible but must match the signature"
+)]
 fn local_addr_snapshot(bound: SocketAddr) -> Option<HashSet<IpAddr>> {
     #[cfg(unix)]
     {
@@ -695,6 +700,12 @@ fn local_interface_addrs() -> Option<HashSet<IpAddr>> {
             cur = ifa.ifa_next;
         }
         libc::freeifaddrs(ifaddrs);
+    }
+    // An empty table would silently weaken the wildcard self check to
+    // "nothing is self" — treat it as an enumeration failure instead
+    // (loopback always exists, so this is unreachable in practice).
+    if addrs.is_empty() {
+        return None;
     }
     Some(addrs)
 }

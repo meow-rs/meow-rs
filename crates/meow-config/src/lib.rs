@@ -4369,6 +4369,17 @@ fn parse_listener_spec(
 ) -> Result<ListenerSpec, anyhow::Error> {
     // The resolved `sni` for `TProxy`-shaped arms — deprecated `tproxy-sni`,
     // dead once a `sniffer:` section exists.
+    let tproxy_shaped = matches!(
+        raw_l.listener_type.to_lowercase().as_str(),
+        "redir" | "tproxy"
+    );
+    if tproxy_shaped && sniffer_declared && raw_l.tproxy_sni.is_some() {
+        warn!(
+            "listeners[{}]: `tproxy-sni` is ignored — the `sniffer:` block \
+             takes precedence (deprecated alias)",
+            raw_l.name
+        );
+    }
     let sni = raw_l.tproxy_sni.unwrap_or(global_tproxy_sni) && !sniffer_declared;
     match raw_l.listener_type.to_lowercase().as_str() {
         "mixed" => Ok(ListenerSpec::Mixed),
