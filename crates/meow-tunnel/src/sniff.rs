@@ -43,6 +43,11 @@ const PEEK_POLL: Duration = Duration::from_millis(5);
 const STALL_LIMIT: u8 = 2;
 #[cfg(not(unix))]
 const STALL_LIMIT: u8 = (SNIFF_WINDOW.as_millis() / 2 / PEEK_POLL.as_millis()) as u8;
+// The budget above is const arithmetic: a `PEEK_POLL` of zero divides
+// by zero, and a window/cadence pair whose quotient passes `u8` would
+// silently truncate it — pin both ends at compile time.
+#[cfg(not(unix))]
+const _: () = assert!(PEEK_POLL.as_millis() > 0 && STALL_LIMIT > 0);
 
 /// Recover a name for a flow whose destination the tunnel cannot map back
 /// (a stale address in our fake-IP range, or another resolver's fake IP in
@@ -426,6 +431,53 @@ mod tests {
             "closed mid-record must not wait out the whole window"
         );
         assert_eq!(md.sniff_host, "");
+    }
+
+    /// Poll-arm pin for the same half-close: `SockRef::peek` keeps
+    /// reporting the queued head after the peer is gone, so each
+    /// `PEEK_POLL` tick counts a stall and the half-window stall
+    /// budget ends the wait — never the deadline. The partial record
+    /// was only peeked and stays queued for the relay.
+    #[cfg(not(unix))]
+    #[tokio::test]
+    async fn peek_poll_ends_early_when_the_peer_closes_mid_record() {
+        let tunnel = mobile_tunnel();
+        let (mut client, mut server) = stream_pair().await;
+        let hello = client_hello("gone.example.com");
+        client.write_all(&hello[..10]).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let start = tokio::time::Instant::now();
+        let mut md = tcp_to(SURGE_FAKE_IP, 443);
+        sniff_unnamed_peek(tunnel.inner(), &server, &mut md).await;
+        assert!(
+            start.elapsed() < SNIFF_WINDOW,
+            "the stall budget must beat the deadline"
+        );
+        assert_eq!(md.sniff_host, "");
+        assert_eq!(relayed(Vec::new(), &mut server, 10).await, &hello[..10]);
+    }
+
+    /// Poll-arm pin: the first `SockRef::peek` of a client-first flow
+    /// is a bare `WouldBlock` — nothing has arrived. An `n == 0` pass
+    /// must keep polling rather than read an empty buffer as a
+    /// completed gather (the incomplete-record check is gated on
+    /// `n > 0` for it): the ClientHello lands a few ticks later and
+    /// still names the flow.
+    #[cfg(not(unix))]
+    #[tokio::test]
+    async fn peek_poll_waits_through_a_wouldblock_first_tick() {
+        let tunnel = mobile_tunnel();
+        let (mut client, server) = stream_pair().await;
+        let hello = client_hello("late.example.com");
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            client.write_all(&hello).await.unwrap();
+        });
+
+        let mut md = tcp_to(SURGE_FAKE_IP, 443);
+        sniff_unnamed_peek(tunnel.inner(), &server, &mut md).await;
+        assert_eq!(md.sniff_host, "late.example.com");
     }
 
     #[tokio::test]
