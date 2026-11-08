@@ -188,6 +188,13 @@ pub enum ListenerSpec {
         udp: bool,
         #[serde(default = "default_udp_timeout_secs")]
         udp_timeout: u64,
+        /// TCP by real TPROXY (local address = original destination)
+        /// instead of REDIRECT; requires `firewall: false`. Set by a
+        /// `listeners:` `type: tproxy` entry's `transparent:` key — never
+        /// by the `tproxy-port`/`redir-port` shorthands (both are
+        /// REDIRECT-shaped: managed vs. deployer-owned rules).
+        #[serde(default)]
+        transparent: bool,
     },
     /// Shadowsocks encrypted-server inbound. The listener terminates SS
     /// encryption (TCP stream cipher / AEAD, UDP relay), reads the SOCKS
@@ -2402,9 +2409,6 @@ fn build_proxy_layer(
         } else {
             meow_proxy::DirectAdapter::new()
         };
-        if let Some(mark) = raw.routing_mark {
-            direct = direct.with_routing_mark(mark);
-        }
         if let Some(slot) = resolver.cloned() {
             direct = direct.with_resolver_slot(slot);
         }
@@ -4352,14 +4356,68 @@ pub(crate) fn resolve_listener_bind(
 /// the caller (which has the listener name in scope). `Shadowsocks` returns
 /// a placeholder spec; `build_named_listeners`
 /// completes it via `build_ss_listener_spec`.
+///
+/// `sniffer_declared` says the raw config carries an explicit `sniffer:`
+/// block (even `enable: false`) — the deliberate knob then defeats the
+/// deprecated `tproxy-sni` synthesis on every arm that carries `sni`, or
+/// `tproxy-sni: true` + `sniffer.enable: false` would still sniff (the
+/// listener's synthesized runtime survives `with_sniffer`'s off state).
 fn parse_listener_spec(
     raw_l: &raw::RawListener,
     global_tproxy_sni: bool,
+    sniffer_declared: bool,
 ) -> Result<ListenerSpec, anyhow::Error> {
+    // The resolved `sni` for `TProxy`-shaped arms — deprecated `tproxy-sni`,
+    // dead once a `sniffer:` section exists.
+    let tproxy_shaped = matches!(
+        raw_l.listener_type.to_lowercase().as_str(),
+        "redir" | "tproxy"
+    );
+    if tproxy_shaped && sniffer_declared && raw_l.tproxy_sni.is_some() {
+        warn!(
+            "listeners[{}]: `tproxy-sni` is ignored — the `sniffer:` block \
+             takes precedence (deprecated alias)",
+            raw_l.name
+        );
+    }
+    let sni = raw_l.tproxy_sni.unwrap_or(global_tproxy_sni) && !sniffer_declared;
     match raw_l.listener_type.to_lowercase().as_str() {
         "mixed" => Ok(ListenerSpec::Mixed),
         "http" => Ok(ListenerSpec::Http),
         "socks5" => Ok(ListenerSpec::Socks5),
+        // mihomo's REDIRECT inbound: meow's tproxy TCP path without managed
+        // rules — the deployer's REDIRECT rules steer traffic here.
+        "redir" => {
+            for (key, set) in [
+                ("firewall", raw_l.firewall.is_some()),
+                ("udp", raw_l.udp.is_some()),
+                ("udp-timeout", raw_l.udp_timeout.is_some()),
+                ("transparent", raw_l.transparent.is_some()),
+                ("cipher", raw_l.cipher.is_some()),
+                ("password", raw_l.password.is_some()),
+                ("simple-obfs", raw_l.simple_obfs.is_some()),
+                ("shadow-tls", raw_l.shadow_tls.is_some()),
+                ("res-tls", raw_l.res_tls.is_some()),
+                ("jls-config", raw_l.jls_config.is_some()),
+                ("kcp-tun", raw_l.kcp_tun.is_some()),
+                ("mux-option", raw_l.mux_option.is_some()),
+            ] {
+                if set {
+                    warn!(
+                        "listeners[{}]: `{key}` is ignored on `type: redir` \
+                         (REDIRECT TCP, rules owned by the deployer)",
+                        raw_l.name
+                    );
+                }
+            }
+            Ok(ListenerSpec::TProxy {
+                sni,
+                firewall: false,
+                udp: false,
+                udp_timeout: default_udp_timeout_secs(),
+                transparent: false,
+            })
+        }
         "tproxy" => {
             // #564: `udp` is opt-in and IPv4-only in this release, and the
             // managed firewall only produces host TCP OUTPUT REDIRECT rules —
@@ -4367,6 +4425,30 @@ fn parse_listener_spec(
             // combination is rejected rather than silently TCP-only.
             let udp = raw_l.udp.unwrap_or(false);
             let firewall = raw_l.firewall.unwrap_or_else(default_tproxy_firewall);
+            if raw_l.transparent.is_none() {
+                warn!(
+                    "listeners[{}]: mihomo's `type: tproxy` is real TPROXY — meow \
+                     defaults to REDIRECT for backward compatibility; set \
+                     `transparent: true` for upstream semantics (requires \
+                     `firewall: false`)",
+                    raw_l.name
+                );
+            }
+            // mihomo's `type: tproxy` is real TPROXY: `transparent: true`.
+            let transparent = raw_l.transparent.unwrap_or(false);
+            if transparent && firewall {
+                anyhow::bail!(
+                    "listeners[{}]: `transparent: true` (TCP by TPROXY) requires \
+                     `firewall: false` — meow's managed rules are REDIRECT",
+                    raw_l.name
+                );
+            }
+            if transparent && !cfg!(target_os = "linux") {
+                anyhow::bail!(
+                    "listeners[{}]: `transparent: true` (TPROXY) is Linux-only",
+                    raw_l.name
+                );
+            }
             if udp && firewall {
                 anyhow::bail!(
                     "listeners[{}]: `udp: true` requires `firewall: false` — meow does \
@@ -4393,10 +4475,11 @@ fn parse_listener_spec(
                 None => default_udp_timeout_secs(),
             };
             Ok(ListenerSpec::TProxy {
-                sni: raw_l.tproxy_sni.unwrap_or(global_tproxy_sni),
+                sni,
                 firewall,
                 udp,
                 udp_timeout,
+                transparent,
             })
         }
         "shadowsocks" | "ss" => Ok(ListenerSpec::Shadowsocks(SsListenerConfig {
@@ -4406,7 +4489,7 @@ fn parse_listener_spec(
             simple_obfs: None,
         })),
         other => anyhow::bail!(
-            "unknown listener type '{other}'; expected mixed, http, socks5, tproxy, or shadowsocks"
+            "unknown listener type '{other}'; expected mixed, http, socks5, tproxy, redir, or shadowsocks"
         ),
     }
 }
@@ -4646,6 +4729,14 @@ fn build_named_listeners(
     default_bind: &str,
     global_tproxy_sni: bool,
 ) -> Result<Vec<NamedListener>, anyhow::Error> {
+    // An explicit `sniffer:` block — even `enable: false` — is the newer,
+    // deliberate knob: the deprecated `tproxy-sni` synthesis must not
+    // outlive it (its private runtime survives `with_sniffer`'s off
+    // state, so a global disable would still sniff). Deadens the global
+    // default for the shorthands below; per-listener `tproxy-sni` is
+    // deadened inside `parse_listener_spec`.
+    let sniffer_declared = raw.sniffer.is_some();
+    let global_tproxy_sni = global_tproxy_sni && !sniffer_declared;
     let mut result: Vec<NamedListener> = Vec::new();
     let mut used_ports: HashMap<u16, String> = HashMap::new();
     let mut used_names: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -4717,7 +4808,7 @@ fn build_named_listeners(
         warn!(
             "firewall: only meaningful under a `listeners:` tproxy entry; \
              the top-level key is ignored — the `tproxy-port` shorthand \
-             always stays managed (issue #563)"
+             always stays managed (issue #563); `redir-port` never installs rules"
         );
     }
     if raw.udp.is_some() {
@@ -4732,6 +4823,24 @@ fn build_named_listeners(
              the top-level key is ignored (issue #564)"
         );
     }
+    // `redir-port` means what it means in mihomo — an inbound for the
+    // deployer's own REDIRECT rules (OpenWrt front-ends generate it), bound
+    // like the other shorthands.
+    if let Some(port) = raw.redir_port.filter(|p| *p != 0) {
+        add(
+            "redir",
+            ListenerSpec::TProxy {
+                sni: global_tproxy_sni,
+                firewall: false,
+                udp: false,
+                udp_timeout: default_udp_timeout_secs(),
+                transparent: false,
+            },
+            port,
+            default_bind,
+            global_max_conns,
+        )?;
+    }
     if let Some(port) = raw.tproxy_port.filter(|p| *p != 0) {
         add(
             "tproxy",
@@ -4740,9 +4849,12 @@ fn build_named_listeners(
                 // The shorthand keeps the managed-firewall default (issue
                 // #563): external management is an explicit `listeners:`
                 // opt-in only. UDP likewise stays opt-in (issue #564).
+                // mihomo's real-TPROXY `tproxy-port` is `listeners:` with
+                // `transparent: true` here.
                 firewall: true,
                 udp: false,
                 udp_timeout: default_udp_timeout_secs(),
+                transparent: false,
             },
             port,
             "127.0.0.1",
@@ -4752,7 +4864,10 @@ fn build_named_listeners(
 
     // Explicit `listeners:` entries
     for raw_l in raw.listeners.as_deref().unwrap_or(&[]) {
-        let spec = parse_listener_spec(raw_l, global_tproxy_sni)?;
+        // `type: redir` lowers to a `TProxy` spec, which erases its origin —
+        // the listen-default and warn-dedupe branches below still need it.
+        let is_redir = raw_l.listener_type.eq_ignore_ascii_case("redir");
+        let spec = parse_listener_spec(raw_l, global_tproxy_sni, sniffer_declared)?;
         if raw_l.firewall.is_some() && !matches!(spec, ListenerSpec::TProxy { .. }) {
             warn!(
                 "listeners[{}].firewall: only meaningful on `type: tproxy`, ignored; \
@@ -4769,6 +4884,9 @@ fn build_named_listeners(
         }
         match (&spec, raw_l.udp_timeout) {
             (ListenerSpec::TProxy { udp: true, .. }, _) | (_, None) => {}
+            // `type: redir` already warned that `udp-timeout` is ignored
+            // on it at spec-parse — don't warn a second time here.
+            (ListenerSpec::TProxy { .. }, Some(_)) if is_redir => {}
             (ListenerSpec::TProxy { .. }, Some(_)) => warn!(
                 "listeners[{}].udp-timeout: has no effect unless `udp: true` is set; \
                  remove it to suppress this warning",
@@ -4794,11 +4912,34 @@ fn build_named_listeners(
                 raw_l.name
             );
         }
-        let listen_raw = raw_l.listen.as_deref().unwrap_or({
-            if matches!(spec, ListenerSpec::TProxy { .. }) {
-                "127.0.0.1"
-            } else {
+        // `transparent` is tproxy-only — on `type: redir` it already
+        // warned at spec-parse, so non-TProxy specs are all that remain.
+        if raw_l.transparent.is_some() && !matches!(spec, ListenerSpec::TProxy { .. }) {
+            warn!(
+                "listeners[{}].transparent: only meaningful on `type: tproxy`, ignored; \
+                 remove it to suppress this warning",
+                raw_l.name
+            );
+        }
+        let listen_raw = raw_l.listen.as_deref().unwrap_or_else(|| {
+            // A `type: redir` or `transparent: true` entry only ever sees
+            // PREROUTING-steered traffic, which the kernel delivers to the
+            // inbound interface address — a loopback default would be a
+            // dead listener, so those take the allow-lan-honoring bind the
+            // port shorthands use. Other tproxy entries keep the
+            // historical 127.0.0.1 default (issue #563 shape).
+            let gateway_facing = is_redir
+                || matches!(
+                    spec,
+                    ListenerSpec::TProxy {
+                        transparent: true,
+                        ..
+                    }
+                );
+            if gateway_facing || !matches!(spec, ListenerSpec::TProxy { .. }) {
                 default_bind
+            } else {
+                "127.0.0.1"
             }
         });
         let (listen, port) = resolve_listener_bind(listen_raw, raw_l.port)?;
@@ -5096,7 +5237,11 @@ pub async fn build_config(
         bind_address: bind_addr,
         tproxy_port: raw.tproxy_port,
         tproxy_sni: global_tproxy_sni,
-        routing_mark: raw.routing_mark,
+        // `Some(0)` means "unset" like `None` (`set_routing_mark` stores 0
+        // for both) — normalize here so no downstream consumer can read a
+        // literal mark-0 as "exempt unmarked traffic" (see
+        // `FirewallGuard::setup`, which filters again defensively).
+        routing_mark: raw.routing_mark.filter(|m| *m != 0),
         tcp_keepalive,
         named: named_listeners,
     };
@@ -8396,7 +8541,7 @@ rules:
              udp-timeout: 18446744073709551615\n",
         )
         .unwrap();
-        let err = parse_listener_spec(&raw_l, false)
+        let err = parse_listener_spec(&raw_l, false, false)
             .expect_err("absurd listener udp-timeout must be rejected");
         assert!(err.to_string().contains("udp-timeout"), "unexpected: {err}");
     }

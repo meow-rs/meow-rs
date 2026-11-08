@@ -123,6 +123,12 @@ fn managed_suffix(rest: &str, sep: char) -> Option<(u32, u32)> {
 /// and tears them down on drop.
 pub struct FirewallGuard {
     inner: PlatformGuard,
+    /// The rules exempt this mark: it stays fixed while they are
+    /// installed. Held — and released on teardown — rather than
+    /// leaked only on drop so a failed teardown keeps the pin (the
+    /// surviving kernel rules still exempt it). Only ever `Some` on
+    /// Linux, the one PlatformGuard that consumes the mark.
+    mark_pin: Option<meow_common::RoutingMarkPin>,
     /// This instance counted itself in `LIVE_MANAGED` at setup.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     managed_live: bool,
@@ -146,12 +152,28 @@ impl FirewallGuard {
         routing_mark: Option<u32>,
         bypass_ips: &[IpAddr],
     ) -> io::Result<Self> {
+        // `Some(0)` means "unset" everywhere else (`set_routing_mark`,
+        // `routing_mark()`, the PUT/PATCH refusal gate): a literal
+        // mark-0 `meta mark 0x0 accept` would exempt ALL unmarked
+        // traffic, and a pin on it would then freeze the misread —
+        // normalize before either consumer sees it.
+        let routing_mark = routing_mark.filter(|m| *m != 0);
         info!(
             "Setting up transparent proxy firewall rules (port={}, mark={:?}, bypass={})",
             listen_port,
             routing_mark,
             bypass_ips.len()
         );
+        // Pin the mark BEFORE the rules install so a runtime change can
+        // never slip into the gap between "rules exist" and "pin taken"
+        // (the rules must always exempt the mark the socket path is
+        // applying). Linux-only: the pf path bypasses by UID, not mark,
+        // so a pin off-Linux would only freeze `routing_mark() == 0` and
+        // manufacture refusals out of nothing.
+        #[cfg(target_os = "linux")]
+        let mark_pin = routing_mark.map(|_| meow_common::pin_routing_mark());
+        #[cfg(not(target_os = "linux"))]
+        let mark_pin: Option<meow_common::RoutingMarkPin> = None;
         let inner = PlatformGuard::setup(listen_port, routing_mark, bypass_ips)?;
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         if LIVE_MANAGED.fetch_add(1, Ordering::Relaxed) > 0 {
@@ -164,6 +186,7 @@ impl FirewallGuard {
         }
         Ok(FirewallGuard {
             inner,
+            mark_pin,
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             managed_live: true,
         })
@@ -188,6 +211,14 @@ impl Drop for FirewallGuard {
     fn drop(&mut self) {
         if let Err(e) = self.teardown() {
             warn!("Failed to teardown firewall rules: {e}");
+        }
+        // A teardown that failed — or reported a non-zero nft/pfctl
+        // exit, which `inner.teardown` warns on but returns `Ok` for —
+        // can leave kernel rules that still exempt the mark. Keep the
+        // pin past this guard's death so a runtime `routing-mark`
+        // change cannot invalidate a live exemption.
+        if !self.inner.is_torn_down() {
+            std::mem::forget(self.mark_pin.take());
         }
     }
 }
@@ -445,6 +476,13 @@ impl PlatformGuard {
         }
         Ok(())
     }
+
+    /// Whether the anchor is gone — `false` either before teardown or
+    /// after one whose `pfctl` flush exited non-zero (its rules may
+    /// still be live in the kernel).
+    fn is_torn_down(&self) -> bool {
+        self.torn_down
+    }
 }
 
 // ── Linux (nftables) ────────────────────────────────────────────────────────
@@ -585,7 +623,11 @@ pub(crate) fn build_nft_ruleset(
             }
         }
     }
-    let mark_rule = match routing_mark {
+    // `Some(0)` is "unset" like `None` — a literal `meta mark 0x0 accept`
+    // would exempt ALL unmarked traffic, the exact loop the rule exists to
+    // prevent. `FirewallGuard::setup` already filters; filter again here so
+    // no caller can ever emit the mark-0 rule.
+    let mark_rule = match routing_mark.filter(|m| *m != 0) {
         Some(mark) => format!("    meta mark 0x{mark:x} accept\n"),
         None => String::new(),
     };
@@ -679,6 +721,13 @@ impl PlatformGuard {
         }
         Ok(())
     }
+
+    /// Whether the table is gone — `false` either before teardown or
+    /// after one whose `nft delete` exited non-zero (its rules,
+    /// including the mark exemption, may still be live in the kernel).
+    fn is_torn_down(&self) -> bool {
+        self.torn_down
+    }
 }
 
 // ── Unsupported platforms ───────────────────────────────────────────────────
@@ -705,6 +754,12 @@ impl PlatformGuard {
     )]
     fn teardown(&mut self) -> io::Result<()> {
         Ok(())
+    }
+
+    /// Nothing is ever installed here (setup always errors), so there is
+    /// nothing live to report.
+    fn is_torn_down(&self) -> bool {
+        true
     }
 }
 
@@ -743,6 +798,17 @@ mod tests {
         assert!(
             !rs.contains("meta mark"),
             "mark rule must not appear when routing_mark is None:\n{rs}"
+        );
+    }
+
+    #[test]
+    fn nft_zero_routing_mark_omits_mark_rule() {
+        // `Some(0)` is "unset": a `meta mark 0x0 accept` rule would exempt
+        // every unmarked packet — the loop the rule exists to prevent.
+        let rs = build_nft_ruleset("t", 1234, Some(0), &[]);
+        assert!(
+            !rs.contains("meta mark"),
+            "mark rule must not appear for a zero routing_mark:\n{rs}"
         );
     }
 

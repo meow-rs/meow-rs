@@ -805,29 +805,7 @@ mod linux {
         SocketAddr::new(IpAddr::V4(ip), u16::from_be(sa.sin_port))
     }
 
-    /// Whether a kernel-recovered `orig_dst` is a plausible client
-    /// destination. Self-targeting: a datagram aimed at the listener's
-    /// own endpoint (stray direct traffic, or a deployer who also
-    /// steers OUTPUT) would otherwise self-reinject — the outbound
-    /// write lands back in this socket and each round spawns a fresh
-    /// flow until the cap. On a wildcard listen we cannot enumerate
-    /// local addresses, so ANY orig_dst sharing the listener port is
-    /// treated as self — a conservative over-block: a remote UDP
-    /// service on the same port number is unreachable through a
-    /// `0.0.0.0`-bound `udp: true` listener. Port 0, unspecified,
-    /// loopback, multicast, and broadcast can never be a real
-    /// LAN-client destination either.
-    fn is_safe_orig_dst(orig_dst: SocketAddr, local_addr: SocketAddr) -> bool {
-        let dst_ip = orig_dst.ip();
-        let self_target = orig_dst.port() == local_addr.port()
-            && (orig_dst == local_addr || local_addr.ip().is_unspecified());
-        !(orig_dst.port() == 0
-            || self_target
-            || dst_ip.is_unspecified()
-            || dst_ip.is_loopback()
-            || dst_ip.is_multicast()
-            || dst_ip == IpAddr::V4(Ipv4Addr::BROADCAST))
-    }
+    use super::super::is_safe_orig_dst;
 
     /// Binds a spawned task's lifetime to a scope: when the owning task's
     /// frame is dropped (abort/cancellation — `run_udp` itself never
@@ -850,6 +828,10 @@ mod linux {
     /// failure still surfaces via the backoff-rate-limited `warn!`.
     /// Idle-flow eviction is lazy (channel-close observed on the next
     /// datagram, or the periodic sweep).
+    ///
+    /// `local_addrs` is the listener's interface-address snapshot — the
+    /// self-target half of `is_safe_orig_dst`; `None` keeps the
+    /// conservative same-port rule.
     pub async fn run_udp(
         tunnel: Tunnel,
         socket: UdpSocket,
@@ -857,6 +839,7 @@ mod linux {
         max_flows: usize,
         in_name: String,
         in_port: u16,
+        local_addrs: Option<Arc<std::collections::HashSet<IpAddr>>>,
     ) {
         let (reply_tx, reply_rx) = mpsc::channel::<ReplyMsg>(REPLY_QUEUE);
         let _dispatcher = AbortOnDrop(tokio::spawn(reply_dispatch(reply_rx)).abort_handle());
@@ -890,7 +873,7 @@ mod linux {
             };
             // Sanity-guard the recovered destination before it ever reaches
             // a flow — see `is_safe_orig_dst`.
-            if !is_safe_orig_dst(orig_dst, local_addr) {
+            if !is_safe_orig_dst(orig_dst, local_addr, local_addrs.as_deref()) {
                 debug!("tproxy UDP: dropping datagram to unsafe orig_dst {orig_dst}");
                 continue;
             }
@@ -1146,14 +1129,41 @@ mod linux {
             let local = "127.0.0.1:7895".parse::<SocketAddr>().unwrap();
             let wild = "0.0.0.0:7895".parse::<SocketAddr>().unwrap();
             let ok = "203.0.113.9:443".parse::<SocketAddr>().unwrap();
-            assert!(is_safe_orig_dst(ok, local));
-            assert!(is_safe_orig_dst(ok, wild));
-            // Self-target: exact endpoint, and any same-port dst on wildcard.
-            assert!(!is_safe_orig_dst(local, local));
-            assert!(!is_safe_orig_dst("203.0.113.9:7895".parse().unwrap(), wild));
+            let none: Option<&std::collections::HashSet<IpAddr>> = None;
+            assert!(is_safe_orig_dst(ok, local, none));
+            assert!(is_safe_orig_dst(ok, wild, none));
+            // Self-target: exact endpoint, and — without an address
+            // snapshot — any same-port dst on wildcard (conservative).
+            assert!(!is_safe_orig_dst(local, local, none));
+            assert!(!is_safe_orig_dst(
+                "203.0.113.9:7895".parse().unwrap(),
+                wild,
+                none
+            ));
+            // With the interface snapshot, same-port self-target means a
+            // LOCAL address at the listener port — a remote service that
+            // merely shares the port number now passes.
+            let addrs: std::collections::HashSet<IpAddr> = ["192.0.2.1".parse::<IpAddr>().unwrap()]
+                .into_iter()
+                .collect();
+            let set = Some(&addrs);
+            assert!(!is_safe_orig_dst(
+                "192.0.2.1:7895".parse().unwrap(),
+                wild,
+                set
+            ));
+            assert!(is_safe_orig_dst(
+                "198.51.100.7:7895".parse().unwrap(),
+                wild,
+                set
+            ));
             // Different-port dst on a specific bind is NOT self (but this
             // particular dst is loopback, so still filtered overall).
-            assert!(!is_safe_orig_dst("127.0.0.1:80".parse().unwrap(), local));
+            assert!(!is_safe_orig_dst(
+                "127.0.0.1:80".parse().unwrap(),
+                local,
+                none
+            ));
             // Port 0 / unspecified / multicast / broadcast.
             for bad in [
                 "203.0.113.9:0",
@@ -1161,7 +1171,7 @@ mod linux {
                 "224.0.0.1:53",
                 "255.255.255.255:53",
             ] {
-                assert!(!is_safe_orig_dst(bad.parse().unwrap(), wild), "{bad}");
+                assert!(!is_safe_orig_dst(bad.parse().unwrap(), wild, none), "{bad}");
             }
         }
     }

@@ -45,6 +45,10 @@ pub struct TProxyListener {
     /// Keepalive posture applied to every accepted socket (see
     /// [`crate::keepalive`]); `enabled: false` writes no sockopts.
     tcp_keepalive: TcpKeepaliveConfig,
+    /// TCP arrives by real TPROXY (mihomo `tproxy-port`), not REDIRECT: the
+    /// accepted socket's local address is the original destination. The
+    /// listening socket must be bound by [`bind_tcp`] with `transparent`.
+    transparent: bool,
     /// Fallible setup performed by [`Self::prepare`] — carried so `run_on`
     /// spawns nothing that can fail inside a detached task (issue #641).
     prepared: Option<Prepared>,
@@ -60,6 +64,10 @@ struct Prepared {
     /// different port than the TCP listener.
     bound_addr: SocketAddr,
     firewall: Option<FirewallGuard>,
+    /// Host interface addresses snapshotted at `prepare` for the
+    /// self-target half of [`is_safe_orig_dst`]; `None` keeps the
+    /// conservative same-port rule (interface enumeration unavailable).
+    local_addrs: Option<Arc<HashSet<IpAddr>>>,
     /// Bound `IP_TRANSPARENT` UDP socket (Linux `udp: true` only).
     #[cfg(target_os = "linux")]
     udp_socket: Option<tokio::net::UdpSocket>,
@@ -77,7 +85,8 @@ impl TProxyListener {
         let sniffer = if enable_sni {
             warn!(
                 "`enable_sni` is deprecated; migrate to the top-level `sniffer:` block. \
-                Accepting as `sniffer.enable: true, sniff.TLS.ports: [443]` for this release. \
+                Accepting as `sniffer.enable: true, sniff.TLS.ports: [443]` for this release; \
+                an explicit `sniffer:` block — even `enable: false` — wins when present. \
                 Will be removed in a future version."
             );
             let cfg = meow_common::SnifferConfig {
@@ -101,6 +110,7 @@ impl TProxyListener {
             udp: false,
             udp_timeout: std::time::Duration::from_secs(60),
             tcp_keepalive: TcpKeepaliveConfig::default(),
+            transparent: false,
             prepared: None,
         }
     }
@@ -127,6 +137,20 @@ impl TProxyListener {
     /// the prepared firewall artifacts (guard dropped → rules removed).
     pub fn with_firewall(mut self, enabled: bool) -> Self {
         self.firewall = enabled;
+        self.prepared = None;
+        self
+    }
+
+    /// Take TCP by real TPROXY (mihomo `type: tproxy`) instead of
+    /// REDIRECT: the accepted socket's local address IS the original
+    /// destination, so no `SO_ORIGINAL_DST`/conntrack recovery runs.
+    /// Requires `firewall: false` (meow's managed rules are REDIRECT) and
+    /// a socket bound by [`bind_tcp`] with `transparent` — enforced at
+    /// config-parse and again at [`Self::prepare`]. Call before `prepare`
+    /// — mutating after prepare discards the prepared artifacts.
+    #[must_use]
+    pub fn with_transparent(mut self, enabled: bool) -> Self {
+        self.transparent = enabled;
         self.prepared = None;
         self
     }
@@ -159,7 +183,7 @@ impl TProxyListener {
     pub async fn run(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Bind first so a port-0 listen can resolve to the OS-assigned port
         // before firewall rules are installed against it.
-        let listener = TcpListener::bind(self.listen_addr).await?;
+        let listener = bind_tcp(self.listen_addr, self.transparent)?;
         self.run_on(listener).await
     }
 
@@ -192,6 +216,13 @@ impl TProxyListener {
 
         // Validate the UDP opt-in BEFORE any firewall work — an invalid
         // combination must not install-then-remove rules on the way out.
+        if self.transparent && self.firewall {
+            return Err(
+                "tproxy transparent (TPROXY) tcp requires `firewall: false` — \
+                 meow's managed rules are REDIRECT"
+                    .into(),
+            );
+        }
         if self.udp && self.firewall {
             return Err(
                 "tproxy `udp: true` requires `firewall: false` — meow does not \
@@ -256,10 +287,22 @@ impl TProxyListener {
         if self.udp {
             return Err("tproxy `udp: true` is Linux-only in this release".into());
         }
+        #[cfg(not(target_os = "linux"))]
+        if self.transparent {
+            return Err("tproxy `transparent: true` (TPROXY) is Linux-only".into());
+        }
+
+        // Snapshot the host's interface addresses for the self-target
+        // half of `is_safe_orig_dst` — on a wildcard bind, "self" is a
+        // destination at the listener's port on one of OUR addresses,
+        // not merely any same-port destination. One `getifaddrs` walk
+        // per prepare, not per connection.
+        let local_addrs = local_addr_snapshot(bound_addr).map(Arc::new);
 
         self.prepared = Some(Prepared {
             bound_addr,
             firewall,
+            local_addrs,
             #[cfg(target_os = "linux")]
             udp_socket,
         });
@@ -293,6 +336,7 @@ impl TProxyListener {
         }
         // The guard keeps the managed ruleset alive for the loop's lifetime.
         let _firewall = prepared.firewall;
+        let local_addrs = prepared.local_addrs;
 
         #[cfg(target_os = "linux")]
         if let Some(udp_socket) = prepared.udp_socket {
@@ -301,6 +345,7 @@ impl TProxyListener {
             let udp_max = self.max_connections;
             let udp_name = self.name.clone();
             let udp_port = bound_addr.port();
+            let udp_addrs = local_addrs.clone();
             // `run_udp` retries socket errors internally and only ends
             // via abort — there is no error return to surface here.
             tokio::spawn(async move {
@@ -311,6 +356,7 @@ impl TProxyListener {
                     udp_max,
                     udp_name,
                     udp_port,
+                    udp_addrs,
                 )
                 .await;
             });
@@ -336,9 +382,14 @@ impl TProxyListener {
         if !self.firewall {
             info!(
                 "TProxy listener '{}': external firewall management — no rules \
-                 installed or cleaned up; TCP REDIRECT (and loop-prevention \
+                 installed or cleaned up; TCP {} (and loop-prevention \
                  bypass) is the deployer's responsibility",
-                self.name
+                self.name,
+                if self.transparent {
+                    "TPROXY"
+                } else {
+                    "REDIRECT"
+                }
             );
         }
 
@@ -364,11 +415,13 @@ impl TProxyListener {
         let name = self.name;
         let max_connections = self.max_connections;
         let tcp_keepalive = self.tcp_keepalive;
+        let transparent = self.transparent;
         bounded_accept_loop(listener, max_connections, name.clone(), {
             move |stream, src_addr| {
                 let tunnel = tunnel.clone();
                 let sniffer = sniffer.clone();
                 let name = name.clone();
+                let local_addrs = local_addrs.clone();
                 // First thing on the accepted socket — before orig-dest
                 // recovery, sniffer peek, or relay, and in the accept loop
                 // itself rather than the spawned task (matching mixed and
@@ -376,9 +429,17 @@ impl TProxyListener {
                 // stalls before its task is ever polled.
                 crate::keepalive::apply(&stream, tcp_keepalive, &name);
                 async move {
-                    if let Err(e) =
-                        handle_tproxy_conn(tunnel, stream, src_addr, bound_addr, sniffer, name)
-                            .await
+                    if let Err(e) = handle_tproxy_conn(
+                        tunnel,
+                        stream,
+                        src_addr,
+                        bound_addr,
+                        transparent,
+                        local_addrs,
+                        sniffer,
+                        name,
+                    )
+                    .await
                     {
                         debug!("TProxy connection error from {src_addr}: {e}");
                     }
@@ -515,20 +576,211 @@ fn collect_proxy_server_ips(tunnel: &Tunnel) -> Vec<IpAddr> {
     result
 }
 
+/// Bind the TCP socket of a tproxy listener. `transparent` sets
+/// `IP_TRANSPARENT` (`IPV6_TRANSPARENT`) so the socket accepts connections
+/// steered to it by an nftables/iptables `TPROXY` rule (Linux, needs
+/// `CAP_NET_ADMIN`); otherwise a plain listener for REDIRECT'd traffic.
+pub fn bind_tcp(addr: SocketAddr, transparent: bool) -> std::io::Result<TcpListener> {
+    let socket = if addr.is_ipv4() {
+        tokio::net::TcpSocket::new_v4()?
+    } else {
+        tokio::net::TcpSocket::new_v6()?
+    };
+    socket.set_reuseaddr(true)?;
+    if transparent {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+            let (level, name) = if addr.is_ipv4() {
+                (libc::SOL_IP, libc::IP_TRANSPARENT)
+            } else {
+                (libc::SOL_IPV6, libc::IPV6_TRANSPARENT)
+            };
+            let one: libc::c_int = 1;
+            // SAFETY: valid fd owned by `socket`; `one` outlives the call.
+            let ret = unsafe {
+                libc::setsockopt(
+                    socket.as_raw_fd(),
+                    level,
+                    name,
+                    std::ptr::from_ref(&one).cast(),
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            };
+            if ret != 0 {
+                let e = std::io::Error::last_os_error();
+                if e.raw_os_error() == Some(libc::EPERM) {
+                    return Err(std::io::Error::new(
+                        e.kind(),
+                        format!("IP_TRANSPARENT: {e} (needs CAP_NET_ADMIN)"),
+                    ));
+                }
+                return Err(e);
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "transparent (TPROXY) tcp is Linux-only",
+        ));
+    }
+    socket.bind(addr)?;
+    socket.listen(1024)
+}
+
+/// Snapshot the host's interface addresses for [`is_safe_orig_dst`]'s
+/// self-target check: the `getifaddrs` table on unix; `{bound addr,
+/// loopbacks}` elsewhere. `None` means enumeration failed — the caller
+/// then keeps the conservative same-port rule.
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the Option is load-bearing on unix (enumeration can fail); \
+              the non-unix arm is infallible but must match the signature"
+)]
+fn local_addr_snapshot(bound: SocketAddr) -> Option<HashSet<IpAddr>> {
+    #[cfg(unix)]
+    {
+        if let Some(addrs) = local_interface_addrs() {
+            return Some(addrs);
+        }
+        warn!(
+            "tproxy: could not enumerate local interface addresses — a same-port \
+             destination on a wildcard bind is treated as self (conservative)"
+        );
+        let _ = bound;
+        None
+    }
+    #[cfg(not(unix))]
+    {
+        // No `getifaddrs` walk wired up for this platform — the minimal
+        // self set is the bound address itself plus loopbacks.
+        let mut addrs = HashSet::new();
+        if !bound.ip().is_unspecified() {
+            addrs.insert(bound.ip());
+        }
+        addrs.insert(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        addrs.insert(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST));
+        Some(addrs)
+    }
+}
+
+/// The unix `getifaddrs(3)` walk behind [`local_addr_snapshot`]. Every
+/// `AF_INET`/`AF_INET6` interface address — including loopbacks — goes
+/// into the set.
+#[cfg(unix)]
+fn local_interface_addrs() -> Option<HashSet<IpAddr>> {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+    let mut addrs = HashSet::new();
+    // SAFETY: `getifaddrs` fills `ifaddrs` on success; the list is walked
+    // only within this scope and released by `freeifaddrs` before return.
+    unsafe {
+        let mut ifaddrs: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut ifaddrs) != 0 {
+            return None;
+        }
+        let mut cur = ifaddrs;
+        while !cur.is_null() {
+            let ifa = &*cur;
+            if !ifa.ifa_addr.is_null() {
+                match (*ifa.ifa_addr).sa_family as i32 {
+                    libc::AF_INET => {
+                        // `s_addr`'s memory bytes are network order — same
+                        // convention `orig_dest.rs` uses for
+                        // `SO_ORIGINAL_DST`.
+                        let sa = &*(ifa.ifa_addr as *const libc::sockaddr_in);
+                        addrs.insert(IpAddr::V4(Ipv4Addr::from(u32::from_be(sa.sin_addr.s_addr))));
+                    }
+                    libc::AF_INET6 => {
+                        let sa = &*(ifa.ifa_addr as *const libc::sockaddr_in6);
+                        addrs.insert(IpAddr::V6(Ipv6Addr::from(sa.sin6_addr.s6_addr)));
+                    }
+                    _ => {}
+                }
+            }
+            cur = ifa.ifa_next;
+        }
+        libc::freeifaddrs(ifaddrs);
+    }
+    // An empty table would silently weaken the wildcard self check to
+    // "nothing is self" — treat it as an enumeration failure instead
+    // (loopback always exists, so this is unreachable in practice).
+    if addrs.is_empty() {
+        return None;
+    }
+    Some(addrs)
+}
+
+/// Whether a kernel-recovered `orig_dst` is a plausible client
+/// destination. Self-targeting: a connection or datagram aimed at the
+/// listener's own endpoint (stray direct traffic, or a deployer who also
+/// steers OUTPUT) would otherwise self-reinject — the outbound dial
+/// lands back in this socket and each round spawns a fresh flow until
+/// the cap. On a wildcard bind "self" means the listener's port on one
+/// of the host's own addresses (`local_addrs`, snapshotted at
+/// `prepare`): a remote service that merely shares the port number is
+/// NOT self and now passes — the remaining over-block is a remote
+/// service on a LOCAL address at the listener port, which genuinely is
+/// this listener. `local_addrs: None` (enumeration unavailable) keeps
+/// the conservative rule: any same-port destination on a wildcard bind
+/// is self. Port 0, unspecified, loopback, multicast, and broadcast can
+/// never be a real LAN-client destination either.
+pub(super) fn is_safe_orig_dst(
+    orig_dst: SocketAddr,
+    local_addr: SocketAddr,
+    local_addrs: Option<&HashSet<IpAddr>>,
+) -> bool {
+    // Canonicalize so an IPv4-mapped `::ffff:a.b.c.d` — a `[::]`-bound
+    // listener's view of a v4 endpoint — hits the same checks as its v4
+    // spelling: the loopback/multicast/broadcast arms are
+    // family-specific, and `local_addrs` stores native-family addresses.
+    let dst_ip = orig_dst.ip().to_canonical();
+    let local_ip = local_addr.ip().to_canonical();
+    let self_target = orig_dst.port() == local_addr.port()
+        && (dst_ip == local_ip
+            || (local_ip.is_unspecified() && local_addrs.is_none_or(|set| set.contains(&dst_ip))));
+    !(orig_dst.port() == 0
+        || self_target
+        || dst_ip.is_unspecified()
+        || dst_ip.is_loopback()
+        || dst_ip.is_multicast()
+        || dst_ip == IpAddr::V4(std::net::Ipv4Addr::BROADCAST))
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each argument is per-listener state the accept loop snapshots \
+              once; a struct would only rename the list it already threads"
+)]
 async fn handle_tproxy_conn(
     tunnel: Tunnel,
     stream: tokio::net::TcpStream,
     src_addr: SocketAddr,
     listen_addr: SocketAddr,
+    transparent: bool,
+    local_addrs: Option<Arc<HashSet<IpAddr>>>,
     sniffer: Option<Arc<SnifferRuntime>>,
     name: String,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Recover the original destination address
-    let orig_dst = orig_dest::get_original_dst(&stream, listen_addr)?;
+    // Recover the original destination address: under TPROXY the kernel
+    // hands over the connection with its original destination as the local
+    // address; under REDIRECT conntrack keeps it.
+    let orig_dst = if transparent {
+        stream.local_addr()?
+    } else {
+        orig_dest::get_original_dst(&stream, listen_addr)?
+    };
+    // A `[::]`-bound listener reports v4 endpoints IPv4-mapped
+    // (`::ffff:a.b.c.d`) — canonicalize both addrs so the safety check's
+    // family-specific arms and the downstream rule matching see the real
+    // family.
+    let orig_dst = SocketAddr::new(orig_dst.ip().to_canonical(), orig_dst.port());
+    let src_addr = SocketAddr::new(src_addr.ip().to_canonical(), src_addr.port());
 
-    // Skip connections where original dest equals listen addr (self-connection)
-    if orig_dst == listen_addr {
-        return Err("original destination is the listen address (loop detected)".into());
+    // Self-connection and junk destinations, as on the UDP path: a
+    // stray connect to the listener's own endpoint would otherwise dial
+    // back in and loop until the connection cap.
+    if !is_safe_orig_dst(orig_dst, listen_addr, local_addrs.as_deref()) {
+        return Err(format!("original destination {orig_dst} is not routable (loop guard)").into());
     }
 
     handle_tproxy_flow(
@@ -1153,6 +1405,51 @@ mod tests {
         })
         .await
         .expect("pre_resolve must let the IP-CIDR rule match the rescued host");
+    }
+
+    /// The orig-dst safety filter shared by the TCP and UDP paths: the
+    /// self-target arm must distinguish "a local address at the listener
+    /// port" (self — a stray direct connect that would loop) from "a
+    /// remote service that merely shares the port number" (a legitimate
+    /// destination on a wildcard-bound gateway, e.g. `0.0.0.0:80`
+    /// serving all of HTTP). Without an interface snapshot the
+    /// conservative rule blocks every same-port destination on wildcard.
+    #[test]
+    fn is_safe_orig_dst_self_target_needs_a_local_address() {
+        let wild = "0.0.0.0:7893".parse::<SocketAddr>().unwrap();
+        let none: Option<&HashSet<IpAddr>> = None;
+        // No snapshot → conservative: any same-port dst on wildcard is self.
+        assert!(!is_safe_orig_dst(
+            "198.51.100.7:7893".parse().unwrap(),
+            wild,
+            none
+        ));
+        // With the snapshot {192.0.2.1}, self is the listener port on a
+        // LOCAL address only — the remote same-port service passes.
+        let addrs: HashSet<IpAddr> = ["192.0.2.1".parse::<IpAddr>().unwrap()]
+            .into_iter()
+            .collect();
+        let set = Some(&addrs);
+        assert!(!is_safe_orig_dst(
+            "192.0.2.1:7893".parse().unwrap(),
+            wild,
+            set
+        ));
+        assert!(is_safe_orig_dst(
+            "198.51.100.7:7893".parse().unwrap(),
+            wild,
+            set
+        ));
+        // …and on any other port the same remote address passes too.
+        assert!(is_safe_orig_dst(
+            "198.51.100.7:443".parse().unwrap(),
+            wild,
+            set
+        ));
+        // An IPv4-mapped spelling of a local address is still self —
+        // canonicalization happens inside the check.
+        let mapped = SocketAddr::new(IpAddr::V6("::ffff:192.0.2.1".parse().unwrap()), 7893);
+        assert!(!is_safe_orig_dst(mapped, wild, set));
     }
 
     #[test]

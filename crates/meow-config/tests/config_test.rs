@@ -2269,6 +2269,7 @@ tproxy-sni: true
             firewall: true,
             udp: false,
             udp_timeout: 60,
+            transparent: false,
         },
         "shorthand tproxy-port should inherit the global tproxy-sni default"
     );
@@ -2296,6 +2297,7 @@ tproxy-sni: false
             firewall: true,
             udp: false,
             udp_timeout: 60,
+            transparent: false,
         },
         "shorthand tproxy-port with global tproxy-sni: false"
     );
@@ -2325,6 +2327,7 @@ listeners:
             firewall: true,
             udp: false,
             udp_timeout: 60,
+            transparent: false,
         },
         "per-listener tproxy-sni: true must override the global false default"
     );
@@ -2358,6 +2361,7 @@ listeners:
             firewall: true,
             udp: false,
             udp_timeout: 60,
+            transparent: false,
         },
         "omitted firewall must default to managed"
     );
@@ -2390,6 +2394,7 @@ listeners:
                 firewall: expected,
                 udp: false,
                 udp_timeout: 60,
+                transparent: false,
             },
             "firewall: {value} must round-trip"
         );
@@ -2415,6 +2420,7 @@ async fn test_tproxy_shorthand_keeps_managed_firewall() {
             firewall: true,
             udp: false,
             udp_timeout: 60,
+            transparent: false,
         },
         "shorthand tproxy-port must keep the managed-firewall default"
     );
@@ -2432,6 +2438,7 @@ fn test_tproxy_spec_deserialization_defaults_firewall_true() {
             firewall: true,
             udp: false,
             udp_timeout: 60,
+            transparent: false,
         },
         "legacy spec without `firewall` must default to managed"
     );
@@ -2453,6 +2460,7 @@ fn test_tproxy_spec_deserialization_round_trips_udp() {
             firewall: false,
             udp: true,
             udp_timeout: 30,
+            transparent: false,
         },
         "spec with `udp`/`udp_timeout` must deserialize"
     );
@@ -2680,6 +2688,7 @@ listeners:
             firewall: false,
             udp: true,
             udp_timeout: 60,
+            transparent: false,
         },
         "udp: true + firewall: false must produce the UDP-enabled spec with the default timeout"
     );
@@ -2971,6 +2980,7 @@ listeners:
             firewall: true,
             udp: false,
             udp_timeout: 60,
+            transparent: false,
         },
         "named tproxy without per-listener tproxy-sni should fall back to global true"
     );
@@ -3051,6 +3061,7 @@ async fn test_listener_type_name() {
             firewall: true,
             udp: false,
             udp_timeout: 60,
+            transparent: false,
         }
         .type_name(),
         "tproxy"
@@ -3061,6 +3072,7 @@ async fn test_listener_type_name() {
             firewall: true,
             udp: false,
             udp_timeout: 60,
+            transparent: false,
         }
         .type_name(),
         "tproxy"
@@ -3454,4 +3466,61 @@ mixed-port: 7890
     assert_eq!(ka.idle, std::time::Duration::from_secs(300));
     assert_eq!(ka.interval, std::time::Duration::from_secs(30));
     assert_eq!(ka.probes, 5);
+}
+
+/// `redir-port` is mihomo's REDIRECT inbound — meow's tproxy
+/// TCP path, no managed rules, bound per allow-lan / bind-address.
+#[tokio::test]
+async fn test_redir_port_is_mihomo_redirect() {
+    let yaml = "redir-port: 7892\nallow-lan: true\nbind-address: '*'\n";
+    let config = load_config_from_str(yaml).await.unwrap();
+    let redir = config
+        .listeners
+        .named
+        .iter()
+        .find(|nl| nl.name == "redir")
+        .expect("redir shorthand listener must exist");
+    assert_eq!(
+        redir.spec,
+        ListenerSpec::TProxy {
+            sni: true,
+            firewall: false,
+            udp: false,
+            udp_timeout: 60,
+            transparent: false,
+        }
+    );
+    assert_eq!(redir.listen, "0.0.0.0");
+    assert_eq!(redir.port, 7892);
+}
+
+/// mihomo's `type: tproxy` is real TPROXY: `listeners:` takes
+/// `transparent`, which needs `firewall: false`.
+#[tokio::test]
+async fn test_listener_transparent_tproxy() {
+    let yaml = "listeners:\n  - name: tp\n    type: tproxy\n    port: 7893\n    listen: 0.0.0.0\n    firewall: false\n    udp: true\n    transparent: true\n";
+    let result = load_config_from_str(yaml).await;
+    if cfg!(target_os = "linux") {
+        let config = result.unwrap();
+        let tp = &config.listeners.named[0];
+        assert!(matches!(
+            tp.spec,
+            ListenerSpec::TProxy {
+                transparent: true,
+                firewall: false,
+                udp: true,
+                ..
+            }
+        ));
+    } else {
+        assert!(result.is_err(), "transparent is Linux-only");
+    }
+    let managed =
+        "listeners:\n  - name: tp\n    type: tproxy\n    port: 7893\n    transparent: true\n";
+    let err = load_config_from_str(managed)
+        .await
+        .err()
+        .expect("transparent with the managed firewall is rejected")
+        .to_string();
+    assert!(err.contains("firewall: false"), "{err}");
 }
