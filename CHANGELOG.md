@@ -146,6 +146,10 @@ the canonical, in-repo source a release is cut from.
   addresses — the only genuine self-target on a wildcard bind, which
   previously refused every same-port destination. IPv4-mapped IPv6
   destinations are canonicalised before the checks.
+- Internal HTTP fetch errors omit full request/redirect URLs and response
+  body snippets from provider diagnostics, preserving the HTTP status and
+  failure category without copying subscription credentials into logs.
+
 - **Hysteria 2 UDP relay no longer collapses under load.** A full
   driver queue reported `Closed`, so the tunnel tore the association
   down and re-dialled per datagram — a fresh server-side socket and
