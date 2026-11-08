@@ -163,11 +163,14 @@ async fn wait_for_more(conn: &tokio::net::TcpStream, deadline: tokio::time::Inst
 /// bytes still sit queued, and every readiness-gated peek (`poll_peek`,
 /// `try_io`) shares that wait — so this loop issues `recv(...,
 /// MSG_PEEK)` itself through `SockRef` on a fixed `PEEK_POLL` cadence,
-/// bypassing the readiness machinery entirely. `WouldBlock` is
-/// "nothing arrived yet": it waits a tick, like the first `peek`
-/// above, and is not a stall. Seeing the same queued bytes again is
-/// one — the peer closed mid-record — and `STALL_LIMIT` silent ticks
-/// end the wait well before the deadline.
+/// bypassing the readiness machinery entirely. A stall is one poll of
+/// no progress — the same queued head again, or a `WouldBlock` after
+/// bytes were already seen: on Windows a half-close with the head
+/// still queued reports `WSAEWOULDBLOCK` forever, the bytes never
+/// surfacing again, which is exactly the closed-mid-record shape.
+/// `STALL_LIMIT` silent ticks end the wait well before the deadline,
+/// while a `WouldBlock` before the first byte stays "nothing arrived
+/// yet" — a silent peer keeps the whole window.
 #[cfg(not(unix))]
 async fn peek_first_bytes(conn: &tokio::net::TcpStream) -> Vec<u8> {
     let deadline = tokio::time::Instant::now() + SNIFF_WINDOW;
@@ -186,8 +189,20 @@ async fn peek_first_bytes(conn: &tokio::net::TcpStream) -> Vec<u8> {
             ))
         };
         match peeked {
-            // Nothing arrived yet — not a stall; wait for the next tick.
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                // `n == 0`: nothing has arrived yet — a silent peer
+                // keeps the whole window, so the tick is not a stall.
+                // `n > 0`: no progress after bytes were seen is the
+                // same stall as re-reading them — on Windows this is
+                // the shape a half-close with a still-queued head
+                // takes (WSAEWOULDBLOCK forever, never the bytes).
+                if n > 0 {
+                    stalls += 1;
+                    if stalls >= STALL_LIMIT {
+                        break;
+                    }
+                }
+            }
             // The peer closed and nothing is left queued, or a real
             // socket error.
             Ok(0) | Err(_) => break,
@@ -478,6 +493,31 @@ mod tests {
         let mut md = tcp_to(SURGE_FAKE_IP, 443);
         sniff_unnamed_peek(tunnel.inner(), &server, &mut md).await;
         assert_eq!(md.sniff_host, "late.example.com");
+    }
+
+    /// A silent peer keeps the whole window — the wait the read arm
+    /// pins in `silent_client_dials_after_the_window_without_losing_bytes`:
+    /// a `WouldBlock` before the first byte must never count as a
+    /// stall or a server-first protocol would be dialed early.
+    /// Peeking consumed nothing, so the banner still reaches the relay.
+    #[tokio::test]
+    async fn peek_sniff_waits_out_the_window_for_a_silent_peer() {
+        let tunnel = mobile_tunnel();
+        let (mut client, mut server) = stream_pair().await;
+        let mut md = tcp_to(SURGE_FAKE_IP, 22);
+
+        let start = tokio::time::Instant::now();
+        sniff_unnamed_peek(tunnel.inner(), &server, &mut md).await;
+        let waited = start.elapsed();
+        assert!(waited >= SNIFF_WINDOW, "waited {waited:?}");
+        assert!(waited < SNIFF_WINDOW * 3, "waited {waited:?}");
+        assert_eq!(md.sniff_host, "");
+
+        client.write_all(b"SSH-2.0-client\r\n").await.unwrap();
+        assert_eq!(
+            relayed(Vec::new(), &mut server, 16).await,
+            b"SSH-2.0-client\r\n"
+        );
     }
 
     #[tokio::test]
