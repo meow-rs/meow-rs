@@ -45,6 +45,9 @@ struct Peer {
     trickle: Arc<AtomicBool>,
     /// Set to make the peer send one lone QUIC datagram (taken by the peer).
     lone_dgram: Arc<AtomicBool>,
+    /// Set to make the peer send a lone PING — a sub-100-byte packet that
+    /// carries no stream or datagram payload (taken by the peer).
+    ping: Arc<AtomicBool>,
     /// Microseconds from the peer's last payload datagram to the next ACK-only
     /// datagram it received; `u64::MAX` until that ACK arrives.
     ack_lag_us: Arc<AtomicU64>,
@@ -127,6 +130,8 @@ fn peer_on(
     let trickle_task = Arc::clone(&trickle);
     let lone_dgram = Arc::new(AtomicBool::new(false));
     let lone_dgram_task = Arc::clone(&lone_dgram);
+    let ping = Arc::new(AtomicBool::new(false));
+    let ping_task = Arc::clone(&ping);
     let ack_lag_us = Arc::new(AtomicU64::new(u64::MAX));
     let ack_lag_task = Arc::clone(&ack_lag_us);
     let task = DriverTask(tokio::spawn(async move {
@@ -261,6 +266,9 @@ fn peer_on(
                     last_data_tx = std::time::Instant::now();
                     conn.dgram_send(&[0x55; 300]).unwrap();
                 }
+                if ping_task.swap(false, Ordering::Relaxed) {
+                    conn.send_ack_eliciting().unwrap();
+                }
                 let flooded = flood_task.swap(0, Ordering::Relaxed);
                 if flooded > 0 {
                     for &id in &established {
@@ -328,6 +336,7 @@ fn peer_on(
         flood,
         trickle,
         lone_dgram,
+        ping,
         ack_lag_us,
         task,
     }
@@ -748,4 +757,63 @@ async fn lone_packet_is_acked_within_the_coalescing_deadline() {
     // Windows' default 15.6 ms resolution. 22 ms clears that with slack
     // while staying under the 25 ms `max_ack_delay` and the PTO path.
     assert!(median < 22_000, "median ACK lag {median} us: {lags:?}");
+}
+
+/// The `delivered` gate, pinned with an unreachable hold: `pkts` and `delay`
+/// are set beyond anything the test can wait out, so a hold can end only
+/// through the safety gates — a wakeup that delivered no payload, queued
+/// frames, a command or a closed connection. A lone PING from the peer
+/// carries no payload (nothing for `pump_reads`/`pump_datagrams` to move):
+/// it must end the hold and flush the held ACK, not feed the hold. That is
+/// the gate the upload regression depends on — an upload's inbound
+/// bare-ACK stream is exactly such traffic, and if it could keep a hold
+/// alive the ACK would wait out the deadline (here, the full 60 s).
+#[tokio::test]
+async fn non_delivery_wakeup_ends_the_ack_hold() {
+    let peer = peer(true, Some(0), 16).await;
+    let (_handle, mut stream) = timeout(
+        TEST_TIMEOUT,
+        dial_with_coalesce(
+            peer.addr,
+            AckCoalesce {
+                pkts: u32::MAX,
+                delay: Duration::from_secs(60),
+            },
+        ),
+    )
+    .await
+    .unwrap();
+    round_trip(&mut stream).await;
+    // Past the 1 ms application-quiet window, with handshake ACKs drained.
+    sleep(Duration::from_millis(50)).await;
+
+    // A delivered datagram opens a hold whose count and deadline rules
+    // cannot end it inside the test window. `ack_lag_us` records the first
+    // sub-100-byte packet the peer sees after it: the held ACK leaving.
+    peer.ack_lag_us.store(u64::MAX, Ordering::Relaxed);
+    peer.lone_dgram.store(true, Ordering::Relaxed);
+    // Let the hold take — and the peer's PTO probes come and go — then land
+    // a wakeup that is guaranteed to deliver no payload.
+    sleep(Duration::from_millis(80)).await;
+    peer.ping.store(true, Ordering::Relaxed);
+    timeout(TEST_TIMEOUT, async {
+        while peer.ack_lag_us.load(Ordering::Relaxed) == u64::MAX {
+            sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("a wakeup with no delivered payload must end the hold, not feed it");
+
+    // The complementary gate: queued application bytes never wait on a
+    // hold. Open a second hold, then write — the echo returns promptly,
+    // not after `delay`.
+    peer.lone_dgram.store(true, Ordering::Relaxed);
+    sleep(Duration::from_millis(80)).await;
+    stream.write_all(b"hi").await.unwrap();
+    let mut echoed = [0; 2];
+    timeout(TEST_TIMEOUT, stream.read_exact(&mut echoed))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&echoed, b"hi");
 }

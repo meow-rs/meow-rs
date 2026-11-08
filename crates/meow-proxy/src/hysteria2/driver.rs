@@ -92,9 +92,9 @@ const RECV_BATCH: usize = 32;
 const CMD_BATCH: usize = 64;
 /// An ACK-only flush is held back until this many datagrams have been
 /// accepted by quiche across payload-delivering wakeups since the last
-/// flush: a pure ACK-only wakeup owes no ACK, so it neither starts nor
-/// extends a hold — though a wakeup that also delivered payload counts
-/// every datagram it accepted...
+/// flush: a pure ACK-only wakeup owes no ACK, so it neither starts a
+/// hold nor keeps one alive — though a wakeup that also delivered
+/// payload counts every datagram it accepted...
 const ACK_COALESCE_PKTS: u32 = 8;
 /// ...or the first of them is this old, whichever comes first. The real
 /// bound adds the OS timer tick — ~1 ms on Linux, up to ~16 ms at
@@ -107,6 +107,11 @@ const ACK_COALESCE_DELAY: Duration = Duration::from_micros(200);
 /// application command arrived within this window (request/response,
 /// uploads).
 const ACK_COALESCE_APP_QUIET: Duration = Duration::from_millis(1);
+/// A `Sleep` cannot be disarmed, so a hold that ends early parks
+/// `ack_timer` this far out instead of leaving the old deadline armed —
+/// armed it would fire a wakeup the `ack_since.is_some()` arm guard just
+/// discards, an empty loop iteration per hold. The next hold re-arms it.
+const ACK_TIMER_PARKED: Duration = Duration::from_secs(86400);
 
 /// The ACK-coalescing thresholds a [`State`] runs with — a parameter rather
 /// than the raw constants so a test can pin them: `driver_tests`'s download
@@ -438,13 +443,14 @@ async fn run(
         // A wakeup that explicitly queued outbound frames — STREAM data/FIN,
         // RESET or STOP_SENDING — must not wait on the coalescing deadline.
         // (Frames quiche queues internally still can — they wait at most the
-        // delay below.)
+        // delay below, plus the OS timer tick.)
         let mut queued = cleanup_streams(&mut st, &mut conn);
         // Payload this wakeup pulled out of quiche for the app — stream
         // bytes/FIN or a QUIC datagram — is the only receive work that may
-        // feed a hold: pure ACK-only packets owe no ACK, so they neither
-        // start nor extend one and an upload's inbound ACK stream never
-        // delays its own stream data behind the deadline.
+        // feed a hold: pure ACK-only packets owe no ACK, so a wakeup that
+        // delivers none ends a hold instead of feeding it, and an
+        // upload's inbound ACK stream never delays its own stream data
+        // behind the deadline.
         let mut delivered = false;
         if auth_done {
             delivered |= pump_reads(&mut st, &mut conn, &mut buf);
@@ -458,7 +464,8 @@ async fn run(
         // quiche's timer, keep-alive, a closed or draining connection and
         // the coalescing deadline always send. The hold is bounded
         // regardless: a skipped flush may still carry flow-control frames
-        // quiche queued internally — they wait at most `coalesce.delay`.
+        // quiche queued internally — they wait at most `coalesce.delay`
+        // plus the OS timer tick (see [`ACK_COALESCE_DELAY`]).
         let now = tokio::time::Instant::now();
         if woke_on_cmd {
             last_app_cmd = Some(now);
@@ -486,7 +493,12 @@ async fn run(
             }
         }
         ack_pending = 0;
-        ack_since = None;
+        if ack_since.take().is_some() {
+            // Park the timer with its flag — see [`ACK_TIMER_PARKED`].
+            ack_timer
+                .as_mut()
+                .reset(tokio::time::Instant::now() + ACK_TIMER_PARKED);
+        }
 
         if let Err(e) = flush_send(&mut st, &mut conn, &mut send_buf).await {
             tracing::debug!("hysteria2 quiche send failed: {e}");

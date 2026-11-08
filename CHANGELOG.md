@@ -105,8 +105,10 @@ the canonical, in-repo source a release is cut from.
   still flushes at once — and never while an application command
   arrived within the last millisecond, so an ACK can still ride on
   upstream data. Wakeups that delivered no payload — the bare-ACK
-  traffic an upload receives — neither start nor extend a hold, so an
-  upload's own stream data never waits on the deadline.
+  traffic an upload receives — neither start nor keep a hold alive:
+  one arriving mid-hold ends it rather than waiting out the deadline
+  (read-progress wakeups still may), so an upload's own stream data
+  never waits on it.
 
 ### Fixed
 
