@@ -271,8 +271,9 @@ pub enum TunReady {
         /// generation's teardown fully completes, which the owner must
         /// await before permitting a successor stack (issue #514).
         core_done: tokio::sync::watch::Receiver<bool>,
-        /// Live UDP flow-table occupancy — written by the UDP read loop,
-        /// readable at any time for observability (issue #515).
+        /// Live UDP flow-table occupancy — the sum over every UDP read
+        /// loop's table (each applies only its own deltas), readable at
+        /// any time for observability (issue #515).
         udp_flows: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     },
     /// Setup failed before reaching the accept loop.  The String carries
@@ -924,7 +925,9 @@ impl TunListener {
         tasks.push(&pump_in);
         tasks.push(&pump_out);
         // Live UDP flow-table occupancy, readable via `TunReady::Ready` →
-        // `TunHandle` for observability (issue #515).
+        // `TunHandle` for observability (issue #515). Both `run_udp` tasks
+        // share this gauge: each applies only its own table's deltas, so
+        // it always reads the sum of the two tables.
         let udp_flows = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         tasks.spawn(udp::run_udp(
             self.tunnel.clone(),
@@ -987,7 +990,19 @@ impl TunListener {
         let warned_saturated = Arc::new(AtomicBool::new(false));
         // System stack: kernel accept errors (ECONNABORTED, EMFILE under a
         // flow storm) back off and retry, as the other listeners do.
-        let mut accept_backoff = meow_common::ErrorBackoff::new();
+        // The accept future is pinned across `select!` iterations — the
+        // macro drops and rebuilds ordinary arm expressions on every loop
+        // pass, which would kill a parked `flow_slot` wait's queue place
+        // and any accepted socket held across it. `accept_system` hands
+        // its `ErrorBackoff` back on completion so the next future can
+        // continue the same sequence without a live `&mut` in the way.
+        let mut accept_fut = std::pin::pin!(accept_system(
+            system.as_ref(),
+            conn_limit.clone(),
+            &warned_saturated,
+            &self.name,
+            meow_common::ErrorBackoff::new(),
+        ));
 
         let result = loop {
             tokio::select! {
@@ -1045,14 +1060,25 @@ impl TunListener {
                     }
                     None => break Err("netstack TCP listener closed".into()),
                 },
-                accepted = accept_system(
-                    system.as_ref(),
-                    conn_limit.clone(),
-                    &warned_saturated,
-                    &self.name,
-                    &mut accept_backoff,
-                ) => match accepted {
-                    Some((permit, stream, src, dst, guard)) => {
+                accepted = accept_fut.as_mut() => match accepted {
+                    Some((accepted, backoff)) => {
+                        // Re-arm before handling: the select keeps polling
+                        // the same future slot, so the next accept starts
+                        // now, not after the handler returns.
+                        accept_fut.set(accept_system(
+                            system.as_ref(),
+                            conn_limit.clone(),
+                            &warned_saturated,
+                            &self.name,
+                            backoff,
+                        ));
+                        let AcceptedSystem {
+                            permit,
+                            stream,
+                            src,
+                            dst,
+                            guard,
+                        } = accepted;
                         let tunnel = self.tunnel.clone();
                         let name = self.name.clone();
                         tasks.spawn(async move {
@@ -1061,6 +1087,13 @@ impl TunListener {
                             // path, peeked so the bytes stay queued: a
                             // close or reset before any payload drops the
                             // flow, silence dials it (server-first, #695).
+                            // Unlike lwIP the slot is already held — taken
+                            // in the pinned accept future once the kernel
+                            // had a connection. Taking it here after the
+                            // window would match lwIP's hold span, but the
+                            // accept loop would keep accepting and park an
+                            // unbounded number of tasks on the semaphore,
+                            // each holding a kernel fd.
                             let mut probe = [0u8; 1];
                             match timeout(TUN_SNIFF_WINDOW, stream.peek(&mut probe)).await {
                                 Ok(Ok(0)) => {
@@ -1125,35 +1158,54 @@ impl TunListener {
     }
 }
 
+/// What one completed kernel accept hands the select arm.
+struct AcceptedSystem {
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    stream: tokio::net::TcpStream,
+    src: SocketAddr,
+    dst: SocketAddr,
+    guard: system::FlowGuard,
+}
+
 /// The next kernel-terminated TCP flow, or never when the system stack is
-/// off (a `select!` arm that stays pending).
-/// The next system-stack flow with its `max-connections` slot, taken
-/// before the accept so a saturated listener leaves connections in the
-/// kernel backlog instead of parking tasks (each holds a kernel fd). Accept
-/// errors back off and retry; `None` only when the limit is gone with the
+/// off (a `select!` arm that stays pending). The caller pins this future
+/// across loop iterations, so a sibling arm winning never drops it —
+/// a parked semaphore wait keeps its queue place and an accepted socket
+/// held across it is never killed mid-wait.
+///
+/// The `max-connections` slot is taken only once a connection exists:
+/// accept errors back off and retry holding no slot — a permit parked
+/// across an `EMFILE` retry storm would take one place out of the pool
+/// for the whole storm — and a saturated listener parks at most this one
+/// accepted fd on the semaphore instead of parking a task per connection.
+/// The `ErrorBackoff` travels by value (the future is rebuilt per flow,
+/// so it cannot borrow one). `None` only when the limit is gone with the
 /// listener.
 async fn accept_system(
     system: Option<&system::SystemStack>,
     sem: Option<Arc<Semaphore>>,
     warned: &AtomicBool,
     name: &str,
-    backoff: &mut meow_common::ErrorBackoff,
-) -> Option<(
-    Option<tokio::sync::OwnedSemaphorePermit>,
-    tokio::net::TcpStream,
-    SocketAddr,
-    SocketAddr,
-    system::FlowGuard,
-)> {
+    mut backoff: meow_common::ErrorBackoff,
+) -> Option<(AcceptedSystem, meow_common::ErrorBackoff)> {
     let Some(sys) = system else {
         return std::future::pending().await;
     };
-    let permit = flow_slot(sem, warned, name).await.ok()?;
     loop {
         match sys.accept().await {
             Ok((stream, src, dst, guard)) => {
                 backoff.succeeded();
-                return Some((permit, stream, src, dst, guard));
+                let permit = flow_slot(sem.clone(), warned, name).await.ok()?;
+                return Some((
+                    AcceptedSystem {
+                        permit,
+                        stream,
+                        src,
+                        dst,
+                        guard,
+                    },
+                    backoff,
+                ));
             }
             Err(e) => {
                 if backoff.failed(&e).await {

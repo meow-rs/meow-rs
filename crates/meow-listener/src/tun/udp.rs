@@ -232,8 +232,13 @@ pub(super) async fn run_udp(
         sweep_countdown -= 1;
         if sweep_countdown == 0 {
             sweep_countdown = SWEEP_INTERVAL;
+            // `live_flows` is shared with the sibling `run_udp` task (the
+            // system stack runs one for direct UDP and one for lwIP
+            // leftovers): only this table's deltas are applied, so the
+            // gauge reads the sum of both.
+            let before = flows.len();
             flows.retain(|_, e| !e.tx.is_closed());
-            live_flows.store(flows.len(), Ordering::Relaxed);
+            live_flows.fetch_sub(before - flows.len(), Ordering::Relaxed);
         }
 
         let key = (src, dst);
@@ -248,7 +253,7 @@ pub(super) async fn run_udp(
                     // through to re-create the flow with this datagram.
                     Err(mpsc::error::TrySendError::Closed(data)) => {
                         flows.remove(&key);
-                        live_flows.store(flows.len(), Ordering::Relaxed);
+                        live_flows.fetch_sub(1, Ordering::Relaxed);
                         data
                     }
                 }
@@ -281,7 +286,9 @@ pub(super) async fn run_udp(
         // Admission bound: reclaim dead entries first, then evict the
         // least-recently-active live flow.
         if flows.len() >= MAX_FLOWS {
+            let before = flows.len();
             evict_for_admission(&mut flows);
+            live_flows.fetch_sub(before - flows.len(), Ordering::Relaxed);
         }
 
         let (tx, rx) = mpsc::channel(FLOW_QUEUE);
@@ -294,7 +301,7 @@ pub(super) async fn run_udp(
                 last_activity: Arc::clone(&last_activity),
             },
         );
-        live_flows.store(flows.len(), Ordering::Relaxed);
+        live_flows.fetch_add(1, Ordering::Relaxed);
         tokio::spawn(flow_task(
             tunnel.clone(),
             FlowSpec {
@@ -307,7 +314,7 @@ pub(super) async fn run_udp(
             },
         ));
     }
-    live_flows.store(0, Ordering::Relaxed);
+    live_flows.fetch_sub(flows.len(), Ordering::Relaxed);
 }
 
 /// Per-flow state handed to the spawned flow task.
@@ -673,6 +680,63 @@ mod tests {
             rx.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
         ));
+    }
+
+    /// The system stack runs two `run_udp` loops (direct + lwIP
+    /// leftovers) on one gauge: each applies only its own table's deltas,
+    /// so readers see the sum, and a loop that exits gives its share back.
+    #[tokio::test]
+    async fn shared_gauge_sums_both_flow_tables() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let gauge = Arc::new(AtomicUsize::new(0));
+        let spawn = || {
+            let (tx, incoming) = tokio::sync::mpsc::channel(4);
+            let (replies, _rx) = tokio::sync::mpsc::channel(4);
+            let task = tokio::spawn(super::run_udp(
+                crate::test_rule_tunnel(),
+                super::UdpIo::Direct { incoming, replies },
+                false,
+                Duration::from_secs(60),
+                "tun".to_string(),
+                net(),
+                Arc::clone(&gauge),
+            ));
+            (tx, task)
+        };
+        let (tx1, t1) = spawn();
+        let (tx2, t2) = spawn();
+
+        let pkt = |port: u16| {
+            (
+                b"x".to_vec(),
+                SocketAddr::from(([10, 0, 0, 1], port)),
+                SocketAddr::from(([8, 8, 8, 8], 53)),
+            )
+        };
+        tx1.send(pkt(1)).await.unwrap();
+        tx2.send(pkt(2)).await.unwrap();
+
+        async fn wait_gauge(gauge: &AtomicUsize, want: usize) {
+            let polled = tokio::time::timeout(Duration::from_secs(5), async {
+                while gauge.load(Ordering::Relaxed) != want {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            })
+            .await;
+            assert!(polled.is_ok(), "gauge never reached {want}");
+        }
+        wait_gauge(&gauge, 2).await;
+
+        // Each loop returns only its own table's count on exit.
+        drop(tx1);
+        t1.await.unwrap();
+        wait_gauge(&gauge, 1).await;
+        drop(tx2);
+        t2.await.unwrap();
+        assert_eq!(gauge.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]

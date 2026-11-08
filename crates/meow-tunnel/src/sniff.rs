@@ -8,11 +8,12 @@
 //! upstream ahead of the rest of the stream. Only flows the tunnel cannot
 //! otherwise name are read: every other flow keeps its routing and timing.
 
+use std::io;
 use std::time::Duration;
 
 use meow_common::sniffer::{sniff_http, sniff_tls};
 use meow_common::Metadata;
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt, Interest};
 
 use crate::TunnelInner;
 
@@ -68,17 +69,41 @@ pub(crate) async fn sniff_unnamed_peek(
     let deadline = tokio::time::Instant::now() + SNIFF_WINDOW;
     let mut buf = vec![0u8; SNIFF_CAP];
     let mut n = 0;
+    // Re-peeks that saw no new bytes, bounded: a persistent non-data
+    // readiness (the peer closed while bytes are still queued — a state
+    // clearing cannot suppress) would otherwise keep the wait instantly
+    // woken until the deadline.
+    let mut stalls = 0u8;
     loop {
         match tokio::time::timeout_at(deadline, conn.peek(&mut buf)).await {
-            Ok(Ok(read)) if read > 0 => n = read,
-            _ => break,
+            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+            Ok(Ok(read)) => {
+                if read <= n {
+                    stalls += 1;
+                    if stalls >= 2 {
+                        break;
+                    }
+                } else {
+                    n = read;
+                    stalls = 0;
+                }
+            }
         }
         if n == buf.len() || !tls_record_incomplete(&buf[..n]) {
             break;
         }
-        // More of the record is on its way; peek returns at once while any
-        // data is queued, so pace the retries.
-        if tokio::time::timeout_at(deadline, tokio::time::sleep(Duration::from_millis(5)))
+        // More of the record is on its way and `peek` left every byte
+        // queued, so the socket still reports READABLE — a bare
+        // `readable()` or `peek` returns at once and only a fixed sleep
+        // paced this loop before (up to ~40 wakeups per window). Report a
+        // deliberate `try_io` WouldBlock instead: tokio clears the
+        // readiness bit only when no newer event landed, so `readable()`
+        // below parks until the next real arrival — one wakeup per
+        // segment, like the `read` variant gets for free.
+        let _ = conn.try_io(Interest::READABLE, || {
+            Err::<usize, _>(io::Error::from(io::ErrorKind::WouldBlock))
+        });
+        if tokio::time::timeout_at(deadline, conn.readable())
             .await
             .is_err()
         {
@@ -280,6 +305,28 @@ mod tests {
         sniff_unnamed_peek(tunnel.inner(), &server, &mut md).await;
         assert_eq!(md.sniff_host, "peek.example.com");
         assert_eq!(relayed(Vec::new(), &mut server, hello.len()).await, hello);
+    }
+
+    /// A peer that half-closes mid-record is itself a fresh edge: the
+    /// wait ends promptly with the partial bytes, not after the whole
+    /// window (nor in a spin — the readiness a close leaves behind is
+    /// bounded by the stall guard).
+    #[tokio::test]
+    async fn peek_sniff_ends_early_when_the_peer_closes_mid_record() {
+        let tunnel = mobile_tunnel();
+        let (mut client, server) = stream_pair().await;
+        let hello = client_hello("gone.example.com");
+        client.write_all(&hello[..10]).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let start = tokio::time::Instant::now();
+        let mut md = tcp_to(SURGE_FAKE_IP, 443);
+        sniff_unnamed_peek(tunnel.inner(), &server, &mut md).await;
+        assert!(
+            start.elapsed() < SNIFF_WINDOW,
+            "closed mid-record must not wait out the whole window"
+        );
+        assert_eq!(md.sniff_host, "");
     }
 
     #[tokio::test]

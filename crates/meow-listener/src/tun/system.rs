@@ -22,7 +22,7 @@
 //! handler ends (then [`CLOSING_TTL`] for the FIN/ACK tail), or for
 //! [`PENDING_TTL`] if the handshake never completes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;
@@ -42,7 +42,10 @@ pub(super) const SWEEP_EVERY: Duration = Duration::from_secs(10);
 /// NAT ports handed out, cycled through; 55 536 concurrent flows.
 const PORT_FIRST: u16 = 10_000;
 /// Half-open entries allowed at once: a port scan of IP literals must not
-/// take the port space from established flows.
+/// take the port space from established flows. At the cap the oldest
+/// pending entry is evicted to admit a new SYN — the UDP flow table's
+/// `MAX_FLOWS` convention — rather than refusing every fresh SYN until an
+/// entry's [`PENDING_TTL`] runs out.
 const PENDING_MAX: usize = 4096;
 
 const IPV6_FRAGMENT: u8 = 44;
@@ -79,13 +82,26 @@ struct Entry {
 struct Table {
     by_flow: HashMap<(SocketAddr, SocketAddr), u16>,
     by_port: HashMap<u16, Entry>,
+    /// Ports of pending entries, oldest first, with the alloc timestamp —
+    /// eviction order at `PENDING_MAX`. Slots whose entry left `Pending`
+    /// (opened, closed, swept) are stale: the eviction walk skips them
+    /// and the periodic sweep drops them.
+    pending_order: VecDeque<(u16, Instant)>,
     next: u16,
     pending: usize,
 }
 
 impl Table {
     fn alloc(&mut self, client: SocketAddr, dst: SocketAddr, now: Instant) -> Option<u16> {
-        if self.by_port.len() > usize::from(u16::MAX - PORT_FIRST) || self.pending >= PENDING_MAX {
+        if self.by_port.len() > usize::from(u16::MAX - PORT_FIRST) {
+            return None;
+        }
+        // At the half-open cap, evict the oldest pending entry rather than
+        // refusing the SYN: under a scan flood, hard-dropping meant every
+        // legitimate handshake queued behind a full 30 s TTL. The oldest
+        // pending is the likeliest garbage — a real handshake completes
+        // long before it would be evicted under anything but a flood.
+        if self.pending >= PENDING_MAX && !self.evict_oldest_pending() {
             return None;
         }
         loop {
@@ -98,10 +114,27 @@ impl Table {
                     state: State::Pending(now),
                 });
                 self.pending += 1;
+                self.pending_order.push_back((port, now));
                 self.by_flow.insert((client, dst), port);
                 return Some(port);
             }
         }
+    }
+
+    /// Remove the oldest still-pending entry; stale deque slots (opened,
+    /// closed, swept, or the port re-allocated to a newer pending) are
+    /// skipped. `false` only when nothing pending remains.
+    fn evict_oldest_pending(&mut self) -> bool {
+        while let Some((port, at)) = self.pending_order.pop_front() {
+            if matches!(
+                self.by_port.get(&port).map(|e| e.state),
+                Some(State::Pending(t)) if t == at
+            ) {
+                self.remove(port);
+                return true;
+            }
+        }
+        false
     }
 
     fn remove(&mut self, port: u16) {
@@ -215,8 +248,10 @@ impl Nat {
 
     fn translate_v6(&self, pkt: &mut [u8], partial: bool) -> Verdict {
         // TCP fragments are dropped as on IPv4: lwIP would reassemble them
-        // into a flow the kernel owns and reset it.
-        if pkt.len() >= 48 && pkt[6] == IPV6_FRAGMENT && pkt[40] == 6 {
+        // into a flow the kernel owns and reset it. The extension-header
+        // chain is walked — a Fragment behind Hop-by-Hop/Routing/etc.
+        // counts the same as a first-header one.
+        if v6_tcp_fragment(pkt) {
             return Verdict::Drop;
         }
         // Other extension headers before TCP are left to lwIP.
@@ -351,6 +386,21 @@ impl Nat {
         for port in expired {
             t.remove(port);
         }
+        // `pending_order` also accrues stale slots when an entry opens,
+        // closes, or ages out — the eviction walk only consumes them at
+        // the cap. Drop them here so the deque tracks live entries plus
+        // at most one sweep interval's churn.
+        let Table {
+            by_port,
+            pending_order,
+            ..
+        } = &mut *t;
+        pending_order.retain(|(port, at)| {
+            matches!(
+                by_port.get(port).map(|e| e.state),
+                Some(State::Pending(s)) if s == *at
+            )
+        });
     }
 
     #[cfg(test)]
@@ -461,6 +511,52 @@ impl SystemStack {
             tracing::debug!("tun system stack: dropping connection from unknown peer {peer}");
         }
     }
+}
+
+/// Whether an IPv6 packet is a TCP fragment: its extension-header chain
+/// holds a Fragment header whose next-header is TCP. Only the
+/// unfragmentable part (headers before the Fragment) is walked — the
+/// Fragment's own next-header field names the payload protocol in every
+/// fragment of a datagram, so the answer never needs to read fragment
+/// payload bytes. `false` for a malformed or unfinished chain (lwIP
+/// decides on those) and for anything without a Fragment header.
+fn v6_tcp_fragment(pkt: &[u8]) -> bool {
+    const MAX_EXT_CHAIN: usize = 8;
+    let Some(&nh0) = pkt.get(6) else {
+        return false;
+    };
+    let mut nh = nh0;
+    // First byte past the fixed 40-byte IPv6 header.
+    let mut off = 40usize;
+    for _ in 0..MAX_EXT_CHAIN {
+        // Extension headers with a (next-header, hdr-ext-len) layout
+        // measured in 8-octet units, not counting the first: Hop-by-Hop,
+        // Routing, Destination Options, Mobility, Shim6.
+        let step = match nh {
+            0 | 43 | 60 | 135 | 140 => {
+                let Some(&hlen) = pkt.get(off + 1) else {
+                    return false;
+                };
+                (usize::from(hlen) + 1) * 8
+            }
+            // AH (51): payload-len field counts 4-octet units minus 2.
+            51 => {
+                let Some(&hlen) = pkt.get(off + 1) else {
+                    return false;
+                };
+                (usize::from(hlen) + 2) * 4
+            }
+            IPV6_FRAGMENT => return pkt.get(off) == Some(&6),
+            // Not an extension header: the chain carries no Fragment.
+            _ => return false,
+        };
+        let Some(&next) = pkt.get(off) else {
+            return false;
+        };
+        nh = next;
+        off += step;
+    }
+    false
 }
 
 fn read16(pkt: &[u8], at: usize) -> u16 {
@@ -721,27 +817,127 @@ mod tests {
         assert_eq!(nat.len(), 0);
     }
 
-    /// Multicast and broadcast SYNs get no NAT entry; half-open entries
-    /// are capped, and an accepted one frees its place.
+    /// Multicast and broadcast SYNs get no NAT entry; at the half-open
+    /// cap the oldest pending entry is evicted to admit a fresh SYN (the
+    /// UDP table's `MAX_FLOWS` convention), and an accepted flow still
+    /// frees its place.
     #[test]
-    fn junk_syns_are_dropped_and_half_open_entries_capped() {
+    fn junk_syns_dropped_and_full_pending_table_evicts_oldest() {
         let nat = nat();
         for dst in [[224, 0, 0, 251], [255, 255, 255, 255]] {
             let mut syn = v4_packet([192, 168, 1, 10], 1, dst, 139, TCP_SYN);
             assert_eq!(nat.translate(&mut syn, false), Verdict::Drop);
         }
         assert_eq!(nat.len(), 0);
+        let first_key = (
+            SocketAddr::from((Ipv4Addr::new(192, 168, 1, 10), 1)),
+            SocketAddr::from((Ipv4Addr::new(1, 1, 1, 1), 80)),
+        );
         for i in 0..PENDING_MAX {
             let port = u16::try_from(i).unwrap() + 1;
             let mut syn = v4_packet([192, 168, 1, 10], port, [1, 1, 1, 1], 80, TCP_SYN);
             assert_eq!(nat.translate(&mut syn, false), Verdict::Write);
         }
+        // Over the cap: admitted, not dropped — the oldest (the first
+        // SYN's entry) was evicted for it.
         let mut over = v4_packet([192, 168, 1, 11], 1, [1, 1, 1, 1], 80, TCP_SYN);
-        assert_eq!(nat.translate(&mut over, false), Verdict::Drop);
-        let first = nat.table.lock().by_flow.values().copied().min().unwrap();
-        let peer = SocketAddr::V4(SocketAddrV4::new(nat.addrs.b4, first));
-        assert!(nat.accepted(peer).is_some());
         assert_eq!(nat.translate(&mut over, false), Verdict::Write);
+        {
+            let t = nat.table.lock();
+            assert_eq!(t.pending, PENDING_MAX);
+            assert_eq!(t.by_port.len(), PENDING_MAX);
+            assert!(
+                !t.by_flow.contains_key(&first_key),
+                "the oldest pending entry must be the victim"
+            );
+            // The evicted entry's deque slot was consumed by the eviction
+            // walk; the new SYN pushed its own.
+            assert_eq!(t.pending_order.len(), PENDING_MAX);
+        }
+        // An evicted port's late handshake no longer resolves: the entry
+        // is gone, so a stale kernel accept is dropped, never attributed
+        // to a flow that reused the port.
+        let evicted_port = PORT_FIRST;
+        let stale = SocketAddr::V4(SocketAddrV4::new(nat.addrs.b4, evicted_port));
+        assert!(nat.accepted(stale).is_none());
+        // A surviving pending entry still accepts and frees its place —
+        // the second-oldest is now the head of the eviction order.
+        let survivor = nat.table.lock().by_flow.values().copied().min().unwrap();
+        let peer = SocketAddr::V4(SocketAddrV4::new(nat.addrs.b4, survivor));
+        assert!(nat.accepted(peer).is_some());
+        assert_eq!(nat.table.lock().pending, PENDING_MAX - 1);
+    }
+
+    /// A v6 packet whose next-header chain is `chain` (each entry an
+    /// 8-byte header pointing at the following one) terminated by `tail`
+    /// — e.g. `(&[43, 44], 6)` is Routing → Fragment → TCP. The tail's
+    /// bytes are zeroes; the verdict path never reads past them.
+    fn v6_chain_packet(chain: &[u8], tail: u8) -> Vec<u8> {
+        let c: Ipv6Addr = "2001:db8::10".parse().unwrap();
+        let d: Ipv6Addr = "2606:4700::1111".parse().unwrap();
+        let mut p = vec![0x60, 0, 0, 0];
+        p.extend_from_slice(&((chain.len() * 8 + 8) as u16).to_be_bytes());
+        p.push(chain.first().copied().unwrap_or(tail));
+        p.push(64);
+        p.extend_from_slice(&c.octets());
+        p.extend_from_slice(&d.octets());
+        for (i, _) in chain.iter().enumerate() {
+            p.push(chain.get(i + 1).copied().unwrap_or(tail));
+            // hdr-ext-len 0 (= 8 bytes); for a Fragment header this slot
+            // is reserved + the zero offset/M-flag bits — both read as a
+            // first fragment, which the verdict does not distinguish.
+            p.extend_from_slice(&[0; 7]);
+        }
+        p.extend_from_slice(&[0; 8]);
+        p
+    }
+
+    /// The Fragment header may sit anywhere in the extension-header
+    /// chain: the old first-header-only check missed `…→Fragment→TCP`
+    /// behind Hop-by-Hop/Routing/AH, and lwIP would have reassembled the
+    /// TCP flow — reset split-brain against the kernel-owned one.
+    #[test]
+    fn v6_tcp_fragments_drop_anywhere_in_the_chain() {
+        let nat = nat();
+        for chain in [
+            &[IPV6_FRAGMENT][..],
+            &[43, IPV6_FRAGMENT][..],
+            &[0, 60, IPV6_FRAGMENT][..],
+            &[51, IPV6_FRAGMENT][..],
+        ] {
+            let mut pkt = v6_chain_packet(chain, 6);
+            assert_eq!(
+                nat.translate(&mut pkt, false),
+                Verdict::Drop,
+                "{chain:?} → TCP"
+            );
+        }
+        // A fragment of a non-TCP payload — and extension headers before
+        // plain TCP — stay lwIP's, as before.
+        for chain in [&[IPV6_FRAGMENT][..], &[43, IPV6_FRAGMENT][..]] {
+            let mut pkt = v6_chain_packet(chain, 17);
+            assert_eq!(
+                nat.translate(&mut pkt, false),
+                Verdict::Stack,
+                "{chain:?} → UDP"
+            );
+        }
+        for chain in [&[43][..], &[0, 50, 60][..]] {
+            let mut pkt = v6_chain_packet(chain, 6);
+            assert_eq!(
+                nat.translate(&mut pkt, false),
+                Verdict::Stack,
+                "{chain:?} → TCP, no Fragment"
+            );
+        }
+        // A malformed chain — a header length running past the packet —
+        // is lwIP's problem, not a panic.
+        let mut bad = v6_chain_packet(&[43, IPV6_FRAGMENT], 6);
+        bad[41] = 0xff;
+        assert_eq!(nat.translate(&mut bad, false), Verdict::Stack);
+        let mut bad = v6_chain_packet(&[51, IPV6_FRAGMENT], 6);
+        bad[41] = 0xff;
+        assert_eq!(nat.translate(&mut bad, false), Verdict::Stack);
     }
 
     #[test]
@@ -770,7 +966,10 @@ mod tests {
         }
         nat.sweep();
         assert_eq!(nat.len(), 0);
-        assert!(nat.table.lock().by_flow.is_empty());
+        let t = nat.table.lock();
+        assert!(t.by_flow.is_empty());
+        // The sweep also reclaims the evicted entry's stale deque slot.
+        assert!(t.pending_order.is_empty());
     }
 
     /// A TSO/GRO packet from an offload device: the TCP field holds the
