@@ -101,6 +101,7 @@ impl OutboundBinding {
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::OutboundBinding;
+    use crate::tun::{TunListener, TunListenerConfig, TunRouteScope, TunStack};
 
     /// Loopback exists on every host.
     const LO: &str = if cfg!(target_os = "macos") {
@@ -156,21 +157,21 @@ mod tests {
         assert!(meow_common::outbound_interface().is_none());
     }
 
-    fn global_listener(binding: OutboundBinding) -> super::super::TunListener {
-        super::super::TunListener::new(
+    fn global_listener(binding: OutboundBinding) -> TunListener {
+        TunListener::new(
             crate::test_rule_tunnel(),
-            super::super::TunListenerConfig {
+            TunListenerConfig {
                 device: None,
                 mtu: 1500,
                 inet4_address: "172.19.0.1/30".parse().unwrap(),
                 inet6_address: None,
                 auto_route: true,
-                route_scope: super::super::TunRouteScope::Global,
+                route_scope: TunRouteScope::Global,
                 outbound_interface: Some(LO.into()),
                 dns_hijack: false,
                 udp_timeout: std::time::Duration::from_secs(60),
                 max_connections: 0,
-                stack: super::super::TunStack::Lwip,
+                stack: TunStack::Lwip,
             },
             "meow-tun-test".into(),
         )

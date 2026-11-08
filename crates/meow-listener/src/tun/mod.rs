@@ -2,11 +2,15 @@
 //!
 //! This is the transparent-proxy path for platforms without a
 //! tproxy/REDIRECT firewall — Windows first and foremost — and works the
-//! same on Linux and macOS. A `tun-rs` device receives raw IP packets; the
-//! lwIP userspace TCP/IP stack ([`lwip`](https://github.com/madeye/lwip))
+//! same on Linux and macOS. A `tun-rs` device receives raw IP packets;
+//! by default the lwIP userspace TCP/IP stack
+//! ([`lwip`](https://github.com/madeye/lwip))
 //! terminates them and hands us ordinary `AsyncRead + AsyncWrite` streams
 //! (TCP) and a packet-level UDP socket, which are dispatched into the
-//! tunnel exactly like every other inbound.
+//! tunnel exactly like every other inbound. On Linux `tun.stack: system`
+//! instead hands TCP to the host kernel through an in-pump NAT and parses
+//! UDP off the device directly (`system.rs`); lwIP still terminates
+//! whatever those two leave (fragments, extension headers, ICMP).
 //!
 //! lwIP's accept hook runs only after the TCP handshake, so a SYN-only
 //! packet never becomes a `TcpStream`. PCB / window / heap caps live in
@@ -500,7 +504,12 @@ impl TunListener {
                 MAX_TUN_RETRIES,
             );
 
-            let offload = cfg.stack == TunStack::System;
+            // Only Linux opens the device with offload (the system
+            // stack's virtio framing): elsewhere `stack: system` falls
+            // back to lwIP, so the flag must not turn a plain
+            // device-create failure into a bogus "offload unavailable"
+            // warn-and-retry.
+            let offload = cfg!(target_os = "linux") && cfg.stack == TunStack::System;
             match tokio::task::spawn_blocking(move || -> io::Result<(tun_rs::AsyncDevice, u32)> {
                 let make = |offload: bool| {
                 let mut builder = tun_rs::DeviceBuilder::new().mtu(mtu);
@@ -526,10 +535,13 @@ impl TunListener {
                     builder = builder.name(n);
                 }
                 // Pin the Wintun DLL we resolved above so tun-rs does not
-                // walk the process DLL search path.
+                // walk the process DLL search path. The clone keeps
+                // `make` callable a second time — moving the String out
+                // would make it FnOnce and the no-offload fallback below
+                // would not compile.
                 #[cfg(target_os = "windows")]
                 {
-                    builder = builder.wintun_file(wintun_file).wintun_log(true);
+                    builder = builder.wintun_file(wintun_file.clone()).wintun_log(true);
                 }
                 // tun-rs opens a same-named, non-orphaned adapter instead
                 // of creating one (an orphaned one it replaces), and
@@ -1121,7 +1133,16 @@ impl TunListener {
                                 .await;
                         });
                     }
-                    None => break Err("system stack TCP listener closed".into()),
+                    // `accept_system` yields None only when `flow_slot`
+                    // fails — the max-connections semaphore closed, which
+                    // nothing does while the listener holds it; this arm
+                    // is effectively unreachable.
+                    None => {
+                        break Err(
+                            "system stack accept loop ended: connection-limit semaphore closed"
+                                .into(),
+                        )
+                    }
                 },
                 joined = &mut pump_in => {
                     break Err(pump_error("device→stack", joined).into());

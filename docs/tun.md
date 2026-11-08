@@ -7,9 +7,10 @@ without a tproxy/REDIRECT firewall — Windows first and foremost. The same
 inbound works on Linux and macOS.
 
 The TUN inbound creates an L3 network device (`wintun` on Windows, `tun` on
-Linux, `utun` on macOS), terminates the raw IP packets in a userspace TCP/IP
-stack ([lwIP](https://github.com/madeye/lwip), via the in-tree tun2socks
-bindings), and dispatches the
+Linux, `utun` on macOS), terminates the raw IP packets — by default in a
+userspace TCP/IP stack ([lwIP](https://github.com/madeye/lwip), via the
+in-tree tun2socks bindings); on Linux `stack: system` hands TCP to the
+host kernel instead — and dispatches the
 resulting TCP/UDP flows through meow's normal routing engine — rules, proxy
 groups, statistics, and the REST API all behave exactly as they do for the
 other inbounds.
@@ -493,9 +494,9 @@ Get-NetRoute -DestinationPrefix 0.0.0.0/1, 128.0.0.0/1   # after stopping meow: 
 | `auto-route` | `true` | What to route into the device at startup (removed on shutdown): `true` = everything the host sends, IPv6 too with `inet6-address` (global scope; Linux, macOS and Windows, fake-ip scope elsewhere); `global` = the same; `fake-ip` = the fake-ip range only; `false` = nothing. See *Route scopes*. |
 | `outbound-interface` | auto-detect | Physical interface outbound sockets bind to in global scope — the interface name on Linux/macOS (`eth0`, `en0`), the interface alias on Windows (`Ethernet`). Ignored otherwise. |
 | `dns-hijack` | on | In-process answering of UDP :53 flows entering the device, and in fake-ip mode the OS resolver redirect. Absent = on; a list with any `:53` entry = on; `[]` = off. Non-`:53` entries warn and are ignored. |
-| `stack` | `lwip` | `system` (or `mixed`): TCP is terminated by the host kernel — the pump rewrites each TCP packet's addresses to a kernel listener on the device address and back (a NAT inside the device subnet, so `inet4-address` needs a /31 or wider) — like mihomo's system stack; several times the throughput per CPU, and DIRECT flows splice in the kernel. UDP is parsed and built in the pump (mihomo's `mixed` uses gVisor for it; here `mixed` is `system`, with a warning); IP fragments and IPv6 extension headers go to lwIP, which reassembles UDP, while fragmented TCP is dropped. Without TSO on TUN the device opens without offload. Linux only (Windows and macOS keep lwIP); `gvisor` falls back to `lwip` with a warning. |
+| `stack` | `lwip` | `system` (or `mixed`): TCP is terminated by the host kernel — the pump rewrites each TCP packet's addresses to a kernel listener on the device address and back (a NAT inside the device subnet, so `inet4-address` needs a /31 or wider) — like mihomo's system stack; several times the throughput per CPU, and DIRECT flows splice in the kernel. UDP is parsed and built in the pump for both values — mihomo's `system` also uses the kernel for UDP and its `mixed` uses gVisor, so `mixed` maps to `system` here with a warning; IP fragments and IPv6 extension headers go to lwIP, which reassembles UDP, while fragmented TCP is dropped. Without TSO on TUN the device opens without offload. Linux only (Windows and macOS keep lwIP); `gvisor` and `mips` (mihomo's own stack) fall back to `lwip` with a warning. |
 | `udp-timeout` | `60` | Seconds of idle before a UDP flow is evicted. |
-| `max-connections` | `256` | Inherited from the top-level `max-connections` (`0` = unlimited); bounds **TCP** flows (a flow takes its slot when it leaves the 200 ms sniff window, so one that closes inside it never occupies one) — a change while TUN runs restarts the listener. The UDP flow table has its own fixed bound (1024 live flows, least-recently-active eviction) that `max-connections` does not adjust. |
+| `max-connections` | `256` | Inherited from the top-level `max-connections` (`0` = unlimited); bounds **TCP** flows — on lwIP a flow takes its slot when it leaves the 200 ms sniff window, so one that closes inside it never occupies one; under `stack: system` the slot is taken when the kernel accepts the connection, just before the window — a change while TUN runs restarts the listener. The UDP flow table has its own fixed bound (1024 live flows, least-recently-active eviction) that `max-connections` does not adjust. |
 
 mihomo fields meow does not implement (`strict-route`,
 `auto-detect-interface`, `mtu-v6`, `endpoint-independent-nat`,

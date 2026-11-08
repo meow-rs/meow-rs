@@ -214,6 +214,17 @@ impl Nat {
                 _ => return Verdict::Drop,
             }
         } else {
+            // Trust boundary: B is the NAT's own peer address — it is
+            // assigned to nothing, so nothing can legitimately source
+            // packets from it, and a forged one (a LAN peer forwarded in
+            // under loose rp_filter) must not mint a NAT entry. A is not
+            // checked the same way: the host's own unsourced sockets take
+            // the device address, so A is *the* ordinary client source —
+            // forged A-sourced packets are indistinguishable from real
+            // host flows, which is the kernel's martian filtering's job.
+            if src == a.b4 {
+                return Verdict::Drop;
+            }
             if super::udp::is_looping_dst(std::net::IpAddr::V4(dst), self.nets) {
                 return Verdict::Drop;
             }
@@ -279,6 +290,10 @@ impl Nat {
                 _ => return Verdict::Drop,
             }
         } else {
+            // As on IPv4: the NAT peer b6 is never a client source.
+            if src == b6 {
+                return Verdict::Drop;
+            }
             if super::udp::is_looping_dst(std::net::IpAddr::V6(dst), self.nets) {
                 return Verdict::Drop;
             }
@@ -315,11 +330,14 @@ impl Nat {
         let syn = flags & (TCP_SYN | TCP_ACK | TCP_RST | TCP_FIN) == TCP_SYN;
         let mut t = self.table.lock();
         if let Some(&port) = t.by_flow.get(&(client, dst)) {
-            let closing = matches!(
-                t.by_port.get(&port).map(|e| e.state),
-                Some(State::Closing(_))
-            );
-            if !(syn && closing) {
+            // A non-SYN packet on a known flow — the common case — needs
+            // no `by_port` probe: only a SYN may reopen a closing entry.
+            if !syn
+                || !matches!(
+                    t.by_port.get(&port).map(|e| e.state),
+                    Some(State::Closing(_))
+                )
+            {
                 return Some(port);
             }
         }
@@ -815,6 +833,31 @@ mod tests {
         assert_eq!(nat.translate(&mut udp, false), Verdict::Stack);
         assert_eq!(udp, before);
         assert_eq!(nat.len(), 0);
+    }
+
+    /// The NAT peer addresses (B, b6) are assigned to nothing: a packet
+    /// claiming them as source in the client direction is forged and must
+    /// not mint an entry. The device addresses (A, a6) are different —
+    /// the host's own unsourced sockets take them, so they stay legal
+    /// client sources.
+    #[test]
+    fn nat_peers_are_not_client_sources_but_device_addrs_are() {
+        let nat = nat();
+        let d: Ipv6Addr = "2606:4700::1111".parse().unwrap();
+
+        let mut forged = v4_packet([172, 31, 0, 2], 51000, [1, 1, 1, 1], 443, TCP_SYN);
+        assert_eq!(nat.translate(&mut forged, false), Verdict::Drop);
+        let b6: Ipv6Addr = "fdfe:dcba:9876::2".parse().unwrap();
+        let mut forged6 = v6_packet(b6, 51000, d, 443, TCP_SYN);
+        assert_eq!(nat.translate(&mut forged6, false), Verdict::Drop);
+        assert_eq!(nat.len(), 0);
+
+        // The host's own flows source the device address.
+        let mut own = v4_packet([172, 31, 0, 1], 51000, [1, 1, 1, 1], 443, TCP_SYN);
+        assert_eq!(nat.translate(&mut own, false), Verdict::Write);
+        let a6: Ipv6Addr = "fdfe:dcba:9876::1".parse().unwrap();
+        let mut own6 = v6_packet(a6, 51000, d, 443, TCP_SYN);
+        assert_eq!(nat.translate(&mut own6, false), Verdict::Write);
     }
 
     /// Multicast and broadcast SYNs get no NAT entry; at the half-open

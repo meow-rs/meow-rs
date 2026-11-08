@@ -392,9 +392,9 @@ pub type RawHosts = IndexMap<String, HostsValue>;
 /// `tun:` YAML section (issue #326) — mihomo-compatible TUN inbound.
 ///
 /// Only the fields meow-rs implements are typed; upstream-only fields
-/// (`stack`, `strict-route`, `auto-detect-interface`, …) are accepted and
-/// produce a `warn!` (Class B per ADR-0002, forward-compat), never a parse
-/// error — the same policy as [`RawGeoDataConfig`] and #328.
+/// (`strict-route`, `auto-detect-interface`, `auto-redirect`, …) are
+/// accepted and produce a `warn!` (Class B per ADR-0002, forward-compat),
+/// never a parse error — the same policy as [`RawGeoDataConfig`] and #328.
 ///
 /// `PartialEq` backs the config-commit TUN reconcile: the primary diff
 /// compares the parsed [`crate::TunConfig`]s, and this raw equality is the
@@ -436,8 +436,11 @@ pub struct RawTun {
     /// global route scope into IPv6 capture (#375); ignored with a
     /// warning in every other mode. Default: none (IPv4 only).
     pub inet6_address: Option<serde_json::Value>,
-    // Upstream-only fields accepted for forward-compat; warn and ignore.
+    /// `stack` — which stack terminates the device's TCP: `system`/`mixed`
+    /// hand it to the host kernel (Linux; lwIP elsewhere), anything else
+    /// keeps lwIP. Free-form JSON: non-string values warn and keep lwIP.
     pub stack: Option<serde_json::Value>,
+    // Upstream-only fields accepted for forward-compat; warn and ignore.
     pub strict_route: Option<serde_json::Value>,
     pub auto_detect_interface: Option<serde_json::Value>,
     pub auto_redirect: Option<serde_json::Value>,

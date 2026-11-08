@@ -120,6 +120,77 @@ struct FlowEntry {
     last_activity: Arc<AtomicU64>,
 }
 
+/// One loop's flow table bundled with its share of the shared occupancy
+/// gauge (`TunReady::Ready.udp_flows`, issue #515): every mutation applies
+/// its gauge delta here so the two can never drift, and `Drop` returns the
+/// remaining count even when the loop's future is aborted mid-park
+/// (listener shutdown) — a tail `fetch_sub` never ran in that case and
+/// the gauge kept a dead loop's flows.
+struct FlowTable {
+    map: HashMap<FlowKey, FlowEntry>,
+    gauge: Arc<AtomicUsize>,
+}
+
+impl FlowTable {
+    fn new(gauge: Arc<AtomicUsize>) -> Self {
+        Self {
+            map: HashMap::new(),
+            gauge,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    fn get(&self, key: &FlowKey) -> Option<&FlowEntry> {
+        self.map.get(key)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&FlowKey, &FlowEntry)> {
+        self.map.iter()
+    }
+
+    /// A fresh key is the only growth: replacing an entry keeps the
+    /// count rather than leaking one.
+    fn insert(&mut self, key: FlowKey, entry: FlowEntry) {
+        if self.map.insert(key, entry).is_none() {
+            self.gauge.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn remove(&mut self, key: &FlowKey) {
+        if self.map.remove(key).is_some() {
+            self.sub(1);
+        }
+    }
+
+    /// `map.retain` plus the gauge delta of however many entries it shed.
+    fn retain(&mut self, f: impl FnMut(&FlowKey, &mut FlowEntry) -> bool) {
+        let before = self.map.len();
+        self.map.retain(f);
+        self.sub(before - self.map.len());
+    }
+
+    /// Saturating subtract: a delta missed by a future change must never
+    /// wrap the shared gauge to `usize::MAX`.
+    fn sub(&self, n: usize) {
+        let _ = self
+            .gauge
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(n))
+            });
+    }
+}
+
+impl Drop for FlowTable {
+    fn drop(&mut self) {
+        // The loop may end without draining (aborted while parked on
+        // `incoming.next()`): give this table's share back either way.
+        self.sub(self.map.len());
+    }
+}
+
 pub(super) async fn run_udp(
     tunnel: Tunnel,
     io: UdpIo,
@@ -150,11 +221,12 @@ pub(super) async fn run_udp(
         UdpIo::Direct { incoming, replies } => (replies, Incoming::Direct(incoming)),
     };
 
-    // Flow table, touched only by this loop. A flow task signals its own
-    // death by closing its queue; the entry is evicted lazily — on the next
-    // datagram for the tuple, by the periodic sweep, or by LRU eviction
-    // when the table reaches MAX_FLOWS (issue #515).
-    let mut flows: HashMap<FlowKey, FlowEntry> = HashMap::new();
+    // Flow table, touched only by this loop — its `Drop` returns the
+    // gauge share however this future ends. A flow task signals its own
+    // death by closing its queue; the entry is evicted lazily — on the
+    // next datagram for the tuple, by the periodic sweep, or by LRU
+    // eviction when the table reaches MAX_FLOWS (issue #515).
+    let mut flows = FlowTable::new(live_flows);
     let mut sweep_countdown = SWEEP_INTERVAL;
     let hijack_permits = Arc::new(tokio::sync::Semaphore::new(HIJACK_IN_FLIGHT));
     let hijack_dropped = Arc::new(AtomicU64::new(0));
@@ -232,13 +304,9 @@ pub(super) async fn run_udp(
         sweep_countdown -= 1;
         if sweep_countdown == 0 {
             sweep_countdown = SWEEP_INTERVAL;
-            // `live_flows` is shared with the sibling `run_udp` task (the
-            // system stack runs one for direct UDP and one for lwIP
-            // leftovers): only this table's deltas are applied, so the
-            // gauge reads the sum of both.
-            let before = flows.len();
+            // `FlowTable` applies the gauge delta of whatever it sheds —
+            // and on `Drop` for whatever is left.
             flows.retain(|_, e| !e.tx.is_closed());
-            live_flows.fetch_sub(before - flows.len(), Ordering::Relaxed);
         }
 
         let key = (src, dst);
@@ -253,7 +321,6 @@ pub(super) async fn run_udp(
                     // through to re-create the flow with this datagram.
                     Err(mpsc::error::TrySendError::Closed(data)) => {
                         flows.remove(&key);
-                        live_flows.fetch_sub(1, Ordering::Relaxed);
                         data
                     }
                 }
@@ -286,9 +353,7 @@ pub(super) async fn run_udp(
         // Admission bound: reclaim dead entries first, then evict the
         // least-recently-active live flow.
         if flows.len() >= MAX_FLOWS {
-            let before = flows.len();
             evict_for_admission(&mut flows);
-            live_flows.fetch_sub(before - flows.len(), Ordering::Relaxed);
         }
 
         let (tx, rx) = mpsc::channel(FLOW_QUEUE);
@@ -301,7 +366,6 @@ pub(super) async fn run_udp(
                 last_activity: Arc::clone(&last_activity),
             },
         );
-        live_flows.fetch_add(1, Ordering::Relaxed);
         tokio::spawn(flow_task(
             tunnel.clone(),
             FlowSpec {
@@ -314,7 +378,8 @@ pub(super) async fn run_udp(
             },
         ));
     }
-    live_flows.fetch_sub(flows.len(), Ordering::Relaxed);
+    // `flows` drops here, returning this table's share of the gauge —
+    // also when the future is aborted mid-loop and never reaches this line.
 }
 
 /// Per-flow state handed to the spawned flow task.
@@ -346,8 +411,9 @@ fn note_hijack_drop(counter: &AtomicU64) {
 /// reports itself — then, if the table is still at `MAX_FLOWS`, the
 /// least-recently-active live flow is evicted. Dropping the evicted
 /// sender closes that flow's queue; its task exits through the ordinary
-/// `rx.recv() == None` shutdown path.
-fn evict_for_admission(flows: &mut HashMap<FlowKey, FlowEntry>) {
+/// `rx.recv() == None` shutdown path. The gauge deltas ride along inside
+/// [`FlowTable`]'s `retain`/`remove`.
+fn evict_for_admission(flows: &mut FlowTable) {
     flows.retain(|_, e| !e.tx.is_closed());
     if flows.len() >= MAX_FLOWS {
         if let Some(victim) = flows
@@ -590,8 +656,7 @@ pub(super) fn is_looping_dst(dst: std::net::IpAddr, tun_net: TunNets) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{evict_for_admission, is_looping_dst, FlowEntry, TunNets, MAX_FLOWS};
-    use std::collections::HashMap;
+    use super::{evict_for_admission, is_looping_dst, FlowEntry, FlowTable, TunNets, MAX_FLOWS};
     use std::net::{IpAddr, SocketAddr};
 
     /// Build a flow table holding `live` live entries plus `dead` entries
@@ -601,11 +666,8 @@ mod tests {
     fn seeded_table(
         live: usize,
         dead: usize,
-    ) -> (
-        HashMap<super::FlowKey, FlowEntry>,
-        Vec<tokio::sync::mpsc::Receiver<Vec<u8>>>,
-    ) {
-        let mut flows = HashMap::new();
+    ) -> (FlowTable, Vec<tokio::sync::mpsc::Receiver<Vec<u8>>>) {
+        let mut flows = FlowTable::new(std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)));
         let mut keepers = Vec::new();
         for i in 0..(live + dead) {
             let (tx, rx) = tokio::sync::mpsc::channel(1);
@@ -640,7 +702,7 @@ mod tests {
         evict_for_admission(&mut flows);
         assert_eq!(flows.len(), MAX_FLOWS - 1);
         assert!(
-            !flows.contains_key(&oldest_key),
+            flows.get(&oldest_key).is_none(),
             "the least-recently-active live flow must be the victim"
         );
         // A live flow whose shared stamp is refreshed by an upstream reply
@@ -656,9 +718,9 @@ mod tests {
             .last_activity
             .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
         evict_for_admission(&mut flows);
-        assert!(flows.contains_key(&oldest_key), "refreshed flow survives");
+        assert!(flows.get(&oldest_key).is_some(), "refreshed flow survives");
         assert!(
-            !flows.contains_key(&next_oldest_key),
+            flows.get(&next_oldest_key).is_none(),
             "the new least-recently-active flow is evicted instead"
         );
     }
@@ -734,6 +796,16 @@ mod tests {
         drop(tx1);
         t1.await.unwrap();
         wait_gauge(&gauge, 1).await;
+
+        // An aborted loop (listener shutdown) returns its share too —
+        // `FlowTable`'s `Drop`, not a tail statement, gives it back.
+        let (tx3, t3) = spawn();
+        tx3.send(pkt(3)).await.unwrap();
+        wait_gauge(&gauge, 2).await;
+        t3.abort();
+        let _ = t3.await;
+        wait_gauge(&gauge, 1).await;
+
         drop(tx2);
         t2.await.unwrap();
         assert_eq!(gauge.load(Ordering::Relaxed), 0);

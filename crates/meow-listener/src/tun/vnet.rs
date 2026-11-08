@@ -101,19 +101,21 @@ pub(super) fn to_plain(framed: &mut [u8]) -> Vec<Vec<u8>> {
     }
 }
 
-/// Without offload framing (off Linux) there is nothing to undo.
+/// Without offload framing (off Linux) there is nothing to undo — and no
+/// caller: `vnet_framing` is false off Linux, so the pump arms never
+/// reach this. Blindly stripping the header from a plain packet would
+/// mangle it, so unreachable is the honest stub.
 #[cfg(not(target_os = "linux"))]
-pub(super) fn to_plain(framed: &mut [u8]) -> Vec<Vec<u8>> {
-    framed
-        .get(HDR_LEN..)
-        .map(<[u8]>::to_vec)
-        .into_iter()
-        .collect()
+pub(super) fn to_plain(_framed: &mut [u8]) -> Vec<Vec<u8>> {
+    unreachable!("virtio-net framing exists only on Linux");
 }
 
 /// Finish a `NEEDS_CSUM` checksum: sum from `csum_start` on, seeded with the
 /// pseudo-header sum the field holds.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "callers are cfg(linux) or cfg(test) only")
+)]
 fn complete_checksum(pkt: &mut [u8], csum_start: u16, csum_offset: u16) {
     let start = usize::from(csum_start);
     let at = start + usize::from(csum_offset);

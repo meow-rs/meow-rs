@@ -319,9 +319,9 @@ pub struct TunConfig {
 
 /// `tun.stack`. `system` and `mixed` hand TCP to the host
 /// kernel's stack, as mihomo's system stack does (Linux; elsewhere the
-/// listener falls back to lwIP); anything else (`gvisor`, `lwip`, unset)
-/// keeps the userspace lwIP stack. Under `system` UDP is handled in the
-/// pump (fragments and ICMP still go to lwIP).
+/// listener falls back to lwIP); anything else (`gvisor`, `mips`, `lwip`,
+/// unset) keeps the userspace lwIP stack. Under `system` UDP is handled
+/// in the pump (fragments and ICMP still go to lwIP).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TunStack {
     #[default]
@@ -557,6 +557,10 @@ fn parse_tun_stack(raw: Option<&serde_json::Value>) -> TunStack {
         }
         Some("gvisor") => {
             warn!("tun.stack: gvisor is not available; using the userspace (lwip) stack");
+            TunStack::Lwip
+        }
+        Some("mips") => {
+            warn!("tun.stack: mips (mihomo's own stack) is not available; using the userspace (lwip) stack");
             TunStack::Lwip
         }
         Some("lwip" | "") => TunStack::Lwip,

@@ -128,8 +128,10 @@ async fn device_to_stack(
         if let Some(nat) = &nat {
             match nat.translate(&mut buf[hdr_len..n], partial) {
                 Verdict::Write => {
-                    // A full device queue drops the packet, as a NIC would;
-                    // TCP retransmits it.
+                    // `send` waits for device queue space — a blocking
+                    // write like mihomo's system stack does; the pause
+                    // back-pressures this read loop and TCP flow control
+                    // absorbs it. Only a real send failure drops the packet.
                     if let Err(e) = end.device.device.send(&buf[..n]).await {
                         tracing::debug!("tun system stack: device write failed: {e}");
                     }
@@ -214,7 +216,9 @@ async fn stack_to_device(
                     continue;
                 };
                 if direct_udp::build(&mut framed, vnet, &data, src, dst, &mut ip_id) {
-                    // A full device queue drops the datagram (UDP semantics).
+                    // The send waits for queue space like the TCP arm
+                    // above — the bounded reply queue absorbs bursts;
+                    // only a real send failure drops the datagram.
                     if let Err(e) = end.device.device.send(&framed).await {
                         tracing::debug!("tun UDP: device write failed: {e}");
                     }
