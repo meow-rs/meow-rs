@@ -160,7 +160,12 @@ async fn connect_new(cfg: Arc<Config>) -> Result<ConnHandle> {
 
     let mut last_error = None;
     for addr in addrs {
-        match timeout(CONNECT_TIMEOUT, connect_addr(&cfg, addr, &server_name)).await {
+        match timeout(
+            CONNECT_TIMEOUT,
+            connect_addr(&cfg, addr, &server_name, driver::AckCoalesce::default()),
+        )
+        .await
+        {
             Ok(Ok(handle)) => return Ok(handle),
             Ok(Err(e)) => last_error = remember(last_error, e),
             Err(_) => {
@@ -190,10 +195,14 @@ fn remember(prev: Option<Error>, next: Error) -> Option<Error> {
     }
 }
 
-async fn connect_addr(
+/// `pub(super)` so `driver_tests` can dial a driver with non-default
+/// `coalesce` thresholds — the [`ReconnectableClient`] path above always
+/// takes [`driver::AckCoalesce`]'s default.
+pub(super) async fn connect_addr(
     cfg: &Config,
     server_addr: SocketAddr,
     server_name: &str,
+    coalesce: driver::AckCoalesce,
 ) -> Result<ConnHandle> {
     // The socket's family follows the canonical server address.
     let server_addr = meow_common::canonical_socket_addr(server_addr);
@@ -218,7 +227,7 @@ async fn connect_addr(
     let conn = quiche::connect(Some(server_name), &scid, local, server_addr, &mut config)
         .map_err(|e| Error::Quic(format!("connect start: {e}")))?;
 
-    driver::spawn(cfg, socket, local, server_addr, conn).await
+    driver::spawn(cfg, socket, local, server_addr, conn, coalesce).await
 }
 
 /// The receive buffer quic-go asks for. The OS default (about 208 KiB on

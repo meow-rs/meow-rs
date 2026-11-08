@@ -103,6 +103,26 @@ const ACK_COALESCE_DELAY: Duration = Duration::from_micros(200);
 /// application command arrived within this window (request/response,
 /// uploads).
 const ACK_COALESCE_APP_QUIET: Duration = Duration::from_millis(1);
+
+/// The ACK-coalescing thresholds a [`State`] runs with — a parameter rather
+/// than the raw constants so a test can pin them: `driver_tests`'s download
+/// test holds `delay` open for a whole transfer, leaving [`ACK_COALESCE_PKTS`]
+/// the only hold-ender and the measured ACK ratio independent of how fast
+/// the runner's timer is. Production always takes `Self::default()`.
+pub(crate) struct AckCoalesce {
+    pkts: u32,
+    delay: Duration,
+}
+
+impl Default for AckCoalesce {
+    fn default() -> Self {
+        Self {
+            pkts: ACK_COALESCE_PKTS,
+            delay: ACK_COALESCE_DELAY,
+        }
+    }
+}
+
 /// Largest payload chunk handed to a stream's reader in one channel item;
 /// with [`STREAM_READ_CHANNEL_CAP`] it bounds what a slow reader holds.
 const READ_CHUNK_BYTES: usize = 16 * 1024;
@@ -215,6 +235,8 @@ struct State {
     /// backpressure, encode/queue failures and full per-session
     /// queues. Per connection, per [`note_drop`]'s scoping rule.
     dropped_udp: AtomicU64,
+    /// ACK-coalescing thresholds — see [`AckCoalesce`].
+    coalesce: AckCoalesce,
     closed: Arc<AtomicBool>,
 }
 
@@ -231,6 +253,7 @@ pub(crate) async fn spawn(
     local: SocketAddr,
     peer: SocketAddr,
     conn: quiche::Connection,
+    coalesce: AckCoalesce,
 ) -> Result<ConnHandle> {
     let (cmd_tx, cmd_rx) = mpsc::channel(CMD_CHANNEL_CAP);
     let read_notify = Arc::new(Notify::new());
@@ -257,6 +280,7 @@ pub(crate) async fn spawn(
         next_udp_session_id: 0,
         next_packet_id: 0,
         dropped_udp: AtomicU64::new(0),
+        coalesce,
         closed: Arc::clone(&closed),
     };
 
@@ -311,7 +335,10 @@ async fn run(
     tokio::pin!(timer);
     let mut armed = None;
     // ACK coalescing: datagrams received (and when the first arrived) since
-    // the last flush, and its own deadline timer.
+    // the last flush, and its own deadline timer. The timer is load-bearing:
+    // quiche keeps no delayed-ACK timer of its own — an ACK rides on whatever
+    // the next `send()` emits — so without it a lone datagram's ACK would
+    // leave only when the peer's next PTO probe woke the driver.
     let mut ack_pending: u32 = 0;
     let mut ack_since: Option<tokio::time::Instant> = None;
     let ack_timer = tokio::time::sleep(Duration::ZERO);
@@ -409,38 +436,45 @@ async fn run(
         // (Frames quiche queues internally still can — they wait at most the
         // delay below.)
         let mut queued = cleanup_streams(&mut st, &mut conn);
+        // Payload this wakeup pulled out of quiche for the app — stream
+        // bytes/FIN or a QUIC datagram — is the only receive work that may
+        // feed a hold: pure ACK-only packets owe no ACK, so they neither
+        // start nor extend one and an upload's inbound ACK stream never
+        // delays its own stream data behind the deadline.
+        let mut delivered = false;
         if auth_done {
-            pump_reads(&mut st, &mut conn, &mut buf);
-            pump_datagrams(&mut st, &mut conn, &mut buf);
+            delivered |= pump_reads(&mut st, &mut conn, &mut buf);
+            delivered |= pump_datagrams(&mut st, &mut conn, &mut buf);
         }
         queued |= pump_writes(&mut st, &mut conn);
         queued |= cleanup_streams(&mut st, &mut conn);
 
-        // Only a receive or read-notify wakeup may skip the flush, and only
-        // while it queued nothing explicitly; commands, quiche's timer,
-        // keep-alive, a closed connection and the coalescing deadline always
-        // send. The hold is bounded regardless: a skipped flush may still
-        // carry flow-control frames quiche queued internally — they wait at
-        // most ACK_COALESCE_DELAY.
+        // Only a payload-delivering or read-notify wakeup may skip the
+        // flush, and only while it queued nothing explicitly; commands,
+        // quiche's timer, keep-alive, a closed connection and the
+        // coalescing deadline always send. The hold is bounded regardless:
+        // a skipped flush may still carry flow-control frames quiche queued
+        // internally — they wait at most `coalesce.delay`.
         let now = tokio::time::Instant::now();
         if woke_on_cmd {
             last_app_cmd = Some(now);
         }
         if auth_done && last_app_cmd.is_none_or(|t| now.duration_since(t) >= ACK_COALESCE_APP_QUIET)
         {
-            if received > 0 {
+            let delivered_payload = received > 0 && delivered;
+            if delivered_payload {
                 ack_pending += received;
                 if ack_since.is_none() {
                     ack_since = Some(now);
-                    ack_timer.as_mut().reset(now + ACK_COALESCE_DELAY);
+                    ack_timer.as_mut().reset(now + st.coalesce.delay);
                 }
             }
             if let Some(since) = ack_since {
-                if (received > 0 || woke_on_notify)
+                if (delivered_payload || woke_on_notify)
                     && !queued
                     && !conn.is_closed()
-                    && ack_pending < ACK_COALESCE_PKTS
-                    && now.duration_since(since) < ACK_COALESCE_DELAY
+                    && ack_pending < st.coalesce.pkts
+                    && now.duration_since(since) < st.coalesce.delay
                 {
                     continue;
                 }
@@ -592,7 +626,12 @@ fn pump_writes(st: &mut State, conn: &mut quiche::Connection) -> bool {
     queued
 }
 
-fn pump_reads(st: &mut State, conn: &mut quiche::Connection, buf: &mut [u8]) {
+/// Returns `true` when the wakeup moved stream payload — bytes or a FIN —
+/// out of quiche: the only inbound work that owes the peer an ACK worth
+/// coalescing. Draining unclaimed streams does not count — no reader ever
+/// sees those bytes.
+fn pump_reads(st: &mut State, conn: &mut quiche::Connection, buf: &mut [u8]) -> bool {
+    let mut delivered = false;
     for s in st.streams.values_mut() {
         let _ = flush_pending(s);
     }
@@ -606,6 +645,7 @@ fn pump_reads(st: &mut State, conn: &mut quiche::Connection, buf: &mut [u8]) {
             loop {
                 match conn.stream_recv(id, buf) {
                     Ok((n, fin)) => {
+                        delivered |= n > 0 || fin;
                         if n > 0 {
                             ingest(s, &buf[..n]);
                         }
@@ -648,6 +688,7 @@ fn pump_reads(st: &mut State, conn: &mut quiche::Connection, buf: &mut [u8]) {
             }
         }
     }
+    delivered
 }
 
 /// Feed received stream bytes into a proxy stream, parsing the hysteria2 TCP
@@ -706,8 +747,12 @@ fn flush_pending(s: &mut StreamState) -> bool {
     true
 }
 
-fn pump_datagrams(st: &mut State, conn: &mut quiche::Connection, buf: &mut [u8]) {
+/// Returns `true` when the wakeup carried QUIC datagram payload —
+/// [`pump_reads`]'s sibling for the ACK-coalescing rule.
+fn pump_datagrams(st: &mut State, conn: &mut quiche::Connection, buf: &mut [u8]) -> bool {
+    let mut delivered = false;
     while let Ok(n) = conn.dgram_recv(buf) {
+        delivered = true;
         tracing::trace!(bytes = n, "hysteria2 received QUIC datagram");
         match proto::decode_udp_message(&buf[..n]) {
             Ok(msg) => {
@@ -734,6 +779,7 @@ fn pump_datagrams(st: &mut State, conn: &mut quiche::Connection, buf: &mut [u8])
             Err(e) => note_drop(&st.dropped_udp, format_args!("decode UDP message: {e}")),
         }
     }
+    delivered
 }
 
 fn send_udp(

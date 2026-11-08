@@ -628,18 +628,61 @@ async fn reset_releases_the_cached_connection_and_reconnects() {
     assert!(client.reset(), "the reconnected connection was cached");
 }
 
+/// Dial `addr` straight into a driver with non-default [`AckCoalesce`]
+/// thresholds — `ReconnectableClient` always takes the defaults, so the
+/// coalescing tests drive the raw [`ConnHandle`]. The returned handle must
+/// outlive the stream: dropping it aborts the driver task.
+async fn dial_with_coalesce(addr: SocketAddr, coalesce: AckCoalesce) -> (ConnHandle, DuplexStream) {
+    let cfg = Config {
+        server_name: "localhost".into(),
+        insecure: true,
+        ..Config::default()
+    };
+    let handle = crate::hysteria2::client::connect_addr(&cfg, addr, "localhost", coalesce)
+        .await
+        .unwrap();
+    let (reply_tx, reply_rx) = oneshot::channel();
+    handle
+        .cmd_tx
+        .send(Cmd::OpenTcp {
+            first_frame: proto::encode_tcp_request(TARGET, &[]).unwrap(),
+            fast_open: false,
+            reply: reply_tx,
+        })
+        .await
+        .unwrap();
+    let mut stream = reply_rx.await.unwrap().unwrap();
+    stream.wait_connected().await.unwrap();
+    (handle, stream)
+}
+
 /// A pure download: the client writes nothing, so no upstream data carries its
 /// ACKs. With the peer's datagrams arriving one per receive wakeup, held-back
 /// ACKs must cut the ACK-only packets well below one per payload packet (a
 /// driver that flushes on every wakeup answers more than half of them).
+/// The hold's wall-clock deadline would tie the ratio to the runner's speed —
+/// a slow machine drains one datagram per wakeup slower than the deadline —
+/// so the test pins a deadline longer than the transfer itself and leaves the
+/// 8-datagram rule the only hold-ender. Deadline semantics stay with
+/// [`lone_packet_is_acked_within_the_coalescing_deadline`].
 #[tokio::test]
 async fn download_acks_are_coalesced_across_wakeups() {
     let peer = peer(true, Some(0), 16).await;
-    let client = peer.client(false);
-    let mut stream = timeout(TEST_TIMEOUT, client.tcp_connect(TARGET))
-        .await
-        .unwrap()
-        .unwrap();
+    // Longer than the read timeout below: `delay` can never end a hold, so
+    // at most one ACK-only packet leaves per ACK_COALESCE_PKTS payload
+    // packets — ratio 1/8 against the asserted 1/3, on a runner of any speed.
+    let (_handle, mut stream) = timeout(
+        TEST_TIMEOUT,
+        dial_with_coalesce(
+            peer.addr,
+            AckCoalesce {
+                delay: Duration::from_secs(60),
+                ..AckCoalesce::default()
+            },
+        ),
+    )
+    .await
+    .unwrap();
     round_trip(&mut stream).await;
     // Let the application-write quiet window pass and the handshake ACKs drain.
     sleep(Duration::from_millis(50)).await;
@@ -669,7 +712,10 @@ async fn download_acks_are_coalesced_across_wakeups() {
 
 /// A lone packet (a single QUIC datagram, nothing for a reader to wake the
 /// driver with) must not wait for more packets: its ACK leaves within the
-/// coalescing deadline, not at quiche's 25 ms ACK timer.
+/// coalescing deadline. quiche keeps no delayed-ACK timer — an ACK rides on
+/// whatever the next `send()` emits — so the fallback this test rules out is
+/// the ACK leaving only when the peer's next PTO probe wakes the driver
+/// (~35 ms here).
 #[tokio::test]
 async fn lone_packet_is_acked_within_the_coalescing_deadline() {
     let peer = peer(true, Some(0), 16).await;
@@ -697,7 +743,9 @@ async fn lone_packet_is_acked_within_the_coalescing_deadline() {
     lags.sort_unstable();
     let median = lags[lags.len() / 2];
     eprintln!("LONE_ACK_LAG_US {lags:?}");
-    // 200 µs coalescing deadline + tokio's ~1 ms timer granularity + CI
-    // slack — still well under quiche's 25 ms ACK timer this guards against.
-    assert!(median < 12_000, "median ACK lag {median} us: {lags:?}");
+    // The ACK must ride our deadline timer, not the peer's ~35 ms PTO probe.
+    // The real bound is the OS timer tick: ~1 ms on Linux, up to ~16 ms at
+    // Windows' default 15.6 ms resolution. 22 ms clears that with slack
+    // while staying under the 25 ms `max_ack_delay` and the PTO path.
+    assert!(median < 22_000, "median ACK lag {median} us: {lags:?}");
 }
