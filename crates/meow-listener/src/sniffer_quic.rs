@@ -27,6 +27,17 @@ const SALT_V2: [u8; 20] = [
 /// Bound on reassembled ClientHello bytes.
 const MAX_CRYPTO: usize = 16 * 1024;
 
+/// Long-header packets of one datagram this sniffer will walk. A real
+/// coalesced datagram carries at most three long-header packets
+/// (Initial + 0-RTT + Handshake — a Retry is never coalesced, and the
+/// short-header 1-RTT packet that may follow has no length field), so
+/// eight is generous headroom. The bound matters against hostile input:
+/// every Initial in the datagram costs an RFC 9001 key derivation plus
+/// an AEAD open (~3–5 µs), and a 1500-byte datagram can smuggle ~30
+/// minimal Initials — an unbounded walk is a LAN-side CPU amplifier
+/// (review #887).
+const MAX_DATAGRAM_PACKETS: usize = 8;
+
 /// What one datagram did for the sniff.
 #[derive(Debug, PartialEq, Eq)]
 pub enum QuicSniffStep {
@@ -38,37 +49,65 @@ pub enum QuicSniffStep {
     Done,
 }
 
+/// The (key, iv, hp) keyset an Initial's DCID derives (RFC 9001 §5.2) —
+/// cached on the sniffer so a retransmitted Initial does not pay the
+/// four-round HKDF again (review #887). A mid-flow DCID or version flip
+/// simply re-derives and overwrites; a ping-pong of alternating DCIDs
+/// degrades to today's per-packet derivation, never worse.
+struct KeyCache {
+    version: u32,
+    dcid: Vec<u8>,
+    key: Vec<u8>,
+    iv: Vec<u8>,
+    hp: Vec<u8>,
+}
+
 /// Reassembles a client's CRYPTO stream across Initial datagrams.
 #[derive(Default)]
 pub struct QuicSniffer {
     /// `(offset, bytes)` chunks of the Initial CRYPTO stream — disjoint
     /// by construction: a retransmission stores only the ranges it adds.
     chunks: Vec<(usize, Vec<u8>)>,
-    /// Bytes of stream `chunks` covers; bounded at `4 * MAX_CRYPTO`.
+    /// Bytes of stream `chunks` covers. Unique coverage can never reach
+    /// `MAX_CRYPTO`, let alone `4 * MAX_CRYPTO`: every CRYPTO frame's
+    /// `off + len` is capped at `MAX_CRYPTO` in `collect`, so `total`
+    /// only ever sums sub-ranges of `[0, MAX_CRYPTO)`. It is still
+    /// checked there as a defensive belt (unreachable today) — and is
+    /// what the tests read to audit coverage accounting.
     total: usize,
+    /// Keyset derived from the DCID the flow's Initials first carried.
+    keys: Option<KeyCache>,
 }
 
 impl QuicSniffer {
     pub fn feed(&mut self, datagram: &[u8]) -> QuicSniffStep {
-        // A datagram may coalesce several long-header packets: walk them
-        // all. QUIC packets that are not client Initials (0-RTT, Handshake)
-        // are skipped and the sniff goes on, as upstream's does.
+        // A datagram may coalesce several long-header packets: walk them,
+        // bounded at MAX_DATAGRAM_PACKETS. QUIC packets that are not
+        // client Initials (0-RTT, Handshake) are skipped and the sniff
+        // goes on, as upstream's does. The walk stops at the first
+        // successfully opened Initial: a coalesced datagram carries at
+        // most one (the Initial leads, Handshake/0-RTT follow — later
+        // Initials arrive in their own datagrams), so reading on would
+        // only pay decryptions for packets that cannot occur.
         let mut d = datagram;
         let (mut quic, mut opened) = (false, false);
-        while !d.is_empty() {
-            match open_packet(d) {
+        for _ in 0..MAX_DATAGRAM_PACKETS {
+            if d.is_empty() {
+                break;
+            }
+            match self.open_packet(d) {
                 Packet::NotQuic => break,
                 Packet::Other(n) => {
                     quic = true;
                     d = &d[n..];
                 }
-                Packet::Initial(frames, n) => {
+                Packet::Initial(frames, _n) => {
                     quic = true;
                     opened = true;
                     if !self.collect(&frames) {
                         return QuicSniffStep::Done;
                     }
-                    d = &d[n..];
+                    break;
                 }
             }
         }
@@ -78,28 +117,33 @@ impl QuicSniffer {
         if !opened {
             return QuicSniffStep::More;
         }
-        let stream = self.contiguous();
-        // ClientHello: type 1, 24-bit length.
-        if stream.len() < 4 {
+        // ClientHello: type 1, 24-bit length. Read the header off the
+        // reassembly without materializing the stream — the body Vec is
+        // only built once the length it declares is covered.
+        let covered = self.covered_prefix_len();
+        if covered < 4 {
             return QuicSniffStep::More;
         }
-        if stream[0] != 1 {
+        let mut header = [0u8; 4];
+        self.read_prefix(&mut header);
+        if header[0] != 1 {
             return QuicSniffStep::Done;
         }
         let len =
-            usize::from(stream[1]) << 16 | usize::from(stream[2]) << 8 | usize::from(stream[3]);
+            usize::from(header[1]) << 16 | usize::from(header[2]) << 8 | usize::from(header[3]);
         if len + 4 > MAX_CRYPTO {
             return QuicSniffStep::Done;
         }
-        if stream.len() < len + 4 {
+        if covered < len + 4 {
             return QuicSniffStep::More;
         }
+        let stream = self.prefix_vec(len + 4);
         // sniff_tls reads a TLS record: wrap the handshake message in one.
         let mut record = Vec::with_capacity(len + 9);
         record.extend_from_slice(&[0x16, 0x03, 0x01]);
         #[allow(clippy::cast_possible_truncation, reason = "bounded by MAX_CRYPTO")]
         record.extend_from_slice(&((len + 4) as u16).to_be_bytes());
-        record.extend_from_slice(&stream[..len + 4]);
+        record.extend_from_slice(&stream);
         meow_common::sniffer::sniff_tls(&record).map_or(QuicSniffStep::Done, QuicSniffStep::Name)
     }
 
@@ -159,6 +203,9 @@ impl QuicSniffer {
                         self.chunks.push((o, q[o - off..o - off + l].to_vec()));
                         self.total += l;
                     }
+                    // Defensive belt, unreachable today: every stored
+                    // chunk lies inside `[0, MAX_CRYPTO)` (`end` above),
+                    // so unique coverage cannot top that either.
                     if self.total > 4 * MAX_CRYPTO {
                         return false;
                     }
@@ -175,13 +222,28 @@ impl QuicSniffer {
 
     /// The `(offset, len)` sub-ranges of `[off, off + len)` no stored
     /// chunk covers. Chunks are few — an Initial's CRYPTO frames across
-    /// a handful of datagrams — so a sort per arrival is cheap.
+    /// a handful of datagrams — so a sort per partial overlap is cheap,
+    /// and the two hot shapes answer without it: a wholly fresh range
+    /// (first arrival) or one a single chunk already covers (a
+    /// retransmission) need no `Vec` at all (review #887).
     fn uncovered(&self, off: usize, len: usize) -> Vec<(usize, usize)> {
+        let end = off + len;
+        let mut overlaps = false;
+        for (o, d) in &self.chunks {
+            let (s, e) = (*o, o + d.len());
+            if s <= off && e >= end {
+                return Vec::new();
+            }
+            overlaps |= e > off && s < end;
+        }
+        if !overlaps {
+            return vec![(off, len)];
+        }
         let mut ranges: Vec<(usize, usize)> =
             self.chunks.iter().map(|(o, d)| (*o, o + d.len())).collect();
         ranges.sort_unstable();
         let mut out = Vec::new();
-        let (mut start, end) = (off, off + len);
+        let mut start = off;
         for (s, e) in ranges {
             if e <= start {
                 continue;
@@ -201,16 +263,53 @@ impl QuicSniffer {
     }
 
     /// The CRYPTO stream from offset 0 up to the first gap.
+    #[cfg(test)]
     fn contiguous(&mut self) -> Vec<u8> {
+        let n = self.covered_prefix_len();
+        self.prefix_vec(n)
+    }
+
+    /// Bytes of CRYPTO stream covered from offset 0 before the first
+    /// gap — no allocation; the sort keeps the prefix helpers O(chunks).
+    fn covered_prefix_len(&mut self) -> usize {
         self.chunks.sort_unstable_by_key(|c| c.0);
-        let mut out: Vec<u8> = Vec::new();
+        let mut end = 0usize;
         for (off, data) in &self.chunks {
-            if *off > out.len() {
+            if *off > end {
                 break;
             }
-            let skip = out.len() - off;
+            end = end.max(*off + data.len());
+        }
+        end
+    }
+
+    /// Copy the stream's covered prefix into `buf` (chunks sorted by
+    /// [`covered_prefix_len`], coverage checked by the caller).
+    fn read_prefix(&self, buf: &mut [u8]) {
+        let mut written = 0;
+        for (off, data) in &self.chunks {
+            if written == buf.len() || *off > written {
+                break;
+            }
+            let skip = written - *off;
+            let take = (data.len() - skip).min(buf.len() - written);
+            buf[written..written + take].copy_from_slice(&data[skip..skip + take]);
+            written += take;
+        }
+    }
+
+    /// The stream's first `n` covered bytes owned — allocated once per
+    /// completed sniff rather than once per `feed` (review #887).
+    fn prefix_vec(&self, n: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(n);
+        for (off, data) in &self.chunks {
+            if out.len() == n || *off > out.len() {
+                break;
+            }
+            let skip = out.len() - *off;
             if skip < data.len() {
-                out.extend_from_slice(&data[skip..]);
+                let take = (data.len() - skip).min(n - out.len());
+                out.extend_from_slice(&data[skip..skip + take]);
             }
         }
         out
@@ -338,120 +437,156 @@ enum Packet {
     Initial(Vec<u8>, usize),
 }
 
-fn open_packet(d: &[u8]) -> Packet {
-    let Some(first) = d.first().copied() else {
-        return Packet::NotQuic;
-    };
-    if first & 0xc0 != 0xc0 || d.len() < 7 {
-        return Packet::NotQuic; // not a long header
+impl QuicSniffer {
+    /// Parse and — for a client Initial — decrypt the first packet of `d`.
+    fn open_packet(&mut self, d: &[u8]) -> Packet {
+        let Some(first) = d.first().copied() else {
+            return Packet::NotQuic;
+        };
+        if first & 0xc0 != 0xc0 || d.len() < 7 {
+            return Packet::NotQuic; // not a long header
+        }
+        let Ok(v) = <[u8; 4]>::try_from(&d[1..5]) else {
+            return Packet::NotQuic;
+        };
+        let version = u32::from_be_bytes(v);
+        let (initial_type, retry_type) = match version {
+            V1 => (0, 3),
+            V2 => (1, 0),
+            _ => return Packet::NotQuic,
+        };
+        let ty = (first >> 4) & 0x03;
+        let is_initial = ty == initial_type;
+        match self.open_long(d, version, is_initial, ty != retry_type) {
+            Some((Some(frames), n)) => Packet::Initial(frames, n),
+            Some((None, n)) => Packet::Other(n),
+            None => Packet::NotQuic,
+        }
     }
-    let Ok(v) = <[u8; 4]>::try_from(&d[1..5]) else {
-        return Packet::NotQuic;
-    };
-    let (salt, prefix, initial_type, retry_type) = match u32::from_be_bytes(v) {
-        V1 => (&SALT_V1, "quic", 0, 3),
-        V2 => (&SALT_V2, "quicv2", 1, 0),
-        _ => return Packet::NotQuic,
-    };
-    let ty = (first >> 4) & 0x03;
-    let is_initial = ty == initial_type;
-    match open_long(d, salt, prefix, is_initial, ty != retry_type) {
-        Some((Some(frames), n)) => Packet::Initial(frames, n),
-        Some((None, n)) => Packet::Other(n),
-        None => Packet::NotQuic,
-    }
-}
 
-/// Walk a long header (`has_length`: Initial, 0-RTT, Handshake — not
-/// Retry) and, for an Initial, decrypt it. Returns the plaintext (Initial
-/// only) and the packet's length; `None` when the framing is broken.
-fn open_long(
-    d: &[u8],
-    salt: &[u8; 20],
-    prefix: &str,
-    is_initial: bool,
-    has_length: bool,
-) -> Option<(Option<Vec<u8>>, usize)> {
-    let mut p = &d[5..];
-    let dcid_len = usize::from(*p.first()?);
-    if dcid_len > 20 || p.len() < 1 + dcid_len {
-        return None;
-    }
-    let dcid = &p[1..=dcid_len];
-    p = &p[1 + dcid_len..];
-    let scid_len = usize::from(*p.first()?);
-    if p.len() < 1 + scid_len {
-        return None;
-    }
-    p = &p[1 + scid_len..];
-    if !has_length {
-        // A Retry carries no length: the rest of the datagram is its.
-        return Some((None, d.len()));
-    }
-    if is_initial {
-        let token_len = usize::try_from(varint(&mut p)?).ok()?;
-        if p.len() < token_len {
+    /// Walk a long header (`has_length`: Initial, 0-RTT, Handshake — not
+    /// Retry) and, for an Initial, decrypt it. Returns the plaintext
+    /// (Initial only) and the packet's length; `None` when the framing
+    /// is broken.
+    fn open_long(
+        &mut self,
+        d: &[u8],
+        version: u32,
+        is_initial: bool,
+        has_length: bool,
+    ) -> Option<(Option<Vec<u8>>, usize)> {
+        let mut p = &d[5..];
+        let dcid_len = usize::from(*p.first()?);
+        if dcid_len > 20 || p.len() < 1 + dcid_len {
             return None;
         }
-        p = &p[token_len..];
+        let dcid = &p[1..=dcid_len];
+        p = &p[1 + dcid_len..];
+        let scid_len = usize::from(*p.first()?);
+        if p.len() < 1 + scid_len {
+            return None;
+        }
+        p = &p[1 + scid_len..];
+        if !has_length {
+            // A Retry carries no length: the rest of the datagram is its.
+            return Some((None, d.len()));
+        }
+        if is_initial {
+            let token_len = usize::try_from(varint(&mut p)?).ok()?;
+            if p.len() < token_len {
+                return None;
+            }
+            p = &p[token_len..];
+        }
+        let length = usize::try_from(varint(&mut p)?).ok()?;
+        let pn_offset = d.len() - p.len();
+        if p.len() < length {
+            return None;
+        }
+        let end = pn_offset + length;
+        if !is_initial {
+            return Some((None, end));
+        }
+        if length < 20 {
+            return None;
+        }
+        Some((
+            self.decrypt_initial(d, dcid, version, pn_offset, length),
+            end,
+        ))
     }
-    let length = usize::try_from(varint(&mut p)?).ok()?;
-    let pn_offset = d.len() - p.len();
-    if p.len() < length {
-        return None;
+
+    /// Open a client Initial: undo header protection, then AES-128-GCM
+    /// the payload with the keyset `dcid`/`version` derives — cached
+    /// across packets so a retransmission skips the HKDF (review #887).
+    fn decrypt_initial(
+        &mut self,
+        d: &[u8],
+        dcid: &[u8],
+        version: u32,
+        pn_offset: usize,
+        length: usize,
+    ) -> Option<Vec<u8>> {
+        let (key, iv, hp) = initial_keys(&mut self.keys, version, dcid)?;
+
+        let sample = &d[pn_offset + 4..pn_offset + 20];
+        let mask = encrypt(Cipher::aes_128_ecb(), hp, None, sample).ok()?;
+        let mut header = d[..pn_offset + 4].to_vec();
+        header[0] ^= mask[0] & 0x0f;
+        let pn_len = usize::from(header[0] & 0x03) + 1;
+        header.truncate(pn_offset + pn_len);
+        let mut pn = 0u64;
+        for i in 0..pn_len {
+            header[pn_offset + i] ^= mask[1 + i];
+            pn = pn << 8 | u64::from(header[pn_offset + i]);
+        }
+        let mut nonce = [0u8; 12];
+        nonce.copy_from_slice(iv);
+        for (n, b) in nonce[4..].iter_mut().zip(pn.to_be_bytes()) {
+            *n ^= b;
+        }
+        let body = &d[pn_offset + pn_len..pn_offset + length];
+        if body.len() < 16 {
+            return None;
+        }
+        let (ct, tag) = body.split_at(body.len() - 16);
+        let mut plain = ct.to_vec();
+        let ctx = AeadCtx::new_default_tag(&Algorithm::aes_128_gcm(), key).ok()?;
+        ctx.open_in_place(&nonce, &mut plain, tag, &header).ok()?;
+        Some(plain)
     }
-    let end = pn_offset + length;
-    if !is_initial {
-        return Some((None, end));
-    }
-    if length < 20 {
-        return None;
-    }
-    Some((
-        decrypt_initial(d, dcid, salt, prefix, pn_offset, length),
-        end,
-    ))
 }
 
-fn decrypt_initial(
-    d: &[u8],
+/// The RFC 9001 §5.2 client keyset for `(version, dcid)` — taken from
+/// `keys` on a hit, derived and stored on a miss. The cache populates
+/// even when the packet that prompted it fails to open: the derivation
+/// is DCID-deterministic, so a corrupted packet's successor hits it.
+fn initial_keys<'a>(
+    keys: &'a mut Option<KeyCache>,
+    version: u32,
     dcid: &[u8],
-    salt: &[u8; 20],
-    prefix: &str,
-    pn_offset: usize,
-    length: usize,
-) -> Option<Vec<u8>> {
-    let initial = hmac_sha256(salt, dcid).ok()?;
-    let client = hkdf_expand_label(&initial, "client in", 32)?;
-    let key = hkdf_expand_label(&client, &[prefix, " key"].concat(), 16)?;
-    let iv = hkdf_expand_label(&client, &[prefix, " iv"].concat(), 12)?;
-    let hp = hkdf_expand_label(&client, &[prefix, " hp"].concat(), 16)?;
-
-    let sample = &d[pn_offset + 4..pn_offset + 20];
-    let mask = encrypt(Cipher::aes_128_ecb(), &hp, None, sample).ok()?;
-    let mut header = d[..pn_offset + 4].to_vec();
-    header[0] ^= mask[0] & 0x0f;
-    let pn_len = usize::from(header[0] & 0x03) + 1;
-    header.truncate(pn_offset + pn_len);
-    let mut pn = 0u64;
-    for i in 0..pn_len {
-        header[pn_offset + i] ^= mask[1 + i];
-        pn = pn << 8 | u64::from(header[pn_offset + i]);
+) -> Option<(&'a [u8], &'a [u8], &'a [u8])> {
+    let hit = keys
+        .as_ref()
+        .is_some_and(|k| k.version == version && k.dcid == dcid);
+    if !hit {
+        let (salt, prefix) = match version {
+            V1 => (&SALT_V1, "quic"),
+            V2 => (&SALT_V2, "quicv2"),
+            _ => return None,
+        };
+        let initial = hmac_sha256(salt, dcid).ok()?;
+        let client = hkdf_expand_label(&initial, "client in", 32)?;
+        *keys = Some(KeyCache {
+            version,
+            dcid: dcid.to_vec(),
+            key: hkdf_expand_label(&client, &[prefix, " key"].concat(), 16)?,
+            iv: hkdf_expand_label(&client, &[prefix, " iv"].concat(), 12)?,
+            hp: hkdf_expand_label(&client, &[prefix, " hp"].concat(), 16)?,
+        });
     }
-    let mut nonce = [0u8; 12];
-    nonce.copy_from_slice(&iv);
-    for (n, b) in nonce[4..].iter_mut().zip(pn.to_be_bytes()) {
-        *n ^= b;
-    }
-    let body = &d[pn_offset + pn_len..pn_offset + length];
-    if body.len() < 16 {
-        return None;
-    }
-    let (ct, tag) = body.split_at(body.len() - 16);
-    let mut plain = ct.to_vec();
-    let ctx = AeadCtx::new_default_tag(&Algorithm::aes_128_gcm(), &key).ok()?;
-    ctx.open_in_place(&nonce, &mut plain, tag, &header).ok()?;
-    Some(plain)
+    let k = keys.as_ref()?;
+    Some((&k.key, &k.iv, &k.hp))
 }
 
 #[cfg(test)]
@@ -519,26 +654,43 @@ mod tests {
         hs
     }
 
-    /// Seal `frames` as a v1 client Initial (packet number `pn`, padded to
-    /// at least the header-protection sample).
-    fn seal_initial(dcid: &[u8], pn: u32, frames: &[u8]) -> Vec<u8> {
-        let initial = hmac_sha256(&SALT_V1, dcid).unwrap();
+    /// Seal `frames` as a `version` client Initial: `pn` in `pn_len`
+    /// bytes (1–4), `token` the Initial's token field, padded to at
+    /// least the header-protection sample.
+    fn seal_initial(
+        version: u32,
+        dcid: &[u8],
+        pn: u64,
+        pn_len: usize,
+        token: &[u8],
+        frames: &[u8],
+    ) -> Vec<u8> {
+        let (salt, label, first) = match version {
+            V1 => (&SALT_V1, "quic", 0xc0u8),
+            V2 => (&SALT_V2, "quicv2", 0xd0u8),
+            _ => unreachable!("test only seals v1/v2"),
+        };
+        let initial = hmac_sha256(salt, dcid).unwrap();
         let client = hkdf_expand_label(&initial, "client in", 32).unwrap();
-        let key = hkdf_expand_label(&client, "quic key", 16).unwrap();
-        let iv = hkdf_expand_label(&client, "quic iv", 12).unwrap();
-        let hp = hkdf_expand_label(&client, "quic hp", 16).unwrap();
+        let key = hkdf_expand_label(&client, &[label, " key"].concat(), 16).unwrap();
+        let iv = hkdf_expand_label(&client, &[label, " iv"].concat(), 12).unwrap();
+        let hp = hkdf_expand_label(&client, &[label, " hp"].concat(), 16).unwrap();
         let mut plain = frames.to_vec();
         plain.resize(plain.len().max(32), 0); // PADDING
-        let length = 4 + plain.len() + 16;
-        let mut pkt = vec![0xc3, 0, 0, 0, 1, u8::try_from(dcid.len()).unwrap()];
+        let length = pn_len + plain.len() + 16;
+        let mut pkt = vec![first | u8::try_from(pn_len - 1).unwrap(), 0, 0, 0, 0];
+        pkt[1..5].copy_from_slice(&version.to_be_bytes());
+        pkt.push(u8::try_from(dcid.len()).unwrap());
         pkt.extend_from_slice(dcid);
-        pkt.extend_from_slice(&[0, 0]); // SCID, token
+        pkt.push(0); // SCID
+        pkt.extend_from_slice(&(0x4000 | u16::try_from(token.len()).unwrap()).to_be_bytes());
+        pkt.extend_from_slice(token);
         pkt.extend_from_slice(&(0x4000 | u16::try_from(length).unwrap()).to_be_bytes());
         let pn_offset = pkt.len();
-        pkt.extend_from_slice(&pn.to_be_bytes());
+        pkt.extend_from_slice(&pn.to_be_bytes()[8 - pn_len..]);
         let mut nonce = [0u8; 12];
         nonce.copy_from_slice(&iv);
-        for (n, b) in nonce[4..].iter_mut().zip(u64::from(pn).to_be_bytes()) {
+        for (n, b) in nonce[4..].iter_mut().zip(pn.to_be_bytes()) {
             *n ^= b;
         }
         let ctx = AeadCtx::new_default_tag(&Algorithm::aes_128_gcm(), &key).unwrap();
@@ -555,10 +707,15 @@ mod tests {
         )
         .unwrap();
         pkt[0] ^= mask[0] & 0x0f;
-        for i in 0..4 {
+        for i in 0..pn_len {
             pkt[pn_offset + i] ^= mask[1 + i];
         }
         pkt
+    }
+
+    /// [`seal_initial`] for the common v1 / 4-byte-PN / tokenless shape.
+    fn seal_v1(dcid: &[u8], pn: u64, frames: &[u8]) -> Vec<u8> {
+        seal_initial(V1, dcid, pn, 4, &[], frames)
     }
 
     fn crypto(off: usize, data: &[u8]) -> Vec<u8> {
@@ -582,18 +739,22 @@ mod tests {
         let handshake = [0xe0, 0, 0, 0, 1, 0, 0, 0];
         assert_eq!(s.feed(&handshake), QuicSniffStep::More);
         let mut coalesced = vec![0xd0, 0, 0, 0, 1, 0, 0, 0]; // 0-RTT, empty
-        coalesced.extend_from_slice(&seal_initial(&dcid, 1, &crypto(a.len(), b)));
+        coalesced.extend_from_slice(&seal_v1(&dcid, 1, &crypto(a.len(), b)));
         assert_eq!(s.feed(&coalesced), QuicSniffStep::More);
-        let first = seal_initial(&dcid, 0, &crypto(0, a));
+        let first = seal_v1(&dcid, 0, &crypto(0, a));
         assert_eq!(
             s.feed(&first),
             QuicSniffStep::Name("quic.example.org".into())
         );
-        // Two Initials in one datagram, each half of the ClientHello.
-        let mut both = seal_initial(&dcid, 0, &crypto(0, a));
-        both.extend_from_slice(&seal_initial(&dcid, 1, &crypto(a.len(), b)));
+        // Two Initials in one datagram: the walk stops at the first
+        // opened Initial — the second half must arrive in a datagram of
+        // its own to be read (a real coalesce carries at most one).
+        let mut both = seal_v1(&dcid, 0, &crypto(0, a));
+        both.extend_from_slice(&seal_v1(&dcid, 1, &crypto(a.len(), b)));
+        let mut s2 = QuicSniffer::default();
+        assert_eq!(s2.feed(&both), QuicSniffStep::More);
         assert_eq!(
-            QuicSniffer::default().feed(&both),
+            s2.feed(&seal_v1(&dcid, 2, &crypto(a.len(), b))),
             QuicSniffStep::Name("quic.example.org".into())
         );
     }
@@ -638,13 +799,10 @@ mod tests {
         let filler = crypto(ch.len() + 100, &pad);
         let mut s = QuicSniffer::default();
         for pn in 0..5 {
-            assert_eq!(
-                s.feed(&seal_initial(&dcid, pn, &filler)),
-                QuicSniffStep::More
-            );
+            assert_eq!(s.feed(&seal_v1(&dcid, pn, &filler)), QuicSniffStep::More);
         }
         assert_eq!(
-            s.feed(&seal_initial(&dcid, 5, &crypto(0, &ch))),
+            s.feed(&seal_v1(&dcid, 5, &crypto(0, &ch))),
             QuicSniffStep::Name("retransmit.example.org".into())
         );
     }
@@ -668,5 +826,121 @@ mod tests {
         // collected stream stays usable.
         assert!(s.collect(&[0x06, 0x03, 0x03, b'd', b'e', b'f', 0x7f]));
         assert_eq!(s.contiguous(), b"abcdef");
+    }
+
+    /// QUIC v2 Initials open the same way with the `quicv2` HKDF labels
+    /// and v2 salt — pinned end to end: a v2-sealed ClientHello names
+    /// the flow, so the label/salt/type table in `open_packet` is right.
+    #[test]
+    fn v2_sealed_initial_yields_the_server_name() {
+        let dcid = hex("8394c8f03e515708");
+        let ch = client_hello("quicv2.example.org");
+        let mut s = QuicSniffer::default();
+        assert_eq!(
+            s.feed(&seal_initial(V2, &dcid, 0, 4, &[], &crypto(0, &ch))),
+            QuicSniffStep::Name("quicv2.example.org".into())
+        );
+    }
+
+    /// Packet numbers are not always four bytes: a sender picks 1–4 —
+    /// the length is decoded from the unmasked header-protection bits,
+    /// so 1- and 2-byte PNs must open too.
+    #[test]
+    fn short_packet_numbers_open() {
+        let dcid = hex("8394c8f03e515708");
+        let ch = client_hello("shortpn.example.org");
+        for pn_len in 1..=2usize {
+            let mut s = QuicSniffer::default();
+            assert_eq!(
+                s.feed(&seal_initial(V1, &dcid, 0, pn_len, &[], &crypto(0, &ch))),
+                QuicSniffStep::Name("shortpn.example.org".into()),
+                "{pn_len}-byte packet number must open"
+            );
+        }
+    }
+
+    /// A Retry packet carries no length field — the rest of the datagram
+    /// is its body — and is not a client Initial; a token-carrying
+    /// Initial (the Retry's answer) still opens and names the flow.
+    #[test]
+    fn retry_and_token_initials() {
+        let dcid = hex("8394c8f03e515708");
+        let mut s = QuicSniffer::default();
+        // v1 Retry (type 3): header + opaque token bytes to the end.
+        let mut retry = vec![0xf0, 0, 0, 0, 1, u8::try_from(dcid.len()).unwrap()];
+        retry.extend_from_slice(&dcid);
+        retry.push(0); // SCID
+        retry.extend_from_slice(b"retry-token-bytes");
+        assert_eq!(s.feed(&retry), QuicSniffStep::More);
+
+        // An Initial with a non-empty token field parses past it.
+        let ch = client_hello("token.example.org");
+        let mut s = QuicSniffer::default();
+        assert_eq!(
+            s.feed(&seal_initial(
+                V1,
+                &dcid,
+                0,
+                4,
+                b"address-token",
+                &crypto(0, &ch)
+            )),
+            QuicSniffStep::Name("token.example.org".into())
+        );
+    }
+
+    /// A coalesced datagram of only non-Initial long-header packets is
+    /// QUIC but reads nothing — `More`, not `Done`.
+    #[test]
+    fn non_initial_coalesced_datagram_is_more() {
+        let mut s = QuicSniffer::default();
+        // v1 0-RTT (type 1) then Handshake (type 2), both length 0.
+        let mut d = vec![0xd0, 0, 0, 0, 1, 0, 0, 0];
+        d.extend_from_slice(&[0xe0, 0, 0, 0, 1, 0, 0, 0]);
+        assert_eq!(s.feed(&d), QuicSniffStep::More);
+    }
+
+    /// An Initial whose `length` field is under 20 (the minimum a
+    /// protected packet can be: 4-byte PN max + 16-byte AEAD tag) is
+    /// malformed — the packet is not readable and the sniff gives up.
+    #[test]
+    fn initial_length_under_20_is_done() {
+        let mut s = QuicSniffer::default();
+        // v1 Initial, token 0, length 16 (< 20), 16 body bytes present.
+        let mut d = vec![0xc3, 0, 0, 0, 1, 0, 0, 0, 0x40, 0x10];
+        d.extend_from_slice(&[0xab; 16]);
+        assert_eq!(s.feed(&d), QuicSniffStep::Done);
+    }
+
+    /// The datagram walk is bounded at `MAX_DATAGRAM_PACKETS` and ends
+    /// at the first opened Initial: a late Initial past the bound goes
+    /// unread, and a second Initial in one datagram is never reached
+    /// (review #887).
+    #[test]
+    fn datagram_walk_is_capped_and_stops_at_first_initial() {
+        let dcid = hex("8394c8f03e515708");
+        let mut s = QuicSniffer::default();
+        // MAX_DATAGRAM_PACKETS minimal Handshake packets, then an
+        // Initial: the budget is spent before the Initial is reached.
+        let handshake = [0xe0, 0, 0, 0, 1, 0, 0, 0];
+        let mut flooded = Vec::new();
+        for _ in 0..MAX_DATAGRAM_PACKETS {
+            flooded.extend_from_slice(&handshake);
+        }
+        flooded.extend_from_slice(&seal_v1(&dcid, 0, &crypto(0, b"abc")));
+        assert_eq!(s.feed(&flooded), QuicSniffStep::More);
+        assert!(s.chunks.is_empty(), "the past-cap Initial must go unread");
+
+        // The first opened Initial ends the walk: a second Initial in
+        // the same datagram contributes nothing.
+        let mut two = seal_v1(&dcid, 0, &crypto(0, b"abc"));
+        two.extend_from_slice(&seal_v1(&dcid, 1, &crypto(3, b"def")));
+        let mut s = QuicSniffer::default();
+        assert_eq!(s.feed(&two), QuicSniffStep::More);
+        assert_eq!(
+            s.contiguous(),
+            b"abc",
+            "the second Initial's CRYPTO went unread"
+        );
     }
 }

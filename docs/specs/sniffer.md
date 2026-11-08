@@ -109,6 +109,8 @@ sniffer:
       ports: [443, 8443]
     HTTP:
       ports: [80, 8080, 8880]
+    QUIC:
+      ports: [443]               # TUN UDP flows only (see divergence 2)
   force-domain:
     - +.netflix.com
   skip-domain:
@@ -122,7 +124,7 @@ Field semantics (ordered by spec impact, not alphabetically):
 |-------|------|---------|---------|
 | `enable` | bool | `false` | Master switch. When `false`, all sniffing is skipped regardless of other fields. |
 | `timeout` | integer (ms) | `100` | Hard cap on the initial `peek()` call. A client that connects and sends nothing within this window causes the sniffer to return empty-handed; the listener proceeds with the unsniffed flow. Bounds silent-client DoS — without this, every silent TCP connection pins a listener task indefinitely in `peek`. Range: 1–60000. |
-| `sniff` | map | empty | Which protocol to sniff per port. Only `TLS` and `HTTP` are supported. Unknown keys warn and are ignored. Empty `sniff` map with `enable: true` is a config error (400 equivalent at parse time). |
+| `sniff` | map | empty | Which protocol to sniff per port. `TLS`, `HTTP`, and `QUIC` are supported — `QUIC` reads the client Initial's SNI on TUN UDP flows only (divergence 2). Unknown keys warn and are ignored. Empty `sniff` map with `enable: true` is a config error (400 equivalent at parse time). |
 | `parse-pure-ip` | bool | `true` | When `true`, sniffer runs only if `Metadata.host` is empty or parses as an `IpAddr`. When `false`, runs unconditionally. |
 | `override-destination` | bool | `false` | When `true`, a successful sniff overwrites `Metadata.host` in addition to `sniff_host`. Affects outbound TLS SNI / HTTP Host rewrites. See **Trojan cert-validation gotcha** below. |
 | `force-domain` | list<glob> | empty | Domains in this list bypass `parse-pure-ip`'s "skip if already a hostname" short-circuit. Useful for domains whose Happy-Eyeballs DNS resolved locally but you still want routed by the *real* SNI seen on the wire. |
@@ -210,6 +212,13 @@ warn-and-ignore vs hard-error on an unimplemented upstream knob.
 2. **`QUIC` on TUN only.** `sniff.QUIC.ports` (default `[443]`, as
    upstream) names TUN UDP flows from their Initial packets — v1 and v2;
    upstream also reads draft-29. Other inbounds carry no sniffed UDP.
+   The hold budget diverges too: meow-rs holds back at most
+   `QUIC_SNIFF_PACKETS` (4) datagrams inside `sniffer.timeout`
+   (~100 ms × 4 packets worst case) before dialing and forwarding them
+   upstream, while upstream buffers Initials for roughly 3 seconds with
+   no packet cap — the tighter bound caps both latency added to
+   non-QUIC flows and the per-flow memory a client can pin by flooding
+   Initial-shaped datagrams (review #887).
 3. **No `tls-fingerprint` key.** Upstream has an undocumented feature
    gate that meow-rs does not implement. Rejected at parse time with
    a clear error (not silent) so users don't assume it's active.

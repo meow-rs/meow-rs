@@ -6624,6 +6624,222 @@ async fn put_configs_invalid_tun_rejected_before_commit() {
     assert!(state.tunnel.has_tun(), "the running listener must survive");
 }
 
+/// Same admission contract for `sniffer:` (review #887): the TUN carries
+/// the sniffer it was spawned with, so a section `spawn_tun_from_raw`
+/// cannot parse must be rejected before commit — admitted unchecked, the
+/// reconcile would stop a healthy listener and only then fail the
+/// spawn-side parse, leaving TUN down on a 204. The `tun:` change in the
+/// body is what would have fired that restart, so the still-running
+/// handle proves the gate ran before the reconcile.
+#[tokio::test]
+async fn put_configs_invalid_sniffer_rejected_keeps_running_tun() {
+    use base64::Engine as _;
+    let mut raw = test_raw_config();
+    raw.tun = Some(serde_saphyr::from_str("enable: true\nmtu: 1500").unwrap());
+    let state = test_state(raw);
+    let (handle, stopped) = fake_tun_handle();
+    state.tunnel.set_tun_handle(handle).await;
+    assert!(state.tunnel.has_tun());
+
+    // Two malformed shapes: `enable: true` with no `sniff:` map, and an
+    // out-of-range `timeout` on an otherwise valid section.
+    for sniffer in [
+        "sniffer:\n  enable: true\n",
+        "sniffer:\n  enable: true\n  timeout: 0\n  sniff:\n    TLS:\n      ports: [443]\n",
+    ] {
+        let yaml = format!(
+            "mode: rule\ntun:\n  enable: true\n  mtu: 9000\n{sniffer}rules:\n  - MATCH,DIRECT\n"
+        );
+        let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+        let resp = create_router(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/configs")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({"payload": payload}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "sniffer {sniffer:?} must be rejected at admission"
+        );
+        let body = body_json(resp).await;
+        assert!(
+            body["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("sniffer config error")),
+            "the 400 must come from the sniffer admission check, got: {body}"
+        );
+    }
+    let committed = state.raw_config.read();
+    assert_eq!(
+        committed.tun.as_ref().map(|t| t.mtu),
+        Some(Some(1500)),
+        "the rejected document must not have been committed"
+    );
+    assert!(committed.sniffer.is_none());
+    drop(committed);
+    assert!(
+        !stopped.load(Ordering::SeqCst),
+        "the running listener must survive the rejected PUT"
+    );
+    assert!(state.tunnel.has_tun(), "the running listener must survive");
+}
+
+/// Semantic diff (review #887): a `sniffer:` respelled with reordered or
+/// duplicated ports/domains parses to the same `SnifferConfig` and must
+/// NOT restart the running listener — only a real change may.
+#[cfg(not(feature = "listener-tun"))]
+#[tokio::test]
+async fn put_configs_sniffer_respelling_does_not_reconcile() {
+    use base64::Engine as _;
+    let mut raw = test_raw_config();
+    raw.tun = Some(serde_saphyr::from_str("enable: true").unwrap());
+    raw.sniffer = Some(
+        serde_saphyr::from_str(
+            "enable: true\nsniff:\n  TLS:\n    ports: [443, 8443]\nskip-domain: [b.example, a.example]\n",
+        )
+        .unwrap(),
+    );
+    let state = test_state(raw);
+    let (handle, stopped) = fake_tun_handle();
+    state.tunnel.set_tun_handle(handle).await;
+
+    // Same sniffer spelled differently: port and domain order swapped,
+    // duplicates added — all normalize away at parse.
+    let yaml = concat!(
+        "mode: rule\n",
+        "tun:\n",
+        "  enable: true\n",
+        "sniffer:\n",
+        "  enable: true\n",
+        "  sniff:\n",
+        "    TLS:\n",
+        "      ports: [8443, 443, 8443]\n",
+        "  skip-domain: [a.example, b.example, a.example]\n",
+        "rules:\n",
+        "  - MATCH,DIRECT\n",
+    );
+    let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert!(
+        !stopped.load(Ordering::SeqCst),
+        "a semantically identical sniffer must not restart the listener"
+    );
+    assert!(state.tunnel.has_tun());
+
+    // Counterpoint: a real port change restarts — under this build the
+    // spawn fails and `enable` rolls back, proving the diff ran.
+    let yaml = yaml.replace("ports: [8443, 443, 8443]", "ports: [443, 4430]");
+    let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert!(
+        stopped.load(Ordering::SeqCst),
+        "a real sniffer diff must restart the running listener"
+    );
+    assert!(
+        state
+            .raw_config
+            .read()
+            .tun
+            .as_ref()
+            .is_some_and(|t| !t.enable),
+        "the restart's spawn failure rolls `enable` back on this build"
+    );
+}
+
+/// A disabled sniffer's remaining fields are dead config — changing
+/// `timeout` or the port lists while `enable: false` is not a restart-
+/// worthy diff (review #887).
+#[tokio::test]
+async fn put_configs_disabled_sniffer_field_change_does_not_reconcile() {
+    use base64::Engine as _;
+    let mut raw = test_raw_config();
+    raw.tun = Some(serde_saphyr::from_str("enable: true").unwrap());
+    raw.sniffer = Some(
+        serde_saphyr::from_str("enable: false\ntimeout: 100\nsniff:\n  TLS:\n    ports: [443]\n")
+            .unwrap(),
+    );
+    let state = test_state(raw);
+    let (handle, stopped) = fake_tun_handle();
+    state.tunnel.set_tun_handle(handle).await;
+
+    let yaml = concat!(
+        "mode: rule\n",
+        "tun:\n",
+        "  enable: true\n",
+        "sniffer:\n",
+        "  enable: false\n",
+        "  timeout: 900\n",
+        "  sniff:\n",
+        "    TLS:\n",
+        "      ports: [443, 8443]\n",
+        "rules:\n",
+        "  - MATCH,DIRECT\n",
+    );
+    let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert!(
+        !stopped.load(Ordering::SeqCst),
+        "dead-field churn under `enable: false` must not restart the listener"
+    );
+    assert!(state.tunnel.has_tun());
+    assert!(
+        state
+            .raw_config
+            .read()
+            .sniffer
+            .as_ref()
+            .is_some_and(|s| s.timeout == Some(900)),
+        "the respelled section still commits — only the restart is skipped"
+    );
+}
+
 /// Same admission contract for `listeners:` — an entry the startup parser
 /// would reject must not be committed into `raw_config`, where the next
 /// `load_config` would hard-error on boot (issue #564 review).

@@ -272,7 +272,7 @@ Upstream config keys documented at https://wiki.metacubex.one/. Checking `crates
 | `hosts` | Static /etc/hosts-style map |
 | `profile` | `store-selected`, `store-fake-ip`, tracing flags |
 | `experimental` | Various flags (`sniff-tls-sni`, etc.) |
-| `sniffer` | TLS/HTTP sniffer config (SNI, Host header extraction) |
+| `sniffer` | TLS/HTTP sniffer config (SNI, Host header extraction), plus `sniff.QUIC` on TUN UDP flows (SNI from client Initials, v1/v2) |
 | `geodata-mode`, `geo-auto-update`, `geodata-loader` | GeoIP/GeoSite DB management |
 | `global-client-fingerprint` | Reality/uTLS fingerprint |
 | `global-ua` | User-Agent override for subscription fetch |

@@ -3385,6 +3385,27 @@ fn parse_sniffer_config(
                 }
             }
 
+            // Canonical order for the semantic `SnifferConfig` diff the
+            // TUN reconcile runs on a config change: the runtime dedups
+            // every list into a `HashMap`/`DomainTrie` anyway, so
+            // `[443, 8443]` and `[8443, 443]` are the same config — sort
+            // + dedup keeps a port-or-domain respelling from restarting
+            // the listener (review #887).
+            for ports in [&mut tls_ports, &mut http_ports, &mut quic_ports] {
+                ports.sort_unstable();
+                ports.dedup();
+            }
+            let normalize_domains = |list: &Option<Vec<String>>| {
+                let mut v: Vec<SmolStr> = list
+                    .iter()
+                    .flatten()
+                    .map(|s| SmolStr::from(s.as_str()))
+                    .collect();
+                v.sort_unstable();
+                v.dedup();
+                v
+            };
+
             Ok(SnifferConfig {
                 enable,
                 timeout: std::time::Duration::from_millis(timeout_ms),
@@ -3393,18 +3414,8 @@ fn parse_sniffer_config(
                 tls_ports,
                 http_ports,
                 quic_ports,
-                skip_domain: rs
-                    .skip_domain
-                    .iter()
-                    .flatten()
-                    .map(|s| SmolStr::from(s.as_str()))
-                    .collect(),
-                force_domain: rs
-                    .force_domain
-                    .iter()
-                    .flatten()
-                    .map(|s| SmolStr::from(s.as_str()))
-                    .collect(),
+                skip_domain: normalize_domains(&rs.skip_domain),
+                force_domain: normalize_domains(&rs.force_domain),
             })
         }
         None if has_tproxy_sni => {
