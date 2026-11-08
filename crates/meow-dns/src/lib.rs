@@ -11,6 +11,9 @@ pub mod resolver;
 pub mod server;
 pub mod upstream;
 
+#[cfg(feature = "quic-dns")]
+mod quic;
+
 pub use cache::{DnsCache, DnsCacheSnapshotEntry, ReverseSnapshotEntry};
 pub use client::{
     reset_pooled_connections, set_socket_factory, ClientError, DnsClient, SocketFactory,
@@ -21,4 +24,4 @@ pub use resolver::{
     BootstrapError, FallbackFilter, HostEntry, NameserverPolicy, PolicyEntry, Resolver,
 };
 pub use server::{new_resolver_slot, BoundDnsServer, DnsServer, LocalAnswer, ResolverSlot};
-pub use upstream::{HostOrIp, NameServerEntry, NameServerParseError, NameServerUrl};
+pub use upstream::{H3Policy, HostOrIp, NameServerEntry, NameServerParseError, NameServerUrl};

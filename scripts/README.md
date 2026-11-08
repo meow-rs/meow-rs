@@ -6,6 +6,7 @@ root for the firewall (`nft` on Linux, `pfctl` on macOS).
 
 | Script | Platform | Purpose |
 |--------|----------|---------|
+| `build-armv7-musl.sh` | Linux container | Build the 32-bit ARM static musl release binary inside a musl cross toolchain. Used by the `armv7-unknown-linux-musleabihf` entry in the release matrix. |
 | `fetch-wintun.sh` | any (writes a Windows DLL) | Download the official signed `wintun.dll` for a Rust Windows target. Official release zips already include it. |
 | `tproxy-local-linux.sh` / `tproxy-local-macos.sh` | Linux / macOS | Proxy **this host's own** outbound traffic. Runs meow; meow auto-manages the firewall. |
 | `tproxy-gateway-linux.sh` / `tproxy-gateway-macos.sh` | Linux / macOS | Make this host a **LAN gateway** that forwards & proxies **other devices'** traffic. Installs the firewall meow does *not* create. |

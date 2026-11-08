@@ -13,7 +13,7 @@ use meow_proxy::DirectAdapter;
 use parking_lot::{Mutex, RwLock};
 use smol_str::SmolStr;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use tracing::{debug, info, warn};
 
@@ -157,6 +157,11 @@ pub struct TunnelInner {
     udp_flush: tokio::sync::watch::Sender<u64>,
     /// Record per-connection notes — see [`Tunnel::set_connection_notes`].
     connection_notes: AtomicBool,
+    /// Whole-connection relay idle timeout in seconds — see
+    /// [`Tunnel::set_tcp_idle_timeout`]. `0` disables the bound. Read once
+    /// per relay setup; relays already in flight keep the bound they
+    /// started with (same per-connection semantics as every per-conn knob).
+    tcp_idle_timeout: AtomicU64,
 }
 
 /// A running TUN listener: the task plus the signal resolving once its
@@ -233,6 +238,16 @@ impl TunnelInner {
     /// [`udp::UdpFlushWatch`].
     pub fn udp_flush_watch(&self) -> udp::UdpFlushWatch {
         udp::UdpFlushWatch::new(self.udp_flush.subscribe())
+    }
+
+    /// The whole-connection relay idle bound [`Tunnel::set_tcp_idle_timeout`]
+    /// installed, resolved for one relay's use: `None` when the bound is
+    /// disabled (`tcp-idle-timeout: 0` or never set programmatically).
+    pub fn tcp_idle_timeout(&self) -> Option<std::time::Duration> {
+        match self.tcp_idle_timeout.load(Ordering::Relaxed) {
+            0 => None,
+            secs => Some(std::time::Duration::from_secs(secs)),
+        }
     }
 
     /// The note log a new connection should record into: the inbound's own
@@ -379,6 +394,11 @@ impl TunnelInner {
             if let Some(host) = resolver.reverse_lookup(ip).filter(|h| is_valid_host(h)) {
                 conn_note!(Dns, "{ip} was resolved earlier for {host}; using that name");
                 metadata.host = host;
+                // mihomo `DNSMapping`: the name is only a label for the
+                // client-chosen address, so a DIRECT UDP dial keeps
+                // `dst_ip` rather than re-resolving it via
+                // `dns.direct-nameserver` (upstream `Metadata.Pure()`).
+                metadata.dns_mode = meow_common::DnsMode::Mapping;
                 snooped = true;
             }
         }
@@ -455,6 +475,44 @@ impl TunnelInner {
         if let Some(real_ip) = self.resolver().resolve_ip_real(&metadata.host).await {
             debug!("pre_resolve: {} -> {}", metadata.host, real_ip);
             metadata.dst_ip = Some(real_ip);
+        }
+    }
+
+    /// Fill the real `dst_ip` UDP needs for its NAT key and outbound packet
+    /// API, after [`Self::pre_resolve`] (which only runs when rules demand
+    /// an IP).
+    ///
+    /// The main nameservers answer first. When they cannot and
+    /// `dns.direct-nameserver` is configured, a flow whose route ends at a
+    /// DIRECT/COMPATIBLE hop resolves through the direct resolver instead:
+    /// its dial never consults the main nameservers (mihomo's direct
+    /// `ListenPacketContext` resolves via `DirectHostResolver`), so a
+    /// main-side failure must not drop it. Other routes never reach the
+    /// direct resolver, which keeps proxied names off that upstream.
+    pub async fn resolve_udp_dst(&self, metadata: &mut Metadata) {
+        if metadata.dst_ip.is_some() || metadata.host.is_empty() {
+            return;
+        }
+        let resolver = self.resolver();
+        metadata.dst_ip = resolver.resolve_ip_real(&metadata.host).await;
+        if metadata.dst_ip.is_some() {
+            return;
+        }
+        let Some(direct) = resolver.direct_resolver().map(Arc::clone) else {
+            return;
+        };
+        let Some(target) = self.resolve_proxy(metadata).await else {
+            return;
+        };
+        if !routes_direct(target.adapter.as_ref(), metadata) {
+            return;
+        }
+        metadata.dst_ip = direct.resolve_ip_real(&metadata.host).await;
+        if let Some(ip) = metadata.dst_ip {
+            debug!(
+                "resolve_udp_dst: {} -> {} via direct-nameserver",
+                metadata.host, ip
+            );
         }
     }
 
@@ -774,6 +832,46 @@ impl std::fmt::Display for MatchedRule<'_> {
     }
 }
 
+/// The `using` part of the per-connection `match` log line: the decision's
+/// adapter, followed by the member the flow dials through in brackets when
+/// that adapter is a group, e.g. `Proxy[HK-01]`. Like upstream's
+/// `Chain.String()`, nested groups print only the outer group and the
+/// final member.
+///
+/// meow logs this line before the dial (upstream logs it after), so the
+/// member is the one the dial will take, peeked with
+/// `unwrap_proxy(metadata, false)` the way the `/connections` `chains`
+/// entry is. The peek runs only when the line is formatted, so it costs
+/// nothing while INFO is off. A round-robin load-balance pick is a
+/// prediction: another flow's dial may commit in between.
+///
+/// A relay group prints as itself, since it resolves its hops per dial and
+/// offers nothing to peek (see `RelayGroup`'s `Proxy` impl). An outbound's
+/// `dialer-proxy` front is not part of the line either: the brackets name
+/// the outbound that reaches the destination, not the hop it dials its
+/// server through.
+pub struct UsingProxy<'a> {
+    adapter: &'a dyn ProxyAdapter,
+    metadata: &'a Metadata,
+}
+
+impl<'a> UsingProxy<'a> {
+    /// `adapter` is the one the decision picked; `metadata` is the flow's.
+    pub fn new(adapter: &'a dyn ProxyAdapter, metadata: &'a Metadata) -> Self {
+        Self { adapter, metadata }
+    }
+}
+
+impl std::fmt::Display for UsingProxy<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.adapter.name())?;
+        if let Some(leaf) = crate::tcp::leaf_proxy(self.adapter, self.metadata) {
+            write!(f, "[{}]", leaf.name())?;
+        }
+        Ok(())
+    }
+}
+
 /// The outcome of [`TunnelInner::resolve_proxy`] /
 /// [`TunnelInner::resolve_proxy_lazy`]:
 /// the adapter to dial, the rule that produced it, and the route-table
@@ -816,6 +914,29 @@ pub enum PreHandleVerdict {
 struct RouteTargetProbe<'a> {
     route: &'a RouteTable,
     metadata: &'a Metadata,
+}
+
+/// `true` when `adapter` dials through a DIRECT/COMPATIBLE hop for
+/// `metadata` — the adapter itself or the member its group chain selects.
+/// Peeks with `unwrap_proxy(metadata, false)`, like
+/// [`RouteTargetProbe::unwraps_to`], so no round-robin counter advances.
+fn routes_direct(adapter: &dyn ProxyAdapter, metadata: &Metadata) -> bool {
+    const MAX_UNWRAP_HOPS: usize = 16;
+    let is_direct = |t: AdapterType| matches!(t, AdapterType::Direct | AdapterType::Compatible);
+    if is_direct(adapter.adapter_type()) {
+        return true;
+    }
+    let mut next = adapter.unwrap_proxy(metadata, false);
+    for _ in 0..MAX_UNWRAP_HOPS {
+        let Some(hop) = next else {
+            return false;
+        };
+        if is_direct(hop.adapter_type()) {
+            return true;
+        }
+        next = hop.unwrap_proxy(metadata, false);
+    }
+    false
 }
 
 impl RouteTargetProbe<'_> {
@@ -892,6 +1013,9 @@ impl Tunnel {
     /// `inner.direct` observe `set_resolver` swaps identically.
     pub fn new_with_slot(resolver: meow_dns::ResolverSlot) -> Self {
         let direct = Arc::new(DirectAdapter::new().with_resolver_slot(Arc::clone(&resolver)));
+        let stats = Arc::new(Statistics::new());
+        let source: Arc<dyn meow_common::traffic_ledger::Source> = Arc::clone(&stats) as _;
+        meow_common::traffic_ledger::register(Arc::downgrade(&source));
         Self {
             inner: Arc::new(TunnelInner {
                 mode: RwLock::new(TunnelMode::Rule),
@@ -900,7 +1024,7 @@ impl Tunnel {
                 direct,
                 reject: Arc::new(meow_proxy::RejectAdapter::new(false)),
                 nat_table: udp::new_nat_table(),
-                stats: Arc::new(Statistics::new()),
+                stats,
                 tcp_generation: RwLock::new(0),
                 health_checks: Mutex::new(crate::health_check::HealthCheckSupervisor::default()),
                 needs_ip_resolution: AtomicBool::new(false),
@@ -909,6 +1033,7 @@ impl Tunnel {
                 dialer_registry: std::sync::OnceLock::new(),
                 udp_flush: tokio::sync::watch::Sender::new(0),
                 connection_notes: AtomicBool::new(false),
+                tcp_idle_timeout: AtomicU64::new(0),
             }),
         }
     }
@@ -923,6 +1048,40 @@ impl Tunnel {
         self.inner
             .connection_notes
             .store(enabled, Ordering::Relaxed);
+    }
+
+    /// Bound how long an established TCP relay may stay silent in BOTH
+    /// directions before it is torn down with a `TimedOut` error — the
+    /// zombie-connection bound for the case where the peer neither sends
+    /// nor closes (dead LAN device, stalled netstack flow, dead upstream).
+    /// `None` or a zero duration disables the bound (pre-change relay
+    /// behaviour). Applied to relays that start after the call, like every
+    /// per-connection knob.
+    ///
+    /// The bound is stored in whole seconds via `Duration::as_secs`, so a
+    /// non-zero sub-second `Some(d)` truncates to `0` and *disables* the
+    /// bound — programmatic callers must round up themselves if that is
+    /// not the intent (config resolution only ever yields whole seconds).
+    /// Any fractional part beyond whole seconds is dropped silently.
+    ///
+    /// # Panics (debug builds only)
+    /// Asserts that a `Some` duration is either exactly zero (the
+    /// documented disable) or carries at least one whole second (and no
+    /// more than `MAX_DURATION_SECS`, past which the relay's
+    /// `Instant + Duration` arithmetic could overflow), so both footguns
+    /// surface immediately in tests rather than silently at runtime.
+    pub fn set_tcp_idle_timeout(&self, d: Option<std::time::Duration>) {
+        debug_assert!(
+            d.is_none_or(|d| d.is_zero()
+                || (d.as_secs() > 0 && d.as_secs() <= meow_common::MAX_DURATION_SECS)),
+            "set_tcp_idle_timeout: Some(d) with 0 < d < 1 s truncates to 0 and \
+             disables the bound (round up to Duration::from_secs(1) minimum), \
+             and a Some(d) above MAX_DURATION_SECS can overflow Instant + \
+             Duration in the relay's idle timer"
+        );
+        self.inner
+            .tcp_idle_timeout
+            .store(d.map_or(0, |d| d.as_secs()), Ordering::Relaxed);
     }
 
     pub fn inner(&self) -> &Arc<TunnelInner> {
@@ -2031,6 +2190,62 @@ mod tests {
         );
     }
 
+    /// UDP needs a concrete address before routing. When the main
+    /// nameservers cannot answer, a DIRECT-routed flow falls back to
+    /// `dns.direct-nameserver`; any other route never reaches it.
+    #[tokio::test]
+    async fn resolve_udp_dst_falls_back_to_direct_resolver_for_direct_routes() {
+        use meow_dns::HostEntry;
+        use meow_rules::{domain_suffix::DomainSuffixRule, final_rule::FinalRule};
+        use std::net::IpAddr;
+
+        let direct_ip = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 2));
+        let mut hosts: DomainTrie<HostEntry> = DomainTrie::new();
+        hosts.insert("direct.test", vec![direct_ip].into());
+        hosts.insert("proxied.test", vec![direct_ip].into());
+        let direct = Resolver::new(vec![], vec![], DnsMode::Normal, hosts, true, true);
+        // No upstreams and no hosts: every main lookup fails.
+        let mut main = Resolver::new(
+            vec![],
+            vec![],
+            DnsMode::Normal,
+            DomainTrie::new(),
+            false,
+            true,
+        );
+        main.set_direct_resolver(Arc::new(direct));
+        let tunnel = Tunnel::new(Arc::new(main));
+
+        let proxies = meow_config::rebuild_from_raw(&Default::default())
+            .unwrap()
+            .proxies;
+        tunnel.update_routing(
+            proxies,
+            vec![
+                Box::new(DomainSuffixRule::new("direct.test", "DIRECT")),
+                Box::new(FinalRule::new("REJECT")),
+            ],
+            Default::default(),
+        );
+
+        let udp = |host: &str| Metadata {
+            network: Network::Udp,
+            host: host.into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+        let mut routed_direct = udp("direct.test");
+        tunnel.inner().resolve_udp_dst(&mut routed_direct).await;
+        assert_eq!(routed_direct.dst_ip, Some(direct_ip));
+
+        let mut proxied = udp("proxied.test");
+        tunnel.inner().resolve_udp_dst(&mut proxied).await;
+        assert_eq!(
+            proxied.dst_ip, None,
+            "non-DIRECT routes stay off direct-nameserver"
+        );
+    }
+
     /// Front-hop mock for the provider-dialer e2e: records every
     /// `dial_tcp`'s metadata and refuses the connection — observing the
     /// dial proves the provider node's `dialer-proxy` chain resolved.
@@ -2626,7 +2841,13 @@ mod tests {
             );
             assert_eq!(snooped.host, "snooped.example.com", "{sniffed}");
             assert_eq!(snooped.dst_ip, Some([198, 18, 1, 220].into()), "{sniffed}");
+            assert_eq!(
+                snooped.dns_mode,
+                DnsMode::Mapping,
+                "a snooped name is tagged like upstream `DNSMapping` ({sniffed})"
+            );
         }
+        assert_eq!(real.dns_mode, DnsMode::Normal, "no snoop, no tag");
     }
 
     /// The sniff gate mirrors the rescue paths: an unmapped address in our

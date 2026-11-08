@@ -187,6 +187,47 @@ async fn require_auth_ws(
     }
 }
 
+/// mihomo decodes request bodies as JSON whatever their `Content-Type`
+/// (`render.DecodeJSON`), and dashboards rely on it: some send a selection
+/// PUT as `text/plain` or with no type at all. axum's `Json` extractor
+/// answers anything but a JSON media type with 415, so every body that is
+/// not typed JSON (absent, empty, unreadable or any other media type) is
+/// relabelled `application/json` before it reaches a handler. No handler
+/// reads the request type, so this only turns 415s into what mihomo does.
+async fn assume_json_body(mut req: Request) -> Request {
+    let relabel = match req.headers().get(header::CONTENT_TYPE) {
+        None => !matches!(
+            *req.method(),
+            axum::http::Method::GET | axum::http::Method::HEAD
+        ),
+        Some(v) => !v.to_str().is_ok_and(is_json_media_type),
+    };
+    if relabel {
+        req.headers_mut().insert(
+            header::CONTENT_TYPE,
+            header::HeaderValue::from_static("application/json"),
+        );
+    }
+    req
+}
+
+/// `application/json` or a `+json` suffix type, parameters ignored, as
+/// axum's `Json` accepts them.
+fn is_json_media_type(t: &str) -> bool {
+    let media = t.split(';').next().unwrap_or("").trim();
+    let Some((ty, sub)) = media.split_once('/') else {
+        return false;
+    };
+    ty.eq_ignore_ascii_case("application")
+        && (sub.eq_ignore_ascii_case("json")
+            || sub
+                .len()
+                .checked_sub(5)
+                .filter(|&n| n > 0)
+                .and_then(|n| sub.get(n..))
+                .is_some_and(|tail| tail.eq_ignore_ascii_case("+json")))
+}
+
 pub fn create_router(state: Arc<AppState>) -> Router {
     // WS routes — accept header or ?token= query param for browser dashboard compat.
     // REST API routes gated behind the Bearer middleware (header-only).
@@ -221,6 +262,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         )
         .route("/metrics", get(get_metrics))
         .route("/traffic", get(get_traffic))
+        .route(
+            "/traffic/ledger",
+            get(crate::traffic_ledger::get_ledger).delete(crate::traffic_ledger::clear_ledger),
+        )
         .route("/statistics", get(get_statistics))
         .route("/logs", get(get_logs))
         .route(
@@ -307,7 +352,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             .route("/ui/{*rest}", get(ui::serve_ui))
     };
 
-    router.layer(CorsLayer::permissive()).with_state(state)
+    router
+        .layer(middleware::map_request(assume_json_body))
+        .layer(CorsLayer::permissive())
+        .with_state(state)
 }
 
 // ── Basic endpoints ──────────────────────────────────────────────────
@@ -735,6 +783,8 @@ struct ConfigResponse {
     bind_address: String,
     #[serde(rename = "ipv6")]
     ipv6: bool,
+    #[serde(rename = "unified-delay")]
+    unified_delay: bool,
     /// Whether the TUN listener is currently running (issue #326).
     /// Mirrors `tun.enable` from the raw config and reflects actual
     /// runtime state so nyanpasu can correctly render its toggle.
@@ -764,6 +814,8 @@ async fn get_configs(State(state): State<Arc<AppState>>) -> Json<ConfigResponse>
             .clone()
             .unwrap_or_else(|| "0.0.0.0".to_string()),
         ipv6: meow_config::effective_ipv6(raw.ipv6),
+        // The live setting, as mihomo reports `UnifiedDelay.Load()`.
+        unified_delay: meow_proxy::health::unified_delay(),
         tun_enable: tun_running,
         tun: TunFields::reported(raw.tun.as_ref(), tun_running),
     })
@@ -776,7 +828,8 @@ async fn get_configs(State(state): State<Arc<AppState>>) -> Json<ConfigResponse>
 /// it carries are merged over the committed section and the rest keep
 /// their value, `enable` included (mihomo reads an omitted `enable` as
 /// `false`). Any other key is ignored, mihomo's upstream-only ones
-/// (`stack`, `strict-route`, `auto-detect-interface`, …) included.
+/// (`strict-route`, `auto-detect-interface`, `auto-redirect`, …)
+/// included.
 #[derive(Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 struct TunFields {
@@ -787,7 +840,7 @@ struct TunFields {
     #[serde(skip_serializing_if = "Option::is_none")]
     mtu: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    inet4_address: Option<String>,
+    inet4_address: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     inet6_address: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -798,6 +851,12 @@ struct TunFields {
     dns_hijack: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     udp_timeout: Option<u64>,
+    /// `stack` is free-form like `RawTun`'s: `system`/`mixed` select the
+    /// kernel TCP stack, anything else commits verbatim and warns at
+    /// parse — the same contract the `tun:` file section gets, rather
+    /// than a 400 for the whole PATCH.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stack: Option<serde_json::Value>,
 }
 
 impl TunFields {
@@ -809,12 +868,13 @@ impl TunFields {
             enable: Some(running),
             device: tun.device,
             mtu: tun.mtu,
-            inet4_address: tun.inet4_address,
+            inet4_address: reported_inet4(tun.inet4_address),
             inet6_address: tun.inet6_address,
             auto_route: tun.auto_route,
             outbound_interface: tun.outbound_interface,
             dns_hijack: tun.dns_hijack,
             udp_timeout: tun.udp_timeout,
+            stack: tun.stack,
         }
     }
 
@@ -836,7 +896,28 @@ impl TunFields {
         merge(&mut tun.outbound_interface, self.outbound_interface);
         merge(&mut tun.dns_hijack, self.dns_hijack);
         merge(&mut tun.udp_timeout, self.udp_timeout);
+        merge(&mut tun.stack, self.stack);
     }
+}
+
+/// `GET /configs`'s `tun.inet4-address` is a plain CIDR string — or absent
+/// — no matter which spelling the committed `tun:` section uses: `RawTun`
+/// keeps the user's form, which may be mihomo's list (`[]netip.Prefix`).
+/// Reporting the first list entry — the one `parse_tun_config` assigns the
+/// device — restores the `string | absent` contract list-typed clients
+/// broke on; `[]` and `null` report absent, while `""` reports `""`,
+/// exactly as the `Option<String>` field behaved before.
+/// A client that echoes the report back through `PATCH /configs` commits
+/// the string spelling — the parsed address is identical, so the
+/// reconcile's parsed-`TunConfig` diff does not restart the listener.
+/// `inet6-address` keeps echoing its committed form: a raw `Value` there
+/// is its shipped contract, not a regression.
+fn reported_inet4(raw: Option<serde_json::Value>) -> Option<serde_json::Value> {
+    let first = match raw {
+        Some(serde_json::Value::Array(entries)) => entries.into_iter().next(),
+        other => other,
+    };
+    first.filter(serde_json::Value::is_string)
 }
 
 #[derive(Deserialize)]
@@ -1332,6 +1413,17 @@ async fn save_config(
 
 // ── Helper: rebuild proxies/rules from raw and apply to tunnel ───────
 
+/// Resolve a candidate's `tcp-idle-timeout` via
+/// [`meow_config::resolve_tcp_idle_timeout`] — the same `build_config`
+/// rules the boot path enforces — flattening the error to the response
+/// `String`. The rebuild passes never see general fields (`RebuildResult`
+/// carries none), so each commit resolves the raw value itself and
+/// replays it beside `set_connection_notes` — otherwise the committed
+/// document and the running bound silently diverge until restart.
+fn resolve_tcp_idle_timeout(raw: &RawConfig) -> Result<Option<Duration>, String> {
+    meow_config::resolve_tcp_idle_timeout(raw).map_err(|e| e.to_string())
+}
+
 /// Pre-resolve DNS-sourced ECH then rebuild proxies/rules from `raw` and
 /// apply to the live tunnel. Takes the config *by value* so callers
 /// clone-and-drop their `parking_lot` guard before awaiting — those guards
@@ -1352,6 +1444,11 @@ async fn apply_raw_to_tunnel(
         "caller must hold the CONFIG_MUTATION lane"
     );
     let connection_notes = raw.connection_notes.unwrap_or(false);
+    // Same ceiling `build_config` enforces at startup — a candidate that
+    // fails it is rejected before the rebuild runs (400 like the bails
+    // below); the resolved bound is replayed at the commit point.
+    let tcp_idle_timeout =
+        resolve_tcp_idle_timeout(&raw).map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
     let expected_groups: Vec<String> = raw
         .proxy_groups
         .as_deref()
@@ -1449,6 +1546,7 @@ async fn apply_raw_to_tunnel(
     }
     state.tunnel.update_routing(proxies, rules, dialer_registry);
     state.tunnel.set_connection_notes(connection_notes);
+    state.tunnel.set_tcp_idle_timeout(tcp_idle_timeout);
     // Commit point reached: every fallible check passed. The candidate's
     // provider sets become the live registries — the rules and DNS
     // `rule-set:` matchers installed above already reference these Arcs
@@ -1689,23 +1787,24 @@ fn dns_uses_proxy_refs(raw: &RawConfig) -> bool {
     let Some(dns) = raw.dns.as_ref() else {
         return false;
     };
-    // A proxy reference is a `#name` tag on plain entries or `?proxy=name`
-    // on tls:///https:// entries — both capture `Arc<dyn Proxy>` at build
-    // time (issue #67 phase 2), so either spelling must force the rebuild.
-    let tagged = |s: &String| s.contains('#') || s.contains("?proxy=");
-    let urls_tagged =
-        |urls: &Option<Vec<String>>| urls.as_deref().is_some_and(|us| us.iter().any(tagged));
+    // Decide from the parsed entry, not a raw `#`: on `tls://` / `https://`
+    // the fragment is SNI (`tls://1.1.1.1#dns.google`), not a proxy tag. An
+    // unparseable entry fails the DNS build itself, so it is no ref here.
+    let tagged =
+        |s: &str| meow_dns::NameServerEntry::parse(s).is_ok_and(|entry| entry.proxy.is_some());
+    let urls_tagged = |urls: &Option<Vec<String>>| {
+        urls.as_deref()
+            .is_some_and(|us| us.iter().any(|u| tagged(u)))
+    };
     urls_tagged(&dns.nameserver)
         || urls_tagged(&dns.fallback)
         || urls_tagged(&dns.default_nameserver)
         || urls_tagged(&dns.proxy_server_nameserver)
-        || dns.nameserver_policy.as_ref().is_some_and(|m| {
-            m.iter().any(|(_k, v)| {
-                v.as_urls()
-                    .iter()
-                    .any(|u| u.contains('#') || u.contains("?proxy="))
-            })
-        })
+        || urls_tagged(&dns.direct_nameserver)
+        || dns
+            .nameserver_policy
+            .as_ref()
+            .is_some_and(|m| m.iter().any(|(_k, v)| v.as_urls().into_iter().any(tagged)))
 }
 
 /// `true` when two raw configs carry identical DNS-relevant inputs —
@@ -3059,15 +3158,17 @@ async fn swap_config_and_reconcile_tun(
     // Snapshot the candidate (only on an off→on transition, before it is
     // moved into the lock) so the parking_lot write guard — which is
     // !Send — is dropped before the first .await below.
-    let (old_enable, tun_changed, snapshot, specs, new_log_level, logbook_enable) = {
+    let (old_enable, tun_changed, snapshot, specs, new_log_level, (logbook_enable, ledger)) = {
         let mut guard = state.raw_config.write();
         let old = guard.tun.as_ref().is_some_and(|t| t.enable);
         // Semantic diff (issue #543): compare the PARSED `TunConfig`s so
         // any real listener-parameter change (`mtu`, `auto-route`,
-        // `dns-hijack`, addresses, inherited `max-connections`, …)
-        // restarts a running listener while no-op respellings
-        // (`auto-route: true` vs `fake-ip`, explicit defaults) and
-        // warn-only ignored fields (`stack`, `strict-route`, …) do not.
+        // `dns-hijack`, addresses, `stack`, inherited `max-connections`,
+        // …) restarts a running listener while no-op respellings
+        // (`auto-route: true` vs `fake-ip`, explicit defaults, `stack`
+        // spellings that parse to the same `TunStack`) and warn-only
+        // ignored fields (`strict-route`, `auto-detect-interface`, …)
+        // do not.
         // When either side fails to parse, fall back to the raw diff —
         // a broken candidate stays conservative: restart → spawn fails
         // → `enable` rolls back.
@@ -3078,8 +3179,9 @@ async fn swap_config_and_reconcile_tun(
         {
             // Fast path: identical raw sections cannot differ
             // semantically — and skipping the parse avoids re-warn!ing
-            // on upstream-only fields (`stack:`, `strict-route:`, …) on
-            // every commit that never touched `tun:`.
+            // on every commit that never touched `tun:` (upstream-only
+            // fields like `strict-route:` and `stack:`'s warn-and-fall-
+            // back spellings all warn at parse).
             false
         } else {
             match (
@@ -3120,6 +3222,13 @@ async fn swap_config_and_reconcile_tun(
         let new_log_level =
             (guard.log_level != candidate.log_level).then(|| candidate.log_level.clone());
         let logbook_enable = meow_config::raw::RawLogbook::enabled(candidate.logbook.as_ref());
+        // Commit point: a rejected candidate never reaches here.
+        meow_proxy::health::set_unified_delay(candidate.unified_delay.unwrap_or(false));
+        let ledger = candidate.traffic_ledger.as_ref();
+        let ledger = (
+            meow_config::raw::RawTrafficLedger::enabled(ledger),
+            meow_config::raw::RawTrafficLedger::options(ledger),
+        );
         *guard = candidate;
         (
             old,
@@ -3127,10 +3236,15 @@ async fn swap_config_and_reconcile_tun(
             snapshot,
             specs,
             new_log_level,
-            logbook_enable,
+            (logbook_enable, ledger),
         )
     };
     logbook::reconfigure(logbook_enable);
+    // Opening or closing the ledger waits on its database.
+    let _ = tokio::task::spawn_blocking(move || {
+        meow_common::traffic_ledger::reconfigure(ledger.0, ledger.1);
+    })
+    .await;
 
     if let Some(new_log_level) = new_log_level {
         let level = new_log_level.as_deref().unwrap_or("info");
@@ -3462,6 +3576,58 @@ async fn put_configs(
     // made it into the PUT.
     meow_config::subscription::reconcile_contribution_claims(&mut raw_config);
 
+    // Same admission contract for `tcp-idle-timeout`: the rebuild never
+    // sees general fields either, so its ceiling must gate persistence
+    // here — committed unchecked, the next boot's `build_config` would
+    // hard-error on a value this PUT accepted. `force` keeps the running
+    // bound, the same degrade the dns arm applies below — AND normalizes
+    // the committed field to that bound: the warm-path commits
+    // (`commit_raw_candidate` → `apply_raw_to_tunnel`) re-resolve this
+    // field on every mutation, so persisting the invalid value would make
+    // every later unrelated PATCH fail with this same error. This gate
+    // must run BEFORE the rebuild — the force early-return below commits
+    // `raw_config` when nothing builds, so a check placed after that arm
+    // would leave the verbatim poison in the committed document.
+    let tcp_idle_timeout = match resolve_tcp_idle_timeout(&raw_config) {
+        Ok(timeout) => timeout,
+        Err(msg) => {
+            if force {
+                tracing::error!("config reload forced despite {msg}");
+                forced.push(msg);
+                let running = state.tunnel.inner().tcp_idle_timeout();
+                // Rewrite the invalid value to what is actually running —
+                // semantically equivalent for the next boot's
+                // `build_config` (0 = disabled) and boot-valid by
+                // construction.
+                raw_config.tcp_idle_timeout = Some(running.map_or(0, |d| d.as_secs()));
+                running
+            } else {
+                return reload_rejected(StatusCode::BAD_REQUEST, &msg);
+            }
+        }
+    };
+
+    // Same admission contract for `tcp-keepalive*`: the rebuild never sees
+    // general fields either, so their semantic validation must gate
+    // persistence here — committed unchecked, the next boot's
+    // `build_config` would hard-error on a value this PUT accepted. The
+    // resolved posture is a startup snapshot like `listeners:` (no
+    // hot-apply), so under `force` there is no running value to keep —
+    // the degrade is warn + commit, matching the listeners arm. Unlike
+    // `tcp-idle-timeout` the committed value is NOT normalized (nothing
+    // running to normalize to): a forced bad value can still reach
+    // `save_config` and hard-error the next boot, the same exposure
+    // `listeners:`/`tun:` already carry — but hoisting the check above
+    // the rebuild at least records it in `forced` on every commit path.
+    if let Err(e) = meow_config::resolve_tcp_keepalive(&raw_config) {
+        if force {
+            tracing::error!("config reload forced despite {e}");
+            forced.push(e.to_string());
+        } else {
+            return reload_rejected(StatusCode::BAD_REQUEST, &e.to_string());
+        }
+    }
+
     // Semantic rebuild (proxy/rule parsing). Share the tunnel's resolver
     // slot so the rebuilt map's DIRECT adapter tracks later
     // `set_resolver` swaps (issue #514).
@@ -3700,6 +3866,7 @@ async fn put_configs(
     state
         .tunnel
         .set_connection_notes(raw_config.connection_notes.unwrap_or(false));
+    state.tunnel.set_tcp_idle_timeout(tcp_idle_timeout);
     if dropped > 0 {
         tracing::warn!(
             connections_dropped = dropped,
@@ -4111,6 +4278,36 @@ async fn get_memory(
         .expect("valid memory stream response")
 }
 
+/// Parse the `VmRSS:` value (KiB, per procfs) out of a `/proc/self/status`
+/// payload and return it in bytes. `None` if the line is missing/malformed.
+#[cfg(any(target_os = "linux", test))]
+fn parse_vmrss_bytes(status: &str) -> Option<u64> {
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            return rest
+                .split_whitespace()
+                .next()
+                .and_then(|kb| kb.parse::<u64>().ok())
+                .map(|kb| kb.saturating_mul(1024));
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+async fn read_rss_bytes() -> u64 {
+    // VmRSS is the same kernel counter sysinfo's Process::memory() exposes;
+    // reading /proc directly keeps sysinfo (and its rayon/disk/network
+    // default features) out of the shipped Linux binary. Deliberately not
+    // /proc/self/statm: its fields are page counts and the page size is a
+    // kernel-config variable, not a constant.
+    let Ok(status) = tokio::fs::read_to_string("/proc/self/status").await else {
+        return 0;
+    };
+    parse_vmrss_bytes(&status).unwrap_or(0)
+}
+
+#[cfg(not(target_os = "linux"))]
 async fn read_rss_bytes() -> u64 {
     tokio::task::spawn_blocking(|| {
         use sysinfo::{Pid, ProcessesToUpdate, System};
@@ -4268,16 +4465,18 @@ async fn refresh_provider(
     };
     match provider.refresh().await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => (
+        // Fetch/parser errors can include private URLs, headers or payloads.
+        Err(_) => msg_err(
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"message": e})),
-        )
-            .into_response(),
+            "Proxy provider refresh failed; the last valid proxies are unchanged",
+        ),
     }
 }
 
-/// Trigger a health check for all proxies in the named provider.
-/// Accepts the same `url` and `timeout` query params as `GET /proxies/:name/delay`.
+/// Trigger a health check for all proxies in the named provider, using the
+/// provider's own `health-check` url/timeout/expected-status. Query params
+/// are not accepted — per-proxy overrides live on
+/// `/providers/proxies/{provider}/{name}/healthcheck`.
 async fn provider_healthcheck(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
@@ -4287,7 +4486,15 @@ async fn provider_healthcheck(
         None => return msg_err(StatusCode::NOT_FOUND, "resource not found"),
     };
 
-    let Some(health) = provider.health_check.as_ref() else {
+    // mihomo's `execute` skips an empty testUrl ("Health Check has been
+    // skipped due to testUrl is empty") — no block or no url both answer
+    // 204 without probing. `enable` deliberately does not gate this: a
+    // manual request is not the periodic sweep it disables.
+    let Some(health) = provider
+        .health_check
+        .as_ref()
+        .filter(|hc| !hc.url.is_empty())
+    else {
         return StatusCode::NO_CONTENT.into_response();
     };
     let timeout = Duration::from_millis(health.timeout.max(1));
@@ -4442,22 +4649,27 @@ async fn get_rule_provider(
 async fn refresh_rule_provider(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
-) -> StatusCode {
+) -> Response {
     let provider = {
         let providers = state.rule_providers.read();
         providers.get(&name).cloned()
     };
     let Some(p) = provider else {
-        return StatusCode::NOT_FOUND;
+        return msg_err(StatusCode::NOT_FOUND, "resource not found");
     };
     // The provider re-parses in its own load-time ParserContext, so a
     // classical payload with GEOIP/GEOSITE entries survives the refresh
     // (issue #533 review).
     match p.refresh().await {
-        Ok(()) => StatusCode::NO_CONTENT,
-        Err(e) => {
-            tracing::warn!(provider = %name, "rule-provider refresh failed: {:#}", e);
-            StatusCode::SERVICE_UNAVAILABLE
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        // Keep the existing last-good owner; only the response changes. Do
+        // not echo the error chain, which may contain a private URL/payload.
+        Err(_) => {
+            tracing::warn!(provider = %name, "rule-provider refresh failed");
+            msg_err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Rule provider refresh failed; the last valid rules are unchanged",
+            )
         }
     }
 }
@@ -4524,6 +4736,32 @@ mod tests {
         assert_eq!(parse_connections_interval(Some("101")), Some(101));
         assert_eq!(parse_connections_interval(Some("5000")), Some(5000));
         assert_eq!(parse_connections_interval(None), Some(1000));
+    }
+
+    /// On `tls://` / `https://` the `#` fragment is SNI, not a proxy tag —
+    /// it must not force a DNS rebuild on every commit. A plain-form
+    /// `#name` in any list (including `direct-nameserver`) still does.
+    #[test]
+    fn sni_fragment_is_not_a_dns_proxy_ref() {
+        let raw = |yaml: &str| -> RawConfig { serde_saphyr::from_str(yaml).unwrap() };
+        for list in ["nameserver", "direct-nameserver", "proxy-server-nameserver"] {
+            assert!(
+                !dns_uses_proxy_refs(&raw(&format!(
+                    "dns:\n  {list}:\n    - tls://1.1.1.1#dns.google\n    - https://1.1.1.1/dns-query#cloudflare-dns.com\n"
+                ))),
+                "{list}: SNI fragment counted as a proxy ref"
+            );
+            assert!(
+                dns_uses_proxy_refs(&raw(&format!("dns:\n  {list}:\n    - 8.8.8.8#P\n"))),
+                "{list}: plain `#name` must count as a proxy ref"
+            );
+        }
+        assert!(!dns_uses_proxy_refs(&raw(
+            "dns:\n  nameserver-policy:\n    'example.com': tls://1.1.1.1#dns.google\n"
+        )));
+        assert!(dns_uses_proxy_refs(&raw(
+            "dns:\n  nameserver-policy:\n    'example.com': [tcp://1.1.1.1#P]\n"
+        )));
     }
 
     /// Issue #533: a `#name` nameserver captures adapters whose registry
@@ -5018,6 +5256,57 @@ mod tests {
             provider.proxies().len(),
             1,
             "the commit must consume deferred_initial and refresh through the now-resolvable proxy"
+        );
+    }
+
+    /// The real `/proc/self/status` line shape: tab, space-padded KiB value.
+    /// 12345 KiB × 1024 = 12,641,280 B.
+    #[test]
+    fn parse_vmrss_bytes_parses_real_proc_line() {
+        assert_eq!(parse_vmrss_bytes("VmRSS:\t   12345 kB\n"), Some(12_641_280));
+    }
+
+    #[test]
+    fn parse_vmrss_bytes_missing_line_is_none() {
+        assert_eq!(parse_vmrss_bytes("Name:\tmeow\nVmHWM:\t   123 kB\n"), None);
+        assert_eq!(parse_vmrss_bytes(""), None);
+    }
+
+    #[test]
+    fn parse_vmrss_bytes_malformed_value_is_none() {
+        assert_eq!(parse_vmrss_bytes("VmRSS:\tabc kB\n"), None);
+        assert_eq!(parse_vmrss_bytes("VmRSS:\t\n"), None);
+    }
+
+    /// The prefix must be exactly `VmRSS:` — `VmHWM:` or `VmRSS ` don't match.
+    #[test]
+    fn parse_vmrss_bytes_requires_exact_prefix() {
+        assert_eq!(parse_vmrss_bytes("VmRSS  123 kB\n"), None);
+        assert_eq!(parse_vmrss_bytes("VmHWM:\t   123 kB\n"), None);
+    }
+
+    /// F-03: a KiB value that would overflow `u64` on `× 1024` saturates
+    /// instead of panicking (debug) or wrapping (release).
+    #[test]
+    fn parse_vmrss_bytes_saturates_instead_of_overflow() {
+        assert_eq!(
+            parse_vmrss_bytes("VmRSS:\t18446744073709551615 kB\n"),
+            Some(u64::MAX)
+        );
+    }
+
+    /// End-to-end over whichever branch this target compiles: on Linux the
+    /// real `/proc/self/status` read + `VmRSS:` parse, elsewhere `sysinfo`.
+    /// A running test process always has resident pages, so `0` (the
+    /// failure sentinel) means the probe is broken on this platform. The
+    /// upper bound catches a unit mix-up (KiB not scaled, or scaled twice).
+    #[tokio::test]
+    async fn read_rss_bytes_reports_live_process_rss() {
+        let rss = read_rss_bytes().await;
+        assert!(rss > 0, "RSS probe returned the failure sentinel 0");
+        assert!(
+            (1 << 20..1 << 40).contains(&rss),
+            "RSS {rss} B is outside a plausible 1 MiB..1 TiB range"
         );
     }
 }

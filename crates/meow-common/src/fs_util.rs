@@ -1,7 +1,7 @@
 //! Shared cleanup for the `{name}.{pid}.{n}.tmp` scratch siblings that
 //! atomic write-then-rename producers (`meow_config::unique_scratch_path`,
-//! `SelectorStore`, fake-IP `FileStore`) leave behind when the process
-//! dies between create and rename (issue #621).
+//! `SelectorStore`, fake-IP `FileStore`, `meow convert-ruleset`) leave
+//! behind when the process dies between create and rename (issue #621).
 //!
 //! Ordinary failures remove their own scratch; only a crash or SIGKILL can
 //! orphan one — which is why cleanup is a best-effort sweep at the next
@@ -44,6 +44,20 @@ const DEAD_PID_MIN_AGE: Duration = Duration::from_secs(1);
 /// the intended sweep of a dead sibling's leftovers), and every error is
 /// ignored — sweeping is strictly best-effort.
 pub fn sweep_scratch_siblings(target: &Path, max_age: Duration) -> usize {
+    sweep_scratch_siblings_impl(target, max_age, None)
+}
+
+/// [`sweep_scratch_siblings`] variant that never removes `keep`: a file the
+/// caller still owns — e.g. `convert-ruleset`'s source, whose name can
+/// itself match the `{target}.{pid}.{n}.tmp` scratch shape and would
+/// otherwise be swept as a stale leftover even though its bytes were just
+/// read from it (issue #877 review). Compared by canonical path.
+pub fn sweep_scratch_siblings_excluding(target: &Path, max_age: Duration, keep: &Path) -> usize {
+    let keep = keep.canonicalize().ok();
+    sweep_scratch_siblings_impl(target, max_age, keep.as_deref())
+}
+
+fn sweep_scratch_siblings_impl(target: &Path, max_age: Duration, keep: Option<&Path>) -> usize {
     // `Path::new("file").parent()` is `Some("")` — a bare filename means
     // the current dir, and `read_dir("")` would fail outright.
     let dir = target
@@ -95,7 +109,15 @@ pub fn sweep_scratch_siblings(target: &Path, max_age: Duration) -> usize {
                 .is_ok_and(|mtime| {
                     now.duration_since(mtime).unwrap_or_default() > DEAD_PID_MIN_AGE
                 });
-        if (stale_by_age || dead_owner) && std::fs::remove_file(entry.path()).is_ok() {
+        if !(stale_by_age || dead_owner) {
+            continue;
+        }
+        // Only now — for a name that would actually be removed — is the
+        // canonical comparison against `keep` worth a syscall.
+        if keep.is_some_and(|keep| entry.path().canonicalize().ok().as_deref() == Some(keep)) {
+            continue;
+        }
+        if std::fs::remove_file(entry.path()).is_ok() {
             removed += 1;
         }
     }
@@ -256,5 +278,30 @@ mod tests {
             0
         );
         assert!(scratch.exists());
+    }
+
+    /// `convert-ruleset`'s source can itself be named like a scratch
+    /// sibling of the target (`meow convert-ruleset domain mrs
+    /// out.txt.1.2.tmp out.txt`); `excluding` must never remove it.
+    #[test]
+    fn sweep_excluding_keeps_a_source_shaped_like_scratch() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("out.txt");
+        let source = dir.path().join("out.txt.1.2.tmp");
+        write(&source);
+        let stale = dir.path().join("out.txt.3.4.tmp");
+        write(&stale);
+
+        assert_eq!(
+            sweep_scratch_siblings_excluding(&target, Duration::ZERO, &source),
+            1
+        );
+        assert!(source.exists(), "the keep file survives the sweep");
+        assert!(!stale.exists(), "other stale scratch still removed");
+
+        // Without the exclusion the same name is swept like any scratch.
+        write(&stale);
+        assert_eq!(sweep_scratch_siblings(&target, Duration::ZERO), 2);
+        assert!(!source.exists());
     }
 }

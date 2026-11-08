@@ -22,6 +22,28 @@ pub struct RuleSetRule {
 
 impl RuleSetRule {
     pub fn new(name: &str, set: Arc<dyn RuleSet>, adapter: &str, flags: RuleFlags) -> Self {
+        // Upstream marks `,src` as meaningful only for `ipcidr` providers:
+        // on a `domain` set the src/dst swap is a no-op (the match reads
+        // the host), so a ported `RULE-SET,<domain-set>,...,src` would
+        // silently never do what the author intended — flag it instead of
+        // ignoring it (Class B, ADR-0002). Centralised here so every
+        // parse path — the top-level `rules:` entry and a sub-rule inside
+        // `AND`/`OR`/`NOT` — warns identically.
+        if flags.is_src && set.behavior() == RuleSetBehavior::Domain {
+            // Inside `AND`/`OR`/`NOT` the adapter slot holds the parser's
+            // splice placeholder — the enclosing logic group owns the real
+            // target. Name it rather than echoing the sentinel.
+            let shown = if adapter == crate::parser::LOGIC_INNER_PLACEHOLDER {
+                "<enclosing logic group's target>"
+            } else {
+                adapter
+            };
+            tracing::warn!(
+                "RULE-SET,{name},{shown},src: `src` has no effect on a \
+                 domain-behavior rule-provider (it is meaningful only for \
+                 ipcidr/classical behavior)"
+            );
+        }
         Self {
             name: name.into(),
             set,

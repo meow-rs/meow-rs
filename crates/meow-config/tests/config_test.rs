@@ -465,6 +465,43 @@ proxy-groups:
     );
 }
 
+/// `strict: true` must not false-positive on legal `hosts:` keys: a
+/// trailing-dot spelling (`x.com.`, `x.com..`, `+.z.com.`) normalizes
+/// onto the same live trie slot as `x.com` — only genuinely dead keys
+/// (empty labels, refused bodies) are flagged.
+#[tokio::test]
+async fn test_strict_hosts_accepts_trailing_dot_keys() {
+    let yaml = r#"
+strict: true
+hosts:
+  "x.com.": "1.2.3.4"
+  "y.com..": "1.2.3.5"
+  "+.z.com.": "1.2.3.6"
+"#;
+    load_config_from_str(yaml)
+        .await
+        .expect("trailing-dot hosts keys are live keys — strict must not flag them");
+}
+
+/// The same strict run must still catch a key that is actually dead: an
+/// empty-label `hosts:` key builds a trie node no query can reach.
+#[tokio::test]
+async fn test_strict_hosts_rejects_empty_label_key() {
+    let yaml = r#"
+strict: true
+hosts:
+  "a..b": "1.2.3.4"
+"#;
+    let err = load_config_from_str(yaml)
+        .await
+        .err()
+        .expect("strict mode must reject a dead hosts key");
+    assert!(
+        err.to_string().contains("empty label"),
+        "unexpected error: {err}"
+    );
+}
+
 /// The check is unconditional — `strict: true` rejects the same cycle
 /// (the registry split it prevents is structural, not a parse defect).
 #[tokio::test]
@@ -1141,6 +1178,149 @@ dns:
     );
 }
 
+/// `dns.prefer-h3` and `?h3=` need a QUIC-capable build. Without the feature
+/// the config is refused (ADR-0002 Class A) instead of silently serving plain
+/// HTTP/1.1 DoH; with it, `https://` entries carry the policy into the
+/// resolver's labels.
+#[tokio::test]
+async fn test_dns_prefer_h3_requires_the_feature_and_applies() {
+    let yaml = r#"
+dns:
+  enable: true
+  prefer-h3: true
+  nameserver:
+    - https://1.1.1.1/dns-query
+    - https://dns.google/dns-query?h3=false
+  default-nameserver:
+    - 223.5.5.5
+"#;
+    if cfg!(feature = "dns-quic") {
+        let config = load_config_from_str(yaml).await.unwrap();
+        let labels: Vec<String> = config
+            .dns
+            .resolver
+            .main_nameservers()
+            .iter()
+            .map(|client| client.upstream_label())
+            .collect();
+        assert!(
+            labels.iter().any(|label| label.contains("h3=prefer")),
+            "prefer-h3 must mark the https entry: {labels:?}"
+        );
+        assert!(
+            labels
+                .iter()
+                .any(|label| label.contains("dns.google") && !label.contains("h3=")),
+            "an explicit ?h3=false must win over prefer-h3: {labels:?}"
+        );
+    } else {
+        match load_config_from_str(yaml).await {
+            Ok(_) => panic!("prefer-h3 must be refused without the dns-quic feature"),
+            Err(err) => {
+                let err = err.to_string();
+                assert!(
+                    err.contains("dns-quic"),
+                    "the error must name the missing feature: {err}"
+                );
+            }
+        }
+    }
+}
+
+/// A bare `?h3=true` entry is the same verdict as `prefer-h3`: no silent
+/// downgrade to HTTP/1.1 on a build without the feature.
+#[tokio::test]
+async fn test_dns_per_entry_h3_requires_the_feature() {
+    let yaml = r#"
+dns:
+  enable: true
+  nameserver:
+    - https://1.1.1.1/dns-query?h3=true
+"#;
+    match load_config_from_str(yaml).await {
+        Ok(_) if cfg!(feature = "dns-quic") => {}
+        Ok(_) => panic!("this entry must be refused without the dns-quic feature"),
+        Err(err) if cfg!(feature = "dns-quic") => panic!("{err}"),
+        Err(err) => {
+            let err = err.to_string();
+            assert!(err.contains("dns-quic"), "{err}");
+        }
+    }
+}
+
+/// The capability gate must read the *post-rewrite* policy map: with
+/// `prefer-h3` and DoH upstreams only under `nameserver-policy`, inspecting
+/// the raw strings misses the rewrite and a panic reaches client
+/// construction on a build without `dns-quic`.
+#[tokio::test]
+async fn test_dns_prefer_h3_policy_only_is_gated() {
+    let yaml = r#"
+dns:
+  enable: true
+  prefer-h3: true
+  default-nameserver: [223.5.5.5]
+  nameserver: [8.8.8.8]
+  nameserver-policy:
+    "geosite:cn":
+      - https://1.1.1.1/dns-query
+"#;
+    match load_config_from_str(yaml).await {
+        Ok(_) if cfg!(feature = "dns-quic") => {}
+        Ok(_) => panic!("a policy-only prefer-h3 config must be refused without the feature"),
+        Err(err) if cfg!(feature = "dns-quic") => panic!("{err}"),
+        Err(err) => {
+            let err = err.to_string();
+            assert!(
+                err.contains("dns-quic"),
+                "the error must name the missing feature: {err}"
+            );
+        }
+    }
+}
+
+/// A `?proxy=`-tagged QUIC upstream whose server is a hostname cannot work —
+/// QUIC must know the peer before the handshake, and a proxied hostname is
+/// resolved by the adapter. Refused at load rather than hanging.
+#[tokio::test]
+#[cfg(feature = "dns-quic")]
+async fn test_dns_proxied_quic_hostname_is_refused() {
+    let yaml = r#"
+dns:
+  enable: true
+  default-nameserver: [223.5.5.5]
+  nameserver:
+    - quic://dns.adguard.com?proxy=DIRECT
+"#;
+    match load_config_from_str(yaml).await {
+        Ok(_) => panic!("proxied QUIC hostname must be refused"),
+        Err(err) => {
+            let err = err.to_string();
+            assert!(err.contains("IP-literal"), "unexpected error: {err}");
+        }
+    }
+}
+
+/// `quic://` nameservers parse only on a QUIC-capable build; the error names
+/// the feature rather than dropping the entry.
+#[tokio::test]
+async fn test_dns_quic_scheme_requires_the_feature() {
+    let yaml = r#"
+dns:
+  enable: true
+  nameserver:
+    - quic://dns.adguard.com
+"#;
+    match load_config_from_str(yaml).await {
+        Ok(_) if cfg!(feature = "dns-quic") => {}
+        Ok(_) => panic!("this entry must be refused without the dns-quic feature"),
+        Err(err) if cfg!(feature = "dns-quic") => panic!("{err}"),
+        Err(err) => {
+            let err = err.to_string();
+            assert!(err.contains("quic-dns"), "{err}");
+        }
+    }
+}
+
 #[tokio::test]
 async fn test_dns_config_disabled() {
     let yaml = r#"
@@ -1684,6 +1864,7 @@ async fn test_proxy_parsing_ss_with_builtin_obfs_table() {
     );
 }
 
+#[cfg(feature = "gost-plugin")]
 #[tokio::test]
 async fn test_proxy_parsing_ss_with_gost_plugin() {
     // `gost-plugin` is an in-process built-in (issue #533): a ws transport
@@ -3078,4 +3259,199 @@ geox-url:
         "https://explicit.test/Country.mmdb"
     );
     assert_eq!(config.geodata.geosite_url, "https://alias.test/geosite.dat");
+}
+
+// ─── tcp-keepalive* / tcp-idle-timeout (zombie-connection bound) ───────────
+
+/// Keys absent: the defaults resolve — keepalive on at 300 s/30 s/5 probes,
+/// relay idle bound disabled (None; pre-894 behaviour preserved).
+#[tokio::test]
+async fn test_tcp_keepalive_defaults() {
+    let config = load_config_from_str("mixed-port: 7890\n").await.unwrap();
+    let ka = config.listeners.tcp_keepalive;
+    assert!(ka.enabled);
+    assert_eq!(ka.idle, std::time::Duration::from_secs(300));
+    assert_eq!(ka.interval, std::time::Duration::from_secs(30));
+    assert_eq!(ka.probes, 5);
+    assert_eq!(config.general.tcp_idle_timeout, None);
+}
+
+/// Explicit values round-trip into the resolved structs.
+#[tokio::test]
+async fn test_tcp_keepalive_explicit_values() {
+    let yaml = r#"
+tcp-keepalive: true
+tcp-keepalive-idle: 120
+tcp-keepalive-interval: 15
+tcp-keepalive-probes: 9
+tcp-idle-timeout: 1800
+"#;
+    let config = load_config_from_str(yaml).await.unwrap();
+    let ka = config.listeners.tcp_keepalive;
+    assert!(ka.enabled);
+    assert_eq!(ka.idle, std::time::Duration::from_secs(120));
+    assert_eq!(ka.interval, std::time::Duration::from_secs(15));
+    assert_eq!(ka.probes, 9);
+    assert_eq!(
+        config.general.tcp_idle_timeout,
+        Some(std::time::Duration::from_secs(1800))
+    );
+}
+
+/// `tcp-idle-timeout: 0` is the documented off-switch: resolves to `None`.
+#[tokio::test]
+async fn test_tcp_idle_timeout_zero_disables() {
+    let config = load_config_from_str("tcp-idle-timeout: 0\n").await.unwrap();
+    assert_eq!(config.general.tcp_idle_timeout, None);
+}
+
+/// `tcp-keepalive: false` resolves `enabled: false` (the config-level kill
+/// switch); parameter keys set alongside it take the warn path but still
+/// resolve to the configured values.
+#[tokio::test]
+async fn test_tcp_keepalive_false_resolves_disabled() {
+    let yaml = r#"
+tcp-keepalive: false
+tcp-keepalive-idle: 120
+"#;
+    let config = load_config_from_str(yaml).await.unwrap();
+    let ka = config.listeners.tcp_keepalive;
+    assert!(!ka.enabled);
+    assert_eq!(ka.idle, std::time::Duration::from_secs(120));
+}
+
+/// Validation matrix: zero/overflow seconds and out-of-range probe counts
+/// are hard config errors.
+#[tokio::test]
+async fn test_tcp_keepalive_validation_rejects_bad_values() {
+    for (yaml, needle) in [
+        ("tcp-keepalive-idle: 0\n", "tcp-keepalive-idle"),
+        ("tcp-keepalive-interval: 0\n", "tcp-keepalive-interval"),
+        ("tcp-keepalive-probes: 0\n", "tcp-keepalive-probes"),
+        ("tcp-keepalive-probes: 128\n", "tcp-keepalive-probes"),
+        (
+            "tcp-keepalive-idle: 18446744073709551615\n",
+            "tcp-keepalive-idle",
+        ),
+        (
+            "tcp-keepalive-interval: 18446744073709551615\n",
+            "tcp-keepalive-interval",
+        ),
+        // One past the setsockopt (EINVAL) ceiling must be a config
+        // error, not a silent runtime fallback to OS-default timing.
+        ("tcp-keepalive-idle: 32768\n", "tcp-keepalive-idle"),
+        ("tcp-keepalive-interval: 32768\n", "tcp-keepalive-interval"),
+        (
+            "tcp-idle-timeout: 18446744073709551615\n",
+            "tcp-idle-timeout",
+        ),
+    ] {
+        let err = load_config_from_str(yaml)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{yaml} must be rejected"));
+        assert!(
+            err.to_string().contains(needle),
+            "{yaml} — unexpected error: {err}"
+        );
+    }
+}
+
+/// Boundary accepts: the inclusive ends of each range and the exact
+/// `Instant + Duration` ceiling all resolve.
+#[tokio::test]
+async fn test_tcp_keepalive_boundaries_accept() {
+    let yaml = r#"
+tcp-keepalive-probes: 1
+tcp-idle-timeout: 1
+"#;
+    let config = load_config_from_str(yaml).await.unwrap();
+    assert_eq!(config.listeners.tcp_keepalive.probes, 1);
+    assert_eq!(
+        config.general.tcp_idle_timeout,
+        Some(std::time::Duration::from_secs(1))
+    );
+
+    let yaml = format!(
+        "tcp-keepalive-probes: 127\ntcp-idle-timeout: {}\n",
+        meow_common::MAX_DURATION_SECS
+    );
+    let config = load_config_from_str(&yaml).await.unwrap();
+    assert_eq!(config.listeners.tcp_keepalive.probes, 127);
+    assert_eq!(
+        config.general.tcp_idle_timeout,
+        Some(std::time::Duration::from_secs(
+            meow_common::MAX_DURATION_SECS
+        ))
+    );
+
+    // `tcp-keepalive-idle`/`-interval` top out at the setsockopt
+    // (EINVAL) ceiling, not the timer ceiling — Linux rejects
+    // TCP_KEEPIDLE/TCP_KEEPINTVL above 32767.
+    let yaml = format!(
+        "tcp-keepalive-idle: {0}\ntcp-keepalive-interval: {0}\n",
+        meow_common::tcp_opts::MAX_TCP_KEEPALIVE_SECS
+    );
+    let config = load_config_from_str(&yaml).await.unwrap();
+    assert_eq!(
+        config.listeners.tcp_keepalive.idle,
+        std::time::Duration::from_secs(meow_common::tcp_opts::MAX_TCP_KEEPALIVE_SECS)
+    );
+    assert_eq!(
+        config.listeners.tcp_keepalive.interval,
+        std::time::Duration::from_secs(meow_common::tcp_opts::MAX_TCP_KEEPALIVE_SECS)
+    );
+}
+
+/// `tcp-keepalive: false` silences *valid* parameter keys with a warn —
+/// but an invalid value is still a hard error even while disabled (dead
+/// config is tolerated, defective config is not).
+#[tokio::test]
+async fn test_tcp_keepalive_disabled_still_rejects_invalid() {
+    for line in [
+        "tcp-keepalive-probes: 0\n",
+        "tcp-keepalive-probes: 128\n",
+        "tcp-keepalive-idle: 0\n",
+        "tcp-keepalive-interval: 0\n",
+        "tcp-keepalive-idle: 32768\n",
+    ] {
+        let yaml = format!("tcp-keepalive: false\n{line}");
+        let err = load_config_from_str(&yaml)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{line} under tcp-keepalive: false must still be rejected"));
+        assert!(
+            err.to_string().contains("tcp-keepalive"),
+            "{line} — unexpected error: {err}"
+        );
+    }
+}
+
+/// Upstream mihomo's `keep-alive-*` keys (which tune inbound listeners
+/// AND outbound dials there) are captured and warned (never honored),
+/// not silently dropped: they must land in the `RawConfig` capture
+/// fields AND not fail the load.
+#[tokio::test]
+async fn test_upstream_keepalive_keys_warn_but_parse() {
+    let yaml = r#"
+keep-alive-idle: 15
+keep-alive-interval: 30
+disable-keep-alive: false
+mixed-port: 7890
+"#;
+    // The keys must be captured, not dropped as unknown fields — a
+    // misnamed serde field would leave `keep-alive-idle` silently
+    // ignored while this test's load assertions still pass.
+    let raw = meow_config::parse_raw_yaml(yaml).unwrap();
+    assert!(raw.keep_alive_idle.is_some());
+    assert!(raw.keep_alive_interval.is_some());
+    assert!(raw.disable_keep_alive.is_some());
+
+    let config = load_config_from_str(yaml).await.unwrap();
+    // Ignored upstream keys never reach the resolved inbound posture.
+    let ka = config.listeners.tcp_keepalive;
+    assert!(ka.enabled);
+    assert_eq!(ka.idle, std::time::Duration::from_secs(300));
+    assert_eq!(ka.interval, std::time::Duration::from_secs(30));
+    assert_eq!(ka.probes, 5);
 }

@@ -403,8 +403,9 @@ proxies:
 
 /// REALITY must load on any build that has the `vless` feature — it no longer
 /// needs `boring-tls`. Release targets where boring-sys cannot be compiled
-/// (armv7/i686 musl, MIPS, windows-gnu, iOS) used to warn-and-skip every
-/// REALITY proxy, which read as "vless just doesn't work" (issue #377).
+/// (i686 musl, MIPS, windows-gnu, iOS) used to warn-and-skip every REALITY
+/// proxy, which read as "vless just doesn't work" (issue #377); armv7 musl
+/// has since gained a release build (PR #744).
 #[tokio::test]
 async fn parse_vless_reality_opts_valid_loads_without_boring_tls() {
     let yaml = r#"
@@ -1618,6 +1619,9 @@ proxies:
 }
 #[tokio::test]
 async fn parse_vless_xhttp_unsupported_mode_skipped() {
+    // `stream-up` is a named XHTTP mode meow does not implement, so it hits
+    // the generic "unsupported xhttp mode" rejection — `auto` no longer
+    // reaches that branch (it resolves like Xray first).
     let yaml = r#"
 proxies:
   - name: vless-xhttp-bad-mode
@@ -1628,7 +1632,7 @@ proxies:
     tls: true
     network: xhttp
     xhttp-opts:
-      mode: auto
+      mode: stream-up
 "#;
     let config = load_config_from_str(yaml)
         .await

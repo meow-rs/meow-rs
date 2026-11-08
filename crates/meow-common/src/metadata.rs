@@ -258,11 +258,17 @@ impl Metadata {
         }
     }
 
+    /// The hostname the rule engine sees: `sniff_host` when the sniffer
+    /// produced one, else `host` — with trailing dots stripped on both
+    /// paths, so a client-supplied `evil.com.` (the fully-qualified
+    /// spelling) still reads as `evil.com` to DOMAIN rules. The stored
+    /// `host`/`sniff_host` keep their verbatim form, so dialing and
+    /// CONNECT lines are unaffected.
     pub fn rule_host(&self) -> &str {
         if self.sniff_host.is_empty() {
-            &self.host
+            self.host.trim_end_matches('.')
         } else {
-            &self.sniff_host
+            self.sniff_host.trim_end_matches('.')
         }
     }
 
@@ -356,6 +362,14 @@ pub fn metadata_ip_literal(s: &str) -> Option<IpAddr> {
 /// SRV/DKIM-style names use underscores), in dot-separated labels of 1-63
 /// bytes, at most 253 bytes in total plus one optional trailing dot.
 /// Punycode (`xn--`) IDNs pass as ordinary labels; raw non-ASCII does not.
+/// A name must also carry at least one non-numeric byte (`-` and `_`
+/// count): `2130706433`, `0177.0.0.1`, `123.456` are libc `inet_aton`
+/// spellings of addresses, not hostnames — on a libc dial path they fold
+/// into IPs the DOMAIN rules never saw (Go `net.isDomainName` makes the
+/// same call). Letter-bearing spellings like `0x7f000001` still pass, as
+/// they do under Go; they are only closed on dial paths that resolve
+/// through the injected DNS resolver (NXDOMAIN) — a `type: direct` node
+/// configured without `dns:` still dials via libc and folds them.
 ///
 /// Everything else is refused — in particular `@`, `/`, `?`, `#`, `:`,
 /// `%`, whitespace, control bytes and NUL. Those bytes make the name the
@@ -376,13 +390,18 @@ pub fn is_valid_host(host: &str) -> bool {
     if name.is_empty() || name.len() > 253 {
         return false;
     }
+    // `split('.')` eats the separators, so the per-byte OR sees only label
+    // bytes — it must stay inside the label check: hoisting it to the
+    // whole name would count `.` as non-numeric and resurrect `123.456`.
+    let mut non_numeric = false;
     name.split('.').all(|label| {
         !label.is_empty()
             && label.len() <= 63
-            && label
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-    })
+            && label.bytes().all(|b| {
+                non_numeric |= !b.is_ascii_digit();
+                b.is_ascii_alphanumeric() || b == b'-' || b == b'_'
+            })
+    }) && non_numeric
 }
 
 #[cfg(test)]
@@ -465,6 +484,16 @@ mod tests {
             "_sip._tcp.example.com",
             "my_host-1.example",
             "-leading-hyphen.example",
+            // `-` and `_` count as non-numeric, so digits-and-hyphens and
+            // digits-and-underscore names are hostnames, not inet_aton
+            // spellings (Go isDomainName parity).
+            "123-456",
+            "1_2",
+            // Letter-bearing numeric spellings pass the gate under Go too;
+            // they stay closed only on resolver-injected dial paths
+            // (NXDOMAIN) — a `type: direct` node without `dns:` can still
+            // fold them via libc.
+            "0x7f000001",
             "1.2.3.4",
             "255.255.255.255",
             "::1",
@@ -523,6 +552,15 @@ mod tests {
             "[evil.com]",
             "fe80::1%eth0",
             "[fe80::1%25eth0]",
+            // Digits-and-dots spellings are inet_aton address forms a libc
+            // dial path would fold into IPs, not hostnames (Go parity:
+            // no non-numeric byte).
+            "2130706433",
+            "0177.0.0.1",
+            "123.456",
+            "1.2.3.4.5",
+            "1.2.3.4.",
+            "999",
         ] {
             assert!(!is_valid_host(host), "{host:?} must be rejected");
         }

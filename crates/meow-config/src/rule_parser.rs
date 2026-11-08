@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use meow_common::Rule;
-use meow_rules::{parse_rule_flags, ParserContext, RuleSet, RuleSetBehavior, RuleSetRule};
+use meow_common::{Rule, RuleType};
+use meow_rules::{parse_rule_flags, ParserContext, RuleSet, RuleSetRule};
 use tracing::warn;
 
 use crate::sub_rules_parser::{build_sub_rule_rule, parse_sub_rule_reference, SubRuleBlocks};
@@ -50,7 +50,46 @@ pub fn parse_rules_full(
             continue;
         }
         match parse_one_rule_or_subrule(line, providers, ctx, sub_rules) {
-            Ok(rule) => rules.push(rule),
+            Ok(rule) => {
+                // A domain rule payload that can never equal/match the
+                // normalized `Metadata::rule_host()` it is compared
+                // against is dead config — the same dead-key concept the
+                // DNS-side trie surfaces flag (issue #822 shape). Scope
+                // per rule type (meow-rules/src/domain_key.rs):
+                //   DOMAIN/DOMAIN-SUFFIX — an empty label (`a..b`), a
+                //     leading/trailing dot (`.x.com`, `x.com.`), or a
+                //     verbatim-dead `*`/`+` spelling (`DOMAIN,*.x.com`);
+                //   DOMAIN-WILDCARD — a literal `+` (the matcher globs
+                //     `*` only) or a dead literal label (`*.foo.`,
+                //     `a..b`);
+                //   DOMAIN-KEYWORD — `..` only (a substring needle like
+                //     `foo.` still matches `foo.bar`);
+                //   DOMAIN-REGEX — not checked (arbitrary pattern).
+                // Lenient warns and keeps the rule; strict fails the load.
+                let dead = match rule.rule_type() {
+                    RuleType::Domain | RuleType::DomainSuffix => {
+                        meow_rules::domain_rule_payload_is_dead(rule.payload())
+                    }
+                    RuleType::DomainWildcard => {
+                        meow_rules::domain_wildcard_payload_is_dead(rule.payload())
+                    }
+                    RuleType::DomainKeyword => {
+                        meow_rules::domain_keyword_payload_is_dead(rule.payload())
+                    }
+                    _ => false,
+                };
+                if dead {
+                    let message = format!(
+                        "rules: '{line}' has a dead domain payload — it can never \
+                         match a normalized host"
+                    );
+                    if strict {
+                        return Err(anyhow::anyhow!("{message} (strict mode)"));
+                    }
+                    warn!("{message}");
+                }
+                rules.push(rule);
+            }
             Err(e) if strict => {
                 return Err(anyhow::anyhow!(
                     "rules: failed to parse '{line}' (strict mode): {e}"
@@ -92,7 +131,8 @@ pub fn parse_one_rule_or_subrule(
         }
         return build_sub_rule_rule(&block_name, sub_rules);
     }
-    meow_rules::parse_rule(line, ctx)
+    // Providers reach `RULE-SET` inside AND/OR/NOT groups too (mihomo parity).
+    meow_rules::parse_rule_with_rule_sets(line, ctx, providers)
 }
 
 /// Returns `Some(...)` only when `line` is a RULE-SET entry; `None` means
@@ -116,19 +156,9 @@ fn try_parse_rule_set(
         return Some(Err(format!("unknown rule-provider '{name}'")));
     };
 
-    // Upstream marks `,src` as meaningful only for `ipcidr` providers: on a
-    // `domain` set the src/dst swap is a no-op (the match reads the host),
-    // so a ported `RULE-SET,<domain-set>,...,src` would silently never do
-    // what the author intended — flag it instead of ignoring it (Class B,
-    // ADR-0002).
-    if flags.is_src && set.behavior() == RuleSetBehavior::Domain {
-        warn!(
-            "RULE-SET,{name},{adapter},src: `src` has no effect on a \
-             domain-behavior rule-provider (it is meaningful only for \
-             ipcidr/classical behavior)"
-        );
-    }
-
+    // `,src` on a domain-behavior set is a no-op upstream — the warn lives
+    // in `RuleSetRule::new` so the logic-group path in meow-rules'
+    // `parse_rule_depth` flags it identically.
     Some(Ok(Box::new(RuleSetRule::new(
         name,
         Arc::clone(set),
@@ -192,6 +222,83 @@ mod tests {
                 "{line}: unexpected error {err}"
             );
         }
+    }
+
+    /// Dead domain payloads can never equal/match the normalized
+    /// `rule_host()` they are compared against: an empty label, a
+    /// leading/trailing dot, an all-dots/prefix-only body, a
+    /// verbatim-dead `*`/`+` spelling on `DOMAIN`/`DOMAIN-SUFFIX`, a
+    /// literal `+` or dead literal label on `DOMAIN-WILDCARD`, or `..`
+    /// on `DOMAIN-KEYWORD`. Lenient warns and keeps the rule;
+    /// `strict: true` fails the load.
+    #[test]
+    fn dead_domain_rule_payload_warns_lenient_errors_strict() {
+        use crate::test_support::WarnCapture;
+        let ctx = ParserContext::default();
+        for line in [
+            "DOMAIN,a..b,REJECT",
+            "DOMAIN-SUFFIX,a..b,REJECT",
+            "DOMAIN,x.com.,REJECT",
+            "DOMAIN-SUFFIX,x.com.,REJECT",
+            "DOMAIN,.,REJECT",
+            // `*`/`+` are verbatim-dead spellings on these rule types —
+            // no normalized host carries either byte — and so is a
+            // leading dot (no host leads with `.` or contains `..`).
+            "DOMAIN,*.x.com,REJECT",
+            "DOMAIN-SUFFIX,+.x.com,REJECT",
+            "DOMAIN,a.*.b,REJECT",
+            "DOMAIN-SUFFIX,.x.com,REJECT",
+            "DOMAIN,.x.com,REJECT",
+            // DOMAIN-WILDCARD: dead literal labels (`*` segments are
+            // globs and never count), and any `+` — the matcher globs
+            // `*` only, so `+.` is a literal byte run, not a wildcard.
+            "DOMAIN-WILDCARD,*.foo.,REJECT",
+            "DOMAIN-WILDCARD,a..b,REJECT",
+            "DOMAIN-WILDCARD,foo.,REJECT",
+            "DOMAIN-WILDCARD,+.wild.example,REJECT",
+            // DOMAIN-KEYWORD: `..` can never appear in a host.
+            "DOMAIN-KEYWORD,a..b,REJECT",
+        ] {
+            let raw = vec![line.to_string()];
+            let cap = WarnCapture::start();
+            let rules = parse_rules(&raw, &ctx, false).expect("lenient mode keeps the dead rule");
+            let warns = cap.take();
+            assert_eq!(rules.len(), 1, "{line}: lenient mode must keep the rule");
+            assert!(
+                warns.contains("dead domain payload") && warns.contains(line),
+                "{line}: the dead payload must be surfaced, got: {warns}"
+            );
+            let err = parse_rules(&raw, &ctx, true)
+                .err()
+                .expect("strict mode must reject a dead domain payload");
+            assert!(
+                err.to_string().contains("dead domain payload"),
+                "{line}: unexpected error {err}"
+            );
+        }
+    }
+
+    /// The payload check must not false-positive: legal payloads on every
+    /// domain rule type load in strict mode without a warning —
+    /// including `DOMAIN-WILDCARD`'s glob segments (but not `+.`, which
+    /// the matcher treats as a literal), a `DOMAIN-KEYWORD` needle that
+    /// ends or leads with a dot (substring match still hits `foo.bar`),
+    /// and `DOMAIN-REGEX`, which the check leaves alone entirely.
+    #[test]
+    fn live_domain_rule_payloads_load_in_strict_mode() {
+        let ctx = ParserContext::default();
+        let raw = vec![
+            "DOMAIN,x.com,REJECT".to_string(),
+            "DOMAIN-SUFFIX,example.com,PROXY".to_string(),
+            "DOMAIN-WILDCARD,*.wild.example,DIRECT".to_string(),
+            "DOMAIN-WILDCARD,a.*.b,DIRECT".to_string(),
+            "DOMAIN-KEYWORD,foo.,DIRECT".to_string(),
+            "DOMAIN-KEYWORD,.foo,DIRECT".to_string(),
+            "DOMAIN-REGEX,^a\\.\\.b$,DIRECT".to_string(),
+            "DOMAIN-REGEX,x.*$,DIRECT".to_string(),
+        ];
+        let rules = parse_rules(&raw, &ctx, true).expect("legal payloads must load");
+        assert_eq!(rules.len(), 8);
     }
 
     /// `RULE-SET,...,src` (issue #625 item 11, upstream `isSrc`): the set
@@ -381,5 +488,36 @@ mod tests {
             ..Metadata::default()
         };
         assert!(!and_only.matches(&meta, &meow_common::RuleMatchHelper));
+    }
+
+    /// mihomo parity: `RULE-SET` resolves inside `AND`/`OR`/`NOT` groups
+    /// (a router front end routes UDP with `AND,((NETWORK,udp),(RULE-SET,x)),ProxyUDP`).
+    #[test]
+    fn rule_set_inside_logic_groups() {
+        let providers = providers();
+        let parse = |line: &str| {
+            parse_one_rule_or_subrule(line, &providers, &ParserContext::default(), &HashMap::new())
+        };
+        let and = parse("AND,((NETWORK,udp),(RULE-SET,ips)),ProxyUDP").expect("AND must parse");
+        let mut meta = Metadata {
+            network: meow_common::Network::Udp,
+            dst_ip: Some("192.0.2.7".parse().unwrap()),
+            ..Metadata::default()
+        };
+        assert!(and.match_metadata(&meta, &meow_common::RuleMatchHelper));
+        meta.network = meow_common::Network::Tcp;
+        assert!(!and.match_metadata(&meta, &meow_common::RuleMatchHelper));
+
+        let not = parse("NOT,((RULE-SET,doms)),DIRECT").expect("NOT must parse");
+        let meta = Metadata {
+            host: "example.com".into(),
+            ..Metadata::default()
+        };
+        assert!(!not.match_metadata(&meta, &meow_common::RuleMatchHelper));
+
+        let err = parse("OR,((RULE-SET,nope),(NETWORK,udp)),X")
+            .err()
+            .expect("an unknown provider inside a group must be an error");
+        assert!(err.contains("unknown rule-provider 'nope'"), "{err}");
     }
 }

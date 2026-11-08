@@ -2,7 +2,6 @@ use meow_common::sniffer::{sniff_http, sniff_tls, SnifferConfig};
 use meow_common::Metadata;
 use meow_trie::DomainTrie;
 use std::collections::HashMap;
-use std::net::IpAddr;
 use tokio::net::TcpStream;
 use tracing::debug;
 
@@ -58,10 +57,13 @@ impl SnifferRuntime {
         }
 
         // parse-pure-ip gate: skip if host is already a non-IP domain name,
-        // unless that domain is in the force list.
+        // unless that domain is in the force list. The IP test is the same
+        // `metadata_ip_literal` the apply side uses — a `IpAddr::parse`
+        // check would miss bracketed IPv6 (`[::1]` reads as a "domain" and
+        // the destination would never be sniffed).
         if self.cfg.parse_pure_ip
             && !metadata.host.is_empty()
-            && metadata.host.parse::<IpAddr>().is_err()
+            && meow_common::metadata_ip_literal(&metadata.host).is_none()
             && self.force.search(&metadata.host).is_none()
         {
             return;
@@ -127,11 +129,34 @@ impl SnifferRuntime {
     /// Apply a pre-extracted hostname to `metadata`, honouring `skip-domain`
     /// and `override-destination`. Used for the HTTP proxy plain-request path
     /// where headers are already read into a buffer rather than peeked.
+    ///
+    /// Priority: an explicit domain authority already in `metadata.host` —
+    /// a CONNECT target, an absolute-form URI authority, a SOCKS5 domain,
+    /// anything that is neither empty nor an IP literal — outranks a
+    /// conflicting sniffed name, so the sniff is not adopted then. Rules
+    /// match on `sniff_host` while the dial uses `host`, so adopting a
+    /// different name would route by one host and dial the other:
+    /// `GET http://evil.com/` + `Host: good.example` would slip past
+    /// `DOMAIN,evil.com,REJECT` yet still dial evil.com. The sniff is
+    /// adopted only when the flow has no routing name of its own — an
+    /// empty `host` or an IP literal — which is what sniffing exists
+    /// for. Two opt-ins override that priority: `force-domain` listing
+    /// `metadata.host` (the user asked that specific domain to be routed
+    /// by the sniffed name anyway — e.g. a CDN front whose real SNI the
+    /// authority hides), and `override-destination: true`, which rewrites
+    /// `host` itself so rules and dial stay consistent.
     pub fn maybe_apply_sniff(&self, host: &str, metadata: &mut Metadata) {
         if !self.cfg.enable {
             return;
         }
         if self.skip.search(host).is_some() {
+            return;
+        }
+        if !self.cfg.override_destination
+            && !metadata.host.is_empty()
+            && meow_common::metadata_ip_literal(&metadata.host).is_none()
+            && self.force.search(&metadata.host).is_none()
+        {
             return;
         }
         debug!("sniffer: {} → {}", metadata, host);
@@ -251,9 +276,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sniffer_force_domain_overrides_pure_ip() {
+    async fn sniffer_force_domain_opts_into_sniffed_name() {
         // host is a subdomain matched by "+.example.com" in force_domain →
-        // parse_pure_ip short-circuit is bypassed and the sniffer runs.
+        // the parse_pure_ip short-circuit is bypassed, the sniffer runs,
+        // and the force opt-in lets the sniffed name land in `sniff_host`
+        // even though `host` is already a domain: force-domain is the
+        // user's explicit "route this authority by what the wire says".
         let cfg = SnifferConfig {
             enable: true,
             parse_pure_ip: true,
@@ -263,16 +291,19 @@ mod tests {
         };
         let rt = make_runtime(cfg);
         let (mut client, server) = make_stream_pair().await;
-        let hello = build_client_hello("www.example.com");
+        let hello = build_client_hello("cdn.other.example");
         client.write_all(&hello).await.unwrap();
 
-        // host is already a domain, but "+.example.com" covers it → sniff runs
         let mut meta = make_metadata("www.example.com", 443);
         rt.sniff(&server, &mut meta).await;
-        assert_eq!(meta.sniff_host, "www.example.com");
+        assert_eq!(meta.sniff_host, "cdn.other.example");
+        assert_eq!(
+            meta.host, "www.example.com",
+            "without override-destination the dial target is unchanged"
+        );
 
         // The apex is covered by "+.example.com" too (upstream `+.`
-        // semantics include the root) — the same gate bypass applies to the
+        // semantics include the root) — the same opt-in applies to the
         // bare domain.
         let (mut client, server) = make_stream_pair().await;
         let hello = build_client_hello("example.com");
@@ -283,6 +314,34 @@ mod tests {
             meta.sniff_host, "example.com",
             "+.example.com must force-sniff the apex itself"
         );
+    }
+
+    #[tokio::test]
+    async fn sniffer_domain_host_outside_force_domain_is_not_adopted() {
+        // Control for the force opt-in: `parse_pure_ip: false` opens the
+        // peek for every flow, but `host` names a domain NOT listed in
+        // force_domain → the apply step still refuses the conflicting
+        // sniffed name (rules would read `sniff_host` while the dial
+        // uses `host`).
+        let cfg = SnifferConfig {
+            enable: true,
+            parse_pure_ip: false,
+            tls_ports: vec![443],
+            force_domain: vec!["+.example.com".into()],
+            ..Default::default()
+        };
+        let rt = make_runtime(cfg);
+        let (mut client, server) = make_stream_pair().await;
+        let hello = build_client_hello("cdn.other.example");
+        client.write_all(&hello).await.unwrap();
+
+        let mut meta = make_metadata("unlisted.example.org", 443);
+        rt.sniff(&server, &mut meta).await;
+        assert_eq!(
+            meta.sniff_host, "",
+            "a domain authority outside force-domain beats a conflicting sniffed name"
+        );
+        assert_eq!(meta.host, "unlisted.example.org");
     }
 
     #[tokio::test]
@@ -463,12 +522,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sniffer_parse_pure_ip_runs_on_bracketed_ipv6_host() {
+        // A bracketed literal `[::1]` is an IP literal for the gate just
+        // as it is for the apply side (both use `metadata_ip_literal`) —
+        // a plain `IpAddr::parse` check would misread it as a domain and
+        // skip sniffing entirely.
+        let cfg = SnifferConfig {
+            enable: true,
+            parse_pure_ip: true,
+            tls_ports: vec![443],
+            ..Default::default()
+        };
+        let rt = make_runtime(cfg);
+        let (mut client, server) = make_stream_pair().await;
+        let hello = build_client_hello("v6.example.com");
+        client.write_all(&hello).await.unwrap();
+
+        let mut meta = make_metadata("[::1]", 443);
+        rt.sniff(&server, &mut meta).await;
+        assert_eq!(meta.sniff_host, "v6.example.com");
+        assert_eq!(meta.host, "[::1]");
+    }
+
+    #[tokio::test]
     async fn sniffer_parse_pure_ip_disabled_runs_on_domain_host() {
         // parse_pure_ip = false → the host-already-a-domain short-circuit is
-        // skipped and sniffing runs normally.
+        // skipped and sniffing runs normally. With `override-destination`
+        // the sniffed name lands on both fields; without it the apply
+        // step would refuse — an explicit domain authority wins.
         let cfg = SnifferConfig {
             enable: true,
             parse_pure_ip: false,
+            override_destination: true,
             tls_ports: vec![443],
             ..Default::default()
         };
@@ -480,6 +565,7 @@ mod tests {
         let mut meta = make_metadata("placeholder.example.com", 443);
         rt.sniff(&server, &mut meta).await;
         assert_eq!(meta.sniff_host, "real-sni.example.com");
+        assert_eq!(meta.host, "real-sni.example.com");
     }
 
     #[test]
@@ -489,6 +575,7 @@ mod tests {
             enable: bool,
             override_destination: bool,
             skip_domain: &'static [&'static str],
+            force_domain: &'static [&'static str],
             meta_host: &'static str,
             meta_port: u16,
             sniffed: &'static str,
@@ -503,6 +590,7 @@ mod tests {
                 enable: false,
                 override_destination: true,
                 skip_domain: &[],
+                force_domain: &[],
                 meta_host: "1.2.3.4",
                 meta_port: 443,
                 sniffed: "example.com",
@@ -515,6 +603,7 @@ mod tests {
                 enable: true,
                 override_destination: true,
                 skip_domain: &["+.ads.example.com"],
+                force_domain: &[],
                 meta_host: "1.2.3.4",
                 meta_port: 80,
                 sniffed: "tracker.ads.example.com",
@@ -528,6 +617,7 @@ mod tests {
                 enable: true,
                 override_destination: true,
                 skip_domain: &["+.ads.example.com"],
+                force_domain: &[],
                 meta_host: "1.2.3.4",
                 meta_port: 80,
                 sniffed: "ads.example.com",
@@ -540,6 +630,7 @@ mod tests {
                 enable: true,
                 override_destination: true,
                 skip_domain: &[],
+                force_domain: &[],
                 meta_host: "1.2.3.4",
                 meta_port: 80,
                 sniffed: "example.com",
@@ -552,11 +643,101 @@ mod tests {
                 enable: true,
                 override_destination: false,
                 skip_domain: &[],
+                force_domain: &[],
                 meta_host: "1.2.3.4",
                 meta_port: 80,
                 sniffed: "example.com",
                 expected_sniff_host: "example.com",
                 expected_host: "1.2.3.4",
+            },
+            // Priority rule: an explicit domain authority in `host` beats a
+            // conflicting sniffed name — rules read `sniff_host` while the
+            // dial uses `host`, so adopting here would route by one name
+            // and dial the other. Nothing is adopted.
+            Case {
+                name: "domain_host_beats_conflicting_sniff",
+                enable: true,
+                override_destination: false,
+                skip_domain: &[],
+                force_domain: &[],
+                meta_host: "evil.com",
+                meta_port: 80,
+                sniffed: "good.example",
+                expected_sniff_host: "",
+                expected_host: "evil.com",
+            },
+            // An empty `host` carries no routing name — the sniffed name
+            // is adopted; recovering that name is what sniffing is for.
+            Case {
+                name: "empty_host_adopts_sniff",
+                enable: true,
+                override_destination: false,
+                skip_domain: &[],
+                force_domain: &[],
+                meta_host: "",
+                meta_port: 80,
+                sniffed: "good.example",
+                expected_sniff_host: "good.example",
+                expected_host: "",
+            },
+            // A bracketed IPv6 literal is still an IP literal (the HTTP
+            // listeners keep the brackets in `host`), so the sniff is
+            // adopted like for a plain literal.
+            Case {
+                name: "bracketed_v6_host_adopts_sniff",
+                enable: true,
+                override_destination: false,
+                skip_domain: &[],
+                force_domain: &[],
+                meta_host: "[::1]",
+                meta_port: 80,
+                sniffed: "good.example",
+                expected_sniff_host: "good.example",
+                expected_host: "[::1]",
+            },
+            // `override-destination` rewrites `host` with the sniffed
+            // name, keeping rules and dial consistent — adoption is
+            // unconditional even against a domain authority.
+            Case {
+                name: "override_destination_beats_domain_host",
+                enable: true,
+                override_destination: true,
+                skip_domain: &[],
+                force_domain: &[],
+                meta_host: "evil.com",
+                meta_port: 80,
+                sniffed: "good.example",
+                expected_sniff_host: "good.example",
+                expected_host: "good.example",
+            },
+            // `force-domain` is the explicit opt-in to the reroute: a
+            // domain `host` listed there is adopted anyway, so rules
+            // route on the sniffed name while the dial keeps `host`.
+            Case {
+                name: "force_domain_hit_adopts_sniff_on_domain_host",
+                enable: true,
+                override_destination: false,
+                skip_domain: &[],
+                force_domain: &["+.example.com"],
+                meta_host: "www.example.com",
+                meta_port: 443,
+                sniffed: "cdn.other.example",
+                expected_sniff_host: "cdn.other.example",
+                expected_host: "www.example.com",
+            },
+            // The same domain `host` outside the force list stays
+            // refused — the opt-in is per-domain, not global.
+            Case {
+                name: "force_domain_miss_keeps_domain_authority",
+                enable: true,
+                override_destination: false,
+                skip_domain: &[],
+                force_domain: &["+.example.com"],
+                meta_host: "unlisted.example.org",
+                meta_port: 443,
+                sniffed: "cdn.other.example",
+                expected_sniff_host: "",
+                expected_host: "unlisted.example.org",
             },
         ];
 
@@ -566,6 +747,7 @@ mod tests {
                 enable: case.enable,
                 override_destination: case.override_destination,
                 skip_domain: case.skip_domain.iter().copied().map(Into::into).collect(),
+                force_domain: case.force_domain.iter().copied().map(Into::into).collect(),
                 ..Default::default()
             };
             let rt = make_runtime(cfg);

@@ -36,6 +36,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::time::{sleep, timeout, Duration, Instant};
 
+// The pin is coupled to `support_x25519_mlkem768` in the REALITY leg
+// below: 26.3.27 predates Xray 26.9.8, which made the X25519MLKEM768
+// share mandatory (a hello without it is diverted to `dest`). Bump the
+// pin past 26.9.8 and that leg must flip the flag to `true`.
 const IMAGE_XRAY: &str = "ghcr.io/xtls/xray-core:26.3.27";
 const UUID: &str = "3971e1b2-18a3-4f83-8fa6-bf9b142ee258";
 const T: Duration = Duration::from_secs(30);
@@ -717,6 +721,9 @@ mod vless_vision {
                 reality: Some(RealityConfig {
                     public_key: hex::decode(REALITY_PUBLIC_KEY).unwrap().try_into().unwrap(),
                     short_id: [0x01, 0x23, 0xab, 0xcd, 0, 0, 0, 0],
+                    // Coupled to IMAGE_XRAY's pin: 26.3.27 predates
+                    // Xray 26.9.8's mandatory hybrid share; a newer pin
+                    // would need `true` here.
                     support_x25519_mlkem768: false,
                 }),
                 ..TlsConfig::new("localhost")

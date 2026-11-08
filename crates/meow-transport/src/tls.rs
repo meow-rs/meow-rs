@@ -54,6 +54,17 @@ pub(crate) mod boring_backend;
 pub(crate) mod boring_stream;
 pub mod distrust;
 
+/// The Mozilla CA bundle, parsed once per process. `X509` is refcounted,
+/// so a store built from these clones shares the parsed certificates.
+///
+/// # Panics
+///
+/// Only if the vendored `webpki-root-certs` bundle fails to parse, which a
+/// build of a released bundle never does.
+pub fn mozilla_roots() -> &'static [boring::x509::X509] {
+    boring_backend::boring_roots()
+}
+
 use boring_backend::{BoringInner, LazyBoringInner};
 
 // ─── Config structs ───────────────────────────────────────────────────────────

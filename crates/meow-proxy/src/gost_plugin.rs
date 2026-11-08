@@ -237,13 +237,9 @@ pub fn parse_opts(s: &str) -> Result<GostPluginConfig> {
             "{PLUGIN}: missing required 'mode=websocket' opt"
         )));
     }
-
-    if cfg.mux && !cfg!(feature = "mux") {
-        return Err(MeowError::Config(format!(
-            "{PLUGIN}: mux=true (the upstream default) needs the `mux` \
-             cargo feature for smux — rebuild with it or set `mux: false`"
-        )));
-    }
+    // No no-mux guard needed: `gost-plugin` implies `mux`, so the smux
+    // machinery `mux: true` (the upstream default) requires is always in
+    // the build whenever this module compiles.
 
     // mTLS: both halves or none — a lone cert or key is a config error.
     match (cert_pem, key_pem) {
@@ -600,25 +596,15 @@ pub async fn dial(
     if !cfg.mux {
         return Ok(stream);
     }
-    #[cfg(feature = "mux")]
-    {
-        let session = std::sync::Arc::new(
-            crate::mux::smux::Session::client_with_stream_buffer(
-                stream,
-                crate::mux::smux::MAX_RECEIVE_BUFFER,
-            )
-            .map_err(MeowError::Io)?,
-        );
-        let stream = session.open_stream().await.map_err(MeowError::Io)?;
-        Ok(Box::new(stream))
-    }
-    #[cfg(not(feature = "mux"))]
-    {
-        // Unreachable — `parse_opts` rejects mux=true without the feature.
-        Err(MeowError::Config(format!(
-            "{PLUGIN}: mux requires the `mux` cargo feature"
-        )))
-    }
+    let session = std::sync::Arc::new(
+        crate::mux::smux::Session::client_with_stream_buffer(
+            stream,
+            crate::mux::smux::MAX_RECEIVE_BUFFER,
+        )
+        .map_err(MeowError::Io)?,
+    );
+    let stream = session.open_stream().await.map_err(MeowError::Io)?;
+    Ok(Box::new(stream))
 }
 
 #[cfg(test)]
@@ -785,17 +771,7 @@ mod tests {
 
         let mut failures = Vec::new();
         for case in &cases {
-            // Without the `mux` feature the upstream mux default (`true`)
-            // is a parse error; neutralize it for inputs that do not
-            // exercise mux themselves.
-            let owned;
-            let input = if cfg!(feature = "mux") || case.input.contains("mux") {
-                case.input
-            } else {
-                owned = format!("{};mux=false", case.input);
-                &owned
-            };
-            let r = parse_opts(input);
+            let r = parse_opts(case.input);
             if !(case.check)(&r) {
                 failures.push(format!("{}: {r:?}", case.name));
             }
@@ -854,9 +830,10 @@ mod tests {
         assert!(!cfg.headers.contains_key("host"));
     }
 
-    #[cfg(feature = "mux")]
+    // `gost-plugin` implies `mux`, so the smux path and this default are
+    // always compiled in whenever this module exists.
     #[test]
-    fn mux_default_true_under_mux_feature() {
+    fn mux_defaults_to_true() {
         let cfg = parse_opts("mode=websocket").unwrap();
         assert!(cfg.mux);
         assert!(!parse_opts("mode=websocket;mux=false").unwrap().mux);
@@ -865,7 +842,6 @@ mod tests {
     /// Full transport loopback: gost `dial` → WebSocket upgrade → smux
     /// session → echo.  The server side is a ws acceptor feeding a
     /// frame-level smux echo — the same wire shape a gost server speaks.
-    #[cfg(feature = "mux")]
     #[tokio::test]
     async fn dial_ws_smux_echo_round_trip() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};

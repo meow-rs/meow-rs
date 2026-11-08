@@ -37,7 +37,27 @@ pub enum UrlTestError {
     Transport(String),
 }
 
-/// Probe a proxy by dialing the target, issuing an HTTP/1.1 `GET`, and
+static UNIFIED_DELAY: AtomicBool = AtomicBool::new(false);
+
+/// mihomo `unified-delay`: when set, a probe sends a second request on the
+/// same warm connection and reports only that one, so the delay is one
+/// round trip through the proxy rather than dial + handshakes + request.
+/// Applied on every config load. A probe batch ([`sweep_members`],
+/// [`probe_stream_bounded`], [`probe_chain_target`], [`diagnose_chain`])
+/// reads it once at entry, so a `PUT /configs` flipping the flag mid-sweep
+/// cannot mix dial-inclusive and warm-only measurements inside one
+/// ranking — a tighter bound than upstream, which loads it per probe.
+pub fn set_unified_delay(on: bool) {
+    UNIFIED_DELAY.store(on, Ordering::Relaxed);
+}
+
+/// The live `unified-delay` setting.
+pub fn unified_delay() -> bool {
+    UNIFIED_DELAY.load(Ordering::Relaxed)
+}
+
+/// Probe a proxy by dialing the target, issuing an HTTP/1.1 `GET` (two
+/// keep-alive `HEAD`s under `unified-delay`, timing the second), and
 /// reading the status line. Returns the total elapsed milliseconds on
 /// success (status within `expected`), otherwise a classified error.
 ///
@@ -54,6 +74,18 @@ pub async fn url_test(
     url: &str,
     expected: Option<&str>,
     timeout: Duration,
+) -> Result<u16, UrlTestError> {
+    url_test_with(adapter, url, expected, timeout, unified_delay()).await
+}
+
+/// [`url_test`] under the caller's `unified-delay` mode, so a probe batch
+/// can read the flag once at entry and keep every probe in it comparable.
+async fn url_test_with(
+    adapter: &dyn ProxyAdapter,
+    url: &str,
+    expected: Option<&str>,
+    timeout: Duration,
+    unified: bool,
 ) -> Result<u16, UrlTestError> {
     let Some(parsed) = ParsedUrl::parse(url) else {
         return Err(UrlTestError::Transport(format!("invalid url: {url}")));
@@ -82,10 +114,18 @@ pub async fn url_test(
         ..Default::default()
     };
 
-    let fut = probe_once(adapter, metadata, parsed, ranges);
+    // The deadline the warm second request of a unified probe is bounded
+    // by, so a peer that accepts one HEAD but never answers the next is
+    // the slow node mihomo reports, not a `Timeout`.
+    let deadline = tokio::time::Instant::now() + timeout;
+    let fut = probe_once(adapter, metadata, parsed, ranges, unified, deadline);
     match tokio::time::timeout(timeout, fut).await {
-        Ok(Ok(())) => {
-            let delay = start.elapsed().as_millis().min(u16::MAX as u128) as u16;
+        Ok(Ok(second)) => {
+            let delay = second
+                .unwrap_or(start)
+                .elapsed()
+                .as_millis()
+                .min(u16::MAX as u128) as u16;
             // Collapse sub-millisecond probes to 1 so callers can treat 0 as
             // the "probe did not complete" sentinel when they choose to.
             let delay = delay.max(1);
@@ -113,12 +153,24 @@ pub async fn probe_and_record(
     expected: Option<&str>,
     timeout: Duration,
 ) -> Result<u16, UrlTestError> {
+    probe_and_record_with(proxy, url, expected, timeout, unified_delay()).await
+}
+
+/// [`probe_and_record`] under the caller's `unified-delay` mode; see
+/// [`url_test_with`].
+async fn probe_and_record_with(
+    proxy: &Arc<dyn Proxy>,
+    url: &str,
+    expected: Option<&str>,
+    timeout: Duration,
+    unified: bool,
+) -> Result<u16, UrlTestError> {
     let _permit = global_delay_probe_limiter()
         .acquire()
         .await
         .expect("global delay probe semaphore is never closed");
     let adapter: &dyn ProxyAdapter = proxy.as_ref();
-    let result = url_test(adapter, url, expected, timeout).await;
+    let result = url_test_with(adapter, url, expected, timeout, unified).await;
     match &result {
         Ok(d) => proxy.health().record_delay(*d),
         Err(_) => proxy.health().record_delay(0),
@@ -165,9 +217,20 @@ pub fn probe_stream_bounded(
 ) -> impl Stream<Item = NamedProbeResult> + Send + 'static {
     let url = Arc::<str>::from(url.to_owned());
     let expected = expected.map(|s| Arc::<str>::from(s.to_owned()));
+    // One `unified-delay` mode for the whole batch: a `PUT /configs`
+    // flipping the flag mid-stream must not mix dial-inclusive and
+    // warm-only measurements the caller compares.
+    let unified = unified_delay();
     futures::stream::iter(probes)
         .map(move |(name, proxy)| {
-            named_probe_future(name, proxy, Arc::clone(&url), expected.clone(), timeout)
+            named_probe_future(
+                name,
+                proxy,
+                Arc::clone(&url),
+                expected.clone(),
+                timeout,
+                unified,
+            )
         })
         .buffer_unordered(concurrency.max(1))
 }
@@ -178,9 +241,12 @@ fn named_probe_future(
     url: Arc<str>,
     expected: Option<Arc<str>>,
     timeout: Duration,
+    unified: bool,
 ) -> BoxFuture<'static, NamedProbeResult> {
     async move {
-        match probe_and_record(&proxy, url.as_ref(), expected.as_deref(), timeout).await {
+        match probe_and_record_with(&proxy, url.as_ref(), expected.as_deref(), timeout, unified)
+            .await
+        {
             Ok(delay) => NamedProbeResult {
                 name,
                 delay,
@@ -267,6 +333,7 @@ pub async fn probe_chain_target(
         expected,
         timeout,
         hold,
+        unified: unified_delay(),
         tried: None,
     };
     let report = round
@@ -326,6 +393,8 @@ struct ChainRound<'a> {
     expected: Option<&'a str>,
     timeout: Duration,
     hold: Duration,
+    /// The `unified-delay` mode the caller's batch runs under.
+    unified: bool,
     /// The member a probe of the owner itself went through and failed, for
     /// the reason given: a check counts it as tried rather than dialling it
     /// again.
@@ -391,7 +460,9 @@ impl ChainRound<'_> {
                     .acquire()
                     .await
                     .expect("global delay probe semaphore is never closed");
-                let result = url_test(&probe, self.url, self.expected, self.timeout).await;
+                let result =
+                    url_test_with(&probe, self.url, self.expected, self.timeout, self.unified)
+                        .await;
                 (*member, result, probe.unsupported.load(Ordering::Relaxed))
             });
             for (member, result, unsupported) in futures::future::join_all(probes).await {
@@ -495,9 +566,15 @@ pub async fn sweep_members(
     concurrency: usize,
     hold: Duration,
 ) -> Vec<SweptMember> {
+    // One `unified-delay` mode for the whole sweep: a `PUT /configs`
+    // flipping the flag mid-sweep must not mix dial-inclusive and
+    // warm-only measurements the group ranks members by.
+    let unified = unified_delay();
     let sweeps: Vec<_> = members
         .into_iter()
-        .map(|(name, proxy)| sweep_member(name, proxy, fronts, url, expected, timeout, hold))
+        .map(|(name, proxy)| {
+            sweep_member(name, proxy, fronts, url, expected, timeout, hold, unified)
+        })
         .collect();
     futures::stream::iter(sweeps)
         .buffer_unordered(concurrency.max(1))
@@ -506,6 +583,10 @@ pub async fn sweep_members(
 }
 
 /// [`sweep_members`] for one member.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one probe spec per member; a struct would only rename the same values"
+)]
 async fn sweep_member(
     name: String,
     proxy: Arc<dyn Proxy>,
@@ -514,13 +595,21 @@ async fn sweep_member(
     expected: Option<&str>,
     timeout: Duration,
     hold: Duration,
+    unified: bool,
 ) -> SweptMember {
     let (result, front_pick) = {
         let _permit = global_delay_probe_limiter()
             .acquire()
             .await
             .expect("global delay probe semaphore is never closed");
-        crate::group::watch_member_dial(url_test(proxy.as_ref(), url, expected, timeout)).await
+        crate::group::watch_member_dial(url_test_with(
+            proxy.as_ref(),
+            url,
+            expected,
+            timeout,
+            unified,
+        ))
+        .await
     };
     let delay = match result {
         Ok(delay) => delay,
@@ -536,6 +625,7 @@ async fn sweep_member(
                         expected,
                         timeout,
                         hold,
+                        unified,
                         tried: front_pick.as_ref().map(|member| (member.name(), reason)),
                     };
                     check_chain(&round, &name, reason).await
@@ -680,9 +770,10 @@ pub async fn diagnose_chain(
     if ChainTarget::from_server_addr(owner.addr()).is_none() {
         return Err(ChainDiagnosisError::NoServer);
     }
+    let unified = unified_delay();
     let probes: Vec<_> = members
         .iter()
-        .map(|member| diagnose_member(owner, member, url, expected, timeout))
+        .map(|member| diagnose_member(owner, member, url, expected, timeout, unified))
         .collect();
     let mut found: Vec<MemberDiagnosis> = futures::stream::iter(probes)
         .buffered(GROUP_DELAY_CONCURRENCY)
@@ -716,6 +807,7 @@ async fn diagnose_member(
     url: &str,
     expected: Option<&str>,
     timeout: Duration,
+    unified: bool,
 ) -> Result<MemberDiagnosis, ChainDiagnosisError> {
     let name = member.name().to_owned();
     let skipped = if member.member_proxies().is_some() {
@@ -733,8 +825,8 @@ async fn diagnose_member(
     }
     let probe = ChainProbe::new(member, owner);
     let (chain, alone) = tokio::join!(
-        limited_url_test(&probe, url, expected, timeout),
-        limited_url_test(member.as_ref(), url, expected, timeout),
+        limited_url_test(&probe, url, expected, timeout, unified),
+        limited_url_test(member.as_ref(), url, expected, timeout, unified),
     );
     if probe.unsupported.load(Ordering::Relaxed) {
         return Err(ChainDiagnosisError::Unsupported);
@@ -761,12 +853,13 @@ async fn limited_url_test(
     url: &str,
     expected: Option<&str>,
     timeout: Duration,
+    unified: bool,
 ) -> Result<u16, UrlTestError> {
     let _permit = global_delay_probe_limiter()
         .acquire()
         .await
         .expect("global delay probe semaphore is never closed");
-    url_test(adapter, url, expected, timeout).await
+    url_test_with(adapter, url, expected, timeout, unified).await
 }
 
 /// `'a', 'b', 'c'`.
@@ -849,7 +942,9 @@ async fn probe_once(
     metadata: meow_common::Metadata,
     parsed: ParsedUrl,
     ranges: Vec<(u16, u16)>,
-) -> Result<(), String> {
+    unified: bool,
+    deadline: tokio::time::Instant,
+) -> Result<Option<Instant>, String> {
     let conn = adapter
         .dial_tcp(&metadata)
         .await
@@ -865,10 +960,106 @@ async fn probe_once(
             .connect(Box::new(conn))
             .await
             .map_err(|e| format!("tls: {e}"))?;
-        send_get_and_check(tls, &parsed, &ranges).await
+        check_maybe_twice(tls, &parsed, &ranges, unified, deadline).await
     } else {
-        send_get_and_check(conn, &parsed, &ranges).await
+        check_maybe_twice(conn, &parsed, &ranges, unified, deadline).await
     }
+}
+
+/// One `GET` — or, for `unified-delay`, two keep-alive `HEAD`s as mihomo
+/// sends them, returning when the second started. As in mihomo's
+/// `URLTest`, the first response gates on transport only and the status
+/// check applies to the response kept: the second's, or — when the second
+/// request fails in transport or runs past `deadline` — the first's,
+/// with the full measurement.
+async fn check_maybe_twice<S>(
+    mut stream: S,
+    parsed: &ParsedUrl,
+    ranges: &[(u16, u16)],
+    unified: bool,
+    deadline: tokio::time::Instant,
+) -> Result<Option<Instant>, String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    if !unified {
+        return send_get_and_check(stream, parsed, ranges)
+            .await
+            .map(|()| None);
+    }
+    send_request(&mut stream, parsed, "HEAD", "keep-alive").await?;
+    let first = read_head(&mut stream).await?;
+    // As in mihomo's `URLTest`: the second timer starts once the first
+    // response is fully read, before the warm request goes on the wire.
+    let second = Instant::now();
+    let warm = async {
+        match send_request(&mut stream, parsed, "HEAD", "close").await {
+            Err(e) => Err(format!("second request not sent: {e}")),
+            Ok(()) => read_status_line(&mut stream)
+                .await
+                .map_err(|e| format!("second response not read: {e}")),
+        }
+    };
+    // A second exchange that hangs — write wedged on a half-open
+    // connection, or a peer that accepts the HEAD but never answers —
+    // must not escalate to the probe's outer `timeout`, which would
+    // report a dead node. mihomo lets the second `client.Do` fail with
+    // the context deadline and keeps the first measurement, so the warm
+    // exchange is bounded by the same deadline here. `Timeout::poll`
+    // polls the inner future before checking its own deadline: when this
+    // `timeout_at` fires, the fallback below completes synchronously
+    // inside that poll and the outer `timeout` sees `Ready`, not
+    // `Elapsed` — no same-deadline race.
+    let warm = tokio::time::timeout_at(deadline, warm)
+        .await
+        .unwrap_or_else(|_| {
+            Err("second request did not complete within the probe deadline".to_string())
+        });
+    match warm {
+        Ok(status) => check_status(status, ranges).map(|()| Some(second)),
+        Err(e) => {
+            warn!("url_test: unified-delay {e}; falling back to the first measurement");
+            check_status(first, ranges).map(|()| None)
+        }
+    }
+}
+
+fn check_status(status: u16, ranges: &[(u16, u16)]) -> Result<(), String> {
+    trace!(status, "url_test: received status");
+    if ranges.iter().any(|(lo, hi)| status >= *lo && status <= *hi) {
+        Ok(())
+    } else {
+        Err(format!("unexpected status {status}"))
+    }
+}
+
+/// Read a response head (status line + headers) and return its status; a
+/// `HEAD` response has no body, so the connection is then ready for the
+/// next request.
+async fn read_head<S>(stream: &mut S) -> Result<u16, String>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    let status = read_status_line(stream).await?;
+    // Status line consumed with its CRLF; the head ends at an empty line.
+    let mut tail = [0u8; 4];
+    tail[2..].copy_from_slice(b"\r\n");
+    let mut byte = [0u8; 1];
+    for _ in 0..16 * 1024 {
+        let n = stream
+            .read(&mut byte)
+            .await
+            .map_err(|e| format!("read: {e}"))?;
+        if n == 0 {
+            return Err("eof in response headers".into());
+        }
+        tail.rotate_left(1);
+        tail[3] = byte[0];
+        if &tail == b"\r\n\r\n" {
+            return Ok(status);
+        }
+    }
+    Err("response headers too large".into())
 }
 
 async fn send_get_and_check<S>(
@@ -879,48 +1070,52 @@ async fn send_get_and_check<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    send_request(&mut stream, parsed, "GET", "close").await?;
+    check_status(read_status_line(&mut stream).await?, ranges)
+}
+
+async fn send_request<S>(
+    stream: &mut S,
+    parsed: &ParsedUrl,
+    method: &str,
+    connection: &str,
+) -> Result<(), String>
+where
+    S: tokio::io::AsyncWrite + Unpin,
+{
     // Host header includes the non-default port so virtual-hosted origins
-    // route correctly; mirrors Go net/http's default behaviour.
+    // route correctly; mirrors Go net/http's default behaviour. Built in a
+    // Vec so no fixed cap splits the two request shapes — the unified-delay
+    // HEAD with `keep-alive` runs 6 bytes longer than the plain GET.
     use std::io::Write as _;
-    let mut buf = [0u8; 512];
     let default_port = if parsed.https { 443 } else { 80 };
-    let mut cursor: &mut [u8] = &mut buf;
+    let mut buf = Vec::with_capacity(512);
     if parsed.port == default_port {
         write!(
-            cursor,
-            "GET {path} HTTP/1.1\r\nHost: {host}\r\n\
-             User-Agent: clash.meta/{ver}\r\nAccept: */*\r\nConnection: close\r\n\r\n",
+            buf,
+            "{method} {path} HTTP/1.1\r\nHost: {host}\r\n\
+             User-Agent: clash.meta/{ver}\r\nAccept: */*\r\nConnection: {connection}\r\n\r\n",
             path = parsed.path,
             host = parsed.host,
             ver = env!("CARGO_PKG_VERSION"),
         )
     } else {
         write!(
-            cursor,
-            "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\n\
-             User-Agent: clash.meta/{ver}\r\nAccept: */*\r\nConnection: close\r\n\r\n",
+            buf,
+            "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\n\
+             User-Agent: clash.meta/{ver}\r\nAccept: */*\r\nConnection: {connection}\r\n\r\n",
             path = parsed.path,
             host = parsed.host,
             port = parsed.port,
             ver = env!("CARGO_PKG_VERSION"),
         )
     }
-    .map_err(|_| "request too large for buffer".to_string())?;
-    let remaining = cursor.len();
-    let written = buf.len() - remaining;
+    .expect("writing to a Vec cannot fail");
     stream
-        .write_all(&buf[..written])
+        .write_all(&buf)
         .await
         .map_err(|e| format!("write: {e}"))?;
-    stream.flush().await.map_err(|e| format!("flush: {e}"))?;
-
-    let status = read_status_line(&mut stream).await?;
-    trace!(status, "url_test: received status");
-    if ranges.iter().any(|(lo, hi)| status >= *lo && status <= *hi) {
-        Ok(())
-    } else {
-        Err(format!("unexpected status {status}"))
-    }
+    stream.flush().await.map_err(|e| format!("flush: {e}"))
 }
 
 async fn read_status_line<S>(stream: &mut S) -> Result<u16, String>
@@ -928,8 +1123,13 @@ where
     S: tokio::io::AsyncRead + Unpin,
 {
     let mut buf = [0u8; 1024];
+    // `len` counts bytes past `buf` too: a status line longer than the
+    // buffer keeps draining to its CRLF so a following `read_head` still
+    // finds the headers where they start; `buf` then holds the truncated
+    // line, whose version and code are intact.
     let mut len = 0usize;
     let mut byte = [0u8; 1];
+    let mut prev = 0u8;
     loop {
         let n = stream
             .read(&mut byte)
@@ -940,13 +1140,19 @@ where
         }
         if len < buf.len() {
             buf[len] = byte[0];
-            len += 1;
         }
-        if buf[..len].ends_with(b"\r\n") || len >= buf.len() {
+        len += 1;
+        let end = prev == b'\r' && byte[0] == b'\n';
+        prev = byte[0];
+        if end {
             break;
         }
+        if len > buf.len() + 16 * 1024 {
+            return Err("status line too long".into());
+        }
     }
-    let line = std::str::from_utf8(&buf[..len]).map_err(|_| "status line not utf-8".to_string())?;
+    let line = std::str::from_utf8(&buf[..len.min(buf.len())])
+        .map_err(|_| "status line not utf-8".to_string())?;
     // HTTP/1.x status line: "HTTP/1.1 204 No Content\r\n"
     let mut parts = line.split_whitespace();
     let version = parts.next().unwrap_or("");
@@ -1018,18 +1224,43 @@ impl ParsedUrl {
     }
 }
 
-/// Parse an `expected` query-param value into inclusive status-code ranges.
-/// Empty / `None` defaults to `[200..=299]`, matching upstream.
+/// Validate an `expected-status` spec at config load (mihomo fails the
+/// provider build on a bad one rather than every probe at run time).
+/// `pub` for that one caller — `meow-config`'s provider build; it lives
+/// in `meow-proxy` because the spec it validates is this crate's
+/// probe-domain syntax.
+///
+/// Note the shared `parse_expected` default under it: an empty spec is
+/// `[200..=299]` — a deliberate divergence from upstream, where empty
+/// parses to `nil` ranges matching *any* status. It feeds the
+/// group/delay probe paths too, so changing it for providers alone
+/// would flip them all.
+pub fn validate_expected_status(spec: &str) -> Result<(), String> {
+    parse_expected(Some(spec)).map(drop)
+}
+
+/// Codes and `lo-hi` ranges separated by `,` or `/` (mihomo's spelling,
+/// `200/302`), or `*` for any status.
 fn parse_expected(spec: Option<&str>) -> Result<Vec<(u16, u16)>, String> {
     let s = spec.unwrap_or("").trim();
     if s.is_empty() {
         return Ok(vec![(200, 299)]);
     }
+    if s == "*" {
+        return Ok(vec![(0, u16::MAX)]);
+    }
     let mut out = Vec::new();
-    for piece in s.split(',') {
+    for piece in s.split([',', '/']) {
         let piece = piece.trim();
         if piece.is_empty() {
             continue;
+        }
+        if piece == "*" {
+            return Err(
+                "expected: `*` (any status) must stand alone — it cannot be combined \
+                 in a list"
+                    .into(),
+            );
         }
         if let Some((lo, hi)) = piece.split_once('-') {
             let lo: u16 = lo
@@ -1060,6 +1291,147 @@ fn parse_expected(spec: Option<&str>) -> Result<Vec<(u16, u16)>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `unified-delay`: two HEADs on one connection, the first keep-alive;
+    /// the second's start is reported. A peer closing after the first
+    /// keeps the full measurement (None), as mihomo does.
+    /// The status that decides is the kept response's: first 503 then 204
+    /// is alive, first 204 then 302 is dead (mihomo `URLTest`).
+    #[tokio::test]
+    async fn unified_delay_checks_the_kept_response_status() {
+        let parsed = ParsedUrl::parse("http://probe.test/generate_204").unwrap();
+        let ranges = parse_expected(None).unwrap();
+        for (first, second, alive) in [("503", "204", true), ("204", "302", false)] {
+            let (client, mut server) = tokio::io::duplex(4096);
+            let srv = tokio::spawn(async move {
+                let mut seen = Vec::new();
+                let mut buf = [0u8; 1024];
+                let mut answered = 0;
+                while answered < 2 {
+                    let n = server.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    seen.extend_from_slice(&buf[..n]);
+                    let requests = seen.windows(4).filter(|w| w == b"\r\n\r\n").count();
+                    while answered < requests {
+                        let code = if answered == 0 { first } else { second };
+                        let resp = format!("HTTP/1.1 {code} X\r\nServer: t\r\n\r\n");
+                        server.write_all(resp.as_bytes()).await.unwrap();
+                        answered += 1;
+                    }
+                }
+            });
+            let got = check_maybe_twice(
+                client,
+                &parsed,
+                &ranges,
+                true,
+                tokio::time::Instant::now() + Duration::from_secs(5),
+            )
+            .await;
+            srv.await.unwrap();
+            assert_eq!(got.is_ok(), alive, "{first} then {second}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unified_delay_times_the_second_request_on_a_warm_connection() {
+        let parsed = ParsedUrl::parse("http://probe.test/generate_204").unwrap();
+        let ranges = parse_expected(None).unwrap();
+        for second_answered in [true, false] {
+            // When `second_answered` is false the server still reads the
+            // second HEAD before hanging up, so the client sees the
+            // exchange as a failed response, not a dead connection.
+            let cap = if second_answered { 2 } else { 1 };
+            let (client, mut server) = tokio::io::duplex(4096);
+            let srv = tokio::spawn(async move {
+                let mut seen = Vec::new();
+                let mut buf = [0u8; 1024];
+                let mut answered = 0;
+                loop {
+                    let n = server.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    seen.extend_from_slice(&buf[..n]);
+                    let requests = seen.windows(4).filter(|w| w == b"\r\n\r\n").count();
+                    while answered < requests.min(cap) {
+                        server
+                            .write_all(b"HTTP/1.1 204 No Content\r\nServer: t\r\n\r\n")
+                            .await
+                            .unwrap();
+                        answered += 1;
+                    }
+                    if requests >= 2 {
+                        break;
+                    }
+                }
+                String::from_utf8(seen).unwrap()
+            });
+            let warm = check_maybe_twice(
+                client,
+                &parsed,
+                &ranges,
+                true,
+                tokio::time::Instant::now() + Duration::from_secs(5),
+            )
+            .await
+            .expect("first request passes");
+            let seen = srv.await.unwrap();
+            assert!(seen.starts_with("HEAD /generate_204 HTTP/1.1\r\n"));
+            // Both HEADs go out in either branch; `second_answered=false`
+            // fails on the second response, not on sending it.
+            assert_eq!(seen.matches("HEAD ").count(), 2, "{seen}");
+            assert_eq!(seen.matches("Connection: keep-alive").count(), 1);
+            assert_eq!(seen.matches("Connection: close").count(), 1);
+            assert_eq!(warm.is_some(), second_answered);
+        }
+    }
+
+    /// A second HEAD the server receives but never answers falls back to
+    /// the first measurement at the probe deadline — mihomo's behaviour
+    /// on a hijacked test URL that cannot take repeated HEADs: the node
+    /// reports alive with the deadline's delay, not `Timeout`.
+    #[tokio::test]
+    async fn unified_delay_a_silent_second_exchange_keeps_the_first_measurement() {
+        // `Serves::Everything` answers one REPLY then only drains reads:
+        // the second HEAD goes out and is never answered while the
+        // connection stays open.
+        let proxy = crate::group::test_support::StreamProxy::new("slow", "probe.test:80");
+        let timeout = Duration::from_millis(200);
+        let delay = url_test_with(
+            proxy.as_ref(),
+            "http://probe.test/generate_204",
+            None,
+            timeout,
+            true,
+        )
+        .await
+        .expect("the first measurement keeps the node alive");
+        assert!(
+            delay as u64 >= timeout.as_millis() as u64
+                && (delay as u64) < timeout.as_millis() as u64 + 1000,
+            "delay ≈ the probe deadline, got {delay}"
+        );
+    }
+
+    /// A status line longer than the read buffer drains to its CRLF
+    /// instead of leaving the tail for `read_head` to scan as headers:
+    /// the truncated copy still carries version and code, and the head
+    /// after it lines up.
+    #[tokio::test]
+    async fn over_long_status_line_drains_to_its_crlf() {
+        let reason = "x".repeat(4 * 1024);
+        let wire = format!("HTTP/1.1 204 {reason}\r\nServer: t\r\n\r\n");
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let srv = tokio::spawn(async move {
+            server.write_all(wire.as_bytes()).await.unwrap();
+        });
+        let status = read_head(&mut client).await.expect("status parses");
+        srv.await.unwrap();
+        assert_eq!(status, 204);
+    }
 
     #[test]
     fn parsed_url_cases() {
@@ -1139,6 +1511,12 @@ mod tests {
         let cases: &[Case] = &[
             ("default: None is 2xx", None, Some(&[(200, 299)])),
             (
+                "mihomo slash list",
+                Some("200/204"),
+                Some(&[(200, 200), (204, 204)]),
+            ),
+            ("mihomo any", Some("*"), Some(&[(0, u16::MAX)])),
+            (
                 "default: empty string is 2xx",
                 Some(""),
                 Some(&[(200, 299)]),
@@ -1150,6 +1528,8 @@ mod tests {
             ),
             ("inverted range is rejected", Some("300-200"), None),
             ("garbage is rejected", Some("abc"), None),
+            ("star in a list is rejected", Some("*,200"), None),
+            ("star in a slash list is rejected", Some("200/*"), None),
         ];
 
         // Every case runs even if an earlier one fails, so one bad input does
@@ -1182,6 +1562,14 @@ mod tests {
             "parse_expected mismatches:\n{}",
             failures.join("\n")
         );
+    }
+
+    /// `*` mixed into a list must not surface as an opaque `bad code "*"` —
+    /// the error names the standalone-only rule.
+    #[test]
+    fn expected_status_star_in_list_explains_standalone() {
+        let err = validate_expected_status("*,200").unwrap_err();
+        assert!(err.contains("stand alone"), "unexpected: {err}");
     }
 
     mod chain_probe {

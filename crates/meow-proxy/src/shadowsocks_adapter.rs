@@ -1,17 +1,22 @@
 use crate::dialer::UdpTarget;
 #[cfg(feature = "ech-tls-tunnel")]
 use crate::ech_tls_tunnel::{self, EchTlsTunnelConfig};
+#[cfg(feature = "gost-plugin")]
 use crate::gost_plugin;
+#[cfg(feature = "jls")]
 use crate::jls_plugin;
 #[cfg(feature = "kcptun")]
 use crate::kcptun_plugin;
+#[cfg(feature = "restls")]
 use crate::restls_plugin;
+#[cfg(feature = "shadow-tls")]
 use crate::shadow_tls_plugin;
 use crate::v2ray_plugin::{self, V2rayPluginConfig};
 use async_trait::async_trait;
 use meow_common::atomic::{checked_increment, AtomicU};
 use meow_common::{
-    AdapterType, MeowError, Metadata, ProxyAdapter, ProxyConn, ProxyHealth, ProxyPacketConn, Result,
+    AdapterType, MeowError, Metadata, Network, ProxyAdapter, ProxyConn, ProxyHealth,
+    ProxyPacketConn, Result,
 };
 use meow_transport::simple_obfs::client::{HttpObfs, TlsObfs};
 use meow_transport::tls::TlsLayer;
@@ -34,7 +39,9 @@ use std::task::{ready, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::time::Sleep;
-use tracing::{debug, warn};
+use tracing::debug;
+#[cfg(any(feature = "restls", feature = "jls"))]
+use tracing::warn;
 
 /// Built-in (native, no external process) simple-obfs configuration.
 #[derive(Debug, Clone)]
@@ -78,6 +85,7 @@ enum PluginKind {
     /// config fails once at startup, not per dial. The TLS layer is a
     /// `ReloadableTlsLayer` — file-sourced mTLS cert/key PEMs are re-stat
     /// per dial and hot-reloaded on change (issue #621).
+    #[cfg(feature = "gost-plugin")]
     Gost(
         gost_plugin::GostPluginConfig,
         Option<gost_plugin::ReloadableTlsLayer>,
@@ -85,12 +93,15 @@ enum PluginKind {
     ),
     /// Native shadow-tls transport (v1/v2/v3). `TlsLayer` is built at
     /// construction so a malformed TLS config fails once at startup.
+    #[cfg(feature = "shadow-tls")]
     ShadowTls(shadow_tls_plugin::ShadowTlsConfig, TlsLayer),
     /// Native restls transport — the record-level TLS client needs no
     /// `TlsLayer`; `RestlsPluginConfig` is validated at construction.
+    #[cfg(feature = "restls")]
     Restls(restls_plugin::RestlsPluginConfig),
     /// Native jls transport — record-level TLS 1.3 with hello-random
     /// authentication; `JlsConfig` is validated at construction.
+    #[cfg(feature = "jls")]
     Jls(jls_plugin::JlsPluginConfig),
     /// Native kcptun transport — KCP-over-UDP + smux session pool.
     /// `Arc` because the pooled client outlives a single dial.
@@ -106,9 +117,13 @@ impl PluginKind {
     fn udp_block_reason(&self) -> Option<&'static str> {
         match self {
             PluginKind::V2ray(..) => Some("v2ray-plugin does not support UDP relay"),
+            #[cfg(feature = "gost-plugin")]
             PluginKind::Gost(..) => Some("gost-plugin does not support UDP relay"),
+            #[cfg(feature = "shadow-tls")]
             PluginKind::ShadowTls(..) => Some("shadow-tls does not support UDP relay"),
+            #[cfg(feature = "restls")]
             PluginKind::Restls(..) => Some("restls does not support UDP relay"),
+            #[cfg(feature = "jls")]
             PluginKind::Jls(..) => Some("jls does not support UDP relay"),
             #[cfg(feature = "ech-tls-tunnel")]
             PluginKind::EchTlsTunnel(..) => Some("ech-tls-tunnel does not support UDP relay"),
@@ -158,6 +173,40 @@ impl ShadowsocksAdapter {
         client_fingerprint: Option<&str>,
         dialer: Arc<dyn crate::dialer::TcpDialer>,
     ) -> Result<Self> {
+        Self::build(
+            name,
+            server,
+            port,
+            password,
+            cipher,
+            udp,
+            plugin_name,
+            plugin_opts,
+            client_fingerprint,
+            dialer,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "SS node params are flat config fields; a builder adds indirection without fewer call-site args"
+    )]
+    fn build(
+        name: &str,
+        server: &str,
+        port: u16,
+        password: &str,
+        cipher: &str,
+        udp: bool,
+        plugin_name: Option<&str>,
+        plugin_opts: Option<&str>,
+        client_fingerprint: Option<&str>,
+        dialer: Arc<dyn crate::dialer::TcpDialer>,
+    ) -> Result<Self> {
+        // Consumed only by the feature-gated plugin arms below (shadow-tls's
+        // cover handshake; restls/jls warn-and-ignore) — under an `ss`-only
+        // build every consumer is cfg'd out, so pin the binding.
+        let _ = client_fingerprint;
         let cipher_kind = cipher
             .parse::<CipherKind>()
             .map_err(|_| MeowError::Config(format!("unknown cipher: {cipher}")))?;
@@ -184,6 +233,7 @@ impl ShadowsocksAdapter {
                 let tls = v2ray_plugin::build_tls_layer(&cfg)?;
                 PluginKind::V2ray(cfg, tls)
             }
+            #[cfg(feature = "gost-plugin")]
             Some("gost-plugin") => {
                 let cfg = gost_plugin::parse_opts(plugin_opts.unwrap_or(""))?;
                 debug!(
@@ -194,6 +244,8 @@ impl ShadowsocksAdapter {
                 let ws = gost_plugin::build_ws_layer(&cfg)?;
                 PluginKind::Gost(cfg, tls, ws)
             }
+
+            #[cfg(feature = "shadow-tls")]
             Some("shadow-tls") => {
                 let cfg = shadow_tls_plugin::parse_opts(plugin_opts.unwrap_or(""))?;
                 debug!(
@@ -203,6 +255,8 @@ impl ShadowsocksAdapter {
                 let tls = shadow_tls_plugin::build_tls_layer(&cfg, client_fingerprint)?;
                 PluginKind::ShadowTls(cfg, tls)
             }
+
+            #[cfg(feature = "restls")]
             Some("restls") => {
                 let cfg = restls_plugin::parse_opts(plugin_opts.unwrap_or(""))?;
                 debug!(
@@ -216,6 +270,8 @@ impl ShadowsocksAdapter {
                 }
                 PluginKind::Restls(cfg)
             }
+
+            #[cfg(feature = "jls")]
             Some("jls") => {
                 let cfg = jls_plugin::parse_opts(plugin_opts.unwrap_or(""))?;
                 debug!(
@@ -229,6 +285,7 @@ impl ShadowsocksAdapter {
                 }
                 PluginKind::Jls(cfg)
             }
+
             #[cfg(feature = "kcptun")]
             Some("kcptun") => {
                 let cfg = kcptun_plugin::parse_opts(plugin_opts.unwrap_or(""))?;
@@ -243,6 +300,7 @@ impl ShadowsocksAdapter {
                     Arc::clone(&dialer),
                 )))
             }
+
             #[cfg(feature = "ech-tls-tunnel")]
             Some("ech-tls-tunnel") => {
                 let cfg = ech_tls_tunnel::parse_opts(plugin_opts.unwrap_or(""))?;
@@ -256,7 +314,13 @@ impl ShadowsocksAdapter {
                 let tls = ech_tls_tunnel::build_tls_layer(&cfg)?;
                 PluginKind::EchTlsTunnel(cfg, tls)
             }
+
             Some(pname) => {
+                if let Some(feature) = feature_gated_plugin_feature(pname) {
+                    return Err(MeowError::Config(format!(
+                        "plugin '{pname}' is not compiled into this build; rebuild with `--features {feature}`"
+                    )));
+                }
                 // SIP003u: a `mode=tcp_and_udp` / `udp_only` token in plugin-opts
                 // selects whether UDP relay is tunneled through the plugin. The
                 // token is consumed here (not forwarded to the plugin process)
@@ -488,6 +552,7 @@ impl SsCore {
                 .await?;
                 Ok(self.ss_conn(transport, addr))
             }
+            #[cfg(feature = "gost-plugin")]
             PluginKind::Gost(cfg, tls, ws) => {
                 let transport = gost_plugin::dial(
                     cfg,
@@ -501,6 +566,7 @@ impl SsCore {
                 .await?;
                 Ok(self.ss_conn(transport, addr))
             }
+            #[cfg(feature = "shadow-tls")]
             PluginKind::ShadowTls(cfg, tls) => {
                 let transport = shadow_tls_plugin::dial(
                     cfg,
@@ -513,12 +579,14 @@ impl SsCore {
                 .await?;
                 Ok(self.ss_conn(transport, addr))
             }
+            #[cfg(feature = "restls")]
             PluginKind::Restls(cfg) => {
                 let transport =
                     restls_plugin::dial(cfg, &self.server, self.port, &*self.dialer, internal)
                         .await?;
                 Ok(self.ss_conn(transport, addr))
             }
+            #[cfg(feature = "jls")]
             PluginKind::Jls(cfg) => {
                 let transport =
                     jls_plugin::dial(cfg, &self.server, self.port, &*self.dialer, internal).await?;
@@ -619,6 +687,7 @@ impl SsCore {
                         .await?;
                 Ok(self.ss_conn(transport, addr))
             }
+            #[cfg(feature = "gost-plugin")]
             PluginKind::Gost(..) => {
                 // gost (ws+tls+smux) could terminate on a relay-supplied
                 // stream once it grows a `handshake_over` split — its `dial`
@@ -630,6 +699,7 @@ impl SsCore {
                         .into(),
                 ))
             }
+            #[cfg(feature = "shadow-tls")]
             PluginKind::ShadowTls(..) => {
                 // shadow-tls could terminate on a relay-supplied stream once
                 // it grows a `handshake_over` split — its `dial` currently
@@ -641,6 +711,7 @@ impl SsCore {
                         .into(),
                 ))
             }
+            #[cfg(feature = "restls")]
             PluginKind::Restls(..) => {
                 // restls could terminate on a relay-supplied stream once it
                 // grows a `handshake_over` split — its `dial` currently owns
@@ -652,6 +723,7 @@ impl SsCore {
                         .into(),
                 ))
             }
+            #[cfg(feature = "jls")]
             PluginKind::Jls(..) => {
                 // jls could terminate on a relay-supplied stream once it
                 // grows a `handshake_over` split — its `dial` currently owns
@@ -742,18 +814,68 @@ pub fn is_builtin_obfs_plugin(name: &str) -> bool {
 }
 
 /// Whether `name` resolves to an in-process plugin — anything else is
-/// spawned as an external SIP003 subprocess.  Must stay in sync with the
-/// dispatch match in `ShadowsocksAdapter::new` (single source of truth
-/// for `meow-config`'s dialer-injection gate, which cannot see the
-/// feature-gated `ech-tls-tunnel`/`kcptun` arms directly).
+/// spawned as an external SIP003 subprocess.  All built-in names stay
+/// listed unconditionally, even when their feature is compiled out: they
+/// remain *reserved* names that must never reach the external
+/// `Plugin::start` path — `ShadowsocksAdapter::new` reports
+/// "not compiled into this build" for them instead.
+/// Must stay in sync with the dispatch match in `ShadowsocksAdapter::new`
+/// (single source of truth for `meow-config`'s dialer-injection and
+/// external-plugin gates, which cannot see the feature-gated arms
+/// directly).
 pub fn is_builtin_sip003_plugin(name: &str) -> bool {
     is_builtin_obfs_plugin(name)
         || matches!(
             name,
-            "v2ray-plugin" | "gost-plugin" | "shadow-tls" | "restls" | "jls"
+            "v2ray-plugin"
+                | "gost-plugin"
+                | "shadow-tls"
+                | "restls"
+                | "jls"
+                | "kcptun"
+                | "ech-tls-tunnel"
         )
-        || (cfg!(feature = "ech-tls-tunnel") && name == "ech-tls-tunnel")
-        || (cfg!(feature = "kcptun") && name == "kcptun")
+}
+
+/// Every reserved built-in SIP003 name whose transport sits behind an
+/// opt-in cargo feature, paired with the feature that re-enables it and a
+/// compile-time flag recording whether this build carries it.
+/// Single source for the "not compiled" fallback in `ShadowsocksAdapter::new`:
+/// a name listed here must never reach the external `Plugin::start` arm,
+/// whatever the feature set — the constructor reports its identity separately.
+const FEATURE_GATED_PLUGINS: &[(&str, &str, bool)] = &[
+    ("gost-plugin", "gost-plugin", cfg!(feature = "gost-plugin")),
+    ("shadow-tls", "shadow-tls", cfg!(feature = "shadow-tls")),
+    ("restls", "restls", cfg!(feature = "restls")),
+    ("jls", "jls", cfg!(feature = "jls")),
+    ("kcptun", "kcptun", cfg!(feature = "kcptun")),
+    (
+        "ech-tls-tunnel",
+        "ech-tls-tunnel",
+        cfg!(feature = "ech-tls-tunnel"),
+    ),
+];
+
+fn feature_gated_plugin_feature(name: &str) -> Option<&'static str> {
+    FEATURE_GATED_PLUGINS
+        .iter()
+        .find(|(reserved, _, _)| *reserved == name)
+        .map(|(_, feature, _)| *feature)
+}
+
+/// The cargo feature a reserved built-in plugin name needs, when this build
+/// lacks it — `None` for unreserved names and for plugins that are compiled
+/// in. Drives `FEATURE_GATED_PLUGINS`, so a new reserved name needs only a
+/// table row. Config parsing uses this to keep a node whose plugin cannot be
+/// constructed bound to a dead placeholder (same contract as the
+/// compiled-out `trusttunnel` type) instead of dropping it and letting a
+/// `select` group or explicit reference slide that traffic to a sibling or
+/// DIRECT; liveness-checked groups still skip the dead entry.
+pub fn missing_plugin_feature(name: &str) -> Option<&'static str> {
+    FEATURE_GATED_PLUGINS
+        .iter()
+        .find(|(reserved, _, compiled)| *reserved == name && !compiled)
+        .map(|(_, feature, _)| *feature)
 }
 
 /// Parses `plugin-opts` (already serialized to SIP003 `key=value;...` form) for
@@ -1484,6 +1606,21 @@ impl ProxyAdapter for ShadowsocksAdapter {
         }
     }
 
+    /// kcptun's KCP datagrams carry every flow, TCP included; a mux session
+    /// carries UDP over its TCP stream; otherwise UDP goes as the plain SS
+    /// association, the way `dial_udp` reaches the server.
+    fn dialer_hop_network(&self, flow: Network) -> Network {
+        #[cfg(feature = "kcptun")]
+        if matches!(self.core.plugin, PluginKind::Kcptun(_)) {
+            return Network::Udp;
+        }
+        #[cfg(feature = "mux")]
+        if self.mux.as_ref().is_some_and(|mux| mux.supports_udp()) {
+            return Network::Tcp;
+        }
+        flow
+    }
+
     async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
         let addr = parse_address(metadata)?;
         debug!("SS connecting to {} via {}", addr, self.addr_str);
@@ -1683,12 +1820,8 @@ impl ProxyAdapter for ShadowsocksAdapter {
         let mut connected = None;
         let mut last_err: Option<MeowError> = None;
         for remote in candidates {
-            let bind_addr: SocketAddr = if remote.is_ipv4() {
-                "0.0.0.0:0".parse().expect("static")
-            } else {
-                "[::]:0".parse().expect("static")
-            };
-            let udp = match meow_common::bind_udp(bind_addr).await {
+            let remote = meow_common::canonical_socket_addr(remote);
+            let udp = match meow_common::bind_udp_for_peer(remote.ip()).await {
                 Ok(udp) => udp,
                 Err(e) => {
                     last_err = MeowError::prefer_errno(
@@ -1825,6 +1958,58 @@ mod tests {
     use super::*;
     use meow_common::atomic::Uint;
     use std::sync::Mutex;
+
+    #[test]
+    fn builtin_plugin_names_never_reach_the_external_spawn_path() {
+        // Every name `is_builtin_sip003_plugin` lists must be either
+        // constructible in-process or rejected with the "not compiled"
+        // Config error — never handed to the external `Plugin::start`
+        // spawn path, whatever the feature set.
+        for (name, opts) in [
+            ("obfs", "mode=http"),
+            ("simple-obfs", "mode=http"),
+            ("v2ray-plugin", "mode=websocket"),
+            (
+                "gost-plugin",
+                "mode=websocket;host=cdn.example.com;mux=false",
+            ),
+            ("shadow-tls", "host=cover.example.com;version=3"),
+            (
+                "restls",
+                "host=cover.example.com;password=pw;version-hint=tls13",
+            ),
+            ("jls", "host=cover.example.com;username=u;password=pw"),
+            ("kcptun", "key=k"),
+            (
+                "ech-tls-tunnel",
+                "mode=client;sni=cover.example.com;path=/ws;ech_config=AAAA",
+            ),
+        ] {
+            assert!(
+                is_builtin_sip003_plugin(name),
+                "is_builtin_sip003_plugin must list {name}"
+            );
+            let disabled = missing_plugin_feature(name).is_some();
+            match ShadowsocksAdapter::new(
+                "inv",
+                "127.0.0.1",
+                1,
+                "p",
+                "aes-128-gcm",
+                false,
+                Some(name),
+                Some(opts),
+                None,
+                std::sync::Arc::new(crate::dialer::DirectDialer),
+            ) {
+                Ok(_) => assert!(!disabled, "disabled {name} unexpectedly constructed"),
+                Err(MeowError::Config(message)) if disabled => {
+                    assert_eq!(message, format!("plugin '{name}' is not compiled into this build; rebuild with `--features {name}`"));
+                }
+                Err(other) => panic!("{name}: unexpected error: {other}"),
+            }
+        }
+    }
 
     #[test]
     fn sip003u_mode_extraction() {
@@ -2513,21 +2698,25 @@ mod tests {
     async fn builtin_tcp_plugins_refuse_udp() {
         for (plugin, opts, tag) in [
             ("v2ray-plugin", "host=cdn.example.com", "v2ray-plugin"),
+            #[cfg(feature = "gost-plugin")]
             (
                 "gost-plugin",
                 "mode=websocket;mux=false;host=cdn.example.com",
                 "gost-plugin",
             ),
+            #[cfg(feature = "shadow-tls")]
             (
                 "shadow-tls",
                 "host=cover.example.com;password=p;version=2",
                 "shadow-tls",
             ),
+            #[cfg(feature = "restls")]
             (
                 "restls",
                 "host=cover.example.com;password=p;version-hint=tls13",
                 "restls",
             ),
+            #[cfg(feature = "jls")]
             ("jls", "host=cover.example.com;username=u;password=p", "jls"),
         ] {
             let adapter = ShadowsocksAdapter::new(
@@ -2562,6 +2751,7 @@ mod tests {
     /// a built-in transport that owns its TCP dial (shadow-tls) must fail
     /// loudly on `connect_over` rather than send unwrapped SS traffic
     /// through the front hop.
+    #[cfg(feature = "shadow-tls")]
     #[tokio::test]
     async fn shadow_tls_refuses_relay_supplied_stream() {
         let adapter = ShadowsocksAdapter::new(

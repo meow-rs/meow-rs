@@ -6,6 +6,8 @@
 //! ships its own DNS client instead of relying on `hickory-resolver`.
 
 use crate::cache::QueryFamilies;
+#[cfg(feature = "quic-dns")]
+use crate::quic::{QuicMode, QuicUpstream};
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
@@ -134,10 +136,46 @@ type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// the local VPN tunnel.
 pub trait SocketFactory: Send + Sync + 'static {
     /// Bind an unconnected UDP socket. Implementations typically bind to
-    /// `0.0.0.0:0`.
+    /// `0.0.0.0:0`; a single-family socket like that must be paired with a
+    /// [`bind_udp_for_peer`](Self::bind_udp_for_peer) override or upstreams
+    /// of the other family stay unreachable.
     fn bind_udp(&self) -> BoxFuture<'_, io::Result<UdpSocket>>;
 
-    /// Open an outbound TCP connection to `addr`.
+    /// Bind for a known upstream. The socket is `connect()`ed to the
+    /// canonical form of `peer` — an IPv4-mapped peer dials plain IPv4 —
+    /// so its family must match the canonical `peer`'s: an IPv4-bound
+    /// socket can never reach a native IPv6 peer, and an IPv6-bound
+    /// socket cannot be relied on to take a plain `sockaddr_in` either
+    /// (dual-stack Linux happens to translate a mapped connect; the
+    /// contract is deliberately stricter than that leniency). A factory
+    /// whose [`bind_udp`](Self::bind_udp) yields a single-family socket
+    /// **must** override this to bind in the canonical `peer`'s family —
+    /// without that override mismatched upstreams still fail, the bug
+    /// this hook fixes.
+    ///
+    /// The default delegates to [`bind_udp`](Self::bind_udp), so custom
+    /// factories keep their socket creation and protection hooks, then
+    /// refuses a family-mismatched pairing up front with
+    /// `AddrNotAvailable` instead of a late, opaque `connect()` failure.
+    fn bind_udp_for_peer(&self, peer: IpAddr) -> BoxFuture<'_, io::Result<UdpSocket>> {
+        Box::pin(async move {
+            let socket = self.bind_udp().await?;
+            if socket.local_addr()?.is_ipv4() != peer.to_canonical().is_ipv4() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrNotAvailable,
+                    "SocketFactory::bind_udp returned a socket whose family \
+                     cannot reach the peer; override bind_udp_for_peer",
+                ));
+            }
+            Ok(socket)
+        })
+    }
+
+    /// Open an outbound TCP connection to `addr`. Call sites pass the
+    /// [`meow_common::canonical_socket_addr`] of the upstream, so the
+    /// IPv4-mapped form never reaches the impl — an implementation that
+    /// picks its socket family from `addr.is_ipv6()` sees the real dial
+    /// family.
     fn connect_tcp(&self, addr: SocketAddr) -> BoxFuture<'_, io::Result<TcpStream>>;
 }
 
@@ -148,12 +186,11 @@ struct DefaultSocketFactory;
 
 impl SocketFactory for DefaultSocketFactory {
     fn bind_udp(&self) -> BoxFuture<'_, io::Result<UdpSocket>> {
-        Box::pin(async {
-            // Bind to v4 unspecified; this is fine because we always
-            // `connect()` the socket before sending, and connect() will
-            // re-resolve the local address family.
-            meow_common::bind_udp(SocketAddr::from(([0u8; 4], 0))).await
-        })
+        Box::pin(meow_common::bind_udp(SocketAddr::from(([0u8; 4], 0))))
+    }
+
+    fn bind_udp_for_peer(&self, peer: IpAddr) -> BoxFuture<'_, io::Result<UdpSocket>> {
+        Box::pin(meow_common::bind_udp_for_peer(peer))
     }
 
     fn connect_tcp(&self, addr: SocketAddr) -> BoxFuture<'_, io::Result<TcpStream>> {
@@ -290,6 +327,16 @@ pub struct DnsClient {
     /// granularity, distinguishable here (review M4).
     #[cfg(all(feature = "encrypted", any(test, debug_assertions)))]
     probe_dead: std::sync::atomic::AtomicUsize,
+    /// The QUIC connection for `quic://` / `prefer-h3` entries. `None` for
+    /// every other transport; the driver task is spawned on first use and
+    /// re-dials by itself, so one client owns one connection per upstream.
+    #[cfg(feature = "quic-dns")]
+    quic: Option<Arc<QuicUpstream>>,
+    /// The HTTP/1.1 DoH client a `prefer-h3` entry falls back to when the
+    /// QUIC exchange fails. Built at construction so the fallback keeps its
+    /// own TLS session pool, proxy tag and certificate roots.
+    #[cfg(feature = "quic-dns")]
+    doh_h1: Option<Box<DnsClient>>,
 }
 
 /// What the pool does to an element it discards while an async context
@@ -555,6 +602,20 @@ enum Transport {
         sni: Arc<str>,
         path: Arc<str>,
     },
+    /// DNS over QUIC (RFC 9250).
+    #[cfg(feature = "quic-dns")]
+    Doq {
+        addr: SocketAddr,
+        sni: Arc<str>,
+    },
+    /// DNS over HTTPS over HTTP/3 — mihomo `prefer-h3`, with the HTTP/1.1
+    /// DoH path as the fallback (`self.doh_h1`).
+    #[cfg(feature = "quic-dns")]
+    Doh3 {
+        addr: SocketAddr,
+        sni: Arc<str>,
+        path: Arc<str>,
+    },
     RCode {
         code: ResponseCode,
     },
@@ -570,6 +631,8 @@ impl Transport {
             Self::Udp { addr } | Self::Tcp { addr } => *addr,
             #[cfg(feature = "encrypted")]
             Self::Dot { addr, .. } | Self::Doh { addr, .. } => *addr,
+            #[cfg(feature = "quic-dns")]
+            Self::Doq { addr, .. } | Self::Doh3 { addr, .. } => *addr,
             Self::RCode { .. } => unreachable!("rcode transport has no dial address"),
         }
     }
@@ -593,6 +656,10 @@ impl DnsClient {
             tls_pool_disabled: false,
             #[cfg(all(feature = "encrypted", any(test, debug_assertions)))]
             probe_dead: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(feature = "quic-dns")]
+            quic: None,
+            #[cfg(feature = "quic-dns")]
+            doh_h1: None,
         }
     }
 
@@ -613,6 +680,10 @@ impl DnsClient {
             tls_pool_disabled: false,
             #[cfg(all(feature = "encrypted", any(test, debug_assertions)))]
             probe_dead: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(feature = "quic-dns")]
+            quic: None,
+            #[cfg(feature = "quic-dns")]
+            doh_h1: None,
         }
     }
 
@@ -633,6 +704,10 @@ impl DnsClient {
             tls_pool_disabled: false,
             #[cfg(all(feature = "encrypted", any(test, debug_assertions)))]
             probe_dead: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(feature = "quic-dns")]
+            quic: None,
+            #[cfg(feature = "quic-dns")]
+            doh_h1: None,
         }
     }
 
@@ -657,6 +732,10 @@ impl DnsClient {
             tls_pool_disabled: false,
             #[cfg(all(feature = "encrypted", any(test, debug_assertions)))]
             probe_dead: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(feature = "quic-dns")]
+            quic: None,
+            #[cfg(feature = "quic-dns")]
+            doh_h1: None,
         }
     }
 
@@ -682,12 +761,111 @@ impl DnsClient {
             tls_pool_disabled: false,
             #[cfg(all(feature = "encrypted", any(test, debug_assertions)))]
             probe_dead: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(feature = "quic-dns")]
+            quic: None,
+            #[cfg(feature = "quic-dns")]
+            doh_h1: None,
+        }
+    }
+
+    /// DNS over QUIC (RFC 9250) — `quic://host[:port][#sni]`.
+    ///
+    /// One bidi stream per query, length-prefixed per RFC 9250 §4.2, with the
+    /// DNS transaction ID zeroed on the wire (the peer MUST answer with ID 0;
+    /// the caller's ID is restored before validation).
+    #[cfg(feature = "quic-dns")]
+    pub fn doq(addr: SocketAddr, sni: &str) -> Self {
+        Self::with_quic(
+            Transport::Doq {
+                addr,
+                sni: Arc::from(sni),
+            },
+            QuicMode::Doq,
+            addr,
+            sni,
+            None,
+        )
+    }
+
+    /// DNS over HTTPS over HTTP/3 — the `prefer-h3` form of a `https://`
+    /// entry.
+    ///
+    /// The HTTP/1.1 DoH client built here is the fallback: when the QUIC
+    /// exchange fails (no h3 support, UDP blocked, connection loss) the
+    /// exchange is retried over HTTP/1.1, and a failed handshake parks h3 for
+    /// this upstream so the next query does not pay a second timeout. The
+    /// fallback shares this client's timeout, proxy tag, certificate roots and
+    /// TLS session pool.
+    #[cfg(feature = "quic-dns")]
+    pub fn doh3(addr: SocketAddr, sni: &str, path: &str) -> Self {
+        let h1 = DnsClient::doh(addr, sni, path);
+        Self::with_quic(
+            Transport::Doh3 {
+                addr,
+                sni: Arc::from(sni),
+                path: Arc::from(path),
+            },
+            QuicMode::Doh3 {
+                path: Arc::from(path),
+            },
+            addr,
+            sni,
+            Some(Box::new(h1)),
+        )
+    }
+
+    /// DoH3 in mihomo's per-entry form (`?h3=true`): HTTP/3 only, with no
+    /// HTTP/1.1 fallback. A failure is reported as-is.
+    #[cfg(feature = "quic-dns")]
+    pub fn doh3_force(addr: SocketAddr, sni: &str, path: &str) -> Self {
+        Self::with_quic(
+            Transport::Doh3 {
+                addr,
+                sni: Arc::from(sni),
+                path: Arc::from(path),
+            },
+            QuicMode::Doh3 {
+                path: Arc::from(path),
+            },
+            addr,
+            sni,
+            None,
+        )
+    }
+
+    /// Shared tail of the two QUIC constructors.
+    #[cfg(feature = "quic-dns")]
+    fn with_quic(
+        transport: Transport,
+        mode: QuicMode,
+        addr: SocketAddr,
+        sni: &str,
+        doh_h1: Option<Box<DnsClient>>,
+    ) -> Self {
+        Self {
+            transport,
+            timeout: DEFAULT_QUERY_TIMEOUT,
+            proxy: None,
+            proxy_target: None,
+            tls_extra_roots: Vec::new(),
+            label: None,
+            tcp_pool: Pool::new(TCP_POOL_CAPACITY, TCP_POOL_IDLE_TIMEOUT),
+            tls_pool: Pool::new(TLS_POOL_CAPACITY, TLS_POOL_IDLE_TIMEOUT),
+            tls_pool_disabled: false,
+            #[cfg(all(feature = "encrypted", any(test, debug_assertions)))]
+            probe_dead: std::sync::atomic::AtomicUsize::new(0),
+            quic: Some(Arc::new(QuicUpstream::new(mode, addr, Arc::from(sni)))),
+            doh_h1,
         }
     }
 
     /// Override the per-query timeout.
     pub fn with_timeout(mut self, t: Duration) -> Self {
         self.timeout = t;
+        #[cfg(feature = "quic-dns")]
+        if let Some(h1) = self.doh_h1.as_mut() {
+            h1.timeout = t;
+        }
         self
     }
 
@@ -703,6 +881,15 @@ impl DnsClient {
     ///   adapters can't relay arbitrary UDP. The fallback matches the
     ///   semantics in ADR-0012.
     pub fn with_proxy(mut self, proxy: DnsProxy) -> Self {
+        #[cfg(feature = "quic-dns")]
+        {
+            if let Some(quic) = self.quic.as_ref() {
+                quic.set_proxy(Arc::clone(&proxy));
+            }
+            if let Some(h1) = self.doh_h1.as_mut() {
+                h1.proxy = Some(Arc::clone(&proxy));
+            }
+        }
         self.proxy = Some(proxy);
         self
     }
@@ -713,6 +900,15 @@ impl DnsClient {
     /// lookup of the upstream name is needed (mihomo `newDNSDialer`
     /// semantics). Only meaningful together with [`Self::with_proxy`].
     pub(crate) fn with_proxy_target(mut self, host: Arc<str>, port: u16) -> Self {
+        #[cfg(feature = "quic-dns")]
+        {
+            if let Some(quic) = self.quic.as_ref() {
+                quic.set_proxy_target(Arc::clone(&host), port);
+            }
+            if let Some(h1) = self.doh_h1.as_mut() {
+                h1.proxy_target = Some((Arc::clone(&host), port));
+            }
+        }
         self.proxy_target = Some((host, port));
         self
     }
@@ -729,6 +925,19 @@ impl DnsClient {
     #[cfg(all(feature = "encrypted", any(test, debug_assertions)))]
     #[doc(hidden)]
     pub fn with_tls_additional_roots(mut self, der: Vec<u8>) -> Self {
+        #[cfg(feature = "quic-dns")]
+        {
+            // The QUIC handshake uses the same trust set, so a test upstream
+            // that presents a self-signed chain is reachable over DoQ/DoH3
+            // too. Adding a root retires the live connection (it was
+            // verified against the old store).
+            if let Some(quic) = self.quic.as_ref() {
+                quic.add_extra_root(der.clone());
+            }
+            if let Some(h1) = self.doh_h1.as_mut() {
+                h1.tls_extra_roots.push(der.clone());
+            }
+        }
         self.tls_extra_roots.push(der);
         self
     }
@@ -743,6 +952,10 @@ impl DnsClient {
     #[doc(hidden)]
     pub fn with_tls_pool_disabled(mut self) -> Self {
         self.tls_pool_disabled = true;
+        #[cfg(feature = "quic-dns")]
+        if let Some(h1) = self.doh_h1.as_mut() {
+            h1.tls_pool_disabled = true;
+        }
         self
     }
 
@@ -760,7 +973,12 @@ impl DnsClient {
 
     /// Override the API/UI label used to report this upstream in DNS results.
     pub fn with_upstream_label(mut self, label: impl Into<String>) -> Self {
-        self.label = Some(Arc::from(label.into()));
+        let label: Arc<str> = Arc::from(label.into());
+        #[cfg(feature = "quic-dns")]
+        if let Some(h1) = self.doh_h1.as_mut() {
+            h1.label = Some(Arc::clone(&label));
+        }
+        self.label = Some(label);
         self
     }
 
@@ -787,9 +1005,27 @@ impl DnsClient {
     /// Non-blocking. Returns the idle conns closed now. UDP opens a socket
     /// per query and pools nothing.
     pub fn reset_connections(&self) -> usize {
+        // The QUIC driver re-dials on its next query; the connection itself
+        // is closed by the task, so this stays non-blocking.
+        #[cfg(feature = "quic-dns")]
+        if let Some(quic) = self.quic.as_ref() {
+            quic.mark_stale();
+        }
+        // A DoH3 client's own pools are unused — the fallback's DoH TLS
+        // sessions are what carries a parked h3 entry, so a reset must reach
+        // them too (network change, proxy switch, `Resolver::reset_connections`).
+        #[cfg(feature = "quic-dns")]
+        let quic_fallback_reset = self.doh_h1.as_ref().map_or(0, |h1| h1.reset_connections());
         #[cfg(feature = "encrypted")]
         {
-            self.tcp_pool.reset() + self.tls_pool.reset()
+            #[cfg(feature = "quic-dns")]
+            {
+                self.tcp_pool.reset() + self.tls_pool.reset() + quic_fallback_reset
+            }
+            #[cfg(not(feature = "quic-dns"))]
+            {
+                self.tcp_pool.reset() + self.tls_pool.reset()
+            }
         }
         #[cfg(not(feature = "encrypted"))]
         {
@@ -829,21 +1065,24 @@ impl DnsClient {
                 #[cfg(feature = "encrypted")]
                 Transport::Doh {
                     addr, sni, path, ..
-                } => {
+                } => doh_label(addr, sni, path),
+                #[cfg(feature = "quic-dns")]
+                Transport::Doq { addr, sni, .. } => {
                     if sni.is_empty() {
-                        format!("https://{}", socket_label(*addr, 443))
-                    } else if path.as_ref() == "/dns-query" {
-                        if addr.port() == 443 {
-                            format!("https://{sni}")
-                        } else {
-                            format!("https://{sni}:{}", addr.port())
-                        }
-                    } else if addr.port() == 443 {
-                        format!("https://{sni}{path}")
+                        format!("quic://{}", socket_label(*addr, 853))
+                    } else if addr.port() == 853 {
+                        format!("quic://{sni}")
                     } else {
-                        format!("https://{sni}:{}{path}", addr.port())
+                        format!("quic://{sni}:{}", addr.port())
                     }
                 }
+                // A DoH3 entry is the same URL as its HTTP/1.1 fallback, so
+                // the label stays `https://…` — the transport is an
+                // implementation detail of one upstream, not its identity.
+                #[cfg(feature = "quic-dns")]
+                Transport::Doh3 {
+                    addr, sni, path, ..
+                } => doh_label(addr, sni, path),
             }
         };
         if let Some(proxy) = &self.proxy {
@@ -1134,6 +1373,10 @@ impl DnsClient {
             // to the pool.
         }
 
+        // Same canonicalisation as `udp_exchange`: a v4-mapped `tcp://`
+        // upstream is dialed as plain IPv4 — the mapped form fails
+        // connect() where a fresh v6 socket defaults to v6-only.
+        let addr = meow_common::canonical_socket_addr(addr);
         // Captured before the socket exists: a reset racing the connect
         // must retire this stream too (issue #695).
         let generation = self.tcp_pool.generation();
@@ -1172,7 +1415,12 @@ impl DnsClient {
         let (host, dst_ip, dst_port) = match &self.proxy_target {
             Some((host, port)) => (smol_str::SmolStr::from(host.as_ref()), None, *port),
             None => {
-                let addr = self.transport.dial_addr();
+                // Same canonicalisation as `tcp_exchange_pooled` /
+                // `dial_tls_inner`: a v4-mapped upstream is advertised
+                // to the adapter as plain IPv4 — an adapter that dials
+                // `dst_ip` verbatim (DirectAdapter) hits the mapped-form
+                // connect() failure this PR fixes.
+                let addr = meow_common::canonical_socket_addr(self.transport.dial_addr());
                 (
                     smol_str::SmolStr::from(addr.ip().to_string()),
                     Some(addr.ip()),
@@ -1241,7 +1489,11 @@ impl DnsClient {
         if let Some(proxy) = self.proxy.as_ref() {
             self.proxy_dial(proxy).await
         } else {
-            let tcp = factory().connect_tcp(self.transport.dial_addr()).await?;
+            // Same canonicalisation as `tcp_exchange_pooled`: a
+            // v4-mapped `tls://`/`https://` upstream is dialed as plain
+            // IPv4 — the mapped form fails connect() on a v6-only socket.
+            let addr = meow_common::canonical_socket_addr(self.transport.dial_addr());
+            let tcp = factory().connect_tcp(addr).await?;
             Ok(Box::new(tcp))
         }
     }
@@ -1430,6 +1682,12 @@ impl DnsClient {
                 Transport::Dot { .. } | Transport::Doh { .. } => {
                     return self.tls_exchange_pooled(wire, expected).await;
                 }
+                // A `?proxy=` QUIC entry dials the adapter's own datagram
+                // association, so it takes the same path as a direct one.
+                #[cfg(feature = "quic-dns")]
+                Transport::Doq { .. } => return self.quic_exchange(wire, expected).await,
+                #[cfg(feature = "quic-dns")]
+                Transport::Doh3 { .. } => return self.doh3_exchange(wire, expected).await,
             }
         }
         match &self.transport {
@@ -1442,7 +1700,87 @@ impl DnsClient {
             Transport::Dot { .. } | Transport::Doh { .. } => {
                 self.tls_exchange_pooled(wire, expected).await
             }
+            #[cfg(feature = "quic-dns")]
+            Transport::Doq { .. } => self.quic_exchange(wire, expected).await,
+            #[cfg(feature = "quic-dns")]
+            Transport::Doh3 { .. } => self.doh3_exchange(wire, expected).await,
         }
+    }
+
+    /// One DoQ exchange through the per-upstream connection driver.
+    #[cfg(feature = "quic-dns")]
+    async fn quic_exchange(
+        &self,
+        wire: &[u8],
+        expected: &ExpectedResponse,
+    ) -> Result<Message, ClientError> {
+        let upstream = self.quic.as_ref().ok_or(ClientError::Protocol(
+            "QUIC transport without an upstream driver",
+        ))?;
+        let response = upstream.exchange(wire).await?;
+        decode_validated_response(&response, expected)
+    }
+
+    /// One DoH3 exchange, falling back to the HTTP/1.1 DoH path — the
+    /// semantics `prefer-h3` names: h3 is preferred, not required.
+    #[cfg(feature = "quic-dns")]
+    async fn doh3_exchange(
+        &self,
+        wire: &[u8],
+        expected: &ExpectedResponse,
+    ) -> Result<Message, ClientError> {
+        let upstream = self.quic.as_ref().ok_or(ClientError::Protocol(
+            "prefer-h3 transport without an upstream driver",
+        ))?;
+        if upstream.h3_available() {
+            // Half the budget. A hung QUIC handshake must leave the HTTP/1.1
+            // fallback enough time to answer, or `prefer-h3` would turn a
+            // dead UDP path into a dead resolver.
+            let budget = self.timeout / 2;
+            let failure = match tokio::time::timeout(budget, upstream.exchange(wire)).await {
+                Ok(Ok(response)) => {
+                    upstream.park_h3(false);
+                    return decode_validated_response(&response, expected);
+                }
+                // A certificate failure is a verdict, not a transport
+                // preference: the fallback would fail identically and the
+                // silent retry would only hide it.
+                Ok(Err(err @ ClientError::Tls(_))) => return Err(err),
+                Ok(Err(err)) => err,
+                Err(_elapsed) => ClientError::Timeout(budget),
+            };
+            // `?h3=true` (mihomo's per-entry form) means HTTP/3 only: there
+            // is no fallback client to retry on.
+            let Some(h1) = self.doh_h1.as_ref() else {
+                return Err(failure);
+            };
+            tracing::debug!(
+                upstream = %self.upstream_label(),
+                error = %failure,
+                "DoH3 exchange failed; retrying over HTTP/1.1"
+            );
+            // Park only for connectivity/handshake verdicts. A per-query
+            // protocol answer on a healthy HTTP/3 connection (non-200 status,
+            // empty body, peer reset) is not evidence that the server lacks
+            // HTTP/3, and parking would send the next ten minutes of queries
+            // over HTTP/1.1 for no reason.
+            if matches!(failure, ClientError::Io(_) | ClientError::Timeout(_)) {
+                upstream.park_h3(true);
+            }
+            // Boxed: `exchange` recursing through this helper would otherwise
+            // make the async fn infinitely sized. The fallback client is a
+            // plain DoH client, so the recursion is one level deep.
+            return Box::pin(h1.exchange(wire, expected)).await;
+        }
+        let Some(h1) = self.doh_h1.as_ref() else {
+            // Parked HTTP/3 on a force-only entry: the cooldown is
+            // meaningless without a fallback, so retry QUIC instead of
+            // failing a query that a fresh connection could answer.
+            upstream.park_h3(false);
+            let response = upstream.exchange(wire).await?;
+            return decode_validated_response(&response, expected);
+        };
+        Box::pin(h1.exchange(wire, expected)).await
     }
 }
 
@@ -1493,6 +1831,25 @@ fn validate_response(response: &Message, expected: &ExpectedResponse) -> Result<
         return Err(ClientError::Protocol("response question class mismatch"));
     }
     Ok(())
+}
+
+/// `https://host[:port][path]` — the label DoH and its HTTP/3 form share,
+/// since both name the same upstream URL.
+#[cfg(feature = "encrypted")]
+fn doh_label(addr: &SocketAddr, sni: &str, path: &str) -> String {
+    if sni.is_empty() {
+        format!("https://{}", socket_label(*addr, 443))
+    } else if path == "/dns-query" {
+        if addr.port() == 443 {
+            format!("https://{sni}")
+        } else {
+            format!("https://{sni}:{}", addr.port())
+        }
+    } else if addr.port() == 443 {
+        format!("https://{sni}{path}")
+    } else {
+        format!("https://{sni}:{}{path}", addr.port())
+    }
 }
 
 fn socket_label(addr: SocketAddr, default_port: u16) -> String {
@@ -1750,6 +2107,7 @@ async fn udp_exchange(
     // Binding to the loopback address selects `lo0` explicitly; it also
     // needs no VPN `protect()` on Android because loopback is never routed
     // into the tunnel.
+    let addr = meow_common::canonical_socket_addr(addr);
     let sock = if addr.ip().is_loopback() {
         let local: SocketAddr = match addr {
             SocketAddr::V4(_) => SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -1757,7 +2115,7 @@ async fn udp_exchange(
         };
         UdpSocket::bind(local).await?
     } else {
-        factory().bind_udp().await?
+        factory().bind_udp_for_peer(addr.ip()).await?
     };
     sock.connect(addr).await?;
     sock.send(wire).await?;
@@ -2167,7 +2525,7 @@ async fn tls_conn_alive(stream: &mut TlsConn) -> bool {
 /// headers; a well-formed DoH answer always fits while an oversized response
 /// is rejected.
 #[cfg(feature = "encrypted")]
-const MAX_DOH_RESPONSE_BYTES: usize = 65535 + 16 * 1024;
+pub(crate) const MAX_DOH_RESPONSE_BYTES: usize = 65535 + 16 * 1024;
 
 /// Read a stream to EOF, rejecting responses whose total size exceeds
 /// [`MAX_DOH_RESPONSE_BYTES`]. This is the close-delimited body arm of
@@ -2819,6 +3177,173 @@ mod tests {
         message.add_answer(a_record("second.example", 300, [192, 0, 2, 11]));
 
         assert_eq!(relevant_ip_answers(&message), (Vec::new(), None));
+    }
+
+    /// A factory that overrides only `bind_udp` with a single-family IPv4
+    /// socket must get an explicit error — not a late `connect()`
+    /// `EAFNOSUPPORT` — when an IPv6 peer asks for a socket it can never
+    /// reach.
+    #[tokio::test]
+    async fn bind_udp_for_peer_default_rejects_v4_socket_for_v6_peer() {
+        struct V4Only;
+        impl SocketFactory for V4Only {
+            fn bind_udp(&self) -> BoxFuture<'_, io::Result<UdpSocket>> {
+                Box::pin(async { UdpSocket::bind("0.0.0.0:0").await })
+            }
+            fn connect_tcp(&self, _addr: SocketAddr) -> BoxFuture<'_, io::Result<TcpStream>> {
+                unreachable!("udp-only test factory")
+            }
+        }
+        let err = V4Only
+            .bind_udp_for_peer("2001:db8::53".parse().unwrap())
+            .await
+            .expect_err("an IPv4-bound socket cannot reach an IPv6 peer");
+        assert_eq!(err.kind(), io::ErrorKind::AddrNotAvailable);
+        // The same default keeps delegating for a peer the socket can reach.
+        let socket = V4Only
+            .bind_udp_for_peer("192.0.2.53".parse().unwrap())
+            .await
+            .expect("IPv4 peer keeps the delegated bind_udp socket");
+        assert!(socket.local_addr().unwrap().is_ipv4());
+    }
+
+    /// The mirror-image pairing is just as unreachable: an IPv6-bound
+    /// socket cannot `connect()` a plain IPv4 `sockaddr_in`, so the
+    /// default refuses it too. Skipped when the host has no IPv6.
+    #[tokio::test]
+    async fn bind_udp_for_peer_default_rejects_v6_socket_for_v4_peer() {
+        if UdpSocket::bind("[::1]:0").await.is_err() {
+            eprintln!("no IPv6 loopback; skipping v6-socket reject test");
+            return;
+        }
+        struct V6Only;
+        impl SocketFactory for V6Only {
+            fn bind_udp(&self) -> BoxFuture<'_, io::Result<UdpSocket>> {
+                Box::pin(async { UdpSocket::bind("[::]:0").await })
+            }
+            fn connect_tcp(&self, _addr: SocketAddr) -> BoxFuture<'_, io::Result<TcpStream>> {
+                unreachable!("udp-only test factory")
+            }
+        }
+        let err = V6Only
+            .bind_udp_for_peer("192.0.2.53".parse().unwrap())
+            .await
+            .expect_err("an IPv6-bound socket cannot connect() a plain IPv4 peer");
+        assert_eq!(err.kind(), io::ErrorKind::AddrNotAvailable);
+        // Same-family peers keep the delegated bind_udp socket.
+        let socket = V6Only
+            .bind_udp_for_peer("2001:db8::53".parse().unwrap())
+            .await
+            .expect("IPv6 peer keeps the delegated bind_udp socket");
+        assert!(socket.local_addr().unwrap().is_ipv6());
+    }
+
+    /// Probe first so a kernel with IPv6 disabled (e.g. `ipv6.disable=1`
+    /// sandboxes) skips instead of failing on `EADDRNOTAVAIL`; the
+    /// `unwrap` below still fails on a real `bind_udp_for_peer` regression.
+    #[tokio::test]
+    async fn default_udp_socket_matches_native_ipv6_nameserver_family() {
+        if UdpSocket::bind("[::1]:0").await.is_err() {
+            eprintln!("no IPv6 loopback; skipping v6 nameserver family test");
+            return;
+        }
+        let socket = DefaultSocketFactory
+            .bind_udp_for_peer("2001:db8::53".parse().unwrap())
+            .await
+            .unwrap();
+        assert!(socket.local_addr().unwrap().is_ipv6());
+    }
+
+    #[tokio::test]
+    async fn udp_accepts_ipv4_mapped_nameserver() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = server.local_addr().unwrap().port();
+        let addr = SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.to_ipv6_mapped().into(), port);
+        let server_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (len, peer) = server.recv_from(&mut buf).await.unwrap();
+            let request = Message::from_bytes(&buf[..len]).unwrap();
+            let reply = response_for(&request, request.metadata.id);
+            server
+                .send_to(&reply.to_bytes().unwrap(), peer)
+                .await
+                .unwrap();
+        });
+        let response = DnsClient::udp(addr)
+            .with_timeout(Duration::from_secs(1))
+            .query("example.test", RecordType::AAAA)
+            .await
+            .unwrap();
+        assert_eq!(response.queries[0].query_type, RecordType::AAAA);
+        // Await the server task so a panic on the passing path is
+        // reported instead of dropped with the JoinHandle; a panic
+        // before the reply already fails the test via the client
+        // timeout above.
+        server_task.await.unwrap();
+    }
+
+    /// A native IPv6 loopback nameserver (`[::1]:53`) takes the same
+    /// loopback branch as the v4-mapped case above and must be dialed
+    /// from an `[::1]`-bound socket. Skipped when the host has no IPv6
+    /// loopback (minimal CI sandboxes).
+    #[tokio::test]
+    async fn udp_accepts_native_ipv6_loopback_nameserver() {
+        let Ok(server) = UdpSocket::bind("[::1]:0").await else {
+            eprintln!("no IPv6 loopback; skipping v6 loopback exchange test");
+            return;
+        };
+        let addr = server.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (len, peer) = server.recv_from(&mut buf).await.unwrap();
+            let request = Message::from_bytes(&buf[..len]).unwrap();
+            let reply = response_for(&request, request.metadata.id);
+            server
+                .send_to(&reply.to_bytes().unwrap(), peer)
+                .await
+                .unwrap();
+        });
+        let response = DnsClient::udp(addr)
+            .with_timeout(Duration::from_secs(1))
+            .query("example.test", RecordType::AAAA)
+            .await
+            .unwrap();
+        assert_eq!(response.queries[0].query_type, RecordType::AAAA);
+        // Same reason as the v4-mapped test above: report a server-task
+        // panic instead of dropping it with the JoinHandle.
+        server_task.await.unwrap();
+    }
+
+    /// A v4-mapped `tcp://` nameserver is canonicalised to plain IPv4
+    /// before `connect_tcp` — the TCP counterpart of
+    /// `udp_accepts_ipv4_mapped_nameserver`. Without it the mapped form
+    /// fails connect() where a fresh v6 socket defaults to v6-only; on
+    /// dual-stack Linux/macOS the kernel maps the connect, so the test
+    /// is a real guard only on v6-only platforms (it passed elsewhere
+    /// even before the fix).
+    #[tokio::test]
+    async fn tcp_accepts_ipv4_mapped_nameserver() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let addr = SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.to_ipv6_mapped().into(), port);
+        let server_task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_lp(&mut stream).await.unwrap();
+            let request = Message::from_bytes(&request).unwrap();
+            let reply = response_for(&request, request.metadata.id);
+            write_lp(&mut stream, &reply.to_bytes().unwrap())
+                .await
+                .unwrap();
+        });
+        let response = DnsClient::tcp(addr)
+            .with_timeout(Duration::from_secs(1))
+            .query("example.test", RecordType::A)
+            .await
+            .unwrap();
+        assert_eq!(response.queries[0].query_type, RecordType::A);
+        // Same as the `udp_accepts_*` siblings above: report a
+        // server-task panic instead of dropping it with the JoinHandle.
+        server_task.await.unwrap();
     }
 
     #[tokio::test]

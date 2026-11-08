@@ -57,7 +57,7 @@ cause problems; items marked ~ work with caveats; items marked ✓ work.
 | `proxies:` — HTTP CONNECT outbound | ✓ | Full parity (M1.B-3). |
 | `proxies:` — SOCKS5 outbound | ✓ | Full parity (M1.B-4). |
 | `proxies:` — Snell | ✓ | v3/v4/v5/v6, UDP-over-TCP, optional HTTP/TLS obfs (v3–v5), v6 `mode` (`default` / `unshaped` / `unsafe-raw`). |
-| `proxies:` — Hysteria2 | ✓ | QUIC TCP/UDP, Salamander obfs, port hopping, bandwidth hints. |
+| `proxies:` — Hysteria2 | ✓ | QUIC TCP/UDP, Salamander obfs, port hopping; `down` bandwidth hint only (`up` is parsed but ignored — warns at load). |
 | `proxies:` — AnyTLS | ✓ | TCP + UDP (udp-over-tcp v2, opt in with `udp: true`). In the `full` bundle, and therefore in the release binaries; excluded from `minimal`. |
 | `proxies:` — TUIC / WireGuard / SSH | ✗ | Not implemented. |
 | `proxy-groups:` — selector, url-test, fallback | ✓ | Fully supported. |
@@ -79,9 +79,11 @@ cause problems; items marked ~ work with caveats; items marked ✓ work.
 | `dns:` — udp, tcp nameservers | ✓ | Fully supported. |
 | `dns:` — DoH (`https://`) | ✓ | See §DNS. |
 | `dns:` — DoT (`tls://`) | ✓ | See §DNS. |
-| `dns:` — DoQ (`quic://`) | ✗ | Deferred to M1.E-6/M2. Hard error (not silent). |
+| `dns:` — DoQ (`quic://`) | ✓ | RFC 9250 on quiche, behind the `dns-quic` feature (in `full`). Without the feature it is a hard error naming it. |
+| `dns:` — `prefer-h3` / `?h3=` | ✓ | Global flag = h3 with HTTP/1.1 fallback; `?h3=true` = HTTP/3 only (mihomo's meaning); `?h3=prefer` / `?h3=false` are meow-rs's per-entry opt-in/opt-out. |
 | `dns:` — `default-nameserver` | ✓ | Bootstrap resolver for encrypted upstream hostnames. |
 | `dns:` — `nameserver-policy` | ✓ | Exact, `+.`/`*.`/`.` wildcard, `geosite:`/`rule-set:` policy keys. Key order is the lookup priority (document order = first match wins); a matcher key shadows domain keys written after it, and same-slot collisions resolve to the document-last key. |
+| `dns:` — `nameserver-policy-exclusive` | ✓ | meow-rs opt-in for upstream's ordering: a policy match is terminal — no `fallback-filter` domain/IP gate, no main/`fallback:` tiers. Off by default (meow's default tiers defer to `fallback-filter`). |
 | `dns:` — `fallback-filter` | ✓ | GeoIP/IP-CIDR/domain gates. |
 | `hosts:` (top level) + `dns:` `use-system-hosts` | ✓ | M1.E-5, wildcards supported. |
 | `dns:` — `fake-ip` mode | ✓ | v4/v6 pools, `fake-ip-filter`, `fake-ip-filter-mode`, `store-fake-ip` JSON persistence. See §fake-ip mode. |
@@ -105,7 +107,9 @@ These fields parse without error but behave differently from Go mihomo:
 | `authentication: ["user:"]` (empty password) | Accepted silently | Accepted; warn-once | B |
 | `skip-auth-prefixes` | Defaults to `[]` | Always includes `127.0.0.1/32` + `::1/128` | A |
 | `skip-auth-prefixes` with invalid CIDR | Silently dropped | Hard parse error | A |
-| `dns.nameserver: quic://...` | Supported | Hard error with roadmap pointer | A |
+| `dns.nameserver: quic://...` | Supported | Supported (same scheme, same 853 default) when built with `dns-quic`; otherwise a hard error naming the feature | — |
+| `dns.nameserver: https://…#h3=true` (params in the fragment) | Supported | Hard error with the fix spelled out — `#` is SNI in meow-rs, so parameters belong in `?h3=true` | A |
+| `dns.prefer-h3` on a build without `dns-quic` | n/a | Hard load error, never a silent downgrade to HTTP/1.1 | A |
 | `dns.nameserver: sdns://...` | Warn-drop (silent) | Hard error | A |
 | `dns.nameserver: tls://…#NAME` / `https://…#NAME` | `#` is SNI | Same — `#` is SNI. When `NAME` matches a configured proxy, a warning points out the routing intent was probably `?proxy=NAME` (lowercase `proxy` only), the spelling that tunnels the exchange through that adapter (`tls://8.8.8.8#dns.google?proxy=JP` for SNI + proxy together). | — |
 | `dns.nameserver: udp/tcp entry with ?…` | Accepted — `url.Parse` keeps the query and it is silently ignored (semantic drift, not a rejection) | Hard error (`InvalidParams`) — `?` sections exist only on `tls://`/`https://`; plain entries keep `#PROXY`. | A |
@@ -123,6 +127,7 @@ These fields parse without error but behave differently from Go mihomo:
 | `geodata-mode`, `geodata-loader`, `geoip-matcher` | Valid fields | Ignored with warn-once (M2+) | B |
 | `dns.listen` / `external-controller` bind failure at startup | Logs error, daemon keeps running | Hard startup error (process exits non-zero) — no prior listener exists to fall back to (the `dns.listen` half keeps its tolerant keep-old semantics on runtime `PUT /configs` rebind; `external-controller` has no runtime rebind) | A |
 | `dns.listen` set while `dns.enable: false` | Silently ignored | Warn-once that no listener is started | B |
+| `keep-alive-idle` / `keep-alive-interval` / `disable-keep-alive` | Tune keepalive on inbound listeners AND outbound dials | Parsed and ignored with a warn pointing to `tcp-keepalive*` — which covers the inbound half only; the outbound-dialer keepalive tuning is not honored | B |
 
 ### Fields that are silently ignored in Go mihomo but error in meow-rs
 
@@ -165,6 +170,16 @@ and `gost-plugin` WebSocket transports are included, along with
 UDP relay via UDP-over-TCP). External SIP003 plugin binaries are
 supported via `plugin:` on `ss` nodes and `allow-external-plugin` on
 providers.
+
+Feature prerequisites: `obfs`/`simple-obfs` and `v2ray-plugin` are
+bundled with `ss` itself (so they are in `minimal`); `gost-plugin`,
+`shadow-tls`, `restls` and `jls` each sit behind a same-named Cargo
+feature, all re-bundled into `default`/`full` but absent from `minimal`
+— a `plugin:` line naming a compiled-out built-in keeps the node bound
+as an unavailable placeholder whose dials fail with a "not compiled
+into this build" error (it is never handed to the external-plugin spawn
+path). `kcptun` and `ech-tls-tunnel` were already separate features and
+behave the same way.
 
 ### Trojan
 
@@ -410,7 +425,8 @@ preceding hop's stream (mihomo `DialContextWithDialer` semantics).
 `anytls`, and `ss` (built-in obfs/v2ray-plugin/ech-tls-tunnel included) all
 terminate a relay chain. Two carve-outs fail loudly instead of silently
 misbehaving: `hysteria2` (QUIC/UDP cannot ride a TCP stream — first-hop
-only) and `ss` with `gost-plugin`/`shadow-tls`/`restls`/`jls` or an
+only) and `ss` with `gost-plugin`/`shadow-tls`/`restls`/`jls` (when those
+per-plugin cargo features are compiled in) or an
 external SIP003 plugin (the plugin owns its outbound leg — a record-level
 transport cannot be replayed over an already-proxied stream). Mux pooling
 (`smux`/`yamux`/`h2mux`/`muxcool`) is bypassed on relay hops: a
@@ -543,6 +559,33 @@ the same trie slot (`x` vs `+.x`, `.x` vs `+.x`, or spellings that
 normalize together), the document-last writer wins — mihomo's `setData`
 parity — and the document order round-trips through config saves.
 
+Dead keys are surfaced, not rejected outright: a key whose body still holds
+an empty label (`a..b`, `..x`, `+..x`) builds a trie node no query can
+reach, and an all-dots or prefix-only body (`"."`, `"+."`) is refused by
+the insert — meow warns naming the key in lenient mode and fails the load
+under `strict: true`, where mihomo's `ValidAndSplitDomain` rejects both
+classes outright. Trailing-dot spellings (`x.com.`, `x.com..`) stay legal:
+they normalize onto the same slot as `x.com`. The check covers config
+`hosts:` keys only — the system hosts file merged in by `use-system-hosts`
+is out of scope: it is parsed leniently line-by-line and its entries never
+pass through the dead-key validation. Before turning on `strict: true`,
+run `meow -t` once in lenient mode — the warnings name every dead key the
+strict load would refuse, so you can fix the list first.
+
+The same dead-key concept reaches the `rules:` list per rule type, judged
+against the normalized host rules compare with: `DOMAIN`/`DOMAIN-SUFFIX`
+flag an empty label, a leading or trailing dot, or a verbatim-dead `*`/`+`
+spelling (`DOMAIN,*.x.com` can never equal a host — `*` belongs on
+`DOMAIN-WILDCARD`, and `DOMAIN-SUFFIX,x.com` already covers apex plus
+subdomains, so `+.` adds nothing);
+`DOMAIN-WILDCARD` flags a literal `+` — its matcher globs `*` only, so
+`+.x.com` is dead there too — plus dead literal labels; `DOMAIN-KEYWORD`
+flags `..` only (a `foo.` needle still matches `foo.bar` as a substring,
+though it no longer hits the bare `foo` under trailing-dot
+normalization — the same residual applies to an anchored
+`DOMAIN-REGEX` like `^foo\.$`, which is otherwise not checked: an
+arbitrary pattern's reachability is not decidable by label inspection).
+
 ---
 
 ## Inbound authentication
@@ -588,6 +631,8 @@ tools built for Go mihomo will ignore them.
 | Extended proxy group API | `GET\|POST\|PUT\|DELETE /api/proxy-groups[/:name]` | meow-rs-specific |
 | Rule CRUD API | `POST\|PUT\|DELETE /rules[/:index]` | Runtime rule editing |
 | Logbook | `GET\|DELETE /logbook`, `logbook: {enable: true}` | Persistent record of notable engine events, kept 7 days in `<home>/logbook/logbook.db`; not in `minimal` builds ([ADR-0014](adr/0014-logbook.md)) |
+| Traffic ledger | `GET\|DELETE /traffic/ledger`, `traffic-ledger: {enable: true, hosts: true, apps: true}` | Per-day traffic by host, app, policy and interface, kept 62 days in `<home>/traffic/traffic.db`; not in `minimal` builds ([ADR-0015](adr/0015-traffic-ledger.md)) |
+| Inbound socket keepalive + relay idle bound | `tcp-keepalive`, `tcp-keepalive-idle`/`interval`/`probes`, `tcp-idle-timeout` | `SO_KEEPALIVE` + timing on every accepted inbound socket, and an opt-in whole-connection idle bound that reaps relays silent in both directions for `tcp-idle-timeout` seconds (off when absent or `0` — kernel keepalive probes are not relay bytes, so a live-but-silent flow like IMAP `IDLE` is still reaped once opted in); keepalive is a listener-startup snapshot, the idle bound is applied by `PUT /configs` to relays started after the commit |
 
 Keep these under the `/api/` prefix so they do not collide with
 Clash-compatible paths.
@@ -606,6 +651,7 @@ meow-rs uses Cargo feature flags where Go mihomo uses build tags:
 | Minimal app bundle | `meow-app/minimal` | off |
 | AnyTLS outbound | `meow-app/anytls` (in `full`, not in `minimal`) | on |
 | Logbook (bundles SQLite) | `meow-app/logbook` (in `full`, not in `minimal`) | on |
+| Traffic ledger (SQLite + public-suffix list) | `meow-app/traffic-ledger` (in `full`, not in `minimal`) | on |
 | Shadowsocks inbound (`listeners:` `type: shadowsocks`) | `meow-app/listener-shadowsocks` (in `full`, not in `minimal`) | on |
 
 To build without encrypted DNS (smaller binary):

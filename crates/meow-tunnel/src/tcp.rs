@@ -1,9 +1,12 @@
-use crate::relay::{copy_bidirectional_buf_tracked_splice, proxy_conn_tcp_view, RELAY_BUF_SIZE};
+use crate::relay::{
+    copy_bidirectional_buf_tracked_splice_idle, proxy_conn_tcp_view, RELAY_BUF_SIZE,
+};
 use crate::statistics::Statistics;
-use crate::tunnel::{MatchedRule, ResolvedTarget, TunnelInner};
+use crate::tunnel::{MatchedRule, ResolvedTarget, TunnelInner, UsingProxy};
 use meow_common::conn_note;
 use meow_common::conn_notes::{self, ConnNotes};
-use meow_common::{with_dial_timeout, Metadata, ProxyAdapter, ProxyConn};
+use meow_common::traffic_ledger::Route;
+use meow_common::{with_dial_timeout, Metadata, Proxy, ProxyAdapter, ProxyConn};
 use smallvec::{smallvec, SmallVec};
 use smol_str::SmolStr;
 use std::sync::Arc;
@@ -73,6 +76,37 @@ fn connection_chain(adapter: &dyn ProxyAdapter, metadata: &Metadata) -> SmallVec
     chain
 }
 
+/// The leaf proxy `adapter` dials through for `metadata` — the
+/// `chains[0]` [`connection_chain`] would record, without building it —
+/// or `None` when `adapter` is no group and dials itself.
+pub(crate) fn leaf_proxy(
+    adapter: &dyn ProxyAdapter,
+    metadata: &Metadata,
+) -> Option<Arc<dyn meow_common::Proxy>> {
+    let mut leaf = None;
+    let mut next = adapter.unwrap_proxy(metadata, false);
+    for _ in 0..MAX_CHAIN_HOPS {
+        let Some(hop) = next else {
+            break;
+        };
+        next = hop.unwrap_proxy(metadata, false);
+        leaf = Some(hop);
+    }
+    leaf
+}
+
+/// The member that carries the `dialer-proxy` hop of the leaf `adapter`
+/// dials through for `metadata` (see [`ProxyAdapter::dialer_hop`]).
+pub(crate) fn dialer_hop(
+    adapter: &dyn ProxyAdapter,
+    metadata: &Metadata,
+) -> Option<Arc<dyn meow_common::Proxy>> {
+    match leaf_proxy(adapter, metadata) {
+        Some(leaf) => leaf.dialer_hop(metadata),
+        None => adapter.dialer_hop(metadata),
+    }
+}
+
 /// A `chains` list read the way it was decided — rule target first, the
 /// leaf that dials last: `Proxy → Auto → HK-01`.
 struct PolicyPath<'a>(&'a [Arc<str>]);
@@ -89,6 +123,45 @@ impl std::fmt::Display for PolicyPath<'_> {
     }
 }
 
+/// What a dial-error line names: the rule's target and, behind a group,
+/// the node its dial went through (`Proxy → HK-01`), since the group's
+/// name alone hides which member failed.
+struct DialVia<'a> {
+    target: &'a str,
+    leaf: Option<Arc<dyn Proxy>>,
+}
+
+impl<'a> DialVia<'a> {
+    /// `pick` is the member the dial's automatic group committed to
+    /// ([`meow_proxy::group::watch_dial_pick`]); without one (a selector
+    /// over a node, or no group at all) the leaf is read the way
+    /// [`connection_chain`] reads it.
+    fn new(
+        adapter: &'a dyn ProxyAdapter,
+        pick: Option<Arc<dyn Proxy>>,
+        metadata: &Metadata,
+    ) -> Self {
+        let leaf = match pick {
+            Some(pick) => leaf_proxy(pick.as_ref(), metadata).or(Some(pick)),
+            None => leaf_proxy(adapter, metadata),
+        };
+        Self {
+            target: adapter.name(),
+            leaf,
+        }
+    }
+}
+
+impl std::fmt::Display for DialVia<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.target)?;
+        if let Some(leaf) = &self.leaf {
+            write!(f, " → {}", leaf.name())?;
+        }
+        Ok(())
+    }
+}
+
 impl<'a> ConnectionGuard<'a> {
     fn track_named(
         stats: &'a Statistics,
@@ -97,7 +170,15 @@ impl<'a> ConnectionGuard<'a> {
         rule_payload: SmolStr,
         adapter: &dyn ProxyAdapter,
     ) -> Self {
-        if let Some(counters) = stats.begin_headless_connection() {
+        let route = || {
+            let leaf = leaf_proxy(adapter, metadata);
+            let leaf: &dyn ProxyAdapter = match &leaf {
+                Some(leaf) => leaf.as_ref(),
+                None => adapter,
+            };
+            Some(stats.route(stats.proxy_name(leaf.name()), leaf.dialer_hop(metadata)))
+        };
+        if let Some(counters) = stats.begin_headless_connection(metadata, route) {
             return Self {
                 stats,
                 key: ConnectionKey::Headless,
@@ -114,6 +195,7 @@ impl<'a> ConnectionGuard<'a> {
             rule_payload,
             chains,
             ConnNotes::current(),
+            || dialer_hop(adapter, metadata),
         );
         Self {
             stats,
@@ -133,7 +215,13 @@ impl<'a> ConnectionGuard<'a> {
     ) -> Self {
         // Obtain the handle before publishing the entry. A concurrent DELETE
         // must cancel this exact handle, even before its first poll.
-        let (key, counters) = if let Some(counters) = stats.begin_headless_connection() {
+        let headless = stats.begin_headless_connection(&metadata, || {
+            Some(Route {
+                policy: Arc::clone(chains.first()?),
+                via: None,
+            })
+        });
+        let (key, counters) = if let Some(counters) = headless {
             (ConnectionKey::Headless, counters)
         } else {
             let (id, counters) = stats.track_connection_with_counters(
@@ -142,6 +230,7 @@ impl<'a> ConnectionGuard<'a> {
                 rule_payload,
                 chains,
                 ConnNotes::current(),
+                || None,
             );
             (ConnectionKey::Api(id), counters)
         };
@@ -270,6 +359,19 @@ pub async fn handle_tcp(
     route_inbound_tcp(tunnel, &mut conn, metadata, &prefix).await;
 }
 
+/// [`handle_tcp`] for an inbound that hands over a kernel socket with a
+/// known original destination (the TUN's system stack). The
+/// name sniff peeks instead of reading, so no prefix is replayed and a
+/// DIRECT relay splices in the kernel.
+pub async fn handle_tcp_socket(
+    tunnel: &TunnelInner,
+    mut conn: tokio::net::TcpStream,
+    mut metadata: Metadata,
+) {
+    crate::sniff::sniff_unnamed_peek(tunnel, &conn, &mut metadata).await;
+    route_inbound_tcp(tunnel, &mut conn, metadata, &[]).await;
+}
+
 /// Route a decrypted inbound TCP connection through the rule engine and relay
 /// it to the matched proxy.
 ///
@@ -391,7 +493,7 @@ async fn route_inbound_tcp_scoped<C>(
             &target.rule_payload,
             target.adapter.name()
         ),
-        target.adapter.name()
+        UsingProxy::new(target.adapter.as_ref(), &metadata)
     );
 
     // `route` pins this generation's dialer registry across the dial —
@@ -432,7 +534,11 @@ async fn route_inbound_tcp_scoped<C>(
                 proxy.adapter_type()
             );
             let started = std::time::Instant::now();
-            let dial = with_dial_timeout(proxy.name(), proxy.dial_tcp(&metadata)).await;
+            let (dial, pick) = meow_proxy::group::watch_dial_pick(with_dial_timeout(
+                proxy.name(),
+                proxy.dial_tcp(&metadata),
+            ))
+            .await;
             // All chained front hops resolved during the dial — release the
             // generation pin before entering the relay loop.
             drop(route.take());
@@ -463,7 +569,7 @@ async fn route_inbound_tcp_scoped<C>(
                             .stats
                             .record_upload(&up, prefix.len() as meow_common::atomic::Int);
                     }
-                    match copy_bidirectional_buf_tracked_splice(
+                    match copy_bidirectional_buf_tracked_splice_idle(
                         conn,
                         &mut *remote,
                         &mut buf_up,
@@ -479,6 +585,7 @@ async fn route_inbound_tcp_scoped<C>(
                                 .stats
                                 .record_download(&dn, n as meow_common::atomic::Int);
                         },
+                        inner.tcp_idle_timeout(),
                     )
                     .await
                     {
@@ -505,9 +612,10 @@ async fn route_inbound_tcp_scoped<C>(
                 }
                 Err(e) => {
                     warn!(
-                        "{} {} dial error: {}",
+                        "{} {} dial error using {}: {}",
                         metadata.conn_type,
                         metadata.remote_address(),
+                        DialVia::new(proxy.as_ref(), pick, &metadata),
                         e
                     );
                     conn_note!(
@@ -1041,8 +1149,10 @@ mod tests {
 
     /// Run `f` on a current-thread runtime and return what it logged at
     /// INFO and above. `with_default` is thread-local, so parallel tests in
-    /// this binary don't see each other's lines.
+    /// this binary don't see each other's lines; see
+    /// [`crate::install_capture_fallback`] for the process-wide part.
     fn capture_info(f: impl std::future::Future<Output = ()>) -> String {
+        crate::install_capture_fallback();
         #[derive(Clone)]
         struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
         impl std::io::Write for Sink {
@@ -1115,6 +1225,46 @@ mod tests {
         }
     }
 
+    /// A group target names the member the flow dials through in brackets,
+    /// as upstream's `Chain.String()` does: the outer group and the final
+    /// member, so `Proxy → Auto → DIRECT` logs `Proxy[DIRECT]`. The rule
+    /// part keeps the rule's own target.
+    #[test]
+    fn match_log_line_names_the_member_a_group_dials_through() {
+        let logs = capture_info(async {
+            let tunnel = test_tunnel();
+            let mut proxies = meow_config::rebuild_from_raw(&Default::default())
+                .unwrap()
+                .proxies;
+            let direct = Arc::clone(&proxies["DIRECT"]);
+            let auto: Arc<dyn meow_common::Proxy> =
+                Arc::new(meow_proxy::SelectorGroup::new("Auto", vec![direct]));
+            proxies.insert("Auto".into(), Arc::clone(&auto));
+            proxies.insert(
+                "Proxy".into(),
+                Arc::new(meow_proxy::SelectorGroup::new("Proxy", vec![auto])),
+            );
+            tunnel.update_routing(
+                proxies,
+                vec![rule("DOMAIN-SUFFIX,cats.invalid,Proxy"), rule("MATCH,Auto")],
+                Default::default(),
+            );
+            for host in ["cats.invalid", "dogs.invalid"] {
+                let meta = Metadata {
+                    host: host.into(),
+                    ..metadata()
+                };
+                route_one(&tunnel, meta).await;
+            }
+        });
+        for line in [
+            "cats.invalid:443 match DOMAIN-SUFFIX(cats.invalid) using Proxy[DIRECT]",
+            "dogs.invalid:443 match MATCH(Auto) using Auto[DIRECT]",
+        ] {
+            assert!(logs.contains(line), "no {line:?} in:\n{logs}");
+        }
+    }
+
     /// The case that motivated notes: an IP rule needs the destination IP,
     /// the lookup finds nothing, and the flow falls through to MATCH.
     #[tokio::test]
@@ -1180,6 +1330,49 @@ mod tests {
         assert!(
             notes.contains(&format!("Fake IP {fake} maps to notes.test")),
             "{notes:?}"
+        );
+    }
+
+    /// A failed dial names the node behind the rule's group, not only the
+    /// group; a leaf target is named once.
+    #[test]
+    fn dial_error_names_the_node_a_group_dialed_through() {
+        let logs = capture_info(async {
+            let raw: meow_config::raw::RawConfig = serde_saphyr::from_str(
+                "proxies:
+  - {name: HK-01, type: socks5, server: 127.0.0.1, port: 1}
+  - {name: JP-01, type: socks5, server: 127.0.0.1, port: 1}
+proxy-groups:
+  - {name: Auto, type: fallback, proxies: [HK-01, JP-01], url: 'http://probe.test/204', interval: 300}
+  - {name: Proxy, type: select, proxies: [Auto, JP-01]}
+",
+            )
+            .unwrap();
+            let proxies = meow_config::rebuild_from_raw(&raw).unwrap().proxies;
+            let tunnel = test_tunnel();
+            tunnel.update_routing(
+                proxies.clone(),
+                vec![
+                    rule("DOMAIN,leaf.invalid,JP-01"),
+                    Box::new(meow_rules::final_rule::FinalRule::new("Proxy")),
+                ],
+                Default::default(),
+            );
+            for host in ["group.invalid", "leaf.invalid"] {
+                let meta = Metadata {
+                    host: host.into(),
+                    ..metadata()
+                };
+                route_one(&tunnel, meta).await;
+            }
+        });
+        assert!(
+            logs.contains("group.invalid:443 dial error using Proxy → HK-01: "),
+            "{logs}"
+        );
+        assert!(
+            logs.contains("leaf.invalid:443 dial error using JP-01: "),
+            "{logs}"
         );
     }
 
@@ -1254,5 +1447,43 @@ proxy-groups:
         // A leaf selection records just the leaf behind the group.
         selector.set("DIRECT").await.unwrap();
         assert_eq!(tracked_chain(&tunnel).await, ["DIRECT", "Proxy"]);
+    }
+
+    /// The traffic ledger asks the leaf a flow's groups pick for the
+    /// member carrying its `dialer-proxy` hop, and that member follows the
+    /// front's own pick.
+    #[tokio::test]
+    async fn the_dialer_hop_is_the_leafs_front_member() {
+        let raw: meow_config::raw::RawConfig = serde_saphyr::from_str(
+            "proxies:
+  - {name: daniel, type: socks5, server: 192.0.2.1, port: 1080, dialer-proxy: fast}
+  - {name: HK-01, type: socks5, server: 127.0.0.1, port: 1}
+  - {name: HK-02, type: socks5, server: 127.0.0.1, port: 2}
+proxy-groups:
+  - {name: fast, type: select, proxies: [HK-01, HK-02]}
+  - {name: Proxy, type: select, proxies: [daniel, HK-01]}
+",
+        )
+        .unwrap();
+        let built = meow_config::rebuild_from_raw(&raw).unwrap();
+        let proxies = built.proxies;
+        let hop =
+            || dialer_hop(proxies["Proxy"].as_ref(), &metadata()).map(|hop| hop.name().to_owned());
+        assert_eq!(hop().as_deref(), Some("HK-01"));
+        proxies["fast"]
+            .selection()
+            .unwrap()
+            .set("HK-02")
+            .await
+            .unwrap();
+        assert_eq!(hop().as_deref(), Some("HK-02"));
+        proxies["Proxy"]
+            .selection()
+            .unwrap()
+            .set("HK-01")
+            .await
+            .unwrap();
+        assert_eq!(hop(), None);
+        drop(built.dialer_registry);
     }
 }

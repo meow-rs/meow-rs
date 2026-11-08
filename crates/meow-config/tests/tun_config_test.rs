@@ -15,7 +15,7 @@
 //! | T5  | invalid `inet4-address` CIDR → hard error                          |
 //! | T6  | `dns-hijack: [any:53]` → hijack on; absent → on; `[]` → off        |
 //! | T7  | `dns-hijack` with only non-53 entries → hijack off (warn-only)     |
-//! | T8  | upstream-only fields (`stack`, `strict-route`, …) → warn, not err  |
+//! | T8  | upstream-only fields (`strict-route`, …) → warn, not err           |
 //! | T8b | `inet6-address` (#375): honoured only in global route scope,       |
 //! |     | string or list form, invalid CIDR → hard error                     |
 //! | T11 | `auto-route` unset / `true` → global scope on Linux, macOS and     |
@@ -27,6 +27,7 @@
 //! | T17 | `global_route_outbound_interface` (the pre-build binding gate,    |
 //! |     | issue #695) agrees with the parsed `TunConfig`                     |
 //! | T18 | unset `inet4-address` → the fake-IP range's first /30, like mihomo |
+//! | T20 | `stack`: `system`/`mixed` → kernel TCP; everything else → lwip     |
 
 use std::time::Duration;
 
@@ -183,7 +184,6 @@ async fn t8_upstream_only_fields_warn_but_load() {
     let yaml = r#"
 tun:
   enable: true
-  stack: system
   strict-route: true
   auto-detect-interface: true
   inet6-address: fdfe:dcba:9876::1/126
@@ -619,4 +619,73 @@ fn t18b_unusable_fake_ip_ranges_fall_back_to_the_default_range() {
             "{range}"
         );
     }
+}
+
+// ─── T19: inet4-address list form (mihomo `[]netip.Prefix`) ──────────────
+
+#[tokio::test]
+async fn t19_inet4_address_list_form_uses_the_first_entry() {
+    let load = |v: &'static str| async move {
+        let yaml = format!("tun:\n  enable: true\n  inet4-address: {v}\n");
+        load_config_from_str(&yaml)
+            .await
+            .map(|c| c.tun.inet4_address.to_string())
+    };
+    assert_eq!(load("[10.9.0.1/30]").await.unwrap(), "10.9.0.1/30");
+    assert_eq!(
+        load("[10.9.0.1/30, 10.8.0.1/30]").await.unwrap(),
+        "10.9.0.1/30",
+        "first entry wins"
+    );
+    assert_eq!(load("[]").await.unwrap(), "198.18.0.1/30", "[] is unset");
+    assert_eq!(load("''").await.unwrap(), "198.18.0.1/30", "'' is unset");
+    for bad in ["[7]", "[not-a-cidr]", "{a: 1}"] {
+        let err = load(bad).await.expect_err(bad).to_string();
+        assert!(err.contains("inet4-address"), "{bad}: {err}");
+    }
+}
+
+/// Non-finite YAML floats deserialize through `serde_json::Value` as
+/// `Null` — not a string — so they were silently "unset" under the
+/// `Value` field. With the old `Option<String>` the spelling reached the
+/// CIDR parse as text and was a hard error; keep it one.
+#[tokio::test]
+async fn t19b_inet4_address_non_finite_float_errors() {
+    let load = |v: &'static str| async move {
+        let yaml = format!("tun:\n  enable: true\n  inet4-address: {v}\n");
+        load_config_from_str(&yaml)
+            .await
+            .map(|c| c.tun.inet4_address.to_string())
+    };
+    for bad in [".nan", ".inf", "-.inf", "1e999"] {
+        let err = load(bad).await.expect_err(bad).to_string();
+        assert!(err.contains("inet4-address"), "{bad}: {err}");
+    }
+    // The same hole through the list spelling.
+    let err = load("[.nan]").await.expect_err("[.nan]").to_string();
+    assert!(err.contains("inet4-address"), "[.nan]: {err}");
+}
+
+// ─── T20: `tun.stack` ───────────────────────────────────────────────────
+
+/// `tun.stack`: `system`/`mixed` select the kernel TCP stack, everything
+/// else the userspace one.
+#[tokio::test]
+async fn t20_stack_system_and_mixed_select_the_kernel_tcp_stack() {
+    for (value, want) in [
+        ("system", meow_config::TunStack::System),
+        ("Mixed", meow_config::TunStack::System),
+        ("gvisor", meow_config::TunStack::Lwip),
+        ("mips", meow_config::TunStack::Lwip),
+        ("lwip", meow_config::TunStack::Lwip),
+    ] {
+        let cfg = load_config_from_str(&format!("tun:\n  enable: true\n  stack: {value}\n"))
+            .await
+            .expect("parses");
+        assert_eq!(cfg.tun.stack, want, "stack: {value}");
+    }
+    let cfg = load_config_from_str("tun:\n  enable: true\n")
+        .await
+        .unwrap();
+    assert_eq!(cfg.tun.stack, meow_config::TunStack::Lwip);
 }

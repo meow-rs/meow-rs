@@ -21,7 +21,7 @@
 //! concrete stream type (`TcpStream` / `HttpObfsServer` / `TlsObfsServer`)
 //! rather than type-erased, keeping the relay hot path dispatch-free.
 
-use meow_common::{metadata_ip_literal, ConnType, Metadata, Network};
+use meow_common::{metadata_ip_literal, ConnType, Metadata, Network, TcpKeepaliveConfig};
 use meow_transport::simple_obfs::server::{HttpObfsServer, TlsObfsServer};
 use meow_tunnel::{route_inbound_tcp, ResolvedTarget, Tunnel};
 use shadowsocks::config::{ServerConfig, ServerType};
@@ -73,6 +73,9 @@ pub struct ShadowsocksListener {
     udp: bool,
     obfs: ObfsKind,
     max_connections: usize,
+    /// Keepalive posture applied to every accepted socket (see
+    /// [`crate::keepalive`]); `enabled: false` writes no sockopts.
+    tcp_keepalive: TcpKeepaliveConfig,
 }
 
 impl ShadowsocksListener {
@@ -106,6 +109,7 @@ impl ShadowsocksListener {
             udp,
             obfs,
             max_connections: DEFAULT_MAX_CONNECTIONS,
+            tcp_keepalive: TcpKeepaliveConfig::default(),
         })
     }
 
@@ -114,6 +118,14 @@ impl ShadowsocksListener {
     /// caps the UDP relay's concurrent `(peer, target)` flows.
     pub fn with_max_connections(mut self, max: usize) -> Self {
         self.max_connections = max;
+        self
+    }
+
+    /// Override the TCP keepalive posture applied to every accepted socket
+    /// (default [`TcpKeepaliveConfig::default`]). `enabled: false` performs
+    /// no keepalive `setsockopt` at all.
+    pub fn with_tcp_keepalive(mut self, cfg: TcpKeepaliveConfig) -> Self {
+        self.tcp_keepalive = cfg;
         self
     }
 
@@ -265,6 +277,20 @@ impl ShadowsocksListener {
         S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static,
         F: Fn(TcpStream) -> S + Clone + Send + Sync + 'static,
     {
+        // Wrap the codec `map` once so keepalive lands on the raw accepted
+        // socket — before obfs wrapping and SS decryption, the earliest
+        // point this listener sees the TcpStream. `ka` is Copy; `name` is
+        // an `Arc<str>` so `accept_map`'s per-connection `map.clone()` costs
+        // a refcount bump, not a heap alloc.
+        let map = {
+            let ka = self.tcp_keepalive;
+            let name: Arc<str> = self.name.as_str().into();
+            let inner = map;
+            move |t: TcpStream| {
+                crate::keepalive::apply(&t, ka, &name);
+                inner(t)
+            }
+        };
         let mut warned_saturated = false;
         // A persistent accept failure (fd exhaustion) must not spin the loop
         // or flood the log; a transient one must not be delayed meaningfully.
@@ -418,7 +444,7 @@ fn build_metadata(peer: SocketAddr, target: &Address, in_name: &str, in_port: u1
 use meow_common::atomic::{checked_increment, AtomicU, Uint};
 use meow_common::{ProxyPacketConn, ReplayWindow};
 use meow_tunnel::udp::DEFAULT_UDP_IDLE;
-use meow_tunnel::{MatchedRule, TunnelInner};
+use meow_tunnel::{MatchedRule, TunnelInner, UsingProxy};
 use shadowsocks::context::SharedContext;
 use shadowsocks::relay::udprelay::options::UdpSocketControlData;
 use shadowsocks::relay::udprelay::proxy_socket::ProxySocketError;
@@ -1138,9 +1164,7 @@ async fn run_ss_udp_flow<S>(
     // UDP keeps the eager pre_resolve (no lazy enrichment): the writer
     // needs a resolved dst_ip regardless of what the rules demand.
     inner.pre_resolve(&mut metadata).await;
-    if metadata.dst_ip.is_none() && !metadata.host.is_empty() {
-        metadata.dst_ip = inner.resolver().resolve_ip_real(&metadata.host).await;
-    }
+    inner.resolve_udp_dst(&mut metadata).await;
     let Some(dst_ip) = metadata.dst_ip else {
         debug!(
             "ss udp flow: dst_ip not resolved for {}",
@@ -1176,7 +1200,7 @@ async fn run_ss_udp_flow<S>(
             "UDP {peer} --> {} match {} using {}",
             metadata.remote_address(),
             MatchedRule::new(&rule_name, &rule_payload, proxy.name()),
-            proxy.name()
+            UsingProxy::new(proxy.as_ref(), &metadata)
         );
         match inner.dial_udp(proxy.as_ref(), &metadata).await {
             Ok(conn) => Arc::from(conn),
@@ -1261,37 +1285,66 @@ async fn run_ss_udp_flow<S>(
     // are being pumped".
     let _ = established.set(Arc::clone(&conn));
 
-    // Writer loop: drain the queue in FIFO order until the flow is evicted
-    // (all senders gone), the upstream write fails, or the reply pump dies
-    // (one-way conn — re-dial on next datagram, issue #514).
-    loop {
-        tokio::select! {
-            queued = rx.recv() => match queued {
-                Some(payload) => {
-                    if let Err(e) = conn.write_packet(&payload, &dst_addr).await {
-                        debug!("ss udp flow to {dst_addr}: upstream write: {e}");
-                        return;
-                    }
-                    last_activity_ms
-                        .store(monotonic_ms() as Uint, std::sync::atomic::Ordering::Relaxed);
+    // Select on the whole writer future so a pending write_packet is
+    // cancelled when flush or reply-pump failure fires. Any payloads still
+    // queued in `rx` are discarded with the flow; SS UDP callers retry on
+    // the next datagram. Pattern mirrors the socks5_udp writer (PR #893).
+    let writer = async {
+        loop {
+            match rx.recv().await {
+                None => {
+                    // All senders dropped — flow evicted from the NAT table.
+                    debug!("ss udp flow to {dst_addr}: sender queue closed; flow evicted");
+                    break;
                 }
-                None => return, // all senders dropped — flow evicted
-            },
-            done = &mut reply_task => {
-                let reason = match done {
-                    Ok(()) => "reply pump exited".to_string(),
-                    Err(e) => format!("reply pump task: {e}"),
-                };
-                debug!("ss udp flow to {dst_addr}: {reason}; next datagram re-dials");
-                return;
-            }
-            () = flush.flushed() => {
-                debug!("ss udp flow to {dst_addr}: outbound sessions flushed; next datagram re-dials");
-                let _ = conn.close();
-                return;
+                Some(payload) => match conn.write_packet(&payload, &dst_addr).await {
+                    Ok(n) if n == payload.len() => {
+                        last_activity_ms
+                            .store(monotonic_ms() as Uint, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Ok(n) => {
+                        // Short writes are not expected from any current
+                        // ProxyPacketConn implementation (datagram
+                        // semantics: the frame is either accepted whole or
+                        // rejected), but the trait contract allows it.
+                        // Retire the flow; the next datagram re-dials.
+                        debug!(
+                            "ss udp flow to {dst_addr}: short upstream write {n}/{}; next datagram re-dials",
+                            payload.len()
+                        );
+                        break;
+                    }
+                    Err(e) => {
+                        debug!("ss udp flow to {dst_addr}: upstream write: {e}; next datagram re-dials");
+                        break;
+                    }
+                },
             }
         }
+    };
+    // No `biased;`: flush and reply_task failures are equally urgent and
+    // neither should starve the other. The writer arm completes naturally
+    // once the queue drains or a write error/short-write retires it.
+    tokio::select! {
+        () = flush.flushed() => {
+            debug!("ss udp flow to {dst_addr}: outbound sessions flushed; next datagram re-dials");
+        }
+        done = &mut reply_task => {
+            let reason = match done {
+                Ok(()) => "reply pump exited".to_string(),
+                Err(e) => format!("reply pump task: {e}"),
+            };
+            debug!("ss udp flow to {dst_addr}: {reason}; next datagram re-dials");
+        }
+        () = writer => {}
     }
+    // Close the conn regardless of which arm fired. If the writer arm was
+    // cancelled mid-write, stream-framed conns (snell, vless, trojan, …)
+    // have already set their `poisoned` flag via `PoisonOnIncomplete`, so
+    // subsequent reads from the reply task fail fast; `close` then tears
+    // down the socket. `_reply_guard` (AbortOnDrop) aborts the reply task
+    // after this point.
+    let _ = conn.close();
 }
 
 #[cfg(test)]

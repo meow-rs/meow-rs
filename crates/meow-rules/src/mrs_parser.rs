@@ -43,7 +43,7 @@
 //! confirm the parser reverses its own encoder.
 
 use std::io::{Cursor, Read};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 pub const MRS_MAGIC: [u8; 4] = *b"MRS!";
 pub const MRS_VERSION: u8 = 1;
@@ -56,8 +56,11 @@ pub const TYPE_CLASSICAL: u8 = 2;
 
 #[derive(Debug, thiserror::Error)]
 pub enum MrsError {
-    #[error("mrs: wrong format (not an mrs file — first 4 bytes are not 'MRS!')")]
-    WrongFormat,
+    /// The first bytes are not the magic the site was parsing for — named
+    /// because the geosite frame (`MRS!`) and the upstream rule-provider
+    /// frame (`MRS\x01`) differ and "wrong format" alone misleads.
+    #[error("mrs: wrong format (not an mrs file — first 4 bytes are not {0})")]
+    WrongFormat(&'static str),
     #[error("mrs: unsupported version {0} (expected 1)")]
     UnsupportedVersion(u8),
     #[error("mrs: unsupported type {0}")]
@@ -98,10 +101,10 @@ pub struct MrsHeader {
 /// call `decompress_payload()` on the returned slice.
 pub fn parse_header(data: &[u8]) -> Result<(MrsHeader, &[u8]), MrsError> {
     if data.len() < 4 {
-        return Err(MrsError::WrongFormat);
+        return Err(MrsError::WrongFormat("'MRS!'"));
     }
     if data[..4] != MRS_MAGIC {
-        return Err(MrsError::WrongFormat);
+        return Err(MrsError::WrongFormat("'MRS!'"));
     }
     // magic(4) + version(1) + type(1) + count(4) = 10 bytes
     if data.len() < 10 {
@@ -382,12 +385,17 @@ pub struct UpstreamRuleSetPayload {
 
 /// Materialise every entry of an upstream `.mrs` payload as text. Kept for
 /// tests and tooling; the rule-set loader streams through
-/// [`UpstreamRuleSetReader`] instead so no per-entry `String` list is built.
+/// [`UpstreamRuleSetReader`] instead so no per-entry `String` list is
+/// built. The skipped-non-UTF-8 count that
+/// [`UpstreamRuleSetReader::for_each_domain`] reports is discarded — a
+/// caller that wants it should stream through the reader directly.
 pub fn parse_upstream_ruleset_mrs(bytes: &[u8]) -> Result<UpstreamRuleSetPayload, MrsError> {
     let reader = UpstreamRuleSetReader::open(bytes)?;
     let mut entries = Vec::new();
     match reader.behavior() {
-        TYPE_DOMAIN => reader.for_each_domain(|d| entries.push(d.to_string()))?,
+        TYPE_DOMAIN => {
+            reader.for_each_domain(|d| entries.push(d.to_string()))?;
+        }
         TYPE_IPCIDR => reader.for_each_net(|net| entries.push(net.to_string()))?,
         other => return Err(MrsError::InvalidBehavior(other)),
     }
@@ -413,7 +421,7 @@ impl UpstreamRuleSetReader {
         let mut r = ByteReader::new(&decompressed);
         let magic = r.read_array::<4>("upstream_magic")?;
         if magic != UPSTREAM_MRS_MAGIC {
-            return Err(MrsError::WrongFormat);
+            return Err(MrsError::WrongFormat("'MRS\\x01'"));
         }
 
         let behavior = r.read_u8("behavior")?;
@@ -456,8 +464,11 @@ impl UpstreamRuleSetReader {
     }
 
     /// Walk every domain of a `domain` body. Each domain is handed over as
-    /// a borrowed `&str` from one reused buffer.
-    pub fn for_each_domain(&self, mut on_domain: impl FnMut(&str)) -> Result<(), MrsError> {
+    /// a borrowed `&str` from one reused buffer. Returns the number of
+    /// stored keys skipped for not being valid UTF-8 — a corrupt set can
+    /// carry bytes no domain could be, and a silent drop would make the
+    /// walk yield fewer entries than the file declares.
+    pub fn for_each_domain(&self, mut on_domain: impl FnMut(&str)) -> Result<usize, MrsError> {
         if self.behavior != TYPE_DOMAIN {
             return Err(MrsError::InvalidBehavior(self.behavior));
         }
@@ -483,8 +494,8 @@ impl UpstreamRuleSetReader {
         for _ in 0..len {
             let from = r.read_array::<16>("ipcidr_from")?;
             let to = r.read_array::<16>("ipcidr_to")?;
-            let from = IpAddr::from(Ipv6Addr::from(from));
-            let to = IpAddr::from(Ipv6Addr::from(to));
+            let from = Ipv6Addr::from(from);
+            let to = Ipv6Addr::from(to);
             push_range_prefixes(from, to, &mut |net| {
                 emitted += 1;
                 on_net(net);
@@ -501,7 +512,12 @@ impl UpstreamRuleSetReader {
 
 /// Decode a succinct domain set, calling `on_domain` once per domain
 /// (forward byte order, reused buffer).
-fn walk_upstream_domain_set(data: &[u8], on_domain: &mut dyn FnMut(&str)) -> Result<(), MrsError> {
+/// Returns the number of keys skipped for not being valid UTF-8 (see
+/// [`UpstreamRuleSetReader::for_each_domain`]).
+fn walk_upstream_domain_set(
+    data: &[u8],
+    on_domain: &mut dyn FnMut(&str),
+) -> Result<usize, MrsError> {
     let mut r = ByteReader::new(data);
     let version = r.read_u8("domain_set_version")?;
     if version != 1 {
@@ -519,9 +535,8 @@ fn walk_upstream_domain_set(data: &[u8], on_domain: &mut dyn FnMut(&str)) -> Res
 
     // A well-formed trie has exactly one terminator bit per node and every
     // non-root node owns one incoming label edge, so #ones <= labels + 1.
-    // Enforce the correlation *before* DomainSetIndex materializes one `usize`
-    // per set bit — a mostly-ones bitmap would otherwise amplify the input
-    // ~64x into memory (issue #513).
+    // A bitmap that breaks the correlation is a malformed trie: reject it
+    // before the walk (issue #513).
     let node_count: usize = label_bitmap
         .iter()
         .map(|word| word.count_ones() as usize)
@@ -541,6 +556,7 @@ fn walk_upstream_domain_set(data: &[u8], on_domain: &mut dyn FnMut(&str)) -> Res
     };
     let mut current = Vec::new();
     let mut forward = String::new();
+    let mut skipped = 0usize;
     traversal.traverse(0, 0, &mut current, &mut |reversed: &[u8]| {
         forward.clear();
         // Internal keys are reversed domain bytes; a trailing '+' byte is
@@ -564,12 +580,17 @@ fn walk_upstream_domain_set(data: &[u8], on_domain: &mut dyn FnMut(&str)) -> Res
         // validate UTF-8 on the stored key, then reverse `char`s.
         // Byte-reversing a multi-byte UTF-8 label produces invalid UTF-8,
         // which is exactly why non-ASCII (IDN) entries were silently
-        // dropped here by `.ok()`.
+        // dropped here by `.ok()`. A key that still fails validation is
+        // corrupt, not non-ASCII — count it so callers can surface the
+        // shortfall instead of dropping it silently.
         if let Ok(key) = std::str::from_utf8(stored) {
             forward.extend(key.chars().rev());
             on_domain(&forward);
+        } else {
+            skipped += 1;
         }
-    })
+    })?;
+    Ok(skipped)
 }
 
 #[cfg(test)]
@@ -674,7 +695,10 @@ impl DomainSetTraversal<'_> {
                 self.labels
                     .get(label_idx)
                     .copied()
-                    .zip(self.label_index.select_one(next_node_id.saturating_sub(1)))
+                    .zip(
+                        self.label_index
+                            .select_one(self.label_bitmap, next_node_id.saturating_sub(1)),
+                    )
                     .map(|(label, prev_terminator)| (label, next_node_id, prev_terminator + 1))
             };
             let Some((label, next_node_id, next_bm_idx)) = child else {
@@ -709,31 +733,23 @@ impl DomainSetTraversal<'_> {
     }
 }
 
+/// Rank over the label bitmap: ones before each word. `select` binary-
+/// searches it instead of keeping one `usize` per set bit — on a large
+/// upstream set (~1M nodes) that table alone was the load's peak.
 struct DomainSetIndex {
     rank_ones_by_word: Vec<usize>,
-    select_ones: Vec<usize>,
 }
 
 impl DomainSetIndex {
     fn new(bits: &[u64]) -> Self {
         let mut rank_ones_by_word = Vec::with_capacity(bits.len() + 1);
-        let mut select_ones = Vec::new();
         let mut seen_ones = 0usize;
-        for (word_idx, word) in bits.iter().copied().enumerate() {
+        for word in bits {
             rank_ones_by_word.push(seen_ones);
-            let mut remaining = word;
-            while remaining != 0 {
-                let bit = remaining.trailing_zeros() as usize;
-                select_ones.push(word_idx * 64 + bit);
-                remaining &= remaining - 1;
-            }
             seen_ones += word.count_ones() as usize;
         }
         rank_ones_by_word.push(seen_ones);
-        Self {
-            rank_ones_by_word,
-            select_ones,
-        }
+        Self { rank_ones_by_word }
     }
 
     fn count_zeros(&self, bits: &[u64], upto: usize) -> usize {
@@ -751,8 +767,19 @@ impl DomainSetIndex {
         upto - ones
     }
 
-    fn select_one(&self, nth: usize) -> Option<usize> {
-        self.select_ones.get(nth).copied()
+    /// Bit index of the `nth` (0-based) set bit.
+    fn select_one(&self, bits: &[u64], nth: usize) -> Option<usize> {
+        debug_assert_eq!(bits.len() + 1, self.rank_ones_by_word.len());
+        // Last word whose preceding-ones count is <= nth.
+        let word = self
+            .rank_ones_by_word
+            .partition_point(|&ones| ones <= nth)
+            .checked_sub(1)?;
+        let mut remaining = *bits.get(word)?;
+        for _ in 0..nth - self.rank_ones_by_word[word] {
+            remaining &= remaining.wrapping_sub(1);
+        }
+        (remaining != 0).then(|| word * 64 + remaining.trailing_zeros() as usize)
     }
 }
 
@@ -761,19 +788,16 @@ fn get_bit(bits: &[u64], idx: usize) -> bool {
         .is_some_and(|word| (word & (1u64 << (idx % 64))) != 0)
 }
 
-fn push_range_prefixes(from: IpAddr, to: IpAddr, out: &mut dyn FnMut(ipnet::IpNet)) {
-    match (from, to) {
-        (IpAddr::V4(a), IpAddr::V4(b)) => push_v4_range(a, b, out),
-        (IpAddr::V6(a), IpAddr::V6(b))
-            if a.to_ipv4_mapped().is_some() && b.to_ipv4_mapped().is_some() =>
-        {
-            push_v4_range(
-                a.to_ipv4_mapped().unwrap(),
-                b.to_ipv4_mapped().unwrap(),
-                out,
-            );
-        }
-        (IpAddr::V6(a), IpAddr::V6(b)) => push_v6_range(a, b, out),
+/// `from`/`to` arrive as the 16-byte wire form, i.e. always `Ipv6Addr` —
+/// v4 ranges travel v4-mapped (upstream `ReadIpCidrSet` stores the same
+/// shape). A mapped pair un-maps into a v4 walk; a genuinely v6 pair
+/// walks v6. A mixed pair — or `from > to`, which the range walkers
+/// silently no-op — describes no real CIDR and drops the record, as
+/// upstream's invalid `netipx.IPRange` likewise emits no prefixes.
+fn push_range_prefixes(from: Ipv6Addr, to: Ipv6Addr, out: &mut dyn FnMut(ipnet::IpNet)) {
+    match (from.to_ipv4_mapped(), to.to_ipv4_mapped()) {
+        (Some(a), Some(b)) => push_v4_range(a, b, out),
+        (None, None) => push_v6_range(from, to, out),
         _ => {}
     }
 }
@@ -821,7 +845,7 @@ fn push_v6_range(from: Ipv6Addr, to: Ipv6Addr, out: &mut dyn FnMut(ipnet::IpNet)
             out(ipnet::IpNet::V6(net));
         }
         let step = 1u128 << block_bits;
-        if end - start + 1 == step {
+        if remaining == step {
             break;
         }
         start = start.saturating_add(step);
@@ -1161,7 +1185,7 @@ mod tests {
     fn mrs_wrong_format_rejected() {
         let bytes = b"NOTMRS...";
         match parse_header(bytes) {
-            Err(MrsError::WrongFormat) => {}
+            Err(MrsError::WrongFormat(_)) => {}
             other => panic!("expected WrongFormat, got {other:?}"),
         }
     }
@@ -1380,8 +1404,37 @@ mod tests {
         assert_eq!(parsed.entries.len(), n);
     }
 
-    /// A mostly-ones bitmap makes `DomainSetIndex` allocate one `usize` per
-    /// set bit — ~64x input amplification. A well-formed trie has one
+    /// `select_one` (rank + in-word scan) agrees with a plain scan.
+    #[test]
+    fn domain_set_select_matches_a_scan() {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let bits: Vec<u64> = (0..40)
+            .map(|i| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                match i % 5 {
+                    0 => 0,
+                    1 => u64::MAX,
+                    _ => x,
+                }
+            })
+            .collect();
+        let ones: Vec<usize> = (0..bits.len() * 64)
+            .filter(|&i| bits[i / 64] >> (i % 64) & 1 == 1)
+            .collect();
+        let index = DomainSetIndex::new(&bits);
+        for (nth, &want) in ones.iter().enumerate() {
+            assert_eq!(index.select_one(&bits, nth), Some(want), "nth {nth}");
+        }
+        assert_eq!(index.select_one(&bits, ones.len()), None);
+        assert_eq!(index.select_one(&bits, usize::MAX), None);
+        let empty = DomainSetIndex::new(&[]);
+        assert_eq!(empty.select_one(&[], 0), None);
+    }
+
+    /// A mostly-ones bitmap once made `DomainSetIndex` allocate one `usize`
+    /// per set bit — ~64x input amplification; the bound still stands. A well-formed trie has one
     /// terminator per node and one incoming label edge per non-root node, so
     /// #ones <= labels + 1 is rejected before the index is built.
     #[test]
@@ -1530,6 +1583,28 @@ mod tests {
                 .collect();
             assert_eq!(parsed.entries, expected, "case {}", case.name);
         }
+    }
+
+    // `for_each_domain` counts the non-UTF-8 keys it skips so callers can
+    // surface the shortfall (convert warns; the rule-set loader warns too).
+    #[test]
+    fn upstream_domain_set_non_utf8_keys_are_counted_not_dropped_silently() {
+        let body = encode_domain_set_bytes(&[b"\xff.com", b"ok.com", b"\xfe\xad.org"]);
+        let bytes = encode_upstream_mrs(TYPE_DOMAIN, 3, &body);
+        let reader = UpstreamRuleSetReader::open(&bytes).unwrap();
+        let mut seen = Vec::new();
+        let skipped = reader
+            .for_each_domain(|d| seen.push(d.to_string()))
+            .unwrap();
+        assert_eq!(skipped, 2);
+        assert_eq!(seen, vec!["ok.com".to_string()]);
+
+        let mut seen = Vec::new();
+        let skipped = reader
+            .for_each_domain(|d| seen.push(d.to_string()))
+            .unwrap();
+        assert_eq!(skipped, 2, "repeat walk counts the same skips");
+        assert_eq!(seen, vec!["ok.com".to_string()]);
     }
 
     // A bare `+` key strips to the empty string; `DomainRuleSet::from_entries`

@@ -19,7 +19,8 @@ a `tracing` layer that fans events to connected clients (for logs) and a
 periodic memory poll (for memory). G-7, G-8, G-9 are each under 10 LOC.
 
 All five are compatible with the existing `AppState` shape — no new
-crate deps beyond `axum-extra` (WebSocket) and `sysinfo` (RSS), both
+crate deps beyond `axum-extra` (WebSocket) and `sysinfo` (RSS,
+non-Linux only), both
 of which already appear in the Rust ecosystem and are zero-unsafe-code
 wrappers.
 
@@ -122,7 +123,11 @@ connected. Frame format (matches upstream `hub/route/memory.go`):
 | `inuse` | integer | Current RSS (resident set size) in bytes |
 | `oslimit` | integer | OS memory limit for the process in bytes; `0` if not determinable |
 
-**RSS source:** use the `sysinfo` crate (cross-platform, no unsafe):
+**RSS source:** platform-split. On Linux, read `VmRSS:` from
+`/proc/self/status` — the same kernel counter `sysinfo` reports — so the
+shipped Linux binary carries no `sysinfo` dep at all. On non-Linux
+platforms, use the `sysinfo` crate (cross-platform, no unsafe); the
+example below applies to that path only:
 
 ```rust
 use sysinfo::{Pid, Process, System};
@@ -133,10 +138,13 @@ let rss = sys.process(Pid::from_u32(std::process::id()))
     .unwrap_or(0);
 ```
 
-`sysinfo` refresh is called once per tick inside the per-connection
-task — no shared `System` instance (avoids locking across many WS
-connections). The overhead of creating a `System` per connection per
-second is negligible; optimize only if profiling shows cost.
+The RSS read runs in a single shared sampler task, not per connection:
+the first `/memory` subscriber spawns it, it reads RSS once per second —
+one `/proc/self/status` read on Linux, a fresh `System` on non-Linux —
+and broadcasts the frame to every connected socket; when the last socket
+disconnects, the sampler exits and cleans up after itself. The total cost
+is one read per second no matter how many WS connections are open;
+optimize only if profiling shows cost.
 
 `oslimit`: On Linux, read `/proc/self/cgroup` or `rlimit(RLIMIT_RSS)`.
 On other platforms, return `0`. A helper `fn process_memory_limit() ->
@@ -508,7 +516,10 @@ api.merge(ws_routes).merge(ui).layer(CorsLayer::permissive()).with_state(state)
 **`meow-api/Cargo.toml`:**
 
 ```toml
-sysinfo = "0.32"    # RSS polling; cross-platform; per-crate (only used here)
+# RSS polling; per-crate (only used here). Non-Linux targets only —
+# Linux reads VmRSS from /proc/self/status and ships no sysinfo dep.
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 # No chrono — use time 0.3.x which is already in the dep graph via hickory-server.
 # Enable the formatting feature for RFC3339 timestamp formatting.
 time = { version = "0.3", features = ["formatting"] }
@@ -540,7 +551,7 @@ sufficient and avoids a duplicate dep.
 | 1 | No historical log ring-buffer on connect | B | Upstream buffers recent events; we stream forward-only. Clients see new events immediately; dashboard just starts from "now". Add ring-buffer in M2 if user-requested. |
 | 2 | `POST /dns/query` kept alongside new `GET /dns/query` | B | Back-compat; our POST was the first impl. No routing change. |
 | 3 | `TRACE` level collapsed to `"debug"` in JSON `type` field | B | Upstream does not expose TRACE to dashboard clients. Matches upstream output. |
-| 4 | `sysinfo` for RSS vs upstream's `runtime.ReadMemStats` (Go) | B | Different language, different API. RSS is the equivalent observable: total resident memory. `oslimit` = 0 on non-Linux is acceptable. |
+| 4 | Platform RSS read (Linux: `/proc/self/status` `VmRSS:`; `sysinfo` elsewhere) vs upstream's `runtime.ReadMemStats` (Go) | B | Different language, different API. RSS is the equivalent observable: total resident memory. `oslimit` = 0 on non-Linux is acceptable. |
 | 5 | Broadcast layer upstream of `EnvFilter` (sees all events ≥ DEBUG regardless of `RUST_LOG`) | B | Dashboard `?level=info` works without needing `RUST_LOG=info`. Upstream may respect env filter first — not confirmed. User hostile to require env-var cooperation to see dashboard logs. |
 | 6 | WS auth accepts `?token=` query param (REST does not) | B | Browser WebSocket API cannot set headers; upstream Go mihomo accepts `?token=`. REST-only paths keep header-only auth to avoid tokens in access logs. |
 
@@ -624,7 +635,9 @@ sufficient and avoids a duplicate dep.
 ## Implementation checklist (for engineer handoff)
 
 - [ ] Confirm `axum` workspace dep has `features = ["ws"]`; add if missing.
-- [ ] Add `sysinfo = "0.32"` to `meow-api/Cargo.toml` (per-crate, not workspace).
+- [ ] Add `sysinfo` to `meow-api/Cargo.toml` under
+      `[target.'cfg(not(target_os = "linux"))'.dependencies]` (per-crate,
+      not workspace; Linux reads `/proc/self/status` instead).
 - [ ] Enable `features = ["formatting"]` on `time` in workspace deps
       (already in graph via hickory-server); reference as
       `time = { workspace = true }` in `meow-api/Cargo.toml`.
@@ -669,7 +682,9 @@ sufficient and avoids a duplicate dep.
    lag frames > 1/subscriber/minute, bump to 512.
 
 2. **`sysinfo` per-crate** — correct. Not workspace-level; only
-   `meow-api` uses it. If a second crate ever needs it, promote then.
+   `meow-api` uses it, and only on non-Linux targets (Linux reads
+   `VmRSS` from `/proc/self/status`). If a second crate ever needs it,
+   promote then.
 
 3. **Use `time`, not `chrono`** — `time 0.3.x` is already in the dep
    graph via `hickory-server`. Enable `features = ["formatting"]` on

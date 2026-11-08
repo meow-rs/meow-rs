@@ -194,6 +194,12 @@ Note: policy nameservers and global nameservers both pass through
 fallback-filter. A domain-pattern gate in fallback-filter bypasses
 steps 3 and 4 (skips primary entirely) and goes straight to step 5.
 
+Divergence note: upstream `ipExchange` treats a policy match as terminal —
+it returns before the domain gate and the IP filter. meow's default tiers
+defer to `fallback-filter` even on a policy match (the flow above);
+`nameserver-policy-exclusive: true` restores the upstream order for
+matched domains.
+
 ### NameserverPolicy struct
 
 ```rust

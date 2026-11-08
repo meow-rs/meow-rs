@@ -6,8 +6,9 @@
 //! for this: `android.net.VpnService.protect(int fd)`. This module is the
 //! single place the JNI bridge installs that hook; the proxy adapters that
 //! open outbound sockets dial through [`connect_tcp`] / [`connect_tcp_host`]
-//! / [`bind_udp`], which call the installed protector before `connect()` /
-//! `bind()` so the very first SYN / UDP packet already bypasses the tunnel.
+//! / [`bind_udp`] / [`bind_udp_for_peer`], which call the installed
+//! protector before `connect()` / `bind()` so the very first SYN / UDP
+//! packet already bypasses the tunnel.
 //!
 //! ## Why the second hook (`HostResolver`)
 //!
@@ -325,8 +326,8 @@ pub use android::{
 
 /// Dial an outbound TCP stream to an already-resolved [`SocketAddr`]. On
 /// Android, applies the installed `SocketProtector` (if any) to the
-/// socket fd before `connect()` so the connection bypasses the VPN. On
-/// every other target this is equivalent to [`TcpStream::connect`].
+/// socket fd before `connect()` so the connection bypasses the VPN.
+/// Desktop targets apply the installed outbound-interface policy.
 ///
 /// Callers that only have a hostname must use [`connect_tcp_host`] —
 /// passing a hostname here is a compile error by construction (the type
@@ -366,7 +367,7 @@ pub(crate) async fn connect_tcp_iface_bound(addr: SocketAddr) -> io::Result<TcpS
         socket2::Domain::IPV6
     };
     let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
-    crate::outbound_iface::apply_outbound_interface(&socket, domain)?;
+    crate::outbound_iface::apply_outbound_interface_for_peer(&socket, domain, addr.ip())?;
     socket.set_nonblocking(true)?;
     let tokio_socket = tokio::net::TcpSocket::from_std_stream(socket.into());
     tokio_socket.connect(addr).await
@@ -520,10 +521,50 @@ pub async fn resolve_host_all(host: &str, port: u16) -> io::Result<Vec<SocketAdd
     resolve_addrs(host, port).await
 }
 
-/// Bind an outbound UDP socket. On Android, applies the installed
-/// `SocketProtector` (if any) to the socket fd before `bind()`. On every
-/// other target this is equivalent to [`UdpSocket::bind`].
+/// Bind an outbound UDP socket to `local`. On Android, applies the
+/// installed `SocketProtector` (if any) to the socket fd before `bind()`.
+/// Desktop targets apply the installed outbound-interface binding, which is
+/// decided by the **local** address: only a socket pinned to a loopback
+/// address is left unbound, so a wildcard bind is always bound. Sockets that
+/// know their peer should use [`bind_udp_for_peer`] instead.
 pub async fn bind_udp<A: ToSocketAddrs>(local: A) -> io::Result<UdpSocket> {
+    bind_udp_with_peer(local, None).await
+}
+
+/// Bind an outbound wildcard UDP socket for traffic to `peer`. Like
+/// [`bind_udp`], but the socket's family and the outbound-interface binding
+/// follow the **peer**: a loopback peer is left unbound, so it stays
+/// reachable under global route scope (the binding would make the send fail
+/// with `EADDRNOTAVAIL` / `WSAEADDRNOTAVAIL`).
+///
+/// An IPv4-mapped `peer` gets an IPv4 socket, so the caller must send to /
+/// `connect()` the [`canonical_socket_addr`] of its destination.
+pub async fn bind_udp_for_peer(peer: IpAddr) -> io::Result<UdpSocket> {
+    let peer = peer.to_canonical();
+    let local = match peer {
+        IpAddr::V4(_) => std::net::Ipv4Addr::UNSPECIFIED.into(),
+        IpAddr::V6(_) => std::net::Ipv6Addr::UNSPECIFIED.into(),
+    };
+    bind_udp_with_peer(SocketAddr::new(local, 0), Some(peer)).await
+}
+
+/// `addr` with an IPv4-mapped IPv6 address (`[::ffff:a.b.c.d]:p`) turned
+/// into plain IPv4 (`a.b.c.d:p`), the form a [`bind_udp_for_peer`] socket
+/// can reach. Native IPv6 addresses — scope id and flow info included — and
+/// IPv4 addresses come back unchanged.
+pub fn canonical_socket_addr(mut addr: SocketAddr) -> SocketAddr {
+    // `set_ip` keeps the scope id for a V6 → V6 change and rebuilds the
+    // address only on a family change (mapped → V4, which has no scope).
+    addr.set_ip(addr.ip().to_canonical());
+    addr
+}
+
+async fn bind_udp_with_peer<A: ToSocketAddrs>(
+    local: A,
+    peer: Option<IpAddr>,
+) -> io::Result<UdpSocket> {
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    let _ = peer;
     #[cfg(any(target_os = "android", all(test, unix)))]
     {
         if let Some(p) = android::socket_protector() {
@@ -548,7 +589,7 @@ pub async fn bind_udp<A: ToSocketAddrs>(local: A) -> io::Result<UdpSocket> {
                 .ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidInput, "bind_udp: no address resolved")
                 })?;
-            return bind_udp_iface_bound(resolved);
+            return bind_udp_iface_bound(resolved, peer.unwrap_or(resolved.ip()));
         }
     }
     UdpSocket::bind(local).await
@@ -556,19 +597,16 @@ pub async fn bind_udp<A: ToSocketAddrs>(local: A) -> io::Result<UdpSocket> {
 
 /// Bind a UDP socket to the installed outbound interface
 /// (`SO_BINDTODEVICE` / `IP_BOUND_IF` / `IP_UNICAST_IF`), then to `local`.
-/// A socket pinned to a loopback `local` address is left unbound where the
-/// platform's binding would break it (see `outbound_iface::binds_peer`).
+/// The destination determines whether the interface binding is required.
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-pub(crate) fn bind_udp_iface_bound(local: SocketAddr) -> io::Result<UdpSocket> {
+pub(crate) fn bind_udp_iface_bound(local: SocketAddr, peer: IpAddr) -> io::Result<UdpSocket> {
     let domain = if local.is_ipv4() {
         socket2::Domain::IPV4
     } else {
         socket2::Domain::IPV6
     };
     let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
-    if crate::outbound_iface::binds_peer(local.ip()) {
-        crate::outbound_iface::apply_outbound_interface(&socket, domain)?;
-    }
+    crate::outbound_iface::apply_outbound_interface_for_peer(&socket, domain, peer)?;
     socket.bind(&local.into())?;
     socket.set_nonblocking(true)?;
     UdpSocket::from_std(socket.into())
@@ -889,7 +927,58 @@ mod tests {
         let sock = bind_udp(addr).await.expect("bind");
         assert!(sock.local_addr().unwrap().port() != 0);
         assert_eq!(counter.count(), 1);
+        let peer_sock = bind_udp_for_peer(addr.ip()).await.expect("peer bind");
+        assert!(peer_sock.local_addr().unwrap().port() != 0);
+        assert_eq!(counter.count(), 2);
         clear_socket_protector();
+    }
+
+    #[tokio::test]
+    async fn bind_udp_for_peer_follows_the_canonical_peer_family() {
+        // Under LOCK: another test's protector must not count these binds.
+        let _g = LOCK.lock().await;
+        for (peer, v4) in [
+            ("127.0.0.1", true),
+            ("192.0.2.1", true),
+            ("::ffff:127.0.0.1", true),
+            ("::ffff:192.0.2.1", true),
+            ("::1", false),
+            ("fe80::1", false),
+            ("2001:db8::1", false),
+        ] {
+            let sock = bind_udp_for_peer(peer.parse().unwrap())
+                .await
+                .expect("peer bind");
+            let local = sock.local_addr().unwrap();
+            assert_eq!(local.is_ipv4(), v4, "{peer}");
+            assert!(local.ip().is_unspecified(), "{peer}: wildcard bind");
+        }
+    }
+
+    #[test]
+    fn canonical_socket_addr_unmaps_ipv4_and_keeps_ipv6_scope() {
+        let cases = [
+            ("[::ffff:127.0.0.1]:53", "127.0.0.1:53"),
+            ("[::ffff:192.0.2.1]:443", "192.0.2.1:443"),
+            ("192.0.2.1:80", "192.0.2.1:80"),
+            ("[::1]:53", "[::1]:53"),
+            ("[2001:db8::1]:443", "[2001:db8::1]:443"),
+        ];
+        for (input, want) in cases {
+            let input: SocketAddr = input.parse().unwrap();
+            assert_eq!(canonical_socket_addr(input), want.parse().unwrap());
+        }
+        // A link-local peer's scope id (and flow info) survive.
+        let scoped = SocketAddr::V6(std::net::SocketAddrV6::new(
+            "fe80::1".parse().unwrap(),
+            5353,
+            7,
+            3,
+        ));
+        let SocketAddr::V6(out) = canonical_socket_addr(scoped) else {
+            panic!("family changed");
+        };
+        assert_eq!((out.scope_id(), out.flowinfo(), out.port()), (3, 7, 5353));
     }
 
     #[tokio::test]

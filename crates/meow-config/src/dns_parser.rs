@@ -8,7 +8,7 @@ use meow_dns::resolver::{
 };
 use meow_dns::upstream::{NameServerEntry, NameServerUrl};
 use meow_dns::{DnsClient, HostOrIp, Resolver};
-use meow_rules::{RuleSet, RuleSetBehavior};
+use meow_rules::{DomainKeyDefect, RuleSet, RuleSetBehavior};
 use meow_trie::DomainTrie;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -67,12 +67,96 @@ pub async fn parse_dns(
     let use_hosts = dns.use_hosts.unwrap_or(true);
     let use_system_hosts = dns.use_system_hosts.unwrap_or(true);
 
-    let main_urls = parse_nameserver_entries(dns.nameserver.as_deref().unwrap_or(&[]))?;
-    let fallback_urls = parse_nameserver_entries(dns.fallback.as_deref().unwrap_or(&[]))?;
-    let default_ns_urls =
-        parse_nameserver_entries(dns.default_nameserver.as_deref().unwrap_or(&[]))?;
-    let proxy_ns_urls =
-        parse_nameserver_entries(dns.proxy_server_nameserver.as_deref().unwrap_or(&[]))?;
+    // mihomo `prefer-h3`: applied to every `https://` entry before parsing,
+    // so an entry that spells its own `?h3=` keeps the last word.
+    let prefer_h3 = dns.prefer_h3.unwrap_or(false);
+    let main_urls = parse_nameserver_entries(&prefer_h3_list(
+        dns.nameserver.as_deref().unwrap_or(&[]),
+        prefer_h3,
+    ))?;
+    let fallback_urls = parse_nameserver_entries(&prefer_h3_list(
+        dns.fallback.as_deref().unwrap_or(&[]),
+        prefer_h3,
+    ))?;
+    let default_ns_urls = parse_nameserver_entries(&prefer_h3_list(
+        dns.default_nameserver.as_deref().unwrap_or(&[]),
+        prefer_h3,
+    ))?;
+    let proxy_ns_urls = parse_nameserver_entries(&prefer_h3_list(
+        dns.proxy_server_nameserver.as_deref().unwrap_or(&[]),
+        prefer_h3,
+    ))?;
+    let direct_ns_urls = parse_nameserver_entries(&prefer_h3_list(
+        dns.direct_nameserver.as_deref().unwrap_or(&[]),
+        prefer_h3,
+    ))?;
+
+    // The same `prefer-h3` rewrite for `nameserver-policy` values, which are
+    // URL strings until the policy builder parses them. Computed *before* the
+    // capability guard below: a policy-only config (`prefer-h3` with every DoH
+    // upstream under `nameserver-policy`) is exactly the case the raw strings
+    // would miss.
+    let effective_policy = dns
+        .nameserver_policy
+        .as_ref()
+        .map(|map| prefer_h3_policy_map(map, prefer_h3));
+
+    // A `prefer-h3` / `?h3=` entry needs a build that can speak QUIC. Reject
+    // the config here — client construction would otherwise panic, which is a
+    // process abort rather than a config error (ADR-0002 Class A).
+    if !cfg!(feature = "dns-quic") {
+        let asks_h3 = |entries: &[NameServerEntry]| {
+            entries.iter().any(
+                |e| matches!(&e.url, meow_dns::NameServerUrl::Https { h3, .. } if h3.is_enabled()),
+            )
+        };
+        // Parse the effective values instead of matching substrings: the
+        // parser trims the `h3` value, so a hand-written list drifts (and a
+        // miss here reaches the panic in `build_single_resolver_with_proxy`).
+        let policy_asks_h3 = effective_policy.as_ref().is_some_and(|map| {
+            map.values().any(|v| {
+                v.as_urls().iter().any(|s| {
+                    NameServerEntry::parse(s).is_ok_and(|e| {
+                        matches!(&e.url, meow_dns::NameServerUrl::Https { h3, .. } if h3.is_enabled())
+                    })
+                })
+            })
+        });
+        if asks_h3(&main_urls)
+            || asks_h3(&fallback_urls)
+            || asks_h3(&default_ns_urls)
+            || asks_h3(&proxy_ns_urls)
+            || asks_h3(&direct_ns_urls)
+            || policy_asks_h3
+        {
+            anyhow::bail!(
+                "dns.prefer-h3 / '?h3=' asks for DNS over HTTP/3, which requires a build \
+                 with the 'dns-quic' feature; this binary was built without it"
+            );
+        }
+    }
+
+    // QUIC needs the peer address before the handshake, so a proxied QUIC
+    // upstream cannot be resolved remotely by the adapter — refuse it at load
+    // rather than hanging every query on an unanswerable handshake.
+    for entry in main_urls
+        .iter()
+        .chain(fallback_urls.iter())
+        .chain(default_ns_urls.iter())
+        .chain(proxy_ns_urls.iter())
+        .chain(direct_ns_urls.iter())
+    {
+        reject_proxied_quic_hostname(entry)?;
+    }
+    if let Some(map) = &effective_policy {
+        for value in map.values() {
+            for url in value.as_urls() {
+                if let Ok(entry) = NameServerEntry::parse(url) {
+                    reject_proxied_quic_hostname(&entry)?;
+                }
+            }
+        }
+    }
 
     let mode = match dns.enhanced_mode.as_deref() {
         Some("fake-ip") => DnsMode::FakeIp,
@@ -138,13 +222,46 @@ pub async fn parse_dns(
     };
 
     // Build nameserver-policy if configured.
-    let policy = if let Some(nsp_map) = &dns.nameserver_policy {
+    let policy = if let Some(nsp_map) = &effective_policy {
         if nsp_map.is_empty() {
             None
         } else {
             let bootstrap_clients = build_policy_bootstrap_clients(&default_ns_urls, &main_urls);
-            Some(
-                build_nameserver_policy(
+            let mut policy = build_nameserver_policy(
+                nsp_map,
+                geosite.as_ref(),
+                &bootstrap_clients,
+                proxy_registry,
+                rule_providers,
+                strict,
+            )
+            .await?;
+            if let Some(exclusive) = dns.nameserver_policy_exclusive {
+                policy = policy.with_exclusive(exclusive);
+            }
+            Some(policy)
+        }
+    } else {
+        None
+    };
+
+    // mihomo `direct-nameserver`: the resolver `DIRECT` outbounds use for
+    // their destination hostnames (dns.Config.DirectServer →
+    // DirectHostResolver). Built like the proxy-server resolver — Normal
+    // mode, no fallback, own hosts trie, bootstrapped via
+    // default-nameserver — except `direct-nameserver-follow-policy` lets it
+    // share the main nameserver-policy (its own copy: policy clients are
+    // owned per resolver).
+    let direct_resolver = if direct_ns_urls.is_empty() {
+        None
+    } else {
+        let direct_policy = match &effective_policy {
+            Some(nsp_map)
+                if !nsp_map.is_empty() && dns.direct_nameserver_follow_policy.unwrap_or(false) =>
+            {
+                let bootstrap_clients =
+                    build_policy_bootstrap_clients(&default_ns_urls, &main_urls);
+                let mut policy = build_nameserver_policy(
                     nsp_map,
                     geosite.as_ref(),
                     &bootstrap_clients,
@@ -152,11 +269,35 @@ pub async fn parse_dns(
                     rule_providers,
                     strict,
                 )
-                .await?,
-            )
+                .await?;
+                if let Some(exclusive) = dns.nameserver_policy_exclusive {
+                    policy = policy.with_exclusive(exclusive);
+                }
+                Some(policy)
+            }
+            _ => None,
+        };
+        let mut direct_hosts = build_hosts_trie(raw.hosts.as_ref(), strict)?;
+        if use_hosts && use_system_hosts {
+            merge_system_hosts(&mut direct_hosts).await;
         }
-    } else {
-        None
+        Some(Arc::new(
+            Resolver::new_with_bootstrap_with_proxies(
+                direct_ns_urls,
+                vec![],
+                default_ns_urls.clone(),
+                DnsMode::Normal,
+                direct_hosts,
+                use_hosts,
+                crate::effective_ipv6(raw.ipv6),
+                direct_policy,
+                None,
+                proxy_registry,
+                crate::is_offline_validate(),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("direct-nameserver: {e}"))?,
+        ))
     };
 
     // Build fallback-filter only when fallback nameservers are configured.
@@ -195,7 +336,10 @@ pub async fn parse_dns(
     // silently fall back to the upstream resolver, which is a user-surprising
     // privacy regression.
     if mode == DnsMode::FakeIp {
-        install_fakeip(&mut resolver, dns, cache_dir, prior).await?;
+        install_fakeip(&mut resolver, dns, cache_dir, prior, strict).await?;
+    }
+    if let Some(direct) = direct_resolver {
+        resolver.set_direct_resolver(direct);
     }
 
     let resolver = Arc::new(resolver);
@@ -213,6 +357,7 @@ async fn install_fakeip(
     dns: &crate::raw::RawDns,
     cache_dir: Option<&std::path::Path>,
     prior: Option<&Resolver>,
+    strict: bool,
 ) -> Result<(), anyhow::Error> {
     let range_str = dns
         .fake_ip_range
@@ -288,6 +433,13 @@ async fn install_fakeip(
 
     // Skipper: fake-ip-filter patterns + optional fake-ip-filter-mode.
     let patterns = dns.fake_ip_filter.clone().unwrap_or_default();
+    for p in &patterns {
+        // Dead trie keys by the same shape as `hosts:` — an empty label
+        // strands an unreachable node, and an all-dots/prefix-only body is
+        // refused by `Skipper`'s own insert (issue #822 shape). Surface
+        // both rather than let the entry sit silently dead.
+        check_domain_key("dns.fake-ip-filter", p, strict)?;
+    }
     let skipper_mode = match dns.fake_ip_filter_mode.as_deref() {
         Some("whitelist") | Some("white-list") => SkipperMode::WhiteList,
         Some("blacklist") | Some("black-list") | None => SkipperMode::BlackList,
@@ -370,6 +522,107 @@ fn is_ip_literal_addr(addr: &str) -> bool {
     let host = host.strip_prefix('[').unwrap_or(host);
     let host = host.strip_suffix(']').unwrap_or(host);
     host.parse::<IpAddr>().is_ok()
+}
+
+/// Refuse a `?proxy=`-tagged QUIC entry whose server is a hostname.
+///
+/// A proxied hostname upstream is resolved by the adapter, so the QUIC peer
+/// address is unknown until after the handshake — but quiche must know it
+/// before, and drops packets from a path it did not dial. The failure mode is
+/// a hung query, so the config is refused instead.
+fn reject_proxied_quic_hostname(entry: &NameServerEntry) -> Result<(), anyhow::Error> {
+    if entry.proxy.is_none() || entry.url.needs_bootstrap().is_none() {
+        return Ok(());
+    }
+    let quic = match &entry.url {
+        meow_dns::NameServerUrl::Quic { .. } => true,
+        meow_dns::NameServerUrl::Https { h3, .. } => h3.is_enabled(),
+        _ => false,
+    };
+    if !quic {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "nameserver '{}': a QUIC upstream (quic:// or ?h3=) dialed through a proxy needs \
+         an IP-literal server address — the QUIC peer must be known before the handshake, \
+         and a proxied hostname is resolved by the adapter. Use the IP, or drop the proxy \
+         tag",
+        entry.url
+    )
+}
+
+/// Append `?h3=prefer` to one nameserver URL when `prefer_h3` is on.
+///
+/// Only `https://` entries are touched, and only when the entry does not
+/// already carry an `h3=` decision of its own — the same "global flag, local
+/// override" rule mihomo applies, expressed **before** parsing so
+/// `nameserver-policy` values (still strings at that point) get it too.
+fn prefer_h3_url(raw: &str, prefer_h3: bool) -> String {
+    if !prefer_h3 {
+        return raw.to_string();
+    }
+    let trimmed = raw.trim();
+    if !trimmed.starts_with("https://") || has_h3_parameter(trimmed) {
+        return raw.to_string();
+    }
+    // Keep the `#sni` fragment last: the parameter section belongs to the
+    // URL, the fragment to meow-rs's SNI override.
+    let (head, fragment) = match trimmed.find('#') {
+        Some(idx) => (&trimmed[..idx], &trimmed[idx..]),
+        None => (trimmed, ""),
+    };
+    // Extend an existing parameter section, or open one.
+    let separator = match head.rfind('?') {
+        Some(idx) if head[idx + 1..].split('&').any(is_param_key_segment) => '&',
+        _ => '?',
+    };
+    format!("{head}{separator}h3=prefer{fragment}")
+}
+
+/// `true` when any `?` section of `url` already sets an `h3` key.
+fn has_h3_parameter(url: &str) -> bool {
+    url.split('?')
+        .skip(1)
+        .flat_map(|section| section.split('&'))
+        .filter_map(|kv| kv.split_once('='))
+        .any(|(k, _)| k.trim().eq_ignore_ascii_case("h3"))
+}
+
+/// A `k=v` segment names a nameserver parameter key (`proxy` / `h3`).
+fn is_param_key_segment(kv: &str) -> bool {
+    kv.split_once('=').is_some_and(|(k, _)| {
+        let k = k.trim();
+        k.eq_ignore_ascii_case("proxy") || k.eq_ignore_ascii_case("h3")
+    })
+}
+
+fn prefer_h3_list(servers: &[String], prefer_h3: bool) -> Vec<String> {
+    servers
+        .iter()
+        .map(|s| prefer_h3_url(s, prefer_h3))
+        .collect()
+}
+
+fn prefer_h3_policy_map(
+    map: &crate::raw::RawNameserverPolicy,
+    prefer_h3: bool,
+) -> crate::raw::RawNameserverPolicy {
+    if !prefer_h3 {
+        return map.clone();
+    }
+    map.iter()
+        .map(|(key, value)| {
+            let value = match value {
+                crate::raw::RawNspValue::One(s) => {
+                    crate::raw::RawNspValue::One(prefer_h3_url(s, true))
+                }
+                crate::raw::RawNspValue::Many(list) => crate::raw::RawNspValue::Many(
+                    list.iter().map(|s| prefer_h3_url(s, true)).collect(),
+                ),
+            };
+            (key.clone(), value)
+        })
+        .collect()
 }
 
 /// Parse nameserver strings into `NameServerEntry`s — every entry must
@@ -567,6 +820,11 @@ async fn build_nameserver_policy(
             // rest (`+.`), and a mid-string `*` (e.g. `a.*.b`) is a literal
             // label only an identical query matches (DR-B F4/F15 unchanged).
             if !key_lower.is_empty() {
+                // As in `hosts:` — the arm still gets the pattern (its
+                // node is simply unreachable, or refused outright); the
+                // warn only surfaces the dead key. Strict mirrors the
+                // prefixed-key rule.
+                check_domain_key("nameserver-policy", &expanded_key, strict)?;
                 patterns.push(PolicyPattern::Domain(key_lower));
             }
         }
@@ -851,12 +1109,25 @@ async fn resolve_policy_hostname_url(
             port,
             path,
             sni,
+            h3,
         } => resolve_policy_host(key, url_str, &host, bootstrap_clients)
             .await
             .map(|ip| NameServerUrl::Https {
                 addr: HostOrIp::Ip(ip),
                 port,
                 path,
+                sni,
+                h3,
+            }),
+        NameServerUrl::Quic {
+            addr: HostOrIp::Host(host),
+            port,
+            sni,
+        } => resolve_policy_host(key, url_str, &host, bootstrap_clients)
+            .await
+            .map(|ip| NameServerUrl::Quic {
+                addr: HostOrIp::Ip(ip),
+                port,
                 sni,
             }),
         other => Some(other),
@@ -961,7 +1232,24 @@ fn build_fallback_filter(
 
     let mut domain: DomainTrie<()> = DomainTrie::new();
     for s in domain_strs {
-        domain.insert(s, ());
+        // Same dead-key shapes as `hosts:` — an empty label inserts but
+        // can never match a query name, and an all-dots/prefix-only body
+        // (`"."`, `"+."`) is refused by the insert below; surface both
+        // rather than swallow them (issue #822 shape).
+        check_domain_key("fallback-filter.domain", s, strict)?;
+        if !domain.insert(s, ()) {
+            // Unreachable for a config key today — every refused shape is
+            // `DomainKeyDefect::NotInsertable` and already surfaced by
+            // `check_domain_key` — kept as the insert's own verdict should
+            // the trie's refusal set ever grow past the predicate.
+            if strict {
+                return Err(anyhow::anyhow!(
+                    "fallback-filter.domain: '{s}' is not a valid domain pattern \
+                     (strict mode)"
+                ));
+            }
+            warn!("fallback-filter.domain: failed to insert '{s}' into trie");
+        }
     }
 
     // Attempt to load GeoIP MMDB for the geoip gate.
@@ -1012,16 +1300,19 @@ fn build_fallback_filter(
 /// slot — `sub.x` still resolves through `+.x`'s Dot slot.
 ///
 /// Known pre-existing validation divergences from mihomo, kept as-is: a key
-/// with a trailing dot (`x.com.`) or an empty mid-label (`a..b`) is accepted
-/// into a trie slot no query can reach (silently dead, even under `strict:`),
-/// where mihomo's `ValidAndSplitDomain` would reject it; whitespace-padded
-/// keys are trimmed and accepted where mihomo rejects; a mid-path `*`
-/// segment (`sub.*.x`) is stored as a literal label where mihomo treats it
-/// as a wildcard; an alias value trims only trailing dots where mihomo
-/// trims both ends (`.foo.com` differs); and mihomo seeds an implicit
-/// `localhost → 127.0.0.1` and accepts the `lan` magic value
-/// (interface addresses), neither of which exists here — `hosts: {x: lan}`
-/// is a hard error.
+/// with a trailing dot (`x.com.`) is accepted and normalized onto the same
+/// live slot as `x.com` where mihomo's `ValidAndSplitDomain` rejects it;
+/// an empty mid-label (`a..b`) or an all-dots/prefix-only key (`"."`,
+/// `"+."`) is likewise accepted into a slot no query can reach — or no
+/// slot at all — where mihomo rejects it, but both are now surfaced as a
+/// warn in lenient mode and an error under `strict:` rather than sitting
+/// silently dead; whitespace-padded keys are trimmed and accepted where
+/// mihomo rejects; a mid-path `*` segment (`sub.*.x`) is stored as a
+/// literal label where mihomo treats it as a wildcard; an alias value
+/// trims only trailing dots where mihomo trims both ends (`.foo.com`
+/// differs); and mihomo seeds an implicit `localhost → 127.0.0.1` and
+/// accepts the `lan` magic value (interface addresses), neither of which
+/// exists here — `hosts: {x: lan}` is a hard error.
 fn build_hosts_trie(
     hosts: Option<&RawHosts>,
     strict: bool,
@@ -1069,7 +1360,15 @@ fn build_hosts_trie(
         };
         // Keys go in as written: `*.foo` is a single-label wildcard, `+.foo`
         // covers the apex plus any-depth subdomains, a bare key is exact.
-        if !trie.insert_overwrite(host.trim(), host_entry) {
+        let key = host.trim();
+        // An empty label strands a node no query can reach (queries never
+        // carry one); an all-dots/prefix-only body is refused by the insert
+        // below — both surfaced, never silently dead (issue #822 shape).
+        check_domain_key("hosts", key, strict)?;
+        if !trie.insert_overwrite(key, host_entry) {
+            // As at `fallback-filter.domain`: unreachable for a config key
+            // today — `DomainKeyDefect::NotInsertable` covers every refused
+            // shape — kept as the insert's own verdict.
             if strict {
                 return Err(anyhow::anyhow!(
                     "hosts: '{}' is not a valid domain pattern (strict mode)",
@@ -1081,6 +1380,30 @@ fn build_hosts_trie(
     }
     reject_host_alias_cycles(&trie, &aliases)?;
     Ok(trie)
+}
+
+/// Surface a dead domain key on a `DomainTrie`-backed config surface:
+/// lenient mode warns naming the key, `strict:` hard-errors — the same
+/// warn/error split every domain-list consumer applies. The caller keeps
+/// the entry either way (observability only, never a semantics change).
+///
+/// The predicate lives in `meow_rules::domain_key` so the `rules:` parser
+/// and every trie surface share one dead-key definition; `match_engine`'s
+/// `indexable_pattern` is the same concept's third encoding.
+pub(crate) fn check_domain_key(field: &str, key: &str, strict: bool) -> Result<(), anyhow::Error> {
+    let Some(defect) = meow_rules::domain_key_defect(key) else {
+        return Ok(());
+    };
+    let why = match defect {
+        DomainKeyDefect::DeadLabel => "contains an empty label",
+        DomainKeyDefect::NotInsertable => "is not a valid domain pattern",
+    };
+    if strict {
+        Err(anyhow::anyhow!("{field}: '{key}' {why} (strict mode)"))
+    } else {
+        warn!("{field}: '{key}' {why}; it can never match");
+        Ok(())
+    }
 }
 
 fn parse_host_alias(value: &str, host: &str) -> Result<String, anyhow::Error> {
@@ -1197,6 +1520,101 @@ async fn parse_system_hosts() -> Vec<(String, Vec<IpAddr>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `dns.prefer-h3` adds the parameter only to `https://` entries, and an
+    /// entry that already decided keeps its own answer.
+    #[test]
+    fn prefer_h3_rewrite_rules() {
+        for (raw, expected) in [
+            (
+                "https://1.1.1.1/dns-query",
+                "https://1.1.1.1/dns-query?h3=prefer",
+            ),
+            (
+                "https://1.1.1.1/dns-query#cloudflare-dns.com",
+                "https://1.1.1.1/dns-query?h3=prefer#cloudflare-dns.com",
+            ),
+            (
+                "https://1.1.1.1/dns-query?proxy=JP",
+                "https://1.1.1.1/dns-query?proxy=JP&h3=prefer",
+            ),
+            // A per-entry decision is not overwritten.
+            (
+                "https://1.1.1.1/dns-query?h3=false",
+                "https://1.1.1.1/dns-query?h3=false",
+            ),
+            (
+                "https://1.1.1.1/dns-query?h3=true",
+                "https://1.1.1.1/dns-query?h3=true",
+            ),
+            // A DoH path with its own query string: another `?` would be a
+            // second parameter section, so the policy joins with `&`… the
+            // parse below keeps one section and the path intact.
+            (
+                "https://1.1.1.1/dns-query?x=1",
+                "https://1.1.1.1/dns-query?x=1?h3=prefer",
+            ),
+            // Everything that is not DoH is left alone.
+            ("tls://8.8.8.8#dns.google", "tls://8.8.8.8#dns.google"),
+            ("quic://dns.adguard.com", "quic://dns.adguard.com"),
+            ("223.5.5.5", "223.5.5.5"),
+        ] {
+            assert_eq!(prefer_h3_url(raw, true), expected, "{raw}");
+            // Off: verbatim.
+            assert_eq!(prefer_h3_url(raw, false), raw, "{raw} (off)");
+        }
+    }
+
+    /// The rewritten URL must parse back into the `Prefer` policy — the flag
+    /// has to survive the parse, not just the string.
+    #[test]
+    fn prefer_h3_rewrite_parses_as_prefer() {
+        let rewritten = prefer_h3_url("https://1.1.1.1/dns-query#cloudflare-dns.com", true);
+        let entry = meow_dns::NameServerEntry::parse(&rewritten).unwrap();
+        match entry.url {
+            meow_dns::NameServerUrl::Https { h3, sni, .. } => {
+                assert_eq!(h3, meow_dns::H3Policy::Prefer);
+                assert_eq!(sni, "cloudflare-dns.com");
+            }
+            other => panic!("expected Https, got {other:?}"),
+        }
+    }
+
+    /// A DoH URL whose path carries a query string survives the rewrite: the
+    /// path stays intact and the policy lands on the entry.
+    #[test]
+    fn prefer_h3_rewrite_keeps_a_query_path() {
+        let rewritten = prefer_h3_url("https://1.1.1.1/dns-query?x=1", true);
+        match meow_dns::NameServerEntry::parse(&rewritten).unwrap().url {
+            meow_dns::NameServerUrl::Https { path, h3, .. } => {
+                assert_eq!(path, "/dns-query?x=1");
+                assert_eq!(h3, meow_dns::H3Policy::Prefer);
+            }
+            other => panic!("expected Https, got {other:?}"),
+        }
+    }
+
+    /// `prefer-h3` reaches `nameserver-policy` values too, which are still
+    /// strings when the policy map is built.
+    #[test]
+    fn prefer_h3_rewrites_policy_values() {
+        let mut map = crate::raw::RawNameserverPolicy::new();
+        map.insert(
+            "geosite:cn".to_string(),
+            crate::raw::RawNspValue::Many(vec![
+                "https://1.1.1.1/dns-query".to_string(),
+                "223.5.5.5".to_string(),
+            ]),
+        );
+        let rewritten = prefer_h3_policy_map(&map, true);
+        let value = rewritten.get("geosite:cn").unwrap();
+        assert_eq!(
+            value.as_urls(),
+            vec!["https://1.1.1.1/dns-query?h3=prefer", "223.5.5.5"]
+        );
+        // `false` returns the map unchanged.
+        assert_eq!(prefer_h3_policy_map(&map, false), map);
+    }
     use crate::raw::HostsValue;
     use std::net::Ipv4Addr;
 
@@ -1217,54 +1635,7 @@ mod tests {
             .collect()
     }
 
-    /// Captures WARN lines while held. `set_default` is thread-local, so the
-    /// guard spans the awaits of a current-thread `#[tokio::test]` and never
-    /// sees a parallel test's lines.
-    struct WarnCapture {
-        sink: WarnSink,
-        _guard: tracing::subscriber::DefaultGuard,
-    }
-
-    #[derive(Clone)]
-    struct WarnSink(Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for WarnSink {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for WarnSink {
-        type Writer = WarnSink;
-        fn make_writer(&'a self) -> WarnSink {
-            self.clone()
-        }
-    }
-
-    impl WarnCapture {
-        fn start() -> Self {
-            let sink = WarnSink(Arc::default());
-            let subscriber = tracing_subscriber::fmt()
-                .with_writer(sink.clone())
-                .with_ansi(false)
-                .with_max_level(tracing::Level::WARN)
-                .finish();
-            Self {
-                sink,
-                _guard: tracing::subscriber::set_default(subscriber),
-            }
-        }
-
-        /// The lines captured since the last call.
-        fn take(&self) -> String {
-            let captured = std::mem::take(&mut *self.sink.0.lock().unwrap());
-            String::from_utf8_lossy(&captured).into_owned()
-        }
-    }
+    use crate::test_support::WarnCapture;
 
     fn addresses(entry: &HostEntry) -> &[IpAddr] {
         match entry {
@@ -1318,6 +1689,142 @@ mod tests {
         .await
         .unwrap();
         assert!(cfg.proxy_resolver.is_none());
+    }
+
+    #[tokio::test]
+    async fn direct_nameserver_installs_direct_resolver() {
+        let raw: RawConfig = serde_saphyr::from_str(
+            "dns:\n  enable: true\n  nameserver:\n    - 1.1.1.1\n  direct-nameserver:\n    - 223.5.5.5\n  direct-nameserver-follow-policy: true\n  nameserver-policy:\n    '+.example.cn': 119.29.29.29\n",
+        )
+        .unwrap();
+        let cfg = parse_dns(
+            &raw,
+            None,
+            None,
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        let direct = cfg
+            .resolver
+            .direct_resolver()
+            .expect("direct-nameserver must install a direct resolver");
+        assert_eq!(direct.mode(), DnsMode::Normal);
+        assert!(direct.direct_resolver().is_none());
+    }
+
+    #[tokio::test]
+    async fn no_direct_nameserver_leaves_direct_resolver_none() {
+        let raw: RawConfig =
+            serde_saphyr::from_str("dns:\n  enable: true\n  nameserver:\n    - 1.1.1.1\n").unwrap();
+        let cfg = parse_dns(
+            &raw,
+            None,
+            None,
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(cfg.resolver.direct_resolver().is_none());
+    }
+
+    /// `nameserver-policy-exclusive` reaches the built resolver: a matched
+    /// domain answers from its policy nameservers ahead of the
+    /// fallback-filter domain gate, and the flag defaults to off. Every
+    /// tier is an `rcode://` transport — no sockets — so the returned
+    /// rcode names the tier that answered.
+    #[tokio::test]
+    async fn nameserver_policy_exclusive_wires_through_parse_dns() {
+        use hickory_proto::op::ResponseCode;
+        use hickory_proto::rr::{Name, RecordType};
+        for (yaml_flag, expected) in [
+            ("true", ResponseCode::NXDomain),
+            ("false", ResponseCode::Refused),
+        ] {
+            let raw: RawConfig = serde_saphyr::from_str(&format!(
+                "dns:\n  enable: true\n  nameserver:\n    - rcode://success\n  fallback:\n    - rcode://refused\n  fallback-filter:\n    geoip: false\n    domain:\n      - 'confined.test'\n  nameserver-policy-exclusive: {yaml_flag}\n  nameserver-policy:\n    'confined.test': rcode://name_error\n"
+            ))
+            .unwrap();
+            let cfg = parse_dns(
+                &raw,
+                None,
+                None,
+                &HashMap::new(),
+                None,
+                &HashMap::new(),
+                None,
+            )
+            .await
+            .unwrap();
+            let name = Name::from_ascii("confined.test").unwrap();
+            let msg = cfg
+                .resolver
+                .forward_generic("confined.test", &name, RecordType::TXT)
+                .await
+                .expect("every tier is an rcode transport — one must answer");
+            assert_eq!(msg.metadata.response_code, expected, "flag {yaml_flag}");
+
+            // A domain the policy does not cover still reaches the main
+            // pool, flag or no flag.
+            let other = Name::from_ascii("other.test").unwrap();
+            let msg = cfg
+                .resolver
+                .forward_generic("other.test", &other, RecordType::TXT)
+                .await
+                .unwrap();
+            assert_eq!(
+                msg.metadata.response_code,
+                ResponseCode::NoError,
+                "flag {yaml_flag}"
+            );
+        }
+    }
+
+    /// `direct-nameserver-follow-policy` inherits `nameserver-policy-exclusive`:
+    /// the flag reaches the direct resolver's own policy copy, not just the
+    /// main resolver's. (The direct resolver runs no fallback filter, so the
+    /// flag itself is the observable wiring here.)
+    #[tokio::test]
+    async fn nameserver_policy_exclusive_reaches_direct_resolver() {
+        let raw: RawConfig = serde_saphyr::from_str(
+            "dns:\n  enable: true\n  nameserver:\n    - rcode://success\n  direct-nameserver:\n    - rcode://success\n  direct-nameserver-follow-policy: true\n  nameserver-policy-exclusive: true\n  nameserver-policy:\n    'confined.test': rcode://name_error\n",
+        )
+        .unwrap();
+        let cfg = parse_dns(
+            &raw,
+            None,
+            None,
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            cfg.resolver
+                .nameserver_policy()
+                .map(meow_dns::NameserverPolicy::is_exclusive),
+            Some(true),
+            "the main resolver's policy must carry the flag"
+        );
+        let direct = cfg
+            .resolver
+            .direct_resolver()
+            .expect("direct-nameserver must install a direct resolver");
+        assert_eq!(
+            direct
+                .nameserver_policy()
+                .map(meow_dns::NameserverPolicy::is_exclusive),
+            Some(true),
+            "the direct resolver's policy copy must inherit the flag"
+        );
     }
 
     #[tokio::test]
@@ -1749,6 +2256,30 @@ mod tests {
         assert!(err.to_string().contains("alias cycle"));
     }
 
+    /// The dead-key classification matrix itself lives with the predicate
+    /// in `meow_rules::domain_key`'s tests; this pins that `hosts:` drives
+    /// it through `check_domain_key` — lenient warns and still loads the
+    /// dead entry, strict hard-errors.
+    #[test]
+    fn build_hosts_trie_empty_label_key_warns_lenient_errors_strict() {
+        let mut map = RawHosts::new();
+        map.insert("a..b".to_string(), one("1.2.3.4"));
+        // Lenient: warns, still inserts the (unreachable) node — no query
+        // may ever see it, and `a.b` in particular must not leak to it.
+        let cap = WarnCapture::start();
+        let trie = build_hosts_trie(Some(&map), false).unwrap();
+        let warns = cap.take();
+        assert!(
+            warns.contains("a..b") && warns.contains("empty label"),
+            "the dead key must be surfaced, got: {warns}"
+        );
+        assert!(trie.search("a.b").is_none(), "a..b must not leak to a.b");
+        let err = build_hosts_trie(Some(&map), true)
+            .err()
+            .expect("strict must hard-error on an empty label");
+        assert!(err.to_string().contains("empty label"));
+    }
+
     #[test]
     fn build_hosts_trie_rejects_domain_in_multi_value_list() {
         let mut map = RawHosts::new();
@@ -2069,13 +2600,27 @@ mod tests {
         );
     }
 
-    // C4: quic:// in nameserver produces an error citing M1.E-6.
+    // C4: quic:// is accepted with the `dns-quic` feature and refused (naming
+    // the feature) without it — never a silent drop.
     #[test]
-    fn parse_nameserver_urls_quic_errors() {
+    fn parse_nameserver_urls_quic_requires_the_feature() {
         let result = parse_nameserver_urls(&["quic://dns.adguard.com".to_string()]);
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("M1.E-6"), "error must cite M1.E-6, got: {msg}");
+        if cfg!(feature = "dns-quic") {
+            assert_eq!(
+                result.unwrap(),
+                vec![meow_dns::NameServerUrl::Quic {
+                    addr: meow_dns::HostOrIp::Host("dns.adguard.com".to_string()),
+                    port: 853,
+                    sni: "dns.adguard.com".to_string(),
+                }]
+            );
+        } else {
+            let msg = result.unwrap_err().to_string();
+            assert!(
+                msg.contains("quic-dns"),
+                "error must cite the feature, got: {msg}"
+            );
+        }
     }
 
     // C5: unknown scheme errors, not warns.
@@ -2105,6 +2650,34 @@ mod tests {
             pol.lookup("anything.cn").is_none(),
             "skipped geosite entry must not match"
         );
+    }
+
+    /// A domain key with an empty label (`a..b`) is an unreachable trie
+    /// node: lenient mode warns and keeps the (dead) arm, strict mode
+    /// hard-errors like it does for unsupported prefixed keys.
+    #[tokio::test]
+    async fn parse_nameserver_policy_empty_label_key_warns_lenient_errors_strict() {
+        use crate::raw::RawNspValue;
+        let map = nsp_map(&[("a..b", RawNspValue::One("rcode://success".to_string()))]);
+        let cap = WarnCapture::start();
+        let pol = build_nameserver_policy(&map, None, &[], &HashMap::new(), &HashMap::new(), false)
+            .await
+            .expect("empty-label key must stay lenient");
+        let warns = cap.take();
+        assert!(
+            warns.contains("a..b") && warns.contains("empty label"),
+            "the dead key must be surfaced, got: {warns}"
+        );
+        assert!(
+            pol.lookup("a.b").is_none(),
+            "the dead node must not leak to a.b"
+        );
+        let result =
+            build_nameserver_policy(&map, None, &[], &HashMap::new(), &HashMap::new(), true).await;
+        let Err(err) = result else {
+            panic!("strict must hard-error on an empty-label key")
+        };
+        assert!(err.to_string().contains("empty label"));
     }
 
     #[tokio::test]
@@ -2723,6 +3296,109 @@ mod tests {
             !ff.domain_gated("a.b.fb.test"),
             "deep subdomain must not match *.fb.test"
         );
+    }
+
+    // An empty-label `fallback-filter.domain` entry inserts a trie node no
+    // query name can ever match — the same dead-node shape as `hosts:`
+    // (issue #822). Lenient surfaces it; strict rejects it.
+    #[test]
+    fn build_fallback_filter_empty_label_domain_warns_lenient_errors_strict() {
+        use crate::raw::RawFallbackFilter;
+        let raw = RawFallbackFilter {
+            geoip: Some(false),
+            geoip_code: None,
+            ipcidr: None,
+            domain: Some(vec!["a..b".to_string(), "fine.example".to_string()]),
+        };
+        let cap = WarnCapture::start();
+        let ff = build_fallback_filter(Some(&raw), None, false).unwrap();
+        let warns = cap.take();
+        assert!(
+            warns.contains("a..b") && warns.contains("empty label"),
+            "the dead entry must be surfaced, got: {warns}"
+        );
+        assert!(
+            ff.domain_gated("fine.example"),
+            "the good entry must still gate"
+        );
+        assert!(!ff.domain_gated("a.b"), "a..b must not leak to a.b");
+        let err = build_fallback_filter(Some(&raw), None, true)
+            .err()
+            .expect("strict must hard-error on an empty label");
+        assert!(err.to_string().contains("empty label"));
+    }
+
+    /// An all-dots/prefix-only `fallback-filter.domain` entry is refused by
+    /// the trie outright (`DomainKeyDefect::NotInsertable`): it takes the
+    /// same lenient-warn / strict-error split as an empty label instead of
+    /// the old warn-only insert failure.
+    #[test]
+    fn build_fallback_filter_all_dots_domain_warns_lenient_errors_strict() {
+        use crate::raw::RawFallbackFilter;
+        for dead in [".", "..", "+.", "*."] {
+            let raw = RawFallbackFilter {
+                geoip: Some(false),
+                geoip_code: None,
+                ipcidr: None,
+                domain: Some(vec![dead.to_string()]),
+            };
+            let cap = WarnCapture::start();
+            build_fallback_filter(Some(&raw), None, false)
+                .unwrap_or_else(|_| panic!("{dead:?} must load in lenient mode"));
+            let warns = cap.take();
+            assert!(
+                warns.contains("not a valid domain pattern"),
+                "{dead:?}: the refused entry must be surfaced, got: {warns}"
+            );
+            let err = build_fallback_filter(Some(&raw), None, true)
+                .err()
+                .expect("strict must hard-error on a refused domain key");
+            assert!(
+                err.to_string().contains("not a valid domain pattern"),
+                "{dead:?}: {err}"
+            );
+        }
+    }
+
+    // Same dead-node observability for `dns.fake-ip-filter`: lenient warns,
+    // strict hard-errors — both through the `parse_dns` fake-IP path.
+    #[tokio::test]
+    async fn install_fakeip_empty_label_pattern_warns_lenient_errors_strict() {
+        let lenient_yaml = "dns:\n  enable: true\n  enhanced-mode: fake-ip\n  nameserver:\n    - 1.1.1.1\n  fake-ip-filter:\n    - a..b\n    - fine.example\n";
+        let raw: RawConfig = serde_saphyr::from_str(lenient_yaml).unwrap();
+        let cap = WarnCapture::start();
+        parse_dns(
+            &raw,
+            None,
+            None,
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+            None,
+        )
+        .await
+        .expect("lenient fake-ip-filter dead label must still load");
+        let warns = cap.take();
+        assert!(
+            warns.contains("a..b") && warns.contains("empty label"),
+            "the dead entry must be surfaced, got: {warns}"
+        );
+
+        let strict_yaml = format!("strict: true\n{lenient_yaml}");
+        let raw: RawConfig = serde_saphyr::from_str(&strict_yaml).unwrap();
+        let err = parse_dns(
+            &raw,
+            None,
+            None,
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+            None,
+        )
+        .await
+        .err()
+        .expect("strict must hard-error on an empty label");
+        assert!(err.to_string().contains("empty label"), "got: {err}");
     }
 
     // --- nameserver-policy `#PROXY` fragments -----------------------------

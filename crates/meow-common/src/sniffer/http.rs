@@ -2,7 +2,11 @@ use smol_str::SmolStr;
 
 /// Parse the HTTP `Host:` header from the first request bytes.
 ///
-/// Returns `None` if the buffer does not look like HTTP/1.x or has no Host header.
+/// Returns `None` if the buffer does not look like HTTP/1.x or has no Host
+/// header — or has more than one: a duplicated `Host:` makes the authority
+/// ambiguous (RFC 9110 §5.4 permits refusing it outright, and the HTTP
+/// listener does refuse it with 400), so no name is adopted rather than
+/// guessing which of the two the peer honoured.
 /// `httparse::Status::Partial` is treated as success — as long as we've seen
 /// the Host line we don't need the full request.
 ///
@@ -13,8 +17,14 @@ pub fn sniff_http(buf: &[u8]) -> Option<SmolStr> {
     let mut req = httparse::Request::new(&mut headers);
     // Both Complete and Partial are fine; an Err means the buffer isn't HTTP.
     req.parse(buf).ok()?;
+    let mut host_value: Option<SmolStr> = None;
     for h in req.headers.iter() {
         if h.name.eq_ignore_ascii_case("host") {
+            // A second Host header makes the authority ambiguous — the
+            // listener refuses it with 400, so the sniffer adopts nothing.
+            if host_value.is_some() {
+                return None;
+            }
             let s = std::str::from_utf8(h.value).ok()?.trim();
             // Strip optional `:port` suffix while preserving bracketed IPv6.
             // RFC 7230 §5.4: `Host = uri-host [":" port]` where uri-host may
@@ -32,14 +42,14 @@ pub fn sniff_http(buf: &[u8]) -> Option<SmolStr> {
             }
             // Hostnames are usually already lowercase — only pay for a
             // char-mapped rebuild when one actually contains uppercase.
-            return Some(if host.bytes().any(|b| b.is_ascii_uppercase()) {
+            host_value = Some(if host.bytes().any(|b| b.is_ascii_uppercase()) {
                 host.chars().map(|c| c.to_ascii_lowercase()).collect()
             } else {
                 SmolStr::new(host)
             });
         }
     }
-    None
+    host_value
 }
 
 #[cfg(test)]
@@ -94,6 +104,18 @@ mod tests {
         // Bracketed IPv6 host without a `:port` suffix is still recognised.
         let buf = b"GET / HTTP/1.1\r\nHost: [2001:db8::1]\r\n\r\n";
         assert_eq!(sniff_http(buf).as_deref(), Some("2001:db8::1"));
+    }
+
+    /// A duplicated `Host:` header makes the authority ambiguous — the
+    /// HTTP listener refuses the request with 400, and the sniffer must
+    /// not adopt either name under the other one's cover.
+    #[test]
+    fn sniff_http_duplicate_host_returns_none() {
+        let buf = b"GET / HTTP/1.1\r\nHost: a.example\r\nHost: b.example\r\n\r\n";
+        assert_eq!(sniff_http(buf), None);
+        // Same-name case variants count too.
+        let buf = b"GET / HTTP/1.1\r\nHost: a.example\r\nHOST: b.example\r\n\r\n";
+        assert_eq!(sniff_http(buf), None);
     }
 
     #[test]

@@ -18,6 +18,8 @@ const CONN_RECEIVE_WINDOW: u64 = STREAM_RECEIVE_WINDOW * 5 / 2;
 const MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_CONCURRENT_STREAMS: u64 = 1024;
 const DGRAM_QUEUE_LEN: usize = 1024;
+/// quic-go's ceiling (1500 − IPv6 40 − UDP 8); PMTUD finds the path's.
+pub(super) const MAX_SEND_UDP_PAYLOAD: usize = 1452;
 
 /// Build a client `quiche::Config` for the given hysteria2 config.
 pub fn build_quiche_config(config: &Config) -> Result<quiche::Config> {
@@ -60,6 +62,20 @@ pub fn build_quiche_config(config: &Config) -> Result<quiche::Config> {
     quic.grease(false);
     // UDP relay rides QUIC datagrams.
     quic.enable_dgram(true, DGRAM_QUEUE_LEN, DGRAM_QUEUE_LEN);
+    // Hysteria 2 clients run BBR or, with a bandwidth set, Brutal —
+    // which quiche lacks, so meow always runs BBRv2, never a
+    // loss-driven CC: quiche's default CUBIC collapses its window on
+    // the datagram loss a saturated UDP relay sees, and the upload rate
+    // with it (OpenWrt TUN benchmark: 0.4 Mbit/s at 300 Mbit/s offered).
+    quic.set_cc_algorithm(quiche::CongestionControlAlgorithm::Bbr2Gcongestion);
+    // quiche sends 1200-byte packets by default: a 1200-byte UDP payload
+    // plus the Hysteria 2 header then no longer fits one DATAGRAM frame and
+    // goes out as two fragments — twice the packets, and a lost half drops
+    // the whole datagram at the server's defragger. quic-go (Hysteria,
+    // mihomo) grows to 1452 with DPLPMTUD; do the same, probing so a
+    // smaller path MTU (PPPoE + IPv6) is found rather than black-holed.
+    quic.set_max_send_udp_payload_size(MAX_SEND_UDP_PAYLOAD);
+    quic.discover_pmtu(true);
 
     Ok(quic)
 }
@@ -118,16 +134,17 @@ fn leaf_matches_pin(ctx: &mut X509StoreContextRef, expected: &[u8; 32]) -> bool 
     Sha256::digest(&der).as_slice() == expected
 }
 
-/// Seed the BoringSSL verify store with the Mozilla CA bundle (mirrors
-/// `meow-transport`'s BoringSSL backend). The default store is empty.
+/// Seed the BoringSSL verify store with the Mozilla CA bundle. The default
+/// store is empty. A context is built per QUIC connection, so the roots come
+/// pre-parsed and shared (`meow_transport::tls::mozilla_roots`): parsing
+/// ~120 certificates each time cost CPU per connect and kept a private copy
+/// alive with every connection.
 fn seed_roots(ssl: &mut SslContextBuilder) -> Result<()> {
     let mut store = boring::x509::store::X509StoreBuilder::new()
         .map_err(|e| Error::tls(format!("X509StoreBuilder: {e}")))?;
-    for cert in webpki_root_certs::TLS_SERVER_ROOT_CERTS {
-        let x509 = boring::x509::X509::from_der(cert.as_ref())
-            .map_err(|e| Error::tls(format!("root cert parse: {e}")))?;
+    for x509 in meow_transport::tls::mozilla_roots() {
         store
-            .add_cert(x509)
+            .add_cert(x509.clone())
             .map_err(|e| Error::tls(format!("root store add_cert: {e}")))?;
     }
     ssl.set_cert_store_builder(store);

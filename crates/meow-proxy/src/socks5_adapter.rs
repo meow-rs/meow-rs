@@ -20,7 +20,8 @@ use std::net::{IpAddr, SocketAddr};
 
 use async_trait::async_trait;
 use meow_common::{
-    AdapterType, MeowError, Metadata, ProxyAdapter, ProxyConn, ProxyHealth, ProxyPacketConn, Result,
+    AdapterType, MeowError, Metadata, Network, ProxyAdapter, ProxyConn, ProxyHealth,
+    ProxyPacketConn, Result,
 };
 use smallvec::SmallVec;
 use smol_str::SmolStr;
@@ -670,6 +671,12 @@ impl ProxyAdapter for Socks5Adapter {
         self.udp && (!self.dialer.is_proxy() || self.dialer.supports_udp())
     }
 
+    /// A UDP flow's datagrams go to the server's relay as datagrams (the
+    /// TCP control connection beside them carries none of its bytes).
+    fn dialer_hop_network(&self, flow: Network) -> Network {
+        flow
+    }
+
     async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
         debug!(
             "socks5: CONNECT {}:{} via {}:{}",
@@ -786,13 +793,10 @@ impl ProxyAdapter for Socks5Adapter {
             }));
         }
 
-        let relay_addr = self.resolve_relay(&relay).await?;
-        let bind: SocketAddr = if relay_addr.is_ipv4() {
-            "0.0.0.0:0".parse().expect("static")
-        } else {
-            "[::]:0".parse().expect("static")
-        };
-        let socket = meow_common::bind_udp(bind).await.map_err(MeowError::Io)?;
+        let relay_addr = meow_common::canonical_socket_addr(self.resolve_relay(&relay).await?);
+        let socket = meow_common::bind_udp_for_peer(relay_addr.ip())
+            .await
+            .map_err(MeowError::Io)?;
         socket.connect(relay_addr).await.map_err(MeowError::Io)?;
 
         Ok(Box::new(Socks5UdpConn {

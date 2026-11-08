@@ -38,10 +38,26 @@ pub(crate) const MAX_REVALIDATION_ATTEMPTS: u32 = 5;
 const USERINFO_SUFFIX: &str = ".subscription-userinfo";
 
 pub struct HealthCheckConfig {
+    /// mihomo `healthCheckSchema.URL`, stored trimmed (upstream
+    /// `strings.TrimSpace`s it in `execute()`/`registerHealthCheckTask`)
+    /// — empty means "no probe URL configured": upstream zeroes the
+    /// interval (`NewHealthCheck`), so no periodic sweep runs and both
+    /// the scheduled loop and the manual healthcheck endpoint skip
+    /// probing.
     pub url: String,
+    /// mihomo `healthCheckSchema.Enable` — gates only the periodic
+    /// sweep; the block still feeds the manual healthcheck endpoint and
+    /// the `testUrl`/`expectedStatus` API echo when false (upstream
+    /// builds `HealthCheck` unconditionally).
+    pub enable: bool,
     pub interval: u64,
     pub timeout: u64,
     pub expected_status: String,
+    /// Upstream `Lazy` skips a tick when the provider saw no traffic in
+    /// the last interval. Parsed for config compatibility only, never
+    /// read: meow tracks no per-provider last-touch, so ticks are never
+    /// skipped (same precedent as group `lazy` — #555, ADR-0002; an
+    /// explicit `lazy: true` warns at build).
     pub lazy: bool,
 }
 
@@ -98,6 +114,13 @@ pub struct ProxyProvider {
     /// at least once — lets a queued background attempt skip the fetch a
     /// straggling startup fetch just completed.
     fetched_remote: AtomicBool,
+    /// Signalled by [`Self::commit`] whenever the member set is replaced —
+    /// the health-check sweep sleeps on it between interval ticks so a
+    /// payload landing mid-interval is probed on arrival, the way
+    /// mihomo's `setProxies` fires `go hc.check()` on every commit.
+    /// `notify_one` leaves a stored permit when nobody is waiting, so a
+    /// commit made before the sweep's first wait still wakes it.
+    members_changed: tokio::sync::Notify,
     /// The committed payload was parsed without its ECH DNS preresolve —
     /// the config-mutation lane's check-only load must not look anything
     /// up, so the detached post-commit fetch owes the slot one off-lane
@@ -308,20 +331,9 @@ impl ProxyProvider {
         let exclude_filter = compile_opt_regex(&raw.exclude_filter, "exclude-filter")?;
         let exclude_type = split_exclude_types(raw.exclude_type.as_deref());
 
-        let health_check = build_health_check_config(raw.health_check.as_ref());
-        if health_check.is_some() {
-            // The config is honoured by the manual
-            // `GET /providers/proxies/{name}/healthcheck` endpoint, but
-            // nothing probes provider members on a timer (mihomo schedules
-            // the provider health-check alongside `interval`). Warn once
-            // per build so the config isn't silently half-wired.
-            warn!(
-                provider = %name,
-                "proxy-provider 'health-check' is stored but not periodically \
-                 scheduled — members are probed only via the manual \
-                 healthcheck endpoint or a group's own health check"
-            );
-        }
+        // Probed every `interval` by `ProxyProviderRefreshSupervisor`.
+        let health_check = build_health_check_config(name, raw.health_check.as_ref())
+            .map_err(|e| format!("proxy-provider '{name}': health-check {e}"))?;
         let header = raw
             .header
             .as_ref()
@@ -435,6 +447,7 @@ impl ProxyProvider {
             deferred_initial: AtomicBool::new(false),
             background_pending: AtomicBool::new(false),
             fetched_remote: AtomicBool::new(false),
+            members_changed: tokio::sync::Notify::new(),
             ech_pending: AtomicBool::new(false),
             declared_dialers: RwLock::new(Vec::new()),
             provider_dialer,
@@ -1129,28 +1142,28 @@ impl ProxyProvider {
                     ));
                 }
                 // Keep the slot entry as a dead placeholder instead of
-                // dropping it, so a group that lists this node can neither
-                // shift its traffic onto a sibling member nor degrade to a
-                // direct dial. Scoped to the node on purpose: this payload
-                // is third-party and refetched on a timer, so rejecting the
-                // whole feed would let its operator empty the registry on
-                // every refresh — and, for a protocol missing from this
-                // build, stop the daemon from starting at all.
-                Err(e) if proxy_parser::node_is_trusttunnel(raw_map) => {
-                    let label = if raw_name.is_empty() {
-                        "<unnamed>"
-                    } else {
-                        raw_name
-                    };
-                    warn!(provider = %self.name, proxy = label, error = %e, "keeping an unavailable trusttunnel node so nothing can dial past it");
-                    result.push(crate::unavailable_placeholder(
-                        label,
-                        &e,
-                        meow_common::AdapterType::TrustTunnel,
-                    ));
-                }
+                // dropping it: a `select` group, an explicit `MATCH` target
+                // or a `dialer-proxy` chain that names this node fails the
+                // dial rather than shifting the traffic to a sibling member
+                // or DIRECT (liveness-checked groups skip it like any
+                // unavailable member). Scoped to the node on purpose: this
+                // payload is third-party and refetched on a timer, so
+                // rejecting the whole feed would let its operator empty the
+                // registry on every refresh — and, for a protocol or
+                // built-in plugin transport missing from this build, stop
+                // the daemon from starting at all.
                 Err(e) => {
-                    warn!(provider = %self.name, proxy = raw_name, error = %e, "failed to parse proxy");
+                    if let Some(declared) = proxy_parser::placeholder_adapter_type(raw_map) {
+                        let label = if raw_name.is_empty() {
+                            "<unnamed>"
+                        } else {
+                            raw_name
+                        };
+                        warn!(provider = %self.name, proxy = label, error = %e, "keeping an unavailable node so nothing can dial past it");
+                        result.push(crate::unavailable_placeholder(label, &e, declared));
+                    } else {
+                        warn!(provider = %self.name, proxy = raw_name, error = %e, "failed to parse proxy");
+                    }
                 }
             }
         }
@@ -1174,6 +1187,20 @@ impl ProxyProvider {
                 .as_secs() as meow_common::atomic::Uint,
             Ordering::Relaxed,
         );
+        // Wake the health-check sweep: upstream probes on `setProxies`,
+        // so a committed payload is checked on arrival instead of one
+        // full interval later. Probe coverage matches upstream — its
+        // `loadBuf` hash-dedups an unchanged payload before `setProxies`
+        // (and the attached `hc.check()`) ever runs, the same early
+        // return `ingest` takes ahead of this commit.
+        self.members_changed.notify_one();
+    }
+
+    /// Waitable signalled on every [`commit`](Self::commit) — the
+    /// health-check sweep uses it to probe a landed payload without
+    /// waiting out the rest of the current interval.
+    pub(crate) fn members_changed(&self) -> &tokio::sync::Notify {
+        &self.members_changed
     }
 
     /// Parse one provider node, honouring a declared `dialer-proxy` chain
@@ -1781,28 +1808,78 @@ async fn read_cache(path: Option<&Path>, name: &str) -> Result<String, String> {
         .map_err(|e| format!("proxy-provider '{name}': no cache at {path:?}: {e}"))
 }
 
-fn build_health_check_config(raw: Option<&RawHealthCheck>) -> Option<HealthCheckConfig> {
-    let hc = raw?;
-    if !hc.enable.unwrap_or(true) {
-        return None;
+fn build_health_check_config(
+    name: &str,
+    raw: Option<&RawHealthCheck>,
+) -> Result<Option<HealthCheckConfig>, String> {
+    let Some(hc) = raw else { return Ok(None) };
+    // mihomo's `NewUnsignedRanges` runs before `Enable` is even read —
+    // a malformed spec fails the provider build whether or not the
+    // block ever probes.
+    if let Some(spec) = hc.expected_status.as_deref() {
+        meow_proxy::health::validate_expected_status(spec)?;
     }
-    Some(HealthCheckConfig {
-        url: hc
-            .url
-            .clone()
-            .unwrap_or_else(|| "https://www.gstatic.com/generate_204".to_string()),
-        interval: hc.interval.unwrap_or(300),
+    let enable = hc.enable.unwrap_or(false);
+    // mihomo's `Enable` has no schema default: a bare block does not
+    // probe. The disable is surfaced rather than silent — a
+    // health-check block whose probes never run is almost always a
+    // config mistake.
+    if !enable {
+        warn!(
+            provider = %name,
+            "proxy-provider health-check present but `enable` is not true; \
+             members will not be probed periodically"
+        );
+    }
+    // mihomo keeps no gstatic default and zeroes the interval when the
+    // url is empty (`NewHealthCheck`): an undeclared url must mean "no
+    // probes", and the manual endpoint skips it too. Upstream also
+    // `strings.TrimSpace`s the url in `execute()`/`registerHealthCheckTask`
+    // before the empty check and the probe, so store it trimmed: a
+    // whitespace-only value degrades to the empty-url path instead of a
+    // sweep whose every probe fails URL parsing (all members marked dead).
+    let url = hc.url.as_deref().unwrap_or_default().trim().to_string();
+    if enable && url.is_empty() {
+        warn!(
+            provider = %name,
+            "proxy-provider health-check `enable` but no `url`; \
+             members will not be probed"
+        );
+    }
+    if hc.lazy == Some(true) {
+        // Per provider per build — a process-global `Once` would hide
+        // every offender's name but the first's.
+        warn!(
+            provider = %name,
+            "proxy-provider health-check `lazy` is not honoured: members are probed every interval"
+        );
+    }
+    Ok(Some(HealthCheckConfig {
+        url,
+        enable,
+        // mihomo maps an explicit 0 to the default, never to "every tick".
+        interval: match hc.interval {
+            None | Some(0) => 300,
+            Some(v) => v,
+        },
         // `timeout` is milliseconds consumed by `tokio::time::timeout`
-        // (provider healthcheck API) — clamp to the shared duration
-        // ceiling so an absurd value degrades to "probe never fires"
-        // instead of wrapping Instant arithmetic (issue #648 review).
-        timeout: hc
-            .timeout
-            .unwrap_or(5000)
-            .min(meow_common::MAX_DURATION_SECS.saturating_mul(1000)),
+        // (provider healthcheck API) — mihomo's `NewHealthCheck` maps an
+        // explicit 0 to 5000 like an absent one, and the value is clamped
+        // to the shared duration ceiling so an absurd value degrades to
+        // "probe never fires" instead of wrapping Instant arithmetic
+        // (issue #648 review).
+        timeout: match hc.timeout {
+            None | Some(0) => 5000,
+            Some(v) => v.min(meow_common::MAX_DURATION_SECS.saturating_mul(1000)),
+        },
         expected_status: hc.expected_status.clone().unwrap_or_default(),
+        // Upstream defaults `lazy: true` (`healthCheckSchema{Lazy: true}`,
+        // parser.go) and skips ticks the provider saw no traffic during.
+        // We keep `false`: meow tracks no per-provider last-touch, so
+        // `lazy` could only ever mean "never probe" — parsed for compat,
+        // not honoured (same precedent as group `lazy` — #555, ADR-0002).
         lazy: hc.lazy.unwrap_or(false),
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -2021,6 +2098,175 @@ mod tests {
                 ("User-Agent".to_string(), "mihomo/1.18.3".to_string()),
             ]
         );
+    }
+
+    // -- health-check block parsing (mihomo `healthCheckSchema` parity) --
+
+    fn hc(
+        enable: Option<bool>,
+        url: Option<&str>,
+        interval: Option<u64>,
+        timeout: Option<u64>,
+        expected_status: Option<&str>,
+        lazy: Option<bool>,
+    ) -> crate::raw::RawHealthCheck {
+        crate::raw::RawHealthCheck {
+            enable,
+            url: url.map(str::to_string),
+            interval,
+            timeout,
+            expected_status: expected_status.map(str::to_string),
+            lazy,
+        }
+    }
+
+    /// No `health-check:` block at all → no config (the `None` early
+    /// return the rest of the build depends on).
+    #[test]
+    fn health_check_absent_block_is_none() {
+        assert!(build_health_check_config("p", None)
+            .expect("absent block")
+            .is_none());
+    }
+
+    /// mihomo builds `HealthCheck` unconditionally — `Enable` only zeroes
+    /// the ticker interval — so an `enable: false` (or absent) block must
+    /// still materialise for the manual endpoint and the `testUrl` echo.
+    #[test]
+    fn health_check_disabled_block_still_builds() {
+        for enable in [None, Some(false)] {
+            let cfg = build_health_check_config(
+                "p",
+                Some(&hc(
+                    enable,
+                    Some("https://probe.test/204"),
+                    Some(60),
+                    None,
+                    None,
+                    None,
+                )),
+            )
+            .expect("block must parse")
+            .expect("the block is kept, not dropped");
+            assert!(!cfg.enable);
+            assert_eq!(cfg.url, "https://probe.test/204");
+        }
+    }
+
+    /// `interval`/`timeout` share mihomo's `== 0 → default` mapping —
+    /// an explicit 0 never means "every tick"/"no wait".
+    #[test]
+    fn health_check_zero_values_map_to_defaults() {
+        let cfg = build_health_check_config(
+            "p",
+            Some(&hc(
+                Some(true),
+                Some("https://probe.test/204"),
+                Some(0),
+                Some(0),
+                None,
+                None,
+            )),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(cfg.interval, 300);
+        assert_eq!(cfg.timeout, 5000);
+        let cfg = build_health_check_config(
+            "p",
+            Some(&hc(
+                Some(true),
+                Some("https://probe.test/204"),
+                Some(42),
+                Some(250),
+                None,
+                None,
+            )),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(cfg.interval, 42);
+        assert_eq!(cfg.timeout, 250);
+    }
+
+    /// The url is stored trimmed — no gstatic fallback: mihomo zeroes
+    /// the interval on an empty url, so "not declared" must mean "no
+    /// probes" rather than "probe the default".
+    #[test]
+    fn health_check_url_keeps_empty() {
+        for url in [None, Some("")] {
+            let cfg =
+                build_health_check_config("p", Some(&hc(Some(true), url, None, None, None, None)))
+                    .unwrap()
+                    .unwrap();
+            assert!(cfg.url.is_empty(), "no implicit probe url: {:?}", cfg.url);
+        }
+    }
+
+    /// Upstream `strings.TrimSpace`s the url in `execute()`/
+    /// `registerHealthCheckTask` — the build stores it already trimmed
+    /// so surrounding padding cannot reach the probe, and a
+    /// whitespace-only value folds into the empty-url path (no sweep,
+    /// manual endpoint 204s) instead of spawning a sweep whose every
+    /// probe fails URL parsing and dead-marks every member.
+    #[test]
+    fn health_check_url_is_trimmed() {
+        let cfg = build_health_check_config(
+            "p",
+            Some(&hc(
+                Some(true),
+                Some("  https://probe.test/204  "),
+                None,
+                None,
+                None,
+                None,
+            )),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(cfg.url, "https://probe.test/204");
+        for url in [Some("   "), Some("\t \n")] {
+            let cfg =
+                build_health_check_config("p", Some(&hc(Some(true), url, None, None, None, None)))
+                    .unwrap()
+                    .unwrap();
+            assert!(
+                cfg.url.is_empty(),
+                "whitespace-only must normalise to empty: {:?}",
+                cfg.url
+            );
+        }
+    }
+
+    /// `expected-status` validates like upstream's `NewUnsignedRanges`,
+    /// which runs before `Enable` is even read — a bad spec fails the
+    /// provider build on an `enable: false` block too.
+    #[test]
+    fn health_check_expected_status_validates_even_when_disabled() {
+        for enable in [None, Some(false), Some(true)] {
+            let Err(err) = build_health_check_config(
+                "p",
+                Some(&hc(
+                    enable,
+                    Some("https://probe.test/204"),
+                    None,
+                    None,
+                    Some("garbage"),
+                    None,
+                )),
+            ) else {
+                panic!("a malformed expected-status must fail the build")
+            };
+            assert!(err.contains("expected"), "unexpected: {err}");
+        }
+        // …and a good spec is echoed verbatim for the probe path.
+        let cfg = build_health_check_config(
+            "p",
+            Some(&hc(None, None, None, None, Some("200-299"), None)),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(cfg.expected_status, "200-299");
     }
 
     #[test]
@@ -3260,6 +3506,106 @@ header:
             .to_string();
         assert!(error.contains("bad"), "{error}");
         assert!(!error.contains("test-only"), "{error}");
+    }
+
+    /// Same contract as the trusttunnel placeholder above, for an `ss` node
+    /// whose reserved built-in plugin's cargo feature is compiled out: the
+    /// payload still loads, the node keeps its slot bound dead as
+    /// `Shadowsocks`, and its dial reason is the "not compiled into this
+    /// build" error — no warn-drop, no feed rejection.
+    #[cfg(all(feature = "ss", not(feature = "gost-plugin")))]
+    #[tokio::test]
+    async fn missing_plugin_node_becomes_a_dead_ss_placeholder_not_a_payload_rejection() {
+        let url = spawn_payload_server(
+            "proxies:\n  - {name: good, type: direct}\n  - {name: dead-ss, type: ss, server: 1.2.3.4, port: 8388, password: p, cipher: aes-128-gcm, plugin: gost-plugin}\n",
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let provider = ProxyProvider::new(
+            "p",
+            &raw_http_provider(&url, None),
+            Some(dir.path()),
+            false,
+            false,
+            ProxyRegistry::default(),
+        )
+        .unwrap();
+        provider
+            .acquire_initial()
+            .await
+            .expect("a missing-plugin node must not reject the whole payload");
+
+        let nodes = provider.proxies();
+        assert_eq!(nodes.len(), 2, "the dead node keeps its slot entry");
+        let dead = nodes
+            .iter()
+            .find(|proxy| proxy.name() == "dead-ss")
+            .expect("the unbuildable node stays addressable by name");
+        assert!(!dead.alive(), "a placeholder must never look usable");
+        assert_eq!(
+            dead.adapter_type(),
+            meow_common::AdapterType::Shadowsocks,
+            "a placeholder must keep the node's own type"
+        );
+        let error = dead
+            .dial_tcp(&meow_common::Metadata::default())
+            .await
+            .err()
+            .expect("a placeholder must fail the dial, not leak it direct")
+            .to_string();
+        assert!(error.contains("dead-ss"), "{error}");
+        assert!(
+            error.contains("not compiled into this build"),
+            "the placeholder's reason must be the plugin gate error: {error}"
+        );
+    }
+
+    /// The placeholder is not a one-shot of the initial load: a `refresh`
+    /// re-parses the same payload through the same arm, so the dead node
+    /// must still be bound dead after the second ingest — never dropped on
+    /// the refresh path (which would let a `use:` group quietly shrink).
+    #[cfg(all(feature = "ss", not(feature = "gost-plugin")))]
+    #[tokio::test]
+    async fn missing_plugin_placeholder_survives_a_second_ingest() {
+        let url = spawn_payload_server(
+            "proxies:\n  - {name: good, type: direct}\n  - {name: dead-ss, type: ss, server: 1.2.3.4, port: 8388, password: p, cipher: aes-128-gcm, plugin: gost-plugin}\n",
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let provider = ProxyProvider::new(
+            "p",
+            &raw_http_provider(&url, None),
+            Some(dir.path()),
+            false,
+            false,
+            ProxyRegistry::default(),
+        )
+        .unwrap();
+        provider
+            .acquire_initial()
+            .await
+            .expect("a missing-plugin node must not reject the whole payload");
+        provider
+            .refresh()
+            .await
+            .expect("a refresh re-parsing the same payload must keep succeeding");
+
+        let nodes = provider.proxies();
+        assert_eq!(nodes.len(), 2, "the dead node keeps its slot on refresh");
+        let dead = nodes
+            .iter()
+            .find(|proxy| proxy.name() == "dead-ss")
+            .expect("the unbuildable node stays addressable after a refresh");
+        let error = dead
+            .dial_tcp(&meow_common::Metadata::default())
+            .await
+            .err()
+            .expect("the refreshed placeholder must still fail the dial")
+            .to_string();
+        assert!(
+            error.contains("not compiled into this build"),
+            "the second ingest binds the same placeholder: {error}"
+        );
     }
 
     /// `proxy: <name>` routes the provider fetch through that registry

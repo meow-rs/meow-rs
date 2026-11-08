@@ -81,6 +81,22 @@ Installs the `meow` service (LocalSystem). Wintun TUN / `tun:` needs that elevat
 Official Windows zips ship `wintun.dll` beside the executable; if it is missing
 the official DLL embedded in `meow.exe` is extracted on first TUN start.
 
+## Convert a rule-set
+
+```bash
+meow convert-ruleset domain mrs geosite-ru.mrs            # -> geosite-ru.txt
+meow convert-ruleset ipcidr mrs geoip-ru.mrs out/ru.txt
+```
+
+As mihomo's `convert-ruleset`, for the `.mrs` → text direction: an upstream
+`domain` or `ipcidr` `.mrs` becomes one entry per line in the same compacted
+form mihomo writes — a domain stored with both its apex and its subdomains
+comes out as a single `+.domain` line, a suffix-only entry stays `.domain`,
+and `ipcidr` ranges split into aligned CIDRs. The output is written whole
+or not at all; a `.txt` source needs an explicit target. Stored keys that
+aren't valid UTF-8 (a corrupt set, not an IDN — punycode/Unicode entries
+decode fine) are skipped and reported as a warning with the count.
+
 ## Hot reload
 
 You don't have to restart to apply config changes. The REST API can reload the whole file

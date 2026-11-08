@@ -128,27 +128,24 @@ fn record_nonce(iv: &[u8; 16], counter: u16) -> [u8; 12] {
 /// `RecordCipher::Unbuilt` on values built via `new_writer`/`new_reader`/
 /// `from_response_keys` (issue #533).
 ///
-/// `*_counter` is one past the last nonce value used. The wire format packs
-/// it into a u16, so record `0xFFFF` is the last safe one — a 65537th record
-/// would reuse nonce 0 under the same key. Reaching `NONCE_BUDGET` retires
-/// the connection (issue #513): the error propagates up the stream and the
-/// flow re-dials. mihomo shares this wrap (v2fly `aead.go`), so a >~1 GiB
-/// transfer on one connection is a deliberate divergence from upstream.
+/// `*_counter` is the next nonce counter value. The wire format packs it into
+/// a u16 and, with no re-keying in the chunk format, every peer wraps it
+/// silently — Xray `proxy/vmess/encoding/client.go` `GenerateChunkNonce`,
+/// sing-vmess `chunk_aead.go` (`nonceCount uint16`), mihomo
+/// `transport/vmess/aead.go` (`count uint16`). A peer that stops at 65536
+/// records would cut off every long TCP transfer (~1 GiB) and every busy UDP
+/// association; the server decrypts with the wrapped counter, so we must too.
 pub struct BodyCipher {
     write: RecordCipher,
     write_iv: [u8; 16],
     read: RecordCipher,
     read_iv: [u8; 16],
-    write_counter: u32,
-    read_counter: u32,
+    write_counter: u16,
+    read_counter: u16,
     /// Reused by the write direction so every record does not allocate a
     /// fresh frame buffer.
     write_buf: Vec<u8>,
 }
-
-/// Number of distinct nonces a u16 counter can produce. Mux logical flows
-/// share this budget because they share the physical connection's keys.
-const NONCE_BUDGET: u32 = 1 << 16;
 
 impl BodyCipher {
     /// Build both directions' key schedules — test-only. Production relays
@@ -250,26 +247,16 @@ impl BodyCipher {
         c
     }
 
-    fn write_nonce(&mut self) -> std::io::Result<[u8; 12]> {
-        if self.write_counter >= NONCE_BUDGET {
-            return Err(std::io::Error::other(
-                "vmess body nonce budget exhausted; retiring connection",
-            ));
-        }
-        let nonce = record_nonce(&self.write_iv, self.write_counter as u16);
-        self.write_counter += 1;
-        Ok(nonce)
+    fn write_nonce(&mut self) -> [u8; 12] {
+        let nonce = record_nonce(&self.write_iv, self.write_counter);
+        self.write_counter = self.write_counter.wrapping_add(1);
+        nonce
     }
 
-    fn read_nonce(&mut self) -> std::io::Result<[u8; 12]> {
-        if self.read_counter >= NONCE_BUDGET {
-            return Err(std::io::Error::other(
-                "vmess body nonce budget exhausted; retiring connection",
-            ));
-        }
-        let nonce = record_nonce(&self.read_iv, self.read_counter as u16);
-        self.read_counter += 1;
-        Ok(nonce)
+    fn read_nonce(&mut self) -> [u8; 12] {
+        let nonce = record_nonce(&self.read_iv, self.read_counter);
+        self.read_counter = self.read_counter.wrapping_add(1);
+        nonce
     }
 
     /// Encrypt and write one body record: [len(2 BE)][ciphertext + tag(16)].
@@ -298,7 +285,7 @@ impl BodyCipher {
         // one write rather than a 2-byte length write and a body write.
         let len = u16::try_from(plaintext.len() + TAG_LEN)
             .map_err(|_| std::io::Error::other("vmess body record too large"))?;
-        let nonce = self.write_nonce()?;
+        let nonce = self.write_nonce();
         let frame = &mut self.write_buf;
         frame.clear();
         frame.reserve(2 + usize::from(len));
@@ -317,7 +304,7 @@ impl BodyCipher {
     /// record boundary (zero bytes into the next length prefix), or it sent
     /// the protocol's zero-length terminator record. Every `Err` — a
     /// partial length prefix, a body shorter than the prefix promised,
-    /// decrypt failure, nonce-budget exhaustion, transport error — means a
+    /// decrypt failure, transport error — means a
     /// corrupt session and is fatal for the exchange: a truncated AEAD
     /// record must not be mistaken for a half-close (issue #514 review).
     #[cfg(test)]
@@ -377,7 +364,7 @@ impl BodyCipher {
 
         buf.resize(len, 0);
         reader.read_exact(buf).await?;
-        let nonce = self.read_nonce()?;
+        let nonce = self.read_nonce();
         self.read.open(&nonce, buf)?;
         Ok(Some(()))
     }
@@ -567,47 +554,41 @@ mod tests {
 
         let (req_key, _) = test_keys();
         let mut cipher = BodyCipher::new(Security::Aes128Gcm, &req_key, &iv, 0x42);
-        assert_eq!(cipher.write_nonce().unwrap()[..2], [0, 0]);
-        assert_eq!(cipher.write_nonce().unwrap()[..2], [0, 1]);
+        assert_eq!(cipher.write_nonce()[..2], [0, 0]);
+        assert_eq!(cipher.write_nonce()[..2], [0, 1]);
     }
 
-    /// Record 0xFFFF is the last safe nonce; the 65537th record must error
-    /// (retiring the connection) rather than reuse nonce 0 under the same key.
-    /// Both AEAD suites and both directions — mux flows share the physical
-    /// connection's BodyCipher, so this is the shared budget too.
-    async fn nonce_budget_retires_instead_of_reusing() {
+    /// Every peer wraps the u16 nonce counter (see `BodyCipher`): the record
+    /// after counter 0xFFFF uses counter 0 again, both directions, both AEAD
+    /// suites. The wrapped record must equal what a fresh cipher emits at
+    /// counter 0 (an independent anchor — the loopback alone would hide a
+    /// self-consistent mistake) and the stream must keep decrypting.
+    async fn nonce_counter_wraps_like_the_peers() {
         let (req_key, req_iv) = test_keys();
         for security in [Security::Aes128Gcm, Security::ChaCha20Poly1305] {
-            // Write direction.
-            let mut c = BodyCipher::new(security, &req_key, &req_iv, 0x42);
-            c.write_counter = NONCE_BUDGET - 1;
-            let mut wire = Vec::new();
-            c.write_record(&mut wire, b"last").await.unwrap();
-            let err = c
-                .write_record(&mut wire, b"one too many")
-                .await
-                .unwrap_err();
-            assert!(err.to_string().contains("nonce budget exhausted"));
-
-            // Read direction: a peer that keeps sending past the budget must
-            // be refused, not decrypted under a reused nonce.
+            let msgs: [&[u8]; 4] = [b"fffe", b"ffff", b"zero", b"one!"];
             let mut c = BodyCipher::loopback(security, &req_key, &req_iv);
-            c.read_counter = NONCE_BUDGET - 1;
-            c.write_counter = NONCE_BUDGET - 1;
+            c.write_counter = u16::MAX - 1;
+            c.read_counter = u16::MAX - 1;
             let mut wire = Vec::new();
-            c.write_record(&mut wire, b"last").await.unwrap();
+            for m in msgs {
+                c.write_record(&mut wire, m).await.unwrap();
+            }
+            assert_eq!(c.write_counter, 2);
+
+            let mut fresh = BodyCipher::new(security, &req_key, &req_iv, 0x42);
+            let mut at_zero = Vec::new();
+            fresh.write_record(&mut at_zero, b"zero").await.unwrap();
+            assert_eq!(&wire[44..66], &at_zero[..], "{security:?}: wrapped nonce");
+
             let mut cursor = std::io::Cursor::new(wire);
-            assert_eq!(
-                c.read_record(&mut cursor).await.unwrap().as_deref(),
-                Some(b"last".as_slice())
-            );
-            // The next read would need nonce 0 again.
-            let mut more = Vec::new();
-            let mut c2 = BodyCipher::new(security, &req_key, &req_iv, 0x42);
-            c2.write_record(&mut more, b"overflow").await.unwrap();
-            let mut cursor = std::io::Cursor::new(more);
-            let err = c.read_record(&mut cursor).await.unwrap_err();
-            assert!(err.to_string().contains("nonce budget exhausted"));
+            for m in msgs {
+                assert_eq!(
+                    c.read_record(&mut cursor).await.unwrap().as_deref(),
+                    Some(m)
+                );
+            }
+            assert_eq!(c.read_counter, 2);
         }
     }
 
@@ -767,6 +748,6 @@ mod tests {
         read_record_decrypts_independently_encoded_response().await;
         write_record_decrypts_under_independently_derived_request_keys().await;
         read_record_eof_classification().await;
-        nonce_budget_retires_instead_of_reusing().await;
+        nonce_counter_wraps_like_the_peers().await;
     }
 }

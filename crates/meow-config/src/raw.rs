@@ -233,6 +233,9 @@ pub struct RawConfig {
     pub tproxy_port: Option<u16>,
     pub tproxy_sni: Option<bool>,
     pub routing_mark: Option<u32>,
+    /// mihomo `unified-delay`: delay probes report the second
+    /// request on a warm connection, without the dial/handshake cost.
+    pub unified_delay: Option<bool>,
     /// Wall-clock bound, in seconds, on the built-in DIRECT adapter's
     /// `TcpStream::connect`. Unset = unbounded (legacy behaviour, subject
     /// only to the OS connect timeout). Motivated by iOS/macOS
@@ -251,6 +254,10 @@ pub struct RawConfig {
     /// by `GET /logbook` (see `meow_common::logbook`). A meow extension; on
     /// by default.
     pub logbook: Option<RawLogbook>,
+    /// `traffic-ledger:` — per-day traffic by host, app, policy and
+    /// interface, served by `GET /traffic/ledger` (see
+    /// `meow_common::traffic_ledger`). A meow extension; on by default.
+    pub traffic_ledger: Option<RawTrafficLedger>,
     /// Static host mappings, preferred over upstream DNS lookups. Values may
     /// be a single IP, a list of IPs, or one domain-name alias. **Document
     /// order decides same-slot collision winners** and round-trips through
@@ -274,6 +281,48 @@ pub struct RawConfig {
     /// listener. The default is 256; explicit `0` disables the cap. Individual `listeners:`
     /// entries can override this with their own `max-connections` field.
     pub max_connections: Option<usize>,
+    /// `tcp-keepalive` — apply `SO_KEEPALIVE` plus the keepalive timing
+    /// knobs below to every *accepted inbound* socket (mixed/http/socks5/
+    /// tproxy/shadowsocks listeners; TUN netstack flows have no host
+    /// socket). Default `true`. These govern *inbound* sockets — they are
+    /// deliberately NOT upstream mihomo's `keep-alive-*` names, which tune
+    /// both inbound listeners and outbound dials there (the keys below
+    /// cover the inbound side only). `false` performs no keepalive
+    /// `setsockopt` at all (config-level kill switch).
+    pub tcp_keepalive: Option<bool>,
+    /// `tcp-keepalive-idle` — seconds of socket silence before the first
+    /// keepalive probe. Linux/Android/musl: `TCP_KEEPIDLE`; macOS/iOS:
+    /// `TCP_KEEPALIVE`; Windows: `SIO_KEEPALIVE_VALS.keepalivetime`;
+    /// OpenBSD/Haiku: not settable — keepalive still engages, timing falls
+    /// back to OS defaults. Default
+    /// [`meow_common::tcp_opts::DEFAULT_TCP_KEEPALIVE_IDLE_SECS`]; 1–32767 —
+    /// Linux rejects (`EINVAL`) `TCP_KEEPIDLE` above 32767, so the config
+    /// errors early instead of relying on the syscall.
+    pub tcp_keepalive_idle: Option<u64>,
+    /// `tcp-keepalive-interval` — seconds between keepalive probes
+    /// (`TCP_KEEPINTVL` / `SIO_KEEPALIVE_VALS.keepaliveinterval`;
+    /// unsupported on OpenBSD/Haiku). Default
+    /// [`meow_common::tcp_opts::DEFAULT_TCP_KEEPALIVE_INTERVAL_SECS`];
+    /// 1–32767 — Linux rejects (`EINVAL`) `TCP_KEEPINTVL` above 32767.
+    pub tcp_keepalive_interval: Option<u64>,
+    /// `tcp-keepalive-probes` — unanswered probes before the kernel
+    /// declares the peer dead (`TCP_KEEPCNT`). Not settable on Windows
+    /// (`SIO_KEEPALIVE_VALS` has no probe-count field; the OS default
+    /// applies). Default
+    /// [`meow_common::tcp_opts::DEFAULT_TCP_KEEPALIVE_PROBES`]; 1–127 —
+    /// Linux rejects (`EINVAL`) counts above 127, so the config errors
+    /// early instead of relying on the syscall.
+    pub tcp_keepalive_probes: Option<u32>,
+    /// `tcp-idle-timeout` — whole-connection relay idle bound in seconds:
+    /// an established relay that moves zero bytes in EITHER direction for
+    /// this long is torn down with a `TimedOut` error, releasing its
+    /// listener permit and stats entry. Covers flows keepalive cannot see
+    /// (TUN netstack streams, dead-but-still-ACKing upstreams). Absent
+    /// also leaves the bound disabled (pre-894 behaviour — the feature is
+    /// opt-in; [`meow_common::tcp_opts::DEFAULT_TCP_IDLE_TIMEOUT_SECS`]
+    /// is the canonical opt-in value); `0` is the explicit off-switch —
+    /// a silent relay then has no timer of its own.
+    pub tcp_idle_timeout: Option<u64>,
     /// No top-level `firewall` key exists — captured only to warn on the
     /// plausible mistake (`firewall:` belongs on a `listeners:` tproxy
     /// entry, issue #563).
@@ -283,6 +332,13 @@ pub struct RawConfig {
     /// tproxy entry; `udp-timeout` on `listeners:`/`tun:`, issue #564).
     pub udp: Option<serde_json::Value>,
     pub udp_timeout: Option<serde_json::Value>,
+    /// Upstream mihomo's `keep-alive-*` keys tune BOTH inbound listeners
+    /// and outbound dials — captured only to warn on the plausible
+    /// migration mistake (`tcp-keepalive*` above covers the inbound
+    /// side; the outbound-dialer tuning is not honored).
+    pub keep_alive_idle: Option<serde_json::Value>,
+    pub keep_alive_interval: Option<serde_json::Value>,
+    pub disable_keep_alive: Option<serde_json::Value>,
 }
 
 impl RawConfig {
@@ -336,9 +392,9 @@ pub type RawHosts = IndexMap<String, HostsValue>;
 /// `tun:` YAML section (issue #326) — mihomo-compatible TUN inbound.
 ///
 /// Only the fields meow-rs implements are typed; upstream-only fields
-/// (`stack`, `strict-route`, `auto-detect-interface`, …) are accepted and
-/// produce a `warn!` (Class B per ADR-0002, forward-compat), never a parse
-/// error — the same policy as [`RawGeoDataConfig`] and #328.
+/// (`strict-route`, `auto-detect-interface`, `auto-redirect`, …) are
+/// accepted and produce a `warn!` (Class B per ADR-0002, forward-compat),
+/// never a parse error — the same policy as [`RawGeoDataConfig`] and #328.
 ///
 /// `PartialEq` backs the config-commit TUN reconcile: the primary diff
 /// compares the parsed [`crate::TunConfig`]s, and this raw equality is the
@@ -358,8 +414,9 @@ pub struct RawTun {
     /// userspace stack's minimum, RFC 8200 §5).
     pub mtu: Option<u16>,
     /// CIDR assigned to the device. Default: the first /30 of
-    /// `dns.fake-ip-range` (`198.18.0.1/30`), like mihomo.
-    pub inet4_address: Option<String>,
+    /// `dns.fake-ip-range` (`198.18.0.1/30`), like mihomo. A string, or
+    /// mihomo's list form (`[]netip.Prefix`; only the first entry is used).
+    pub inet4_address: Option<serde_json::Value>,
     /// Route installation on startup. Accepts the mihomo boolean
     /// (`true` = capture all traffic where supported, `false` = off) plus
     /// the #375 mode strings `fake-ip` and `global`. Default true.
@@ -379,8 +436,11 @@ pub struct RawTun {
     /// global route scope into IPv6 capture (#375); ignored with a
     /// warning in every other mode. Default: none (IPv4 only).
     pub inet6_address: Option<serde_json::Value>,
-    // Upstream-only fields accepted for forward-compat; warn and ignore.
+    /// `stack` — which stack terminates the device's TCP: `system`/`mixed`
+    /// hand it to the host kernel (Linux; lwIP elsewhere), anything else
+    /// keeps lwIP. Free-form JSON: non-string values warn and keep lwIP.
     pub stack: Option<serde_json::Value>,
+    // Upstream-only fields accepted for forward-compat; warn and ignore.
     pub strict_route: Option<serde_json::Value>,
     pub auto_detect_interface: Option<serde_json::Value>,
     pub auto_redirect: Option<serde_json::Value>,
@@ -478,6 +538,13 @@ pub struct RawDns {
     /// (mihomo `proxy-server-nameserver`). When set, proxy adapters resolve
     /// their `server:` through these instead of the main `nameserver` list.
     pub proxy_server_nameserver: Option<Vec<String>>,
+    /// Nameservers used to resolve destinations dialed by `DIRECT`
+    /// outbounds (mihomo `direct-nameserver`). Unset keeps `DIRECT` on the
+    /// main `nameserver` list.
+    pub direct_nameserver: Option<Vec<String>>,
+    /// If true, `nameserver-policy` also applies to `direct-nameserver`
+    /// lookups (mihomo `direct-nameserver-follow-policy`, default false).
+    pub direct_nameserver_follow_policy: Option<bool>,
     pub fake_ip_filter: Option<Vec<String>>,
     /// If false, the hosts trie lookup is skipped entirely at query time.
     pub use_hosts: Option<bool>,
@@ -491,8 +558,30 @@ pub struct RawDns {
     /// value is a single server URL or a list of URLs. **Document order is
     /// the lookup priority** — see [`RawNameserverPolicy`].
     pub nameserver_policy: Option<RawNameserverPolicy>,
+    /// Confine queries matching a `nameserver-policy` key to that entry's
+    /// nameservers: their answer is used as-is — or the query fails —
+    /// instead of escalating through the `fallback-filter` domain gate,
+    /// its `ipcidr`/geoip rejection, or the main/`fallback:` tiers
+    /// (mihomo `ipExchange` parity, which returns right after a
+    /// `matchPolicy` hit). A matched domain therefore also bypasses the
+    /// fallback-filter's poisoned-answer checks — confining a zone to a
+    /// private upstream means trusting that upstream's answers. The flag
+    /// is policy-wide (per-key exclusivity is not offered) and also
+    /// constrains `direct-nameserver` lookups when
+    /// `direct-nameserver-follow-policy` is on. Defaults to false.
+    pub nameserver_policy_exclusive: Option<bool>,
     /// Controls when the `fallback:` nameservers replace the primary result.
     pub fallback_filter: Option<RawFallbackFilter>,
+    /// mihomo `prefer-h3`: every `https://` nameserver prefers HTTP/3 and
+    /// falls back to HTTP/1.1 when the QUIC exchange fails. A per-entry
+    /// `?h3=true` overrides it (HTTP/3 only), `?h3=false` turns it off, and
+    /// `?h3=prefer` opts a single entry in without the global flag.
+    ///
+    /// Requires a build with the `dns-quic` feature (meow-config forwards it
+    /// to `meow-dns/quic-dns`); without it, a config
+    /// that asks for HTTP/3 is a hard load error rather than a silent
+    /// downgrade (ADR-0002 Class A).
+    pub prefer_h3: Option<bool>,
 }
 
 /// A nameserver-policy value: either a single URL string or a list of URLs.
@@ -675,6 +764,35 @@ pub struct RawRuleProvider {
     pub header: Option<HashMap<String, StringOrList>>,
     /// Inline payload: list of rule strings (only for type=inline).
     pub payload: Option<Vec<String>>,
+}
+
+/// `traffic-ledger:` section.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub struct RawTrafficLedger {
+    /// Record traffic under `<home>/traffic/`. Default true.
+    pub enable: Option<bool>,
+    /// Record the hosts traffic went to. Default true.
+    pub hosts: Option<bool>,
+    /// Record the app that opened each flow: the package name on Android,
+    /// the owning process of a flow from this host elsewhere, looked up
+    /// for every such flow. Default true.
+    pub apps: Option<bool>,
+}
+
+impl RawTrafficLedger {
+    /// The effective `traffic-ledger.enable` of a config.
+    pub fn enabled(raw: Option<&Self>) -> bool {
+        raw.and_then(|ledger| ledger.enable).unwrap_or(true)
+    }
+
+    /// The ledger options of a config.
+    pub fn options(raw: Option<&Self>) -> meow_common::traffic_ledger::Options {
+        meow_common::traffic_ledger::Options {
+            hosts: raw.and_then(|ledger| ledger.hosts).unwrap_or(true),
+            apps: raw.and_then(|ledger| ledger.apps).unwrap_or(true),
+        }
+    }
 }
 
 /// `logbook:` section.

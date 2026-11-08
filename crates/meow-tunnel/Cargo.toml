@@ -25,6 +25,10 @@ uuid = { workspace = true }
 serde = { workspace = true }
 smol_str = { workspace = true }
 smallvec = { workspace = true }
+# `SockRef::peek` — a raw `recv(..., MSG_PEEK)` for the non-unix
+# peek-sniff arm, which must bypass tokio's readiness machinery (under
+# IOCP a half-close can leave none behind).
+socket2 = { workspace = true }
 time = { workspace = true }
 
 # The relay splices socket-to-socket traffic (`relay::splice`).
@@ -54,6 +58,8 @@ meow-rules = { workspace = true }
 serde-saphyr = { workspace = true }
 tempfile = { workspace = true }
 tracing-subscriber = { workspace = true }
+# The statistics tests record into a real traffic ledger.
+meow-common = { workspace = true, features = ["traffic-ledger"] }
 
 [lints]
 workspace = true

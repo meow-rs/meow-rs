@@ -173,11 +173,12 @@ impl DnsServer {
         }
 
         // Non-address queries (TXT, MX, SRV, HTTPS, SOA, PTR, …) go through
-        // the same nameserver pipeline as A/AAAA — domain-gate → policy →
-        // main → fallback — and the upstream `Message` is relayed back on
-        // the wire with only per-hop identity rewritten. We deliberately
-        // stop short of fake-IP synthesis here: only address records ever
-        // get a synthetic answer.
+        // the same nameserver pipeline as A/AAAA — an `exclusive` policy
+        // match first, then domain-gate → policy → main → fallback — and
+        // the upstream `Message` is relayed back on the wire with only
+        // per-hop identity rewritten. We deliberately stop short of
+        // fake-IP synthesis here: only address records ever get a
+        // synthetic answer.
         if qtype != 1 && qtype != 28 {
             return Self::handle_generic_forward(
                 id,

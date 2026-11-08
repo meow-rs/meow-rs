@@ -8,10 +8,13 @@
 //! upstream ahead of the rest of the stream. Only flows the tunnel cannot
 //! otherwise name are read: every other flow keeps its routing and timing.
 
+use std::io;
 use std::time::Duration;
 
 use meow_common::sniffer::{sniff_http, sniff_tls};
 use meow_common::Metadata;
+#[cfg(unix)]
+use tokio::io::Interest;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::TunnelInner;
@@ -24,6 +27,28 @@ const SNIFF_WINDOW: Duration = Duration::from_millis(200);
 /// Most bytes gathered while waiting for a ClientHello split across
 /// segments. Matches the listener sniffer's peek buffer.
 const SNIFF_CAP: usize = 8192;
+/// Poll cadence of the non-unix [`peek_first_bytes`] arm.
+#[cfg(not(unix))]
+const PEEK_POLL: Duration = Duration::from_millis(5);
+/// Re-peeks that see no new bytes before the wait gives up. On unix a
+/// stall follows a real readiness edge, so a stalled pair means a
+/// persistent non-data readiness — the peer closed while bytes are
+/// still queued, a state clearing cannot suppress. Other platforms
+/// issue a raw `MSG_PEEK` recv on a `PEEK_POLL` cadence instead (see
+/// [`peek_first_bytes`]): a stall is one poll of silence after bytes
+/// were seen, and the budget — half the window — leaves a slow split
+/// record ample time while still ending a closed-mid-record wait
+/// early whenever the close is observable; when it is not the
+/// deadline owns the wait.
+#[cfg(unix)]
+const STALL_LIMIT: u8 = 2;
+#[cfg(not(unix))]
+const STALL_LIMIT: u8 = (SNIFF_WINDOW.as_millis() / 2 / PEEK_POLL.as_millis()) as u8;
+// The budget above is const arithmetic: a `PEEK_POLL` of zero divides
+// by zero, and a window/cadence pair whose quotient passes `u8` would
+// silently truncate it — pin both ends at compile time.
+#[cfg(not(unix))]
+const _: () = assert!(PEEK_POLL.as_millis() > 0 && STALL_LIMIT > 0);
 
 /// Recover a name for a flow whose destination the tunnel cannot map back
 /// (a stale address in our fake-IP range, or another resolver's fake IP in
@@ -51,6 +76,177 @@ where
         metadata.sniff_host = name;
     }
     prefix
+}
+
+/// [`sniff_unnamed`] for a kernel socket: the first bytes
+/// are peeked, not read, so they stay queued in the socket — nothing has to
+/// be replayed and a DIRECT relay can still splice. A ClientHello split
+/// across segments is re-peeked until it is whole or the window ends.
+pub(crate) async fn sniff_unnamed_peek(
+    tunnel: &TunnelInner,
+    conn: &tokio::net::TcpStream,
+    metadata: &mut Metadata,
+) {
+    if !tunnel.needs_sniffed_name(metadata) {
+        return;
+    }
+    let buf = peek_first_bytes(conn).await;
+    if let Some(name) = sniff_tls(&buf).or_else(|| sniff_http(&buf)) {
+        metadata.sniff_host = name;
+    }
+}
+
+/// Peek the client's first bytes into a fresh buffer within
+/// [`SNIFF_WINDOW`], re-peeking while it holds the start of a TLS
+/// record that is not complete yet; returns only what was queued.
+///
+/// Unix arm. `peek` itself awaits each arrival, so its first call
+/// doubles as the wait for a client-first flow and [`wait_for_more`]
+/// parks on real readiness edges between segments. Re-peeks that saw
+/// no new bytes are bounded — a stall follows a real readiness edge,
+/// so a stalled pair is a persistent non-data readiness: the peer
+/// closed mid-record while bytes are still queued, a state clearing
+/// cannot suppress.
+#[cfg(unix)]
+async fn peek_first_bytes(conn: &tokio::net::TcpStream) -> Vec<u8> {
+    let deadline = tokio::time::Instant::now() + SNIFF_WINDOW;
+    let mut buf = vec![0u8; SNIFF_CAP];
+    let mut n = 0;
+    let mut stalls = 0u8;
+    loop {
+        match tokio::time::timeout_at(deadline, conn.peek(&mut buf)).await {
+            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+            Ok(Ok(read)) => {
+                if read <= n {
+                    stalls += 1;
+                    if stalls >= STALL_LIMIT {
+                        break;
+                    }
+                } else {
+                    n = read;
+                    stalls = 0;
+                }
+            }
+        }
+        if n == buf.len() || !tls_record_incomplete(&buf[..n]) {
+            break;
+        }
+        if !wait_for_more(conn, deadline).await {
+            break;
+        }
+    }
+    buf.truncate(n);
+    buf
+}
+
+/// Park until the next segment of an incomplete record may have arrived;
+/// `false` ends the sniff loop when the window closes first.
+///
+/// More of the record is on its way and `peek` left every byte queued,
+/// so the socket still reports READABLE — a bare `readable()` or `peek`
+/// returns at once and only a fixed sleep paced this loop before (up to
+/// ~40 wakeups per window). Report a deliberate `try_io` WouldBlock
+/// instead: tokio clears the readiness bit only when no newer event
+/// landed, so `readable()` below parks until the next real arrival —
+/// one wakeup per segment, like the `read` variant gets for free.
+#[cfg(unix)]
+async fn wait_for_more(conn: &tokio::net::TcpStream, deadline: tokio::time::Instant) -> bool {
+    let _ = conn.try_io(Interest::READABLE, || {
+        Err::<usize, _>(io::Error::from(io::ErrorKind::WouldBlock))
+    });
+    tokio::time::timeout_at(deadline, conn.readable())
+        .await
+        .is_ok()
+}
+
+/// Non-unix arm. Under IOCP a half-close can leave no read readiness
+/// behind at all — `peek` then parks until the deadline even while
+/// bytes still sit queued, and every readiness-gated peek (`poll_peek`,
+/// `try_io`) shares that wait — so this loop issues `recv(...,
+/// MSG_PEEK)` itself through `SockRef` on a fixed `PEEK_POLL` cadence,
+/// bypassing the readiness machinery entirely.
+///
+/// Windows CI shows the flip the stall guard leans on is total: once
+/// the peer's FIN lands a sync `MSG_PEEK` reports `WSAEWOULDBLOCK` for
+/// good — with bytes still queued, and it can hide the head from the
+/// very first poll on, so `n` never leaves 0 and the close reads
+/// exactly like a silent peer. The guard is therefore best-effort,
+/// not a close detector: a `WouldBlock` after bytes were already seen
+/// (`n > 0`) still counts a stall and ends a closed-mid-record wait
+/// after `STALL_LIMIT` silent ticks whenever the head was peeked
+/// before the FIN — but a `WouldBlock` before the first byte stays
+/// "nothing arrived yet", so a silent peer keeps the whole window
+/// and, in the blind case, so does a close. Observing the close
+/// itself would take `select`/`WSAEventSelect` FFI — out of
+/// proportion for an arm that exists for test parity only, since its
+/// caller `handle_tcp_socket` runs in production just on Linux
+/// (`tun.stack = system` is a Linux-only stack; elsewhere the TUN
+/// listener terminates TCP in lwIP). Harmless either way: the wait is
+/// still bounded by the deadline, the dial goes out with an empty
+/// prefix, and the relay still meets the queued head plus EOF.
+#[cfg(not(unix))]
+async fn peek_first_bytes(conn: &tokio::net::TcpStream) -> Vec<u8> {
+    let deadline = tokio::time::Instant::now() + SNIFF_WINDOW;
+    let mut buf = vec![0u8; SNIFF_CAP];
+    let sock = socket2::SockRef::from(conn);
+    let mut n = 0;
+    let mut stalls = 0u8;
+    loop {
+        // SAFETY: `MaybeUninit<u8>` shares `u8`'s layout and `peek`
+        // reports how much of the buffer it wrote; `buf` stays live
+        // and unchanged in length for the borrow.
+        let peeked = unsafe {
+            sock.peek(std::slice::from_raw_parts_mut(
+                buf.as_mut_ptr().cast::<std::mem::MaybeUninit<u8>>(),
+                buf.len(),
+            ))
+        };
+        match peeked {
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                // `n == 0`: nothing has arrived yet — a silent peer
+                // keeps the whole window, so the tick is not a stall
+                // (a FIN that beat every poll looks exactly like
+                // this; the deadline owns it — see the fn docs).
+                // `n > 0`: no progress after bytes were seen is the
+                // same stall as re-reading them — on Windows a FIN
+                // flips `MSG_PEEK` to `WSAEWOULDBLOCK` for good,
+                // queued head included, which is this shape.
+                if n > 0 {
+                    stalls += 1;
+                    if stalls >= STALL_LIMIT {
+                        break;
+                    }
+                }
+            }
+            // The peer closed and nothing is left queued, or a real
+            // socket error.
+            Ok(0) | Err(_) => break,
+            Ok(read) => {
+                if read <= n {
+                    stalls += 1;
+                    if stalls >= STALL_LIMIT {
+                        break;
+                    }
+                } else {
+                    n = read;
+                    stalls = 0;
+                }
+            }
+        }
+        // `n == 0` is only a WouldBlock that saw no data yet — keep
+        // polling; a completed gather or full buffer ends it.
+        if n > 0 && (n == buf.len() || !tls_record_incomplete(&buf[..n])) {
+            break;
+        }
+        if tokio::time::timeout_at(deadline, tokio::time::sleep(PEEK_POLL))
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+    buf.truncate(n);
+    buf
 }
 
 /// Read the client's first bytes within `window`. Keeps reading while the
@@ -221,6 +417,149 @@ mod tests {
         assert_eq!(md.sniff_host, "split.example.com");
         assert_eq!(prefix, hello);
         assert_eq!(prefix.capacity(), prefix.len(), "sniff buffer trimmed");
+    }
+
+    /// The kernel-socket variant (TUN system stack) peeks: the name is
+    /// found, a split ClientHello is gathered, and every byte is still
+    /// queued for the relay.
+    #[tokio::test]
+    async fn peek_sniff_names_the_flow_and_leaves_the_bytes_queued() {
+        let tunnel = mobile_tunnel();
+        let (mut client, mut server) = stream_pair().await;
+        let hello = client_hello("peek.example.com");
+        let (head, tail) = hello.split_at(10);
+        client.write_all(head).await.unwrap();
+        let tail = tail.to_vec();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            client.write_all(&tail).await.unwrap();
+        });
+
+        let mut md = tcp_to(SURGE_FAKE_IP, 443);
+        sniff_unnamed_peek(tunnel.inner(), &server, &mut md).await;
+        assert_eq!(md.sniff_host, "peek.example.com");
+        assert_eq!(relayed(Vec::new(), &mut server, hello.len()).await, hello);
+    }
+
+    /// A peer that half-closes mid-record ends the wait promptly on
+    /// unix, where the close is itself a fresh readiness edge and the
+    /// stall guard bounds the re-peeks. Off unix the close may never
+    /// be observed at all: `MSG_PEEK` reports `WSAEWOULDBLOCK` for
+    /// good once the FIN lands — the queued head included, and it can
+    /// be hidden from the very first poll — so a close then reads
+    /// exactly like a silent peer and only the deadline ends the wait
+    /// (see [`peek_first_bytes`]). The FIN is still held back a beat
+    /// to give the head a chance of being peeked first, and the
+    /// timing pin is platform-split: strict early exit on unix,
+    /// "bounded, not hung" off unix.
+    #[tokio::test]
+    async fn peek_sniff_ends_early_when_the_peer_closes_mid_record() {
+        let tunnel = mobile_tunnel();
+        let (mut client, server) = stream_pair().await;
+        let hello = client_hello("gone.example.com");
+        client.write_all(&hello[..10]).await.unwrap();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            client.shutdown().await.unwrap();
+        });
+
+        let start = tokio::time::Instant::now();
+        let mut md = tcp_to(SURGE_FAKE_IP, 443);
+        sniff_unnamed_peek(tunnel.inner(), &server, &mut md).await;
+        let waited = start.elapsed();
+        // Unix `peek` meets the close as a readiness edge: strict
+        // early exit. Off unix `MSG_PEEK` can be blind to it (see the
+        // fn docs), so the deadline is the bound — early exit stays
+        // possible and passes either way.
+        #[cfg(unix)]
+        let bound = SNIFF_WINDOW;
+        #[cfg(not(unix))]
+        let bound = SNIFF_WINDOW * 2;
+        assert!(waited < bound, "closed mid-record waited {waited:?}");
+        assert_eq!(md.sniff_host, "");
+    }
+
+    /// Poll-arm pin for the same half-close, FIN likewise held back
+    /// to give the queued head a chance of being peeked first.
+    /// Windows CI shows the blind spot in [`peek_first_bytes`] is
+    /// real: `MSG_PEEK` can report `WSAEWOULDBLOCK` from the first
+    /// poll on — the queued head never surfaces, `n` stays 0 — so the
+    /// deadline, not the stall budget, is the guaranteed bound. The
+    /// timing pin is therefore "bounded, not hung": early exit stays
+    /// possible whenever the head is observed (a `read <= n` repeat
+    /// or a post-data `WouldBlock` still counts a stall) and passes
+    /// either way. What must hold regardless: the wait ends, no name
+    /// is found, and the partial record was only peeked — every byte
+    /// is still queued for the relay.
+    #[cfg(not(unix))]
+    #[tokio::test]
+    async fn peek_poll_ends_early_when_the_peer_closes_mid_record() {
+        let tunnel = mobile_tunnel();
+        let (mut client, mut server) = stream_pair().await;
+        let hello = client_hello("gone.example.com");
+        client.write_all(&hello[..10]).await.unwrap();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            client.shutdown().await.unwrap();
+        });
+
+        let start = tokio::time::Instant::now();
+        let mut md = tcp_to(SURGE_FAKE_IP, 443);
+        sniff_unnamed_peek(tunnel.inner(), &server, &mut md).await;
+        let waited = start.elapsed();
+        assert!(
+            waited < SNIFF_WINDOW * 2,
+            "a peer close must not hang the sniff past the window, waited {waited:?}"
+        );
+        assert_eq!(md.sniff_host, "");
+        assert_eq!(relayed(Vec::new(), &mut server, 10).await, &hello[..10]);
+    }
+
+    /// Poll-arm pin: the first `SockRef::peek` of a client-first flow
+    /// is a bare `WouldBlock` — nothing has arrived. An `n == 0` pass
+    /// must keep polling rather than read an empty buffer as a
+    /// completed gather (the incomplete-record check is gated on
+    /// `n > 0` for it): the ClientHello lands a few ticks later and
+    /// still names the flow.
+    #[cfg(not(unix))]
+    #[tokio::test]
+    async fn peek_poll_waits_through_a_wouldblock_first_tick() {
+        let tunnel = mobile_tunnel();
+        let (mut client, server) = stream_pair().await;
+        let hello = client_hello("late.example.com");
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            client.write_all(&hello).await.unwrap();
+        });
+
+        let mut md = tcp_to(SURGE_FAKE_IP, 443);
+        sniff_unnamed_peek(tunnel.inner(), &server, &mut md).await;
+        assert_eq!(md.sniff_host, "late.example.com");
+    }
+
+    /// A silent peer keeps the whole window — the wait the read arm
+    /// pins in `silent_client_dials_after_the_window_without_losing_bytes`:
+    /// a `WouldBlock` before the first byte must never count as a
+    /// stall or a server-first protocol would be dialed early.
+    /// Peeking consumed nothing, so the banner still reaches the relay.
+    #[tokio::test]
+    async fn peek_sniff_waits_out_the_window_for_a_silent_peer() {
+        let tunnel = mobile_tunnel();
+        let (mut client, mut server) = stream_pair().await;
+        let mut md = tcp_to(SURGE_FAKE_IP, 22);
+
+        let start = tokio::time::Instant::now();
+        sniff_unnamed_peek(tunnel.inner(), &server, &mut md).await;
+        let waited = start.elapsed();
+        assert!(waited >= SNIFF_WINDOW, "waited {waited:?}");
+        assert!(waited < SNIFF_WINDOW * 3, "waited {waited:?}");
+        assert_eq!(md.sniff_host, "");
+
+        client.write_all(b"SSH-2.0-client\r\n").await.unwrap();
+        assert_eq!(
+            relayed(Vec::new(), &mut server, 16).await,
+            b"SSH-2.0-client\r\n"
+        );
     }
 
     #[tokio::test]

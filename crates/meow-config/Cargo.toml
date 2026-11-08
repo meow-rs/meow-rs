@@ -9,13 +9,22 @@ repository.workspace = true
 homepage.workspace = true
 
 [features]
-default = ["ss", "trojan", "vless", "vless-vision", "vless-encryption", "ech-tls-tunnel", "vmess", "snell", "hysteria2", "mux", "kcptun"]
+default = ["ss", "trojan", "vless", "vless-vision", "vless-encryption", "ech-tls-tunnel", "vmess", "snell", "hysteria2", "mux", "kcptun", "shadow-tls", "restls", "jls", "gost-plugin"]
 ss = ["meow-proxy/ss"]
+# Built-in SIP003 plugin transports on the `ss` outbound — opt-in, each
+# implies `ss`; `ss` alone keeps only simple-obfs + v2ray-plugin.
+shadow-tls = ["ss", "meow-proxy/shadow-tls"]
+restls = ["ss", "meow-proxy/restls"]
+jls = ["ss", "meow-proxy/jls"]
+# gost-plugin's `mux:` plugin-opt defaults to true and rides the `mux`
+# feature (same shape as kcptun below): keep the config-layer `smux:`/
+# `mux:` node blocks usable on any build that carries the plugin.
+gost-plugin = ["ss", "mux", "meow-proxy/gost-plugin"]
 trojan = ["meow-proxy/trojan"]
 # `meow-transport/reality` rides along with vless: `reality-opts` is only
-# reachable from the vless parser, and REALITY must not depend on boring-tls
-# (issue #377 — boring-sys cannot be linked on some targets; REALITY uses
-# x25519-dalek so it works with the rustls-only `full` feature set).
+# reachable from the vless parser. The reality feature pulls its own
+# BoringSSL (`tls` for the record layer, `boring/mlkem` for the hybrid
+# key share's ML-KEM-768); only its X25519 ECDH uses x25519-dalek.
 vless = ["meow-proxy/vless", "meow-transport/reality"]
 vless-vision = ["vless", "meow-proxy/vless-vision"]
 vless-encryption = ["vless", "meow-proxy/vless-encryption"]
@@ -44,6 +53,10 @@ mux = ["meow-proxy/mux"]
 # against the ADR-0007 size caps. Even when enabled, the code path is
 # force-disabled on iOS/Android targets (see `src/lib.rs`).
 external-ui-download = ["dep:zip"]
+# DNS over QUIC (`quic://`) and DoH over HTTP/3 (`dns.prefer-h3`, `?h3=`),
+# forwarded to meow-dns. Off by default: quiche adds build time and binary
+# size against the ADR-0007 caps, and only the `full` bundle ships it.
+dns-quic = ["meow-dns/quic-dns"]
 
 [dependencies]
 meow-common = { workspace = true }

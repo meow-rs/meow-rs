@@ -140,6 +140,12 @@ pub struct Hy2Adapter {
 
 impl Hy2Adapter {
     pub fn new(options: Hy2Options) -> std::result::Result<Self, String> {
+        if options.up_bps > 0 {
+            tracing::warn!(
+                "hysteria2 {}: `up` is ignored — meow runs BBRv2 (no Brutal in quiche)",
+                options.name
+            );
+        }
         let name = options.name.clone();
         let (addr, support_udp, cfg) = options.into_hysteria_config()?;
         Ok(Self {

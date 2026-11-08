@@ -30,7 +30,7 @@ Status meanings:
 | `GET /memory` | Compatible | HTTP/WebSocket; each client starts with the mihomo-compatible zero frame. |
 | `GET /dns/query` | Compatible | Supports address and generic RR types with the mihomo DNS JSON shape. |
 | `GET /rules` | Partial | `index`, `type`, `payload`, `proxy`, and `size` are present; rule-wrapper hit/miss data is unavailable. |
-| `GET/PUT /providers/proxies[/{name}]` | Compatible | Refresh failures return 503. HTTP providers report `subscriptionInfo` from the `subscription-userinfo` response header. |
+| `GET/PUT /providers/proxies[/{name}]` | Compatible | Refresh failures return 503. HTTP providers report `subscriptionInfo` from the `subscription-userinfo` response header. `expectedStatus` echoes the configured spec verbatim — `""` when unset or no health-check block, where mihomo reports `"*"`. |
 | `GET /providers/proxies/{name}/healthcheck` | Compatible | Uses provider health-check configuration and returns 204. |
 | `GET /providers/proxies/{provider}/{proxy}[/healthcheck]` | Compatible | Provider member detail and delay probe; members carry `provider-name`. |
 | `GET/PUT /providers/rules[/{name}]` | Compatible | Includes format (`YamlRule`, `TextRule` or `MrsRule`: what the payload parsed as), vehicle type, rule count, and RFC 3339 update time. |
@@ -99,6 +99,16 @@ The following routes are retained and do not collide with the mihomo surface:
   with `before=<id>`, polls with `since=<rev>`. `logbook: {enable: false}`
   turns it off; a `minimal` build reports `enabled: false`. See
   [ADR-0014](adr/0014-logbook.md) for the event kinds
+- `GET /traffic/ledger` and `DELETE /traffic/ledger`: the traffic of
+  local days by host (registrable domain), app, leaf policy or interface
+  label, kept for 62 days across restarts. `from` and `to` (`YYYY-MM-DD`,
+  today by default), `by` (`host`, `app`, `policy`, `interface`), and
+  `host`, `app`, `policy`, `interface` to drill into one group. A
+  policy row counts what the node carried as a `dialer-proxy` front too
+  (`via_upload`, `via_download`, `via_requests`), so `policy=` takes in
+  those flows as well. `traffic-ledger: {enable: false}` turns it off;
+  a `minimal` build reports `enabled: false`. See
+  [ADR-0015](adr/0015-traffic-ledger.md)
 
 When the mihomo baseline changes, compare `hub/route` and the outbound-group
 JSON marshalers against this table before marking a new release compatible.

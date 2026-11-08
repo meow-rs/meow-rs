@@ -7,6 +7,7 @@ pub mod adapter;
 pub mod asn_index;
 pub mod country_index;
 pub mod domain;
+pub mod domain_key;
 pub mod domain_keyword;
 pub mod domain_regex;
 pub mod domain_suffix;
@@ -38,7 +39,14 @@ pub mod src_geoip;
 pub mod sub_rule;
 pub mod uid;
 
-pub use parser::{parse_rule, parse_rule_flags, ParserContext, RuleFlags};
+pub use domain_key::{
+    domain_key_defect, domain_key_has_dead_label, domain_key_is_dead,
+    domain_keyword_payload_is_dead, domain_rule_payload_is_dead, domain_wildcard_payload_is_dead,
+    DomainKeyDefect,
+};
+pub use parser::{
+    parse_rule, parse_rule_flags, parse_rule_with_rule_sets, ParserContext, RuleFlags, RuleSets,
+};
 pub use rule_set::{
     build_rule_set, build_rule_set_checked, build_rule_set_from_mrs,
     build_rule_set_from_mrs_with_behavior, is_mrs_bytes, ClassicalRuleSet, DomainRuleSet,
