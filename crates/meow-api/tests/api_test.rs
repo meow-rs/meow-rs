@@ -79,6 +79,7 @@ fn test_state_with_backing(raw: RawConfig, config_path: Option<String>) -> Arc<A
         external_ui: None,
         traffic_feed: Default::default(),
         dns_server: Default::default(),
+        ui_storage: Default::default(),
     })
 }
 
@@ -118,6 +119,7 @@ fn test_state_with_route(raw: RawConfig, named: Vec<(&str, Arc<dyn Proxy>)>) -> 
         external_ui: None,
         traffic_feed: Default::default(),
         dns_server: Default::default(),
+        ui_storage: Default::default(),
     })
 }
 
@@ -160,6 +162,7 @@ fn test_state_with_secret(secret: &str) -> Arc<AppState> {
         external_ui: None,
         traffic_feed: Default::default(),
         dns_server: Default::default(),
+        ui_storage: Default::default(),
     })
 }
 
@@ -300,6 +303,7 @@ async fn external_ui_serves_static_directory() {
         external_ui: Some(dir.path().to_path_buf()),
         traffic_feed: Default::default(),
         dns_server: Default::default(),
+        ui_storage: Default::default(),
     });
     let app = create_router(state);
 
@@ -1043,10 +1047,108 @@ async fn get_rules_returns_initial() {
     let json = body_json(resp).await;
     let rules = json["rules"].as_array().unwrap();
     assert_eq!(rules.len(), 2);
-    assert_eq!(rules[0]["type"], "DOMAIN");
+    assert_eq!(rules[0]["type"], "Domain");
     assert_eq!(rules[0]["payload"], "example.com");
     assert_eq!(rules[0]["proxy"], "DIRECT");
-    assert_eq!(rules[1]["type"], "MATCH");
+    assert_eq!(rules[1]["type"], "Match");
+}
+
+/// mihomo's `PATCH /rules/disable` (`{index: disabled}`, any content type)
+/// and the `extra` object `/rules` reports it through.
+#[tokio::test]
+async fn disable_rules_sets_extra_disabled() {
+    let state = test_state_default();
+    let patch = |body: &'static str| {
+        create_router(Arc::clone(&state)).oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/rules/disable")
+                .body(axum::body::Body::from(body))
+                .unwrap(),
+        )
+    };
+    assert_eq!(
+        patch(r#"{"1":true,"9":true}"#).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        patch(r#"{"x":true}"#).await.unwrap().status(),
+        StatusCode::BAD_REQUEST
+    );
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::get("/rules")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let json = body_json(resp).await;
+    let rules = json["rules"].as_array().unwrap();
+    assert_eq!(rules[0]["extra"]["disabled"], false);
+    assert_eq!(rules[1]["extra"]["disabled"], true);
+    assert_eq!(rules[1]["extra"]["hitCount"], 0);
+    assert_eq!(rules[1]["extra"]["hitAt"], "1970-01-01T00:00:00Z");
+}
+
+/// The lines a client rebuilds from `GET /rules` (mihomo names:
+/// `Domain,example.com,DIRECT`) parse back; a negative index is skipped as
+/// upstream's `map[int]bool` does; the disabled switch survives the commit.
+#[tokio::test]
+async fn rules_round_trip_keeps_disabled_switch() {
+    let state = test_state_default();
+    let send = |method: &str, uri: &str, body: String| {
+        create_router(Arc::clone(&state)).oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body))
+                .unwrap(),
+        )
+    };
+    let rules = || async {
+        let resp = send("GET", "/rules", String::new()).await.unwrap();
+        body_json(resp).await["rules"].as_array().unwrap().clone()
+    };
+    let resp = send("PATCH", "/rules/disable", r#"{"-1":true,"0":true}"#.into());
+    assert_eq!(resp.await.unwrap().status(), StatusCode::NO_CONTENT);
+    let lines: Vec<String> = rules()
+        .await
+        .iter()
+        .map(|r| {
+            let (t, p, x) = (&r["type"], &r["payload"], &r["proxy"]);
+            let (t, p, x) = (
+                t.as_str().unwrap(),
+                p.as_str().unwrap(),
+                x.as_str().unwrap(),
+            );
+            if p.is_empty() {
+                format!("{t},{x}")
+            } else {
+                format!("{t},{p},{x}")
+            }
+        })
+        .collect();
+    assert_eq!(lines[0], "Domain,example.com,DIRECT");
+    let resp = send(
+        "POST",
+        "/rules",
+        serde_json::json!({ "rules": lines }).to_string(),
+    );
+    assert_eq!(resp.await.unwrap().status(), StatusCode::NO_CONTENT);
+    let resp = send(
+        "POST",
+        "/rules/append",
+        r#"{"rule":"DomainSuffix,a.org,DIRECT"}"#.into(),
+    );
+    assert_eq!(resp.await.unwrap().status(), StatusCode::NO_CONTENT);
+    let after = rules().await;
+    assert_eq!(after.len(), 3);
+    assert_eq!(after[0]["type"], "Domain");
+    assert_eq!(after[0]["extra"]["disabled"], true);
+    assert_eq!(after[1]["extra"]["disabled"], false);
+    assert_eq!(after[2]["type"], "DomainSuffix");
 }
 
 #[tokio::test]
@@ -1081,7 +1183,7 @@ async fn replace_rules() {
     let json = body_json(resp2).await;
     let rules = json["rules"].as_array().unwrap();
     assert_eq!(rules.len(), 2);
-    assert_eq!(rules[0]["type"], "DOMAIN-SUFFIX");
+    assert_eq!(rules[0]["type"], "DomainSuffix");
 
     // Also verify raw_config was updated
     let raw = state.raw_config.read();
@@ -3179,6 +3281,7 @@ mod delay_support {
             external_ui: None,
             traffic_feed: Default::default(),
             dns_server: Default::default(),
+            ui_storage: Default::default(),
         })
     }
 
@@ -3237,6 +3340,7 @@ mod delay_support {
             external_ui: None,
             traffic_feed: Default::default(),
             dns_server: Default::default(),
+            ui_storage: Default::default(),
         })
     }
 }
@@ -4615,6 +4719,7 @@ fn test_state_with_hosts_entry() -> Arc<AppState> {
         external_ui: None,
         traffic_feed: Default::default(),
         dns_server: Default::default(),
+        ui_storage: Default::default(),
     })
 }
 
@@ -4777,6 +4882,7 @@ async fn get_dns_query_txt_relays_upstream_sections_and_flags() {
         external_ui: None,
         traffic_feed: Default::default(),
         dns_server: Default::default(),
+        ui_storage: Default::default(),
     });
 
     let resp = create_router(state)
@@ -6131,7 +6237,7 @@ async fn unavailable_trusttunnel_node_fails_udp_closed_through_rule_resolution()
             adapter, rule_name, ..
         } = state.tunnel.inner().resolve_proxy(&metadata).await.unwrap();
         assert_eq!(
-            rule_name, "MATCH",
+            rule_name, "Match",
             "{target}: the UDP flow was skipped past the unavailable node"
         );
         assert_eq!(adapter.name(), target);

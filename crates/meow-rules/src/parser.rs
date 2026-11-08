@@ -142,7 +142,13 @@ fn parse_rule_depth(
         return Err(format!("invalid rule: {line}"));
     }
 
+    // mihomo's API spelling (`GET /rules` reports `DomainSuffix`) maps to
+    // the config grammar, so dashboard and bundled-UI round-trips parse.
     let rule_type = parts[0].trim();
+    let rule_type: &str = match meow_common::RuleType::from_mihomo_name(rule_type) {
+        Some(t) => t.as_str(),
+        None => rule_type,
+    };
 
     // MATCH only needs adapter
     if rule_type == "MATCH" {

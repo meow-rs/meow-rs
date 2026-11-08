@@ -157,7 +157,12 @@ pub async fn rules(ctx: &Ctx, filter: Option<&str>) -> anyhow::Result<()> {
         .context("meow answered /rules without a rule list")?;
     let mut shown = Vec::new();
     for raw in rules.drain(..) {
-        let rule: RuleInfo = serde_json::from_value(raw.clone())?;
+        let mut rule: RuleInfo = serde_json::from_value(raw.clone())?;
+        // `/rules` reports mihomo's names (`DomainSuffix`); show and filter
+        // on the config spelling users write (`DOMAIN-SUFFIX`).
+        if let Some(t) = meow_common::RuleType::from_mihomo_name(&rule.rule_type) {
+            rule.rule_type = t.as_str().to_string();
+        }
         if format::matches(filter, &[&rule.rule_type, &rule.payload, &rule.proxy]) {
             shown.push((raw, rule));
         }

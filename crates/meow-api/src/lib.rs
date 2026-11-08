@@ -6,6 +6,8 @@
 pub mod log_stream;
 mod logbook;
 pub mod routes;
+mod storage;
+pub use storage::{UiStorage, UiStorageSlot};
 mod traffic_ledger;
 pub mod ui;
 
@@ -359,6 +361,7 @@ impl ApiServer {
             external_ui: self.resolve_external_ui(),
             traffic_feed: Default::default(),
             dns_server: Arc::clone(&self.dns_server),
+            ui_storage: Default::default(),
             provider_dialer_registry: self.provider_dialer_registry.clone(),
         });
 
