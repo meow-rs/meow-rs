@@ -2814,6 +2814,7 @@ dependencies = [
  "serde-saphyr",
  "smallvec",
  "smol_str",
+ "socket2 0.5.10",
  "tempfile",
  "time",
  "tokio",
