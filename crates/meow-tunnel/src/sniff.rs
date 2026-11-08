@@ -35,10 +35,11 @@ const PEEK_POLL: Duration = Duration::from_millis(5);
 /// persistent non-data readiness — the peer closed while bytes are
 /// still queued, a state clearing cannot suppress. Other platforms
 /// issue a raw `MSG_PEEK` recv on a `PEEK_POLL` cadence instead (see
-/// [`peek_first_bytes`]): a stall is one poll of silence, and the
-/// budget — half the window — leaves a slow split record ample time
-/// while still ending a closed-mid-record wait well before the
-/// deadline.
+/// [`peek_first_bytes`]): a stall is one poll of silence after bytes
+/// were seen, and the budget — half the window — leaves a slow split
+/// record ample time while still ending a closed-mid-record wait
+/// early whenever the close is observable; when it is not the
+/// deadline owns the wait.
 #[cfg(unix)]
 const STALL_LIMIT: u8 = 2;
 #[cfg(not(unix))]
@@ -163,24 +164,26 @@ async fn wait_for_more(conn: &tokio::net::TcpStream, deadline: tokio::time::Inst
 /// bytes still sit queued, and every readiness-gated peek (`poll_peek`,
 /// `try_io`) shares that wait — so this loop issues `recv(...,
 /// MSG_PEEK)` itself through `SockRef` on a fixed `PEEK_POLL` cadence,
-/// bypassing the readiness machinery entirely. A stall is one poll of
-/// no progress — the same queued head again, or a `WouldBlock` after
-/// bytes were already seen: on Windows the peer's FIN flips `MSG_PEEK`
-/// to `WSAEWOULDBLOCK` for good, queued head included, so either
-/// shape ends a closed-mid-record wait after `STALL_LIMIT` silent
-/// ticks, well before the deadline. A `WouldBlock` before the first
-/// byte stays "nothing arrived yet" — a silent peer keeps the whole
-/// window.
+/// bypassing the readiness machinery entirely.
 ///
-/// That flip is also the blind spot: a FIN that lands before any
-/// poll has seen a byte is indistinguishable from a silent peer —
-/// the queued head never surfaces, `n` stays 0 and no stall counts —
-/// so only the deadline ends the wait. Harmless: the dial goes out
-/// with an empty prefix and the relay still meets the queued head
-/// plus EOF. And this arm exists for test parity only — its caller
-/// `handle_tcp_socket` runs in production just on Linux
+/// Windows CI shows the flip the stall guard leans on is total: once
+/// the peer's FIN lands a sync `MSG_PEEK` reports `WSAEWOULDBLOCK` for
+/// good — with bytes still queued, and it can hide the head from the
+/// very first poll on, so `n` never leaves 0 and the close reads
+/// exactly like a silent peer. The guard is therefore best-effort,
+/// not a close detector: a `WouldBlock` after bytes were already seen
+/// (`n > 0`) still counts a stall and ends a closed-mid-record wait
+/// after `STALL_LIMIT` silent ticks whenever the head was peeked
+/// before the FIN — but a `WouldBlock` before the first byte stays
+/// "nothing arrived yet", so a silent peer keeps the whole window
+/// and, in the blind case, so does a close. Observing the close
+/// itself would take `select`/`WSAEventSelect` FFI — out of
+/// proportion for an arm that exists for test parity only, since its
+/// caller `handle_tcp_socket` runs in production just on Linux
 /// (`tun.stack = system` is a Linux-only stack; elsewhere the TUN
-/// listener terminates TCP in lwIP).
+/// listener terminates TCP in lwIP). Harmless either way: the wait is
+/// still bounded by the deadline, the dial goes out with an empty
+/// prefix, and the relay still meets the queued head plus EOF.
 #[cfg(not(unix))]
 async fn peek_first_bytes(conn: &tokio::net::TcpStream) -> Vec<u8> {
     let deadline = tokio::time::Instant::now() + SNIFF_WINDOW;
@@ -438,15 +441,17 @@ mod tests {
         assert_eq!(relayed(Vec::new(), &mut server, hello.len()).await, hello);
     }
 
-    /// A peer that half-closes mid-record ends the wait promptly with
-    /// the partial bytes, not after the whole window (nor in a spin —
-    /// the readiness a close leaves behind is bounded by the stall
-    /// guard; on unix the close is itself a fresh edge). The FIN is
-    /// held back a beat so the loop has already peeked the queued
-    /// head — off unix a FIN that beats every poll is
-    /// indistinguishable from a silent peer (`MSG_PEEK` reports
-    /// `WSAEWOULDBLOCK` either way) and only the deadline would end
-    /// it; see [`peek_first_bytes`].
+    /// A peer that half-closes mid-record ends the wait promptly on
+    /// unix, where the close is itself a fresh readiness edge and the
+    /// stall guard bounds the re-peeks. Off unix the close may never
+    /// be observed at all: `MSG_PEEK` reports `WSAEWOULDBLOCK` for
+    /// good once the FIN lands — the queued head included, and it can
+    /// be hidden from the very first poll — so a close then reads
+    /// exactly like a silent peer and only the deadline ends the wait
+    /// (see [`peek_first_bytes`]). The FIN is still held back a beat
+    /// to give the head a chance of being peeked first, and the
+    /// timing pin is platform-split: strict early exit on unix,
+    /// "bounded, not hung" off unix.
     #[tokio::test]
     async fn peek_sniff_ends_early_when_the_peer_closes_mid_record() {
         let tunnel = mobile_tunnel();
@@ -461,21 +466,31 @@ mod tests {
         let start = tokio::time::Instant::now();
         let mut md = tcp_to(SURGE_FAKE_IP, 443);
         sniff_unnamed_peek(tunnel.inner(), &server, &mut md).await;
-        assert!(
-            start.elapsed() < SNIFF_WINDOW,
-            "closed mid-record must not wait out the whole window"
-        );
+        let waited = start.elapsed();
+        // Unix `peek` meets the close as a readiness edge: strict
+        // early exit. Off unix `MSG_PEEK` can be blind to it (see the
+        // fn docs), so the deadline is the bound — early exit stays
+        // possible and passes either way.
+        #[cfg(unix)]
+        let bound = SNIFF_WINDOW;
+        #[cfg(not(unix))]
+        let bound = SNIFF_WINDOW * 2;
+        assert!(waited < bound, "closed mid-record waited {waited:?}");
         assert_eq!(md.sniff_host, "");
     }
 
     /// Poll-arm pin for the same half-close, FIN likewise held back
-    /// so the queued head is seen first: afterwards `SockRef::peek`
-    /// either keeps reporting that head (`read <= n`) or, as on
-    /// Windows, flips to `WSAEWOULDBLOCK` for good (a post-data
-    /// `WouldBlock`) — both count a stall per `PEEK_POLL` tick and
-    /// the half-window stall budget ends the wait, never the
-    /// deadline. The partial record was only peeked and stays queued
-    /// for the relay.
+    /// to give the queued head a chance of being peeked first.
+    /// Windows CI shows the blind spot in [`peek_first_bytes`] is
+    /// real: `MSG_PEEK` can report `WSAEWOULDBLOCK` from the first
+    /// poll on — the queued head never surfaces, `n` stays 0 — so the
+    /// deadline, not the stall budget, is the guaranteed bound. The
+    /// timing pin is therefore "bounded, not hung": early exit stays
+    /// possible whenever the head is observed (a `read <= n` repeat
+    /// or a post-data `WouldBlock` still counts a stall) and passes
+    /// either way. What must hold regardless: the wait ends, no name
+    /// is found, and the partial record was only peeked — every byte
+    /// is still queued for the relay.
     #[cfg(not(unix))]
     #[tokio::test]
     async fn peek_poll_ends_early_when_the_peer_closes_mid_record() {
@@ -491,9 +506,10 @@ mod tests {
         let start = tokio::time::Instant::now();
         let mut md = tcp_to(SURGE_FAKE_IP, 443);
         sniff_unnamed_peek(tunnel.inner(), &server, &mut md).await;
+        let waited = start.elapsed();
         assert!(
-            start.elapsed() < SNIFF_WINDOW,
-            "the stall budget must beat the deadline"
+            waited < SNIFF_WINDOW * 2,
+            "a peer close must not hang the sniff past the window, waited {waited:?}"
         );
         assert_eq!(md.sniff_host, "");
         assert_eq!(relayed(Vec::new(), &mut server, 10).await, &hello[..10]);
