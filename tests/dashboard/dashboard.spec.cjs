@@ -65,6 +65,10 @@ const test = base.extend({
           return { type, payload: parts.join(','), proxy };
         });
         result = { rules: state.rules };
+      } else if (endpoint === '/rules/append' && method === 'POST') {
+        const [type, ...parts] = body.rule.split(',');
+        const proxy = parts.pop();
+        state.rules.push({ type, payload: parts.join(','), proxy });
       } else if (endpoint === '/rules/reorder') {
         const [rule] = state.rules.splice(body.from, 1);
         state.rules.splice(body.to, 0, rule);
@@ -194,7 +198,7 @@ test('rules add MATCH without payload, filter, reorder, and delete original indi
   await page.locator('#rule-target').selectOption('DIRECT');
   await page.locator('#tab-rules').getByRole('button', { name: 'Add', exact: true }).click();
   await expect(page.locator('#rules-list .rule-row')).toHaveCount(3);
-  expect(d.mutations()[0].body.rules).toEqual(['DOMAIN,example.test,DIRECT', 'DOMAIN,other.test,REJECT', 'MATCH,DIRECT']);
+  expect(d.mutations()[0]).toEqual(expect.objectContaining({ endpoint: '/rules/append', body: { rule: 'MATCH,DIRECT' } }));
   await page.locator('.rule-row').nth(2).dragTo(page.locator('.rule-row').nth(0));
   await expect(page.locator('.rule-row').first()).toContainText('MATCH,DIRECT');
   expect(d.mutations()).toContainEqual(expect.objectContaining({ endpoint: '/rules/reorder', body: { from: 2, to: 0 } }));
