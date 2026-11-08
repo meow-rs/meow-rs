@@ -190,6 +190,9 @@ fn wants_bulk_upgrade(amt: u64, buf_len: usize) -> bool {
 }
 
 // Keep the error kind unchanged so diagnostics never alter relay behavior.
+// Applied once per failure path, by the bidirectional loop, which supplies
+// the direction label; `HalfCopy` below propagates the raw error, so the
+// message composes to `client-to-proxy: connection reset by peer`.
 fn relay_operation_error(operation: &str, error: &io::Error) -> io::Error {
     io::Error::new(error.kind(), format!("{operation}: {error}"))
 }
@@ -263,14 +266,14 @@ impl<'buf> HalfCopy<'buf> {
                     self.pos = 0;
                     self.cap = filled;
                 }
-                Poll::Ready(Err(e)) => return Err(relay_operation_error("read", &e)),
+                Poll::Ready(Err(e)) => return Err(e),
                 Poll::Pending => {
                     // Nothing buffered and the reader is idle: push written
                     // bytes to the peer before parking this direction.
                     if self.need_flush {
                         match Pin::new(&mut *writer).poll_flush(cx) {
                             Poll::Ready(Ok(())) => self.need_flush = false,
-                            Poll::Ready(Err(e)) => return Err(relay_operation_error("flush", &e)),
+                            Poll::Ready(Err(e)) => return Err(e),
                             Poll::Pending => return Ok(Cycle::Pending),
                         }
                     }
@@ -307,7 +310,7 @@ impl<'buf> HalfCopy<'buf> {
                     on_progress(n as u64);
                     self.need_flush = true;
                 }
-                Poll::Ready(Err(e)) => return Err(relay_operation_error("write", &e)),
+                Poll::Ready(Err(e)) => return Err(e),
                 // Blocked on the writer — retrying this direction cannot help
                 // until its waker fires, even though bytes may have moved.
                 Poll::Pending => return Ok(Cycle::Pending),
@@ -317,7 +320,7 @@ impl<'buf> HalfCopy<'buf> {
         if self.read_done {
             return match Pin::new(&mut *writer).poll_shutdown(cx) {
                 Poll::Ready(Ok(())) => Ok(Cycle::Done),
-                Poll::Ready(Err(e)) => Err(relay_operation_error("shutdown", &e)),
+                Poll::Ready(Err(e)) => Err(e),
                 Poll::Pending => Ok(Cycle::Pending),
             };
         }

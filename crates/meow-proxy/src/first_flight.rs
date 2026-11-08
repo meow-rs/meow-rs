@@ -175,6 +175,10 @@ pub(crate) struct FirstFlight {
     flight: Vec<u8>,
     disabled: bool,
     retried: bool,
+    shutdown: bool,
+    // The `Mutex` is not for contention — every access goes through
+    // `Pin<&mut Self>` and uses `get_mut()`, which never locks. It is what
+    // makes the `Send`-only `DialFuture` `Sync`, as `ProxyConn` requires.
     pending: Mutex<Option<DialFuture>>,
     recovery_timer: Option<Pin<Box<tokio::time::Sleep>>>,
     recovery_timeout: Duration,
@@ -189,6 +193,7 @@ impl FirstFlight {
             flight: Vec::new(),
             disabled: false,
             retried: false,
+            shutdown: false,
             pending: Mutex::new(None),
             recovery_timer: None,
             recovery_timeout: Duration::from_secs(4),
@@ -269,6 +274,23 @@ impl FirstFlight {
         self.recovery_timer = Some(Box::pin(tokio::time::sleep_until(deadline)));
         true
     }
+    /// Whether the recovery budget armed by [`retry`] has lapsed. Shared by
+    /// every poll method that can outlive the redial: a read-silent caller
+    /// must not let the fresh conn idle past the deadline just because no
+    /// `poll_read` is there to observe the timer.
+    fn recovery_expired(&mut self, cx: &mut Context<'_>) -> bool {
+        if self
+            .recovery_timer
+            .as_mut()
+            .is_some_and(|t| t.as_mut().poll(cx).is_ready())
+        {
+            drop(self.inner.take());
+            self.disable();
+            self.wake_waiters();
+            return true;
+        }
+        false
+    }
     fn connected(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let pending = self.pending.get_mut().unwrap();
         if let Some(future) = pending.as_mut() {
@@ -307,6 +329,11 @@ impl AsyncRead for FirstFlight {
         if let Some(inner) = s.settled() {
             return Pin::new(inner).poll_read(cx, buf);
         }
+        // Shutdown may have cancelled a pending redial: with no live conn the
+        // woken reader must see a clean close, not a synthetic `NotConnected`.
+        if s.shutdown {
+            return Poll::Ready(Ok(()));
+        }
         s.read_waker = Some(cx.waker().clone());
         if buf.remaining() == 0 {
             return Poll::Ready(Ok(()));
@@ -341,13 +368,7 @@ impl AsyncRead for FirstFlight {
                     return Poll::Ready(Err(e));
                 }
                 Poll::Pending => {
-                    if s.recovery_timer
-                        .as_mut()
-                        .is_some_and(|t| t.as_mut().poll(cx).is_ready())
-                    {
-                        drop(s.inner.take());
-                        s.disable();
-                        s.wake_waiters();
+                    if s.recovery_expired(cx) {
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::TimedOut,
                             "TLS first-flight recovery budget",
@@ -384,6 +405,12 @@ impl AsyncWrite for FirstFlight {
             Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
             _ => {}
         }
+        if s.recovery_expired(cx) {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "TLS first-flight recovery budget",
+            )));
+        }
         let result = Pin::new(s.inner.as_mut().unwrap()).poll_write(cx, buf);
         if let Poll::Ready(Ok(n)) = result {
             s.remember(&buf[..n]);
@@ -397,13 +424,21 @@ impl AsyncWrite for FirstFlight {
         }
         s.write_waker = Some(cx.waker().clone());
         match s.connected(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            _ => Pin::new(s.inner.as_mut().unwrap()).poll_flush(cx),
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            _ => {}
         }
+        if s.recovery_expired(cx) {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "TLS first-flight recovery budget",
+            )));
+        }
+        Pin::new(s.inner.as_mut().unwrap()).poll_flush(cx)
     }
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let s = self.get_mut();
+        s.shutdown = true;
         s.disable();
         if s.pending.get_mut().unwrap().take().is_some() {
             s.wake_waiters();
@@ -682,14 +717,33 @@ mod tests {
         assert!(release.send(()).is_err(), "pending redial was not dropped");
         assert!(reader.0.load(Ordering::SeqCst) > read_before);
         assert!(writer.0.load(Ordering::SeqCst) > write_before);
+        // The cancelled redial left no live conn: the woken read half must
+        // see a clean close (EOF), not a synthetic `NotConnected` error.
+        let mut rb = ReadBuf::new(&mut b);
         assert!(matches!(
-            Pin::new(&mut conn).poll_read(&mut read_cx, &mut ReadBuf::new(&mut b)),
-            Poll::Ready(Err(_))
+            Pin::new(&mut conn).poll_read(&mut read_cx, &mut rb),
+            Poll::Ready(Ok(()))
         ));
+        assert!(rb.filled().is_empty());
         assert!(matches!(
             Pin::new(&mut conn).poll_flush(&mut write_cx),
             Poll::Ready(Err(_))
         ));
+    }
+    /// Shutdown that drops the pending redial leaves `inner` unset: reads on
+    /// the woken half report a clean EOF, so the relay logs a close rather
+    /// than a spurious `NotConnected` failure.
+    #[tokio::test]
+    async fn shutdown_during_pending_redial_reads_clean_eof() {
+        let (mut conn, release) = controlled_recovery().await;
+        let waker = Waker::from(Arc::new(CountWake::default()));
+        let mut cx = Context::from_waker(&waker);
+        assert!(Pin::new(&mut conn)
+            .poll_read(&mut cx, &mut ReadBuf::new(&mut [0; 1]))
+            .is_pending());
+        conn.shutdown().await.unwrap();
+        assert!(release.send(()).is_err(), "pending redial was not dropped");
+        assert_eq!(conn.read(&mut [0; 1]).await.unwrap(), 0);
     }
     #[test]
     fn strict_flight_validation_rejects_plaintext_extra_records_and_early_data() {
