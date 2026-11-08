@@ -165,12 +165,22 @@ async fn wait_for_more(conn: &tokio::net::TcpStream, deadline: tokio::time::Inst
 /// MSG_PEEK)` itself through `SockRef` on a fixed `PEEK_POLL` cadence,
 /// bypassing the readiness machinery entirely. A stall is one poll of
 /// no progress — the same queued head again, or a `WouldBlock` after
-/// bytes were already seen: on Windows a half-close with the head
-/// still queued reports `WSAEWOULDBLOCK` forever, the bytes never
-/// surfacing again, which is exactly the closed-mid-record shape.
-/// `STALL_LIMIT` silent ticks end the wait well before the deadline,
-/// while a `WouldBlock` before the first byte stays "nothing arrived
-/// yet" — a silent peer keeps the whole window.
+/// bytes were already seen: on Windows the peer's FIN flips `MSG_PEEK`
+/// to `WSAEWOULDBLOCK` for good, queued head included, so either
+/// shape ends a closed-mid-record wait after `STALL_LIMIT` silent
+/// ticks, well before the deadline. A `WouldBlock` before the first
+/// byte stays "nothing arrived yet" — a silent peer keeps the whole
+/// window.
+///
+/// That flip is also the blind spot: a FIN that lands before any
+/// poll has seen a byte is indistinguishable from a silent peer —
+/// the queued head never surfaces, `n` stays 0 and no stall counts —
+/// so only the deadline ends the wait. Harmless: the dial goes out
+/// with an empty prefix and the relay still meets the queued head
+/// plus EOF. And this arm exists for test parity only — its caller
+/// `handle_tcp_socket` runs in production just on Linux
+/// (`tun.stack = system` is a Linux-only stack; elsewhere the TUN
+/// listener terminates TCP in lwIP).
 #[cfg(not(unix))]
 async fn peek_first_bytes(conn: &tokio::net::TcpStream) -> Vec<u8> {
     let deadline = tokio::time::Instant::now() + SNIFF_WINDOW;
@@ -191,11 +201,13 @@ async fn peek_first_bytes(conn: &tokio::net::TcpStream) -> Vec<u8> {
         match peeked {
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 // `n == 0`: nothing has arrived yet — a silent peer
-                // keeps the whole window, so the tick is not a stall.
+                // keeps the whole window, so the tick is not a stall
+                // (a FIN that beat every poll looks exactly like
+                // this; the deadline owns it — see the fn docs).
                 // `n > 0`: no progress after bytes were seen is the
-                // same stall as re-reading them — on Windows this is
-                // the shape a half-close with a still-queued head
-                // takes (WSAEWOULDBLOCK forever, never the bytes).
+                // same stall as re-reading them — on Windows a FIN
+                // flips `MSG_PEEK` to `WSAEWOULDBLOCK` for good,
+                // queued head included, which is this shape.
                 if n > 0 {
                     stalls += 1;
                     if stalls >= STALL_LIMIT {
@@ -429,14 +441,22 @@ mod tests {
     /// A peer that half-closes mid-record ends the wait promptly with
     /// the partial bytes, not after the whole window (nor in a spin —
     /// the readiness a close leaves behind is bounded by the stall
-    /// guard; on unix the close is itself a fresh edge).
+    /// guard; on unix the close is itself a fresh edge). The FIN is
+    /// held back a beat so the loop has already peeked the queued
+    /// head — off unix a FIN that beats every poll is
+    /// indistinguishable from a silent peer (`MSG_PEEK` reports
+    /// `WSAEWOULDBLOCK` either way) and only the deadline would end
+    /// it; see [`peek_first_bytes`].
     #[tokio::test]
     async fn peek_sniff_ends_early_when_the_peer_closes_mid_record() {
         let tunnel = mobile_tunnel();
         let (mut client, server) = stream_pair().await;
         let hello = client_hello("gone.example.com");
         client.write_all(&hello[..10]).await.unwrap();
-        client.shutdown().await.unwrap();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            client.shutdown().await.unwrap();
+        });
 
         let start = tokio::time::Instant::now();
         let mut md = tcp_to(SURGE_FAKE_IP, 443);
@@ -448,11 +468,14 @@ mod tests {
         assert_eq!(md.sniff_host, "");
     }
 
-    /// Poll-arm pin for the same half-close: `SockRef::peek` keeps
-    /// reporting the queued head after the peer is gone, so each
-    /// `PEEK_POLL` tick counts a stall and the half-window stall
-    /// budget ends the wait — never the deadline. The partial record
-    /// was only peeked and stays queued for the relay.
+    /// Poll-arm pin for the same half-close, FIN likewise held back
+    /// so the queued head is seen first: afterwards `SockRef::peek`
+    /// either keeps reporting that head (`read <= n`) or, as on
+    /// Windows, flips to `WSAEWOULDBLOCK` for good (a post-data
+    /// `WouldBlock`) — both count a stall per `PEEK_POLL` tick and
+    /// the half-window stall budget ends the wait, never the
+    /// deadline. The partial record was only peeked and stays queued
+    /// for the relay.
     #[cfg(not(unix))]
     #[tokio::test]
     async fn peek_poll_ends_early_when_the_peer_closes_mid_record() {
@@ -460,7 +483,10 @@ mod tests {
         let (mut client, mut server) = stream_pair().await;
         let hello = client_hello("gone.example.com");
         client.write_all(&hello[..10]).await.unwrap();
-        client.shutdown().await.unwrap();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            client.shutdown().await.unwrap();
+        });
 
         let start = tokio::time::Instant::now();
         let mut md = tcp_to(SURGE_FAKE_IP, 443);
