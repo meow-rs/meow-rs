@@ -15,6 +15,17 @@ the canonical, in-repo source a release is cut from.
   (they used to fail the node). Unset, the connection window ceiling is MemTotal/16
   (4-24 MiB), so a slow reader cannot park ~24 MiB per connection on a small router;
   4 GB+ hosts keep the stock windows.
+- **mimalloc allocator on musl targets + `alloc-mimalloc` cargo feature** —
+  Linux/Android musl builds now swap the global allocator to mimalloc
+  unconditionally, fixing the stock allocator's freed-page retention that
+  ratcheted RSS upward under periodic churn (url-test sweeps, provider
+  rebuilds — observed 305 MB over 20 h on an embedded gateway). Other
+  Linux/Android builds can opt in via `--features alloc-mimalloc`. Uses
+  the mimalloc v2 line and no `override`, so C dependencies (e.g.
+  BoringSSL) still use the platform malloc; `dhat-heap` takes precedence
+  when both are enabled. Implements the `alloc-mimalloc` feature named
+  by ADR-0008 §2 — the default-on question for other targets stays open
+  for M2.
 - `dns.proxy-server-nameserver-policy` selects nameservers for node domains
   without changing ordinary DNS. It preserves policy order on reload and uses
   the existing `nameserver-policy-exclusive` flag. Node-policy dependencies

@@ -34,6 +34,11 @@ logbook = ["meow-common/logbook"]
 traffic-ledger = ["meow-common/traffic-ledger"]
 # Heap profiling via dhat crate — swaps global allocator; never enable in production.
 dhat-heap = ["dhat"]
+# mimalloc global allocator — opt-in, meant for musl static builds where the
+# stock allocator retains freed pages under churn (probe/provider refresh
+# ratchets RSS to hundreds of MB on long uptimes). No-ops outside of the
+# allocator swap; mutually exclusive with dhat-heap by cfg in main.rs.
+alloc-mimalloc = ["dep:mimalloc"]
 
 # Protocol features — forwarded to meow-proxy and meow-config
 ss = ["meow-config/ss", "meow-proxy/ss"]
@@ -145,6 +150,27 @@ libc = "0.2"
 log = "0.4"
 dhat = { workspace = true, optional = true }
 same-file = { workspace = true }
+
+# mimalloc semantics (see main.rs for the matching code gate):
+# - musl targets: non-optional dep, allocator is ALWAYS on — the retained-page
+#   churn-ratchet this fixes is musl's allocator, so every musl build carries
+#   the fix with zero operator action.
+# - other linux/android: opt-in via --features alloc-mimalloc (glibc's malloc
+#   already returns freed memory; the swap is a deployment choice there).
+# v2 line pinned deliberately: libmimalloc-sys 0.1.49+ vendors mimalloc v3,
+# whose 3.3.x has a multi-threaded heap-corruption SIGSEGV upstream
+# (microsoft/mimalloc#1287) — wrong gamble for a long-running tokio daemon.
+# The v2 feature selects the vendored v2 source; a sys crate that drops the
+# flag fails to resolve loudly rather than silently shipping v3, while the
+# Cargo.lock pin on libmimalloc-sys is the actual version guarantee.
+# No `override` feature: on musl static links it collides with musl's own
+# malloc symbol (microsoft/mimalloc#243); C deps like BoringSSL keep musl
+# malloc, only the Rust heap moves to mimalloc.
+[target.'cfg(all(any(target_os = "linux", target_os = "android"), target_env = "musl"))'.dependencies]
+mimalloc = { version = "0.1", features = ["v2"] }
+
+[target.'cfg(all(any(target_os = "linux", target_os = "android"), not(target_env = "musl")))'.dependencies]
+mimalloc = { version = "0.1", optional = true, features = ["v2"] }
 
 [target.'cfg(windows)'.dependencies]
 tracing-appender = "0.2.5"
