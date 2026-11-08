@@ -9,6 +9,7 @@ pub mod client;
 pub mod fakeip;
 pub mod host_resolver_hook;
 pub mod resolver;
+pub mod response_policy;
 pub mod server;
 pub mod upstream;
 

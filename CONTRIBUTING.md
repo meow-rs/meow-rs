@@ -72,7 +72,7 @@ cargo test -p meow-listener --all-features --lib udp_port_53
 # Mirrors the "Unit + integration tests (default features)" CI step.
 cargo test --lib --bin meow --bin meow-bench \
   --test socks5_udp_user \
-  --test common_test --test dns_cache_test --test config_test \
+  --test common_test --test dns_cache_test --test dns_response_rules --test config_test \
   --test statistics_test --test rules_test --test api_test \
   --test raii_guard_test --test http_connection_close \
   --test config_persistence_test --test systemd_config_test \

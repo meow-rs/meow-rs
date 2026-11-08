@@ -591,6 +591,8 @@ pub struct RawDns {
     /// value is a single server URL or a list of URLs. **Document order is
     /// the lookup priority** — see [`RawNameserverPolicy`].
     pub nameserver_policy: Option<RawNameserverPolicy>,
+    /// Ordered DNS wire responses (meow extension, see the response-policy spec).
+    pub response_rules: Option<Vec<RawDnsResponseRule>>,
     /// Confine queries matching a `nameserver-policy` key to that entry's
     /// nameservers: their answer is used as-is — or the query fails —
     /// instead of escalating through the `fallback-filter` domain gate,
@@ -632,6 +634,29 @@ impl RawNspValue {
             RawNspValue::Many(v) => v.iter().map(String::as_str).collect(),
         }
     }
+}
+
+/// One ordered response rule. Invalid fields fail loading even outside strict mode.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct RawDnsResponseRule {
+    #[serde(rename = "match")]
+    pub matcher: String,
+    pub types: Option<Vec<String>>,
+    pub action: RawDnsResponseAction,
+    pub address: Option<std::net::IpAddr>,
+    pub ttl: Option<u32>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum RawDnsResponseAction {
+    #[serde(rename = "nodata")]
+    NoData,
+    Refused,
+    Address,
+    FakeIp,
+    Forward,
 }
 
 /// The raw `nameserver-policy:` map, kept in YAML document order: that

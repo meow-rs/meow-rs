@@ -9181,4 +9181,111 @@ async fn configs_sniffing_uses_resolved_sniffer() {
     });
     let state = test_state(raw);
     assert!(!get_sniffing(&state).await, "explicit sniffer wins");
+
+#[tokio::test]
+async fn response_rules_reload_order_provider_generation_and_rejection() {
+    use base64::Engine as _;
+    use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
+    use hickory_proto::rr::{Name, RecordType};
+
+    async fn code(resolver: &Resolver, name: &str) -> ResponseCode {
+        let mut query = Message::new(42, MessageType::Query, OpCode::Query);
+        query.add_query(Query::query(
+            Name::from_ascii(name).unwrap(),
+            RecordType::HTTPS,
+        ));
+        let wire = meow_dns::DnsServer::handle_query(&query.to_vec().unwrap(), resolver)
+            .await
+            .unwrap();
+        Message::from_vec(&wire).unwrap().metadata.response_code
+    }
+
+    let state = test_state(test_raw_config());
+    let put = |yaml: &str| {
+        let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+        create_router(Arc::clone(&state)).oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+    };
+    let first = r#"mode: rule
+rules: ['MATCH,DIRECT']
+rule-providers:
+  selected: {type: inline, behavior: domain, payload: [one.test]}
+dns:
+  enable: true
+  use-system-hosts: false
+  nameserver: [rcode://refused]
+  response-rules:
+    - {match: 'rule-set:selected', action: refused}
+    - {match: '*', action: nodata}
+"#;
+    assert_eq!(put(first).await.unwrap().status(), StatusCode::NO_CONTENT);
+    let original = state.tunnel.resolver();
+    assert_eq!(code(&original, "one.test").await, ResponseCode::Refused);
+    assert_eq!(code(&original, "two.test").await, ResponseCode::NoError);
+
+    let second = first.replace("payload: [one.test]", "payload: [two.test]");
+    assert_eq!(put(&second).await.unwrap().status(), StatusCode::NO_CONTENT);
+    let current = state.tunnel.resolver();
+    assert!(!Arc::ptr_eq(&original, &current));
+    assert_eq!(code(&current, "one.test").await, ResponseCode::NoError);
+    assert_eq!(code(&current, "two.test").await, ResponseCode::Refused);
+    assert_eq!(code(&original, "one.test").await, ResponseCode::Refused);
+
+    // Identical raw input still binds the newly built provider generation.
+    assert_eq!(put(&second).await.unwrap().status(), StatusCode::NO_CONTENT);
+    let current = state.tunnel.resolver();
+    let invalid = second.replace("action: nodata", "action: fake-ip");
+    assert_eq!(
+        put(&invalid).await.unwrap().status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert!(Arc::ptr_eq(&current, &state.tunnel.resolver()));
+    assert_eq!(
+        code(&state.tunnel.resolver(), "two.test").await,
+        ResponseCode::Refused
+    );
+
+    let reordered = second.replace(
+        "    - {match: 'rule-set:selected', action: refused}\n    - {match: '*', action: nodata}",
+        "    - {match: '*', action: nodata}\n    - {match: 'rule-set:selected', action: refused}",
+    );
+    assert_eq!(
+        put(&reordered).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        code(&state.tunnel.resolver(), "two.test").await,
+        ResponseCode::NoError
+    );
+    // Pure domain rules must also detect a reorder without runtime references.
+    let plain = reordered.replace("rule-set:selected", "+.test");
+    assert_eq!(put(&plain).await.unwrap().status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        code(&state.tunnel.resolver(), "two.test").await,
+        ResponseCode::NoError
+    );
+    let reversed = plain.replace(
+        "    - {match: '*', action: nodata}\n    - {match: '+.test', action: refused}",
+        "    - {match: '+.test', action: refused}\n    - {match: '*', action: nodata}",
+    );
+    assert_eq!(
+        put(&reversed).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        code(&state.tunnel.resolver(), "two.test").await,
+        ResponseCode::Refused
+    );
+    assert_eq!(
+        put("rules: ['MATCH,DIRECT']\n").await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
 }

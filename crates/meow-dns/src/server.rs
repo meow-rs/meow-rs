@@ -1,4 +1,5 @@
 use crate::resolver::{AddressLookupResult, Resolver};
+use crate::response_policy::ResponseAction;
 use futures::FutureExt;
 use hickory_proto::op::{Edns, Message, MessageType, ResponseCode};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
@@ -215,6 +216,12 @@ impl DnsServer {
             .await;
         }
 
+        if let Some(response) =
+            Self::try_response_rule(data, question_len, &domain, qtype, resolver)
+        {
+            return Ok(response);
+        }
+
         // Check hosts trie first. If the domain is present in the hosts table
         // but has no IPs of the queried family, return NOERROR with zero answers
         // rather than NXDOMAIN — clients may retry on NXDOMAIN but not on an
@@ -369,6 +376,12 @@ impl DnsServer {
             return LocalAnswer::Upstream;
         }
 
+        if let Some(response) =
+            Self::try_response_rule(data, question_len, &domain, qtype, resolver)
+        {
+            return LocalAnswer::Answer(response);
+        }
+
         let outcome = {
             // Mirror handle_query's ordering exactly: check the hosts trie
             // BEFORE the IPv6-disable short-circuit — an AAAA query for a
@@ -501,54 +514,12 @@ impl DnsServer {
         // successful `parse_question` over `query[12..]`.
         debug_assert!(12 + question_len <= query.len());
 
-        // The declared record counts feed a `Vec::with_capacity` inside
-        // the hickory decode. A datagram cannot physically hold more
-        // resource records than `len / 11` (one-byte root name plus the
-        // 10-byte record header), so an impossible count is malformed
-        // input — FORMERR before the decoder reserves megabytes for it.
-        // The wire outcome is identical either way: hickory fails the
-        // same packet at record-read EOF.
-        let arcount = u16::from_be_bytes([query[10], query[11]]);
-        let declared_records = u16::from_be_bytes([query[6], query[7]]) as usize
-            + u16::from_be_bytes([query[8], query[9]]) as usize
-            + arcount as usize;
-        // `query.len() - 12 - question_len` == remaining record-region bytes.
-        if declared_records * 11 > query.len() - 12 - question_len {
-            return Ok(Self::build_formerr(id, flags, arcount > 0));
-        }
-
-        // Parse the inbound query before spending an upstream round-trip:
-        // the question echo, RD/CD request bits and EDNS presence all come
-        // from it. A query hickory rejects where `parse_question` succeeded
-        // (duplicate OPT, OPT outside the additional section, malformed
-        // trailing records — RFC 6891 §6.1.1) is malformed input and gets
-        // FORMERR, never a forwarded lookup.
-        let Ok(req) = Message::from_vec(query) else {
-            // The request's EDNS presence is undecodable here — fall back
-            // to the raw ARCOUNT heuristic the preamble uses.
-            return Ok(Self::build_formerr(id, flags, arcount > 0));
+        let req = match Self::parse_request(query, question_len) {
+            Ok(req) => req,
+            Err(response) => return Ok(response),
         };
-
-        // Defense in depth: the preamble already drops QR=1, so this arm
-        // is unreachable — kept so the private function cannot silently
-        // forward a response packet if it ever gains another caller.
-        if req.metadata.message_type != MessageType::Query {
-            return Err("response packet cannot be forwarded".into());
-        }
-
-        // RFC 6891 §6.1.3: an EDNS version newer than implemented (0) gets
-        // BADVERS — the extended rcode rides in a version-0 response OPT.
-        if req.edns.as_ref().is_some_and(|e| e.version() > 0) {
-            let mut resp = Message::new(id, MessageType::Response, req.metadata.op_code);
-            resp.metadata.recursion_desired = req.metadata.recursion_desired;
-            resp.metadata.checking_disabled = req.metadata.checking_disabled;
-            resp.metadata.recursion_available = true;
-            resp.metadata.response_code = ResponseCode::BADVERS;
-            resp.add_queries(req.queries.iter().cloned());
-            resp.edns = req.edns.as_ref().map(Self::response_edns);
-            return Ok(resp
-                .to_vec()
-                .unwrap_or_else(|_| Self::build_servfail(id, query, flags, question_len)));
+        if let Some(response) = Self::build_rule_response(&req, flags, domain, qtype, resolver) {
+            return Ok(response);
         }
 
         // The name sent upstream is the wire-faithful `Name` hickory decoded
@@ -657,6 +628,132 @@ impl DnsServer {
         Ok(resp
             .to_vec()
             .unwrap_or_else(|_| Self::build_servfail(id, query, flags, question_len)))
+    }
+
+    /// Decode once before a rule can synthesize a reply. Both address serve
+    /// arms share the generic path's bounds, FORMERR and BADVERS checks.
+    fn parse_request(query: &[u8], question_len: usize) -> Result<Message, Vec<u8>> {
+        let id = u16::from_be_bytes([query[0], query[1]]);
+        let flags = u16::from_be_bytes([query[2], query[3]]);
+        // The declared record counts feed a `Vec::with_capacity` inside
+        // the hickory decode. A datagram cannot physically hold more
+        // resource records than `len / 11` (one-byte root name plus the
+        // 10-byte record header), so an impossible count is malformed
+        // input — FORMERR before the decoder reserves megabytes for it.
+        // The wire outcome is identical either way: hickory fails the
+        // same packet at record-read EOF.
+        let arcount = u16::from_be_bytes([query[10], query[11]]);
+        let declared_records = u16::from_be_bytes([query[6], query[7]]) as usize
+            + u16::from_be_bytes([query[8], query[9]]) as usize
+            + arcount as usize;
+        // `query.len() - 12 - question_len` == remaining record-region bytes.
+        if declared_records * 11 > query.len() - 12 - question_len {
+            return Err(Self::build_formerr(id, flags, arcount > 0));
+        }
+
+        // Parse the inbound query before spending an upstream round-trip:
+        // the question echo, RD/CD request bits and EDNS presence all come
+        // from it. A query hickory rejects where `parse_question` succeeded
+        // (duplicate OPT, OPT outside the additional section, malformed
+        // trailing records — RFC 6891 §6.1.1) is malformed input and gets
+        // FORMERR, never a forwarded lookup.
+        let Ok(req) = Message::from_vec(query) else {
+            // The request's EDNS presence is undecodable here — fall back
+            // to the raw ARCOUNT heuristic the preamble uses.
+            return Err(Self::build_formerr(id, flags, arcount > 0));
+        };
+
+        // Defense in depth: the preamble already drops QR=1, so this arm
+        // is unreachable — kept so the private function cannot silently
+        // forward a response packet if it ever gains another caller.
+        if req.metadata.message_type != MessageType::Query {
+            return Err(Self::build_formerr(id, flags, arcount > 0));
+        }
+
+        // RFC 6891 §6.1.3: an EDNS version newer than implemented (0) gets
+        // BADVERS — the extended rcode rides in a version-0 response OPT.
+        if req.edns.as_ref().is_some_and(|e| e.version() > 0) {
+            let resp = Self::response_message(&req, ResponseCode::BADVERS);
+            return Err(resp
+                .to_vec()
+                .unwrap_or_else(|_| Self::build_servfail(id, query, flags, question_len)));
+        }
+
+        Ok(req)
+    }
+
+    fn response_message(req: &Message, code: ResponseCode) -> Message {
+        let mut response =
+            Message::new(req.metadata.id, MessageType::Response, req.metadata.op_code);
+        response.metadata.recursion_desired = req.metadata.recursion_desired;
+        response.metadata.checking_disabled = req.metadata.checking_disabled;
+        response.metadata.recursion_available = true;
+        response.metadata.response_code = code;
+        response.add_queries(req.queries.iter().cloned());
+        response.edns = req.edns.as_ref().map(Self::response_edns);
+        response
+    }
+
+    fn try_response_rule(
+        data: &[u8],
+        question_len: usize,
+        domain: &str,
+        qtype: u16,
+        resolver: &Resolver,
+    ) -> Option<Vec<u8>> {
+        // Keep the ordinary hot path free of full-message decoding.
+        if !resolver.has_response_rules() {
+            return None;
+        }
+        let req = match Self::parse_request(data, question_len) {
+            Ok(req) => req,
+            Err(response) => return Some(response),
+        };
+        let flags = u16::from_be_bytes([data[2], data[3]]);
+        Self::build_rule_response(&req, flags, domain, qtype, resolver)
+    }
+
+    fn build_rule_response(
+        req: &Message,
+        flags: u16,
+        domain: &str,
+        qtype: u16,
+        resolver: &Resolver,
+    ) -> Option<Vec<u8>> {
+        let action = resolver.response_action(domain, qtype)?;
+        let mut response = Self::response_message(req, ResponseCode::NoError);
+        let address = match action {
+            ResponseAction::Forward => return None,
+            ResponseAction::FakeIp if !matches!(qtype, 1 | 28) => return None,
+            ResponseAction::FakeIp => resolver.response_fake_ip(domain, qtype).map(|ip| {
+                (
+                    ip,
+                    resolver
+                        .fake_ip_ttl()
+                        .as_secs()
+                        .clamp(1, u64::from(u32::MAX)) as u32,
+                )
+            }),
+            ResponseAction::Address { address, ttl } => Some((address, ttl)),
+            ResponseAction::NoData => None,
+            ResponseAction::Refused => {
+                response.metadata.response_code = ResponseCode::Refused;
+                None
+            }
+        };
+        if let Some((address, ttl)) = address {
+            let rdata = match (address, qtype) {
+                (std::net::IpAddr::V4(ip), 1) => Some(RData::A(ip.into())),
+                (std::net::IpAddr::V6(ip), 28) => Some(RData::AAAA(ip.into())),
+                _ => None,
+            };
+            if let Some(rdata) = rdata {
+                response.add_answer(Record::from_rdata(req.queries[0].name.clone(), ttl, rdata));
+            }
+        }
+        Some(response.to_vec().unwrap_or_else(|_| {
+            Self::build_header_error(req.metadata.id, flags, 2, req.edns.is_some())
+        }))
     }
 
     /// Minimal per-hop response OPT synthesized from the client's request
@@ -2683,6 +2780,65 @@ mod tests {
                     "non-faked record keeps its legitimate hints"
                 );
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn response_rule_fake_ip_strips_hints_even_when_filter_bypasses_name() {
+        use crate::fakeip::{MemoryStore, Pool, Skipper, SkipperMode};
+        use crate::response_policy::ResponseRule;
+        use hickory_proto::rr::rdata::svcb::SvcParamKey;
+        for block_a in [false, true] {
+            let upstream = spawn_dns_responder(|response| {
+                response.add_answer(https_record_with_hints());
+            })
+            .await;
+            let mut resolver = Resolver::new(
+                vec![upstream],
+                vec![],
+                DnsMode::FakeIp,
+                meow_trie::DomainTrie::new(),
+                true,
+                true,
+            );
+            resolver.set_fakeip_v4(Arc::new(
+                Pool::new(
+                    "198.18.0.0/16".parse().unwrap(),
+                    Arc::new(MemoryStore::new(32)),
+                )
+                .unwrap(),
+            ));
+            resolver.set_fakeip_skipper(Skipper::new(
+                &["example.com".to_string()],
+                SkipperMode::BlackList,
+            ));
+            let mut rules = vec![ResponseRule {
+                matcher: Arc::new(|name| name == "example.com"),
+                query_types: vec![],
+                action: ResponseAction::FakeIp,
+            }];
+            if block_a {
+                rules.insert(
+                    0,
+                    ResponseRule {
+                        matcher: Arc::new(|name| name == "example.com"),
+                        query_types: vec![1],
+                        action: ResponseAction::NoData,
+                    },
+                );
+            }
+            resolver.set_response_rules(rules).unwrap();
+            let wire = DnsServer::handle_query(&sample_query(42, 65), &resolver)
+                .await
+                .unwrap();
+            let response = Message::from_vec(&wire).unwrap();
+            let RData::HTTPS(record) = &response.answers[0].data else {
+                panic!("HTTPS required");
+            };
+            let keys: Vec<_> = record.0.svc_params.iter().map(|(key, _)| *key).collect();
+            assert!(keys.contains(&SvcParamKey::Alpn));
+            assert!(!keys.contains(&SvcParamKey::Ipv4Hint));
+            assert!(!keys.contains(&SvcParamKey::Ipv6Hint));
         }
     }
 

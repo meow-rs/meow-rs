@@ -10,6 +10,7 @@ the canonical, in-repo source a release is cut from.
 
 ### Added
 
+<<<<<<< HEAD
 - `redir-port` / `listeners: type: redir`: mihomo's REDIRECT inbound, rules
   owned by the deployer. `listeners: type: tproxy` takes `transparent: true`
   for TCP by real TPROXY (`IP_TRANSPARENT`, Linux, needs `firewall: false`).
@@ -31,6 +32,11 @@ the canonical, in-repo source a release is cut from.
   across reloads; `GET/PUT/DELETE /storage/{key}` keeps dashboard settings
   (zashboard's sync); `POST /rules/append`. Rule lines in mihomo's API
   spelling (`DomainSuffix,a.com,DIRECT`) parse through `/rules`.
+- Optional `dns.response-rules` select ordered, query-type-specific NODATA,
+  REFUSED, static addresses with TTLs, forwarding or per-family fake-IP
+  answers. Rules reuse domain/geosite/provider matching, honor hosts
+  precedence and reload atomically with their resolver generation.
+
 - **`support-x25519mlkem768: true`** — REALITY now offers an
   X25519MLKEM768 key share (its own X25519 key) ahead of X25519, which
   Xray REALITY servers >= 26.9.8 require; the REALITY ClientVer is a
