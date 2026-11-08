@@ -263,6 +263,13 @@ pub trait Rule: Send + Sync {
     fn match_metadata(&self, metadata: &Metadata, helper: &RuleMatchHelper) -> bool;
     fn adapter(&self) -> &str;
     fn payload(&self) -> &str;
+    /// mihomo's `GetRecodeSize`: the number of records backing this rule —
+    /// a provider set's length, a GEOIP country's range count. `-1` when
+    /// the rule has no backing record set, which is what `GET /rules`
+    /// reports as `size`.
+    fn size(&self) -> i64 {
+        -1
+    }
     fn should_resolve_ip(&self) -> bool {
         false
     }

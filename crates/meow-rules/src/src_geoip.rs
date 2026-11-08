@@ -57,6 +57,12 @@ impl Rule for SrcGeoIpRule {
         &self.country
     }
 
+    /// Same range count [`crate::geoip::GeoIpRule::size`] reports.
+    fn size(&self) -> i64 {
+        let (v4, v6) = self.ranges.interval_counts();
+        (v4 + v6) as i64
+    }
+
     fn never_matches(&self) -> bool {
         // A payload absent from the loaded index materialises as an
         // empty range set — the rule can never fire (same precedent as

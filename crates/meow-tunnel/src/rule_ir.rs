@@ -328,6 +328,21 @@ fn check_target(probe: &dyn TargetProbe, m: &CompiledMatchResult<'_>) -> TargetC
     }
 }
 
+/// Trace line for a [`TargetCheck::Pass`] skip: a PASS-adapter match reads
+/// as upstream's "match Pass rule", while a disabled rule — also `Pass` —
+/// gets its own wording so the log cannot conflate the two skips.
+fn note_pass_skip(probe: &dyn TargetProbe, m: &CompiledMatchResult<'_>) {
+    if probe.rule_enabled(m.rule_index) {
+        debug!("{} match Pass rule", m.adapter_name);
+    } else {
+        debug!(
+            "{} match disabled rule #{}",
+            m.adapter_name,
+            m.rule_index + 1
+        );
+    }
+}
+
 /// One borrowed result from a compiled rule-set match.
 #[derive(Clone, Copy)]
 pub struct CompiledMatchResult<'a> {
@@ -671,7 +686,7 @@ impl CompiledRuleSet {
             let m = self.static_match(slot, rules);
             match check_target(probe, &m) {
                 TargetCheck::Usable => return Some(m),
-                TargetCheck::Pass => debug!("{} match Pass rule", m.adapter_name),
+                TargetCheck::Pass => note_pass_skip(probe, &m),
                 TargetCheck::Missing => on_missing(m),
             }
             tail_start += 1;
@@ -784,7 +799,7 @@ impl CompiledRuleSet {
                         TargetCheck::Usable => {
                             break 'scan LazyMatchOutcome::Matched(m);
                         }
-                        TargetCheck::Pass => debug!("{} match Pass rule", m.adapter_name),
+                        TargetCheck::Pass => note_pass_skip(probe, &m),
                         TargetCheck::Missing => on_missing(m),
                     }
                     tail_start += 1;
@@ -960,7 +975,7 @@ impl CompiledRuleSet {
                     // A PASS-typed target silently skips the rule — the
                     // match loop's `continue GetRules` upstream. Distinct
                     // from `Missing`: never warned, never buffered.
-                    TargetCheck::Pass => debug!("{} match Pass rule", m.adapter_name),
+                    TargetCheck::Pass => note_pass_skip(probe, &m),
                     TargetCheck::Missing => on_missing(m),
                 }
             }

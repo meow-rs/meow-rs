@@ -10,7 +10,7 @@ use axum::{
 };
 use dashmap::DashMap;
 use meow_common::logbook::{self, Level};
-use meow_common::TunnelMode;
+use meow_common::{TunnelMode, EPOCH_RFC3339};
 use meow_config::{
     proxy_provider::ProxyProvider,
     raw::{RawAutoRoute, RawConfig, RawProxyGroup, RawSubscription, RawTun},
@@ -619,12 +619,12 @@ struct RuleInfo<'a> {
 struct RuleExtra {
     disabled: bool,
     hit_count: u64,
-    hit_at: String,
+    /// `Cow` so the never-hit epoch answer stays one shared constant
+    /// instead of an allocation per rule.
+    hit_at: std::borrow::Cow<'static, str>,
     miss_count: u64,
     miss_at: &'static str,
 }
-
-const EPOCH_RFC3339: &str = "1970-01-01T00:00:00Z";
 
 #[derive(Serialize)]
 struct RulesResponse<'a> {
@@ -646,12 +646,14 @@ async fn get_rules(State(state): State<Arc<AppState>>) -> Response {
                 rule_type: r.rule_type().mihomo_name(),
                 payload: r.payload(),
                 proxy: r.adapter(),
-                size: -1,
+                size: r.size(),
                 extra: RuleExtra {
                     disabled: stat.disabled,
                     hit_count: stat.hits,
                     hit_at: unix_rfc3339(u64::from(stat.hit_at))
-                        .unwrap_or_else(|| EPOCH_RFC3339.to_string()),
+                        .map_or(std::borrow::Cow::Borrowed(EPOCH_RFC3339), |s| {
+                            std::borrow::Cow::Owned(s)
+                        }),
                     miss_count: 0,
                     miss_at: EPOCH_RFC3339,
                 },
@@ -669,16 +671,23 @@ async fn get_rules(State(state): State<Arc<AppState>>) -> Response {
 /// The body is read as JSON whatever its `Content-Type`, as upstream's
 /// `render.DecodeJSON` does — panels do not all send the header.
 async fn disable_rules(State(state): State<Arc<AppState>>, body: axum::body::Bytes) -> Response {
+    // The rule-mutation lane every sibling handler takes: `update_rules`
+    // /`update_routing` compute `RuleStats::carried` from a snapshot taken
+    // before their route write, so a disable landing between the snapshot
+    // and the install would be silently reverted despite answering 204.
+    let _mutation = CONFIG_MUTATION.lock().await;
     // Decoded whole before anything applies, as upstream's `map[int]bool`:
     // a bad key fails the request with nothing changed; an index outside
-    // the list (negative included) is skipped.
-    let Ok(body) = serde_json::from_slice::<HashMap<i64, bool>>(&body) else {
+    // the list (negative included) is skipped. `null` decodes to the nil
+    // map upstream — an empty patch, 204; `{"0":null}` is a `false`.
+    let Ok(body) = serde_json::from_slice::<Option<HashMap<i64, Option<bool>>>>(&body) else {
         return msg_err(StatusCode::BAD_REQUEST, "Body invalid");
     };
-    state.tunnel.set_rules_disabled(
-        body.into_iter()
-            .filter_map(|(index, disabled)| Some((usize::try_from(index).ok()?, disabled))),
-    );
+    state
+        .tunnel
+        .set_rules_disabled(body.unwrap_or_default().into_iter().filter_map(
+            |(index, disabled)| Some((usize::try_from(index).ok()?, disabled.unwrap_or(false))),
+        ));
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -881,7 +890,11 @@ async fn get_configs(State(state): State<Arc<AppState>>) -> Json<ConfigResponse>
         ipv6: meow_config::effective_ipv6(raw.ipv6),
         // The live setting, as mihomo reports `UnifiedDelay.Load()`.
         unified_delay: meow_proxy::health::unified_delay(),
-        sniffing: raw.sniffer.as_ref().and_then(|s| s.enable).unwrap_or(false),
+        // The resolved value, not just the `sniffer:` block: the deprecated
+        // `tproxy-sni` alias synthesises an enabled sniffer when the block
+        // is absent — `sniffer_config_from_raw` is the same resolution the
+        // config build uses (and `sniffer:` wins when both are present).
+        sniffing: meow_config::sniffer_config_from_raw(&raw).is_ok_and(|c| c.enable),
         skip_auth_prefixes: raw.skip_auth_prefixes.clone().unwrap_or_default(),
         tun_enable: tun_running,
         tun: TunFields::reported(raw.tun.as_ref(), tun_running),
@@ -2791,12 +2804,53 @@ async fn append_rule(
     let _mutation = CONFIG_MUTATION.lock().await;
     let snapshot = {
         let mut raw = state.raw_config.read().clone();
+        // `parse_rules_full` warns and skips a line that fails — an append
+        // would answer 204 while the rule never lands (a logic rule's
+        // display payload, e.g. `((T,p) && (T,p))`, is one such line).
+        // Dry-parse first so the caller hears about it; comments and blank
+        // lines parse as nothing by config-file convention and pass.
+        let trimmed = body.rule.trim();
+        if !trimmed.is_empty() && !trimmed.starts_with('#') {
+            if let Err(e) = dry_parse_rule_line(&state, &raw, trimmed) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("rule '{trimmed}' failed to parse: {e}"),
+                ));
+            }
+        }
         raw.rules.get_or_insert_with(Vec::new).push(body.rule);
         meow_config::subscription::reconcile_contribution_claims(&mut raw);
         raw
     };
     commit_raw_candidate(&state, snapshot, config_change("Appended a rule".into())).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Dry-run one `rules:` line through [`meow_config::rule_parser`]'s
+/// per-line path against the inputs the commit's rebuild will use — the
+/// live rule-provider sets and the config's sub-rule blocks. The geo
+/// context carries empty indexes, the same stand-in the offline `-t`
+/// validation uses: a GEOIP/IP-ASN line still parses, and were the real
+/// MMDB unreadable the rebuild's own context load would fail the commit
+/// anyway.
+fn dry_parse_rule_line(state: &AppState, raw: &RawConfig, line: &str) -> Result<(), String> {
+    let providers = meow_config::rule_provider::live_ruleset_map(&state.rule_providers.read());
+    let ctx = meow_rules::ParserContext {
+        geoip: Some(Arc::new(meow_rules::country_index::CountryIndex::default())),
+        asn: Some(Arc::new(meow_rules::asn_index::AsnIndex::default())),
+        geosite: None,
+    };
+    let sub_rules = match raw.sub_rules.as_ref() {
+        // A committed `sub-rules:` section always parses — on defect the
+        // rebuild errors louder than this check, so an empty map stands in.
+        Some(map) if !map.is_empty() => {
+            meow_config::sub_rules_parser::parse_sub_rules(map, &providers, &ctx)
+                .unwrap_or_default()
+        }
+        _ => Default::default(),
+    };
+    meow_config::rule_parser::parse_one_rule_or_subrule(line, &providers, &ctx, &sub_rules)
+        .map(|_| ())
 }
 
 async fn delete_rule(

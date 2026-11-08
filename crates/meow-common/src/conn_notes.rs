@@ -199,7 +199,7 @@ impl Serialize for NoteJson<'_> {
             .unwrap_or(time);
         let time = time
             .format(&Rfc3339)
-            .unwrap_or_else(|_| String::from("1970-01-01T00:00:00Z"));
+            .unwrap_or_else(|_| String::from(crate::EPOCH_RFC3339));
         let mut map = serializer.serialize_map(Some(3))?;
         map.serialize_entry("time", &time)?;
         map.serialize_entry("kind", self.kind.as_str())?;

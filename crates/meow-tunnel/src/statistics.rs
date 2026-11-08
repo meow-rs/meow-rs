@@ -887,7 +887,7 @@ fn chrono_now() -> SmolStr {
         }
     }
 
-    SmolStr::new_static("1970-01-01T00:00:00Z")
+    SmolStr::new_static(meow_common::EPOCH_RFC3339)
 }
 
 #[derive(Default)]

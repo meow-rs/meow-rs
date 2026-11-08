@@ -90,6 +90,21 @@ impl RouteTable {
             rule_stats: Arc::default(),
         }
     }
+
+    /// A copy with every field shared — the partial-update sites build a
+    /// table via `RouteTable { changed: …, ..prior.inherit() }` so the
+    /// single field list here, not three struct literals, is what a new
+    /// field or init step must join (issue #882 review).
+    fn inherit(&self) -> Self {
+        Self {
+            rules: Arc::clone(&self.rules),
+            domain_index: Arc::clone(&self.domain_index),
+            compiled_rules: Arc::clone(&self.compiled_rules),
+            proxies: Arc::clone(&self.proxies),
+            dialer_registry: self.dialer_registry.clone(),
+            rule_stats: Arc::clone(&self.rule_stats),
+        }
+    }
 }
 
 /// Whether [`Tunnel::flush_for_outbound_interface_change`] cancels tracked
@@ -514,7 +529,12 @@ impl TunnelInner {
         let Some(direct) = resolver.direct_resolver().map(Arc::clone) else {
             return;
         };
-        let Some(target) = self.resolve_proxy(metadata).await else {
+        // Probe only — "does this route end DIRECT?" — so it must not
+        // record the hit `resolve_proxy` counts: every UDP caller resolves
+        // for real right after (a double hit per flow), and a packet this
+        // probe leaves undialling would still have tallied (issue #882
+        // review).
+        let Some(target) = self.resolve_proxy_inner(metadata, false).await else {
             return;
         };
         if !routes_direct(target.adapter.as_ref(), metadata) {
@@ -547,6 +567,19 @@ impl TunnelInner {
     /// on the blocking pool — keeping it synchronous here would stall the
     /// calling worker on hosts with large socket tables (issue #515).
     pub async fn resolve_proxy(&self, metadata: &Metadata) -> Option<ResolvedTarget> {
+        self.resolve_proxy_inner(metadata, true).await
+    }
+
+    /// [`Self::resolve_proxy`] with the hit bookkeeping optional:
+    /// `record_hit = false` for the `resolve_udp_dst` "does this route end
+    /// DIRECT" probe, whose caller resolves for real right after — counting
+    /// there too would double a flow's `hitCount` (and tally packets that
+    /// never dial).
+    async fn resolve_proxy_inner(
+        &self,
+        metadata: &Metadata,
+        record_hit: bool,
+    ) -> Option<ResolvedTarget> {
         let mode = *self.mode.read();
         match mode {
             TunnelMode::Direct => {
@@ -595,7 +628,7 @@ impl TunnelInner {
                     route.rules.as_ref(),
                     &Self::target_probe(&route, match_metadata),
                 );
-                Some(self.materialize_rule_match(&route, result))
+                Some(self.materialize_rule_match(&route, result, record_hit))
             }
         }
     }
@@ -624,8 +657,10 @@ impl TunnelInner {
             .compiled_rules
             .match_rules_lazy(metadata, route.rules.as_ref(), &probe)
         {
-            LazyMatchOutcome::Matched(m) => Some(self.materialize_rule_match(&route, Some(m))),
-            LazyMatchOutcome::NoMatch => Some(self.materialize_rule_match(&route, None)),
+            LazyMatchOutcome::Matched(m) => {
+                Some(self.materialize_rule_match(&route, Some(m), true))
+            }
+            LazyMatchOutcome::NoMatch => Some(self.materialize_rule_match(&route, None, true)),
             LazyMatchOutcome::NeedsEnrichment {
                 needs_ip,
                 needs_process,
@@ -688,7 +723,7 @@ impl TunnelInner {
                     route.rules.as_ref(),
                     &Self::target_probe(&route, match_metadata),
                 );
-                Some(self.materialize_rule_match(&route, result))
+                Some(self.materialize_rule_match(&route, result, true))
             }
         }
     }
@@ -706,11 +741,15 @@ impl TunnelInner {
     /// Map a rule-match result to a [`ResolvedTarget`], recording match
     /// statistics; `None` falls through to DIRECT. The target retains
     /// `route` so the generation's dialer registry stays pinned across the
-    /// caller's dial (see [`Self::resolve_proxy`]).
+    /// caller's dial (see [`Self::resolve_proxy`]). `record_hit` is false
+    /// for `resolve_udp_dst`'s internal probe — only a resolution the
+    /// caller keeps counts toward `hitCount`/`rule_match` (issue #882
+    /// review).
     fn materialize_rule_match(
         &self,
         route: &Arc<RouteTable>,
         result: Option<CompiledMatchResult<'_>>,
+        record_hit: bool,
     ) -> ResolvedTarget {
         match result {
             Some(m) => {
@@ -755,10 +794,12 @@ impl TunnelInner {
                         Arc::clone(&self.reject) as Arc<dyn ProxyAdapter>
                     }
                 };
-                route.rule_stats.record_hit(m.rule_index);
-                self.stats
-                    .rule_match
-                    .increment(m.rule_type.as_str(), action);
+                if record_hit {
+                    route.rule_stats.record_hit(m.rule_index);
+                    self.stats
+                        .rule_match
+                        .increment(m.rule_type.as_str(), action);
+                }
                 conn_note!(
                     Rule,
                     "Matched rule #{} {} → {target}",
@@ -1188,8 +1229,7 @@ impl Tunnel {
                 rules: Arc::new(rules),
                 domain_index: Arc::new(new_index),
                 compiled_rules: Arc::new(compiled_rules),
-                proxies: Arc::clone(&route.proxies),
-                dialer_registry: route.dialer_registry.clone(),
+                ..route.inherit()
             };
             self.publish_dialer_registry(&new_route);
             std::mem::replace(&mut *route, Arc::new(new_route))
@@ -1210,6 +1250,65 @@ impl Tunnel {
         );
     }
 
+    /// `PATCH /rules/disable`: switch rules on or off by index (indexes past
+    /// the end are skipped) and recompile the plan without the disabled
+    /// ones, so the prune passes never fold a live rule into a disabled one.
+    ///
+    /// The switches themselves are atomics on the shared `RuleStats`, so a
+    /// read guard is enough to flip them and snapshot the Arcs — the
+    /// compile (a `Regex::new` per regex rule) then runs with NO lock held
+    /// rather than stalling every new connection's `route()` read for the
+    /// compile duration. The write section only installs the result, and
+    /// only while the snapshotted table is still installed.
+    pub fn set_rules_disabled(&self, changes: impl IntoIterator<Item = (usize, bool)>) {
+        let changes: Vec<(usize, bool)> = changes.into_iter().collect();
+        loop {
+            let (rules, stats, changed) = {
+                let route = self.inner.route.read();
+                let mut changed = false;
+                for &(index, disabled) in &changes {
+                    changed |= route.rule_stats.is_disabled(index) != disabled
+                        && route.rule_stats.set_disabled(index, disabled);
+                }
+                (
+                    Arc::clone(&route.rules),
+                    Arc::clone(&route.rule_stats),
+                    changed,
+                )
+            };
+            if !changed {
+                return;
+            }
+            let compiled = CompiledRuleSet::build_masked(&rules, |i| stats.is_disabled(i));
+            let old = {
+                let mut route = self.inner.route.write();
+                // Rule mutations serialize on the API's CONFIG_MUTATION
+                // lane, so in production the snapshotted Arcs are still
+                // installed; a mismatch means a rebuild ran outside the
+                // lane — our flips landed on its superseded RuleStats, so
+                // drop the guard and re-apply to whatever is current.
+                if !Arc::ptr_eq(&route.rules, &rules) || !Arc::ptr_eq(&route.rule_stats, &stats) {
+                    drop(route);
+                    continue;
+                }
+                self.inner
+                    .needs_ip_resolution
+                    .store(compiled.needs_ip_resolution(), Ordering::Relaxed);
+                self.inner
+                    .needs_process_lookup
+                    .store(compiled.needs_process_lookup(), Ordering::Relaxed);
+                let new_route = RouteTable {
+                    compiled_rules: Arc::new(compiled),
+                    ..route.inherit()
+                };
+                std::mem::replace(&mut *route, Arc::new(new_route))
+            };
+            // Same drop-outside-lock rule as `update_rules`.
+            drop(old);
+            return;
+        }
+    }
+
     /// Swap the proxies map while keeping the current rules, installing
     /// `dialer_registry` alongside it. Callers rebuilding a whole config
     /// should use [`Self::update_routing`], which carries the rebuild's own
@@ -1227,41 +1326,6 @@ impl Tunnel {
     /// `proxies` into — the route table must own it, or the map's
     /// `dialer-proxy` chains lose their cell and fail closed (issue #533
     /// review).
-    /// `PATCH /rules/disable`: switch rules on or off by index (indexes past
-    /// the end are skipped) and recompile the plan without the disabled
-    /// ones, so the prune passes never fold a live rule into a disabled one.
-    pub fn set_rules_disabled(&self, changes: impl IntoIterator<Item = (usize, bool)>) {
-        let old = {
-            let mut route = self.inner.route.write();
-            let mut changed = false;
-            for (index, disabled) in changes {
-                changed |= route.rule_stats.is_disabled(index) != disabled
-                    && route.rule_stats.set_disabled(index, disabled);
-            }
-            if !changed {
-                return;
-            }
-            let stats = Arc::clone(&route.rule_stats);
-            let compiled = CompiledRuleSet::build_masked(&route.rules, |i| stats.is_disabled(i));
-            self.inner
-                .needs_ip_resolution
-                .store(compiled.needs_ip_resolution(), Ordering::Relaxed);
-            self.inner
-                .needs_process_lookup
-                .store(compiled.needs_process_lookup(), Ordering::Relaxed);
-            let new_route = RouteTable {
-                rules: Arc::clone(&route.rules),
-                domain_index: Arc::clone(&route.domain_index),
-                compiled_rules: Arc::new(compiled),
-                proxies: Arc::clone(&route.proxies),
-                dialer_registry: route.dialer_registry.clone(),
-                rule_stats: stats,
-            };
-            std::mem::replace(&mut *route, Arc::new(new_route))
-        };
-        drop(old);
-    }
-
     pub fn update_proxies(
         &self,
         proxies: HashMap<SmolStr, Arc<dyn Proxy>>,
@@ -1273,12 +1337,9 @@ impl Tunnel {
         let old = {
             let mut route = self.inner.route.write();
             let new_route = RouteTable {
-                rules: Arc::clone(&route.rules),
-                domain_index: Arc::clone(&route.domain_index),
-                compiled_rules: Arc::clone(&route.compiled_rules),
                 proxies: Arc::new(proxies),
                 dialer_registry,
-                rule_stats: Arc::clone(&route.rule_stats),
+                ..route.inherit()
             };
             self.publish_dialer_registry(&new_route);
             std::mem::replace(&mut *route, Arc::new(new_route))
@@ -2313,6 +2374,67 @@ mod tests {
         assert_eq!(
             proxied.dst_ip, None,
             "non-DIRECT routes stay off direct-nameserver"
+        );
+    }
+
+    /// `resolve_udp_dst`'s route probe is bookkeeping-free: the flow's
+    /// real `resolve_proxy` right after is what counts the hit — the pair
+    /// must tally one, not two (issue #882 review).
+    #[tokio::test]
+    async fn resolve_udp_dst_probe_records_no_hit() {
+        use meow_dns::HostEntry;
+        use meow_rules::domain_suffix::DomainSuffixRule;
+        use meow_rules::final_rule::FinalRule;
+        use std::net::IpAddr;
+
+        let direct_ip = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 2));
+        let mut hosts: DomainTrie<HostEntry> = DomainTrie::new();
+        hosts.insert("direct.test", vec![direct_ip].into());
+        let direct = Resolver::new(vec![], vec![], DnsMode::Normal, hosts, true, true);
+        // No upstreams and no hosts: every main lookup fails, so the
+        // direct-resolver probe runs.
+        let mut main = Resolver::new(
+            vec![],
+            vec![],
+            DnsMode::Normal,
+            DomainTrie::new(),
+            false,
+            true,
+        );
+        main.set_direct_resolver(Arc::new(direct));
+        let tunnel = Tunnel::new(Arc::new(main));
+
+        let proxies = meow_config::rebuild_from_raw(&Default::default())
+            .unwrap()
+            .proxies;
+        tunnel.update_routing(
+            proxies,
+            vec![
+                Box::new(DomainSuffixRule::new("direct.test", "DIRECT")),
+                Box::new(FinalRule::new("REJECT")),
+            ],
+            Default::default(),
+        );
+
+        let mut meta = Metadata {
+            network: Network::Udp,
+            host: "direct.test".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+        tunnel.inner().resolve_udp_dst(&mut meta).await;
+        assert_eq!(meta.dst_ip, Some(direct_ip));
+        let route = tunnel.route_snapshot();
+        assert_eq!(
+            route.rule_stats.view(0).hits,
+            0,
+            "the probe must not record a hit"
+        );
+        tunnel.inner().resolve_proxy(&meta).await.unwrap();
+        assert_eq!(
+            route.rule_stats.view(0).hits,
+            1,
+            "the real resolution counts once"
         );
     }
 

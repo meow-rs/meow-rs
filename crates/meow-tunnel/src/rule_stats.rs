@@ -9,7 +9,7 @@
 //! matcher never visits most rules, so a miss count would mean evaluating
 //! every rule per connection; `/rules` reports zero for them.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering::Relaxed};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use meow_common::atomic::AtomicU;
@@ -33,16 +33,17 @@ pub struct RuleStatView {
 #[derive(Default)]
 pub struct RuleStats {
     entries: Box<[RuleStat]>,
-    /// Fast path: matching consults the per-rule switch only once any rule
-    /// has been disabled.
-    any_disabled: AtomicBool,
+    /// Fast path: matching consults the per-rule switch only while any
+    /// rule is disabled. A re-enable decrements back to 0 — a one-way
+    /// latch would leave the slow path on forever after one disable cycle.
+    disabled_count: AtomicUsize,
 }
 
 impl RuleStats {
     pub fn new(rule_count: usize) -> Self {
         Self {
             entries: (0..rule_count).map(|_| RuleStat::default()).collect(),
-            any_disabled: AtomicBool::new(false),
+            disabled_count: AtomicUsize::new(0),
         }
     }
 
@@ -61,6 +62,25 @@ impl RuleStats {
         type Key<'a> = (meow_common::RuleType, &'a str, &'a str);
         fn key(r: &dyn meow_common::Rule) -> Key<'_> {
             (r.rule_type(), r.payload(), r.adapter())
+        }
+        // Fast path — the common reload is the same list verbatim: equal
+        // keys in equal positions copy state slot-for-slot and skip the
+        // map + VecDeque allocation entirely.
+        if old_rules.len() == new_rules.len()
+            && old_rules
+                .iter()
+                .zip(new_rules.iter())
+                .all(|(a, b)| key(a.as_ref()) == key(b.as_ref()))
+        {
+            for (from, to) in old.entries.iter().zip(fresh.entries.iter()) {
+                to.hits.store(from.hits.load(Relaxed), Relaxed);
+                to.hit_at.store(from.hit_at.load(Relaxed), Relaxed);
+                if from.disabled.load(Relaxed) {
+                    to.disabled.store(true, Relaxed);
+                    fresh.disabled_count.fetch_add(1, Relaxed);
+                }
+            }
+            return fresh;
         }
         let mut by_key: std::collections::HashMap<Key<'a>, std::collections::VecDeque<usize>> =
             std::collections::HashMap::new();
@@ -81,7 +101,7 @@ impl RuleStats {
             to.hit_at.store(from.hit_at.load(Relaxed), Relaxed);
             if from.disabled.load(Relaxed) {
                 to.disabled.store(true, Relaxed);
-                fresh.any_disabled.store(true, Relaxed);
+                fresh.disabled_count.fetch_add(1, Relaxed);
             }
         }
         fresh
@@ -102,7 +122,7 @@ impl RuleStats {
 
     #[inline]
     pub fn is_enabled(&self, index: usize) -> bool {
-        !self.any_disabled.load(Relaxed)
+        self.disabled_count.load(Relaxed) == 0
             || !self
                 .entries
                 .get(index)
@@ -110,13 +130,19 @@ impl RuleStats {
     }
 
     /// Returns `false` for an index past the end (mihomo skips those).
+    /// `disabled_count` moves only on an actual transition — rewriting the
+    /// same value must not unbalance it.
     pub fn set_disabled(&self, index: usize, disabled: bool) -> bool {
         let Some(e) = self.entries.get(index) else {
             return false;
         };
-        e.disabled.store(disabled, Relaxed);
+        if e.disabled.swap(disabled, Relaxed) == disabled {
+            return true;
+        }
         if disabled {
-            self.any_disabled.store(true, Relaxed);
+            self.disabled_count.fetch_add(1, Relaxed);
+        } else {
+            self.disabled_count.fetch_sub(1, Relaxed);
         }
         true
     }
@@ -170,6 +196,26 @@ mod tests {
         assert!(s.is_enabled(1));
     }
 
+    /// The count gates `is_enabled`'s fast path: it must move only on a
+    /// real transition and return to 0 once nothing is disabled, not
+    /// latch on after the first disable (issue #882 review).
+    #[test]
+    fn disabled_count_tracks_transitions() {
+        let s = RuleStats::new(2);
+        s.set_disabled(0, true);
+        s.set_disabled(1, true);
+        assert_eq!(s.disabled_count.load(Relaxed), 2);
+        // Rewriting the same value is not a transition.
+        s.set_disabled(0, true);
+        assert_eq!(s.disabled_count.load(Relaxed), 2);
+        s.set_disabled(0, false);
+        assert_eq!(s.disabled_count.load(Relaxed), 1);
+        assert!(!s.is_enabled(1) && s.is_enabled(0));
+        s.set_disabled(1, false);
+        assert_eq!(s.disabled_count.load(Relaxed), 0);
+        assert!(s.is_enabled(0) && s.is_enabled(1));
+    }
+
     /// A rebuilt list keeps the switch of an equal rule, the n-th equal
     /// rule taking the n-th one's; new rules start enabled.
     #[test]
@@ -194,5 +240,22 @@ mod tests {
         assert!(c.is_enabled(1) && c.view(1).hits == 1);
         assert!(c.is_disabled(2));
         assert!(c.is_disabled(3));
+    }
+
+    /// The same list rebuilt verbatim hits the positional fast path —
+    /// same semantics as the map walk (issue #882 review).
+    #[test]
+    fn carried_identical_list_copies_positionally() {
+        use meow_rules::domain_suffix::DomainSuffixRule;
+        let r = |p: &str| -> Box<dyn meow_common::Rule> { Box::new(DomainSuffixRule::new(p, "P")) };
+        let old = vec![r("a.com"), r("b.com")];
+        let stats = RuleStats::new(old.len());
+        stats.set_disabled(1, true);
+        stats.record_hit(0);
+        let new = vec![r("a.com"), r("b.com")];
+        let c = RuleStats::carried(&old, &stats, &new);
+        assert_eq!(c.view(0).hits, 1);
+        assert!(c.is_enabled(0) && c.is_disabled(1));
+        assert_eq!(c.disabled_count.load(Relaxed), 1);
     }
 }

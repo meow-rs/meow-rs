@@ -4,12 +4,15 @@
 //! syncs its settings through it after login and logs an error when the
 //! route is missing. GET answers the stored JSON (`null` when unset), PUT
 //! stores a body that must be valid JSON of at most 1 MB, DELETE removes it.
-//! Keys are at most 64 bytes and the store keeps at most 16384 of them,
-//! evicting an existing key for a new one past that — upstream's limits.
+//! A key past 64 bytes is silently accepted but never stored — upstream's
+//! quirk: PUT still answers 204 and GET still returns `null`.
+//! The store keeps at most 16384 keys and about 1 MiB of them in all,
+//! evicting the least recently WRITTEN first — upstream's limits.
 //!
 //! Persisted as one JSON file in the home directory (`ui-storage.json`, a
-//! map of key → JSON text) next to `selector-cache.json`, written through
-//! atomically on every change — dashboards PUT only on a settings change.
+//! map of key → JSON text) next to `selector-cache.json`. Writes coalesce:
+//! a change marks the store dirty and one detached pass drains it, so a
+//! burst of PUTs costs O(1) writes rather than a tmp+rename each.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -31,16 +34,39 @@ const MAX_VALUE: usize = 1 << 20;
 const MAX_KEY: usize = 64;
 /// mihomo's `maxStorageEntries`.
 const MAX_ENTRIES: usize = 16384;
+/// The ~1 MiB aggregate budget (`key.len() + value.len()` over the map)
+/// upstream evicts under alongside the entry cap.
+const MAX_TOTAL_BYTES: usize = 1 << 20;
 const FILE_NAME: &str = "ui-storage.json";
 
 pub struct UiStorage {
     path: PathBuf,
-    map: Mutex<HashMap<String, String>>,
+    store: Mutex<Store>,
     /// Serializes the disk writes so the last rename carries the newest map.
     write_lock: Mutex<()>,
-    /// The file is behind the map (a write failed): the next PUT or DELETE
-    /// persists even when it changes nothing.
+    /// The map is ahead of the file — a persist pass is owed. Left set
+    /// when a write fails too, so the next PUT or DELETE persists even
+    /// when it changes nothing.
     dirty: AtomicBool,
+    /// A persist pass is running or queued on the blocking pool — rapid
+    /// updates coalesce behind it instead of queueing one write each.
+    persist_in_flight: AtomicBool,
+}
+
+#[derive(Default)]
+struct Store {
+    map: HashMap<String, Entry>,
+    /// `key.len() + value.len()` over the whole map — what the
+    /// [`MAX_TOTAL_BYTES`] budget counts.
+    total_bytes: usize,
+    /// Last-write sequence: eviction order, oldest write first.
+    seq: u64,
+}
+
+struct Entry {
+    value: String,
+    /// `Store::seq` at the last write — rewriting refreshes recency.
+    seq: u64,
 }
 
 /// Per-router slot for the store, filled on first use.
@@ -48,7 +74,7 @@ pub type UiStorageSlot = Arc<OnceLock<Arc<UiStorage>>>;
 
 impl UiStorage {
     fn open(path: PathBuf) -> Self {
-        let map = match std::fs::read(&path) {
+        let map: HashMap<String, String> = match std::fs::read(&path) {
             Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
                 warn!(path = %path.display(), error = %e, "ui storage: malformed, starting empty");
                 HashMap::new()
@@ -59,44 +85,141 @@ impl UiStorage {
                 HashMap::new()
             }
         };
+        let mut store = Store::default();
+        for (key, value) in map {
+            store.seq += 1;
+            store.total_bytes += key.len() + value.len();
+            store.map.insert(
+                key,
+                Entry {
+                    value,
+                    seq: store.seq,
+                },
+            );
+        }
         Self {
             path,
-            map: Mutex::new(map),
+            store: Mutex::new(store),
             write_lock: Mutex::new(()),
             dirty: AtomicBool::new(false),
+            persist_in_flight: AtomicBool::new(false),
         }
     }
 
     fn get(&self, key: &str) -> Option<String> {
-        self.map.lock().get(key).cloned()
+        self.store.lock().map.get(key).map(|e| e.value.clone())
     }
 
     /// `None` deletes. Returns whether the map changed.
     fn set(&self, key: &str, value: Option<String>) -> bool {
-        let mut map = self.map.lock();
+        // Upstream's quirk: an overlong key is silently accepted — nothing
+        // is stored, the answer is still 204.
+        if key.len() > MAX_KEY {
+            return false;
+        }
+        let mut store = self.store.lock();
         match value {
-            Some(v) if map.get(key) == Some(&v) => false,
+            Some(v) if store.map.get(key).is_some_and(|e| e.value == v) => false,
             Some(v) => {
-                if map.len() >= MAX_ENTRIES && !map.contains_key(key) {
-                    if let Some(old) = map.keys().next().cloned() {
-                        map.remove(&old);
+                let exists = store.map.contains_key(key);
+                let old_len = store.map.get(key).map_or(0, |e| key.len() + e.value.len());
+                let new_len = key.len() + v.len();
+                // A new key must fit the entry cap; every write must fit
+                // the byte budget — evict oldest-written entries (never
+                // the key being written) until both hold.
+                while (!exists && store.map.len() >= MAX_ENTRIES)
+                    || store.total_bytes - old_len + new_len > MAX_TOTAL_BYTES
+                {
+                    let Some(oldest) = store
+                        .map
+                        .iter()
+                        .filter(|(k, _)| k.as_str() != key)
+                        .min_by_key(|(_, e)| e.seq)
+                        .map(|(k, _)| k.clone())
+                    else {
+                        // Nothing left to evict — a lone oversized entry
+                        // still lands (upstream's cap is approximate too).
+                        break;
+                    };
+                    if let Some(evicted) = store.map.remove(&oldest) {
+                        store.total_bytes -= oldest.len() + evicted.value.len();
                     }
                 }
-                map.insert(key.to_string(), v);
+                store.seq += 1;
+                let seq = store.seq;
+                if let Some(old) = store.map.insert(key.to_string(), Entry { value: v, seq }) {
+                    store.total_bytes -= key.len() + old.value.len();
+                }
+                store.total_bytes += new_len;
                 true
             }
-            None => map.remove(key).is_some(),
+            None => match store.map.remove(key) {
+                Some(old) => {
+                    store.total_bytes -= key.len() + old.value.len();
+                    true
+                }
+                None => false,
+            },
         }
     }
 
-    fn persist(&self) {
+    /// One synchronous write of the current map. Returns whether it FAILED.
+    fn write_now(&self) -> bool {
         let _write = self.write_lock.lock();
-        let snapshot = self.map.lock().clone();
-        let failed = write_atomic(&self.path, &snapshot).is_err_and(|e| {
+        let snapshot: HashMap<String, String> = self
+            .store
+            .lock()
+            .map
+            .iter()
+            .map(|(k, e)| (k.clone(), e.value.clone()))
+            .collect();
+        write_atomic(&self.path, &snapshot).is_err_and(|e| {
             warn!(path = %self.path.display(), error = %e, "ui storage: persist failed");
             true
-        });
-        self.dirty.store(failed, Ordering::Relaxed);
+        })
+    }
+
+    #[cfg(test)]
+    fn persist(&self) {
+        self.dirty.store(self.write_now(), Ordering::Relaxed);
+    }
+
+    /// Mark the store dirty and schedule the drain. A change that lands
+    /// while a pass runs costs no extra write — the pass re-checks `dirty`
+    /// before exiting, so a burst of PUTs persists O(1) times.
+    fn request_persist(self: &Arc<Self>) {
+        self.dirty.store(true, Ordering::Release);
+        if self.persist_in_flight.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let store = Arc::clone(self);
+        tokio::task::spawn_blocking(move || store.persist_run());
+    }
+
+    /// The detached drain: write while dirty, then hand the flag back.
+    fn persist_run(&self) {
+        loop {
+            while self.dirty.swap(false, Ordering::AcqRel) {
+                if self.write_now() {
+                    // The file stays behind the map — keep dirty set so
+                    // the next update owes the retry (and a no-change one
+                    // still writes), rather than spinning on a failing
+                    // disk inside this task.
+                    self.dirty.store(true, Ordering::Release);
+                    self.persist_in_flight.store(false, Ordering::Release);
+                    return;
+                }
+            }
+            self.persist_in_flight.store(false, Ordering::Release);
+            // A set() landing between the last `swap` and the flag clear
+            // saw `in_flight` set and skipped its spawn — without this
+            // recheck its change would wait unsaved for the next update.
+            if !self.dirty.load(Ordering::Acquire)
+                || self.persist_in_flight.swap(true, Ordering::AcqRel)
+            {
+                return;
+            }
+        }
     }
 }
 
@@ -143,9 +266,10 @@ pub(crate) async fn set_storage(
     UrlPath(key): UrlPath<String>,
     body: Bytes,
 ) -> Response {
-    // Upstream's order: key, JSON validity, then size.
+    // Upstream's order: key, JSON validity, then size. An overlong key is
+    // a silent no-op — accepted, nothing stored.
     if key.len() > MAX_KEY {
-        return msg_err(StatusCode::BAD_REQUEST, "key too long");
+        return StatusCode::NO_CONTENT.into_response();
     }
     if serde_json::from_slice::<serde::de::IgnoredAny>(&body).is_err() {
         return msg_err(StatusCode::BAD_REQUEST, "Body invalid");
@@ -169,7 +293,7 @@ pub(crate) async fn delete_storage(
 async fn update(state: &AppState, key: &str, value: Option<String>) -> Response {
     let store = storage(state);
     if store.set(key, value) | store.dirty.load(Ordering::Relaxed) {
-        let _ = tokio::task::spawn_blocking(move || store.persist()).await;
+        store.request_persist();
     }
     StatusCode::NO_CONTENT.into_response()
 }
@@ -194,16 +318,46 @@ mod tests {
     }
 
     #[test]
-    fn a_full_store_evicts_for_a_new_key() {
+    fn overlong_keys_are_silently_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = UiStorage::open(dir.path().join(FILE_NAME));
+        let long = "k".repeat(MAX_KEY + 1);
+        assert!(!s.set(&long, Some("1".into())), "a no-op, not an error");
+        assert!(!s.set(&long, None));
+        assert_eq!(s.get(&long), None);
+        let max = "k".repeat(MAX_KEY);
+        assert!(s.set(&max, Some("1".into())));
+        assert_eq!(s.get(&max).as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn a_full_store_evicts_oldest_written() {
         let dir = tempfile::tempdir().unwrap();
         let s = UiStorage::open(dir.path().join(FILE_NAME));
         for i in 0..MAX_ENTRIES {
             s.set(&i.to_string(), Some("1".into()));
         }
         assert!(s.set("0", Some("2".into())), "an existing key replaces");
-        assert_eq!(s.map.lock().len(), MAX_ENTRIES);
+        assert_eq!(s.store.lock().map.len(), MAX_ENTRIES);
+        // Rewriting "0" made it the newest write — the new key evicts "1",
+        // the oldest write now.
         assert!(s.set("new", Some("1".into())));
-        assert_eq!(s.map.lock().len(), MAX_ENTRIES);
+        assert_eq!(s.store.lock().map.len(), MAX_ENTRIES);
         assert_eq!(s.get("new").as_deref(), Some("1"));
+        assert_eq!(s.get("0").as_deref(), Some("2"), "rewritten keys stay");
+        assert_eq!(s.get("1"), None, "oldest write evicts first");
+    }
+
+    #[test]
+    fn the_byte_budget_evicts_oldest_written_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = UiStorage::open(dir.path().join(FILE_NAME));
+        // 2/5 of the budget each: two entries fit, the third must evict.
+        let val = "v".repeat(2 * MAX_TOTAL_BYTES / 5);
+        s.set("a", Some(val.clone()));
+        s.set("b", Some(val.clone()));
+        s.set("c", Some(val));
+        assert_eq!(s.get("a"), None, "a evicts for the byte budget");
+        assert!(s.get("b").is_some() && s.get("c").is_some());
     }
 }

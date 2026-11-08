@@ -407,6 +407,11 @@ fn parse_logic_rule(
         // groups recurse through here, so the check covers any depth.
         let mut fields = g.splitn(3, ',');
         let first = fields.next().map_or("", str::trim);
+        // The guards below compare the config grammar's names, so a mihomo
+        // API spelling must translate first, the same way `parse_rule_depth`
+        // does — otherwise `(Match,X)` parses an always-true inner leg and
+        // `(DomainRegex,a,b)` silently truncates its payload.
+        let first = meow_common::RuleType::from_mihomo_name(first).map_or(first, |t| t.as_str());
         if first == "MATCH" {
             return Err(format!(
                 "{rule_type} rule: MATCH is not allowed inside logic groups"
@@ -838,6 +843,19 @@ mod tests {
         // an empty keyword (match-all) without the guard, while a bare
         // `(DOMAIN-KEYWORD)` errors downstream on `< 2 parts` either way.
         assert!(parse_rule("OR,((DOMAIN-KEYWORD,),(DOMAIN,a.example)),Proxy", &ctx()).is_err());
+    }
+
+    /// The inner-leg guards compare the config grammar's names, so the
+    /// mihomo API spellings `GET /rules` reports must trip them too —
+    /// `(Match,X)` is still an always-true `FinalRule` leg, and
+    /// `(DomainRegex,a,b)` still carries a comma the grammar cannot
+    /// represent (issue #882 review).
+    #[test]
+    fn test_parse_logic_rejects_inner_mihomo_spellings() {
+        assert!(parse_rule("OR,((Match,x),(DOMAIN,a.example)),Proxy", &ctx()).is_err());
+        assert!(parse_rule("AND,((DomainRegex,a,b),(DOMAIN,a.example)),Proxy", &ctx()).is_err());
+        // A comma-free mihomo-spelled regex leg still parses.
+        assert!(parse_rule("AND,((DomainRegex,a+),(DOMAIN,a.example)),Proxy", &ctx()).is_ok());
     }
 
     /// `IP-CIDR6,...,src` shares the IP-CIDR arm — IPv6 source axis.

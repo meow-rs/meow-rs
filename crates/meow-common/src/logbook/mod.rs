@@ -527,7 +527,7 @@ mod rfc3339 {
     pub fn format(t: SystemTime) -> String {
         OffsetDateTime::from(super::to_millis(t))
             .format(&Rfc3339)
-            .unwrap_or_else(|_| String::from("1970-01-01T00:00:00Z"))
+            .unwrap_or_else(|_| String::from(crate::EPOCH_RFC3339))
     }
 
     pub fn serialize<S: Serializer>(t: &SystemTime, serializer: S) -> Result<S::Ok, S::Error> {
