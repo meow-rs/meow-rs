@@ -7,6 +7,12 @@ use tokio::time::{sleep, timeout};
 
 const TARGET: &str = "target:80";
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// The echo peer's send cap and scratch buffer: the client's production
+/// cap plus QUIC header headroom — this peer's connection ID makes its
+/// outgoing packet header slightly larger than the incoming one, and
+/// the echo must still fit complete client datagrams. Tied to the
+/// production constant so the 1452-band behaviour stays under test.
+const PEER_SEND_CAP: usize = crate::hysteria2::tls::MAX_SEND_UDP_PAYLOAD + 48;
 
 #[tokio::test]
 async fn raw_udp_round_trip_without_http3_datagrams() {
@@ -106,9 +112,7 @@ fn peer_on(
     config.set_initial_max_stream_data_bidi_remote(64 * 1024);
     config.set_initial_max_stream_data_uni(64 * 1024);
     config.enable_dgram(true, 64, 64);
-    // Echo complete client datagrams even when this peer's connection ID
-    // makes the outgoing packet header slightly larger than the incoming one.
-    config.set_max_send_udp_payload_size(1500);
+    config.set_max_send_udp_payload_size(PEER_SEND_CAP);
     let read_payload = Arc::new(AtomicBool::new(true));
     let read_enabled = Arc::clone(&read_payload);
     let stop_writes = Arc::new(AtomicBool::new(false));
@@ -145,7 +149,7 @@ fn peer_on(
         let mut established = std::collections::HashSet::new();
         let mut pending: HashMap<u64, VecDeque<u8>> = HashMap::new();
         let mut finished = std::collections::HashSet::new();
-        let mut out = [0; 1500];
+        let mut out = [0; PEER_SEND_CAP];
         let mut last_data_tx = std::time::Instant::now();
         loop {
             if conn.is_established() && h3.is_none() {
