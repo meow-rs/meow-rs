@@ -120,6 +120,11 @@
 // #define TCP_SND_BUF (8 * TCP_MSS)
 // #define MEM_LIBC_MALLOC 1
 // #define MEMP_MEM_MALLOC 1
+// meow-lwip feature `libc-malloc`: pools and heap from libc on demand.
+#ifdef MEOW_LWIP_LIBC_MALLOC
+#define MEM_LIBC_MALLOC 1
+#define MEMP_MEM_MALLOC 1
+#endif
 
 #define SYS_LIGHTWEIGHT_PROT 0
 #define LWIP_DONT_PROVIDE_BYTEORDER_FUNCTIONS

@@ -92,6 +92,9 @@ fn compile_lwip() {
     if let Some(sdk_include_path) = sdk_include_path() {
         build.include(sdk_include_path);
     }
+    if env::var_os("CARGO_FEATURE_LIBC_MALLOC").is_some() {
+        build.define("MEOW_LWIP_LIBC_MALLOC", "1");
+    }
     build.debug(true);
     build.compile("liblwip.a");
 

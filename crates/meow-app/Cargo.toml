@@ -91,6 +91,10 @@ listener-mixed = ["meow-listener/listener-mixed"]
 # TUN inbound (issue #326) — transparent proxy without a tproxy/REDIRECT
 # firewall; the only transparent-proxy mode available on Windows.
 listener-tun = ["meow-listener/listener-tun", "meow-api/listener-tun"]
+# lwIP memory from libc malloc on demand instead of ~3.2 MB of static
+# pools in .bss (meow-lwip `libc-malloc`). Off in every bundle; for
+# memory-tight Linux devices.
+lwip-libc-malloc = ["meow-listener/lwip-libc-malloc"]
 # Shadowsocks encrypted-server inbound. In `full` (about 200 KiB on
 # x86_64; the `shadowsocks` crate is already there for the `ss` outbound).
 # Not in `minimal`: it would take half the room left under that bundle's

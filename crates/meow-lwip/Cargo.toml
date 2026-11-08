@@ -47,6 +47,13 @@ name = "lwip"
 crate-type = ["lib", "cdylib"]
 path = "rust/lib.rs"
 
+[features]
+# lwIP memory from libc malloc on demand (MEM_LIBC_MALLOC + MEMP_MEM_MALLOC)
+# instead of ~3.2 MB of static pools in .bss, which memp_init touches at
+# start. For memory-tight devices (routers), especially with `stack: system`,
+# where lwIP may stay idle.
+libc-malloc = []
+
 [dependencies]
 bytes = "1"
 futures = "0.3"
