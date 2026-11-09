@@ -1686,6 +1686,13 @@ async fn apply_raw_to_tunnel(
     }
     state.tunnel.update_routing(proxies, rules, dialer_registry);
     state.tunnel.set_connection_notes(connection_notes);
+    meow_tunnel::nftset::install(
+        &state.tunnel,
+        raw.dns
+            .as_ref()
+            .and_then(|d| d.nftset.as_ref())
+            .and_then(|n| n.parse().ok().flatten()),
+    );
     state.tunnel.set_tcp_idle_timeout(tcp_idle_timeout);
     // Commit point reached: every fallible check passed. The candidate's
     // provider sets become the live registries — the rules and DNS
@@ -4208,6 +4215,14 @@ async fn put_configs(
     state
         .tunnel
         .set_connection_notes(raw_config.connection_notes.unwrap_or(false));
+    meow_tunnel::nftset::install(
+        &state.tunnel,
+        raw_config
+            .dns
+            .as_ref()
+            .and_then(|d| d.nftset.as_ref())
+            .and_then(|n| n.parse().ok().flatten()),
+    );
     state.tunnel.set_tcp_idle_timeout(tcp_idle_timeout);
     if dropped > 0 {
         tracing::warn!(

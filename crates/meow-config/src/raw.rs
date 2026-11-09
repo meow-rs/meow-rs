@@ -525,10 +525,34 @@ pub struct RawSimpleObfs {
     pub mode: Option<String>,
 }
 
+/// `dns.nftset`: `family#table#set` per address family and
+/// the minimum element timeout in seconds (default one day).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct RawNftset {
+    pub ipv4: Option<String>,
+    pub ipv6: Option<String>,
+    pub timeout: Option<u64>,
+}
+
+impl RawNftset {
+    pub fn parse(&self) -> Result<Option<meow_common::nftset::NftsetConfig>, String> {
+        meow_common::nftset::NftsetConfig::parse(
+            self.ipv4.as_deref(),
+            self.ipv6.as_deref(),
+            self.timeout,
+        )
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub struct RawDns {
     pub enable: Option<bool>,
+    /// Add answers of domains the rules route through the
+    /// core to nftables sets (see `meow_common::nftset`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nftset: Option<RawNftset>,
     pub listen: Option<String>,
     pub enhanced_mode: Option<String>,
     pub fake_ip_range: Option<String>,

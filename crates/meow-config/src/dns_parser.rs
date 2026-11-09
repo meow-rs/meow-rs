@@ -37,6 +37,9 @@ pub async fn parse_dns(
     // `strict` (top-level `strict: true`, issue #533): static config defects
     // become hard errors; transient resolution failures stay lenient.
     let strict = raw.strict.unwrap_or(false);
+    if let Some(n) = raw.dns.as_ref().and_then(|d| d.nftset.as_ref()) {
+        n.parse().map_err(|e| anyhow::anyhow!("dns.{e}"))?;
+    }
     let dns = match &raw.dns {
         Some(dns) if dns.enable.unwrap_or(false) => dns,
         _ => {

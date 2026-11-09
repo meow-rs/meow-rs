@@ -54,8 +54,8 @@ pub fn new_resolver_slot(resolver: Arc<Resolver>) -> ResolverSlot {
 /// receive loop runs before dispatching a query (issue #515).
 #[derive(Debug)]
 pub enum LocalAnswer {
-    /// Fully answered from local state — send these bytes now.
-    Answer(Vec<u8>),
+    /// Fully answered from local state — send it per [`LocalResponse`].
+    Answer(LocalResponse),
     /// Malformed or otherwise unanswerable — drop silently, exactly what
     /// [`DnsServer::handle_query`]'s error path does, but without spending
     /// an in-flight permit or a task spawn on guaranteed-failure packets.
@@ -63,6 +63,29 @@ pub enum LocalAnswer {
     /// Needs the upstream pipeline (or a full `handle_query` pass) —
     /// dispatch a bounded task.
     Upstream,
+}
+
+/// A locally-decided answer: wire-ready bytes plus the deferred
+/// answer-hook work (`dns.nftset`) that must complete before they are
+/// sent. The hook can block on a netlink ack, so the caller runs `hook`
+/// off the receive loop — `response` goes out only after it completes;
+/// unrelated answers do not queue behind it.
+#[derive(Debug)]
+pub struct LocalResponse {
+    /// The response to put on the wire.
+    pub response: Vec<u8>,
+    /// Deferred hook work; `None` whenever no hook is installed.
+    pub hook: Option<crate::answer_hook::PendingHook>,
+}
+
+impl LocalResponse {
+    /// An answer with no hook work — the overwhelmingly common shape.
+    fn plain(response: Vec<u8>) -> Self {
+        Self {
+            response,
+            hook: None,
+        }
+    }
 }
 
 /// Simple DNS server that handles queries by forwarding to our resolver.
@@ -209,15 +232,29 @@ impl DnsServer {
                 all_ips.iter().find(|ip| ip.is_ipv6()).copied()
             };
             return Ok(match ip {
-                Some(addr) => Self::build_response(
-                    id,
-                    data,
-                    flags,
-                    question_len,
-                    qtype,
-                    addr,
-                    DEFAULT_ANSWER_TTL_SECS,
-                ),
+                Some(addr) => {
+                    // The answer hook runs on the blocking pool (it can
+                    // wait on a netlink ack); awaiting it here keeps the
+                    // ordering — the element is in before this answer is
+                    // sent.
+                    if let Some(work) = crate::answer_hook::pending(
+                        resolver,
+                        &domain,
+                        addr,
+                        std::time::Duration::from_secs(u64::from(DEFAULT_ANSWER_TTL_SECS)),
+                    ) {
+                        crate::answer_hook::run_blocking(work).await;
+                    }
+                    Self::build_response(
+                        id,
+                        data,
+                        flags,
+                        question_len,
+                        qtype,
+                        addr,
+                        DEFAULT_ANSWER_TTL_SECS,
+                    )
+                }
                 None => Self::build_noerror_empty(id, data, flags, question_len),
             });
         }
@@ -245,6 +282,9 @@ impl DnsServer {
 
         Ok(match lookup {
             AddressLookupResult::Answer(addr, ttl) => {
+                if let Some(work) = crate::answer_hook::pending(resolver, &domain, addr, ttl) {
+                    crate::answer_hook::run_blocking(work).await;
+                }
                 // Sub-second remainders round up to 1 — a 0-TTL answer means
                 // "never cache", which is stricter than the entry deserves.
                 let ttl_secs = ttl.as_secs().clamp(1, u64::from(u32::MAX)) as u32;
@@ -289,14 +329,22 @@ impl DnsServer {
             return LocalAnswer::Drop;
         }
         if flags & 0x7800 != 0 {
-            return LocalAnswer::Answer(Self::build_notimp(id, flags, arcount > 0));
+            return LocalAnswer::Answer(LocalResponse::plain(Self::build_notimp(
+                id,
+                flags,
+                arcount > 0,
+            )));
         }
         if qdcount == 0 {
             return LocalAnswer::Drop; // handle_query errs — silently dropped
         }
         // Same rule as handle_query: multi-question queries get FORMERR.
         if qdcount != 1 {
-            return LocalAnswer::Answer(Self::build_formerr(id, flags, arcount > 0));
+            return LocalAnswer::Answer(LocalResponse::plain(Self::build_formerr(
+                id,
+                flags,
+                arcount > 0,
+            )));
         }
         let Ok((domain, qtype, question_len)) = Self::parse_question(&data[12..]) else {
             // Parity with handle_query's per-error debug log — the inline
@@ -307,7 +355,11 @@ impl DnsServer {
         // Same rule as handle_query: only class IN is served.
         let qclass = u16::from_be_bytes([data[12 + question_len - 2], data[12 + question_len - 1]]);
         if qclass != 1 {
-            return LocalAnswer::Answer(Self::build_notimp(id, flags, arcount > 0));
+            return LocalAnswer::Answer(LocalResponse::plain(Self::build_notimp(
+                id,
+                flags,
+                arcount > 0,
+            )));
         }
         if qtype != 1 && qtype != 28 {
             // Generic queries escalate to the task path — the remaining
@@ -331,19 +383,40 @@ impl DnsServer {
                     all_ips.iter().find(|ip| ip.is_ipv6()).copied()
                 };
                 LocalAnswer::Answer(match ip {
-                    Some(addr) => Self::build_response(
+                    // The hook's `(domain, addr, ttl)` is captured for the
+                    // caller to run off the loop — the response bytes are
+                    // built here as usual.
+                    Some(addr) => LocalResponse {
+                        response: Self::build_response(
+                            id,
+                            data,
+                            flags,
+                            question_len,
+                            qtype,
+                            addr,
+                            DEFAULT_ANSWER_TTL_SECS,
+                        ),
+                        hook: crate::answer_hook::pending(
+                            resolver,
+                            &domain,
+                            addr,
+                            std::time::Duration::from_secs(u64::from(DEFAULT_ANSWER_TTL_SECS)),
+                        ),
+                    },
+                    None => LocalResponse::plain(Self::build_noerror_empty(
                         id,
                         data,
                         flags,
                         question_len,
-                        qtype,
-                        addr,
-                        DEFAULT_ANSWER_TTL_SECS,
-                    ),
-                    None => Self::build_noerror_empty(id, data, flags, question_len),
+                    )),
                 })
             } else if qtype == 28 && !resolver.ipv6_enabled() {
-                LocalAnswer::Answer(Self::build_noerror_empty(id, data, flags, question_len))
+                LocalAnswer::Answer(LocalResponse::plain(Self::build_noerror_empty(
+                    id,
+                    data,
+                    flags,
+                    question_len,
+                )))
             } else {
                 // lookup_*_local covers the remaining local decisions:
                 // hosts alias → upstream, fake-IP synthesis, and fresh
@@ -358,29 +431,32 @@ impl DnsServer {
                         LocalAnswer::Answer(match lookup {
                             AddressLookupResult::Answer(addr, ttl) => {
                                 let ttl_secs = ttl.as_secs().clamp(1, u64::from(u32::MAX)) as u32;
-                                Self::build_response(
-                                    id,
-                                    data,
-                                    flags,
-                                    question_len,
-                                    qtype,
-                                    addr,
-                                    ttl_secs,
-                                )
+                                LocalResponse {
+                                    response: Self::build_response(
+                                        id,
+                                        data,
+                                        flags,
+                                        question_len,
+                                        qtype,
+                                        addr,
+                                        ttl_secs,
+                                    ),
+                                    hook: crate::answer_hook::pending(resolver, &domain, addr, ttl),
+                                }
                             }
-                            AddressLookupResult::NoData => {
-                                Self::build_noerror_empty(id, data, flags, question_len)
-                            }
-                            AddressLookupResult::NxDomain => {
-                                Self::build_nxdomain(id, data, flags, question_len)
-                            }
+                            AddressLookupResult::NoData => LocalResponse::plain(
+                                Self::build_noerror_empty(id, data, flags, question_len),
+                            ),
+                            AddressLookupResult::NxDomain => LocalResponse::plain(
+                                Self::build_nxdomain(id, data, flags, question_len),
+                            ),
                             // Local probes never yield `Failed` today (they
                             // produce `Upstream` instead); kept so a future
                             // `Decided` variant can't silently change wire
                             // semantics.
-                            AddressLookupResult::Failed => {
-                                Self::build_servfail(id, data, flags, question_len)
-                            }
+                            AddressLookupResult::Failed => LocalResponse::plain(
+                                Self::build_servfail(id, data, flags, question_len),
+                            ),
                         })
                     }
                     crate::resolver::LocalLookup::Upstream(_) => LocalAnswer::Upstream,
@@ -987,19 +1063,28 @@ impl BoundDnsServer {
                 DnsServer::try_answer_local(&buf[..len], &resolver_guard)
             };
             match local {
-                LocalAnswer::Answer(response) => {
-                    // `try_send_to`, not `send_to().await`: a transient
-                    // full send buffer must not head-of-line block every
-                    // later query behind one slow reply (UDP semantics —
-                    // the stub resolver retries). Counted like the
-                    // saturation drops below so `dropped_queries` stays a
-                    // truthful "no response was sent" signal.
-                    match socket.try_send_to(&response, src) {
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                LocalAnswer::Answer(LocalResponse { response, hook }) => {
+                    match hook {
+                        // `dns.nftset` ordering: the element must be in
+                        // before this answer reaches the client. The add
+                        // blocks on netlink, so it runs on the blocking
+                        // pool with the send chained after it — unrelated
+                        // answers don't queue behind it.
+                        Some(work) => {
+                            // Weak, like the query tasks: the loop stays
+                            // the sole strong owner so an abort still
+                            // releases the port. A dead socket means no
+                            // listener is left to answer anyway.
+                            let sock = Arc::downgrade(&socket);
+                            let dropped = Arc::clone(&dropped);
+                            tokio::task::spawn_blocking(move || {
+                                work.run();
+                                if let Some(sock) = sock.upgrade() {
+                                    send_local_answer(&sock, &response, src, &dropped);
+                                }
+                            });
                         }
-                        Err(e) => warn!("DNS send error: {e}"),
-                        Ok(_) => {}
+                        None => send_local_answer(&socket, &response, src, &dropped),
                     }
                     continue;
                 }
@@ -1058,6 +1143,27 @@ impl BoundDnsServer {
                 }
             });
         }
+    }
+}
+
+/// `try_send_to`, not `send_to().await`: a transient full send buffer
+/// must not head-of-line block every later query behind one slow reply
+/// (UDP semantics — the stub resolver retries). The drop is counted like
+/// the saturation drops so `dropped_queries` stays a truthful
+/// "no response was sent" signal. Called from the serve loop or from a
+/// `spawn_blocking` worker carrying a deferred answer hook.
+fn send_local_answer(
+    socket: &UdpSocket,
+    response: &[u8],
+    src: SocketAddr,
+    dropped: &std::sync::atomic::AtomicU64,
+) {
+    match socket.try_send_to(response, src) {
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Err(e) => warn!("DNS send error: {e}"),
+        Ok(_) => {}
     }
 }
 
@@ -2749,7 +2855,7 @@ mod tests {
     /// decided.
     fn answered(outcome: super::LocalAnswer) -> Vec<u8> {
         match outcome {
-            super::LocalAnswer::Answer(bytes) => bytes,
+            super::LocalAnswer::Answer(local) => local.response,
             other => panic!("expected a local answer, got {other:?}"),
         }
     }

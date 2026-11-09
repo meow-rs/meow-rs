@@ -635,6 +635,12 @@ const RAW_SOCKET_ALLOWLIST: &[(&str, &str, usize, &str)] = &[
         "NETLINK_ROUTE socket installing the TUN policy rules; not IP-routed",
     ),
     (
+        "crates/meow-common/src/nftset.rs",
+        "libc::socket(",
+        1,
+        "AF_NETLINK nftables set-element socket; not IP-routed",
+    ),
+    (
         "crates/meow-app/src/arp.rs",
         "libc::socket(",
         1,

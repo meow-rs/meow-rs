@@ -19,6 +19,12 @@ the canonical, in-repo source a release is cut from.
   `PUT /configs` applies a new mark, and refuses one while meow's managed
   tproxy rules exempt the current mark. `GET /configs` reports the live mark.
   Not marked: inbound/reply sockets and SIP003 plugin subprocesses.
+- **`dns.nftset`** (Linux): each A/AAAA answer whose domain and address the
+  rules would route anywhere but `DIRECT` is added to an nftables set
+  (`family#table#set`, dnsmasq `nftset=` style) before the answer leaves
+  meow, so a firewall can intercept only those destinations and leave the
+  rest to kernel forwarding / flowtable / hardware offload. Libc-only
+  netlink writer; fake-IP answers skipped. See `docs/nftset.md`.
 - **mihomo dashboard parity** (#882): `GET /rules` reports mihomo's type
   names and the `extra` object (`disabled`, `hitCount`, `hitAt`);
   `PATCH /rules/disable` switches rules off, the switch following its rule
