@@ -571,6 +571,8 @@ pub struct RawDns {
     /// (mihomo `proxy-server-nameserver`). When set, proxy adapters resolve
     /// their `server:` through these instead of the main `nameserver` list.
     pub proxy_server_nameserver: Option<Vec<String>>,
+    /// Domain policy used only by the dedicated proxy-server resolver.
+    pub proxy_server_nameserver_policy: Option<RawNameserverPolicy>,
     /// Nameservers used to resolve destinations dialed by `DIRECT`
     /// outbounds (mihomo `direct-nameserver`). Unset keeps `DIRECT` on the
     /// main `nameserver` list.

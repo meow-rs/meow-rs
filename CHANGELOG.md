@@ -10,6 +10,11 @@ the canonical, in-repo source a release is cut from.
 
 ### Added
 
+- `dns.proxy-server-nameserver-policy` selects nameservers for node domains
+  without changing ordinary DNS. It preserves policy order on reload and uses
+  the existing `nameserver-policy-exclusive` flag. Node-policy dependencies
+  must bootstrap independently; see `docs/specs/proxy-server-dns-policy.md`.
+
 - `redir-port` / `listeners: type: redir`: mihomo's REDIRECT inbound, rules
   owned by the deployer. `listeners: type: tproxy` takes `transparent: true`
   for TCP by real TPROXY (`IP_TRANSPARENT`, Linux, needs `firewall: false`).

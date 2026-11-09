@@ -1,6 +1,6 @@
 # Proposal for query-type-specific DNS responses
 
-Status: response-rule implementation proposed; bootstrap policy is a separate follow-up.
+Status: response rules implemented; node bootstrap policy is now documented in [proxy-server-dns-policy.md](proxy-server-dns-policy.md).
 Owner: engineer
 Date: 2026-11-07
 Tracking: [PR #906](https://github.com/meow-rs/meow-rs/pull/906)
@@ -8,8 +8,7 @@ Upstream reference: `fake-ip-filter-mode: rule`
 ([MetaCubeX/mihomo#2469](https://github.com/MetaCubeX/mihomo/pull/2469) —
 an ordered `fake-ip`/`real-ip` verdict list, the closest shipped relative
 of the fake-IP action proposed here), `rcode://` nameserver URLs, and
-`proxy-server-nameserver-policy` (an upstream field meow has not
-implemented — see the transport note below).
+`proxy-server-nameserver-policy` (now implemented separately; see the transport note below).
 
 A split DNS gateway may need to return an empty HTTPS answer for one set
 of domains, refuse the same query for a second set, and forward it
@@ -132,7 +131,7 @@ must not change that.
 Keep transport and pool selection in the existing resolver. A proxy
 endpoint can need a different bootstrap pool from ordinary client
 lookups; upstream gives it a dedicated `proxy-server-nameserver-policy`
-field, which meow has never implemented — prefer reusing the
+field, now implemented by reusing the
 nameserver-policy map and builder for the `proxy-server-nameserver`
 resolver, the one `ResolverHostHook` consults for proxy hostnames,
 rather than growing a second policy surface (the `direct-nameserver`

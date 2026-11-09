@@ -2002,8 +2002,9 @@ fn dns_uses_proxy_refs(raw: &RawConfig) -> bool {
         || urls_tagged(&dns.direct_nameserver)
         || dns
             .nameserver_policy
-            .as_ref()
-            .is_some_and(|m| m.iter().any(|(_k, v)| v.as_urls().into_iter().any(tagged)))
+            .iter()
+            .chain(dns.proxy_server_nameserver_policy.iter())
+            .any(|m| m.iter().any(|(_k, v)| v.as_urls().into_iter().any(tagged)))
 }
 
 /// `true` when two raw configs carry identical DNS-relevant inputs —
@@ -2011,7 +2012,7 @@ fn dns_uses_proxy_refs(raw: &RawConfig) -> bool {
 /// resolver build. Compared structurally (the `Raw*` types derive
 /// `PartialEq`; map sections are order-insensitive, list sections keep
 /// list order — same semantics the JSON comparison had, without building
-/// a DOM per commit) — with two exceptions: `nameserver-policy` key
+/// a DOM per commit) — with two exceptions: both nameserver-policy maps' key
 /// order IS semantic (document order = lookup priority) and `hosts` key
 /// order decides same-slot collision winners (the document-last writer
 /// wins, so a pure reorder must rebuild), but `IndexMap`'s `==` cannot
@@ -2023,10 +2024,18 @@ fn dns_uses_proxy_refs(raw: &RawConfig) -> bool {
 fn dns_inputs_equal(a: &RawConfig, b: &RawConfig) -> bool {
     // A pure key reorder of `nameserver-policy` must read as a change —
     // `a.dns == b.dns` alone is order-insensitive for this section.
-    let nsp_equal = {
-        let pa = a.dns.as_ref().and_then(|d| d.nameserver_policy.as_ref());
-        let pb = b.dns.as_ref().and_then(|d| d.nameserver_policy.as_ref());
-        match (pa, pb) {
+    fn policies(raw: &RawConfig) -> [Option<&meow_config::raw::RawNameserverPolicy>; 2] {
+        raw.dns.as_ref().map_or([None, None], |dns| {
+            [
+                dns.nameserver_policy.as_ref(),
+                dns.proxy_server_nameserver_policy.as_ref(),
+            ]
+        })
+    }
+    let nsp_equal = policies(a)
+        .into_iter()
+        .zip(policies(b))
+        .all(|(pa, pb)| match (pa, pb) {
             (None, None) => true,
             (Some(ma), Some(mb)) => {
                 ma.len() == mb.len()
@@ -2035,12 +2044,8 @@ fn dns_inputs_equal(a: &RawConfig, b: &RawConfig) -> bool {
                         .zip(mb.iter())
                         .all(|((ka, va), (kb, vb))| ka == kb && va == vb)
             }
-            // `(None, Some)` / `(Some, None)` — even `None` vs
-            // `Some(empty)` — reads as a change: a conservative rebuild,
-            // the same Option-diff semantics the derived `==` had.
             _ => false,
-        }
-    };
+        });
     // A pure key reorder of `hosts` must read as a change — document order
     // decides same-slot collision winners, and `IndexMap`'s `==` is
     // order-insensitive.
@@ -5219,6 +5224,20 @@ mod tests {
     /// `dns_inputs_equal` compares that map pairwise. A `PUT /configs`
     /// that only reorders the policy keys must still rebuild the
     /// resolver.
+    #[test]
+    fn node_policy_reorder_and_proxy_references_rebuild_dns() {
+        let raw_a: RawConfig = serde_saphyr::from_str(
+            "dns:\n  enable: true\n  proxy-server-nameserver: [rcode://success]\n  proxy-server-nameserver-policy:\n    z.test: 'tcp://192.0.2.1#P'\n    a.test: rcode://refused\n"
+        ).unwrap();
+        let raw_b: RawConfig = serde_saphyr::from_str(
+            "dns:\n  enable: true\n  proxy-server-nameserver: [rcode://success]\n  proxy-server-nameserver-policy:\n    a.test: rcode://refused\n    z.test: 'tcp://192.0.2.1#P'\n"
+        ).unwrap();
+        assert!(!dns_inputs_equal(&raw_a, &raw_b));
+        assert!(!dns_inputs_equal(&raw_b, &raw_a));
+        assert!(dns_inputs_equal(&raw_a, &raw_a));
+        assert!(dns_uses_proxy_refs(&raw_a));
+    }
+
     #[test]
     fn dns_inputs_equal_sees_nameserver_policy_key_order() {
         let raw_a: RawConfig = serde_saphyr::from_str(
