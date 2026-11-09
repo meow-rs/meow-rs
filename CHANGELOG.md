@@ -178,6 +178,9 @@ the canonical, in-repo source a release is cut from.
   are refused with 400**, matching the origin-form path and `sniff_http`
   — RFC 9110 §5.4 permits refusing the ambiguous pair, which previously
   was forwarded to the origin verbatim (issue #869).
+- TUN UDP loops own their flow tasks, cancelling blocked flows on shutdown
+  or loop cancellation instead of retaining them until their idle timeout.
+
 - TUN UDP flows join their reply reader before closing the packet connection;
   cancelling a flow also cancels its reader instead of leaving it detached.
 
