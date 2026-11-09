@@ -160,6 +160,19 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **`rules:` dead-payload check closes three gaps** (issue #869): an empty
+  `DOMAIN-KEYWORD` needle (`DOMAIN-KEYWORD,,X`) is now surfaced as the
+  silent match-all it is — `contains("")` is true for every flow —
+  instead of parsing unremarked; `DOMAIN-KEYWORD` needles carrying a
+  byte no normalized host can hold (`*`, `+`, `?`, a space, non-ASCII)
+  are flagged dead like the other domain types; and `sub-rules:` bodies
+  get the same pass `rules:` lines do. Lenient mode warns and keeps the
+  rule — the empty needle still matches all, as mihomo does — while
+  `strict: true` fails the load.
+- **Plain-HTTP absolute-form requests with a duplicated `Host` header
+  are refused with 400**, matching the origin-form path and `sniff_http`
+  — RFC 9110 §5.4 permits refusing the ambiguous pair, which previously
+  was forwarded to the origin verbatim (issue #869).
 - TUN UDP flows join their reply reader before closing the packet connection;
   cancelling a flow also cancels its reader instead of leaving it detached.
 

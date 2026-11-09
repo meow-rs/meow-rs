@@ -234,6 +234,23 @@ async fn handle_http_inner(
         } else {
             (host, port)
         };
+        // A duplicated `Host` field makes the effective authority
+        // ambiguous (RFC 9110 §5.4 permits refusing it outright). An
+        // origin-form request dies on the hostname gate below either way —
+        // `host_header` yields None for a dup, leaving the host empty —
+        // but an absolute-form request carries its authority in the
+        // target, so without this check the ambiguous pair would be
+        // forwarded to the origin verbatim (issue #869).
+        if request
+            .headers
+            .iter()
+            .filter(|header| header.name.eq_ignore_ascii_case(b"host"))
+            .nth(1)
+            .is_some()
+        {
+            write_bad_request(stream).await?;
+            return Err("duplicate Host header".into());
+        }
         if !meow_common::is_valid_host(host) {
             write_bad_request(stream).await?;
             return Err(format!("request target {url:?} has no valid host").into());

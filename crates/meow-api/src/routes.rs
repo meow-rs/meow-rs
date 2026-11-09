@@ -2933,7 +2933,7 @@ fn dry_parse_rule_line(state: &AppState, raw: &RawConfig, line: &str) -> Result<
         // A committed `sub-rules:` section always parses — on defect the
         // rebuild errors louder than this check, so an empty map stands in.
         Some(map) if !map.is_empty() => {
-            meow_config::sub_rules_parser::parse_sub_rules(map, &providers, &ctx)
+            meow_config::sub_rules_parser::parse_sub_rules(map, &providers, &ctx, false)
                 .unwrap_or_default()
         }
         _ => Default::default(),
