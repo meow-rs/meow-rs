@@ -160,6 +160,10 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- TUN UDP connection refresh now cancels pending QUIC sniffing, DNS resolution,
+  route selection and outbound dialing, without waiting for establishment to
+  finish on an obsolete network binding.
+
 - **`DOMAIN` payload check now consults `is_valid_host` itself** (the gate
   every `host`/`sniff_host` producer passes), so all-numeric non-IP
   spellings — libc `inet_aton` forms like `DOMAIN,2130706433`,
