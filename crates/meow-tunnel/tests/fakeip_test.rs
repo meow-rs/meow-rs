@@ -68,6 +68,53 @@ async fn fakeip_destination_rewritten_to_hostname() {
 }
 
 #[tokio::test]
+async fn live_fakeip_routes_and_dials_by_the_mapped_name() {
+    let resolver = build_fakeip_resolver();
+    let fake = resolver.lookup_ipv4("mapped.test").await.unwrap();
+    let tunnel = Tunnel::new(resolver);
+    let cfg = meow_config::rebuild_from_raw(&Default::default()).unwrap();
+    tunnel.update_proxies(cfg.proxies, cfg.dialer_registry);
+    tunnel.update_rules(vec![
+        Box::new(meow_rules::domain_suffix::DomainSuffixRule::new(
+            "sniffed.test",
+            "REJECT",
+        )),
+        Box::new(meow_rules::domain_suffix::DomainSuffixRule::new(
+            "mapped.test",
+            "DIRECT",
+        )),
+    ]);
+    for network in [Network::Tcp, Network::Udp] {
+        // A conflicting sniffed name is discarded; a matching one —
+        // including its FQDN spelling — is kept verbatim, as is no
+        // sniffed name at all.
+        for (sniff, expected_sniff) in [
+            ("sniffed.test", ""),
+            ("mapped.test.", "mapped.test."),
+            ("", ""),
+        ] {
+            let mut md = Metadata {
+                network,
+                dst_ip: Some(fake),
+                dst_port: 443,
+                sniff_host: sniff.into(),
+                ..Default::default()
+            };
+            assert_eq!(
+                tunnel.inner().pre_handle_metadata(&mut md),
+                PreHandleVerdict::Continue
+            );
+            assert_eq!(md.sniff_host.as_str(), expected_sniff);
+            assert_eq!(md.host.as_str(), "mapped.test");
+            let target = tunnel.inner().resolve_proxy_lazy(&mut md).await.unwrap();
+            assert_eq!(target.rule_payload, "mapped.test");
+            assert_eq!(target.adapter.name(), "DIRECT");
+            assert_eq!(md.remote_address().to_string(), "mapped.test:443");
+        }
+    }
+}
+
+#[tokio::test]
 async fn non_fakeip_destination_passes_through() {
     // Same resolver, but the incoming connection arrives with a real IP
     // (e.g. a SOCKS5 client dialed directly). pre_handle_metadata must
@@ -337,11 +384,26 @@ async fn fakeip_v6_range_drops_unmapped() {
 
 /// Issue #618 sibling: a stale fake IP that still carries a hostname
 /// (e.g. sniffed SNI) is rescued — the adapter resolves the real name
-/// instead of dialing the looping literal.
+/// instead of dialing the looping literal. A sniffed name that
+/// conflicts with the surviving `host` is discarded: `rule_host()`
+/// prefers `sniff_host`, so keeping it would route by one domain while
+/// `remote_address()` dials another.
 #[tokio::test]
 async fn stale_fakeip_with_host_falls_back_to_name() {
     let resolver = build_fakeip_resolver();
     let tunnel = Tunnel::new(resolver);
+    let cfg = meow_config::rebuild_from_raw(&Default::default()).unwrap();
+    tunnel.update_proxies(cfg.proxies, cfg.dialer_registry);
+    tunnel.update_rules(vec![
+        Box::new(meow_rules::domain_suffix::DomainSuffixRule::new(
+            "sniffed.test",
+            "REJECT",
+        )),
+        Box::new(meow_rules::domain_suffix::DomainSuffixRule::new(
+            "example.test",
+            "DIRECT",
+        )),
+    ]);
     let mut md = Metadata {
         host: "example.test".into(),
         dst_ip: Some(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 9))),
@@ -358,6 +420,34 @@ async fn stale_fakeip_with_host_falls_back_to_name() {
         "stale literal must clear so the adapter resolves the host"
     );
     assert_eq!(md.host.as_str(), "example.test");
+
+    // The rescued `host` wins the dial, so a sniffed name that differs
+    // must not keep routing the flow by its own domain; a matching one
+    // (modulo a trailing dot) is kept verbatim.
+    for (sniff, expected_sniff) in [
+        ("sniffed.test", ""),
+        ("example.test.", "example.test."),
+        ("", ""),
+    ] {
+        let mut md = Metadata {
+            host: "example.test".into(),
+            sniff_host: sniff.into(),
+            dst_ip: Some(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 9))),
+            dst_port: 443,
+            network: Network::Tcp,
+            ..Default::default()
+        };
+        assert_eq!(
+            tunnel.inner().pre_handle_metadata(&mut md),
+            PreHandleVerdict::Continue
+        );
+        assert_eq!(md.sniff_host.as_str(), expected_sniff);
+        assert_eq!(md.host.as_str(), "example.test");
+        let target = tunnel.inner().resolve_proxy_lazy(&mut md).await.unwrap();
+        assert_eq!(target.rule_payload, "example.test");
+        assert_eq!(target.adapter.name(), "DIRECT");
+        assert_eq!(md.remote_address().to_string(), "example.test:443");
+    }
 }
 
 /// Issue #701: `CONNECT [::1]:443` fills `host="[::1]"` *and*

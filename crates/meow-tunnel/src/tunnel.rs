@@ -380,6 +380,15 @@ impl TunnelInner {
                 Some(host) => {
                     debug!("pre_handle_metadata: fake-ip {ip} → {host}");
                     conn_note!(Dns, "Fake IP {ip} maps to {host}");
+                    // The live allocation wins routing and the dial: a
+                    // sniffed name that differs is discarded so
+                    // `rule_host()` returns the mapped name rather than
+                    // another domain's. A sniffed name that matches
+                    // (modulo a trailing dot — its FQDN spelling) is
+                    // kept verbatim for the API's sniffHost field.
+                    if sniff_conflicts(&metadata.sniff_host, &host) {
+                        metadata.sniff_host = Default::default();
+                    }
                     metadata.host = host;
                     metadata.dst_ip = None;
                 }
@@ -394,6 +403,14 @@ impl TunnelInner {
                     // surviving `host` here is a genuine name.
                     if metadata.host.is_empty() && is_sniffed_name(metadata) {
                         metadata.host = metadata.sniff_host.clone();
+                    } else if sniff_conflicts(&metadata.sniff_host, &metadata.host) {
+                        // A surviving `host` names the dial target, so a
+                        // sniffed name that differs is discarded —
+                        // `rule_host()` must not route the flow by a
+                        // different domain than the one being dialed. An
+                        // equal (modulo a trailing dot) sniffed name is
+                        // kept verbatim for the API's sniffHost field.
+                        metadata.sniff_host = Default::default();
                     }
                     if metadata.host.is_empty() {
                         debug!("pre_handle_metadata: drop unmapped fake-ip {ip}");
@@ -1663,6 +1680,17 @@ fn is_sniffed_name(metadata: &Metadata) -> bool {
     !metadata.sniff_host.is_empty()
         && metadata_ip_literal(&metadata.sniff_host).is_none()
         && is_valid_host(&metadata.sniff_host)
+}
+
+/// Whether a sniffed name disagrees with the name that will route and
+/// dial the flow: non-empty and not `host` once the sniffed name's
+/// trailing dots are ignored — the normalization `rule_host()` applies,
+/// so an FQDN-spelled SNI (`mapped.test.` against `mapped.test`) is a
+/// match, not a conflict. `rule_host()` prefers `sniff_host` while
+/// `remote_address()` dials `host`, so an unresolved conflict lets
+/// rules see one domain while the adapter dials another.
+fn sniff_conflicts(sniff_host: &str, host: &str) -> bool {
+    !sniff_host.is_empty() && sniff_host.trim_end_matches('.') != host
 }
 
 #[cfg(test)]
