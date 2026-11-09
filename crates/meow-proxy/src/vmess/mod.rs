@@ -336,18 +336,34 @@ impl ProxyAdapter for VmessAdapter {
         );
         let sealed = header::seal_request_header(&self.cmd_key, self.security, metadata, true)
             .map_err(MeowError::Proxy)?;
-        let stream = self
-            .dialer
-            .dial(&self.server, self.port, metadata.is_internal())
-            .await
-            .map_err(MeowError::Io)?;
-        let stream = send_request(&self.transport, stream, &sealed, false).await?;
         let remote = std::net::SocketAddr::new(
             metadata
                 .dst_ip
                 .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
             metadata.dst_port,
         );
+        // A user dial straight to the server shares a multiplexed
+        // (gRPC/xhttp) connection like `dial_vmess` — a UDP-over-TCP tunnel
+        // is a plain bidirectional stream, so it multiplexes identically
+        // (VLESS's `dial_udp` shares through `dial_stream` the same way).
+        let shared = !metadata.is_internal() && !self.dialer.is_proxy();
+        if shared {
+            if let Some(stream) = self.transport.reuse().await {
+                let stream = write_header(stream, &sealed).await?;
+                return Ok(Box::new(packet::VmessPacketConn::new(
+                    stream,
+                    &sealed,
+                    self.security,
+                    remote,
+                )));
+            }
+        }
+        let stream = self
+            .dialer
+            .dial(&self.server, self.port, metadata.is_internal())
+            .await
+            .map_err(MeowError::Io)?;
+        let stream = send_request(&self.transport, stream, &sealed, shared).await?;
         Ok(Box::new(packet::VmessPacketConn::new(
             stream,
             &sealed,

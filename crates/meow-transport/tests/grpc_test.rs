@@ -814,3 +814,134 @@ async fn grpc_reuse_multiplexes_streams_on_one_connection() {
     layer.reset();
     assert!(layer.reuse().await.is_none(), "reset clears the slot");
 }
+
+/// Issue #695 contract: a `connect_shared` dial that straddles `reset()`
+/// must not install its pre-reset connection in the slot — mirrors
+/// `MuxClient`'s `reset_discards_a_session_dialled_across_it`.
+#[tokio::test]
+async fn grpc_shared_dial_across_reset_is_discarded() {
+    use std::sync::Arc;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let (dial_started_tx, dial_started_rx) = tokio::sync::oneshot::channel::<()>();
+    let (resume_tx, resume_rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let Ok((tcp, _)) = listener.accept().await else {
+            return;
+        };
+        // The client preface being readable proves `connect_shared` is
+        // parked mid-handshake; `readable` does not consume it, so the
+        // h2 server handshake below still parses it.
+        tcp.readable().await.expect("preface readable");
+        let _ = dial_started_tx.send(());
+        let _ = resume_rx.await;
+        let Ok(mut conn) = h2::server::handshake(tcp).await else {
+            return;
+        };
+        while let Some(Ok((request, mut respond))) = conn.accept().await {
+            tokio::spawn(async move {
+                let mut body = request.into_body();
+                let response = http::Response::builder().status(200).body(()).unwrap();
+                let mut send = respond.send_response(response, false).unwrap();
+                while let Some(Ok(chunk)) = body.data().await {
+                    let _ = body.flow_control().release_capacity(chunk.len());
+                    if send.send_data(chunk, false).is_err() {
+                        return;
+                    }
+                }
+                let _ = send.send_data(bytes::Bytes::new(), true);
+            });
+        }
+    });
+
+    let layer = Arc::new(GrpcLayer::new(GrpcConfig::default()));
+    let tcp = tokio::net::TcpStream::connect(addr).await.expect("tcp");
+    let connect = {
+        let layer = Arc::clone(&layer);
+        tokio::spawn(async move { layer.connect_shared(Box::new(tcp)).await })
+    };
+    dial_started_rx.await.expect("client handshake in flight");
+    layer.reset(); // lands mid-dial
+    let _ = resume_tx.send(());
+    let stream = tokio::time::timeout(Duration::from_secs(5), connect)
+        .await
+        .expect("dial completes")
+        .expect("connect task")
+        .expect("connect succeeds");
+    drop(stream);
+    assert!(
+        layer.reuse().await.is_none(),
+        "a dial straddling reset must not install its connection"
+    );
+}
+
+/// Concurrent `connect_shared` slot misses must not each dial: the second
+/// re-checks `reuse` behind the dial gate and opens on the winner's
+/// connection — the server sees one h2 handshake for both tunnels.
+#[tokio::test]
+async fn grpc_concurrent_connect_shared_dials_once() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let handshakes = Arc::new(AtomicUsize::new(0));
+    let handshakes_srv = Arc::clone(&handshakes);
+    tokio::spawn(async move {
+        while let Ok((tcp, _)) = listener.accept().await {
+            let handshakes = Arc::clone(&handshakes_srv);
+            tokio::spawn(async move {
+                let Ok(mut conn) = h2::server::handshake(tcp).await else {
+                    return;
+                };
+                handshakes.fetch_add(1, Ordering::SeqCst);
+                while let Some(Ok((request, mut respond))) = conn.accept().await {
+                    tokio::spawn(async move {
+                        let mut body = request.into_body();
+                        let response = http::Response::builder().status(200).body(()).unwrap();
+                        let mut send = respond.send_response(response, false).unwrap();
+                        while let Some(Ok(chunk)) = body.data().await {
+                            let _ = body.flow_control().release_capacity(chunk.len());
+                            if send.send_data(chunk, false).is_err() {
+                                return;
+                            }
+                        }
+                        let _ = send.send_data(bytes::Bytes::new(), true);
+                    });
+                }
+            });
+        }
+    });
+
+    let layer = GrpcLayer::new(GrpcConfig::default());
+    let tcp1 = tokio::net::TcpStream::connect(addr).await.expect("tcp");
+    let tcp2 = tokio::net::TcpStream::connect(addr).await.expect("tcp");
+    let (s1, s2) = tokio::join!(
+        layer.connect_shared(Box::new(tcp1)),
+        layer.connect_shared(Box::new(tcp2)),
+    );
+    let (mut s1, mut s2) = (s1.expect("connect"), s2.expect("connect"));
+    for (i, stream) in [&mut s1, &mut s2].into_iter().enumerate() {
+        let msg = format!("tunnel {i}");
+        stream.write_all(msg.as_bytes()).await.expect("write");
+        let mut buf = vec![0u8; msg.len()];
+        tokio::time::timeout(Duration::from_secs(3), stream.read_exact(&mut buf))
+            .await
+            .expect("echo in time")
+            .expect("read");
+        assert_eq!(buf, msg.as_bytes());
+    }
+    // A slow server could still be finishing a loser conn's handshake —
+    // but the loser's TCP was dropped on `reuse`, so it can never get one.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        handshakes.load(Ordering::SeqCst),
+        1,
+        "the second miss must reuse the winner's connection, not dial"
+    );
+}
