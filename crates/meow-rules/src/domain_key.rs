@@ -103,21 +103,22 @@ fn byte_outside_rule_host_alphabet(b: u8) -> bool {
     )
 }
 
-/// True when a `DOMAIN`/`DOMAIN-SUFFIX` `rules:` payload can never equal
+/// True when a `DOMAIN-SUFFIX` `rules:` payload can never equal
 /// the normalized [`Metadata::rule_host`] it is compared against:
 ///
 /// - a trailing dot — `rule_host()` strips trailing dots, so `x.com.` can
-///   only ever name `x.com`, which no `DOMAIN,x.com.` payload matches;
-/// - a leading dot — `DomainRule` compares verbatim and
-///   `DomainSuffixRule` matches `host == suffix` or `.{suffix}` at a
-///   label boundary, so `.x.com` would need a host starting with `.`
-///   (or containing `..x.com`) — impossible on a normalized host;
-/// - any byte outside the rule-host alphabet — `DomainRule`/
-///   `DomainSuffixRule` compare the payload verbatim, and no normalized
-///   host carries `*`, `+`, `?`, a space, or non-ASCII bytes, so
-///   wildcard spellings (`DOMAIN,*.x.com`, `DOMAIN-SUFFIX,+.x.com`) and
-///   impossible-byte payloads (`DOMAIN,a?b`) are dead on these rule
-///   types (`*` belongs on `DOMAIN-WILDCARD`; a `DOMAIN-SUFFIX,x.com`
+///   only ever name `x.com`, which no `DOMAIN-SUFFIX,x.com.` payload
+///   matches;
+/// - a leading dot — `DomainSuffixRule` matches `host == suffix` or
+///   `.{suffix}` at a label boundary, so `.x.com` would need a host
+///   starting with `.` (or containing `..x.com`) — impossible on a
+///   normalized host;
+/// - any byte outside the rule-host alphabet — `DomainSuffixRule`
+///   compares the payload verbatim, and no normalized host carries `*`,
+///   `+`, `?`, a space, or non-ASCII bytes, so wildcard spellings
+///   (`DOMAIN-SUFFIX,*.x.com`, `DOMAIN-SUFFIX,+.x.com`) and
+///   impossible-byte payloads (`DOMAIN-SUFFIX,a?b`) are dead on this
+///   rule type (`*` belongs on `DOMAIN-WILDCARD`; a `DOMAIN-SUFFIX,x.com`
 ///   payload already covers apex plus subdomains, so `+.` adds
 ///   nothing); or
 /// - any [`domain_key_defect`] shape (`a..b`, `"."`, `"+."`).
@@ -139,6 +140,43 @@ pub fn domain_rule_payload_is_dead(payload: &str) -> bool {
         || payload.starts_with('.')
         || payload.bytes().any(byte_outside_rule_host_alphabet)
         || domain_key_is_dead(payload)
+}
+
+/// True when a `DOMAIN` `rules:` payload can never equal the normalized
+/// [`Metadata::rule_host`] it is compared verbatim against — checked
+/// against `is_valid_host` itself, the gate every `Metadata::host` and
+/// `sniff_host` producer passes through. Anything the oracle refuses can
+/// never be produced as a rule host, so an exact-match payload carrying
+/// it is dead:
+///
+/// - a hostname-shaped payload that is all-numeric and not an IP literal
+///   (`2130706433`, `0177.0.0.1`, `123.456` — libc `inet_aton` spellings,
+///   never legal rule hosts, where `10.0.0.1` itself is live because an
+///   IP-literal flow carries the IP string);
+/// - any byte outside the rule-host alphabet, which also subsumes the
+///   shared [`domain_rule_payload_is_dead`] byte check — but spelled
+///   through the oracle so IPv6 literals (`::1`, `[::1]`) stay live and
+///   letter-bearing inet_aton spellings like `0x7f000001` keep matching
+///   the verbatim host a client can still send;
+/// - a trailing/leading dot or any [`domain_key_is_dead`] shape, kept
+///   explicit because `is_valid_host` forgives a trailing dot that the
+///   verbatim `DomainRule` comparison never sees.
+///
+/// Note the asymmetry with `DOMAIN-SUFFIX`: an all-numeric payload is
+/// live there — `x.2130706433` is a legal host the suffix can end on —
+/// so the suffix arm stays on the label-structure check, not the oracle.
+/// Empty payloads stay classified by the caller as a host-less match-all
+/// rather than dead.
+///
+/// [`Metadata::rule_host`]: meow_common::Metadata::rule_host
+/// [`domain_rule_payload_is_dead`]: domain_rule_payload_is_dead
+pub fn domain_exact_payload_is_dead(payload: &str) -> bool {
+    let payload = payload.trim();
+    payload.is_empty()
+        || payload.ends_with('.')
+        || payload.starts_with('.')
+        || domain_key_is_dead(payload)
+        || !meow_common::is_valid_host(payload)
 }
 
 /// True when a `DOMAIN-WILDCARD` `rules:` payload can never match the
