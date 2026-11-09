@@ -235,12 +235,12 @@ async fn handle_http_inner(
             (host, port)
         };
         // A duplicated `Host` field makes the effective authority
-        // ambiguous (RFC 9110 §5.4 permits refusing it outright). An
-        // origin-form request dies on the hostname gate below either way —
-        // `host_header` yields None for a dup, leaving the host empty —
+        // ambiguous (RFC 9110 §5.4 permits refusing it outright). The
+        // origin-form path refused it indirectly — `host_header` yields
+        // None for a dup, leaving an empty host for the hostname gate —
         // but an absolute-form request carries its authority in the
-        // target, so without this check the ambiguous pair would be
-        // forwarded to the origin verbatim (issue #869).
+        // target, so the ambiguous pair was forwarded to the origin
+        // verbatim. Both forms now reject the same way here (issue #869).
         if request
             .headers
             .iter()

@@ -72,9 +72,9 @@ async fn transfer_encoding_on_http_1_0_is_rejected() {
 }
 
 /// RFC 9110 §5.4: a duplicated `Host` field makes the authority ambiguous.
-/// An origin-form target already died on the hostname gate, but an
-/// absolute-form request used to forward the pair to the origin verbatim —
-/// both forms now reject the same way (issue #869).
+/// Origin-form requests were already refused on the hostname gate (a dup
+/// leaves no authority to route); absolute-form requests forwarded the
+/// pair verbatim — both forms now reject the same way (issue #869).
 #[tokio::test]
 async fn duplicate_host_headers_are_rejected() {
     assert_bad_request(

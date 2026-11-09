@@ -166,7 +166,8 @@ the canonical, in-repo source a release is cut from.
   instead of parsing unremarked; `DOMAIN-KEYWORD` needles carrying a
   byte no normalized host can hold (`*`, `+`, `?`, a space, non-ASCII)
   are flagged dead like the other domain types; and `sub-rules:` bodies
-  get the same pass `rules:` lines do. Lenient mode warns and keeps the
+  plus `AND`/`OR`/`NOT` legs get the same pass `rules:` lines do. Lenient
+  mode warns and keeps the
   rule — the empty needle still matches all, as mihomo does — while
   `strict: true` fails the load.
 - **Plain-HTTP absolute-form requests with a duplicated `Host` header

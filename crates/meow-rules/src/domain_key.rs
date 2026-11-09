@@ -341,10 +341,14 @@ mod tests {
     /// The empty needle is the opposite of dead — `contains("")` is
     /// always true, so `DOMAIN-KEYWORD,,X` silently matches every flow.
     /// It is flagged by `domain_keyword_payload_matches_all`, not by the
-    /// dead check (issue #869).
+    /// dead check (issue #869): callers must consult *both* predicates —
+    /// checking only `is_dead` would leave the match-all unseen, and
+    /// checking only `matches_all` would miss every dead shape.
     #[test]
     fn domain_keyword_payload_matches_all_flags_empty_only() {
+        // The combined contract: empty is match-all and *not* dead.
         assert!(domain_keyword_payload_matches_all(""));
+        assert!(!domain_keyword_payload_is_dead(""));
         for payload in ["x", "foo.", " ", "*"] {
             assert!(
                 !domain_keyword_payload_matches_all(payload),

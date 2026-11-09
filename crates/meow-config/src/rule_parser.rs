@@ -92,8 +92,30 @@ pub fn parse_rules_full(
 ///     `+`, `?`, space) is dead; the empty needle is flagged apart as a
 ///     match-all, not dead;
 ///   DOMAIN-REGEX — not checked (arbitrary pattern).
+/// AND/OR/NOT legs carry their own payloads through the same parser, so
+/// the walk recurses into logic groups and reports the first defective
+/// leg against the outer line (issue #869).
 pub(crate) fn domain_payload_defect(rule: &dyn Rule) -> Option<&'static str> {
-    if rule.rule_type() == RuleType::DomainKeyword
+    use meow_rules::logic::{AndRule, NotRule, OrRule};
+    if let Some(any) = rule.as_any() {
+        if let Some(and) = any.downcast_ref::<AndRule>() {
+            return and
+                .sub_rules()
+                .iter()
+                .find_map(|leg| domain_payload_defect(leg.as_ref()));
+        }
+        if let Some(or) = any.downcast_ref::<OrRule>() {
+            return or
+                .sub_rules()
+                .iter()
+                .find_map(|leg| domain_payload_defect(leg.as_ref()));
+        }
+        if let Some(not) = any.downcast_ref::<NotRule>() {
+            return domain_payload_defect(not.inner());
+        }
+    }
+    let rule_type = rule.rule_type();
+    if rule_type == RuleType::DomainKeyword
         && meow_rules::domain_keyword_payload_matches_all(rule.payload())
     {
         return Some(
@@ -101,7 +123,7 @@ pub(crate) fn domain_payload_defect(rule: &dyn Rule) -> Option<&'static str> {
              silently matches every flow; use 'MATCH' to catch all",
         );
     }
-    let dead = match rule.rule_type() {
+    let dead = match rule_type {
         RuleType::Domain | RuleType::DomainSuffix => {
             meow_rules::domain_rule_payload_is_dead(rule.payload())
         }
@@ -320,6 +342,37 @@ mod tests {
             err.to_string().contains("matches every flow"),
             "unexpected error {err}"
         );
+    }
+
+    /// The payload check recurses into AND/OR/NOT legs — a defective
+    /// domain payload nested inside a logic group draws the same
+    /// verdict as a top-level line, reported against the outer line
+    /// (issue #869).
+    #[test]
+    fn dead_domain_payload_inside_logic_group_warns_lenient_errors_strict() {
+        use crate::test_support::WarnCapture;
+        let ctx = ParserContext::default();
+        for line in [
+            "AND,((DOMAIN,x.com.,DIRECT),(DST-PORT,9090)),REJECT",
+            "OR,((DOMAIN-KEYWORD,x+y,DIRECT),(DST-PORT,443)),REJECT",
+            "NOT,((DOMAIN,a..b,DIRECT)),REJECT",
+            // A defective leg two levels deep still surfaces.
+            "AND,((OR,((DOMAIN,.x.com,DIRECT),(NETWORK,tcp))),(DST-PORT,80)),REJECT",
+        ] {
+            let raw = vec![line.to_string()];
+            let cap = WarnCapture::start();
+            let rules = parse_rules(&raw, &ctx, false).expect("lenient mode keeps the group");
+            let warns = cap.take();
+            assert_eq!(rules.len(), 1, "{line}: the group must still load");
+            assert!(
+                warns.contains("dead domain payload") && warns.contains(line),
+                "{line}: the nested defect must be surfaced, got: {warns}"
+            );
+            assert!(
+                parse_rules(&raw, &ctx, true).is_err(),
+                "{line}: strict mode must reject the nested defect"
+            );
+        }
     }
 
     /// The payload check must not false-positive: legal payloads on every

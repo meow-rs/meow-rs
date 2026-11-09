@@ -590,7 +590,8 @@ bare `foo` under trailing-dot normalization — the same residual applies
 to an anchored `DOMAIN-REGEX` like `^foo\.$`, which is otherwise not
 checked: an arbitrary pattern's reachability is not decidable by label
 inspection. Two more surfaces get the same pass: `sub-rules:` bodies
-flag the defects above inside each block, and an *empty*
+and `AND`/`OR`/`NOT` legs flag the defects above (reported against the
+block name or the outer rule line), and an *empty*
 `DOMAIN-KEYWORD` needle is flagged separately — `contains("")` is
 always true, so `DOMAIN-KEYWORD,,X` silently matches every flow rather
 than dying (a comma slip for `MATCH,X`), which mihomo also accepts as a
