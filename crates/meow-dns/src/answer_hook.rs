@@ -63,11 +63,20 @@ impl std::fmt::Debug for PendingHook {
 /// `work.run()` on the blocking pool — the async-context form for spawned
 /// query tasks, where running inline would park the runtime worker. The
 /// caller keeps ordering by awaiting this before sending the answer.
-pub(crate) async fn run_blocking(work: PendingHook) {
+pub(crate) async fn run_blocking(
+    work: PendingHook,
+    charge: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+) {
     // A JoinError means the blocking task died; `run` already catches a
     // hook panic, so this is pathological — the answer must go out
     // anyway.
-    let _ = tokio::task::spawn_blocking(move || work.run()).await;
+    // Cancellation drops only the async waiter. The blocking work retains
+    // the query's charge until it actually finishes, including on timeout.
+    let _ = tokio::task::spawn_blocking(move || {
+        let _charge = charge;
+        work.run();
+    })
+    .await;
 }
 
 /// The hook call for this answer, packaged to run later — `None` when no
@@ -148,6 +157,106 @@ mod tests {
         let log = Arc::new(StdMutex::new(Vec::new()));
         install(Some(Arc::new(Recorder(Arc::clone(&log)))));
         log
+    }
+
+    #[test]
+    fn cancelled_upstream_answer_keeps_blocking_hook_charged() {
+        let (_lock, _guard) = locked();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            use hickory_proto::serialize::binary::BinEncodable;
+            use hickory_proto::{
+                op::{Message, MessageType, OpCode, Query},
+                rr::{rdata::A, Name, RData, Record, RecordType},
+            };
+            struct BlockingHook {
+                started: StdMutex<Option<tokio::sync::oneshot::Sender<()>>>,
+                release: StdMutex<std::sync::mpsc::Receiver<()>>,
+            }
+            impl AnswerHook for BlockingHook {
+                fn on_answer(&self, domain: &str, _: IpAddr, _: Duration) {
+                    if domain != "charged-hook.invalid" {
+                        return;
+                    }
+                    if let Some(tx) = self.started.lock().unwrap().take() {
+                        let _ = tx.send(());
+                    }
+                    let _ = self
+                        .release
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(5));
+                }
+            }
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            install(Some(Arc::new(BlockingHook {
+                started: StdMutex::new(Some(started_tx)),
+                release: StdMutex::new(release_rx),
+            })));
+            let upstream = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let addr = upstream.local_addr().unwrap();
+            let peer = tokio::spawn(async move {
+                let mut bytes = [0; 512];
+                let (len, source) = upstream.recv_from(&mut bytes).await.unwrap();
+                let request = Message::from_vec(&bytes[..len]).unwrap();
+                let mut response =
+                    Message::new(request.metadata.id, MessageType::Response, OpCode::Query);
+                response.add_queries(request.queries.iter().cloned());
+                response.add_answer(Record::from_rdata(
+                    Name::from_ascii("charged-hook.invalid.").unwrap(),
+                    60,
+                    RData::A(A::new(192, 0, 2, 1)),
+                ));
+                upstream
+                    .send_to(&response.to_bytes().unwrap(), source)
+                    .await
+                    .unwrap();
+            });
+            let resolver = Resolver::new(
+                vec![addr],
+                Vec::new(),
+                DnsMode::Normal,
+                meow_trie::DomainTrie::new(),
+                false,
+                true,
+            );
+            let mut query = Message::new(11, MessageType::Query, OpCode::Query);
+            query.add_query(Query::query(
+                Name::from_ascii("charged-hook.invalid.").unwrap(),
+                RecordType::A,
+            ));
+            let wire = query.to_bytes().unwrap();
+            assert!(matches!(
+                crate::server::DnsServer::try_answer_local(&wire, &resolver),
+                crate::server::LocalAnswer::Upstream
+            ));
+            let budget = Arc::new(tokio::sync::Semaphore::new(1));
+            let charge = Arc::new(Arc::clone(&budget).acquire_owned().await.unwrap());
+            let task = tokio::spawn(async move {
+                crate::server::DnsServer::handle_query_charged(&wire, &resolver, Some(charge)).await
+            });
+            tokio::time::timeout(Duration::from_secs(2), started_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            task.abort();
+            let _ = task.await;
+            let held_after_cancel = budget.available_permits() == 0;
+            release_tx.send(()).unwrap();
+            let _permit = tokio::time::timeout(Duration::from_secs(2), budget.acquire())
+                .await
+                .unwrap()
+                .unwrap();
+            peer.await.unwrap();
+            assert!(
+                held_after_cancel,
+                "uncancellable upstream hook released its work charge early"
+            );
+        });
     }
 
     #[test]
@@ -320,7 +429,7 @@ mod tests {
             )
         };
 
-        run_blocking(work).await;
+        run_blocking(work, None).await;
 
         assert!(log
             .lock()
