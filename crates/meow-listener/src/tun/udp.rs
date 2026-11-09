@@ -472,6 +472,18 @@ async fn flow_task(tunnel: Tunnel, spec: FlowSpec) {
     }
 }
 
+/// Map a completed reply-reader join to the flow's exit error — the
+/// reader owns the only `up_tx`, so any reader exit ends the flow.
+/// `None` (empty set) is unreachable today — every earlier `join_next`
+/// breaks out — and folds into the clean-exit message.
+fn reply_reader_exit(done: Option<Result<Result<(), String>, tokio::task::JoinError>>) -> String {
+    match done {
+        Some(Ok(Err(e))) => e,
+        Some(Ok(Ok(()))) | None => "downstream reader exited".into(),
+        Some(Err(e)) => format!("downstream reader task: {e}"),
+    }
+}
+
 /// Route the flow, dial the outbound, then pump datagrams both ways until
 /// `udp_timeout` passes with no traffic in either direction. `last_activity`
 /// is the table entry's shared stamp — upstream replies it successfully
@@ -643,11 +655,7 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
             let write_result = tokio::select! {
                 () = &mut idle => break 'flow Ok(()), // idle-timeout during write
                 () = flush.flushed() => break 'flow Ok(()), // flush during write
-                done = reply_task.join_next() => break 'flow Err(match done {
-                    Some(Ok(Err(e))) => e,
-                    Some(Ok(Ok(()))) | None => "downstream reader exited".into(),
-                    Some(Err(e)) => format!("downstream reader task: {e}"),
-                }),
+                done = reply_task.join_next() => break 'flow Err(reply_reader_exit(done)),
                 r = conn.write_packet(&data, &dst_addr) => r,
             };
             match write_result {
@@ -680,11 +688,7 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
                         let write_result = tokio::select! {
                             () = &mut idle => break Ok(()), // idle-timeout during write
                             () = flush.flushed() => break Ok(()), // flush during write
-                            done = reply_task.join_next() => break Err(match done {
-                                Some(Ok(Err(e))) => e,
-                                Some(Ok(Ok(()))) | None => "downstream reader exited".into(),
-                                Some(Err(e)) => format!("downstream reader task: {e}"),
-                            }),
+                            done = reply_task.join_next() => break Err(reply_reader_exit(done)),
                             r = conn.write_packet(&data, &dst_addr) => r,
                         };
                         match write_result {
@@ -727,11 +731,7 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
                     }
                     // The reader task exited — it owns the only `up_tx`. The
                     // set removes its completed task, so shutdown will not poll it twice.
-                    None => break Err(match reply_task.join_next().await {
-                        Some(Ok(Err(e))) => e,
-                        Some(Ok(Ok(()))) | None => "downstream reader exited".into(),
-                        Some(Err(e)) => format!("downstream reader task: {e}"),
-                    }),
+                    None => break Err(reply_reader_exit(reply_task.join_next().await)),
                 },
             }
         }
