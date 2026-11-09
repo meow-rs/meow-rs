@@ -116,6 +116,16 @@ jobs:
           f="luci-app-meow_${IPK_VERSION}-1_all.ipk"
           sha256sum "$f" > "$f.sha256"
 
+      - name: Cache apk-tools
+        if: steps.fresh.outputs.stale != 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/apk-tools
+          # Same key as build.yml/test.yml/release.yml: a stale Alpine pin
+          # must never reach the CDN from a publish job — a warm cache
+          # makes install-apk-tools.sh exit before downloading.
+          key: apk-tools-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('openwrt/install-apk-tools.sh') }}
+
       - name: Package luci-app-meow apk (arch-independent)
         if: steps.fresh.outputs.stale != 'true'
         run: |

@@ -35,9 +35,11 @@
 #   (`wintun-${{ matrix.target }}-${{ hashFiles(...) }}`, path dist/wintun)
 #   and self-seeding on the release path — a different key/path pair than
 #   the test.yml x86_64 leg warmed below.
-# - apk-tools (test.yml openwrt leg): same hashFiles-on-fetch-script
-#   pattern, but that leg is a niche e2e edge and not a CDN-flake hotspot;
-#   skipped to keep this workflow's runtime bounded.
+# - apk-tools is warmed below for a different reason than the peers: the
+#   failure mode is not CDN flakes but Alpine pruning superseded builds —
+#   a stale pin 404s deterministically. A daily warm doubles as a canary
+#   that surfaces the prune in an isolated job before a publish leg meets
+#   it, and keeps a verified binary restorable while a pin bump lands.
 
 name: cache-warmup
 
@@ -225,6 +227,28 @@ jobs:
         with:
           path: ${{ runner.temp }}/trusttunnel
           key: trusttunnel-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/fetch-trusttunnel-endpoint.sh') }}
+
+      - name: Cache apk-tools
+        id: cache-apk-tools
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/apk-tools
+          # Mirrors build.yml/test.yml/release.yml/alpha.yml exactly.
+          key: apk-tools-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('openwrt/install-apk-tools.sh') }}
+
+      # Also the staleness canary: a 404 here means Alpine pruned the
+      # pinned build — bump APK_TOOLS_VERSION/SHA256_* in the script.
+      - name: Install apk-tools
+        id: install-apk-tools
+        if: steps.cache-apk-tools.outputs.cache-hit != 'true'
+        run: bash openwrt/install-apk-tools.sh "$HOME/.cache/apk-tools"
+
+      - name: Save apk-tools cache
+        if: steps.cache-apk-tools.outputs.cache-hit != 'true' && steps.install-apk-tools.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/apk-tools
+          key: apk-tools-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('openwrt/install-apk-tools.sh') }}
 
   warmup-macos:
     runs-on: macos-latest
