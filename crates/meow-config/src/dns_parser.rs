@@ -104,8 +104,11 @@ pub async fn parse_dns(
         .nameserver_policy
         .as_ref()
         .map(|map| prefer_h3_policy_map(map, prefer_h3));
-    let effective_proxy_policy =
-        active_node_policy(raw).map(|map| prefer_h3_policy_map(map, prefer_h3));
+    // The global `prefer-h3` does NOT apply to the node policy: proxy
+    // hostname resolution is latency-sensitive and a silent H3→H2 fallback
+    // would just time out. An explicit `?h3=` entry still works and
+    // is still capability-gated below.
+    let effective_proxy_policy = active_node_policy(raw).cloned();
 
     // A `prefer-h3` / `?h3=` entry needs a build that can speak QUIC. Reject
     // the config here — client construction would otherwise panic, which is a
@@ -218,6 +221,11 @@ pub async fn parse_dns(
                     strict,
                 )
                 .await?
+                // Same exclusive flag as the main policy: it is a
+                // matched-entry semantic (the dedicated upstream owns the
+                // query, no fall-through on failure) — a policy MISS always
+                // falls through to `proxy_server_nameserver` regardless, so
+                // propagating the flag cannot strand uncovered hostnames.
                 .with_exclusive(dns.nameserver_policy_exclusive.unwrap_or(false)),
             )
         } else {
@@ -741,8 +749,14 @@ pub(crate) fn validate_node_policy_sources(raw: &RawConfig) -> anyhow::Result<()
         else {
             continue; // The shared policy builder reports missing providers.
         };
-        anyhow::ensure!(!provider.provider_type.eq_ignore_ascii_case("http"),
-            "dns.proxy-server-nameserver-policy: rule-set '{name}' needs independent bootstrap; use an inline or file provider (HTTP redirects and proxy routing can re-enter this node resolver)");
+        // Allowlist, not denylist: only provider types proven independent of
+        // the node resolver may feed its policy. Any new remote type must
+        // re-justify itself here before it is allowed through.
+        anyhow::ensure!(
+            provider.provider_type.eq_ignore_ascii_case("file")
+                || provider.provider_type.eq_ignore_ascii_case("inline"),
+            "dns.proxy-server-nameserver-policy: rule-set '{name}' needs independent bootstrap; use an inline or file provider (remote fetches can redirect or route via a node that re-enters this node resolver)"
+        );
     }
     Ok(())
 }
@@ -4187,6 +4201,11 @@ mod tests {
             op::ResponseCode,
             rr::{Name, RecordType},
         };
+        // `nameserver-policy-exclusive` propagates to the node resolver: it
+        // only owns MATCHED entries (miss always falls through to
+        // `proxy-server-nameserver`), so propagation is the coherent single
+        // knob — a dedicated node upstream's failure is not silently masked
+        // by the general node pool.
         for exclusive in [false, true] {
             let cfg = node_policy_config(&format!(
                 "dns:\n  enable: true\n  nameserver: [rcode://success]\n  proxy-server-nameserver: [rcode://refused]\n  nameserver-policy-exclusive: {exclusive}\n  proxy-server-nameserver-policy:\n    '+.node.test': rcode://name_error\n"
@@ -4279,8 +4298,8 @@ mod tests {
         let raw: RawConfig = serde_saphyr::from_str(
             r#"
 proxies:
-  - {name: Node, type: trojan, server: 192.0.2.1, port: 443, password: example, dialer-proxy: G}
-  - {name: Front, type: trojan, server: front.invalid, port: 443, password: example}
+  - {name: Node, type: ss, server: 192.0.2.1, port: 443, cipher: aes-128-gcm, password: example, dialer-proxy: G}
+  - {name: Front, type: ss, server: front.invalid, port: 443, cipher: aes-128-gcm, password: example}
 proxy-groups:
   - {name: G, type: select, proxies: [REJECT, Front]}
 dns:
@@ -4442,7 +4461,9 @@ dns:
     #[cfg(not(feature = "dns-quic"))]
     #[tokio::test]
     async fn node_policy_h3_capability_is_checked_before_client_construction() {
-        let raw: RawConfig = serde_saphyr::from_str("dns:\n  enable: true\n  nameserver: [rcode://success]\n  proxy-server-nameserver: [rcode://success]\n  prefer-h3: true\n  proxy-server-nameserver-policy:\n    node.test: 'https://192.0.2.1/dns-query'\n").unwrap();
+        // Global prefer-h3 does not rewrite node-policy entries; an explicit
+        // `?h3=` entry is still capability-gated before client construction.
+        let raw: RawConfig = serde_saphyr::from_str("dns:\n  enable: true\n  nameserver: [rcode://success]\n  proxy-server-nameserver: [rcode://success]\n  prefer-h3: true\n  proxy-server-nameserver-policy:\n    node.test: 'https://192.0.2.1/dns-query?h3=prefer'\n").unwrap();
         let error = parse_dns(
             &raw,
             None,
@@ -4456,5 +4477,25 @@ dns:
         .err()
         .unwrap();
         assert!(error.to_string().contains("dns-quic"));
+    }
+
+    #[cfg(not(feature = "dns-quic"))]
+    #[tokio::test]
+    async fn node_policy_plain_https_entry_ignores_prefer_h3() {
+        // Global prefer-h3 must not rewrite node-policy entries: a bare
+        // `https://` node entry stays HTTP/2-capable and parses fine on a
+        // build without `dns-quic`.
+        let raw: RawConfig = serde_saphyr::from_str("dns:\n  enable: true\n  nameserver: [rcode://success]\n  proxy-server-nameserver: [rcode://success]\n  prefer-h3: true\n  proxy-server-nameserver-policy:\n    node.test: 'https://192.0.2.1/dns-query'\n").unwrap();
+        parse_dns(
+            &raw,
+            None,
+            None,
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
     }
 }

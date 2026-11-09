@@ -25,8 +25,12 @@ flag remains off by default, consistent with meow's existing policy behavior.
 
 Policy reordering is a DNS input change. Proxy references also force a resolver
 rebuild when the proxy registry changes; rule-set matchers bind to the candidate
-provider generation. `prefer-h3`, DNS feature checks, domain-key validation and
-geosite discovery use the same machinery as the ordinary policy.
+provider generation. DNS feature checks, domain-key validation and geosite
+discovery use the same machinery as the ordinary policy. The global `prefer-h3`
+does **not** rewrite node-policy `https://` entries — proxy hostname resolution
+is latency-sensitive and a silent H3 attempt would just time out where QUIC is
+firewalled; an explicit `?h3=` entry still works and is still
+capability-gated.
 
 ## Independent bootstrap requirements
 
