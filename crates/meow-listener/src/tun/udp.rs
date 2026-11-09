@@ -605,6 +605,20 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
     // server name, at most `sniffer.timeout` and a few packets; they are
     // sent upstream first once the flow is dialed.
     let mut held: Vec<Vec<u8>> = Vec::new();
+
+    // Flush and error returns below exit before `held` is flushed to the
+    // conn: say so when that drops datagrams — the client sent its
+    // Initials and otherwise waits out its idle timeout for answers that
+    // were never forwarded.
+    let drop_held = |held: &[Vec<u8>]| {
+        if !held.is_empty() {
+            debug!(
+                "tun UDP {src} -> {dst}: dropping {} held QUIC Initial datagram(s) unsent",
+                held.len()
+            );
+        }
+    };
+
     if sniffer.is_some() {
         crate::sniffer::prefill_host(&tunnel.inner().resolver(), &mut metadata);
     }
@@ -614,7 +628,10 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
         while held.len() < QUIC_SNIFF_PACKETS {
             let packet = tokio::select! {
                 biased;
-                () = flush.flushed() => return Ok(()),
+                () = flush.flushed() => {
+                    drop_held(&held);
+                    return Ok(());
+                }
                 packet = tokio::time::timeout_at(deadline, rx.recv()) => packet,
             };
             let Ok(Some(data)) = packet else { break };
@@ -631,19 +648,6 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
         }
     }
 
-    // Routing or dial failures below return before `held` is flushed to
-    // the conn: say so when that drops datagrams — the client sent its
-    // Initials and otherwise waits out its idle timeout for answers that
-    // were never forwarded.
-    let drop_held = |held: &[Vec<u8>]| {
-        if !held.is_empty() {
-            debug!(
-                "tun UDP {src} -> {dst}: dropping {} held QUIC Initial datagram(s) unsent",
-                held.len()
-            );
-        }
-    };
-
     let inner = tunnel.inner();
     if matches!(
         inner.pre_handle_metadata(&mut metadata),
@@ -657,7 +661,12 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
     // demand — including after a fake-IP was rewritten back to a hostname.
     tokio::select! {
         biased;
-        () = flush.flushed() => return Ok(()),
+        () = flush.flushed() => {
+            drop_held(&held);
+            // A flush between pre_resolve and resolve_udp_dst can leave
+            // metadata half-resolved; it is never read after this return.
+            return Ok(());
+        }
         () = async {
             inner.pre_resolve(&mut metadata).await;
             inner.resolve_udp_dst(&mut metadata).await;
@@ -675,7 +684,10 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
     // Non-hijacked client traffic follows the same policy on every port.
     let target = tokio::select! {
         biased;
-        () = flush.flushed() => return Ok(()),
+        () = flush.flushed() => {
+            drop_held(&held);
+            return Ok(());
+        }
         target = inner.resolve_proxy(&metadata) => target,
     };
     let Some(ResolvedTarget {
@@ -700,9 +712,14 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
     );
 
     // Prioritize an already-pending flush even if the dial is ready too.
+    // Invariant: dial_udp must not spawn detached tasks — cancellation via
+    // future drop must release every socket the dial opened.
     let dialed = tokio::select! {
         biased;
-        () = flush.flushed() => return Ok(()),
+        () = flush.flushed() => {
+            drop_held(&held);
+            return Ok(());
+        }
         result = inner.dial_udp(proxy.as_ref(), &metadata) => result,
     };
     let conn: std::sync::Arc<dyn meow_common::ProxyPacketConn> = match dialed {
@@ -1507,6 +1524,8 @@ mod cleanup_tests {
     #[tokio::test]
     async fn tun_dns_query_cancelled_on_loop_abort() {
         stop_loop_with_pending_dns(true).await;
+    }
+
     #[tokio::test]
     async fn flush_cancels_pending_udp_dial() {
         let (tunnel, spec, _tx, probe) = fixture();
@@ -1530,7 +1549,7 @@ mod cleanup_tests {
 
     #[tokio::test]
     async fn flush_cancels_pending_udp_sniff() {
-        let (tunnel, mut spec, _tx, _probe) = fixture();
+        let (tunnel, mut spec, tx, _probe) = fixture();
         spec.sniffer = Some(Arc::new(crate::sniffer::SnifferRuntime::new(
             meow_common::sniffer::SnifferConfig {
                 enable: true,
@@ -1541,6 +1560,12 @@ mod cleanup_tests {
         )));
         let relay = relay_flow(&tunnel, spec);
         tokio::pin!(relay);
+        // Feed one packet so the first poll lands inside the sniff-loop
+        // select, not at the function entry — the flush arm under test is
+        // the loop's, and a second recv parks there awaiting packet two.
+        // A v1 0-RTT long-header with a zero-length payload feeds `More`
+        // (not Initial): the loop stays parked on `rx.recv()`.
+        tx.try_send(vec![0xd0, 0, 0, 0, 1, 0, 0, 0]).unwrap();
         assert!(futures::poll!(&mut relay).is_pending());
         let count = tunnel.close_all_udp_sessions();
         let done = tokio::time::timeout(Duration::from_secs(1), &mut relay).await;
