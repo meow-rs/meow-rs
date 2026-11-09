@@ -221,7 +221,7 @@ async fn fetch_capped(
     limit: usize,
     direct_fallback: bool,
 ) -> Result<Response> {
-    let mut current = Url::parse(url).map_err(|e| anyhow!("invalid URL '{url}': {e}"))?;
+    let mut current = Url::parse(url).map_err(|e| anyhow!("invalid URL: {e}"))?;
     let mut headers = headers.to_vec();
     for attempt in 0..=MAX_REDIRECTS {
         match fetch_one(&current, proxy, &headers, limit).await {
@@ -229,7 +229,7 @@ async fn fetch_capped(
             Ok(Outcome::Redirect(next)) => {
                 let next = current
                     .join(&next)
-                    .map_err(|e| anyhow!("bad redirect Location '{next}': {e}"))?;
+                    .map_err(|e| anyhow!("bad redirect Location: {e}"))?;
                 if current.origin() != next.origin() {
                     headers.retain(|(name, _)| {
                         ![
@@ -259,7 +259,7 @@ async fn fetch_capped(
             }
         }
     }
-    bail!("too many redirects (> {MAX_REDIRECTS}) starting from {url}")
+    bail!("too many redirects (> {MAX_REDIRECTS})")
 }
 
 enum Outcome {
@@ -299,15 +299,15 @@ async fn fetch_one(
     let is_https = match scheme {
         "https" => true,
         "http" => false,
-        other => bail!("unsupported URL scheme '{other}': {url}"),
+        other => bail!("unsupported URL scheme '{other}'"),
     };
     let host = url
         .host_str()
-        .ok_or_else(|| anyhow!("URL has no host: {url}"))?
+        .ok_or_else(|| anyhow!("URL has no host"))?
         .to_string();
     let port = url
         .port_or_known_default()
-        .ok_or_else(|| anyhow!("URL has no port: {url}"))?;
+        .ok_or_else(|| anyhow!("URL has no port"))?;
     let path_and_query = match url.query() {
         Some(q) => format!("{}?{q}", url.path()),
         None => url.path().to_string(),
@@ -494,14 +494,9 @@ fn parse_response(buf: &[u8], limit: usize) -> Result<Outcome> {
         bail!("HTTP {status} redirect without Location header");
     }
     if !(200..300).contains(&status) {
-        let snippet: String = String::from_utf8_lossy(&buf[body_start..])
-            .chars()
-            .take(200)
-            .collect();
-        if snippet.is_empty() {
-            bail!("HTTP {status}");
-        }
-        bail!("HTTP {status}: {snippet}");
+        // Fetch errors reach provider logs and the logbook. An error page
+        // can echo subscription credentials or contain private provider data.
+        bail!("HTTP {status}");
     }
     // A declared Content-Length above the cap is rejected outright (issue
     // #431) — a dishonest or huge value must not be trusted over the cap.
@@ -642,6 +637,84 @@ mod tests {
     fn parse_response_rejects_truncated_chunk() {
         let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nabc";
         assert!(parse_response(response, MAX_BODY_BYTES).is_err());
+    }
+
+    #[tokio::test]
+    async fn fetch_errors_omit_url_credentials() {
+        for (url, category) in [
+            (
+                "http://user:secret-password@127.0.0.1:invalid/private-token?token=query-secret",
+                "invalid URL",
+            ),
+            (
+                "file:///private-token?token=query-secret",
+                "unsupported URL scheme",
+            ),
+        ] {
+            let error = fetch_direct(url).await.unwrap_err();
+            assert!(error.to_string().contains(category), "{error}");
+            let diagnostic = format!("{error} {error:#} {error:?}");
+            for secret in ["secret-password", "private-token", "query-secret"] {
+                assert!(!diagnostic.contains(secret), "{diagnostic}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_status_errors_omit_response_content() {
+        for response in [
+            b"HTTP/1.1 403 body-secret\r\nContent-Length: 11\r\n\r\nbody-secret".as_slice(),
+            b"HTTP/1.1 503 Unavailable\r\nTransfer-Encoding: chunked\r\n\r\nb\r\nbody-secret\r\n0\r\n\r\n".as_slice(),
+        ] {
+            let url = spawn_raw_http_server(response).await;
+            let error = fetch_direct(&url).await.unwrap_err();
+            let status = std::str::from_utf8(&response[9..12]).unwrap();
+            assert_eq!(error.to_string(), format!("HTTP {status}"));
+            assert!(!format!("{error:#} {error:?}").contains("body-secret"));
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_redirect_errors_omit_location() {
+        let url = spawn_raw_http_server(
+            b"HTTP/1.1 302 Found\r\nLocation: http://user:secret-password@127.0.0.1:invalid/private-token?token=query-secret\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+        let error = fetch_direct(&url).await.unwrap_err();
+        assert!(error.to_string().contains("bad redirect Location"));
+        let diagnostic = format!("{error} {error:#} {error:?}");
+        for secret in ["secret-password", "private-token", "query-secret"] {
+            assert!(!diagnostic.contains(secret), "{diagnostic}");
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_redirect_limit_omits_original_url() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://{}/private-token?token=query-secret",
+            listener.local_addr().unwrap()
+        );
+        let server = tokio::spawn(async move {
+            for _ in 0..=MAX_REDIRECTS {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 1024];
+                let received = stream.read(&mut request).await.unwrap();
+                assert!(received > 0);
+                stream.write_all(b"HTTP/1.1 302 Found\r\nLocation: /private-token?token=query-secret\r\nContent-Length: 0\r\n\r\n").await.unwrap();
+                stream.shutdown().await.unwrap();
+            }
+        });
+        let error = tokio::time::timeout(Duration::from_secs(5), fetch_direct(&url))
+            .await
+            .unwrap()
+            .unwrap_err();
+        server.await.unwrap();
+        assert!(error.to_string().contains("too many redirects"));
+        let diagnostic = format!("{error} {error:#} {error:?}");
+        for secret in ["private-token", "query-secret"] {
+            assert!(!diagnostic.contains(secret), "{diagnostic}");
+        }
     }
 
     // start_paused: tokio auto-advances the clock when every task is idle, so
