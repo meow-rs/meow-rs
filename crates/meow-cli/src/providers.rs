@@ -302,6 +302,14 @@ mod tests {
 
     #[test]
     fn fetch_errors_lose_their_urls() {
+        // Engine fetch errors no longer embed URLs at all (meow-config's
+        // internal_http); `hide_urls` is the backstop in case one leaks
+        // through a new path — it must still strip them wherever they sit.
+        assert_eq!(hide_urls("invalid URL: x"), "invalid URL: x");
+        assert_eq!(
+            hide_urls("too many redirects (> 5)"),
+            "too many redirects (> 5)"
+        );
         assert_eq!(
             hide_urls(
                 "invalid URL 'https://sub.example.com/s?token=abc': x; \
