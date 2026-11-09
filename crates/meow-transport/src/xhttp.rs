@@ -11,12 +11,8 @@ use async_trait::async_trait;
 use rand::seq::IndexedRandom as _;
 use rand::Rng as _;
 
-use crate::h2_common::{H2Stream, RecvState};
+use crate::h2_common::{H2Stream, RecvState, SharedH2, SharedH2Slot};
 use crate::{Result, Stream, Transport, TransportError};
-
-/// Timeout for acquiring send readiness (`h2.ready()`) during `connect`.
-/// Mirrors H2Layer and h2mux's `OPEN_TIMEOUT` (5 s).
-const OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Upper bound for `x-padding-bytes` — the padding becomes a `String` of that
 /// length inside a Referer header on every connect, so an unbounded value is
@@ -107,18 +103,49 @@ impl Default for XhttpConfig {
 /// Transport layer that wraps an inner stream with an XHTTP tunnel.
 pub struct XhttpLayer {
     config: XhttpConfig,
+    /// stream-one tunnels share one h2 connection, as Xray's xmux does
+    ///: no new TCP + TLS/REALITY handshake per tunnel.
+    session: SharedH2Slot,
 }
 
 impl XhttpLayer {
     /// Create an `XhttpLayer` from the given configuration.
     pub fn new(config: XhttpConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            session: SharedH2Slot::default(),
+        }
     }
-}
 
-#[async_trait]
-impl Transport for XhttpLayer {
-    async fn connect(&self, inner: Box<dyn Stream>) -> Result<Box<dyn Stream>> {
+    /// Open one stream-one tunnel on `session`.
+    async fn open(&self, session: &SharedH2, wait: bool) -> Result<Box<dyn Stream>> {
+        let request = self.request()?;
+        // `wait` bounds readiness by `h2_common::OPEN_TIMEOUT` (5 s, like
+        // H2Layer's and h2mux's); readiness resolves instantly once the
+        // peer's SETTINGS arrive, so only a `max_concurrent_streams=0`
+        // peer runs it out.
+        let (response_future, send_stream) = session
+            .send_request(request, wait, TransportError::Xhttp)
+            .await?;
+        // Do NOT await the response here: upstream's handler reads the
+        // client's first DATA frame before it writes response headers.
+        // The response is resolved lazily on the first read via RecvState.
+        Ok(Box::new(
+            H2Stream::new(
+                send_stream,
+                RecvState::with_timeout(
+                    response_future,
+                    Duration::from_secs(15),
+                    crate::h2_common::StatusPolicy::Success,
+                    "xhttp",
+                ),
+            )
+            .with_shared_driver(session.lease()),
+        ))
+    }
+
+    /// A stream-one request: fresh host pick and padding every time.
+    fn request(&self) -> Result<http::Request<()>> {
         validate_config(&self.config)?;
 
         let host = self
@@ -180,58 +207,84 @@ impl Transport for XhttpLayer {
             }
         }
 
-        let request = request_builder
+        request_builder
             .body(())
-            .map_err(|e| TransportError::Config(format!("xhttp: invalid request config: {e}")))?;
+            .map_err(|e| TransportError::Config(format!("xhttp: invalid request config: {e}")))
+    }
+}
+
+#[async_trait]
+impl Transport for XhttpLayer {
+    async fn reuse(&self) -> Option<Box<dyn Stream>> {
+        let session = self.session.live().await?;
+        match self.open(&session, false).await {
+            Ok(stream) => Some(stream),
+            Err(_) => {
+                self.session.forget(&session);
+                None
+            }
+        }
+    }
+
+    async fn connect(&self, inner: Box<dyn Stream>) -> Result<Box<dyn Stream>> {
+        self.dial(inner, false).await
+    }
+
+    async fn connect_shared(&self, inner: Box<dyn Stream>) -> Result<Box<dyn Stream>> {
+        // Single-flight on a slot miss: without the gate two concurrent
+        // misses each dial and `set` last-writer-wins, orphaning a conn.
+        // The second caller re-checks `reuse` behind the gate and opens a
+        // stream on the winner's connection instead (`MuxClient::offer`
+        // holds its pool lock across the dial the same way). Held across
+        // the dial, so it is a tokio Mutex; plain `connect` never takes it.
+        let _gate = self.session.dial.lock().await;
+        if let Some(stream) = self.reuse().await {
+            return Ok(stream);
+        }
+        self.dial(inner, true).await
+    }
+
+    fn reset(&self) {
+        self.session.clear();
+    }
+}
+
+impl XhttpLayer {
+    /// Open the h2 connection and its first stream; `share` keeps the
+    /// connection for [`Transport::reuse`].
+    async fn dial(&self, inner: Box<dyn Stream>, share: bool) -> Result<Box<dyn Stream>> {
+        // Configuration errors surface before the h2 handshake.
+        self.request()?;
+
+        // A `reset` landing mid-dial invalidates the connection being set
+        // up — its socket may predate a new outbound binding (issue #695)
+        // — so `set` discards it when the generation captured here has
+        // moved on (`MuxClient::offer_new_locked` drops a straddling
+        // session the same way).
+        let generation = self.session.generation();
 
         // Proxy-sized receive windows — see `h2_common::client_builder`.
-        let (mut h2, conn) = crate::h2_common::client_builder()
-            .handshake::<_, bytes::Bytes>(inner)
-            .await
-            .map_err(|e| crate::h2_common::h2_to_transport(e, TransportError::Xhttp))?;
+        // Bounded: `connect_shared` callers hold the slot's dial gate, so
+        // the handshake needs its own ceiling independent of the caller's
+        // dial deadline.
+        let (h2, conn) = tokio::time::timeout(
+            crate::h2_common::OPEN_TIMEOUT,
+            crate::h2_common::client_builder().handshake::<_, bytes::Bytes>(inner),
+        )
+        .await
+        .map_err(|_| TransportError::Xhttp("timed out in h2 handshake".into()))?
+        .map_err(|e| crate::h2_common::h2_to_transport(e, TransportError::Xhttp))?;
 
-        let driver_task = tokio::spawn(async move {
-            let _ = conn.await;
-        });
-        let abort_handle = driver_task.abort_handle();
-        h2 = match tokio::time::timeout(OPEN_TIMEOUT, h2.ready()).await {
-            Ok(Ok(ready_h2)) => ready_h2,
-            Ok(Err(e)) => {
-                abort_handle.abort();
-                return Err(crate::h2_common::h2_to_transport(e, TransportError::Xhttp));
+        // A failed first stream drops `session`, whose driver aborts
+        // (issue #669); only a working connection is offered for reuse.
+        let session = SharedH2::spawn(h2, conn);
+        let stream = self.open(&session, true).await?;
+        if share {
+            if let Some(generation) = generation {
+                self.session.set(session, generation);
             }
-            Err(_) => {
-                abort_handle.abort();
-                return Err(TransportError::Xhttp(
-                    "timed out waiting for send readiness (open)".into(),
-                ));
-            }
-        };
-
-        // Open the h2 stream; `end_of_stream = false` — we stream bidirectional data.
-        let (response_future, send_stream) = match h2.send_request(request, false) {
-            Ok(parts) => parts,
-            Err(e) => {
-                abort_handle.abort();
-                return Err(crate::h2_common::h2_to_transport(e, TransportError::Xhttp));
-            }
-        };
-
-        // Do NOT await the response here: upstream's handler reads the
-        // client's first DATA frame before it writes response headers.
-        // The response is resolved lazily on the first read via RecvState.
-        Ok(Box::new(
-            H2Stream::new(
-                send_stream,
-                RecvState::with_timeout(
-                    response_future,
-                    Duration::from_secs(15),
-                    crate::h2_common::StatusPolicy::Success,
-                    "xhttp",
-                ),
-            )
-            .with_conn_driver(driver_task),
-        ))
+        }
+        Ok(stream)
     }
 }
 

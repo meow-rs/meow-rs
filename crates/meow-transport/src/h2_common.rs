@@ -5,8 +5,12 @@ use http::StatusCode;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
+#[cfg(any(feature = "grpc", feature = "xhttp"))]
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
+#[cfg(any(feature = "grpc", feature = "xhttp"))]
+use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::TransportError;
@@ -218,6 +222,360 @@ impl RecvState {
 /// default window keep their single-poll behaviour.
 const WRITE_STASH_CAP: usize = 64 * 1024;
 
+// ─── Shared client connection (gRPC, XHTTP) ───────────────────
+// Only the multiplexing layers pool one h2 connection per proxy; the h2
+// layer and h2mux open a connection per tunnel, so this whole block is
+// dead code under `h2`-only builds and gated on the pooling features.
+
+/// After this long without *received* bytes on any of its streams, a
+/// reused connection is PINGed first (a NAT or the server may have
+/// dropped it silently).
+#[cfg(any(feature = "grpc", feature = "xhttp"))]
+const REUSE_IDLE_PING: Duration = Duration::from_secs(30);
+
+/// Bound on `h2.ready()` when adding a stream to a *reused* connection —
+/// doubles as the PING RTT budget in `alive`. `ready()` resolves
+/// instantly while the peer's `max_concurrent_streams` leaves room
+/// (capacity is pre-checked by `has_room`), so only a saturated
+/// connection runs the timeout out and is replaced by a fresh dial.
+#[cfg(any(feature = "grpc", feature = "xhttp"))]
+const REUSE_READY_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Bound on `h2.ready()` for a connection's first stream — mirrors
+/// `H2Layer`'s and h2mux's `OPEN_TIMEOUT`. Readiness resolves instantly
+/// once the peer's SETTINGS arrive; the bound only matters for a peer
+/// holding `max_concurrent_streams` at 0.
+#[cfg(any(feature = "grpc", feature = "xhttp"))]
+pub(crate) const OPEN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// New streams stop going to a connection this old (Xray's xmux rotates
+/// connections after 30-50 min); streams already on it run to completion.
+#[cfg(any(feature = "grpc", feature = "xhttp"))]
+const REUSE_MAX_AGE: Duration = Duration::from_secs(30 * 60);
+
+/// The h2 connection driver task, shared by a [`SharedH2`] and the streams
+/// opened on it, plus the connection liveness state those streams report.
+/// The conn owns the inner stream's fd: once every send/recv ref is gone
+/// the driver self-terminates, but only if its closing flush can make
+/// progress — so the last owner bounds that wait (issue #669).
+#[cfg(any(feature = "grpc", feature = "xhttp"))]
+pub(crate) struct ConnDriver {
+    handle: Option<tokio::task::JoinHandle<()>>,
+    /// Last peer activity seen on any stream of the connection — the only
+    /// trustworthy liveness signal. `send_request` merely queues bytes
+    /// into a possibly-black-holed socket, so submissions must not
+    /// refresh it: a NAT-drop corpse would otherwise keep accepting new
+    /// tunnels forever and never reach `alive`'s PING gate.
+    last_recv: std::sync::Mutex<Instant>,
+    /// A stream ended having seen no response bytes: the connection may
+    /// be a corpse whose queued writes reported success, so the next
+    /// `alive` check must PING instead of trusting recent submissions.
+    suspect: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(any(feature = "grpc", feature = "xhttp"))]
+impl ConnDriver {
+    fn is_finished(&self) -> bool {
+        self.handle
+            .as_ref()
+            .is_none_or(tokio::task::JoinHandle::is_finished)
+    }
+
+    /// Stamp confirmed liveness: the peer sent response headers or a DATA
+    /// frame. Called from the streams' recv paths (never from submits).
+    fn note_recv(&self) {
+        if let Ok(mut last) = self.last_recv.lock() {
+            *last = Instant::now();
+        }
+    }
+}
+
+#[cfg(any(feature = "grpc", feature = "xhttp"))]
+impl Drop for ConnDriver {
+    fn drop(&mut self) {
+        let Some(mut driver) = self.handle.take() else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            driver.abort();
+            return;
+        };
+        runtime.spawn(async move {
+            if tokio::time::timeout(DRIVER_DRAIN_TIMEOUT, &mut driver)
+                .await
+                .is_err()
+            {
+                driver.abort();
+                let _ = driver.await;
+            }
+        });
+    }
+}
+
+/// One client h2 connection that a multiplexing layer (gRPC, XHTTP) opens
+/// every tunnel of a proxy on, as mihomo/Xray clients do — instead of a new
+/// TCP + TLS/REALITY session per tunnel.
+#[cfg(any(feature = "grpc", feature = "xhttp"))]
+#[derive(Clone)]
+pub(crate) struct SharedH2 {
+    h2: h2::client::SendRequest<Bytes>,
+    driver: Arc<ConnDriver>,
+    /// Tunnels open on the connection ([`StreamLease`]s alive), checked
+    /// against the peer's `SETTINGS_MAX_CONCURRENT_STREAMS` so a full
+    /// connection is passed over at once rather than after a ready timeout.
+    open: Arc<std::sync::atomic::AtomicUsize>,
+    ping: Arc<tokio::sync::Mutex<Option<h2::PingPong>>>,
+    born: Instant,
+}
+
+/// A tunnel's hold on a [`SharedH2`] connection: keeps the driver alive
+/// and counts as one open stream until dropped.
+#[cfg(any(feature = "grpc", feature = "xhttp"))]
+pub(crate) struct StreamLease {
+    driver: Arc<ConnDriver>,
+    open: Arc<std::sync::atomic::AtomicUsize>,
+    /// This stream saw response headers or body. A lease dropped without
+    /// it marks the connection [`ConnDriver::suspect`] — an early stream
+    /// failure is how a silently-dead connection first shows itself.
+    received: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(any(feature = "grpc", feature = "xhttp"))]
+impl StreamLease {
+    /// Record peer activity seen by this stream (response headers or body
+    /// bytes): confirms the connection is alive and clears this stream's
+    /// early-failure signal.
+    pub(crate) fn note_recv(&self) {
+        self.received
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.driver.note_recv();
+    }
+}
+
+#[cfg(any(feature = "grpc", feature = "xhttp"))]
+impl Drop for StreamLease {
+    fn drop(&mut self) {
+        self.open.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        if !self.received.load(std::sync::atomic::Ordering::Relaxed) {
+            // Early stream failure: the stream ended before any response
+            // byte arrived, which is exactly how a corpse connection
+            // (queued writes reporting success) first surfaces. Marking
+            // the conn suspect makes the next `alive` PING verify it
+            // rather than blindly queueing another tunnel on it.
+            self.driver
+                .suspect
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+#[cfg(any(feature = "grpc", feature = "xhttp"))]
+impl SharedH2 {
+    /// Spawn the driver for a fresh connection.
+    pub(crate) fn spawn<T>(
+        h2: h2::client::SendRequest<Bytes>,
+        mut conn: h2::client::Connection<T, Bytes>,
+    ) -> Self
+    where
+        T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let ping = conn.ping_pong();
+        let driver = tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        Self {
+            h2,
+            driver: Arc::new(ConnDriver {
+                handle: Some(driver),
+                // The just-completed handshake (peer SETTINGS) already
+                // proved the connection live.
+                last_recv: std::sync::Mutex::new(Instant::now()),
+                suspect: std::sync::atomic::AtomicBool::new(false),
+            }),
+            open: Arc::default(),
+            ping: Arc::new(tokio::sync::Mutex::new(ping)),
+            born: Instant::now(),
+        }
+    }
+
+    /// The hold a stream opened on the connection keeps on it.
+    pub(crate) fn lease(&self) -> StreamLease {
+        self.open.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        StreamLease {
+            driver: Arc::clone(&self.driver),
+            open: Arc::clone(&self.open),
+            received: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Whether the peer's concurrent-stream limit leaves room for one more.
+    fn has_room(&self) -> bool {
+        self.open.load(std::sync::atomic::Ordering::Relaxed) < self.h2.current_max_send_streams()
+    }
+
+    /// Open a request stream. `wait` — a fresh connection's first stream —
+    /// bounds send readiness by [`OPEN_TIMEOUT`]; otherwise by
+    /// [`REUSE_READY_TIMEOUT`] so a saturated connection is replaced.
+    pub(crate) async fn send_request(
+        &self,
+        request: http::Request<()>,
+        wait: bool,
+        tag: fn(String) -> TransportError,
+    ) -> Result<(h2::client::ResponseFuture, h2::SendStream<Bytes>), TransportError> {
+        if !wait && !self.has_room() {
+            return Err(tag("connection full".into()));
+        }
+        let ready = self.h2.clone().ready();
+        let mut h2 = if wait {
+            tokio::time::timeout(OPEN_TIMEOUT, ready)
+                .await
+                .map_err(|_| tag("timed out waiting for send readiness".into()))?
+                .map_err(|e| h2_to_transport(e, tag))?
+        } else {
+            tokio::time::timeout(REUSE_READY_TIMEOUT, ready)
+                .await
+                .map_err(|_| tag("connection busy".into()))?
+                .map_err(|e| h2_to_transport(e, tag))?
+        };
+        h2.send_request(request, false)
+            .map_err(|e| h2_to_transport(e, tag))
+    }
+
+    /// False when the connection ended, is too old to take new streams, or
+    /// — silent on the receive side for a while — does not answer a PING
+    /// in time.
+    async fn alive(&self) -> bool {
+        if self.driver.is_finished() || self.born.elapsed() > REUSE_MAX_AGE {
+            return false;
+        }
+        // Liveness must be proven by the peer, not by submissions: a
+        // corpse connection still accepts `send_request`s, so only a
+        // receive-silent stretch — or a stream that dropped unanswered —
+        // earns the PING probe below.
+        let silent = self
+            .driver
+            .last_recv
+            .lock()
+            .map_or(Duration::ZERO, |last| last.elapsed());
+        let suspect = self
+            .driver
+            .suspect
+            .swap(false, std::sync::atomic::Ordering::Relaxed);
+        if silent < REUSE_IDLE_PING && !suspect {
+            return true;
+        }
+        let mut ping = self.ping.lock().await;
+        let Some(ping) = ping.as_mut() else {
+            return true;
+        };
+        match tokio::time::timeout(REUSE_READY_TIMEOUT, ping.ping(h2::Ping::opaque())).await {
+            Ok(Ok(_)) => {
+                // The pong is itself received bytes — restart the
+                // silence clock so the next check does not re-ping.
+                self.driver.note_recv();
+                true
+            }
+            // A timed-out ping leaves PingPong at PENDING_PONG, so later
+            // probes fail fast; `SharedH2Slot::live` then forgets this
+            // session outright, so `live` returns None rather than
+            // re-pinging a dead conn.
+            _ => false,
+        }
+    }
+}
+
+/// The shared connection and the generation it was stored under; `None`
+/// when empty or superseded by `clear`. One mutex covers both, so the
+/// bump in `clear` and the slot write are a single atomic step.
+#[cfg(any(feature = "grpc", feature = "xhttp"))]
+#[derive(Default)]
+struct SharedH2SlotState {
+    session: Option<(SharedH2, u64)>,
+    /// Bumped by `SharedH2Slot::clear` (`Transport::reset`, issue #695):
+    /// a dial that straddles a reset predates the flush, so `set`
+    /// discards it (`MuxClient`'s `generation` does the same).
+    generation: u64,
+}
+
+/// The connection a layer currently shares (the last one it opened),
+/// behind a generation counter and a single-flight dial gate.
+#[cfg(any(feature = "grpc", feature = "xhttp"))]
+#[derive(Default)]
+pub(crate) struct SharedH2Slot {
+    state: std::sync::Mutex<SharedH2SlotState>,
+    /// Serializes `connect_shared` slot misses so two concurrent misses
+    /// do not each dial and `set` last-writer-wins (orphaning a conn).
+    /// Held across the dial, so it must be a tokio Mutex; the plain
+    /// `connect` path never touches it.
+    pub(crate) dial: tokio::sync::Mutex<()>,
+}
+
+#[cfg(any(feature = "grpc", feature = "xhttp"))]
+impl SharedH2Slot {
+    /// The shared connection if it is still usable; a dead one is dropped.
+    pub(crate) async fn live(&self) -> Option<SharedH2> {
+        let session = {
+            let mut state = self.state.lock().ok()?;
+            let live = match &state.session {
+                // A stored generation older than the current one predates
+                // a `clear`: the connection is pre-flush and never offered.
+                Some((session, gen)) if *gen == state.generation => Some(session.clone()),
+                _ => None,
+            };
+            if live.is_none() {
+                state.session = None;
+            }
+            live?
+        };
+        if session.alive().await {
+            Some(session)
+        } else {
+            self.forget(&session);
+            None
+        }
+    }
+
+    /// The value a dial passes back to [`Self::set`] so a `clear` landing
+    /// mid-dial makes the store a no-op.
+    pub(crate) fn generation(&self) -> Option<u64> {
+        self.state.lock().ok().map(|state| state.generation)
+    }
+
+    /// Offer `session` for [`Self::live`]; discarded when `generation` has
+    /// moved on, i.e. `reset` ran during the dial — a straddling
+    /// connection predates the flush (issue #695) and is never stored.
+    pub(crate) fn set(&self, session: SharedH2, generation: u64) {
+        if let Ok(mut state) = self.state.lock() {
+            if generation == state.generation {
+                state.session = Some((session, generation));
+            }
+        }
+    }
+
+    /// Drop the shared connection (streams open on it keep it alive) and
+    /// invalidate any dial still in flight — its `set` sees the bumped
+    /// generation and discards.
+    pub(crate) fn clear(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.generation += 1;
+            state.session = None;
+        }
+    }
+
+    /// Drop the shared connection if it is still `stale`.
+    pub(crate) fn forget(&self, stale: &SharedH2) {
+        if let Ok(mut state) = self.state.lock() {
+            if state
+                .session
+                .as_ref()
+                .is_some_and(|(s, _)| Arc::ptr_eq(&s.driver, &stale.driver))
+            {
+                state.session = None;
+            }
+        }
+    }
+}
+
 /// Raw bidirectional bytes over one HTTP/2 request/response pair.
 pub struct H2Stream {
     send: h2::SendStream<Bytes>,
@@ -240,6 +598,10 @@ pub struct H2Stream {
     remote_no_error_is_eof: bool,
     eos_sent: bool,
     conn_driver: Option<tokio::task::JoinHandle<()>>,
+    /// Keep-alive on a [`SharedH2`] connection other streams may use too
+    /// (XHTTP stream-one; gRPC's `GunStream` holds its lease directly).
+    #[cfg(feature = "xhttp")]
+    shared_driver: Option<StreamLease>,
 }
 
 impl H2Stream {
@@ -252,7 +614,18 @@ impl H2Stream {
             remote_no_error_is_eof: false,
             eos_sent: false,
             conn_driver: None,
+            #[cfg(feature = "xhttp")]
+            shared_driver: None,
         }
+    }
+
+    /// Keep a shared connection alive while this stream lives; on drop the
+    /// response is drained (bounded) so its flow-control window returns to
+    /// the connection the other streams keep using.
+    #[cfg(feature = "xhttp")]
+    pub(crate) fn with_shared_driver(mut self, driver: StreamLease) -> Self {
+        self.shared_driver = Some(driver);
+        self
     }
 
     pub fn with_conn_driver(mut self, driver: tokio::task::JoinHandle<()>) -> Self {
@@ -287,6 +660,17 @@ impl H2Stream {
 impl Drop for H2Stream {
     fn drop(&mut self) {
         self.best_effort_eos();
+        #[cfg(feature = "xhttp")]
+        if let Some(shared) = self.shared_driver.take() {
+            let recv = self.recv.take();
+            if let (Some(recv), Ok(runtime)) = (recv, tokio::runtime::Handle::try_current()) {
+                runtime.spawn(async move {
+                    let _ = tokio::time::timeout(DRIVER_DRAIN_TIMEOUT, recv.drain()).await;
+                    drop(shared);
+                });
+            }
+            return;
+        }
         let Some(mut driver) = self.conn_driver.take() else {
             return;
         };
@@ -339,10 +723,22 @@ impl AsyncRead for H2Stream {
                 return Poll::Ready(Ok(()));
             }
             let recv = this.recv.as_mut().expect("receive state present");
+            #[cfg(feature = "xhttp")]
+            let awaiting_headers = recv.stream().is_none();
             match recv.poll_ready(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Ok(())) => {
+                    // Response headers just arrived — the shared conn
+                    // proved itself (stamping on every resolved poll would
+                    // mask a conn that went silent afterwards).
+                    #[cfg(feature = "xhttp")]
+                    if awaiting_headers {
+                        if let Some(lease) = &this.shared_driver {
+                            lease.note_recv();
+                        }
+                    }
+                }
             }
             let recv = recv.stream().expect("poll_ready resolved Ok");
             match recv.poll_data(cx) {
@@ -360,6 +756,10 @@ impl AsyncRead for H2Stream {
                 }
                 Poll::Ready(Some(Ok(bytes))) => {
                     let _ = recv.flow_control().release_capacity(bytes.len());
+                    #[cfg(feature = "xhttp")]
+                    if let Some(lease) = &this.shared_driver {
+                        lease.note_recv();
+                    }
                     this.read_buf = bytes;
                 }
             }
