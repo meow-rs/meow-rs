@@ -51,7 +51,7 @@ permissions:
 
 concurrency:
   group: cache-warmup-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   warmup-linux:
@@ -77,11 +77,12 @@ jobs:
           key: install-action-nextest-${{ runner.os }}-${{ runner.arch }}-v1
 
       - name: Install cargo-nextest
+        id: install-nextest
         if: steps.cache-nextest.outputs.cache-hit != 'true'
         uses: taiki-e/install-action@nextest
 
       - name: Save cargo-nextest cache
-        if: steps.cache-nextest.outputs.cache-hit != 'true'
+        if: steps.cache-nextest.outputs.cache-hit != 'true' && steps.install-nextest.outcome == 'success'
         uses: actions/cache/save@v4
         with:
           path: |
@@ -99,11 +100,12 @@ jobs:
           key: install-action-cargo-hack-${{ runner.os }}-${{ runner.arch }}-v1
 
       - name: Install cargo-hack
+        id: install-cargo-hack
         if: steps.cache-cargo-hack.outputs.cache-hit != 'true'
         uses: taiki-e/install-action@cargo-hack
 
       - name: Save cargo-hack cache
-        if: steps.cache-cargo-hack.outputs.cache-hit != 'true'
+        if: steps.cache-cargo-hack.outputs.cache-hit != 'true' && steps.install-cargo-hack.outcome == 'success'
         uses: actions/cache/save@v4
         with:
           path: |
@@ -121,11 +123,12 @@ jobs:
           key: install-action-cargo-llvm-cov-${{ runner.os }}-${{ runner.arch }}-v1
 
       - name: Install cargo-llvm-cov
+        id: install-cargo-llvm-cov
         if: steps.cache-cargo-llvm-cov.outputs.cache-hit != 'true'
         uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: Save cargo-llvm-cov cache
-        if: steps.cache-cargo-llvm-cov.outputs.cache-hit != 'true'
+        if: steps.cache-cargo-llvm-cov.outputs.cache-hit != 'true' && steps.install-cargo-llvm-cov.outcome == 'success'
         uses: actions/cache/save@v4
         with:
           path: |
@@ -143,6 +146,7 @@ jobs:
       # Same layout the consumer stages: a bare binary at
       # $RUNNER_TEMP/ci-peers/sing-box, not the extracted directory.
       - name: Install sing-box
+        id: install-sing-box
         if: steps.cache-sing-box.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
@@ -153,7 +157,7 @@ jobs:
           cp "/tmp/sing-box-${SINGBOX_VERSION}-linux-amd64/sing-box" "$RUNNER_TEMP/ci-peers/sing-box"
 
       - name: Save sing-box cache
-        if: steps.cache-sing-box.outputs.cache-hit != 'true'
+        if: steps.cache-sing-box.outputs.cache-hit != 'true' && steps.install-sing-box.outcome == 'success'
         uses: actions/cache/save@v4
         with:
           path: ${{ runner.temp }}/ci-peers/sing-box
@@ -167,6 +171,7 @@ jobs:
           key: gost-${{ env.GOST_VERSION }}-${{ runner.os }}-${{ runner.arch }}
 
       - name: Install gost
+        id: install-gost
         if: steps.cache-gost.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
@@ -177,7 +182,7 @@ jobs:
           cp /tmp/gost "$RUNNER_TEMP/ci-peers/gost"
 
       - name: Save gost cache
-        if: steps.cache-gost.outputs.cache-hit != 'true'
+        if: steps.cache-gost.outputs.cache-hit != 'true' && steps.install-gost.outcome == 'success'
         uses: actions/cache/save@v4
         with:
           path: ${{ runner.temp }}/ci-peers/gost
@@ -191,11 +196,12 @@ jobs:
           key: v2ray-plugin-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/fetch-v2ray-plugin.sh') }}
 
       - name: Fetch official v2ray-plugin (pinned, SHA256 verified)
+        id: install-v2ray-plugin
         if: steps.cache-v2ray-plugin.outputs.cache-hit != 'true'
         run: bash scripts/fetch-v2ray-plugin.sh "$RUNNER_TEMP/v2ray-plugin"
 
       - name: Save v2ray-plugin cache
-        if: steps.cache-v2ray-plugin.outputs.cache-hit != 'true'
+        if: steps.cache-v2ray-plugin.outputs.cache-hit != 'true' && steps.install-v2ray-plugin.outcome == 'success'
         uses: actions/cache/save@v4
         with:
           path: ${{ runner.temp }}/v2ray-plugin
@@ -209,11 +215,12 @@ jobs:
           key: trusttunnel-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/fetch-trusttunnel-endpoint.sh') }}
 
       - name: Fetch official TrustTunnel endpoint (pinned, SHA256 verified)
+        id: install-trusttunnel
         if: steps.cache-trusttunnel.outputs.cache-hit != 'true'
         run: bash scripts/fetch-trusttunnel-endpoint.sh "$RUNNER_TEMP/trusttunnel"
 
       - name: Save TrustTunnel endpoint cache
-        if: steps.cache-trusttunnel.outputs.cache-hit != 'true'
+        if: steps.cache-trusttunnel.outputs.cache-hit != 'true' && steps.install-trusttunnel.outcome == 'success'
         uses: actions/cache/save@v4
         with:
           path: ${{ runner.temp }}/trusttunnel
@@ -235,11 +242,12 @@ jobs:
           key: install-action-nextest-${{ runner.os }}-${{ runner.arch }}-v1
 
       - name: Install cargo-nextest
+        id: install-nextest
         if: steps.cache-nextest.outputs.cache-hit != 'true'
         uses: taiki-e/install-action@nextest
 
       - name: Save cargo-nextest cache
-        if: steps.cache-nextest.outputs.cache-hit != 'true'
+        if: steps.cache-nextest.outputs.cache-hit != 'true' && steps.install-nextest.outcome == 'success'
         uses: actions/cache/save@v4
         with:
           path: |
@@ -269,11 +277,12 @@ jobs:
           key: install-action-nextest-${{ runner.os }}-${{ runner.arch }}-v1
 
       - name: Install cargo-nextest
+        id: install-nextest
         if: steps.cache-nextest.outputs.cache-hit != 'true'
         uses: taiki-e/install-action@nextest
 
       - name: Save cargo-nextest cache
-        if: steps.cache-nextest.outputs.cache-hit != 'true'
+        if: steps.cache-nextest.outputs.cache-hit != 'true' && steps.install-nextest.outcome == 'success'
         uses: actions/cache/save@v4
         with:
           path: |
@@ -289,13 +298,14 @@ jobs:
           key: llvm-${{ env.LLVM_VERSION }}-${{ runner.os }}
 
       - name: Install LLVM
+        id: install-llvm
         if: steps.cache-llvm.outputs.cache-hit != 'true'
         uses: KyleMayes/install-llvm-action@v2
         with:
           version: ${{ env.LLVM_VERSION }}
 
       - name: Save LLVM cache
-        if: steps.cache-llvm.outputs.cache-hit != 'true'
+        if: steps.cache-llvm.outputs.cache-hit != 'true' && steps.install-llvm.outcome == 'success'
         uses: actions/cache/save@v4
         with:
           path: 'C:\Program Files\LLVM'
@@ -309,12 +319,13 @@ jobs:
           key: wintun-x86_64-pc-windows-msvc-${{ hashFiles('scripts/fetch-wintun.sh') }}
 
       - name: Fetch wintun.dll
+        id: install-wintun
         if: steps.cache-wintun.outputs.cache-hit != 'true'
         shell: bash
         run: bash scripts/fetch-wintun.sh --target x86_64-pc-windows-msvc --outdir "$RUNNER_TEMP/wintun"
 
       - name: Save wintun.dll cache
-        if: steps.cache-wintun.outputs.cache-hit != 'true'
+        if: steps.cache-wintun.outputs.cache-hit != 'true' && steps.install-wintun.outcome == 'success'
         uses: actions/cache/save@v4
         with:
           path: ${{ runner.temp }}/wintun
