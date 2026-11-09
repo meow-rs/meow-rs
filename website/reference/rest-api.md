@@ -105,7 +105,7 @@ hysteria2, found once a member reaches its server. TCP only.
 | `DELETE` | `/rules/{index}` | Delete the rule at an index → 204 |
 | `POST` | `/rules/reorder` | Move a rule — body `{ "from": i, "to": j }` → 204 |
 | `POST` | `/rules/append` | Append one rule line — body `{ "rule": "..." }` → 204; 400 naming the line when it fails to parse |
-| `PATCH` | `/rules/disable` | Toggle rules — body `{ "<index>": true|false }` (`null` body or `null` values allowed) → 204 |
+| `PATCH` | `/rules/disable` | Toggle rules — body `{ "<index>": true\|false }` (`null` body or `null` values allowed) → 204 |
 
 ## Storage (dashboard KV)
 
