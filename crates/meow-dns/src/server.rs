@@ -159,6 +159,14 @@ impl DnsServer {
         data: &[u8],
         resolver: &Resolver,
     ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+        Self::handle_query_charged(data, resolver, None).await
+    }
+
+    pub(crate) async fn handle_query_charged(
+        data: &[u8],
+        resolver: &Resolver,
+        charge: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
         // Minimal DNS parsing: extract the query name and type
         if data.len() < 12 {
             return Err("DNS packet too short".into());
@@ -250,7 +258,7 @@ impl DnsServer {
                     addr,
                     std::time::Duration::from_secs(u64::from(ttl)),
                 ) {
-                    crate::answer_hook::run_blocking(work).await;
+                    crate::answer_hook::run_blocking(work, charge.clone()).await;
                 }
             }
             return Ok(answer.response);
@@ -284,7 +292,7 @@ impl DnsServer {
                         addr,
                         std::time::Duration::from_secs(u64::from(DEFAULT_ANSWER_TTL_SECS)),
                     ) {
-                        crate::answer_hook::run_blocking(work).await;
+                        crate::answer_hook::run_blocking(work, charge.clone()).await;
                     }
                     Self::build_response(
                         id,
@@ -324,7 +332,7 @@ impl DnsServer {
         Ok(match lookup {
             AddressLookupResult::Answer(addr, ttl) => {
                 if let Some(work) = crate::answer_hook::pending(resolver, &domain, addr, ttl) {
-                    crate::answer_hook::run_blocking(work).await;
+                    crate::answer_hook::run_blocking(work, charge.clone()).await;
                 }
                 // Sub-second remainders round up to 1 — a 0-TTL answer means
                 // "never cache", which is stricter than the entry deserves.
@@ -1316,16 +1324,20 @@ impl BoundDnsServer {
             let resolver_slot = Arc::clone(&resolver);
             let sock: Weak<UdpSocket> = Arc::downgrade(&socket);
             tokio::spawn(async move {
-                let _permit = permit;
+                let charge = Arc::new(permit);
                 // Snapshot the current resolver generation per query —
                 // a `PUT /configs` DNS reload swaps the slot (issue #514).
                 // The read guard must drop before `.await`: it is !Send.
                 let resolver = Arc::clone(&resolver_slot.read());
                 // Panic guard: a panicked task would drop the query, so keep
                 // the panic scoped to this one request and log it loudly.
-                let outcome = AssertUnwindSafe(DnsServer::handle_query(&data, &resolver))
-                    .catch_unwind()
-                    .await;
+                let outcome = AssertUnwindSafe(DnsServer::handle_query_charged(
+                    &data,
+                    &resolver,
+                    Some(charge),
+                ))
+                .catch_unwind()
+                .await;
                 match outcome {
                     Ok(Ok(response)) => {
                         // Upgrade per reply; hold the strong ref only across
@@ -1441,8 +1453,13 @@ async fn serve_tcp_client(
                     ))
                 }
                 LocalAnswer::Upstream => {
-                    let _permit = budget.acquire().await.map_err(std::io::Error::other)?;
-                    DnsServer::handle_query(&query, &current)
+                    let charge = Arc::new(
+                        Arc::clone(&budget)
+                            .acquire_owned()
+                            .await
+                            .map_err(std::io::Error::other)?,
+                    );
+                    DnsServer::handle_query_charged(&query, &current, Some(charge))
                         .await
                         .map_err(|_| {
                             std::io::Error::new(std::io::ErrorKind::InvalidData, "DNS TCP query")
@@ -1452,8 +1469,12 @@ async fn serve_tcp_client(
             let length = u16::try_from(response.len()).map_err(|_| {
                 std::io::Error::new(std::io::ErrorKind::InvalidData, "DNS TCP response length")
             })?;
-            stream.write_u16(length).await?;
-            stream.write_all(&response).await?;
+            // One contiguous write avoids a tiny prefix segment waiting on
+            // delayed ACKs before Nagle allows the response body through.
+            let mut framed = Vec::with_capacity(response.len() + 2);
+            framed.extend_from_slice(&length.to_be_bytes());
+            framed.extend_from_slice(&response);
+            stream.write_all(&framed).await?;
             Ok(true)
         };
         match tokio::time::timeout(TCP_EXCHANGE_TIMEOUT, exchange).await {
