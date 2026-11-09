@@ -53,22 +53,70 @@ fn build_rule(
         RawDnsResponseAction::NoData => ResponseAction::NoData,
         RawDnsResponseAction::Refused => ResponseAction::Refused,
         RawDnsResponseAction::Forward => ResponseAction::Forward,
-        RawDnsResponseAction::FakeIp => ResponseAction::FakeIp,
-        RawDnsResponseAction::Address => ResponseAction::Address {
-            address: raw
+        RawDnsResponseAction::FakeIp => {
+            // Only A/AAAA queries ever get a fake IP — a `types` list
+            // with no address family makes the rule a silent no-op.
+            if !query_types.is_empty() && !query_types.iter().any(|t| matches!(*t, 1 | 28)) {
+                bail!(
+                    "fake-ip answers only A/AAAA queries; \
+                     the rule needs an address-family type or no types"
+                );
+            }
+            ResponseAction::FakeIp
+        }
+        RawDnsResponseAction::Address => {
+            let address = raw
                 .address
-                .context("address action requires an IP address")?,
-            ttl: raw.ttl.unwrap_or(60),
-        },
+                .context("address action requires an IP address")?;
+            // Same dead-rule shape: a static address emits only its own
+            // family, so a `types` list without it can never fire.
+            let (family, kind) = if address.is_ipv4() {
+                (1, "A")
+            } else {
+                (28, "AAAA")
+            };
+            if !query_types.is_empty() && !query_types.contains(&family) {
+                bail!(
+                    "address {address} answers only {kind} queries; \
+                     the rule needs that type or no types"
+                );
+            }
+            ResponseAction::Address {
+                address,
+                ttl: raw.ttl.unwrap_or(60),
+            }
+        }
     };
     let keys = expand_policy_keys(&raw.matcher);
     if keys.is_empty() {
         bail!("match must contain a domain condition");
     }
-    let matchers = keys
-        .iter()
-        .map(|key| build_matcher(key, geosite, providers))
-        .collect::<Result<Vec<_>>>()?;
+    let mut matchers: Vec<NameserverPolicyMatcher> = Vec::new();
+    // Prefixed keys (`geosite:`/`rule-set:`) get their own matchers; all
+    // of a rule's plain-domain keys share one DomainTrie — the
+    // nameserver-policy `domainTriePolicy` shape (see
+    // `dns_parser::build_policy`) — instead of one trie per key.
+    let mut domain_keys: Vec<&str> = Vec::new();
+    let mut match_all = false;
+    for key in &keys {
+        if let Some(matcher) = build_matcher(key, geosite, providers)? {
+            matchers.push(matcher);
+        } else if key == "*" {
+            match_all = true;
+        } else {
+            check_domain_key("dns.response-rules.match", key, true)?;
+            domain_keys.push(key);
+        }
+    }
+    if match_all {
+        matchers.push(Arc::new(|_| true));
+    } else if !domain_keys.is_empty() {
+        let mut trie = DomainTrie::new();
+        for key in domain_keys {
+            trie.insert_overwrite(key, ());
+        }
+        matchers.push(Arc::new(move |host| trie.search(host).is_some()));
+    }
     Ok(ResponseRule {
         matcher: Arc::new(move |host| matchers.iter().any(|matcher| matcher(host))),
         query_types,
@@ -76,11 +124,14 @@ fn build_rule(
     })
 }
 
+/// Compile a `geosite:`/`rule-set:` match key into a matcher of its own.
+/// Returns `None` for a plain-domain key — the caller folds all of a
+/// rule's domain keys into one shared `DomainTrie` arm.
 fn build_matcher(
     key: &str,
     geosite: Option<&Arc<GeositeDB>>,
     providers: &HashMap<String, Arc<RuleProvider>>,
-) -> Result<NameserverPolicyMatcher> {
+) -> Result<Option<NameserverPolicyMatcher>> {
     let lower = key.to_ascii_lowercase();
     if let Some(category) = lower.strip_prefix("geosite:") {
         if category.is_empty() {
@@ -88,7 +139,7 @@ fn build_matcher(
         }
         let db = Arc::clone(geosite.context("geosite condition requires a loaded database")?);
         let category = category.to_owned();
-        return Ok(Arc::new(move |host| db.lookup(&category, host)));
+        return Ok(Some(Arc::new(move |host| db.lookup(&category, host))));
     }
     if lower.starts_with("rule-set:") {
         let name = key["rule-set:".len()..].trim();
@@ -99,18 +150,12 @@ fn build_matcher(
             bail!("rule-set '{name}' must use domain or classical behavior");
         }
         let provider = Arc::clone(provider);
-        return Ok(Arc::new(move |host| provider.matches_domain(host)));
+        return Ok(Some(Arc::new(move |host| provider.matches_domain(host))));
     }
     if lower.contains(':') {
         bail!("unsupported match prefix: {key}");
     }
-    if key == "*" {
-        return Ok(Arc::new(|_| true));
-    }
-    check_domain_key("dns.response-rules.match", key, true)?;
-    let mut trie = DomainTrie::new();
-    trie.insert_overwrite(key, ());
-    Ok(Arc::new(move |host| trie.search(host).is_some()))
+    Ok(None)
 }
 
 #[cfg(test)]

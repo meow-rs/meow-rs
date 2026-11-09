@@ -3,7 +3,7 @@ use crate::response_policy::ResponseAction;
 use futures::FutureExt;
 use hickory_proto::op::{Edns, Message, MessageType, ResponseCode};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Weak};
 use tokio::net::UdpSocket;
@@ -87,6 +87,15 @@ impl LocalResponse {
             hook: None,
         }
     }
+}
+
+/// A synthesized response-rule answer: the wire response plus, when it
+/// carries an address record, the `(ip, ttl)` it emitted —
+/// `try_answer_local` hands that to the `dns.nftset` answer hook. Error
+/// replies report no emitted address.
+struct RuleAnswer {
+    response: Vec<u8>,
+    emitted: Option<(IpAddr, u32)>,
 }
 
 /// Simple DNS server that handles queries by forwarding to our resolver.
@@ -216,10 +225,11 @@ impl DnsServer {
             .await;
         }
 
-        if let Some(response) =
-            Self::try_response_rule(data, question_len, &domain, qtype, resolver)
+        if let Some(answer) = Self::try_response_rule(data, question_len, &domain, qtype, resolver)
         {
-            return Ok(response);
+            // The emitted `(ip, ttl)` has no hook carrier on this path —
+            // `try_answer_local` packages it for its callers.
+            return Ok(answer.response);
         }
 
         // Check hosts trie first. If the domain is present in the hosts table
@@ -376,10 +386,23 @@ impl DnsServer {
             return LocalAnswer::Upstream;
         }
 
-        if let Some(response) =
-            Self::try_response_rule(data, question_len, &domain, qtype, resolver)
+        if let Some(answer) = Self::try_response_rule(data, question_len, &domain, qtype, resolver)
         {
-            return LocalAnswer::Answer(LocalResponse::plain(response));
+            return LocalAnswer::Answer(LocalResponse {
+                response: answer.response,
+                // A static-address answer emits an IP the client will
+                // connect to — `dns.nftset` must see it exactly like a
+                // hosts answer. NODATA/REFUSED and error answers emit no
+                // address; `pending` drops fake-IP answers by design.
+                hook: answer.emitted.and_then(|(addr, ttl)| {
+                    crate::answer_hook::pending(
+                        resolver,
+                        &domain,
+                        addr,
+                        std::time::Duration::from_secs(u64::from(ttl)),
+                    )
+                }),
+            });
         }
 
         let outcome = {
@@ -518,8 +541,8 @@ impl DnsServer {
             Ok(req) => req,
             Err(response) => return Ok(response),
         };
-        if let Some(response) = Self::build_rule_response(&req, flags, domain, qtype, resolver) {
-            return Ok(response);
+        if let Some(answer) = Self::build_rule_response(&req, flags, domain, qtype, resolver) {
+            return Ok(answer.response);
         }
 
         // The name sent upstream is the wire-faithful `Name` hickory decoded
@@ -694,32 +717,53 @@ impl DnsServer {
         response
     }
 
+    /// Probe the response rules for an address query. The rule scan is
+    /// cheap — a hosts-trie lookup plus a linear rule scan — so a `forward`
+    /// verdict and no-match leave without touching the wire bytes;
+    /// [`Self::parse_request`]'s full decode only runs when a rule will
+    /// actually synthesize the reply.
     fn try_response_rule(
         data: &[u8],
         question_len: usize,
         domain: &str,
         qtype: u16,
         resolver: &Resolver,
-    ) -> Option<Vec<u8>> {
+    ) -> Option<RuleAnswer> {
         // Keep the ordinary hot path free of full-message decoding.
         if !resolver.has_response_rules() {
             return None;
         }
+        let action = resolver.response_action(domain, qtype)?;
+        if action == ResponseAction::Forward {
+            return None;
+        }
         let req = match Self::parse_request(data, question_len) {
+            // A matching rule over a malformed packet is still an error
+            // answer, never an upstream forward.
             Ok(req) => req,
-            Err(response) => return Some(response),
+            Err(response) => {
+                return Some(RuleAnswer {
+                    response,
+                    emitted: None,
+                })
+            }
         };
         let flags = u16::from_be_bytes([data[2], data[3]]);
         Self::build_rule_response(&req, flags, domain, qtype, resolver)
     }
 
+    /// Synthesize the rule's reply — the wire bytes plus, when the answer
+    /// section actually carries an address record, the `(ip, ttl)` it
+    /// emitted (for the `dns.nftset` answer hook; `answer_hook::pending`
+    /// drops fake-IP addresses by design). A family-mismatched `address`
+    /// action answers NODATA and reports nothing.
     fn build_rule_response(
         req: &Message,
         flags: u16,
         domain: &str,
         qtype: u16,
         resolver: &Resolver,
-    ) -> Option<Vec<u8>> {
+    ) -> Option<RuleAnswer> {
         let action = resolver.response_action(domain, qtype)?;
         let mut response = Self::response_message(req, ResponseCode::NoError);
         let address = match action {
@@ -741,19 +785,24 @@ impl DnsServer {
                 None
             }
         };
+        let mut emitted = None;
         if let Some((address, ttl)) = address {
             let rdata = match (address, qtype) {
-                (std::net::IpAddr::V4(ip), 1) => Some(RData::A(ip.into())),
-                (std::net::IpAddr::V6(ip), 28) => Some(RData::AAAA(ip.into())),
+                (IpAddr::V4(ip), 1) => Some(RData::A(ip.into())),
+                (IpAddr::V6(ip), 28) => Some(RData::AAAA(ip.into())),
                 _ => None,
             };
             if let Some(rdata) = rdata {
                 response.add_answer(Record::from_rdata(req.queries[0].name.clone(), ttl, rdata));
+                emitted = Some((address, ttl));
             }
         }
-        Some(response.to_vec().unwrap_or_else(|_| {
-            Self::build_header_error(req.metadata.id, flags, 2, req.edns.is_some())
-        }))
+        Some(RuleAnswer {
+            response: response.to_vec().unwrap_or_else(|_| {
+                Self::build_header_error(req.metadata.id, flags, 2, req.edns.is_some())
+            }),
+            emitted,
+        })
     }
 
     /// Minimal per-hop response OPT synthesized from the client's request

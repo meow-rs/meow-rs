@@ -276,6 +276,13 @@ async fn invalid_rules_fail_loading() {
         "{match: 'unknown:x', action: refused}",
         "{match: '*', action: refuesd}",
         "{match: '*', action: refused, typoes: [A]}",
+        // Dead rules: the types list admits no query family the action
+        // can ever answer, so the rule could never fire.
+        "{match: '*', types: [TXT], action: fake-ip}",
+        "{match: '*', types: [TXT, MX], action: fake-ip}",
+        "{match: '*', types: [AAAA], action: address, address: '192.0.2.7'}",
+        "{match: '*', types: [A], action: address, address: '2001:db8::7'}",
+        "{match: '*', types: [TXT], action: address, address: '192.0.2.7'}",
     ] {
         let options = format!("response-rules:\n  - {rule}");
         assert!(
@@ -285,6 +292,39 @@ async fn invalid_rules_fail_loading() {
             "{rule}"
         );
     }
+}
+
+#[tokio::test]
+async fn dead_type_filters_rejected_with_reason() {
+    for (rule, why) in [
+        (
+            "{match: '*', types: [TXT], action: fake-ip}",
+            "fake-ip answers only A/AAAA queries",
+        ),
+        (
+            "{match: '*', types: [AAAA], action: address, address: '192.0.2.7'}",
+            "answers only A queries",
+        ),
+        (
+            "{match: '*', types: [A, TXT], action: address, address: '2001:db8::7'}",
+            "answers only AAAA queries",
+        ),
+    ] {
+        let options = format!("response-rules:\n  - {rule}");
+        let err = configuration("127.0.0.1:9".parse().unwrap(), &options, "")
+            .await
+            .err()
+            .expect("dead rule must fail loading");
+        assert!(format!("{err:#}").contains(why), "{rule}: {err:#}");
+    }
+    // The same actions with an address-family type (or none) still load.
+    let ok = configuration(
+        "127.0.0.1:9".parse().unwrap(),
+        "enhanced-mode: fake-ip\nresponse-rules:\n  - {match: '*', types: [A], action: fake-ip}\n  - {match: '*', action: fake-ip}\n  - {match: '*', types: [A, TXT], action: address, address: '192.0.2.7'}\n  - {match: '*', types: [A, AAAA], action: address, address: '2001:db8::7'}",
+        "",
+    )
+    .await;
+    assert!(ok.is_ok(), "{:?}", ok.err());
 }
 
 #[tokio::test]
@@ -435,5 +475,77 @@ async fn forwarding_keeps_wire_name_and_stops_rule_scan() {
     assert_eq!(response.metadata.response_code, ResponseCode::NoError);
     assert_eq!(response.queries[0].name, request.queries[0].name);
     assert!(matches!(response.answers[0].data, RData::TXT(_)));
+    assert_eq!(upstream.hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn non_matching_and_forward_queries_skip_rule_decode() {
+    let upstream = Upstream::start().await;
+    let config = configuration(
+        upstream.address,
+        "response-rules:\n  - {match: 'blocked.test', action: refused}\n  - {match: 'forward.test', action: forward}",
+        "",
+    )
+    .await
+    .unwrap();
+    // A packet hickory would reject (duplicate OPT — parse_question still
+    // succeeds) for a domain no rule matches, and for a `forward` rule:
+    // neither may be decoded for the rule probe, so both resolve like any
+    // other A query instead of dying on the wire error.
+    for name in ["other.test", "forward.test"] {
+        let good = query(name, RecordType::A);
+        let mut malformed = good.clone();
+        malformed[10..12].copy_from_slice(&2u16.to_be_bytes());
+        malformed.extend_from_slice(&good[good.len() - 11..]);
+        // The probe doesn't even look at the wire bytes without a
+        // synthesizing rule — it escalates to the task path.
+        assert!(matches!(
+            DnsServer::try_answer_local(&malformed, &config.resolver),
+            LocalAnswer::Upstream
+        ));
+        let response = DnsServer::handle_query(&malformed, &config.resolver)
+            .await
+            .unwrap();
+        assert_eq!(
+            Message::from_vec(&response).unwrap().metadata.response_code,
+            ResponseCode::NoError,
+            "{name}: no rule decodes the packet — it resolves upstream"
+        );
+    }
+    assert_eq!(upstream.hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn plain_domain_keys_share_one_domain_arm() {
+    let upstream = Upstream::start().await;
+    let config = configuration(
+        upstream.address,
+        "response-rules:\n  - {match: 'one.test,two.test,+.sub.test', action: refused}\n  - {match: 'anything.test,*', types: [TXT], action: refused}",
+        "",
+    )
+    .await
+    .unwrap();
+    // Every plain-domain key of a rule matches from the shared arm —
+    // bare, wildcard and `+.` (apex plus subdomains) forms alike.
+    for name in ["one.test", "two.test", "sub.test", "deep.sub.test"] {
+        let response = answer(&config.resolver, name, RecordType::A).await;
+        assert_eq!(
+            response.metadata.response_code,
+            ResponseCode::Refused,
+            "{name}"
+        );
+    }
+    // A `*` key in a mixed list still catches every name.
+    for name in ["anything.test", "else.where"] {
+        let response = answer(&config.resolver, name, RecordType::TXT).await;
+        assert_eq!(
+            response.metadata.response_code,
+            ResponseCode::Refused,
+            "{name}"
+        );
+    }
+    // An unmatched query type still falls through to upstream.
+    let response = answer(&config.resolver, "else.where", RecordType::A).await;
+    assert_eq!(response.metadata.response_code, ResponseCode::NoError);
     assert_eq!(upstream.hits.load(Ordering::SeqCst), 1);
 }

@@ -215,6 +215,73 @@ mod tests {
             .all(|(d, _, _)| d != "faked.example"));
     }
 
+    /// `try_answer_local` must package the hook for a static-address
+    /// response-rule answer — `dns.nftset` sees it like a hosts answer —
+    /// while NODATA/REFUSED answers emit no address and carry no hook.
+    #[test]
+    fn response_rule_answers_carry_the_hook_only_with_an_address() {
+        use crate::response_policy::{ResponseAction, ResponseRule};
+        use crate::server::{DnsServer, LocalAnswer, LocalResponse};
+
+        let (_l, _g) = locked();
+        let log = install_recorder();
+
+        fn rule_resolver(action: ResponseAction) -> Resolver {
+            let mut resolver = empty_resolver();
+            resolver
+                .set_response_rules(vec![ResponseRule {
+                    matcher: Arc::new(|_| true),
+                    query_types: Vec::new(),
+                    action,
+                }])
+                .unwrap();
+            resolver
+        }
+
+        // Minimal wire A query for static.example.
+        fn a_query() -> Vec<u8> {
+            let mut q = vec![
+                0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            ];
+            for label in "static.example".split('.') {
+                q.push(u8::try_from(label.len()).unwrap());
+                q.extend_from_slice(label.as_bytes());
+            }
+            q.push(0);
+            q.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // A + IN
+            q
+        }
+
+        fn answered(resolver: &Resolver) -> LocalResponse {
+            match DnsServer::try_answer_local(&a_query(), resolver) {
+                LocalAnswer::Answer(local) => local,
+                other => panic!("expected a local answer, got {other:?}"),
+            }
+        }
+
+        let address: IpAddr = "192.0.2.7".parse().unwrap();
+        let resolver = rule_resolver(ResponseAction::Address { address, ttl: 42 });
+        let work = answered(&resolver)
+            .hook
+            .expect("a static-address answer must package the hook");
+        work.run();
+        assert!(log
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|(d, i, t)| d == "static.example"
+                && *i == address
+                && *t == Duration::from_secs(42)));
+
+        for action in [ResponseAction::NoData, ResponseAction::Refused] {
+            let resolver = rule_resolver(action);
+            assert!(
+                answered(&resolver).hook.is_none(),
+                "{action:?} emits no address — no hook"
+            );
+        }
+    }
+
     #[test]
     fn run_survives_a_panicking_hook() {
         let (_l, _g) = locked();
