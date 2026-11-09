@@ -1978,10 +1978,19 @@ mod tests {
             result.is_err(),
             "occupied TCP port must fail the whole DNS bind"
         );
-        assert!(
-            UdpSocket::bind(addr).await.is_ok(),
-            "failed bind leaked UDP port"
-        );
+        // Windows defers closesocket of a reactor-registered socket to the
+        // next poll drain — the rollback drop is issued but the port may not
+        // be free until the runtime ticks. Retry briefly instead of racing
+        // the drain; a genuine leak never frees within this bound.
+        let mut freed = false;
+        for _ in 0..100 {
+            if UdpSocket::bind(addr).await.is_ok() {
+                freed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(freed, "failed bind leaked UDP port");
     }
 
     async fn tcp_frame(stream: &mut TcpStream, query: &[u8]) {
