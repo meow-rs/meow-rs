@@ -439,7 +439,7 @@ fn decode_proxy_name(encoded: &str) -> Result<String, NameServerParseError> {
     }
     String::from_utf8(bytes)
         .ok()
-        .filter(|name| !name.is_empty() && !name.chars().any(char::is_control))
+        .filter(|name| !name.trim().is_empty() && !name.chars().any(char::is_control))
         .ok_or_else(invalid)
 }
 
@@ -1915,7 +1915,9 @@ mod proxy_encoding_tests {
                 ("%E9%A6%99%E6%B8%AF", "香港"),
                 ("a%26b%23c%3Fd%3De", "a&b#c?d=e"),
                 ("a+b", "a+b"),
+                ("%41", "A"),
                 ("literal%2520", "literal%20"),
+                ("literal%2525", "literal%25"),
             ] {
                 let path = if scheme == "https" { "/dns-query" } else { "" };
                 let entry = NameServerEntry::parse(&format!(
@@ -1947,7 +1949,9 @@ mod proxy_encoding_tests {
 
     #[test]
     fn encrypted_proxy_parameter_rejects_bad_escapes_and_controls() {
-        for value in ["%", "%0", "%xx", "%FF", "%C0%AF", "%00", "%0A", "%7f"] {
+        for value in [
+            "%", "%0", "%xx", "%FF", "%C0%AF", "%00", "%0A", "%7f", "%7F", "%20",
+        ] {
             assert!(
                 NameServerEntry::parse(&format!(
                     "https://192.0.2.1/dns-query?proxy={value}#dns.example"
