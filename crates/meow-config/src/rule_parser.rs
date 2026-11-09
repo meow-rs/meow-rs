@@ -92,6 +92,12 @@ pub fn parse_rules_full(
 ///     `+`, `?`, space) is dead; the empty needle is flagged apart as a
 ///     match-all, not dead;
 ///   DOMAIN-REGEX — not checked (arbitrary pattern).
+/// The *empty* payload gets its own reason on each type: for
+/// DOMAIN-KEYWORD it is a total match-all (`contains("")` is always
+/// true), for DOMAIN/DOMAIN-SUFFIX it still silently matches every
+/// host-less flow (`rule_host()` is `""` on IP-literal destinations);
+/// DOMAIN-WILDCARD's matcher early-returns on an empty host, so its
+/// empty payload is genuinely dead.
 /// AND/OR/NOT legs carry their own payloads through the same parser, so
 /// the walk recurses into logic groups and reports the first defective
 /// leg against the outer line (issue #869).
@@ -115,13 +121,26 @@ pub(crate) fn domain_payload_defect(rule: &dyn Rule) -> Option<&'static str> {
         }
     }
     let rule_type = rule.rule_type();
-    if rule_type == RuleType::DomainKeyword
-        && meow_rules::domain_keyword_payload_matches_all(rule.payload())
-    {
-        return Some(
-            "an empty DOMAIN-KEYWORD payload — `contains(\"\")` is always true, so the rule \
-             silently matches every flow; use 'MATCH' to catch all",
-        );
+    if rule.payload().is_empty() {
+        match rule_type {
+            RuleType::Domain | RuleType::DomainSuffix => {
+                return Some(
+                    "an empty payload — `rule_host()` is empty on host-less flows, so the rule \
+                     silently matches every IP-literal destination; use 'IP-CIDR' or 'MATCH' \
+                     to catch those",
+                );
+            }
+            RuleType::DomainKeyword => {
+                return Some(
+                    "an empty DOMAIN-KEYWORD payload — `contains(\"\")` is always true, so the \
+                     rule silently matches every flow; use 'MATCH' to catch all",
+                );
+            }
+            // DOMAIN-WILDCARD's matcher early-returns on an empty host,
+            // so its empty payload falls through to the dead check below;
+            // other types carry no domain payload at all.
+            _ => {}
+        }
     }
     let dead = match rule_type {
         RuleType::Domain | RuleType::DomainSuffix => {
@@ -282,6 +301,11 @@ mod tests {
             "DOMAIN,a.*.b,REJECT",
             "DOMAIN-SUFFIX,.x.com,REJECT",
             "DOMAIN,.x.com,REJECT",
+            // And any other byte the `is_valid_host` alphabet can never
+            // produce — `?`, `@`, space, non-ASCII (issue #869).
+            "DOMAIN,a?b,REJECT",
+            "DOMAIN-SUFFIX,a@b,REJECT",
+            "DOMAIN,bücher.example,REJECT",
             // DOMAIN-WILDCARD: dead literal labels (`*` segments are
             // globs and never count), and any `+` — the matcher globs
             // `*` only, so `+.` is a literal byte run, not a wildcard.
@@ -313,6 +337,32 @@ mod tests {
             assert!(
                 err.to_string().contains("dead domain payload"),
                 "{line}: unexpected error {err}"
+            );
+        }
+    }
+
+    /// An empty `DOMAIN`/`DOMAIN-SUFFIX` payload is not dead either:
+    /// `rule_host()` is `""` on host-less flows and `"" == ""`, so the
+    /// rule silently matches every IP-literal destination — a host-less
+    /// match-all, reported with its own reason rather than the dead-key
+    /// message (issue #869).
+    #[test]
+    fn empty_domain_rule_payload_warns_host_less_match_lenient_errors_strict() {
+        use crate::test_support::WarnCapture;
+        let ctx = ParserContext::default();
+        for line in ["DOMAIN,,REJECT", "DOMAIN-SUFFIX,,REJECT"] {
+            let raw = vec![line.to_string()];
+            let cap = WarnCapture::start();
+            let rules = parse_rules(&raw, &ctx, false).expect("lenient mode keeps the rule");
+            let warns = cap.take();
+            assert_eq!(rules.len(), 1, "{line}: lenient mode must keep the rule");
+            assert!(
+                warns.contains("IP-literal") && warns.contains(line),
+                "{line}: the host-less match-all must be surfaced, got: {warns}"
+            );
+            assert!(
+                parse_rules(&raw, &ctx, true).is_err(),
+                "{line}: strict mode must reject the empty payload"
             );
         }
     }
@@ -356,8 +406,10 @@ mod tests {
             "AND,((DOMAIN,x.com.,DIRECT),(DST-PORT,9090)),REJECT",
             "OR,((DOMAIN-KEYWORD,x+y,DIRECT),(DST-PORT,443)),REJECT",
             "NOT,((DOMAIN,a..b,DIRECT)),REJECT",
-            // A defective leg two levels deep still surfaces.
+            // A defective leg two levels deep — and not in first place —
+            // still surfaces.
             "AND,((OR,((DOMAIN,.x.com,DIRECT),(NETWORK,tcp))),(DST-PORT,80)),REJECT",
+            "AND,((DST-PORT,9090),(DOMAIN-KEYWORD,a/b,DIRECT)),REJECT",
         ] {
             let raw = vec![line.to_string()];
             let cap = WarnCapture::start();

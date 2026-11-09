@@ -89,6 +89,18 @@ pub fn domain_key_is_dead(key: &str) -> bool {
     domain_key_defect(key).is_some()
 }
 
+/// The bytes a normalized `rule_host()` can carry: DNS-label bytes
+/// (`[0-9a-zA-Z._-]` plus the `.` separators) and IP-literal bytes (`:`
+/// and `[`/`]` for IPv6). Every producer of `Metadata::host`/`sniff_host`
+/// passes `is_valid_host`, so a payload byte outside this alphabet can
+/// never appear in what the rule compares against.
+fn byte_outside_rule_host_alphabet(b: u8) -> bool {
+    !matches!(
+        b,
+        b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z' | b'.' | b'-' | b'_' | b':' | b'[' | b']'
+    )
+}
+
 /// True when a `DOMAIN`/`DOMAIN-SUFFIX` `rules:` payload can never equal
 /// the normalized [`Metadata::rule_host`] it is compared against:
 ///
@@ -98,13 +110,24 @@ pub fn domain_key_is_dead(key: &str) -> bool {
 ///   `DomainSuffixRule` matches `host == suffix` or `.{suffix}` at a
 ///   label boundary, so `.x.com` would need a host starting with `.`
 ///   (or containing `..x.com`) — impossible on a normalized host;
-/// - a `*` or `+` anywhere — `DomainRule`/`DomainSuffixRule` compare the
-///   payload verbatim, and no normalized host contains either byte, so
-///   wildcard spellings (`DOMAIN,*.x.com`, `DOMAIN-SUFFIX,+.x.com`) are
-///   dead on these rule types (`*` belongs on `DOMAIN-WILDCARD`; a
-///   `DOMAIN-SUFFIX,x.com` payload already covers apex plus subdomains,
-///   so `+.` adds nothing); or
+/// - any byte outside the rule-host alphabet — `DomainRule`/
+///   `DomainSuffixRule` compare the payload verbatim, and no normalized
+///   host carries `*`, `+`, `?`, a space, or non-ASCII bytes, so
+///   wildcard spellings (`DOMAIN,*.x.com`, `DOMAIN-SUFFIX,+.x.com`) and
+///   impossible-byte payloads (`DOMAIN,a?b`) are dead on these rule
+///   types (`*` belongs on `DOMAIN-WILDCARD`; a `DOMAIN-SUFFIX,x.com`
+///   payload already covers apex plus subdomains, so `+.` adds
+///   nothing); or
 /// - any [`domain_key_defect`] shape (`a..b`, `"."`, `"+."`).
+///
+/// Caveat on the empty payload: it is dead only in the
+/// never-equals-a-*named*-host sense — `rule_host()` is `""` on
+/// host-less flows, so `DOMAIN,,X` and `DOMAIN-SUFFIX,,X` still match
+/// every IP-literal destination (a silent host-less match-all, issue
+/// #869). `domain_payload_defect` in meow-config reports that case with
+/// its own catch-all-shaped warning; this predicate keeps `is_empty` in
+/// the dead set because the trie/index consumers genuinely cannot key
+/// it either.
 ///
 /// [`Metadata::rule_host`]: meow_common::Metadata::rule_host
 pub fn domain_rule_payload_is_dead(payload: &str) -> bool {
@@ -112,7 +135,7 @@ pub fn domain_rule_payload_is_dead(payload: &str) -> bool {
     payload.is_empty()
         || payload.ends_with('.')
         || payload.starts_with('.')
-        || payload.contains(['*', '+'])
+        || payload.bytes().any(byte_outside_rule_host_alphabet)
         || domain_key_is_dead(payload)
 }
 
@@ -166,13 +189,7 @@ pub fn domain_wildcard_payload_is_dead(payload: &str) -> bool {
 ///
 /// [`Metadata::rule_host`]: meow_common::Metadata::rule_host
 pub fn domain_keyword_payload_is_dead(payload: &str) -> bool {
-    payload.contains("..")
-        || payload.bytes().any(|b| {
-            !matches!(
-                b,
-                b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z' | b'.' | b'-' | b'_' | b':' | b'[' | b']'
-            )
-        })
+    payload.contains("..") || payload.bytes().any(byte_outside_rule_host_alphabet)
 }
 
 /// True when a `DOMAIN-KEYWORD` `rules:` payload is empty: the needle is

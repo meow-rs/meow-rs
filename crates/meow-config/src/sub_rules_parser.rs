@@ -268,15 +268,22 @@ mod tests {
     /// #869): lenient keeps the block and warns, strict fails the load.
     #[test]
     fn domain_payload_defects_inside_block_warn_lenient_error_strict() {
+        use crate::test_support::WarnCapture;
         let providers = HashMap::new();
         for (line, needle) in [
             ("DOMAIN,x.com.,DIRECT", "dead domain payload"),
             ("DOMAIN-KEYWORD,,DIRECT", "matches every flow"),
         ] {
             let raw_map = raw(&[("a", &[line])]);
+            let cap = WarnCapture::start();
             let block = parse_sub_rules(&raw_map, &providers, &ParserContext::default(), false)
                 .expect("lenient mode keeps the defective payload");
+            let warns = cap.take();
             assert_eq!(block["a"].len(), 1, "{line}");
+            assert!(
+                warns.contains(needle) && warns.contains("sub-rules 'a'"),
+                "{line}: the lenient warning must name the defect and block, got: {warns}"
+            );
             let err = parse_sub_rules(&raw_map, &providers, &ParserContext::default(), true)
                 .err()
                 .unwrap_or_else(|| panic!("strict mode must reject {line:?}"));

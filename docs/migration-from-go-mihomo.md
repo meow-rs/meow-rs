@@ -576,10 +576,11 @@ strict load would refuse, so you can fix the list first.
 
 The same dead-key concept reaches the `rules:` list per rule type, judged
 against the normalized host rules compare with: `DOMAIN`/`DOMAIN-SUFFIX`
-flag an empty label, a leading or trailing dot, or a verbatim-dead `*`/`+`
-spelling (`DOMAIN,*.x.com` can never equal a host — `*` belongs on
-`DOMAIN-WILDCARD`, and `DOMAIN-SUFFIX,x.com` already covers apex plus
-subdomains, so `+.` adds nothing);
+flag an empty label, a leading or trailing dot, or any byte the hostname
+gate can never produce — `*`, `+`, `?`, a space, non-ASCII (`DOMAIN,*.x.com`
+can never equal a host — `*` belongs on `DOMAIN-WILDCARD`, and
+`DOMAIN-SUFFIX,x.com` already covers apex plus subdomains, so `+.` adds
+nothing);
 `DOMAIN-WILDCARD` flags a literal `+` — its matcher globs `*` only, so
 `+.x.com` is dead there too — plus dead literal labels; `DOMAIN-KEYWORD`
 flags `..` and any byte no normalized host can carry (`*`, `+`, `?`, a
@@ -595,7 +596,10 @@ block name or the outer rule line), and an *empty*
 `DOMAIN-KEYWORD` needle is flagged separately — `contains("")` is
 always true, so `DOMAIN-KEYWORD,,X` silently matches every flow rather
 than dying (a comma slip for `MATCH,X`), which mihomo also accepts as a
-match-all.
+match-all. The same treatment applies to an empty `DOMAIN`/
+`DOMAIN-SUFFIX` payload: `rule_host()` is `""` on host-less flows, so
+`DOMAIN,,X` still matches every IP-literal destination — a host-less
+match-all, warned as such rather than mislabeled "dead".
 
 ---
 
