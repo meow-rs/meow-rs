@@ -139,6 +139,13 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **A live fake-IP allocation wins routing over a conflicting sniffed
+  name.** When the fake-IP pool maps the flow's destination to a domain
+  (#908), a sniffed SNI/Host that differs no longer selects another
+  domain's routing rule — the mapped name routes and dials the flow.
+  The same conflict is cleared when the allocation is stale and the
+  listener-supplied `host` survives; an equal sniffed name (modulo its
+  FQDN trailing-dot spelling) is kept for the API's `sniffHost` field.
 - **The tproxy/redir listener drops unsafe original destinations.** A
   REDIRECT'd or TPROXY'd TCP flow whose recovered destination is port 0,
   unspecified, loopback, multicast or broadcast is refused before routing,
