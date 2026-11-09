@@ -624,7 +624,8 @@ async fn resolve_via_hook(
 
 /// Dial an outbound TCP stream to `host:port`. The hostname is resolved
 /// through `resolve_addrs` (installed `HostResolver` → cache → system
-/// resolver), then each candidate is dialed via [`connect_tcp`] so the
+/// resolver). Address families race after a 250 ms fallback delay, retaining
+/// resolver order within each family. Each candidate uses [`connect_tcp`] so the
 /// `SocketProtector` (Android) still applies. If every candidate fails to
 /// connect, any cached system-resolver entry is evicted so the next dial
 /// re-resolves instead of reusing a dead address.
@@ -640,13 +641,64 @@ pub async fn connect_tcp_host(host: &str, port: u16) -> io::Result<TcpStream> {
     result
 }
 
-// Behavior-preserving seam for deterministic candidate scheduling regressions.
-async fn connect_resolved_candidates<T, F, Fut>(
-    addrs: Vec<SocketAddr>,
-    mut dial: F,
-) -> io::Result<T>
+// Race address families, not protocol handshakes. Each family retains resolver
+// order and has at most one physical connect pending. No spawned task can
+// outlive the caller; returning a winner drops the other family's future.
+async fn connect_resolved_candidates<T, F, Fut>(addrs: Vec<SocketAddr>, dial: F) -> io::Result<T>
 where
-    F: FnMut(SocketAddr) -> Fut,
+    F: Fn(SocketAddr) -> Fut + Sync,
+    Fut: std::future::Future<Output = io::Result<T>>,
+{
+    let first_v6 = addrs.first().is_some_and(SocketAddr::is_ipv6);
+    let (preferred, fallback): (Vec<_>, Vec<_>) = addrs
+        .into_iter()
+        .partition(|addr| addr.is_ipv6() == first_v6);
+    if fallback.is_empty() {
+        return connect_address_family(preferred, &dial).await;
+    }
+    let first = connect_address_family(preferred, &dial);
+    tokio::pin!(first);
+    // A failed preferred family starts fallback immediately. Otherwise allow
+    // it 250 ms before racing the other family under the caller's deadline.
+    tokio::select! {
+        biased;
+        result = &mut first => {
+            return match result {
+                Ok(stream) => Ok(stream),
+                Err(error) => connect_address_family(fallback, &dial)
+                    .await
+                    .map_err(|other| {
+                        crate::MeowError::prefer_errno_io(Some(error), other)
+                            .expect("prefer_errno_io yields Some for a Some prev")
+                    }),
+            };
+        }
+        () = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
+    }
+    let second = connect_address_family(fallback, &dial);
+    tokio::pin!(second);
+    tokio::select! {
+        biased;
+        result = &mut first => match result {
+            Ok(stream) => Ok(stream),
+            Err(error) => second.await.map_err(|other| {
+                crate::MeowError::prefer_errno_io(Some(error), other)
+                    .expect("prefer_errno_io yields Some for a Some prev")
+            }),
+        },
+        result = &mut second => match result {
+            Ok(stream) => Ok(stream),
+            Err(error) => first.await.map_err(|other| {
+                crate::MeowError::prefer_errno_io(Some(error), other)
+                    .expect("prefer_errno_io yields Some for a Some prev")
+            }),
+        },
+    }
+}
+
+async fn connect_address_family<T, F, Fut>(addrs: Vec<SocketAddr>, dial: &F) -> io::Result<T>
+where
+    F: Fn(SocketAddr) -> Fut + Sync,
     Fut: std::future::Future<Output = io::Result<T>>,
 {
     let mut last_err = None;
@@ -1431,5 +1483,150 @@ mod candidate_progress_regression {
             result.is_ok(),
             "reachable IPv4 candidate must be tried before the dial deadline"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fast_preferred_family_does_not_start_fallback() {
+        let calls = std::sync::Mutex::new(Vec::new());
+        let addrs = vec![
+            "[::1]:443".parse().unwrap(),
+            "127.0.0.1:443".parse().unwrap(),
+        ];
+        let winner = connect_resolved_candidates(addrs, |addr| {
+            calls.lock().unwrap().push(addr);
+            async move { Ok(addr) }
+        })
+        .await
+        .unwrap();
+        assert!(winner.is_ipv6());
+        assert_eq!(calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_family_advances_immediately_in_resolver_order() {
+        let calls = std::sync::Mutex::new(Vec::new());
+        let addrs: Vec<SocketAddr> = ["[::1]:443", "127.0.0.1:443", "[::2]:443"]
+            .into_iter()
+            .map(|s| s.parse().unwrap())
+            .collect();
+        let start = tokio::time::Instant::now();
+        connect_resolved_candidates(addrs.clone(), |addr| {
+            calls.lock().unwrap().push(addr);
+            async move {
+                if addr.is_ipv6() {
+                    Err(io::ErrorKind::ConnectionRefused.into())
+                } else {
+                    Ok(addr)
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(*calls.lock().unwrap(), vec![addrs[0], addrs[2], addrs[1]]);
+        assert_eq!(start.elapsed(), std::time::Duration::ZERO);
+    }
+
+    struct PendingGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+    impl Drop for PendingGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn winner_drops_stalled_loser_in_both_family_orders() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        for first_v6 in [true, false] {
+            let active = Arc::new(AtomicUsize::new(0));
+            let mut addrs: Vec<SocketAddr> = ["[::1]:443", "127.0.0.1:443"]
+                .into_iter()
+                .map(|s| s.parse().unwrap())
+                .collect();
+            if !first_v6 {
+                addrs.reverse();
+            }
+            let start = tokio::time::Instant::now();
+            let winner = connect_resolved_candidates(addrs, |addr| {
+                let active = Arc::clone(&active);
+                async move {
+                    let count = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    assert!(count <= 2);
+                    let _guard = PendingGuard(active);
+                    if addr.is_ipv6() == first_v6 {
+                        std::future::pending::<()>().await;
+                    }
+                    Ok(addr)
+                }
+            })
+            .await
+            .unwrap();
+            assert_ne!(winner.is_ipv6(), first_v6);
+            assert_eq!(start.elapsed(), std::time::Duration::from_millis(250));
+            assert_eq!(active.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn caller_deadline_cancels_both_candidates_without_resetting_budget() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let active = Arc::new(AtomicUsize::new(0));
+        let started = AtomicUsize::new(0);
+        let start = tokio::time::Instant::now();
+        let result = crate::dial::with_dial_timeout("test", async {
+            tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+            let addrs = vec![
+                "[::1]:443".parse().unwrap(),
+                "127.0.0.1:443".parse().unwrap(),
+            ];
+            connect_resolved_candidates(addrs, |_| {
+                let active = Arc::clone(&active);
+                let started = &started;
+                async move {
+                    assert_eq!(
+                        crate::dial::dial_deadline(),
+                        Some(start + crate::dial::DIAL_TIMEOUT)
+                    );
+                    started.fetch_add(1, Ordering::SeqCst);
+                    active.fetch_add(1, Ordering::SeqCst);
+                    let _guard = PendingGuard(active);
+                    std::future::pending::<io::Result<()>>().await
+                }
+            })
+            .await
+            .map_err(crate::MeowError::Io)
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(start.elapsed(), crate::dial::DIAL_TIMEOUT);
+        assert_eq!(started.load(Ordering::SeqCst), 2);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn all_failures_preserve_errno_and_empty_input_error() {
+        let addrs = vec![
+            "[::1]:443".parse().unwrap(),
+            "127.0.0.1:443".parse().unwrap(),
+        ];
+        let error = connect_resolved_candidates(addrs, |addr| async move {
+            if addr.is_ipv6() {
+                Err::<(), _>(io::Error::from_raw_os_error(24))
+            } else {
+                Err(io::Error::other("synthetic failure"))
+            }
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(24));
+        let error = connect_resolved_candidates(Vec::new(), |_| async { Ok(()) })
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 }
