@@ -18,9 +18,14 @@
 //! consumer — the warn/error surfaces a defect instead of changing what
 //! the entry matches.
 //!
-//! Coverage on the `rules:` surface, per rule type: `DOMAIN` and
-//! `DOMAIN-SUFFIX` get [`domain_rule_payload_is_dead`] (dead label,
-//! leading/trailing dot, a verbatim-dead `*`/`+` spelling);
+//! Coverage on the `rules:` surface, per rule type: `DOMAIN` gets
+//! [`domain_exact_payload_is_dead`] (the `is_valid_host` oracle — any
+//! payload the host gate refuses can never equal a producible
+//! `rule_host()`, including all-numeric non-IP `inet_aton` spellings);
+//! `DOMAIN-SUFFIX` gets [`domain_rule_payload_is_dead`] (dead label,
+//! leading/trailing dot, a verbatim-dead `*`/`+` spelling — an
+//! all-numeric payload stays live, it can end a legal mixed host like
+//! `x.2130706433`);
 //! `DOMAIN-WILDCARD` gets [`domain_wildcard_payload_is_dead`] (a
 //! literal `+` — the matcher globs `*` only — or a dead literal
 //! label); `DOMAIN-KEYWORD` gets [`domain_keyword_payload_is_dead`]
@@ -151,8 +156,9 @@ pub fn domain_rule_payload_is_dead(payload: &str) -> bool {
 ///
 /// - a hostname-shaped payload that is all-numeric and not an IP literal
 ///   (`2130706433`, `0177.0.0.1`, `123.456` — libc `inet_aton` spellings,
-///   never legal rule hosts, where `10.0.0.1` itself is live because an
-///   IP-literal flow carries the IP string);
+///   never legal rule hosts, where `10.0.0.1` itself stays live — an
+///   IP-literal `host` folds into `dst_ip` before matching, but
+///   `sniff_host` can still carry the literal verbatim);
 /// - any byte outside the rule-host alphabet, which also subsumes the
 ///   shared [`domain_rule_payload_is_dead`] byte check — but spelled
 ///   through the oracle so IPv6 literals (`::1`, `[::1]`) stay live and

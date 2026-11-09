@@ -582,8 +582,8 @@ any byte no hostname carries (`*`, `+`, `?`, a space, non-ASCII —
 `DOMAIN,*.x.com` can never equal a host; `*` belongs on `DOMAIN-WILDCARD`),
 all-numeric non-IP spellings like `DOMAIN,2130706433` or `DOMAIN,123.456`
 are dead too (libc `inet_aton` forms no listener produces), while
-`DOMAIN,10.0.0.1` and `DOMAIN,0x7f000001` stay live — an IP-literal flow
-carries the IP string, and `0x7f000001` is a legal hostname spelling a
+`DOMAIN,10.0.0.1` and `DOMAIN,0x7f000001` stay live — `sniff_host` can
+still carry the literal, and `0x7f000001` is a legal hostname spelling a
 client may send. `DOMAIN-SUFFIX` keeps the label-structure check rather
 than the oracle — an all-numeric payload can still end a legal mixed host
 (`x.2130706433`), so it only flags an empty label, a leading or trailing

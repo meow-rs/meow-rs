@@ -83,9 +83,14 @@ pub fn parse_rules_full(
 /// bodies (`sub_rules_parser`). Returns the warn/error descriptor for
 /// the caller's message; `None` when the payload is live or unchecked.
 /// Scope per rule type (meow-rules/src/domain_key.rs):
-///   DOMAIN/DOMAIN-SUFFIX — an empty label (`a..b`), a
-///     leading/trailing dot (`.x.com`, `x.com.`), or a verbatim-dead
-///     `*`/`+` spelling (`DOMAIN,*.x.com`);
+///   DOMAIN — judged against `is_valid_host` itself (the gate every
+///     `host`/`sniff_host` producer passes): an empty label (`a..b`),
+///     a leading/trailing dot, alphabet-impossible bytes, or any
+///     unproducible host form like all-numeric `inet_aton` spellings
+///     (`DOMAIN,2130706433`);
+///   DOMAIN-SUFFIX — an empty label (`a..b`), a leading/trailing dot
+///     (`.x.com`, `x.com.`), or alphabet-impossible bytes — an
+///     all-numeric payload stays live (`x.2130706433` ends on it);
 ///   DOMAIN-WILDCARD — a literal `+` (the matcher globs `*` only) or a
 ///     dead literal label (`*.foo.`, `a..b`);
 ///   DOMAIN-KEYWORD — `..` or a byte no normalized host can carry (`*`,
