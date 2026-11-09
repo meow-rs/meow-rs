@@ -13,6 +13,13 @@ use std::time::Duration;
 /// answer a downstream cache keeps serving stays covered.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(86_400);
 
+/// `NFPROTO_*` values for the families a `family#table#set` spec accepts.
+const NFPROTO_INET: u8 = 1;
+const NFPROTO_IPV4: u8 = 2;
+const NFPROTO_NETDEV: u8 = 5;
+const NFPROTO_BRIDGE: u8 = 7;
+const NFPROTO_IPV6: u8 = 10;
+
 /// One nftables set: `family#table#set`, e.g. `inet#fw4#meow_proxy4`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SetRef {
@@ -31,11 +38,11 @@ impl SetRef {
             return Err(format!("nftset `{spec}`: expected family#table#set"));
         };
         let family = match family {
-            "inet" => 1,
-            "ip" => 2,
-            "ip6" => 10,
-            "bridge" => 7,
-            "netdev" => 5,
+            "inet" => NFPROTO_INET,
+            "ip" => NFPROTO_IPV4,
+            "ip6" => NFPROTO_IPV6,
+            "bridge" => NFPROTO_BRIDGE,
+            "netdev" => NFPROTO_NETDEV,
             other => return Err(format!("nftset `{spec}`: unknown family `{other}`")),
         };
         let valid = |s: &str| !s.is_empty() && s.len() < 256 && !s.contains('\0');
@@ -73,10 +80,42 @@ impl NftsetConfig {
         if ipv4.is_none() && ipv6.is_none() {
             return Ok(None);
         }
+        // The slot names the address family the answers will carry: a set
+        // that can't hold it dead-ends every add, so it is a spec error.
+        // `inet` covers both families.
+        if let Some(s) = &ipv4 {
+            if !matches!(s.family, NFPROTO_INET | NFPROTO_IPV4) {
+                return Err(format!(
+                    "nftset ipv4 `{}#{}`: family must be `ip` or `inet`",
+                    s.table, s.set
+                ));
+            }
+        }
+        if let Some(s) = &ipv6 {
+            if !matches!(s.family, NFPROTO_INET | NFPROTO_IPV6) {
+                return Err(format!(
+                    "nftset ipv6 `{}#{}`: family must be `ip6` or `inet`",
+                    s.table, s.set
+                ));
+            }
+        }
+        // Same Instant+Duration overflow class as `udp-timeout`
+        // (issue #648): element-expiry arithmetic must never reach
+        // panic=abort.
+        let timeout = match timeout_secs {
+            Some(s) if s > crate::MAX_DURATION_SECS => {
+                return Err(format!(
+                    "nftset timeout: {s}s exceeds the {}s ceiling",
+                    crate::MAX_DURATION_SECS
+                ));
+            }
+            Some(s) => Duration::from_secs(s),
+            None => DEFAULT_TIMEOUT,
+        };
         Ok(Some(Self {
             ipv4,
             ipv6,
-            timeout: timeout_secs.map_or(DEFAULT_TIMEOUT, Duration::from_secs),
+            timeout,
         }))
     }
 
@@ -355,5 +394,16 @@ mod tests {
             .unwrap();
         assert_eq!(c.timeout, DEFAULT_TIMEOUT);
         assert!(c.set_for("::1".parse().unwrap()).is_none());
+    }
+
+    #[test]
+    fn slots_reject_the_wrong_family_and_huge_timeouts() {
+        assert!(NftsetConfig::parse(Some("ip6#t#s"), None, None).is_err());
+        assert!(NftsetConfig::parse(None, Some("ip#t#s"), None).is_err());
+        assert!(NftsetConfig::parse(Some("inet#t#s"), Some("inet#t#s"), None).is_ok());
+        assert!(
+            NftsetConfig::parse(Some("ip#t#s"), None, Some(crate::MAX_DURATION_SECS + 1)).is_err()
+        );
+        assert!(NftsetConfig::parse(Some("ip#t#s"), None, Some(crate::MAX_DURATION_SECS)).is_ok());
     }
 }

@@ -6,6 +6,11 @@ firewall that sends only those destinations (plus your static proxy IP
 lists) to meow leaves everything else to kernel forwarding — flowtable and
 hardware offload included — and dnsmasq no longer needs the domain lists.
 
+Requirements: Linux only (`nf_tables` kernel support; the key is parsed
+but ignored elsewhere) and `CAP_NET_ADMIN` — adding set elements is an
+nfnetlink mutation, the same privilege class as installing nftables rules
+(see [tproxy-gateway.md](tproxy-gateway.md)).
+
 ```yaml
 dns:
   enable: true
@@ -49,5 +54,6 @@ matched on domain and address only. Fake-IP answers are skipped (intercept
 the fake range as a whole).
 
 Caveats: elements stay after a rule change until they expire (flush the set
-on reload if that matters), and clients that bypass meow's DNS (DoH, DoT,
-hard-coded addresses) are not covered — block them in the firewall.
+on reload if that matters), HTTPS/SVCB `ipv4hint`/`ipv6hint` addresses are
+not added, and clients that bypass meow's DNS (DoH, DoT, hard-coded
+addresses) are not covered — block them in the firewall.

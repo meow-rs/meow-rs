@@ -26,7 +26,7 @@ use futures::{FutureExt, StreamExt};
 use ipnet::{Ipv4Net, Ipv6Net};
 use lwip::UdpSocket;
 use meow_common::{ConnType, Metadata, Network};
-use meow_dns::server::{hex_prefix, DnsServer, LocalAnswer};
+use meow_dns::server::{hex_prefix, DnsServer, LocalAnswer, LocalResponse};
 use meow_tunnel::{MatchedRule, ResolvedTarget, Tunnel, UsingProxy};
 use tokio::sync::mpsc;
 use tokio::time::{sleep_until, Instant};
@@ -260,9 +260,26 @@ pub(super) async fn run_udp(
             // answered inline — they never spend a hijack permit or a task
             // spawn, so a warm cache can't queue behind slow upstreams.
             match DnsServer::try_answer_local(&data, &resolver) {
-                LocalAnswer::Answer(response) => {
-                    if reply_tx.try_send((response, dst, src)).is_err() {
-                        note_hijack_drop(&hijack_dropped);
+                LocalAnswer::Answer(LocalResponse { response, hook }) => {
+                    match hook {
+                        // `dns.nftset` ordering, same as the serve loop:
+                        // the (blocking) element add finishes before this
+                        // answer is queued for the stack writer.
+                        Some(work) => {
+                            let reply_tx = reply_tx.clone();
+                            let hijack_dropped = Arc::clone(&hijack_dropped);
+                            tokio::task::spawn_blocking(move || {
+                                work.run();
+                                if reply_tx.try_send((response, dst, src)).is_err() {
+                                    note_hijack_drop(&hijack_dropped);
+                                }
+                            });
+                        }
+                        None => {
+                            if reply_tx.try_send((response, dst, src)).is_err() {
+                                note_hijack_drop(&hijack_dropped);
+                            }
+                        }
                     }
                     continue;
                 }
