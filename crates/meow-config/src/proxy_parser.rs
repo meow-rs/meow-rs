@@ -48,6 +48,11 @@ struct DialerHop {
 }
 
 impl WrappedProxy {
+    /// Configured dependency, independent of the front group's current pick.
+    pub(crate) fn has_configured_dialer(&self) -> bool {
+        self.hop.is_some()
+    }
+
     pub fn new(adapter: Box<dyn ProxyAdapter>) -> Self {
         Self { adapter, hop: None }
     }
@@ -139,6 +144,10 @@ impl ProxyAdapter for WrappedProxy {
 }
 
 impl Proxy for WrappedProxy {
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+
     fn alive(&self) -> bool {
         self.adapter.health().alive()
     }

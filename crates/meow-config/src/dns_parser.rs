@@ -34,6 +34,7 @@ pub async fn parse_dns(
     rule_providers: &HashMap<String, Arc<RuleProvider>>,
     prior: Option<&Resolver>,
 ) -> Result<DnsConfig, anyhow::Error> {
+    validate_node_policy_sources(raw)?;
     // `strict` (top-level `strict: true`, issue #533): static config defects
     // become hard errors; transient resolution failures stay lenient.
     let strict = raw.strict.unwrap_or(false);
@@ -103,6 +104,11 @@ pub async fn parse_dns(
         .nameserver_policy
         .as_ref()
         .map(|map| prefer_h3_policy_map(map, prefer_h3));
+    // The global `prefer-h3` does NOT apply to the node policy: proxy
+    // hostname resolution is latency-sensitive and a silent H3→H2 fallback
+    // would just time out. An explicit `?h3=` entry still works and
+    // is still capability-gated below.
+    let effective_proxy_policy = active_node_policy(raw).cloned();
 
     // A `prefer-h3` / `?h3=` entry needs a build that can speak QUIC. Reject
     // the config here — client construction would otherwise panic, which is a
@@ -116,7 +122,7 @@ pub async fn parse_dns(
         // Parse the effective values instead of matching substrings: the
         // parser trims the `h3` value, so a hand-written list drifts (and a
         // miss here reaches the panic in `build_single_resolver_with_proxy`).
-        let policy_asks_h3 = effective_policy.as_ref().is_some_and(|map| {
+        let policy_asks_h3 = effective_policy.iter().chain(effective_proxy_policy.iter()).any(|map| {
             map.values().any(|v| {
                 v.as_urls().iter().any(|s| {
                     NameServerEntry::parse(s).is_ok_and(|e| {
@@ -151,7 +157,7 @@ pub async fn parse_dns(
     {
         reject_proxied_quic_hostname(entry)?;
     }
-    if let Some(map) = &effective_policy {
+    for map in effective_policy.iter().chain(effective_proxy_policy.iter()) {
         for value in map.values() {
             for url in value.as_urls() {
                 if let Ok(entry) = NameServerEntry::parse(url) {
@@ -184,7 +190,8 @@ pub async fn parse_dns(
     // mihomo `proxy-server-nameserver`: a dedicated resolver used only for
     // proxy server hostnames (dns.Config.ProxyServer → ProxyServerHostResolver).
     // Normal mode — proxy server domains must never get fake IPs — and no
-    // fallback/policy; hostname URLs bootstrap via default-nameserver exactly
+    // fallback; its dedicated policy never affects ordinary queries.
+    // Hostname URLs bootstrap via default-nameserver exactly
     // like the main list. Hosts entries still apply (mihomo checks its global
     // hosts table before consulting any resolver), so it gets its own copy of
     // the hosts trie — DomainTrie is not Clone, hence the rebuild.
@@ -201,6 +208,29 @@ pub async fn parse_dns(
                  drop the proxy tag."
             );
         }
+        let proxy_policy = if let Some(map) = &effective_proxy_policy {
+            validate_node_policy_proxy_tags(map, proxy_registry)?;
+            let bootstrap = build_policy_bootstrap_clients(&default_ns_urls, &main_urls);
+            Some(
+                build_nameserver_policy(
+                    map,
+                    geosite.as_ref(),
+                    &bootstrap,
+                    proxy_registry,
+                    rule_providers,
+                    strict,
+                )
+                .await?
+                // Same exclusive flag as the main policy: it is a
+                // matched-entry semantic (the dedicated upstream owns the
+                // query, no fall-through on failure) — a policy MISS always
+                // falls through to `proxy_server_nameserver` regardless, so
+                // propagating the flag cannot strand uncovered hostnames.
+                .with_exclusive(dns.nameserver_policy_exclusive.unwrap_or(false)),
+            )
+        } else {
+            None
+        };
         let mut proxy_hosts = build_hosts_trie(raw.hosts.as_ref(), strict)?;
         if use_hosts && use_system_hosts {
             merge_system_hosts(&mut proxy_hosts).await;
@@ -214,7 +244,7 @@ pub async fn parse_dns(
                 proxy_hosts,
                 use_hosts,
                 crate::effective_ipv6(raw.ipv6),
-                None,
+                proxy_policy,
                 None,
                 proxy_registry,
                 crate::is_offline_validate(),
@@ -672,6 +702,7 @@ pub(crate) fn dns_policy_keys(raw: &crate::raw::RawConfig) -> impl Iterator<Item
     raw.dns.iter().flat_map(|dns| {
         dns.nameserver_policy
             .iter()
+            .chain(active_node_policy(raw))
             .flat_map(|map| map.keys().map(String::as_str))
             .chain(
                 dns.response_rules
@@ -680,6 +711,93 @@ pub(crate) fn dns_policy_keys(raw: &crate::raw::RawConfig) -> impl Iterator<Item
                     .map(|rule| rule.matcher.as_str()),
             )
     })
+}
+
+/// Like mihomo, this map is inert without an enabled, dedicated node resolver.
+fn active_node_policy(raw: &RawConfig) -> Option<&crate::raw::RawNameserverPolicy> {
+    let dns = raw.dns.as_ref()?;
+    if !dns.enable.unwrap_or(false)
+        || dns
+            .proxy_server_nameserver
+            .as_deref()
+            .unwrap_or(&[])
+            .is_empty()
+    {
+        return None;
+    }
+    dns.proxy_server_nameserver_policy.as_ref()
+}
+
+/// Run before provider fetching at startup and reload. A remote condition
+/// cannot depend on the node resolver whose policy it is needed to construct.
+/// Inline/file providers are independent. Remote providers may redirect to a
+/// hostname or route through a node even from an IP-literal URL, so they cannot
+/// prove this property yet. A cached payload does not waive the refresh risk.
+pub(crate) fn validate_node_policy_sources(raw: &RawConfig) -> anyhow::Result<()> {
+    let Some(map) = active_node_policy(raw) else {
+        return Ok(());
+    };
+    for key in map.keys().flat_map(|key| expand_policy_keys(key)) {
+        if !key.to_ascii_lowercase().starts_with("rule-set:") {
+            continue;
+        }
+        let name = key["rule-set:".len()..].trim();
+        let Some(provider) = raw
+            .rule_providers
+            .as_ref()
+            .and_then(|providers| providers.get(name))
+        else {
+            continue; // The shared policy builder reports missing providers.
+        };
+        // Allowlist, not denylist: only provider types proven independent of
+        // the node resolver may feed its policy. Any new remote type must
+        // re-justify itself here before it is allowed through.
+        anyhow::ensure!(
+            provider.provider_type.eq_ignore_ascii_case("file")
+                || provider.provider_type.eq_ignore_ascii_case("inline"),
+            "dns.proxy-server-nameserver-policy: rule-set '{name}' needs independent bootstrap; use an inline or file provider (remote fetches can redirect or route via a node that re-enters this node resolver)"
+        );
+    }
+    Ok(())
+}
+
+/// New node policies fail closed on a proxy whose endpoint resolution can
+/// re-enter this very resolver. Keep the legacy base-list warning unchanged.
+fn validate_node_policy_proxy_tags(
+    map: &crate::raw::RawNameserverPolicy,
+    registry: &HashMap<smol_str::SmolStr, Arc<dyn meow_common::Proxy>>,
+) -> anyhow::Result<()> {
+    for value in map.values() {
+        for url in value.as_urls() {
+            let entry = NameServerEntry::parse(url)
+                .map_err(|error| anyhow::anyhow!("dns.proxy-server-nameserver-policy: {error}"))?;
+            if let Some(name) = entry.proxy {
+                let proxy = registry.get(name.as_str()).ok_or_else(|| {
+                    anyhow::anyhow!("dns.proxy-server-nameserver-policy: unknown proxy '{name}'")
+                })?;
+                // A selected REJECT/PASS has no live carrier, but changing
+                // that selection cannot waive a configured bootstrap dependency.
+                let configured_chain = proxy
+                    .as_any()
+                    .and_then(|proxy| proxy.downcast_ref::<crate::proxy_parser::WrappedProxy>())
+                    .is_some_and(crate::proxy_parser::WrappedProxy::has_configured_dialer);
+                let chained = configured_chain
+                    || [meow_common::Network::Tcp, meow_common::Network::Udp]
+                        .into_iter()
+                        .any(|network| {
+                            proxy
+                                .dialer_hop(&meow_common::Metadata {
+                                    network,
+                                    ..Default::default()
+                                })
+                                .is_some()
+                        });
+                anyhow::ensure!(is_ip_literal_addr(proxy.addr()) && !chained,
+                    "dns.proxy-server-nameserver-policy: proxy '{name}' needs independent bootstrap; use an unchained IP-literal node or an untagged nameserver (hostname nodes and groups can re-enter the node resolver)");
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Build a `NameserverPolicy` from the raw YAML map.
@@ -4061,5 +4179,323 @@ mod tests {
         // Unknown names are the bootstrap builder's error to raise, not ours.
         let registry = stub_registry(&[("JP", "node.example:443")]);
         assert!(circular_proxy_tags(&entries, &registry).is_empty());
+    }
+    async fn node_policy_config(yaml: &str) -> DnsConfig {
+        let raw: RawConfig = serde_saphyr::from_str(yaml).unwrap();
+        parse_dns(
+            &raw,
+            None,
+            None,
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn node_policy_is_separate_and_preserves_exclusive_flag() {
+        use hickory_proto::{
+            op::ResponseCode,
+            rr::{Name, RecordType},
+        };
+        // `nameserver-policy-exclusive` propagates to the node resolver: it
+        // only owns MATCHED entries (miss always falls through to
+        // `proxy-server-nameserver`), so propagation is the coherent single
+        // knob — a dedicated node upstream's failure is not silently masked
+        // by the general node pool.
+        for exclusive in [false, true] {
+            let cfg = node_policy_config(&format!(
+                "dns:\n  enable: true\n  nameserver: [rcode://success]\n  proxy-server-nameserver: [rcode://refused]\n  nameserver-policy-exclusive: {exclusive}\n  proxy-server-nameserver-policy:\n    '+.node.test': rcode://name_error\n"
+            )).await;
+            let proxy = cfg.proxy_resolver.unwrap();
+            assert_eq!(proxy.mode(), DnsMode::Normal);
+            assert_eq!(
+                proxy
+                    .nameserver_policy()
+                    .expect("dedicated policy")
+                    .is_exclusive(),
+                exclusive
+            );
+            for (host, expected) in [
+                ("a.node.test", ResponseCode::NXDomain),
+                ("other.test", ResponseCode::Refused),
+            ] {
+                let name = Name::from_ascii(host).unwrap();
+                let answer = proxy
+                    .forward_generic(host, &name, RecordType::TXT)
+                    .await
+                    .unwrap();
+                assert_eq!(answer.metadata.response_code, expected);
+                let ordinary = cfg
+                    .resolver
+                    .forward_generic(host, &name, RecordType::TXT)
+                    .await
+                    .unwrap();
+                assert_eq!(ordinary.metadata.response_code, ResponseCode::NoError);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn node_policy_exclusive_failure_does_not_use_default_pool() {
+        use hickory_proto::rr::{Name, RecordType};
+        let silent = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let cfg = node_policy_config(&format!(
+            "dns:\n  enable: true\n  nameserver: [rcode://success]\n  proxy-server-nameserver: [rcode://success]\n  nameserver-policy-exclusive: true\n  proxy-server-nameserver-policy:\n    node.test: '{}'\n", silent.local_addr().unwrap()
+        )).await;
+        let proxy = cfg.proxy_resolver.unwrap();
+        let name = Name::from_ascii("node.test").unwrap();
+        let answer = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            proxy.forward_generic("node.test", &name, RecordType::TXT),
+        )
+        .await
+        .unwrap();
+        assert!(
+            answer.is_none(),
+            "a failed policy must not fall through to the successful default pool"
+        );
+        let mut packet = [0u8; 2048];
+        assert!(
+            silent.try_recv_from(&mut packet).is_ok(),
+            "the selected policy upstream must actually receive a query"
+        );
+    }
+
+    #[tokio::test]
+    async fn node_policy_is_ignored_without_its_resolver_or_dns() {
+        for yaml in [
+            "dns:\n  enable: true\n  nameserver: [rcode://success]\n  proxy-server-nameserver-policy: {node.test: 'broken://value'}\n",
+            "dns:\n  enable: false\n  proxy-server-nameserver: [rcode://success]\n  proxy-server-nameserver-policy: {node.test: 'broken://value'}\n",
+        ] {
+            assert!(node_policy_config(yaml).await.proxy_resolver.is_none());
+        }
+    }
+
+    #[test]
+    fn node_policy_discovers_provider_and_geosite_keys() {
+        let raw: RawConfig = serde_saphyr::from_str("dns:\n  enable: true\n  proxy-server-nameserver: [rcode://success]\n  proxy-server-nameserver-policy:\n    'rule-set:nodes': rcode://success\n    'geosite:private': rcode://success\n").unwrap();
+        assert!(dns_needs_rule_providers(&raw));
+        assert!(dns_policy_keys(&raw).any(|key| key == "geosite:private"));
+    }
+
+    #[tokio::test]
+    async fn node_policy_rejects_circular_proxy_before_bootstrap() {
+        let raw: RawConfig = serde_saphyr::from_str("dns:\n  enable: true\n  nameserver: [rcode://success]\n  proxy-server-nameserver: [rcode://success]\n  proxy-server-nameserver-policy:\n    node.test: 'tcp://policy.invalid#Proxy'\n").unwrap();
+        let registry = stub_registry(&[("Proxy", "node.test:443")]);
+        let error = parse_dns(&raw, None, None, &registry, None, &HashMap::new(), None)
+            .await
+            .err()
+            .expect("self-dependent node policy must be rejected");
+        assert!(error.to_string().contains("proxy-server-nameserver-policy"));
+    }
+
+    #[tokio::test]
+    async fn node_policy_rejects_declared_chain_when_group_selects_reject() {
+        let raw: RawConfig = serde_saphyr::from_str(
+            r#"
+proxies:
+  - {name: Node, type: ss, server: 192.0.2.1, port: 443, cipher: aes-128-gcm, password: example, dialer-proxy: G}
+  - {name: Front, type: ss, server: front.invalid, port: 443, cipher: aes-128-gcm, password: example}
+proxy-groups:
+  - {name: G, type: select, proxies: [REJECT, Front]}
+dns:
+  enable: true
+  nameserver: [rcode://success]
+  proxy-server-nameserver: [rcode://success]
+  proxy-server-nameserver-policy:
+    node.test: tcp://192.0.2.53#Node
+"#,
+        )
+        .unwrap();
+        let error = crate::build_config(raw, None)
+            .await
+            .err()
+            .expect("declared chain must be rejected even when its current pick sends nothing");
+        assert!(
+            error.to_string().contains("independent bootstrap"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn node_policy_yaml_roundtrip_keeps_document_order() {
+        let yaml = "dns:\n  enable: true\n  proxy-server-nameserver: [rcode://success]\n  proxy-server-nameserver-policy:\n    'z.test': rcode://success\n    'a.test': rcode://refused\n";
+        let raw: RawConfig = serde_saphyr::from_str(yaml).unwrap();
+        let encoded = serde_saphyr::to_string(&raw).unwrap();
+        let start = encoded
+            .find("proxy-server-nameserver-policy:")
+            .expect("policy preserved");
+        let policy = &encoded[start..];
+        assert!(policy.find("z.test").unwrap() < policy.find("a.test").unwrap());
+    }
+    #[tokio::test]
+    async fn node_policy_inline_provider_reload_uses_candidate_generation() {
+        let yaml = "dns:\n  enable: true\n  nameserver: [rcode://success]\n  proxy-server-nameserver: [rcode://refused]\n  proxy-server-nameserver-policy:\n    'rule-set:nodes': rcode://name_error\nrule-providers:\n  nodes:\n    type: inline\n    behavior: domain\n    payload: ['old.node.test']\n";
+        let mut raw: RawConfig = serde_saphyr::from_str(yaml).unwrap();
+        let old = crate::parse_dns_from_raw(&raw, None, &HashMap::new(), None, None, None, None)
+            .await
+            .unwrap()
+            .proxy_resolver
+            .unwrap();
+        raw.rule_providers
+            .as_mut()
+            .unwrap()
+            .get_mut("nodes")
+            .unwrap()
+            .payload = Some(vec!["new.node.test".into()]);
+        let new = crate::parse_dns_from_raw(&raw, None, &HashMap::new(), None, None, None, None)
+            .await
+            .unwrap()
+            .proxy_resolver
+            .unwrap();
+        assert!(old
+            .nameserver_policy()
+            .unwrap()
+            .lookup("old.node.test")
+            .is_some());
+        assert!(new
+            .nameserver_policy()
+            .unwrap()
+            .lookup("old.node.test")
+            .is_none());
+        assert!(new
+            .nameserver_policy()
+            .unwrap()
+            .lookup("new.node.test")
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn node_policy_rejects_provider_dependency_before_fetch_on_all_build_paths() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let raw: RawConfig = serde_saphyr::from_str(&format!(
+            "dns:\n  enable: true\n  nameserver: [rcode://success]\n  proxy-server-nameserver: [rcode://success]\n  proxy-server-nameserver-policy:\n    'rule-set:nodes': rcode://success\nrule-providers:\n  nodes:\n    type: http\n    behavior: domain\n    url: 'http://{}/rules'\n", listener.local_addr().unwrap()
+        )).unwrap();
+        let built = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            crate::build_config(raw.clone(), None),
+        )
+        .await
+        .unwrap();
+        assert!(built
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("independent bootstrap"));
+        let reloaded = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            crate::parse_dns_from_raw(&raw, None, &HashMap::new(), None, None, None, None),
+        )
+        .await
+        .unwrap();
+        assert!(reloaded
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("independent bootstrap"));
+        assert!(crate::rebuild_from_raw(&raw)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("independent bootstrap"));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), listener.accept())
+                .await
+                .is_err(),
+            "rejected configs must not fetch the condition provider first"
+        );
+        let mut independent = raw;
+        independent
+            .rule_providers
+            .as_mut()
+            .unwrap()
+            .get_mut("nodes")
+            .unwrap()
+            .proxy = Some("DIRECT".into());
+        assert!(validate_node_policy_sources(&independent).is_err());
+        independent
+            .rule_providers
+            .as_mut()
+            .unwrap()
+            .get_mut("nodes")
+            .unwrap()
+            .url = Some("https://provider.node.test/rules".into());
+        assert!(validate_node_policy_sources(&independent).is_err());
+    }
+
+    #[tokio::test]
+    async fn node_policy_ip_proxy_does_not_bootstrap_remote_dns_hostname() {
+        let raw: RawConfig = serde_saphyr::from_str("dns:\n  enable: true\n  nameserver: [rcode://success]\n  proxy-server-nameserver: [rcode://success]\n  proxy-server-nameserver-policy:\n    node.test: 'tcp://policy.invalid#Proxy'\n").unwrap();
+        let registry = stub_registry(&[("Proxy", "192.0.2.1:443")]);
+        let config = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            parse_dns(&raw, None, None, &registry, None, &HashMap::new(), None),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let resolver = config.proxy_resolver.unwrap();
+        assert!(resolver
+            .nameserver_policy()
+            .unwrap()
+            .lookup("node.test")
+            .unwrap()
+            .nameservers[0]
+            .is_proxied());
+    }
+
+    #[tokio::test]
+    async fn node_policy_keeps_real_resolution_under_fake_ip_mode() {
+        let cfg = node_policy_config("dns:\n  enable: true\n  enhanced-mode: fake-ip\n  nameserver: [rcode://success]\n  proxy-server-nameserver: [rcode://success]\n  proxy-server-nameserver-policy:\n    node.test: rcode://name_error\n").await;
+        let fake = cfg.resolver.lookup_ipv4("node.test").await.unwrap();
+        assert!(cfg.resolver.is_fake_ip(fake));
+        let proxy = cfg.proxy_resolver.unwrap();
+        assert_eq!(proxy.mode(), DnsMode::Normal);
+        assert!(proxy.lookup_ipv4("node.test").await.is_none());
+    }
+
+    #[cfg(not(feature = "dns-quic"))]
+    #[tokio::test]
+    async fn node_policy_h3_capability_is_checked_before_client_construction() {
+        // Global prefer-h3 does not rewrite node-policy entries; an explicit
+        // `?h3=` entry is still capability-gated before client construction.
+        let raw: RawConfig = serde_saphyr::from_str("dns:\n  enable: true\n  nameserver: [rcode://success]\n  proxy-server-nameserver: [rcode://success]\n  prefer-h3: true\n  proxy-server-nameserver-policy:\n    node.test: 'https://192.0.2.1/dns-query?h3=prefer'\n").unwrap();
+        let error = parse_dns(
+            &raw,
+            None,
+            None,
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+            None,
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("dns-quic"));
+    }
+
+    #[cfg(not(feature = "dns-quic"))]
+    #[tokio::test]
+    async fn node_policy_plain_https_entry_ignores_prefer_h3() {
+        // Global prefer-h3 must not rewrite node-policy entries: a bare
+        // `https://` node entry stays HTTP/2-capable and parses fine on a
+        // build without `dns-quic`.
+        let raw: RawConfig = serde_saphyr::from_str("dns:\n  enable: true\n  nameserver: [rcode://success]\n  proxy-server-nameserver: [rcode://success]\n  prefer-h3: true\n  proxy-server-nameserver-policy:\n    node.test: 'https://192.0.2.1/dns-query'\n").unwrap();
+        parse_dns(
+            &raw,
+            None,
+            None,
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
     }
 }

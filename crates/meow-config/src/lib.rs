@@ -1519,6 +1519,7 @@ pub async fn parse_dns_from_raw(
     prior_resolver: Option<&meow_dns::Resolver>,
     dialer_registry: Option<&meow_proxy::dialer::ProxyRegistry>,
 ) -> Result<DnsConfig, anyhow::Error> {
+    dns_parser::validate_node_policy_sources(raw)?;
     let geo = geodata::parse_geodata(raw.geodata.as_ref(), raw.geox_url.as_ref())?;
     let empty = rule_provider::PrefetchedPayloads::default();
     let payloads: &rule_provider::PrefetchedPayloads =
@@ -2945,6 +2946,7 @@ fn rebuild_from_raw_impl(
     // and validation/test rebuilds must not reach the network.
     fetch_geodata: bool,
 ) -> Result<RebuildResult, anyhow::Error> {
+    dns_parser::validate_node_policy_sources(raw)?;
     // Top-level `strict: true` (issue #533): warn-skipped defects in
     // *operator-authored* content become hard errors — proxies,
     // proxy-groups and rules are covered inside
@@ -4968,6 +4970,7 @@ pub async fn build_config(
     mut raw: raw::RawConfig,
     cache_dir: Option<&Path>,
 ) -> Result<Config, anyhow::Error> {
+    dns_parser::validate_node_policy_sources(&raw)?;
     // Pre-resolve any DNS-sourced ECH configs into inline base64 so the
     // sync `parse_proxy` path that follows can stay sync. Failures warn
     // and leave the map unchanged — except the `enable: true` with no
