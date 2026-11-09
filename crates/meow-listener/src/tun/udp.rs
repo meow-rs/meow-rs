@@ -472,6 +472,18 @@ async fn flow_task(tunnel: Tunnel, spec: FlowSpec) {
     }
 }
 
+/// Map a completed reply-reader join to the flow's exit error — the
+/// reader owns the only `up_tx`, so any reader exit ends the flow.
+/// `None` (empty set) is unreachable today — every earlier `join_next`
+/// breaks out — and folds into the clean-exit message.
+fn reply_reader_exit(done: Option<Result<Result<(), String>, tokio::task::JoinError>>) -> String {
+    match done {
+        Some(Ok(Err(e))) => e,
+        Some(Ok(Ok(()))) | None => "downstream reader exited".into(),
+        Some(Err(e)) => format!("downstream reader task: {e}"),
+    }
+}
+
 /// Route the flow, dial the outbound, then pump datagrams both ways until
 /// `udp_timeout` passes with no traffic in either direction. `last_activity`
 /// is the table entry's shared stamp — upstream replies it successfully
@@ -607,7 +619,10 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
     // traffic for its idle deadline — the same per-datagram `to_vec`
     // profile the pre-#514 pump had.
     let (up_tx, mut up_rx) = mpsc::channel::<Vec<u8>>(FLOW_QUEUE);
-    let mut reply_task = tokio::spawn({
+    // A one-task set keeps the reader owned by this flow on cancellation,
+    // and lets normal exits wait for its in-flight read and buffer to drop.
+    let mut reply_task = tokio::task::JoinSet::new();
+    reply_task.spawn({
         let conn = std::sync::Arc::clone(&conn);
         async move {
             let mut rbuf = vec![0u8; DATAGRAM_BUF];
@@ -640,11 +655,7 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
             let write_result = tokio::select! {
                 () = &mut idle => break 'flow Ok(()), // idle-timeout during write
                 () = flush.flushed() => break 'flow Ok(()), // flush during write
-                done = &mut reply_task => break 'flow Err(match done {
-                    Ok(Err(e)) => e,
-                    Ok(Ok(())) => "downstream reader exited".into(),
-                    Err(e) => format!("downstream reader task: {e}"),
-                }),
+                done = reply_task.join_next() => break 'flow Err(reply_reader_exit(done)),
                 r = conn.write_packet(&data, &dst_addr) => r,
             };
             match write_result {
@@ -677,11 +688,7 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
                         let write_result = tokio::select! {
                             () = &mut idle => break Ok(()), // idle-timeout during write
                             () = flush.flushed() => break Ok(()), // flush during write
-                            done = &mut reply_task => break Err(match done {
-                                Ok(Err(e)) => e,
-                                Ok(Ok(())) => "downstream reader exited".into(),
-                                Err(e) => format!("downstream reader task: {e}"),
-                            }),
+                            done = reply_task.join_next() => break Err(reply_reader_exit(done)),
                             r = conn.write_packet(&data, &dst_addr) => r,
                         };
                         match write_result {
@@ -723,18 +730,14 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
                         }
                     }
                     // The reader task exited — it owns the only `up_tx`. The
-                    // borrow-await keeps the handle usable for the abort below.
-                    None => break Err(match (&mut reply_task).await {
-                        Ok(Err(e)) => e,
-                        Ok(Ok(())) => "downstream reader exited".into(),
-                        Err(e) => format!("downstream reader task: {e}"),
-                    }),
+                    // set removes its completed task, so shutdown will not poll it twice.
+                    None => break Err(reply_reader_exit(reply_task.join_next().await)),
                 },
             }
         }
     };
 
-    reply_task.abort();
+    reply_task.shutdown().await;
     let _ = conn.close();
     result
 }
@@ -1084,5 +1087,212 @@ mod tests {
         assert!(!is_looping_dst(ip("fdfe:dcba:9876::1"), net()));
         assert!(!is_looping_dst(ip("fdfe:dcba:9876::4"), dual_net()));
         assert!(!is_looping_dst(ip("2001:db8::1"), dual_net()));
+    }
+}
+
+#[cfg(test)]
+mod cleanup_tests {
+    use super::*;
+    use meow_common::{Proxy, ProxyAdapter, ProxyHealth, ProxyPacketConn};
+    use std::sync::atomic::AtomicBool;
+    use tokio::sync::Notify;
+
+    #[derive(Default)]
+    struct Probe {
+        reading: Notify,
+        writing: Notify,
+        release_read: Notify,
+        read_dropped: AtomicBool,
+        conn_dropped: Notify,
+        closed_while_reading: AtomicBool,
+    }
+    struct Conn(Arc<Probe>);
+    impl Drop for Conn {
+        fn drop(&mut self) {
+            self.0.conn_dropped.notify_one();
+        }
+    }
+    struct ReadGuard(Arc<Probe>);
+    impl Drop for ReadGuard {
+        fn drop(&mut self) {
+            self.0.read_dropped.store(true, Ordering::SeqCst);
+        }
+    }
+    #[async_trait::async_trait]
+    impl ProxyPacketConn for Conn {
+        async fn read_packet(&self, _: &mut [u8]) -> meow_common::Result<(usize, SocketAddr)> {
+            let _guard = ReadGuard(Arc::clone(&self.0));
+            self.0.reading.notify_one();
+            self.0.release_read.notified().await;
+            Err(std::io::Error::other("fixture reader ended").into())
+        }
+        async fn write_packet(&self, _: &[u8], _: &SocketAddr) -> meow_common::Result<usize> {
+            self.0.writing.notify_one();
+            std::future::pending().await
+        }
+        fn local_addr(&self) -> meow_common::Result<SocketAddr> {
+            Ok(([127, 0, 0, 1], 0).into())
+        }
+        fn close(&self) -> meow_common::Result<()> {
+            self.0.closed_while_reading.store(
+                !self.0.read_dropped.load(Ordering::SeqCst),
+                Ordering::SeqCst,
+            );
+            Ok(())
+        }
+    }
+    struct FixtureProxy {
+        probe: Arc<Probe>,
+        health: ProxyHealth,
+    }
+    #[async_trait::async_trait]
+    impl ProxyAdapter for FixtureProxy {
+        fn name(&self) -> &str {
+            "cleanup-fixture"
+        }
+        fn adapter_type(&self) -> meow_common::AdapterType {
+            meow_common::AdapterType::Direct
+        }
+        fn addr(&self) -> &str {
+            ""
+        }
+        fn support_udp(&self) -> bool {
+            true
+        }
+        fn health(&self) -> &ProxyHealth {
+            &self.health
+        }
+        async fn dial_tcp(
+            &self,
+            _: &Metadata,
+        ) -> meow_common::Result<Box<dyn meow_common::ProxyConn>> {
+            Err(meow_common::MeowError::NotSupported("no tcp".into()))
+        }
+        async fn dial_udp(&self, _: &Metadata) -> meow_common::Result<Box<dyn ProxyPacketConn>> {
+            Ok(Box::new(Conn(Arc::clone(&self.probe))))
+        }
+    }
+    impl Proxy for FixtureProxy {
+        fn alive(&self) -> bool {
+            true
+        }
+        fn alive_for_url(&self, _: &str) -> bool {
+            true
+        }
+        fn last_delay(&self) -> u16 {
+            0
+        }
+        fn last_delay_for_url(&self, _: &str) -> u16 {
+            0
+        }
+        fn delay_history(&self) -> Vec<meow_common::DelayHistory> {
+            vec![]
+        }
+    }
+    fn fixture() -> (Tunnel, FlowSpec, mpsc::Sender<Vec<u8>>, Arc<Probe>) {
+        let probe = Arc::new(Probe::default());
+        let tunnel = crate::test_rule_tunnel();
+        let mut config = meow_config::rebuild_from_raw(&Default::default()).unwrap();
+        config.proxies.insert(
+            "cleanup-fixture".into(),
+            Arc::new(FixtureProxy {
+                probe: Arc::clone(&probe),
+                health: ProxyHealth::new(),
+            }),
+        );
+        tunnel.update_proxies(config.proxies, config.dialer_registry);
+        tunnel.update_rules(vec![Box::new(meow_rules::final_rule::FinalRule::new(
+            "cleanup-fixture",
+        ))]);
+        let (tx, rx) = mpsc::channel(1);
+        let (reply_tx, _reply_rx) = mpsc::channel(1);
+        let spec = FlowSpec {
+            rx,
+            reply_tx,
+            key: (([10, 0, 0, 2], 12345).into(), ([192, 0, 2, 1], 443).into()),
+            udp_timeout: Duration::from_secs(60),
+            in_name: "tun".into(),
+            last_activity: Arc::new(AtomicU64::new(0)),
+            sniffer: None,
+        };
+        (tunnel, spec, tx, probe)
+    }
+
+    #[tokio::test]
+    async fn tun_udp_exit_joins_reader_before_closing_conn() {
+        let (tunnel, spec, tx, probe) = fixture();
+        let stop = async {
+            probe.reading.notified().await;
+            drop(tx);
+        };
+        // Poll the real relay in this task: after it returns, the assertion
+        // runs before a detached reader can incidentally get scheduled.
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(relay_flow(&tunnel, spec), stop)
+        })
+        .await
+        .unwrap();
+        assert!(result.is_ok());
+        assert!(
+            !probe.closed_while_reading.load(Ordering::SeqCst),
+            "connection closed while the reader still owned an in-flight read"
+        );
+        assert!(probe.read_dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn tun_udp_cancel_does_not_detach_reader() {
+        let (tunnel, spec, _tx, probe) = fixture();
+        let flow = tokio::spawn(async move { relay_flow(&tunnel, spec).await });
+        tokio::time::timeout(Duration::from_secs(2), probe.reading.notified())
+            .await
+            .unwrap();
+        flow.abort();
+        assert!(flow.await.unwrap_err().is_cancelled());
+        let released =
+            tokio::time::timeout(Duration::from_secs(2), probe.conn_dropped.notified()).await;
+        // Also release the baseline's leaked task, so a red test leaves no
+        // fixture task waiting indefinitely.
+        probe.release_read.notify_one();
+        assert!(
+            released.is_ok(),
+            "cancelled flow detached its reader and packet connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn tun_udp_flush_during_write_joins_reader() {
+        let (tunnel, spec, tx, probe) = fixture();
+        tx.send(vec![1]).await.unwrap();
+        let flush = async {
+            probe.reading.notified().await;
+            probe.writing.notified().await;
+            tunnel.close_all_udp_sessions();
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(relay_flow(&tunnel, spec), flush)
+        })
+        .await
+        .unwrap();
+        assert!(result.is_ok());
+        assert!(!probe.closed_while_reading.load(Ordering::SeqCst));
+        assert!(probe.read_dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn tun_udp_reader_error_finishes_without_rejoining_consumed_task() {
+        let (tunnel, spec, tx, probe) = fixture();
+        tx.send(vec![1]).await.unwrap(); // pending write must not hide reader death
+        let finish = async {
+            probe.reading.notified().await;
+            probe.release_read.notify_one();
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(relay_flow(&tunnel, spec), finish)
+        })
+        .await
+        .unwrap();
+        assert!(result.unwrap_err().contains("fixture reader ended"));
+        assert!(!probe.closed_while_reading.load(Ordering::SeqCst));
     }
 }

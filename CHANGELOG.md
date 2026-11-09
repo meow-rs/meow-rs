@@ -160,6 +160,9 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- TUN UDP flows join their reply reader before closing the packet connection;
+  cancelling a flow also cancels its reader instead of leaving it detached.
+
 - **A live fake-IP allocation wins routing over a conflicting sniffed
   name.** When the fake-IP pool maps the flow's destination to a domain
   (#908), a sniffed SNI/Host that differs no longer selects another
