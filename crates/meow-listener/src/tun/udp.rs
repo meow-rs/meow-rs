@@ -247,7 +247,13 @@ pub(super) async fn run_udp(
             packet = incoming.next() => packet,
             done = flow_tasks.join_next(), if !flow_tasks.is_empty() => {
                 if let Some(Err(error)) = done {
-                    debug!("tun UDP flow task: {error}");
+                    // Cancellation is the normal loop-shutdown path; a panic
+                    // is a flow-task bug and must be audible at default level.
+                    if error.is_panic() {
+                        warn!("tun UDP flow task survived a panic: {error}");
+                    } else {
+                        debug!("tun UDP flow task: {error}");
+                    }
                 }
                 // Reap completions even with no incoming packets; otherwise
                 // finished task records accumulate for the listener lifetime.
@@ -1239,7 +1245,7 @@ mod cleanup_tests {
     }
 
     async fn loop_stop_releases_blocked_flow(abort: bool) {
-        let (tunnel, spec, _unused_tx, probe) = fixture();
+        let (tunnel, spec, _keepalive_tx, probe) = fixture();
         let flush = tunnel.clone();
         let (incoming_tx, incoming) = mpsc::channel(1);
         let (replies, _reply_rx) = mpsc::channel(1);
