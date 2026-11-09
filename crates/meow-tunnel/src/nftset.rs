@@ -165,10 +165,13 @@ struct HookState {
     seen: HashMap<IpAddr, Instant>,
     /// Per family (v4, v6): the set rejected an element timeout (no `flags
     /// timeout`).
+    #[cfg(target_os = "linux")]
     no_timeout: [bool; 2],
+    #[cfg(target_os = "linux")]
     warned: bool,
 }
 
+#[cfg(target_os = "linux")]
 const SEEN_CAP: usize = 8192;
 
 impl NftsetHook {
@@ -180,7 +183,9 @@ impl NftsetHook {
                 #[cfg(target_os = "linux")]
                 writer: None,
                 seen: HashMap::new(),
+                #[cfg(target_os = "linux")]
                 no_timeout: [false; 2],
+                #[cfg(target_os = "linux")]
                 warned: false,
             }),
         }
