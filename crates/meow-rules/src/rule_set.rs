@@ -551,21 +551,27 @@ impl<'a> ClassicalRuleSetBuilder<'a> {
                 "'{entry}': MATCH is not allowed in a classical rule-set"
             ));
         }
+        // Classical rules have no target column. Every byte after the first
+        // comma belongs to the regex, including repetition bounds and commas.
+        if first_field == "DOMAIN-REGEX" {
+            let pattern = entry.split_once(',').map_or("", |(_, tail)| tail.trim());
+            if pattern.is_empty() {
+                return Err(format!("'{entry}': missing payload"));
+            }
+            let rule = crate::domain_regex::DomainRegexRule::new(
+                pattern,
+                crate::parser::LOGIC_INNER_PLACEHOLDER,
+            )
+            .map_err(|error| format!("'{entry}': invalid regex: {error}"))?;
+            self.rules.push(Box::new(rule));
+            return Ok(());
+        }
         // An empty or missing payload silently degrades to match-all for
         // the substring-match types (`DOMAIN-SUFFIX,` → ends_with(""),
         // `DOMAIN-KEYWORD,` → contains("") — same as `FinalRule`). Same
         // class as MATCH — reject loudly (Class B, ADR-0002).
         if fields.next().map_or("", str::trim).is_empty() {
             return Err(format!("'{entry}': missing payload"));
-        }
-        // Comma-safe upstream regex payloads cannot be spliced
-        // unambiguously — the truncated payload could still be a
-        // valid-but-different regex. Reject loudly (Class B, ADR-0002).
-        if first_field == "DOMAIN-REGEX" && fields.next().is_some() {
-            return Err(format!(
-                "'{entry}': {first_field} payloads containing commas are \
-                 not supported in a classical rule-set"
-            ));
         }
         let patched = splice_placeholder_adapter(entry);
         match parse_rule(&patched, self.ctx) {
@@ -709,9 +715,8 @@ mod tests {
         assert!(!set.matches(&meta_host("nope.example"), &helper()));
         assert!(set.matches(&meta_host("fine.example"), &helper()));
 
-        // A comma-containing DOMAIN-REGEX payload cannot be represented —
-        // the entry must be rejected, not silently truncated to a
-        // different regex (`DOMAIN-REGEX,a,b` → regex "a").
+        // A classical regex has no target column: preserve the entire tail
+        // rather than truncating it to a different expression.
         let set = ClassicalRuleSet::from_entries(
             &[
                 "DOMAIN-REGEX,a,b".to_string(),
@@ -719,7 +724,9 @@ mod tests {
             ],
             &ParserContext::empty(),
         );
-        assert_eq!(set.len(), 1, "the ambiguous DOMAIN-REGEX must be dropped");
+        assert_eq!(set.len(), 2);
+        assert!(set.matches(&meta_host("a,b"), &helper()));
+        assert!(!set.matches(&meta_host("a"), &helper()));
         assert!(set.matches(&meta_host("ok.example"), &helper()));
 
         // Empty/missing payloads must not silently degrade to match-all
@@ -738,6 +745,50 @@ mod tests {
         // without the guard the set would match every connection.
         assert!(!set.matches(&meta_host(""), &helper()));
         assert!(set.matches(&meta_host("ok.example"), &helper()));
+    }
+
+    #[test]
+    fn classical_regex_preserves_comma_payloads() {
+        for (pattern, yes, no) in [
+            (
+                r"^api[0-9]{1,3}\.example$",
+                "api123.example",
+                "api1234.example",
+            ),
+            (r"^a,b\.example$", "a,b.example", "a.example"),
+            (r",example$", "a,example", "aexample"),
+            (
+                r"^node[0-9]{2,}\.example$",
+                "node123.example",
+                "node1.example",
+            ),
+        ] {
+            let ctx = ParserContext::empty();
+            let mut builder = ClassicalRuleSetBuilder::new(&ctx);
+            builder
+                .push_checked(&format!("DOMAIN-REGEX,{pattern}"))
+                .unwrap();
+            let set = builder.build();
+            assert_eq!(set.len(), 1);
+            assert!(set.matches(&meta_host(yes), &helper()), "{pattern}");
+            assert!(!set.matches(&meta_host(no), &helper()), "{pattern}");
+        }
+    }
+
+    #[test]
+    fn classical_regex_rejects_empty_and_malformed_payloads() {
+        let ctx = ParserContext::empty();
+        let mut builder = ClassicalRuleSetBuilder::new(&ctx);
+        for entry in [
+            "DOMAIN-REGEX",
+            "DOMAIN-REGEX,",
+            "DOMAIN-REGEX,  ",
+            "DOMAIN-REGEX,[",
+            "DOMAIN-REGEX,a{3,2}",
+        ] {
+            assert!(builder.push_checked(entry).is_err(), "{entry}");
+        }
+        assert_eq!(builder.build().len(), 0);
     }
 
     #[test]

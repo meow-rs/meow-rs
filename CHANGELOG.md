@@ -167,6 +167,9 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- Classical rule providers preserve commas in `DOMAIN-REGEX` payloads, including
+  repetition bounds such as `{1,3}`, rather than rejecting valid expressions.
+
 - TUN UDP connection refresh now cancels pending QUIC sniffing, DNS resolution,
   route selection and outbound dialing, without waiting for establishment to
   finish on an obsolete network binding.
