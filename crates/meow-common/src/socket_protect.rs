@@ -633,21 +633,29 @@ async fn resolve_via_hook(
 /// consulted, but the protector still applies to the literal dial.
 pub async fn connect_tcp_host(host: &str, port: u16) -> io::Result<TcpStream> {
     let addrs = resolve_addrs(host, port).await?;
-    let mut last_err: Option<io::Error> = None;
-    for addr in &addrs {
-        match connect_tcp(*addr).await {
+    let result = connect_resolved_candidates(addrs, connect_tcp).await;
+    if result.is_err() {
+        sys_cache_evict(host);
+    }
+    result
+}
+
+// Behavior-preserving seam for deterministic candidate scheduling regressions.
+async fn connect_resolved_candidates<T, F, Fut>(
+    addrs: Vec<SocketAddr>,
+    mut dial: F,
+) -> io::Result<T>
+where
+    F: FnMut(SocketAddr) -> Fut,
+    Fut: std::future::Future<Output = io::Result<T>>,
+{
+    let mut last_err = None;
+    for addr in addrs {
+        match dial(addr).await {
             Ok(stream) => return Ok(stream),
-            Err(e) => {
-                // An errno-backed failure (e.g. EMFILE on socket()) must
-                // not be masked by a later errno-less error — it carries
-                // the local-vs-member classification (issue #668).
-                last_err = crate::MeowError::prefer_errno_io(last_err, e);
-            }
+            Err(error) => last_err = crate::MeowError::prefer_errno_io(last_err, error),
         }
     }
-    // Every candidate failed — drop any cached system entry so the next dial
-    // re-resolves. No-op for the literal / resolver-hook paths (not cached).
-    sys_cache_evict(host);
     Err(last_err.unwrap_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1396,5 +1404,32 @@ mod tests {
         assert_eq!(r.count(), 2, "the guard must not leak across calls");
 
         clear_host_resolver();
+    }
+}
+
+#[cfg(test)]
+mod candidate_progress_regression {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_first_family_does_not_starve_reachable_second_family() {
+        let addrs = vec![
+            "[::1]:443".parse().unwrap(),
+            "127.0.0.1:443".parse().unwrap(),
+        ];
+        let result = tokio::time::timeout(
+            crate::dial::DIAL_TIMEOUT,
+            connect_resolved_candidates(addrs, |addr| async move {
+                if addr.is_ipv6() {
+                    std::future::pending::<()>().await;
+                }
+                Ok(addr)
+            }),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "reachable IPv4 candidate must be tried before the dial deadline"
+        );
     }
 }
