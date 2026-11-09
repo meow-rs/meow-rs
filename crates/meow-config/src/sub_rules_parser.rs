@@ -20,7 +20,7 @@ use meow_rules::sub_rule::{SubRuleBlock, SubRuleRule};
 use meow_rules::{ParserContext, RuleSet};
 use tracing::warn;
 
-use crate::rule_parser::parse_one_rule_or_subrule;
+use crate::rule_parser::{domain_payload_defect, parse_one_rule_or_subrule};
 
 /// Resolved sub-rule blocks keyed by name.
 pub type SubRuleBlocks = HashMap<String, SubRuleBlock>;
@@ -35,12 +35,16 @@ pub type SubRuleBlocks = HashMap<String, SubRuleBlock>;
 /// - undefined block reference (Class A per ADR-0002)
 /// - cycle in the reference graph (Class A per ADR-0002)
 ///
-/// Warns (Class B):
+/// Warns (Class B; `strict: true` promotes them to errors like `rules:`):
 /// - empty block (parses successfully but always falls through at match time)
+/// - dead / match-all domain rule payloads inside block bodies — the same
+///   `domain_payload_defect` check `rules:` applies, which previously ran
+///   on top-level lines only (issue #869)
 pub fn parse_sub_rules(
     raw: &HashMap<String, Vec<String>>,
     providers: &HashMap<String, Arc<dyn RuleSet>>,
     ctx: &ParserContext,
+    strict: bool,
 ) -> Result<SubRuleBlocks, anyhow::Error> {
     let references = build_reference_graph(raw)?;
     let order = topo_order_with_cycle_check(raw, &references)?;
@@ -63,6 +67,13 @@ pub fn parse_sub_rules(
             }
             let rule = parse_one_rule_or_subrule(line, providers, ctx, &resolved)
                 .map_err(|e| anyhow!("sub-rule '{block_name}': {e}"))?;
+            if let Some(reason) = domain_payload_defect(rule.as_ref()) {
+                let message = format!("sub-rules '{block_name}': '{line}' has {reason}");
+                if strict {
+                    return Err(anyhow!("{message} (strict mode)"));
+                }
+                warn!("{message}");
+            }
             rules.push(rule);
         }
         resolved.insert(block_name, Arc::new(rules));
@@ -243,13 +254,37 @@ mod tests {
             ("b", &["SUB-RULE,a,junk"]),
         ]);
         let providers = HashMap::new();
-        let err = parse_sub_rules(&raw_map, &providers, &ParserContext::default())
+        let err = parse_sub_rules(&raw_map, &providers, &ParserContext::default(), false)
             .err()
             .expect("SUB-RULE,a,junk inside a block body must fail");
         assert!(
             err.to_string().contains("trailing"),
             "unexpected error: {err}"
         );
+    }
+
+    /// Dead and match-all domain payloads inside a block body are flagged
+    /// by the same `domain_payload_defect` pass `rules:` uses (issue
+    /// #869): lenient keeps the block and warns, strict fails the load.
+    #[test]
+    fn domain_payload_defects_inside_block_warn_lenient_error_strict() {
+        let providers = HashMap::new();
+        for (line, needle) in [
+            ("DOMAIN,x.com.,DIRECT", "dead domain payload"),
+            ("DOMAIN-KEYWORD,,DIRECT", "matches every flow"),
+        ] {
+            let raw_map = raw(&[("a", &[line])]);
+            let block = parse_sub_rules(&raw_map, &providers, &ParserContext::default(), false)
+                .expect("lenient mode keeps the defective payload");
+            assert_eq!(block["a"].len(), 1, "{line}");
+            let err = parse_sub_rules(&raw_map, &providers, &ParserContext::default(), true)
+                .err()
+                .unwrap_or_else(|| panic!("strict mode must reject {line:?}"));
+            assert!(
+                err.to_string().contains(needle) && err.to_string().contains("sub-rules 'a'"),
+                "{line}: unexpected error {err}"
+            );
+        }
     }
 
     #[test]

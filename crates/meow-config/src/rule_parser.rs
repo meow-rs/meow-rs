@@ -54,35 +54,12 @@ pub fn parse_rules_full(
                 // A domain rule payload that can never equal/match the
                 // normalized `Metadata::rule_host()` it is compared
                 // against is dead config — the same dead-key concept the
-                // DNS-side trie surfaces flag (issue #822 shape). Scope
-                // per rule type (meow-rules/src/domain_key.rs):
-                //   DOMAIN/DOMAIN-SUFFIX — an empty label (`a..b`), a
-                //     leading/trailing dot (`.x.com`, `x.com.`), or a
-                //     verbatim-dead `*`/`+` spelling (`DOMAIN,*.x.com`);
-                //   DOMAIN-WILDCARD — a literal `+` (the matcher globs
-                //     `*` only) or a dead literal label (`*.foo.`,
-                //     `a..b`);
-                //   DOMAIN-KEYWORD — `..` only (a substring needle like
-                //     `foo.` still matches `foo.bar`);
-                //   DOMAIN-REGEX — not checked (arbitrary pattern).
-                // Lenient warns and keeps the rule; strict fails the load.
-                let dead = match rule.rule_type() {
-                    RuleType::Domain | RuleType::DomainSuffix => {
-                        meow_rules::domain_rule_payload_is_dead(rule.payload())
-                    }
-                    RuleType::DomainWildcard => {
-                        meow_rules::domain_wildcard_payload_is_dead(rule.payload())
-                    }
-                    RuleType::DomainKeyword => {
-                        meow_rules::domain_keyword_payload_is_dead(rule.payload())
-                    }
-                    _ => false,
-                };
-                if dead {
-                    let message = format!(
-                        "rules: '{line}' has a dead domain payload — it can never \
-                         match a normalized host"
-                    );
+                // DNS-side trie surfaces flag (issue #822 shape) — and an
+                // empty `DOMAIN-KEYWORD` needle is the reverse defect, a
+                // silent match-all (issue #869). Lenient warns and keeps
+                // the rule; strict fails the load.
+                if let Some(reason) = domain_payload_defect(rule.as_ref()) {
+                    let message = format!("rules: '{line}' has {reason}");
                     if strict {
                         return Err(anyhow::anyhow!("{message} (strict mode)"));
                     }
@@ -99,6 +76,40 @@ pub fn parse_rules_full(
         }
     }
     Ok(rules)
+}
+
+/// Classify the domain-payload defect a parsed rule carries, if any —
+/// the observability pass shared by `rules:` (above) and `sub-rules:`
+/// bodies (`sub_rules_parser`). Returns the warn/error descriptor for
+/// the caller's message; `None` when the payload is live or unchecked.
+/// Scope per rule type (meow-rules/src/domain_key.rs):
+///   DOMAIN/DOMAIN-SUFFIX — an empty label (`a..b`), a
+///     leading/trailing dot (`.x.com`, `x.com.`), or a verbatim-dead
+///     `*`/`+` spelling (`DOMAIN,*.x.com`);
+///   DOMAIN-WILDCARD — a literal `+` (the matcher globs `*` only) or a
+///     dead literal label (`*.foo.`, `a..b`);
+///   DOMAIN-KEYWORD — `..` or a byte no normalized host can carry (`*`,
+///     `+`, `?`, space) is dead; the empty needle is flagged apart as a
+///     match-all, not dead;
+///   DOMAIN-REGEX — not checked (arbitrary pattern).
+pub(crate) fn domain_payload_defect(rule: &dyn Rule) -> Option<&'static str> {
+    if rule.rule_type() == RuleType::DomainKeyword
+        && meow_rules::domain_keyword_payload_matches_all(rule.payload())
+    {
+        return Some(
+            "an empty DOMAIN-KEYWORD payload — `contains(\"\")` is always true, so the rule \
+             silently matches every flow; use 'MATCH' to catch all",
+        );
+    }
+    let dead = match rule.rule_type() {
+        RuleType::Domain | RuleType::DomainSuffix => {
+            meow_rules::domain_rule_payload_is_dead(rule.payload())
+        }
+        RuleType::DomainWildcard => meow_rules::domain_wildcard_payload_is_dead(rule.payload()),
+        RuleType::DomainKeyword => meow_rules::domain_keyword_payload_is_dead(rule.payload()),
+        _ => false,
+    };
+    dead.then_some("a dead domain payload — it can never match a normalized host")
 }
 
 /// Parse a single rule line. Handles `RULE-SET,<name>,...`,
@@ -256,8 +267,14 @@ mod tests {
             "DOMAIN-WILDCARD,a..b,REJECT",
             "DOMAIN-WILDCARD,foo.,REJECT",
             "DOMAIN-WILDCARD,+.wild.example,REJECT",
-            // DOMAIN-KEYWORD: `..` can never appear in a host.
+            // DOMAIN-KEYWORD: `..` can never appear in a host, and neither
+            // can any byte outside the `is_valid_host` alphabet — `*`,
+            // `+`, `?`, space, `/` (issue #869).
             "DOMAIN-KEYWORD,a..b,REJECT",
+            "DOMAIN-KEYWORD,x+y,REJECT",
+            "DOMAIN-KEYWORD,foo?bar,REJECT",
+            "DOMAIN-KEYWORD,foo*bar,REJECT",
+            "DOMAIN-KEYWORD,a/b,REJECT",
         ] {
             let raw = vec![line.to_string()];
             let cap = WarnCapture::start();
@@ -276,6 +293,33 @@ mod tests {
                 "{line}: unexpected error {err}"
             );
         }
+    }
+
+    /// An empty `DOMAIN-KEYWORD` needle is the reverse defect — not dead
+    /// but a silent match-all (`contains("")` is always true, so the rule
+    /// swallows every flow, host-less IP flows included, and short-
+    /// circuits every rule below it). It gets its own warning naming the
+    /// catch-all, not the dead-payload one (issue #869).
+    #[test]
+    fn empty_domain_keyword_payload_warns_match_all_lenient_errors_strict() {
+        use crate::test_support::WarnCapture;
+        let ctx = ParserContext::default();
+        let raw = vec!["DOMAIN-KEYWORD,,REJECT".to_string()];
+        let cap = WarnCapture::start();
+        let rules = parse_rules(&raw, &ctx, false).expect("lenient mode keeps the rule");
+        let warns = cap.take();
+        assert_eq!(rules.len(), 1, "lenient mode must keep the rule");
+        assert!(
+            warns.contains("matches every flow") && warns.contains("DOMAIN-KEYWORD,,REJECT"),
+            "the silent match-all must be surfaced, got: {warns}"
+        );
+        let err = parse_rules(&raw, &ctx, true)
+            .err()
+            .expect("strict mode must reject the empty keyword");
+        assert!(
+            err.to_string().contains("matches every flow"),
+            "unexpected error {err}"
+        );
     }
 
     /// The payload check must not false-positive: legal payloads on every

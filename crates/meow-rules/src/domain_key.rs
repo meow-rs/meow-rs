@@ -24,10 +24,13 @@
 //! `DOMAIN-WILDCARD` gets [`domain_wildcard_payload_is_dead`] (a
 //! literal `+` — the matcher globs `*` only — or a dead literal
 //! label); `DOMAIN-KEYWORD` gets [`domain_keyword_payload_is_dead`]
-//! (`..` only — a `foo.` needle still matches `foo.bar` as a
-//! substring). `DOMAIN-REGEX` is not checked: its payload is an
-//! arbitrary pattern, so whether it can match a normalized host is
-//! not decidable by label inspection.
+//! (`..` or a byte no normalized host can carry — a `foo.` needle
+//! still matches `foo.bar` as a substring) plus
+//! [`domain_keyword_payload_matches_all`] for the empty needle,
+//! which is not dead but the opposite — a silent match-all.
+//! `DOMAIN-REGEX` is not checked: its payload is an arbitrary
+//! pattern, so whether it can match a normalized host is not
+//! decidable by label inspection.
 
 /// The defect a domain key carries on a `DomainTrie` surface, if any.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,8 +143,13 @@ pub fn domain_wildcard_payload_is_dead(payload: &str) -> bool {
 }
 
 /// True when a `DOMAIN-KEYWORD` `rules:` payload can never match: the
-/// keyword is a substring probe against `rule_host()`, and no normalized
-/// host contains an empty label, so only `..` is dead.
+/// keyword is a substring probe against `rule_host()`, whose producers
+/// (`Metadata::host` at every ingress, `sniff_host` from the SNI/Host
+/// sniffers) all pass `is_valid_host` — so the bytes a normalized host
+/// can carry are DNS-label bytes (`[0-9a-zA-Z._-]`) and IP-literal
+/// bytes (`:` and `[`/`]` for IPv6). A needle holding `..` or any byte
+/// outside that alphabet (`*`, `+`, `?`, a space, non-ASCII, …) can
+/// never be a substring of a rule host.
 ///
 /// A trailing-dot keyword (`evil.com.`) is *live* and must not be
 /// flagged — it still matches superstrings like `evil.com.au` where the
@@ -152,9 +160,30 @@ pub fn domain_wildcard_payload_is_dead(payload: &str) -> bool {
 /// `DOMAIN-REGEX` like `^foo\.$`, which the check does not cover at
 /// all — a documented residual of the trailing-dot normalization.
 ///
+/// An *empty* needle is not dead either — `contains("")` is always
+/// true — so it is flagged by [`domain_keyword_payload_matches_all`]
+/// instead of here.
+///
 /// [`Metadata::rule_host`]: meow_common::Metadata::rule_host
 pub fn domain_keyword_payload_is_dead(payload: &str) -> bool {
     payload.contains("..")
+        || payload.bytes().any(|b| {
+            !matches!(
+                b,
+                b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z' | b'.' | b'-' | b'_' | b':' | b'[' | b']'
+            )
+        })
+}
+
+/// True when a `DOMAIN-KEYWORD` `rules:` payload is empty: the needle is
+/// the payload verbatim (parser-trimmed before `DomainKeywordRule::new`),
+/// and `host.contains("")` is always true, so the rule silently matches
+/// *every* flow — host-less IP flows included — and short-circuits every
+/// rule below it. Not dead, the opposite, so it gets its own flag: a
+/// `DOMAIN-KEYWORD,,X` line is almost always a comma slip for `MATCH,X`
+/// (issue #869).
+pub fn domain_keyword_payload_matches_all(payload: &str) -> bool {
+    payload.is_empty()
 }
 
 #[cfg(test)]
@@ -274,20 +303,52 @@ mod tests {
         }
     }
 
-    /// DOMAIN-KEYWORD is a substring probe: only `..` can never appear in
-    /// a normalized host. `foo.` stays live — it matches `foo.bar`.
+    /// DOMAIN-KEYWORD is a substring probe: `..` and any byte outside
+    /// the `is_valid_host` alphabet (`*`, `+`, `?`, space, non-ASCII)
+    /// can never appear in a normalized host. `foo.` stays live — it
+    /// matches `foo.bar`; `:`/`[`/`]` stay live for IPv6-literal rule
+    /// hosts.
     #[test]
     fn domain_keyword_payload_is_dead_matrix() {
-        for payload in ["a..b", "..x", "x..", "foo..bar"] {
+        for payload in [
+            "a..b",
+            "..x",
+            "x..",
+            "foo..bar",
+            "*",
+            "+",
+            "x+y",
+            "foo?",
+            "a b",
+            "a/b",
+            "a@b",
+            "caf\u{e9}",
+            "a,b",
+        ] {
             assert!(
                 domain_keyword_payload_is_dead(payload),
                 "{payload:?} is a dead keyword payload"
             );
         }
-        for payload in ["foo.", ".foo", "foo.bar", "x", "*", "+", ""] {
+        for payload in ["foo.", ".foo", "foo.bar", "x", ":53", "[2001", "a-b_c", ""] {
             assert!(
                 !domain_keyword_payload_is_dead(payload),
                 "{payload:?} is a live keyword payload"
+            );
+        }
+    }
+
+    /// The empty needle is the opposite of dead — `contains("")` is
+    /// always true, so `DOMAIN-KEYWORD,,X` silently matches every flow.
+    /// It is flagged by `domain_keyword_payload_matches_all`, not by the
+    /// dead check (issue #869).
+    #[test]
+    fn domain_keyword_payload_matches_all_flags_empty_only() {
+        assert!(domain_keyword_payload_matches_all(""));
+        for payload in ["x", "foo.", " ", "*"] {
+            assert!(
+                !domain_keyword_payload_matches_all(payload),
+                "{payload:?} is not the match-all needle"
             );
         }
     }

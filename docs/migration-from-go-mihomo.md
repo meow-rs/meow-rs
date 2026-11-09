@@ -582,11 +582,19 @@ spelling (`DOMAIN,*.x.com` can never equal a host — `*` belongs on
 subdomains, so `+.` adds nothing);
 `DOMAIN-WILDCARD` flags a literal `+` — its matcher globs `*` only, so
 `+.x.com` is dead there too — plus dead literal labels; `DOMAIN-KEYWORD`
-flags `..` only (a `foo.` needle still matches `foo.bar` as a substring,
-though it no longer hits the bare `foo` under trailing-dot
-normalization — the same residual applies to an anchored
-`DOMAIN-REGEX` like `^foo\.$`, which is otherwise not checked: an
-arbitrary pattern's reachability is not decidable by label inspection).
+flags `..` and any byte no normalized host can carry (`*`, `+`, `?`, a
+space, non-ASCII — every `host`/`sniff_host` producer passes the
+hostname gate, so such a needle is never a substring) — a `foo.` needle
+still matches `foo.bar` as a substring, though it no longer hits the
+bare `foo` under trailing-dot normalization — the same residual applies
+to an anchored `DOMAIN-REGEX` like `^foo\.$`, which is otherwise not
+checked: an arbitrary pattern's reachability is not decidable by label
+inspection. Two more surfaces get the same pass: `sub-rules:` bodies
+flag the defects above inside each block, and an *empty*
+`DOMAIN-KEYWORD` needle is flagged separately — `contains("")` is
+always true, so `DOMAIN-KEYWORD,,X` silently matches every flow rather
+than dying (a comma slip for `MATCH,X`), which mihomo also accepts as a
+match-all.
 
 ---
 
