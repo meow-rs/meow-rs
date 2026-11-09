@@ -88,7 +88,22 @@ jobs:
           cache-on-failure: true
           key: powerset-daily
 
+      - name: Cache cargo-hack
+        id: cache-cargo-hack
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.install-action/bin/cargo-hack*
+            ~/.cargo/bin/cargo-hack*
+          # bump the -v1 suffix to refresh the cached binary.
+          key: install-action-cargo-hack-${{ runner.os }}-${{ runner.arch }}-v1
+
+      - name: Restore cargo-hack PATH
+        if: steps.cache-cargo-hack.outputs.cache-hit == 'true' && runner.os != 'Windows'
+        run: echo "$HOME/.install-action/bin" >> "$GITHUB_PATH"
+
       - name: Install cargo-hack
+        if: steps.cache-cargo-hack.outputs.cache-hit != 'true'
         uses: taiki-e/install-action@cargo-hack
 
       # --no-dev-deps: dev-dependencies are irrelevant to a compile check and

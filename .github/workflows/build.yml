@@ -329,15 +329,24 @@ jobs:
             echo "Size check passed: ${SIZE} <= ${BUDGET}"
           fi
 
+      - name: Cache wintun.dll
+        if: runner.os == 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: dist/wintun
+          key: wintun-${{ matrix.target }}-${{ hashFiles('scripts/fetch-wintun.sh') }}
+
       - name: Fetch wintun.dll
         if: runner.os == 'Windows'
         shell: bash
         run: |
           # Official signed Wintun DLL (https://www.wintun.net/). Required
           # for the Windows TUN inbound / transparent-proxy path.
-          bash scripts/fetch-wintun.sh \
-            --target "${{ matrix.target }}" \
-            --outdir dist/wintun
+          if [ ! -f dist/wintun/wintun.dll ]; then
+            bash scripts/fetch-wintun.sh \
+              --target "${{ matrix.target }}" \
+              --outdir dist/wintun
+          fi
 
       - name: Package archive
         id: pkg
