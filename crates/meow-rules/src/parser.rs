@@ -82,7 +82,7 @@ impl ParserContext {
 /// the inner text per level, so an unbounded line overflows the stack and
 /// amplifies transient allocation (issue #533 review).
 const MAX_LOGIC_DEPTH: usize = 64;
-const MAX_RULE_LINE_LEN: usize = 64 * 1024;
+pub(crate) const MAX_RULE_LINE_LEN: usize = 64 * 1024;
 
 /// Named rule-providers a `RULE-SET,<name>` sub-rule can reference.
 pub type RuleSets = HashMap<String, Arc<dyn RuleSet>>;

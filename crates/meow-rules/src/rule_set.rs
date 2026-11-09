@@ -554,6 +554,12 @@ impl<'a> ClassicalRuleSetBuilder<'a> {
         // Classical rules have no target column. Every byte after the first
         // comma belongs to the regex, including repetition bounds and commas.
         if first_field == "DOMAIN-REGEX" {
+            // This path bypasses parse_rule, but must retain its input bound
+            // before allocating or compiling an untrusted provider expression.
+            let max_len = crate::parser::MAX_RULE_LINE_LEN;
+            if entry.len() > max_len {
+                return Err(format!("rule line exceeds {max_len} bytes"));
+            }
             let pattern = entry.split_once(',').map_or("", |(_, tail)| tail.trim());
             if pattern.is_empty() {
                 return Err(format!("'{entry}': missing payload"));
@@ -773,6 +779,26 @@ mod tests {
             assert!(set.matches(&meta_host(yes), &helper()), "{pattern}");
             assert!(!set.matches(&meta_host(no), &helper()), "{pattern}");
         }
+    }
+
+    #[test]
+    fn classical_regex_enforces_rule_line_byte_limit() {
+        let ctx = ParserContext::empty();
+        let mut builder = ClassicalRuleSetBuilder::new(&ctx);
+        // Extended-mode comments make length-boundary fixtures cheap to compile.
+        let prefix = "DOMAIN-REGEX,(?x)^ok$#";
+        let at_limit = format!("{prefix}{}", "a".repeat(64 * 1024 - prefix.len()));
+        builder.push_checked(&at_limit).unwrap();
+        for suffix in ["a", "é"] {
+            let error = builder
+                .push_checked(&format!("{at_limit}{suffix}"))
+                .unwrap_err();
+            assert_eq!(error, "rule line exceeds 65536 bytes");
+        }
+        let set = builder.build();
+        assert_eq!(set.len(), 1);
+        assert!(set.matches(&meta_host("ok"), &helper()));
+        assert!(!set.matches(&meta_host("no"), &helper()));
     }
 
     #[test]
