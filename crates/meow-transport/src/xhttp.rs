@@ -264,10 +264,16 @@ impl XhttpLayer {
         let generation = self.session.generation();
 
         // Proxy-sized receive windows — see `h2_common::client_builder`.
-        let (h2, conn) = crate::h2_common::client_builder()
-            .handshake::<_, bytes::Bytes>(inner)
-            .await
-            .map_err(|e| crate::h2_common::h2_to_transport(e, TransportError::Xhttp))?;
+        // Bounded: `connect_shared` callers hold the slot's dial gate, so
+        // the handshake needs its own ceiling independent of the caller's
+        // dial deadline.
+        let (h2, conn) = tokio::time::timeout(
+            crate::h2_common::OPEN_TIMEOUT,
+            crate::h2_common::client_builder().handshake::<_, bytes::Bytes>(inner),
+        )
+        .await
+        .map_err(|_| TransportError::Xhttp("timed out in h2 handshake".into()))?
+        .map_err(|e| crate::h2_common::h2_to_transport(e, TransportError::Xhttp))?;
 
         // A failed first stream drops `session`, whose driver aborts
         // (issue #669); only a working connection is offered for reuse.

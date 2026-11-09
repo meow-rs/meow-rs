@@ -179,10 +179,16 @@ impl GrpcLayer {
 
         // Perform the HTTP/2 client handshake over the inner stream, with
         // the proxy-sized receive windows (see `h2_common::client_builder`).
-        let (h2, conn) = crate::h2_common::client_builder()
-            .handshake::<_, Bytes>(inner)
-            .await
-            .map_err(|e| crate::h2_common::h2_to_transport(e, TransportError::Grpc))?;
+        // Bounded: `connect_shared` callers hold the slot's dial gate, so
+        // the handshake needs its own ceiling independent of the caller's
+        // dial deadline.
+        let (h2, conn) = tokio::time::timeout(
+            crate::h2_common::OPEN_TIMEOUT,
+            crate::h2_common::client_builder().handshake::<_, Bytes>(inner),
+        )
+        .await
+        .map_err(|_| TransportError::Grpc("timed out in h2 handshake".into()))?
+        .map_err(|e| crate::h2_common::h2_to_transport(e, TransportError::Grpc))?;
 
         // The driver task processes h2 control frames; its last owner bounds
         // the shutdown flush (issue #669).
