@@ -83,9 +83,14 @@ pub fn parse_rules_full(
 /// bodies (`sub_rules_parser`). Returns the warn/error descriptor for
 /// the caller's message; `None` when the payload is live or unchecked.
 /// Scope per rule type (meow-rules/src/domain_key.rs):
-///   DOMAIN/DOMAIN-SUFFIX — an empty label (`a..b`), a
-///     leading/trailing dot (`.x.com`, `x.com.`), or a verbatim-dead
-///     `*`/`+` spelling (`DOMAIN,*.x.com`);
+///   DOMAIN — judged against `is_valid_host` itself (the gate every
+///     `host`/`sniff_host` producer passes): an empty label (`a..b`),
+///     a leading/trailing dot, alphabet-impossible bytes, or any
+///     unproducible host form like all-numeric `inet_aton` spellings
+///     (`DOMAIN,2130706433`);
+///   DOMAIN-SUFFIX — an empty label (`a..b`), a leading/trailing dot
+///     (`.x.com`, `x.com.`), or alphabet-impossible bytes — an
+///     all-numeric payload stays live (`x.2130706433` ends on it);
 ///   DOMAIN-WILDCARD — a literal `+` (the matcher globs `*` only) or a
 ///     dead literal label (`*.foo.`, `a..b`);
 ///   DOMAIN-KEYWORD — `..` or a byte no normalized host can carry (`*`,
@@ -151,9 +156,8 @@ pub(crate) fn domain_payload_defect(rule: &dyn Rule) -> Option<&'static str> {
         }
     }
     let dead = match rule_type {
-        RuleType::Domain | RuleType::DomainSuffix => {
-            meow_rules::domain_rule_payload_is_dead(rule.payload())
-        }
+        RuleType::Domain => meow_rules::domain_exact_payload_is_dead(rule.payload()),
+        RuleType::DomainSuffix => meow_rules::domain_rule_payload_is_dead(rule.payload()),
         RuleType::DomainWildcard => meow_rules::domain_wildcard_payload_is_dead(rule.payload()),
         RuleType::DomainKeyword => meow_rules::domain_keyword_payload_is_dead(rule.payload()),
         _ => false,
@@ -314,6 +318,13 @@ mod tests {
             "DOMAIN,a?b,REJECT",
             "DOMAIN-SUFFIX,a@b,REJECT",
             "DOMAIN,bücher.example,REJECT",
+            // `DOMAIN` compares verbatim, so its oracle is `is_valid_host`
+            // itself: all-numeric non-IP spellings (`inet_aton` forms) are
+            // hosts no listener ever produces, while `10.0.0.1`/`0x...`
+            // stay live (IP-literal arm / letter-bearing names).
+            "DOMAIN,2130706433,REJECT",
+            "DOMAIN,0177.0.0.1,REJECT",
+            "DOMAIN,123.456,REJECT",
             // DOMAIN-WILDCARD: dead literal labels (`*` segments are
             // globs and never count), and any literal byte no host
             // carries — the matcher has no `?`/`+` glob, so those are
@@ -474,9 +485,18 @@ mod tests {
             "DOMAIN,_dmarc.example,REJECT".to_string(),
             "DOMAIN,xn--nxasmq6b.example,REJECT".to_string(),
             "DOMAIN-SUFFIX,3.4.5.6,REJECT".to_string(),
+            // IP-shaped and all-numeric payloads the exact/suffix oracles
+            // must keep live: `DOMAIN,ip` matches IP-literal flows,
+            // `0x7f000001` is a letter-bearing name a client can send,
+            // and an all-numeric suffix can still end a mixed host
+            // (`x.2130706433`).
+            "DOMAIN,10.0.0.1,REJECT".to_string(),
+            "DOMAIN,0x7f000001,REJECT".to_string(),
+            "DOMAIN-SUFFIX,2130706433,REJECT".to_string(),
+            "DOMAIN-SUFFIX,0.0.1,REJECT".to_string(),
         ];
         let rules = parse_rules(&raw, &ctx, true).expect("live payloads must load");
-        assert_eq!(rules.len(), 13);
+        assert_eq!(rules.len(), 17);
     }
 
     /// `RULE-SET,...,src` (issue #625 item 11, upstream `isSrc`): the set

@@ -40,7 +40,7 @@ pub mod sub_rule;
 pub mod uid;
 
 pub use domain_key::{
-    domain_key_defect, domain_key_has_dead_label, domain_key_is_dead,
+    domain_exact_payload_is_dead, domain_key_defect, domain_key_has_dead_label, domain_key_is_dead,
     domain_keyword_payload_is_dead, domain_keyword_payload_matches_all,
     domain_rule_payload_is_dead, domain_wildcard_payload_is_dead, DomainKeyDefect,
 };

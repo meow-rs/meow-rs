@@ -575,12 +575,20 @@ run `meow -t` once in lenient mode — the warnings name every dead key the
 strict load would refuse, so you can fix the list first.
 
 The same dead-key concept reaches the `rules:` list per rule type, judged
-against the normalized host rules compare with: `DOMAIN`/`DOMAIN-SUFFIX`
-flag an empty label, a leading or trailing dot, or any byte the hostname
-gate can never produce — `*`, `+`, `?`, a space, non-ASCII (`DOMAIN,*.x.com`
-can never equal a host — `*` belongs on `DOMAIN-WILDCARD`, and
-`DOMAIN-SUFFIX,x.com` already covers apex plus subdomains, so `+.` adds
-nothing);
+against the normalized host rules compare with: `DOMAIN` flags its payload
+against `is_valid_host` itself — the gate every `host`/`sniff_host`
+producer passes — so besides an empty label, a leading or trailing dot, and
+any byte no hostname carries (`*`, `+`, `?`, a space, non-ASCII —
+`DOMAIN,*.x.com` can never equal a host; `*` belongs on `DOMAIN-WILDCARD`),
+all-numeric non-IP spellings like `DOMAIN,2130706433` or `DOMAIN,123.456`
+are dead too (libc `inet_aton` forms no listener produces), while
+`DOMAIN,10.0.0.1` and `DOMAIN,0x7f000001` stay live — `sniff_host` can
+still carry the literal, and `0x7f000001` is a legal hostname spelling a
+client may send. `DOMAIN-SUFFIX` keeps the label-structure check rather
+than the oracle — an all-numeric payload can still end a legal mixed host
+(`x.2130706433`), so it only flags an empty label, a leading or trailing
+dot, or alphabet-impossible bytes (`DOMAIN-SUFFIX,x.com` already covers
+apex plus subdomains, so `+.` adds nothing);
 `DOMAIN-WILDCARD` flags any literal byte outside the same alphabet —
 its matcher globs `*` only (no `?` glob either), so `+.x.com` and
 `a?b` are dead literal bytes there too — plus dead literal labels;

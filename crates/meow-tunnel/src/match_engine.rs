@@ -111,7 +111,8 @@ pub fn star_wildcard_indexable(payload: &str) -> bool {
 /// predicate matches.
 ///
 /// This is the runtime side of the dead-key concept `meow_rules::domain_key`
-/// classifies at config load (`domain_rule_payload_is_dead` warns/errs on the
+/// classifies at config load (`domain_exact_payload_is_dead` on `DOMAIN`,
+/// `domain_rule_payload_is_dead` on `DOMAIN-SUFFIX` warn/err on the
 /// same shapes): an empty label, a leading wildcard marker, or a trailing
 /// dot can never equal a normalized `rule_host()`, so the shape is kept on
 /// the linear scan instead of owning a trie slot it could never fill.

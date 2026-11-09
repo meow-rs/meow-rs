@@ -160,6 +160,16 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **`DOMAIN` payload check now consults `is_valid_host` itself** (the gate
+  every `host`/`sniff_host` producer passes), so all-numeric non-IP
+  spellings — libc `inet_aton` forms like `DOMAIN,2130706433`,
+  `DOMAIN,123.456`, `DOMAIN,0177.0.0.1` — are flagged dead as hosts no
+  listener can produce, while `DOMAIN,10.0.0.1` (`sniff_host` can still
+  carry the literal) and `DOMAIN,0x7f000001` (a letter-bearing name a
+  client may send) stay live. `DOMAIN-SUFFIX` keeps the label-structure
+  check: an all-numeric
+  payload can still end a legal mixed host (`x.2130706433`), closing the
+  last #869 dead-key item.
 - **`rules:` payload-defect check closes the #869 gaps**: empty
   `DOMAIN-KEYWORD`/`DOMAIN`/`DOMAIN-SUFFIX`/`DOMAIN-REGEX` payloads are
   no longer silently classified — the KEYWORD needle is a total
