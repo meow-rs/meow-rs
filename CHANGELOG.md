@@ -170,6 +170,12 @@ the canonical, in-repo source a release is cut from.
   check: an all-numeric
   payload can still end a legal mixed host (`x.2130706433`), closing the
   last #869 dead-key item.
+
+- TUN UDP shutdown also cancels in-flight DNS hijack queries and owns the
+  lwIP reply pump, so pending queries do not retain the stopped loop's replies.
+  Completed flows leave the table without waiting for more packets; old task
+  completions cannot remove a newer flow using the same address pair.
+
 - **`rules:` payload-defect check closes the #869 gaps**: empty
   `DOMAIN-KEYWORD`/`DOMAIN`/`DOMAIN-SUFFIX`/`DOMAIN-REGEX` payloads are
   no longer silently classified — the KEYWORD needle is a total
