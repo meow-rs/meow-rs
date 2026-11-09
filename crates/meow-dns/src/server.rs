@@ -1,8 +1,9 @@
 use crate::resolver::{AddressLookupResult, Resolver};
+use crate::response_policy::ResponseAction;
 use futures::FutureExt;
 use hickory_proto::op::{Edns, Message, MessageType, ResponseCode};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Weak};
 use tokio::net::UdpSocket;
@@ -86,6 +87,15 @@ impl LocalResponse {
             hook: None,
         }
     }
+}
+
+/// A synthesized response-rule answer: the wire response plus, when it
+/// carries an address record, the `(ip, ttl)` it emitted —
+/// `try_answer_local` hands that to the `dns.nftset` answer hook. Error
+/// replies report no emitted address.
+struct RuleAnswer {
+    response: Vec<u8>,
+    emitted: Option<(IpAddr, u32)>,
 }
 
 /// Simple DNS server that handles queries by forwarding to our resolver.
@@ -213,6 +223,26 @@ impl DnsServer {
                 resolver,
             )
             .await;
+        }
+
+        if let Some(answer) = Self::try_response_rule(data, question_len, &domain, qtype, resolver)
+        {
+            // A static-address answer feeds the nftset hook exactly like
+            // the hosts arm below — run it inline. Normally unreachable
+            // (`try_answer_local` answers matching rules first), but a
+            // resolver-generation swap mid-dispatch or a future caller
+            // skipping the probe must not skip the element add.
+            if let Some((addr, ttl)) = answer.emitted {
+                if let Some(work) = crate::answer_hook::pending(
+                    resolver,
+                    &domain,
+                    addr,
+                    std::time::Duration::from_secs(u64::from(ttl)),
+                ) {
+                    crate::answer_hook::run_blocking(work).await;
+                }
+            }
+            return Ok(answer.response);
         }
 
         // Check hosts trie first. If the domain is present in the hosts table
@@ -369,6 +399,25 @@ impl DnsServer {
             return LocalAnswer::Upstream;
         }
 
+        if let Some(answer) = Self::try_response_rule(data, question_len, &domain, qtype, resolver)
+        {
+            return LocalAnswer::Answer(LocalResponse {
+                response: answer.response,
+                // A static-address answer emits an IP the client will
+                // connect to — `dns.nftset` must see it exactly like a
+                // hosts answer. NODATA/REFUSED and error answers emit no
+                // address; `pending` drops fake-IP answers by design.
+                hook: answer.emitted.and_then(|(addr, ttl)| {
+                    crate::answer_hook::pending(
+                        resolver,
+                        &domain,
+                        addr,
+                        std::time::Duration::from_secs(u64::from(ttl)),
+                    )
+                }),
+            });
+        }
+
         let outcome = {
             // Mirror handle_query's ordering exactly: check the hosts trie
             // BEFORE the IPv6-disable short-circuit — an AAAA query for a
@@ -501,54 +550,16 @@ impl DnsServer {
         // successful `parse_question` over `query[12..]`.
         debug_assert!(12 + question_len <= query.len());
 
-        // The declared record counts feed a `Vec::with_capacity` inside
-        // the hickory decode. A datagram cannot physically hold more
-        // resource records than `len / 11` (one-byte root name plus the
-        // 10-byte record header), so an impossible count is malformed
-        // input — FORMERR before the decoder reserves megabytes for it.
-        // The wire outcome is identical either way: hickory fails the
-        // same packet at record-read EOF.
-        let arcount = u16::from_be_bytes([query[10], query[11]]);
-        let declared_records = u16::from_be_bytes([query[6], query[7]]) as usize
-            + u16::from_be_bytes([query[8], query[9]]) as usize
-            + arcount as usize;
-        // `query.len() - 12 - question_len` == remaining record-region bytes.
-        if declared_records * 11 > query.len() - 12 - question_len {
-            return Ok(Self::build_formerr(id, flags, arcount > 0));
-        }
-
-        // Parse the inbound query before spending an upstream round-trip:
-        // the question echo, RD/CD request bits and EDNS presence all come
-        // from it. A query hickory rejects where `parse_question` succeeded
-        // (duplicate OPT, OPT outside the additional section, malformed
-        // trailing records — RFC 6891 §6.1.1) is malformed input and gets
-        // FORMERR, never a forwarded lookup.
-        let Ok(req) = Message::from_vec(query) else {
-            // The request's EDNS presence is undecodable here — fall back
-            // to the raw ARCOUNT heuristic the preamble uses.
-            return Ok(Self::build_formerr(id, flags, arcount > 0));
+        let req = match Self::parse_request(query, question_len) {
+            Ok(req) => req,
+            Err(response) => return Ok(response),
         };
-
-        // Defense in depth: the preamble already drops QR=1, so this arm
-        // is unreachable — kept so the private function cannot silently
-        // forward a response packet if it ever gains another caller.
-        if req.metadata.message_type != MessageType::Query {
-            return Err("response packet cannot be forwarded".into());
-        }
-
-        // RFC 6891 §6.1.3: an EDNS version newer than implemented (0) gets
-        // BADVERS — the extended rcode rides in a version-0 response OPT.
-        if req.edns.as_ref().is_some_and(|e| e.version() > 0) {
-            let mut resp = Message::new(id, MessageType::Response, req.metadata.op_code);
-            resp.metadata.recursion_desired = req.metadata.recursion_desired;
-            resp.metadata.checking_disabled = req.metadata.checking_disabled;
-            resp.metadata.recursion_available = true;
-            resp.metadata.response_code = ResponseCode::BADVERS;
-            resp.add_queries(req.queries.iter().cloned());
-            resp.edns = req.edns.as_ref().map(Self::response_edns);
-            return Ok(resp
-                .to_vec()
-                .unwrap_or_else(|_| Self::build_servfail(id, query, flags, question_len)));
+        if let Some(action) = resolver.response_action(domain, qtype) {
+            if let Some(answer) =
+                Self::build_rule_response(&req, flags, domain, qtype, action, resolver)
+            {
+                return Ok(answer.response);
+            }
         }
 
         // The name sent upstream is the wire-faithful `Name` hickory decoded
@@ -657,6 +668,170 @@ impl DnsServer {
         Ok(resp
             .to_vec()
             .unwrap_or_else(|_| Self::build_servfail(id, query, flags, question_len)))
+    }
+
+    /// Decode once before a rule can synthesize a reply. Both address serve
+    /// arms share the generic path's bounds, FORMERR and BADVERS checks.
+    fn parse_request(query: &[u8], question_len: usize) -> Result<Message, Vec<u8>> {
+        let id = u16::from_be_bytes([query[0], query[1]]);
+        let flags = u16::from_be_bytes([query[2], query[3]]);
+        // The declared record counts feed a `Vec::with_capacity` inside
+        // the hickory decode. A datagram cannot physically hold more
+        // resource records than `len / 11` (one-byte root name plus the
+        // 10-byte record header), so an impossible count is malformed
+        // input — FORMERR before the decoder reserves megabytes for it.
+        // The wire outcome is identical either way: hickory fails the
+        // same packet at record-read EOF.
+        let arcount = u16::from_be_bytes([query[10], query[11]]);
+        let declared_records = u16::from_be_bytes([query[6], query[7]]) as usize
+            + u16::from_be_bytes([query[8], query[9]]) as usize
+            + arcount as usize;
+        // `query.len() - 12 - question_len` == remaining record-region bytes.
+        if declared_records * 11 > query.len() - 12 - question_len {
+            return Err(Self::build_formerr(id, flags, arcount > 0));
+        }
+
+        // Parse the inbound query before spending an upstream round-trip:
+        // the question echo, RD/CD request bits and EDNS presence all come
+        // from it. A query hickory rejects where `parse_question` succeeded
+        // (duplicate OPT, OPT outside the additional section, malformed
+        // trailing records — RFC 6891 §6.1.1) is malformed input and gets
+        // FORMERR, never a forwarded lookup.
+        let Ok(req) = Message::from_vec(query) else {
+            // The request's EDNS presence is undecodable here — fall back
+            // to the raw ARCOUNT heuristic the preamble uses.
+            return Err(Self::build_formerr(id, flags, arcount > 0));
+        };
+
+        // Defense in depth: the preamble already drops QR=1, so this arm
+        // is unreachable — kept so the private function cannot silently
+        // forward a response packet if it ever gains another caller.
+        // Replying to a response at all would risk the resolver
+        // ping-pong the preamble's silent drop exists to prevent; the
+        // assert makes a future caller who skipped that gate loud.
+        if req.metadata.message_type != MessageType::Query {
+            debug_assert!(false, "response packet reached parse_request");
+            return Err(Self::build_formerr(id, flags, arcount > 0));
+        }
+
+        // RFC 6891 §6.1.3: an EDNS version newer than implemented (0) gets
+        // BADVERS — the extended rcode rides in a version-0 response OPT.
+        if req.edns.as_ref().is_some_and(|e| e.version() > 0) {
+            let resp = Self::response_message(&req, ResponseCode::BADVERS);
+            return Err(resp
+                .to_vec()
+                .unwrap_or_else(|_| Self::build_servfail(id, query, flags, question_len)));
+        }
+
+        Ok(req)
+    }
+
+    fn response_message(req: &Message, code: ResponseCode) -> Message {
+        let mut response =
+            Message::new(req.metadata.id, MessageType::Response, req.metadata.op_code);
+        response.metadata.recursion_desired = req.metadata.recursion_desired;
+        response.metadata.checking_disabled = req.metadata.checking_disabled;
+        response.metadata.recursion_available = true;
+        response.metadata.response_code = code;
+        response.add_queries(req.queries.iter().cloned());
+        response.edns = req.edns.as_ref().map(Self::response_edns);
+        response
+    }
+
+    /// Probe the response rules for an address query. The rule scan is
+    /// cheap — a hosts-trie lookup plus a linear rule scan — so a `forward`
+    /// verdict and no-match leave without touching the wire bytes;
+    /// [`Self::parse_request`]'s full decode only runs when a rule will
+    /// actually synthesize the reply.
+    fn try_response_rule(
+        data: &[u8],
+        question_len: usize,
+        domain: &str,
+        qtype: u16,
+        resolver: &Resolver,
+    ) -> Option<RuleAnswer> {
+        // Keep the ordinary hot path free of full-message decoding.
+        if !resolver.has_response_rules() {
+            return None;
+        }
+        let action = resolver.response_action(domain, qtype)?;
+        if action == ResponseAction::Forward {
+            return None;
+        }
+        let req = match Self::parse_request(data, question_len) {
+            // A matching rule over a malformed packet is still an error
+            // answer, never an upstream forward.
+            Ok(req) => req,
+            Err(response) => {
+                return Some(RuleAnswer {
+                    response,
+                    emitted: None,
+                })
+            }
+        };
+        let flags = u16::from_be_bytes([data[2], data[3]]);
+        Self::build_rule_response(&req, flags, domain, qtype, action, resolver)
+    }
+
+    /// Synthesize the rule's reply — the wire bytes plus, when the answer
+    /// section actually carries an address record, the `(ip, ttl)` it
+    /// emitted (for the `dns.nftset` answer hook; `answer_hook::pending`
+    /// drops fake-IP addresses by design). A family-mismatched `address`
+    /// action answers NODATA and reports nothing. `action` comes from the
+    /// caller's `response_action` scan so a matching query pays one rule
+    /// walk, not two.
+    fn build_rule_response(
+        req: &Message,
+        flags: u16,
+        domain: &str,
+        qtype: u16,
+        action: ResponseAction,
+        resolver: &Resolver,
+    ) -> Option<RuleAnswer> {
+        let mut response = Self::response_message(req, ResponseCode::NoError);
+        let address = match action {
+            ResponseAction::Forward => return None,
+            ResponseAction::FakeIp if !matches!(qtype, 1 | 28) => return None,
+            ResponseAction::FakeIp => resolver.response_fake_ip(domain, qtype).map(|ip| {
+                (
+                    ip,
+                    resolver
+                        .fake_ip_ttl()
+                        .as_secs()
+                        .clamp(1, u64::from(u32::MAX)) as u32,
+                )
+            }),
+            ResponseAction::Address { address, ttl } => Some((address, ttl)),
+            ResponseAction::NoData => None,
+            ResponseAction::Refused => {
+                response.metadata.response_code = ResponseCode::Refused;
+                None
+            }
+        };
+        let mut emitted = None;
+        if let Some((address, ttl)) = address {
+            let rdata = match (address, qtype) {
+                (IpAddr::V4(ip), 1) => Some(RData::A(ip.into())),
+                (IpAddr::V6(ip), 28) => Some(RData::AAAA(ip.into())),
+                _ => None,
+            };
+            if let Some(rdata) = rdata {
+                // `qdcount == 1` + a successful decode guarantees a
+                // question — `.first()` mirrors `handle_generic_forward`
+                // so a hypothetical empty parse degrades to NODATA, not
+                // a panic through the probe path's bare call.
+                if let Some(query) = req.queries.first() {
+                    response.add_answer(Record::from_rdata(query.name.clone(), ttl, rdata));
+                    emitted = Some((address, ttl));
+                }
+            }
+        }
+        Some(RuleAnswer {
+            response: response.to_vec().unwrap_or_else(|_| {
+                Self::build_header_error(req.metadata.id, flags, 2, req.edns.is_some())
+            }),
+            emitted,
+        })
     }
 
     /// Minimal per-hop response OPT synthesized from the client's request
@@ -2682,6 +2857,155 @@ mod tests {
                     keys.contains(&&SvcParamKey::Ipv4Hint),
                     "non-faked record keeps its legitimate hints"
                 );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn response_rule_fake_ip_strips_hints_even_when_filter_bypasses_name() {
+        use crate::fakeip::{MemoryStore, Pool, Skipper, SkipperMode};
+        use crate::response_policy::ResponseRule;
+        use hickory_proto::rr::rdata::svcb::SvcParamKey;
+        for block_a in [false, true] {
+            let upstream = spawn_dns_responder(|response| {
+                response.add_answer(https_record_with_hints());
+            })
+            .await;
+            let mut resolver = Resolver::new(
+                vec![upstream],
+                vec![],
+                DnsMode::FakeIp,
+                meow_trie::DomainTrie::new(),
+                true,
+                true,
+            );
+            resolver.set_fakeip_v4(Arc::new(
+                Pool::new(
+                    "198.18.0.0/16".parse().unwrap(),
+                    Arc::new(MemoryStore::new(32)),
+                )
+                .unwrap(),
+            ));
+            resolver.set_fakeip_skipper(Skipper::new(
+                &["example.com".to_string()],
+                SkipperMode::BlackList,
+            ));
+            let mut rules = vec![ResponseRule {
+                matcher: Arc::new(|name| name == "example.com"),
+                query_types: vec![],
+                action: ResponseAction::FakeIp,
+            }];
+            if block_a {
+                rules.insert(
+                    0,
+                    ResponseRule {
+                        matcher: Arc::new(|name| name == "example.com"),
+                        query_types: vec![1],
+                        action: ResponseAction::NoData,
+                    },
+                );
+            }
+            resolver.set_response_rules(rules).unwrap();
+            let wire = DnsServer::handle_query(&sample_query(42, 65), &resolver)
+                .await
+                .unwrap();
+            let response = Message::from_vec(&wire).unwrap();
+            let RData::HTTPS(record) = &response.answers[0].data else {
+                panic!("HTTPS required");
+            };
+            let keys: Vec<_> = record.0.svc_params.iter().map(|(key, _)| *key).collect();
+            assert!(keys.contains(&SvcParamKey::Alpn));
+            assert!(!keys.contains(&SvcParamKey::Ipv4Hint));
+            assert!(!keys.contains(&SvcParamKey::Ipv6Hint));
+        }
+    }
+
+    #[tokio::test]
+    async fn response_rule_implicit_fake_ip_suppression_strips_hints() {
+        use crate::fakeip::{MemoryStore, Pool, Skipper, SkipperMode};
+        use crate::response_policy::ResponseRule;
+        use hickory_proto::rr::rdata::svcb::SvcParamKey;
+        for forward_aaaa in [false, true] {
+            for bypass in [false, true] {
+                let upstream = spawn_dns_responder(|response| {
+                    response.add_answer(https_record_with_hints());
+                    response.add_authority(https_record_with_hints());
+                    response.add_additional(https_record_with_hints());
+                })
+                .await;
+                let mut resolver = Resolver::new(
+                    vec![upstream],
+                    vec![],
+                    DnsMode::FakeIp,
+                    meow_trie::DomainTrie::new(),
+                    true,
+                    true,
+                );
+                resolver.set_fakeip_v4(Arc::new(
+                    Pool::new(
+                        "198.18.0.0/16".parse().unwrap(),
+                        Arc::new(MemoryStore::new(32)),
+                    )
+                    .unwrap(),
+                ));
+                if bypass {
+                    resolver.set_fakeip_skipper(Skipper::new(
+                        &["example.com".to_string()],
+                        SkipperMode::BlackList,
+                    ));
+                }
+                let mut rules = vec![ResponseRule {
+                    matcher: Arc::new(|name| name == "example.com"),
+                    query_types: vec![1],
+                    action: ResponseAction::NoData,
+                }];
+                if forward_aaaa {
+                    rules.push(ResponseRule {
+                        matcher: Arc::new(|name| name == "example.com"),
+                        query_types: vec![28],
+                        action: ResponseAction::Forward,
+                    });
+                }
+                resolver.set_response_rules(rules).unwrap();
+                if !bypass {
+                    for qtype in [1, 28] {
+                        let wire = DnsServer::handle_query(&sample_query(42, qtype), &resolver)
+                            .await
+                            .unwrap();
+                        let response = Message::from_vec(&wire).unwrap();
+                        assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+                        assert!(
+                            response.answers.is_empty(),
+                            "both address families are suppressed"
+                        );
+                    }
+                }
+                let wire = DnsServer::handle_query(&sample_query(42, 65), &resolver)
+                    .await
+                    .unwrap();
+                let response = Message::from_vec(&wire).unwrap();
+                for rec in response
+                    .answers
+                    .iter()
+                    .chain(&response.authorities)
+                    .chain(&response.additionals)
+                {
+                    let RData::HTTPS(record) = &rec.data else {
+                        panic!("HTTPS required")
+                    };
+                    let keys: Vec<_> = record.0.svc_params.iter().map(|(key, _)| *key).collect();
+                    assert!(keys.contains(&SvcParamKey::Alpn));
+                    assert_eq!(
+                        keys.contains(&SvcParamKey::Ipv4Hint),
+                        bypass,
+                        "forward={forward_aaaa}, bypass={bypass}"
+                    );
+                    assert_eq!(
+                        keys.contains(&SvcParamKey::Ipv6Hint),
+                        bypass,
+                        "forward={forward_aaaa}, bypass={bypass}"
+                    );
+                }
             }
         }
     }

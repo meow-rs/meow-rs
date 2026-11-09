@@ -1,6 +1,7 @@
 use crate::cache::{DnsCache, DnsCacheSnapshotEntry, FamilyCacheHit, FamilyNeg, QueryFamilies};
 use crate::client::{prefer_errno, ClientError, DnsClient, FamilyAnswer, FamilySet};
 use crate::fakeip::{Pool, Skipper};
+use crate::response_policy::{ResponseAction, ResponseRule};
 use crate::upstream::{H3Policy, HostOrIp, NameServerEntry, NameServerUrl};
 use dashmap::DashMap;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -324,6 +325,7 @@ pub struct Resolver {
     /// [`InflightMap`].
     inflight: [InflightMap; 3],
     policy: Option<NameserverPolicy>,
+    response_rules: Vec<ResponseRule>,
     fallback_filter: Option<FallbackFilter>,
     /// IPv4 fake-IP pool (None when fake-ip mode is disabled or only v6 is configured).
     fakeip_v4: Option<Arc<Pool>>,
@@ -345,6 +347,44 @@ pub struct Resolver {
 }
 
 impl Resolver {
+    /// Install wire-response rules after configuring the fake-IP pools.
+    pub fn set_response_rules(&mut self, rules: Vec<ResponseRule>) -> Result<(), &'static str> {
+        if rules
+            .iter()
+            .any(|rule| rule.action == ResponseAction::FakeIp)
+            && (self.mode != DnsMode::FakeIp
+                || (self.fakeip_v4.is_none() && self.fakeip_v6.is_none()))
+        {
+            return Err("dns.response-rules: fake-ip requires enhanced-mode: fake-ip and a pool");
+        }
+        self.response_rules = rules;
+        Ok(())
+    }
+
+    pub(crate) fn has_response_rules(&self) -> bool {
+        !self.response_rules.is_empty()
+    }
+
+    pub(crate) fn response_action(&self, host: &str, qtype: u16) -> Option<ResponseAction> {
+        // Address aliases are explicit hosts overrides too. Generic types
+        // still use response rules, because the hosts table cannot answer them.
+        if matches!(qtype, 1 | 28) && self.use_hosts && self.hosts.search(host).is_some() {
+            return None;
+        }
+        self.response_rules
+            .iter()
+            .find(|rule| rule.matches(host, qtype))
+            .map(|rule| rule.action)
+    }
+
+    pub(crate) fn response_fake_ip(&self, host: &str, qtype: u16) -> Option<IpAddr> {
+        match qtype {
+            1 => self.fakeip_v4.as_ref().map(|pool| pool.lookup(host)),
+            28 if self.ipv6 => self.fakeip_v6.as_ref().map(|pool| pool.lookup(host)),
+            _ => None,
+        }
+    }
+
     /// The global (main) upstream clients — exposed so config-layer tests
     /// can assert which adapters `#PROXY`-tagged nameserver entries
     /// captured.
@@ -858,6 +898,7 @@ impl Resolver {
             use_hosts,
             inflight: [DashMap::new(), DashMap::new(), DashMap::new()],
             policy: None,
+            response_rules: Vec::new(),
             fallback_filter: None,
             fakeip_v4: None,
             fakeip_v6: None,
@@ -1156,6 +1197,7 @@ impl Resolver {
             use_hosts,
             inflight: [DashMap::new(), DashMap::new(), DashMap::new()],
             policy,
+            response_rules: Vec::new(),
             fallback_filter,
             fakeip_v4: None,
             fakeip_v6: None,
@@ -2208,7 +2250,28 @@ impl Resolver {
         if self.use_hosts && self.hosts.search(host).is_some() {
             return false;
         }
-        (self.fakeip_v4.is_some() || self.fakeip_v6.is_some()) && !self.skipper_bypasses(host)
+        if self.response_rules.is_empty() {
+            return (self.fakeip_v4.is_some() || self.fakeip_v6.is_some())
+                && !self.skipper_bypasses(host);
+        }
+        [
+            (1, self.fakeip_v4.is_some()),
+            // The ordinary v4-only fake-IP path suppresses AAAA too
+            // (lookup_ipv6_local), even without an explicit fake-ip rule.
+            (
+                28,
+                self.ipv6 && (self.fakeip_v6.is_some() || self.fakeip_v4.is_some()),
+            ),
+        ]
+        .into_iter()
+        .any(|(qtype, enabled)| match self.response_action(host, qtype) {
+            // A forced family without a pool answers NODATA. Real hints
+            // must not bypass that decision, even if the other family was
+            // already suppressed by an earlier rule.
+            Some(ResponseAction::FakeIp) => true,
+            Some(ResponseAction::Forward) | None => enabled && !self.skipper_bypasses(host),
+            _ => false,
+        })
     }
 
     /// True if `ip` is an active fake-IP allocation (either family).

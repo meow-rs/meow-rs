@@ -28,6 +28,7 @@ still used internally so rules and proxies can resolve names.
 | `default-nameserver` | list | `[]` | Bootstrap servers to resolve DoT/DoH hostnames |
 | `proxy-server-nameserver` | list | `[]` | Dedicated upstreams for proxy server hostnames; when unset they use `nameserver` |
 | `nameserver-policy` | map | — | Per-domain upstream routing |
+| `response-rules` | ordered list | `[]` | Query-type-specific local answers (meow extension) |
 | `nameserver-policy-exclusive` | bool | `false` | Confine policy-matched queries to that entry's upstreams |
 | `fallback-filter` | block | — | When to use `fallback` |
 | `fake-ip-range` | string | `198.18.0.1/16` | Fake-IP CIDR pool |
@@ -37,6 +38,74 @@ still used internally so rules and proxies can resolve names.
 | `store-fake-ip` | bool | `false` | Persist the fake-IP map across restarts |
 | `use-hosts` | bool | `true` | Honor the top-level `hosts:` map |
 | `use-system-hosts` | bool | `true` | Merge the OS hosts file (`/etc/hosts`, or `%SystemRoot%\System32\drivers\etc\hosts` on Windows) |
+
+## Ordered response rules
+
+`dns.response-rules` is an opt-in meow extension for local DNS answers.
+Use `nameserver-policy` to select upstreams and `response-rules` to select
+the answer sent to a DNS client. The first matching rule wins, including
+`forward`. A query with no matching rule uses the ordinary pipeline.
+
+```yaml
+dns:
+  enable: true
+  enhanced-mode: fake-ip
+  nameserver: [1.1.1.1]
+  fake-ip-filter: [real.example.test]
+  response-rules:
+    - match: '+.example.test'
+      types: [HTTPS, SVCB]
+      action: nodata
+    - match: real.example.test
+      action: forward
+    - match: blocked.example.test
+      action: refused
+    - match: static.example.test
+      action: address
+      address: 192.0.2.7
+      ttl: 42
+    - match: '+.example.test'
+      action: fake-ip
+```
+
+`match` accepts the existing nameserver-policy domain patterns (exact,
+`+.`, `*.`, `.`), `geosite:` and `rule-set:` conditions. `'*'` matches
+every name. Matching uses loaded state synchronously. Rule providers
+use `domain` or `classical` behavior and inspect only domain conditions.
+Provider names are case-sensitive. Candidate configuration changes bind
+the candidate's provider objects; background refreshes are visible through
+those same objects.
+
+`types` is optional. Omission matches all query types; a supplied list must
+be nonempty. It accepts DNS type names such as `A`, `AAAA`, `HTTPS`, `SVCB`
+and `TXT`, or `TYPE<number>` for an arbitrary 16-bit type. Names are
+case-insensitive. `ANY` selects the literal ANY question type.
+
+| Action | Wire result |
+| --- | --- |
+| `nodata` | NOERROR with zero answers |
+| `refused` | REFUSED with zero answers |
+| `address` | One A or AAAA record of the configured family; every other query type gets NODATA. Requires `address`; `ttl` defaults to 60 seconds and may be zero. |
+| `fake-ip` | Allocate from the queried family's existing pool, overriding `fake-ip-filter`. An unavailable/disabled family gets NODATA. Generic types resume ordinary forwarding. Requires `enhanced-mode: fake-ip`. |
+| `forward` | Stop the rule scan and resume the ordinary pipeline, including its fake-IP filter, cache and upstream selection |
+
+Explicit hosts entries, including aliases, take priority for address
+questions. Response rules run next, ahead of IPv6 suppression, fake-IP,
+cache and upstream lookup. Packet validation precedes rule synthesis.
+Replies echo RD/CD and, for EDNS requests, DO with a version-0 OPT advertising
+1232 bytes. Duplicate OPT records get FORMERR and unsupported EDNS versions
+get BADVERS. Synthesized answers contain no relayed ECH/ALPN records;
+forwarded HTTPS/SVCB answers retain ADR-0013 hint filtering, including names
+forced into fake-IP by a rule.
+
+These rules apply to the UDP DNS listener and TUN DNS-hijack wire path.
+Outbound hostname resolution and `GET /dns/query` use the resolver pipeline
+directly. This keeps proxy-server bootstrap free of synthesized fake-IP
+addresses and makes the API endpoint an upstream diagnostic.
+
+Invalid actions, types, action fields, missing providers and unavailable
+geosite databases fail configuration loading. A rejected reload retains the
+live resolver and its rules. Reordering rules triggers a resolver rebuild.
 
 ## Upstream formats
 

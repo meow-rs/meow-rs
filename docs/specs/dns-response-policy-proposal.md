@@ -1,6 +1,6 @@
 # Proposal for query-type-specific DNS responses
 
-Status: proposed for discussion.
+Status: response-rule implementation proposed; bootstrap policy is a separate follow-up.
 Owner: engineer
 Date: 2026-11-07
 Tracking: [PR #906](https://github.com/meow-rs/meow-rs/pull/906)
@@ -192,3 +192,27 @@ surface would conflate who resolves a name with what is answered for
 it. It would help to settle that before making a public schema hard to
 change. In either design, transport, domain matching, fake-IP
 allocation and packet validation stay with their current owners.
+
+## Implementation choice
+
+The follow-up implementation uses the dedicated ordered
+`dns.response-rules` list documented in the [DNS guide](../../website/guide/dns.md#ordered-response-rules).
+The schema is a meow extension under review. Rule predicates reuse the
+domain trie and loaded geosite/provider matchers. The main resolver owns
+the immutable rule list for its generation, and only DNS wire handlers
+apply its actions. `GET /dns/query` remains an upstream diagnostic.
+
+The address probe and task path share the same local rule builder.
+Generic queries evaluate rules on the task path after packet validation.
+Raw rule lists participate in ordered `RawDns` equality, while provider
+and geosite discovery include their match conditions. Provider references
+force a rebuild on each candidate commit through the existing runtime-ref
+gate. Strict validation of this new surface rejects rules that could
+otherwise silently forward a query their configuration intended to block
+(ADR-0002 Class A).
+
+Endpoint-specific `proxy-server-nameserver-policy` is a separate transport
+configuration change. It can reuse the existing nameserver-policy builder
+and requires its own construction-cycle and exclusive-pool tests. The
+response-rule implementation keeps proxy-server hostname resolution on
+the existing non-synthesizing path.

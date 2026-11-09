@@ -5,6 +5,7 @@
 
 pub mod auth;
 pub mod dns_parser;
+mod dns_response_rules;
 pub mod dropped_providers;
 pub mod ech_dns;
 // Force-disabled on iOS/Android: mobile apps embed their own UI and must not
@@ -4097,35 +4098,16 @@ fn dns_policy_uses_geosite(raw: &raw::RawConfig) -> bool {
     if !enabled {
         return false;
     }
-    raw.dns
-        .as_ref()
-        .and_then(|dns| dns.nameserver_policy.as_ref())
-        .is_some_and(|policy| {
-            // Expand per segment like the policy builder — a mixed key
-            // (`"+.a,geosite:cn"`) puts the prefix on a non-leading segment
-            // the whole-key check would miss (issue #514 review).
-            policy
-                .keys()
-                .flat_map(|key| dns_parser::expand_policy_keys(key))
-                .any(|ek| ek.to_ascii_lowercase().starts_with("geosite:"))
-        })
+    dns_parser::dns_policy_keys(raw)
+        .flat_map(dns_parser::expand_policy_keys)
+        .any(|key| key.to_ascii_lowercase().starts_with("geosite:"))
 }
 
 fn collect_dns_policy_geosite_categories(
     raw: &raw::RawConfig,
 ) -> std::collections::HashSet<String> {
     let mut out = std::collections::HashSet::new();
-    let Some(policy) = raw
-        .dns
-        .as_ref()
-        .and_then(|dns| dns.nameserver_policy.as_ref())
-    else {
-        return out;
-    };
-    for expanded in policy
-        .keys()
-        .flat_map(|key| dns_parser::expand_policy_keys(key))
-    {
+    for expanded in dns_parser::dns_policy_keys(raw).flat_map(dns_parser::expand_policy_keys) {
         let lower = expanded.to_ascii_lowercase();
         let Some(rest) = lower.strip_prefix("geosite:") else {
             continue;

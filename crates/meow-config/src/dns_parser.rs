@@ -341,6 +341,14 @@ pub async fn parse_dns(
     if mode == DnsMode::FakeIp {
         install_fakeip(&mut resolver, dns, cache_dir, prior, strict).await?;
     }
+    let response_rules = crate::dns_response_rules::build(
+        dns.response_rules.as_deref().unwrap_or(&[]),
+        geosite.as_ref(),
+        rule_providers,
+    )?;
+    resolver
+        .set_response_rules(response_rules)
+        .map_err(anyhow::Error::msg)?;
     if let Some(direct) = direct_resolver {
         resolver.set_direct_resolver(direct);
     }
@@ -654,17 +662,24 @@ fn parse_nameserver_urls(servers: &[String]) -> Result<Vec<NameServerUrl>, anyho
 /// whether the resolver build must load the candidate's rule-providers
 /// rather than a possibly-stale live registry (issue #514).
 pub fn dns_needs_rule_providers(raw: &crate::raw::RawConfig) -> bool {
-    raw.dns
-        .as_ref()
-        .and_then(|d| d.nameserver_policy.as_ref())
-        .is_some_and(|m| {
-            // Expand per segment like `build_nameserver_policy` — a mixed
-            // key (`"+.corp.example,rule-set:x"`) puts the prefix on a
-            // non-leading segment the whole-key check would miss.
-            m.keys()
-                .flat_map(|k| expand_policy_keys(k))
-                .any(|ek| ek.to_ascii_lowercase().starts_with("rule-set:"))
-        })
+    dns_policy_keys(raw)
+        .flat_map(expand_policy_keys)
+        .any(|key| key.to_ascii_lowercase().starts_with("rule-set:"))
+}
+
+/// Domain conditions that require candidate-generation provider/geosite state.
+pub(crate) fn dns_policy_keys(raw: &crate::raw::RawConfig) -> impl Iterator<Item = &str> {
+    raw.dns.iter().flat_map(|dns| {
+        dns.nameserver_policy
+            .iter()
+            .flat_map(|map| map.keys().map(String::as_str))
+            .chain(
+                dns.response_rules
+                    .iter()
+                    .flatten()
+                    .map(|rule| rule.matcher.as_str()),
+            )
+    })
 }
 
 /// Build a `NameserverPolicy` from the raw YAML map.

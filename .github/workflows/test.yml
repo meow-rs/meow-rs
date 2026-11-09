@@ -287,7 +287,7 @@ jobs:
             --test socks5_udp_user \
             --test host_validation \
             --test ss_listener_integration \
-            --test dns_cache_test \
+            --test dns_cache_test --test dns_response_rules \
             --test config_test \
             --test tun_config_test --test sniffer_config_test \
             --test dialer_proxy_group \
