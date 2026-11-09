@@ -1,0 +1,332 @@
+# Cache warm-up for external test-peer binaries and install-action tools.
+#
+# SYNC SENTINEL — every `key:`/`path:` pair below is byte-identical to a
+# consumer entry added in #920. The consumers live in
+# .github/workflows/test.yml (nextest, cargo-hack, sing-box, gost,
+# v2ray-plugin, trusttunnel, LLVM, wintun legs) and
+# .github/workflows/coverage.yml (cargo-llvm-cov, sing-box, v2ray-plugin,
+# trusttunnel legs). When a consumer key, path, version-pin env, or fetch
+# script changes, update this file in the same PR — otherwise the entries
+# warmed here stop matching the consumer lookups and this workflow
+# silently keeps dead keys alive.
+#
+# Why this exists: the per-tool actions/cache@v4 blocks only shield the
+# GitHub release-asset CDN (which has 504 outage windows) on a cache HIT,
+# and nothing reliably plants the main-scope seed — the merge-triggered
+# run's carrier leg can fail before save executes, and PR-scope entries
+# evaporate unused. This workflow runs on main daily (plus
+# workflow_dispatch) to plant and keep alive entries under keys identical
+# to the consumers'.
+#
+# Structure: every tool uses restore → install → save with
+# actions/cache/restore@v4 and actions/cache/save@v4 rather than
+# actions/cache@v4, so a successful install is saved immediately and a
+# failure in a later tool's steps cannot strand an already-fetched
+# binary.
+#
+# Deliberately NOT warmed here:
+# - ssserver (`cargo install shadowsocks-rust` in test.yml/coverage.yml):
+#   its key is Cargo.lock-hashed, so entries die on every dependency
+#   bump; a daily warm would mostly re-seed keys that are already stale.
+# - Swatinem/rust-cache entries: rust-cache manages its own restore/save
+#   lifecycle and restore-keys fallback chain — out-of-band saves under
+#   its derived keys would fight that scheme.
+# - build.yml wintun: keyed per-target inside the release matrix
+#   (`wintun-${{ matrix.target }}-${{ hashFiles(...) }}`, path dist/wintun)
+#   and self-seeding on the release path — a different key/path pair than
+#   the test.yml x86_64 leg warmed below.
+# - apk-tools (test.yml openwrt leg): same hashFiles-on-fetch-script
+#   pattern, but that leg is a niche e2e edge and not a CDN-flake hotspot;
+#   skipped to keep this workflow's runtime bounded.
+
+name: cache-warmup
+
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cache-warmup-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  warmup-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # Keep in sync with the linux legs in test.yml / coverage.yml.
+      SINGBOX_VERSION: "1.14.0"
+      GOST_VERSION: "3.3.0"
+    steps:
+      # checkout is required both for the fetch scripts below and for
+      # hashFiles('scripts/...') to resolve to the same value the
+      # consumers compute.
+      - uses: actions/checkout@v5
+
+      - name: Cache cargo-nextest
+        id: cache-nextest
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.install-action/bin/cargo-nextest*
+            ~/.cargo/bin/cargo-nextest*
+          key: install-action-nextest-${{ runner.os }}-${{ runner.arch }}-v1
+
+      - name: Install cargo-nextest
+        id: install-nextest
+        if: steps.cache-nextest.outputs.cache-hit != 'true'
+        uses: taiki-e/install-action@nextest
+
+      - name: Save cargo-nextest cache
+        if: steps.cache-nextest.outputs.cache-hit != 'true' && steps.install-nextest.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.install-action/bin/cargo-nextest*
+            ~/.cargo/bin/cargo-nextest*
+          key: install-action-nextest-${{ runner.os }}-${{ runner.arch }}-v1
+
+      - name: Cache cargo-hack
+        id: cache-cargo-hack
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.install-action/bin/cargo-hack*
+            ~/.cargo/bin/cargo-hack*
+          key: install-action-cargo-hack-${{ runner.os }}-${{ runner.arch }}-v1
+
+      - name: Install cargo-hack
+        id: install-cargo-hack
+        if: steps.cache-cargo-hack.outputs.cache-hit != 'true'
+        uses: taiki-e/install-action@cargo-hack
+
+      - name: Save cargo-hack cache
+        if: steps.cache-cargo-hack.outputs.cache-hit != 'true' && steps.install-cargo-hack.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.install-action/bin/cargo-hack*
+            ~/.cargo/bin/cargo-hack*
+          key: install-action-cargo-hack-${{ runner.os }}-${{ runner.arch }}-v1
+
+      - name: Cache cargo-llvm-cov
+        id: cache-cargo-llvm-cov
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.install-action/bin/cargo-llvm-cov*
+            ~/.cargo/bin/cargo-llvm-cov*
+          key: install-action-cargo-llvm-cov-${{ runner.os }}-${{ runner.arch }}-v1
+
+      - name: Install cargo-llvm-cov
+        id: install-cargo-llvm-cov
+        if: steps.cache-cargo-llvm-cov.outputs.cache-hit != 'true'
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Save cargo-llvm-cov cache
+        if: steps.cache-cargo-llvm-cov.outputs.cache-hit != 'true' && steps.install-cargo-llvm-cov.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.install-action/bin/cargo-llvm-cov*
+            ~/.cargo/bin/cargo-llvm-cov*
+          key: install-action-cargo-llvm-cov-${{ runner.os }}-${{ runner.arch }}-v1
+
+      - name: Cache sing-box binary
+        id: cache-sing-box
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/ci-peers/sing-box
+          key: sing-box-${{ env.SINGBOX_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+
+      # Same layout the consumer stages: a bare binary at
+      # $RUNNER_TEMP/ci-peers/sing-box, not the extracted directory.
+      - name: Install sing-box
+        id: install-sing-box
+        if: steps.cache-sing-box.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/sing-box.tar.gz \
+            "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/sing-box-${SINGBOX_VERSION}-linux-amd64.tar.gz"
+          tar -xzf /tmp/sing-box.tar.gz -C /tmp
+          mkdir -p "$RUNNER_TEMP/ci-peers"
+          cp "/tmp/sing-box-${SINGBOX_VERSION}-linux-amd64/sing-box" "$RUNNER_TEMP/ci-peers/sing-box"
+
+      - name: Save sing-box cache
+        if: steps.cache-sing-box.outputs.cache-hit != 'true' && steps.install-sing-box.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/ci-peers/sing-box
+          key: sing-box-${{ env.SINGBOX_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Cache gost binary
+        id: cache-gost
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/ci-peers/gost
+          key: gost-${{ env.GOST_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install gost
+        id: install-gost
+        if: steps.cache-gost.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/gost.tar.gz \
+            "https://github.com/go-gost/gost/releases/download/v${GOST_VERSION}/gost_${GOST_VERSION}_linux_amd64.tar.gz"
+          tar -xzf /tmp/gost.tar.gz -C /tmp gost
+          mkdir -p "$RUNNER_TEMP/ci-peers"
+          cp /tmp/gost "$RUNNER_TEMP/ci-peers/gost"
+
+      - name: Save gost cache
+        if: steps.cache-gost.outputs.cache-hit != 'true' && steps.install-gost.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/ci-peers/gost
+          key: gost-${{ env.GOST_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Cache v2ray-plugin
+        id: cache-v2ray-plugin
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/v2ray-plugin
+          key: v2ray-plugin-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/fetch-v2ray-plugin.sh') }}
+
+      - name: Fetch official v2ray-plugin (pinned, SHA256 verified)
+        id: install-v2ray-plugin
+        if: steps.cache-v2ray-plugin.outputs.cache-hit != 'true'
+        run: bash scripts/fetch-v2ray-plugin.sh "$RUNNER_TEMP/v2ray-plugin"
+
+      - name: Save v2ray-plugin cache
+        if: steps.cache-v2ray-plugin.outputs.cache-hit != 'true' && steps.install-v2ray-plugin.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/v2ray-plugin
+          key: v2ray-plugin-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/fetch-v2ray-plugin.sh') }}
+
+      - name: Cache TrustTunnel endpoint
+        id: cache-trusttunnel
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/trusttunnel
+          key: trusttunnel-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/fetch-trusttunnel-endpoint.sh') }}
+
+      - name: Fetch official TrustTunnel endpoint (pinned, SHA256 verified)
+        id: install-trusttunnel
+        if: steps.cache-trusttunnel.outputs.cache-hit != 'true'
+        run: bash scripts/fetch-trusttunnel-endpoint.sh "$RUNNER_TEMP/trusttunnel"
+
+      - name: Save TrustTunnel endpoint cache
+        if: steps.cache-trusttunnel.outputs.cache-hit != 'true' && steps.install-trusttunnel.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/trusttunnel
+          key: trusttunnel-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/fetch-trusttunnel-endpoint.sh') }}
+
+  warmup-macos:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      # The only external binary the macOS consumer leg fetches; its key
+      # has no hashFiles term, so no checkout is needed in this job.
+      - name: Cache cargo-nextest
+        id: cache-nextest
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.install-action/bin/cargo-nextest*
+            ~/.cargo/bin/cargo-nextest*
+          key: install-action-nextest-${{ runner.os }}-${{ runner.arch }}-v1
+
+      - name: Install cargo-nextest
+        id: install-nextest
+        if: steps.cache-nextest.outputs.cache-hit != 'true'
+        uses: taiki-e/install-action@nextest
+
+      - name: Save cargo-nextest cache
+        if: steps.cache-nextest.outputs.cache-hit != 'true' && steps.install-nextest.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.install-action/bin/cargo-nextest*
+            ~/.cargo/bin/cargo-nextest*
+          key: install-action-nextest-${{ runner.os }}-${{ runner.arch }}-v1
+
+  warmup-windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      # Exact LLVM pin — the cache key names it. Keep in sync with the
+      # windows leg in test.yml.
+      LLVM_VERSION: "18.1.8"
+    steps:
+      # Needed for hashFiles('scripts/fetch-wintun.sh') and the fetch
+      # script itself.
+      - uses: actions/checkout@v5
+
+      - name: Cache cargo-nextest
+        id: cache-nextest
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.install-action/bin/cargo-nextest*
+            ~/.cargo/bin/cargo-nextest*
+          key: install-action-nextest-${{ runner.os }}-${{ runner.arch }}-v1
+
+      - name: Install cargo-nextest
+        id: install-nextest
+        if: steps.cache-nextest.outputs.cache-hit != 'true'
+        uses: taiki-e/install-action@nextest
+
+      - name: Save cargo-nextest cache
+        if: steps.cache-nextest.outputs.cache-hit != 'true' && steps.install-nextest.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.install-action/bin/cargo-nextest*
+            ~/.cargo/bin/cargo-nextest*
+          key: install-action-nextest-${{ runner.os }}-${{ runner.arch }}-v1
+
+      - name: Cache LLVM
+        id: cache-llvm
+        uses: actions/cache/restore@v4
+        with:
+          path: 'C:\Program Files\LLVM'
+          key: llvm-${{ env.LLVM_VERSION }}-${{ runner.os }}
+
+      - name: Install LLVM
+        id: install-llvm
+        if: steps.cache-llvm.outputs.cache-hit != 'true'
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: ${{ env.LLVM_VERSION }}
+
+      - name: Save LLVM cache
+        if: steps.cache-llvm.outputs.cache-hit != 'true' && steps.install-llvm.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: 'C:\Program Files\LLVM'
+          key: llvm-${{ env.LLVM_VERSION }}-${{ runner.os }}
+
+      - name: Cache wintun.dll
+        id: cache-wintun
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/wintun
+          key: wintun-x86_64-pc-windows-msvc-${{ hashFiles('scripts/fetch-wintun.sh') }}
+
+      - name: Fetch wintun.dll
+        id: install-wintun
+        if: steps.cache-wintun.outputs.cache-hit != 'true'
+        shell: bash
+        run: bash scripts/fetch-wintun.sh --target x86_64-pc-windows-msvc --outdir "$RUNNER_TEMP/wintun"
+
+      - name: Save wintun.dll cache
+        if: steps.cache-wintun.outputs.cache-hit != 'true' && steps.install-wintun.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/wintun
+          key: wintun-x86_64-pc-windows-msvc-${{ hashFiles('scripts/fetch-wintun.sh') }}
