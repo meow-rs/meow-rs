@@ -1431,27 +1431,20 @@ async fn serve_tcp_client(
             let response = match DnsServer::try_answer_local(&query, &current) {
                 LocalAnswer::Answer(LocalResponse { response, hook }) => {
                     if let Some(work) = hook {
-                        let permit = Arc::clone(&budget)
-                            .acquire_owned()
+                        // Mirror the UDP path: locally answerable queries
+                        // bypass the upstream budget entirely — a saturated
+                        // in-flight pool must not delay an answer that needs
+                        // no upstream, so the hook runs uncharged.
+                        tokio::task::spawn_blocking(move || work.run())
                             .await
                             .map_err(std::io::Error::other)?;
-                        // Blocking hooks cannot be aborted. Keep their charge
-                        // until the work actually finishes, even on cancellation.
-                        tokio::task::spawn_blocking(move || {
-                            let _permit = permit;
-                            work.run();
-                        })
-                        .await
-                        .map_err(std::io::Error::other)?;
                     }
                     response
                 }
-                LocalAnswer::Drop => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "DNS TCP query",
-                    ))
-                }
+                // Non-query traffic (QR=1, garbage) is a protocol event,
+                // not data corruption: close the connection cleanly rather
+                // than answering a frame that needs no response.
+                LocalAnswer::Drop => return Ok(false),
                 LocalAnswer::Upstream => {
                     let charge = Arc::new(
                         Arc::clone(&budget)
