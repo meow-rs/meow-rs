@@ -929,7 +929,7 @@ mod tests {
             let (tx, incoming) = tokio::sync::mpsc::channel(4);
             let (replies, _rx) = tokio::sync::mpsc::channel(4);
             let task = tokio::spawn(super::run_udp(
-                crate::test_rule_tunnel(),
+                super::cleanup_tests::live_tunnel(),
                 super::UdpIo::Direct { incoming, replies },
                 false,
                 Duration::from_secs(60),
@@ -1012,7 +1012,7 @@ mod tests {
         let (tx, incoming) = tokio::sync::mpsc::channel(4);
         let (replies, _rx) = tokio::sync::mpsc::channel(4);
         let task = tokio::spawn(super::run_udp(
-            crate::test_rule_tunnel(),
+            super::cleanup_tests::live_tunnel(),
             super::UdpIo::Direct { incoming, replies },
             false,
             Duration::from_secs(60),
@@ -1263,6 +1263,12 @@ mod cleanup_tests {
             sniffer: None,
         };
         (tunnel, spec, tx, probe)
+    }
+
+    // Occupancy tests must keep an actual flow alive: REJECT completes
+    // immediately and is now correctly removed by the completion branch.
+    pub(super) fn live_tunnel() -> Tunnel {
+        fixture().0
     }
 
     #[tokio::test]
