@@ -235,11 +235,28 @@ pub(super) async fn run_udp(
     // next datagram for the tuple, by the periodic sweep, or by LRU
     // eviction when the table reaches MAX_FLOWS (issue #515).
     let mut flows = FlowTable::new(live_flows);
+    // Keep flow tasks owned by this loop: closing their queues alone cannot
+    // interrupt a pending dial or write. Drop cancels them if the loop aborts.
+    let mut flow_tasks = tokio::task::JoinSet::new();
     let mut sweep_countdown = SWEEP_INTERVAL;
     let hijack_permits = Arc::new(tokio::sync::Semaphore::new(HIJACK_IN_FLIGHT));
     let hijack_dropped = Arc::new(AtomicU64::new(0));
 
-    while let Some((data, src, dst)) = incoming.next().await {
+    loop {
+        let packet = tokio::select! {
+            packet = incoming.next() => packet,
+            done = flow_tasks.join_next(), if !flow_tasks.is_empty() => {
+                if let Some(Err(error)) = done {
+                    debug!("tun UDP flow task: {error}");
+                }
+                // Reap completions even with no incoming packets; otherwise
+                // finished task records accumulate for the listener lifetime.
+                continue;
+            }
+        };
+        let Some((data, src, dst)) = packet else {
+            break;
+        };
         // The TCP NAT's trust boundary holds for UDP too: the peer
         // addresses are assigned to nothing, so a datagram claiming one
         // as its source is forged (a LAN peer forwarded in under loose
@@ -400,7 +417,7 @@ pub(super) async fn run_udp(
                 last_activity: Arc::clone(&last_activity),
             },
         );
-        tokio::spawn(flow_task(
+        flow_tasks.spawn(flow_task(
             tunnel.clone(),
             FlowSpec {
                 rx,
@@ -413,8 +430,11 @@ pub(super) async fn run_udp(
             },
         ));
     }
-    // `flows` drops here, returning this table's share of the gauge —
-    // also when the future is aborted mid-loop and never reaches this line.
+    // Stop even flows parked in dial/write rather than waiting for their idle
+    // deadline. Each flow owns its reply reader, which is cancelled with it.
+    drop(flows);
+    flow_tasks.shutdown().await;
+    // On external cancellation the table and set also clean up via Drop.
 }
 
 /// Per-flow state handed to the spawned flow task.
@@ -1216,6 +1236,73 @@ mod cleanup_tests {
             sniffer: None,
         };
         (tunnel, spec, tx, probe)
+    }
+
+    async fn loop_stop_releases_blocked_flow(abort: bool) {
+        let (tunnel, spec, _unused_tx, probe) = fixture();
+        let flush = tunnel.clone();
+        let (incoming_tx, incoming) = mpsc::channel(1);
+        let (replies, _reply_rx) = mpsc::channel(1);
+        let gauge = Arc::new(AtomicUsize::new(0));
+        let task = tokio::spawn(run_udp(
+            tunnel,
+            UdpIo::Direct { incoming, replies },
+            false,
+            Duration::from_secs(60),
+            "tun".into(),
+            TunNets {
+                v4: "198.18.0.1/30".parse().unwrap(),
+                v6: None,
+                nat: None,
+            },
+            Arc::clone(&gauge),
+            None,
+        ));
+        incoming_tx
+            .send((vec![1], spec.key.0, spec.key.1))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            probe.reading.notified().await;
+            probe.writing.notified().await;
+        })
+        .await
+        .unwrap();
+        assert_eq!(gauge.load(Ordering::Relaxed), 1);
+        if abort {
+            task.abort();
+        }
+        drop(incoming_tx);
+        let outcome = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap();
+        if abort {
+            assert!(outcome.unwrap_err().is_cancelled());
+        } else {
+            outcome.unwrap();
+        }
+        assert_eq!(gauge.load(Ordering::Relaxed), 0);
+        let released =
+            tokio::time::timeout(Duration::from_secs(2), probe.conn_dropped.notified()).await;
+        // Clean up the unfixed baseline too; the assertion must not rely on
+        // this external flush or the 60-second idle deadline.
+        flush.close_all_udp_sessions();
+        probe.release_read.notify_one();
+        assert!(
+            released.is_ok(),
+            "UDP loop stopped but its blocked flow retained the connection"
+        );
+        assert!(probe.read_dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn tun_udp_loop_eof_releases_blocked_flow() {
+        loop_stop_releases_blocked_flow(false).await;
+    }
+
+    #[tokio::test]
+    async fn tun_udp_loop_abort_releases_blocked_flow() {
+        loop_stop_releases_blocked_flow(true).await;
     }
 
     #[tokio::test]
