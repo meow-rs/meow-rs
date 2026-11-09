@@ -16,6 +16,8 @@ mod aead;
 mod certificate_pin;
 pub mod dialer;
 pub mod direct;
+#[cfg(feature = "ss")]
+mod first_flight;
 pub mod group;
 pub mod health;
 pub mod http_adapter;

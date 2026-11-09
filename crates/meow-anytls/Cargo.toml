@@ -86,10 +86,10 @@ notify = { version = "8.2", optional = true }
 x509-parser = { version = "0.18", optional = true }
 chrono = { version = "0.4", optional = true }
 
-# libc is only used by the Android socket-protect helper (EINPROGRESS check on
+# libc is only used by the Android / OpenHarmony socket-protect helper (EINPROGRESS check on
 # the non-blocking connect). Off-Android the helper compiles down to a direct
 # `TcpStream::connect` / `UdpSocket::bind` and the dep is never pulled in.
-[target.'cfg(target_os = "android")'.dependencies]
+[target.'cfg(any(target_os = "android", target_env = "ohos"))'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]

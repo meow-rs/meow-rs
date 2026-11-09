@@ -189,6 +189,14 @@ fn wants_bulk_upgrade(amt: u64, buf_len: usize) -> bool {
     amt >= RELAY_BULK_UPGRADE_BYTES && buf_len < RELAY_BULK_BUF_SIZE
 }
 
+// Keep the error kind unchanged so diagnostics never alter relay behavior.
+// Applied once per failure path, by the bidirectional loop, which supplies
+// the direction label; `HalfCopy` below propagates the raw error, so the
+// message composes to `client-to-proxy: connection reset by peer`.
+fn relay_operation_error(operation: &str, error: &io::Error) -> io::Error {
+    io::Error::new(error.kind(), format!("{operation}: {error}"))
+}
+
 struct HalfCopy<'buf> {
     buf: Scratch<'buf>,
     read_done: bool,
@@ -565,7 +573,9 @@ where
                         cycles += 1;
                     }
                     Ok(Cycle::Pending) => a_parked = true,
-                    Err(e) => return Poll::Ready(Err(e)),
+                    Err(e) => {
+                        return Poll::Ready(Err(relay_operation_error("client-to-proxy", &e)))
+                    }
                 }
             }
 
@@ -577,7 +587,9 @@ where
                         cycles += 1;
                     }
                     Ok(Cycle::Pending) => b_parked = true,
-                    Err(e) => return Poll::Ready(Err(e)),
+                    Err(e) => {
+                        return Poll::Ready(Err(relay_operation_error("proxy-to-client", &e)))
+                    }
                 }
             }
 

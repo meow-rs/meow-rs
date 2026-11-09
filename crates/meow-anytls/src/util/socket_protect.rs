@@ -19,7 +19,7 @@ use std::io;
 
 use tokio::net::{TcpStream, ToSocketAddrs, UdpSocket};
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 mod android {
     use super::*;
     use std::net::SocketAddr;
@@ -115,7 +115,7 @@ mod android {
     }
 }
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 pub use android::{
     SocketProtector, clear_socket_protector, set_socket_protector, socket_protector,
 };
@@ -130,7 +130,7 @@ pub use android::{
 /// `tokio::net::lookup_host` and each resolved `SocketAddr` is tried in
 /// turn.
 pub async fn connect_tcp<A: ToSocketAddrs>(addr: A) -> io::Result<TcpStream> {
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_env = "ohos"))]
     {
         if let Some(p) = android::socket_protector() {
             let mut last_err: Option<io::Error> = None;
@@ -161,7 +161,7 @@ pub async fn connect_tcp<A: ToSocketAddrs>(addr: A) -> io::Result<TcpStream> {
 /// `SocketProtector` (if any) to the socket fd before `bind()`. On every
 /// other target this is equivalent to [`UdpSocket::bind`].
 pub async fn bind_udp<A: ToSocketAddrs>(local: A) -> io::Result<UdpSocket> {
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_env = "ohos"))]
     {
         if let Some(p) = android::socket_protector() {
             let resolved = tokio::net::lookup_host(local)

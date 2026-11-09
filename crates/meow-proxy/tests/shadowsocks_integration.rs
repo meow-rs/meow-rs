@@ -580,6 +580,74 @@ async fn test_ss_tcp_relay_with_builtin_obfs_http() {
     );
 }
 
+/// Server-first target over the built-in obfs-http client: the client
+/// writes nothing, so the SS request header goes out on its own as the
+/// fake HTTP request body (the eager mihomo-style header sent at dial
+/// time), and the C `obfs-server` must accept that body-only-header
+/// request and relay the banner back. (`obfs-server` coalesces its
+/// response headers with the first banner bytes; the header-only response
+/// case is covered by the `HttpObfs` unit tests.)
+#[tokio::test]
+async fn test_ss_builtin_obfs_http_server_first_banner() {
+    if !ssserver_available() {
+        skip_or_fail("ssserver not found in PATH");
+        return;
+    }
+    if !obfs_server_available() {
+        skip_or_fail("obfs-server not found in PATH");
+        return;
+    }
+
+    const BANNER: &[u8] = b"220 server-first banner\r\n";
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let banner_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                // Speak well after the dial: the SS header must not wait
+                // for client bytes.
+                sleep(Duration::from_millis(300)).await;
+                let _ = stream.write_all(BANNER).await;
+                let mut buf = [0u8; 64];
+                let _ = stream.read(&mut buf).await;
+            });
+        }
+    });
+    let ss_port = free_port().await;
+    let _ssserver = start_ssserver_with_plugin(ss_port, "obfs-server", "obfs=http").await;
+
+    let adapter = ShadowsocksAdapter::new(
+        "test-ss-builtin-obfs-http-server-first",
+        "127.0.0.1",
+        ss_port,
+        SS_PASSWORD,
+        SS_CIPHER,
+        false,
+        Some("obfs"),
+        Some("mode=http;host=bing.com"),
+        None,
+        Arc::new(DirectDialer),
+    )
+    .expect("failed to create adapter with built-in obfs http");
+    let metadata = Metadata {
+        network: Network::Tcp,
+        dst_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        dst_port: banner_addr.port(),
+        ..Default::default()
+    };
+
+    let mut conn = timeout(TIMEOUT, adapter.dial_tcp(&metadata))
+        .await
+        .expect("TCP dial timed out")
+        .expect("TCP dial failed");
+    let mut buf = vec![0u8; BANNER.len()];
+    timeout(TIMEOUT, conn.read_exact(&mut buf))
+        .await
+        .expect("banner read timed out")
+        .expect("banner read failed");
+    assert_eq!(&buf, BANNER, "server-first banner mismatch via obfs-http");
+}
+
 /// Same as above, but for `mode=tls` simple-obfs.
 #[tokio::test]
 async fn test_ss_tcp_relay_with_builtin_obfs_tls() {

@@ -531,7 +531,18 @@ impl SsCore {
                     BuiltinObfs::Http { host } => {
                         let wrapped = HttpObfs::new(tcp, host, self.port)
                             .map_err(|e| MeowError::Config(format!("ss obfs: {e}")))?;
-                        Ok(self.ss_conn(wrapped, addr))
+                        let mut stream = self.ss_conn(wrapped, addr);
+                        use tokio::io::AsyncWriteExt;
+                        // Like mihomo, send the SS salt + target address as
+                        // the fake request's whole body at dial time rather
+                        // than coalescing it with the client's first bytes:
+                        // the client's first flight (e.g. a TLS ClientHello)
+                        // then follows as passthrough, which is what
+                        // `FirstFlight` records and can replay on a redial.
+                        // An empty write is `SsConn`'s "header now" request.
+                        let _ = stream.write(&[]).await?;
+                        stream.flush().await?;
+                        Ok(stream)
                     }
                     BuiltinObfs::Tls { server } => {
                         let wrapped = TlsObfs::new(tcp, server)
@@ -1631,9 +1642,24 @@ impl ProxyAdapter for ShadowsocksAdapter {
             return Ok(Box::new(conn));
         }
 
-        self.core
-            .dial_tcp_stream(addr, metadata.is_internal())
-            .await
+        let internal = metadata.is_internal();
+        let conn = self.core.dial_tcp_stream(addr.clone(), internal).await?;
+        if matches!(self.core.plugin, PluginKind::Obfs(BuiltinObfs::Http { .. })) {
+            let core = Arc::clone(&self.core);
+            let redial: crate::first_flight::Redial = Arc::new(move || {
+                let core = Arc::clone(&core);
+                let addr = addr.clone();
+                Box::pin(async move {
+                    core.dial_tcp_stream(addr, internal)
+                        .await
+                        .map_err(|e| e.into_io_error("ss obfs redial"))
+                })
+            });
+            return Ok(Box::new(crate::first_flight::FirstFlight::new(
+                conn, redial,
+            )));
+        }
+        Ok(conn)
     }
 
     /// Run the SS handshake over an existing stream (relay chain).

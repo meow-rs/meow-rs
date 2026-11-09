@@ -23,8 +23,12 @@
 //! whose upstream sockets *are* protected) before falling back to the
 //! system resolver.
 //!
-//! The `SocketProtector` (raw-fd) hook is compiled only on Android in
-//! production — that's the platform whose VPN model demands it; for tests we
+//! The `SocketProtector` (raw-fd) hook is compiled only on Android and
+//! OpenHarmony (`target_env = "ohos"`) in production — the platforms whose
+//! VPN model demands it. OpenHarmony is fail-closed: without a protector
+//! [`connect_tcp`] / [`bind_udp`] refuse to open a socket, and hostname
+//! lookups go to the embedder's bootstrap resolver
+//! (`set_bootstrap_host_resolver`) instead of libc. For tests we
 //! also enable it on any unix host so CI can exercise it against real
 //! loopback sockets. The `HostResolver` hook carries no platform dependency
 //! and is compiled everywhere: Android installs it alongside the protector,
@@ -87,6 +91,32 @@ pub trait HostResolver: Send + Sync {
 }
 
 static RESOLVER: RwLock<Option<Arc<dyn HostResolver>>> = RwLock::new(None);
+
+/// OpenHarmony's stand-in for the system resolver (see
+/// [`set_bootstrap_host_resolver`]).
+#[cfg(target_env = "ohos")]
+static BOOTSTRAP_RESOLVER: RwLock<Option<Arc<dyn HostResolver>>> = RwLock::new(None);
+
+/// Install the OpenHarmony bootstrap resolver: a lookup that runs on the
+/// physical network (e.g. the embedder's `connection.getAddressesByName`
+/// bound to the default net), not through the VPN.
+///
+/// On OpenHarmony [`connect_tcp_host`] never falls back to libc's
+/// `getaddrinfo` — its DNS sockets cannot be protected and would loop through
+/// the tunnel — so every lookup the [`HostResolver`] hook does not answer
+/// (none installed yet, or a re-entrant lookup from inside the hook) goes
+/// here instead, and fails with `NotConnected` while none is installed.
+/// Only compiled for `target_env = "ohos"`.
+#[cfg(target_env = "ohos")]
+pub fn set_bootstrap_host_resolver(resolver: Arc<dyn HostResolver>) {
+    *BOOTSTRAP_RESOLVER.write() = Some(resolver);
+}
+
+/// Remove the OpenHarmony bootstrap resolver, if any.
+#[cfg(target_env = "ohos")]
+pub fn clear_bootstrap_host_resolver() {
+    *BOOTSTRAP_RESOLVER.write() = None;
+}
 
 /// Install the global host resolver. Call once at startup, right after the
 /// meow-rs `Resolver` is built. Safe to re-install (e.g. config reload) — the
@@ -219,12 +249,13 @@ fn sys_cache_evict(host: &str) {
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn sys_cache_evict(_host: &str) {}
 
-// In production we only compile the protector hook on Android — that's the
-// platform whose VPN model demands `VpnService.protect(fd)` and we don't want
-// non-Android binaries paying any footprint for it. For tests we additionally
+// In production we only compile the protector hook on Android and
+// OpenHarmony (`target_env = "ohos"`, whose VPN extension has the same
+// per-fd `VpnConnection.protect(fd)` model) — the platforms whose VPN model
+// demands it — and we don't want other binaries paying any footprint for it. For tests we additionally
 // enable the module on any unix host so CI (which does not target Android)
 // can actually exercise the protector path against real loopback sockets.
-#[cfg(any(target_os = "android", all(test, unix)))]
+#[cfg(any(target_os = "android", target_env = "ohos", all(test, unix)))]
 mod android {
     use super::*;
     use std::os::fd::{AsRawFd, RawFd};
@@ -234,7 +265,11 @@ mod android {
 
     /// Hook invoked on every outbound socket fd just before `connect()` /
     /// `bind()`. Typically a thin JNI shim around
-    /// `android.net.VpnService.protect(int)`.
+    /// `android.net.VpnService.protect(int)`, or on OpenHarmony a NAPI shim
+    /// around `VpnConnection.protect(fd)`.
+    ///
+    /// On OpenHarmony a dial or bind made while none is installed fails
+    /// with `NotConnected` instead of opening an unprotected socket.
     ///
     /// Implementations must not block — the call runs on the async runtime
     /// worker that is dialing the socket.
@@ -319,7 +354,7 @@ mod android {
     }
 }
 
-#[cfg(any(target_os = "android", all(test, unix)))]
+#[cfg(any(target_os = "android", target_env = "ohos", all(test, unix)))]
 pub use android::{
     clear_socket_protector, set_socket_protector, socket_protector, SocketProtector,
 };
@@ -328,16 +363,19 @@ pub use android::{
 /// socket meow opens through this module (proxy servers, DIRECT, DNS,
 /// health checks, provider fetches, TCP and UDP), so the deployer's
 /// TPROXY/REDIRECT rules can exempt meow's own traffic. `0` = unset.
-#[cfg(target_os = "linux")]
+/// OpenHarmony is `target_os = "linux"` too, but its dials go through the
+/// VPN protector — every mark consumer below is `not(target_env = "ohos")`,
+/// so the state itself is excluded there as well.
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 static ROUTING_MARK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// Install (or clear with `None` / `Some(0)`) the global routing mark.
 /// Setting `SO_MARK` needs `CAP_NET_ADMIN`; without it outbound sockets
 /// fail to open, as in mihomo. Linux only; a no-op elsewhere.
 pub fn set_routing_mark(mark: Option<u32>) {
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     ROUTING_MARK.store(mark.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
     if mark.is_some_and(|m| m != 0) {
         static WARNED: std::sync::Once = std::sync::Once::new();
         WARNED.call_once(|| {
@@ -348,11 +386,11 @@ pub fn set_routing_mark(mark: Option<u32>) {
 
 /// The live routing mark (`0` = unset; always `0` off Linux).
 pub fn routing_mark() -> u32 {
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     {
         ROUTING_MARK.load(std::sync::atomic::Ordering::Relaxed)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
     {
         0
     }
@@ -385,15 +423,20 @@ pub fn routing_mark_pinned() -> bool {
     ROUTING_MARK_PINS.load(std::sync::atomic::Ordering::Relaxed) > 0
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[cfg(all(
+    not(target_env = "ohos"),
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
 fn routing_mark_set() -> bool {
     routing_mark() != 0
 }
 
 /// `SO_MARK` on a `socket2` socket per [`ROUTING_MARK`] (`0` = unset).
 /// Linux-only by definition — `set_mark` exists on no other cfg target —
-/// so callers wrap the call in `#[cfg(target_os = "linux")]`.
-#[cfg(target_os = "linux")]
+/// so callers wrap the call in `#[cfg(target_os = "linux")]`. OpenHarmony
+/// counts as `linux` but its only callers are `not(target_env = "ohos")`,
+/// so the fn is excluded there too.
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 fn apply_routing_mark(socket: &socket2::Socket) -> io::Result<()> {
     match ROUTING_MARK.load(std::sync::atomic::Ordering::Relaxed) {
         0 => {}
@@ -414,16 +457,24 @@ fn apply_routing_mark(socket: &socket2::Socket) -> io::Result<()> {
 /// silent regressions back into the system resolver; see the module docs
 /// for the loop-routing failure mode.
 pub async fn connect_tcp(addr: SocketAddr) -> io::Result<TcpStream> {
-    #[cfg(any(target_os = "android", all(test, unix)))]
+    #[cfg(any(target_os = "android", target_env = "ohos", all(test, unix)))]
     {
         if let Some(p) = android::socket_protector() {
             return android::connect_tcp_protected(addr, p.as_ref()).await;
         }
     }
+    #[cfg(target_env = "ohos")]
+    return Err(io::Error::new(
+        io::ErrorKind::NotConnected,
+        "OpenHarmony socket protector is not initialized",
+    ));
     // TUN global-route loop avoidance (#375): when an outbound interface is
     // installed, bind the socket to it before connect() so the SYN already
     // takes the physical route past the TUN default routes.
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    #[cfg(all(
+        not(target_env = "ohos"),
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    ))]
     {
         if routing_mark_set()
             || (crate::outbound_iface::binds_peer(addr.ip())
@@ -432,14 +483,21 @@ pub async fn connect_tcp(addr: SocketAddr) -> io::Result<TcpStream> {
             return connect_tcp_iface_bound(addr).await;
         }
     }
-    TcpStream::connect(addr).await
+    #[cfg(not(target_env = "ohos"))]
+    {
+        TcpStream::connect(addr).await
+    }
 }
 
 /// Dial with the socket bound to the installed outbound interface
 /// (`SO_BINDTODEVICE` / `IP_BOUND_IF` / `IP_UNICAST_IF`) before `connect()`.
 /// Uses `tokio::net::TcpSocket` for the async connect so connection errors
 /// surface here, not on first I/O.
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+// Unused on OpenHarmony, whose dials fail closed without a protector.
+#[cfg(all(
+    not(target_env = "ohos"),
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
 pub(crate) async fn connect_tcp_iface_bound(addr: SocketAddr) -> io::Result<TcpStream> {
     let domain = if addr.is_ipv4() {
         socket2::Domain::IPV4
@@ -507,7 +565,8 @@ async fn resolve_addrs(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
         return Ok(cached);
     }
 
-    #[cfg(any(target_os = "android", all(test, unix)))]
+    // Not on OpenHarmony: it never falls back to the system resolver.
+    #[cfg(all(not(target_env = "ohos"), any(target_os = "android", all(test, unix))))]
     {
         if android::socket_protector().is_some() {
             tracing::warn!(
@@ -518,6 +577,19 @@ async fn resolve_addrs(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
         }
     }
 
+    // OpenHarmony: libc's resolver sockets cannot be protected, so the
+    // embedder's physical-network resolver stands in for it (fail-closed).
+    #[cfg(target_env = "ohos")]
+    let addrs: Vec<SocketAddr> = {
+        let bootstrap = BOOTSTRAP_RESOLVER.read().clone().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "OpenHarmony bootstrap resolver is not initialized",
+            )
+        })?;
+        resolve_via_hook(bootstrap.as_ref(), host, port).await?
+    };
+    #[cfg(not(target_env = "ohos"))]
     let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port)).await?.collect();
     if addrs.is_empty() {
         return Err(io::Error::new(
@@ -647,7 +719,7 @@ async fn bind_udp_with_peer<A: ToSocketAddrs>(
 ) -> io::Result<UdpSocket> {
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     let _ = peer;
-    #[cfg(any(target_os = "android", all(test, unix)))]
+    #[cfg(any(target_os = "android", target_env = "ohos", all(test, unix)))]
     {
         if let Some(p) = android::socket_protector() {
             let resolved = tokio::net::lookup_host(local)
@@ -659,10 +731,18 @@ async fn bind_udp_with_peer<A: ToSocketAddrs>(
             return android::bind_udp_protected(resolved, p.as_ref());
         }
     }
+    #[cfg(target_env = "ohos")]
+    return Err(io::Error::new(
+        io::ErrorKind::NotConnected,
+        "OpenHarmony socket protector is not initialized",
+    ));
     // TUN global-route loop avoidance (#375): bind the socket to the
     // installed outbound interface before the local-address bind, mirroring
     // `connect_tcp` — so the first datagram already bypasses the TUN routes.
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    #[cfg(all(
+        not(target_env = "ohos"),
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    ))]
     {
         if routing_mark_set() || crate::outbound_iface::outbound_interface().is_some() {
             let resolved = tokio::net::lookup_host(local)
@@ -674,13 +754,22 @@ async fn bind_udp_with_peer<A: ToSocketAddrs>(
             return bind_udp_iface_bound(resolved, peer.unwrap_or(resolved.ip()));
         }
     }
-    UdpSocket::bind(local).await
+    #[cfg(not(target_env = "ohos"))]
+    {
+        UdpSocket::bind(local).await
+    }
 }
 
 /// Bind a UDP socket to the installed outbound interface
 /// (`SO_BINDTODEVICE` / `IP_BOUND_IF` / `IP_UNICAST_IF`), then to `local`.
 /// The destination determines whether the interface binding is required.
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+/// A socket pinned to a loopback `local` address is left unbound where the
+/// platform's binding would break it (see `outbound_iface::binds_peer`).
+// Unused on OpenHarmony, whose dials fail closed without a protector.
+#[cfg(all(
+    not(target_env = "ohos"),
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
 pub(crate) fn bind_udp_iface_bound(local: SocketAddr, peer: IpAddr) -> io::Result<UdpSocket> {
     let domain = if local.is_ipv4() {
         socket2::Domain::IPV4
