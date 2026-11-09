@@ -185,7 +185,12 @@ pub fn needs_core(route: &RouteTable, mode: TunnelMode, domain: &str, ip: IpAddr
             continue;
         }
         let target = rule.adapter();
-        let direct = if target == "DIRECT" {
+        let direct = if rule.rule_type() == RuleType::SubRule {
+            // A SUB-RULE's `adapter()` is the block name, not a proxy —
+            // the inner rules' target is unknowable at verdict time, so
+            // assume core: `judge` already answers `Maybe{scoped}`.
+            false
+        } else if target == "DIRECT" {
             // The built-in resolves without a registry entry.
             true
         } else {
@@ -307,6 +312,16 @@ impl meow_dns::answer_hook::AnswerHook for NftsetHook {
             if fresh(&st) {
                 return;
             }
+            // A latched-dead or backing-off family never reaches the
+            // add — skip the rules verdict too.
+            #[cfg(target_os = "linux")]
+            if st.dead[usize::from(ip.is_ipv6())]
+                || st
+                    .last_failure
+                    .is_some_and(|t| now.duration_since(t) < TRANSIENT_BACKOFF)
+            {
+                return;
+            }
         }
         let route = self.tunnel.route_snapshot();
         if !needs_core(&route, self.tunnel.mode(), domain, ip) {
@@ -336,11 +351,21 @@ impl meow_dns::answer_hook::AnswerHook for NftsetHook {
                 match meow_common::nftset::NftWriter::new() {
                     Ok(w) => st.writer = Some(w),
                     Err(e) => {
-                        if !st.warned[fam] {
-                            st.warned[fam] = true;
-                            tracing::warn!("dns.nftset: netlink socket: {e}");
+                        // AF_NETLINK SOCK_RAW itself needs CAP_NET_ADMIN —
+                        // a permanent failure, same as an add-time EPERM.
+                        if permanent(&e) {
+                            st.dead[fam] = true;
+                            tracing::warn!(
+                                "dns.nftset: netlink socket: {e} — giving up on \
+                                 this address family"
+                            );
+                        } else {
+                            if !st.warned[fam] {
+                                st.warned[fam] = true;
+                                tracing::warn!("dns.nftset: netlink socket: {e}");
+                            }
+                            st.last_failure = Some(now);
                         }
-                        st.last_failure = Some(now);
                         return;
                     }
                 }
@@ -446,10 +471,19 @@ mod tests {
     }
 
     fn route_with(lines: &[&str], proxies: HashMap<SmolStr, Arc<dyn Proxy>>) -> RouteTable {
-        let rules: Vec<Box<dyn Rule>> = lines
-            .iter()
-            .map(|l| parse_rule(l, &Default::default()).unwrap())
-            .collect();
+        route_from_rules(
+            lines
+                .iter()
+                .map(|l| parse_rule(l, &Default::default()).unwrap())
+                .collect(),
+            proxies,
+        )
+    }
+
+    fn route_from_rules(
+        rules: Vec<Box<dyn Rule>>,
+        proxies: HashMap<SmolStr, Arc<dyn Proxy>>,
+    ) -> RouteTable {
         let rule_stats = crate::rule_stats::RuleStats::new(rules.len());
         RouteTable {
             rules: Arc::new(rules),
@@ -585,5 +619,23 @@ mod tests {
             )]),
         );
         assert!(!needs_core(&t, TunnelMode::Rule, "a.example.com", ip));
+    }
+
+    #[test]
+    fn sub_rule_targets_are_judged_conservatively() {
+        let ip: IpAddr = "198.51.100.1".parse().unwrap();
+        let sub = meow_rules::sub_rule::SubRuleRule::new(
+            "sub",
+            Arc::new(
+                vec![parse_rule("MATCH,DIRECT", &Default::default()).unwrap()]
+                    as Vec<Box<dyn Rule>>,
+            ),
+        );
+        let match_direct = parse_rule("MATCH,DIRECT", &Default::default()).unwrap();
+        // A SUB-RULE's `adapter()` is the block name — not a proxy —
+        // so the registry lookup must not skip it: the inner rules may
+        // proxy, and the verdict assumes core either way.
+        let t = route_from_rules(vec![Box::new(sub), match_direct], HashMap::new());
+        assert!(needs_core(&t, TunnelMode::Rule, "a.example.com", ip));
     }
 }

@@ -1071,11 +1071,17 @@ impl BoundDnsServer {
                         // pool with the send chained after it — unrelated
                         // answers don't queue behind it.
                         Some(work) => {
-                            let sock = Arc::clone(&socket);
+                            // Weak, like the query tasks: the loop stays
+                            // the sole strong owner so an abort still
+                            // releases the port. A dead socket means no
+                            // listener is left to answer anyway.
+                            let sock = Arc::downgrade(&socket);
                             let dropped = Arc::clone(&dropped);
                             tokio::task::spawn_blocking(move || {
                                 work.run();
-                                send_local_answer(&sock, &response, src, &dropped);
+                                if let Some(sock) = sock.upgrade() {
+                                    send_local_answer(&sock, &response, src, &dropped);
+                                }
                             });
                         }
                         None => send_local_answer(&socket, &response, src, &dropped),
