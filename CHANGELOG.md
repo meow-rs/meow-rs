@@ -14,6 +14,8 @@ the canonical, in-repo source a release is cut from.
   without changing ordinary DNS. It preserves policy order on reload and uses
   the existing `nameserver-policy-exclusive` flag. Node-policy dependencies
   must bootstrap independently; see `docs/specs/proxy-server-dns-policy.md`.
+- `dns.listen` now binds TCP and UDP at the same address. TCP connections use
+  bounded admission, framed queries, per-query resolver reload and owned cleanup.
 
 - `redir-port` / `listeners: type: redir`: mihomo's REDIRECT inbound, rules
   owned by the deployer. `listeners: type: tproxy` takes `transparent: true`

@@ -6,7 +6,8 @@ use hickory_proto::rr::{Name, RData, Record, RecordType};
 use std::net::{IpAddr, SocketAddr};
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Weak};
-use tokio::net::UdpSocket;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tracing::{debug, error, info, warn};
 
 /// TTL stamped on regular (non-fake-IP) A/AAAA answers built by this server.
@@ -22,6 +23,13 @@ const DEFAULT_ANSWER_TTL_SECS: u32 = 60;
 const MAX_IN_FLIGHT: usize = 512;
 #[cfg(test)]
 const MAX_IN_FLIGHT: usize = 8;
+
+/// Bound idle/partial-frame connections separately from active DNS work.
+#[cfg(not(test))]
+const MAX_TCP_CONNECTIONS: usize = 128;
+#[cfg(test)]
+const MAX_TCP_CONNECTIONS: usize = 4;
+const TCP_EXCHANGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Minimal EDNS0 OPT pseudo-record (11 bytes) appended to responses when the
 /// query carried one in the additional section.  Windows DNS Client (used by
@@ -127,11 +135,14 @@ impl DnsServer {
     /// "bind failed, every query will be dropped".
     pub async fn bind(&self) -> std::io::Result<BoundDnsServer> {
         let socket = Arc::new(UdpSocket::bind(self.listen_addr).await?);
-        let bound = socket.local_addr().unwrap_or(self.listen_addr);
+        let bound = socket.local_addr()?;
+        // Roll back the UDP reservation if TCP cannot bind the same port.
+        let tcp = TcpListener::bind(bound).await?;
         info!("DNS server listening on {bound}");
         Ok(BoundDnsServer {
             resolver: Arc::clone(&self.resolver),
             socket,
+            tcp: Some(tcp),
             dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
@@ -1121,6 +1132,7 @@ impl DnsServer {
 pub struct BoundDnsServer {
     resolver: ResolverSlot,
     socket: Arc<UdpSocket>,
+    tcp: Option<TcpListener>,
     /// Queries dropped because `MAX_IN_FLIGHT` upstream-bound tasks were
     /// already running. Exposed for stats/observability (issue #515).
     dropped: Arc<std::sync::atomic::AtomicU64>,
@@ -1141,6 +1153,7 @@ impl BoundDnsServer {
         Self {
             resolver: Arc::new(parking_lot::RwLock::new(resolver)),
             socket: Arc::new(socket),
+            tcp: None,
             dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
@@ -1151,6 +1164,7 @@ impl BoundDnsServer {
         Self {
             resolver,
             socket: Arc::new(socket),
+            tcp: None,
             dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
@@ -1199,14 +1213,29 @@ impl BoundDnsServer {
     /// upstream (previously worker-held strong clones kept the port bound
     /// for up to the ~5 s query timeout after an abort, so an immediate
     /// stop→start rebind of a fixed port hit EADDRINUSE).
-    pub async fn run(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn run(mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let in_flight = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
+        if let Some(tcp) = self.tcp.take() {
+            let resolver = Arc::clone(&self.resolver);
+            tokio::select! {
+                result = self.run_udp(Arc::clone(&in_flight)) => result,
+                result = run_tcp_listener(tcp, resolver, in_flight) => result,
+            }
+        } else {
+            self.run_udp(in_flight).await
+        }
+    }
+
+    async fn run_udp(
+        self,
+        in_flight: Arc<tokio::sync::Semaphore>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let BoundDnsServer {
             resolver,
             socket,
             dropped,
+            tcp: _,
         } = self;
-
-        let in_flight = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
 
         let mut buf = vec![0u8; 4096];
         // A persistent recv failure must not spin the loop or flood the log;
@@ -1317,6 +1346,126 @@ impl BoundDnsServer {
                     }
                 }
             });
+        }
+    }
+}
+
+// This task set owns every accepted stream: dropping the listener future
+// cancels idle clients, partial frames and in-flight queries together.
+async fn run_tcp_listener(
+    listener: TcpListener,
+    resolver: ResolverSlot,
+    budget: Arc<tokio::sync::Semaphore>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut clients = tokio::task::JoinSet::new();
+    let mut backoff = meow_common::ErrorBackoff::new();
+    loop {
+        tokio::select! {
+            completed = clients.join_next(), if !clients.is_empty() => {
+                if let Some(Err(error)) = completed {
+                    warn!("DNS TCP client task failed: {error}");
+                }
+            }
+            accepted = listener.accept(), if clients.len() < MAX_TCP_CONNECTIONS => {
+                match accepted {
+                    Ok((stream, _)) => {
+                        backoff.succeeded();
+                        let resolver = Arc::clone(&resolver);
+                        let budget = Arc::clone(&budget);
+                        clients.spawn(async move {
+                            if let Err(error) = serve_tcp_client(stream, resolver, budget).await {
+                                debug!("DNS TCP exchange failed: {error}");
+                            }
+                        });
+                    }
+                    Err(error) => {
+                        if backoff.failed(&error).await {
+                            error!("DNS TCP accept failed: {error}");
+                        } else {
+                            debug!("DNS TCP accept failed: {error}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn serve_tcp_client(
+    mut stream: TcpStream,
+    resolver: ResolverSlot,
+    budget: Arc<tokio::sync::Semaphore>,
+) -> std::io::Result<()> {
+    loop {
+        let exchange = async {
+            // Distinguish orderly EOF between queries from truncated frames.
+            let mut prefix = [0; 2];
+            if stream.read(&mut prefix[..1]).await? == 0 {
+                return Ok(false);
+            }
+            stream.read_exact(&mut prefix[1..]).await?;
+            let length = usize::from(u16::from_be_bytes(prefix));
+            if length < 12 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "DNS TCP query length",
+                ));
+            }
+            // The wire prefix bounds each query to 65535 bytes. A client owns
+            // at most one frame, even when it pipelines requests.
+            let mut query = vec![0; length];
+            stream.read_exact(&mut query).await?;
+            let current = Arc::clone(&resolver.read());
+            let response = match DnsServer::try_answer_local(&query, &current) {
+                LocalAnswer::Answer(LocalResponse { response, hook }) => {
+                    if let Some(work) = hook {
+                        let permit = Arc::clone(&budget)
+                            .acquire_owned()
+                            .await
+                            .map_err(std::io::Error::other)?;
+                        // Blocking hooks cannot be aborted. Keep their charge
+                        // until the work actually finishes, even on cancellation.
+                        tokio::task::spawn_blocking(move || {
+                            let _permit = permit;
+                            work.run();
+                        })
+                        .await
+                        .map_err(std::io::Error::other)?;
+                    }
+                    response
+                }
+                LocalAnswer::Drop => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "DNS TCP query",
+                    ))
+                }
+                LocalAnswer::Upstream => {
+                    let _permit = budget.acquire().await.map_err(std::io::Error::other)?;
+                    DnsServer::handle_query(&query, &current)
+                        .await
+                        .map_err(|_| {
+                            std::io::Error::new(std::io::ErrorKind::InvalidData, "DNS TCP query")
+                        })?
+                }
+            };
+            let length = u16::try_from(response.len()).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "DNS TCP response length")
+            })?;
+            stream.write_u16(length).await?;
+            stream.write_all(&response).await?;
+            Ok(true)
+        };
+        match tokio::time::timeout(TCP_EXCHANGE_TIMEOUT, exchange).await {
+            Ok(Ok(true)) => {}
+            Ok(Ok(false)) => return Ok(()),
+            Ok(Err(error)) => return Err(error),
+            Err(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "DNS TCP exchange",
+                ))
+            }
         }
     }
 }
@@ -1788,6 +1937,250 @@ mod tests {
             "low flag byte = RA=1, rcode=0 (NoError) — not NXDOMAIN"
         );
         assert_eq!(&resp[6..8], &[0x00, 0x00], "ANCOUNT must be zero");
+    }
+
+    #[tokio::test]
+    async fn dns_tcp_bind_claims_same_port_as_udp() {
+        let server = DnsServer::new(Arc::new(empty_resolver()), "127.0.0.1:0".parse().unwrap());
+        let bound = server.bind().await.unwrap();
+        let addr = bound.local_addr().unwrap();
+        let competing = tokio::net::TcpListener::bind(addr).await;
+        assert!(
+            competing.is_err(),
+            "DNS bind must reserve TCP as well as UDP"
+        );
+        drop(bound);
+        assert!(tokio::net::TcpListener::bind(addr).await.is_ok());
+        assert!(UdpSocket::bind(addr).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dns_tcp_bind_failure_rolls_back_udp() {
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = occupied.local_addr().unwrap();
+        let server = DnsServer::new(Arc::new(empty_resolver()), addr);
+        let result = server.bind().await;
+        assert!(
+            result.is_err(),
+            "occupied TCP port must fail the whole DNS bind"
+        );
+        assert!(
+            UdpSocket::bind(addr).await.is_ok(),
+            "failed bind leaked UDP port"
+        );
+    }
+
+    async fn tcp_frame(stream: &mut TcpStream, query: &[u8]) {
+        stream.write_u16(query.len() as u16).await.unwrap();
+        stream.write_all(query).await.unwrap();
+    }
+
+    async fn tcp_reply(stream: &mut TcpStream) -> Message {
+        let length = stream.read_u16().await.unwrap() as usize;
+        let mut bytes = vec![0; length];
+        stream.read_exact(&mut bytes).await.unwrap();
+        Message::from_vec(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn dns_tcp_pipeline_reload_and_abort() {
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let mut bytes = [0; 512];
+            for _ in 0..2 {
+                let (len, source) = upstream.recv_from(&mut bytes).await.unwrap();
+                let request = Message::from_vec(&bytes[..len]).unwrap();
+                let mut response =
+                    Message::new(request.metadata.id, MessageType::Response, OpCode::Query);
+                response.add_queries(request.queries.iter().cloned());
+                response.metadata.response_code = ResponseCode::Refused;
+                upstream
+                    .send_to(&response.to_bytes().unwrap(), source)
+                    .await
+                    .unwrap();
+            }
+        });
+        let resolver = Arc::new(crate::resolver::Resolver::new(
+            vec![upstream_addr],
+            Vec::new(),
+            DnsMode::Normal,
+            meow_trie::DomainTrie::new(),
+            false,
+            true,
+        ));
+        let bound = DnsServer::new(resolver, "127.0.0.1:0".parse().unwrap())
+            .bind()
+            .await
+            .unwrap();
+        let addr = bound.local_addr().unwrap();
+        let slot = bound.resolver_slot();
+        let task = tokio::spawn(bound.run());
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        tcp_frame(&mut stream, &sample_query(10, 16)).await;
+        tcp_frame(&mut stream, &sample_query(11, 16)).await;
+        for id in [10, 11] {
+            let reply = tcp_reply(&mut stream).await;
+            assert_eq!(reply.metadata.id, id);
+            assert_eq!(reply.metadata.response_code, ResponseCode::Refused);
+        }
+        peer.await.unwrap();
+        *slot.write() = Arc::new(resolver_with_upstream_rcode(ResponseCode::NXDomain).await);
+        tcp_frame(&mut stream, &sample_query(12, 16)).await;
+        assert_eq!(
+            tcp_reply(&mut stream).await.metadata.response_code,
+            ResponseCode::NXDomain
+        );
+        // Leave a partial prefix parked when the owner goes away.
+        stream.write_all(&[0]).await.unwrap();
+        task.abort();
+        let _ = task.await;
+        let mut byte = [0];
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(2), stream.read(&mut byte))
+            .await
+            .unwrap();
+        assert!(
+            matches!(ended, Ok(0) | Err(_)),
+            "client survived listener cancellation"
+        );
+        assert!(TcpListener::bind(addr).await.is_ok());
+        assert!(UdpSocket::bind(addr).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dns_tcp_shared_budget_blocks_upstream_but_not_local_answers() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        let resolver = Arc::new(resolver_with_upstream_rcode(ResponseCode::Refused).await);
+        let slot = new_resolver_slot(resolver);
+        let budget = Arc::new(tokio::sync::Semaphore::new(1));
+        let held = budget.acquire().await.unwrap();
+        let task = tokio::spawn(serve_tcp_client(
+            stream,
+            Arc::clone(&slot),
+            Arc::clone(&budget),
+        ));
+        tcp_frame(&mut client, &sample_query(30, 16)).await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), tcp_reply(&mut client))
+                .await
+                .is_err()
+        );
+        drop(held);
+        assert_eq!(
+            tcp_reply(&mut client).await.metadata.response_code,
+            ResponseCode::Refused
+        );
+        let held = budget.acquire().await.unwrap();
+        // IPv6-disabled answers are local even when all upstream slots are busy.
+        *slot.write() = Arc::new(crate::resolver::Resolver::new(
+            Vec::new(),
+            Vec::new(),
+            DnsMode::Normal,
+            meow_trie::DomainTrie::new(),
+            false,
+            false,
+        ));
+        tcp_frame(&mut client, &sample_query(31, 28)).await;
+        let reply =
+            tokio::time::timeout(std::time::Duration::from_secs(1), tcp_reply(&mut client)).await;
+        drop(held);
+        task.abort();
+        let _ = task.await;
+        assert!(reply.is_ok(), "local answer consumed upstream budget");
+        assert_eq!(budget.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn dns_tcp_partial_frame_times_out_and_releases_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        client.write_all(&[0]).await.unwrap();
+        tokio::time::pause();
+        let result = serve_tcp_client(
+            stream,
+            new_resolver_slot(Arc::new(empty_resolver())),
+            Arc::new(tokio::sync::Semaphore::new(1)),
+        )
+        .await;
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn dns_tcp_truncated_frame_is_not_clean_eof() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        client.write_all(&[0, 12, 1]).await.unwrap();
+        client.shutdown().await.unwrap();
+        let result = serve_tcp_client(
+            stream,
+            new_resolver_slot(Arc::new(empty_resolver())),
+            Arc::new(tokio::sync::Semaphore::new(1)),
+        )
+        .await;
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[tokio::test]
+    async fn dns_tcp_connection_cap_keeps_udp_responsive_and_releases_slots() {
+        let resolver = Arc::new(crate::resolver::Resolver::new(
+            Vec::new(),
+            Vec::new(),
+            DnsMode::Normal,
+            meow_trie::DomainTrie::new(),
+            false,
+            false,
+        ));
+        let bound = DnsServer::new(resolver, "127.0.0.1:0".parse().unwrap())
+            .bind()
+            .await
+            .unwrap();
+        let addr = bound.local_addr().unwrap();
+        let task = tokio::spawn(bound.run());
+        let mut clients = Vec::new();
+        for id in 0..MAX_TCP_CONNECTIONS {
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            tcp_frame(&mut client, &sample_query(id as u16, 28)).await;
+            assert_eq!(tcp_reply(&mut client).await.metadata.id, id as u16);
+            clients.push(client);
+        }
+        let mut waiting = TcpStream::connect(addr).await.unwrap();
+        tcp_frame(&mut waiting, &sample_query(100, 28)).await;
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            tcp_reply(&mut waiting)
+        )
+        .await
+        .is_err());
+        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        udp.send_to(&sample_query(101, 28), addr).await.unwrap();
+        let mut bytes = [0; 512];
+        let (len, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), udp.recv_from(&mut bytes))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(Message::from_vec(&bytes[..len]).unwrap().metadata.id, 101);
+        drop(clients.pop());
+        let reply =
+            tokio::time::timeout(std::time::Duration::from_secs(1), tcp_reply(&mut waiting))
+                .await
+                .unwrap();
+        assert_eq!(reply.metadata.id, 100);
+        task.abort();
+        let _ = task.await;
     }
 
     fn empty_resolver() -> crate::resolver::Resolver {
