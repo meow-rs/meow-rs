@@ -113,6 +113,13 @@ jobs:
     # `ubuntu-latest` once it is built some other way.
     runs-on: ubuntu-24.04
     needs: lint
+    env:
+      # Pinned external test-peer versions — one source for the download
+      # URL, the cache key and the install step, so a version bump can
+      # never leave a stale key behind. Keep in sync with
+      # SINGBOX_VERSION in crates/meow-app/tests/smux_singbox_integration.rs.
+      SINGBOX_VERSION: "1.14.0"
+      GOST_VERSION: "3.3.0"
     steps:
       - uses: actions/checkout@v5
 
@@ -125,7 +132,34 @@ jobs:
       # cargo-nextest: per-test process isolation + `--retries 2 --no-fail-fast` absorbs
       # the tail-latency/UDP-drop flakes these real-I/O suites are prone to
       # on shared runners (e.g. snell_v3_docker_udp read timeouts).
+      # The release-asset download is itself a flake edge (GitHub CDN 504s)
+      # — cache the installed binary; install-action drops it in
+      # ~/.cargo/bin when that is on PATH, else ~/.install-action/bin.
+      # Bump the -v1 suffix to refresh the cached binary.
+      - name: Cache cargo-nextest
+        id: cache-nextest
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.install-action/bin/cargo-nextest*
+            ~/.cargo/bin/cargo-nextest*
+          key: install-action-nextest-${{ runner.os }}-${{ runner.arch }}-v1
+
+      - name: Restore cargo-nextest PATH
+        if: steps.cache-nextest.outputs.cache-hit == 'true' && runner.os != 'Windows'
+        # Either install dir may hold the binary depending on whether
+        # ~/.cargo/bin was already on PATH — add both.
+        run: |
+          echo "$HOME/.install-action/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Restore cargo-nextest PATH (Windows)
+        if: steps.cache-nextest.outputs.cache-hit == 'true' && runner.os == 'Windows'
+        run: |
+          Add-Content -Encoding utf8 -Path $env:GITHUB_PATH -Value "$env:USERPROFILE\.install-action\bin"
+
       - name: Install cargo-nextest
+        if: steps.cache-nextest.outputs.cache-hit != 'true'
         uses: taiki-e/install-action@nextest
 
       - name: Cache ssserver binary
@@ -151,20 +185,38 @@ jobs:
           command -v obfs-local
           command -v obfs-server
 
+      - name: Cache sing-box binary
+        id: cache-sing-box
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/ci-peers/sing-box
+          key: sing-box-${{ env.SINGBOX_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+
       # Real-server smux E2E (smux_singbox_integration) runs against this
       # pinned sing-box and REFUSES to silently skip when it is missing,
-      # so a green run always means real-server smux was exercised. Keep
-      # the version in sync with SINGBOX_VERSION in
-      # crates/meow-app/tests/smux_singbox_integration.rs.
+      # so a green run always means real-server smux was exercised. The
+      # version pin lives in this job's env (see above).
       - name: Install sing-box (real-server smux E2E)
         run: |
           set -euo pipefail
-          SINGBOX_VERSION=1.14.0
-          curl -fsSL -o /tmp/sing-box.tar.gz \
-            "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/sing-box-${SINGBOX_VERSION}-linux-amd64.tar.gz"
-          tar -xzf /tmp/sing-box.tar.gz -C /tmp
-          sudo install -m 755 "/tmp/sing-box-${SINGBOX_VERSION}-linux-amd64/sing-box" /usr/local/bin/sing-box
+          # On a cache hit the staged binary is already in place — skip
+          # the release-asset download entirely (GitHub CDN 504 shield).
+          if [ ! -x "$RUNNER_TEMP/ci-peers/sing-box" ]; then
+            curl -fsSL -o /tmp/sing-box.tar.gz \
+              "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/sing-box-${SINGBOX_VERSION}-linux-amd64.tar.gz"
+            tar -xzf /tmp/sing-box.tar.gz -C /tmp
+            mkdir -p "$RUNNER_TEMP/ci-peers"
+            cp "/tmp/sing-box-${SINGBOX_VERSION}-linux-amd64/sing-box" "$RUNNER_TEMP/ci-peers/sing-box"
+          fi
+          sudo install -m 755 "$RUNNER_TEMP/ci-peers/sing-box" /usr/local/bin/sing-box
           command -v sing-box
+
+      - name: Cache gost binary
+        id: cache-gost
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/ci-peers/gost
+          key: gost-${{ env.GOST_VERSION }}-${{ runner.os }}-${{ runner.arch }}
 
       # Real-peer gost-plugin interop (gost_plugin_integration) runs against
       # this pinned gost binary — with it on PATH the suite exercises a real
@@ -172,18 +224,32 @@ jobs:
       - name: Install gost (gost-plugin interop E2E)
         run: |
           set -euo pipefail
-          GOST_VERSION=3.3.0
-          curl -fsSL -o /tmp/gost.tar.gz \
-            "https://github.com/go-gost/gost/releases/download/v${GOST_VERSION}/gost_${GOST_VERSION}_linux_amd64.tar.gz"
-          tar -xzf /tmp/gost.tar.gz -C /tmp gost
-          sudo install -m 755 /tmp/gost /usr/local/bin/gost
+          if [ ! -x "$RUNNER_TEMP/ci-peers/gost" ]; then
+            curl -fsSL -o /tmp/gost.tar.gz \
+              "https://github.com/go-gost/gost/releases/download/v${GOST_VERSION}/gost_${GOST_VERSION}_linux_amd64.tar.gz"
+            tar -xzf /tmp/gost.tar.gz -C /tmp gost
+            mkdir -p "$RUNNER_TEMP/ci-peers"
+            cp /tmp/gost "$RUNNER_TEMP/ci-peers/gost"
+          fi
+          sudo install -m 755 "$RUNNER_TEMP/ci-peers/gost" /usr/local/bin/gost
           command -v gost
+
+      # hashFiles rotates the key whenever the pin/version/SHA256 in the
+      # fetch script changes — the cached dir is exactly what the script
+      # would have produced.
+      - name: Cache v2ray-plugin
+        id: cache-v2ray-plugin
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/v2ray-plugin
+          key: v2ray-plugin-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/fetch-v2ray-plugin.sh') }}
 
       # v2ray_plugin_integration runs ssserver with this official
       # v2ray-plugin as its server plugin (default options, so Mux.Cool,
       # plus `mux=0` legs); V2RAY_PLUGIN_BIN on the test step points the
       # suite at it, and the suite fails when it is unset (no silent skip).
       - name: Fetch official v2ray-plugin (pinned, SHA256 verified)
+        if: steps.cache-v2ray-plugin.outputs.cache-hit != 'true'
         run: bash scripts/fetch-v2ray-plugin.sh "$RUNNER_TEMP/v2ray-plugin"
 
       # The restls upstream-interop leg runs against a real
@@ -229,7 +295,15 @@ jobs:
       - name: Build
         run: cargo build --tests
 
+      - name: Cache TrustTunnel endpoint
+        id: cache-trusttunnel
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/trusttunnel
+          key: trusttunnel-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/fetch-trusttunnel-endpoint.sh') }}
+
       - name: Fetch official TrustTunnel endpoint (pinned, SHA256 verified)
+        if: steps.cache-trusttunnel.outputs.cache-hit != 'true'
         run: bash scripts/fetch-trusttunnel-endpoint.sh "$RUNNER_TEMP/trusttunnel"
 
       - name: TrustTunnel opt-in protocol and configuration tests
@@ -403,12 +477,55 @@ jobs:
           cache-on-failure: true
           key: features
 
+      - name: Cache cargo-hack
+        id: cache-cargo-hack
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.install-action/bin/cargo-hack*
+            ~/.cargo/bin/cargo-hack*
+          # bump the -v1 suffix to refresh the cached binary.
+          key: install-action-cargo-hack-${{ runner.os }}-${{ runner.arch }}-v1
+
+      - name: Restore cargo-hack PATH
+        if: steps.cache-cargo-hack.outputs.cache-hit == 'true' && runner.os != 'Windows'
+        run: |
+          echo "$HOME/.install-action/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Restore cargo-hack PATH (Windows)
+        if: steps.cache-cargo-hack.outputs.cache-hit == 'true' && runner.os == 'Windows'
+        run: |
+          Add-Content -Encoding utf8 -Path $env:GITHUB_PATH -Value "$env:USERPROFILE\.install-action\bin"
+
       - name: Install cargo-hack
+        if: steps.cache-cargo-hack.outputs.cache-hit != 'true'
         uses: taiki-e/install-action@cargo-hack
+
+      - name: Cache cargo-nextest
+        id: cache-nextest
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.install-action/bin/cargo-nextest*
+            ~/.cargo/bin/cargo-nextest*
+          key: install-action-nextest-${{ runner.os }}-${{ runner.arch }}-v1
+
+      - name: Restore cargo-nextest PATH
+        if: steps.cache-nextest.outputs.cache-hit == 'true' && runner.os != 'Windows'
+        run: |
+          echo "$HOME/.install-action/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Restore cargo-nextest PATH (Windows)
+        if: steps.cache-nextest.outputs.cache-hit == 'true' && runner.os == 'Windows'
+        run: |
+          Add-Content -Encoding utf8 -Path $env:GITHUB_PATH -Value "$env:USERPROFILE\.install-action\bin"
 
       # The ss-only meow-config leg below runs its reserved-plugin contract
       # tests through nextest like every other test step.
       - name: Install cargo-nextest
+        if: steps.cache-nextest.outputs.cache-hit != 'true'
         uses: taiki-e/install-action@nextest
 
       # Capped powerset: --depth 2 covers the empty set, every single feature,
@@ -477,6 +594,10 @@ jobs:
   windows:
     runs-on: windows-latest
     needs: lint
+    env:
+      # Exact LLVM pin — the cache key names it, so a stale-key restore
+      # can never hide a minor-version bump behind a floating "18".
+      LLVM_VERSION: "18.1.8"
     steps:
       - uses: actions/checkout@v5
 
@@ -490,19 +611,70 @@ jobs:
           cache-on-failure: true
           key: windows
 
+      - name: Cache cargo-nextest
+        id: cache-nextest
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.install-action/bin/cargo-nextest*
+            ~/.cargo/bin/cargo-nextest*
+          # bump the -v1 suffix to refresh the cached binary.
+          key: install-action-nextest-${{ runner.os }}-${{ runner.arch }}-v1
+
+      - name: Restore cargo-nextest PATH
+        if: steps.cache-nextest.outputs.cache-hit == 'true' && runner.os != 'Windows'
+        run: |
+          echo "$HOME/.install-action/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Restore cargo-nextest PATH (Windows)
+        if: steps.cache-nextest.outputs.cache-hit == 'true' && runner.os == 'Windows'
+        run: |
+          Add-Content -Encoding utf8 -Path $env:GITHUB_PATH -Value "$env:USERPROFILE\.install-action\bin"
+
       - name: Install cargo-nextest
+        if: steps.cache-nextest.outputs.cache-hit != 'true'
         uses: taiki-e/install-action@nextest
+
+      - name: Cache LLVM
+        id: cache-llvm
+        uses: actions/cache@v4
+        with:
+          path: "C:\\Program Files\\LLVM"
+          key: llvm-${{ env.LLVM_VERSION }}-${{ runner.os }}
+
+      # Mirrors the env block install-llvm-action exports for bindgen
+      # (LLVM_PATH + <bin> on PATH; lib dirs for the LLVM dylibs).
+      - name: Restore LLVM environment
+        if: steps.cache-llvm.outputs.cache-hit == 'true'
+        run: |
+          Add-Content -Encoding utf8 -Path $env:GITHUB_ENV -Value "LLVM_PATH=C:\Program Files\LLVM"
+          Add-Content -Encoding utf8 -Path $env:GITHUB_ENV -Value "LD_LIBRARY_PATH=C:\Program Files\LLVM\lib"
+          Add-Content -Encoding utf8 -Path $env:GITHUB_ENV -Value "DYLD_LIBRARY_PATH=C:\Program Files\LLVM\lib"
+          Add-Content -Encoding utf8 -Path $env:GITHUB_PATH -Value "C:\Program Files\LLVM\bin"
 
       # lwIP (listener-tun, in the `full` default bundle) uses bindgen.
       - name: Install LLVM
+        if: steps.cache-llvm.outputs.cache-hit != 'true'
         uses: KyleMayes/install-llvm-action@v2
         with:
-          version: "18"
+          version: ${{ env.LLVM_VERSION }}
+
+      - name: Cache wintun.dll
+        id: cache-wintun
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/wintun
+          # The DLL arch is the *target's*, named in the key — one wintun
+          # arch per target triple, hashFiles rotates on the version pin.
+          key: wintun-x86_64-pc-windows-msvc-${{ hashFiles('scripts/fetch-wintun.sh') }}
 
       - name: Fetch wintun.dll
         shell: bash
         run: |
-          bash scripts/fetch-wintun.sh --target x86_64-pc-windows-msvc --outdir "$RUNNER_TEMP/wintun"
+          if [ ! -f "$RUNNER_TEMP/wintun/wintun.dll" ]; then
+            bash scripts/fetch-wintun.sh --target x86_64-pc-windows-msvc --outdir "$RUNNER_TEMP/wintun"
+          fi
           echo "MEOW_WINTUN_DLL=$RUNNER_TEMP/wintun/wintun.dll" >> "$GITHUB_ENV"
 
       - name: Clippy (default features)
@@ -591,7 +763,29 @@ jobs:
           cache-on-failure: true
           key: macos
 
+      - name: Cache cargo-nextest
+        id: cache-nextest
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.install-action/bin/cargo-nextest*
+            ~/.cargo/bin/cargo-nextest*
+          # bump the -v1 suffix to refresh the cached binary.
+          key: install-action-nextest-${{ runner.os }}-${{ runner.arch }}-v1
+
+      - name: Restore cargo-nextest PATH
+        if: steps.cache-nextest.outputs.cache-hit == 'true' && runner.os != 'Windows'
+        run: |
+          echo "$HOME/.install-action/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Restore cargo-nextest PATH (Windows)
+        if: steps.cache-nextest.outputs.cache-hit == 'true' && runner.os == 'Windows'
+        run: |
+          Add-Content -Encoding utf8 -Path $env:GITHUB_PATH -Value "$env:USERPROFILE\.install-action\bin"
+
       - name: Install cargo-nextest
+        if: steps.cache-nextest.outputs.cache-hit != 'true'
         uses: taiki-e/install-action@nextest
 
       - name: Build

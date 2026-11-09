@@ -21,6 +21,11 @@ jobs:
     # fork owners' minutes on a run that cannot upload without upstream's
     # Codecov token anyway.
     if: github.event.repository.fork == false
+    env:
+      # Pinned sing-box version — one source for the download URL and the
+      # cache key. Keep in sync with test.yml and SINGBOX_VERSION in
+      # crates/meow-app/tests/smux_singbox_integration.rs.
+      SINGBOX_VERSION: "1.14.0"
     steps:
       - uses: actions/checkout@v5
 
@@ -50,7 +55,29 @@ jobs:
           cache-on-failure: true
           key: coverage
 
+      - name: Cache cargo-llvm-cov
+        id: cache-cargo-llvm-cov
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.install-action/bin/cargo-llvm-cov*
+            ~/.cargo/bin/cargo-llvm-cov*
+          # bump the -v1 suffix to refresh the cached binary.
+          key: install-action-cargo-llvm-cov-${{ runner.os }}-${{ runner.arch }}-v1
+
+      - name: Restore cargo-llvm-cov PATH
+        if: steps.cache-cargo-llvm-cov.outputs.cache-hit == 'true' && runner.os != 'Windows'
+        run: |
+          echo "$HOME/.install-action/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Restore cargo-llvm-cov PATH (Windows)
+        if: steps.cache-cargo-llvm-cov.outputs.cache-hit == 'true' && runner.os == 'Windows'
+        run: |
+          Add-Content -Encoding utf8 -Path $env:GITHUB_PATH -Value "$env:USERPROFILE\.install-action\bin"
+
       - name: Install cargo-llvm-cov
+        if: steps.cache-cargo-llvm-cov.outputs.cache-hit != 'true'
         uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: Cache ssserver binary
@@ -73,18 +100,28 @@ jobs:
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends simple-obfs
 
+      - name: Cache sing-box binary
+        id: cache-sing-box
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/ci-peers/sing-box
+          key: sing-box-${{ env.SINGBOX_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+
       # The real-server smux E2E (smux_singbox_integration) REFUSES to
-      # silently skip without this binary. Keep the version in sync with
-      # SINGBOX_VERSION in crates/meow-app/tests/smux_singbox_integration.rs
-      # and with the test.yml install step.
+      # silently skip without this binary. The version pin lives in this
+      # job's env (see above); keep it in sync with test.yml and
+      # SINGBOX_VERSION in crates/meow-app/tests/smux_singbox_integration.rs.
       - name: Install sing-box (real-server smux E2E)
         run: |
           set -euo pipefail
-          SINGBOX_VERSION=1.14.0
-          curl -fsSL -o /tmp/sing-box.tar.gz \
-            "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/sing-box-${SINGBOX_VERSION}-linux-amd64.tar.gz"
-          tar -xzf /tmp/sing-box.tar.gz -C /tmp
-          sudo install -m 755 "/tmp/sing-box-${SINGBOX_VERSION}-linux-amd64/sing-box" /usr/local/bin/sing-box
+          if [ ! -x "$RUNNER_TEMP/ci-peers/sing-box" ]; then
+            curl -fsSL -o /tmp/sing-box.tar.gz \
+              "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/sing-box-${SINGBOX_VERSION}-linux-amd64.tar.gz"
+            tar -xzf /tmp/sing-box.tar.gz -C /tmp
+            mkdir -p "$RUNNER_TEMP/ci-peers"
+            cp "/tmp/sing-box-${SINGBOX_VERSION}-linux-amd64/sing-box" "$RUNNER_TEMP/ci-peers/sing-box"
+          fi
+          sudo install -m 755 "$RUNNER_TEMP/ci-peers/sing-box" /usr/local/bin/sing-box
           command -v sing-box
 
       # The real-peer e2e suites (restls_e2e, jls_e2e, kcptun_e2e,
@@ -118,10 +155,26 @@ jobs:
         working-directory: crates/meow-proxy/tests/support/kcptun-server
         run: go build -o "$RUNNER_TEMP/kcptun-server" .
 
+      - name: Cache TrustTunnel endpoint
+        id: cache-trusttunnel
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/trusttunnel
+          key: trusttunnel-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/fetch-trusttunnel-endpoint.sh') }}
+
       - name: Fetch official TrustTunnel endpoint (pinned, SHA256 verified)
+        if: steps.cache-trusttunnel.outputs.cache-hit != 'true'
         run: bash scripts/fetch-trusttunnel-endpoint.sh "$RUNNER_TEMP/trusttunnel"
 
+      - name: Cache v2ray-plugin
+        id: cache-v2ray-plugin
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/v2ray-plugin
+          key: v2ray-plugin-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/fetch-v2ray-plugin.sh') }}
+
       - name: Fetch official v2ray-plugin (pinned, SHA256 verified)
+        if: steps.cache-v2ray-plugin.outputs.cache-hit != 'true'
         run: bash scripts/fetch-v2ray-plugin.sh "$RUNNER_TEMP/v2ray-plugin"
 
       - name: Collect coverage

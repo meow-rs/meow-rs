@@ -30,6 +30,11 @@ jobs:
     # Scheduled workflows also fire on forks that enable Actions — don't
     # burn fork owners' minutes on a daily trend only upstream reads.
     if: github.event.repository.fork == false
+    env:
+      # Pinned sing-box version — one source for the download URL and the
+      # cache key. Keep in sync with test.yml and SINGBOX_VERSION in
+      # crates/meow-app/tests/smux_singbox_integration.rs.
+      SINGBOX_VERSION: "1.14.0"
 
     steps:
       - uses: actions/checkout@v5
@@ -50,17 +55,28 @@ jobs:
       - name: Build release binaries
         run: cargo build --release -p meow-app -p meow-bench
 
+      - name: Cache sing-box binary
+        id: cache-sing-box
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/ci-peers/sing-box
+          key: sing-box-${{ env.SINGBOX_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+
       # Proxied-outbound workload (#558): sing-box is the VLESS server
-      # half. Keep the pin in sync with SINGBOX_VERSION in
+      # half. The version pin lives in this job's env (see above); keep it
+      # in sync with test.yml and SINGBOX_VERSION in
       # crates/meow-app/tests/smux_singbox_integration.rs.
       - name: Install sing-box (proxied workload server)
         run: |
           set -euo pipefail
-          SINGBOX_VERSION=1.14.0
-          curl -fsSL --retry 3 --retry-delay 5 -o /tmp/sing-box.tar.gz \
-            "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/sing-box-${SINGBOX_VERSION}-linux-amd64.tar.gz"
-          tar -xzf /tmp/sing-box.tar.gz -C /tmp
-          sudo install -m 755 "/tmp/sing-box-${SINGBOX_VERSION}-linux-amd64/sing-box" /usr/local/bin/sing-box
+          if [ ! -x "$RUNNER_TEMP/ci-peers/sing-box" ]; then
+            curl -fsSL --retry 3 --retry-delay 5 -o /tmp/sing-box.tar.gz \
+              "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/sing-box-${SINGBOX_VERSION}-linux-amd64.tar.gz"
+            tar -xzf /tmp/sing-box.tar.gz -C /tmp
+            mkdir -p "$RUNNER_TEMP/ci-peers"
+            cp "/tmp/sing-box-${SINGBOX_VERSION}-linux-amd64/sing-box" "$RUNNER_TEMP/ci-peers/sing-box"
+          fi
+          sudo install -m 755 "$RUNNER_TEMP/ci-peers/sing-box" /usr/local/bin/sing-box
           command -v sing-box
 
       - name: Run benchmark harness
