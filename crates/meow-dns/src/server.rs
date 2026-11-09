@@ -379,7 +379,7 @@ impl DnsServer {
         if let Some(response) =
             Self::try_response_rule(data, question_len, &domain, qtype, resolver)
         {
-            return LocalAnswer::Answer(response);
+            return LocalAnswer::Answer(LocalResponse::plain(response));
         }
 
         let outcome = {
@@ -2839,6 +2839,96 @@ mod tests {
             assert!(keys.contains(&SvcParamKey::Alpn));
             assert!(!keys.contains(&SvcParamKey::Ipv4Hint));
             assert!(!keys.contains(&SvcParamKey::Ipv6Hint));
+        }
+    }
+
+    #[tokio::test]
+    async fn response_rule_implicit_fake_ip_suppression_strips_hints() {
+        use crate::fakeip::{MemoryStore, Pool, Skipper, SkipperMode};
+        use crate::response_policy::ResponseRule;
+        use hickory_proto::rr::rdata::svcb::SvcParamKey;
+        for forward_aaaa in [false, true] {
+            for bypass in [false, true] {
+                let upstream = spawn_dns_responder(|response| {
+                    response.add_answer(https_record_with_hints());
+                    response.add_authority(https_record_with_hints());
+                    response.add_additional(https_record_with_hints());
+                })
+                .await;
+                let mut resolver = Resolver::new(
+                    vec![upstream],
+                    vec![],
+                    DnsMode::FakeIp,
+                    meow_trie::DomainTrie::new(),
+                    true,
+                    true,
+                );
+                resolver.set_fakeip_v4(Arc::new(
+                    Pool::new(
+                        "198.18.0.0/16".parse().unwrap(),
+                        Arc::new(MemoryStore::new(32)),
+                    )
+                    .unwrap(),
+                ));
+                if bypass {
+                    resolver.set_fakeip_skipper(Skipper::new(
+                        &["example.com".to_string()],
+                        SkipperMode::BlackList,
+                    ));
+                }
+                let mut rules = vec![ResponseRule {
+                    matcher: Arc::new(|name| name == "example.com"),
+                    query_types: vec![1],
+                    action: ResponseAction::NoData,
+                }];
+                if forward_aaaa {
+                    rules.push(ResponseRule {
+                        matcher: Arc::new(|name| name == "example.com"),
+                        query_types: vec![28],
+                        action: ResponseAction::Forward,
+                    });
+                }
+                resolver.set_response_rules(rules).unwrap();
+                if !bypass {
+                    for qtype in [1, 28] {
+                        let wire = DnsServer::handle_query(&sample_query(42, qtype), &resolver)
+                            .await
+                            .unwrap();
+                        let response = Message::from_vec(&wire).unwrap();
+                        assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+                        assert!(
+                            response.answers.is_empty(),
+                            "both address families are suppressed"
+                        );
+                    }
+                }
+                let wire = DnsServer::handle_query(&sample_query(42, 65), &resolver)
+                    .await
+                    .unwrap();
+                let response = Message::from_vec(&wire).unwrap();
+                for rec in response
+                    .answers
+                    .iter()
+                    .chain(&response.authorities)
+                    .chain(&response.additionals)
+                {
+                    let RData::HTTPS(record) = &rec.data else {
+                        panic!("HTTPS required")
+                    };
+                    let keys: Vec<_> = record.0.svc_params.iter().map(|(key, _)| *key).collect();
+                    assert!(keys.contains(&SvcParamKey::Alpn));
+                    assert_eq!(
+                        keys.contains(&SvcParamKey::Ipv4Hint),
+                        bypass,
+                        "forward={forward_aaaa}, bypass={bypass}"
+                    );
+                    assert_eq!(
+                        keys.contains(&SvcParamKey::Ipv6Hint),
+                        bypass,
+                        "forward={forward_aaaa}, bypass={bypass}"
+                    );
+                }
+            }
         }
     }
 

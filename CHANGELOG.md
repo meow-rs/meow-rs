@@ -10,7 +10,6 @@ the canonical, in-repo source a release is cut from.
 
 ### Added
 
-<<<<<<< HEAD
 - `redir-port` / `listeners: type: redir`: mihomo's REDIRECT inbound, rules
   owned by the deployer. `listeners: type: tproxy` takes `transparent: true`
   for TCP by real TPROXY (`IP_TRANSPARENT`, Linux, needs `firewall: false`).

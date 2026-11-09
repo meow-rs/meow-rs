@@ -2256,7 +2256,12 @@ impl Resolver {
         }
         [
             (1, self.fakeip_v4.is_some()),
-            (28, self.ipv6 && self.fakeip_v6.is_some()),
+            // The ordinary v4-only fake-IP path suppresses AAAA too
+            // (lookup_ipv6_local), even without an explicit fake-ip rule.
+            (
+                28,
+                self.ipv6 && (self.fakeip_v6.is_some() || self.fakeip_v4.is_some()),
+            ),
         ]
         .into_iter()
         .any(|(qtype, enabled)| match self.response_action(host, qtype) {

@@ -9181,6 +9181,7 @@ async fn configs_sniffing_uses_resolved_sniffer() {
     });
     let state = test_state(raw);
     assert!(!get_sniffing(&state).await, "explicit sniffer wins");
+}
 
 #[tokio::test]
 async fn response_rules_reload_order_provider_generation_and_rejection() {

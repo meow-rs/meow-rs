@@ -108,7 +108,9 @@ async fn answer(resolver: &Resolver, name: &str, kind: RecordType) -> Message {
     let local = DnsServer::try_answer_local(&request, resolver);
     let response = DnsServer::handle_query(&request, resolver).await.unwrap();
     match local {
-        LocalAnswer::Answer(inline) => assert_eq!(inline, response, "inline/task wire parity"),
+        LocalAnswer::Answer(inline) => {
+            assert_eq!(inline.response, response, "inline/task wire parity");
+        }
         LocalAnswer::Upstream => {}
         LocalAnswer::Drop => panic!("valid question dropped"),
     }
@@ -251,7 +253,7 @@ async fn malformed_queries_and_edns_versions_precede_rules() {
             if let LocalAnswer::Answer(inline) =
                 DnsServer::try_answer_local(&request, &config.resolver)
             {
-                assert_eq!(inline, response);
+                assert_eq!(inline.response, response);
             } else {
                 assert_eq!(kind, RecordType::HTTPS);
             }
