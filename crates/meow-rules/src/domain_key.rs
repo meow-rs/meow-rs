@@ -28,9 +28,11 @@
 //! still matches `foo.bar` as a substring) plus
 //! [`domain_keyword_payload_matches_all`] for the empty needle,
 //! which is not dead but the opposite — a silent match-all.
-//! `DOMAIN-REGEX` is not checked: its payload is an arbitrary
-//! pattern, so whether it can match a normalized host is not
-//! decidable by label inspection.
+//! `DOMAIN-REGEX` is not checked by these predicates: its payload is
+//! an arbitrary pattern, so whether it can match a normalized host is
+//! not decidable by label inspection — the *empty* pattern is the one
+//! decidable case, flagged as a match-all by the config-time
+//! classifier (`domain_payload_defect` in meow-config).
 
 /// The defect a domain key carries on a `DomainTrie` surface, if any.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

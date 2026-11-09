@@ -43,3 +43,23 @@ impl Rule for DomainKeywordRule {
         &self.keyword
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The empty-needle fast path returns true for every `rule_host()`
+    /// including `""` — `DOMAIN-KEYWORD,,X` silently swallows every flow.
+    /// The config-time `domain_payload_defect` match-all reason depends
+    /// on this contract (issue #869).
+    #[test]
+    fn empty_keyword_payload_matches_every_flow() {
+        let rule = DomainKeywordRule::new("", "X");
+        assert!(rule.match_metadata(&Metadata::default(), &RuleMatchHelper));
+        let named = Metadata {
+            host: "example.com".into(),
+            ..Metadata::default()
+        };
+        assert!(rule.match_metadata(&named, &RuleMatchHelper));
+    }
+}
