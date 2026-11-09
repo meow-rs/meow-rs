@@ -135,6 +135,10 @@ fn activity_ms() -> u64 {
 struct FlowEntry {
     tx: mpsc::Sender<Vec<u8>>,
     last_activity: Arc<AtomicU64>,
+    /// Owning task's id — every entry removal must also drop this slot
+    /// from `flow_owners` so slow-winding evictees cannot accumulate
+    /// stale owner records (`None` only in test fixtures).
+    task_id: Option<tokio::task::Id>,
 }
 
 /// One loop's flow table bundled with its share of the shared occupancy
@@ -264,7 +268,14 @@ pub(super) async fn run_udp(
                     Some(Ok((id, ()))) => id,
                     Some(Err(error)) => {
                         if error.is_panic() {
-                            warn!("tun UDP worker survived a panic: {error}");
+                            // Flow tasks own a table entry; helpers (hijack
+                            // queries, the reply pump) do not — the owner map
+                            // distinguishes which subsystem panicked.
+                            if flow_owners.contains_key(&error.id()) {
+                                warn!("tun UDP flow task survived a panic: {error}");
+                            } else {
+                                warn!("tun UDP helper task survived a panic: {error}");
+                            }
                         } else {
                             debug!("tun UDP worker: {error}");
                         }
@@ -380,8 +391,19 @@ pub(super) async fn run_udp(
         if sweep_countdown == 0 {
             sweep_countdown = SWEEP_INTERVAL;
             // `FlowTable` applies the gauge delta of whatever it sheds —
-            // and on `Drop` for whatever is left.
-            flows.retain(|_, e| !e.tx.is_closed());
+            // and on `Drop` for whatever is left. Shed entries drop their
+            // `flow_owners` slot too: the completion will find nothing to
+            // reap and skip harmlessly.
+            flows.retain(|_, e| {
+                if e.tx.is_closed() {
+                    if let Some(id) = e.task_id {
+                        flow_owners.remove(&id);
+                    }
+                    false
+                } else {
+                    true
+                }
+            });
         }
 
         let key = (src, dst);
@@ -395,7 +417,11 @@ pub(super) async fn run_udp(
                     // Flow task ended (idle timeout or error): evict and fall
                     // through to re-create the flow with this datagram.
                     Err(mpsc::error::TrySendError::Closed(data)) => {
+                        let task_id = entry.task_id;
                         flows.remove(&key);
+                        if let Some(id) = task_id {
+                            flow_owners.remove(&id);
+                        }
                         data
                     }
                 }
@@ -428,19 +454,12 @@ pub(super) async fn run_udp(
         // Admission bound: reclaim dead entries first, then evict the
         // least-recently-active live flow.
         if flows.len() >= MAX_FLOWS {
-            evict_for_admission(&mut flows);
+            evict_for_admission(&mut flows, &mut flow_owners);
         }
 
         let (tx, rx) = mpsc::channel(FLOW_QUEUE);
         tx.try_send(data).expect("fresh flow queue has capacity");
         let last_activity = Arc::new(AtomicU64::new(activity_ms()));
-        flows.insert(
-            key,
-            FlowEntry {
-                tx,
-                last_activity: Arc::clone(&last_activity),
-            },
-        );
         let identity = Arc::clone(&last_activity);
         let task = tasks.spawn(flow_task(
             tunnel.clone(),
@@ -454,7 +473,16 @@ pub(super) async fn run_udp(
                 sniffer: sniffer.clone(),
             },
         ));
-        flow_owners.insert(task.id(), (key, identity));
+        let task_id = task.id();
+        flows.insert(
+            key,
+            FlowEntry {
+                tx,
+                last_activity: Arc::clone(&identity),
+                task_id: Some(task_id),
+            },
+        );
+        flow_owners.insert(task_id, (key, identity));
     }
     // Stop flows parked in dial/write and DNS queries waiting for upstream.
     // Each flow owns its reply reader, which is cancelled with it; also stop
@@ -498,16 +526,28 @@ fn note_hijack_drop(counter: &AtomicU64) {
 /// sender closes that flow's queue; its task exits through the ordinary
 /// `rx.recv() == None` shutdown path. The gauge deltas ride along inside
 /// [`FlowTable`]'s `retain`/`remove`.
-fn evict_for_admission(flows: &mut FlowTable) {
-    flows.retain(|_, e| !e.tx.is_closed());
+fn evict_for_admission(flows: &mut FlowTable, owners: &mut FlowOwners) {
+    flows.retain(|_, e| {
+        if e.tx.is_closed() {
+            if let Some(id) = e.task_id {
+                owners.remove(&id);
+            }
+            false
+        } else {
+            true
+        }
+    });
     if flows.len() >= MAX_FLOWS {
-        if let Some(victim) = flows
+        if let Some((victim, task_id)) = flows
             .iter()
             .min_by_key(|(_, e)| e.last_activity.load(Ordering::Relaxed))
-            .map(|(k, _)| *k)
+            .map(|(k, e)| (*k, e.task_id))
         {
             debug!("tun UDP flow table full: evicting LRU flow {victim:?}");
             flows.remove(&victim);
+            if let Some(id) = task_id {
+                owners.remove(&id);
+            }
         }
     }
 }
@@ -852,6 +892,7 @@ mod tests {
                 FlowEntry {
                     tx,
                     last_activity: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(i as u64)),
+                    task_id: None,
                 },
             );
         }
@@ -861,7 +902,7 @@ mod tests {
     #[test]
     fn evict_for_admission_reclaims_dead_before_touching_live() {
         let (mut flows, _keepers) = seeded_table(MAX_FLOWS - 1, 3);
-        evict_for_admission(&mut flows);
+        evict_for_admission(&mut flows, &mut super::FlowOwners::new());
         assert_eq!(flows.len(), MAX_FLOWS - 1, "only dead entries removed");
     }
 
@@ -870,7 +911,7 @@ mod tests {
         let (mut flows, _keepers) = seeded_table(MAX_FLOWS, 0);
         // seeded_table stamps index 0 as least-recently-active.
         let oldest_key: super::FlowKey = (([10, 0, 0, 1], 10000).into(), ([8, 8, 8, 8], 53).into());
-        evict_for_admission(&mut flows);
+        evict_for_admission(&mut flows, &mut super::FlowOwners::new());
         assert_eq!(flows.len(), MAX_FLOWS - 1);
         assert!(
             flows.get(&oldest_key).is_none(),
@@ -888,7 +929,7 @@ mod tests {
             .unwrap()
             .last_activity
             .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
-        evict_for_admission(&mut flows);
+        evict_for_admission(&mut flows, &mut super::FlowOwners::new());
         assert!(flows.get(&oldest_key).is_some(), "refreshed flow survives");
         assert!(
             flows.get(&next_oldest_key).is_none(),
@@ -1293,6 +1334,7 @@ mod cleanup_tests {
                 FlowEntry {
                     tx,
                     last_activity: Arc::clone(&fresh),
+                    task_id: Some(id),
                 },
             );
             let completed = match tasks.join_next_with_id().await.unwrap() {
@@ -1303,7 +1345,10 @@ mod cleanup_tests {
             assert_eq!(gauge.load(Ordering::Relaxed), 1);
             assert!(Arc::ptr_eq(&flows.get(&key).unwrap().last_activity, &fresh));
             assert!(owners.is_empty());
-            // A completion of the current incarnation removes it exactly once.
+            // A completion of the current incarnation removes it exactly
+            // once — the second call no-ops because the owner slot was
+            // already consumed by the first (early-return on `None`), not
+            // because the identity check rejects it again.
             owners.insert(id, (key, fresh));
             reap_flow(&mut flows, &mut owners, id);
             reap_flow(&mut flows, &mut owners, id);
