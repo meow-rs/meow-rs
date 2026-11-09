@@ -168,7 +168,9 @@ impl NameServerEntry {
 
     /// Parse a nameserver string, returning the parsed `NameServerUrl` plus
     /// the optional proxy name carried by a plain-form `#PROXY` fragment or
-    /// an encrypted-form `?proxy=NAME` parameter section.
+    /// an encrypted-form `?proxy=NAME` parameter section. The latter decodes
+    /// percent escapes once; encode a literal percent as `%25`. Parameter keys,
+    /// the DoH request path and plain-form fragments are not decoded here.
     pub fn parse(s: &str) -> Result<Self, NameServerParseError> {
         let s = s.trim();
         if s.is_empty() {
@@ -293,7 +295,7 @@ impl NameServerEntry {
                              (only 'proxy' and 'h3' are supported)"
                         )));
                     }
-                    query_proxy = proxy_value.map(str::to_string);
+                    query_proxy = proxy_value.map(decode_proxy_name).transpose()?;
                     head = match trailing_frag {
                         Some(frag) => Cow::Owned(format!("{}{frag}", &s[..qidx])),
                         None => Cow::Borrowed(&s[..qidx]),
@@ -413,6 +415,32 @@ impl NameServerEntry {
             proxy: query_proxy,
         })
     }
+}
+
+// Decode only an already-isolated proxy value. Decoding before splitting the
+// URL would turn escaped group-name delimiters into path/SNI/parameter syntax.
+// A plus is literal (these are config URLs, not HTML form submissions).
+fn decode_proxy_name(encoded: &str) -> Result<String, NameServerParseError> {
+    let invalid =
+        || NameServerParseError::InvalidParams("invalid percent-encoded proxy name".into());
+    let mut bytes = Vec::with_capacity(encoded.len());
+    let mut input = encoded.bytes();
+    while let Some(byte) = input.next() {
+        if byte == b'%' {
+            let hi = input.next().and_then(|b| (b as char).to_digit(16));
+            let lo = input.next().and_then(|b| (b as char).to_digit(16));
+            let (Some(hi), Some(lo)) = (hi, lo) else {
+                return Err(invalid());
+            };
+            bytes.push((hi * 16 + lo) as u8);
+        } else {
+            bytes.push(byte);
+        }
+    }
+    String::from_utf8(bytes)
+        .ok()
+        .filter(|name| !name.is_empty() && !name.chars().any(char::is_control))
+        .ok_or_else(invalid)
 }
 
 impl From<NameServerUrl> for NameServerEntry {
@@ -1868,6 +1896,65 @@ mod tests {
                 NameServerUrl::Https { path, .. } => assert_eq!(path, want, "{s}"),
                 _ => panic!("expected Https"),
             }
+        }
+    }
+}
+
+#[cfg(all(test, feature = "encrypted"))]
+mod proxy_encoding_tests {
+    use super::*;
+
+    #[test]
+    fn encrypted_proxy_parameter_decodes_values_once() {
+        for scheme in ["https", "tls", "quic"] {
+            if scheme == "quic" && !cfg!(feature = "quic-dns") {
+                continue;
+            }
+            for (encoded, expected) in [
+                ("group%20%2F%20one", "group / one"),
+                ("%E9%A6%99%E6%B8%AF", "香港"),
+                ("a%26b%23c%3Fd%3De", "a&b#c?d=e"),
+                ("a+b", "a+b"),
+                ("literal%2520", "literal%20"),
+            ] {
+                let path = if scheme == "https" { "/dns-query" } else { "" };
+                let entry = NameServerEntry::parse(&format!(
+                    "{scheme}://192.0.2.1{path}?proxy={encoded}#dns.example"
+                ))
+                .unwrap();
+                assert_eq!(entry.proxy.as_deref(), Some(expected));
+                match entry.url {
+                    NameServerUrl::Https { sni, path, .. } => {
+                        assert_eq!(sni, "dns.example");
+                        assert_eq!(path, "/dns-query");
+                    }
+                    NameServerUrl::Tls { sni, .. } | NameServerUrl::Quic { sni, .. } => {
+                        assert_eq!(sni, "dns.example");
+                    }
+                    _ => panic!("unexpected scheme"),
+                }
+            }
+        }
+        // The plain-form fragment is a literal group name, not a query value.
+        assert_eq!(
+            NameServerEntry::parse("1.1.1.1#literal%20")
+                .unwrap()
+                .proxy
+                .as_deref(),
+            Some("literal%20")
+        );
+    }
+
+    #[test]
+    fn encrypted_proxy_parameter_rejects_bad_escapes_and_controls() {
+        for value in ["%", "%0", "%xx", "%FF", "%C0%AF", "%00", "%0A", "%7f"] {
+            assert!(
+                NameServerEntry::parse(&format!(
+                    "https://192.0.2.1/dns-query?proxy={value}#dns.example"
+                ))
+                .is_err(),
+                "accepted malformed proxy value {value}"
+            );
         }
     }
 }
