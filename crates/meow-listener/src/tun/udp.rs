@@ -587,6 +587,9 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
         last_activity,
         sniffer,
     } = spec;
+    // Capture the generation before any await, including sniffing and DNS.
+    // A refresh must cancel establishment, not just a connected relay.
+    let mut flush = tunnel.inner().udp_flush_watch();
     let mut metadata = Metadata {
         network: Network::Udp,
         conn_type: ConnType::Tun,
@@ -609,9 +612,12 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
         let deadline = Instant::now() + rt.timeout();
         let mut quic = crate::sniffer_quic::QuicSniffer::default();
         while held.len() < QUIC_SNIFF_PACKETS {
-            let Ok(Some(data)) = tokio::time::timeout_at(deadline, rx.recv()).await else {
-                break;
+            let packet = tokio::select! {
+                biased;
+                () = flush.flushed() => return Ok(()),
+                packet = tokio::time::timeout_at(deadline, rx.recv()) => packet,
             };
+            let Ok(Some(data)) = packet else { break };
             let step = quic.feed(&data);
             held.push(data);
             match step {
@@ -649,8 +655,14 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
     // UDP keeps the eager pre_resolve (no lazy enrichment): the outbound
     // packet API below needs a resolved dst_ip regardless of what the rules
     // demand — including after a fake-IP was rewritten back to a hostname.
-    inner.pre_resolve(&mut metadata).await;
-    inner.resolve_udp_dst(&mut metadata).await;
+    tokio::select! {
+        biased;
+        () = flush.flushed() => return Ok(()),
+        () = async {
+            inner.pre_resolve(&mut metadata).await;
+            inner.resolve_udp_dst(&mut metadata).await;
+        } => {}
+    }
     let Some(dst_ip) = metadata.dst_ip else {
         drop_held(&held);
         return Err(format!(
@@ -661,12 +673,17 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
     let dst_addr = SocketAddr::new(dst_ip, metadata.dst_port);
 
     // Non-hijacked client traffic follows the same policy on every port.
+    let target = tokio::select! {
+        biased;
+        () = flush.flushed() => return Ok(()),
+        target = inner.resolve_proxy(&metadata) => target,
+    };
     let Some(ResolvedTarget {
         adapter: proxy,
         rule_name,
         rule_payload,
         route: _route,
-    }) = inner.resolve_proxy(&metadata).await
+    }) = target
     else {
         drop_held(&held);
         return Err(format!(
@@ -682,17 +699,19 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
         UsingProxy::new(proxy.as_ref(), &metadata)
     );
 
-    // Taken before the dial so a flush landing mid-dial still ends the flow
-    // (issue #695): its socket may predate the new outbound binding.
-    let mut flush = inner.udp_flush_watch();
-    let conn: std::sync::Arc<dyn meow_common::ProxyPacketConn> =
-        match inner.dial_udp(proxy.as_ref(), &metadata).await {
-            Ok(conn) => std::sync::Arc::from(conn),
-            Err(e) => {
-                drop_held(&held);
-                return Err(format!("dial_udp via {}: {e}", proxy.name()));
-            }
-        };
+    // Prioritize an already-pending flush even if the dial is ready too.
+    let dialed = tokio::select! {
+        biased;
+        () = flush.flushed() => return Ok(()),
+        result = inner.dial_udp(proxy.as_ref(), &metadata) => result,
+    };
+    let conn: std::sync::Arc<dyn meow_common::ProxyPacketConn> = match dialed {
+        Ok(conn) => std::sync::Arc::from(conn),
+        Err(e) => {
+            drop_held(&held);
+            return Err(format!("dial_udp via {}: {e}", proxy.name()));
+        }
+    };
     // `_route` exists to pin the route-table generation across the dial
     // only — a long-lived flow must not keep its dial-time generation
     // alive across config reloads.
@@ -1188,11 +1207,20 @@ mod cleanup_tests {
     #[derive(Default)]
     struct Probe {
         reading: Notify,
+        dialing: Notify,
+        stall_dial: AtomicBool,
+        dial_dropped: AtomicBool,
         writing: Notify,
         release_read: Notify,
         read_dropped: AtomicBool,
         conn_dropped: Notify,
         closed_while_reading: AtomicBool,
+    }
+    struct DialGuard(Arc<Probe>);
+    impl Drop for DialGuard {
+        fn drop(&mut self) {
+            self.0.dial_dropped.store(true, Ordering::SeqCst);
+        }
     }
     struct Conn(Arc<Probe>);
     impl Drop for Conn {
@@ -1257,6 +1285,11 @@ mod cleanup_tests {
             Err(meow_common::MeowError::NotSupported("no tcp".into()))
         }
         async fn dial_udp(&self, _: &Metadata) -> meow_common::Result<Box<dyn ProxyPacketConn>> {
+            if self.probe.stall_dial.load(Ordering::SeqCst) {
+                let _guard = DialGuard(Arc::clone(&self.probe));
+                self.probe.dialing.notify_one();
+                std::future::pending::<()>().await;
+            }
             Ok(Box::new(Conn(Arc::clone(&self.probe))))
         }
     }
@@ -1474,6 +1507,82 @@ mod cleanup_tests {
     #[tokio::test]
     async fn tun_dns_query_cancelled_on_loop_abort() {
         stop_loop_with_pending_dns(true).await;
+    #[tokio::test]
+    async fn flush_cancels_pending_udp_dial() {
+        let (tunnel, spec, _tx, probe) = fixture();
+        probe.stall_dial.store(true, Ordering::SeqCst);
+        let worker_tunnel = tunnel.clone();
+        let mut task = tokio::spawn(async move { relay_flow(&worker_tunnel, spec).await });
+        tokio::time::timeout(Duration::from_secs(2), probe.dialing.notified())
+            .await
+            .unwrap();
+        assert_eq!(tunnel.close_all_udp_sessions(), 1);
+        let done = tokio::time::timeout(Duration::from_secs(1), &mut task).await;
+        if done.is_err() {
+            task.abort();
+            let _ = task.await;
+        }
+        assert!(done.is_ok(), "flush left the old outbound dial pending");
+        assert!(done.unwrap().unwrap().is_ok());
+        assert!(probe.dial_dropped.load(Ordering::SeqCst));
+        assert_eq!(tunnel.close_all_udp_sessions(), 0, "watch was released");
+    }
+
+    #[tokio::test]
+    async fn flush_cancels_pending_udp_sniff() {
+        let (tunnel, mut spec, _tx, _probe) = fixture();
+        spec.sniffer = Some(Arc::new(crate::sniffer::SnifferRuntime::new(
+            meow_common::sniffer::SnifferConfig {
+                enable: true,
+                quic_ports: vec![443],
+                timeout: Duration::from_secs(60),
+                ..Default::default()
+            },
+        )));
+        let relay = relay_flow(&tunnel, spec);
+        tokio::pin!(relay);
+        assert!(futures::poll!(&mut relay).is_pending());
+        let count = tunnel.close_all_udp_sessions();
+        let done = tokio::time::timeout(Duration::from_secs(1), &mut relay).await;
+        assert!(done.is_ok(), "flush left the QUIC gather pending");
+        assert!(done.unwrap().is_ok());
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn flush_cancels_pending_udp_resolution() {
+        let upstream = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let raw = meow_config::parse_raw_yaml(&format!(
+            "dns:\n  enable: true\n  enhanced-mode: fake-ip\n  nameserver: ['{}']\n",
+            upstream.local_addr().unwrap()
+        ))
+        .unwrap();
+        let dns =
+            meow_config::parse_dns_from_raw(&raw, None, &HashMap::new(), None, None, None, None)
+                .await
+                .unwrap();
+        let resolver = dns.resolver;
+        let fake = resolver.lookup_ipv4("pending.example").await.unwrap();
+        let (tunnel, mut spec, _tx, probe) = fixture();
+        tunnel.set_resolver(resolver);
+        spec.key.1.set_ip(fake);
+        let worker_tunnel = tunnel.clone();
+        let mut task = tokio::spawn(async move { relay_flow(&worker_tunnel, spec).await });
+        let mut packet = [0u8; 4096];
+        tokio::time::timeout(Duration::from_secs(2), upstream.recv_from(&mut packet))
+            .await
+            .unwrap()
+            .unwrap();
+        let count = tunnel.close_all_udp_sessions();
+        let done = tokio::time::timeout(Duration::from_secs(1), &mut task).await;
+        if done.is_err() {
+            task.abort();
+            let _ = task.await;
+        }
+        assert!(done.is_ok(), "flush left pre-dial DNS resolution pending");
+        assert!(done.unwrap().unwrap().is_ok());
+        assert_eq!(count, 1, "resolving flows must already hold a flush watch");
+        assert!(!probe.read_dropped.load(Ordering::SeqCst));
     }
 
     async fn loop_stop_releases_blocked_flow(abort: bool) {
