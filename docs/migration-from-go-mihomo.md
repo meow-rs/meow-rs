@@ -581,25 +581,29 @@ gate can never produce — `*`, `+`, `?`, a space, non-ASCII (`DOMAIN,*.x.com`
 can never equal a host — `*` belongs on `DOMAIN-WILDCARD`, and
 `DOMAIN-SUFFIX,x.com` already covers apex plus subdomains, so `+.` adds
 nothing);
-`DOMAIN-WILDCARD` flags a literal `+` — its matcher globs `*` only, so
-`+.x.com` is dead there too — plus dead literal labels; `DOMAIN-KEYWORD`
-flags `..` and any byte no normalized host can carry (`*`, `+`, `?`, a
-space, non-ASCII — every `host`/`sniff_host` producer passes the
-hostname gate, so such a needle is never a substring) — a `foo.` needle
-still matches `foo.bar` as a substring, though it no longer hits the
-bare `foo` under trailing-dot normalization — the same residual applies
-to an anchored `DOMAIN-REGEX` like `^foo\.$`, which is otherwise not
-checked: an arbitrary pattern's reachability is not decidable by label
-inspection. Two more surfaces get the same pass: `sub-rules:` bodies
-and `AND`/`OR`/`NOT` legs flag the defects above (reported against the
-block name or the outer rule line), and an *empty*
-`DOMAIN-KEYWORD` needle is flagged separately — `contains("")` is
-always true, so `DOMAIN-KEYWORD,,X` silently matches every flow rather
-than dying (a comma slip for `MATCH,X`), which mihomo also accepts as a
-match-all. The same treatment applies to an empty `DOMAIN`/
-`DOMAIN-SUFFIX` payload: `rule_host()` is `""` on host-less flows, so
-`DOMAIN,,X` still matches every IP-literal destination — a host-less
-match-all, warned as such rather than mislabeled "dead".
+`DOMAIN-WILDCARD` flags any literal byte outside the same alphabet —
+its matcher globs `*` only (no `?` glob either), so `+.x.com` and
+`a?b` are dead literal bytes there too — plus dead literal labels;
+`DOMAIN-KEYWORD` flags `..` and any byte no normalized host can carry
+(`*`, `+`, `?`, a space, non-ASCII — every `host`/`sniff_host`
+producer passes the hostname gate, so such a needle is never a
+substring) — a `foo.` needle still matches `foo.bar` as a substring,
+though it no longer hits the bare `foo` under trailing-dot
+normalization — the same residual applies to an anchored
+`DOMAIN-REGEX` like `^foo\.$`, which is otherwise not checked: an
+arbitrary pattern's reachability is not decidable by label inspection
+(the *empty* pattern is the one decidable case — see below). Two more
+surfaces get the same pass: `sub-rules:` bodies and `AND`/`OR`/`NOT`
+legs flag the defects above (reported against the block name or the
+outer rule line). An *empty* payload is flagged separately per type —
+never as dead, but as a silent match-all spelled out: `contains("")`
+is always true, so `DOMAIN-KEYWORD,,X` swallows every flow rather than
+dying (a comma slip for `MATCH,X`, which mihomo also accepts as a
+match-all); `Regex::new("")` is a zero-width match, so
+`DOMAIN-REGEX,,X` does the same; and since `rule_host()` is `""` on
+host-less flows, `DOMAIN,,X` / `DOMAIN-SUFFIX,,X` still match every
+IP-literal destination — a host-less match-all, warned as such rather
+than mislabeled "dead".
 
 ---
 

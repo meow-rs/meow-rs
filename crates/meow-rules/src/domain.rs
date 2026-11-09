@@ -34,3 +34,23 @@ impl Rule for DomainRule {
         &self.domain
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `rule_host()` is `""` on host-less flows and `"" == ""`, so an
+    /// empty payload silently matches every IP-literal destination — a
+    /// host-less match-all, not dead config (issue #869). The config-time
+    /// `domain_payload_defect` reason depends on this contract.
+    #[test]
+    fn empty_domain_payload_matches_host_less_flows() {
+        let rule = DomainRule::new("", "X");
+        assert!(rule.match_metadata(&Metadata::default(), &RuleMatchHelper));
+        let named = Metadata {
+            host: "example.com".into(),
+            ..Metadata::default()
+        };
+        assert!(!rule.match_metadata(&named, &RuleMatchHelper));
+    }
+}

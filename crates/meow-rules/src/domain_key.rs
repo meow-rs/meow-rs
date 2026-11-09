@@ -144,21 +144,26 @@ pub fn domain_rule_payload_is_dead(payload: &str) -> bool {
 ///
 /// - a `+` anywhere — the matcher globs `*` only, so `regex::escape`
 ///   leaves `+` a literal byte no host carries (`+.wild.example` reads
-///   like the mihomo DOMAIN-SUFFIX spelling but is dead here); or
+///   like the mihomo DOMAIN-SUFFIX spelling but is dead here);
+/// - any other byte outside the rule-host alphabet — the matcher has no
+///   `?` glob either (upstream supports `*` only), so `a?b`, a space or
+///   a non-ASCII byte is a literal byte no normalized host carries
+///   (issue #869); or
 /// - after one `*.` glob prefix is normalized away (a pure prefix does
 ///   not count as a literal label), any remaining label that is empty
 ///   names a byte run no normalized host produces — `a..b`, `.foo`,
 ///   `foo.`, `*.foo.`. `*`-bearing segments are globs (`[^.]+`), never
-///   empty labels.
-///
-/// Scope: only the dead shapes above are checked — an `x*` glob or a
-/// literal byte a host never carries (e.g. `?`) is a legal, if narrow,
-/// pattern and stays outside this check.
+///   empty labels, and `*` is the one byte exempted from the alphabet
+///   check for that reason.
 ///
 /// [`Metadata::rule_host`]: meow_common::Metadata::rule_host
 pub fn domain_wildcard_payload_is_dead(payload: &str) -> bool {
     let payload = payload.trim();
-    if payload.is_empty() || payload.contains('+') {
+    if payload.is_empty()
+        || payload
+            .bytes()
+            .any(|b| b != b'*' && byte_outside_rule_host_alphabet(b))
+    {
         return true;
     }
     let body = payload.strip_prefix("*.").unwrap_or(payload);
@@ -273,8 +278,9 @@ mod tests {
     }
 
     /// DOMAIN-WILDCARD dead-shape matrix: the matcher globs `*` only, so
-    /// any `+` is a literal byte no host carries — `+.wild.example` reads
-    /// like the DOMAIN-SUFFIX spelling but is dead here. A literal empty
+    /// `+`/`?`/space/non-ASCII are literal bytes no host carries —
+    /// `+.wild.example` reads like the DOMAIN-SUFFIX spelling but is dead
+    /// here, and `a?b` is a literal `?` no host produces. A literal empty
     /// label (`..`, leading or trailing dot) can never appear in a
     /// normalized host; a `*` segment is a glob, never an empty label,
     /// though `*.` alone reduces to a glob plus a literal trailing dot.
@@ -297,6 +303,14 @@ mod tests {
             "+.wild.example",
             "a+b",
             "x+*",
+            // And so is every other byte outside the host alphabet — the
+            // matcher has no `?` glob, so these are literal dead bytes.
+            "a?b",
+            "*.a?b",
+            "a b",
+            "a/b",
+            "a@b",
+            "caf\u{e9}",
         ] {
             assert!(
                 domain_wildcard_payload_is_dead(payload),

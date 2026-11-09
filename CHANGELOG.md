@@ -161,18 +161,19 @@ the canonical, in-repo source a release is cut from.
 ### Fixed
 
 - **`rules:` payload-defect check closes the #869 gaps**: empty
-  `DOMAIN-KEYWORD`/`DOMAIN`/`DOMAIN-SUFFIX` payloads are no longer
-  silently classified — the KEYWORD needle is a total match-all
-  (`contains("")` is true for every flow), and an empty `DOMAIN,,X` or
-  `DOMAIN-SUFFIX,,X` still matches every host-less IP-literal
-  destination, so each gets its own warning instead of the
-  "can never match" label; impossible-byte payloads
+  `DOMAIN-KEYWORD`/`DOMAIN`/`DOMAIN-SUFFIX`/`DOMAIN-REGEX` payloads are
+  no longer silently classified — the KEYWORD needle is a total
+  match-all (`contains("")` is true for every flow), an empty
+  `DOMAIN,,X` or `DOMAIN-SUFFIX,,X` still matches every host-less
+  IP-literal destination, and `Regex::new("")` is a zero-width match on
+  everything, so each gets its own warning instead of the
+  "can never match" label or silence; impossible-byte payloads
   (`*`, `+`, `?`, space, non-ASCII — outside the `is_valid_host`
-  alphabet) are flagged dead on `DOMAIN`, `DOMAIN-SUFFIX` and
-  `DOMAIN-KEYWORD` alike; and `sub-rules:` bodies plus `AND`/`OR`/`NOT`
-  legs get the same pass `rules:` lines do. Lenient mode warns and keeps
-  the rule — the empty needle still matches all, as mihomo does — while
-  `strict: true` fails the load.
+  alphabet) are flagged dead on `DOMAIN`, `DOMAIN-SUFFIX`,
+  `DOMAIN-WILDCARD` and `DOMAIN-KEYWORD` alike; and `sub-rules:` bodies
+  plus `AND`/`OR`/`NOT` legs get the same pass `rules:` lines do.
+  Lenient mode warns and keeps the rule — the empty needle still
+  matches all, as mihomo does — while `strict: true` fails the load.
 - **Plain-HTTP absolute-form requests with a duplicated `Host` header
   are refused with 400**, matching the origin-form path and `sniff_http`
   — RFC 9110 §5.4 permits refusing the ambiguous pair, which previously
