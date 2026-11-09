@@ -71,6 +71,19 @@ async fn transfer_encoding_on_http_1_0_is_rejected() {
         .await;
 }
 
+/// RFC 9110 §5.4: a duplicated `Host` field makes the authority ambiguous.
+/// Origin-form requests were already refused on the hostname gate (a dup
+/// leaves no authority to route); absolute-form requests forwarded the
+/// pair verbatim — both forms now reject the same way (issue #869).
+#[tokio::test]
+async fn duplicate_host_headers_are_rejected() {
+    assert_bad_request(
+        b"GET http://127.0.0.1:9/ HTTP/1.1\r\nHost: a.example\r\nHost: b.example\r\n\r\n",
+    )
+    .await;
+    assert_bad_request(b"GET / HTTP/1.1\r\nHost: a.example\r\nHost: b.example\r\n\r\n").await;
+}
+
 /// The streaming validator runs per socket read, so a head delivered one byte
 /// at a time must reach the same verdict as one delivered in a single write.
 #[tokio::test]

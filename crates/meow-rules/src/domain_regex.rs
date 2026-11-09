@@ -38,3 +38,23 @@ impl Rule for DomainRegexRule {
         &self.pattern
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `Regex::new("")` is a zero-width match — `is_match` is true on
+    /// every `rule_host()` including `""`, so an empty payload silently
+    /// swallows every flow. The config-time `domain_payload_defect`
+    /// match-all reason depends on this contract (issue #869).
+    #[test]
+    fn empty_regex_payload_matches_every_flow() {
+        let rule = DomainRegexRule::new("", "X").unwrap();
+        assert!(rule.match_metadata(&Metadata::default(), &RuleMatchHelper));
+        let named = Metadata {
+            host: "example.com".into(),
+            ..Metadata::default()
+        };
+        assert!(rule.match_metadata(&named, &RuleMatchHelper));
+    }
+}
