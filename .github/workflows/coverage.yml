@@ -67,7 +67,14 @@ jobs:
 
       - name: Restore cargo-llvm-cov PATH
         if: steps.cache-cargo-llvm-cov.outputs.cache-hit == 'true' && runner.os != 'Windows'
-        run: echo "$HOME/.install-action/bin" >> "$GITHUB_PATH"
+        run: |
+          echo "$HOME/.install-action/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Restore cargo-llvm-cov PATH (Windows)
+        if: steps.cache-cargo-llvm-cov.outputs.cache-hit == 'true' && runner.os == 'Windows'
+        run: |
+          Add-Content -Encoding utf8 -Path $env:GITHUB_PATH -Value "$env:USERPROFILE\.install-action\bin"
 
       - name: Install cargo-llvm-cov
         if: steps.cache-cargo-llvm-cov.outputs.cache-hit != 'true'

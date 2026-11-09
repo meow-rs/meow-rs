@@ -147,7 +147,16 @@ jobs:
 
       - name: Restore cargo-nextest PATH
         if: steps.cache-nextest.outputs.cache-hit == 'true' && runner.os != 'Windows'
-        run: echo "$HOME/.install-action/bin" >> "$GITHUB_PATH"
+        # Either install dir may hold the binary depending on whether
+        # ~/.cargo/bin was already on PATH — add both.
+        run: |
+          echo "$HOME/.install-action/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Restore cargo-nextest PATH (Windows)
+        if: steps.cache-nextest.outputs.cache-hit == 'true' && runner.os == 'Windows'
+        run: |
+          Add-Content -Encoding utf8 -Path $env:GITHUB_PATH -Value "$env:USERPROFILE\.install-action\bin"
 
       - name: Install cargo-nextest
         if: steps.cache-nextest.outputs.cache-hit != 'true'
@@ -480,7 +489,14 @@ jobs:
 
       - name: Restore cargo-hack PATH
         if: steps.cache-cargo-hack.outputs.cache-hit == 'true' && runner.os != 'Windows'
-        run: echo "$HOME/.install-action/bin" >> "$GITHUB_PATH"
+        run: |
+          echo "$HOME/.install-action/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Restore cargo-hack PATH (Windows)
+        if: steps.cache-cargo-hack.outputs.cache-hit == 'true' && runner.os == 'Windows'
+        run: |
+          Add-Content -Encoding utf8 -Path $env:GITHUB_PATH -Value "$env:USERPROFILE\.install-action\bin"
 
       - name: Install cargo-hack
         if: steps.cache-cargo-hack.outputs.cache-hit != 'true'
@@ -497,7 +513,14 @@ jobs:
 
       - name: Restore cargo-nextest PATH
         if: steps.cache-nextest.outputs.cache-hit == 'true' && runner.os != 'Windows'
-        run: echo "$HOME/.install-action/bin" >> "$GITHUB_PATH"
+        run: |
+          echo "$HOME/.install-action/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Restore cargo-nextest PATH (Windows)
+        if: steps.cache-nextest.outputs.cache-hit == 'true' && runner.os == 'Windows'
+        run: |
+          Add-Content -Encoding utf8 -Path $env:GITHUB_PATH -Value "$env:USERPROFILE\.install-action\bin"
 
       # The ss-only meow-config leg below runs its reserved-plugin contract
       # tests through nextest like every other test step.
@@ -572,9 +595,9 @@ jobs:
     runs-on: windows-latest
     needs: lint
     env:
-      # install-llvm-action resolves "18" to the newest 18.x — the cache
-      # key names the major pin; bump the -v1 suffix on it to refresh.
-      LLVM_VERSION: "18"
+      # Exact LLVM pin — the cache key names it, so a stale-key restore
+      # can never hide a minor-version bump behind a floating "18".
+      LLVM_VERSION: "18.1.8"
     steps:
       - uses: actions/checkout@v5
 
@@ -600,7 +623,14 @@ jobs:
 
       - name: Restore cargo-nextest PATH
         if: steps.cache-nextest.outputs.cache-hit == 'true' && runner.os != 'Windows'
-        run: echo "$HOME/.install-action/bin" >> "$GITHUB_PATH"
+        run: |
+          echo "$HOME/.install-action/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Restore cargo-nextest PATH (Windows)
+        if: steps.cache-nextest.outputs.cache-hit == 'true' && runner.os == 'Windows'
+        run: |
+          Add-Content -Encoding utf8 -Path $env:GITHUB_PATH -Value "$env:USERPROFILE\.install-action\bin"
 
       - name: Install cargo-nextest
         if: steps.cache-nextest.outputs.cache-hit != 'true'
@@ -611,17 +641,17 @@ jobs:
         uses: actions/cache@v4
         with:
           path: "C:\\Program Files\\LLVM"
-          key: llvm-${{ env.LLVM_VERSION }}-${{ runner.os }}-v1
+          key: llvm-${{ env.LLVM_VERSION }}-${{ runner.os }}
 
       # Mirrors the env block install-llvm-action exports for bindgen
       # (LLVM_PATH + <bin> on PATH; lib dirs for the LLVM dylibs).
       - name: Restore LLVM environment
         if: steps.cache-llvm.outputs.cache-hit == 'true'
         run: |
-          echo "LLVM_PATH=C:\Program Files\LLVM" >> "$env:GITHUB_ENV"
-          echo "LD_LIBRARY_PATH=C:\Program Files\LLVM\lib" >> "$env:GITHUB_ENV"
-          echo "DYLD_LIBRARY_PATH=C:\Program Files\LLVM\lib" >> "$env:GITHUB_ENV"
-          echo "C:\Program Files\LLVM\bin" >> "$env:GITHUB_PATH"
+          Add-Content -Encoding utf8 -Path $env:GITHUB_ENV -Value "LLVM_PATH=C:\Program Files\LLVM"
+          Add-Content -Encoding utf8 -Path $env:GITHUB_ENV -Value "LD_LIBRARY_PATH=C:\Program Files\LLVM\lib"
+          Add-Content -Encoding utf8 -Path $env:GITHUB_ENV -Value "DYLD_LIBRARY_PATH=C:\Program Files\LLVM\lib"
+          Add-Content -Encoding utf8 -Path $env:GITHUB_PATH -Value "C:\Program Files\LLVM\bin"
 
       # lwIP (listener-tun, in the `full` default bundle) uses bindgen.
       - name: Install LLVM
@@ -745,7 +775,14 @@ jobs:
 
       - name: Restore cargo-nextest PATH
         if: steps.cache-nextest.outputs.cache-hit == 'true' && runner.os != 'Windows'
-        run: echo "$HOME/.install-action/bin" >> "$GITHUB_PATH"
+        run: |
+          echo "$HOME/.install-action/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Restore cargo-nextest PATH (Windows)
+        if: steps.cache-nextest.outputs.cache-hit == 'true' && runner.os == 'Windows'
+        run: |
+          Add-Content -Encoding utf8 -Path $env:GITHUB_PATH -Value "$env:USERPROFILE\.install-action\bin"
 
       - name: Install cargo-nextest
         if: steps.cache-nextest.outputs.cache-hit != 'true'

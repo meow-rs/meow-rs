@@ -331,6 +331,7 @@ jobs:
 
       - name: Cache wintun.dll
         if: runner.os == 'Windows'
+        id: cache-wintun
         uses: actions/cache@v4
         with:
           path: dist/wintun
