@@ -91,7 +91,7 @@ case-insensitive. `ANY` selects the literal ANY question type.
 
 Explicit hosts entries, including aliases, take priority for address
 questions. Response rules run next, ahead of IPv6 suppression, fake-IP,
-cache and upstream lookup. Packet validation precedes rule evaluation.
+cache and upstream lookup. Packet validation precedes rule synthesis.
 Replies echo RD/CD and, for EDNS requests, DO with a version-0 OPT advertising
 1232 bytes. Duplicate OPT records get FORMERR and unsupported EDNS versions
 get BADVERS. Synthesized answers contain no relayed ECH/ALPN records;

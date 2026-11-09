@@ -143,6 +143,9 @@ fn build_matcher(
     }
     if lower.starts_with("rule-set:") {
         let name = key["rule-set:".len()..].trim();
+        if name.is_empty() {
+            bail!("'rule-set:' key has an empty provider name");
+        }
         let provider = providers
             .get(name)
             .with_context(|| format!("unknown rule-set: {name}"))?;

@@ -227,8 +227,21 @@ impl DnsServer {
 
         if let Some(answer) = Self::try_response_rule(data, question_len, &domain, qtype, resolver)
         {
-            // The emitted `(ip, ttl)` has no hook carrier on this path —
-            // `try_answer_local` packages it for its callers.
+            // A static-address answer feeds the nftset hook exactly like
+            // the hosts arm below — run it inline. Normally unreachable
+            // (`try_answer_local` answers matching rules first), but a
+            // resolver-generation swap mid-dispatch or a future caller
+            // skipping the probe must not skip the element add.
+            if let Some((addr, ttl)) = answer.emitted {
+                if let Some(work) = crate::answer_hook::pending(
+                    resolver,
+                    &domain,
+                    addr,
+                    std::time::Duration::from_secs(u64::from(ttl)),
+                ) {
+                    crate::answer_hook::run_blocking(work).await;
+                }
+            }
             return Ok(answer.response);
         }
 
@@ -541,8 +554,12 @@ impl DnsServer {
             Ok(req) => req,
             Err(response) => return Ok(response),
         };
-        if let Some(answer) = Self::build_rule_response(&req, flags, domain, qtype, resolver) {
-            return Ok(answer.response);
+        if let Some(action) = resolver.response_action(domain, qtype) {
+            if let Some(answer) =
+                Self::build_rule_response(&req, flags, domain, qtype, action, resolver)
+            {
+                return Ok(answer.response);
+            }
         }
 
         // The name sent upstream is the wire-faithful `Name` hickory decoded
@@ -689,7 +706,11 @@ impl DnsServer {
         // Defense in depth: the preamble already drops QR=1, so this arm
         // is unreachable — kept so the private function cannot silently
         // forward a response packet if it ever gains another caller.
+        // Replying to a response at all would risk the resolver
+        // ping-pong the preamble's silent drop exists to prevent; the
+        // assert makes a future caller who skipped that gate loud.
         if req.metadata.message_type != MessageType::Query {
+            debug_assert!(false, "response packet reached parse_request");
             return Err(Self::build_formerr(id, flags, arcount > 0));
         }
 
@@ -749,22 +770,24 @@ impl DnsServer {
             }
         };
         let flags = u16::from_be_bytes([data[2], data[3]]);
-        Self::build_rule_response(&req, flags, domain, qtype, resolver)
+        Self::build_rule_response(&req, flags, domain, qtype, action, resolver)
     }
 
     /// Synthesize the rule's reply — the wire bytes plus, when the answer
     /// section actually carries an address record, the `(ip, ttl)` it
     /// emitted (for the `dns.nftset` answer hook; `answer_hook::pending`
     /// drops fake-IP addresses by design). A family-mismatched `address`
-    /// action answers NODATA and reports nothing.
+    /// action answers NODATA and reports nothing. `action` comes from the
+    /// caller's `response_action` scan so a matching query pays one rule
+    /// walk, not two.
     fn build_rule_response(
         req: &Message,
         flags: u16,
         domain: &str,
         qtype: u16,
+        action: ResponseAction,
         resolver: &Resolver,
     ) -> Option<RuleAnswer> {
-        let action = resolver.response_action(domain, qtype)?;
         let mut response = Self::response_message(req, ResponseCode::NoError);
         let address = match action {
             ResponseAction::Forward => return None,
@@ -793,8 +816,14 @@ impl DnsServer {
                 _ => None,
             };
             if let Some(rdata) = rdata {
-                response.add_answer(Record::from_rdata(req.queries[0].name.clone(), ttl, rdata));
-                emitted = Some((address, ttl));
+                // `qdcount == 1` + a successful decode guarantees a
+                // question — `.first()` mirrors `handle_generic_forward`
+                // so a hypothetical empty parse degrades to NODATA, not
+                // a panic through the probe path's bare call.
+                if let Some(query) = req.queries.first() {
+                    response.add_answer(Record::from_rdata(query.name.clone(), ttl, rdata));
+                    emitted = Some((address, ttl));
+                }
             }
         }
         Some(RuleAnswer {
