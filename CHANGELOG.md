@@ -189,6 +189,10 @@ the canonical, in-repo source a release is cut from.
   declared dependency is read through a `ProxyAdapter` query instead of a
   concrete-type downcast, so a front group parked on REJECT can no longer
   make the chain invisible.
+- hysteria2 `max-stream-receive-window` values configured above
+  `max-connection-receive-window` are clamped to the connection ceiling —
+  a stream can never outrun connection credit — keeping the advertised
+  `conn ≥ stream` invariant the code documents.
 - Hostname TCP dialing tries the alternate address family after 250 ms so a
   stalled IPv6 or IPv4 connect does not starve a reachable alternative.
 - Restore OpenHarmony builds of `meow-common` by matching the peer-aware

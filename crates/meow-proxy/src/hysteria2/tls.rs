@@ -58,7 +58,7 @@ fn resolve_windows(cfg: super::ReceiveWindows, mem_total: Option<u64>) -> Window
         );
     }
     let max_conn = cfg.max_conn.unwrap_or(auto_conn);
-    let max_stream = cfg.max_stream.unwrap_or(MAX_STREAM_WINDOW.min(max_conn));
+    let max_stream = cfg.max_stream.unwrap_or(MAX_STREAM_WINDOW).min(max_conn);
     Windows {
         initial_stream: cfg
             .initial_stream
@@ -344,6 +344,16 @@ mod tests {
             (w.initial_stream, w.max_stream, w.max_conn),
             (M, 16 * M, 32 * M)
         );
+        // An explicit max_stream above max_conn clamps to the ceiling —
+        // the advertised conn ≥ stream invariant holds either way.
+        let cfg = super::super::ReceiveWindows {
+            max_stream: Some(20 * M),
+            max_conn: Some(4 * M),
+            ..Default::default()
+        };
+        let w = resolve_windows(cfg, None);
+        assert_eq!(w.max_stream, 4 * M);
+        assert_eq!(w.initial_stream, 4 * M);
     }
 
     #[test]
