@@ -634,11 +634,114 @@ async fn resolve_via_hook(
 /// consulted, but the protector still applies to the literal dial.
 pub async fn connect_tcp_host(host: &str, port: u16) -> io::Result<TcpStream> {
     let addrs = resolve_addrs(host, port).await?;
-    let result = connect_resolved_candidates(addrs, connect_tcp).await;
+    let result = connect_tcp_candidates(addrs, connect_tcp).await;
     if result.is_err() {
         sys_cache_evict(host);
     }
     result
+}
+
+/// Connect resolved physical addresses using the caller's existing dial budget.
+/// With a deadline, at most two attempts run at once and later addresses receive
+/// a share of the remaining time. Without a deadline, preserve the ordinary
+/// two-family fallback without introducing a new overall timeout. Callers must
+/// retain their socket protection/binding and configured per-connect timeout —
+/// under a deadline that per-connect timeout is a ceiling the fairness window
+/// may tighten, so no candidate is guaranteed its full configured slice.
+pub async fn connect_tcp_candidates<T, F, Fut>(addrs: Vec<SocketAddr>, dial: F) -> io::Result<T>
+where
+    F: Fn(SocketAddr) -> Fut + Sync,
+    Fut: std::future::Future<Output = io::Result<T>>,
+{
+    match crate::dial::dial_deadline() {
+        Some(deadline) => connect_candidates_before(addrs, deadline, dial).await,
+        None => connect_resolved_candidates(addrs, dial).await,
+    }
+}
+
+async fn connect_candidates_before<T, F, Fut>(
+    addrs: Vec<SocketAddr>,
+    deadline: tokio::time::Instant,
+    mut dial: F,
+) -> io::Result<T>
+where
+    F: FnMut(SocketAddr) -> Fut,
+    Fut: std::future::Future<Output = io::Result<T>>,
+{
+    use futures::{stream::FuturesUnordered, StreamExt};
+    use tokio::time::{sleep_until, timeout_at, Duration, Instant};
+    const STAGGER: Duration = Duration::from_millis(250);
+    const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
+    let first_v6 = addrs.first().is_some_and(SocketAddr::is_ipv6);
+    let (mut first, mut other): (std::collections::VecDeque<_>, std::collections::VecDeque<_>) =
+        addrs
+            .into_iter()
+            .partition(|addr| addr.is_ipv6() == first_v6);
+    let mut ordered = std::collections::VecDeque::new();
+    while !first.is_empty() || !other.is_empty() {
+        if let Some(addr) = first.pop_front() {
+            ordered.push_back(addr);
+        }
+        if let Some(addr) = other.pop_front() {
+            ordered.push_back(addr);
+        }
+    }
+    // All attempts belong to this one future. Once the queue is drained,
+    // slicing no longer needs to free a slot: survivors can use the rest of
+    // the caller budget. Atomic storage keeps the enclosing future Send.
+    let all_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut pending = FuturesUnordered::new();
+    let mut next = Instant::now();
+    let mut last_err = None;
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(last_err.unwrap_or_else(|| io::ErrorKind::TimedOut.into()));
+        }
+        if pending.is_empty() || (pending.len() < 2 && now >= next) {
+            let waves = (pending.len() + ordered.len()).div_ceil(2).max(1);
+            let window = (deadline - now).div_f64(waves as f64).min(ATTEMPT_TIMEOUT);
+            if let Some(addr) = ordered.pop_front() {
+                let attempt = dial(addr);
+                let attempt_deadline = (now + window).min(deadline);
+                all_started.store(ordered.is_empty(), std::sync::atomic::Ordering::Relaxed);
+                let all_started = Arc::clone(&all_started);
+                pending.push(async move {
+                    tokio::pin!(attempt);
+                    match timeout_at(attempt_deadline, &mut attempt).await {
+                        Ok(result) => result,
+                        Err(_) if all_started.load(std::sync::atomic::Ordering::Relaxed) => {
+                            // Keep the original connect future; never restart a socket.
+                            attempt.await
+                        }
+                        Err(_) => Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "TCP candidate timed out",
+                        )),
+                    }
+                });
+                // Compress staggering for a nearly exhausted caller budget;
+                // reserve time for the remaining addresses rather than sleeping
+                // through their entire opportunity.
+                next = now + STAGGER.min((deadline - now).div_f64((ordered.len() + 1) as f64));
+            } else if pending.is_empty() {
+                return Err(last_err.unwrap_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "no TCP candidate addresses")
+                }));
+            }
+        }
+        tokio::select! {
+            () = sleep_until(deadline) => return Err(last_err.unwrap_or_else(|| io::ErrorKind::TimedOut.into())),
+            result = pending.next(), if !pending.is_empty() => {
+                match result.expect("pending candidate") {
+                    Ok(stream) => return Ok(stream),
+                    Err(error) => last_err = crate::MeowError::prefer_errno_io(last_err, error),
+                }
+                next = Instant::now();
+            }
+            () = sleep_until(next), if pending.len() < 2 && !ordered.is_empty() => {}
+        }
+    }
 }
 
 // Race address families, not protocol handshakes. Each family retains resolver
@@ -1632,5 +1735,94 @@ mod candidate_progress_regression {
             .await
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+}
+
+#[cfg(test)]
+mod same_family_progress {
+    use super::*;
+    use std::time::Duration;
+    #[tokio::test(start_paused = true)]
+    async fn surviving_candidate_reclaims_budget_after_others_fail() {
+        let addrs = (1..=3)
+            .map(|p| SocketAddr::from(([192, 0, 2, 1], p)))
+            .collect();
+        let start = tokio::time::Instant::now();
+        let result = crate::dial::with_dial_timeout("reclaim fixture", async {
+            Ok(connect_tcp_candidates(addrs, |addr| async move {
+                if addr.port() == 1 {
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    Ok(addr)
+                } else {
+                    Err(io::ErrorKind::ConnectionRefused.into())
+                }
+            })
+            .await?)
+        })
+        .await;
+        assert_eq!(result.unwrap().port(), 1);
+        assert_eq!(start.elapsed(), Duration::from_secs(3));
+    }
+    #[tokio::test(start_paused = true)]
+    async fn stalled_same_family_addresses_do_not_starve_later_candidates() {
+        let addresses = (1..=3)
+            .map(|port| SocketAddr::from(([192, 0, 2, 1], port)))
+            .collect();
+        let start = tokio::time::Instant::now();
+        let result = crate::dial::with_dial_timeout("same-family fixture", async {
+            Ok(connect_tcp_candidates(addresses, |addr| async move {
+                if addr.port() != 3 {
+                    std::future::pending::<()>().await;
+                }
+                Ok(addr)
+            })
+            .await?)
+        })
+        .await;
+        assert_eq!(result.unwrap().port(), 3);
+        assert!(start.elapsed() < crate::dial::DIAL_TIMEOUT);
+    }
+    #[tokio::test(start_paused = true)]
+    async fn no_caller_deadline_does_not_introduce_five_second_limit() {
+        let addr = SocketAddr::from(([192, 0, 2, 1], 1));
+        let start = tokio::time::Instant::now();
+        let result = connect_tcp_candidates(vec![addr], |address| async move {
+            tokio::time::sleep(Duration::from_secs(6)).await;
+            Ok(address)
+        })
+        .await
+        .unwrap();
+        assert_eq!(result, addr);
+        assert_eq!(start.elapsed(), Duration::from_secs(6));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shared_deadline_race_bounds_and_drops_pending_attempts() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Live(Arc<AtomicUsize>);
+        impl Drop for Live {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let live = Arc::new(AtomicUsize::new(0));
+        let addrs = (1..=4)
+            .map(|p| SocketAddr::from(([192, 0, 2, 1], p)))
+            .collect();
+        let race = crate::dial::with_dial_timeout::<_, ()>("cancel fixture", async {
+            Ok(connect_tcp_candidates(addrs, |_| {
+                let live = Arc::clone(&live);
+                async move {
+                    assert!(live.fetch_add(1, Ordering::SeqCst) < 2);
+                    let _guard = Live(live);
+                    std::future::pending::<io::Result<()>>().await
+                }
+            })
+            .await?)
+        });
+        assert!(tokio::time::timeout(Duration::from_secs(1), race)
+            .await
+            .is_err());
+        assert_eq!(live.load(Ordering::SeqCst), 0);
     }
 }

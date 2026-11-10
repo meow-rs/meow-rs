@@ -359,29 +359,14 @@ impl ProxyAdapter for DirectAdapter {
 
     async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
         let dests = self.resolve_targets(metadata).await?;
-        let mut last_err = None;
-
-        for dest in dests {
-            match apply_connect_timeout(
-                // `routing-mark` and the outbound-interface binding are applied
-                // here, as on every other outbound socket.
-                meow_common::connect_tcp(dest),
-                self.connect_timeout,
-                dest,
-            )
-            .await
-            {
-                Ok(stream) => return Ok(Box::new(DirectConn(stream))),
-                // An errno-backed connect failure (e.g. EMFILE on
-                // socket()) outranks a later context-only error — the
-                // errno is what dead-mark classification reads (issue
-                // #668); this error also escapes through relay hop-0 /
-                // dialer-proxy front boundaries.
-                Err(err) => last_err = MeowError::prefer_errno(last_err, err),
-            }
-        }
-
-        Err(last_err.unwrap_or_else(|| MeowError::Proxy("direct: no reachable address".into())))
+        let stream = meow_common::connect_tcp_candidates(dests, |dest| async move {
+            apply_connect_timeout(meow_common::connect_tcp(dest), self.connect_timeout, dest)
+                .await
+                .map_err(|error| error.into_io_error("direct candidate"))
+        })
+        .await
+        .map_err(MeowError::Io)?;
+        Ok(Box::new(DirectConn(stream)))
     }
 
     async fn dial_udp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
