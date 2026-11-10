@@ -546,6 +546,13 @@ impl<'a> ClassicalRuleSetBuilder<'a> {
         // `parse_logic_rule`).
         let mut fields = entry.splitn(3, ',');
         let first_field = fields.next().map_or("", str::trim);
+        // Compare against the config grammar's names, the same way
+        // `parse_rule` does — a mihomo API spelling must hit the guards
+        // too: `Match,x` would otherwise splice into an always-true
+        // `FinalRule`, and `DomainRegex,a,b` would bypass the
+        // comma-preserving path below and truncate to `a`.
+        let first_field = meow_common::RuleType::from_mihomo_name(first_field)
+            .map_or(first_field, |t| t.as_str());
         if first_field == "MATCH" {
             return Err(format!(
                 "'{entry}': MATCH is not allowed in a classical rule-set"
@@ -779,6 +786,26 @@ mod tests {
             assert!(set.matches(&meta_host(yes), &helper()), "{pattern}");
             assert!(!set.matches(&meta_host(no), &helper()), "{pattern}");
         }
+
+        // The mihomo API spelling must hit the same path — `DomainRegex`
+        // would otherwise splice and truncate `a,b` to `a`.
+        let ctx = ParserContext::empty();
+        let mut builder = ClassicalRuleSetBuilder::new(&ctx);
+        builder.push_checked("DomainRegex,a,b").unwrap();
+        let set = builder.build();
+        assert!(set.matches(&meta_host("a,b"), &helper()));
+        assert!(!set.matches(&meta_host("a"), &helper()));
+    }
+
+    #[test]
+    fn classical_mihomo_spelling_still_rejects_match() {
+        // `Match` normalizes to MATCH through `from_mihomo_name` — without
+        // the normalized guard it would splice into an always-true
+        // `FinalRule` and make the provider match every connection.
+        let ctx = ParserContext::empty();
+        let mut builder = ClassicalRuleSetBuilder::new(&ctx);
+        assert!(builder.push_checked("Match,DIRECT").is_err());
+        assert_eq!(builder.build().len(), 0);
     }
 
     #[test]
