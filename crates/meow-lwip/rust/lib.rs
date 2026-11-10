@@ -17,6 +17,8 @@ pub use {udp::RecvHalf as UdpRecvHalf, udp::SendHalf as UdpSendHalf, udp::UdpPkt
 pub enum Error {
     #[error("LwIP error ({0})")]
     LwIP(i8),
+    #[error("MTU {0} is below the IPv6 minimum 1280")]
+    InvalidMtu(u16),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

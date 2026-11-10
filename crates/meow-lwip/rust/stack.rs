@@ -30,7 +30,13 @@ pub struct NetStack {
 
 impl NetStack {
     pub fn new() -> Result<(Self, TcpListener, Box<UdpSocket>), Error> {
-        Self::with_buffer_size(512, 64)
+        Self::with_mtu(1500)
+    }
+
+    /// Use the TUN device's MTU for both IP families. Values below the
+    /// IPv6 minimum (1280) are rejected before touching the global stack.
+    pub fn with_mtu(mtu: u16) -> Result<(Self, TcpListener, Box<UdpSocket>), Error> {
+        Self::with_buffer_size_and_mtu(512, 64, mtu)
     }
 
     /// Build the stack and spawn the single-owner core task on the current
@@ -39,7 +45,18 @@ impl NetStack {
         stack_buffer_size: usize,
         udp_buffer_size: usize,
     ) -> Result<(Self, TcpListener, Box<UdpSocket>), Error> {
-        let parts = LwipCore::build(stack_buffer_size, udp_buffer_size)?;
+        Self::with_buffer_size_and_mtu(stack_buffer_size, udp_buffer_size, 1500)
+    }
+
+    fn with_buffer_size_and_mtu(
+        stack_buffer_size: usize,
+        udp_buffer_size: usize,
+        mtu: u16,
+    ) -> Result<(Self, TcpListener, Box<UdpSocket>), Error> {
+        if mtu < 1280 {
+            return Err(Error::InvalidMtu(mtu));
+        }
+        let parts = LwipCore::build(stack_buffer_size, udp_buffer_size, mtu)?;
 
         let stack = NetStack {
             ingress: PollSender::new(parts.ingress_tx),
