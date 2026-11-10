@@ -183,6 +183,8 @@ the canonical, in-repo source a release is cut from.
   as `{1,3}`: classical rule providers take the whole tail after the first
   comma, while `rules:` entries and logic sub-rules take the last comma
   field as the target — matching upstream comma protection.
+- Hostname TCP dialing tries the alternate address family after 250 ms so a
+  stalled IPv6 or IPv4 connect does not starve a reachable alternative.
 
 - TUN UDP connection refresh now cancels pending QUIC sniffing, DNS resolution,
   route selection and outbound dialing, without waiting for establishment to
