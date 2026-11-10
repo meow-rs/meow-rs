@@ -1479,6 +1479,7 @@ pub async fn serve_tcp_stream<S: AsyncRead + AsyncWrite + Unpin>(
             framed.extend_from_slice(&length.to_be_bytes());
             framed.extend_from_slice(&response);
             stream.write_all(&framed).await?;
+            stream.flush().await?;
             Ok(true)
         };
         match tokio::time::timeout(TCP_EXCHANGE_TIMEOUT, exchange).await {
@@ -2160,6 +2161,51 @@ mod tests {
             client.write_all(&query[..5]).await.unwrap();
             client.write_all(&query[5..]).await.unwrap();
             let n = client.read_u16().await.unwrap();
+            let mut response = vec![0; n as usize];
+            client.read_exact(&mut response).await.unwrap();
+            assert_eq!(&response[..2], &(octet as u16).to_be_bytes());
+            assert_eq!(&response[response.len() - 4..], &[10, 0, 0, octet]);
+            assert_eq!(response[2] & 2, 0, "TCP answer not truncated");
+        }
+        client.shutdown().await.unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn serve_tcp_buffered_stream_flushes_before_next_query() {
+        let make = |ip| {
+            let mut hosts = meow_trie::DomainTrie::new();
+            hosts.insert(
+                "example.com",
+                crate::resolver::HostEntry::Addresses(vec![ip]),
+            );
+            Arc::new(crate::resolver::Resolver::new(
+                Vec::new(),
+                Vec::new(),
+                DnsMode::Normal,
+                hosts,
+                true,
+                true,
+            ))
+        };
+        let slot = Arc::new(parking_lot::RwLock::new(make("10.0.0.1".parse().unwrap())));
+        let (mut client, server) = tokio::io::duplex(8192);
+        let task = tokio::spawn(serve_tcp_stream(
+            tokio::io::BufStream::new(server),
+            Arc::clone(&slot),
+            Arc::new(tokio::sync::Semaphore::new(1)),
+        ));
+        for octet in [1, 2] {
+            *slot.write() = make(format!("10.0.0.{octet}").parse().unwrap());
+            let query = sample_query(octet as u16, 1);
+            client.write_u16(query.len() as u16).await.unwrap();
+            // Split input framing like a TCP fallback after a truncated UDP answer.
+            client.write_all(&query[..5]).await.unwrap();
+            client.write_all(&query[5..]).await.unwrap();
+            let n = tokio::time::timeout(std::time::Duration::from_millis(100), client.read_u16())
+                .await
+                .expect("buffered response must be flushed")
+                .unwrap();
             let mut response = vec![0; n as usize];
             client.read_exact(&mut response).await.unwrap();
             assert_eq!(&response[..2], &(octet as u16).to_be_bytes());
