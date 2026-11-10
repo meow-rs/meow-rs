@@ -6,8 +6,10 @@ use hickory_proto::rr::{Name, RData, Record, RecordType};
 use std::net::{IpAddr, SocketAddr};
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Weak};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+#[cfg(test)]
+use tokio::net::TcpStream;
+use tokio::net::{TcpListener, UdpSocket};
 use tracing::{debug, error, info, warn};
 
 /// TTL stamped on regular (non-fake-IP) A/AAAA answers built by this server.
@@ -134,17 +136,37 @@ impl DnsServer {
     /// `run()` fire-and-forget had no way to distinguish "listening" from
     /// "bind failed, every query will be dropped".
     pub async fn bind(&self) -> std::io::Result<BoundDnsServer> {
-        let socket = Arc::new(UdpSocket::bind(self.listen_addr).await?);
-        let bound = socket.local_addr()?;
-        // Roll back the UDP reservation if TCP cannot bind the same port.
-        let tcp = TcpListener::bind(bound).await?;
-        info!("DNS server listening on {bound}");
-        Ok(BoundDnsServer {
-            resolver: Arc::clone(&self.resolver),
-            socket,
-            tcp: Some(tcp),
-            dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        })
+        // Windows reserves excluded port ranges per protocol (Hyper-V/WINNAT):
+        // an ephemeral UDP port can sit inside a TCP-only exclusion, so the
+        // same-port TCP bind fails with WSAEACCES. With a :0 listen the port
+        // is ours to choose — roll a fresh pair instead of failing the whole
+        // server. A configured port keeps its single fail-fast attempt; a
+        // UDP bind failure always surfaces (the OS never hands out a port it
+        // excludes for the same protocol).
+        const BIND_ATTEMPTS: u32 = 8;
+        let mut last_err = None;
+        for _ in 0..BIND_ATTEMPTS {
+            let socket = Arc::new(UdpSocket::bind(self.listen_addr).await?);
+            let bound = socket.local_addr()?;
+            match TcpListener::bind(bound).await {
+                Ok(tcp) => {
+                    info!("DNS server listening on {bound}");
+                    return Ok(BoundDnsServer {
+                        resolver: Arc::clone(&self.resolver),
+                        socket,
+                        tcp: Some(tcp),
+                        dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                    });
+                }
+                Err(error) => {
+                    if self.listen_addr.port() != 0 {
+                        return Err(error);
+                    }
+                    last_err = Some(error);
+                }
+            }
+        }
+        Err(last_err.expect("bind loop ran at least once"))
     }
 
     /// Bind and serve in one call. Kept for callers that await `run()`
@@ -1385,7 +1407,7 @@ async fn run_tcp_listener(
                         let resolver = Arc::clone(&resolver);
                         let budget = Arc::clone(&budget);
                         clients.spawn(async move {
-                            if let Err(error) = serve_tcp_client(stream, resolver, budget).await {
+                            if let Err(error) = serve_tcp_stream(stream, resolver, budget).await {
                                 debug!("DNS TCP exchange failed: {error}");
                             }
                         });
@@ -1403,8 +1425,17 @@ async fn run_tcp_listener(
     }
 }
 
-async fn serve_tcp_client(
-    mut stream: TcpStream,
+/// Serve length-prefixed DNS queries on a caller-owned byte stream (for
+/// example a userspace TUN TCP connection). The caller bounds concurrent
+/// connections and cancels this future when its connection/session ends.
+///
+/// Each exchange has a 30-second deadline and at most one 65535-byte query.
+/// Share `budget` across streams to bound upstream queries; locally answerable
+/// queries bypass it. Resolver reloads take effect between complete queries.
+/// Dropping this future drops the stream and pending asynchronous query work;
+/// an already-running blocking response hook retains its own permit until done.
+pub async fn serve_tcp_stream<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: S,
     resolver: ResolverSlot,
     budget: Arc<tokio::sync::Semaphore>,
 ) -> std::io::Result<()> {
@@ -1468,6 +1499,7 @@ async fn serve_tcp_client(
             framed.extend_from_slice(&length.to_be_bytes());
             framed.extend_from_slice(&response);
             stream.write_all(&framed).await?;
+            stream.flush().await?;
             Ok(true)
         };
         match tokio::time::timeout(TCP_EXCHANGE_TIMEOUT, exchange).await {
@@ -2081,7 +2113,7 @@ mod tests {
         let slot = new_resolver_slot(resolver);
         let budget = Arc::new(tokio::sync::Semaphore::new(1));
         let held = budget.acquire().await.unwrap();
-        let task = tokio::spawn(serve_tcp_client(
+        let task = tokio::spawn(serve_tcp_stream(
             stream,
             Arc::clone(&slot),
             Arc::clone(&budget),
@@ -2118,6 +2150,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn serve_tcp_stream_frames_queries_and_reloads_resolver() {
+        let make = |ip| {
+            let mut hosts = meow_trie::DomainTrie::new();
+            hosts.insert(
+                "example.com",
+                crate::resolver::HostEntry::Addresses(vec![ip]),
+            );
+            Arc::new(crate::resolver::Resolver::new(
+                Vec::new(),
+                Vec::new(),
+                DnsMode::Normal,
+                hosts,
+                true,
+                true,
+            ))
+        };
+        let slot = Arc::new(parking_lot::RwLock::new(make("10.0.0.1".parse().unwrap())));
+        let (mut client, server) = tokio::io::duplex(8192);
+        let task = tokio::spawn(serve_tcp_stream(
+            server,
+            Arc::clone(&slot),
+            Arc::new(tokio::sync::Semaphore::new(1)),
+        ));
+        for octet in [1, 2] {
+            *slot.write() = make(format!("10.0.0.{octet}").parse().unwrap());
+            let query = sample_query(octet as u16, 1);
+            client.write_u16(query.len() as u16).await.unwrap();
+            // Split input framing like a TCP fallback after a truncated UDP answer.
+            client.write_all(&query[..5]).await.unwrap();
+            client.write_all(&query[5..]).await.unwrap();
+            let n = client.read_u16().await.unwrap();
+            let mut response = vec![0; n as usize];
+            client.read_exact(&mut response).await.unwrap();
+            assert_eq!(&response[..2], &(octet as u16).to_be_bytes());
+            assert_eq!(&response[response.len() - 4..], &[10, 0, 0, octet]);
+            assert_eq!(response[2] & 2, 0, "TCP answer not truncated");
+        }
+        client.shutdown().await.unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn serve_tcp_buffered_stream_flushes_before_next_query() {
+        let make = |ip| {
+            let mut hosts = meow_trie::DomainTrie::new();
+            hosts.insert(
+                "example.com",
+                crate::resolver::HostEntry::Addresses(vec![ip]),
+            );
+            Arc::new(crate::resolver::Resolver::new(
+                Vec::new(),
+                Vec::new(),
+                DnsMode::Normal,
+                hosts,
+                true,
+                true,
+            ))
+        };
+        let slot = Arc::new(parking_lot::RwLock::new(make("10.0.0.1".parse().unwrap())));
+        let (mut client, server) = tokio::io::duplex(8192);
+        let task = tokio::spawn(serve_tcp_stream(
+            tokio::io::BufStream::new(server),
+            Arc::clone(&slot),
+            Arc::new(tokio::sync::Semaphore::new(1)),
+        ));
+        for octet in [1, 2] {
+            *slot.write() = make(format!("10.0.0.{octet}").parse().unwrap());
+            let query = sample_query(octet as u16, 1);
+            client.write_u16(query.len() as u16).await.unwrap();
+            // Split input framing like a TCP fallback after a truncated UDP answer.
+            client.write_all(&query[..5]).await.unwrap();
+            client.write_all(&query[5..]).await.unwrap();
+            let n = tokio::time::timeout(std::time::Duration::from_millis(100), client.read_u16())
+                .await
+                .expect("buffered response must be flushed")
+                .unwrap();
+            let mut response = vec![0; n as usize];
+            client.read_exact(&mut response).await.unwrap();
+            assert_eq!(&response[..2], &(octet as u16).to_be_bytes());
+            assert_eq!(&response[response.len() - 4..], &[10, 0, 0, octet]);
+            assert_eq!(response[2] & 2, 0, "TCP answer not truncated");
+        }
+        client.shutdown().await.unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn dns_tcp_partial_frame_times_out_and_releases_connection() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut client = TcpStream::connect(listener.local_addr().unwrap())
@@ -2126,7 +2245,7 @@ mod tests {
         let (stream, _) = listener.accept().await.unwrap();
         client.write_all(&[0]).await.unwrap();
         tokio::time::pause();
-        let result = serve_tcp_client(
+        let result = serve_tcp_stream(
             stream,
             new_resolver_slot(Arc::new(empty_resolver())),
             Arc::new(tokio::sync::Semaphore::new(1)),
@@ -2144,7 +2263,7 @@ mod tests {
         let (stream, _) = listener.accept().await.unwrap();
         client.write_all(&[0, 12, 1]).await.unwrap();
         client.shutdown().await.unwrap();
-        let result = serve_tcp_client(
+        let result = serve_tcp_stream(
             stream,
             new_resolver_slot(Arc::new(empty_resolver())),
             Arc::new(tokio::sync::Semaphore::new(1)),
