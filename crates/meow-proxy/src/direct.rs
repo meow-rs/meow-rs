@@ -247,6 +247,18 @@ impl tokio::io::AsyncWrite for DirectConn {
         std::pin::Pin::new(&mut self.0).poll_write(cx, buf)
     }
 
+    fn is_write_vectored(&self) -> bool {
+        self.0.is_write_vectored()
+    }
+
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.0).poll_write_vectored(cx, bufs)
+    }
+
     fn poll_flush(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -464,6 +476,35 @@ impl ProxyAdapter for DirectAdapter {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn direct_conn_preserves_vectored_writes() {
+        use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stream = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut peer, _) = listener.accept().await.unwrap();
+        let expected = stream.is_write_vectored();
+        assert!(
+            expected,
+            "fixture socket must support scatter/gather writes"
+        );
+        let mut conn = super::DirectConn(stream);
+        assert_eq!(
+            conn.is_write_vectored(),
+            expected,
+            "wrapper lost the socket capability"
+        );
+        let chunks = [
+            std::io::IoSlice::new(b"head"),
+            std::io::IoSlice::new(b"body"),
+        ];
+        assert_eq!(conn.write_vectored(&chunks).await.unwrap(), 8);
+        let mut received = [0; 8];
+        peer.read_exact(&mut received).await.unwrap();
+        assert_eq!(&received, b"headbody");
+    }
+
     use super::*;
     use meow_common::DnsMode;
     use meow_dns::HostEntry;
