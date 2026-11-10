@@ -899,7 +899,9 @@ impl TunListener {
         // Built before the pumps so the first SYN is already translated.
         let system = if cfg.stack == TunStack::System {
             if cfg!(target_os = "linux") {
-                match system::SystemStack::bind(tun_net, used_addr, used_addr6).await {
+                match system::SystemStack::bind(tun_net, used_addr, used_addr6, cfg.dns_hijack)
+                    .await
+                {
                     Ok(sys) => Some(sys),
                     Err(e) => {
                         warn!("tun.stack system unavailable ({e}); TCP stays on lwIP");
@@ -1688,7 +1690,6 @@ mod tests {
     use std::time::Duration;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
 
-<<<<<<< HEAD
     #[tokio::test]
     async fn lwip_admission_cancel_closes_waiting_stream() {
         let sem = Arc::new(Semaphore::new(1));
