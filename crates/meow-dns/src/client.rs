@@ -2164,8 +2164,8 @@ async fn read_lp<R: AsyncReadExt + Unpin>(r: &mut R) -> Result<Vec<u8>, ClientEr
 /// response with full RFC 7230 §3.3 framing via [`read_http_response`]
 /// and returns the DNS body plus the pool-eligibility verdict.
 #[cfg(feature = "encrypted")]
-async fn doh_http_exchange(
-    stream: &mut TlsConn,
+async fn doh_http_exchange<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send>(
+    stream: &mut S,
     sni: &str,
     path: &str,
     wire: &[u8],
@@ -2175,6 +2175,7 @@ async fn doh_http_exchange(
          Host: {host}\r\n\
          User-Agent: meow-rs\r\n\
          Accept: application/dns-message\r\n\
+         Accept-Encoding: identity\r\n\
          Content-Type: application/dns-message\r\n\
          Content-Length: {len}\r\n\
          \r\n",
@@ -2309,13 +2310,10 @@ where
     /// the stream via [`read_bounded_http_response`] (the historical EOF
     /// arm), the total bounded by [`MAX_DOH_RESPONSE_BYTES`].
     async fn read_to_eof(&mut self) -> Result<Vec<u8>, ClientError> {
-        let mut body = self.unconsumed().to_vec();
-        let rest = read_bounded_http_response(self.stream).await?;
-        if body.len() + rest.len() > MAX_DOH_RESPONSE_BYTES {
-            return Err(ClientError::Protocol("doh: response exceeds maximum size"));
-        }
-        body.extend_from_slice(&rest);
-        Ok(body)
+        // Include already-read headers and body in the same budget before
+        // awaiting any more input. An oversized response need not send EOF.
+        let all = read_bounded_http_response(self.stream, std::mem::take(&mut self.buf)).await?;
+        Ok(all[self.pos..].to_vec())
     }
 
     /// Read a `Transfer-Encoding: chunked` body (RFC 7230 §4.1): hex-size
@@ -2448,6 +2446,10 @@ where
                         .next()
                         .is_some_and(|coding| coding.trim().eq_ignore_ascii_case("chunked")),
                 );
+            } else if name.trim().eq_ignore_ascii_case("content-encoding") {
+                if !value.eq_ignore_ascii_case("identity") {
+                    return Err(ClientError::Protocol("doh: unsupported content-encoding"));
+                }
             } else if name.trim().eq_ignore_ascii_case("content-length") {
                 // Duplicate CLs take the last value. RFC 7230 §3.3.3 #4
                 // wants mismatched duplicates rejected — tolerated
@@ -2533,11 +2535,13 @@ pub(crate) const MAX_DOH_RESPONSE_BYTES: usize = 65535 + 16 * 1024;
 /// the bounded read stays unit testable without standing up a TLS DoH
 /// server.
 #[cfg(feature = "encrypted")]
-async fn read_bounded_http_response<R>(stream: &mut R) -> Result<Vec<u8>, ClientError>
+async fn read_bounded_http_response<R>(
+    stream: &mut R,
+    mut all: Vec<u8>,
+) -> Result<Vec<u8>, ClientError>
 where
     R: tokio::io::AsyncRead + Unpin + Send,
 {
-    let mut all = Vec::with_capacity(1024);
     let mut chunk = [0u8; 4096];
     loop {
         let n = stream.read(&mut chunk).await?;
@@ -2631,16 +2635,77 @@ mod tests {
     /// is rejected with a protocol error. Guards the low-risk review fix
     /// that bounds the previously unbounded `read_to_end`.
     #[cfg(feature = "encrypted")]
+    #[cfg(feature = "encrypted")]
+    #[tokio::test]
+    async fn doh_close_delimited_counts_buffered_bytes_before_eof() {
+        let (mut client, mut server) = tokio::io::duplex(2 * MAX_DOH_RESPONSE_BYTES);
+        // Leave the peer open after exceeding the total budget. The first
+        // fill includes part of this body along with the headers.
+        let response = [
+            b"HTTP/1.0 200 OK\r\n\r\n".to_vec(),
+            vec![b'x'; MAX_DOH_RESPONSE_BYTES + 1],
+        ]
+        .concat();
+        server.write_all(&response).await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(1), read_http_response(&mut client))
+            .await
+            .expect("oversized buffered body must not wait for EOF");
+        assert!(matches!(
+            result,
+            Err(ClientError::Protocol("doh: response exceeds maximum size"))
+        ));
+    }
+
+    #[tokio::test]
+    async fn doh_requests_identity_from_a_compression_capable_server() {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let peer = tokio::spawn(async move {
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                head.push(server.read_u8().await.unwrap());
+            }
+            let head = String::from_utf8(head).unwrap();
+            let mut query = [0; 5];
+            server.read_exact(&mut query).await.unwrap();
+            let body: &[u8] = if head.contains("\r\nAccept-Encoding: identity\r\n") {
+                b"ABCD"
+            } else {
+                // A gzip-coded ABCD response; absence of Accept-Encoding does
+                // not forbid a server from applying a content coding.
+                &[
+                    31, 139, 8, 0, 0, 0, 0, 0, 2, 3, 115, 116, 114, 118, 1, 0, 165, 32, 23, 219, 4,
+                    0, 0, 0,
+                ]
+            };
+            let coding = if body == b"ABCD" { "identity" } else { "gzip" };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Encoding: {coding}\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            server.write_all(response.as_bytes()).await.unwrap();
+            server.write_all(body).await.unwrap();
+        });
+        let (body, _) = doh_http_exchange(&mut client, "dns.example", "/dns-query", b"query")
+            .await
+            .unwrap();
+        peer.await.unwrap();
+        assert_eq!(body, b"ABCD");
+    }
+
     #[tokio::test]
     async fn doh_bounded_read_enforces_response_size_cap() {
         let at_cap = vec![0u8; MAX_DOH_RESPONSE_BYTES];
         let mut reader = at_cap.as_slice();
-        let got = read_bounded_http_response(&mut reader).await.unwrap();
+        let got = read_bounded_http_response(&mut reader, Vec::new())
+            .await
+            .unwrap();
         assert_eq!(got.len(), MAX_DOH_RESPONSE_BYTES);
 
         let over_cap = vec![0u8; MAX_DOH_RESPONSE_BYTES + 1];
         let mut reader = over_cap.as_slice();
-        let err = read_bounded_http_response(&mut reader).await.unwrap_err();
+        let err = read_bounded_http_response(&mut reader, Vec::new())
+            .await
+            .unwrap_err();
         assert!(
             matches!(
                 err,
@@ -2687,6 +2752,20 @@ mod tests {
     /// non-chunked final coding and close-delimited bodies answer
     /// correctly but must not be pooled.
     #[cfg(feature = "encrypted")]
+    #[cfg(feature = "encrypted")]
+    #[tokio::test]
+    async fn doh_coded_response_is_rejected_before_body_and_pooling() {
+        for coding in ["gzip", "br", "identity, gzip"] {
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Encoding: {coding}\r\nContent-Length: 999\r\n\r\n"
+            );
+            assert!(matches!(
+                doh_response(head.as_bytes()).await,
+                Err(ClientError::Protocol("doh: unsupported content-encoding"))
+            ));
+        }
+    }
+
     #[tokio::test]
     async fn doh_response_framing_matrix() {
         // Content-Length + keep-alive → reusable.
