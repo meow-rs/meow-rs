@@ -30,6 +30,10 @@
 #ifndef LWIP_CUSTOM_LWIPOPTS_H
 #define LWIP_CUSTOM_LWIPOPTS_H
 
+// Reference copy: build.rs compiles lwIP with `-I old-src/custom`, so the
+// live options file is `old-src/custom/lwipopts.h`. Changes must be
+// mirrored there — edits to this file alone have no build effect.
+
 // enable tun2socks logic
 #define TUN2SOCKS 1
 
@@ -120,6 +124,13 @@
 // #define TCP_SND_BUF (8 * TCP_MSS)
 // #define MEM_LIBC_MALLOC 1
 // #define MEMP_MEM_MALLOC 1
+// meow-lwip feature `libc-malloc`: pools and heap from libc on demand.
+// MEM_LIBC_MALLOC compiles out mem.c's entire heap arm (ram_heap
+// included); MEMP_MEM_MALLOC drops the static pool arrays.
+#ifdef MEOW_LWIP_LIBC_MALLOC
+#define MEM_LIBC_MALLOC 1
+#define MEMP_MEM_MALLOC 1
+#endif
 
 #define SYS_LIGHTWEIGHT_PROT 0
 #define LWIP_DONT_PROVIDE_BYTEORDER_FUNCTIONS

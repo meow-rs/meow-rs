@@ -32,6 +32,13 @@ the canonical, in-repo source a release is cut from.
   meow, so a firewall can intercept only those destinations and leave the
   rest to kernel forwarding / flowtable / hardware offload. Libc-only
   netlink writer; fake-IP answers skipped. See `docs/nftset.md`.
+- **`lwip-libc-malloc`** feature (meow-app, meow-listener; meow-lwip
+  `libc-malloc`): lwIP's pools and heap come from libc malloc on demand
+  (`MEM_LIBC_MALLOC` compiles out `mem.c`'s heap arm including `ram_heap`;
+  `MEMP_MEM_MALLOC` drops the static pool arrays) instead of ~3.2 MB of
+  static `.bss` that `memp_init` touches when the TUN starts — 1.2–3 MB
+  less anonymous RSS on a router, same throughput. Off in every bundle;
+  silently inert without `listener-tun`.
 - **mihomo dashboard parity** (#882): `GET /rules` reports mihomo's type
   names and the `extra` object (`disabled`, `hitCount`, `hitAt`);
   `PATCH /rules/disable` switches rules off, the switch following its rule
