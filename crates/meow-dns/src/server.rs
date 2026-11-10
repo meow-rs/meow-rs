@@ -136,17 +136,37 @@ impl DnsServer {
     /// `run()` fire-and-forget had no way to distinguish "listening" from
     /// "bind failed, every query will be dropped".
     pub async fn bind(&self) -> std::io::Result<BoundDnsServer> {
-        let socket = Arc::new(UdpSocket::bind(self.listen_addr).await?);
-        let bound = socket.local_addr()?;
-        // Roll back the UDP reservation if TCP cannot bind the same port.
-        let tcp = TcpListener::bind(bound).await?;
-        info!("DNS server listening on {bound}");
-        Ok(BoundDnsServer {
-            resolver: Arc::clone(&self.resolver),
-            socket,
-            tcp: Some(tcp),
-            dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        })
+        // Windows reserves excluded port ranges per protocol (Hyper-V/WINNAT):
+        // an ephemeral UDP port can sit inside a TCP-only exclusion, so the
+        // same-port TCP bind fails with WSAEACCES. With a :0 listen the port
+        // is ours to choose — roll a fresh pair instead of failing the whole
+        // server. A configured port keeps its single fail-fast attempt; a
+        // UDP bind failure always surfaces (the OS never hands out a port it
+        // excludes for the same protocol).
+        const BIND_ATTEMPTS: u32 = 8;
+        let mut last_err = None;
+        for _ in 0..BIND_ATTEMPTS {
+            let socket = Arc::new(UdpSocket::bind(self.listen_addr).await?);
+            let bound = socket.local_addr()?;
+            match TcpListener::bind(bound).await {
+                Ok(tcp) => {
+                    info!("DNS server listening on {bound}");
+                    return Ok(BoundDnsServer {
+                        resolver: Arc::clone(&self.resolver),
+                        socket,
+                        tcp: Some(tcp),
+                        dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                    });
+                }
+                Err(error) => {
+                    if self.listen_addr.port() != 0 {
+                        return Err(error);
+                    }
+                    last_err = Some(error);
+                }
+            }
+        }
+        Err(last_err.expect("bind loop ran at least once"))
     }
 
     /// Bind and serve in one call. Kept for callers that await `run()`
