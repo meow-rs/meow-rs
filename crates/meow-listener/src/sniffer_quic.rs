@@ -944,3 +944,44 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod independent_vectors {
+    use super::{QuicSniffStep, QuicSniffer};
+    #[test]
+    fn rfc_initials_require_authentication_before_routing() {
+        for text in [
+            include_str!("sniffer/fixtures/rfc9001-client.hex"),
+            include_str!("sniffer/fixtures/rfc9369-client.hex"),
+        ] {
+            let text: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+            let (pairs, remainder) = text.as_bytes().as_chunks::<2>();
+            assert!(remainder.is_empty(), "fixture must contain whole hex bytes");
+            let packet: Vec<u8> = pairs
+                .iter()
+                .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+                .collect();
+            assert_eq!(
+                QuicSniffer::default().feed(&packet),
+                QuicSniffStep::Name("example.com".into())
+            );
+            // Flip the last byte (inside the AEAD tag) and a body byte (inside
+            // the ciphertext): either must fail authentication before the SNI
+            // can route.
+            for offset in [packet.len() - 1, packet.len() / 2] {
+                let mut corrupt = packet.clone();
+                corrupt[offset] ^= 1;
+                assert!(!matches!(
+                    QuicSniffer::default().feed(&corrupt),
+                    QuicSniffStep::Name(_)
+                ));
+            }
+            for n in 0..packet.len() {
+                assert!(!matches!(
+                    QuicSniffer::default().feed(&packet[..n]),
+                    QuicSniffStep::Name(_)
+                ));
+            }
+        }
+    }
+}
