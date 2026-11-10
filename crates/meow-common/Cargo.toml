@@ -9,6 +9,7 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
+futures = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 smol_str = { workspace = true }
