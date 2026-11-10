@@ -1022,6 +1022,8 @@ impl TunListener {
             None
         };
         let warned_saturated = Arc::new(AtomicBool::new(false));
+        // Bound upstream DNS work across all intercepted TCP streams.
+        let tcp_dns_budget = Arc::new(Semaphore::new(64));
         // System stack: kernel accept errors (ECONNABORTED, EMFILE under a
         // flow storm) back off and retry, as the other listeners do.
         // The accept future is pinned across `select!` iterations — the
@@ -1058,11 +1060,13 @@ impl TunListener {
                         Some(((stream, src, dst), permit)) => {
                             // Same loop guard as the UDP path: a dial to the
                             // TUN's own subnet routes back into the device.
-                            if udp::is_looping_dst(dst.ip(), tun_net) {
+                            if tcp_loop_guard(dst, cfg.dns_hijack, tun_net) {
                                 debug!("tun TCP: dropping non-routable dst {dst} (from {src})");
                                 drop(stream);
                                 continue;
                             }
+                            let dns_hijack = cfg.dns_hijack;
+                            let dns_budget = Arc::clone(&tcp_dns_budget);
                             let tunnel = self.tunnel.clone();
                             let name = self.name.clone();
                             let sniffer = self.sniffer.clone();
@@ -1092,16 +1096,30 @@ impl TunListener {
                                         return;
                                     }
                                 };
-                                handle_tcp_flow(
-                                    tunnel,
-                                    stream,
-                                    prefix,
-                                    src,
-                                    dst,
-                                    &name,
-                                    sniffer.as_deref(),
-                                )
-                                .await;
+                                if dns_hijack && dst.port() == 53 {
+                                    let stream = TunTcpConn {
+                                        prefix,
+                                        pos: 0,
+                                        inner: std::sync::Mutex::new(stream),
+                                    };
+                                    let _ = meow_dns::server::serve_tcp_stream(
+                                        stream,
+                                        tunnel.resolver_slot(),
+                                        dns_budget,
+                                    )
+                                    .await;
+                                } else {
+                                    handle_tcp_flow(
+                                        tunnel,
+                                        stream,
+                                        prefix,
+                                        src,
+                                        dst,
+                                        &name,
+                                        sniffer.as_deref(),
+                                    )
+                                    .await;
+                                }
                             });
                         }
                         None => break Err("netstack TCP listener or connection quota closed".into()),
@@ -1126,6 +1144,9 @@ impl TunListener {
                             dst,
                             guard,
                         } = accepted;
+                        if tcp_loop_guard(dst, cfg.dns_hijack, tun_net) { continue; }
+                        let dns_hijack = cfg.dns_hijack;
+                        let dns_budget = Arc::clone(&tcp_dns_budget);
                         let tunnel = self.tunnel.clone();
                         let name = self.name.clone();
                         let sniffer = self.sniffer.clone();
@@ -1151,6 +1172,12 @@ impl TunListener {
                                 Ok(Ok(_)) | Err(_) => {}
                             }
                             let _permit = permit;
+                            if dns_hijack && dst.port() == 53 {
+                                let _ = meow_dns::server::serve_tcp_stream(
+                                    stream, tunnel.resolver_slot(), dns_budget,
+                                ).await;
+                                return;
+                            }
                             let mut metadata = Metadata {
                                 network: Network::Tcp,
                                 conn_type: ConnType::Tun,
@@ -1513,6 +1540,11 @@ where
     Ok(buf)
 }
 
+// Intercept DNS to the TUN address before rejecting subnet loopback traffic.
+fn tcp_loop_guard(dst: SocketAddr, dns_hijack: bool, nets: udp::TunNets) -> bool {
+    !(dns_hijack && dst.port() == 53) && udp::is_looping_dst(dst.ip(), nets)
+}
+
 async fn handle_tcp_flow(
     tunnel: Tunnel,
     tcp: lwip::TcpStream,
@@ -1656,6 +1688,7 @@ mod tests {
     use std::time::Duration;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
 
+<<<<<<< HEAD
     #[tokio::test]
     async fn lwip_admission_cancel_closes_waiting_stream() {
         let sem = Arc::new(Semaphore::new(1));
@@ -1772,6 +1805,25 @@ mod tests {
                 input.abort();
                 let _ = input.await;
             }
+        }
+    }
+
+    #[test]
+    fn tcp_dns_hijack_precedes_subnet_loop_guard() {
+        let nets = super::udp::TunNets {
+            v4: "172.19.0.1/30".parse().unwrap(),
+            v6: Some("fd00::1/126".parse().unwrap()),
+            nat: None,
+        };
+        for ip in ["172.19.0.1", "fd00::1"] {
+            let dns = std::net::SocketAddr::new(ip.parse().unwrap(), 53);
+            assert!(!super::tcp_loop_guard(dns, true, nets));
+            assert!(super::tcp_loop_guard(dns, false, nets));
+            assert!(super::tcp_loop_guard(
+                std::net::SocketAddr::new(dns.ip(), 80),
+                true,
+                nets
+            ));
         }
     }
 

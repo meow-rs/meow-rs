@@ -118,6 +118,12 @@ Flow handling is the same in both scopes:
   concurrent in-process answers (queries it cannot decide locally past
   that bound are dropped; clients retry). Live occupancy is observable via
   `Tunnel::tun_udp_flow_count`.
+- TCP queries to port 53 are also answered by `dns-hijack` when enabled,
+  on both TCP backends, including queries addressed to the TUN interface.
+  Streams reuse the bounded TCP DNS service: one query at a time, a 30-second
+  exchange deadline, and a shared 64-query upstream budget separate from UDP.
+  Locally answerable queries bypass that upstream budget. `dns-hijack: []`
+  leaves TCP DNS on the ordinary routing path.
 - A destination **inside** the fake-ip range with **no live allocation** —
   stale across a restart, evicted by pool wrap, or a literal connect into
   the range — is dropped rather than dialed: dialing it would route
@@ -332,6 +338,7 @@ ip route get 1.1.1.1                  # dev meow-tun table 1835364215
 curl 1.1.1.1                          # IP literal — captured (check meow logs)
 curl https://example.com              # domain flow — still captured
 dig @9.9.9.9 example.com              # UDP: answered by dns-hijack with a fake IP
+dig +tcp @9.9.9.9 example.com         # TCP fallback: same in-process resolver
 # no loop: meow's own dials leave by the physical interface, never the tun
 sudo tcpdump -ni eth0 'tcp[tcpflags] & tcp-syn != 0'       # the outbound SYNs
 sudo tcpdump -ni meow-tun src host <eth0 address>          # stays empty
