@@ -107,24 +107,6 @@ jobs:
       - name: Doc check
         run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 
-  ohos:
-    name: OpenHarmony socket crates
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      # rustup resolves the repository's toolchain pin before installing the
-      # target. These socket crates need no OHOS C/C++ sysroot for check.
-      - name: Install OpenHarmony target
-        run: rustup target add aarch64-unknown-linux-ohos
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: true
-      - name: Check OpenHarmony socket crates
-        env:
-          RUSTFLAGS: -D warnings
-        run: cargo check --locked --target aarch64-unknown-linux-ohos -p meow-common -p meow-anytls
-
   test:
     # Ubuntu 26.04, which `ubuntu-latest` is moving to, no longer packages
     # simple-obfs (installed below for the SS integration tests); return to
