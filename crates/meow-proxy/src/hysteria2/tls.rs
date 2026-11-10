@@ -37,15 +37,26 @@ struct Windows {
 }
 
 /// The configured windows, defaults filled in. Unset, the connection ceiling
-/// scales with RAM (MemTotal / 16, 4..=24 MiB): a client reading slower than
-/// the server sends parks a whole window in this process, and the stock
-/// 20-24 MiB per connection is a third of a 64 MB router (meow-openwrt;
-/// tunbench, 20 Mbit/s client: 29-33 MB anon). Initials never exceed their
-/// ceilings.
+/// scales with RAM (MemTotal / 16, 4..=24 MiB — the crossover is 384 MB of
+/// total RAM): a client reading slower than the server sends parks a whole
+/// window in this process, and the stock 20-24 MiB per connection is a third
+/// of a 64 MB router (meow-openwrt; tunbench, 20 Mbit/s client: 29-33 MB
+/// anon). Initials never exceed their ceilings.
+///
+/// `max_stream` defaults to `min(16 MiB, max_conn)` — mihomo advertises the
+/// independent 16 MiB, but a stream can never outrun the connection credit
+/// anyway, so clamping the advertised window is functionally equivalent and
+/// keeps the QUIC `conn ≥ stream` invariant explicit.
 fn resolve_windows(cfg: super::ReceiveWindows, mem_total: Option<u64>) -> Windows {
     let auto_conn = mem_total.map_or(MAX_CONN_WINDOW, |m| {
         (m / 16).clamp(MIN_AUTO_CONN_WINDOW, MAX_CONN_WINDOW)
     });
+    if cfg.max_conn.is_none() && auto_conn < MAX_CONN_WINDOW {
+        tracing::debug!(
+            "hysteria2: RAM-scaled connection window ceiling: {} MiB",
+            auto_conn / (1024 * 1024)
+        );
+    }
     let max_conn = cfg.max_conn.unwrap_or(auto_conn);
     let max_stream = cfg.max_stream.unwrap_or(MAX_STREAM_WINDOW.min(max_conn));
     Windows {
@@ -62,7 +73,11 @@ fn resolve_windows(cfg: super::ReceiveWindows, mem_total: Option<u64>) -> Window
     }
 }
 
-/// `MemTotal` in bytes, read once (Linux; `None` elsewhere).
+/// `MemTotal` in bytes, read once (Linux; `None` elsewhere). Deliberately
+/// the host's physical RAM, not the cgroup limit: physical RAM is static
+/// and explicit config overrides the scaling, so a container seeing more
+/// than its cgroup allowance keeps the stock windows rather than guessing
+/// at quota files that vary by runtime.
 fn mem_total() -> Option<u64> {
     static MEM: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     *MEM.get_or_init(|| {
@@ -75,7 +90,7 @@ fn mem_total() -> Option<u64> {
             .trim()
             .parse()
             .ok()?;
-        Some(kb * 1024)
+        Some(kb.saturating_mul(1024))
     })
 }
 
