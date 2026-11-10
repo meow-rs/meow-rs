@@ -48,6 +48,8 @@ pub(crate) type StreamId = u64;
 pub(crate) const WRITE_CHUNK: usize = 4096;
 /// Per-stream write channel capacity, in chunks.
 pub(crate) const WRITE_CHAN_CAP: usize = 8;
+/// Bound pending accepts independently of already accepted streams.
+pub(crate) const ACCEPT_QUEUE_CAP: usize = 64;
 
 /// Ordered per-stream commands. Travelling a dedicated bounded channel gives
 /// the write path real backpressure (a full channel parks the writer via
@@ -129,7 +131,7 @@ pub(crate) struct CbCtx {
 pub(crate) struct ListenerCtx {
     next_id: StreamId,
     cmd_tx: UnboundedSender<Cmd>,
-    accept_tx: UnboundedSender<(TcpStream, SocketAddr, SocketAddr)>,
+    accept_tx: Sender<(TcpStream, SocketAddr, SocketAddr)>,
 }
 
 /// Context the netif output hook pushes egress frames through. The old code
@@ -293,6 +295,14 @@ pub extern "C" fn tcp_accept_cb(arg: *mut raw::c_void, newpcb: *mut tcp_pcb, err
         return err_enum_t_ERR_OK as err_t;
     }
     let listener = unsafe { &mut *(arg as *mut ListenerCtx) };
+    let Ok(accept) = listener.accept_tx.try_reserve() else {
+        // No callback context or Rust handle has escaped yet. The C accept
+        // callback must report ERR_ABRT after freeing this new PCB.
+        unsafe {
+            tcp_abort(newpcb);
+        }
+        return err_enum_t_ERR_ABRT as err_t;
+    };
     listener.next_id += 1;
     let id = listener.next_id;
 
@@ -343,7 +353,7 @@ pub extern "C" fn tcp_accept_cb(arg: *mut raw::c_void, newpcb: *mut tcp_pcb, err
         write_tx,
         listener.cmd_tx.clone(),
     );
-    let _ = listener.accept_tx.send((stream, src_addr, dest_addr));
+    accept.send((stream, src_addr, dest_addr));
 
     err_enum_t_ERR_OK as err_t
 }
@@ -440,7 +450,7 @@ pub(crate) struct LwipCore {
 /// Bundle handed back to `NetStack::with_buffer_size` alongside the handles.
 pub(crate) struct CoreParts {
     pub core: LwipCore,
-    pub accept_rx: UnboundedReceiver<(TcpStream, SocketAddr, SocketAddr)>,
+    pub accept_rx: Receiver<(TcpStream, SocketAddr, SocketAddr)>,
     pub egress_rx: Receiver<Vec<u8>>,
     pub udp_in_rx: Receiver<super::udp::UdpPkt>,
     pub udp_out_tx: Sender<UdpOut>,
@@ -466,7 +476,7 @@ impl LwipCore {
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let (ingress_tx, ingress_rx) = tokio::sync::mpsc::channel(stack_buffer_size);
         let (egress_tx, egress_rx) = tokio::sync::mpsc::channel(stack_buffer_size);
-        let (accept_tx, accept_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (accept_tx, accept_rx) = tokio::sync::mpsc::channel(ACCEPT_QUEUE_CAP);
         let (udp_in_tx, udp_in_rx) = tokio::sync::mpsc::channel(udp_buffer_size);
         let (udp_out_tx, udp_out_rx) = tokio::sync::mpsc::channel(udp_buffer_size);
         let (done_tx, done_rx) = watch::channel(false);

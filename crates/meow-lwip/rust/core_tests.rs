@@ -496,3 +496,47 @@ async fn ipv6_reassembly_size_boundary_drops_and_recovers() {
         .unwrap()
         .unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_accept_queue_pressure_preserves_existing_streams_and_recovers() {
+    let _serial = STACK_LOCK.lock().await;
+    let (stack, mut listener, _udp) = NetStack::new().unwrap();
+    let mut done = stack.core_done();
+    let (sink, egress) = stack.split();
+    let mut peer = Peer { sink, egress };
+    for i in 0..=64 {
+        peer.handshake(30000 + i as u16).await;
+    }
+    peer.expect("new accept rejected", |s| {
+        s.dport == 30000 + 64 && s.flags & RST != 0
+    })
+    .await;
+    let mut held = Vec::new();
+    for _ in 0..64 {
+        held.push(
+            timeout(STEP_TIMEOUT, listener.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .0,
+        );
+    }
+    held[0].write_all(b"alive").await.unwrap();
+    peer.expect("existing stream survives", |s| {
+        s.dport == 30000 && s.len == 5
+    })
+    .await;
+    peer.handshake(31000).await;
+    let (mut recovered, _, _) = timeout(STEP_TIMEOUT, listener.next())
+        .await
+        .unwrap()
+        .unwrap();
+    recovered.write_all(b"new").await.unwrap();
+    peer.expect("new stream recovers", |s| s.dport == 31000 && s.len == 3)
+        .await;
+    peer.sink.close().await.unwrap();
+    timeout(STEP_TIMEOUT, done.wait_for(|done| *done))
+        .await
+        .unwrap()
+        .unwrap();
+}
