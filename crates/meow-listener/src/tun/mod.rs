@@ -864,7 +864,7 @@ impl TunListener {
                 }
             }
         }
-        let (stack, mut tcp_listener, udp_socket) = lwip::NetStack::with_mtu(cfg.mtu)
+        let (stack, tcp_listener, udp_socket) = lwip::NetStack::with_mtu(cfg.mtu)
             .map_err(|e| io::Error::other(format!("lwIP netstack: {e}")))?;
         // Publish this generation's done signal so the next stack build
         // gates on it — including the case where this listener is aborted
@@ -1038,10 +1038,24 @@ impl TunListener {
             meow_common::ErrorBackoff::new(),
         ));
 
+        // Both admission futures remain in the outer select. A semaphore
+        // permit reserved for one backend must not prevent polling that backend.
+        let mut lwip_accept_fut = Box::pin(accept_lwip(
+            tcp_listener,
+            conn_limit.clone(),
+            &warned_saturated,
+            &self.name,
+        ));
+
         let result = loop {
             tokio::select! {
-                accepted = tcp_listener.next() => match accepted {
-                    Some((stream, src, dst)) => {
+                accepted = lwip_accept_fut.as_mut() => {
+                    let (listener, accepted) = accepted;
+                    lwip_accept_fut.set(accept_lwip(
+                        listener, conn_limit.clone(), &warned_saturated, &self.name,
+                    ));
+                    match accepted {
+                    Some(((stream, src, dst), permit)) => {
                         // Same loop guard as the UDP path: a dial to the
                         // TUN's own subnet routes back into the device.
                         if udp::is_looping_dst(dst.ip(), tun_net) {
@@ -1049,15 +1063,6 @@ impl TunListener {
                             drop(stream);
                             continue;
                         }
-                        // Keep at most one accepted stream waiting here. With the
-                        // libc allocator the PCB count is not a finite task cap.
-                        let (stream, permit) = match admit_lwip_flow(
-                            stream, conn_limit.clone(), &warned_saturated,
-                            &self.name, &mut pump_in, &mut pump_out,
-                        ).await {
-                            Ok(accepted) => accepted,
-                            Err(error) => break Err(error.into()),
-                        };
                         let tunnel = self.tunnel.clone();
                         let name = self.name.clone();
                         let sniffer = self.sniffer.clone();
@@ -1091,7 +1096,8 @@ impl TunListener {
                                 .await;
                         });
                     }
-                    None => break Err("netstack TCP listener closed".into()),
+                    None => break Err("netstack TCP listener or connection quota closed".into()),
+                    }
                 },
                 accepted = accept_fut.as_mut() => match accepted {
                     Some((accepted, backoff)) => {
@@ -1199,29 +1205,30 @@ impl TunListener {
             let _ = pump_out.await;
         }
         tasks.shutdown().await;
-        drop(tcp_listener);
+        drop(lwip_accept_fut);
         result
     }
 }
 
-/// Wait before publishing a handler, retaining one stream and observing pump
-/// termination even while the explicit connection limit is saturated.
-async fn admit_lwip_flow<T>(
-    stream: T,
+/// Retain one accepted stream while waiting for a slot. The caller pins this
+/// future alongside system admission and both pumps, preserving FIFO progress.
+/// Return the listener so the next future can own it without overlapping borrows.
+async fn accept_lwip<S: futures::Stream + Unpin>(
+    mut listener: S,
     sem: Option<Arc<Semaphore>>,
     warned: &AtomicBool,
     name: &str,
-    pump_in: &mut tokio::task::JoinHandle<io::Result<()>>,
-    pump_out: &mut tokio::task::JoinHandle<io::Result<()>>,
-) -> Result<(T, Option<tokio::sync::OwnedSemaphorePermit>), String> {
-    tokio::select! {
-        permit = flow_slot(sem, warned, name) => {
-            let permit = permit.map_err(|_| "TUN connection-limit semaphore closed".to_string())?;
-            Ok((stream, permit))
-        }
-        joined = pump_in => Err(pump_error("device→stack", joined)),
-        joined = pump_out => Err(pump_error("stack→device", joined)),
-    }
+) -> (
+    S,
+    Option<(S::Item, Option<tokio::sync::OwnedSemaphorePermit>)>,
+) {
+    let Some(stream) = listener.next().await else {
+        return (listener, None);
+    };
+    let Ok(permit) = flow_slot(sem, warned, name).await else {
+        return (listener, None);
+    };
+    (listener, Some((stream, permit)))
 }
 
 /// What one completed kernel accept hands the select arm.
@@ -1642,60 +1649,66 @@ mod tests {
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
 
     #[tokio::test]
-    async fn lwip_admission_waits_before_publishing_and_releases_on_cancel() {
+    async fn lwip_admission_cancel_closes_waiting_stream() {
         let sem = Arc::new(Semaphore::new(1));
         let held = Arc::clone(&sem).acquire_owned().await.unwrap();
         let warned = AtomicBool::new(false);
-        let mut input = tokio::spawn(std::future::pending::<io::Result<()>>());
-        let mut output = tokio::spawn(std::future::pending::<io::Result<()>>());
         let (stream, mut peer) = tokio::io::duplex(8);
-        let mut admission = Box::pin(super::admit_lwip_flow(
-            stream,
+        let mut admission = Box::pin(super::accept_lwip(
+            futures::stream::iter([stream]),
             Some(Arc::clone(&sem)),
             &warned,
             "test",
-            &mut input,
-            &mut output,
         ));
         assert!(futures::poll!(&mut admission).is_pending());
-        assert_eq!(sem.available_permits(), 0);
         drop(admission);
-        let mut byte = [0];
-        assert_eq!(peer.read(&mut byte).await.unwrap(), 0);
+        assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
         drop(held);
         assert_eq!(sem.available_permits(), 1);
-        input.abort();
-        output.abort();
-        let _ = input.await;
-        let _ = output.await;
     }
 
     #[tokio::test]
-    async fn lwip_admission_publishes_only_after_slot_release() {
-        let sem = Arc::new(Semaphore::new(1));
-        let held = Arc::clone(&sem).acquire_owned().await.unwrap();
-        let warned = AtomicBool::new(false);
-        let mut input = tokio::spawn(std::future::pending::<io::Result<()>>());
-        let mut output = tokio::spawn(std::future::pending::<io::Result<()>>());
-        let mut admission = Box::pin(super::admit_lwip_flow(
-            42,
-            Some(Arc::clone(&sem)),
-            &warned,
-            "test",
-            &mut input,
-            &mut output,
-        ));
-        assert!(futures::poll!(&mut admission).is_pending());
-        drop(held);
-        let (stream, permit) = admission.await.unwrap();
-        assert_eq!(stream, 42);
-        assert_eq!(sem.available_permits(), 0);
-        drop(permit);
-        assert_eq!(sem.available_permits(), 1);
-        input.abort();
-        output.abort();
-        let _ = input.await;
-        let _ = output.await;
+    async fn lwip_admission_progresses_behind_system_waiter() {
+        for system_first in [false, true] {
+            let sem = Arc::new(Semaphore::new(1));
+            let held = Arc::clone(&sem).acquire_owned().await.unwrap();
+            let warned = AtomicBool::new(false);
+            let mut system = Box::pin(super::flow_slot(Some(Arc::clone(&sem)), &warned, "system"));
+            let mut lwip = Box::pin(super::accept_lwip(
+                futures::stream::iter([42]),
+                Some(Arc::clone(&sem)),
+                &warned,
+                "lwip",
+            ));
+            if system_first {
+                assert!(futures::poll!(&mut system).is_pending());
+                assert!(futures::poll!(&mut lwip).is_pending());
+            } else {
+                assert!(futures::poll!(&mut lwip).is_pending());
+                assert!(futures::poll!(&mut system).is_pending());
+            }
+            drop(held);
+            timeout(Duration::from_secs(1), async {
+                tokio::select! {
+                    permit = &mut system => {
+                        assert!(system_first);
+                        drop(permit.unwrap());
+                        let (_, accepted) = lwip.await;
+                        let (stream, permit) = accepted.unwrap();
+                        assert_eq!(stream, 42); drop(permit);
+                    }
+                    (_, accepted) = &mut lwip => {
+                        assert!(!system_first);
+                        let (stream, permit) = accepted.unwrap();
+                        assert_eq!(stream, 42); drop(permit);
+                        drop(system.await.unwrap());
+                    }
+                }
+            })
+            .await
+            .expect("both backends must progress through a shared FIFO quota");
+            assert_eq!(sem.available_permits(), 1);
+        }
     }
 
     #[tokio::test]
@@ -1711,15 +1724,23 @@ mod tests {
                 output.abort();
             }
             let (stream, mut peer) = tokio::io::duplex(8);
-            let result = timeout(
-                Duration::from_secs(1),
-                super::admit_lwip_flow(stream, Some(sem), &warned, "test", &mut input, &mut output),
-            )
+            let mut admission = Box::pin(super::accept_lwip(
+                futures::stream::iter([stream]),
+                Some(sem),
+                &warned,
+                "test",
+            ));
+            timeout(Duration::from_secs(1), async {
+                tokio::select! {
+                    _ = &mut admission => panic!("saturated admission completed"),
+                    _ = &mut input => assert!(failed_input),
+                    _ = &mut output => assert!(!failed_input),
+                }
+            })
             .await
             .unwrap();
-            assert!(result.is_err());
+            drop(admission);
             assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
-            // The selected handle was consumed by admission; join only its sibling.
             if failed_input {
                 output.abort();
                 let _ = output.await;
