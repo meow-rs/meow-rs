@@ -183,6 +183,16 @@ the canonical, in-repo source a release is cut from.
   as `{1,3}`: classical rule providers take the whole tail after the first
   comma, while `rules:` entries and logic sub-rules take the last comma
   field as the target — matching upstream comma protection.
+- `dns.proxy-server-nameserver-policy` now also rejects a proxy tagged while
+  it carries a `dialer-proxy:` chain through the relay-based fallback
+  wrapper (hysteria2 and anytls nodes cannot take an injected dialer): the
+  declared dependency is read through a `ProxyAdapter` query instead of a
+  concrete-type downcast, so a front group parked on REJECT can no longer
+  make the chain invisible.
+- hysteria2 `max-stream-receive-window` values configured above
+  `max-connection-receive-window` are clamped to the connection ceiling —
+  a stream can never outrun connection credit — keeping the advertised
+  `conn ≥ stream` invariant the code documents.
 - Hostname TCP dialing tries the alternate address family after 250 ms so a
   stalled IPv6 or IPv4 connect does not starve a reachable alternative.
 - Restore OpenHarmony builds of `meow-common` by matching the peer-aware

@@ -48,11 +48,6 @@ struct DialerHop {
 }
 
 impl WrappedProxy {
-    /// Configured dependency, independent of the front group's current pick.
-    pub(crate) fn has_configured_dialer(&self) -> bool {
-        self.hop.is_some()
-    }
-
     pub fn new(adapter: Box<dyn ProxyAdapter>) -> Self {
         Self { adapter, hop: None }
     }
@@ -126,6 +121,11 @@ impl ProxyAdapter for WrappedProxy {
             ),
             None => self.adapter.dialer_hop(metadata),
         }
+    }
+
+    /// Configured dependency, independent of the front group's current pick.
+    fn has_configured_dialer(&self) -> bool {
+        self.hop.is_some()
     }
 
     fn dialer_hop_network(&self, flow: meow_common::Network) -> meow_common::Network {
