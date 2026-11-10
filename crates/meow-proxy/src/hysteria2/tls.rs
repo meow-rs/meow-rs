@@ -13,13 +13,86 @@ use sha2::{Digest, Sha256};
 use std::time::Duration;
 
 const ALPN_H3: &[u8] = b"h3";
+/// Initial windows, as Hysteria's client (8 MiB stream, 20 MiB connection).
 const STREAM_RECEIVE_WINDOW: u64 = 8 * 1024 * 1024;
 const CONN_RECEIVE_WINDOW: u64 = STREAM_RECEIVE_WINDOW * 5 / 2;
+/// quiche's auto-tuning ceilings.
+const MAX_STREAM_WINDOW: u64 = 16 * 1024 * 1024;
+const MAX_CONN_WINDOW: u64 = 24 * 1024 * 1024;
+/// Floor of the memory-scaled connection ceiling.
+const MIN_AUTO_CONN_WINDOW: u64 = 4 * 1024 * 1024;
 const MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_CONCURRENT_STREAMS: u64 = 1024;
 const DGRAM_QUEUE_LEN: usize = 1024;
 /// quic-go's ceiling (1500 − IPv6 40 − UDP 8); PMTUD finds the path's.
 pub(super) const MAX_SEND_UDP_PAYLOAD: usize = 1452;
+
+/// Flow-control windows in effect, bytes.
+#[derive(Debug, PartialEq, Eq)]
+struct Windows {
+    initial_stream: u64,
+    max_stream: u64,
+    initial_conn: u64,
+    max_conn: u64,
+}
+
+/// The configured windows, defaults filled in. Unset, the connection ceiling
+/// scales with RAM (MemTotal / 16, 4..=24 MiB — the crossover is 384 MB of
+/// total RAM): a client reading slower than the server sends parks a whole
+/// window in this process, and the stock 20-24 MiB per connection is a third
+/// of a 64 MB router (meow-openwrt; tunbench, 20 Mbit/s client: 29-33 MB
+/// anon). Initials never exceed their ceilings.
+///
+/// `max_stream` defaults to `min(16 MiB, max_conn)` — mihomo advertises the
+/// independent 16 MiB, but a stream can never outrun the connection credit
+/// anyway, so clamping the advertised window is functionally equivalent and
+/// keeps the QUIC `conn ≥ stream` invariant explicit.
+fn resolve_windows(cfg: super::ReceiveWindows, mem_total: Option<u64>) -> Windows {
+    let auto_conn = mem_total.map_or(MAX_CONN_WINDOW, |m| {
+        (m / 16).clamp(MIN_AUTO_CONN_WINDOW, MAX_CONN_WINDOW)
+    });
+    if cfg.max_conn.is_none() && auto_conn < MAX_CONN_WINDOW {
+        tracing::debug!(
+            "hysteria2: RAM-scaled connection window ceiling: {} MiB",
+            auto_conn / (1024 * 1024)
+        );
+    }
+    let max_conn = cfg.max_conn.unwrap_or(auto_conn);
+    let max_stream = cfg.max_stream.unwrap_or(MAX_STREAM_WINDOW.min(max_conn));
+    Windows {
+        initial_stream: cfg
+            .initial_stream
+            .unwrap_or(STREAM_RECEIVE_WINDOW)
+            .min(max_stream),
+        max_stream,
+        initial_conn: cfg
+            .initial_conn
+            .unwrap_or(CONN_RECEIVE_WINDOW)
+            .min(max_conn),
+        max_conn,
+    }
+}
+
+/// `MemTotal` in bytes, read once (Linux; `None` elsewhere). Deliberately
+/// the host's physical RAM, not the cgroup limit: physical RAM is static
+/// and explicit config overrides the scaling, so a container seeing more
+/// than its cgroup allowance keeps the stock windows rather than guessing
+/// at quota files that vary by runtime.
+fn mem_total() -> Option<u64> {
+    static MEM: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *MEM.get_or_init(|| {
+        let s = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let kb: u64 = s
+            .lines()
+            .find_map(|l| l.strip_prefix("MemTotal:"))?
+            .trim()
+            .trim_end_matches("kB")
+            .trim()
+            .parse()
+            .ok()?;
+        Some(kb.saturating_mul(1024))
+    })
+}
 
 /// Build a client `quiche::Config` for the given hysteria2 config.
 pub fn build_quiche_config(config: &Config) -> Result<quiche::Config> {
@@ -52,10 +125,13 @@ pub fn build_quiche_config(config: &Config) -> Result<quiche::Config> {
     quic.set_application_protos(&[ALPN_H3])
         .map_err(|e| Error::tls(format!("quiche alpn: {e}")))?;
     quic.set_max_idle_timeout(u64::try_from(MAX_IDLE_TIMEOUT.as_millis()).unwrap_or(u64::MAX));
-    quic.set_initial_max_data(CONN_RECEIVE_WINDOW);
-    quic.set_initial_max_stream_data_bidi_local(STREAM_RECEIVE_WINDOW);
-    quic.set_initial_max_stream_data_bidi_remote(STREAM_RECEIVE_WINDOW);
-    quic.set_initial_max_stream_data_uni(STREAM_RECEIVE_WINDOW);
+    let w = resolve_windows(config.windows, mem_total());
+    quic.set_initial_max_data(w.initial_conn);
+    quic.set_max_connection_window(w.max_conn);
+    quic.set_initial_max_stream_data_bidi_local(w.initial_stream);
+    quic.set_initial_max_stream_data_bidi_remote(w.initial_stream);
+    quic.set_initial_max_stream_data_uni(w.initial_stream);
+    quic.set_max_stream_window(w.max_stream);
     quic.set_initial_max_streams_bidi(MAX_CONCURRENT_STREAMS);
     quic.set_initial_max_streams_uni(MAX_CONCURRENT_STREAMS);
     // hysteria2 disables the QUIC bit greasing.
@@ -227,6 +303,47 @@ mod tests {
     #[test]
     fn skip_cert_verify_without_a_pin_accepts_anything() {
         assert_eq!(server_cert_verifier(true, None), CertVerifier::Insecure);
+    }
+
+    #[test]
+    fn windows_scale_with_ram_unless_configured() {
+        const M: u64 = 1024 * 1024;
+        let auto = |mem| resolve_windows(super::super::ReceiveWindows::default(), mem);
+        // 64 MB router: 4 MiB ceiling, initials clamped under it.
+        assert_eq!(
+            auto(Some(64 * M)),
+            Windows {
+                initial_stream: 4 * M,
+                max_stream: 4 * M,
+                initial_conn: 4 * M,
+                max_conn: 4 * M
+            }
+        );
+        // 128 MB: 8 MiB.
+        assert_eq!(auto(Some(128 * M)).max_conn, 8 * M);
+        // Plenty of RAM / unknown: the stock windows.
+        for mem in [Some(4096 * M), None] {
+            assert_eq!(
+                auto(mem),
+                Windows {
+                    initial_stream: 8 * M,
+                    max_stream: 16 * M,
+                    initial_conn: 20 * M,
+                    max_conn: 24 * M
+                }
+            );
+        }
+        // Configured values win over the RAM scaling.
+        let cfg = super::super::ReceiveWindows {
+            max_conn: Some(32 * M),
+            initial_stream: Some(M),
+            ..Default::default()
+        };
+        let w = resolve_windows(cfg, Some(64 * M));
+        assert_eq!(
+            (w.initial_stream, w.max_stream, w.max_conn),
+            (M, 16 * M, 32 * M)
+        );
     }
 
     #[test]

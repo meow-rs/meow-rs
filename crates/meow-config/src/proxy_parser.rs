@@ -1392,8 +1392,9 @@ fn reject_unsupported_anytls_options(
 /// Optional fields follow the mihomo surface supported by the in-tree Rust
 /// backend: `up`, `down`, `obfs: salamander | gecko`, `obfs-password`,
 /// `obfs-min-packet-size` / `obfs-max-packet-size` (gecko only), `ports`,
-/// `hop-interval`, `sni`, `skip-cert-verify`, `fingerprint`, `udp`, and
-/// `fast-open`.
+/// `hop-interval`, `sni`, `skip-cert-verify`, `fingerprint`, `udp`,
+/// `fast-open`, and the four `*-receive-window` keys (bytes; `0`/absent
+/// is unset — a present non-integer value is a hard error).
 ///
 /// # Hard errors (Class A per ADR-0002)
 ///
@@ -1451,6 +1452,23 @@ fn parse_hysteria2(
         .unwrap_or(true);
     validate_hy2_alpn(name, config.get("alpn"))?;
     reject_unsupported_hy2_options(name, config)?;
+    // mihomo treats an absent or zero window as unset; a present value of
+    // the wrong type is a config error, not a silent default.
+    let window = |key: &str| -> std::result::Result<Option<u64>, String> {
+        let Some(value) = config.get(key).filter(|v| !v.is_null()) else {
+            return Ok(None);
+        };
+        let n = value.as_u64().ok_or_else(|| {
+            format!("hysteria2[{name}]: '{key}' must be an unsigned integer (bytes)")
+        })?;
+        Ok((n > 0).then_some(n))
+    };
+    let windows = meow_proxy::Hy2ReceiveWindows {
+        initial_stream: window("initial-stream-receive-window")?,
+        max_stream: window("max-stream-receive-window")?,
+        initial_conn: window("initial-connection-receive-window")?,
+        max_conn: window("max-connection-receive-window")?,
+    };
 
     meow_proxy::Hy2Adapter::new(Hy2Options {
         name: name.to_string(),
@@ -1469,6 +1487,7 @@ fn parse_hysteria2(
             .map(|(min_secs, max_secs)| Hy2HopInterval { min_secs, max_secs }),
         fingerprint,
         fast_open,
+        windows,
     })
 }
 
@@ -1827,10 +1846,6 @@ fn reject_unsupported_hy2_options(
     reject_enabled_hy2_map(name, config, "realm-opts")?;
     reject_nonzero_hy2_option(name, config, "cwnd")?;
     reject_nonzero_hy2_option(name, config, "udp-mtu")?;
-    reject_nonzero_hy2_option(name, config, "initial-stream-receive-window")?;
-    reject_nonzero_hy2_option(name, config, "max-stream-receive-window")?;
-    reject_nonzero_hy2_option(name, config, "initial-connection-receive-window")?;
-    reject_nonzero_hy2_option(name, config, "max-connection-receive-window")?;
     if optional_nonempty_str(config, "bbr-profile").is_some() {
         return Err(format!(
             "hysteria2[{name}]: 'bbr-profile' is not supported by the Rust backend"
@@ -4686,6 +4701,26 @@ tls: true
                  certificate: ./client.crt\n",
                 "certificate",
             ),
+            (
+                "string receive window",
+                "name: jp-hy2\n\
+                 type: hysteria2\n\
+                 server: 1.2.3.4\n\
+                 port: 443\n\
+                 password: secret\n\
+                 initial-stream-receive-window: 32m\n",
+                "must be an unsigned integer",
+            ),
+            (
+                "negative receive window",
+                "name: jp-hy2\n\
+                 type: hysteria2\n\
+                 server: 1.2.3.4\n\
+                 port: 443\n\
+                 password: secret\n\
+                 max-connection-receive-window: -1\n",
+                "must be an unsigned integer",
+            ),
         ];
 
         // Collect every failure instead of asserting inline so one bad row does
@@ -4721,6 +4756,23 @@ tls: true
     fn parse_hysteria2_accepts_zero_port_with_ports() {
         let cfg = hy2_config(
             "name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\nport: 0\nports: '443,8443'\npassword: secret\n",
+        );
+        assert!(parse_proxy(&cfg).is_ok());
+    }
+
+    #[cfg(feature = "hysteria2")]
+    #[test]
+    fn parse_hysteria2_accepts_zero_and_positive_windows() {
+        // mihomo treats an explicit 0 as unset — only a present value of the
+        // wrong type is a hard error.
+        let cfg = hy2_config(
+            "name: jp-hy2\n\
+             type: hysteria2\n\
+             server: 1.2.3.4\n\
+             port: 443\n\
+             password: secret\n\
+             initial-stream-receive-window: 0\n\
+             max-connection-receive-window: 4194304\n",
         );
         assert!(parse_proxy(&cfg).is_ok());
     }

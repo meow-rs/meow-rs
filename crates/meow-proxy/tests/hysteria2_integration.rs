@@ -331,6 +331,7 @@ fn adapter(port: u16, obfs: Option<Hy2Obfs>) -> Hy2Adapter {
         hop_interval: None,
         fingerprint: None,
         fast_open: true,
+        windows: Default::default(),
     })
     .expect("hysteria2 adapter must build")
 }

@@ -10,7 +10,7 @@ mod tls;
 mod udp;
 
 pub use client::ReconnectableClient;
-pub use config::{Config, ObfsConfig};
+pub use config::{Config, ObfsConfig, ReceiveWindows};
 pub use error::{Error, Result};
 pub(crate) use obfs::gecko_packet_sizes;
 /// Adapter-side bound for `host:port` datagram addresses (issue #657).

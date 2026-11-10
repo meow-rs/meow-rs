@@ -12,6 +12,19 @@ pub struct Config {
     pub pin_sha256: String,
     /// Return after sending the request instead of waiting for the remote dial response.
     pub fast_open: bool,
+    /// QUIC flow-control windows (mihomo's `*-receive-window`); `None` picks
+    /// the default.
+    pub windows: ReceiveWindows,
+}
+
+/// mihomo's `initial-/max-stream-receive-window` and
+/// `initial-/max-connection-receive-window`, in bytes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReceiveWindows {
+    pub initial_stream: Option<u64>,
+    pub max_stream: Option<u64>,
+    pub initial_conn: Option<u64>,
+    pub max_conn: Option<u64>,
 }
 
 /// UDP datagram obfuscation below QUIC (`obfs:`).
