@@ -128,6 +128,10 @@
 #define MEMP_MEM_MALLOC 1
 #endif
 
+// One full-size UDP datagram at the supported minimum MTU (1280) needs
+// up to 54 fragments. Keep reassembly bounded, but allow that datagram.
+#define IP_REASS_MAX_PBUFS 64
+
 #define SYS_LIGHTWEIGHT_PROT 0
 #define LWIP_DONT_PROVIDE_BYTEORDER_FUNCTIONS
 

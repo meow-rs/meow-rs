@@ -378,3 +378,75 @@ async fn ipv6_tcp_and_udp_flows_keep_their_addresses() {
         .expect("core teardown timed out")
         .expect("core dropped its done signal");
 }
+
+fn udp_test_datagram(payload: &[u8], source: u16, destination: u16) -> Vec<u8> {
+    let mut data = Vec::with_capacity(payload.len() + 8);
+    data.extend_from_slice(&source.to_be_bytes());
+    data.extend_from_slice(&destination.to_be_bytes());
+    data.extend_from_slice(&u16::try_from(payload.len() + 8).unwrap().to_be_bytes());
+    data.extend_from_slice(&[0, 0]); // inbound checksum checks are disabled
+    data.extend_from_slice(payload);
+    data
+}
+
+fn udp_test_fragments(ipv6: bool, mtu: u16, payload: &[u8]) -> Vec<Vec<u8>> {
+    let data = udp_test_datagram(payload, 42000, SERVER_PORT);
+    let header = if ipv6 { 48 } else { 20 };
+    let chunk = (usize::from(mtu) - header) & !7;
+    data.chunks(chunk)
+        .enumerate()
+        .map(|(index, part)| {
+            let offset = index * chunk;
+            let more = offset + part.len() < data.len();
+            if ipv6 {
+                let mut fragment = vec![17, 0];
+                fragment.extend_from_slice(&((offset as u16) | u16::from(more)).to_be_bytes());
+                fragment.extend_from_slice(&0x12345678u32.to_be_bytes());
+                fragment.extend_from_slice(part);
+                v6_frame(44, &fragment)
+            } else {
+                let mut frame = vec![0x45, 0];
+                frame.extend_from_slice(&u16::try_from(20 + part.len()).unwrap().to_be_bytes());
+                frame.extend_from_slice(&0x1234u16.to_be_bytes());
+                let flags_offset = (offset as u16 / 8) | if more { 0x2000 } else { 0 };
+                frame.extend_from_slice(&flags_offset.to_be_bytes());
+                frame.extend_from_slice(&[64, 17, 0, 0]);
+                frame.extend_from_slice(&CLIENT.octets());
+                frame.extend_from_slice(&SERVER.octets());
+                frame.extend_from_slice(part);
+                frame
+            }
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn large_fragmented_udp_reassembles() {
+    let _serial = STACK_LOCK.lock().await;
+    let (mut stack, listener, udp) = NetStack::new().unwrap();
+    let mut done = stack.core_done();
+    let (tx, mut rx) = udp.split();
+    for ipv6 in [false, true] {
+        let payload: Vec<u8> = (0..60000).map(|i| (i % 251) as u8).collect();
+        // Reverse order also checks that the last fragment arriving first
+        // does not cause premature delivery or discard the datagram.
+        for frame in udp_test_fragments(ipv6, 1280, &payload).into_iter().rev() {
+            stack.send(frame).await.unwrap();
+        }
+        let (data, src, dst) = timeout(STEP_TIMEOUT, rx.recv_from())
+            .await
+            .expect("large fragmented UDP was not reassembled")
+            .unwrap();
+        assert_eq!(data, payload);
+        let expected_src = if ipv6 { CLIENT6.into() } else { CLIENT.into() };
+        let expected_dst = if ipv6 { SERVER6.into() } else { SERVER.into() };
+        assert_eq!(src, SocketAddr::new(expected_src, 42000));
+        assert_eq!(dst, SocketAddr::new(expected_dst, SERVER_PORT));
+    }
+    drop((listener, tx, rx));
+    stack.close().await.unwrap();
+    timeout(STEP_TIMEOUT, done.wait_for(|done| *done))
+        .await
+        .unwrap()
+        .unwrap();
+}
