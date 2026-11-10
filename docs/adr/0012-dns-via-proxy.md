@@ -87,7 +87,12 @@ async fn tcp_exchange(addr: SocketAddr, wire: &[u8], proxy: Option<&Arc<dyn Prox
 }
 ```
 
-For UDP-via-proxy, fall through to TCP DNS automatically (most proxies don't relay arbitrary UDP). Document this in the config docs — users wanting true UDP-over-proxy must set `udp: true` on the proxy AND use `tcp://` URL form (the TCP fallback is the safer default).
+Literal-address UDP nameservers use the selected adapter's UDP association when
+`support_udp()` is true. TCP-only adapters and hostname nameservers retain the
+TCP path; `tcp://` explicitly selects TCP regardless of UDP support. A validated
+truncated answer retries TCP through the same adapter under the original query
+deadline. Send/read errors do not silently switch transports or bypass the proxy.
+Each query closes its association on completion, failure, timeout or cancellation.
 
 For DoT/DoH, layer `tokio_rustls` / HTTP/1.1 over the `Box<dyn AsyncRead+AsyncWrite>` exactly as today — the existing TLS connector is generic over `IO: AsyncRead + AsyncWrite + Unpin`.
 
@@ -106,7 +111,6 @@ resolver before swapping the route table so no query observes a dead cell.
 
 ### What this ADR does NOT cover
 
-- **UDP-native DNS through proxy** when the proxy supports UDP. V1 routes all `#PROXY` queries over TCP. UDP-over-proxy is an optimization that can land later behind a `udp-dns: true` flag.
 - **`fakeip` routing through proxy** — fake-IP synthesis happens *before* the proxy is chosen, so the question is meaningless for fakeip mode.
 - **Per-rule-set DNS routing** (resolve domains in ruleset X via proxy Y). That's `nameserver-policy` territory and is already partially supported.
 

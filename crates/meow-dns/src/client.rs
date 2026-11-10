@@ -877,9 +877,11 @@ impl DnsClient {
     /// - DoT / DoH exchanges dial `proxy.dial_tcp` and run the TLS
     ///   handshake over the returned [`meow_common::ProxyConn`] via
     ///   [`TlsLayer::connect_typed`].
-    /// - UDP exchanges fall through to TCP-over-proxy, since most proxy
-    ///   adapters can't relay arbitrary UDP. The fallback matches the
-    ///   semantics in ADR-0012.
+    /// - Literal-address UDP exchanges use the adapter's datagram support
+    ///   when available. TCP-only adapters and hostname upstreams retain
+    ///   TCP-over-proxy; explicit TCP entries always remain TCP.
+    /// - A validated truncated UDP answer retries through the same proxy's
+    ///   TCP transport under the original query deadline.
     pub fn with_proxy(mut self, proxy: DnsProxy) -> Self {
         #[cfg(feature = "quic-dns")]
         {
@@ -1668,6 +1670,11 @@ impl DnsClient {
         expected: &ExpectedResponse,
     ) -> Result<Message, ClientError> {
         if let Some(proxy) = self.proxy.as_ref() {
+            if let Transport::Udp { addr } = &self.transport {
+                if proxy.support_udp() && self.proxy_target.is_none() {
+                    return proxy_udp_exchange(self, proxy, *addr, wire, expected).await;
+                }
+            }
             match &self.transport {
                 Transport::Udp { .. } | Transport::Tcp { .. } => {
                     let response = self.proxy_tcp_exchange(proxy, wire).await?;
@@ -1871,6 +1878,84 @@ fn tls_connect_error<S>(err: meow_transport::tls::ConnectTypedError<S>) -> Clien
         other => ClientError::Tls(other.to_string()),
     }
 }
+
+/// The packet association belongs to this query future. Dropping an exchange
+/// on success, error, timeout or caller cancellation always signals close.
+struct DnsPacket(Box<dyn meow_common::ProxyPacketConn>);
+
+impl Drop for DnsPacket {
+    fn drop(&mut self) {
+        let _ = self.0.close();
+    }
+}
+
+async fn proxy_udp_exchange(
+    client: &DnsClient,
+    proxy: &DnsProxy,
+    addr: SocketAddr,
+    wire: &[u8],
+    expected: &ExpectedResponse,
+) -> Result<Message, ClientError> {
+    use meow_common::{ConnType, Metadata, Network};
+    let metadata = Metadata {
+        network: Network::Udp,
+        conn_type: ConnType::Inner,
+        host: smol_str::SmolStr::from(addr.ip().to_string()),
+        dst_ip: Some(addr.ip()),
+        dst_port: addr.port(),
+        internal: true,
+        ..Default::default()
+    };
+    let packet = DnsPacket(
+        meow_common::socket_protect::dns_via_proxy_dial_scope(proxy.dial_udp(&metadata))
+            .await
+            .map_err(|e| e.into_io_error("dns-via-proxy UDP dial"))?,
+    );
+    let written = packet
+        .0
+        .write_packet(wire, &addr)
+        .await
+        .map_err(|e| e.into_io_error("dns-via-proxy UDP send"))?;
+    if written != wire.len() {
+        return Err(ClientError::Protocol("short DNS datagram write"));
+    }
+    // The full DNS wire limit, bounded per query. A shorter receive buffer
+    // could silently truncate a datagram before its DNS TC flag is examined.
+    let mut buf = vec![0u8; 65535];
+    loop {
+        let (n, peer) = packet
+            .0
+            .read_packet(&mut buf)
+            .await
+            .map_err(|e| e.into_io_error("dns-via-proxy UDP receive"))?;
+        // Bound transports may report an unspecified source by contract.
+        // For per-packet transports verify both address and port, accepting
+        // equivalent IPv4-mapped IPv6 representations.
+        if !peer.ip().is_unspecified()
+            && (peer.ip().to_canonical() != addr.ip().to_canonical() || peer.port() != addr.port())
+        {
+            continue;
+        }
+        let Some(bytes) = buf.get(..n) else {
+            return Err(ClientError::Protocol("oversized DNS datagram read"));
+        };
+        let Ok(response) = decode_validated_response(bytes, expected) else {
+            continue;
+        };
+        if response.metadata.truncation {
+            // Release the UDP association before the explicit DNS TCP retry,
+            // through the same proxy and under the query's original deadline.
+            drop(packet);
+            let response = client.proxy_tcp_exchange(proxy, wire).await?;
+            return decode_validated_response(&response, expected);
+        }
+        return Ok(response);
+    }
+}
+
+#[cfg(test)]
+#[path = "proxy_udp_tests.rs"]
+mod proxy_udp_tests;
 
 fn ip_from_record(rec: &Record) -> Option<IpAddr> {
     match &rec.data {
