@@ -2160,9 +2160,11 @@ async fn read_lp<R: AsyncReadExt + Unpin>(r: &mut R) -> Result<Vec<u8>, ClientEr
 /// proxied paths, which differ only in how `stream` was dialed.
 ///
 /// Sends a minimal `POST path` with `application/dns-message` (no
-/// `Connection: close` — the session is poolable), then reads the
-/// response with full RFC 7230 §3.3 framing via [`read_http_response`]
-/// and returns the DNS body plus the pool-eligibility verdict.
+/// `Connection: close` — the session is poolable), restricted to
+/// `Accept-Encoding: identity` so a coded body cannot poison the DNS
+/// parse, then reads the response with full RFC 7230 §3.3 framing via
+/// [`read_http_response`] and returns the DNS body plus the
+/// pool-eligibility verdict.
 #[cfg(feature = "encrypted")]
 async fn doh_http_exchange<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send>(
     stream: &mut S,
@@ -2631,10 +2633,9 @@ mod tests {
         assert_eq!(find_subseq(b"", b"x"), None);
     }
 
-    /// A DoH response at exactly the cap is accepted; one byte over the cap
-    /// is rejected with a protocol error. Guards the low-risk review fix
-    /// that bounds the previously unbounded `read_to_end`.
-    #[cfg(feature = "encrypted")]
+    /// A close-delimited DoH body charges the bytes already buffered with
+    /// the headers against the cap, so an oversized response is rejected
+    /// without waiting for EOF.
     #[cfg(feature = "encrypted")]
     #[tokio::test]
     async fn doh_close_delimited_counts_buffered_bytes_before_eof() {
@@ -2656,6 +2657,9 @@ mod tests {
         ));
     }
 
+    /// `Accept-Encoding: identity` is sent, and a server that ignores it
+    /// with a coded body is rejected rather than fed garbage bytes.
+    #[cfg(feature = "encrypted")]
     #[tokio::test]
     async fn doh_requests_identity_from_a_compression_capable_server() {
         let (mut client, mut server) = tokio::io::duplex(4096);
@@ -2692,6 +2696,10 @@ mod tests {
         assert_eq!(body, b"ABCD");
     }
 
+    /// A DoH response at exactly the cap is accepted; one byte over the cap
+    /// is rejected with a protocol error. Guards the low-risk review fix
+    /// that bounds the previously unbounded `read_to_end`.
+    #[cfg(feature = "encrypted")]
     #[tokio::test]
     async fn doh_bounded_read_enforces_response_size_cap() {
         let at_cap = vec![0u8; MAX_DOH_RESPONSE_BYTES];
@@ -2747,11 +2755,9 @@ mod tests {
         read_http_response(&mut reader).await
     }
 
-    /// The DoH framing matrix (RFC 7230 §3.3): `Content-Length` and
-    /// chunked bodies are poolable; `Connection: close`, HTTP/1.0, a
-    /// non-chunked final coding and close-delimited bodies answer
-    /// correctly but must not be pooled.
-    #[cfg(feature = "encrypted")]
+    /// A `Content-Encoding` other than `identity` is rejected while the
+    /// headers are parsed — before the body is read or the connection is
+    /// considered for pooling.
     #[cfg(feature = "encrypted")]
     #[tokio::test]
     async fn doh_coded_response_is_rejected_before_body_and_pooling() {
@@ -2766,6 +2772,11 @@ mod tests {
         }
     }
 
+    /// The DoH framing matrix (RFC 7230 §3.3): `Content-Length` and
+    /// chunked bodies are poolable; `Connection: close`, HTTP/1.0, a
+    /// non-chunked final coding and close-delimited bodies answer
+    /// correctly but must not be pooled.
+    #[cfg(feature = "encrypted")]
     #[tokio::test]
     async fn doh_response_framing_matrix() {
         // Content-Length + keep-alive → reusable.
