@@ -3524,3 +3524,30 @@ async fn test_listener_transparent_tproxy() {
         .to_string();
     assert!(err.contains("firewall: false"), "{err}");
 }
+
+#[tokio::test]
+async fn classical_provider_preserves_regex_quantifiers() {
+    let config = load_config_from_str(
+        r#"
+strict: true
+rule-providers:
+  nodes:
+    type: inline
+    behavior: classical
+    payload:
+      - 'DOMAIN-REGEX,^api[0-9]{1,3}\.example$'
+rules:
+  - RULE-SET,nodes,REJECT
+  - MATCH,DIRECT
+"#,
+    )
+    .await
+    .unwrap();
+    let metadata = |host: &str| meow_common::Metadata {
+        host: host.into(),
+        ..Default::default()
+    };
+    let rule = &config.rules[0];
+    assert!(rule.match_metadata(&metadata("api123.example"), &meow_common::RuleMatchHelper));
+    assert!(!rule.match_metadata(&metadata("api1234.example"), &meow_common::RuleMatchHelper));
+}

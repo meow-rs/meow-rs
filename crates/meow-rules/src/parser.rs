@@ -82,7 +82,7 @@ impl ParserContext {
 /// the inner text per level, so an unbounded line overflows the stack and
 /// amplifies transient allocation (issue #533 review).
 const MAX_LOGIC_DEPTH: usize = 64;
-const MAX_RULE_LINE_LEN: usize = 64 * 1024;
+pub(crate) const MAX_RULE_LINE_LEN: usize = 64 * 1024;
 
 /// Named rule-providers a `RULE-SET,<name>` sub-rule can reference.
 pub type RuleSets = HashMap<String, Arc<dyn RuleSet>>;
@@ -179,9 +179,24 @@ fn parse_rule_depth(
         "DOMAIN" => Ok(Box::new(DomainRule::new(payload, adapter))),
         "DOMAIN-SUFFIX" => Ok(Box::new(DomainSuffixRule::new(payload, adapter))),
         "DOMAIN-KEYWORD" => Ok(Box::new(DomainKeywordRule::new(payload, adapter))),
-        "DOMAIN-REGEX" => DomainRegexRule::new(payload, adapter)
-            .map(|r| Box::new(r) as Box<dyn Rule>)
-            .map_err(|e| format!("invalid regex: {e}")),
+        "DOMAIN-REGEX" => {
+            // Upstream comma-protects regex payloads (`ParseRulePayload`
+            // with needTarget=true): the adapter is the *last* comma field
+            // and the expression is everything between the type and it —
+            // `DOMAIN-REGEX,a{1,3},Proxy` parses as `a{1,3}` → `Proxy`.
+            // The shared `splitn(4)` above would cut the expression at its
+            // first comma, so re-split `line` on the last comma instead.
+            let Some((_, rest)) = line.split_once(',') else {
+                return Err(format!("rule needs at least 3 parts: {line}"));
+            };
+            let (pattern, adapter) = rest
+                .rsplit_once(',')
+                .map(|(p, a)| (p.trim(), a.trim()))
+                .ok_or_else(|| format!("rule needs at least 3 parts: {line}"))?;
+            DomainRegexRule::new(pattern, adapter)
+                .map(|r| Box::new(r) as Box<dyn Rule>)
+                .map_err(|e| format!("invalid regex: {e}"))
+        }
         "IP-CIDR" | "IP-CIDR6" => {
             // Trailing `,src` (upstream `ParseParams`) makes the rule
             // source-axis, matching `SRC-IP-CIDR`.
@@ -424,17 +439,9 @@ fn parse_logic_rule(
         if fields.next().map_or("", str::trim).is_empty() {
             return Err(format!("{rule_type} rule: '{g}' has no payload"));
         }
-        // Upstream comma-protects regex payloads (target = last field,
-        // payload = everything before it); our grammar splits payload at
-        // the first comma, so an inner entry with a comma in its payload
-        // would silently truncate (`DOMAIN-REGEX,a,b` → regex "a").
-        // Reject loudly instead.
-        if first == "DOMAIN-REGEX" && fields.next().is_some() {
-            return Err(format!(
-                "{rule_type} rule: {first} payloads containing commas are \
-                 not supported inside logic groups"
-            ));
-        }
+        // A comma-containing DOMAIN-REGEX payload parses through the
+        // last-field adapter split below — upstream comma-protects it
+        // the same way (inner `payloadToRule` joins all fields).
         let patched = splice_inner_adapter(g.trim());
         inner_rules.push(parse_rule_depth(&patched, ctx, rule_sets, logic_depth + 1)?);
     }
@@ -513,9 +520,15 @@ pub(crate) const LOGIC_INNER_PLACEHOLDER: &str = "LOGIC-INNER-PLACEHOLDER";
 fn splice_inner_adapter(entry: &str) -> String {
     // Logic sub-rules carry their own parenthesised payload that must not be
     // split on commas — their "adapter" slot is appended at the end.
+    // DOMAIN-REGEX joins that class: its payload may contain commas and its
+    // adapter slot is the *last* field, so the placeholder must likewise go
+    // at the end (`DOMAIN-REGEX,a,b` → `DOMAIN-REGEX,a,b,<PH>` keeps `a,b`
+    // — inserting it mid-entry would splice into the expression).
     if let Some((ty, _)) = entry.split_once(',') {
-        let upper = ty.trim().to_ascii_uppercase();
-        if matches!(upper.as_str(), "AND" | "OR" | "NOT") {
+        let ty = meow_common::RuleType::from_mihomo_name(ty.trim())
+            .map_or(ty.trim(), |t| t.as_str())
+            .to_ascii_uppercase();
+        if matches!(ty.as_str(), "AND" | "OR" | "NOT" | "DOMAIN-REGEX") {
             return format!("{entry},{LOGIC_INNER_PLACEHOLDER}");
         }
     }
@@ -830,10 +843,16 @@ mod tests {
         assert!(parse_rule("OR,((MATCH,x),(DOMAIN,a.example)),Proxy", &ctx()).is_err());
         // And at arbitrary nesting depth.
         assert!(parse_rule("AND,((NOT,((MATCH,x))),(DOMAIN,a.example)),Proxy", &ctx()).is_err());
-        // A comma-containing DOMAIN-REGEX payload cannot be represented
-        // in our grammar — reject loudly rather than silently truncating
-        // to a different regex.
-        assert!(parse_rule("AND,((DOMAIN-REGEX,a,b),(DOMAIN,a.example)),Proxy", &ctx()).is_err());
+        // A comma-containing DOMAIN-REGEX leg keeps its whole payload —
+        // the spliced placeholder takes the (last-field) adapter slot so
+        // `(DOMAIN-REGEX,a,b)` is the regex `a,b`, not a truncation to `a`.
+        let rule = parse_rule(
+            "OR,((DOMAIN-REGEX,a,b),(DOMAIN-SUFFIX,ok.example)),Proxy",
+            &ctx(),
+        )
+        .unwrap();
+        assert!(rule.match_metadata(&make_metadata("a,b", 443), &noop_helper()));
+        assert!(!rule.match_metadata(&make_metadata("a", 443), &noop_helper()));
         // A comma-free DOMAIN-REGEX leg still parses.
         assert!(parse_rule("AND,((DOMAIN-REGEX,a+),(DOMAIN,a.example)),Proxy", &ctx()).is_ok());
         // An empty-payload leg would silently become match-all
@@ -846,16 +865,46 @@ mod tests {
     }
 
     /// The inner-leg guards compare the config grammar's names, so the
-    /// mihomo API spellings `GET /rules` reports must trip them too —
-    /// `(Match,X)` is still an always-true `FinalRule` leg, and
-    /// `(DomainRegex,a,b)` still carries a comma the grammar cannot
-    /// represent (issue #882 review).
+    /// mihomo API spellings `GET /rules` reports must hit them too —
+    /// `(Match,X)` is still an always-true `FinalRule` leg, while
+    /// `(DomainRegex,a,b)` must reach the same comma-protected regex path
+    /// as its `DOMAIN-REGEX` spelling (issue #882 review).
     #[test]
     fn test_parse_logic_rejects_inner_mihomo_spellings() {
         assert!(parse_rule("OR,((Match,x),(DOMAIN,a.example)),Proxy", &ctx()).is_err());
-        assert!(parse_rule("AND,((DomainRegex,a,b),(DOMAIN,a.example)),Proxy", &ctx()).is_err());
+        let rule = parse_rule(
+            "OR,((DomainRegex,a,b),(DOMAIN-SUFFIX,ok.example)),Proxy",
+            &ctx(),
+        )
+        .unwrap();
+        assert!(rule.match_metadata(&make_metadata("a,b", 443), &noop_helper()));
+        assert!(!rule.match_metadata(&make_metadata("a", 443), &noop_helper()));
         // A comma-free mihomo-spelled regex leg still parses.
         assert!(parse_rule("AND,((DomainRegex,a+),(DOMAIN,a.example)),Proxy", &ctx()).is_ok());
+    }
+
+    /// `DOMAIN-REGEX` is comma-protected at the top level too (upstream
+    /// `ParseRulePayload`, needTarget=true): the adapter is the last comma
+    /// field and the expression is everything between the type and it.
+    #[test]
+    fn test_parse_domain_regex_last_field_adapter() {
+        let rule = parse_rule(r"DOMAIN-REGEX,^api[0-9]{1,3}\.example$,DIRECT", &ctx()).unwrap();
+        assert!(rule.match_metadata(&make_metadata("api12.example", 443), &noop_helper()));
+        assert!(!rule.match_metadata(&make_metadata("api1234.example", 443), &noop_helper()));
+        assert_eq!(rule.adapter(), "DIRECT");
+        // `DOMAIN-REGEX,a,b` keeps the ordinary reading — payload `a`,
+        // adapter `b` — because the adapter column is mandatory here.
+        let rule = parse_rule("DOMAIN-REGEX,a,b", &ctx()).unwrap();
+        assert!(rule.match_metadata(&make_metadata("a", 443), &noop_helper()));
+        assert_eq!(rule.adapter(), "b");
+        // `DOMAIN-REGEX,a,b,c` is regex `a,b` routed to `c`, not `a` → `b`.
+        let rule = parse_rule("DOMAIN-REGEX,a,b,c", &ctx()).unwrap();
+        assert!(rule.match_metadata(&make_metadata("a,b", 443), &noop_helper()));
+        assert_eq!(rule.adapter(), "c");
+        // An empty payload stays a zero-width match-all — the
+        // `domain_payload_defect` machinery owns that warning (issue
+        // #869), same as `DOMAIN-KEYWORD,,X`.
+        assert!(parse_rule("DOMAIN-REGEX,,DIRECT", &ctx()).is_ok());
     }
 
     /// `IP-CIDR6,...,src` shares the IP-CIDR arm — IPv6 source axis.
