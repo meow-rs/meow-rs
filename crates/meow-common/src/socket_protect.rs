@@ -645,7 +645,9 @@ pub async fn connect_tcp_host(host: &str, port: u16) -> io::Result<TcpStream> {
 /// With a deadline, at most two attempts run at once and later addresses receive
 /// a share of the remaining time. Without a deadline, preserve the ordinary
 /// two-family fallback without introducing a new overall timeout. Callers must
-/// retain their socket protection/binding and configured per-connect timeout.
+/// retain their socket protection/binding and configured per-connect timeout —
+/// under a deadline that per-connect timeout is a ceiling the fairness window
+/// may tighten, so no candidate is guaranteed its full configured slice.
 pub async fn connect_tcp_candidates<T, F, Fut>(addrs: Vec<SocketAddr>, dial: F) -> io::Result<T>
 where
     F: Fn(SocketAddr) -> Fut + Sync,
@@ -684,6 +686,10 @@ where
             ordered.push_back(addr);
         }
     }
+    // All attempts belong to this one future. Once the queue is drained,
+    // slicing no longer needs to free a slot: survivors can use the rest of
+    // the caller budget. Atomic storage keeps the enclosing future Send.
+    let all_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut pending = FuturesUnordered::new();
     let mut next = Instant::now();
     let mut last_err = None;
@@ -698,15 +704,21 @@ where
             if let Some(addr) = ordered.pop_front() {
                 let attempt = dial(addr);
                 let attempt_deadline = (now + window).min(deadline);
+                all_started.store(ordered.is_empty(), std::sync::atomic::Ordering::Relaxed);
+                let all_started = Arc::clone(&all_started);
                 pending.push(async move {
-                    timeout_at(attempt_deadline, attempt)
-                        .await
-                        .unwrap_or_else(|_| {
-                            Err(io::Error::new(
-                                io::ErrorKind::TimedOut,
-                                "TCP candidate timed out",
-                            ))
-                        })
+                    tokio::pin!(attempt);
+                    match timeout_at(attempt_deadline, &mut attempt).await {
+                        Ok(result) => result,
+                        Err(_) if all_started.load(std::sync::atomic::Ordering::Relaxed) => {
+                            // Keep the original connect future; never restart a socket.
+                            attempt.await
+                        }
+                        Err(_) => Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "TCP candidate timed out",
+                        )),
+                    }
                 });
                 // Compress staggering for a nearly exhausted caller budget;
                 // reserve time for the remaining addresses rather than sleeping
@@ -1730,6 +1742,27 @@ mod candidate_progress_regression {
 mod same_family_progress {
     use super::*;
     use std::time::Duration;
+    #[tokio::test(start_paused = true)]
+    async fn surviving_candidate_reclaims_budget_after_others_fail() {
+        let addrs = (1..=3)
+            .map(|p| SocketAddr::from(([192, 0, 2, 1], p)))
+            .collect();
+        let start = tokio::time::Instant::now();
+        let result = crate::dial::with_dial_timeout("reclaim fixture", async {
+            Ok(connect_tcp_candidates(addrs, |addr| async move {
+                if addr.port() == 1 {
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    Ok(addr)
+                } else {
+                    Err(io::ErrorKind::ConnectionRefused.into())
+                }
+            })
+            .await?)
+        })
+        .await;
+        assert_eq!(result.unwrap().port(), 1);
+        assert_eq!(start.elapsed(), Duration::from_secs(3));
+    }
     #[tokio::test(start_paused = true)]
     async fn stalled_same_family_addresses_do_not_starve_later_candidates() {
         let addresses = (1..=3)
