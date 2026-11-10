@@ -121,15 +121,11 @@
 // #define MEM_LIBC_MALLOC 1
 // #define MEMP_MEM_MALLOC 1
 // meow-lwip feature `libc-malloc`: pools and heap from libc on demand.
+// MEM_LIBC_MALLOC compiles out mem.c's entire heap arm (ram_heap
+// included); MEMP_MEM_MALLOC drops the static pool arrays.
 #ifdef MEOW_LWIP_LIBC_MALLOC
 #define MEM_LIBC_MALLOC 1
 #define MEMP_MEM_MALLOC 1
-// mem.c declares ram_heap unconditionally, so MEM_LIBC_MALLOC alone
-// leaves the 2 MiB static block in .bss. Nothing dereferences it once
-// mem_malloc is libc — shrink the reservation to the two sentinel
-// structs and actually free the space the feature promises.
-#undef MEM_SIZE
-#define MEM_SIZE 0
 #endif
 
 #define SYS_LIGHTWEIGHT_PROT 0
