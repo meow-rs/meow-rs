@@ -180,6 +180,16 @@ pub trait ProxyAdapter: Send + Sync {
     fn dialer_hop(&self, _metadata: &Metadata) -> Option<Arc<dyn Proxy>> {
         None
     }
+    /// `true` for an outbound configured with a `dialer-proxy` chain,
+    /// regardless of the chain's current live state: a relay-based wrapper
+    /// answers `true` even when its front group's pick is REJECT/PASS and
+    /// [`Self::dialer_hop`] probes nothing. The DNS bootstrap validator
+    /// reads this so reselecting a group cannot waive a declared
+    /// dependency. `false` for a self-dialing outbound and for groups —
+    /// their members answer for themselves.
+    fn has_configured_dialer(&self) -> bool {
+        false
+    }
     /// The network an injected dialer's hop to the server takes for a
     /// flow over `flow`, which a group front may pick for differently (a
     /// load-balance front picks a UDP hop among its UDP-capable members).

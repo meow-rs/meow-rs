@@ -777,10 +777,7 @@ fn validate_node_policy_proxy_tags(
                 })?;
                 // A selected REJECT/PASS has no live carrier, but changing
                 // that selection cannot waive a configured bootstrap dependency.
-                let configured_chain = proxy
-                    .as_any()
-                    .and_then(|proxy| proxy.downcast_ref::<crate::proxy_parser::WrappedProxy>())
-                    .is_some_and(crate::proxy_parser::WrappedProxy::has_configured_dialer);
+                let configured_chain = proxy.has_configured_dialer();
                 let chained = configured_chain
                     || [meow_common::Network::Tcp, meow_common::Network::Udp]
                         .into_iter()
@@ -4315,6 +4312,38 @@ dns:
             .await
             .err()
             .expect("declared chain must be rejected even when its current pick sends nothing");
+        assert!(
+            error.to_string().contains("independent bootstrap"),
+            "{error}"
+        );
+    }
+
+    /// The relay-based `DialerProxyAdapter` fallback (hysteria2 cannot take
+    /// an injected dialer) is not a `WrappedProxy` — the validator must see
+    /// its declared chain through `has_configured_dialer`, or a front group
+    /// parked on REJECT would let the tag pass.
+    #[cfg(feature = "hysteria2")]
+    #[tokio::test]
+    async fn node_policy_rejects_dpa_chain_when_front_selects_reject() {
+        let raw: RawConfig = serde_saphyr::from_str(
+            r#"
+proxies:
+  - {name: Node, type: hysteria2, server: 192.0.2.1, port: 443, password: example, dialer-proxy: G}
+  - {name: Front, type: ss, server: front.invalid, port: 443, cipher: aes-128-gcm, password: example}
+proxy-groups:
+  - {name: G, type: select, proxies: [REJECT, Front]}
+dns:
+  enable: true
+  nameserver: [rcode://success]
+  proxy-server-nameserver: [rcode://success]
+  proxy-server-nameserver-policy:
+    node.test: tcp://192.0.2.53#Node
+"#,
+        )
+        .unwrap();
+        let error = crate::build_config(raw, None).await.err().expect(
+            "relay-wrapper chain must be rejected even when its current pick sends nothing",
+        );
         assert!(
             error.to_string().contains("independent bootstrap"),
             "{error}"

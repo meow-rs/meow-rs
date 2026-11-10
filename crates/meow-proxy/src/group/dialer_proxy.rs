@@ -156,6 +156,13 @@ impl ProxyAdapter for DialerProxyAdapter {
         crate::dialer::front_hop_carrier(&self.dialer.resolve()?, metadata)
     }
 
+    /// This wrapper exists only because a `dialer-proxy:` was configured —
+    /// the declared chain holds even while the front's pick sends nothing
+    /// and `dialer_hop` returns `None`.
+    fn has_configured_dialer(&self) -> bool {
+        true
+    }
+
     /// Forward the session flush (issue #695): `member_proxies` exposes the
     /// inner adapter's members, never the inner adapter itself, so the
     /// reachability walk would otherwise miss its pools. A wrapper chain is
