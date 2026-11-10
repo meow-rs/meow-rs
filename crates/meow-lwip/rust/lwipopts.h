@@ -30,6 +30,10 @@
 #ifndef LWIP_CUSTOM_LWIPOPTS_H
 #define LWIP_CUSTOM_LWIPOPTS_H
 
+// Reference copy: build.rs compiles lwIP with `-I old-src/custom`, so the
+// live options file is `old-src/custom/lwipopts.h`. Changes must be
+// mirrored there — edits to this file alone have no build effect.
+
 // enable tun2socks logic
 #define TUN2SOCKS 1
 
@@ -124,6 +128,12 @@
 #ifdef MEOW_LWIP_LIBC_MALLOC
 #define MEM_LIBC_MALLOC 1
 #define MEMP_MEM_MALLOC 1
+// mem.c declares ram_heap unconditionally, so MEM_LIBC_MALLOC alone
+// leaves the 2 MiB static block in .bss. Nothing dereferences it once
+// mem_malloc is libc — shrink the reservation to the two sentinel
+// structs and actually free the space the feature promises.
+#undef MEM_SIZE
+#define MEM_SIZE 0
 #endif
 
 #define SYS_LIGHTWEIGHT_PROT 0

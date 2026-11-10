@@ -15,6 +15,7 @@ listener-socks5 = []
 listener-tproxy = []
 listener-mixed = ["listener-http", "listener-socks5"]
 # lwIP from libc malloc instead of static pools (meow-lwip `libc-malloc`).
+# Weak dep — silently inert unless `listener-tun` also pulls lwip in.
 lwip-libc-malloc = ["lwip?/libc-malloc"]
 # TUN inbound (issue #326) — transparent proxy on platforms without a
 # tproxy/REDIRECT firewall (Windows). Off by default: pulls in the device,

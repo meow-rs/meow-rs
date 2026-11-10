@@ -47,6 +47,7 @@ fn sdk_include_path() -> Option<String> {
 
 fn compile_lwip() {
     println!("cargo:rerun-if-changed=old-src/core");
+    println!("cargo:rerun-if-changed=old-src/custom/lwipopts.h");
     let mut build = cc::Build::new();
     build
         .file("old-src/core/init.c")
