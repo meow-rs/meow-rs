@@ -26,7 +26,7 @@ subtle = { workspace = true }
 # bundle leaves out (ADR-0007 binary-size caps). The SQLite comes bundled
 # (below) everywhere but iOS/tvOS, which link the system libsqlite3 the OS
 # already ships rather than grow the size-capped Network Extension.
-rusqlite = { version = "0.40", default-features = false, features = [
+rusqlite = { version = "0.41", default-features = false, features = [
     "fallible_uint",
 ], optional = true }
 # Pinned exactly, as in meow-proxy: one embedded public-suffix list.
@@ -43,7 +43,7 @@ logbook = ["dep:rusqlite"]
 traffic-ledger = ["dep:rusqlite", "dep:psl"]
 
 [target.'cfg(not(any(target_os = "ios", target_os = "tvos")))'.dependencies]
-rusqlite = { version = "0.40", default-features = false, features = [
+rusqlite = { version = "0.41", default-features = false, features = [
     "bundled",
 ], optional = true }
 
