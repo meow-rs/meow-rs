@@ -185,6 +185,8 @@ the canonical, in-repo source a release is cut from.
   field as the target — matching upstream comma protection.
 - Hostname TCP dialing tries the alternate address family after 250 ms so a
   stalled IPv6 or IPv4 connect does not starve a reachable alternative.
+- Restore OpenHarmony builds of `meow-common` by matching the peer-aware
+  outbound-interface helper's re-export to its platform availability.
 
 - TUN UDP connection refresh now cancels pending QUIC sniffing, DNS resolution,
   route selection and outbound dialing, without waiting for establishment to

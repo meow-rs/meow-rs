@@ -777,7 +777,11 @@ async fn bind_udp_with_peer<A: ToSocketAddrs>(
     local: A,
     peer: Option<IpAddr>,
 ) -> io::Result<UdpSocket> {
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    // Only the interface-bound path below consults the peer.
+    #[cfg(not(all(
+        not(target_env = "ohos"),
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    )))]
     let _ = peer;
     #[cfg(any(target_os = "android", target_env = "ohos", all(test, unix)))]
     {
