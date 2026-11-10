@@ -553,6 +553,22 @@ ip6_reass(struct pbuf *p)
     /* All fragments have been received */
     struct ip6_hdr* iphdr_ptr;
 
+    /* pbuf lengths are 16-bit, including the IPv6 header and any
+     * unfragmentable extension headers. Check before pbuf_cat can wrap
+     * tot_len or restoring the IPv6 header can fail with an assertion.
+     * The helper may borrow bytes preceding the fragment header. */
+    u32_t header_len = (u32_t)((u8_t*)ipr->p->payload - (u8_t*)ipr->iphdr);
+#if IPV6_FRAG_COPYHEADER
+    if (IPV6_FRAG_REQROOM > 0) {
+      header_len += IPV6_FRAG_REQROOM;
+    }
+#endif
+    if ((u32_t)ipr->datagram_len + header_len > 0xffffU) {
+      IP6_FRAG_STATS_INC(ip6_frag.drop);
+      ip6_reass_free_complete_datagram(ipr);
+      return NULL;
+    }
+
     /* chain together the pbufs contained within the ip6_reassdata list. */
     iprh = (struct ip6_reass_helper*) ipr->p->payload;
     while (iprh != NULL) {

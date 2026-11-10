@@ -450,3 +450,49 @@ async fn large_fragmented_udp_reassembles() {
         .unwrap()
         .unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ipv6_reassembly_size_boundary_drops_and_recovers() {
+    let _serial = STACK_LOCK.lock().await;
+    let (mut stack, listener, udp) = NetStack::new().unwrap();
+    let mut done = stack.core_done();
+    let (tx, mut rx) = udp.split();
+    for extension in [false, true] {
+        let header = if extension { 48 } else { 40 };
+        let maximum = 65535 - header - 8;
+        // Reject oversized packets, then prove the queue/stack remains usable
+        // at the exact largest representable reassembled pbuf length.
+        for size in [maximum + 1, 65527, maximum, 60000] {
+            let payload = vec![42; size];
+            for frame in udp_test_fragments(true, 1272, &payload).into_iter().rev() {
+                let frame = if extension {
+                    let mut data = vec![44, 0, 0, 0, 0, 0, 0, 0]; // destination options
+                    data.extend_from_slice(&frame[40..]);
+                    v6_frame(60, &data)
+                } else {
+                    frame
+                };
+                stack.send(frame).await.unwrap();
+            }
+            if size <= maximum {
+                let (data, _, _) = timeout(STEP_TIMEOUT, rx.recv_from())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(data, payload);
+            } else {
+                assert!(
+                    timeout(std::time::Duration::from_millis(50), rx.recv_from())
+                        .await
+                        .is_err()
+                );
+            }
+        }
+    }
+    drop((listener, tx, rx));
+    stack.close().await.unwrap();
+    timeout(STEP_TIMEOUT, done.wait_for(|done| *done))
+        .await
+        .unwrap()
+        .unwrap();
+}
