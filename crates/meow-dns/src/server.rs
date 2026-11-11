@@ -1444,6 +1444,9 @@ pub async fn serve_tcp_stream<S: AsyncRead + AsyncWrite + Unpin>(
             // Distinguish orderly EOF between queries from truncated frames.
             let mut prefix = [0; 2];
             if stream.read(&mut prefix[..1]).await? == 0 {
+                // Queue FIN after the response; dropping lwIP without shutdown
+                // aborts unsent and unacknowledged data. This shares the deadline.
+                stream.shutdown().await?;
                 return Ok(false);
             }
             stream.read_exact(&mut prefix[1..]).await?;
@@ -2189,6 +2192,76 @@ mod tests {
         }
         client.shutdown().await.unwrap();
         task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn serve_tcp_clean_eof_shuts_down_after_response() {
+        // A queued writer like lwIP needs ordered shutdown; flush alone is not
+        // delivery. Record the ordering without requiring a privileged TUN.
+        struct Queued {
+            input: std::io::Cursor<Vec<u8>>,
+            written: Vec<u8>,
+            shut: bool,
+        }
+        impl AsyncRead for Queued {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::pin::Pin::new(&mut self.input).poll_read(cx, buf)
+            }
+        }
+        impl AsyncWrite for Queued {
+            fn poll_write(
+                mut self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                buf: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                assert!(!self.shut);
+                self.written.extend_from_slice(buf);
+                std::task::Poll::Ready(Ok(buf.len()))
+            }
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                mut self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                assert!(self.written.len() > 2);
+                self.shut = true;
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+        let mut query = sample_query(42, 1);
+        query[2] |= 0x08; // unsupported opcode is answered locally (NOTIMP)
+        let mut frame = (query.len() as u16).to_be_bytes().to_vec();
+        frame.extend(query);
+        let mut stream = Queued {
+            input: std::io::Cursor::new(frame),
+            written: Vec::new(),
+            shut: false,
+        };
+        serve_tcp_stream(
+            &mut stream,
+            new_resolver_slot(Arc::new(empty_resolver())),
+            Arc::new(tokio::sync::Semaphore::new(1)),
+        )
+        .await
+        .unwrap();
+        assert!(
+            stream.shut,
+            "clean EOF must shut down queued output before drop"
+        );
+        assert_eq!(
+            usize::from(u16::from_be_bytes([stream.written[0], stream.written[1]])),
+            stream.written.len() - 2
+        );
+        assert_eq!(&stream.written[2..4], &42u16.to_be_bytes());
     }
 
     #[tokio::test]

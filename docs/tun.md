@@ -118,6 +118,12 @@ Flow handling is the same in both scopes:
   concurrent in-process answers (queries it cannot decide locally past
   that bound are dropped; clients retry). Live occupancy is observable via
   `Tunnel::tun_udp_flow_count`.
+- TCP queries to port 53 are also answered by `dns-hijack` when enabled,
+  on both TCP backends, including queries addressed to the TUN interface.
+  Streams reuse the bounded TCP DNS service: one query at a time, a 30-second
+  exchange deadline, and a shared 64-query upstream budget separate from UDP.
+  Locally answerable queries bypass that upstream budget. `dns-hijack: []`
+  leaves TCP DNS on the ordinary routing path.
 - A destination **inside** the fake-ip range with **no live allocation** —
   stale across a restart, evicted by pool wrap, or a literal connect into
   the range — is dropped rather than dialed: dialing it would route
@@ -332,6 +338,7 @@ ip route get 1.1.1.1                  # dev meow-tun table 1835364215
 curl 1.1.1.1                          # IP literal — captured (check meow logs)
 curl https://example.com              # domain flow — still captured
 dig @9.9.9.9 example.com              # UDP: answered by dns-hijack with a fake IP
+dig +tcp @9.9.9.9 example.com         # TCP fallback: same in-process resolver
 # no loop: meow's own dials leave by the physical interface, never the tun
 sudo tcpdump -ni eth0 'tcp[tcpflags] & tcp-syn != 0'       # the outbound SYNs
 sudo tcpdump -ni meow-tun src host <eth0 address>          # stays empty
@@ -493,10 +500,10 @@ Get-NetRoute -DestinationPrefix 0.0.0.0/1, 128.0.0.0/1   # after stopping meow: 
 | `inet6-address` | none | IPv6 CIDR assigned to the device, e.g. `fdfe:dcba:9876::1/126` — a string, or mihomo's list form (only the first entry is used). Only honoured in global scope, where it also captures IPv6 (experimental, see above); ignored with a warning otherwise. An invalid CIDR is a hard error. |
 | `auto-route` | `true` | What to route into the device at startup (removed on shutdown): `true` = everything the host sends, IPv6 too with `inet6-address` (global scope; Linux, macOS and Windows, fake-ip scope elsewhere); `global` = the same; `fake-ip` = the fake-ip range only; `false` = nothing. See *Route scopes*. |
 | `outbound-interface` | auto-detect | Physical interface outbound sockets bind to in global scope — the interface name on Linux/macOS (`eth0`, `en0`), the interface alias on Windows (`Ethernet`). Ignored otherwise. |
-| `dns-hijack` | on | In-process answering of UDP :53 flows entering the device, and in fake-ip mode the OS resolver redirect. Absent = on; a list with any `:53` entry = on; `[]` = off. Non-`:53` entries warn and are ignored. |
+| `dns-hijack` | on | In-process answering of UDP and TCP :53 flows entering the device, and in fake-ip mode the OS resolver redirect. Absent = on; a list with any `:53` entry = on; `[]` = off. Non-`:53` entries warn and are ignored. |
 | `stack` | `lwip` | `system` (or `mixed`): TCP is terminated by the host kernel — the pump rewrites each TCP packet's addresses to a kernel listener on the device address and back (a NAT inside the device subnet, so `inet4-address` needs a /31 or wider) — like mihomo's system stack; several times the throughput per CPU, and DIRECT flows splice in the kernel. UDP is parsed and built in the pump for both values — mihomo's `system` also uses the kernel for UDP and its `mixed` uses gVisor, so `mixed` maps to `system` here with a warning; IP fragments and IPv6 extension headers go to lwIP, which reassembles UDP, while fragmented TCP is dropped. Without TSO on TUN the device opens without offload. Linux only (Windows and macOS keep lwIP); `gvisor` and `mips` (mihomo's own stack) fall back to `lwip` with a warning. |
 | `udp-timeout` | `60` | Seconds of idle before a UDP flow is evicted. |
-| `max-connections` | `256` | Inherited from the top-level `max-connections` (`0` = unlimited); bounds **TCP** flows — on lwIP a flow takes its slot when it leaves the 200 ms sniff window, so one that closes inside it never occupies one; under `stack: system` the slot is taken when the kernel accepts the connection, just before the window — a change while TUN runs restarts the listener. The UDP flow table has its own fixed bound (1024 live flows, least-recently-active eviction) that `max-connections` does not adjust. |
+| `max-connections` | `256` | Inherited from the top-level `max-connections` (`0` = unlimited); bounds **TCP** flows — on lwIP the slot is taken at accept, before the flow's 200 ms sniff window, so one that closes inside the window still occupies its slot briefly; under `stack: system` the slot is taken when the kernel accepts the connection, just before the window — a change while TUN runs restarts the listener. The UDP flow table has its own fixed bound (1024 live flows, least-recently-active eviction) that `max-connections` does not adjust. |
 
 mihomo fields meow does not implement (`strict-route`,
 `auto-detect-interface`, `mtu-v6`, `endpoint-independent-nat`,
