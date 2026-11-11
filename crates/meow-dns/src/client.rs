@@ -1931,7 +1931,7 @@ async fn proxy_udp_exchange(
         // Bound transports may report an unspecified source by contract.
         // For per-packet transports verify both address and port, accepting
         // equivalent IPv4-mapped IPv6 representations.
-        if !peer.ip().is_unspecified()
+        if !peer.ip().to_canonical().is_unspecified()
             && (peer.ip().to_canonical() != addr.ip().to_canonical() || peer.port() != addr.port())
         {
             continue;

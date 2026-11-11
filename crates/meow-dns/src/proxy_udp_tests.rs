@@ -16,6 +16,7 @@ enum Mode {
     Valid,
     Unspecified,
     Mapped,
+    MappedUnspecified,
     Truncated,
     Short,
     Error,
@@ -73,6 +74,7 @@ impl ProxyPacketConn for Packet {
         replies.push_back((bad.to_bytes().unwrap(), *addr));
         let peer = match self.0.mode {
             Mode::Unspecified => "0.0.0.0:0".parse().unwrap(),
+            Mode::MappedUnspecified => "[::ffff:0.0.0.0]:0".parse().unwrap(),
             Mode::Mapped => "[::ffff:192.0.2.1]:53".parse().unwrap(),
             _ => *addr,
         };
@@ -198,7 +200,12 @@ fn fixture(mode: Mode, udp: bool, tcp: bool) -> (DnsClient, Arc<State>) {
 
 #[tokio::test]
 async fn udp_proxy_validates_source_and_question_and_closes() {
-    for mode in [Mode::Valid, Mode::Unspecified, Mode::Mapped] {
+    for mode in [
+        Mode::Valid,
+        Mode::Unspecified,
+        Mode::Mapped,
+        Mode::MappedUnspecified,
+    ] {
         let (client, state) = fixture(mode, true, false);
         client.query("fixture.test", RecordType::A).await.unwrap();
         assert_eq!(state.read.load(Ordering::SeqCst), 6);
