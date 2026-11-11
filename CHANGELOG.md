@@ -196,6 +196,12 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **`ech-opts` on a VLESS REALITY node.** A node with both was refused with
+  `reality-opts cannot be combined with ech-opts` once the ECH config was
+  known, whether inline or fetched from DNS. `ech-opts` is now ignored with a
+  warning and no DNS lookup is made, as in mihomo, which takes the REALITY
+  path before it looks at ECH. A malformed `ech-opts.config` is still
+  refused.
 - `DOMAIN-REGEX` payloads preserve commas, including repetition bounds such
   as `{1,3}`: classical rule providers take the whole tail after the first
   comma, while `rules:` entries and logic sub-rules take the last comma

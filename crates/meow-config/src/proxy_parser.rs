@@ -2194,6 +2194,8 @@ fn parse_vless(
             }
         }
 
+        drop_ech_under_reality(name, &mut tls_cfg);
+
         let tls_layer =
             TlsLayer::new(&tls_cfg).map_err(|e| format!("vless: TLS layer error: {e}"))?;
         chain.push(Box::new(tls_layer));
@@ -2870,6 +2872,17 @@ fn default_transport_alpn(network: &str, alpn: Vec<String>) -> Vec<String> {
         "ws" => vec!["http/1.1".to_string()],
         "grpc" | "h2" | "xhttp" => vec!["h2".to_string()],
         _ => alpn,
+    }
+}
+
+/// Drop `ech-opts` from a REALITY connection. mihomo's `StreamTLSConn` takes
+/// the REALITY path before it looks at ECH, so subscriptions carrying both
+/// work there; the REALITY record layer refuses the pair. Nothing is exposed
+/// by dropping it: the REALITY SNI is a public cover name by design.
+#[cfg(feature = "vless")]
+fn drop_ech_under_reality(name: &str, tls: &mut meow_transport::tls::TlsConfig) {
+    if tls.reality.is_some() && tls.ech.take().is_some() {
+        tracing::warn!(proxy = %name, "ech-opts is ignored because reality-opts is set");
     }
 }
 

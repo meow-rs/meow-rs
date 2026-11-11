@@ -222,6 +222,10 @@ pub async fn preresolve_ech(
         return Ok(());
     }
     for proxy in proxies {
+        // REALITY never uses ECH, so its lookup would be wasted.
+        if proxy.contains_key("reality-opts") {
+            continue;
+        }
         let proxy_name = proxy
             .get("name")
             .and_then(|v| v.as_str())
@@ -290,8 +294,12 @@ pub async fn preresolve_ech(
 /// up in DNS, and the shape [`check_ech_defects`] defects on when nothing
 /// names a query target. `has_query_source` is `true` when
 /// `query-server-name:` or `server:` supplies one. `None` for every other
-/// map (`ech-opts:` absent, not a mapping, disabled, or already inline).
+/// map (`ech-opts:` absent, not a mapping, disabled, already inline, or
+/// ignored because the proxy uses `reality-opts`).
 fn ech_dns_status(proxy: &HashMap<String, Value>) -> Option<bool> {
+    if proxy.contains_key("reality-opts") {
+        return None;
+    }
     let ech_map = proxy.get("ech-opts")?.as_object()?;
     let enabled = ech_map
         .get("enable")
@@ -354,6 +362,26 @@ pub fn check_ech_defects(proxies: &[HashMap<String, Value>], strict: bool) -> Re
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn preresolve_skips_reality_proxies() {
+        let _serial = crate::test_support::ech_dns_serial().lock().await;
+        ECH_LOOKUPS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let proxy: HashMap<String, Value> = serde_json::from_value(serde_json::json!({
+            "name": "r",
+            "server": "example.com",
+            "reality-opts": {"public-key": "k"},
+            "ech-opts": {"enable": true, "query-server-name": "example.com"},
+        }))
+        .unwrap();
+        let mut proxies = vec![proxy.clone()];
+
+        assert!(!needs_ech_dns(&proxies));
+        preresolve_ech(&mut proxies, true).await.unwrap();
+
+        assert_eq!(ECH_LOOKUPS.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(proxies, vec![proxy]);
+    }
 
     #[test]
     fn parses_ipv4_nameserver() {
