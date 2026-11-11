@@ -1055,48 +1055,56 @@ impl TunListener {
                         listener, conn_limit.clone(), &warned_saturated, &self.name,
                     ));
                     match accepted {
-                    Some(((stream, src, dst), permit)) => {
-                        // Same loop guard as the UDP path: a dial to the
-                        // TUN's own subnet routes back into the device.
-                        if udp::is_looping_dst(dst.ip(), tun_net) {
-                            debug!("tun TCP: dropping non-routable dst {dst} (from {src})");
-                            drop(stream);
-                            continue;
-                        }
-                        let tunnel = self.tunnel.clone();
-                        let name = self.name.clone();
-                        let sniffer = self.sniffer.clone();
-                        tasks.spawn(async move {
-                            let _permit = permit;
-                            // lwIP only delivers this stream after the
-                            // handshake. Sniff the client's first bytes for
-                            // up to TUN_SNIFF_WINDOW; a close/reset inside
-                            // the window drops the flow, silence dials it
-                            // with an empty prefix (server-first, #695).
-                            let mut stream = stream;
-                            let prefix = match sniff_first_payload(&mut stream).await {
-                                Ok(p) => {
-                                    if p.is_empty() {
-                                        debug!(
-                                            "tun TCP: {src} -> {dst} silent for {}ms, \
-                                             dialing without prefix",
-                                            TUN_SNIFF_WINDOW.as_millis()
-                                        );
+                        Some(((stream, src, dst), permit)) => {
+                            // Same loop guard as the UDP path: a dial to the
+                            // TUN's own subnet routes back into the device.
+                            if udp::is_looping_dst(dst.ip(), tun_net) {
+                                debug!("tun TCP: dropping non-routable dst {dst} (from {src})");
+                                drop(stream);
+                                continue;
+                            }
+                            let tunnel = self.tunnel.clone();
+                            let name = self.name.clone();
+                            let sniffer = self.sniffer.clone();
+                            tasks.spawn(async move {
+                                let _permit = permit;
+                                // lwIP only delivers this stream after the
+                                // handshake. Sniff the client's first bytes for
+                                // up to TUN_SNIFF_WINDOW; a close/reset inside
+                                // the window drops the flow, silence dials it
+                                // with an empty prefix (server-first, #695).
+                                let mut stream = stream;
+                                let prefix = match sniff_first_payload(&mut stream).await {
+                                    Ok(p) => {
+                                        if p.is_empty() {
+                                            debug!(
+                                                "tun TCP: {src} -> {dst} silent for {}ms, \
+                                                 dialing without prefix",
+                                                TUN_SNIFF_WINDOW.as_millis()
+                                            );
+                                        }
+                                        p
                                     }
-                                    p
-                                }
-                                Err(e) => {
-                                    debug!(
-                                        "tun TCP: dropping {src} -> {dst} before payload: {e}"
-                                    );
-                                    return;
-                                }
-                            };
-                            handle_tcp_flow(tunnel, stream, prefix, src, dst, &name, sniffer.as_deref())
+                                    Err(e) => {
+                                        debug!(
+                                            "tun TCP: dropping {src} -> {dst} before payload: {e}"
+                                        );
+                                        return;
+                                    }
+                                };
+                                handle_tcp_flow(
+                                    tunnel,
+                                    stream,
+                                    prefix,
+                                    src,
+                                    dst,
+                                    &name,
+                                    sniffer.as_deref(),
+                                )
                                 .await;
-                        });
-                    }
-                    None => break Err("netstack TCP listener or connection quota closed".into()),
+                            });
+                        }
+                        None => break Err("netstack TCP listener or connection quota closed".into()),
                     }
                 },
                 accepted = accept_fut.as_mut() => match accepted {
