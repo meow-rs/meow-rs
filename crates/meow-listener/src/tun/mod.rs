@@ -1104,12 +1104,15 @@ impl TunListener {
                                         pos: 0,
                                         inner: std::sync::Mutex::new(stream),
                                     };
-                                    let _ = meow_dns::server::serve_tcp_stream(
+                                    if let Err(e) = meow_dns::server::serve_tcp_stream(
                                         stream,
                                         tunnel.resolver_slot(),
                                         dns_budget,
                                     )
-                                    .await;
+                                    .await
+                                    {
+                                        debug!("tun TCP DNS: {src} -> {dst}: {e}");
+                                    }
                                 } else {
                                     handle_tcp_flow(
                                         tunnel,
@@ -1175,9 +1178,15 @@ impl TunListener {
                             }
                             let _permit = permit;
                             if dns_hijack && dst.port() == 53 {
-                                let _ = meow_dns::server::serve_tcp_stream(
-                                    stream, tunnel.resolver_slot(), dns_budget,
-                                ).await;
+                                if let Err(e) = meow_dns::server::serve_tcp_stream(
+                                    stream,
+                                    tunnel.resolver_slot(),
+                                    dns_budget,
+                                )
+                                .await
+                                {
+                                    debug!("tun TCP DNS: {src} -> {dst}: {e}");
+                                }
                                 return;
                             }
                             let mut metadata = Metadata {
