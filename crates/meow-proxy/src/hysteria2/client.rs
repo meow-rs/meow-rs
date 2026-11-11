@@ -110,20 +110,36 @@ impl ReconnectableClient {
     }
 
     async fn handle(&self) -> Result<Arc<ConnHandle>> {
-        let mut guard = self.conn.lock().await;
-        if let Some((handle, generation)) = guard.as_ref() {
-            if *generation == self.generation() && handle.is_active() {
-                return Ok(Arc::clone(handle));
-            }
-        }
-        // Stale or dead: release its driver (and socket) before dialling.
-        guard.take();
-        // A reset landing mid-connect (issue #695) invalidates the new
-        // connection — its socket may predate the new outbound binding — so
-        // it is dropped and redialled once rather than cached.
         for _ in 0..2 {
-            let generation = self.generation();
-            let handle = Arc::new(connect_new(Arc::clone(&self.cfg)).await?);
+            let generation;
+            {
+                let mut guard = self.conn.lock().await;
+                generation = self.generation();
+                if let Some((handle, cached_generation)) = guard.as_ref() {
+                    if *cached_generation == generation && handle.is_active() {
+                        return Ok(Arc::clone(handle));
+                    }
+                }
+                // Release a stale driver before resolving or opening a socket.
+                guard.take();
+            }
+            // Endpoint DNS may itself dial this pool. Do not hold its connect
+            // lock until resolution has completed: the nested lookup needs to
+            // reach the existing host-resolver reentry fence first.
+            let (server, addrs) = resolve_server(&self.cfg).await?;
+            let mut guard = self.conn.lock().await;
+            if self.generation() != generation {
+                continue;
+            }
+            // A nested DNS dial or concurrent caller may have populated the
+            // cache while resolution was pending. Never replace that driver.
+            if let Some((handle, cached_generation)) = guard.as_ref() {
+                if *cached_generation == generation && handle.is_active() {
+                    return Ok(Arc::clone(handle));
+                }
+            }
+            guard.take();
+            let handle = Arc::new(connect_new(Arc::clone(&self.cfg), server, addrs).await?);
             if self.generation() != generation {
                 continue;
             }
@@ -137,7 +153,7 @@ impl ReconnectableClient {
     }
 }
 
-async fn connect_new(cfg: Arc<Config>) -> Result<ConnHandle> {
+async fn resolve_server(cfg: &Config) -> Result<(ServerTarget, Vec<SocketAddr>)> {
     let server = ServerTarget::parse(&cfg.server_addr)?;
     let addrs = meow_common::resolve_host_all(&server.host, server.port)
         .await
@@ -152,6 +168,14 @@ async fn connect_new(cfg: Arc<Config>) -> Result<ConnHandle> {
                 Error::Resolve(format!("{}:{}: {e}", server.host, server.port))
             }
         })?;
+    Ok((server, addrs))
+}
+
+async fn connect_new(
+    cfg: Arc<Config>,
+    server: ServerTarget,
+    addrs: Vec<SocketAddr>,
+) -> Result<ConnHandle> {
     let server_name = if cfg.server_name.trim().is_empty() {
         server.host.clone()
     } else {
