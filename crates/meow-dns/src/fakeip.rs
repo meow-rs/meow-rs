@@ -1088,6 +1088,21 @@ mod tests {
                 );
             }
         }
+
+        // The guard's exclusion side: empty and dots-only names never match,
+        // and a bare `*` entry keeps its distinct (literal-label) meaning.
+        let skipper = Skipper::new(&["+.*".to_string()], SkipperMode::BlackList);
+        for host in ["", ".", "..."] {
+            assert!(
+                !skipper.should_skip(host),
+                "all-dot or empty host must not match: {host:?}"
+            );
+        }
+        let bare = Skipper::new(&["*".to_string()], SkipperMode::BlackList);
+        assert!(
+            !bare.should_skip("example.com"),
+            "bare * must stay distinct from the +.* all-domain form"
+        );
     }
 
     /// Table-driven merge of the former `skipper_blacklist_skips_matched`,
