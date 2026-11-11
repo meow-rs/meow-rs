@@ -1897,6 +1897,9 @@ async fn proxy_udp_exchange(
     expected: &ExpectedResponse,
 ) -> Result<Message, ClientError> {
     use meow_common::{ConnType, Metadata, Network};
+    // Same canonicalization as proxy_dial: an adapter dialing dst_ip
+    // verbatim (DirectAdapter) fails on v4-mapped IPv6 nameservers.
+    let addr = meow_common::canonical_socket_addr(addr);
     let metadata = Metadata {
         network: Network::Udp,
         conn_type: ConnType::Inner,

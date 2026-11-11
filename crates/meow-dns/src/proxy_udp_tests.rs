@@ -223,6 +223,33 @@ async fn udp_proxy_validates_source_and_question_and_closes() {
 }
 
 #[tokio::test]
+async fn udp_proxy_mapped_nameserver_dials_canonical_ip() {
+    // A v4-mapped IPv6 nameserver must reach the adapter as plain IPv4 —
+    // DirectAdapter-style dials fail on the mapped form.
+    let state = Arc::new(State {
+        mode: Mode::Valid,
+        udp: true,
+        closed: 0.into(),
+        tcp: 0.into(),
+        sent: 0.into(),
+        read: 0.into(),
+        started: Notify::new(),
+        seen: Mutex::new(vec![]),
+        replies: Mutex::new(VecDeque::new()),
+    });
+    let client =
+        DnsClient::udp("[::ffff:192.0.2.1]:53".parse().unwrap()).with_proxy(Arc::new(TestProxy {
+            state: Arc::clone(&state),
+            health: ProxyHealth::new(),
+        }));
+    client.query("fixture.test", RecordType::A).await.unwrap();
+    let seen = state.seen.lock().unwrap();
+    assert_eq!(seen[0].host, "192.0.2.1");
+    assert_eq!(seen[0].dst_ip, Some("192.0.2.1".parse().unwrap()));
+    assert_eq!(seen[0].dst_port, 53);
+}
+
+#[tokio::test]
 async fn udp_proxy_send_or_read_failure_never_retries_tcp() {
     for mode in [Mode::Short, Mode::Error, Mode::ReadError] {
         let (client, state) = fixture(mode, true, false);
