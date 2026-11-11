@@ -15,6 +15,8 @@ the canonical, in-repo source a release is cut from.
 
 - `dns.fake-ip-range6` installs an additional IPv6 fake-IP pool alongside the
   existing IPv4 pool. Each family preserves its mappings on unchanged reloads.
+  Linux global TUN routing also captures forwarded traffic to that IPv6 pool
+  when `inet6-address` is set, and reloads update both families' routes.
 
 - **hysteria2:** mihomo's `initial-stream-receive-window`, `max-stream-receive-window`,
   `initial-connection-receive-window` and `max-connection-receive-window` are honoured

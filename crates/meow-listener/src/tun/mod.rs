@@ -671,7 +671,7 @@ impl TunListener {
             v6: cfg.inet6_address,
             nat: None,
         };
-        let fake_ip_net = self.tunnel.resolver().fake_ip_v4_net();
+        let fake_ip_nets = fake_ip_route_nets(&self.tunnel.resolver(), cfg.inet6_address.is_some());
 
         // Global scope on Linux: the device's default routes go in a table
         // of their own, which policy rules send only the flows this host
@@ -715,8 +715,8 @@ impl TunListener {
             (false, _) => Vec::new(),
             // The policy rules leave traffic the host forwards
             // (containers, VMs, a gateway's LAN clients) to the main table,
-            // where the fake-IP range still catches its domain flows.
-            (true, TunRouteScope::Global) if policy_routed => fake_ip_net.into_iter().collect(),
+            // where both configured fake-IP ranges catch its domain flows.
+            (true, TunRouteScope::Global) if policy_routed => fake_ip_nets,
             // Split defaults: two /1s (macOS: eight routes that avoid the
             // all-zero key) cover all IPv4 while staying more specific
             // than the physical 0/0 default, so the original route
@@ -725,7 +725,7 @@ impl TunListener {
             // the /1s already.
             (true, TunRouteScope::Global) => global_route_nets(cfg.inet6_address.is_some()),
             (true, TunRouteScope::FakeIp) => {
-                if fake_ip_net.is_none() {
+                if fake_ip_nets.is_empty() {
                     warn!(
                         "tun '{}': 'auto-route: fake-ip' only routes the fake-IP range, but \
                          DNS is not in fake-ip mode — no routes installed. Use \
@@ -733,7 +733,7 @@ impl TunListener {
                         self.name
                     );
                 }
-                fake_ip_net.into_iter().collect()
+                fake_ip_nets
             }
         };
 
@@ -1361,6 +1361,18 @@ async fn flow_slot(
     Ok(Some(permit))
 }
 
+/// Main-table fake-IP routes also capture forwarded LAN/container traffic,
+/// which Linux's host-originated policy rules deliberately leave untouched.
+fn fake_ip_route_nets(resolver: &meow_dns::Resolver, ipv6: bool) -> Vec<ipnet::IpNet> {
+    [
+        resolver.fake_ip_v4_net(),
+        ipv6.then(|| resolver.fake_ip_v6_net()).flatten(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
 /// The split default routes of global route scope (#375): more specific
 /// than the physical default so it is never touched. IPv6 is included only
 /// when the device carries an IPv6 address — routes into a device that
@@ -1698,6 +1710,36 @@ mod tests {
     use std::task::{Context, Poll};
     use std::time::Duration;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
+
+    #[test]
+    fn forwarded_fake_ip_routes_include_the_configured_ipv6_pool() {
+        let mut resolver = meow_dns::Resolver::new(
+            vec![],
+            vec![],
+            meow_common::DnsMode::FakeIp,
+            meow_trie::DomainTrie::new(),
+            false,
+            true,
+        );
+        let v4 = "198.18.0.0/16".parse().unwrap();
+        let v6 = "fdfe:dcba:9876::/64".parse().unwrap();
+        for (range, ipv6) in [(v4, false), (v6, true)] {
+            let pool = Arc::new(
+                meow_dns::Pool::new(range, Arc::new(meow_dns::MemoryStore::new(16))).unwrap(),
+            );
+            if ipv6 {
+                resolver.set_fakeip_v6(pool);
+            } else {
+                resolver.set_fakeip_v4(pool);
+            }
+        }
+        assert_eq!(super::fake_ip_route_nets(&resolver, true), vec![v4, v6]);
+        assert_eq!(
+            super::fake_ip_route_nets(&resolver, false),
+            vec![v4],
+            "an IPv4-only device must not claim IPv6 routes"
+        );
+    }
 
     #[tokio::test]
     async fn lwip_admission_cancel_closes_waiting_stream() {

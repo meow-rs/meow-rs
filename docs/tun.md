@@ -205,8 +205,10 @@ How each loop-avoidance piece works:
      sends the rest to the device.
    - `iif lo` limits all of this to the host's own traffic: forwarded
      traffic (containers, VMs, a gateway's LAN clients) keeps the main
-     table, where meow routes the fake-ip range into the device, so their
-     domain flows are still captured.
+     table, where meow routes the configured fake-IP ranges into the device,
+     so their domain flows are still captured. With `inet6-address`, this
+     includes `dns.fake-ip-range6`; without an IPv6 device address no IPv6
+     route is installed. Changing either pool on reload rebuilds these routes.
 
    The rules need a kernel with policy routing (`CONFIG_IP_MULTIPLE_TABLES`)
    and the `dport` selector (Linux 4.17); without them meow warns and falls
