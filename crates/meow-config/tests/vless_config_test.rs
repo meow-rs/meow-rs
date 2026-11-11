@@ -355,6 +355,43 @@ proxies:
 }
 
 #[tokio::test]
+async fn parse_vless_reality_ignores_ech_opts() {
+    let node = |ech_config: &str| {
+        format!(
+            r#"
+proxies:
+  - name: v
+    type: vless
+    server: example.com
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    tls: true
+    client-fingerprint: chrome
+    reality-opts:
+      public-key: hSDwCYkwp1R0i33ctD73Wg2_Og0mOBr066SpjqqbTmo
+    ech-opts:
+      enable: true
+      config: "{ech_config}"
+"#
+        )
+    };
+    let config = load_config_from_str(&node("AAECAw=="))
+        .await
+        .expect("config must load");
+    assert!(
+        config.proxies.contains_key("v"),
+        "ech-opts on a REALITY node is ignored, as in mihomo"
+    );
+    let config = load_config_from_str(&node("not-base64!"))
+        .await
+        .expect("config load must succeed (warn-and-skip)");
+    assert!(
+        !config.proxies.contains_key("v"),
+        "a malformed ech-opts.config is still refused, as in mihomo"
+    );
+}
+
+#[tokio::test]
 async fn parse_vless_reality_opts_invalid_public_key_skipped() {
     let yaml = r#"
 proxies:
