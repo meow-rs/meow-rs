@@ -385,6 +385,27 @@ buffer-reuse; M3 can flatten further if profiling demands.
    opens an amendment PR *before* engineer-a starts the optimisation
    work, so the "what we're fixing" is in ADR form.
 
+**Landed adjustment (PR #912):** step 1 shipped with different posture
+than written — recording the as-built contract so the ADR stays honest:
+
+- `alloc-mimalloc` exists as the named feature, but the allocator is
+  **always on for musl targets** (non-optional dep) and **opt-in via the
+  feature on other Linux/Android** — not the default-on, single-gate
+  shape described above. Rationale: the motivating defect (freed-page
+  churn-ratchet, observed 305 MB RSS over 20 h on a musl gateway) is
+  musl's allocator, so musl builds carry the fix unconditionally; glibc
+  already returns freed memory, so the swap stays a deployment choice
+  there. The default-on question for the M2 measurement substrate
+  remains open pending M2 benchmarks.
+- `features = ["v2"]`, not `["override"]`: libmimalloc-sys 0.1.49+
+  vendors mimalloc v3.3.x, which carries a multi-threaded
+  heap-corruption SIGSEGV (microsoft/mimalloc#1287). `override` is also
+  deliberately off — on musl static links it collides with musl's own
+  `malloc` symbol (microsoft/mimalloc#243), so C deps (BoringSSL) keep
+  the platform allocator and only the Rust heap moves.
+- `dhat-heap` still wins when both features are enabled (profiling must
+  measure the system allocator).
+
 No user-visible change from this ADR alone.
 
 ## Open questions deferred
