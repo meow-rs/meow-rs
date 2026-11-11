@@ -32,6 +32,12 @@ the canonical, in-repo source a release is cut from.
   must bootstrap independently; see `docs/specs/proxy-server-dns-policy.md`.
 - `dns.listen` now binds TCP and UDP at the same address. TCP connections use
   bounded admission, framed queries, per-query resolver reload and owned cleanup.
+- **`dns` upstream through a proxy:** literal-address UDP upstreams dial the
+  adapter's real datagram transport (`support_udp`) instead of always
+  tunneling TCP — Shadowsocks-style UDP relays get native latency. TCP-only
+  adapters, hostname upstreams and explicit `tcp://` entries keep the
+  TCP-over-proxy path; a valid truncated UDP answer retries over the same
+  proxy's TCP under the query's original deadline (ADR-0012).
 
 - `redir-port` / `listeners: type: redir`: mihomo's REDIRECT inbound, rules
   owned by the deployer. `listeners: type: tproxy` takes `transparent: true`
