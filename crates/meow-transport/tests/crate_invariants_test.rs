@@ -587,8 +587,9 @@ const RAW_SOCKET_ALLOWLIST: &[(&str, &str, usize, &str)] = &[
     (
         "crates/meow-dns/src/server.rs",
         "UdpSocket::bind(",
-        1,
-        "inbound DNS listener",
+        2,
+        "inbound DNS listener — :0 retries alternate which protocol picks \
+         the port (Windows per-protocol exclusions can partition it)",
     ),
     (
         "crates/meow-listener/src/socks5_udp.rs",

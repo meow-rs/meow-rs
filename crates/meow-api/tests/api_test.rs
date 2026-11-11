@@ -5913,13 +5913,16 @@ async fn put_configs_dns_rebind_failure_keeps_old_listener() {
 
     // First PUT: bind a standalone DNS listener on a free port. The DNS
     // bind needs UDP *and* TCP on the same port, and Windows can exclude a
-    // port per protocol (Hyper-V/WINNAT) — a UDP-only probe can land inside
-    // a TCP exclusion and the listener never comes up. Probe both.
+    // port per protocol (Hyper-V/WINNAT) — the two ranges can partition the
+    // ephemeral space, so a UDP-picked port can fail every TCP probe. Let
+    // TCP pick (its allocator skips TCP exclusions) and verify UDP while
+    // the probe holds the port; the protocol spaces are independent.
     let mut port_a = None;
     for _ in 0..16 {
-        let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let sock = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let candidate = sock.local_addr().unwrap().port();
-        if std::net::TcpListener::bind(("127.0.0.1", candidate)).is_ok() {
+        if std::net::UdpSocket::bind(("127.0.0.1", candidate)).is_ok() {
+            drop(sock);
             port_a = Some(candidate);
             break;
         }

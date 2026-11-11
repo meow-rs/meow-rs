@@ -137,19 +137,30 @@ impl DnsServer {
     /// "bind failed, every query will be dropped".
     pub async fn bind(&self) -> std::io::Result<BoundDnsServer> {
         // Windows reserves excluded port ranges per protocol (Hyper-V/WINNAT):
-        // an ephemeral UDP port can sit inside a TCP-only exclusion, so the
-        // same-port TCP bind fails with WSAEACCES. With a :0 listen the port
-        // is ours to choose — roll a fresh pair instead of failing the whole
-        // server. A configured port keeps its single fail-fast attempt; a
-        // UDP bind failure always surfaces (the OS never hands out a port it
-        // excludes for the same protocol).
+        // a port one protocol's allocator hands out can sit inside the
+        // other's exclusion, and when the two ranges partition the ephemeral
+        // space every same-direction retry fails identically — so :0
+        // attempts alternate which protocol picks the port. A configured
+        // port keeps its single fail-fast attempt; a bind failure on the
+        // picking protocol always surfaces (the OS never hands out a port
+        // it excludes for that protocol).
         const BIND_ATTEMPTS: u32 = 8;
         let mut last_err = None;
-        for _ in 0..BIND_ATTEMPTS {
-            let socket = Arc::new(UdpSocket::bind(self.listen_addr).await?);
-            let bound = socket.local_addr()?;
-            match TcpListener::bind(bound).await {
-                Ok(tcp) => {
+        for attempt in 0..BIND_ATTEMPTS {
+            let pair = if attempt % 2 == 0 {
+                let socket = Arc::new(UdpSocket::bind(self.listen_addr).await?);
+                TcpListener::bind(socket.local_addr()?)
+                    .await
+                    .map(|tcp| (socket, tcp))
+            } else {
+                let tcp = TcpListener::bind(self.listen_addr).await?;
+                UdpSocket::bind(tcp.local_addr()?)
+                    .await
+                    .map(|udp| (Arc::new(udp), tcp))
+            };
+            match pair {
+                Ok((socket, tcp)) => {
+                    let bound = socket.local_addr()?;
                     info!("DNS server listening on {bound}");
                     return Ok(BoundDnsServer {
                         resolver: Arc::clone(&self.resolver),
@@ -2005,19 +2016,21 @@ mod tests {
 
     #[tokio::test]
     async fn dns_tcp_bind_failure_rolls_back_udp() {
-        // The port must be provably bindable over UDP before the TCP
-        // listener takes it: otherwise a port inside a Windows UDP exclusion
-        // range makes the *UDP* bind fail instead of the TCP bind, and every
-        // probe below fails with EACCES — indistinguishable from a leaked
-        // socket. Probe UDP :0 first, then occupy the port over TCP.
+        // The port must be provably bindable over both protocols before the
+        // TCP listener takes it. Windows reserves excluded port ranges per
+        // protocol (Hyper-V/WINNAT) and the two ranges can partition the
+        // ephemeral space, so letting UDP pick the port can fail every TCP
+        // probe — let TCP pick instead (its allocator skips TCP exclusions)
+        // and verify UDP on the same port while the listener still holds
+        // it; the two protocol spaces are independent. The probe then stays
+        // as the occupying listener.
         let mut occupied = None;
         let mut addr = None;
         for _ in 0..16 {
-            let probe = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let candidate = probe.local_addr().unwrap();
-            drop(probe);
-            if let Ok(tcp) = tokio::net::TcpListener::bind(candidate).await {
-                occupied = Some(tcp);
+            if UdpSocket::bind(candidate).await.is_ok() {
+                occupied = Some(probe);
                 addr = Some(candidate);
                 break;
             }
