@@ -5,6 +5,7 @@
 
 pub mod auth;
 pub mod dns_parser;
+mod dns_proxy;
 mod dns_response_rules;
 pub mod dropped_providers;
 pub mod ech_dns;
@@ -1550,6 +1551,9 @@ pub async fn parse_dns_from_raw(
     } else {
         HashMap::new()
     };
+    let bound_proxies =
+        dialer_registry.map(|generation| dns_proxy::registry(proxy_registry, generation));
+    let proxy_registry = bound_proxies.as_ref().unwrap_or(proxy_registry);
     let dns = dns_parser::parse_dns(
         raw,
         geo.mmdb_path.as_deref(),
@@ -5067,8 +5071,8 @@ pub async fn build_config(
     //      depends on the placeholder built in step 1.
     //
     // Both passes publish into ONE shared `dialer-proxy` registry: pass-1
-    // adapters are retained by the DNS resolver (`#PROXY` nameservers) and
-    // by rule-provider fetch contexts for the app's whole first generation,
+    // adapters may be retained by rule-provider fetch contexts for the
+    // first generation; DNS resolves named proxies through this shared cell,
     // and the shared cell lets them resolve the pass-2 snapshot rather than
     // a stale pass-1 map (issue #533).
     let dialer_registry = meow_proxy::dialer::ProxyRegistry::default();
@@ -5174,11 +5178,14 @@ pub async fn build_config(
     // DNS — pass the explicit mmdb path so fallback-filter GeoIP uses the
     // same path as the rule engine, plus the proxy registry from step 1
     // so #PROXY-tagged nameservers can resolve their referenced adapter.
+    // Bind DNS to the published generation rather than retaining pass-1 groups.
+    // Weak targets avoid a resolver -> DIRECT -> resolver ownership cycle.
+    let dns_proxies = dns_proxy::registry(&proxies, &dialer_registry);
     let dns_config = dns_parser::parse_dns(
         &raw,
         geodata.mmdb_path.as_deref(),
         cache_dir,
-        &proxies,
+        &dns_proxies,
         ctx.geosite.clone(),
         &rule_providers,
         None,
