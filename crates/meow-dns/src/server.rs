@@ -2438,6 +2438,69 @@ mod tests {
         let _ = task.await;
     }
 
+    #[tokio::test]
+    async fn ordered_refusal_visits_each_candidate_once_per_request() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let visits = Arc::new(AtomicUsize::new(0));
+        let mut resolver = empty_resolver();
+        resolver
+            .set_response_rules(
+                (0..32)
+                    .map(|index| {
+                        let visits = Arc::clone(&visits);
+                        crate::response_policy::ResponseRule {
+                            matcher: Arc::new(move |_| {
+                                visits.fetch_add(1, Ordering::Relaxed);
+                                index == 31
+                            }),
+                            query_types: vec![],
+                            action: crate::response_policy::ResponseAction::Refused,
+                        }
+                    })
+                    .collect(),
+            )
+            .unwrap();
+        let query = sample_query(7, 1);
+        let LocalAnswer::Answer(inline) = DnsServer::try_answer_local(&query, &resolver) else {
+            panic!("expected local refusal");
+        };
+        assert_eq!(visits.swap(0, Ordering::Relaxed), 32);
+        let asynchronous = DnsServer::handle_query(&query, &resolver).await.unwrap();
+        assert_eq!(visits.load(Ordering::Relaxed), 32);
+        assert_eq!(inline.response, asynchronous);
+        assert_eq!(inline.response[3] & 15, 5);
+    }
+
+    #[tokio::test]
+    async fn generic_policy_checks_edns_before_refusing_a_query() {
+        let mut resolver = empty_resolver();
+        resolver
+            .set_response_rules(vec![crate::response_policy::ResponseRule {
+                matcher: Arc::new(|_| true),
+                query_types: vec![65],
+                action: crate::response_policy::ResponseAction::Refused,
+            }])
+            .unwrap();
+        let query = sample_edns_query(17, RecordType::HTTPS, false);
+        let mut newer = Message::from_vec(&query).unwrap();
+        newer.edns.as_mut().unwrap().set_version(1);
+        let mut truncated = query.clone();
+        truncated.truncate(truncated.len() - 1);
+        for (packet, expected) in [
+            (newer.to_vec().unwrap(), 16_u16),
+            (truncated, 1),
+            (query, 5),
+        ] {
+            assert!(matches!(
+                DnsServer::try_answer_local(&packet, &resolver),
+                LocalAnswer::Upstream
+            ));
+            let reply = DnsServer::handle_query(&packet, &resolver).await.unwrap();
+            let msg = Message::from_vec(&reply).unwrap();
+            assert_eq!(u16::from(msg.metadata.response_code), expected);
+        }
+    }
+
     fn empty_resolver() -> crate::resolver::Resolver {
         crate::resolver::Resolver::new(
             Vec::new(),
@@ -4251,3 +4314,10 @@ mod tests {
         serve.abort();
     }
 }
+
+#[cfg(test)]
+#[path = "server_admission_tests.rs"]
+mod admission_tests;
+#[cfg(test)]
+#[path = "server_budget_tests.rs"]
+mod budget_tests;
