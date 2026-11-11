@@ -223,7 +223,7 @@ async fn doh_actual_direct_and_proxy_stream_paths_share_framing_and_fail_closed(
     }
     assert_eq!(proxy.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     assert!(
-        tokio::time::timeout(Duration::from_millis(30), bypass.accept())
+        tokio::time::timeout(Duration::from_millis(100), bypass.accept())
             .await
             .is_err()
     );
@@ -257,7 +257,8 @@ async fn upstream_total_response_budget_rejects_without_peer_eof() {
             "x".repeat(MAX_DOH_RESPONSE_BYTES + 1)
         ),
     ] {
-        let (mut client, mut server) = tokio::io::duplex(131072);
+        // Buffer must hold the whole over-limit payload without a reader.
+        let (mut client, mut server) = tokio::io::duplex(MAX_DOH_RESPONSE_BYTES * 2 + 4096);
         server.write_all(bytes.as_bytes()).await.unwrap();
         let result = tokio::time::timeout(Duration::from_secs(1), read_http_response(&mut client))
             .await

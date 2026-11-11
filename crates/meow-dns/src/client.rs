@@ -4449,7 +4449,7 @@ mod tests {
                 .all(|m| m.internal && m.dst_ip == Some(addr.ip()) && m.dst_port == addr.port()));
         }
         assert!(
-            tokio::time::timeout(Duration::from_millis(30), listener.accept())
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
                 .await
                 .is_err()
         );
