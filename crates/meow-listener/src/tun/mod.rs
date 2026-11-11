@@ -1670,7 +1670,10 @@ mod tests {
         ));
         assert!(futures::poll!(&mut admission).is_pending());
         drop(admission);
-        assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
+        // A non-empty buffer: Ok(0) is EOF (the dropped stream), WouldBlock
+        // would mean it was still open. An empty buffer reads Ok(0) either way.
+        let mut byte = [0u8; 1];
+        assert_eq!(peer.try_read(&mut byte).unwrap(), 0);
         drop(held);
         assert_eq!(sem.available_permits(), 1);
     }
@@ -1748,7 +1751,8 @@ mod tests {
             .await
             .unwrap();
             drop(admission);
-            assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
+            let mut byte = [0u8; 1];
+            assert_eq!(peer.try_read(&mut byte).unwrap(), 0);
             if failed_input {
                 output.abort();
                 let _ = output.await;
