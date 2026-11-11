@@ -286,7 +286,8 @@ Scope and caveats:
   the *IPv4* default route. If that interface has no IPv6 connectivity,
   DIRECT dials to IPv6 destinations fail (clients fall back to IPv4);
   proxied ones are unaffected. `inet6-address` is ignored, with a warning,
-  in fake-ip scope: it has no IPv6 range to route.
+  in fake-ip scope — so a `dns.fake-ip-range6` pool is routed only under
+  global scope; without the address its fake AAAA answers are unroutable.
 - `fake-ip` DNS mode is still recommended so domain rules match; global
   scope adds IP-literal capture on top rather than replacing the DNS flow.
 - Requires root/`CAP_NET_ADMIN` (Administrator on Windows) like the rest

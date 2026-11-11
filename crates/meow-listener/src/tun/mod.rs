@@ -672,6 +672,14 @@ impl TunListener {
             nat: None,
         };
         let fake_ip_nets = fake_ip_route_nets(&self.tunnel.resolver(), cfg.inet6_address.is_some());
+        if cfg.inet6_address.is_none() && self.tunnel.resolver().fake_ip_v6_net().is_some() {
+            warn!(
+                "tun '{}': 'dns.fake-ip-range6' is configured but the device has no \
+                 'inet6-address' — fake AAAA answers have no route into '{dev_name}'. \
+                 'inet6-address' applies only under 'auto-route: true'.",
+                self.name
+            );
+        }
 
         // Global scope on Linux: the device's default routes go in a table
         // of their own, which policy rules send only the flows this host

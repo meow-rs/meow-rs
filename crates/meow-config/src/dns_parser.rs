@@ -374,9 +374,27 @@ pub async fn parse_dns(
             let prefix: ipnet::Ipv6Net = range.parse().map_err(|e| {
                 anyhow::anyhow!("dns.fake-ip-range6 '{range}' is not a valid IPv6 CIDR: {e}")
             })?;
+            if !crate::effective_ipv6(raw.ipv6) {
+                warn!(
+                    "dns.fake-ip-range6 is set but 'ipv6' is disabled — the \
+                     pool installs yet AAAA queries never consult it"
+                );
+            }
             let mut v6 = dns.clone();
             v6.fake_ip_range = Some(prefix.to_string());
             install_fakeip(&mut resolver, &v6, cache_dir, prior, strict).await?;
+        }
+    } else {
+        // Dead-key observability for the fake-IP ranges: a user who pairs
+        // them with `enhanced-mode: redir-host` (or a typo) otherwise gets a
+        // silently inert block of config.
+        for (key, set) in [
+            ("fake-ip-range", dns.fake_ip_range.is_some()),
+            ("fake-ip-range6", dns.fake_ip_range6.is_some()),
+        ] {
+            if set {
+                warn!("dns.{key} is set but enhanced-mode is not 'fake-ip' — ignored");
+            }
         }
     }
     let response_rules = crate::dns_response_rules::build(
@@ -2053,6 +2071,87 @@ mod tests {
                 "invalid fake-ip-range6 must not silently forward: {range}"
             );
         }
+    }
+
+    /// Dead `fake-ip-range6` config must say so: outside fake-ip mode the
+    /// key is ignored, and inside it with `ipv6` off the pool installs yet
+    /// AAAA queries never consult it. Same scoped sink as
+    /// `policy_resolver_sni_matching_proxy_name_warns`.
+    #[test]
+    fn fakeip_range6_dead_config_warns() {
+        #[derive(Clone)]
+        struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+            type Writer = Sink;
+            fn make_writer(&'a self) -> Sink {
+                self.clone()
+            }
+        }
+        let sink = Sink(Arc::new(std::sync::Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current_thread runtime");
+
+        tracing::subscriber::with_default(subscriber, || {
+            rt.block_on(async {
+                for (yaml, expected_pool) in [
+                    // Not fake-ip mode: the key is ignored outright.
+                    (
+                        "dns:\n  enable: true\n  nameserver: [rcode://refused]\n  fake-ip-range6: fdfe:dcba:9876::/64\n",
+                        false,
+                    ),
+                    // fake-ip mode but `ipv6` unset: installs anyway — the
+                    // warn explains why it stays unreachable.
+                    (
+                        "dns:\n  enable: true\n  enhanced-mode: fake-ip\n  nameserver: [rcode://refused]\n  fake-ip-range6: fdfe:dcba:9876::/64\n",
+                        true,
+                    ),
+                ] {
+                    let raw: RawConfig = serde_saphyr::from_str(yaml).unwrap();
+                    let cfg = parse_dns(
+                        &raw,
+                        None,
+                        None,
+                        &HashMap::new(),
+                        None,
+                        &HashMap::new(),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(
+                        cfg.resolver.fake_ip_v6_net().is_some(),
+                        expected_pool,
+                        "{yaml}"
+                    );
+                }
+            });
+        });
+
+        let captured = String::from_utf8_lossy(&sink.0.lock().unwrap()).into_owned();
+        assert!(
+            captured.contains("fake-ip-range6 is set but enhanced-mode is not 'fake-ip'"),
+            "non-fake-ip mode must warn the key is ignored; got: {captured}"
+        );
+        assert!(
+            captured.contains("fake-ip-range6 is set but 'ipv6' is disabled"),
+            "ipv6-off fake-ip mode must warn the pool is dead; got: {captured}"
+        );
     }
 
     /// Issue #514 review follow-up: a config reload that rebuilds the
