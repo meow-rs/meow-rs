@@ -5911,10 +5911,20 @@ async fn put_configs_dns_rebind_failure_keeps_old_listener() {
         )
     };
 
-    // First PUT: bind a standalone DNS listener on a free port.
-    let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    let port_a = sock.local_addr().unwrap().port();
-    drop(sock);
+    // First PUT: bind a standalone DNS listener on a free port. The DNS
+    // bind needs UDP *and* TCP on the same port, and Windows can exclude a
+    // port per protocol (Hyper-V/WINNAT) — a UDP-only probe can land inside
+    // a TCP exclusion and the listener never comes up. Probe both.
+    let mut port_a = None;
+    for _ in 0..16 {
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let candidate = sock.local_addr().unwrap().port();
+        if std::net::TcpListener::bind(("127.0.0.1", candidate)).is_ok() {
+            port_a = Some(candidate);
+            break;
+        }
+    }
+    let port_a = port_a.expect("no port bindable over both UDP and TCP");
     let yaml_a = format!(
         "mode: rule\ndns:\n  enable: true\n  listen: 127.0.0.1:{port_a}\n  nameserver:\n    - 127.0.0.1\nrules:\n  - MATCH,DIRECT\n"
     );

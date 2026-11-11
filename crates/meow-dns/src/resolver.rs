@@ -43,7 +43,7 @@ impl From<Vec<IpAddr>> for HostEntry {
 #[non_exhaustive]
 pub enum BootstrapError {
     #[error(
-        "default-nameserver entry '{entry}' must be a plain UDP/TCP nameserver (tls:// and https:// are not allowed here because they would create a bootstrap loop)"
+        "default-nameserver entry '{entry}' must use an IP literal — a bootstrap root cannot carry a hostname that itself needs resolving"
     )]
     DefaultNameserverNotPlain { entry: String },
     #[error("cannot resolve '{host}' via bootstrap nameserver: {source}")]
@@ -424,34 +424,6 @@ fn clamp_ttl(raw: Duration) -> Duration {
     const MIN_TTL: Duration = Duration::from_secs(10);
     const MAX_TTL: Duration = Duration::from_secs(3600);
     raw.clamp(MIN_TTL, MAX_TTL)
-}
-
-fn url_to_plain_socketaddr(url: &NameServerUrl) -> SocketAddr {
-    match url {
-        NameServerUrl::Udp { addr, port } | NameServerUrl::Tcp { addr, port } => {
-            let ip = match addr {
-                HostOrIp::Ip(ip) => *ip,
-                HostOrIp::Host(_) => {
-                    unreachable!("default_ns hostname entries should have been rejected")
-                }
-            };
-            SocketAddr::new(ip, *port)
-        }
-        NameServerUrl::Tls { addr, .. }
-        | NameServerUrl::Https { addr, .. }
-        | NameServerUrl::Quic { addr, .. } => {
-            let ip = match addr {
-                HostOrIp::Ip(ip) => *ip,
-                HostOrIp::Host(_) => {
-                    unreachable!("default_ns hostname entries should have been rejected")
-                }
-            };
-            SocketAddr::new(ip, 53)
-        }
-        NameServerUrl::RCode { .. } => {
-            unreachable!("rcode default-nameserver does not have a socket address")
-        }
-    }
 }
 
 /// Read the platform's configured recursive resolvers, used as bootstrap
@@ -1120,14 +1092,10 @@ impl Resolver {
                 default_ns
                     .iter()
                     .map(|ns| {
-                        let c = match ns {
-                            NameServerUrl::RCode { code, .. } => DnsClient::rcode(*code),
-                            NameServerUrl::Tcp { .. } => {
-                                DnsClient::tcp(url_to_plain_socketaddr(ns))
-                            }
-                            _ => DnsClient::udp(url_to_plain_socketaddr(ns)),
-                        };
-                        Arc::new(c.with_timeout(Duration::from_secs(3)))
+                        Arc::new(
+                            Self::build_resolver_client(ns, &HashMap::new(), None)
+                                .with_timeout(Duration::from_secs(3)),
+                        )
                     })
                     .collect()
             };
@@ -1243,6 +1211,14 @@ impl Resolver {
         resolved: &HashMap<String, IpAddr>,
         proxy: Option<Arc<dyn meow_common::Proxy>>,
     ) -> Arc<DnsClient> {
+        Arc::new(Self::build_resolver_client(url, resolved, proxy))
+    }
+
+    fn build_resolver_client(
+        url: &NameServerUrl,
+        resolved: &HashMap<String, IpAddr>,
+        proxy: Option<Arc<dyn meow_common::Proxy>>,
+    ) -> DnsClient {
         let (socket_addr, proxy_target) = match url {
             NameServerUrl::Udp { addr, port }
             | NameServerUrl::Tcp { addr, port }
@@ -1287,7 +1263,7 @@ impl Resolver {
                     Some(p) => client.with_proxy(p),
                     None => client,
                 };
-                return Arc::new(client);
+                return client;
             }
         };
         let label = encrypted_upstream_label(url);
@@ -1359,12 +1335,11 @@ impl Resolver {
             Some(label) => client.with_upstream_label(label),
             None => client,
         };
-        let client = match (proxy, proxy_target) {
+        match (proxy, proxy_target) {
             (Some(p), Some((host, port))) => client.with_proxy(p).with_proxy_target(host, port),
             (Some(p), None) => client.with_proxy(p),
             (None, _) => client,
-        };
-        Arc::new(client)
+        }
     }
 
     /// Resolve `host` to every enabled address.
@@ -4939,5 +4914,55 @@ mod tests {
             "fenced fallback must return exactly the enabled-family subset \
              of the system answer (v6 leaked if this differs)"
         );
+    }
+}
+
+#[cfg(all(test, feature = "encrypted"))]
+mod bootstrap_transport_tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    async fn assert_tls_bootstrap(scheme: &str, suffix: &str) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let resolve = Resolver::new_with_bootstrap(
+            vec![NameServerUrl::parse("tls://bootstrap-target.invalid").unwrap()],
+            vec![],
+            vec![NameServerUrl::parse(&format!("{scheme}://127.0.0.1:{port}{suffix}")).unwrap()],
+            DnsMode::Normal,
+            DomainTrie::new(),
+            false,
+            true,
+            None,
+            None,
+        );
+        let observe = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut prefix = [0; 3];
+            socket.read_exact(&mut prefix).await.unwrap();
+            assert_eq!(
+                &prefix[..2],
+                &[0x16, 0x03],
+                "expected a TLS handshake record"
+            );
+        };
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(1)) => panic!("configured encrypted bootstrap port was never contacted"),
+            _ = observe => {},
+            result = resolve => panic!(
+                "bootstrap completed before TLS transport was observed: {:?}",
+                result.map(|_| ())
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn dot_bootstrap_preserves_transport_and_port() {
+        assert_tls_bootstrap("tls", "#bootstrap.test").await;
+    }
+
+    #[tokio::test]
+    async fn doh_bootstrap_preserves_transport_and_port() {
+        assert_tls_bootstrap("https", "/dns-query#bootstrap.test").await;
     }
 }
