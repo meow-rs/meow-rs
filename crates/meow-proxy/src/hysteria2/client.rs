@@ -126,7 +126,7 @@ impl ReconnectableClient {
             // Endpoint DNS may itself dial this pool. Do not hold its connect
             // lock until resolution has completed: the nested lookup needs to
             // reach the existing host-resolver reentry fence first.
-            let (server, addrs) = resolve_server(&self.cfg).await?;
+            let resolved = resolve_server(&self.cfg).await;
             let mut guard = self.conn.lock().await;
             if self.generation() != generation {
                 continue;
@@ -138,6 +138,8 @@ impl ReconnectableClient {
                     return Ok(Arc::clone(handle));
                 }
             }
+            // A failed concurrent lookup does not invalidate a usable cache.
+            let (server, addrs) = resolved?;
             guard.take();
             let handle = Arc::new(connect_new(Arc::clone(&self.cfg), server, addrs).await?);
             if self.generation() != generation {
