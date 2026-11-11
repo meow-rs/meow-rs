@@ -5,3 +5,4 @@
 #include "../include/lwip/tcp.h"
 #include "../include/lwip/udp.h"
 #include "../include/lwip/ip_addr.h"
+#include "../include/lwip/priv/tcp_priv.h"

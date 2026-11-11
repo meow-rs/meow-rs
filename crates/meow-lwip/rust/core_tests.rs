@@ -157,8 +157,21 @@ impl Peer {
 /// handle still held, `MEMP_NUM_TCP_PCB` filler connections force lwIP to
 /// recycle A's pcb, then A's handle is dropped. Nothing may close any
 /// filler, and A must still read the bytes that preceded its EOF.
+#[cfg(not(feature = "libc-malloc"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn timewait_pcb_recycled_by_lwip_is_not_closed_on_drop() {
+    timewait_reclamation_preserves_live_handles(false).await;
+}
+
+// libc allocation has no MEMP_NUM_TCP_PCB ceiling, so filling that many
+// connections does not prove the TIME_WAIT PCB was freed. Exercise the
+// timer-expiry path under both allocators and observe the actual lwIP list.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timewait_pcb_expired_by_lwip_is_not_closed_on_drop() {
+    timewait_reclamation_preserves_live_handles(true).await;
+}
+
+async fn timewait_reclamation_preserves_live_handles(expire: bool) {
     const A_PORT: u16 = 40000;
     const FILLER_BASE: u16 = 20000;
 
@@ -194,11 +207,19 @@ async fn timewait_pcb_recycled_by_lwip_is_not_closed_on_drop() {
     })
     .await;
 
-    // Fill the pcb pool. A still holds a slot, so the last filler's SYN can
-    // only get a pcb by tcp_alloc evicting A through tcp_kill_timewait, and
-    // the LIFO free list hands it A's slot. Every filler being accepted
-    // therefore proves A's pcb was recycled.
-    let pool = usize::try_from(MEMP_NUM_TCP_PCB).unwrap();
+    assert_eq!(listener.timewait_count().await, 1, "A must reach TIME_WAIT");
+    let pool = if expire {
+        listener.expire_timewait().await;
+        assert_eq!(
+            listener.timewait_count().await,
+            0,
+            "timer must free A's PCB"
+        );
+        1
+    } else {
+        // Fixed-pool pressure evicts A and the LIFO free list reuses its slot.
+        usize::try_from(MEMP_NUM_TCP_PCB).unwrap()
+    };
     let mut fillers = Vec::with_capacity(pool);
     for i in 0..pool {
         let port = FILLER_BASE + u16::try_from(i).unwrap();
@@ -209,6 +230,12 @@ async fn timewait_pcb_recycled_by_lwip_is_not_closed_on_drop() {
             .expect("listener closed");
         fillers.push(stream);
     }
+
+    assert_eq!(
+        listener.timewait_count().await,
+        0,
+        "TIME_WAIT reclamation must occur before the stale handle is dropped"
+    );
 
     // A's handle outlived its pcb but must still drain what preceded EOF.
     let mut tail = Vec::new();
