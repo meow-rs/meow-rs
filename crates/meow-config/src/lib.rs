@@ -418,6 +418,16 @@ pub fn default_tun_inet4_address(fake_ip_range: Option<&str>) -> ipnet::Ipv4Net 
         .expect("the default fake-IP range is an IPv4 /16")
 }
 
+/// Reject capacities Tokio cannot represent before any listener starts.
+fn validate_connection_limit(value: usize) -> Result<(), anyhow::Error> {
+    anyhow::ensure!(
+        value <= tokio::sync::Semaphore::MAX_PERMITS,
+        "max-connections exceeds the runtime maximum ({})",
+        tokio::sync::Semaphore::MAX_PERMITS
+    );
+    Ok(())
+}
+
 /// Parse and validate the raw `tun:` block. Returns `TunConfig::default()`
 /// (disabled) when the block is absent. `fake_ip_range` is the config's
 /// `dns.fake-ip-range`, which sets the default `inet4-address`.
@@ -426,6 +436,7 @@ pub fn parse_tun_config(
     global_max_connections: Option<usize>,
     fake_ip_range: Option<&str>,
 ) -> Result<TunConfig, anyhow::Error> {
+    validate_connection_limit(global_max_connections.unwrap_or(256))?;
     let Some(r) = raw else {
         // Keep the global-cap folding symmetric with the `Some` arm: an
         // absent section still inherits `max-connections`, so callers
@@ -4731,6 +4742,7 @@ fn build_named_listeners(
     let mut used_ports: HashMap<u16, String> = HashMap::new();
     let mut used_names: std::collections::HashSet<String> = std::collections::HashSet::new();
     let global_max_conns = raw.max_connections.unwrap_or(256);
+    validate_connection_limit(global_max_conns)?;
 
     let mut add = |name: &str,
                    spec: ListenerSpec,
@@ -4738,6 +4750,8 @@ fn build_named_listeners(
                    listen: &str,
                    max_connections: usize|
      -> Result<(), anyhow::Error> {
+        validate_connection_limit(max_connections)
+            .map_err(|e| anyhow::anyhow!("listener '{name}': {e}"))?;
         // Port 0 is "OS assigns an ephemeral port" — each such listener binds
         // a distinct port at runtime, so they are not duplicates of each other.
         if port != 0 {
@@ -9895,6 +9909,69 @@ mod default_geo_path_tests {
         assert_eq!(
             existing_or_first(dir.path(), ASN),
             dir.path().join("GeoLite2-ASN.mmdb")
+        );
+    }
+}
+
+#[cfg(test)]
+mod connection_limit_tests {
+    use super::*;
+
+    #[test]
+    fn oversized_global_connection_limit_is_a_config_error() {
+        let raw = raw::RawConfig {
+            mixed_port: Some(1080),
+            max_connections: Some(tokio::sync::Semaphore::MAX_PERMITS + 1),
+            ..Default::default()
+        };
+        assert!(build_named_listeners(&raw, "127.0.0.1", false).is_err());
+    }
+
+    #[test]
+    fn oversized_named_connection_limit_is_a_config_error() {
+        let raw: raw::RawConfig = crate::parse_raw_yaml(&format!(
+            "listeners:\n  - name: test\n    type: mixed\n    port: 0\n    max-connections: {}\n",
+            tokio::sync::Semaphore::MAX_PERMITS + 1
+        ))
+        .unwrap();
+        assert!(build_named_listeners(&raw, "127.0.0.1", false).is_err());
+    }
+
+    #[test]
+    fn tun_parser_rejects_unrepresentable_connection_limit() {
+        let oversized = Some(tokio::sync::Semaphore::MAX_PERMITS + 1);
+        assert!(parse_tun_config(None, oversized, None).is_err());
+        assert!(parse_tun_config(Some(&raw::RawTun::default()), oversized, None).is_err());
+    }
+
+    #[test]
+    fn connection_limit_boundaries_preserve_existing_semantics() {
+        for limit in [0, 256, tokio::sync::Semaphore::MAX_PERMITS] {
+            let raw = raw::RawConfig {
+                mixed_port: Some(1080),
+                max_connections: Some(limit),
+                ..Default::default()
+            };
+            let listeners = build_named_listeners(&raw, "127.0.0.1", false).unwrap();
+            assert_eq!(listeners[0].max_connections, limit);
+            assert_eq!(
+                parse_tun_config(None, Some(limit), None)
+                    .unwrap()
+                    .max_connections,
+                limit
+            );
+        }
+        let raw = raw::RawConfig {
+            mixed_port: Some(1080),
+            ..Default::default()
+        };
+        assert_eq!(
+            build_named_listeners(&raw, "127.0.0.1", false).unwrap()[0].max_connections,
+            256
+        );
+        assert_eq!(
+            parse_tun_config(None, None, None).unwrap().max_connections,
+            256
         );
     }
 }
