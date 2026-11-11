@@ -743,6 +743,8 @@ pub enum SkipperMode {
 pub struct Skipper {
     trie: DomainTrie<()>,
     mode: SkipperMode,
+    /// `+.*` covers any single-label apex and all its subdomains.
+    match_all: bool,
     /// True if no patterns were configured. WhiteList with an empty trie is
     /// a foot-gun (would bypass everything) — we treat empty WhiteList as
     /// "skip nothing" and emit a warn at construction time.
@@ -753,9 +755,18 @@ impl Skipper {
     pub fn new(patterns: &[String], mode: SkipperMode) -> Self {
         let mut trie: DomainTrie<()> = DomainTrie::new();
         let mut inserted = 0usize;
+        let mut match_all = false;
         for raw in patterns {
             let pat = raw.trim();
             if pat.is_empty() {
+                continue;
+            }
+            // mihomo's `+.` adds both an apex and its subdomains; with
+            // the single-label wildcard apex, `+.*` therefore covers every
+            // domain depth. Keep bare `*` distinct from this suffix form.
+            if pat == "+.*" {
+                match_all = true;
+                inserted += 1;
                 continue;
             }
             // Entries go in as written, matching upstream fake-ip-filter's
@@ -776,7 +787,12 @@ impl Skipper {
                  treating as 'skip nothing' instead"
             );
         }
-        Self { trie, mode, empty }
+        Self {
+            trie,
+            mode,
+            match_all,
+            empty,
+        }
     }
 
     /// True if `host` should bypass fake-IP and go to a real resolver.
@@ -785,7 +801,8 @@ impl Skipper {
             // Empty filter ⇒ never skip (BlackList semantics by default).
             return false;
         }
-        let matched = self.trie.search(host).is_some();
+        let matched = (self.match_all && !host.trim_end_matches('.').is_empty())
+            || self.trie.search(host).is_some();
         match self.mode {
             SkipperMode::BlackList => matched,
             SkipperMode::WhiteList => !matched,
@@ -1052,6 +1069,25 @@ mod tests {
             pool.look_back(first_ip).as_deref() != Some(first_host),
             "after wrap, original first_host mapping must be evicted"
         );
+    }
+
+    #[test]
+    fn skipper_wildcard_suffix_covers_all_domain_depths() {
+        for mode in [SkipperMode::BlackList, SkipperMode::WhiteList] {
+            let skipper = Skipper::new(&["+.*".to_string()], mode);
+            for host in [
+                "localhost",
+                "example.com",
+                "a.b.example.com",
+                "EXAMPLE.COM.",
+            ] {
+                assert_eq!(
+                    skipper.should_skip(host),
+                    mode == SkipperMode::BlackList,
+                    "{mode:?}: {host}"
+                );
+            }
+        }
     }
 
     /// Table-driven merge of the former `skipper_blacklist_skips_matched`,

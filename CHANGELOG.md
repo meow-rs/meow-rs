@@ -10,6 +10,9 @@ the canonical, in-repo source a release is cut from.
 
 ### Added
 
+- `dns.fake-ip-filter` recognizes the mihomo `+.*` wildcard suffix across
+  all domain depths in both blacklist and whitelist modes.
+
 - **hysteria2:** mihomo's `initial-stream-receive-window`, `max-stream-receive-window`,
   `initial-connection-receive-window` and `max-connection-receive-window` are honoured
   (they used to fail the node). Unset, the connection window ceiling is MemTotal/16
