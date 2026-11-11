@@ -556,6 +556,8 @@ pub struct RawDns {
     pub listen: Option<String>,
     pub enhanced_mode: Option<String>,
     pub fake_ip_range: Option<String>,
+    /// Optional additional IPv6 fake-IP pool (mihomo `fake-ip-range6`).
+    pub fake_ip_range6: Option<String>,
     /// Fake-IP filter mode: `blacklist` (default) or `whitelist`. Controls
     /// how `fake_ip_filter` patterns are interpreted.
     pub fake_ip_filter_mode: Option<String>,

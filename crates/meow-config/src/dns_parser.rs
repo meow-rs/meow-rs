@@ -370,6 +370,14 @@ pub async fn parse_dns(
     // privacy regression.
     if mode == DnsMode::FakeIp {
         install_fakeip(&mut resolver, dns, cache_dir, prior, strict).await?;
+        if let Some(range) = &dns.fake_ip_range6 {
+            let prefix: ipnet::Ipv6Net = range.parse().map_err(|e| {
+                anyhow::anyhow!("dns.fake-ip-range6 '{range}' is not a valid IPv6 CIDR: {e}")
+            })?;
+            let mut v6 = dns.clone();
+            v6.fake_ip_range = Some(prefix.to_string());
+            install_fakeip(&mut resolver, &v6, cache_dir, prior, strict).await?;
+        }
     }
     let response_rules = crate::dns_response_rules::build(
         dns.response_rules.as_deref().unwrap_or(&[]),
@@ -1981,6 +1989,70 @@ mod tests {
         .unwrap();
         assert!(!cfg.enabled);
         assert!(cfg.proxy_resolver.is_none());
+    }
+
+    #[tokio::test]
+    async fn fakeip_range6_installs_both_families_and_reuses_each_pool() {
+        let raw: RawConfig = serde_saphyr::from_str(
+            "ipv6: true\ndns:\n  enable: true\n  enhanced-mode: fake-ip\n  nameserver: [rcode://refused]\n  fake-ip-range: 198.18.0.1/16\n  fake-ip-range6: fdfe:dcba:9876::1/64\n",
+        ).unwrap();
+        let cfg = parse_dns(
+            &raw,
+            None,
+            None,
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        let next = parse_dns(
+            &raw,
+            None,
+            None,
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+            Some(&cfg.resolver),
+        )
+        .await
+        .unwrap();
+        for cidr in ["198.18.0.1/16", "fdfe:dcba:9876::1/64"] {
+            let range = cidr.parse().unwrap();
+            let pool = cfg
+                .resolver
+                .fakeip_pool_over(range)
+                .expect("both address-family pools must be installed");
+            let ip = pool.lookup("dual.example");
+            assert_eq!(pool.look_back(ip).as_deref(), Some("dual.example"));
+            let carried = next.resolver.fakeip_pool_over(range).unwrap();
+            assert!(Arc::ptr_eq(&pool, &carried));
+            assert_eq!(carried.lookup("dual.example"), ip);
+        }
+    }
+
+    #[tokio::test]
+    async fn fakeip_range6_rejects_wrong_family_and_bad_cidr() {
+        for range in ["198.18.0.1/16", "not-a-cidr"] {
+            let raw: RawConfig = serde_saphyr::from_str(&format!(
+                "dns:\n  enable: true\n  enhanced-mode: fake-ip\n  nameserver: [rcode://refused]\n  fake-ip-range6: {range}\n"
+            )).unwrap();
+            let result = parse_dns(
+                &raw,
+                None,
+                None,
+                &HashMap::new(),
+                None,
+                &HashMap::new(),
+                None,
+            )
+            .await;
+            assert!(
+                result.is_err(),
+                "invalid fake-ip-range6 must not silently forward: {range}"
+            );
+        }
     }
 
     /// Issue #514 review follow-up: a config reload that rebuilds the
