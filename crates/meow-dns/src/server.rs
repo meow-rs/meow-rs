@@ -2005,27 +2005,54 @@ mod tests {
 
     #[tokio::test]
     async fn dns_tcp_bind_failure_rolls_back_udp() {
-        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = occupied.local_addr().unwrap();
+        // The port must be provably bindable over UDP before the TCP
+        // listener takes it: otherwise a port inside a Windows UDP exclusion
+        // range makes the *UDP* bind fail instead of the TCP bind, and every
+        // probe below fails with EACCES — indistinguishable from a leaked
+        // socket. Probe UDP :0 first, then occupy the port over TCP.
+        let mut occupied = None;
+        let mut addr = None;
+        for _ in 0..16 {
+            let probe = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let candidate = probe.local_addr().unwrap();
+            drop(probe);
+            if let Ok(tcp) = tokio::net::TcpListener::bind(candidate).await {
+                occupied = Some(tcp);
+                addr = Some(candidate);
+                break;
+            }
+        }
+        let addr = addr.expect("no port bindable over UDP and TCP");
+        let _occupied = occupied.unwrap();
         let server = DnsServer::new(Arc::new(empty_resolver()), addr);
         let result = server.bind().await;
         assert!(
             result.is_err(),
             "occupied TCP port must fail the whole DNS bind"
         );
-        // Windows defers closesocket of a reactor-registered socket to the
-        // next poll drain — the rollback drop is issued but the port may not
-        // be free until the runtime ticks. Retry briefly instead of racing
-        // the drain; a genuine leak never frees within this bound.
+        // Windows defers closesocket of a reactor-registered socket to a
+        // later poll drain — the rollback drop is issued but the port may not
+        // be free until the runtime ticks, and under CI load that drain can
+        // be starved for well over a second. Yield to pump the reactor, then
+        // retry within a generous bound; a genuine leak never frees at all,
+        // and any other error kind surfaces in the failure message.
         let mut freed = false;
-        for _ in 0..100 {
-            if UdpSocket::bind(addr).await.is_ok() {
-                freed = true;
-                break;
+        let mut last_err = None;
+        for _ in 0..300 {
+            match UdpSocket::bind(addr).await {
+                Ok(_) => {
+                    freed = true;
+                    break;
+                }
+                Err(e) => last_err = Some(e),
             }
+            tokio::task::yield_now().await;
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        assert!(freed, "failed bind leaked UDP port");
+        assert!(
+            freed,
+            "failed bind leaked UDP port; last bind error: {last_err:?}"
+        );
     }
 
     async fn tcp_frame(stream: &mut TcpStream, query: &[u8]) {

@@ -4422,6 +4422,49 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "encrypted")]
+    #[tokio::test]
+    async fn encrypted_dns_uses_named_proxy_and_never_falls_back_after_dial_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let proxy = Arc::new(CapturingMetaProxy {
+            seen: Default::default(),
+            health: meow_common::ProxyHealth::new(),
+        });
+        for client in [
+            DnsClient::dot(addr, "dns.example"),
+            DnsClient::doh(addr, "dns.example", "/dns-query"),
+        ] {
+            assert!(client
+                .with_proxy(Arc::clone(&proxy) as DnsProxy)
+                .query("test.example", RecordType::A)
+                .await
+                .is_err());
+        }
+        {
+            let seen = proxy.seen.lock().unwrap();
+            assert_eq!(seen.len(), 2);
+            assert!(seen
+                .iter()
+                .all(|m| m.internal && m.dst_ip == Some(addr.ip()) && m.dst_port == addr.port()));
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
+        let proxy: DnsProxy = Arc::new(ErrnoProxy {
+            health: meow_common::ProxyHealth::new(),
+        });
+        let err = DnsClient::dot(addr, "dns.example")
+            .with_proxy(proxy)
+            .dial_tls_inner()
+            .await
+            .err()
+            .unwrap();
+        assert!(err.is_errno_backed());
+    }
+
     fn emfile_client() -> DnsClient {
         DnsClient::udp("203.0.113.53:53".parse().unwrap()).with_proxy(std::sync::Arc::new(
             ErrnoProxy {
@@ -4582,3 +4625,7 @@ mod tests {
         assert!(r.ips.is_empty());
     }
 }
+
+#[cfg(all(test, feature = "encrypted"))]
+#[path = "doh_stream_tests.rs"]
+mod doh_stream_tests;
