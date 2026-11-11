@@ -1,6 +1,7 @@
 #include "../include/lwip/init.h"
 #include "../include/lwip/timeouts.h"
 #include "../include/lwip/netif.h"
+#include "../include/lwip/nd6.h"
 #include "../include/lwip/tcp.h"
 #include "../include/lwip/udp.h"
 #include "../include/lwip/ip_addr.h"

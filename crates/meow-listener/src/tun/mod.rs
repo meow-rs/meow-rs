@@ -864,8 +864,8 @@ impl TunListener {
                 }
             }
         }
-        let (stack, mut tcp_listener, udp_socket) =
-            lwip::NetStack::new().map_err(|e| io::Error::other(format!("lwIP netstack: {e}")))?;
+        let (stack, mut tcp_listener, udp_socket) = lwip::NetStack::with_mtu(cfg.mtu)
+            .map_err(|e| io::Error::other(format!("lwIP netstack: {e}")))?;
         // Publish this generation's done signal so the next stack build
         // gates on it — including the case where this listener is aborted
         // before readiness fires.

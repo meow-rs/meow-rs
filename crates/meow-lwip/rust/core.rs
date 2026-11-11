@@ -468,6 +468,7 @@ impl LwipCore {
     pub(crate) fn build(
         stack_buffer_size: usize,
         udp_buffer_size: usize,
+        mtu: u16,
     ) -> Result<CoreParts, crate::Error> {
         use std::sync::Once;
         static LWIP_INIT: Once = Once::new();
@@ -485,7 +486,10 @@ impl LwipCore {
         unsafe {
             (*netif_list).output = Some(output_ip4);
             (*netif_list).output_ip6 = Some(output_ip6);
-            (*netif_list).mtu = 1500;
+            // Reset stale path-MTU state when a new TUN generation takes over.
+            nd6_cleanup_netif(netif_list);
+            (*netif_list).mtu = mtu;
+            (*netif_list).mtu6 = mtu;
             OUTPUT_PTR = output_ctx;
         }
 
