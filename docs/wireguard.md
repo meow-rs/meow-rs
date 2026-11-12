@@ -259,7 +259,7 @@ listeners:
   port lazily starts listening on it — peers reach whatever they dial,
   like a TUN. New streams get the TUN path's sniff window (SNI/`Host`)
   and are routed by `route_inbound_tcp` with `ConnType::WireGuard`;
-  `GET /connections` reports `metadata.type = "WireGuard"`.
+  `GET /connections` reports `metadata.type = "wireguard"`.
 - **UDP** (when `udp: true`) is routed per-flow through
   `TunnelInner::dial_udp`, keyed on `(peer, inner src, inner dst)` and
   evicted after `udp-timeout`; replies are size-capped at `mtu - 64` and

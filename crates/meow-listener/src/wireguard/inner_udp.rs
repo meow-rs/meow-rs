@@ -20,7 +20,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bytes::Bytes;
 use meow_common::{ConnType, Metadata, Network};
@@ -41,16 +41,13 @@ pub(super) const UDP_FLOW_QUEUE: usize = 64;
 /// answered with ICMP fragmentation-needed (spec §6).
 const DATAGRAM_BUF: usize = 64 * 1024;
 
-/// One inner-UDP flow as the actor sees it — the send half of the
-/// payload queue plus the liveness stamp the idle sweep consults.
+/// One inner-UDP flow as the actor sees it — just the send half of the
+/// payload queue. Idle timing lives entirely in the flow task (its
+/// timer resets on *both* directions), so the actor's only sweep
+/// signal is `tx.is_closed()`: a dead task drops `rx` and the send
+/// half reports closed.
 pub(super) struct UdpFlow {
     pub tx: mpsc::Sender<Bytes>,
-    /// Last client→remote datagram the actor forwarded. The flow task
-    /// additionally self-evicts on its own idle timer (it also counts
-    /// reply traffic), so this is the actor-side pruning aid: a task
-    /// that died closes `tx`, and a stale `last_active` with a still-
-    /// live `tx` (idle timer granularity) gets swept on the next tick.
-    pub last_active: Instant,
 }
 
 /// Flow-table key: the peer namespace is part of the key, so two peers

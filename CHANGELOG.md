@@ -25,7 +25,7 @@ the canonical, in-repo source a release is cut from.
   roaming on authenticated datagrams, `allowed-ips` inner-source ACLs
   (v4/v6), optional `preshared-key` and WARP-style `reserved` bytes. Inner
   TCP terminates in a lazy smoltcp AnyIP listen pool and routes through
-  `route_inbound_tcp` (`metadata.type = "WireGuard"`, SNI/`Host` sniffing);
+  `route_inbound_tcp` (`metadata.type = "wireguard"`, SNI/`Host` sniffing);
   inner UDP routes per-flow through `dial_udp` keyed on
   `(peer, inner src, inner dst)` with `udp-timeout` eviction and `mtu - 64`
   reply caps. `udp`, `udp-timeout` and `max-connections` follow the TUN

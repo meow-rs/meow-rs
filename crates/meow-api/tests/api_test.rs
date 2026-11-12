@@ -5056,9 +5056,9 @@ async fn get_connections_entry_has_camel_case_shape() {
     );
 }
 
-/// `ConnType::WireGuard` serialises as the variant name `"WireGuard"` in
-/// `/connections` `metadata.type` — the same serde rule every conn type
-/// follows (mihomo panels match on the CamelCase spellings).
+/// `ConnType::WireGuard` serialises as `"wireguard"` in `/connections`
+/// `metadata.type` — errata U4 pins the lowercase spelling even though
+/// the other conn types keep their CamelCase variant names.
 #[tokio::test]
 async fn get_connections_wireguard_metadata_type() {
     use meow_common::{ConnType, Metadata, Network};
@@ -5090,7 +5090,7 @@ async fn get_connections_wireguard_metadata_type() {
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
     let conn = &json["connections"].as_array().unwrap()[0];
-    assert_eq!(conn["metadata"]["type"], "WireGuard");
+    assert_eq!(conn["metadata"]["type"], "wireguard");
     assert_eq!(conn["metadata"]["network"], "tcp");
 }
 

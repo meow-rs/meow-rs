@@ -84,8 +84,10 @@ pub enum ConnType {
     Inner,
     /// WireGuard inbound listener (`type: wireguard`): an inner TCP/UDP
     /// flow terminated from a WG-encapsulated datagram. Serializes as
-    /// the variant name in `/connections` `metadata.type`, the same rule
-    /// as every variant above — pinned by an API test.
+    /// `"wireguard"` in `/connections` `metadata.type` (errata U4 —
+    /// pinned by an API test); the alias keeps the first shipped
+    /// spelling readable on deserialize.
+    #[serde(rename = "wireguard", alias = "WireGuard")]
     WireGuard,
 }
 

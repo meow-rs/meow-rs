@@ -158,7 +158,7 @@ a UDP reply never stalls the loop).
 - `meow-config` parser matrix in `wireguard_listener_config_test.rs`
   (30 tests): every rejection row, defaults, warns, serde roundtrip,
   key redaction.
-- API: `GET /connections` `metadata.type == "WireGuard"` pinned in
+- API: `GET /connections` `metadata.type == "wireguard"` pinned in
   `api_test.rs`; `GET /listeners` `type=wireguard` falls out of
   `type_name()` for free.
 - CI: the `test.yml` WG leg gains the listener clippy/nextest runs plus

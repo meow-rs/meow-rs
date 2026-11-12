@@ -17,8 +17,9 @@
 //!    segments deliver, emits go to `device.tx_queue`).
 //! 4. `post_poll` — sweep listen-pool entries whose socket left
 //!    `State::Listen` (errata E5: only `Listen` sockets are pool
-//!    occupants) and register fresh flow sockets, recording each
-//!    socket's owning peer from the listener that accepted it.
+//!    occupants) and register fresh flow sockets, resolving each
+//!    socket's owning peer from the `pending_syn` tuple its SYN
+//!    recorded at feed time; then reap ownerless `Closed` sockets.
 //! 5. `drain_device_tx` — every emitted packet's 4-tuple maps back to
 //!    the flow it belongs to, hence to the peer that owns the session
 //!    it encrypts under (a stray RST the demux never matched takes the
@@ -29,7 +30,7 @@
 //! 7. `flush_outbox` — nonblocking sends; a full socket backs off to
 //!    the next pass rather than stalling the loop.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -77,16 +78,24 @@ const IDLE_SLEEP: Duration = Duration::from_millis(50);
 /// the actor). Full → the flow drops its reply (UDP drop semantics).
 const INJECT_QUEUE: usize = 256;
 
+/// Wire outbox bound — on sustained `WouldBlock` (endpoint send buffer
+/// full) the queue drops the *oldest* pending datagram rather than
+/// growing without limit: the same lossy-tail semantics UDP tolerates,
+/// bounded per §10.2's "no unbounded queue" posture.
+const OUTBOX_CAP: usize = 1024;
+
 /// Original-direction inner TCP tuple — `(client_ip, client_port,
 /// target_ip, target_port)` as the peer wrote it. Reply packets reverse
 /// it back to this key, so one map serves both directions.
 type InnerTuple = (IpAddr, u16, IpAddr, u16);
 
 /// One pool occupant: a smoltcp socket parked in `State::Listen` on a
-/// dport, owned by the peer slot whose SYN created it.
+/// `(peer_slot, dport)` key — the requesting peer is part of the key so
+/// same-batch same-dport SYNs from different peers each get a
+/// placeholder (flow ownership itself comes from `pending_syn`, not
+/// from the socket that happened to accept).
 struct ListenEntry {
     handle: smoltcp::iface::SocketHandle,
-    slot: usize,
     created: Instant,
 }
 
@@ -143,22 +152,33 @@ pub(super) struct WgActor {
 
     tcp: HashMap<smoltcp::iface::SocketHandle, TcpFlow>,
     tcp_by_tuple: HashMap<InnerTuple, smoltcp::iface::SocketHandle>,
-    /// ≥ one entry per demanded dport, each tagged with the peer whose
-    /// SYN owns it — the cross-peer ambiguity a shared-per-port pool
-    /// would introduce (a listener can't tell which peer's SYN it
-    /// accepted) is resolved by replacing a still-`Listen` entry when a
-    /// different peer needs the port.
-    listen_pool: HashMap<u16, ListenEntry>,
-    /// The peer a just-created listener belongs to: consumed when its
-    /// socket leaves `Listen` and becomes a flow.
-    listener_owner: HashMap<smoltcp::iface::SocketHandle, usize>,
+    /// ≥ one entry per demanded `(peer_slot, dport)`. A listener
+    /// carries no per-peer state — `accepts()` matches port only — so
+    /// the flow's real owner is recovered from `pending_syn`, never
+    /// from which placeholder took the SYN.
+    listen_pool: HashMap<(usize, u16), ListenEntry>,
+    /// First-fed-wins `tuple → peer slot` for every unclaimed SYN
+    /// pushed to smoltcp this pass: `post_poll` looks the accepted
+    /// socket's tuple up here to learn the real owning peer (same-dport
+    /// SYNs from two peers in one batch can't be told apart by which
+    /// listener accepted them). Cleared at the end of `post_poll` —
+    /// smoltcp accepts queued SYNs in receive order, so the earliest
+    /// recorded SYN is the one a listener took.
+    pending_syn: HashMap<InnerTuple, usize>,
     /// Reversed-tuple → peer slot for emitted RSTs the demux didn't
     /// match (refused SYNs, strays). Populated at feed time, drained
     /// with `tx_queue`, cleared each pass — the emission is same-poll.
     rst_hint: HashMap<InnerTuple, usize>,
-    /// SYNs fed to smoltcp since the last `post_poll` — the in-flight
-    /// half of the connection cap so a same-batch burst can't overshoot.
-    in_flight_accept: usize,
+    /// `Closed` sockets awaiting removal — deferred one pass so the
+    /// queued RST of a cap-gate abort dispatches before the socket
+    /// leaves the set (removing it at abort time would silently eat
+    /// the refusal).
+    pending_close: Vec<smoltcp::iface::SocketHandle>,
+    /// Tuples whose SYN demanded (and got) a listener since the last
+    /// `post_poll` — the in-flight half of the connection cap so a
+    /// same-batch burst can't overshoot; deduped by tuple so a
+    /// retransmitted SYN can't double-count.
+    in_flight_syns: HashSet<InnerTuple>,
 
     udp_flows: HashMap<UdpFlowKey, UdpFlow>,
     udp_enabled: bool,
@@ -248,9 +268,10 @@ impl WgActor {
             tcp: HashMap::new(),
             tcp_by_tuple: HashMap::new(),
             listen_pool: HashMap::new(),
-            listener_owner: HashMap::new(),
+            pending_syn: HashMap::new(),
             rst_hint: HashMap::new(),
-            in_flight_accept: 0,
+            pending_close: Vec::new(),
+            in_flight_syns: HashSet::new(),
             udp_flows: HashMap::new(),
             udp_enabled: cfg.udp,
             udp_timeout: cfg.udp_timeout,
@@ -398,7 +419,7 @@ impl WgActor {
     /// Fold a demux action into socket/flow work.
     fn apply_action(&mut self, action: Action) {
         match action {
-            Action::ToWire { addr, bytes, .. } => self.outbox.push_back((addr, bytes)),
+            Action::ToWire { addr, bytes, .. } => self.enqueue_outbox(addr, bytes),
             Action::Inner { slot, v6, bytes } => self.handle_inner(slot, &bytes, v6),
         }
     }
@@ -431,15 +452,35 @@ impl WgActor {
             return;
         };
         let key: InnerTuple = (view.src, tcpv.sport, view.dst, tcpv.dport);
-        if tcpv.syn
-            && !tcpv.ack
-            && !self.tcp_by_tuple.contains_key(&key)
-            && !self.at_capacity()
-            && self.ensure_listener(slot, tcpv.dport)
-        {
-            self.in_flight_accept += 1;
+        if let Some(&handle) = self.tcp_by_tuple.get(&key) {
+            // The tuple's owning flow pins the peer: a segment for it
+            // arriving over a *different* peer's session is an
+            // injection — overlapping allowed_ips legitimately lets
+            // two peers claim the same inner addresses, so the demux
+            // alone can't tell them apart. Drop before smoltcp's own
+            // tuple demux feeds it into the victim's socket.
+            if self.tcp.get(&handle).is_none_or(|f| f.slot != slot) {
+                trace!(
+                    "wireguard {}: cross-peer TCP segment on owned tuple {key:?} dropped",
+                    self.name
+                );
+                return;
+            }
         }
-        if !self.tcp_by_tuple.contains_key(&key) {
+        let claimed = self.tcp_by_tuple.contains_key(&key);
+        if tcpv.syn && !tcpv.ack && !claimed {
+            // Record the owner before any listener/capacity decision —
+            // a SYN accepted by *any* placeholder (including a stale
+            // one another peer created) must resolve to the peer that
+            // actually sent it. First-fed wins: smoltcp accepts queued
+            // SYNs in receive order, so the earliest recorded SYN is
+            // the one a listener took.
+            self.pending_syn.entry(key).or_insert(slot);
+            if !self.at_capacity() && self.ensure_listener(slot, tcpv.dport) {
+                self.in_flight_syns.insert(key);
+            }
+        }
+        if !claimed {
             // No flow claims this packet — if smoltcp answers with an
             // RST it carries the reversed tuple, which maps back via
             // this hint to the peer that must encrypt it.
@@ -464,7 +505,6 @@ impl WgActor {
             dst: target,
         };
         if let Some(flow) = self.udp_flows.get_mut(&key) {
-            flow.last_active = Instant::now();
             // Full → UDP drop semantics (bounded queue, same as TProxy).
             let _ = flow.tx.try_send(Bytes::copy_from_slice(payload));
             return;
@@ -492,13 +532,7 @@ impl WgActor {
             }
         });
         let _ = tx.try_send(Bytes::copy_from_slice(payload));
-        self.udp_flows.insert(
-            key,
-            UdpFlow {
-                tx,
-                last_active: Instant::now(),
-            },
-        );
+        self.udp_flows.insert(key, UdpFlow { tx });
     }
 
     /// A flow task's finished inner packet — encrypt under the owning
@@ -511,10 +545,19 @@ impl WgActor {
                     if let Some(addr) = peer.endpoint {
                         let mut buf = b.to_vec();
                         peer.stamp_reserved(&mut buf);
-                        self.outbox.push_back((addr, buf));
+                        self.enqueue_outbox(addr, buf);
                     }
                 }
             }
+        } else {
+            // Unreachable while `work` is MTU-sized — kept as a spec §6
+            // drop+log guard rather than a silent oversize swallow.
+            debug!(
+                "wireguard {}: dropping {}B inject packet (work {}B)",
+                self.name,
+                pkt.len(),
+                work.len()
+            );
         }
         self.work = work;
     }
@@ -524,26 +567,28 @@ impl WgActor {
     /// Combined TCP+UDP cap (`max-connections`; `0` = unlimited).
     fn at_capacity(&self) -> bool {
         self.max_connections > 0
-            && self.tcp.len() + self.in_flight_accept + self.udp_flows.len() >= self.max_connections
+            && self.tcp.len() + self.in_flight_syns.len() + self.udp_flows.len()
+                >= self.max_connections
     }
 
-    /// Ensure a `State::Listen` socket exists for `(slot, dport)` and
-    /// that this peer's SYN owns it. Returns false when the SYN should
-    /// be dropped: the pool is full *and* no `Listen`-state socket is
-    /// evictable (errata E5), or smoltcp refused the listen.
+    /// Ensure a `State::Listen` socket exists for `(slot, dport)`.
+    /// Returns false when the SYN should be dropped: the pool is full
+    /// *and* no `Listen`-state socket is evictable (errata E5), or
+    /// smoltcp refused the listen. The placeholder itself is peer-blind
+    /// — `pending_syn` carries ownership — so a live entry serves the
+    /// same peer again while a different peer's same-dport SYN simply
+    /// gets its own key.
     fn ensure_listener(&mut self, slot: usize, dport: u16) -> bool {
-        if let Some(entry) = self.listen_pool.get(&dport) {
-            let socket = self.sockets.get::<tcp::Socket>(entry.handle);
-            if socket.state() == tcp::State::Listen && entry.slot == slot {
+        if let Some(entry) = self.listen_pool.get(&(slot, dport)) {
+            if self.sockets.get::<tcp::Socket>(entry.handle).state() == tcp::State::Listen {
                 return true;
             }
-            // Stale (already transitioned → it's a flow now) or owned by
-            // a different peer: a still-Listen socket holds no per-peer
-            // state, so replacing it costs nothing and keeps accept
-            // peer-affine.
-            self.sockets.remove(entry.handle);
-            self.listener_owner.remove(&entry.handle);
-            self.listen_pool.remove(&dport);
+            // Stale bookkeeping: the socket already left `Listen` — it
+            // is a flow (or a reaped orphan) owned elsewhere now, so
+            // only the pool entry is ours to drop. The socket itself is
+            // *not* removed here: mid-flight it may be registered this
+            // very pass, and terminating it would kill a live conn.
+            self.listen_pool.remove(&(slot, dport));
         }
         if self.listen_pool.len() >= LISTEN_POOL_CAP && !self.evict_oldest_listener() {
             // Errata E5: nothing Listen-state to evict — the new SYN is
@@ -565,12 +610,10 @@ impl WgActor {
             return false;
         }
         let handle = self.sockets.add(socket);
-        self.listener_owner.insert(handle, slot);
         self.listen_pool.insert(
-            dport,
+            (slot, dport),
             ListenEntry {
                 handle,
-                slot,
                 created: Instant::now(),
             },
         );
@@ -587,29 +630,29 @@ impl WgActor {
                 self.sockets.get::<tcp::Socket>(e.handle).state() == tcp::State::Listen
             })
             .min_by_key(|(_, e)| e.created)
-            .map(|(p, _)| *p);
-        let Some(port) = oldest else {
+            .map(|(k, _)| *k);
+        let Some(key) = oldest else {
             return false;
         };
-        let entry = self.listen_pool.remove(&port).expect("entry checked above");
+        let entry = self.listen_pool.remove(&key).expect("entry checked above");
         self.sockets.remove(entry.handle);
-        self.listener_owner.remove(&entry.handle);
         true
     }
 
     /// After `iface.poll`: listeners that accepted a SYN left the pool
     /// (their socket is now a flow in `SynReceived`+); register fresh
-    /// flow sockets with the owning peer from `listener_owner`.
+    /// flow sockets with the owning peer recovered from `pending_syn`,
+    /// then bury any socket that died with no owner.
     fn post_poll(&mut self) {
-        self.in_flight_accept = 0;
+        self.in_flight_syns.clear();
         let mut stale = Vec::new();
-        for (port, entry) in &self.listen_pool {
+        for (key, entry) in &self.listen_pool {
             if self.sockets.get::<tcp::Socket>(entry.handle).state() != tcp::State::Listen {
-                stale.push(*port);
+                stale.push(*key);
             }
         }
-        for port in stale {
-            self.listen_pool.remove(&port);
+        for key in stale {
+            self.listen_pool.remove(&key);
         }
 
         let mut new_flows = Vec::new();
@@ -630,16 +673,23 @@ impl WgActor {
             }
         }
         for (handle, local, remote) in new_flows {
-            // The listener that accepted this SYN recorded the peer that
-            // created it — the only place peer affinity exists, since a
-            // 4-tuple can't disambiguate overlapping peers.
-            let Some(slot) = self.listener_owner.remove(&handle) else {
+            // The flow's real peer is the one whose SYN the socket
+            // accepted — recorded at feed time, since a placeholder
+            // listener carries no per-peer state and can accept another
+            // peer's same-dport SYN.
+            let key: InnerTuple = (
+                remote.addr.into(),
+                remote.port,
+                local.addr.into(),
+                local.port,
+            );
+            let Some(slot) = self.pending_syn.get(&key).copied() else {
                 // A flow with no recorded owner can't be routed back —
                 // refuse it rather than guess.
                 self.sockets.get_mut::<tcp::Socket>(handle).abort();
                 continue;
             };
-            // Second capacity gate: `inner_tcp`'s `in_flight_accept`
+            // Second capacity gate: `inner_tcp`'s `in_flight_syns`
             // only stops *new listener demand* — a SYN to a port whose
             // listener already exists is accepted by smoltcp no matter
             // how full we are. Refuse it here so `max_connections`
@@ -651,6 +701,54 @@ impl WgActor {
             }
             self.register_tcp_flow(handle, slot, local, remote);
         }
+        self.pending_syn.clear();
+        self.reap_orphaned_sockets();
+    }
+
+    /// Bury sockets that died with no owner — a `!is_open()` socket is
+    /// terminal (`Closed`, or `TimeWait` with nothing left to send
+    /// that could still route), and one that is neither a registered
+    /// flow nor a pool member has nothing left to do once its final
+    /// packets dispatch. Each candidate defers one pass so a queued
+    /// RST (the cap-gate abort's refusal) emits on the intervening
+    /// poll; without this step every refused accept and every same-poll
+    /// teardown orphaned ~512KiB of socket buffers forever.
+    fn reap_orphaned_sockets(&mut self) {
+        // Handles deferred last pass — re-validated because smoltcp
+        // recycles freed slots: a reused handle pointing at a live
+        // socket fails `is_orphan_dead` and is left alone.
+        let pending = std::mem::take(&mut self.pending_close);
+        for handle in pending {
+            if self.is_orphan_dead(handle) {
+                self.sockets.remove(handle);
+            }
+        }
+        for (handle, socket) in self.sockets.iter() {
+            let smoltcp::socket::Socket::Tcp(t) = socket else {
+                continue;
+            };
+            if t.is_open() {
+                continue;
+            }
+            if self.tcp.contains_key(&handle)
+                || self.listen_pool.values().any(|e| e.handle == handle)
+            {
+                continue;
+            }
+            self.pending_close.push(handle);
+        }
+    }
+
+    /// The handle still refers to a dead socket nobody owns — checked
+    /// at removal time, not when it was deferred (see the note on
+    /// handle recycling in [`Self::reap_orphaned_sockets`]).
+    fn is_orphan_dead(&self, handle: smoltcp::iface::SocketHandle) -> bool {
+        if self.tcp.contains_key(&handle) || self.listen_pool.values().any(|e| e.handle == handle) {
+            return false;
+        }
+        self.sockets.iter().any(|(h, s)| {
+            h == handle && matches!(s, smoltcp::socket::Socket::Tcp(t) if !t.is_open())
+        })
     }
 
     /// Channels + table entries for a newly accepted socket. The route
@@ -702,7 +800,7 @@ impl WgActor {
         // Spawns are collected, not run inline: `spawn_route_task`
         // borrows `&self`, which can't happen while the socket borrow
         // below is live.
-        let mut to_spawn: Vec<(usize, WgStream, IpEndpoint, IpEndpoint)> = Vec::new();
+        let mut to_spawn: Vec<(WgStream, IpEndpoint, IpEndpoint)> = Vec::new();
         let wake_tx = self.wake_tx.clone();
         for (handle, st) in &mut self.tcp {
             let socket = self.sockets.get_mut::<tcp::Socket>(*handle);
@@ -732,7 +830,7 @@ impl WgActor {
                     dead.push(*handle);
                     continue;
                 };
-                to_spawn.push((st.slot, stream, local, remote));
+                to_spawn.push((stream, local, remote));
             }
 
             // conn→actor drain (channel disconnect = conn dropped).
@@ -832,8 +930,8 @@ impl WgActor {
         for handle in dead {
             self.remove_tcp_flow(handle);
         }
-        for (slot, stream, local, remote) in to_spawn {
-            self.spawn_route_task(slot, stream, local, remote);
+        for (stream, local, remote) in to_spawn {
+            self.spawn_route_task(stream, local, remote);
         }
     }
 
@@ -841,20 +939,13 @@ impl WgActor {
     /// sniff-window → gather → `sniff_bytes` → `route_inbound_tcp`
     /// shape, with `ConnType::WireGuard` metadata and the listener's
     /// bound port as `in_port`.
-    fn spawn_route_task(
-        &self,
-        slot: usize,
-        mut stream: WgStream,
-        local: IpEndpoint,
-        remote: IpEndpoint,
-    ) {
+    fn spawn_route_task(&self, mut stream: WgStream, local: IpEndpoint, remote: IpEndpoint) {
         let client = SocketAddr::new(remote.addr.into(), remote.port);
         let target = SocketAddr::new(local.addr.into(), local.port);
         let inner = Arc::clone(&self.inner);
         let sniffer = self.sniffer.clone();
         let in_name: Arc<str> = self.name.clone().into();
         let in_port = self.bound_port;
-        let peer_label = self.table.peers()[slot].label.clone();
         self.main_rt.spawn(async move {
             let prefix = match sniff_first_payload(&mut stream).await {
                 Ok(p) => {
@@ -897,18 +988,16 @@ impl WgActor {
                 }
                 rt.sniff_bytes(&prefix, &mut metadata);
             }
-            let _ = peer_label; // diagnostics only; never enters Metadata
             meow_tunnel::tcp::route_inbound_tcp(&inner, &mut stream, metadata, &prefix).await;
         });
     }
 
     /// Remove a dead socket and its bookkeeping — socket handle, flow
-    /// entry, tuple map (and any listener owner entry, defensively).
+    /// entry, tuple map.
     fn remove_tcp_flow(&mut self, handle: smoltcp::iface::SocketHandle) {
         if let Some(st) = self.tcp.remove(&handle) {
             self.tcp_by_tuple.remove(&st.key);
         }
-        self.listener_owner.remove(&handle);
         if self.sockets.iter().any(|(h, _)| h == handle) {
             self.sockets.remove(handle);
         }
@@ -945,7 +1034,7 @@ impl WgActor {
                 };
                 let mut buf = b.to_vec();
                 peer.stamp_reserved(&mut buf);
-                self.outbox.push_back((addr, buf));
+                self.enqueue_outbox(addr, buf);
             }
         }
         self.work = work;
@@ -965,6 +1054,20 @@ impl WgActor {
             .get(&key)
             .and_then(|h| self.tcp.get(h).map(|f| f.slot))
             .or_else(|| self.rst_hint.get(&key).copied())
+    }
+
+    /// Queue a wire datagram, bounded: past [`OUTBOX_CAP`] the oldest
+    /// pending datagram is dropped (newest-wins lossy tail — a stale
+    /// queued packet is worth less than the one that just arrived).
+    fn enqueue_outbox(&mut self, addr: SocketAddr, pkt: Vec<u8>) {
+        if self.outbox.len() >= OUTBOX_CAP {
+            self.outbox.pop_front();
+            trace!(
+                "wireguard {}: outbox full — dropped oldest datagram",
+                self.name
+            );
+        }
+        self.outbox.push_back((addr, pkt));
     }
 
     /// Nonblocking sends; a full socket defers the tail to the next
@@ -989,13 +1092,14 @@ impl WgActor {
 
     // ── UDP flow liveness ────────────────────────────────────────────
 
-    /// Prune dead/idle UDP flows: a task that evicted itself drops its
-    /// `rx`, making `tx` report closed; the liveness stamp catches the
-    /// remainder.
+    /// Prune dead UDP flows: a task that evicted itself drops its `rx`,
+    /// making `tx` report closed. Idle timing is owned entirely by the
+    /// flow task — it resets on client→remote writes *and* relayed
+    /// replies, so a one-direction-idle flow is still legitimately
+    /// alive and must not be actor-swept (the TProxy precedent —
+    /// `tproxy/udp.rs` prunes dead tasks only).
     fn sweep_udp_flows(&mut self) {
-        let timeout = self.udp_timeout;
-        self.udp_flows
-            .retain(|_, flow| !flow.tx.is_closed() && flow.last_active.elapsed() <= timeout);
+        self.udp_flows.retain(|_, flow| !flow.tx.is_closed());
     }
 }
 
@@ -1096,6 +1200,12 @@ mod tests {
     use std::net::Ipv4Addr;
 
     fn test_actor() -> WgActor {
+        test_actor_peers(1)
+    }
+
+    /// An actor whose table has `n` peers — `inner_tcp` takes the slot
+    /// directly, so the peers need only occupy table positions.
+    fn test_actor_peers(n: usize) -> WgActor {
         let resolver = Arc::new(Resolver::new(
             vec![],
             vec![],
@@ -1107,13 +1217,15 @@ mod tests {
         let tunnel = Tunnel::new(resolver);
         let spec = WgListenerSpec {
             private_key: [0x5E; 32],
-            peers: vec![WgPeerSpec {
-                public_key: [0xA0; 32],
-                preshared_key: None,
-                allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
-                name: SmolStr::new(""),
-                reserved: None,
-            }],
+            peers: (0..n)
+                .map(|i| WgPeerSpec {
+                    public_key: [0xA0 + i as u8; 32],
+                    preshared_key: None,
+                    allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
+                    name: SmolStr::new(""),
+                    reserved: None,
+                })
+                .collect(),
             mtu: 1420,
             udp: true,
             udp_timeout: Duration::from_secs(60),
@@ -1130,10 +1242,18 @@ mod tests {
         .expect("actor builds")
     }
 
-    /// A checksummed inner IPv4 SYN `src:sport` → `dst:dport` — smoltcp
-    /// only transitions the listen socket for a packet whose checksums
-    /// verify, so the test builds them for real.
-    fn syn_v4(src: Ipv4Addr, dst: Ipv4Addr, sport: u16, dport: u16) -> Vec<u8> {
+    /// A checksummed inner IPv4 TCP segment `src:sport` → `dst:dport`
+    /// with arbitrary flags — smoltcp only accepts a packet whose
+    /// checksums verify, so the test builds them for real.
+    fn seg_v4(
+        src: Ipv4Addr,
+        dst: Ipv4Addr,
+        sport: u16,
+        dport: u16,
+        seq: u32,
+        ack: u32,
+        flags: u8,
+    ) -> Vec<u8> {
         let mut p = vec![0u8; 40];
         p[0] = 0x45;
         p[2..4].copy_from_slice(&40u16.to_be_bytes());
@@ -1145,9 +1265,10 @@ mod tests {
         p[10..12].copy_from_slice(&ip_sum.to_be_bytes());
         p[20..22].copy_from_slice(&sport.to_be_bytes());
         p[22..24].copy_from_slice(&dport.to_be_bytes());
-        p[24..28].copy_from_slice(&100u32.to_be_bytes()); // seq
+        p[24..28].copy_from_slice(&seq.to_be_bytes());
+        p[28..32].copy_from_slice(&ack.to_be_bytes());
         p[32] = 0x50; // data offset 5
-        p[33] = 0x02; // SYN
+        p[33] = flags;
         p[34..36].copy_from_slice(&0xffffu16.to_be_bytes()); // window
         let mut pseudo = Vec::with_capacity(32);
         pseudo.extend_from_slice(&src.octets());
@@ -1159,6 +1280,27 @@ mod tests {
         let tcp_sum = !inner_udp::checksum_fold(&pseudo);
         p[36..38].copy_from_slice(&tcp_sum.to_be_bytes());
         p
+    }
+
+    /// A checksummed inner IPv4 SYN `src:sport` → `dst:dport`.
+    fn syn_v4(src: Ipv4Addr, dst: Ipv4Addr, sport: u16, dport: u16) -> Vec<u8> {
+        seg_v4(src, dst, sport, dport, 100, 0, 0x02)
+    }
+
+    /// Feed `pkt` through `inner_tcp` as peer `slot` — the feed half of
+    /// a service pass, without wire framing.
+    fn feed_tcp(actor: &mut WgActor, slot: usize, pkt: &[u8]) {
+        let view = parse_inner(pkt, false).expect("test packet parses");
+        actor.inner_tcp(slot, pkt, &view);
+    }
+
+    /// The poll half of a service pass: smoltcp consumes the rx queue,
+    /// then post_poll does registration/cleanup.
+    fn poll_once(actor: &mut WgActor) {
+        actor
+            .iface
+            .poll(SmolInstant::now(), &mut actor.device, &mut actor.sockets);
+        actor.post_poll();
     }
 
     /// `tcp_listen_pool_lazy_alloc`: listeners are created per new
@@ -1182,9 +1324,9 @@ mod tests {
         assert_eq!(actor.listen_pool.len(), LISTEN_POOL_CAP);
         assert!(actor.ensure_listener(0, 65000));
         assert_eq!(actor.listen_pool.len(), LISTEN_POOL_CAP);
-        assert!(actor.listen_pool.contains_key(&65000));
+        assert!(actor.listen_pool.contains_key(&(0, 65000)));
         assert!(
-            !actor.listen_pool.contains_key(&80),
+            !actor.listen_pool.contains_key(&(0, 80)),
             "oldest Listen entry evicted first"
         );
     }
@@ -1230,43 +1372,36 @@ mod tests {
         );
     }
 
-    /// `inner_udp_flow_idle_evict`: the actor-side sweep drops flows
-    /// whose `last_active` passed `udp_timeout` (the task itself also
-    /// self-evicts — this is the pruning aid for a task that wedged).
+    /// M2 — `inner_udp_flow_dead_task_evict`: idle timing belongs to
+    /// the flow task (it resets on client→remote writes *and* relayed
+    /// replies), so the actor sweep must only reap flows whose channel
+    /// died with the task — never a one-direction-idle but live flow.
     #[tokio::test]
-    async fn inner_udp_flow_idle_evict() {
+    async fn inner_udp_flow_dead_task_evict() {
         let mut actor = test_actor();
-        let fresh = UdpFlowKey {
+        let live = UdpFlowKey {
             slot: 0,
             src: "10.0.0.2:1111".parse().unwrap(),
             dst: "8.8.8.8:53".parse().unwrap(),
         };
-        let stale = UdpFlowKey {
+        let dead = UdpFlowKey {
             slot: 0,
             src: "10.0.0.2:2222".parse().unwrap(),
             dst: "1.1.1.1:53".parse().unwrap(),
         };
-        let (tx_fresh, _rx_f) = mpsc::channel(1);
-        let (tx_stale, _rx_s) = mpsc::channel(1);
-        actor.udp_flows.insert(
-            fresh,
-            UdpFlow {
-                tx: tx_fresh,
-                last_active: Instant::now(),
-            },
-        );
-        actor.udp_flows.insert(
-            stale,
-            UdpFlow {
-                tx: tx_stale,
-                last_active: Instant::now() - actor.udp_timeout - Duration::from_secs(1),
-            },
-        );
+        let (tx_live, _rx_live) = mpsc::channel(1);
+        let (tx_dead, rx_dead) = mpsc::channel::<Bytes>(1);
+        drop(rx_dead); // the task exited — its send half reports closed
+        actor.udp_flows.insert(live, UdpFlow { tx: tx_live });
+        actor.udp_flows.insert(dead, UdpFlow { tx: tx_dead });
         actor.sweep_udp_flows();
-        assert!(actor.udp_flows.contains_key(&fresh));
         assert!(
-            !actor.udp_flows.contains_key(&stale),
-            "idle flow swept past udp_timeout"
+            actor.udp_flows.contains_key(&live),
+            "live one-direction-idle flow must not be actor-swept"
+        );
+        assert!(
+            !actor.udp_flows.contains_key(&dead),
+            "dead task's flow is reaped"
         );
     }
 
@@ -1282,13 +1417,7 @@ mod tests {
             dst: "8.8.8.8:53".parse().unwrap(),
         };
         let (tx, _rx) = mpsc::channel(inner_udp::UDP_FLOW_QUEUE);
-        actor.udp_flows.insert(
-            key,
-            UdpFlow {
-                tx,
-                last_active: Instant::now(),
-            },
-        );
+        actor.udp_flows.insert(key, UdpFlow { tx });
         // UDP header src=1111 dst=53 len=8+payload, cksum 0.
         let l4 = {
             let mut b = Vec::with_capacity(8);
@@ -1315,5 +1444,138 @@ mod tests {
             "queue stays bounded — overflow datagrams dropped"
         );
         assert_eq!(actor.udp_flows.len(), 1);
+    }
+
+    // ── u3-review regressions ────────────────────────────────────────
+
+    /// S2 — two peers racing SYNs to the same inner dport inside one
+    /// poll: each accepted flow must be owned by the peer that fed its
+    /// SYN, never by whichever placeholder socket accepted it.
+    #[tokio::test]
+    async fn tcp_same_dport_cross_peer_attribution() {
+        let mut actor = test_actor_peers(2);
+        let target: Ipv4Addr = "203.0.113.9".parse().unwrap();
+        let a: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let b: Ipv4Addr = "10.0.0.3".parse().unwrap();
+        let syn_a = syn_v4(a, target, 40000, 443);
+        let syn_b = syn_v4(b, target, 40001, 443);
+        feed_tcp(&mut actor, 0, &syn_a);
+        feed_tcp(&mut actor, 1, &syn_b);
+        poll_once(&mut actor);
+
+        let h_a = actor.tcp_by_tuple[&(a.into(), 40000, target.into(), 443)];
+        assert_eq!(actor.tcp[&h_a].slot, 0, "A's flow must be owned by peer A");
+        let h_b = actor.tcp_by_tuple[&(b.into(), 40001, target.into(), 443)];
+        assert_eq!(actor.tcp[&h_b].slot, 1, "B's flow must be owned by peer B");
+    }
+
+    /// S3 — an accepted tuple belongs to the peer that opened it: a
+    /// segment for that exact 4-tuple arriving over a *different*
+    /// peer's session is an injection and must never reach smoltcp
+    /// (overlapping `allowed_ips` legitimately shares inner addresses).
+    #[tokio::test]
+    async fn tcp_cross_peer_tuple_injection_dropped() {
+        let mut actor = test_actor_peers(2);
+        let target: Ipv4Addr = "203.0.113.9".parse().unwrap();
+        let a: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        // Peer A opens a flow.
+        let syn = syn_v4(a, target, 40000, 443);
+        feed_tcp(&mut actor, 0, &syn);
+        poll_once(&mut actor);
+        assert_eq!(actor.tcp.len(), 1);
+
+        // Peer B replays A's exact tuple — silently refused.
+        let queued = actor.device.rx_queue.len();
+        let forged = seg_v4(a, target, 40000, 443, 101, 1, 0x10); // ACK
+        feed_tcp(&mut actor, 1, &forged);
+        assert_eq!(
+            actor.device.rx_queue.len(),
+            queued,
+            "cross-peer segment on an owned tuple must not be fed"
+        );
+    }
+
+    /// S1 — a socket closed with no flow/pool ownership must be reaped:
+    /// each cap-gate abort used to orphan ~512KiB of socket buffers
+    /// forever. The refusal RST still gets its dispatch first.
+    #[tokio::test]
+    async fn closed_orphan_sockets_reaped() {
+        let mut actor = test_actor();
+        actor.max_connections = 1;
+        let client: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let target: Ipv4Addr = "203.0.113.9".parse().unwrap();
+
+        for round in 0..4u16 {
+            // A placeholder that never accepts: the fed SYN's checksum
+            // is deliberately broken, so smoltcp drops it and the
+            // socket stays `Listen` while the cap fills elsewhere.
+            let mut bad = syn_v4(client, target, 41000 + round, 443);
+            bad[37] ^= 0xff;
+            feed_tcp(&mut actor, 0, &bad);
+            poll_once(&mut actor);
+
+            // A legit conn on another dport fills the cap.
+            let good = syn_v4(client, target, 42000 + round, 80);
+            feed_tcp(&mut actor, 0, &good);
+            poll_once(&mut actor);
+            assert_eq!(actor.tcp.len(), 1);
+
+            // A valid SYN to the held dport accepts on the stale
+            // listener and is aborted at the cap — an orphaned
+            // `Closed` socket the reaper must bury.
+            let refused = syn_v4(client, target, 43000 + round, 443);
+            feed_tcp(&mut actor, 0, &refused);
+            poll_once(&mut actor);
+            actor.drain_device_tx();
+
+            // Conn churn: the next round starts under the cap again.
+            let h = *actor.tcp.keys().next().expect("one flow live");
+            actor.remove_tcp_flow(h);
+            // One more pass so a deferred removal can land.
+            poll_once(&mut actor);
+        }
+
+        let closed = actor
+            .sockets
+            .iter()
+            .filter(|(_, s)| {
+                matches!(s, smoltcp::socket::Socket::Tcp(t) if t.state() == tcp::State::Closed)
+            })
+            .count();
+        assert!(
+            closed <= 1,
+            "orphaned Closed sockets must be reaped — {closed} still in the set"
+        );
+        assert!(
+            actor.sockets.iter().count() <= 3,
+            "socket set stays bounded — {}",
+            actor.sockets.iter().count()
+        );
+    }
+
+    /// M4 — a retransmitted SYN counts once toward the cap: the
+    /// in-flight half of `max_connections` dedups by tuple.
+    #[tokio::test]
+    async fn in_flight_syn_retransmit_dedup() {
+        let mut actor = test_actor();
+        actor.max_connections = 2;
+        let client: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let target: Ipv4Addr = "203.0.113.9".parse().unwrap();
+
+        // The same SYN fed twice (a retransmit) must not double-count.
+        let syn = syn_v4(client, target, 40000, 443);
+        feed_tcp(&mut actor, 0, &syn);
+        feed_tcp(&mut actor, 0, &syn);
+        assert_eq!(actor.listen_pool.len(), 1);
+
+        // A second dport still gets its placeholder — the cap was not
+        // spent on the duplicate.
+        let other = syn_v4(client, target, 40001, 444);
+        feed_tcp(&mut actor, 0, &other);
+        assert_eq!(
+            actor.listen_pool.len(),
+            2,
+            "a retransmitted SYN must not consume the in-flight cap"
+        );
     }
 }

@@ -29,7 +29,7 @@
 //! everything between them so its behaviour is assertable end to end.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use meow_wireguard::noise::handshake::parse_handshake_anon;
@@ -82,11 +82,11 @@ pub(super) struct PeerTable {
     peer_by_pubkey: HashMap<[u8; 32], usize>,
 }
 
-/// The per-peer handshake rate limit a single peer would have gotten on
-/// its own (`PEER_HANDSHAKE_RATE_LIMIT` in boringtun). The listener
-/// shares one limiter across every peer, so the bound scales with the
-/// table size — a large table shouldn't let one loud initiator starve
-/// the socket, and a small one shouldn't lower the per-peer bar either.
+/// The listener-wide handshake rate budget (`PEER_HANDSHAKE_RATE_LIMIT`
+/// in boringtun, unchanged): one shared limiter covers every peer, and
+/// the bound is a flat constant per spec §3.4 — a forged-handshake
+/// flood does not get more room just because the peer table is bigger
+/// (kernel WG's global-limiter semantics).
 const PEER_HANDSHAKE_RATE_LIMIT: u64 = 10;
 
 /// Cookie reply size — mirrors `noise::COOKIE_REPLY_SZ` in the vendored
@@ -108,10 +108,7 @@ impl PeerTable {
         }
         let secret = x25519::StaticSecret::from(cfg.private_key);
         let public = x25519::PublicKey::from(&secret);
-        let limiter = Arc::new(RateLimiter::new(
-            &public,
-            PEER_HANDSHAKE_RATE_LIMIT.saturating_mul(cfg.peers.len().max(1) as u64),
-        ));
+        let limiter = Arc::new(RateLimiter::new(&public, PEER_HANDSHAKE_RATE_LIMIT));
         let mut peers = Vec::with_capacity(cfg.peers.len());
         let mut peer_by_pubkey = HashMap::with_capacity(cfg.peers.len());
         for (index, peer_cfg) in cfg.peers.iter().enumerate() {
@@ -272,12 +269,12 @@ impl PeerTable {
                 self.enqueue_wire(actions, slot, src, b);
                 true
             }
-            TunnResult::WriteToTunnelV4(b, _) => {
-                self.handle_inner(slot, b, false, actions);
+            TunnResult::WriteToTunnelV4(b, src) => {
+                self.handle_inner(slot, b, IpAddr::V4(src), actions);
                 false
             }
-            TunnResult::WriteToTunnelV6(b, _) => {
-                self.handle_inner(slot, b, true, actions);
+            TunnResult::WriteToTunnelV6(b, src) => {
+                self.handle_inner(slot, b, IpAddr::V6(src), actions);
                 false
             }
             // Done carries nothing; Err is an auth/decrypt failure —
@@ -329,24 +326,21 @@ impl PeerTable {
     }
 
     /// The single inner-packet ACL point: emit `Action::Inner` only
-    /// when the packet's source address is inside the owning peer's
-    /// `allowed_ips`. Everything else is a silent drop.
-    fn handle_inner(&mut self, slot: usize, pkt: &[u8], v6: bool, actions: &mut Vec<Action>) {
-        match inner_src_addr(pkt, v6) {
-            Some(src) if self.peers[slot].allows_src(src) => {
-                actions.push(Action::Inner {
-                    slot,
-                    v6,
-                    bytes: pkt.to_vec(),
-                });
-            }
-            Some(src) => {
-                trace!(
-                    "wireguard: peer '{}' inner src {src} outside allowed_ips",
-                    self.peers[slot].label
-                );
-            }
-            None => trace!("wireguard: malformed inner packet from peer '{slot}'"),
+    /// when the packet's source address — already parsed and validated
+    /// by the decapsulator — is inside the owning peer's `allowed_ips`.
+    /// Everything else is a silent drop.
+    fn handle_inner(&mut self, slot: usize, pkt: &[u8], src: IpAddr, actions: &mut Vec<Action>) {
+        if self.peers[slot].allows_src(src) {
+            actions.push(Action::Inner {
+                slot,
+                v6: src.is_ipv6(),
+                bytes: pkt.to_vec(),
+            });
+        } else {
+            trace!(
+                "wireguard: peer '{}' inner src {src} outside allowed_ips",
+                self.peers[slot].label
+            );
         }
     }
 
@@ -356,24 +350,6 @@ impl PeerTable {
         let mut buf = bytes.to_vec();
         self.peers[slot].stamp_reserved(&mut buf);
         actions.push(Action::ToWire { addr, bytes: buf });
-    }
-}
-
-/// The inner packet's source address — what the ACL checks. Kept
-/// byte-level (no smoltcp parse) so the demux stays a pure function of
-/// the packet and usable before the stack's own validation.
-fn inner_src_addr(pkt: &[u8], v6: bool) -> Option<std::net::IpAddr> {
-    if v6 {
-        // IPv6: 8-byte source at offset 8.
-        let src = pkt.get(8..24)?;
-        Some(std::net::IpAddr::V6(std::net::Ipv6Addr::from(
-            <[u8; 16]>::try_from(src).ok()?,
-        )))
-    } else {
-        let src = pkt.get(12..16)?;
-        Some(std::net::IpAddr::V4(std::net::Ipv4Addr::from(
-            <[u8; 4]>::try_from(src).ok()?,
-        )))
     }
 }
 
@@ -937,5 +913,34 @@ mod tests {
             }
         }
         assert!(saw_cookie, "limiter never emitted a cookie reply");
+    }
+
+    /// M1 — the shared handshake budget is a flat
+    /// `PEER_HANDSHAKE_RATE_LIMIT` regardless of peer count (spec
+    /// §3.4: a forged-init flood does not get more room just because
+    /// the table is bigger). With 4 peers a peer-scaled limit would
+    /// be 40 — the budget must trip at 10 anyway.
+    #[test]
+    fn shared_rate_limit_budget_constant() {
+        let mut work = vec![0u8; 4096];
+        let (mut table, server_public, keys) = table_with(4, &["0.0.0.0/0"], None);
+        let mut c0 = client_for(&keys[0].0, &server_public.to_bytes(), 0, None);
+
+        let mut saw_cookie = false;
+        for i in 0..PEER_HANDSHAKE_RATE_LIMIT + 2 {
+            let actions = send_init(&mut c0, &mut table, ENDPOINT_A, &mut work, true);
+            if let [Action::ToWire { bytes, .. }] = &actions[..] {
+                if bytes.first() == Some(&3) {
+                    saw_cookie = true;
+                }
+            } else {
+                panic!("init {i}: unexpected {actions:?}");
+            }
+        }
+        assert!(
+            saw_cookie,
+            "the global budget must not scale with peer count — \
+             a {PEER_HANDSHAKE_RATE_LIMIT}-init flood already sheds load"
+        );
     }
 }

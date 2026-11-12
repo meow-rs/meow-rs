@@ -1676,8 +1676,8 @@ mod tests {
         device_name_for_attempt, global_route_nets, global_route_nets_for, rotate_v4, rotate_v6,
         sniff_first_payload, Ipv4Addr, Ipv6Net, TunTcpConn, TUN_SNIFF_WINDOW,
     };
-    use crate::stream_sniff::sniff_first_payload_within;
     use super::{timeout, Arc, AtomicBool, Semaphore};
+    use crate::stream_sniff::sniff_first_payload_within;
     use std::io;
     use std::pin::Pin;
     use std::task::{Context, Poll};
