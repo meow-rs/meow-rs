@@ -2018,24 +2018,43 @@ mod tests {
     async fn dns_tcp_bind_failure_rolls_back_udp() {
         // The port must be provably bindable over both protocols before the
         // TCP listener takes it. Windows reserves excluded port ranges per
-        // protocol (Hyper-V/WINNAT) and the two ranges can partition the
-        // ephemeral space, so letting UDP pick the port can fail every TCP
-        // probe — let TCP pick instead (its allocator skips TCP exclusions)
-        // and verify UDP on the same port while the listener still holds
-        // it; the two protocol spaces are independent. The probe then stays
-        // as the occupying listener.
+        // protocol (Hyper-V/WINNAT) — either protocol's allocator can walk
+        // into the other's exclusion band. Alternate which side picks the
+        // :0 port (matching DnsServer::bind()'s mechanism) so both allocators
+        // sample independent counter positions. The kept socket is always a
+        // TcpListener: DnsServer::bind() attempt 0 is UDP-first and tries to
+        // TCP-bind the configured address; an occupied TCP port therefore
+        // trips the rollback path regardless of which arm found the port.
         let mut occupied = None;
         let mut addr = None;
-        for _ in 0..16 {
-            let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let candidate = probe.local_addr().unwrap();
-            if UdpSocket::bind(candidate).await.is_ok() {
-                occupied = Some(probe);
-                addr = Some(candidate);
-                break;
+        'probe: for attempt in 0..16u32 {
+            if attempt % 2 == 0 {
+                // Even: TCP picks, UDP verifies. Keep the TCP listener as the
+                // blocker — DnsServer::bind() attempt 0 (UDP-first) will try
+                // to TCP-bind this port and fail, exercising the rollback path.
+                let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let candidate = probe.local_addr().unwrap();
+                if UdpSocket::bind(candidate).await.is_ok() {
+                    occupied = Some(probe);
+                    addr = Some(candidate);
+                    break 'probe;
+                }
+            } else {
+                // Odd: UDP picks, TCP verifies. Keep the TCP verify listener
+                // (not the UDP pick socket) — same blocker invariant applies.
+                // Cross-protocol independence means dropping the UDP socket
+                // does not affect the TCP listener that holds the port.
+                let probe_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                let candidate = probe_udp.local_addr().unwrap();
+                if let Ok(probe_tcp) = tokio::net::TcpListener::bind(candidate).await {
+                    drop(probe_udp);
+                    occupied = Some(probe_tcp);
+                    addr = Some(candidate);
+                    break 'probe;
+                }
             }
         }
-        let addr = addr.expect("no port bindable over UDP and TCP");
+        let addr = addr.expect("no port bindable over UDP and TCP after 16 alternating attempts");
         let _occupied = occupied.unwrap();
         let server = DnsServer::new(Arc::new(empty_resolver()), addr);
         let result = server.bind().await;
