@@ -337,11 +337,15 @@ jobs:
         run: |
           cargo clippy -p meow-wireguard --all-targets -- -D warnings
           cargo clippy -p meow-proxy --no-default-features --features wireguard --all-targets -- -D warnings
-          # Two-step form: `! tree | grep` masks a cargo failure (grep
-          # exits 1 on empty input → `!` flips it to pass), and so does
-          # $() inside a `!` pipeline. Assign first so -e catches it.
+          # Assign first so bash -e catches a cargo-tree failure. The
+          # assertion must be `if …; then exit 1`, never `! grep …`:
+          # under -e a `!`-inverted status is exempt, so `! grep` mid-
+          # script would print the offending dep and still pass.
           wgdeps="$(cargo tree -p meow-wireguard --edges normal)"
-          ! grep -wE 'ring|ring_compat|aws-lc' <<<"$wgdeps"
+          if grep -wE 'ring|ring_compat|aws-lc' <<<"$wgdeps"; then
+            echo "::error::ring-family dep crept into meow-wireguard"
+            exit 1
+          fi
           # No --lib: tests/wg_vectors.rs (the two-Tunn wire roundtrip) is
           # an integration target a --lib run would silently skip.
           cargo nextest run -p meow-wireguard --retries 2 --no-fail-fast
@@ -354,10 +358,14 @@ jobs:
           # run would silently skip.
           cargo nextest run -p meow-proxy --features wireguard --lib --test wireguard_integration --retries 2 --no-fail-fast
           # `minimal` must not pull the WG stack into its dep tree at all;
-          # grep prints the offending lines on failure. Same two-step
-          # form so a cargo-tree failure cannot masquerade as 0 matches.
+          # grep prints the offending lines on failure. Same `if` form —
+          # positional luck is the only thing that made `! grep` work
+          # here before (last command in the script).
           mindeps="$(cargo tree -p meow-app --no-default-features --features minimal --edges normal)"
-          ! grep -wE 'meow-wireguard|smoltcp' <<<"$mindeps"
+          if grep -wE 'meow-wireguard|smoltcp' <<<"$mindeps"; then
+            echo "::error::minimal feature tree pulled the WG stack"
+            exit 1
+          fi
 
       # The QUIC DNS transports live behind meow-dns's `quic-dns` feature
       # (meow-app's `dns-quic` forwards it, and `full` carries that), so no

@@ -54,18 +54,22 @@ const UDP_WRITE_QUEUE: usize = 128;
 const WAKE_QUEUE: usize = 64;
 
 /// Per-socket smoltcp buffers (rx and tx). The rx half doubles as the
-/// advertised TCP window, so per-flow throughput caps at
-/// `TCP_SOCKET_BUF / RTT`: 64 KiB held a 140 ms-RTT path to ~0.5 MB/s
-/// (measured on a real KR↔US peer), 256 KiB lifts the cap to ~1.8 MB/s.
-/// Cost: 2 × 256 KiB eagerly allocated per WG TCP connection.
+/// advertised TCP window — smoltcp negotiates RFC 7323 window scaling in
+/// SYN (`remote_win_shift = log2(capacity) - 16` = 3 here), so per-flow
+/// throughput caps at `TCP_SOCKET_BUF / RTT`: 64 KiB held a 140 ms-RTT
+/// path to ~0.5 MB/s (measured on a real KR↔US peer), 256 KiB lifts the
+/// cap to ~1.8 MB/s. Peers that don't answer with `window_scale` fall
+/// back to the 16-bit wire window (~64 KiB cap) silently. Cost:
+/// 2 × 256 KiB eagerly allocated per WG TCP connection.
 const TCP_SOCKET_BUF: usize = 256 * 1024;
 /// smoltcp UDP packet buffer: packet slots and payload arena.
 const UDP_SOCKET_PACKETS: usize = 64;
 const UDP_SOCKET_BYTES: usize = 65536;
 
-/// Read chunk handed to `socket.recv`. 16 KiB per channel item fills a
-/// relay's 64 KiB ReadBuf in ~4 channel hops instead of 16, without
-/// letting one socket monopolise a service pass.
+/// Read chunk handed to `socket.recv`. One 16 KiB item drains through a
+/// relay's bulk-tier 32 KiB ReadBuf in ~2 channel hops (or four 4 KiB
+/// hops before the bulk upgrade) instead of four times as many 4 KiB
+/// items, without letting one socket monopolise a service pass.
 const TCP_READ_CHUNK: usize = 16384;
 
 /// Endpoint→Tunn drain bound per loop iteration; excess waits for the next
@@ -410,6 +414,7 @@ impl WgPump {
         // self` freely — same pattern as `self.work`, restored below.
         // Zero alloc, zero copy per inbound datagram.
         let mut pkt_in = std::mem::take(&mut self.recv_buf);
+        debug_assert!(n <= pkt_in.len(), "n is a byte count read into this buffer");
         // WG header bytes 1..4 are reserved-zero on the wire — but peers
         // like Cloudflare WARP stamp non-zero identifiers there, and
         // vendored boringtun's `parse_incoming_packet` checks type and
@@ -1531,6 +1536,10 @@ mod tests {
         // datagram and the outbox stays empty.
         assert_eq!(pump.outbox.len(), 1, "handshake response queued");
         assert_eq!(pump.outbox[0][0], 2, "response is a WG handshake response");
+        // The taken recv_buf must be restored — an empty buffer left
+        // behind would make every later endpoint.recv/try_recv a 0-byte
+        // read.
+        assert!(!pump.recv_buf.is_empty(), "recv_buf restored after take");
     }
 
     /// smoltcp clears a socket's `tuple` the moment its terminal RST is
