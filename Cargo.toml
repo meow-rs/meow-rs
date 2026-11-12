@@ -6,6 +6,7 @@ members = [
     "crates/meow-anytls",
     "crates/meow-lwip",
     "crates/meow-wireguard",
+    "crates/meow-wgstack",
     "crates/meow-dns",
     "crates/meow-rules",
     "crates/meow-transport",
@@ -299,6 +300,10 @@ meow-anytls = { path = "crates/meow-anytls", version = "0.29.0" }
 # Vendored boringtun 0.7.1 noise module (ring replaced by RustCrypto);
 # optional, pulled in only by meow-proxy's `wireguard` feature (#899).
 meow-wireguard = { path = "crates/meow-wireguard", version = "0.29.0" }
+# Shared smoltcp/tokio plumbing for the WG outbound pump and the WG
+# inbound listener; optional, pulled in only by `wireguard`-family
+# features.
+meow-wgstack = { path = "crates/meow-wgstack", version = "0.29.0" }
 meow-dns = { path = "crates/meow-dns", version = "0.29.0", default-features = false }
 meow-rules = { path = "crates/meow-rules", version = "0.29.0" }
 # default-features = false so each consumer names the layers it needs

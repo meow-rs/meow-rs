@@ -2776,6 +2776,7 @@ dependencies = [
  "meow-dns",
  "meow-transport",
  "meow-trie",
+ "meow-wgstack",
  "meow-wireguard",
  "ml-kem",
  "parking_lot",
@@ -2907,6 +2908,19 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "meow-wgstack"
+version = "0.29.0"
+dependencies = [
+ "bytes",
+ "libc",
+ "meow-common",
+ "smoltcp",
+ "socket2 0.5.10",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

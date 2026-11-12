@@ -1,0 +1,32 @@
+# Shared userspace plumbing for WireGuard peers (#899 outbound pump, WG
+# inbound listener): the channel-backed smoltcp `Device`, the per-conn
+# stream shim, their queue/buffer constants, and the endpoint-socket
+# SO_RCVBUF enlarger. Deliberately free of `meow-wireguard` — the boringtun
+# `Tunn` stays owned by the caller's actor.
+[package]
+name = "meow-wgstack"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Shared smoltcp/tokio plumbing for the meow-rs WireGuard outbound pump and inbound listener."
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+# `ProxyConn` is implemented for `WgStream` here — the trait is
+# meow-common's, so the impl cannot live in a downstream crate (orphan
+# rule). Same meow-common edge meow-anytls already carries.
+meow-common = { workspace = true }
+smoltcp = { workspace = true }
+tokio = { version = "1", features = ["net", "sync"] }
+bytes = { workspace = true }
+tracing = { workspace = true }
+socket2 = { workspace = true }
+
+# `force_recv_buffer` (SO_RCVBUFFORCE inside `enlarge_recv_buffer`).
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+libc = "0.2"
+
+[lints]
+workspace = true
