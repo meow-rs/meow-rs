@@ -1931,9 +1931,9 @@ fn reject_nonzero_hy2_option(
 /// - `ip`/`ipv6` that is neither an address nor a CIDR of that family.
 /// - an `allowed-ips` entry that is not a CIDR.
 /// - `reserved` that is not a 3-element list or base64 → 3 bytes.
-/// - `mtu` outside 640–9000 (the spec's 576–9000 outer range, tightened
-///   so the inner IP MTU — `mtu - 64` WG overhead — never falls below
-///   576; [`WireGuardAdapter::new`] keeps the same floor as a backstop).
+/// - `mtu` outside 640–9000 (the floor keeps the inner IP MTU —
+///   `mtu - 64` WG overhead — at or above the 576 IPv4 minimum;
+///   `WireGuardAdapter::new` keeps the same floor as a backstop).
 /// - `ip-stack` other than `"gvisor"`/`"system"`.
 ///
 /// Phase-1 accepts-but-ignores: `dns` (warns once; `remote-dns-resolve`

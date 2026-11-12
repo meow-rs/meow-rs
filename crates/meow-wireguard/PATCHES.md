@@ -28,11 +28,14 @@ Patch 1 — Rewrite Cargo.toml (deps)
                              workspace versions
               portable-atomic "1" + fallback
               libc           "0.2" (needed by Patch 9)
-  Add:     [lib] crate-type = ["rlib"], publish = false,
-           [lints] workspace = true,
+  Add:     [lints] workspace = true,
            feature `mock-instant = []` (empty — see Patch 8),
            subtle "2" (crypto.rs facade dep — see Patch 13 note on
-           constant_time_eq)
+           constant_time_eq), hmac (see Patch 13), and the publishable-
+           crate metadata (description/license/repository/homepage/
+           readme) — the crate is published under the `meow-` name like
+           meow-anytls/meow-lwip so meow-proxy's optional `wireguard`
+           feature resolves from crates.io; do not add `publish=false`
 
 Patch 2 — Replace ring AEAD in handshake.rs
   File: src/noise/handshake.rs

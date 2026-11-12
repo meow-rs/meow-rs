@@ -602,9 +602,9 @@ mod tests {
     use super::*;
     use rand_core::{OsRng, RngCore};
 
-    /// Serializes tests that advance the process-global mock clock — or
-    /// whose asserts depend on a clock-sensitive intermediate state.
-    /// Otherwise one test's `MockClock::advance` can land inside a
+    /// PATCH(14): serializes tests that advance the process-global mock
+    /// clock — or whose asserts depend on a clock-sensitive intermediate
+    /// state. Otherwise one test's `MockClock::advance` can land inside a
     /// sibling's in-flight `InitSent` window and push it past
     /// REKEY_ATTEMPT_TIME: `new_handshake_after_two_mins`'s +120s made
     /// `handshake_no_resp_rekey_timeout` fail intermittently under
@@ -742,6 +742,10 @@ mod tests {
 
     #[test]
     fn full_handshake_plus_timers() {
+        // Asserts on a clock-sensitive intermediate state (`Done` holds
+        // only while no timer has fired): hold the lock so a sibling's
+        // `MockClock::advance` cannot land mid-test.
+        let _clock = TIMER_CLOCK_LOCK.lock();
         let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
         // Time has not yet advanced so their is nothing to do
         assert!(matches!(my_tun.update_timers(&mut []), TunnResult::Done));

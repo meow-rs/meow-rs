@@ -191,8 +191,8 @@ dialer.
 ## Known limitations (Phase-1)
 
 - **No AmneziaWG.** `amnezia-wg-option` on a node is a hard parse error
-  ("amnezia-wg is not supported in this build"); the obfuscation fields
-  and the `<b>`/`<t>`/`<r>` DSL are planned for Phase-3.
+  (`'amnezia-wg-option' is not supported in this build`); the obfuscation
+  fields and the `<b>`/`<t>`/`<r>` DSL are planned for Phase-3.
 - **No `dialer-proxy` on the node** — a hard parse error at load
   (`reject_unthreaded_dialer`): the WG transport owns its UDP endpoint
   socket and cannot be carried over a TCP dialer. A `wireguard` node
@@ -223,8 +223,9 @@ dialer.
 The WireGuard implementation is a **vendored fork of
 [`boringtun`](https://github.com/cloudflare/boringtun) 0.7.1**
 (BSD-3-Clause, Cloudflare), carried in-tree as `crates/meow-wireguard`
-(`publish = false`; the in-crate `LICENSE` and `UPSTREAM` files record
-provenance). `ring` is removed — its AEAD and constant-time-equality
+(published under the `meow-` name like `meow-anytls`/`meow-lwip` so
+`meow-proxy`'s optional `wireguard` feature resolves from crates.io; the
+in-crate `LICENSE` and `UPSTREAM` files record provenance). `ring` is removed — its AEAD and constant-time-equality
 call sites are patched onto the workspace's RustCrypto crates
 (`x25519-dalek`, `blake2`, `chacha20poly1305`), and each replacement is
 enumerated in `crates/meow-wireguard/PATCHES.md` for replay on future

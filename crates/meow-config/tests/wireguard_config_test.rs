@@ -352,10 +352,10 @@ mod enabled {
 
     #[test]
     fn mtu_and_keepalive_bounds() {
-        // The parser enforces 640–9000 itself — the spec's 576–9000 outer
-        // range tightened so the inner IP MTU (`mtu` − 64 WG overhead)
-        // never drops below 576; the adapter's identical check is now an
-        // unreachable backstop.
+        // The parser enforces 640–9000 itself — the floor keeps the inner
+        // IP MTU (`mtu` − 64 WG overhead) at or above the 576 IPv4
+        // minimum; the adapter's identical check is now an unreachable
+        // backstop.
         for extra in [
             "mtu: 575\n",
             "mtu: 576\n",

@@ -325,7 +325,8 @@ proxies:
 | `dialer-proxy` on the node | Field accepted by the outbound schema | Hard parse error — the WG transport owns its UDP endpoint socket and cannot ride a TCP dialer. |
 | `dns` | Per-node tunnel DNS list | Accepted but ignored, warn-once — `remote-dns-resolve` covers tunnel-side resolution (per-node DNS is Phase-2). |
 | `ip-stack: system` | Kernel WG stack | Warn-once, then runs smoltcp anyway — no kernel WG mode in Phase-1. |
-| `mtu` | Documented range 576–9000 | Enforced range 640–9000 — the smoltcp inner MTU (`mtu − 64` WG overhead) must stay ≥ 576. |
+| `mtu` | No bound enforced (default `1408`) | Enforced range 640–9000, default `1420` — the smoltcp inner MTU (`mtu − 64` WG overhead) must stay ≥ 576. |
+| `udp` / `remote-dns-resolve` | Default `false` | Default `true` — UDP relay and tunnel-side DNS resolution are on unless disabled. |
 | `type: wireguard` without the feature | n/a | Parse error naming the `wireguard` feature — same contract as `anytls`. |
 
 ### Not supported in the default app build
