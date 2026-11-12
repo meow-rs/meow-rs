@@ -147,6 +147,17 @@ struct TcpState {
     graceful_close: bool,
 }
 
+impl Drop for TcpState {
+    /// A `WgStream` parked on a full write channel waits on
+    /// `drain_notify` — dropping the state without waking it would pin
+    /// the conn task forever (the channel-close wake in
+    /// `WgStream::poll_write_wait` is the second safety net). Fire all
+    /// waiters so the writer's next `try_send` sees `Closed` and exits.
+    fn drop(&mut self) {
+        self.drain_notify.notify_waiters();
+    }
+}
+
 struct UdpState {
     read_tx: mpsc::Sender<(Bytes, SocketAddr)>,
     write_rx: mpsc::Receiver<UdpIo>,
@@ -656,19 +667,30 @@ impl WgPump {
                 }
             }
 
-            // ── conn→pump drain (channel disconnect = conn dropped) ─
-            let mut conn_gone = false;
-            loop {
+            // ── conn→pump drain (channel disconnect = conn dropped),
+            // gated on `out` headroom: once the backlog reaches
+            // TCP_WRITE_QUEUE the channel itself must be the stall
+            // point — draining it regardless moved the bound into an
+            // unbounded VecDeque, letting a stalled socket
+            // (`can_send()` = false on a full tx window) grow `out`
+            // forever while the writer never saw `Full`.
+            while st.out.len() < TCP_WRITE_QUEUE {
                 match st.write_rx.try_recv() {
                     Ok(io) => st.out.push_back(io),
-                    Err(mpsc::error::TryRecvError::Empty) => break,
-                    Err(mpsc::error::TryRecvError::Disconnected) => {
-                        conn_gone = true;
-                        break;
-                    }
+                    Err(_) => break,
                 }
             }
-            if conn_gone && !st.graceful_close {
+            // `is_closed` + `is_empty`, not the drain's `Disconnected`:
+            // a conn that dropped while `out` sat at the cap never
+            // surfaces `Disconnected` to a capped drain — and the
+            // emptiness check keeps `Close` ordered behind whatever
+            // the channel already held. The back-of-queue dedup stops
+            // a still-closed channel pushing one `Close` per pass.
+            let conn_gone = st.write_rx.is_closed() && st.write_rx.is_empty();
+            if conn_gone
+                && !st.graceful_close
+                && !matches!(st.out.back(), Some(TcpIo::Close | TcpIo::Shutdown))
+            {
                 debug!("wireguard {}: TCP {handle:?} conn_gone → Close", self.name);
                 st.out.push_back(TcpIo::Close);
             }
@@ -846,7 +868,8 @@ impl WgPump {
                 // peer-RST path — the one place the port must not leak.
                 self.used_ports.remove(&st.local_port);
                 self.sockets.remove(handle);
-                if let Some(p) = st.pending {
+                let mut st = st;
+                if let Some(p) = st.pending.take() {
                     let _ = p.reply.send(Err(MeowError::Proxy(format!(
                         "wireguard {}: connect aborted",
                         self.name

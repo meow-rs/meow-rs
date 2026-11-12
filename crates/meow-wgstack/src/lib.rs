@@ -187,6 +187,27 @@ impl WgStream {
     fn nudge(&self) {
         let _ = self.wake.try_send(());
     }
+
+    /// The two wake sources a full-channel park must wait on: the
+    /// actor's drain notification *and* the channel's close. The
+    /// second arm is what un-parks a writer whose flow died while it
+    /// waited — a dropped `write_rx` never fires `drain_notify` again,
+    /// and without it the route task would stay pinned forever (holding
+    /// the stream and the remote conn). Polling both registers the
+    /// waker with either.
+    ///
+    /// `Ready(true)` = retry the send; `Ready(false)` = channel gone.
+    fn poll_write_wait(&mut self, cx: &mut Context<'_>) -> Poll<bool> {
+        let mut notified = std::pin::pin!(self.drain_notify.notified());
+        if notified.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(true);
+        }
+        let mut closed = std::pin::pin!(self.tx.closed());
+        if closed.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(false);
+        }
+        Poll::Pending
+    }
 }
 
 impl Drop for WgStream {
@@ -256,12 +277,16 @@ impl AsyncWrite for WgStream {
                     Ok(()) => continue,
                     Err(mpsc::error::TrySendError::Full(item)) => {
                         self.pending_write = Some(item);
-                        // Park on the actor's drain notification. `Notify`
+                        // Park on the actor's drain notification — or the
+                        // channel's close (see `poll_write_wait`). `Notify`
                         // stores one permit, so a drain between try_send
                         // and this poll is not missed.
-                        let mut notified = std::pin::pin!(self.drain_notify.notified());
-                        match notified.as_mut().poll(cx) {
-                            Poll::Ready(()) => continue,
+                        match self.poll_write_wait(cx) {
+                            Poll::Ready(true) => continue,
+                            Poll::Ready(false) => {
+                                self.write_done = true;
+                                return Poll::Ready(Err(stream_broken()));
+                            }
                             Poll::Pending => return Poll::Pending,
                         }
                     }
@@ -313,9 +338,12 @@ impl AsyncWrite for WgStream {
                 }
                 Err(mpsc::error::TrySendError::Full(item)) => {
                     self.pending_write = Some(item);
-                    let mut notified = std::pin::pin!(self.drain_notify.notified());
-                    match notified.as_mut().poll(cx) {
-                        Poll::Ready(()) => continue,
+                    match self.poll_write_wait(cx) {
+                        Poll::Ready(true) => continue,
+                        Poll::Ready(false) => {
+                            self.write_done = true;
+                            return Poll::Ready(Err(stream_broken()));
+                        }
                         Poll::Pending => return Poll::Pending,
                     }
                 }

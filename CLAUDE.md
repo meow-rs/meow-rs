@@ -102,7 +102,7 @@ The `tun:` config section (issue #326, feature `listener-tun`, in the `full` bun
 
 ### WireGuard inbound (responder listener)
 
-`listeners: - type: wireguard` (feature `listener-wireguard`, in `full`, never `minimal`) makes meow a static multi-peer WireGuard *server* — "a TUN carried over WireGuard". Implementation: `meow-listener/src/wireguard/` (`mod.rs` socket + spec, `peer.rs`/`demux.rs` peer table + dispatch, `actor.rs` the single-threaded wire loop + smoltcp AnyIP stack + listen pool, `inner_udp.rs` the per-flow UDP path). One UDP socket per listener; handshake-init datagrams dispatch on the anonymous-decrypted static pubkey, everything else on `receiver_idx >> 8` (each peer's `Tunn` owns a disjoint index namespace). The listener-level `RateLimiter` verifies mac1/cookies before any per-peer work; peers roam on authenticated datagrams only; `allowed-ips` is the inner-source ACL. Inner TCP terminates in a lazy 64-entry smoltcp listen pool and routes through `route_inbound_tcp` (with the shared `stream_sniff` window); inner UDP goes through `TunnelInner::dial_udp` keyed on `(peer, inner src, inner dst)`. `metadata.type` reports `"WireGuard"`. Docs: [docs/wireguard.md](docs/wireguard.md), spec [docs/specs/proxy-wireguard-server.md](docs/specs/proxy-wireguard-server.md).
+`listeners: - type: wireguard` (feature `listener-wireguard`, in `full`, never `minimal`) makes meow a static multi-peer WireGuard *server* — "a TUN carried over WireGuard". Implementation: `meow-listener/src/wireguard/` (`mod.rs` socket + spec, `peer.rs`/`demux.rs` peer table + dispatch, `actor.rs` the single-threaded wire loop + smoltcp AnyIP stack + listen pool, `inner_udp.rs` the per-flow UDP path). One UDP socket per listener; handshake-init datagrams dispatch on the anonymous-decrypted static pubkey, everything else on `receiver_idx >> 8` (each peer's `Tunn` owns a disjoint index namespace). The listener-level `RateLimiter` verifies mac1/cookies before any per-peer work; peers roam only on ACL-admitted inner packets; `allowed-ips` is the inner-source ACL. Inner TCP terminates in a lazy 64-entry smoltcp listen pool and routes through `route_inbound_tcp` (with the shared `stream_sniff` window); inner UDP goes through `TunnelInner::dial_udp` keyed on `(peer, inner src, inner dst)`. `metadata.type` reports `"wireguard"`. Docs: [docs/wireguard.md](docs/wireguard.md), spec [docs/specs/proxy-wireguard-server.md](docs/specs/proxy-wireguard-server.md).
 
 ### Key Patterns
 
@@ -210,7 +210,7 @@ cargo clippy -p meow-wgstack --all-targets -- -D warnings
 cargo tree -p meow-listener --no-default-features --features listener-wireguard --edges normal | grep -wE 'ring|ring_compat|aws-lc'
 cargo tree -p meow-wgstack --edges normal | grep -wE 'ring|ring_compat|aws-lc'
 cargo test -p meow-listener --features listener-wireguard --lib --test wireguard_listener
-cargo test -p meow-config --test wireguard_listener_config_test
+cargo test -p meow-config --features wireguard --test wireguard_listener_config_test
 cargo test -p meow-config --no-default-features --test wireguard_listener_config_test
 
 # The official TrustTunnel test peer is required for the e2e target.

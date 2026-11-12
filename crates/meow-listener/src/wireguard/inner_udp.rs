@@ -247,6 +247,14 @@ pub(super) async fn run_flow(args: FlowArgs, mut rx: mpsc::Receiver<Bytes>) -> R
             }),
         }
     };
+
+    // TProxy `udp_flow` cleanup (udp.rs:261): dropping the JoinHandle
+    // would *detach* the reader — it stays parked on `conn.read_packet`
+    // pinning the task, the conn's upstream session and its 64KiB
+    // buffer until the remote happens to send again. Abort it and
+    // close the conn so every exit path releases the flow fully.
+    reply_task.abort();
+    let _ = conn.close();
     result
 }
 

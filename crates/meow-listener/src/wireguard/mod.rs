@@ -238,3 +238,42 @@ impl Drop for WireGuardListenerGuard {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The hand-rolled `Debug` impls must keep key material out of
+    /// logs — a regression to `#[derive(Debug)]` would print
+    /// `private_key`/`preshared_key` byte arrays. (meow-config pins
+    /// its own copy of this contract; these spec types are a second,
+    /// separate implementation.)
+    #[test]
+    fn spec_debug_redacts_key_material() {
+        let spec = WgListenerSpec {
+            private_key: [0x5E; 32],
+            peers: vec![WgPeerSpec {
+                public_key: [0xA0; 32],
+                preshared_key: Some([0x42; 32]),
+                allowed_ips: vec!["10.0.0.0/8".parse().unwrap()],
+                name: SmolStr::new("peer-a"),
+                reserved: None,
+            }],
+            mtu: 1420,
+            udp: true,
+            udp_timeout: Duration::from_secs(60),
+        };
+        let dbg = format!("{spec:?}");
+        assert!(dbg.contains("[REDACTED]"), "{dbg}");
+        for secret in [[0x5E; 32], [0x42; 32]] {
+            let rendered = format!("{secret:?}");
+            assert!(
+                !dbg.contains(&rendered[..rendered.len() - 4]),
+                "key material leaked into Debug: {dbg}"
+            );
+        }
+        // Non-secret fields still show.
+        assert!(dbg.contains("1420"), "{dbg}");
+        assert!(dbg.contains("peer-a"), "{dbg}");
+    }
+}

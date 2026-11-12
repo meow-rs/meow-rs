@@ -388,7 +388,10 @@ jobs:
             exit 1
           fi
           cargo nextest run -p meow-listener --features listener-wireguard --lib --test wireguard_listener --retries 2 --no-fail-fast
-          cargo nextest run -p meow-config --test wireguard_listener_config_test --retries 2 --no-fail-fast
+          # `--features wireguard`: meow-config's default set excludes it,
+          # and the x25519 self-peer test (`wg_peer_public_key_equal_own_errors`)
+          # compiles only under it — same shape as the outbound leg above.
+          cargo nextest run -p meow-config --features wireguard --test wireguard_listener_config_test --retries 2 --no-fail-fast
           cargo nextest run -p meow-config --no-default-features --test wireguard_listener_config_test --retries 2 --no-fail-fast
 
       # The QUIC DNS transports live behind meow-dns's `quic-dns` feature

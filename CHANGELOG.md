@@ -22,7 +22,7 @@ the canonical, in-repo source a release is cut from.
 - **WireGuard inbound** (`listeners: - type: wireguard`) — meow as a static
   multi-peer WireGuard *server*: authenticated responder handshakes via the
   same vendored boringtun, per-peer `receiver_idx >> 8` demux, endpoint
-  roaming on authenticated datagrams, `allowed-ips` inner-source ACLs
+  roaming on ACL-admitted inner packets, `allowed-ips` inner-source ACLs
   (v4/v6), optional `preshared-key` and WARP-style `reserved` bytes. Inner
   TCP terminates in a lazy smoltcp AnyIP listen pool and routes through
   `route_inbound_tcp` (`metadata.type = "wireguard"`, SNI/`Host` sniffing);

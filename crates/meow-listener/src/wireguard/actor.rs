@@ -121,6 +121,17 @@ struct TcpFlow {
     spawned: bool,
 }
 
+impl Drop for TcpFlow {
+    /// A `WgStream` parked on a full write channel waits on
+    /// `drain_notify` — dropping the flow without waking it would pin
+    /// the route task forever (the channel-close wake in
+    /// `WgStream::poll_write_wait` is the second safety net). Fire all
+    /// waiters so the writer's next `try_send` sees `Closed` and exits.
+    fn drop(&mut self) {
+        self.drain_notify.notify_waiters();
+    }
+}
+
 /// Parsed inner-packet view used by the demux→stack bridge.
 struct InnerView<'a> {
     src: IpAddr,
@@ -173,11 +184,17 @@ pub(super) struct WgActor {
     /// match (refused SYNs, strays). Populated at feed time, drained
     /// with `tx_queue`, cleared each pass — the emission is same-poll.
     rst_hint: HashMap<InnerTuple, usize>,
-    /// `Closed` sockets awaiting removal — deferred one pass so the
-    /// queued RST of a cap-gate abort dispatches before the socket
-    /// leaves the set (removing it at abort time would silently eat
-    /// the refusal).
+    /// `Closed` sockets awaiting removal — deferred one pass so a
+    /// queued RST (a cap-gate abort's refusal, or a conn-dead
+    /// `TcpIo::Close` abort) dispatches before the socket leaves the
+    /// set (removing it at abort time would silently eat the reset).
     pending_close: Vec<smoltcp::iface::SocketHandle>,
+    /// Flows torn down but whose socket is still deferred in
+    /// `pending_close` — `handle → (slot, tuple)` so the abort's RST
+    /// emitted on the deferred pass still routes to the owning peer
+    /// (`route_tx_packet` consults this once `self.tcp` no longer
+    /// holds the flow) and the tuple entry dies with the socket.
+    tcp_dying: HashMap<smoltcp::iface::SocketHandle, (usize, InnerTuple)>,
     /// Tuples whose SYN demanded (and got) a listener since the last
     /// `post_poll` — the in-flight half of the connection cap so a
     /// same-batch burst can't overshoot; deduped by tuple so a
@@ -276,6 +293,7 @@ impl WgActor {
             pending_syn: HashMap::new(),
             rst_hint: HashMap::new(),
             pending_close: Vec::new(),
+            tcp_dying: HashMap::new(),
             in_flight_syns: HashSet::new(),
             udp_flows: HashMap::new(),
             udp_enabled: cfg.udp,
@@ -316,7 +334,13 @@ impl WgActor {
                 r = self.endpoint.recv_from(&mut self.recv_buf) => {
                     match r {
                         Ok((n, src)) => self.demux_one(src, n),
-                        Err(e) => debug!("wireguard {}: endpoint recv error: {e}", self.name),
+                        Err(e) => {
+                            // A persistent socket error would busy-spin
+                            // the loop — back off before retrying (the
+                            // pump's recv-error arm does the same).
+                            debug!("wireguard {}: endpoint recv error: {e}", self.name);
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
                     }
                 }
                 item = self.inject_rx.recv() => {
@@ -336,11 +360,27 @@ impl WgActor {
     /// timers → flush.
     fn service(&mut self) {
         self.drain_wire();
+        self.drain_inject();
         self.service_tcp();
         self.sweep_udp_flows();
         let now = SmolInstant::now();
+        // `post_poll`'s bookkeeping only has work when the poll could
+        // have changed anything it tracks — fresh inner packets fed to
+        // smoltcp, packets emitted (an accept's SYN-ACK), or same-pass
+        // bookkeeping outstanding. A quiet pass skips its O(sockets)
+        // sweeps entirely: no accept, no abort, no orphan can appear
+        // out of nothing (timer-driven deaths of owned flows are
+        // already caught by `service_tcp`'s own iteration).
+        let had_rx = !self.device.rx_queue.is_empty();
         self.iface.poll(now, &mut self.device, &mut self.sockets);
-        self.post_poll();
+        if had_rx
+            || !self.device.tx_queue.is_empty()
+            || !self.pending_syn.is_empty()
+            || !self.in_flight_syns.is_empty()
+            || !self.pending_close.is_empty()
+        {
+            self.post_poll();
+        }
         self.drain_device_tx();
         if self.last_timer.elapsed() >= WG_TIMER_INTERVAL {
             self.last_timer = Instant::now();
@@ -535,7 +575,12 @@ impl WgActor {
             inject_tx: self.inject_tx.clone(),
         };
         // Routing tasks run on the main runtime — the actor's
-        // current-thread rt only ever polls the wire loop.
+        // current-thread rt only ever polls the wire loop. `spawn`
+        // panics if `main_rt` is already mid-shutdown (tokio Handle
+        // semantics): that window only exists during listener teardown
+        // racing an in-flight SYN, and the fallout is a loud "actor
+        // panicked" line at `wait()`, not corrupt state — a deliberate
+        // trade-off over silently dropping a routed flow.
         self.main_rt.spawn(async move {
             if let Err(e) = inner_udp::run_flow(args, rx).await {
                 debug!("wireguard UDP flow {client} -> {target}: {e}");
@@ -543,6 +588,17 @@ impl WgActor {
         });
         let _ = tx.try_send(Bytes::copy_from_slice(payload));
         self.udp_flows.insert(key, UdpFlow { tx });
+    }
+
+    /// Nonblocking batch drain of flow-task replies — mirrors
+    /// `drain_wire`: under a sustained wire flood the `select!` arm
+    /// only ever consumed one inject item per iteration, so a backed-up
+    /// queue starved behind wire datagrams. Bounded by the inject
+    /// channel's own capacity.
+    fn drain_inject(&mut self) {
+        while let Ok((slot, pkt)) = self.inject_rx.try_recv() {
+            self.handle_inject(slot, &pkt);
+        }
     }
 
     /// A flow task's finished inner packet — encrypt under the owning
@@ -748,6 +804,11 @@ impl WgActor {
         for handle in pending {
             if self.is_orphan_dead(handle) {
                 self.sockets.remove(handle);
+                // A deferred conn-dead flow dies with its socket —
+                // its RST already dispatched on the intervening poll.
+                if let Some((_, key)) = self.tcp_dying.remove(&handle) {
+                    self.tcp_by_tuple.remove(&key);
+                }
             }
         }
         for (handle, socket) in self.sockets.iter() {
@@ -858,19 +919,29 @@ impl WgActor {
                 to_spawn.push((stream, local, remote));
             }
 
-            // conn→actor drain (channel disconnect = conn dropped).
-            let mut conn_gone = false;
-            loop {
+            // conn→actor drain, gated on `out` headroom: once the
+            // backlog reaches TCP_WRITE_QUEUE the channel itself must
+            // be the stall point — draining it regardless moved the
+            // bound into an unbounded VecDeque, letting a stalled
+            // socket (`can_send()` = false on a full tx window) grow
+            // `out` forever while the writer never saw `Full`.
+            while st.out.len() < TCP_WRITE_QUEUE {
                 match st.write_rx.try_recv() {
                     Ok(io) => st.out.push_back(io),
-                    Err(mpsc::error::TryRecvError::Empty) => break,
-                    Err(mpsc::error::TryRecvError::Disconnected) => {
-                        conn_gone = true;
-                        break;
-                    }
+                    Err(_) => break,
                 }
             }
-            if conn_gone && !st.graceful_close {
+            // `is_closed` + `is_empty`, not the drain's `Disconnected`:
+            // a conn that dropped while `out` sat at the cap never
+            // surfaces `Disconnected` to a capped drain — and the
+            // emptiness check keeps `Close` ordered behind whatever
+            // the channel already held. The back-of-queue dedup stops
+            // a still-closed channel pushing one `Close` per pass.
+            let conn_gone = st.write_rx.is_closed() && st.write_rx.is_empty();
+            if conn_gone
+                && !st.graceful_close
+                && !matches!(st.out.back(), Some(TcpIo::Close | TcpIo::Shutdown))
+            {
                 st.out.push_back(TcpIo::Close);
             }
 
@@ -971,6 +1042,9 @@ impl WgActor {
         let sniffer = self.sniffer.clone();
         let in_name: Arc<str> = self.name.clone().into();
         let in_port = self.bound_port;
+        // Same `spawn`-on-shutdown note as `inner_udp`: a mid-teardown
+        // `main_rt` panics the actor thread — teardown noise, not a
+        // correctness hole.
         self.main_rt.spawn(async move {
             let prefix = match sniff_first_payload(&mut stream).await {
                 Ok(p) => {
@@ -1017,13 +1091,19 @@ impl WgActor {
         });
     }
 
-    /// Remove a dead socket and its bookkeeping — socket handle, flow
-    /// entry, tuple map.
+    /// Remove a dead socket's flow bookkeeping — and defer the socket
+    /// itself one pass. A conn-dead `TcpIo::Close` abort queues an RST
+    /// that only dispatches on the *next* `iface.poll`; dropping the
+    /// socket immediately ate it (the cap-gate abort already defers
+    /// through `pending_close` — this aligns the conn-dead path). The
+    /// tuple entry survives in `tcp_dying` so the emitted RST still
+    /// routes to the owning peer, then both die with the socket.
     fn remove_tcp_flow(&mut self, handle: smoltcp::iface::SocketHandle) {
         if let Some(st) = self.tcp.remove(&handle) {
-            self.tcp_by_tuple.remove(&st.key);
-        }
-        if self.sockets.iter().any(|(h, _)| h == handle) {
+            self.tcp_dying.insert(handle, (st.slot, st.key));
+            drop(st); // Drop fires drain_notify for parked writers.
+            self.pending_close.push(handle);
+        } else if self.sockets.iter().any(|(h, _)| h == handle) {
             self.sockets.remove(handle);
         }
     }
@@ -1077,7 +1157,12 @@ impl WgActor {
         let key = (view.dst, t.dport, view.src, t.sport);
         self.tcp_by_tuple
             .get(&key)
-            .and_then(|h| self.tcp.get(h).map(|f| f.slot))
+            .and_then(|h| {
+                self.tcp
+                    .get(h)
+                    .map(|f| f.slot)
+                    .or_else(|| self.tcp_dying.get(h).map(|(slot, _)| *slot))
+            })
             .or_else(|| self.rst_hint.get(&key).copied())
     }
 
@@ -1240,15 +1325,6 @@ mod tests {
     /// An actor whose table has `n` peers — `inner_tcp` takes the slot
     /// directly, so the peers need only occupy table positions.
     fn test_actor_peers(n: usize) -> WgActor {
-        let resolver = Arc::new(Resolver::new(
-            vec![],
-            vec![],
-            meow_common::DnsMode::Normal,
-            DomainTrie::new(),
-            false,
-            true,
-        ));
-        let tunnel = Tunnel::new(resolver);
         let spec = WgListenerSpec {
             private_key: [0x5E; 32],
             peers: (0..n)
@@ -1264,6 +1340,22 @@ mod tests {
             udp: true,
             udp_timeout: Duration::from_secs(60),
         };
+        actor_with_spec(spec)
+    }
+
+    /// An actor built on a caller-supplied spec — needed when a test
+    /// must run real `Tunn` clients (the peer `public_key` has to be a
+    /// derived key, not a byte pattern) or toggle `udp`.
+    fn actor_with_spec(spec: WgListenerSpec) -> WgActor {
+        let resolver = Arc::new(Resolver::new(
+            vec![],
+            vec![],
+            meow_common::DnsMode::Normal,
+            DomainTrie::new(),
+            false,
+            true,
+        ));
+        let tunnel = Tunnel::new(resolver);
         let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         sock.set_nonblocking(true).unwrap();
         let (_tx, rx) = mpsc::channel(1);
@@ -1632,6 +1724,204 @@ mod tests {
             actor.listen_pool.len(),
             2,
             "a retransmitted SYN must not consume the in-flight cap"
+        );
+    }
+
+    // ── prfix2 coverage pins ─────────────────────────────────────────
+
+    /// `parse_inner`'s silent-drop matrix — fragments, truncations and
+    /// version mismatches all return `None`. A first fragment reaching
+    /// the demux would be misread as a UDP/TCP header into a flow.
+    #[test]
+    fn parse_inner_drops_malformed_and_fragments() {
+        // Baseline: a plain v4 UDP datagram parses.
+        let mut pkt = vec![0u8; 28];
+        pkt[0] = 0x45;
+        pkt[2..4].copy_from_slice(&28u16.to_be_bytes());
+        pkt[8] = 64;
+        pkt[9] = 17;
+        pkt[12..16].copy_from_slice(&[10, 0, 0, 1]);
+        pkt[16..20].copy_from_slice(&[10, 0, 0, 2]);
+        assert!(parse_inner(&pkt, false).is_some());
+
+        // v4 MF flag and nonzero fragment offset both drop.
+        let mut frag = pkt.clone();
+        frag[6..8].copy_from_slice(&0x2000u16.to_be_bytes());
+        assert!(parse_inner(&frag, false).is_none(), "v4 MF fragment");
+        frag[6..8].copy_from_slice(&0x0040u16.to_be_bytes());
+        assert!(parse_inner(&frag, false).is_none(), "v4 offset fragment");
+
+        // IHL < 20, header truncated below IHL, wrong version nibble.
+        let mut ihl = pkt.clone();
+        ihl[0] = 0x44;
+        assert!(parse_inner(&ihl, false).is_none(), "ihl < 20");
+        assert!(parse_inner(&pkt[..10], false).is_none(), "short v4 header");
+        let mut ver = pkt.clone();
+        ver[0] = 0x65;
+        assert!(parse_inner(&ver, false).is_none(), "v6 nibble in v4 path");
+
+        // v6 with a fragment header (nexthdr 44) drops; a short packet
+        // or a v4 nibble in the v6 path drops too.
+        let mut v6 = vec![0u8; 48];
+        v6[0] = 0x60;
+        v6[6] = 17;
+        v6[8] = 0xfd;
+        v6[24] = 0xfd;
+        assert!(parse_inner(&v6, true).is_some());
+        v6[6] = 44;
+        assert!(parse_inner(&v6, true).is_none(), "v6 fragment header");
+        assert!(parse_inner(&v6[..30], true).is_none(), "short v6 header");
+        let mut v6v = v6.clone();
+        v6v[0] = 0x45;
+        assert!(parse_inner(&v6v, true).is_none(), "v4 nibble in v6 path");
+
+        // A hop-by-hop chain deeper than the 8-header walk bound stops
+        // walking — it must not surface as TCP/UDP to the demux.
+        let mut deep = vec![0u8; 40 + 9 * 8];
+        deep[0] = 0x60;
+        deep[6] = 0; // hop-by-hop, each 8B header pointing at the next
+        for i in 0..9 {
+            deep[40 + i * 8] = 0;
+            deep[40 + i * 8 + 1] = 0;
+        }
+        let deep_view = parse_inner(&deep, true);
+        assert!(
+            deep_view.is_none_or(|v| v.proto != 6 && v.proto != 17),
+            "an over-deep ext chain must not demux as TCP/UDP"
+        );
+    }
+
+    /// `udp: false` must drop inner UDP datagrams before any flow
+    /// spawns — the `udp_enabled` switch semantics (spawn_listener
+    /// e2e only ever runs `udp: true`).
+    #[tokio::test]
+    async fn udp_disabled_drops_inner_udp() {
+        let mut actor = test_actor();
+        actor.udp_enabled = false;
+        // v4 UDP 10.0.0.2:1111 → 8.8.8.8:53.
+        let mut pkt = vec![0u8; 28];
+        pkt[0] = 0x45;
+        pkt[2..4].copy_from_slice(&28u16.to_be_bytes());
+        pkt[8] = 64;
+        pkt[9] = 17;
+        pkt[12..16].copy_from_slice(&[10, 0, 0, 2]);
+        pkt[16..20].copy_from_slice(&[8, 8, 8, 8]);
+        pkt[20..22].copy_from_slice(&1111u16.to_be_bytes());
+        pkt[22..24].copy_from_slice(&53u16.to_be_bytes());
+        pkt[24..26].copy_from_slice(&8u16.to_be_bytes());
+        actor.handle_inner(0, &pkt, false);
+        assert!(actor.udp_flows.is_empty(), "udp:false must not open a flow");
+
+        // Same packet with udp:true opens the flow — polarity pin.
+        actor.udp_enabled = true;
+        actor.handle_inner(0, &pkt, false);
+        assert_eq!(actor.udp_flows.len(), 1, "udp:true opens the flow");
+    }
+
+    /// `demux_one` scrubs inbound reserved bytes 1..4 *before* the
+    /// demux sees them (a WARP-style stamped init must still process)
+    /// and restores `recv_buf` to full length — a truncated buffer
+    /// would silently cap every later datagram at the last size.
+    #[tokio::test]
+    async fn demux_one_scrubs_reserved_and_restores_buffer() {
+        use meow_wireguard::x25519;
+        let server_secret = x25519::StaticSecret::from([0x5E; 32]);
+        let server_public = x25519::PublicKey::from(&server_secret);
+        let client_secret = x25519::StaticSecret::from([0xA0; 32]);
+        let client_public = x25519::PublicKey::from(&client_secret);
+        let spec = WgListenerSpec {
+            private_key: server_secret.to_bytes(),
+            peers: vec![WgPeerSpec {
+                public_key: client_public.to_bytes(),
+                preshared_key: None,
+                allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
+                name: SmolStr::new(""),
+                reserved: None,
+            }],
+            mtu: 1420,
+            udp: true,
+            udp_timeout: Duration::from_secs(60),
+        };
+        let mut actor = actor_with_spec(spec);
+        let mut client =
+            meow_wireguard::Tunn::new(client_secret, server_public, None, None, 0, None);
+        let mut work = vec![0u8; 4096];
+        let TunnResult::WriteToNetwork(init) = client.format_handshake_initiation(&mut work, false)
+        else {
+            panic!("init formats");
+        };
+        let mut datagram = init.to_vec();
+        // WARP-style stamp over bytes 1..4 — the actor must erase it
+        // before the demux's type/index check.
+        datagram[1..4].copy_from_slice(&[0xAA, 0xBB, 0xCC]);
+        let n = datagram.len();
+        actor.recv_buf[..n].copy_from_slice(&datagram);
+        let src: SocketAddr = "127.0.0.1:51001".parse().unwrap();
+        actor.demux_one(src, n);
+        assert!(
+            matches!(actor.outbox.front(), Some((addr, _)) if *addr == src),
+            "the scrubbed init must produce a handshake response: {:?}",
+            actor.outbox.front()
+        );
+        assert_eq!(
+            actor.recv_buf.len(),
+            1420 + 256,
+            "recv_buf keeps its full length for the next datagram"
+        );
+    }
+
+    /// `OUTBOX_CAP` drop-oldest: past the cap the *oldest* queued
+    /// datagram is evicted, the queue stays bounded, and nothing
+    /// panics — the m4 bounded-outbox pin.
+    #[tokio::test]
+    async fn outbox_cap_drops_oldest() {
+        let mut actor = test_actor();
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        for i in 0..OUTBOX_CAP + 5 {
+            actor.enqueue_outbox(addr, vec![i as u8]);
+        }
+        assert_eq!(actor.outbox.len(), OUTBOX_CAP, "outbox stays bounded");
+        assert_eq!(
+            actor.outbox.front().expect("nonempty").1,
+            vec![5u8],
+            "the oldest entries were evicted"
+        );
+    }
+
+    /// `rst_hint` peer attribution: an unmatched TCP segment triggers
+    /// smoltcp's rst_reply, which must be encrypted under the peer
+    /// whose session fed the segment — a two-peer table makes a
+    /// misroute observable via the outbox destination.
+    #[tokio::test]
+    async fn rst_hint_routes_stray_rst_to_feeding_peer() {
+        let mut actor = test_actor_peers(2);
+        let ep_b: SocketAddr = "192.0.2.1:51002".parse().unwrap();
+        // Peer 1 is the only one with a learned endpoint — a reply
+        // routed to it proves the hint, not the tuple, picked slot 1.
+        actor.table.peers_mut()[1].endpoint = Some(ep_b);
+        // An ACK to a tuple nothing claims — smoltcp answers RST.
+        let seg = seg_v4(
+            "10.0.0.3".parse().unwrap(),
+            "203.0.113.9".parse().unwrap(),
+            41000,
+            9999,
+            1,
+            1,
+            0x10,
+        );
+        feed_tcp(&mut actor, 1, &seg);
+        let now = SmolInstant::now();
+        actor.iface.poll(now, &mut actor.device, &mut actor.sockets);
+        actor.drain_device_tx();
+        assert_eq!(
+            actor.outbox.len(),
+            1,
+            "the stray segment produced one RST: {:?}",
+            actor.outbox
+        );
+        assert_eq!(
+            actor.outbox[0].0, ep_b,
+            "the RST must encrypt under peer 1's session toward its endpoint"
         );
     }
 }

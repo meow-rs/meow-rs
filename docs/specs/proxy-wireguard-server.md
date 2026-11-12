@@ -58,9 +58,9 @@ PeerTable (demux.rs)
       (O(1)); HandshakeResponse / CookieReply / Data:
       receiver_idx >> 8 → peer slot
    3. per-peer Tunn::handle_verified_packet — authenticate+decrypt
-   4. roam — a non-error result on a nonempty datagram re-learns the
-      peer's endpoint
-   5. ACL — inner src IP must be inside peer.allowed_ips, else silent
+   4. ACL — inner src IP must be inside peer.allowed_ips, else silent
+   5. roam — only an ACL-admitted inner packet re-learns the peer's
+      endpoint (handshakes, keepalives, rejected sources do not)
         ▼                                    ▼
    smoltcp Interface (AnyIP)         inner UDP flow table
    lazy (peer,dport) listen pool     (slot, src, dst) keyed
@@ -77,16 +77,20 @@ PeerTable (demux.rs)
   through the low byte, so `receiver_idx >> 8` is an O(1) dispatch and
   the low-byte counter may wrap freely (session ring +
   WrongIndex-checks absorb it).
-- **Roaming.** Endpoints move only on authenticated, non-error,
-  non-empty datagrams — the empty datagrams used to flush boringtun's
-  send queue never re-learn (WG semantics: a valid packet under the
-  session *is* the proof of reachability).
+- **Roaming.** Endpoints move only on an ACL-admitted inner packet —
+  the inner source the peer's `allowed_ips` accepts is the proof of
+  reachability. Handshakes, keepalives and authenticated-but-ACL-
+  rejected datagrams change nothing (a bare handshake's reply already
+  answers its source directly), and the empty datagrams used to flush
+  boringtun's send queue never re-learn.
 - **Reserved bytes.** Inbound datagrams have bytes 1..4 cleared before
   parsing (the vendored parser's strict type-word check is upstream's
   and stays). Outbound datagrams to a peer get that peer's configured
   3-byte `reserved` stamped post-encapsulation.
 - **Rate limiting.** One listener-level `RateLimiter` shared across
-  peers, sized `PEER_HANDSHAKE_RATE_LIMIT × peer count`; the actor calls
+  peers at a flat `PEER_HANDSHAKE_RATE_LIMIT` budget — a forged-init
+  flood gets no more room for a bigger table (kernel WG's global-
+  limiter semantics); the actor calls
   `reset_count()` every ~250 ms timer tick — the limiter's own one-
   second debounce decides the roll (errata E1). Forged MACs, unknown
   peer keys, out-of-range receiver indices and malformed packets are
@@ -100,7 +104,7 @@ PeerTable (demux.rs)
   (errata E5 — a transitioned socket is a flow, never a pool member;
   a fully-transitioned pool refuses new dports). `max_connections`
   counts inner TCP conns + UDP flows together, enforced both at
-  listener demand (`in_flight_accept`) and again at post-poll accept
+  listener demand (`in_flight_syns`) and again at post-poll accept
   time — a SYN to an existing listener's port is accepted by smoltcp
   regardless, then RST-aborted if over cap.
 - **TCP tail.** An `Established` socket becomes a `WgStream`; the route
@@ -140,6 +144,13 @@ bounded: wire drain budget, per-flow TCP read/write queues, UDP payload
 queue (drop-on-full), and the flow→actor inject queue (drop-on-full —
 a UDP reply never stalls the loop).
 
+Sizing note: the smoltcp socket buffers are `TCP_SOCKET_BUF` (256 KiB)
+per direction per connection — ~0.7 MiB committed per active inner TCP
+conn once channel queues fill, plus ≤32 MiB of eager listen-pool
+buffers at the 64-entry cap. That ceiling is the price of the pump's
+full-window throughput constants applied to a multi-conn inbound;
+`max_connections` (default 256) bounds the total commit at ~180 MiB.
+
 ## Tests
 
 - §11.1 unit matrix: receiver-index `>>8` dispatch, pubkey-map hit/miss,
@@ -147,7 +158,7 @@ a UDP reply never stalls the loop).
   authenticated-only roaming, v4/v6 ACLs, PSK on/off, inbound reserved
   clearing, cookie reply under load, listen-pool lazy alloc + E5
   eviction, UDP flow idle eviction + queue-full drop, IPv4/IPv6 reply
-  goldens + checksums + MTU bounds (19 tests across `demux.rs`,
+  goldens + checksums + MTU bounds (34 tests across `demux.rs`,
   `inner_udp.rs`, `actor.rs`).
 - §11.2 integration (`tests/wireguard_listener.rs`): the real
   `WireGuardAdapter` as in-process client over loopback UDP — TCP echo
@@ -156,7 +167,7 @@ a UDP reply never stalls the loop).
   `max_connections` backpressure (RST refusal, survivor unaffected),
   SNI sniff → DOMAIN rule, shutdown drain.
 - `meow-config` parser matrix in `wireguard_listener_config_test.rs`
-  (30 tests): every rejection row, defaults, warns, serde roundtrip,
+  (26 tests): every rejection row, defaults, warns, serde roundtrip,
   key redaction.
 - API: `GET /connections` `metadata.type == "wireguard"` pinned in
   `api_test.rs`; `GET /listeners` `type=wireguard` falls out of

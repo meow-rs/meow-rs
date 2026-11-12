@@ -2542,8 +2542,7 @@ mod tests {
                 udp: true,
                 udp_timeout: std::time::Duration::from_secs(60),
             })),
-            Some("listener-wireguard"),
-            "unconditional until the meow-listener `listener-wireguard` feature exists"
+            (!cfg!(feature = "listener-wireguard")).then_some("listener-wireguard")
         );
     }
 

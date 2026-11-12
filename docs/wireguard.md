@@ -226,7 +226,7 @@ through the same route engine a `tun:` inbound uses. Semantically it is
 "a TUN carried over WireGuard"; the shape follows sing-box's `wireguard`
 inbound. Feature: `listener-wireguard` (meow-app `full`, never
 `minimal`); a build without it reports `needs feature
-'listener-wireguard'` at parse.
+'listener-wireguard'` at config validation.
 
 ```yaml
 listeners:
@@ -253,8 +253,9 @@ listeners:
   dropped (v4 and v6). A peer key may not equal the listener's own
   public key, and duplicates are rejected at parse.
 - **Roaming** follows WireGuard semantics: a peer's remembered endpoint
-  moves to whatever source address an *authenticated* datagram arrives
-  from — forged or replayed packets never re-aim replies.
+  moves to whatever source address an *ACL-admitted inner packet* arrives
+  from — bare handshakes, keepalives, forged or replayed packets never
+  re-aim replies.
 - **TCP** terminates in userspace (smoltcp, AnyIP): the first `SYN` to a
   port lazily starts listening on it — peers reach whatever they dial,
   like a TUN. New streams get the TUN path's sniff window (SNI/`Host`)

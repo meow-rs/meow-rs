@@ -107,6 +107,15 @@ impl PeerTable {
     /// table that would overflow the `receiver_idx` slot namespace —
     /// the config layer already rejects it, so reaching this is a bug.
     pub fn new(cfg: &WgListenerSpec) -> Result<Self, String> {
+        Self::with_limit(cfg, PEER_HANDSHAKE_RATE_LIMIT)
+    }
+
+    /// `new` with the shared limiter budget injectable — used by tests
+    /// that mint hundreds of responder indices in one run: they raise
+    /// the limit so `verify_packet` never sheds into cookie replies
+    /// (a cookie reply echoes the *initiator's* index back and would
+    /// mask the responder-side namespace assertions those tests pin).
+    fn with_limit(cfg: &WgListenerSpec, handshake_rate_limit: u64) -> Result<Self, String> {
         if cfg.peers.len() > MAX_PEERS {
             return Err(format!(
                 "wireguard listener: {} peers exceeds the {}-peer receiver-index namespace",
@@ -116,7 +125,7 @@ impl PeerTable {
         }
         let secret = x25519::StaticSecret::from(cfg.private_key);
         let public = x25519::PublicKey::from(&secret);
-        let limiter = Arc::new(RateLimiter::new(&public, PEER_HANDSHAKE_RATE_LIMIT));
+        let limiter = Arc::new(RateLimiter::new(&public, handshake_rate_limit));
         let mut peers = Vec::with_capacity(cfg.peers.len());
         let mut peer_by_pubkey = HashMap::with_capacity(cfg.peers.len());
         for (index, peer_cfg) in cfg.peers.iter().enumerate() {
@@ -441,6 +450,21 @@ mod tests {
         x25519::PublicKey,
         Vec<(x25519::StaticSecret, x25519::PublicKey)>,
     ) {
+        table_with_limit(n, allowed, psk, PEER_HANDSHAKE_RATE_LIMIT)
+    }
+
+    /// `table_with` with an injectable limiter budget — see
+    /// [`PeerTable::with_limit`].
+    fn table_with_limit(
+        n: usize,
+        allowed: &[&str],
+        psk: Option<[u8; 32]>,
+        limit: u64,
+    ) -> (
+        PeerTable,
+        x25519::PublicKey,
+        Vec<(x25519::StaticSecret, x25519::PublicKey)>,
+    ) {
         let (server_secret, server_public) = keypair(0x5E);
         let mut peers = Vec::new();
         let mut keys = Vec::new();
@@ -457,7 +481,7 @@ mod tests {
             udp_timeout: std::time::Duration::from_secs(60),
         };
         (
-            PeerTable::new(&spec).expect("table builds"),
+            PeerTable::with_limit(&spec, limit).expect("table builds"),
             server_public,
             keys,
         )
@@ -756,11 +780,15 @@ mod tests {
 
     /// `index_namespace_disjoint`: the local indices the responder
     /// mints never leave the peer's `>>8` namespace, even across the
-    /// low-byte wrap (256+ allocations).
+    /// low-byte wrap (256+ allocations). The limiter runs wide open —
+    /// under-load cookie replies echo the *initiator's* index back at
+    /// bytes 4..8, which masked the same `>>8` assertion before (the
+    /// client Tunn was built with `index = slot`, so the echo read
+    /// like a correctly-namespaced responder index).
     #[test]
     fn index_namespace_disjoint() {
         let mut work = vec![0u8; 4096];
-        let (mut table, server_public, keys) = table_with(2, &["0.0.0.0/0"], None);
+        let (mut table, server_public, keys) = table_with_limit(2, &["0.0.0.0/0"], None, u64::MAX);
 
         let mut c0 = client_for(&keys[0].0, &server_public.to_bytes(), 0, None);
         // 260 inits on slot 0 → sender indices 0..259 on the responder,
@@ -770,6 +798,10 @@ mod tests {
             let [Action::ToWire { bytes: resp, .. }] = &actions[..] else {
                 panic!("init {i} produced a response");
             };
+            assert_eq!(
+                resp[0], 2,
+                "init {i}: a cookie reply can't pose as a response"
+            );
             let sender_idx = u32::from_le_bytes(resp[4..8].try_into().unwrap());
             assert_eq!(sender_idx >> 8, 0, "init {i} leaked namespaces");
         }
@@ -779,6 +811,7 @@ mod tests {
         let [Action::ToWire { bytes: resp, .. }] = &actions[..] else {
             panic!("response");
         };
+        assert_eq!(resp[0], 2);
         let sender_idx = u32::from_le_bytes(resp[4..8].try_into().unwrap());
         assert_eq!(sender_idx >> 8, 1);
     }
@@ -973,6 +1006,41 @@ mod tests {
         );
     }
 
+    /// `stamp_reserved`: a peer configured with WARP-style `reserved`
+    /// bytes gets them stamped at bytes 1..4 of *every* wire datagram
+    /// the demux produces — handshake responses included. (The config
+    /// layer already pins `reserved` parsing; this is the wire-level
+    /// contract nothing else covered.)
+    #[test]
+    fn stamp_reserved_on_wire() {
+        let mut work = vec![0u8; 4096];
+        let (server_secret, server_public) = keypair(0x5E);
+        let (csec, cpub) = keypair(0xA0);
+        let reserved = [13u8, 53, 133];
+        let mut peer = peer_spec(cpub.to_bytes(), &["0.0.0.0/0"], None);
+        peer.reserved = Some(reserved);
+        let spec = WgListenerSpec {
+            private_key: server_secret.to_bytes(),
+            peers: vec![peer],
+            mtu: 1420,
+            udp: true,
+            udp_timeout: std::time::Duration::from_secs(60),
+        };
+        let mut table = PeerTable::new(&spec).expect("table builds");
+        let mut c0 = client_for(&csec, &server_public.to_bytes(), 0, None);
+
+        let actions = send_init(&mut c0, &mut table, ENDPOINT_A, &mut work, false);
+        let [Action::ToWire { bytes: resp, .. }] = &actions[..] else {
+            panic!("init produced a response");
+        };
+        assert_eq!(resp[0], 2);
+        assert_eq!(
+            &resp[1..4],
+            &reserved,
+            "reserved field stamped on the response"
+        );
+    }
+
     /// `reserved_zeroed_inbound`: the actor clears bytes 1..4 before
     /// the demux — simulate both halves: a stamped datagram fails as
     /// garbage, the cleared copy processes normally.
@@ -999,6 +1067,39 @@ mod tests {
         init[1..4].fill(0); // actor-side scrub
         let actions = table.process_datagram(ENDPOINT_A, &init, &mut work);
         assert!(matches!(&actions[..], [Action::ToWire { .. }]));
+    }
+
+    /// A cookie reply answers an *unidentified* initiator — it must
+    /// never carry a peer's `reserved` stamp (only `enqueue_wire`
+    /// stamps; the under-load early return deliberately bypasses it).
+    #[test]
+    fn cookie_reply_unstamped() {
+        let mut work = vec![0u8; 4096];
+        let (server_secret, server_public) = keypair(0x5E);
+        let (csec, cpub) = keypair(0xA0);
+        let mut peer = peer_spec(cpub.to_bytes(), &["0.0.0.0/0"], None);
+        peer.reserved = Some([0xAA, 0xBB, 0xCC]);
+        let spec = WgListenerSpec {
+            private_key: server_secret.to_bytes(),
+            peers: vec![peer],
+            mtu: 1420,
+            udp: true,
+            udp_timeout: std::time::Duration::from_secs(60),
+        };
+        let mut table = PeerTable::new(&spec).expect("table builds");
+        let mut c0 = client_for(&csec, &server_public.to_bytes(), 0, None);
+
+        let mut saw_cookie = false;
+        for _ in 0..PEER_HANDSHAKE_RATE_LIMIT + 2 {
+            let actions = send_init(&mut c0, &mut table, ENDPOINT_A, &mut work, true);
+            if let [Action::ToWire { bytes, .. }] = &actions[..] {
+                if bytes.first() == Some(&3) {
+                    assert_eq!(&bytes[1..4], &[0, 0, 0], "cookie replies are never stamped");
+                    saw_cookie = true;
+                }
+            }
+        }
+        assert!(saw_cookie, "limiter never emitted a cookie reply");
     }
 
     /// The shared limiter emits a cookie reply to `src` once the
