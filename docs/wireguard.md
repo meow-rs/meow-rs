@@ -90,7 +90,10 @@ Field notes:
 - **`reserved`** is applied after encapsulation: bytes 1–3 of each
   outbound WireGuard packet header are overwritten with the configured
   bytes before send. Cloudflare WARP requires them; other servers can
-  drop the field.
+  drop the field. Inbound, the same header bytes are *zeroed* before the
+  datagram reaches the vendored noise parser — don't-care receive
+  semantics, so a WARP peer that echoes non-zero identifiers back does
+  not wedge the handshake.
 - **`dns`** is parsed for mihomo config compatibility, stored, and
   ignored — Phase-1 resolves tunnel-side names through the injected
   resolver under `remote-dns-resolve`, not a per-node DNS list. A

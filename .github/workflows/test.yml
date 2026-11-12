@@ -345,7 +345,7 @@ jobs:
           cargo nextest run -p meow-wireguard --features mock-instant --lib --retries 2 --no-fail-fast
           cargo nextest run -p meow-config --features wireguard --test wireguard_config_test --retries 2 --no-fail-fast
           cargo nextest run -p meow-config --no-default-features --test wireguard_config_test --retries 2 --no-fail-fast
-          cargo nextest run -p meow-proxy --features wireguard --test wireguard_integration --retries 2 --no-fail-fast
+          cargo nextest run -p meow-proxy --features wireguard --lib --test wireguard_integration --retries 2 --no-fail-fast
           # `minimal` must not pull the WG stack into its dep tree at all.
           test "$(cargo tree -p meow-app --no-default-features --features minimal --edges normal | grep -cw 'meow-wireguard\|smoltcp')" = 0
 

@@ -189,7 +189,7 @@ cargo test -p meow-wireguard
 cargo test -p meow-wireguard --features mock-instant --lib
 cargo test -p meow-config --features wireguard --test wireguard_config_test
 cargo test -p meow-config --no-default-features --test wireguard_config_test
-cargo test -p meow-proxy --features wireguard --test wireguard_integration
+cargo test -p meow-proxy --features wireguard --lib --test wireguard_integration
 # `minimal` must not pull the WG stack: count must be 0.
 cargo tree -p meow-app --no-default-features --features minimal --edges normal | grep -cw 'meow-wireguard\|smoltcp'
 
