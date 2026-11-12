@@ -43,6 +43,14 @@ mod socks5_udp;
 pub mod tproxy;
 #[cfg(feature = "listener-tun")]
 pub mod tun;
+#[cfg(feature = "listener-wireguard")]
+pub mod wireguard;
+
+/// First-payload sniff window shared by the userspace-stack inbounds
+/// (TUN lwIP, WireGuard smoltcp): the client's opening bytes double as
+/// the relay prefix after a TLS/HTTP sniff pass.
+#[cfg(any(feature = "listener-tun", feature = "listener-wireguard"))]
+pub(crate) mod stream_sniff;
 
 #[cfg(feature = "listener-mixed")]
 pub use mixed::MixedListener;
@@ -55,6 +63,8 @@ pub(crate) mod sniffer_quic;
 pub use tproxy::TProxyListener;
 #[cfg(feature = "listener-tun")]
 pub use tun::{OutboundBinding, TunListener, TunListenerConfig, TunReady, TunRouteScope, TunStack};
+#[cfg(feature = "listener-wireguard")]
+pub use wireguard::{WgListenerSpec, WgPeerSpec, WireGuardListener, WireGuardListenerGuard};
 
 #[cfg(all(
     test,

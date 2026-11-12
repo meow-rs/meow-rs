@@ -109,6 +109,13 @@ lwip-libc-malloc = ["meow-listener/lwip-libc-malloc"]
 # Not in `minimal`: it would take half the room left under that bundle's
 # 8 MiB aarch64 cap (ADR-0007).
 listener-shadowsocks = ["meow-listener/listener-shadowsocks"]
+# WireGuard *inbound* (`listeners: - type: wireguard`): meow is the WG
+# responder over one UDP socket with a static peer table — semantically
+# a TUN inbound carried over WireGuard. Pulls the whole WG feature set
+# (the `wireguard` feature below carries the config-side self-key check
+# and the outbound adapter with it — the inbound needs the same vendored
+# noise crate either way).
+listener-wireguard = ["meow-listener/listener-wireguard", "wireguard"]
 
 # Convenience bundles
 minimal = ["ss", "trojan", "dns-server", "listener-mixed"]
@@ -117,7 +124,7 @@ full = [
     "shadow-tls", "restls", "jls", "gost-plugin",
     "dns-server", "dns-encrypted", "dns-quic",
     "listener-http", "listener-socks5", "listener-tproxy", "listener-mixed", "listener-tun",
-    "listener-shadowsocks",
+    "listener-shadowsocks", "listener-wireguard",
     "logbook",
     "traffic-ledger",
     "public-suffix",
