@@ -39,9 +39,10 @@ use super::config::WireGuardConfig;
 /// Mailbox capacity: a burst of parallel dials stays non-blocking well
 /// beyond realistic fan-out (spec §3.3).
 const ACTOR_MAILBOX: usize = 64;
-/// pump→conn stream events per TCP flow (≈128 × 4 KiB ≈ 512 KiB of read
-/// backpressure per flow before smoltcp's window stalls it).
-const TCP_READ_QUEUE: usize = 128;
+/// pump→conn stream events per TCP flow (≈32 × 16 KiB ≈ 512 KiB of read
+/// backpressure per flow — deeper than the smoltcp socket window so the
+/// relay read side, not the channel, is the stall point).
+const TCP_READ_QUEUE: usize = 32;
 /// conn→pump write items per TCP flow.
 const TCP_WRITE_QUEUE: usize = 64;
 /// pump→conn datagrams per UDP association.
@@ -52,15 +53,20 @@ const UDP_WRITE_QUEUE: usize = 128;
 /// pump sleeping in `select!` services the new work immediately.
 const WAKE_QUEUE: usize = 64;
 
-/// Per-socket smoltcp buffers (rx and tx), spec §3.6.
-const TCP_SOCKET_BUF: usize = 65536;
+/// Per-socket smoltcp buffers (rx and tx). The rx half doubles as the
+/// advertised TCP window, so per-flow throughput caps at
+/// `TCP_SOCKET_BUF / RTT`: 64 KiB held a 140 ms-RTT path to ~0.5 MB/s
+/// (measured on a real KR↔US peer), 256 KiB lifts the cap to ~1.8 MB/s.
+/// Cost: 2 × 256 KiB eagerly allocated per WG TCP connection.
+const TCP_SOCKET_BUF: usize = 256 * 1024;
 /// smoltcp UDP packet buffer: packet slots and payload arena.
 const UDP_SOCKET_PACKETS: usize = 64;
 const UDP_SOCKET_BYTES: usize = 65536;
 
-/// Read chunk handed to `socket.recv` — one MTU-ish slice per item keeps
-/// per-conn queues responsive instead of draining 64 KiB at once.
-const TCP_READ_CHUNK: usize = 4096;
+/// Read chunk handed to `socket.recv`. 16 KiB per channel item fills a
+/// relay's 64 KiB ReadBuf in ~4 channel hops instead of 16, without
+/// letting one socket monopolise a service pass.
+const TCP_READ_CHUNK: usize = 16384;
 
 /// Endpoint→Tunn drain bound per loop iteration; excess waits for the next
 /// wake-up rather than starving the rest of the service pass.
@@ -400,9 +406,10 @@ impl WgPump {
     /// queued behind a handshake (`decapsulate` doc: repeat until the
     /// result is not `WriteToNetwork`).
     fn decapsulate_wire(&mut self, n: usize) {
-        // Copy the datagram out of `self.recv_buf` so the loop body can take
-        // `&mut self` freely; ≤ MTU bytes once per inbound datagram.
-        let mut pkt_in = self.recv_buf[..n].to_vec();
+        // Move the buffer out of `self` so the loop body can take `&mut
+        // self` freely — same pattern as `self.work`, restored below.
+        // Zero alloc, zero copy per inbound datagram.
+        let mut pkt_in = std::mem::take(&mut self.recv_buf);
         // WG header bytes 1..4 are reserved-zero on the wire — but peers
         // like Cloudflare WARP stamp non-zero identifiers there, and
         // vendored boringtun's `parse_incoming_packet` checks type and
@@ -410,10 +417,10 @@ impl WgPump {
         // wholesale. Zero the field on receipt — don't-care semantics,
         // the same treatment mihomo applies for wireguard-go — rather
         // than patching the vendored parser.
-        if pkt_in.len() >= 4 {
+        if n >= 4 {
             pkt_in[1..4].fill(0);
         }
-        let mut datagram: &[u8] = &pkt_in;
+        let mut datagram: &[u8] = &pkt_in[..n];
         let mut work = std::mem::take(&mut self.work);
         loop {
             match self.tunn.decapsulate(None, datagram, &mut work) {
@@ -434,6 +441,7 @@ impl WgPump {
             }
         }
         self.work = work;
+        self.recv_buf = pkt_in;
     }
 
     fn drain_wire(&mut self) {
