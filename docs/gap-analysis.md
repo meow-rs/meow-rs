@@ -43,7 +43,7 @@ Upstream lives in `adapter/outbound/`. Current Rust adapters live in `crates/meo
 | Hysteria v1     | Yes      | No        | **Gap** | Medium priority, QUIC-based |
 | Hysteria2       | Yes      | Yes       | OK      | QUIC via quiche (BoringSSL-native) |
 | TUIC            | Yes      | No        | **Gap** | QUIC-based, medium priority |
-| WireGuard       | Yes      | No        | **Gap** | Upstream uses `wireguard-go`; Rust can use `boringtun` |
+| WireGuard       | Yes      | Yes       | OK      | Userspace client (#899): vendored `boringtun` 0.7.1 with `ring` replaced by RustCrypto, over smoltcp — behind the `wireguard` feature (in `full`, not `minimal`). Phase-1: `dns` accepted-but-ignored, `ip-stack` always smoltcp, `amnezia-wg-option` and `dialer-proxy` hard-rejected. See [wireguard.md](wireguard.md) |
 | SSH             | Yes      | No        | **Gap** | Niche |
 | HTTP (outbound) | Yes      | No        | **Gap** | HTTP CONNECT outbound |
 | SOCKS5 (outbound)| Yes     | No        | **Gap** | SOCKS5 outbound |

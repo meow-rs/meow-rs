@@ -327,6 +327,28 @@ jobs:
           # this scope compiles them with every TrustTunnel transport on.
           cargo nextest run -p meow-config --features trusttunnel-h3 --lib --retries 2 --no-fail-fast
 
+      # WireGuard (issue #899) is opt-in behind `wireguard` (meow-app `full`
+      # only, never `minimal`): the vendored boringtun crate, the smoltcp
+      # pump, the loopback adapter integration and both parser legs compile
+      # only under explicit feature runs. The first two lines pin the crypto
+      # boundary — boringtun's ring backend was replaced by crypto.rs and
+      # must never creep back through a dependency bump.
+      - name: WireGuard opt-in protocol and configuration tests
+        run: |
+          cargo clippy -p meow-wireguard --all-targets -- -D warnings
+          ! cargo tree -p meow-wireguard --edges normal | grep -w ring
+          # No --lib: tests/wg_vectors.rs (the two-Tunn wire roundtrip) is
+          # an integration target a --lib run would silently skip.
+          cargo nextest run -p meow-wireguard --retries 2 --no-fail-fast
+          # `mock-instant` un-gates the vendored rekey/retransmission timer
+          # tests — dead code under every other invocation.
+          cargo nextest run -p meow-wireguard --features mock-instant --lib --retries 2 --no-fail-fast
+          cargo nextest run -p meow-config --features wireguard --test wireguard_config_test --retries 2 --no-fail-fast
+          cargo nextest run -p meow-config --no-default-features --test wireguard_config_test --retries 2 --no-fail-fast
+          cargo nextest run -p meow-proxy --features wireguard --test wireguard_integration --retries 2 --no-fail-fast
+          # `minimal` must not pull the WG stack into its dep tree at all.
+          test "$(cargo tree -p meow-app --no-default-features --features minimal --edges normal | grep -cw 'meow-wireguard\|smoltcp')" = 0
+
       # The QUIC DNS transports live behind meow-dns's `quic-dns` feature
       # (meow-app's `dns-quic` forwards it, and `full` carries that), so no
       # default-features invocation compiles them. The peer is an in-process

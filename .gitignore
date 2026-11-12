@@ -32,3 +32,4 @@ dh_out.json
 website/node_modules
 website/.vitepress/cache
 website/.vitepress/dist
+.spec-inputs/

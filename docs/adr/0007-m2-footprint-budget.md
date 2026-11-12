@@ -468,6 +468,28 @@ Consequences:
   (`--group-features`), keeping the meow-proxy depth-4 leg count at 1788
   instead of 3676.
 
+## Addendum (2026-11-12): WireGuard (Phase-1) — §6 amendment
+
+**Feature**: `wireguard` (meow-proxy, meow-wireguard)
+
+**Measurement plan**: After the feature PR merges, measure stripped aarch64-linux-musl
+release binary with and without `--features wireguard` using:
+```
+cargo build --release --target aarch64-unknown-linux-musl --features full
+strip target/.../meow && wc -c meow
+```
+Compare to the last recorded `default`/`full` baseline in this document.
+
+**Expected delta**: ~400–600 KiB for smoltcp + meow-wireguard (no ring; RustCrypto
+crates already counted in the baseline via SS/snell/hysteria2 deps).
+
+**Budget posture**: If the delta breaches the `full`-profile cap, the amendment
+shall raise the cap by the measured delta rounded up to the nearest 512 KiB, with
+a note that the cap reflects WireGuard's smoltcp stack.
+
+**Minimal posture**: The `minimal` build must remain below its cap. Verified by
+the CI step "minimal build size check" gating on the unchanged minimal cap.
+
 ## References
 
 - `docs/roadmap.md` §M2 items 3 + 5 — pinned by this ADR.

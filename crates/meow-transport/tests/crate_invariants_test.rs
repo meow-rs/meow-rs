@@ -647,6 +647,14 @@ const RAW_SOCKET_ALLOWLIST: &[(&str, &str, usize, &str)] = &[
         1,
         "AF_PACKET ARP frame on an explicit interface; not IP-routed",
     ),
+    (
+        "crates/meow-proxy/src/wireguard/pump.rs",
+        "Socket::new(",
+        2,
+        "smoltcp tcp::Socket/udp::Socket struct constructors — userspace \
+         netstack objects with no fd to bind; the endpoint OS socket is \
+         created via meow_common::bind_udp_for_peer (adapter.rs)",
+    ),
     // A separate process, never inside the engine.
     (
         "crates/meow-cli/src/client.rs",
