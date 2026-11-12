@@ -241,7 +241,7 @@ impl WireGuardAdapter {
     async fn bind_endpoint(&self, addr: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
         let peer = meow_common::canonical_socket_addr(addr);
         let socket = meow_common::bind_udp_for_peer(peer.ip()).await?;
-        enlarge_recv_buffer(&socket);
+        meow_wgstack::enlarge_recv_buffer(&socket);
         let std_sock = socket.into_std()?;
         std_sock.connect(peer)?;
         Ok(std_sock)
@@ -431,53 +431,5 @@ impl ProxyAdapter for WireGuardAdapter {
 
     fn health(&self) -> &ProxyHealth {
         &self.health
-    }
-}
-
-/// One full-window inner-TCP burst lands on this socket as ~`TCP_SOCKET_BUF`
-/// bytes of back-to-back WG datagrams (~280 KB at the current window —
-/// over the 208 KiB Linux default, which would drop the tail of every
-/// saturated burst and cost an inner-TCP retransmit round). 4× absorbs
-/// bursts from a few saturated flows at once; the kernel commits pages
-/// only on use, so asking is cheap.
-const ENDPOINT_RECV_BUFFER: usize = 4 * pump::TCP_SOCKET_BUF;
-
-/// Grow the endpoint socket's `SO_RCVBUF`, best effort — the same
-/// contract as the hysteria2 enlarger: never fatal, halve until the OS
-/// accepts one, floor at a single-burst size. Anything the OS grants
-/// above the unconfigured default is a win.
-fn enlarge_recv_buffer(socket: &tokio::net::UdpSocket) {
-    let sock = socket2::SockRef::from(socket);
-    let mut size = ENDPOINT_RECV_BUFFER;
-    while size >= pump::TCP_SOCKET_BUF && sock.set_recv_buffer_size(size).is_err() {
-        size /= 2;
-    }
-    // getsockopt reports twice the size taken on Linux.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    if sock
-        .recv_buffer_size()
-        .is_ok_and(|got| got < 2 * ENDPOINT_RECV_BUFFER)
-    {
-        force_recv_buffer(socket);
-    }
-    tracing::debug!(size = ?sock.recv_buffer_size(), "wireguard endpoint receive buffer");
-}
-
-/// `SO_RCVBUFFORCE` needs `CAP_NET_ADMIN`, so it fails harmlessly (EPERM)
-/// for an unprivileged meow.
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn force_recv_buffer(socket: &tokio::net::UdpSocket) {
-    use std::os::fd::AsRawFd;
-    let size = ENDPOINT_RECV_BUFFER as libc::c_int;
-    // SAFETY: the socket stays open for the call, and the option value is
-    // a c_int of the size passed.
-    unsafe {
-        libc::setsockopt(
-            socket.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_RCVBUFFORCE,
-            std::ptr::addr_of!(size).cast(),
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
     }
 }
