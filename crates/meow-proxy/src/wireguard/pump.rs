@@ -243,6 +243,13 @@ struct PendingTcp {
 
 struct TcpState {
     pending: Option<PendingTcp>,
+    /// The ephemeral port `dial_tcp` bound this socket to. Kept in state
+    /// because smoltcp clears a socket's `tuple` when its terminal RST is
+    /// processed (peer RST in, or our own abort's RST out): past that
+    /// point `local_endpoint()` is `None` — exactly when dead-socket
+    /// cleanup needs the port back — and reading it there would leak the
+    /// port for good.
+    local_port: u16,
     read_tx: mpsc::Sender<StreamEvent>,
     write_rx: mpsc::Receiver<TcpIo>,
     /// Signalled after the `out` backlog shrinks; a `WgStream` whose
@@ -395,7 +402,17 @@ impl WgPump {
     fn decapsulate_wire(&mut self, n: usize) {
         // Copy the datagram out of `self.recv_buf` so the loop body can take
         // `&mut self` freely; ≤ MTU bytes once per inbound datagram.
-        let pkt_in = self.recv_buf[..n].to_vec();
+        let mut pkt_in = self.recv_buf[..n].to_vec();
+        // WG header bytes 1..4 are reserved-zero on the wire — but peers
+        // like Cloudflare WARP stamp non-zero identifiers there, and
+        // vendored boringtun's `parse_incoming_packet` checks type and
+        // reserved as one LE u32, so an unscrubbed datagram is rejected
+        // wholesale. Zero the field on receipt — don't-care semantics,
+        // the same treatment mihomo applies for wireguard-go — rather
+        // than patching the vendored parser.
+        if pkt_in.len() >= 4 {
+            pkt_in[1..4].fill(0);
+        }
         let mut datagram: &[u8] = &pkt_in;
         let mut work = std::mem::take(&mut self.work);
         loop {
@@ -461,19 +478,53 @@ impl WgPump {
     /// keepalive-deadline is subsumed by it).
     fn tick_timers(&mut self) {
         let mut work = std::mem::take(&mut self.work);
-        if let TunnResult::WriteToNetwork(b) = self.tunn.update_timers(&mut work) {
-            let out = b.to_vec();
-            self.work = work;
-            self.enqueue_wg(&out);
-            // boringtun's contract: packets queued behind the handshake a
-            // rekey just triggered flush via chained empty-datagram
-            // `decapsulate` calls — the same drain loop `decapsulate_wire`
-            // runs for real datagrams. Skipping this drops every inner
-            // packet parked while the old session was rekeying.
-            self.decapsulate_wire(0);
-            return;
+        match self.tunn.update_timers(&mut work) {
+            TunnResult::WriteToNetwork(b) => {
+                self.enqueue_wg(b);
+                self.work = work;
+                // boringtun's contract: packets queued behind the handshake
+                // a rekey just triggered flush via chained empty-datagram
+                // `decapsulate` calls — the same drain loop
+                // `decapsulate_wire` runs for real datagrams. Skipping
+                // this drops every inner packet parked while the old
+                // session was rekeying.
+                self.decapsulate_wire(0);
+            }
+            TunnResult::Err(e) => {
+                // `update_timers` reports `ConnectionExpired` once the
+                // handshake has been `Expired` for good (REKEY_ATTEMPT_TIME
+                // of unanswered initiations, REJECT_AFTER_TIME * 3 of
+                // silence). An `if let` used to drop the error on the
+                // floor and leave a dead session: `encapsulate` kept
+                // queueing inner packets behind a handshake that would
+                // never retry, and every new dial ate the full handshake
+                // timeout. boringtun's own recovery is a forced
+                // initiation — the same call `update_timers` makes on a
+                // rekey timeout (`format_handshake_initiation(dst, true)`)
+                // — which moves the handshake out of `Expired` and starts
+                // a fresh one.
+                warn!(
+                    "wireguard {}: session error {e:?}; forcing re-handshake",
+                    self.name
+                );
+                match self.tunn.format_handshake_initiation(&mut work, true) {
+                    TunnResult::WriteToNetwork(b) => {
+                        self.enqueue_wg(b);
+                        self.work = work;
+                        self.decapsulate_wire(0);
+                    }
+                    TunnResult::Err(e2) => {
+                        warn!(
+                            "wireguard {}: forced re-handshake failed: {e2:?}",
+                            self.name
+                        );
+                        self.work = work;
+                    }
+                    _ => self.work = work,
+                }
+            }
+            _ => self.work = work,
         }
-        self.work = work;
     }
 
     /// Kick off the WireGuard handshake immediately so it overlaps the
@@ -563,6 +614,7 @@ impl WgPump {
         self.tcp.insert(
             handle,
             TcpState {
+                local_port: port,
                 pending: Some(PendingTcp {
                     reply,
                     read_rx,
@@ -742,6 +794,12 @@ impl WgPump {
             }
 
             // ── ordered writes into the smoltcp socket ─────────────
+            // `drain_notify` is only worth re-arming when this pass could
+            // have freed room for a parked writer — i.e. the conn→pump
+            // drain (or a `Close` push) actually put items in `out`. An
+            // unconditional `notify_one` stores a permit on every service
+            // pass, buying an idle writer one spurious wake.
+            let had_out = !st.out.is_empty();
             while let Some(front) = st.out.front_mut() {
                 match front {
                     TcpIo::Data(b) => {
@@ -786,7 +844,9 @@ impl WgPump {
             }
             // Re-arm a writer parked on a full queue (one stored permit;
             // spurious wakes just retry the send).
-            st.drain_notify.notify_one();
+            if had_out {
+                st.drain_notify.notify_one();
+            }
 
             // ── socket→conn reads ──────────────────────────────────
             while let Some(ev) = st.pending_read.pop_front() {
@@ -897,11 +957,11 @@ impl WgPump {
 
         for handle in dead_tcp {
             if let Some(st) = self.tcp.remove(&handle) {
-                // Read the bound port while the socket is still in the set,
-                // then drop the socket itself.
-                if let Some(ep) = self.sockets.get::<tcp::Socket>(handle).local_endpoint() {
-                    self.used_ports.remove(&ep.port);
-                }
+                // The port comes from `TcpState`, not the socket: smoltcp
+                // cleared the socket's `tuple` the moment its terminal RST
+                // was processed, so `local_endpoint()` is `None` on the
+                // peer-RST path — the one place the port must not leak.
+                self.used_ports.remove(&st.local_port);
                 self.sockets.remove(handle);
                 if let Some(p) = st.pending {
                     let _ = p.reply.send(Err(MeowError::Proxy(format!(
@@ -1393,6 +1453,162 @@ mod tests {
         drop(stream);
         // write_done is set — Drop must not queue a Close behind the FIN.
         assert!(rx.try_recv().is_err());
+    }
+
+    /// A minimal client-side config: `client_secret`/`server_public` are
+    /// the WG static keys; the pump's `Tunn` plays the client side.
+    fn test_config(
+        client_secret: &x25519::StaticSecret,
+        server_public: &x25519::PublicKey,
+    ) -> WireGuardConfig {
+        WireGuardConfig {
+            name: "wg-test".into(),
+            server: "127.0.0.1".into(),
+            port: 9,
+            private_key: client_secret.to_bytes(),
+            public_key: server_public.to_bytes(),
+            pre_shared_key: None,
+            ip: Some(std::net::Ipv4Addr::new(10, 0, 0, 2)),
+            ipv6: None,
+            allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
+            reserved: None,
+            mtu: 1420,
+            udp: true,
+            remote_dns_resolve: true,
+            persistent_keepalive: 0,
+            dns: vec![],
+        }
+    }
+
+    /// A pump on a bound-but-idle loopback endpoint socket.
+    /// `WgPump::new` registers the socket with the current reactor, so
+    /// call this only inside a `#[tokio::test]` runtime.
+    fn pump_for_test(cfg: &WireGuardConfig) -> WgPump {
+        let std_sock = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind test socket");
+        let (_tx, rx) = mpsc::channel(4);
+        let endpoint: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        WgPump::new(cfg, std_sock, endpoint, rx).expect("pump build")
+    }
+
+    /// A real handshake initiation from the peer, but with WARP-style
+    /// non-zero reserved bytes. boringtun's `parse_incoming_packet`
+    /// checks type+reserved as one LE u32, so an unscrubbed datagram is
+    /// `InvalidPacket` — the pump must zero the field before
+    /// `decapsulate` sees it, the same don't-care treatment mihomo gives
+    /// the wireguard-go parser.
+    #[tokio::test(flavor = "current_thread")]
+    async fn decapsulate_wire_zeroes_inbound_reserved_bytes() {
+        let client_secret = x25519::StaticSecret::from([0x11; 32]);
+        let client_public = x25519::PublicKey::from(&client_secret);
+        let server_secret = x25519::StaticSecret::from([0x22; 32]);
+        let server_public = x25519::PublicKey::from(&server_secret);
+        let mut pump = pump_for_test(&test_config(&client_secret, &server_public));
+
+        let mut server = Tunn::new(server_secret, client_public, None, None, 7, None);
+        let mut buf = vec![0u8; 2048];
+        let mut datagram = match server.format_handshake_initiation(&mut buf, false) {
+            TunnResult::WriteToNetwork(b) => b.to_vec(),
+            other => panic!("expected WriteToNetwork, got {other:?}"),
+        };
+        // Cloudflare WARP's identifier — non-zero, stamped into the
+        // reserved field of every inbound header.
+        datagram[1..4].copy_from_slice(&[13, 53, 133]);
+
+        pump.recv_buf[..datagram.len()].copy_from_slice(&datagram);
+        pump.decapsulate_wire(datagram.len());
+
+        // A valid initiation produces a HANDSHAKE_RESP (type 2) queued
+        // for the wire. Without the scrub the parser rejects the
+        // datagram and the outbox stays empty.
+        assert_eq!(pump.outbox.len(), 1, "handshake response queued");
+        assert_eq!(pump.outbox[0][0], 2, "response is a WG handshake response");
+    }
+
+    /// smoltcp clears a socket's `tuple` the moment its terminal RST is
+    /// dispatched — after that `local_endpoint()` is `None`, so dead-sock
+    /// port bookkeeping must come from `TcpState`, not the socket. This
+    /// is the state a peer-RST'd socket is already in when cleanup runs
+    /// (`process()` lands `Closed` with the tuple gone).
+    #[tokio::test(flavor = "current_thread")]
+    async fn dead_tcp_releases_port_after_tuple_cleared() {
+        let client_secret = x25519::StaticSecret::from([0x33; 32]);
+        let server_public = x25519::PublicKey::from(&x25519::StaticSecret::from([0x44; 32]));
+        let mut pump = pump_for_test(&test_config(&client_secret, &server_public));
+
+        let (reply_tx, _reply_rx) = oneshot::channel();
+        pump.dial_tcp("203.0.113.1:443".parse().unwrap(), "t".into(), reply_tx);
+        assert_eq!(pump.used_ports.len(), 1);
+        let port = *pump.used_ports.iter().next().unwrap();
+        let handle = *pump.tcp.keys().next().unwrap();
+
+        // Abort + one interface poll: the dispatch emits the RST, then
+        // clears the tuple — `local_endpoint()` is `None` from here on.
+        pump.sockets.get_mut::<tcp::Socket>(handle).abort();
+        pump.iface
+            .poll(SmolInstant::now(), &mut pump.device, &mut pump.sockets);
+        assert!(
+            pump.sockets
+                .get::<tcp::Socket>(handle)
+                .local_endpoint()
+                .is_none(),
+            "tuple must be gone for this test to mean anything"
+        );
+
+        pump.service_sockets();
+        assert!(!pump.tcp.contains_key(&handle));
+        assert!(
+            !pump.used_ports.contains(&port),
+            "ephemeral port {port} leaked"
+        );
+    }
+
+    /// An idle socket must not accumulate a drain permit: `notify_one`
+    /// stores one when nobody is waiting, and the next real writer would
+    /// burn its wake on a permit that bought nothing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn idle_socket_stores_no_drain_permit() {
+        let client_secret = x25519::StaticSecret::from([0x55; 32]);
+        let server_public = x25519::PublicKey::from(&x25519::StaticSecret::from([0x66; 32]));
+        let mut pump = pump_for_test(&test_config(&client_secret, &server_public));
+
+        let (reply_tx, _reply_rx) = oneshot::channel();
+        pump.dial_tcp("203.0.113.1:443".parse().unwrap(), "t".into(), reply_tx);
+        let handle = *pump.tcp.keys().next().unwrap();
+        let notify = Arc::clone(&pump.tcp[&handle].drain_notify);
+
+        pump.service_sockets();
+
+        let mut notified = std::pin::pin!(notify.notified());
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(notified.as_mut().poll(&mut cx), Poll::Pending));
+    }
+
+    /// …and the complement: write items that actually moved off the
+    /// conn→pump channel this pass must still leave a permit behind, or
+    /// a writer parked on the full channel never wakes.
+    #[tokio::test(flavor = "current_thread")]
+    async fn drained_write_stores_drain_permit() {
+        let client_secret = x25519::StaticSecret::from([0x77; 32]);
+        let server_public = x25519::PublicKey::from(&x25519::StaticSecret::from([0x88; 32]));
+        let mut pump = pump_for_test(&test_config(&client_secret, &server_public));
+
+        let (reply_tx, _reply_rx) = oneshot::channel();
+        pump.dial_tcp("203.0.113.1:443".parse().unwrap(), "t".into(), reply_tx);
+        let handle = *pump.tcp.keys().next().unwrap();
+        let notify = Arc::clone(&pump.tcp[&handle].drain_notify);
+        pump.tcp[&handle]
+            .pending
+            .as_ref()
+            .expect("pending dial")
+            .write_tx
+            .try_send(TcpIo::Data(Bytes::from_static(b"x")))
+            .expect("channel has room");
+
+        pump.service_sockets();
+
+        let mut notified = std::pin::pin!(notify.notified());
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(notified.as_mut().poll(&mut cx), Poll::Ready(())));
     }
 
     #[tokio::test]
