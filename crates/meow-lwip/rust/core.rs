@@ -69,8 +69,11 @@ pub(crate) enum StreamCmd {
 /// because handles send from `poll_*` and `Drop`, where blocking or dropping
 /// a command is not an option.
 pub(crate) enum Cmd {
+    /// (test only) Count pcbs on `tcp_tw_pcbs`, walked on the core thread.
     #[cfg(test)]
     TimewaitCount(tokio::sync::oneshot::Sender<usize>),
+    /// (test only) Advances lwIP's global TCP clock ~2*MSL: expires every
+    /// aged pcb, not just TIME_WAIT — send only while no streams are live.
     #[cfg(test)]
     ExpireTimewait(tokio::sync::oneshot::Sender<()>),
     /// Handle-side bookkeeping for a freshly accepted stream (created inside
