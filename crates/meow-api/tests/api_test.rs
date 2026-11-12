@@ -5911,23 +5911,35 @@ async fn put_configs_dns_rebind_failure_keeps_old_listener() {
         )
     };
 
-    // First PUT: bind a standalone DNS listener on a free port. The DNS
-    // bind needs UDP *and* TCP on the same port, and Windows can exclude a
-    // port per protocol (Hyper-V/WINNAT) — the two ranges can partition the
-    // ephemeral space, so a UDP-picked port can fail every TCP probe. Let
-    // TCP pick (its allocator skips TCP exclusions) and verify UDP while
-    // the probe holds the port; the protocol spaces are independent.
+    // The DNS bind needs UDP *and* TCP on the same port, and Windows can
+    // exclude a port per protocol (Hyper-V/WINNAT) — either protocol's
+    // allocator can walk into the other's exclusion band. Alternate which
+    // protocol picks the :0 port so both allocators sample independent
+    // counter positions (the same mechanism DnsServer::bind() uses).
     let mut port_a = None;
-    for _ in 0..16 {
-        let sock = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let candidate = sock.local_addr().unwrap().port();
-        if std::net::UdpSocket::bind(("127.0.0.1", candidate)).is_ok() {
-            drop(sock);
-            port_a = Some(candidate);
-            break;
+    'probe: for attempt in 0..16u32 {
+        if attempt % 2 == 0 {
+            // Even: TCP picks, UDP verifies.
+            let sock = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let candidate = sock.local_addr().unwrap().port();
+            if std::net::UdpSocket::bind(("127.0.0.1", candidate)).is_ok() {
+                drop(sock);
+                port_a = Some(candidate);
+                break 'probe;
+            }
+        } else {
+            // Odd: UDP picks, TCP verifies.
+            let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let candidate = sock.local_addr().unwrap().port();
+            if std::net::TcpListener::bind(("127.0.0.1", candidate)).is_ok() {
+                drop(sock);
+                port_a = Some(candidate);
+                break 'probe;
+            }
         }
     }
-    let port_a = port_a.expect("no port bindable over both UDP and TCP");
+    let port_a =
+        port_a.expect("no port bindable over both UDP and TCP after 16 alternating attempts");
     let yaml_a = format!(
         "mode: rule\ndns:\n  enable: true\n  listen: 127.0.0.1:{port_a}\n  nameserver:\n    - 127.0.0.1\nrules:\n  - MATCH,DIRECT\n"
     );
