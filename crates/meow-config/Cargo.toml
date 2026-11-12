@@ -34,7 +34,13 @@ hysteria2 = ["meow-proxy/hysteria2"]
 # WireGuard userspace outbound (issue #899 Phase-1) — vendored ring-free
 # boringtun noise over a smoltcp stack; opt-in, bundled into the app `full`
 # profile, kept out of `default`/`minimal` (ADR-0007 binary-size caps).
-wireguard = ["meow-proxy/wireguard"]
+# `dep:x25519-dalek` rides along: the `type: wireguard` *listener* schema
+# parses unconditionally (no config-side feature gate — see
+# ListenerSpec::WireGuard), and this build mode additionally validates at
+# config time that no peer public-key equals the listener's own derived
+# public key; on other build modes that one check is deferred to listener
+# startup (meow-listener holds meow-wireguard's x25519).
+wireguard = ["meow-proxy/wireguard", "dep:x25519-dalek"]
 # TrustTunnel H2 client outbound; opt-in pending upstream profile review (#727).
 trusttunnel = ["meow-proxy/trusttunnel"]
 # `quic: true` for that outbound; see meow-proxy's `trusttunnel-h3`.
@@ -78,7 +84,9 @@ tracing = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 maxminddb = { workspace = true }
-ipnet = { workspace = true }
+# `serde` for the typed `WgPeerConfig::allowed_ips` (`ListenerSpec` derives
+# serde for persisted-config round-trip); additive impls for other users.
+ipnet = { workspace = true, features = ["serde"] }
 base64 = { workspace = true }
 regex = { workspace = true }
 parking_lot = { workspace = true }
@@ -90,6 +98,11 @@ httparse = "1"
 # `deflate` is the only codec GitHub release zips use; skip the heavier ones.
 zip = { version = "9", default-features = false, features = ["deflate"], optional = true }
 dashmap = { workspace = true }
+# Optional: only needed by the `wireguard`-feature config-time check that a
+# `type: wireguard` listener peer's public-key differs from the listener's
+# own derived public key (X25519 basepoint multiply). Without the feature —
+# and in every build lacking it — the listener startup path re-checks.
+x25519-dalek = { workspace = true, optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

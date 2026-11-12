@@ -2099,6 +2099,9 @@ name = "ipnet"
 version = "2.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "791930b43c0d5973160d90a8f3894509f2b273430f5c5c73b668636d0287c5c0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "ipnetwork"
@@ -2665,6 +2668,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "x25519-dalek",
  "zip",
 ]
 

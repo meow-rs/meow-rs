@@ -203,6 +203,14 @@ pub enum ListenerSpec {
     /// target address, and hands the decrypted flow to the tunnel. Mirrors
     /// upstream mihomo's `type: shadowsocks` listener.
     Shadowsocks(SsListenerConfig),
+    /// WireGuard server-side inbound (`type: wireguard`): meow is the WG
+    /// responder on one UDP port serving a static peer table; inner
+    /// TCP/UDP flows are routed by the tunnel — semantically a TUN inbound
+    /// carried over WireGuard. The variant always parses (no config-side
+    /// feature gate); servability is gated at runtime by the
+    /// `listener-wireguard` build feature — the same pattern as
+    /// `type: shadowsocks` vs. `listener-shadowsocks`.
+    WireGuard(WgListenerConfig),
 }
 
 /// Per-listener config for the `shadowsocks` inbound (`ListenerSpec::Shadowsocks`).
@@ -222,6 +230,102 @@ pub struct SsListenerConfig {
 
 fn default_ss_udp() -> bool {
     true
+}
+
+/// Per-listener config for the `wireguard` inbound (`ListenerSpec::WireGuard`).
+///
+/// Validated at config-build time by `build_wg_listener_spec`: `private_key`
+/// is the listener's static private key (base64 → exactly 32 bytes in the
+/// YAML, stored decoded) and `peers` is the static peer table (never empty,
+/// at most `2^24 - 1` entries — the `index << 8` demux namespace).
+/// `port`/`listen`/`max_connections` live on [`NamedListener`], the same
+/// split as [`SsListenerConfig`].
+///
+/// [`Debug`] is hand-rolled: the struct carries key material that must
+/// never land in a log line (the `WireGuardConfig` outbound precedent).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WgListenerConfig {
+    /// Listener static private key, 32 bytes. Never logged.
+    pub private_key: [u8; 32],
+    /// Static peer table — at least one entry after validation.
+    pub peers: Vec<WgPeerConfig>,
+    /// Outer (wire) MTU; `inner_mtu = mtu - 64` stays ≥ 576. Default 1420.
+    #[serde(default = "default_wg_mtu")]
+    pub mtu: u16,
+    /// `false` silently drops inner UDP datagrams. Default `true`.
+    #[serde(default = "default_wg_udp")]
+    pub udp: bool,
+    /// Inner UDP flow idle timeout (default 60s; `0` is rejected at build
+    /// time, matching the `tproxy`/`tun` `udp-timeout` contract).
+    #[serde(default = "default_wg_udp_timeout")]
+    pub udp_timeout: std::time::Duration,
+}
+
+/// One static peer of a `type: wireguard` listener.
+///
+/// `public_key` doubles as the handshake demux key and must be unique
+/// inside the listener's peer table; `allowed_ips` is the inbound
+/// inner-source-IP ACL (spoofing guard) and is never empty — an explicit
+/// `0.0.0.0/0` + `::/0` is required for full openness, deliberately
+/// unlike the outbound's empty-means-open default.
+///
+/// [`Debug`] is hand-rolled to redact `preshared_key`; `public_key` is
+/// *not* redacted — a public key is safe to log and needed for diagnosis.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WgPeerConfig {
+    /// Peer static public key, 32 bytes.
+    pub public_key: [u8; 32],
+    /// Optional pre-shared symmetric key (Noise `psk` mixing). Never logged.
+    pub preshared_key: Option<[u8; 32]>,
+    /// Inbound inner-source-IP ACL for this peer — non-empty.
+    pub allowed_ips: Vec<ipnet::IpNet>,
+    /// Log/diagnostic label only (`peer-<index>` when unnamed) — never
+    /// enters `Metadata`.
+    pub name: SmolStr,
+    /// WARP-style 3-byte `reserved` field stamped onto wire datagrams
+    /// headed to this peer; inbound reserved bytes are cleared regardless.
+    pub reserved: Option<[u8; 3]>,
+}
+
+impl std::fmt::Debug for WgListenerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WgListenerConfig")
+            .field("private_key", &"[REDACTED]")
+            .field("peers", &self.peers)
+            .field("mtu", &self.mtu)
+            .field("udp", &self.udp)
+            .field("udp_timeout", &self.udp_timeout)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for WgPeerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WgPeerConfig")
+            .field("public_key", &self.public_key)
+            .field("preshared_key", &self.preshared_key.map(|_| "[REDACTED]"))
+            .field("allowed_ips", &self.allowed_ips)
+            .field("name", &self.name)
+            .field("reserved", &self.reserved)
+            .finish()
+    }
+}
+
+/// `WgListenerConfig::mtu` serde default — the usual WG baseline, same as
+/// the outbound adapter's.
+fn default_wg_mtu() -> u16 {
+    1420
+}
+
+/// `WgListenerConfig::udp` serde default: the inner-UDP path is on.
+fn default_wg_udp() -> bool {
+    true
+}
+
+/// `WgListenerConfig::udp_timeout` serde default — matches the `tproxy`
+/// `udp-timeout` and `tun.udp-timeout` default (60s).
+fn default_wg_udp_timeout() -> std::time::Duration {
+    std::time::Duration::from_secs(default_udp_timeout_secs())
 }
 
 /// `ListenerSpec::TProxy::firewall` serde default: managed firewall rules
@@ -265,6 +369,7 @@ impl ListenerSpec {
             Self::Socks5 => "socks5",
             Self::TProxy { .. } => "tproxy",
             Self::Shadowsocks(_) => "shadowsocks",
+            Self::WireGuard(_) => "wireguard",
         }
     }
 }
@@ -4363,6 +4468,9 @@ pub(crate) fn resolve_listener_bind(
 /// deprecated `tproxy-sni` synthesis on every arm that carries `sni`, or
 /// `tproxy-sni: true` + `sniffer.enable: false` would still sniff (the
 /// listener's synthesized runtime survives `with_sniffer`'s off state).
+///
+/// `TProxy` and `WireGuard` are fully resolved here; `Shadowsocks` returns
+/// a placeholder the caller completes via `build_ss_listener_spec`.
 fn parse_listener_spec(
     raw_l: &raw::RawListener,
     global_tproxy_sni: bool,
@@ -4489,8 +4597,9 @@ fn parse_listener_spec(
             udp: true,
             simple_obfs: None,
         })),
+        "wireguard" => Ok(ListenerSpec::WireGuard(build_wg_listener_spec(raw_l)?)),
         other => anyhow::bail!(
-            "unknown listener type '{other}'; expected mixed, http, socks5, tproxy, redir, or shadowsocks"
+            "unknown listener type '{other}'; expected mixed, http, socks5, tproxy, redir, shadowsocks, or wireguard"
         ),
     }
 }
@@ -4555,6 +4664,263 @@ fn build_ss_listener_spec(raw_l: &raw::RawListener) -> Result<SsListenerConfig, 
         password,
         udp: raw_l.udp.unwrap_or(true),
         simple_obfs,
+    })
+}
+
+/// Decode a base64 WireGuard key field into exactly 32 bytes (standard
+/// alphabet — the spelling every WG tool emits; the same rule the
+/// outbound parser's `parse_wg_key` enforces). `ctx` carries the field
+/// path for the error, e.g. `listeners[wg].peers[0].public-key`.
+fn wg_b64_key(value: Option<&str>, ctx: &str) -> Result<[u8; 32], anyhow::Error> {
+    use base64::Engine;
+    let raw = value
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("{ctx}: missing base64 key"))?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(raw)
+        .map_err(|_| anyhow::anyhow!("{ctx}: must be base64"))?;
+    bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("{ctx}: must decode to exactly 32 bytes"))
+}
+
+/// `reserved` on a `type: wireguard` peer — the 3-byte Cloudflare
+/// WARP-style identifier, a YAML list of three bytes or a base64 string
+/// decoding to exactly 3 bytes (the same shapes the outbound `reserved`
+/// accepts). Inbound reserved bytes are cleared unconditionally; this
+/// only stamps the wire datagrams meow sends to the peer.
+fn wg_peer_reserved(
+    value: Option<&serde_json::Value>,
+    ctx: &str,
+) -> Result<Option<[u8; 3]>, anyhow::Error> {
+    use base64::Engine;
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Array(list)) => {
+            if list.len() != 3 {
+                anyhow::bail!("{ctx}: must be a list of exactly 3 bytes");
+            }
+            let mut out = [0u8; 3];
+            for (i, v) in list.iter().enumerate() {
+                let n = v
+                    .as_u64()
+                    .ok_or_else(|| anyhow::anyhow!("{ctx}: entries must be bytes (0-255)"))?;
+                out[i] = u8::try_from(n)
+                    .map_err(|_| anyhow::anyhow!("{ctx}: entries must be bytes (0-255)"))?;
+            }
+            Ok(Some(out))
+        }
+        Some(serde_json::Value::String(s)) => {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(s)
+                .map_err(|_| anyhow::anyhow!("{ctx}: must be a 3-byte list or base64"))?;
+            <[u8; 3]>::try_from(bytes.as_slice())
+                .map(Some)
+                .map_err(|_| anyhow::anyhow!("{ctx}: base64 must decode to exactly 3 bytes"))
+        }
+        Some(_) => anyhow::bail!("{ctx}: must be a 3-byte list or base64"),
+    }
+}
+
+/// Build a validated [`WgListenerConfig`] from a raw `listeners:` entry
+/// (`type: wireguard`).
+///
+/// Hard errors (Class A per ADR-0002): a missing/undecodable
+/// `private-key` (or the all-zero key, refused exactly like the outbound
+/// adapter), missing or empty `peers`, `peers` at/over the 2^24
+/// demux-namespace cap, a peer `public-key` that is missing, not
+/// base64 → 32 bytes, or duplicated in the table, a `preshared-key` that
+/// does not decode to 32 bytes, `allowed-ips` missing, empty, or holding
+/// a non-CIDR entry, `reserved` that is not a 3-byte list or base64 → 3
+/// bytes, `mtu` outside `640..=9000`, or `udp-timeout: 0` (the same
+/// contract `tproxy`'s `udp-timeout` enforces).
+///
+/// A peer `public-key` equal to the listener's *own* public key
+/// (`x25519_dalek::PublicKey::from(&StaticSecret)`) is a self-peering
+/// misconfiguration: rejected here when the `wireguard` feature is
+/// compiled — its `dep:x25519-dalek` puts the basepoint multiply in
+/// scope — and re-checked at listener startup on every build
+/// (meow-listener holds meow-wireguard's x25519), so `meow-config`
+/// carries no unconditional crypto dep.
+///
+/// Keys the schema knows but `type: wireguard` does not consume
+/// (`cipher`, `tproxy-sni`, the opaque upstream sub-options, …) and
+/// schema-unknown keys (captured by `RawListener`'s flatten field)
+/// warn-and-ignore — the same policy every other listener arm applies
+/// (ADR-0002), keeping forward-compat with keys a newer schema adds.
+fn build_wg_listener_spec(raw_l: &raw::RawListener) -> Result<WgListenerConfig, anyhow::Error> {
+    for (key, set) in [
+        ("cipher", raw_l.cipher.is_some()),
+        ("password", raw_l.password.is_some()),
+        ("simple-obfs", raw_l.simple_obfs.is_some()),
+        ("shadow-tls", raw_l.shadow_tls.is_some()),
+        ("res-tls", raw_l.res_tls.is_some()),
+        ("jls-config", raw_l.jls_config.is_some()),
+        ("kcp-tun", raw_l.kcp_tun.is_some()),
+        ("mux-option", raw_l.mux_option.is_some()),
+    ] {
+        if set {
+            warn!(
+                "listeners[{}]: `{key}` is ignored on `type: wireguard`; \
+                 remove it to suppress this warning",
+                raw_l.name
+            );
+        }
+    }
+    let mut unknown_keys: Vec<&String> = raw_l.extra.keys().collect();
+    unknown_keys.sort();
+    for key in unknown_keys {
+        warn!(
+            "listeners[{}]: `{key}` is not a known `type: wireguard` field, ignored",
+            raw_l.name
+        );
+    }
+
+    let private_key = wg_b64_key(
+        raw_l.private_key.as_deref(),
+        &format!("listeners[{}].private-key", raw_l.name),
+    )?;
+    if private_key == [0u8; 32] {
+        anyhow::bail!(
+            "listeners[{}].private-key: the all-zero key is not a valid WireGuard key",
+            raw_l.name
+        );
+    }
+
+    let mtu = match raw_l.mtu.unwrap_or_else(default_wg_mtu) {
+        m if !(640..=9000).contains(&m) => anyhow::bail!(
+            "listeners[{}].mtu: {m} must be in 640..=9000 (outer MTU; inner = mtu - 64)",
+            raw_l.name
+        ),
+        m => m,
+    };
+    let udp_timeout = match raw_l.udp_timeout {
+        Some(0) => anyhow::bail!(
+            "listeners[{}].udp-timeout: must be at least 1 second",
+            raw_l.name
+        ),
+        // Same Instant+Duration overflow class as tproxy.udp-timeout —
+        // the bound keeps every future consumer honest (issue #648).
+        Some(s) if s > meow_common::MAX_DURATION_SECS => anyhow::bail!(
+            "listeners[{}].udp-timeout: {s}s exceeds the {}s ceiling",
+            raw_l.name,
+            meow_common::MAX_DURATION_SECS
+        ),
+        Some(s) => std::time::Duration::from_secs(s),
+        None => default_wg_udp_timeout(),
+    };
+
+    let raw_peers = raw_l.peers.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "listeners[{}]: wireguard listener requires 'peers' (non-empty)",
+            raw_l.name
+        )
+    })?;
+    if raw_peers.is_empty() {
+        anyhow::bail!(
+            "listeners[{}].peers: must contain at least one peer",
+            raw_l.name
+        );
+    }
+    // Peer slots feed the `index << 8` demux namespace: the low 8 bits are
+    // the per-peer session counter, so the table caps at 2^24 - 1.
+    if raw_peers.len() >= (1 << 24) {
+        anyhow::bail!(
+            "listeners[{}].peers: {} peers exceeds the 2^24-1 demux-namespace cap",
+            raw_l.name,
+            raw_peers.len()
+        );
+    }
+
+    let mut seen_keys = std::collections::HashSet::new();
+    let mut peers = Vec::with_capacity(raw_peers.len());
+    for (i, rp) in raw_peers.iter().enumerate() {
+        let mut unknown_peer_keys: Vec<&String> = rp.extra.keys().collect();
+        unknown_peer_keys.sort();
+        for key in unknown_peer_keys {
+            warn!(
+                "listeners[{}].peers[{i}]: `{key}` is not a known wireguard peer field, ignored",
+                raw_l.name
+            );
+        }
+        let public_key = wg_b64_key(
+            rp.public_key.as_deref(),
+            &format!("listeners[{}].peers[{i}].public-key", raw_l.name),
+        )?;
+        if !seen_keys.insert(public_key) {
+            anyhow::bail!(
+                "listeners[{}].peers[{i}].public-key: duplicates an earlier peer",
+                raw_l.name
+            );
+        }
+        let preshared_key = match rp.preshared_key.as_deref() {
+            Some(_) => Some(wg_b64_key(
+                rp.preshared_key.as_deref(),
+                &format!("listeners[{}].peers[{i}].preshared-key", raw_l.name),
+            )?),
+            None => None,
+        };
+        let allowed_ips = match rp.allowed_ips.as_deref() {
+            None => anyhow::bail!(
+                "listeners[{}].peers[{i}]: wireguard peer requires 'allowed-ips' (non-empty; \
+                 write 0.0.0.0/0 and ::/0 explicitly for full openness)",
+                raw_l.name
+            ),
+            Some([]) => anyhow::bail!(
+                "listeners[{}].peers[{i}].allowed-ips: must not be empty (inbound ACL; \
+                 write 0.0.0.0/0 and ::/0 explicitly for full openness)",
+                raw_l.name
+            ),
+            Some(list) => list
+                .iter()
+                .map(|s| {
+                    s.parse::<ipnet::IpNet>().map_err(|_| {
+                        anyhow::anyhow!(
+                            "listeners[{}].peers[{i}].allowed-ips: '{s}' is not a valid CIDR",
+                            raw_l.name
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+        let reserved = wg_peer_reserved(
+            rp.reserved.as_ref(),
+            &format!("listeners[{}].peers[{i}].reserved", raw_l.name),
+        )?;
+        peers.push(WgPeerConfig {
+            public_key,
+            preshared_key,
+            allowed_ips,
+            name: rp
+                .name
+                .as_deref()
+                .map_or_else(|| SmolStr::from(format!("peer-{i}")), SmolStr::from),
+            reserved,
+        });
+    }
+
+    #[cfg(feature = "wireguard")]
+    {
+        let self_public =
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(private_key));
+        if let Some(i) = peers
+            .iter()
+            .position(|p| p.public_key == *self_public.as_bytes())
+        {
+            anyhow::bail!(
+                "listeners[{}].peers[{i}].public-key: equals the listener's own public key \
+                 (self-peering is not a valid peer)",
+                raw_l.name
+            );
+        }
+    }
+
+    Ok(WgListenerConfig {
+        private_key,
+        peers,
+        mtu,
+        udp: raw_l.udp.unwrap_or_else(default_wg_udp),
+        udp_timeout,
     })
 }
 
@@ -4887,7 +5253,11 @@ fn build_named_listeners(
             );
         }
         match (&spec, raw_l.udp_timeout) {
-            (ListenerSpec::TProxy { udp: true, .. }, _) | (_, None) => {}
+            // `wireguard` consumes `udp-timeout` itself (inner-UDP flow
+            // idle bound) — no warning on it either.
+            (ListenerSpec::TProxy { udp: true, .. }, _)
+            | (ListenerSpec::WireGuard(_), _)
+            | (_, None) => {}
             // `type: redir` already warned that `udp-timeout` is ignored
             // on it at spec-parse — don't warn a second time here.
             (ListenerSpec::TProxy { .. }, Some(_)) if is_redir => {}
@@ -4897,24 +5267,41 @@ fn build_named_listeners(
                 raw_l.name
             ),
             (_, Some(_)) => warn!(
-                "listeners[{}].udp-timeout: only meaningful on `type: tproxy`, ignored; \
+                "listeners[{}].udp-timeout: only meaningful on `type: tproxy`/`wireguard`, ignored; \
                  remove it to suppress this warning",
                 raw_l.name
             ),
         }
-        // `udp` is meaningful on tproxy (issue #564) and shadowsocks; any
-        // other listener type ignoring it is warned about.
+        // `udp` is meaningful on tproxy (issue #564), shadowsocks and
+        // wireguard; any other listener type ignoring it is warned about.
         if raw_l.udp.is_some()
             && !matches!(
                 spec,
-                ListenerSpec::TProxy { .. } | ListenerSpec::Shadowsocks(_)
+                ListenerSpec::TProxy { .. }
+                    | ListenerSpec::Shadowsocks(_)
+                    | ListenerSpec::WireGuard(_)
             )
         {
             warn!(
-                "listeners[{}].udp: only meaningful on `type: tproxy`/`shadowsocks`, \
+                "listeners[{}].udp: only meaningful on `type: tproxy`/`shadowsocks`/`wireguard`, \
                  ignored; remove it to suppress this warning",
                 raw_l.name
             );
+        }
+        // WireGuard-only fields set on another listener type warn — the
+        // same shape as the `firewall`/`tproxy-sni` checks above.
+        for (key, set) in [
+            ("private-key", raw_l.private_key.is_some()),
+            ("mtu", raw_l.mtu.is_some()),
+            ("peers", raw_l.peers.is_some()),
+        ] {
+            if set && !matches!(spec, ListenerSpec::WireGuard(_)) {
+                warn!(
+                    "listeners[{}].{key}: only meaningful on `type: wireguard`, ignored; \
+                     remove it to suppress this warning",
+                    raw_l.name
+                );
+            }
         }
         // `transparent` is tproxy-only — on `type: redir` it already
         // warned at spec-parse, so non-TProxy specs are all that remain.
@@ -4940,7 +5327,13 @@ fn build_named_listeners(
                         ..
                     }
                 );
-            if gateway_facing || !matches!(spec, ListenerSpec::TProxy { .. }) {
+            if matches!(spec, ListenerSpec::WireGuard(_)) {
+                // A WG responder exists to accept peers from the network —
+                // the spec pins `0.0.0.0` rather than the shared
+                // `default_bind` convention (spec §2.1); loopback is
+                // always writable explicitly for tests.
+                "0.0.0.0"
+            } else if gateway_facing || !matches!(spec, ListenerSpec::TProxy { .. }) {
                 default_bind
             } else {
                 "127.0.0.1"

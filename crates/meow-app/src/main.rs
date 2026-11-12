@@ -738,6 +738,11 @@ fn listener_feature_gate(spec: &meow_config::ListenerSpec) -> Option<&'static st
         S::Shadowsocks(_) => {
             (!cfg!(feature = "listener-shadowsocks")).then_some("listener-shadowsocks")
         }
+        // `listener-wireguard` does not exist yet (the meow-listener side
+        // lands with it); unconditionally reported missing until then —
+        // `cfg!(feature = ...)` on an undeclared feature also trips the
+        // `unexpected_cfgs` lint.
+        S::WireGuard(_) => Some("listener-wireguard"),
     }
 }
 
@@ -1813,6 +1818,17 @@ async fn run(
                     );
                 }
             }
+            ListenerSpec::WireGuard(cfg) => {
+                // The WG responder listener lands with meow-listener's
+                // `listener-wireguard` feature; until then `ensure_inbounds_supported`
+                // rejects the config at `-t`/startup, so reaching this arm is
+                // only possible through a permissive gate.
+                let _ = cfg;
+                tracing::warn!(
+                    "listener '{}': wireguard requires feature 'listener-wireguard'",
+                    nl.name
+                );
+            }
         }
     }
 
@@ -2468,6 +2484,17 @@ mod tests {
         assert_eq!(
             gate(&ss_spec()),
             (!cfg!(feature = "listener-shadowsocks")).then_some("listener-shadowsocks")
+        );
+        assert_eq!(
+            gate(&S::WireGuard(meow_config::WgListenerConfig {
+                private_key: [0u8; 32],
+                peers: vec![],
+                mtu: 1420,
+                udp: true,
+                udp_timeout: std::time::Duration::from_secs(60),
+            })),
+            Some("listener-wireguard"),
+            "unconditional until the meow-listener `listener-wireguard` feature exists"
         );
     }
 
