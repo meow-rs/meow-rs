@@ -2312,6 +2312,12 @@ impl Resolver {
         self.fakeip_v4.as_ref().map(|p| p.ipnet())
     }
 
+    /// The optional IPv6 fake-IP pool prefix. TUN main-table routes need
+    /// this too: Linux's policy rules capture host-originated traffic only.
+    pub fn fake_ip_v6_net(&self) -> Option<ipnet::IpNet> {
+        self.fakeip_v6.as_ref().map(|p| p.ipnet())
+    }
+
     /// The v4 fake-IP pool gateway (network + 1, e.g. `198.18.0.1`), which
     /// the pool never hands out. The TUN device takes it by default; with
     /// `dns-hijack` the OS resolver is pointed at it, or at the reserved

@@ -535,8 +535,9 @@ dns:
   semantics); use `+.example.com` for apex + any-depth subdomains, `*.` for
   exactly one label, `.` for any-depth subdomains excluding the apex.
 - **AAAA in v4-only configs.** Returns NOERROR-empty so clients fall back
-  to IPv4 cleanly. To allocate v6 fake IPs, point `fake-ip-range` at an
-  IPv6 prefix (e.g. `fc00::/64`).
+  to IPv4 cleanly. To allocate v6 fake IPs alongside the v4 pool, set
+  `fake-ip-range6` (e.g. `fdfe:dcba:9876::/64`) — an IPv6 CIDR in
+  `fake-ip-range` itself makes the single pool v6-only.
 - **Persistence.** `store-fake-ip: true` writes `fakeip-v4.json` /
   `fakeip-v6.json` under the provider cache dir (next to the config file
   for file-backed runs; the resolved home dir under `--config-string`),

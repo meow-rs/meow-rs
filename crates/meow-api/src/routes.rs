@@ -3406,6 +3406,12 @@ async fn spawn_tun_from_raw(
     Ok(None)
 }
 
+fn tun_fake_ip_changed(prior: &meow_dns::Resolver, current: &meow_dns::Resolver) -> bool {
+    prior.fake_ip_v4_net() != current.fake_ip_v4_net()
+        || prior.fake_ip_v4_gateway() != current.fake_ip_v4_gateway()
+        || prior.fake_ip_v6_net() != current.fake_ip_v6_net()
+}
+
 /// Commit `candidate` as the new raw config and reconcile the TUN listener
 /// against the `tun:` diff: an `enable` transition starts/stops it, and an
 /// unchanged `enable: true` with any other parameter change (or changed
@@ -3602,23 +3608,16 @@ async fn swap_config_and_reconcile_tun(
     // resolver, so `tunnel.resolver()` would read the NEW generation and
     // the on→on `fake_ip_changed` check below could never fire
     // (issue #533 review).
-    let old_fake_ip = dns.is_some().then(|| {
-        (
-            prior_resolver.fake_ip_v4_net(),
-            prior_resolver.fake_ip_v4_gateway(),
-        )
-    });
+    let dns_rebuilt = dns.is_some();
     if let Some(dns) = dns {
         publish_dns(&state.tunnel, &state.dns_server, &dns).await;
     }
-    // The TUN listener snapshots `fake_ip_v4_net`/`fake_ip_v4_gateway`/
-    // DnsGuard when the stack is built; after a resolver swap those are
-    // stale — restart the listener so fake-ip-range/enhanced-mode changes
+    // The TUN listener snapshots both fake-IP pool prefixes, the v4 gateway
+    // and DnsGuard when the stack is built; after a resolver swap those are
+    // stale — restart it so either fake-ip range or enhanced-mode changes
     // take effect instead of blackholing the new pool (issue #514).
-    let fake_ip_changed = old_fake_ip.is_some_and(|(net, gw)| {
-        let r = state.tunnel.resolver();
-        r.fake_ip_v4_net() != net || r.fake_ip_v4_gateway() != gw
-    });
+    let fake_ip_changed =
+        dns_rebuilt && tun_fake_ip_changed(&prior_resolver, &state.tunnel.resolver());
 
     if old_enable == new_enable {
         // on → on with changed fake-IP inputs or any real `tun:` parameter
@@ -5382,6 +5381,47 @@ mod tests {
             inputs(&prior),
             inputs(&candidate_changed),
             "a fake-IP range change must be visible across generations"
+        );
+    }
+
+    #[test]
+    fn tun_reload_sees_ipv6_fake_ip_pool_add_change_and_remove() {
+        let make = |prefix: Option<&str>| {
+            let mut resolver = meow_dns::Resolver::new(
+                vec![],
+                vec![],
+                meow_common::DnsMode::FakeIp,
+                meow_trie::DomainTrie::new(),
+                false,
+                true,
+            );
+            if let Some(prefix) = prefix {
+                resolver.set_fakeip_v6(Arc::new(
+                    meow_dns::Pool::new(
+                        prefix.parse().unwrap(),
+                        Arc::new(meow_dns::MemoryStore::new(16)),
+                    )
+                    .unwrap(),
+                ));
+            }
+            resolver
+        };
+        let absent = make(None);
+        let first = make(Some("fdfe:dcba:9876::/64"));
+        let same = make(Some("fdfe:dcba:9876::/64"));
+        let changed = make(Some("fdfe:dcba:9877::/64"));
+        assert!(
+            tun_fake_ip_changed(&absent, &first),
+            "adding an IPv6 pool requires route installation"
+        );
+        assert!(!tun_fake_ip_changed(&first, &same));
+        assert!(
+            tun_fake_ip_changed(&first, &changed),
+            "changing only the IPv6 pool requires route replacement"
+        );
+        assert!(
+            tun_fake_ip_changed(&first, &absent),
+            "removing an IPv6 pool requires route cleanup"
         );
     }
 

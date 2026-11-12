@@ -295,7 +295,7 @@ which meow-rs has no consumer for (the GeoIP MMDB URL lives under
 
 ### DNS section sub-keys
 
-Supported: `enable`, `listen`, `enhanced-mode` (incl. `fake-ip`), `nameserver`, `fallback`, `fake-ip-range`, `fake-ip-filter`, `fake-ip-filter-mode`, `store-fake-ip`, `default-nameserver`, `nameserver-policy`, `fallback-filter.{geoip,geoip-code,ipcidr,domain}`, `use-hosts`, `use-system-hosts`.
+Supported: `enable`, `listen`, `enhanced-mode` (incl. `fake-ip`), `nameserver`, `fallback`, `fake-ip-range`, `fake-ip-range6`, `fake-ip-filter`, `fake-ip-filter-mode`, `store-fake-ip`, `default-nameserver`, `nameserver-policy`, `fallback-filter.{geoip,geoip-code,ipcidr,domain}`, `use-hosts`, `use-system-hosts`.
 
 Missing: `respect-rules`, `prefer-h3`, `cache-algorithm`.
 
