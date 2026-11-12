@@ -94,7 +94,7 @@ impl std::fmt::Debug for WireGuardConfig {
 
 impl WireGuardConfig {
     /// Inner IP MTU exported by the smoltcp device (`mtu - WG_OVERHEAD`).
-    /// Parser-side validation (576–9000) guarantees this stays sane.
+    /// Parser-side validation (640–9000) guarantees this stays ≥ 576.
     pub(crate) fn inner_mtu(&self) -> usize {
         usize::from(self.mtu).saturating_sub(WG_OVERHEAD)
     }

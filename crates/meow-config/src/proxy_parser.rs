@@ -1931,9 +1931,9 @@ fn reject_nonzero_hy2_option(
 /// - `ip`/`ipv6` that is neither an address nor a CIDR of that family.
 /// - an `allowed-ips` entry that is not a CIDR.
 /// - `reserved` that is not a 3-element list or base64 → 3 bytes.
-/// - `mtu` outside 576–9000 (the spec's outer-MTU range;
-///   [`WireGuardAdapter::new`] additionally requires inner MTU ≥ 576,
-///   i.e. `mtu ≥ 640`, and rejects with its own message).
+/// - `mtu` outside 640–9000 (the spec's 576–9000 outer range, tightened
+///   so the inner IP MTU — `mtu - 64` WG overhead — never falls below
+///   576; [`WireGuardAdapter::new`] keeps the same floor as a backstop).
 /// - `ip-stack` other than `"gvisor"`/`"system"`.
 ///
 /// Phase-1 accepts-but-ignores: `dns` (warns once; `remote-dns-resolve`
@@ -2041,10 +2041,10 @@ fn parse_wireguard(
     let reserved = parse_wg_reserved(name, config)?;
 
     let mtu = opt_u16("mtu", 1420)?;
-    if !(576..=9000).contains(&mtu) {
+    if !(640..=9000).contains(&mtu) {
         return Err(format!(
-            "wireguard[{name}]: 'mtu' must be in 576..=9000 (outer MTU; \
-             inner = mtu - 64 WG overhead)"
+            "wireguard[{name}]: 'mtu' must be in 640..=9000 (outer MTU; \
+             inner = mtu - 64 WG overhead must be >= 576)"
         ));
     }
     let udp = boolean("udp", true)?;

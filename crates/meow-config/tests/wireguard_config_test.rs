@@ -352,9 +352,10 @@ mod enabled {
 
     #[test]
     fn mtu_and_keepalive_bounds() {
-        // `mtu` outer range per the spec table is 576–9000; the adapter
-        // additionally requires inner MTU ≥ 576 (mtu ≥ 640), so 576–639
-        // is a hard error from the adapter's own message.
+        // The parser enforces 640–9000 itself — the spec's 576–9000 outer
+        // range tightened so the inner IP MTU (`mtu` − 64 WG overhead)
+        // never drops below 576; the adapter's identical check is now an
+        // unreachable backstop.
         for extra in [
             "mtu: 575\n",
             "mtu: 576\n",
@@ -381,6 +382,13 @@ mod enabled {
         ] {
             parse_proxy(&node(extra), false).unwrap_or_else(|e| panic!("{extra}: {e}"));
         }
+        // The bound is the parser's own range message, not the adapter's
+        // "leaves inner MTU" error: 576–639 used to sail through the
+        // parser and die at construction instead.
+        let error = parse_proxy(&node("mtu: 576\n"), false)
+            .err()
+            .expect("mtu 576 must not parse");
+        assert!(error.contains("640..=9000"), "{error}");
     }
 
     #[test]
