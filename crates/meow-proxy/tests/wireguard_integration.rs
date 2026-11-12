@@ -300,6 +300,7 @@ struct TcpSeg<'a> {
     dport: u16,
     seq: u32,
     flags: u8,
+    options: &'a [u8],
     payload: &'a [u8],
 }
 
@@ -313,7 +314,7 @@ fn parse_ipv4_tcp(pkt: &[u8]) -> Option<TcpSeg<'_>> {
     }
     let t = &pkt[ihl..];
     let off = usize::from(t[12] >> 4) * 4;
-    if t.len() < off {
+    if t.len() < off || off < 20 {
         return None;
     }
     Some(TcpSeg {
@@ -323,6 +324,7 @@ fn parse_ipv4_tcp(pkt: &[u8]) -> Option<TcpSeg<'_>> {
         dport: u16::from_be_bytes([t[2], t[3]]),
         seq: u32::from_be_bytes(t[4..8].try_into().ok()?),
         flags: t[13],
+        options: &t[20..off],
         payload: &t[off..],
     })
 }
@@ -336,9 +338,18 @@ struct TcpEnds {
 }
 
 /// A checksummed IPv4+TCP segment — smoltcp drops checksum failures
-/// silently, so the pseudo-header checksum must be real.
-fn build_ipv4_tcp(ends: &TcpEnds, seq: u32, ack: u32, flags: u8, payload: &[u8]) -> Vec<u8> {
-    let tcp_len = 20 + payload.len();
+/// silently, so the pseudo-header checksum must be real. `options` must
+/// be 4-byte aligned already (NOP-padded); pass `&[]` for a bare header.
+fn build_ipv4_tcp(
+    ends: &TcpEnds,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    options: &[u8],
+    payload: &[u8],
+) -> Vec<u8> {
+    debug_assert_eq!(options.len() % 4, 0, "TCP options must be 4-aligned");
+    let tcp_len = 20 + options.len() + payload.len();
     let total_len = 20 + tcp_len;
     let mut pkt = vec![0u8; total_len];
     pkt[0] = 0x45;
@@ -356,10 +367,11 @@ fn build_ipv4_tcp(ends: &TcpEnds, seq: u32, ack: u32, flags: u8, payload: &[u8])
         t[2..4].copy_from_slice(&ends.dport.to_be_bytes());
         t[4..8].copy_from_slice(&seq.to_be_bytes());
         t[8..12].copy_from_slice(&ack.to_be_bytes());
-        t[12] = 5 << 4;
+        t[12] = (((20 + options.len()) / 4) as u8) << 4;
         t[13] = flags;
         t[14..16].copy_from_slice(&64240u16.to_be_bytes());
-        t[20..].copy_from_slice(payload);
+        t[20..20 + options.len()].copy_from_slice(options);
+        t[20 + options.len()..].copy_from_slice(payload);
     }
     let mut pseudo = Vec::with_capacity(12 + tcp_len);
     pseudo.extend_from_slice(&ends.src.octets());
@@ -510,6 +522,7 @@ async fn tcp_stream_echoes_through_full_tunnel() {
             seq,
             ack,
             flags,
+            &[],
             &payload,
         ))
     })
@@ -670,6 +683,120 @@ async fn concurrent_first_dials_share_one_handshake() {
         initiations.load(std::sync::atomic::Ordering::Relaxed),
         1,
         "concurrent first dials must share one handshake"
+    );
+
+    adapter.reset_sessions();
+    responder_task.abort();
+}
+
+/// Scan a TCP options block for the Window Scale option (kind 3, len 3).
+fn tcp_window_scale(options: &[u8]) -> Option<u8> {
+    let mut rest = options;
+    while let Some((&kind, tail)) = rest.split_first() {
+        match kind {
+            0 => return None, // EOL
+            1 => rest = tail, // NOP
+            3 if tail.len() >= 2 && tail[0] == 3 => return Some(tail[1]),
+            _ => {
+                let len = usize::from(*tail.first()?);
+                if len < 2 || rest.len() <= len {
+                    return None;
+                }
+                rest = &rest[len..];
+            }
+        }
+    }
+    None
+}
+
+/// Window-scale negotiation is the path the throughput fix relies on:
+/// smoltcp derives `remote_win_shift = bit_width(buffer) - 16` = 3 for
+/// the 256 KiB socket buffer and must emit it as a WS option in SYN, and
+/// a WS-bearing SYN-ACK must still drive the socket to Established with
+/// a working data path. Without this test every crafted SYN-ACK is bare
+/// (no options) and only the non-WS fallback path is ever exercised.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tcp_window_scale_negotiates_scaled_window() {
+    let ws_seen = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(u8::MAX));
+    let ws_seen_cl = std::sync::Arc::clone(&ws_seen);
+    let mut srv_next = 5001u32;
+    let (endpoint, responder_task, _inits) = spawn_responder(move |pkt| {
+        let seg = parse_ipv4_tcp(pkt)?;
+        let (seq, ack, flags, payload): (u32, u32, u8, Vec<u8>) =
+            if seg.flags & TCP_SYN != 0 && seg.flags & TCP_ACK == 0 {
+                if let Some(shift) = tcp_window_scale(seg.options) {
+                    ws_seen_cl.store(shift, std::sync::atomic::Ordering::Relaxed);
+                }
+                (5000, seg.seq.wrapping_add(1), TCP_SYN | TCP_ACK, Vec::new())
+            } else if seg.flags & TCP_FIN != 0 {
+                let reply = (
+                    srv_next,
+                    seg.seq
+                        .wrapping_add(u32::try_from(seg.payload.len()).unwrap())
+                        .wrapping_add(1),
+                    TCP_FIN | TCP_ACK,
+                    Vec::new(),
+                );
+                srv_next = srv_next.wrapping_add(1);
+                reply
+            } else if !seg.payload.is_empty() {
+                let len = u32::try_from(seg.payload.len()).unwrap();
+                let reply = (
+                    srv_next,
+                    seg.seq.wrapping_add(len),
+                    TCP_PSH | TCP_ACK,
+                    seg.payload.to_vec(),
+                );
+                srv_next = srv_next.wrapping_add(len);
+                reply
+            } else {
+                return None;
+            };
+        // Answer SYNs with our own WS offer (shift 3, NOP-padded to 4B);
+        // data/FIN segments go out bare like the echo responder's.
+        let options: &[u8] = if flags & TCP_SYN != 0 {
+            &[3, 3, 3, 1]
+        } else {
+            &[]
+        };
+        Some(build_ipv4_tcp(
+            &TcpEnds {
+                src: seg.dst_ip,
+                dst: seg.src_ip,
+                sport: seg.dport,
+                dport: seg.sport,
+            },
+            seq,
+            ack,
+            flags,
+            options,
+            &payload,
+        ))
+    })
+    .await;
+    let adapter = WireGuardAdapter::new(wg_config(endpoint, None)).expect("construct adapter");
+    let meta = Metadata {
+        network: Network::Tcp,
+        dst_ip: Some(Ipv4Addr::new(10, 9, 9, 9).into()),
+        dst_port: 443,
+        host: "10.9.9.9".into(),
+        ..Metadata::default()
+    };
+    let mut conn = tokio::time::timeout(Duration::from_secs(15), adapter.dial_tcp(&meta))
+        .await
+        .expect("dial must finish within the WG handshake window")
+        .expect("dial_tcp");
+    conn.write_all(b"meow-ws-echo").await.expect("stream write");
+    let mut buf = vec![0u8; b"meow-ws-echo".len()];
+    tokio::time::timeout(Duration::from_secs(10), conn.read_exact(&mut buf))
+        .await
+        .expect("echo must return within 10s")
+        .expect("stream read");
+    assert_eq!(&buf, b"meow-ws-echo", "scaled path echoes byte-for-byte");
+    assert_eq!(
+        ws_seen.load(std::sync::atomic::Ordering::Relaxed),
+        3,
+        "smoltcp SYN must offer window-scale 3 (bit_width(256KiB) - 16)"
     );
 
     adapter.reset_sessions();
