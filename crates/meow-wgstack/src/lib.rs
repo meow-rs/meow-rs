@@ -23,11 +23,11 @@ use smoltcp::time::Instant as SmolInstant;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
 
-/// pump→conn stream events per TCP flow (≈32 × 16 KiB ≈ 512 KiB of read
+/// actor→conn stream events per TCP flow (≈32 × 16 KiB ≈ 512 KiB of read
 /// backpressure per flow — deeper than the smoltcp socket window so the
 /// relay read side, not the channel, is the stall point).
 pub const TCP_READ_QUEUE: usize = 32;
-/// conn→pump write items per TCP flow.
+/// conn→actor write items per TCP flow.
 pub const TCP_WRITE_QUEUE: usize = 64;
 
 /// Per-socket smoltcp buffers (rx and tx). The rx half doubles as the
@@ -140,7 +140,7 @@ impl Device for ChannelDevice {
     }
 }
 
-/// conn→pump TCP items.
+/// conn→actor TCP items.
 #[derive(Debug)]
 pub enum TcpIo {
     Data(Bytes),
@@ -150,7 +150,7 @@ pub enum TcpIo {
     Close,
 }
 
-/// pump→conn TCP events. `Closed` is queued strictly after every `Data`
+/// actor→conn TCP events. `Closed` is queued strictly after every `Data`
 /// already delivered, preserving read order.
 pub enum StreamEvent {
     Data(Bytes),

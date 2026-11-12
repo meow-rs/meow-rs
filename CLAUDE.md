@@ -64,7 +64,7 @@ Listeners (HTTP/SOCKS5/Mixed/TProxy/TUN)
 
 ### Workspace Crates
 
-The workspace has 15 crates (see also [ADR-0009](docs/adr/0009-cleanup-scope.md) for crate-boundary policy):
+The workspace has 16 crates (see also [ADR-0009](docs/adr/0009-cleanup-scope.md) for crate-boundary policy):
 
 | Crate | Purpose |
 |-------|---------|
@@ -72,6 +72,7 @@ The workspace has 15 crates (see also [ADR-0009](docs/adr/0009-cleanup-scope.md)
 | `meow-trie` | Domain trie for efficient pattern matching |
 | `meow-anytls` | Vendored fork of `anytls-rs` (lib name `anytls_rs`); MIT-licensed, in-tree to provide `Stream::close()` (see [#262](https://github.com/madeye/meow-rs/issues/262)). Pulled in only by `meow-proxy`'s opt-in `anytls` feature |
 | `meow-lwip` | Vendored fork of `lwip` (madeye/lwip); MIT/Apache-2.0 bindings over BSD-3 lwIP C sources, in-tree because crates.io forbids `git` deps. Lib name `lwip`; pulled in only by `meow-listener`'s `listener-tun` feature |
+| `meow-wgstack` | Shared smoltcp/Tokio plumbing for WireGuard adapters/listeners (channel-backed smoltcp `Device`, per-conn `WgStream` AsyncRead/AsyncWrite shim, queue/buffer constants, endpoint `SO_RCVBUF` enlarger); consumed by `meow-proxy`'s opt-in `wireguard` feature and the WG inbound listener |
 | `meow-transport` | Composable stream-transport layers (TLS, WebSocket, gRPC, HTTP/2, HTTP Upgrade) — protocol-agnostic, no dep on other meow-rs crates (see [ADR-0001](docs/adr/0001-meow-transport-crate.md)) |
 | `meow-proxy` | Proxy protocol implementations (SS, Trojan, VLESS, Direct, Reject), groups (Selector, URLTest, Fallback, LoadBalance, Relay), and health probing |
 | `meow-rules` | Rule matching engine and parser (domain, IP-CIDR, GeoIP, process, logic composition) |

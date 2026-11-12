@@ -85,8 +85,8 @@ jobs:
           # dev-depends on meow-config, so config precedes tunnel). meow-bench is
           # intentionally not published.
           crates=(
-            meow-common meow-trie meow-anytls meow-lwip meow-transport
-            meow-rules meow-dns meow-proxy
+            meow-common meow-trie meow-anytls meow-lwip meow-wireguard
+            meow-wgstack meow-transport meow-rules meow-dns meow-proxy
             meow-config meow-tunnel meow-listener meow-api
             meow-app
           )
