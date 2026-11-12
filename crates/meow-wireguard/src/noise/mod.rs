@@ -602,6 +602,15 @@ mod tests {
     use super::*;
     use rand_core::{OsRng, RngCore};
 
+    /// Serializes tests that advance the process-global mock clock — or
+    /// whose asserts depend on a clock-sensitive intermediate state.
+    /// Otherwise one test's `MockClock::advance` can land inside a
+    /// sibling's in-flight `InitSent` window and push it past
+    /// REKEY_ATTEMPT_TIME: `new_handshake_after_two_mins`'s +120s made
+    /// `handshake_no_resp_rekey_timeout` fail intermittently under
+    /// `cargo test` (cargo-nextest's per-test processes cannot collide).
+    static TIMER_CLOCK_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
     fn create_two_tuns() -> (Tunn, Tunn) {
         let my_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
         let my_public_key = x25519_dalek::PublicKey::from(&my_secret_key);
@@ -742,6 +751,7 @@ mod tests {
     #[test]
     #[cfg(feature = "mock-instant")]
     fn new_handshake_after_two_mins() {
+        let _clock = TIMER_CLOCK_LOCK.lock();
         let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
         let mut my_dst = [0u8; 1024];
 
@@ -766,6 +776,7 @@ mod tests {
     #[test]
     #[cfg(feature = "mock-instant")]
     fn handshake_no_resp_rekey_timeout() {
+        let _clock = TIMER_CLOCK_LOCK.lock();
         let (mut my_tun, _their_tun) = create_two_tuns();
 
         let init = create_handshake_init(&mut my_tun);
@@ -774,6 +785,63 @@ mod tests {
 
         crate::mock_instant::MockClock::advance(REKEY_TIMEOUT);
         update_timer_results_in_handshake(&mut my_tun);
+    }
+
+    /// A `HandshakeState::Expired` session is recoverable: once the
+    /// handshake is `Expired`, `update_timers` reports
+    /// `Err(ConnectionExpired)` on every tick — the sticky error a caller
+    /// that swallows it would see forever — until boringtun's own
+    /// recovery, `format_handshake_initiation(dst, true)` (the same call
+    /// `update_timers` itself makes on a rekey timeout), moves the
+    /// handshake back to `InitSent`. The meow-proxy wireguard pump's
+    /// `tick_timers` relies on exactly this contract.
+    ///
+    /// `set_expired()` plants the same terminal state the
+    /// REKEY_ATTEMPT_TIME / REJECT_AFTER_TIME*3 paths produce, without
+    /// advancing the process-global mock clock — a real 90s+ advance
+    /// would race sibling tests' in-flight handshakes.
+    #[test]
+    fn forced_handshake_initiation_recovers_expired_session() {
+        // The final `update_timers` assert is clock-sensitive: a stray
+        // sibling advance could push the fresh InitSent over
+        // REKEY_ATTEMPT_TIME and back into `Err`. The lock rules it out.
+        let _clock = TIMER_CLOCK_LOCK.lock();
+        let (mut my_tun, _their_tun) = create_two_tuns();
+        // InitSent with no response — the initiation retry clock runs.
+        let init = create_handshake_init(&mut my_tun);
+        let packet = Tunn::parse_incoming_packet(&init).unwrap();
+        assert!(matches!(packet, Packet::HandshakeInit(_)));
+
+        // The state every expiry path lands in; the sticky error is what
+        // a pump that dropped the `Err` would see on each tick.
+        my_tun.handshake.set_expired();
+        let mut dst = [0u8; 2048];
+        assert!(matches!(
+            my_tun.update_timers(&mut dst),
+            TunnResult::Err(WireGuardError::ConnectionExpired)
+        ));
+        assert!(matches!(
+            my_tun.update_timers(&mut dst),
+            TunnResult::Err(WireGuardError::ConnectionExpired)
+        ));
+        assert!(my_tun.is_expired());
+
+        // The forced resend emits a fresh initiation and un-expires the
+        // handshake — no clock involvement, fully deterministic.
+        let res = my_tun.format_handshake_initiation(&mut dst, true);
+        assert!(matches!(res, TunnResult::WriteToNetwork(_)));
+        let TunnResult::WriteToNetwork(packet_data) = res else {
+            unreachable!();
+        };
+        let packet = Tunn::parse_incoming_packet(packet_data).unwrap();
+        assert!(matches!(packet, Packet::HandshakeInit(_)));
+        assert!(!my_tun.is_expired());
+
+        // The tick is off the sticky-error path and back to normal duty:
+        // an idle tick has nothing to do — a deterministic `Done` under
+        // the clock lock.
+        let res = my_tun.update_timers(&mut dst);
+        assert!(matches!(res, TunnResult::Done), "got {res:?}");
     }
 
     #[test]

@@ -180,6 +180,23 @@ Patch 13 — noise/mod.rs: DATA_OVERHEAD_SZ private -> pub + facade deps
     x25519-dalek. Keep the length pre-check + the SAFETY NOTE.
   * crypto.rs `aead_chacha20_open_inner` writes `dst[..buf.len()]`
     (caller buffers may be larger than the plaintext — documented).
+
+Patch 14 — noise/mod.rs tests: serialize the process-global mock clock
+  Patch 8's MockClock is a single global offset shared by every test in
+  the process. Upstream's `new_handshake_after_two_mins` advances +120s,
+  which can land inside `handshake_no_resp_rekey_timeout`'s in-flight
+  `InitSent` window and push it past REKEY_ATTEMPT_TIME (90s) — a ~1-in-5
+  flake under `cargo test` threads; cargo-nextest's per-test processes
+  cannot collide. `static TIMER_CLOCK_LOCK` (parking_lot::Mutex) is held
+  for the whole body of every test that advances the clock or asserts on
+  a clock-sensitive intermediate state.
+  Also adds `forced_handshake_initiation_recovers_expired_session` —
+  pins the Expired -> InitSent recovery contract the meow-proxy
+  wireguard pump's tick_timers relies on. It drives the Expired state
+  via `handshake.set_expired()` (pub(crate), reachable from the test
+  module) instead of a real 90s+ advance precisely to avoid widening
+  that race surface; it still takes the lock for its final
+  clock-sensitive timer assert.
 ```
 
 Notes on what did NOT need patching
@@ -193,3 +210,11 @@ Notes on what did NOT need patching
   do not "simplify" them into each other.
 * noise/errors.rs and sleepyinstant/windows.rs are byte-identical to
   upstream.
+* `parse_incoming_packet` (noise/mod.rs) keeps upstream's strict check
+  verbatim: bytes 0..4 are read as one LE u32, so any non-zero reserved
+  byte fails type matching. Cloudflare WARP-style peers stamp non-zero
+  identifiers there — the don't-care receive semantics lives in the
+  caller instead (meow-proxy's pump zeroes bytes 1..4 of every inbound
+  datagram before `decapsulate`, in `decapsulate_wire`). Do NOT loosen
+  this check inside the crate, and do not "fix" the parser on a vendor
+  bump replay — the strictness is upstream's.
