@@ -4673,9 +4673,13 @@ fn build_ss_listener_spec(raw_l: &raw::RawListener) -> Result<SsListenerConfig, 
 /// path for the error, e.g. `listeners[wg].peers[0].public-key`.
 fn wg_b64_key(value: Option<&str>, ctx: &str) -> Result<[u8; 32], anyhow::Error> {
     use base64::Engine;
-    let raw = value
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("{ctx}: missing base64 key"))?;
+    let raw = match value {
+        None => anyhow::bail!("{ctx}: missing base64 key"),
+        // A present-but-empty key names a different defect than an absent
+        // one — don't call it "missing".
+        Some("") => anyhow::bail!("{ctx}: must not be empty"),
+        Some(s) => s,
+    };
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(raw)
         .map_err(|_| anyhow::anyhow!("{ctx}: must be base64"))?;
@@ -4744,10 +4748,12 @@ fn wg_peer_reserved(
 /// carries no unconditional crypto dep.
 ///
 /// Keys the schema knows but `type: wireguard` does not consume
-/// (`cipher`, `tproxy-sni`, the opaque upstream sub-options, …) and
-/// schema-unknown keys (captured by `RawListener`'s flatten field)
-/// warn-and-ignore — the same policy every other listener arm applies
-/// (ADR-0002), keeping forward-compat with keys a newer schema adds.
+/// (`cipher`, the opaque upstream sub-options, …) and schema-unknown
+/// keys (captured by `RawListener`'s flatten field) warn-and-ignore —
+/// the same policy every other listener arm applies (ADR-0002), keeping
+/// forward-compat with keys a newer schema adds. Tproxy-only keys set
+/// on a WG entry (`tproxy-sni`, `firewall`, `transparent`) warn in the
+/// generic arms of `build_named_listeners`, not here.
 fn build_wg_listener_spec(raw_l: &raw::RawListener) -> Result<WgListenerConfig, anyhow::Error> {
     for (key, set) in [
         ("cipher", raw_l.cipher.is_some()),
@@ -4809,6 +4815,15 @@ fn build_wg_listener_spec(raw_l: &raw::RawListener) -> Result<WgListenerConfig, 
         Some(s) => std::time::Duration::from_secs(s),
         None => default_wg_udp_timeout(),
     };
+    // Same asymmetric-misuse diagnosis as the tproxy arm: with `udp:
+    // false` the timeout binds nothing.
+    if raw_l.udp == Some(false) && raw_l.udp_timeout.is_some() {
+        warn!(
+            "listeners[{}].udp-timeout: has no effect unless `udp: true` is set; \
+             remove it to suppress this warning",
+            raw_l.name
+        );
+    }
 
     let raw_peers = raw_l.peers.as_deref().ok_or_else(|| {
         anyhow::anyhow!(
@@ -4894,6 +4909,7 @@ fn build_wg_listener_spec(raw_l: &raw::RawListener) -> Result<WgListenerConfig, 
             name: rp
                 .name
                 .as_deref()
+                .filter(|s| !s.is_empty())
                 .map_or_else(|| SmolStr::from(format!("peer-{i}")), SmolStr::from),
             reserved,
         });

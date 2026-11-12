@@ -281,6 +281,16 @@ async fn wg_max_connections_and_bind_conflict() {
     assert!(err.contains("conflicts"), "{err}");
 }
 
+/// A present-but-empty peer `name` is the same "no value" as an absent
+/// one — the `peer-<index>` auto-label applies (the key helpers filter
+/// empty strings the same way).
+#[tokio::test]
+async fn wg_peer_empty_name_falls_back_to_index() {
+    let p = peer("        name: \"\"\n");
+    let cfg = build_wg(&wg_yaml("", &p)).await;
+    assert_eq!(cfg.peers[0].name.as_str(), "peer-0");
+}
+
 // ─── Hard errors ─────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -291,6 +301,17 @@ async fn wg_missing_private_key_errors() {
     );
     let err = err_of(&yaml).await;
     assert!(err.contains("private-key"), "{err}");
+}
+
+/// `private-key: ""` is present-but-empty, a different defect than an
+/// absent key — the error must not call it "missing".
+#[tokio::test]
+async fn wg_empty_private_key_errors() {
+    let yaml = minimal_yaml().replace(LISTENER_PRIV, "");
+    let err = err_of(&yaml).await;
+    assert!(err.contains("private-key"), "{err}");
+    assert!(err.contains("empty"), "{err}");
+    assert!(!err.contains("missing"), "{err}");
 }
 
 #[tokio::test]
@@ -425,6 +446,28 @@ async fn wg_unknown_and_foreign_keys_warn_not_error() {
             "missing warn containing '{needle}': {lines:?}"
         );
     }
+}
+
+/// `udp: false` + `udp-timeout: N` is the same asymmetric misuse the
+/// tproxy arm diagnoses — warn, don't silently consume.
+#[tokio::test]
+async fn wg_udp_timeout_with_udp_disabled_warns() {
+    let yaml = wg_yaml("    udp: false\n    udp-timeout: 120\n", &peer(""));
+    let (result, lines) = load_capturing_warns(&yaml).await;
+    result.unwrap_or_else(|e| panic!("must warn, not error: {e:#}"));
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("udp-timeout") && l.contains("has no effect unless `udp: true`")),
+        "missing udp-timeout warn: {lines:?}"
+    );
+    // Without `udp: false` the same timeout is consumed silently.
+    let (result, lines) = load_capturing_warns(&wg_yaml("    udp-timeout: 120\n", &peer(""))).await;
+    result.unwrap();
+    assert!(
+        !lines.iter().any(|l| l.contains("udp-timeout")),
+        "no warn expected with udp enabled: {lines:?}"
+    );
 }
 
 #[tokio::test]
