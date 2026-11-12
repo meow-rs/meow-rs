@@ -55,13 +55,17 @@ const WAKE_QUEUE: usize = 64;
 
 /// Per-socket smoltcp buffers (rx and tx). The rx half doubles as the
 /// advertised TCP window — smoltcp negotiates RFC 7323 window scaling in
-/// SYN (`remote_win_shift = log2(capacity) - 16` = 3 here), so per-flow
+/// SYN (`remote_win_shift = bit_width(capacity) - 16` = 19 - 16 = 3), so
+/// per-flow
 /// throughput caps at `TCP_SOCKET_BUF / RTT`: 64 KiB held a 140 ms-RTT
 /// path to ~0.5 MB/s (measured on a real KR↔US peer), 256 KiB lifts the
 /// cap to ~1.8 MB/s. Peers that don't answer with `window_scale` fall
 /// back to the 16-bit wire window (~64 KiB cap) silently. Cost:
 /// 2 × 256 KiB eagerly allocated per WG TCP connection.
-const TCP_SOCKET_BUF: usize = 256 * 1024;
+///
+/// `pub(super)`: the adapter sizes the endpoint's kernel receive buffer
+/// from this — a full-window burst arrives as ~this many WG datagrams.
+pub(super) const TCP_SOCKET_BUF: usize = 256 * 1024;
 /// smoltcp UDP packet buffer: packet slots and payload arena.
 const UDP_SOCKET_PACKETS: usize = 64;
 const UDP_SOCKET_BYTES: usize = 65536;
