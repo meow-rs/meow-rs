@@ -195,6 +195,13 @@ pub(super) struct WgActor {
     /// (`route_tx_packet` consults this once `self.tcp` no longer
     /// holds the flow) and the tuple entry dies with the socket.
     tcp_dying: HashMap<smoltcp::iface::SocketHandle, (usize, InnerTuple)>,
+    /// Handles whose `tcp_dying`/`tcp_by_tuple` entries die on the
+    /// *next* reap pass — a conn aborted in this pass has its RST
+    /// emitted by this pass's `iface.poll`, but `drain_device_tx` only
+    /// routes it after `reap_orphaned_sockets` has run; erasing the
+    /// tables at removal time would strand that RST unroutable. One
+    /// deferred pass covers the drain window.
+    dead_dying: Vec<smoltcp::iface::SocketHandle>,
     /// Tuples whose SYN demanded (and got) a listener since the last
     /// `post_poll` — the in-flight half of the connection cap so a
     /// same-batch burst can't overshoot; deduped by tuple so a
@@ -294,6 +301,7 @@ impl WgActor {
             rst_hint: HashMap::new(),
             pending_close: Vec::new(),
             tcp_dying: HashMap::new(),
+            dead_dying: Vec::new(),
             in_flight_syns: HashSet::new(),
             udp_flows: HashMap::new(),
             udp_enabled: cfg.udp,
@@ -800,14 +808,23 @@ impl WgActor {
         // Handles deferred last pass — re-validated because smoltcp
         // recycles freed slots: a reused handle pointing at a live
         // socket fails `is_orphan_dead` and is left alone.
+        // Entries deferred last pass: their RST drained on the
+        // intervening `drain_device_tx`, so the tables can go now.
+        for handle in std::mem::take(&mut self.dead_dying) {
+            if let Some((_, key)) = self.tcp_dying.remove(&handle) {
+                self.tcp_by_tuple.remove(&key);
+            }
+        }
         let pending = std::mem::take(&mut self.pending_close);
         for handle in pending {
             if self.is_orphan_dead(handle) {
                 self.sockets.remove(handle);
-                // A deferred conn-dead flow dies with its socket —
-                // its RST already dispatched on the intervening poll.
-                if let Some((_, key)) = self.tcp_dying.remove(&handle) {
-                    self.tcp_by_tuple.remove(&key);
+                // The socket dies now but its RST is queued in
+                // `device.tx_queue` and routes via `tcp_dying` in the
+                // `drain_device_tx` that runs right after this pass's
+                // `post_poll` — defer the table erase one pass.
+                if self.tcp_dying.contains_key(&handle) {
+                    self.dead_dying.push(handle);
                 }
             }
         }
