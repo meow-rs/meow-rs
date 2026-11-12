@@ -69,6 +69,13 @@ pub(crate) enum StreamCmd {
 /// because handles send from `poll_*` and `Drop`, where blocking or dropping
 /// a command is not an option.
 pub(crate) enum Cmd {
+    /// (test only) Count pcbs on `tcp_tw_pcbs`, walked on the core thread.
+    #[cfg(test)]
+    TimewaitCount(tokio::sync::oneshot::Sender<usize>),
+    /// (test only) Advances lwIP's global TCP clock ~2*MSL: expires every
+    /// aged pcb, not just TIME_WAIT — send only while no streams are live.
+    #[cfg(test)]
+    ExpireTimewait(tokio::sync::oneshot::Sender<()>),
     /// Handle-side bookkeeping for a freshly accepted stream (created inside
     /// `tcp_accept_cb`); FIFO order guarantees the core sees this before any
     /// other command for the same id.
@@ -624,6 +631,29 @@ impl LwipCore {
 
     fn handle_cmd(&mut self, cmd: Cmd) {
         match cmd {
+            #[cfg(test)]
+            Cmd::ExpireTimewait(done) => {
+                // Test time advances through the same owner as packet input.
+                for _ in 0..=2 * TCP_MSL / TCP_SLOW_INTERVAL {
+                    unsafe {
+                        tcp_slowtmr();
+                    }
+                }
+                let _ = done.send(());
+            }
+            #[cfg(test)]
+            Cmd::TimewaitCount(done) => {
+                let mut count = 0;
+                // Only the existing serialized core accesses lwIP's lists.
+                unsafe {
+                    let mut pcb = tcp_tw_pcbs;
+                    while !pcb.is_null() {
+                        count += 1;
+                        pcb = (*pcb).next;
+                    }
+                }
+                let _ = done.send(count);
+            }
             Cmd::NewStream {
                 id,
                 pcb,

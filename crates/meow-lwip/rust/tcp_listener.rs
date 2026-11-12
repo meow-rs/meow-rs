@@ -15,6 +15,20 @@ pub struct TcpListener {
 }
 
 impl TcpListener {
+    #[cfg(test)]
+    pub(crate) async fn expire_timewait(&self) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx.send(Cmd::ExpireTimewait(tx)).unwrap();
+        rx.await.unwrap();
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn timewait_count(&self) -> usize {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx.send(Cmd::TimewaitCount(tx)).unwrap();
+        rx.await.unwrap()
+    }
+
     pub(crate) fn new(
         accept_rx: Receiver<(TcpStream, SocketAddr, SocketAddr)>,
         cmd_tx: UnboundedSender<Cmd>,
