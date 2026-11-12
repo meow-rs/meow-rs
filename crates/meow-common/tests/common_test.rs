@@ -20,6 +20,7 @@ fn test_adapter_type_display() {
         (AdapterType::Vless, "Vless"),
         (AdapterType::Trojan, "Trojan"),
         (AdapterType::Hysteria2, "Hysteria2"),
+        (AdapterType::WireGuard, "WireGuard"),
     ];
     for (variant, expected) in cases {
         assert_eq!(variant.to_string(), expected, "AdapterType::{variant:?}");

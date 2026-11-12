@@ -1,0 +1,1428 @@
+//! The WireGuard pump: a single-actor loop that owns the boringtun `Tunn`
+//! noise session, the smoltcp `Interface`/`SocketSet`, the channel-backed
+//! `Device` between them, and the endpoint UDP socket to the WG peer.
+//!
+//! Spec §3/§4.5: smoltcp's `Interface`/`SocketSet` are confined to one
+//! dedicated `std::thread` running a current-thread tokio runtime (the
+//! hysteria2/quiche non-`Send` precedent). Everything cross-thread travels
+//! over tokio mpsc channels: [`ActorMsg`] for dial/bind/shutdown, per-conn
+//! channels for stream/datagram payload, and a shared `wake` channel a conn
+//! nudges after enqueueing so a sleeping pump picks the item up at once.
+//!
+//! The actor owns `Tunn` outright — the loop itself is the serialization
+//! point, so there is no `Mutex<Tunn>` (deviation from spec §3.3, which
+//! sketched one before §4.5 settled on actor-serialized access).
+
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
+use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant as StdInstant};
+
+use bytes::{Buf, Bytes};
+use meow_common::{MeowError, ProxyConn, ProxyPacketConn, Result};
+use meow_wireguard::{x25519, Tunn, TunnResult};
+use smoltcp::iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet};
+use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
+use smoltcp::socket::{tcp, udp};
+use smoltcp::time::Instant as SmolInstant;
+use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::sync::{mpsc, oneshot};
+use tracing::{debug, warn};
+
+use super::config::WireGuardConfig;
+
+/// Mailbox capacity: a burst of parallel dials stays non-blocking well
+/// beyond realistic fan-out (spec §3.3).
+const ACTOR_MAILBOX: usize = 64;
+/// pump→conn stream events per TCP flow (≈128 × 4 KiB ≈ 512 KiB of read
+/// backpressure per flow before smoltcp's window stalls it).
+const TCP_READ_QUEUE: usize = 128;
+/// conn→pump write items per TCP flow.
+const TCP_WRITE_QUEUE: usize = 64;
+/// pump→conn datagrams per UDP association.
+const UDP_READ_QUEUE: usize = 256;
+/// conn→pump datagrams per UDP association.
+const UDP_WRITE_QUEUE: usize = 128;
+/// Shared wake channel: every conn enqueues a nudge after each item so a
+/// pump sleeping in `select!` services the new work immediately.
+const WAKE_QUEUE: usize = 64;
+
+/// Per-socket smoltcp buffers (rx and tx), spec §3.6.
+const TCP_SOCKET_BUF: usize = 65536;
+/// smoltcp UDP packet buffer: packet slots and payload arena.
+const UDP_SOCKET_PACKETS: usize = 64;
+const UDP_SOCKET_BYTES: usize = 65536;
+
+/// Read chunk handed to `socket.recv` — one MTU-ish slice per item keeps
+/// per-conn queues responsive instead of draining 64 KiB at once.
+const TCP_READ_CHUNK: usize = 4096;
+
+/// Endpoint→Tunn drain bound per loop iteration; excess waits for the next
+/// wake-up rather than starving the rest of the service pass.
+const WIRE_DRAIN_BUDGET: usize = 64;
+
+/// boringtun's own device loop ticks its timers at 250 ms (rekey timeout is
+/// 5 s, jitter ≤ 333 ms — this is well inside slack). Spec §3.4 sketched
+/// 100 ms without naming a constant; the upstream cadence is the better
+/// choice for idle CPU.
+const WG_TIMER_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Idle `select!` sleep when smoltcp reports no `poll_delay`: inbound WG
+/// datagrams, mailbox messages and conn wakes all break the sleep early, so
+/// this only bounds the smoltcp housekeeping cadence.
+const IDLE_SLEEP: Duration = Duration::from_millis(10);
+
+/// Spec §3.7: a WG handshake that has not completed within 10 s fails all
+/// dials still waiting on it.
+const HANDSHAKE_DIAL_LIMIT: Duration = Duration::from_secs(10);
+/// Once the WG session is up, a TCP connect may wait out the adapter's
+/// outer 30 s dial deadline (spec §4.2); the pump gives up one step earlier
+/// so the reply error beats the caller's timeout.
+const TCP_CONNECT_LIMIT: Duration = Duration::from_secs(25);
+
+/// Ephemeral port range for tunnel-local sockets; smoltcp does not allocate
+/// ephemeral ports for us.
+const EPHEMERAL_PORT_BASE: u16 = 49152;
+const EPHEMERAL_PORT_SPAN: u16 = 16384;
+
+/// Messages into the pump actor.
+pub(crate) enum ActorMsg {
+    /// Open a smoltcp TCP socket toward `remote`; the reply fires once the
+    /// connection reaches `Established` or definitively fails.
+    DialTcp {
+        remote: SocketAddr,
+        display: String,
+        reply: oneshot::Sender<Result<Box<dyn ProxyConn>>>,
+    },
+    /// Allocate a smoltcp UDP socket and hand back its packet conn.
+    UdpBind {
+        /// Shared allowed-IPs table for per-datagram egress checks.
+        allowed: Arc<Vec<ipnet::IpNet>>,
+        /// Whether a tunnel address of each family exists (write-time
+        /// pre-check so the caller gets an error instead of a silent drop).
+        has_v4: bool,
+        has_v6: bool,
+        reply: oneshot::Sender<Result<Box<dyn ProxyPacketConn>>>,
+    },
+    /// Stop the pump; in-flight conns die with it (`reset_sessions`).
+    Shutdown,
+}
+
+/// conn→pump TCP items.
+#[derive(Debug)]
+pub(crate) enum TcpIo {
+    Data(Bytes),
+    /// `poll_shutdown`: FIN after everything queued ahead of it.
+    Shutdown,
+    /// Conn dropped without shutdown: abort the socket.
+    Close,
+}
+
+/// pump→conn TCP events. `Closed` is queued strictly after every `Data`
+/// already delivered, preserving read order.
+pub(crate) enum StreamEvent {
+    Data(Bytes),
+    /// Orderly EOF (peer FIN'd, or the conn vanished). Abrupt socket death
+    /// surfaces instead as the channel dropping → same `Ok(0)` shape a
+    /// torn-down stream gets everywhere else in the adapter surface.
+    Closed,
+}
+
+/// conn→pump UDP items.
+pub(crate) enum UdpIo {
+    SendTo {
+        data: Bytes,
+        addr: SocketAddr,
+    },
+    /// Conn dropped or `close()`d: remove the socket.
+    Close,
+}
+
+/// A channel-backed smoltcp [`Device`]: packets `Tunn::decapsulate` yields
+/// are pushed into `rx_queue` for `Interface` ingress; everything
+/// `Interface` egresses lands in `tx_queue` for `Tunn::encapsulate`.
+struct ChannelDevice {
+    rx_queue: VecDeque<Vec<u8>>,
+    tx_queue: VecDeque<Vec<u8>>,
+    caps: DeviceCapabilities,
+}
+
+impl ChannelDevice {
+    fn new(mtu: usize) -> Self {
+        // `DeviceCapabilities` is #[non_exhaustive] — mutate from default.
+        let mut caps = DeviceCapabilities::default();
+        caps.medium = Medium::Ip;
+        // The "wire" is the WG tunnel; an IP packet up to inner MTU
+        // always fits one WG data message.
+        caps.max_transmission_unit = mtu;
+        caps.max_burst_size = None;
+        // Checksum::Both (the default): software checksums everywhere.
+        Self {
+            rx_queue: VecDeque::new(),
+            tx_queue: VecDeque::new(),
+            caps,
+        }
+    }
+}
+
+struct SmolRxToken {
+    packet: Vec<u8>,
+}
+
+impl RxToken for SmolRxToken {
+    fn consume<R, F>(self, f: F) -> R
+    where
+        F: FnOnce(&[u8]) -> R,
+    {
+        f(&self.packet)
+    }
+}
+
+struct SmolTxToken<'a> {
+    queue: &'a mut VecDeque<Vec<u8>>,
+}
+
+impl TxToken for SmolTxToken<'_> {
+    fn consume<R, F>(self, len: usize, f: F) -> R
+    where
+        F: FnOnce(&mut [u8]) -> R,
+    {
+        let mut buf = vec![0u8; len];
+        let out = f(&mut buf);
+        self.queue.push_back(buf);
+        out
+    }
+}
+
+impl Device for ChannelDevice {
+    type RxToken<'a> = SmolRxToken;
+    type TxToken<'a> = SmolTxToken<'a>;
+
+    fn receive(
+        &mut self,
+        _timestamp: SmolInstant,
+    ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        self.rx_queue.pop_front().map(|packet| {
+            (
+                SmolRxToken { packet },
+                SmolTxToken {
+                    queue: &mut self.tx_queue,
+                },
+            )
+        })
+    }
+
+    fn transmit(&mut self, _timestamp: SmolInstant) -> Option<Self::TxToken<'_>> {
+        Some(SmolTxToken {
+            queue: &mut self.tx_queue,
+        })
+    }
+
+    fn capabilities(&self) -> DeviceCapabilities {
+        self.caps.clone()
+    }
+}
+
+type TcpDialReply = oneshot::Sender<Result<Box<dyn ProxyConn>>>;
+
+/// A TCP flow still waiting on `Established` — or on the WG handshake to
+/// finish so the SYN can leave at all.
+struct PendingTcp {
+    reply: TcpDialReply,
+    read_rx: mpsc::Receiver<StreamEvent>,
+    write_tx: mpsc::Sender<TcpIo>,
+    drain_notify: Arc<tokio::sync::Notify>,
+    display: String,
+    created: StdInstant,
+}
+
+struct TcpState {
+    pending: Option<PendingTcp>,
+    read_tx: mpsc::Sender<StreamEvent>,
+    write_rx: mpsc::Receiver<TcpIo>,
+    /// Signalled after the `out` backlog shrinks; a `WgStream` whose
+    /// `poll_write` met a full channel parks on this instead of a timeout.
+    drain_notify: Arc<tokio::sync::Notify>,
+    /// Ordered conn→socket items not yet accepted by `send_slice`
+    /// (shutdown/close markers ride the same queue to stay ordered).
+    out: VecDeque<TcpIo>,
+    /// Socket→conn chunks the conn channel had no room for; flushed ahead
+    /// of new `recv` pulls so ordering survives.
+    pending_read: VecDeque<StreamEvent>,
+    eof_sent: bool,
+    /// A `Shutdown` was already consumed: the FIN is flowing, so a later
+    /// conn-drop must not downgrade the close to `abort()` and RST the
+    /// peer mid-drain.
+    graceful_close: bool,
+}
+
+struct UdpState {
+    read_tx: mpsc::Sender<(Bytes, SocketAddr)>,
+    write_rx: mpsc::Receiver<UdpIo>,
+    /// Datagrams stalled on `SendError::BufferFull`; UDP items are atomic,
+    /// so each entry is a whole datagram.
+    out: VecDeque<(Bytes, SocketAddr)>,
+    local: SocketAddr,
+}
+
+/// The smoltcp/boringtun actor. Constructed inside [`spawn_pump`]'s thread
+/// so nothing smoltcp touches ever crosses a thread boundary.
+struct WgPump {
+    name: String,
+    tunn: Tunn,
+    iface: Interface,
+    device: ChannelDevice,
+    sockets: SocketSet<'static>,
+    endpoint: tokio::net::UdpSocket,
+    endpoint_addr: SocketAddr,
+    rx: mpsc::Receiver<ActorMsg>,
+    wake_tx: mpsc::Sender<()>,
+    wake_rx: mpsc::Receiver<()>,
+    tcp: HashMap<SocketHandle, TcpState>,
+    udp: HashMap<SocketHandle, UdpState>,
+    used_ports: HashSet<u16>,
+    next_port: u16,
+    /// WG datagrams to write to the endpoint socket; drained by `try_send`
+    /// so a stuffed kernel buffer only ever delays, never wedges the actor.
+    outbox: VecDeque<Vec<u8>>,
+    reserved: Option<[u8; 3]>,
+    /// Tunnel source addresses for `UdpMetadata.local_address`, per family.
+    src_v4: Option<IpAddress>,
+    src_v6: Option<IpAddress>,
+    recv_buf: Vec<u8>,
+    /// Scratch for `Tunn::{encapsulate,decapsulate,update_timers,...}` —
+    /// kept outside `self` during calls so the `TunnResult`'s borrow of it
+    /// never fights the `&mut self` the enqueue paths need.
+    work: Vec<u8>,
+    udp_scratch: Vec<u8>,
+    last_timer: StdInstant,
+}
+
+impl WgPump {
+    fn new(
+        config: &WireGuardConfig,
+        std_sock: std::net::UdpSocket,
+        endpoint_addr: SocketAddr,
+        rx: mpsc::Receiver<ActorMsg>,
+    ) -> std::io::Result<Self> {
+        std_sock.set_nonblocking(true)?;
+        let endpoint = tokio::net::UdpSocket::from_std(std_sock)?;
+
+        let tunn = Tunn::new(
+            x25519::StaticSecret::from(config.private_key),
+            x25519::PublicKey::from(config.public_key),
+            config.pre_shared_key,
+            (config.persistent_keepalive > 0).then_some(config.persistent_keepalive),
+            rand::random(),
+            None,
+        );
+
+        // The device advertises the inner MTU; smoltcp clamps TCP's MSS to
+        // it. Floor at the IPv4 minimum so a degenerate `mtu` config cannot
+        // make every egress packet unrepresentable.
+        let inner_mtu = config.inner_mtu().max(576);
+        let mut device = ChannelDevice::new(inner_mtu);
+        let mut iface_config = IfaceConfig::new(HardwareAddress::Ip);
+        iface_config.random_seed = rand::random();
+        let mut iface = Interface::new(iface_config, &mut device, SmolInstant::now());
+        iface.update_ip_addrs(|addrs| {
+            if let Some(ip) = config.ip {
+                let _ = addrs.push(IpCidr::new(ip.into(), 32));
+            }
+            if let Some(ip) = config.ipv6 {
+                let _ = addrs.push(IpCidr::new(ip.into(), 128));
+            }
+        });
+        // Note: no routes are programmed. `Medium::Ip` egress never consults
+        // the route table (route lookup exists for neighbor media), and
+        // `connect()`'s source-address selection reads `ip_addrs`, not
+        // routes — so allowed-ips policy lives at the adapter's
+        // dial/write-time check, where it can produce an error instead of
+        // a silent drop.
+
+        let buf_size = usize::from(config.mtu).max(2048) + 64;
+        let (wake_tx, wake_rx) = mpsc::channel(WAKE_QUEUE);
+        Ok(Self {
+            name: config.name.clone(),
+            tunn,
+            iface,
+            device,
+            sockets: SocketSet::new(vec![]),
+            endpoint,
+            endpoint_addr,
+            rx,
+            wake_tx,
+            wake_rx,
+            tcp: HashMap::new(),
+            udp: HashMap::new(),
+            used_ports: HashSet::new(),
+            next_port: EPHEMERAL_PORT_BASE + rand::random::<u16>() % EPHEMERAL_PORT_SPAN,
+            outbox: VecDeque::new(),
+            reserved: config.reserved,
+            src_v4: config.ip.map(Into::into),
+            src_v6: config.ipv6.map(Into::into),
+            recv_buf: vec![0u8; buf_size],
+            work: vec![0u8; buf_size],
+            udp_scratch: vec![0u8; inner_mtu],
+            last_timer: StdInstant::now(),
+        })
+    }
+
+    /// Overwrite the reserved bytes of an outbound WG datagram (byte 0 is
+    /// the message type; 1..4 are the reserved field Cloudflare WARP uses)
+    /// and queue it for the endpoint socket. boringtun has no reserved-byte
+    /// API — this is the post-encapsulation mutation the spec requires on
+    /// *every* `WriteToNetwork` output, handshake messages included.
+    fn enqueue_wg(&mut self, pkt: &[u8]) {
+        let mut v = pkt.to_vec();
+        if let Some(reserved) = self.reserved {
+            if v.len() >= 4 {
+                v[1..4].copy_from_slice(&reserved);
+            }
+        }
+        self.outbox.push_back(v);
+    }
+
+    /// Feed one inbound datagram through `Tunn`, chaining the
+    /// empty-datagram calls boringtun's contract requires to flush packets
+    /// queued behind a handshake (`decapsulate` doc: repeat until the
+    /// result is not `WriteToNetwork`).
+    fn decapsulate_wire(&mut self, n: usize) {
+        // Copy the datagram out of `self.recv_buf` so the loop body can take
+        // `&mut self` freely; ≤ MTU bytes once per inbound datagram.
+        let pkt_in = self.recv_buf[..n].to_vec();
+        let mut datagram: &[u8] = &pkt_in;
+        let mut work = std::mem::take(&mut self.work);
+        loop {
+            match self.tunn.decapsulate(None, datagram, &mut work) {
+                TunnResult::Done => break,
+                TunnResult::Err(e) => {
+                    debug!("wireguard {}: decapsulate error: {e:?}", self.name);
+                    break;
+                }
+                TunnResult::WriteToNetwork(b) => {
+                    self.enqueue_wg(b);
+                    // Chained call with an empty datagram flushes the queue.
+                    datagram = &[];
+                }
+                TunnResult::WriteToTunnelV4(b, _) | TunnResult::WriteToTunnelV6(b, _) => {
+                    self.device.rx_queue.push_back(b.to_vec());
+                    break;
+                }
+            }
+        }
+        self.work = work;
+    }
+
+    fn drain_wire(&mut self) {
+        for _ in 0..WIRE_DRAIN_BUDGET {
+            match self.endpoint.try_recv(&mut self.recv_buf) {
+                Ok(n) => self.decapsulate_wire(n),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => {
+                    warn!("wireguard {}: endpoint recv error: {e}", self.name);
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Egress: `device.tx_queue` → `Tunn::encapsulate` → outbox. A queued
+    /// inner packet resurfaces here once the handshake completes.
+    fn drain_device_tx(&mut self) {
+        let mut work = std::mem::take(&mut self.work);
+        while let Some(pkt) = self.device.tx_queue.pop_front() {
+            // `Tunn::encapsulate` *panics* on an undersized dst — guard
+            // rather than trust the MTU accounting.
+            if pkt.len() + meow_wireguard::DATA_OVERHEAD_SZ > work.len() {
+                warn!(
+                    "wireguard {}: dropping {}B inner packet (work buffer {}B)",
+                    self.name,
+                    pkt.len(),
+                    work.len()
+                );
+                continue;
+            }
+            if let TunnResult::WriteToNetwork(b) = self.tunn.encapsulate(&pkt, &mut work) {
+                let out = b.to_vec();
+                self.enqueue_wg(&out);
+            }
+        }
+        self.work = work;
+    }
+
+    /// boringtun's housekeeping — rekey, session expiry, persistent
+    /// keepalive — all inside `update_timers` (spec §3.8's manual
+    /// keepalive-deadline is subsumed by it).
+    fn tick_timers(&mut self) {
+        let mut work = std::mem::take(&mut self.work);
+        if let TunnResult::WriteToNetwork(b) = self.tunn.update_timers(&mut work) {
+            let out = b.to_vec();
+            self.work = work;
+            self.enqueue_wg(&out);
+            // boringtun's contract: packets queued behind the handshake a
+            // rekey just triggered flush via chained empty-datagram
+            // `decapsulate` calls — the same drain loop `decapsulate_wire`
+            // runs for real datagrams. Skipping this drops every inner
+            // packet parked while the old session was rekeying.
+            self.decapsulate_wire(0);
+            return;
+        }
+        self.work = work;
+    }
+
+    /// Kick off the WireGuard handshake immediately so it overlaps the
+    /// first dial instead of starting when the first SYN needs encrypting.
+    fn kick_handshake(&mut self) {
+        let mut work = std::mem::take(&mut self.work);
+        if let TunnResult::WriteToNetwork(b) =
+            self.tunn.format_handshake_initiation(&mut work, false)
+        {
+            let out = b.to_vec();
+            self.enqueue_wg(&out);
+        }
+        self.work = work;
+    }
+
+    fn flush_outbox(&mut self) {
+        while let Some(pkt) = self.outbox.pop_front() {
+            match self.endpoint.try_send(&pkt) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    self.outbox.push_front(pkt);
+                    break;
+                }
+                Err(e) => {
+                    warn!(
+                        "wireguard {}: endpoint send to {} failed: {e}",
+                        self.name, self.endpoint_addr
+                    );
+                }
+            }
+        }
+    }
+
+    fn alloc_port(&mut self) -> Option<u16> {
+        for _ in 0..EPHEMERAL_PORT_SPAN {
+            let port = self.next_port;
+            // Range is [49152, 65535]: `checked_add` wraps the u16 top back
+            // to the base; the filter re-enters the range if a corrupt
+            // `next_port` ever slipped below it.
+            self.next_port = self
+                .next_port
+                .checked_add(1)
+                .filter(|p| *p >= EPHEMERAL_PORT_BASE)
+                .unwrap_or(EPHEMERAL_PORT_BASE);
+            if self.used_ports.insert(port) {
+                return Some(port);
+            }
+        }
+        None
+    }
+
+    fn session_up(&self) -> bool {
+        self.tunn.time_since_last_handshake().is_some()
+    }
+
+    fn dial_tcp(&mut self, remote: SocketAddr, display: String, reply: TcpDialReply) {
+        let Some(port) = self.alloc_port() else {
+            let _ = reply.send(Err(MeowError::Proxy(format!(
+                "wireguard {}: ephemeral ports exhausted",
+                self.name
+            ))));
+            return;
+        };
+        let mut socket = tcp::Socket::new(
+            tcp::SocketBuffer::new(vec![0; TCP_SOCKET_BUF]),
+            tcp::SocketBuffer::new(vec![0; TCP_SOCKET_BUF]),
+        );
+        // TCP_NODELAY: a proxy stream wants latency over tinygram batching.
+        socket.set_nagle_enabled(false);
+        let connect = socket.connect(
+            self.iface.context(),
+            IpEndpoint::from(remote),
+            IpListenEndpoint::from(port),
+        );
+        if let Err(e) = connect {
+            self.used_ports.remove(&port);
+            let _ = reply.send(Err(MeowError::Proxy(format!(
+                "wireguard {}: tcp connect {remote}: {e}",
+                self.name
+            ))));
+            return;
+        }
+        let (read_tx, read_rx) = mpsc::channel(TCP_READ_QUEUE);
+        let (write_tx, write_rx) = mpsc::channel(TCP_WRITE_QUEUE);
+        let drain_notify = Arc::new(tokio::sync::Notify::new());
+        let handle = self.sockets.add(socket);
+        self.tcp.insert(
+            handle,
+            TcpState {
+                pending: Some(PendingTcp {
+                    reply,
+                    read_rx,
+                    write_tx,
+                    drain_notify: Arc::clone(&drain_notify),
+                    display,
+                    created: StdInstant::now(),
+                }),
+                read_tx,
+                write_rx,
+                drain_notify,
+                out: VecDeque::new(),
+                pending_read: VecDeque::new(),
+                eof_sent: false,
+                graceful_close: false,
+            },
+        );
+    }
+
+    fn udp_bind(
+        &mut self,
+        allowed: Arc<Vec<ipnet::IpNet>>,
+        has_v4: bool,
+        has_v6: bool,
+        reply: oneshot::Sender<Result<Box<dyn ProxyPacketConn>>>,
+    ) {
+        let Some(port) = self.alloc_port() else {
+            let _ = reply.send(Err(MeowError::Proxy(format!(
+                "wireguard {}: ephemeral ports exhausted",
+                self.name
+            ))));
+            return;
+        };
+        let mut socket = udp::Socket::new(
+            udp::PacketBuffer::new(
+                vec![udp::PacketMetadata::EMPTY; UDP_SOCKET_PACKETS],
+                vec![0; UDP_SOCKET_BYTES],
+            ),
+            udp::PacketBuffer::new(
+                vec![udp::PacketMetadata::EMPTY; UDP_SOCKET_PACKETS],
+                vec![0; UDP_SOCKET_BYTES],
+            ),
+        );
+        // Wildcard bind: a flow's packets may leave on either tunnel
+        // family; per-datagram `local_address` pins the source instead.
+        if let Err(e) = socket.bind(IpListenEndpoint::from(port)) {
+            self.used_ports.remove(&port);
+            let _ = reply.send(Err(MeowError::Proxy(format!(
+                "wireguard {}: udp bind :{port}: {e}",
+                self.name
+            ))));
+            return;
+        }
+        let (read_tx, read_rx) = mpsc::channel(UDP_READ_QUEUE);
+        let (write_tx, write_rx) = mpsc::channel(UDP_WRITE_QUEUE);
+        let handle = self.sockets.add(socket);
+        let local = SocketAddr::new(
+            self.src_v4
+                .map_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), IpAddr::from),
+            port,
+        );
+        self.udp.insert(
+            handle,
+            UdpState {
+                read_tx,
+                write_rx,
+                out: VecDeque::new(),
+                local,
+            },
+        );
+        let conn = WgPacketConn {
+            local,
+            rx: tokio::sync::Mutex::new(read_rx),
+            tx: write_tx,
+            wake: self.wake_tx.clone(),
+            closed: AtomicBool::new(false),
+            allowed,
+            has_v4,
+            has_v6,
+        };
+        let _ = reply.send(Ok(Box::new(conn) as Box<dyn ProxyPacketConn>));
+    }
+
+    fn handle_msg(&mut self, msg: ActorMsg) {
+        match msg {
+            ActorMsg::DialTcp {
+                remote,
+                display,
+                reply,
+            } => self.dial_tcp(remote, display, reply),
+            ActorMsg::UdpBind {
+                allowed,
+                has_v4,
+                has_v6,
+                reply,
+            } => self.udp_bind(allowed, has_v4, has_v6, reply),
+            ActorMsg::Shutdown => {} // handled by the run loop's drains
+        }
+    }
+
+    /// Per-socket service pass: conn→socket writes, socket→conn reads, and
+    /// lifecycle (connect completion, EOF, teardown). Runs once per loop.
+    fn service_sockets(&mut self) {
+        let session_up = self.session_up();
+        let wake_tx = self.wake_tx.clone();
+        let src_v4 = self.src_v4;
+        let src_v6 = self.src_v6;
+        let mut dead_tcp: Vec<SocketHandle> = Vec::new();
+        let mut dead_udp: Vec<SocketHandle> = Vec::new();
+
+        for (handle, st) in &mut self.tcp {
+            let socket = self.sockets.get_mut::<tcp::Socket>(*handle);
+
+            // ── pending dial resolution ────────────────────────────
+            if let Some(p) = st.pending.as_ref() {
+                let state = socket.state();
+                let failed = match state {
+                    tcp::State::Established => false,
+                    tcp::State::Closed => true,
+                    _ => {
+                        let limit = if session_up {
+                            TCP_CONNECT_LIMIT
+                        } else {
+                            HANDSHAKE_DIAL_LIMIT
+                        };
+                        p.created.elapsed() >= limit
+                    }
+                };
+                if failed {
+                    let reason = if state == tcp::State::Closed {
+                        "connection refused/reset"
+                    } else {
+                        "timed out"
+                    };
+                    let p = st.pending.take().expect("pending checked is_some above");
+                    let _ = p.reply.send(Err(MeowError::Proxy(format!(
+                        "wireguard {}: connect {reason}",
+                        self.name
+                    ))));
+                    socket.abort();
+                    dead_tcp.push(*handle);
+                    continue;
+                }
+                if state == tcp::State::Established {
+                    debug!("wireguard {}: TCP {handle:?} established", self.name);
+                    let p = st.pending.take().expect("pending checked is_some above");
+                    let stream = WgStream {
+                        remote: p.display,
+                        rx: p.read_rx,
+                        tx: p.write_tx,
+                        wake: wake_tx.clone(),
+                        drain_notify: p.drain_notify,
+                        pending_read: None,
+                        pending_write: None,
+                        read_eof: false,
+                        write_done: false,
+                    };
+                    let _ = p.reply.send(Ok(Box::new(stream) as Box<dyn ProxyConn>));
+                }
+            }
+
+            // ── conn→pump drain (channel disconnect = conn dropped) ─
+            let mut conn_gone = false;
+            loop {
+                match st.write_rx.try_recv() {
+                    Ok(io) => st.out.push_back(io),
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        conn_gone = true;
+                        break;
+                    }
+                }
+            }
+            if conn_gone && !st.graceful_close {
+                debug!("wireguard {}: TCP {handle:?} conn_gone → Close", self.name);
+                st.out.push_back(TcpIo::Close);
+            }
+
+            // ── ordered writes into the smoltcp socket ─────────────
+            while let Some(front) = st.out.front_mut() {
+                match front {
+                    TcpIo::Data(b) => {
+                        if !socket.can_send() {
+                            break;
+                        }
+                        match socket.send_slice(b) {
+                            Ok(0) | Err(_) => {
+                                debug!(
+                                    "wireguard {}: TCP {handle:?} send_slice failed (state {:?})",
+                                    self.name,
+                                    socket.state()
+                                );
+                                break;
+                            }
+                            Ok(n) => {
+                                b.advance(n);
+                                if b.is_empty() {
+                                    st.out.pop_front();
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    TcpIo::Shutdown => {
+                        socket.close();
+                        st.graceful_close = true;
+                        st.out.pop_front();
+                    }
+                    TcpIo::Close => {
+                        // A `Close` queued behind an un-consumed
+                        // `Shutdown` reaches the front only after the FIN
+                        // went out — aborting here would downgrade that
+                        // graceful close to an RST and drop tail bytes.
+                        if !st.graceful_close {
+                            socket.abort();
+                        }
+                        st.out.pop_front();
+                    }
+                }
+            }
+            // Re-arm a writer parked on a full queue (one stored permit;
+            // spurious wakes just retry the send).
+            st.drain_notify.notify_one();
+
+            // ── socket→conn reads ──────────────────────────────────
+            while let Some(ev) = st.pending_read.pop_front() {
+                match st.read_tx.try_send(ev) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(ev)) => {
+                        st.pending_read.push_front(ev);
+                        break;
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => break,
+                }
+            }
+            while socket.can_recv() && st.pending_read.is_empty() {
+                let chunk = socket.recv(|data| {
+                    let n = data.len().min(TCP_READ_CHUNK);
+                    (n, StreamEvent::Data(Bytes::copy_from_slice(&data[..n])))
+                });
+                match chunk {
+                    Ok(ev) => match st.read_tx.try_send(ev) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(ev)) => {
+                            st.pending_read.push_back(ev);
+                            break;
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => break,
+                    },
+                    Err(_) => break,
+                }
+            }
+
+            // ── EOF + teardown ─────────────────────────────────────
+            // `pending.is_none()` guards pre-Established states: in
+            // SynSent `may_recv` is already false, so an unchecked EOF
+            // here would queue `Closed` before the conn even exists.
+            if !st.eof_sent && st.pending.is_none() && !socket.can_recv() && !socket.may_recv() {
+                debug!(
+                    "wireguard {}: TCP {handle:?} eof (state {:?})",
+                    self.name,
+                    socket.state()
+                );
+                match st.read_tx.try_send(StreamEvent::Closed) {
+                    Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => st.eof_sent = true,
+                    Err(mpsc::error::TrySendError::Full(_)) => {}
+                }
+            }
+            if !socket.is_open() {
+                debug!(
+                    "wireguard {}: TCP {handle:?} dead (state {:?})",
+                    self.name,
+                    socket.state()
+                );
+                dead_tcp.push(*handle);
+            }
+        }
+
+        for (handle, st) in &mut self.udp {
+            let socket = self.sockets.get_mut::<udp::Socket>(*handle);
+            let mut conn_gone = false;
+            loop {
+                match st.write_rx.try_recv() {
+                    Ok(UdpIo::SendTo { data, addr }) => st.out.push_back((data, addr)),
+                    Ok(UdpIo::Close) => conn_gone = true,
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        conn_gone = true;
+                        break;
+                    }
+                }
+            }
+            while socket.can_send() {
+                let Some((data, addr)) = st.out.front() else {
+                    break;
+                };
+                let local_address = match addr.ip() {
+                    IpAddr::V4(_) => src_v4,
+                    IpAddr::V6(_) => src_v6,
+                };
+                let meta = udp::UdpMetadata {
+                    endpoint: (*addr).into(),
+                    local_address,
+                    meta: Default::default(),
+                };
+                match socket.send_slice(data, meta) {
+                    Err(udp::SendError::BufferFull) => break,
+                    // Unaddressable et al.: the conn's write_packet checks
+                    // make those unreachable; drop the datagram rather than
+                    // wedge the queue behind a permanently-failing one.
+                    Ok(()) | Err(_) => {
+                        st.out.pop_front();
+                    }
+                }
+            }
+            while socket.can_recv() {
+                match socket.recv_slice(&mut self.udp_scratch) {
+                    Ok((n, meta)) => {
+                        let src = SocketAddr::new(meta.endpoint.addr.into(), meta.endpoint.port);
+                        let data = Bytes::copy_from_slice(&self.udp_scratch[..n]);
+                        // Full → drop: datagram loss is the UDP contract.
+                        let _ = st.read_tx.try_send((data, src));
+                    }
+                    Err(_) => break,
+                }
+            }
+            if conn_gone {
+                dead_udp.push(*handle);
+            }
+        }
+
+        for handle in dead_tcp {
+            if let Some(st) = self.tcp.remove(&handle) {
+                // Read the bound port while the socket is still in the set,
+                // then drop the socket itself.
+                if let Some(ep) = self.sockets.get::<tcp::Socket>(handle).local_endpoint() {
+                    self.used_ports.remove(&ep.port);
+                }
+                self.sockets.remove(handle);
+                if let Some(p) = st.pending {
+                    let _ = p.reply.send(Err(MeowError::Proxy(format!(
+                        "wireguard {}: connect aborted",
+                        self.name
+                    ))));
+                }
+            }
+        }
+        for handle in dead_udp {
+            if let Some(st) = self.udp.remove(&handle) {
+                self.sockets.remove(handle);
+                self.used_ports.remove(&st.local.port());
+            }
+        }
+    }
+
+    /// How long `select!` may sleep before smoltcp's timers or the WG tick
+    /// need service. Mailbox, endpoint and wake events all interrupt it —
+    /// and they are the only wake sources the backlog paths need: conn
+    /// writes nudge `wake_rx`, conn-write backlogs stalled on smoltcp tx
+    /// capacity unblock on inbound ACKs (`endpoint.recv`), outbox retries
+    /// ride this very timer cadence. Nothing sleeps with work only it can
+    /// drain, so no busy-wait override is needed.
+    fn sleep_duration(&mut self, now: SmolInstant) -> Duration {
+        let smol_delay = self
+            .iface
+            .poll_delay(now, &self.sockets)
+            .map_or(IDLE_SLEEP, |d| Duration::from_millis(d.total_millis()));
+        smol_delay.min(WG_TIMER_INTERVAL.saturating_sub(self.last_timer.elapsed()))
+    }
+
+    async fn run(mut self) {
+        self.kick_handshake();
+        self.flush_outbox();
+        'outer: loop {
+            // 1. endpoint → tunn → device (bounded nonblocking drain).
+            self.drain_wire();
+            // 2. mailbox drain.
+            loop {
+                match self.rx.try_recv() {
+                    Ok(ActorMsg::Shutdown) | Err(mpsc::error::TryRecvError::Disconnected) => {
+                        break 'outer
+                    }
+                    Ok(msg) => self.handle_msg(msg),
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                }
+            }
+            // 3. conn queues, smoltcp poll, tunnel egress, WG timers.
+            self.service_sockets();
+            let now = SmolInstant::now();
+            self.iface.poll(now, &mut self.device, &mut self.sockets);
+            self.drain_device_tx();
+            if self.last_timer.elapsed() >= WG_TIMER_INTERVAL {
+                self.tick_timers();
+                self.last_timer = StdInstant::now();
+            }
+            self.flush_outbox();
+
+            let delay = self.sleep_duration(now);
+            tokio::select! {
+                biased;
+                msg = self.rx.recv() => match msg {
+                    None | Some(ActorMsg::Shutdown) => break 'outer,
+                    Some(m) => self.handle_msg(m),
+                },
+                r = self.endpoint.recv(&mut self.recv_buf) => match r {
+                    Ok(n) => self.decapsulate_wire(n),
+                    Err(e) => {
+                        warn!("wireguard {}: endpoint recv error: {e}", self.name);
+                        // A dead socket must not spin the loop.
+                        tokio::time::sleep(IDLE_SLEEP).await;
+                    }
+                },
+                _ = self.wake_rx.recv() => {},
+                _ = tokio::time::sleep(delay) => {},
+            }
+        }
+        debug!("wireguard {}: pump stopped", self.name);
+    }
+}
+
+/// Spawn the pump thread for one WireGuard adapter. Everything smoltcp
+/// touches is built inside the thread (spec §4.3 Option A); only the
+/// `Send`-safe parts — the connected std socket, the config, the mailbox —
+/// cross over.
+pub(crate) fn spawn_pump(
+    config: &WireGuardConfig,
+    std_sock: std::net::UdpSocket,
+    endpoint_addr: SocketAddr,
+) -> std::io::Result<(mpsc::Sender<ActorMsg>, std::thread::JoinHandle<()>)> {
+    let (tx, rx) = mpsc::channel::<ActorMsg>(ACTOR_MAILBOX);
+    let config = config.clone();
+    let thread_name = format!("wg-pump-{}", config.name);
+    let handle = std::thread::Builder::new()
+        .name(thread_name)
+        .spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    warn!("wireguard {}: tokio runtime build failed: {e}", config.name);
+                    return;
+                }
+            };
+            rt.block_on(async move {
+                match WgPump::new(&config, std_sock, endpoint_addr, rx) {
+                    Ok(pump) => pump.run().await,
+                    Err(e) => warn!("wireguard {}: pump init failed: {e}", config.name),
+                }
+            });
+        })?;
+    Ok((tx, handle))
+}
+
+/// `ProxyConn` shim for a smoltcp TCP socket. Writes go to the pump on a
+/// per-conn channel (disconnect = conn dropped = abort); reads arrive as
+/// ordered [`StreamEvent`]s.
+pub(crate) struct WgStream {
+    remote: String,
+    rx: mpsc::Receiver<StreamEvent>,
+    tx: mpsc::Sender<TcpIo>,
+    wake: mpsc::Sender<()>,
+    /// Pump → conn write-capacity wake-up (see [`TcpState::drain_notify`]).
+    drain_notify: Arc<tokio::sync::Notify>,
+    pending_read: Option<Bytes>,
+    /// A `TcpIo` item the shared path couldn't push yet — retried ahead of
+    /// accepting new write bytes so ordering survives.
+    pending_write: Option<TcpIo>,
+    /// Terminal read state: the pump sent `Closed` (or the channel died).
+    read_eof: bool,
+    write_done: bool,
+}
+
+impl WgStream {
+    /// Wake the pump so it services this flow's queues now rather than at
+    /// the next timer tick. Also nudged on every read pop — that is what
+    /// re-arms a full-channel read backlog in `pending_read`.
+    fn nudge(&self) {
+        let _ = self.wake.try_send(());
+    }
+}
+
+impl Drop for WgStream {
+    fn drop(&mut self) {
+        if !self.write_done {
+            let _ = self.tx.try_send(TcpIo::Close);
+            self.nudge();
+        }
+    }
+}
+
+fn stream_broken() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::BrokenPipe, "wireguard stream closed")
+}
+
+impl AsyncRead for WgStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if self.read_eof {
+            return Poll::Ready(Ok(()));
+        }
+        if let Some(b) = &mut self.pending_read {
+            let n = b.len().min(buf.remaining());
+            buf.put_slice(&b[..n]);
+            b.advance(n);
+            if b.is_empty() {
+                self.pending_read = None;
+            }
+            return Poll::Ready(Ok(()));
+        }
+        match self.rx.poll_recv(cx) {
+            Poll::Ready(Some(StreamEvent::Data(mut b))) => {
+                self.nudge();
+                let n = b.len().min(buf.remaining());
+                buf.put_slice(&b[..n]);
+                b.advance(n);
+                if !b.is_empty() {
+                    self.pending_read = Some(b);
+                }
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Some(StreamEvent::Closed)) | Poll::Ready(None) => {
+                self.read_eof = true;
+                Poll::Ready(Ok(()))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl AsyncWrite for WgStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        if self.write_done {
+            return Poll::Ready(Err(stream_broken()));
+        }
+        loop {
+            if self.pending_write.is_some() {
+                let item = self.pending_write.take().expect("checked is_some above");
+                match self.tx.try_send(item) {
+                    Ok(()) => continue,
+                    Err(mpsc::error::TrySendError::Full(item)) => {
+                        self.pending_write = Some(item);
+                        // Park on the pump's drain notification. `Notify`
+                        // stores one permit, so a drain between try_send
+                        // and this poll is not missed.
+                        let mut notified = std::pin::pin!(self.drain_notify.notified());
+                        match notified.as_mut().poll(cx) {
+                            Poll::Ready(()) => continue,
+                            Poll::Pending => return Poll::Pending,
+                        }
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        self.write_done = true;
+                        return Poll::Ready(Err(stream_broken()));
+                    }
+                }
+            }
+            let n = buf.len();
+            match self.tx.try_send(TcpIo::Data(Bytes::copy_from_slice(buf))) {
+                Ok(()) => {
+                    self.nudge();
+                    return Poll::Ready(Ok(n));
+                }
+                Err(mpsc::error::TrySendError::Full(item)) => {
+                    self.pending_write = Some(item);
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    self.write_done = true;
+                    return Poll::Ready(Err(stream_broken()));
+                }
+            }
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        // The pump applies items in order; there is no deeper flush point.
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        if self.write_done {
+            return Poll::Ready(Ok(()));
+        }
+        // Same backpressure contract as `poll_write`: drain anything parked
+        // there, then queue the FIN — a full channel parks on the pump's
+        // drain notification instead of silently dropping `Shutdown`.
+        loop {
+            let item = self.pending_write.take().unwrap_or(TcpIo::Shutdown);
+            let is_shutdown = matches!(item, TcpIo::Shutdown);
+            match self.tx.try_send(item) {
+                Ok(()) => {
+                    if is_shutdown {
+                        self.write_done = true;
+                        self.nudge();
+                        return Poll::Ready(Ok(()));
+                    }
+                }
+                Err(mpsc::error::TrySendError::Full(item)) => {
+                    self.pending_write = Some(item);
+                    let mut notified = std::pin::pin!(self.drain_notify.notified());
+                    match notified.as_mut().poll(cx) {
+                        Poll::Ready(()) => continue,
+                        Poll::Pending => return Poll::Pending,
+                    }
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    self.write_done = true;
+                    return Poll::Ready(Err(stream_broken()));
+                }
+            }
+        }
+    }
+}
+
+impl ProxyConn for WgStream {
+    fn remote_destination(&self) -> String {
+        self.remote.clone()
+    }
+}
+
+/// `ProxyPacketConn` shim for a smoltcp UDP socket. `write_packet` enqueues
+/// a datagram for the pump after allowed-IPs / family pre-checks;
+/// `read_packet` drains the pump's recv channel.
+pub(crate) struct WgPacketConn {
+    local: SocketAddr,
+    rx: tokio::sync::Mutex<mpsc::Receiver<(Bytes, SocketAddr)>>,
+    tx: mpsc::Sender<UdpIo>,
+    wake: mpsc::Sender<()>,
+    closed: AtomicBool,
+    allowed: Arc<Vec<ipnet::IpNet>>,
+    has_v4: bool,
+    has_v6: bool,
+}
+
+#[async_trait::async_trait]
+impl ProxyPacketConn for WgPacketConn {
+    async fn read_packet(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr)> {
+        let mut rx = self.rx.lock().await;
+        match rx.recv().await {
+            Some((data, addr)) => {
+                // Nudge the pump: popping frees channel room it may have a
+                // stalled write drain waiting on.
+                let _ = self.wake.try_send(());
+                let n = data.len().min(buf.len());
+                buf[..n].copy_from_slice(&data[..n]);
+                Ok((n, addr))
+            }
+            None => Err(MeowError::Proxy("wireguard udp: session closed".into())),
+        }
+    }
+
+    async fn write_packet(&self, buf: &[u8], addr: &SocketAddr) -> Result<usize> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(MeowError::Proxy("wireguard udp: session closed".into()));
+        }
+        let ip = addr.ip();
+        let family_ok = match ip {
+            IpAddr::V4(_) => self.has_v4,
+            IpAddr::V6(_) => self.has_v6,
+        };
+        if !family_ok {
+            return Err(MeowError::NotSupported(format!(
+                "wireguard udp: no {} tunnel address configured",
+                if ip.is_ipv4() { "IPv4" } else { "IPv6" }
+            )));
+        }
+        if !self.allowed.iter().any(|net| net.contains(&ip)) {
+            return Err(MeowError::Proxy(format!(
+                "wireguard udp: {ip} outside allowed-ips"
+            )));
+        }
+        let len = buf.len();
+        self.tx
+            .send(UdpIo::SendTo {
+                data: Bytes::copy_from_slice(buf),
+                addr: *addr,
+            })
+            .await
+            .map_err(|_| MeowError::Proxy("wireguard udp: session closed".into()))?;
+        let _ = self.wake.try_send(());
+        Ok(len)
+    }
+
+    fn local_addr(&self) -> Result<SocketAddr> {
+        Ok(self.local)
+    }
+
+    fn close(&self) -> Result<()> {
+        if !self.closed.swap(true, Ordering::Relaxed) {
+            let _ = self.tx.try_send(UdpIo::Close);
+            let _ = self.wake.try_send(());
+        }
+        Ok(())
+    }
+}
+
+impl Drop for WgPacketConn {
+    fn drop(&mut self) {
+        let _ = self.close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Channel-level tests for the conn shims — no pump, no wire. They pin
+    //! the backpressure/ordering machinery the service loop relies on:
+    //! `pending_write` FIFO, `drain_notify` re-arm, `TcpIo` ordering, and
+    //! `WgPacketConn`'s pre-send policy checks.
+    use super::*;
+
+    fn stream_pair(cap: usize) -> (WgStream, mpsc::Receiver<TcpIo>) {
+        let (tx, rx) = mpsc::channel(cap);
+        let (_read_tx, read_rx) = mpsc::channel(4);
+        let (wake_tx, _wake_rx) = mpsc::channel(4);
+        (
+            WgStream {
+                remote: "t".into(),
+                rx: read_rx,
+                tx,
+                wake: wake_tx,
+                drain_notify: Arc::new(tokio::sync::Notify::new()),
+                pending_read: None,
+                pending_write: None,
+                read_eof: false,
+                write_done: false,
+            },
+            rx,
+        )
+    }
+
+    #[test]
+    fn poll_write_parks_on_full_queue_and_resumes_after_drain() {
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let (mut stream, mut rx) = stream_pair(2);
+        assert!(matches!(
+            Pin::new(&mut stream).poll_write(&mut cx, b"aa"),
+            Poll::Ready(Ok(2))
+        ));
+        assert!(matches!(
+            Pin::new(&mut stream).poll_write(&mut cx, b"bb"),
+            Poll::Ready(Ok(2))
+        ));
+        // Queue full → the item is stashed, the poll parks on drain_notify.
+        assert!(matches!(
+            Pin::new(&mut stream).poll_write(&mut cx, b"cc"),
+            Poll::Pending
+        ));
+        assert!(stream.pending_write.is_some());
+        // The pump drains both queued items, then re-arms the writer.
+        assert!(matches!(rx.try_recv(), Ok(TcpIo::Data(_))));
+        assert!(matches!(rx.try_recv(), Ok(TcpIo::Data(_))));
+        stream.drain_notify.notify_one();
+        // The stashed "cc" goes first; the new write follows in order.
+        assert!(matches!(
+            Pin::new(&mut stream).poll_write(&mut cx, b"dd"),
+            Poll::Ready(Ok(2))
+        ));
+        match rx.try_recv() {
+            Ok(TcpIo::Data(b)) => assert_eq!(&b[..], b"cc"),
+            other => panic!("expected Data(cc), got {other:?}"),
+        }
+        match rx.try_recv() {
+            Ok(TcpIo::Data(b)) => assert_eq!(&b[..], b"dd"),
+            other => panic!("expected Data(dd), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn poll_shutdown_orders_behind_pending_data() {
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let (mut stream, mut rx) = stream_pair(2);
+        // Data then shutdown with room: Data precedes Shutdown on the wire.
+        assert!(matches!(
+            Pin::new(&mut stream).poll_write(&mut cx, b"aa"),
+            Poll::Ready(Ok(2))
+        ));
+        assert!(matches!(
+            Pin::new(&mut stream).poll_shutdown(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        assert!(matches!(rx.try_recv(), Ok(TcpIo::Data(_))));
+        assert!(matches!(rx.try_recv(), Ok(TcpIo::Shutdown)));
+
+        // Full queue: the FIN waits, it is never dropped silently.
+        let (mut stream, mut rx) = stream_pair(1);
+        assert!(matches!(
+            Pin::new(&mut stream).poll_write(&mut cx, b"x"),
+            Poll::Ready(Ok(1))
+        ));
+        assert!(matches!(
+            Pin::new(&mut stream).poll_shutdown(&mut cx),
+            Poll::Pending
+        ));
+        assert!(rx.try_recv().is_ok());
+        stream.drain_notify.notify_one();
+        assert!(matches!(
+            Pin::new(&mut stream).poll_shutdown(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        assert!(matches!(rx.try_recv(), Ok(TcpIo::Shutdown)));
+    }
+
+    #[test]
+    fn drop_sends_close_while_write_side_open() {
+        let (stream, mut rx) = stream_pair(4);
+        drop(stream);
+        assert!(matches!(rx.try_recv(), Ok(TcpIo::Close)));
+    }
+
+    #[test]
+    fn drop_after_shutdown_sends_nothing() {
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let (mut stream, mut rx) = stream_pair(4);
+        assert!(matches!(
+            Pin::new(&mut stream).poll_shutdown(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        assert!(matches!(rx.try_recv(), Ok(TcpIo::Shutdown)));
+        drop(stream);
+        // write_done is set — Drop must not queue a Close behind the FIN.
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn packet_conn_enforces_allowed_ips_family_and_close() {
+        let (_rtx, rrx) = mpsc::channel(4);
+        let (wtx, _wrx) = mpsc::channel(4);
+        let (waketx, _wakerx) = mpsc::channel(4);
+        let conn = WgPacketConn {
+            local: "10.0.0.2:1000".parse().unwrap(),
+            rx: tokio::sync::Mutex::new(rrx),
+            tx: wtx,
+            wake: waketx,
+            closed: AtomicBool::new(false),
+            allowed: Arc::new(vec!["10.0.0.0/8".parse().unwrap(), "::/0".parse().unwrap()]),
+            has_v4: true,
+            has_v6: false,
+        };
+        let outside = "8.8.8.8:53".parse().unwrap();
+        let err = conn.write_packet(b"x", &outside).await.unwrap_err();
+        assert!(err.to_string().contains("outside allowed-ips"), "{err}");
+
+        let v6 = "[fd00::1]:53".parse().unwrap();
+        let err = conn.write_packet(b"x", &v6).await.unwrap_err();
+        assert!(matches!(err, MeowError::NotSupported(_)), "{err:?}");
+
+        let inside = "10.9.9.9:53".parse().unwrap();
+        assert_eq!(conn.write_packet(b"x", &inside).await.unwrap(), 1);
+
+        conn.close().unwrap();
+        let err = conn.write_packet(b"x", &inside).await.unwrap_err();
+        assert!(err.to_string().contains("session closed"), "{err}");
+    }
+}
