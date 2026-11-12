@@ -466,8 +466,7 @@ impl WgPump {
                 continue;
             }
             if let TunnResult::WriteToNetwork(b) = self.tunn.encapsulate(&pkt, &mut work) {
-                let out = b.to_vec();
-                self.enqueue_wg(&out);
+                self.enqueue_wg(b);
             }
         }
         self.work = work;
@@ -513,9 +512,9 @@ impl WgPump {
                         self.work = work;
                         self.decapsulate_wire(0);
                     }
-                    TunnResult::Err(e2) => {
+                    TunnResult::Err(err) => {
                         warn!(
-                            "wireguard {}: forced re-handshake failed: {e2:?}",
+                            "wireguard {}: forced re-handshake failed: {err:?}",
                             self.name
                         );
                         self.work = work;
@@ -534,8 +533,7 @@ impl WgPump {
         if let TunnResult::WriteToNetwork(b) =
             self.tunn.format_handshake_initiation(&mut work, false)
         {
-            let out = b.to_vec();
-            self.enqueue_wg(&out);
+            self.enqueue_wg(b);
         }
         self.work = work;
     }
@@ -794,11 +792,14 @@ impl WgPump {
             }
 
             // ── ordered writes into the smoltcp socket ─────────────
-            // `drain_notify` is only worth re-arming when this pass could
-            // have freed room for a parked writer — i.e. the conn→pump
-            // drain (or a `Close` push) actually put items in `out`. An
-            // unconditional `notify_one` stores a permit on every service
-            // pass, buying an idle writer one spurious wake.
+            // `drain_notify` is only worth re-arming when this pass did
+            // write-side work a parked writer could join: items the
+            // conn→pump drain just moved off the channel, a backlog left
+            // over from a previous stall, or a `Close` push — any of them
+            // means `out` is non-empty here. The permit may buy nothing
+            // (a stalled socket pops nothing new), which is harmless;
+            // what it must not do is fire unconditionally on an idle
+            // socket, where a stored permit is a guaranteed spurious wake.
             let had_out = !st.out.is_empty();
             while let Some(front) = st.out.front_mut() {
                 match front {

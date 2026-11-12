@@ -78,8 +78,10 @@ impl WireGuardAdapter {
     /// Build the adapter from a parsed config. The parser validates key
     /// material and field ranges; `new` adds the few checks whose failure
     /// would be a runtime panic rather than a clean error (unspecified
-    /// tunnel addrs panic `update_ip_addrs`; `mtu ≤ 64` would make the
-    /// device unable to emit anything).
+    /// tunnel addrs panic `update_ip_addrs`; an inner MTU under 576 would
+    /// make the device unable to carry a minimal IPv4 datagram — the
+    /// parser's `mtu ≥ 640` floor reaches that first, this is the
+    /// backstop).
     pub fn new(mut config: WireGuardConfig) -> std::result::Result<Self, String> {
         if config.server.trim().is_empty() {
             return Err("wireguard: server must not be empty".into());
