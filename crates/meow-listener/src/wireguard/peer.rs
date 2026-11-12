@@ -14,7 +14,7 @@ use super::WgPeerSpec;
 
 /// A static peer of the listener. `endpoint` is learned by roaming —
 /// a responder never initiates, so a peer that has never sent an
-/// authenticated datagram simply has nowhere to send timer output.
+/// ACL-admitted inner datagram simply has nowhere to send timer output.
 pub(super) struct PeerState {
     /// Log/diagnostic label (`peer-<index>` when the config left the
     /// name empty) — diagnostics only, never enters `Metadata`.
@@ -23,9 +23,10 @@ pub(super) struct PeerState {
     /// `index = slot`, so the session receiver indices it mints sit in
     /// the `slot << 8` namespace `demux` decodes.
     pub tunn: Tunn,
-    /// Authenticated source of the peer's latest datagram. Only updated
-    /// after a non-error `handle_verified_packet` result on a non-empty
-    /// datagram — see [`crate::wireguard::demux`].
+    /// Source of the peer's latest ACL-admitted inner packet — the
+    /// only datagram allowed to move the endpoint (a bare handshake or
+    /// keepalive does not; its reply already answers `src` directly).
+    /// See [`crate::wireguard::demux`].
     pub endpoint: Option<SocketAddr>,
     /// Inner-source-IP ACL (`allowed_ips`), validated non-empty at
     /// config load. Applied once, at the inner-packet entry point.

@@ -17,10 +17,15 @@
 //!    `receiver_idx` we minted, so `receiver_idx >> 8` selects the peer
 //!    slot directly (`Tunn::new(index)` puts the slot in the index's
 //!    upper bits and cycles sessions through the low byte).
-//! 3. **Authenticate, then roam.** `handle_verified_packet` produces a
-//!    [`TunnResult`]; only a non-error result on a *non-empty* datagram
-//!    moves the peer's endpoint. The empty datagrams used to flush the
-//!    send queue never touch it (a peer can't be "roamed" by silence).
+//! 3. **Authenticate, ACL, then roam.** `handle_verified_packet`
+//!    produces a [`TunnResult`]; only an inner packet *admitted by the
+//!    peer's `allowed_ips` ACL* moves the peer's endpoint — a bare
+//!    handshake or keepalive does not (its reply already answers the
+//!    datagram's source directly), and neither does an
+//!    authenticated-but-ACL-rejected packet, which proves nothing
+//!    about where the peer lives. The empty datagrams used to flush
+//!    the send queue never touch it (a peer can't be "roamed" by
+//!    silence).
 //! 4. **Silent-drop discipline.** Unknown keys, bad MACs, out-of-range
 //!    indices and malformed packets change nothing and emit nothing —
 //!    at most a `trace!` line.
@@ -82,11 +87,14 @@ pub(super) struct PeerTable {
     peer_by_pubkey: HashMap<[u8; 32], usize>,
 }
 
-/// The listener-wide handshake rate budget (`PEER_HANDSHAKE_RATE_LIMIT`
-/// in boringtun, unchanged): one shared limiter covers every peer, and
-/// the bound is a flat constant per spec §3.4 — a forged-handshake
-/// flood does not get more room just because the peer table is bigger
-/// (kernel WG's global-limiter semantics).
+/// The listener-wide handshake rate budget — boringtun's
+/// `PEER_HANDSHAKE_RATE_LIMIT`, kept at its upstream default of 10
+/// verified handshake packets per limiter window (vendored at
+/// `meow-wireguard/src/noise/mod.rs`, where `Tunn::new` uses it when no
+/// limiter is passed; the multi-peer listener always shares one
+/// explicit limiter instead). A flat constant per spec §3.4 — a
+/// forged-handshake flood does not get more room just because the
+/// peer table is bigger (kernel WG's global-limiter semantics).
 const PEER_HANDSHAKE_RATE_LIMIT: u64 = 10;
 
 /// Cookie reply size — mirrors `noise::COOKIE_REPLY_SZ` in the vendored
@@ -112,6 +120,17 @@ impl PeerTable {
         let mut peers = Vec::with_capacity(cfg.peers.len());
         let mut peer_by_pubkey = HashMap::with_capacity(cfg.peers.len());
         for (index, peer_cfg) in cfg.peers.iter().enumerate() {
+            // A peer keyed by the listener's own public key is a
+            // self-peer — `X25519(secret, own_pub)` would echo our
+            // traffic back. meow-config rejects this only under its
+            // `wireguard` feature (x25519 is feature-gated there), so
+            // the check is repeated here on every build.
+            if peer_cfg.public_key == *public.as_bytes() {
+                return Err(format!(
+                    "wireguard listener: peer at index {index} equals the \
+                     listener's own public key (self-peering is not a valid peer)"
+                ));
+            }
             // A duplicate static pubkey would alias two slots onto one
             // demux key; config validation already rejects it, so a
             // collision here is a bug, not a config error.
@@ -227,20 +246,12 @@ impl PeerTable {
         };
 
         let result = self.peers[slot].tunn.handle_verified_packet(packet, work);
-        // Roam *only* on an authenticated, non-error packet — and only
-        // for a real datagram. This call is always on a non-empty
-        // datagram (the empty-flush path below passes `src` explicitly),
-        // so a successful decrypt by definition came from `src`.
-        if !matches!(result, TunnResult::Err(_)) && self.peers[slot].endpoint != Some(src) {
-            tracing::debug!(
-                "wireguard: peer '{}' endpoint → {src}",
-                self.peers[slot].label
-            );
-            self.peers[slot].endpoint = Some(src);
-        }
         // `handle_result` consumes `result` (which borrows `work`), so
         // the queued-packet flush — which needs `work` again — runs
-        // only after it returns and that borrow is dead.
+        // only after it returns and that borrow is dead. Roaming is
+        // decided *inside* `handle_result`, after the inner-packet ACL
+        // verdict it produces: an authenticated-but-ACL-rejected packet
+        // must not move the endpoint.
         if self.handle_result(slot, src, result, &mut actions) {
             while let TunnResult::WriteToNetwork(b) =
                 self.peers[slot].tunn.decapsulate(None, &[], work)
@@ -269,25 +280,49 @@ impl PeerTable {
                 self.enqueue_wire(actions, slot, src, b);
                 true
             }
-            TunnResult::WriteToTunnelV4(b, src) => {
-                self.handle_inner(slot, b, IpAddr::V4(src), actions);
+            TunnResult::WriteToTunnelV4(b, ip_src) => {
+                // Roam *only* on an ACL-admitted inner packet — an
+                // authenticated datagram whose inner src the ACL
+                // rejected proved nothing about where the peer lives,
+                // and a bare handshake or keepalive does not either
+                // (its reply already answered `src` directly). The
+                // endpoint is learned exactly when replies to inner
+                // packets start needing it.
+                if self.handle_inner(slot, b, IpAddr::V4(ip_src), actions) {
+                    self.roam(slot, src);
+                }
                 false
             }
-            TunnResult::WriteToTunnelV6(b, src) => {
-                self.handle_inner(slot, b, IpAddr::V6(src), actions);
+            TunnResult::WriteToTunnelV6(b, ip_src) => {
+                if self.handle_inner(slot, b, IpAddr::V6(ip_src), actions) {
+                    self.roam(slot, src);
+                }
                 false
             }
             // Done carries nothing; Err is an auth/decrypt failure —
-            // both silent.
+            // both silent, neither roams.
             TunnResult::Done | TunnResult::Err(_) => false,
+        }
+    }
+
+    /// Move the peer's endpoint to `src` — reachable only from
+    /// `handle_result`'s ACL-admitted inner-packet arms (see their
+    /// comment for why nothing else may move a responder's endpoint).
+    fn roam(&mut self, slot: usize, src: SocketAddr) {
+        if self.peers[slot].endpoint != Some(src) {
+            tracing::debug!(
+                "wireguard: peer '{}' endpoint → {src}",
+                self.peers[slot].label
+            );
+            self.peers[slot].endpoint = Some(src);
         }
     }
 
     /// The peer's timer pass — `update_timers` drives responder-side
     /// housekeeping (session expiry teardown; a responder never
     /// re-initiates). Wire output goes to the peer's *learned*
-    /// endpoint; a peer that has never authenticated has none and its
-    /// output is dropped.
+    /// endpoint; a peer that has never sent an ACL-admitted inner
+    /// packet has none and its output is dropped.
     pub fn tick(&mut self, work: &mut [u8]) -> Vec<Action> {
         let mut actions = Vec::new();
         for slot in 0..self.peers.len() {
@@ -327,20 +362,30 @@ impl PeerTable {
 
     /// The single inner-packet ACL point: emit `Action::Inner` only
     /// when the packet's source address — already parsed and validated
-    /// by the decapsulator — is inside the owning peer's `allowed_ips`.
+    /// by the decapsulator — is inside the owning peer's `allowed_ips`,
+    /// and report the verdict to the caller (it doubles as the roam
+    /// gate: only admitted inner traffic may move the endpoint).
     /// Everything else is a silent drop.
-    fn handle_inner(&mut self, slot: usize, pkt: &[u8], src: IpAddr, actions: &mut Vec<Action>) {
+    fn handle_inner(
+        &mut self,
+        slot: usize,
+        pkt: &[u8],
+        src: IpAddr,
+        actions: &mut Vec<Action>,
+    ) -> bool {
         if self.peers[slot].allows_src(src) {
             actions.push(Action::Inner {
                 slot,
                 v6: src.is_ipv6(),
                 bytes: pkt.to_vec(),
             });
+            true
         } else {
             trace!(
                 "wireguard: peer '{}' inner src {src} outside allowed_ips",
                 self.peers[slot].label
             );
+            false
         }
     }
 
@@ -624,8 +669,10 @@ mod tests {
             actions.is_empty(),
             "unregistered key must drop, got {actions:?}"
         );
-        // The good peer's endpoint is untouched — zero state change.
-        assert_eq!(table.peers()[0].endpoint, Some(ENDPOINT_A));
+        // The good peer's endpoint is untouched — zero state change:
+        // a bare handshake does not learn the endpoint (only an
+        // ACL-admitted inner packet does).
+        assert_eq!(table.peers()[0].endpoint, None);
     }
 
     /// `demux_init_forged_mac1`: a handshake init with a corrupted mac1
@@ -704,7 +751,7 @@ mod tests {
         // namespace — feeding it back must not disturb any peer (it
         // decodes to slot 1 via client index 1 and fails its checks).
         let _ = table.process_datagram(ENDPOINT_B, resp, &mut work);
-        assert_eq!(table.peers()[1].endpoint, Some(ENDPOINT_B));
+        assert_eq!(table.peers()[1].endpoint, None);
     }
 
     /// `index_namespace_disjoint`: the local indices the responder
@@ -736,8 +783,8 @@ mod tests {
         assert_eq!(sender_idx >> 8, 1);
     }
 
-    /// `roam_authenticated_only`: a valid datagram from a new source
-    /// roams the endpoint; a forged one does not.
+    /// `roam_authenticated_only`: a valid ACL-admitted datagram from a
+    /// new source roams the endpoint; a forged one does not.
     #[test]
     fn roam_authenticated_only() {
         let mut work = vec![0u8; 4096];
@@ -745,6 +792,11 @@ mod tests {
 
         let mut c0 = client_for(&keys[0].0, &server_public.to_bytes(), 0, None);
         handshake(&mut c0, &mut table, ENDPOINT_A, &mut work);
+        // The handshake itself does not learn the endpoint — the first
+        // ACL-admitted inner packet does.
+        assert_eq!(table.peers()[0].endpoint, None);
+        let learn = inner_v4([10, 0, 0, 5], [10, 1, 2, 3], 17, &udp_l4(1, 2, b"l"));
+        let _ = send_inner(&mut c0, &mut table, ENDPOINT_A, &learn, &mut work);
         assert_eq!(table.peers()[0].endpoint, Some(ENDPOINT_A));
 
         // Authenticated roam: same session, new source.
@@ -771,6 +823,67 @@ mod tests {
         forged[4..8].copy_from_slice(&(77u32 << 8).to_le_bytes());
         assert!(table.process_datagram(src3, &forged, &mut work).is_empty());
         assert_eq!(table.peers()[0].endpoint, Some(ENDPOINT_B));
+    }
+
+    /// F1 — roam requires an ACL-admitted inner packet: an
+    /// authenticated datagram whose inner source sits outside
+    /// `allowed_ips` must not move the endpoint (the roam used to run
+    /// before the ACL check, so a rejected inner src could still drag
+    /// the endpoint to a spoofed datagram source). A handshake alone
+    /// does not learn the endpoint either — it is learned exactly when
+    /// reply traffic starts needing it.
+    #[test]
+    fn roam_requires_acl_admitted_inner() {
+        let mut work = vec![0u8; 4096];
+        let (mut table, server_public, keys) = table_with(1, &["10.0.0.0/24"], None);
+
+        let mut c0 = client_for(&keys[0].0, &server_public.to_bytes(), 0, None);
+        handshake(&mut c0, &mut table, ENDPOINT_A, &mut work);
+        assert_eq!(
+            table.peers()[0].endpoint,
+            None,
+            "handshake/keepalive alone must not learn the endpoint"
+        );
+
+        // ACL-admitted packet → the endpoint is learned.
+        let ok = inner_v4([10, 0, 0, 7], [10, 9, 9, 9], 17, &udp_l4(1, 2, b"x"));
+        let _ = send_inner(&mut c0, &mut table, ENDPOINT_A, &ok, &mut work);
+        assert_eq!(table.peers()[0].endpoint, Some(ENDPOINT_A));
+
+        // Inner src outside allowed_ips → the packet drops at the ACL
+        // and the authenticated datagram still leaves the endpoint.
+        let bad = inner_v4([10, 0, 1, 7], [10, 9, 9, 9], 17, &udp_l4(1, 2, b"x"));
+        let acts = send_inner(&mut c0, &mut table, ENDPOINT_B, &bad, &mut work);
+        assert!(
+            inner_actions(&acts).is_empty(),
+            "ACL-rejected inner packet drops"
+        );
+        assert_eq!(
+            table.peers()[0].endpoint,
+            Some(ENDPOINT_A),
+            "an ACL-rejected inner packet must not roam the endpoint"
+        );
+    }
+
+    /// F2 — a peer keyed by the listener's own public key is a
+    /// self-peer (`X25519(secret, own_pub)` would echo our traffic).
+    /// meow-config rejects it only when its `wireguard` feature is
+    /// compiled, so the table re-checks on every build — a
+    /// `no-default-features` config build must not slip one in.
+    #[test]
+    fn self_peer_public_key_rejected() {
+        let (server_secret, server_public) = keypair(0x5E);
+        let spec = WgListenerSpec {
+            private_key: server_secret.to_bytes(),
+            peers: vec![peer_spec(server_public.to_bytes(), &["10.0.0.0/8"], None)],
+            mtu: 1420,
+            udp: true,
+            udp_timeout: std::time::Duration::from_secs(60),
+        };
+        let err = PeerTable::new(&spec)
+            .err()
+            .expect("self-loop peer must be rejected");
+        assert!(err.contains("own public key"), "{err}");
     }
 
     /// `allowed_ips_v4_v6_acl`: per-peer source ACLs admit listed

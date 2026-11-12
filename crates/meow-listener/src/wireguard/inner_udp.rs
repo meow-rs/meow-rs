@@ -268,6 +268,14 @@ pub(super) fn build_reply(
             build_reply_v6(src, from.port(), dst, to.port(), payload, inner_mtu)
         }
         _ => {
+            // Unreachable: `client` and `orig_dst` are parsed from the
+            // same inner packet's src/dst — always one family. The
+            // debug_assert pins that flow-key contract; the drop stays
+            // as the release-mode guard.
+            debug_assert!(
+                from.is_ipv4() == to.is_ipv4(),
+                "inner UDP reply crossed address families ({from} → {to})"
+            );
             debug!("wg: mixed-family UDP reply {from} → {to}; dropping");
             None
         }

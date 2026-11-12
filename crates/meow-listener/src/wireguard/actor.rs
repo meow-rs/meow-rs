@@ -157,6 +157,10 @@ pub(super) struct WgActor {
     /// the flow's real owner is recovered from `pending_syn`, never
     /// from which placeholder took the SYN.
     listen_pool: HashMap<(usize, u16), ListenEntry>,
+    /// Mirror of `listen_pool`'s socket handles, kept in lockstep at
+    /// every pool insert/remove — the orphan reaper's ownership check
+    /// is O(1) instead of a values() scan.
+    listen_pool_handles: HashSet<smoltcp::iface::SocketHandle>,
     /// First-fed-wins `tuple → peer slot` for every unclaimed SYN
     /// pushed to smoltcp this pass: `post_poll` looks the accepted
     /// socket's tuple up here to learn the real owning peer (same-dport
@@ -268,6 +272,7 @@ impl WgActor {
             tcp: HashMap::new(),
             tcp_by_tuple: HashMap::new(),
             listen_pool: HashMap::new(),
+            listen_pool_handles: HashSet::new(),
             pending_syn: HashMap::new(),
             rst_hint: HashMap::new(),
             pending_close: Vec::new(),
@@ -469,9 +474,14 @@ impl WgActor {
         }
         let claimed = self.tcp_by_tuple.contains_key(&key);
         if tcpv.syn && !tcpv.ack && !claimed {
-            // Record the owner before any listener/capacity decision —
-            // a SYN accepted by *any* placeholder (including a stale
-            // one another peer created) must resolve to the peer that
+            // Record the owner unconditionally — BEFORE the capacity
+            // decision, not inside it: the SYN is fed to smoltcp
+            // regardless (the cap only gates *new listener demand*),
+            // so a placeholder that already exists may still accept it
+            // and `post_poll` needs this entry both to attribute the
+            // flow and to refuse it at the second cap gate. A SYN
+            // accepted by *any* placeholder (including a stale one
+            // another peer created) must resolve to the peer that
             // actually sent it. First-fed wins: smoltcp accepts queued
             // SYNs in receive order, so the earliest recorded SYN is
             // the one a listener took.
@@ -550,8 +560,19 @@ impl WgActor {
                 }
             }
         } else {
-            // Unreachable while `work` is MTU-sized — kept as a spec §6
-            // drop+log guard rather than a silent oversize swallow.
+            // Unreachable while `work` is MTU-sized — `build_reply`
+            // caps the inner packet at inner_mtu = mtu - 64, and
+            // `work` is mtu + 256, so headroom always covers the WG
+            // overhead. The debug_assert pins that contract; the
+            // drop+log stays as the spec §6 release-mode guard rather
+            // than a silent oversize swallow.
+            debug_assert!(
+                pkt.len() + DATA_OVERHEAD_SZ <= work.len(),
+                "inject packet {}B + {DATA_OVERHEAD_SZ}B overhead exceeds \
+                 MTU-sized work buffer {}B",
+                pkt.len(),
+                work.len()
+            );
             debug!(
                 "wireguard {}: dropping {}B inject packet (work {}B)",
                 self.name,
@@ -588,7 +609,9 @@ impl WgActor {
             // only the pool entry is ours to drop. The socket itself is
             // *not* removed here: mid-flight it may be registered this
             // very pass, and terminating it would kill a live conn.
-            self.listen_pool.remove(&(slot, dport));
+            if let Some(entry) = self.listen_pool.remove(&(slot, dport)) {
+                self.listen_pool_handles.remove(&entry.handle);
+            }
         }
         if self.listen_pool.len() >= LISTEN_POOL_CAP && !self.evict_oldest_listener() {
             // Errata E5: nothing Listen-state to evict — the new SYN is
@@ -610,6 +633,7 @@ impl WgActor {
             return false;
         }
         let handle = self.sockets.add(socket);
+        self.listen_pool_handles.insert(handle);
         self.listen_pool.insert(
             (slot, dport),
             ListenEntry {
@@ -635,6 +659,7 @@ impl WgActor {
             return false;
         };
         let entry = self.listen_pool.remove(&key).expect("entry checked above");
+        self.listen_pool_handles.remove(&entry.handle);
         self.sockets.remove(entry.handle);
         true
     }
@@ -652,7 +677,9 @@ impl WgActor {
             }
         }
         for key in stale {
-            self.listen_pool.remove(&key);
+            if let Some(entry) = self.listen_pool.remove(&key) {
+                self.listen_pool_handles.remove(&entry.handle);
+            }
         }
 
         let mut new_flows = Vec::new();
@@ -730,9 +757,7 @@ impl WgActor {
             if t.is_open() {
                 continue;
             }
-            if self.tcp.contains_key(&handle)
-                || self.listen_pool.values().any(|e| e.handle == handle)
-            {
+            if self.tcp.contains_key(&handle) || self.listen_pool_handles.contains(&handle) {
                 continue;
             }
             self.pending_close.push(handle);
@@ -743,7 +768,7 @@ impl WgActor {
     /// at removal time, not when it was deferred (see the note on
     /// handle recycling in [`Self::reap_orphaned_sockets`]).
     fn is_orphan_dead(&self, handle: smoltcp::iface::SocketHandle) -> bool {
-        if self.tcp.contains_key(&handle) || self.listen_pool.values().any(|e| e.handle == handle) {
+        if self.tcp.contains_key(&handle) || self.listen_pool_handles.contains(&handle) {
             return false;
         }
         self.sockets.iter().any(|(h, s)| {
@@ -1150,13 +1175,22 @@ fn parse_inner(pkt: &[u8], v6: bool) -> Option<InnerView<'_>> {
         if u16::from_be_bytes([pkt[6], pkt[7]]) & 0x3fff != 0 {
             return None;
         }
+        // `total_length` bounds the datagram — bytes the buffer carries
+        // past it are padding, not payload, and must not reach the L4
+        // checksum/demux (the WG decapsulator already clips, but this
+        // parser must not rely on that upstream contract).
+        let total_len = usize::from(u16::from_be_bytes([pkt[2], pkt[3]]));
+        let end = total_len.min(pkt.len());
+        if ihl >= end {
+            return None;
+        }
         let src = IpAddr::from(<[u8; 4]>::try_from(&pkt[12..16]).ok()?);
         let dst = IpAddr::from(<[u8; 4]>::try_from(&pkt[16..20]).ok()?);
         Some(InnerView {
             src,
             dst,
             proto: pkt[9],
-            l4: pkt.get(ihl..)?,
+            l4: pkt.get(ihl..end)?,
         })
     }
 }
@@ -1551,6 +1585,28 @@ mod tests {
             "socket set stays bounded — {}",
             actor.sockets.iter().count()
         );
+    }
+
+    /// F3 — the IPv4 `total_length` field bounds the L4 slice: bytes a
+    /// buffer carries past it are link padding, not payload, and must
+    /// not reach the demux/checksum path.
+    #[test]
+    fn parse_inner_v4_total_length_clips_l4() {
+        let mut pkt = vec![0u8; 48];
+        pkt[0] = 0x45;
+        pkt[2..4].copy_from_slice(&28u16.to_be_bytes()); // 20B hdr + 8B UDP
+        pkt[8] = 64;
+        pkt[9] = 17;
+        pkt[12..16].copy_from_slice(&[10, 0, 0, 1]);
+        pkt[16..20].copy_from_slice(&[10, 0, 0, 2]);
+        // The 20-byte padding tail must not leak into `l4`.
+        let view = parse_inner(&pkt, false).expect("parses");
+        assert_eq!(view.proto, 17);
+        assert_eq!(view.l4.len(), 8);
+
+        // A total_length shorter than the header itself is malformed.
+        pkt[2..4].copy_from_slice(&16u16.to_be_bytes());
+        assert!(parse_inner(&pkt, false).is_none());
     }
 
     /// M4 — a retransmitted SYN counts once toward the cap: the
