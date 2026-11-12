@@ -72,7 +72,7 @@ A `proxies:` entry with `type: wireguard` takes these fields:
 | `pre-shared-key` | base64 | none | decodes to exactly 32 bytes when present | optional PSK (post-quantum hedge) |
 | `reserved` | `[u8; 3]` | none | 3-element list, or base64 decoding to 3 bytes | Cloudflare WARP client identifier |
 | `persistent-keepalive` | `u16` seconds | `0` | ≥ 0 | `0` disables; ~25 holds NAT state open |
-| `mtu` | `u16` | `1420` | 576–9000 | outer MTU; inner = `mtu - 64` |
+| `mtu` | `u16` | `1420` | 640–9000 | outer MTU; inner = `mtu - 64` ≥ 576 |
 | `udp` | `bool` | `true` | — | carry UDP flows through the tunnel |
 | `remote-dns-resolve` | `bool` | `true` | — | resolve destination domains inside the tunnel |
 | `dns` | list of nameservers | `[]` | **accepted but ignored** — warns once | per-node tunnel DNS is Phase-2 |
