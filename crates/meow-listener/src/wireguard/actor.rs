@@ -1289,7 +1289,7 @@ impl WgActor {
         while let Some(pkt) = self.device.tx_queue.pop_front() {
             let Some(slot) = self.route_tx_packet(&pkt) else {
                 trace!("wireguard {}: unroutable inner tx packet", self.name);
-                self.device.tx_pool.push_back(pkt);
+                self.device.return_tx_buf(pkt);
                 continue;
             };
             if pkt.len() + DATA_OVERHEAD_SZ > dst.len() {
@@ -1299,11 +1299,11 @@ impl WgActor {
                     pkt.len(),
                     dst.len()
                 );
-                self.device.tx_pool.push_back(pkt);
+                self.device.return_tx_buf(pkt);
                 continue;
             }
             let Some(peer) = self.table.peers_mut().get_mut(slot) else {
-                self.device.tx_pool.push_back(pkt);
+                self.device.return_tx_buf(pkt);
                 continue;
             };
             if let TunnResult::WriteToNetwork(b) = peer.tunn.encapsulate(&pkt, &mut dst) {
@@ -1316,12 +1316,12 @@ impl WgActor {
                         dst = self.take_scratch();
                     }
                     None => {
-                        self.device.tx_pool.push_back(pkt);
+                        self.device.return_tx_buf(pkt);
                         continue;
                     }
                 }
             }
-            self.device.tx_pool.push_back(pkt);
+            self.device.return_tx_buf(pkt);
         }
         self.return_scratch(dst);
         // RST hints only live for the poll that produced them — a stale

@@ -398,7 +398,7 @@ impl WgPump {
                     pkt.len(),
                     dst.len()
                 );
-                self.device.tx_pool.push_back(pkt);
+                self.device.return_tx_buf(pkt);
                 continue;
             }
             if let TunnResult::WriteToNetwork(b) = self.tunn.encapsulate(&pkt, &mut dst) {
@@ -407,7 +407,7 @@ impl WgPump {
                 self.enqueue_wg(dst);
                 dst = self.take_scratch();
             }
-            self.device.tx_pool.push_back(pkt);
+            self.device.return_tx_buf(pkt);
         }
         self.return_scratch(dst);
     }

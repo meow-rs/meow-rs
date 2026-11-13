@@ -55,6 +55,10 @@ pub const WIRE_DRAIN_BUDGET: usize = 64;
 /// choice for idle CPU.
 pub const WG_TIMER_INTERVAL: Duration = Duration::from_millis(250);
 
+/// Upper bound on `ChannelDevice::tx_pool` residency; buffers returned
+/// past the cap free instead of pooling.
+const TX_POOL_CAP: usize = 128;
+
 /// A channel-backed smoltcp [`Device`]: packets `Tunn::decapsulate` yields
 /// are pushed into `rx_queue` for `Interface` ingress; everything
 /// `Interface` egresses lands in `tx_queue` for `Tunn::encapsulate`.
@@ -71,6 +75,15 @@ pub struct ChannelDevice {
 }
 
 impl ChannelDevice {
+    /// Return a drained `tx_queue` buffer to `tx_pool`. The pool is a
+    /// peak-water recycler, so cap it — a one-off burst must not pin
+    /// MTU-sized allocations for the process lifetime.
+    pub fn return_tx_buf(&mut self, buf: Vec<u8>) {
+        if self.tx_pool.len() < TX_POOL_CAP {
+            self.tx_pool.push_back(buf);
+        }
+    }
+
     pub fn new(mtu: usize) -> Self {
         // `DeviceCapabilities` is #[non_exhaustive] — mutate from default.
         let mut caps = DeviceCapabilities::default();
