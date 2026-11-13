@@ -4,11 +4,13 @@
 //! actors open toward their peers with batch calls that collapse a
 //! wire burst into a single `recvmmsg`/`sendmmsg` syscall on Linux.
 //! Everywhere else the same calls degrade to a per-datagram `try_*`
-//! loop — BSD/macOS have no mmsg syscalls, and bionic (Android, a
-//! separate `target_os`) does not expose the libc wrappers — so the
-//! calling actors keep one code path and the syscall savings are
-//! strictly an optimization. The ordinary `try_*`/`recv*` methods are
-//! forwarded for the single-datagram paths that remain.
+//! loop — BSD/macOS have no mmsg syscalls — so the calling actors
+//! keep one code path and the syscall savings are strictly an
+//! optimization. Android (a separate `target_os`) stays on the
+//! fallback too: `libc` binds bionic's `sendmmsg`/`recvmmsg` as of
+//! 0.2.191, so the `linux`-only cfg is a deliberate conservative
+//! choice, not a missing binding. The ordinary `try_*`/`recv*`
+//! methods are forwarded for the single-datagram paths that remain.
 //!
 //! Batch semantics match the per-packet loops they replace: a short
 //! count means the next datagram is the boundary the kernel stopped
@@ -110,8 +112,12 @@ impl BatchEndpoint {
 
     // ── batch calls ──────────────────────────────────────────────
 
-    /// Drain up to `min(bufs.len(), budget)` datagrams — one
-    /// `recvmmsg` on Linux, a `try_recv_buf` loop elsewhere. Every
+    /// Drain up to `min(bufs.len(), budget, WIRE_DRAIN_BUDGET)`
+    /// datagrams — one `recvmmsg` on Linux, a `try_recv_buf` loop
+    /// elsewhere. The third clamp is the stack-array bound: a single
+    /// mmsg call can never service more slots than its arrays hold,
+    /// and the fallback loop inherits the same bound so both paths
+    /// agree on what one call is allowed to do. Every
     /// slot's whole *capacity* is its receive window — never its
     /// current length — so a persistent slot set serves batch after
     /// batch without restaging. On return, each of `bufs[..ret]` is
@@ -466,5 +472,111 @@ mod tests {
         b.readable().await.expect("readable");
         let n = b.recv_batch(&mut bufs, 3);
         assert_eq!(n, 3, "budget clamps the drain");
+    }
+
+    /// Read `expected` datagrams off `sock` in wire order, polling
+    /// until the count is met or the deadline passes — loopback
+    /// delivery is not synchronous with the sender's `send` (on Linux
+    /// each datagram crosses a softirq backlog first).
+    async fn drain_all(sock: &BatchEndpoint, expected: usize) -> Vec<Vec<u8>> {
+        let mut got: Vec<Vec<u8>> = Vec::new();
+        let mut buf = vec![0u8; 65536];
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while got.len() < expected {
+            match tokio::time::timeout_at(deadline, sock.readable()).await {
+                Ok(r) => r.expect("readable"),
+                Err(_) => break,
+            }
+            while let Ok(n) = sock.try_recv(&mut buf) {
+                got.push(buf[..n].to_vec());
+            }
+        }
+        got
+    }
+
+    /// Chunks past the [`WIRE_DRAIN_BUDGET`] stack-array bound: a
+    /// 130-datagram `send_batch` takes three mmsg rounds on Linux —
+    /// the `pkts[sent..sent + n]` offset must stay exact — and a plain
+    /// loop elsewhere. The receiver sees every datagram once, in
+    /// order.
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_batch_chunks_past_stack_bound() {
+        let a_sock = std_sock();
+        let b_sock = std_sock();
+        let b_addr = b_sock.local_addr().expect("addr");
+        a_sock.connect(b_addr).expect("connect");
+        let a = ep(a_sock, true);
+        let b = ep(b_sock, false);
+
+        const N: usize = 130; // > 2 × WIRE_DRAIN_BUDGET ⇒ ≥3 kernel rounds
+        let payloads: Vec<Vec<u8>> = (0..N).map(|i| vec![i as u8; 8 + i]).collect();
+        let refs: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
+        a.writable().await.expect("sender writable");
+        assert_eq!(a.send_batch(&refs, b_addr), N, "all chunks sent");
+
+        let got = drain_all(&b, N).await;
+        assert_eq!(got, payloads, "every datagram exactly once, in order");
+    }
+
+    /// The unconnected half of the same pin: `send_batch_to` carries
+    /// each datagram's own destination across the same chunk boundary.
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_batch_to_chunks_past_stack_bound() {
+        let a = ep(std_sock(), false);
+        let b_sock = std_sock();
+        let b_addr = b_sock.local_addr().expect("addr");
+        let b = ep(b_sock, false);
+
+        const N: usize = 130;
+        let payloads: Vec<Vec<u8>> = (0..N).map(|i| vec![i as u8; 8 + i]).collect();
+        let refs: Vec<(SocketAddr, &[u8])> =
+            payloads.iter().map(|p| (b_addr, p.as_slice())).collect();
+        a.writable().await.expect("sender writable");
+        assert_eq!(a.send_batch_to(&refs), N, "all chunks sent");
+
+        let got = drain_all(&b, N).await;
+        assert_eq!(got, payloads, "every datagram exactly once, in order");
+    }
+
+    /// The third `recv_batch` clamp: a slot set wider than
+    /// [`WIRE_DRAIN_BUDGET`] is serviced a stack-array-sized slice at
+    /// a time — one call never exceeds the mmsg array bound, and the
+    /// remainder surfaces on the next call.
+    #[tokio::test(flavor = "current_thread")]
+    async fn recv_batch_clamps_to_stack_bound() {
+        let a_sock = std_sock();
+        let a_addr = a_sock.local_addr().expect("addr");
+        let b_sock = std_sock();
+        b_sock.connect(a_addr).expect("connect");
+        let b = ep(b_sock, true);
+
+        const N: usize = WIRE_DRAIN_BUDGET + 6;
+        for i in 0..N {
+            a_sock
+                .send_to(&[i as u8; 20], b.local_addr().expect("addr"))
+                .expect("send");
+        }
+
+        let mut bufs: Vec<Vec<u8>> = (0..N).map(|_| vec![0u8; 128]).collect();
+        b.readable().await.expect("readable");
+        // `readable` resolves on the first datagram; give the backlog
+        // a moment to land the rest so the queue provably holds ≥64
+        // before the batch is measured.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let first = b.recv_batch(&mut bufs, N);
+        assert_eq!(
+            first, WIRE_DRAIN_BUDGET,
+            "one call never exceeds the stack-array bound"
+        );
+        for (i, buf) in bufs[..first].iter().enumerate() {
+            assert_eq!(buf.as_slice(), &[i as u8; 20]);
+        }
+
+        b.readable().await.expect("readable");
+        let second = b.recv_batch(&mut bufs, N);
+        assert_eq!(second, N - WIRE_DRAIN_BUDGET);
+        for (i, buf) in bufs[..second].iter().enumerate() {
+            assert_eq!(buf.as_slice(), &[(i + first) as u8; 20]);
+        }
     }
 }

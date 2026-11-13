@@ -522,4 +522,20 @@ mod tests {
             );
         });
     }
+
+    /// `tx_pool` residency is capped: past `TX_POOL_CAP` a returned
+    /// buffer frees instead of pooling — a one-off burst must not pin
+    /// MTU-sized allocations for the process lifetime.
+    #[test]
+    fn tx_pool_cap_evicts_past_bound() {
+        let mut d = ChannelDevice::new(1420);
+        for _ in 0..TX_POOL_CAP + 1 {
+            d.return_tx_buf(Vec::with_capacity(1420));
+        }
+        assert_eq!(
+            d.tx_pool.len(),
+            TX_POOL_CAP,
+            "the (cap + 1)-th return must not pool"
+        );
+    }
 }

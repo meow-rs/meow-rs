@@ -312,10 +312,30 @@ fn parse_ipv4_tcp(pkt: &[u8]) -> Option<TcpSeg<'_>> {
     if pkt.len() < ihl + 20 {
         return None;
     }
+    // The device advertises `Checksum::Tx` — software-compute on send —
+    // so the responder plays the role of the peer's kernel stack and
+    // verifies both checksums: a zero or wrong TCP checksum means the
+    // TX path forgot to fill it, and the packet is refused exactly the
+    // way a real peer's stack would refuse it.
+    if inet_checksum(&pkt[..ihl]) != 0 {
+        return None; // IPv4 header checksum (field included) must fold to 0
+    }
     let t = &pkt[ihl..];
     let off = usize::from(t[12] >> 4) * 4;
     if t.len() < off || off < 20 {
         return None;
+    }
+    if u16::from_be_bytes([t[16], t[17]]) == 0 {
+        return None; // TCP checksum was never computed
+    }
+    let mut pseudo = Vec::with_capacity(12 + t.len());
+    pseudo.extend_from_slice(&pkt[12..16]);
+    pseudo.extend_from_slice(&pkt[16..20]);
+    pseudo.extend_from_slice(&[0, 6]);
+    pseudo.extend_from_slice(&(t.len() as u16).to_be_bytes());
+    pseudo.extend_from_slice(t);
+    if inet_checksum(&pseudo) != 0 {
+        return None; // pseudo-header + segment must fold to 0
     }
     Some(TcpSeg {
         src_ip: Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]),
@@ -337,8 +357,11 @@ struct TcpEnds {
     dport: u16,
 }
 
-/// A checksummed IPv4+TCP segment — smoltcp drops checksum failures
-/// silently, so the pseudo-header checksum must be real. `options` must
+/// A checksummed IPv4+TCP segment — `ChannelDevice` advertises
+/// `Checksum::Tx` (compute on send, skip RX verification), so nothing
+/// on our side drops a bad checksum; the responder's own
+/// `parse_ipv4_tcp` does the rejecting instead, which is exactly what
+/// makes a real pseudo-header checksum mandatory here. `options` must
 /// be 4-byte aligned already (NOP-padded); pass `&[]` for a bare header.
 fn build_ipv4_tcp(
     ends: &TcpEnds,
@@ -564,6 +587,22 @@ async fn udp_ingress_reaches_read_packet() {
         }
         let ihl = usize::from(pkt[0] & 0x0f) * 4;
         let u = &pkt[ihl..];
+        // Same `Checksum::Tx` gate as `parse_ipv4_tcp`: the IP header
+        // checksum must fold to 0 and the UDP checksum must exist and
+        // verify — a zero field is RFC-legal for senders that don't
+        // checksum, but ours must compute it.
+        if inet_checksum(&pkt[..ihl]) != 0 || u16::from_be_bytes([u[6], u[7]]) == 0 {
+            return None;
+        }
+        let mut pseudo = Vec::with_capacity(12 + u.len());
+        pseudo.extend_from_slice(&pkt[12..16]);
+        pseudo.extend_from_slice(&pkt[16..20]);
+        pseudo.extend_from_slice(&[0, 17]);
+        pseudo.extend_from_slice(&(u.len() as u16).to_be_bytes());
+        pseudo.extend_from_slice(u);
+        if inet_checksum(&pseudo) != 0 {
+            return None;
+        }
         let sport = u16::from_be_bytes([u[0], u[1]]);
         let dport = u16::from_be_bytes([u[2], u[3]]);
         let payload = &u[8..];
@@ -801,4 +840,49 @@ async fn tcp_window_scale_negotiates_scaled_window() {
 
     adapter.reset_sessions();
     responder_task.abort();
+}
+
+/// `parse_ipv4_tcp` is the responder's kernel-stack stand-in for the
+/// `Checksum::Tx` contract: a segment whose IP or TCP checksum is zero
+/// or wrong must be refused, exactly as a real peer's stack would. A
+/// good `build_ipv4_tcp` output parses (sanity that the gate isn't
+/// unconditionally rejecting).
+#[test]
+fn parse_ipv4_tcp_rejects_bad_or_missing_checksums() {
+    let ends = TcpEnds {
+        src: Ipv4Addr::new(10, 0, 0, 2),
+        dst: Ipv4Addr::new(10, 9, 9, 9),
+        sport: 50000,
+        dport: 443,
+    };
+    let good = build_ipv4_tcp(&ends, 100, 1, TCP_SYN, &[], &[]);
+    assert!(
+        parse_ipv4_tcp(&good).is_some(),
+        "a correctly checksummed segment parses"
+    );
+
+    // Zeroed TCP checksum — a TX path that forgot to compute it.
+    let mut zero_tcp = good.clone();
+    zero_tcp[36] = 0;
+    zero_tcp[37] = 0;
+    assert!(
+        parse_ipv4_tcp(&zero_tcp).is_none(),
+        "zero TCP checksum must be refused"
+    );
+
+    // Corrupted TCP checksum — valid-looking nonzero garbage.
+    let mut bad_tcp = good.clone();
+    bad_tcp[36] ^= 0x5A;
+    assert!(
+        parse_ipv4_tcp(&bad_tcp).is_none(),
+        "wrong TCP checksum must be refused"
+    );
+
+    // Corrupted IPv4 header checksum.
+    let mut bad_ip = good;
+    bad_ip[10] ^= 0x5A;
+    assert!(
+        parse_ipv4_tcp(&bad_ip).is_none(),
+        "wrong IPv4 header checksum must be refused"
+    );
 }

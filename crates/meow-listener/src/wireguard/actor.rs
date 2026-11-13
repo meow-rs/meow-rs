@@ -273,9 +273,9 @@ impl WgActor {
 
         let table = PeerTable::new(&cfg).map_err(io::Error::other)?;
 
-        // MTU math per spec §6: the configured value is the *outer* wire
-        // MTU; the inner stack gets `mtu - 64` (WireGuard + UDP + IP
-        // overhead), floor 576.
+        // MTU math per the spec's MTU contract: the configured value
+        // is the *outer* wire MTU; the inner stack gets `mtu - 64`
+        // (WireGuard + UDP + IP overhead), floor 576.
         let mtu = usize::from(cfg.mtu);
         let inner_mtu = mtu.saturating_sub(64).max(576);
 
@@ -727,8 +727,9 @@ impl WgActor {
             // caps the inner packet at inner_mtu = mtu - 64, and
             // `dst` is mtu + 256, so headroom always covers the WG
             // overhead. The debug_assert pins that contract; the
-            // drop+log stays as the spec §6 release-mode guard rather
-            // than a silent oversize swallow.
+            // drop+log stays as the release-mode guard the spec's
+            // oversize-drop posture calls for, rather than a silent
+            // oversize swallow.
             debug_assert!(
                 pkt.len() + DATA_OVERHEAD_SZ <= dst.len(),
                 "inject packet {}B + {DATA_OVERHEAD_SZ}B overhead exceeds \
@@ -2352,6 +2353,240 @@ mod tests {
         assert_eq!(
             actor.outbox[0].0, ep_b,
             "the RST must encrypt under peer 1's session toward its endpoint"
+        );
+    }
+
+    // ── flush_outbox / scratch-pool pins ─────────────────────────
+
+    /// Arm the endpoint's cached *writable* readiness through the only
+    /// public async call `BatchEndpoint` forwards — `recv_from` for
+    /// this unconnected endpoint. The poll never resolves (nothing
+    /// ever arrives), but while it parks the reactor reports the
+    /// socket's ready bits and `try_send_to` stops short-circuiting
+    /// `WouldBlock` so it reaches the real syscall.
+    async fn arm_writable(endpoint: &BatchEndpoint) {
+        let mut buf = [0u8; 16];
+        let _ =
+            tokio::time::timeout(Duration::from_millis(250), endpoint.recv_from(&mut buf)).await;
+    }
+
+    /// Drain `expected` datagrams off a receiver, in wire order.
+    /// Loopback delivery is not synchronous with the sender's `send` —
+    /// on Linux each datagram crosses a softirq backlog first, so keep
+    /// polling until the count is met or the deadline passes.
+    async fn drain_received(receiver: &tokio::net::UdpSocket, expected: usize) -> Vec<Vec<u8>> {
+        let mut got: Vec<Vec<u8>> = Vec::new();
+        let mut buf = vec![0u8; 65536];
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while got.len() < expected {
+            match tokio::time::timeout_at(deadline, receiver.readable()).await {
+                Ok(r) => r.expect("receiver readable"),
+                Err(_) => break,
+            }
+            while let Ok(n) = receiver.try_recv(&mut buf) {
+                got.push(buf[..n].to_vec());
+            }
+        }
+        got
+    }
+
+    /// F1 regression pin — a `send_batch_to` that stops short replays
+    /// the boundary datagram, sees `WouldBlock`, and must requeue
+    /// `[boundary, successors…]` *ahead* of whatever the outbox already
+    /// held, losing nothing (per-destination addressing preserved).
+    ///
+    /// Deterministic boundary without timing tricks: the staged batch
+    /// carries one oversized datagram at `BOUNDARY`, so the kernel
+    /// stops the batch exactly there — `sendmmsg` reports the short
+    /// count on Linux, the fallback `try_send_to` loop stops at its
+    /// first error elsewhere. The `WouldBlock` verdict then comes
+    /// from tokio's *cold* readiness gate: this `current_thread` test
+    /// awaits nothing before the first flush, so the driver never
+    /// polled the fresh socket and the replay `try_send_to` short-
+    /// circuits `WouldBlock` without reaching the kernel — on every
+    /// platform. (A small `SO_SNDBUF` cannot produce the short batch
+    /// instead: transmitted UDP skbs orphan their wmem charge at xmit,
+    /// so a loopback send queue never fills.)
+    ///
+    /// The second flush runs with the gate armed: the oversized
+    /// boundary now reaches the kernel, takes the `EMSGSIZE` drop arm
+    /// (pinned separately below), and every other datagram lands on
+    /// the wire in queue order.
+    #[tokio::test(flavor = "current_thread")]
+    async fn flush_outbox_wouldblock_requeue_preserves_order() {
+        let receiver_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind receiver");
+        receiver_std
+            .set_nonblocking(true)
+            .expect("receiver nonblocking");
+        let peer = receiver_std.local_addr().expect("receiver addr");
+        let mut actor = actor_with_spec(WgListenerSpec {
+            private_key: [0x5E; 32],
+            peers: vec![WgPeerSpec {
+                public_key: [0xA0; 32],
+                preshared_key: None,
+                allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
+                name: SmolStr::new(""),
+                reserved: None,
+            }],
+            mtu: 1420,
+            udp: true,
+            udp_timeout: Duration::from_secs(60),
+        });
+
+        // A full staged batch (tags 0..BUDGET, oversized at BOUNDARY)
+        // ahead of two older queued datagrams (tags 0xF0/0xF1) the
+        // outbox already held — all addressed to the same peer. Each
+        // Vec carries `scratch_len` capacity so `return_scratch`
+        // pools it; the tag byte makes content order observable.
+        const STAGED: usize = WIRE_DRAIN_BUDGET;
+        const BOUNDARY: usize = 3;
+        const BOUNDARY_TAG: u8 = 0xEE;
+        const OLD: [u8; 2] = [0xF0, 0xF1];
+        let tag_of = |i: usize| {
+            if i == BOUNDARY {
+                BOUNDARY_TAG
+            } else {
+                i as u8
+            }
+        };
+        let scratch_len = actor.scratch_len;
+        let tag = move |t: u8| {
+            let mut v = Vec::with_capacity(scratch_len);
+            v.push(t);
+            v
+        };
+        for i in 0..STAGED {
+            let v = if i == BOUNDARY {
+                vec![BOUNDARY_TAG; 70_000] // > 65 507 max UDP payload; first byte is the tag
+            } else {
+                tag(tag_of(i))
+            };
+            actor.outbox.push_back((peer, v));
+        }
+        for t in OLD {
+            actor.outbox.push_back((peer, tag(t)));
+        }
+
+        actor.flush_outbox();
+
+        // Path proof: on Linux the batch genuinely stopped at the
+        // oversized index inside `sendmmsg`; elsewhere the cold gate
+        // stopped the `try_send_to` loop at index 0.
+        let sent = STAGED + OLD.len() - actor.outbox.len();
+        #[cfg(target_os = "linux")]
+        assert_eq!(sent, BOUNDARY, "sendmmsg stops at the EMSGSIZE index");
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(sent, 0, "cold readiness stops the fallback loop at index 0");
+
+        // The pre-F1 bug pushed the boundary first, then its
+        // successors ahead of it — [s1..s63, b, old]. The contract is
+        // [b, s1..s63, old]: a strictly consecutive tag run at the
+        // front (staged[sent] onward), then the old tail.
+        let expected: Vec<u8> = (sent..STAGED).map(tag_of).chain(OLD).collect();
+        let got: Vec<u8> = actor.outbox.iter().map(|(_, v)| v[0]).collect();
+        assert_eq!(
+            got, expected,
+            "requeue must keep the boundary datagram ahead of its successors, ahead of the old tail"
+        );
+        assert!(
+            actor.outbox.iter().all(|(a, _)| *a == peer),
+            "per-datagram destinations survive the requeue"
+        );
+
+        // The successors stay behind the boundary on the wire too:
+        // arm the gate, flush once more, and the receiver must see
+        // every datagram in queue order — the earlier partial send
+        // first, the oversized boundary dropped by the error arm.
+        arm_writable(&actor.endpoint).await;
+        actor.flush_outbox();
+        assert!(actor.outbox.is_empty(), "armed socket drains the requeue");
+
+        let receiver = tokio::net::UdpSocket::from_std(receiver_std).expect("tokio receiver");
+        let got = drain_received(&receiver, STAGED + OLD.len() - 1).await;
+        let expected: Vec<Vec<u8>> = (0..STAGED)
+            .filter(|&i| i != BOUNDARY)
+            .map(|i| vec![tag_of(i)])
+            .chain(OLD.iter().map(|&t| vec![t]))
+            .collect();
+        assert_eq!(
+            got, expected,
+            "wire order must match queue order across the requeue"
+        );
+    }
+
+    /// The other boundary arm: a datagram whose replay reports a real
+    /// errno (not `WouldBlock`) is dropped — exactly that one — while
+    /// the rest of the staged batch continues, and every spent buffer
+    /// (sent or dropped) returns to the scratch pool. The trigger is
+    /// an oversized datagram: `send*` answers `EMSGSIZE` determinist-
+    /// ically on every platform.
+    #[tokio::test]
+    async fn flush_outbox_boundary_error_drops_only_that_datagram() {
+        let receiver_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind receiver");
+        receiver_std
+            .set_nonblocking(true)
+            .expect("receiver nonblocking");
+        let peer = receiver_std.local_addr().expect("receiver addr");
+        let mut actor = test_actor();
+
+        // Arm the reactor readiness: `try_send_to` must reach the
+        // kernel for EMSGSIZE rather than WouldBlock-ing on a cold
+        // gate.
+        arm_writable(&actor.endpoint).await;
+
+        let oversized = vec![0xEE; 70_000]; // > 65 507 max UDP payload
+        let scratch_len = actor.scratch_len;
+        let tag = move |t: u8| {
+            let mut v = Vec::with_capacity(scratch_len);
+            v.push(t);
+            v
+        };
+        actor.outbox.push_back((peer, tag(0)));
+        actor.outbox.push_back((peer, tag(1)));
+        actor.outbox.push_back((peer, oversized));
+        actor.outbox.push_back((peer, tag(3)));
+
+        actor.flush_outbox();
+
+        assert!(actor.outbox.is_empty(), "batch completes past the error");
+        assert_eq!(
+            actor.scratch_pool.len(),
+            4,
+            "sent and dropped buffers all return to the scratch pool"
+        );
+        let receiver = tokio::net::UdpSocket::from_std(receiver_std).expect("tokio receiver");
+        let got = drain_received(&receiver, 3).await;
+        assert_eq!(
+            got,
+            vec![vec![0u8], vec![1], vec![3]],
+            "exactly the failing datagram is dropped; successors continue in order"
+        );
+    }
+
+    /// `return_scratch` is a bounded, full-size-only recycler: an
+    /// undersized buffer (capacity below `scratch_len`) frees instead
+    /// of pooling, and residency never passes `SCRATCH_POOL_CAP`.
+    #[tokio::test]
+    async fn return_scratch_rejects_undersize_and_caps_pool() {
+        let mut actor = test_actor();
+
+        let undersized = Vec::with_capacity(actor.scratch_len - 1);
+        actor.return_scratch(undersized);
+        assert!(
+            actor.scratch_pool.is_empty(),
+            "capacity < scratch_len must not pool — a checkout would realloc anyway"
+        );
+
+        actor.return_scratch(Vec::with_capacity(actor.scratch_len));
+        assert_eq!(actor.scratch_pool.len(), 1, "full-size buffer pools");
+
+        for _ in 0..SCRATCH_POOL_CAP + 1 {
+            actor.return_scratch(Vec::with_capacity(actor.scratch_len));
+        }
+        assert_eq!(
+            actor.scratch_pool.len(),
+            SCRATCH_POOL_CAP,
+            "pool residency is capped — past it the Vec frees"
         );
     }
 }
