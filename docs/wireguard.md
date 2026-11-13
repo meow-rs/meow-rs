@@ -31,7 +31,16 @@ and torn down by `reset_sessions`:
   (`crates/meow-wireguard`, BSD-3-Clause) with `ring` replaced by the
   workspace's RustCrypto crates — `x25519-dalek`, `blake2`,
   `chacha20poly1305`. Only the `noise/` and serialization modules are
-  vendored; boringtun's device/FFI/JNI halves never enter the tree. See
+  vendored; boringtun's device/FFI/JNI halves never enter the tree.
+  Behind the optional `wireguard-boring` Cargo feature the *session*
+  data-path AEAD (the per-packet ChaCha20-Poly1305) runs on BoringSSL's
+  `AeadCtx` — the key schedule is built once per session instead of per
+  packet, on the same vendored BoringSSL the rest of the tree already
+  links — while the Noise handshake stays on RustCrypto either way.
+  meow-proxy's `wireguard` feature enables it, so release builds take
+  the BoringSSL path; a standalone `meow-wireguard` build without it
+  keeps the pure-RustCrypto session path, and both backends produce
+  identical wire bytes. See
   [Security note](#security-note) for what that ownership means.
 - **The TCP/IP stack** is
   [`smoltcp`](https://github.com/smoltcp-rs/smoltcp): decapsulated IP
@@ -293,7 +302,11 @@ call sites are patched onto the workspace's RustCrypto crates
 enumerated in `crates/meow-wireguard/PATCHES.md` for replay on future
 vendor bumps. A CI check fails the build if `ring` ever re-enters the
 crate's dependency tree, and an in-process two-peer test (handshake
-plus transport round-trip, no network) gates every merge.
+plus transport round-trip, no network) gates every merge. The optional
+`wireguard-boring` feature swaps the *session* data-path AEAD to the
+vendored BoringSSL (`boring::aead::AeadCtx`) — still no `ring`, and the
+handshake stays on RustCrypto — with a fixed known-answer test pinning
+byte-identical session ciphertext across the two backends.
 
 That also means **the team owns the fork's maintenance**: upstream
 boringtun fixes do not flow in automatically — a bump is a deliberate

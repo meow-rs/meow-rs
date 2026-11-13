@@ -38,7 +38,11 @@ opt-level = 1
 [workspace.package]
 version = "0.29.0"
 edition = "2021"
-rust-version = "1.89"
+# MSRV floor: smoltcp 0.13 (see below) declares rust-version 1.91 and is a
+# non-optional dep of always-built meow-wgstack, so 1.91 is the honest
+# workspace floor — the rust-toolchain.toml pin (1.98.1) already exceeds
+# it, and the msrv CI leg reads this field.
+rust-version = "1.91"
 license = "MIT"
 repository = "https://github.com/meow-rs/meow-rs"
 homepage = "https://meow-rs.github.io/meow-rs/"
@@ -148,9 +152,12 @@ ipnet = "2"
 # Userspace TCP/IP for the WireGuard outbound (#899) — a different stack
 # from lwIP: the WG pump owns it single-threaded inside a dedicated actor
 # thread, driving Interface::poll off plain mpsc channels. `medium-ip`
-# gives the L3 (no-Ethernet) device; `std` supplies smoltcp's clock;
-# 0.13+ requires rustc 1.91 while the workspace floor is 1.89.
-smoltcp = { version = "0.12", default-features = false, features = [
+# gives the L3 (no-Ethernet) device; `std` supplies smoltcp's clock.
+# 0.13.1 fixes a listen-SYN panic, a SACK seq overflow panic and stale
+# `poll_at` timestamps; 0.13's #1059 makes `poll` itself exhaust socket
+# egress, which our `poll_burst` loop keeps bounded on its own budget.
+# 0.13 requires rustc 1.91 — the workspace floor above moved with it.
+smoltcp = { version = "0.13", default-features = false, features = [
     "std",
     "log",
     "medium-ip",

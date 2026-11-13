@@ -26,6 +26,10 @@ x25519-dalek  = { workspace = true }
 blake2        = { workspace = true }
 hmac          = { workspace = true }
 chacha20poly1305 = { workspace = true }
+# `wireguard-boring`: BoringSSL AEAD for the session data path — the same
+# `boring` crate (and single vendored BoringSSL, `links = "boringssl"`)
+# every other meow-rs crypto path links, pulled in only by that feature.
+boring        = { workspace = true, optional = true }
 
 # Boringtun non-crypto deps (kept verbatim, versions aligned to workspace)
 parking_lot   = { workspace = true }
@@ -36,6 +40,15 @@ libc          = "0.2"
 
 [features]
 default = []
+# Session data-path AEAD via BoringSSL (`boring::aead::AeadCtx`): the key
+# schedule is built once per Session instead of per packet, and the
+# primitive itself is BoringSSL's platform assembly (aarch64 NEON) which
+# is ~5x the RustCrypto software path under the workspace's
+# opt-level = "z" release profile. Handshake-path AEAD stays on
+# RustCrypto — it runs a handful of times per session, not per packet.
+# meow-proxy's `wireguard` feature turns this on; without it the crate
+# keeps the exact RustCrypto fallback.
+wireguard-boring = ["dep:boring"]
 # Kept for upstream test compatibility; NOT used in production. The feature is
 # deliberately empty: when enabled it swaps sleepyinstant for the in-crate mock
 # clock in src/mock_instant.rs, so no external mock_instant crate is needed.

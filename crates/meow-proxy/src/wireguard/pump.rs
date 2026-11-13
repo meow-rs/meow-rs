@@ -633,6 +633,29 @@ impl WgPump {
     }
 
     fn dial_tcp(&mut self, remote: SocketAddr, display: String, reply: TcpDialReply) {
+        // A WG iface carries exactly one address per family, so the
+        // same-family tunnel address is the only local endpoint this
+        // dial could ever use — pin it instead of letting smoltcp's
+        // RFC 6724 source selection run: for an IPv6 *loopback*
+        // destination that selection returns `::1`, which smoltcp 0.13
+        // (#1113) then closes on the first dispatch because `::1` is not
+        // in `ip_addrs`. A family the tunnel has no address for can never
+        // carry the flow at all — fail it here, the same contract the
+        // UDP conn's `has_v4`/`has_v6` pre-check gives, rather than let
+        // a dead-end auto-selection surface a bare "refused" after the
+        // socket's first dispatch (or the full connect limit).
+        let local_addr = match remote.ip() {
+            IpAddr::V4(_) => self.src_v4,
+            IpAddr::V6(_) => self.src_v6,
+        };
+        let Some(local_addr) = local_addr else {
+            let _ = reply.send(Err(MeowError::NotSupported(format!(
+                "wireguard {}: no {} tunnel address configured for {remote}",
+                self.name,
+                if remote.is_ipv4() { "IPv4" } else { "IPv6" },
+            ))));
+            return;
+        };
         let Some(port) = self.alloc_port() else {
             let _ = reply.send(Err(MeowError::Proxy(format!(
                 "wireguard {}: ephemeral ports exhausted",
@@ -649,7 +672,10 @@ impl WgPump {
         let connect = socket.connect(
             self.iface.context(),
             IpEndpoint::from(remote),
-            IpListenEndpoint::from(port),
+            IpListenEndpoint {
+                addr: Some(local_addr),
+                port,
+            },
         );
         if let Err(e) = connect {
             self.used_ports.remove(&port);
@@ -1058,11 +1084,14 @@ impl WgPump {
     /// regression to one `iface.poll` per pass must fail that test,
     /// not just prod.
     fn poll_stack(&mut self, now: SmolInstant) {
-        // Burst, not a single poll: smoltcp egresses at most one TCP
-        // segment per socket per `poll`, so one call per pass capped
-        // a bulk flow at ~1 segment per inner-RTT wake — the same
-        // ceiling the WG listener measured (~285 KB/s). `poll_burst`
-        // loops until the stack goes quiet.
+        // Burst, not a single poll. Before smoltcp 0.13 a socket
+        // egressed at most one TCP segment per `poll`, so one call per
+        // pass capped a bulk flow at ~1 segment per inner-RTT wake —
+        // the ~285 KB/s ceiling the WG listener measured; the loop was
+        // the throughput critical path. 0.13's `poll` now drains socket
+        // egress internally (upstream #1059), so `poll_burst` stays
+        // only as the bounded-budget safety net, looping until the
+        // stack goes quiet.
         poll_burst(&mut self.iface, now, &mut self.device, &mut self.sockets);
     }
 
@@ -1830,6 +1859,44 @@ mod tests {
             !pump.outbox.iter().any(|d| d.len() == 148 && d[0] == 1),
             "an AEAD failure must not trigger a handshake"
         );
+    }
+
+    /// A dial to a family the tunnel has no address for fails *inside*
+    /// `dial_tcp` — before a port, socket or `connect` exists — so the
+    /// caller gets a named error instead of the 25 s connect-limit burn
+    /// the `addr: None` auto-selection path left behind (smoltcp 0.13
+    /// then RST'd the socket on first dispatch anyway). The adapter's
+    /// `check_tunnel_target` normally rejects these first; this is the
+    /// in-pump backstop, symmetric with the UDP conn's `has_v4`/`has_v6`
+    /// write-time check.
+    #[tokio::test(flavor = "current_thread")]
+    async fn dial_tcp_missing_family_fails_fast() {
+        let client_secret = x25519::StaticSecret::from([0x45; 32]);
+        let server_public = x25519::PublicKey::from(&x25519::StaticSecret::from([0x46; 32]));
+        // test_config carries `ip` only — the tunnel has no IPv6 address.
+        let mut pump = pump_for_test(&test_config(&client_secret, &server_public));
+
+        let (reply_tx, mut reply_rx) = oneshot::channel();
+        pump.dial_tcp("[fd00::1]:443".parse().unwrap(), "t".into(), reply_tx);
+
+        // `try_recv` resolves only if the Err was queued inside the call
+        // itself — no service pass, no timer, no 25 s wait.
+        let err = match reply_rx.try_recv() {
+            Ok(Err(e)) => e,
+            Ok(Ok(_)) => panic!("a v6 dial on a v4-only tunnel must fail"),
+            Err(e) => panic!("the early Err must be queued inside dial_tcp: {e}"),
+        };
+        assert!(
+            matches!(err, MeowError::NotSupported(_)),
+            "a family miss is NotSupported, matching the udp pre-check: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("IPv6 tunnel address"),
+            "the failure names the missing family: {err}"
+        );
+        // Nothing leaked: no socket was created and no port was taken.
+        assert!(pump.tcp.is_empty(), "no TCP socket may be allocated");
+        assert!(pump.used_ports.is_empty(), "no ephemeral port may be held");
     }
 
     /// smoltcp clears a socket's `tuple` the moment its terminal RST is

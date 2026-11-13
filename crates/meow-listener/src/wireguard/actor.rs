@@ -448,10 +448,14 @@ impl WgActor {
         // out of nothing (timer-driven deaths of owned flows are
         // already caught by `service_tcp`'s own iteration).
         let had_rx = !self.device.rx_queue.is_empty();
-        // Burst, not a single poll: smoltcp egresses at most one TCP
-        // segment per socket per `poll`, so one call per pass capped a
-        // bulk flow at ~1 segment per inner-RTT wake (~285 KB/s
-        // measured). `poll_burst` loops until the stack goes quiet.
+        // Burst, not a single poll. Before smoltcp 0.13 a socket
+        // egressed at most one TCP segment per `poll`, so one call per
+        // pass capped a bulk flow at ~1 segment per inner-RTT wake
+        // (~285 KB/s measured); the loop was the throughput critical
+        // path. 0.13's `poll` now drains socket egress internally
+        // (upstream #1059), so `poll_burst` stays only as the
+        // bounded-budget safety net, looping until the stack goes
+        // quiet.
         poll_burst(&mut self.iface, now, &mut self.device, &mut self.sockets);
         if had_rx
             || !self.device.tx_queue.is_empty()

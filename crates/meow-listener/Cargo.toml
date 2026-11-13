@@ -54,6 +54,7 @@ listener-shadowsocks = [
 # through meow-wgstack.
 listener-wireguard = [
     "dep:meow-wireguard",
+    "meow-wireguard/wireguard-boring",
     "dep:meow-wgstack",
     "dep:smoltcp",
     "dep:ipnet",

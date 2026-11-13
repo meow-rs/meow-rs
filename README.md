@@ -273,7 +273,7 @@ flowchart TD
 
 ### Build
 
-Requires Rust 1.89+ (the workspace pins `rust-version = "1.89"` and CI enforces it via a dedicated MSRV job). `rust-toolchain.toml` additionally pins the default channel rustup uses in the checkout, so CI and local builds share one toolchain.
+Requires Rust 1.91+ (the workspace pins `rust-version = "1.91"` and CI enforces it via a dedicated MSRV job). `rust-toolchain.toml` additionally pins the default channel rustup uses in the checkout, so CI and local builds share one toolchain.
 
 ```bash
 cargo build --release
