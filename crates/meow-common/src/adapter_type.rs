@@ -82,6 +82,13 @@ pub enum ConnType {
     Tuic,
     Hysteria2,
     Inner,
+    /// WireGuard inbound listener (`type: wireguard`): an inner TCP/UDP
+    /// flow terminated from a WG-encapsulated datagram. Serializes as
+    /// `"wireguard"` in `/connections` `metadata.type` (errata U4 —
+    /// pinned by an API test); the alias keeps the first shipped
+    /// spelling readable on deserialize.
+    #[serde(rename = "wireguard", alias = "WireGuard")]
+    WireGuard,
 }
 
 impl fmt::Display for ConnType {
@@ -102,6 +109,7 @@ impl fmt::Display for ConnType {
             ConnType::Tuic => write!(f, "Tuic"),
             ConnType::Hysteria2 => write!(f, "Hysteria2"),
             ConnType::Inner => write!(f, "Inner"),
+            ConnType::WireGuard => write!(f, "WireGuard"),
         }
     }
 }

@@ -200,6 +200,19 @@ Patch 14 — noise/mod.rs tests: serialize the process-global mock clock
   module) instead of a real 90s+ advance precisely to avoid widening
   that race surface; it still takes the lock for its final
   clock-sensitive timer assert.
+
+Patch 15 — noise/mod.rs: handle_verified_packet pub(crate) -> pub
+  The WireGuard inbound listener (responder) needs upstream's device
+  order split across `decapsulate`'s two halves: `RateLimiter::
+  verify_packet` (cheap BLAKE2s mac1 check + handshake-rate accounting +
+  cookie reply) FIRST, then peer dispatch (init: `parse_handshake_anon`
+  static-pubkey lookup; data/response/cookie: `receiver_idx >> 8`
+  slot), then this call. Re-entering through `decapsulate` instead would
+  run verify_packet a second time per datagram — doubling the rate
+  limiter's handshake counters (halving the flood budget) and paying the
+  init DH+AEAD twice on the hit path — while skipping it would let
+  forged inits eat DH+AEAD before any rate limiting. Visibility-only;
+  no upstream body touched.
 ```
 
 Notes on what did NOT need patching

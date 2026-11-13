@@ -310,7 +310,12 @@ impl Tunn {
         self.handle_verified_packet(packet, dst)
     }
 
-    pub(crate) fn handle_verified_packet<'a>(
+    // PATCH(15): pub(crate) -> pub — a responder-style caller (the WG
+    // inbound listener) needs the upstream device-order split of
+    // `decapsulate`: rate-limit + mac1 verify first, dispatch by peer, then
+    // this call, so a forged init pays no DH/AEAD before the limiter and a
+    // known init pays the handshake crypto exactly once.
+    pub fn handle_verified_packet<'a>(
         &mut self,
         packet: Packet,
         dst: &'a mut [u8],

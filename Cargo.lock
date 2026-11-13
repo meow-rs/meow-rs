@@ -2099,6 +2099,9 @@ name = "ipnet"
 version = "2.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "791930b43c0d5973160d90a8f3894509f2b273430f5c5c73b668636d0287c5c0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "ipnetwork"
@@ -2665,6 +2668,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "x25519-dalek",
  "zip",
 ]
 
@@ -2706,6 +2710,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "boring",
+ "bytes",
  "futures",
  "ipnet",
  "libc",
@@ -2713,24 +2718,30 @@ dependencies = [
  "meow-config",
  "meow-dns",
  "meow-lwip",
+ "meow-proxy",
  "meow-rules",
  "meow-transport",
  "meow-trie",
  "meow-tunnel",
+ "meow-wgstack",
+ "meow-wireguard",
  "netlink-packet-core 0.9.0",
  "netlink-packet-route 0.33.0",
  "netlink-sys",
  "parking_lot",
+ "rand 0.9.5",
  "route_manager",
  "shadowsocks",
  "smallvec",
  "smol_str",
+ "smoltcp",
  "socket2 0.5.10",
  "tokio",
  "tracing",
  "tracing-subscriber",
  "tun-rs",
  "windows-sys 0.60.2",
+ "x25519-dalek",
 ]
 
 [[package]]
@@ -2776,6 +2787,7 @@ dependencies = [
  "meow-dns",
  "meow-transport",
  "meow-trie",
+ "meow-wgstack",
  "meow-wireguard",
  "ml-kem",
  "parking_lot",
@@ -2907,6 +2919,19 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "meow-wgstack"
+version = "0.29.0"
+dependencies = [
+ "bytes",
+ "libc",
+ "meow-common",
+ "smoltcp",
+ "socket2 0.5.10",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

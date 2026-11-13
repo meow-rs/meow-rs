@@ -5056,6 +5056,44 @@ async fn get_connections_entry_has_camel_case_shape() {
     );
 }
 
+/// `ConnType::WireGuard` serialises as `"wireguard"` in `/connections`
+/// `metadata.type` — errata U4 pins the lowercase spelling even though
+/// the other conn types keep their CamelCase variant names.
+#[tokio::test]
+async fn get_connections_wireguard_metadata_type() {
+    use meow_common::{ConnType, Metadata, Network};
+    let state = test_state_default();
+
+    let meta = Metadata {
+        network: Network::Tcp,
+        conn_type: ConnType::WireGuard,
+        host: "10.0.0.2".into(),
+        dst_port: 443,
+        ..Default::default()
+    };
+    state.tunnel.statistics().track_connection(
+        meta,
+        smol_str::SmolStr::new_static("MATCH"),
+        smol_str::SmolStr::default(),
+        smallvec![Arc::from("DIRECT")],
+    );
+
+    let app = create_router(Arc::clone(&state));
+    let resp = app
+        .oneshot(
+            Request::get("/connections")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let conn = &json["connections"].as_array().unwrap()[0];
+    assert_eq!(conn["metadata"]["type"], "wireguard");
+    assert_eq!(conn["metadata"]["network"], "tcp");
+}
+
 /// `metadata.dscp` is always a number in `/connections`, as mihomo panels
 /// read it: `0` for a flow whose inbound saw no DSCP (every listener but
 /// TProxy), the value otherwise.

@@ -38,6 +38,8 @@ use meow_listener::SnifferRuntime;
 use meow_listener::TProxyListener;
 #[cfg(feature = "listener-tun")]
 use meow_listener::TunListener;
+#[cfg(feature = "listener-wireguard")]
+use meow_listener::WireGuardListener;
 use meow_tunnel::Tunnel;
 use parking_lot::RwLock;
 use std::net::{IpAddr, SocketAddr};
@@ -738,6 +740,7 @@ fn listener_feature_gate(spec: &meow_config::ListenerSpec) -> Option<&'static st
         S::Shadowsocks(_) => {
             (!cfg!(feature = "listener-shadowsocks")).then_some("listener-shadowsocks")
         }
+        S::WireGuard(_) => (!cfg!(feature = "listener-wireguard")).then_some("listener-wireguard"),
     }
 }
 
@@ -1813,6 +1816,67 @@ async fn run(
                     );
                 }
             }
+            ListenerSpec::WireGuard(cfg) => {
+                #[cfg(feature = "listener-wireguard")]
+                {
+                    // UDP bind here (not inside the listener) so a
+                    // `port: 0` resolves to the real port for the
+                    // `/listeners` snapshot — the same bind-before-spawn
+                    // contract the TCP listeners follow.
+                    let socket = match WireGuardListener::bind(addr) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            listener_failed(&nl.name, &format!("bind {addr} failed: {e}"));
+                            continue;
+                        }
+                    };
+                    let bound = socket.local_addr().unwrap_or(addr);
+                    nl.port = bound.port();
+                    // meow-listener takes plain ctor args, never a
+                    // meow-config type — map the validated config onto
+                    // the listener-facing spec.
+                    let spec = meow_listener::WgListenerSpec {
+                        private_key: cfg.private_key,
+                        peers: cfg
+                            .peers
+                            .iter()
+                            .map(|p| meow_listener::WgPeerSpec {
+                                public_key: p.public_key,
+                                preshared_key: p.preshared_key,
+                                allowed_ips: p.allowed_ips.clone(),
+                                name: p.name.clone(),
+                                reserved: p.reserved,
+                            })
+                            .collect(),
+                        mtu: cfg.mtu,
+                        udp: cfg.udp,
+                        udp_timeout: cfg.udp_timeout,
+                    };
+                    let listener = WireGuardListener::new(tunnel.clone(), spec, nl.name.clone())
+                        .with_max_connections(nl.max_connections)
+                        .with_sniffer(Arc::clone(&sniffer_runtime));
+                    match listener.spawn(socket) {
+                        Ok(guard) => {
+                            tokio::spawn(async move {
+                                if let Err(e) = guard.wait().await {
+                                    error!("WireGuard listener error: {e}");
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            listener_failed(&nl.name, &format!("spawn failed: {e}"));
+                        }
+                    }
+                }
+                #[cfg(not(feature = "listener-wireguard"))]
+                {
+                    let _ = cfg;
+                    tracing::warn!(
+                        "listener '{}': wireguard requires feature 'listener-wireguard'",
+                        nl.name
+                    );
+                }
+            }
         }
     }
 
@@ -2019,7 +2083,8 @@ fn publish_controller(
 #[cfg(any(
     feature = "listener-mixed",
     feature = "listener-tproxy",
-    feature = "listener-shadowsocks"
+    feature = "listener-shadowsocks",
+    feature = "listener-wireguard"
 ))]
 fn listener_failed(name: &str, message: &str) {
     error!("listener '{name}': {message}");
@@ -2468,6 +2533,16 @@ mod tests {
         assert_eq!(
             gate(&ss_spec()),
             (!cfg!(feature = "listener-shadowsocks")).then_some("listener-shadowsocks")
+        );
+        assert_eq!(
+            gate(&S::WireGuard(meow_config::WgListenerConfig {
+                private_key: [0u8; 32],
+                peers: vec![],
+                mtu: 1420,
+                udp: true,
+                udp_timeout: std::time::Duration::from_secs(60),
+            })),
+            (!cfg!(feature = "listener-wireguard")).then_some("listener-wireguard")
         );
     }
 

@@ -88,7 +88,7 @@ kcptun = ["ss", "mux", "dep:tokio-util", "meow-transport/kcptun"]
 # stack running on a dedicated actor thread. Opt-in — the app `full`
 # bundle is expected to enable it; keep it out of `minimal` (ADR-0007
 # binary-size caps).
-wireguard = ["dep:meow-wireguard", "dep:smoltcp", "dep:ipnet"]
+wireguard = ["dep:meow-wireguard", "dep:meow-wgstack", "dep:smoltcp", "dep:ipnet"]
 
 [dependencies]
 meow-common = { workspace = true }
@@ -103,6 +103,9 @@ meow-anytls = { workspace = true, optional = true }
 # (`meow-wireguard`), and the smoltcp userspace stack it encrypts for —
 # both pulled in only by the `wireguard` feature.
 meow-wireguard = { workspace = true, optional = true }
+# Shared smoltcp/tokio plumbing the pump drives — same optional gate as
+# meow-wireguard above it.
+meow-wgstack = { workspace = true, optional = true }
 smoltcp = { workspace = true, optional = true }
 ipnet = { workspace = true, optional = true }
 # quiche = QUIC + HTTP/3 for the hysteria2 outbound, on BoringSSL (shares the

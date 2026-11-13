@@ -2648,8 +2648,8 @@ listeners:
     for needle in [
         "udp: only meaningful under a `listeners:` entry",
         "udp-timeout: only meaningful under a `listeners:`/`tun:` entry",
-        "my-http].udp: only meaningful on `type: tproxy`/`shadowsocks`",
-        "my-ss].udp-timeout: only meaningful on `type: tproxy`",
+        "my-http].udp: only meaningful on `type: tproxy`/`shadowsocks`/`wireguard`",
+        "my-ss].udp-timeout: only meaningful on `type: tproxy`/`wireguard`",
         "my-http].tproxy-sni: only meaningful on `type: tproxy`",
     ] {
         assert!(logs.contains(needle), "missing warning '{needle}': {logs}");
@@ -2920,8 +2920,8 @@ listeners:
     });
     let logs = String::from_utf8_lossy(&sink.0.lock().unwrap()).into_owned();
     assert!(
-        logs.contains("only meaningful on `type: tproxy`/`shadowsocks`")
-            && logs.contains("only meaningful on `type: tproxy`, ignored"),
+        logs.contains("only meaningful on `type: tproxy`/`shadowsocks`/`wireguard`")
+            && logs.contains("only meaningful on `type: tproxy`/`wireguard`, ignored"),
         "expected both misuse warnings, got: {logs}"
     );
 

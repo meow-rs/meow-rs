@@ -19,6 +19,19 @@ the canonical, in-repo source a release is cut from.
   prevention under `tun.auto-route`. Behind the `wireguard` feature; included in
   `full`, excluded from `minimal`. (#899)
 
+- **WireGuard inbound** (`listeners: - type: wireguard`) — meow as a static
+  multi-peer WireGuard *server*: authenticated responder handshakes via the
+  same vendored boringtun, per-peer `receiver_idx >> 8` demux, endpoint
+  roaming on ACL-admitted inner packets, `allowed-ips` inner-source ACLs
+  (v4/v6), optional `preshared-key` and WARP-style `reserved` bytes. Inner
+  TCP terminates in a lazy smoltcp AnyIP listen pool and routes through
+  `route_inbound_tcp` (`metadata.type = "wireguard"`, SNI/`Host` sniffing);
+  inner UDP routes per-flow through `dial_udp` keyed on
+  `(peer, inner src, inner dst)` with `udp-timeout` eviction and `mtu - 64`
+  reply caps. `udp`, `udp-timeout` and `max-connections` follow the TUN
+  inbound's semantics. Behind the `listener-wireguard` feature; included
+  in `full`, excluded from `minimal`.
+
 - `dns.fake-ip-filter` recognizes the mihomo `+.*` wildcard suffix across
   all domain depths in both blacklist and whitelist modes.
 

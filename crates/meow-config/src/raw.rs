@@ -485,11 +485,12 @@ pub struct RawListener {
     /// an external system — no nft/pfctl invocation, no bypass-IP
     /// collection, no cleanup on exit (issue #563).
     pub firewall: Option<bool>,
-    /// `tproxy` listeners only: UDP flow idle timeout in seconds
+    /// `tproxy`/`wireguard` listeners: UDP flow idle timeout in seconds
     /// (default 60, issue #564). `0` is a config error. The companion `udp`
     /// key itself lives in the shadowsocks field block below — one raw key,
     /// two consumers: for tproxy `udp` defaults to `false` and requires
-    /// `firewall: false` (meow does not manage UDP gateway rules).
+    /// `firewall: false` (meow does not manage UDP gateway rules); for
+    /// wireguard `udp` defaults to `true` and gates the inner-UDP path.
     pub udp_timeout: Option<u64>,
     /// Per-listener override of the global `max-connections` cap. `0`
     /// disables the cap for this listener.
@@ -498,12 +499,22 @@ pub struct RawListener {
     // ── shadowsocks-listener fields (only meaningful when `type: shadowsocks`) ──
     pub cipher: Option<String>,
     pub password: Option<String>,
+    /// `shadowsocks`/`tproxy`/`wireguard` consumers — see `udp_timeout`.
     #[serde(default)]
     pub udp: Option<bool>,
     pub simple_obfs: Option<RawSimpleObfs>,
     /// `tproxy`: take TCP by real TPROXY (`IP_TRANSPARENT`; mihomo's
     /// `type: tproxy`) instead of REDIRECT. Requires `firewall: false`.
     pub transparent: Option<bool>,
+
+    // ── wireguard-listener fields (only meaningful when `type: wireguard`) ──
+    /// Listener static private key, base64 decoding to exactly 32 bytes
+    /// (required for `type: wireguard`).
+    pub private_key: Option<String>,
+    /// Outer (wire) MTU; default 1420, accepted range `640..=9000`.
+    pub mtu: Option<u16>,
+    /// Static peer table; required and non-empty for `type: wireguard`.
+    pub peers: Option<Vec<RawWgPeer>>,
 
     // ── upstream sub-options not yet supported by meow-rs ──
     // Captured as opaque `Value`s so their mere presence can be warned about
@@ -514,6 +525,41 @@ pub struct RawListener {
     pub jls_config: Option<serde_json::Value>,
     pub kcp_tun: Option<serde_json::Value>,
     pub mux_option: Option<serde_json::Value>,
+
+    /// Keys no listener type's schema models land here — let the typed
+    /// consumer warn-and-ignore them by name (forward-compat, ADR-0002)
+    /// instead of serde dropping them silently.
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
+}
+
+/// One `peers:` element of a `type: wireguard` listener (kebab-case).
+///
+/// The raw layer only shapes the fields; every presence/format check
+/// (required `public-key`/`allowed-ips`, base64 → 32-byte keys, CIDR
+/// entries, 3-byte `reserved`) happens in `build_wg_listener_spec` — the
+/// same "raw loose, typed strict" split the rest of `raw.rs` follows.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "kebab-case")]
+pub struct RawWgPeer {
+    /// Peer static public key, base64 → exactly 32 bytes (required).
+    pub public_key: Option<String>,
+    /// Optional pre-shared symmetric key, base64 → exactly 32 bytes.
+    pub preshared_key: Option<String>,
+    /// Inbound inner-source-IP ACL for this peer (required, non-empty) —
+    /// a list of CIDR strings.
+    pub allowed_ips: Option<Vec<String>>,
+    /// Log/diagnostic label only; defaults to `peer-<index>` when absent.
+    pub name: Option<String>,
+    /// Cloudflare WARP-style 3-byte `reserved` field: a list of three
+    /// bytes or a base64 string decoding to exactly 3 bytes (same shapes
+    /// as the outbound `reserved`, mirrored server-side).
+    pub reserved: Option<serde_json::Value>,
+    /// Unmodelled keys land here so the typed builder can warn-and-ignore
+    /// them by name (ADR-0002) — e.g. a `pre-shared-key` typo otherwise
+    /// drops the peer's PSK silently.
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 /// Raw `simple-obfs:` block for a shadowsocks listener.

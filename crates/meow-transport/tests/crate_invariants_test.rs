@@ -655,6 +655,20 @@ const RAW_SOCKET_ALLOWLIST: &[(&str, &str, usize, &str)] = &[
          netstack objects with no fd to bind; the endpoint OS socket is \
          created via meow_common::bind_udp_for_peer (adapter.rs)",
     ),
+    (
+        "crates/meow-listener/src/wireguard/actor.rs",
+        "Socket::new(",
+        1,
+        "smoltcp tcp::Socket struct constructor for the lazy listen pool — \
+         userspace netstack object with no fd to bind",
+    ),
+    (
+        "crates/meow-listener/src/wireguard/mod.rs",
+        "UdpSocket::bind(",
+        1,
+        "inbound WireGuard listener endpoint socket facing the peers — \
+         bound by the app before spawn, never dials",
+    ),
     // A separate process, never inside the engine.
     (
         "crates/meow-cli/src/client.rs",

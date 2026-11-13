@@ -218,6 +218,68 @@ dialer.
   config reload, an explicit session reset) aborts the pump and
   re-handshakes on the next dial; in-flight flows do not migrate.
 
+## WireGuard inbound (`listeners: - type: wireguard`)
+
+The mirror image of the node: meow as the WireGuard *server* — a static
+multi-peer responder that decrypts inner IPv4/IPv6 traffic and feeds it
+through the same route engine a `tun:` inbound uses. Semantically it is
+"a TUN carried over WireGuard"; the shape follows sing-box's `wireguard`
+inbound. Feature: `listener-wireguard` (meow-app `full`, never
+`minimal`); a build without it reports `needs feature
+'listener-wireguard'` at config validation.
+
+```yaml
+listeners:
+  - name: wg-in
+    type: wireguard
+    listen: 0.0.0.0
+    port: 51820                 # 0 = ephemeral, resolved before bind
+    private-key: <base64 32-byte key>   # openssl rand -base64 32
+    mtu: 1420                   # wire MTU; inner IP MTU = mtu - 64
+    udp: true                   # false drops inner UDP silently
+    udp-timeout: 60             # seconds an idle UDP flow survives
+    max-connections: 256        # TCP conns + UDP flows combined; 0 = ∞
+    peers:
+      - name: laptop            # diagnostic label (logs), defaults peer-<i>
+        public-key: <base64 32-byte peer key>
+        preshared-key: <base64 32-byte key>   # optional
+        allowed-ips: [10.0.0.2/32]            # inner-source ACL, nonempty
+        reserved: [0, 0, 0]                   # optional WARP-style field
+```
+
+- `peers` is the static peer table — an unknown public key cannot even
+  decrypt the handshake. `allowed-ips` is the *inbound* ACL: inner
+  packets whose source IP is outside the peer's list are silently
+  dropped (v4 and v6). A peer key may not equal the listener's own
+  public key, and duplicates are rejected at parse.
+- **Roaming** follows WireGuard semantics: a peer's remembered endpoint
+  moves to whatever source address an *ACL-admitted inner packet* arrives
+  from — bare handshakes, keepalives, forged or replayed packets never
+  re-aim replies.
+- **TCP** terminates in userspace (smoltcp, AnyIP): the first `SYN` to a
+  port lazily starts listening on it — peers reach whatever they dial,
+  like a TUN. New streams get the TUN path's sniff window (SNI/`Host`)
+  and are routed by `route_inbound_tcp` with `ConnType::WireGuard`;
+  `GET /connections` reports `metadata.type = "wireguard"`.
+- **UDP** (when `udp: true`) is routed per-flow through
+  `TunnelInner::dial_udp`, keyed on `(peer, inner src, inner dst)` and
+  evicted after `udp-timeout`; replies are size-capped at `mtu - 64` and
+  drop silently beyond that — never fragmented, never ICMP.
+- **No `persistent-keepalive`** on the server side — a responder never
+  initiates. Cookie replies, handshake rate limiting and mac1 checks
+  are inherited from the vendored boringtun; one listener-level limiter
+  is shared across peers.
+- The responder shares one UDP socket per listener across all peers;
+  `receiver_idx >> 8` dispatches responses/cookies/data in O(1), so
+  peers stay cryptographically isolated.
+
+The listener's UDP socket binds eagerly at startup (`port: 0` resolves
+to the real port before the actor spawns — `GET /listeners` shows it).
+Config validation rejects bad/short keys, empty `peers`, empty
+`allowed-ips`, `mtu` outside 640–9000, `udp-timeout: 0` and ≥2²⁴ peers;
+private keys and preshared keys are `[REDACTED]` in Debug output and
+never logged. Implementation details: [spec](specs/proxy-wireguard-server.md).
+
 ## Security note
 
 The WireGuard implementation is a **vendored fork of

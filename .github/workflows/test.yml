@@ -362,10 +362,37 @@ jobs:
           # positional luck is the only thing that made `! grep` work
           # here before (last command in the script).
           mindeps="$(cargo tree -p meow-app --no-default-features --features minimal --edges normal)"
-          if grep -wE 'meow-wireguard|smoltcp' <<<"$mindeps"; then
+          if grep -wE 'meow-wireguard|meow-wgstack|smoltcp' <<<"$mindeps"; then
             echo "::error::minimal feature tree pulled the WG stack"
             exit 1
           fi
+
+      # The WireGuard *inbound* (`listeners: - type: wireguard`) is opt-in
+      # behind meow-listener's `listener-wireguard` (meow-app `full`,
+      # never `minimal`): the responder demux, the AnyIP smoltcp stack and
+      # the inner UDP reply builder compile only under the feature run.
+      # The dep-tree assertions reuse the ring-free contract — the
+      # listener links the same vendored noise crate as the outbound.
+      - name: WireGuard inbound listener (listener-wireguard)
+        run: |
+          cargo clippy -p meow-listener --no-default-features --features listener-wireguard --all-targets -- -D warnings
+          cargo clippy -p meow-wgstack --all-targets -- -D warnings
+          ldeps="$(cargo tree -p meow-listener --no-default-features --features listener-wireguard --edges normal)"
+          if grep -wE 'ring|ring_compat|aws-lc' <<<"$ldeps"; then
+            echo "::error::ring-family dep crept into the WG listener tree"
+            exit 1
+          fi
+          sdeps="$(cargo tree -p meow-wgstack --edges normal)"
+          if grep -wE 'ring|ring_compat|aws-lc' <<<"$sdeps"; then
+            echo "::error::ring-family dep crept into meow-wgstack"
+            exit 1
+          fi
+          cargo nextest run -p meow-listener --features listener-wireguard --lib --test wireguard_listener --retries 2 --no-fail-fast
+          # `--features wireguard`: meow-config's default set excludes it,
+          # and the x25519 self-peer test (`wg_peer_public_key_equal_own_errors`)
+          # compiles only under it — same shape as the outbound leg above.
+          cargo nextest run -p meow-config --features wireguard --test wireguard_listener_config_test --retries 2 --no-fail-fast
+          cargo nextest run -p meow-config --no-default-features --test wireguard_listener_config_test --retries 2 --no-fail-fast
 
       # The QUIC DNS transports live behind meow-dns's `quic-dns` feature
       # (meow-app's `dns-quic` forwards it, and `full` carries that), so no

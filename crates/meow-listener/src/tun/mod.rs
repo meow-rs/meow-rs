@@ -102,8 +102,13 @@ use tokio::sync::Semaphore;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
+// The sniff window/read helpers moved to `crate::stream_sniff`, shared
+// with the WireGuard inbound's smoltcp path — the aliases keep this file's
+// existing call sites and test imports unchanged.
+use crate::stream_sniff::sniff_first_payload;
+
 /// Bound on the first bytes gathered for a TLS sniff on lwIP flows.
-const TUN_SNIFF_GATHER_MAX: usize = 16 * 1024;
+const TUN_SNIFF_GATHER_MAX: usize = crate::stream_sniff::STREAM_SNIFF_GATHER_MAX;
 
 /// Post-handshake sniff window: how long an accepted TUN TCP flow may stay
 /// silent before it is dialed anyway with an empty prefix (#695).
@@ -119,10 +124,7 @@ const TUN_SNIFF_GATHER_MAX: usize = 16 * 1024;
 /// for a flow the tunnel cannot name (an unmapped fake IP):
 /// `meow_tunnel::tcp::handle_tcp` sniffs its SNI / `Host`, through the
 /// replayed prefix or its own short wait.
-const TUN_SNIFF_WINDOW: Duration = Duration::from_millis(200);
-/// First-read size when waiting for real traffic. Large enough to pull a
-/// TLS ClientHello record header + a bit of payload in one shot.
-const TUN_FIRST_READ: usize = 256;
+const TUN_SNIFF_WINDOW: Duration = crate::stream_sniff::STREAM_SNIFF_WINDOW;
 
 use route::RouteGuard;
 
@@ -1534,43 +1536,6 @@ fn pump_error(direction: &str, joined: Result<io::Result<()>, tokio::task::JoinE
     }
 }
 
-/// Sniff the client's first payload within [`TUN_SNIFF_WINDOW`] (the
-/// handshake is already done by lwIP).
-///
-/// - `Ok(bytes)` — the client spoke first; `bytes` is the relay prefix.
-/// - `Ok(empty)` — the window expired in silence: dial anyway, the server
-///   may be the one to speak first (#695). No allocation is kept.
-/// - `Err(_)` — EOF or reset before any payload: drop the flow.
-async fn sniff_first_payload<R>(tcp: &mut R) -> io::Result<Vec<u8>>
-where
-    R: AsyncRead + Unpin,
-{
-    sniff_first_payload_within(tcp, TUN_SNIFF_WINDOW).await
-}
-
-/// [`sniff_first_payload`] with an explicit window. The stream stays usable
-/// after the window expires: lwIP's `TcpStream::poll_read` only consumes a
-/// chunk on the poll that returns it, so dropping the pending read loses
-/// nothing — the relay picks up whatever arrives later.
-async fn sniff_first_payload_within<R>(tcp: &mut R, window: Duration) -> io::Result<Vec<u8>>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut buf = vec![0u8; TUN_FIRST_READ];
-    let Ok(read) = timeout(window, tcp.read(&mut buf)).await else {
-        return Ok(Vec::new());
-    };
-    let n = read?;
-    if n == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "peer closed before sending payload",
-        ));
-    }
-    buf.truncate(n);
-    Ok(buf)
-}
-
 // Intercept DNS to the TUN address before rejecting subnet loopback traffic.
 fn tcp_loop_guard(dst: SocketAddr, dns_hijack: bool, nets: udp::TunNets) -> bool {
     !(dns_hijack && dst.port() == 53) && udp::is_looping_dst(dst.ip(), nets)
@@ -1709,10 +1674,10 @@ impl<S: AsyncRead + AsyncWrite + Send + Sync + Unpin> ProxyConn for TunTcpConn<S
 mod tests {
     use super::{
         device_name_for_attempt, global_route_nets, global_route_nets_for, rotate_v4, rotate_v6,
-        sniff_first_payload, sniff_first_payload_within, Ipv4Addr, Ipv6Net, TunTcpConn,
-        TUN_SNIFF_WINDOW,
+        sniff_first_payload, Ipv4Addr, Ipv6Net, TunTcpConn, TUN_SNIFF_WINDOW,
     };
     use super::{timeout, Arc, AtomicBool, Semaphore};
+    use crate::stream_sniff::sniff_first_payload_within;
     use std::io;
     use std::pin::Pin;
     use std::task::{Context, Poll};
