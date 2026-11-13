@@ -71,6 +71,21 @@ const HANDSHAKE_DIAL_LIMIT: Duration = Duration::from_secs(10);
 /// so the reply error beats the caller's timeout.
 const TCP_CONNECT_LIMIT: Duration = Duration::from_secs(25);
 
+/// Floor between desync-triggered handshake initiations — WG's own
+/// REKEY_TIMEOUT (the wireguard paper's 5 s initiation-retry floor,
+/// `timers.rs` in meow-wireguard; the constant is crate-private, so it
+/// is mirrored here). `format_handshake_initiation(_, false)` dedups
+/// only while a handshake is in flight: once a response lands the
+/// dedup is gone, and a flood of data datagrams with a forged
+/// `receiver_idx` — DATA carries no mac1, so `NoCurrentSession`/
+/// `WrongIndex` are both forgeable at line rate — would mint a fresh
+/// initiation every RTT (~200/s on a 5 ms path), each reply spending
+/// the responder's 2×DH+2×AEAD. The floor is independent of handshake
+/// state so it holds across completions: a genuine epoch desync still
+/// heals on the first error (~1 RTT) while a forged flood is clamped
+/// to 0.2 initiations/s.
+const DESYNC_KICK_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Ephemeral port range for tunnel-local sockets; smoltcp does not allocate
 /// ephemeral ports for us.
 const EPHEMERAL_PORT_BASE: u16 = 49152;
@@ -220,6 +235,13 @@ struct WgPump {
     scratch_len: usize,
     udp_scratch: Vec<u8>,
     last_timer: StdInstant,
+    /// When the last desync-triggered initiation was emitted — the
+    /// [`DESYNC_KICK_INTERVAL`] floor's stamp, `None` until the first
+    /// kick. Set only on `WriteToNetwork`: a kick suppressed by an
+    /// in-flight handshake must not consume budget it never spent, or
+    /// a flood arriving inside one handshake would push the floor's
+    /// zero point past that handshake's completion.
+    last_desync_kick: Option<StdInstant>,
 }
 
 impl WgPump {
@@ -292,6 +314,7 @@ impl WgPump {
             scratch_len: buf_size,
             udp_scratch: vec![0u8; inner_mtu],
             last_timer: StdInstant::now(),
+            last_desync_kick: None,
         })
     }
 
@@ -374,21 +397,32 @@ impl WgPump {
                         // traffic before a re-initiation — and every
                         // pending dial burns its deadline inside that
                         // window. Kick the handshake at the first such
-                        // error instead. `force=false` self-limits: an
-                        // in-flight handshake turns this into a no-op,
-                        // so a flood of undecryptable datagrams costs
-                        // at most one initiation per response RTT.
-                        // `InvalidAeadTag`/`InvalidCounter` et al. stay
-                        // pure drops — they prove nothing about session
-                        // identity and a forged datagram must not buy a
-                        // handshake.
-                        if let TunnResult::WriteToNetwork(b) =
-                            self.tunn.format_handshake_initiation(&mut dst, false)
-                        {
-                            let len = b.len();
-                            dst.truncate(len);
-                            self.enqueue_wg(dst);
-                            dst = self.take_scratch();
+                        // error instead.
+                        //
+                        // Two independent bounds keep the kick cheap:
+                        // `force=false` dedups against a handshake
+                        // already in flight, and `desync_kick_due`
+                        // floors *re-arms* at REKEY_TIMEOUT — the dedup
+                        // alone ends the moment a response lands, so
+                        // without the floor a flood of forged
+                        // `receiver_idx` datagrams (DATA carries no
+                        // mac1; both errors above are forgeable at
+                        // line rate) would mint an initiation every
+                        // RTT and spend the responder's 2×DH+2×AEAD
+                        // per reply. `InvalidAeadTag`/`InvalidCounter`
+                        // et al. stay pure drops — they prove nothing
+                        // about session identity and a forged datagram
+                        // must not buy a handshake.
+                        if self.desync_kick_due() {
+                            if let TunnResult::WriteToNetwork(b) =
+                                self.tunn.format_handshake_initiation(&mut dst, false)
+                            {
+                                self.last_desync_kick = Some(StdInstant::now());
+                                let len = b.len();
+                                dst.truncate(len);
+                                self.enqueue_wg(dst);
+                                dst = self.take_scratch();
+                            }
                         }
                     }
                     break;
@@ -511,6 +545,16 @@ impl WgPump {
             }
             _ => self.return_scratch(dst),
         }
+    }
+
+    /// Whether the desync floor permits another initiation: the first
+    /// error always may; later ones wait [`DESYNC_KICK_INTERVAL`] out.
+    /// The in-flight dedup stays inside `format_handshake_initiation(_,
+    /// false)` — this only caps how often the window reopens after a
+    /// handshake completes.
+    fn desync_kick_due(&self) -> bool {
+        self.last_desync_kick
+            .is_none_or(|t| t.elapsed() >= DESYNC_KICK_INTERVAL)
     }
 
     /// Kick off the WireGuard handshake immediately so it overlaps the
@@ -1534,34 +1578,30 @@ mod tests {
         );
     }
 
-    /// A data datagram addressed to a session this initiator never
-    /// completed — here, one the responder minted for a *second*
-    /// initiator instance sharing the static key, which flipped the
-    /// responder's `current` to the newest session — proves the noise
-    /// state has diverged: every reply keeps arriving under indices the
-    /// ring cannot map (`NoCurrentSession`/`WrongIndex`) until a newer
-    /// session of ours exists. boringtun's own recovery is the
-    /// KEEPALIVE+REKEY_TIMEOUT ladder — ~15 s of one-way traffic before
-    /// `want_handshake` fires, long past every pending dial's deadline.
-    /// The pump must instead kick a fresh handshake on the first such
-    /// error; `format_handshake_initiation(dst, false)` self-limits to
-    /// one initiation per in-flight handshake.
-    #[tokio::test(flavor = "current_thread")]
-    async fn desync_data_packet_kicks_handshake() {
-        let client_secret = x25519::StaticSecret::from([0x51; 32]);
-        let client_public = x25519::PublicKey::from(&client_secret);
-        let server_secret = x25519::StaticSecret::from([0x52; 32]);
-        let server_public = x25519::PublicKey::from(&server_secret);
-        let mut pump = pump_for_test(&test_config(&client_secret, &server_public));
-        let mut server = Tunn::new(server_secret, client_public, None, None, 0, None);
-        session_up(&mut pump, &mut server);
-        pump.outbox.clear();
-
+    /// A data datagram `pump`'s session ring cannot map: `server`
+    /// encapsulates under a *second* initiator session minted with the
+    /// pump's own static key, which flipped the responder's `current`
+    /// to the newest session — the same rule that makes an established
+    /// peer roam. The rogue's sender index ends in a low byte the
+    /// pump's own first session also uses, so the `receiver_idx` lands
+    /// on a ring slot the pump holds under a different generation:
+    /// `WrongIndex`, deterministically — undecryptable noise-state
+    /// divergence, not a crypto failure.
+    fn desync_datagram(
+        client_secret: &x25519::StaticSecret,
+        server_public: &x25519::PublicKey,
+        server: &mut Tunn,
+    ) -> Vec<u8> {
         // A same-key second initiator: its session indices live in a
-        // namespace the pump's ring never held, so data the responder
-        // sends under that session is undecryptable noise-state
-        // divergence — not a crypto failure.
-        let mut rogue = Tunn::new(client_secret, server_public, None, None, 9, None);
+        // namespace the pump's ring never held.
+        let mut rogue = Tunn::new(
+            x25519::StaticSecret::from(client_secret.to_bytes()),
+            *server_public,
+            None,
+            None,
+            9,
+            None,
+        );
         let mut wire = vec![0u8; 2048];
         let rogue_init = {
             let TunnResult::WriteToNetwork(b) = rogue.format_handshake_initiation(&mut wire, false)
@@ -1585,25 +1625,171 @@ mod tests {
             b.to_vec()
         };
         // The responder's `current` flips to the newest session on the
-        // first data packet it decrypts from it — the same rule that
-        // makes an established peer roam.
+        // first data packet it decrypts from it.
         let res = server.decapsulate(None, &rogue_keepalive, &mut wire);
         assert!(matches!(res, TunnResult::Done), "got {res:?}");
 
-        // Replies now leave under the rogue session: a datagram the
-        // pump cannot decrypt because the index is not one it minted.
-        let desync = {
-            let TunnResult::WriteToNetwork(b) = server.encapsulate(&[], &mut wire) else {
-                panic!("responder encapsulates under the newest session");
-            };
-            b.to_vec()
+        // Replies now leave under the rogue session.
+        let TunnResult::WriteToNetwork(b) = server.encapsulate(&[], &mut wire) else {
+            panic!("responder encapsulates under the newest session");
         };
-        let mut datagram = desync;
+        b.to_vec()
+    }
+
+    /// A data datagram addressed to a session this initiator never
+    /// completed — here, one the responder minted for a *second*
+    /// initiator instance sharing the static key, which flipped the
+    /// responder's `current` to the newest session — proves the noise
+    /// state has diverged: every reply keeps arriving under indices the
+    /// ring cannot map (`NoCurrentSession`/`WrongIndex`) until a newer
+    /// session of ours exists. boringtun's own recovery is the
+    /// KEEPALIVE+REKEY_TIMEOUT ladder — ~15 s of one-way traffic before
+    /// `want_handshake` fires, long past every pending dial's deadline.
+    /// The pump must instead kick a fresh handshake on the first such
+    /// error; the kick itself is bounded by the in-flight dedup and
+    /// the [`DESYNC_KICK_INTERVAL`] floor, both pinned below.
+    #[tokio::test(flavor = "current_thread")]
+    async fn desync_data_packet_kicks_handshake() {
+        let client_secret = x25519::StaticSecret::from([0x51; 32]);
+        let client_public = x25519::PublicKey::from(&client_secret);
+        let server_secret = x25519::StaticSecret::from([0x52; 32]);
+        let server_public = x25519::PublicKey::from(&server_secret);
+        let mut pump = pump_for_test(&test_config(&client_secret, &server_public));
+        let mut server = Tunn::new(server_secret, client_public, None, None, 0, None);
+        session_up(&mut pump, &mut server);
+        pump.outbox.clear();
+
+        let mut datagram = desync_datagram(&client_secret, &server_public, &mut server);
         pump.decapsulate_wire(&mut datagram);
 
         assert!(
             pump.outbox.iter().any(|d| d.len() == 148 && d[0] == 1),
             "a diverged-session datagram must kick a fresh handshake initiation"
+        );
+    }
+
+    /// The in-flight bound: while the kicked handshake is still
+    /// unanswered, a flood of diverged datagrams mints no further
+    /// initiation — `format_handshake_initiation(_, false)` returns
+    /// `Done` until a response lands (and the floor, stamped by the
+    /// first kick, has not elapsed either). One initiation is the
+    /// whole point of the kick; the flood buys nothing while it is
+    /// in flight.
+    #[tokio::test(flavor = "current_thread")]
+    async fn desync_flood_dedups_while_in_flight() {
+        let client_secret = x25519::StaticSecret::from([0x57; 32]);
+        let client_public = x25519::PublicKey::from(&client_secret);
+        let server_secret = x25519::StaticSecret::from([0x58; 32]);
+        let server_public = x25519::PublicKey::from(&server_secret);
+        let mut pump = pump_for_test(&test_config(&client_secret, &server_public));
+        let mut server = Tunn::new(server_secret, client_public, None, None, 0, None);
+        session_up(&mut pump, &mut server);
+        pump.outbox.clear();
+
+        let desync = desync_datagram(&client_secret, &server_public, &mut server);
+        for _ in 0..4 {
+            let mut datagram = desync.clone();
+            pump.decapsulate_wire(&mut datagram);
+        }
+
+        let inits = pump
+            .outbox
+            .iter()
+            .filter(|d| d.len() == 148 && d[0] == 1)
+            .count();
+        assert_eq!(
+            inits, 1,
+            "an in-flight handshake must dedup the flood to one initiation"
+        );
+    }
+
+    /// The floor bound — the cap the in-flight dedup cannot give:
+    /// once the kicked handshake *completes*, `is_in_progress` is
+    /// gone, so a flood of forged `receiver_idx` datagrams (DATA
+    /// carries no mac1) would mint a fresh initiation every RTT —
+    /// ~200/s on a 5 ms path — each reply spending the responder's
+    /// 2×DH+2×AEAD. With the floor, a second diverged datagram
+    /// inside [`DESYNC_KICK_INTERVAL`] mints nothing: the sustained
+    /// ceiling is 0.2 initiations/s while a genuine desync still
+    /// kicks on the first error.
+    #[tokio::test(flavor = "current_thread")]
+    async fn desync_kick_rate_floor_holds_across_handshakes() {
+        let client_secret = x25519::StaticSecret::from([0x59; 32]);
+        let client_public = x25519::PublicKey::from(&client_secret);
+        let server_secret = x25519::StaticSecret::from([0x5a; 32]);
+        let server_public = x25519::PublicKey::from(&server_secret);
+        let mut pump = pump_for_test(&test_config(&client_secret, &server_public));
+        let mut server = Tunn::new(server_secret, client_public, None, None, 0, None);
+        session_up(&mut pump, &mut server);
+        pump.outbox.clear();
+
+        let desync = desync_datagram(&client_secret, &server_public, &mut server);
+
+        // Kick #1: the first error always fires.
+        let mut datagram = desync.clone();
+        pump.decapsulate_wire(&mut datagram);
+        let init = pump.outbox.pop_front().expect("first desync kicks");
+        assert!(
+            init.len() == 148 && init[0] == 1,
+            "the kick is a handshake initiation"
+        );
+        pump.outbox.clear();
+
+        // Answer that initiation so `is_in_progress` clears — the
+        // exact state the forged flood reopens at every RTT.
+        let mut wire = vec![0u8; 2048];
+        let mut resp = {
+            let TunnResult::WriteToNetwork(b) = server.decapsulate(None, &init, &mut wire) else {
+                panic!("responder answers the kicked initiation");
+            };
+            b.to_vec()
+        };
+        pump.decapsulate_wire(&mut resp);
+        pump.outbox.clear(); // the post-response keepalive
+
+        // A second diverged datagram inside the floor mints nothing.
+        let mut datagram = desync;
+        pump.decapsulate_wire(&mut datagram);
+        assert!(
+            !pump.outbox.iter().any(|d| d.len() == 148 && d[0] == 1),
+            "a second desync inside REKEY_TIMEOUT must not mint another initiation"
+        );
+    }
+
+    /// The `NoCurrentSession` arm: a datagram whose `receiver_idx`
+    /// names a ring slot the pump never filled takes the same kick
+    /// path as `WrongIndex`. It is forgeable at line rate — a DATA
+    /// packet's `receiver_idx` rides in the clear, unauthenticated —
+    /// which is exactly why the floor above has to exist.
+    #[tokio::test(flavor = "current_thread")]
+    async fn desync_empty_slot_kicks_handshake() {
+        let client_secret = x25519::StaticSecret::from([0x5b; 32]);
+        let client_public = x25519::PublicKey::from(&client_secret);
+        let server_secret = x25519::StaticSecret::from([0x5c; 32]);
+        let server_public = x25519::PublicKey::from(&server_secret);
+        let mut pump = pump_for_test(&test_config(&client_secret, &server_public));
+        let mut server = Tunn::new(server_secret, client_public, None, None, 0, None);
+        session_up(&mut pump, &mut server);
+        pump.outbox.clear();
+
+        // A real reply datagram carries the pump's live `receiver_idx`
+        // in cleartext; +1 lands on a slot the single-session ring
+        // never filled — `NoCurrentSession`, not `WrongIndex`.
+        let mut wire = vec![0u8; 2048];
+        let mut forged = {
+            let TunnResult::WriteToNetwork(b) = server.encapsulate(&[], &mut wire) else {
+                panic!("responder encapsulates under the current session");
+            };
+            b.to_vec()
+        };
+        let live_idx = u32::from_le_bytes(forged[4..8].try_into().unwrap());
+        forged[4..8].copy_from_slice(&live_idx.wrapping_add(1).to_le_bytes());
+
+        pump.decapsulate_wire(&mut forged);
+
+        assert!(
+            pump.outbox.iter().any(|d| d.len() == 148 && d[0] == 1),
+            "an empty-slot datagram must kick a fresh handshake initiation"
         );
     }
 
