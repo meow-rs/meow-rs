@@ -858,6 +858,12 @@ impl WgPump {
                     Err(_) => break,
                 }
             }
+            // Same fallback as the TCP conn_gone probe above: a conn that
+            // dropped while `out` sat at the cap never surfaces
+            // `Disconnected` to the gated drain — and a socket wedged on
+            // `BufferFull` would pin the flow, its socket and its port
+            // forever.
+            conn_gone |= st.write_rx.is_closed();
             if conn_gone {
                 dead_udp.push(*handle);
             }
@@ -1419,6 +1425,67 @@ mod tests {
             st.write_rx.len(),
             10,
             "overflow stays channel-side as backpressure"
+        );
+    }
+
+    /// The boundary form: `out` starts *below* UDP_WRITE_QUEUE and the
+    /// drain must stop exactly at the cap — pulling only the headroom,
+    /// never a datagram more.
+    #[tokio::test(flavor = "current_thread")]
+    async fn udp_out_drain_stops_at_cap_boundary() {
+        let client_secret = x25519::StaticSecret::from([0xbb; 32]);
+        let server_public = x25519::PublicKey::from(&x25519::StaticSecret::from([0xcc; 32]));
+        let mut pump = pump_for_test(&test_config(&client_secret, &server_public));
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        pump.udp_bind(
+            Arc::new(vec!["0.0.0.0/0".parse().unwrap()]),
+            true,
+            false,
+            reply_tx,
+        );
+        let conn = reply_rx
+            .await
+            .expect("bind reply")
+            .expect("udp_bind succeeds");
+        let handle = *pump.udp.keys().next().expect("one udp flow");
+        let dst: SocketAddr = "10.9.9.9:53".parse().unwrap();
+
+        // Same wedge as above: a full tx buffer blocks every send, so
+        // the pass is a pure drain-cap exercise.
+        let socket = pump.sockets.get_mut::<udp::Socket>(handle);
+        let meta = udp::UdpMetadata {
+            endpoint: dst.into(),
+            local_address: pump.src_v4,
+            meta: Default::default(),
+        };
+        for _ in 0..UDP_SOCKET_PACKETS {
+            socket.send_slice(b"x", meta).expect("tx buffer has room");
+        }
+        assert!(!socket.can_send(), "tx buffer must be full for the stall");
+
+        let st = pump.udp.get_mut(&handle).expect("udp state");
+        for _ in 0..UDP_WRITE_QUEUE - 8 {
+            st.out.push_back((Bytes::from_static(b"x"), dst));
+        }
+        for _ in 0..20 {
+            conn.write_packet(b"y", &dst)
+                .await
+                .expect("channel has room");
+        }
+
+        pump.service_sockets();
+
+        let st = &pump.udp[&handle];
+        assert_eq!(
+            st.out.len(),
+            UDP_WRITE_QUEUE,
+            "drain tops the backlog off at the cap, no further"
+        );
+        assert_eq!(
+            st.write_rx.len(),
+            12,
+            "the 8 pulled in are the only channel items consumed"
         );
     }
 
