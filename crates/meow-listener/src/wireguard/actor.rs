@@ -544,9 +544,11 @@ impl WgActor {
     ///      consumes — zero-copy end to end. Non-DATA packets —
     ///      handshakes, cookie replies, drops — finish inline through
     ///      `finish_verified` in arrival order.
-    ///   B. **Worker pass** — `CryptoPool::shared().run(&mut jobs)` on
-    ///      the process-wide pool: a multi-peer burst parallelises
-    ///      across all the peers it spans, not just per-peer.
+    ///   B. **Worker pass** — `CryptoPool::run_shared(&mut jobs)` on
+    ///      the process-wide pool (resolved lazily — `jobs <= 2` stays
+    ///      inline and never spawns it): a multi-peer burst
+    ///      parallelises across all the peers it spans, not just
+    ///      per-peer.
     ///   C. **Serial post-pass** — in wire order:
     ///      `handle_decrypted_data` replays the session/timer/validate
     ///      bookkeeping, `admit_data` runs the ACL + roam gate, and the
@@ -652,8 +654,10 @@ impl WgActor {
         self.return_scratch(dst);
 
         // Phase B — the batch's AEAD opens, in place inside the job
-        // bufs. `run` fills every `job.result`, preserving job order.
-        CryptoPool::shared().run(&mut jobs);
+        // bufs. `run_shared` fills every `job.result`, preserving job
+        // order — and its `n <= 2` shortcut runs *before* the shared
+        // pool is resolved, so a small batch never spawns the workers.
+        CryptoPool::run_shared(&mut jobs);
 
         // Phase C — serial post-pass in wire order. The demux's serial
         // contract drops DATA decrypt/auth errors silently; the fused

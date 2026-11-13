@@ -170,12 +170,35 @@ impl CryptoPool {
 
     /// The process-wide pool — one resident set shared by every
     /// outbound pump and every inbound listener actor. `OnceLock` init
-    /// spawns the workers on the first parallel pass, not at startup:
-    /// a process with no WireGuard traffic (or only `n <= 2` batches)
-    /// never pays them.
+    /// spawns the workers on first use; callers go through
+    /// [`run_shared`](Self::run_shared), whose `n <= 2` serial shortcut
+    /// keeps even that lazy — a process with no WireGuard traffic (or
+    /// only small batches) never resolves `shared()` at all, so the
+    /// workers spawn on the first genuinely parallel pass.
     pub fn shared() -> &'static CryptoPool {
         static POOL: OnceLock<CryptoPool> = OnceLock::new();
         POOL.get_or_init(|| CryptoPool::new(Self::default_workers()))
+    }
+
+    /// `run` on the process-wide [`shared`](Self::shared) pool — the
+    /// entry point both receive actors use. The `n <= 2` serial
+    /// shortcut runs *before* `shared()` is resolved, so small batches
+    /// never spawn the resident threads; bigger batches delegate to
+    /// `shared().run` with its full contract.
+    pub fn run_shared(jobs: &mut Vec<CryptoJob>) {
+        if jobs.len() <= 2 {
+            Self::run_serial(jobs);
+            return;
+        }
+        Self::shared().run(jobs);
+    }
+
+    /// The serial fallback — every job's open inline on the calling
+    /// thread, in order.
+    fn run_serial(jobs: &mut [CryptoJob]) {
+        for job in jobs.iter_mut() {
+            job.decrypt();
+        }
     }
 
     /// Run one batch: fill every job's `result`, preserving `jobs`'s
@@ -183,13 +206,18 @@ impl CryptoPool {
     /// channel hops or when no workers exist; otherwise contiguous
     /// chunks go out one per worker and come back in chunk order — the
     /// positional merge the module docs describe.
+    ///
+    /// The calling thread blocks until the pass joins; concurrent
+    /// `run`s serialize through `inner`'s mutex, so two actors' passes
+    /// queue back to back — they never interleave chunks on a worker.
+    /// Call it from a dedicated actor thread (every current caller is
+    /// one), never a shared tokio worker: the blocking join would
+    /// stall the runtime's other tasks for the pass's duration.
     pub fn run(&self, jobs: &mut Vec<CryptoJob>) {
         let n = jobs.len();
         let workers = n.min(self.senders.len());
         if workers <= 1 || n <= 2 {
-            for job in jobs.iter_mut() {
-                job.decrypt();
-            }
+            Self::run_serial(jobs);
             return;
         }
 
@@ -218,7 +246,12 @@ impl CryptoPool {
                 Ok(()) => waiting.push(i),
                 Err(mpsc::SendError(mut chunk)) => {
                     // Dead worker — run the chunk here rather than lose
-                    // its datagrams.
+                    // its datagrams. Cold path: a resident worker only
+                    // dies on panic, so the warn never sits in the hot
+                    // loop.
+                    tracing::warn!(
+                        "wg-crypto worker {i} died before dispatch; running its chunk inline"
+                    );
                     for job in &mut chunk {
                         job.decrypt();
                     }
@@ -227,11 +260,17 @@ impl CryptoPool {
             }
         }
         for i in waiting {
-            if let Ok(chunk) = rxs[i].recv() {
-                done[i] = Some(chunk);
+            match rxs[i].recv() {
+                Ok(chunk) => done[i] = Some(chunk),
+                // RecvErr ⇒ the worker died mid-pass; the chunk is gone
+                // with it — a drop the caller tolerates like a UDP
+                // drop, but never a silent one.
+                Err(_) => {
+                    tracing::warn!(
+                        "wg-crypto worker {i} died mid-pass; its chunk's datagrams drop"
+                    );
+                }
             }
-            // RecvErr ⇒ the worker died mid-pass; the chunk is gone
-            // with it — a drop the caller tolerates like a UDP drop.
         }
         for chunk in done.into_iter().flatten() {
             jobs.extend(chunk);

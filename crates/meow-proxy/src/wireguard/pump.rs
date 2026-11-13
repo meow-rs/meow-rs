@@ -546,9 +546,10 @@ impl WgPump {
     ///      non-DATA packet — handshake, cookie reply, drop — is fully
     ///      handled inline in arrival order, as is its `WriteToNetwork`
     ///      output and chained flush.
-    ///   B. **Worker pass** — `CryptoPool::shared().run(&mut jobs)`:
-    ///      the batch's AEAD opens on the process-wide resident pool
-    ///      (inline when `jobs <= 2` or the pool is single-threaded).
+    ///   B. **Worker pass** — `CryptoPool::run_shared(&mut jobs)`: the
+    ///      batch's AEAD opens on the process-wide resident pool
+    ///      (inline when `jobs <= 2` — resolved lazily, so a small
+    ///      batch never spawns it — or the pool is single-threaded).
     ///   C. **Serial post-pass** — in job order: `handle_decrypted_data`
     ///      replays the `set_current_session`/timer/validate
     ///      bookkeeping `handle_data_in_place` would have run, then the
@@ -615,8 +616,10 @@ impl WgPump {
         }
 
         // Phase B — the batch's AEAD opens, in place inside the job
-        // bufs. `run` fills every `job.result`, preserving job order.
-        CryptoPool::shared().run(&mut jobs);
+        // bufs. `run_shared` fills every `job.result`, preserving job
+        // order — and its `n <= 2` shortcut runs *before* the shared
+        // pool is resolved, so a small batch never spawns the workers.
+        CryptoPool::run_shared(&mut jobs);
 
         // Phase C — serial post-pass in wire order.
         for job in jobs {

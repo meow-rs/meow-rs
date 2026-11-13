@@ -341,20 +341,26 @@ Patch 18 — Shared session crypto + process-wide data-plane crypto pool
     rewritten `buf[DATA_PAYLOAD_OFF..]` to plaintext.
   * crypto_pool.rs (new): `CryptoPool`, the process-wide resident
     worker set behind `CryptoPool::shared()` (`OnceLock` — spawned on
-    first use, shared by every outbound pump and inbound listener
-    actor). `W = min(available_parallelism - 1, 4)`, floor 1 — the
-    `- 1` keeps a core for the actor's own serial work, `4` is where
-    the per-session replay mutex and single consumer stop scaling.
-    `CryptoJob` carries the *owned* wire datagram plus
-    `Option<SessionHandle>`; `run` splits contiguous `Vec` chunks over
-    `std::sync::mpsc`, one per worker, and merges results positionally —
-    job order is preserved with no reorder buffer. `W <= 1` or
-    `n <= 2` runs inline (the spec's serial fallback); a worker dead at
-    dispatch re-runs its chunk on the caller, while one lost mid-pass
-    degrades to a dropped datagram — the job's caller-owned `tag` keeps
-    the remaining results mapped to the right contexts and the
-    caller's receive-slot healing re-arms the missing buffers, so the
-    loss is indistinguishable from a UDP drop.
+    the first `run_shared` pass with `n > 2`, shared by every outbound
+    pump and inbound listener actor). It lives in this crate, not a
+    consumer's, because `CryptoJob` touches crate-private surface —
+    `SessionCrypto`, `SessionHandle`, `receive_packet_data_in_place` —
+    that a pool in meow-proxy/meow-listener could only reach through
+    new `pub` exports of vendored internals. `W =
+    min(available_parallelism - 1, 4)`, floor 1 — the `- 1` keeps a
+    core for the actor's own serial work, `4` is where the per-session
+    replay mutex and single consumer stop scaling. `CryptoJob` carries
+    the *owned* wire datagram plus `Option<SessionHandle>`; `run`
+    splits contiguous `Vec` chunks over `std::sync::mpsc`, one per
+    worker, and merges results positionally — job order is preserved
+    with no reorder buffer. `W <= 1` or `n <= 2` runs inline (the
+    spec's serial fallback — `run_shared` takes it before `shared()`
+    is even resolved); a worker dead at dispatch re-runs its chunk on
+    the caller, while one lost mid-pass degrades to a dropped datagram
+    — the job's caller-owned `tag` keeps the remaining results mapped
+    to the right contexts and the caller's receive-slot healing
+    re-arms the missing buffers, so the loss is indistinguishable from
+    a UDP drop.
   * lib.rs: `CryptoJob`, `CryptoPool`, `SessionHandle`, `WireClass`
     (and PATCH(17)'s `DATA_PAYLOAD_OFF`) re-exported for the pump and
     the listener demux.

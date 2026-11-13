@@ -633,6 +633,12 @@ impl Tunn {
     /// validate sequence the fused path did — the batch drain calls it
     /// in the caller's arrival order, so session/timer/byte bookkeeping
     /// is indistinguishable from serial processing.
+    ///
+    /// Trust contract: `pt_len` must be a result the pool's
+    /// `open_in_place` produced on this same `buf` — then
+    /// `pt_len <= buf.len() - DATA_PAYLOAD_OFF` holds by construction.
+    /// Feed it nothing else; the plaintext slice below is indexed, not
+    /// bounds-checked against the wire datagram.
     pub fn handle_decrypted_data<'a>(
         &mut self,
         receiver_idx: u32,
