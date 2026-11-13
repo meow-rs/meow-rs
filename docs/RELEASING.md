@@ -1,6 +1,6 @@
 # Releasing meow-rs
 
-meow-rs ships as **13 crates** published together to [crates.io](https://crates.io)
+meow-rs ships as **15 crates** published together to [crates.io](https://crates.io)
 at a single workspace version. This is the checklist for cutting a release.
 
 > [!IMPORTANT]
@@ -16,7 +16,7 @@ at a single workspace version. This is the checklist for cutting a release.
 2. Add it to the repo as the **`CARGO_REGISTRY_TOKEN`** Actions secret
    (`Settings → Secrets and variables → Actions`). The
    [`publish.yml`](../.github/workflows/publish.yml) workflow reads it.
-3. Confirm you own all 13 crate names on crates.io.
+3. Confirm you own all 15 crate names on crates.io.
 
 ## The crates & publish order
 
@@ -26,9 +26,9 @@ dependencies — including **dev-dependencies**, which crates.io validates at pu
 time (e.g. `meow-tunnel` dev-depends on `meow-config`, so config goes first):
 
 ```
-meow-common  meow-trie  meow-anytls  meow-lwip  meow-transport   (leaves)
-meow-rules   meow-dns                        (→ common, trie)
-meow-proxy                                   (→ common, dns, transport, anytls)
+meow-common  meow-trie  meow-anytls  meow-lwip  meow-wireguard  meow-transport   (leaves)
+meow-rules   meow-dns   meow-wgstack           (→ common, trie)
+meow-proxy                                   (→ common, dns, transport, anytls, wireguard, wgstack)
 meow-config                                  (→ common, trie, dns, rules, proxy)
 meow-tunnel                                  (→ …, + dev-dep on config)
 meow-listener  meow-api                      (→ tunnel, config)
@@ -105,7 +105,7 @@ secret beyond `CARGO_REGISTRY_TOKEN` is involved.
    It checks that `CHANGELOG.md` has the `## [X.Y.Z]` section, creates the
    annotated tag `vX.Y.Z` on the merge commit, and then calls:
    - [`publish.yml`](../.github/workflows/publish.yml) — verifies the tag
-     matches the workspace version and publishes all 13 crates in order;
+     matches the workspace version and publishes all 15 crates in order;
    - [`release.yml`](../.github/workflows/release.yml) — builds the binaries
      and OpenWrt packages and publishes the GitHub Release, with the
      `CHANGELOG.md` section as its notes.
@@ -143,7 +143,7 @@ wins; the other sees the tag and stands down.
 ### Rehearsal
 
 - **crates.io:** `Actions → Publish to crates.io → Run workflow` with
-  **dry-run** left ticked packages and verifies all 13 crates without
+  **dry-run** left ticked packages and verifies all 15 crates without
   uploading.
 - **Binaries:** `Actions → Release → Run workflow` with a tag builds the full
   artifact matrix without publishing a Release.
@@ -180,7 +180,7 @@ part of cutting a stable release; it needs no manual steps.
   *first* publish (0.15.0). It does **not** apply to new versions of existing
   crates.
 - **New versions of existing crates:** a much higher limit, so a normal release
-  publishes all 13 crates back-to-back without throttling.
+  publishes all 15 crates back-to-back without throttling.
 
 ## Forked dependencies
 
@@ -207,8 +207,8 @@ version here — never point `[workspace.dependencies]` at a git rev.
 If the publish workflow is unavailable, publish locally (logged in via `cargo login`):
 
 ```bash
-for c in meow-common meow-trie meow-anytls meow-lwip meow-transport \
-         meow-rules meow-dns meow-proxy \
+for c in meow-common meow-trie meow-anytls meow-lwip meow-wireguard \
+         meow-wgstack meow-transport meow-rules meow-dns meow-proxy \
          meow-config meow-tunnel meow-listener meow-api \
          meow-app; do
   cargo publish -p "$c" || break   # waits for index propagation between crates

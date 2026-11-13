@@ -37,6 +37,8 @@ exist yet.
 | `load-balance` | `meow-proxy` | Load-balance group |
 | `relay` | `meow-proxy` | Relay group |
 | `public-suffix` | `meow-proxy` | Public-suffix list (`psl`, ~500 KB) for load-balance `consistent-hashing` eTLD+1 keys; in `full`, not `minimal`, which keys on the last two labels |
+| `wireguard` | `meow-proxy` | WireGuard outbound (issue #899): vendored boringtun Noise (`meow-wireguard`) + smoltcp userspace stack (`meow-wgstack`) behind a pump-thread actor; implies `meow-wireguard/wireguard-boring`; in `full`, not `minimal` |
+| `wireguard-boring` | `meow-wireguard` | Session data-path AEAD on BoringSSL `AeadCtx` (key schedule once per session, platform assembly) instead of a per-packet RustCrypto cipher — the handshake stays on RustCrypto and wire bytes are identical. Implied by `wireguard` and `listener-wireguard`; a standalone `meow-wireguard` build without it keeps the pure-RustCrypto session path |
 
 The `ss` built-in-plugin contract is narrowed to `simple-obfs`/`obfs` +
 `v2ray-plugin`; the four heavier SIP003 transports above are opt-in and
@@ -66,6 +68,7 @@ SIP003 subprocess path.
 | `listener-socks5` | `meow-listener` | SOCKS5 inbound |
 | `listener-tproxy` | `meow-listener` | TProxy (nftables/pf); Linux/macOS only |
 | `listener-mixed` | `meow-listener` | Mixed (HTTP+SOCKS5) inbound |
+| `listener-wireguard` | `meow-listener` | WireGuard inbound responder (`listeners: - type: wireguard`): static multi-peer table on one UDP port, AnyIP smoltcp TCP termination, per-flow UDP dial; implies `meow-wireguard/wireguard-boring`; in `full`, not `minimal` |
 
 ### DNS features
 

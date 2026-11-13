@@ -1,6 +1,6 @@
 name: Publish to crates.io
 
-# Publishes all 13 publishable workspace crates to crates.io in dependency order.
+# Publishes all 15 publishable workspace crates to crates.io in dependency order.
 #
 # Triggers:
 #   - push a tag `vX.Y.Z`  -> real publish (tag must match the workspace version)

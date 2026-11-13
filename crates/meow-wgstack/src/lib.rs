@@ -201,6 +201,12 @@ impl Device for ChannelDevice {
 /// `None` means every socket went quiet — send window full, Nagle-held
 /// tail, timers idle — so the loop breaks there. The whole burst shares
 /// one timestamp: it is one logical service pass.
+///
+/// One more 0.12→0.13 delta worth knowing while reading latency
+/// profiles: `RTTE_MIN_RTO` went 10 ms → 1000 ms (the RFC 6298 floor),
+/// so on a sub-millisecond inner link a retransmit tail now sits ~1 s
+/// where it used to fire ~100× sooner — expected upstream behavior, not
+/// a wedge.
 pub fn poll_burst(
     iface: &mut Interface,
     now: SmolInstant,
