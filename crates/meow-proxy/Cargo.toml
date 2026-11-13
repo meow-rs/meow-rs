@@ -83,6 +83,12 @@ ech-tls-tunnel = ["ss"]
 # `full` bundle; excluded from `minimal` (ADR-0007 — the cipher suite,
 # reed-solomon and snappy deps are only reachable via `plugin: kcptun`).
 kcptun = ["ss", "mux", "dep:tokio-util", "meow-transport/kcptun"]
+# WireGuard outbound (issue #899): the vendored, ring-free boringtun noise
+# module (`meow-wireguard`) encrypts packets for a smoltcp userspace TCP/IP
+# stack running on a dedicated actor thread. Opt-in — the app `full`
+# bundle is expected to enable it; keep it out of `minimal` (ADR-0007
+# binary-size caps).
+wireguard = ["dep:meow-wireguard", "dep:smoltcp", "dep:ipnet"]
 
 [dependencies]
 meow-common = { workspace = true }
@@ -93,6 +99,12 @@ tokio-util = { workspace = true, optional = true }
 yamux = { workspace = true, optional = true }
 h2 = { version = "0.4", optional = true }
 meow-anytls = { workspace = true, optional = true }
+# Vendored boringtun 0.7.1 noise module with ring replaced by RustCrypto
+# (`meow-wireguard`), and the smoltcp userspace stack it encrypts for —
+# both pulled in only by the `wireguard` feature.
+meow-wireguard = { workspace = true, optional = true }
+smoltcp = { workspace = true, optional = true }
+ipnet = { workspace = true, optional = true }
 # quiche = QUIC + HTTP/3 for the hysteria2 outbound, on BoringSSL (shares the
 # `boring` crate's vendored copy). No rustls, no second crypto library.
 quiche = { workspace = true, optional = true }

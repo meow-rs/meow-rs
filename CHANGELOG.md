@@ -10,6 +10,15 @@ the canonical, in-repo source a release is cut from.
 
 ### Added
 
+- **WireGuard outbound** (`type: wireguard`) — userspace WireGuard via a vendored
+  patch of `boringtun 0.7.1` (ring replaced by workspace RustCrypto crates) over
+  smoltcp; full mihomo config surface except `dns` (Phase-1: ignored),
+  `amnezia-wg-option` (Phase-1: rejected), and `dialer-proxy` (rejected —
+  the WG transport owns its UDP socket); standard WG servers, Cloudflare WARP
+  `reserved` field, persistent-keepalive, `remote-dns-resolve`, routing-loop
+  prevention under `tun.auto-route`. Behind the `wireguard` feature; included in
+  `full`, excluded from `minimal`. (#899)
+
 - `dns.fake-ip-filter` recognizes the mihomo `+.*` wildcard suffix across
   all domain depths in both blacklist and whitelist modes.
 

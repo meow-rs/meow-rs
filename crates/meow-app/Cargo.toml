@@ -80,6 +80,10 @@ shadow-tls = ["ss", "meow-config/shadow-tls", "meow-proxy/shadow-tls"]
 restls = ["ss", "meow-config/restls", "meow-proxy/restls"]
 jls = ["ss", "meow-config/jls", "meow-proxy/jls"]
 gost-plugin = ["ss", "meow-config/gost-plugin", "meow-proxy/gost-plugin"]
+# WireGuard userspace outbound (issue #899 Phase-1) — vendored ring-free
+# boringtun over smoltcp; in `full` so release binaries carry it,
+# excluded from `minimal` (ADR-0007 binary-size caps).
+wireguard = ["meow-config/wireguard", "meow-proxy/wireguard"]
 
 # DNS
 dns-server = ["meow-dns/dns-server"]
@@ -109,7 +113,7 @@ listener-shadowsocks = ["meow-listener/listener-shadowsocks"]
 # Convenience bundles
 minimal = ["ss", "trojan", "dns-server", "listener-mixed"]
 full = [
-    "ss", "trojan", "vless", "vless-vision", "vless-encryption", "vmess", "snell", "hysteria2", "anytls", "ech-tls-tunnel", "mux", "kcptun",
+    "ss", "trojan", "vless", "vless-vision", "vless-encryption", "vmess", "snell", "hysteria2", "anytls", "wireguard", "ech-tls-tunnel", "mux", "kcptun",
     "shadow-tls", "restls", "jls", "gost-plugin",
     "dns-server", "dns-encrypted", "dns-quic",
     "listener-http", "listener-socks5", "listener-tproxy", "listener-mixed", "listener-tun",

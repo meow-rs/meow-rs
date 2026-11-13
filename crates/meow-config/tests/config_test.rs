@@ -1472,13 +1472,13 @@ proxies:
 async fn test_unsupported_proxy_type_skipped() {
     let yaml = r#"
 proxies:
-  - name: "wireguard-server"
-    type: wireguard
+  - name: "tuic-server"
+    type: tuic
     server: "1.2.3.4"
     port: 443
 "#;
     let config = load_config_from_str(yaml).await.unwrap();
-    assert!(!config.proxies.contains_key("wireguard-server"));
+    assert!(!config.proxies.contains_key("tuic-server"));
 }
 
 #[tokio::test]

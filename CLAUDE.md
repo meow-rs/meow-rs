@@ -178,6 +178,22 @@ cargo test -p meow-proxy --no-default-features --features trusttunnel-h3 --test 
 cargo test -p meow-config --features trusttunnel-h3 --test trusttunnel_config_test
 cargo test -p meow-config --features trusttunnel-h3 --lib
 
+# WireGuard (issue #899) is opt-in behind `wireguard` in `full` only: the
+# vendored boringtun, the smoltcp pump and both parser legs compile only
+# under explicit feature runs. The crypto crate must stay ring-free —
+# `cargo tree` below must print nothing.
+cargo clippy -p meow-wireguard --all-targets -- -D warnings
+cargo clippy -p meow-proxy --no-default-features --features wireguard --all-targets -- -D warnings
+cargo tree -p meow-wireguard --edges normal | grep -wE 'ring|ring_compat|aws-lc'
+cargo test -p meow-wireguard
+# `mock-instant` un-gates the vendored rekey/retransmission timer tests.
+cargo test -p meow-wireguard --features mock-instant --lib
+cargo test -p meow-config --features wireguard --test wireguard_config_test
+cargo test -p meow-config --no-default-features --test wireguard_config_test
+cargo test -p meow-proxy --features wireguard --lib --test wireguard_integration
+# `minimal` must not pull the WG stack: must print nothing.
+cargo tree -p meow-app --no-default-features --features minimal --edges normal | grep -wE 'meow-wireguard|smoltcp'
+
 # The official TrustTunnel test peer is required for the e2e target.
 # Fetch with `bash scripts/fetch-trusttunnel-endpoint.sh /tmp/meow-tt-peer`,
 # then export TRUSTTUNNEL_SERVER_BIN=/tmp/meow-tt-peer/trusttunnel_endpoint.

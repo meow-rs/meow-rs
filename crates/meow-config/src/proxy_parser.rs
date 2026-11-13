@@ -13,6 +13,8 @@ use meow_proxy::{
 };
 #[cfg(feature = "vless")]
 use meow_proxy::{TransportChain, VlessAdapter, VlessFlow};
+#[cfg(feature = "wireguard")]
+use meow_proxy::{WireGuardAdapter, WireGuardConfig};
 use smol_str::SmolStr;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -529,6 +531,17 @@ pub fn parse_proxy_with_dialer(
                 WrappedProxy::new(Box::new(adapter)).dialing_through(config, dialer),
             ))
         }
+        // WireGuard accepts the mihomo spellings "wireguard" and
+        // "WireGuard" (docs/wireguard.md field table).
+        #[cfg(feature = "wireguard")]
+        "wireguard" | "WireGuard" => {
+            // The WG transport owns its UDP endpoint socket — a TCP
+            // `dialer-proxy` chain cannot carry it (same reason anytls and
+            // hysteria2 refuse one), so reject before constructing.
+            reject_unthreaded_dialer(name, "wireguard", dialer)?;
+            let adapter = parse_wireguard(name, config)?;
+            Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
+        }
         #[cfg(not(feature = "trusttunnel"))]
         "trusttunnel" => Err(feature_gated_proxy_type("trusttunnel")),
         #[cfg(not(feature = "ss"))]
@@ -545,6 +558,8 @@ pub fn parse_proxy_with_dialer(
         "vmess" => Err(feature_gated_proxy_type("vmess")),
         #[cfg(not(feature = "snell"))]
         "snell" => Err(feature_gated_proxy_type("snell")),
+        #[cfg(not(feature = "wireguard"))]
+        "wireguard" | "WireGuard" => Err(feature_gated_proxy_type("wireguard")),
         // `node_is_trusttunnel` trims and ignores case; this dispatch is
         // exact, like mihomo's. Without this arm a ` trusttunnel ` or
         // `TrustTunnel` node reports a generic "unsupported proxy type"
@@ -614,7 +629,8 @@ fn reject_unthreaded_dialer(
     feature = "hysteria2",
     feature = "vmess",
     feature = "snell",
-    feature = "trusttunnel"
+    feature = "trusttunnel",
+    feature = "wireguard"
 )))]
 fn feature_gated_proxy_type(proxy_type: &str) -> String {
     if proxy_type == "trusttunnel" {
@@ -1891,6 +1907,322 @@ fn reject_nonzero_hy2_option(
         }
     }
     Ok(())
+}
+
+/// Parse a `type: wireguard` proxy block into a [`WireGuardAdapter`]
+/// (issue #899 Phase-1; `WireGuard` is accepted too, per docs/wireguard.md).
+///
+/// Required fields: `server`, `port`, `private-key`, `public-key` (base64,
+/// standard encoding, exactly 32 bytes decoded). Optional: `ip`, `ipv6`
+/// (tunnel interface addresses — bare address or CIDR; the prefix is
+/// meaningless on a point-to-point WG interface and is stripped),
+/// `allowed-ips` (list of CIDRs; absent/empty → the adapter applies the
+/// catch-all `0.0.0.0/0` + `::/0`), `pre-shared-key`, `reserved` (3-byte
+/// list or base64 → 3 bytes), `mtu`, `udp`, `remote-dns-resolve`,
+/// `persistent-keepalive`, `dns`, `ip-stack`.
+///
+/// # Hard errors (Class A per ADR-0002)
+///
+/// - `amnezia-wg-option` present — AmneziaWG is not in this build.
+/// - `dialer-proxy` — rejected earlier in the dispatch by
+///   [`reject_unthreaded_dialer`]; the WG transport owns its UDP socket.
+/// - missing `server`, `port`, `private-key`, or `public-key`.
+/// - a key that is not base64, or decodes to other than 32 bytes.
+/// - `ip`/`ipv6` that is neither an address nor a CIDR of that family.
+/// - an `allowed-ips` entry that is not a CIDR.
+/// - `reserved` that is not a 3-element list or base64 → 3 bytes.
+/// - `mtu` outside 640–9000 (the floor keeps the inner IP MTU —
+///   `mtu - 64` WG overhead — at or above the 576 IPv4 minimum;
+///   `WireGuardAdapter::new` keeps the same floor as a backstop).
+/// - `ip-stack` other than `"gvisor"`/`"system"`.
+///
+/// Phase-1 accepts-but-ignores: `dns` (warns once; `remote-dns-resolve`
+/// covers tunnel-side lookups) and `ip-stack` (`gvisor` maps to the
+/// built-in smoltcp stack; `system` warns once then does the same).
+///
+/// upstream: `adapter/outbound/wireguard.go`
+#[cfg(feature = "wireguard")]
+fn parse_wireguard(
+    name: &str,
+    config: &HashMap<String, serde_json::Value>,
+) -> std::result::Result<WireGuardAdapter, String> {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    // AmneziaWG obfuscation is Phase-3 — name the field instead of
+    // silently running the standard session the operator did not ask for.
+    if config
+        .get("amnezia-wg-option")
+        .is_some_and(|v| !v.is_null())
+    {
+        return Err(format!(
+            "wireguard[{name}]: 'amnezia-wg-option' is not supported in this build"
+        ));
+    }
+
+    let required_str = |field: &str| -> std::result::Result<&str, String> {
+        config
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| format!("wireguard[{name}]: missing {field}"))
+    };
+    let opt_str = |field: &str| -> std::result::Result<Option<&str>, String> {
+        match config.get(field) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(v) => v
+                .as_str()
+                .map(Some)
+                .ok_or_else(|| format!("wireguard[{name}]: '{field}' must be a string")),
+        }
+    };
+    let boolean = |field: &str, default: bool| -> std::result::Result<bool, String> {
+        match config.get(field) {
+            None | Some(serde_json::Value::Null) => Ok(default),
+            Some(v) => v
+                .as_bool()
+                .ok_or_else(|| format!("wireguard[{name}]: '{field}' must be boolean")),
+        }
+    };
+    let opt_u16 = |field: &str, default: u16| -> std::result::Result<u16, String> {
+        match config.get(field) {
+            None | Some(serde_json::Value::Null) => Ok(default),
+            Some(v) => {
+                let n = v.as_u64().ok_or_else(|| {
+                    format!("wireguard[{name}]: '{field}' must be an unsigned integer")
+                })?;
+                u16::try_from(n)
+                    .map_err(|_| format!("wireguard[{name}]: '{field}' {n} exceeds 65535"))
+            }
+        }
+    };
+
+    let server = required_str("server")?;
+    let port = required_port(config, &format!("wireguard[{name}]"))?;
+    let private_key = parse_wg_key(name, config, "private-key")?;
+    let public_key = parse_wg_key(name, config, "public-key")?;
+    let pre_shared_key = match opt_str("pre-shared-key")? {
+        None => None,
+        Some(_) => Some(parse_wg_key(name, config, "pre-shared-key")?),
+    };
+
+    // `ip`/`ipv6` are the tunnel interface addresses. A bare address or a
+    // CIDR is accepted; the prefix has no meaning on a point-to-point WG
+    // interface (the adapter assigns /32 resp. /128), so it is stripped.
+    let parse_tunnel_addr = |field: &str| -> std::result::Result<Option<std::net::IpAddr>, String> {
+        let Some(raw) = opt_str(field)? else {
+            return Ok(None);
+        };
+        if let Ok(addr) = raw.parse::<std::net::IpAddr>() {
+            return Ok(Some(addr));
+        }
+        if let Ok(net) = raw.parse::<ipnet::IpNet>() {
+            return Ok(Some(net.addr()));
+        }
+        Err(format!(
+            "wireguard[{name}]: '{field}' must be an IP address or CIDR"
+        ))
+    };
+    let ip: Option<Ipv4Addr> = match parse_tunnel_addr("ip")? {
+        None => None,
+        Some(std::net::IpAddr::V4(a)) => Some(a),
+        Some(std::net::IpAddr::V6(_)) => {
+            return Err(format!("wireguard[{name}]: 'ip' must be IPv4"))
+        }
+    };
+    let ipv6: Option<Ipv6Addr> = match parse_tunnel_addr("ipv6")? {
+        None => None,
+        Some(std::net::IpAddr::V6(a)) => Some(a),
+        Some(std::net::IpAddr::V4(_)) => {
+            return Err(format!("wireguard[{name}]: 'ipv6' must be IPv6"))
+        }
+    };
+
+    let allowed_ips = parse_wg_allowed_ips(name, config)?;
+    let reserved = parse_wg_reserved(name, config)?;
+
+    let mtu = opt_u16("mtu", 1420)?;
+    if !(640..=9000).contains(&mtu) {
+        return Err(format!(
+            "wireguard[{name}]: 'mtu' must be in 640..=9000 (outer MTU; \
+             inner = mtu - 64 WG overhead must be >= 576)"
+        ));
+    }
+    let udp = boolean("udp", true)?;
+    let remote_dns_resolve = boolean("remote-dns-resolve", true)?;
+    let persistent_keepalive = opt_u16("persistent-keepalive", 0)?;
+
+    // `dns` is parsed and stored but ignored in Phase-1 — tunnel-side
+    // resolution goes through `remote-dns-resolve` and the injected
+    // resolver. Warn once per parse so generated mihomo configs keep
+    // loading without pretending per-node tunnel DNS works.
+    let dns_present = config.get("dns").is_some_and(|v| !v.is_null());
+    let dns: Vec<String> = match config.get("dns") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(serde_json::Value::String(s)) => vec![s.clone()],
+        Some(serde_json::Value::Array(list)) => list
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| format!("wireguard[{name}]: 'dns' entries must be strings"))
+            })
+            .collect::<std::result::Result<_, _>>()?,
+        Some(_) => {
+            return Err(format!(
+                "wireguard[{name}]: 'dns' must be a nameserver string or list"
+            ))
+        }
+    };
+    if dns_present {
+        tracing::warn!(
+            "wireguard {name}: 'dns' is accepted but ignored in Phase-1 \
+             (remote-dns-resolve covers tunnel-side lookups)"
+        );
+    }
+
+    // Phase-1 runs one userspace stack — smoltcp. `gvisor` is the same
+    // role in mihomo terms, so it is accepted silently; `system` maps to
+    // smoltcp with a warn rather than a hard error so such configs keep
+    // loading (docs/wireguard.md). Every other value — including
+    // mihomo's `{mode, congestion-controller}` object form — is a named
+    // error instead of a silent semantic change.
+    match config.get("ip-stack") {
+        None | Some(serde_json::Value::Null) => {}
+        Some(serde_json::Value::String(stack)) => match stack.as_str() {
+            "" | "gvisor" => {}
+            "system" => tracing::warn!(
+                "wireguard {name}: 'ip-stack: system' maps to the built-in \
+                 smoltcp stack — no kernel WireGuard mode in Phase-1"
+            ),
+            other => {
+                return Err(format!(
+                    "wireguard[{name}]: 'ip-stack' \"{other}\" is not supported — \
+                     this build runs the smoltcp userspace stack \
+                     (accepted: \"gvisor\", \"system\")"
+                ))
+            }
+        },
+        Some(_) => {
+            return Err(format!(
+                "wireguard[{name}]: 'ip-stack' must be \"gvisor\" or \"system\""
+            ))
+        }
+    }
+
+    WireGuardAdapter::new(WireGuardConfig {
+        name: name.to_string(),
+        server: server.to_string(),
+        port,
+        private_key,
+        public_key,
+        pre_shared_key,
+        ip,
+        ipv6,
+        allowed_ips,
+        reserved,
+        mtu,
+        udp,
+        remote_dns_resolve,
+        persistent_keepalive,
+        dns,
+    })
+    .map_err(|e| format!("wireguard[{name}]: {e}"))
+}
+
+/// Decode a required WireGuard key field: base64 (standard alphabet, as
+/// every WG tool emits) that must come out to exactly 32 bytes.
+#[cfg(feature = "wireguard")]
+fn parse_wg_key(
+    name: &str,
+    config: &HashMap<String, serde_json::Value>,
+    field: &str,
+) -> std::result::Result<[u8; 32], String> {
+    use base64::Engine;
+    let raw = config
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| format!("wireguard[{name}]: missing {field}"))?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(raw)
+        .map_err(|_| format!("wireguard[{name}]: '{field}' must be base64"))?;
+    bytes
+        .try_into()
+        .map_err(|_| format!("wireguard[{name}]: '{field}' must decode to exactly 32 bytes"))
+}
+
+/// `allowed-ips`: each entry must be a CIDR (`addr/prefix`). An absent or
+/// empty list is *not* an error — [`WireGuardAdapter::new`] substitutes
+/// the catch-all `0.0.0.0/0` + `::/0` default at construction.
+#[cfg(feature = "wireguard")]
+fn parse_wg_allowed_ips(
+    name: &str,
+    config: &HashMap<String, serde_json::Value>,
+) -> std::result::Result<Vec<ipnet::IpNet>, String> {
+    match config.get("allowed-ips") {
+        None | Some(serde_json::Value::Null) => Ok(Vec::new()),
+        Some(serde_json::Value::Array(list)) => list
+            .iter()
+            .map(|v| {
+                let s = v.as_str().ok_or_else(|| {
+                    format!("wireguard[{name}]: 'allowed-ips' entries must be CIDR strings")
+                })?;
+                s.parse::<ipnet::IpNet>().map_err(|_| {
+                    format!("wireguard[{name}]: 'allowed-ips' entry '{s}' is not a valid CIDR")
+                })
+            })
+            .collect(),
+        Some(_) => Err(format!(
+            "wireguard[{name}]: 'allowed-ips' must be a list of CIDR strings"
+        )),
+    }
+}
+
+/// `reserved` — the 3-byte Cloudflare WARP client identifier: a YAML list
+/// of three bytes (`[13, 53, 133]`) or a base64 string decoding to exactly
+/// 3 bytes (`"DTWF"`). The pump overwrites bytes 1–4 of each outbound WG
+/// datagram with it after encapsulation.
+#[cfg(feature = "wireguard")]
+fn parse_wg_reserved(
+    name: &str,
+    config: &HashMap<String, serde_json::Value>,
+) -> std::result::Result<Option<[u8; 3]>, String> {
+    use base64::Engine;
+    match config.get("reserved") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Array(list)) => {
+            if list.len() != 3 {
+                return Err(format!(
+                    "wireguard[{name}]: 'reserved' must be a list of exactly 3 bytes"
+                ));
+            }
+            let mut out = [0u8; 3];
+            for (i, v) in list.iter().enumerate() {
+                let n = v.as_u64().ok_or_else(|| {
+                    format!("wireguard[{name}]: 'reserved' entries must be bytes (0-255)")
+                })?;
+                out[i] = u8::try_from(n).map_err(|_| {
+                    format!("wireguard[{name}]: 'reserved' entries must be bytes (0-255)")
+                })?;
+            }
+            Ok(Some(out))
+        }
+        Some(serde_json::Value::String(s)) => {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(s)
+                .map_err(|_| {
+                    format!("wireguard[{name}]: 'reserved' must be a 3-byte list or base64")
+                })?;
+            <[u8; 3]>::try_from(bytes.as_slice())
+                .map(Some)
+                .map_err(|_| {
+                    format!("wireguard[{name}]: 'reserved' base64 must decode to exactly 3 bytes")
+                })
+        }
+        Some(_) => Err(format!(
+            "wireguard[{name}]: 'reserved' must be a 3-byte list or base64"
+        )),
+    }
 }
 
 /// Parse the `strategy` field for a `load-balance` group.

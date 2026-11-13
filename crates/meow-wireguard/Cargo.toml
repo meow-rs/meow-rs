@@ -1,0 +1,45 @@
+[package]
+name = "meow-wireguard"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Vendored boringtun 0.7.1 WireGuard Noise implementation with ring replaced by RustCrypto, for the meow-rs proxy kernel."
+license = "BSD-3-Clause"
+repository = "https://github.com/meow-rs/meow-rs"
+homepage = "https://meow-rs.github.io/meow-rs/"
+readme = "README.md"
+
+[lib]
+name = "meow_wireguard"
+
+[dependencies]
+# WireGuard Noise protocol crypto — ring removed, replaced by crypto.rs facade.
+# `aead` and `rand_core` keep boringtun's original pins: x25519-dalek 2 is
+# generic over rand_core 0.6 traits (workspace `rand` 0.9 is rand_core 0.9 and
+# does not satisfy them), and chacha20poly1305 0.10 already pulls aead 0.5 —
+# both resolve to versions already in the workspace lockfile.
+aead          = "0.5"
+rand_core     = { version = "0.6", features = ["getrandom"] }
+subtle        = "2"   # ConstantTimeEq for crypto::constant_time_eq — vetted
+                      # primitive instead of an optimizable XOR fold
+x25519-dalek  = { workspace = true }
+blake2        = { workspace = true }
+hmac          = { workspace = true }
+chacha20poly1305 = { workspace = true }
+
+# Boringtun non-crypto deps (kept verbatim, versions aligned to workspace)
+parking_lot   = { workspace = true }
+portable-atomic = { version = "1", features = ["fallback"] }
+tracing       = { workspace = true }
+base64        = { workspace = true }
+libc          = "0.2"
+
+[features]
+default = []
+# Kept for upstream test compatibility; NOT used in production. The feature is
+# deliberately empty: when enabled it swaps sleepyinstant for the in-crate mock
+# clock in src/mock_instant.rs, so no external mock_instant crate is needed.
+mock-instant = []
+
+[lints]
+workspace = true

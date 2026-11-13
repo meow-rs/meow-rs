@@ -5,6 +5,7 @@ members = [
     "crates/meow-trie",
     "crates/meow-anytls",
     "crates/meow-lwip",
+    "crates/meow-wireguard",
     "crates/meow-dns",
     "crates/meow-rules",
     "crates/meow-transport",
@@ -143,6 +144,21 @@ lru = "0.18"
 # IP handling
 ipnet = "2"
 
+# Userspace TCP/IP for the WireGuard outbound (#899) — a different stack
+# from lwIP: the WG pump owns it single-threaded inside a dedicated actor
+# thread, driving Interface::poll off plain mpsc channels. `medium-ip`
+# gives the L3 (no-Ethernet) device; `std` supplies smoltcp's clock;
+# 0.13+ requires rustc 1.91 while the workspace floor is 1.89.
+smoltcp = { version = "0.12", default-features = false, features = [
+    "std",
+    "log",
+    "medium-ip",
+    "proto-ipv4",
+    "proto-ipv6",
+    "socket-tcp",
+    "socket-udp",
+] }
+
 # TUN inbound (issue #326) — cross-platform L3 device + userspace TCP/IP
 # stack + route table control. Optional; pulled in only by meow-listener's
 # `listener-tun` feature. The stack is madeye/lwip (lwIP), not smoltcp:
@@ -172,7 +188,7 @@ subtle = "2"
 # All pure-Rust RustCrypto/dalek crates, gated behind `vless-encryption`.
 blake3 = "1"
 ml-kem = { version = "0.3", features = ["getrandom"] }
-x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets", "reusable_secrets"] }
 ctr = "0.9"
 # Snell uses Argon2id (t=3, m=8 KiB, p=1) as its KDF; its AEAD, like
 # VMess's and VLESS encryption's, is BoringSSL's (meow-proxy `src/aead.rs`).
@@ -280,6 +296,9 @@ meow-trie = { path = "crates/meow-trie", version = "0.29.0" }
 # Vendored anytls fork (lib name `anytls_rs`); optional, pulled in only by
 # meow-proxy's `anytls` feature.
 meow-anytls = { path = "crates/meow-anytls", version = "0.29.0" }
+# Vendored boringtun 0.7.1 noise module (ring replaced by RustCrypto);
+# optional, pulled in only by meow-proxy's `wireguard` feature (#899).
+meow-wireguard = { path = "crates/meow-wireguard", version = "0.29.0" }
 meow-dns = { path = "crates/meow-dns", version = "0.29.0", default-features = false }
 meow-rules = { path = "crates/meow-rules", version = "0.29.0" }
 # default-features = false so each consumer names the layers it needs

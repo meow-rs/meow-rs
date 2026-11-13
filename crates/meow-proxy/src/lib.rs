@@ -1,8 +1,8 @@
 //! Outbound proxy protocol implementations and groups for the meow-rs kernel.
 //!
 //! Adapters for Shadowsocks, Trojan, VLESS, VMess, Hysteria2, Snell, AnyTLS,
-//! HTTP, SOCKS5, Direct, and Reject, plus Selector, URLTest, Fallback,
-//! LoadBalance, and Relay groups.
+//! WireGuard, HTTP, SOCKS5, Direct, and Reject, plus Selector, URLTest,
+//! Fallback, LoadBalance, and Relay groups.
 
 /// BoringSSL record-layer AEAD shared by Snell, VMess and VLESS encryption.
 #[cfg(any(feature = "snell", feature = "vmess", feature = "vless-encryption"))]
@@ -78,6 +78,12 @@ pub mod hysteria2_adapter;
 pub use hysteria2::ReceiveWindows as Hy2ReceiveWindows;
 #[cfg(feature = "hysteria2")]
 pub use hysteria2_adapter::{Hy2Adapter, Hy2HopInterval, Hy2Obfs, Hy2Options};
+/// WireGuard outbound (`type: wireguard`), userspace boringtun + smoltcp —
+/// opt-in feature `wireguard` (issue #899 Phase-1).
+#[cfg(feature = "wireguard")]
+pub mod wireguard;
+#[cfg(feature = "wireguard")]
+pub use wireguard::{WireGuardAdapter, WireGuardConfig};
 
 #[cfg(feature = "vless")]
 pub(crate) mod vless;

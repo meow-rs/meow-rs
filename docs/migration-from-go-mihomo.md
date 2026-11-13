@@ -59,7 +59,8 @@ cause problems; items marked ~ work with caveats; items marked ✓ work.
 | `proxies:` — Snell | ✓ | v3/v4/v5/v6, UDP-over-TCP, optional HTTP/TLS obfs (v3–v5), v6 `mode` (`default` / `unshaped` / `unsafe-raw`). |
 | `proxies:` — Hysteria2 | ✓ | QUIC TCP/UDP, Salamander obfs, port hopping; `down` bandwidth hint only (`up` is parsed but ignored — warns at load). |
 | `proxies:` — AnyTLS | ✓ | TCP + UDP (udp-over-tcp v2, opt in with `udp: true`). In the `full` bundle, and therefore in the release binaries; excluded from `minimal`. |
-| `proxies:` — TUIC / WireGuard / SSH | ✗ | Not implemented. |
+| `proxies:` — WireGuard | ✓ | Userspace WG client (vendored boringtun + smoltcp): standard WG + Cloudflare WARP `reserved`. In the `full` bundle, and therefore in the release binaries; excluded from `minimal`. Phase-1: `dns` is ignored and `amnezia-wg-option`/`dialer-proxy` are hard errors — see [wireguard.md](wireguard.md). |
+| `proxies:` — TUIC / SSH | ✗ | Not implemented. |
 | `proxy-groups:` — selector, url-test, fallback | ✓ | Fully supported. |
 | `proxy-groups:` — load-balance | ✓ | round-robin + consistent-hashing (M1.C-1). |
 | `proxy-groups:` — relay | ✓ | Chain multiple outbounds (M1.C-2). |
@@ -295,6 +296,39 @@ proxies:
 an `atyp 0x03` (domain) request. IP-only dial is used only when no hostname is
 available. This preserves domain for SNI and logging on the destination server.
 
+### WireGuard
+
+Supported behind the `wireguard` Cargo feature — part of the `full` bundle, so
+the published release binaries carry it; `minimal` builds leave it out
+(ADR-0007 binary-size caps). The client is a userspace stack: a vendored
+boringtun 0.7.1 noise layer (ring replaced by RustCrypto) over smoltcp. Full
+field reference, compatibility table and Phase-1 scope:
+[wireguard.md](wireguard.md).
+
+```yaml
+proxies:
+  - name: warp
+    type: wireguard
+    server: engage.cloudflareclient.com
+    port: 2408
+    ip: 172.16.0.2
+    private-key: eCtXsJZ27+4PbhDkHnB923tkUn2Gj59wZw5wFA75MnU=
+    public-key: bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=
+    udp: true
+```
+
+**Divergences from Go mihomo:**
+
+| Field / behaviour | Go mihomo | meow-rs |
+|-------------------|-----------|-------------|
+| `amnezia-wg-option` | AmneziaWG obfuscation fields | Hard parse error — Phase-1 is standard WireGuard only (Phase-3 planned). |
+| `dialer-proxy` on the node | Field accepted by the outbound schema | Hard parse error — the WG transport owns its UDP endpoint socket and cannot ride a TCP dialer. |
+| `dns` | Per-node tunnel DNS list | Accepted but ignored, warn-once — `remote-dns-resolve` covers tunnel-side resolution (per-node DNS is Phase-2). |
+| `ip-stack: system` | Kernel WG stack | Warn-once, then runs smoltcp anyway — no kernel WG mode in Phase-1. |
+| `mtu` | No bound enforced (default `1408`) | Enforced range 640–9000, default `1420` — the smoltcp inner MTU (`mtu − 64` WG overhead) must stay ≥ 576. |
+| `udp` / `remote-dns-resolve` | Default `false` | Default `true` — UDP relay and tunnel-side DNS resolution are on unless disabled. |
+| `type: wireguard` without the feature | n/a | Parse error naming the `wireguard` feature — same contract as `anytls`. |
+
 ### Not supported in the default app build
 
 The following protocols are not available in the default app build. Using them
@@ -302,8 +336,11 @@ in `proxies:` will produce a hard parse error unless a feature note says
 otherwise:
 
 - **TUIC** — not implemented.
-- **WireGuard** — niche; deferred.
 - **SSH** — niche; deferred.
+- **WireGuard** — supported behind the `wireguard` Cargo feature. Part of the
+  `full` bundle, so the published release binaries carry it; `minimal` builds
+  leave it out and a `type: wireguard` node there fails to parse with an error
+  naming the feature (ADR-0007 binary-size caps).
 - **AnyTLS** — supported. Part of the `full` bundle, so the published release
   binaries carry it; `minimal` builds leave it out (ADR-0007 binary-size caps).
 
@@ -643,7 +680,7 @@ using them will produce a clear error at startup.
 
 | Feature | Reason | Alternative |
 |---------|--------|-------------|
-| TUIC, WireGuard, SSH protocols | Protocol scope and dependency budget | Revisit in M2+ if users need them |
+| TUIC, SSH protocols | Protocol scope and dependency budget | Revisit in M2+ if users need them |
 | TUN inbound | L3-device transparent proxy (issue #326) | `tun:` section with the `listener-tun` Cargo feature |
 
 ---
@@ -679,6 +716,7 @@ meow-rs uses Cargo feature flags where Go mihomo uses build tags:
 | Full app bundle | `meow-app/full` | on |
 | Minimal app bundle | `meow-app/minimal` | off |
 | AnyTLS outbound | `meow-app/anytls` (in `full`, not in `minimal`) | on |
+| WireGuard outbound | `meow-proxy/wireguard` (in `full`, not in `minimal`) | on |
 | Logbook (bundles SQLite) | `meow-app/logbook` (in `full`, not in `minimal`) | on |
 | Traffic ledger (SQLite + public-suffix list) | `meow-app/traffic-ledger` (in `full`, not in `minimal`) | on |
 | Shadowsocks inbound (`listeners:` `type: shadowsocks`) | `meow-app/listener-shadowsocks` (in `full`, not in `minimal`) | on |
@@ -697,10 +735,11 @@ cargo build --release --no-default-features -p meow-dns
 
 Most common format from public providers. Typical issues:
 
-1. **Unsupported proxy types** — TUIC, WireGuard, SSH, ShadowsocksR, and other
-   niche upstream protocols still need replacement or removal. AnyTLS works
-   out of the box in the release binaries; a `minimal` build needs
-   `--features anytls`.
+1. **Unsupported proxy types** — TUIC, SSH, ShadowsocksR, and other niche
+   upstream protocols still need replacement or removal. AnyTLS and WireGuard
+   work out of the box in the release binaries (the `full` bundle); a
+   `minimal` build needs `--features anytls` for AnyTLS and the `wireguard`
+   feature for WireGuard.
 2. **`enhanced-mode: fake-ip`** — supported. Migration from a prior
    meow-rs release that warned-and-fell-back to `normal` is automatic;
    no config change required.
@@ -812,9 +851,9 @@ These have been tested against a real subscription and confirmed working:
 The following are unsupported or intentionally rejected:
 
 - **`quic://` nameservers** — hard error; replace with `tls://` or `https://`.
-- **TUIC / WireGuard / SSH / ShadowsocksR proxies** — hard error; no default-build adapter.
-- **AnyTLS proxies in a `minimal` build** — hard error; the `full` bundle and
-  the release binaries support them.
+- **TUIC / SSH / ShadowsocksR proxies** — hard error; no adapter.
+- **AnyTLS or WireGuard proxies in a `minimal` build** — hard error; the
+  `full` bundle and the release binaries support them.
 - **Snell v1/v2** — hard error; use Snell v3/v4/v5/v6.
 - **`vless` with `flow: xtls-rprx-direct`** — hard error; use `xtls-rprx-vision`.
 - **External dashboard auto-download** (`external-ui-url`) — not performed.

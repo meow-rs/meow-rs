@@ -21,6 +21,9 @@ pub enum AdapterType {
     TrustTunnel,
     Anytls,
     Snell,
+    /// Userspace WireGuard outbound (issue #899): vendored boringtun noise
+    /// over a smoltcp TCP/IP stack, behind meow-proxy's `wireguard` feature.
+    WireGuard,
     /// Built-in nop adapter (`PASS`) — a matched rule is skipped silently
     /// by the match loop (upstream `C.Pass`).
     Pass,
@@ -54,6 +57,7 @@ impl fmt::Display for AdapterType {
             AdapterType::TrustTunnel => write!(f, "TrustTunnel"),
             AdapterType::Anytls => write!(f, "AnyTLS"),
             AdapterType::Snell => write!(f, "Snell"),
+            AdapterType::WireGuard => write!(f, "WireGuard"),
             AdapterType::Pass => write!(f, "Pass"),
             AdapterType::PassRule => write!(f, "PassRule"),
             AdapterType::Compatible => write!(f, "Compatible"),

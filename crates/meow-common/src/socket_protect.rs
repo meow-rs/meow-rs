@@ -561,6 +561,14 @@ async fn resolve_addrs(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
         None => {}
     }
 
+    resolve_addrs_system(host, port).await
+}
+
+/// The system-resolver tail of [`resolve_addrs`]: warm single-flight cache,
+/// then `tokio::net::lookup_host` (OpenHarmony substitutes the bootstrap
+/// hook — libc's resolver sockets cannot be protected), then cache the
+/// answer. Never returns an empty `Vec`.
+async fn resolve_addrs_system(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
     if let Some(cached) = sys_cache_get(host, port) {
         return Ok(cached);
     }
@@ -599,6 +607,43 @@ async fn resolve_addrs(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
     }
     sys_cache_put(host, &addrs);
     Ok(addrs)
+}
+
+/// `resolve_addrs` for a caller-supplied [`HostResolver`] rather than the
+/// installed global hook — e.g. an adapter carrying its own injected
+/// resolver (the WireGuard endpoint lookup). The lookup runs under the same
+/// `IN_HOST_RESOLVER` scope `resolve_via_hook` applies to the global
+/// hook: an *unscoped* `resolve_all` would let a `#PROXY`-tagged nameserver
+/// inside the hook re-enter this very dial and deadlock on the resolver's
+/// single-flight map (see `in_host_resolver`). A re-entrant call answers
+/// from `resolve_all_local` — what the hook already holds — then falls back
+/// to the system resolver, matching `resolve_addrs`'s re-entry arm. Literal
+/// hosts short-circuit before any hook, also as `resolve_addrs` does.
+pub async fn resolve_host_all_via(
+    r: &dyn HostResolver,
+    host: &str,
+    port: u16,
+) -> io::Result<Vec<SocketAddr>> {
+    if let Some(ip) = crate::metadata_ip_literal(host) {
+        return Ok(vec![SocketAddr::new(ip, port)]);
+    }
+    if in_host_resolver() {
+        if let Some(ips) = r.resolve_all_local(host) {
+            if !ips.is_empty() {
+                return Ok(ips
+                    .into_iter()
+                    .map(|ip| SocketAddr::new(ip, port))
+                    .collect());
+            }
+        }
+        tracing::debug!(
+            host,
+            "resolve: re-entrant resolver call — using the system resolver for this \
+             hop to avoid a lookup cycle"
+        );
+        return resolve_addrs_system(host, port).await;
+    }
+    resolve_via_hook(r, host, port).await
 }
 
 /// Run one [`HostResolver`] lookup with [`IN_HOST_RESOLVER`] set, so a dial
@@ -1561,6 +1606,69 @@ mod tests {
             assert_eq!(addrs, vec![SocketAddr::from(([198, 51, 100, 4], 8388))]);
         }
         assert_eq!(r.count(), 2, "the guard must not leak across calls");
+
+        clear_host_resolver();
+    }
+
+    #[tokio::test]
+    async fn injected_resolver_lookup_is_scoped_outside_a_hook() {
+        let _g = LOCK.lock().await;
+        clear_host_resolver();
+        let r = FixedResolver::new(IpAddr::from([203, 0, 113, 9]));
+        let addrs = resolve_host_all_via(r.as_ref(), "wg.example", 51820)
+            .await
+            .expect("caller-supplied resolver answers");
+        assert_eq!(addrs, vec![SocketAddr::from(([203, 0, 113, 9], 51820))]);
+        assert_eq!(r.count(), 1);
+    }
+
+    /// An adapter resolving its endpoint *inside* a global-hook call —
+    /// e.g. the nameserver answering the query is `#PROXY`-tagged through
+    /// this very adapter — must hit the same re-entry fence as the
+    /// installed hook: answer from the system resolver, never call the
+    /// injected hook again (the real resolver's single-flight map would
+    /// deadlock the pair).
+    #[tokio::test]
+    async fn injected_resolver_inside_a_hook_scope_uses_the_system_resolver() {
+        let _g = LOCK.lock().await;
+        clear_host_resolver();
+
+        struct Outer {
+            inner: parking_lot::Mutex<Option<io::Result<Vec<SocketAddr>>>>,
+            via: Arc<FixedResolver>,
+        }
+        #[async_trait]
+        impl HostResolver for Outer {
+            async fn resolve(&self, host: &str) -> io::Result<IpAddr> {
+                self.resolve_all(host).await.map(|ips| ips[0])
+            }
+            async fn resolve_all(&self, _host: &str) -> io::Result<Vec<IpAddr>> {
+                *self.inner.lock() =
+                    Some(resolve_host_all_via(self.via.as_ref(), "localhost", 51820).await);
+                Ok(vec![IpAddr::from([203, 0, 113, 7])])
+            }
+        }
+
+        let injected = FixedResolver::new(IpAddr::from([203, 0, 113, 9]));
+        let outer = Arc::new(Outer {
+            inner: parking_lot::Mutex::new(None),
+            via: Arc::clone(&injected),
+        });
+        set_host_resolver(Arc::clone(&outer) as Arc<dyn HostResolver>);
+
+        resolve_host_all("proxy.example", 443).await.unwrap();
+
+        let inner = outer.inner.lock().take().expect("nested lookup ran");
+        let inner = inner.expect("system resolver answered the re-entrant lookup");
+        assert!(
+            inner.iter().all(|a| a.ip().is_loopback()),
+            "re-entrant injected lookup must use the system resolver, got {inner:?}"
+        );
+        assert_eq!(
+            injected.count(),
+            0,
+            "the re-entrant call must not reach the injected resolver"
+        );
 
         clear_host_resolver();
     }
