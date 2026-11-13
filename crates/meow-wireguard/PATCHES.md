@@ -369,7 +369,7 @@ Patch 18 — Shared session crypto + process-wide data-plane crypto pool
     `classify_incoming` per filled `rx_slot` → DATA slots move into
     `CryptoJob`s (the slot Vec itself travels — the worker opens it in
     place, so the zero-copy `Bytes` hand-off PATCH(17) built is
-    unchanged) → `CryptoPool::shared().run` → `handle_decrypted_data`
+    unchanged) → `CryptoPool::run_shared` → `handle_decrypted_data`
     per job in wire order. Non-DATA packets — handshake, cookie reply,
     drop — finish inline in arrival order, including the chained
     empty-datagram flush and the rate-limited desync kick.
