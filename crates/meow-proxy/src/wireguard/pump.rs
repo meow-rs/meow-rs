@@ -810,15 +810,18 @@ impl WgPump {
         for (handle, st) in &mut self.udp {
             let socket = self.sockets.get_mut::<udp::Socket>(*handle);
             let mut conn_gone = false;
-            loop {
+            // Same gate as the TCP drain above: once the backlog reaches
+            // UDP_WRITE_QUEUE the channel itself must be the stall point,
+            // or a socket wedged on `BufferFull` grows `out` without
+            // bound while the conn never sees backpressure.
+            while st.out.len() < UDP_WRITE_QUEUE {
                 match st.write_rx.try_recv() {
                     Ok(UdpIo::SendTo { data, addr }) => st.out.push_back((data, addr)),
-                    Ok(UdpIo::Close) => conn_gone = true,
-                    Err(mpsc::error::TryRecvError::Empty) => break,
-                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                    Ok(UdpIo::Close) | Err(mpsc::error::TryRecvError::Disconnected) => {
                         conn_gone = true;
                         break;
                     }
+                    Err(mpsc::error::TryRecvError::Empty) => break,
                 }
             }
             while socket.can_send() {
@@ -1353,6 +1356,70 @@ mod tests {
         let mut notified = std::pin::pin!(notify.notified());
         let mut cx = Context::from_waker(std::task::Waker::noop());
         assert!(matches!(notified.as_mut().poll(&mut cx), Poll::Ready(())));
+    }
+
+    /// The UDP conn→pump drain must stop pulling once `out` reaches
+    /// UDP_WRITE_QUEUE — the channel is the stall point, exactly like
+    /// the TCP gate. Without it a socket wedged on `BufferFull` moved
+    /// the bound into an unbounded VecDeque.
+    #[tokio::test(flavor = "current_thread")]
+    async fn udp_out_queue_bounded_on_send_stall() {
+        let client_secret = x25519::StaticSecret::from([0x99; 32]);
+        let server_public = x25519::PublicKey::from(&x25519::StaticSecret::from([0xaa; 32]));
+        let mut pump = pump_for_test(&test_config(&client_secret, &server_public));
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        pump.udp_bind(
+            Arc::new(vec!["0.0.0.0/0".parse().unwrap()]),
+            true,
+            false,
+            reply_tx,
+        );
+        let conn = reply_rx
+            .await
+            .expect("bind reply")
+            .expect("udp_bind succeeds");
+        let handle = *pump.udp.keys().next().expect("one udp flow");
+        let dst: SocketAddr = "10.9.9.9:53".parse().unwrap();
+
+        // Stall the socket: a full smoltcp tx buffer is what a congested
+        // egress leaves behind (`can_send()` = `!tx_buffer.is_full()`).
+        let socket = pump.sockets.get_mut::<udp::Socket>(handle);
+        let meta = udp::UdpMetadata {
+            endpoint: dst.into(),
+            local_address: pump.src_v4,
+            meta: Default::default(),
+        };
+        for _ in 0..UDP_SOCKET_PACKETS {
+            socket.send_slice(b"x", meta).expect("tx buffer has room");
+        }
+        assert!(!socket.can_send(), "tx buffer must be full for the stall");
+
+        // The backlog the stall piled up, plus ten datagrams still
+        // channel-side (capacity 128 — sends never block).
+        let st = pump.udp.get_mut(&handle).expect("udp state");
+        for _ in 0..UDP_WRITE_QUEUE {
+            st.out.push_back((Bytes::from_static(b"x"), dst));
+        }
+        for _ in 0..10 {
+            conn.write_packet(b"y", &dst)
+                .await
+                .expect("channel has room");
+        }
+
+        pump.service_sockets();
+
+        let st = &pump.udp[&handle];
+        assert_eq!(
+            st.out.len(),
+            UDP_WRITE_QUEUE,
+            "capped drain must not over-enqueue"
+        );
+        assert_eq!(
+            st.write_rx.len(),
+            10,
+            "overflow stays channel-side as backpressure"
+        );
     }
 
     #[tokio::test]
