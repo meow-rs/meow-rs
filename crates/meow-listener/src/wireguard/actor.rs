@@ -40,8 +40,8 @@ use bytes::{Buf, Bytes};
 use meow_common::{ConnType, Metadata, Network};
 use meow_tunnel::TunnelInner;
 use meow_wgstack::{
-    enlarge_recv_buffer, ChannelDevice, StreamEvent, TcpIo, WgStream, TCP_READ_QUEUE,
-    TCP_SOCKET_BUF, TCP_WRITE_QUEUE, WG_TIMER_INTERVAL, WIRE_DRAIN_BUDGET,
+    enlarge_recv_buffer, BatchEndpoint, ChannelDevice, StreamEvent, TcpIo, WgStream,
+    TCP_READ_QUEUE, TCP_SOCKET_BUF, TCP_WRITE_QUEUE, WG_TIMER_INTERVAL, WIRE_DRAIN_BUDGET,
 };
 use meow_wireguard::{TunnResult, DATA_OVERHEAD_SZ};
 use smoltcp::iface::{Config as IfaceConfig, Interface, SocketSet};
@@ -160,7 +160,10 @@ struct TcpView {
 
 pub(super) struct WgActor {
     name: String,
-    endpoint: tokio::net::UdpSocket,
+    /// The unconnected listen socket, wrapped for batched `sendmmsg`
+    /// I/O on Linux (a `try_send_to` loop elsewhere). Receive stays
+    /// per-datagram — the demux needs each packet's source.
+    endpoint: BatchEndpoint,
     bound_port: u16,
     table: PeerTable,
     device: ChannelDevice,
@@ -279,6 +282,7 @@ impl WgActor {
         let endpoint = tokio::net::UdpSocket::from_std(std_sock)?;
         enlarge_recv_buffer(&endpoint);
         let bound_port = endpoint.local_addr()?.port();
+        let endpoint = BatchEndpoint::unconnected(endpoint);
 
         // AnyIP needs a route resolving to an interface-owned address —
         // both the v4 and v6 defaults point at the interface's own IPs,
@@ -363,7 +367,16 @@ impl WgActor {
                 _ = self.shutdown_rx.recv() => break,
                 r = self.endpoint.recv_from(&mut self.recv_buf) => {
                     match r {
-                        Ok((n, src)) => self.demux_one(src, n),
+                        Ok((n, src)) => {
+                            self.demux_one(src, n);
+                            // Opportunistic batch drain: a burst usually
+                            // arrives together — squeeze what's already
+                            // queued through the demux before the next
+                            // service pass instead of paying one select
+                            // cycle per datagram. Same `try_recv_from`
+                            // loop `service()` opens with, same budget.
+                            self.drain_wire();
+                        }
                         Err(e) => {
                             // A persistent socket error would busy-spin
                             // the loop — back off before retrying (the
@@ -1364,23 +1377,55 @@ impl WgActor {
         self.outbox.push_back((addr, pkt));
     }
 
-    /// Nonblocking sends; a full socket defers the tail to the next
-    /// pass rather than stalling the loop. Sent and failed buffers
-    /// both go back to the scratch pool.
+    /// Nonblocking sends, a [`WIRE_DRAIN_BUDGET`]-bounded batch at a
+    /// time — one `sendmmsg` (a destination per `mmsghdr`, so roaming
+    /// peers keep per-packet addressing) on Linux, a `try_send_to`
+    /// loop elsewhere. A batch that stops short leaves the boundary
+    /// datagram at the head of `staged`: replaying it surfaces the
+    /// errno the mmsg call folded into the short count — `WouldBlock`
+    /// requeues the remainder verbatim (a full socket defers the tail
+    /// to the next pass), any other error logs and drops that one
+    /// datagram while the rest of the batch continues — the same
+    /// semantics as the per-packet loop. Sent and failed buffers both
+    /// go back to the scratch pool.
     fn flush_outbox(&mut self) {
-        while let Some((addr, pkt)) = self.outbox.pop_front() {
-            match self.endpoint.try_send_to(&pkt, addr) {
-                Ok(_) => self.return_scratch(pkt),
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    self.outbox.push_front((addr, pkt));
+        let mut staged: VecDeque<(SocketAddr, Vec<u8>)> =
+            VecDeque::with_capacity(WIRE_DRAIN_BUDGET);
+        while !self.outbox.is_empty() {
+            for _ in 0..self.outbox.len().min(WIRE_DRAIN_BUDGET) {
+                staged.push_back(self.outbox.pop_front().expect("bounded by len"));
+            }
+            loop {
+                // `refs` borrows `staged` — scoped inside the loop so
+                // the shared borrow ends before `staged` shrinks.
+                let refs: Vec<(SocketAddr, &[u8])> =
+                    staged.iter().map(|(a, p)| (*a, p.as_slice())).collect();
+                let sent = self.endpoint.send_batch_to(&refs);
+                for (_, pkt) in staged.drain(..sent) {
+                    self.return_scratch(pkt);
+                }
+                if staged.is_empty() {
                     break;
                 }
-                Err(e) => {
-                    debug!(
-                        "wireguard {}: endpoint send to {addr} failed: {e}",
-                        self.name
-                    );
-                    self.return_scratch(pkt);
+                let (addr, pkt) = staged.pop_front().expect("non-empty after partial batch");
+                match self.endpoint.try_send_to(&pkt, addr) {
+                    Ok(_) => self.return_scratch(pkt),
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        self.outbox.push_front((addr, pkt));
+                        // Requeue the rest of the batch ahead of
+                        // whatever the outbox already held.
+                        while let Some(tail) = staged.pop_back() {
+                            self.outbox.push_front(tail);
+                        }
+                        return;
+                    }
+                    Err(e) => {
+                        debug!(
+                            "wireguard {}: endpoint send to {addr} failed: {e}",
+                            self.name
+                        );
+                        self.return_scratch(pkt);
+                    }
                 }
             }
         }

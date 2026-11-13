@@ -22,8 +22,8 @@ use std::time::{Duration, Instant as StdInstant};
 use bytes::{Buf, Bytes};
 use meow_common::{MeowError, ProxyConn, ProxyPacketConn, Result};
 use meow_wgstack::{
-    ChannelDevice, StreamEvent, TcpIo, WgStream, TCP_READ_QUEUE, TCP_SOCKET_BUF, TCP_WRITE_QUEUE,
-    WG_TIMER_INTERVAL, WIRE_DRAIN_BUDGET,
+    BatchEndpoint, ChannelDevice, StreamEvent, TcpIo, WgStream, TCP_READ_QUEUE, TCP_SOCKET_BUF,
+    TCP_WRITE_QUEUE, WG_TIMER_INTERVAL, WIRE_DRAIN_BUDGET,
 };
 use meow_wireguard::{x25519, Tunn, TunnResult};
 use smoltcp::iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet};
@@ -177,7 +177,9 @@ struct WgPump {
     iface: Interface,
     device: ChannelDevice,
     sockets: SocketSet<'static>,
-    endpoint: tokio::net::UdpSocket,
+    /// The connected peer socket, wrapped for batched `sendmmsg`/
+    /// `recvmmsg` I/O on Linux (a `try_*` loop elsewhere).
+    endpoint: BatchEndpoint,
     endpoint_addr: SocketAddr,
     rx: mpsc::Receiver<ActorMsg>,
     /// Conn → pump work-available signal, shared by every stream and
@@ -201,6 +203,12 @@ struct WgPump {
     src_v4: Option<IpAddress>,
     src_v6: Option<IpAddress>,
     recv_buf: Vec<u8>,
+    /// The batch drain's receive slots: [`WIRE_DRAIN_BUDGET`] independent
+    /// `buf_size`-capacity `Vec`s, persistent across passes so a quiet
+    /// loop pays nothing. `recv_batch` advertises each slot's whole
+    /// capacity as the window and rewrites a filled slot's len to its
+    /// datagram — capacity, never len, is what carries over.
+    rx_slots: Vec<Vec<u8>>,
     /// Recycled dst buffers for `Tunn::{encapsulate,decapsulate,
     /// update_timers,...}` — replaces the single fixed `work` scratch:
     /// a produced wire datagram keeps its buffer for `outbox` instead
@@ -222,7 +230,7 @@ impl WgPump {
         rx: mpsc::Receiver<ActorMsg>,
     ) -> std::io::Result<Self> {
         std_sock.set_nonblocking(true)?;
-        let endpoint = tokio::net::UdpSocket::from_std(std_sock)?;
+        let endpoint = BatchEndpoint::connected(tokio::net::UdpSocket::from_std(std_sock)?);
 
         let tunn = Tunn::new(
             x25519::StaticSecret::from(config.private_key),
@@ -277,6 +285,9 @@ impl WgPump {
             src_v4: config.ip.map(Into::into),
             src_v6: config.ipv6.map(Into::into),
             recv_buf: vec![0u8; buf_size],
+            rx_slots: (0..WIRE_DRAIN_BUDGET)
+                .map(|_| Vec::with_capacity(buf_size))
+                .collect(),
             scratch_pool: VecDeque::new(),
             scratch_len: buf_size,
             udp_scratch: vec![0u8; inner_mtu],
@@ -323,13 +334,11 @@ impl WgPump {
     /// Feed one inbound datagram through `Tunn`, chaining the
     /// empty-datagram calls boringtun's contract requires to flush packets
     /// queued behind a handshake (`decapsulate` doc: repeat until the
-    /// result is not `WriteToNetwork`).
-    fn decapsulate_wire(&mut self, n: usize) {
-        // Move the buffer out of `self` so the loop body can take `&mut
-        // self` freely — same pattern as the scratch dst, restored
-        // below. Zero alloc, zero copy per inbound datagram.
-        let mut pkt_in = std::mem::take(&mut self.recv_buf);
-        debug_assert!(n <= pkt_in.len(), "n is a byte count read into this buffer");
+    /// result is not `WriteToNetwork`). The datagram arrives as a
+    /// caller-owned `&mut [u8]` already bounded to its wire length —
+    /// the buffer never borrows `self`, so the loop below can take
+    /// `&mut self` freely.
+    fn decapsulate_wire(&mut self, datagram: &mut [u8]) {
         // WG header bytes 1..4 are reserved-zero on the wire — but peers
         // like Cloudflare WARP stamp non-zero identifiers there, and
         // vendored boringtun's `parse_incoming_packet` checks type and
@@ -337,10 +346,10 @@ impl WgPump {
         // wholesale. Zero the field on receipt — don't-care semantics,
         // the same treatment mihomo applies for wireguard-go — rather
         // than patching the vendored parser.
-        if n >= 4 {
-            pkt_in[1..4].fill(0);
+        if datagram.len() >= 4 {
+            datagram[1..4].fill(0);
         }
-        let mut datagram: &[u8] = &pkt_in[..n];
+        let mut datagram: &[u8] = datagram;
         let mut dst = self.take_scratch();
         loop {
             match self.tunn.decapsulate(None, datagram, &mut dst) {
@@ -367,20 +376,21 @@ impl WgPump {
             }
         }
         self.return_scratch(dst);
-        self.recv_buf = pkt_in;
     }
 
+    /// One batch read into the persistent slots — a `recvmmsg` on
+    /// Linux, a `try_recv_buf` loop elsewhere — then `Tunn` over each
+    /// filled slot in wire order. The slots come out of `self` for the
+    /// pass because `decapsulate_wire` borrows a datagram mutably while
+    /// the method itself needs `&mut self`; independent `Vec`s mean a
+    /// slot the kernel skipped can't clobber a neighbour's packet.
     fn drain_wire(&mut self) {
-        for _ in 0..WIRE_DRAIN_BUDGET {
-            match self.endpoint.try_recv(&mut self.recv_buf) {
-                Ok(n) => self.decapsulate_wire(n),
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(e) => {
-                    warn!("wireguard {}: endpoint recv error: {e}", self.name);
-                    break;
-                }
-            }
+        let mut slots = std::mem::take(&mut self.rx_slots);
+        let n = self.endpoint.recv_batch(&mut slots, WIRE_DRAIN_BUDGET);
+        for slot in &mut slots[..n] {
+            self.decapsulate_wire(slot.as_mut_slice());
         }
+        self.rx_slots = slots;
     }
 
     /// Egress: `device.tx_queue` → `Tunn::encapsulate` → outbox. A queued
@@ -428,7 +438,7 @@ impl WgPump {
                 // `decapsulate_wire` runs for real datagrams. Skipping
                 // this drops every inner packet parked while the old
                 // session was rekeying.
-                self.decapsulate_wire(0);
+                self.decapsulate_wire(&mut []);
             }
             TunnResult::Err(e) => {
                 // `update_timers` reports `ConnectionExpired` once the
@@ -452,7 +462,7 @@ impl WgPump {
                         let len = b.len();
                         dst.truncate(len);
                         self.enqueue_wg(dst);
-                        self.decapsulate_wire(0);
+                        self.decapsulate_wire(&mut []);
                     }
                     TunnResult::Err(err) => {
                         warn!(
@@ -483,20 +493,52 @@ impl WgPump {
         }
     }
 
+    /// Nonblocking sends, a [`WIRE_DRAIN_BUDGET`]-bounded batch at a
+    /// time — one `sendmmsg` on Linux, a `try_send` loop elsewhere.
+    /// A batch that stops short leaves the boundary datagram at the
+    /// head of `staged`: replaying it with `try_send` is how the
+    /// `WouldBlock`/`errno` split the old per-packet loop had is
+    /// recovered (`sendmmsg` folds a post-partial error into the
+    /// returned count). `WouldBlock` requeues the remainder verbatim
+    /// and backs off; any other error logs and drops that one
+    /// datagram while the rest of the batch continues — the same
+    /// semantics as the per-packet loop.
     fn flush_outbox(&mut self) {
-        while let Some(pkt) = self.outbox.pop_front() {
-            match self.endpoint.try_send(&pkt) {
-                Ok(_) => self.return_scratch(pkt),
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    self.outbox.push_front(pkt);
+        let mut staged: VecDeque<Vec<u8>> = VecDeque::with_capacity(WIRE_DRAIN_BUDGET);
+        while !self.outbox.is_empty() {
+            for _ in 0..self.outbox.len().min(WIRE_DRAIN_BUDGET) {
+                staged.push_back(self.outbox.pop_front().expect("bounded by len"));
+            }
+            loop {
+                // `refs` borrows `staged` — scoped inside the loop so
+                // the shared borrow ends before `staged` shrinks.
+                let refs: Vec<&[u8]> = staged.iter().map(Vec::as_slice).collect();
+                let sent = self.endpoint.send_batch(&refs, self.endpoint_addr);
+                for pkt in staged.drain(..sent) {
+                    self.return_scratch(pkt);
+                }
+                if staged.is_empty() {
                     break;
                 }
-                Err(e) => {
-                    warn!(
-                        "wireguard {}: endpoint send to {} failed: {e}",
-                        self.name, self.endpoint_addr
-                    );
-                    self.return_scratch(pkt);
+                let pkt = staged.pop_front().expect("non-empty after partial batch");
+                match self.endpoint.try_send(&pkt) {
+                    Ok(_) => self.return_scratch(pkt),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        self.outbox.push_front(pkt);
+                        // Requeue the rest of the batch ahead of
+                        // whatever the outbox already held.
+                        while let Some(tail) = staged.pop_back() {
+                            self.outbox.push_front(tail);
+                        }
+                        return;
+                    }
+                    Err(e) => {
+                        warn!(
+                            "wireguard {}: endpoint send to {} failed: {e}",
+                            self.name, self.endpoint_addr
+                        );
+                        self.return_scratch(pkt);
+                    }
                 }
             }
         }
@@ -997,7 +1039,15 @@ impl WgPump {
                     Some(m) => self.handle_msg(m),
                 },
                 r = self.endpoint.recv(&mut self.recv_buf) => match r {
-                    Ok(n) => self.decapsulate_wire(n),
+                    Ok(n) => {
+                        // `decapsulate_wire` borrows the datagram buffer
+                        // mutably — take it out of `self` first, then
+                        // restore (the batch drain uses pooled slots
+                        // instead of this buffer).
+                        let mut pkt = std::mem::take(&mut self.recv_buf);
+                        self.decapsulate_wire(&mut pkt[..n]);
+                        self.recv_buf = pkt;
+                    }
                     Err(e) => {
                         warn!("wireguard {}: endpoint recv error: {e}", self.name);
                         // A dead socket must not spin the loop.
@@ -1346,7 +1396,11 @@ mod tests {
         };
 
         pump.recv_buf[..n].copy_from_slice(&buf[..n]);
-        pump.decapsulate_wire(n);
+        // `decapsulate_wire` borrows the datagram mutably — take it out
+        // of `self` like the select arm does, then restore.
+        let mut pkt = std::mem::take(&mut pump.recv_buf);
+        pump.decapsulate_wire(&mut pkt[..n]);
+        pump.recv_buf = pkt;
 
         // A valid initiation produces a HANDSHAKE_RESP (type 2) queued
         // for the wire. Without the scrub the parser rejects the
@@ -1354,8 +1408,7 @@ mod tests {
         assert_eq!(pump.outbox.len(), 1, "handshake response queued");
         assert_eq!(pump.outbox[0][0], 2, "response is a WG handshake response");
         // The taken recv_buf must be restored — an empty buffer left
-        // behind would make every later endpoint.recv/try_recv a 0-byte
-        // read.
+        // behind would make every later endpoint.recv a 0-byte read.
         assert!(!pump.recv_buf.is_empty(), "recv_buf restored after take");
     }
 
