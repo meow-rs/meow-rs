@@ -725,7 +725,14 @@ impl WgActor {
             .get(&(slot, dport))
             .map_or(0, |e| e.handles.len());
         while have < needed {
-            if self.listen_pool_handles.len() >= LISTEN_POOL_CAP && !self.evict_oldest_listener() {
+            // `protect` keeps the filling key out of the candidate set:
+            // evicting it would drop placeholders `have` still counts
+            // (the entry would resurface under `or_insert` with a single
+            // handle while the count kept climbing — returning true on
+            // fewer than `needed` sockets).
+            if self.listen_pool_handles.len() >= LISTEN_POOL_CAP
+                && !self.evict_oldest_listener((slot, dport))
+            {
                 // Errata E5: nothing Listen-state to evict — the new
                 // SYN is dropped, silently (it will still be fed;
                 // smoltcp may RST, which is the §4.2 pool-exhausted
@@ -762,16 +769,19 @@ impl WgActor {
 
     /// Evict the oldest pool entry still holding a `State::Listen`
     /// socket — the whole key goes, every placeholder it parked.
-    /// Returns false when no occupant qualifies — the E5 "no
-    /// evictable" case.
-    fn evict_oldest_listener(&mut self) -> bool {
+    /// `protect` exempts one key from candidacy: `ensure_listener_n`
+    /// passes the key it is filling, whose placeholders must survive
+    /// the very eviction that makes their room. Returns false when no
+    /// other occupant qualifies — the E5 "no evictable" case.
+    fn evict_oldest_listener(&mut self, protect: (usize, u16)) -> bool {
         let oldest = self
             .listen_pool
             .iter()
-            .filter(|(_, e)| {
-                e.handles
-                    .iter()
-                    .any(|&h| self.sockets.get::<tcp::Socket>(h).state() == tcp::State::Listen)
+            .filter(|(k, e)| {
+                **k != protect
+                    && e.handles
+                        .iter()
+                        .any(|&h| self.sockets.get::<tcp::Socket>(h).state() == tcp::State::Listen)
             })
             .min_by_key(|(_, e)| e.created)
             .map(|(k, _)| *k);
@@ -1591,13 +1601,60 @@ mod tests {
             }
         }
         assert!(
-            !actor.evict_oldest_listener(),
+            !actor.evict_oldest_listener((0, 65000)),
             "a fully-transitioned pool has no Listen socket to evict"
         );
         assert!(
             !actor.ensure_listener(0, 65000),
             "no evictable socket → the new dport's SYN is refused"
         );
+    }
+
+    /// Self-eviction regression: when the key being filled is itself the
+    /// oldest evictable occupant, the fill loop must not evict it out
+    /// from under `have` — the pre-fix loop dropped the entry, recreated
+    /// it via `or_insert` with a single handle, and still counted the
+    /// snapshot upward, returning true on fewer placeholders than
+    /// demanded. The fix exempts the filling key from candidacy, so the
+    /// demand is met against other victims (or refused, E5-style).
+    #[tokio::test]
+    async fn ensure_listener_n_never_evicts_its_own_key() {
+        let mut actor = test_actor();
+        // The filling key parks one placeholder first, then the rest of
+        // the pool fills behind newer entries.
+        assert!(actor.ensure_listener(0, 80));
+        for port in 1000..1000 + (LISTEN_POOL_CAP - 1) as u16 {
+            assert!(actor.ensure_listener(0, port), "dport {port} listens");
+        }
+        assert_eq!(actor.listen_pool_handles.len(), LISTEN_POOL_CAP);
+        // Pin (0, 80) as the unique LRU front — `Instant` resolution can
+        // tie entries created in one burst, and `min_by_key` breaks ties
+        // on HashMap order.
+        actor
+            .listen_pool
+            .get_mut(&(0, 80))
+            .expect("filling key parked")
+            .created = Instant::now() - Duration::from_secs(60);
+
+        assert!(
+            actor.ensure_listener_n(0, 80, 3),
+            "other occupants are evictable — the demand must be met"
+        );
+        let entry = actor
+            .listen_pool
+            .get(&(0, 80))
+            .expect("filling key survives its own fill");
+        assert_eq!(
+            entry.handles.len(),
+            3,
+            "every demanded placeholder really parked"
+        );
+        for &h in &entry.handles {
+            assert_eq!(
+                actor.sockets.get::<tcp::Socket>(h).state(),
+                tcp::State::Listen
+            );
+        }
     }
 
     /// M2 — `inner_udp_flow_dead_task_evict`: idle timing belongs to
