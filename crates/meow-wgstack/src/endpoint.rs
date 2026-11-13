@@ -218,7 +218,8 @@ impl BatchEndpoint {
             }
             // SAFETY: `fd` is a live nonblocking socket; `msgs`
             // describes `n` headers whose iovecs point at `pkts` data
-            // that outlives this call and whose names point at `sas`.
+            // that outlives this call (the kernel only reads through
+            // send iovecs) and whose names point at `sas`.
             let ret = unsafe {
                 libc::sendmmsg(
                     self.inner.as_raw_fd(),
@@ -247,6 +248,8 @@ impl BatchEndpoint {
     #[cfg(target_os = "linux")]
     fn recv_batch_mmsg(&self, bufs: &mut [Vec<u8>]) -> usize {
         use std::os::fd::AsRawFd;
+        let n = bufs.len().min(WIRE_DRAIN_BUDGET);
+        let bufs = &mut bufs[..n];
         if bufs.is_empty() {
             return 0;
         }
