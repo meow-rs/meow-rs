@@ -50,6 +50,12 @@ const WAKE_QUEUE: usize = 64;
 const UDP_SOCKET_PACKETS: usize = 64;
 const UDP_SOCKET_BYTES: usize = 65536;
 
+/// Retained crypto-scratch buffers. Demand is a handful of live dsts
+/// between `flush_outbox` passes, so the cap only bounds the memory a
+/// send-side burst leaves behind — past it the Vecs free, exactly what
+/// happened to them pre-pool.
+const SCRATCH_POOL_CAP: usize = 128;
+
 /// Read chunk handed to `socket.recv`. One 16 KiB item drains through a
 /// relay's bulk-tier 32 KiB ReadBuf in ~2 channel hops (or four 4 KiB
 /// hops before the bulk upgrade) instead of four times as many 4 KiB
@@ -186,16 +192,25 @@ struct WgPump {
     next_port: u16,
     /// WG datagrams to write to the endpoint socket; drained by `try_send`
     /// so a stuffed kernel buffer only ever delays, never wedges the actor.
+    /// Entries are the crypto dst buffers themselves — a `Tunn` call
+    /// writes straight into one, gets `truncate`d to the datagram, and
+    /// moves here with no copy; `flush_outbox` returns spent buffers to
+    /// `scratch_pool`.
     outbox: VecDeque<Vec<u8>>,
     reserved: Option<[u8; 3]>,
     /// Tunnel source addresses for `UdpMetadata.local_address`, per family.
     src_v4: Option<IpAddress>,
     src_v6: Option<IpAddress>,
     recv_buf: Vec<u8>,
-    /// Scratch for `Tunn::{encapsulate,decapsulate,update_timers,...}` —
-    /// kept outside `self` during calls so the `TunnResult`'s borrow of it
-    /// never fights the `&mut self` the enqueue paths need.
-    work: Vec<u8>,
+    /// Recycled dst buffers for `Tunn::{encapsulate,decapsulate,
+    /// update_timers,...}` — replaces the single fixed `work` scratch:
+    /// a produced wire datagram keeps its buffer for `outbox` instead
+    /// of being copied out of a shared one. Bounded by
+    /// [`SCRATCH_POOL_CAP`] (plus whatever the outbox holds in flight).
+    scratch_pool: VecDeque<Vec<u8>>,
+    /// The size a checked-out scratch is reset to — the old fixed
+    /// `work` buffer's size (wire MTU + headroom).
+    scratch_len: usize,
     udp_scratch: Vec<u8>,
     last_timer: StdInstant,
 }
@@ -264,25 +279,47 @@ impl WgPump {
             src_v4: config.ip.map(Into::into),
             src_v6: config.ipv6.map(Into::into),
             recv_buf: vec![0u8; buf_size],
-            work: vec![0u8; buf_size],
+            scratch_pool: VecDeque::new(),
+            scratch_len: buf_size,
             udp_scratch: vec![0u8; inner_mtu],
             last_timer: StdInstant::now(),
         })
+    }
+
+    /// A crypto dst buffer for the next `Tunn` call: a pooled one reset
+    /// to `scratch_len` zeroed bytes, or a fresh allocation when the
+    /// pool is empty. `Tunn` takes `&mut [u8]` and panics on undersize,
+    /// so *length* — not capacity — is the contract.
+    fn take_scratch(&mut self) -> Vec<u8> {
+        let mut buf = self.scratch_pool.pop_back().unwrap_or_default();
+        buf.clear();
+        buf.resize(self.scratch_len, 0);
+        buf
+    }
+
+    /// Return a spent buffer to the pool. Only full-size buffers are
+    /// kept — an undersized one would force a realloc at the next
+    /// checkout anyway. Anything past [`SCRATCH_POOL_CAP`] frees, the
+    /// same fate every outbox Vec had before pooling.
+    fn return_scratch(&mut self, buf: Vec<u8>) {
+        if buf.capacity() >= self.scratch_len && self.scratch_pool.len() < SCRATCH_POOL_CAP {
+            self.scratch_pool.push_back(buf);
+        }
     }
 
     /// Overwrite the reserved bytes of an outbound WG datagram (byte 0 is
     /// the message type; 1..4 are the reserved field Cloudflare WARP uses)
     /// and queue it for the endpoint socket. boringtun has no reserved-byte
     /// API — this is the post-encapsulation mutation the spec requires on
-    /// *every* `WriteToNetwork` output, handshake messages included.
-    fn enqueue_wg(&mut self, pkt: &[u8]) {
-        let mut v = pkt.to_vec();
+    /// *every* `WriteToNetwork` output, handshake messages included. The
+    /// datagram arrives as its own crypto dst buffer — moved, not copied.
+    fn enqueue_wg(&mut self, mut pkt: Vec<u8>) {
         if let Some(reserved) = self.reserved {
-            if v.len() >= 4 {
-                v[1..4].copy_from_slice(&reserved);
+            if pkt.len() >= 4 {
+                pkt[1..4].copy_from_slice(&reserved);
             }
         }
-        self.outbox.push_back(v);
+        self.outbox.push_back(pkt);
     }
 
     /// Feed one inbound datagram through `Tunn`, chaining the
@@ -291,8 +328,8 @@ impl WgPump {
     /// result is not `WriteToNetwork`).
     fn decapsulate_wire(&mut self, n: usize) {
         // Move the buffer out of `self` so the loop body can take `&mut
-        // self` freely — same pattern as `self.work`, restored below.
-        // Zero alloc, zero copy per inbound datagram.
+        // self` freely — same pattern as the scratch dst, restored
+        // below. Zero alloc, zero copy per inbound datagram.
         let mut pkt_in = std::mem::take(&mut self.recv_buf);
         debug_assert!(n <= pkt_in.len(), "n is a byte count read into this buffer");
         // WG header bytes 1..4 are reserved-zero on the wire — but peers
@@ -306,26 +343,32 @@ impl WgPump {
             pkt_in[1..4].fill(0);
         }
         let mut datagram: &[u8] = &pkt_in[..n];
-        let mut work = std::mem::take(&mut self.work);
+        let mut dst = self.take_scratch();
         loop {
-            match self.tunn.decapsulate(None, datagram, &mut work) {
+            match self.tunn.decapsulate(None, datagram, &mut dst) {
                 TunnResult::Done => break,
                 TunnResult::Err(e) => {
                     debug!("wireguard {}: decapsulate error: {e:?}", self.name);
                     break;
                 }
                 TunnResult::WriteToNetwork(b) => {
-                    self.enqueue_wg(b);
+                    // Every `WriteToNetwork` slice starts at dst[0], so
+                    // the produced datagram is exactly the truncated
+                    // buffer — moved into the outbox, not copied.
+                    let len = b.len();
+                    dst.truncate(len);
+                    self.enqueue_wg(dst);
                     // Chained call with an empty datagram flushes the queue.
+                    dst = self.take_scratch();
                     datagram = &[];
                 }
                 TunnResult::WriteToTunnelV4(b, _) | TunnResult::WriteToTunnelV6(b, _) => {
-                    self.device.rx_queue.push_back(b.to_vec());
+                    self.device.rx_queue.push_back(Bytes::copy_from_slice(b));
                     break;
                 }
             }
         }
-        self.work = work;
+        self.return_scratch(dst);
         self.recv_buf = pkt_in;
     }
 
@@ -346,37 +389,41 @@ impl WgPump {
     /// inner packet resurfaces here once the handshake completes. Each
     /// drained buffer goes back to `device.tx_pool` for reuse.
     fn drain_device_tx(&mut self) {
-        let mut work = std::mem::take(&mut self.work);
+        let mut dst = self.take_scratch();
         while let Some(pkt) = self.device.tx_queue.pop_front() {
             // `Tunn::encapsulate` *panics* on an undersized dst — guard
             // rather than trust the MTU accounting.
-            if pkt.len() + meow_wireguard::DATA_OVERHEAD_SZ > work.len() {
+            if pkt.len() + meow_wireguard::DATA_OVERHEAD_SZ > dst.len() {
                 warn!(
-                    "wireguard {}: dropping {}B inner packet (work buffer {}B)",
+                    "wireguard {}: dropping {}B inner packet (scratch buffer {}B)",
                     self.name,
                     pkt.len(),
-                    work.len()
+                    dst.len()
                 );
                 self.device.tx_pool.push_back(pkt);
                 continue;
             }
-            if let TunnResult::WriteToNetwork(b) = self.tunn.encapsulate(&pkt, &mut work) {
-                self.enqueue_wg(b);
+            if let TunnResult::WriteToNetwork(b) = self.tunn.encapsulate(&pkt, &mut dst) {
+                let len = b.len();
+                dst.truncate(len);
+                self.enqueue_wg(dst);
+                dst = self.take_scratch();
             }
             self.device.tx_pool.push_back(pkt);
         }
-        self.work = work;
+        self.return_scratch(dst);
     }
 
     /// boringtun's housekeeping — rekey, session expiry, persistent
     /// keepalive — all inside `update_timers` (spec §3.8's manual
     /// keepalive-deadline is subsumed by it).
     fn tick_timers(&mut self) {
-        let mut work = std::mem::take(&mut self.work);
-        match self.tunn.update_timers(&mut work) {
+        let mut dst = self.take_scratch();
+        match self.tunn.update_timers(&mut dst) {
             TunnResult::WriteToNetwork(b) => {
-                self.enqueue_wg(b);
-                self.work = work;
+                let len = b.len();
+                dst.truncate(len);
+                self.enqueue_wg(dst);
                 // boringtun's contract: packets queued behind the handshake
                 // a rekey just triggered flush via chained empty-datagram
                 // `decapsulate` calls — the same drain loop
@@ -402,10 +449,11 @@ impl WgPump {
                     "wireguard {}: session error {e:?}; forcing re-handshake",
                     self.name
                 );
-                match self.tunn.format_handshake_initiation(&mut work, true) {
+                match self.tunn.format_handshake_initiation(&mut dst, true) {
                     TunnResult::WriteToNetwork(b) => {
-                        self.enqueue_wg(b);
-                        self.work = work;
+                        let len = b.len();
+                        dst.truncate(len);
+                        self.enqueue_wg(dst);
                         self.decapsulate_wire(0);
                     }
                     TunnResult::Err(err) => {
@@ -413,31 +461,34 @@ impl WgPump {
                             "wireguard {}: forced re-handshake failed: {err:?}",
                             self.name
                         );
-                        self.work = work;
+                        self.return_scratch(dst);
                     }
-                    _ => self.work = work,
+                    _ => self.return_scratch(dst),
                 }
             }
-            _ => self.work = work,
+            _ => self.return_scratch(dst),
         }
     }
 
     /// Kick off the WireGuard handshake immediately so it overlaps the
     /// first dial instead of starting when the first SYN needs encrypting.
     fn kick_handshake(&mut self) {
-        let mut work = std::mem::take(&mut self.work);
+        let mut dst = self.take_scratch();
         if let TunnResult::WriteToNetwork(b) =
-            self.tunn.format_handshake_initiation(&mut work, false)
+            self.tunn.format_handshake_initiation(&mut dst, false)
         {
-            self.enqueue_wg(b);
+            let len = b.len();
+            dst.truncate(len);
+            self.enqueue_wg(dst);
+        } else {
+            self.return_scratch(dst);
         }
-        self.work = work;
     }
 
     fn flush_outbox(&mut self) {
         while let Some(pkt) = self.outbox.pop_front() {
             match self.endpoint.try_send(&pkt) {
-                Ok(_) => {}
+                Ok(_) => self.return_scratch(pkt),
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     self.outbox.push_front(pkt);
                     break;
@@ -447,6 +498,7 @@ impl WgPump {
                         "wireguard {}: endpoint send to {} failed: {e}",
                         self.name, self.endpoint_addr
                     );
+                    self.return_scratch(pkt);
                 }
             }
         }
@@ -1258,16 +1310,18 @@ mod tests {
 
         let mut server = Tunn::new(server_secret, client_public, None, None, 7, None);
         let mut buf = vec![0u8; 2048];
-        let mut datagram = match server.format_handshake_initiation(&mut buf, false) {
-            TunnResult::WriteToNetwork(b) => b.to_vec(),
+        let n = match server.format_handshake_initiation(&mut buf, false) {
+            // Cloudflare WARP's identifier — non-zero, stamped into the
+            // reserved field of every inbound header.
+            TunnResult::WriteToNetwork(b) => {
+                b[1..4].copy_from_slice(&[13, 53, 133]);
+                b.len()
+            }
             other => panic!("expected WriteToNetwork, got {other:?}"),
         };
-        // Cloudflare WARP's identifier — non-zero, stamped into the
-        // reserved field of every inbound header.
-        datagram[1..4].copy_from_slice(&[13, 53, 133]);
 
-        pump.recv_buf[..datagram.len()].copy_from_slice(&datagram);
-        pump.decapsulate_wire(datagram.len());
+        pump.recv_buf[..n].copy_from_slice(&buf[..n]);
+        pump.decapsulate_wire(n);
 
         // A valid initiation produces a HANDSHAKE_RESP (type 2) queued
         // for the wire. Without the scrub the parser rejects the

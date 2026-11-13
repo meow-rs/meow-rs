@@ -65,9 +65,10 @@ use crate::wireguard::WireGuardListener;
 /// already transitioned is a flow, not a pool member).
 const LISTEN_POOL_CAP: usize = 64;
 
-/// Bytes drained per `socket.recv` call — sized to a full inner-MTU TCP
-/// segment so `read_tx` items stay packet-shaped.
-const TCP_READ_CHUNK: usize = 4096;
+/// Bytes drained per `socket.recv` call — the pump's 16 KiB chunk: a
+/// full-burst segment drains in one item instead of four, so a hot flow
+/// costs a quarter of the `recv`/`try_send` rounds.
+const TCP_READ_CHUNK: usize = 16384;
 
 /// Idle `select!` sleep when smoltcp reports no `poll_delay` — the
 /// pump's own fallback (its comment in `sleep_duration` explains why
@@ -83,6 +84,12 @@ const INJECT_QUEUE: usize = 256;
 /// growing without limit: the same lossy-tail semantics UDP tolerates,
 /// bounded per §10.2's "no unbounded queue" posture.
 const OUTBOX_CAP: usize = 1024;
+
+/// Retained crypto-scratch buffers. Demand is a handful of live dsts
+/// between `flush_outbox` passes, so the cap only bounds the memory a
+/// send-side burst leaves behind — past it the Vecs free, exactly what
+/// happened to them pre-pool.
+const SCRATCH_POOL_CAP: usize = 128;
 
 /// Original-direction inner TCP tuple — `(client_ip, client_port,
 /// target_ip, target_port)` as the peer wrote it. Reply packets reverse
@@ -159,9 +166,15 @@ pub(super) struct WgActor {
     device: ChannelDevice,
     iface: Interface,
     sockets: SocketSet<'static>,
-    /// Reusable work buffers — `work` for tunn crypto (wire MTU sized),
-    /// `recv_buf`/`select_buf` for datagrams.
-    work: Vec<u8>,
+    /// Recycled dst buffers for the `Tunn` calls — replaces the single
+    /// fixed `work` scratch: a produced wire datagram keeps its buffer
+    /// for `outbox` (`truncate` + move, no copy) and `flush_outbox`
+    /// returns spent buffers here. Bounded by [`SCRATCH_POOL_CAP`]
+    /// (plus whatever the outbox holds in flight).
+    scratch_pool: VecDeque<Vec<u8>>,
+    /// The size a checked-out scratch is reset to (`mtu + 256`, the old
+    /// fixed `work` buffer's size).
+    scratch_len: usize,
     recv_buf: Vec<u8>,
     outbox: VecDeque<(SocketAddr, Vec<u8>)>,
 
@@ -296,7 +309,8 @@ impl WgActor {
             device,
             iface,
             sockets: SocketSet::new(vec![]),
-            work: vec![0u8; mtu + 256],
+            scratch_pool: VecDeque::new(),
+            scratch_len: mtu + 256,
             recv_buf: vec![0u8; mtu + 256],
             outbox: VecDeque::new(),
             tcp: HashMap::new(),
@@ -403,11 +417,17 @@ impl WgActor {
             // limiter's own ~1s debounce decides whether the window
             // actually rolled.
             self.table.reset_rate_limit();
-            let mut work = std::mem::take(&mut self.work);
-            for action in self.table.tick(&mut work) {
+            let mut dst = self.take_scratch();
+            let mut recharge = || {
+                let mut b = self.scratch_pool.pop_back().unwrap_or_default();
+                b.clear();
+                b.resize(self.scratch_len, 0);
+                b
+            };
+            for action in self.table.tick(&mut dst, &mut recharge) {
                 self.apply_action(action);
             }
-            self.work = work;
+            self.return_scratch(dst);
             for peer in self.table.peers_mut() {
                 if !peer.session_logged && peer.tunn.time_since_last_handshake().is_some() {
                     info!(
@@ -419,6 +439,28 @@ impl WgActor {
             }
         }
         self.flush_outbox();
+    }
+
+    /// A crypto dst buffer for the next `Tunn` call: a pooled one reset
+    /// to `scratch_len` zeroed bytes, or a fresh allocation when the
+    /// pool is empty. `Tunn` takes `&mut [u8]` and panics on undersize,
+    /// so *length* — not capacity — is the contract.
+    fn take_scratch(&mut self) -> Vec<u8> {
+        let mut buf = self.scratch_pool.pop_back().unwrap_or_default();
+        buf.clear();
+        buf.resize(self.scratch_len, 0);
+        buf
+    }
+
+    /// Return a spent buffer to the pool. Only full-size buffers are
+    /// kept — an undersized one (e.g. a demux-produced `to_vec`
+    /// datagram) would force a realloc at the next checkout anyway, so
+    /// it frees as it did pre-pool. Anything past [`SCRATCH_POOL_CAP`]
+    /// frees too.
+    fn return_scratch(&mut self, buf: Vec<u8>) {
+        if buf.capacity() >= self.scratch_len && self.scratch_pool.len() < SCRATCH_POOL_CAP {
+            self.scratch_pool.push_back(buf);
+        }
     }
 
     /// The next sleep bound — the pump's `sleep_duration` shape:
@@ -468,11 +510,23 @@ impl WgActor {
         if n >= 4 {
             pkt[1..4].fill(0);
         }
-        let mut work = std::mem::take(&mut self.work);
-        for action in self.table.process_datagram(src, &pkt[..n], &mut work) {
+        let mut dst = self.take_scratch();
+        // `recharge` refills `dst` from the pool each time a produced
+        // wire datagram consumes it — field-precise captures keep
+        // `self.table` (call) and `self` (apply_action) borrowable.
+        let mut recharge = || {
+            let mut b = self.scratch_pool.pop_back().unwrap_or_default();
+            b.clear();
+            b.resize(self.scratch_len, 0);
+            b
+        };
+        for action in self
+            .table
+            .process_datagram(src, &pkt[..n], &mut dst, &mut recharge)
+        {
             self.apply_action(action);
         }
-        self.work = work;
+        self.return_scratch(dst);
         self.recv_buf = pkt;
     }
 
@@ -489,8 +543,9 @@ impl WgActor {
     /// The inner-packet entry point: parse the L3/L4 headers and route
     /// to TCP (smoltcp) or UDP (flow table). Fragments drop — the inner
     /// MTU guarantee means a whole datagram always arrives; a fragment
-    /// signals a peer violating its own MTU.
-    fn handle_inner(&mut self, slot: usize, pkt: &[u8], v6: bool) {
+    /// signals a peer violating its own MTU. The packet arrives as
+    /// `Bytes` so the TCP path feeds `rx_queue` with a refcount clone.
+    fn handle_inner(&mut self, slot: usize, pkt: &Bytes, v6: bool) {
         let Some(view) = parse_inner(pkt, v6) else {
             trace!("wireguard {}: malformed/fragmented inner packet", self.name);
             return;
@@ -507,7 +562,7 @@ impl WgActor {
     /// retransmitted SYN demuxes to it directly, and anything else
     /// either hits a tuple or draws an RST we route back via
     /// `rst_hint`.
-    fn inner_tcp(&mut self, slot: usize, pkt: &[u8], view: &InnerView) {
+    fn inner_tcp(&mut self, slot: usize, pkt: &Bytes, view: &InnerView) {
         let Some(tcpv) = parse_tcp(view.l4) else {
             return;
         };
@@ -571,7 +626,7 @@ impl WgActor {
             // this hint to the peer that must encrypt it.
             self.rst_hint.insert(key, slot);
         }
-        self.device.rx_queue.push_back(pkt.to_vec());
+        self.device.rx_queue.push_back(pkt.clone());
     }
 
     /// Hand a UDP datagram's payload to its flow, creating the flow on
@@ -639,39 +694,41 @@ impl WgActor {
     /// A flow task's finished inner packet — encrypt under the owning
     /// peer's session and send to its endpoint.
     fn handle_inject(&mut self, slot: usize, pkt: &[u8]) {
-        let mut work = std::mem::take(&mut self.work);
-        if pkt.len() + DATA_OVERHEAD_SZ <= work.len() {
+        let mut dst = self.take_scratch();
+        if pkt.len() + DATA_OVERHEAD_SZ <= dst.len() {
             if let Some(peer) = self.table.peers_mut().get_mut(slot) {
-                if let TunnResult::WriteToNetwork(b) = peer.tunn.encapsulate(pkt, &mut work) {
+                if let TunnResult::WriteToNetwork(b) = peer.tunn.encapsulate(pkt, &mut dst) {
                     if let Some(addr) = peer.endpoint {
-                        let mut buf = b.to_vec();
-                        peer.stamp_reserved(&mut buf);
-                        self.enqueue_outbox(addr, buf);
+                        let len = b.len();
+                        dst.truncate(len);
+                        peer.stamp_reserved(&mut dst);
+                        self.enqueue_outbox(addr, dst);
+                        return;
                     }
                 }
             }
         } else {
-            // Unreachable while `work` is MTU-sized — `build_reply`
+            // Unreachable while `dst` is MTU-sized — `build_reply`
             // caps the inner packet at inner_mtu = mtu - 64, and
-            // `work` is mtu + 256, so headroom always covers the WG
+            // `dst` is mtu + 256, so headroom always covers the WG
             // overhead. The debug_assert pins that contract; the
             // drop+log stays as the spec §6 release-mode guard rather
             // than a silent oversize swallow.
             debug_assert!(
-                pkt.len() + DATA_OVERHEAD_SZ <= work.len(),
+                pkt.len() + DATA_OVERHEAD_SZ <= dst.len(),
                 "inject packet {}B + {DATA_OVERHEAD_SZ}B overhead exceeds \
-                 MTU-sized work buffer {}B",
+                 MTU-sized scratch buffer {}B",
                 pkt.len(),
-                work.len()
+                dst.len()
             );
             debug!(
-                "wireguard {}: dropping {}B inject packet (work {}B)",
+                "wireguard {}: dropping {}B inject packet (scratch {}B)",
                 self.name,
                 pkt.len(),
-                work.len()
+                dst.len()
             );
         }
-        self.work = work;
+        self.return_scratch(dst);
     }
 
     // ── listen pool + flow registration ──────────────────────────────
@@ -1226,19 +1283,19 @@ impl WgActor {
     /// the `rst_hint` its ingress recorded. Each drained buffer goes
     /// back to `device.tx_pool` for reuse.
     fn drain_device_tx(&mut self) {
-        let mut work = std::mem::take(&mut self.work);
+        let mut dst = self.take_scratch();
         while let Some(pkt) = self.device.tx_queue.pop_front() {
             let Some(slot) = self.route_tx_packet(&pkt) else {
                 trace!("wireguard {}: unroutable inner tx packet", self.name);
                 self.device.tx_pool.push_back(pkt);
                 continue;
             };
-            if pkt.len() + DATA_OVERHEAD_SZ > work.len() {
+            if pkt.len() + DATA_OVERHEAD_SZ > dst.len() {
                 warn!(
-                    "wireguard {}: dropping {}B inner tx packet (work {}B)",
+                    "wireguard {}: dropping {}B inner tx packet (scratch {}B)",
                     self.name,
                     pkt.len(),
-                    work.len()
+                    dst.len()
                 );
                 self.device.tx_pool.push_back(pkt);
                 continue;
@@ -1247,18 +1304,24 @@ impl WgActor {
                 self.device.tx_pool.push_back(pkt);
                 continue;
             };
-            if let TunnResult::WriteToNetwork(b) = peer.tunn.encapsulate(&pkt, &mut work) {
-                let Some(addr) = peer.endpoint else {
-                    self.device.tx_pool.push_back(pkt);
-                    continue;
-                };
-                let mut buf = b.to_vec();
-                peer.stamp_reserved(&mut buf);
-                self.enqueue_outbox(addr, buf);
+            if let TunnResult::WriteToNetwork(b) = peer.tunn.encapsulate(&pkt, &mut dst) {
+                match peer.endpoint {
+                    Some(addr) => {
+                        let len = b.len();
+                        dst.truncate(len);
+                        peer.stamp_reserved(&mut dst);
+                        self.enqueue_outbox(addr, dst);
+                        dst = self.take_scratch();
+                    }
+                    None => {
+                        self.device.tx_pool.push_back(pkt);
+                        continue;
+                    }
+                }
             }
             self.device.tx_pool.push_back(pkt);
         }
-        self.work = work;
+        self.return_scratch(dst);
         // RST hints only live for the poll that produced them — a stale
         // entry could misroute a same-tuple RST of a later packet.
         self.rst_hint.clear();
@@ -1285,9 +1348,12 @@ impl WgActor {
     /// Queue a wire datagram, bounded: past [`OUTBOX_CAP`] the oldest
     /// pending datagram is dropped (newest-wins lossy tail — a stale
     /// queued packet is worth less than the one that just arrived).
+    /// The evicted buffer still goes back to the scratch pool.
     fn enqueue_outbox(&mut self, addr: SocketAddr, pkt: Vec<u8>) {
         if self.outbox.len() >= OUTBOX_CAP {
-            self.outbox.pop_front();
+            if let Some((_, dropped)) = self.outbox.pop_front() {
+                self.return_scratch(dropped);
+            }
             trace!(
                 "wireguard {}: outbox full — dropped oldest datagram",
                 self.name
@@ -1297,11 +1363,12 @@ impl WgActor {
     }
 
     /// Nonblocking sends; a full socket defers the tail to the next
-    /// pass rather than stalling the loop.
+    /// pass rather than stalling the loop. Sent and failed buffers
+    /// both go back to the scratch pool.
     fn flush_outbox(&mut self) {
         while let Some((addr, pkt)) = self.outbox.pop_front() {
             match self.endpoint.try_send_to(&pkt, addr) {
-                Ok(_) => {}
+                Ok(_) => self.return_scratch(pkt),
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     self.outbox.push_front((addr, pkt));
                     break;
@@ -1311,6 +1378,7 @@ impl WgActor {
                         "wireguard {}: endpoint send to {addr} failed: {e}",
                         self.name
                     );
+                    self.return_scratch(pkt);
                 }
             }
         }
@@ -1533,7 +1601,7 @@ mod tests {
     /// a service pass, without wire framing.
     fn feed_tcp(actor: &mut WgActor, slot: usize, pkt: &[u8]) {
         let view = parse_inner(pkt, false).expect("test packet parses");
-        actor.inner_tcp(slot, pkt, &view);
+        actor.inner_tcp(slot, &Bytes::copy_from_slice(pkt), &view);
     }
 
     /// The poll half of a service pass: smoltcp consumes the rx queue,
@@ -1594,7 +1662,7 @@ mod tests {
                 40000 + i as u16,
                 port,
             );
-            actor.device.rx_queue.push_back(pkt);
+            actor.device.rx_queue.push_back(pkt.into());
         }
         let now = SmolInstant::now();
         actor.iface.poll(now, &mut actor.device, &mut actor.sockets);
@@ -2123,12 +2191,12 @@ mod tests {
         pkt[20..22].copy_from_slice(&1111u16.to_be_bytes());
         pkt[22..24].copy_from_slice(&53u16.to_be_bytes());
         pkt[24..26].copy_from_slice(&8u16.to_be_bytes());
-        actor.handle_inner(0, &pkt, false);
+        actor.handle_inner(0, &pkt.clone().into(), false);
         assert!(actor.udp_flows.is_empty(), "udp:false must not open a flow");
 
         // Same packet with udp:true opens the flow — polarity pin.
         actor.udp_enabled = true;
-        actor.handle_inner(0, &pkt, false);
+        actor.handle_inner(0, &pkt.into(), false);
         assert_eq!(actor.udp_flows.len(), 1, "udp:true opens the flow");
     }
 
@@ -2164,12 +2232,11 @@ mod tests {
         else {
             panic!("init formats");
         };
-        let mut datagram = init.to_vec();
         // WARP-style stamp over bytes 1..4 — the actor must erase it
         // before the demux's type/index check.
-        datagram[1..4].copy_from_slice(&[0xAA, 0xBB, 0xCC]);
-        let n = datagram.len();
-        actor.recv_buf[..n].copy_from_slice(&datagram);
+        init[1..4].copy_from_slice(&[0xAA, 0xBB, 0xCC]);
+        let n = init.len();
+        actor.recv_buf[..n].copy_from_slice(init);
         let src: SocketAddr = "127.0.0.1:51001".parse().unwrap();
         actor.demux_one(src, n);
         assert!(

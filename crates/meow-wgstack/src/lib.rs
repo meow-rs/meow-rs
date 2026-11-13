@@ -58,11 +58,13 @@ pub const WG_TIMER_INTERVAL: Duration = Duration::from_millis(250);
 /// A channel-backed smoltcp [`Device`]: packets `Tunn::decapsulate` yields
 /// are pushed into `rx_queue` for `Interface` ingress; everything
 /// `Interface` egresses lands in `tx_queue` for `Tunn::encapsulate`.
+/// `rx_queue` entries are [`Bytes`] (refcounted, `Deref<[u8]>`) so an
+/// owning producer can hand a packet over without a second copy.
 /// `tx_pool` recycles the egress buffers — the owner returns each drained
 /// `tx_queue` Vec to it instead of dropping it, so `SmolTxToken::consume`
 /// reuses the allocation rather than paying a `vec![]` per packet.
 pub struct ChannelDevice {
-    pub rx_queue: VecDeque<Vec<u8>>,
+    pub rx_queue: VecDeque<Bytes>,
     pub tx_queue: VecDeque<Vec<u8>>,
     pub tx_pool: VecDeque<Vec<u8>>,
     caps: DeviceCapabilities,
@@ -98,7 +100,7 @@ impl ChannelDevice {
 }
 
 pub struct SmolRxToken {
-    packet: Vec<u8>,
+    packet: Bytes,
 }
 
 impl RxToken for SmolRxToken {

@@ -37,6 +37,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
+use bytes::Bytes;
 use meow_wireguard::noise::handshake::parse_handshake_anon;
 use meow_wireguard::noise::rate_limiter::RateLimiter;
 use meow_wireguard::noise::{Packet, TunnResult};
@@ -64,12 +65,10 @@ pub(super) enum Action {
     /// A decrypted inner IP packet from peer `slot` whose ACL passed.
     /// `v6` selects the address family; the bytes start at the IP
     /// header. This is the single ACL enforcement point — every inner
-    /// packet the stack sees came through here.
-    Inner {
-        slot: usize,
-        v6: bool,
-        bytes: Vec<u8>,
-    },
+    /// packet the stack sees came through here. `Bytes` lets the actor
+    /// feed `device.rx_queue` with a refcount clone instead of a second
+    /// copy.
+    Inner { slot: usize, v6: bool, bytes: Bytes },
 }
 
 /// The multi-peer responder table: shared keys and limiter, the
@@ -200,11 +199,19 @@ impl PeerTable {
     /// actor zeroes its copy before handing it over — inbound reserved
     /// fields never reach the parser). Returns the actions the actor
     /// performs, in order.
+    ///
+    /// `dst` is the crypto scratch the `Tunn` calls write into. Every
+    /// `WriteToNetwork` result consumes it: [`enqueue_wire`] truncates
+    /// the Vec to the produced datagram and moves it into
+    /// `Action::ToWire` — no copy — then `recharge` refills `dst` for
+    /// the next call. The caller (the actor's pool, a test's `vec!`
+    /// producer) owns where recharged buffers come from.
     pub fn process_datagram(
         &mut self,
         src: SocketAddr,
         datagram: &[u8],
-        work: &mut [u8],
+        dst: &mut Vec<u8>,
+        recharge: &mut dyn FnMut() -> Vec<u8>,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         let mut cookie = [0u8; COOKIE_REPLY_SZ];
@@ -215,7 +222,9 @@ impl PeerTable {
             Ok(packet) => packet,
             Err(TunnResult::WriteToNetwork(reply)) => {
                 // Under load: a cookie reply for an initiator we haven't
-                // identified — send it back to `src` unstamped.
+                // identified — send it back to `src` unstamped. `reply`
+                // borrows the stack `cookie` array, not `dst`, so it
+                // copies.
                 actions.push(Action::ToWire {
                     addr: src,
                     bytes: reply.to_vec(),
@@ -254,63 +263,63 @@ impl PeerTable {
             },
         };
 
-        let result = self.peers[slot].tunn.handle_verified_packet(packet, work);
-        // `handle_result` consumes `result` (which borrows `work`), so
-        // the queued-packet flush — which needs `work` again — runs
-        // only after it returns and that borrow is dead. Roaming is
-        // decided *inside* `handle_result`, after the inner-packet ACL
-        // verdict it produces: an authenticated-but-ACL-rejected packet
-        // must not move the endpoint.
-        if self.handle_result(slot, src, result, &mut actions) {
-            while let TunnResult::WriteToNetwork(b) =
-                self.peers[slot].tunn.decapsulate(None, &[], work)
-            {
-                let addr = self.peers[slot].endpoint.unwrap_or(src);
-                self.enqueue_wire(&mut actions, slot, addr, b);
+        let result = self.peers[slot].tunn.handle_verified_packet(packet, dst);
+        match result {
+            TunnResult::WriteToNetwork(b) => {
+                let len = b.len();
+                self.enqueue_wire(&mut actions, slot, src, len, dst, recharge);
+                // boringtun's chained-empty-datagram contract: packets
+                // queued behind the handshake this result just answered
+                // flush through `decapsulate` until it stops producing.
+                while let TunnResult::WriteToNetwork(b) =
+                    self.peers[slot].tunn.decapsulate(None, &[], dst)
+                {
+                    let addr = self.peers[slot].endpoint.unwrap_or(src);
+                    let len = b.len();
+                    self.enqueue_wire(&mut actions, slot, addr, len, dst, recharge);
+                }
             }
+            // Roaming is decided *inside* `handle_result`, after the
+            // inner-packet ACL verdict it produces: an
+            // authenticated-but-ACL-rejected packet must not move the
+            // endpoint.
+            other => self.handle_result(slot, src, other, &mut actions),
         }
         actions
     }
 
-    /// Fold one `TunnResult` into actions: wire output is stamped and
-    /// queued, inner packets get their ACL check. Returns `true` when
-    /// the result was `WriteToNetwork` — the caller then runs the
-    /// boringtun chained-empty-datagram flush (the queued sends behind
-    /// a handshake reply) with the scratch buffer this call released.
+    /// Fold a non-`WriteToNetwork` `TunnResult` into actions: inner
+    /// packets get their ACL check (the roam gate doubles on it).
+    /// `WriteToNetwork` stays at the call site — moving the produced
+    /// datagram out of the scratch Vec can't go through a result that
+    /// still borrows that Vec.
     fn handle_result(
         &mut self,
         slot: usize,
         src: SocketAddr,
         result: TunnResult<'_>,
         actions: &mut Vec<Action>,
-    ) -> bool {
+    ) {
         match result {
-            TunnResult::WriteToNetwork(b) => {
-                self.enqueue_wire(actions, slot, src, b);
-                true
+            // Roam *only* on an ACL-admitted inner packet — an
+            // authenticated datagram whose inner src the ACL rejected
+            // proved nothing about where the peer lives, and a bare
+            // handshake or keepalive does not either (its reply already
+            // answered `src` directly). The endpoint is learned exactly
+            // when replies to inner packets start needing it.
+            TunnResult::WriteToTunnelV4(b, ip_src)
+                if self.handle_inner(slot, b, IpAddr::V4(ip_src), actions) =>
+            {
+                self.roam(slot, src);
             }
-            TunnResult::WriteToTunnelV4(b, ip_src) => {
-                // Roam *only* on an ACL-admitted inner packet — an
-                // authenticated datagram whose inner src the ACL
-                // rejected proved nothing about where the peer lives,
-                // and a bare handshake or keepalive does not either
-                // (its reply already answered `src` directly). The
-                // endpoint is learned exactly when replies to inner
-                // packets start needing it.
-                if self.handle_inner(slot, b, IpAddr::V4(ip_src), actions) {
-                    self.roam(slot, src);
-                }
-                false
+            TunnResult::WriteToTunnelV6(b, ip_src)
+                if self.handle_inner(slot, b, IpAddr::V6(ip_src), actions) =>
+            {
+                self.roam(slot, src);
             }
-            TunnResult::WriteToTunnelV6(b, ip_src) => {
-                if self.handle_inner(slot, b, IpAddr::V6(ip_src), actions) {
-                    self.roam(slot, src);
-                }
-                false
-            }
-            // Done carries nothing; Err is an auth/decrypt failure —
-            // both silent, neither roams.
-            TunnResult::Done | TunnResult::Err(_) => false,
+            // ACL-rejected packets fall here too — Done carries nothing;
+            // Err is an auth/decrypt failure — all silent, none roam.
+            _ => {}
         }
     }
 
@@ -331,11 +340,17 @@ impl PeerTable {
     /// housekeeping (session expiry teardown; a responder never
     /// re-initiates). Wire output goes to the peer's *learned*
     /// endpoint; a peer that has never sent an ACL-admitted inner
-    /// packet has none and its output is dropped.
-    pub fn tick(&mut self, work: &mut [u8]) -> Vec<Action> {
+    /// packet has none and its output is dropped. `dst`/`recharge` are
+    /// the [`process_datagram`] contract: every produced datagram
+    /// consumes and refills the scratch.
+    pub fn tick(
+        &mut self,
+        dst: &mut Vec<u8>,
+        recharge: &mut dyn FnMut() -> Vec<u8>,
+    ) -> Vec<Action> {
         let mut actions = Vec::new();
         for slot in 0..self.peers.len() {
-            let result = self.peers[slot].tunn.update_timers(work);
+            let result = self.peers[slot].tunn.update_timers(dst);
             match result {
                 TunnResult::WriteToNetwork(b) => {
                     let Some(addr) = self.peers[slot].endpoint else {
@@ -345,12 +360,14 @@ impl PeerTable {
                         );
                         continue;
                     };
-                    self.enqueue_wire(&mut actions, slot, addr, b);
+                    let len = b.len();
+                    self.enqueue_wire(&mut actions, slot, addr, len, dst, recharge);
                     while let TunnResult::WriteToNetwork(b) =
-                        self.peers[slot].tunn.decapsulate(None, &[], work)
+                        self.peers[slot].tunn.decapsulate(None, &[], dst)
                     {
                         let addr = self.peers[slot].endpoint.unwrap_or(addr);
-                        self.enqueue_wire(&mut actions, slot, addr, b);
+                        let len = b.len();
+                        self.enqueue_wire(&mut actions, slot, addr, len, dst, recharge);
                     }
                 }
                 TunnResult::Err(e) => {
@@ -386,7 +403,7 @@ impl PeerTable {
             actions.push(Action::Inner {
                 slot,
                 v6: src.is_ipv6(),
-                bytes: pkt.to_vec(),
+                bytes: Bytes::copy_from_slice(pkt),
             });
             true
         } else {
@@ -398,12 +415,24 @@ impl PeerTable {
         }
     }
 
-    /// Copy a wire datagram into the outbox with the peer's `reserved`
-    /// bytes stamped.
-    fn enqueue_wire(&self, actions: &mut Vec<Action>, slot: usize, addr: SocketAddr, bytes: &[u8]) {
-        let mut buf = bytes.to_vec();
-        self.peers[slot].stamp_reserved(&mut buf);
-        actions.push(Action::ToWire { addr, bytes: buf });
+    /// Move a produced wire datagram out of `dst` — truncate to `len`,
+    /// stamp the peer's `reserved` bytes, queue — then refill `dst`
+    /// from the caller's `recharge` hook so the next `Tunn` call still
+    /// has a full scratch. The datagram keeps its buffer end to end:
+    /// no copy.
+    fn enqueue_wire(
+        &self,
+        actions: &mut Vec<Action>,
+        slot: usize,
+        addr: SocketAddr,
+        len: usize,
+        dst: &mut Vec<u8>,
+        recharge: &mut dyn FnMut() -> Vec<u8>,
+    ) {
+        let mut out = std::mem::replace(dst, recharge());
+        out.truncate(len);
+        self.peers[slot].stamp_reserved(&mut out);
+        actions.push(Action::ToWire { addr, bytes: out });
     }
 }
 
@@ -504,13 +533,19 @@ mod tests {
         )
     }
 
+    /// Scratch recharge for tests: a fresh dst each time the demux
+    /// consumes one — pooling itself is the actor's concern.
+    fn fresh_scratch() -> Vec<u8> {
+        vec![0u8; 4096]
+    }
+
     /// Drive one handshake initiation client→table; returns the
     /// responder's datagrams destined for `src` (usually one response).
     fn send_init(
         client: &mut meow_wireguard::Tunn,
         table: &mut PeerTable,
         src: SocketAddr,
-        work: &mut [u8],
+        work: &mut Vec<u8>,
         force: bool,
     ) -> Vec<Action> {
         let init = {
@@ -521,7 +556,7 @@ mod tests {
             };
             b.to_vec()
         };
-        table.process_datagram(src, &init, work)
+        table.process_datagram(src, &init, work, &mut fresh_scratch)
     }
 
     /// Complete a handshake at `src`: init → response → client's
@@ -530,13 +565,18 @@ mod tests {
         client: &mut meow_wireguard::Tunn,
         table: &mut PeerTable,
         src: SocketAddr,
-        work: &mut [u8],
+        work: &mut Vec<u8>,
     ) {
         let actions = send_init(client, table, src, work, false);
         let [Action::ToWire { addr, bytes }] = &actions[..] else {
             panic!("init produced a single response, got {actions:?}");
         };
         assert_eq!(*addr, src);
+        assert_eq!(
+            bytes.capacity(),
+            work.capacity(),
+            "wire output keeps the stolen scratch buffer — a copy would be len-sized"
+        );
         // Client consumes the response → keepalive.
         let keepalive = {
             let meow_wireguard::TunnResult::WriteToNetwork(b) =
@@ -547,7 +587,7 @@ mod tests {
             b.to_vec()
         };
         // The keepalive establishes the responder's data path.
-        let _ = table.process_datagram(src, &keepalive, work);
+        let _ = table.process_datagram(src, &keepalive, work, &mut fresh_scratch);
     }
 
     /// A minimal IPv4 packet `src`→`dst` carrying `l4` — enough for the
@@ -592,7 +632,7 @@ mod tests {
         table: &mut PeerTable,
         src: SocketAddr,
         inner: &[u8],
-        work: &mut [u8],
+        work: &mut Vec<u8>,
     ) -> Vec<Action> {
         let datagram = {
             let meow_wireguard::TunnResult::WriteToNetwork(b) = client.encapsulate(inner, work)
@@ -601,7 +641,7 @@ mod tests {
             };
             b.to_vec()
         };
-        table.process_datagram(src, &datagram, work)
+        table.process_datagram(src, &datagram, work, &mut fresh_scratch)
     }
 
     fn inner_actions(actions: &[Action]) -> Vec<&Action> {
@@ -659,7 +699,7 @@ mod tests {
         // receiver_idx lives at bytes 4..8 LE; force slot = 9.
         forged[4..8].copy_from_slice(&(9u32 << 8).to_le_bytes());
         assert!(table
-            .process_datagram(ENDPOINT_A, &forged, &mut work)
+            .process_datagram(ENDPOINT_A, &forged, &mut work, &mut fresh_scratch)
             .is_empty());
     }
 
@@ -688,7 +728,7 @@ mod tests {
             };
             b.to_vec()
         };
-        let actions = table.process_datagram(ENDPOINT_B, &init, &mut work);
+        let actions = table.process_datagram(ENDPOINT_B, &init, &mut work, &mut fresh_scratch);
         assert!(
             actions.is_empty(),
             "unregistered key must drop, got {actions:?}"
@@ -720,7 +760,7 @@ mod tests {
         let n = init.len();
         init[n - 20] ^= 0xFF;
         assert!(table
-            .process_datagram(ENDPOINT_A, &init, &mut work)
+            .process_datagram(ENDPOINT_A, &init, &mut work, &mut fresh_scratch)
             .is_empty());
         assert!(table.peers()[0].endpoint.is_none());
     }
@@ -760,7 +800,7 @@ mod tests {
         synthetic_resp[0] = 2;
         synthetic_resp[4..8].copy_from_slice(&(9u32 << 8).to_le_bytes());
         assert!(table
-            .process_datagram(ENDPOINT_B, &synthetic_resp, &mut work)
+            .process_datagram(ENDPOINT_B, &synthetic_resp, &mut work, &mut fresh_scratch)
             .is_empty());
 
         // Same for a type-3 cookie reply with an out-of-namespace
@@ -769,12 +809,12 @@ mod tests {
         cookie[0] = 3;
         cookie[4..8].copy_from_slice(&(9u32 << 8).to_le_bytes());
         assert!(table
-            .process_datagram(ENDPOINT_B, &cookie, &mut work)
+            .process_datagram(ENDPOINT_B, &cookie, &mut work, &mut fresh_scratch)
             .is_empty());
         // The real response's receiver_idx decoded to the client's own
         // namespace — feeding it back must not disturb any peer (it
         // decodes to slot 1 via client index 1 and fails its checks).
-        let _ = table.process_datagram(ENDPOINT_B, resp, &mut work);
+        let _ = table.process_datagram(ENDPOINT_B, resp, &mut work, &mut fresh_scratch);
         assert_eq!(table.peers()[1].endpoint, None);
     }
 
@@ -849,12 +889,16 @@ mod tests {
         };
         let n = forged.len();
         forged[n - 1] ^= 0xFF;
-        assert!(table.process_datagram(src3, &forged, &mut work).is_empty());
+        assert!(table
+            .process_datagram(src3, &forged, &mut work, &mut fresh_scratch)
+            .is_empty());
         assert_eq!(table.peers()[0].endpoint, Some(ENDPOINT_B));
 
         // Forged: out-of-namespace receiver_idx — drops before the peer.
         forged[4..8].copy_from_slice(&(77u32 << 8).to_le_bytes());
-        assert!(table.process_datagram(src3, &forged, &mut work).is_empty());
+        assert!(table
+            .process_datagram(src3, &forged, &mut work, &mut fresh_scratch)
+            .is_empty());
         assert_eq!(table.peers()[0].endpoint, Some(ENDPOINT_B));
     }
 
@@ -1062,10 +1106,10 @@ mod tests {
         // check wholesale — the scrubbed copy must still work.
         init[1..4].copy_from_slice(&[0xAA, 0xBB, 0xCC]);
         assert!(table
-            .process_datagram(ENDPOINT_A, &init, &mut work)
+            .process_datagram(ENDPOINT_A, &init, &mut work, &mut fresh_scratch)
             .is_empty());
         init[1..4].fill(0); // actor-side scrub
-        let actions = table.process_datagram(ENDPOINT_A, &init, &mut work);
+        let actions = table.process_datagram(ENDPOINT_A, &init, &mut work, &mut fresh_scratch);
         assert!(matches!(&actions[..], [Action::ToWire { .. }]));
     }
 
