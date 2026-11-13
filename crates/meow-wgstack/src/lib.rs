@@ -537,6 +537,17 @@ pub fn enlarge_send_buffer(socket: &tokio::net::UdpSocket) {
     while size >= TCP_SOCKET_BUF && sock.set_send_buffer_size(size).is_err() {
         size /= 2;
     }
+    if size < TCP_SOCKET_BUF {
+        // The halving ladder exhausted without a single success — the
+        // socket keeps its platform default (9 KiB on macOS), which
+        // drops a `poll_burst` egress tail on ENOBUFS. Loud, not the
+        // quiet line a granted raise gets.
+        tracing::warn!(
+            "wireguard endpoint send buffer: SO_SNDBUF raise rejected at \
+             every size down to {TCP_SOCKET_BUF} — burst egress may lose \
+             tail datagrams to ENOBUFS"
+        );
+    }
     tracing::debug!(size = ?sock.send_buffer_size(), "wireguard endpoint send buffer");
 }
 
