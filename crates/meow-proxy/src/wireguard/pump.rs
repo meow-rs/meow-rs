@@ -25,7 +25,7 @@ use meow_wgstack::{
     BatchEndpoint, ChannelDevice, StreamEvent, TcpIo, WgStream, TCP_READ_QUEUE, TCP_SOCKET_BUF,
     TCP_WRITE_QUEUE, WG_TIMER_INTERVAL, WIRE_DRAIN_BUDGET,
 };
-use meow_wireguard::{x25519, Tunn, TunnResult};
+use meow_wireguard::{x25519, Tunn, TunnResult, WireGuardError};
 use smoltcp::iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet};
 use smoltcp::socket::{tcp, udp};
 use smoltcp::time::Instant as SmolInstant;
@@ -356,6 +356,41 @@ impl WgPump {
                 TunnResult::Done => break,
                 TunnResult::Err(e) => {
                     debug!("wireguard {}: decapsulate error: {e:?}", self.name);
+                    if matches!(
+                        e,
+                        WireGuardError::NoCurrentSession | WireGuardError::WrongIndex
+                    ) {
+                        // A data datagram addressed to a session index
+                        // this ring does not hold — or to a different
+                        // generation in its slot — proves the peer's
+                        // noise state diverged from ours: it is
+                        // encrypting replies under a session we cannot
+                        // read and will keep doing so until it sees a
+                        // newer session of ours (the responder's
+                        // `current` follows the newest session that
+                        // sent it a data packet). boringtun's own
+                        // recovery is the `want_handshake` ladder —
+                        // KEEPALIVE+REKEY_TIMEOUT (~15 s) of one-way
+                        // traffic before a re-initiation — and every
+                        // pending dial burns its deadline inside that
+                        // window. Kick the handshake at the first such
+                        // error instead. `force=false` self-limits: an
+                        // in-flight handshake turns this into a no-op,
+                        // so a flood of undecryptable datagrams costs
+                        // at most one initiation per response RTT.
+                        // `InvalidAeadTag`/`InvalidCounter` et al. stay
+                        // pure drops — they prove nothing about session
+                        // identity and a forged datagram must not buy a
+                        // handshake.
+                        if let TunnResult::WriteToNetwork(b) =
+                            self.tunn.format_handshake_initiation(&mut dst, false)
+                        {
+                            let len = b.len();
+                            dst.truncate(len);
+                            self.enqueue_wg(dst);
+                            dst = self.take_scratch();
+                        }
+                    }
                     break;
                 }
                 TunnResult::WriteToNetwork(b) => {
@@ -1463,6 +1498,159 @@ mod tests {
         // The taken recv_buf must be restored — an empty buffer left
         // behind would make every later endpoint.recv a 0-byte read.
         assert!(!pump.recv_buf.is_empty(), "recv_buf restored after take");
+    }
+
+    /// Drive one handshake between `pump.tunn` (initiator) and `server`
+    /// (responder) entirely through `decapsulate_wire`, so the outbox
+    /// ends holding the client's post-response keepalive — which this
+    /// helper drains back into `server` to complete the session on both
+    /// sides. Returns nothing; panics on any protocol deviation.
+    fn session_up(pump: &mut WgPump, server: &mut Tunn) {
+        let mut wire = vec![0u8; 2048];
+        let init = {
+            let TunnResult::WriteToNetwork(b) =
+                pump.tunn.format_handshake_initiation(&mut wire, false)
+            else {
+                panic!("initiator formats an initiation");
+            };
+            b.to_vec()
+        };
+        let resp = {
+            let TunnResult::WriteToNetwork(b) = server.decapsulate(None, &init, &mut wire) else {
+                panic!("responder answers the initiation");
+            };
+            b.to_vec()
+        };
+        let mut datagram = resp;
+        pump.decapsulate_wire(&mut datagram);
+        let keepalive = pump
+            .outbox
+            .pop_front()
+            .expect("response yields a keepalive");
+        let res = server.decapsulate(None, &keepalive, &mut wire);
+        assert!(
+            matches!(res, TunnResult::Done),
+            "responder consumes the keepalive, got {res:?}"
+        );
+    }
+
+    /// A data datagram addressed to a session this initiator never
+    /// completed — here, one the responder minted for a *second*
+    /// initiator instance sharing the static key, which flipped the
+    /// responder's `current` to the newest session — proves the noise
+    /// state has diverged: every reply keeps arriving under indices the
+    /// ring cannot map (`NoCurrentSession`/`WrongIndex`) until a newer
+    /// session of ours exists. boringtun's own recovery is the
+    /// KEEPALIVE+REKEY_TIMEOUT ladder — ~15 s of one-way traffic before
+    /// `want_handshake` fires, long past every pending dial's deadline.
+    /// The pump must instead kick a fresh handshake on the first such
+    /// error; `format_handshake_initiation(dst, false)` self-limits to
+    /// one initiation per in-flight handshake.
+    #[tokio::test(flavor = "current_thread")]
+    async fn desync_data_packet_kicks_handshake() {
+        let client_secret = x25519::StaticSecret::from([0x51; 32]);
+        let client_public = x25519::PublicKey::from(&client_secret);
+        let server_secret = x25519::StaticSecret::from([0x52; 32]);
+        let server_public = x25519::PublicKey::from(&server_secret);
+        let mut pump = pump_for_test(&test_config(&client_secret, &server_public));
+        let mut server = Tunn::new(server_secret, client_public, None, None, 0, None);
+        session_up(&mut pump, &mut server);
+        pump.outbox.clear();
+
+        // A same-key second initiator: its session indices live in a
+        // namespace the pump's ring never held, so data the responder
+        // sends under that session is undecryptable noise-state
+        // divergence — not a crypto failure.
+        let mut rogue = Tunn::new(client_secret, server_public, None, None, 9, None);
+        let mut wire = vec![0u8; 2048];
+        let rogue_init = {
+            let TunnResult::WriteToNetwork(b) = rogue.format_handshake_initiation(&mut wire, false)
+            else {
+                panic!("rogue formats an initiation");
+            };
+            b.to_vec()
+        };
+        let rogue_resp = {
+            let TunnResult::WriteToNetwork(b) = server.decapsulate(None, &rogue_init, &mut wire)
+            else {
+                panic!("responder answers the rogue initiation");
+            };
+            b.to_vec()
+        };
+        let rogue_keepalive = {
+            let TunnResult::WriteToNetwork(b) = rogue.decapsulate(None, &rogue_resp, &mut wire)
+            else {
+                panic!("rogue consumes the response");
+            };
+            b.to_vec()
+        };
+        // The responder's `current` flips to the newest session on the
+        // first data packet it decrypts from it — the same rule that
+        // makes an established peer roam.
+        let res = server.decapsulate(None, &rogue_keepalive, &mut wire);
+        assert!(matches!(res, TunnResult::Done), "got {res:?}");
+
+        // Replies now leave under the rogue session: a datagram the
+        // pump cannot decrypt because the index is not one it minted.
+        let desync = {
+            let TunnResult::WriteToNetwork(b) = server.encapsulate(&[], &mut wire) else {
+                panic!("responder encapsulates under the newest session");
+            };
+            b.to_vec()
+        };
+        let mut datagram = desync;
+        pump.decapsulate_wire(&mut datagram);
+
+        assert!(
+            pump.outbox.iter().any(|d| d.len() == 148 && d[0] == 1),
+            "a diverged-session datagram must kick a fresh handshake initiation"
+        );
+    }
+
+    /// The complement of the desync pin: ordinary crypto noise — here
+    /// a corrupted data datagram from the *current* session — must not
+    /// kick anything. Otherwise a spoofed garbage datagram could drive
+    /// endless initiations at the endpoint's rate.
+    #[tokio::test(flavor = "current_thread")]
+    async fn corrupt_data_packet_does_not_kick_handshake() {
+        let client_secret = x25519::StaticSecret::from([0x53; 32]);
+        let client_public = x25519::PublicKey::from(&client_secret);
+        let server_secret = x25519::StaticSecret::from([0x54; 32]);
+        let server_public = x25519::PublicKey::from(&server_secret);
+        let mut pump = pump_for_test(&test_config(&client_secret, &server_public));
+        let mut server = Tunn::new(server_secret, client_public, None, None, 0, None);
+        session_up(&mut pump, &mut server);
+
+        // One data packet pump→server flips the responder's `current`
+        // to the shared session, so its reply datagrams carry an index
+        // the pump does hold — corrupting a payload byte then exercises
+        // the AEAD-failure path, which is not divergence.
+        let probe = {
+            let mut wire = vec![0u8; 2048];
+            let TunnResult::WriteToNetwork(b) = pump.tunn.encapsulate(&[], &mut wire) else {
+                panic!("initiator encapsulates a keepalive");
+            };
+            b.to_vec()
+        };
+        let mut wire = vec![0u8; 2048];
+        let res = server.decapsulate(None, &probe, &mut wire);
+        assert!(matches!(res, TunnResult::Done), "got {res:?}");
+
+        let mut forged = {
+            let TunnResult::WriteToNetwork(b) = server.encapsulate(&[], &mut wire) else {
+                panic!("responder encapsulates under the current session");
+            };
+            b.to_vec()
+        };
+        let last = forged.len() - 1;
+        forged[last] ^= 0x5a;
+        pump.outbox.clear();
+        pump.decapsulate_wire(&mut forged);
+
+        assert!(
+            !pump.outbox.iter().any(|d| d.len() == 148 && d[0] == 1),
+            "an AEAD failure must not trigger a handshake"
+        );
     }
 
     /// smoltcp clears a socket's `tuple` the moment its terminal RST is
