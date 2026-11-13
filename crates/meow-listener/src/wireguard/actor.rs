@@ -392,6 +392,7 @@ impl WgActor {
             || !self.pending_syn.is_empty()
             || !self.in_flight_syns.is_empty()
             || !self.pending_close.is_empty()
+            || !self.dead_dying.is_empty()
         {
             self.post_poll();
         }
@@ -887,7 +888,14 @@ impl WgActor {
         // intervening `drain_device_tx`, so the tables can go now.
         for handle in std::mem::take(&mut self.dead_dying) {
             if let Some((_, key)) = self.tcp_dying.remove(&handle) {
-                self.tcp_by_tuple.remove(&key);
+                // Erase only the mapping this dead entry owned: the
+                // key may already point at a rebuilt same-tuple claim
+                // (smoltcp recycles handles, so an unconditional
+                // remove could take the new mapping down with the
+                // old).
+                if self.tcp_by_tuple.get(&key) == Some(&handle) {
+                    self.tcp_by_tuple.remove(&key);
+                }
             }
         }
         let pending = std::mem::take(&mut self.pending_close);
@@ -1778,6 +1786,84 @@ mod tests {
             "socket set stays bounded — {}",
             actor.sockets.iter().count()
         );
+    }
+
+    /// wgsrv-fix-1 §I-1 — a killed flow parks its tuple in `tcp_dying`
+    /// for one extra pass so the final RST still routes; the deferred
+    /// erase in `dead_dying` must then dirty the post-poll gate on its
+    /// own — a quiet pass that skips `post_poll` would strand the stale
+    /// tuple mapping (and its `tcp_dying` entry) forever, dropping
+    /// every same-tuple reconnect at the ownership check. The erase
+    /// itself is also scoped to the handle the dead entry owned, so a
+    /// rebuilt claim on the tuple can never be taken down with it.
+    #[tokio::test]
+    async fn dead_flow_tuple_rebuild_survives_deferred_erase() {
+        let mut actor = test_actor();
+        actor.max_connections = 4;
+        let client: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let target: Ipv4Addr = "203.0.113.9".parse().unwrap();
+        let key: InnerTuple = (client.into(), 44000, target.into(), 443);
+
+        // A live conn on the tuple.
+        let syn = syn_v4(client, target, 44000, 443);
+        feed_tcp(&mut actor, 0, &syn);
+        poll_once(&mut actor);
+        let h1 = actor.tcp_by_tuple[&key];
+
+        // Conn death: `service_tcp` moves it to `tcp_dying` +
+        // `pending_close`; the abort's RST emits on the next poll.
+        actor.sockets.get_mut::<tcp::Socket>(h1).abort();
+        actor.service_tcp();
+        assert!(!actor.tcp.contains_key(&h1));
+        assert!(actor.tcp_dying.contains_key(&h1));
+
+        // The reap pass buries the socket and defers the table erase
+        // one pass via `dead_dying`; drain the emitted RST here.
+        poll_once(&mut actor);
+        actor.drain_device_tx();
+        assert_eq!(actor.dead_dying, vec![h1]);
+        assert_eq!(actor.tcp_by_tuple.get(&key), Some(&h1));
+
+        // The quiet pass: nothing fed, nothing queued to emit — the
+        // deferred erase alone must still pull `post_poll` (the §I-1
+        // dirty-gate bug left these entries stranded forever).
+        assert!(actor.device.rx_queue.is_empty());
+        assert!(actor.device.tx_queue.is_empty());
+        actor.service();
+        assert!(
+            actor.dead_dying.is_empty() && actor.tcp_dying.is_empty(),
+            "deferred erase drains on a pass with no other dirty signal"
+        );
+        assert!(!actor.tcp_by_tuple.contains_key(&key));
+
+        // Same-tuple rebuild: a fresh SYN claims the tuple cleanly and
+        // the already-run erase can't reach the new mapping.
+        let syn2 = syn_v4(client, target, 44000, 443);
+        feed_tcp(&mut actor, 0, &syn2);
+        poll_once(&mut actor);
+        let h2 = actor.tcp_by_tuple[&key];
+        assert_eq!(actor.tcp[&h2].slot, 0);
+
+        // If a rebuilt claim ever lands while a deferred erase is
+        // still queued, the drain must skip it: the erase only removes
+        // a mapping that still points at the dead entry's own handle.
+        // (A fresh listener handle stands in for the dead flow's —
+        // socket handles are unique, so `hx` can't equal `h2`.)
+        assert!(actor.ensure_listener(0, 65000));
+        let hx = *actor
+            .listen_pool_handles
+            .iter()
+            .next()
+            .expect("the 65000 listener's handle");
+        actor.tcp_dying.insert(hx, (0, key));
+        actor.dead_dying.push(hx);
+        actor.reap_orphaned_sockets();
+        assert_eq!(
+            actor.tcp_by_tuple.get(&key),
+            Some(&h2),
+            "a queued erase must not take a rebuilt mapping down"
+        );
+        assert!(actor.tcp.contains_key(&h2));
     }
 
     /// F3 — the IPv4 `total_length` field bounds the L4 slice: bytes a
