@@ -224,8 +224,11 @@ Patch 16 — `wireguard-boring` feature: BoringSSL session AEAD + zero-alloc
   NEON assembly at ~1.6–2.4 GB/s, which ignores opt-level entirely.
   Files/flags:
   * Cargo.toml: optional `boring` dep + `wireguard-boring` feature
-    (activated by meow-proxy's `wireguard` feature; the crate still
-    builds and passes all tests without it).
+    (activated on both WireGuard edges — meow-proxy's `wireguard`
+    feature and meow-listener's `listener-wireguard` both forward it,
+    so the inbound responder's session data path gets the same
+    BoringSSL AEAD as the outbound; the crate still builds and passes
+    all tests without it).
   * crypto.rs: new `boring_ctx` module (`#[cfg(feature =
     "wireguard-boring")]`) wrapping `boring::aead::AeadCtx` as
     `SessionAead` — key schedule once at `Session::new`.
