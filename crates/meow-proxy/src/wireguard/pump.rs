@@ -2212,6 +2212,100 @@ mod tests {
         assert_eq!(returned.len(), n);
     }
 
+    /// PATCH(18): `drain_wire`'s parallel path end to end — a real
+    /// session (`session_up`), then a DATA burst over the real endpoint
+    /// socket. The first datagram rides `endpoint.recv` →
+    /// `decapsulate_wire` — the production select arm's shape, which
+    /// also arms the reactor readiness the fallback `try_recv_buf`
+    /// gates on — and the rest batch through `recv_batch` →
+    /// `classify_incoming` → the crypto pool → `handle_decrypted_data`.
+    /// Order is asserted off `rx_queue` (every decrypted inner lands in
+    /// wire order) and the consumed slots come back at full capacity.
+    #[tokio::test(flavor = "current_thread")]
+    async fn drain_wire_parallel_decrypts_in_wire_order() {
+        let client_secret = x25519::StaticSecret::from([0x91; 32]);
+        let client_public = x25519::PublicKey::from(&client_secret);
+        let server_secret = x25519::StaticSecret::from([0x92; 32]);
+        let server_public = x25519::PublicKey::from(&server_secret);
+
+        // A real socket pair: the pump's endpoint OS-connected to the
+        // responder's sender, so `recv_batch` only ever sees the one
+        // peer — exactly the connected-endpoint contract.
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind sender");
+        let sender_addr = sender.local_addr().expect("sender addr");
+        let pump_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind pump socket");
+        pump_std.connect(sender_addr).expect("connect pump socket");
+        let pump_addr = pump_std.local_addr().expect("pump addr");
+        let mut pump = pump_with_socket(
+            &test_config(&client_secret, &server_public),
+            pump_std,
+            sender_addr,
+        );
+        let mut server = Tunn::new(server_secret, client_public, None, None, 0, None);
+        session_up(&mut pump, &mut server);
+
+        // Eight DATA datagrams under consecutive counters — more than
+        // the pool's `n <= 2` inline cutoff, so the batch must run the
+        // worker arm for real. Each inner is the same 20-byte-header +
+        // 4-payload IPv4 shape the in-place test uses (the tunnel only
+        // inspects the version nibble, total length and source); the
+        // last payload byte marks wire order.
+        const N: usize = 8;
+        let mut wire = vec![0u8; 2048];
+        let mut inners = Vec::new();
+        for i in 0..N {
+            let inner = vec![
+                0x45, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 10, 0, 0,
+                2, 10, 0, 0, 1, 0xde, 0xad, 0xbe, i as u8,
+            ];
+            let datagram = {
+                let TunnResult::WriteToNetwork(b) = server.encapsulate(&inner, &mut wire) else {
+                    panic!("responder encapsulates the inner packet");
+                };
+                b.to_vec()
+            };
+            inners.push(inner);
+            sender.send_to(&datagram, pump_addr).expect("send data");
+        }
+
+        // The production receive arm: async `recv` for the datagram
+        // that woke the reactor (feeds `decapsulate_wire` serially and
+        // arms the `try_*` readiness), then `drain_wire` for the rest.
+        let n = pump
+            .endpoint
+            .recv(&mut pump.recv_buf)
+            .await
+            .expect("first datagram ready");
+        let pkt = std::mem::take(&mut pump.recv_buf);
+        pump.recv_buf = pump
+            .decapsulate_wire(pkt, n)
+            .unwrap_or_else(|| vec![0u8; pump.scratch_len]);
+        pump.drain_wire();
+
+        // Every decrypted inner reached smoltcp in wire order — the
+        // first through the serial arm, the rest through the pool pass.
+        assert_eq!(
+            pump.device.rx_queue.len(),
+            N,
+            "every DATA datagram produced an inner packet"
+        );
+        for (i, pkt) in pump.device.rx_queue.iter().enumerate() {
+            assert_eq!(
+                &pkt[..],
+                &inners[i][..],
+                "rx_queue order must match wire order"
+            );
+        }
+        // Consumed slots were re-armed at full capacity — the next
+        // batch's `recv_batch` still sees the whole window.
+        assert!(
+            pump.rx_slots
+                .iter()
+                .all(|s| s.capacity() == pump.scratch_len),
+            "every rx_slot returns at full capacity"
+        );
+    }
+
     /// A dial to a family the tunnel has no address for fails *inside*
     /// `dial_tcp` — before a port, socket or `connect` exists — so the
     /// caller gets a named error instead of the 25 s connect-limit burn

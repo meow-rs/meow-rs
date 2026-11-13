@@ -1227,14 +1227,23 @@ mod tests {
         let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
         let mut enc_dst = [0u8; 2048];
 
-        // A datagram sealed under the *current* session generation.
-        let inner = create_ipv4_udp_packet();
-        let TunnResult::WriteToNetwork(w) = my_tun.encapsulate(&inner, &mut enc_dst) else {
-            unreachable!();
-        };
-        let old_wire = w.to_vec();
-        let r_idx = u32::from_le_bytes(old_wire[4..8].try_into().unwrap());
-        let counter = u64::from_le_bytes(old_wire[8..16].try_into().unwrap());
+        // Three datagrams sealed under the *current* session
+        // generation — `n > 2` is what pushes each pool pass below onto
+        // real worker threads instead of the inline shortcut. Distinct
+        // last payload bytes keep the plaintexts checkable per job.
+        let base = create_ipv4_udp_packet();
+        let mut old_wires = Vec::new();
+        let mut inners = Vec::new();
+        for i in 0u8..3 {
+            let mut inner = base.clone();
+            *inner.last_mut().unwrap() = i;
+            let TunnResult::WriteToNetwork(w) = my_tun.encapsulate(&inner, &mut enc_dst) else {
+                unreachable!();
+            };
+            inners.push(inner);
+            old_wires.push(w.to_vec());
+        }
+        let r_idx = u32::from_le_bytes(old_wires[0][4..8].try_into().unwrap());
         let old_handle = their_tun
             .session_handle_for(r_idx)
             .expect("session established");
@@ -1258,40 +1267,57 @@ mod tests {
         drop(_clock);
 
         // The slot now holds a new generation — the same `r_idx` lookup
-        // returns crypto that rejects the old wire packet as
-        // `WrongIndex`.
-        let mut stale = vec![CryptoJob::new(
-            old_wire.clone(),
-            old_wire.len(),
-            r_idx,
-            counter,
-            their_tun.session_handle_for(r_idx),
-        )];
+        // returns crypto that rejects every old wire packet as
+        // `WrongIndex`, on the pool's parallel arm.
+        let mut stale: Vec<CryptoJob> = old_wires
+            .iter()
+            .map(|wire| {
+                CryptoJob::new(
+                    wire.clone(),
+                    wire.len(),
+                    r_idx,
+                    u64::from_le_bytes(wire[8..16].try_into().unwrap()),
+                    their_tun.session_handle_for(r_idx),
+                )
+            })
+            .collect();
         CryptoPool::new(4).run(&mut stale);
-        assert!(
-            matches!(stale[0].result, Some(Err(WireGuardError::WrongIndex))),
-            "post-rotation session must reject the old wire packet, got {:?}",
-            stale[0].result
-        );
+        assert_eq!(stale.len(), 3);
+        for (i, job) in stale.iter().enumerate() {
+            assert!(
+                matches!(job.result, Some(Err(WireGuardError::WrongIndex))),
+                "post-rotation session must reject old wire packet {i}, got {:?}",
+                job.result
+            );
+        }
 
         // But the captured handle IS the old session's crypto — the
         // `Arc` keeps it alive past ring eviction, and it still opens
-        // its own datagram.
-        let mut jobs = vec![CryptoJob::new(
-            old_wire.clone(),
-            old_wire.len(),
-            r_idx,
-            counter,
-            Some(old_handle),
-        )];
+        // every datagram the stale lookup rejected (distinct counters,
+        // so the shared replay window admits all three).
+        let mut jobs: Vec<CryptoJob> = old_wires
+            .iter()
+            .map(|wire| {
+                CryptoJob::new(
+                    wire.clone(),
+                    wire.len(),
+                    r_idx,
+                    u64::from_le_bytes(wire[8..16].try_into().unwrap()),
+                    Some(old_handle.clone()),
+                )
+            })
+            .collect();
         CryptoPool::new(4).run(&mut jobs);
-        let pt_len = match jobs[0].result {
-            Some(Ok(len)) => len,
-            ref other => panic!("old handle must still decrypt: {other:?}"),
-        };
-        assert_eq!(
-            &jobs[0].buf[DATA_PAYLOAD_OFF..DATA_PAYLOAD_OFF + pt_len],
-            &inner[..]
-        );
+        assert_eq!(jobs.len(), 3);
+        for (i, job) in jobs.iter().enumerate() {
+            let pt_len = match job.result {
+                Some(Ok(len)) => len,
+                ref other => panic!("old handle must still decrypt job {i}: {other:?}"),
+            };
+            assert_eq!(
+                &job.buf[DATA_PAYLOAD_OFF..DATA_PAYLOAD_OFF + pt_len],
+                &inners[i][..]
+            );
+        }
     }
 }
