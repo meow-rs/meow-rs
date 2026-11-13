@@ -524,12 +524,14 @@ impl WgPump {
                 match self.endpoint.try_send(&pkt) {
                     Ok(_) => self.return_scratch(pkt),
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        self.outbox.push_front(pkt);
                         // Requeue the rest of the batch ahead of
-                        // whatever the outbox already held.
+                        // whatever the outbox already held, then the
+                        // boundary datagram itself — it must stay
+                        // ahead of its successors.
                         while let Some(tail) = staged.pop_back() {
                             self.outbox.push_front(tail);
                         }
+                        self.outbox.push_front(pkt);
                         return;
                     }
                     Err(e) => {

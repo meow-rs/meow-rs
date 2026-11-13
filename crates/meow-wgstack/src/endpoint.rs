@@ -24,7 +24,6 @@ use std::net::SocketAddr;
 /// bound, so a single `sendmmsg`/`recvmmsg` covers a whole staged
 /// batch. `pkts`/`bufs` longer than this are chunked (or clamped for
 /// receive) inside the call.
-#[cfg(target_os = "linux")]
 use crate::WIRE_DRAIN_BUDGET;
 
 /// A `tokio::net::UdpSocket` plus batch-syscall wrappers. `connected`
@@ -121,10 +120,10 @@ impl BatchEndpoint {
     /// reported because the pump's socket only ever receives from the
     /// bound peer.
     pub fn recv_batch(&self, bufs: &mut [Vec<u8>], budget: usize) -> usize {
-        let n = bufs.len().min(budget);
+        let n = bufs.len().min(budget).min(WIRE_DRAIN_BUDGET);
         #[cfg(target_os = "linux")]
         {
-            self.recv_batch_mmsg(&mut bufs[..n.min(WIRE_DRAIN_BUDGET)])
+            self.recv_batch_mmsg(&mut bufs[..n])
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -135,7 +134,12 @@ impl BatchEndpoint {
                 buf.clear();
                 match self.inner.try_recv_buf(buf) {
                     Ok(_) => got += 1,
-                    Err(_) => break,
+                    Err(e) => {
+                        if e.kind() != io::ErrorKind::WouldBlock {
+                            tracing::debug!("wireguard endpoint recv_batch error: {e}");
+                        }
+                        break;
+                    }
                 }
             }
             got
@@ -272,6 +276,12 @@ impl BatchEndpoint {
             )
         };
         if ret <= 0 {
+            if ret < 0 {
+                let e = io::Error::last_os_error();
+                if e.kind() != io::ErrorKind::WouldBlock {
+                    tracing::debug!("wireguard endpoint recvmmsg error: {e}");
+                }
+            }
             return 0;
         }
         let got = ret as usize;

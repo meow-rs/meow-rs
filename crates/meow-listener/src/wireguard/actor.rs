@@ -1411,12 +1411,14 @@ impl WgActor {
                 match self.endpoint.try_send_to(&pkt, addr) {
                     Ok(_) => self.return_scratch(pkt),
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        self.outbox.push_front((addr, pkt));
                         // Requeue the rest of the batch ahead of
-                        // whatever the outbox already held.
+                        // whatever the outbox already held, then the
+                        // boundary datagram itself — it must stay
+                        // ahead of its successors.
                         while let Some(tail) = staged.pop_back() {
                             self.outbox.push_front(tail);
                         }
+                        self.outbox.push_front((addr, pkt));
                         return;
                     }
                     Err(e) => {
