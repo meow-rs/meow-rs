@@ -282,6 +282,18 @@ listeners:
   `receiver_idx >> 8` dispatches responses/cookies/data in O(1), so
   peers stay cryptographically isolated.
 
+**Memory budget.** Inner TCP socket buffers come from `meow-wgstack`'s
+`TCP_SOCKET_BUF` — 1 MiB per direction per connection, chosen because
+the rx half doubles as the advertised TCP window: per-flow throughput
+caps at `buf / RTT`, so 1 MiB lifts a ~140 ms-RTT peer from ~0.5 MB/s
+(at 64 KiB) to ~7.5 MB/s. The trade is 2 MiB eagerly allocated per
+inner conn (~2.2 MiB with its channel-queue share), so a deployment's
+budget is roughly conns × ~2.2 MiB + ≤128 MiB of listen-pool
+placeholders (64 × the same 2 MiB) + outbox/scratch slack — ~700 MiB
+at the default `max-connections: 256`. The cap is the lever: set it
+against the host's memory envelope, not just the conn target. The
+outbound node's own dials pay the same 2 MiB apiece.
+
 The listener's UDP socket binds eagerly at startup (`port: 0` resolves
 to the real port before the actor spawns — `GET /listeners` shows it).
 Config validation rejects bad/short keys, empty `peers`, empty

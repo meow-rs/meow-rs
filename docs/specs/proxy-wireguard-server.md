@@ -144,12 +144,18 @@ bounded: wire drain budget, per-flow TCP read/write queues, UDP payload
 queue (drop-on-full), and the flow→actor inject queue (drop-on-full —
 a UDP reply never stalls the loop).
 
-Sizing note: the smoltcp socket buffers are `TCP_SOCKET_BUF` (256 KiB)
-per direction per connection — ~0.7 MiB committed per active inner TCP
-conn once channel queues fill, plus ≤32 MiB of eager listen-pool
-buffers at the 64-entry cap. That ceiling is the price of the pump's
-full-window throughput constants applied to a multi-conn inbound;
-`max_connections` (default 256) bounds the total commit at ~180 MiB.
+Sizing note: the smoltcp socket buffers are `TCP_SOCKET_BUF` (1 MiB)
+per direction per connection — 2 MiB eagerly committed per inner TCP
+conn, ~2.2 MiB once its channel queues carry their share, the price
+of the pump's full-window throughput constants applied to a
+multi-conn inbound. The lazy listen pool prices placeholders the
+same: ≤64 × 2 MiB ≈ 128 MiB of eager buffers at the cap (a socket
+that transitions to a flow counts under the conn side, not the pool).
+`max_connections` (default 256) bounds the flow side of the commit,
+so the deployment's memory budget is roughly conns × ~2.2 MiB + ≤128
+MiB of listen-pool headroom + outbox/scratch slack — ~700 MiB at the
+default cap. High-concurrency deployments should set
+`max_connections` from that budget, not from the conn count alone.
 
 ## Tests
 
