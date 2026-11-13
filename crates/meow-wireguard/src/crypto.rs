@@ -416,6 +416,17 @@ mod tests {
             aead.open(nonce, b"aad", &mut dst3, &rc_sealed).unwrap(),
             pt.as_slice()
         );
+
+        // Reverse leg: the BoringSSL seal is byte-identical to the
+        // RustCrypto seal on the same key/nonce/aad/plaintext — and
+        // therefore opens under `aead_chacha20_open_inner` too.
+        assert_eq!(
+            ct_and_tag, rc_sealed,
+            "boring and RustCrypto seals must produce identical bytes"
+        );
+        let mut dst4 = vec![0u8; pt.len()];
+        aead_chacha20_open_inner(&mut dst4, &key, nonce, &ct_and_tag, b"aad").unwrap();
+        assert_eq!(dst4, pt.as_slice());
     }
 
     #[test]
