@@ -24,9 +24,14 @@ bytes = { workspace = true }
 tracing = { workspace = true }
 socket2 = { workspace = true }
 
-# `force_recv_buffer` (SO_RCVBUFFORCE inside `enlarge_recv_buffer`).
+# `force_recv_buffer` (SO_RCVBUFFORCE inside `enlarge_recv_buffer`) and
+# the `sendmmsg`/`recvmmsg` batch calls in `endpoint.rs`.
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+# `endpoint.rs` batch tests drive loopback `tokio::net::UdpSocket`s.
+tokio = { version = "1", features = ["macros", "rt", "net"] }
 
 [lints]
 workspace = true

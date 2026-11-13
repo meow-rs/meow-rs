@@ -5,8 +5,9 @@
 //! Everything here is direction-agnostic: a channel-backed smoltcp
 //! [`Device`] the owning actor drives, the per-conn [`WgStream`]
 //! AsyncRead/AsyncWrite shim with its backpressure machinery, the queue
-//! and buffer constants both sides must agree on, and the endpoint
-//! `SO_RCVBUF` enlarger. The boringtun `Tunn` is deliberately *not* here —
+//! and buffer constants both sides must agree on, the endpoint
+//! `SO_RCVBUF` enlarger, and the [`BatchEndpoint`] batch-syscall
+//! socket wrapper. The boringtun `Tunn` is deliberately *not* here —
 //! each actor owns its own session(s).
 
 use std::collections::VecDeque;
@@ -22,6 +23,9 @@ use smoltcp::phy::{Checksum, Device, DeviceCapabilities, Medium, RxToken, TxToke
 use smoltcp::time::Instant as SmolInstant;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
+
+mod endpoint;
+pub use endpoint::BatchEndpoint;
 
 /// actor→conn stream events per TCP flow (≈32 × 16 KiB ≈ 512 KiB of read
 /// backpressure per flow — deeper than the smoltcp socket window so the
