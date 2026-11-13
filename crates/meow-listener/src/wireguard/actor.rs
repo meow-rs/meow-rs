@@ -559,6 +559,19 @@ impl WgActor {
     /// DATA packet's `Inner`, and each sink — the wire socket and the
     /// smoltcp feed — still sees its own inputs in order (the pump's
     /// drain_wire carries the same contract).
+    ///
+    /// Two bounded divergences inside a batch remain, both confined to
+    /// ordering-sensitive state: (a) a DATA packet's `timer_tick`/
+    /// `set_current_session` lands in Phase C, *after* a same-batch
+    /// non-DATA packet's output — the `want_keepalive`/`want_handshake`
+    /// liveness pair's last writer can differ (the numeric timestamps a
+    /// tick writes are order-free), and one flushed queued packet may
+    /// seal under the pre-batch `current` session; (b)
+    /// `finish_verified`'s chained flush resolves the peer's `endpoint`
+    /// in Phase A, before Phase C's `admit_data` can roam it — a batch
+    /// that both roams a peer and triggers its flush can send that
+    /// flush to the previous address; the roam still lands and the
+    /// next batch's output already uses it.
     fn drain_wire(&mut self) {
         let mut slots = std::mem::take(&mut self.rx_slots);
         let mut jobs: Vec<CryptoJob> = Vec::new();

@@ -563,6 +563,18 @@ impl WgPump {
     /// session generation (`session_timers[new] >= [cur]`), so a
     /// mid-batch re-handshake can never be regressed by a stale
     /// packet's bookkeeping.
+    ///
+    /// "Reordered" is not "indistinguishable": one bounded divergence
+    /// remains inside a batch. A DATA packet's `timer_tick`/
+    /// `set_current_session` lands in Phase C, *after* a same-batch
+    /// non-DATA packet's output — so where the serial drain leaves the
+    /// non-DATA's `TimeLastPacketSent` tick last (`want_handshake`
+    /// set), this drain leaves the DATA `TimeLastPacketReceived` last
+    /// (`want_keepalive`): a last-writer-wins difference confined to
+    /// the liveness arm, since every numeric timestamp a tick writes is
+    /// order-free. The same deferral can seal one flushed queued packet
+    /// under the pre-batch `current` session — still a live session,
+    /// and the generation guard above still forbids a regression.
     fn drain_wire(&mut self) {
         let mut slots = std::mem::take(&mut self.rx_slots);
         let n = self.endpoint.recv_batch(&mut slots, WIRE_DRAIN_BUDGET);
