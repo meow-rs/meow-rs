@@ -14,7 +14,8 @@
 //!    pump's `service_sockets` shape, minus dial-pending, plus the
 //!    Established→route-task handoff).
 //! 3. `iface.poll` — smoltcp consumes the rx queue (SYNs accept,
-//!    segments deliver, emits go to `device.tx_queue`).
+//!    segments deliver, emits go to `device.tx_queue`), burst-looped
+//!    via [`poll_burst`] since one poll egresses ≤1 segment/socket.
 //! 4. `post_poll` — sweep listen-pool entries whose socket left
 //!    `State::Listen` (errata E5: only `Listen` sockets are pool
 //!    occupants) and register fresh flow sockets, resolving each
@@ -40,8 +41,9 @@ use bytes::{Buf, Bytes};
 use meow_common::{ConnType, Metadata, Network};
 use meow_tunnel::TunnelInner;
 use meow_wgstack::{
-    enlarge_recv_buffer, BatchEndpoint, ChannelDevice, StreamEvent, TcpIo, WgStream,
-    TCP_READ_QUEUE, TCP_SOCKET_BUF, TCP_WRITE_QUEUE, WG_TIMER_INTERVAL, WIRE_DRAIN_BUDGET,
+    enlarge_recv_buffer, enlarge_send_buffer, poll_burst, BatchEndpoint, ChannelDevice,
+    StreamEvent, TcpIo, WgStream, TCP_READ_QUEUE, TCP_SOCKET_BUF, TCP_WRITE_QUEUE,
+    WG_TIMER_INTERVAL, WIRE_DRAIN_BUDGET,
 };
 use meow_wireguard::{TunnResult, DATA_OVERHEAD_SZ};
 use smoltcp::iface::{Config as IfaceConfig, Interface, SocketSet};
@@ -124,23 +126,11 @@ struct TcpFlow {
     read_rx: Option<mpsc::Receiver<StreamEvent>>,
     write_tx: Option<mpsc::Sender<TcpIo>>,
     write_rx: mpsc::Receiver<TcpIo>,
-    drain_notify: Arc<tokio::sync::Notify>,
     out: VecDeque<TcpIo>,
     pending_read: VecDeque<StreamEvent>,
     eof_sent: bool,
     graceful_close: bool,
     spawned: bool,
-}
-
-impl Drop for TcpFlow {
-    /// A `WgStream` parked on a full write channel waits on
-    /// `drain_notify` — dropping the flow without waking it would pin
-    /// the route task forever (the channel-close wake in
-    /// `WgStream::poll_write_wait` is the second safety net). Fire all
-    /// waiters so the writer's next `try_send` sees `Closed` and exits.
-    fn drop(&mut self) {
-        self.drain_notify.notify_waiters();
-    }
 }
 
 /// Parsed inner-packet view used by the demux→stack bridge.
@@ -281,6 +271,10 @@ impl WgActor {
 
         let endpoint = tokio::net::UdpSocket::from_std(std_sock)?;
         enlarge_recv_buffer(&endpoint);
+        // Symmetric: a `poll_burst` egress hands the kernel a ~64-
+        // datagram batch in one shot — the platform default `SO_SNDBUF`
+        // (9 KiB on macOS) drops the tail of every burst on ENOBUFS.
+        enlarge_send_buffer(&endpoint);
         let bound_port = endpoint.local_addr()?.port();
         let endpoint = BatchEndpoint::unconnected(endpoint);
 
@@ -415,7 +409,11 @@ impl WgActor {
         // out of nothing (timer-driven deaths of owned flows are
         // already caught by `service_tcp`'s own iteration).
         let had_rx = !self.device.rx_queue.is_empty();
-        self.iface.poll(now, &mut self.device, &mut self.sockets);
+        // Burst, not a single poll: smoltcp egresses at most one TCP
+        // segment per socket per `poll`, so one call per pass capped a
+        // bulk flow at ~1 segment per inner-RTT wake (~285 KB/s
+        // measured). `poll_burst` loops until the stack goes quiet.
+        poll_burst(&mut self.iface, now, &mut self.device, &mut self.sockets);
         if had_rx
             || !self.device.tx_queue.is_empty()
             || !self.pending_syn.is_empty()
@@ -816,6 +814,12 @@ impl WgActor {
                 tcp::SocketBuffer::new(vec![0; TCP_SOCKET_BUF]),
                 tcp::SocketBuffer::new(vec![0; TCP_SOCKET_BUF]),
             );
+            // TCP_NODELAY — the placeholder is itself the socket a SYN
+            // transitions into a conn (smoltcp listeners have no accept
+            // queue to swap identities), so the flag carries onto the
+            // accepted flow. A proxy stream wants latency over tinygram
+            // batching; the pump's `dial_tcp` sets the same.
+            socket.set_nagle_enabled(false);
             if socket
                 .listen(IpListenEndpoint {
                     addr: None,
@@ -1052,7 +1056,6 @@ impl WgActor {
                 read_rx: Some(read_rx),
                 write_tx: Some(write_tx),
                 write_rx,
-                drain_notify: Arc::new(tokio::sync::Notify::new()),
                 out: VecDeque::new(),
                 pending_read: VecDeque::new(),
                 eof_sent: false,
@@ -1087,9 +1090,10 @@ impl WgActor {
                     rx: read_rx,
                     tx: write_tx,
                     wake: Arc::clone(&wake),
-                    drain_notify: Arc::clone(&st.drain_notify),
                     pending_read: None,
                     pending_write: None,
+                    write_reserve: None,
+                    write_permit: None,
                     read_eof: false,
                     write_done: false,
                 };
@@ -1128,9 +1132,7 @@ impl WgActor {
                 st.out.push_back(TcpIo::Close);
             }
 
-            // Ordered writes into the socket (pump semantics: only
-            // re-arm drain_notify when this pass did write work).
-            let had_out = !st.out.is_empty();
+            // Ordered writes into the socket.
             while let Some(front) = st.out.front_mut() {
                 match front {
                     TcpIo::Data(b) => {
@@ -1161,9 +1163,6 @@ impl WgActor {
                         st.out.pop_front();
                     }
                 }
-            }
-            if had_out {
-                st.drain_notify.notify_one();
             }
 
             // socket→conn reads.
@@ -1284,7 +1283,7 @@ impl WgActor {
     fn remove_tcp_flow(&mut self, handle: smoltcp::iface::SocketHandle) {
         if let Some(st) = self.tcp.remove(&handle) {
             self.tcp_dying.insert(handle, (st.slot, st.key));
-            drop(st); // Drop fires drain_notify for parked writers.
+            drop(st); // Dropping `write_rx` closes the writer's channel.
             self.pending_close.push(handle);
         } else if self.sockets.iter().any(|(h, _)| h == handle) {
             self.sockets.remove(handle);
@@ -1654,12 +1653,16 @@ mod tests {
         actor.inner_tcp(slot, &Bytes::copy_from_slice(pkt), &view);
     }
 
-    /// The poll half of a service pass: smoltcp consumes the rx queue,
-    /// then post_poll does registration/cleanup.
+    /// The poll half of a service pass: smoltcp consumes the rx queue
+    /// (burst-polled, the same way `service` drives it), then post_poll
+    /// does registration/cleanup.
     fn poll_once(actor: &mut WgActor) {
-        actor
-            .iface
-            .poll(SmolInstant::now(), &mut actor.device, &mut actor.sockets);
+        poll_burst(
+            &mut actor.iface,
+            SmolInstant::now(),
+            &mut actor.device,
+            &mut actor.sockets,
+        );
         actor.post_poll();
     }
 
@@ -2072,6 +2075,83 @@ mod tests {
         // A total_length shorter than the header itself is malformed.
         pkt[2..4].copy_from_slice(&16u16.to_be_bytes());
         assert!(parse_inner(&pkt, false).is_none());
+    }
+
+    /// mac-perf regression (T1) — one service pass must emit more than a
+    /// single TCP segment per flow: smoltcp's `Interface::poll` egresses
+    /// at most one segment per socket per call, so the old single-poll
+    /// pass capped a bulk flow at ~1 segment per inner-RTT wake (~285
+    /// KB/s measured on a real peer). The pass now polls to
+    /// `PollResult::None` under `POLL_BURST`, so a queued multi-segment
+    /// write lands in `tx_queue` as one burst. The count is asserted
+    /// mid-service — `drain_device_tx` always empties `tx_queue`, so
+    /// between the poll and the drain is the only place it is visible.
+    #[tokio::test]
+    async fn service_pass_egresses_a_segment_burst() {
+        let mut actor = test_actor();
+        let client: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let target: Ipv4Addr = "203.0.113.9".parse().unwrap();
+        let key: InnerTuple = (client.into(), 40000, target.into(), 443);
+
+        // SYN → SYN-ACK: learn the accepted socket's ISN off the wire
+        // (it is chosen from the interface's random seed).
+        feed_tcp(&mut actor, 0, &syn_v4(client, target, 40000, 443));
+        poll_once(&mut actor);
+        let handle = actor.tcp_by_tuple[&key];
+        let syn_ack = actor
+            .device
+            .tx_queue
+            .back()
+            .expect("the accept emitted a SYN-ACK");
+        let server_isn = u32::from_be_bytes(syn_ack[24..28].try_into().unwrap());
+
+        // The listener placeholder carries TCP_NODELAY onto the
+        // accepted socket — same object, no accept queue — the
+        // server-side twin of the pump's dial-time `set_nagle_enabled`.
+        assert!(
+            !actor.sockets.get::<tcp::Socket>(handle).nagle_enabled(),
+            "accepted flow must inherit the listener's TCP_NODELAY"
+        );
+
+        // The handshake ACK (client's SYN was seq 100) → Established.
+        let ack = seg_v4(
+            client,
+            target,
+            40000,
+            443,
+            101,
+            server_isn.wrapping_add(1),
+            0x10,
+        );
+        feed_tcp(&mut actor, 0, &ack);
+        poll_once(&mut actor);
+        assert_eq!(
+            actor.sockets.get::<tcp::Socket>(handle).state(),
+            tcp::State::Established
+        );
+        actor.device.tx_queue.clear(); // count data segments only
+
+        // 32 KiB ≈ 61 segments at the 536-octet DEFAULT_MSS the
+        // optionless test SYN negotiates — far past one segment and
+        // inside the peer's 65535-octet window.
+        actor
+            .tcp
+            .get_mut(&handle)
+            .expect("flow registered")
+            .out
+            .push_back(TcpIo::Data(Bytes::from(vec![0xAB; 32 * 1024])));
+        actor.service_tcp(); // the conn→socket drain fills the tx buffer
+        poll_burst(
+            &mut actor.iface,
+            SmolInstant::now(),
+            &mut actor.device,
+            &mut actor.sockets,
+        );
+        assert!(
+            actor.device.tx_queue.len() >= 10,
+            "one pass must burst a multi-segment write, got {}",
+            actor.device.tx_queue.len()
+        );
     }
 
     /// wgsrv-fix-1 §I-3 — a same-batch burst of same-dport SYNs each

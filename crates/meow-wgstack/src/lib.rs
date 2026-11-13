@@ -19,10 +19,11 @@ use std::time::Duration;
 
 use bytes::{Buf, Bytes};
 use meow_common::ProxyConn;
+use smoltcp::iface::{Interface, PollResult, SocketSet};
 use smoltcp::phy::{Checksum, Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::time::Instant as SmolInstant;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::{self, error::SendError, OwnedPermit};
 
 mod endpoint;
 pub use endpoint::BatchEndpoint;
@@ -52,6 +53,13 @@ pub const TCP_SOCKET_BUF: usize = 256 * 1024;
 /// Endpoint→Tunn drain bound per loop iteration; excess waits for the next
 /// wake-up rather than starving the rest of the service pass.
 pub const WIRE_DRAIN_BUDGET: usize = 64;
+
+/// Bound on [`Interface::poll`] iterations per service pass — see
+/// [`poll_burst`]. A permanently-progressing pass (a saturated bulk flow
+/// emits a segment every poll) must not livelock the owning actor out of
+/// its drain/flush halves; a capped burst simply resumes next pass —
+/// `poll_delay` reports `Now` while segments remain queued.
+pub const POLL_BURST: usize = 64;
 
 /// boringtun's own device loop ticks its timers at 250 ms (rekey timeout is
 /// 5 s, jitter ≤ 333 ms — this is well inside slack). Spec §3.4 sketched
@@ -181,6 +189,29 @@ impl Device for ChannelDevice {
     }
 }
 
+/// Drive `Interface::poll` until it reports no progress or [`POLL_BURST`]
+/// iterations have run. smoltcp 0.12's socket egress dispatches at most
+/// one TCP segment per socket per `poll` call, so a single poll per
+/// service pass caps a bulk flow at ~1 segment per inner-RTT wake — the
+/// WG listener measured ~285 KB/s that way. `SocketStateChanged` is the
+/// only progress signal the interface reports (a packet ingressed *or*
+/// egressed); `None` means every socket went quiet — send window full,
+/// Nagle-held tail, timers idle — so the loop breaks there. The whole
+/// burst shares one timestamp: it is one logical service pass.
+pub fn poll_burst(
+    iface: &mut Interface,
+    now: SmolInstant,
+    device: &mut ChannelDevice,
+    sockets: &mut SocketSet<'_>,
+) {
+    for _ in 0..POLL_BURST {
+        match iface.poll(now, device, sockets) {
+            PollResult::SocketStateChanged => {}
+            PollResult::None => break,
+        }
+    }
+}
+
 /// conn→actor TCP items.
 #[derive(Debug)]
 pub enum TcpIo {
@@ -201,6 +232,12 @@ pub enum StreamEvent {
     Closed,
 }
 
+/// Boxed `Sender::reserve_owned` future — the storable capacity wait
+/// whose in-semaphore waker survives `Pending` polls (see
+/// [`WgStream::write_reserve`]).
+type ReserveFut =
+    Pin<Box<dyn Future<Output = Result<OwnedPermit<TcpIo>, SendError<()>>> + Send + Sync>>;
+
 /// Async stream shim for a smoltcp TCP socket. Writes go to the owning
 /// actor on a per-conn channel (disconnect = conn dropped = abort); reads
 /// arrive as ordered [`StreamEvent`]s.
@@ -214,13 +251,17 @@ pub struct WgStream {
     /// promptly on its next select — while N nudges collapse to one
     /// instead of queuing N unit items.
     pub wake: Arc<tokio::sync::Notify>,
-    /// Actor → conn write-capacity wake-up (the actor's per-socket
-    /// drain notification this stream parks on when the channel is full).
-    pub drain_notify: Arc<tokio::sync::Notify>,
     pub pending_read: Option<Bytes>,
     /// A `TcpIo` item the shared path couldn't push yet — retried ahead of
     /// accepting new write bytes so ordering survives.
     pub pending_write: Option<TcpIo>,
+    /// In-flight channel-capacity reservation while the conn→actor queue
+    /// is full. The future is *stored*, not dropped on `Pending`, so its
+    /// waker stays registered in the mpsc semaphore — the wake arrives.
+    pub write_reserve: Option<ReserveFut>,
+    /// A capacity slot already won by [`WgStream::write_reserve`],
+    /// consumed by the next send instead of competing for a fresh one.
+    pub write_permit: Option<OwnedPermit<TcpIo>>,
     /// Terminal read state: the actor sent `Closed` (or the channel died).
     pub read_eof: bool,
     pub write_done: bool,
@@ -234,25 +275,57 @@ impl WgStream {
         self.wake.notify_one();
     }
 
-    /// The two wake sources a full-channel park must wait on: the
-    /// actor's drain notification *and* the channel's close. The
-    /// second arm is what un-parks a writer whose flow died while it
-    /// waited — a dropped `write_rx` never fires `drain_notify` again,
-    /// and without it the route task would stay pinned forever (holding
-    /// the stream and the remote conn). Polling both registers the
-    /// waker with either.
+    /// Wait for channel capacity — an mpsc semaphore reservation, not a
+    /// `Notify`. A `Notified` future only holds its waiter registration
+    /// while it is *alive*: the old `pin!(notified()).poll()` dropped
+    /// the future on `Pending`, unregistering the waker, so an actor's
+    /// `notify_one` that landed while the route task slept on another
+    /// direction's park stored a permit nobody ever polled — the writer
+    /// slept forever with a full upstream receive buffer (measured:
+    /// 532 KB stranded mid-download). `reserve_owned` *kept in a field*
+    /// survives `Pending`, so its waker stays inside the channel's
+    /// semaphore where the actor's drain finds it, and it resolves
+    /// `Err` on a closed channel — the dead-flow exit the `tx.closed()`
+    /// arm used to provide.
     ///
-    /// `Ready(true)` = retry the send; `Ready(false)` = channel gone.
+    /// `Ready(true)` = retry the send (a slot is held in `write_permit`);
+    /// `Ready(false)` = channel gone.
     fn poll_write_wait(&mut self, cx: &mut Context<'_>) -> Poll<bool> {
-        let mut notified = std::pin::pin!(self.drain_notify.notified());
-        if notified.as_mut().poll(cx).is_ready() {
+        if self.write_permit.is_some() {
             return Poll::Ready(true);
         }
-        let mut closed = std::pin::pin!(self.tx.closed());
-        if closed.as_mut().poll(cx).is_ready() {
-            return Poll::Ready(false);
+        let fut = self
+            .write_reserve
+            .get_or_insert_with(|| Box::pin(self.tx.clone().reserve_owned()));
+        match fut.as_mut().poll(cx) {
+            Poll::Ready(Ok(permit)) => {
+                self.write_reserve = None;
+                self.write_permit = Some(permit);
+                Poll::Ready(true)
+            }
+            Poll::Ready(Err(_)) => {
+                self.write_reserve = None;
+                Poll::Ready(false)
+            }
+            Poll::Pending => Poll::Pending,
         }
-        Poll::Pending
+    }
+
+    /// Send `item`, consuming the reservation first if one is held —
+    /// the slot a parked poll waited for, not a second one.
+    fn send_item(&mut self, item: TcpIo) -> Result<(), mpsc::error::TrySendError<TcpIo>> {
+        if let Some(permit) = self.write_permit.take() {
+            permit.send(item);
+            return Ok(());
+        }
+        let res = self.tx.try_send(item);
+        if res.is_ok() {
+            // A parked reservation may already have claimed a freed slot;
+            // dropping it returns the permit to the pool instead of
+            // pinning capacity until the next `Full`.
+            self.write_reserve = None;
+        }
+        res
     }
 }
 
@@ -319,14 +392,21 @@ impl AsyncWrite for WgStream {
         loop {
             if self.pending_write.is_some() {
                 let item = self.pending_write.take().expect("checked is_some above");
-                match self.tx.try_send(item) {
-                    Ok(()) => continue,
+                match self.send_item(item) {
+                    Ok(()) => {
+                        // The stash *is* this call's bytes — a retry after
+                        // `Pending` hands back the same `buf`, so flushing
+                        // it completes the write. Falling through to
+                        // `try_send(Data(buf))` here would put the payload
+                        // on the wire twice.
+                        self.nudge();
+                        return Poll::Ready(Ok(buf.len()));
+                    }
                     Err(mpsc::error::TrySendError::Full(item)) => {
                         self.pending_write = Some(item);
-                        // Park on the actor's drain notification — or the
-                        // channel's close (see `poll_write_wait`). `Notify`
-                        // stores one permit, so a drain between try_send
-                        // and this poll is not missed.
+                        // Park on a channel reservation — not a Notify —
+                        // so the waker survives a `Pending` poll (see
+                        // `poll_write_wait`).
                         match self.poll_write_wait(cx) {
                             Poll::Ready(true) => continue,
                             Poll::Ready(false) => {
@@ -343,7 +423,7 @@ impl AsyncWrite for WgStream {
                 }
             }
             let n = buf.len();
-            match self.tx.try_send(TcpIo::Data(Bytes::copy_from_slice(buf))) {
+            match self.send_item(TcpIo::Data(Bytes::copy_from_slice(buf))) {
                 Ok(()) => {
                     self.nudge();
                     return Poll::Ready(Ok(n));
@@ -369,12 +449,12 @@ impl AsyncWrite for WgStream {
             return Poll::Ready(Ok(()));
         }
         // Same backpressure contract as `poll_write`: drain anything parked
-        // there, then queue the FIN — a full channel parks on the actor's
-        // drain notification instead of silently dropping `Shutdown`.
+        // there, then queue the FIN — a full channel parks on the channel
+        // reservation instead of silently dropping `Shutdown`.
         loop {
             let item = self.pending_write.take().unwrap_or(TcpIo::Shutdown);
             let is_shutdown = matches!(item, TcpIo::Shutdown);
-            match self.tx.try_send(item) {
+            match self.send_item(item) {
                 Ok(()) => {
                     if is_shutdown {
                         self.write_done = true;
@@ -435,6 +515,25 @@ pub fn enlarge_recv_buffer(socket: &tokio::net::UdpSocket) {
         force_recv_buffer(socket);
     }
     tracing::debug!(size = ?sock.recv_buffer_size(), "wireguard endpoint receive buffer");
+}
+
+/// The send side needs the same headroom as the receive side: a
+/// [`poll_burst`] egress burst is handed to the kernel in one
+/// [`WIRE_DRAIN_BUDGET`] batch (~`POLL_BURST` × ~1.5 KB ≈ 90 KB), and the
+/// default send buffer is far smaller than that on some platforms —
+/// macOS grants only `9216` bytes of `SO_SNDBUF` out of the box, so a
+/// burst beyond ~6 datagrams dies on `ENOBUFS` *inside* `send_batch_to`
+/// (a short count, not a `WouldBlock`) and the inner TCP sees the
+/// dropped tail as a hole to retransmit. 4×[`TCP_SOCKET_BUF`] absorbs a
+/// full-window burst from several saturated flows; the kernel commits
+/// pages only on use.
+pub fn enlarge_send_buffer(socket: &tokio::net::UdpSocket) {
+    let sock = socket2::SockRef::from(socket);
+    let mut size = ENDPOINT_RECV_BUFFER;
+    while size >= TCP_SOCKET_BUF && sock.set_send_buffer_size(size).is_err() {
+        size /= 2;
+    }
+    tracing::debug!(size = ?sock.send_buffer_size(), "wireguard endpoint send buffer");
 }
 
 /// `SO_RCVBUFFORCE` needs `CAP_NET_ADMIN`, so it fails harmlessly (EPERM)

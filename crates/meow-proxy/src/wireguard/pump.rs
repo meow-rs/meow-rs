@@ -22,8 +22,8 @@ use std::time::{Duration, Instant as StdInstant};
 use bytes::{Buf, Bytes};
 use meow_common::{MeowError, ProxyConn, ProxyPacketConn, Result};
 use meow_wgstack::{
-    BatchEndpoint, ChannelDevice, StreamEvent, TcpIo, WgStream, TCP_READ_QUEUE, TCP_SOCKET_BUF,
-    TCP_WRITE_QUEUE, WG_TIMER_INTERVAL, WIRE_DRAIN_BUDGET,
+    poll_burst, BatchEndpoint, ChannelDevice, StreamEvent, TcpIo, WgStream, TCP_READ_QUEUE,
+    TCP_SOCKET_BUF, TCP_WRITE_QUEUE, WG_TIMER_INTERVAL, WIRE_DRAIN_BUDGET,
 };
 use meow_wireguard::{x25519, Tunn, TunnResult, WireGuardError};
 use smoltcp::iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet};
@@ -132,7 +132,6 @@ struct PendingTcp {
     reply: TcpDialReply,
     read_rx: mpsc::Receiver<StreamEvent>,
     write_tx: mpsc::Sender<TcpIo>,
-    drain_notify: Arc<tokio::sync::Notify>,
     display: String,
     created: StdInstant,
 }
@@ -148,9 +147,6 @@ struct TcpState {
     local_port: u16,
     read_tx: mpsc::Sender<StreamEvent>,
     write_rx: mpsc::Receiver<TcpIo>,
-    /// Signalled after the `out` backlog shrinks; a `WgStream` whose
-    /// `poll_write` met a full channel parks on this instead of a timeout.
-    drain_notify: Arc<tokio::sync::Notify>,
     /// Ordered conn→socket items not yet accepted by `send_slice`
     /// (shutdown/close markers ride the same queue to stay ordered).
     out: VecDeque<TcpIo>,
@@ -162,17 +158,6 @@ struct TcpState {
     /// conn-drop must not downgrade the close to `abort()` and RST the
     /// peer mid-drain.
     graceful_close: bool,
-}
-
-impl Drop for TcpState {
-    /// A `WgStream` parked on a full write channel waits on
-    /// `drain_notify` — dropping the state without waking it would pin
-    /// the conn task forever (the channel-close wake in
-    /// `WgStream::poll_write_wait` is the second safety net). Fire all
-    /// waiters so the writer's next `try_send` sees `Closed` and exits.
-    fn drop(&mut self) {
-        self.drain_notify.notify_waiters();
-    }
 }
 
 struct UdpState {
@@ -676,7 +661,6 @@ impl WgPump {
         }
         let (read_tx, read_rx) = mpsc::channel(TCP_READ_QUEUE);
         let (write_tx, write_rx) = mpsc::channel(TCP_WRITE_QUEUE);
-        let drain_notify = Arc::new(tokio::sync::Notify::new());
         let handle = self.sockets.add(socket);
         self.tcp.insert(
             handle,
@@ -686,13 +670,11 @@ impl WgPump {
                     reply,
                     read_rx,
                     write_tx,
-                    drain_notify: Arc::clone(&drain_notify),
                     display,
                     created: StdInstant::now(),
                 }),
                 read_tx,
                 write_rx,
-                drain_notify,
                 out: VecDeque::new(),
                 pending_read: VecDeque::new(),
                 eof_sent: false,
@@ -833,9 +815,10 @@ impl WgPump {
                         rx: p.read_rx,
                         tx: p.write_tx,
                         wake: Arc::clone(&wake),
-                        drain_notify: p.drain_notify,
                         pending_read: None,
                         pending_write: None,
+                        write_reserve: None,
+                        write_permit: None,
                         read_eof: false,
                         write_done: false,
                     };
@@ -872,15 +855,6 @@ impl WgPump {
             }
 
             // ── ordered writes into the smoltcp socket ─────────────
-            // `drain_notify` is only worth re-arming when this pass did
-            // write-side work a parked writer could join: items the
-            // conn→pump drain just moved off the channel, a backlog left
-            // over from a previous stall, or a `Close` push — any of them
-            // means `out` is non-empty here. The permit may buy nothing
-            // (a stalled socket pops nothing new), which is harmless;
-            // what it must not do is fire unconditionally on an idle
-            // socket, where a stored permit is a guaranteed spurious wake.
-            let had_out = !st.out.is_empty();
             while let Some(front) = st.out.front_mut() {
                 match front {
                     TcpIo::Data(b) => {
@@ -923,12 +897,6 @@ impl WgPump {
                     }
                 }
             }
-            // Re-arm a writer parked on a full queue (one stored permit;
-            // spurious wakes just retry the send).
-            if had_out {
-                st.drain_notify.notify_one();
-            }
-
             // ── socket→conn reads ──────────────────────────────────
             while let Some(ev) = st.pending_read.pop_front() {
                 match st.read_tx.try_send(ev) {
@@ -1104,7 +1072,12 @@ impl WgPump {
             // 3. conn queues, smoltcp poll, tunnel egress, WG timers.
             self.service_sockets();
             let now = SmolInstant::now();
-            self.iface.poll(now, &mut self.device, &mut self.sockets);
+            // Burst, not a single poll: smoltcp egresses at most one TCP
+            // segment per socket per `poll`, so one call per pass capped
+            // a bulk flow at ~1 segment per inner-RTT wake — the same
+            // ceiling the WG listener measured (~285 KB/s). `poll_burst`
+            // loops until the stack goes quiet.
+            poll_burst(&mut self.iface, now, &mut self.device, &mut self.sockets);
             self.drain_device_tx();
             if self.last_timer.elapsed() >= WG_TIMER_INTERVAL {
                 self.tick_timers();
@@ -1264,7 +1237,7 @@ impl Drop for WgPacketConn {
 mod tests {
     //! Channel-level tests for the conn shims — no pump, no wire. They pin
     //! the backpressure/ordering machinery the service loop relies on:
-    //! `pending_write` FIFO, `drain_notify` re-arm, `TcpIo` ordering, and
+    //! `pending_write` FIFO, `TcpIo` ordering, and
     //! `WgPacketConn`'s pre-send policy checks.
     use std::future::Future;
     use std::pin::Pin;
@@ -1285,9 +1258,10 @@ mod tests {
                 rx: read_rx,
                 tx,
                 wake: Arc::clone(&wake),
-                drain_notify: Arc::new(tokio::sync::Notify::new()),
                 pending_read: None,
                 pending_write: None,
+                write_reserve: None,
+                write_permit: None,
                 read_eof: false,
                 write_done: false,
             },
@@ -1308,25 +1282,37 @@ mod tests {
             Pin::new(&mut stream).poll_write(&mut cx, b"bb"),
             Poll::Ready(Ok(2))
         ));
-        // Queue full → the item is stashed, the poll parks on drain_notify.
+        // Queue full → the item is stashed, the poll parks on a channel
+        // reservation (`write_reserve`).
         assert!(matches!(
             Pin::new(&mut stream).poll_write(&mut cx, b"cc"),
             Poll::Pending
         ));
         assert!(stream.pending_write.is_some());
-        // The pump drains both queued items, then re-arms the writer.
+        // The pump drains both queued items — freed capacity is the wake
+        // the reservation waits on; no separate notify exists.
         assert!(matches!(rx.try_recv(), Ok(TcpIo::Data(_))));
         assert!(matches!(rx.try_recv(), Ok(TcpIo::Data(_))));
-        stream.drain_notify.notify_one();
-        // The stashed "cc" goes first; the new write follows in order.
+        // AsyncWrite contract: a `Pending` write is retried with the SAME
+        // buf — the stash already carries its bytes, so the flush must
+        // deliver them exactly once.
         assert!(matches!(
-            Pin::new(&mut stream).poll_write(&mut cx, b"dd"),
+            Pin::new(&mut stream).poll_write(&mut cx, b"cc"),
             Poll::Ready(Ok(2))
         ));
         match rx.try_recv() {
             Ok(TcpIo::Data(b)) => assert_eq!(&b[..], b"cc"),
             other => panic!("expected Data(cc), got {other:?}"),
         }
+        assert!(
+            rx.try_recv().is_err(),
+            "a same-buf retry must not duplicate the stashed payload"
+        );
+        // A fresh write with room proceeds normally.
+        assert!(matches!(
+            Pin::new(&mut stream).poll_write(&mut cx, b"dd"),
+            Poll::Ready(Ok(2))
+        ));
         match rx.try_recv() {
             Ok(TcpIo::Data(b)) => assert_eq!(&b[..], b"dd"),
             other => panic!("expected Data(dd), got {other:?}"),
@@ -1360,7 +1346,6 @@ mod tests {
             Poll::Pending
         ));
         assert!(rx.try_recv().is_ok());
-        stream.drain_notify.notify_one();
         assert!(matches!(
             Pin::new(&mut stream).poll_shutdown(&mut cx),
             Poll::Ready(Ok(()))
@@ -1877,11 +1862,13 @@ mod tests {
         );
     }
 
-    /// An idle socket must not accumulate a drain permit: `notify_one`
-    /// stores one when nobody is waiting, and the next real writer would
-    /// burn its wake on a permit that bought nothing.
+    /// A `WgStream` parked on a full conn→pump channel waits on the
+    /// channel's own capacity semaphore (`reserve_owned`), not a notify:
+    /// once `service_sockets` moves the queued items into `out`, the
+    /// writer's reservation resolves — this is the wake the old
+    /// `drain_notify` permit tried (and intermittently failed) to be.
     #[tokio::test(flavor = "current_thread")]
-    async fn idle_socket_stores_no_drain_permit() {
+    async fn writer_resumes_when_pump_drains_channel() {
         let client_secret = x25519::StaticSecret::from([0x55; 32]);
         let server_public = x25519::PublicKey::from(&x25519::StaticSecret::from([0x66; 32]));
         let mut pump = pump_for_test(&test_config(&client_secret, &server_public));
@@ -1889,41 +1876,29 @@ mod tests {
         let (reply_tx, _reply_rx) = oneshot::channel();
         pump.dial_tcp("203.0.113.1:443".parse().unwrap(), "t".into(), reply_tx);
         let handle = *pump.tcp.keys().next().unwrap();
-        let notify = Arc::clone(&pump.tcp[&handle].drain_notify);
-
-        pump.service_sockets();
-
-        let mut notified = std::pin::pin!(notify.notified());
-        let mut cx = Context::from_waker(std::task::Waker::noop());
-        assert!(matches!(notified.as_mut().poll(&mut cx), Poll::Pending));
-    }
-
-    /// …and the complement: write items that actually moved off the
-    /// conn→pump channel this pass must still leave a permit behind, or
-    /// a writer parked on the full channel never wakes.
-    #[tokio::test(flavor = "current_thread")]
-    async fn drained_write_stores_drain_permit() {
-        let client_secret = x25519::StaticSecret::from([0x77; 32]);
-        let server_public = x25519::PublicKey::from(&x25519::StaticSecret::from([0x88; 32]));
-        let mut pump = pump_for_test(&test_config(&client_secret, &server_public));
-
-        let (reply_tx, _reply_rx) = oneshot::channel();
-        pump.dial_tcp("203.0.113.1:443".parse().unwrap(), "t".into(), reply_tx);
-        let handle = *pump.tcp.keys().next().unwrap();
-        let notify = Arc::clone(&pump.tcp[&handle].drain_notify);
-        pump.tcp[&handle]
+        let write_tx = pump.tcp[&handle]
             .pending
             .as_ref()
             .expect("pending dial")
             .write_tx
+            .clone();
+        write_tx
             .try_send(TcpIo::Data(Bytes::from_static(b"x")))
             .expect("channel has room");
 
         pump.service_sockets();
 
-        let mut notified = std::pin::pin!(notify.notified());
-        let mut cx = Context::from_waker(std::task::Waker::noop());
-        assert!(matches!(notified.as_mut().poll(&mut cx), Poll::Ready(())));
+        assert_eq!(
+            pump.tcp[&handle].out.len(),
+            1,
+            "the queued item must move from the channel into `out`"
+        );
+        assert!(
+            write_tx
+                .try_send(TcpIo::Data(Bytes::from_static(b"y")))
+                .is_ok(),
+            "capacity freed by the drain is the writer's wake"
+        );
     }
 
     /// The UDP conn→pump drain must stop pulling once `out` reaches
@@ -2080,6 +2055,132 @@ mod tests {
         conn.close().unwrap();
         let err = conn.write_packet(b"x", &inside).await.unwrap_err();
         assert!(err.to_string().contains("session closed"), "{err}");
+    }
+
+    // ── poll-burst regression ────────────────────────────────────
+
+    /// RFC 1071 checksum over `data` — the listener-side `seg_v4`
+    /// builder uses the same fold. (The device skips rx checksum
+    /// verification, but a fed packet that needs no special pleading
+    /// keeps the test honest.)
+    fn seg_checksum(data: &[u8]) -> u16 {
+        let mut sum: u32 = 0;
+        for w in data.chunks(2) {
+            let word = if w.len() == 2 {
+                u16::from_be_bytes([w[0], w[1]])
+            } else {
+                u16::from(w[0]) << 8
+            };
+            sum += u32::from(word);
+        }
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        !(sum as u16)
+    }
+
+    /// A checksummed inner IPv4 TCP segment `src:sport` → `dst:dport`
+    /// with arbitrary flags — the peer-side half of an in-iface
+    /// handshake, fed to `device.rx_queue`.
+    fn tcp_seg_v4(
+        src: std::net::Ipv4Addr,
+        dst: std::net::Ipv4Addr,
+        sport: u16,
+        dport: u16,
+        seq: u32,
+        ack: u32,
+        flags: u8,
+    ) -> Vec<u8> {
+        let mut p = vec![0u8; 40];
+        p[0] = 0x45;
+        p[2..4].copy_from_slice(&40u16.to_be_bytes());
+        p[8] = 64;
+        p[9] = 6;
+        p[12..16].copy_from_slice(&src.octets());
+        p[16..20].copy_from_slice(&dst.octets());
+        let ip_sum = seg_checksum(&p[..20]);
+        p[10..12].copy_from_slice(&ip_sum.to_be_bytes());
+        p[20..22].copy_from_slice(&sport.to_be_bytes());
+        p[22..24].copy_from_slice(&dport.to_be_bytes());
+        p[24..28].copy_from_slice(&seq.to_be_bytes());
+        p[28..32].copy_from_slice(&ack.to_be_bytes());
+        p[32] = 0x50; // data offset 5
+        p[33] = flags;
+        p[34..36].copy_from_slice(&0xffffu16.to_be_bytes()); // window
+        let mut pseudo = Vec::with_capacity(32);
+        pseudo.extend_from_slice(&src.octets());
+        pseudo.extend_from_slice(&dst.octets());
+        pseudo.push(0);
+        pseudo.push(6);
+        pseudo.extend_from_slice(&20u16.to_be_bytes());
+        pseudo.extend_from_slice(&p[20..]);
+        let tcp_sum = seg_checksum(&pseudo);
+        p[36..38].copy_from_slice(&tcp_sum.to_be_bytes());
+        p
+    }
+
+    /// mac-perf T1, client side — the same single-poll ceiling as the
+    /// listener: one `Interface::poll` egresses at most one segment per
+    /// socket, so a queued bulk write must land in `tx_queue` as a
+    /// burst, not one segment per pass. The count is asserted between
+    /// the poll and `drain_device_tx` (which always empties the queue).
+    #[tokio::test(flavor = "current_thread")]
+    async fn poll_burst_egresses_queued_segments() {
+        let client_secret = x25519::StaticSecret::from([0x71; 32]);
+        let server_public = x25519::PublicKey::from(&x25519::StaticSecret::from([0x72; 32]));
+        let mut pump = pump_for_test(&test_config(&client_secret, &server_public));
+
+        let (reply_tx, _reply_rx) = oneshot::channel();
+        pump.dial_tcp("203.0.113.1:443".parse().unwrap(), "t".into(), reply_tx);
+        let handle = *pump.tcp.keys().next().unwrap();
+
+        // The first poll emits the SYN; our ISN and ephemeral port come
+        // straight off the wire packet.
+        pump.iface
+            .poll(SmolInstant::now(), &mut pump.device, &mut pump.sockets);
+        let syn = pump.device.tx_queue.back().expect("the dial emitted a SYN");
+        let local_port = u16::from_be_bytes([syn[20], syn[21]]);
+        let isn = u32::from_be_bytes(syn[24..28].try_into().unwrap());
+
+        // The peer's SYN-ACK (seq 5000, ack'ing our SYN) → Established.
+        let syn_ack = tcp_seg_v4(
+            "203.0.113.1".parse().unwrap(),
+            "10.0.0.2".parse().unwrap(),
+            443,
+            local_port,
+            5000,
+            isn.wrapping_add(1),
+            0x12,
+        );
+        pump.device.rx_queue.push_back(Bytes::from(syn_ack));
+        pump.iface
+            .poll(SmolInstant::now(), &mut pump.device, &mut pump.sockets);
+        assert_eq!(
+            pump.sockets.get::<tcp::Socket>(handle).state(),
+            tcp::State::Established
+        );
+        pump.device.tx_queue.clear(); // count data segments only
+
+        // 32 KiB ≈ 61 segments at the 536-octet DEFAULT_MSS the
+        // optionless SYN-ACK negotiates — far past one segment and
+        // inside the peer's 65535-octet window.
+        pump.tcp
+            .get_mut(&handle)
+            .expect("tcp state")
+            .out
+            .push_back(TcpIo::Data(Bytes::from(vec![0xAB; 32 * 1024])));
+        pump.service_sockets(); // the conn→socket drain fills the tx buffer
+        poll_burst(
+            &mut pump.iface,
+            SmolInstant::now(),
+            &mut pump.device,
+            &mut pump.sockets,
+        );
+        assert!(
+            pump.device.tx_queue.len() >= 10,
+            "one pass must burst a multi-segment write, got {}",
+            pump.device.tx_queue.len()
+        );
     }
 
     // ── flush_outbox / scratch-pool pins ─────────────────────────
