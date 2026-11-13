@@ -1663,9 +1663,29 @@ mod tests {
         ack: u32,
         flags: u8,
     ) -> Vec<u8> {
-        let mut p = vec![0u8; 40];
+        seg_v4_data(src, dst, sport, dport, seq, ack, flags, &[])
+    }
+
+    /// `seg_v4` carrying `payload` after the 20-octet TCP header — the
+    /// wire form of bytes a peer's TCP delivered to the inner socket.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one parameter per wire field; a struct would only rename the list"
+    )]
+    fn seg_v4_data(
+        src: Ipv4Addr,
+        dst: Ipv4Addr,
+        sport: u16,
+        dport: u16,
+        seq: u32,
+        ack: u32,
+        flags: u8,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let mut p = vec![0u8; 40 + payload.len()];
+        let total_len = p.len() as u16;
         p[0] = 0x45;
-        p[2..4].copy_from_slice(&40u16.to_be_bytes());
+        p[2..4].copy_from_slice(&total_len.to_be_bytes());
         p[8] = 64;
         p[9] = 6;
         p[12..16].copy_from_slice(&src.octets());
@@ -1679,12 +1699,13 @@ mod tests {
         p[32] = 0x50; // data offset 5
         p[33] = flags;
         p[34..36].copy_from_slice(&0xffffu16.to_be_bytes()); // window
-        let mut pseudo = Vec::with_capacity(32);
+        p[40..].copy_from_slice(payload);
+        let mut pseudo = Vec::with_capacity(32 + payload.len());
         pseudo.extend_from_slice(&src.octets());
         pseudo.extend_from_slice(&dst.octets());
         pseudo.push(0);
         pseudo.push(6);
-        pseudo.extend_from_slice(&20u16.to_be_bytes());
+        pseudo.extend_from_slice(&(20u16 + payload.len() as u16).to_be_bytes());
         pseudo.extend_from_slice(&p[20..]);
         let tcp_sum = !inner_udp::checksum_fold(&pseudo);
         p[36..38].copy_from_slice(&tcp_sum.to_be_bytes());
@@ -2100,6 +2121,115 @@ mod tests {
             "a queued erase must not take a rebuilt mapping down"
         );
         assert!(actor.tcp.contains_key(&h2));
+    }
+
+    /// `discard_socket_rx` — the dead-conn drain, inbound shape: the
+    /// route task half-closed the flow (FIN flowing → `graceful_close`),
+    /// then died while the peer still had tail bytes in flight — the
+    /// `FinWait` zombie pair the fn's doc names. The pinned observables,
+    /// all through the real `service_tcp` pass: the `Closed` channel arm
+    /// calls the discard, the socket's rx residue empties (the advertised
+    /// window un-pins on the next ACK), and the events parked in
+    /// `pending_read` go with it. The socket itself survives — a
+    /// graceful close never aborts — so the drain, not teardown, is
+    /// what the assertions see.
+    #[tokio::test]
+    async fn discard_socket_rx_drains_residue_on_dead_conn() {
+        let mut actor = test_actor();
+        let client: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let target: Ipv4Addr = "203.0.113.9".parse().unwrap();
+        let key: InnerTuple = (client.into(), 40000, target.into(), 443);
+
+        feed_tcp(&mut actor, 0, &syn_v4(client, target, 40000, 443));
+        poll_once(&mut actor);
+        let handle = actor.tcp_by_tuple[&key];
+        let syn_ack = actor
+            .device
+            .tx_queue
+            .back()
+            .expect("the accept emitted a SYN-ACK");
+        let server_isn = u32::from_be_bytes(syn_ack[24..28].try_into().unwrap());
+
+        // Handshake ACK → Established.
+        let ack = seg_v4(
+            client,
+            target,
+            40000,
+            443,
+            101,
+            server_isn.wrapping_add(1),
+            0x10,
+        );
+        feed_tcp(&mut actor, 0, &ack);
+        poll_once(&mut actor);
+        assert_eq!(
+            actor.sockets.get::<tcp::Socket>(handle).state(),
+            tcp::State::Established
+        );
+
+        // The route task already spawned (`spawned`), sends its FIN —
+        // a real `TcpIo::Shutdown` down the conn channel — then dies:
+        // both ends it was handed close (`read_rx`/`write_tx` are the
+        // stream's own ends pre-spawn, so dropping them is the conn
+        // death, not bookkeeping noise).
+        {
+            let st = actor.tcp.get_mut(&handle).expect("flow state");
+            st.spawned = true;
+            st.write_tx
+                .as_ref()
+                .expect("pre-spawn flow still holds write_tx")
+                .try_send(TcpIo::Shutdown)
+                .expect("channel has room");
+        }
+        actor.service_tcp(); // consumes Shutdown → close() + graceful_close
+        assert_eq!(
+            actor.sockets.get::<tcp::Socket>(handle).state(),
+            tcp::State::FinWait1
+        );
+        {
+            let st = actor.tcp.get_mut(&handle).expect("flow state");
+            drop(st.read_rx.take());
+            drop(st.write_tx.take());
+            // Two events parked behind the dead channel — `clear()`'s
+            // half of the drain.
+            st.pending_read
+                .push_back(StreamEvent::Data(Bytes::from_static(b"x")));
+            st.pending_read
+                .push_back(StreamEvent::Data(Bytes::from_static(b"y")));
+        }
+
+        // Residue: tail data lands after the conn is gone.
+        let data = seg_v4_data(
+            client,
+            target,
+            40000,
+            443,
+            101,
+            server_isn.wrapping_add(1),
+            0x18,
+            b"dead-conn residue",
+        );
+        feed_tcp(&mut actor, 0, &data);
+        poll_once(&mut actor);
+        assert!(
+            actor.sockets.get::<tcp::Socket>(handle).recv_queue() > 0,
+            "rx residue must be present for the drain to matter"
+        );
+
+        actor.service_tcp();
+
+        let socket = actor.sockets.get::<tcp::Socket>(handle);
+        assert_eq!(
+            socket.recv_queue(),
+            0,
+            "the discard must empty the rx buffer so the window un-pins"
+        );
+        assert!(!socket.can_recv());
+        assert!(actor.tcp[&handle].pending_read.is_empty());
+        assert!(
+            actor.tcp.contains_key(&handle),
+            "a graceful close never aborts — the drain emptied rx, not teardown"
+        );
     }
 
     /// F3 — the IPv4 `total_length` field bounds the L4 slice: bytes a

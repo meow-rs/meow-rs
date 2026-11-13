@@ -208,7 +208,12 @@ struct WgPump {
     /// `buf_size`-capacity `Vec`s, persistent across passes so a quiet
     /// loop pays nothing. `recv_batch` advertises each slot's whole
     /// capacity as the window and rewrites a filled slot's len to its
-    /// datagram — capacity, never len, is what carries over.
+    /// datagram — capacity, never len, is what carries over. A slot a
+    /// DATA packet consumed leaves inside `rx_queue` as
+    /// `Bytes::from(Vec)` — the refcounted slice keeps the Vec's whole
+    /// ~`buf_size` allocation (~2 KiB), not just the datagram's span:
+    /// queue residency stays bounded in count, at a slightly larger
+    /// per-packet footprint — the price of the zero-copy handoff.
     rx_slots: Vec<Vec<u8>>,
     /// Recycled dst buffers for `Tunn::{encapsulate,decapsulate,
     /// update_timers,...}` — replaces the single fixed `work` scratch:
@@ -2086,6 +2091,112 @@ mod tests {
         );
     }
 
+    /// `discard_socket_rx` — the dead-conn drain: the conn half-closed
+    /// gracefully (FIN flowing, `graceful_close` set), then died while
+    /// the peer still had tail bytes in flight — the `FinWait` zombie
+    /// case the fn's doc names. The pinned observables, all through
+    /// the real `service_sockets` pass: the `Closed` channel arm calls
+    /// the discard, the socket's rx residue empties (window un-pins on
+    /// the next ACK), and the events parked in `pending_read` go with
+    /// it. The socket itself survives — a graceful close never aborts —
+    /// so the drain, not teardown, is what the assertions see.
+    #[tokio::test(flavor = "current_thread")]
+    async fn discard_socket_rx_drains_residue_on_dead_conn() {
+        let client_secret = x25519::StaticSecret::from([0x77; 32]);
+        let server_public = x25519::PublicKey::from(&x25519::StaticSecret::from([0x78; 32]));
+        let mut pump = pump_for_test(&test_config(&client_secret, &server_public));
+
+        let (reply_tx, mut reply_rx) = oneshot::channel();
+        pump.dial_tcp("203.0.113.1:443".parse().unwrap(), "t".into(), reply_tx);
+        let handle = *pump.tcp.keys().next().unwrap();
+
+        // SYN → our ISN/ephemeral port off the wire packet; the peer's
+        // SYN-ACK (seq 5000) → Established.
+        pump.iface
+            .poll(SmolInstant::now(), &mut pump.device, &mut pump.sockets);
+        let syn = pump.device.tx_queue.back().expect("the dial emitted a SYN");
+        let local_port = u16::from_be_bytes([syn[20], syn[21]]);
+        let isn = u32::from_be_bytes(syn[24..28].try_into().unwrap());
+        let syn_ack = tcp_seg_v4(
+            "203.0.113.1".parse().unwrap(),
+            "10.0.0.2".parse().unwrap(),
+            443,
+            local_port,
+            5000,
+            isn.wrapping_add(1),
+            0x12,
+        );
+        pump.device.rx_queue.push_back(Bytes::from(syn_ack));
+        pump.iface
+            .poll(SmolInstant::now(), &mut pump.device, &mut pump.sockets);
+        assert_eq!(
+            pump.sockets.get::<tcp::Socket>(handle).state(),
+            tcp::State::Established
+        );
+
+        // The dial resolves — the WgStream's channels are the conn ends.
+        pump.service_sockets();
+        let mut conn = match reply_rx.try_recv() {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => panic!("dial failed: {e}"),
+            Err(e) => panic!("dial did not resolve in one pass: {e}"),
+        };
+
+        // Graceful half-close first — the FIN is flowing — then the
+        // conn dies mid-tail.
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(
+            Pin::new(&mut *conn).poll_shutdown(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        pump.service_sockets(); // consumes Shutdown → close() + graceful_close
+        assert_eq!(
+            pump.sockets.get::<tcp::Socket>(handle).state(),
+            tcp::State::FinWait1
+        );
+        drop(conn); // read_rx + write_tx close — the conn is dead
+
+        // Residue: a data segment lands after the conn is gone, and two
+        // events are parked in `pending_read` behind the dead channel.
+        let data = tcp_seg_v4_data(
+            "203.0.113.1".parse().unwrap(),
+            "10.0.0.2".parse().unwrap(),
+            443,
+            local_port,
+            5001,
+            isn.wrapping_add(1),
+            0x18,
+            b"dead-conn residue",
+        );
+        pump.device.rx_queue.push_back(Bytes::from(data));
+        pump.iface
+            .poll(SmolInstant::now(), &mut pump.device, &mut pump.sockets);
+        assert!(
+            pump.sockets.get::<tcp::Socket>(handle).recv_queue() > 0,
+            "rx residue must be present for the drain to matter"
+        );
+        let st = pump.tcp.get_mut(&handle).expect("flow state");
+        st.pending_read
+            .push_back(StreamEvent::Data(Bytes::from_static(b"x")));
+        st.pending_read
+            .push_back(StreamEvent::Data(Bytes::from_static(b"y")));
+
+        pump.service_sockets();
+
+        let socket = pump.sockets.get::<tcp::Socket>(handle);
+        assert_eq!(
+            socket.recv_queue(),
+            0,
+            "the discard must empty the rx buffer so the window un-pins"
+        );
+        assert!(!socket.can_recv());
+        assert!(pump.tcp[&handle].pending_read.is_empty());
+        assert!(
+            pump.tcp.contains_key(&handle),
+            "a graceful close never aborts — the drain emptied rx, not teardown"
+        );
+    }
+
     /// A `WgStream` parked on a full conn→pump channel waits on the
     /// channel's own capacity semaphore (`reserve_owned`), not a notify:
     /// once `service_sockets` moves the queued items into `out`, the
@@ -2315,9 +2426,29 @@ mod tests {
         ack: u32,
         flags: u8,
     ) -> Vec<u8> {
-        let mut p = vec![0u8; 40];
+        tcp_seg_v4_data(src, dst, sport, dport, seq, ack, flags, &[])
+    }
+
+    /// `tcp_seg_v4` carrying `payload` after the 20-octet TCP header —
+    /// the wire form of bytes the peer's smoltcp delivered to ours.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one parameter per wire field; a struct would only rename the list"
+    )]
+    fn tcp_seg_v4_data(
+        src: std::net::Ipv4Addr,
+        dst: std::net::Ipv4Addr,
+        sport: u16,
+        dport: u16,
+        seq: u32,
+        ack: u32,
+        flags: u8,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let mut p = vec![0u8; 40 + payload.len()];
+        let total_len = p.len() as u16;
         p[0] = 0x45;
-        p[2..4].copy_from_slice(&40u16.to_be_bytes());
+        p[2..4].copy_from_slice(&total_len.to_be_bytes());
         p[8] = 64;
         p[9] = 6;
         p[12..16].copy_from_slice(&src.octets());
@@ -2331,12 +2462,13 @@ mod tests {
         p[32] = 0x50; // data offset 5
         p[33] = flags;
         p[34..36].copy_from_slice(&0xffffu16.to_be_bytes()); // window
-        let mut pseudo = Vec::with_capacity(32);
+        p[40..].copy_from_slice(payload);
+        let mut pseudo = Vec::with_capacity(32 + payload.len());
         pseudo.extend_from_slice(&src.octets());
         pseudo.extend_from_slice(&dst.octets());
         pseudo.push(0);
         pseudo.push(6);
-        pseudo.extend_from_slice(&20u16.to_be_bytes());
+        pseudo.extend_from_slice(&(20u16 + payload.len() as u16).to_be_bytes());
         pseudo.extend_from_slice(&p[20..]);
         let tcp_sum = seg_checksum(&pseudo);
         p[36..38].copy_from_slice(&tcp_sum.to_be_bytes());
