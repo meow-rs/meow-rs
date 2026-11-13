@@ -235,7 +235,7 @@ In every member `crates/*/Cargo.toml`:
 workspace = true
 ```
 
-This requires Rust 1.74+; the workspace MSRV is 1.89 and the repo toolchain
+This requires Rust 1.74+; the workspace MSRV is 1.91 and the repo toolchain
 is pinned via `rust-toolchain.toml` — safe.
 
 ## Consequences

@@ -17,7 +17,7 @@
 
 ### 前置要求
 
-- Rust 1.89+ (通过 `rustup` 安装)
+- Rust 1.91+ (通过 `rustup` 安装)
 - Git
 - (可选) GitHub CLI (`gh`) 用于 PR 管理
 

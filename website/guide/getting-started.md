@@ -4,7 +4,7 @@ This page takes you from a fresh clone to a running proxy with a live dashboard.
 
 ## Prerequisites
 
-- **Rust 1.89+** (the workspace pins a minimum `rust-version`). Install via
+- **Rust 1.91+** (the workspace pins a minimum `rust-version`). Install via
   [rustup](https://rustup.rs).
 - A C toolchain (C/C++ compiler, cmake, libclang) is needed to build:
   BoringSSL via `boring-sys` is a hard dependency of the default
