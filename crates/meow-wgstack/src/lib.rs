@@ -456,9 +456,13 @@ impl AsyncWrite for WgStream {
             let is_shutdown = matches!(item, TcpIo::Shutdown);
             match self.send_item(item) {
                 Ok(()) => {
+                    // `poll_write` symmetry: every queued item is fresh
+                    // conn→actor work — nudge per send, not only on the
+                    // terminal FIN, or a flushed stash item waits out
+                    // the 250 ms timer tick.
+                    self.nudge();
                     if is_shutdown {
                         self.write_done = true;
-                        self.nudge();
                         return Poll::Ready(Ok(()));
                     }
                 }
