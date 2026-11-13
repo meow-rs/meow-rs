@@ -343,7 +343,8 @@ impl WgPump {
     }
 
     /// Egress: `device.tx_queue` → `Tunn::encapsulate` → outbox. A queued
-    /// inner packet resurfaces here once the handshake completes.
+    /// inner packet resurfaces here once the handshake completes. Each
+    /// drained buffer goes back to `device.tx_pool` for reuse.
     fn drain_device_tx(&mut self) {
         let mut work = std::mem::take(&mut self.work);
         while let Some(pkt) = self.device.tx_queue.pop_front() {
@@ -356,11 +357,13 @@ impl WgPump {
                     pkt.len(),
                     work.len()
                 );
+                self.device.tx_pool.push_back(pkt);
                 continue;
             }
             if let TunnResult::WriteToNetwork(b) = self.tunn.encapsulate(&pkt, &mut work) {
                 self.enqueue_wg(b);
             }
+            self.device.tx_pool.push_back(pkt);
         }
         self.work = work;
     }

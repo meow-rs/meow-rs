@@ -1223,12 +1223,14 @@ impl WgActor {
     /// Encrypt each emitted packet under its owning peer's session. The
     /// packet's reversed tuple locates the flow (hence peer slot); an
     /// unmatched packet — an RST for a refused SYN or stray — consults
-    /// the `rst_hint` its ingress recorded.
+    /// the `rst_hint` its ingress recorded. Each drained buffer goes
+    /// back to `device.tx_pool` for reuse.
     fn drain_device_tx(&mut self) {
         let mut work = std::mem::take(&mut self.work);
         while let Some(pkt) = self.device.tx_queue.pop_front() {
             let Some(slot) = self.route_tx_packet(&pkt) else {
                 trace!("wireguard {}: unroutable inner tx packet", self.name);
+                self.device.tx_pool.push_back(pkt);
                 continue;
             };
             if pkt.len() + DATA_OVERHEAD_SZ > work.len() {
@@ -1238,19 +1240,23 @@ impl WgActor {
                     pkt.len(),
                     work.len()
                 );
+                self.device.tx_pool.push_back(pkt);
                 continue;
             }
             let Some(peer) = self.table.peers_mut().get_mut(slot) else {
+                self.device.tx_pool.push_back(pkt);
                 continue;
             };
             if let TunnResult::WriteToNetwork(b) = peer.tunn.encapsulate(&pkt, &mut work) {
                 let Some(addr) = peer.endpoint else {
+                    self.device.tx_pool.push_back(pkt);
                     continue;
                 };
                 let mut buf = b.to_vec();
                 peer.stamp_reserved(&mut buf);
                 self.enqueue_outbox(addr, buf);
             }
+            self.device.tx_pool.push_back(pkt);
         }
         self.work = work;
         // RST hints only live for the poll that produced them — a stale

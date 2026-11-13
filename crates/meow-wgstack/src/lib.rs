@@ -58,9 +58,13 @@ pub const WG_TIMER_INTERVAL: Duration = Duration::from_millis(250);
 /// A channel-backed smoltcp [`Device`]: packets `Tunn::decapsulate` yields
 /// are pushed into `rx_queue` for `Interface` ingress; everything
 /// `Interface` egresses lands in `tx_queue` for `Tunn::encapsulate`.
+/// `tx_pool` recycles the egress buffers — the owner returns each drained
+/// `tx_queue` Vec to it instead of dropping it, so `SmolTxToken::consume`
+/// reuses the allocation rather than paying a `vec![]` per packet.
 pub struct ChannelDevice {
     pub rx_queue: VecDeque<Vec<u8>>,
     pub tx_queue: VecDeque<Vec<u8>>,
+    pub tx_pool: VecDeque<Vec<u8>>,
     caps: DeviceCapabilities,
 }
 
@@ -87,6 +91,7 @@ impl ChannelDevice {
         Self {
             rx_queue: VecDeque::new(),
             tx_queue: VecDeque::new(),
+            tx_pool: VecDeque::new(),
             caps,
         }
     }
@@ -107,6 +112,7 @@ impl RxToken for SmolRxToken {
 
 pub struct SmolTxToken<'a> {
     queue: &'a mut VecDeque<Vec<u8>>,
+    pool: &'a mut VecDeque<Vec<u8>>,
 }
 
 impl TxToken for SmolTxToken<'_> {
@@ -114,7 +120,11 @@ impl TxToken for SmolTxToken<'_> {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let mut buf = vec![0u8; len];
+        // Recycle a drained tx buffer when one is pooled; the full
+        // clear+resize keeps stale bytes out of the emitted packet.
+        let mut buf = self.pool.pop_back().unwrap_or_default();
+        buf.clear();
+        buf.resize(len, 0);
         let out = f(&mut buf);
         self.queue.push_back(buf);
         out
@@ -134,6 +144,7 @@ impl Device for ChannelDevice {
                 SmolRxToken { packet },
                 SmolTxToken {
                     queue: &mut self.tx_queue,
+                    pool: &mut self.tx_pool,
                 },
             )
         })
@@ -142,6 +153,7 @@ impl Device for ChannelDevice {
     fn transmit(&mut self, _timestamp: SmolInstant) -> Option<Self::TxToken<'_>> {
         Some(SmolTxToken {
             queue: &mut self.tx_queue,
+            pool: &mut self.tx_pool,
         })
     }
 
@@ -443,5 +455,47 @@ mod tests {
             assert!(!cap.rx(), "{name} rx checksum verification must be off");
             assert!(cap.tx(), "{name} tx checksum computation must stay on");
         }
+    }
+
+    /// A drained `tx_queue` Vec returned to `tx_pool` is the buffer the
+    /// next `consume` hands out — pointer identity proves the reuse and
+    /// with it the skipped allocation.
+    #[test]
+    fn tx_pool_reuse_after_warmup() {
+        let mut d = ChannelDevice::new(1420);
+        let token = d.transmit(SmolInstant::ZERO).expect("transmit token");
+        token.consume(100, |buf| buf[0] = 0xAB);
+        let vec = d.tx_queue.pop_front().expect("emitted packet");
+        let ptr = vec.as_ptr();
+        d.tx_pool.push_back(vec);
+
+        let token = d.transmit(SmolInstant::ZERO).expect("transmit token");
+        token.consume(50, |buf| {
+            assert_eq!(buf.as_ptr(), ptr, "pooled buffer must be reused");
+        });
+        assert_eq!(
+            d.tx_queue.back().expect("emitted packet").len(),
+            50,
+            "reused buffer is resized to the new packet"
+        );
+    }
+
+    /// A pooled buffer is fully zeroed on reuse — bytes from the
+    /// previous packet must never leak into the next emission.
+    #[test]
+    fn tx_pool_buf_zeroed_on_reuse() {
+        let mut d = ChannelDevice::new(1420);
+        let token = d.transmit(SmolInstant::ZERO).expect("transmit token");
+        token.consume(100, |buf| buf.iter_mut().for_each(|b| *b = 0xFF));
+        let vec = d.tx_queue.pop_front().expect("emitted packet");
+        d.tx_pool.push_back(vec);
+
+        let token = d.transmit(SmolInstant::ZERO).expect("transmit token");
+        token.consume(50, |buf| {
+            assert!(
+                buf.iter().all(|&b| b == 0),
+                "reused buffer must be fully zeroed"
+            );
+        });
     }
 }
