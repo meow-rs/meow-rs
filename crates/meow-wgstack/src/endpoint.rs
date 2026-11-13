@@ -150,7 +150,16 @@ impl BatchEndpoint {
     /// unspecified. This is a connected-peer read: sources are not
     /// reported because the pump's socket only ever receives from the
     /// bound peer.
+    ///
+    /// Connected endpoints only — on an unconnected socket every
+    /// backend reads without a `msg_name`, so a stray peer's datagram
+    /// would be silently attributed to the bound peer's stream. Debug
+    /// builds assert the flag.
     pub fn recv_batch(&self, bufs: &mut [Vec<u8>], budget: usize) -> usize {
+        debug_assert!(
+            self.connected,
+            "recv_batch drops source addresses — connected endpoints only"
+        );
         let n = bufs.len().min(budget).min(WIRE_DRAIN_BUDGET);
         #[cfg(target_os = "linux")]
         {
@@ -483,7 +492,12 @@ impl BatchEndpoint {
 /// - `recvmsg_x` returns the count of datagrams received (the first
 ///   message may block only without `MSG_DONTWAIT` — we always pass
 ///   it), writing each message's copied byte count into `msg_datalen`.
-///   `cnt` must be in `1..=kern.ipc.maxrecvmsgx` (default 256).
+///   `cnt` is clipped to `kern.ipc.maxrecvmsgx` (sysctl, default 100 —
+///   RW and tuneable down; `sendmsg_x` above clips at `maxsendmsgx`
+///   the same way) and only `0`/`> UIO_MAXIOV` fails EINVAL outright.
+///   Either way the batch just comes back short: the callers'
+///   short-count handling re-issues the remainder per datagram, so a
+///   tuned-down ceiling degrades the batch without reordering it.
 #[cfg(all(target_os = "macos", not(feature = "no-macos-sendmsg-x")))]
 mod msgx {
     /// The `msghdr_x` wire layout, verbatim from `socket_private.h`'s
@@ -506,11 +520,25 @@ mod msgx {
     }
 
     // Layout pin: the kernel copyin is `struct user64_msghdr_x` —
-    // identical field order/sizes. If either assert trips the binding
+    // identical field order/sizes. If any assert trips the binding
     // drifted from the wire format.
     const _: () = assert!(size_of::<msghdr_x>() == 56);
     const _: () = assert!(align_of::<msghdr_x>() == 8);
+    const _: () = assert!(std::mem::offset_of!(msghdr_x, msg_iov) == 16);
+    const _: () = assert!(std::mem::offset_of!(msghdr_x, msg_control) == 32);
+    const _: () = assert!(std::mem::offset_of!(msghdr_x, msg_flags) == 44);
     const _: () = assert!(std::mem::offset_of!(msghdr_x, msg_datalen) == 48);
+
+    // `cnt` ceiling pin: XNU clips each call's datagram count at
+    // `somaxsendmsgx`/`somaxrecvmsgx` (default 100 — see the module
+    // docs) and EINVALs past `UIO_MAXIOV`. Keeping the wire-drain
+    // budget under the default ceiling means a staged batch always
+    // fits one call on a stock kernel — a budget bump past it would
+    // silently truncate the tail of every chunk.
+    const _: () = assert!(
+        crate::WIRE_DRAIN_BUDGET <= 100,
+        "WIRE_DRAIN_BUDGET exceeds XNU's default sendmsg_x/recvmsg_x cnt ceiling (100)"
+    );
 
     extern "C" {
         /// `ssize_t sendmsg_x(int, const struct msghdr_x *, u_int, int)`.
