@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use bytes::{Buf, Bytes};
 use meow_common::ProxyConn;
-use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
+use smoltcp::phy::{Checksum, Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::time::Instant as SmolInstant;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
@@ -73,7 +73,17 @@ impl ChannelDevice {
         // always fits one WG data message.
         caps.max_transmission_unit = mtu;
         caps.max_burst_size = None;
-        // Checksum::Both (the default): software checksums everywhere.
+        // `Checksum::Tx` — software-compute on send only, skip receive
+        // verification. RX verification is redundant here: inner packets
+        // arrive in `rx_queue` only after ChaCha20-Poly1305 AEAD open, so
+        // their integrity is cryptographically proven already. TX stays
+        // on — the plaintext inner packet leaves this stack for a peer
+        // kernel/gVisor stack that does validate the checksums.
+        caps.checksum.ipv4 = Checksum::Tx;
+        caps.checksum.udp = Checksum::Tx;
+        caps.checksum.tcp = Checksum::Tx;
+        caps.checksum.icmpv4 = Checksum::Tx;
+        caps.checksum.icmpv6 = Checksum::Tx;
         Self {
             rx_queue: VecDeque::new(),
             tx_queue: VecDeque::new(),
@@ -407,5 +417,31 @@ fn force_recv_buffer(socket: &tokio::net::UdpSocket) {
             std::ptr::addr_of!(size).cast(),
             std::mem::size_of::<libc::c_int>() as libc::socklen_t,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The device computes checksums on TX (the peer's kernel/gVisor
+    /// stack validates them on the plaintext inner packet) but skips RX
+    /// verification — every inner packet reached `rx_queue` through a
+    /// ChaCha20-Poly1305 AEAD open, so its integrity is already proven
+    /// and the software check is dead work.
+    #[test]
+    fn channel_device_caps_checksum_tx_only() {
+        let d = ChannelDevice::new(1420);
+        let caps = d.capabilities();
+        for (name, cap) in [
+            ("ipv4", caps.checksum.ipv4),
+            ("udp", caps.checksum.udp),
+            ("tcp", caps.checksum.tcp),
+            ("icmpv4", caps.checksum.icmpv4),
+            ("icmpv6", caps.checksum.icmpv6),
+        ] {
+            assert!(!cap.rx(), "{name} rx checksum verification must be off");
+            assert!(cap.tx(), "{name} tx checksum computation must stay on");
+        }
     }
 }

@@ -1795,11 +1795,16 @@ mod tests {
         let target: Ipv4Addr = "203.0.113.9".parse().unwrap();
 
         for round in 0..4u16 {
-            // A placeholder that never accepts: the fed SYN's checksum
-            // is deliberately broken, so smoltcp drops it and the
-            // socket stays `Listen` while the cap fills elsewhere.
+            // A placeholder that never accepts: the fed SYN's IPv4
+            // `total_len` claims more than the datagram carries, so
+            // smoltcp drops it at IP parse and the socket stays
+            // `Listen` while the cap fills elsewhere. (A broken
+            // checksum used to be the trigger; `ChannelDevice` now
+            // skips RX verification — the AEAD open already proved
+            // integrity — so the malformed-length path is the drop
+            // that still exists.)
             let mut bad = syn_v4(client, target, 41000 + round, 443);
-            bad[37] ^= 0xff;
+            bad[2..4].copy_from_slice(&200u16.to_be_bytes());
             feed_tcp(&mut actor, 0, &bad);
             poll_once(&mut actor);
 
