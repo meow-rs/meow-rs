@@ -179,7 +179,8 @@ struct WgPump {
     device: ChannelDevice,
     sockets: SocketSet<'static>,
     /// The connected peer socket, wrapped for batched `sendmmsg`/
-    /// `recvmmsg` I/O on Linux (a `try_*` loop elsewhere).
+    /// `recvmmsg` I/O on Linux and `sendmsg_x`/`recvmsg_x` on macOS
+    /// (a `try_*` loop elsewhere).
     endpoint: BatchEndpoint,
     endpoint_addr: SocketAddr,
     rx: mpsc::Receiver<ActorMsg>,
@@ -478,7 +479,8 @@ impl WgPump {
     }
 
     /// One batch read into the persistent slots — a `recvmmsg` on
-    /// Linux, a `try_recv_buf` loop elsewhere — then `Tunn` over each
+    /// Linux, a `recvmsg_x` on macOS, a `try_recv_buf` loop elsewhere —
+    /// then `Tunn` over each
     /// filled slot in wire order. The slots come out of `self` for the
     /// pass because `decapsulate_wire` owns a slot's datagram while the
     /// method itself needs `&mut self`; independent `Vec`s mean a slot
@@ -613,7 +615,8 @@ impl WgPump {
     }
 
     /// Nonblocking sends, a [`WIRE_DRAIN_BUDGET`]-bounded batch at a
-    /// time — one `sendmmsg` on Linux, a `try_send` loop elsewhere.
+    /// time — one `sendmmsg`/`sendmsg_x` on Linux/macOS, a `try_send`
+    /// loop elsewhere.
     /// A batch that stops short leaves the boundary datagram at the
     /// head of `staged`: replaying it with `try_send` is how the
     /// `WouldBlock`/`errno` split the old per-packet loop had is
@@ -2545,9 +2548,10 @@ mod tests {
     ///
     /// Deterministic boundary without timing tricks: the staged batch
     /// carries one oversized datagram at `BOUNDARY`, so the kernel
-    /// stops the batch exactly there — `sendmmsg` reports the short
-    /// count on Linux, the fallback `try_send` loop stops at its first
-    /// error elsewhere. The `WouldBlock` verdict then comes from
+    /// stops the batch exactly there — `sendmmsg`/`sendmsg_x` report
+    /// the short count on the batch-syscall platforms, the fallback
+    /// `try_send` loop stops at its first error elsewhere. The
+    /// `WouldBlock` verdict then comes from
     /// tokio's *cold* readiness gate: this `current_thread` test
     /// awaits nothing before the first flush, so the driver never
     /// polled the fresh socket and the replay `try_send` short-
@@ -2605,14 +2609,19 @@ mod tests {
 
         pump.flush_outbox();
 
-        // Path proof: on Linux the batch genuinely stopped at the
-        // oversized index inside `sendmmsg`; elsewhere the cold gate
-        // stopped the `try_send` loop at index 0.
+        // Path proof: with the batched syscalls (`sendmmsg`/`sendmsg_x`)
+        // the batch genuinely stopped at the oversized index inside
+        // the kernel; on the fallback the cold gate stopped the
+        // `try_send` loop at index 0.
         let sent = STAGED + OLD.len() - pump.outbox.len();
-        #[cfg(target_os = "linux")]
-        assert_eq!(sent, BOUNDARY, "sendmmsg stops at the EMSGSIZE index");
-        #[cfg(not(target_os = "linux"))]
-        assert_eq!(sent, 0, "cold readiness stops the fallback loop at index 0");
+        if BatchEndpoint::BATCHED_SYSCALLS {
+            assert_eq!(
+                sent, BOUNDARY,
+                "the batched send stops at the EMSGSIZE index"
+            );
+        } else {
+            assert_eq!(sent, 0, "cold readiness stops the fallback loop at index 0");
+        }
 
         // The pre-F1 bug pushed the boundary first, then its
         // successors ahead of it — [s1..s63, b, old]. The contract is

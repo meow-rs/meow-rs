@@ -1411,7 +1411,8 @@ impl WgActor {
 
     /// Nonblocking sends, a [`WIRE_DRAIN_BUDGET`]-bounded batch at a
     /// time — one `sendmmsg` (a destination per `mmsghdr`, so roaming
-    /// peers keep per-packet addressing) on Linux, a `try_send_to`
+    /// peers keep per-packet addressing) on Linux, one `sendmsg_x`
+    /// (same, per `msghdr_x`) on macOS, a `try_send_to`
     /// loop elsewhere. A batch that stops short leaves the boundary
     /// datagram at the head of `staged`: replaying it surfaces the
     /// errno the mmsg call folded into the short count — `WouldBlock`
@@ -2651,9 +2652,10 @@ mod tests {
     ///
     /// Deterministic boundary without timing tricks: the staged batch
     /// carries one oversized datagram at `BOUNDARY`, so the kernel
-    /// stops the batch exactly there — `sendmmsg` reports the short
-    /// count on Linux, the fallback `try_send_to` loop stops at its
-    /// first error elsewhere. The `WouldBlock` verdict then comes
+    /// stops the batch exactly there — `sendmmsg`/`sendmsg_x` report
+    /// the short count on the batch-syscall platforms, the fallback
+    /// `try_send_to` loop stops at its first error elsewhere. The
+    /// `WouldBlock` verdict then comes
     /// from tokio's *cold* readiness gate: this `current_thread` test
     /// awaits nothing before the first flush, so the driver never
     /// polled the fresh socket and the replay `try_send_to` short-
@@ -2723,14 +2725,19 @@ mod tests {
 
         actor.flush_outbox();
 
-        // Path proof: on Linux the batch genuinely stopped at the
-        // oversized index inside `sendmmsg`; elsewhere the cold gate
-        // stopped the `try_send_to` loop at index 0.
+        // Path proof: with the batched syscalls (`sendmmsg`/`sendmsg_x`)
+        // the batch genuinely stopped at the oversized index inside
+        // the kernel; on the fallback the cold gate stopped the
+        // `try_send_to` loop at index 0.
         let sent = STAGED + OLD.len() - actor.outbox.len();
-        #[cfg(target_os = "linux")]
-        assert_eq!(sent, BOUNDARY, "sendmmsg stops at the EMSGSIZE index");
-        #[cfg(not(target_os = "linux"))]
-        assert_eq!(sent, 0, "cold readiness stops the fallback loop at index 0");
+        if BatchEndpoint::BATCHED_SYSCALLS {
+            assert_eq!(
+                sent, BOUNDARY,
+                "the batched send stops at the EMSGSIZE index"
+            );
+        } else {
+            assert_eq!(sent, 0, "cold readiness stops the fallback loop at index 0");
+        }
 
         // The pre-F1 bug pushed the boundary first, then its
         // successors ahead of it — [s1..s63, b, old]. The contract is

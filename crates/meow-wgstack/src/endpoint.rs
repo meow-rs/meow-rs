@@ -2,22 +2,32 @@
 //!
 //! [`BatchEndpoint`] wraps the `tokio::net::UdpSocket` both WireGuard
 //! actors open toward their peers with batch calls that collapse a
-//! wire burst into a single `recvmmsg`/`sendmmsg` syscall on Linux.
+//! wire burst into a single `recvmmsg`/`sendmmsg` syscall on Linux,
+//! or a single `recvmsg_x`/`sendmsg_x` call on macOS — Darwin's
+//! private-but-libSystem-exported batch SPI (see the `msgx` module).
 //! Everywhere else the same calls degrade to a per-datagram `try_*`
-//! loop — BSD/macOS have no mmsg syscalls — so the calling actors
-//! keep one code path and the syscall savings are strictly an
-//! optimization. Android (a separate `target_os`) stays on the
-//! fallback too: `libc` binds bionic's `sendmmsg`/`recvmmsg` as of
-//! 0.2.191, so the `linux`-only cfg is a deliberate conservative
-//! choice, not a missing binding. The ordinary `try_*`/`recv*`
-//! methods are forwarded for the single-datagram paths that remain.
+//! loop — Android (a separate `target_os`) among them: `libc` binds
+//! bionic's `sendmmsg`/`recvmmsg` as of 0.2.191, so the `linux`-only
+//! cfg is a deliberate conservative choice, not a missing binding —
+//! so the calling actors keep one code path and the syscall savings
+//! are strictly an optimization. On macOS the `no-macos-sendmsg-x`
+//! feature compiles the fallback back in: an opt-out for
+//! environments that audit or shim private SPI (enable it via
+//! `-p meow-wgstack --features no-macos-sendmsg-x`, or
+//! `meow-wgstack/no-macos-sendmsg-x` from a direct dependent —
+//! meow-proxy/meow-listener; the release bundles do not re-export
+//! it). The ordinary `try_*`/`recv*` methods are forwarded for the
+//! single-datagram paths that remain.
 //!
 //! Batch semantics match the per-packet loops they replace: a short
 //! count means the next datagram is the boundary the kernel stopped
-//! at — `sendmmsg` folds a post-partial error into the returned
-//! count, so re-issuing that datagram with `try_send`/`try_send_to`
-//! is how the caller learns `WouldBlock` (requeue) from a real errno
-//! (log and drop, then continue).
+//! at — `sendmmsg` and `sendmsg_x` alike fold a post-partial error
+//! into the returned count, so re-issuing that datagram with
+//! `try_send`/`try_send_to` is how the caller learns `WouldBlock`
+//! (requeue) from a real errno (log and drop, then continue). The
+//! batched calls go straight to the raw fd — they never consult
+//! tokio's cached readiness, so a cold (never-polled) socket still
+//! reaches the kernel; see [`BatchEndpoint::BATCHED_SYSCALLS`].
 
 use std::io;
 use std::net::SocketAddr;
@@ -38,6 +48,20 @@ pub struct BatchEndpoint {
 }
 
 impl BatchEndpoint {
+    /// `true` when [`send_batch`](Self::send_batch)/
+    /// [`send_batch_to`](Self::send_batch_to)/
+    /// [`recv_batch`](Self::recv_batch) issue real batched syscalls —
+    /// `sendmmsg`/`recvmmsg` on Linux, `sendmsg_x`/`recvmsg_x` on
+    /// macOS — rather than the per-datagram `try_*` fallback loop.
+    /// The batched calls go straight to the raw fd: they never consult
+    /// tokio's cached readiness, so a batch on a cold (never-polled)
+    /// socket still reaches the kernel — the behaviour the downstream
+    /// requeue pins key on.
+    pub const BATCHED_SYSCALLS: bool = cfg!(any(
+        target_os = "linux",
+        all(target_os = "macos", not(feature = "no-macos-sendmsg-x"))
+    ));
+
     /// Wrap a socket bound to one peer (the outbound pump's endpoint).
     pub fn connected(inner: tokio::net::UdpSocket) -> Self {
         Self {
@@ -113,11 +137,12 @@ impl BatchEndpoint {
     // ── batch calls ──────────────────────────────────────────────
 
     /// Drain up to `min(bufs.len(), budget, WIRE_DRAIN_BUDGET)`
-    /// datagrams — one `recvmmsg` on Linux, a `try_recv_buf` loop
-    /// elsewhere. The third clamp is the stack-array bound: a single
-    /// mmsg call can never service more slots than its arrays hold,
-    /// and the fallback loop inherits the same bound so both paths
-    /// agree on what one call is allowed to do. Every
+    /// datagrams — one `recvmmsg` on Linux, one `recvmsg_x` on macOS,
+    /// a `try_recv_buf` loop elsewhere. The third clamp is the
+    /// stack-array bound: a single batched call can never service more
+    /// slots than its arrays hold, and the fallback loop inherits the
+    /// same bound so both paths agree on what one call is allowed to
+    /// do. Every
     /// slot's whole *capacity* is its receive window — never its
     /// current length — so a persistent slot set serves batch after
     /// batch without restaging. On return, each of `bufs[..ret]` is
@@ -131,7 +156,14 @@ impl BatchEndpoint {
         {
             self.recv_batch_mmsg(&mut bufs[..n])
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(all(target_os = "macos", not(feature = "no-macos-sendmsg-x")))]
+        {
+            self.recv_batch_msgx(&mut bufs[..n])
+        }
+        #[cfg(not(any(
+            target_os = "linux",
+            all(target_os = "macos", not(feature = "no-macos-sendmsg-x"))
+        )))]
         {
             let mut got = 0;
             for buf in &mut bufs[..n] {
@@ -171,10 +203,13 @@ impl BatchEndpoint {
         self.send_batch_inner(pkts, |(a, b)| (*a, *b))
     }
 
-    /// Linux: `sendmmsg` over stack-built `mmsghdr`/`iovec` arrays.
+    /// Batched-syscall platforms (`sendmmsg`/`sendmsg_x` below).
     /// Elsewhere: a `try_send`/`try_send_to` loop that stops at the
     /// first error — the same short-count contract either way.
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(
+        target_os = "linux",
+        all(target_os = "macos", not(feature = "no-macos-sendmsg-x"))
+    )))]
     fn send_batch_inner<T>(&self, pkts: &[T], get: impl Fn(&T) -> (SocketAddr, &[u8])) -> usize {
         let mut sent = 0;
         for t in pkts {
@@ -304,6 +339,199 @@ impl BatchEndpoint {
         }
         got
     }
+
+    /// macOS: `sendmsg_x` over stack-built `msghdr_x`/`iovec` arrays —
+    /// the same shape as the Linux `sendmmsg` path, chunked at
+    /// [`WIRE_DRAIN_BUDGET`]. On a connected UDP socket XNU takes the
+    /// `sendit_x`/`sosend_list` fast path (no per-datagram name); on an
+    /// unconnected one each header's `msg_name` carries its
+    /// destination and the kernel loops `sendit` — still one syscall
+    /// per chunk, per-datagram addressing preserved.
+    #[cfg(all(target_os = "macos", not(feature = "no-macos-sendmsg-x")))]
+    fn send_batch_inner<T>(&self, pkts: &[T], get: impl Fn(&T) -> (SocketAddr, &[u8])) -> usize {
+        use std::os::fd::AsRawFd;
+        let mut sent = 0usize;
+        while sent < pkts.len() {
+            let n = (pkts.len() - sent).min(WIRE_DRAIN_BUDGET);
+            // SAFETY: `iovec`, `msghdr_x` and `sockaddr_storage` are C
+            // PODs — the all-zero bit pattern is valid for every field
+            // (null pointer, zero length, family AF_UNSPEC) and zeroed
+            // `msg_flags`/`msg_datalen` are the input values
+            // `sendmsg_x` requires.
+            let mut iov: [libc::iovec; WIRE_DRAIN_BUDGET] = unsafe { std::mem::zeroed() };
+            let mut msgs: [msgx::msghdr_x; WIRE_DRAIN_BUDGET] = unsafe { std::mem::zeroed() };
+            let mut sas: [libc::sockaddr_storage; WIRE_DRAIN_BUDGET] =
+                unsafe { std::mem::zeroed() };
+            for (j, t) in pkts[sent..sent + n].iter().enumerate() {
+                let (addr, buf) = get(t);
+                iov[j] = libc::iovec {
+                    iov_base: buf.as_ptr().cast_mut().cast(),
+                    iov_len: buf.len(),
+                };
+                msgs[j].msg_iov = &mut iov[j];
+                msgs[j].msg_iovlen = 1;
+                if !self.connected {
+                    msgs[j].msg_namelen = write_sockaddr(&mut sas[j], &addr);
+                    msgs[j].msg_name = (&mut sas[j]) as *mut _ as *mut _;
+                }
+            }
+            // SAFETY: `fd` is a live nonblocking socket; `msgs` holds
+            // `n` headers whose iovecs point at `pkts` data that
+            // outlives this call (the kernel only reads through send
+            // iovecs) and whose names point at `sas`. `MSG_DONTWAIT`
+            // is redundant with O_NONBLOCK but states the contract.
+            let ret = unsafe {
+                msgx::sendmsg_x(
+                    self.inner.as_raw_fd(),
+                    msgs.as_ptr(),
+                    n as libc::c_uint,
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            if ret < 0 {
+                let e = io::Error::last_os_error();
+                if e.kind() == io::ErrorKind::Interrupted && sent == 0 {
+                    continue;
+                }
+                break;
+            }
+            sent += ret as usize;
+            if (ret as usize) < n {
+                break;
+            }
+        }
+        sent
+    }
+
+    /// One `recvmsg_x` into the staged buffers — XNU's batched
+    /// `soreceive_m_list`, which stops when the socket queue runs dry
+    /// under `MSG_DONTWAIT` and reports each datagram's received length
+    /// in `msg_datalen` (bytes actually copied, ≤ the advertised iov
+    /// capacity). `msgs[..got]` is the only span the kernel rewrote.
+    #[cfg(all(target_os = "macos", not(feature = "no-macos-sendmsg-x")))]
+    fn recv_batch_msgx(&self, bufs: &mut [Vec<u8>]) -> usize {
+        use std::os::fd::AsRawFd;
+        let n = bufs.len().min(WIRE_DRAIN_BUDGET);
+        let bufs = &mut bufs[..n];
+        if bufs.is_empty() {
+            return 0;
+        }
+        // SAFETY: as in `send_batch_inner` — C POD arrays, all-zero
+        // valid; `recvmsg_x` requires zeroed `msg_flags` on input.
+        let mut iov: [libc::iovec; WIRE_DRAIN_BUDGET] = unsafe { std::mem::zeroed() };
+        let mut msgs: [msgx::msghdr_x; WIRE_DRAIN_BUDGET] = unsafe { std::mem::zeroed() };
+        for (j, buf) in bufs.iter_mut().enumerate() {
+            iov[j] = libc::iovec {
+                iov_base: buf.as_mut_ptr().cast(),
+                iov_len: buf.capacity(),
+            };
+            msgs[j].msg_iov = &mut iov[j];
+            msgs[j].msg_iovlen = 1;
+        }
+        // SAFETY: `fd` is a live nonblocking socket; `msgs` describes
+        // `n` iovecs each covering that Vec's whole allocation,
+        // initialised or not — writes through the raw pointer are
+        // in-bounds and no Rust reference aliases them.
+        let ret = unsafe {
+            msgx::recvmsg_x(
+                self.inner.as_raw_fd(),
+                msgs.as_mut_ptr(),
+                n as libc::c_uint,
+                libc::MSG_DONTWAIT,
+            )
+        };
+        if ret <= 0 {
+            if ret < 0 {
+                let e = io::Error::last_os_error();
+                if e.kind() != io::ErrorKind::WouldBlock {
+                    tracing::debug!("wireguard endpoint recvmsg_x error: {e}");
+                }
+            }
+            return 0;
+        }
+        let got = ret as usize;
+        for (j, buf) in bufs[..got].iter_mut().enumerate() {
+            let len = msgs[j].msg_datalen.min(buf.capacity());
+            // SAFETY: the kernel wrote the first `msg_datalen` bytes
+            // of `buf`'s allocation (datalen is the copied count, ≤
+            // the advertised capacity), so those bytes are initialised
+            // and extending `len` over them is sound.
+            unsafe { buf.set_len(len) };
+        }
+        got
+    }
+}
+
+/// Darwin's batched-datagram SPI: `sendmsg_x`/`recvmsg_x`, declared in
+/// XNU's kernel-side `bsd/sys/socket_private.h` and exported by
+/// libSystem — no `#[link]` attribute needed (libSystem is always in
+/// the image). Private SPI but a stable presence since macOS 10.12,
+/// used in production by mDNSResponder, Network.framework and
+/// WireGuard's Apple clients; the `no-macos-sendmsg-x` feature is the
+/// escape hatch should that ever change.
+///
+/// Call contract (from `bsd/kern/uipc_syscalls.c`, xnu-11417):
+/// - `sendmsg_x` returns the count of datagrams sent; a mid-batch
+///   failure folds into a short count exactly like `sendmmsg`
+///   (`ERESTART`/`EINTR`/`EWOULDBLOCK`/`ENOBUFS`/`EMSGSIZE` after a
+///   partial send return the count, not the errno). `msg_flags` and
+///   `msg_datalen` must be zero on input. A connected datagram socket
+///   takes the `sendit_x`/`sosend_list` fast path; an unconnected one
+///   runs an in-kernel `sendit` loop that honours each message's
+///   `msg_name`/`msg_namelen` — the header comment's "address … not
+///   supported" is stale relative to the implementation.
+/// - `recvmsg_x` returns the count of datagrams received (the first
+///   message may block only without `MSG_DONTWAIT` — we always pass
+///   it), writing each message's copied byte count into `msg_datalen`.
+///   `cnt` must be in `1..=kern.ipc.maxrecvmsgx` (default 256).
+#[cfg(all(target_os = "macos", not(feature = "no-macos-sendmsg-x")))]
+mod msgx {
+    /// The `msghdr_x` wire layout, verbatim from `socket_private.h`'s
+    /// `struct msghdr_x` — a `msghdr` plus the trailing `msg_datalen`.
+    /// Every macOS target is LP64: pointers and `size_t` are 8-byte,
+    /// `socklen_t`/`int` 4-byte — 56 bytes, 8-aligned, matching the
+    /// kernel's `struct user64_msghdr_x`. The C spelling is kept so
+    /// this stays diffable against the header.
+    #[repr(C)]
+    #[allow(non_camel_case_types, reason = "keeps XNU's C spelling")]
+    pub struct msghdr_x {
+        pub msg_name: *mut libc::c_void,
+        pub msg_namelen: libc::socklen_t,
+        pub msg_iov: *mut libc::iovec,
+        pub msg_iovlen: libc::c_int,
+        pub msg_control: *mut libc::c_void,
+        pub msg_controllen: libc::socklen_t,
+        pub msg_flags: libc::c_int,
+        pub msg_datalen: usize,
+    }
+
+    // Layout pin: the kernel copyin is `struct user64_msghdr_x` —
+    // identical field order/sizes. If either assert trips the binding
+    // drifted from the wire format.
+    const _: () = assert!(size_of::<msghdr_x>() == 56);
+    const _: () = assert!(align_of::<msghdr_x>() == 8);
+    const _: () = assert!(std::mem::offset_of!(msghdr_x, msg_datalen) == 48);
+
+    extern "C" {
+        /// `ssize_t sendmsg_x(int, const struct msghdr_x *, u_int, int)`.
+        pub fn sendmsg_x(
+            socket: libc::c_int,
+            msgp: *const msghdr_x,
+            cnt: libc::c_uint,
+            flags: libc::c_int,
+        ) -> libc::ssize_t;
+
+        /// `ssize_t recvmsg_x(int, const struct msghdr_x *, u_int, int)`
+        /// — the header writes `const msgp` but the kernel's copyouts
+        /// write `msg_datalen`/`msg_flags` back through the array, so
+        /// the binding declares `*mut`.
+        pub fn recvmsg_x(
+            socket: libc::c_int,
+            msgp: *mut msghdr_x,
+            cnt: libc::c_uint,
+            flags: libc::c_int,
+        ) -> libc::ssize_t;
+    }
 }
 
 /// Serialize `addr` into `storage`, returning the `msg_namelen` the
@@ -351,11 +579,61 @@ fn write_sockaddr(storage: &mut libc::sockaddr_storage, addr: &SocketAddr) -> li
     }
 }
 
+/// Serialize `addr` into `storage`, returning the `msg_namelen` the
+/// kernel expects for the family — the Darwin variant, whose
+/// `sockaddr_in`/`sockaddr_in6` lead with the BSD `sin_len` byte the
+/// kernel validates on `sendto`-style calls.
+#[cfg(all(target_os = "macos", not(feature = "no-macos-sendmsg-x")))]
+fn write_sockaddr(storage: &mut libc::sockaddr_storage, addr: &SocketAddr) -> libc::socklen_t {
+    match addr {
+        SocketAddr::V4(v4) => {
+            let sa = libc::sockaddr_in {
+                sin_len: size_of::<libc::sockaddr_in>() as u8,
+                sin_family: libc::AF_INET as libc::sa_family_t,
+                sin_port: v4.port().to_be(),
+                sin_addr: libc::in_addr {
+                    s_addr: u32::from_ne_bytes(v4.ip().octets()),
+                },
+                sin_zero: [0; 8],
+            };
+            // SAFETY: `sockaddr_in` fits inside `sockaddr_storage`.
+            unsafe {
+                std::ptr::write(
+                    (storage as *mut libc::sockaddr_storage).cast::<libc::sockaddr_in>(),
+                    sa,
+                );
+            }
+            size_of::<libc::sockaddr_in>() as libc::socklen_t
+        }
+        SocketAddr::V6(v6) => {
+            let sa = libc::sockaddr_in6 {
+                sin6_len: size_of::<libc::sockaddr_in6>() as u8,
+                sin6_family: libc::AF_INET6 as libc::sa_family_t,
+                sin6_port: v6.port().to_be(),
+                sin6_flowinfo: v6.flowinfo(),
+                sin6_addr: libc::in6_addr {
+                    s6_addr: v6.ip().octets(),
+                },
+                sin6_scope_id: v6.scope_id(),
+            };
+            // SAFETY: `sockaddr_in6` fits inside `sockaddr_storage`.
+            unsafe {
+                std::ptr::write(
+                    (storage as *mut libc::sockaddr_storage).cast::<libc::sockaddr_in6>(),
+                    sa,
+                );
+            }
+            size_of::<libc::sockaddr_in6>() as libc::socklen_t
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    //! Loopback UDP batch I/O. This host is macOS, so these exercise
-    //! the per-datagram fallback; on Linux the same tests drive the
-    //! real `sendmmsg`/`recvmmsg` path.
+    //! Loopback UDP batch I/O. On Linux these drive the real
+    //! `sendmmsg`/`recvmmsg` path, on macOS `sendmsg_x`/`recvmsg_x`
+    //! (unless `no-macos-sendmsg-x` put the fallback back), elsewhere
+    //! the per-datagram loop.
     use super::*;
 
     fn std_sock() -> std::net::UdpSocket {
@@ -389,14 +667,10 @@ mod tests {
         a.writable().await.expect("sender writable");
         assert_eq!(a.send_batch_to(&refs), N);
 
-        b.readable().await.expect("receiver readable");
-        let mut buf = [0u8; 256];
-        let mut got = 0;
-        while let Ok(n) = b.try_recv(&mut buf) {
-            assert_eq!(&buf[..n], &payloads[got][..]);
-            got += 1;
-        }
-        assert_eq!(got, N);
+        // `readable` resolves on the first datagram; the rest of the
+        // batch can still be in flight, so drain with a deadline.
+        let got = drain_all(&b, N).await;
+        assert_eq!(got, payloads, "every datagram exactly once, in order");
     }
 
     /// A connected endpoint's `send_batch` delivers to the bound peer
@@ -416,14 +690,8 @@ mod tests {
         a.writable().await.expect("sender writable");
         assert_eq!(a.send_batch(&refs, b_addr), N);
 
-        b.readable().await.expect("receiver readable");
-        let mut buf = [0u8; 256];
-        let mut got = 0;
-        while let Ok(n) = b.try_recv(&mut buf) {
-            assert_eq!(&buf[..n], &payloads[got][..]);
-            got += 1;
-        }
-        assert_eq!(got, N);
+        let got = drain_all(&b, N).await;
+        assert_eq!(got, payloads, "every datagram exactly once, in order");
     }
 
     /// `recv_batch` fills leading slots, sizes each to its datagram,
@@ -445,11 +713,24 @@ mod tests {
         }
 
         let mut bufs: Vec<Vec<u8>> = (0..10).map(|_| vec![0u8; 128]).collect();
-        // Loopback delivery is synchronous at the kernel level; the
-        // `readable` await only covers the reactor's readiness cache.
+        // `readable` resolves on the first datagram; the rest of the
+        // backlog can still be in flight, so top up across calls until
+        // the queue yields all N. A 0-returning drain clears the
+        // cached readiness on the fallback path, so re-arm between
+        // calls; on the raw-syscall paths each call re-reads the
+        // kernel queue regardless.
         b.readable().await.expect("readable");
-        let n = b.recv_batch(&mut bufs, 10);
-        assert_eq!(n, N);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut n = 0;
+        while n < N {
+            n += b.recv_batch(&mut bufs[n..], 10 - n);
+            if n < N {
+                match tokio::time::timeout_at(deadline, b.readable()).await {
+                    Ok(r) => r.expect("readable"),
+                    Err(_) => panic!("recv_batch stalled at {n}/{N} datagrams"),
+                }
+            }
+        }
         for (i, buf) in bufs[..n].iter().enumerate() {
             assert_eq!(buf.len(), 40 + i);
             assert!(buf.iter().all(|&x| x == i as u8));
@@ -468,9 +749,20 @@ mod tests {
         }
         let mut bufs: Vec<Vec<u8>> = (0..10).map(|_| vec![0u8; 128]).collect();
         // The first drain ran the socket dry, clearing cached
-        // readiness — re-arm it before the second batch.
+        // readiness — re-arm it before the second batch, and top up
+        // for the same in-flight reason as above. The per-call budget
+        // keeps the total clamped at 3.
         b.readable().await.expect("readable");
-        let n = b.recv_batch(&mut bufs, 3);
+        let mut n = 0;
+        while n < 3 {
+            n += b.recv_batch(&mut bufs[n..], 3 - n);
+            if n < 3 {
+                match tokio::time::timeout_at(deadline, b.readable()).await {
+                    Ok(r) => r.expect("readable"),
+                    Err(_) => panic!("recv_batch stalled at {n}/3 datagrams"),
+                }
+            }
+        }
         assert_eq!(n, 3, "budget clamps the drain");
     }
 
@@ -560,9 +852,9 @@ mod tests {
         let mut bufs: Vec<Vec<u8>> = (0..N).map(|_| vec![0u8; 128]).collect();
         b.readable().await.expect("readable");
         // `readable` resolves on the first datagram; give the backlog
-        // a moment to land the rest so the queue provably holds ≥64
-        // before the batch is measured.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // a wide margin to land the rest so the queue provably holds
+        // ≥64 before the batch is measured.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         let first = b.recv_batch(&mut bufs, N);
         assert_eq!(
             first, WIRE_DRAIN_BUDGET,
@@ -578,5 +870,88 @@ mod tests {
         for (i, buf) in bufs[..second].iter().enumerate() {
             assert_eq!(buf.as_slice(), &[(i + first) as u8; 20]);
         }
+    }
+
+    /// P4-3 msgx pin — on macOS `send_batch`/`recv_batch` must be the
+    /// real `sendmsg_x`/`recvmsg_x` syscalls, not the per-datagram
+    /// fallback. There is no cheap in-process syscall counter for a
+    /// unit test (DTrace/`dtruss` sampling needs privileges the test
+    /// runner may not have — syscall density is instead measured
+    /// out-of-band by the real-machine benchmark), so the proof is
+    /// behavioural: tokio's `try_*` calls gate on the reactor's
+    /// *cached* readiness and read `WouldBlock` on a socket the driver
+    /// never polled, while the raw batch syscalls go straight to the
+    /// kernel — a batch that lands *without* arming the readiness
+    /// cache can only have come through `sendmsg_x`/`recvmsg_x`.
+    ///
+    /// The roundtrip itself re-asserts the batch contract: N staged
+    /// datagrams, one `send_batch` count of N, one `recv_batch` count
+    /// of N, payloads in wire order.
+    #[cfg(all(target_os = "macos", not(feature = "no-macos-sendmsg-x")))]
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_recv_batch_macos_msgx_roundtrip() {
+        let a_sock = std_sock();
+        let b_sock = std_sock();
+        let b_addr = b_sock.local_addr().expect("addr");
+        a_sock.connect(b_addr).expect("connect");
+        let a = ep(a_sock, true);
+        let b = ep(b_sock, true);
+
+        const N: usize = 12;
+        let payloads: Vec<Vec<u8>> = (0..N).map(|i| vec![0x30 + i as u8; 24 + i]).collect();
+        let refs: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
+        // No `writable()` arm: `try_send` would cold-gate to zero, so
+        // N accepted here is only possible through the raw syscall.
+        assert_eq!(
+            a.send_batch(&refs, b_addr),
+            N,
+            "a batch accepted on a never-polled socket is the sendmsg_x proof"
+        );
+
+        let mut bufs: Vec<Vec<u8>> = (0..N).map(|_| vec![0u8; 128]).collect();
+        // No `readable()` arm either: `recvmsg_x` reads the kernel
+        // queue directly — `try_recv_buf` would cold-gate to zero —
+        // so every datagram drained here came through the raw syscall
+        // on a never-polled socket. Delivery can still be in flight
+        // when the first drain runs, so top up across further raw
+        // drains — a gated fallback would return 0 forever and trip
+        // the deadline, which keeps the cold-gate proof intact.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut n = 0;
+        while n < N {
+            n += b.recv_batch(&mut bufs[n..], N - n);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "recv_batch stalled at {n}/{N} — a reactor-gated fallback \
+                 cold-gates to zero on this never-polled socket"
+            );
+            tokio::task::yield_now().await;
+        }
+        for (i, buf) in bufs.iter().enumerate() {
+            assert_eq!(buf.as_slice(), &payloads[i][..], "wire order preserved");
+        }
+    }
+
+    /// The `no-macos-sendmsg-x` opt-out restores the per-datagram
+    /// fallback: a `send_batch` on a never-polled socket cold-gates to
+    /// zero — the exact inverse of the msgx pin above.
+    #[cfg(all(target_os = "macos", feature = "no-macos-sendmsg-x"))]
+    #[tokio::test(flavor = "current_thread")]
+    async fn no_macos_sendmsg_x_restores_fallback() {
+        let a_sock = std_sock();
+        let b_addr = std_sock().local_addr().expect("addr");
+        a_sock.connect(b_addr).expect("connect");
+        let a = ep(a_sock, true);
+
+        let payloads: Vec<Vec<u8>> = (0..4).map(|i| vec![i as u8; 32]).collect();
+        let refs: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
+        assert_eq!(
+            a.send_batch(&refs, b_addr),
+            0,
+            "fallback `try_send` cold-gates without armed readiness"
+        );
+        // Compile-time pin: under this feature the batch calls must
+        // not claim the syscall path.
+        const _: () = assert!(!BatchEndpoint::BATCHED_SYSCALLS);
     }
 }
