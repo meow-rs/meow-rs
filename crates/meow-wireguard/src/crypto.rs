@@ -102,9 +102,13 @@ pub(crate) mod boring_ctx {
         /// `4..12` little-endian counter).
         pub(crate) fn seal(&self, nonce: [u8; 12], aad: &[u8], buf: &mut [u8]) -> [u8; 16] {
             let mut tag = [0u8; 16];
-            self.0
+            let written = self
+                .0
                 .seal_in_place(&nonce, buf, &mut tag, aad)
                 .expect("session seal never fails on a 12-byte nonce");
+            // BoringSSL reports the tag prefix it actually wrote — a
+            // short write would silently ship zero-padded tag bytes.
+            debug_assert_eq!(written.len(), 16);
             tag
         }
 
