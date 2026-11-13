@@ -40,7 +40,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use meow_wireguard::noise::handshake::parse_handshake_anon;
 use meow_wireguard::noise::rate_limiter::RateLimiter;
-use meow_wireguard::noise::{Packet, TunnResult};
+use meow_wireguard::noise::{Packet, PacketData, TunnResult};
 use meow_wireguard::x25519;
 use tracing::trace;
 
@@ -69,6 +69,27 @@ pub(super) enum Action {
     /// feed `device.rx_queue` with a refcount clone instead of a second
     /// copy.
     Inner { slot: usize, v6: bool, bytes: Bytes },
+}
+
+/// PATCH(18): `process_datagram`'s verify + dispatch verdict, split so
+/// the actor's parallel drain can park `Data` on the crypto pool and
+/// rejoin at [`PeerTable::admit_data`]. `Other` rides back into
+/// [`PeerTable::finish_verified`] — the same `handle_verified_packet`
+/// call `process_datagram` makes. The actor owns the datagram buffer
+/// itself, so only the parsed view (and the peer slot) travels here.
+pub(super) enum Verdict<'a> {
+    /// A DATA packet addressed to peer `slot` — the caller extracts the
+    /// session handle and builds a `CryptoJob` from the owned datagram.
+    Data { slot: usize, packet: PacketData<'a> },
+    /// Any other verified packet — handshake init/response, cookie
+    /// reply — handled serially through `handle_verified_packet`.
+    Other { slot: usize, packet: Packet<'a> },
+    /// An under-load cookie reply the limiter rendered for `src` —
+    /// send it verbatim (unstamped: it answers an unidentified
+    /// initiator).
+    CookieReply(Vec<u8>),
+    /// Forged/malformed/out-of-namespace — the silent drop.
+    Drop,
 }
 
 /// The multi-peer responder table: shared keys and limiter, the
@@ -194,6 +215,100 @@ impl PeerTable {
         (slot < self.peers.len()).then_some(slot)
     }
 
+    /// PATCH(18): `process_datagram`'s verify + dispatch half — the
+    /// shared rate-limiter check, then `slot_of`/`parse_handshake_anon`
+    /// dispatch — split so the actor's batch drain can run it serially
+    /// per datagram and fork the DATA arm into the crypto pool. The
+    /// ordering contract is unchanged: every datagram pays exactly one
+    /// `verify_packet`, in arrival order, before any dispatch.
+    pub(super) fn classify_datagram<'a>(
+        &mut self,
+        src: SocketAddr,
+        datagram: &'a [u8],
+    ) -> Verdict<'a> {
+        let mut cookie = [0u8; COOKIE_REPLY_SZ];
+        let packet = match self
+            .limiter
+            .verify_packet(Some(src.ip()), datagram, &mut cookie)
+        {
+            Ok(packet) => packet,
+            Err(TunnResult::WriteToNetwork(reply)) => {
+                // Under load: a cookie reply for an initiator we haven't
+                // identified — send it back to `src` unstamped. `reply`
+                // borrows the stack `cookie` array, so it copies.
+                return Verdict::CookieReply(reply.to_vec());
+            }
+            Err(_) => return Verdict::Drop, // forged/malformed: silent
+        };
+        match packet {
+            Packet::HandshakeInit(init) => {
+                // Anonymous half of the handshake: decrypt the
+                // initiator's static key only (cheap: two HMACs, one DH,
+                // one AEAD-open) to learn which configured peer this is.
+                match parse_handshake_anon(&self.secret, &self.public, &init) {
+                    Ok(half) => match self.peer_by_pubkey.get(&half.peer_static_public) {
+                        Some(&slot) => Verdict::Other { slot, packet },
+                        None => {
+                            trace!("wireguard: handshake init from unknown peer key ({src})");
+                            Verdict::Drop
+                        }
+                    },
+                    Err(_) => Verdict::Drop, // failed AEAD-open: silent
+                }
+            }
+            Packet::HandshakeResponse(p) => match self.slot_of(p.receiver_idx) {
+                Some(slot) => Verdict::Other { slot, packet },
+                None => Verdict::Drop,
+            },
+            Packet::PacketCookieReply(p) => match self.slot_of(p.receiver_idx) {
+                Some(slot) => Verdict::Other { slot, packet },
+                None => Verdict::Drop,
+            },
+            Packet::PacketData(p) => match self.slot_of(p.receiver_idx) {
+                Some(slot) => Verdict::Data { slot, packet: p },
+                None => Verdict::Drop,
+            },
+        }
+    }
+
+    /// PATCH(18): `process_datagram`'s post-dispatch tail —
+    /// `handle_verified_packet`, its `WriteToNetwork` chain, then
+    /// `handle_result`'s ACL/roam fold — callable for both the fused
+    /// serial path and the actor's non-DATA drain arm. Identical call
+    /// order to the fused version.
+    pub(super) fn finish_verified(
+        &mut self,
+        slot: usize,
+        src: SocketAddr,
+        packet: Packet<'_>,
+        actions: &mut Vec<Action>,
+        dst: &mut Vec<u8>,
+        recharge: &mut dyn FnMut() -> Vec<u8>,
+    ) {
+        let result = self.peers[slot].tunn.handle_verified_packet(packet, dst);
+        match result {
+            TunnResult::WriteToNetwork(b) => {
+                let len = b.len();
+                self.enqueue_wire(actions, slot, src, len, dst, recharge);
+                // boringtun's chained-empty-datagram contract: packets
+                // queued behind the handshake this result just answered
+                // flush through `decapsulate` until it stops producing.
+                while let TunnResult::WriteToNetwork(b) =
+                    self.peers[slot].tunn.decapsulate(None, &[], dst)
+                {
+                    let addr = self.peers[slot].endpoint.unwrap_or(src);
+                    let len = b.len();
+                    self.enqueue_wire(actions, slot, addr, len, dst, recharge);
+                }
+            }
+            // Roaming is decided *inside* `handle_result`, after the
+            // inner-packet ACL verdict it produces: an
+            // authenticated-but-ACL-rejected packet must not move the
+            // endpoint.
+            other => self.handle_result(slot, src, other, actions),
+        }
+    }
+
     /// Verify and dispatch one wire datagram. `datagram` is the packet
     /// **with reserved bytes 1..4 already cleared by the caller** (the
     /// actor zeroes its copy before handing it over — inbound reserved
@@ -214,78 +329,52 @@ impl PeerTable {
         recharge: &mut dyn FnMut() -> Vec<u8>,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
-        let mut cookie = [0u8; COOKIE_REPLY_SZ];
-        let packet = match self
-            .limiter
-            .verify_packet(Some(src.ip()), datagram, &mut cookie)
-        {
-            Ok(packet) => packet,
-            Err(TunnResult::WriteToNetwork(reply)) => {
-                // Under load: a cookie reply for an initiator we haven't
-                // identified — send it back to `src` unstamped. `reply`
-                // borrows the stack `cookie` array, not `dst`, so it
-                // copies.
-                actions.push(Action::ToWire {
-                    addr: src,
-                    bytes: reply.to_vec(),
-                });
-                return actions;
+        match self.classify_datagram(src, datagram) {
+            Verdict::Data { slot, packet } => self.finish_verified(
+                slot,
+                src,
+                Packet::PacketData(packet),
+                &mut actions,
+                dst,
+                recharge,
+            ),
+            Verdict::Other { slot, packet } => {
+                self.finish_verified(slot, src, packet, &mut actions, dst, recharge);
             }
-            Err(_) => return actions, // forged/malformed: silent
-        };
-        let slot = match packet {
-            Packet::HandshakeInit(init) => {
-                // Anonymous half of the handshake: decrypt the
-                // initiator's static key only (cheap: two HMACs, one DH,
-                // one AEAD-open) to learn which configured peer this is.
-                match parse_handshake_anon(&self.secret, &self.public, &init) {
-                    Ok(half) => match self.peer_by_pubkey.get(&half.peer_static_public) {
-                        Some(&slot) => slot,
-                        None => {
-                            trace!("wireguard: handshake init from unknown peer key ({src})");
-                            return actions;
-                        }
-                    },
-                    Err(_) => return actions, // failed AEAD-open: silent
-                }
-            }
-            Packet::HandshakeResponse(p) => match self.slot_of(p.receiver_idx) {
-                Some(slot) => slot,
-                None => return actions,
-            },
-            Packet::PacketCookieReply(p) => match self.slot_of(p.receiver_idx) {
-                Some(slot) => slot,
-                None => return actions,
-            },
-            Packet::PacketData(p) => match self.slot_of(p.receiver_idx) {
-                Some(slot) => slot,
-                None => return actions,
-            },
-        };
-
-        let result = self.peers[slot].tunn.handle_verified_packet(packet, dst);
-        match result {
-            TunnResult::WriteToNetwork(b) => {
-                let len = b.len();
-                self.enqueue_wire(&mut actions, slot, src, len, dst, recharge);
-                // boringtun's chained-empty-datagram contract: packets
-                // queued behind the handshake this result just answered
-                // flush through `decapsulate` until it stops producing.
-                while let TunnResult::WriteToNetwork(b) =
-                    self.peers[slot].tunn.decapsulate(None, &[], dst)
-                {
-                    let addr = self.peers[slot].endpoint.unwrap_or(src);
-                    let len = b.len();
-                    self.enqueue_wire(&mut actions, slot, addr, len, dst, recharge);
-                }
-            }
-            // Roaming is decided *inside* `handle_result`, after the
-            // inner-packet ACL verdict it produces: an
-            // authenticated-but-ACL-rejected packet must not move the
-            // endpoint.
-            other => self.handle_result(slot, src, other, &mut actions),
+            Verdict::CookieReply(bytes) => actions.push(Action::ToWire { addr: src, bytes }),
+            Verdict::Drop => {}
         }
         actions
+    }
+
+    /// PATCH(18): the DATA post-pass's ACL + roam for the parallel
+    /// drain — the `handle_inner` verdict on a decrypted inner packet
+    /// whose plaintext lives in an *owned* `Bytes` (the crypto-pool's
+    /// receive slot) instead of a `dst` borrow. `src_ip` comes from
+    /// `handle_decrypted_data`'s validated header. Admitted packets
+    /// roam the endpoint exactly like `handle_result`'s arm; rejected
+    /// ones are the same silent drop.
+    pub(super) fn admit_data(
+        &mut self,
+        slot: usize,
+        src: SocketAddr,
+        src_ip: IpAddr,
+        pkt: Bytes,
+    ) -> Option<Action> {
+        if self.peers[slot].allows_src(src_ip) {
+            self.roam(slot, src);
+            Some(Action::Inner {
+                slot,
+                v6: src_ip.is_ipv6(),
+                bytes: pkt,
+            })
+        } else {
+            trace!(
+                "wireguard: peer '{}' inner src {src_ip} outside allowed_ips",
+                self.peers[slot].label
+            );
+            None
+        }
     }
 
     /// Fold a non-`WriteToNetwork` `TunnResult` into actions: inner

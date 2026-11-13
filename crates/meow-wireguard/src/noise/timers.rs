@@ -157,7 +157,7 @@ impl Tunn {
                 if let Some(session) = self.sessions[i].take() {
                     tracing::debug!(
                         message = "SESSION_EXPIRED(REJECT_AFTER_TIME)",
-                        session = session.receiving_index
+                        session = session.crypto.receiving_index
                     );
                 }
                 *t = time_now;

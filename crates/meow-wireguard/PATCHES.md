@@ -293,6 +293,94 @@ Patch 17 — In-place decapsulation for the single-peer data path
   inbound datagram through `decapsulate_in_place` and pushes the
   returned `Bytes` view of the slot Vec into `device.rx_queue` —
   `Bytes::from(Vec)` + `slice` is a refcount hand-off, not a copy.
+
+Patch 18 — Shared session crypto + process-wide data-plane crypto pool
+  Motivation: receive-side AEAD was serial per actor — one inbound DATA
+  datagram's open ran on the pump/listener thread between two socket
+  syscalls, so a multi-gigabit peer was bounded by one core's
+  ChaCha20-Poly1305. The fix splits every wire batch into a serial
+  verify/demux phase, a parallel AEAD phase on a resident worker pool,
+  and a serial post-pass that replays the session/timer bookkeeping in
+  the batch's original arrival order. TX stays serial end to end.
+  Files:
+  * noise/session.rs: all data-plane crypto state moved into
+    `pub(crate) SessionCrypto` — `receiving_index`/`sending_index`, the
+    per-backend AEAD handles (BoringSSL `SessionAead` ctxs under
+    `wireguard-boring`; *cached* `ChaCha20Poly1305` sender/receiver
+    ciphers without — PATCH(4)'s per-packet `new_from_slice` key
+    schedule is gone from the fallback data path too),
+    `AtomicU64 sending_key_counter`, and
+    `Mutex<ReceivingKeyCounterValidator>`. `Session` is now just
+    `Arc<SessionCrypto>` — the ring's `[Option<Session>; N_SESSIONS]`
+    layout is unchanged and `Session` is never cloned; an `Arc` handle
+    outlives a mid-batch rotation, which is exactly what a worker job
+    needs. All `Session`/`SessionCrypto` methods delegate through the
+    shared struct; `receive_packet_data_in_place` is `pub(crate)` so the
+    pool reaches it through the handle. The replay-window mutex makes
+    concurrent opens on one session replay-safe: the
+    `receiving_counter_mark` under lock, not the lock-free quick check,
+    is authoritative.
+  * crypto.rs: the non-boring `session_seal_in_place`,
+    `session_open_in_place` and `session_decrypt_in_place` take
+    `&ChaCha20Poly1305` instead of `&[u8; 32]` — same bodies, the caller
+    passes the cached cipher. The `wireguard-boring` signatures and the
+    handshake-path AEAD are untouched.
+  * noise/mod.rs: `SessionHandle` — a pub `Arc<SessionCrypto>` newtype
+    whose `pub(crate) open_in_place` runs the in-place open without
+    `&mut Tunn`. `WireClass` — the verify/dispatch verdict split out of
+    `decapsulate`/`decapsulate_in_place`: `Data(PacketData)` /
+    `Other(Packet)` / `CookieReply(len)` / `Drop(WireGuardError)`.
+    `classify_incoming` computes it (identical `verify_packet` +
+    dispatch, in the identical order); both fused entry points now sit
+    on top of it. `PacketData::counter()` exposes the transport counter
+    (nonce + replay key) to `CryptoJob` builders. `session_handle_for`
+    clones the ring slot's `Arc` for a `receiver_idx`. And
+    `handle_decrypted_data` is `handle_data_in_place`'s serial tail —
+    `set_current_session` → `TimeLastPacketReceived` →
+    `validate_decapsulated_packet` — callable once the worker has
+    rewritten `buf[DATA_PAYLOAD_OFF..]` to plaintext.
+  * crypto_pool.rs (new): `CryptoPool`, the process-wide resident
+    worker set behind `CryptoPool::shared()` (`OnceLock` — spawned on
+    first use, shared by every outbound pump and inbound listener
+    actor). `W = min(available_parallelism - 1, 4)`, floor 1 — the
+    `- 1` keeps a core for the actor's own serial work, `4` is where
+    the per-session replay mutex and single consumer stop scaling.
+    `CryptoJob` carries the *owned* wire datagram plus
+    `Option<SessionHandle>`; `run` splits contiguous `Vec` chunks over
+    `std::sync::mpsc`, one per worker, and merges results positionally —
+    job order is preserved with no reorder buffer. `W <= 1` or
+    `n <= 2` runs inline (the spec's serial fallback); a worker dead at
+    dispatch re-runs its chunk on the caller, while one lost mid-pass
+    degrades to a dropped datagram — the job's caller-owned `tag` keeps
+    the remaining results mapped to the right contexts and the
+    caller's receive-slot healing re-arms the missing buffers, so the
+    loss is indistinguishable from a UDP drop.
+  * lib.rs: `CryptoJob`, `CryptoPool`, `SessionHandle`, `WireClass`
+    (and PATCH(17)'s `DATA_PAYLOAD_OFF`) re-exported for the pump and
+    the listener demux.
+  Callers:
+  * `meow-proxy`'s wireguard pump (`drain_wire`): serial
+    `classify_incoming` per filled `rx_slot` → DATA slots move into
+    `CryptoJob`s (the slot Vec itself travels — the worker opens it in
+    place, so the zero-copy `Bytes` hand-off PATCH(17) built is
+    unchanged) → `CryptoPool::shared().run` → `handle_decrypted_data`
+    per job in wire order. Non-DATA packets — handshake, cookie reply,
+    drop — finish inline in arrival order, including the chained
+    empty-datagram flush and the rate-limited desync kick.
+  * `meow-listener`'s wireguard demux/actor: `process_datagram` split
+    into `classify_datagram` (shared limiter/mac1 + `receiver_idx >> 8`
+    peer dispatch) and `finish_verified` (the `handle_verified_packet`
+    tail); the actor's `drain_wire` flattens DATA jobs across *all*
+    peers into the one shared pool, then replays per-job
+    `handle_decrypted_data` + `admit_data` (the ACL + roam gate) in
+    wire order with each datagram's `SocketAddr` kept — the
+    unconnected socket's source metadata is preserved.
+  Invariants kept: `handle_verified_packet`'s upstream dispatch is
+  verbatim; handshake/timer/cookie output stays on the actor thread;
+  the `[Option<Session>; N_SESSIONS]` ring type is unchanged; both
+  crypto backends build and pass the same tests; `receive_packet_data`
+  (the `dst` path `decapsulate` uses) is untouched apart from reading
+  through `self.crypto`.
 ```
 
 Notes on what did NOT need patching

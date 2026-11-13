@@ -45,7 +45,7 @@ use meow_wgstack::{
     ChannelDevice, StreamEvent, TcpIo, WgStream, TCP_READ_QUEUE, TCP_SOCKET_BUF, TCP_WRITE_QUEUE,
     WG_TIMER_INTERVAL, WIRE_DRAIN_BUDGET,
 };
-use meow_wireguard::{TunnResult, DATA_OVERHEAD_SZ};
+use meow_wireguard::{CryptoJob, CryptoPool, TunnResult, DATA_OVERHEAD_SZ, DATA_PAYLOAD_OFF};
 use smoltcp::iface::{Config as IfaceConfig, Interface, SocketSet};
 use smoltcp::socket::tcp;
 use smoltcp::time::Instant as SmolInstant;
@@ -55,7 +55,7 @@ use tokio::sync::mpsc;
 use tokio::time::{timeout_at, Instant as TokioInstant};
 use tracing::{debug, info, trace, warn};
 
-use super::demux::{Action, PeerTable};
+use super::demux::{Action, PeerTable, Verdict};
 use super::inner_udp::{self, UdpFlow, UdpFlowKey};
 use crate::sniffer::SnifferRuntime;
 use crate::stream_sniff::{sniff_first_payload, STREAM_SNIFF_GATHER_MAX};
@@ -181,6 +181,15 @@ pub(super) struct WgActor {
     /// fixed `work` buffer's size).
     scratch_len: usize,
     recv_buf: Vec<u8>,
+    /// PATCH(18): the batch drain's receive slots — the pump's
+    /// `rx_slots` shape: [`WIRE_DRAIN_BUDGET`] independent
+    /// `mtu + 256`-byte buffers so a DATA packet's datagram can move
+    /// into the crypto pool (and onward into `rx_queue` as `Bytes`)
+    /// without ever copying the payload. Unlike the pump's
+    /// capacity-only slots these stay fully sized — the listener's
+    /// unconnected socket reads each datagram with
+    /// `try_recv_from(&mut [u8])`, which needs the whole slice.
+    rx_slots: Vec<Vec<u8>>,
     outbox: VecDeque<(SocketAddr, Vec<u8>)>,
 
     tcp: HashMap<smoltcp::iface::SocketHandle, TcpFlow>,
@@ -325,6 +334,9 @@ impl WgActor {
             scratch_pool: VecDeque::new(),
             scratch_len: mtu + 256,
             recv_buf: vec![0u8; mtu + 256],
+            rx_slots: (0..WIRE_DRAIN_BUDGET)
+                .map(|_| vec![0u8; mtu + 256])
+                .collect(),
             outbox: VecDeque::new(),
             tcp: HashMap::new(),
             tcp_by_tuple: HashMap::new(),
@@ -520,18 +532,182 @@ impl WgActor {
     // ── wire ingress ─────────────────────────────────────────────────
 
     /// Nonblocking drain of everything the endpoint already has, up to
-    /// [`WIRE_DRAIN_BUDGET`] — the burst bound the pump shares.
+    /// [`WIRE_DRAIN_BUDGET`], as the PATCH(18) three-phase pass:
+    ///
+    ///   A. **Serial demux** — `try_recv_from` into `rx_slots`, then
+    ///      reserved-scrub + `classify_datagram` per slot in wire order
+    ///      (the shared limiter/mac1 verify and peer dispatch the fused
+    ///      `process_datagram` ran — ordering contract unchanged). DATA
+    ///      packets become `CryptoJob`s flattened across peers: the slot
+    ///      Vec itself travels into the job, so the worker opens it in
+    ///      place and the same buffer becomes the `Bytes` the stack
+    ///      consumes — zero-copy end to end. Non-DATA packets —
+    ///      handshakes, cookie replies, drops — finish inline through
+    ///      `finish_verified` in arrival order.
+    ///   B. **Worker pass** — `CryptoPool::shared().run(&mut jobs)` on
+    ///      the process-wide pool: a multi-peer burst parallelises
+    ///      across all the peers it spans, not just per-peer.
+    ///   C. **Serial post-pass** — in wire order:
+    ///      `handle_decrypted_data` replays the session/timer/validate
+    ///      bookkeeping, `admit_data` runs the ACL + roam gate, and the
+    ///      slot's `Bytes` view moves into `handle_inner`.
+    ///
+    /// Reordering vs the serial drain is confined to disjoint sinks: an
+    /// interleaved non-DATA datagram's `ToWire` actions land before a
+    /// DATA packet's `Inner`, and each sink — the wire socket and the
+    /// smoltcp feed — still sees its own inputs in order (the pump's
+    /// drain_wire carries the same contract).
     fn drain_wire(&mut self) {
-        for _ in 0..WIRE_DRAIN_BUDGET {
-            match self.endpoint.try_recv_from(&mut self.recv_buf) {
-                Ok((n, src)) => self.demux_one(src, n),
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(e) => {
-                    debug!("wireguard {}: endpoint recv error: {e}", self.name);
-                    break;
+        let mut slots = std::mem::take(&mut self.rx_slots);
+        let mut jobs: Vec<CryptoJob> = Vec::new();
+        // (rx-slot index, datagram source, peer slot) per job — the
+        // post-pass replays them back in the same wire order.
+        let mut ctxs: Vec<(usize, SocketAddr, usize)> = Vec::new();
+        // Phase-A actions — `finish_verified` can only emit `ToWire`
+        // for a non-DATA packet (handshake response, its chained
+        // flush, or the under-load cookie reply): inner packets can
+        // only come out of the DATA arm, which phase C owns.
+        let mut actions: Vec<Action> = Vec::new();
+        let mut dst = self.take_scratch();
+        // `recharge` refills `dst` from the pool each time a produced
+        // wire datagram consumes it — the `demux_one` field-precise
+        // capture trick: `self.table` stays borrowable while the
+        // closure owns `scratch_pool`/`scratch_len`. The scope ends its
+        // borrow before the `&mut self` calls below it.
+        {
+            let mut recharge = || {
+                reset_scratch(
+                    self.scratch_pool.pop_back().unwrap_or_default(),
+                    self.scratch_len,
+                )
+            };
+            for (i, slot) in slots.iter_mut().enumerate() {
+                // `slots` stays `WIRE_DRAIN_BUDGET` long — the recv loop
+                // just stops early on WouldBlock/error.
+                let (n, src) = match self.endpoint.try_recv_from(slot) {
+                    Ok(x) => x,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) => {
+                        debug!("wireguard {}: endpoint recv error: {e}", self.name);
+                        break;
+                    }
+                };
+                let mut pkt = std::mem::take(slot);
+                // Inbound reserved bytes 1..4 zero before parse — the same
+                // scrub `demux_one` documents (WARP peers stamp the field;
+                // the vendored parser checks it as part of the LE type).
+                if n >= 4 {
+                    pkt[1..4].fill(0);
+                }
+                match self.table.classify_datagram(src, &pkt[..n]) {
+                    Verdict::Data {
+                        slot: peer_slot,
+                        packet,
+                    } => {
+                        let (receiver_idx, counter) = (packet.receiver_idx, packet.counter());
+                        // `Arc` the session crypto while `&mut self.table`
+                        // is free — the job carries it to the worker; a
+                        // mid-batch re-handshake replacing the ring slot
+                        // can't strand the open.
+                        let crypto = self.table.peers()[peer_slot]
+                            .tunn
+                            .session_handle_for(receiver_idx);
+                        let mut job = CryptoJob::new(pkt, n, receiver_idx, counter, crypto);
+                        // The job's own context tag — the post-pass
+                        // lands each result on its (slot, source, peer)
+                        // exactly, even if a lost chunk ever shifted
+                        // the return positions.
+                        job.tag = ctxs.len();
+                        jobs.push(job);
+                        ctxs.push((i, src, peer_slot));
+                    }
+                    Verdict::Other {
+                        slot: peer_slot,
+                        packet,
+                    } => {
+                        self.table.finish_verified(
+                            peer_slot,
+                            src,
+                            packet,
+                            &mut actions,
+                            &mut dst,
+                            &mut recharge,
+                        );
+                        *slot = pkt;
+                    }
+                    Verdict::CookieReply(bytes) => {
+                        actions.push(Action::ToWire { addr: src, bytes });
+                        *slot = pkt;
+                    }
+                    Verdict::Drop => *slot = pkt,
                 }
             }
         }
+        // Phase-A wire output first — socket sends land before the
+        // crypto results rejoin, exactly as the serial drain emitted
+        // them.
+        for action in actions {
+            self.apply_action(action);
+        }
+        self.return_scratch(dst);
+
+        // Phase B — the batch's AEAD opens, in place inside the job
+        // bufs. `run` fills every `job.result`, preserving job order.
+        CryptoPool::shared().run(&mut jobs);
+
+        // Phase C — serial post-pass in wire order. The demux's serial
+        // contract drops DATA decrypt/auth errors silently; the fused
+        // path's `handle_result` `_` arm did the same, so no log.
+        for job in jobs {
+            let (i, src, peer_slot) = ctxs[job.tag];
+            let mut pkt = job.buf;
+            slots[i] = match job.result {
+                Some(Ok(pt_len)) => {
+                    let produced = match self.table.peers_mut()[peer_slot]
+                        .tunn
+                        .handle_decrypted_data(job.receiver_idx, pt_len, &mut pkt[..job.wire_len])
+                    {
+                        TunnResult::WriteToTunnelV4(b, ip) => Some((b.len(), IpAddr::V4(ip))),
+                        TunnResult::WriteToTunnelV6(b, ip) => Some((b.len(), IpAddr::V6(ip))),
+                        // Keepalive (Done) / malformed-inner / the
+                        // session bookkeeping paths — all silent.
+                        _ => None,
+                    };
+                    match produced {
+                        Some((len, src_ip)) => {
+                            // The pump's `Bytes` hand-off: bound the Vec
+                            // to the datagram, take over the allocation,
+                            // publish only the plaintext view.
+                            pkt.truncate(job.wire_len);
+                            let bytes =
+                                Bytes::from(pkt).slice(DATA_PAYLOAD_OFF..DATA_PAYLOAD_OFF + len);
+                            if let Some(action) =
+                                self.table.admit_data(peer_slot, src, src_ip, bytes)
+                            {
+                                self.apply_action(action);
+                            }
+                            // Consumed slot — back-fill a fresh
+                            // full-size buffer for the next drain.
+                            vec![0u8; self.scratch_len]
+                        }
+                        None => pkt,
+                    }
+                }
+                Some(Err(_)) | None => pkt,
+            };
+        }
+        // A worker-lost chunk leaves its slots `mem::take`n — capacity-0
+        // husks whose `try_recv_from` would read zero bytes forever.
+        // Back-fill them at full size; a loss-free pass heals nothing.
+        let mut healed = 0usize;
+        for slot in &mut slots {
+            if slot.capacity() == 0 {
+                *slot = vec![0u8; self.scratch_len];
+                healed += 1;
+            }
+        }
+        debug_assert_eq!(healed, 0, "crypto pool lost a chunk's buffers");
+        self.rx_slots = slots;
     }
 
     /// One wire datagram through the peer table. The recv buffer is
@@ -2848,6 +3024,143 @@ mod tests {
             actor.scratch_pool.len(),
             SCRATCH_POOL_CAP,
             "pool residency is capped — past it the Vec frees"
+        );
+    }
+
+    /// PATCH(18): `drain_wire`'s parallel path end to end — a real
+    /// handshake over the actor's own socket, then a DATA burst run
+    /// through `classify_datagram` → `CryptoPool` → `handle_decrypted_data`
+    /// + `admit_data`. Each burst's first datagram rides `recv_from` →
+    /// `demux_one` — the production select arm's shape, which also arms
+    /// the reactor readiness the `try_*` calls gate on — and the rest
+    /// batch through the crypto pool. Order is asserted off `rx_queue`:
+    /// every admitted inner TCP segment lands there in wire order.
+    #[tokio::test(flavor = "current_thread")]
+    async fn drain_wire_parallel_decrypts_in_wire_order() {
+        use meow_wireguard::x25519;
+
+        let server_secret = x25519::StaticSecret::from([0x5E; 32]);
+        let server_public = x25519::PublicKey::from(&server_secret);
+        let client_secret = x25519::StaticSecret::from([0xA0; 32]);
+        let client_public = x25519::PublicKey::from(&client_secret);
+        let spec = WgListenerSpec {
+            private_key: server_secret.to_bytes(),
+            peers: vec![WgPeerSpec {
+                public_key: client_public.to_bytes(),
+                preshared_key: None,
+                allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
+                name: SmolStr::new(""),
+                reserved: None,
+            }],
+            mtu: 1420,
+            udp: true,
+            udp_timeout: Duration::from_secs(60),
+        };
+        let mut actor = actor_with_spec(spec);
+        let mut client =
+            meow_wireguard::Tunn::new(client_secret, server_public, None, None, 0, None);
+        let actor_addr: SocketAddr = format!("127.0.0.1:{}", actor.bound_port).parse().unwrap();
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("client socket");
+        let client_addr = sender.local_addr().unwrap();
+        let mut work = vec![0u8; 4096];
+
+        /// The production receive arm: async `recv_from` for the
+        /// datagram that woke the reactor (feeds `demux_one` serially
+        /// and arms the `try_*` readiness), then `drain_wire` for
+        /// whatever else is already queued.
+        async fn feed_pending(actor: &mut WgActor) {
+            let (n, src) = actor
+                .endpoint
+                .recv_from(&mut actor.recv_buf)
+                .await
+                .expect("datagram ready");
+            actor.demux_one(src, n);
+            actor.drain_wire();
+        }
+
+        // A real handshake across the socket: init → response → the
+        // client's keepalive → established.
+        let init = {
+            let TunnResult::WriteToNetwork(b) =
+                client.format_handshake_initiation(&mut work, false)
+            else {
+                panic!("initiation formats");
+            };
+            b.to_vec()
+        };
+        sender.send_to(&init, actor_addr).expect("send init");
+        feed_pending(&mut actor).await;
+        let (resp_addr, resp) = actor
+            .outbox
+            .pop_front()
+            .expect("init produces a handshake response");
+        assert_eq!(resp_addr, client_addr);
+        let keepalive = {
+            let TunnResult::WriteToNetwork(b) =
+                client.decapsulate(Some(client_addr.ip()), &resp, &mut work)
+            else {
+                panic!("client consumes the response");
+            };
+            b.to_vec()
+        };
+        sender
+            .send_to(&keepalive, actor_addr)
+            .expect("send keepalive");
+        feed_pending(&mut actor).await;
+        assert!(actor.outbox.is_empty(), "the keepalive answers nothing");
+
+        // Eight DATA datagrams — inner TCP segments whose seq and last
+        // payload byte mark wire order (`seg_v4_data` checksums for
+        // real, which smoltcp requires).
+        const N: usize = 8;
+        let client_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let target_ip: Ipv4Addr = "203.0.113.9".parse().unwrap();
+        for i in 0..N {
+            let inner = seg_v4_data(
+                client_ip,
+                target_ip,
+                40000,
+                443,
+                1000 + i as u32,
+                0,
+                0x18,
+                &[i as u8],
+            );
+            let wire = {
+                let TunnResult::WriteToNetwork(b) = client.encapsulate(&inner, &mut work) else {
+                    panic!("encapsulate yields wire data");
+                };
+                b.to_vec()
+            };
+            sender.send_to(&wire, actor_addr).expect("send data");
+        }
+        feed_pending(&mut actor).await;
+
+        // Every admitted segment reached smoltcp in wire order — the
+        // first through `demux_one`'s serial path, the rest through the
+        // pool pass.
+        assert_eq!(
+            actor.device.rx_queue.len(),
+            N,
+            "every DATA datagram produced an inner packet"
+        );
+        for (i, pkt) in actor.device.rx_queue.iter().enumerate() {
+            assert_eq!(
+                u32::from_be_bytes(pkt[24..28].try_into().unwrap()),
+                1000 + i as u32,
+                "rx_queue order must match wire order"
+            );
+            assert_eq!(pkt.last(), Some(&(i as u8)));
+        }
+        // An ACL-admitted inner moved the peer's endpoint to the
+        // datagram source — the roam gate still runs post-decrypt.
+        assert_eq!(actor.table.peers()[0].endpoint, Some(client_addr));
+        // Consumed slots were back-filled at full size — the next
+        // drain's `try_recv_from` still sees the whole window.
+        let full = actor.scratch_len;
+        assert!(
+            actor.rx_slots.iter().all(|s| s.len() == full),
+            "every rx_slot returns at full size"
         );
     }
 }
