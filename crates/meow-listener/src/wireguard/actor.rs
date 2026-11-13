@@ -400,29 +400,7 @@ impl WgActor {
         self.drain_inject();
         self.service_tcp();
         self.sweep_udp_flows();
-        let now = SmolInstant::now();
-        // `post_poll`'s bookkeeping only has work when the poll could
-        // have changed anything it tracks — fresh inner packets fed to
-        // smoltcp, packets emitted (an accept's SYN-ACK), or same-pass
-        // bookkeeping outstanding. A quiet pass skips its O(sockets)
-        // sweeps entirely: no accept, no abort, no orphan can appear
-        // out of nothing (timer-driven deaths of owned flows are
-        // already caught by `service_tcp`'s own iteration).
-        let had_rx = !self.device.rx_queue.is_empty();
-        // Burst, not a single poll: smoltcp egresses at most one TCP
-        // segment per socket per `poll`, so one call per pass capped a
-        // bulk flow at ~1 segment per inner-RTT wake (~285 KB/s
-        // measured). `poll_burst` loops until the stack goes quiet.
-        poll_burst(&mut self.iface, now, &mut self.device, &mut self.sockets);
-        if had_rx
-            || !self.device.tx_queue.is_empty()
-            || !self.pending_syn.is_empty()
-            || !self.in_flight_syns.is_empty()
-            || !self.pending_close.is_empty()
-            || !self.dead_dying.is_empty()
-        {
-            self.post_poll();
-        }
+        self.poll_stack();
         self.drain_device_tx();
         if self.last_timer.elapsed() >= WG_TIMER_INTERVAL {
             self.last_timer = Instant::now();
@@ -452,6 +430,38 @@ impl WgActor {
             }
         }
         self.flush_outbox();
+    }
+
+    /// The smoltcp half of a service pass: burst-poll the interface,
+    /// then `post_poll`'s registration/cleanup when the pass could
+    /// have moved anything it tracks. Its own method so `service`'s
+    /// poll step and the T1 burst pin drive the exact same code — a
+    /// regression to one `iface.poll` per pass must fail that test,
+    /// not just prod.
+    fn poll_stack(&mut self) {
+        let now = SmolInstant::now();
+        // `post_poll`'s bookkeeping only has work when the poll could
+        // have changed anything it tracks — fresh inner packets fed to
+        // smoltcp, packets emitted (an accept's SYN-ACK), or same-pass
+        // bookkeeping outstanding. A quiet pass skips its O(sockets)
+        // sweeps entirely: no accept, no abort, no orphan can appear
+        // out of nothing (timer-driven deaths of owned flows are
+        // already caught by `service_tcp`'s own iteration).
+        let had_rx = !self.device.rx_queue.is_empty();
+        // Burst, not a single poll: smoltcp egresses at most one TCP
+        // segment per socket per `poll`, so one call per pass capped a
+        // bulk flow at ~1 segment per inner-RTT wake (~285 KB/s
+        // measured). `poll_burst` loops until the stack goes quiet.
+        poll_burst(&mut self.iface, now, &mut self.device, &mut self.sockets);
+        if had_rx
+            || !self.device.tx_queue.is_empty()
+            || !self.pending_syn.is_empty()
+            || !self.in_flight_syns.is_empty()
+            || !self.pending_close.is_empty()
+            || !self.dead_dying.is_empty()
+        {
+            self.post_poll();
+        }
     }
 
     /// A crypto dst buffer for the next `Tunn` call: a pooled one reset
@@ -1653,17 +1663,14 @@ mod tests {
         actor.inner_tcp(slot, &Bytes::copy_from_slice(pkt), &view);
     }
 
-    /// The poll half of a service pass: smoltcp consumes the rx queue
-    /// (burst-polled, the same way `service` drives it), then post_poll
-    /// does registration/cleanup.
+    /// The poll half of a service pass, driven through the same
+    /// `poll_stack` `service` itself runs: smoltcp consumes the rx
+    /// queue under the burst loop, then the gated `post_poll` does
+    /// registration/cleanup. Tests never re-spell a `poll_burst` call
+    /// of their own — the binding under test is the production poll
+    /// path, not the helper.
     fn poll_once(actor: &mut WgActor) {
-        poll_burst(
-            &mut actor.iface,
-            SmolInstant::now(),
-            &mut actor.device,
-            &mut actor.sockets,
-        );
-        actor.post_poll();
+        actor.poll_stack();
     }
 
     /// `tcp_listen_pool_lazy_alloc`: listeners are created per new
@@ -2141,12 +2148,9 @@ mod tests {
             .out
             .push_back(TcpIo::Data(Bytes::from(vec![0xAB; 32 * 1024])));
         actor.service_tcp(); // the conn→socket drain fills the tx buffer
-        poll_burst(
-            &mut actor.iface,
-            SmolInstant::now(),
-            &mut actor.device,
-            &mut actor.sockets,
-        );
+                             // The same poll step `service()` runs — the pin is on the
+                             // service-pass poll loop, not on `poll_burst` the helper.
+        actor.poll_stack();
         assert!(
             actor.device.tx_queue.len() >= 10,
             "one pass must burst a multi-segment write, got {}",

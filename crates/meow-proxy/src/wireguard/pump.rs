@@ -1053,6 +1053,19 @@ impl WgPump {
         smol_delay.min(WG_TIMER_INTERVAL.saturating_sub(self.last_timer.elapsed()))
     }
 
+    /// The interface-poll step of a service pass — its own method so
+    /// `run`'s poll and the T1 burst pin drive the exact same code: a
+    /// regression to one `iface.poll` per pass must fail that test,
+    /// not just prod.
+    fn poll_stack(&mut self, now: SmolInstant) {
+        // Burst, not a single poll: smoltcp egresses at most one TCP
+        // segment per socket per `poll`, so one call per pass capped
+        // a bulk flow at ~1 segment per inner-RTT wake — the same
+        // ceiling the WG listener measured (~285 KB/s). `poll_burst`
+        // loops until the stack goes quiet.
+        poll_burst(&mut self.iface, now, &mut self.device, &mut self.sockets);
+    }
+
     async fn run(mut self) {
         self.kick_handshake();
         self.flush_outbox();
@@ -1072,12 +1085,7 @@ impl WgPump {
             // 3. conn queues, smoltcp poll, tunnel egress, WG timers.
             self.service_sockets();
             let now = SmolInstant::now();
-            // Burst, not a single poll: smoltcp egresses at most one TCP
-            // segment per socket per `poll`, so one call per pass capped
-            // a bulk flow at ~1 segment per inner-RTT wake — the same
-            // ceiling the WG listener measured (~285 KB/s). `poll_burst`
-            // loops until the stack goes quiet.
-            poll_burst(&mut self.iface, now, &mut self.device, &mut self.sockets);
+            self.poll_stack(now);
             self.drain_device_tx();
             if self.last_timer.elapsed() >= WG_TIMER_INTERVAL {
                 self.tick_timers();
@@ -2170,12 +2178,9 @@ mod tests {
             .out
             .push_back(TcpIo::Data(Bytes::from(vec![0xAB; 32 * 1024])));
         pump.service_sockets(); // the conn→socket drain fills the tx buffer
-        poll_burst(
-            &mut pump.iface,
-            SmolInstant::now(),
-            &mut pump.device,
-            &mut pump.sockets,
-        );
+                                // The same poll step `run()` executes — the pin is on the
+                                // service-pass poll loop, not on `poll_burst` the helper.
+        pump.poll_stack(SmolInstant::now());
         assert!(
             pump.device.tx_queue.len() >= 10,
             "one pass must burst a multi-segment write, got {}",
