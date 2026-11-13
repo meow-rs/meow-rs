@@ -41,8 +41,8 @@ use bytes::{Buf, Bytes};
 use meow_common::{ConnType, Metadata, Network};
 use meow_tunnel::TunnelInner;
 use meow_wgstack::{
-    enlarge_recv_buffer, enlarge_send_buffer, poll_burst, BatchEndpoint, ChannelDevice,
-    StreamEvent, TcpIo, WgStream, TCP_READ_QUEUE, TCP_SOCKET_BUF, TCP_WRITE_QUEUE,
+    enlarge_recv_buffer, enlarge_send_buffer, poll_burst, reset_scratch, BatchEndpoint,
+    ChannelDevice, StreamEvent, TcpIo, WgStream, TCP_READ_QUEUE, TCP_SOCKET_BUF, TCP_WRITE_QUEUE,
     WG_TIMER_INTERVAL, WIRE_DRAIN_BUDGET,
 };
 use meow_wireguard::{TunnResult, DATA_OVERHEAD_SZ};
@@ -67,10 +67,11 @@ use crate::wireguard::WireGuardListener;
 /// already transitioned is a flow, not a pool member).
 const LISTEN_POOL_CAP: usize = 64;
 
-/// Bytes drained per `socket.recv` call — the pump's 16 KiB chunk: a
-/// full-burst segment drains in one item instead of four, so a hot flow
-/// costs a quarter of the `recv`/`try_send` rounds.
-const TCP_READ_CHUNK: usize = 16384;
+/// Bytes drained per `socket.recv` call — the pump's 64 KiB chunk: a
+/// hot flow costs a quarter of the `recv`/`try_send` rounds 16 KiB
+/// items needed, and a `TCP_READ_QUEUE` of them covers the 1 MiB rx
+/// window without one socket monopolising a service pass.
+const TCP_READ_CHUNK: usize = 65536;
 
 /// Idle `select!` sleep when smoltcp reports no `poll_delay` — the
 /// pump's own fallback (its comment in `sleep_duration` explains why
@@ -85,7 +86,18 @@ const INJECT_QUEUE: usize = 256;
 /// full) the queue drops the *oldest* pending datagram rather than
 /// growing without limit: the same lossy-tail semantics UDP tolerates,
 /// bounded per §10.2's "no unbounded queue" posture.
-const OUTBOX_CAP: usize = 1024;
+///
+/// Sizing must cover one service pass's worst-case production, not just
+/// a send-side backlog: `drain_device_tx` encapsulates every inner
+/// packet smoltcp egressed this pass *before* `flush_outbox` runs, and a
+/// single saturated TCP flow egresses up to its whole advertised window
+/// — `TCP_SOCKET_BUF / ~1400` datagrams (~750 at 1 MiB). `1024` dropped
+/// the tail of every two-flow 768 KiB+ burst onto the inner TCP as a
+/// hole, which smoltcp's ≥1 s RTO floor turned into multi-second stalls
+/// (measured: macOS loopback two-flow collapse to ~0–30 KB/s). 4× the
+/// full-window burst covers a handful of saturated flows per pass while
+/// staying a hard bound (~6 MB of staged datagrams at 1 MiB).
+const OUTBOX_CAP: usize = 4 * TCP_SOCKET_BUF / 1400;
 
 /// Retained crypto-scratch buffers. Demand is a handful of live dsts
 /// between `flush_outbox` passes, so the cap only bounds the memory a
@@ -410,10 +422,10 @@ impl WgActor {
             self.table.reset_rate_limit();
             let mut dst = self.take_scratch();
             let mut recharge = || {
-                let mut b = self.scratch_pool.pop_back().unwrap_or_default();
-                b.clear();
-                b.resize(self.scratch_len, 0);
-                b
+                reset_scratch(
+                    self.scratch_pool.pop_back().unwrap_or_default(),
+                    self.scratch_len,
+                )
             };
             for action in self.table.tick(&mut dst, &mut recharge) {
                 self.apply_action(action);
@@ -469,14 +481,14 @@ impl WgActor {
     }
 
     /// A crypto dst buffer for the next `Tunn` call: a pooled one reset
-    /// to `scratch_len` zeroed bytes, or a fresh allocation when the
-    /// pool is empty. `Tunn` takes `&mut [u8]` and panics on undersize,
-    /// so *length* — not capacity — is the contract.
+    /// to `scratch_len`, or a fresh allocation when the pool is empty.
+    /// [`reset_scratch`] carries the safety contract — *length*, not
+    /// capacity, is what `Tunn` sees.
     fn take_scratch(&mut self) -> Vec<u8> {
-        let mut buf = self.scratch_pool.pop_back().unwrap_or_default();
-        buf.clear();
-        buf.resize(self.scratch_len, 0);
-        buf
+        reset_scratch(
+            self.scratch_pool.pop_back().unwrap_or_default(),
+            self.scratch_len,
+        )
     }
 
     /// Return a spent buffer to the pool. Only full-size buffers are
@@ -542,10 +554,10 @@ impl WgActor {
         // wire datagram consumes it — field-precise captures keep
         // `self.table` (call) and `self` (apply_action) borrowable.
         let mut recharge = || {
-            let mut b = self.scratch_pool.pop_back().unwrap_or_default();
-            b.clear();
-            b.resize(self.scratch_len, 0);
-            b
+            reset_scratch(
+                self.scratch_pool.pop_back().unwrap_or_default(),
+                self.scratch_len,
+            )
         };
         for action in self
             .table
@@ -1187,7 +1199,10 @@ impl WgActor {
                         st.pending_read.push_front(ev);
                         break;
                     }
-                    Err(mpsc::error::TrySendError::Closed(_)) => break,
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        discard_socket_rx(st, socket);
+                        break;
+                    }
                 }
             }
             while socket.can_recv() && st.pending_read.is_empty() {
@@ -1202,7 +1217,10 @@ impl WgActor {
                             st.pending_read.push_back(ev);
                             break;
                         }
-                        Err(mpsc::error::TrySendError::Closed(_)) => break,
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            discard_socket_rx(st, socket);
+                            break;
+                        }
                     },
                     Err(_) => break,
                 }
@@ -1457,6 +1475,24 @@ impl WgActor {
     /// `tproxy/udp.rs` prunes dead tasks only).
     fn sweep_udp_flows(&mut self) {
         self.udp_flows.retain(|_, flow| !flow.tx.is_closed());
+    }
+}
+
+/// Conn dead → drain the socket's rx to /dev/null instead of leaving
+/// it full. An undrained rx keeps the advertised window pinned at 0:
+/// the peer's smoltcp then holds `remote_win_len == 0`, its tx buffer
+/// never flushes, the queued `TcpIo::Close` sits behind undrainable
+/// `Data`, and both ends zombify (measured: `CloseWait`/`FinWait2`
+/// pairs accumulating one per killed download, each pinning ~2 MiB).
+/// With the buffer emptied the next ACK advertises a live window, the
+/// peer flushes its backlog, its queued abort runs, and both sockets
+/// reach `Closed` — a memmove-free drain since `recv` only consumes.
+fn discard_socket_rx(st: &mut TcpFlow, socket: &mut tcp::Socket<'_>) {
+    st.pending_read.clear();
+    while socket.can_recv() {
+        if socket.recv(|data| (data.len(), ())).is_err() {
+            break;
+        }
     }
 }
 

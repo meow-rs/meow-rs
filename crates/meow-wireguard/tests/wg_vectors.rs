@@ -9,7 +9,7 @@
 //! to integration tests).
 
 use meow_wireguard::x25519::{PublicKey, StaticSecret};
-use meow_wireguard::{Tunn, TunnResult};
+use meow_wireguard::{Tunn, TunnResult, DATA_PAYLOAD_OFF};
 
 /// Fixed 20-byte IPv4 header + 4-byte payload, matching what the in-crate
 /// `one_ip_packet` test encapsulates (the tunnel only inspects the version
@@ -110,4 +110,95 @@ fn two_tunn_handshake_and_transport_roundtrip() {
         other => panic!("expected WriteToTunnelV4, got {other:?}"),
     };
     assert_eq!(plaintext2, ip_payload);
+}
+
+/// PATCH(17): `decapsulate_in_place` produces the same plaintext as
+/// `decapsulate` — but inside the caller's own datagram buffer, which is
+/// what makes the pump's `Bytes::from(receive_vec)` hand-off zero-copy.
+/// Two assertions pin the contract: byte-identical plaintext, and the
+/// returned slice physically inside the datagram (in place, not into a
+/// scratch). Handshake and keepalive legs ride the same method so the
+/// whole receive path can go through it.
+#[test]
+fn decapsulate_in_place_decrypts_inside_the_datagram() {
+    let initiator_private = StaticSecret::from([0x33u8; 32]);
+    let initiator_public = PublicKey::from(&initiator_private);
+    let responder_private = StaticSecret::from([0x44u8; 32]);
+    let responder_public = PublicKey::from(&responder_private);
+
+    let mut initiator = Tunn::new(initiator_private, responder_public, None, None, 1, None);
+    let mut responder = Tunn::new(responder_private, initiator_public, None, None, 2, None);
+
+    let mut src = vec![0u8; 2048];
+    let mut dst = vec![0u8; 2048];
+
+    // Handshake through `decapsulate_in_place` — non-data packets behave
+    // exactly like `decapsulate`, producing their output in `dst`.
+    let init_pkt = match initiator.format_handshake_initiation(&mut src, false) {
+        TunnResult::WriteToNetwork(pkt) => pkt.to_vec(),
+        other => panic!("expected WriteToNetwork, got {other:?}"),
+    };
+    let mut init_wire = init_pkt;
+    let resp_pkt = match responder.decapsulate_in_place(None, &mut init_wire, &mut dst) {
+        TunnResult::WriteToNetwork(pkt) => pkt.to_vec(),
+        other => panic!("responder expected WriteToNetwork response, got {other:?}"),
+    };
+    let mut resp_wire = resp_pkt;
+    let keepalive = match initiator.decapsulate_in_place(None, &mut resp_wire, &mut dst) {
+        TunnResult::WriteToNetwork(pkt) => pkt.to_vec(),
+        other => panic!("initiator expected keepalive WriteToNetwork, got {other:?}"),
+    };
+    let mut keepalive_wire = keepalive;
+    match responder.decapsulate_in_place(None, &mut keepalive_wire, &mut dst) {
+        TunnResult::Done => {}
+        other => panic!("responder expected Done after keepalive, got {other:?}"),
+    }
+
+    // Data leg: encrypt on the initiator, move the wire datagram into an
+    // owned Vec (the pump's receive-slot shape), decrypt in place.
+    let ip_payload = build_test_ipv4_packet();
+    let data_pkt = match initiator.encapsulate(&ip_payload, &mut src) {
+        TunnResult::WriteToNetwork(pkt) => pkt.to_vec(),
+        other => panic!("expected WriteToNetwork for data, got {other:?}"),
+    };
+    let mut slot = data_pkt;
+    let slot_base = slot.as_ptr() as usize;
+    let slot_end = slot_base + slot.len();
+
+    let (plain_len, plain_ptr) = match responder.decapsulate_in_place(None, &mut slot, &mut dst) {
+        TunnResult::WriteToTunnelV4(plain, _addr) => (plain.len(), plain.as_ptr() as usize),
+        other => panic!("expected WriteToTunnelV4, got {other:?}"),
+    };
+
+    // The plaintext view starts exactly at the payload offset inside the
+    // receive buffer — proof the decrypt happened in place, and the exact
+    // slice shape the pump hands to `Bytes::slice`.
+    assert_eq!(
+        plain_ptr,
+        slot_base + DATA_PAYLOAD_OFF,
+        "in-place plaintext must start at the datagram payload offset"
+    );
+    assert!(
+        plain_ptr + plain_len <= slot_end,
+        "plaintext view must stay inside the datagram buffer"
+    );
+    assert_eq!(
+        &slot[DATA_PAYLOAD_OFF..DATA_PAYLOAD_OFF + plain_len],
+        ip_payload.as_slice(),
+        "in-place plaintext must match the original payload byte-for-byte"
+    );
+
+    // A second data packet still decrypts (counter advanced to 2 after
+    // the keepalive consumed 0 and the first data packet 1).
+    let data_pkt2 = match initiator.encapsulate(&ip_payload, &mut src) {
+        TunnResult::WriteToNetwork(pkt) => pkt.to_vec(),
+        other => panic!("expected WriteToNetwork for second data, got {other:?}"),
+    };
+    let mut slot2 = data_pkt2;
+    match responder.decapsulate_in_place(None, &mut slot2, &mut dst) {
+        TunnResult::WriteToTunnelV4(plain, _addr) => {
+            assert_eq!(plain, ip_payload.as_slice());
+        }
+        other => panic!("expected WriteToTunnelV4, got {other:?}"),
+    }
 }

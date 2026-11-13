@@ -351,6 +351,47 @@ async fn listener_tcp_echo_end_to_end() {
     assert_eq!(&buf, payload);
 }
 
+/// P4-1/P4-2's bulk leg: 100 KiB through the full path — adapter pump
+/// (in-place decapsulation, 64 KiB read chunks) → wire → listener
+/// actor → DIRECT → loopback echo and back — enough segments and WG
+/// datagram batches to prove data integrity through the resized
+/// window/scratch plumbing, not just a one-packet round-trip.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn listener_tcp_bulk_100k() {
+    init_logs();
+    let (srv_priv, srv_pub) = server_keypair();
+    let (client_priv, client_pub) = keypair(0xA0);
+    let echo = spawn_echo_server().await;
+    let tunnel = direct_tunnel();
+    let (_guard, listen) = spawn_listener(
+        tunnel,
+        srv_priv,
+        vec![peer_spec(client_pub, &["10.0.0.0/8"])],
+        0,
+        None,
+    );
+    let client = client_adapter("wg-a", client_priv, srv_pub, listen, Some(CLIENT_V4), None);
+
+    let mut conn = timeout(OP_TIMEOUT, client.dial_tcp(&tcp_meta(echo)))
+        .await
+        .expect("dial resolves")
+        .expect("dial_tcp through listener");
+    // 100 KiB of a deterministic nonzero pattern — ~70 inner segments,
+    // several datagram batches through each direction.
+    const BULK: usize = 100 * 1024;
+    let payload: Vec<u8> = (0..BULK).map(|i| (i % 251) as u8).collect();
+    timeout(OP_TIMEOUT, conn.write_all(&payload))
+        .await
+        .expect("bulk write within timeout")
+        .expect("bulk write");
+    let mut echoed = vec![0u8; BULK];
+    timeout(OP_TIMEOUT, conn.read_exact(&mut echoed))
+        .await
+        .expect("bulk echo within timeout")
+        .expect("bulk read");
+    assert_eq!(echoed, payload, "100 KiB echoes byte-exact");
+}
+
 /// `listener_udp_echo_end_to_end`: `dial_udp` → listener flow table →
 /// DIRECT `dial_udp` → loopback echo → reply packet byte-exact.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

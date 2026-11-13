@@ -749,8 +749,8 @@ fn tcp_window_scale(options: &[u8]) -> Option<u8> {
 }
 
 /// Window-scale negotiation is the path the throughput fix relies on:
-/// smoltcp derives `remote_win_shift = bit_width(buffer) - 16` = 3 for
-/// the 256 KiB socket buffer and must emit it as a WS option in SYN, and
+/// smoltcp derives `remote_win_shift = bit_width(buffer) - 16` = 5 for
+/// the 1 MiB socket buffer and must emit it as a WS option in SYN, and
 /// a WS-bearing SYN-ACK must still drive the socket to Established with
 /// a working data path. Without this test every crafted SYN-ACK is bare
 /// (no options) and only the non-WS fallback path is ever exercised.
@@ -834,8 +834,8 @@ async fn tcp_window_scale_negotiates_scaled_window() {
     assert_eq!(&buf, b"meow-ws-echo", "scaled path echoes byte-for-byte");
     assert_eq!(
         ws_seen.load(std::sync::atomic::Ordering::Relaxed),
-        3,
-        "smoltcp SYN must offer window-scale 3 (bit_width(256KiB) - 16)"
+        5,
+        "smoltcp SYN must offer window-scale 5 (bit_width(1MiB) - 16)"
     );
 
     adapter.reset_sessions();

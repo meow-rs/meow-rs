@@ -253,6 +253,46 @@ Patch 16 — `wireguard-boring` feature: BoringSSL session AEAD + zero-alloc
   format is identical (same ChaCha20-Poly1305 nonce/tag layout); the
   `boring_session_seal_open_round_trip` test pins cross-backend
   openability.
+
+Patch 17 — In-place decapsulation for the single-peer data path
+  Motivation: `decapsulate` decrypts a DATA datagram into a caller
+  scratch `dst` (a copy of the ciphertext, then the AEAD open), and the
+  pump then copied that plaintext into a `Bytes` for the inner stack —
+  two copies per inbound packet. With the plaintext produced inside the
+  caller's own receive buffer instead, the whole buffer moves to the
+  stack as-is: zero copies on the wire→tunnel leg.
+  Files:
+  * noise/mod.rs: new `pub const DATA_PAYLOAD_OFF` (= 16 — type+reserved,
+    receiver index, counter) used by `parse_incoming_packet`'s DATA arm
+    (the `&src[16..]` literal became the named constant); new
+    `Tunn::decapsulate_in_place(src_addr, datagram: &mut [u8], dst:
+    &mut [u8])` — same verify_packet → dispatch → chained-flush contract
+    as `decapsulate`, except `PacketData` goes through
+    `handle_data_in_place`, which decrypts `datagram[DATA_PAYLOAD_OFF..]`
+    in place and returns the `WriteToTunnelV4/V6` slice borrowed from
+    `datagram` itself. All non-data packets behave exactly like
+    `decapsulate` (`dst`-based). `decapsulate` is untouched; the
+    multi-peer listener's demux (which needs `&[u8]` datagrams for its
+    verify→peer-dispatch split) still uses it.
+  * noise/session.rs: new `receive_packet_data_in_place(receiver_idx,
+    counter, ct_and_tag: &mut [u8]) -> Result<usize, WireGuardError>` —
+    `receive_packet_data`'s twin minus the `dst`: same `WrongIndex`
+    ordering, `receiving_counter_quick_check` → open →
+    `receiving_counter_mark` discipline; returns the plaintext length.
+  * crypto.rs: new `session_decrypt_in_place(key_or_ctx, nonce, aad,
+    buf: &mut [u8]) -> Result<usize, ()>` for both AEAD backends —
+    splits `buf` into `ciphertext‖tag` internally and opens the
+    ciphertext where it stands (RustCrypto:
+    `decrypt_in_place_detached`; BoringSSL: new
+    `SessionAead::open_detached` over `AeadCtx::open_in_place` — its
+    detached-tag signature already fits). No ciphertext copy anywhere.
+  * lib.rs: `DATA_PAYLOAD_OFF` re-exported alongside
+    `DATA_OVERHEAD_SZ` — the pump slices the plaintext view out of the
+    receive buffer at exactly this offset.
+  Caller: `meow-proxy`'s wireguard pump (`decapsulate_wire`) feeds every
+  inbound datagram through `decapsulate_in_place` and pushes the
+  returned `Bytes` view of the slot Vec into `device.rx_queue` —
+  `Bytes::from(Vec)` + `slice` is a refcount hand-off, not a copy.
 ```
 
 Notes on what did NOT need patching

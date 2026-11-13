@@ -20,7 +20,7 @@ pub(crate) mod crypto;
 pub(crate) mod serialization;
 
 pub use noise::errors::WireGuardError;
-pub use noise::{Tunn, TunnResult, DATA_OVERHEAD_SZ};
+pub use noise::{Tunn, TunnResult, DATA_OVERHEAD_SZ, DATA_PAYLOAD_OFF};
 
 /// Re-export of the x25519 types
 pub mod x25519 {

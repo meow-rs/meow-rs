@@ -88,6 +88,14 @@ const COOKIE_REPLY_SZ: usize = 64;
 // buffer against the same constant instead of a magic 32 (PATCH(13)).
 pub const DATA_OVERHEAD_SZ: usize = 32;
 
+// PATCH(17): `pub` — the payload offset inside a DATA datagram
+// (4-byte type+reserved, 4-byte receiver index, 8-byte counter).
+// `parse_incoming_packet` slices `encrypted_encapsulated_packet` from
+// here, and `decapsulate_in_place` opens the ciphertext at this offset
+// *inside the datagram itself*, so callers slicing the plaintext out of
+// the same buffer start here too.
+pub const DATA_PAYLOAD_OFF: usize = 16;
+
 // PATCH(lint): Copy derived on the four packet-view structs — all fields are
 // Copy and upstream passes them by value without consuming them
 // (needless_pass_by_value). No behavior change.
@@ -165,7 +173,7 @@ impl Tunn {
             (DATA, DATA_OVERHEAD_SZ..=std::usize::MAX) => Packet::PacketData(PacketData {
                 receiver_idx: u32::from_le_bytes(src[4..8].try_into().unwrap()),
                 counter: u64::from_le_bytes(src[8..16].try_into().unwrap()),
-                encrypted_encapsulated_packet: &src[16..],
+                encrypted_encapsulated_packet: &src[DATA_PAYLOAD_OFF..],
             }),
             _ => return Err(WireGuardError::InvalidPacket),
         })
@@ -310,6 +318,67 @@ impl Tunn {
         self.handle_verified_packet(packet, dst)
     }
 
+    /// PATCH(17): `decapsulate`'s in-place twin for the single-peer data
+    /// path. `datagram` is the caller-owned receive buffer holding one
+    /// wire datagram; a DATA packet's ciphertext at
+    /// `datagram[DATA_PAYLOAD_OFF..]` is opened *where it stands* — the
+    /// plaintext occupies the same range — so a `WriteToTunnelV4/V6`
+    /// result hands back a subslice of `datagram` itself and the caller
+    /// moves the whole buffer onward with no decrypt-into-scratch copy.
+    /// Everything else — handshake/cookie dispatch, the cookie reply
+    /// under load, the chained empty-datagram flush — behaves exactly
+    /// like `decapsulate` and writes into `dst` (which may alias nothing
+    /// in `datagram`; the caller passes its crypto scratch).
+    ///
+    /// Like `decapsulate`, a `WriteToNetwork` result asks for another
+    /// call with an empty datagram until it stops producing output.
+    pub fn decapsulate_in_place<'a>(
+        &mut self,
+        src_addr: Option<IpAddr>,
+        datagram: &'a mut [u8],
+        dst: &'a mut [u8],
+    ) -> TunnResult<'a> {
+        if datagram.is_empty() {
+            // Indicates a repeated call
+            return self.send_queued_packet(dst);
+        }
+
+        let mut cookie = [0u8; COOKIE_REPLY_SZ];
+        let packet = match self
+            .rate_limiter
+            .verify_packet(src_addr, datagram, &mut cookie)
+        {
+            Ok(packet) => packet,
+            Err(TunnResult::WriteToNetwork(cookie)) => {
+                dst[..cookie.len()].copy_from_slice(cookie);
+                return TunnResult::WriteToNetwork(&mut dst[..cookie.len()]);
+            }
+            Err(TunnResult::Err(e)) => return TunnResult::Err(e),
+            _ => unreachable!(),
+        };
+
+        // `packet` borrows `datagram`, so the in-place arm must first
+        // drop that borrow: the dispatch fields are Copy, so they come
+        // out of the `PacketData` view here, and the `&mut` the decrypt
+        // needs is only created after `packet` is dead. Non-data
+        // packets keep `packet` alive into `handle_verified_packet` —
+        // exactly like `decapsulate`.
+        let in_place = match &packet {
+            Packet::PacketData(p) => Some((
+                p.receiver_idx,
+                p.counter,
+                p.encrypted_encapsulated_packet.len(),
+            )),
+            _ => None,
+        };
+        if let Some((receiver_idx, counter, ct_len)) = in_place {
+            return self
+                .handle_data_in_place(receiver_idx, counter, ct_len, datagram)
+                .unwrap_or_else(TunnResult::from);
+        }
+        self.handle_verified_packet(packet, dst)
+    }
+
     // PATCH(15): pub(crate) -> pub — a responder-style caller (the WG
     // inbound listener) needs the upstream device-order split of
     // `decapsulate`: rate-limit + mac1 verify first, dispatch by peer, then
@@ -440,6 +509,46 @@ impl Tunn {
         self.timer_tick(TimerName::TimeLastPacketReceived);
 
         Ok(self.validate_decapsulated_packet(decapsulated_packet))
+    }
+
+    /// PATCH(17): `handle_data`'s in-place twin — same session lookup,
+    /// counter bookkeeping and decapsulated-packet validation, but the
+    /// ciphertext already sits at `buf[DATA_PAYLOAD_OFF..DATA_PAYLOAD_OFF
+    /// + ct_len]` inside the receive buffer, so the plaintext is
+    /// produced there and the result borrows `buf`, not a `dst`.
+    fn handle_data_in_place<'a>(
+        &mut self,
+        receiver_idx: u32,
+        counter: u64,
+        ct_len: usize,
+        buf: &'a mut [u8],
+    ) -> Result<TunnResult<'a>, WireGuardError> {
+        let r_idx = receiver_idx as usize;
+        let idx = r_idx % N_SESSIONS;
+
+        // Get the (probably) right session
+        let pt_len = {
+            let session = self.sessions[idx].as_ref();
+            let session = session.ok_or_else(|| {
+                tracing::trace!(message = "No current session available", remote_idx = r_idx);
+                WireGuardError::NoCurrentSession
+            })?;
+            session.receive_packet_data_in_place(
+                receiver_idx,
+                counter,
+                &mut buf[DATA_PAYLOAD_OFF..DATA_PAYLOAD_OFF + ct_len],
+            )?
+        };
+
+        self.set_current_session(r_idx);
+
+        self.timer_tick(TimerName::TimeLastPacketReceived);
+
+        Ok(
+            self.validate_decapsulated_packet(
+                &mut buf[DATA_PAYLOAD_OFF..DATA_PAYLOAD_OFF + pt_len],
+            ),
+        )
     }
 
     /// Formats a new handshake initiation message and store it in dst. If force_resend is true will send

@@ -28,27 +28,30 @@ use tokio::sync::mpsc::{self, error::SendError, OwnedPermit};
 mod endpoint;
 pub use endpoint::BatchEndpoint;
 
-/// actor→conn stream events per TCP flow (≈32 × 16 KiB ≈ 512 KiB of read
-/// backpressure per flow — deeper than the smoltcp socket window so the
-/// relay read side, not the channel, is the stall point).
+/// actor→conn stream events per TCP flow (≈32 × 64 KiB ≈ 2 MiB of read
+/// backpressure per flow — deeper than the 1 MiB smoltcp socket window
+/// so the relay read side, not the channel, is the stall point; the two
+/// layers together bound a saturated flow at ~3 MiB).
 pub const TCP_READ_QUEUE: usize = 32;
 /// conn→actor write items per TCP flow.
 pub const TCP_WRITE_QUEUE: usize = 64;
 
 /// Per-socket smoltcp buffers (rx and tx). The rx half doubles as the
 /// advertised TCP window — smoltcp negotiates RFC 7323 window scaling in
-/// SYN (`remote_win_shift = bit_width(capacity) - 16` = 19 - 16 = 3), so
-/// per-flow
-/// throughput caps at `TCP_SOCKET_BUF / RTT`: 64 KiB held a 140 ms-RTT
-/// path to ~0.5 MB/s (measured on a real KR↔US peer), 256 KiB lifts the
-/// cap to ~1.8 MB/s. Peers that don't answer with `window_scale` fall
-/// back to the 16-bit wire window (~64 KiB cap) silently. Cost:
-/// 2 × 256 KiB eagerly allocated per WG TCP connection.
+/// SYN (`remote_win_shift = bit_width(capacity) - 16` = 21 - 16 = 5, so
+/// the wire window can grow past the 16-bit field up to the full 1 MiB
+/// buffer), and per-flow throughput caps at `TCP_SOCKET_BUF / RTT`:
+/// 64 KiB held a 140 ms-RTT path to ~0.5 MB/s and 256 KiB to ~1.8 MB/s
+/// (measured on a real KR↔US peer); 1 MiB lifts the cap to ~7.5 MB/s.
+/// Peers that don't answer with `window_scale` fall back to the 16-bit
+/// wire window (~64 KiB cap) silently. Cost: 2 × 1 MiB eagerly
+/// allocated per WG TCP connection — a high-conn-count deployment
+/// should weigh that against its configured connection bound.
 ///
 /// `pub`: the endpoint socket's kernel receive buffer is sized from this
 /// — a full-window burst arrives as ~this many WG datagrams (see
 /// [`enlarge_recv_buffer`]).
-pub const TCP_SOCKET_BUF: usize = 256 * 1024;
+pub const TCP_SOCKET_BUF: usize = 1024 * 1024;
 
 /// Endpoint→Tunn drain bound per loop iteration; excess waits for the next
 /// wake-up rather than starving the rest of the service pass.
@@ -502,11 +505,11 @@ impl ProxyConn for WgStream {
 }
 
 /// One full-window inner-TCP burst lands on this socket as ~`TCP_SOCKET_BUF`
-/// bytes of back-to-back WG datagrams (~280 KB at the current window —
-/// over the 208 KiB Linux default, which would drop the tail of every
-/// saturated burst and cost an inner-TCP retransmit round). 4× absorbs
-/// bursts from a few saturated flows at once; the kernel commits pages
-/// only on use, so asking is cheap.
+/// bytes of back-to-back WG datagrams (~1.1 MB on the wire at the current
+/// window — far over the 208 KiB Linux default, which would drop the tail
+/// of every saturated burst and cost an inner-TCP retransmit round). 4×
+/// absorbs bursts from a few saturated flows at once; the kernel commits
+/// pages only on use, so asking is cheap.
 const ENDPOINT_RECV_BUFFER: usize = 4 * TCP_SOCKET_BUF;
 
 /// Grow the endpoint socket's `SO_RCVBUF`, best effort — the same
@@ -558,6 +561,40 @@ pub fn enlarge_send_buffer(socket: &tokio::net::UdpSocket) {
         );
     }
     tracing::debug!(size = ?sock.send_buffer_size(), "wireguard endpoint send buffer");
+}
+
+/// Reset `buf` (a pooled crypto-scratch Vec, or a fresh `Vec::new()`)
+/// into a `scratch_len`-byte crypto dst for the next `Tunn` call —
+/// shared by the proxy pump's `take_scratch` and the listener actor's
+/// `take_scratch`/`recharge` so the unsafe lives in exactly one place.
+/// `Tunn` takes `&mut [u8]` and panics on undersize, so *length* — not
+/// capacity — is the contract.
+///
+/// When `buf` already has the capacity this skips the `resize`'s
+/// per-checkout zeroing memset. SAFETY contract (why exposing
+/// uninitialised bytes is sound here): `Tunn` only ever *writes* into
+/// the dst slice — header, ciphertext or plaintext lands through
+/// `copy_from_slice`/in-place AEAD before any of it is read — and
+/// reports the produced length, after which every consumer truncates
+/// the Vec (or slices the returned region) to the produced bytes.
+/// Stale bytes past the produced length are never read: the outbox
+/// send goes through the truncated Vec, and the in-place decapsulation
+/// path never touches `dst` at all.
+#[inline]
+pub fn reset_scratch(mut buf: Vec<u8>, scratch_len: usize) -> Vec<u8> {
+    buf.clear();
+    if buf.capacity() >= scratch_len {
+        // SAFETY: `buf`'s allocation covers `scratch_len`, so the new
+        // length stays inside it; the bytes are uninitialised-or-stale
+        // but every reader sees only regions a `Tunn` call wrote first
+        // (see the contract above).
+        unsafe { buf.set_len(scratch_len) };
+    } else {
+        // Fresh or undersized allocation — grow zeroed (the rare path:
+        // first checkout and any Vec that fell below `scratch_len`).
+        buf.resize(scratch_len, 0);
+    }
+    buf
 }
 
 /// `SO_RCVBUFFORCE` needs `CAP_NET_ADMIN`, so it fails harmlessly (EPERM)
@@ -660,5 +697,54 @@ mod tests {
             TX_POOL_CAP,
             "the (cap + 1)-th return must not pool"
         );
+    }
+
+    /// P4-1: `TCP_SOCKET_BUF` is 1 MiB — the rx half's window-scale
+    /// negotiation needs `bit_width(capacity) - 16` ≥ 5 to advertise past
+    /// the 16-bit field up to the full buffer, and `ENDPOINT_RECV_BUFFER`
+    /// tracks it at 4× automatically. Both halves of the socket buffer
+    /// pair are this size, so a WG TCP connection allocates 2 × 1 MiB —
+    /// pinned here in lieu of heap profiling.
+    #[test]
+    fn tcp_socket_buf_is_one_mib() {
+        assert_eq!(TCP_SOCKET_BUF, 1024 * 1024);
+        assert_eq!(ENDPOINT_RECV_BUFFER, 4 * 1024 * 1024);
+        // The allocation shape every WG TCP socket pays (pump `dial_tcp`
+        // and the listener's accept path share this constructor).
+        use smoltcp::socket::tcp;
+        let rx = tcp::SocketBuffer::new(vec![0; TCP_SOCKET_BUF]);
+        let tx = tcp::SocketBuffer::new(vec![0; TCP_SOCKET_BUF]);
+        assert_eq!(
+            rx.capacity() + tx.capacity(),
+            2 * 1024 * 1024,
+            "one WG TCP connection holds 2 × 1 MiB of socket buffers"
+        );
+        // smoltcp's `remote_win_shift = bit_width(capacity) - 16`; at
+        // 1 MiB that is 21 - 16 = 5 — enough shift to advertise the
+        // whole buffer on the wire.
+        let shift = usize::BITS as usize - TCP_SOCKET_BUF.leading_zeros() as usize - 16;
+        assert_eq!(shift, 5);
+    }
+
+    /// `reset_scratch` contract: a pooled-capacity Vec comes back at
+    /// `scratch_len` without a realloc, an undersized/fresh one grows
+    /// zeroed — and either way the reported *length* is the Tunn
+    /// contract.
+    #[test]
+    fn reset_scratch_len_contract() {
+        let pooled = reset_scratch(Vec::with_capacity(4096), 2048);
+        assert_eq!(pooled.len(), 2048);
+        assert!(pooled.capacity() >= 4096);
+
+        let fresh = reset_scratch(Vec::new(), 2048);
+        assert_eq!(fresh.len(), 2048);
+        assert!(
+            fresh.iter().all(|&b| b == 0),
+            "the fresh-allocation path stays zeroed"
+        );
+
+        let undersized = reset_scratch(Vec::with_capacity(1024), 2048);
+        assert!(undersized.capacity() >= 2048);
+        assert!(undersized.iter().all(|&b| b == 0));
     }
 }
