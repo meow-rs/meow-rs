@@ -352,6 +352,7 @@ jobs:
           # `mock-instant` un-gates the vendored rekey/retransmission timer
           # tests — dead code under every other invocation.
           cargo nextest run -p meow-wireguard --features mock-instant --lib --retries 2 --no-fail-fast
+          cargo nextest run -p meow-wireguard --features wireguard-boring
           cargo nextest run -p meow-config --features wireguard --test wireguard_config_test --retries 2 --no-fail-fast
           cargo nextest run -p meow-config --no-default-features --test wireguard_config_test --retries 2 --no-fail-fast
           # `--lib` pulls in the wireguard::pump unit tests a --test-only
