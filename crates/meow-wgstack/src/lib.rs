@@ -190,14 +190,17 @@ impl Device for ChannelDevice {
 }
 
 /// Drive `Interface::poll` until it reports no progress or [`POLL_BURST`]
-/// iterations have run. smoltcp 0.12's socket egress dispatches at most
+/// iterations have run. smoltcp 0.12's socket egress dispatched at most
 /// one TCP segment per socket per `poll` call, so a single poll per
-/// service pass caps a bulk flow at ~1 segment per inner-RTT wake — the
-/// WG listener measured ~285 KB/s that way. `SocketStateChanged` is the
-/// only progress signal the interface reports (a packet ingressed *or*
-/// egressed); `None` means every socket went quiet — send window full,
-/// Nagle-held tail, timers idle — so the loop breaks there. The whole
-/// burst shares one timestamp: it is one logical service pass.
+/// service pass capped a bulk flow at ~1 segment per inner-RTT wake — the
+/// WG listener measured ~285 KB/s that way. smoltcp 0.13's `poll` now
+/// exhausts socket egress internally (upstream #1059), which makes the
+/// second iteration here the usual exit; the loop stays anyway as *our*
+/// bounded-budget driver — `SocketStateChanged` is the only progress
+/// signal the interface reports (a packet ingressed *or* egressed) and
+/// `None` means every socket went quiet — send window full, Nagle-held
+/// tail, timers idle — so the loop breaks there. The whole burst shares
+/// one timestamp: it is one logical service pass.
 pub fn poll_burst(
     iface: &mut Interface,
     now: SmolInstant,

@@ -646,10 +646,25 @@ impl WgPump {
         );
         // TCP_NODELAY: a proxy stream wants latency over tinygram batching.
         socket.set_nagle_enabled(false);
+        // Pin the configured same-family tunnel address as the local
+        // endpoint instead of letting smoltcp's RFC 6724 source selection
+        // run: for an IPv6 *loopback* destination it returns `::1`, and
+        // smoltcp 0.13 (#1113) then closes the socket on the first
+        // dispatch because `::1` is not in `ip_addrs`. A WG iface has
+        // exactly one address per family, so auto-selection could only
+        // ever pick it anyway; `None` keeps the auto path for a
+        // destination family the tunnel has no address for.
+        let local_addr = match remote.ip() {
+            IpAddr::V4(_) => self.src_v4,
+            IpAddr::V6(_) => self.src_v6,
+        };
         let connect = socket.connect(
             self.iface.context(),
             IpEndpoint::from(remote),
-            IpListenEndpoint::from(port),
+            IpListenEndpoint {
+                addr: local_addr,
+                port,
+            },
         );
         if let Err(e) = connect {
             self.used_ports.remove(&port);
