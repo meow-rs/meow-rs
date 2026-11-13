@@ -2941,6 +2941,7 @@ dependencies = [
  "aead 0.5.2",
  "base64 0.22.1",
  "blake2",
+ "boring",
  "chacha20poly1305",
  "hmac",
  "libc",

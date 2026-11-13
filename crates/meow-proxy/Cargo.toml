@@ -87,8 +87,17 @@ kcptun = ["ss", "mux", "dep:tokio-util", "meow-transport/kcptun"]
 # module (`meow-wireguard`) encrypts packets for a smoltcp userspace TCP/IP
 # stack running on a dedicated actor thread. Opt-in — the app `full`
 # bundle is expected to enable it; keep it out of `minimal` (ADR-0007
-# binary-size caps).
-wireguard = ["dep:meow-wireguard", "dep:meow-wgstack", "dep:smoltcp", "dep:ipnet"]
+# binary-size caps). `meow-wireguard/wireguard-boring` moves the session
+# data-path AEAD onto the BoringSSL `boring` already in this crate's
+# graph — no new build surface — and is the ~5x faster path for the
+# per-packet ChaCha20-Poly1305.
+wireguard = [
+    "dep:meow-wireguard",
+    "meow-wireguard/wireguard-boring",
+    "dep:meow-wgstack",
+    "dep:smoltcp",
+    "dep:ipnet",
+]
 
 [dependencies]
 meow-common = { workspace = true }

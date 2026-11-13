@@ -213,6 +213,43 @@ Patch 15 — noise/mod.rs: handle_verified_packet pub(crate) -> pub
   init DH+AEAD twice on the hit path — while skipping it would let
   forged inits eat DH+AEAD before any rate limiting. Visibility-only;
   no upstream body touched.
+
+Patch 16 — `wireguard-boring` feature: BoringSSL session AEAD + zero-alloc
+            open
+  Motivation: the session data path built `ChaCha20Poly1305` from raw key
+  bytes per packet (PATCH(4)'s construct-per-call shape), and under the
+  workspace `opt-level = "z"` profile chacha20poly1305 0.10 runs its
+  software-scalar core (the aarch64 NEON backend is
+  `chacha20_force_neon`-gated and off) — ~300–400 MB/s vs BoringSSL's
+  NEON assembly at ~1.6–2.4 GB/s, which ignores opt-level entirely.
+  Files/flags:
+  * Cargo.toml: optional `boring` dep + `wireguard-boring` feature
+    (activated by meow-proxy's `wireguard` feature; the crate still
+    builds and passes all tests without it).
+  * crypto.rs: new `boring_ctx` module (`#[cfg(feature =
+    "wireguard-boring")]`) wrapping `boring::aead::AeadCtx` as
+    `SessionAead` — key schedule once at `Session::new`.
+    `session_seal_in_place` / `session_open_in_place` get a second,
+    cfg-mutually-exclusive signature taking `&SessionAead` instead of
+    `&[u8; 32]`; the RustCrypto bodies keep the `#[cfg(not(...))]` side.
+  * session.rs (PATCH(16) comments): `Session` fields become
+    `receiver_ctx`/`sender_ctx: SessionAead` under the feature (raw
+    `[u8; 32]` keys without); `new()` builds the contexts once;
+    `format_packet_data`/`receive_packet_data` pass `&self.*_ctx` vs
+    `&self.*_key` under the respective cfgs. Both call the same facade
+    function names — the cfg picks the signature.
+  * crypto.rs `aead_chacha20_open_inner` (feature-independent): the
+    `src.to_vec()` + `decrypt_in_place` pair became copy-ct-into-dst +
+    `decrypt_in_place_detached` — one copy instead of alloc+copy, and
+    `src.len() < 16` now returns `Err(())` instead of falling out of
+    `decrypt_in_place`. Callers pass `dst` sized to `src.len() - 16`
+    (handshake.rs: 32/12/0-byte outputs), which the new shape honours.
+  Handshake-path AEAD (`aead_chacha20_*` in handshake.rs) deliberately
+  stays on RustCrypto in both feature sets — it runs a handful of times
+  per session, so the win is not worth a second AeadCtx cache. Wire
+  format is identical (same ChaCha20-Poly1305 nonce/tag layout); the
+  `boring_session_seal_open_round_trip` test pins cross-backend
+  openability.
 ```
 
 Notes on what did NOT need patching

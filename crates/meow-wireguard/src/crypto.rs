@@ -54,13 +54,81 @@ pub(crate) fn aead_chacha20_open_inner(
     aad: &[u8],
 ) -> Result<(), ()> {
     let cipher = ChaCha20Poly1305::new_from_slice(key).expect("aead open: key length is always 32");
-    // src = ciphertext || tag (16 bytes); decrypt_in_place strips the tag.
-    let mut buf = src.to_vec();
+    // src = ciphertext || tag (16 bytes). Copy the ciphertext half into
+    // dst and decrypt it in place with the tag detached — one copy, no
+    // per-packet `to_vec()` allocation (PATCH(16)).
+    let ct_len = src.len().checked_sub(16).ok_or(())?;
+    let (ct, tag) = src.split_at(ct_len);
+    dst[..ct_len].copy_from_slice(ct);
     cipher
-        .decrypt_in_place(Nonce::from_slice(&nonce), aad, &mut buf)
+        .decrypt_in_place_detached(
+            Nonce::from_slice(&nonce),
+            aad,
+            &mut dst[..ct_len],
+            chacha20poly1305::Tag::from_slice(tag),
+        )
         .map_err(|_| ())?;
-    dst[..buf.len()].copy_from_slice(&buf);
     Ok(())
+}
+
+/// `wireguard-boring`: per-session AEAD contexts over BoringSSL.
+///
+/// The RustCrypto fallback constructs `ChaCha20Poly1305` from the raw
+/// session key *per packet* and, under the workspace `opt-level = "z"`
+/// release profile, runs the software-scalar chacha20 core (the NEON
+/// backend is `chacha20_force_neon`-gated and off by default) — measured
+/// ~300–400 MB/s on aarch64. BoringSSL's `EVP_AEAD` does its key
+/// schedule once and runs NEON assembly regardless of opt-level
+/// (~1.6–2.4 GB/s). `Session` caches one `SessionAead` per direction,
+/// so the data path keeps a ready cipher instead of raw key bytes.
+#[cfg(feature = "wireguard-boring")]
+pub(crate) mod boring_ctx {
+    use boring::aead::{AeadCtx, Algorithm};
+
+    /// A session-direction AEAD context: the key schedule built once at
+    /// `Session::new`, then reused for every packet in that direction.
+    pub(crate) struct SessionAead(AeadCtx);
+
+    impl SessionAead {
+        pub(crate) fn new(key: &[u8; 32]) -> Self {
+            Self(
+                AeadCtx::new_default_tag(&Algorithm::chacha20_poly1305(), key)
+                    .expect("ChaCha20-Poly1305 key is always 32 bytes"),
+            )
+        }
+
+        /// Encrypt `buf` in place; return the 16-byte Poly1305 tag.
+        /// `nonce` is the pre-built 12-byte WG nonce (bytes `0..4` zero,
+        /// `4..12` little-endian counter).
+        pub(crate) fn seal(&self, nonce: [u8; 12], aad: &[u8], buf: &mut [u8]) -> [u8; 16] {
+            let mut tag = [0u8; 16];
+            self.0
+                .seal_in_place(&nonce, buf, &mut tag, aad)
+                .expect("session seal never fails on a 12-byte nonce");
+            tag
+        }
+
+        /// Verify the tag and decrypt `ct_and_tag` (ciphertext || 16-byte
+        /// tag) into `dst`, which must be at least `ct_and_tag.len() - 16`
+        /// bytes. Returns the plaintext slice on success. Same one-copy
+        /// shape as the RustCrypto path — BoringSSL opens in place, so the
+        /// ciphertext lands in `dst` first.
+        pub(crate) fn open<'a>(
+            &self,
+            nonce: [u8; 12],
+            aad: &[u8],
+            dst: &'a mut [u8],
+            ct_and_tag: &[u8],
+        ) -> Result<&'a mut [u8], ()> {
+            let ct_len = ct_and_tag.len().checked_sub(16).ok_or(())?;
+            let (ct, tag) = ct_and_tag.split_at(ct_len);
+            dst[..ct_len].copy_from_slice(ct);
+            self.0
+                .open_in_place(&nonce, &mut dst[..ct_len], tag, aad)
+                .map(|_| &mut dst[..ct_len])
+                .map_err(|_| ())
+        }
+    }
 }
 
 /// Session-layer AEAD seal: data path, in place (no extra plaintext copy).
@@ -68,6 +136,40 @@ pub(crate) fn aead_chacha20_open_inner(
 /// into the caller's output buffer. `nonce_bytes` is the pre-built 12-byte
 /// nonce (bytes `0..4` zero, `4..12` little-endian counter).
 /// Returns the Poly1305 tag.
+#[cfg(feature = "wireguard-boring")]
+#[inline]
+pub(crate) fn session_seal_in_place(
+    aead: &boring_ctx::SessionAead,
+    nonce_bytes: [u8; 12],
+    aad: &[u8],
+    buffer: &mut [u8],
+) -> [u8; 16] {
+    aead.seal(nonce_bytes, aad, buffer)
+}
+
+/// Session-layer AEAD open: data path.
+/// `ciphertext_and_tag` is the ciphertext followed by the 16-byte Poly1305
+/// tag; `dst` must be at least `ciphertext_and_tag.len() - 16` bytes (the
+/// plaintext size — a longer `dst` is fine). Returns a slice into `dst`
+/// holding the plaintext on success.
+#[cfg(feature = "wireguard-boring")]
+#[inline]
+pub(crate) fn session_open_in_place<'a>(
+    aead: &boring_ctx::SessionAead,
+    nonce_bytes: [u8; 12],
+    aad: &[u8],
+    dst: &'a mut [u8],
+    ciphertext_and_tag: &[u8],
+) -> Result<&'a mut [u8], ()> {
+    aead.open(nonce_bytes, aad, dst, ciphertext_and_tag)
+}
+
+/// Session-layer AEAD seal: data path, in place (no extra plaintext copy).
+/// Used by `Session::format_packet_data` where ciphertext is written directly
+/// into the caller's output buffer. `nonce_bytes` is the pre-built 12-byte
+/// nonce (bytes `0..4` zero, `4..12` little-endian counter).
+/// Returns the Poly1305 tag.
+#[cfg(not(feature = "wireguard-boring"))]
 #[inline]
 pub(crate) fn session_seal_in_place(
     key: &[u8; 32],
@@ -89,6 +191,7 @@ pub(crate) fn session_seal_in_place(
 /// tag; `dst` must be at least `ciphertext_and_tag.len() - 16` bytes (the
 /// plaintext size — a longer `dst` is fine). Returns a slice into `dst`
 /// holding the plaintext on success.
+#[cfg(not(feature = "wireguard-boring"))]
 #[inline]
 pub(crate) fn session_open_in_place<'a>(
     key: &[u8; 32],
@@ -230,6 +333,84 @@ mod tests {
         assert!(
             aead_chacha20_open_inner(&mut wrong, &key, nonce, &sealed, b"other").is_err(),
             "wrong AAD must fail tag verification"
+        );
+    }
+
+    /// The de-`to_vec` `aead_chacha20_open_inner` keeps the exact contract:
+    /// plaintext lands in `dst`, a `dst` longer than the plaintext leaves
+    /// its tail untouched, a short `src` (no room for the tag) errors,
+    /// and a flipped tag byte errors without writing plaintext.
+    #[test]
+    fn open_inner_contract_after_detached_tag_rewrite() {
+        let key = [0x11u8; 32];
+        let nonce = [0u8; 12];
+        let aad = b"ad";
+        let plaintext = b"hello wireguard";
+
+        let mut sealed = vec![0u8; plaintext.len() + 16];
+        aead_chacha20_seal_inner(&mut sealed, &key, nonce, plaintext, aad);
+
+        // Longer dst: only the first plaintext.len() bytes are written.
+        let mut dst = vec![0xAAu8; plaintext.len() + 8];
+        aead_chacha20_open_inner(&mut dst, &key, nonce, &sealed, aad).unwrap();
+        assert_eq!(&dst[..plaintext.len()], plaintext.as_slice());
+        assert!(
+            dst[plaintext.len()..].iter().all(|&b| b == 0xAA),
+            "dst tail beyond the plaintext must be untouched"
+        );
+
+        // A tag-only src (empty plaintext — the handshake's
+        // `encrypted_nothing` shape) still verifies, into an empty dst.
+        let mut sealed_empty = vec![0u8; 16];
+        aead_chacha20_seal_inner(&mut sealed_empty, &key, nonce, &[], aad);
+        aead_chacha20_open_inner(&mut [], &key, nonce, &sealed_empty, aad).unwrap();
+
+        // src shorter than the tag errors rather than panicking.
+        assert!(aead_chacha20_open_inner(&mut dst, &key, nonce, &sealed[..8], aad).is_err());
+
+        // Tag mismatch errors; dst is left as it was (the ciphertext half
+        // is copied in before the tag check fails — callers treat Err as
+        // "output unspecified", matching the old decrypt_in_place path).
+        let mut bad = sealed.clone();
+        let last = bad.len() - 1;
+        bad[last] ^= 0xFF;
+        assert!(aead_chacha20_open_inner(&mut dst, &key, nonce, &bad, aad).is_err());
+    }
+
+    /// The BoringSSL session context round-trips and rejects a wrong tag —
+    /// and the same bytes a RustCrypto seal produced open under BoringSSL
+    /// (the two backends are the same primitive on the wire).
+    #[cfg(feature = "wireguard-boring")]
+    #[test]
+    fn boring_session_seal_open_round_trip() {
+        use super::boring_ctx::SessionAead;
+        let key = [7u8; 32];
+        let aead = SessionAead::new(&key);
+        let nonce = [3u8; 12];
+        let pt = b"wireguard session data";
+
+        let mut buf = pt.to_vec();
+        let tag = aead.seal(nonce, b"aad", &mut buf);
+        let mut ct_and_tag = buf.clone();
+        ct_and_tag.extend_from_slice(&tag);
+
+        let mut dst = vec![0u8; pt.len()];
+        assert_eq!(
+            aead.open(nonce, b"aad", &mut dst, &ct_and_tag).unwrap(),
+            pt.as_slice()
+        );
+
+        // Wrong AAD must fail tag verification.
+        let mut dst2 = vec![0u8; pt.len()];
+        assert!(aead.open(nonce, b"other", &mut dst2, &ct_and_tag).is_err());
+
+        // Cross-backend: RustCrypto-sealed bytes open under BoringSSL.
+        let mut rc_sealed = vec![0u8; pt.len() + 16];
+        aead_chacha20_seal_inner(&mut rc_sealed, &key, nonce, pt, b"aad");
+        let mut dst3 = vec![0u8; pt.len()];
+        assert_eq!(
+            aead.open(nonce, b"aad", &mut dst3, &rc_sealed).unwrap(),
+            pt.as_slice()
         );
     }
 

@@ -9,10 +9,19 @@ use portable_atomic::{AtomicU64, Ordering};
 // PATCH(4): ring::aead::LessSafeKey fields replaced by raw key bytes; the
 // AEAD cipher is constructed per operation in the crate::crypto facade (the
 // same construct-per-call pattern upstream used in handshake.rs).
+// PATCH(16): under `wireguard-boring` the key bytes become cached
+// BoringSSL `SessionAead` contexts — key schedule runs once here instead
+// of per packet.
 pub struct Session {
     pub(crate) receiving_index: u32,
     sending_index: u32,
+    #[cfg(feature = "wireguard-boring")]
+    receiver_ctx: crate::crypto::boring_ctx::SessionAead,
+    #[cfg(feature = "wireguard-boring")]
+    sender_ctx: crate::crypto::boring_ctx::SessionAead,
+    #[cfg(not(feature = "wireguard-boring"))]
     receiver_key: [u8; 32],
+    #[cfg(not(feature = "wireguard-boring"))]
     sender_key: [u8; 32],
     sending_key_counter: AtomicU64,
     receiving_key_counter: Mutex<ReceivingKeyCounterValidator>,
@@ -162,7 +171,13 @@ impl Session {
         Session {
             receiving_index: local_index,
             sending_index: peer_index,
+            #[cfg(feature = "wireguard-boring")]
+            receiver_ctx: crate::crypto::boring_ctx::SessionAead::new(&receiving_key),
+            #[cfg(feature = "wireguard-boring")]
+            sender_ctx: crate::crypto::boring_ctx::SessionAead::new(&sending_key),
+            #[cfg(not(feature = "wireguard-boring"))]
             receiver_key: receiving_key,
+            #[cfg(not(feature = "wireguard-boring"))]
             sender_key: sending_key,
             sending_key_counter: AtomicU64::new(0),
             receiving_key_counter: Mutex::new(Default::default()),
@@ -213,6 +228,15 @@ impl Session {
             nonce[4..12].copy_from_slice(&sending_key_counter.to_le_bytes());
             data[..src.len()].copy_from_slice(src);
             // PATCH(4): seal in place via the facade, then append the tag.
+            // PATCH(16): the boring build seals through the cached ctx.
+            #[cfg(feature = "wireguard-boring")]
+            let tag = crate::crypto::session_seal_in_place(
+                &self.sender_ctx,
+                nonce,
+                &[],
+                &mut data[..src.len()],
+            );
+            #[cfg(not(feature = "wireguard-boring"))]
             let tag = crate::crypto::session_seal_in_place(
                 &self.sender_key,
                 nonce,
@@ -250,15 +274,25 @@ impl Session {
             let mut nonce = [0u8; 12];
             nonce[4..12].copy_from_slice(&packet.counter.to_le_bytes());
             // PATCH(4): open in place via the facade — copies the ciphertext
-            // into dst and strips the tag internally.
-            crate::crypto::session_open_in_place(
+            // into dst and strips the tag internally. PATCH(16): the
+            // boring build opens through the cached ctx.
+            #[cfg(feature = "wireguard-boring")]
+            let opened = crate::crypto::session_open_in_place(
+                &self.receiver_ctx,
+                nonce,
+                &[],
+                dst,
+                packet.encrypted_encapsulated_packet,
+            );
+            #[cfg(not(feature = "wireguard-boring"))]
+            let opened = crate::crypto::session_open_in_place(
                 &self.receiver_key,
                 nonce,
                 &[],
                 dst,
                 packet.encrypted_encapsulated_packet,
-            )
-            .map_err(|_| WireGuardError::InvalidAeadTag)?
+            );
+            opened.map_err(|_| WireGuardError::InvalidAeadTag)?
         };
 
         // After decryption is done, check counter again, and mark as received
