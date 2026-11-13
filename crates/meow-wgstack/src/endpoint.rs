@@ -482,7 +482,7 @@ impl BatchEndpoint {
 /// Call contract (from `bsd/kern/uipc_syscalls.c`, xnu-11417):
 /// - `sendmsg_x` returns the count of datagrams sent; a mid-batch
 ///   failure folds into a short count exactly like `sendmmsg`
-///   (`ERESTART`/`EINTR`/`EWOULDBLOCK`/`ENOBUFS`/`EMSGSIZE` after a
+///   (`ERESTART`/`EINTR`/`EWOULDBLOCK`/`ENOBUFS` after a
 ///   partial send return the count, not the errno). `msg_flags` and
 ///   `msg_datalen` must be zero on input. A connected datagram socket
 ///   takes the `sendit_x`/`sosend_list` fast path; an unconnected one
