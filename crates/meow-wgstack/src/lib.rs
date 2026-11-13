@@ -191,7 +191,12 @@ pub struct WgStream {
     pub remote: String,
     pub rx: mpsc::Receiver<StreamEvent>,
     pub tx: mpsc::Sender<TcpIo>,
-    pub wake: mpsc::Sender<()>,
+    /// Conn → actor work-available signal. `Notify` pulse-merges
+    /// identical to the bounded mpsc it replaced: a nudge that finds
+    /// no waiter stores a single permit, so a busy actor still wakes
+    /// promptly on its next select — while N nudges collapse to one
+    /// instead of queuing N unit items.
+    pub wake: Arc<tokio::sync::Notify>,
     /// Actor → conn write-capacity wake-up (the actor's per-socket
     /// drain notification this stream parks on when the channel is full).
     pub drain_notify: Arc<tokio::sync::Notify>,
@@ -209,7 +214,7 @@ impl WgStream {
     /// the next timer tick. Also nudged on every read pop — that is what
     /// re-arms a full-channel read backlog in `pending_read`.
     fn nudge(&self) {
-        let _ = self.wake.try_send(());
+        self.wake.notify_one();
     }
 
     /// The two wake sources a full-channel park must wait on: the

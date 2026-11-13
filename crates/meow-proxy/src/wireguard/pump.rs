@@ -6,8 +6,8 @@
 //! dedicated `std::thread` running a current-thread tokio runtime (the
 //! hysteria2/quiche non-`Send` precedent). Everything cross-thread travels
 //! over tokio mpsc channels: [`ActorMsg`] for dial/bind/shutdown, per-conn
-//! channels for stream/datagram payload, and a shared `wake` channel a conn
-//! nudges after enqueueing so a sleeping pump picks the item up at once.
+//! channels for stream/datagram payload, and a shared `Notify` a conn
+//! pulses after enqueueing so a sleeping pump picks the item up at once.
 //!
 //! The actor owns `Tunn` outright — the loop itself is the serialization
 //! point, so there is no `Mutex<Tunn>` (deviation from spec §3.3, which
@@ -42,10 +42,6 @@ const ACTOR_MAILBOX: usize = 64;
 const UDP_READ_QUEUE: usize = 256;
 /// conn→pump datagrams per UDP association.
 const UDP_WRITE_QUEUE: usize = 128;
-/// Shared wake channel: every conn enqueues a nudge after each item so a
-/// pump sleeping in `select!` services the new work immediately.
-const WAKE_QUEUE: usize = 64;
-
 /// smoltcp UDP packet buffer: packet slots and payload arena.
 const UDP_SOCKET_PACKETS: usize = 64;
 const UDP_SOCKET_BYTES: usize = 65536;
@@ -184,8 +180,11 @@ struct WgPump {
     endpoint: tokio::net::UdpSocket,
     endpoint_addr: SocketAddr,
     rx: mpsc::Receiver<ActorMsg>,
-    wake_tx: mpsc::Sender<()>,
-    wake_rx: mpsc::Receiver<()>,
+    /// Conn → pump work-available signal, shared by every stream and
+    /// packet conn. `Notify` pulse-merges: nudges while the pump is
+    /// mid-pass collapse to one stored permit — the same "one pending
+    /// wake" bound the bounded mpsc channel it replaced approximated.
+    wake: Arc<tokio::sync::Notify>,
     tcp: HashMap<SocketHandle, TcpState>,
     udp: HashMap<SocketHandle, UdpState>,
     used_ports: HashSet<u16>,
@@ -258,7 +257,7 @@ impl WgPump {
         // a silent drop.
 
         let buf_size = usize::from(config.mtu).max(2048) + 64;
-        let (wake_tx, wake_rx) = mpsc::channel(WAKE_QUEUE);
+        let wake = Arc::new(tokio::sync::Notify::new());
         Ok(Self {
             name: config.name.clone(),
             tunn,
@@ -268,8 +267,7 @@ impl WgPump {
             endpoint,
             endpoint_addr,
             rx,
-            wake_tx,
-            wake_rx,
+            wake,
             tcp: HashMap::new(),
             udp: HashMap::new(),
             used_ports: HashSet::new(),
@@ -635,7 +633,7 @@ impl WgPump {
             local,
             rx: tokio::sync::Mutex::new(read_rx),
             tx: write_tx,
-            wake: self.wake_tx.clone(),
+            wake: Arc::clone(&self.wake),
             closed: AtomicBool::new(false),
             allowed,
             has_v4,
@@ -665,7 +663,7 @@ impl WgPump {
     /// lifecycle (connect completion, EOF, teardown). Runs once per loop.
     fn service_sockets(&mut self) {
         let session_up = self.session_up();
-        let wake_tx = self.wake_tx.clone();
+        let wake = Arc::clone(&self.wake);
         let src_v4 = self.src_v4;
         let src_v6 = self.src_v6;
         let mut dead_tcp: Vec<SocketHandle> = Vec::new();
@@ -711,7 +709,7 @@ impl WgPump {
                         remote: p.display,
                         rx: p.read_rx,
                         tx: p.write_tx,
-                        wake: wake_tx.clone(),
+                        wake: Arc::clone(&wake),
                         drain_notify: p.drain_notify,
                         pending_read: None,
                         pending_write: None,
@@ -952,7 +950,7 @@ impl WgPump {
     /// How long `select!` may sleep before smoltcp's timers or the WG tick
     /// need service. Mailbox, endpoint and wake events all interrupt it —
     /// and they are the only wake sources the backlog paths need: conn
-    /// writes nudge `wake_rx`, conn-write backlogs stalled on smoltcp tx
+    /// writes pulse `wake`, conn-write backlogs stalled on smoltcp tx
     /// capacity unblock on inbound ACKs (`endpoint.recv`), outbox retries
     /// ride this very timer cadence. Nothing sleeps with work only it can
     /// drain, so no busy-wait override is needed.
@@ -1006,7 +1004,7 @@ impl WgPump {
                         tokio::time::sleep(IDLE_SLEEP).await;
                     }
                 },
-                _ = self.wake_rx.recv() => {},
+                _ = self.wake.notified() => {},
                 _ = tokio::time::sleep(delay) => {},
             }
         }
@@ -1056,7 +1054,7 @@ pub(crate) struct WgPacketConn {
     local: SocketAddr,
     rx: tokio::sync::Mutex<mpsc::Receiver<(Bytes, SocketAddr)>>,
     tx: mpsc::Sender<UdpIo>,
-    wake: mpsc::Sender<()>,
+    wake: Arc<tokio::sync::Notify>,
     closed: AtomicBool,
     allowed: Arc<Vec<ipnet::IpNet>>,
     has_v4: bool,
@@ -1071,7 +1069,7 @@ impl ProxyPacketConn for WgPacketConn {
             Some((data, addr)) => {
                 // Nudge the pump: popping frees channel room it may have a
                 // stalled write drain waiting on.
-                let _ = self.wake.try_send(());
+                self.wake.notify_one();
                 let n = data.len().min(buf.len());
                 buf[..n].copy_from_slice(&data[..n]);
                 Ok((n, addr))
@@ -1108,7 +1106,7 @@ impl ProxyPacketConn for WgPacketConn {
             })
             .await
             .map_err(|_| MeowError::Proxy("wireguard udp: session closed".into()))?;
-        let _ = self.wake.try_send(());
+        self.wake.notify_one();
         Ok(len)
     }
 
@@ -1119,7 +1117,7 @@ impl ProxyPacketConn for WgPacketConn {
     fn close(&self) -> Result<()> {
         if !self.closed.swap(true, Ordering::Relaxed) {
             let _ = self.tx.try_send(UdpIo::Close);
-            let _ = self.wake.try_send(());
+            self.wake.notify_one();
         }
         Ok(())
     }
@@ -1146,16 +1144,16 @@ mod tests {
 
     use super::*;
 
-    fn stream_pair(cap: usize) -> (WgStream, mpsc::Receiver<TcpIo>) {
+    fn stream_pair(cap: usize) -> (WgStream, mpsc::Receiver<TcpIo>, Arc<tokio::sync::Notify>) {
         let (tx, rx) = mpsc::channel(cap);
         let (_read_tx, read_rx) = mpsc::channel(4);
-        let (wake_tx, _wake_rx) = mpsc::channel(4);
+        let wake = Arc::new(tokio::sync::Notify::new());
         (
             WgStream {
                 remote: "t".into(),
                 rx: read_rx,
                 tx,
-                wake: wake_tx,
+                wake: Arc::clone(&wake),
                 drain_notify: Arc::new(tokio::sync::Notify::new()),
                 pending_read: None,
                 pending_write: None,
@@ -1163,13 +1161,14 @@ mod tests {
                 write_done: false,
             },
             rx,
+            wake,
         )
     }
 
     #[test]
     fn poll_write_parks_on_full_queue_and_resumes_after_drain() {
         let mut cx = Context::from_waker(std::task::Waker::noop());
-        let (mut stream, mut rx) = stream_pair(2);
+        let (mut stream, mut rx, _) = stream_pair(2);
         assert!(matches!(
             Pin::new(&mut stream).poll_write(&mut cx, b"aa"),
             Poll::Ready(Ok(2))
@@ -1206,7 +1205,7 @@ mod tests {
     #[test]
     fn poll_shutdown_orders_behind_pending_data() {
         let mut cx = Context::from_waker(std::task::Waker::noop());
-        let (mut stream, mut rx) = stream_pair(2);
+        let (mut stream, mut rx, _) = stream_pair(2);
         // Data then shutdown with room: Data precedes Shutdown on the wire.
         assert!(matches!(
             Pin::new(&mut stream).poll_write(&mut cx, b"aa"),
@@ -1220,7 +1219,7 @@ mod tests {
         assert!(matches!(rx.try_recv(), Ok(TcpIo::Shutdown)));
 
         // Full queue: the FIN waits, it is never dropped silently.
-        let (mut stream, mut rx) = stream_pair(1);
+        let (mut stream, mut rx, _) = stream_pair(1);
         assert!(matches!(
             Pin::new(&mut stream).poll_write(&mut cx, b"x"),
             Poll::Ready(Ok(1))
@@ -1238,9 +1237,35 @@ mod tests {
         assert!(matches!(rx.try_recv(), Ok(TcpIo::Shutdown)));
     }
 
+    /// P4 — the conn→pump wake is the shared `Notify`, pulse-merging:
+    /// a write's nudge stores a permit even with no waiter parked (the
+    /// `notified()` future created *after* the pulse still resolves —
+    /// the select arm can never miss a nudge the way a non-polled
+    /// `try_send` could drop past a full queue), and merged pulses
+    /// leave exactly one permit.
+    #[test]
+    fn stream_write_pulses_shared_notify() {
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let (mut stream, _rx, wake) = stream_pair(4);
+        assert!(matches!(
+            Pin::new(&mut stream).poll_write(&mut cx, b"aa"),
+            Poll::Ready(Ok(2))
+        ));
+        let mut notified = std::pin::pin!(wake.notified());
+        assert!(
+            matches!(notified.as_mut().poll(&mut cx), Poll::Ready(())),
+            "the write's nudge must wake a parked actor"
+        );
+        let mut again = std::pin::pin!(wake.notified());
+        assert!(
+            matches!(again.as_mut().poll(&mut cx), Poll::Pending),
+            "a single nudge is one permit, not a queue of items"
+        );
+    }
+
     #[test]
     fn drop_sends_close_while_write_side_open() {
-        let (stream, mut rx) = stream_pair(4);
+        let (stream, mut rx, _) = stream_pair(4);
         drop(stream);
         assert!(matches!(rx.try_recv(), Ok(TcpIo::Close)));
     }
@@ -1248,7 +1273,7 @@ mod tests {
     #[test]
     fn drop_after_shutdown_sends_nothing() {
         let mut cx = Context::from_waker(std::task::Waker::noop());
-        let (mut stream, mut rx) = stream_pair(4);
+        let (mut stream, mut rx, _) = stream_pair(4);
         assert!(matches!(
             Pin::new(&mut stream).poll_shutdown(&mut cx),
             Poll::Ready(Ok(()))
@@ -1550,7 +1575,7 @@ mod tests {
     async fn packet_conn_enforces_allowed_ips_family_and_close() {
         let (_rtx, rrx) = mpsc::channel(4);
         let (wtx, _wrx) = mpsc::channel(4);
-        let (waketx, _wakerx) = mpsc::channel(4);
+        let waketx = Arc::new(tokio::sync::Notify::new());
         let conn = WgPacketConn {
             local: "10.0.0.2:1000".parse().unwrap(),
             rx: tokio::sync::Mutex::new(rrx),

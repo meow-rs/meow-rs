@@ -235,8 +235,11 @@ pub(super) struct WgActor {
     last_timer: Instant,
 
     shutdown_rx: mpsc::Receiver<()>,
-    wake_tx: mpsc::Sender<()>,
-    wake_rx: mpsc::Receiver<()>,
+    /// Flow → actor work-available signal, shared by every routed
+    /// stream. `Notify` pulse-merges: nudges while the actor is mid-pass
+    /// collapse to one stored permit — the same "one pending wake" the
+    /// capacity-1 mpsc approximated.
+    wake: Arc<tokio::sync::Notify>,
     inject_rx: mpsc::Receiver<(usize, Bytes)>,
     inject_tx: mpsc::Sender<(usize, Bytes)>,
 
@@ -300,7 +303,7 @@ impl WgActor {
             .map_err(|e| io::Error::other(format!("smoltcp v6 route: {e}")))?;
         iface.set_any_ip(true);
 
-        let (wake_tx, wake_rx) = mpsc::channel(1);
+        let wake = Arc::new(tokio::sync::Notify::new());
         let (inject_tx, inject_rx) = mpsc::channel(INJECT_QUEUE);
 
         Ok(Self {
@@ -330,8 +333,7 @@ impl WgActor {
             max_connections,
             last_timer: Instant::now(),
             shutdown_rx,
-            wake_tx,
-            wake_rx,
+            wake,
             inject_rx,
             inject_tx,
             inner: Arc::clone(tunnel.inner()),
@@ -377,7 +379,7 @@ impl WgActor {
                     }
                     // None ⇒ all flow tasks gone — keep looping.
                 }
-                _ = self.wake_rx.recv() => {}
+                _ = self.wake.notified() => {}
                 _ = tokio::time::sleep(delay) => {}
             }
         }
@@ -1054,7 +1056,7 @@ impl WgActor {
         // borrows `&self`, which can't happen while the socket borrow
         // below is live.
         let mut to_spawn: Vec<(WgStream, IpEndpoint, IpEndpoint)> = Vec::new();
-        let wake_tx = self.wake_tx.clone();
+        let wake = Arc::clone(&self.wake);
         for (handle, st) in &mut self.tcp {
             let socket = self.sockets.get_mut::<tcp::Socket>(*handle);
 
@@ -1070,7 +1072,7 @@ impl WgActor {
                     remote: format!("{:?}", socket.remote_endpoint()),
                     rx: read_rx,
                     tx: write_tx,
-                    wake: wake_tx.clone(),
+                    wake: Arc::clone(&wake),
                     drain_notify: Arc::clone(&st.drain_notify),
                     pending_read: None,
                     pending_write: None,
