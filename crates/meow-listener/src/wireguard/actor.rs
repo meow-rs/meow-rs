@@ -89,13 +89,17 @@ const OUTBOX_CAP: usize = 1024;
 /// it back to this key, so one map serves both directions.
 type InnerTuple = (IpAddr, u16, IpAddr, u16);
 
-/// One pool occupant: a smoltcp socket parked in `State::Listen` on a
-/// `(peer_slot, dport)` key — the requesting peer is part of the key so
-/// same-batch same-dport SYNs from different peers each get a
-/// placeholder (flow ownership itself comes from `pending_syn`, not
-/// from the socket that happened to accept).
+/// One pool entry: the `State::Listen` placeholders parked on a
+/// `(peer_slot, dport)` key. A smoltcp listener has no accept queue —
+/// it takes exactly one SYN and leaves `Listen` — so a same-batch
+/// burst of N same-dport SYNs needs N sockets or the tail draws RSTs.
+/// The requesting peer is part of the key so bursts from different
+/// peers each get their own placeholders (flow ownership itself comes
+/// from `pending_syn`, not from the socket that happened to accept).
 struct ListenEntry {
-    handle: smoltcp::iface::SocketHandle,
+    handles: Vec<smoltcp::iface::SocketHandle>,
+    /// The first placeholder's creation time — the eviction ordering
+    /// key; handles added to the same entry later ride its age.
     created: Instant,
 }
 
@@ -163,10 +167,12 @@ pub(super) struct WgActor {
 
     tcp: HashMap<smoltcp::iface::SocketHandle, TcpFlow>,
     tcp_by_tuple: HashMap<InnerTuple, smoltcp::iface::SocketHandle>,
-    /// ≥ one entry per demanded `(peer_slot, dport)`. A listener
-    /// carries no per-peer state — `accepts()` matches port only — so
-    /// the flow's real owner is recovered from `pending_syn`, never
-    /// from which placeholder took the SYN.
+    /// ≥ one `State::Listen` placeholder per demanded `(peer_slot,
+    /// dport)` — an entry holds one handle per in-flight same-dport
+    /// SYN in the batch (smoltcp listeners have no accept queue). A
+    /// listener carries no per-peer state — `accepts()` matches port
+    /// only — so the flow's real owner is recovered from
+    /// `pending_syn`, never from which placeholder took the SYN.
     listen_pool: HashMap<(usize, u16), ListenEntry>,
     /// Mirror of `listen_pool`'s socket handles, kept in lockstep at
     /// every pool insert/remove — the orphan reaper's ownership check
@@ -534,8 +540,28 @@ impl WgActor {
             // SYNs in receive order, so the earliest recorded SYN is
             // the one a listener took.
             self.pending_syn.entry(key).or_insert(slot);
-            if !self.at_capacity() && self.ensure_listener(slot, tcpv.dport) {
-                self.in_flight_syns.insert(key);
+            // Counted *before* the capacity decision: `needed` below
+            // reads the in-flight set, so this SYN must be in it —
+            // which means `at_capacity` counts it too. That errs on
+            // the conservative side: an over-cap SYN still spends an
+            // in-flight slot for the rest of this pass (the second
+            // gate in `post_poll` aborts its accept anyway).
+            self.in_flight_syns.insert(key);
+            if !self.at_capacity() {
+                // One `Listen` placeholder per in-flight same-dport
+                // SYN owned by this peer — a smoltcp listener has no
+                // accept queue, so N same-batch SYNs to one port need
+                // N sockets or the tail draws RSTs. `pending_syn`
+                // carries each tuple's owning slot, so a different
+                // peer's same-dport burst counts toward its own key.
+                let needed = self
+                    .in_flight_syns
+                    .iter()
+                    .filter(|t| {
+                        t.3 == tcpv.dport && self.pending_syn.get(t).is_some_and(|&s| s == slot)
+                    })
+                    .count();
+                self.ensure_listener_n(slot, tcpv.dport, needed);
             }
         }
         if !claimed {
@@ -656,66 +682,95 @@ impl WgActor {
                 >= self.max_connections
     }
 
-    /// Ensure a `State::Listen` socket exists for `(slot, dport)`.
-    /// Returns false when the SYN should be dropped: the pool is full
-    /// *and* no `Listen`-state socket is evictable (errata E5), or
-    /// smoltcp refused the listen. The placeholder itself is peer-blind
-    /// — `pending_syn` carries ownership — so a live entry serves the
-    /// same peer again while a different peer's same-dport SYN simply
-    /// gets its own key.
+    /// Single-demand form of [`Self::ensure_listener_n`] — kept for
+    /// tests that assert a placeholder's presence rather than a batch
+    /// count (`inner_tcp` always calls the counted form).
+    #[cfg(test)]
     fn ensure_listener(&mut self, slot: usize, dport: u16) -> bool {
-        if let Some(entry) = self.listen_pool.get(&(slot, dport)) {
-            if self.sockets.get::<tcp::Socket>(entry.handle).state() == tcp::State::Listen {
-                return true;
+        self.ensure_listener_n(slot, dport, 1)
+    }
+
+    /// Ensure `(slot, dport)` holds at least `needed` `State::Listen`
+    /// placeholders. Returns false when demand can't be met: the pool
+    /// is full *and* no `Listen`-state socket is evictable (errata E5),
+    /// or smoltcp refused the listen. The placeholder itself is
+    /// peer-blind beyond the key's slot — `pending_syn` carries
+    /// ownership — so one entry serves a peer's whole same-dport burst
+    /// while a different peer's SYNs get their own key.
+    fn ensure_listener_n(&mut self, slot: usize, dport: u16, needed: usize) -> bool {
+        // Drop handles whose socket already left `Listen` — it is a
+        // flow (or a reaped orphan) owned elsewhere now, so only the
+        // pool bookkeeping is ours to clear. The socket itself is
+        // *not* removed here: mid-flight it may be registered this
+        // very pass, and terminating it would kill a live conn.
+        if let Some(entry) = self.listen_pool.get_mut(&(slot, dport)) {
+            let mut stale = Vec::new();
+            entry.handles.retain(|&h| {
+                let keep = self.sockets.get::<tcp::Socket>(h).state() == tcp::State::Listen;
+                if !keep {
+                    stale.push(h);
+                }
+                keep
+            });
+            for h in stale {
+                self.listen_pool_handles.remove(&h);
             }
-            // Stale bookkeeping: the socket already left `Listen` — it
-            // is a flow (or a reaped orphan) owned elsewhere now, so
-            // only the pool entry is ours to drop. The socket itself is
-            // *not* removed here: mid-flight it may be registered this
-            // very pass, and terminating it would kill a live conn.
-            if let Some(entry) = self.listen_pool.remove(&(slot, dport)) {
-                self.listen_pool_handles.remove(&entry.handle);
+            if entry.handles.is_empty() {
+                self.listen_pool.remove(&(slot, dport));
             }
         }
-        if self.listen_pool.len() >= LISTEN_POOL_CAP && !self.evict_oldest_listener() {
-            // Errata E5: nothing Listen-state to evict — the new SYN is
-            // dropped, silently (it will still be fed; smoltcp may RST,
-            // which is the §4.2 pool-exhausted answer).
-            return false;
+        let mut have = self
+            .listen_pool
+            .get(&(slot, dport))
+            .map_or(0, |e| e.handles.len());
+        while have < needed {
+            if self.listen_pool_handles.len() >= LISTEN_POOL_CAP && !self.evict_oldest_listener() {
+                // Errata E5: nothing Listen-state to evict — the new
+                // SYN is dropped, silently (it will still be fed;
+                // smoltcp may RST, which is the §4.2 pool-exhausted
+                // answer).
+                return false;
+            }
+            let mut socket = tcp::Socket::new(
+                tcp::SocketBuffer::new(vec![0; TCP_SOCKET_BUF]),
+                tcp::SocketBuffer::new(vec![0; TCP_SOCKET_BUF]),
+            );
+            if socket
+                .listen(IpListenEndpoint {
+                    addr: None,
+                    port: dport,
+                })
+                .is_err()
+            {
+                return false;
+            }
+            let handle = self.sockets.add(socket);
+            self.listen_pool_handles.insert(handle);
+            self.listen_pool
+                .entry((slot, dport))
+                .or_insert_with(|| ListenEntry {
+                    handles: Vec::new(),
+                    created: Instant::now(),
+                })
+                .handles
+                .push(handle);
+            have += 1;
         }
-        let mut socket = tcp::Socket::new(
-            tcp::SocketBuffer::new(vec![0; TCP_SOCKET_BUF]),
-            tcp::SocketBuffer::new(vec![0; TCP_SOCKET_BUF]),
-        );
-        if socket
-            .listen(IpListenEndpoint {
-                addr: None,
-                port: dport,
-            })
-            .is_err()
-        {
-            return false;
-        }
-        let handle = self.sockets.add(socket);
-        self.listen_pool_handles.insert(handle);
-        self.listen_pool.insert(
-            (slot, dport),
-            ListenEntry {
-                handle,
-                created: Instant::now(),
-            },
-        );
         true
     }
 
-    /// Evict the oldest pool occupant still in `State::Listen`. Returns
-    /// false when no occupant qualifies — the E5 "no evictable" case.
+    /// Evict the oldest pool entry still holding a `State::Listen`
+    /// socket — the whole key goes, every placeholder it parked.
+    /// Returns false when no occupant qualifies — the E5 "no
+    /// evictable" case.
     fn evict_oldest_listener(&mut self) -> bool {
         let oldest = self
             .listen_pool
             .iter()
             .filter(|(_, e)| {
-                self.sockets.get::<tcp::Socket>(e.handle).state() == tcp::State::Listen
+                e.handles
+                    .iter()
+                    .any(|&h| self.sockets.get::<tcp::Socket>(h).state() == tcp::State::Listen)
             })
             .min_by_key(|(_, e)| e.created)
             .map(|(k, _)| *k);
@@ -723,8 +778,14 @@ impl WgActor {
             return false;
         };
         let entry = self.listen_pool.remove(&key).expect("entry checked above");
-        self.listen_pool_handles.remove(&entry.handle);
-        self.sockets.remove(entry.handle);
+        for h in entry.handles {
+            // Only a socket still in `Listen` is ours to close — one
+            // that already transitioned is a flow owned elsewhere.
+            if self.sockets.get::<tcp::Socket>(h).state() == tcp::State::Listen {
+                self.sockets.remove(h);
+            }
+            self.listen_pool_handles.remove(&h);
+        }
         true
     }
 
@@ -734,16 +795,30 @@ impl WgActor {
     /// then bury any socket that died with no owner.
     fn post_poll(&mut self) {
         self.in_flight_syns.clear();
-        let mut stale = Vec::new();
-        for (key, entry) in &self.listen_pool {
-            if self.sockets.get::<tcp::Socket>(entry.handle).state() != tcp::State::Listen {
-                stale.push(*key);
+        // Pool sweep, per handle: a placeholder that took a SYN left
+        // `Listen` and is a flow now — drop just that handle; the key
+        // itself goes once no socket still listens on it. Removed
+        // handles collect in `stale_handles` so `listen_pool_handles`
+        // isn't borrowed while the map iterates.
+        let mut stale_handles = Vec::new();
+        let mut empty_keys = Vec::new();
+        for (key, entry) in &mut self.listen_pool {
+            entry.handles.retain(|&h| {
+                let keep = self.sockets.get::<tcp::Socket>(h).state() == tcp::State::Listen;
+                if !keep {
+                    stale_handles.push(h);
+                }
+                keep
+            });
+            if entry.handles.is_empty() {
+                empty_keys.push(*key);
             }
         }
-        for key in stale {
-            if let Some(entry) = self.listen_pool.remove(&key) {
-                self.listen_pool_handles.remove(&entry.handle);
-            }
+        for h in stale_handles {
+            self.listen_pool_handles.remove(&h);
+        }
+        for key in empty_keys {
+            self.listen_pool.remove(&key);
         }
 
         let mut new_flows = Vec::new();
@@ -1500,10 +1575,12 @@ mod tests {
         let now = SmolInstant::now();
         actor.iface.poll(now, &mut actor.device, &mut actor.sockets);
         for entry in actor.listen_pool.values() {
-            assert_ne!(
-                actor.sockets.get::<tcp::Socket>(entry.handle).state(),
-                tcp::State::Listen
-            );
+            for &h in &entry.handles {
+                assert_ne!(
+                    actor.sockets.get::<tcp::Socket>(h).state(),
+                    tcp::State::Listen
+                );
+            }
         }
         assert!(
             !actor.evict_oldest_listener(),
@@ -1644,7 +1721,11 @@ mod tests {
     #[tokio::test]
     async fn closed_orphan_sockets_reaped() {
         let mut actor = test_actor();
-        actor.max_connections = 1;
+        // Cap 2 while connections set up: the in-flight set counts the
+        // *current* SYN before the gate, so a fully-used cap would
+        // never allow fresh listener demand — the refused leg below
+        // tightens the cap *after* setup instead.
+        actor.max_connections = 2;
         let client: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let target: Ipv4Addr = "203.0.113.9".parse().unwrap();
 
@@ -1657,19 +1738,22 @@ mod tests {
             feed_tcp(&mut actor, 0, &bad);
             poll_once(&mut actor);
 
-            // A legit conn on another dport fills the cap.
+            // A legit conn on another dport takes one cap slot.
             let good = syn_v4(client, target, 42000 + round, 80);
             feed_tcp(&mut actor, 0, &good);
             poll_once(&mut actor);
             assert_eq!(actor.tcp.len(), 1);
 
-            // A valid SYN to the held dport accepts on the stale
-            // listener and is aborted at the cap — an orphaned
-            // `Closed` socket the reaper must bury.
+            // Tighten the cap under the established conn: a valid SYN
+            // to the held dport accepts on the stale listener and is
+            // aborted at the second gate — an orphaned `Closed`
+            // socket the reaper must bury.
+            actor.max_connections = 1;
             let refused = syn_v4(client, target, 43000 + round, 443);
             feed_tcp(&mut actor, 0, &refused);
             poll_once(&mut actor);
             actor.drain_device_tx();
+            actor.max_connections = 2;
 
             // Conn churn: the next round starts under the cap again.
             let h = *actor.tcp.keys().next().expect("one flow live");
@@ -1718,12 +1802,71 @@ mod tests {
         assert!(parse_inner(&pkt, false).is_none());
     }
 
+    /// wgsrv-fix-1 §I-3 — a same-batch burst of same-dport SYNs each
+    /// needs its own `Listen` placeholder: a smoltcp listener has no
+    /// accept queue (one SYN leaves `Listen`), so a single shared
+    /// placeholder RST'd every tail SYN of the burst.
+    #[tokio::test]
+    async fn concurrent_syns_same_dport_all_get_placeholder() {
+        let mut actor = test_actor();
+        actor.max_connections = 10;
+        let client: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let target: Ipv4Addr = "203.0.113.9".parse().unwrap();
+        for sport in 40001..=40003 {
+            let syn = syn_v4(client, target, sport, 443);
+            feed_tcp(&mut actor, 0, &syn);
+        }
+        assert_eq!(actor.in_flight_syns.len(), 3);
+        assert_eq!(
+            actor.listen_pool_handles.len(),
+            3,
+            "one placeholder per same-batch in-flight SYN"
+        );
+
+        poll_once(&mut actor);
+        assert_eq!(actor.tcp.len(), 3, "every SYN in the batch accepts");
+        for sport in 40001..=40003 {
+            let key: InnerTuple = (client.into(), sport, target.into(), 443);
+            let h = actor.tcp_by_tuple[&key];
+            assert_eq!(actor.tcp[&h].slot, 0);
+        }
+    }
+
+    /// wgsrv-fix-1 §I-3 — a retransmitted SYN dedups in
+    /// `in_flight_syns`, so the batch count asks for no second
+    /// placeholder; a genuinely different sport does ask.
+    #[tokio::test]
+    async fn concurrent_syns_retransmit_no_extra_placeholder() {
+        let mut actor = test_actor();
+        actor.max_connections = 10;
+        let client: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let target: Ipv4Addr = "203.0.113.9".parse().unwrap();
+
+        let syn = syn_v4(client, target, 40001, 443);
+        feed_tcp(&mut actor, 0, &syn);
+        feed_tcp(&mut actor, 0, &syn);
+        assert_eq!(
+            actor.in_flight_syns.len(),
+            1,
+            "a retransmitted SYN dedups by tuple"
+        );
+        assert_eq!(actor.listen_pool_handles.len(), 1);
+
+        let other = syn_v4(client, target, 40002, 443);
+        feed_tcp(&mut actor, 0, &other);
+        assert_eq!(actor.in_flight_syns.len(), 2);
+        assert_eq!(actor.listen_pool_handles.len(), 2);
+    }
+
     /// M4 — a retransmitted SYN counts once toward the cap: the
     /// in-flight half of `max_connections` dedups by tuple.
     #[tokio::test]
     async fn in_flight_syn_retransmit_dedup() {
         let mut actor = test_actor();
-        actor.max_connections = 2;
+        // Cap 3: the in-flight set counts the *current* SYN before
+        // the gate, so each distinct tuple needs its own slot of
+        // headroom to demand a listener.
+        actor.max_connections = 3;
         let client: Ipv4Addr = "10.0.0.2".parse().unwrap();
         let target: Ipv4Addr = "203.0.113.9".parse().unwrap();
 

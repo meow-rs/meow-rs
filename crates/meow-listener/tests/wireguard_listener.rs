@@ -153,6 +153,27 @@ fn udp_meta(dst: SocketAddr) -> Metadata {
     }
 }
 
+/// Loopback TCP echo that accepts every conn — unlike
+/// `common::spawn_echo_server` (a one-shot single conn), needed when a
+/// test opens several flows to the same target.
+async fn spawn_tcp_echo_multi() -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                while let Ok(n) = stream.read(&mut buf).await {
+                    if n == 0 || stream.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
 /// Loopback UDP echo: replies every datagram byte-for-byte.
 async fn spawn_udp_echo() -> SocketAddr {
     let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -591,9 +612,12 @@ async fn listener_unknown_peer_quiet() {
     );
 }
 
-/// `listener_tcp_backpressure`: `max_connections = 1` — conn #2 to the
-/// same inner port is refused (RST from the aborted accept) while the
-/// established conn keeps flowing.
+/// `listener_tcp_backpressure`: `max_connections = 2` — conn #2 to the
+/// same inner port is refused while the established conn keeps
+/// flowing. (The in-flight set counts the current SYN, so the first
+/// conn needs the second slot's headroom to demand its listener;
+/// conn #2 then finds no headroom and draws smoltcp's no-listener
+/// RST.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn listener_tcp_backpressure() {
     let (srv_priv, srv_pub) = server_keypair();
@@ -604,7 +628,7 @@ async fn listener_tcp_backpressure() {
         tunnel,
         srv_priv,
         vec![peer_spec(client_pub, &["10.0.0.0/8"])],
-        1, // one inner flow, TCP+UDP combined
+        2, // one inner flow, plus the in-flight headroom it costs
         None,
     );
     let client = client_adapter("wg-a", client_priv, srv_pub, listen, Some(CLIENT_V4), None);
@@ -620,8 +644,8 @@ async fn listener_tcp_backpressure() {
         .expect("first echo")
         .unwrap();
 
-    // The second conn to the *same* port hits the already-registered
-    // listener — smoltcp accepts, the post-poll cap gate aborts → RST.
+    // The second conn to the *same* port finds no cap headroom for
+    // new listener demand — smoltcp answers its SYN with an RST.
     let refused = timeout(OP_TIMEOUT, client.dial_tcp(&tcp_meta(echo)))
         .await
         .expect("dial resolves");
@@ -635,6 +659,50 @@ async fn listener_tcp_backpressure() {
         .expect("first conn still echoes")
         .unwrap();
     assert_eq!(&buf, b"cap-ok");
+}
+
+/// `listener_concurrent_syn_same_dport` (wgsrv-fix-1 §I-3): three
+/// zero-gap `dial_tcp`s to one inner target must all connect — a
+/// smoltcp listener has no accept queue, so the actor allocates one
+/// `Listen` placeholder per in-flight same-dport SYN instead of
+/// letting a shared placeholder accept the first and RST the rest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn listener_concurrent_syn_same_dport() {
+    init_logs();
+    let (srv_priv, srv_pub) = server_keypair();
+    let (client_priv, client_pub) = keypair(0xA0);
+    let echo = spawn_tcp_echo_multi().await;
+    let tunnel = direct_tunnel();
+    let (_guard, listen) = spawn_listener(
+        tunnel,
+        srv_priv,
+        vec![peer_spec(client_pub, &["10.0.0.0/8"])],
+        0,
+        None,
+    );
+    let client = client_adapter("wg-a", client_priv, srv_pub, listen, Some(CLIENT_V4), None);
+
+    let meta = tcp_meta(echo);
+    let (c1, c2, c3) = tokio::join!(
+        timeout(OP_TIMEOUT, client.dial_tcp(&meta)),
+        timeout(OP_TIMEOUT, client.dial_tcp(&meta)),
+        timeout(OP_TIMEOUT, client.dial_tcp(&meta)),
+    );
+    let mut conns = [
+        c1.expect("dial 1 resolves").expect("conn 1 connects"),
+        c2.expect("dial 2 resolves").expect("conn 2 connects"),
+        c3.expect("dial 3 resolves").expect("conn 3 connects"),
+    ];
+    for (i, conn) in conns.iter_mut().enumerate() {
+        let payload = [b'a' + i as u8];
+        conn.write_all(&payload).await.unwrap();
+        let mut buf = [0u8; 1];
+        timeout(OP_TIMEOUT, conn.read_exact(&mut buf))
+            .await
+            .expect("echo within timeout")
+            .unwrap();
+        assert_eq!(buf, payload, "conn {i} echoes its own byte");
+    }
 }
 
 /// `listener_tcp_sniff_host`: an inner ClientHello's SNI lands in
