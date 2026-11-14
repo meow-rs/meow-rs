@@ -2957,6 +2957,187 @@ mod tests {
         );
     }
 
+    /// The jammed half of the bound: the conn dies with its write
+    /// channel still full — a peer that stopped ACKing pinned the
+    /// socket's tx buffer, `out` sits at the [`TCP_WRITE_QUEUE`] cap,
+    /// and the channel itself never drains. `conn_gone`'s `is_empty`
+    /// arm can never fire — no `Close` is enqueued — but a jammed
+    /// closed channel is exactly as dead as a drained one, so
+    /// `dead_since` must arm on `is_closed` alone, and past
+    /// [`TCP_ORPHAN_GRACE`] the socket is reaped all the same.
+    #[tokio::test(flavor = "current_thread")]
+    async fn conn_dropped_with_full_channel() {
+        let client_secret = x25519::StaticSecret::from([0x81; 32]);
+        let server_public = x25519::PublicKey::from(&x25519::StaticSecret::from([0x82; 32]));
+        let mut pump = pump_for_test(&test_config(&client_secret, &server_public));
+
+        let (reply_tx, mut reply_rx) = oneshot::channel();
+        pump.dial_tcp("203.0.113.1:443".parse().unwrap(), "t".into(), reply_tx);
+        let handle = *pump.tcp.keys().next().unwrap();
+        let port = *pump.used_ports.iter().next().unwrap();
+
+        // SYN → SYN-ACK → Established, then the dial resolves.
+        pump.iface
+            .poll(SmolInstant::now(), &mut pump.device, &mut pump.sockets);
+        let syn = pump.device.tx_queue.back().expect("the dial emitted a SYN");
+        let local_port = u16::from_be_bytes([syn[20], syn[21]]);
+        let isn = u32::from_be_bytes(syn[24..28].try_into().unwrap());
+        let syn_ack = tcp_seg_v4(
+            "203.0.113.1".parse().unwrap(),
+            "10.0.0.2".parse().unwrap(),
+            443,
+            local_port,
+            5000,
+            isn.wrapping_add(1),
+            0x12,
+        );
+        pump.device.rx_queue.push_back(Bytes::from(syn_ack));
+        pump.iface
+            .poll(SmolInstant::now(), &mut pump.device, &mut pump.sockets);
+        assert_eq!(
+            pump.sockets.get::<tcp::Socket>(handle).state(),
+            tcp::State::Established
+        );
+        pump.service_sockets();
+        let mut conn = match reply_rx.try_recv() {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => panic!("dial failed: {e}"),
+            Err(e) => panic!("dial did not resolve in one pass: {e}"),
+        };
+
+        // Jam the socket: a window's worth of payload fills the 1 MiB
+        // tx buffer and no ACK ever lands to drain it — the
+        // zero-window stand-in that holds `can_send` false forever.
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let window_fill = vec![0xAB; TCP_SOCKET_BUF];
+        assert!(matches!(
+            Pin::new(&mut *conn).poll_write(&mut cx, &window_fill),
+            Poll::Ready(Ok(_))
+        ));
+        pump.service_sockets();
+        assert!(
+            !pump.sockets.get::<tcp::Socket>(handle).can_send(),
+            "the full tx buffer must pin can_send — the jam's socket half"
+        );
+
+        // Fill `out` to the drain cap, then the channel itself: the
+        // backlog spans both queues — the shape a conn drop on a
+        // stalled socket leaves behind.
+        let chunk = [0xCD; 1024];
+        while matches!(
+            Pin::new(&mut *conn).poll_write(&mut cx, &chunk),
+            Poll::Ready(Ok(_))
+        ) {}
+        pump.service_sockets();
+        assert_eq!(
+            pump.tcp.get(&handle).expect("flow state").out.len(),
+            TCP_WRITE_QUEUE,
+            "`out` must sit at the cap so the channel can never drain"
+        );
+        while matches!(
+            Pin::new(&mut *conn).poll_write(&mut cx, &chunk),
+            Poll::Ready(Ok(_))
+        ) {}
+
+        // The conn dies mid-jam: its drop-side `Close` cannot even win
+        // a channel slot — both halves close with items still queued.
+        drop(conn);
+        pump.service_sockets();
+        let st = pump.tcp.get(&handle).expect("flow state");
+        assert!(
+            !st.write_rx.is_empty(),
+            "the jam must pin — a full channel can never go is_empty"
+        );
+        assert!(
+            st.out.iter().all(|io| matches!(io, TcpIo::Data(_))),
+            "conn_gone's is_empty arm must never have queued a Close"
+        );
+        assert!(
+            st.dead_since.is_some(),
+            "a jammed closed channel is equally dead — the arm needs no is_empty"
+        );
+
+        // Past the grace the socket is reaped anyway — state → dead,
+        // port released — exactly the drained-channel outcome.
+        pump.tcp.get_mut(&handle).expect("flow state").dead_since =
+            Some(StdInstant::now() - TCP_ORPHAN_GRACE);
+        pump.service_sockets();
+        assert!(
+            !pump.tcp.contains_key(&handle),
+            "the jammed orphan must be reaped once grace expires"
+        );
+        assert!(
+            !pump.used_ports.contains(&port),
+            "ephemeral port {port} leaked"
+        );
+    }
+
+    /// The negative half of the arm: a conn with both channel halves
+    /// still held is a live flow, not an orphan — even once its FIN is
+    /// out. `graceful_close` alone must never set `dead_since`; the
+    /// bound only exists for a conn that is actually gone.
+    #[tokio::test(flavor = "current_thread")]
+    async fn live_conn_does_not_arm_dead_since() {
+        let client_secret = x25519::StaticSecret::from([0x83; 32]);
+        let server_public = x25519::PublicKey::from(&x25519::StaticSecret::from([0x84; 32]));
+        let mut pump = pump_for_test(&test_config(&client_secret, &server_public));
+
+        let (reply_tx, mut reply_rx) = oneshot::channel();
+        pump.dial_tcp("203.0.113.1:443".parse().unwrap(), "t".into(), reply_tx);
+        let handle = *pump.tcp.keys().next().unwrap();
+
+        // SYN → SYN-ACK → Established, then the dial resolves.
+        pump.iface
+            .poll(SmolInstant::now(), &mut pump.device, &mut pump.sockets);
+        let syn = pump.device.tx_queue.back().expect("the dial emitted a SYN");
+        let local_port = u16::from_be_bytes([syn[20], syn[21]]);
+        let isn = u32::from_be_bytes(syn[24..28].try_into().unwrap());
+        let syn_ack = tcp_seg_v4(
+            "203.0.113.1".parse().unwrap(),
+            "10.0.0.2".parse().unwrap(),
+            443,
+            local_port,
+            5000,
+            isn.wrapping_add(1),
+            0x12,
+        );
+        pump.device.rx_queue.push_back(Bytes::from(syn_ack));
+        pump.iface
+            .poll(SmolInstant::now(), &mut pump.device, &mut pump.sockets);
+        pump.service_sockets();
+        let mut conn = match reply_rx.try_recv() {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => panic!("dial failed: {e}"),
+            Err(e) => panic!("dial did not resolve in one pass: {e}"),
+        };
+        assert!(
+            pump.tcp[&handle].dead_since.is_none(),
+            "an established conn is a live flow — nothing to arm"
+        );
+
+        // Graceful half-close: FIN out, `graceful_close` set — but the
+        // conn is still held, so both halves stay open and the arm
+        // must not fire on the close's shape alone.
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(
+            Pin::new(&mut *conn).poll_shutdown(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        pump.service_sockets();
+        assert_eq!(
+            pump.sockets.get::<tcp::Socket>(handle).state(),
+            tcp::State::FinWait1
+        );
+        assert!(
+            pump.tcp[&handle].graceful_close,
+            "the shutdown pass must have set graceful_close for this test to mean anything"
+        );
+        assert!(
+            pump.tcp[&handle].dead_since.is_none(),
+            "a live conn's FIN is not an orphan — dead_since stays unarmed"
+        );
+    }
+
     /// A `WgStream` parked on a full conn→pump channel waits on the
     /// channel's own capacity semaphore (`reserve_owned`), not a notify:
     /// once `service_sockets` moves the queued items into `out`, the

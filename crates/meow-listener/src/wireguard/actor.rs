@@ -2780,6 +2780,28 @@ mod tests {
             !actor.tcp.contains_key(&handle),
             "the orphaned socket must be reaped once grace expires"
         );
+
+        // The reap machinery finishes what the abort started — the
+        // `pending_close` → `dead_dying` deferred-erase chain
+        // `dead_flow_tuple_rebuild_survives_deferred_erase` pins: the
+        // RST dispatches on this poll while the socket is buried, the
+        // drain routes it through `tcp_dying`, and the next pass
+        // erases the dying/tuple entries together.
+        actor.poll_stack();
+        actor.drain_device_tx();
+        actor.poll_stack();
+        assert!(
+            !actor.tcp_dying.contains_key(&handle),
+            "the reaped flow's dying entry must be erased"
+        );
+        assert!(
+            !actor.tcp_by_tuple.contains_key(&key),
+            "the reaped flow's tuple mapping must be erased"
+        );
+        assert!(
+            actor.pending_close.is_empty() && actor.dead_dying.is_empty(),
+            "the deferred close bookkeeping must drain with the socket"
+        );
     }
 
     /// F3 — the IPv4 `total_length` field bounds the L4 slice: bytes a
