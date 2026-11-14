@@ -3524,4 +3524,148 @@ mod tests {
             }
         }
     }
+
+    /// PATCH(19): `drain_inject`'s parallel arm end to end — the
+    /// flow-reply twin of the `tx_queue` drain test above. A real
+    /// handshake gives peer 0 a session; eight `(slot, Bytes)` inject
+    /// items past the `n <= 2` inline cutoff flatten into one
+    /// `TxCryptoJob` batch whose per-item `reserve_tx_counters(1)`
+    /// keeps counters consecutive in queue order. Every outbox
+    /// datagram must decrypt at the client back to its reply *in emit
+    /// order*, and nothing returns to `tx_pool` — inject inners are
+    /// `Bytes` copies that drop with their job (`pool_inner: false`).
+    #[tokio::test(flavor = "current_thread")]
+    async fn drain_inject_parallel_seals_in_job_order() {
+        use meow_wireguard::x25519;
+
+        let server_secret = x25519::StaticSecret::from([0x7E; 32]);
+        let server_public = x25519::PublicKey::from(&server_secret);
+        let client_secret = x25519::StaticSecret::from([0xB1; 32]);
+        let client_public = x25519::PublicKey::from(&client_secret);
+        let spec = WgListenerSpec {
+            private_key: server_secret.to_bytes(),
+            peers: vec![WgPeerSpec {
+                public_key: client_public.to_bytes(),
+                preshared_key: None,
+                allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
+                name: SmolStr::new(""),
+                reserved: None,
+            }],
+            mtu: 1420,
+            udp: true,
+            udp_timeout: Duration::from_secs(60),
+        };
+        let mut actor = actor_with_spec(spec);
+        let mut client =
+            meow_wireguard::Tunn::new(client_secret, server_public, None, None, 0, None);
+        let actor_addr: SocketAddr = format!("127.0.0.1:{}", actor.bound_port).parse().unwrap();
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("client socket");
+        let client_addr = sender.local_addr().unwrap();
+        let mut work = vec![0u8; 4096];
+
+        /// The production receive arm — same shape as the sibling
+        /// test's: async `recv_from` for the datagram that woke the
+        /// reactor, then `drain_wire` for whatever else is queued.
+        async fn feed_pending(actor: &mut WgActor) {
+            let (n, src) = actor
+                .endpoint
+                .recv_from(&mut actor.recv_buf)
+                .await
+                .expect("datagram ready");
+            actor.demux_one(src, n);
+            actor.drain_wire();
+        }
+
+        // The real handshake — init → response → keepalive — arms peer
+        // 0's responder session, which `drain_inject`'s Phase-A handle
+        // cache then resolves per slot.
+        let init = {
+            let TunnResult::WriteToNetwork(b) =
+                client.format_handshake_initiation(&mut work, false)
+            else {
+                panic!("initiation formats");
+            };
+            b.to_vec()
+        };
+        sender.send_to(&init, actor_addr).expect("send init");
+        feed_pending(&mut actor).await;
+        let (resp_addr, resp) = actor
+            .outbox
+            .pop_front()
+            .expect("init produces a handshake response");
+        assert_eq!(resp_addr, client_addr);
+        let keepalive = {
+            let TunnResult::WriteToNetwork(b) =
+                client.decapsulate(Some(client_addr.ip()), &resp, &mut work)
+            else {
+                panic!("client consumes the response");
+            };
+            b.to_vec()
+        };
+        sender
+            .send_to(&keepalive, actor_addr)
+            .expect("send keepalive");
+        feed_pending(&mut actor).await;
+        assert!(actor.outbox.is_empty(), "the keepalive answers nothing");
+
+        // The peer's endpoint — the post-pass resolves it per job.
+        actor.table.peers_mut()[0].endpoint = Some(client_addr);
+
+        // Eight flow-task replies queue on the inject channel — past
+        // the pool's inline cutoff, so the seals ride real workers.
+        // The last payload byte marks queue position.
+        const N: usize = 8;
+        let client_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let target_ip: Ipv4Addr = "203.0.113.9".parse().unwrap();
+        let mut inners = Vec::new();
+        for i in 0..N {
+            let inner = seg_v4_data(
+                target_ip,
+                client_ip,
+                443,
+                40000,
+                9000 + i as u32,
+                1000,
+                0x18,
+                &[i as u8],
+            );
+            inners.push(inner.clone());
+            actor
+                .inject_tx
+                .try_send((0, Bytes::from(inner)))
+                .expect("inject queue has room");
+        }
+        actor.drain_inject();
+
+        assert_eq!(
+            actor.outbox.len(),
+            N,
+            "every sealed inject job emitted a datagram"
+        );
+        assert!(
+            actor.device.tx_pool.is_empty(),
+            "inject inners are copies — they drop with the job, never pool"
+        );
+
+        let mut prev: Option<u64> = None;
+        for (i, (addr, datagram)) in actor.outbox.iter().enumerate() {
+            assert_eq!(*addr, client_addr);
+            assert_eq!(
+                u32::from_le_bytes(datagram[0..4].try_into().unwrap()),
+                4,
+                "datagram {i} is WG data"
+            );
+            let counter = u64::from_le_bytes(datagram[8..16].try_into().unwrap());
+            if let Some(p) = prev {
+                assert_eq!(counter, p + 1, "counters stay consecutive in emit order");
+            }
+            prev = Some(counter);
+            match client.decapsulate(Some(client_addr.ip()), datagram, &mut work) {
+                TunnResult::WriteToTunnelV4(b, _) | TunnResult::WriteToTunnelV6(b, _) => {
+                    assert_eq!(&b[..], &inners[i][..], "datagram {i} decrypts to inner {i}");
+                }
+                other => panic!("client must decrypt datagram {i}, got {other:?}"),
+            }
+        }
+    }
 }
