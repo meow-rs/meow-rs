@@ -45,7 +45,10 @@ use meow_wgstack::{
     ChannelDevice, StreamEvent, TcpIo, WgStream, TCP_READ_QUEUE, TCP_SOCKET_BUF, TCP_WRITE_QUEUE,
     WG_TIMER_INTERVAL, WIRE_DRAIN_BUDGET,
 };
-use meow_wireguard::{CryptoJob, CryptoPool, TunnResult, DATA_OVERHEAD_SZ, DATA_PAYLOAD_OFF};
+use meow_wireguard::{
+    CryptoJob, CryptoPool, SessionHandle, TunnResult, TxCryptoJob, DATA_OVERHEAD_SZ,
+    DATA_PAYLOAD_OFF,
+};
 use smoltcp::iface::{Config as IfaceConfig, Interface, SocketSet};
 use smoltcp::socket::tcp;
 use smoltcp::time::Instant as SmolInstant;
@@ -627,13 +630,18 @@ impl WgActor {
                         let crypto = self.table.peers()[peer_slot]
                             .tunn
                             .session_handle_for(receiver_idx);
-                        let mut job = CryptoJob::new(pkt, n, receiver_idx, counter, crypto);
                         // The job's own context tag — the post-pass
                         // lands each result on its (slot, source, peer)
                         // exactly, even if a lost chunk ever shifted
                         // the return positions.
-                        job.tag = ctxs.len();
-                        jobs.push(job);
+                        jobs.push(CryptoJob::new(
+                            pkt,
+                            n,
+                            receiver_idx,
+                            counter,
+                            crypto,
+                            ctxs.len(),
+                        ));
                         ctxs.push((i, src, peer_slot));
                     }
                     Verdict::Other {
@@ -917,14 +925,79 @@ impl WgActor {
     /// only ever consumed one inject item per iteration, so a backed-up
     /// queue starved behind wire datagrams. Bounded by the inject
     /// channel's own capacity.
+    ///
+    /// PATCH(19): the same three-phase shape `drain_device_tx` carries —
+    /// items whose peer holds a current session flatten into one
+    /// `TxCryptoJob` batch across all peers (each `Bytes` item is
+    /// copied into the job's `inner` Vec — flow replies are small and
+    /// the AEAD seal dominates); items whose peer has no session keep
+    /// the serial [`handle_inject`](Self::handle_inject) arm, which is
+    /// where `queue_packet` + the handshake chain live. Counter
+    /// reservation is per item (`reserve_tx_counters(1)`) — unlike
+    /// `drain_device_tx`'s contiguous block this queue keys counters
+    /// per packet, which stays correct because counters need
+    /// uniqueness, not contiguity.
     fn drain_inject(&mut self) {
+        let mut jobs: Vec<TxCryptoJob> = Vec::new();
+        let mut ctxs: Vec<usize> = Vec::new();
+        let mut handles: HashMap<usize, Option<SessionHandle>> = HashMap::new();
         while let Ok((slot, pkt)) = self.inject_rx.try_recv() {
-            self.handle_inject(slot, &pkt);
+            let crypto = handles
+                .entry(slot)
+                .or_insert_with(|| {
+                    self.table
+                        .peers()
+                        .get(slot)
+                        .and_then(|p| p.tunn.current_session_handle())
+                })
+                .clone();
+            match crypto {
+                Some(handle) => {
+                    if pkt.len() + DATA_OVERHEAD_SZ > self.scratch_len {
+                        // `build_reply` caps the inner packet at
+                        // inner_mtu = mtu - 64 — a breach is a flow-task
+                        // bug; the debug_assert pins the contract while
+                        // the drop keeps release-mode posture.
+                        debug_assert!(
+                            pkt.len() + DATA_OVERHEAD_SZ <= self.scratch_len,
+                            "inject packet {}B + {DATA_OVERHEAD_SZ}B overhead exceeds \
+                             MTU-sized scratch buffer {}B",
+                            pkt.len(),
+                            self.scratch_len
+                        );
+                        debug!(
+                            "wireguard {}: dropping {}B inject packet (scratch {}B)",
+                            self.name,
+                            pkt.len(),
+                            self.scratch_len
+                        );
+                        continue;
+                    }
+                    jobs.push(TxCryptoJob::new(
+                        pkt.to_vec(),
+                        self.take_scratch(),
+                        handle.reserve_tx_counters(1),
+                        handle,
+                        ctxs.len(),
+                    ));
+                    ctxs.push(slot);
+                }
+                None => self.handle_inject(slot, &pkt),
+            }
         }
+
+        CryptoPool::run_tx_shared(&mut jobs);
+        // Inner copies aren't `tx_queue` buffers — `pool_inner: false`
+        // drops them with the job, exactly as the serial arm dropped
+        // the `Bytes`.
+        self.finish_tx_jobs(jobs, &ctxs, false);
     }
 
     /// A flow task's finished inner packet — encrypt under the owning
-    /// peer's session and send to its endpoint.
+    /// peer's session and send to its endpoint. The serial arm of
+    /// [`drain_inject`](Self::drain_inject): peers with no established
+    /// session take this path so `encapsulate`'s `queue_packet` +
+    /// handshake-initiation chain still runs.
     fn handle_inject(&mut self, slot: usize, pkt: &[u8]) {
         let mut dst = self.take_scratch();
         if pkt.len() + DATA_OVERHEAD_SZ <= dst.len() {
@@ -1517,54 +1590,183 @@ impl WgActor {
 
     // ── device tx → wire ─────────────────────────────────────────────
 
-    /// Encrypt each emitted packet under its owning peer's session. The
-    /// packet's reversed tuple locates the flow (hence peer slot); an
-    /// unmatched packet — an RST for a refused SYN or stray — consults
-    /// the `rst_hint` its ingress recorded. Each drained buffer goes
-    /// back to `device.tx_pool` for reuse.
+    /// Encrypt each emitted packet under its owning peer's session —
+    /// the PATCH(19) three-phase shape `drain_wire` carries on the RX
+    /// side:
+    ///
+    ///   A. **Serial setup** — the packet's reversed tuple locates the
+    ///      flow (hence peer slot); an unmatched packet — an RST for a
+    ///      refused SYN or stray — consults the `rst_hint` its ingress
+    ///      recorded. Each peer's `current_session_handle` is captured
+    ///      once into a slot cache, so the batch's per-peer `Arc` clone
+    ///      happens while `&mut Tunn` is reachable; jobs flatten across
+    ///      peers into one vector, each keyed to its peer's slot through
+    ///      the `ctxs` side-table (`job.tag` indexes it — the same
+    ///      opaque-tag pattern `drain_wire`'s `CryptoJob`s use). A peer
+    ///      with no established session takes the serial
+    ///      [`encapsulate_tx_packet`](Self::encapsulate_tx_packet) arm
+    ///      inline — that is where `queue_packet` + the
+    ///      handshake-initiation chain live — so the only reordering is
+    ///      onto disjoint sinks (different peers' sockets, or a
+    ///      handshake landing ahead of a same-peer DATA, which is the
+    ///      order WireGuard wants anyway). Counters reserve per packet
+    ///      in queue order — per-peer counters stay monotone in that
+    ///      peer's emit order.
+    ///   B. **Worker pass** — `CryptoPool::run_tx_shared(&mut jobs)`:
+    ///      the batch's AEAD seals off-thread (inline when
+    ///      `jobs <= 2`, lazily resolved like the RX entry point).
+    ///   C. **Serial post-pass** —
+    ///      [`finish_tx_jobs`](Self::finish_tx_jobs) walks jobs in
+    ///      order: per-peer `handle_sent_data`, `stamp_reserved`,
+    ///      endpoint lookup, outbox enqueue — job order = each peer's
+    ///      counter order = the emit order the serial loop produced.
+    ///      Every `inner` Vec returns to `device.tx_pool` regardless
+    ///      of outcome; failed `wire` bufs return to `scratch_pool`.
+    ///
+    /// A peer with no endpoint still runs `handle_sent_data` — the
+    /// serial path's accounting lived inside `encapsulate`, before the
+    /// endpoint check dropped the produced datagram — and its sealed
+    /// `wire` buf returns to `scratch_pool` rather than the outbox.
     fn drain_device_tx(&mut self) {
         let mut dst = self.take_scratch();
+        let mut jobs: Vec<TxCryptoJob> = Vec::new();
+        let mut ctxs: Vec<usize> = Vec::new();
+        let mut handles: HashMap<usize, Option<SessionHandle>> = HashMap::new();
         while let Some(pkt) = self.device.tx_queue.pop_front() {
             let Some(slot) = self.route_tx_packet(&pkt) else {
                 trace!("wireguard {}: unroutable inner tx packet", self.name);
                 self.device.return_tx_buf(pkt);
                 continue;
             };
-            if pkt.len() + DATA_OVERHEAD_SZ > dst.len() {
-                warn!(
-                    "wireguard {}: dropping {}B inner tx packet (scratch {}B)",
-                    self.name,
-                    pkt.len(),
-                    dst.len()
-                );
-                self.device.return_tx_buf(pkt);
-                continue;
-            }
-            let Some(peer) = self.table.peers_mut().get_mut(slot) else {
-                self.device.return_tx_buf(pkt);
-                continue;
-            };
-            if let TunnResult::WriteToNetwork(b) = peer.tunn.encapsulate(&pkt, &mut dst) {
-                match peer.endpoint {
-                    Some(addr) => {
-                        let len = b.len();
-                        dst.truncate(len);
-                        peer.stamp_reserved(&mut dst);
-                        self.enqueue_outbox(addr, dst);
-                        dst = self.take_scratch();
-                    }
-                    None => {
+            let crypto = handles
+                .entry(slot)
+                .or_insert_with(|| {
+                    self.table
+                        .peers()
+                        .get(slot)
+                        .and_then(|p| p.tunn.current_session_handle())
+                })
+                .clone();
+            match crypto {
+                Some(handle) => {
+                    if pkt.len() + DATA_OVERHEAD_SZ > self.scratch_len {
+                        warn!(
+                            "wireguard {}: dropping {}B inner tx packet (scratch {}B)",
+                            self.name,
+                            pkt.len(),
+                            self.scratch_len
+                        );
                         self.device.return_tx_buf(pkt);
                         continue;
                     }
+                    jobs.push(TxCryptoJob::new(
+                        pkt,
+                        self.take_scratch(),
+                        handle.reserve_tx_counters(1),
+                        handle,
+                        ctxs.len(),
+                    ));
+                    ctxs.push(slot);
+                }
+                None => {
+                    self.encapsulate_tx_packet(slot, &pkt, &mut dst);
+                    self.device.return_tx_buf(pkt);
                 }
             }
-            self.device.return_tx_buf(pkt);
         }
         self.return_scratch(dst);
+
+        // Phase B — the batch's AEAD seals inside the job `wire` bufs.
+        CryptoPool::run_tx_shared(&mut jobs);
+
+        // Phase C — serial post-pass in job order.
+        self.finish_tx_jobs(jobs, &ctxs, true);
+
         // RST hints only live for the poll that produced them — a stale
         // entry could misroute a same-tuple RST of a later packet.
         self.rst_hint.clear();
+    }
+
+    /// The serial half of `drain_device_tx`: one inner packet through
+    /// `encapsulate` — the no-session arm (where `queue_packet` + the
+    /// handshake-initiation chain live) and `encapsulate`'s own
+    /// non-DATA output. `dst` is the caller-owned scratch: a produced
+    /// datagram consumes it and the caller refills on the next call.
+    /// The inner packet's `tx_pool` return stays with the caller —
+    /// every path returns it exactly once.
+    fn encapsulate_tx_packet(&mut self, slot: usize, pkt: &[u8], dst: &mut Vec<u8>) {
+        if pkt.len() + DATA_OVERHEAD_SZ > dst.len() {
+            warn!(
+                "wireguard {}: dropping {}B inner tx packet (scratch {}B)",
+                self.name,
+                pkt.len(),
+                dst.len()
+            );
+            return;
+        }
+        let Some(peer) = self.table.peers_mut().get_mut(slot) else {
+            return;
+        };
+        if let TunnResult::WriteToNetwork(b) = peer.tunn.encapsulate(pkt, dst) {
+            if let Some(addr) = peer.endpoint {
+                let len = b.len();
+                dst.truncate(len);
+                peer.stamp_reserved(dst);
+                let out = std::mem::replace(dst, self.take_scratch());
+                self.enqueue_outbox(addr, out);
+            }
+        }
+    }
+
+    /// The Phase-C post-pass both TX drains share: walk each job's
+    /// result in order, replay the peer's bookkeeping on its own
+    /// `Tunn`, stamp its reserved bytes, and enqueue to its endpoint.
+    /// `ctxs[job.tag]` is the job's peer slot. `pool_inner` routes the
+    /// inner Vec: `true` returns it to `device.tx_pool` (a drained
+    /// `tx_queue` buffer); `false` drops it (an inject copy that was
+    /// never pool-owned). A job the pool failed or never resolved
+    /// returns its `wire` buf to `scratch_pool` unmodified — still
+    /// full-size, so the pool accepts it.
+    fn finish_tx_jobs(&mut self, jobs: Vec<TxCryptoJob>, ctxs: &[usize], pool_inner: bool) {
+        for job in jobs {
+            let slot = ctxs[job.tag];
+            let inner_len = job.inner.len();
+            if pool_inner {
+                self.device.return_tx_buf(job.inner);
+            }
+            let mut wire = job.wire;
+            match job.result {
+                Some(Ok(_)) => match self.table.peers_mut().get_mut(slot) {
+                    Some(peer) => {
+                        // The serial path's accounting lived inside
+                        // `encapsulate` — it ran on every produced
+                        // datagram, including one the endpoint check
+                        // then dropped — so it replays before the
+                        // endpoint gate here too.
+                        peer.tunn.handle_sent_data(inner_len);
+                        match peer.endpoint {
+                            Some(addr) => {
+                                peer.stamp_reserved(&mut wire);
+                                self.enqueue_outbox(addr, wire);
+                            }
+                            None => self.return_scratch(wire),
+                        }
+                    }
+                    // A peer slot the table no longer holds can't
+                    // happen (the table is static) — drop like the
+                    // serial arm's `get_mut` miss.
+                    None => self.return_scratch(wire),
+                },
+                Some(Err(e)) => {
+                    debug!("wireguard {}: encapsulate error: {e:?}", self.name);
+                    self.return_scratch(wire);
+                }
+                None => {
+                    debug_assert!(false, "crypto pool resolves every job");
+                    self.return_scratch(wire);
+                }
+            }
+        }
     }
 
     /// Map an emitted inner packet back to its peer slot.
@@ -3179,5 +3381,291 @@ mod tests {
             actor.rx_slots.iter().all(|s| s.len() == full),
             "every rx_slot returns at full size"
         );
+    }
+
+    /// PATCH(19): `drain_device_tx`'s parallel arm end to end — the
+    /// listener-side twin of the pump test. A real handshake over the
+    /// actor's own socket gives the peer a session (the endpoint is
+    /// armed directly, the slot roaming would teach it); eight inner
+    /// TCP replies routed through `rst_hint` flatten into one
+    /// `TxCryptoJob` batch past the `n <= 2` inline cutoff. Every
+    /// outbox datagram must decrypt at the client back to its inner
+    /// *in emit order* — job order = counter order = wire order — and
+    /// every drained `tx_queue` buffer returns to `tx_pool`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn drain_device_tx_parallel_seals_in_job_order() {
+        use meow_wireguard::x25519;
+
+        let server_secret = x25519::StaticSecret::from([0x6E; 32]);
+        let server_public = x25519::PublicKey::from(&server_secret);
+        let client_secret = x25519::StaticSecret::from([0xA1; 32]);
+        let client_public = x25519::PublicKey::from(&client_secret);
+        let spec = WgListenerSpec {
+            private_key: server_secret.to_bytes(),
+            peers: vec![WgPeerSpec {
+                public_key: client_public.to_bytes(),
+                preshared_key: None,
+                allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
+                name: SmolStr::new(""),
+                reserved: None,
+            }],
+            mtu: 1420,
+            udp: true,
+            udp_timeout: Duration::from_secs(60),
+        };
+        let mut actor = actor_with_spec(spec);
+        let mut client =
+            meow_wireguard::Tunn::new(client_secret, server_public, None, None, 0, None);
+        let actor_addr: SocketAddr = format!("127.0.0.1:{}", actor.bound_port).parse().unwrap();
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("client socket");
+        let client_addr = sender.local_addr().unwrap();
+        let mut work = vec![0u8; 4096];
+
+        /// The production receive arm — same shape as the RX test's:
+        /// async `recv_from` for the datagram that woke the reactor,
+        /// then `drain_wire` for whatever else is queued.
+        async fn feed_pending(actor: &mut WgActor) {
+            let (n, src) = actor
+                .endpoint
+                .recv_from(&mut actor.recv_buf)
+                .await
+                .expect("datagram ready");
+            actor.demux_one(src, n);
+            actor.drain_wire();
+        }
+
+        // The real handshake — init → response → keepalive —
+        // establishes the peer's responder session on the actor.
+        let init = {
+            let TunnResult::WriteToNetwork(b) =
+                client.format_handshake_initiation(&mut work, false)
+            else {
+                panic!("initiation formats");
+            };
+            b.to_vec()
+        };
+        sender.send_to(&init, actor_addr).expect("send init");
+        feed_pending(&mut actor).await;
+        let (resp_addr, resp) = actor
+            .outbox
+            .pop_front()
+            .expect("init produces a handshake response");
+        assert_eq!(resp_addr, client_addr);
+        let keepalive = {
+            let TunnResult::WriteToNetwork(b) =
+                client.decapsulate(Some(client_addr.ip()), &resp, &mut work)
+            else {
+                panic!("client consumes the response");
+            };
+            b.to_vec()
+        };
+        sender
+            .send_to(&keepalive, actor_addr)
+            .expect("send keepalive");
+        feed_pending(&mut actor).await;
+        assert!(actor.outbox.is_empty(), "the keepalive answers nothing");
+
+        // The peer's endpoint — armed the way an ACL-admitted roam
+        // would leave it (the drain's post-pass must resolve it
+        // per job).
+        actor.table.peers_mut()[0].endpoint = Some(client_addr);
+
+        // Eight inner replies `443 → 40000` routed to peer 0 through
+        // `rst_hint` — the drain's unmatched-tuple fallback. The last
+        // payload byte marks queue position.
+        let client_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let target_ip: Ipv4Addr = "203.0.113.9".parse().unwrap();
+        actor
+            .rst_hint
+            .insert((client_ip.into(), 40000, target_ip.into(), 443), 0);
+        const N: usize = 8;
+        let mut inners = Vec::new();
+        for i in 0..N {
+            let inner = seg_v4_data(
+                target_ip,
+                client_ip,
+                443,
+                40000,
+                7000 + i as u32,
+                1000,
+                0x18,
+                &[i as u8],
+            );
+            inners.push(inner.clone());
+            actor.device.tx_queue.push_back(inner);
+        }
+        actor.drain_device_tx();
+
+        assert_eq!(actor.outbox.len(), N, "every sealed job emitted a datagram");
+        assert_eq!(
+            actor.device.tx_pool.len(),
+            N,
+            "every drained inner returned to tx_pool"
+        );
+
+        let mut prev: Option<u64> = None;
+        for (i, (addr, datagram)) in actor.outbox.iter().enumerate() {
+            assert_eq!(*addr, client_addr);
+            assert_eq!(
+                u32::from_le_bytes(datagram[0..4].try_into().unwrap()),
+                4,
+                "datagram {i} is WG data"
+            );
+            let counter = u64::from_le_bytes(datagram[8..16].try_into().unwrap());
+            if let Some(p) = prev {
+                assert_eq!(counter, p + 1, "counters stay consecutive in emit order");
+            }
+            prev = Some(counter);
+            match client.decapsulate(Some(client_addr.ip()), datagram, &mut work) {
+                TunnResult::WriteToTunnelV4(b, _) | TunnResult::WriteToTunnelV6(b, _) => {
+                    assert_eq!(&b[..], &inners[i][..], "datagram {i} decrypts to inner {i}");
+                }
+                other => panic!("client must decrypt datagram {i}, got {other:?}"),
+            }
+        }
+    }
+
+    /// PATCH(19): `drain_inject`'s parallel arm end to end — the
+    /// flow-reply twin of the `tx_queue` drain test above. A real
+    /// handshake gives peer 0 a session; eight `(slot, Bytes)` inject
+    /// items past the `n <= 2` inline cutoff flatten into one
+    /// `TxCryptoJob` batch whose per-item `reserve_tx_counters(1)`
+    /// keeps counters consecutive in queue order. Every outbox
+    /// datagram must decrypt at the client back to its reply *in emit
+    /// order*, and nothing returns to `tx_pool` — inject inners are
+    /// `Bytes` copies that drop with their job (`pool_inner: false`).
+    #[tokio::test(flavor = "current_thread")]
+    async fn drain_inject_parallel_seals_in_job_order() {
+        use meow_wireguard::x25519;
+
+        let server_secret = x25519::StaticSecret::from([0x7E; 32]);
+        let server_public = x25519::PublicKey::from(&server_secret);
+        let client_secret = x25519::StaticSecret::from([0xB1; 32]);
+        let client_public = x25519::PublicKey::from(&client_secret);
+        let spec = WgListenerSpec {
+            private_key: server_secret.to_bytes(),
+            peers: vec![WgPeerSpec {
+                public_key: client_public.to_bytes(),
+                preshared_key: None,
+                allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
+                name: SmolStr::new(""),
+                reserved: None,
+            }],
+            mtu: 1420,
+            udp: true,
+            udp_timeout: Duration::from_secs(60),
+        };
+        let mut actor = actor_with_spec(spec);
+        let mut client =
+            meow_wireguard::Tunn::new(client_secret, server_public, None, None, 0, None);
+        let actor_addr: SocketAddr = format!("127.0.0.1:{}", actor.bound_port).parse().unwrap();
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("client socket");
+        let client_addr = sender.local_addr().unwrap();
+        let mut work = vec![0u8; 4096];
+
+        /// The production receive arm — same shape as the sibling
+        /// test's: async `recv_from` for the datagram that woke the
+        /// reactor, then `drain_wire` for whatever else is queued.
+        async fn feed_pending(actor: &mut WgActor) {
+            let (n, src) = actor
+                .endpoint
+                .recv_from(&mut actor.recv_buf)
+                .await
+                .expect("datagram ready");
+            actor.demux_one(src, n);
+            actor.drain_wire();
+        }
+
+        // The real handshake — init → response → keepalive — arms peer
+        // 0's responder session, which `drain_inject`'s Phase-A handle
+        // cache then resolves per slot.
+        let init = {
+            let TunnResult::WriteToNetwork(b) =
+                client.format_handshake_initiation(&mut work, false)
+            else {
+                panic!("initiation formats");
+            };
+            b.to_vec()
+        };
+        sender.send_to(&init, actor_addr).expect("send init");
+        feed_pending(&mut actor).await;
+        let (resp_addr, resp) = actor
+            .outbox
+            .pop_front()
+            .expect("init produces a handshake response");
+        assert_eq!(resp_addr, client_addr);
+        let keepalive = {
+            let TunnResult::WriteToNetwork(b) =
+                client.decapsulate(Some(client_addr.ip()), &resp, &mut work)
+            else {
+                panic!("client consumes the response");
+            };
+            b.to_vec()
+        };
+        sender
+            .send_to(&keepalive, actor_addr)
+            .expect("send keepalive");
+        feed_pending(&mut actor).await;
+        assert!(actor.outbox.is_empty(), "the keepalive answers nothing");
+
+        // The peer's endpoint — the post-pass resolves it per job.
+        actor.table.peers_mut()[0].endpoint = Some(client_addr);
+
+        // Eight flow-task replies queue on the inject channel — past
+        // the pool's inline cutoff, so the seals ride real workers.
+        // The last payload byte marks queue position.
+        const N: usize = 8;
+        let client_ip: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let target_ip: Ipv4Addr = "203.0.113.9".parse().unwrap();
+        let mut inners = Vec::new();
+        for i in 0..N {
+            let inner = seg_v4_data(
+                target_ip,
+                client_ip,
+                443,
+                40000,
+                9000 + i as u32,
+                1000,
+                0x18,
+                &[i as u8],
+            );
+            inners.push(inner.clone());
+            actor
+                .inject_tx
+                .try_send((0, Bytes::from(inner)))
+                .expect("inject queue has room");
+        }
+        actor.drain_inject();
+
+        assert_eq!(
+            actor.outbox.len(),
+            N,
+            "every sealed inject job emitted a datagram"
+        );
+        assert!(
+            actor.device.tx_pool.is_empty(),
+            "inject inners are copies — they drop with the job, never pool"
+        );
+
+        let mut prev: Option<u64> = None;
+        for (i, (addr, datagram)) in actor.outbox.iter().enumerate() {
+            assert_eq!(*addr, client_addr);
+            assert_eq!(
+                u32::from_le_bytes(datagram[0..4].try_into().unwrap()),
+                4,
+                "datagram {i} is WG data"
+            );
+            let counter = u64::from_le_bytes(datagram[8..16].try_into().unwrap());
+            if let Some(p) = prev {
+                assert_eq!(counter, p + 1, "counters stay consecutive in emit order");
+            }
+            prev = Some(counter);
+            match client.decapsulate(Some(client_addr.ip()), datagram, &mut work) {
+                TunnResult::WriteToTunnelV4(b, _) | TunnResult::WriteToTunnelV6(b, _) => {
+                    assert_eq!(&b[..], &inners[i][..], "datagram {i} decrypts to inner {i}");
+                }
+                other => panic!("client must decrypt datagram {i}, got {other:?}"),
+            }
+        }
     }
 }

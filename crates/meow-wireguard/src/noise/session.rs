@@ -268,28 +268,62 @@ impl SessionCrypto {
         ret
     }
 
+    /// PATCH(19): block-reserve `n` sending counters, returning the base
+    /// — a TX batch's job_i seals with `base + i`, so one `fetch_add`
+    /// serves the whole pass instead of one per packet. `Relaxed`
+    /// suffices: the counter is a nonce, so disjointness is all the
+    /// wire needs — it carries no ordering dependency the memory model
+    /// must publish (the receiver's replay window accepts any unseen
+    /// counter inside N_BITS of its high-water mark).
+    pub(crate) fn reserve_tx_counters(&self, n: usize) -> u64 {
+        self.sending_key_counter
+            .fetch_add(n as u64, Ordering::Relaxed)
+    }
+
     /// src - an IP packet from the interface
     /// dst - pre-allocated space to hold the encapsulating UDP packet to send over the network
     /// returns the size of the formatted packet
     fn format_packet_data<'a>(&self, src: &[u8], dst: &'a mut [u8]) -> &'a mut [u8] {
+        // PATCH(19): the undersize check stays *ahead* of the counter
+        // fetch, the same order the pre-delegation body ran — a panic
+        // after `fetch_add` would burn a nonce the serial contract
+        // never burned. `format_packet_data_at` keeps its own copy of
+        // the check as the job path's guard.
+        if dst.len() < src.len() + super::DATA_OVERHEAD_SZ {
+            panic!("The destination buffer is too small");
+        }
+        let counter = self.sending_key_counter.fetch_add(1, Ordering::Relaxed);
+        let n = self.format_packet_data_at(src, dst, counter);
+        &mut dst[..n]
+    }
+
+    /// PATCH(19): `format_packet_data`'s body with the counter supplied
+    /// by the caller — the `&self` shape a crypto-pool worker needs
+    /// (the batch's Phase A block-reserved the counter through
+    /// [`reserve_tx_counters`](Self::reserve_tx_counters), so the seal
+    /// never touches the atomic itself). Writes
+    /// `type‖sending_index‖counter‖ciphertext‖tag` into `dst` exactly
+    /// as the fetching form does and returns the wire length
+    /// (`DATA_OFFSET + src.len() + AEAD_SIZE`). Same panic contract:
+    /// `dst` must hold `src.len() + DATA_OVERHEAD_SZ` — the job layer
+    /// guards before calling.
+    pub(crate) fn format_packet_data_at(&self, src: &[u8], dst: &mut [u8], counter: u64) -> usize {
         if dst.len() < src.len() + super::DATA_OVERHEAD_SZ {
             panic!("The destination buffer is too small");
         }
 
-        let sending_key_counter = self.sending_key_counter.fetch_add(1, Ordering::Relaxed);
-
         let (message_type, rest) = dst.split_at_mut(4);
         let (receiver_index, rest) = rest.split_at_mut(4);
-        let (counter, data) = rest.split_at_mut(8);
+        let (counter_field, data) = rest.split_at_mut(8);
 
         message_type.copy_from_slice(&super::DATA.to_le_bytes());
         receiver_index.copy_from_slice(&self.sending_index.to_le_bytes());
-        counter.copy_from_slice(&sending_key_counter.to_le_bytes());
+        counter_field.copy_from_slice(&counter.to_le_bytes());
 
         // TODO: spec requires padding to 16 bytes, but actually works fine without it
         let n = {
             let mut nonce = [0u8; 12];
-            nonce[4..12].copy_from_slice(&sending_key_counter.to_le_bytes());
+            nonce[4..12].copy_from_slice(&counter.to_le_bytes());
             data[..src.len()].copy_from_slice(src);
             // PATCH(4): seal in place via the facade, then append the tag.
             // PATCH(16): the boring build seals through the cached ctx;
@@ -312,7 +346,7 @@ impl SessionCrypto {
             src.len() + AEAD_SIZE
         };
 
-        &mut dst[..DATA_OFFSET + n]
+        DATA_OFFSET + n
     }
 
     /// packet - a data packet we received from the network
@@ -514,5 +548,81 @@ mod tests {
         assert!(b
             .receive_packet_data_in_place(r_idx, counter, &mut dup[DATA_OFFSET..wire_len])
             .is_err());
+    }
+
+    /// PATCH(19): `reserve_tx_counters` hands out disjoint, internally
+    /// contiguous ranges — one `fetch_add` per call no matter how the
+    /// callers interleave on the shared crypto.
+    #[test]
+    fn tx_reserve_counters_disjoint() {
+        let s = Session::new(1, 11, [9u8; 32], [7u8; 32]);
+        let bases = Mutex::new(Vec::new());
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    bases.lock().push(s.crypto.reserve_tx_counters(16));
+                });
+            }
+        });
+        let mut bases = bases.into_inner();
+        bases.sort_unstable();
+        // Four threads × 16 counters: the only disjoint contiguous
+        // partition of [0, 64).
+        assert_eq!(bases, [0, 16, 32, 48]);
+    }
+
+    /// PATCH(19): `format_packet_data_at` reproduces
+    /// `format_packet_data` byte-for-byte at the same counter — two
+    /// identically-built sessions, one sealing through the fetching
+    /// form, one through the caller-supplied form, must emit the same
+    /// datagram (header and AEAD tag are keyed to the counter alone).
+    /// Runs under both backends — the seal path is shared.
+    #[test]
+    fn format_packet_data_at_equivalence() {
+        let a_fetch = Session::new(1, 11, [9u8; 32], [7u8; 32]);
+        let a_at = Session::new(1, 11, [9u8; 32], [7u8; 32]);
+        for counter in 0..32u64 {
+            let src = format!("packet-{counter}").into_bytes();
+            let mut d1 = vec![0u8; src.len() + crate::noise::DATA_OVERHEAD_SZ];
+            let mut d2 = vec![0u8; src.len() + crate::noise::DATA_OVERHEAD_SZ];
+            let n1 = a_fetch.format_packet_data(&src, &mut d1).len();
+            let n2 = a_at.crypto.format_packet_data_at(&src, &mut d2, counter);
+            assert_eq!(n1, n2);
+            assert_eq!(&d1[..n1], &d2[..n2], "counter {counter} diverged");
+        }
+    }
+
+    /// PATCH(19): 100 caller-counter seal→open round-trips, opened in a
+    /// non-monotone order — `(step * 37 + 13) % 100` is a full-period
+    /// permutation — pinning both the worker-side seal and the replay
+    /// window's out-of-order acceptance at the far end. No cfg gate:
+    /// `format_packet_data_at` is the pool's seal path under both
+    /// backends.
+    #[test]
+    fn format_packet_data_at_round_trip() {
+        let a = Session::new(1, 11, [9u8; 32], [7u8; 32]);
+        let b = Session::new(11, 1, [7u8; 32], [9u8; 32]);
+        let mut datagrams: Vec<Vec<u8>> = Vec::new();
+        for i in 0..100u64 {
+            let src = format!("packet-{i}").into_bytes();
+            let mut dst = vec![0u8; src.len() + crate::noise::DATA_OVERHEAD_SZ];
+            let n = a.crypto.format_packet_data_at(&src, &mut dst, i);
+            dst.truncate(n);
+            datagrams.push(dst);
+        }
+        for step in 0..100u64 {
+            let i = ((step * 37 + 13) % 100) as usize;
+            let mut dst = std::mem::take(&mut datagrams[i]);
+            let wire_len = dst.len();
+            let r_idx = u32::from_le_bytes(dst[4..8].try_into().unwrap());
+            let counter = u64::from_le_bytes(dst[8..16].try_into().unwrap());
+            assert_eq!(r_idx, 11);
+            assert_eq!(counter, i as u64);
+            let pt_len = b
+                .receive_packet_data_in_place(r_idx, counter, &mut dst[DATA_OFFSET..wire_len])
+                .expect("caller-counter seal opens");
+            let expect = format!("packet-{i}").into_bytes();
+            assert_eq!(&dst[DATA_OFFSET..DATA_OFFSET + pt_len], &expect[..]);
+        }
     }
 }

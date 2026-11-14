@@ -26,7 +26,9 @@ use meow_wgstack::{
     TCP_READ_QUEUE, TCP_SOCKET_BUF, TCP_WRITE_QUEUE, WG_TIMER_INTERVAL, WIRE_DRAIN_BUDGET,
 };
 use meow_wireguard::noise::Packet;
-use meow_wireguard::{x25519, CryptoJob, CryptoPool, Tunn, TunnResult, WireClass, WireGuardError};
+use meow_wireguard::{
+    x25519, CryptoJob, CryptoPool, Tunn, TunnResult, TxCryptoJob, WireClass, WireGuardError,
+};
 use smoltcp::iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet};
 use smoltcp::socket::{tcp, udp};
 use smoltcp::time::Instant as SmolInstant;
@@ -602,12 +604,17 @@ impl WgPump {
                     // `Arc` the session's crypto while `&mut self.tunn`
                     // is free — the job carries it to the worker.
                     let crypto = self.tunn.session_handle_for(receiver_idx);
-                    let mut job = CryptoJob::new(pkt, wire_len, receiver_idx, counter, crypto);
                     // The job's own context tag — the post-pass lands
                     // each result on its source slot exactly, even if a
                     // lost chunk ever shifted the return positions.
-                    job.tag = i;
-                    jobs.push(job);
+                    jobs.push(CryptoJob::new(
+                        pkt,
+                        wire_len,
+                        receiver_idx,
+                        counter,
+                        crypto,
+                        i,
+                    ));
                 }
                 WireClass::Other(packet) => {
                     self.handle_verified_wire(packet, &mut dst);
@@ -697,33 +704,129 @@ impl WgPump {
         self.rx_slots = slots;
     }
 
-    /// Egress: `device.tx_queue` → `Tunn::encapsulate` → outbox. A queued
-    /// inner packet resurfaces here once the handshake completes. Each
-    /// drained buffer goes back to `device.tx_pool` for reuse.
+    /// Egress: `device.tx_queue` → WG DATA datagrams → outbox — the TX
+    /// twin of `drain_wire`'s three-phase shape (PATCH(19)):
+    ///
+    ///   A. **Serial setup** — `current_session_handle` once: an `Arc`
+    ///      clone of the outbound session's crypto, read off the same
+    ///      ring slot `encapsulate` consults. `None` means no
+    ///      established session, and the whole batch falls back to the
+    ///      serial `encapsulate` loop — the only path that may produce
+    ///      non-DATA output here, since `queue_packet` + the
+    ///      handshake-initiation chain need `&mut Tunn`. With a
+    ///      session, `reserve_tx_counters(n)` block-reserves the
+    ///      batch's nonces in one `fetch_add` and each inner packet
+    ///      moves into a [`TxCryptoJob`]: the `tx_queue` Vec travels
+    ///      into the job as `inner`, a `take_scratch()` Vec is its
+    ///      `wire` buffer.
+    ///   B. **Worker pass** — `CryptoPool::run_tx_shared(&mut jobs)`:
+    ///      the batch's AEAD seals off-thread (inline when
+    ///      `jobs <= 2` — resolved lazily, so a small batch never
+    ///      spawns the pool).
+    ///   C. **Serial post-pass** — in job order, which is also counter
+    ///      order and the order `encapsulate` would have emitted (the
+    ///      same triple-coincidence `drain_wire`'s positional merge
+    ///      gives the open direction): each sealed `wire` Vec goes to
+    ///      `enqueue_wg`, then `handle_sent_data` replays the
+    ///      timer/`tx_bytes` bookkeeping `encapsulate` ran inline —
+    ///      deferred past Phase B exactly like the DATA bookkeeping on
+    ///      the RX side, the same bounded last-writer-wins divergence
+    ///      on the liveness arm only. Every `inner` Vec returns to
+    ///      `device.tx_pool` regardless of outcome; a failed job's
+    ///      `wire` Vec returns to `scratch_pool`.
+    ///
+    /// Divergence map vs the serial path, all bounded inside a pass:
+    /// a packet that arrives between the `current_session_handle`
+    /// snapshot and Phase C seals under the captured session even if
+    /// `current` rotated mid-pass — a live session the peer still
+    /// accepts, the same window the serial path's per-packet re-read
+    /// had. Undersize packets take the serial arm's `warn!` + drop,
+    /// never the panic `format_packet_data` carries.
     fn drain_device_tx(&mut self) {
-        let mut dst = self.take_scratch();
-        while let Some(pkt) = self.device.tx_queue.pop_front() {
-            // `Tunn::encapsulate` *panics* on an undersized dst — guard
-            // rather than trust the MTU accounting.
-            if pkt.len() + meow_wireguard::DATA_OVERHEAD_SZ > dst.len() {
+        let Some(crypto) = self.tunn.current_session_handle() else {
+            // No established session — the serial arm: `encapsulate`
+            // queues each inner packet and drives the handshake chain.
+            let mut dst = self.take_scratch();
+            while let Some(pkt) = self.device.tx_queue.pop_front() {
+                // `Tunn::encapsulate` *panics* on an undersized dst —
+                // guard rather than trust the MTU accounting.
+                if pkt.len() + meow_wireguard::DATA_OVERHEAD_SZ > dst.len() {
+                    warn!(
+                        "wireguard {}: dropping {}B inner packet (scratch buffer {}B)",
+                        self.name,
+                        pkt.len(),
+                        dst.len()
+                    );
+                    self.device.return_tx_buf(pkt);
+                    continue;
+                }
+                if let TunnResult::WriteToNetwork(b) = self.tunn.encapsulate(&pkt, &mut dst) {
+                    let len = b.len();
+                    dst.truncate(len);
+                    self.enqueue_wg(dst);
+                    dst = self.take_scratch();
+                }
+                self.device.return_tx_buf(pkt);
+            }
+            self.return_scratch(dst);
+            return;
+        };
+
+        // Phase A — `n` snapshots the queue: packets pushed during the
+        // pass are for the next iteration. The block reservation keys
+        // each job's nonce to `base + i`; a packet dropped at the
+        // undersize guard simply skips its counter (counters need
+        // uniqueness, not contiguity).
+        let n = self.device.tx_queue.len();
+        let base = crypto.reserve_tx_counters(n);
+        let mut jobs: Vec<TxCryptoJob> = Vec::with_capacity(n);
+        for i in 0..n {
+            let pkt = self.device.tx_queue.pop_front().expect("n was snapshotted");
+            if pkt.len() + meow_wireguard::DATA_OVERHEAD_SZ > self.scratch_len {
                 warn!(
                     "wireguard {}: dropping {}B inner packet (scratch buffer {}B)",
                     self.name,
                     pkt.len(),
-                    dst.len()
+                    self.scratch_len
                 );
                 self.device.return_tx_buf(pkt);
                 continue;
             }
-            if let TunnResult::WriteToNetwork(b) = self.tunn.encapsulate(&pkt, &mut dst) {
-                let len = b.len();
-                dst.truncate(len);
-                self.enqueue_wg(dst);
-                dst = self.take_scratch();
-            }
-            self.device.return_tx_buf(pkt);
+            jobs.push(TxCryptoJob::new(
+                pkt,
+                self.take_scratch(),
+                base + i as u64,
+                crypto.clone(),
+                i,
+            ));
         }
-        self.return_scratch(dst);
+
+        // Phase B — the batch's AEAD seals inside the job `wire` bufs.
+        // `run_tx_shared` fills every `job.result`, preserving job
+        // order — and its `n <= 2` shortcut runs *before* the shared
+        // pool is resolved, so a small batch never spawns the workers.
+        CryptoPool::run_tx_shared(&mut jobs);
+
+        // Phase C — serial post-pass in job order = counter order =
+        // the wire-emit order `encapsulate` would have produced.
+        for job in jobs {
+            let inner_len = job.inner.len();
+            self.device.return_tx_buf(job.inner);
+            match job.result {
+                Some(Ok(_)) => {
+                    self.enqueue_wg(job.wire);
+                    self.tunn.handle_sent_data(inner_len);
+                }
+                Some(Err(e)) => {
+                    debug!("wireguard {}: encapsulate error: {e:?}", self.name);
+                    self.return_scratch(job.wire);
+                }
+                None => {
+                    debug_assert!(false, "crypto pool resolves every job");
+                    self.return_scratch(job.wire);
+                }
+            }
+        }
     }
 
     /// boringtun's housekeeping — rekey, session expiry, persistent
@@ -2304,6 +2407,69 @@ mod tests {
                 .all(|s| s.capacity() == pump.scratch_len),
             "every rx_slot returns at full capacity"
         );
+    }
+
+    /// PATCH(19): `drain_device_tx`'s parallel arm end to end — a real
+    /// session (`session_up`), then a burst of inner packets through
+    /// `tx_queue` → `TxCryptoJob` → `run_tx_shared`. The burst exceeds
+    /// the `n <= 2` inline cutoff, so the pass rides real workers;
+    /// every outbox datagram must decrypt at the responder back to its
+    /// inner *in emit order* — job order = counter order = wire order —
+    /// and every drained `tx_queue` buffer must land back in `tx_pool`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn drain_device_tx_parallel_seals_in_job_order() {
+        let client_secret = x25519::StaticSecret::from([0x93; 32]);
+        let client_public = x25519::PublicKey::from(&client_secret);
+        let server_secret = x25519::StaticSecret::from([0x94; 32]);
+        let server_public = x25519::PublicKey::from(&server_secret);
+        let mut pump = pump_for_test(&test_config(&client_secret, &server_public));
+        let mut server = Tunn::new(server_secret, client_public, None, None, 0, None);
+        session_up(&mut pump, &mut server);
+        pump.outbox.clear();
+        let pool_before = pump.device.tx_pool.len();
+
+        // Eight inner packets — past the pool's `n <= 2` inline
+        // cutoff, so the seal pass must ride real workers. The last
+        // byte marks the queue position the wire order must mirror.
+        const N: usize = 8;
+        let mut inners = Vec::new();
+        for i in 0..N {
+            let inner = vec![
+                0x45, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 10, 0, 0,
+                2, 10, 0, 0, 1, 0xde, 0xad, 0xbe, i as u8,
+            ];
+            inners.push(inner.clone());
+            pump.device.tx_queue.push_back(inner);
+        }
+        pump.drain_device_tx();
+
+        assert_eq!(pump.outbox.len(), N, "every sealed job emitted a datagram");
+        assert_eq!(
+            pump.device.tx_pool.len() - pool_before,
+            N,
+            "every drained inner returned to tx_pool"
+        );
+
+        let mut wire = vec![0u8; 2048];
+        let mut prev: Option<u64> = None;
+        for (i, datagram) in pump.outbox.iter().enumerate() {
+            assert_eq!(
+                u32::from_le_bytes(datagram[0..4].try_into().unwrap()),
+                4,
+                "datagram {i} is WG data"
+            );
+            let counter = u64::from_le_bytes(datagram[8..16].try_into().unwrap());
+            if let Some(p) = prev {
+                assert_eq!(counter, p + 1, "counters stay consecutive in emit order");
+            }
+            prev = Some(counter);
+            match server.decapsulate(None, datagram, &mut wire) {
+                TunnResult::WriteToTunnelV4(b, _) | TunnResult::WriteToTunnelV6(b, _) => {
+                    assert_eq!(&b[..], &inners[i][..], "datagram {i} decrypts to inner {i}");
+                }
+                other => panic!("responder must decrypt datagram {i}, got {other:?}"),
+            }
+        }
     }
 
     /// A dial to a family the tunnel has no address for fails *inside*
