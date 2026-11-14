@@ -284,6 +284,14 @@ impl SessionCrypto {
     /// dst - pre-allocated space to hold the encapsulating UDP packet to send over the network
     /// returns the size of the formatted packet
     fn format_packet_data<'a>(&self, src: &[u8], dst: &'a mut [u8]) -> &'a mut [u8] {
+        // PATCH(19): the undersize check stays *ahead* of the counter
+        // fetch, the same order the pre-delegation body ran — a panic
+        // after `fetch_add` would burn a nonce the serial contract
+        // never burned. `format_packet_data_at` keeps its own copy of
+        // the check as the job path's guard.
+        if dst.len() < src.len() + super::DATA_OVERHEAD_SZ {
+            panic!("The destination buffer is too small");
+        }
         let counter = self.sending_key_counter.fetch_add(1, Ordering::Relaxed);
         let n = self.format_packet_data_at(src, dst, counter);
         &mut dst[..n]
