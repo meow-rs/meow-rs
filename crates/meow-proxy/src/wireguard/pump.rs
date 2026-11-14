@@ -22,8 +22,8 @@ use std::time::{Duration, Instant as StdInstant};
 use bytes::{Buf, Bytes};
 use meow_common::{MeowError, ProxyConn, ProxyPacketConn, Result};
 use meow_wgstack::{
-    poll_burst, BatchEndpoint, ChannelDevice, StreamEvent, TcpIo, WgStream, TCP_READ_QUEUE,
-    TCP_SOCKET_BUF, TCP_WRITE_QUEUE, WG_TIMER_INTERVAL, WIRE_DRAIN_BUDGET,
+    poll_burst, reset_scratch, BatchEndpoint, ChannelDevice, StreamEvent, TcpIo, WgStream,
+    TCP_READ_QUEUE, TCP_SOCKET_BUF, TCP_WRITE_QUEUE, WG_TIMER_INTERVAL, WIRE_DRAIN_BUDGET,
 };
 use meow_wireguard::{x25519, Tunn, TunnResult, WireGuardError};
 use smoltcp::iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet};
@@ -52,11 +52,12 @@ const UDP_SOCKET_BYTES: usize = 65536;
 /// happened to them pre-pool.
 const SCRATCH_POOL_CAP: usize = 128;
 
-/// Read chunk handed to `socket.recv`. One 16 KiB item drains through a
-/// relay's bulk-tier 32 KiB ReadBuf in ~2 channel hops (or four 4 KiB
-/// hops before the bulk upgrade) instead of four times as many 4 KiB
-/// items, without letting one socket monopolise a service pass.
-const TCP_READ_CHUNK: usize = 16384;
+/// Read chunk handed to `socket.recv`. One 64 KiB item drains through a
+/// relay's bulk-tier 32 KiB ReadBuf in ~2 channel hops — a quarter of the
+/// hop count 16 KiB items needed — and a `TCP_READ_QUEUE` of them still
+/// covers the 1 MiB rx window, without letting one socket monopolise a
+/// service pass.
+const TCP_READ_CHUNK: usize = 65536;
 
 /// Idle `select!` sleep when smoltcp reports no `poll_delay`: inbound WG
 /// datagrams, mailbox messages and conn wakes all break the sleep early, so
@@ -178,7 +179,8 @@ struct WgPump {
     device: ChannelDevice,
     sockets: SocketSet<'static>,
     /// The connected peer socket, wrapped for batched `sendmmsg`/
-    /// `recvmmsg` I/O on Linux (a `try_*` loop elsewhere).
+    /// `recvmmsg` I/O on Linux and `sendmsg_x`/`recvmsg_x` on macOS
+    /// (a `try_*` loop elsewhere).
     endpoint: BatchEndpoint,
     endpoint_addr: SocketAddr,
     rx: mpsc::Receiver<ActorMsg>,
@@ -207,7 +209,12 @@ struct WgPump {
     /// `buf_size`-capacity `Vec`s, persistent across passes so a quiet
     /// loop pays nothing. `recv_batch` advertises each slot's whole
     /// capacity as the window and rewrites a filled slot's len to its
-    /// datagram — capacity, never len, is what carries over.
+    /// datagram — capacity, never len, is what carries over. A slot a
+    /// DATA packet consumed leaves inside `rx_queue` as
+    /// `Bytes::from(Vec)` — the refcounted slice keeps the Vec's whole
+    /// ~`buf_size` allocation (~2 KiB), not just the datagram's span:
+    /// queue residency stays bounded in count, at a slightly larger
+    /// per-packet footprint — the price of the zero-copy handoff.
     rx_slots: Vec<Vec<u8>>,
     /// Recycled dst buffers for `Tunn::{encapsulate,decapsulate,
     /// update_timers,...}` — replaces the single fixed `work` scratch:
@@ -304,14 +311,14 @@ impl WgPump {
     }
 
     /// A crypto dst buffer for the next `Tunn` call: a pooled one reset
-    /// to `scratch_len` zeroed bytes, or a fresh allocation when the
-    /// pool is empty. `Tunn` takes `&mut [u8]` and panics on undersize,
-    /// so *length* — not capacity — is the contract.
+    /// to `scratch_len`, or a fresh allocation when the pool is empty.
+    /// [`reset_scratch`] carries the safety contract — *length*, not
+    /// capacity, is what `Tunn` sees.
     fn take_scratch(&mut self) -> Vec<u8> {
-        let mut buf = self.scratch_pool.pop_back().unwrap_or_default();
-        buf.clear();
-        buf.resize(self.scratch_len, 0);
-        buf
+        reset_scratch(
+            self.scratch_pool.pop_back().unwrap_or_default(),
+            self.scratch_len,
+        )
     }
 
     /// Return a spent buffer to the pool. Only full-size buffers are
@@ -339,14 +346,23 @@ impl WgPump {
         self.outbox.push_back(pkt);
     }
 
-    /// Feed one inbound datagram through `Tunn`, chaining the
+    /// Feed one inbound wire datagram through `Tunn`, chaining the
     /// empty-datagram calls boringtun's contract requires to flush packets
     /// queued behind a handshake (`decapsulate` doc: repeat until the
-    /// result is not `WriteToNetwork`). The datagram arrives as a
-    /// caller-owned `&mut [u8]` already bounded to its wire length —
-    /// the buffer never borrows `self`, so the loop below can take
-    /// `&mut self` freely.
-    fn decapsulate_wire(&mut self, datagram: &mut [u8]) {
+    /// result is not `WriteToNetwork`).
+    ///
+    /// The datagram arrives inside an *owned* receive buffer `slot`
+    /// (its first `wire_len` bytes — an rx-slot Vec, the select arm's
+    /// `recv_buf`, or a bare test datagram) because a DATA packet is
+    /// opened *in place* inside it (PATCH(17)): the plaintext lands at
+    /// `slot[DATA_PAYLOAD_OFF..]` and the whole Vec then moves into
+    /// `device.rx_queue` as `Bytes`, so the decrypt-into-scratch copy
+    /// plus the `Bytes::copy_from_slice` allocation the dst path needed
+    /// are both gone. `Some(slot)` hands the buffer back for reuse
+    /// (handshake/cookie/error traffic and keepalives, which decrypt to
+    /// empty plaintext); `None` means the decrypted packet owns it and
+    /// the caller back-fills a fresh buffer.
+    fn decapsulate_wire(&mut self, mut slot: Vec<u8>, wire_len: usize) -> Option<Vec<u8>> {
         // WG header bytes 1..4 are reserved-zero on the wire — but peers
         // like Cloudflare WARP stamp non-zero identifiers there, and
         // vendored boringtun's `parse_incoming_packet` checks type and
@@ -354,95 +370,135 @@ impl WgPump {
         // wholesale. Zero the field on receipt — don't-care semantics,
         // the same treatment mihomo applies for wireguard-go — rather
         // than patching the vendored parser.
-        if datagram.len() >= 4 {
-            datagram[1..4].fill(0);
+        if wire_len >= 4 {
+            slot[1..4].fill(0);
         }
-        let mut datagram: &[u8] = datagram;
         let mut dst = self.take_scratch();
-        loop {
-            match self.tunn.decapsulate(None, datagram, &mut dst) {
-                TunnResult::Done => break,
-                TunnResult::Err(e) => {
-                    debug!("wireguard {}: decapsulate error: {e:?}", self.name);
-                    if matches!(
-                        e,
-                        WireGuardError::NoCurrentSession | WireGuardError::WrongIndex
-                    ) {
-                        // A data datagram addressed to a session index
-                        // this ring does not hold — or to a different
-                        // generation in its slot — proves the peer's
-                        // noise state diverged from ours: it is
-                        // encrypting replies under a session we cannot
-                        // read and will keep doing so until it sees a
-                        // newer session of ours (the responder's
-                        // `current` follows the newest session that
-                        // sent it a data packet). boringtun's own
-                        // recovery is the `want_handshake` ladder —
-                        // KEEPALIVE+REKEY_TIMEOUT (~15 s) of one-way
-                        // traffic before a re-initiation — and every
-                        // pending dial burns its deadline inside that
-                        // window. Kick the handshake at the first such
-                        // error instead.
-                        //
-                        // Two independent bounds keep the kick cheap:
-                        // `force=false` dedups against a handshake
-                        // already in flight, and `desync_kick_due`
-                        // floors *re-arms* at REKEY_TIMEOUT — the dedup
-                        // alone ends the moment a response lands, so
-                        // without the floor a flood of forged
-                        // `receiver_idx` datagrams (DATA carries no
-                        // mac1; both errors above are forgeable at
-                        // line rate) would mint an initiation every
-                        // RTT and spend the responder's 2×DH+2×AEAD
-                        // per reply. `InvalidAeadTag`/`InvalidCounter`
-                        // et al. stay pure drops — they prove nothing
-                        // about session identity and a forged datagram
-                        // must not buy a handshake.
-                        if self.desync_kick_due() {
-                            if let TunnResult::WriteToNetwork(b) =
-                                self.tunn.format_handshake_initiation(&mut dst, false)
-                            {
-                                self.last_desync_kick = Some(StdInstant::now());
-                                let len = b.len();
-                                dst.truncate(len);
-                                self.enqueue_wg(dst);
-                                dst = self.take_scratch();
+        // `Some(len)` once a DATA packet has decrypted inside `slot`:
+        // the plaintext is `slot[DATA_PAYLOAD_OFF..DATA_PAYLOAD_OFF +
+        // len]` and the in-place path may not touch `slot` again after
+        // that, so the produced length is carried out of the borrow
+        // scope this way and the Vec moves below.
+        let mut plaintext_len = None;
+        {
+            let mut datagram: &mut [u8] = &mut slot[..wire_len];
+            loop {
+                match self.tunn.decapsulate_in_place(None, datagram, &mut dst) {
+                    TunnResult::Done => break,
+                    TunnResult::Err(e) => {
+                        debug!("wireguard {}: decapsulate error: {e:?}", self.name);
+                        if matches!(
+                            e,
+                            WireGuardError::NoCurrentSession | WireGuardError::WrongIndex
+                        ) {
+                            // A data datagram addressed to a session index
+                            // this ring does not hold — or to a different
+                            // generation in its slot — proves the peer's
+                            // noise state diverged from ours: it is
+                            // encrypting replies under a session we cannot
+                            // read and will keep doing so until it sees a
+                            // newer session of ours (the responder's
+                            // `current` follows the newest session that
+                            // sent it a data packet). boringtun's own
+                            // recovery is the `want_handshake` ladder —
+                            // KEEPALIVE+REKEY_TIMEOUT (~15 s) of one-way
+                            // traffic before a re-initiation — and every
+                            // pending dial burns its deadline inside that
+                            // window. Kick the handshake at the first such
+                            // error instead.
+                            //
+                            // Two independent bounds keep the kick cheap:
+                            // `force=false` dedups against a handshake
+                            // already in flight, and `desync_kick_due`
+                            // floors *re-arms* at REKEY_TIMEOUT — the dedup
+                            // alone ends the moment a response lands, so
+                            // without the floor a flood of forged
+                            // `receiver_idx` datagrams (DATA carries no
+                            // mac1; both errors above are forgeable at
+                            // line rate) would mint an initiation every
+                            // RTT and spend the responder's 2×DH+2×AEAD
+                            // per reply. `InvalidAeadTag`/`InvalidCounter`
+                            // et al. stay pure drops — they prove nothing
+                            // about session identity and a forged datagram
+                            // must not buy a handshake.
+                            if self.desync_kick_due() {
+                                if let TunnResult::WriteToNetwork(b) =
+                                    self.tunn.format_handshake_initiation(&mut dst, false)
+                                {
+                                    self.last_desync_kick = Some(StdInstant::now());
+                                    let len = b.len();
+                                    dst.truncate(len);
+                                    self.enqueue_wg(dst);
+                                    dst = self.take_scratch();
+                                }
                             }
                         }
+                        break;
                     }
-                    break;
-                }
-                TunnResult::WriteToNetwork(b) => {
-                    // Every `WriteToNetwork` slice starts at dst[0], so
-                    // the produced datagram is exactly the truncated
-                    // buffer — moved into the outbox, not copied.
-                    let len = b.len();
-                    dst.truncate(len);
-                    self.enqueue_wg(dst);
-                    // Chained call with an empty datagram flushes the queue.
-                    dst = self.take_scratch();
-                    datagram = &[];
-                }
-                TunnResult::WriteToTunnelV4(b, _) | TunnResult::WriteToTunnelV6(b, _) => {
-                    self.device.rx_queue.push_back(Bytes::copy_from_slice(b));
-                    break;
+                    TunnResult::WriteToNetwork(b) => {
+                        // Every `WriteToNetwork` slice starts at dst[0], so
+                        // the produced datagram is exactly the truncated
+                        // buffer — moved into the outbox, not copied.
+                        let len = b.len();
+                        dst.truncate(len);
+                        self.enqueue_wg(dst);
+                        // Chained call with an empty datagram flushes the queue.
+                        dst = self.take_scratch();
+                        datagram = &mut [];
+                    }
+                    TunnResult::WriteToTunnelV4(b, _) | TunnResult::WriteToTunnelV6(b, _) => {
+                        // PATCH(17): `b` is the plaintext the AEAD open
+                        // left inside `slot` at `DATA_PAYLOAD_OFF` —
+                        // record the produced length and let the borrow
+                        // die with the loop so the slot Vec itself can
+                        // move on. A chained empty-datagram flush can
+                        // only produce `WriteToNetwork`/`Done`/`Err`,
+                        // never this arm.
+                        plaintext_len = Some(b.len());
+                        break;
+                    }
                 }
             }
         }
         self.return_scratch(dst);
+        match plaintext_len {
+            // DATA decrypted in place: bound the Vec to the datagram,
+            // then `Bytes::from(Vec)` takes the whole allocation over —
+            // no copy — and only the plaintext view is published.
+            Some(len) => {
+                slot.truncate(wire_len);
+                let start = meow_wireguard::DATA_PAYLOAD_OFF;
+                self.device
+                    .rx_queue
+                    .push_back(Bytes::from(slot).slice(start..start + len));
+                None
+            }
+            // The slot holds nothing a consumer needs — reuse it.
+            None => Some(slot),
+        }
     }
 
     /// One batch read into the persistent slots — a `recvmmsg` on
-    /// Linux, a `try_recv_buf` loop elsewhere — then `Tunn` over each
+    /// Linux, a `recvmsg_x` on macOS, a `try_recv_buf` loop elsewhere —
+    /// then `Tunn` over each
     /// filled slot in wire order. The slots come out of `self` for the
-    /// pass because `decapsulate_wire` borrows a datagram mutably while
-    /// the method itself needs `&mut self`; independent `Vec`s mean a
-    /// slot the kernel skipped can't clobber a neighbour's packet.
+    /// pass because `decapsulate_wire` owns a slot's datagram while the
+    /// method itself needs `&mut self`; independent `Vec`s mean a slot
+    /// the kernel skipped can't clobber a neighbour's packet. A DATA
+    /// slot decrypts in place and leaves with its plaintext into
+    /// `rx_queue` — `decapsulate_wire` returns `None` for it and a
+    /// fresh buffer keeps the pool [`WIRE_DRAIN_BUDGET`] deep.
     fn drain_wire(&mut self) {
         let mut slots = std::mem::take(&mut self.rx_slots);
         let n = self.endpoint.recv_batch(&mut slots, WIRE_DRAIN_BUDGET);
         for slot in &mut slots[..n] {
-            self.decapsulate_wire(slot.as_mut_slice());
+            // `recv_batch` rewrote the filled slot's len to its datagram
+            // — that length is the wire bound `decapsulate_wire` uses.
+            let filled = std::mem::take(slot);
+            let wire_len = filled.len();
+            *slot = self
+                .decapsulate_wire(filled, wire_len)
+                .unwrap_or_else(|| Vec::with_capacity(self.scratch_len));
         }
         self.rx_slots = slots;
     }
@@ -491,8 +547,9 @@ impl WgPump {
                 // `decapsulate` calls — the same drain loop
                 // `decapsulate_wire` runs for real datagrams. Skipping
                 // this drops every inner packet parked while the old
-                // session was rekeying.
-                self.decapsulate_wire(&mut []);
+                // session was rekeying. An empty slot is the empty
+                // datagram; it comes back unused.
+                let _ = self.decapsulate_wire(Vec::new(), 0);
             }
             TunnResult::Err(e) => {
                 // `update_timers` reports `ConnectionExpired` once the
@@ -516,7 +573,7 @@ impl WgPump {
                         let len = b.len();
                         dst.truncate(len);
                         self.enqueue_wg(dst);
-                        self.decapsulate_wire(&mut []);
+                        let _ = self.decapsulate_wire(Vec::new(), 0);
                     }
                     TunnResult::Err(err) => {
                         warn!(
@@ -558,7 +615,8 @@ impl WgPump {
     }
 
     /// Nonblocking sends, a [`WIRE_DRAIN_BUDGET`]-bounded batch at a
-    /// time — one `sendmmsg` on Linux, a `try_send` loop elsewhere.
+    /// time — one `sendmmsg`/`sendmsg_x` on Linux/macOS, a `try_send`
+    /// loop elsewhere.
     /// A batch that stops short leaves the boundary datagram at the
     /// head of `staged`: replaying it with `try_send` is how the
     /// `WouldBlock`/`errno` split the old per-packet loop had is
@@ -773,6 +831,24 @@ impl WgPump {
         let _ = reply.send(Ok(Box::new(conn) as Box<dyn ProxyPacketConn>));
     }
 
+    /// Conn dead → drain the socket's rx to /dev/null instead of leaving
+    /// it full. An undrained rx keeps the advertised window pinned at 0:
+    /// the peer's smoltcp then holds `remote_win_len == 0`, its tx buffer
+    /// never flushes, the queued `TcpIo::Close` sits behind undrainable
+    /// `Data`, and both ends zombify (measured: `CloseWait`/`FinWait2`
+    /// pairs accumulating one per killed download, each pinning ~2 MiB).
+    /// With the buffer emptied the next ACK advertises a live window, the
+    /// peer flushes its backlog, its queued abort runs, and both sockets
+    /// reach `Closed` — a memmove-free drain since `recv` only consumes.
+    fn discard_socket_rx(st: &mut TcpState, socket: &mut tcp::Socket<'_>) {
+        st.pending_read.clear();
+        while socket.can_recv() {
+            if socket.recv(|data| (data.len(), ())).is_err() {
+                break;
+            }
+        }
+    }
+
     fn handle_msg(&mut self, msg: ActorMsg) {
         match msg {
             ActorMsg::DialTcp {
@@ -931,7 +1007,10 @@ impl WgPump {
                         st.pending_read.push_front(ev);
                         break;
                     }
-                    Err(mpsc::error::TrySendError::Closed(_)) => break,
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        Self::discard_socket_rx(st, socket);
+                        break;
+                    }
                 }
             }
             while socket.can_recv() && st.pending_read.is_empty() {
@@ -946,7 +1025,10 @@ impl WgPump {
                             st.pending_read.push_back(ev);
                             break;
                         }
-                        Err(mpsc::error::TrySendError::Closed(_)) => break,
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            Self::discard_socket_rx(st, socket);
+                            break;
+                        }
                     },
                     Err(_) => break,
                 }
@@ -1131,13 +1213,15 @@ impl WgPump {
                 },
                 r = self.endpoint.recv(&mut self.recv_buf) => match r {
                     Ok(n) => {
-                        // `decapsulate_wire` borrows the datagram buffer
-                        // mutably — take it out of `self` first, then
-                        // restore (the batch drain uses pooled slots
-                        // instead of this buffer).
-                        let mut pkt = std::mem::take(&mut self.recv_buf);
-                        self.decapsulate_wire(&mut pkt[..n]);
-                        self.recv_buf = pkt;
+                        // `decapsulate_wire` consumes the datagram
+                        // buffer: a DATA packet decrypts in place and
+                        // the buffer leaves with its plaintext `Bytes`,
+                        // so a fresh full-size one replaces it (the
+                        // batch drain uses pooled slots instead).
+                        let pkt = std::mem::take(&mut self.recv_buf);
+                        self.recv_buf = self
+                            .decapsulate_wire(pkt, n)
+                            .unwrap_or_else(|| vec![0u8; self.scratch_len]);
                     }
                     Err(e) => {
                         warn!("wireguard {}: endpoint recv error: {e}", self.name);
@@ -1550,11 +1634,13 @@ mod tests {
         };
 
         pump.recv_buf[..n].copy_from_slice(&buf[..n]);
-        // `decapsulate_wire` borrows the datagram mutably — take it out
-        // of `self` like the select arm does, then restore.
-        let mut pkt = std::mem::take(&mut pump.recv_buf);
-        pump.decapsulate_wire(&mut pkt[..n]);
-        pump.recv_buf = pkt;
+        // `decapsulate_wire` consumes the datagram buffer like the
+        // select arm does — take it out of `self`, then restore what
+        // it hands back (a non-data packet never consumes the slot).
+        let pkt = std::mem::take(&mut pump.recv_buf);
+        pump.recv_buf = pump
+            .decapsulate_wire(pkt, n)
+            .expect("a handshake packet returns the slot");
 
         // A valid initiation produces a HANDSHAKE_RESP (type 2) queued
         // for the wire. Without the scrub the parser rejects the
@@ -1564,6 +1650,14 @@ mod tests {
         // The taken recv_buf must be restored — an empty buffer left
         // behind would make every later endpoint.recv a 0-byte read.
         assert!(!pump.recv_buf.is_empty(), "recv_buf restored after take");
+    }
+
+    /// Tests feed datagrams as bare Vecs — the Vec's own length is the
+    /// wire bound — and the slot `decapsulate_wire` hands back is
+    /// dropped (a non-data result never consumes it anyway).
+    fn feed_wire(pump: &mut WgPump, datagram: Vec<u8>) {
+        let n = datagram.len();
+        pump.decapsulate_wire(datagram, n);
     }
 
     /// Drive one handshake between `pump.tunn` (initiator) and `server`
@@ -1587,8 +1681,7 @@ mod tests {
             };
             b.to_vec()
         };
-        let mut datagram = resp;
-        pump.decapsulate_wire(&mut datagram);
+        feed_wire(pump, resp);
         let keepalive = pump
             .outbox
             .pop_front()
@@ -1681,8 +1774,8 @@ mod tests {
         session_up(&mut pump, &mut server);
         pump.outbox.clear();
 
-        let mut datagram = desync_datagram(&client_secret, &server_public, &mut server);
-        pump.decapsulate_wire(&mut datagram);
+        let datagram = desync_datagram(&client_secret, &server_public, &mut server);
+        feed_wire(&mut pump, datagram);
 
         assert!(
             pump.outbox.iter().any(|d| d.len() == 148 && d[0] == 1),
@@ -1710,8 +1803,7 @@ mod tests {
 
         let desync = desync_datagram(&client_secret, &server_public, &mut server);
         for _ in 0..4 {
-            let mut datagram = desync.clone();
-            pump.decapsulate_wire(&mut datagram);
+            feed_wire(&mut pump, desync.clone());
         }
 
         let inits = pump
@@ -1748,8 +1840,7 @@ mod tests {
         let desync = desync_datagram(&client_secret, &server_public, &mut server);
 
         // Kick #1: the first error always fires.
-        let mut datagram = desync.clone();
-        pump.decapsulate_wire(&mut datagram);
+        feed_wire(&mut pump, desync.clone());
         let init = pump.outbox.pop_front().expect("first desync kicks");
         assert!(
             init.len() == 148 && init[0] == 1,
@@ -1760,18 +1851,17 @@ mod tests {
         // Answer that initiation so `is_in_progress` clears — the
         // exact state the forged flood reopens at every RTT.
         let mut wire = vec![0u8; 2048];
-        let mut resp = {
+        let resp = {
             let TunnResult::WriteToNetwork(b) = server.decapsulate(None, &init, &mut wire) else {
                 panic!("responder answers the kicked initiation");
             };
             b.to_vec()
         };
-        pump.decapsulate_wire(&mut resp);
+        feed_wire(&mut pump, resp);
         pump.outbox.clear(); // the post-response keepalive
 
         // A second diverged datagram inside the floor mints nothing.
-        let mut datagram = desync;
-        pump.decapsulate_wire(&mut datagram);
+        feed_wire(&mut pump, desync);
         assert!(
             !pump.outbox.iter().any(|d| d.len() == 148 && d[0] == 1),
             "a second desync inside REKEY_TIMEOUT must not mint another initiation"
@@ -1807,7 +1897,7 @@ mod tests {
         let live_idx = u32::from_le_bytes(forged[4..8].try_into().unwrap());
         forged[4..8].copy_from_slice(&live_idx.wrapping_add(1).to_le_bytes());
 
-        pump.decapsulate_wire(&mut forged);
+        feed_wire(&mut pump, forged);
 
         assert!(
             pump.outbox.iter().any(|d| d.len() == 148 && d[0] == 1),
@@ -1853,12 +1943,79 @@ mod tests {
         let last = forged.len() - 1;
         forged[last] ^= 0x5a;
         pump.outbox.clear();
-        pump.decapsulate_wire(&mut forged);
+        feed_wire(&mut pump, forged);
 
         assert!(
             !pump.outbox.iter().any(|d| d.len() == 148 && d[0] == 1),
             "an AEAD failure must not trigger a handshake"
         );
+    }
+
+    /// PATCH(17): an inbound DATA datagram decrypts *inside* its receive
+    /// slot and the slot's Vec moves into `rx_queue` as `Bytes` — the
+    /// `decapsulate`-into-scratch copy plus the `Bytes::copy_from_slice`
+    /// allocation are gone, so `decapsulate_wire` returns `None` (the
+    /// caller back-fills a fresh buffer) and the queued item is the
+    /// plaintext IP packet bounded to it. A keepalive's plaintext is
+    /// empty — `Done`, not `WriteToTunnel` — so its slot comes back.
+    #[tokio::test(flavor = "current_thread")]
+    async fn decapsulate_wire_moves_data_slot_into_rx_queue() {
+        let client_secret = x25519::StaticSecret::from([0x61; 32]);
+        let client_public = x25519::PublicKey::from(&client_secret);
+        let server_secret = x25519::StaticSecret::from([0x62; 32]);
+        let server_public = x25519::PublicKey::from(&server_secret);
+        let mut pump = pump_for_test(&test_config(&client_secret, &server_public));
+        let mut server = Tunn::new(server_secret, client_public, None, None, 0, None);
+        session_up(&mut pump, &mut server);
+        pump.outbox.clear();
+        pump.device.rx_queue.clear();
+
+        // A real IPv4 packet from the responder: 20-byte header + 4
+        // payload bytes (the shape `wg_vectors` uses — the tunnel only
+        // inspects the version nibble, total-length and source).
+        let inner: &[u8] = &[
+            0x45, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 10, 0, 0, 2,
+            10, 0, 0, 1, 0xde, 0xad, 0xbe, 0xef,
+        ];
+        let mut wire = vec![0u8; 2048];
+        let datagram = {
+            let TunnResult::WriteToNetwork(b) = server.encapsulate(inner, &mut wire) else {
+                panic!("responder encapsulates the inner packet");
+            };
+            b.to_vec()
+        };
+        let n = datagram.len();
+
+        // `None` says the decrypted packet owns the slot now; the queued
+        // `Bytes` is a view into its allocation, not a copy.
+        assert!(
+            pump.decapsulate_wire(datagram, n).is_none(),
+            "a DATA packet consumes its receive slot"
+        );
+        let packet = pump
+            .device
+            .rx_queue
+            .pop_front()
+            .expect("decrypted packet queued");
+        assert_eq!(
+            &packet[..],
+            inner,
+            "the plaintext IP packet arrives byte-identical"
+        );
+
+        // A keepalive decrypts to zero-length plaintext — `Done`, not
+        // `WriteToTunnel`, so the slot is handed back for reuse.
+        let keepalive = {
+            let TunnResult::WriteToNetwork(b) = server.encapsulate(&[], &mut wire) else {
+                panic!("responder encapsulates a keepalive");
+            };
+            b.to_vec()
+        };
+        let n = keepalive.len();
+        let returned = pump
+            .decapsulate_wire(keepalive, n)
+            .expect("a keepalive does not consume the slot");
+        assert_eq!(returned.len(), n);
     }
 
     /// A dial to a family the tunnel has no address for fails *inside*
@@ -1934,6 +2091,112 @@ mod tests {
         assert!(
             !pump.used_ports.contains(&port),
             "ephemeral port {port} leaked"
+        );
+    }
+
+    /// `discard_socket_rx` — the dead-conn drain: the conn half-closed
+    /// gracefully (FIN flowing, `graceful_close` set), then died while
+    /// the peer still had tail bytes in flight — the `FinWait` zombie
+    /// case the fn's doc names. The pinned observables, all through
+    /// the real `service_sockets` pass: the `Closed` channel arm calls
+    /// the discard, the socket's rx residue empties (window un-pins on
+    /// the next ACK), and the events parked in `pending_read` go with
+    /// it. The socket itself survives — a graceful close never aborts —
+    /// so the drain, not teardown, is what the assertions see.
+    #[tokio::test(flavor = "current_thread")]
+    async fn discard_socket_rx_drains_residue_on_dead_conn() {
+        let client_secret = x25519::StaticSecret::from([0x77; 32]);
+        let server_public = x25519::PublicKey::from(&x25519::StaticSecret::from([0x78; 32]));
+        let mut pump = pump_for_test(&test_config(&client_secret, &server_public));
+
+        let (reply_tx, mut reply_rx) = oneshot::channel();
+        pump.dial_tcp("203.0.113.1:443".parse().unwrap(), "t".into(), reply_tx);
+        let handle = *pump.tcp.keys().next().unwrap();
+
+        // SYN → our ISN/ephemeral port off the wire packet; the peer's
+        // SYN-ACK (seq 5000) → Established.
+        pump.iface
+            .poll(SmolInstant::now(), &mut pump.device, &mut pump.sockets);
+        let syn = pump.device.tx_queue.back().expect("the dial emitted a SYN");
+        let local_port = u16::from_be_bytes([syn[20], syn[21]]);
+        let isn = u32::from_be_bytes(syn[24..28].try_into().unwrap());
+        let syn_ack = tcp_seg_v4(
+            "203.0.113.1".parse().unwrap(),
+            "10.0.0.2".parse().unwrap(),
+            443,
+            local_port,
+            5000,
+            isn.wrapping_add(1),
+            0x12,
+        );
+        pump.device.rx_queue.push_back(Bytes::from(syn_ack));
+        pump.iface
+            .poll(SmolInstant::now(), &mut pump.device, &mut pump.sockets);
+        assert_eq!(
+            pump.sockets.get::<tcp::Socket>(handle).state(),
+            tcp::State::Established
+        );
+
+        // The dial resolves — the WgStream's channels are the conn ends.
+        pump.service_sockets();
+        let mut conn = match reply_rx.try_recv() {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => panic!("dial failed: {e}"),
+            Err(e) => panic!("dial did not resolve in one pass: {e}"),
+        };
+
+        // Graceful half-close first — the FIN is flowing — then the
+        // conn dies mid-tail.
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(
+            Pin::new(&mut *conn).poll_shutdown(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        pump.service_sockets(); // consumes Shutdown → close() + graceful_close
+        assert_eq!(
+            pump.sockets.get::<tcp::Socket>(handle).state(),
+            tcp::State::FinWait1
+        );
+        drop(conn); // read_rx + write_tx close — the conn is dead
+
+        // Residue: a data segment lands after the conn is gone, and two
+        // events are parked in `pending_read` behind the dead channel.
+        let data = tcp_seg_v4_data(
+            "203.0.113.1".parse().unwrap(),
+            "10.0.0.2".parse().unwrap(),
+            443,
+            local_port,
+            5001,
+            isn.wrapping_add(1),
+            0x18,
+            b"dead-conn residue",
+        );
+        pump.device.rx_queue.push_back(Bytes::from(data));
+        pump.iface
+            .poll(SmolInstant::now(), &mut pump.device, &mut pump.sockets);
+        assert!(
+            pump.sockets.get::<tcp::Socket>(handle).recv_queue() > 0,
+            "rx residue must be present for the drain to matter"
+        );
+        let st = pump.tcp.get_mut(&handle).expect("flow state");
+        st.pending_read
+            .push_back(StreamEvent::Data(Bytes::from_static(b"x")));
+        st.pending_read
+            .push_back(StreamEvent::Data(Bytes::from_static(b"y")));
+
+        pump.service_sockets();
+
+        let socket = pump.sockets.get::<tcp::Socket>(handle);
+        assert_eq!(
+            socket.recv_queue(),
+            0,
+            "the discard must empty the rx buffer so the window un-pins"
+        );
+        assert!(!socket.can_recv());
+        assert!(pump.tcp[&handle].pending_read.is_empty());
+        assert!(
+            pump.tcp.contains_key(&handle),
+            "a graceful close never aborts — the drain emptied rx, not teardown"
         );
     }
 
@@ -2166,9 +2429,29 @@ mod tests {
         ack: u32,
         flags: u8,
     ) -> Vec<u8> {
-        let mut p = vec![0u8; 40];
+        tcp_seg_v4_data(src, dst, sport, dport, seq, ack, flags, &[])
+    }
+
+    /// `tcp_seg_v4` carrying `payload` after the 20-octet TCP header —
+    /// the wire form of bytes the peer's smoltcp delivered to ours.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one parameter per wire field; a struct would only rename the list"
+    )]
+    fn tcp_seg_v4_data(
+        src: std::net::Ipv4Addr,
+        dst: std::net::Ipv4Addr,
+        sport: u16,
+        dport: u16,
+        seq: u32,
+        ack: u32,
+        flags: u8,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let mut p = vec![0u8; 40 + payload.len()];
+        let total_len = p.len() as u16;
         p[0] = 0x45;
-        p[2..4].copy_from_slice(&40u16.to_be_bytes());
+        p[2..4].copy_from_slice(&total_len.to_be_bytes());
         p[8] = 64;
         p[9] = 6;
         p[12..16].copy_from_slice(&src.octets());
@@ -2182,12 +2465,13 @@ mod tests {
         p[32] = 0x50; // data offset 5
         p[33] = flags;
         p[34..36].copy_from_slice(&0xffffu16.to_be_bytes()); // window
-        let mut pseudo = Vec::with_capacity(32);
+        p[40..].copy_from_slice(payload);
+        let mut pseudo = Vec::with_capacity(32 + payload.len());
         pseudo.extend_from_slice(&src.octets());
         pseudo.extend_from_slice(&dst.octets());
         pseudo.push(0);
         pseudo.push(6);
-        pseudo.extend_from_slice(&20u16.to_be_bytes());
+        pseudo.extend_from_slice(&(20u16 + payload.len() as u16).to_be_bytes());
         pseudo.extend_from_slice(&p[20..]);
         let tcp_sum = seg_checksum(&pseudo);
         p[36..38].copy_from_slice(&tcp_sum.to_be_bytes());
@@ -2264,9 +2548,10 @@ mod tests {
     ///
     /// Deterministic boundary without timing tricks: the staged batch
     /// carries one oversized datagram at `BOUNDARY`, so the kernel
-    /// stops the batch exactly there — `sendmmsg` reports the short
-    /// count on Linux, the fallback `try_send` loop stops at its first
-    /// error elsewhere. The `WouldBlock` verdict then comes from
+    /// stops the batch exactly there — `sendmmsg`/`sendmsg_x` report
+    /// the short count on the batch-syscall platforms, the fallback
+    /// `try_send` loop stops at its first error elsewhere. The
+    /// `WouldBlock` verdict then comes from
     /// tokio's *cold* readiness gate: this `current_thread` test
     /// awaits nothing before the first flush, so the driver never
     /// polled the fresh socket and the replay `try_send` short-
@@ -2324,14 +2609,19 @@ mod tests {
 
         pump.flush_outbox();
 
-        // Path proof: on Linux the batch genuinely stopped at the
-        // oversized index inside `sendmmsg`; elsewhere the cold gate
-        // stopped the `try_send` loop at index 0.
+        // Path proof: with the batched syscalls (`sendmmsg`/`sendmsg_x`)
+        // the batch genuinely stopped at the oversized index inside
+        // the kernel; on the fallback the cold gate stopped the
+        // `try_send` loop at index 0.
         let sent = STAGED + OLD.len() - pump.outbox.len();
-        #[cfg(target_os = "linux")]
-        assert_eq!(sent, BOUNDARY, "sendmmsg stops at the EMSGSIZE index");
-        #[cfg(not(target_os = "linux"))]
-        assert_eq!(sent, 0, "cold readiness stops the fallback loop at index 0");
+        if BatchEndpoint::BATCHED_SYSCALLS {
+            assert_eq!(
+                sent, BOUNDARY,
+                "the batched send stops at the EMSGSIZE index"
+            );
+        } else {
+            assert_eq!(sent, 0, "cold readiness stops the fallback loop at index 0");
+        }
 
         // The pre-F1 bug pushed the boundary first, then its
         // successors ahead of it — [s1..s63, b, old]. The contract is
@@ -2444,5 +2734,21 @@ mod tests {
             SCRATCH_POOL_CAP,
             "pool residency is capped — past it the Vec frees"
         );
+    }
+
+    /// P4-2's flow-budget math: the 64 KiB read chunk is what a bulk
+    /// relay drains in ~2 hops, and `TCP_READ_QUEUE` of them still
+    /// covers the 1 MiB smoltcp rx window (2 MiB of per-flow
+    /// backpressure) — pinned so a "harmless" constant bump can't
+    /// quietly break the layering.
+    #[test]
+    fn tcp_read_chunk_covers_rx_window() {
+        assert_eq!(TCP_READ_CHUNK, 65536);
+        const {
+            assert!(
+                TCP_READ_QUEUE * TCP_READ_CHUNK >= TCP_SOCKET_BUF,
+                "read-queue depth must cover the advertised window"
+            );
+        }
     }
 }

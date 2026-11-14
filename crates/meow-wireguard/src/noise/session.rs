@@ -300,6 +300,47 @@ impl Session {
         Ok(ret)
     }
 
+    /// PATCH(17): in-place twin of `receive_packet_data` — `ct_and_tag`
+    /// is the ciphertext‖tag payload region of the wire datagram itself
+    /// (the receive buffer's `buf[DATA_PAYLOAD_OFF..]`), and the
+    /// plaintext replaces the ciphertext where it stood instead of
+    /// being copied into a caller `dst`. The buffer's own length bounds
+    /// the input, so the upstream undersize-`dst` panic has no analogue
+    /// here; the `WrongIndex`/counter-check/open/mark ordering is
+    /// identical. Returns the plaintext length
+    /// (`ct_and_tag.len() - AEAD_SIZE`) on success.
+    pub(super) fn receive_packet_data_in_place(
+        &self,
+        receiver_idx: u32,
+        counter: u64,
+        ct_and_tag: &mut [u8],
+    ) -> Result<usize, WireGuardError> {
+        if receiver_idx != self.receiving_index {
+            return Err(WireGuardError::WrongIndex);
+        }
+        // Don't reuse counters, in case this is a replay attack we want to quickly check the counter without running expensive decryption
+        self.receiving_counter_quick_check(counter)?;
+
+        let pt_len = {
+            let mut nonce = [0u8; 12];
+            nonce[4..12].copy_from_slice(&counter.to_le_bytes());
+            // PATCH(17): open inside the datagram — no ciphertext copy,
+            // no `dst` at all. PATCH(16): the boring build opens through
+            // the cached ctx.
+            #[cfg(feature = "wireguard-boring")]
+            let opened =
+                crate::crypto::session_decrypt_in_place(&self.receiver_ctx, nonce, &[], ct_and_tag);
+            #[cfg(not(feature = "wireguard-boring"))]
+            let opened =
+                crate::crypto::session_decrypt_in_place(&self.receiver_key, nonce, &[], ct_and_tag);
+            opened.map_err(|_| WireGuardError::InvalidAeadTag)?
+        };
+
+        // After decryption is done, check counter again, and mark as received
+        self.receiving_counter_mark(counter)?;
+        Ok(pt_len)
+    }
+
     /// Returns the estimated downstream packet loss for this session
     pub(super) fn current_packet_cnt(&self) -> (u64, u64) {
         let counter_validator = self.receiving_key_counter.lock();

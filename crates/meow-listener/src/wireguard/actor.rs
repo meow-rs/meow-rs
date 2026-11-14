@@ -41,8 +41,8 @@ use bytes::{Buf, Bytes};
 use meow_common::{ConnType, Metadata, Network};
 use meow_tunnel::TunnelInner;
 use meow_wgstack::{
-    enlarge_recv_buffer, enlarge_send_buffer, poll_burst, BatchEndpoint, ChannelDevice,
-    StreamEvent, TcpIo, WgStream, TCP_READ_QUEUE, TCP_SOCKET_BUF, TCP_WRITE_QUEUE,
+    enlarge_recv_buffer, enlarge_send_buffer, poll_burst, reset_scratch, BatchEndpoint,
+    ChannelDevice, StreamEvent, TcpIo, WgStream, TCP_READ_QUEUE, TCP_SOCKET_BUF, TCP_WRITE_QUEUE,
     WG_TIMER_INTERVAL, WIRE_DRAIN_BUDGET,
 };
 use meow_wireguard::{TunnResult, DATA_OVERHEAD_SZ};
@@ -67,10 +67,11 @@ use crate::wireguard::WireGuardListener;
 /// already transitioned is a flow, not a pool member).
 const LISTEN_POOL_CAP: usize = 64;
 
-/// Bytes drained per `socket.recv` call — the pump's 16 KiB chunk: a
-/// full-burst segment drains in one item instead of four, so a hot flow
-/// costs a quarter of the `recv`/`try_send` rounds.
-const TCP_READ_CHUNK: usize = 16384;
+/// Bytes drained per `socket.recv` call — the pump's 64 KiB chunk: a
+/// hot flow costs a quarter of the `recv`/`try_send` rounds 16 KiB
+/// items needed, and a `TCP_READ_QUEUE` of them covers the 1 MiB rx
+/// window without one socket monopolising a service pass.
+const TCP_READ_CHUNK: usize = 65536;
 
 /// Idle `select!` sleep when smoltcp reports no `poll_delay` — the
 /// pump's own fallback (its comment in `sleep_duration` explains why
@@ -85,7 +86,18 @@ const INJECT_QUEUE: usize = 256;
 /// full) the queue drops the *oldest* pending datagram rather than
 /// growing without limit: the same lossy-tail semantics UDP tolerates,
 /// bounded per §10.2's "no unbounded queue" posture.
-const OUTBOX_CAP: usize = 1024;
+///
+/// Sizing must cover one service pass's worst-case production, not just
+/// a send-side backlog: `drain_device_tx` encapsulates every inner
+/// packet smoltcp egressed this pass *before* `flush_outbox` runs, and a
+/// single saturated TCP flow egresses up to its whole advertised window
+/// — `TCP_SOCKET_BUF / ~1400` datagrams (~750 at 1 MiB). `1024` dropped
+/// the tail of every two-flow 768 KiB+ burst onto the inner TCP as a
+/// hole, which smoltcp's ≥1 s RTO floor turned into multi-second stalls
+/// (measured: macOS loopback two-flow collapse to ~0–30 KB/s). 4× the
+/// full-window burst covers a handful of saturated flows per pass while
+/// staying a hard bound (~6 MB of staged datagrams at 1 MiB).
+const OUTBOX_CAP: usize = 4 * TCP_SOCKET_BUF / 1400;
 
 /// Retained crypto-scratch buffers. Demand is a handful of live dsts
 /// between `flush_outbox` passes, so the cap only bounds the memory a
@@ -410,10 +422,10 @@ impl WgActor {
             self.table.reset_rate_limit();
             let mut dst = self.take_scratch();
             let mut recharge = || {
-                let mut b = self.scratch_pool.pop_back().unwrap_or_default();
-                b.clear();
-                b.resize(self.scratch_len, 0);
-                b
+                reset_scratch(
+                    self.scratch_pool.pop_back().unwrap_or_default(),
+                    self.scratch_len,
+                )
             };
             for action in self.table.tick(&mut dst, &mut recharge) {
                 self.apply_action(action);
@@ -469,14 +481,14 @@ impl WgActor {
     }
 
     /// A crypto dst buffer for the next `Tunn` call: a pooled one reset
-    /// to `scratch_len` zeroed bytes, or a fresh allocation when the
-    /// pool is empty. `Tunn` takes `&mut [u8]` and panics on undersize,
-    /// so *length* — not capacity — is the contract.
+    /// to `scratch_len`, or a fresh allocation when the pool is empty.
+    /// [`reset_scratch`] carries the safety contract — *length*, not
+    /// capacity, is what `Tunn` sees.
     fn take_scratch(&mut self) -> Vec<u8> {
-        let mut buf = self.scratch_pool.pop_back().unwrap_or_default();
-        buf.clear();
-        buf.resize(self.scratch_len, 0);
-        buf
+        reset_scratch(
+            self.scratch_pool.pop_back().unwrap_or_default(),
+            self.scratch_len,
+        )
     }
 
     /// Return a spent buffer to the pool. Only full-size buffers are
@@ -542,10 +554,10 @@ impl WgActor {
         // wire datagram consumes it — field-precise captures keep
         // `self.table` (call) and `self` (apply_action) borrowable.
         let mut recharge = || {
-            let mut b = self.scratch_pool.pop_back().unwrap_or_default();
-            b.clear();
-            b.resize(self.scratch_len, 0);
-            b
+            reset_scratch(
+                self.scratch_pool.pop_back().unwrap_or_default(),
+                self.scratch_len,
+            )
         };
         for action in self
             .table
@@ -1187,7 +1199,10 @@ impl WgActor {
                         st.pending_read.push_front(ev);
                         break;
                     }
-                    Err(mpsc::error::TrySendError::Closed(_)) => break,
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        discard_socket_rx(st, socket);
+                        break;
+                    }
                 }
             }
             while socket.can_recv() && st.pending_read.is_empty() {
@@ -1202,7 +1217,10 @@ impl WgActor {
                             st.pending_read.push_back(ev);
                             break;
                         }
-                        Err(mpsc::error::TrySendError::Closed(_)) => break,
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            discard_socket_rx(st, socket);
+                            break;
+                        }
                     },
                     Err(_) => break,
                 }
@@ -1393,7 +1411,8 @@ impl WgActor {
 
     /// Nonblocking sends, a [`WIRE_DRAIN_BUDGET`]-bounded batch at a
     /// time — one `sendmmsg` (a destination per `mmsghdr`, so roaming
-    /// peers keep per-packet addressing) on Linux, a `try_send_to`
+    /// peers keep per-packet addressing) on Linux, one `sendmsg_x`
+    /// (same, per `msghdr_x`) on macOS, a `try_send_to`
     /// loop elsewhere. A batch that stops short leaves the boundary
     /// datagram at the head of `staged`: replaying it surfaces the
     /// errno the mmsg call folded into the short count — `WouldBlock`
@@ -1457,6 +1476,24 @@ impl WgActor {
     /// `tproxy/udp.rs` prunes dead tasks only).
     fn sweep_udp_flows(&mut self) {
         self.udp_flows.retain(|_, flow| !flow.tx.is_closed());
+    }
+}
+
+/// Conn dead → drain the socket's rx to /dev/null instead of leaving
+/// it full. An undrained rx keeps the advertised window pinned at 0:
+/// the peer's smoltcp then holds `remote_win_len == 0`, its tx buffer
+/// never flushes, the queued `TcpIo::Close` sits behind undrainable
+/// `Data`, and both ends zombify (measured: `CloseWait`/`FinWait2`
+/// pairs accumulating one per killed download, each pinning ~2 MiB).
+/// With the buffer emptied the next ACK advertises a live window, the
+/// peer flushes its backlog, its queued abort runs, and both sockets
+/// reach `Closed` — a memmove-free drain since `recv` only consumes.
+fn discard_socket_rx(st: &mut TcpFlow, socket: &mut tcp::Socket<'_>) {
+    st.pending_read.clear();
+    while socket.can_recv() {
+        if socket.recv(|data| (data.len(), ())).is_err() {
+            break;
+        }
     }
 }
 
@@ -1627,9 +1664,29 @@ mod tests {
         ack: u32,
         flags: u8,
     ) -> Vec<u8> {
-        let mut p = vec![0u8; 40];
+        seg_v4_data(src, dst, sport, dport, seq, ack, flags, &[])
+    }
+
+    /// `seg_v4` carrying `payload` after the 20-octet TCP header — the
+    /// wire form of bytes a peer's TCP delivered to the inner socket.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one parameter per wire field; a struct would only rename the list"
+    )]
+    fn seg_v4_data(
+        src: Ipv4Addr,
+        dst: Ipv4Addr,
+        sport: u16,
+        dport: u16,
+        seq: u32,
+        ack: u32,
+        flags: u8,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let mut p = vec![0u8; 40 + payload.len()];
+        let total_len = p.len() as u16;
         p[0] = 0x45;
-        p[2..4].copy_from_slice(&40u16.to_be_bytes());
+        p[2..4].copy_from_slice(&total_len.to_be_bytes());
         p[8] = 64;
         p[9] = 6;
         p[12..16].copy_from_slice(&src.octets());
@@ -1643,12 +1700,13 @@ mod tests {
         p[32] = 0x50; // data offset 5
         p[33] = flags;
         p[34..36].copy_from_slice(&0xffffu16.to_be_bytes()); // window
-        let mut pseudo = Vec::with_capacity(32);
+        p[40..].copy_from_slice(payload);
+        let mut pseudo = Vec::with_capacity(32 + payload.len());
         pseudo.extend_from_slice(&src.octets());
         pseudo.extend_from_slice(&dst.octets());
         pseudo.push(0);
         pseudo.push(6);
-        pseudo.extend_from_slice(&20u16.to_be_bytes());
+        pseudo.extend_from_slice(&(20u16 + payload.len() as u16).to_be_bytes());
         pseudo.extend_from_slice(&p[20..]);
         let tcp_sum = !inner_udp::checksum_fold(&pseudo);
         p[36..38].copy_from_slice(&tcp_sum.to_be_bytes());
@@ -2064,6 +2122,115 @@ mod tests {
             "a queued erase must not take a rebuilt mapping down"
         );
         assert!(actor.tcp.contains_key(&h2));
+    }
+
+    /// `discard_socket_rx` — the dead-conn drain, inbound shape: the
+    /// route task half-closed the flow (FIN flowing → `graceful_close`),
+    /// then died while the peer still had tail bytes in flight — the
+    /// `FinWait` zombie pair the fn's doc names. The pinned observables,
+    /// all through the real `service_tcp` pass: the `Closed` channel arm
+    /// calls the discard, the socket's rx residue empties (the advertised
+    /// window un-pins on the next ACK), and the events parked in
+    /// `pending_read` go with it. The socket itself survives — a
+    /// graceful close never aborts — so the drain, not teardown, is
+    /// what the assertions see.
+    #[tokio::test]
+    async fn discard_socket_rx_drains_residue_on_dead_conn() {
+        let mut actor = test_actor();
+        let client: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let target: Ipv4Addr = "203.0.113.9".parse().unwrap();
+        let key: InnerTuple = (client.into(), 40000, target.into(), 443);
+
+        feed_tcp(&mut actor, 0, &syn_v4(client, target, 40000, 443));
+        poll_once(&mut actor);
+        let handle = actor.tcp_by_tuple[&key];
+        let syn_ack = actor
+            .device
+            .tx_queue
+            .back()
+            .expect("the accept emitted a SYN-ACK");
+        let server_isn = u32::from_be_bytes(syn_ack[24..28].try_into().unwrap());
+
+        // Handshake ACK → Established.
+        let ack = seg_v4(
+            client,
+            target,
+            40000,
+            443,
+            101,
+            server_isn.wrapping_add(1),
+            0x10,
+        );
+        feed_tcp(&mut actor, 0, &ack);
+        poll_once(&mut actor);
+        assert_eq!(
+            actor.sockets.get::<tcp::Socket>(handle).state(),
+            tcp::State::Established
+        );
+
+        // The route task already spawned (`spawned`), sends its FIN —
+        // a real `TcpIo::Shutdown` down the conn channel — then dies:
+        // both ends it was handed close (`read_rx`/`write_tx` are the
+        // stream's own ends pre-spawn, so dropping them is the conn
+        // death, not bookkeeping noise).
+        {
+            let st = actor.tcp.get_mut(&handle).expect("flow state");
+            st.spawned = true;
+            st.write_tx
+                .as_ref()
+                .expect("pre-spawn flow still holds write_tx")
+                .try_send(TcpIo::Shutdown)
+                .expect("channel has room");
+        }
+        actor.service_tcp(); // consumes Shutdown → close() + graceful_close
+        assert_eq!(
+            actor.sockets.get::<tcp::Socket>(handle).state(),
+            tcp::State::FinWait1
+        );
+        {
+            let st = actor.tcp.get_mut(&handle).expect("flow state");
+            drop(st.read_rx.take());
+            drop(st.write_tx.take());
+            // Two events parked behind the dead channel — `clear()`'s
+            // half of the drain.
+            st.pending_read
+                .push_back(StreamEvent::Data(Bytes::from_static(b"x")));
+            st.pending_read
+                .push_back(StreamEvent::Data(Bytes::from_static(b"y")));
+        }
+
+        // Residue: tail data lands after the conn is gone.
+        let data = seg_v4_data(
+            client,
+            target,
+            40000,
+            443,
+            101,
+            server_isn.wrapping_add(1),
+            0x18,
+            b"dead-conn residue",
+        );
+        feed_tcp(&mut actor, 0, &data);
+        poll_once(&mut actor);
+        assert!(
+            actor.sockets.get::<tcp::Socket>(handle).recv_queue() > 0,
+            "rx residue must be present for the drain to matter"
+        );
+
+        actor.service_tcp();
+
+        let socket = actor.sockets.get::<tcp::Socket>(handle);
+        assert_eq!(
+            socket.recv_queue(),
+            0,
+            "the discard must empty the rx buffer so the window un-pins"
+        );
+        assert!(!socket.can_recv());
+        assert!(actor.tcp[&handle].pending_read.is_empty());
+        assert!(
+            actor.tcp.contains_key(&handle),
+            "a graceful close never aborts — the drain emptied rx, not teardown"
+        );
     }
 
     /// F3 — the IPv4 `total_length` field bounds the L4 slice: bytes a
@@ -2485,9 +2652,10 @@ mod tests {
     ///
     /// Deterministic boundary without timing tricks: the staged batch
     /// carries one oversized datagram at `BOUNDARY`, so the kernel
-    /// stops the batch exactly there — `sendmmsg` reports the short
-    /// count on Linux, the fallback `try_send_to` loop stops at its
-    /// first error elsewhere. The `WouldBlock` verdict then comes
+    /// stops the batch exactly there — `sendmmsg`/`sendmsg_x` report
+    /// the short count on the batch-syscall platforms, the fallback
+    /// `try_send_to` loop stops at its first error elsewhere. The
+    /// `WouldBlock` verdict then comes
     /// from tokio's *cold* readiness gate: this `current_thread` test
     /// awaits nothing before the first flush, so the driver never
     /// polled the fresh socket and the replay `try_send_to` short-
@@ -2557,14 +2725,19 @@ mod tests {
 
         actor.flush_outbox();
 
-        // Path proof: on Linux the batch genuinely stopped at the
-        // oversized index inside `sendmmsg`; elsewhere the cold gate
-        // stopped the `try_send_to` loop at index 0.
+        // Path proof: with the batched syscalls (`sendmmsg`/`sendmsg_x`)
+        // the batch genuinely stopped at the oversized index inside
+        // the kernel; on the fallback the cold gate stopped the
+        // `try_send_to` loop at index 0.
         let sent = STAGED + OLD.len() - actor.outbox.len();
-        #[cfg(target_os = "linux")]
-        assert_eq!(sent, BOUNDARY, "sendmmsg stops at the EMSGSIZE index");
-        #[cfg(not(target_os = "linux"))]
-        assert_eq!(sent, 0, "cold readiness stops the fallback loop at index 0");
+        if BatchEndpoint::BATCHED_SYSCALLS {
+            assert_eq!(
+                sent, BOUNDARY,
+                "the batched send stops at the EMSGSIZE index"
+            );
+        } else {
+            assert_eq!(sent, 0, "cold readiness stops the fallback loop at index 0");
+        }
 
         // The pre-F1 bug pushed the boundary first, then its
         // successors ahead of it — [s1..s63, b, old]. The contract is

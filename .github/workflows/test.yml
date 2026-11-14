@@ -883,6 +883,12 @@ jobs:
       - name: meow-listener TUN tests (listener-tun)
         run: cargo nextest run -p meow-listener --features listener-tun --lib --retries 2 --no-fail-fast
 
+      # The `no-macos-sendmsg-x` opt-out compiles the per-datagram
+      # fallback back in; only a Darwin runner exercises that cfg —
+      # on the Linux legs the feature is inert.
+      - name: meow-wgstack clippy (no-macos-sendmsg-x opt-out)
+        run: cargo clippy -p meow-wgstack --features no-macos-sendmsg-x --all-targets -- -D warnings
+
   tproxy:
     runs-on: ubuntu-latest
     needs: lint

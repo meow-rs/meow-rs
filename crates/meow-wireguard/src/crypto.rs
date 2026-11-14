@@ -142,6 +142,21 @@ pub(crate) mod boring_ctx {
                 .map(|_| &mut dst[..ct_len])
                 .map_err(|_| ())
         }
+
+        /// Verify `tag` and decrypt `ct` where it stands — the two are
+        /// disjoint slices (typically the payload‖tag halves of one
+        /// datagram), so unlike `open` there is no ciphertext copy at
+        /// all. PATCH(17): `Session::receive_packet_data_in_place` opens
+        /// the wire datagram inside the caller's receive buffer itself.
+        pub(crate) fn open_detached(
+            &self,
+            nonce: [u8; 12],
+            aad: &[u8],
+            ct: &mut [u8],
+            tag: &[u8],
+        ) -> Result<(), ()> {
+            self.0.open_in_place(&nonce, ct, tag, aad).map_err(|_| ())
+        }
     }
 }
 
@@ -176,6 +191,25 @@ pub(crate) fn session_open_in_place<'a>(
     ciphertext_and_tag: &[u8],
 ) -> Result<&'a mut [u8], ()> {
     aead.open(nonce_bytes, aad, dst, ciphertext_and_tag)
+}
+
+/// Session-layer AEAD open, *fully* in place (PATCH(17)): `buf` holds
+/// `ciphertext‖tag` — the wire datagram's own payload region — and the
+/// plaintext replaces the ciphertext where it stands. No `dst`, no
+/// copy: the receive buffer becomes the plaintext buffer. Returns the
+/// plaintext length (`buf.len() - 16`).
+#[cfg(feature = "wireguard-boring")]
+#[inline]
+pub(crate) fn session_decrypt_in_place(
+    aead: &boring_ctx::SessionAead,
+    nonce_bytes: [u8; 12],
+    aad: &[u8],
+    buf: &mut [u8],
+) -> Result<usize, ()> {
+    let ct_len = buf.len().checked_sub(16).ok_or(())?;
+    let (ct, tag) = buf.split_at_mut(ct_len);
+    aead.open_detached(nonce_bytes, aad, ct, tag)?;
+    Ok(ct_len)
 }
 
 /// Session-layer AEAD seal: data path, in place (no extra plaintext copy).
@@ -233,6 +267,33 @@ pub(crate) fn session_open_in_place<'a>(
         )
         .map_err(|_| ())?;
     Ok(&mut dst[..ct_len - 16])
+}
+
+/// Session-layer AEAD open, *fully* in place (PATCH(17)): `buf` holds
+/// `ciphertext‖tag` — the wire datagram's own payload region — and the
+/// plaintext replaces the ciphertext where it stands. No `dst`, no
+/// copy: the receive buffer becomes the plaintext buffer. Returns the
+/// plaintext length (`buf.len() - 16`).
+#[cfg(not(feature = "wireguard-boring"))]
+#[inline]
+pub(crate) fn session_decrypt_in_place(
+    key: &[u8; 32],
+    nonce_bytes: [u8; 12],
+    aad: &[u8],
+    buf: &mut [u8],
+) -> Result<usize, ()> {
+    let cipher = ChaCha20Poly1305::new_from_slice(key).expect("session open: key length is 32");
+    let ct_len = buf.len().checked_sub(16).ok_or(())?;
+    let (ct, tag) = buf.split_at_mut(ct_len);
+    cipher
+        .decrypt_in_place_detached(
+            Nonce::from_slice(&nonce_bytes),
+            aad,
+            ct,
+            chacha20poly1305::Tag::from_slice(tag),
+        )
+        .map_err(|_| ())?;
+    Ok(ct_len)
 }
 
 /// Constant-time byte-slice equality, replacing what upstream called

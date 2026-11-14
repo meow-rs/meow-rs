@@ -13,6 +13,16 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
+[features]
+# Opt-out escape hatch: `endpoint.rs` uses Darwin's private
+# `sendmsg_x`/`recvmsg_x` SPI for batched UDP I/O on macOS. Enabling
+# this feature (e.g. `cargo test -p meow-wgstack --features
+# no-macos-sendmsg-x`, or `meow-wgstack/no-macos-sendmsg-x` from a
+# direct dependent — meow-proxy/meow-listener, the release bundles do
+# not re-export it) compiles the per-datagram `try_*` loop instead, for
+# environments that audit or shim out private SPI.
+no-macos-sendmsg-x = []
+
 [dependencies]
 # `ProxyConn` is implemented for `WgStream` here — the trait is
 # meow-common's, so the impl cannot live in a downstream crate (orphan
@@ -25,8 +35,10 @@ tracing = { workspace = true }
 socket2 = { workspace = true }
 
 # `force_recv_buffer` (SO_RCVBUFFORCE inside `enlarge_recv_buffer`) and
-# the `sendmmsg`/`recvmmsg` batch calls in `endpoint.rs`.
-[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+# the batched-syscall types/constants in `endpoint.rs`: `sendmmsg`/
+# `recvmmsg` on Linux, the `msghdr_x` wire layout + `sockaddr_in`'s
+# `sin_len` for `sendmsg_x`/`recvmsg_x` on macOS.
+[target.'cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]
