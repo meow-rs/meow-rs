@@ -100,6 +100,17 @@ const HANDSHAKE_DIAL_LIMIT: Duration = Duration::from_secs(10);
 /// so the reply error beats the caller's timeout.
 const TCP_CONNECT_LIMIT: Duration = Duration::from_secs(25);
 
+/// Once a socket's owning conn is gone on both channel halves the flow has
+/// no consumer left. `conn_gone` can never fire while `graceful_close`
+/// holds — the FIN is already out and `TcpIo::Close` is deliberately
+/// suppressed so the peer's tail bytes survive — and a peer that never
+/// closes back pins the socket forever: smoltcp has no FinWait-2 timeout
+/// and `discard_socket_rx` keeps the receive window open, so the peer's
+/// stream keeps arriving to /dev/null. The grace covers the real teardown
+/// (FIN handshake, `out` flush at socket pace); a peer still open past it
+/// was never going to close.
+const TCP_ORPHAN_GRACE: Duration = Duration::from_secs(2);
+
 /// Floor between desync-triggered handshake initiations — WG's own
 /// REKEY_TIMEOUT (the wireguard paper's 5 s initiation-retry floor,
 /// `timers.rs` in meow-wireguard; the constant is crate-private, so it
@@ -187,6 +198,11 @@ struct TcpState {
     /// conn-drop must not downgrade the close to `abort()` and RST the
     /// peer mid-drain.
     graceful_close: bool,
+    /// Armed when both conn channel halves report the flow task gone;
+    /// the [`TCP_ORPHAN_GRACE`] deadline after which the socket is
+    /// aborted regardless of `graceful_close` — the bound that keeps a
+    /// peer that never closes back from pinning the socket forever.
+    dead_since: Option<StdInstant>,
 }
 
 struct UdpState {
@@ -1134,6 +1150,7 @@ impl WgPump {
                 pending_read: VecDeque::new(),
                 eof_sent: false,
                 graceful_close: false,
+                dead_since: None,
             },
         );
     }
@@ -1437,6 +1454,26 @@ impl WgPump {
                 match st.read_tx.try_send(StreamEvent::Closed) {
                     Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => st.eof_sent = true,
                     Err(mpsc::error::TrySendError::Full(_)) => {}
+                }
+            }
+            // Orphan bound: both channel halves closed means the flow
+            // task released the stream entirely — the socket's output
+            // has no consumer and its input is discard-drained. Give a
+            // graceful close the grace to finish, then abort whatever
+            // is still open: without it a FinWait socket under a peer
+            // that keeps streaming lives until session teardown.
+            if st.write_rx.is_closed() && st.read_tx.is_closed() {
+                match st.dead_since {
+                    None => st.dead_since = Some(StdInstant::now()),
+                    Some(t) if t.elapsed() >= TCP_ORPHAN_GRACE => {
+                        debug!(
+                            "wireguard {}: TCP {handle:?} conn dead past grace (state {:?}) → abort",
+                            self.name,
+                            socket.state()
+                        );
+                        socket.abort();
+                    }
+                    _ => {}
                 }
             }
             if !socket.is_open() {
@@ -2782,6 +2819,138 @@ mod tests {
         assert!(
             pump.tcp.contains_key(&handle),
             "a graceful close never aborts — the drain emptied rx, not teardown"
+        );
+    }
+
+    /// The other half of the zombie: the conn died *after* its FIN went
+    /// out (`graceful_close`), and the peer never closes back — it keeps
+    /// streaming into the discard drain. `conn_gone` can never enqueue
+    /// `Close` while `graceful_close` holds, and smoltcp's FinWait has
+    /// no timeout of its own, so without [`TCP_ORPHAN_GRACE`] the socket
+    /// outlives the whole session. The bound pins both sides of it: the
+    /// socket must survive inside the grace (a real close may still
+    /// complete) and must be aborted past it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn orphan_grace_aborts_socket_past_deadline() {
+        let client_secret = x25519::StaticSecret::from([0x79; 32]);
+        let server_public = x25519::PublicKey::from(&x25519::StaticSecret::from([0x80; 32]));
+        let mut pump = pump_for_test(&test_config(&client_secret, &server_public));
+
+        let (reply_tx, mut reply_rx) = oneshot::channel();
+        pump.dial_tcp("203.0.113.1:443".parse().unwrap(), "t".into(), reply_tx);
+        let handle = *pump.tcp.keys().next().unwrap();
+        let port = *pump.used_ports.iter().next().unwrap();
+
+        // SYN → SYN-ACK → Established, then the dial resolves.
+        pump.iface
+            .poll(SmolInstant::now(), &mut pump.device, &mut pump.sockets);
+        let syn = pump.device.tx_queue.back().expect("the dial emitted a SYN");
+        let local_port = u16::from_be_bytes([syn[20], syn[21]]);
+        let isn = u32::from_be_bytes(syn[24..28].try_into().unwrap());
+        let syn_ack = tcp_seg_v4(
+            "203.0.113.1".parse().unwrap(),
+            "10.0.0.2".parse().unwrap(),
+            443,
+            local_port,
+            5000,
+            isn.wrapping_add(1),
+            0x12,
+        );
+        pump.device.rx_queue.push_back(Bytes::from(syn_ack));
+        pump.iface
+            .poll(SmolInstant::now(), &mut pump.device, &mut pump.sockets);
+        assert_eq!(
+            pump.sockets.get::<tcp::Socket>(handle).state(),
+            tcp::State::Established
+        );
+        pump.service_sockets();
+        let mut conn = match reply_rx.try_recv() {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => panic!("dial failed: {e}"),
+            Err(e) => panic!("dial did not resolve in one pass: {e}"),
+        };
+
+        // Graceful half-close (FIN out), then the conn dies entirely —
+        // kill -9's shape when the kernel FIN'd the user socket before
+        // the flow task unwound.
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(
+            Pin::new(&mut *conn).poll_shutdown(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        pump.service_sockets(); // consumes Shutdown → close() + graceful_close
+        assert_eq!(
+            pump.sockets.get::<tcp::Socket>(handle).state(),
+            tcp::State::FinWait1
+        );
+        drop(conn); // read_rx + write_tx close — the conn is dead
+
+        // The first pass only arms the deadline: inside the grace the
+        // socket must survive — a real close may still be completing.
+        pump.service_sockets();
+        assert!(pump.tcp.contains_key(&handle));
+        assert!(pump.tcp[&handle].dead_since.is_some());
+
+        // The peer keeps streaming instead of closing: the discard
+        // drain eats its segment — the zombie window-stays-open case —
+        // and the socket still survives while grace has not elapsed.
+        let data = tcp_seg_v4_data(
+            "203.0.113.1".parse().unwrap(),
+            "10.0.0.2".parse().unwrap(),
+            443,
+            local_port,
+            5001,
+            isn.wrapping_add(1),
+            0x18,
+            b"peer that never closes",
+        );
+        pump.device.rx_queue.push_back(Bytes::from(data));
+        pump.iface
+            .poll(SmolInstant::now(), &mut pump.device, &mut pump.sockets);
+        pump.service_sockets();
+        assert_eq!(pump.sockets.get::<tcp::Socket>(handle).recv_queue(), 0);
+        assert!(
+            pump.tcp.contains_key(&handle),
+            "inside the grace the socket must not be torn down"
+        );
+
+        // Grace expiry → abort: the socket is reaped, the ephemeral
+        // port comes back, and the peer's stream actually stops — the
+        // socket is out of the set, so its next segment draws the
+        // no-socket RST from the iface.
+        pump.tcp.get_mut(&handle).expect("flow state").dead_since =
+            Some(StdInstant::now() - TCP_ORPHAN_GRACE);
+        pump.service_sockets();
+        assert!(
+            !pump.tcp.contains_key(&handle),
+            "the orphaned socket must be reaped once grace expires"
+        );
+        assert!(
+            !pump.used_ports.contains(&port),
+            "ephemeral port {port} leaked"
+        );
+        let late = tcp_seg_v4_data(
+            "203.0.113.1".parse().unwrap(),
+            "10.0.0.2".parse().unwrap(),
+            443,
+            local_port,
+            5010,
+            isn.wrapping_add(1),
+            0x18,
+            b"still streaming",
+        );
+        pump.device.rx_queue.push_back(Bytes::from(late));
+        pump.iface
+            .poll(SmolInstant::now(), &mut pump.device, &mut pump.sockets);
+        let tail = pump
+            .device
+            .tx_queue
+            .back()
+            .expect("a segment for a dead tuple must draw an RST");
+        assert_eq!(
+            tail[33] & 0x04,
+            0x04,
+            "the peer's next segment must be answered with an RST"
         );
     }
 

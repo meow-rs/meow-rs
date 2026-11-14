@@ -78,6 +78,17 @@ const LISTEN_POOL_CAP: usize = 64;
 /// window without one socket monopolising a service pass.
 const TCP_READ_CHUNK: usize = 65536;
 
+/// Once a socket's owning route task is gone on both channel halves the
+/// flow has no consumer left. `conn_gone` can never fire while
+/// `graceful_close` holds — the FIN is already out and `TcpIo::Close`
+/// is deliberately suppressed so the peer's tail bytes survive — and a
+/// peer that never closes back pins the socket forever: smoltcp has no
+/// FinWait-2 timeout and `discard_socket_rx` keeps the receive window
+/// open, so the peer's stream keeps arriving to /dev/null. The grace
+/// covers the real teardown (FIN handshake, `out` flush at socket
+/// pace); a peer still open past it was never going to close.
+const TCP_ORPHAN_GRACE: Duration = Duration::from_secs(2);
+
 /// Idle `select!` sleep when smoltcp reports no `poll_delay` — the
 /// pump's own fallback (its comment in `sleep_duration` explains why
 /// nothing else needs to wake us).
@@ -148,6 +159,11 @@ struct TcpFlow {
     eof_sent: bool,
     graceful_close: bool,
     spawned: bool,
+    /// Armed when both conn channel halves report the route task gone;
+    /// the [`TCP_ORPHAN_GRACE`] deadline after which the socket is
+    /// aborted regardless of `graceful_close` — the bound that keeps a
+    /// peer that never closes back from pinning the socket forever.
+    dead_since: Option<Instant>,
 }
 
 /// Parsed inner-packet view used by the demux→stack bridge.
@@ -1357,6 +1373,7 @@ impl WgActor {
                 eof_sent: false,
                 graceful_close: false,
                 spawned: false,
+                dead_since: None,
             },
         );
     }
@@ -1501,6 +1518,26 @@ impl WgActor {
                 match st.read_tx.try_send(StreamEvent::Closed) {
                     Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => st.eof_sent = true,
                     Err(mpsc::error::TrySendError::Full(_)) => {}
+                }
+            }
+            // Orphan bound: both channel halves closed means the route
+            // task released the stream entirely — the socket's output
+            // has no consumer and its input is discard-drained. Give a
+            // graceful close the grace to finish, then abort whatever
+            // is still open: without it a FinWait socket under a peer
+            // that keeps streaming lives until session teardown.
+            if st.write_rx.is_closed() && st.read_tx.is_closed() {
+                match st.dead_since {
+                    None => st.dead_since = Some(Instant::now()),
+                    Some(t) if t.elapsed() >= TCP_ORPHAN_GRACE => {
+                        debug!(
+                            "wireguard {}: TCP {handle:?} conn dead past grace (state {:?}) → abort",
+                            self.name,
+                            socket.state()
+                        );
+                        socket.abort();
+                    }
+                    _ => {}
                 }
             }
             if !socket.is_open() {
@@ -2634,6 +2671,110 @@ mod tests {
         assert!(
             actor.tcp.contains_key(&handle),
             "a graceful close never aborts — the drain emptied rx, not teardown"
+        );
+    }
+
+    /// The other half of the zombie: the route task died *after* its
+    /// FIN went out (`graceful_close`), and the peer never closes back
+    /// — it keeps streaming into the discard drain. `conn_gone` can
+    /// never enqueue `Close` while `graceful_close` holds, and
+    /// smoltcp's FinWait has no timeout of its own, so without
+    /// [`TCP_ORPHAN_GRACE`] the socket outlives the whole session. The
+    /// bound pins both sides of it: the socket must survive inside the
+    /// grace (a real close may still complete) and must be aborted
+    /// past it.
+    #[tokio::test]
+    async fn orphan_grace_aborts_socket_past_deadline() {
+        let mut actor = test_actor();
+        let client: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let target: Ipv4Addr = "203.0.113.9".parse().unwrap();
+        let key: InnerTuple = (client.into(), 40000, target.into(), 443);
+
+        feed_tcp(&mut actor, 0, &syn_v4(client, target, 40000, 443));
+        poll_once(&mut actor);
+        let handle = actor.tcp_by_tuple[&key];
+        let syn_ack = actor
+            .device
+            .tx_queue
+            .back()
+            .expect("the accept emitted a SYN-ACK");
+        let server_isn = u32::from_be_bytes(syn_ack[24..28].try_into().unwrap());
+
+        // Handshake ACK → Established.
+        let ack = seg_v4(
+            client,
+            target,
+            40000,
+            443,
+            101,
+            server_isn.wrapping_add(1),
+            0x10,
+        );
+        feed_tcp(&mut actor, 0, &ack);
+        poll_once(&mut actor);
+        assert_eq!(
+            actor.sockets.get::<tcp::Socket>(handle).state(),
+            tcp::State::Established
+        );
+
+        // Graceful half-close (FIN out), then the route task dies —
+        // both ends it was handed close.
+        {
+            let st = actor.tcp.get_mut(&handle).expect("flow state");
+            st.spawned = true;
+            st.write_tx
+                .as_ref()
+                .expect("pre-spawn flow still holds write_tx")
+                .try_send(TcpIo::Shutdown)
+                .expect("channel has room");
+        }
+        actor.service_tcp(); // consumes Shutdown → close() + graceful_close
+        assert_eq!(
+            actor.sockets.get::<tcp::Socket>(handle).state(),
+            tcp::State::FinWait1
+        );
+        {
+            let st = actor.tcp.get_mut(&handle).expect("flow state");
+            drop(st.read_rx.take());
+            drop(st.write_tx.take());
+        }
+
+        // The first pass only arms the deadline: inside the grace the
+        // socket must survive — a real close may still be completing.
+        actor.service_tcp();
+        assert!(actor.tcp.contains_key(&handle));
+        assert!(actor.tcp[&handle].dead_since.is_some());
+
+        // The peer keeps streaming instead of closing: the discard
+        // drain eats its segment — the zombie window-stays-open case —
+        // and the socket still survives while grace has not elapsed.
+        let data = seg_v4_data(
+            client,
+            target,
+            40000,
+            443,
+            101,
+            server_isn.wrapping_add(1),
+            0x18,
+            b"peer that never closes",
+        );
+        feed_tcp(&mut actor, 0, &data);
+        poll_once(&mut actor);
+        actor.service_tcp();
+        assert_eq!(actor.sockets.get::<tcp::Socket>(handle).recv_queue(), 0);
+        assert!(
+            actor.tcp.contains_key(&handle),
+            "inside the grace the socket must not be torn down"
+        );
+
+        // Grace expiry → abort: the flow is reaped and the abort's RST
+        // goes out on the next dispatch so the peer's stream stops.
+        actor.tcp.get_mut(&handle).expect("flow state").dead_since =
+            Some(Instant::now() - TCP_ORPHAN_GRACE);
+        actor.service_tcp();
+        assert!(
+            !actor.tcp.contains_key(&handle),
+            "the orphaned socket must be reaped once grace expires"
         );
     }
 
