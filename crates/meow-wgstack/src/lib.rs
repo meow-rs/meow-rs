@@ -949,7 +949,12 @@ mod tests {
 
     /// P7-3a: 200 queued rx packets — deeper than the old 64-poll cap and
     /// three `WIRE_DRAIN_BUDGET` wire batches — drain inside ONE
-    /// `poll_burst` call instead of waiting for the next wake.
+    /// `poll_burst` call instead of waiting for the next wake. Under
+    /// smoltcp 0.13 that means the *first* `Interface::poll` drains the
+    /// whole queue internally (upstream #1059): asserting the poll count
+    /// — one working poll plus the quiet poll the burst exits on — is
+    /// what pins "within one pass"; an emptied-queue-only assert would
+    /// also pass under the old one-packet-per-poll world.
     #[test]
     fn poll_burst_drains_deep_rx_queue() {
         const DEPTH: usize = 200;
@@ -960,10 +965,21 @@ mod tests {
                 .push_back(udp_datagram_v4(40, (i % 251) as u8));
         }
         assert_eq!(device.rx_queue.len(), DEPTH);
-        poll_burst(&mut iface, SmolInstant::now(), &mut device, &mut sockets);
+        let polls = poll_burst_budgeted(
+            &mut iface,
+            SmolInstant::now(),
+            &mut device,
+            &mut sockets,
+            usize::MAX,
+        );
         assert!(
             device.rx_queue.is_empty(),
             "a burst must drain the whole injected depth"
+        );
+        assert_eq!(
+            polls, 2,
+            "the first poll drains every queued packet internally; \
+             the second is the quiet exit"
         );
     }
 
