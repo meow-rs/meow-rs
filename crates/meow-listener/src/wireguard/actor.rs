@@ -14,8 +14,10 @@
 //!    pump's `service_sockets` shape, minus dial-pending, plus the
 //!    Established→route-task handoff).
 //! 3. `iface.poll` — smoltcp consumes the rx queue (SYNs accept,
-//!    segments deliver, emits go to `device.tx_queue`), burst-looped
-//!    via [`poll_burst`] since one poll egresses ≤1 segment/socket.
+//!    segments deliver, emits go to `device.tx_queue`), looped via
+//!    [`poll_burst`] as the bounded-budget backstop (smoltcp 0.13
+//!    drains socket egress inside one poll already; the burst bounds
+//!    a permanently-progressing pass).
 //! 4. `post_poll` — sweep listen-pool entries whose socket left
 //!    `State::Listen` (errata E5: only `Listen` sockets are pool
 //!    occupants) and register fresh flow sockets, resolving each
@@ -295,8 +297,9 @@ impl WgActor {
 
         let endpoint = tokio::net::UdpSocket::from_std(std_sock)?;
         enlarge_recv_buffer(&endpoint);
-        // Symmetric: a `poll_burst` egress hands the kernel a ~64-
-        // datagram batch in one shot — the platform default `SO_SNDBUF`
+        // Symmetric: a `poll_burst` pass can stage MiBs of wire-bound
+        // datagrams, flushed to the kernel as `WIRE_DRAIN_BUDGET`-sized
+        // batches back to back — the platform default `SO_SNDBUF`
         // (9 KiB on macOS) drops the tail of every burst on ENOBUFS.
         enlarge_send_buffer(&endpoint);
         let bound_port = endpoint.local_addr()?.port();
@@ -462,9 +465,10 @@ impl WgActor {
     /// The smoltcp half of a service pass: burst-poll the interface,
     /// then `post_poll`'s registration/cleanup when the pass could
     /// have moved anything it tracks. Its own method so `service`'s
-    /// poll step and the T1 burst pin drive the exact same code — a
-    /// regression to one `iface.poll` per pass must fail that test,
-    /// not just prod.
+    /// poll step and the T1 burst pin drive the exact same code —
+    /// under smoltcp 0.13 one `poll` drains egress internally, so the
+    /// burst loop is the bounded-budget backstop rather than the
+    /// throughput path; the pin still wants the production entry.
     fn poll_stack(&mut self) {
         let now = SmolInstant::now();
         // `post_poll`'s bookkeeping only has work when the poll could
@@ -2656,14 +2660,17 @@ mod tests {
     }
 
     /// mac-perf regression (T1) — one service pass must emit more than a
-    /// single TCP segment per flow: smoltcp's `Interface::poll` egresses
-    /// at most one segment per socket per call, so the old single-poll
-    /// pass capped a bulk flow at ~1 segment per inner-RTT wake (~285
-    /// KB/s measured on a real peer). The pass now polls to
-    /// `PollResult::None` under `POLL_BURST`, so a queued multi-segment
-    /// write lands in `tx_queue` as one burst. The count is asserted
-    /// mid-service — `drain_device_tx` always empties `tx_queue`, so
-    /// between the poll and the drain is the only place it is visible.
+    /// single TCP segment per flow. Before smoltcp 0.13, `Interface::
+    /// poll` egressed at most one segment per socket per call, so the
+    /// old single-poll pass capped a bulk flow at ~1 segment per
+    /// inner-RTT wake (~285 KB/s measured on a real peer); 0.13's poll
+    /// drains socket egress internally, which makes this the smoke pin
+    /// that a queued multi-segment write lands in `tx_queue` as one
+    /// burst inside a pass. The count is asserted mid-service —
+    /// `drain_device_tx` always empties `tx_queue`, so between the
+    /// poll and the drain is the only place it is visible. The
+    /// poll-count budget itself is pinned in `meow-wgstack`'s
+    /// `poll_burst_budgeted` tests.
     #[tokio::test]
     async fn service_pass_egresses_a_segment_burst() {
         let mut actor = test_actor();

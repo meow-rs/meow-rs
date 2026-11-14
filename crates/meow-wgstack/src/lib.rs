@@ -78,6 +78,23 @@ pub const POLL_BURST: usize = 256;
 /// monopolize a service pass. 256 polls × ~1500 B/segment ≈ 384 KB of
 /// uncapped headroom; 2 MiB leaves comfortable room for several saturated
 /// flows while still bounding the pass.
+///
+/// The bound is *soft/advisory*, not hard: it is only consulted between
+/// `Interface::poll` calls, and smoltcp 0.13's `poll` drains socket
+/// egress internally — one call may exceed the budget before the check
+/// runs (worst case `budget + one poll's internal drain`).
+/// Hard-enforcing at the device — a per-pass counter on
+/// [`ChannelDevice`] with `transmit()` returning `None` past it
+/// (smoltcp 0.13 maps that to `EgressError::Exhausted`, cleanly
+/// breaking the egress loop) — was rejected: `socket_egress` walks the
+/// `SocketSet` in insertion order, so a mid-poll refusal would always
+/// land at the same point and let the earliest sockets eat the whole
+/// budget every pass while tail sockets starve. The soft bound lets an
+/// in-flight poll finish draining and only skips *additional* polls.
+///
+/// Under normal WG flow the budget rarely trips at all — `PollResult::
+/// None` exits the burst first (the quiet poll after the stack drains).
+/// The budget is the degenerate-load bound, not the everyday exit.
 const POLL_TX_BYTES_BUDGET: usize = 2 * 1024 * 1024;
 
 /// boringtun's own device loop ticks its timers at 250 ms (rekey timeout is
@@ -664,16 +681,17 @@ pub fn enlarge_recv_buffer(socket: &tokio::net::UdpSocket) {
     tracing::debug!(size = ?sock.recv_buffer_size(), "wireguard endpoint receive buffer");
 }
 
-/// The send side needs the same headroom as the receive side: a
-/// [`poll_burst`] egress burst is handed to the kernel in one
-/// [`WIRE_DRAIN_BUDGET`] batch (~`POLL_BURST` × ~1.5 KB ≈ 90 KB), and the
-/// default send buffer is far smaller than that on some platforms —
-/// macOS grants only `9216` bytes of `SO_SNDBUF` out of the box, so a
-/// burst beyond ~6 datagrams dies on `ENOBUFS` *inside* `send_batch_to`
-/// (a short count, not a `WouldBlock`) and the inner TCP sees the
-/// dropped tail as a hole to retransmit. 4×[`TCP_SOCKET_BUF`] absorbs a
-/// full-window burst from several saturated flows; the kernel commits
-/// pages only on use.
+/// The send side needs the same headroom as the receive side: one
+/// [`poll_burst`] pass can stage up to `POLL_TX_BYTES_BUDGET` (~2 MiB,
+/// ≈1 400 datagrams at ~1.5 KB) of wire-bound inner segments before its
+/// soft budget trips, handed to the kernel as [`WIRE_DRAIN_BUDGET`]-sized
+/// `send_batch` batches back to back — and the default send buffer is
+/// far smaller than one batch on some platforms: macOS grants only
+/// `9216` bytes of `SO_SNDBUF` out of the box, so a burst beyond ~6
+/// datagrams dies on `ENOBUFS` *inside* `send_batch_to` (a short count,
+/// not a `WouldBlock`) and the inner TCP sees the dropped tail as a
+/// hole to retransmit. 4×[`TCP_SOCKET_BUF`] absorbs a full-window burst
+/// from several saturated flows; the kernel commits pages only on use.
 pub fn enlarge_send_buffer(socket: &tokio::net::UdpSocket) {
     let sock = socket2::SockRef::from(socket);
     let mut size = ENDPOINT_RECV_BUFFER;

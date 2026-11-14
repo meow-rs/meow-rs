@@ -1563,9 +1563,11 @@ impl WgPump {
     }
 
     /// The interface-poll step of a service pass — its own method so
-    /// `run`'s poll and the T1 burst pin drive the exact same code: a
-    /// regression to one `iface.poll` per pass must fail that test,
-    /// not just prod.
+    /// `run`'s poll and the T1 burst pin drive the exact same code.
+    /// Under smoltcp 0.13 one `poll` drains socket egress internally,
+    /// so `poll_burst`'s extra iterations are the bounded-budget
+    /// backstop rather than the throughput path — the pin still wants
+    /// the production entry point, not a helper re-spelled.
     fn poll_stack(&mut self, now: SmolInstant) {
         // Burst, not a single poll. Before smoltcp 0.13 a socket
         // egressed at most one TCP segment per `poll`, so one call per
@@ -3061,11 +3063,14 @@ mod tests {
         p
     }
 
-    /// mac-perf T1, client side — the same single-poll ceiling as the
-    /// listener: one `Interface::poll` egresses at most one segment per
-    /// socket, so a queued bulk write must land in `tx_queue` as a
-    /// burst, not one segment per pass. The count is asserted between
-    /// the poll and `drain_device_tx` (which always empties the queue).
+    /// mac-perf T1, client side — the smoke half of the listener's
+    /// burst pin: a queued bulk write must land in `tx_queue` as a
+    /// multi-segment burst inside one service pass, not one segment
+    /// per pass. Under smoltcp 0.13 the drain happens inside a single
+    /// `poll`, so the pin is the post-pass segment count — asserted
+    /// between the poll and `drain_device_tx` (which always empties
+    /// the queue); the poll-count budget itself is pinned in
+    /// `meow-wgstack`'s `poll_burst_budgeted` tests.
     #[tokio::test(flavor = "current_thread")]
     async fn poll_burst_egresses_queued_segments() {
         let client_secret = x25519::StaticSecret::from([0x71; 32]);

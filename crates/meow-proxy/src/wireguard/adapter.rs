@@ -246,8 +246,9 @@ impl WireGuardAdapter {
         let peer = meow_common::canonical_socket_addr(addr);
         let socket = meow_common::bind_udp_for_peer(peer.ip()).await?;
         meow_wgstack::enlarge_recv_buffer(&socket);
-        // Symmetric: a `poll_burst` egress hands the kernel a ~64-
-        // datagram batch in one shot — the platform default `SO_SNDBUF`
+        // Symmetric: a `poll_burst` pass can stage MiBs of wire-bound
+        // datagrams, flushed to the kernel as `WIRE_DRAIN_BUDGET`-sized
+        // batches back to back — the platform default `SO_SNDBUF`
         // (9 KiB on macOS) drops the tail of every burst on ENOBUFS.
         meow_wgstack::enlarge_send_buffer(&socket);
         let std_sock = socket.into_std()?;
