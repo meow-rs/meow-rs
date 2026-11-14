@@ -38,6 +38,12 @@ struct PumpHandle {
 
 impl Drop for PumpHandle {
     fn drop(&mut self) {
+        // Sender close is the guaranteed terminator — the pump exits
+        // on `Disconnected`/`is_closed` even when this `try_send` drops
+        // `Shutdown` against a full mailbox; the send is only the fast
+        // path. Queued items that outlive this sender are refused by
+        // the pump's `is_closed` guard rather than serviced into
+        // dead-on-arrival conns.
         let _ = self.tx.try_send(ActorMsg::Shutdown);
         drop(self.task.take());
     }

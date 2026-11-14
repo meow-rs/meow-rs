@@ -1601,6 +1601,16 @@ impl WgPump {
                     Ok(ActorMsg::Shutdown) | Err(mpsc::error::TryRecvError::Disconnected) => {
                         break 'outer
                     }
+                    // The sole `ActorMsg` sender lives in `PumpHandle`,
+                    // so `is_closed` fires the moment the handle drops —
+                    // while queued items still drain ahead of the
+                    // `Disconnected` verdict. A dial drained now would
+                    // build a conn on a pump that exits this pass (dead
+                    // on arrival); dropping the item instead lets its
+                    // reply channel report the failure. This is the
+                    // full-mailbox hole `PumpHandle::drop`'s best-effort
+                    // `try_send(Shutdown)` leaves.
+                    Ok(_) if self.rx.is_closed() => break 'outer,
                     Ok(msg) => self.handle_msg(msg),
                     Err(mpsc::error::TryRecvError::Empty) => break,
                 }
@@ -1634,10 +1644,15 @@ impl WgPump {
                 biased;
                 msg = self.rx.recv() => match msg {
                     None | Some(ActorMsg::Shutdown) => break 'outer,
+                    // The dead-on-arrival guard above, on the parked
+                    // path: queued items that outlive the last sender
+                    // are refused, not serviced.
+                    Some(_) if self.rx.is_closed() => break 'outer,
                     Some(m) => self.handle_msg(m),
                 },
                 r = self.endpoint.recv(&mut self.recv_buf) => match r {
                     Ok(n) => {
+                        self.last_service_bytes += n;
                         // `decapsulate_wire` consumes the datagram
                         // buffer: a DATA packet decrypts in place and
                         // the buffer leaves with its plaintext `Bytes`,
