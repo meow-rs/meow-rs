@@ -14,12 +14,12 @@ default = ["encrypted", "dns-server"]
 # DNS shares the process-wide backend (BoringSSL when the app is built with
 # `boring-tls` — the default — rustls otherwise) instead of carrying its own
 # rustls client config.
-encrypted = ["dep:meow-transport", "dep:tokio-boring"]
+encrypted = ["dep:meow-transport", "dep:tokio-boring", "dep:h2", "dep:http", "dep:bytes"]
 # DNS over QUIC (RFC 9250) and DNS over HTTPS over HTTP/3 (`prefer-h3`).
 # quiche links the same vendored BoringSSL as `meow-transport` (the
 # `boringssl-boring-crate` backend the workspace already pins), so this
 # feature adds no second crypto library. It implies `encrypted`: the DoH3
-# fallback rides the HTTP/1.1 DoH path and both share one certificate
+# fallback rides the HTTP/2 / HTTP/1.1 DoH path and both share one certificate
 # decision.
 quic-dns = ["encrypted", "dep:quiche", "dep:boring", "dep:webpki-root-certs"]
 # `dns-server` historically gated hickory-server; the in-tree server now uses
@@ -36,6 +36,12 @@ meow-transport = { workspace = true, features = ["tls"], optional = true }
 # public signature — naming the type (DoT/DoH over `ProxyConn`) needs the
 # crate itself, not just the transport wrapper.
 tokio-boring = { workspace = true, optional = true }
+# HTTP/2 DoH (RFC 8484 §5.2): the client offers `h2` next to `http/1.1` and
+# speaks whichever the server picks. Same `h2` 0.4 `meow-transport` already
+# links for its HTTP/2 transports.
+h2 = { version = "0.4", optional = true }
+http = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
 # QUIC transport for `quic://` and `prefer-h3` (feature `quic-dns`).
 quiche = { workspace = true, optional = true }
 # BoringSSL `SslContextBuilder` for the quiche TLS config (one shared verify
@@ -74,6 +80,10 @@ hickory-proto = { workspace = true }
 boring = { workspace = true }
 tokio-boring = { workspace = true }
 rcgen = "0.13"
+# HTTP/2 DoH stub (`proxy_routed_dns`).
+h2 = { version = "0.4" }
+http = { workspace = true }
+bytes = { workspace = true }
 
 [lints]
 workspace = true

@@ -1343,3 +1343,218 @@ async fn tls_pool_disabled_pays_full_price() {
         "a pool-disabled client must dial once per query"
     );
 }
+
+/// A DoH stub shaped like Yandex DNS (77.88.8.8): it accepts either ALPN
+/// and prefers `h2`, but closes every HTTP/1.1 request unanswered. The
+/// counters split accepted conns by negotiated protocol and count h2
+/// streams; `streams_per_conn` closes a conn after that many answers.
+#[cfg(all(feature = "encrypted", debug_assertions))]
+struct H2DohStub {
+    addr: SocketAddr,
+    root: Vec<u8>,
+    http1_conns: Arc<AtomicUsize>,
+    h2_conns: Arc<AtomicUsize>,
+    h2_streams: Arc<AtomicUsize>,
+}
+
+#[cfg(all(feature = "encrypted", debug_assertions))]
+async fn start_h2_doh_stub(streams_per_conn: Option<usize>) -> H2DohStub {
+    let ck = rcgen::generate_simple_self_signed(vec!["doh-stub.test".to_string()]).unwrap();
+    let cert = boring::x509::X509::from_der(ck.cert.der()).unwrap();
+    let key = boring::pkey::PKey::private_key_from_der(&ck.key_pair.serialize_der()).unwrap();
+    let mut builder =
+        boring::ssl::SslAcceptor::mozilla_intermediate_v5(boring::ssl::SslMethod::tls()).unwrap();
+    builder.set_certificate(&cert).unwrap();
+    builder.set_private_key(&key).unwrap();
+    builder.set_alpn_select_callback(|_, client| {
+        boring::ssl::select_next_proto(b"\x02h2\x08http/1.1", client)
+            .ok_or(boring::ssl::AlpnError::NOACK)
+    });
+    let acceptor = builder.build();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let http1_conns = Arc::new(AtomicUsize::new(0));
+    let h2_conns = Arc::new(AtomicUsize::new(0));
+    let h2_streams = Arc::new(AtomicUsize::new(0));
+    let counters = (
+        Arc::clone(&http1_conns),
+        Arc::clone(&h2_conns),
+        Arc::clone(&h2_streams),
+    );
+    tokio::spawn(async move {
+        while let Ok((tcp, _)) = listener.accept().await {
+            let acceptor = acceptor.clone();
+            let (h1, h2c, streams) = (
+                Arc::clone(&counters.0),
+                Arc::clone(&counters.1),
+                Arc::clone(&counters.2),
+            );
+            tokio::spawn(async move {
+                let Ok(mut stream) = tokio_boring::accept(&acceptor, tcp).await else {
+                    return;
+                };
+                if stream.ssl().selected_alpn_protocol() != Some(b"h2") {
+                    h1.fetch_add(1, Ordering::SeqCst);
+                    // Read the request, then close without a response.
+                    let mut buf = [0u8; 1024];
+                    let _ = stream.read(&mut buf).await;
+                    let _ = stream.shutdown().await;
+                    return;
+                }
+                h2c.fetch_add(1, Ordering::SeqCst);
+                let Ok(mut conn) = h2::server::handshake(stream).await else {
+                    return;
+                };
+                let mut answered = 0usize;
+                while let Some(Ok((request, mut respond))) = conn.accept().await {
+                    assert_eq!(request.method(), http::Method::POST);
+                    assert_eq!(request.uri().path(), "/dns-query");
+                    streams.fetch_add(1, Ordering::SeqCst);
+                    // Each stream answers on its own task, so concurrent
+                    // queries really share the conn.
+                    tokio::spawn(async move {
+                        let mut body = request.into_body();
+                        let mut wire = Vec::new();
+                        while let Some(Ok(chunk)) = body.data().await {
+                            let _ = body.flow_control().release_capacity(chunk.len());
+                            wire.extend_from_slice(&chunk);
+                        }
+                        let Ok(req_msg) = Message::from_bytes(&wire) else {
+                            return;
+                        };
+                        let answer = answer_for(&req_msg).to_bytes().unwrap();
+                        let response = http::Response::builder()
+                            .status(200)
+                            .header("content-type", "application/dns-message")
+                            .body(())
+                            .unwrap();
+                        let Ok(mut send) = respond.send_response(response, false) else {
+                            return;
+                        };
+                        let _ = send.send_data(bytes::Bytes::from(answer), true);
+                    });
+                    answered += 1;
+                    if streams_per_conn.is_some_and(|limit| answered >= limit) {
+                        conn.graceful_shutdown();
+                    }
+                }
+            });
+        }
+    });
+    H2DohStub {
+        addr,
+        root: ck.cert.der().to_vec(),
+        http1_conns,
+        h2_conns,
+        h2_streams,
+    }
+}
+
+#[cfg(all(feature = "encrypted", debug_assertions))]
+async fn query_ok(client: &DnsClient, name: &str) {
+    let msg = timeout(T, client.query(name, RecordType::A))
+        .await
+        .expect("must not stall")
+        .expect("DoH query must succeed over h2");
+    assert_example_answer(&msg);
+}
+
+/// A server that answers only over h2 (Yandex DNS closes HTTP/1.1
+/// requests) is reached by offering `h2` in ALPN, and every query after
+/// the first, sequential or concurrent, is a stream on the same conn.
+#[cfg(all(feature = "encrypted", debug_assertions))]
+#[tokio::test]
+async fn doh_negotiates_h2_and_shares_one_connection() {
+    let stub = start_h2_doh_stub(None).await;
+    let client = Arc::new(
+        DnsClient::doh(stub.addr, "doh-stub.test", "/dns-query")
+            .with_tls_additional_roots(stub.root.clone()),
+    );
+
+    for name in ["a.example.com", "b.example.com", "c.example.com"] {
+        query_ok(&client, name).await;
+    }
+    let burst = futures::future::join_all((0..8).map(|index| {
+        let client = Arc::clone(&client);
+        async move { query_ok(&client, &format!("n{index}.example.com")).await }
+    }));
+    timeout(T, burst).await.expect("burst must not stall");
+
+    assert_eq!(stub.http1_conns.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        stub.h2_conns.load(Ordering::SeqCst),
+        1,
+        "every query after the first rides the shared h2 conn"
+    );
+    assert_eq!(stub.h2_streams.load(Ordering::SeqCst), 11);
+}
+
+/// The same over a `?proxy=` dial: one proxied dial serves every query.
+#[cfg(all(feature = "encrypted", debug_assertions))]
+#[tokio::test]
+async fn doh_h2_via_proxy_dials_once() {
+    let stub = start_h2_doh_stub(None).await;
+    let dialed = Arc::new(Mutex::new(Vec::<DialRecord>::new()));
+    let proxy = mock_proxy(&dialed, stub.addr);
+    let client = DnsClient::doh(stub.addr, "doh-stub.test", "/dns-query")
+        .with_proxy(proxy)
+        .with_tls_additional_roots(stub.root.clone());
+
+    for name in ["a.example.com", "b.example.com", "c.example.com"] {
+        query_ok(&client, name).await;
+    }
+    assert_eq!(stub.http1_conns.load(Ordering::SeqCst), 0);
+    assert_eq!(stub.h2_conns.load(Ordering::SeqCst), 1);
+    assert_eq!(dialed.lock().len(), 1, "the shared h2 conn is dialed once");
+}
+
+/// A server that ends the h2 conn after each answer (GOAWAY) costs a
+/// redial, never a failed query.
+#[cfg(all(feature = "encrypted", debug_assertions))]
+#[tokio::test]
+async fn doh_h2_redials_after_server_goaway() {
+    let stub = start_h2_doh_stub(Some(1)).await;
+    let client = DnsClient::doh(stub.addr, "doh-stub.test", "/dns-query")
+        .with_tls_additional_roots(stub.root.clone());
+
+    for index in 0..4 {
+        query_ok(&client, &format!("n{index}.example.com")).await;
+        // Let the GOAWAY reach the client between queries part of the
+        // time; the reuse path's retry covers the rest.
+        if index % 2 == 0 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+    assert_eq!(stub.h2_streams.load(Ordering::SeqCst), 4);
+    assert_eq!(stub.h2_conns.load(Ordering::SeqCst), 4);
+}
+
+/// `reset_connections` retires the shared h2 conn: the next query dials.
+#[cfg(all(feature = "encrypted", debug_assertions))]
+#[tokio::test]
+async fn doh_h2_reset_connections_redials() {
+    let stub = start_h2_doh_stub(None).await;
+    let client = DnsClient::doh(stub.addr, "doh-stub.test", "/dns-query")
+        .with_tls_additional_roots(stub.root.clone());
+
+    query_ok(&client, "a.example.com").await;
+    assert_eq!(client.reset_connections(), 1, "the shared h2 conn closes");
+    query_ok(&client, "b.example.com").await;
+    assert_eq!(stub.h2_conns.load(Ordering::SeqCst), 2);
+}
+
+/// Mutation control for the sharing assertions: with the pool disabled
+/// every h2 query dials its own conn.
+#[cfg(all(feature = "encrypted", debug_assertions))]
+#[tokio::test]
+async fn doh_h2_pool_disabled_dials_per_query() {
+    let stub = start_h2_doh_stub(None).await;
+    let client = DnsClient::doh(stub.addr, "doh-stub.test", "/dns-query")
+        .with_tls_additional_roots(stub.root.clone())
+        .with_tls_pool_disabled();
+
+    for name in ["a.example.com", "b.example.com", "c.example.com"] {
+        query_ok(&client, name).await;
+    }
+    assert_eq!(stub.h2_conns.load(Ordering::SeqCst), 3);
+}

@@ -116,7 +116,7 @@ Each `nameserver` / `fallback` entry is a server URL:
 | `8.8.8.8` or `udp://8.8.8.8:53` | DNS over UDP | 53 |
 | `tcp://8.8.8.8:53` | DNS over TCP | 53 |
 | `tls://1.1.1.1:853#cloudflare-dns.com` | DoT (SNI after `#`) | 853 |
-| `https://1.1.1.1/dns-query#cloudflare-dns.com` | DoH (HTTP/1.1) | 443 |
+| `https://1.1.1.1/dns-query#cloudflare-dns.com` | DoH (HTTP/2 or HTTP/1.1, as the server picks) | 443 |
 | `https://dns.google/dns-query?h3=true` | DoH over HTTP/3 only | 443 |
 | `quic://dns.adguard.com#dns.adguard.com` | DoQ (RFC 9250) | 853 |
 | `rcode://REFUSED` | Synthetic error (testing) | — |
@@ -149,7 +149,7 @@ dns:
 - **DoH3** is RFC 8484 over HTTP/3: one `POST` per query, `application/dns-message` both
   ways, `:status 200` required.
 - **`prefer-h3` vs `?h3=true`.** The global flag means *prefer*: HTTP/3 is tried first
-  and the query falls back to HTTP/1.1 DoH when the QUIC exchange fails, with the failed
+  and the query falls back to HTTP/2 / HTTP/1.1 DoH when the QUIC exchange fails, with the failed
   handshake parked for ten minutes so a server without HTTP/3 does not cost a handshake
   timeout per query. `?h3=true` is mihomo's per-entry spelling and means *HTTP/3 only* —
   no fallback. `?h3=prefer` opts a single entry into the fallback behaviour without the
