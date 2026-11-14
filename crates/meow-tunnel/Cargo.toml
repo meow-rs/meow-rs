@@ -30,6 +30,13 @@ smallvec = { workspace = true }
 # IOCP a half-close can leave none behind).
 socket2 = { workspace = true }
 time = { workspace = true }
+# `BytesMut`/`Bytes` — the WG zero-copy relay scratch (relay.rs's
+# `Scratch::BytesMut`, perf-7 P7-1).
+bytes = { workspace = true }
+# `poll_read_buf` — fills a `BytesMut`'s uninitialized spare capacity
+# straight from the reader, so the zero-copy path needs no per-fill
+# memset (the `unsafe` boundary lives inside tokio-util).
+tokio-util = { workspace = true, features = ["io"] }
 
 # The relay splices socket-to-socket traffic (`relay::splice`).
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]

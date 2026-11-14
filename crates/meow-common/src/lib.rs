@@ -63,7 +63,7 @@ pub use chain_health::{
     failure_reason, Blame, CarrierChange, ChainHealth, ChainTarget, ChainVerdict,
     CLOSED_BEFORE_REPLY,
 };
-pub use conn::{ProxyConn, ProxyPacketConn, UdpPacket};
+pub use conn::{ProxyConn, ProxyPacketConn, UdpPacket, WriteBytes};
 pub use dial::{with_dial_timeout, DIAL_TIMEOUT};
 pub use dns_mode::DnsMode;
 pub use error::{MeowError, Result};

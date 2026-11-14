@@ -1344,6 +1344,16 @@ impl WgPump {
             while socket.can_recv() && st.pending_read.is_empty() {
                 let chunk = socket.recv(|data| {
                     let n = data.len().min(TCP_READ_CHUNK);
+                    // STRUCTURAL COPY (perf-7 memcpy #6): smoltcp's `recv`
+                    // closure yields a `&[u8]` view of the socket's ring
+                    // buffer; its lifetime is bound to the SocketSet
+                    // borrow, so the bytes cannot be moved, taken, or
+                    // handed to the conn channel — only copied out.
+                    // Elimination needs a smoltcp owned-buffer take API
+                    // (e.g. `recv_owned(&mut self) -> Bytes`), which
+                    // smoltcp 0.13.1 does not provide. Do NOT replace with
+                    // an unsafe pointer cast: smoltcp's buffer management
+                    // assumes the closure never retains the slice.
                     (n, StreamEvent::Data(Bytes::copy_from_slice(&data[..n])))
                 });
                 match chunk {
@@ -1439,6 +1449,15 @@ impl WgPump {
                 match socket.recv_slice(&mut self.udp_scratch) {
                     Ok((n, meta)) => {
                         let src = SocketAddr::new(meta.endpoint.addr.into(), meta.endpoint.port);
+                        // STRUCTURAL COPY (perf-7 memcpy #6, UDP twin of
+                        // the TCP `recv` note above): `recv_slice` fills
+                        // `udp_scratch` — the datagram lands in the pump's
+                        // scratch Vec — and the conn channel needs an
+                        // owned payload, so `copy_from_slice` is the hand
+                        // off. smoltcp 0.13.1 exposes no owned-buffer take
+                        // for UDP sockets either (`recv` yields the same
+                        // borrowed slice the TCP path shows). No unsafe
+                        // pointer casts — smoltcp owns the storage.
                         let data = Bytes::copy_from_slice(&self.udp_scratch[..n]);
                         // Full → drop: datagram loss is the UDP contract.
                         let _ = st.read_tx.try_send((data, src));
@@ -3239,5 +3258,28 @@ mod tests {
                 "read-queue depth must cover the advertised window"
             );
         }
+    }
+
+    /// P7-2's `WgPump: Send` proof is the module-level `const _` assert
+    /// next to the struct — it fails compilation, so it can never go
+    /// stale silently. This test re-states it in-suite so a regression
+    /// also surfaces in `cargo test` output.
+    #[test]
+    fn _wg_pump_send_const_assert() {
+        fn assert_send<T: Send>() {}
+        assert_send::<WgPump>();
+    }
+
+    /// P7-3 §3.3: the `STRUCTURAL COPY` rationale blocks sit next to the
+    /// smoltcp receive sites they explain (TCP `recv` and UDP
+    /// `recv_slice`) — pin the anchors so the notes cannot rot away from
+    /// the code. Both copies are structural, not eliminated work.
+    #[test]
+    fn structural_recv_copy_comment_exists() {
+        let src = include_str!("pump.rs");
+        assert!(
+            src.matches("STRUCTURAL COPY").count() >= 2,
+            "TCP and UDP smoltcp-receive copies must each carry a STRUCTURAL COPY note"
+        );
     }
 }

@@ -18,7 +18,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::{Buf, Bytes};
-use meow_common::ProxyConn;
+use meow_common::{ProxyConn, WriteBytes};
 use smoltcp::iface::{Interface, PollResult, SocketSet};
 use smoltcp::phy::{Checksum, Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::time::Instant as SmolInstant;
@@ -542,9 +542,96 @@ impl AsyncWrite for WgStream {
     }
 }
 
+/// perf-7 P7-1: the conn→actor channel carries `TcpIo::Data(Bytes)`, so
+/// the caller's owned `Bytes` moves straight into a channel slot — the
+/// `poll_write` slice copy (`Bytes::copy_from_slice`) is gone on this
+/// path. The `Option` slot stays the *caller's*: on full channel the
+/// bytes are handed back into it (the relay re-presents them next poll,
+/// its `pos` having never advanced), on success `take()` leaves `None`.
+impl WriteBytes for WgStream {
+    fn poll_write_bytes(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &mut Option<Bytes>,
+    ) -> Poll<std::io::Result<()>> {
+        if self.write_done {
+            return Poll::Ready(Err(stream_broken()));
+        }
+        loop {
+            // Anything stashed from an earlier `poll_write`/`poll_shutdown`
+            // drains ahead of the slot's bytes — ordering is the channel's.
+            if self.pending_write.is_some() {
+                let item = self.pending_write.take().expect("checked is_some above");
+                match self.send_item(item) {
+                    Ok(()) => {
+                        self.nudge();
+                        continue;
+                    }
+                    Err(mpsc::error::TrySendError::Full(item)) => {
+                        self.pending_write = Some(item);
+                        match self.poll_write_wait(cx) {
+                            Poll::Ready(true) => continue,
+                            Poll::Ready(false) => {
+                                self.write_done = true;
+                                return Poll::Ready(Err(stream_broken()));
+                            }
+                            Poll::Pending => return Poll::Pending,
+                        }
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        self.write_done = true;
+                        return Poll::Ready(Err(stream_broken()));
+                    }
+                }
+            }
+            // The caller's slot is the in-flight marker: `None` means an
+            // earlier poll already handed the bytes to the channel (or
+            // the caller had nothing) — the write is done either way.
+            let Some(b) = bytes.take() else {
+                return Poll::Ready(Ok(()));
+            };
+            match self.send_item(TcpIo::Data(b)) {
+                Ok(()) => {
+                    self.nudge();
+                    return Poll::Ready(Ok(()));
+                }
+                Err(mpsc::error::TrySendError::Full(item)) => {
+                    // Hand the bytes back to the caller's slot: unlike
+                    // `pending_write` (which the stream retries itself),
+                    // the item stays reachable through this poll entry —
+                    // the relay only re-enters the write arm while its
+                    // `pos` is unconsumed, so the parked `Bytes` would
+                    // never drain if they moved into `pending_write`
+                    // with `pos` already at `cap`.
+                    let TcpIo::Data(b) = item else {
+                        unreachable!("the item was built from Data above");
+                    };
+                    *bytes = Some(b);
+                    match self.poll_write_wait(cx) {
+                        Poll::Ready(true) => continue,
+                        Poll::Ready(false) => {
+                            self.write_done = true;
+                            return Poll::Ready(Err(stream_broken()));
+                        }
+                        Poll::Pending => return Poll::Pending,
+                    }
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    self.write_done = true;
+                    return Poll::Ready(Err(stream_broken()));
+                }
+            }
+        }
+    }
+}
+
 impl ProxyConn for WgStream {
     fn remote_destination(&self) -> String {
         self.remote.clone()
+    }
+
+    fn write_bytes(&mut self) -> Option<&mut dyn WriteBytes> {
+        Some(self)
     }
 }
 
@@ -925,5 +1012,111 @@ mod tests {
     #[test]
     fn poll_burst_cap_is_256() {
         assert_eq!(POLL_BURST, 256);
+    }
+
+    // ── perf-7 P7-1: owned-Bytes writes ──────────────────────────
+
+    fn test_stream(tx: mpsc::Sender<TcpIo>) -> WgStream {
+        let (_evt_tx, evt_rx) = mpsc::channel::<StreamEvent>(1);
+        WgStream {
+            remote: "test".into(),
+            rx: evt_rx,
+            tx,
+            wake: Arc::new(tokio::sync::Notify::new()),
+            pending_read: None,
+            pending_write: None,
+            write_reserve: None,
+            write_permit: None,
+            read_eof: false,
+            write_done: false,
+        }
+    }
+
+    /// P7-1: `poll_write_bytes` moves the caller's `Bytes` into the
+    /// channel slot untouched — the `TcpIo::Data` the actor receives is
+    /// the SAME allocation, no `copy_from_slice`.
+    #[tokio::test]
+    async fn wg_stream_write_bytes_zero_copy() {
+        let (tx, mut rx) = mpsc::channel::<TcpIo>(1);
+        let mut stream = test_stream(tx);
+
+        let bytes = Bytes::from(vec![7u8; 4096]);
+        let original_ptr = bytes.as_ptr();
+        let mut slot = Some(bytes);
+        std::future::poll_fn(|cx| Pin::new(&mut stream).poll_write_bytes(cx, &mut slot))
+            .await
+            .unwrap();
+        assert!(slot.is_none(), "a successful write consumes the slot");
+
+        match rx.recv().await {
+            Some(TcpIo::Data(b)) => {
+                assert_eq!(
+                    b.as_ptr(),
+                    original_ptr,
+                    "channel item is the caller's allocation"
+                );
+            }
+            other => panic!("expected TcpIo::Data, got {other:?}"),
+        }
+    }
+
+    /// P7-1: a full channel reports `Pending` and the caller KEEPS its
+    /// bytes (the relay's `pos` never advanced); after a drain the same
+    /// slot is re-presented and every message lands in FIFO order.
+    #[tokio::test]
+    async fn write_bytes_pending_preserves_ordering() {
+        let (tx, mut rx) = mpsc::channel::<TcpIo>(2);
+        let mut stream = test_stream(tx);
+        let msgs: Vec<Bytes> = (0..4u8).map(|i| Bytes::from(vec![i; 16])).collect();
+
+        // Fill the channel to capacity.
+        for m in &msgs[..2] {
+            let mut slot = Some(m.clone());
+            std::future::poll_fn(|cx| Pin::new(&mut stream).poll_write_bytes(cx, &mut slot))
+                .await
+                .unwrap();
+            assert!(slot.is_none());
+        }
+
+        // The next write parks: the slot must retain the bytes.
+        let mut slot3 = Some(msgs[2].clone());
+        std::future::poll_fn(
+            |cx| match Pin::new(&mut stream).poll_write_bytes(cx, &mut slot3) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(r) => panic!("full channel must report Pending, got {r:?}"),
+            },
+        )
+        .await;
+        assert!(
+            slot3.is_some(),
+            "the caller retains its bytes across a Pending write"
+        );
+
+        // Free one slot, then re-present — the parked bytes send.
+        match rx.recv().await {
+            Some(TcpIo::Data(b)) => assert_eq!(&b[..], &msgs[0][..]),
+            other => panic!("expected TcpIo::Data, got {other:?}"),
+        }
+        std::future::poll_fn(|cx| Pin::new(&mut stream).poll_write_bytes(cx, &mut slot3))
+            .await
+            .unwrap();
+        assert!(slot3.is_none());
+
+        // Free one more slot (m2 leaves, channel = [m3]), then the last
+        // message goes through and the drain asserts FIFO: m3 before m4.
+        match rx.recv().await {
+            Some(TcpIo::Data(b)) => assert_eq!(&b[..], &msgs[1][..]),
+            other => panic!("expected TcpIo::Data, got {other:?}"),
+        }
+        let mut slot4 = Some(msgs[3].clone());
+        std::future::poll_fn(|cx| Pin::new(&mut stream).poll_write_bytes(cx, &mut slot4))
+            .await
+            .unwrap();
+        for (i, m) in msgs[2..].iter().enumerate() {
+            match rx.recv().await {
+                Some(TcpIo::Data(b)) => assert_eq!(&b[..], &m[..], "message {}", i + 2),
+                other => panic!("expected TcpIo::Data, got {other:?}"),
+            }
+        }
     }
 }

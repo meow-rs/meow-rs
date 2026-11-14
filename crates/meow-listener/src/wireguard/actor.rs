@@ -1567,6 +1567,11 @@ impl WgActor {
                 }
                 rt.sniff_bytes(&prefix, &mut metadata);
             }
+            // Box as `dyn ProxyConn` so the tunnel's inbound
+            // `WriteBytesView` probe (an `Any` downcast) finds the
+            // `WgStream` underneath and bulk-relays into it with owned
+            // `Bytes`, not a per-fill `copy_from_slice` (perf-7 P7-1).
+            let mut stream: Box<dyn meow_common::ProxyConn> = Box::new(stream);
             meow_tunnel::tcp::route_inbound_tcp(&inner, &mut stream, metadata, &prefix).await;
         });
     }
