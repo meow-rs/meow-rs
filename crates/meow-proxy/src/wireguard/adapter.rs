@@ -5,7 +5,7 @@
 //! allowed-IPs table, resolves the WG server endpoint, owns one pump actor
 //! ([`super::pump`]) lazily spawned on first use, and relays
 //! dial/bind/shutdown over the actor mailbox. All smoltcp/boringtun state
-//! lives inside the pump thread.
+//! lives inside the pump task.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
@@ -26,22 +26,26 @@ use super::pump::{self, ActorMsg};
 /// deadlines — so a timeout here means "the actor is gone or stuffed".
 const DIAL_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Live pump actor: the mailbox plus the thread handle (kept so `Drop` can
-/// reap it off-thread — a blocking join in the dropping task would stall a
-/// tokio worker).
+/// Live pump actor: the mailbox plus the task handle. The task exits on
+/// its own once `Shutdown` lands or the mailbox closes, so the handle is
+/// never awaited — dropping it detaches (a `JoinHandle` drop is *not* an
+/// abort), the same reaping semantics the throwaway join thread gave the
+/// `std::thread` pump (perf-7 P7-2).
 struct PumpHandle {
     tx: mpsc::Sender<ActorMsg>,
-    thread: Option<std::thread::JoinHandle<()>>,
+    task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Drop for PumpHandle {
     fn drop(&mut self) {
+        // Sender close is the guaranteed terminator — the pump exits
+        // on `Disconnected`/`is_closed` even when this `try_send` drops
+        // `Shutdown` against a full mailbox; the send is only the fast
+        // path. Queued items that outlive this sender are refused by
+        // the pump's `is_closed` guard rather than serviced into
+        // dead-on-arrival conns.
         let _ = self.tx.try_send(ActorMsg::Shutdown);
-        if let Some(t) = self.thread.take() {
-            std::thread::spawn(move || {
-                let _ = t.join();
-            });
-        }
+        drop(self.task.take());
     }
 }
 
@@ -242,8 +246,9 @@ impl WireGuardAdapter {
         let peer = meow_common::canonical_socket_addr(addr);
         let socket = meow_common::bind_udp_for_peer(peer.ip()).await?;
         meow_wgstack::enlarge_recv_buffer(&socket);
-        // Symmetric: a `poll_burst` egress hands the kernel a ~64-
-        // datagram batch in one shot — the platform default `SO_SNDBUF`
+        // Symmetric: a `poll_burst` pass can stage MiBs of wire-bound
+        // datagrams, flushed to the kernel as `WIRE_DRAIN_BUDGET`-sized
+        // batches back to back — the platform default `SO_SNDBUF`
         // (9 KiB on macOS) drops the tail of every burst on ENOBUFS.
         meow_wgstack::enlarge_send_buffer(&socket);
         let std_sock = socket.into_std()?;
@@ -252,7 +257,7 @@ impl WireGuardAdapter {
     }
 
     /// The live pump, lazily spawned: resolve endpoint → bind+connect →
-    /// spawn actor thread → publish under the mutex. Losers of a
+    /// spawn actor task → publish under the mutex. Losers of a
     /// double-spawn race drop their handle, which shuts that pump down via
     /// [`PumpHandle::drop`].
     async fn ensure_pump(&self) -> Result<Arc<PumpHandle>> {
@@ -283,10 +288,10 @@ impl WireGuardAdapter {
         for addr in endpoints {
             match self.bind_endpoint(addr).await {
                 Ok(sock) => match pump::spawn_pump(&self.config, sock, addr) {
-                    Ok((tx, thread)) => {
+                    Ok((tx, task)) => {
                         let handle = Arc::new(PumpHandle {
                             tx,
-                            thread: Some(thread),
+                            task: Some(task),
                         });
                         let mut guard = self
                             .pump
@@ -429,7 +434,7 @@ impl ProxyAdapter for WireGuardAdapter {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
-        // `PumpHandle::drop` sends Shutdown and reaps the thread.
+        // `PumpHandle::drop` sends Shutdown and detaches the task.
         drop(handle);
     }
 

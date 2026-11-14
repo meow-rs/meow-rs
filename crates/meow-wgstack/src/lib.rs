@@ -18,7 +18,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::{Buf, Bytes};
-use meow_common::ProxyConn;
+use meow_common::{ProxyConn, WriteBytes};
 use smoltcp::iface::{Interface, PollResult, SocketSet};
 use smoltcp::phy::{Checksum, Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::time::Instant as SmolInstant;
@@ -62,7 +62,40 @@ pub const WIRE_DRAIN_BUDGET: usize = 64;
 /// emits a segment every poll) must not livelock the owning actor out of
 /// its drain/flush halves; a capped burst simply resumes next pass —
 /// `poll_delay` reports `Now` while segments remain queued.
-pub const POLL_BURST: usize = 64;
+///
+/// Raised 64 → 256 (perf-7): a full [`WIRE_DRAIN_BUDGET`] batch fills
+/// `rx_queue` with 64 packets, and the burst also has to absorb residual
+/// queue depth left by a back-pressured previous pass; 256 gives 4×
+/// headroom over one wire batch without letting a stacked burst dominate.
+/// smoltcp 0.13's `poll` already drains ingress and egress *internally*,
+/// so the burst usually exits on the first `PollResult::None` — the cap
+/// and [`POLL_TX_BYTES_BUDGET`] stay as the bounded-budget safety net.
+pub const POLL_BURST: usize = 256;
+
+/// Per-pass TX-bytes budget inside [`poll_burst`] (perf-7): break out of
+/// the burst early once this many bytes of inner segments have been
+/// emitted into `ChannelDevice::tx_queue`, so a saturated socket cannot
+/// monopolize a service pass. 256 polls × ~1500 B/segment ≈ 384 KB of
+/// uncapped headroom; 2 MiB leaves comfortable room for several saturated
+/// flows while still bounding the pass.
+///
+/// The bound is *soft/advisory*, not hard: it is only consulted between
+/// `Interface::poll` calls, and smoltcp 0.13's `poll` drains socket
+/// egress internally — one call may exceed the budget before the check
+/// runs (worst case `budget + one poll's internal drain`).
+/// Hard-enforcing at the device — a per-pass counter on
+/// [`ChannelDevice`] with `transmit()` returning `None` past it
+/// (smoltcp 0.13 maps that to `EgressError::Exhausted`, cleanly
+/// breaking the egress loop) — was rejected: `socket_egress` walks the
+/// `SocketSet` in insertion order, so a mid-poll refusal would always
+/// land at the same point and let the earliest sockets eat the whole
+/// budget every pass while tail sockets starve. The soft bound lets an
+/// in-flight poll finish draining and only skips *additional* polls.
+///
+/// Under normal WG flow the budget rarely trips at all — `PollResult::
+/// None` exits the burst first (the quiet poll after the stack drains).
+/// The budget is the degenerate-load bound, not the everyday exit.
+pub const POLL_TX_BYTES_BUDGET: usize = 2 * 1024 * 1024;
 
 /// boringtun's own device loop ticks its timers at 250 ms (rekey timeout is
 /// 5 s, jitter ≤ 333 ms — this is well inside slack). Spec §3.4 sketched
@@ -216,12 +249,40 @@ pub fn poll_burst(
     device: &mut ChannelDevice,
     sockets: &mut SocketSet<'_>,
 ) {
-    for _ in 0..POLL_BURST {
+    poll_burst_budgeted(iface, now, device, sockets, POLL_TX_BYTES_BUDGET);
+}
+
+/// [`poll_burst`] with the TX-bytes budget explicit — the public entry
+/// uses [`POLL_TX_BYTES_BUDGET`]; tests pass a smaller budget to exercise
+/// the early break without producing MiBs of traffic. Returns the number
+/// of `Interface::poll` iterations executed (always ≥ 1).
+fn poll_burst_budgeted(
+    iface: &mut Interface,
+    now: SmolInstant,
+    device: &mut ChannelDevice,
+    sockets: &mut SocketSet<'_>,
+    tx_bytes_budget: usize,
+) -> usize {
+    let mut tx_bytes: usize = 0;
+    // `tx_queue` only grows inside `poll` (egress appends): entries that
+    // existed before each poll were already accounted, so re-checkpoint
+    // the length per iteration and sum only the newly emitted tail.
+    let mut tx_len_before = device.tx_queue.len();
+    for i in 0..POLL_BURST {
         match iface.poll(now, device, sockets) {
-            PollResult::SocketStateChanged => {}
-            PollResult::None => break,
+            PollResult::SocketStateChanged => {
+                for pkt in device.tx_queue.iter().skip(tx_len_before) {
+                    tx_bytes += pkt.len();
+                }
+                tx_len_before = device.tx_queue.len();
+                if tx_bytes > tx_bytes_budget {
+                    return i + 1;
+                }
+            }
+            PollResult::None => return i + 1,
         }
     }
+    POLL_BURST
 }
 
 /// conn→actor TCP items.
@@ -498,9 +559,96 @@ impl AsyncWrite for WgStream {
     }
 }
 
+/// perf-7 P7-1: the conn→actor channel carries `TcpIo::Data(Bytes)`, so
+/// the caller's owned `Bytes` moves straight into a channel slot — the
+/// `poll_write` slice copy (`Bytes::copy_from_slice`) is gone on this
+/// path. The `Option` slot stays the *caller's*: on full channel the
+/// bytes are handed back into it (the relay re-presents them next poll,
+/// its `pos` having never advanced), on success `take()` leaves `None`.
+impl WriteBytes for WgStream {
+    fn poll_write_bytes(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &mut Option<Bytes>,
+    ) -> Poll<std::io::Result<()>> {
+        if self.write_done {
+            return Poll::Ready(Err(stream_broken()));
+        }
+        loop {
+            // Anything stashed from an earlier `poll_write`/`poll_shutdown`
+            // drains ahead of the slot's bytes — ordering is the channel's.
+            if self.pending_write.is_some() {
+                let item = self.pending_write.take().expect("checked is_some above");
+                match self.send_item(item) {
+                    Ok(()) => {
+                        self.nudge();
+                        continue;
+                    }
+                    Err(mpsc::error::TrySendError::Full(item)) => {
+                        self.pending_write = Some(item);
+                        match self.poll_write_wait(cx) {
+                            Poll::Ready(true) => continue,
+                            Poll::Ready(false) => {
+                                self.write_done = true;
+                                return Poll::Ready(Err(stream_broken()));
+                            }
+                            Poll::Pending => return Poll::Pending,
+                        }
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        self.write_done = true;
+                        return Poll::Ready(Err(stream_broken()));
+                    }
+                }
+            }
+            // The caller's slot is the in-flight marker: `None` means an
+            // earlier poll already handed the bytes to the channel (or
+            // the caller had nothing) — the write is done either way.
+            let Some(b) = bytes.take() else {
+                return Poll::Ready(Ok(()));
+            };
+            match self.send_item(TcpIo::Data(b)) {
+                Ok(()) => {
+                    self.nudge();
+                    return Poll::Ready(Ok(()));
+                }
+                Err(mpsc::error::TrySendError::Full(item)) => {
+                    // Hand the bytes back to the caller's slot: unlike
+                    // `pending_write` (which the stream retries itself),
+                    // the item stays reachable through this poll entry —
+                    // the relay only re-enters the write arm while its
+                    // `pos` is unconsumed, so the parked `Bytes` would
+                    // never drain if they moved into `pending_write`
+                    // with `pos` already at `cap`.
+                    let TcpIo::Data(b) = item else {
+                        unreachable!("the item was built from Data above");
+                    };
+                    *bytes = Some(b);
+                    match self.poll_write_wait(cx) {
+                        Poll::Ready(true) => continue,
+                        Poll::Ready(false) => {
+                            self.write_done = true;
+                            return Poll::Ready(Err(stream_broken()));
+                        }
+                        Poll::Pending => return Poll::Pending,
+                    }
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    self.write_done = true;
+                    return Poll::Ready(Err(stream_broken()));
+                }
+            }
+        }
+    }
+}
+
 impl ProxyConn for WgStream {
     fn remote_destination(&self) -> String {
         self.remote.clone()
+    }
+
+    fn write_bytes(&mut self) -> Option<&mut dyn WriteBytes> {
+        Some(self)
     }
 }
 
@@ -533,16 +681,17 @@ pub fn enlarge_recv_buffer(socket: &tokio::net::UdpSocket) {
     tracing::debug!(size = ?sock.recv_buffer_size(), "wireguard endpoint receive buffer");
 }
 
-/// The send side needs the same headroom as the receive side: a
-/// [`poll_burst`] egress burst is handed to the kernel in one
-/// [`WIRE_DRAIN_BUDGET`] batch (~`POLL_BURST` × ~1.5 KB ≈ 90 KB), and the
-/// default send buffer is far smaller than that on some platforms —
-/// macOS grants only `9216` bytes of `SO_SNDBUF` out of the box, so a
-/// burst beyond ~6 datagrams dies on `ENOBUFS` *inside* `send_batch_to`
-/// (a short count, not a `WouldBlock`) and the inner TCP sees the
-/// dropped tail as a hole to retransmit. 4×[`TCP_SOCKET_BUF`] absorbs a
-/// full-window burst from several saturated flows; the kernel commits
-/// pages only on use.
+/// The send side needs the same headroom as the receive side: one
+/// [`poll_burst`] pass can stage up to `POLL_TX_BYTES_BUDGET` (~2 MiB,
+/// ≈1 400 datagrams at ~1.5 KB) of wire-bound inner segments before its
+/// soft budget trips, handed to the kernel as [`WIRE_DRAIN_BUDGET`]-sized
+/// `send_batch` batches back to back — and the default send buffer is
+/// far smaller than one batch on some platforms: macOS grants only
+/// `9216` bytes of `SO_SNDBUF` out of the box, so a burst beyond ~6
+/// datagrams dies on `ENOBUFS` *inside* `send_batch_to` (a short count,
+/// not a `WouldBlock`) and the inner TCP sees the dropped tail as a
+/// hole to retransmit. 4×[`TCP_SOCKET_BUF`] absorbs a full-window burst
+/// from several saturated flows; the kernel commits pages only on use.
 pub fn enlarge_send_buffer(socket: &tokio::net::UdpSocket) {
     let sock = socket2::SockRef::from(socket);
     let mut size = ENDPOINT_RECV_BUFFER;
@@ -746,5 +895,262 @@ mod tests {
         let undersized = reset_scratch(Vec::with_capacity(1024), 2048);
         assert!(undersized.capacity() >= 2048);
         assert!(undersized.iter().all(|&b| b == 0));
+    }
+
+    // ── perf-7 P7-3a: burst cap + TX-byte budget ─────────────────
+
+    /// The minimum interface a `poll_burst` can ingress through: one v4
+    /// tunnel address, `Medium::Ip` device, empty socket set.
+    fn burst_iface() -> (Interface, ChannelDevice, SocketSet<'static>) {
+        let mut device = ChannelDevice::new(1420);
+        let mut cfg = smoltcp::iface::Config::new(smoltcp::wire::HardwareAddress::Ip);
+        cfg.random_seed = 0;
+        let mut iface = Interface::new(cfg, &mut device, SmolInstant::now());
+        iface.update_ip_addrs(|a| {
+            a.push(smoltcp::wire::IpCidr::new(
+                smoltcp::wire::IpAddress::v4(10, 0, 0, 2),
+                32,
+            ))
+            .unwrap();
+        });
+        (iface, device, SocketSet::new(vec![]))
+    }
+
+    /// A parseable IPv4+UDP datagram 10.0.0.1 → 10.0.0.2. RX checksum
+    /// verification is off on [`ChannelDevice`] (`Checksum::Tx`), so only
+    /// the header layout must be right; the IPv4 checksum is still
+    /// computed for realism.
+    fn udp_datagram_v4(payload_len: usize, tag: u8) -> Bytes {
+        let total = 20 + 8 + payload_len;
+        let mut p = vec![0u8; total];
+        p[0] = 0x45; // IPv4, IHL 5
+        p[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+        p[4..6].copy_from_slice(&(u16::from(tag) + 1).to_be_bytes()); // ident
+        p[6..8].copy_from_slice(&0x4000u16.to_be_bytes()); // DF
+        p[8] = 64; // TTL
+        p[9] = 17; // UDP
+        p[12..16].copy_from_slice(&[10, 0, 0, 1]);
+        p[16..20].copy_from_slice(&[10, 0, 0, 2]);
+        let mut cks: u32 = 0;
+        for w in p[..20].as_chunks::<2>().0 {
+            cks += u32::from(u16::from_be_bytes(*w));
+        }
+        while cks >> 16 != 0 {
+            cks = (cks & 0xFFFF) + (cks >> 16);
+        }
+        p[10..12].copy_from_slice(&(!(cks as u16)).to_be_bytes());
+        p[20..22].copy_from_slice(&12345u16.to_be_bytes());
+        p[22..24].copy_from_slice(&9u16.to_be_bytes());
+        p[24..26].copy_from_slice(&((8 + payload_len) as u16).to_be_bytes());
+        // UDP checksum stays 0 — legal on IPv4, and RX verify is off anyway.
+        p[28..].fill(tag);
+        Bytes::from(p)
+    }
+
+    /// P7-3a: 200 queued rx packets — deeper than the old 64-poll cap and
+    /// three `WIRE_DRAIN_BUDGET` wire batches — drain inside ONE
+    /// `poll_burst` call instead of waiting for the next wake. Under
+    /// smoltcp 0.13 that means the *first* `Interface::poll` drains the
+    /// whole queue internally (upstream #1059): asserting the poll count
+    /// — one working poll plus the quiet poll the burst exits on — is
+    /// what pins "within one pass"; an emptied-queue-only assert would
+    /// also pass under the old one-packet-per-poll world.
+    #[test]
+    fn poll_burst_drains_deep_rx_queue() {
+        const DEPTH: usize = 200;
+        let (mut iface, mut device, mut sockets) = burst_iface();
+        for i in 0..DEPTH {
+            device
+                .rx_queue
+                .push_back(udp_datagram_v4(40, (i % 251) as u8));
+        }
+        assert_eq!(device.rx_queue.len(), DEPTH);
+        let polls = poll_burst_budgeted(
+            &mut iface,
+            SmolInstant::now(),
+            &mut device,
+            &mut sockets,
+            usize::MAX,
+        );
+        assert!(
+            device.rx_queue.is_empty(),
+            "a burst must drain the whole injected depth"
+        );
+        assert_eq!(
+            polls, 2,
+            "the first poll drains every queued packet internally; \
+             the second is the quiet exit"
+        );
+    }
+
+    /// P7-3a: with an emitting socket and a sub-segment budget the burst
+    /// exits right after the first producing poll; without a budget it
+    /// keeps polling until the stack reports `PollResult::None`.
+    #[test]
+    fn poll_burst_tx_budget_breaks_early() {
+        let (mut iface, mut device, mut sockets) = burst_iface();
+        let mut sock = smoltcp::socket::tcp::Socket::new(
+            smoltcp::socket::tcp::SocketBuffer::new(vec![0; 2048]),
+            smoltcp::socket::tcp::SocketBuffer::new(vec![0; 2048]),
+        );
+        sock.connect(
+            iface.context(),
+            (smoltcp::wire::IpAddress::v4(10, 0, 0, 1), 80),
+            49500,
+        )
+        .unwrap();
+        sockets.add(sock);
+
+        let polls = poll_burst_budgeted(
+            &mut iface,
+            SmolInstant::now(),
+            &mut device,
+            &mut sockets,
+            1, // budget far below the ~60-byte SYN
+        );
+        assert!(
+            !device.tx_queue.is_empty(),
+            "the connect must have emitted a SYN before the break"
+        );
+        assert_eq!(
+            polls, 1,
+            "the TX-byte budget must break right after the producing poll"
+        );
+
+        // Control: the same emission under an effectively unbounded
+        // budget exits on `PollResult::None` — the poll after the SYN's.
+        let (mut iface, mut device, mut sockets) = burst_iface();
+        let mut sock = smoltcp::socket::tcp::Socket::new(
+            smoltcp::socket::tcp::SocketBuffer::new(vec![0; 2048]),
+            smoltcp::socket::tcp::SocketBuffer::new(vec![0; 2048]),
+        );
+        sock.connect(
+            iface.context(),
+            (smoltcp::wire::IpAddress::v4(10, 0, 0, 1), 80),
+            49500,
+        )
+        .unwrap();
+        sockets.add(sock);
+        let polls = poll_burst_budgeted(
+            &mut iface,
+            SmolInstant::now(),
+            &mut device,
+            &mut sockets,
+            usize::MAX,
+        );
+        assert_eq!(polls, 2, "no budget: exit on the quiet poll");
+    }
+
+    /// The public constant stays at its perf-7 value — the deep-drain
+    /// and budget tests above only pass by it being ≫ `WIRE_DRAIN_BUDGET`.
+    #[test]
+    fn poll_burst_cap_is_256() {
+        assert_eq!(POLL_BURST, 256);
+    }
+
+    // ── perf-7 P7-1: owned-Bytes writes ──────────────────────────
+
+    fn test_stream(tx: mpsc::Sender<TcpIo>) -> WgStream {
+        let (_evt_tx, evt_rx) = mpsc::channel::<StreamEvent>(1);
+        WgStream {
+            remote: "test".into(),
+            rx: evt_rx,
+            tx,
+            wake: Arc::new(tokio::sync::Notify::new()),
+            pending_read: None,
+            pending_write: None,
+            write_reserve: None,
+            write_permit: None,
+            read_eof: false,
+            write_done: false,
+        }
+    }
+
+    /// P7-1: `poll_write_bytes` moves the caller's `Bytes` into the
+    /// channel slot untouched — the `TcpIo::Data` the actor receives is
+    /// the SAME allocation, no `copy_from_slice`.
+    #[tokio::test]
+    async fn wg_stream_write_bytes_zero_copy() {
+        let (tx, mut rx) = mpsc::channel::<TcpIo>(1);
+        let mut stream = test_stream(tx);
+
+        let bytes = Bytes::from(vec![7u8; 4096]);
+        let original_ptr = bytes.as_ptr();
+        let mut slot = Some(bytes);
+        std::future::poll_fn(|cx| Pin::new(&mut stream).poll_write_bytes(cx, &mut slot))
+            .await
+            .unwrap();
+        assert!(slot.is_none(), "a successful write consumes the slot");
+
+        match rx.recv().await {
+            Some(TcpIo::Data(b)) => {
+                assert_eq!(
+                    b.as_ptr(),
+                    original_ptr,
+                    "channel item is the caller's allocation"
+                );
+            }
+            other => panic!("expected TcpIo::Data, got {other:?}"),
+        }
+    }
+
+    /// P7-1: a full channel reports `Pending` and the caller KEEPS its
+    /// bytes (the relay's `pos` never advanced); after a drain the same
+    /// slot is re-presented and every message lands in FIFO order.
+    #[tokio::test]
+    async fn write_bytes_pending_preserves_ordering() {
+        let (tx, mut rx) = mpsc::channel::<TcpIo>(2);
+        let mut stream = test_stream(tx);
+        let msgs: Vec<Bytes> = (0..4u8).map(|i| Bytes::from(vec![i; 16])).collect();
+
+        // Fill the channel to capacity.
+        for m in &msgs[..2] {
+            let mut slot = Some(m.clone());
+            std::future::poll_fn(|cx| Pin::new(&mut stream).poll_write_bytes(cx, &mut slot))
+                .await
+                .unwrap();
+            assert!(slot.is_none());
+        }
+
+        // The next write parks: the slot must retain the bytes.
+        let mut slot3 = Some(msgs[2].clone());
+        std::future::poll_fn(
+            |cx| match Pin::new(&mut stream).poll_write_bytes(cx, &mut slot3) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(r) => panic!("full channel must report Pending, got {r:?}"),
+            },
+        )
+        .await;
+        assert!(
+            slot3.is_some(),
+            "the caller retains its bytes across a Pending write"
+        );
+
+        // Free one slot, then re-present — the parked bytes send.
+        match rx.recv().await {
+            Some(TcpIo::Data(b)) => assert_eq!(&b[..], &msgs[0][..]),
+            other => panic!("expected TcpIo::Data, got {other:?}"),
+        }
+        std::future::poll_fn(|cx| Pin::new(&mut stream).poll_write_bytes(cx, &mut slot3))
+            .await
+            .unwrap();
+        assert!(slot3.is_none());
+
+        // Free one more slot (m2 leaves, channel = [m3]), then the last
+        // message goes through and the drain asserts FIFO: m3 before m4.
+        match rx.recv().await {
+            Some(TcpIo::Data(b)) => assert_eq!(&b[..], &msgs[1][..]),
+            other => panic!("expected TcpIo::Data, got {other:?}"),
+        }
+        let mut slot4 = Some(msgs[3].clone());
+        std::future::poll_fn(|cx| Pin::new(&mut stream).poll_write_bytes(cx, &mut slot4))
+            .await
+            .unwrap();
+        for (i, m) in msgs[2..].iter().enumerate() {
+            match rx.recv().await {
+                Some(TcpIo::Data(b)) => assert_eq!(&b[..], &m[..], "message {}", i + 2),
+                other => panic!("expected TcpIo::Data, got {other:?}"),
+            }
+        }
     }
 }

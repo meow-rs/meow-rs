@@ -371,9 +371,14 @@ impl CryptoPool {
     /// The calling thread blocks until the pass joins; concurrent
     /// `run`s serialize through `inner`'s mutex, so two actors' passes
     /// queue back to back — they never interleave chunks on a worker.
-    /// Call it from a dedicated actor thread (every current caller is
-    /// one), never a shared tokio worker: the blocking join would
-    /// stall the runtime's other tasks for the pass's duration.
+    /// The join is a blocking `mpsc::recv` hold on the caller, so the
+    /// caller's own threading matters: a dedicated actor thread (the
+    /// inbound listener's) blocks outright — nothing else lives on it
+    /// — while a caller on a shared tokio worker (the outbound pump's
+    /// `tokio::spawn`'d task) must wrap the call in
+    /// `tokio::task::block_in_place` so the wait moves off the
+    /// runtime's worker set; a bare call would stall the worker's
+    /// other tasks for the pass's duration.
     pub fn run(&self, jobs: &mut Vec<CryptoJob>) {
         self.dispatch(jobs, JobChunk::Rx, |chunk| match chunk {
             JobChunk::Rx(jobs) => Some(jobs),
@@ -383,7 +388,8 @@ impl CryptoPool {
 
     /// [`run`](Self::run)'s TX twin — one seal batch through the same
     /// resident workers, same order-preserving merge, same serial
-    /// fallbacks.
+    /// fallbacks, same caller-threading contract (shared tokio workers
+    /// wrap it in `block_in_place`).
     pub fn run_tx(&self, jobs: &mut Vec<TxCryptoJob>) {
         self.dispatch(jobs, JobChunk::Tx, |chunk| match chunk {
             JobChunk::Tx(jobs) => Some(jobs),

@@ -14,8 +14,10 @@
 //!    pump's `service_sockets` shape, minus dial-pending, plus the
 //!    Established→route-task handoff).
 //! 3. `iface.poll` — smoltcp consumes the rx queue (SYNs accept,
-//!    segments deliver, emits go to `device.tx_queue`), burst-looped
-//!    via [`poll_burst`] since one poll egresses ≤1 segment/socket.
+//!    segments deliver, emits go to `device.tx_queue`), looped via
+//!    [`poll_burst`] as the bounded-budget backstop (smoltcp 0.13
+//!    drains socket egress inside one poll already; the burst bounds
+//!    a permanently-progressing pass).
 //! 4. `post_poll` — sweep listen-pool entries whose socket left
 //!    `State::Listen` (errata E5: only `Listen` sockets are pool
 //!    occupants) and register fresh flow sockets, resolving each
@@ -75,6 +77,18 @@ const LISTEN_POOL_CAP: usize = 64;
 /// items needed, and a `TCP_READ_QUEUE` of them covers the 1 MiB rx
 /// window without one socket monopolising a service pass.
 const TCP_READ_CHUNK: usize = 65536;
+
+/// Once a socket's owning route task is gone on both channel halves the
+/// flow has no consumer left. `conn_gone` can never enqueue `Close`
+/// once `graceful_close` holds — the FIN is already out and
+/// `TcpIo::Close` is deliberately suppressed so the peer's tail bytes
+/// survive — and a peer that never closes back pins the socket forever:
+/// smoltcp has no FinWait-2 timeout and `discard_socket_rx` keeps the
+/// receive window open, so the peer's stream keeps arriving to
+/// /dev/null. The grace covers the real teardown (FIN handshake, `out`
+/// flush at socket pace); a peer still open past it was never going to
+/// close.
+const TCP_ORPHAN_GRACE: Duration = Duration::from_secs(2);
 
 /// Idle `select!` sleep when smoltcp reports no `poll_delay` — the
 /// pump's own fallback (its comment in `sleep_duration` explains why
@@ -146,6 +160,11 @@ struct TcpFlow {
     eof_sent: bool,
     graceful_close: bool,
     spawned: bool,
+    /// Armed when both conn channel halves report the route task gone;
+    /// the [`TCP_ORPHAN_GRACE`] deadline after which the socket is
+    /// aborted regardless of `graceful_close` — the bound that keeps a
+    /// peer that never closes back from pinning the socket forever.
+    dead_since: Option<Instant>,
 }
 
 /// Parsed inner-packet view used by the demux→stack bridge.
@@ -295,8 +314,9 @@ impl WgActor {
 
         let endpoint = tokio::net::UdpSocket::from_std(std_sock)?;
         enlarge_recv_buffer(&endpoint);
-        // Symmetric: a `poll_burst` egress hands the kernel a ~64-
-        // datagram batch in one shot — the platform default `SO_SNDBUF`
+        // Symmetric: a `poll_burst` pass can stage MiBs of wire-bound
+        // datagrams, flushed to the kernel as `WIRE_DRAIN_BUDGET`-sized
+        // batches back to back — the platform default `SO_SNDBUF`
         // (9 KiB on macOS) drops the tail of every burst on ENOBUFS.
         enlarge_send_buffer(&endpoint);
         let bound_port = endpoint.local_addr()?.port();
@@ -462,9 +482,10 @@ impl WgActor {
     /// The smoltcp half of a service pass: burst-poll the interface,
     /// then `post_poll`'s registration/cleanup when the pass could
     /// have moved anything it tracks. Its own method so `service`'s
-    /// poll step and the T1 burst pin drive the exact same code — a
-    /// regression to one `iface.poll` per pass must fail that test,
-    /// not just prod.
+    /// poll step and the T1 burst pin drive the exact same code —
+    /// under smoltcp 0.13 one `poll` drains egress internally, so the
+    /// burst loop is the bounded-budget backstop rather than the
+    /// throughput path; the pin still wants the production entry.
     fn poll_stack(&mut self) {
         let now = SmolInstant::now();
         // `post_poll`'s bookkeeping only has work when the poll could
@@ -1353,6 +1374,7 @@ impl WgActor {
                 eof_sent: false,
                 graceful_close: false,
                 spawned: false,
+                dead_since: None,
             },
         );
     }
@@ -1499,6 +1521,29 @@ impl WgActor {
                     Err(mpsc::error::TrySendError::Full(_)) => {}
                 }
             }
+            // Orphan bound: both channel halves closed means the route
+            // task released the stream entirely — the socket's output
+            // has no consumer and its input is discard-drained. Unlike
+            // `conn_gone` the arm needs no `write_rx.is_empty()`: a
+            // jammed closed channel is equally dead, and the grace
+            // abort covers it. Give a graceful close the grace to
+            // finish, then abort whatever is still open: without it a
+            // FinWait socket under a peer that keeps streaming lives
+            // until session teardown.
+            if st.write_rx.is_closed() && st.read_tx.is_closed() {
+                match st.dead_since {
+                    None => st.dead_since = Some(Instant::now()),
+                    Some(t) if t.elapsed() >= TCP_ORPHAN_GRACE => {
+                        debug!(
+                            "wireguard {}: TCP {handle:?} conn dead past grace (state {:?}) → abort",
+                            self.name,
+                            socket.state()
+                        );
+                        socket.abort();
+                    }
+                    _ => {}
+                }
+            }
             if !socket.is_open() {
                 dead.push(*handle);
             }
@@ -1567,6 +1612,11 @@ impl WgActor {
                 }
                 rt.sniff_bytes(&prefix, &mut metadata);
             }
+            // Box as `dyn ProxyConn` so the tunnel's inbound
+            // `WriteBytesView` probe (an `Any` downcast) finds the
+            // `WgStream` underneath and bulk-relays into it with owned
+            // `Bytes`, not a per-fill `copy_from_slice` (perf-7 P7-1).
+            let mut stream: Box<dyn meow_common::ProxyConn> = Box::new(stream);
             meow_tunnel::tcp::route_inbound_tcp(&inner, &mut stream, metadata, &prefix).await;
         });
     }
@@ -2628,6 +2678,132 @@ mod tests {
         );
     }
 
+    /// The other half of the zombie: the route task died *after* its
+    /// FIN went out (`graceful_close`), and the peer never closes back
+    /// — it keeps streaming into the discard drain. `conn_gone` can
+    /// never enqueue `Close` while `graceful_close` holds, and
+    /// smoltcp's FinWait has no timeout of its own, so without
+    /// [`TCP_ORPHAN_GRACE`] the socket outlives the whole session. The
+    /// bound pins both sides of it: the socket must survive inside the
+    /// grace (a real close may still complete) and must be aborted
+    /// past it.
+    #[tokio::test]
+    async fn orphan_grace_aborts_socket_past_deadline() {
+        let mut actor = test_actor();
+        let client: Ipv4Addr = "10.0.0.2".parse().unwrap();
+        let target: Ipv4Addr = "203.0.113.9".parse().unwrap();
+        let key: InnerTuple = (client.into(), 40000, target.into(), 443);
+
+        feed_tcp(&mut actor, 0, &syn_v4(client, target, 40000, 443));
+        poll_once(&mut actor);
+        let handle = actor.tcp_by_tuple[&key];
+        let syn_ack = actor
+            .device
+            .tx_queue
+            .back()
+            .expect("the accept emitted a SYN-ACK");
+        let server_isn = u32::from_be_bytes(syn_ack[24..28].try_into().unwrap());
+
+        // Handshake ACK → Established.
+        let ack = seg_v4(
+            client,
+            target,
+            40000,
+            443,
+            101,
+            server_isn.wrapping_add(1),
+            0x10,
+        );
+        feed_tcp(&mut actor, 0, &ack);
+        poll_once(&mut actor);
+        assert_eq!(
+            actor.sockets.get::<tcp::Socket>(handle).state(),
+            tcp::State::Established
+        );
+
+        // Graceful half-close (FIN out), then the route task dies —
+        // both ends it was handed close.
+        {
+            let st = actor.tcp.get_mut(&handle).expect("flow state");
+            st.spawned = true;
+            st.write_tx
+                .as_ref()
+                .expect("pre-spawn flow still holds write_tx")
+                .try_send(TcpIo::Shutdown)
+                .expect("channel has room");
+        }
+        actor.service_tcp(); // consumes Shutdown → close() + graceful_close
+        assert_eq!(
+            actor.sockets.get::<tcp::Socket>(handle).state(),
+            tcp::State::FinWait1
+        );
+        {
+            let st = actor.tcp.get_mut(&handle).expect("flow state");
+            drop(st.read_rx.take());
+            drop(st.write_tx.take());
+        }
+
+        // The first pass only arms the deadline: inside the grace the
+        // socket must survive — a real close may still be completing.
+        actor.service_tcp();
+        assert!(actor.tcp.contains_key(&handle));
+        assert!(actor.tcp[&handle].dead_since.is_some());
+
+        // The peer keeps streaming instead of closing: the discard
+        // drain eats its segment — the zombie window-stays-open case —
+        // and the socket still survives while grace has not elapsed.
+        let data = seg_v4_data(
+            client,
+            target,
+            40000,
+            443,
+            101,
+            server_isn.wrapping_add(1),
+            0x18,
+            b"peer that never closes",
+        );
+        feed_tcp(&mut actor, 0, &data);
+        poll_once(&mut actor);
+        actor.service_tcp();
+        assert_eq!(actor.sockets.get::<tcp::Socket>(handle).recv_queue(), 0);
+        assert!(
+            actor.tcp.contains_key(&handle),
+            "inside the grace the socket must not be torn down"
+        );
+
+        // Grace expiry → abort: the flow is reaped and the abort's RST
+        // goes out on the next dispatch so the peer's stream stops.
+        actor.tcp.get_mut(&handle).expect("flow state").dead_since =
+            Some(Instant::now() - TCP_ORPHAN_GRACE);
+        actor.service_tcp();
+        assert!(
+            !actor.tcp.contains_key(&handle),
+            "the orphaned socket must be reaped once grace expires"
+        );
+
+        // The reap machinery finishes what the abort started — the
+        // `pending_close` → `dead_dying` deferred-erase chain
+        // `dead_flow_tuple_rebuild_survives_deferred_erase` pins: the
+        // RST dispatches on this poll while the socket is buried, the
+        // drain routes it through `tcp_dying`, and the next pass
+        // erases the dying/tuple entries together.
+        actor.poll_stack();
+        actor.drain_device_tx();
+        actor.poll_stack();
+        assert!(
+            !actor.tcp_dying.contains_key(&handle),
+            "the reaped flow's dying entry must be erased"
+        );
+        assert!(
+            !actor.tcp_by_tuple.contains_key(&key),
+            "the reaped flow's tuple mapping must be erased"
+        );
+        assert!(
+            actor.pending_close.is_empty() && actor.dead_dying.is_empty(),
+            "the deferred close bookkeeping must drain with the socket"
+        );
+    }
+
     /// F3 — the IPv4 `total_length` field bounds the L4 slice: bytes a
     /// buffer carries past it are link padding, not payload, and must
     /// not reach the demux/checksum path.
@@ -2651,14 +2827,17 @@ mod tests {
     }
 
     /// mac-perf regression (T1) — one service pass must emit more than a
-    /// single TCP segment per flow: smoltcp's `Interface::poll` egresses
-    /// at most one segment per socket per call, so the old single-poll
-    /// pass capped a bulk flow at ~1 segment per inner-RTT wake (~285
-    /// KB/s measured on a real peer). The pass now polls to
-    /// `PollResult::None` under `POLL_BURST`, so a queued multi-segment
-    /// write lands in `tx_queue` as one burst. The count is asserted
-    /// mid-service — `drain_device_tx` always empties `tx_queue`, so
-    /// between the poll and the drain is the only place it is visible.
+    /// single TCP segment per flow. Before smoltcp 0.13, `Interface::
+    /// poll` egressed at most one segment per socket per call, so the
+    /// old single-poll pass capped a bulk flow at ~1 segment per
+    /// inner-RTT wake (~285 KB/s measured on a real peer); 0.13's poll
+    /// drains socket egress internally, which makes this the smoke pin
+    /// that a queued multi-segment write lands in `tx_queue` as one
+    /// burst inside a pass. The count is asserted mid-service —
+    /// `drain_device_tx` always empties `tx_queue`, so between the
+    /// poll and the drain is the only place it is visible. The
+    /// poll-count budget itself is pinned in `meow-wgstack`'s
+    /// `poll_burst_budgeted` tests.
     #[tokio::test]
     async fn service_pass_egresses_a_segment_burst() {
         let mut actor = test_actor();

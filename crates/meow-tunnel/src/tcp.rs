@@ -1,12 +1,13 @@
 use crate::relay::{
-    copy_bidirectional_buf_tracked_splice_idle, proxy_conn_tcp_view, RELAY_BUF_SIZE,
+    copy_bidirectional_buf_tracked_wg, proxy_conn_tcp_view, proxy_conn_write_bytes_view,
+    RELAY_BUF_SIZE,
 };
 use crate::statistics::Statistics;
 use crate::tunnel::{MatchedRule, ResolvedTarget, TunnelInner, UsingProxy};
 use meow_common::conn_note;
 use meow_common::conn_notes::{self, ConnNotes};
 use meow_common::traffic_ledger::Route;
-use meow_common::{with_dial_timeout, Metadata, Proxy, ProxyAdapter, ProxyConn};
+use meow_common::{with_dial_timeout, Metadata, Proxy, ProxyAdapter, ProxyConn, WriteBytes};
 use smallvec::{smallvec, SmallVec};
 use smol_str::SmolStr;
 use std::sync::Arc;
@@ -448,6 +449,19 @@ fn inbound_tcp_view<C: std::any::Any>(conn: &C) -> Option<&tokio::net::TcpStream
     (conn as &dyn std::any::Any).downcast_ref()
 }
 
+/// The inbound's owned-`Bytes` write path when the listener hands over a
+/// boxed [`ProxyConn`] that has one — WireGuard's `WgStream`, boxed by the
+/// WG listener (`meow-listener/src/wireguard/actor.rs`) — so the relay can
+/// move its bulk buffer into the conn without `copy_from_slice`
+/// (perf-7 P7-1). Anything else — bare sockets, the remote's `dyn
+/// ProxyConn` — answers `None` and the direction stays on `poll_write`
+/// or splice.
+fn inbound_write_bytes_view<C: 'static>(conn: &mut C) -> Option<&mut dyn WriteBytes> {
+    (conn as &mut dyn std::any::Any)
+        .downcast_mut::<Box<dyn ProxyConn>>()
+        .and_then(|c| c.write_bytes())
+}
+
 async fn route_inbound_tcp_scoped<C>(
     inner: &TunnelInner,
     conn: &mut C,
@@ -569,12 +583,13 @@ async fn route_inbound_tcp_scoped<C>(
                             .stats
                             .record_upload(&up, prefix.len() as meow_common::atomic::Int);
                     }
-                    match copy_bidirectional_buf_tracked_splice_idle(
+                    match copy_bidirectional_buf_tracked_wg(
                         conn,
                         &mut *remote,
                         &mut buf_up,
                         &mut buf_dn,
                         (inbound_tcp_view, proxy_conn_tcp_view),
+                        (inbound_write_bytes_view, proxy_conn_write_bytes_view),
                         |n| {
                             inner
                                 .stats

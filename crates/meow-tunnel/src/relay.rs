@@ -33,8 +33,18 @@
 //   pipe to socket without copying them through userspace, which is how the
 //   Go runtime relays TCP to TCP. Callers opt in through
 //   [`copy_bidirectional_buf_tracked_splice`] and a [`TcpView`] per endpoint.
+//
+// Owned-Bytes writers (perf-7 P7-1):
+//   A channel-backed conn — WireGuard's `WgStream`, the only current kind —
+//   carries `Bytes` items to its actor, so copying the relay fill into a
+//   fresh `Bytes` on every `poll_write` was a pure-overhead memcpy. Through
+//   [`copy_bidirectional_buf_tracked_wg`] and its [`WriteBytesView`] probes,
+//   a direction whose writer exposes [`WriteBytes`] bulk-relays through a
+//   64 KiB `BytesMut`: reads fill uninitialised spare capacity, each fill
+//   freezes into a `Bytes` that moves into the writer untouched.
 
-use meow_common::ProxyConn;
+use bytes::{Bytes, BytesMut};
+use meow_common::{ProxyConn, WriteBytes};
 use std::future::{poll_fn, Future};
 use std::io;
 use std::pin::Pin;
@@ -42,6 +52,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
+use tokio_util::io::poll_read_buf;
 
 /// Buffer size used for each relay direction at connection setup.
 /// 4 KiB halves the tokio default (8 KiB) to save 8 KiB/conn at the
@@ -64,6 +75,23 @@ pub const RELAY_BUF_SIZE: usize = 4 * 1024;
 /// past HP-1's warmup window and amortizes to ~0.0001 allocations per
 /// iteration over its 10k-iteration budget (ADR-0008 §3 threshold 0.5).
 const RELAY_BULK_BUF_SIZE: usize = 32 * 1024;
+
+/// The bulk scratch for a direction whose writer takes owned `Bytes`
+/// (perf-7 P7-1): WireGuard's `WgStream`, which enqueues the `Bytes` for
+/// its pump actor with no copy. 64 KiB matches a full `TCP_READ_CHUNK`
+/// arriving back from the pump in one channel hop and a full read per
+/// relay cycle — larger is pointless since the pump read side chunks at
+/// 64 KiB anyway. Only the `Scratch::BytesMut` variant uses it; the
+/// global `RELAY_BULK_BUF_SIZE` is unchanged so non-WG conns keep the
+/// 32 KiB footprint.
+///
+/// Memory: one 64 KiB `BytesMut` per bulk WG direction vs the 32 KiB
+/// `Owned` it replaces (+64 KiB per WG conn across both directions).
+/// While a frozen `Bytes` still sits in the stream's channel, the next
+/// fill allocates a second 64 KiB rather than reclaiming — bounded by
+/// the stream's channel depth, same worst-case shape as the copied
+/// path's per-item allocations.
+const RELAY_BULK_BUF_SIZE_WG: usize = 64 * 1024;
 
 /// Bytes a direction must relay before its scratch buffer is upgraded to
 /// [`RELAY_BULK_BUF_SIZE`]. Typical request/response exchanges stay below
@@ -139,25 +167,62 @@ pub fn proxy_conn_tcp_view(conn: &dyn ProxyConn) -> Option<&TcpStream> {
     conn.tcp_stream()
 }
 
+/// The owned-`Bytes` write path behind a relay endpoint, when it has one
+/// (perf-7 P7-1) — the write-side counterpart of [`TcpView`]. A direction
+/// whose writer answers `Some` here relays bulk traffic through
+/// `BytesMut` → `Bytes` ownership transfer instead of `poll_write` on a
+/// borrowed slice — the `Bytes` moves into the writer (WireGuard's
+/// `WgStream`, which channels it to the pump) without a `copy_from_slice`.
+pub type WriteBytesView<T> = for<'x> fn(&'x mut T) -> Option<&'x mut dyn WriteBytes>;
+
+/// [`WriteBytesView`] of a dialed connection: `Some` only when the
+/// adapter's conn exposes an owned-`Bytes` write path, see
+/// [`ProxyConn::write_bytes`].
+///
+/// The explicit `+ 'static` object bound matches `Box<dyn ProxyConn>`'s —
+/// a `&mut dyn Trait` infers the borrow's lifetime instead, which is not
+/// the `WriteBytesView<dyn ProxyConn>` shape the call site passes.
+pub fn proxy_conn_write_bytes_view<'a>(
+    conn: &'a mut (dyn ProxyConn + 'static),
+) -> Option<&'a mut (dyn WriteBytes + 'a)> {
+    conn.write_bytes()
+}
+
 /// Per-direction scratch storage: the caller's stack array until the
-/// direction proves bulk, then a one-time owned upgrade (#386), or a splice
-/// pipe when both of its endpoints are bare sockets.
+/// direction proves bulk, then a one-time owned upgrade (#386), a splice
+/// pipe when both of its endpoints are bare sockets, or a `BytesMut`
+/// when the writer accepts owned `Bytes` (perf-7 P7-1).
 enum Scratch<'buf> {
     Borrowed(&'buf mut [u8]),
     Owned(Box<[u8]>),
     #[cfg(any(target_os = "linux", target_os = "android"))]
     Pipe(splice::Pipe),
+    /// WG zero-copy path: reads land in the `BytesMut`'s uninitialized
+    /// spare capacity; each fill is `split_to().freeze()`d into a `Bytes`
+    /// that moves into the writer via [`WriteBytes::poll_write_bytes`]
+    /// with no `copy_from_slice`. The `Option<Bytes>` slot holds the
+    /// frozen bytes the stream did not accept on the last poll — the
+    /// caller retains ownership across `Pending` (see the `WriteBytes`
+    /// contract), which is what keeps the write arm driving the retry.
+    BytesMut(BytesMut, Option<Bytes>),
 }
 
-/// The bulk tier for a direction (#386): a splice pipe when the platform
-/// has `splice(2)` and both endpoints are bare sockets, otherwise (or when
-/// the pipe cannot be created, e.g. at the fd limit) the owned
-/// [`RELAY_BULK_BUF_SIZE`] buffer.
+/// The bulk tier for a direction (#386, perf-7 P7-1): a `BytesMut`
+/// scratch when the writer accepts owned `Bytes`, else a splice pipe
+/// when the platform has `splice(2)` and both endpoints are bare sockets,
+/// otherwise (or when the pipe cannot be created, e.g. at the fd limit)
+/// the owned [`RELAY_BULK_BUF_SIZE`] buffer.
 fn bulk_scratch<'buf, R: ?Sized, W: ?Sized>(
     reader: &R,
-    writer: &W,
+    writer: &mut W,
     views: Option<(TcpView<R>, TcpView<W>)>,
+    wb_writer: Option<WriteBytesView<W>>,
 ) -> Scratch<'buf> {
+    if let Some(view) = wb_writer {
+        if view(writer).is_some() {
+            return Scratch::BytesMut(BytesMut::with_capacity(RELAY_BULK_BUF_SIZE_WG), None);
+        }
+    }
     #[cfg(any(target_os = "linux", target_os = "android"))]
     if let Some((reader_tcp, writer_tcp)) = views {
         if reader_tcp(reader).is_some() && writer_tcp(writer).is_some() {
@@ -228,12 +293,15 @@ impl<'buf> HalfCopy<'buf> {
     ///
     /// `views` find the reader's and writer's sockets for the splice tier;
     /// in pipe mode `pos..cap` counts the bytes sitting in the pipe.
+    /// `wb_writer` probes the writer's owned-`Bytes` path at tier upgrade
+    /// and re-resolves it inside the `BytesMut` write arm.
     fn poll_cycle<R, W, F>(
         &mut self,
         cx: &mut Context<'_>,
         reader: &mut R,
         writer: &mut W,
         views: Option<(TcpView<R>, TcpView<W>)>,
+        wb_writer: Option<WriteBytesView<W>>,
         on_progress: &mut F,
     ) -> io::Result<Cycle>
     where
@@ -248,7 +316,7 @@ impl<'buf> HalfCopy<'buf> {
             // pipe) per bulk direction for the connection's remaining lifetime.
             if let Scratch::Borrowed(buf) = &self.buf {
                 if wants_bulk_upgrade(self.amt, buf.len()) {
-                    self.buf = bulk_scratch(&*reader, &*writer, views);
+                    self.buf = bulk_scratch(&*reader, &mut *writer, views, wb_writer);
                 }
             }
             let read = match &mut self.buf {
@@ -259,6 +327,25 @@ impl<'buf> HalfCopy<'buf> {
                     Some(src) => pipe.poll_fill(cx, src),
                     None => Poll::Ready(Err(splice::lost_socket())),
                 },
+                Scratch::BytesMut(bm, _) => {
+                    // Restore the read window to the full buffer: after
+                    // `split_to` moved the last fill's prefix into a
+                    // `Bytes`, `bm` is the empty tail of the same
+                    // allocation. `try_reclaim` re-widens it once every
+                    // shipped `Bytes` is gone downstream (the steady
+                    // state: one allocation for the whole direction);
+                    // while a `Bytes` is still queued in the stream's
+                    // channel this allocates instead — the same one
+                    // allocation per fill `copy_from_slice` paid, minus
+                    // the copy. `poll_read_buf` fills uninitialized
+                    // spare — no per-fill memset.
+                    if bm.capacity() - bm.len() < RELAY_BULK_BUF_SIZE_WG
+                        && !bm.try_reclaim(RELAY_BULK_BUF_SIZE_WG)
+                    {
+                        bm.reserve(RELAY_BULK_BUF_SIZE_WG);
+                    }
+                    poll_read_buf(Pin::new(&mut *reader), cx, bm)
+                }
             };
             match read {
                 Poll::Ready(Ok(0)) => self.read_done = true,
@@ -296,6 +383,41 @@ impl<'buf> HalfCopy<'buf> {
                     Some(dst) => pipe.poll_drain(cx, dst, self.cap - self.pos),
                     None => Poll::Ready(Err(splice::lost_socket())),
                 },
+                Scratch::BytesMut(bm, pending) => {
+                    // Freeze this fill into a `Bytes` — a refcount bump on
+                    // the same allocation, not a copy — then move it into
+                    // the writer. `pos` does NOT advance at freeze time:
+                    // the bytes are unwritten until the stream accepts
+                    // them, and `pos < cap` is what keeps this arm (and so
+                    // the retry) live on later polls while the caller-held
+                    // `pending` slot carries the item across `Pending`s.
+                    if pending.is_none() {
+                        *pending = Some(bm.split_to(self.cap - self.pos).freeze());
+                    }
+                    let n = pending.as_ref().map_or(0, Bytes::len);
+                    // The scratch only exists because the probe answered
+                    // `Some` at tier upgrade; like the pipe arm's
+                    // `lost_socket()`, a view that stops resolving is a
+                    // hard error, never a silent fallback (the `pending`
+                    // bytes must not move to a different write path).
+                    let Some(view) = wb_writer else {
+                        return Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "BytesMut scratch without a WriteBytes probe",
+                        ));
+                    };
+                    let Some(wb) = view(&mut *writer) else {
+                        return Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "writer lost its WriteBytes path mid-direction",
+                        ));
+                    };
+                    match Pin::new(wb).poll_write_bytes(cx, pending) {
+                        Poll::Ready(Ok(())) => Poll::Ready(Ok(n)),
+                        Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                        Poll::Pending => Poll::Pending,
+                    }
+                }
             };
             match written {
                 Poll::Ready(Ok(0)) => {
@@ -375,7 +497,7 @@ where
     FB: FnMut(u64),
 {
     relay(
-        a, b, buf_a_to_b, buf_b_to_a, None, on_a_to_b, on_b_to_a, None,
+        a, b, buf_a_to_b, buf_b_to_a, None, None, on_a_to_b, on_b_to_a, None,
     )
     .await
 }
@@ -410,6 +532,7 @@ where
         b,
         buf_a_to_b,
         buf_b_to_a,
+        None,
         None,
         on_a_to_b,
         on_b_to_a,
@@ -446,6 +569,7 @@ where
         buf_a_to_b,
         buf_b_to_a,
         Some(views),
+        None,
         on_a_to_b,
         on_b_to_a,
         None,
@@ -482,6 +606,50 @@ where
         buf_a_to_b,
         buf_b_to_a,
         Some(views),
+        None,
+        on_a_to_b,
+        on_b_to_a,
+        idle_timeout,
+    )
+    .await
+}
+
+/// [`copy_bidirectional_buf_tracked_splice_idle`] plus owned-`Bytes`
+/// writers (perf-7 P7-1): `wb_views` (for `a`, then `b`) probe each
+/// endpoint's `WriteBytes` path. A direction whose writer answers `Some`
+/// bulk-relays through `BytesMut` → `Bytes` ownership transfer — the
+/// `Bytes` moves into the writer with no `copy_from_slice` — instead of
+/// the splice pipe or the owned buffer. This is the entry the WireGuard
+/// routing paths use; every other caller keeps
+/// [`copy_bidirectional_buf_tracked_splice_idle`].
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors copy_bidirectional_buf_tracked_splice_idle; wb_views cannot be folded into views (mut probes vs shared probes)"
+)]
+pub async fn copy_bidirectional_buf_tracked_wg<A, B, FA, FB>(
+    a: &mut A,
+    b: &mut B,
+    buf_a_to_b: &mut [u8],
+    buf_b_to_a: &mut [u8],
+    views: (TcpView<A>, TcpView<B>),
+    wb_views: (WriteBytesView<A>, WriteBytesView<B>),
+    on_a_to_b: FA,
+    on_b_to_a: FB,
+    idle_timeout: Option<Duration>,
+) -> io::Result<(u64, u64)>
+where
+    A: AsyncRead + AsyncWrite + Unpin + ?Sized,
+    B: AsyncRead + AsyncWrite + Unpin + ?Sized,
+    FA: FnMut(u64),
+    FB: FnMut(u64),
+{
+    relay(
+        a,
+        b,
+        buf_a_to_b,
+        buf_b_to_a,
+        Some(views),
+        Some(wb_views),
         on_a_to_b,
         on_b_to_a,
         idle_timeout,
@@ -491,7 +659,7 @@ where
 
 #[allow(
     clippy::too_many_arguments,
-    reason = "idle_timeout added this PR; a relay-options struct would be the right refactor but is out of scope here"
+    reason = "wb_views added for perf-7 P7-1; a relay-options struct would be the right refactor but is out of scope here"
 )]
 async fn relay<A, B, FA, FB>(
     a: &mut A,
@@ -499,6 +667,7 @@ async fn relay<A, B, FA, FB>(
     buf_a_to_b: &mut [u8],
     buf_b_to_a: &mut [u8],
     views: Option<(TcpView<A>, TcpView<B>)>,
+    wb_views: Option<(WriteBytesView<A>, WriteBytesView<B>)>,
     mut on_a_to_b: FA,
     mut on_b_to_a: FB,
     idle_timeout: Option<Duration>,
@@ -510,6 +679,9 @@ where
     FB: FnMut(u64),
 {
     let views_b_to_a = views.map(|(a_tcp, b_tcp)| (b_tcp, a_tcp));
+    // Direction b→a reads `b` and writes `a`: the writer probe it needs is
+    // `a`'s — symmetric with `views_b_to_a` above.
+    let wb_views_b_to_a = wb_views.map(|(a_wb, b_wb)| (b_wb, a_wb));
     let mut a_to_b = HalfCopy::new(buf_a_to_b);
     let mut b_to_a = HalfCopy::new(buf_b_to_a);
     let mut a_done = false;
@@ -566,7 +738,14 @@ where
             let mut progressed = false;
 
             if !a_done && !a_parked {
-                match a_to_b.poll_cycle(cx, &mut *a, &mut *b, views, &mut on_a_to_b) {
+                match a_to_b.poll_cycle(
+                    cx,
+                    &mut *a,
+                    &mut *b,
+                    views,
+                    wb_views.map(|(_, b_wb)| b_wb),
+                    &mut on_a_to_b,
+                ) {
                     Ok(Cycle::Done) => a_done = true,
                     Ok(Cycle::Progress) => {
                         progressed = true;
@@ -580,7 +759,14 @@ where
             }
 
             if !b_done && !b_parked {
-                match b_to_a.poll_cycle(cx, &mut *b, &mut *a, views_b_to_a, &mut on_b_to_a) {
+                match b_to_a.poll_cycle(
+                    cx,
+                    &mut *b,
+                    &mut *a,
+                    views_b_to_a,
+                    wb_views_b_to_a.map(|(_, a_wb)| a_wb),
+                    &mut on_b_to_a,
+                ) {
                     Ok(Cycle::Done) => b_done = true,
                     Ok(Cycle::Progress) => {
                         progressed = true;
@@ -1427,5 +1613,145 @@ mod tests {
 
         peer.await.unwrap();
         assert_eq!((up, down), (4, 0));
+    }
+
+    // ── perf-7 P7-1: owned-Bytes (WG) bulk path ─────────────────
+
+    /// A writer double that takes owned `Bytes`: the stand-in for
+    /// `WgStream` on this side of the crate boundary. Everything a
+    /// `poll_write_bytes` accepts lands in `received` — pointer identity
+    /// is what the tests assert on.
+    #[derive(Default)]
+    struct BytesSink {
+        received: Vec<Bytes>,
+    }
+
+    impl AsyncWrite for BytesSink {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.received.push(Bytes::copy_from_slice(buf));
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl WriteBytes for BytesSink {
+        fn poll_write_bytes(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            bytes: &mut Option<Bytes>,
+        ) -> Poll<io::Result<()>> {
+            let Some(b) = bytes.take() else {
+                return Poll::Ready(Ok(()));
+            };
+            self.received.push(b);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "the WriteBytesView<W> probe signature requires Option"
+    )]
+    fn bytes_sink_view(s: &mut BytesSink) -> Option<&mut dyn WriteBytes> {
+        Some(s)
+    }
+
+    /// P7-1: a writer with no `WriteBytes` probe — `DuplexStream`, the
+    /// shape every non-WG conn takes — answers `None` and keeps the
+    /// copied `Scratch::Owned` bulk buffer: the old path is untouched.
+    #[test]
+    fn write_bytes_any_returns_none_for_duplex() {
+        fn no_write_bytes<T>(_: &mut T) -> Option<&mut dyn WriteBytes> {
+            None
+        }
+        let (a_side, mut b_side) = duplex(64);
+        assert!(no_write_bytes(&mut b_side).is_none());
+        match bulk_scratch(
+            &a_side,
+            &mut b_side,
+            None,
+            Some(no_write_bytes::<tokio::io::DuplexStream>),
+        ) {
+            Scratch::Owned(_) => {}
+            Scratch::BytesMut(..) => {
+                panic!("a writer without WriteBytes must keep the Owned scratch")
+            }
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            Scratch::Pipe(_) => panic!("no sockets in play — a pipe is impossible"),
+            Scratch::Borrowed(_) => unreachable!("bulk_scratch never returns Borrowed"),
+        }
+    }
+
+    /// P7-1: a `WriteBytes`-capable writer upgrades to `Scratch::BytesMut`
+    /// sized exactly `RELAY_BULK_BUF_SIZE_WG` — the WG 64 KiB bulk buffer.
+    #[test]
+    fn relay_wg_bulk_buf_is_64k() {
+        let (a_side, _unused) = duplex(64);
+        let mut sink = BytesSink::default();
+        match bulk_scratch(&a_side, &mut sink, None, Some(bytes_sink_view)) {
+            Scratch::BytesMut(bm, _) => {
+                assert_eq!(bm.capacity(), RELAY_BULK_BUF_SIZE_WG);
+            }
+            _ => panic!("a WriteBytes writer must get the BytesMut scratch"),
+        }
+    }
+
+    /// P7-1: the `Bytes` the writer receives IS the relay's `BytesMut`
+    /// allocation — `split_to().freeze()` gives it a refcount on the same
+    /// storage, so `bm`'s remaining tail starts exactly `n` bytes past the
+    /// shipped `Bytes`' pointer. A `copy_from_slice` anywhere in between
+    /// would hand the writer a different allocation and break this.
+    #[tokio::test]
+    async fn relay_wg_bytes_not_copied() {
+        use tokio::io::AsyncWriteExt;
+
+        let payload = vec![0xABu8; 8192];
+        let (mut rd, mut wr) = duplex(payload.len());
+        wr.write_all(&payload).await.unwrap();
+
+        let mut sink = BytesSink::default();
+        let mut buf = [0u8; RELAY_BUF_SIZE];
+        let mut hc = HalfCopy::new(&mut buf);
+        // Jump straight to the BytesMut tier — `bulk_scratch` is the code
+        // the real upgrade path runs, the 128 KiB warm-up only gates WHEN.
+        hc.buf = bulk_scratch(&rd, &mut sink, None, Some(bytes_sink_view));
+
+        // One poll cycle with the fill already readable — the read arm
+        // never parks, so a oneshot cx drives it to completion.
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let cycle = hc
+            .poll_cycle(
+                &mut cx,
+                &mut rd,
+                &mut sink,
+                None,
+                Some(bytes_sink_view),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert!(matches!(cycle, Cycle::Progress | Cycle::Done));
+
+        assert_eq!(sink.received.len(), 1, "one fill → one Bytes");
+        let received = sink.received.pop().unwrap();
+        assert_eq!(&received[..], &payload[..], "payload intact");
+        match &hc.buf {
+            Scratch::BytesMut(bm, _) => {
+                assert_eq!(
+                    bm.as_ptr() as usize,
+                    received.as_ptr() as usize + received.len(),
+                    "the shipped Bytes and bm's tail share one allocation"
+                );
+            }
+            _ => unreachable!("checked above"),
+        }
     }
 }

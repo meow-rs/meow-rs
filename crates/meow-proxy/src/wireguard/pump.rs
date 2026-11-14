@@ -3,11 +3,17 @@
 //! `Device` between them, and the endpoint UDP socket to the WG peer.
 //!
 //! Spec §3/§4.5: smoltcp's `Interface`/`SocketSet` are confined to one
-//! dedicated `std::thread` running a current-thread tokio runtime (the
-//! hysteria2/quiche non-`Send` precedent). Everything cross-thread travels
-//! over tokio mpsc channels: [`ActorMsg`] for dial/bind/shutdown, per-conn
-//! channels for stream/datagram payload, and a shared `Notify` a conn
-//! pulses after enqueueing so a sleeping pump picks the item up at once.
+//! actor *task* on the shared runtime (perf-7 P7-2). The dedicated
+//! `std::thread` + current-thread runtime this replaced was a hysteria2/
+//! quiche precedent — `quiche::Connection` holds a `*mut` FFI handle and
+//! is `!Send`; smoltcp 0.13's types are pure-Rust `Send`, so the thread
+//! bought nothing but an OS futex round-trip on every `Notify` nudge,
+//! which is the wake path's hot cost. `WgPump: Send` is proven at compile
+//! time below. Everything cross-task still travels over tokio mpsc
+//! channels: [`ActorMsg`] for dial/bind/shutdown, per-conn channels for
+//! stream/datagram payload, and a shared `Notify` a conn pulses after
+//! enqueueing so a sleeping pump picks the item up at once — now an
+//! in-runtime wake instead of a context switch.
 //!
 //! The actor owns `Tunn` outright — the loop itself is the serialization
 //! point, so there is no `Mutex<Tunn>` (deviation from spec §3.3, which
@@ -67,6 +73,25 @@ const TCP_READ_CHUNK: usize = 65536;
 /// this only bounds the smoltcp housekeeping cadence.
 const IDLE_SLEEP: Duration = Duration::from_millis(10);
 
+/// Worker-fairness bound on a *task* pump (perf-7 P7-2): one service pass
+/// is synchronous start to finish, so a flow moving this much payload in
+/// rolling accumulation yields the tokio worker once — sibling tasks
+/// (other adapters' pumps on the same worker among them) get scheduled.
+/// The counter rolls across passes, not per-pass: a steady 900 KB/pass
+/// flow still yields every ~1.2 passes rather than never. Every payload
+/// path counts — TCP and UDP socket service in both directions, inbound
+/// wire datagrams, sealed inner packets, flushed outbox datagrams — so
+/// no unbounded non-parking workload skips the yield.
+const SERVICE_YIELD_THRESHOLD: usize = 1024 * 1024;
+
+/// The byte counter's low-volume backstop: a flood of *small* datagrams
+/// moves little payload per pass yet still costs real work per pass
+/// (verify, crypto, bookkeeping), so a byte-only threshold would let a
+/// sustained small-packet flood pin a shared worker far longer than
+/// intended. Every pass counts — parked or not — which is coarser than
+/// "non-parking passes" but strictly stronger on the bounding side.
+const SERVICE_YIELD_PASS_LIMIT: usize = 32;
+
 /// Spec §3.7: a WG handshake that has not completed within 10 s fails all
 /// dials still waiting on it.
 const HANDSHAKE_DIAL_LIMIT: Duration = Duration::from_secs(10);
@@ -74,6 +99,17 @@ const HANDSHAKE_DIAL_LIMIT: Duration = Duration::from_secs(10);
 /// outer 30 s dial deadline (spec §4.2); the pump gives up one step earlier
 /// so the reply error beats the caller's timeout.
 const TCP_CONNECT_LIMIT: Duration = Duration::from_secs(25);
+
+/// Once a socket's owning conn is gone on both channel halves the flow has
+/// no consumer left. `conn_gone` can never enqueue `Close` once
+/// `graceful_close` holds — the FIN is already out and `TcpIo::Close` is
+/// deliberately suppressed so the peer's tail bytes survive — and a peer
+/// that never closes back pins the socket forever: smoltcp has no
+/// FinWait-2 timeout and `discard_socket_rx` keeps the receive window
+/// open, so the peer's stream keeps arriving to /dev/null. The grace
+/// covers the real teardown (FIN handshake, `out` flush at socket pace);
+/// a peer still open past it was never going to close.
+const TCP_ORPHAN_GRACE: Duration = Duration::from_secs(2);
 
 /// Floor between desync-triggered handshake initiations — WG's own
 /// REKEY_TIMEOUT (the wireguard paper's 5 s initiation-retry floor,
@@ -162,6 +198,11 @@ struct TcpState {
     /// conn-drop must not downgrade the close to `abort()` and RST the
     /// peer mid-drain.
     graceful_close: bool,
+    /// Armed when both conn channel halves report the flow task gone;
+    /// the [`TCP_ORPHAN_GRACE`] deadline after which the socket is
+    /// aborted regardless of `graceful_close` — the bound that keeps a
+    /// peer that never closes back from pinning the socket forever.
+    dead_since: Option<StdInstant>,
 }
 
 struct UdpState {
@@ -173,8 +214,11 @@ struct UdpState {
     local: SocketAddr,
 }
 
-/// The smoltcp/boringtun actor. Constructed inside [`spawn_pump`]'s thread
-/// so nothing smoltcp touches ever crosses a thread boundary.
+/// The smoltcp/boringtun actor. Constructed by [`spawn_pump`] *before*
+/// the `tokio::spawn` so init failures reach the caller's endpoint-
+/// fallback loop; the `Send` proof below is what makes the move into
+/// the task legal (spec §4.3's "nothing smoltcp touches crosses a task
+/// boundary" predates `Send` being proven).
 struct WgPump {
     name: String,
     tunn: Tunn,
@@ -237,7 +281,28 @@ struct WgPump {
     /// a flood arriving inside one handshake would push the floor's
     /// zero point past that handshake's completion.
     last_desync_kick: Option<StdInstant>,
+    /// Payload bytes the last service passes moved through the pump —
+    /// `send_slice` accepts and `recv` payloads on the socket paths,
+    /// inbound wire datagrams, sealed inner packets, flushed outbox
+    /// datagrams — accumulated rolling across passes. The `run()` loop
+    /// yields the worker once it crosses [`SERVICE_YIELD_THRESHOLD`],
+    /// so a saturated flow cannot pin a shared tokio worker through
+    /// back-to-back synchronous passes.
+    last_service_bytes: usize,
+    /// Passes serviced since the last yield — the backstop
+    /// [`SERVICE_YIELD_PASS_LIMIT`] trips on when per-pass payload is
+    /// too small for the byte counter to notice.
+    last_service_passes: usize,
 }
+
+// The pump rides the shared tokio worker pool (perf-7 P7-2): if any
+// field ever turns `!Send` — a `Rc`/`Cell`/raw pointer sneaking into a
+// smoltcp or boringtun type — this file stops compiling here, at zero
+// runtime cost. See the module docs for why `Send` holds.
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<WgPump>();
+};
 
 impl WgPump {
     fn new(
@@ -310,6 +375,8 @@ impl WgPump {
             udp_scratch: vec![0u8; inner_mtu],
             last_timer: StdInstant::now(),
             last_desync_kick: None,
+            last_service_bytes: 0,
+            last_service_passes: 0,
         })
     }
 
@@ -580,6 +647,10 @@ impl WgPump {
     fn drain_wire(&mut self) {
         let mut slots = std::mem::take(&mut self.rx_slots);
         let n = self.endpoint.recv_batch(&mut slots, WIRE_DRAIN_BUDGET);
+        // Wire bytes count toward the service-yield budget whether a
+        // datagram turns out DATA, handshake, or garbage — the verify +
+        // demux + crypto work below is paid per datagram either way.
+        self.last_service_bytes += slots[..n].iter().map(Vec::len).sum::<usize>();
 
         // Phase A — serial demux: DATA slots become jobs (the Vec
         // travels into the job); everything else is handled inline.
@@ -748,6 +819,7 @@ impl WgPump {
             // queues each inner packet and drives the handshake chain.
             let mut dst = self.take_scratch();
             while let Some(pkt) = self.device.tx_queue.pop_front() {
+                self.last_service_bytes += pkt.len();
                 // `Tunn::encapsulate` *panics* on an undersized dst —
                 // guard rather than trust the MTU accounting.
                 if pkt.len() + meow_wireguard::DATA_OVERHEAD_SZ > dst.len() {
@@ -782,6 +854,7 @@ impl WgPump {
         let mut jobs: Vec<TxCryptoJob> = Vec::with_capacity(n);
         for i in 0..n {
             let pkt = self.device.tx_queue.pop_front().expect("n was snapshotted");
+            self.last_service_bytes += pkt.len();
             if pkt.len() + meow_wireguard::DATA_OVERHEAD_SZ > self.scratch_len {
                 warn!(
                     "wireguard {}: dropping {}B inner packet (scratch buffer {}B)",
@@ -886,6 +959,19 @@ impl WgPump {
         }
     }
 
+    /// Whether the service loop owes the shared worker a yield —
+    /// `run()` consults this between passes. Two independent bounds so
+    /// *no* unbounded non-parking workload skips it: a rolling payload
+    /// count ([`SERVICE_YIELD_THRESHOLD`]) catches saturated bulk
+    /// flows, while a rolling pass count ([`SERVICE_YIELD_PASS_LIMIT`])
+    /// catches high-rate small-datagram floods whose per-pass payload
+    /// the byte counter barely notices but whose per-datagram work —
+    /// verify, demux, crypto — is real.
+    fn service_yield_due(&self) -> bool {
+        self.last_service_bytes >= SERVICE_YIELD_THRESHOLD
+            || self.last_service_passes >= SERVICE_YIELD_PASS_LIMIT
+    }
+
     /// Whether the desync floor permits another initiation: the first
     /// error always may; later ones wait [`DESYNC_KICK_INTERVAL`] out.
     /// The in-flight dedup stays inside `format_handshake_initiation(_,
@@ -934,6 +1020,7 @@ impl WgPump {
                 let refs: Vec<&[u8]> = staged.iter().map(Vec::as_slice).collect();
                 let sent = self.endpoint.send_batch(&refs, self.endpoint_addr);
                 for pkt in staged.drain(..sent) {
+                    self.last_service_bytes += pkt.len();
                     self.return_scratch(pkt);
                 }
                 if staged.is_empty() {
@@ -941,7 +1028,10 @@ impl WgPump {
                 }
                 let pkt = staged.pop_front().expect("non-empty after partial batch");
                 match self.endpoint.try_send(&pkt) {
-                    Ok(_) => self.return_scratch(pkt),
+                    Ok(_) => {
+                        self.last_service_bytes += pkt.len();
+                        self.return_scratch(pkt);
+                    }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         // Requeue the rest of the batch ahead of
                         // whatever the outbox already held, then the
@@ -1060,6 +1150,7 @@ impl WgPump {
                 pending_read: VecDeque::new(),
                 eof_sent: false,
                 graceful_close: false,
+                dead_since: None,
             },
         );
     }
@@ -1270,6 +1361,7 @@ impl WgPump {
                                 break;
                             }
                             Ok(n) => {
+                                self.last_service_bytes += n;
                                 b.advance(n);
                                 if b.is_empty() {
                                     st.out.pop_front();
@@ -1313,20 +1405,38 @@ impl WgPump {
             while socket.can_recv() && st.pending_read.is_empty() {
                 let chunk = socket.recv(|data| {
                     let n = data.len().min(TCP_READ_CHUNK);
+                    // STRUCTURAL COPY (perf-7 memcpy #6): smoltcp's `recv`
+                    // closure yields a `&[u8]` view of the socket's ring
+                    // buffer; its lifetime is bound to the SocketSet
+                    // borrow, so the bytes cannot be moved, taken, or
+                    // handed to the conn channel — only copied out.
+                    // Elimination needs a smoltcp owned-buffer take API
+                    // (e.g. `recv_owned(&mut self) -> Bytes`), which
+                    // smoltcp 0.13.1 does not provide. Do NOT replace with
+                    // an unsafe pointer cast: smoltcp's buffer management
+                    // assumes the closure never retains the slice.
                     (n, StreamEvent::Data(Bytes::copy_from_slice(&data[..n])))
                 });
                 match chunk {
-                    Ok(ev) => match st.read_tx.try_send(ev) {
-                        Ok(()) => {}
-                        Err(mpsc::error::TrySendError::Full(ev)) => {
-                            st.pending_read.push_back(ev);
-                            break;
+                    Ok(ev) => {
+                        // Count the payload toward the service-yield budget
+                        // whether or not the conn channel takes it — the
+                        // smoltcp→conn copy already happened.
+                        if let StreamEvent::Data(b) = &ev {
+                            self.last_service_bytes += b.len();
                         }
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                            Self::discard_socket_rx(st, socket);
-                            break;
+                        match st.read_tx.try_send(ev) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(ev)) => {
+                                st.pending_read.push_back(ev);
+                                break;
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                Self::discard_socket_rx(st, socket);
+                                break;
+                            }
                         }
-                    },
+                    }
                     Err(_) => break,
                 }
             }
@@ -1344,6 +1454,29 @@ impl WgPump {
                 match st.read_tx.try_send(StreamEvent::Closed) {
                     Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => st.eof_sent = true,
                     Err(mpsc::error::TrySendError::Full(_)) => {}
+                }
+            }
+            // Orphan bound: both channel halves closed means the flow
+            // task released the stream entirely — the socket's output
+            // has no consumer and its input is discard-drained. Unlike
+            // `conn_gone` the arm needs no `write_rx.is_empty()`: a
+            // jammed closed channel is equally dead, and the grace
+            // abort covers it. Give a graceful close the grace to
+            // finish, then abort whatever is still open: without it a
+            // FinWait socket under a peer that keeps streaming lives
+            // until session teardown.
+            if st.write_rx.is_closed() && st.read_tx.is_closed() {
+                match st.dead_since {
+                    None => st.dead_since = Some(StdInstant::now()),
+                    Some(t) if t.elapsed() >= TCP_ORPHAN_GRACE => {
+                        debug!(
+                            "wireguard {}: TCP {handle:?} conn dead past grace (state {:?}) → abort",
+                            self.name,
+                            socket.state()
+                        );
+                        socket.abort();
+                    }
+                    _ => {}
                 }
             }
             if !socket.is_open() {
@@ -1392,6 +1525,7 @@ impl WgPump {
                     // make those unreachable; drop the datagram rather than
                     // wedge the queue behind a permanently-failing one.
                     Ok(()) | Err(_) => {
+                        self.last_service_bytes += data.len();
                         st.out.pop_front();
                     }
                 }
@@ -1399,7 +1533,17 @@ impl WgPump {
             while socket.can_recv() {
                 match socket.recv_slice(&mut self.udp_scratch) {
                     Ok((n, meta)) => {
+                        self.last_service_bytes += n;
                         let src = SocketAddr::new(meta.endpoint.addr.into(), meta.endpoint.port);
+                        // STRUCTURAL COPY (perf-7 memcpy #6, UDP twin of
+                        // the TCP `recv` note above): `recv_slice` fills
+                        // `udp_scratch` — the datagram lands in the pump's
+                        // scratch Vec — and the conn channel needs an
+                        // owned payload, so `copy_from_slice` is the hand
+                        // off. smoltcp 0.13.1 exposes no owned-buffer take
+                        // for UDP sockets either (`recv` yields the same
+                        // borrowed slice the TCP path shows). No unsafe
+                        // pointer casts — smoltcp owns the storage.
                         let data = Bytes::copy_from_slice(&self.udp_scratch[..n]);
                         // Full → drop: datagram loss is the UDP contract.
                         let _ = st.read_tx.try_send((data, src));
@@ -1459,9 +1603,11 @@ impl WgPump {
     }
 
     /// The interface-poll step of a service pass — its own method so
-    /// `run`'s poll and the T1 burst pin drive the exact same code: a
-    /// regression to one `iface.poll` per pass must fail that test,
-    /// not just prod.
+    /// `run`'s poll and the T1 burst pin drive the exact same code.
+    /// Under smoltcp 0.13 one `poll` drains socket egress internally,
+    /// so `poll_burst`'s extra iterations are the bounded-budget
+    /// backstop rather than the throughput path — the pin still wants
+    /// the production entry point, not a helper re-spelled.
     fn poll_stack(&mut self, now: SmolInstant) {
         // Burst, not a single poll. Before smoltcp 0.13 a socket
         // egressed at most one TCP segment per `poll`, so one call per
@@ -1479,22 +1625,56 @@ impl WgPump {
         self.flush_outbox();
         'outer: loop {
             // 1. endpoint → tunn → device (bounded nonblocking drain).
-            self.drain_wire();
+            //    `drain_wire`'s Phase-B crypto pass joins the pool's
+            //    resident workers on a blocking `mpsc::recv` while
+            //    holding the pool's pass mutex — a bare call would
+            //    park this shared tokio worker for the join's whole
+            //    duration, so the drain runs under `block_in_place`
+            //    (`run` only ever executes inside `spawn_pump`'s
+            //    `tokio::spawn` on the multi-thread runtime, the one
+            //    flavor where `block_in_place` is legal). The wrap
+            //    lives here rather than inside `drain_wire` because
+            //    tests drive the drain on current-thread runtimes,
+            //    where `block_in_place` panics.
+            tokio::task::block_in_place(|| self.drain_wire());
             // 2. mailbox drain.
             loop {
                 match self.rx.try_recv() {
                     Ok(ActorMsg::Shutdown) | Err(mpsc::error::TryRecvError::Disconnected) => {
                         break 'outer
                     }
+                    // The sole `ActorMsg` sender lives in `PumpHandle`,
+                    // so `is_closed` fires the moment the handle drops —
+                    // while queued items still drain ahead of the
+                    // `Disconnected` verdict. A dial drained now would
+                    // build a conn on a pump that exits this pass (dead
+                    // on arrival); dropping the item instead lets its
+                    // reply channel report the failure. This is the
+                    // full-mailbox hole `PumpHandle::drop`'s best-effort
+                    // `try_send(Shutdown)` leaves.
+                    Ok(_) if self.rx.is_closed() => break 'outer,
                     Ok(msg) => self.handle_msg(msg),
                     Err(mpsc::error::TryRecvError::Empty) => break,
                 }
             }
             // 3. conn queues, smoltcp poll, tunnel egress, WG timers.
             self.service_sockets();
+            // A service pass is synchronous end to end; on the shared
+            // worker pool a saturated flow would otherwise monopolise a
+            // thread between `select!` parks. Yield once per rolling MiB
+            // moved — or per pass limit, the low-volume backstop — so
+            // co-located tasks stay schedulable.
+            self.last_service_passes += 1;
+            if self.service_yield_due() {
+                tokio::task::yield_now().await;
+                self.last_service_bytes = 0;
+                self.last_service_passes = 0;
+            }
             let now = SmolInstant::now();
             self.poll_stack(now);
-            self.drain_device_tx();
+            // Same `block_in_place` wrap as `drain_wire` above — the
+            // seal pass's worker join must not park a shared worker.
+            tokio::task::block_in_place(|| self.drain_device_tx());
             if self.last_timer.elapsed() >= WG_TIMER_INTERVAL {
                 self.tick_timers();
                 self.last_timer = StdInstant::now();
@@ -1506,10 +1686,15 @@ impl WgPump {
                 biased;
                 msg = self.rx.recv() => match msg {
                     None | Some(ActorMsg::Shutdown) => break 'outer,
+                    // The dead-on-arrival guard above, on the parked
+                    // path: queued items that outlive the last sender
+                    // are refused, not serviced.
+                    Some(_) if self.rx.is_closed() => break 'outer,
                     Some(m) => self.handle_msg(m),
                 },
                 r = self.endpoint.recv(&mut self.recv_buf) => match r {
                     Ok(n) => {
+                        self.last_service_bytes += n;
                         // `decapsulate_wire` consumes the datagram
                         // buffer: a DATA packet decrypts in place and
                         // the buffer leaves with its plaintext `Bytes`,
@@ -1534,39 +1719,25 @@ impl WgPump {
     }
 }
 
-/// Spawn the pump thread for one WireGuard adapter. Everything smoltcp
-/// touches is built inside the thread (spec §4.3 Option A); only the
-/// `Send`-safe parts — the connected std socket, the config, the mailbox —
-/// cross over.
+/// Spawn the pump actor for one WireGuard adapter as a `tokio` task on
+/// the caller's runtime (perf-7 P7-2 — the dedicated `std::thread` +
+/// current-thread runtime it replaces was a `!Send` quiche precedent;
+/// smoltcp is `Send`, proven by the const assert above). The pump is
+/// built *synchronously* — `WgPump::new` failures (reactor
+/// registration, nonblocking setup) return `Err` here so the caller's
+/// endpoint-fallback loop can try the next resolved address, the
+/// contract `ensure_pump` has carried since the threaded pump.
+/// Needs a multi-thread runtime context twice over: `tokio::spawn`
+/// itself, and `run`'s `block_in_place` crypto joins — the production
+/// runtime is one.
 pub(crate) fn spawn_pump(
     config: &WireGuardConfig,
     std_sock: std::net::UdpSocket,
     endpoint_addr: SocketAddr,
-) -> std::io::Result<(mpsc::Sender<ActorMsg>, std::thread::JoinHandle<()>)> {
+) -> std::io::Result<(mpsc::Sender<ActorMsg>, tokio::task::JoinHandle<()>)> {
     let (tx, rx) = mpsc::channel::<ActorMsg>(ACTOR_MAILBOX);
-    let config = config.clone();
-    let thread_name = format!("wg-pump-{}", config.name);
-    let handle = std::thread::Builder::new()
-        .name(thread_name)
-        .spawn(move || {
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => {
-                    warn!("wireguard {}: tokio runtime build failed: {e}", config.name);
-                    return;
-                }
-            };
-            rt.block_on(async move {
-                match WgPump::new(&config, std_sock, endpoint_addr, rx) {
-                    Ok(pump) => pump.run().await,
-                    Err(e) => warn!("wireguard {}: pump init failed: {e}", config.name),
-                }
-            });
-        })?;
-    Ok((tx, handle))
+    let pump = WgPump::new(config, std_sock, endpoint_addr, rx)?;
+    Ok((tx, tokio::spawn(pump.run())))
 }
 
 /// `ProxyPacketConn` shim for a smoltcp UDP socket. `write_packet` enqueues
@@ -2654,6 +2825,319 @@ mod tests {
         );
     }
 
+    /// The other half of the zombie: the conn died *after* its FIN went
+    /// out (`graceful_close`), and the peer never closes back — it keeps
+    /// streaming into the discard drain. `conn_gone` can never enqueue
+    /// `Close` while `graceful_close` holds, and smoltcp's FinWait has
+    /// no timeout of its own, so without [`TCP_ORPHAN_GRACE`] the socket
+    /// outlives the whole session. The bound pins both sides of it: the
+    /// socket must survive inside the grace (a real close may still
+    /// complete) and must be aborted past it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn orphan_grace_aborts_socket_past_deadline() {
+        let client_secret = x25519::StaticSecret::from([0x79; 32]);
+        let server_public = x25519::PublicKey::from(&x25519::StaticSecret::from([0x80; 32]));
+        let mut pump = pump_for_test(&test_config(&client_secret, &server_public));
+
+        let (reply_tx, mut reply_rx) = oneshot::channel();
+        pump.dial_tcp("203.0.113.1:443".parse().unwrap(), "t".into(), reply_tx);
+        let handle = *pump.tcp.keys().next().unwrap();
+        let port = *pump.used_ports.iter().next().unwrap();
+
+        // SYN → SYN-ACK → Established, then the dial resolves.
+        pump.iface
+            .poll(SmolInstant::now(), &mut pump.device, &mut pump.sockets);
+        let syn = pump.device.tx_queue.back().expect("the dial emitted a SYN");
+        let local_port = u16::from_be_bytes([syn[20], syn[21]]);
+        let isn = u32::from_be_bytes(syn[24..28].try_into().unwrap());
+        let syn_ack = tcp_seg_v4(
+            "203.0.113.1".parse().unwrap(),
+            "10.0.0.2".parse().unwrap(),
+            443,
+            local_port,
+            5000,
+            isn.wrapping_add(1),
+            0x12,
+        );
+        pump.device.rx_queue.push_back(Bytes::from(syn_ack));
+        pump.iface
+            .poll(SmolInstant::now(), &mut pump.device, &mut pump.sockets);
+        assert_eq!(
+            pump.sockets.get::<tcp::Socket>(handle).state(),
+            tcp::State::Established
+        );
+        pump.service_sockets();
+        let mut conn = match reply_rx.try_recv() {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => panic!("dial failed: {e}"),
+            Err(e) => panic!("dial did not resolve in one pass: {e}"),
+        };
+
+        // Graceful half-close (FIN out), then the conn dies entirely —
+        // kill -9's shape when the kernel FIN'd the user socket before
+        // the flow task unwound.
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(
+            Pin::new(&mut *conn).poll_shutdown(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        pump.service_sockets(); // consumes Shutdown → close() + graceful_close
+        assert_eq!(
+            pump.sockets.get::<tcp::Socket>(handle).state(),
+            tcp::State::FinWait1
+        );
+        drop(conn); // read_rx + write_tx close — the conn is dead
+
+        // The first pass only arms the deadline: inside the grace the
+        // socket must survive — a real close may still be completing.
+        pump.service_sockets();
+        assert!(pump.tcp.contains_key(&handle));
+        assert!(pump.tcp[&handle].dead_since.is_some());
+
+        // The peer keeps streaming instead of closing: the discard
+        // drain eats its segment — the zombie window-stays-open case —
+        // and the socket still survives while grace has not elapsed.
+        let data = tcp_seg_v4_data(
+            "203.0.113.1".parse().unwrap(),
+            "10.0.0.2".parse().unwrap(),
+            443,
+            local_port,
+            5001,
+            isn.wrapping_add(1),
+            0x18,
+            b"peer that never closes",
+        );
+        pump.device.rx_queue.push_back(Bytes::from(data));
+        pump.iface
+            .poll(SmolInstant::now(), &mut pump.device, &mut pump.sockets);
+        pump.service_sockets();
+        assert_eq!(pump.sockets.get::<tcp::Socket>(handle).recv_queue(), 0);
+        assert!(
+            pump.tcp.contains_key(&handle),
+            "inside the grace the socket must not be torn down"
+        );
+
+        // Grace expiry → abort: the socket is reaped, the ephemeral
+        // port comes back, and the peer's stream actually stops — the
+        // socket is out of the set, so its next segment draws the
+        // no-socket RST from the iface.
+        pump.tcp.get_mut(&handle).expect("flow state").dead_since =
+            Some(StdInstant::now() - TCP_ORPHAN_GRACE);
+        pump.service_sockets();
+        assert!(
+            !pump.tcp.contains_key(&handle),
+            "the orphaned socket must be reaped once grace expires"
+        );
+        assert!(
+            !pump.used_ports.contains(&port),
+            "ephemeral port {port} leaked"
+        );
+        let late = tcp_seg_v4_data(
+            "203.0.113.1".parse().unwrap(),
+            "10.0.0.2".parse().unwrap(),
+            443,
+            local_port,
+            5010,
+            isn.wrapping_add(1),
+            0x18,
+            b"still streaming",
+        );
+        pump.device.rx_queue.push_back(Bytes::from(late));
+        pump.iface
+            .poll(SmolInstant::now(), &mut pump.device, &mut pump.sockets);
+        let tail = pump
+            .device
+            .tx_queue
+            .back()
+            .expect("a segment for a dead tuple must draw an RST");
+        assert_eq!(
+            tail[33] & 0x04,
+            0x04,
+            "the peer's next segment must be answered with an RST"
+        );
+    }
+
+    /// The jammed half of the bound: the conn dies with its write
+    /// channel still full — a peer that stopped ACKing pinned the
+    /// socket's tx buffer, `out` sits at the [`TCP_WRITE_QUEUE`] cap,
+    /// and the channel itself never drains. `conn_gone`'s `is_empty`
+    /// arm can never fire — no `Close` is enqueued — but a jammed
+    /// closed channel is exactly as dead as a drained one, so
+    /// `dead_since` must arm on `is_closed` alone, and past
+    /// [`TCP_ORPHAN_GRACE`] the socket is reaped all the same.
+    #[tokio::test(flavor = "current_thread")]
+    async fn conn_dropped_with_full_channel() {
+        let client_secret = x25519::StaticSecret::from([0x81; 32]);
+        let server_public = x25519::PublicKey::from(&x25519::StaticSecret::from([0x82; 32]));
+        let mut pump = pump_for_test(&test_config(&client_secret, &server_public));
+
+        let (reply_tx, mut reply_rx) = oneshot::channel();
+        pump.dial_tcp("203.0.113.1:443".parse().unwrap(), "t".into(), reply_tx);
+        let handle = *pump.tcp.keys().next().unwrap();
+        let port = *pump.used_ports.iter().next().unwrap();
+
+        // SYN → SYN-ACK → Established, then the dial resolves.
+        pump.iface
+            .poll(SmolInstant::now(), &mut pump.device, &mut pump.sockets);
+        let syn = pump.device.tx_queue.back().expect("the dial emitted a SYN");
+        let local_port = u16::from_be_bytes([syn[20], syn[21]]);
+        let isn = u32::from_be_bytes(syn[24..28].try_into().unwrap());
+        let syn_ack = tcp_seg_v4(
+            "203.0.113.1".parse().unwrap(),
+            "10.0.0.2".parse().unwrap(),
+            443,
+            local_port,
+            5000,
+            isn.wrapping_add(1),
+            0x12,
+        );
+        pump.device.rx_queue.push_back(Bytes::from(syn_ack));
+        pump.iface
+            .poll(SmolInstant::now(), &mut pump.device, &mut pump.sockets);
+        assert_eq!(
+            pump.sockets.get::<tcp::Socket>(handle).state(),
+            tcp::State::Established
+        );
+        pump.service_sockets();
+        let mut conn = match reply_rx.try_recv() {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => panic!("dial failed: {e}"),
+            Err(e) => panic!("dial did not resolve in one pass: {e}"),
+        };
+
+        // Jam the socket: a window's worth of payload fills the 1 MiB
+        // tx buffer and no ACK ever lands to drain it — the
+        // zero-window stand-in that holds `can_send` false forever.
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let window_fill = vec![0xAB; TCP_SOCKET_BUF];
+        assert!(matches!(
+            Pin::new(&mut *conn).poll_write(&mut cx, &window_fill),
+            Poll::Ready(Ok(_))
+        ));
+        pump.service_sockets();
+        assert!(
+            !pump.sockets.get::<tcp::Socket>(handle).can_send(),
+            "the full tx buffer must pin can_send — the jam's socket half"
+        );
+
+        // Fill `out` to the drain cap, then the channel itself: the
+        // backlog spans both queues — the shape a conn drop on a
+        // stalled socket leaves behind.
+        let chunk = [0xCD; 1024];
+        while matches!(
+            Pin::new(&mut *conn).poll_write(&mut cx, &chunk),
+            Poll::Ready(Ok(_))
+        ) {}
+        pump.service_sockets();
+        assert_eq!(
+            pump.tcp.get(&handle).expect("flow state").out.len(),
+            TCP_WRITE_QUEUE,
+            "`out` must sit at the cap so the channel can never drain"
+        );
+        while matches!(
+            Pin::new(&mut *conn).poll_write(&mut cx, &chunk),
+            Poll::Ready(Ok(_))
+        ) {}
+
+        // The conn dies mid-jam: its drop-side `Close` cannot even win
+        // a channel slot — both halves close with items still queued.
+        drop(conn);
+        pump.service_sockets();
+        let st = pump.tcp.get(&handle).expect("flow state");
+        assert!(
+            !st.write_rx.is_empty(),
+            "the jam must pin — a full channel can never go is_empty"
+        );
+        assert!(
+            st.out.iter().all(|io| matches!(io, TcpIo::Data(_))),
+            "conn_gone's is_empty arm must never have queued a Close"
+        );
+        assert!(
+            st.dead_since.is_some(),
+            "a jammed closed channel is equally dead — the arm needs no is_empty"
+        );
+
+        // Past the grace the socket is reaped anyway — state → dead,
+        // port released — exactly the drained-channel outcome.
+        pump.tcp.get_mut(&handle).expect("flow state").dead_since =
+            Some(StdInstant::now() - TCP_ORPHAN_GRACE);
+        pump.service_sockets();
+        assert!(
+            !pump.tcp.contains_key(&handle),
+            "the jammed orphan must be reaped once grace expires"
+        );
+        assert!(
+            !pump.used_ports.contains(&port),
+            "ephemeral port {port} leaked"
+        );
+    }
+
+    /// The negative half of the arm: a conn with both channel halves
+    /// still held is a live flow, not an orphan — even once its FIN is
+    /// out. `graceful_close` alone must never set `dead_since`; the
+    /// bound only exists for a conn that is actually gone.
+    #[tokio::test(flavor = "current_thread")]
+    async fn live_conn_does_not_arm_dead_since() {
+        let client_secret = x25519::StaticSecret::from([0x83; 32]);
+        let server_public = x25519::PublicKey::from(&x25519::StaticSecret::from([0x84; 32]));
+        let mut pump = pump_for_test(&test_config(&client_secret, &server_public));
+
+        let (reply_tx, mut reply_rx) = oneshot::channel();
+        pump.dial_tcp("203.0.113.1:443".parse().unwrap(), "t".into(), reply_tx);
+        let handle = *pump.tcp.keys().next().unwrap();
+
+        // SYN → SYN-ACK → Established, then the dial resolves.
+        pump.iface
+            .poll(SmolInstant::now(), &mut pump.device, &mut pump.sockets);
+        let syn = pump.device.tx_queue.back().expect("the dial emitted a SYN");
+        let local_port = u16::from_be_bytes([syn[20], syn[21]]);
+        let isn = u32::from_be_bytes(syn[24..28].try_into().unwrap());
+        let syn_ack = tcp_seg_v4(
+            "203.0.113.1".parse().unwrap(),
+            "10.0.0.2".parse().unwrap(),
+            443,
+            local_port,
+            5000,
+            isn.wrapping_add(1),
+            0x12,
+        );
+        pump.device.rx_queue.push_back(Bytes::from(syn_ack));
+        pump.iface
+            .poll(SmolInstant::now(), &mut pump.device, &mut pump.sockets);
+        pump.service_sockets();
+        let mut conn = match reply_rx.try_recv() {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => panic!("dial failed: {e}"),
+            Err(e) => panic!("dial did not resolve in one pass: {e}"),
+        };
+        assert!(
+            pump.tcp[&handle].dead_since.is_none(),
+            "an established conn is a live flow — nothing to arm"
+        );
+
+        // Graceful half-close: FIN out, `graceful_close` set — but the
+        // conn is still held, so both halves stay open and the arm
+        // must not fire on the close's shape alone.
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(
+            Pin::new(&mut *conn).poll_shutdown(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        pump.service_sockets();
+        assert_eq!(
+            pump.sockets.get::<tcp::Socket>(handle).state(),
+            tcp::State::FinWait1
+        );
+        assert!(
+            pump.tcp[&handle].graceful_close,
+            "the shutdown pass must have set graceful_close for this test to mean anything"
+        );
+        assert!(
+            pump.tcp[&handle].dead_since.is_none(),
+            "a live conn's FIN is not an orphan — dead_since stays unarmed"
+        );
+    }
+
     /// A `WgStream` parked on a full conn→pump channel waits on the
     /// channel's own capacity semaphore (`reserve_owned`), not a notify:
     /// once `service_sockets` moves the queued items into `out`, the
@@ -2932,11 +3416,14 @@ mod tests {
         p
     }
 
-    /// mac-perf T1, client side — the same single-poll ceiling as the
-    /// listener: one `Interface::poll` egresses at most one segment per
-    /// socket, so a queued bulk write must land in `tx_queue` as a
-    /// burst, not one segment per pass. The count is asserted between
-    /// the poll and `drain_device_tx` (which always empties the queue).
+    /// mac-perf T1, client side — the smoke half of the listener's
+    /// burst pin: a queued bulk write must land in `tx_queue` as a
+    /// multi-segment burst inside one service pass, not one segment
+    /// per pass. Under smoltcp 0.13 the drain happens inside a single
+    /// `poll`, so the pin is the post-pass segment count — asserted
+    /// between the poll and `drain_device_tx` (which always empties
+    /// the queue); the poll-count budget itself is pinned in
+    /// `meow-wgstack`'s `poll_burst_budgeted` tests.
     #[tokio::test(flavor = "current_thread")]
     async fn poll_burst_egresses_queued_segments() {
         let client_secret = x25519::StaticSecret::from([0x71; 32]);
@@ -3204,5 +3691,51 @@ mod tests {
                 "read-queue depth must cover the advertised window"
             );
         }
+    }
+
+    /// The service-yield contract is two independent bounds, not just
+    /// payload bytes: a flood of small datagrams moves little payload
+    /// per pass but still costs per-datagram work (verify, demux,
+    /// crypto), so the pass counter must trip `service_yield_due` on
+    /// its own — a byte-only gate would let that flood pin a shared
+    /// worker indefinitely.
+    #[tokio::test(flavor = "current_thread")]
+    async fn service_yield_has_a_pass_backstop() {
+        let client_secret = x25519::StaticSecret::from([0x81; 32]);
+        let server_public = x25519::PublicKey::from(&x25519::StaticSecret::from([0x82; 32]));
+        let mut pump = pump_for_test(&test_config(&client_secret, &server_public));
+
+        pump.last_service_bytes = SERVICE_YIELD_THRESHOLD;
+        assert!(pump.service_yield_due(), "the byte arm trips alone");
+        pump.last_service_bytes = 0;
+        assert!(!pump.service_yield_due());
+        pump.last_service_passes = SERVICE_YIELD_PASS_LIMIT;
+        assert!(
+            pump.service_yield_due(),
+            "the pass arm trips alone — the small-datagram backstop"
+        );
+    }
+
+    /// P7-2's `WgPump: Send` proof is the module-level `const _` assert
+    /// next to the struct — it fails compilation, so it can never go
+    /// stale silently. This test re-states it in-suite so a regression
+    /// also surfaces in `cargo test` output.
+    #[test]
+    fn _wg_pump_send_const_assert() {
+        fn assert_send<T: Send>() {}
+        assert_send::<WgPump>();
+    }
+
+    /// P7-3 §3.3: the `STRUCTURAL COPY` rationale blocks sit next to the
+    /// smoltcp receive sites they explain (TCP `recv` and UDP
+    /// `recv_slice`) — pin the anchors so the notes cannot rot away from
+    /// the code. Both copies are structural, not eliminated work.
+    #[test]
+    fn structural_recv_copy_comment_exists() {
+        let src = include_str!("pump.rs");
+        assert!(
+            src.matches("STRUCTURAL COPY").count() >= 2,
+            "TCP and UDP smoltcp-receive copies must each carry a STRUCTURAL COPY note"
+        );
     }
 }
