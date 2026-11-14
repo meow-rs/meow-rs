@@ -630,13 +630,18 @@ impl WgActor {
                         let crypto = self.table.peers()[peer_slot]
                             .tunn
                             .session_handle_for(receiver_idx);
-                        let mut job = CryptoJob::new(pkt, n, receiver_idx, counter, crypto);
                         // The job's own context tag — the post-pass
                         // lands each result on its (slot, source, peer)
                         // exactly, even if a lost chunk ever shifted
                         // the return positions.
-                        job.tag = ctxs.len();
-                        jobs.push(job);
+                        jobs.push(CryptoJob::new(
+                            pkt,
+                            n,
+                            receiver_idx,
+                            counter,
+                            crypto,
+                            ctxs.len(),
+                        ));
                         ctxs.push((i, src, peer_slot));
                     }
                     Verdict::Other {
@@ -968,14 +973,13 @@ impl WgActor {
                         );
                         continue;
                     }
-                    let mut job = TxCryptoJob::new(
+                    jobs.push(TxCryptoJob::new(
                         pkt.to_vec(),
                         self.take_scratch(),
                         handle.reserve_tx_counters(1),
-                        Some(handle),
-                    );
-                    job.tag = ctxs.len();
-                    jobs.push(job);
+                        handle,
+                        ctxs.len(),
+                    ));
                     ctxs.push(slot);
                 }
                 None => self.handle_inject(slot, &pkt),
@@ -1655,14 +1659,13 @@ impl WgActor {
                         self.device.return_tx_buf(pkt);
                         continue;
                     }
-                    let mut job = TxCryptoJob::new(
+                    jobs.push(TxCryptoJob::new(
                         pkt,
                         self.take_scratch(),
                         handle.reserve_tx_counters(1),
-                        Some(handle),
-                    );
-                    job.tag = ctxs.len();
-                    jobs.push(job);
+                        handle,
+                        ctxs.len(),
+                    ));
                     ctxs.push(slot);
                 }
                 None => {

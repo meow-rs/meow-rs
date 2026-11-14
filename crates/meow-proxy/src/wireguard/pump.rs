@@ -604,12 +604,17 @@ impl WgPump {
                     // `Arc` the session's crypto while `&mut self.tunn`
                     // is free — the job carries it to the worker.
                     let crypto = self.tunn.session_handle_for(receiver_idx);
-                    let mut job = CryptoJob::new(pkt, wire_len, receiver_idx, counter, crypto);
                     // The job's own context tag — the post-pass lands
                     // each result on its source slot exactly, even if a
                     // lost chunk ever shifted the return positions.
-                    job.tag = i;
-                    jobs.push(job);
+                    jobs.push(CryptoJob::new(
+                        pkt,
+                        wire_len,
+                        receiver_idx,
+                        counter,
+                        crypto,
+                        i,
+                    ));
                 }
                 WireClass::Other(packet) => {
                     self.handle_verified_wire(packet, &mut dst);
@@ -787,14 +792,13 @@ impl WgPump {
                 self.device.return_tx_buf(pkt);
                 continue;
             }
-            let mut job = TxCryptoJob::new(
+            jobs.push(TxCryptoJob::new(
                 pkt,
                 self.take_scratch(),
                 base + i as u64,
-                Some(crypto.clone()),
-            );
-            job.tag = i;
-            jobs.push(job);
+                crypto.clone(),
+                i,
+            ));
         }
 
         // Phase B — the batch's AEAD seals inside the job `wire` bufs.

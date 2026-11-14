@@ -81,14 +81,18 @@ pub struct CryptoJob {
 
 impl CryptoJob {
     /// Build a job from the classified DATA packet: `buf` is the owned
-    /// wire datagram, `wire_len` its bound, and `crypto` the
-    /// `Tunn::session_handle_for` result for `receiver_idx`.
+    /// wire datagram, `wire_len` its bound, `crypto` the
+    /// `Tunn::session_handle_for` result for `receiver_idx`, and `tag`
+    /// the caller's context index the post-pass maps the result back
+    /// through. `tag` is a constructor input — a defaulted tag would
+    /// silently map every forgotten job onto context 0.
     pub fn new(
         buf: Vec<u8>,
         wire_len: usize,
         receiver_idx: u32,
         counter: u64,
         crypto: Option<SessionHandle>,
+        tag: usize,
     ) -> Self {
         Self {
             buf,
@@ -96,7 +100,7 @@ impl CryptoJob {
             receiver_idx,
             counter,
             crypto,
-            tag: 0,
+            tag,
             result: None,
         }
     }
@@ -149,13 +153,19 @@ pub struct TxCryptoJob {
     /// wire header's counter field.
     counter: u64,
     /// The session's shared crypto, captured in Phase A through
-    /// `Tunn::current_session_handle`. `None` reports
-    /// `NoCurrentSession`, the same verdict `encapsulate` gives.
-    crypto: Option<SessionHandle>,
-    /// Caller-owned context tag — the same opaque-tag pattern as
-    /// [`CryptoJob::tag`]: a job position at the single-peer pump, a
-    /// `(peer_slot, i)` context index at the multi-peer listener. The
-    /// pool never reads or writes it.
+    /// `Tunn::current_session_handle`. Non-optional by contract —
+    /// unlike the RX [`CryptoJob`], a TX job is only built once the
+    /// caller confirmed a session exists: a peer with none takes the
+    /// serial `encapsulate` arm, where `queue_packet` + the handshake
+    /// chain live. `Option` here would encode a silent drop the serial
+    /// semantics never had, so a no-session caller cannot construct
+    /// this type at all.
+    crypto: SessionHandle,
+    /// Caller ctxs side-table dense index — the multi-peer listener's
+    /// `ctxs` slot whose peer this job's post-pass resolves (the
+    /// single-peer pump uses the job's own position). The same
+    /// opaque-tag pattern as [`CryptoJob::tag`]: the pool never reads
+    /// or writes it.
     pub tag: usize,
     /// `None` until a worker (or the serial shortcut) fills it: the
     /// wire length on success.
@@ -166,15 +176,24 @@ impl TxCryptoJob {
     /// Build a job from a drained inner packet: `inner` is the packet
     /// the caller owns (a `tx_queue` Vec or an inject copy), `wire` a
     /// fresh scratch buffer, `counter` one value out of the batch's
-    /// block reservation, and `crypto` the session handle Phase A
-    /// captured.
-    pub fn new(inner: Vec<u8>, wire: Vec<u8>, counter: u64, crypto: Option<SessionHandle>) -> Self {
+    /// block reservation, `crypto` the session handle Phase A
+    /// captured, and `tag` the caller's `ctxs` side-table index.
+    /// Both `crypto` and `tag` are constructor inputs — a no-session
+    /// job would silently drop where the serial semantics queue +
+    /// handshake, and a defaulted tag would silently map `ctxs[0]`.
+    pub fn new(
+        inner: Vec<u8>,
+        wire: Vec<u8>,
+        counter: u64,
+        crypto: SessionHandle,
+        tag: usize,
+    ) -> Self {
         Self {
             inner,
             wire,
             counter,
             crypto,
-            tag: 0,
+            tag,
             result: None,
         }
     }
@@ -187,18 +206,15 @@ impl TxCryptoJob {
     /// drain's Phase-A scratch check), reported `InvalidPacket` rather
     /// than panicking the pool.
     fn seal(&mut self) {
-        self.result = Some(match self.crypto.as_ref() {
-            Some(handle) => {
-                if self.inner.len() + DATA_OVERHEAD_SZ > self.wire.len() {
-                    Err(WireGuardError::InvalidPacket)
-                } else {
-                    let n = handle.seal_at(&self.inner, &mut self.wire, self.counter);
-                    debug_assert_eq!(n, self.inner.len() + DATA_OVERHEAD_SZ);
-                    self.wire.truncate(n);
-                    Ok(n)
-                }
-            }
-            None => Err(WireGuardError::NoCurrentSession),
+        self.result = Some(if self.inner.len() + DATA_OVERHEAD_SZ > self.wire.len() {
+            Err(WireGuardError::InvalidPacket)
+        } else {
+            let n = self
+                .crypto
+                .seal_at(&self.inner, &mut self.wire, self.counter);
+            debug_assert_eq!(n, self.inner.len() + DATA_OVERHEAD_SZ);
+            self.wire.truncate(n);
+            Ok(n)
         });
     }
 }
@@ -214,6 +230,11 @@ enum JobChunk {
     Rx(Vec<CryptoJob>),
     Tx(Vec<TxCryptoJob>),
 }
+
+/// The process-wide pool instance [`CryptoPool::shared`] lazily
+/// resolves — module-scope so a `#[cfg(test)]` probe can observe
+/// whether the `n <= 2` serial shortcuts really run before init.
+static POOL: OnceLock<CryptoPool> = OnceLock::new();
 
 /// The resident worker set. One [`CryptoPool::shared`] instance serves
 /// the whole process; `run`/`run_tx` serialize callers internally so
@@ -288,8 +309,17 @@ impl CryptoPool {
     /// traffic (or only small batches) never resolves `shared()` at
     /// all, so the workers spawn on the first genuinely parallel pass.
     pub fn shared() -> &'static CryptoPool {
-        static POOL: OnceLock<CryptoPool> = OnceLock::new();
         POOL.get_or_init(|| CryptoPool::new(Self::default_workers()))
+    }
+
+    /// Test probe: has [`shared`](Self::shared) been resolved yet?
+    /// `parallel_tx_serial_fallback` compares this across a small-batch
+    /// `run_tx_shared` to pin the serial shortcut running *before* the
+    /// pool's `OnceLock` init (an earlier test may legitimately have
+    /// resolved it, so the pin is on the *transition*, not the state).
+    #[cfg(test)]
+    fn shared_resolved() -> bool {
+        POOL.get().is_some()
     }
 
     /// `run` on the process-wide [`shared`](Self::shared) pool — the
@@ -486,15 +516,7 @@ mod tests {
     /// `NoCurrentSession` per job without needing a session.
     fn no_session_jobs(n: usize) -> Vec<CryptoJob> {
         (0..n)
-            .map(|_| CryptoJob::new(vec![0u8; 64], 64, 0, 0, None))
-            .collect()
-    }
-
-    /// TX twin of [`no_session_jobs`] — `crypto: None` resolves to
-    /// `NoCurrentSession` per job.
-    fn no_session_tx_jobs(n: usize) -> Vec<TxCryptoJob> {
-        (0..n)
-            .map(|i| TxCryptoJob::new(vec![i as u8; 64], vec![0u8; 256], i as u64, None))
+            .map(|i| CryptoJob::new(vec![0u8; 64], 64, 0, 0, None, i))
             .collect()
     }
 
@@ -590,14 +612,13 @@ mod tests {
     fn tx_jobs(handle: &SessionHandle, base: u64, n: usize) -> Vec<TxCryptoJob> {
         (0..n)
             .map(|i| {
-                let mut job = TxCryptoJob::new(
+                TxCryptoJob::new(
                     inner_packet(i as u8),
                     vec![0u8; 2048],
                     base + i as u64,
-                    Some(handle.clone()),
-                );
-                job.tag = i;
-                job
+                    handle.clone(),
+                    i,
+                )
             })
             .collect()
     }
@@ -624,7 +645,7 @@ mod tests {
         let pool = CryptoPool::new(4);
         let mut jobs: Vec<CryptoJob> = (0..64u32)
             .map(|i| {
-                let mut job = CryptoJob::new(vec![0u8; 64], 64, i, i as u64, None);
+                let mut job = CryptoJob::new(vec![0u8; 64], 64, i, i as u64, None, i as usize);
                 // Stamp the job's identity into its buffer so the merge
                 // order is checkable after the pass.
                 job.buf[0] = i as u8;
@@ -659,42 +680,55 @@ mod tests {
 
     /// PATCH(19): the TX serial fallback — `n <= 2` resolves inline on
     /// both entry points (`run_tx` and `run_tx_shared`), and `new(1)`
-    /// resolves a full batch without workers.
+    /// resolves a full batch without workers. TX jobs carry a real
+    /// session (a `None` crypto cannot be constructed — no-session TX
+    /// traffic takes the caller's serial arm), so the pin is on every
+    /// job sealing, not on an error verdict.
     #[test]
     fn parallel_tx_serial_fallback() {
+        let (a, _b) = session_pair();
+        let handle = a.current_session_handle().expect("session is up");
+
         let pool = CryptoPool::new(4);
         for n in [0usize, 1, 2] {
-            let mut jobs = no_session_tx_jobs(n);
+            let base = handle.reserve_tx_counters(n);
+            let mut jobs = tx_jobs(&handle, base, n);
             pool.run_tx(&mut jobs);
             assert_eq!(jobs.len(), n);
             for (i, job) in jobs.iter().enumerate() {
                 assert!(
-                    matches!(job.result, Some(Err(WireGuardError::NoCurrentSession))),
+                    matches!(job.result, Some(Ok(_))),
                     "job {i} must be resolved"
                 );
             }
         }
 
-        // `run_tx_shared` takes the same inline arm for a small batch.
-        let mut jobs = no_session_tx_jobs(2);
+        // `run_tx_shared` takes the same inline arm for a small batch —
+        // and the shortcut must run *before* `shared()` resolves the
+        // process-wide `OnceLock`. The pin is on the transition (an
+        // earlier test in this binary may legitimately have resolved
+        // the pool): a 2-job pass must not flip it.
+        let resolved = CryptoPool::shared_resolved();
+        let base = handle.reserve_tx_counters(2);
+        let mut jobs = tx_jobs(&handle, base, 2);
         CryptoPool::run_tx_shared(&mut jobs);
         for job in &jobs {
-            assert!(matches!(
-                job.result,
-                Some(Err(WireGuardError::NoCurrentSession))
-            ));
+            assert!(matches!(job.result, Some(Ok(_))));
         }
+        assert_eq!(
+            CryptoPool::shared_resolved(),
+            resolved,
+            "the n <= 2 shortcut must run before shared() init"
+        );
 
         // new(1) spawns nothing; run_tx still resolves every job.
         let pool = CryptoPool::new(1);
-        let mut jobs = no_session_tx_jobs(8);
+        let base = handle.reserve_tx_counters(8);
+        let mut jobs = tx_jobs(&handle, base, 8);
         pool.run_tx(&mut jobs);
         assert_eq!(jobs.len(), 8);
         for job in &jobs {
-            assert!(matches!(
-                job.result,
-                Some(Err(WireGuardError::NoCurrentSession))
-            ));
+            assert!(matches!(job.result, Some(Ok(_))));
         }
     }
 
@@ -760,7 +794,7 @@ mod tests {
         let stale_peer_idx = {
             // Read the index a fresh seal stamps — the session's
             // sending_index, for comparison with the rotated one.
-            let mut job = TxCryptoJob::new(inner_packet(0), vec![0u8; 256], 0, Some(stale.clone()));
+            let mut job = TxCryptoJob::new(inner_packet(0), vec![0u8; 256], 0, stale.clone(), 0);
             job.seal();
             u32::from_le_bytes(job.wire[4..8].try_into().unwrap())
         };
@@ -772,7 +806,7 @@ mod tests {
         // under the session it captured (its peer-side slot may be
         // evicted; sealing itself is what the pin covers).
         let counter = stale.reserve_tx_counters(1);
-        let mut job = TxCryptoJob::new(inner_packet(1), vec![0u8; 2048], counter, Some(stale));
+        let mut job = TxCryptoJob::new(inner_packet(1), vec![0u8; 2048], counter, stale, 0);
         job.seal();
         assert!(matches!(job.result, Some(Ok(_))));
         assert_eq!(job.wire[0], 4);
@@ -786,7 +820,7 @@ mod tests {
         // sending index — and the peer (post-rotation) opens it.
         let fresh = a.current_session_handle().expect("session is up");
         let counter = fresh.reserve_tx_counters(1);
-        let mut job = TxCryptoJob::new(inner_packet(2), vec![0u8; 2048], counter, Some(fresh));
+        let mut job = TxCryptoJob::new(inner_packet(2), vec![0u8; 2048], counter, fresh, 0);
         job.seal();
         let Some(Ok(wire_len)) = job.result else {
             panic!("fresh session seals");

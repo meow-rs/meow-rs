@@ -1173,7 +1173,8 @@ mod tests {
         let order: Vec<usize> = (0..64).step_by(2).chain((1..64).step_by(2)).collect();
         let mut jobs: Vec<CryptoJob> = order
             .iter()
-            .map(|&i| {
+            .enumerate()
+            .map(|(pos, &i)| {
                 let wire = wires[i].clone();
                 let r_idx = u32::from_le_bytes(wire[4..8].try_into().unwrap());
                 let counter = u64::from_le_bytes(wire[8..16].try_into().unwrap());
@@ -1183,6 +1184,7 @@ mod tests {
                     r_idx,
                     counter,
                     their_tun.session_handle_for(r_idx),
+                    pos,
                 )
             })
             .collect();
@@ -1211,6 +1213,7 @@ mod tests {
             r_idx,
             counter,
             their_tun.session_handle_for(r_idx),
+            0,
         )];
         CryptoPool::new(4).run(&mut dup);
         assert!(matches!(
@@ -1237,13 +1240,14 @@ mod tests {
         let r_idx = u32::from_le_bytes(wire[4..8].try_into().unwrap());
         let counter = u64::from_le_bytes(wire[8..16].try_into().unwrap());
         let mut jobs: Vec<CryptoJob> = (0..4)
-            .map(|_| {
+            .map(|i| {
                 CryptoJob::new(
                     wire.clone(),
                     wire.len(),
                     r_idx,
                     counter,
                     their_tun.session_handle_for(r_idx),
+                    i,
                 )
             })
             .collect();
@@ -1325,13 +1329,15 @@ mod tests {
         // `WrongIndex`, on the pool's parallel arm.
         let mut stale: Vec<CryptoJob> = old_wires
             .iter()
-            .map(|wire| {
+            .enumerate()
+            .map(|(i, wire)| {
                 CryptoJob::new(
                     wire.clone(),
                     wire.len(),
                     r_idx,
                     u64::from_le_bytes(wire[8..16].try_into().unwrap()),
                     their_tun.session_handle_for(r_idx),
+                    i,
                 )
             })
             .collect();
@@ -1351,13 +1357,15 @@ mod tests {
         // so the shared replay window admits all three).
         let mut jobs: Vec<CryptoJob> = old_wires
             .iter()
-            .map(|wire| {
+            .enumerate()
+            .map(|(i, wire)| {
                 CryptoJob::new(
                     wire.clone(),
                     wire.len(),
                     r_idx,
                     u64::from_le_bytes(wire[8..16].try_into().unwrap()),
                     Some(old_handle.clone()),
+                    i,
                 )
             })
             .collect();
