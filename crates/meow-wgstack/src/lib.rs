@@ -62,7 +62,23 @@ pub const WIRE_DRAIN_BUDGET: usize = 64;
 /// emits a segment every poll) must not livelock the owning actor out of
 /// its drain/flush halves; a capped burst simply resumes next pass —
 /// `poll_delay` reports `Now` while segments remain queued.
-pub const POLL_BURST: usize = 64;
+///
+/// Raised 64 → 256 (perf-7): a full [`WIRE_DRAIN_BUDGET`] batch fills
+/// `rx_queue` with 64 packets, and the burst also has to absorb residual
+/// queue depth left by a back-pressured previous pass; 256 gives 4×
+/// headroom over one wire batch without letting a stacked burst dominate.
+/// smoltcp 0.13's `poll` already drains ingress and egress *internally*,
+/// so the burst usually exits on the first `PollResult::None` — the cap
+/// and [`POLL_TX_BYTES_BUDGET`] stay as the bounded-budget safety net.
+pub const POLL_BURST: usize = 256;
+
+/// Per-pass TX-bytes budget inside [`poll_burst`] (perf-7): break out of
+/// the burst early once this many bytes of inner segments have been
+/// emitted into `ChannelDevice::tx_queue`, so a saturated socket cannot
+/// monopolize a service pass. 256 polls × ~1500 B/segment ≈ 384 KB of
+/// uncapped headroom; 2 MiB leaves comfortable room for several saturated
+/// flows while still bounding the pass.
+const POLL_TX_BYTES_BUDGET: usize = 2 * 1024 * 1024;
 
 /// boringtun's own device loop ticks its timers at 250 ms (rekey timeout is
 /// 5 s, jitter ≤ 333 ms — this is well inside slack). Spec §3.4 sketched
@@ -216,12 +232,40 @@ pub fn poll_burst(
     device: &mut ChannelDevice,
     sockets: &mut SocketSet<'_>,
 ) {
-    for _ in 0..POLL_BURST {
+    poll_burst_budgeted(iface, now, device, sockets, POLL_TX_BYTES_BUDGET);
+}
+
+/// [`poll_burst`] with the TX-bytes budget explicit — the public entry
+/// uses [`POLL_TX_BYTES_BUDGET`]; tests pass a smaller budget to exercise
+/// the early break without producing MiBs of traffic. Returns the number
+/// of `Interface::poll` iterations executed (always ≥ 1).
+fn poll_burst_budgeted(
+    iface: &mut Interface,
+    now: SmolInstant,
+    device: &mut ChannelDevice,
+    sockets: &mut SocketSet<'_>,
+    tx_bytes_budget: usize,
+) -> usize {
+    let mut tx_bytes: usize = 0;
+    // `tx_queue` only grows inside `poll` (egress appends): entries that
+    // existed before each poll were already accounted, so re-checkpoint
+    // the length per iteration and sum only the newly emitted tail.
+    let mut tx_len_before = device.tx_queue.len();
+    for i in 0..POLL_BURST {
         match iface.poll(now, device, sockets) {
-            PollResult::SocketStateChanged => {}
-            PollResult::None => break,
+            PollResult::SocketStateChanged => {
+                for pkt in device.tx_queue.iter().skip(tx_len_before) {
+                    tx_bytes += pkt.len();
+                }
+                tx_len_before = device.tx_queue.len();
+                if tx_bytes > tx_bytes_budget {
+                    return i + 1;
+                }
+            }
+            PollResult::None => return i + 1,
         }
     }
+    POLL_BURST
 }
 
 /// conn→actor TCP items.
@@ -746,5 +790,140 @@ mod tests {
         let undersized = reset_scratch(Vec::with_capacity(1024), 2048);
         assert!(undersized.capacity() >= 2048);
         assert!(undersized.iter().all(|&b| b == 0));
+    }
+
+    // ── perf-7 P7-3a: burst cap + TX-byte budget ─────────────────
+
+    /// The minimum interface a `poll_burst` can ingress through: one v4
+    /// tunnel address, `Medium::Ip` device, empty socket set.
+    fn burst_iface() -> (Interface, ChannelDevice, SocketSet<'static>) {
+        let mut device = ChannelDevice::new(1420);
+        let mut cfg = smoltcp::iface::Config::new(smoltcp::wire::HardwareAddress::Ip);
+        cfg.random_seed = 0;
+        let mut iface = Interface::new(cfg, &mut device, SmolInstant::now());
+        iface.update_ip_addrs(|a| {
+            a.push(smoltcp::wire::IpCidr::new(
+                smoltcp::wire::IpAddress::v4(10, 0, 0, 2),
+                32,
+            ))
+            .unwrap();
+        });
+        (iface, device, SocketSet::new(vec![]))
+    }
+
+    /// A parseable IPv4+UDP datagram 10.0.0.1 → 10.0.0.2. RX checksum
+    /// verification is off on [`ChannelDevice`] (`Checksum::Tx`), so only
+    /// the header layout must be right; the IPv4 checksum is still
+    /// computed for realism.
+    fn udp_datagram_v4(payload_len: usize, tag: u8) -> Bytes {
+        let total = 20 + 8 + payload_len;
+        let mut p = vec![0u8; total];
+        p[0] = 0x45; // IPv4, IHL 5
+        p[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+        p[4..6].copy_from_slice(&(u16::from(tag) + 1).to_be_bytes()); // ident
+        p[6..8].copy_from_slice(&0x4000u16.to_be_bytes()); // DF
+        p[8] = 64; // TTL
+        p[9] = 17; // UDP
+        p[12..16].copy_from_slice(&[10, 0, 0, 1]);
+        p[16..20].copy_from_slice(&[10, 0, 0, 2]);
+        let mut cks: u32 = 0;
+        for w in p[..20].as_chunks::<2>().0 {
+            cks += u32::from(u16::from_be_bytes(*w));
+        }
+        while cks >> 16 != 0 {
+            cks = (cks & 0xFFFF) + (cks >> 16);
+        }
+        p[10..12].copy_from_slice(&(!(cks as u16)).to_be_bytes());
+        p[20..22].copy_from_slice(&12345u16.to_be_bytes());
+        p[22..24].copy_from_slice(&9u16.to_be_bytes());
+        p[24..26].copy_from_slice(&((8 + payload_len) as u16).to_be_bytes());
+        // UDP checksum stays 0 — legal on IPv4, and RX verify is off anyway.
+        p[28..].fill(tag);
+        Bytes::from(p)
+    }
+
+    /// P7-3a: 200 queued rx packets — deeper than the old 64-poll cap and
+    /// three `WIRE_DRAIN_BUDGET` wire batches — drain inside ONE
+    /// `poll_burst` call instead of waiting for the next wake.
+    #[test]
+    fn poll_burst_drains_deep_rx_queue() {
+        const DEPTH: usize = 200;
+        let (mut iface, mut device, mut sockets) = burst_iface();
+        for i in 0..DEPTH {
+            device
+                .rx_queue
+                .push_back(udp_datagram_v4(40, (i % 251) as u8));
+        }
+        assert_eq!(device.rx_queue.len(), DEPTH);
+        poll_burst(&mut iface, SmolInstant::now(), &mut device, &mut sockets);
+        assert!(
+            device.rx_queue.is_empty(),
+            "a burst must drain the whole injected depth"
+        );
+    }
+
+    /// P7-3a: with an emitting socket and a sub-segment budget the burst
+    /// exits right after the first producing poll; without a budget it
+    /// keeps polling until the stack reports `PollResult::None`.
+    #[test]
+    fn poll_burst_tx_budget_breaks_early() {
+        let (mut iface, mut device, mut sockets) = burst_iface();
+        let mut sock = smoltcp::socket::tcp::Socket::new(
+            smoltcp::socket::tcp::SocketBuffer::new(vec![0; 2048]),
+            smoltcp::socket::tcp::SocketBuffer::new(vec![0; 2048]),
+        );
+        sock.connect(
+            iface.context(),
+            (smoltcp::wire::IpAddress::v4(10, 0, 0, 1), 80),
+            49500,
+        )
+        .unwrap();
+        sockets.add(sock);
+
+        let polls = poll_burst_budgeted(
+            &mut iface,
+            SmolInstant::now(),
+            &mut device,
+            &mut sockets,
+            1, // budget far below the ~60-byte SYN
+        );
+        assert!(
+            !device.tx_queue.is_empty(),
+            "the connect must have emitted a SYN before the break"
+        );
+        assert_eq!(
+            polls, 1,
+            "the TX-byte budget must break right after the producing poll"
+        );
+
+        // Control: the same emission under an effectively unbounded
+        // budget exits on `PollResult::None` — the poll after the SYN's.
+        let (mut iface, mut device, mut sockets) = burst_iface();
+        let mut sock = smoltcp::socket::tcp::Socket::new(
+            smoltcp::socket::tcp::SocketBuffer::new(vec![0; 2048]),
+            smoltcp::socket::tcp::SocketBuffer::new(vec![0; 2048]),
+        );
+        sock.connect(
+            iface.context(),
+            (smoltcp::wire::IpAddress::v4(10, 0, 0, 1), 80),
+            49500,
+        )
+        .unwrap();
+        sockets.add(sock);
+        let polls = poll_burst_budgeted(
+            &mut iface,
+            SmolInstant::now(),
+            &mut device,
+            &mut sockets,
+            usize::MAX,
+        );
+        assert_eq!(polls, 2, "no budget: exit on the quiet poll");
+    }
+
+    /// The public constant stays at its perf-7 value — the deep-drain
+    /// and budget tests above only pass by it being ≫ `WIRE_DRAIN_BUDGET`.
+    #[test]
+    fn poll_burst_cap_is_256() {
+        assert_eq!(POLL_BURST, 256);
     }
 }

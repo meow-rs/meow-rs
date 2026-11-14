@@ -3,11 +3,17 @@
 //! `Device` between them, and the endpoint UDP socket to the WG peer.
 //!
 //! Spec §3/§4.5: smoltcp's `Interface`/`SocketSet` are confined to one
-//! dedicated `std::thread` running a current-thread tokio runtime (the
-//! hysteria2/quiche non-`Send` precedent). Everything cross-thread travels
-//! over tokio mpsc channels: [`ActorMsg`] for dial/bind/shutdown, per-conn
-//! channels for stream/datagram payload, and a shared `Notify` a conn
-//! pulses after enqueueing so a sleeping pump picks the item up at once.
+//! actor *task* on the shared runtime (perf-7 P7-2). The dedicated
+//! `std::thread` + current-thread runtime this replaced was a hysteria2/
+//! quiche precedent — `quiche::Connection` holds a `*mut` FFI handle and
+//! is `!Send`; smoltcp 0.13's types are pure-Rust `Send`, so the thread
+//! bought nothing but an OS futex round-trip on every `Notify` nudge,
+//! which is the wake path's hot cost. `WgPump: Send` is proven at compile
+//! time below. Everything cross-task still travels over tokio mpsc
+//! channels: [`ActorMsg`] for dial/bind/shutdown, per-conn channels for
+//! stream/datagram payload, and a shared `Notify` a conn pulses after
+//! enqueueing so a sleeping pump picks the item up at once — now an
+//! in-runtime wake instead of a context switch.
 //!
 //! The actor owns `Tunn` outright — the loop itself is the serialization
 //! point, so there is no `Mutex<Tunn>` (deviation from spec §3.3, which
@@ -66,6 +72,14 @@ const TCP_READ_CHUNK: usize = 65536;
 /// datagrams, mailbox messages and conn wakes all break the sleep early, so
 /// this only bounds the smoltcp housekeeping cadence.
 const IDLE_SLEEP: Duration = Duration::from_millis(10);
+
+/// Worker-fairness bound on a *task* pump (perf-7 P7-2): one service pass
+/// is synchronous start to finish, so a flow moving this much payload in
+/// rolling accumulation yields the tokio worker once — sibling tasks
+/// (other adapters' pumps on the same worker among them) get scheduled.
+/// The counter rolls across passes, not per-pass: a steady 900 KB/pass
+/// flow still yields every ~1.2 passes rather than never.
+const SERVICE_YIELD_THRESHOLD: usize = 1024 * 1024;
 
 /// Spec §3.7: a WG handshake that has not completed within 10 s fails all
 /// dials still waiting on it.
@@ -173,8 +187,8 @@ struct UdpState {
     local: SocketAddr,
 }
 
-/// The smoltcp/boringtun actor. Constructed inside [`spawn_pump`]'s thread
-/// so nothing smoltcp touches ever crosses a thread boundary.
+/// The smoltcp/boringtun actor. Constructed inside [`spawn_pump`]'s task
+/// so nothing smoltcp touches ever crosses a task boundary.
 struct WgPump {
     name: String,
     tunn: Tunn,
@@ -237,7 +251,22 @@ struct WgPump {
     /// a flood arriving inside one handshake would push the floor's
     /// zero point past that handshake's completion.
     last_desync_kick: Option<StdInstant>,
+    /// Payload bytes the last service passes moved through smoltcp —
+    /// `send_slice` accepts plus `recv` payloads, accumulated rolling
+    /// across passes. The `run()` loop yields the worker once it crosses
+    /// [`SERVICE_YIELD_THRESHOLD`], so a saturated flow cannot pin a
+    /// shared tokio worker through back-to-back synchronous passes.
+    last_service_bytes: usize,
 }
+
+// The pump rides the shared tokio worker pool (perf-7 P7-2): if any
+// field ever turns `!Send` — a `Rc`/`Cell`/raw pointer sneaking into a
+// smoltcp or boringtun type — this file stops compiling here, at zero
+// runtime cost. See the module docs for why `Send` holds.
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<WgPump>();
+};
 
 impl WgPump {
     fn new(
@@ -310,6 +339,7 @@ impl WgPump {
             udp_scratch: vec![0u8; inner_mtu],
             last_timer: StdInstant::now(),
             last_desync_kick: None,
+            last_service_bytes: 0,
         })
     }
 
@@ -1270,6 +1300,7 @@ impl WgPump {
                                 break;
                             }
                             Ok(n) => {
+                                self.last_service_bytes += n;
                                 b.advance(n);
                                 if b.is_empty() {
                                     st.out.pop_front();
@@ -1316,17 +1347,25 @@ impl WgPump {
                     (n, StreamEvent::Data(Bytes::copy_from_slice(&data[..n])))
                 });
                 match chunk {
-                    Ok(ev) => match st.read_tx.try_send(ev) {
-                        Ok(()) => {}
-                        Err(mpsc::error::TrySendError::Full(ev)) => {
-                            st.pending_read.push_back(ev);
-                            break;
+                    Ok(ev) => {
+                        // Count the payload toward the service-yield budget
+                        // whether or not the conn channel takes it — the
+                        // smoltcp→conn copy already happened.
+                        if let StreamEvent::Data(b) = &ev {
+                            self.last_service_bytes += b.len();
                         }
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                            Self::discard_socket_rx(st, socket);
-                            break;
+                        match st.read_tx.try_send(ev) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(ev)) => {
+                                st.pending_read.push_back(ev);
+                                break;
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                Self::discard_socket_rx(st, socket);
+                                break;
+                            }
                         }
-                    },
+                    }
                     Err(_) => break,
                 }
             }
@@ -1492,6 +1531,14 @@ impl WgPump {
             }
             // 3. conn queues, smoltcp poll, tunnel egress, WG timers.
             self.service_sockets();
+            // A service pass is synchronous end to end; on the shared
+            // worker pool a saturated flow would otherwise monopolise a
+            // thread between `select!` parks. Yield once per rolling MiB
+            // moved so co-located tasks stay schedulable.
+            if self.last_service_bytes >= SERVICE_YIELD_THRESHOLD {
+                tokio::task::yield_now().await;
+                self.last_service_bytes = 0;
+            }
             let now = SmolInstant::now();
             self.poll_stack(now);
             self.drain_device_tx();
@@ -1534,39 +1581,27 @@ impl WgPump {
     }
 }
 
-/// Spawn the pump thread for one WireGuard adapter. Everything smoltcp
-/// touches is built inside the thread (spec §4.3 Option A); only the
-/// `Send`-safe parts — the connected std socket, the config, the mailbox —
-/// cross over.
+/// Spawn the pump actor for one WireGuard adapter as a `tokio` task on
+/// the caller's runtime (perf-7 P7-2 — the dedicated `std::thread` +
+/// current-thread runtime it replaces was a `!Send` quiche precedent;
+/// smoltcp is `Send`, proven by the const assert above). Everything
+/// smoltcp touches is still built inside the task (spec §4.3 Option A);
+/// only the `Send`-safe parts — the connected std socket, the config,
+/// the mailbox — cross over.
 pub(crate) fn spawn_pump(
     config: &WireGuardConfig,
     std_sock: std::net::UdpSocket,
     endpoint_addr: SocketAddr,
-) -> std::io::Result<(mpsc::Sender<ActorMsg>, std::thread::JoinHandle<()>)> {
+) -> (mpsc::Sender<ActorMsg>, tokio::task::JoinHandle<()>) {
     let (tx, rx) = mpsc::channel::<ActorMsg>(ACTOR_MAILBOX);
     let config = config.clone();
-    let thread_name = format!("wg-pump-{}", config.name);
-    let handle = std::thread::Builder::new()
-        .name(thread_name)
-        .spawn(move || {
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => {
-                    warn!("wireguard {}: tokio runtime build failed: {e}", config.name);
-                    return;
-                }
-            };
-            rt.block_on(async move {
-                match WgPump::new(&config, std_sock, endpoint_addr, rx) {
-                    Ok(pump) => pump.run().await,
-                    Err(e) => warn!("wireguard {}: pump init failed: {e}", config.name),
-                }
-            });
-        })?;
-    Ok((tx, handle))
+    let task = tokio::spawn(async move {
+        match WgPump::new(&config, std_sock, endpoint_addr, rx) {
+            Ok(pump) => pump.run().await,
+            Err(e) => warn!("wireguard {}: pump init failed: {e}", config.name),
+        }
+    });
+    (tx, task)
 }
 
 /// `ProxyPacketConn` shim for a smoltcp UDP socket. `write_packet` enqueues

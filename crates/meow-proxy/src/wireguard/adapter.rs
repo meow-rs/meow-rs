@@ -5,7 +5,7 @@
 //! allowed-IPs table, resolves the WG server endpoint, owns one pump actor
 //! ([`super::pump`]) lazily spawned on first use, and relays
 //! dial/bind/shutdown over the actor mailbox. All smoltcp/boringtun state
-//! lives inside the pump thread.
+//! lives inside the pump task.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
@@ -26,22 +26,20 @@ use super::pump::{self, ActorMsg};
 /// deadlines — so a timeout here means "the actor is gone or stuffed".
 const DIAL_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Live pump actor: the mailbox plus the thread handle (kept so `Drop` can
-/// reap it off-thread — a blocking join in the dropping task would stall a
-/// tokio worker).
+/// Live pump actor: the mailbox plus the task handle. The task exits on
+/// its own once `Shutdown` lands or the mailbox closes, so the handle is
+/// never awaited — dropping it detaches (a `JoinHandle` drop is *not* an
+/// abort), the same reaping semantics the throwaway join thread gave the
+/// `std::thread` pump (perf-7 P7-2).
 struct PumpHandle {
     tx: mpsc::Sender<ActorMsg>,
-    thread: Option<std::thread::JoinHandle<()>>,
+    task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Drop for PumpHandle {
     fn drop(&mut self) {
         let _ = self.tx.try_send(ActorMsg::Shutdown);
-        if let Some(t) = self.thread.take() {
-            std::thread::spawn(move || {
-                let _ = t.join();
-            });
-        }
+        drop(self.task.take());
     }
 }
 
@@ -252,7 +250,7 @@ impl WireGuardAdapter {
     }
 
     /// The live pump, lazily spawned: resolve endpoint → bind+connect →
-    /// spawn actor thread → publish under the mutex. Losers of a
+    /// spawn actor task → publish under the mutex. Losers of a
     /// double-spawn race drop their handle, which shuts that pump down via
     /// [`PumpHandle::drop`].
     async fn ensure_pump(&self) -> Result<Arc<PumpHandle>> {
@@ -282,33 +280,31 @@ impl WireGuardAdapter {
         let mut last_err: Option<std::io::Error> = None;
         for addr in endpoints {
             match self.bind_endpoint(addr).await {
-                Ok(sock) => match pump::spawn_pump(&self.config, sock, addr) {
-                    Ok((tx, thread)) => {
-                        let handle = Arc::new(PumpHandle {
-                            tx,
-                            thread: Some(thread),
-                        });
-                        let mut guard = self
-                            .pump
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        if self.pump_gen.load(std::sync::atomic::Ordering::Relaxed) != gen {
-                            // reset_sessions ran while this spawn was in
-                            // flight — do not resurrect the session it
-                            // meant to kill.
-                            return Err(MeowError::Proxy(format!(
-                                "wireguard {}: sessions reset during startup",
-                                self.config.name
-                            )));
-                        }
-                        if let Some(existing) = guard.as_ref() {
-                            return Ok(Arc::clone(existing));
-                        }
-                        *guard = Some(Arc::clone(&handle));
-                        return Ok(handle);
+                Ok(sock) => {
+                    let (tx, task) = pump::spawn_pump(&self.config, sock, addr);
+                    let handle = Arc::new(PumpHandle {
+                        tx,
+                        task: Some(task),
+                    });
+                    let mut guard = self
+                        .pump
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if self.pump_gen.load(std::sync::atomic::Ordering::Relaxed) != gen {
+                        // reset_sessions ran while this spawn was in
+                        // flight — do not resurrect the session it
+                        // meant to kill.
+                        return Err(MeowError::Proxy(format!(
+                            "wireguard {}: sessions reset during startup",
+                            self.config.name
+                        )));
                     }
-                    Err(e) => last_err = MeowError::prefer_errno_io(last_err, e),
-                },
+                    if let Some(existing) = guard.as_ref() {
+                        return Ok(Arc::clone(existing));
+                    }
+                    *guard = Some(Arc::clone(&handle));
+                    return Ok(handle);
+                }
                 Err(e) => last_err = MeowError::prefer_errno_io(last_err, e),
             }
         }
@@ -429,7 +425,7 @@ impl ProxyAdapter for WireGuardAdapter {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
-        // `PumpHandle::drop` sends Shutdown and reaps the thread.
+        // `PumpHandle::drop` sends Shutdown and detaches the task.
         drop(handle);
     }
 
