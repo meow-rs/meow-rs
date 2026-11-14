@@ -3,8 +3,11 @@
 
 use super::PacketData;
 use crate::noise::errors::WireGuardError;
+#[cfg(not(feature = "wireguard-boring"))]
+use chacha20poly1305::{aead::KeyInit, ChaCha20Poly1305};
 use parking_lot::Mutex;
 use portable_atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 // PATCH(4): ring::aead::LessSafeKey fields replaced by raw key bytes; the
 // AEAD cipher is constructed per operation in the crate::crypto facade (the
@@ -12,7 +15,15 @@ use portable_atomic::{AtomicU64, Ordering};
 // PATCH(16): under `wireguard-boring` the key bytes become cached
 // BoringSSL `SessionAead` contexts — key schedule runs once here instead
 // of per packet.
-pub struct Session {
+// PATCH(18): everything a data-plane worker needs moved into
+// `SessionCrypto`, held by `Arc` — the RustCrypto fallback caches a
+// built `ChaCha20Poly1305` per direction the same way (the per-packet
+// `new_from_slice` key schedule is gone from this path too). The ring
+// keeps owning `Session`; a `SessionHandle` is an `Arc` clone of the
+// same crypto, so a packet whose session rotated out of the ring
+// mid-batch still decrypts, and the replay-window mutex is shared —
+// never copied.
+pub(crate) struct SessionCrypto {
     pub(crate) receiving_index: u32,
     sending_index: u32,
     #[cfg(feature = "wireguard-boring")]
@@ -20,11 +31,18 @@ pub struct Session {
     #[cfg(feature = "wireguard-boring")]
     sender_ctx: crate::crypto::boring_ctx::SessionAead,
     #[cfg(not(feature = "wireguard-boring"))]
-    receiver_key: [u8; 32],
+    receiver_cipher: ChaCha20Poly1305,
     #[cfg(not(feature = "wireguard-boring"))]
-    sender_key: [u8; 32],
+    sender_cipher: ChaCha20Poly1305,
     sending_key_counter: AtomicU64,
     receiving_key_counter: Mutex<ReceivingKeyCounterValidator>,
+}
+
+/// One noise session. The struct itself only wraps the shared
+/// [`SessionCrypto`] — `Tunn`'s ring keeps owning it, workers borrow it
+/// through `SessionHandle`.
+pub struct Session {
+    pub(crate) crypto: Arc<SessionCrypto>,
 }
 
 impl std::fmt::Debug for Session {
@@ -32,7 +50,7 @@ impl std::fmt::Debug for Session {
         write!(
             f,
             "Session: {}<- ->{}",
-            self.receiving_index, self.sending_index
+            self.crypto.receiving_index, self.crypto.sending_index
         )
     }
 }
@@ -169,25 +187,71 @@ impl Session {
         sending_key: [u8; 32],
     ) -> Session {
         Session {
-            receiving_index: local_index,
-            sending_index: peer_index,
-            #[cfg(feature = "wireguard-boring")]
-            receiver_ctx: crate::crypto::boring_ctx::SessionAead::new(&receiving_key),
-            #[cfg(feature = "wireguard-boring")]
-            sender_ctx: crate::crypto::boring_ctx::SessionAead::new(&sending_key),
-            #[cfg(not(feature = "wireguard-boring"))]
-            receiver_key: receiving_key,
-            #[cfg(not(feature = "wireguard-boring"))]
-            sender_key: sending_key,
-            sending_key_counter: AtomicU64::new(0),
-            receiving_key_counter: Mutex::new(Default::default()),
+            crypto: Arc::new(SessionCrypto {
+                receiving_index: local_index,
+                sending_index: peer_index,
+                #[cfg(feature = "wireguard-boring")]
+                receiver_ctx: crate::crypto::boring_ctx::SessionAead::new(&receiving_key),
+                #[cfg(feature = "wireguard-boring")]
+                sender_ctx: crate::crypto::boring_ctx::SessionAead::new(&sending_key),
+                // PATCH(18): the fallback builds each direction's cipher
+                // once at handshake time, matching the boring build's
+                // cached-ctx shape — the data path never re-runs the key
+                // schedule (and a worker pass never runs it concurrently).
+                #[cfg(not(feature = "wireguard-boring"))]
+                receiver_cipher: ChaCha20Poly1305::new_from_slice(&receiving_key)
+                    .expect("ChaCha20-Poly1305 key is always 32 bytes"),
+                #[cfg(not(feature = "wireguard-boring"))]
+                sender_cipher: ChaCha20Poly1305::new_from_slice(&sending_key)
+                    .expect("ChaCha20-Poly1305 key is always 32 bytes"),
+                sending_key_counter: AtomicU64::new(0),
+                receiving_key_counter: Mutex::new(Default::default()),
+            }),
         }
     }
 
     pub(super) fn local_index(&self) -> usize {
-        self.receiving_index as usize
+        self.crypto.receiving_index as usize
     }
 
+    /// src - an IP packet from the interface
+    /// dst - pre-allocated space to hold the encapsulating UDP packet to send over the network
+    /// returns the size of the formatted packet
+    pub(super) fn format_packet_data<'a>(&self, src: &[u8], dst: &'a mut [u8]) -> &'a mut [u8] {
+        self.crypto.format_packet_data(src, dst)
+    }
+
+    /// packet - a data packet we received from the network
+    /// dst - pre-allocated space to hold the encapsulated IP packet, to send to the interface
+    ///       dst will always take less space than src
+    /// return the size of the encapsulated packet on success
+    pub(super) fn receive_packet_data<'a>(
+        &self,
+        packet: PacketData,
+        dst: &'a mut [u8],
+    ) -> Result<&'a mut [u8], WireGuardError> {
+        self.crypto.receive_packet_data(packet, dst)
+    }
+
+    /// PATCH(17): in-place twin of `receive_packet_data` — see
+    /// [`SessionCrypto::receive_packet_data_in_place`].
+    pub(super) fn receive_packet_data_in_place(
+        &self,
+        receiver_idx: u32,
+        counter: u64,
+        ct_and_tag: &mut [u8],
+    ) -> Result<usize, WireGuardError> {
+        self.crypto
+            .receive_packet_data_in_place(receiver_idx, counter, ct_and_tag)
+    }
+
+    /// Returns the estimated downstream packet loss for this session
+    pub(super) fn current_packet_cnt(&self) -> (u64, u64) {
+        self.crypto.current_packet_cnt()
+    }
+}
+
+impl SessionCrypto {
     /// Returns true if receiving counter is good to use
     fn receiving_counter_quick_check(&self, counter: u64) -> Result<(), WireGuardError> {
         let counter_validator = self.receiving_key_counter.lock();
@@ -207,7 +271,7 @@ impl Session {
     /// src - an IP packet from the interface
     /// dst - pre-allocated space to hold the encapsulating UDP packet to send over the network
     /// returns the size of the formatted packet
-    pub(super) fn format_packet_data<'a>(&self, src: &[u8], dst: &'a mut [u8]) -> &'a mut [u8] {
+    fn format_packet_data<'a>(&self, src: &[u8], dst: &'a mut [u8]) -> &'a mut [u8] {
         if dst.len() < src.len() + super::DATA_OVERHEAD_SZ {
             panic!("The destination buffer is too small");
         }
@@ -228,7 +292,8 @@ impl Session {
             nonce[4..12].copy_from_slice(&sending_key_counter.to_le_bytes());
             data[..src.len()].copy_from_slice(src);
             // PATCH(4): seal in place via the facade, then append the tag.
-            // PATCH(16): the boring build seals through the cached ctx.
+            // PATCH(16): the boring build seals through the cached ctx;
+            // PATCH(18): the fallback seals through the cached cipher.
             #[cfg(feature = "wireguard-boring")]
             let tag = crate::crypto::session_seal_in_place(
                 &self.sender_ctx,
@@ -238,7 +303,7 @@ impl Session {
             );
             #[cfg(not(feature = "wireguard-boring"))]
             let tag = crate::crypto::session_seal_in_place(
-                &self.sender_key,
+                &self.sender_cipher,
                 nonce,
                 &[],
                 &mut data[..src.len()],
@@ -254,7 +319,7 @@ impl Session {
     /// dst - pre-allocated space to hold the encapsulated IP packet, to send to the interface
     ///       dst will always take less space than src
     /// return the size of the encapsulated packet on success
-    pub(super) fn receive_packet_data<'a>(
+    fn receive_packet_data<'a>(
         &self,
         packet: PacketData,
         dst: &'a mut [u8],
@@ -275,7 +340,8 @@ impl Session {
             nonce[4..12].copy_from_slice(&packet.counter.to_le_bytes());
             // PATCH(4): open in place via the facade — copies the ciphertext
             // into dst and strips the tag internally. PATCH(16): the
-            // boring build opens through the cached ctx.
+            // boring build opens through the cached ctx; PATCH(18): the
+            // fallback opens through the cached cipher.
             #[cfg(feature = "wireguard-boring")]
             let opened = crate::crypto::session_open_in_place(
                 &self.receiver_ctx,
@@ -286,7 +352,7 @@ impl Session {
             );
             #[cfg(not(feature = "wireguard-boring"))]
             let opened = crate::crypto::session_open_in_place(
-                &self.receiver_key,
+                &self.receiver_cipher,
                 nonce,
                 &[],
                 dst,
@@ -309,7 +375,11 @@ impl Session {
     /// here; the `WrongIndex`/counter-check/open/mark ordering is
     /// identical. Returns the plaintext length
     /// (`ct_and_tag.len() - AEAD_SIZE`) on success.
-    pub(super) fn receive_packet_data_in_place(
+    /// PATCH(18): callable through a `SessionHandle` — the shared
+    /// replay-window mutex makes concurrent opens on the same session
+    /// replay-safe (the mark side of the check rejects a duplicate the
+    /// quick check raced past).
+    pub(crate) fn receive_packet_data_in_place(
         &self,
         receiver_idx: u32,
         counter: u64,
@@ -326,13 +396,18 @@ impl Session {
             nonce[4..12].copy_from_slice(&counter.to_le_bytes());
             // PATCH(17): open inside the datagram — no ciphertext copy,
             // no `dst` at all. PATCH(16): the boring build opens through
-            // the cached ctx.
+            // the cached ctx; PATCH(18): the fallback through the cached
+            // cipher.
             #[cfg(feature = "wireguard-boring")]
             let opened =
                 crate::crypto::session_decrypt_in_place(&self.receiver_ctx, nonce, &[], ct_and_tag);
             #[cfg(not(feature = "wireguard-boring"))]
-            let opened =
-                crate::crypto::session_decrypt_in_place(&self.receiver_key, nonce, &[], ct_and_tag);
+            let opened = crate::crypto::session_decrypt_in_place(
+                &self.receiver_cipher,
+                nonce,
+                &[],
+                ct_and_tag,
+            );
             opened.map_err(|_| WireGuardError::InvalidAeadTag)?
         };
 
@@ -342,7 +417,7 @@ impl Session {
     }
 
     /// Returns the estimated downstream packet loss for this session
-    pub(super) fn current_packet_cnt(&self) -> (u64, u64) {
+    fn current_packet_cnt(&self) -> (u64, u64) {
         let counter_validator = self.receiving_key_counter.lock();
         (counter_validator.next, counter_validator.receive_cnt)
     }
@@ -351,6 +426,7 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn test_replay_counter() {
         let mut c: ReceivingKeyCounterValidator = Default::default();
@@ -399,5 +475,44 @@ mod tests {
         assert!(c.mark_did_receive(N_BITS * 3 + 70).is_err());
         assert!(c.mark_did_receive(N_BITS * 3 + 71).is_err());
         assert!(c.mark_did_receive(N_BITS * 3 + 72).is_err());
+    }
+
+    /// PATCH(18): the RustCrypto fallback's cached-cipher path —
+    /// `Session::new` builds each direction's `ChaCha20Poly1305` once
+    /// and `format_packet_data`/`receive_packet_data_in_place` use it
+    /// on every packet. 100 seal→open round-trips pin both directions
+    /// of that path end to end (plus the replay bit on a duplicate).
+    #[cfg(not(feature = "wireguard-boring"))]
+    #[test]
+    fn rustcrypto_cached_cipher_round_trip() {
+        // a seals under key [7] toward b; b opens under the same key.
+        let a = Session::new(1, 11, [9u8; 32], [7u8; 32]);
+        let b = Session::new(11, 1, [7u8; 32], [9u8; 32]);
+        let mut first = None;
+        for i in 0..100u64 {
+            let src = format!("packet-{i}").into_bytes();
+            let mut dst = vec![0u8; src.len() + crate::noise::DATA_OVERHEAD_SZ];
+            let wire_len = a.format_packet_data(&src, &mut dst).len();
+            if i == 0 {
+                first = Some(dst[..wire_len].to_vec());
+            }
+            let r_idx = u32::from_le_bytes(dst[4..8].try_into().unwrap());
+            let counter = u64::from_le_bytes(dst[8..16].try_into().unwrap());
+            assert_eq!(r_idx, 11);
+            assert_eq!(counter, i);
+            let pt_len = b
+                .receive_packet_data_in_place(r_idx, counter, &mut dst[DATA_OFFSET..wire_len])
+                .expect("cached cipher opens");
+            assert_eq!(&dst[DATA_OFFSET..DATA_OFFSET + pt_len], &src[..]);
+        }
+        // A replayed datagram fails the counter check — the mark side
+        // of the shared validator already saw it.
+        let mut dup = first.expect("kept the first datagram");
+        let wire_len = dup.len();
+        let r_idx = u32::from_le_bytes(dup[4..8].try_into().unwrap());
+        let counter = u64::from_le_bytes(dup[8..16].try_into().unwrap());
+        assert!(b
+            .receive_packet_data_in_place(r_idx, counter, &mut dup[DATA_OFFSET..wire_len])
+            .is_err());
     }
 }

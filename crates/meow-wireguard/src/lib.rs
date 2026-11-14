@@ -17,10 +17,16 @@ pub(crate) mod sleepyinstant;
 
 pub(crate) mod crypto;
 
+// PATCH(18): the shared data-plane crypto pool — resident threads that
+// open DATA packets through `SessionHandle`s so the receive actors stay
+// serial for everything except the AEAD pass itself.
+mod crypto_pool;
+
 pub(crate) mod serialization;
 
+pub use crypto_pool::{CryptoJob, CryptoPool};
 pub use noise::errors::WireGuardError;
-pub use noise::{Tunn, TunnResult, DATA_OVERHEAD_SZ, DATA_PAYLOAD_OFF};
+pub use noise::{SessionHandle, Tunn, TunnResult, WireClass, DATA_OVERHEAD_SZ, DATA_PAYLOAD_OFF};
 
 /// Re-export of the x25519 types
 pub mod x25519 {

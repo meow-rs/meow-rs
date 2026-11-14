@@ -25,7 +25,8 @@ use meow_wgstack::{
     poll_burst, reset_scratch, BatchEndpoint, ChannelDevice, StreamEvent, TcpIo, WgStream,
     TCP_READ_QUEUE, TCP_SOCKET_BUF, TCP_WRITE_QUEUE, WG_TIMER_INTERVAL, WIRE_DRAIN_BUDGET,
 };
-use meow_wireguard::{x25519, Tunn, TunnResult, WireGuardError};
+use meow_wireguard::noise::Packet;
+use meow_wireguard::{x25519, CryptoJob, CryptoPool, Tunn, TunnResult, WireClass, WireGuardError};
 use smoltcp::iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet};
 use smoltcp::socket::{tcp, udp};
 use smoltcp::time::Instant as SmolInstant;
@@ -346,6 +347,107 @@ impl WgPump {
         self.outbox.push_back(pkt);
     }
 
+    /// `decapsulate_wire`'s `Err` arm, factored so the batch drain's
+    /// post-pass runs the identical handling on a crypto-pool result
+    /// (a DATA packet whose off-actor open failed is the same class of
+    /// error a serial `decapsulate_in_place` produces).
+    fn wire_error(&mut self, e: &WireGuardError, dst: &mut Vec<u8>) {
+        debug!("wireguard {}: decapsulate error: {e:?}", self.name);
+        if matches!(
+            e,
+            WireGuardError::NoCurrentSession | WireGuardError::WrongIndex
+        ) {
+            // A data datagram addressed to a session index
+            // this ring does not hold — or to a different
+            // generation in its slot — proves the peer's
+            // noise state diverged from ours: it is
+            // encrypting replies under a session we cannot
+            // read and will keep doing so until it sees a
+            // newer session of ours (the responder's
+            // `current` follows the newest session that
+            // sent it a data packet). boringtun's own
+            // recovery is the `want_handshake` ladder —
+            // KEEPALIVE+REKEY_TIMEOUT (~15 s) of one-way
+            // traffic before a re-initiation — and every
+            // pending dial burns its deadline inside that
+            // window. Kick the handshake at the first such
+            // error instead.
+            //
+            // Two independent bounds keep the kick cheap:
+            // `force=false` dedups against a handshake
+            // already in flight, and `desync_kick_due`
+            // floors *re-arms* at REKEY_TIMEOUT — the dedup
+            // alone ends the moment a response lands, so
+            // without the floor a flood of forged
+            // `receiver_idx` datagrams (DATA carries no
+            // mac1; both errors above are forgeable at
+            // line rate) would mint an initiation every
+            // RTT and spend the responder's 2×DH+2×AEAD
+            // per reply. `InvalidAeadTag`/`InvalidCounter`
+            // et al. stay pure drops — they prove nothing
+            // about session identity and a forged datagram
+            // must not buy a handshake.
+            if self.desync_kick_due() {
+                if let TunnResult::WriteToNetwork(b) =
+                    self.tunn.format_handshake_initiation(dst, false)
+                {
+                    self.last_desync_kick = Some(StdInstant::now());
+                    let len = b.len();
+                    dst.truncate(len);
+                    self.enqueue_wg(std::mem::take(dst));
+                    *dst = self.take_scratch();
+                }
+            }
+        }
+    }
+
+    /// boringtun's chained empty-datagram flush: after any
+    /// `WriteToNetwork` the protocol requires re-calling with an empty
+    /// datagram until it stops producing (inner packets queued behind
+    /// a handshake flush here). The tail of `decapsulate_wire`'s loop,
+    /// factored so the batch drain's non-DATA and cookie arms reach it.
+    fn flush_queue_chain(&mut self, dst: &mut Vec<u8>) {
+        loop {
+            match self.tunn.decapsulate_in_place(None, &mut [], dst) {
+                TunnResult::Done => break,
+                TunnResult::Err(e) => {
+                    self.wire_error(&e, dst);
+                    break;
+                }
+                TunnResult::WriteToNetwork(b) => {
+                    let len = b.len();
+                    dst.truncate(len);
+                    self.enqueue_wg(std::mem::take(dst));
+                    *dst = self.take_scratch();
+                }
+                TunnResult::WriteToTunnelV4(..) | TunnResult::WriteToTunnelV6(..) => {
+                    unreachable!("an empty datagram only flushes the send queue")
+                }
+            }
+        }
+    }
+
+    /// The batch drain's non-DATA arm: `handle_verified_packet` on the
+    /// classified `Packet` (handshake init/response, cookie reply —
+    /// everything but DATA), then the chained flush a `WriteToNetwork`
+    /// mandates — `decapsulate_wire`'s non-DATA iterations verbatim.
+    fn handle_verified_wire(&mut self, packet: Packet<'_>, dst: &mut Vec<u8>) {
+        match self.tunn.handle_verified_packet(packet, dst) {
+            TunnResult::Done => {}
+            TunnResult::Err(e) => self.wire_error(&e, dst),
+            TunnResult::WriteToNetwork(b) => {
+                let len = b.len();
+                dst.truncate(len);
+                self.enqueue_wg(std::mem::take(dst));
+                *dst = self.take_scratch();
+                self.flush_queue_chain(dst);
+            }
+            TunnResult::WriteToTunnelV4(..) | TunnResult::WriteToTunnelV6(..) => {
+                unreachable!("non-DATA packets never produce tunnel writes")
+            }
+        }
+    }
+
     /// Feed one inbound wire datagram through `Tunn`, chaining the
     /// empty-datagram calls boringtun's contract requires to flush packets
     /// queued behind a handshake (`decapsulate` doc: repeat until the
@@ -386,53 +488,7 @@ impl WgPump {
                 match self.tunn.decapsulate_in_place(None, datagram, &mut dst) {
                     TunnResult::Done => break,
                     TunnResult::Err(e) => {
-                        debug!("wireguard {}: decapsulate error: {e:?}", self.name);
-                        if matches!(
-                            e,
-                            WireGuardError::NoCurrentSession | WireGuardError::WrongIndex
-                        ) {
-                            // A data datagram addressed to a session index
-                            // this ring does not hold — or to a different
-                            // generation in its slot — proves the peer's
-                            // noise state diverged from ours: it is
-                            // encrypting replies under a session we cannot
-                            // read and will keep doing so until it sees a
-                            // newer session of ours (the responder's
-                            // `current` follows the newest session that
-                            // sent it a data packet). boringtun's own
-                            // recovery is the `want_handshake` ladder —
-                            // KEEPALIVE+REKEY_TIMEOUT (~15 s) of one-way
-                            // traffic before a re-initiation — and every
-                            // pending dial burns its deadline inside that
-                            // window. Kick the handshake at the first such
-                            // error instead.
-                            //
-                            // Two independent bounds keep the kick cheap:
-                            // `force=false` dedups against a handshake
-                            // already in flight, and `desync_kick_due`
-                            // floors *re-arms* at REKEY_TIMEOUT — the dedup
-                            // alone ends the moment a response lands, so
-                            // without the floor a flood of forged
-                            // `receiver_idx` datagrams (DATA carries no
-                            // mac1; both errors above are forgeable at
-                            // line rate) would mint an initiation every
-                            // RTT and spend the responder's 2×DH+2×AEAD
-                            // per reply. `InvalidAeadTag`/`InvalidCounter`
-                            // et al. stay pure drops — they prove nothing
-                            // about session identity and a forged datagram
-                            // must not buy a handshake.
-                            if self.desync_kick_due() {
-                                if let TunnResult::WriteToNetwork(b) =
-                                    self.tunn.format_handshake_initiation(&mut dst, false)
-                                {
-                                    self.last_desync_kick = Some(StdInstant::now());
-                                    let len = b.len();
-                                    dst.truncate(len);
-                                    self.enqueue_wg(dst);
-                                    dst = self.take_scratch();
-                                }
-                            }
-                        }
+                        self.wire_error(&e, &mut dst);
                         break;
                     }
                     TunnResult::WriteToNetwork(b) => {
@@ -480,26 +536,164 @@ impl WgPump {
 
     /// One batch read into the persistent slots — a `recvmmsg` on
     /// Linux, a `recvmsg_x` on macOS, a `try_recv_buf` loop elsewhere —
-    /// then `Tunn` over each
-    /// filled slot in wire order. The slots come out of `self` for the
-    /// pass because `decapsulate_wire` owns a slot's datagram while the
-    /// method itself needs `&mut self`; independent `Vec`s mean a slot
-    /// the kernel skipped can't clobber a neighbour's packet. A DATA
-    /// slot decrypts in place and leaves with its plaintext into
-    /// `rx_queue` — `decapsulate_wire` returns `None` for it and a
-    /// fresh buffer keeps the pool [`WIRE_DRAIN_BUDGET`] deep.
+    /// then the PATCH(18) three-phase pass over the filled slots:
+    ///
+    ///   A. **Serial demux** — scrub + `classify_incoming` per slot in
+    ///      wire order (the same verify half `decapsulate_in_place`
+    ///      ran). DATA packets become `CryptoJob`s whose `buf` is the
+    ///      slot Vec itself (the worker opens it in place — zero copy
+    ///      is preserved exactly as `decapsulate_wire` arranged); every
+    ///      non-DATA packet — handshake, cookie reply, drop — is fully
+    ///      handled inline in arrival order, as is its `WriteToNetwork`
+    ///      output and chained flush.
+    ///   B. **Worker pass** — `CryptoPool::run_shared(&mut jobs)`: the
+    ///      batch's AEAD opens on the process-wide resident pool
+    ///      (inline when `jobs <= 2` — resolved lazily, so a small
+    ///      batch never spawns it — or the pool is single-threaded).
+    ///   C. **Serial post-pass** — in job order: `handle_decrypted_data`
+    ///      replays the `set_current_session`/timer/validate
+    ///      bookkeeping `handle_data_in_place` would have run, then the
+    ///      slot's `Bytes` hand-off into `rx_queue` — the same publish
+    ///      order the serial drain produced.
+    ///
+    /// The only reordered observable is *when* a DATA packet's
+    /// bookkeeping runs relative to a later non-DATA packet's
+    /// `WriteToNetwork` — a chained flush cannot depend on an inner
+    /// packet's side effects, and `set_current_session` is guarded by
+    /// session generation (`session_timers[new] >= [cur]`), so a
+    /// mid-batch re-handshake can never be regressed by a stale
+    /// packet's bookkeeping.
+    ///
+    /// "Reordered" is not "indistinguishable": one bounded divergence
+    /// remains inside a batch. A DATA packet's `timer_tick`/
+    /// `set_current_session` lands in Phase C, *after* a same-batch
+    /// non-DATA packet's output — so where the serial drain leaves the
+    /// non-DATA's `TimeLastPacketSent` tick last (`want_handshake`
+    /// set), this drain leaves the DATA `TimeLastPacketReceived` last
+    /// (`want_keepalive`): a last-writer-wins difference confined to
+    /// the liveness arm, since every numeric timestamp a tick writes is
+    /// order-free. The same deferral can seal one flushed queued packet
+    /// under the pre-batch `current` session — still a live session,
+    /// and the generation guard above still forbids a regression.
     fn drain_wire(&mut self) {
         let mut slots = std::mem::take(&mut self.rx_slots);
         let n = self.endpoint.recv_batch(&mut slots, WIRE_DRAIN_BUDGET);
-        for slot in &mut slots[..n] {
-            // `recv_batch` rewrote the filled slot's len to its datagram
-            // — that length is the wire bound `decapsulate_wire` uses.
-            let filled = std::mem::take(slot);
-            let wire_len = filled.len();
-            *slot = self
-                .decapsulate_wire(filled, wire_len)
-                .unwrap_or_else(|| Vec::with_capacity(self.scratch_len));
+
+        // Phase A — serial demux: DATA slots become jobs (the Vec
+        // travels into the job); everything else is handled inline.
+        let mut jobs: Vec<CryptoJob> = Vec::new();
+        let mut dst = self.take_scratch();
+        for (i, slot) in slots[..n].iter_mut().enumerate() {
+            // `recv_batch` rewrote the filled slot's len to its
+            // datagram — that length is the wire bound.
+            let mut pkt = std::mem::take(slot);
+            let wire_len = pkt.len();
+            // The WARP-reserved scrub `decapsulate_wire` applies —
+            // bytes 1..4 zero before parse.
+            if wire_len >= 4 {
+                pkt[1..4].fill(0);
+            }
+            match self
+                .tunn
+                .classify_incoming(None, &pkt[..wire_len], &mut dst)
+            {
+                WireClass::Data(p) => {
+                    let (receiver_idx, counter) = (p.receiver_idx, p.counter());
+                    // `Arc` the session's crypto while `&mut self.tunn`
+                    // is free — the job carries it to the worker.
+                    let crypto = self.tunn.session_handle_for(receiver_idx);
+                    let mut job = CryptoJob::new(pkt, wire_len, receiver_idx, counter, crypto);
+                    // The job's own context tag — the post-pass lands
+                    // each result on its source slot exactly, even if a
+                    // lost chunk ever shifted the return positions.
+                    job.tag = i;
+                    jobs.push(job);
+                }
+                WireClass::Other(packet) => {
+                    self.handle_verified_wire(packet, &mut dst);
+                    *slot = pkt;
+                }
+                WireClass::CookieReply(len) => {
+                    dst.truncate(len);
+                    self.enqueue_wg(std::mem::take(&mut dst));
+                    dst = self.take_scratch();
+                    self.flush_queue_chain(&mut dst);
+                    *slot = pkt;
+                }
+                WireClass::Drop(e) => {
+                    self.wire_error(&e, &mut dst);
+                    *slot = pkt;
+                }
+            }
         }
+
+        // Phase B — the batch's AEAD opens, in place inside the job
+        // bufs. `run_shared` fills every `job.result`, preserving job
+        // order — and its `n <= 2` shortcut runs *before* the shared
+        // pool is resolved, so a small batch never spawns the workers.
+        CryptoPool::run_shared(&mut jobs);
+
+        // Phase C — serial post-pass in wire order.
+        for job in jobs {
+            let i = job.tag;
+            let mut pkt = job.buf;
+            slots[i] = match job.result {
+                Some(Ok(pt_len)) => {
+                    let produced = match self.tunn.handle_decrypted_data(
+                        job.receiver_idx,
+                        pt_len,
+                        &mut pkt[..job.wire_len],
+                    ) {
+                        TunnResult::WriteToTunnelV4(b, _) | TunnResult::WriteToTunnelV6(b, _) => {
+                            Some(b.len())
+                        }
+                        TunnResult::Done => None,
+                        TunnResult::Err(e) => {
+                            self.wire_error(&e, &mut dst);
+                            None
+                        }
+                        TunnResult::WriteToNetwork(_) => {
+                            unreachable!("data post-pass never emits wire output")
+                        }
+                    };
+                    match produced {
+                        Some(len) => {
+                            // The same `Bytes` hand-off
+                            // `decapsulate_wire` makes: the Vec becomes
+                            // the plaintext view, no copy.
+                            pkt.truncate(job.wire_len);
+                            let start = meow_wireguard::DATA_PAYLOAD_OFF;
+                            self.device
+                                .rx_queue
+                                .push_back(Bytes::from(pkt).slice(start..start + len));
+                            Vec::with_capacity(self.scratch_len)
+                        }
+                        None => pkt,
+                    }
+                }
+                Some(Err(e)) => {
+                    self.wire_error(&e, &mut dst);
+                    pkt
+                }
+                None => {
+                    debug_assert!(false, "crypto pool resolves every job");
+                    pkt
+                }
+            };
+        }
+        // A worker-lost chunk leaves its slots `mem::take`n — capacity-0
+        // husks `recv_batch` would read nothing into. Re-arm them (the
+        // pool's slots key on *capacity*, not len); a loss-free pass
+        // heals nothing.
+        let mut healed = 0usize;
+        for slot in &mut slots {
+            if slot.capacity() == 0 {
+                *slot = Vec::with_capacity(self.scratch_len);
+                healed += 1;
+            }
+        }
+        debug_assert_eq!(healed, 0, "crypto pool lost a chunk's buffers");
+        self.return_scratch(dst);
         self.rx_slots = slots;
     }
 
@@ -2016,6 +2210,100 @@ mod tests {
             .decapsulate_wire(keepalive, n)
             .expect("a keepalive does not consume the slot");
         assert_eq!(returned.len(), n);
+    }
+
+    /// PATCH(18): `drain_wire`'s parallel path end to end — a real
+    /// session (`session_up`), then a DATA burst over the real endpoint
+    /// socket. The first datagram rides `endpoint.recv` →
+    /// `decapsulate_wire` — the production select arm's shape, which
+    /// also arms the reactor readiness the fallback `try_recv_buf`
+    /// gates on — and the rest batch through `recv_batch` →
+    /// `classify_incoming` → the crypto pool → `handle_decrypted_data`.
+    /// Order is asserted off `rx_queue` (every decrypted inner lands in
+    /// wire order) and the consumed slots come back at full capacity.
+    #[tokio::test(flavor = "current_thread")]
+    async fn drain_wire_parallel_decrypts_in_wire_order() {
+        let client_secret = x25519::StaticSecret::from([0x91; 32]);
+        let client_public = x25519::PublicKey::from(&client_secret);
+        let server_secret = x25519::StaticSecret::from([0x92; 32]);
+        let server_public = x25519::PublicKey::from(&server_secret);
+
+        // A real socket pair: the pump's endpoint OS-connected to the
+        // responder's sender, so `recv_batch` only ever sees the one
+        // peer — exactly the connected-endpoint contract.
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind sender");
+        let sender_addr = sender.local_addr().expect("sender addr");
+        let pump_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind pump socket");
+        pump_std.connect(sender_addr).expect("connect pump socket");
+        let pump_addr = pump_std.local_addr().expect("pump addr");
+        let mut pump = pump_with_socket(
+            &test_config(&client_secret, &server_public),
+            pump_std,
+            sender_addr,
+        );
+        let mut server = Tunn::new(server_secret, client_public, None, None, 0, None);
+        session_up(&mut pump, &mut server);
+
+        // Eight DATA datagrams under consecutive counters — more than
+        // the pool's `n <= 2` inline cutoff, so the batch must run the
+        // worker arm for real. Each inner is the same 20-byte-header +
+        // 4-payload IPv4 shape the in-place test uses (the tunnel only
+        // inspects the version nibble, total length and source); the
+        // last payload byte marks wire order.
+        const N: usize = 8;
+        let mut wire = vec![0u8; 2048];
+        let mut inners = Vec::new();
+        for i in 0..N {
+            let inner = vec![
+                0x45, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 10, 0, 0,
+                2, 10, 0, 0, 1, 0xde, 0xad, 0xbe, i as u8,
+            ];
+            let datagram = {
+                let TunnResult::WriteToNetwork(b) = server.encapsulate(&inner, &mut wire) else {
+                    panic!("responder encapsulates the inner packet");
+                };
+                b.to_vec()
+            };
+            inners.push(inner);
+            sender.send_to(&datagram, pump_addr).expect("send data");
+        }
+
+        // The production receive arm: async `recv` for the datagram
+        // that woke the reactor (feeds `decapsulate_wire` serially and
+        // arms the `try_*` readiness), then `drain_wire` for the rest.
+        let n = pump
+            .endpoint
+            .recv(&mut pump.recv_buf)
+            .await
+            .expect("first datagram ready");
+        let pkt = std::mem::take(&mut pump.recv_buf);
+        pump.recv_buf = pump
+            .decapsulate_wire(pkt, n)
+            .unwrap_or_else(|| vec![0u8; pump.scratch_len]);
+        pump.drain_wire();
+
+        // Every decrypted inner reached smoltcp in wire order — the
+        // first through the serial arm, the rest through the pool pass.
+        assert_eq!(
+            pump.device.rx_queue.len(),
+            N,
+            "every DATA datagram produced an inner packet"
+        );
+        for (i, pkt) in pump.device.rx_queue.iter().enumerate() {
+            assert_eq!(
+                &pkt[..],
+                &inners[i][..],
+                "rx_queue order must match wire order"
+            );
+        }
+        // Consumed slots were re-armed at full capacity — the next
+        // batch's `recv_batch` still sees the whole window.
+        assert!(
+            pump.rx_slots
+                .iter()
+                .all(|s| s.capacity() == pump.scratch_len),
+            "every rx_slot returns at full capacity"
+        );
     }
 
     /// A dial to a family the tunnel has no address for fails *inside*

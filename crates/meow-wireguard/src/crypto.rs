@@ -217,15 +217,17 @@ pub(crate) fn session_decrypt_in_place(
 /// into the caller's output buffer. `nonce_bytes` is the pre-built 12-byte
 /// nonce (bytes `0..4` zero, `4..12` little-endian counter).
 /// Returns the Poly1305 tag.
+/// PATCH(18): takes the cipher `Session::new` built once per direction —
+/// the per-packet `new_from_slice` key schedule is off the data path (and
+/// a worker pass shares the same `&ChaCha20Poly1305` safely).
 #[cfg(not(feature = "wireguard-boring"))]
 #[inline]
 pub(crate) fn session_seal_in_place(
-    key: &[u8; 32],
+    cipher: &ChaCha20Poly1305,
     nonce_bytes: [u8; 12],
     aad: &[u8],
     buffer: &mut [u8],
 ) -> [u8; 16] {
-    let cipher = ChaCha20Poly1305::new_from_slice(key).expect("session seal: key length is 32");
     let tag = cipher
         .encrypt_in_place_detached(Nonce::from_slice(&nonce_bytes), aad, buffer)
         .expect("session seal");
@@ -239,16 +241,16 @@ pub(crate) fn session_seal_in_place(
 /// tag; `dst` must be at least `ciphertext_and_tag.len() - 16` bytes (the
 /// plaintext size — a longer `dst` is fine). Returns a slice into `dst`
 /// holding the plaintext on success.
+/// PATCH(18): takes the session's cached cipher — same body.
 #[cfg(not(feature = "wireguard-boring"))]
 #[inline]
 pub(crate) fn session_open_in_place<'a>(
-    key: &[u8; 32],
+    cipher: &ChaCha20Poly1305,
     nonce_bytes: [u8; 12],
     aad: &[u8],
     dst: &'a mut [u8],
     ciphertext_and_tag: &[u8],
 ) -> Result<&'a mut [u8], ()> {
-    let cipher = ChaCha20Poly1305::new_from_slice(key).expect("session open: key length is 32");
     let ct_len = ciphertext_and_tag.len();
     // src = ciphertext || tag (16 bytes). decrypt_in_place_detached verifies
     // the tag and leaves the plaintext in place — the right API for a fixed
@@ -274,15 +276,16 @@ pub(crate) fn session_open_in_place<'a>(
 /// plaintext replaces the ciphertext where it stands. No `dst`, no
 /// copy: the receive buffer becomes the plaintext buffer. Returns the
 /// plaintext length (`buf.len() - 16`).
+/// PATCH(18): takes the session's cached cipher — the worker pass's
+/// `open` path shares the `&ChaCha20Poly1305`, never rebuilds it.
 #[cfg(not(feature = "wireguard-boring"))]
 #[inline]
 pub(crate) fn session_decrypt_in_place(
-    key: &[u8; 32],
+    cipher: &ChaCha20Poly1305,
     nonce_bytes: [u8; 12],
     aad: &[u8],
     buf: &mut [u8],
 ) -> Result<usize, ()> {
-    let cipher = ChaCha20Poly1305::new_from_slice(key).expect("session open: key length is 32");
     let ct_len = buf.len().checked_sub(16).ok_or(())?;
     let (ct, tag) = buf.split_at_mut(ct_len);
     cipher
@@ -528,12 +531,15 @@ mod tests {
     ];
 
     /// RustCrypto session backend: seal must reproduce the pinned
-    /// `ct‖tag`, and open must round-trip it.
+    /// `ct‖tag`, and open must round-trip it. PATCH(18): the cipher is
+    /// built once — the exact shape `SessionCrypto` now caches.
     #[cfg(not(feature = "wireguard-boring"))]
     #[test]
     fn session_seal_open_known_answer() {
+        let cipher =
+            ChaCha20Poly1305::new_from_slice(&SESSION_KAT_KEY).expect("32-byte key builds");
         let mut buf = SESSION_KAT_PT.to_vec();
-        let tag = session_seal_in_place(&SESSION_KAT_KEY, SESSION_KAT_NONCE, &[], &mut buf);
+        let tag = session_seal_in_place(&cipher, SESSION_KAT_NONCE, &[], &mut buf);
         buf.extend_from_slice(&tag);
         assert_eq!(
             buf.as_slice(),
@@ -542,7 +548,7 @@ mod tests {
         );
 
         let mut dst = vec![0u8; SESSION_KAT_PT.len()];
-        let pt = session_open_in_place(&SESSION_KAT_KEY, SESSION_KAT_NONCE, &[], &mut dst, &buf)
+        let pt = session_open_in_place(&cipher, SESSION_KAT_NONCE, &[], &mut dst, &buf)
             .expect("the pinned vector opens");
         assert_eq!(pt, SESSION_KAT_PT);
     }
