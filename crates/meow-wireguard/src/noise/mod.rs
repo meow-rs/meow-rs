@@ -170,6 +170,28 @@ impl SessionHandle {
         self.0
             .receive_packet_data_in_place(receiver_idx, counter, ct_and_tag)
     }
+
+    /// PATCH(19): block-reserve `n` sending counters on this session,
+    /// returning the base — a TX drain calls it once in Phase A and
+    /// hands `base + i` to each `TxCryptoJob`. `pub` (unlike
+    /// `open_in_place`/`seal_at`) because the *caller* of the pool —
+    /// the pump or the listener actor, in different crates — does the
+    /// reserving; the job's `seal` is the only side that stays
+    /// in-crate.
+    pub fn reserve_tx_counters(&self, n: usize) -> u64 {
+        self.0.reserve_tx_counters(n)
+    }
+
+    /// PATCH(19): the seal the TX side of the crypto pool runs —
+    /// `format_packet_data` with the counter already block-reserved
+    /// (`reserve_tx_counters`), exposed on the shared crypto so
+    /// `&mut Tunn` is not required. Writes the whole wire datagram
+    /// `type‖sending_index‖counter‖ciphertext‖tag` into `dst` and
+    /// returns its length; panics like `format_packet_data` on an
+    /// undersized `dst` (the job guards first).
+    pub(crate) fn seal_at(&self, src: &[u8], dst: &mut [u8], counter: u64) -> usize {
+        self.0.format_packet_data_at(src, dst, counter)
+    }
 }
 
 /// PATCH(18): the verify/demux verdict `decapsulate*` used to compute
@@ -327,12 +349,9 @@ impl Tunn {
         if let Some(ref session) = self.sessions[current % N_SESSIONS] {
             // Send the packet using an established session
             let packet = session.format_packet_data(src, dst);
-            self.timer_tick(TimerName::TimeLastPacketSent);
-            // Exclude Keepalive packets from timer update.
-            if !src.is_empty() {
-                self.timer_tick(TimerName::TimeLastDataPacketSent);
-            }
-            self.tx_bytes += src.len();
+            // PATCH(19): the bookkeeping tail lives in `handle_sent_data`
+            // now — the crypto pool's post-pass replays it per sealed job.
+            self.handle_sent_data(src.len());
             return TunnResult::WriteToNetwork(packet);
         }
 
@@ -388,6 +407,41 @@ impl Tunn {
         self.sessions[receiver_idx as usize % N_SESSIONS]
             .as_ref()
             .map(|s| SessionHandle(Arc::clone(&s.crypto)))
+    }
+
+    /// PATCH(19): the TX twin of [`session_handle_for`](Self::session_handle_for)
+    /// — an `Arc` clone of the *current outbound* session's crypto, the
+    /// same `sessions[current % N_SESSIONS]` slot `encapsulate` reads.
+    /// A TX drain captures it once in Phase A and hands it to the
+    /// batch's `TxCryptoJob`s; `None` means no established session and
+    /// the caller falls back to the serial `encapsulate` loop (where
+    /// `queue_packet` + the handshake-initiation chain live). A job
+    /// sealing under a handle captured just before a mid-batch
+    /// rotation still produces a datagram the peer accepts — exactly
+    /// the window the serial path's per-packet `current` re-read gave.
+    pub fn current_session_handle(&self) -> Option<SessionHandle> {
+        self.sessions[self.current % N_SESSIONS]
+            .as_ref()
+            .map(|s| SessionHandle(Arc::clone(&s.crypto)))
+    }
+
+    /// PATCH(19): `encapsulate`'s bookkeeping tail, split out the way
+    /// `handle_decrypted_data` split `handle_data_in_place`'s in
+    /// PATCH(18) — the timer ticks and `tx_bytes` accounting a
+    /// successfully sealed inner packet earns, run in the post-pass in
+    /// job order so the batch's observable bookkeeping matches what
+    /// the serial `encapsulate` loop would have emitted.
+    /// `src_len` is the *inner* packet's length, exactly as
+    /// `encapsulate` counts it (an empty keepalive payload skips the
+    /// `TimeLastDataPacketSent` tick).
+    pub fn handle_sent_data(&mut self, src_len: usize) {
+        self.timer_tick(TimerName::TimeLastPacketSent);
+        // Exclude Keepalive packets from timer update — the same
+        // `!src.is_empty()` guard `encapsulate` runs.
+        if src_len > 0 {
+            self.timer_tick(TimerName::TimeLastDataPacketSent);
+        }
+        self.tx_bytes += src_len;
     }
 
     /// Receives a UDP datagram from the network and parses it.

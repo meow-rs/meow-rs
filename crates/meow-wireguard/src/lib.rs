@@ -17,14 +17,15 @@ pub(crate) mod sleepyinstant;
 
 pub(crate) mod crypto;
 
-// PATCH(18): the shared data-plane crypto pool — resident threads that
-// open DATA packets through `SessionHandle`s so the receive actors stay
+// PATCH(18)/PATCH(19): the shared data-plane crypto pool — resident
+// threads that open DATA packets through `SessionHandle`s (RX) and seal
+// inner packets under block-reserved counters (TX), so the actors stay
 // serial for everything except the AEAD pass itself.
 mod crypto_pool;
 
 pub(crate) mod serialization;
 
-pub use crypto_pool::{CryptoJob, CryptoPool};
+pub use crypto_pool::{CryptoJob, CryptoPool, TxCryptoJob};
 pub use noise::errors::WireGuardError;
 pub use noise::{SessionHandle, Tunn, TunnResult, WireClass, DATA_OVERHEAD_SZ, DATA_PAYLOAD_OFF};
 

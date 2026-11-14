@@ -12,11 +12,24 @@
 //! in place — so the zero-copy `rx_slots` contract survives: the same
 //! `Vec` becomes the `Bytes` the inner stack consumes, no copy anywhere.
 //!
+//! PATCH(19): the same pool seals the TX direction. A [`TxCryptoJob`]
+//! carries the inner packet *and* a wire-side scratch buffer through
+//! the pool — the worker writes
+//! `type‖sending_index‖counter‖ciphertext‖tag` into the scratch and
+//! truncates it to the datagram — so the pump/actor post-pass moves the
+//! finished datagram to the outbox untouched. The seal direction needs
+//! its own job type rather than a generalized `CryptoJob` enum: the
+//! buffer ownership contracts differ (open: one owned Vec; seal: two
+//! owned Vecs with different post-pass fates). Both directions share
+//! the resident threads through the [`JobChunk`] channel enum — a pass
+//! is always homogeneous, so `run` only ever sees `Rx` chunks and
+//! `run_tx` only `Tx`, each `debug_assert`ed at the unwrap.
+//!
 //! Why this shape: `std::thread::scope`'s spawn cost (~50 µs per thread
 //! per pass) exceeds an entire batch's AEAD time, so per-batch threads
 //! lose to serial. Resident workers pay one `mpsc` wakeup (~1–3 µs) per
-//! chunk. Dispatch is chunk-based — contiguous `Vec<CryptoJob>` ranges,
-//! one message per worker — and each worker's paired result channel
+//! chunk. Dispatch is chunk-based — contiguous `Vec` ranges, one
+//! message per worker — and each worker's paired result channel
 //! returns its chunk in order, so reassembly is positional: chunk
 //! boundaries guarantee the original order with no reorder buffer.
 //!
@@ -25,7 +38,7 @@
 //! post-pass, smoltcp); `4` is where the per-session replay-window
 //! mutex and the single consumer stop scaling anyway. `W <= 1` (or a
 //! batch of `n <= 2`) skips the pool entirely and runs inline — the
-//! serial fallback the spec requires.
+//! serial fallback the spec requires, identical in both directions.
 
 use std::sync::mpsc;
 use std::sync::OnceLock;
@@ -113,37 +126,135 @@ impl CryptoJob {
     }
 }
 
+/// One data-packet seal, moved end to end through the pool — the TX
+/// twin of [`CryptoJob`]. Kept a sibling type rather than folding into
+/// a job enum because the buffer contract differs: a seal job owns
+/// *two* Vecs with different post-pass fates — `inner` returns to the
+/// caller regardless of outcome (the caller decides whether it goes
+/// back to `tx_pool` or drops), while `wire` carries the finished
+/// datagram to the outbox on success and to the scratch pool on
+/// failure.
+pub struct TxCryptoJob {
+    /// The inner packet — moved out of `device.tx_queue` / `inject_rx`.
+    /// The worker only reads it; the post-pass owns its return path.
+    pub inner: Vec<u8>,
+    /// The wire output buffer — a `take_scratch()` Vec at full scratch
+    /// length. The worker writes `type‖sending_index‖counter‖
+    /// ciphertext‖tag` at its front and truncates it to the wire
+    /// length on success; on failure it stays full-size, so
+    /// `return_scratch` accepts it either way.
+    pub wire: Vec<u8>,
+    /// The counter the caller block-reserved for this job
+    /// (`SessionHandle::reserve_tx_counters`) — the AEAD nonce and the
+    /// wire header's counter field.
+    counter: u64,
+    /// The session's shared crypto, captured in Phase A through
+    /// `Tunn::current_session_handle`. `None` reports
+    /// `NoCurrentSession`, the same verdict `encapsulate` gives.
+    crypto: Option<SessionHandle>,
+    /// Caller-owned context tag — the same opaque-tag pattern as
+    /// [`CryptoJob::tag`]: a job position at the single-peer pump, a
+    /// `(peer_slot, i)` context index at the multi-peer listener. The
+    /// pool never reads or writes it.
+    pub tag: usize,
+    /// `None` until a worker (or the serial shortcut) fills it: the
+    /// wire length on success.
+    pub result: Option<Result<usize, WireGuardError>>,
+}
+
+impl TxCryptoJob {
+    /// Build a job from a drained inner packet: `inner` is the packet
+    /// the caller owns (a `tx_queue` Vec or an inject copy), `wire` a
+    /// fresh scratch buffer, `counter` one value out of the batch's
+    /// block reservation, and `crypto` the session handle Phase A
+    /// captured.
+    pub fn new(inner: Vec<u8>, wire: Vec<u8>, counter: u64, crypto: Option<SessionHandle>) -> Self {
+        Self {
+            inner,
+            wire,
+            counter,
+            crypto,
+            tag: 0,
+            result: None,
+        }
+    }
+
+    /// The AEAD seal itself — the only work that travels to a worker
+    /// thread. Writes the whole wire datagram into `self.wire` and
+    /// truncates it to the wire length; `format_packet_data_at` keeps
+    /// `format_packet_data`'s panic-on-undersize contract, which the
+    /// guard below discharges first — a breach is a caller bug (the
+    /// drain's Phase-A scratch check), reported `InvalidPacket` rather
+    /// than panicking the pool.
+    fn seal(&mut self) {
+        self.result = Some(match self.crypto.as_ref() {
+            Some(handle) => {
+                if self.inner.len() + DATA_OVERHEAD_SZ > self.wire.len() {
+                    Err(WireGuardError::InvalidPacket)
+                } else {
+                    let n = handle.seal_at(&self.inner, &mut self.wire, self.counter);
+                    debug_assert_eq!(n, self.inner.len() + DATA_OVERHEAD_SZ);
+                    self.wire.truncate(n);
+                    Ok(n)
+                }
+            }
+            None => Err(WireGuardError::NoCurrentSession),
+        });
+    }
+}
+
+/// A chunk of jobs travelling to or from a worker — one contiguous job
+/// range, one message, in one direction. The pool's two entry points
+/// share the resident threads but a pass is always homogeneous:
+/// `run` only sends and unwraps `Rx`, `run_tx` only `Tx` — a foreign
+/// variant coming back can only mean a worker replayed a stale chunk,
+/// which the caller treats like a mid-pass worker death (and
+/// `debug_assert`s away).
+enum JobChunk {
+    Rx(Vec<CryptoJob>),
+    Tx(Vec<TxCryptoJob>),
+}
+
 /// The resident worker set. One [`CryptoPool::shared`] instance serves
-/// the whole process; `run` serializes callers internally so two actors
-/// can never interleave their chunks on a worker's queue.
+/// the whole process; `run`/`run_tx` serialize callers internally so
+/// two actors can never interleave their chunks on a worker's queue.
 pub struct CryptoPool {
     /// Job chunk → worker.
-    senders: Vec<mpsc::Sender<Vec<CryptoJob>>>,
+    senders: Vec<mpsc::Sender<JobChunk>>,
     /// Worker → finished chunk, one receiver per worker so the caller
     /// drains them in chunk order (the no-reorder guarantee above).
     /// The mutex serializes whole passes: two actors' `run` calls queue
     /// back to back rather than mixing chunks on a worker.
-    inner: Mutex<Vec<mpsc::Receiver<Vec<CryptoJob>>>>,
+    inner: Mutex<Vec<mpsc::Receiver<JobChunk>>>,
 }
 
 impl CryptoPool {
     /// A pool with `workers` resident threads. `workers <= 1` spawns
-    /// nothing — `run` then always takes the serial path, which is also
-    /// what keeps a single-core or `new(1)` test from paying a dead
-    /// thread.
+    /// nothing — `run`/`run_tx` then always take the serial path,
+    /// which is also what keeps a single-core or `new(1)` test from
+    /// paying a dead thread.
     pub fn new(workers: usize) -> Self {
         let mut senders = Vec::new();
         let mut receivers = Vec::new();
         if workers > 1 {
             for _ in 0..workers {
-                let (job_tx, job_rx) = mpsc::channel::<Vec<CryptoJob>>();
-                let (done_tx, done_rx) = mpsc::channel::<Vec<CryptoJob>>();
+                let (job_tx, job_rx) = mpsc::channel::<JobChunk>();
+                let (done_tx, done_rx) = mpsc::channel::<JobChunk>();
                 std::thread::Builder::new()
                     .name("wg-crypto".into())
                     .spawn(move || {
                         while let Ok(mut chunk) = job_rx.recv() {
-                            for job in &mut chunk {
-                                job.decrypt();
+                            match &mut chunk {
+                                JobChunk::Rx(jobs) => {
+                                    for job in jobs {
+                                        job.decrypt();
+                                    }
+                                }
+                                JobChunk::Tx(jobs) => {
+                                    for job in jobs {
+                                        job.seal();
+                                    }
+                                }
                             }
                             if done_tx.send(chunk).is_err() {
                                 return;
@@ -171,10 +282,11 @@ impl CryptoPool {
     /// The process-wide pool — one resident set shared by every
     /// outbound pump and every inbound listener actor. `OnceLock` init
     /// spawns the workers on first use; callers go through
-    /// [`run_shared`](Self::run_shared), whose `n <= 2` serial shortcut
-    /// keeps even that lazy — a process with no WireGuard traffic (or
-    /// only small batches) never resolves `shared()` at all, so the
-    /// workers spawn on the first genuinely parallel pass.
+    /// [`run_shared`](Self::run_shared) /
+    /// [`run_tx_shared`](Self::run_tx_shared), whose `n <= 2` serial
+    /// shortcut keeps even that lazy — a process with no WireGuard
+    /// traffic (or only small batches) never resolves `shared()` at
+    /// all, so the workers spawn on the first genuinely parallel pass.
     pub fn shared() -> &'static CryptoPool {
         static POOL: OnceLock<CryptoPool> = OnceLock::new();
         POOL.get_or_init(|| CryptoPool::new(Self::default_workers()))
@@ -193,11 +305,30 @@ impl CryptoPool {
         Self::shared().run(jobs);
     }
 
+    /// [`run_shared`](Self::run_shared)'s TX twin — the entry point the
+    /// pump's and the listener actor's egress drains use. Same lazy
+    /// `n <= 2` shortcut, same process-wide pool underneath.
+    pub fn run_tx_shared(jobs: &mut Vec<TxCryptoJob>) {
+        if jobs.len() <= 2 {
+            Self::run_tx_serial(jobs);
+            return;
+        }
+        Self::shared().run_tx(jobs);
+    }
+
     /// The serial fallback — every job's open inline on the calling
     /// thread, in order.
     fn run_serial(jobs: &mut [CryptoJob]) {
         for job in jobs.iter_mut() {
             job.decrypt();
+        }
+    }
+
+    /// [`run_serial`](Self::run_serial)'s TX twin — inline seals, in
+    /// order.
+    fn run_tx_serial(jobs: &mut [TxCryptoJob]) {
+        for job in jobs.iter_mut() {
+            job.seal();
         }
     }
 
@@ -214,10 +345,40 @@ impl CryptoPool {
     /// one), never a shared tokio worker: the blocking join would
     /// stall the runtime's other tasks for the pass's duration.
     pub fn run(&self, jobs: &mut Vec<CryptoJob>) {
+        self.dispatch(jobs, JobChunk::Rx, |chunk| match chunk {
+            JobChunk::Rx(jobs) => Some(jobs),
+            JobChunk::Tx(_) => None,
+        });
+    }
+
+    /// [`run`](Self::run)'s TX twin — one seal batch through the same
+    /// resident workers, same order-preserving merge, same serial
+    /// fallbacks.
+    pub fn run_tx(&self, jobs: &mut Vec<TxCryptoJob>) {
+        self.dispatch(jobs, JobChunk::Tx, |chunk| match chunk {
+            JobChunk::Tx(jobs) => Some(jobs),
+            JobChunk::Rx(_) => None,
+        });
+    }
+
+    /// The chunk-split / dispatch / positional-merge both directions
+    /// share — the job-type-generic half of `run`. `wrap` packs a
+    /// chunk for the channel, `unwrap` unpacks the returned message
+    /// (failing only on a foreign variant — impossible while passes
+    /// stay homogeneous, guarded by `debug_assert` and treated like a
+    /// dead worker's lost chunk in release).
+    fn dispatch<T, W, U>(&self, jobs: &mut Vec<T>, wrap: W, unwrap: U)
+    where
+        T: JobProcess + Send,
+        W: Fn(Vec<T>) -> JobChunk,
+        U: Fn(JobChunk) -> Option<Vec<T>>,
+    {
         let n = jobs.len();
         let workers = n.min(self.senders.len());
         if workers <= 1 || n <= 2 {
-            Self::run_serial(jobs);
+            for job in jobs.iter_mut() {
+                job.process();
+            }
             return;
         }
 
@@ -225,7 +386,7 @@ impl CryptoPool {
 
         // Split into `workers` contiguous chunks of ceil(n/workers).
         let per = n.div_ceil(workers);
-        let mut chunks: Vec<Vec<CryptoJob>> = Vec::with_capacity(workers);
+        let mut chunks: Vec<Vec<T>> = Vec::with_capacity(workers);
         {
             let mut iter = std::mem::take(jobs).into_iter();
             let mut left = n;
@@ -238,13 +399,13 @@ impl CryptoPool {
 
         // Per-chunk slots keep the merge positional even when a dead
         // worker's chunk lands inline.
-        let mut done: Vec<Option<Vec<CryptoJob>>> = Vec::new();
+        let mut done: Vec<Option<Vec<T>>> = Vec::new();
         done.resize_with(chunks.len(), || None);
         let mut waiting = Vec::with_capacity(chunks.len());
         for (i, chunk) in chunks.into_iter().enumerate() {
-            match self.senders[i].send(chunk) {
+            match self.senders[i].send(wrap(chunk)) {
                 Ok(()) => waiting.push(i),
-                Err(mpsc::SendError(mut chunk)) => {
+                Err(mpsc::SendError(msg)) => {
                     // Dead worker — run the chunk here rather than lose
                     // its datagrams. Cold path: a resident worker only
                     // dies on panic, so the warn never sits in the hot
@@ -252,8 +413,11 @@ impl CryptoPool {
                     tracing::warn!(
                         "wg-crypto worker {i} died before dispatch; running its chunk inline"
                     );
+                    // The message we just built can only hold our own
+                    // variant — unwrap cannot miss.
+                    let mut chunk = unwrap(msg).expect("own chunk variant");
                     for job in &mut chunk {
-                        job.decrypt();
+                        job.process();
                     }
                     done[i] = Some(chunk);
                 }
@@ -261,7 +425,19 @@ impl CryptoPool {
         }
         for i in waiting {
             match rxs[i].recv() {
-                Ok(chunk) => done[i] = Some(chunk),
+                Ok(msg) => match unwrap(msg) {
+                    Some(chunk) => done[i] = Some(chunk),
+                    None => {
+                        // A foreign variant can only come from a worker
+                        // replaying a stale chunk — impossible while
+                        // passes serialize through `inner`; treated as
+                        // a mid-pass loss in release.
+                        debug_assert!(false, "worker returned a foreign chunk variant");
+                        tracing::warn!(
+                            "wg-crypto worker {i} returned a foreign chunk; its datagrams drop"
+                        );
+                    }
+                },
                 // RecvErr ⇒ the worker died mid-pass; the chunk is gone
                 // with it — a drop the caller tolerates like a UDP
                 // drop, but never a silent one.
@@ -278,9 +454,30 @@ impl CryptoPool {
     }
 }
 
+/// The per-job unit of work both job types share — `decrypt` for RX,
+/// `seal` for TX — so [`CryptoPool::dispatch`] stays job-type-generic
+/// without trait objects or enum-wrapped jobs.
+trait JobProcess {
+    fn process(&mut self);
+}
+
+impl JobProcess for CryptoJob {
+    fn process(&mut self) {
+        self.decrypt();
+    }
+}
+
+impl JobProcess for TxCryptoJob {
+    fn process(&mut self) {
+        self.seal();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::noise::Tunn;
+    use crate::x25519;
 
     /// A fake crypto handle is impossible (the job stores a real
     /// `Option<SessionHandle>`), so these exercise the pool's own
@@ -290,6 +487,118 @@ mod tests {
     fn no_session_jobs(n: usize) -> Vec<CryptoJob> {
         (0..n)
             .map(|_| CryptoJob::new(vec![0u8; 64], 64, 0, 0, None))
+            .collect()
+    }
+
+    /// TX twin of [`no_session_jobs`] — `crypto: None` resolves to
+    /// `NoCurrentSession` per job.
+    fn no_session_tx_jobs(n: usize) -> Vec<TxCryptoJob> {
+        (0..n)
+            .map(|i| TxCryptoJob::new(vec![i as u8; 64], vec![0u8; 256], i as u64, None))
+            .collect()
+    }
+
+    /// Two `Tunn`s with a completed handshake — the only way to mint a
+    /// real `SessionHandle` for a TX job (the session types stay
+    /// crate-private; `Tunn`'s own ring mints them).
+    fn session_pair() -> (Tunn, Tunn) {
+        let a_secret = x25519::StaticSecret::from([0xA1; 32]);
+        let a_public = x25519::PublicKey::from(&a_secret);
+        let b_secret = x25519::StaticSecret::from([0xB2; 32]);
+        let b_public = x25519::PublicKey::from(&b_secret);
+        let mut a = Tunn::new(a_secret, b_public, None, None, 0, None);
+        let mut b = Tunn::new(b_secret, a_public, None, None, 0, None);
+        let mut wire = vec![0u8; 2048];
+        let init = {
+            let crate::noise::TunnResult::WriteToNetwork(p) =
+                a.format_handshake_initiation(&mut wire, false)
+            else {
+                panic!("initiator formats an initiation");
+            };
+            p.to_vec()
+        };
+        let resp = {
+            let crate::noise::TunnResult::WriteToNetwork(p) = b.decapsulate(None, &init, &mut wire)
+            else {
+                panic!("responder answers the initiation");
+            };
+            p.to_vec()
+        };
+        let keepalive = {
+            let crate::noise::TunnResult::WriteToNetwork(p) = a.decapsulate(None, &resp, &mut wire)
+            else {
+                panic!("initiator consumes the response");
+            };
+            p.to_vec()
+        };
+        let res = b.decapsulate(None, &keepalive, &mut wire);
+        assert!(
+            matches!(res, crate::noise::TunnResult::Done),
+            "responder consumes the keepalive, got {res:?}"
+        );
+        (a, b)
+    }
+
+    /// One more full handshake round on an already-linked pair —
+    /// bumps `current` to a fresh session on both sides, the same
+    /// rekey a mid-batch rotation performs.
+    fn rotate_session(a: &mut Tunn, b: &mut Tunn) {
+        let mut wire = vec![0u8; 2048];
+        let init = {
+            let crate::noise::TunnResult::WriteToNetwork(p) =
+                a.format_handshake_initiation(&mut wire, false)
+            else {
+                panic!("initiator re-formats an initiation");
+            };
+            p.to_vec()
+        };
+        let resp = {
+            let crate::noise::TunnResult::WriteToNetwork(p) = b.decapsulate(None, &init, &mut wire)
+            else {
+                panic!("responder answers the re-initiation");
+            };
+            p.to_vec()
+        };
+        let keepalive = {
+            let crate::noise::TunnResult::WriteToNetwork(p) = a.decapsulate(None, &resp, &mut wire)
+            else {
+                panic!("initiator consumes the re-response");
+            };
+            p.to_vec()
+        };
+        let res = b.decapsulate(None, &keepalive, &mut wire);
+        assert!(
+            matches!(res, crate::noise::TunnResult::Done),
+            "responder consumes the re-keepalive, got {res:?}"
+        );
+    }
+
+    /// A minimal valid IPv4 inner — `validate_decapsulated_packet`
+    /// checks the version nibble and that the header's total length
+    /// (24) does not exceed the packet; `tag` in the last byte keeps
+    /// job identity observable across the merge.
+    fn inner_packet(tag: u8) -> Vec<u8> {
+        vec![
+            0x45, 0, 0, 0x18, 0, 0, 0, 0, 64, 6, 0, 0, 10, 0, 0, 1, 10, 0, 0, 2, 0xde, 0xad, 0xbe,
+            tag,
+        ]
+    }
+
+    /// A TX batch over a real session: `handle`'s counters block-
+    /// reserved, each job's `inner` stamped with its index so merge
+    /// order is observable, each `wire` full-size scratch.
+    fn tx_jobs(handle: &SessionHandle, base: u64, n: usize) -> Vec<TxCryptoJob> {
+        (0..n)
+            .map(|i| {
+                let mut job = TxCryptoJob::new(
+                    inner_packet(i as u8),
+                    vec![0u8; 2048],
+                    base + i as u64,
+                    Some(handle.clone()),
+                );
+                job.tag = i;
+                job
+            })
             .collect()
     }
 
@@ -346,5 +655,156 @@ mod tests {
                 Some(Err(WireGuardError::NoCurrentSession))
             ));
         }
+    }
+
+    /// PATCH(19): the TX serial fallback — `n <= 2` resolves inline on
+    /// both entry points (`run_tx` and `run_tx_shared`), and `new(1)`
+    /// resolves a full batch without workers.
+    #[test]
+    fn parallel_tx_serial_fallback() {
+        let pool = CryptoPool::new(4);
+        for n in [0usize, 1, 2] {
+            let mut jobs = no_session_tx_jobs(n);
+            pool.run_tx(&mut jobs);
+            assert_eq!(jobs.len(), n);
+            for (i, job) in jobs.iter().enumerate() {
+                assert!(
+                    matches!(job.result, Some(Err(WireGuardError::NoCurrentSession))),
+                    "job {i} must be resolved"
+                );
+            }
+        }
+
+        // `run_tx_shared` takes the same inline arm for a small batch.
+        let mut jobs = no_session_tx_jobs(2);
+        CryptoPool::run_tx_shared(&mut jobs);
+        for job in &jobs {
+            assert!(matches!(
+                job.result,
+                Some(Err(WireGuardError::NoCurrentSession))
+            ));
+        }
+
+        // new(1) spawns nothing; run_tx still resolves every job.
+        let pool = CryptoPool::new(1);
+        let mut jobs = no_session_tx_jobs(8);
+        pool.run_tx(&mut jobs);
+        assert_eq!(jobs.len(), 8);
+        for job in &jobs {
+            assert!(matches!(
+                job.result,
+                Some(Err(WireGuardError::NoCurrentSession))
+            ));
+        }
+    }
+
+    /// PATCH(19): 64 real seals through the pool — job order preserved
+    /// in the merged vec (identity rides `inner`, which the seal never
+    /// rewrites), every result is `Ok(inner + DATA_OVERHEAD_SZ)`, the
+    /// wire headers carry the reserved counters in order, and the peer
+    /// opens every datagram back to its inner packet end to end.
+    #[test]
+    fn parallel_tx_order_preserved() {
+        let (a, mut b) = session_pair();
+        let handle = a.current_session_handle().expect("session is up");
+        let base = handle.reserve_tx_counters(64);
+        let mut jobs = tx_jobs(&handle, base, 64);
+
+        let pool = CryptoPool::new(4);
+        pool.run_tx(&mut jobs);
+
+        assert_eq!(jobs.len(), 64);
+        let mut wire = vec![0u8; 2048];
+        for (i, job) in jobs.iter().enumerate() {
+            // Merge order: the job at position i is the one built at i.
+            assert_eq!(
+                *job.inner.last().expect("inner payload"),
+                i as u8,
+                "job order must be preserved"
+            );
+            let Some(Ok(wire_len)) = job.result else {
+                panic!("job {i} must seal, got {:?}", job.result);
+            };
+            assert_eq!(wire_len, job.inner.len() + DATA_OVERHEAD_SZ);
+            assert_eq!(job.wire.len(), wire_len, "wire truncated to the datagram");
+            // Header: DATA type, then the reserved counter in position.
+            assert_eq!(u32::from_le_bytes(job.wire[0..4].try_into().unwrap()), 4);
+            assert_eq!(
+                u64::from_le_bytes(job.wire[8..16].try_into().unwrap()),
+                base + i as u64,
+                "the wire header carries the job's reserved counter"
+            );
+            // The peer opens it back to the same inner packet.
+            let res = b.decapsulate(None, &job.wire[..wire_len], &mut wire);
+            match res {
+                crate::noise::TunnResult::WriteToTunnelV4(b_out, _)
+                | crate::noise::TunnResult::WriteToTunnelV6(b_out, _) => {
+                    assert_eq!(b_out, &job.inner[..], "decrypted inner matches");
+                }
+                other => panic!("peer must decrypt job {i}'s datagram, got {other:?}"),
+            }
+        }
+    }
+
+    /// PATCH(19): a handle captured in Phase A outlives the session it
+    /// cloned — eight rotations fill the whole session ring and evict
+    /// the original slot, yet the `Arc`'d crypto still seals a
+    /// well-formed datagram (exactly the mid-batch-rotation window the
+    /// serial path's per-packet `current` re-read had), while
+    /// `current_session_handle` now returns the newest session and its
+    /// seal decrypts at the peer.
+    #[test]
+    fn parallel_tx_session_rotation_mid_batch() {
+        let (mut a, mut b) = session_pair();
+        let stale = a.current_session_handle().expect("session is up");
+        let stale_peer_idx = {
+            // Read the index a fresh seal stamps — the session's
+            // sending_index, for comparison with the rotated one.
+            let mut job = TxCryptoJob::new(inner_packet(0), vec![0u8; 256], 0, Some(stale.clone()));
+            job.seal();
+            u32::from_le_bytes(job.wire[4..8].try_into().unwrap())
+        };
+        for _ in 0..8 {
+            rotate_session(&mut a, &mut b);
+        }
+
+        // The stale handle still seals — the datagram is well-formed
+        // under the session it captured (its peer-side slot may be
+        // evicted; sealing itself is what the pin covers).
+        let counter = stale.reserve_tx_counters(1);
+        let mut job = TxCryptoJob::new(inner_packet(1), vec![0u8; 2048], counter, Some(stale));
+        job.seal();
+        assert!(matches!(job.result, Some(Ok(_))));
+        assert_eq!(job.wire[0], 4);
+        assert_eq!(
+            u32::from_le_bytes(job.wire[4..8].try_into().unwrap()),
+            stale_peer_idx,
+            "the captured session still seals under its own index"
+        );
+
+        // The fresh handle seals under the *new* session — a different
+        // sending index — and the peer (post-rotation) opens it.
+        let fresh = a.current_session_handle().expect("session is up");
+        let counter = fresh.reserve_tx_counters(1);
+        let mut job = TxCryptoJob::new(inner_packet(2), vec![0u8; 2048], counter, Some(fresh));
+        job.seal();
+        let Some(Ok(wire_len)) = job.result else {
+            panic!("fresh session seals");
+        };
+        assert_ne!(
+            u32::from_le_bytes(job.wire[4..8].try_into().unwrap()),
+            stale_peer_idx,
+            "eight rotations moved the outbound session"
+        );
+        let mut wire = vec![0u8; 2048];
+        let res = b.decapsulate(None, &job.wire[..wire_len], &mut wire);
+        assert!(
+            matches!(
+                res,
+                crate::noise::TunnResult::WriteToTunnelV4(..)
+                    | crate::noise::TunnResult::WriteToTunnelV6(..)
+            ),
+            "peer opens the fresh-session datagram, got {res:?}"
+        );
     }
 }
