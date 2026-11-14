@@ -198,8 +198,11 @@ struct UdpState {
     local: SocketAddr,
 }
 
-/// The smoltcp/boringtun actor. Constructed inside [`spawn_pump`]'s task
-/// so nothing smoltcp touches ever crosses a task boundary.
+/// The smoltcp/boringtun actor. Constructed by [`spawn_pump`] *before*
+/// the `tokio::spawn` so init failures reach the caller's endpoint-
+/// fallback loop; the `Send` proof below is what makes the move into
+/// the task legal (spec §4.3's "nothing smoltcp touches crosses a task
+/// boundary" predates `Send` being proven).
 struct WgPump {
     name: String,
     tunn: Tunn,
@@ -1662,24 +1665,22 @@ impl WgPump {
 /// Spawn the pump actor for one WireGuard adapter as a `tokio` task on
 /// the caller's runtime (perf-7 P7-2 — the dedicated `std::thread` +
 /// current-thread runtime it replaces was a `!Send` quiche precedent;
-/// smoltcp is `Send`, proven by the const assert above). Everything
-/// smoltcp touches is still built inside the task (spec §4.3 Option A);
-/// only the `Send`-safe parts — the connected std socket, the config,
-/// the mailbox — cross over.
+/// smoltcp is `Send`, proven by the const assert above). The pump is
+/// built *synchronously* — `WgPump::new` failures (reactor
+/// registration, nonblocking setup) return `Err` here so the caller's
+/// endpoint-fallback loop can try the next resolved address, the
+/// contract `ensure_pump` has carried since the threaded pump.
+/// Needs a multi-thread runtime context twice over: `tokio::spawn`
+/// itself, and `run`'s `block_in_place` crypto joins — the production
+/// runtime is one.
 pub(crate) fn spawn_pump(
     config: &WireGuardConfig,
     std_sock: std::net::UdpSocket,
     endpoint_addr: SocketAddr,
-) -> (mpsc::Sender<ActorMsg>, tokio::task::JoinHandle<()>) {
+) -> std::io::Result<(mpsc::Sender<ActorMsg>, tokio::task::JoinHandle<()>)> {
     let (tx, rx) = mpsc::channel::<ActorMsg>(ACTOR_MAILBOX);
-    let config = config.clone();
-    let task = tokio::spawn(async move {
-        match WgPump::new(&config, std_sock, endpoint_addr, rx) {
-            Ok(pump) => pump.run().await,
-            Err(e) => warn!("wireguard {}: pump init failed: {e}", config.name),
-        }
-    });
-    (tx, task)
+    let pump = WgPump::new(config, std_sock, endpoint_addr, rx)?;
+    Ok((tx, tokio::spawn(pump.run())))
 }
 
 /// `ProxyPacketConn` shim for a smoltcp UDP socket. `write_packet` enqueues

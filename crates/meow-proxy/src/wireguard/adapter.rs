@@ -280,31 +280,33 @@ impl WireGuardAdapter {
         let mut last_err: Option<std::io::Error> = None;
         for addr in endpoints {
             match self.bind_endpoint(addr).await {
-                Ok(sock) => {
-                    let (tx, task) = pump::spawn_pump(&self.config, sock, addr);
-                    let handle = Arc::new(PumpHandle {
-                        tx,
-                        task: Some(task),
-                    });
-                    let mut guard = self
-                        .pump
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if self.pump_gen.load(std::sync::atomic::Ordering::Relaxed) != gen {
-                        // reset_sessions ran while this spawn was in
-                        // flight — do not resurrect the session it
-                        // meant to kill.
-                        return Err(MeowError::Proxy(format!(
-                            "wireguard {}: sessions reset during startup",
-                            self.config.name
-                        )));
+                Ok(sock) => match pump::spawn_pump(&self.config, sock, addr) {
+                    Ok((tx, task)) => {
+                        let handle = Arc::new(PumpHandle {
+                            tx,
+                            task: Some(task),
+                        });
+                        let mut guard = self
+                            .pump
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if self.pump_gen.load(std::sync::atomic::Ordering::Relaxed) != gen {
+                            // reset_sessions ran while this spawn was in
+                            // flight — do not resurrect the session it
+                            // meant to kill.
+                            return Err(MeowError::Proxy(format!(
+                                "wireguard {}: sessions reset during startup",
+                                self.config.name
+                            )));
+                        }
+                        if let Some(existing) = guard.as_ref() {
+                            return Ok(Arc::clone(existing));
+                        }
+                        *guard = Some(Arc::clone(&handle));
+                        return Ok(handle);
                     }
-                    if let Some(existing) = guard.as_ref() {
-                        return Ok(Arc::clone(existing));
-                    }
-                    *guard = Some(Arc::clone(&handle));
-                    return Ok(handle);
-                }
+                    Err(e) => last_err = MeowError::prefer_errno_io(last_err, e),
+                },
                 Err(e) => last_err = MeowError::prefer_errno_io(last_err, e),
             }
         }
