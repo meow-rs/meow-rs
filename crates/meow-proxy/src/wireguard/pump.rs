@@ -78,8 +78,19 @@ const IDLE_SLEEP: Duration = Duration::from_millis(10);
 /// rolling accumulation yields the tokio worker once — sibling tasks
 /// (other adapters' pumps on the same worker among them) get scheduled.
 /// The counter rolls across passes, not per-pass: a steady 900 KB/pass
-/// flow still yields every ~1.2 passes rather than never.
+/// flow still yields every ~1.2 passes rather than never. Every payload
+/// path counts — TCP and UDP socket service in both directions, inbound
+/// wire datagrams, sealed inner packets, flushed outbox datagrams — so
+/// no unbounded non-parking workload skips the yield.
 const SERVICE_YIELD_THRESHOLD: usize = 1024 * 1024;
+
+/// The byte counter's low-volume backstop: a flood of *small* datagrams
+/// moves little payload per pass yet still costs real work per pass
+/// (verify, crypto, bookkeeping), so a byte-only threshold would let a
+/// sustained small-packet flood pin a shared worker far longer than
+/// intended. Every pass counts — parked or not — which is coarser than
+/// "non-parking passes" but strictly stronger on the bounding side.
+const SERVICE_YIELD_PASS_LIMIT: usize = 32;
 
 /// Spec §3.7: a WG handshake that has not completed within 10 s fails all
 /// dials still waiting on it.
@@ -251,12 +262,18 @@ struct WgPump {
     /// a flood arriving inside one handshake would push the floor's
     /// zero point past that handshake's completion.
     last_desync_kick: Option<StdInstant>,
-    /// Payload bytes the last service passes moved through smoltcp —
-    /// `send_slice` accepts plus `recv` payloads, accumulated rolling
-    /// across passes. The `run()` loop yields the worker once it crosses
-    /// [`SERVICE_YIELD_THRESHOLD`], so a saturated flow cannot pin a
-    /// shared tokio worker through back-to-back synchronous passes.
+    /// Payload bytes the last service passes moved through the pump —
+    /// `send_slice` accepts and `recv` payloads on the socket paths,
+    /// inbound wire datagrams, sealed inner packets, flushed outbox
+    /// datagrams — accumulated rolling across passes. The `run()` loop
+    /// yields the worker once it crosses [`SERVICE_YIELD_THRESHOLD`],
+    /// so a saturated flow cannot pin a shared tokio worker through
+    /// back-to-back synchronous passes.
     last_service_bytes: usize,
+    /// Passes serviced since the last yield — the backstop
+    /// [`SERVICE_YIELD_PASS_LIMIT`] trips on when per-pass payload is
+    /// too small for the byte counter to notice.
+    last_service_passes: usize,
 }
 
 // The pump rides the shared tokio worker pool (perf-7 P7-2): if any
@@ -340,6 +357,7 @@ impl WgPump {
             last_timer: StdInstant::now(),
             last_desync_kick: None,
             last_service_bytes: 0,
+            last_service_passes: 0,
         })
     }
 
@@ -610,6 +628,10 @@ impl WgPump {
     fn drain_wire(&mut self) {
         let mut slots = std::mem::take(&mut self.rx_slots);
         let n = self.endpoint.recv_batch(&mut slots, WIRE_DRAIN_BUDGET);
+        // Wire bytes count toward the service-yield budget whether a
+        // datagram turns out DATA, handshake, or garbage — the verify +
+        // demux + crypto work below is paid per datagram either way.
+        self.last_service_bytes += slots[..n].iter().map(Vec::len).sum::<usize>();
 
         // Phase A — serial demux: DATA slots become jobs (the Vec
         // travels into the job); everything else is handled inline.
@@ -778,6 +800,7 @@ impl WgPump {
             // queues each inner packet and drives the handshake chain.
             let mut dst = self.take_scratch();
             while let Some(pkt) = self.device.tx_queue.pop_front() {
+                self.last_service_bytes += pkt.len();
                 // `Tunn::encapsulate` *panics* on an undersized dst —
                 // guard rather than trust the MTU accounting.
                 if pkt.len() + meow_wireguard::DATA_OVERHEAD_SZ > dst.len() {
@@ -812,6 +835,7 @@ impl WgPump {
         let mut jobs: Vec<TxCryptoJob> = Vec::with_capacity(n);
         for i in 0..n {
             let pkt = self.device.tx_queue.pop_front().expect("n was snapshotted");
+            self.last_service_bytes += pkt.len();
             if pkt.len() + meow_wireguard::DATA_OVERHEAD_SZ > self.scratch_len {
                 warn!(
                     "wireguard {}: dropping {}B inner packet (scratch buffer {}B)",
@@ -916,6 +940,19 @@ impl WgPump {
         }
     }
 
+    /// Whether the service loop owes the shared worker a yield —
+    /// `run()` consults this between passes. Two independent bounds so
+    /// *no* unbounded non-parking workload skips it: a rolling payload
+    /// count ([`SERVICE_YIELD_THRESHOLD`]) catches saturated bulk
+    /// flows, while a rolling pass count ([`SERVICE_YIELD_PASS_LIMIT`])
+    /// catches high-rate small-datagram floods whose per-pass payload
+    /// the byte counter barely notices but whose per-datagram work —
+    /// verify, demux, crypto — is real.
+    fn service_yield_due(&self) -> bool {
+        self.last_service_bytes >= SERVICE_YIELD_THRESHOLD
+            || self.last_service_passes >= SERVICE_YIELD_PASS_LIMIT
+    }
+
     /// Whether the desync floor permits another initiation: the first
     /// error always may; later ones wait [`DESYNC_KICK_INTERVAL`] out.
     /// The in-flight dedup stays inside `format_handshake_initiation(_,
@@ -964,6 +1001,7 @@ impl WgPump {
                 let refs: Vec<&[u8]> = staged.iter().map(Vec::as_slice).collect();
                 let sent = self.endpoint.send_batch(&refs, self.endpoint_addr);
                 for pkt in staged.drain(..sent) {
+                    self.last_service_bytes += pkt.len();
                     self.return_scratch(pkt);
                 }
                 if staged.is_empty() {
@@ -971,7 +1009,10 @@ impl WgPump {
                 }
                 let pkt = staged.pop_front().expect("non-empty after partial batch");
                 match self.endpoint.try_send(&pkt) {
-                    Ok(_) => self.return_scratch(pkt),
+                    Ok(_) => {
+                        self.last_service_bytes += pkt.len();
+                        self.return_scratch(pkt);
+                    }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         // Requeue the rest of the batch ahead of
                         // whatever the outbox already held, then the
@@ -1441,6 +1482,7 @@ impl WgPump {
                     // make those unreachable; drop the datagram rather than
                     // wedge the queue behind a permanently-failing one.
                     Ok(()) | Err(_) => {
+                        self.last_service_bytes += data.len();
                         st.out.pop_front();
                     }
                 }
@@ -1448,6 +1490,7 @@ impl WgPump {
             while socket.can_recv() {
                 match socket.recv_slice(&mut self.udp_scratch) {
                     Ok((n, meta)) => {
+                        self.last_service_bytes += n;
                         let src = SocketAddr::new(meta.endpoint.addr.into(), meta.endpoint.port);
                         // STRUCTURAL COPY (perf-7 memcpy #6, UDP twin of
                         // the TCP `recv` note above): `recv_slice` fills
@@ -1564,10 +1607,13 @@ impl WgPump {
             // A service pass is synchronous end to end; on the shared
             // worker pool a saturated flow would otherwise monopolise a
             // thread between `select!` parks. Yield once per rolling MiB
-            // moved so co-located tasks stay schedulable.
-            if self.last_service_bytes >= SERVICE_YIELD_THRESHOLD {
+            // moved — or per pass limit, the low-volume backstop — so
+            // co-located tasks stay schedulable.
+            self.last_service_passes += 1;
+            if self.service_yield_due() {
                 tokio::task::yield_now().await;
                 self.last_service_bytes = 0;
+                self.last_service_passes = 0;
             }
             let now = SmolInstant::now();
             self.poll_stack(now);
@@ -3271,6 +3317,29 @@ mod tests {
                 "read-queue depth must cover the advertised window"
             );
         }
+    }
+
+    /// The service-yield contract is two independent bounds, not just
+    /// payload bytes: a flood of small datagrams moves little payload
+    /// per pass but still costs per-datagram work (verify, demux,
+    /// crypto), so the pass counter must trip `service_yield_due` on
+    /// its own — a byte-only gate would let that flood pin a shared
+    /// worker indefinitely.
+    #[tokio::test(flavor = "current_thread")]
+    async fn service_yield_has_a_pass_backstop() {
+        let client_secret = x25519::StaticSecret::from([0x81; 32]);
+        let server_public = x25519::PublicKey::from(&x25519::StaticSecret::from([0x82; 32]));
+        let mut pump = pump_for_test(&test_config(&client_secret, &server_public));
+
+        pump.last_service_bytes = SERVICE_YIELD_THRESHOLD;
+        assert!(pump.service_yield_due(), "the byte arm trips alone");
+        pump.last_service_bytes = 0;
+        assert!(!pump.service_yield_due());
+        pump.last_service_passes = SERVICE_YIELD_PASS_LIMIT;
+        assert!(
+            pump.service_yield_due(),
+            "the pass arm trips alone — the small-datagram backstop"
+        );
     }
 
     /// P7-2's `WgPump: Send` proof is the module-level `const _` assert
