@@ -1695,6 +1695,11 @@ impl DnsClient {
                         est_rtt = ?conn.est_rtt(),
                         "dns doh h2: proven RTT cannot meet the reuse cap; dialing fresh"
                     );
+                    // Retire it, as the TLS pool drops such a conn: left in
+                    // the slot it would keep `doh_h2_install` from taking the
+                    // fresh conn, and every query until it idles out would
+                    // dial.
+                    self.doh_h2_retire(&conn);
                 }
             }
         }
@@ -1905,6 +1910,9 @@ impl DnsClient {
             .uri(doh_h2_uri(sni, path))
             .header(http::header::USER_AGENT, "meow-rs")
             .header(http::header::ACCEPT, "application/dns-message")
+            // As on HTTP/1.1 (`doh_http_exchange`): no coding is decoded,
+            // so ask for none and refuse one a server applies anyway.
+            .header(http::header::ACCEPT_ENCODING, "identity")
             .header(http::header::CONTENT_TYPE, "application/dns-message")
             .header(http::header::CONTENT_LENGTH, wire.len())
             .body(())
@@ -1924,6 +1932,14 @@ impl DnsClient {
         let response = response.await.map_err(|e| doh_h2_error(&e))?;
         if response.status() != http::StatusCode::OK {
             return Err(ClientError::Protocol("doh: non-200 status"));
+        }
+        if response
+            .headers()
+            .get_all(http::header::CONTENT_ENCODING)
+            .iter()
+            .any(|coding| !coding.as_bytes().eq_ignore_ascii_case(b"identity"))
+        {
+            return Err(ClientError::Protocol("doh: unsupported content-encoding"));
         }
         let mut body = response.into_body();
         let mut out = Vec::new();
