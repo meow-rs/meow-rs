@@ -95,7 +95,7 @@ pub const POLL_BURST: usize = 256;
 /// Under normal WG flow the budget rarely trips at all — `PollResult::
 /// None` exits the burst first (the quiet poll after the stack drains).
 /// The budget is the degenerate-load bound, not the everyday exit.
-const POLL_TX_BYTES_BUDGET: usize = 2 * 1024 * 1024;
+pub const POLL_TX_BYTES_BUDGET: usize = 2 * 1024 * 1024;
 
 /// boringtun's own device loop ticks its timers at 250 ms (rekey timeout is
 /// 5 s, jitter ≤ 333 ms — this is well inside slack). Spec §3.4 sketched
