@@ -310,7 +310,13 @@ Patch 18 — Shared session crypto + process-wide data-plane crypto pool
     ciphers without — PATCH(4)'s per-packet `new_from_slice` key
     schedule is gone from the fallback data path too),
     `AtomicU64 sending_key_counter`, and
-    `Mutex<ReceivingKeyCounterValidator>`. `Session` is now just
+    `Mutex<ReceivingKeyCounterValidator>`. The struct is `pub(crate)`
+    so `SessionHandle` can reach it, but of those fields only
+    `receiving_index` is `pub(crate)` (timers.rs reads it for the
+    index-keyed expiry sweep); `sending_index`, both key counters and
+    the AEAD handles stay module-private — cross-module access goes
+    through `SessionCrypto`'s methods, never the fields. `Session` is
+    now just
     `Arc<SessionCrypto>` — the ring's `[Option<Session>; N_SESSIONS]`
     layout is unchanged and `Session` is never cloned; an `Arc` handle
     outlives a mid-batch rotation, which is exactly what a worker job
@@ -425,7 +431,14 @@ Patch 19 — TX parallel crypto (parallel seal on the resident pool)
     Vecs, the inner packet (worker reads; post-pass owns its fate)
     and a scratch `wire` buf (worker writes the whole datagram into
     it and truncates to the wire length on success — `return_scratch`
-    accepts it either way). `JobChunk::{Rx(Vec<CryptoJob>),
+    accepts it either way). `crypto` is a plain `SessionHandle`, not
+    `Option` like the RX job's — a TX job is only built once the
+    caller's Phase A confirmed a session, and a no-session inner takes
+    the serial `queue_packet` + handshake arm, so `Option` would
+    encode a silent drop the serial semantics never had. `tag` (the
+    caller's `ctxs` side-table dense index) is a `new` parameter on
+    both job types — a defaulted tag would silently map `ctxs[0]`.
+    `JobChunk::{Rx(Vec<CryptoJob>),
     Tx(Vec<TxCryptoJob>)}` multiplexes both directions over the same
     resident threads and channels; `run`/`run_tx` share one
     job-type-generic `dispatch` (contiguous chunks, one message per
