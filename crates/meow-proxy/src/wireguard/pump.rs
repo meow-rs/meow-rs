@@ -1537,7 +1537,18 @@ impl WgPump {
         self.flush_outbox();
         'outer: loop {
             // 1. endpoint → tunn → device (bounded nonblocking drain).
-            self.drain_wire();
+            //    `drain_wire`'s Phase-B crypto pass joins the pool's
+            //    resident workers on a blocking `mpsc::recv` while
+            //    holding the pool's pass mutex — a bare call would
+            //    park this shared tokio worker for the join's whole
+            //    duration, so the drain runs under `block_in_place`
+            //    (`run` only ever executes inside `spawn_pump`'s
+            //    `tokio::spawn` on the multi-thread runtime, the one
+            //    flavor where `block_in_place` is legal). The wrap
+            //    lives here rather than inside `drain_wire` because
+            //    tests drive the drain on current-thread runtimes,
+            //    where `block_in_place` panics.
+            tokio::task::block_in_place(|| self.drain_wire());
             // 2. mailbox drain.
             loop {
                 match self.rx.try_recv() {
@@ -1560,7 +1571,9 @@ impl WgPump {
             }
             let now = SmolInstant::now();
             self.poll_stack(now);
-            self.drain_device_tx();
+            // Same `block_in_place` wrap as `drain_wire` above — the
+            // seal pass's worker join must not park a shared worker.
+            tokio::task::block_in_place(|| self.drain_device_tx());
             if self.last_timer.elapsed() >= WG_TIMER_INTERVAL {
                 self.tick_timers();
                 self.last_timer = StdInstant::now();
