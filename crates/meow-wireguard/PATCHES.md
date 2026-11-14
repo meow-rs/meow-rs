@@ -387,6 +387,85 @@ Patch 18 — Shared session crypto + process-wide data-plane crypto pool
   crypto backends build and pass the same tests; `receive_packet_data`
   (the `dst` path `decapsulate` uses) is untouched apart from reading
   through `self.crypto`.
+
+Patch 19 — TX parallel crypto (parallel seal on the resident pool)
+  Motivation: PATCH(18) left `format_packet_data` serial on the
+  pump/actor thread — the last one-core ChaCha20-Poly1305 bound, this
+  time on egress. The fix mirrors the RX pass: block-reserve the
+  batch's counters serially, seal the batch on the resident workers,
+  then emit wire datagrams serially in job order — job order =
+  counter order = the emit order the serial `encapsulate` loop
+  produced.
+  Files:
+  * noise/session.rs: `SessionCrypto::reserve_tx_counters(n) -> u64` —
+    one `fetch_add(n, Relaxed)` returns the base; batch job i seals
+    with `base + i`, so a whole pass costs one atomic instead of one
+    per packet (the counter is a nonce — disjointness is all the wire
+    needs). `format_packet_data_at(&self, src, dst, counter) -> usize`
+    is `format_packet_data`'s body with the counter supplied — same
+    `type‖sending_index‖counter‖ciphertext‖tag` layout, same
+    in-place seal through the cached backend ctx/cipher, same
+    panic-on-undersize contract; `format_packet_data` keeps the serial
+    API and now delegates (fetch one, call `_at`).
+  * noise/mod.rs: `SessionHandle::{reserve_tx_counters, seal_at}` —
+    the pub reservation entry point (callers live in other crates) and
+    the `pub(crate)` caller-counter seal the pool runs.
+    `Tunn::current_session_handle()` clones the `Arc` off
+    `sessions[current % N_SESSIONS]` — the same slot `encapsulate`
+    reads — so a batch captures the outbound session once in Phase A
+    and a mid-pass rotation can't strand its seals.
+    `Tunn::handle_sent_data(src_len)` is `encapsulate`'s bookkeeping
+    tail — `TimeLastPacketSent` → `TimeLastDataPacketSent` (skipped
+    for empty keepalives) → `tx_bytes` — replayed by the post-pass in
+    job order; `encapsulate` itself now delegates to it. `encapsulate`
+    and every exceptional path (no session → `queue_packet` +
+    handshake chain, timers, cookie) are untouched.
+  * crypto_pool.rs: `TxCryptoJob` — sibling type, not a `CryptoJob`
+    enum arm, because the buffer contract differs: it owns *two*
+    Vecs, the inner packet (worker reads; post-pass owns its fate)
+    and a scratch `wire` buf (worker writes the whole datagram into
+    it and truncates to the wire length on success — `return_scratch`
+    accepts it either way). `JobChunk::{Rx(Vec<CryptoJob>),
+    Tx(Vec<TxCryptoJob>)}` multiplexes both directions over the same
+    resident threads and channels; `run`/`run_tx` share one
+    job-type-generic `dispatch` (contiguous chunks, one message per
+    worker, positional merge, dead-worker inline/drop semantics
+    unchanged). A foreign variant coming back is `debug_assert`ed and
+    treated like a mid-pass loss in release. `run_tx_shared` mirrors
+    `run_shared`: the `n <= 2` inline shortcut runs *before*
+    `shared()` resolves, so small batches never spawn the workers.
+  * lib.rs: `TxCryptoJob` re-exported.
+  Callers:
+  * `meow-proxy`'s wireguard pump (`drain_device_tx`): Phase A resolves
+    `current_session_handle` once — `None` falls the *whole* batch
+    back to the serial `encapsulate` loop (the only path that may
+    emit non-DATA: `queue_packet` + handshake initiation need
+    `&mut Tunn`); `Some` reserves one counter block over the queue
+    snapshot and builds jobs (`base + queue-index` — an undersize
+    packet's skipped counter is fine, nonces need uniqueness not
+    contiguity). Phase C walks jobs in order: `enqueue_wg` then
+    `handle_sent_data` per success; every `inner` returns to
+    `tx_pool`, every failed `wire` to `scratch_pool`.
+  * `meow-listener`'s wireguard actor (`drain_device_tx`,
+    `drain_inject`): jobs flatten across all peers in one vector —
+    per-slot session handles cached in a `HashMap`, `job.tag`
+    indexing a `ctxs` side-table of peer slots, counters reserved
+    per packet in queue order (per-peer counters stay monotone in
+    that peer's emit order). Peers with no session take the serial
+    `encapsulate_tx_packet`/`handle_inject` arm inline during Phase
+    A — the only reordering is onto disjoint sinks. The shared
+    `finish_tx_jobs` post-pass runs `handle_sent_data` →
+    `stamp_reserved` → endpoint → `enqueue_outbox` per job in order;
+    `rst_hint` routing is consulted in Phase A and cleared as before;
+    a peer with no endpoint still runs the accounting (the serial
+    path's `encapsulate` did it before the endpoint check dropped
+    the datagram) and returns the sealed `wire` to `scratch_pool`.
+  Invariants kept: counter monotonic order, job order and wire emit
+  order coincide; both backends build and pass the same tests; the
+  RX job/channel types are only generalized (`JobChunk` enum), never
+  re-shaped; `encapsulate`'s serial behavior is preserved verbatim
+  for the no-session and control paths; `meow-wireguard` stays
+  ring-free and dependency-free.
 ```
 
 Notes on what did NOT need patching
