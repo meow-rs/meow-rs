@@ -27,6 +27,12 @@ codegen-units = 1
 panic = "abort"
 opt-level = "z"
 
+# smoltcp's per-byte hot loops (IP/TCP checksum, TCP state processing) are
+# ~40% of the WireGuard data-plane thread under `opt-level = "z"` (measured
+# via `sample` on the perf-7 rig). Compile just this dependency for speed.
+[profile.release.package.smoltcp]
+opt-level = 3
+
 # Profile for dhat heap profiling — keeps debug symbols, no strip, no LTO.
 [profile.dhat]
 inherits = "release"
