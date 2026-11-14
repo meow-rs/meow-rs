@@ -101,14 +101,14 @@ const HANDSHAKE_DIAL_LIMIT: Duration = Duration::from_secs(10);
 const TCP_CONNECT_LIMIT: Duration = Duration::from_secs(25);
 
 /// Once a socket's owning conn is gone on both channel halves the flow has
-/// no consumer left. `conn_gone` can never fire while `graceful_close`
-/// holds — the FIN is already out and `TcpIo::Close` is deliberately
-/// suppressed so the peer's tail bytes survive — and a peer that never
-/// closes back pins the socket forever: smoltcp has no FinWait-2 timeout
-/// and `discard_socket_rx` keeps the receive window open, so the peer's
-/// stream keeps arriving to /dev/null. The grace covers the real teardown
-/// (FIN handshake, `out` flush at socket pace); a peer still open past it
-/// was never going to close.
+/// no consumer left. `conn_gone` can never enqueue `Close` once
+/// `graceful_close` holds — the FIN is already out and `TcpIo::Close` is
+/// deliberately suppressed so the peer's tail bytes survive — and a peer
+/// that never closes back pins the socket forever: smoltcp has no
+/// FinWait-2 timeout and `discard_socket_rx` keeps the receive window
+/// open, so the peer's stream keeps arriving to /dev/null. The grace
+/// covers the real teardown (FIN handshake, `out` flush at socket pace);
+/// a peer still open past it was never going to close.
 const TCP_ORPHAN_GRACE: Duration = Duration::from_secs(2);
 
 /// Floor between desync-triggered handshake initiations — WG's own
@@ -1458,10 +1458,13 @@ impl WgPump {
             }
             // Orphan bound: both channel halves closed means the flow
             // task released the stream entirely — the socket's output
-            // has no consumer and its input is discard-drained. Give a
-            // graceful close the grace to finish, then abort whatever
-            // is still open: without it a FinWait socket under a peer
-            // that keeps streaming lives until session teardown.
+            // has no consumer and its input is discard-drained. Unlike
+            // `conn_gone` the arm needs no `write_rx.is_empty()`: a
+            // jammed closed channel is equally dead, and the grace
+            // abort covers it. Give a graceful close the grace to
+            // finish, then abort whatever is still open: without it a
+            // FinWait socket under a peer that keeps streaming lives
+            // until session teardown.
             if st.write_rx.is_closed() && st.read_tx.is_closed() {
                 match st.dead_since {
                     None => st.dead_since = Some(StdInstant::now()),
