@@ -1683,7 +1683,7 @@ pub async fn parse_dns_from_raw(
     Ok(dns)
 }
 
-/// Prefix of the sentinel dialer target [`apply_dialer_proxies`] binds to a
+/// Prefix of the sentinel dialer target [`collect_dialer_edges`] binds to a
 /// node whose `dialer-proxy` value is malformed in lenient mode. It is never
 /// registered in the proxy map, so the node's dials fail loudly ("not in the
 /// proxy registry", naming the node via the suffix) instead of silently
@@ -1691,47 +1691,49 @@ pub async fn parse_dns_from_raw(
 /// dialer name that resolves to nothing.
 const MALFORMED_DIALER_PREFIX: &str = "__malformed_dialer_proxy__";
 
-/// Apply per-outbound `dialer-proxy` in place (issue #210).
+/// The `dialer-proxy` edges of one `proxies:` list, collected before any
+/// leaf is built.
 ///
-/// For every proxy that declares `dialer-proxy: <name>`, its registry entry is
-/// re-parsed from the raw config with a [`meow_proxy::dialer::NamedProxyDialer`]
-/// injected, so the adapter dials its server through `<name>` transparently
-/// (mihomo `proxyDialer` model).
+/// [`insert_parsed_leaves`] injects each edge into the *single* parse of the
+/// block that declared it — the same shape provider nodes already use —
+/// instead of building every node bare and re-parsing the chained ones
+/// afterwards (issue #513 rework: one construction per block, so an `ss`
+/// node on an external SIP003 plugin spawns its subprocess exactly once).
+struct DialerEdges {
+    /// `(proxy name, dialer name)` per effective declaration, in collection
+    /// order — the same list the old post-build pass returned, feeding the
+    /// post-build checks and [`seed_chain_owners`].
+    declared: Vec<(SmolStr, SmolStr)>,
+    /// `raw_proxies` index of each edge's *effective* block (the last block
+    /// of a duplicated name) → its dialer name, so
+    /// [`insert_parsed_leaves`]'s forward pass can tell which block carries
+    /// the chain. A superseded duplicate must not get it: the registry
+    /// insert is last-wins, and injecting the edge into a block that is
+    /// about to be overwritten would both waste a construction (a second
+    /// plugin subprocess for `ss` + external SIP003) and resurrect the
+    /// earlier definition the file superseded.
+    by_index: HashMap<usize, SmolStr>,
+}
+
+/// Collect proxy -> dialer edges from the raw `proxies:` list, before any
+/// leaf is built.
 ///
-/// `<name>` is bound *late*: the injected dialer keeps the name plus a
-/// [`meow_proxy::dialer::ProxyRegistry`] handle and looks the front proxy up on
-/// every dial, which is what mihomo does (`component/proxydialer/byname.go`).
-/// Capturing the front `Arc` here instead freezes whatever the registry holds
-/// at build time — and since this pass runs *before* groups are built, so that
-/// grouped members inherit the chain (issue #513), a group-valued dialer does
-/// not exist yet at that point.
+/// Iterate in reverse and keep only the first sighting (the *last* block in
+/// the file) per name: the registry-building loop uses `insert`, so for
+/// duplicate `name:` entries the last block is the effective definition.
+/// Collecting edges from superseded duplicates would apply a chain the
+/// effective block never declared.
 ///
-/// Adapter types that do not establish their underlying connection through the
-/// pluggable dialer — `anytls`, `hysteria2` (QUIC), and `ss` with an external
-/// SIP003 plugin — reject the injected dialer at parse time. Those fall back to
-/// wrapping the existing entry with a [`meow_proxy::DialerProxyAdapter`] (relay
-/// chain), which works where `connect_over` is implemented (direct, reject,
-/// http, socks5, snell, vless, vmess, trojan, anytls, and ss without an
-/// external plugin) and fails loudly at dial time otherwise (`hysteria2`,
-/// `ss` + external SIP003). The fallback never degrades to a direct dial, so
-/// a configured chain cannot be silently bypassed.
-///
-/// UDP: Shadowsocks plain relay and SOCKS5 UDP ASSOCIATE now chain — the
-/// front proxy opens a UDP association to the inner node's datagram
-/// endpoint and the protocol framing rides it (mihomo
-/// `proxyDialer.ListenPacket` parity), failing closed when the front
-/// cannot carry UDP. Datagram transports that still cannot chain refuse
-/// rather than leak the real source path; mux-based UDP rides the dialer
-/// over TCP and is unaffected.
-///
-/// A self-referencing dialer, a reference to a name the config does not
-/// declare, or a dialer cycle is a hard config error — silently falling back to
-/// a direct dial would let traffic egress from the real source path past a
-/// chain the user configured for policy/security reasons (Class A, ADR-0002).
-/// A cycle has to be caught here in particular: late binding would turn it into
-/// unbounded recursion on the first dial. Cycles *through group membership* are
-/// checked separately by [`reject_group_membership_cycles`], which runs after
-/// the group build where the real membership is known.
+/// A self-referencing dialer is a hard config error in either mode — the
+/// old post-build pass never warn-skipped it, and silently keeping the node
+/// unchained would dial past the chain the user configured for
+/// policy/security reasons (Class A, ADR-0002). A dialer cycle is a hard
+/// error for the same reason: late binding would turn it into unbounded
+/// recursion on the first dial. The cycle peel here runs on the *declared*
+/// name graph — every member of a pure leaf chain must itself declare an
+/// edge — so it needs no built adapters. Cycles *through group membership*
+/// are checked separately by [`reject_group_membership_cycles`], which runs
+/// after the group build where the real membership is known.
 ///
 /// A malformed (non-string, non-null) `dialer-proxy` value rejects the whole
 /// config under strict; lenient mode instead binds the node to a
@@ -1739,37 +1741,14 @@ const MALFORMED_DIALER_PREFIX: &str = "__malformed_dialer_proxy__";
 /// loudly naming the node — the same "node loads, dial fails" shape mihomo
 /// gives a dialer name that resolves to nothing — rather than silently
 /// egressing direct.
-///
-/// `placeholder_names` carries the leaf names [`insert_parsed_leaves`] bound
-/// as unavailable placeholders: those entries skip the relay-based wrapper
-/// below, since `DialerProxyAdapter::support_udp()` is always `false` and
-/// would hide the placeholder's `true` guard that keeps a UDP rule from
-/// sliding to DIRECT — the node is dead either way, so the chain adds
-/// nothing for TCP.
-///
-/// Returns the applied `(proxy, dialer)` edges so the caller can re-validate
-/// dialer targets once groups have been built (a *declared* group that failed
-/// to build satisfies `dialable` but never enters the registry) and run
-/// [`reject_group_membership_cycles`] against the finished registry.
-fn apply_dialer_proxies(
-    proxies: &mut HashMap<SmolStr, Arc<dyn Proxy>>,
+fn collect_dialer_edges(
     raw_proxies: &[HashMap<String, serde_json::Value>],
-    raw_groups: &[raw::RawProxyGroup],
-    registry: &meow_proxy::dialer::ProxyRegistry,
-    ipv6: bool,
     strict: bool,
-    placeholder_names: &std::collections::HashSet<SmolStr>,
-) -> Result<Vec<(SmolStr, SmolStr)>, anyhow::Error> {
-    // Collect proxy -> dialer edges from the raw config.
-    //
-    // Iterate in reverse and keep only the first sighting (the *last* block in
-    // the file) per name: the registry-building loop uses `insert`, so for
-    // duplicate `name:` entries the last block is the effective definition.
-    // Collecting edges from superseded duplicates would apply a chain the
-    // effective block never declared.
-    let mut edges: Vec<(SmolStr, SmolStr)> = Vec::new();
+) -> Result<DialerEdges, anyhow::Error> {
+    let mut declared: Vec<(SmolStr, SmolStr)> = Vec::new();
+    let mut by_index: HashMap<usize, SmolStr> = HashMap::new();
     let mut seen_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for raw_proxy in raw_proxies.iter().rev() {
+    for (index, raw_proxy) in raw_proxies.iter().enumerate().rev() {
         let Some(name) = raw_proxy.get("name").and_then(|v| v.as_str()) else {
             continue;
         };
@@ -1788,7 +1767,8 @@ fn apply_dialer_proxies(
             Some(v) => match v.as_str() {
                 // Trimmed like the provider-node path so
                 // `dialer-proxy: " front "` resolves `front` identically
-                // on statics instead of missing the `dialable` check below.
+                // on statics instead of missing the `dialable` check in
+                // [`apply_dialer_proxies_validate`].
                 Some(s) if !s.trim().is_empty() => SmolStr::from(s.trim()),
                 // `""` and `~` unset the chain in mihomo — not malformed.
                 Some("") => continue,
@@ -1811,33 +1791,23 @@ fn apply_dialer_proxies(
         if dialer.as_str() == name {
             anyhow::bail!("proxy '{name}': dialer-proxy points to itself");
         }
-        edges.push((SmolStr::from(name), dialer));
+        declared.push((SmolStr::from(name), dialer.clone()));
+        by_index.insert(index, dialer);
     }
-    if edges.is_empty() {
-        return Ok(edges);
-    }
-
-    // Names a dialer may reference. Leaf proxies are in the registry already;
-    // groups are built after this pass, so only their *declared* names count
-    // here, plus `GLOBAL`, which is auto-created when the config omits it.
-    let dialable: std::collections::HashSet<&str> = proxies
-        .keys()
-        .map(SmolStr::as_str)
-        .chain(raw_groups.iter().map(|group| group.name.as_str()))
-        .chain(std::iter::once("GLOBAL"))
-        .collect();
-    for (name, dialer) in &edges {
-        if !dialable.contains(dialer.as_str()) && !dialer.starts_with(MALFORMED_DIALER_PREFIX) {
-            anyhow::bail!("proxy '{name}': dialer-proxy '{dialer}' not found");
-        }
+    if declared.is_empty() {
+        return Ok(DialerEdges { declared, by_index });
     }
 
     // Peel every edge whose dialer declares no dialer of its own. What survives
     // is on a cycle or feeds one, and late binding would recurse forever on it.
-    let mut live: std::collections::HashSet<&SmolStr> = edges.iter().map(|(n, _)| n).collect();
+    // The check only needs the declared name graph — a dialer naming a group
+    // or a leaf that never declares an edge has no outgoing edge and peels
+    // away — so it runs here, ahead of the leaf build, exactly as it did in
+    // the old post-collection pass.
+    let mut live: std::collections::HashSet<&SmolStr> = declared.iter().map(|(n, _)| n).collect();
     loop {
         let before = live.len();
-        for (name, dialer) in &edges {
+        for (name, dialer) in &declared {
             if live.contains(name) && !live.contains(dialer) {
                 live.remove(name);
             }
@@ -1847,7 +1817,7 @@ fn apply_dialer_proxies(
         }
     }
     if !live.is_empty() {
-        let cycle: Vec<String> = edges
+        let cycle: Vec<String> = declared
             .iter()
             .filter(|(name, _)| live.contains(name))
             .map(|(name, dialer)| format!("{name} -> {dialer}"))
@@ -1855,88 +1825,45 @@ fn apply_dialer_proxies(
         anyhow::bail!("dialer-proxy cycle detected: {}", cycle.join(", "));
     }
 
-    // Apply the edges. Order no longer matters — the front hop is resolved at
-    // dial time — so nested chains need no deepest-first deferral pass.
-    for (name, dialer) in &edges {
-        let target = meow_proxy::dialer::DialerTarget::new(dialer.clone(), registry);
-        // `rev()` matters: the registry-building loop above uses `insert`, so
-        // for a config with duplicate `name:` entries the *last* block wins. A
-        // forward `find` here would resurrect the *first* block and silently
-        // swap the running definition out from under the user.
-        let Some(raw) = raw_proxies
-            .iter()
-            .rev()
-            .find(|rp| rp.get("name").and_then(|v| v.as_str()) == Some(name.as_str()))
-        else {
-            // Unreachable in practice — edges are only collected from blocks in
-            // this same list — but refuse instead of silently dialing direct if
-            // the invariant ever breaks.
-            anyhow::bail!(
-                "proxy '{name}': dialer-proxy '{dialer}' not applied; no raw \
-                 config block found for this name"
-            );
-        };
-        // Re-parse the raw block with the by-name dialer injected (mihomo
-        // model), so the adapter's own dial + handshake runs on the tunneled
-        // stream.
-        let proxy_dialer: Arc<dyn meow_proxy::dialer::TcpDialer> = Arc::new(
-            meow_proxy::dialer::NamedProxyDialer::new(target.clone()).owned_by(name.clone()),
-        );
-        match proxy_parser::parse_proxy_with_dialer(raw, &proxy_dialer, ipv6) {
-            Ok(rebuilt) => {
-                proxies.insert(name.clone(), rebuilt);
-            }
-            Err(e) if strict => {
-                // Under `strict` the dial-time failure the relay wrapper
-                // defers to is not acceptable — surface it at load.
-                return Err(anyhow::anyhow!(
-                    "proxy '{name}': cannot inject dialer-proxy '{dialer}' \
-                     (strict mode): {e}"
-                ));
-            }
-            Err(e) => {
-                // The adapter type cannot carry an injected dialer (anytls,
-                // hysteria2, SS-with-external-SIP003-plugin) or the block is
-                // otherwise unparseable. Fall back to the relay-based
-                // `DialerProxyAdapter`, which preserves the pre-dialer
-                // behaviour: it works for the protocols that implement
-                // `connect_over` (direct/reject/http/socks5/snell/vless/
-                // vmess/trojan/anytls/ss-without-external-plugin) and fails
-                // loudly at dial time for the rest (hysteria2, ss + external
-                // SIP003) — never silently dialing direct and leaking past
-                // the chain.
-                //
-                // A node already bound as an unavailable placeholder keeps it
-                // instead of the wrapper: `DialerProxyAdapter::support_udp()`
-                // is always `false`, so wrapping would hide the placeholder's
-                // `true` guard that fails UDP loudly — a UDP rule could then
-                // slide to DIRECT. The chain adds nothing for TCP either way,
-                // since every dial through the dead node already fails.
-                if let Some(inner) = proxies.get(name).cloned() {
-                    if placeholder_names.contains(name) {
-                        debug!(
-                            "proxy '{name}': dialer-proxy '{dialer}' not applied; \
-                             the node is an unavailable placeholder ({e})"
-                        );
-                    } else {
-                        warn!(
-                            "proxy '{name}': cannot inject dialer-proxy '{dialer}' \
-                             ({e}); falling back to the relay-based wrapper"
-                        );
-                        let wrapped: Arc<dyn Proxy> =
-                            Arc::new(meow_proxy::DialerProxyAdapter::new(inner, target));
-                        proxies.insert(name.clone(), wrapped);
-                    }
-                } else {
-                    warn!(
-                        "proxy '{name}': dialer-proxy '{dialer}' not applied \
-                         ({e}); the outbound itself failed to parse"
-                    );
-                }
-            }
+    Ok(DialerEdges { declared, by_index })
+}
+
+/// Validate the `dialer-proxy` edges [`collect_dialer_edges`] declared, now
+/// that every leaf has been built — the check half of the old
+/// `apply_dialer_proxies` pass. The chains themselves are already applied:
+/// [`insert_parsed_leaves`] injected each edge into the single construction
+/// it feeds, so nothing is parsed or replaced here.
+///
+/// Names a dialer may reference: leaf proxies are in the registry already;
+/// groups are built after this pass, so only their *declared* names count
+/// here, plus `GLOBAL`, which is auto-created when the config omits it. A
+/// reference to a name the config does not declare is a hard config error —
+/// silently falling back to a direct dial would let traffic egress from the
+/// real source path past a chain the user configured for policy/security
+/// reasons (Class A, ADR-0002). The caller re-validates every target again
+/// against the finished registry once groups exist (a *declared* group that
+/// failed to build satisfies `dialable` but never enters the registry) and
+/// runs [`reject_group_membership_cycles`] on the same edges.
+fn apply_dialer_proxies_validate(
+    proxies: &HashMap<SmolStr, Arc<dyn Proxy>>,
+    dialer_edges: &[(SmolStr, SmolStr)],
+    raw_groups: &[raw::RawProxyGroup],
+) -> Result<(), anyhow::Error> {
+    if dialer_edges.is_empty() {
+        return Ok(());
+    }
+    let dialable: std::collections::HashSet<&str> = proxies
+        .keys()
+        .map(SmolStr::as_str)
+        .chain(raw_groups.iter().map(|group| group.name.as_str()))
+        .chain(std::iter::once("GLOBAL"))
+        .collect();
+    for (name, dialer) in dialer_edges {
+        if !dialable.contains(dialer.as_str()) && !dialer.starts_with(MALFORMED_DIALER_PREFIX) {
+            anyhow::bail!("proxy '{name}': dialer-proxy '{dialer}' not found");
         }
     }
-    Ok(edges)
+    Ok(())
 }
 
 /// Reject cycles in the declared group-membership graph (issue #562).
@@ -2275,6 +2202,132 @@ pub(crate) fn unavailable_placeholder(
     )))
 }
 
+/// What one `proxies:` block resolved to in [`insert_parsed_leaves`]: the
+/// value to bind under the block's key, plus whether it is an unavailable
+/// placeholder (which fills only a vacant slot) rather than a live adapter.
+/// `None` means the block was skipped after its own warn.
+type ParsedLeaf = Option<(Arc<dyn Proxy>, bool)>;
+
+/// Parse the `dialer-proxy`-edged half of one `proxies:` block for
+/// [`insert_parsed_leaves`] — a single construction attempt per parse path,
+/// the same shape provider nodes already use.
+///
+/// First tries [`proxy_parser::parse_proxy_with_dialer`] with a late-bound
+/// [`meow_proxy::dialer::NamedProxyDialer`] injected (mihomo `proxyDialer`
+/// model): the adapter's own dial + handshake runs on the tunnelled stream.
+/// `<name>` is bound *late* — the injected dialer keeps the name plus a
+/// [`meow_proxy::dialer::ProxyRegistry`] handle and looks the front proxy up
+/// on every dial — so a dialer may name a group or a node declared later in
+/// the file, and nested chains need no ordering pass.
+///
+/// Adapter types that do not establish their underlying connection through
+/// the pluggable dialer — `direct` (resolver-threaded dials stay on the real
+/// path), `anytls`, `hysteria2` (QUIC), and `ss` with an external SIP003
+/// plugin — reject the injected dialer at parse time. Those are re-parsed
+/// *directly* — via [`proxy_parser::parse_static_proxy`] so the
+/// `dns.direct-nameserver` slot wiring matches the unedged path — and
+/// wrapped with a [`meow_proxy::DialerProxyAdapter`] (relay chain), which
+/// works where `connect_over` is implemented and fails loudly at dial time
+/// otherwise. The fallback never degrades to a direct dial, so a configured
+/// chain cannot be silently bypassed.
+///
+/// When both parses fail, lenient mode keeps the old pass's verdicts by
+/// looking up what the name already resolves to: a bound unavailable
+/// placeholder stays unwrapped (a `DialerProxyAdapter` over a dead inner
+/// is non-transparent, so its `support_udp()` is `false` and would hide
+/// the placeholder's `true` guard that keeps a UDP rule from sliding to
+/// DIRECT); a live earlier binding still takes the wrapper; an empty slot
+/// gets the unavailable placeholder when the block is placeholder-eligible,
+/// else a warn-drop.
+///
+/// Return contract mirrors the unedged match arm:
+/// `Ok(Some((proxy, placeholder_bound)))` binds through the shared tail;
+/// `Ok(None)` skips the block (a warn was already emitted); `Err` bails.
+#[allow(clippy::too_many_arguments)]
+fn parse_dialered_leaf(
+    raw_proxy: &HashMap<String, serde_json::Value>,
+    dialer: &SmolStr,
+    proxies: &HashMap<SmolStr, Arc<dyn Proxy>>,
+    placeholder_names: &std::collections::HashSet<SmolStr>,
+    resolver: Option<&meow_dns::ResolverSlot>,
+    ipv6: bool,
+    strict: bool,
+    registry: &meow_proxy::dialer::ProxyRegistry,
+) -> Result<ParsedLeaf, anyhow::Error> {
+    // Edged blocks always carry `name:` — `collect_dialer_edges` only emits
+    // an edge for a block whose name parses.
+    let name = raw_proxy
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("<unnamed>");
+    let key = SmolStr::from(name);
+    let target = meow_proxy::dialer::DialerTarget::new(dialer.clone(), registry);
+    let proxy_dialer: Arc<dyn meow_proxy::dialer::TcpDialer> =
+        Arc::new(meow_proxy::dialer::NamedProxyDialer::new(target.clone()).owned_by(key.clone()));
+    match proxy_parser::parse_proxy_with_dialer(raw_proxy, &proxy_dialer, ipv6) {
+        Ok(built) => Ok(Some((built, false))),
+        Err(chain_err) if strict => {
+            // Under `strict` the dial-time failure the relay wrapper defers
+            // to is not acceptable — surface it at load, exactly as the old
+            // post-build pass did.
+            Err(anyhow::anyhow!(
+                "proxy '{name}': cannot inject dialer-proxy '{dialer}' \
+                 (strict mode): {chain_err}"
+            ))
+        }
+        Err(chain_err) => match proxy_parser::parse_static_proxy(raw_proxy, ipv6, resolver) {
+            Ok(inner) => {
+                warn!(
+                    "proxy '{name}': cannot inject dialer-proxy '{dialer}' \
+                     ({chain_err}); falling back to the relay-based wrapper"
+                );
+                let wrapped: Arc<dyn Proxy> =
+                    Arc::new(meow_proxy::DialerProxyAdapter::new(inner, target));
+                Ok(Some((wrapped, false)))
+            }
+            Err(parse_err) => {
+                if let Some(existing) = proxies.get(&key) {
+                    if placeholder_names.contains(&key) {
+                        debug!(
+                            "proxy '{name}': dialer-proxy '{dialer}' not applied; \
+                             the node is an unavailable placeholder \
+                             ({chain_err}); the block itself also failed to parse \
+                             ({parse_err})"
+                        );
+                        Ok(None)
+                    } else {
+                        warn!(
+                            "proxy '{name}': cannot inject dialer-proxy '{dialer}' \
+                             ({chain_err}); the block itself also failed to parse \
+                             ({parse_err}); falling back to the relay-based \
+                             wrapper over the earlier same-name binding"
+                        );
+                        let wrapped: Arc<dyn Proxy> = Arc::new(
+                            meow_proxy::DialerProxyAdapter::new(Arc::clone(existing), target),
+                        );
+                        Ok(Some((wrapped, false)))
+                    }
+                } else if let Some(declared) = proxy_parser::placeholder_adapter_type(raw_proxy) {
+                    warn!(
+                        "proxies: '{name}' failed to parse ({parse_err}); keeping the name bound \
+                         to an unavailable node so no dial can fall back past it"
+                    );
+                    Ok(Some((
+                        unavailable_placeholder(name, &parse_err, declared),
+                        true,
+                    )))
+                } else {
+                    warn!(
+                        "proxy '{name}': dialer-proxy '{dialer}' not applied \
+                         ({parse_err}); the outbound itself failed to parse"
+                    );
+                    Ok(None)
+                }
+            }
+        },
+    }
+}
+
 /// Parse every `proxies:` leaf entry into `proxies`, keyed by its YAML `name:`
 /// (`proxy.name()` only as fallback — `DirectAdapter::name()` is hardcoded to
 /// "DIRECT" and would overwrite the built-in, hiding a user-named direct proxy
@@ -2283,8 +2336,20 @@ pub(crate) fn unavailable_placeholder(
 /// `include-all-proxies` and membership cycles. Factored out of
 /// `build_proxy_layer` so the key derivation lives in exactly one place.
 ///
-/// Returns the names this pass bound as unavailable placeholders, for
-/// [`apply_dialer_proxies`] to leave unwrapped.
+/// `dialer_edges` maps each block index [`collect_dialer_edges`] assigned a
+/// `dialer-proxy` edge to the dialer name; those blocks go through
+/// [`parse_dialered_leaf`]'s single chained parse (plus direct re-parse
+/// fallback) instead of the bare [`proxy_parser::parse_static_proxy`], so an
+/// edged block is constructed at most once per parse path — never built
+/// bare and then rebuilt for the chain. `registry` is the late-binding
+/// handle the injected [`meow_proxy::dialer::NamedProxyDialer`]s keep; the
+/// caller must publish the finished map into it or every injected dial
+/// fails "not in the proxy registry".
+///
+/// Returns the names this pass bound as unavailable placeholders — edged
+/// blocks consult it mid-loop to keep an already-bound placeholder
+/// unwrapped, and tests reuse it for assertions.
+#[allow(clippy::too_many_arguments)]
 fn insert_parsed_leaves(
     proxies: &mut HashMap<SmolStr, Arc<dyn Proxy>>,
     static_proxy_names: &mut std::collections::HashSet<SmolStr>,
@@ -2292,10 +2357,26 @@ fn insert_parsed_leaves(
     resolver: Option<&meow_dns::ResolverSlot>,
     ipv6: bool,
     strict: bool,
+    registry: &meow_proxy::dialer::ProxyRegistry,
+    dialer_edges: &HashMap<usize, SmolStr>,
 ) -> Result<std::collections::HashSet<SmolStr>, anyhow::Error> {
     let mut placeholder_names = std::collections::HashSet::new();
-    for raw_proxy in raw_proxies {
-        let (proxy, placeholder_bound) =
+    for (index, raw_proxy) in raw_proxies.iter().enumerate() {
+        let (proxy, placeholder_bound) = if let Some(dialer) = dialer_edges.get(&index) {
+            match parse_dialered_leaf(
+                raw_proxy,
+                dialer,
+                proxies,
+                &placeholder_names,
+                resolver,
+                ipv6,
+                strict,
+                registry,
+            )? {
+                Some(bound) => bound,
+                None => continue,
+            }
+        } else {
             match proxy_parser::parse_static_proxy(raw_proxy, ipv6, resolver) {
                 Ok(proxy) => (proxy, false),
                 Err(e) if strict => {
@@ -2332,7 +2413,8 @@ fn insert_parsed_leaves(
                         continue;
                     }
                 }
-            };
+            }
+        };
         // Prefer the YAML `name:` as the registry key. `proxy.name()`
         // is fine for SS/Trojan/VLESS (their parsers thread the name
         // into the adapter) but `DirectAdapter::name()` is hardcoded
@@ -2381,8 +2463,9 @@ fn insert_parsed_leaves(
                 warn!("duplicate proxy name '{key}': the later entry replaces the earlier one");
             }
             // A *live* duplicate still wins over an earlier placeholder —
-            // the normal insert replaces it, so unmark the name first or
-            // `apply_dialer_proxies` would skip wrapping a working node.
+            // the normal insert replaces it, so unmark the name first or a
+            // later same-named edged block would mistake it for a bound
+            // placeholder and leave it unwrapped.
             placeholder_names.remove(&key);
             proxies.insert(key, proxy);
         }
@@ -2580,13 +2663,25 @@ fn build_proxy_layer(
         ))),
     );
 
-    let placeholder_names = insert_parsed_leaves(
+    // Collect `dialer-proxy` edges (issue #210) *before* any leaf is built:
+    // the raw-name, self-reference, malformed-value and declared-cycle checks
+    // all run on the declared name graph, so they need no adapters. The
+    // collected edges then steer [`insert_parsed_leaves`]'s single chained
+    // parse — the same shape provider nodes already use — instead of the old
+    // build-bare-then-re-parse pass, whose double construction could spawn an
+    // `ss` node's external SIP003 subprocess twice.
+    let raw_proxies = raw.proxies.as_deref().unwrap_or(&[]);
+    let dialer_edges = collect_dialer_edges(raw_proxies, strict)?;
+
+    insert_parsed_leaves(
         &mut proxies,
         &mut static_proxy_names,
-        raw.proxies.as_deref().unwrap_or(&[]),
+        raw_proxies,
         resolver,
         ipv6,
         strict,
+        registry,
+        &dialer_edges.by_index,
     )?;
 
     let raw_groups = raw.proxy_groups.as_deref().unwrap_or(&[]);
@@ -2630,23 +2725,17 @@ fn build_proxy_layer(
 
     reject_declared_group_cycles(raw_groups)?;
 
-    // Apply per-outbound `dialer-proxy` chains (issue #210) *before* groups are
-    // built: groups clone their members eagerly, so a chain applied afterwards
-    // would only cover direct rule references and a grouped node would silently
-    // bypass it (issue #513). The front hop is resolved by name at dial time,
-    // which is what lets a dialer name a group that does not exist yet here.
-    let dialer_edges = apply_dialer_proxies(
-        &mut proxies,
-        raw.proxies.as_deref().unwrap_or(&[]),
-        raw_groups,
-        registry,
-        ipv6,
-        strict,
-        &placeholder_names,
-    )?;
+    // Validate the `dialer-proxy` targets now that every leaf is built: the
+    // static contract accepts leaf names, *declared* group names and
+    // `GLOBAL`, and the post-build recheck below narrows that to what
+    // actually landed. The chains themselves are already applied by the
+    // leaf pass — groups built afterwards clone the finished (chained or
+    // wrapped) members eagerly, which is what keeps a grouped node from
+    // bypassing its chain (issue #513).
+    apply_dialer_proxies_validate(&proxies, &dialer_edges.declared, raw_groups)?;
 
     // Mihomo expands `include-all-proxies` from the top-level `proxies:`
-    // entries only. Capture those adapters after dialer wrapping but before
+    // entries only. Capture those adapters after dialer chaining but before
     // any groups enter the registry, and keep mihomo's name-sorted order.
     let mut include_all_proxies: Vec<(SmolStr, Arc<dyn Proxy>)> = static_proxy_names
         .iter()
@@ -2910,7 +2999,7 @@ fn build_proxy_layer(
     // first dial report it late. Lenient-mode malformed-value sentinels are
     // exempt: they are deliberately unresolvable so the node's dials fail
     // loudly at dial time rather than here at load.
-    for (name, dialer) in &dialer_edges {
+    for (name, dialer) in &dialer_edges.declared {
         if !proxies.contains_key(dialer.as_str()) && !dialer.starts_with(MALFORMED_DIALER_PREFIX) {
             anyhow::bail!(
                 "proxy '{name}': dialer-proxy '{dialer}' is declared but did \
@@ -2923,14 +3012,14 @@ fn build_proxy_layer(
     // failed GLOBAL that the auto-create just backstopped — are only decidable
     // now that the registry is finished.
     reject_group_membership_cycles(
-        &dialer_edges,
+        &dialer_edges.declared,
         raw_groups,
         &proxies,
         &static_proxy_names,
         global_auto_created,
     )?;
 
-    seed_chain_owners(&dialer_edges, &proxies);
+    seed_chain_owners(&dialer_edges.declared, &proxies);
 
     Ok(proxies)
 }
@@ -5811,6 +5900,8 @@ mod missing_plugin_placeholder_tests {
             None,
             false,
             false,
+            &meow_proxy::dialer::ProxyRegistry::default(),
+            &HashMap::new(),
         )
         .unwrap();
         let bound = proxies
@@ -5833,6 +5924,8 @@ mod missing_plugin_placeholder_tests {
             None,
             false,
             true,
+            &meow_proxy::dialer::ProxyRegistry::default(),
+            &HashMap::new(),
         )
         .unwrap_err();
         assert!(
@@ -5977,8 +6070,8 @@ mod missing_plugin_placeholder_tests {
     /// that came first — upstream dropped it, so it could never displace a
     /// working node; the placeholder fills only an empty slot. (A live
     /// duplicate still replaces an earlier placeholder, via the normal
-    /// insert — and the placeholder set must forget the name so
-    /// `apply_dialer_proxies` wraps it normally.)
+    /// insert — and the placeholder set must forget the name so a later
+    /// same-named edged block wraps it normally.)
     #[cfg(all(feature = "ss", not(feature = "gost-plugin")))]
     #[test]
     fn placeholder_duplicate_never_shadows_a_live_binding() {
@@ -6012,6 +6105,8 @@ mod missing_plugin_placeholder_tests {
             None,
             false,
             false,
+            &meow_proxy::dialer::ProxyRegistry::default(),
+            &HashMap::new(),
         )
         .unwrap();
         assert_eq!(
@@ -6035,6 +6130,8 @@ mod missing_plugin_placeholder_tests {
             None,
             false,
             false,
+            &meow_proxy::dialer::ProxyRegistry::default(),
+            &HashMap::new(),
         )
         .unwrap();
         assert_eq!(
@@ -6114,9 +6211,9 @@ mod dialer_proxy_tests {
         !Arc::ptr_eq(b, a)
     }
 
-    /// Run the dialer pass against a fresh by-name registry and publish it on
-    /// success, the way `rebuild_from_raw_impl` does — without the publish the
-    /// chained adapters cannot resolve their front hop at dial time.
+    /// Run the dialer pipeline against a fresh by-name registry and publish it
+    /// on success, the way `rebuild_from_raw_impl` does — without the publish
+    /// the chained adapters cannot resolve their front hop at dial time.
     ///
     /// Returns the registry: `DialerTarget`s hold it weakly (issue #533), so a
     /// test that actually dials must keep the handle alive for the duration.
@@ -6132,21 +6229,29 @@ mod dialer_proxy_tests {
     /// for the group build by giving every declared group a registry entry —
     /// the cycle check models declared membership, so what the entry *is*
     /// does not matter, only that it exists.
+    ///
+    /// Mirrors `build_proxy_layer`'s order — collect the edges, single-parse
+    /// the leaves with them, validate targets, then stub groups and run the
+    /// membership-cycle check — minus the real group construction.
     fn apply_chains_with_groups(
         proxies: &mut HashMap<SmolStr, Arc<dyn Proxy>>,
         raw_proxies: &[HashMap<String, serde_json::Value>],
         raw_groups: &[raw::RawProxyGroup],
     ) -> Result<meow_proxy::dialer::ProxyRegistry, anyhow::Error> {
         let registry = meow_proxy::dialer::ProxyRegistry::default();
-        let edges = apply_dialer_proxies(
+        let edges = collect_dialer_edges(raw_proxies, false)?;
+        let mut static_proxy_names = std::collections::HashSet::new();
+        insert_parsed_leaves(
             proxies,
+            &mut static_proxy_names,
             raw_proxies,
-            raw_groups,
-            &registry,
+            None,
             true,
             false,
-            &std::collections::HashSet::new(),
+            &registry,
+            &edges.by_index,
         )?;
+        apply_dialer_proxies_validate(proxies, &edges.declared, raw_groups)?;
         for group in raw_groups {
             proxies
                 .entry(SmolStr::from(group.name.as_str()))
@@ -6159,7 +6264,7 @@ mod dialer_proxy_tests {
             .map(SmolStr::from)
             .collect();
         reject_group_membership_cycles(
-            &edges,
+            &edges.declared,
             raw_groups,
             proxies,
             &include_all_proxy_names,
@@ -6600,6 +6705,10 @@ mod dialer_proxy_tests {
         assert!(!was_wrapped(&before, &proxies, "fast"));
     }
 
+    /// A self-referencing dialer is rejected during edge collection — before
+    /// any leaf is built — in *both* modes. Lenient never warn-skipped it even
+    /// in the old pass: keeping the node unchained would dial past the chain
+    /// the config asked for (Class A, ADR-0002).
     #[test]
     fn self_reference_is_a_config_error() {
         let mut proxies = registry(&["A"]);
@@ -6611,16 +6720,26 @@ mod dialer_proxy_tests {
             "unexpected: {err}"
         );
         assert!(!was_wrapped(&before, &proxies, "A"));
+
+        // Strict bails at the same collection stage.
+        let err = collect_dialer_edges(&[raw_proxy("A", Some("A"))], true)
+            .err()
+            .expect("strict mode rejects a self-reference at edge collection");
+        assert!(
+            err.to_string().contains("points to itself"),
+            "unexpected: {err}"
+        );
     }
 
     #[test]
     fn missing_dialer_is_a_config_error() {
         let mut proxies = registry(&["A"]);
-        let before = proxies.clone();
         let err = apply_chains(&mut proxies, &[raw_proxy("A", Some("ghost"))])
             .expect_err("an unknown dialer must not silently dial direct");
         assert!(err.to_string().contains("not found"), "unexpected: {err}");
-        assert!(!was_wrapped(&before, &proxies, "A"));
+        // The leaf pass may already have wrapped A's entry in-flight — the
+        // single-parse stage runs before target validation by design — but
+        // the build is discarded with the error, so the wrap never ships.
     }
 
     #[test]
@@ -6765,7 +6884,6 @@ mod dialer_proxy_tests {
     /// direct-dial the node (upstream parity; issue #489 review).
     #[test]
     fn malformed_dialer_proxy_is_a_config_error() {
-        let mut proxies = registry(&["A", "B"]);
         let mut raw = raw_proxy("A", None);
         raw.insert(
             "dialer-proxy".to_string(),
@@ -6773,18 +6891,11 @@ mod dialer_proxy_tests {
         );
         // Malformed values are a hard error under `strict` — the lenient
         // fail-at-dial sentinel arm is covered by `strict_mode_tests` at the
-        // rebuild level. `apply_chains` runs the lenient path.
-        let err = apply_dialer_proxies(
-            &mut proxies,
-            &[raw],
-            &[],
-            &meow_proxy::dialer::ProxyRegistry::default(),
-            true,
-            true,
-            &std::collections::HashSet::new(),
-        )
-        .map(|_| ())
-        .expect_err("malformed dialer-proxy must fail under strict");
+        // rebuild level. The check lives in edge collection, before any
+        // leaf is built.
+        let err = collect_dialer_edges(&[raw], true)
+            .err()
+            .expect("malformed dialer-proxy must fail under strict");
         assert!(
             err.to_string().contains("malformed dialer-proxy"),
             "error must name the field: {err}"
@@ -6885,7 +6996,17 @@ mod dialer_proxy_tests {
         let mut names = std::collections::HashSet::new();
 
         tracing::subscriber::with_default(subscriber, || {
-            insert_parsed_leaves(&mut proxies, &mut names, &raws, None, false, false).unwrap();
+            insert_parsed_leaves(
+                &mut proxies,
+                &mut names,
+                &raws,
+                None,
+                false,
+                false,
+                &meow_proxy::dialer::ProxyRegistry::default(),
+                &HashMap::new(),
+            )
+            .unwrap();
         });
 
         assert_eq!(proxies.len(), 1, "last-wins is unchanged");
@@ -6912,7 +7033,6 @@ mod dialer_proxy_tests {
     #[test]
     fn stale_duplicate_dialer_edge_is_ignored() {
         let mut proxies = registry(&["A", "front"]);
-        let before = proxies.clone();
 
         let mut first = raw_socks5_proxy("A", Some("front"), false);
         first.insert(
@@ -6927,10 +7047,17 @@ mod dialer_proxy_tests {
 
         apply_chains(&mut proxies, &[first, last]).expect("the effective block declares no dialer");
 
+        let bound = proxies.get("A").expect("present after");
         assert!(
-            !was_wrapped(&before, &proxies, "A"),
+            !bound.has_configured_dialer(),
             "the last duplicate block declares no dialer-proxy, so no chain \
-             may be applied"
+             may be applied — the single-parse pass must not leak the stale \
+             block's edge into the surviving construction"
+        );
+        assert_eq!(
+            bound.addr(),
+            "127.0.0.1:2222",
+            "the effective (last) block still wins the name"
         );
     }
 
@@ -7036,13 +7163,31 @@ mod dialer_proxy_tests {
     /// drop the user's `dialer-proxy` and egress from the real source path, so
     /// the parser rejects it and the relay-based wrapper takes over — which
     /// fails loudly at dial time rather than dialing direct.
-    #[test]
-    fn types_that_cannot_carry_a_dialer_fall_back_to_the_wrapper() {
-        for ty in ["anytls", "hysteria2"] {
+    ///
+    /// The raw must parse *standalone* (a `password` is required): the
+    /// fallback wraps the re-parsed inner, and only a non-transparent inner
+    /// keeps `support_udp` false — a wrapper over a transparent (direct-class)
+    /// binding legitimately advertises UDP via the front (#D1 semantics).
+    /// `#[tokio::test]` because the direct re-parse really constructs the
+    /// adapter — `anytls` spawns its session-pool reaper on a reactor.
+    #[tokio::test]
+    async fn types_that_cannot_carry_a_dialer_fall_back_to_the_wrapper() {
+        let types: &[&str] = &[
+            #[cfg(feature = "anytls")]
+            "anytls",
+            #[cfg(feature = "hysteria2")]
+            "hysteria2",
+        ];
+        for &ty in types {
             let mut proxies = registry(&["A", "front"]);
             let before = proxies.clone();
 
-            apply_chains(&mut proxies, &[raw_typed_proxy("A", ty, Some("front"))])
+            let mut raw = raw_typed_proxy("A", ty, Some("front"));
+            raw.insert(
+                "password".to_string(),
+                serde_json::Value::String("pw".to_string()),
+            );
+            apply_chains(&mut proxies, &[raw])
                 .expect("valid chain applies via the wrapper fallback");
 
             let after = proxies.get("A").expect("entry survives");
@@ -7053,14 +7198,18 @@ mod dialer_proxy_tests {
             );
             assert!(
                 !after.support_udp(),
-                "{ty}: the wrapper must not advertise UDP over the chain"
+                "{ty}: the wrapper over a non-transparent inner must not \
+                 advertise UDP over the chain"
             );
         }
     }
 
-    /// `ss` with an *external* SIP003 plugin must not be re-parsed: the
-    /// constructor spawns the plugin subprocess, so a second parse would leave
-    /// two copies running whenever a group still holds the original Arc.
+    /// `ss` with an *external* SIP003 plugin must not reach its constructor
+    /// twice: it spawns the plugin subprocess, and a second `Plugin::start`
+    /// would leave two copies running. The single-parse pipeline makes that
+    /// structural — the injected-dialer attempt bails before
+    /// `ShadowsocksAdapter::new` (the defensive `ss` early-reject stays), the
+    /// direct re-parse spawns once, and the wrapper carries the chain.
     #[test]
     fn external_sip003_plugin_is_not_re_parsed() {
         let mut proxies = registry(&["A", "front"]);
@@ -7121,8 +7270,9 @@ mod dialer_proxy_tests {
     fn fallback_wraps_when_re_parse_fails() {
         // A raw proxy with no `type` field cannot be re-parsed — the fallback
         // DialerProxyAdapter wrapper should be used instead. We verify this
-        // by checking that support_udp is false (DialerProxyAdapter always
-        // returns false, even if the inner proxy supported UDP).
+        // by checking that support_udp is false: the wrapper only advertises
+        // UDP for a *transparent* (direct-class) inner, and a socks5 inner
+        // is not one.
         let mut proxies = registry(&["A", "front"]);
         // Give "A" a real socks5 adapter so the fallback has something to wrap.
         let parsed_a = proxy_parser::parse_proxy(&raw_socks5_proxy("A", None, true), true)
@@ -7298,13 +7448,14 @@ mod dialer_proxy_tests {
     }
 
     /// Issue #554 — a `dialer-proxy` member must share ONE health handle
-    /// with its registry adapter. `apply_dialer_proxies` runs before group
-    /// construction (issue #513), so the adapter a group captured is the
-    /// same object `route.proxies` and `group.member_proxies()` serve the
-    /// sweep and API probes. Marking the registry adapter dead must move
-    /// the group's selection — a second `ProxyHealth` minted after group
-    /// capture would leave the group reading a default-alive private
-    /// handle while probes recorded results on the other.
+    /// with its registry adapter. The chain is applied during the leaf
+    /// parse, before group construction (issue #513), so the adapter a
+    /// group captured is the same object `route.proxies` and
+    /// `group.member_proxies()` serve the sweep and API probes. Marking
+    /// the registry adapter dead must move the group's selection — a second
+    /// `ProxyHealth` minted after group capture would leave the group
+    /// reading a default-alive private handle while probes recorded results
+    /// on the other.
     #[test]
     fn dialer_proxy_member_shares_health_with_group_selection() {
         let raw: raw::RawConfig = serde_saphyr::from_str(
@@ -7358,6 +7509,118 @@ rules:
             Some("spare"),
             "a dead registry adapter must stop being selected — a second \
              ProxyHealth minted after group capture would stay default-alive"
+        );
+    }
+
+    /// `type: direct` refuses the injected dialer (a resolver-threaded dial
+    /// belongs on the real path — see `reject_unthreaded_dialer`), so a
+    /// `direct` + `dialer-proxy` node takes the relay-wrapper fallback: the
+    /// wrapper over a *live* Direct inner stays transparent and reports the
+    /// chain. The fallback re-parses through `parse_static_proxy`, which is
+    /// also what wires the `dns.direct-nameserver` slot — verified
+    /// end-to-end below by dialling through the chain: the front `direct`
+    /// hop (itself a `parse_static_proxy` product) resolves the final
+    /// target's name through the configured slot, not the main resolver.
+    #[test]
+    fn direct_node_with_dialer_proxy_wraps_not_injects() {
+        let mut proxies = registry(&["d", "front"]);
+        let mut raw = raw_proxy("d", Some("front"));
+        raw.insert(
+            "type".to_string(),
+            serde_json::Value::String("direct".to_string()),
+        );
+
+        apply_chains(&mut proxies, &[raw])
+            .expect("direct + dialer-proxy falls back to the relay wrapper");
+
+        let bound = proxies.get("d").expect("d survives");
+        let wrapper = bound
+            .as_any()
+            .and_then(|any| any.downcast_ref::<meow_proxy::DialerProxyAdapter>())
+            .expect(
+                "a direct node cannot inject the dialer — it must be the \
+                 relay wrapper",
+            );
+        assert_eq!(wrapper.dialer_name(), "front");
+        assert_eq!(bound.adapter_type(), meow_common::AdapterType::Direct);
+        assert!(
+            bound.has_configured_dialer(),
+            "the declared chain must be reported even through the wrapper"
+        );
+        // A transparent (direct-class) inner makes the wrapper transparent:
+        // `support_udp` true here *proves* the inner is a live Direct
+        // adapter — an unavailable placeholder or an absent parse would
+        // leave it false.
+        assert!(bound.support_udp());
+    }
+
+    /// End-to-end: the `dns.direct-nameserver` slot survives the chained
+    /// build. `front` resolves `node.test` through the slot's direct
+    /// resolver (hosts-mapped to loopback), so the dial through `d`'s
+    /// wrapper lands on the listener — a build that dropped the slot on
+    /// either direct node would fail to resolve and never connect.
+    #[tokio::test]
+    async fn direct_chain_keeps_the_direct_nameserver_slot() {
+        use meow_dns::{HostEntry, Resolver};
+        use meow_trie::DomainTrie;
+
+        let (port, accepts) = counting_listener().await;
+
+        let hosts_only = |ip: std::net::IpAddr| {
+            let mut hosts: DomainTrie<HostEntry> = DomainTrie::new();
+            hosts.insert("node.test", vec![ip].into());
+            Resolver::new(
+                vec![],
+                vec![],
+                meow_common::DnsMode::Normal,
+                hosts,
+                true,
+                true,
+            )
+        };
+        // The main resolver answers `node.test` with an unroutable
+        // documentation-range address; the direct-nameserver resolver maps
+        // it to loopback. Only the slot path can reach the listener.
+        let mut main = hosts_only(std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1)));
+        main.set_direct_resolver(Arc::new(hosts_only(std::net::IpAddr::V4(
+            std::net::Ipv4Addr::LOCALHOST,
+        ))));
+        let slot = meow_dns::new_resolver_slot(Arc::new(main));
+
+        let raw: raw::RawConfig = serde_saphyr::from_str(
+            "proxies:\n\
+             \x20 - name: d\n    type: direct\n    dialer-proxy: front\n\
+             \x20 - name: front\n    type: direct\n",
+        )
+        .unwrap();
+        let result = rebuild_from_raw_with_resolver(&raw, Some(&slot), None, &HashMap::new(), None)
+            .expect("direct chain builds");
+
+        let metadata = meow_common::Metadata {
+            network: meow_common::Network::Tcp,
+            host: "node.test".into(),
+            dst_port: port,
+            ..Default::default()
+        };
+        // `result.dialer_registry` stays alive in `result` for the dial —
+        // `DialerTarget`s bind it weakly (issue #533).
+        let mut conn = result.proxies["d"]
+            .dial_tcp(&metadata)
+            .await
+            .expect("the chain must resolve `node.test` through the slot");
+        // TCP `connect` returns at SYN-ACK, which can precede the spawned
+        // accept task by a scheduling quantum. The listener drops every
+        // accepted stream after bumping the counter, so reading this conn
+        // to EOF is the barrier that proves `accept()` already ran.
+        use tokio::io::AsyncReadExt;
+        let mut buf = [0u8; 1];
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), conn.read(&mut buf)).await;
+        assert_eq!(
+            hits(&accepts),
+            1,
+            "the chain must dial the slot-resolved loopback address — a \
+             dropped direct-nameserver slot resolves `node.test` to the \
+             unreachable main-resolver answer instead"
         );
     }
 }

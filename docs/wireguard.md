@@ -49,11 +49,15 @@ and torn down by `reset_sessions`:
   and UDP flows are smoltcp sockets. WireGuard adds 64 bytes of
   per-packet overhead, so the inner MTU is `mtu - 64` (1356 at the
   default 1420).
-- **The pump** is one dedicated thread per adapter holding the boringtun
-  `Tunn`, the smoltcp stack (which is not `Send`), and the UDP socket to
-  the server endpoint — the same thread-per-session model hysteria2
-  uses for quiche. Every `dial_tcp`/`dial_udp` goes through a mailbox to
-  that thread, and all TCP streams and UDP flows multiplex over the
+- **The pump** is one tokio task per adapter holding the boringtun
+  `Tunn`, the smoltcp stack, and the UDP transport to the server
+  endpoint — a raw socket directly, or a channel bridge to the
+  `dialer-proxy` front's UDP association. It runs on the shared
+  multi-thread runtime (smoltcp's types are `Send`, so the dedicated
+  `std::thread` it replaced bought nothing); `block_in_place` is
+  borrowed only briefly around the batched crypto joins in the wire
+  drain. Every `dial_tcp`/`dial_udp` goes through a mailbox to
+  that task, and all TCP streams and UDP flows multiplex over the
   single WireGuard session. The pump initiates the handshake when it
   starts: a session that is not established within 10 seconds fails the
   waiting dials; a TCP dial otherwise carries a 30-second timeout, a UDP
@@ -85,7 +89,7 @@ A `proxies:` entry with `type: wireguard` takes these fields:
 | `udp` | `bool` | `true` | — | carry UDP flows through the tunnel |
 | `remote-dns-resolve` | `bool` | `true` | — | resolve destination domains inside the tunnel |
 | `dns` | list of nameservers | `[]` | **accepted but ignored** — warns once | per-node tunnel DNS is Phase-2 |
-| `dialer-proxy` | — | — | **hard error** | WG owns its UDP endpoint socket; it cannot ride a TCP dialer |
+| `dialer-proxy` | proxy name | none | front must provide a UDP association | the endpoint's UDP transport rides the front hop (e.g. `direct` with routing-mark, `ss`, `socks5`); a UDP-less front fails at dial time |
 | `amnezia-wg-option` | — | — | **hard error** | AmneziaWG is not in this build (Phase-3) |
 | `ip-stack` | `"gvisor"` / `"system"` | none | accepted; `system` warns once, both map to smoltcp | no kernel WG mode in Phase-1 |
 
@@ -110,6 +114,23 @@ Field notes:
 - **`remote-dns-resolve: false`** restricts the node to IP-literal
   destinations: a domain-named flow fails the dial rather than leaking
   a lookup onto the local network.
+- **`dialer-proxy`** routes the WG endpoint's UDP transport through the
+  named front's UDP association instead of a raw socket — for a routing
+  mark/binding on the egress (`direct`), or a real chained front (`ss`
+  with UDP, `socks5`). A domain `server` is delegated to the front's
+  own resolver (same `Name` semantics as the TCP chain); a front that
+  cannot carry a domain target gets a local-resolution fallback dial
+  per candidate. If the front is a group, whichever member is live at
+  dial time must support UDP — a UDP-less pick fails the endpoint bind,
+  closed like any other endpoint error (never a silent direct egress).
+  Chaining WG *through* WG is legal but pays double crypto + MTU
+  shrink — lower `mtu` accordingly. `persistent-keepalive` holds the
+  front's NAT/association state open; if the front's UDP association
+  still dies, the pump treats the closed proxy endpoint as terminal
+  and exits, so the next dial clears the stale pump and redials the
+  front hop — automatic recovery, no config reload needed. (The direct
+  path without `dialer-proxy` is unchanged: socket recv errors are
+  treated as transient and retried in place.)
 
 ## Example config
 
@@ -164,7 +185,7 @@ selects it.
 | `allowed-ips` | ✓ | default ["0.0.0.0/0", "::/0"] |
 | `remote-dns-resolve` | ✓ | default true |
 | `dns` | accepted (ignored, Phase-1) | custom tunnel DNS planned for Phase-2 |
-| `dialer-proxy` | ✗ hard reject | WireGuard cannot be carried over a TCP dialer |
+| `dialer-proxy` | ✓ (UDP fronts) | endpoint UDP rides the front's UDP association; UDP-less fronts fail at dial time |
 | `ip-stack` | accepted (smoltcp) | "system" silently maps to smoltcp |
 | `amnezia-wg-option` | ✗ hard reject | AmneziaWG planned for Phase-3 |
 
@@ -193,22 +214,30 @@ same path hysteria2's QUIC socket and kcptun use:
 `dialer_hop_network` reports `Network::Udp`, so load-balance groups
 that key members on transport see the node for what it is.
 
-This is also why `dialer-proxy` is a hard error rather than a silent
-fallback: the endpoint socket cannot be replaced by an injected TCP
-dialer.
+A node-level `dialer-proxy` replaces that raw socket with the front
+hop's UDP association rather than fighting the same-loop mechanism:
+`direct` fronts still bind through `bind_udp_for_peer` inside their own
+`dial_udp_conn`, so the interface-binding guarantee above carries over
+to the chained path unchanged.
 
 ## Known limitations (Phase-1)
 
 - **No AmneziaWG.** `amnezia-wg-option` on a node is a hard parse error
   (`'amnezia-wg-option' is not supported in this build`); the obfuscation
   fields and the `<b>`/`<t>`/`<r>` DSL are planned for Phase-3.
-- **No `dialer-proxy` on the node** — a hard parse error at load
-  (`reject_unthreaded_dialer`): the WG transport owns its UDP endpoint
-  socket and cannot be carried over a TCP dialer. A `wireguard` node
-  likewise cannot front another node's `dialer-proxy` chain or sit as a
-  hop in a `relay` group — it exposes no stream transport for the chain
-  to dial through. Put a `fallback`/`url-test` group in front when you
-  need failover.
+- **`dialer-proxy` needs a UDP-capable front** — the WG endpoint's UDP
+  transport rides the front hop's UDP association (`direct` with
+  routing-mark, `ss`, `socks5`, a group whose live member supports
+  UDP). A TCP-only front (e.g. `trojan`, `vless` without UDP) fails the
+  endpoint bind at dial time — closed, never a silent direct egress.
+  Put a `fallback`/`url-test` group in front when you need failover.
+- **Chain head only, never a middle hop.** A `wireguard` node's
+  `dial_tcp`/`dial_udp` are complete tunnel exits, so the node can front
+  another node's `dialer-proxy` chain and can sit as the first hop of a
+  `relay` group — chained destinations pass the same `allowed-ips` gate
+  as any dial. It cannot sit at a later relay hop: it exposes no stream
+  transport for `connect_over` to run the next hop's handshake over, so
+  the trait default `NotSupported` fires at dial.
 - **`dns` is accepted but ignored** — parsed and stored, warned once
   per config load; `remote-dns-resolve` covers tunnel-side resolution
   in Phase-1. Per-node tunnel DNS lists are Phase-2.
@@ -217,9 +246,10 @@ dialer.
   too — there is no kernel WireGuard mode in Phase-1 (a kernel WG
   device would be an OS-managed interface outside meow's adapter
   model).
-- **One pump thread per adapter.** Every flow through a node shares a
-  single-threaded event loop — ample for a WARP-class exit, but one WG
-  node will not scale across cores; run several nodes behind
+- **One pump task per adapter.** Every flow through a node shares a
+  single-actor event loop on the shared runtime (perf-7 moved it off
+  the dedicated `std::thread`) — ample for a WARP-class exit, but one
+  WG node will not scale across cores; run several nodes behind
   `load-balance` when you need more.
 - **`remote-dns-resolve: false` limits the node to IP literals**, per
   the field note above.

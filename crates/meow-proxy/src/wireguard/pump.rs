@@ -28,7 +28,7 @@ use std::time::{Duration, Instant as StdInstant};
 use bytes::{Buf, Bytes};
 use meow_common::{MeowError, ProxyConn, ProxyPacketConn, Result};
 use meow_wgstack::{
-    poll_burst, reset_scratch, BatchEndpoint, ChannelDevice, StreamEvent, TcpIo, WgStream,
+    poll_burst, reset_scratch, ChannelDevice, Endpoint, StreamEvent, TcpIo, WgStream,
     TCP_READ_QUEUE, TCP_SOCKET_BUF, TCP_WRITE_QUEUE, WG_TIMER_INTERVAL, WIRE_DRAIN_BUDGET,
 };
 use meow_wireguard::noise::Packet;
@@ -225,10 +225,13 @@ struct WgPump {
     iface: Interface,
     device: ChannelDevice,
     sockets: SocketSet<'static>,
-    /// The connected peer socket, wrapped for batched `sendmmsg`/
-    /// `recvmmsg` I/O on Linux and `sendmsg_x`/`recvmsg_x` on macOS
-    /// (a `try_*` loop elsewhere).
-    endpoint: BatchEndpoint,
+    /// The connected peer socket (a [`BatchEndpoint`] wrapped for
+    /// batched `sendmmsg`/`recvmmsg` I/O on Linux and
+    /// `sendmsg_x`/`recvmsg_x` on macOS, a `try_*` loop elsewhere) or —
+    /// on a `dialer-proxy` chain — the channel pair bridged to the front
+    /// hop's `ProxyPacketConn` (issue #899). Same method surface either
+    /// way: enum dispatch, no trait object on the drain/flush path.
+    endpoint: Endpoint,
     endpoint_addr: SocketAddr,
     rx: mpsc::Receiver<ActorMsg>,
     /// Conn → pump work-available signal, shared by every stream and
@@ -307,13 +310,10 @@ const _: fn() = || {
 impl WgPump {
     fn new(
         config: &WireGuardConfig,
-        std_sock: std::net::UdpSocket,
+        endpoint: Endpoint,
         endpoint_addr: SocketAddr,
         rx: mpsc::Receiver<ActorMsg>,
-    ) -> std::io::Result<Self> {
-        std_sock.set_nonblocking(true)?;
-        let endpoint = BatchEndpoint::connected(tokio::net::UdpSocket::from_std(std_sock)?);
-
+    ) -> Self {
         let tunn = Tunn::new(
             x25519::StaticSecret::from(config.private_key),
             x25519::PublicKey::from(config.public_key),
@@ -348,7 +348,7 @@ impl WgPump {
 
         let buf_size = usize::from(config.mtu).max(2048) + 64;
         let wake = Arc::new(tokio::sync::Notify::new());
-        Ok(Self {
+        Self {
             name: config.name.clone(),
             tunn,
             iface,
@@ -377,7 +377,7 @@ impl WgPump {
             last_desync_kick: None,
             last_service_bytes: 0,
             last_service_passes: 0,
-        })
+        }
     }
 
     /// A crypto dst buffer for the next `Tunn` call: a pooled one reset
@@ -1007,7 +1007,11 @@ impl WgPump {
     /// returned count). `WouldBlock` requeues the remainder verbatim
     /// and backs off; any other error logs and drops that one
     /// datagram while the rest of the batch continues — the same
-    /// semantics as the per-packet loop.
+    /// semantics as the per-packet loop. `ConnectionReset` is the one
+    /// terminal verdict (`Endpoint::Proxy`'s closed TX channel — the
+    /// front conn is dead): the outbox clears wholesale rather than
+    /// warn-per-packet while the pump's `endpoint.recv` arm is on its
+    /// way to the same verdict and the actor's exit.
     fn flush_outbox(&mut self) {
         let mut staged: VecDeque<Vec<u8>> = VecDeque::with_capacity(WIRE_DRAIN_BUDGET);
         while !self.outbox.is_empty() {
@@ -1041,6 +1045,26 @@ impl WgPump {
                             self.outbox.push_front(tail);
                         }
                         self.outbox.push_front(pkt);
+                        return;
+                    }
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::ConnectionReset
+                            && matches!(self.endpoint, Endpoint::Proxy(_)) =>
+                    {
+                        // `Endpoint::Proxy` only — the TX bridge's
+                        // channel is closed, the front conn is dead,
+                        // and the pump's next `endpoint.recv` returns
+                        // the same verdict and stops the actor. A raw
+                        // socket can report ConnectionReset too (e.g.
+                        // Windows WSAECONNRESET after an ICMP
+                        // port-unreachable), so the variant guard — not
+                        // the error kind alone — makes this arm
+                        // proxy-exclusive. Drop the whole queue in one
+                        // return; WG tolerates the loss and the redial
+                        // re-sends what matters — warn-per-packet until
+                        // the recv arm gets there would only storm.
+                        self.outbox.clear();
+                        self.return_scratch(pkt);
                         return;
                     }
                     Err(e) => {
@@ -1705,11 +1729,34 @@ impl WgPump {
                             .decapsulate_wire(pkt, n)
                             .unwrap_or_else(|| vec![0u8; self.scratch_len]);
                     }
-                    Err(e) => {
-                        warn!("wireguard {}: endpoint recv error: {e}", self.name);
-                        // A dead socket must not spin the loop.
-                        tokio::time::sleep(IDLE_SLEEP).await;
-                    }
+                    Err(e) => match &self.endpoint {
+                        // Raw socket: EAGAIN/EINTR/ENOBUFS-class errnos are
+                        // transient — warn, back off a tick so a dead
+                        // socket cannot spin the loop, retry next pass.
+                        Endpoint::Batch(_) => {
+                            warn!("wireguard {}: endpoint recv error: {e}", self.name);
+                            // A dead socket must not spin the loop.
+                            tokio::time::sleep(IDLE_SLEEP).await;
+                        }
+                        // A `ProxyEndpoint` reports an error only when its
+                        // RX channel is disconnected — the bridge RX task
+                        // exits solely on conn death (or endpoint drop,
+                        // which cannot happen while the pump owns it), so
+                        // `ConnectionReset` here is terminal, not
+                        // transient: spinning cannot revive the front
+                        // conn and would only warn-storm at ~100 Hz while
+                        // outbound datagrams blackhole. Stop the pump;
+                        // `ensure_pump` sees the dead task via
+                        // `is_proxy_dead`, clears the slot and redials
+                        // the front hop.
+                        Endpoint::Proxy(_) => {
+                            warn!(
+                                "wireguard {}: proxy endpoint dead ({e}), stopping pump",
+                                self.name
+                            );
+                            break 'outer;
+                        }
+                    },
                 },
                 _ = self.wake.notified() => {},
                 _ = tokio::time::sleep(delay) => {},
@@ -1723,21 +1770,21 @@ impl WgPump {
 /// the caller's runtime (perf-7 P7-2 — the dedicated `std::thread` +
 /// current-thread runtime it replaces was a `!Send` quiche precedent;
 /// smoltcp is `Send`, proven by the const assert above). The pump is
-/// built *synchronously* — `WgPump::new` failures (reactor
-/// registration, nonblocking setup) return `Err` here so the caller's
-/// endpoint-fallback loop can try the next resolved address, the
-/// contract `ensure_pump` has carried since the threaded pump.
+/// built *synchronously* and is infallible: socket reactor/nonblocking
+/// setup moved out to the adapter's endpoint binding with the
+/// `Endpoint` split, so `ensure_pump`'s endpoint-fallback loop only
+/// ever retries bind/connect failures upstream of this call.
 /// Needs a multi-thread runtime context twice over: `tokio::spawn`
 /// itself, and `run`'s `block_in_place` crypto joins — the production
 /// runtime is one.
 pub(crate) fn spawn_pump(
     config: &WireGuardConfig,
-    std_sock: std::net::UdpSocket,
+    endpoint: Endpoint,
     endpoint_addr: SocketAddr,
-) -> std::io::Result<(mpsc::Sender<ActorMsg>, tokio::task::JoinHandle<()>)> {
+) -> (mpsc::Sender<ActorMsg>, tokio::task::JoinHandle<()>) {
     let (tx, rx) = mpsc::channel::<ActorMsg>(ACTOR_MAILBOX);
-    let pump = WgPump::new(config, std_sock, endpoint_addr, rx)?;
-    Ok((tx, tokio::spawn(pump.run())))
+    let pump = WgPump::new(config, endpoint, endpoint_addr, rx);
+    (tx, tokio::spawn(pump.run()))
 }
 
 /// `ProxyPacketConn` shim for a smoltcp UDP socket. `write_packet` enqueues
@@ -1832,8 +1879,9 @@ mod tests {
     use std::pin::Pin;
     use std::task::{Context, Poll};
 
-    use meow_wgstack::{TcpIo, WgStream};
+    use meow_wgstack::{BatchEndpoint, TcpIo, WgStream};
     use tokio::io::AsyncWrite;
+    use tracing_subscriber::layer::SubscriberExt;
 
     use super::*;
 
@@ -2014,14 +2062,24 @@ mod tests {
         }
     }
 
+    /// Wrap a test socket as the direct-path `Endpoint` — the same
+    /// `set_nonblocking` + `from_std` + `connected` dance
+    /// `WireGuardAdapter::bind_endpoint` performs.
+    fn test_endpoint(std_sock: std::net::UdpSocket) -> Endpoint {
+        std_sock.set_nonblocking(true).expect("nonblocking");
+        Endpoint::Batch(BatchEndpoint::connected(
+            tokio::net::UdpSocket::from_std(std_sock).expect("tokio socket"),
+        ))
+    }
+
     /// A pump on a bound-but-idle loopback endpoint socket.
-    /// `WgPump::new` registers the socket with the current reactor, so
+    /// `test_endpoint` registers the socket with the current reactor, so
     /// call this only inside a `#[tokio::test]` runtime.
     fn pump_for_test(cfg: &WireGuardConfig) -> WgPump {
         let std_sock = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind test socket");
         let (_tx, rx) = mpsc::channel(4);
         let endpoint: SocketAddr = "127.0.0.1:9".parse().unwrap();
-        WgPump::new(cfg, std_sock, endpoint, rx).expect("pump build")
+        WgPump::new(cfg, test_endpoint(std_sock), endpoint, rx)
     }
 
     /// `pump_for_test` over a caller-prepared endpoint socket — the
@@ -2033,7 +2091,7 @@ mod tests {
         endpoint: SocketAddr,
     ) -> WgPump {
         let (_tx, rx) = mpsc::channel(4);
-        WgPump::new(cfg, std_sock, endpoint, rx).expect("pump build")
+        WgPump::new(cfg, test_endpoint(std_sock), endpoint, rx)
     }
 
     /// An outbox-ready Vec: capacity at least `scratch_len` (so
@@ -2046,11 +2104,11 @@ mod tests {
     }
 
     /// Arm the endpoint's cached *writable* readiness through the only
-    /// public async call `BatchEndpoint` forwards — `recv`. The poll
+    /// public async call `Endpoint` forwards — `recv`. The poll
     /// never resolves (nothing ever arrives), but while it parks the
     /// reactor reports the socket's ready bits and `try_send` stops
     /// short-circuiting `WouldBlock` so it reaches the real syscall.
-    async fn arm_writable(endpoint: &BatchEndpoint) {
+    async fn arm_writable(endpoint: &mut Endpoint) {
         let mut buf = [0u8; 16];
         let _ = tokio::time::timeout(Duration::from_millis(250), endpoint.recv(&mut buf)).await;
     }
@@ -3579,7 +3637,7 @@ mod tests {
         // arm the gate, flush once more, and the receiver must see
         // every datagram in queue order — the earlier partial send
         // first, the oversized boundary dropped by the error arm.
-        arm_writable(&pump.endpoint).await;
+        arm_writable(&mut pump.endpoint).await;
         pump.flush_outbox();
         assert!(pump.outbox.is_empty(), "armed socket drains the requeue");
 
@@ -3618,7 +3676,7 @@ mod tests {
 
         // Arm the reactor readiness: `try_send` must reach the kernel
         // for EMSGSIZE rather than WouldBlock-ing on a cold gate.
-        arm_writable(&pump.endpoint).await;
+        arm_writable(&mut pump.endpoint).await;
 
         let oversized = vec![0xEE; 70_000]; // > 65 507 max UDP payload
         for v in [
@@ -3736,6 +3794,109 @@ mod tests {
         assert!(
             src.matches("STRUCTURAL COPY").count() >= 2,
             "TCP and UDP smoltcp-receive copies must each carry a STRUCTURAL COPY note"
+        );
+    }
+
+    // ── P1 regression: flush_outbox on a dead proxy endpoint ──────
+
+    /// A `ProxyPacketConn` whose write fails immediately — the trigger
+    /// datagram kills the endpoint's TX bridge, which (post-fix) takes
+    /// the RX bridge with it, so the endpoint's TX channel reports
+    /// `ConnectionReset` to `flush_outbox`. `read_packet` parks and
+    /// `close()` is a no-op — the Raw-conn shape the P1 defect leaked.
+    struct DeadWriteConn;
+
+    #[async_trait::async_trait]
+    impl ProxyPacketConn for DeadWriteConn {
+        async fn read_packet(&self, _buf: &mut [u8]) -> Result<(usize, SocketAddr)> {
+            std::future::pending().await
+        }
+        async fn write_packet(&self, _buf: &[u8], _addr: &SocketAddr) -> Result<usize> {
+            Err(MeowError::Proxy("dead write conn".into()))
+        }
+        fn local_addr(&self) -> Result<SocketAddr> {
+            Ok("192.0.2.4:41000".parse().unwrap())
+        }
+        fn close(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A subscriber layer counting WARN events — the observable split
+    /// between the old warn-per-packet drain and the terminal
+    /// clear-and-return.
+    struct CountWarns(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CountWarns {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// `flush_outbox` on an `Endpoint::Proxy` whose TX channel is
+    /// closed takes the `ConnectionReset` arm: the whole outbox clears
+    /// in one return — the staged batch included — and nothing warns;
+    /// the pump's `endpoint.recv` arm is the single place the death is
+    /// logged. Pre-fix this looped the generic errno arm and warned
+    /// once per staged datagram while still draining.
+    #[tokio::test(flavor = "current_thread")]
+    async fn flush_outbox_proxy_connection_reset_clears_outbox() {
+        let client_secret = x25519::StaticSecret::from([0x55; 32]);
+        let server_public = x25519::PublicKey::from(&x25519::StaticSecret::from([0x66; 32]));
+
+        let endpoint_addr: SocketAddr = "203.0.113.7:51820".parse().unwrap();
+        let local_addr: SocketAddr = "192.0.2.4:41000".parse().unwrap();
+        let endpoint = Endpoint::Proxy(meow_wgstack::ProxyEndpoint::new(
+            Arc::new(DeadWriteConn),
+            endpoint_addr,
+            local_addr,
+        ));
+        endpoint.try_send(b"trigger").expect("queued");
+        // Wait for the write error to actually kill the TX bridge —
+        // `Closed` on the channel is the `ConnectionReset` verdict.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match endpoint.try_send(b"probe") {
+                    Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => break,
+                    _ => tokio::task::yield_now().await,
+                }
+            }
+        })
+        .await
+        .expect("TX bridge must exit on the write error");
+
+        let (_tx, rx) = mpsc::channel(4);
+        let mut pump = WgPump::new(
+            &test_config(&client_secret, &server_public),
+            endpoint,
+            endpoint_addr,
+            rx,
+        );
+        // Ten queued datagrams: the pre-fix path warned once per staged
+        // replay; the fix returns after the first ConnectionReset.
+        for tag in 0..10u8 {
+            pump.outbox
+                .push_back(tagged_outbox_vec(tag, pump.scratch_len));
+        }
+
+        let warns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let subscriber = tracing_subscriber::registry().with(CountWarns(Arc::clone(&warns)));
+        tracing::subscriber::with_default(subscriber, || pump.flush_outbox());
+
+        assert!(
+            pump.outbox.is_empty(),
+            "ConnectionReset clears the queued tail in one return"
+        );
+        assert_eq!(
+            warns.load(Ordering::Relaxed),
+            0,
+            "a dead proxy endpoint must not warn-per-packet"
         );
     }
 }

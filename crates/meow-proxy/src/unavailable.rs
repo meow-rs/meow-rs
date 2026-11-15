@@ -13,8 +13,9 @@
 //! running binary is the worst case of both: the user cannot fix it by editing
 //! their config at all.
 //!
-//! This adapter is the third option, and the shape `apply_dialer_proxies`
-//! already uses for a malformed `dialer-proxy` (`MALFORMED_DIALER_PREFIX`):
+//! This adapter is the third option, and the shape the dialer-proxy
+//! builder already uses for a malformed `dialer-proxy`
+//! (`MALFORMED_DIALER_PREFIX`):
 //! the name stays bound, every dial fails loudly naming the node and the
 //! reason, and health reports dead so `url-test` / `fallback` route around it
 //! the same way they route around any down node. A rule, or a group with

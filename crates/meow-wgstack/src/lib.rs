@@ -26,7 +26,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc::{self, error::SendError, OwnedPermit};
 
 mod endpoint;
-pub use endpoint::BatchEndpoint;
+pub use endpoint::{BatchEndpoint, Endpoint, ProxyEndpoint};
 
 /// actor→conn stream events per TCP flow (≈32 × 64 KiB ≈ 2 MiB of read
 /// backpressure per flow — deeper than the 1 MiB smoltcp socket window

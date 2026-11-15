@@ -31,6 +31,12 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+
+use bytes::Bytes;
+use meow_common::ProxyPacketConn;
+use tokio::sync::{mpsc, Notify};
 
 /// The stack arrays behind one batch call are sized to the wire drain
 /// bound, so a single `sendmmsg`/`recvmmsg` covers a whole staged
@@ -468,6 +474,397 @@ impl BatchEndpoint {
             unsafe { buf.set_len(len) };
         }
         got
+    }
+}
+
+/// Bounded queue depth of a [`ProxyEndpoint`]'s two bridge channels, in
+/// datagrams. Sized to two full wire drains so one whole
+/// [`Endpoint::recv_batch`] burst — or the symmetric staged
+/// [`Endpoint::send_batch`] flush — never meets a full queue mid-pass:
+/// back-pressure surfaces as `WouldBlock` only past that, exactly where
+/// the socket path's `ENOBUFS`/`EAGAIN` would.
+const PROXY_ENDPOINT_QUEUE: usize = 2 * WIRE_DRAIN_BUDGET;
+
+/// Staging buffer of the [`ProxyEndpoint`] RX bridge — one full UDP
+/// payload. WG wire datagrams stay far below this (outer MTU +
+/// overhead); the bound only keeps a pathological conn read inside the
+/// slice, same role as the socket's own 64 KiB ceiling.
+const BRIDGE_BUF: usize = 65535;
+
+/// Per-datagram bound on a TX-bridge `conn.write_packet`. A front hop
+/// whose async write stalls on flow control or a half-dead transport
+/// would otherwise pin the bridge task — and its `Arc` refs on the conn
+/// and the RX queue — past teardown. The bound is generous (well past
+/// WG's handshake retry cadence): a slow-but-alive front keeps writing,
+/// while a truly wedged one drops the task so the conn can close and
+/// the pump's `is_proxy_dead` redial take over. WG is datagram
+/// transport, so cancelling a mid-flight write corrupts nothing — each
+/// packet is independent, unlike a stream's `PoisonOnIncomplete`.
+const PROXY_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The outbound pump's wire endpoint: `Batch` is the direct path (a
+/// connected [`BatchEndpoint`]), `Proxy` a [`ProxyEndpoint`] bridged to a
+/// `dialer-proxy` front's `ProxyPacketConn` (issue #899 — the WG
+/// endpoint's UDP transport rides the front hop's UDP association).
+///
+/// An enum, not a trait object: the method set is closed, both variants
+/// sit on the hot drain/flush path, and enum dispatch keeps the direct
+/// path free of a vtable it never needed.
+pub enum Endpoint {
+    /// A connected kernel socket — the direct path.
+    Batch(BatchEndpoint),
+    /// A channel pair bridged to an async `ProxyPacketConn`.
+    Proxy(ProxyEndpoint),
+}
+
+impl Endpoint {
+    /// Nonblocking single-datagram receive — the pump's fast-path drain.
+    ///
+    /// `Proxy`: pops the bridge RX queue — `Empty` → `WouldBlock`,
+    /// `Disconnected` → `ConnectionReset` (the conn is dead — terminal
+    /// for a proxy endpoint: the pump's `recv` arm stops the actor, and
+    /// `ensure_pump`'s `is_proxy_dead` check clears the slot and
+    /// redials the front hop. The `Batch` arm's warn+sleep retry does
+    /// not apply here).
+    pub fn try_recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Endpoint::Batch(e) => e.try_recv(buf),
+            Endpoint::Proxy(e) => e.try_recv(buf),
+        }
+    }
+
+    /// Async single-datagram receive — the pump's `select!` driver.
+    ///
+    /// `Proxy`: awaits the bridge RX queue; a closed queue (conn dead or
+    /// the RX bridge exited) maps to `ConnectionReset`.
+    pub async fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Endpoint::Batch(e) => e.recv(buf).await,
+            Endpoint::Proxy(e) => e.recv(buf).await,
+        }
+    }
+
+    /// Drain up to `min(bufs.len(), budget, WIRE_DRAIN_BUDGET)`
+    /// datagrams into the staged slots — same leading-count contract as
+    /// [`BatchEndpoint::recv_batch`]: each of `bufs[..ret]` is sized to
+    /// its datagram, slot capacity survives for the next batch.
+    pub fn recv_batch(&mut self, bufs: &mut [Vec<u8>], budget: usize) -> usize {
+        match self {
+            Endpoint::Batch(e) => e.recv_batch(bufs, budget),
+            Endpoint::Proxy(e) => e.recv_batch(bufs, budget),
+        }
+    }
+
+    /// Nonblocking single-datagram send — `WouldBlock` means "requeue
+    /// and stop", matching the socket's `EAGAIN` semantics the pump's
+    /// `flush_outbox` already keys on.
+    pub fn try_send(&self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Endpoint::Batch(e) => e.try_send(buf),
+            Endpoint::Proxy(e) => e.try_send(buf),
+        }
+    }
+
+    /// Send every datagram to the bound peer, returning the leading
+    /// accepted count. `addr` is advisory on a connected endpoint —
+    /// `Proxy` ignores it entirely (the TX bridge stamps the endpoint
+    /// address captured at construction onto each `write_packet`, which
+    /// is what per-packet conns like SS UDP need in their header).
+    ///
+    /// `Proxy` degrades the batch to a `try_send` loop — expected, not a
+    /// fallback: the front hop serializes datagrams anyway, so batch
+    /// syscalls would buy nothing.
+    pub fn send_batch(&self, pkts: &[&[u8]], addr: SocketAddr) -> usize {
+        match self {
+            Endpoint::Batch(e) => e.send_batch(pkts, addr),
+            Endpoint::Proxy(e) => e.send_batch(pkts, addr),
+        }
+    }
+
+    /// The local address of the endpoint socket / front-hop conn.
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        match self {
+            Endpoint::Batch(e) => e.local_addr(),
+            Endpoint::Proxy(e) => Ok(e.local_addr()),
+        }
+    }
+}
+
+/// A [`Notify`] pulse armed on drop — the TX bridge task's exit edge
+/// into its RX twin. Held as a local of the TX task's async block so
+/// *every* exit path (queue close, write error, `PROXY_WRITE_TIMEOUT`,
+/// the `shutdown_tx` drop edge) fires `shutdown_rx` at scope end —
+/// right after `conn.close()` ran. `close()` alone cannot reach the
+/// RX task's parked `read_packet` on the Raw `ProxyPacketConn`s
+/// (`DirectPacketConn`, `Socks5UdpTransport::Raw`, `SsUdpIo::Raw`,
+/// `ConnectedUdpConn`), where it is a no-op: without the pulse the RX
+/// task outlived a dead TX side forever, `wire_tx` never dropped, and
+/// the pump's `recv` never saw the channel close — no
+/// `ConnectionReset`, no `is_proxy_dead` redial, and a warn-per-packet
+/// storm on the send path while the dead front hop blackholed
+/// datagrams.
+struct NotifyOnDrop(Arc<Notify>);
+
+impl Drop for NotifyOnDrop {
+    fn drop(&mut self) {
+        self.0.notify_one();
+    }
+}
+
+/// A [`ProxyPacketConn`] (async) bridged onto the pump's synchronous
+/// `try_recv`/`try_send`/`recv`/`recv_batch`/`send_batch` surface by two
+/// bounded mpsc queues and two tokio bridge tasks spawned at
+/// construction:
+///
+/// - **RX task** loops `conn.read_packet` → `wire_tx.send(Bytes)`; a
+///   conn error exits the task, dropping the sender — the pump's next
+///   `try_recv`/`recv` sees `Disconnected`/`None` → `ConnectionReset`,
+///   the terminal signal that stops the actor for `ensure_pump` to
+///   redial. A [`Notify`] edge lets `drop` interrupt a parked
+///   `read_packet` instead of waiting for the conn.
+/// - **TX task** races `pump_rx.recv` against its own [`Notify`] drop
+///   edge, then races each `conn.write_packet(&pkt, &endpoint_addr)`
+///   against the same edge under a `PROXY_WRITE_TIMEOUT` bound —
+///   two selects, so a stalled in-flight write can still be cancelled:
+///   a write error or a wedged write exits the task (a dead front conn
+///   is terminal — draining the queue would only blackhole datagrams),
+///   as do queue close (pump teardown) and the drop edge. Every exit
+///   calls `conn.close()` and then — via a `NotifyOnDrop` guard held
+///   for the block's scope — pulses `shutdown_rx`, so TX death reaches
+///   the parked `read_packet` even on conns whose `close()` is a no-op.
+pub struct ProxyEndpoint {
+    /// Inbound wire: datagrams the RX bridge pulled off the front conn.
+    rx: mpsc::Receiver<Bytes>,
+    /// Outbound wire: datagrams the TX bridge hands to the front conn.
+    tx: mpsc::Sender<Bytes>,
+    /// Cached `conn.local_addr()` — the bound port of the front conn.
+    local_addr: SocketAddr,
+    /// Drop edge for the RX bridge — a parked `read_packet` would
+    /// otherwise outlive the endpoint until the conn reports.
+    shutdown_rx: Arc<Notify>,
+    /// Drop edge for the TX bridge — interrupts a `write_packet`
+    /// stalled past its timeout that the `pump_rx` close alone cannot
+    /// reach. A second `Notify`, not a share of the RX edge:
+    /// `notify_one` wakes a single waiter, so one shared edge could
+    /// leave one bridge task unpulsed; two edges each hold their own
+    /// stored permit and both tasks see the drop, parked or just about
+    /// to park.
+    shutdown_tx: Arc<Notify>,
+    /// A reference on the front conn — the endpoint owns it as long as
+    /// it lives (the two bridge tasks share the other refs).
+    _conn: Arc<dyn ProxyPacketConn>,
+    /// The two bridge tasks; kept only so their lifetime reads as owned
+    /// by the endpoint (each is self-terminating on channel close).
+    _bridge: (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>),
+}
+
+impl ProxyEndpoint {
+    /// Build the endpoint and spawn both bridge tasks. Must be called
+    /// from a tokio runtime context (`tokio::spawn` inside); the
+    /// adapter's `ensure_pump` is async so this is always true.
+    ///
+    /// `endpoint_addr` is the destination stamped on every
+    /// `write_packet` — for per-packet conns (SS UDP) it is what lands
+    /// in the relay header, so callers pass the real target
+    /// (`UdpTarget::write_dst`), not a placeholder.
+    pub fn new(
+        conn: Arc<dyn ProxyPacketConn>,
+        endpoint_addr: SocketAddr,
+        local_addr: SocketAddr,
+    ) -> Self {
+        let (wire_tx, wire_rx) = mpsc::channel::<Bytes>(PROXY_ENDPOINT_QUEUE);
+        let (pump_tx, pump_rx) = mpsc::channel::<Bytes>(PROXY_ENDPOINT_QUEUE);
+        let shutdown_rx = Arc::new(Notify::new());
+        let shutdown_tx = Arc::new(Notify::new());
+
+        let rx_task = tokio::spawn({
+            let conn = Arc::clone(&conn);
+            let shutdown = Arc::clone(&shutdown_rx);
+            async move {
+                let mut buf = vec![0u8; BRIDGE_BUF];
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = shutdown.notified() => break,
+                        r = conn.read_packet(&mut buf) => match r {
+                            Ok((n, _src)) => {
+                                if wire_tx
+                                    .send(Bytes::copy_from_slice(&buf[..n]))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            // conn dead → drop the queue's sender so the
+                            // pump sees Disconnected → ConnectionReset.
+                            Err(_) => break,
+                        }
+                    }
+                }
+            }
+        });
+
+        let tx_task = tokio::spawn({
+            let conn = Arc::clone(&conn);
+            let shutdown = Arc::clone(&shutdown_tx);
+            let rx_pulse = NotifyOnDrop(Arc::clone(&shutdown_rx));
+            async move {
+                // Dropped at scope end — after `conn.close()` below —
+                // on *every* exit path, pulsing `shutdown_rx` so the
+                // RX bridge unwinds its parked `read_packet`: the kill
+                // edge `close()` cannot provide on Raw conns (see
+                // `NotifyOnDrop`).
+                let _rx_pulse = rx_pulse;
+                let mut pump_rx = pump_rx;
+                loop {
+                    // Two selects, not one: a `write_packet` awaited
+                    // *inside* a select arm runs outside the race —
+                    // the drop edge could never cancel it. Racing the
+                    // write itself against `notified()` is what lets a
+                    // stalled write unwind on teardown; the
+                    // `pump_rx` close alone cannot reach into an
+                    // in-flight write.
+                    let pkt = tokio::select! {
+                        biased;
+                        _ = shutdown.notified() => break,
+                        pkt = pump_rx.recv() => {
+                            let Some(pkt) = pkt else { break };
+                            pkt
+                        }
+                    };
+                    // A failed front-hop write is terminal for this
+                    // conn — no transient/permanent split, no retry
+                    // threshold: WG is a datagram transport, so a lost
+                    // packet is ordinary (the Noise layer retransmits
+                    // on its own cadence), and the errnos a write-side
+                    // retry could outlive (`EHOSTUNREACH`, `EPERM`) do
+                    // not self-heal inside one. The recovery unit is
+                    // `ensure_pump`'s conn redial, reached through
+                    // `_rx_pulse` → `ConnectionReset`; draining the
+                    // rest of the queue would only blackhole datagrams
+                    // until the pump gets there.
+                    let r = tokio::select! {
+                        biased;
+                        _ = shutdown.notified() => break,
+                        r = tokio::time::timeout(
+                            PROXY_WRITE_TIMEOUT,
+                            conn.write_packet(&pkt, &endpoint_addr),
+                        ) => r,
+                    };
+                    match r {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(_)) | Err(_) => break,
+                    }
+                }
+                let _ = conn.close();
+            }
+        });
+
+        Self {
+            rx: wire_rx,
+            tx: pump_tx,
+            local_addr,
+            shutdown_rx,
+            shutdown_tx,
+            _conn: conn,
+            _bridge: (rx_task, tx_task),
+        }
+    }
+
+    /// See [`Endpoint::try_recv`].
+    fn try_recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self.rx.try_recv() {
+            Ok(pkt) => {
+                let n = pkt.len().min(buf.len());
+                buf[..n].copy_from_slice(&pkt[..n]);
+                Ok(n)
+            }
+            Err(mpsc::error::TryRecvError::Empty) => {
+                Err(io::Error::from(io::ErrorKind::WouldBlock))
+            }
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                Err(io::Error::from(io::ErrorKind::ConnectionReset))
+            }
+        }
+    }
+
+    /// See [`Endpoint::recv`].
+    async fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self.rx.recv().await {
+            Some(pkt) => {
+                let n = pkt.len().min(buf.len());
+                buf[..n].copy_from_slice(&pkt[..n]);
+                Ok(n)
+            }
+            None => Err(io::Error::from(io::ErrorKind::ConnectionReset)),
+        }
+    }
+
+    /// See [`Endpoint::recv_batch`].
+    fn recv_batch(&mut self, bufs: &mut [Vec<u8>], budget: usize) -> usize {
+        let n = bufs.len().min(budget).min(WIRE_DRAIN_BUDGET);
+        let mut got = 0;
+        for buf in &mut bufs[..n] {
+            match self.rx.try_recv() {
+                Ok(pkt) => {
+                    // The slot's whole capacity is its receive window —
+                    // same contract as the socket path.
+                    buf.clear();
+                    let take = pkt.len().min(buf.capacity());
+                    buf.extend_from_slice(&pkt[..take]);
+                    got += 1;
+                }
+                Err(_) => break,
+            }
+        }
+        got
+    }
+
+    /// See [`Endpoint::try_send`].
+    fn try_send(&self, buf: &[u8]) -> io::Result<usize> {
+        match self.tx.try_send(Bytes::copy_from_slice(buf)) {
+            Ok(()) => Ok(buf.len()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                Err(io::Error::from(io::ErrorKind::WouldBlock))
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(io::Error::from(io::ErrorKind::ConnectionReset))
+            }
+        }
+    }
+
+    /// See [`Endpoint::send_batch`]. The `addr` arg is ignored — the TX
+    /// bridge holds the stamped destination from construction.
+    fn send_batch(&self, pkts: &[&[u8]], _addr: SocketAddr) -> usize {
+        let mut sent = 0;
+        for pkt in pkts {
+            match self.tx.try_send(Bytes::copy_from_slice(pkt)) {
+                Ok(()) => sent += 1,
+                Err(_) => break,
+            }
+        }
+        sent
+    }
+
+    /// See [`Endpoint::local_addr`].
+    fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+}
+
+impl Drop for ProxyEndpoint {
+    /// Pulse both bridge select arms so a parked `read_packet` or a
+    /// stalled `write_packet` unwinds promptly. Each task owns a
+    /// separate `Notify` — a single `notify_one` wakes only one waiter,
+    /// so a shared edge could strand one of the two; the stored permit
+    /// also covers a task that parks on `notified()` just after this
+    /// pulse. The TX task's secondary exit is the `pump_tx` close on
+    /// the field teardown right below (it calls `conn.close()` on the
+    /// way out).
+    fn drop(&mut self) {
+        self.shutdown_rx.notify_one();
+        self.shutdown_tx.notify_one();
     }
 }
 
@@ -981,5 +1378,532 @@ mod tests {
         // Compile-time pin: under this feature the batch calls must
         // not claim the syscall path.
         const _: () = assert!(!BatchEndpoint::BATCHED_SYSCALLS);
+    }
+
+    // ── ProxyEndpoint bridge tests (issue #899) ────────────────────
+
+    /// A `ProxyPacketConn` over two test-owned mpsc halves: `in_tx`
+    /// feeds `read_packet`, `out_rx` collects every `write_packet` with
+    /// its stamped address. The trait is `#[async_trait]` but this
+    /// crate carries no `async-trait` dep (and must not add one for
+    /// tests), so the impl spells out the desugared signature.
+    ///
+    /// `held` is a write gate — while the test holds its lock every
+    /// `write_packet` parks, so fill-count assertions are deterministic
+    /// (the bridge consumed exactly the datagrams it provably reported,
+    /// no more). `write_started` fires inside `write_packet` so a test
+    /// can wait until the bridge is holding a datagram mid-write before
+    /// measuring queue depth.
+    struct FakeConn {
+        inbound: tokio::sync::Mutex<mpsc::Receiver<Bytes>>,
+        outbound: mpsc::Sender<(Bytes, SocketAddr)>,
+        remote: SocketAddr,
+        local: SocketAddr,
+        held: tokio::sync::Mutex<()>,
+        write_started: Notify,
+        closed: std::sync::atomic::AtomicBool,
+    }
+
+    impl meow_common::ProxyPacketConn for FakeConn {
+        fn read_packet<'a, 'b, 'c>(
+            &'a self,
+            buf: &'b mut [u8],
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = meow_common::Result<(usize, SocketAddr)>>
+                    + Send
+                    + 'c,
+            >,
+        >
+        where
+            'a: 'c,
+            'b: 'c,
+        {
+            Box::pin(async move {
+                match self.inbound.lock().await.recv().await {
+                    Some(pkt) => {
+                        let n = pkt.len().min(buf.len());
+                        buf[..n].copy_from_slice(&pkt[..n]);
+                        Ok((n, self.remote))
+                    }
+                    None => Err(meow_common::MeowError::Proxy(
+                        "fake conn: inbound closed".into(),
+                    )),
+                }
+            })
+        }
+
+        fn write_packet<'a, 'b, 'd, 'c>(
+            &'a self,
+            buf: &'b [u8],
+            addr: &'d SocketAddr,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = meow_common::Result<usize>> + Send + 'c>,
+        >
+        where
+            'a: 'c,
+            'b: 'c,
+            'd: 'c,
+        {
+            Box::pin(async move {
+                self.write_started.notify_one();
+                let _held = self.held.lock().await;
+                if self.closed.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err(meow_common::MeowError::Proxy("fake conn: closed".into()));
+                }
+                self.outbound
+                    .send((Bytes::copy_from_slice(buf), *addr))
+                    .await
+                    .map_err(|_| meow_common::MeowError::Proxy("fake conn: outbox gone".into()))?;
+                Ok(buf.len())
+            })
+        }
+
+        fn local_addr(&self) -> meow_common::Result<SocketAddr> {
+            Ok(self.local)
+        }
+
+        fn close(&self) -> meow_common::Result<()> {
+            self.closed
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    /// `FakeConn` plus the halves the test drives: `in_tx` injects
+    /// datagrams the conn reads, `out_rx` observes what the TX bridge
+    /// writes back.
+    struct FakeWire {
+        conn: Arc<FakeConn>,
+        in_tx: mpsc::Sender<Bytes>,
+        out_rx: mpsc::Receiver<(Bytes, SocketAddr)>,
+        endpoint: SocketAddr,
+        local: SocketAddr,
+    }
+
+    fn fake_wire() -> FakeWire {
+        let (in_tx, in_rx) = mpsc::channel::<Bytes>(8);
+        let (out_tx, out_rx) = mpsc::channel::<(Bytes, SocketAddr)>(PROXY_ENDPOINT_QUEUE + 8);
+        let endpoint: SocketAddr = "203.0.113.7:51820".parse().unwrap();
+        let local: SocketAddr = "192.0.2.4:41000".parse().unwrap();
+        FakeWire {
+            conn: Arc::new(FakeConn {
+                inbound: tokio::sync::Mutex::new(in_rx),
+                outbound: out_tx,
+                remote: endpoint,
+                local,
+                held: tokio::sync::Mutex::new(()),
+                write_started: Notify::new(),
+                closed: std::sync::atomic::AtomicBool::new(false),
+            }),
+            in_tx,
+            out_rx,
+            endpoint,
+            local,
+        }
+    }
+
+    impl FakeWire {
+        /// The conn as the trait object `ProxyEndpoint::new` takes —
+        /// the coercion point keeps call sites to one word.
+        #[allow(
+            clippy::clone_on_ref_ptr,
+            reason = "the Arc<FakeConn> → Arc<dyn ProxyPacketConn> unsize cannot ride Arc::clone(&_) — its generic T is pinned by the argument's concrete type"
+        )]
+        fn proxy_conn(&self) -> Arc<dyn meow_common::ProxyPacketConn> {
+            self.conn.clone()
+        }
+    }
+
+    /// `Endpoint::try_recv` on a `Proxy` picks up what the front conn
+    /// delivered: RX bridge → queue → pump slot.
+    #[tokio::test(flavor = "current_thread")]
+    async fn proxy_endpoint_rx_delivers_to_pump() {
+        let w = fake_wire();
+        let mut ep = Endpoint::Proxy(ProxyEndpoint::new(w.proxy_conn(), w.endpoint, w.local));
+        w.in_tx.send(Bytes::from_static(b"wg-init")).await.unwrap();
+
+        let mut buf = vec![0u8; 128];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match ep.try_recv(&mut buf) {
+                    Ok(n) => break n,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        tokio::task::yield_now().await;
+                    }
+                    Err(e) => panic!("unexpected recv error: {e}"),
+                }
+            }
+        })
+        .await
+        .expect("bridge must deliver within 5s");
+        assert_eq!(&buf[..n], b"wg-init");
+        assert_eq!(ep.local_addr().unwrap(), w.local);
+    }
+
+    /// `try_send` → TX bridge → `write_packet` on the conn, with the
+    /// construction-time endpoint address stamped on every datagram.
+    #[tokio::test(flavor = "current_thread")]
+    async fn proxy_endpoint_tx_delivers_to_conn() {
+        let w = fake_wire();
+        let mut w = w;
+        let ep = Endpoint::Proxy(ProxyEndpoint::new(w.proxy_conn(), w.endpoint, w.local));
+
+        ep.try_send(b"wg-data").expect("try_send");
+        let (pkt, addr) = tokio::time::timeout(std::time::Duration::from_secs(5), w.out_rx.recv())
+            .await
+            .expect("TX bridge delivers")
+            .expect("outbox open");
+        assert_eq!(&pkt[..], b"wg-data");
+        assert_eq!(addr, w.endpoint, "stamps the bound endpoint address");
+    }
+
+    /// A dead conn (read errors) disconnects the RX queue — the pump's
+    /// `recv` then surfaces `ConnectionReset`, its dead-endpoint signal.
+    #[tokio::test(flavor = "current_thread")]
+    async fn proxy_endpoint_conn_dead_signals_disconnect() {
+        let w = fake_wire();
+        let mut ep = Endpoint::Proxy(ProxyEndpoint::new(w.proxy_conn(), w.endpoint, w.local));
+        // Drop the injection half: the fake's read_packet errors, the RX
+        // bridge exits, its queue sender drops.
+        drop(w.in_tx);
+
+        let mut buf = vec![0u8; 64];
+        let err = tokio::time::timeout(std::time::Duration::from_secs(5), ep.recv(&mut buf))
+            .await
+            .expect("disconnect surfaces within 5s")
+            .expect_err("closed queue reads as an error");
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionReset);
+    }
+
+    /// A full TX queue reports `WouldBlock` — the signal the pump's
+    /// `flush_outbox` treats like socket `EAGAIN` (requeue and stop).
+    #[tokio::test(flavor = "current_thread")]
+    async fn proxy_endpoint_send_full_returns_would_block() {
+        let w = fake_wire();
+        let gate = w.conn.held.lock().await; // park every write_packet
+        let ep = Endpoint::Proxy(ProxyEndpoint::new(w.proxy_conn(), w.endpoint, w.local));
+        // One datagram to prime the bridge: the await below returns once
+        // the bridge is parked mid-write holding it, so the queue is
+        // provably empty from here on.
+        ep.try_send(b"held").expect("first send");
+        w.conn.write_started.notified().await;
+        for _ in 0..PROXY_ENDPOINT_QUEUE {
+            ep.try_send(b"x").expect("queue accepts up to capacity");
+        }
+        let err = ep.try_send(b"overflow").expect_err("full queue");
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        drop(gate);
+    }
+
+    /// Dropping the endpoint unwinds both bridges: the RX task's
+    /// `Notify` arm fires, the TX task drains the closed queue and calls
+    /// `conn.close()`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn proxy_endpoint_drop_shuts_down_bridge() {
+        let w = fake_wire();
+        let conn = Arc::clone(&w.conn);
+        let ep = Endpoint::Proxy(ProxyEndpoint::new(w.proxy_conn(), w.endpoint, w.local));
+        drop(ep);
+
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !conn.closed.load(std::sync::atomic::Ordering::Relaxed) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        closed.expect("TX bridge must close the conn after endpoint drop");
+    }
+
+    /// `recv_batch` honours the budget: a queue deeper than `budget`
+    /// drains exactly `budget` datagrams, in order.
+    #[tokio::test(flavor = "current_thread")]
+    async fn proxy_endpoint_recv_batch_drains_up_to_budget() {
+        let w = fake_wire();
+        let mut ep = Endpoint::Proxy(ProxyEndpoint::new(w.proxy_conn(), w.endpoint, w.local));
+        const N: usize = 6;
+        for i in 0..N {
+            w.in_tx.send(Bytes::from(vec![i as u8; 16])).await.unwrap();
+        }
+        // Let the bridge top the queue up before the batch is measured.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let mut bufs: Vec<Vec<u8>> = (0..N).map(|_| vec![0u8; 64]).collect();
+        let got = ep.recv_batch(&mut bufs, 3);
+        assert_eq!(got, 3, "budget clamps the drain");
+        for (i, buf) in bufs[..got].iter().enumerate() {
+            assert_eq!(buf.as_slice(), &[i as u8; 16], "wire order preserved");
+        }
+    }
+
+    /// `send_batch` returns the leading accepted count and stops at a
+    /// full queue — the same short-count contract `sendmmsg` gives —
+    /// then unblocking the conn lets the bridge drain the queue in
+    /// order with the stamped address on every datagram.
+    #[tokio::test(flavor = "current_thread")]
+    async fn proxy_endpoint_send_batch_stops_on_full() {
+        let mut w = fake_wire();
+        let gate = w.conn.held.lock().await; // park every write_packet
+        let ep = Endpoint::Proxy(ProxyEndpoint::new(w.proxy_conn(), w.endpoint, w.local));
+        ep.try_send(b"first").expect("first send");
+        w.conn.write_started.notified().await; // bridge parked on pkt 1
+        for _ in 0..PROXY_ENDPOINT_QUEUE {
+            ep.try_send(b"x").expect("queue accepts up to capacity");
+        }
+        let pkts: Vec<&[u8]> = vec![b"a", b"b", b"c"];
+        let sent = ep.send_batch(&pkts, w.endpoint);
+        assert_eq!(sent, 0, "a full queue reports a zero accepted count");
+
+        drop(gate);
+        // The bridge drains in order: the in-flight "first" write, then
+        // the queued datagrams — every one stamped with the endpoint.
+        let (pkt, addr) = tokio::time::timeout(std::time::Duration::from_secs(5), w.out_rx.recv())
+            .await
+            .expect("TX bridge drains after unblock")
+            .expect("outbox open");
+        assert_eq!(&pkt[..], b"first");
+        assert_eq!(addr, w.endpoint);
+    }
+
+    /// Dropping the endpoint interrupts a *stalled* write too: the TX
+    /// task's own `Notify` edge cancels the parked `write_packet`
+    /// (the `pump_rx` close alone cannot reach into an in-flight
+    /// write), so the task exits through `conn.close()` while the
+    /// front hop is still wedged. `FakeConn` with `held` taken is the
+    /// spec's `SlowConn` — the write would outlive any timeout the
+    /// test could wait out, so only the drop edge can free the task.
+    #[tokio::test(flavor = "current_thread")]
+    async fn proxy_endpoint_drop_interrupts_stalled_write() {
+        let w = fake_wire();
+        let conn = Arc::clone(&w.conn);
+        let gate = w.conn.held.lock().await; // every write_packet parks
+        let ep = Endpoint::Proxy(ProxyEndpoint::new(w.proxy_conn(), w.endpoint, w.local));
+        ep.try_send(b"stalled").expect("try_send");
+        // The bridge is now provably parked inside `write_packet`.
+        w.conn.write_started.notified().await;
+
+        drop(ep); // pulses both drop edges, then `pump_tx` closes
+
+        // The gate stays held — the write never returns — yet the TX
+        // task must still complete, and its only exit path runs
+        // `conn.close()`. Without the shutdown select arm this would
+        // hang until `PROXY_WRITE_TIMEOUT` (30 s) at best.
+        let closed = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+            while !conn.closed.load(std::sync::atomic::Ordering::Relaxed) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        drop(gate);
+        closed.expect("TX bridge must close the conn within 500ms of drop");
+    }
+
+    /// A `write_packet` that returns `Err` is terminal for the front
+    /// conn — the TX task exits and closes it rather than draining the
+    /// queue into a dead hop.
+    #[tokio::test(flavor = "current_thread")]
+    async fn proxy_endpoint_tx_write_error_closes_conn() {
+        let w = fake_wire();
+        let conn = Arc::clone(&w.conn);
+        conn.closed
+            .store(true, std::sync::atomic::Ordering::Relaxed); // next write errs
+        let ep = Endpoint::Proxy(ProxyEndpoint::new(w.proxy_conn(), w.endpoint, w.local));
+        ep.try_send(b"lost").expect("try_send");
+
+        // The write error itself is what breaks the loop — `closed`
+        // was already true, so a still-running task would leave it
+        // unchanged; instead assert the task drained out and the
+        // queue closed: a second try_send must see the dead channel.
+        let dead = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match ep.try_send(b"probe") {
+                    Err(e) if e.kind() == io::ErrorKind::ConnectionReset => break,
+                    _ => tokio::task::yield_now().await,
+                }
+            }
+        })
+        .await;
+        dead.expect("TX bridge must exit on write error within 5s");
+    }
+
+    // ── P1 regression: TX death must take the RX bridge with it ──
+    //
+    // The defect the `NotifyOnDrop` guard fixes: a TX task exiting on
+    // a write error or `PROXY_WRITE_TIMEOUT` only called `conn.close()`
+    // — a no-op on the Raw `ProxyPacketConn`s — so the RX task's parked
+    // `read_packet` never noticed, `wire_tx` never dropped, and the
+    // pump's `recv` never saw `ConnectionReset`. Both conns below share
+    // the Raw shape: parked read, no-op close, writes that die in
+    // different ways.
+
+    /// `write_packet` errs `delay` in — the front hop dying mid-write —
+    /// while `read_packet` parks forever and `close()` is a no-op: the
+    /// exact conn shape whose `close()` could not interrupt the RX
+    /// bridge's parked read in the P1 defect.
+    struct DelayedErrConn {
+        delay: Duration,
+        local: SocketAddr,
+    }
+
+    impl meow_common::ProxyPacketConn for DelayedErrConn {
+        fn read_packet<'a, 'b, 'c>(
+            &'a self,
+            _buf: &'b mut [u8],
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = meow_common::Result<(usize, SocketAddr)>>
+                    + Send
+                    + 'c,
+            >,
+        >
+        where
+            'a: 'c,
+            'b: 'c,
+        {
+            Box::pin(async move {
+                std::future::pending::<meow_common::Result<(usize, SocketAddr)>>().await
+            })
+        }
+
+        fn write_packet<'a, 'b, 'd, 'c>(
+            &'a self,
+            _buf: &'b [u8],
+            _addr: &'d SocketAddr,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = meow_common::Result<usize>> + Send + 'c>,
+        >
+        where
+            'a: 'c,
+            'b: 'c,
+            'd: 'c,
+        {
+            Box::pin(async move {
+                tokio::time::sleep(self.delay).await;
+                Err(meow_common::MeowError::Io(io::Error::from(
+                    io::ErrorKind::ConnectionReset,
+                )))
+            })
+        }
+
+        fn local_addr(&self) -> meow_common::Result<SocketAddr> {
+            Ok(self.local)
+        }
+
+        fn close(&self) -> meow_common::Result<()> {
+            Ok(()) // no-op — the Raw-conn shape under test
+        }
+    }
+
+    /// The wedged-write shape: `write_packet` parks forever (a
+    /// flow-controlled or half-dead transport) so only
+    /// `PROXY_WRITE_TIMEOUT` can end it; `write_started` lets a test
+    /// prove the TX bridge is mid-write before the clock is advanced
+    /// past the bound.
+    struct HangConn {
+        write_started: Notify,
+        local: SocketAddr,
+    }
+
+    impl meow_common::ProxyPacketConn for HangConn {
+        fn read_packet<'a, 'b, 'c>(
+            &'a self,
+            _buf: &'b mut [u8],
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = meow_common::Result<(usize, SocketAddr)>>
+                    + Send
+                    + 'c,
+            >,
+        >
+        where
+            'a: 'c,
+            'b: 'c,
+        {
+            Box::pin(async move {
+                std::future::pending::<meow_common::Result<(usize, SocketAddr)>>().await
+            })
+        }
+
+        fn write_packet<'a, 'b, 'd, 'c>(
+            &'a self,
+            _buf: &'b [u8],
+            _addr: &'d SocketAddr,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = meow_common::Result<usize>> + Send + 'c>,
+        >
+        where
+            'a: 'c,
+            'b: 'c,
+            'd: 'c,
+        {
+            Box::pin(async move {
+                self.write_started.notify_one();
+                std::future::pending::<meow_common::Result<usize>>().await
+            })
+        }
+
+        fn local_addr(&self) -> meow_common::Result<SocketAddr> {
+            Ok(self.local)
+        }
+
+        fn close(&self) -> meow_common::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A dead TX write must take the RX bridge down with it: the
+    /// `NotifyOnDrop` guard pulses `shutdown_rx` on the TX task's exit,
+    /// so `recv` surfaces `ConnectionReset` well inside 500 ms rather
+    /// than parking on a `read_packet` that can never report again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn proxy_endpoint_tx_write_error_stops_rx_bridge() {
+        let conn = Arc::new(DelayedErrConn {
+            delay: Duration::from_millis(50),
+            local: "192.0.2.4:41000".parse().unwrap(),
+        });
+        let mut ep = Endpoint::Proxy(ProxyEndpoint::new(
+            conn,
+            "203.0.113.7:51820".parse().unwrap(),
+            "192.0.2.4:41000".parse().unwrap(),
+        ));
+        ep.try_send(b"trigger").expect("try_send");
+
+        let mut buf = vec![0u8; 64];
+        let err = tokio::time::timeout(Duration::from_millis(500), ep.recv(&mut buf))
+            .await
+            .expect("RX bridge must exit within 500 ms of TX death — P1 regression")
+            .expect_err("a dead front conn reads as ConnectionReset");
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionReset);
+    }
+
+    /// The timeout arm of the same chain: a write parked past
+    /// `PROXY_WRITE_TIMEOUT` exits the TX task, and the guard must
+    /// pulse `shutdown_rx` there too. `start_paused` fast-forwards the
+    /// 30 s bound — the bridge's own write timeout fires, then the RX
+    /// bridge follows it out and `recv` reports `ConnectionReset`.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn proxy_endpoint_tx_write_timeout_stops_rx_bridge() {
+        let conn = Arc::new(HangConn {
+            write_started: Notify::new(),
+            local: "192.0.2.4:41000".parse().unwrap(),
+        });
+        let write_started = Arc::clone(&conn);
+        let mut ep = Endpoint::Proxy(ProxyEndpoint::new(
+            conn,
+            "203.0.113.7:51820".parse().unwrap(),
+            "192.0.2.4:41000".parse().unwrap(),
+        ));
+        ep.try_send(b"stalled").expect("try_send");
+        // Provably mid-write before the clock moves.
+        write_started.write_started.notified().await;
+
+        tokio::time::advance(PROXY_WRITE_TIMEOUT + Duration::from_secs(1)).await;
+
+        let mut buf = vec![0u8; 64];
+        let err = tokio::time::timeout(Duration::from_secs(5), ep.recv(&mut buf))
+            .await
+            .expect("RX bridge must exit after TX write timeout — P1 regression")
+            .expect_err("a dead front conn reads as ConnectionReset");
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionReset);
     }
 }

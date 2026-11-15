@@ -316,10 +316,10 @@ pub fn parse_proxy_provider_node(
 }
 
 /// Like [parse_proxy] but injects a custom [meow_proxy::dialer::TcpDialer]
-/// into every adapter. Used by apply_dialer_proxies — and by provider node
-/// parsing (issue #489) — to inject a [meow_proxy::dialer::NamedProxyDialer]
-/// so that dialer-proxy chaining works for all protocols without requiring
-/// connect_over.
+/// into every adapter. Used by the `dialer-proxy` single-parse path in
+/// `insert_parsed_leaves` — and by provider node parsing (issue #489) — to
+/// inject a [meow_proxy::dialer::NamedProxyDialer] so that dialer-proxy
+/// chaining works for all protocols without requiring connect_over.
 pub fn parse_proxy_with_dialer(
     config: &HashMap<String, serde_json::Value>,
     dialer: &std::sync::Arc<dyn meow_proxy::dialer::TcpDialer>,
@@ -372,9 +372,8 @@ pub fn parse_proxy_with_dialer(
             // A SIP003 *external* plugin is a local subprocess spawned by
             // `ShadowsocksAdapter::new`, and the adapter deliberately dials it
             // over loopback without the pluggable dialer.  Bail out *before*
-            // constructing so the re-parse in `apply_dialer_proxies` does not
-            // spawn a second copy of the plugin process (the first one stays
-            // alive as long as any group still holds the original Arc), and so
+            // constructing so the chained parse never spawns a copy of the
+            // plugin process the direct re-parse then spawns again, and so
             // the user learns their `dialer-proxy` has no effect here.
             if dialer.is_proxy() && is_external_sip003_plugin(plugin) {
                 return Err(format!(
@@ -535,12 +534,24 @@ pub fn parse_proxy_with_dialer(
         // "WireGuard" (docs/wireguard.md field table).
         #[cfg(feature = "wireguard")]
         "wireguard" | "WireGuard" => {
-            // The WG transport owns its UDP endpoint socket — a TCP
-            // `dialer-proxy` chain cannot carry it (same reason anytls and
-            // hysteria2 refuse one), so reject before constructing.
-            reject_unthreaded_dialer(name, "wireguard", dialer)?;
             let adapter = parse_wireguard(name, config)?;
-            Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
+            // A `dialer-proxy` chain carries the WG endpoint's UDP
+            // transport through the front hop's UDP association (issue
+            // #899). Any proxy dialer is accepted here — no
+            // `supports_udp` gate: that flag answers `false` for an
+            // unresolved group target, which would kill legal group
+            // fronts at parse time. A UDP-less front fails
+            // `dial_udp_conn` at runtime, closed like any other
+            // endpoint bind error. `dialing_through` attaches the
+            // DialerHop so `front_hop` metrics name the member.
+            let adapter = if dialer.is_proxy() {
+                adapter.with_dialer(Arc::clone(dialer))
+            } else {
+                adapter
+            };
+            Ok(Arc::new(
+                WrappedProxy::new(Box::new(adapter)).dialing_through(config, dialer),
+            ))
         }
         #[cfg(not(feature = "trusttunnel"))]
         "trusttunnel" => Err(feature_gated_proxy_type("trusttunnel")),
@@ -596,7 +607,7 @@ fn is_external_sip003_plugin(plugin: Option<&str>) -> bool {
 /// None of them can honour an injected dialer, so accepting one here would
 /// silently drop the user's `dialer-proxy` and egress from the real source
 /// path — a Class A silent divergence (ADR-0002).  Returning `Err` instead
-/// lets `apply_dialer_proxies` fall back to the relay-based
+/// lets the `dialer-proxy` leaf parse fall back to the relay-based
 /// `DialerProxyAdapter` wrapper, which fails loudly at dial time rather
 /// than pretending the chain was applied or dialing direct.
 ///
@@ -1924,8 +1935,11 @@ fn reject_nonzero_hy2_option(
 /// # Hard errors (Class A per ADR-0002)
 ///
 /// - `amnezia-wg-option` present — AmneziaWG is not in this build.
-/// - `dialer-proxy` — rejected earlier in the dispatch by
-///   [`reject_unthreaded_dialer`]; the WG transport owns its UDP socket.
+/// - `dialer-proxy` — accepted since issue #899: the WG endpoint's UDP
+///   transport dials through the front hop's UDP association. Any proxy
+///   dialer passes the gate (a group front's UDP capability is only
+///   decidable at dial time); a UDP-less front fails `dial_udp_conn` at
+///   runtime, closed like any other endpoint bind error.
 /// - missing `server`, `port`, `private-key`, or `public-key`.
 /// - a key that is not base64, or decodes to other than 32 bytes.
 /// - `ip`/`ipv6` that is neither an address nor a CIDR of that family.

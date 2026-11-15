@@ -1221,7 +1221,7 @@ impl ProxyProvider {
     /// A node whose adapter type cannot carry an injected dialer (anytls,
     /// hysteria2, an `ss` node with an external SIP003 plugin) falls back to
     /// the relay-based [`meow_proxy::DialerProxyAdapter`] — the same
-    /// treatment `apply_dialer_proxies` gives static `proxies:` entries,
+    /// treatment the static `proxies:` builder gives its entries,
     /// except that provider payloads keep the fallback under `strict` too:
     /// the remote-declared chain still holds, where erroring would drop
     /// every sibling node with it.

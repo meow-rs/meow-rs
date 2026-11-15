@@ -25,9 +25,11 @@
 //!   WARP-unaware responder.
 
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
 use meow_common::{AdapterType, MeowError, Metadata, Network, ProxyAdapter};
+use meow_proxy::dialer::DirectDialer;
 use meow_proxy::{WireGuardAdapter, WireGuardConfig};
 use meow_wireguard::x25519::{PublicKey, StaticSecret};
 use meow_wireguard::{Tunn, TunnResult};
@@ -116,14 +118,18 @@ fn assert_ipv4_udp(pkt: &[u8], src: Ipv4Addr, dst: Ipv4Addr, dst_port: u16, payl
     );
 }
 
-/// One UDP flow end to end: adapter → smoltcp → Noise session → real UDP
-/// → responder `Tunn` → decapsulated inner packet.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn adapter_handshake_and_udp_datagram_decapsulates_at_peer() {
-    // ── Responder side: a real UDP socket driven by a responder Tunn ──
-    let responder_sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
-        .await
-        .expect("bind responder");
+/// The responder half of the loopback wire: a real UDP socket driven by
+/// a responder `Tunn` answering the initiator's handshake and forwarding
+/// each decapsulated inner packet into `seen_rx`. Returns the bound
+/// endpoint address, the packet channel, and the task handle.
+fn spawn_wg_responder() -> (
+    SocketAddr,
+    tokio::sync::mpsc::Receiver<Vec<u8>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let responder_sock = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind responder");
+    responder_sock.set_nonblocking(true).expect("nonblocking");
+    let responder_sock = tokio::net::UdpSocket::from_std(responder_sock).expect("tokio socket");
     let endpoint = responder_sock.local_addr().unwrap();
     let initiator_public = PublicKey::from(&StaticSecret::from(INITIATOR_PRIVATE));
     let mut responder_tunn = Tunn::new(
@@ -134,7 +140,7 @@ async fn adapter_handshake_and_udp_datagram_decapsulates_at_peer() {
         7,
         None,
     );
-    let (seen_tx, mut seen_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+    let (seen_tx, seen_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
     let responder_task = tokio::spawn(async move {
         let mut buf = [0u8; 2048];
         let mut dst = vec![0u8; 2048];
@@ -163,6 +169,15 @@ async fn adapter_handshake_and_udp_datagram_decapsulates_at_peer() {
             }
         }
     });
+    (endpoint, seen_rx, responder_task)
+}
+
+/// One UDP flow end to end: adapter → smoltcp → Noise session → real UDP
+/// → responder `Tunn` → decapsulated inner packet.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adapter_handshake_and_udp_datagram_decapsulates_at_peer() {
+    // ── Responder side: a real UDP socket driven by a responder Tunn ──
+    let (endpoint, mut seen_rx, responder_task) = spawn_wg_responder();
 
     // ── Initiator side: the real adapter + pump ───────────────────────
     let adapter = WireGuardAdapter::new(wg_config(endpoint, None)).expect("construct adapter");
@@ -189,6 +204,47 @@ async fn adapter_handshake_and_udp_datagram_decapsulates_at_peer() {
         Ipv4Addr::new(10, 9, 9, 9),
         53,
         b"meow-ping",
+    );
+
+    adapter.reset_sessions();
+    responder_task.abort();
+}
+
+/// The `dialer-proxy` endpoint path (issue #899): the adapter's UDP
+/// endpoint transport opens via `dial_udp_conn` + the `ProxyEndpoint`
+/// channel bridge instead of a raw socket. `DirectDialer` returns a
+/// `ConnectedUdpConn` (a connected raw socket), so this leg proves the
+/// full bridge path — handshake + UDP datagram — is byte-for-byte
+/// equivalent to the direct `bind_endpoint` path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adapter_udp_datagram_via_udp_dialer_decapsulates_at_peer() {
+    let (endpoint, mut seen_rx, responder_task) = spawn_wg_responder();
+
+    let adapter = WireGuardAdapter::new(wg_config(endpoint, None))
+        .expect("construct adapter")
+        .with_dialer(Arc::new(DirectDialer));
+    let dst_addr: SocketAddr = "10.9.9.9:53".parse().unwrap();
+    let meta = Metadata {
+        network: Network::Udp,
+        dst_ip: Some(dst_addr.ip()),
+        dst_port: dst_addr.port(),
+        ..Metadata::default()
+    };
+    let conn = adapter.dial_udp(&meta).await.expect("udp bind via dialer");
+    conn.write_packet(b"meow-ping-dialer", &dst_addr)
+        .await
+        .expect("write_packet");
+
+    let inner = tokio::time::timeout(Duration::from_secs(15), seen_rx.recv())
+        .await
+        .expect("handshake + datagram via dialer endpoint within 15s")
+        .expect("responder stays up");
+    assert_ipv4_udp(
+        &inner,
+        Ipv4Addr::new(10, 0, 0, 2),
+        Ipv4Addr::new(10, 9, 9, 9),
+        53,
+        b"meow-ping-dialer",
     );
 
     adapter.reset_sessions();

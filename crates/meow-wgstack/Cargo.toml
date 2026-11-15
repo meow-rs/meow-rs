@@ -29,7 +29,10 @@ no-macos-sendmsg-x = []
 # rule). Same meow-common edge meow-anytls already carries.
 meow-common = { workspace = true }
 smoltcp = { workspace = true }
-tokio = { version = "1", features = ["net", "sync"] }
+# `time`: `endpoint.rs`'s TX bridge bounds `conn.write_packet` with
+# `tokio::time::timeout` — declare it rather than ride a transitive
+# unification of someone else's feature set.
+tokio = { version = "1", features = ["net", "sync", "time"] }
 bytes = { workspace = true }
 tracing = { workspace = true }
 socket2 = { workspace = true }
@@ -43,7 +46,10 @@ libc = "0.2"
 
 [dev-dependencies]
 # `endpoint.rs` batch tests drive loopback `tokio::net::UdpSocket`s.
-tokio = { version = "1", features = ["macros", "rt", "net"] }
+# `rt-multi-thread`/`test-util`: the proxy-bridge tests spawn on a
+# multi-thread runtime and pause/advance the clock past
+# `PROXY_WRITE_TIMEOUT`.
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "net", "test-util"] }
 
 [lints]
 workspace = true

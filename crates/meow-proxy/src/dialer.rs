@@ -78,9 +78,15 @@ impl UdpTarget {
     ///
     /// Bound conns (VLESS, mux, name-bound fronts) ignore the arg, so for
     /// `Name` — where the caller holds no literal — this returns an
-    /// unspecified placeholder carrying only the port. Per-packet conns
-    /// are only ever returned for [`UdpTarget::Addr`] (or a caller-side
-    /// fallback to it), where the caller does hold the literal.
+    /// unspecified placeholder carrying only the port. **The placeholder
+    /// is only valid as the `write_packet` arg of a conn known to ignore
+    /// it**: it must never be stamped into a per-packet relay header,
+    /// surfaced in logs, or used anywhere a real address is expected —
+    /// callers needing one resolve `host` themselves (the WireGuard
+    /// endpoint bind keeps a locally-resolved candidate for exactly this).
+    /// Per-packet conns are only ever returned for [`UdpTarget::Addr`]
+    /// (or a caller-side fallback to it), where the caller does hold the
+    /// literal.
     pub fn write_dst(&self) -> SocketAddr {
         match self {
             UdpTarget::Addr(addr) => *addr,
