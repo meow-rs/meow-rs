@@ -966,3 +966,167 @@ async fn retirement_h3_cancelled_second_attempt_stops_and_allows_retry() {
     fallback_echo(&client, &healthy).await;
     assert!(bad.captured.lock().unwrap().is_empty());
 }
+
+// ─── dialer-proxy injection (issue #899 follow-up, hysteria2 parity) ────────
+
+/// A `ProxyPacketConn` standing in for the front hop's UDP association:
+/// connected-mode reads and writes against a real socket so the client's
+/// whole QUIC connection actually reaches the endpoint.
+struct BridgedConn {
+    socket: UdpSocket,
+    remote: SocketAddr,
+}
+
+#[async_trait::async_trait]
+impl meow_common::ProxyPacketConn for BridgedConn {
+    async fn read_packet(&self, buf: &mut [u8]) -> meow_common::Result<(usize, SocketAddr)> {
+        let n = self
+            .socket
+            .recv(buf)
+            .await
+            .map_err(meow_common::MeowError::Io)?;
+        Ok((n, self.remote))
+    }
+    async fn write_packet(&self, buf: &[u8], addr: &SocketAddr) -> meow_common::Result<usize> {
+        let _ = addr; // bound-mode arg, inert like a real front conn
+        self.socket
+            .send(buf)
+            .await
+            .map_err(meow_common::MeowError::Io)
+    }
+    fn local_addr(&self) -> meow_common::Result<SocketAddr> {
+        self.socket.local_addr().map_err(meow_common::MeowError::Io)
+    }
+    fn close(&self) -> meow_common::Result<()> {
+        Ok(())
+    }
+}
+
+/// Records every `dial_udp_conn` (`(target, internal)`) and binds each
+/// association to a real socket, so the bridge carries actual datagrams.
+struct BridgingDialer {
+    dials: Mutex<Vec<(crate::dialer::UdpTarget, bool)>>,
+}
+
+#[async_trait::async_trait]
+impl crate::dialer::TcpDialer for BridgingDialer {
+    async fn dial(
+        &self,
+        _host: &str,
+        _port: u16,
+        _internal: bool,
+    ) -> io::Result<Box<dyn meow_transport::Stream>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "bridge dialer carries UDP only",
+        ))
+    }
+    fn is_proxy(&self) -> bool {
+        true
+    }
+    async fn dial_udp_conn(
+        &self,
+        remote: crate::dialer::UdpTarget,
+        internal: bool,
+    ) -> io::Result<Arc<dyn meow_common::ProxyPacketConn>> {
+        self.dials.lock().unwrap().push((remote.clone(), internal));
+        let crate::dialer::UdpTarget::Addr(remote) = remote else {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "bridge dialer resolves nothing",
+            ));
+        };
+        let socket = UdpSocket::bind("127.0.0.1:0").await?;
+        socket.connect(remote).await?;
+        Ok(Arc::new(BridgedConn { socket, remote }))
+    }
+}
+
+/// `with_dialer` must put the whole QUIC connection — Initial included —
+/// on the front association's `SocketIo` bridge: the CONNECT then echoes
+/// back through it exactly like the direct path, and the `Addr` dial is
+/// non-internal (user traffic keeps a lazy front alive, issue #555).
+#[tokio::test]
+async fn quic_transport_rides_injected_socket_io() {
+    let endpoint = endpoint(Behaviour::default()).await;
+    let dialer = Arc::new(BridgingDialer {
+        dials: Mutex::new(Vec::new()),
+    });
+    #[allow(
+        clippy::clone_on_ref_ptr,
+        reason = "the Arc<BridgingDialer> → Arc<dyn TcpDialer> unsize cannot ride Arc::clone(&_)"
+    )]
+    let dialer_dyn: Arc<dyn crate::dialer::TcpDialer> = dialer.clone();
+    let options = options();
+    let connector = QuicConnector::with_dialer(
+        &endpoint.addr.ip().to_string(),
+        endpoint.addr.port(),
+        &insecure_tls(),
+        options.timeout,
+        dialer_dyn,
+    )
+    .unwrap();
+    let client = Client::new(Arc::new(connector), options).unwrap();
+
+    let mut stream = client.tcp("target.test:443").await.unwrap();
+    stream.write_all(b"winner").await.unwrap();
+    let mut bytes = [0; 6];
+    stream.read_exact(&mut bytes).await.unwrap();
+    assert_eq!(&bytes, b"winner");
+    assert_eq!(
+        endpoint.captures("target.test:443").len(),
+        1,
+        "the CONNECT must ride the injected association"
+    );
+    assert_eq!(
+        dialer.dials.lock().unwrap().as_slice(),
+        &[(crate::dialer::UdpTarget::Addr(endpoint.addr), false)]
+    );
+}
+
+/// A domain endpoint asks the front to carry the name first (issue #657);
+/// `Unsupported` resolves locally and redials each literal — every
+/// attempt `internal = false`, the #555 lazy-front rule — and the bound
+/// peer is a resolved literal, never the `write_dst` placeholder.
+#[tokio::test]
+async fn domain_association_falls_back_to_literal_dials() {
+    let dialer = Arc::new(BridgingDialer {
+        dials: Mutex::new(Vec::new()),
+    });
+    #[allow(
+        clippy::clone_on_ref_ptr,
+        reason = "the Arc<BridgingDialer> → Arc<dyn TcpDialer> unsize cannot ride Arc::clone(&_)"
+    )]
+    let dialer_dyn: Arc<dyn crate::dialer::TcpDialer> = dialer.clone();
+    let mut connector =
+        QuicConnector::new("localhost", 4443, &insecure_tls(), Duration::from_secs(3)).unwrap();
+    connector.dialer = Some(dialer_dyn);
+    let (_, peer) = connector
+        .bind_association()
+        .await
+        .expect("the literal fallback must bind");
+    let dials = dialer.dials.lock().unwrap().clone();
+    let (first, rest) = dials.split_first().unwrap();
+    assert_eq!(
+        *first,
+        (
+            crate::dialer::UdpTarget::Name {
+                host: "localhost".into(),
+                port: 4443,
+            },
+            false
+        ),
+        "the front gets the domain target first, non-internal"
+    );
+    assert!(
+        !rest.is_empty()
+            && rest.iter().all(|(t, internal)| {
+                matches!(t, crate::dialer::UdpTarget::Addr(_)) && !internal
+            }),
+        "every fallback dial is a non-internal literal: {rest:?}"
+    );
+    assert!(
+        peer.port() == 4443 && !peer.ip().is_unspecified(),
+        "the bound peer is a resolved literal, not the placeholder: {peer}"
+    );
+}

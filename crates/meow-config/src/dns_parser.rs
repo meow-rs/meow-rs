@@ -4489,17 +4489,17 @@ dns:
         );
     }
 
-    /// The relay-based `DialerProxyAdapter` fallback (hysteria2 cannot take
-    /// an injected dialer) is not a `WrappedProxy` — the validator must see
-    /// its declared chain through `has_configured_dialer`, or a front group
-    /// parked on REJECT would let the tag pass.
-    #[cfg(feature = "hysteria2")]
+    /// The relay-based `DialerProxyAdapter` fallback (a `type: direct`
+    /// node cannot take an injected dialer — it is a raw egress) is not
+    /// a `WrappedProxy` — the validator must see its declared chain
+    /// through `has_configured_dialer`, or a front group parked on REJECT
+    /// would let the tag pass.
     #[tokio::test]
     async fn node_policy_rejects_dpa_chain_when_front_selects_reject() {
         let raw: RawConfig = serde_saphyr::from_str(
             r#"
 proxies:
-  - {name: Node, type: hysteria2, server: 192.0.2.1, port: 443, password: example, dialer-proxy: G}
+  - {name: Node, type: direct, dialer-proxy: G}
   - {name: Front, type: ss, server: front.invalid, port: 443, cipher: aes-128-gcm, password: example}
 proxy-groups:
   - {name: G, type: select, proxies: [REJECT, Front]}

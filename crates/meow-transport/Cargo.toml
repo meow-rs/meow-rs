@@ -107,7 +107,14 @@ jls = ["restls"]
 # formats. aes stays on the cipher-0.5 line (0.9.x) to share the RustCrypto
 # traits with the exotic crypts (blowfish/cast5/twofish/des); vmess's `aes`
 # 0.8 in meow-proxy is unaffected — the two majors coexist in the lockfile.
+# datagram: the connected-datagram `SocketIo` trait (`UdpSocket` impl +
+# `SO_RCVBUF`/`SO_SNDBUF`/`TOS` plumbing — the only socket2 consumer here).
+# The hysteria2 / trusttunnel-h3 QUIC drivers pull it without kcptun's
+# crypto stack; kcptun implies it.
+datagram = ["dep:socket2"]
+
 kcptun = [
+    "datagram",
     "dep:reed-solomon-erasure",
     "dep:crc32fast",
     "dep:pbkdf2",
@@ -123,7 +130,6 @@ kcptun = [
     "dep:cipher",
     "dep:twofish",
     "dep:tokio-snappy",
-    "dep:socket2",
 ]
 
 [dependencies]
@@ -185,7 +191,8 @@ twofish = { version = "0.8", optional = true }
 # `tokio-snappy` wraps `snap`'s frame format (wire-identical to golang/snappy's
 # Writer/Reader) over a bidirectional tokio stream. 185 lines, MIT.
 tokio-snappy = { version = "0.2", optional = true }
-# `SO_RCVBUF`/`SO_SNDBUF`/`TOS` on the kcptun UDP socket (`sockbuf`/`dscp`).
+# `SO_RCVBUF`/`SO_SNDBUF`/`TOS` on the datagram `UdpSocket` impl
+# (`sockbuf`/`dscp`); pulled in by the `datagram` feature.
 socket2 = { workspace = true, optional = true }
 
 # tls feature (BoringSSL)

@@ -184,6 +184,14 @@ the canonical, in-repo source a release is cut from.
   dials and forwards them upstream first. TCP flows on the same
   listeners keep the existing TLS/HTTP sniff; non-TUN inbounds carry
   no sniffed UDP.
+- **`dialer-proxy` on `hysteria2` and `trusttunnel` (`quic: true`)
+  nodes** — the QUIC endpoint's whole transport rides the front hop's
+  UDP association, the WireGuard `with_dialer` contract (issue #899
+  follow-up); TrustTunnel `quic: false` keeps its existing TCP path. A
+  hysteria2 node's `ports`/`hop-interval` hopping is ignored with a
+  warning beside a chain — a bound front association has no second port
+  to hop to. `anytls`, `direct`, and `ss` with an external SIP003 plugin
+  still cannot take an injected dialer (relay-based wrapper fallback).
 
 ### Changed
 
@@ -248,10 +256,10 @@ the canonical, in-repo source a release is cut from.
   field as the target — matching upstream comma protection.
 - `dns.proxy-server-nameserver-policy` now also rejects a proxy tagged while
   it carries a `dialer-proxy:` chain through the relay-based fallback
-  wrapper (hysteria2 and anytls nodes cannot take an injected dialer): the
-  declared dependency is read through a `ProxyAdapter` query instead of a
-  concrete-type downcast, so a front group parked on REJECT can no longer
-  make the chain invisible.
+  wrapper (anytls and `direct` nodes — and `ss` with an external SIP003
+  plugin — cannot take an injected dialer): the declared dependency is
+  read through a `ProxyAdapter` query instead of a concrete-type downcast,
+  so a front group parked on REJECT can no longer make the chain invisible.
 - hysteria2 `max-stream-receive-window` values configured above
   `max-connection-receive-window` are clamped to the connection ceiling —
   a stream can never outrun connection credit — keeping the advertised
@@ -447,6 +455,14 @@ the canonical, in-repo source a release is cut from.
   Windows (Linux bound loopback TCP too), everything else — LAN,
   link-local and multicast included — keeps it. IPv4-mapped destinations
   get an IPv4 socket; native IPv6 keeps its scope id.
+- **A UDP flow matched to a `dialer-proxy`-chained target whose inner is
+  non-transparent now fails loudly at the named rule** instead of sliding
+  to a later rule that may resolve to `DIRECT` (issue #969): the chain
+  the operator pinned cannot be silently replaced, and the dial refuses
+  with `UdpNotSupported`. A chain over a transparent inner
+  (`type: direct`) is unchanged — UDP routes through the front hop's
+  association — and a plain `udp: false` node keeps mihomo's `continue`
+  semantics, the scan sliding to the next rule as before.
 
 ## [0.29.0] - 2026-11-05
 

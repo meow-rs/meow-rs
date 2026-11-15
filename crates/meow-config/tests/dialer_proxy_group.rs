@@ -494,3 +494,95 @@ rules:
     }
     drop(dialer_registry);
 }
+
+/// Hysteria2's hop to its server is a QUIC/UDP association even for a TCP
+/// flow, so its `dialer-proxy` front must resolve a UDP hop on every
+/// connection class — and its hopping knobs (`ports`, `hop-interval`)
+/// warn-and-clear beside the chain instead of erroring, since a connected
+/// front association has no second port to hop to.
+#[cfg(feature = "hysteria2")]
+#[test]
+fn hysteria2_chains_over_udp_on_every_flow() {
+    let raw: RawConfig = serde_saphyr::from_str(
+        r#"
+proxies:
+  - {name: hy2, type: hysteria2, server: 192.0.2.30, port: 443, ports: '443,8443', hop-interval: 10-30, password: quic-hop, dialer-proxy: lb}
+  - {name: HK-TCP, type: trojan, server: 127.0.0.1, port: 1, password: quic-hop, udp: false}
+  - {name: HK-UDP, type: trojan, server: 127.0.0.1, port: 2, password: quic-hop, udp: true}
+proxy-groups:
+  - {name: lb, type: load-balance, strategy: round-robin, proxies: [HK-TCP, HK-UDP]}
+rules:
+  - MATCH,DIRECT
+"#,
+    )
+    .unwrap();
+    let meow_config::RebuildResult {
+        proxies,
+        dialer_registry,
+        ..
+    } = meow_config::rebuild_from_raw(&raw)
+        .expect("hopping fields under dialer-proxy must warn, not error");
+    for network in [Network::Tcp, Network::Udp] {
+        let metadata = Metadata {
+            network,
+            host: "example.com".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+        assert_eq!(
+            proxies["hy2"]
+                .dialer_hop(&metadata)
+                .unwrap_or_else(|| panic!("hy2 names no hop over {network:?}"))
+                .name(),
+            "HK-UDP",
+            "hy2's whole hop is UDP-shaped, {network:?} flow included"
+        );
+    }
+    drop(dialer_registry);
+}
+
+/// The TrustTunnel `quic: true` transport is the same shape: HTTP/3
+/// carries its whole server hop as QUIC datagrams, so the front's hop is
+/// UDP on TCP flows too. An H2 (`quic` absent) node still chains over TCP.
+#[cfg(feature = "trusttunnel-h3")]
+#[test]
+fn trusttunnel_h3_chains_over_udp_on_every_flow() {
+    let raw: RawConfig = serde_saphyr::from_str(
+        r#"
+proxies:
+  - {name: tt-h3, type: trusttunnel, server: 192.0.2.40, port: 443, username: u, password: quic-hop, quic: true, dialer-proxy: lb}
+  - {name: tt-h2, type: trusttunnel, server: 192.0.2.41, port: 443, username: u, password: quic-hop, dialer-proxy: lb}
+  - {name: HK-TCP, type: trojan, server: 127.0.0.1, port: 1, password: quic-hop, udp: false}
+  - {name: HK-UDP, type: trojan, server: 127.0.0.1, port: 2, password: quic-hop, udp: true}
+proxy-groups:
+  - {name: lb, type: load-balance, strategy: round-robin, proxies: [HK-TCP, HK-UDP]}
+rules:
+  - MATCH,DIRECT
+"#,
+    )
+    .unwrap();
+    let meow_config::RebuildResult {
+        proxies,
+        dialer_registry,
+        ..
+    } = meow_config::rebuild_from_raw(&raw).expect("quic + dialer-proxy must parse");
+    for (name, tcp, udp) in [("tt-h3", "HK-UDP", "HK-UDP"), ("tt-h2", "HK-TCP", "HK-TCP")] {
+        for (network, expected) in [(Network::Tcp, tcp), (Network::Udp, udp)] {
+            let metadata = Metadata {
+                network,
+                host: "example.com".into(),
+                dst_port: 443,
+                ..Default::default()
+            };
+            assert_eq!(
+                proxies[name]
+                    .dialer_hop(&metadata)
+                    .unwrap_or_else(|| panic!("{name} names no hop over {network:?}"))
+                    .name(),
+                expected,
+                "{name} over {network:?}"
+            );
+        }
+    }
+    drop(dialer_registry);
+}

@@ -41,12 +41,12 @@
 //!   natively injected dialer takes. `support_udp` advertises exactly
 //!   that distinction: `true` for a transparent inner routes UDP through
 //!   the front's association and a front without UDP fails the dial
-//!   loudly; `false` for anything else makes the adapter report Missing
-//!   for UDP rule probes, so the scan can slide the flow to a later rule
-//!   (e.g. `MATCH,DIRECT`) — a known residual gap for non-transparent
-//!   inners, not a fail-closed path. Protocols that do accept an
-//!   injected `TcpDialer` (e.g. Shadowsocks, SOCKS5) chain UDP natively
-//!   and never reach this adapter.
+//!   loudly; `false` for anything else makes the rule probe report the
+//!   target `Unusable` — the scan stops *on* the matched rule and the
+//!   flow fails at dial, never sliding to a later rule's target
+//!   (issue #969). Protocols that do accept an injected `TcpDialer`
+//!   (e.g. Shadowsocks, SOCKS5, hysteria2, TrustTunnel H3) chain UDP
+//!   natively and never reach this adapter.
 //! - **As a relay hop**: when a dialer-proxy outbound itself appears inside a
 //!   `relay` chain, `connect_over` delegates to the inner adapter — the relay
 //!   chain already defines the path, so the per-outbound dialer is not applied a
@@ -59,6 +59,7 @@ use meow_common::{
     ProxyPacketConn, Result,
 };
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use super::relay::relay_tcp;
@@ -131,6 +132,10 @@ pub struct DialerProxyAdapter {
     /// cannot change, and reading the health bit once keeps a later
     /// liveness flap from flapping the advertised capability.
     transparent: bool,
+    /// Once-per-adapter latch for the `dial_udp` refusal: a UDP NAT
+    /// rebuild re-dials, and the match probe already logged why the scan
+    /// stopped here — repeating this warn per session is noise.
+    warned_udp: AtomicBool,
 }
 
 impl DialerProxyAdapter {
@@ -140,6 +145,7 @@ impl DialerProxyAdapter {
             inner,
             dialer,
             transparent,
+            warned_udp: AtomicBool::new(false),
         }
     }
 
@@ -173,9 +179,11 @@ impl ProxyAdapter for DialerProxyAdapter {
     /// whole path is the front's UDP association, so it advertises `true`;
     /// anything else stays `false`. The front's own capability is
     /// deliberately *not* consulted — answering `false` for a UDP-less
-    /// front would reopen the silent slide (the probe reports the target
-    /// missing and the scan can fall through to `DIRECT`), while `true`
-    /// keeps the match and lets the dial refuse loudly, fail-closed.
+    /// front would pin the failure on this node (an `Unusable` verdict:
+    /// "the named outbound cannot carry UDP") instead of on the front
+    /// association that actually lacks UDP, and the match still fails
+    /// closed either way (issue #969). `true` keeps the failure where it
+    /// belongs: `dial_udp` → the front's `dial_udp_conn` refuses loudly.
     fn support_udp(&self) -> bool {
         self.transparent
     }
@@ -219,6 +227,17 @@ impl ProxyAdapter for DialerProxyAdapter {
 
     async fn dial_udp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
         if !self.transparent {
+            // First refusal only — a UDP NAT rebuild re-dials, and the
+            // flow already cost the match scan its `Unusable` warn.
+            if !self.warned_udp.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    "dialer-proxy '{}' (front: {}) cannot carry UDP — the \
+                     flow fails at this dial instead of sliding to a later \
+                     rule's target (issue #969)",
+                    self.name(),
+                    self.dialer.name()
+                );
+            }
             return Err(MeowError::UdpNotSupported);
         }
         // The transparent inner contributes nothing but a raw egress, so
@@ -314,6 +333,13 @@ impl Proxy for DialerProxyAdapter {
     /// `RelayGroup`'s members.
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         Some(self)
+    }
+
+    /// `!transparent` is exactly the `support_udp` condition: the UDP probe
+    /// fails a matched rule on this adapter closed (issue #969) where a
+    /// plain `udp: false` node keeps mihomo's `continue`.
+    fn is_dialer_proxy_non_transparent(&self) -> bool {
+        !self.transparent
     }
 
     fn members(&self) -> Option<Vec<String>> {
@@ -553,8 +579,9 @@ mod tests {
     }
 
     /// T-D1-1: a non-transparent inner keeps `UdpNotSupported` — the probe
-    /// reads `support_udp() == false` as a missing target so the match
-    /// refuses rather than silently sliding to a later `DIRECT` rule.
+    /// reads `support_udp() == false` on a DPA as `Unusable` (issue #969),
+    /// so the match stops on the named rule and the dial refuses rather
+    /// than silently sliding to a later `DIRECT` rule.
     #[tokio::test]
     async fn udp_is_unsupported() {
         let (target, _registry) = front(MockProxy::new_udp("fast"));

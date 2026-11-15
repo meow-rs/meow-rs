@@ -420,7 +420,7 @@ impl ProxyDialer {
     }
 }
 
-#[cfg(feature = "kcptun")]
+#[cfg(any(feature = "kcptun", feature = "hysteria2", feature = "trusttunnel-h3"))]
 mod packet_conn_socket {
     //! `SocketIo` over a front proxy's UDP relay — the `dialer-proxy`
     //! counterpart of `DirectDialer`'s raw `UdpSocket`. `ProxyPacketConn`
@@ -428,13 +428,18 @@ mod packet_conn_socket {
     //! bounded channels; the poll side then carries ordinary channel
     //! backpressure semantics. Both tasks exit — and the association
     //! closes — when the socket drops.
+    //!
+    //! Compiled for every transport that can sit on a connected datagram
+    //! endpoint — `kcptun`'s KCP stream and the hysteria2 / trusttunnel-h3
+    //! QUIC drivers — none of which pulls the others' crypto deps (the
+    //! module is pure tokio/mpsc, so `hysteria2` gets no kcptun crypto).
 
     use std::io;
     use std::net::SocketAddr;
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
 
-    use meow_transport::kcptun::SocketIo;
+    use meow_transport::datagram::SocketIo;
     use tokio::io::ReadBuf;
     use tokio::sync::mpsc;
     use tokio_util::sync::PollSender;
@@ -456,6 +461,13 @@ mod packet_conn_socket {
         /// conn would pin it indefinitely; abort that one too.
         read_task: tokio::task::JoinHandle<()>,
         write_task: tokio::task::JoinHandle<()>,
+        /// `conn.local_addr()`, captured at construction so the QUIC drivers
+        /// can stamp quiche's `to` without re-asking the (possibly dead)
+        /// association later. An unspecified addr (`0.0.0.0:port`, the
+        /// common shape of an unconnected-bind front conn) is *no* hint —
+        /// `None` lets the caller pick its own unspecified placeholder
+        /// rather than quiche recording a wildcard `to` with a real port.
+        local_addr: Option<SocketAddr>,
     }
 
     impl Drop for PacketConnSocket {
@@ -467,6 +479,10 @@ mod packet_conn_socket {
 
     impl PacketConnSocket {
         pub fn new(conn: Arc<dyn meow_common::ProxyPacketConn>, remote: SocketAddr) -> Self {
+            let local_addr = conn
+                .local_addr()
+                .ok()
+                .filter(|addr| !addr.ip().is_unspecified());
             let (in_tx, inbound) = mpsc::channel(QUEUE);
             let (outbound, mut out_rx) = mpsc::channel::<Vec<u8>>(QUEUE);
 
@@ -494,6 +510,7 @@ mod packet_conn_socket {
                 outbound: Mutex::new(PollSender::new(outbound)),
                 read_task,
                 write_task,
+                local_addr,
             }
         }
     }
@@ -530,6 +547,12 @@ mod packet_conn_socket {
                 Poll::Pending => Poll::Pending,
             }
         }
+
+        /// The association's own `local_addr()` — quiche stamps it as this
+        /// path's `to` on the hysteria2 / trusttunnel-h3 injection paths.
+        fn local_addr_hint(&self) -> Option<SocketAddr> {
+            self.local_addr
+        }
     }
 
     fn closed() -> io::Error {
@@ -537,8 +560,8 @@ mod packet_conn_socket {
     }
 }
 
-#[cfg(feature = "kcptun")]
-use packet_conn_socket::PacketConnSocket;
+#[cfg(any(feature = "kcptun", feature = "hysteria2", feature = "trusttunnel-h3"))]
+pub(crate) use packet_conn_socket::PacketConnSocket;
 
 /// Add the front hop of a `dialer-proxy` dial to the current connection's
 /// notes, e.g. `Dialing ss.example.com:8443 via dialer-proxy fast → HK-01
@@ -2573,11 +2596,11 @@ mod tests {
     /// the write pump (which `write_packet`s the bound remote), poll_recv
     /// surfaces pumped inbound datagrams, and a dead read pump turns recv
     /// into BrokenPipe.
-    #[cfg(feature = "kcptun")]
+    #[cfg(any(feature = "kcptun", feature = "hysteria2", feature = "trusttunnel-h3"))]
     #[tokio::test]
     async fn packet_conn_socket_bridges_poll_and_async() {
         use futures::future::poll_fn;
-        use meow_transport::kcptun::SocketIo;
+        use meow_transport::datagram::SocketIo;
         use tokio::io::ReadBuf;
 
         /// A datagram conn fed by a channel: `read_packet` parks on the
@@ -2631,6 +2654,10 @@ mod tests {
         let conn_dyn: Arc<dyn ProxyPacketConn> = conn_cloned;
         let mut sock = super::packet_conn_socket::PacketConnSocket::new(conn_dyn, remote);
 
+        // The hint the QUIC drivers stamp as quiche's `to`: the
+        // association's own `local_addr()`, captured at construction.
+        assert_eq!(sock.local_addr_hint(), Some(remote));
+
         // Outbound: poll_send → write pump → conn.write_packet(remote).
         poll_fn(|cx| sock.poll_send(cx, b"ping"))
             .await
@@ -2663,6 +2690,40 @@ mod tests {
         let mut rb3 = ReadBuf::new(&mut sink);
         let r = poll_fn(|cx| sock.poll_recv(cx, &mut rb3)).await;
         assert_eq!(r.unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
+    }
+
+    /// An unconnected-bind front conn reports `local_addr()` as
+    /// `0.0.0.0:port` — wildcard with a real port. That is *no* usable
+    /// hint: the socket must yield `None` so the QUIC driver stamps its
+    /// own unspecified `to` instead of a wildcard+port pair.
+    #[cfg(any(feature = "kcptun", feature = "hysteria2", feature = "trusttunnel-h3"))]
+    #[tokio::test]
+    async fn packet_conn_socket_drops_an_unspecified_local_addr_hint() {
+        use meow_transport::datagram::SocketIo;
+
+        struct WildcardConn;
+        #[async_trait]
+        impl ProxyPacketConn for WildcardConn {
+            async fn read_packet(&self, _buf: &mut [u8]) -> MeowResult<(usize, SocketAddr)> {
+                std::future::pending().await
+            }
+            async fn write_packet(&self, buf: &[u8], _addr: &SocketAddr) -> MeowResult<usize> {
+                Ok(buf.len())
+            }
+            fn local_addr(&self) -> MeowResult<SocketAddr> {
+                Ok("0.0.0.0:1234".parse().unwrap())
+            }
+            fn close(&self) -> MeowResult<()> {
+                Ok(())
+            }
+        }
+
+        let conn: Arc<dyn ProxyPacketConn> = Arc::new(WildcardConn);
+        let sock = super::packet_conn_socket::PacketConnSocket::new(
+            conn,
+            "10.0.0.1:7777".parse().unwrap(),
+        );
+        assert_eq!(sock.local_addr_hint(), None);
     }
 
     /// Per-proxy totals for the hop-counting tests, keyed like the tunnel's.

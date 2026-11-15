@@ -315,24 +315,27 @@ async fn start_udp_echo_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
 }
 
 fn adapter(port: u16, obfs: Option<Hy2Obfs>) -> Hy2Adapter {
-    Hy2Adapter::new(Hy2Options {
-        name: "docker-hy2".into(),
-        server: "127.0.0.1".into(),
-        port,
-        password: PASSWORD.into(),
-        sni: Some("localhost".into()),
-        skip_cert_verify: true,
-        udp: true,
-        up_bps: 10_000_000,
-        down_bps: 10_000_000,
-        obfs,
-        obfs_password: obfs.map(|_| OBFS_PASSWORD.into()),
-        ports: None,
-        hop_interval: None,
-        fingerprint: None,
-        fast_open: true,
-        windows: Default::default(),
-    })
+    Hy2Adapter::new(
+        Hy2Options {
+            name: "docker-hy2".into(),
+            server: "127.0.0.1".into(),
+            port,
+            password: PASSWORD.into(),
+            sni: Some("localhost".into()),
+            skip_cert_verify: true,
+            udp: true,
+            up_bps: 10_000_000,
+            down_bps: 10_000_000,
+            obfs,
+            obfs_password: obfs.map(|_| OBFS_PASSWORD.into()),
+            ports: None,
+            hop_interval: None,
+            fingerprint: None,
+            fast_open: true,
+            windows: Default::default(),
+        },
+        None,
+    )
     .expect("hysteria2 adapter must build")
 }
 

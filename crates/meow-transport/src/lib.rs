@@ -93,6 +93,13 @@ pub mod jls;
 #[cfg(feature = "simple-obfs")]
 pub mod simple_obfs;
 
+/// `SocketIo` — the connected-datagram endpoint abstraction shared by the
+/// QUIC/UDP transports: `kcptun`'s KCP stream and `meow-proxy`'s hysteria2 /
+/// trusttunnel-h3 QUIC drivers. Gated by the `datagram` feature (kcptun
+/// implies it) so the QUIC drivers need none of kcptun's crypto deps.
+#[cfg(feature = "datagram")]
+pub mod datagram;
+
 /// kcptun SS-plugin transport (issue #533): a kcp-go wire-compatible
 /// KCP-over-UDP stream plus the crypt/FEC/snappy packet layers.
 /// Gated by the `kcptun` feature; the smux session and client pool live

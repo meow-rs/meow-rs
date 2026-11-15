@@ -3,22 +3,38 @@
 //! opens proxied TCP streams and UDP sessions through it.
 
 use super::config::Config;
-use super::driver::{self, Cmd, ConnHandle};
+use super::driver::{self, Cmd, ConnHandle, DriverSocket};
 use super::proto;
 use super::tcp::DuplexStream;
 use super::udp::UdpSession;
 use super::{Error, Result};
+use crate::dialer::{PacketConnSocket, TcpDialer, UdpTarget};
 use meow_common::atomic::{AtomicU, Uint};
-use std::net::SocketAddr;
+use meow_common::ProxyPacketConn;
+use meow_transport::datagram::SocketIo;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::sync::{oneshot, Mutex};
 use tokio::time::{timeout, Duration};
+use tracing::warn;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How the client's QUIC connection reaches the server.
+enum Connect {
+    /// Direct: local DNS + a bound `UdpSocket` per attempt (the default).
+    Raw,
+    /// `dialer-proxy`: the QUIC connection rides a single front UDP
+    /// association. Every (re)connect must `dial_udp_conn` again — a dead
+    /// `PacketConnSocket` can never be handed a second connection, so the
+    /// dialer is stored here and consulted inside `handle()`.
+    Dialer(Arc<dyn TcpDialer>),
+}
+
 pub struct ReconnectableClient {
     cfg: Arc<Config>,
+    connect: Connect,
     /// The cached connection and the [`generation`](Self::generation) it
     /// was established under.
     conn: Mutex<Option<(Arc<ConnHandle>, Uint)>>,
@@ -32,6 +48,19 @@ impl ReconnectableClient {
     pub fn new(cfg: Config) -> Self {
         Self {
             cfg: Arc::new(cfg),
+            connect: Connect::Raw,
+            conn: Mutex::new(None),
+            generation: AtomicU::new(0),
+        }
+    }
+
+    /// A client whose QUIC datagrams ride the `dialer-proxy` front's UDP
+    /// association instead of a bound `UdpSocket` (issue #899 follow-up —
+    /// the WireGuard `with_dialer` contract).
+    pub fn with_dialer(cfg: Config, dialer: Arc<dyn TcpDialer>) -> Self {
+        Self {
+            cfg: Arc::new(cfg),
+            connect: Connect::Dialer(dialer),
             conn: Mutex::new(None),
             generation: AtomicU::new(0),
         }
@@ -123,10 +152,12 @@ impl ReconnectableClient {
                 // Release a stale driver before resolving or opening a socket.
                 guard.take();
             }
-            // Endpoint DNS may itself dial this pool. Do not hold its connect
-            // lock until resolution has completed: the nested lookup needs to
-            // reach the existing host-resolver reentry fence first.
-            let resolved = resolve_server(&self.cfg).await;
+            // Endpoint DNS may itself dial this pool — and the
+            // `dialer-proxy` arm's `dial_udp_conn` re-enters the registry
+            // and the host resolver. Do not hold this client's connect lock
+            // until the outbound step has completed: a nested lookup needs
+            // to reach the existing host-resolver reentry fence first.
+            let prepared = self.prepare().await;
             let mut guard = self.conn.lock().await;
             if self.generation() != generation {
                 continue;
@@ -139,9 +170,17 @@ impl ReconnectableClient {
                 }
             }
             // A failed concurrent lookup does not invalidate a usable cache.
-            let (server, addrs) = resolved?;
             guard.take();
-            let handle = Arc::new(connect_new(Arc::clone(&self.cfg), server, addrs).await?);
+            let handle = match prepared {
+                Prepared::Direct(resolved) => {
+                    let (server, addrs) = resolved?;
+                    Arc::new(connect_new(Arc::clone(&self.cfg), server, addrs).await?)
+                }
+                Prepared::Dialer(bound) => {
+                    let (server, conn, peer) = bound?;
+                    Arc::new(connect_bound(Arc::clone(&self.cfg), &server, conn, peer).await?)
+                }
+            };
             if self.generation() != generation {
                 continue;
             }
@@ -153,23 +192,36 @@ impl ReconnectableClient {
             "hysteria2: connection reset during setup",
         )))
     }
+
+    /// The outbound work done *outside* the connect lock — same shape as
+    /// `resolve_server`, extended for the `dialer-proxy` arm: parse the
+    /// endpoint and open the front's UDP association, so the lock only
+    /// ever spans the quiche connect itself.
+    async fn prepare(&self) -> Prepared {
+        match &self.connect {
+            Connect::Raw => Prepared::Direct(resolve_server(&self.cfg).await),
+            Connect::Dialer(dialer) => {
+                let result = async {
+                    let server = ServerTarget::parse(&self.cfg.server_addr)?;
+                    let (conn, peer) = dial_server_association(&server, dialer).await?;
+                    Ok((server, conn, peer))
+                };
+                Prepared::Dialer(result.await)
+            }
+        }
+    }
+}
+
+/// A finished [`ReconnectableClient::prepare`] — endpoint resolution plus
+/// whatever the connect step needs, produced lock-free.
+enum Prepared {
+    Direct(Result<(ServerTarget, Vec<SocketAddr>)>),
+    Dialer(Result<(ServerTarget, Arc<dyn ProxyPacketConn>, SocketAddr)>),
 }
 
 async fn resolve_server(cfg: &Config) -> Result<(ServerTarget, Vec<SocketAddr>)> {
     let server = ServerTarget::parse(&cfg.server_addr)?;
-    let addrs = meow_common::resolve_host_all(&server.host, server.port)
-        .await
-        .map_err(|e| {
-            // errno-bearing failures (e.g. EMFILE opening the resolver
-            // socket under local fd pressure) keep the `Io` arm so the
-            // errno survives to `MeowError::Io`; context-only errors keep
-            // the `Resolve` shape (issue #668).
-            if meow_common::MeowError::io_errno_backed(&e) {
-                Error::Io(e)
-            } else {
-                Error::Resolve(format!("{}:{}: {e}", server.host, server.port))
-            }
-        })?;
+    let addrs = resolve_server_host(&server).await?;
     Ok((server, addrs))
 }
 
@@ -221,6 +273,130 @@ fn remember(prev: Option<Error>, next: Error) -> Option<Error> {
     }
 }
 
+/// The `dialer-proxy` arm of [`Prepared`]: open a UDP association to the
+/// server through the injected dialer — the WireGuard `bind_via_dialer`
+/// contract (issue #899) carried onto the hysteria2 endpoint.
+///
+/// `UdpTarget::named` collapses an IP-literal `server` to `Addr` and
+/// delegates a domain to the front hop's own resolver view (issue #657);
+/// a front that cannot carry a domain refuses `Unsupported` and the
+/// documented fallback applies: resolve locally, redial each literal.
+///
+/// The returned `SocketAddr` is what quiche records as this path's peer:
+/// a real address, never `write_dst`'s `0.0.0.0:port` placeholder — for a
+/// `Name` target it comes from a local resolution, strictly cosmetic (a
+/// bound conn ignores the write arg), so a failed lookup warns and keeps
+/// the inert placeholder rather than unbinding a dial that succeeded.
+async fn dial_server_association(
+    server: &ServerTarget,
+    dialer: &Arc<dyn TcpDialer>,
+) -> Result<(Arc<dyn ProxyPacketConn>, SocketAddr)> {
+    let target = UdpTarget::named(&server.host, server.port);
+    // `internal` stays false on every dial below: this association is the
+    // only dial signal a lazy front hop sees for the QUIC connection's
+    // whole lifetime — marking it internal would leave the front
+    // permanently "unused" while user traffic flows (issue #555 boundary,
+    // the same rule `ProxyDialer::dial_udp_endpoint` documents).
+    match dialer.dial_udp_conn(target.clone(), false).await {
+        Ok(conn) => {
+            let peer = match &target {
+                UdpTarget::Addr(addr) => *addr,
+                UdpTarget::Name { .. } => match resolve_server_host(server).await {
+                    Ok(addrs) => match addrs.into_iter().next() {
+                        Some(addr) => addr,
+                        None => {
+                            warn!(
+                                "hysteria2: front bound {target} but local resolution \
+                                     returned no address — peer addr stays unspecified \
+                                     (inert on the bound conn)"
+                            );
+                            target.write_dst()
+                        }
+                    },
+                    Err(e) => {
+                        warn!(
+                            "hysteria2: front bound {target} but local resolution \
+                                 failed ({e}) — peer addr stays unspecified (inert on \
+                                 the bound conn)"
+                        );
+                        target.write_dst()
+                    }
+                },
+            };
+            Ok((conn, peer))
+        }
+        Err(e)
+            if e.kind() == std::io::ErrorKind::Unsupported
+                && matches!(target, UdpTarget::Name { .. }) =>
+        {
+            let addrs = resolve_server_host(server).await?;
+            let mut last_err: Option<std::io::Error> = None;
+            let mut bound = None;
+            for addr in addrs {
+                match dialer.dial_udp_conn(UdpTarget::Addr(addr), false).await {
+                    Ok(conn) => {
+                        bound = Some((conn, addr));
+                        break;
+                    }
+                    Err(e) => last_err = meow_common::MeowError::prefer_errno_io(last_err, e),
+                }
+            }
+            bound.ok_or_else(|| match last_err {
+                Some(e) => Error::Io(e),
+                None => Error::Resolve(format!(
+                    "hysteria2: {}:{} resolved to no address",
+                    server.host, server.port
+                )),
+            })
+        }
+        Err(e) => Err(Error::Io(e)),
+    }
+}
+
+/// `resolve_host_all` on the server endpoint with the same errno-preserving
+/// classification [`resolve_server`] applies (issue #668).
+async fn resolve_server_host(server: &ServerTarget) -> Result<Vec<SocketAddr>> {
+    meow_common::resolve_host_all(&server.host, server.port)
+        .await
+        .map_err(|e| {
+            if meow_common::MeowError::io_errno_backed(&e) {
+                Error::Io(e)
+            } else {
+                Error::Resolve(format!("{}:{}: {e}", server.host, server.port))
+            }
+        })
+}
+
+/// Connect through an already-bound front association: bridge it into a
+/// [`DriverSocket::Io`] and run the ordinary quiche connect + driver over
+/// it. Reconnect is handled by `handle()` — a fresh `dial_udp_conn` every
+/// time, never a resurrected socket.
+async fn connect_bound(
+    cfg: Arc<Config>,
+    server: &ServerTarget,
+    conn: Arc<dyn ProxyPacketConn>,
+    peer: SocketAddr,
+) -> Result<ConnHandle> {
+    let server_name = if cfg.server_name.trim().is_empty() {
+        server.host.clone()
+    } else {
+        cfg.server_name.trim().to_string()
+    };
+    let socket = PacketConnSocket::new(conn, peer);
+    timeout(
+        CONNECT_TIMEOUT,
+        connect_addr_with_io(
+            &cfg,
+            peer,
+            &server_name,
+            driver::AckCoalesce::default(),
+            Some(Box::new(socket)),
+        ),
+    )
+    .await
+    .map_err(|_| Error::Quic(format!("connect timeout after {CONNECT_TIMEOUT:?}")))?
+}
+
 /// `pub(super)` so `driver_tests` can dial a driver with non-default
 /// `coalesce` thresholds — the [`ReconnectableClient`] path above always
 /// takes [`driver::AckCoalesce`]'s default.
@@ -230,19 +406,60 @@ pub(super) async fn connect_addr(
     server_name: &str,
     coalesce: driver::AckCoalesce,
 ) -> Result<ConnHandle> {
+    connect_addr_with_io(cfg, server_addr, server_name, coalesce, None).await
+}
+
+/// `connect_addr` generalized: `Some(io)` runs the connection over an
+/// injected connected endpoint (a `dialer-proxy` front association), `None`
+/// binds a `UdpSocket` for `server_addr` exactly as the direct path always
+/// has. For `Io`, `local` comes from the endpoint's [`SocketIo::local_addr_hint`]
+/// — the association may report none, in which case quiche gets an
+/// unspecified `to` of the peer's family (cosmetic: a bound association
+/// owns no dialable local tuple).
+pub(super) async fn connect_addr_with_io(
+    cfg: &Config,
+    server_addr: SocketAddr,
+    server_name: &str,
+    coalesce: driver::AckCoalesce,
+    socket_io: Option<Box<dyn SocketIo>>,
+) -> Result<ConnHandle> {
     // The socket's family follows the canonical server address.
     let server_addr = meow_common::canonical_socket_addr(server_addr);
-    // Through the outbound-socket chokepoint, never a raw bind: it applies
-    // the TUN global-route interface binding (`meow_common::outbound_iface`)
-    // and the Android `protect()` hook before the first QUIC Initial leaves —
-    // otherwise the datagrams follow the TUN's split default routes back
-    // into the device and loop (issue #695). A loopback server is left
-    // unbound, where the binding would make every send fail.
-    let socket = meow_common::bind_udp_for_peer(server_addr.ip())
-        .await
-        .map_err(Error::Io)?;
-    enlarge_recv_buffer(&socket);
-    let local = socket.local_addr().map_err(Error::Io)?;
+    let (socket, local) = match socket_io {
+        Some(io) => {
+            let local = io.local_addr_hint().unwrap_or_else(|| {
+                SocketAddr::new(
+                    if server_addr.is_ipv6() {
+                        IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+                    } else {
+                        IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+                    },
+                    0,
+                )
+            });
+            (
+                DriverSocket::Io {
+                    io,
+                    peer: server_addr,
+                },
+                local,
+            )
+        }
+        None => {
+            // Through the outbound-socket chokepoint, never a raw bind: it applies
+            // the TUN global-route interface binding (`meow_common::outbound_iface`)
+            // and the Android `protect()` hook before the first QUIC Initial leaves —
+            // otherwise the datagrams follow the TUN's split default routes back
+            // into the device and loop (issue #695). A loopback server is left
+            // unbound, where the binding would make every send fail.
+            let socket = meow_common::bind_udp_for_peer(server_addr.ip())
+                .await
+                .map_err(Error::Io)?;
+            enlarge_recv_buffer(&socket);
+            let local = socket.local_addr().map_err(Error::Io)?;
+            (DriverSocket::Raw(socket), local)
+        }
+    };
 
     let mut config = super::tls::build_quiche_config(cfg)?;
     let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
@@ -341,6 +558,104 @@ impl ServerTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `dial_udp_conn` recorder: refuses `Name` targets `Unsupported`
+    /// like a front that cannot carry domains, binds every literal `Addr`
+    /// to a parked conn, and notes `internal` on each attempt. The
+    /// recording is shared so the test keeps a handle after the
+    /// `Arc<dyn TcpDialer>` unsize.
+    type DialLog = Arc<std::sync::Mutex<Vec<(UdpTarget, bool)>>>;
+
+    struct FallbackDialer {
+        seen: DialLog,
+    }
+
+    struct ParkedConn;
+    #[async_trait::async_trait]
+    impl ProxyPacketConn for ParkedConn {
+        async fn read_packet(&self, _: &mut [u8]) -> meow_common::Result<(usize, SocketAddr)> {
+            std::future::pending().await
+        }
+        async fn write_packet(&self, buf: &[u8], _: &SocketAddr) -> meow_common::Result<usize> {
+            Ok(buf.len())
+        }
+        fn local_addr(&self) -> meow_common::Result<SocketAddr> {
+            Ok("192.0.2.9:4444".parse().unwrap())
+        }
+        fn close(&self) -> meow_common::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TcpDialer for FallbackDialer {
+        async fn dial(
+            &self,
+            _: &str,
+            _: u16,
+            _: bool,
+        ) -> std::io::Result<Box<dyn meow_transport::Stream>> {
+            unreachable!("QUIC transport never TCP-dials")
+        }
+        fn is_proxy(&self) -> bool {
+            true
+        }
+        async fn dial_udp_conn(
+            &self,
+            remote: UdpTarget,
+            internal: bool,
+        ) -> std::io::Result<Arc<dyn ProxyPacketConn>> {
+            self.seen.lock().unwrap().push((remote.clone(), internal));
+            match remote {
+                UdpTarget::Name { .. } => Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "front resolves no domains",
+                )),
+                UdpTarget::Addr(_) => Ok(Arc::new(ParkedConn)),
+            }
+        }
+    }
+
+    /// A domain `server` asks the front to carry the name first (issue
+    /// #657); `Unsupported` redials the locally resolved literals — every
+    /// attempt `internal = false`, the #555 lazy-front rule.
+    #[tokio::test]
+    async fn domain_association_falls_back_to_literal_dials() {
+        let seen: DialLog = Default::default();
+        let dialer: Arc<dyn TcpDialer> = Arc::new(FallbackDialer {
+            seen: Arc::clone(&seen),
+        });
+        // `localhost` stays a `Name` target (not an IP literal) and
+        // resolves through the system resolver without a fixture.
+        let server = ServerTarget::parse("localhost:4443").unwrap();
+        let (_, peer) = dial_server_association(&server, &dialer)
+            .await
+            .expect("the literal fallback must bind");
+        let seen = seen.lock().unwrap().clone();
+        let (first, rest) = seen.split_first().unwrap();
+        assert_eq!(
+            *first,
+            (
+                UdpTarget::Name {
+                    host: "localhost".into(),
+                    port: 4443,
+                },
+                false
+            ),
+            "the front gets the domain target first, non-internal"
+        );
+        assert!(
+            !rest.is_empty()
+                && rest
+                    .iter()
+                    .all(|(t, internal)| matches!(t, UdpTarget::Addr(_)) && !internal),
+            "every fallback dial is a non-internal literal: {rest:?}"
+        );
+        assert!(
+            peer.port() == 4443 && !peer.ip().is_unspecified(),
+            "the bound peer is a resolved literal, not the placeholder: {peer}"
+        );
+    }
 
     #[test]
     fn parses_domain_server_target() {

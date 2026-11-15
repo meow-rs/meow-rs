@@ -817,3 +817,329 @@ async fn non_delivery_wakeup_ends_the_ack_hold() {
         .unwrap();
     assert_eq!(&echoed, b"hi");
 }
+
+// ─── dialer-proxy injection (issue #899 follow-up) ─────────────────────────
+//
+// A `ProxyPacketConn` that actually carries datagrams: the injected
+// `SocketIo` path is exercised end to end — the client's whole QUIC
+// connection (Initial included) rides the front association's bridge to the
+// in-process peer. `remote` is what `write_packet` would stamp; the bridge
+// is connected-mode so the arg is inert, like a bound front conn.
+struct BridgedConn {
+    socket: UdpSocket,
+    remote: SocketAddr,
+    closed: AtomicBool,
+    /// Association-death button: `notify_waiters` ends a parked
+    /// `read_packet`, the way a dead front conn ends the pump, and
+    /// `killed` fails every subsequent call so the error is permanent.
+    kill: Arc<tokio::sync::Notify>,
+    killed: Arc<AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl meow_common::ProxyPacketConn for BridgedConn {
+    async fn read_packet(&self, buf: &mut [u8]) -> meow_common::Result<(usize, SocketAddr)> {
+        if self.killed.load(Ordering::Relaxed) {
+            return Err(meow_common::MeowError::Proxy(
+                "front association died".into(),
+            ));
+        }
+        tokio::select! {
+            n = self.socket.recv(buf) => {
+                n.map(|n| (n, self.remote)).map_err(meow_common::MeowError::Io)
+            }
+            _ = self.kill.notified() => {
+                Err(meow_common::MeowError::Proxy("front association died".into()))
+            }
+        }
+    }
+    async fn write_packet(&self, buf: &[u8], addr: &SocketAddr) -> meow_common::Result<usize> {
+        let _ = addr;
+        if self.killed.load(Ordering::Relaxed) {
+            return Err(meow_common::MeowError::Proxy(
+                "front association died".into(),
+            ));
+        }
+        self.socket
+            .send(buf)
+            .await
+            .map_err(meow_common::MeowError::Io)
+    }
+    fn local_addr(&self) -> meow_common::Result<SocketAddr> {
+        self.socket.local_addr().map_err(meow_common::MeowError::Io)
+    }
+    fn close(&self) -> meow_common::Result<()> {
+        self.closed.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+/// A `TcpDialer` standing in for the injected `dialer-proxy` front: every
+/// `dial_udp_conn` is recorded (`(target, internal)`), then bound to a real
+/// socket so the association actually reaches the peer.
+struct BridgingDialer {
+    dials: std::sync::Mutex<Vec<(crate::dialer::UdpTarget, bool)>>,
+    /// One death switch per produced conn — the test kills a single
+    /// association without poisoning the one its redial creates.
+    conns: std::sync::Mutex<Vec<(Arc<tokio::sync::Notify>, Arc<AtomicBool>)>>,
+}
+
+#[async_trait::async_trait]
+impl crate::dialer::TcpDialer for BridgingDialer {
+    async fn dial(
+        &self,
+        _host: &str,
+        _port: u16,
+        _internal: bool,
+    ) -> std::io::Result<Box<dyn meow_transport::Stream>> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "bridge dialer carries UDP only",
+        ))
+    }
+    fn is_proxy(&self) -> bool {
+        true
+    }
+    async fn dial_udp_conn(
+        &self,
+        remote: crate::dialer::UdpTarget,
+        internal: bool,
+    ) -> std::io::Result<Arc<dyn meow_common::ProxyPacketConn>> {
+        self.dials
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((remote.clone(), internal));
+        let crate::dialer::UdpTarget::Addr(remote) = remote else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "bridge dialer resolves nothing",
+            ));
+        };
+        let socket = UdpSocket::bind("127.0.0.1:0").await?;
+        socket.connect(remote).await?;
+        let kill = Arc::new(tokio::sync::Notify::new());
+        let killed = Arc::new(AtomicBool::new(false));
+        self.conns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((Arc::clone(&kill), Arc::clone(&killed)));
+        Ok(Arc::new(BridgedConn {
+            socket,
+            remote,
+            closed: AtomicBool::new(false),
+            kill,
+            killed,
+        }))
+    }
+}
+
+/// The whole QUIC connection — Initial through auth to proxied traffic —
+/// must ride the injected front association, not a raw UDP socket. The
+/// `Addr` dial is non-internal: user traffic keeps a lazy front alive
+/// (issue #555's rule).
+#[tokio::test]
+async fn quic_transport_rides_injected_socket_io() {
+    let peer = peer(true, Some(0), 16).await;
+    let dialer = Arc::new(BridgingDialer {
+        dials: std::sync::Mutex::new(Vec::new()),
+        conns: std::sync::Mutex::new(Vec::new()),
+    });
+    #[allow(
+        clippy::clone_on_ref_ptr,
+        reason = "the Arc<BridgingDialer> → Arc<dyn TcpDialer> unsize cannot ride Arc::clone(&_)"
+    )]
+    let dialer_dyn: Arc<dyn crate::dialer::TcpDialer> = dialer.clone();
+    let client = ReconnectableClient::with_dialer(
+        Config {
+            server_addr: peer.addr.to_string(),
+            server_name: "localhost".into(),
+            insecure: true,
+            fast_open: true,
+            ..Config::default()
+        },
+        dialer_dyn,
+    );
+
+    let mut stream = timeout(TEST_TIMEOUT, client.tcp_connect(TARGET))
+        .await
+        .unwrap()
+        .unwrap();
+    round_trip(&mut stream).await;
+
+    // UDP over the same injected connection: the datagram session's echo
+    // still comes back through the front association.
+    let mut udp = timeout(TEST_TIMEOUT, client.udp()).await.unwrap().unwrap();
+    udp.send(b"hop", TARGET).unwrap();
+    let (received, addr) = timeout(TEST_TIMEOUT, udp.recv()).await.unwrap().unwrap();
+    assert_eq!(received, b"hop");
+    assert_eq!(addr, TARGET);
+
+    // One association dial, to the literal endpoint, non-internal.
+    assert_eq!(
+        dialer
+            .dials
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_slice(),
+        &[(crate::dialer::UdpTarget::Addr(peer.addr), false)]
+    );
+}
+
+/// `DriverSocket::Io` semantics at the seam: `send_to` ignores `dest` on a
+/// bound endpoint and `recv_from`/`try_recv_from` report the association
+/// peer — never a per-packet source.
+#[tokio::test]
+async fn io_socket_reports_the_bound_peer() {
+    let sink = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let peer_addr = sink.local_addr().unwrap();
+    let raw = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    raw.connect(peer_addr).await.unwrap();
+    let conn_addr = raw.local_addr().unwrap();
+    let conn: Arc<dyn meow_common::ProxyPacketConn> = Arc::new(BridgedConn {
+        socket: raw,
+        remote: peer_addr,
+        closed: AtomicBool::new(false),
+        kill: Arc::new(tokio::sync::Notify::new()),
+        killed: Arc::new(AtomicBool::new(false)),
+    });
+    let io = crate::dialer::PacketConnSocket::new(conn, peer_addr);
+    let mut socket = DriverSocket::Io {
+        io: Box::new(io),
+        peer: peer_addr,
+    };
+
+    // Empty queue: the drain pass ends instead of pending.
+    let mut buf = [0u8; 64];
+    assert!(socket.try_recv_from(&mut buf).unwrap().is_none());
+
+    // Inbound: every datagram reports the bound peer as `from`.
+    sink.send_to(b"pong", conn_addr).await.unwrap();
+    let (n, from) = timeout(TEST_TIMEOUT, socket.recv_from(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&buf[..n], b"pong");
+    assert_eq!(from, peer_addr);
+
+    // …and the next queued datagram surfaces through the drain pass.
+    sink.send_to(b"pong2", conn_addr).await.unwrap();
+    timeout(TEST_TIMEOUT, async {
+        loop {
+            if let Some((n, from)) = socket.try_recv_from(&mut buf).unwrap() {
+                assert_eq!(&buf[..n], b"pong2");
+                assert_eq!(from, peer_addr);
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    // Outbound: dest is advisory on a bound endpoint — the payload still
+    // reaches the peer.
+    socket.send_to(b"reply", peer_addr).await.unwrap();
+    let mut got = [0u8; 16];
+    let (n, _) = timeout(TEST_TIMEOUT, sink.recv_from(&mut got))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&got[..n], b"reply");
+}
+
+/// The `dialer-proxy` reconnect contract: when the front association
+/// dies, the cached `ConnHandle` goes `is_active() == false` and the next
+/// `handle()` must `dial_udp_conn` a *fresh* association — a bound
+/// `PacketConnSocket` can never be re-dialed, so a reused one would leave
+/// the reconnected QUIC session writing into a dead endpoint.
+#[tokio::test]
+async fn dead_front_association_redials_a_fresh_association() {
+    let first = peer(true, Some(0), 16).await;
+    let server = first.addr;
+    let dialer = Arc::new(BridgingDialer {
+        dials: std::sync::Mutex::new(Vec::new()),
+        conns: std::sync::Mutex::new(Vec::new()),
+    });
+    #[allow(
+        clippy::clone_on_ref_ptr,
+        reason = "the Arc<BridgingDialer> → Arc<dyn TcpDialer> unsize cannot ride Arc::clone(&_)"
+    )]
+    let dialer_dyn: Arc<dyn crate::dialer::TcpDialer> = dialer.clone();
+    let client = ReconnectableClient::with_dialer(
+        Config {
+            server_addr: server.to_string(),
+            server_name: "localhost".into(),
+            insecure: true,
+            fast_open: true,
+            ..Config::default()
+        },
+        dialer_dyn,
+    );
+
+    let mut stream = timeout(TEST_TIMEOUT, client.tcp_connect(TARGET))
+        .await
+        .unwrap()
+        .unwrap();
+    round_trip(&mut stream).await;
+    drop(stream);
+
+    // Kill the association the first connection rides: the parked read
+    // errors, the driver's recv pump dies, `is_active()` flips.
+    {
+        let (kill, killed) = {
+            let conns = dialer
+                .conns
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(conns.len(), 1, "the first connect dialed once");
+            conns[0].clone()
+        };
+        killed.store(true, Ordering::Relaxed);
+        kill.notify_waiters();
+    }
+
+    // The peer serves one connection; a fresh one on the same address is
+    // the only way a second handshake can complete (the
+    // `reset_releases_the_cached_connection_and_reconnects` precedent).
+    drop(first);
+    let rebound = timeout(TEST_TIMEOUT, async {
+        loop {
+            if let Ok(socket) = UdpSocket::bind(server).await {
+                break socket;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("first peer released its address");
+    let mut second = peer_on(rebound, true, Some(0), 16, 30_000);
+
+    // A connect attempted while `is_active` is still flipping fails fast
+    // on the dead handle, so retry — the winning attempt is the one that
+    // re-dials a new association.
+    let mut stream = timeout(TEST_TIMEOUT, async {
+        loop {
+            match client.tcp_connect(TARGET).await {
+                Ok(stream) => break stream,
+                Err(_) => sleep(Duration::from_millis(20)).await,
+            }
+        }
+    })
+    .await
+    .expect("the redial must produce a live connection");
+    round_trip(&mut stream).await;
+    timeout(TEST_TIMEOUT, second.auth_seen.recv())
+        .await
+        .unwrap()
+        .expect("the redial authenticated on a new connection");
+
+    assert_eq!(
+        dialer
+            .dials
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len(),
+        2,
+        "a dead association must be re-dialed through the front, not reused"
+    );
+}

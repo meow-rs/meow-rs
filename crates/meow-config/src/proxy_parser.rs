@@ -66,6 +66,18 @@ impl WrappedProxy {
         let port = config
             .get("port")
             .and_then(serde_json::Value::as_u64)
+            .filter(|&port| port > 0)
+            .or_else(|| {
+                // A `ports`-only node (hysteria2's hopping range, which may
+                // carry `port: 0` or none at all) still dials one concrete
+                // endpoint: the range's first port, same as the adapter.
+                config
+                    .get("ports")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|ports| ports.split([',', '-']).next())
+                    .and_then(|first| first.trim().parse::<u64>().ok())
+                    .filter(|&port| port > 0)
+            })
             .and_then(|port| u16::try_from(port).ok());
         if let (true, Some(host), Some(port)) = (dialer.is_proxy(), host, port) {
             self.hop = Some(DialerHop {
@@ -512,9 +524,18 @@ pub fn parse_proxy_with_dialer(
         }
         #[cfg(feature = "hysteria2")]
         "hysteria2" => {
-            reject_unthreaded_dialer(name, "hysteria2", dialer)?;
-            let adapter = parse_hysteria2(name, config)?;
-            Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
+            // A `dialer-proxy` chain carries the QUIC endpoint's UDP
+            // transport through the front hop's UDP association (issue
+            // #899 follow-up, the WireGuard precedent). Any proxy dialer
+            // is accepted here — no `supports_udp` gate: that flag
+            // answers `false` for an unresolved group target, which would
+            // kill legal group fronts at parse time. A UDP-less front
+            // fails `dial_udp_conn` at runtime, closed like any other
+            // endpoint bind error.
+            let adapter = parse_hysteria2(name, config, dialer)?;
+            Ok(Arc::new(
+                WrappedProxy::new(Box::new(adapter)).dialing_through(config, dialer),
+            ))
         }
         #[cfg(feature = "vmess")]
         "vmess" => {
@@ -602,14 +623,14 @@ fn is_external_sip003_plugin(plugin: Option<&str>) -> bool {
 
 /// Reject a `ProxyDialer` for adapter types that do not thread it through.
 ///
-/// `anytls` dials via `meow_common::connect_tcp_host` internally and
-/// `hysteria2` owns its QUIC socket; `direct` is a raw egress by definition.
-/// None of them can honour an injected dialer, so accepting one here would
-/// silently drop the user's `dialer-proxy` and egress from the real source
-/// path — a Class A silent divergence (ADR-0002).  Returning `Err` instead
-/// lets the `dialer-proxy` leaf parse fall back to the relay-based
-/// `DialerProxyAdapter` wrapper, which fails loudly at dial time rather
-/// than pretending the chain was applied or dialing direct.
+/// `anytls` dials via `meow_common::connect_tcp_host` internally; `direct`
+/// is a raw egress by definition. Neither can honour an injected dialer,
+/// so accepting one here would silently drop the user's `dialer-proxy` and
+/// egress from the real source path — a Class A silent divergence
+/// (ADR-0002).  Returning `Err` instead lets the `dialer-proxy` leaf parse
+/// fall back to the relay-based `DialerProxyAdapter` wrapper, which fails
+/// loudly at dial time rather than pretending the chain was applied or
+/// dialing direct.
 ///
 /// A `DirectDialer` is always accepted: it is the no-op default, so nothing
 /// is lost by ignoring it.
@@ -1095,11 +1116,13 @@ fn parse_trusttunnel(
     if quic {
         return Err("trusttunnel: `quic: true` selects the HTTP/3 transport, which is not compiled into this build; rebuild with `--features trusttunnel-h3`".into());
     }
-    if quic {
-        // QUIC carries its own UDP socket, so there is no TCP connection for
-        // a `dialer-proxy` chain to carry (same reason hysteria2 refuses it).
-        reject_unthreaded_dialer(name, "trusttunnel", dialer)?;
-    }
+    // A `quic: true` node's `dialer-proxy` chain carries the QUIC
+    // endpoint's UDP transport through the front hop's UDP association
+    // (issue #899 follow-up — `TrustTunnelAdapter` hands the dialer to
+    // `QuicConnector::with_dialer`); H2 keeps its TCP dialer path. No
+    // `supports_udp` gate: that flag answers `false` for an unresolved
+    // group target, and a UDP-less front fails `dial_udp_conn` at dial,
+    // closed.
     let nonempty = |field: &str| {
         config.get(field).is_some_and(|value| match value {
             serde_json::Value::Null => false,
@@ -1437,6 +1460,7 @@ fn reject_unsupported_anytls_options(
 fn parse_hysteria2(
     name: &str,
     config: &HashMap<String, serde_json::Value>,
+    dialer: &Arc<dyn meow_proxy::dialer::TcpDialer>,
 ) -> std::result::Result<meow_proxy::Hy2Adapter, String> {
     use meow_proxy::{Hy2HopInterval, Hy2Options};
 
@@ -1471,7 +1495,20 @@ fn parse_hysteria2(
         return Err(format!("hysteria2[{name}]: missing obfs-password"));
     }
 
-    let hop_interval = parse_hy2_hop_interval(name, config.get("hop-interval"))?;
+    let mut hop_interval = parse_hy2_hop_interval(name, config.get("hop-interval"))?;
+    let mut ports = ports;
+    // A `dialer-proxy` chain binds the QUIC connection to one front UDP
+    // association — a connected endpoint has no second port to hop to.
+    // Hopping config is legal beside it, so warn and drop it rather than
+    // reject: the driver also skips `HopState` on an injected endpoint.
+    if dialer.is_proxy() && (ports.is_some() || hop_interval.is_some()) {
+        tracing::warn!(
+            "hysteria2[{name}]: `ports`/`hop-interval` are ignored with `dialer-proxy` \
+             — a front association is bound to a single peer port and cannot hop"
+        );
+        ports = None;
+        hop_interval = None;
+    }
     let fingerprint = parse_hy2_fingerprint(name, config.get("fingerprint"))?;
     let fast_open = config
         .get("fast-open")
@@ -1497,25 +1534,28 @@ fn parse_hysteria2(
         max_conn: window("max-connection-receive-window")?,
     };
 
-    meow_proxy::Hy2Adapter::new(Hy2Options {
-        name: name.to_string(),
-        server: server.to_string(),
-        port,
-        password: password.to_string(),
-        sni: sni.map(str::to_string),
-        skip_cert_verify,
-        udp,
-        up_bps,
-        down_bps,
-        obfs,
-        obfs_password,
-        ports,
-        hop_interval: hop_interval
-            .map(|(min_secs, max_secs)| Hy2HopInterval { min_secs, max_secs }),
-        fingerprint,
-        fast_open,
-        windows,
-    })
+    meow_proxy::Hy2Adapter::new(
+        Hy2Options {
+            name: name.to_string(),
+            server: server.to_string(),
+            port,
+            password: password.to_string(),
+            sni: sni.map(str::to_string),
+            skip_cert_verify,
+            udp,
+            up_bps,
+            down_bps,
+            obfs,
+            obfs_password,
+            ports,
+            hop_interval: hop_interval
+                .map(|(min_secs, max_secs)| Hy2HopInterval { min_secs, max_secs }),
+            fingerprint,
+            fast_open,
+            windows,
+        },
+        Some(Arc::clone(dialer)),
+    )
 }
 
 #[cfg(feature = "hysteria2")]
@@ -5117,6 +5157,96 @@ tls: true
             "name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\nport: 0\nports: '443,8443'\npassword: secret\n",
         );
         assert!(parse_proxy(&cfg).is_ok());
+    }
+
+    /// A `dialer-proxy` chain binds the QUIC endpoint to one front UDP
+    /// association, so `ports`/`hop-interval` can never take effect: the
+    /// parser warns once and drops them instead of rejecting a config the
+    /// operator may share with an unchained build.
+    #[cfg(feature = "hysteria2")]
+    #[test]
+    fn hysteria2_dialer_proxy_warns_and_drops_hopping_fields() {
+        use meow_proxy::dialer::{DialerTarget, NamedProxyDialer, ProxyRegistry};
+
+        let registry = ProxyRegistry::default();
+        let dialer: Arc<dyn meow_proxy::dialer::TcpDialer> =
+            Arc::new(NamedProxyDialer::new(DialerTarget::new("front", &registry)));
+        let cfg = hy2_config(
+            "name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\nports: '443,8443'\nhop-interval: 10-30\npassword: secret\n",
+        );
+        let (parsed, logs) = capture_warns(|| super::parse_proxy_with_dialer(&cfg, &dialer, true));
+        parsed.expect("hopping fields under dialer-proxy warn, not error");
+        assert!(
+            logs.contains("ports`/`hop-interval` are ignored"),
+            "expected the hopping warning, got: {logs}"
+        );
+        // Without the chain the same fields stay: direct builds keep the
+        // hop behaviour the config asked for.
+        let cfg = hy2_config(
+            "name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\nports: '443,8443'\nhop-interval: 10-30\npassword: secret\n",
+        );
+        let (_, logs) = capture_warns(|| parse_proxy(&cfg).unwrap());
+        assert!(
+            !logs.contains("ports`/`hop-interval"),
+            "an unchained node must not warn, got: {logs}"
+        );
+    }
+
+    /// A `ports`-only hysteria2 node (and the `port: 0` spelling of one)
+    /// has no `port` field for the hop record — but the chain still dials
+    /// one endpoint, the range's first port. `dialing_through` must fall
+    /// back to it or `dialer_hop`/`has_configured_dialer` lose the chain.
+    #[cfg(feature = "hysteria2")]
+    #[test]
+    fn hysteria2_ports_only_chain_records_the_hop() {
+        use meow_proxy::dialer::{DialerTarget, NamedProxyDialer, ProxyRegistry};
+
+        let registry = ProxyRegistry::default();
+        let dialer: Arc<dyn meow_proxy::dialer::TcpDialer> =
+            Arc::new(NamedProxyDialer::new(DialerTarget::new("front", &registry)));
+        for yaml in [
+            "name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\nports: '443,8443-8446'\npassword: secret\n",
+            "name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\nport: 0\nports: '443,8443'\npassword: secret\n",
+        ] {
+            let cfg = hy2_config(yaml);
+            let parsed = super::parse_proxy_with_dialer(&cfg, &dialer, true)
+                .unwrap_or_else(|e| panic!("ports-only chain must parse: {e}"));
+            assert!(
+                parsed.has_configured_dialer(),
+                "the declared chain must survive a `ports`-only config"
+            );
+            let wrapped = parsed
+                .as_any()
+                .and_then(|any| any.downcast_ref::<WrappedProxy>())
+                .expect("a parsed leaf sits behind WrappedProxy");
+            assert_eq!(
+                wrapped.hop.as_ref().map(|hop| hop.port),
+                Some(443),
+                "the hop endpoint is the range's first port"
+            );
+        }
+    }
+
+    /// An explicit `port:` always wins over the `ports:` range — the hop
+    /// must record the address the QUIC socket actually dials.
+    #[cfg(feature = "hysteria2")]
+    #[test]
+    fn hysteria2_explicit_port_beats_ports_range_for_the_hop() {
+        use meow_proxy::dialer::{DialerTarget, NamedProxyDialer, ProxyRegistry};
+
+        let registry = ProxyRegistry::default();
+        let dialer: Arc<dyn meow_proxy::dialer::TcpDialer> =
+            Arc::new(NamedProxyDialer::new(DialerTarget::new("front", &registry)));
+        let cfg = hy2_config(
+            "name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\nport: 9443\nports: '443,8443'\npassword: secret\n",
+        );
+        let parsed = super::parse_proxy_with_dialer(&cfg, &dialer, true)
+            .unwrap_or_else(|e| panic!("explicit-port chain must parse: {e}"));
+        let wrapped = parsed
+            .as_any()
+            .and_then(|any| any.downcast_ref::<WrappedProxy>())
+            .expect("a parsed leaf sits behind WrappedProxy");
+        assert_eq!(wrapped.hop.as_ref().map(|hop| hop.port), Some(9443));
     }
 
     #[cfg(feature = "hysteria2")]

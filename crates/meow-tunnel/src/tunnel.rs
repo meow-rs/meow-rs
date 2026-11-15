@@ -1058,6 +1058,17 @@ impl TargetProbe for RouteTargetProbe<'_> {
             return TargetCheck::Pass;
         }
         if self.metadata.network == Network::Udp && !p.support_udp() {
+            // mihomo `continue`s a UDP-incapable target: a plain node's
+            // `udp: false` is a routing preference, so the scan slides
+            // and a later rule can still pick the flow up. The single
+            // exception is a `dialer-proxy` wrapper over a
+            // non-transparent inner — the operator chained *every* flow
+            // through that node, so sliding (e.g. to `MATCH,DIRECT`)
+            // would silently reroute what the config pinned; the scan
+            // stops on the match and the dial fails loudly (issue #969).
+            if p.is_dialer_proxy_non_transparent() {
+                return TargetCheck::Unusable;
+            }
             return TargetCheck::Missing;
         }
         TargetCheck::Usable
@@ -2239,6 +2250,103 @@ mod tests {
             adapter.name(),
             "REJECT",
             "PASS-targeted rule must be skipped"
+        );
+    }
+
+    /// Issue #969: a UDP flow matched to a rule targeting a
+    /// `dialer-proxy` chain over a non-transparent inner
+    /// (`support_udp() == false` by construction) must NOT slide to a
+    /// later rule's target the way a missing target — or a plain
+    /// `udp: false` node — does. `TargetCheck::Unusable` stops the scan
+    /// *on* the match: resolution returns the named outbound and the
+    /// flow fails at its dial, loudly, instead of silently rerouting
+    /// through DIRECT.
+    #[tokio::test]
+    async fn udp_flow_to_udp_incapable_target_fails_closed() {
+        use meow_rules::{domain_suffix::DomainSuffixRule, final_rule::FinalRule};
+
+        let tunnel = test_tunnel();
+        let mut proxies = meow_config::rebuild_from_raw(&Default::default())
+            .unwrap()
+            .proxies;
+        // The real chain shape, not just a UDP-less leaf: the
+        // `DialerProxyAdapter` wraps a non-transparent inner
+        // (`RecordingFront` is Socks5-typed), which is exactly what
+        // `is_dialer_proxy_non_transparent` reports.
+        let front: Arc<dyn Proxy> = Arc::new(RecordingFront {
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let registry = meow_proxy::dialer::ProxyRegistry::default();
+        let chained = Arc::new(meow_proxy::DialerProxyAdapter::new(
+            front,
+            meow_proxy::dialer::DialerTarget::new("hop", &registry),
+        ));
+        proxies.insert("NOUDP".into(), chained);
+        tunnel.update_routing(
+            proxies,
+            vec![
+                Box::new(DomainSuffixRule::new("example.com", "NOUDP")),
+                Box::new(FinalRule::new("DIRECT")),
+            ],
+            Default::default(),
+        );
+        let meta = Metadata {
+            host: "x.example.com".into(),
+            dst_port: 443,
+            network: Network::Udp,
+            ..Default::default()
+        };
+        let adapter = tunnel.inner().resolve_proxy(&meta).await.unwrap().adapter;
+        assert_eq!(
+            adapter.name(),
+            "front",
+            "an existing-but-UDP-incapable target must be returned, not DIRECT"
+        );
+        // The same flow on TCP still picks the target, so the verdict is
+        // scoped to the connection class like mihomo's SupportUDP check.
+        let tcp_meta = Metadata {
+            host: "x.example.com".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+        let adapter = tunnel
+            .inner()
+            .resolve_proxy(&tcp_meta)
+            .await
+            .unwrap()
+            .adapter;
+        assert_eq!(adapter.name(), "front");
+    }
+
+    /// The complement: a *missing* target keeps upstream `continue`
+    /// semantics — the scan warns and slides to the next rule (issue
+    /// #513), so the `Unusable` verdict must not have broken it.
+    #[tokio::test]
+    async fn missing_target_still_slides_to_the_next_rule() {
+        use meow_rules::{domain_suffix::DomainSuffixRule, final_rule::FinalRule};
+
+        let tunnel = test_tunnel();
+        tunnel.update_routing(
+            meow_config::rebuild_from_raw(&Default::default())
+                .unwrap()
+                .proxies,
+            vec![
+                Box::new(DomainSuffixRule::new("example.com", "GONE")),
+                Box::new(FinalRule::new("DIRECT")),
+            ],
+            Default::default(),
+        );
+        let meta = Metadata {
+            host: "x.example.com".into(),
+            dst_port: 443,
+            network: Network::Udp,
+            ..Default::default()
+        };
+        let adapter = tunnel.inner().resolve_proxy(&meta).await.unwrap().adapter;
+        assert_eq!(
+            adapter.name(),
+            "DIRECT",
+            "absent targets keep continue-on-missing semantics"
         );
     }
 

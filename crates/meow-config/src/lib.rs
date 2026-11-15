@@ -2222,7 +2222,7 @@ type ParsedLeaf = Option<(Arc<dyn Proxy>, bool)>;
 ///
 /// Adapter types that do not establish their underlying connection through
 /// the pluggable dialer — `direct` (resolver-threaded dials stay on the real
-/// path), `anytls`, `hysteria2` (QUIC), and `ss` with an external SIP003
+/// path), `anytls`, and `ss` with an external SIP003
 /// plugin — reject the injected dialer at parse time. Those are re-parsed
 /// *directly* — via [`proxy_parser::parse_static_proxy`] so the
 /// `dns.direct-nameserver` slot wiring matches the unedged path — and
@@ -7158,10 +7158,10 @@ mod dialer_proxy_tests {
         m
     }
 
-    /// `anytls` / `hysteria2` establish their own transport and never call the
-    /// pluggable dialer. Accepting the injected dialer there would silently
-    /// drop the user's `dialer-proxy` and egress from the real source path, so
-    /// the parser rejects it and the relay-based wrapper takes over — which
+    /// `anytls` establishes its own transport and never calls the pluggable
+    /// dialer. Accepting the injected dialer there would silently drop the
+    /// user's `dialer-proxy` and egress from the real source path, so the
+    /// parser rejects it and the relay-based wrapper takes over — which
     /// fails loudly at dial time rather than dialing direct.
     ///
     /// The raw must parse *standalone* (a `password` is required): the
@@ -7175,8 +7175,6 @@ mod dialer_proxy_tests {
         let types: &[&str] = &[
             #[cfg(feature = "anytls")]
             "anytls",
-            #[cfg(feature = "hysteria2")]
-            "hysteria2",
         ];
         for &ty in types {
             let mut proxies = registry(&["A", "front"]);
@@ -9511,7 +9509,7 @@ rules:
     }
 
     /// A `dialer-proxy` on an adapter that cannot carry an injected dialer
-    /// (`direct`, `anytls`, `hysteria2`, SS + external SIP003) fails the
+    /// (`direct`, `anytls`, SS + external SIP003) fails the
     /// by-name re-parse. Lenient falls back to the relay-based
     /// `DialerProxyAdapter` wrapper; strict surfaces the defect at load
     /// (issue #533 review).

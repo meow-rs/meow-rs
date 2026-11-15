@@ -286,6 +286,20 @@ pub trait Proxy: ProxyAdapter {
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         None
     }
+    /// `true` only for a `dialer-proxy` wrapper over a non-transparent
+    /// inner — the one UDP-incapable target a matched rule must stop on
+    /// (`TargetCheck::Unusable`, issue #969): the operator chained every
+    /// flow through the named node, so sliding to a later rule would
+    /// silently reroute what the config pinned. Every other UDP-incapable
+    /// adapter keeps mihomo's `continue` — an `udp: false` node is a
+    /// routing preference, not a chain the flow must die inside.
+    ///
+    /// `DialerProxyAdapter` is always the outermost registry entry, so
+    /// this default is unreachable today; any future wrapper that can
+    /// sit above one must forward it (same contract as `dialer_hop`).
+    fn is_dialer_proxy_non_transparent(&self) -> bool {
+        false
+    }
     /// For group adapters: the ordered list of member proxy names.
     /// Leaf adapters return `None`.
     fn members(&self) -> Option<Vec<String>> {

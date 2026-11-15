@@ -12,6 +12,7 @@
 
 use super::stream::{H3Stream, WRITE_BUFFER_BYTES};
 use http::StatusCode;
+use meow_transport::datagram::SocketIo;
 use quiche::h3::{self, NameValue as _};
 use std::{
     collections::{HashMap, VecDeque},
@@ -24,10 +25,59 @@ use std::{
     time::Duration,
 };
 use tokio::{
+    io::ReadBuf,
     net::UdpSocket,
     sync::{mpsc, mpsc::error::TrySendError, oneshot, Notify, OwnedSemaphorePermit, Semaphore},
 };
 use tokio_util::sync::CancellationToken;
+
+/// The datagram endpoint the driver reads and writes: either a bound
+/// `UdpSocket` (the direct path) or an injected connected `SocketIo` — a
+/// `dialer-proxy` front's UDP association bridged by `PacketConnSocket`,
+/// whose peer is implicit: `send` ignores `dest`, `recv` reports the
+/// association's bound peer.
+pub(super) enum Socket {
+    Raw(UdpSocket),
+    Io {
+        io: Box<dyn SocketIo>,
+        /// The address quiche sees as this path's peer — the association's
+        /// `UdpTarget` (or a locally-resolved cosmetic stand-in for a
+        /// `Name` target). Received datagrams report it as `from`.
+        peer: SocketAddr,
+    },
+}
+
+impl Socket {
+    /// Await one datagram. `Raw` reports the real source; `Io` reports the
+    /// association's bound peer — its reads are connected-mode and carry
+    /// no source address.
+    async fn recv_from(&mut self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        match self {
+            Self::Raw(socket) => socket.recv_from(buf).await,
+            Self::Io { io, peer } => {
+                let mut rb = ReadBuf::new(buf);
+                std::future::poll_fn(|cx| io.poll_recv(cx, &mut rb)).await?;
+                Ok((rb.filled().len(), *peer))
+            }
+        }
+    }
+
+    /// One datagram out. `Io` ignores `dest` — the endpoint is bound to the
+    /// association's peer, so `debug_assert` it matches what quiche asked
+    /// for rather than silently routing elsewhere.
+    async fn send_to(&mut self, buf: &[u8], dest: SocketAddr) -> io::Result<usize> {
+        match self {
+            Self::Raw(socket) => socket.send_to(buf, dest).await,
+            Self::Io { io, peer } => {
+                debug_assert_eq!(
+                    *peer, dest,
+                    "injected endpoint must only send to its bound peer"
+                );
+                std::future::poll_fn(|cx| io.poll_send(cx, buf)).await
+            }
+        }
+    }
+}
 
 /// HTTP/3 error codes this client sends (PROTOCOL.md §10.2).
 const H3_NO_ERROR: u64 = 0x100;
@@ -154,7 +204,7 @@ impl Drop for StreamState {
 /// Driver state that is *not* the quiche connection, so helpers can borrow it
 /// alongside `&mut conn`.
 struct State {
-    socket: UdpSocket,
+    socket: Socket,
     local: SocketAddr,
     cmd_tx: mpsc::WeakSender<Cmd>,
     cmd_rx: mpsc::Receiver<Cmd>,
@@ -171,7 +221,7 @@ struct State {
 /// QUIC handshake completes, HTTP/3 is negotiated and its control streams are
 /// up. Everything the connection owns stops when `cancel` fires.
 pub(super) async fn spawn(
-    socket: UdpSocket,
+    socket: Socket,
     local: SocketAddr,
     conn: quiche::Connection,
     cancel: CancellationToken,
