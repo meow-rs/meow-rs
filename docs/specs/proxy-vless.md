@@ -43,8 +43,9 @@ In scope:
 4. TCP outbound. `network: tcp | ws | grpc | h2 | httpupgrade` via
    the `meow-transport` chain (`vless::transport::build_chain` in
    `vless.rs`).
-5. UDP-over-TCP (VLESS `cmd: 0x02`). Implemented inline in
-   `vless/conn.rs`.
+5. UDP-over-TCP: bare VLESS `cmd: 0x02` for non-vision flows
+   (`vless/conn.rs`); a per-association Mux.Cool CommandMux session for
+   `flow: xtls-rprx-vision` (see §Vision UDP).
 6. YAML config parser for `proxies: [{ type: vless }]` matching
    upstream's field set.
 7. Integration with `ProxyHealth` (api-delay-endpoints spec) and
@@ -143,7 +144,7 @@ Field reference:
 | 4 | Unknown `flow` value — upstream ignores | A | An unknown flow might skip expected security processing. Hard-error. |
 | 5 | `encryption: <non-none>` — upstream hard-errors too | — | Both hard-error; this is a match, not a divergence. |
 | 6 | `mux: { enabled: true }` — upstream runs Mux.Cool | B | Not implemented; warn-once and ignore. User gets same destination, just no muxing. |
-| 7 | `flow: xtls-rprx-vision` + `udp: true` — Vision TCP-only, UDP silently uses plain VLESS upstream | B | Warn-once at config load; UDP relay still routes to the same destination with outer-TLS guarantees. Not Class A because crypto and routing are unchanged on the UDP path. |
+| 7 | `flow: xtls-rprx-vision` + `udp: true` — upstream clients route vision UDP over a CommandMux session, not a bare `Cmd::Udp` request | B | Matched (see §Vision UDP below): with `mux` compiled in `dial_udp` opens a per-association Mux.Cool session — `cmd=0x03` + the `xtls-rprx-vision` addon + a `network=0x02` substream — the only shape strict servers (sing-box ≥1.12, `request.Flow == account.Flow` on every command) accept. A domain UDP target cannot ride Mux.Cool and falls back to the bare request with one warn per adapter; without `mux` the capability is off (`support_udp() == false`). |
 
 ## Wire format
 
@@ -158,8 +159,8 @@ version(1)         = 0x00
 uuid(16)           = 16-byte user ID (binary, not hex string)
 addon_length(1)    = byte length of the addon blob that follows
 addon(addon_length)= protobuf-encoded addons (see below)
-command(1)         = 0x01 TCP | 0x02 UDP
-port(2)            = destination port, big-endian
+command(1)         = 0x01 TCP | 0x02 UDP | 0x03 CommandMux
+port(2)            = destination port, big-endian (absent for 0x03)
 addr_type(1)       = 0x01 IPv4 | 0x02 domain | 0x03 IPv6
 address            = variable (same encoding as VMess — see below)
 ```
@@ -326,19 +327,43 @@ transport that cannot switch reads fails with an `Unsupported` error.
 - Vision does **not** require the application to be doing TLS — it
   falls through to pass-through if the first 5 bytes are not a TLS
   record header. No error at runtime, just a `trace!` log.
-- `flow: xtls-rprx-vision` + `udp: true` — Vision is TCP-only.
-  `dial_udp` ignores `flow` and uses plain `VlessConn`. **Warn-once
-  at config load** (Class B per ADR-0002, divergence row #7):
-  ```
-  warn!(
-      proxy = %name,
-      "flow: xtls-rprx-vision applies to TCP only; UDP relays on \
-       this proxy will use plain VLESS (Vision's inner-TLS splice \
-       is not defined for UDP datagrams)"
-  );
-  ```
-  The user gets one loud signal at startup and can accept it or set
-  `udp: false`. No runtime log noise on subsequent UDP dials.
+- `flow: xtls-rprx-vision` + `udp: true` — Vision is TCP-only, but
+  upstream clients do **not** send a bare `Cmd::Udp` request for a
+  flow user: the UDP association rides a Mux.Cool session (see
+  §Vision UDP). **Warn-once at config load** (Class B per ADR-0002,
+  divergence row #7); the strict-server detail lives in §Vision UDP.
+
+### Vision UDP
+
+sing-box ≥1.12 (its vendored sing-vmess `vless.Service`) checks
+`request.Flow == account.Flow` on **every** command. A bare `Cmd::Udp`
+request from a vision user carries an empty addon and is rejected as a
+flow mismatch; a `Cmd::Udp` request *with* the addon is rejected by
+xray, mihomo and sing-box alike. Upstream clients therefore never emit
+one — vision UDP goes over a CommandMux session:
+
+- `dial_udp` (with the `mux` feature compiled in) first honours a
+  configured `mux:` pool as before. With no pool configured it builds
+  a **per-association `MuxClient`** — `self.mux` is never reused for
+  this, so UDP is not serialized behind TCP streams — with
+  `protocol: MuxCool`. The session dial is the shared `mux_dial_fn`:
+  `self.dialer` (dialer-proxy chains preserved) → transport chain →
+  Encryption → `VlessConn::new_mux_deferred(stream, uuid,
+  Some("xtls-rprx-vision"))` wrapped in `VisionConn`. The wire request
+  is `cmd=0x03` (CommandMux, no port/address) + the 18-byte vision
+  addon, written raw ahead of the first Vision padding frame.
+- `MuxClient::open_packet_stream_for` then opens a `network=0x02`
+  Mux.Cool substream and returns `muxcool::PacketConn`, whose Keep+Data
+  frames stamp a `SocketAddr` destination per datagram.
+- **Domain targets:** `UdpTarget::Name` (host-only UDP metadata) cannot
+  ride that per-datagram `SocketAddr`, so the mux path declines
+  (`Ok(None)`); the adapter warns once per adapter and falls back to
+  the bare `Cmd::Udp` request — correct on tolerant listeners, rejected
+  by strict ones, and the warn says so.
+- **Without `mux`:** there is no lawful wire shape for vision UDP —
+  `support_udp() == false` and `dial_udp` refuses with `NotSupported`
+  rather than returning a conn that blackholes. Non-vision UDP is
+  unaffected: it stays on the plain `Cmd::Udp` request in every build.
 
 ## Internal design sketch
 
@@ -402,7 +427,9 @@ impl ProxyAdapter for VlessAdapter {
     }
 
     async fn dial_udp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
-        // ... identical shape to dial_tcp, Cmd::Udp, no Vision on UDP
+        // non-vision: bare VlessPacketConn, Cmd::Udp.
+        // vision: per-association Mux.Cool session (Cmd::Mux + vision
+        // addon, network=0x02 substream) — see §Vision UDP.
     }
 
     fn health(&self) -> &ProxyHealth { &self.health }
@@ -641,9 +668,14 @@ Same skip-if-absent pattern as `vmess_integration.rs`. Binary name:
    Vision" is not a useful unit to ship for real users (Vision is why
    people choose VLESS over VMess). Bundled.
 
-3. **UDP + Vision → silent pass-through, warn-once at load.**
-   `VlessAdapter::dial_udp` silently ignores `flow: xtls-rprx-vision`
-   and uses plain `VlessConn`. Warn-once at config load (Class B per
-   ADR-0002 — see divergence row #7). UDP relay still routes correctly
-   with outer-TLS guarantees; Vision's inner-TLS splice is TCP-only by
-   definition.
+3. **UDP + Vision → Mux.Cool session (supersedes "silent pass-through"
+   from the original sign-off).** The original answer assumed upstream
+   tolerates a bare `Cmd::Udp` request from a flow user; sing-box ≥1.12's
+   per-command `request.Flow == account.Flow` check proves it does not,
+   and no upstream client emits `Cmd::Udp` with a flow addon either.
+   `VlessAdapter::dial_udp` instead matches upstream: a per-association
+   Mux.Cool session (`cmd=0x03` + the vision addon + a `network=0x02`
+   substream) when `mux` is compiled in, warn-once bare fallback for
+   domain targets, `support_udp() == false` when it is not — see
+   §Vision UDP. Vision's inner-TLS splice remains TCP-only; this change
+   is about which *request* carries the UDP association.
