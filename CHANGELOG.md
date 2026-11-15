@@ -299,6 +299,9 @@ the canonical, in-repo source a release is cut from.
   `h2` and `http/1.1`, as mihomo does, and speaks whichever the server picks.
   On h2 an upstream keeps one shared connection and runs concurrent queries
   as streams on it; servers that pick HTTP/1.1 keep the keep-alive pool.
+  HTTP/2 is behind the new app feature `dns-doh-h2` (meow-dns `doh-h2`), in
+  `full` and out of `minimal`, where it would be the first user of the `h2`
+  crate (ADR-0007); a `minimal` build keeps HTTP/1.1-only DoH.
 - **`ech-opts` on a VLESS REALITY node.** A node with both was refused with
   `reality-opts cannot be combined with ech-opts` once the ECH config was
   known, whether inline or fetched from DNS. `ech-opts` is now ignored with a

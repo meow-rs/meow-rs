@@ -124,6 +124,10 @@ Each `nameserver` / `fallback` entry is a server URL:
 An encrypted entry takes `?proxy=NAME` to tunnel the exchange through a proxy, and
 `?h3=` on `https://` entries. `#` is the SNI override, as everywhere in meow-rs.
 
+DoH speaks HTTP/2 through the `dns-doh-h2` feature (in the `full` bundle, out of `minimal`
+for binary size). Without it DoH offers only `http/1.1`, so a server that answers only over
+HTTP/2 (Yandex DNS, for one) does not work from a `minimal` build.
+
 ## DoQ and DoH over HTTP/3
 
 Both ride `quiche` on the same vendored BoringSSL as the rest of the process, so there is

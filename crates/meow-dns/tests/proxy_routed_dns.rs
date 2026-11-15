@@ -1348,7 +1348,7 @@ async fn tls_pool_disabled_pays_full_price() {
 /// and prefers `h2`, but closes every HTTP/1.1 request unanswered. The
 /// counters split accepted conns by negotiated protocol and count h2
 /// streams. [`H2StubOpts`] shapes the answers.
-#[cfg(all(feature = "encrypted", debug_assertions))]
+#[cfg(all(feature = "doh-h2", debug_assertions))]
 struct H2DohStub {
     addr: SocketAddr,
     root: Vec<u8>,
@@ -1358,7 +1358,7 @@ struct H2DohStub {
 }
 
 /// How a [`H2DohStub`] codes its answers.
-#[cfg(all(feature = "encrypted", debug_assertions))]
+#[cfg(all(feature = "doh-h2", debug_assertions))]
 #[derive(Clone, Copy, Default)]
 enum H2StubCoding {
     /// Plain `application/dns-message` bodies.
@@ -1371,7 +1371,7 @@ enum H2StubCoding {
     AlwaysGzip,
 }
 
-#[cfg(all(feature = "encrypted", debug_assertions))]
+#[cfg(all(feature = "doh-h2", debug_assertions))]
 #[derive(Clone, Copy, Default)]
 struct H2StubOpts {
     /// Close a conn (GOAWAY) after this many answers.
@@ -1381,7 +1381,7 @@ struct H2StubOpts {
     coding: H2StubCoding,
 }
 
-#[cfg(all(feature = "encrypted", debug_assertions))]
+#[cfg(all(feature = "doh-h2", debug_assertions))]
 async fn start_h2_doh_stub(streams_per_conn: Option<usize>) -> H2DohStub {
     start_h2_doh_stub_with(H2StubOpts {
         streams_per_conn,
@@ -1390,7 +1390,7 @@ async fn start_h2_doh_stub(streams_per_conn: Option<usize>) -> H2DohStub {
     .await
 }
 
-#[cfg(all(feature = "encrypted", debug_assertions))]
+#[cfg(all(feature = "doh-h2", debug_assertions))]
 async fn start_h2_doh_stub_with(opts: H2StubOpts) -> H2DohStub {
     let H2StubOpts {
         streams_per_conn,
@@ -1506,7 +1506,7 @@ async fn start_h2_doh_stub_with(opts: H2StubOpts) -> H2DohStub {
     }
 }
 
-#[cfg(all(feature = "encrypted", debug_assertions))]
+#[cfg(all(feature = "doh-h2", debug_assertions))]
 async fn query_ok(client: &DnsClient, name: &str) {
     let msg = timeout(T, client.query(name, RecordType::A))
         .await
@@ -1518,7 +1518,7 @@ async fn query_ok(client: &DnsClient, name: &str) {
 /// A server that answers only over h2 (Yandex DNS closes HTTP/1.1
 /// requests) is reached by offering `h2` in ALPN, and every query after
 /// the first, sequential or concurrent, is a stream on the same conn.
-#[cfg(all(feature = "encrypted", debug_assertions))]
+#[cfg(all(feature = "doh-h2", debug_assertions))]
 #[tokio::test]
 async fn doh_negotiates_h2_and_shares_one_connection() {
     let stub = start_h2_doh_stub(None).await;
@@ -1546,7 +1546,7 @@ async fn doh_negotiates_h2_and_shares_one_connection() {
 }
 
 /// The same over a `?proxy=` dial: one proxied dial serves every query.
-#[cfg(all(feature = "encrypted", debug_assertions))]
+#[cfg(all(feature = "doh-h2", debug_assertions))]
 #[tokio::test]
 async fn doh_h2_via_proxy_dials_once() {
     let stub = start_h2_doh_stub(None).await;
@@ -1566,7 +1566,7 @@ async fn doh_h2_via_proxy_dials_once() {
 
 /// A server that ends the h2 conn after each answer (GOAWAY) costs a
 /// redial, never a failed query.
-#[cfg(all(feature = "encrypted", debug_assertions))]
+#[cfg(all(feature = "doh-h2", debug_assertions))]
 #[tokio::test]
 async fn doh_h2_redials_after_server_goaway() {
     let stub = start_h2_doh_stub(Some(1)).await;
@@ -1586,7 +1586,7 @@ async fn doh_h2_redials_after_server_goaway() {
 }
 
 /// `reset_connections` retires the shared h2 conn: the next query dials.
-#[cfg(all(feature = "encrypted", debug_assertions))]
+#[cfg(all(feature = "doh-h2", debug_assertions))]
 #[tokio::test]
 async fn doh_h2_reset_connections_redials() {
     let stub = start_h2_doh_stub(None).await;
@@ -1601,7 +1601,7 @@ async fn doh_h2_reset_connections_redials() {
 
 /// Mutation control for the sharing assertions: with the pool disabled
 /// every h2 query dials its own conn.
-#[cfg(all(feature = "encrypted", debug_assertions))]
+#[cfg(all(feature = "doh-h2", debug_assertions))]
 #[tokio::test]
 async fn doh_h2_pool_disabled_dials_per_query() {
     let stub = start_h2_doh_stub(None).await;
@@ -1617,7 +1617,7 @@ async fn doh_h2_pool_disabled_dials_per_query() {
 
 /// The h2 path asks for `identity` like HTTP/1.1 does: a server that
 /// would otherwise gzip the answer sends it plain.
-#[cfg(all(feature = "encrypted", debug_assertions))]
+#[cfg(all(feature = "doh-h2", debug_assertions))]
 #[tokio::test]
 async fn doh_h2_requests_identity_encoding() {
     let stub = start_h2_doh_stub_with(H2StubOpts {
@@ -1632,7 +1632,7 @@ async fn doh_h2_requests_identity_encoding() {
 
 /// A coded answer the client did not ask for is refused, never decoded as
 /// DNS, as on HTTP/1.1.
-#[cfg(all(feature = "encrypted", debug_assertions))]
+#[cfg(all(feature = "doh-h2", debug_assertions))]
 #[tokio::test]
 async fn doh_h2_refuses_a_content_coding() {
     let stub = start_h2_doh_stub_with(H2StubOpts {
@@ -1655,7 +1655,7 @@ async fn doh_h2_refuses_a_content_coding() {
 /// A shared conn whose first answer was too slow to reuse (est. RTT at or
 /// above half the timeout) gives its slot up: the next fresh conn answers
 /// fast, is installed, and the query after it reuses that one.
-#[cfg(all(feature = "encrypted", debug_assertions))]
+#[cfg(all(feature = "doh-h2", debug_assertions))]
 #[tokio::test]
 async fn doh_h2_slow_conn_gives_its_slot_to_a_fresh_one() {
     let stub = start_h2_doh_stub_with(H2StubOpts {

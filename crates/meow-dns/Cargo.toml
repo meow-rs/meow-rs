@@ -9,17 +9,24 @@ repository.workspace = true
 homepage.workspace = true
 
 [features]
-default = ["encrypted", "dns-server"]
+default = ["encrypted", "doh-h2", "dns-server"]
 # DoT / DoH upstreams. TLS goes through `meow_transport::tls::TlsLayer`, so
 # DNS shares the process-wide backend (BoringSSL when the app is built with
 # `boring-tls` — the default — rustls otherwise) instead of carrying its own
 # rustls client config.
-encrypted = ["dep:meow-transport", "dep:tokio-boring", "dep:h2", "dep:http", "dep:bytes"]
+encrypted = ["dep:meow-transport", "dep:tokio-boring"]
+# HTTP/2 for DoH (RFC 8484 §5.2): the client offers `h2` next to `http/1.1`
+# and speaks whichever the server picks, as mihomo does. Without it DoH
+# offers `http/1.1` alone. Kept apart from `encrypted` because it is the
+# first user of the `h2` crate in the app's `minimal` bundle (about 350 KB
+# on aarch64-musl, past that bundle's ADR-0007 cap); the `full` bundle
+# turns it on through the app's `dns-doh-h2`.
+doh-h2 = ["encrypted", "dep:h2", "dep:http", "dep:bytes"]
 # DNS over QUIC (RFC 9250) and DNS over HTTPS over HTTP/3 (`prefer-h3`).
 # quiche links the same vendored BoringSSL as `meow-transport` (the
 # `boringssl-boring-crate` backend the workspace already pins), so this
 # feature adds no second crypto library. It implies `encrypted`: the DoH3
-# fallback rides the HTTP/2 / HTTP/1.1 DoH path and both share one certificate
+# fallback rides the plain DoH path (HTTP/2 with `doh-h2`, else HTTP/1.1) and both share one certificate
 # decision.
 quic-dns = ["encrypted", "dep:quiche", "dep:boring", "dep:webpki-root-certs"]
 # `dns-server` historically gated hickory-server; the in-tree server now uses
@@ -36,9 +43,8 @@ meow-transport = { workspace = true, features = ["tls"], optional = true }
 # public signature — naming the type (DoT/DoH over `ProxyConn`) needs the
 # crate itself, not just the transport wrapper.
 tokio-boring = { workspace = true, optional = true }
-# HTTP/2 DoH (RFC 8484 §5.2): the client offers `h2` next to `http/1.1` and
-# speaks whichever the server picks. Same `h2` 0.4 `meow-transport` already
-# links for its HTTP/2 transports.
+# HTTP/2 DoH (feature `doh-h2`). Same `h2` 0.4 `meow-transport` uses for
+# its HTTP/2 transports.
 h2 = { version = "0.4", optional = true }
 http = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
