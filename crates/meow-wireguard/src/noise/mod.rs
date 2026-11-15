@@ -357,8 +357,21 @@ impl Tunn {
 
         // If there is no session, queue the packet for future retry
         self.queue_packet(src);
-        // Initiate a new handshake if none is in progress
-        self.format_handshake_initiation(dst, false)
+        // PATCH(20): mint a new initiation when none is in flight — and
+        // re-arm one whose last send is already REKEY_TIMEOUT old, the
+        // way the kernel's `wg_packet_send_queued_handshake_initiation`
+        // resends a stale initiation on packet pressure instead of
+        // dedup'ing on the in-flight state. Upstream's unconditional
+        // `false` meant an unanswered initiation held the dedup for its
+        // whole flight: post-expiry re-handshakes sit InitSent for up to
+        // a REKEY_ATTEMPT_TIME generation while fresh data only queued —
+        // and each generation's `clear_all` wiped that queue — with only
+        // `update_timers`' retransmit ever renewing the wire. The forced
+        // resend is the same call `update_timers` makes on its own
+        // rekey timeout, so the attempt-generation accounting is
+        // unchanged; a fresh in-flight initiation still dedups to
+        // `Done`.
+        self.format_handshake_initiation(dst, self.handshake.is_init_stale())
     }
 
     /// PATCH(18): `decapsulate*`'s verify/dispatch half, split out so a
@@ -1117,6 +1130,81 @@ mod tests {
         // the clock lock.
         let res = my_tun.update_timers(&mut dst);
         assert!(matches!(res, TunnResult::Done), "got {res:?}");
+    }
+
+    /// PATCH(20), the dedup side — clock-free on every feature set: a
+    /// freshly minted in-flight initiation is not yet stale, so packet
+    /// pressure inside REKEY_TIMEOUT still reports `Done` exactly as
+    /// upstream did. The stale arm is the mock-instant test below.
+    #[test]
+    fn encapsulate_dedups_fresh_in_flight_initiation() {
+        // Under mock-instant a sibling's `MockClock::advance` could age
+        // the fresh initiation past REKEY_TIMEOUT between the mint and
+        // the assert and flip the verdict — the lock rules that out (a
+        // no-op cost on the real clock).
+        let _clock = TIMER_CLOCK_LOCK.lock();
+        let (mut my_tun, _their_tun) = create_two_tuns();
+        let _init = create_handshake_init(&mut my_tun);
+        let mut dst = vec![0u8; 2048];
+        let udp = create_ipv4_udp_packet();
+        assert!(
+            matches!(my_tun.encapsulate(&udp, &mut dst), TunnResult::Done),
+            "a fresh in-flight initiation must dedup, not re-arm"
+        );
+    }
+
+    /// PATCH(20): kernel `wg_packet_send_queued_handshake_initiation`
+    /// parity — once an in-flight initiation is REKEY_TIMEOUT old, the
+    /// next data packet must mint a *new* initiation, not `Done`.
+    /// Pre-fix this arm dedup'd on the in-flight state for the whole
+    /// flight, which is the "UDP never recovers past session expiry"
+    /// mechanism: the datagram queued behind a stale initiation while
+    /// only `update_timers`' retransmit could renew the wire.
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn encapsulate_rearms_stale_in_flight_initiation() {
+        // `advance` moves the process-global clock — hold the lock like
+        // every clock-moving test so no sibling assert can observe the
+        // shifted timeline.
+        let _clock = TIMER_CLOCK_LOCK.lock();
+        let (mut my_tun, _their_tun) = create_two_tuns();
+        let mut dst = vec![0u8; 2048];
+        let udp = create_ipv4_udp_packet();
+
+        // One initiation in flight, no session behind it — the state
+        // every post-expiry re-handshake generation sits in.
+        let init = create_handshake_init(&mut my_tun);
+
+        // Inside REKEY_TIMEOUT the packet only queues — the initiation
+        // is fresh, so the in-flight dedup still holds.
+        assert!(matches!(
+            my_tun.encapsulate(&udp, &mut dst),
+            TunnResult::Done
+        ));
+
+        // Past REKEY_TIMEOUT the same call must produce a new
+        // initiation — a different sender index, not a byte replay.
+        crate::mock_instant::MockClock::advance(REKEY_TIMEOUT);
+        let res = my_tun.encapsulate(&udp, &mut dst);
+        let TunnResult::WriteToNetwork(packet_data) = res else {
+            panic!("a stale in-flight initiation must re-arm on packet pressure, got {res:?}");
+        };
+        let resent_idx = match Tunn::parse_incoming_packet(packet_data).unwrap() {
+            Packet::HandshakeInit(p) => p.sender_idx,
+            other => panic!("expected a fresh HandshakeInit, got {other:?}"),
+        };
+        let init_idx = u32::from_le_bytes(init[4..8].try_into().unwrap());
+        assert_ne!(
+            resent_idx, init_idx,
+            "the re-armed initiation is freshly minted, not replayed"
+        );
+
+        // The re-arm is per-REKEY_TIMEOUT, not per-packet — the
+        // just-resent initiation is fresh and dedups again.
+        assert!(
+            matches!(my_tun.encapsulate(&udp, &mut dst), TunnResult::Done),
+            "a just-resent initiation must dedup again"
+        );
     }
 
     #[test]

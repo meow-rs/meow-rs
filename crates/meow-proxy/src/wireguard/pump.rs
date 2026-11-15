@@ -2477,6 +2477,117 @@ mod tests {
         );
     }
 
+    /// PATCH(20) at the pump seam — the "UDP never recovers after
+    /// session expiry" mechanism end to end. With an initiation in
+    /// flight and unanswered, once that initiation is REKEY_TIMEOUT
+    /// old the next inner datagram must push a *new* initiation onto
+    /// the outbox (`encapsulate`'s stale re-arm — the kernel's
+    /// `wg_packet_send_queued_handshake_initiation`), not sit queued
+    /// behind a dedup'd handshake. The responder's answer then
+    /// establishes the session and flushes every queued datagram.
+    ///
+    /// The wait is the real clock: the predicate is the in-flight
+    /// init's `time_sent` age on `sleepyinstant` (CLOCK_MONOTONIC /
+    /// CLOCK_BOOTTIME) — tokio's paused clock cannot touch it, no
+    /// `mock_instant` offset reaches this crate's build, and
+    /// fabricating a past Instant would need new constructors on all
+    /// three Instant backends just for tests. One 5.2 s sleep is the
+    /// honest crossing of the 5 s REKEY_TIMEOUT.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_in_flight_initiation_rearms_on_data() {
+        let client_secret = x25519::StaticSecret::from([0xa1; 32]);
+        let client_public = x25519::PublicKey::from(&client_secret);
+        let server_secret = x25519::StaticSecret::from([0xa2; 32]);
+        let server_public = x25519::PublicKey::from(&server_secret);
+        let mut pump = pump_for_test(&test_config(&client_secret, &server_public));
+        let mut server = Tunn::new(server_secret, client_public, None, None, 0, None);
+        let mut wire = vec![0u8; 2048];
+
+        // An initiation in flight with no session behind it — the
+        // state every post-expiry re-handshake generation sits in.
+        let TunnResult::WriteToNetwork(_) = pump.tunn.format_handshake_initiation(&mut wire, false)
+        else {
+            panic!("initiator formats an initiation");
+        };
+
+        // The inner shape the tunnel only inspects for version
+        // nibble, total length and source — last byte tags order.
+        let inner = |tag: u8| -> Vec<u8> {
+            vec![
+                0x45, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 10, 0, 0,
+                2, 10, 0, 0, 9, 0xde, 0xad, 0xbe, tag,
+            ]
+        };
+
+        // Fresh: the in-flight dedup holds — the datagram queues
+        // inside `tunn` and nothing reaches the outbox.
+        pump.device.tx_queue.push_back(inner(0));
+        pump.drain_device_tx();
+        assert!(
+            pump.outbox.is_empty(),
+            "a fresh in-flight initiation must still dedup packet pressure"
+        );
+
+        // Cross REKEY_TIMEOUT (5 s, crate-private constant) on the
+        // real clock — the in-flight initiation is now stale.
+        tokio::time::sleep(Duration::from_secs_f64(5.2)).await;
+
+        pump.device.tx_queue.push_back(inner(1));
+        pump.drain_device_tx();
+        let resent = pump
+            .outbox
+            .pop_front()
+            .expect("a stale in-flight initiation must re-arm on packet pressure");
+        assert!(
+            resent.len() == 148 && resent[0] == 1,
+            "the re-armed output is a handshake initiation, got {}B type {}",
+            resent.len(),
+            resent[0]
+        );
+        // The resend re-stamps the flight: one more datagram right
+        // behind it dedups again — the re-arm is per-REKEY_TIMEOUT,
+        // not per-packet.
+        pump.device.tx_queue.push_back(inner(2));
+        pump.drain_device_tx();
+        assert!(
+            pump.outbox.is_empty(),
+            "the just-resent initiation must dedup again"
+        );
+
+        // The responder answers the *resent* initiation; the session
+        // establishes and every queued datagram flushes in order:
+        // keepalive (32 B empty DATA) + the three inner packets.
+        let resp = {
+            let TunnResult::WriteToNetwork(b) = server.decapsulate(None, &resent, &mut wire) else {
+                panic!("responder answers the re-armed initiation");
+            };
+            b.to_vec()
+        };
+        feed_wire(&mut pump, resp);
+
+        assert_eq!(
+            pump.outbox.len(),
+            4,
+            "keepalive plus three queued datagrams flush post-handshake"
+        );
+        assert!(
+            pump.outbox[0].len() == 32 && pump.outbox[0][0] == 4,
+            "first flush item is the empty keepalive DATA datagram"
+        );
+        for (i, datagram) in pump.outbox.iter().skip(1).enumerate() {
+            match server.decapsulate(None, datagram, &mut wire) {
+                TunnResult::WriteToTunnelV4(b, _) => {
+                    assert_eq!(
+                        &b[..],
+                        &inner(i as u8)[..],
+                        "datagram {i} decrypts to the queued inner"
+                    );
+                }
+                other => panic!("responder must decapsulate datagram {i}, got {other:?}"),
+            }
+        }
+    }
+
     /// PATCH(17): an inbound DATA datagram decrypts *inside* its receive
     /// slot and the slot's Vec moves into `rx_queue` as `Bytes` — the
     /// `decapsulate`-into-scratch copy plus the `Bytes::copy_from_slice`

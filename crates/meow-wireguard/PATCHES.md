@@ -479,6 +479,46 @@ Patch 19 — TX parallel crypto (parallel seal on the resident pool)
   re-shaped; `encapsulate`'s serial behavior is preserved verbatim
   for the no-session and control paths; `meow-wireguard` stays
   ring-free and dependency-free.
+
+Patch 20 — noise/mod.rs + handshake.rs: re-arm a stale in-flight
+           initiation on packet pressure (kernel parity)
+  Motivation: upstream's `encapsulate` no-session arm is
+  `queue_packet` + `format_handshake_initiation(dst, false)` — the
+  `false` dedups on `Handshake::is_in_progress()` for the whole
+  flight of an unanswered initiation. The kernel sends on a
+  different rule: `wg_packet_send_queued_handshake_initiation`
+  resends the initiation on packet pressure whenever
+  `last_sent_handshake` is more than REKEY_TIMEOUT old — the
+  in-flight state never dedups a *stale* initiation. The gap shows
+  after session expiry: every forced re-handshake sits InitSent for
+  up to a REKEY_ATTEMPT_TIME generation while fresh UDP datagrams
+  only queue — and each generation's `clear_all` wipes that queue —
+  so between `update_timers`' 5 s retransmit ticks the wire mints
+  nothing and a recovered peer's response can land to an empty queue.
+  Files:
+  * noise/handshake.rs: new `Handshake::is_init_stale()` — `timer()`
+    (the InitSent send stamp; `None` in every other state, including
+    InitReceived, which carries no send stamp) elapsed >=
+    REKEY_TIMEOUT. `REKEY_TIMEOUT` is imported from noise::timers
+    (already `pub(crate)`).
+  * noise/mod.rs `encapsulate`: the no-session arm now calls
+    `format_handshake_initiation(dst, self.handshake.is_init_stale())`
+    — a stale in-flight initiation takes the forced-resend path, the
+    identical call `update_timers` makes on its own rekey timeout, so
+    the attempt-generation accounting is untouched
+    (`starting_new_handshake` stays false — no new
+    TimeLastHandshakeStarted window). A fresh in-flight initiation
+    still dedups to `Done`; `InitReceived` dedups as before.
+  Invariants kept: `clear_all`/`packet_queue` semantics untouched;
+  the established-session seal paths (serial and the PATCH(19)
+  crypto-pool arm) gained no in-progress gate — rekeying under a
+  live session correctly keeps using it; the resend stamps a fresh
+  InitSent so the re-arm is per-REKEY_TIMEOUT, not per-packet.
+  Tests: `encapsulate_rearms_stale_in_flight_initiation`
+  (mock-instant) pins the stale re-arm, the fresh-mint sender index
+  and the post-resend dedup; `encapsulate_dedups_fresh_in_flight_
+  initiation` pins the inside-REKEY_TIMEOUT `Done` on every feature
+  set.
 ```
 
 Notes on what did NOT need patching
