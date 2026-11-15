@@ -463,6 +463,13 @@ the canonical, in-repo source a release is cut from.
   (`type: direct`) is unchanged — UDP routes through the front hop's
   association — and a plain `udp: false` node keeps mihomo's `continue`
   semantics, the scan sliding to the next rule as before.
+- fix(tunnel): UDP flows to an injected `dialer-proxy` node whose inner
+  cannot carry UDP (e.g. `type: http`, or `type: ss`/`type: socks5` via a
+  UDP-incapable front) now fail closed at the matched rule instead of
+  silently sliding to `DIRECT` — the injected-path counterpart of the
+  #969 fix above, since an injected leaf carries no `DialerProxyAdapter`
+  to report the configured chain; a new `ChainedProxy` registry marker
+  reports it instead (#969).
 
 ## [0.29.0] - 2026-11-05
 

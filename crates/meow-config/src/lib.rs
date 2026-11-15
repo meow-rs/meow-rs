@@ -2218,7 +2218,11 @@ type ParsedLeaf = Option<(Arc<dyn Proxy>, bool)>;
 /// `<name>` is bound *late* — the injected dialer keeps the name plus a
 /// [`meow_proxy::dialer::ProxyRegistry`] handle and looks the front proxy up
 /// on every dial — so a dialer may name a group or a node declared later in
-/// the file, and nested chains need no ordering pass.
+/// the file, and nested chains need no ordering pass. A successful
+/// injection is wrapped in [`proxy_parser::ChainedProxy`]: the marker is
+/// what reports the configured chain to the UDP probe
+/// (`is_dialer_proxy_non_transparent`, issue #969), since an injected leaf
+/// carries no `DialerProxyAdapter` to answer for it.
 ///
 /// Adapter types that do not establish their underlying connection through
 /// the pluggable dialer — `direct` (resolver-threaded dials stay on the real
@@ -2265,7 +2269,15 @@ fn parse_dialered_leaf(
     let proxy_dialer: Arc<dyn meow_proxy::dialer::TcpDialer> =
         Arc::new(meow_proxy::dialer::NamedProxyDialer::new(target.clone()).owned_by(key.clone()));
     match proxy_parser::parse_proxy_with_dialer(raw_proxy, &proxy_dialer, ipv6) {
-        Ok(built) => Ok(Some((built, false))),
+        // The `ChainedProxy` marker pins the #969 fail-closed verdict on
+        // injected entries: unlike the relay-based wrapper below, an
+        // injected leaf carries no `DialerProxyAdapter` to report the
+        // configured chain, so the UDP probe would otherwise read it as a
+        // plain `udp: false` node and slide a matched flow to a later rule.
+        Ok(built) => Ok(Some((
+            Arc::new(proxy_parser::ChainedProxy::new(built)) as Arc<dyn Proxy>,
+            false,
+        ))),
         Err(chain_err) if strict => {
             // Under `strict` the dial-time failure the relay wrapper defers
             // to is not acceptable — surface it at load, exactly as the old
@@ -7550,6 +7562,10 @@ rules:
         // adapter — an unavailable placeholder or an absent parse would
         // leave it false.
         assert!(bound.support_udp());
+        // ...and the probe predicate agrees: a transparent chain carries
+        // UDP over the front's association, so it is NOT the #969
+        // fail-closed shape.
+        assert!(!bound.is_dialer_proxy_non_transparent());
     }
 
     /// End-to-end: the `dns.direct-nameserver` slot survives the chained
@@ -7619,6 +7635,74 @@ rules:
             "the chain must dial the slot-resolved loopback address — a \
              dropped direct-nameserver slot resolves `node.test` to the \
              unreachable main-resolver answer instead"
+        );
+    }
+
+    /// Issue #969 on the injected path: an `http` node carrying
+    /// `dialer-proxy` registers behind the `ChainedProxy` marker, so the
+    /// UDP probe reads the configured chain
+    /// (`is_dialer_proxy_non_transparent`) instead of a plain `udp: false`
+    /// node that would slide a matched UDP flow to a later rule.
+    #[test]
+    fn injected_http_leaf_is_marked_for_udp_fail_closed() {
+        let raw: raw::RawConfig = serde_saphyr::from_str(
+            "proxies:\n\
+             \x20 - name: front\n    type: socks5\n    server: 127.0.0.1\n    port: 1080\n\
+             \x20 - name: leaf\n    type: http\n    server: 127.0.0.1\n    port: 8080\n    dialer-proxy: front\n",
+        )
+        .unwrap();
+        let result = rebuild_from_raw(&raw).expect("http chain builds");
+        let leaf = &result.proxies["leaf"];
+
+        assert!(!leaf.support_udp(), "http cannot carry UDP");
+        assert!(
+            leaf.is_dialer_proxy_non_transparent(),
+            "the ChainedProxy marker must pin the #969 fail-closed verdict"
+        );
+        assert!(
+            leaf.has_configured_dialer(),
+            "the declared chain must still be reported through the marker"
+        );
+        // The marker is transparent to the downcasts the bare leaf
+        // previously answered: the injected `WrappedProxy` stays reachable.
+        assert!(
+            leaf.as_any()
+                .and_then(|any| any.downcast_ref::<proxy_parser::WrappedProxy>())
+                .is_some(),
+            "as_any must keep resolving the injected WrappedProxy leaf"
+        );
+        // And the front it chains through is untouched — an unmarked leaf
+        // keeps the trait's default `false`.
+        assert!(
+            !result.proxies["front"].is_dialer_proxy_non_transparent(),
+            "the unchained front must not be marked"
+        );
+    }
+
+    /// The `ss` twin (issue #969): `udp: true` folds the *front's* UDP
+    /// capability into `support_udp` — an `http` front yields `false` —
+    /// and the `ChainedProxy` marker still reports the configured chain,
+    /// so a matched UDP rule fails closed instead of sliding.
+    #[cfg(feature = "ss")]
+    #[test]
+    fn injected_ss_via_http_front_udp_fails_closed() {
+        let raw: raw::RawConfig = serde_saphyr::from_str(
+            "proxies:\n\
+             \x20 - name: front\n    type: http\n    server: 127.0.0.1\n    port: 8080\n\
+             \x20 - name: leaf\n    type: ss\n    server: 127.0.0.1\n    port: 8388\n\
+             \x20   cipher: aes-128-gcm\n    password: pw\n    udp: true\n    dialer-proxy: front\n",
+        )
+        .unwrap();
+        let result = rebuild_from_raw(&raw).expect("ss-via-http chain builds");
+        let leaf = &result.proxies["leaf"];
+
+        assert!(
+            !leaf.support_udp(),
+            "the http front cannot carry UDP, so the fold must report false"
+        );
+        assert!(
+            leaf.is_dialer_proxy_non_transparent(),
+            "the ChainedProxy marker must pin the #969 fail-closed verdict"
         );
     }
 }

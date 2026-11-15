@@ -179,6 +179,166 @@ impl Proxy for WrappedProxy {
     }
 }
 
+/// Marks a `proxies:` leaf whose `dialer-proxy` was applied by *injection* —
+/// its adapter threads every dial through the chained front hop itself, so
+/// no `DialerProxyAdapter` wrapper exists to carry the chain signal the UDP
+/// probe reads (issue #969).
+///
+/// Every `Proxy` / `ProxyAdapter` method delegates to `inner` verbatim — the
+/// marker is observational only: `support_udp` still propagates the inner
+/// advertisement (an `http` node reports `false`; a `ss`/`socks5` node folds
+/// the front's live capability), `as_any` still resolves the inner concrete
+/// type so existing downcasts land exactly as they did on the bare entry,
+/// and the health/delay/member views are untouched.
+///
+/// The one override is `is_dialer_proxy_non_transparent` → `true`: a
+/// successful injection is *always* a non-transparent leaf. `type: direct`
+/// (and `anytls`, and `ss` with an external SIP003 plugin) rejects the
+/// injected dialer inside [`parse_proxy_with_dialer`]
+/// (`reject_unthreaded_dialer`) and lands in the relay-based
+/// `DialerProxyAdapter` fallback instead, which computes its own
+/// transparency — so reaching this wrapper already proves the inner owns a
+/// server transport. A UDP flow matched to a rule targeting this node then
+/// fails closed on the match instead of sliding to a later rule the way a
+/// plain `udp: false` node does.
+pub struct ChainedProxy {
+    inner: Arc<dyn Proxy>,
+}
+
+impl ChainedProxy {
+    pub fn new(inner: Arc<dyn Proxy>) -> Self {
+        Self { inner }
+    }
+}
+
+#[async_trait]
+impl ProxyAdapter for ChainedProxy {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+    fn adapter_type(&self) -> AdapterType {
+        self.inner.adapter_type()
+    }
+    fn addr(&self) -> &str {
+        self.inner.addr()
+    }
+    fn support_udp(&self) -> bool {
+        self.inner.support_udp()
+    }
+    async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
+        self.inner.dial_tcp(metadata).await
+    }
+    async fn dial_udp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
+        self.inner.dial_udp(metadata).await
+    }
+    async fn connect_over(
+        &self,
+        stream: Box<dyn ProxyConn>,
+        metadata: &Metadata,
+    ) -> Result<Box<dyn ProxyConn>> {
+        self.inner.connect_over(stream, metadata).await
+    }
+
+    /// Forward the peek/commit walk like `WrappedProxy` — a chained entry
+    /// whose inner resolved (theoretical today: injected entries are leaves)
+    /// must not hide PASS/PASS-RULE members from the match-time probe.
+    fn unwrap_proxy(&self, metadata: &Metadata, touch: bool) -> Option<Arc<dyn Proxy>> {
+        self.inner.unwrap_proxy(metadata, touch)
+    }
+
+    /// The injected leaf answers the front hop itself; forward so the
+    /// answer keeps reaching the probe through this wrapper.
+    fn dialer_hop(&self, metadata: &Metadata) -> Option<Arc<dyn Proxy>> {
+        self.inner.dialer_hop(metadata)
+    }
+
+    /// The injected leaf already reports the configured chain; forward.
+    fn has_configured_dialer(&self) -> bool {
+        self.inner.has_configured_dialer()
+    }
+
+    fn dialer_hop_network(&self, flow: meow_common::Network) -> meow_common::Network {
+        self.inner.dialer_hop_network(flow)
+    }
+
+    /// Forward the session flush (issue #695) — a marker that hid it would
+    /// strand the inner adapter's pooled transport sessions.
+    fn reset_sessions(&self) {
+        self.inner.reset_sessions();
+    }
+
+    fn health(&self) -> &ProxyHealth {
+        self.inner.health()
+    }
+}
+
+impl Proxy for ChainedProxy {
+    fn alive(&self) -> bool {
+        self.inner.alive()
+    }
+    fn alive_for_url(&self, url: &str) -> bool {
+        self.inner.alive_for_url(url)
+    }
+    fn last_delay(&self) -> u16 {
+        self.inner.last_delay()
+    }
+    fn last_delay_for_url(&self, url: &str) -> u16 {
+        self.inner.last_delay_for_url(url)
+    }
+    fn delay_history(&self) -> Vec<DelayHistory> {
+        self.inner.delay_history()
+    }
+
+    /// Transparent to concrete-type downcasts: callers still reach the
+    /// injected leaf (`WrappedProxy`, the group types) — the registry entry
+    /// answers `as_any` exactly as the bare inner did before marking.
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        self.inner.as_any()
+    }
+
+    /// The marker's single verdict — see the struct doc for why injection
+    /// already proves non-transparency (issue #969).
+    fn is_dialer_proxy_non_transparent(&self) -> bool {
+        true
+    }
+
+    fn members(&self) -> Option<Vec<String>> {
+        self.inner.members()
+    }
+
+    fn member_proxies(&self) -> Option<Vec<Arc<dyn Proxy>>> {
+        self.inner.member_proxies()
+    }
+
+    fn current(&self) -> Option<String> {
+        self.inner.current()
+    }
+
+    fn selection(&self) -> Option<&dyn meow_common::ProxySelection> {
+        self.inner.selection()
+    }
+
+    fn test_url(&self) -> Option<&str> {
+        self.inner.test_url()
+    }
+
+    fn expected_status(&self) -> Option<&str> {
+        self.inner.expected_status()
+    }
+
+    fn group_display(&self) -> Option<&GroupDisplay> {
+        self.inner.group_display()
+    }
+
+    fn usage_generation(&self) -> u64 {
+        self.inner.usage_generation()
+    }
+
+    fn chain_health(&self) -> Option<&Arc<meow_common::chain_health::ChainHealth>> {
+        self.inner.chain_health()
+    }
+}
+
 pub fn parse_proxy(
     config: &HashMap<String, serde_json::Value>,
     ipv6: bool,
@@ -5389,6 +5549,62 @@ tls: true
             };
             assert!(err.contains(needle), "{yaml:?} → {err}");
         }
+    }
+
+    /// The `ChainedProxy` marker forwards every `Proxy` view to the
+    /// injected leaf — only `is_dialer_proxy_non_transparent` differs
+    /// (issue #969). Exercised over a `SelectorGroup` inner so the member
+    /// views have observable values; a leaf inner answers `None` for those
+    /// either way and would prove nothing about the delegation.
+    #[test]
+    fn chained_proxy_delegates_alive_and_member_proxies() {
+        let member: Arc<dyn Proxy> = Arc::new(WrappedProxy::new(Box::new(DirectAdapter::new())));
+        let group = SelectorGroup::new("front", vec![Arc::clone(&member)]);
+        let chained = ChainedProxy::new(Arc::new(group));
+
+        assert!(chained.alive(), "delegated liveness starts alive");
+        member.health().set_alive(false);
+        assert!(
+            !chained.alive(),
+            "a dead inner must read dead through the marker"
+        );
+        assert!(!chained.alive_for_url("http://x"));
+        member.health().record_delay(321);
+        assert_eq!(chained.last_delay(), 321, "delay delegates");
+        assert_eq!(chained.delay_history().len(), 1, "history delegates");
+
+        assert_eq!(
+            chained.members().expect("members delegate"),
+            vec!["DIRECT".to_string()]
+        );
+        let members = chained.member_proxies().expect("member_proxies delegate");
+        assert_eq!(members.len(), 1);
+        assert!(
+            Arc::ptr_eq(&members[0], &member),
+            "the marker must hand back the inner's own member list"
+        );
+        assert_eq!(chained.current().as_deref(), Some("DIRECT"));
+
+        // Verbatim delegation, not invention: the inner's capability,
+        // group-only views and `as_any` target all survive the wrap —
+        // `as_any` still resolves the *inner* concrete type.
+        assert!(
+            chained.support_udp(),
+            "support_udp propagates the inner advertisement"
+        );
+        assert!(!chained.has_configured_dialer());
+        assert!(chained.selection().is_some(), "selection delegates");
+        assert!(
+            chained
+                .as_any()
+                .and_then(|any| any.downcast_ref::<SelectorGroup>())
+                .is_some(),
+            "as_any must reach the inner SelectorGroup, not the marker"
+        );
+
+        // The marker's single verdict (issue #969): the inner group
+        // answers `false` by default, the chained entry always `true`.
+        assert!(chained.is_dialer_proxy_non_transparent());
     }
 
     // ─── Load-balance strategy parser (F1-F7) ────────────────────────────────

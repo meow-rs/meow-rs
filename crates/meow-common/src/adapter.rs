@@ -294,9 +294,14 @@ pub trait Proxy: ProxyAdapter {
     /// adapter keeps mihomo's `continue` — an `udp: false` node is a
     /// routing preference, not a chain the flow must die inside.
     ///
-    /// `DialerProxyAdapter` is always the outermost registry entry, so
-    /// this default is unreachable today; any future wrapper that can
-    /// sit above one must forward it (same contract as `dialer_hop`).
+    /// Two registry shapes report `true`: the relay-based
+    /// `DialerProxyAdapter` over a non-transparent inner, and the config
+    /// layer's `ChainedProxy` marker on a `dialer-proxy` leaf whose chain
+    /// was applied by *injection* (no `DialerProxyAdapter` exists there to
+    /// answer). `DialerProxyAdapter` is always the outermost entry when it
+    /// is used, so this default stays unreachable for it; any future
+    /// wrapper that can sit above one must forward it (same contract as
+    /// `dialer_hop`).
     fn is_dialer_proxy_non_transparent(&self) -> bool {
         false
     }

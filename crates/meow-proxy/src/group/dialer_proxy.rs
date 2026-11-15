@@ -46,7 +46,12 @@
 //!   flow fails at dial, never sliding to a later rule's target
 //!   (issue #969). Protocols that do accept an injected `TcpDialer`
 //!   (e.g. Shadowsocks, SOCKS5, hysteria2, TrustTunnel H3) chain UDP
-//!   natively and never reach this adapter.
+//!   natively and never reach this adapter — but they carry no wrapper
+//!   either, so the config build marks their registry entries with
+//!   `meow_config`'s `ChainedProxy` to report the same
+//!   `is_dialer_proxy_non_transparent` verdict this adapter's
+//!   `!transparent` does. Any wrapper above a `DialerProxyAdapter` must
+//!   likewise forward the predicate (the `dialer_hop` contract).
 //! - **As a relay hop**: when a dialer-proxy outbound itself appears inside a
 //!   `relay` chain, `connect_over` delegates to the inner adapter — the relay
 //!   chain already defines the path, so the per-outbound dialer is not applied a
