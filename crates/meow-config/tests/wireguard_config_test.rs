@@ -206,19 +206,27 @@ mod enabled {
     }
 
     #[test]
-    fn dialer_proxy_is_rejected() {
-        // The WG transport owns its UDP endpoint socket, so a TCP dialer
-        // chain cannot carry it — `reject_unthreaded_dialer` fires when
-        // `apply_dialer_proxies` re-parses the node with the chain's
-        // injected dialer (the mihomo model).
+    fn dialer_proxy_is_accepted_and_attaches_the_hop() {
+        // Issue #899: the WG endpoint's UDP transport rides the front
+        // hop's UDP association, so an injected proxy dialer is stored
+        // on the adapter — and `dialing_through` attaches the DialerHop
+        // for `front_hop` metrics.
         let registry = ProxyRegistry::default();
         let target = DialerTarget::new("front", &registry);
         let dialer: Arc<dyn TcpDialer> =
             Arc::new(NamedProxyDialer::new(target).owned_by("fixture"));
-        let error = parse_proxy_with_dialer(&node("dialer-proxy: front\n"), &dialer, false)
-            .err()
-            .expect("a proxy dialer must be rejected for wireguard");
-        assert!(error.contains("dialer-proxy"), "{error}");
+        let proxy = parse_proxy_with_dialer(&node("dialer-proxy: front\n"), &dialer, false)
+            .expect("a proxy dialer must be accepted for wireguard");
+        assert!(proxy.has_configured_dialer(), "DialerHop must be attached");
+    }
+
+    #[test]
+    fn absent_dialer_proxy_keeps_the_direct_path() {
+        // A DirectDialer (the unchained default) is not a chain: no
+        // DialerHop is attached and the endpoint stays a raw socket.
+        let dialer: Arc<dyn TcpDialer> = Arc::new(DirectDialer);
+        let proxy = parse_proxy_with_dialer(&node(""), &dialer, false).unwrap();
+        assert!(!proxy.has_configured_dialer());
     }
 
     #[test]

@@ -59,7 +59,7 @@ cause problems; items marked ~ work with caveats; items marked ✓ work.
 | `proxies:` — Snell | ✓ | v3/v4/v5/v6, UDP-over-TCP, optional HTTP/TLS obfs (v3–v5), v6 `mode` (`default` / `unshaped` / `unsafe-raw`). |
 | `proxies:` — Hysteria2 | ✓ | QUIC TCP/UDP, Salamander obfs, port hopping; `down` bandwidth hint only (`up` is parsed but ignored — warns at load). |
 | `proxies:` — AnyTLS | ✓ | TCP + UDP (udp-over-tcp v2, opt in with `udp: true`). In the `full` bundle, and therefore in the release binaries; excluded from `minimal`. |
-| `proxies:` — WireGuard | ✓ | Userspace WG client (vendored boringtun + smoltcp): standard WG + Cloudflare WARP `reserved`. In the `full` bundle, and therefore in the release binaries; excluded from `minimal`. Phase-1: `dns` is ignored and `amnezia-wg-option`/`dialer-proxy` are hard errors — see [wireguard.md](wireguard.md). |
+| `proxies:` — WireGuard | ✓ | Userspace WG client (vendored boringtun + smoltcp): standard WG + Cloudflare WARP `reserved`. In the `full` bundle, and therefore in the release binaries; excluded from `minimal`. Phase-1: `dns` is ignored and `amnezia-wg-option` is a hard error; `dialer-proxy` is supported (UDP-capable fronts only — a TCP-only front fails the bind at dial time) — see [wireguard.md](wireguard.md). |
 | `proxies:` — TUIC / SSH | ✗ | Not implemented. |
 | `proxy-groups:` — selector, url-test, fallback | ✓ | Fully supported. |
 | `proxy-groups:` — load-balance | ✓ | round-robin + consistent-hashing (M1.C-1). |
@@ -322,7 +322,7 @@ proxies:
 | Field / behaviour | Go mihomo | meow-rs |
 |-------------------|-----------|-------------|
 | `amnezia-wg-option` | AmneziaWG obfuscation fields | Hard parse error — Phase-1 is standard WireGuard only (Phase-3 planned). |
-| `dialer-proxy` on the node | Field accepted by the outbound schema | Hard parse error — the WG transport owns its UDP endpoint socket and cannot ride a TCP dialer. |
+| `dialer-proxy` on the node | Field accepted by the outbound schema | Supported — the endpoint's UDP transport rides the front's UDP association (UDP-capable fronts only; a TCP-only front fails the bind at dial time — closed, never a silent direct egress). |
 | `dns` | Per-node tunnel DNS list | Accepted but ignored, warn-once — `remote-dns-resolve` covers tunnel-side resolution (per-node DNS is Phase-2). |
 | `ip-stack: system` | Kernel WG stack | Warn-once, then runs smoltcp anyway — no kernel WG mode in Phase-1. |
 | `mtu` | No bound enforced (default `1408`) | Enforced range 640–9000, default `1420` — the smoltcp inner MTU (`mtu − 64` WG overhead) must stay ≥ 576. |

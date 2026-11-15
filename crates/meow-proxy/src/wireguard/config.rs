@@ -65,8 +65,11 @@ pub struct WireGuardConfig {
     /// `dns:` entries from the proxy block — *stored* for parser
     /// round-trip completeness but **ignored** in Phase 1: endpoint and
     /// destination lookups go through the injected/global resolver instead.
-    /// (The parser also rejects `amnezia-wg-option`, `ip-stack: system` and
-    /// `dialer-proxy` before they reach this struct.)
+    /// (The parser rejects `amnezia-wg-option` outright and accepts
+    /// `ip-stack` with a warn-once. `dialer-proxy` is accepted too —
+    /// a TCP-only front cannot carry the UDP endpoint and fails at
+    /// dial time, while a UDP-capable dialer — `direct`, `ss`,
+    /// `socks5` — is injected via `WireGuardAdapter::with_dialer`.)
     pub dns: Vec<String>,
 }
 
