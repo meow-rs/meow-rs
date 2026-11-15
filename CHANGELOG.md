@@ -204,6 +204,40 @@ the canonical, in-repo source a release is cut from.
 
 ### Changed
 
+- **WireGuard received packets are now serviced in the same pump pass
+  that polls them**, removing a half-poll scheduling gap that left an
+  inbound packet waiting for the next timer wakeup — this was the ~12.7 ms
+  floor under every chained-WireGuard RTT. A pass that did work reschedules
+  at once instead of the idle 10 ms sleep, smoltcp's TCP ACK delay drops
+  from 10 ms to 1 ms, UDP socket queues grow 64→256 packets, the wire
+  drain budget grows 64→256, and macOS `sendmsg_x`/`recvmsg_x` calls are
+  chunked at 100 (XNU clips larger counts). On a LAN rig the chained
+  WireGuard UDP echo RTT went from a 12.7 ms p50 to 0.35 ms and new-TCP
+  churn from ~24 to ~850 connections/s.
+
+- **Chained Hysteria2/TrustTunnel-H3 datagrams drop instead of stalling
+  the whole QUIC engine when the front hop is congested.** The
+  `ProxyPacketConn → SocketIo` bridge used `PollSender::poll_reserve`, so
+  one full mpsc queue suspended the connection driver's entire poll —
+  every stream on the association stalled behind a single slow front
+  hop. `poll_send` now uses `try_send` (quic-go's semantics: QUIC's own
+  loss recovery absorbs a dropped datagram, a stalled driver cannot be
+  recovered), with a `dropped_tx` counter for observability, queues grow
+  256→4096, UDP receive buffers grow to 7 MiB, the front hop gets a
+  1280 MTU hint, and the receive batch grows 32→128. `quiche` and
+  `shadowsocks` are now compiled at `opt-level=3`.
+
+- **BoringTLS client connections resume sessions from a per-`SSL_CTX`
+  ticket store.** Each connector keeps a 64-entry FIFO of
+  `SslSession`s keyed by SNI, offers the newest via `SSL_set_session`
+  only within the same context, and drops an SNI's whole queue when a
+  handshake fails (peer restart or ticket-key rotation makes stale
+  tickets actively harmful). Verified live: `session_reused=true` on the
+  `boring TLS handshake complete` debug line against sing-box. A
+  `vless connect breakdown` debug line now reports per-phase connect
+  timings (`tcp_ms`/`tls_ms`/`vless_ms`) for VLESS dials, plus first
+  payload-write/first-server-data markers on Vision streams.
+
 - **gRPC and XHTTP (stream-one) tunnels share one HTTP/2 connection per
   proxy**, as mihomo and Xray clients do, instead of a TCP + TLS/REALITY
   handshake per tunnel (each REALITY handshake costs the server a `dest`
