@@ -143,12 +143,12 @@ impl BatchEndpoint {
     // ── batch calls ──────────────────────────────────────────────
 
     /// Drain up to `min(bufs.len(), budget, WIRE_DRAIN_BUDGET)`
-    /// datagrams — one `recvmmsg` on Linux, one `recvmsg_x` on macOS,
-    /// a `try_recv_buf` loop elsewhere. The third clamp is the
-    /// stack-array bound: a single batched call can never service more
-    /// slots than its arrays hold, and the fallback loop inherits the
-    /// same bound so both paths agree on what one call is allowed to
-    /// do. Every
+    /// datagrams — one `recvmmsg` on Linux, [`MSGX_CHUNK`]-capped
+    /// `recvmsg_x` rounds on macOS, a `try_recv_buf` loop elsewhere.
+    /// The third clamp is the stack-array bound: a single batched call
+    /// can never service more slots than its arrays hold, and the
+    /// fallback loop inherits the same bound so both paths agree on
+    /// what one call is allowed to do. Every
     /// slot's whole *capacity* is its receive window — never its
     /// current length — so a persistent slot set serves batch after
     /// batch without restaging. On return, each of `bufs[..ret]` is
@@ -355,9 +355,22 @@ impl BatchEndpoint {
         got
     }
 
+    /// Per-`sendmsg_x`/`recvmsg_x` datagram ceiling: XNU clips each
+    /// call's count at `somaxsendmsgx`/`somaxrecvmsgx` (default 100 —
+    /// see `msgx`), so a [`WIRE_DRAIN_BUDGET`]-sized batch is serviced
+    /// in chunks of at most this many headers where Linux spends one
+    /// `sendmmsg`/`recvmmsg`. The `min` keeps the batch a single call
+    /// should the budget ever drop back under the kernel's ceiling.
+    #[cfg(all(target_os = "macos", not(feature = "no-macos-sendmsg-x")))]
+    const MSGX_CHUNK: usize = if WIRE_DRAIN_BUDGET < 100 {
+        WIRE_DRAIN_BUDGET
+    } else {
+        100
+    };
+
     /// macOS: `sendmsg_x` over stack-built `msghdr_x`/`iovec` arrays —
     /// the same shape as the Linux `sendmmsg` path, chunked at
-    /// [`WIRE_DRAIN_BUDGET`]. On a connected UDP socket XNU takes the
+    /// [`MSGX_CHUNK`]. On a connected UDP socket XNU takes the
     /// `sendit_x`/`sosend_list` fast path (no per-datagram name); on an
     /// unconnected one each header's `msg_name` carries its
     /// destination and the kernel loops `sendit` — still one syscall
@@ -367,16 +380,15 @@ impl BatchEndpoint {
         use std::os::fd::AsRawFd;
         let mut sent = 0usize;
         while sent < pkts.len() {
-            let n = (pkts.len() - sent).min(WIRE_DRAIN_BUDGET);
+            let n = (pkts.len() - sent).min(Self::MSGX_CHUNK);
             // SAFETY: `iovec`, `msghdr_x` and `sockaddr_storage` are C
             // PODs — the all-zero bit pattern is valid for every field
             // (null pointer, zero length, family AF_UNSPEC) and zeroed
             // `msg_flags`/`msg_datalen` are the input values
             // `sendmsg_x` requires.
-            let mut iov: [libc::iovec; WIRE_DRAIN_BUDGET] = unsafe { std::mem::zeroed() };
-            let mut msgs: [msgx::msghdr_x; WIRE_DRAIN_BUDGET] = unsafe { std::mem::zeroed() };
-            let mut sas: [libc::sockaddr_storage; WIRE_DRAIN_BUDGET] =
-                unsafe { std::mem::zeroed() };
+            let mut iov: [libc::iovec; Self::MSGX_CHUNK] = unsafe { std::mem::zeroed() };
+            let mut msgs: [msgx::msghdr_x; Self::MSGX_CHUNK] = unsafe { std::mem::zeroed() };
+            let mut sas: [libc::sockaddr_storage; Self::MSGX_CHUNK] = unsafe { std::mem::zeroed() };
             for (j, t) in pkts[sent..sent + n].iter().enumerate() {
                 let (addr, buf) = get(t);
                 iov[j] = libc::iovec {
@@ -418,72 +430,85 @@ impl BatchEndpoint {
         sent
     }
 
-    /// One `recvmsg_x` into the staged buffers — XNU's batched
-    /// `soreceive_m_list`, which stops when the socket queue runs dry
-    /// under `MSG_DONTWAIT` and reports each datagram's received length
-    /// in `msg_datalen` (bytes actually copied, ≤ the advertised iov
-    /// capacity). `msgs[..got]` is the only span the kernel rewrote.
+    /// One or more `recvmsg_x` rounds into the staged buffers — XNU's
+    /// batched `soreceive_m_list`, which stops when the socket queue
+    /// runs dry under `MSG_DONTWAIT` and reports each datagram's
+    /// received length in `msg_datalen` (bytes actually copied, ≤ the
+    /// advertised iov capacity). Each round is capped at [`MSGX_CHUNK`]
+    /// headers — XNU's per-call clip — so a batch wider than the clip
+    /// loops until a short round reports the queue dry; `msgs[..got]`
+    /// of each round is the only span the kernel rewrote.
     #[cfg(all(target_os = "macos", not(feature = "no-macos-sendmsg-x")))]
     fn recv_batch_msgx(&self, bufs: &mut [Vec<u8>]) -> usize {
         use std::os::fd::AsRawFd;
-        let n = bufs.len().min(WIRE_DRAIN_BUDGET);
-        let bufs = &mut bufs[..n];
-        if bufs.is_empty() {
-            return 0;
-        }
-        // SAFETY: as in `send_batch_inner` — C POD arrays, all-zero
-        // valid; `recvmsg_x` requires zeroed `msg_flags` on input.
-        let mut iov: [libc::iovec; WIRE_DRAIN_BUDGET] = unsafe { std::mem::zeroed() };
-        let mut msgs: [msgx::msghdr_x; WIRE_DRAIN_BUDGET] = unsafe { std::mem::zeroed() };
-        for (j, buf) in bufs.iter_mut().enumerate() {
-            iov[j] = libc::iovec {
-                iov_base: buf.as_mut_ptr().cast(),
-                iov_len: buf.capacity(),
-            };
-            msgs[j].msg_iov = &mut iov[j];
-            msgs[j].msg_iovlen = 1;
-        }
-        // SAFETY: `fd` is a live nonblocking socket; `msgs` describes
-        // `n` iovecs each covering that Vec's whole allocation,
-        // initialised or not — writes through the raw pointer are
-        // in-bounds and no Rust reference aliases them.
-        let ret = unsafe {
-            msgx::recvmsg_x(
-                self.inner.as_raw_fd(),
-                msgs.as_mut_ptr(),
-                n as libc::c_uint,
-                libc::MSG_DONTWAIT,
-            )
-        };
-        if ret <= 0 {
-            if ret < 0 {
-                let e = io::Error::last_os_error();
-                if e.kind() != io::ErrorKind::WouldBlock {
-                    tracing::debug!("wireguard endpoint recvmsg_x error: {e}");
-                }
+        let mut total = 0usize;
+        while total < bufs.len() {
+            let n = (bufs.len() - total).min(Self::MSGX_CHUNK);
+            let chunk = &mut bufs[total..total + n];
+            // SAFETY: as in `send_batch_inner` — C POD arrays, all-zero
+            // valid; `recvmsg_x` requires zeroed `msg_flags` on input.
+            let mut iov: [libc::iovec; Self::MSGX_CHUNK] = unsafe { std::mem::zeroed() };
+            let mut msgs: [msgx::msghdr_x; Self::MSGX_CHUNK] = unsafe { std::mem::zeroed() };
+            for (j, buf) in chunk.iter_mut().enumerate() {
+                iov[j] = libc::iovec {
+                    iov_base: buf.as_mut_ptr().cast(),
+                    iov_len: buf.capacity(),
+                };
+                msgs[j].msg_iov = &mut iov[j];
+                msgs[j].msg_iovlen = 1;
             }
-            return 0;
+            // SAFETY: `fd` is a live nonblocking socket; `msgs`
+            // describes `n` iovecs each covering that Vec's whole
+            // allocation, initialised or not — writes through the raw
+            // pointer are in-bounds and no Rust reference aliases them.
+            let ret = unsafe {
+                msgx::recvmsg_x(
+                    self.inner.as_raw_fd(),
+                    msgs.as_mut_ptr(),
+                    n as libc::c_uint,
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            if ret <= 0 {
+                if ret < 0 {
+                    let e = io::Error::last_os_error();
+                    if e.kind() != io::ErrorKind::WouldBlock {
+                        tracing::debug!("wireguard endpoint recvmsg_x error: {e}");
+                    }
+                }
+                break;
+            }
+            let got = ret as usize;
+            for (j, buf) in chunk[..got].iter_mut().enumerate() {
+                let len = msgs[j].msg_datalen.min(buf.capacity());
+                // SAFETY: the kernel wrote the first `msg_datalen`
+                // bytes of `buf`'s allocation (datalen is the copied
+                // count, ≤ the advertised capacity), so those bytes
+                // are initialised and extending `len` over them is
+                // sound.
+                unsafe { buf.set_len(len) };
+            }
+            total += got;
+            // A short round is the dry-queue report — stop rather than
+            // spend a syscall confirming it.
+            if got < n {
+                break;
+            }
         }
-        let got = ret as usize;
-        for (j, buf) in bufs[..got].iter_mut().enumerate() {
-            let len = msgs[j].msg_datalen.min(buf.capacity());
-            // SAFETY: the kernel wrote the first `msg_datalen` bytes
-            // of `buf`'s allocation (datalen is the copied count, ≤
-            // the advertised capacity), so those bytes are initialised
-            // and extending `len` over them is sound.
-            unsafe { buf.set_len(len) };
-        }
-        got
+        total
     }
 }
 
 /// Bounded queue depth of a [`ProxyEndpoint`]'s two bridge channels, in
-/// datagrams. Sized to two full wire drains so one whole
+/// datagrams. Sized to four full wire drains so one whole
 /// [`Endpoint::recv_batch`] burst — or the symmetric staged
 /// [`Endpoint::send_batch`] flush — never meets a full queue mid-pass:
 /// back-pressure surfaces as `WouldBlock` only past that, exactly where
-/// the socket path's `ENOBUFS`/`EAGAIN` would.
-const PROXY_ENDPOINT_QUEUE: usize = 2 * WIRE_DRAIN_BUDGET;
+/// the socket path's `ENOBUFS`/`EAGAIN` would. Four rather than two:
+/// the bridge is also the front hop's jitter absorber, and a burst
+/// arriving mid-pass must not drop while this pass's drain is still
+/// staged (wg-perf, paired with the `WIRE_DRAIN_BUDGET` raise).
+const PROXY_ENDPOINT_QUEUE: usize = 4 * WIRE_DRAIN_BUDGET;
 
 /// Staging buffer of the [`ProxyEndpoint`] RX bridge — one full UDP
 /// payload. WG wire datagrams stay far below this (outer MTU +
@@ -928,13 +953,14 @@ mod msgx {
 
     // `cnt` ceiling pin: XNU clips each call's datagram count at
     // `somaxsendmsgx`/`somaxrecvmsgx` (default 100 — see the module
-    // docs) and EINVALs past `UIO_MAXIOV`. Keeping the wire-drain
-    // budget under the default ceiling means a staged batch always
-    // fits one call on a stock kernel — a budget bump past it would
-    // silently truncate the tail of every chunk.
+    // docs) and EINVALs past `UIO_MAXIOV`. The per-call chunk stays
+    // under the default ceiling even though `WIRE_DRAIN_BUDGET` may
+    // exceed it — a bigger budget is serviced over several calls,
+    // while a chunk sized past the ceiling would silently truncate
+    // the tail of every round.
     const _: () = assert!(
-        crate::WIRE_DRAIN_BUDGET <= 100,
-        "WIRE_DRAIN_BUDGET exceeds XNU's default sendmsg_x/recvmsg_x cnt ceiling (100)"
+        super::BatchEndpoint::MSGX_CHUNK <= 100,
+        "MSGX_CHUNK exceeds XNU's default sendmsg_x/recvmsg_x cnt ceiling (100)"
     );
 
     extern "C" {
@@ -1211,9 +1237,9 @@ mod tests {
         got
     }
 
-    /// Chunks past the [`WIRE_DRAIN_BUDGET`] stack-array bound: a
-    /// 130-datagram `send_batch` takes three mmsg rounds on Linux —
-    /// the `pkts[sent..sent + n]` offset must stay exact — and a plain
+    /// Chunks past the per-call stack-array bound: a batch wider than
+    /// two rounds takes ≥3 mmsg/msgx rounds on Linux/macOS — the
+    /// `pkts[sent..sent + n]` offset must stay exact — and a plain
     /// loop elsewhere. The receiver sees every datagram once, in
     /// order.
     #[tokio::test(flavor = "current_thread")]
@@ -1225,8 +1251,12 @@ mod tests {
         let a = ep(a_sock, true);
         let b = ep(b_sock, false);
 
-        const N: usize = 130; // > 2 × WIRE_DRAIN_BUDGET ⇒ ≥3 kernel rounds
-        let payloads: Vec<Vec<u8>> = (0..N).map(|i| vec![i as u8; 8 + i]).collect();
+        // > 2 × the per-call chunk ⇒ ≥3 kernel rounds on either backend
+        // (mmsg chunks at `WIRE_DRAIN_BUDGET`, msgx at `MSGX_CHUNK`).
+        // Payloads stay ≤39 B so the queued batch fits a stock kernel
+        // receive buffer whole.
+        const N: usize = 2 * WIRE_DRAIN_BUDGET + 2;
+        let payloads: Vec<Vec<u8>> = (0..N).map(|i| vec![i as u8; 8 + i % 32]).collect();
         let refs: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
         a.writable().await.expect("sender writable");
         assert_eq!(a.send_batch(&refs, b_addr), N, "all chunks sent");
@@ -1244,8 +1274,8 @@ mod tests {
         let b_addr = b_sock.local_addr().expect("addr");
         let b = ep(b_sock, false);
 
-        const N: usize = 130;
-        let payloads: Vec<Vec<u8>> = (0..N).map(|i| vec![i as u8; 8 + i]).collect();
+        const N: usize = 2 * WIRE_DRAIN_BUDGET + 2;
+        let payloads: Vec<Vec<u8>> = (0..N).map(|i| vec![i as u8; 8 + i % 32]).collect();
         let refs: Vec<(SocketAddr, &[u8])> =
             payloads.iter().map(|p| (b_addr, p.as_slice())).collect();
         a.writable().await.expect("sender writable");

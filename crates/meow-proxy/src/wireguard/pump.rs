@@ -51,9 +51,12 @@ const ACTOR_MAILBOX: usize = 64;
 const UDP_READ_QUEUE: usize = 256;
 /// conn→pump datagrams per UDP association.
 const UDP_WRITE_QUEUE: usize = 128;
-/// smoltcp UDP packet buffer: packet slots and payload arena.
-const UDP_SOCKET_PACKETS: usize = 64;
-const UDP_SOCKET_BYTES: usize = 65536;
+/// smoltcp UDP packet buffer: packet slots and payload arena. Raised
+/// 64/64 KiB → 256/256 KiB with [`WIRE_DRAIN_BUDGET`] (wg-perf): a
+/// 64-slot buffer dropped every wire batch that out-paced the conn
+/// drain past 64 datagrams; 256 covers a full drain's inner output.
+const UDP_SOCKET_PACKETS: usize = 256;
+const UDP_SOCKET_BYTES: usize = 262144;
 
 /// Retained crypto-scratch buffers. Demand is a handful of live dsts
 /// between `flush_outbox` passes, so the cap only bounds the memory a
@@ -644,7 +647,11 @@ impl WgPump {
     /// order-free. The same deferral can seal one flushed queued packet
     /// under the pre-batch `current` session — still a live session,
     /// and the generation guard above still forbids a regression.
-    fn drain_wire(&mut self) {
+    /// `run_crypto` is the Phase-B batch strategy — `run` hands it the
+    /// `block_in_place` offload (the pool join must not park the shared
+    /// worker), tests the direct pool call (they run on current-thread
+    /// runtimes, where `block_in_place` panics).
+    fn drain_wire(&mut self, run_crypto: impl FnOnce(&mut Vec<CryptoJob>)) {
         let mut slots = std::mem::take(&mut self.rx_slots);
         let n = self.endpoint.recv_batch(&mut slots, WIRE_DRAIN_BUDGET);
         // Wire bytes count toward the service-yield budget whether a
@@ -706,10 +713,11 @@ impl WgPump {
         }
 
         // Phase B — the batch's AEAD opens, in place inside the job
-        // bufs. `run_shared` fills every `job.result`, preserving job
-        // order — and its `n <= 2` shortcut runs *before* the shared
-        // pool is resolved, so a small batch never spawns the workers.
-        CryptoPool::run_shared(&mut jobs);
+        // bufs. `run_crypto` fills every `job.result`, preserving job
+        // order — and `run_shared`'s `n <= 2` shortcut runs *before*
+        // the shared pool is resolved, so a small batch never spawns
+        // the workers.
+        run_crypto(&mut jobs);
 
         // Phase C — serial post-pass in wire order.
         for job in jobs {
@@ -813,7 +821,11 @@ impl WgPump {
     /// accepts, the same window the serial path's per-packet re-read
     /// had. Undersize packets take the serial arm's `warn!` + drop,
     /// never the panic `format_packet_data` carries.
-    fn drain_device_tx(&mut self) {
+    ///
+    /// `run_crypto` is the Phase-B seal strategy — `run` hands it the
+    /// `block_in_place` offload, tests the direct pool call (see
+    /// [`drain_wire`](Self::drain_wire)).
+    fn drain_device_tx(&mut self, run_crypto: impl FnOnce(&mut Vec<TxCryptoJob>)) {
         let Some(crypto) = self.tunn.current_session_handle() else {
             // No established session — the serial arm: `encapsulate`
             // queues each inner packet and drives the handshake chain.
@@ -875,10 +887,11 @@ impl WgPump {
         }
 
         // Phase B — the batch's AEAD seals inside the job `wire` bufs.
-        // `run_tx_shared` fills every `job.result`, preserving job
-        // order — and its `n <= 2` shortcut runs *before* the shared
-        // pool is resolved, so a small batch never spawns the workers.
-        CryptoPool::run_tx_shared(&mut jobs);
+        // `run_crypto` fills every `job.result`, preserving job order —
+        // and `run_tx_shared`'s `n <= 2` shortcut runs *before* the
+        // shared pool is resolved, so a small batch never spawns the
+        // workers.
+        run_crypto(&mut jobs);
 
         // Phase C — serial post-pass in job order = counter order =
         // the wire-emit order `encapsulate` would have produced.
@@ -1138,6 +1151,10 @@ impl WgPump {
         );
         // TCP_NODELAY: a proxy stream wants latency over tinygram batching.
         socket.set_nagle_enabled(false);
+        // Delayed-ACK at 1 ms (wg-perf): smoltcp's 10 ms default holds
+        // each ACK for a full pass cadence, so a request/response flow
+        // ate it twice — first segment and FIN — on every connection.
+        socket.set_ack_delay(Some(smoltcp::time::Duration::from_millis(1)));
         let connect = socket.connect(
             self.iface.context(),
             IpEndpoint::from(remote),
@@ -1611,6 +1628,25 @@ impl WgPump {
         }
     }
 
+    /// The crypto-batch strategy `run` hands both drains: the pool join
+    /// blocks its caller on `mpsc::recv` until the workers return, which
+    /// must not park a shared tokio worker — so a parallel-sized batch
+    /// rides `block_in_place` and the wait moves off the worker set.
+    /// `> 2` mirrors [`CryptoPool`]'s own serial cutoff: smaller batches
+    /// resolve inline either way, and a dry pass — the pump's steady
+    /// state — never pays the migration. Lives on the `run` side
+    /// because tests drive the drains on current-thread runtimes, where
+    /// `block_in_place` panics (`run` only ever executes inside
+    /// `spawn_pump`'s `tokio::spawn` on the multi-thread runtime, the
+    /// one flavor where `block_in_place` is legal).
+    fn offload_crypto<T>(jobs: &mut Vec<T>, run: fn(&mut Vec<T>)) {
+        if jobs.len() > 2 {
+            tokio::task::block_in_place(|| run(jobs));
+        } else {
+            run(jobs);
+        }
+    }
+
     /// How long `select!` may sleep before smoltcp's timers or the WG tick
     /// need service. Mailbox, endpoint and wake events all interrupt it —
     /// and they are the only wake sources the backlog paths need: conn
@@ -1644,23 +1680,71 @@ impl WgPump {
         poll_burst(&mut self.iface, now, &mut self.device, &mut self.sockets);
     }
 
+    /// The conn-facing half of a service pass as one method — socket
+    /// service, the fairness yield, the interface poll, a second socket
+    /// service, then the egress seal — so `run` and the same-pass pin
+    /// drive the identical sequence.
+    ///
+    /// `service_sockets` runs twice (wg-perf R1): the first drains
+    /// conn→socket writes and hands the conns what the *previous*
+    /// pass's poll stacked; `poll_stack` then moves this pass's inbound
+    /// plaintext `rx_queue` → sockets, and the second service delivers
+    /// it *this* pass. Without it inbound plaintext waited a full loop
+    /// plus the `select!` park (up to `IDLE_SLEEP`) for the next pass's
+    /// service — the 12.7 ms RTT cadence the latency fix removes.
+    ///
+    /// `run_crypto` is `drain_device_tx`'s seal strategy — see
+    /// [`offload_crypto`](Self::offload_crypto).
+    async fn service_pass(&mut self, run_crypto: impl FnOnce(&mut Vec<TxCryptoJob>)) {
+        self.service_sockets();
+        // A service pass is synchronous end to end; on the shared
+        // worker pool a saturated flow would otherwise monopolise a
+        // thread between `select!` parks. Yield once per rolling MiB
+        // moved — or per pass limit, the low-volume backstop — so
+        // co-located tasks stay schedulable.
+        self.last_service_passes += 1;
+        if self.service_yield_due() {
+            tokio::task::yield_now().await;
+            self.last_service_bytes = 0;
+            self.last_service_passes = 0;
+        }
+        self.poll_stack(SmolInstant::now());
+        self.service_sockets();
+        self.drain_device_tx(run_crypto);
+    }
+
+    /// `run`'s pass-end park decision (wg-perf R1): a pass that moved
+    /// payload — `last_service_bytes` advanced past the `pass_bytes`
+    /// snapshot `run` took at loop top — may have follow-on work
+    /// already queued (a full wire drain, a just-fed conn channel, a
+    /// window an inbound ACK just opened), so the loop must not park:
+    /// `ZERO` still runs the `select!`'s other arms one nonblocking
+    /// poll before the next pass. A quiet pass sleeps exactly what
+    /// `sleep_duration` reports.
+    fn pass_delay(&mut self, pass_bytes: usize) -> Duration {
+        if self.last_service_bytes == pass_bytes {
+            self.sleep_duration(SmolInstant::now())
+        } else {
+            Duration::ZERO
+        }
+    }
+
     async fn run(mut self) {
         self.kick_handshake();
         self.flush_outbox();
         'outer: loop {
+            // Progress guard for the pass-end park — see `pass_delay`.
+            // Snapshot before `drain_wire`, the pass's first byte mover;
+            // a mid-pass yield resets the counter and the inequality
+            // still reports progress.
+            let pass_bytes = self.last_service_bytes;
             // 1. endpoint → tunn → device (bounded nonblocking drain).
             //    `drain_wire`'s Phase-B crypto pass joins the pool's
             //    resident workers on a blocking `mpsc::recv` while
-            //    holding the pool's pass mutex — a bare call would
-            //    park this shared tokio worker for the join's whole
-            //    duration, so the drain runs under `block_in_place`
-            //    (`run` only ever executes inside `spawn_pump`'s
-            //    `tokio::spawn` on the multi-thread runtime, the one
-            //    flavor where `block_in_place` is legal). The wrap
-            //    lives here rather than inside `drain_wire` because
-            //    tests drive the drain on current-thread runtimes,
-            //    where `block_in_place` panics.
-            tokio::task::block_in_place(|| self.drain_wire());
+            //    holding the pool's pass mutex — `offload_crypto` moves
+            //    that wait off this shared worker, but only once the
+            //    demux actually produced a parallel-sized batch.
+            self.drain_wire(|jobs| Self::offload_crypto(jobs, CryptoPool::run_shared));
             // 2. mailbox drain.
             loop {
                 match self.rx.try_recv() {
@@ -1682,30 +1766,15 @@ impl WgPump {
                 }
             }
             // 3. conn queues, smoltcp poll, tunnel egress, WG timers.
-            self.service_sockets();
-            // A service pass is synchronous end to end; on the shared
-            // worker pool a saturated flow would otherwise monopolise a
-            // thread between `select!` parks. Yield once per rolling MiB
-            // moved — or per pass limit, the low-volume backstop — so
-            // co-located tasks stay schedulable.
-            self.last_service_passes += 1;
-            if self.service_yield_due() {
-                tokio::task::yield_now().await;
-                self.last_service_bytes = 0;
-                self.last_service_passes = 0;
-            }
-            let now = SmolInstant::now();
-            self.poll_stack(now);
-            // Same `block_in_place` wrap as `drain_wire` above — the
-            // seal pass's worker join must not park a shared worker.
-            tokio::task::block_in_place(|| self.drain_device_tx());
+            self.service_pass(|jobs| Self::offload_crypto(jobs, CryptoPool::run_tx_shared))
+                .await;
             if self.last_timer.elapsed() >= WG_TIMER_INTERVAL {
                 self.tick_timers();
                 self.last_timer = StdInstant::now();
             }
             self.flush_outbox();
 
-            let delay = self.sleep_duration(now);
+            let delay = self.pass_delay(pass_bytes);
             tokio::select! {
                 biased;
                 msg = self.rx.recv() => match msg {
@@ -2522,7 +2591,7 @@ mod tests {
         // Fresh: the in-flight dedup holds — the datagram queues
         // inside `tunn` and nothing reaches the outbox.
         pump.device.tx_queue.push_back(inner(0));
-        pump.drain_device_tx();
+        pump.drain_device_tx(CryptoPool::run_tx_shared);
         assert!(
             pump.outbox.is_empty(),
             "a fresh in-flight initiation must still dedup packet pressure"
@@ -2533,7 +2602,7 @@ mod tests {
         tokio::time::sleep(Duration::from_secs_f64(5.2)).await;
 
         pump.device.tx_queue.push_back(inner(1));
-        pump.drain_device_tx();
+        pump.drain_device_tx(CryptoPool::run_tx_shared);
         let resent = pump
             .outbox
             .pop_front()
@@ -2548,7 +2617,7 @@ mod tests {
         // behind it dedups again — the re-arm is per-REKEY_TIMEOUT,
         // not per-packet.
         pump.device.tx_queue.push_back(inner(2));
-        pump.drain_device_tx();
+        pump.drain_device_tx(CryptoPool::run_tx_shared);
         assert!(
             pump.outbox.is_empty(),
             "the just-resent initiation must dedup again"
@@ -2723,7 +2792,7 @@ mod tests {
         pump.recv_buf = pump
             .decapsulate_wire(pkt, n)
             .unwrap_or_else(|| vec![0u8; pump.scratch_len]);
-        pump.drain_wire();
+        pump.drain_wire(CryptoPool::run_shared);
 
         // Every decrypted inner reached smoltcp in wire order — the
         // first through the serial arm, the rest through the pool pass.
@@ -2781,7 +2850,7 @@ mod tests {
             inners.push(inner.clone());
             pump.device.tx_queue.push_back(inner);
         }
-        pump.drain_device_tx();
+        pump.drain_device_tx(CryptoPool::run_tx_shared);
 
         assert_eq!(pump.outbox.len(), N, "every sealed job emitted a datagram");
         assert_eq!(
@@ -3647,6 +3716,91 @@ mod tests {
             "one pass must burst a multi-segment write, got {}",
             pump.device.tx_queue.len()
         );
+    }
+
+    /// wg-perf R1 pass-order pin — `service_pass` runs
+    /// `service_sockets` again after `poll_stack`, so a data segment
+    /// the poll just delivered reaches the conn in the SAME pass:
+    /// before the second service, inbound plaintext waited a whole
+    /// loop plus the `select!` park for the next pass's service. The
+    /// pin is that delivery is already complete when the pass ends —
+    /// a bare `poll_read` finds it, no waiting.
+    #[tokio::test(flavor = "current_thread")]
+    async fn service_pass_delivers_polled_rx_same_pass() {
+        let client_secret = x25519::StaticSecret::from([0x73; 32]);
+        let server_public = x25519::PublicKey::from(&x25519::StaticSecret::from([0x74; 32]));
+        let mut pump = pump_for_test(&test_config(&client_secret, &server_public));
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        pump.dial_tcp("203.0.113.1:443".parse().unwrap(), "t".into(), reply_tx);
+
+        // SYN out, peer's SYN-ACK in — the established-socket dance
+        // `poll_burst_egresses_queued_segments` uses.
+        pump.iface
+            .poll(SmolInstant::now(), &mut pump.device, &mut pump.sockets);
+        let syn = pump.device.tx_queue.back().expect("the dial emitted a SYN");
+        let local_port = u16::from_be_bytes([syn[20], syn[21]]);
+        let isn = u32::from_be_bytes(syn[24..28].try_into().unwrap());
+        pump.device.rx_queue.push_back(Bytes::from(tcp_seg_v4(
+            "203.0.113.1".parse().unwrap(),
+            "10.0.0.2".parse().unwrap(),
+            443,
+            local_port,
+            5000,
+            isn.wrapping_add(1),
+            0x12,
+        )));
+        pump.iface
+            .poll(SmolInstant::now(), &mut pump.device, &mut pump.sockets);
+        pump.device.tx_queue.clear();
+
+        // A peer data segment lands in `rx_queue` — the wire→device
+        // direction's output exactly as `drain_wire` leaves it. One
+        // `service_pass` must take it poll → socket → conn.
+        pump.device.rx_queue.push_back(Bytes::from(tcp_seg_v4_data(
+            "203.0.113.1".parse().unwrap(),
+            "10.0.0.2".parse().unwrap(),
+            443,
+            local_port,
+            5001,
+            isn.wrapping_add(1),
+            0x18,
+            b"hello",
+        )));
+        pump.service_pass(CryptoPool::run_tx_shared).await;
+
+        let mut conn = reply_rx.await.expect("reply").expect("dial resolves");
+        // Same pass, no further service call: the payload must already
+        // sit on the conn — a bare `poll_read` is Ready, not Pending.
+        let mut buf = [0u8; 16];
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let mut rb = tokio::io::ReadBuf::new(&mut buf);
+        assert!(
+            matches!(
+                Pin::new(&mut *conn).poll_read(&mut cx, &mut rb),
+                Poll::Ready(Ok(()))
+            ),
+            "polled rx must reach the conn inside the same service pass"
+        );
+        assert_eq!(rb.filled(), b"hello");
+    }
+
+    /// wg-perf R1 progress-guard pin — `pass_delay` reports `ZERO` when
+    /// the pass moved payload (follow-on work may already be queued),
+    /// and defers to `sleep_duration` only when the pass was quiet.
+    #[tokio::test(flavor = "current_thread")]
+    async fn pass_delay_zeroes_only_on_progress() {
+        let client_secret = x25519::StaticSecret::from([0x75; 32]);
+        let server_public = x25519::PublicKey::from(&x25519::StaticSecret::from([0x76; 32]));
+        let mut pump = pump_for_test(&test_config(&client_secret, &server_public));
+
+        // A quiet pass parks on `sleep_duration` — nonzero.
+        assert_ne!(pump.pass_delay(0), Duration::ZERO);
+        // Moved payload → the loop must not park.
+        pump.last_service_bytes = 1;
+        assert_eq!(pump.pass_delay(0), Duration::ZERO);
+        // The snapshot consumed → the next quiet pass parks again.
+        assert_ne!(pump.pass_delay(1), Duration::ZERO);
     }
 
     // ── flush_outbox / scratch-pool pins ─────────────────────────

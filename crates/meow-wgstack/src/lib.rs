@@ -54,8 +54,13 @@ pub const TCP_WRITE_QUEUE: usize = 64;
 pub const TCP_SOCKET_BUF: usize = 1024 * 1024;
 
 /// Endpoint→Tunn drain bound per loop iteration; excess waits for the next
-/// wake-up rather than starving the rest of the service pass.
-pub const WIRE_DRAIN_BUDGET: usize = 64;
+/// wake-up rather than starving the rest of the service pass. Raised
+/// 64 → 256 (wg-perf): 64 × ~1.4 KB wire datagrams capped a saturated
+/// flow at ~86 KB/pass (~42 MB/s at the measured ~490 pass/s cadence);
+/// 256 lifts the per-pass ceiling to ~345 KB. The macOS `sendmsg_x`/
+/// `recvmsg_x` per-call chunk stays under XNU's 100-datagram clip via
+/// `endpoint`'s `MSGX_CHUNK`, not this constant.
+pub const WIRE_DRAIN_BUDGET: usize = 256;
 
 /// Bound on [`Interface::poll`] iterations per service pass — see
 /// [`poll_burst`]. A permanently-progressing pass (a saturated bulk flow
