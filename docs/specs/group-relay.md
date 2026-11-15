@@ -103,11 +103,11 @@ Out of scope:
   chain that must keep mux pooling, prefer a `dialer-proxy` front on the
   last hop — for adapters that accept an injected `TcpDialer`
   (vless/vmess/trojan/ss) the mux layer pools sessions above the
-  injected dialer, matching mihomo's model. This does not extend to
-  `anytls` or `hysteria2`: they cannot carry an injected dialer, so
-  `dialer-proxy` falls back to the same relay wrapper — anytls sessions
-  stay unpooled per connection and hysteria2 fails loudly at dial time.
-  `type: relay` is for ad hoc multi-hop.
+  injected dialer, matching mihomo's model. `anytls` likewise accepts an
+  injected transport dialer and keeps its session pooling on the chained
+  transport; `hysteria2` rides the front's UDP association instead (its
+  sessions pool on the QUIC connection, not per dial). `type: relay` is
+  for ad hoc multi-hop.
 
 ## User-facing config
 

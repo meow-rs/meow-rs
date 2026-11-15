@@ -290,7 +290,7 @@ impl Client {
                 let (host, port) = crate::util::socket_protect::split_host_port(&self.server_addr)
                     .ok_or_else(|| {
                         AnyTlsError::Protocol(format!(
-                            "transport dialer: cannot split server address {}",
+                            "malformed server address {} (expected host:port)",
                             self.server_addr
                         ))
                     })?;

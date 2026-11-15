@@ -1218,8 +1218,8 @@ impl ProxyProvider {
     /// the stronger levels overwrite unconditionally, so `override` is an
     /// enforcement knob remote nodes cannot escape.
     ///
-    /// A node whose adapter type cannot carry an injected dialer (anytls,
-    /// hysteria2, an `ss` node with an external SIP003 plugin) falls back to
+    /// A node whose adapter type cannot carry an injected dialer
+    /// (`direct`, an `ss` node with an external SIP003 plugin) falls back to
     /// the relay-based [`meow_proxy::DialerProxyAdapter`] — the same
     /// treatment the static `proxies:` builder gives its entries,
     /// except that provider payloads keep the fallback under `strict` too:
