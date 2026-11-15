@@ -28,8 +28,8 @@ pub use socket_protect::{
     SocketProtector, clear_socket_protector, set_socket_protector, socket_protector,
 };
 pub use socket_protect::{
-    TcpDialer, bind_udp, clear_tcp_dialer, connect_tcp, connect_tcp_addr, set_tcp_dialer,
-    tcp_dialer,
+    TcpDialer, TransportDialFuture, TransportDialer, bind_udp, clear_tcp_dialer, connect_tcp,
+    connect_tcp_addr, set_tcp_dialer, tcp_dialer,
 };
 pub use string_map::*;
 pub use tls::*;

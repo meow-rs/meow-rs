@@ -20,7 +20,7 @@ use anytls_rs::client::Client as AnytlsClient;
 use anytls_rs::client::UDP_OVER_TCP_MAGIC_ADDR;
 use anytls_rs::padding::PaddingFactory;
 use anytls_rs::session::{Session, Stream as AnytlsStream};
-use anytls_rs::{AsyncStream, TlsConnect, TlsConnectFuture};
+use anytls_rs::{AsyncStream, SyncStream, TlsConnect, TlsConnectFuture};
 use async_trait::async_trait;
 use bytes::Bytes;
 use meow_transport::tls::{TlsConfig, TlsLayer};
@@ -114,7 +114,9 @@ pub struct AnytlsAdapter {
     /// The adapter's own TLS layer, `Arc`-shared with the `TlsConnect` hook
     /// given to the anytls client. `connect_over` runs it directly on the
     /// relay-supplied stream because `TlsConnect::connect` is typed on
-    /// `TcpStream` while a relay stream is a generic `meow_transport::Stream`.
+    /// `TcpStream` while a relay stream is a generic `meow_transport::Stream`;
+    /// an injected `dialer-proxy` reaches the same layer through
+    /// `TlsConnect::connect_stream` inside the client.
     tls_layer: Arc<TlsLayer>,
     udp: bool,
 }
@@ -199,6 +201,27 @@ impl AnytlsAdapter {
             udp,
         })
     }
+
+    /// Inject the `dialer-proxy` dialer every AnyTLS session's transport
+    /// is established through (Batch-2 parity with WireGuard/hysteria2).
+    ///
+    /// The config layer attaches this only for a real chain
+    /// (`dialer.is_proxy()`); the no-op `DirectDialer` keeps the client's
+    /// own `connect_tcp_host` path. The dialer returns the raw chained
+    /// stream — the vendored client then runs its usual TLS handshake
+    /// (`connect_stream`), auth and session setup on top, and the session
+    /// pools like a direct one (the client holds one transport class, so
+    /// pooled sessions can never be mixed across paths). `udp: true`
+    /// UoT rides the same chained session, so injected UDP works — it
+    /// only needs the front to carry TCP.
+    ///
+    /// `connect_over` is unaffected: it bypasses both the dialer and the
+    /// pool, staying the unpooled single-purpose path it always was.
+    pub fn with_dialer(mut self, dialer: Arc<dyn crate::dialer::TcpDialer>) -> Self {
+        self.client
+            .set_transport_dialer(Arc::new(ChainedTransportDialer(dialer)));
+        self
+    }
 }
 
 #[async_trait]
@@ -233,12 +256,14 @@ impl ProxyAdapter for AnytlsAdapter {
     /// Run TLS + the AnyTLS session handshake over an existing stream
     /// (relay chain).
     ///
-    /// The vendored client's `TlsConnect` hook is typed on `TcpStream`, so
-    /// the adapter runs its shared `TlsLayer` itself and hands the
-    /// handshaken stream to `create_proxy_stream_on_tls`. The session that
-    /// comes back is **not** pooled — pooling it would let a later direct
-    /// `dial_tcp` silently reuse the relay channel — so the returned conn
-    /// owns it and closes it on drop.
+    /// The vendored client's pool path dials its own transport, so the
+    /// adapter runs its shared `TlsLayer` itself and hands the handshaken
+    /// stream to `create_proxy_stream_on_tls`. The session that comes
+    /// back is **not** pooled — pooling it would let a later `dial_tcp`
+    /// silently reuse the relay channel — so the returned conn owns it
+    /// and closes it on drop. The injected `dialer-proxy` path is
+    /// different: there the *client* dials the chain itself, so those
+    /// sessions pool normally.
     async fn connect_over(
         &self,
         stream: Box<dyn ProxyConn>,
@@ -759,6 +784,46 @@ impl TlsConnect for MeowTlsConnect {
                 }
             })?;
             Ok(Box::new(stream) as Box<dyn AsyncStream>)
+        })
+    }
+
+    /// The `dialer-proxy` leg of the same hook: the client's transport
+    /// dialer already connected the stream (through the front proxy), so
+    /// the identical `TlsLayer` handshake runs over it — the exact path
+    /// `connect_over` proves on a relay-supplied stream.
+    fn connect_stream(&self, stream: Box<dyn SyncStream>) -> TlsConnectFuture<'_> {
+        Box::pin(async move {
+            let stream = self
+                .layer
+                .connect(Box::new(stream))
+                .await
+                .map_err(|e| match e {
+                    meow_transport::TransportError::Io(e) => anytls_rs::AnyTlsError::Io(e),
+                    other => anytls_rs::AnyTlsError::Tls(format!("TLS handshake failed: {other}")),
+                })?;
+            Ok(Box::new(stream) as Box<dyn AsyncStream>)
+        })
+    }
+}
+
+/// Bridges the injected `dialer-proxy`
+/// [`TcpDialer`](crate::dialer::TcpDialer) into the vendored client's
+/// per-client `TransportDialer` hook: its `dial` already returns
+/// `Box<dyn meow_transport::Stream>`, which satisfies `SyncStream` (that
+/// stream contract requires `Send + Sync + Unpin`), so the bridge is a
+/// pure repackage — no wrapper stream to frame or downcast through.
+///
+/// `internal` stays `false`: an AnyTLS session is the outbound's shared
+/// long-lived transport — it multiplexes whichever streams the pool hands
+/// it, so its establishment is user-traffic plumbing, not housekeeping
+/// (the front group's usage accounting treats it as the outbound's own).
+struct ChainedTransportDialer(Arc<dyn crate::dialer::TcpDialer>);
+
+impl anytls_rs::TransportDialer for ChainedTransportDialer {
+    fn dial<'a>(&'a self, host: &'a str, port: u16) -> anytls_rs::TransportDialFuture<'a> {
+        Box::pin(async move {
+            let stream = self.0.dial(host, port, false).await?;
+            Ok(Box::new(stream) as Box<dyn SyncStream>)
         })
     }
 }

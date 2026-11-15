@@ -191,16 +191,22 @@ impl Proxy for WrappedProxy {
 /// type so existing downcasts land exactly as they did on the bare entry,
 /// and the health/delay/member views are untouched.
 ///
-/// The one override is `is_dialer_proxy_non_transparent` → `true`: a
-/// successful injection is *always* a non-transparent leaf. `type: direct`
-/// (and `anytls`, and `ss` with an external SIP003 plugin) rejects the
-/// injected dialer inside [`parse_proxy_with_dialer`]
+/// The one override is `is_dialer_proxy_non_transparent` →
+/// `!inner.support_udp()`: the #969 fail-closed verdict is exactly the
+/// `support_udp` condition, matching `DialerProxyAdapter`'s
+/// `!transparent`. An injected leaf whose chained transport carries UDP
+/// — hysteria2 over the front's UDP association, WireGuard, or anytls
+/// `udp: true` (UoT rides the chained TCP session) — is *not*
+/// non-transparent: its UDP flow rides the declared chain, so there is
+/// nothing to fail closed on. `type: direct` (and `ss` with an external
+/// SIP003 plugin) rejects the injected dialer inside
+/// [`parse_proxy_with_dialer`]
 /// (`reject_unthreaded_dialer`) and lands in the relay-based
 /// `DialerProxyAdapter` fallback instead, which computes its own
 /// transparency — so reaching this wrapper already proves the inner owns a
-/// server transport. A UDP flow matched to a rule targeting this node then
-/// fails closed on the match instead of sliding to a later rule the way a
-/// plain `udp: false` node does.
+/// server transport. A UDP flow matched to a rule targeting a
+/// UDP-incapable chained node then fails closed on the match instead of
+/// sliding to a later rule the way a plain `udp: false` node does.
 pub struct ChainedProxy {
     inner: Arc<dyn Proxy>,
 }
@@ -296,10 +302,16 @@ impl Proxy for ChainedProxy {
         self.inner.as_any()
     }
 
-    /// The marker's single verdict — see the struct doc for why injection
-    /// already proves non-transparency (issue #969).
+    /// The marker's single verdict (issue #969): an injected leaf is the
+    /// non-transparent chain shape only when the chain cannot carry UDP
+    /// — `!inner.support_udp()`, the same condition
+    /// `DialerProxyAdapter` answers with `!transparent` and the only case
+    /// the route probe consults this marker for. A leaf whose chained
+    /// transport does carry UDP (injected hysteria2/WireGuard, anytls
+    /// `udp: true`) answers `false` so a group pick forwarding this
+    /// verdict stays truthful.
     fn is_dialer_proxy_non_transparent(&self) -> bool {
-        true
+        !self.inner.support_udp()
     }
 
     fn members(&self) -> Option<Vec<String>> {
@@ -678,9 +690,21 @@ pub fn parse_proxy_with_dialer(
         }
         #[cfg(feature = "anytls")]
         "anytls" => {
-            reject_unthreaded_dialer(name, "anytls", dialer)?;
             let adapter = parse_anytls(name, config)?;
-            Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
+            // WireGuard-shaped injection: a proxy dialer becomes the
+            // client's per-session transport dialer — the raw chained
+            // stream the client layers its own TLS + session pool on — so
+            // injected sessions pool like direct ones and `udp: true` UoT
+            // rides the chain. The no-op `DirectDialer` keeps the built-in
+            // connect path.
+            let adapter = if dialer.is_proxy() {
+                adapter.with_dialer(Arc::clone(dialer))
+            } else {
+                adapter
+            };
+            Ok(Arc::new(
+                WrappedProxy::new(Box::new(adapter)).dialing_through(config, dialer),
+            ))
         }
         #[cfg(feature = "hysteria2")]
         "hysteria2" => {
@@ -783,14 +807,13 @@ fn is_external_sip003_plugin(plugin: Option<&str>) -> bool {
 
 /// Reject a `ProxyDialer` for adapter types that do not thread it through.
 ///
-/// `anytls` dials via `meow_common::connect_tcp_host` internally; `direct`
-/// is a raw egress by definition. Neither can honour an injected dialer,
-/// so accepting one here would silently drop the user's `dialer-proxy` and
-/// egress from the real source path — a Class A silent divergence
-/// (ADR-0002).  Returning `Err` instead lets the `dialer-proxy` leaf parse
-/// fall back to the relay-based `DialerProxyAdapter` wrapper, which fails
-/// loudly at dial time rather than pretending the chain was applied or
-/// dialing direct.
+/// `direct` is a raw egress by definition — a resolver-threaded dial
+/// belongs on the real source path — so accepting an injected dialer here
+/// would silently drop the user's `dialer-proxy` and egress from the real
+/// source path — a Class A silent divergence (ADR-0002).  Returning `Err`
+/// instead lets the `dialer-proxy` leaf parse fall back to the
+/// relay-based `DialerProxyAdapter` wrapper, which fails loudly at dial
+/// time rather than pretending the chain was applied or dialing direct.
 ///
 /// A `DirectDialer` is always accepted: it is the no-op default, so nothing
 /// is lost by ignoring it.
@@ -5030,6 +5053,41 @@ tls: true
         assert!(parse_proxy(&on).unwrap().support_udp());
     }
 
+    /// `dialer-proxy` injects into anytls (Batch 2): the vendored client
+    /// threads every session's transport through the chained dialer, so
+    /// the parse accepts it and `dialing_through` records the hop. A
+    /// `NamedProxyDialer` reports `is_proxy()` without resolving — target
+    /// lookup only happens at dial time.
+    #[cfg(feature = "anytls")]
+    #[tokio::test]
+    async fn parse_anytls_accepts_dialer_proxy_injection() {
+        use meow_proxy::dialer::{DialerTarget, NamedProxyDialer, ProxyRegistry};
+
+        let registry = ProxyRegistry::default();
+        let dialer: Arc<dyn meow_proxy::dialer::TcpDialer> =
+            Arc::new(NamedProxyDialer::new(DialerTarget::new("front", &registry)));
+
+        let cfg = anytls_config(&format!("{ANYTLS_BASE}dialer-proxy: front\n"));
+        let chained = super::parse_proxy_with_dialer(&cfg, &dialer, false)
+            .expect("anytls must accept an injected dialer");
+        assert!(chained.has_configured_dialer());
+
+        // `udp: true` still advertises UDP over the chain — UoT rides the
+        // same chained session, so it only needs the front to carry TCP.
+        let cfg_udp = anytls_config(&format!("{ANYTLS_BASE}udp: true\ndialer-proxy: front\n"));
+        let chained_udp = super::parse_proxy_with_dialer(&cfg_udp, &dialer, false)
+            .expect("anytls + udp must accept an injected dialer");
+        assert!(chained_udp.support_udp());
+        assert!(chained_udp.has_configured_dialer());
+
+        // The no-op `DirectDialer` leaves the plain parse untouched: no
+        // chain is reported for an unchained node.
+        let direct: Arc<dyn meow_proxy::dialer::TcpDialer> =
+            Arc::new(meow_proxy::dialer::DirectDialer);
+        let plain = super::parse_proxy_with_dialer(&cfg, &direct, false).expect("unchained parse");
+        assert!(!plain.has_configured_dialer());
+    }
+
     #[cfg(feature = "anytls")]
     const ANYTLS_BASE: &str =
         "name: jp\ntype: anytls\nserver: 1.2.3.4\nport: 443\npassword: secret\n";
@@ -5602,9 +5660,12 @@ tls: true
             "as_any must reach the inner SelectorGroup, not the marker"
         );
 
-        // The marker's single verdict (issue #969): the inner group
-        // answers `false` by default, the chained entry always `true`.
-        assert!(chained.is_dialer_proxy_non_transparent());
+        // The marker's single verdict (issue #969): the chained entry
+        // reports `!inner.support_udp()` — this inner advertises UDP, so
+        // the marker is `false` (a UDP flow rides the chain; there is
+        // nothing to fail closed on). A UDP-incapable inner marks `true`
+        // — see the leaf-level tests for that half.
+        assert!(!chained.is_dialer_proxy_non_transparent());
     }
 
     // ─── Load-balance strategy parser (F1-F7) ────────────────────────────────

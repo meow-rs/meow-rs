@@ -4,7 +4,8 @@ use crate::client::{SessionPool, SessionPoolConfig};
 use crate::padding::{PaddingFactory, SharedPaddingFactory};
 use crate::session::{Session, SessionHeartbeatConfig};
 use crate::util::{
-    AnyTlsError, Result, TlsConnect, configure_tcp_stream, hash_password, send_authentication,
+    AnyTlsError, Result, TlsConnect, TransportDialer, configure_tcp_stream, hash_password,
+    send_authentication,
 };
 use bytes::Bytes;
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -14,11 +15,19 @@ use std::sync::Arc;
 ///
 /// TLS is supplied by the host through [`TlsConnect`]; the client dials TCP,
 /// hands the socket to the hook, and speaks AnyTLS over whatever stream
-/// comes back.
+/// comes back. With a [`TransportDialer`] installed the same handshake runs
+/// over the chained stream that dialer returns (meow-rs `dialer-proxy`).
 pub struct Client {
     password_hash: [u8; 32],
     server_addr: String,
     tls: Arc<dyn TlsConnect>,
+    /// Per-client transport dialer (meow-rs `dialer-proxy` chaining).
+    /// `None` dials the server with the global [`crate::util::TcpDialer`] /
+    /// connect path; `Some` hands session establishment to the injected
+    /// dialer. Because it is fixed per client, every session the pool
+    /// hands out was established the same way — pooled sessions can never
+    /// be mixed across the two transport classes.
+    transport_dialer: Option<Arc<dyn TransportDialer>>,
     /// Padding factory in force for this server, shared with every session the
     /// client opens so an `UpdatePaddingScheme` push outlives the session that
     /// received it.
@@ -61,10 +70,26 @@ impl Client {
             password_hash,
             server_addr,
             tls,
+            transport_dialer: None,
             padding: padding.into_shared(),
             session_pool,
             pool_config,
         }
+    }
+
+    /// Install the per-client [`TransportDialer`] sessions are
+    /// established through — meow-rs's `dialer-proxy` edge: the dialer
+    /// returns an already-connected stream tunnelled through the front
+    /// proxy, and the client runs its usual TLS handshake
+    /// ([`TlsConnect::connect_stream`]) plus AnyTLS auth/session on top.
+    ///
+    /// Call before the first dial. Because the field is fixed for the
+    /// client's life, the session pool carries exactly one transport
+    /// class — chained sessions pool and reuse exactly like direct ones,
+    /// and a pooled session can never be handed out against the other
+    /// path. `reset_sessions` flushes either class identically.
+    pub fn set_transport_dialer(&mut self, dialer: Arc<dyn TransportDialer>) {
+        self.transport_dialer = Some(dialer);
     }
 
     /// Create a new stream by establishing or reusing a session
@@ -244,74 +269,133 @@ impl Client {
         tracing::debug!("[Client] Creating new session to {}", self.server_addr);
         let generation = self.session_pool.generation();
 
-        // Establish TCP connection
-        tracing::trace!(
-            "[Client] Connecting TCP to {} (this may trigger DNS lookup)",
-            self.server_addr
-        );
-        // Dial via the socket-protect helper: an installed `TcpDialer`
-        // (host-app bridge, e.g. meow-common's resolver + protector stack)
-        // takes the whole resolve+connect path; otherwise the fallback
-        // applies the `SocketProtector` (Android) around a system-resolver
-        // dial, degrading to plain `TcpStream::connect` off-Android. The
-        // dialer hook matters inside VPN apps whose system DNS is a fake-IP
-        // server — `lookup_host` there returns unroutable fake IPs.
-        let tcp_stream = match crate::util::socket_protect::connect_tcp_addr(&self.server_addr)
-            .await
-        {
-            Ok(stream) => stream,
-            Err(e) => {
-                tracing::error!("[Client] Failed to connect to {}: {}", self.server_addr, e);
-
-                // Provide helpful error messages
-                let error_str = format!("{}", e);
-                if error_str.contains("lookup")
-                    || error_str.contains("DNS")
-                    || error_str.contains("Try again")
-                {
-                    tracing::error!("[Client] DNS resolution failed for '{}'", self.server_addr);
-                    tracing::error!("[Client] Troubleshooting steps:");
+        // Establish the transport to the server, then run TLS on it. Two
+        // shapes produce the same `Box<dyn AsyncStream>` for
+        // `session_over_transport`:
+        //
+        // - the default dial below (global `TcpDialer` / system connect +
+        //   protector) yields a `TcpStream`, handed to
+        //   `TlsConnect::connect`;
+        // - an injected `TransportDialer` (meow-rs `dialer-proxy`) yields
+        //   an already-connected chained stream, handed to
+        //   `TlsConnect::connect_stream` — TLS stays the client's so SNI,
+        //   ALPN, pins and fingerprints are identical on both paths, and
+        //   the session is pooled just like a direct one.
+        let tls_stream = match &self.transport_dialer {
+            Some(dialer) => {
+                tracing::trace!(
+                    "[Client] Dialling {} through the transport dialer",
+                    self.server_addr
+                );
+                let (host, port) = crate::util::socket_protect::split_host_port(&self.server_addr)
+                    .ok_or_else(|| {
+                        AnyTlsError::Protocol(format!(
+                            "transport dialer: cannot split server address {}",
+                            self.server_addr
+                        ))
+                    })?;
+                // The injected dialer owns reachability — resolution,
+                // binding, the chain itself — so the resolve/connect
+                // troubleshooting arm below does not apply here.
+                let transport = dialer.dial(host, port).await.map_err(|e| {
                     tracing::error!(
-                        "[Client]   1. Check if server address is correct: {}",
-                        self.server_addr
-                    );
-                    tracing::error!("[Client]   2. Try using IP address instead of hostname");
-                    tracing::error!(
-                        "[Client]   3. Test DNS: nslookup $(echo {} | cut -d: -f1)",
-                        self.server_addr
-                    );
-                    tracing::error!(
-                        "[Client]   4. Test TCP connection: nc -zv $(echo {} | cut -d: -f1) $(echo {} | cut -d: -f2)",
+                        "[Client] Transport dialer failed for {}: {}",
                         self.server_addr,
-                        self.server_addr
+                        e
                     );
-                } else if error_str.contains("Connection refused") {
-                    tracing::error!(
-                        "[Client] Connection refused. Server may not be running or not listening on {}",
-                        self.server_addr
-                    );
-                } else if error_str.contains("Connection timed out") {
-                    tracing::error!(
-                        "[Client] Connection timed out. Check network connectivity and firewall settings"
-                    );
-                }
+                    AnyTlsError::Io(e)
+                })?;
+                tracing::debug!(
+                    "[Client] Chained transport established to {}",
+                    self.server_addr
+                );
+                tracing::trace!("[Client] Starting TLS handshake over the chained stream");
+                self.tls.connect_stream(transport).await.map_err(|e| {
+                    tracing::error!("[Client] TLS handshake failed: {}", e);
+                    e
+                })?
+            }
+            None => {
+                tracing::trace!(
+                    "[Client] Connecting TCP to {} (this may trigger DNS lookup)",
+                    self.server_addr
+                );
+                // Dial via the socket-protect helper: an installed `TcpDialer`
+                // (host-app bridge, e.g. meow-common's resolver + protector stack)
+                // takes the whole resolve+connect path; otherwise the fallback
+                // applies the `SocketProtector` (Android) around a system-resolver
+                // dial, degrading to plain `TcpStream::connect` off-Android. The
+                // dialer hook matters inside VPN apps whose system DNS is a fake-IP
+                // server — `lookup_host` there returns unroutable fake IPs.
+                let tcp_stream = match crate::util::socket_protect::connect_tcp_addr(
+                    &self.server_addr,
+                )
+                .await
+                {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        tracing::error!(
+                            "[Client] Failed to connect to {}: {}",
+                            self.server_addr,
+                            e
+                        );
 
-                return Err(AnyTlsError::Io(e));
+                        // Provide helpful error messages
+                        let error_str = format!("{}", e);
+                        if error_str.contains("lookup")
+                            || error_str.contains("DNS")
+                            || error_str.contains("Try again")
+                        {
+                            tracing::error!(
+                                "[Client] DNS resolution failed for '{}'",
+                                self.server_addr
+                            );
+                            tracing::error!("[Client] Troubleshooting steps:");
+                            tracing::error!(
+                                "[Client]   1. Check if server address is correct: {}",
+                                self.server_addr
+                            );
+                            tracing::error!(
+                                "[Client]   2. Try using IP address instead of hostname"
+                            );
+                            tracing::error!(
+                                "[Client]   3. Test DNS: nslookup $(echo {} | cut -d: -f1)",
+                                self.server_addr
+                            );
+                            tracing::error!(
+                                "[Client]   4. Test TCP connection: nc -zv $(echo {} | cut -d: -f1) $(echo {} | cut -d: -f2)",
+                                self.server_addr,
+                                self.server_addr
+                            );
+                        } else if error_str.contains("Connection refused") {
+                            tracing::error!(
+                                "[Client] Connection refused. Server may not be running or not listening on {}",
+                                self.server_addr
+                            );
+                        } else if error_str.contains("Connection timed out") {
+                            tracing::error!(
+                                "[Client] Connection timed out. Check network connectivity and firewall settings"
+                            );
+                        }
+
+                        return Err(AnyTlsError::Io(e));
+                    }
+                };
+                configure_tcp_stream(&tcp_stream, &self.server_addr);
+
+                tracing::debug!(
+                    "[Client] TCP connection established to {}",
+                    self.server_addr
+                );
+
+                // Perform TLS handshake through the host-supplied hook
+                tracing::trace!("[Client] Starting TLS handshake");
+                self.tls.connect(tcp_stream).await.map_err(|e| {
+                    tracing::error!("[Client] TLS handshake failed: {}", e);
+                    e
+                })?
             }
         };
-        configure_tcp_stream(&tcp_stream, &self.server_addr);
-
-        tracing::debug!(
-            "[Client] TCP connection established to {}",
-            self.server_addr
-        );
-
-        // Perform TLS handshake through the host-supplied hook
-        tracing::trace!("[Client] Starting TLS handshake");
-        let tls_stream = self.tls.connect(tcp_stream).await.map_err(|e| {
-            tracing::error!("[Client] TLS handshake failed: {}", e);
-            e
-        })?;
         tracing::debug!("[Client] TLS handshake successful");
 
         let session = self.session_over_transport(tls_stream).await?;
@@ -552,5 +636,99 @@ mod tests {
             !drained.is_empty(),
             "auth + settings + SYN bytes must have reached the peer"
         );
+    }
+
+    /// The injected [`crate::util::TransportDialer`] path (meow-rs
+    /// `dialer-proxy`): the client dials the supplied chained stream —
+    /// never a `TcpStream` — runs `TlsConnect::connect_stream` on it, and
+    /// pools the session exactly like a direct one: a second open reuses
+    /// it without redialling, `reset_sessions` flushes it, and the next
+    /// open dials a fresh chained transport.
+    #[tokio::test]
+    async fn transport_dialer_sessions_pool_and_reset() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// Returns the client half of a duplex pair per dial and counts;
+        /// the peer half is retained so session writes never stall.
+        struct DuplexDialer {
+            dials: AtomicUsize,
+            peers: tokio::sync::Mutex<Vec<tokio::io::DuplexStream>>,
+        }
+
+        impl crate::util::TransportDialer for DuplexDialer {
+            fn dial<'a>(
+                &'a self,
+                host: &'a str,
+                port: u16,
+            ) -> crate::util::TransportDialFuture<'a> {
+                Box::pin(async move {
+                    assert_eq!((host, port), ("anytls.test", 443));
+                    self.dials.fetch_add(1, Ordering::SeqCst);
+                    let (client_half, peer_half) = tokio::io::duplex(64 * 1024);
+                    self.peers.lock().await.push(peer_half);
+                    Ok(Box::new(client_half) as Box<dyn crate::util::SyncStream>)
+                })
+            }
+        }
+
+        /// Passthrough TLS over the chained stream — reaching
+        /// `connect_stream` (rather than `connect`) is itself part of the
+        /// assertion.
+        struct PlainTls;
+        impl TlsConnect for PlainTls {
+            fn connect(&self, _tcp: TcpStream) -> TlsConnectFuture<'_> {
+                Box::pin(async {
+                    Err(AnyTlsError::Protocol(
+                        "PlainTls: TcpStream path must not be reached".into(),
+                    ))
+                })
+            }
+
+            fn connect_stream(
+                &self,
+                stream: Box<dyn crate::util::SyncStream>,
+            ) -> TlsConnectFuture<'_> {
+                Box::pin(async move { Ok(Box::new(stream) as Box<dyn crate::util::AsyncStream>) })
+            }
+        }
+
+        let dialer = Arc::new(DuplexDialer {
+            dials: AtomicUsize::new(0),
+            peers: tokio::sync::Mutex::new(Vec::new()),
+        });
+        let mut client = Client::new(
+            "password",
+            "anytls.test:443".to_string(),
+            Arc::new(PlainTls),
+            PaddingFactory::default(),
+        );
+        client.set_transport_dialer(Arc::clone(&dialer) as Arc<dyn crate::util::TransportDialer>);
+
+        client
+            .create_proxy_stream(("example.com".into(), 443))
+            .await
+            .expect("the first stream opens over the injected dialer");
+        assert_eq!(dialer.dials.load(Ordering::SeqCst), 1);
+
+        // The chained session is pooled: a second stream reuses it
+        // without consulting the dialer again.
+        client
+            .create_proxy_stream(("example.com".into(), 443))
+            .await
+            .expect("the second stream reuses the pooled chained session");
+        assert_eq!(
+            dialer.dials.load(Ordering::SeqCst),
+            1,
+            "a pooled chained session must not redial the transport"
+        );
+
+        // `reset_sessions` flushes the pool whichever transport class it
+        // holds; the next stream establishes a fresh chained session.
+        client.reset_sessions();
+        client
+            .create_proxy_stream(("example.com".into(), 443))
+            .await
+            .expect("a post-reset stream opens a fresh session");
+        assert_eq!(dialer.dials.load(Ordering::SeqCst), 2);
     }
 }

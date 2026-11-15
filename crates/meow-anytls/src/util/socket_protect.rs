@@ -10,6 +10,12 @@
 //! call the installed protector before `connect()` / `bind()` so the very
 //! first SYN / UDP datagram already bypasses the tunnel.
 //!
+//! The module also hosts the two dialer hooks the client can reach its
+//! server through: [`TcpDialer`], a process-wide replacement for the
+//! direct resolve+connect path, and [`TransportDialer`], a per-client
+//! hook that returns an already-connected byte stream (e.g. tunnelled
+//! through another proxy for `dialer-proxy` chaining).
+//!
 //! The protector trait and global setter are compiled only on Android. On
 //! every other target [`connect_tcp`] / [`bind_udp`] degrade to the same
 //! plain tokio code path used historically — so call sites need no `cfg`
@@ -220,8 +226,34 @@ pub fn tcp_dialer() -> Option<std::sync::Arc<dyn TcpDialer>> {
     TCP_DIALER.read().ok().and_then(|g| g.clone())
 }
 
+/// The boxed future a [`TransportDialer`] resolves to the connected
+/// chained stream.
+pub type TransportDialFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = io::Result<Box<dyn crate::util::SyncStream>>> + Send + 'a>,
+>;
+
+/// Pluggable per-client transport dialer — the `dialer-proxy` chain's
+/// counterpart of [`TcpDialer`].
+///
+/// [`TcpDialer`] is the process-wide hook for *direct* reachability (the
+/// host's resolver + socket-protector stack) and still yields a
+/// `TcpStream`. A `TransportDialer` is installed on one
+/// [`Client`](crate::client::Client) and returns whatever already-
+/// connected byte stream the host built — typically a connection
+/// tunnelled through another proxy — so the return is a boxed
+/// [`SyncStream`](crate::util::SyncStream), not a socket. The client runs
+/// its TLS handshake and the AnyTLS session over it unchanged; pooling
+/// stays correct because the field is fixed per client, so a session
+/// pool never mixes transport classes.
+pub trait TransportDialer: Send + Sync {
+    /// Dial `host:port` and return the connected transport — raw bytes;
+    /// the client layers TLS on it through [`crate::util::TlsConnect`]
+    /// itself. `host` may be a hostname or an IP literal.
+    fn dial<'a>(&'a self, host: &'a str, port: u16) -> TransportDialFuture<'a>;
+}
+
 /// Split a `host:port` / `[v6]:port` address string.
-fn split_host_port(addr: &str) -> Option<(&str, u16)> {
+pub(crate) fn split_host_port(addr: &str) -> Option<(&str, u16)> {
     let (host, port) = addr.rsplit_once(':')?;
     let port: u16 = port.parse().ok()?;
     let host = host
