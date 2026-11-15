@@ -425,7 +425,7 @@ pub(super) async fn connect_addr_with_io(
 ) -> Result<ConnHandle> {
     // The socket's family follows the canonical server address.
     let server_addr = meow_common::canonical_socket_addr(server_addr);
-    let (socket, local) = match socket_io {
+    let (socket, local, mtu_hint) = match socket_io {
         Some(io) => {
             let local = io.local_addr_hint().unwrap_or_else(|| {
                 SocketAddr::new(
@@ -437,12 +437,19 @@ pub(super) async fn connect_addr_with_io(
                     0,
                 )
             });
+            // An injected endpoint knows its path's safe payload size:
+            // a front proxy's per-packet encapsulation on top of the
+            // stock 1452 send cap fragments the wire datagram (see
+            // [`SocketIo::mtu_hint`]), and a lost fragment drops the
+            // whole QUIC packet.
+            let mtu_hint = io.mtu_hint();
             (
                 DriverSocket::Io {
                     io,
                     peer: server_addr,
                 },
                 local,
+                mtu_hint,
             )
         }
         None => {
@@ -455,13 +462,16 @@ pub(super) async fn connect_addr_with_io(
             let socket = meow_common::bind_udp_for_peer(server_addr.ip())
                 .await
                 .map_err(Error::Io)?;
-            enlarge_recv_buffer(&socket);
+            meow_common::enlarge_udp_recv_buffer(&socket);
             let local = socket.local_addr().map_err(Error::Io)?;
-            (DriverSocket::Raw(socket), local)
+            (DriverSocket::Raw(socket), local, None)
         }
     };
 
     let mut config = super::tls::build_quiche_config(cfg)?;
+    if let Some(mtu) = mtu_hint {
+        config.set_max_send_udp_payload_size(mtu);
+    }
     let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
     for b in &mut scid {
         *b = rand::random();
@@ -471,54 +481,6 @@ pub(super) async fn connect_addr_with_io(
         .map_err(|e| Error::Quic(format!("connect start: {e}")))?;
 
     driver::spawn(cfg, socket, local, server_addr, conn, coalesce).await
-}
-
-/// The receive buffer quic-go asks for. The OS default (about 208 KiB on
-/// Linux) overflows whenever the driver falls a few milliseconds behind a
-/// fast download, and each dropped datagram is a loss the server must
-/// detect and resend.
-const RECV_BUFFER_BYTES: usize = 7 << 20;
-
-/// Grow the QUIC socket's receive buffer, best effort. Linux caps the
-/// request at `net.core.rmem_max`, so a privileged meow forces it past the
-/// cap as quic-go does; macOS rejects a size above `kern.ipc.maxsockbuf`, so
-/// the request halves until one is taken. The send buffer keeps the OS
-/// default: the driver does not pace, and a full send buffer is what holds
-/// its bursts back from the interface queue.
-fn enlarge_recv_buffer(socket: &tokio::net::UdpSocket) {
-    let sock = socket2::SockRef::from(socket);
-    let mut size = RECV_BUFFER_BYTES;
-    while size >= 1 << 20 && sock.set_recv_buffer_size(size).is_err() {
-        size /= 2;
-    }
-    // getsockopt reports twice the size taken on Linux.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    if sock
-        .recv_buffer_size()
-        .is_ok_and(|got| got < 2 * RECV_BUFFER_BYTES)
-    {
-        force_recv_buffer(socket);
-    }
-    tracing::debug!(size = ?sock.recv_buffer_size(), "hysteria2 socket receive buffer");
-}
-
-/// `SO_RCVBUFFORCE` needs `CAP_NET_ADMIN`, so it fails harmlessly (EPERM)
-/// for an unprivileged meow.
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn force_recv_buffer(socket: &tokio::net::UdpSocket) {
-    use std::os::fd::AsRawFd;
-    let size = RECV_BUFFER_BYTES as libc::c_int;
-    // SAFETY: the socket stays open for the call, and the option value is a
-    // c_int of the size passed.
-    unsafe {
-        libc::setsockopt(
-            socket.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_RCVBUFFORCE,
-            std::ptr::addr_of!(size).cast(),
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
-    }
 }
 
 struct ServerTarget {

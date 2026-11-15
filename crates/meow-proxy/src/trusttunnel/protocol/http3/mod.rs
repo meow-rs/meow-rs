@@ -208,7 +208,7 @@ impl QuicConnector {
         // The socket's family follows the canonical peer; a loopback peer is
         // left outside the TUN global-route interface binding.
         let peer = meow_common::canonical_socket_addr(peer);
-        let (socket, local) = match socket_io {
+        let (socket, local, mtu_hint) = match socket_io {
             Some(io) => {
                 let local = io.local_addr_hint().unwrap_or_else(|| {
                     SocketAddr::new(
@@ -220,12 +220,20 @@ impl QuicConnector {
                         0,
                     )
                 });
-                (Socket::Io { io, peer }, local)
+                // The front's per-packet encapsulation makes the stock
+                // send cap unsafe — same [`SocketIo::mtu_hint`] contract
+                // the hysteria2 client applies.
+                let mtu_hint = io.mtu_hint();
+                (Socket::Io { io, peer }, local, mtu_hint)
             }
             None => {
                 let socket = meow_common::bind_udp_for_peer(peer.ip()).await?;
+                // Same receive-buffer headroom as the hysteria2 raw path:
+                // a full 208 KiB default drops datagrams quiche must then
+                // detect and resend.
+                meow_common::enlarge_udp_recv_buffer(&socket);
                 let local = socket.local_addr()?;
-                (Socket::Raw(socket), local)
+                (Socket::Raw(socket), local, None)
             }
         };
         let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
@@ -237,6 +245,9 @@ impl QuicConnector {
                 .config
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(mtu) = mtu_hint {
+                config.set_max_send_udp_payload_size(mtu);
+            }
             quiche::connect(
                 self.server_name.as_deref(),
                 &quiche::ConnectionId::from_ref(&scid),

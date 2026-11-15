@@ -36,6 +36,9 @@ struct Peer {
     /// Datagrams the peer received that are too small to carry payload —
     /// ACK-only packets plus any other sub-100-byte control traffic.
     small_rx: Arc<AtomicUsize>,
+    /// Largest client datagram the peer has seen on the wire — the
+    /// injected-path send cap shows up here.
+    max_rx: Arc<AtomicUsize>,
     /// Datagrams the peer sent that are big enough to carry payload.
     big_tx: Arc<AtomicUsize>,
     /// Bytes to push down every established stream, taken (reset to 0) by the peer.
@@ -123,7 +126,12 @@ fn peer_on(
     let (auth_tx, auth_seen) = mpsc::unbounded_channel();
     let small_rx = Arc::new(AtomicUsize::new(0));
     let big_tx = Arc::new(AtomicUsize::new(0));
-    let (small_rx_task, big_tx_task) = (Arc::clone(&small_rx), Arc::clone(&big_tx));
+    let max_rx = Arc::new(AtomicUsize::new(0));
+    let (small_rx_task, big_tx_task, max_rx_task) = (
+        Arc::clone(&small_rx),
+        Arc::clone(&big_tx),
+        Arc::clone(&max_rx),
+    );
     let flood = Arc::new(AtomicUsize::new(0));
     let flood_task = Arc::clone(&flood);
     let trickle = Arc::new(AtomicBool::new(false));
@@ -312,6 +320,7 @@ fn peer_on(
             tokio::select! {
                 packet = socket.recv_from(&mut incoming) => {
                     let (n, from) = packet.unwrap();
+                    max_rx_task.fetch_max(n, Ordering::Relaxed);
                     if n < 100 {
                         small_rx_task.fetch_add(1, Ordering::Relaxed);
                         if ack_lag_task.load(Ordering::Relaxed) == u64::MAX {
@@ -332,6 +341,7 @@ fn peer_on(
         stop_writes,
         auth_seen,
         small_rx,
+        max_rx,
         big_tx,
         flood,
         trickle,
@@ -982,6 +992,61 @@ async fn quic_transport_rides_injected_socket_io() {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_slice(),
         &[(crate::dialer::UdpTarget::Addr(peer.addr), false)]
+    );
+}
+
+/// The injected endpoint's [`SocketIo::mtu_hint`] reaches quiche:
+/// `connect_addr_with_io` clamps `set_max_send_udp_payload_size` to the
+/// front-path cap, so on the wire a chained client's datagrams stay ≤1280
+/// instead of the raw-path 1452 that fragments once the front's
+/// per-packet overhead pushes them past a 1500 MTU.
+#[tokio::test]
+async fn injected_socket_mtu_hint_caps_client_datagrams() {
+    let peer = peer(true, Some(0), 16).await;
+    let dialer = Arc::new(BridgingDialer {
+        dials: std::sync::Mutex::new(Vec::new()),
+        conns: std::sync::Mutex::new(Vec::new()),
+    });
+    #[allow(
+        clippy::clone_on_ref_ptr,
+        reason = "the Arc<BridgingDialer> → Arc<dyn TcpDialer> unsize cannot ride Arc::clone(&_)"
+    )]
+    let dialer_dyn: Arc<dyn crate::dialer::TcpDialer> = dialer.clone();
+    let client = ReconnectableClient::with_dialer(
+        Config {
+            server_addr: peer.addr.to_string(),
+            server_name: "localhost".into(),
+            insecure: true,
+            fast_open: true,
+            ..Config::default()
+        },
+        dialer_dyn,
+    );
+
+    let mut stream = timeout(TEST_TIMEOUT, client.tcp_connect(TARGET))
+        .await
+        .unwrap()
+        .unwrap();
+    // Enough stream data to emit full-size datagrams; the peer records
+    // the largest client datagram it sees.
+    timeout(TEST_TIMEOUT, async {
+        stream.write_all(&[0x55; 64 * 1024]).await.unwrap();
+        stream.flush().await.unwrap();
+    })
+    .await
+    .unwrap();
+
+    timeout(TEST_TIMEOUT, async {
+        while peer.max_rx.load(Ordering::Relaxed) <= 1000 {
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the peer must see full-size client datagrams");
+    assert!(
+        peer.max_rx.load(Ordering::Relaxed) <= 1280,
+        "client datagrams on a front association must stay at the 1280 hint: {}",
+        peer.max_rx.load(Ordering::Relaxed)
     );
 }
 

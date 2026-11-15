@@ -307,6 +307,11 @@ impl TcpDialer for DirectDialer {
             };
             match udp.connect(remote).await {
                 Ok(()) => {
+                    // Same headroom the QUIC raw path gets: a chained QUIC
+                    // transport can ride this association, and a full
+                    // 208 KiB default receive buffer drops datagrams the
+                    // transport then sees as loss.
+                    meow_common::enlarge_udp_recv_buffer(&udp);
                     return Ok(Arc::new(ConnectedUdpConn {
                         socket: udp,
                         remote,
@@ -436,27 +441,53 @@ mod packet_conn_socket {
 
     use std::io;
     use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
 
     use meow_transport::datagram::SocketIo;
     use tokio::io::ReadBuf;
     use tokio::sync::mpsc;
-    use tokio_util::sync::PollSender;
 
     /// Datagram queue depth either way — sized like a socket buffer, not a
-    /// stream queue: a full queue drops a datagram and KCP retransmits.
-    const QUEUE: usize = 256;
+    /// stream queue: a full queue drops a datagram and the transport's own
+    /// loss recovery retransmits. 4096 × ~1400 B ≈ 5.7 MiB — the same order
+    /// of headroom the raw path gets from its enlarged kernel `SO_RCVBUF`.
+    const QUEUE: usize = 4096;
+
+    /// What an injected [`SocketIo::mtu_hint`] reports to the QUIC drivers:
+    /// the IPv6 minimum-link MTU. A front proxy's per-packet encapsulation
+    /// (an SS SIP022 header + AEAD tag is ~60 B, a chained QUIC transport's
+    /// own overhead more) sits on top of quiche's stock 1452 send cap —
+    /// past a 1500 path MTU the wire datagram fragments, and a single lost
+    /// fragment drops the whole QUIC packet. 1280 keeps datagram + front
+    /// overhead under any standards-compliant path MTU.
+    const FRONT_PATH_MTU: usize = 1280;
 
     pub struct PacketConnSocket {
-        /// `Mutex` only because `Receiver`/`PollSender` are `!Sync`;
-        /// `&mut` poll methods go through `get_mut`, never the lock.
+        /// `Mutex` only because `Receiver` is `!Sync`; the `&mut` poll
+        /// method goes through `get_mut`, never the lock.
         inbound: Mutex<mpsc::Receiver<Vec<u8>>>,
-        outbound: Mutex<PollSender<Vec<u8>>>,
+        /// Raw `try_send` side of the write pump's queue — deliberately not
+        /// a `PollSender`: `poll_reserve` on a full queue parked the
+        /// caller, which for the QUIC drivers is the single driver task —
+        /// freezing the inbound drain along with the send it was waiting
+        /// on, so the queue stayed full. A bounded queue that drops (like
+        /// a kernel socket buffer, like quic-go's `sendQueue.Add`) breaks
+        /// the deadlock: the transport's loss recovery resends what the
+        /// drop lost.
+        outbound: mpsc::Sender<Vec<u8>>,
+        /// Datagrams dropped by [`SocketIo::poll_send`] on a full outbound
+        /// queue, or reported as sent-then-lost — same scoping rule as the
+        /// hysteria2 driver's `dropped_udp`: per socket, never global.
+        dropped_tx: AtomicU64,
+        /// Datagrams the read pump dropped on a full inbound queue.
+        /// `Arc` — the pump task owns an increment side too.
+        dropped_rx: Arc<AtomicU64>,
         /// Aborted on drop: the read task parks inside `read_packet` and
         /// would otherwise outlive the socket, pinning the front-proxy UDP
         /// association open across KCP session churn. The write pump exits
-        /// on its own once the `PollSender` side closes — but only after
+        /// on its own once the `outbound` sender drops — but only after
         /// the in-flight `write_packet` completes, so a wedged front-proxy
         /// conn would pin it indefinitely; abort that one too.
         read_task: tokio::task::JoinHandle<()>,
@@ -472,6 +503,20 @@ mod packet_conn_socket {
 
     impl Drop for PacketConnSocket {
         fn drop(&mut self) {
+            // Final tally at association close — the powers-of-two log
+            // during the socket's life shows drops arriving; this shows
+            // how many it ended on.
+            let (rx, tx) = (
+                self.dropped_rx.load(Ordering::Relaxed),
+                self.dropped_tx.load(Ordering::Relaxed),
+            );
+            if rx > 0 || tx > 0 {
+                tracing::debug!(
+                    dropped_rx = rx,
+                    dropped_tx = tx,
+                    "packet conn socket closed with dropped datagrams"
+                );
+            }
             self.read_task.abort();
             self.write_task.abort();
         }
@@ -479,20 +524,37 @@ mod packet_conn_socket {
 
     impl PacketConnSocket {
         pub fn new(conn: Arc<dyn meow_common::ProxyPacketConn>, remote: SocketAddr) -> Self {
+            Self::with_queue(conn, remote, QUEUE)
+        }
+
+        /// `new` with an explicit queue depth — tests shrink the channels
+        /// to reach the drop path deterministically.
+        pub(super) fn with_queue(
+            conn: Arc<dyn meow_common::ProxyPacketConn>,
+            remote: SocketAddr,
+            queue: usize,
+        ) -> Self {
             let local_addr = conn
                 .local_addr()
                 .ok()
                 .filter(|addr| !addr.ip().is_unspecified());
-            let (in_tx, inbound) = mpsc::channel(QUEUE);
-            let (outbound, mut out_rx) = mpsc::channel::<Vec<u8>>(QUEUE);
+            let (in_tx, inbound) = mpsc::channel(queue);
+            let (outbound, mut out_rx) = mpsc::channel::<Vec<u8>>(queue);
 
+            let dropped_rx = Arc::new(AtomicU64::new(0));
             let reader = Arc::clone(&conn);
+            let read_dropped = Arc::clone(&dropped_rx);
             let read_task = tokio::spawn(async move {
                 let mut buf = vec![0u8; 65536];
-                // try_send drops on a full queue: KCP retransmits, same as
-                // a full kernel socket buffer upstream.
+                // try_send drops on a full queue: the transport retransmits,
+                // same as a full kernel socket buffer upstream.
                 while let Ok((n, _src)) = reader.read_packet(&mut buf).await {
-                    let _ = in_tx.try_send(buf[..n].to_vec());
+                    match in_tx.try_send(buf[..n].to_vec()) {
+                        Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            note_drop(&read_dropped, "read queue full");
+                        }
+                    }
                 }
                 let _ = reader.close();
             });
@@ -507,26 +569,68 @@ mod packet_conn_socket {
 
             Self {
                 inbound: Mutex::new(inbound),
-                outbound: Mutex::new(PollSender::new(outbound)),
+                outbound,
+                dropped_tx: AtomicU64::new(0),
+                dropped_rx,
                 read_task,
                 write_task,
                 local_addr,
             }
         }
+
+        /// Datagrams [`SocketIo::poll_send`] dropped on a full outbound
+        /// queue — the counter [`note_drop`] logs, mirroring the hysteria2
+        /// driver's `dropped_udp` telemetry.
+        #[cfg(test)]
+        pub(super) fn dropped_tx(&self) -> u64 {
+            self.dropped_tx.load(Ordering::Relaxed)
+        }
+
+        /// Datagrams the read pump dropped on a full inbound queue.
+        #[cfg(test)]
+        pub(super) fn dropped_rx(&self) -> u64 {
+            self.dropped_rx.load(Ordering::Relaxed)
+        }
+    }
+
+    /// Count a dropped datagram, logging at powers of two — the same
+    /// telemetry shape as hysteria2's `note_drop` (`udp.rs`): a saturated
+    /// association stays observable without flooding, and the counter is
+    /// scoped to one socket so a busy flow cannot mask a quiet one's drops.
+    fn note_drop(dropped: &AtomicU64, reason: impl std::fmt::Display) {
+        let n = dropped.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        if n.is_power_of_two() {
+            tracing::debug!(
+                dropped = n,
+                "packet conn socket: datagram dropped ({reason})"
+            );
+        }
     }
 
     impl SocketIo for PacketConnSocket {
-        fn poll_send(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
-            let sender = self.outbound.get_mut().unwrap();
-            match sender.poll_reserve(cx) {
-                // `send_item` after a successful reserve cannot fail to
-                // enqueue — the permit is already held.
-                Poll::Ready(Ok(())) => match sender.send_item(buf.to_vec()) {
-                    Ok(()) => Poll::Ready(Ok(buf.len())),
-                    Err(_) => Poll::Ready(Err(closed())),
-                },
-                Poll::Ready(Err(_)) => Poll::Ready(Err(closed())),
-                Poll::Pending => Poll::Pending,
+        fn poll_send(&mut self, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+            // A full queue is congestion, not a dead socket: drop the
+            // datagram as UDP would and let the transport's loss recovery
+            // resend — quic-go's `sendQueue.Add` contract. Returning
+            // `Pending` here instead was the deadlock: the QUIC driver's
+            // one task suspended on send backpressure could not run the
+            // inbound drain that would have let the queue empty.
+            //
+            // Skip the per-datagram copy when the queue is a known full —
+            // the `UdpSession::send` guard (hysteria2 `udp.rs`): a dropped
+            // receiver drains its queue and returns the permits, so
+            // `capacity() == 0` on a live channel really is full.
+            if self.outbound.capacity() == 0 && !self.outbound.is_closed() {
+                note_drop(&self.dropped_tx, "write queue full");
+                return Poll::Ready(Ok(buf.len()));
+            }
+            match self.outbound.try_send(buf.to_vec()) {
+                Ok(()) => Poll::Ready(Ok(buf.len())),
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    note_drop(&self.dropped_tx, "write queue full");
+                    Poll::Ready(Ok(buf.len()))
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => Poll::Ready(Err(closed())),
             }
         }
 
@@ -552,6 +656,13 @@ mod packet_conn_socket {
         /// path's `to` on the hysteria2 / trusttunnel-h3 injection paths.
         fn local_addr_hint(&self) -> Option<SocketAddr> {
             self.local_addr
+        }
+
+        /// Every injected endpoint carries a front proxy's per-packet
+        /// encapsulation, so the stock 1452 QUIC ceiling would fragment —
+        /// report [`FRONT_PATH_MTU`].
+        fn mtu_hint(&self) -> Option<usize> {
+            Some(FRONT_PATH_MTU)
         }
     }
 
@@ -2690,6 +2801,187 @@ mod tests {
         let mut rb3 = ReadBuf::new(&mut sink);
         let r = poll_fn(|cx| sock.poll_recv(cx, &mut rb3)).await;
         assert_eq!(r.unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
+    }
+
+    /// The send side's contract under congestion: a full outbound queue
+    /// *drops* the datagram — the transport retransmits it — and still
+    /// answers `Ready(Ok)`, never `Pending`. `PollSender::poll_reserve`
+    /// suspended the poll here, which for the single-task QUIC drivers
+    /// froze the inbound drain along with the send, so the queue could
+    /// never empty.
+    #[cfg(any(feature = "kcptun", feature = "hysteria2", feature = "trusttunnel-h3"))]
+    #[tokio::test]
+    async fn packet_conn_socket_drops_on_a_full_outbound_queue() {
+        use meow_transport::datagram::SocketIo;
+
+        /// A conn whose write path never completes: the write pump parks
+        /// on the first packet forever, so the bounded queue is the only
+        /// place sends can go.
+        struct StalledConn;
+        #[async_trait]
+        impl ProxyPacketConn for StalledConn {
+            async fn read_packet(&self, _buf: &mut [u8]) -> MeowResult<(usize, SocketAddr)> {
+                std::future::pending().await
+            }
+            async fn write_packet(&self, _buf: &[u8], _addr: &SocketAddr) -> MeowResult<usize> {
+                std::future::pending().await
+            }
+            fn local_addr(&self) -> MeowResult<SocketAddr> {
+                Ok("10.0.0.2:7777".parse().unwrap())
+            }
+            fn close(&self) -> MeowResult<()> {
+                Ok(())
+            }
+        }
+
+        let remote: SocketAddr = "10.0.0.1:7777".parse().unwrap();
+        let conn: Arc<dyn ProxyPacketConn> = Arc::new(StalledConn);
+        let mut sock = super::packet_conn_socket::PacketConnSocket::with_queue(conn, remote, 2);
+
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        // A pump parked on one write accepts at most queue + 1 packets;
+        // every other send must drop — and count — without suspending.
+        const SENDS: usize = 32;
+        for _ in 0..SENDS {
+            match sock.poll_send(&mut cx, b"ping") {
+                std::task::Poll::Ready(Ok(n)) => assert_eq!(n, 4),
+                other => {
+                    panic!("poll_send must drop, not suspend or fail, on a full queue: {other:?}")
+                }
+            }
+        }
+        assert!(
+            sock.dropped_tx() >= (SENDS - 3) as u64,
+            "dropped_tx must count every queue-full drop: {}",
+            sock.dropped_tx()
+        );
+    }
+
+    /// Once the write pump dies — a `write_packet` error ends the
+    /// association — `poll_send` reports `BrokenPipe` rather than
+    /// queueing into a channel nobody drains.
+    #[cfg(any(feature = "kcptun", feature = "hysteria2", feature = "trusttunnel-h3"))]
+    #[tokio::test]
+    async fn packet_conn_socket_send_reports_broken_pipe_when_the_write_pump_dies() {
+        use meow_transport::datagram::SocketIo;
+
+        struct FailingConn;
+        #[async_trait]
+        impl ProxyPacketConn for FailingConn {
+            async fn read_packet(&self, _buf: &mut [u8]) -> MeowResult<(usize, SocketAddr)> {
+                std::future::pending().await
+            }
+            async fn write_packet(&self, _buf: &[u8], _addr: &SocketAddr) -> MeowResult<usize> {
+                Err(MeowError::Proxy("write failed".into()))
+            }
+            fn local_addr(&self) -> MeowResult<SocketAddr> {
+                Ok("10.0.0.2:7777".parse().unwrap())
+            }
+            fn close(&self) -> MeowResult<()> {
+                Ok(())
+            }
+        }
+
+        let remote: SocketAddr = "10.0.0.1:7777".parse().unwrap();
+        let conn: Arc<dyn ProxyPacketConn> = Arc::new(FailingConn);
+        let mut sock = super::packet_conn_socket::PacketConnSocket::with_queue(conn, remote, 2);
+
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        // The pump hasn't run yet on the first send — it queues fine.
+        assert!(matches!(
+            sock.poll_send(&mut cx, b"ping"),
+            std::task::Poll::Ready(Ok(4))
+        ));
+        // The pump takes it, hits the write error and exits — the next
+        // send sees the closed channel as BrokenPipe.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let std::task::Poll::Ready(Err(e)) = sock.poll_send(&mut cx, b"ping") {
+                    assert_eq!(e.kind(), std::io::ErrorKind::BrokenPipe);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a dead write pump must surface BrokenPipe");
+    }
+
+    /// The read pump's side of the same contract: an association flooding
+    /// faster than the consumer drains drops the excess — counted like
+    /// the outbound side — instead of growing memory unboundedly.
+    #[cfg(any(feature = "kcptun", feature = "hysteria2", feature = "trusttunnel-h3"))]
+    #[tokio::test]
+    async fn packet_conn_socket_read_pump_drops_on_a_full_inbound_queue() {
+        /// Answers every read with a fresh datagram — the pump then
+        /// out-produces an undrained queue. The yield keeps the
+        /// single-threaded test runtime scheduling the test task itself.
+        struct FloodingConn;
+        #[async_trait]
+        impl ProxyPacketConn for FloodingConn {
+            async fn read_packet(&self, buf: &mut [u8]) -> MeowResult<(usize, SocketAddr)> {
+                tokio::task::yield_now().await;
+                buf[0] = 0x55;
+                Ok((1, "10.0.0.1:7777".parse().unwrap()))
+            }
+            async fn write_packet(&self, buf: &[u8], _addr: &SocketAddr) -> MeowResult<usize> {
+                Ok(buf.len())
+            }
+            fn local_addr(&self) -> MeowResult<SocketAddr> {
+                Ok("10.0.0.2:7777".parse().unwrap())
+            }
+            fn close(&self) -> MeowResult<()> {
+                Ok(())
+            }
+        }
+
+        let conn: Arc<dyn ProxyPacketConn> = Arc::new(FloodingConn);
+        let sock = super::packet_conn_socket::PacketConnSocket::with_queue(
+            conn,
+            "10.0.0.1:7777".parse().unwrap(),
+            2,
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while sock.dropped_rx() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("an undrained read pump must drop and count");
+    }
+
+    /// An injected endpoint carries a front proxy's per-packet
+    /// encapsulation, so it reports the conservative front-path cap —
+    /// `connect_addr_with_io` clamps quiche's send size to it (the wire
+    /// behaviour is pinned in `driver_tests`).
+    #[cfg(any(feature = "kcptun", feature = "hysteria2", feature = "trusttunnel-h3"))]
+    #[tokio::test]
+    async fn packet_conn_socket_reports_the_front_path_mtu_hint() {
+        use meow_transport::datagram::SocketIo;
+
+        struct ParkedConn;
+        #[async_trait]
+        impl ProxyPacketConn for ParkedConn {
+            async fn read_packet(&self, _buf: &mut [u8]) -> MeowResult<(usize, SocketAddr)> {
+                std::future::pending().await
+            }
+            async fn write_packet(&self, buf: &[u8], _addr: &SocketAddr) -> MeowResult<usize> {
+                Ok(buf.len())
+            }
+            fn local_addr(&self) -> MeowResult<SocketAddr> {
+                Ok("10.0.0.2:7777".parse().unwrap())
+            }
+            fn close(&self) -> MeowResult<()> {
+                Ok(())
+            }
+        }
+
+        let conn: Arc<dyn ProxyPacketConn> = Arc::new(ParkedConn);
+        let sock = super::packet_conn_socket::PacketConnSocket::new(
+            conn,
+            "10.0.0.1:7777".parse().unwrap(),
+        );
+        assert_eq!(sock.mtu_hint(), Some(1280));
     }
 
     /// An unconnected-bind front conn reports `local_addr()` as

@@ -416,6 +416,10 @@ impl ProxyAdapter for DirectAdapter {
                 };
                 match socket.connect(addr).await {
                     Ok(()) => {
+                        // A chained QUIC transport can ride this
+                        // association — same receive-buffer headroom as
+                        // the QUIC raw path.
+                        meow_common::enlarge_udp_recv_buffer(&socket);
                         return Ok(Box::new(DirectPacketConn {
                             socket,
                             bound: Some(addr),
@@ -446,6 +450,7 @@ impl ProxyAdapter for DirectAdapter {
         let socket = meow_common::bind_udp_for_peer(peer)
             .await
             .map_err(MeowError::Io)?;
+        meow_common::enlarge_udp_recv_buffer(&socket);
         Ok(Box::new(DirectPacketConn {
             socket,
             bound: None,

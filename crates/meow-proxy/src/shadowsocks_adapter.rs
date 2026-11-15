@@ -1874,6 +1874,12 @@ impl ProxyAdapter for ShadowsocksAdapter {
             return Err(last_err
                 .unwrap_or_else(|| MeowError::Proxy("ss udp connect: no candidates".into())));
         };
+        // This association can end up carrying a chained QUIC transport
+        // (hy2/trusttunnel-h3 `dialer-proxy` dials a front's `dial_udp`):
+        // give its kernel receive queue the same headroom the QUIC raw
+        // path gets — a full 208 KiB default drops datagrams the
+        // transport then sees as loss.
+        meow_common::enlarge_udp_recv_buffer(&udp);
         let socket = ProxySocket::<TokioUdpDatagram>::from_socket(
             UdpSocketType::Client,
             Arc::clone(&self.core.context),

@@ -89,8 +89,10 @@ const UDP_SESSION_QUEUE: usize = 64;
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 /// Datagrams fed to quiche per socket wakeup before the driver flushes. One
 /// flush then acknowledges the whole batch, where a flush per datagram sent
-/// an ACK (and a syscall) for every packet of a download.
-const RECV_BATCH: usize = 32;
+/// an ACK (and a syscall) for every packet of a download. 128 keeps a
+/// saturated download draining the socket inside one wakeup — at ~1400 B a
+/// pass is ~180 KB, the same order as the queues feeding it.
+const RECV_BATCH: usize = 128;
 /// Commands handled per wakeup, for the same reason on the upload side.
 const CMD_BATCH: usize = 64;
 /// An ACK-only flush is held back until this many datagrams have been

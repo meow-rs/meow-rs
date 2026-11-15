@@ -38,6 +38,16 @@ pub trait SocketIo: Send + Sync {
     fn local_addr_hint(&self) -> Option<SocketAddr> {
         None
     }
+    /// The largest UDP payload this path should carry, if the endpoint
+    /// knows one. `None` — the default — leaves the caller's own ceiling
+    /// in place: a raw `UdpSocket` relies on PMTUD to discover the path's.
+    /// A tunneled endpoint reports a conservative cap when its per-packet
+    /// encapsulation makes the stock ceiling unsafe (a ~1452-byte QUIC
+    /// datagram plus a front proxy's header/AEAD overhead fragments at a
+    /// 1500 path MTU, and a lost fragment kills the whole datagram).
+    fn mtu_hint(&self) -> Option<usize> {
+        None
+    }
 }
 
 impl SocketIo for UdpSocket {
