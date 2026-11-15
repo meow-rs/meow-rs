@@ -48,9 +48,11 @@ impl Client {
         );
 
         // Step 1: Create a stream to the magic address, flushing the initial
-        // request (isConnect + target address) before the SYNACK wait — a
-        // sing-box inbound reads the request before it SYNACKs, so sending it
-        // after the stream is returned deadlocks (meow-rs issue #535).
+        // request (isConnect + target address) in the open's first write —
+        // a sing-box inbound reads the request before it SYNACKs (meow-rs
+        // issue #535), but the open no longer waits for SYNACK, so that
+        // ordering can no longer deadlock; the eager write is now just a
+        // latency measure.
         let initial_request = encode_initial_request(target_addr)?;
         let magic_destination = (UDP_OVER_TCP_MAGIC_ADDR.to_string(), 0);
         let (stream, _session) = self

@@ -9,7 +9,6 @@ use crate::util::{
 use bytes::Bytes;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
-use tokio::time::Duration;
 
 /// Client manages connections to AnyTLS servers
 ///
@@ -79,15 +78,13 @@ impl Client {
     }
 
     /// Create a new stream like [`Client::create_proxy_stream`], but write
-    /// `payload` to the wire right after the destination address, **before**
-    /// waiting for SYNACK.
+    /// `payload` to the wire right after the destination address.
     ///
-    /// Required for udp-over-tcp: sing-box's anytls inbound reads the UoT
+    /// Used for udp-over-tcp: sing-box's anytls inbound reads the UoT
     /// request inside `RouteConnectionEx` and only reports handshake success
-    /// (SYNACK) once it has it, so a client that returns the stream first and
-    /// writes the request later deadlocks — client waits SYNACK, server waits
-    /// request (meow-rs issue #535). Servers that SYNACK unconditionally are
-    /// unaffected either way.
+    /// (SYNACK) once it has it (meow-rs issue #535). Opening no longer waits
+    /// for SYNACK, so that ordering can no longer deadlock; the eager write
+    /// just keeps the request in the stream's first flush.
     pub async fn create_proxy_stream_with_payload(
         &self,
         destination: (String, u16),
@@ -108,8 +105,8 @@ impl Client {
     }
 
     /// Open a proxy stream on an already-established session: open the
-    /// stream, write the SOCKS5-form destination, flush the optional eager
-    /// payload, and wait for SYNACK.
+    /// stream, write the SOCKS5-form destination and the optional eager
+    /// payload, and return without waiting for SYNACK.
     async fn open_proxy_stream(
         session: &Arc<Session>,
         destination: (String, u16),
@@ -118,10 +115,7 @@ impl Client {
         // Open a new stream in the session
         let (stream, synack_rx) = session.open_stream().await?;
         let mut guard = crate::session::stream::OpeningStreamGuard::new(Arc::clone(&stream));
-        tracing::debug!(
-            "[Client] Opened stream {} in session, waiting for SYNACK",
-            stream.id()
-        );
+        tracing::debug!("[Client] Opened stream {} in session", stream.id());
 
         // Write destination address to stream (SOCKS5 format)
         // Use session's write_data_frame to send data without needing to unwrap Arc<Stream>
@@ -187,8 +181,8 @@ impl Client {
         );
 
         // Eager payload (e.g. the udp-over-tcp request) goes out in its own
-        // frame, still ahead of the SYNACK wait — same byte order on the
-        // wire as the reference client's lazy first write.
+        // frame — same byte order on the wire as the reference client's
+        // lazy first write.
         if let Some(payload) = payload
             && !payload.is_empty()
         {
@@ -199,49 +193,24 @@ impl Client {
             );
             session.write_data_frame(stream_id, payload).await?;
         }
+        // Hand the stream back now rather than after SYNACK, as the
+        // reference clients do (anytls-go / sing-anytls / mihomo
+        // `CreateProxy`: write the address, return the conn). Waiting here
+        // made every stream pay one extra round trip before the caller
+        // could send its first byte. A refused open still closes the
+        // stream: the session's SynAck arm evicts and closes it on an
+        // error payload, so the caller's next read sees EOF and its next
+        // write fails; the `open_stream` watchdog bounds a silent peer
+        // only for v2+ sessions at sid >= 2 — any SynAck disarms it, so a
+        // sid-1 or sibling-disarmed open has no session-level bound
+        // (upstream `synDone` parity).
+        guard.disarm();
+        drop(synack_rx);
         tracing::debug!(
-            "[Client] Waiting for SYNACK from server for stream {}...",
+            "[Client] Stream {} opened, not waiting for SYNACK",
             stream_id
         );
-
-        // Wait for SYNACK with timeout (30 seconds default)
-        const DEFAULT_SYNACK_TIMEOUT: Duration = Duration::from_secs(30);
-
-        match tokio::time::timeout(DEFAULT_SYNACK_TIMEOUT, synack_rx).await {
-            Ok(Ok(Ok(()))) => {
-                guard.disarm();
-                tracing::debug!(
-                    "[Client] SYNACK received for stream {} - stream ready",
-                    stream_id
-                );
-                Ok(stream)
-            }
-            Ok(Ok(Err(e))) => {
-                tracing::error!("[Client] SYNACK error for stream {}: {}", stream_id, e);
-                let error_msg = e.to_string();
-                let error = AnyTlsError::Protocol(error_msg.clone());
-                stream.close_with_error(error);
-                Err(AnyTlsError::Protocol(error_msg))
-            }
-            Ok(Err(_)) => {
-                tracing::error!("[Client] SYNACK channel closed for stream {}", stream_id);
-                let error = AnyTlsError::Protocol("SYNACK channel closed".into());
-                stream.close_with_error(error);
-                Err(AnyTlsError::Protocol("SYNACK channel closed".into()))
-            }
-            Err(_) => {
-                tracing::error!(
-                    "[Client] SYNACK timeout for stream {} after {}s",
-                    stream_id,
-                    DEFAULT_SYNACK_TIMEOUT.as_secs()
-                );
-                let error_msg =
-                    format!("SYNACK timeout after {}s", DEFAULT_SYNACK_TIMEOUT.as_secs());
-                let error = AnyTlsError::Protocol(error_msg.clone());
-                stream.close_with_error(error);
-                Err(AnyTlsError::Protocol(error_msg))
-            }
-        }
+        Ok(stream)
     }
 
     /// Create a new stream by establishing or reusing a session
@@ -434,9 +403,9 @@ impl Client {
     /// caller owns the returned `Arc<Session>` and should close it when the
     /// stream is dropped.
     ///
-    /// Cancellation-safe: the host's dial timeout (5 s) drops this future
-    /// well inside the 30 s SYNACK wait, so the guard — not the `Err`
-    /// branch — is what closes the session on the common abort path.
+    /// Cancellation-safe: if the host's dial timeout (5 s) drops this future
+    /// mid-open, the guard — not the `Err` branch — is what closes the
+    /// session.
     pub async fn create_proxy_stream_on_tls<S>(
         &self,
         tls_stream: S,
@@ -524,6 +493,7 @@ mod tests {
     use crate::util::{AnyTlsError, TlsConnectFuture};
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpStream;
+    use tokio::time::Duration;
 
     /// `create_proxy_stream_on_tls` never touches the TLS hook (the caller
     /// supplies an already-handshaken stream), so a stub suffices.
@@ -536,10 +506,11 @@ mod tests {
     }
 
     /// Regression: a cancelled unpooled open must close its session — and
-    /// with it the transport. The dial timeout drops the open future while
-    /// it is parked in the 30 s SYNACK wait; without `SessionCloseGuard`
-    /// the session's recv/writer/heartbeat tasks keep it (and the whole
-    /// relay leg underneath) alive indefinitely.
+    /// with it the transport. The dial timeout can drop the open future
+    /// after `start_client` has spawned the session's recv/writer/heartbeat
+    /// tasks but before the stream is handed back (the SETTINGS/SYN/address
+    /// writes); without `SessionCloseGuard` those tasks keep the session
+    /// (and the whole relay leg underneath) alive indefinitely.
     #[tokio::test]
     async fn cancelled_unpooled_open_closes_session_and_transport() {
         let client = Client::new(
@@ -554,15 +525,18 @@ mod tests {
             let open = client.create_proxy_stream_on_tls(tls_half, ("example.com".into(), 443));
             tokio::pin!(open);
 
-            // Drive the open until handshake bytes reach the peer — the
-            // session has started and the open is now parked in (or about
-            // to enter) the SYNACK wait, i.e. inside the guarded window.
+            // Drive the open until handshake bytes reach the peer, then drop
+            // it while it is still writing the session/stream setup. The open
+            // no longer parks on a 30 s SYNACK wait and can in principle
+            // complete, so `biased` keeps `peer.read` first in poll order —
+            // it wins whenever handshake bytes can arrive, as intended.
             let mut first = [0u8; 16];
             tokio::select! {
-                _res = &mut open => panic!("open completed unexpectedly"),
+                biased;
                 res = peer.read(&mut first) => {
                     res.expect("peer must see the client's handshake bytes");
                 }
+                _res = &mut open => panic!("open completed unexpectedly"),
             }
             // `open` is dropped at scope end: cancellation.
         }

@@ -903,10 +903,10 @@ async fn anytls_auth_record_arrives_in_single_tls_record() {
     // Real adapter: it dials, completes the TLS handshake, and emits the
     // auth record. We don't care whether `dial_tcp` ultimately succeeds —
     // the regression server closes right after capturing auth, so the
-    // client's post-auth SYNACK wait may error. The assertion is purely
+    // client's post-auth session setup may error. The assertion is purely
     // server-side: did the whole auth come over in one TLS record? Run the
     // dial on a detached task so the test isn't held hostage to the
-    // client's post-auth timeout.
+    // client's post-auth error handling.
     //
     // Invariant this test depends on: a *freshly constructed* adapter has
     // an empty session pool, so the first `dial_tcp` opens a brand-new
@@ -977,19 +977,19 @@ async fn anytls_auth_record_arrives_in_single_tls_record() {
     dial_h.abort();
 }
 
-// ─── Regression: UoT request must precede the SYNACK wait (#535) ──────────
+// ─── Regression: UoT request rides the open's first flush (#535) ──────────
 //
 // sing-box's anytls inbound sequences a UoT stream as: read destination →
 // see the magic address → `uot.ReadRequest(conn)` blocks on the wire →
-// `RoutePacketConnectionEx` → `N.HandshakeSuccess` → SYNACK. A client that
-// returns the stream from `dial_udp` and writes the UoT request lazily with
-// the first datagram deadlocks against it: client waits SYNACK, server
-// waits request. The vendored `anytls_rs::server::Server` SYNACKs
-// unconditionally right after the destination (handler.rs), so the tests
-// above cannot pin this ordering. The fake below speaks just enough AnyTLS
-// — TLS, auth, the frame layer — to reproduce sing-box's ordering: it
-// withholds SYNACK until the UoT request has been consumed, then echoes
-// datagrams back.
+// `RoutePacketConnectionEx` → `N.HandshakeSuccess` → SYNACK. The open no
+// longer waits for SYNACK, so that ordering can no longer deadlock — but
+// the request still goes out with the first flush, a latency measure where
+// upstream sends it lazily with the first datagram (`uot.NewLazyConn`).
+// The vendored `anytls_rs::server::Server` SYNACKs unconditionally right
+// after the destination (handler.rs), so the tests above cannot pin this
+// ordering. The fake below speaks just enough AnyTLS — TLS, auth, the
+// frame layer — to reproduce sing-box's ordering: it withholds SYNACK
+// until the UoT request has been consumed, then echoes datagrams back.
 
 /// Bytes consumed by a SOCKS5-family `ATYP+ADDR+PORT` at the front of
 /// `buf`; `None` while more bytes are needed.
@@ -1114,9 +1114,24 @@ async fn run_singbox_uot_session(
                                 break;
                             };
                             let uot = is_uot_magic(&stream.buf[..n]);
+                            let port = u16::from_be_bytes([stream.buf[n - 2], stream.buf[n - 1]]);
                             stream.buf.drain(..n);
                             if uot {
                                 stream.stage = FakeUotStage::Request;
+                            } else if port == FAKE_REFUSED_PORT {
+                                // Outbound dial failed: SYNACK carries the
+                                // error message (protocol v2).
+                                write_anytls_frame(
+                                    &mut writer,
+                                    Command::SynAck,
+                                    stream_id,
+                                    b"connection refused",
+                                )
+                                .await?;
+                                stream.stage = FakeUotStage::Dead;
+                            } else if port == FAKE_SILENT_PORT {
+                                // A server that never SYNACKs (protocol v1).
+                                stream.stage = FakeUotStage::Dead;
                             } else {
                                 // Non-UoT destination: SYNACK immediately,
                                 // the vendored server's unconditional shape.
@@ -1167,6 +1182,11 @@ async fn run_singbox_uot_session(
     }
 }
 
+/// Destination port the fake refuses with an error SYNACK.
+const FAKE_REFUSED_PORT: u16 = 9;
+/// Destination port the fake never SYNACKs, like a protocol v1 server.
+const FAKE_SILENT_PORT: u16 = 7;
+
 /// Start the sing-box-ordered fake AnyTLS server; returns its bound addr.
 async fn start_singbox_uot_server(
     cert_der: rustls::pki_types::CertificateDer<'static>,
@@ -1192,11 +1212,11 @@ async fn start_singbox_uot_server(
     (addr, h)
 }
 
-/// Regression for issue #535: `dial_udp` must put the UoT request on the
-/// wire before it waits for SYNACK. Under the old lazy-request shape the
-/// server below withholds SYNACK forever (its UoT-request read never
-/// completes), the dial stalls until the outer deadline, and this test
-/// fails at the 5-second timeout — the exact deadlock sing-box produced.
+/// Issue #535 ordering, kept: `dial_udp` puts the UoT request on the wire
+/// in the open's first flush. The open no longer waits for SYNACK, so the
+/// request-gated fake below can no longer deadlock the dial — what this
+/// pins now is the wire-order interop: the request lands ahead of the
+/// first datagram, the fake SYNACKs on consuming it, then echoes.
 #[tokio::test]
 async fn anytls_udp_survives_singbox_synack_after_uot_request_ordering() {
     install_crypto_provider();
@@ -1221,7 +1241,7 @@ async fn anytls_udp_survives_singbox_synack_after_uot_request_ordering() {
         adapter.dial_udp(&udp_metadata(target)),
     )
     .await
-    .expect("dial_udp deadlocks while SYNACK is gated on the uot request")
+    .expect("dial_udp must not stall on a request-gated SYNACK")
     .expect("dial_udp must succeed against sing-box-ordered SYNACK");
 
     timeout(T, conn.write_packet(b"ping", &target))
@@ -1279,6 +1299,83 @@ async fn anytls_tcp_gets_immediate_synack_from_singbox_ordered_fake() {
         .expect("tcp write must not stall")
         .expect("tcp write must succeed");
     conn.flush().await.unwrap();
+}
+
+fn tcp_metadata(port: u16) -> Metadata {
+    Metadata {
+        network: Network::Tcp,
+        host: smol_str::SmolStr::from("192.0.2.2"),
+        dst_ip: Some("192.0.2.2".parse().unwrap()),
+        dst_port: port,
+        ..Default::default()
+    }
+}
+
+/// `dial_tcp` hands the stream back without waiting for SYNACK, like the
+/// reference clients (mihomo / sing-anytls `CreateProxy`), so a server that
+/// never SYNACKs (protocol v1) neither stalls the dial nor blocks the first
+/// write. Waiting cost every stream one extra round trip.
+#[tokio::test]
+async fn anytls_tcp_dial_does_not_wait_for_synack() {
+    install_crypto_provider();
+
+    let (cert, key) = self_signed_cert();
+    let (server_addr, _server_h) = start_singbox_uot_server(cert, key).await;
+    let adapter = AnytlsAdapter::new(
+        "test-anytls-tcp-no-synack",
+        &server_addr.ip().to_string(),
+        server_addr.port(),
+        PASSWORD,
+        Some("localhost"),
+        true,
+        true,
+    )
+    .expect("adapter must build");
+
+    let mut conn = timeout(T, adapter.dial_tcp(&tcp_metadata(FAKE_SILENT_PORT)))
+        .await
+        .expect("dial_tcp must not wait for a SYNACK that never comes")
+        .expect("dial_tcp must succeed");
+    timeout(T, conn.write_all(b"GET / HTTP/1.0\r\n\r\n"))
+        .await
+        .expect("tcp write must not stall")
+        .expect("tcp write must succeed");
+    conn.flush().await.unwrap();
+}
+
+/// A SYNACK carrying an error (the server's outbound dial failed) arrives
+/// after `dial_tcp` returned; it must close the stream so the caller's
+/// read ends promptly instead of hanging — mihomo surfaces it the same way,
+/// on the next read.
+#[tokio::test]
+async fn anytls_tcp_error_synack_ends_the_stream() {
+    install_crypto_provider();
+
+    let (cert, key) = self_signed_cert();
+    let (server_addr, _server_h) = start_singbox_uot_server(cert, key).await;
+    let adapter = AnytlsAdapter::new(
+        "test-anytls-tcp-refused",
+        &server_addr.ip().to_string(),
+        server_addr.port(),
+        PASSWORD,
+        Some("localhost"),
+        true,
+        true,
+    )
+    .expect("adapter must build");
+
+    let mut conn = timeout(T, adapter.dial_tcp(&tcp_metadata(FAKE_REFUSED_PORT)))
+        .await
+        .expect("dial_tcp must not stall")
+        .expect("dial_tcp returns before the error SYNACK arrives");
+    let mut buf = [0u8; 16];
+    let read = timeout(T, conn.read(&mut buf))
+        .await
+        .expect("an error SYNACK must end the stream, not leave the read hanging");
+    assert!(
+        matches!(read, Ok(0) | Err(_)),
+        "a refused stream must not yield data: {read:?}"
+    );
 }
 
 /// Issue #570 — `connect_over` must apply the adapter's TLS layer to the

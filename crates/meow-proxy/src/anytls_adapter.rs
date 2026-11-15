@@ -266,11 +266,11 @@ impl ProxyAdapter for AnytlsAdapter {
     ///
     /// Mirrors mihomo `adapter/outbound/anytls.go: ListenPacketContext`: a
     /// plain proxy stream to the magic destination, then sing-box's `uot`
-    /// framing on top of it. The uot request is flushed on the open path,
-    /// ahead of the SYNACK wait — sing-box's inbound reads the request before
-    /// it reports handshake success, so sending it lazily with the first
-    /// datagram (upstream's `uot.NewLazyConn` shape) deadlocks against
-    /// sing-box (issue #535).
+    /// framing on top of it. The uot request rides the open's first flush:
+    /// sing-box's inbound reads it before reporting handshake success
+    /// (issue #535), and since the open no longer waits for SYNACK that
+    /// ordering can no longer deadlock — the eager write is a latency
+    /// measure over upstream's lazy `uot.NewLazyConn` shape.
     async fn dial_udp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
         if !self.udp {
             return Err(MeowError::NotSupported(
@@ -1043,9 +1043,9 @@ mod tests {
         assert_eq!((cmd, stream_id), (Command::Push, id));
         // One datagram is one frame: uot addr + u16 length + payload, with no
         // request prefix — in production the request was already flushed by
-        // `create_proxy_stream_with_payload` before the SYNACK wait
-        // (issue #535); this harness builds the conn directly so no request
-        // exists on the wire here at all.
+        // `create_proxy_stream_with_payload` before the stream is handed
+        // back (issue #535); this harness builds the conn directly so no
+        // request exists on the wire here at all.
         assert_eq!(
             data,
             [UOT_ATYP_IPV4, 192, 0, 2, 2, 0, 53, 0, 3, b'u', b'd', b'p']
