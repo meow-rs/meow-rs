@@ -1133,6 +1133,12 @@ impl WgActor {
             // accepted flow. A proxy stream wants latency over tinygram
             // batching; the pump's `dial_tcp` sets the same.
             socket.set_nagle_enabled(false);
+            // Delayed-ACK at 1 ms — the server-side twin of `dial_tcp`'s
+            // `set_ack_delay`: smoltcp's 10 ms default holds each ACK for
+            // a full pass cadence, so an accepted request/response flow
+            // would eat it twice — first segment and FIN — on every
+            // connection.
+            socket.set_ack_delay(Some(smoltcp::time::Duration::from_millis(1)));
             if socket
                 .listen(IpListenEndpoint {
                     addr: None,
@@ -2857,12 +2863,19 @@ mod tests {
             .expect("the accept emitted a SYN-ACK");
         let server_isn = u32::from_be_bytes(syn_ack[24..28].try_into().unwrap());
 
-        // The listener placeholder carries TCP_NODELAY onto the
-        // accepted socket — same object, no accept queue — the
-        // server-side twin of the pump's dial-time `set_nagle_enabled`.
+        // The listener placeholder carries TCP_NODELAY and the 1 ms
+        // ACK delay onto the accepted socket — same object, no accept
+        // queue — the server-side twin of the pump's dial-time
+        // `set_nagle_enabled` / `set_ack_delay`.
+        let sock = actor.sockets.get::<tcp::Socket>(handle);
         assert!(
-            !actor.sockets.get::<tcp::Socket>(handle).nagle_enabled(),
+            !sock.nagle_enabled(),
             "accepted flow must inherit the listener's TCP_NODELAY"
+        );
+        assert_eq!(
+            sock.ack_delay(),
+            Some(smoltcp::time::Duration::from_millis(1)),
+            "accepted flow must inherit the listener's 1 ms ACK delay"
         );
 
         // The handshake ACK (client's SYN was seq 100) → Established.

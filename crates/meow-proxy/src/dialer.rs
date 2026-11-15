@@ -449,11 +449,22 @@ mod packet_conn_socket {
     use tokio::io::ReadBuf;
     use tokio::sync::mpsc;
 
-    /// Datagram queue depth either way — sized like a socket buffer, not a
+    /// Inbound datagram queue depth — sized like a socket buffer, not a
     /// stream queue: a full queue drops a datagram and the transport's own
     /// loss recovery retransmits. 4096 × ~1400 B ≈ 5.7 MiB — the same order
-    /// of headroom the raw path gets from its enlarged kernel `SO_RCVBUF`.
-    const QUEUE: usize = 4096;
+    /// of headroom the raw path gets from its enlarged kernel `SO_RCVBUF`,
+    /// whose absorption this queue substitutes for.
+    pub(super) const INBOUND_QUEUE: usize = 4096;
+
+    /// Outbound stays far shallower than [`INBOUND_QUEUE`] — a deep send
+    /// queue is bufferbloat, not absorption. quic-go's `sendQueue` is 8
+    /// deep; at 4096 a sustained front-congestion stall tail-drops only
+    /// once ~5.7 MiB has piled up, so quiche's loss signal lands ~8×
+    /// later and its RTT/BDP estimate soaks up the standing queue. 512
+    /// still rides out jitter bursts, and the transport's own recovery
+    /// retransmits what a drop loses — same contract as the send side
+    /// documented on `outbound` below.
+    pub(super) const OUTBOUND_QUEUE: usize = 512;
 
     /// What an injected [`SocketIo::mtu_hint`] reports to the QUIC drivers:
     /// the IPv6 minimum-link MTU. A front proxy's per-packet encapsulation
@@ -524,22 +535,23 @@ mod packet_conn_socket {
 
     impl PacketConnSocket {
         pub fn new(conn: Arc<dyn meow_common::ProxyPacketConn>, remote: SocketAddr) -> Self {
-            Self::with_queue(conn, remote, QUEUE)
+            Self::with_queue(conn, remote, INBOUND_QUEUE, OUTBOUND_QUEUE)
         }
 
-        /// `new` with an explicit queue depth — tests shrink the channels
+        /// `new` with explicit queue depths — tests shrink the channels
         /// to reach the drop path deterministically.
         pub(super) fn with_queue(
             conn: Arc<dyn meow_common::ProxyPacketConn>,
             remote: SocketAddr,
-            queue: usize,
+            inbound_queue: usize,
+            outbound_queue: usize,
         ) -> Self {
             let local_addr = conn
                 .local_addr()
                 .ok()
                 .filter(|addr| !addr.ip().is_unspecified());
-            let (in_tx, inbound) = mpsc::channel(queue);
-            let (outbound, mut out_rx) = mpsc::channel::<Vec<u8>>(queue);
+            let (in_tx, inbound) = mpsc::channel(inbound_queue);
+            let (outbound, mut out_rx) = mpsc::channel::<Vec<u8>>(outbound_queue);
 
             let dropped_rx = Arc::new(AtomicU64::new(0));
             let reader = Arc::clone(&conn);
@@ -590,6 +602,18 @@ mod packet_conn_socket {
         #[cfg(test)]
         pub(super) fn dropped_rx(&self) -> u64 {
             self.dropped_rx.load(Ordering::Relaxed)
+        }
+
+        /// `(inbound, outbound)` capacity still available — on a fresh
+        /// socket the permit counts are the depths themselves, so the
+        /// [`INBOUND_QUEUE`]/[`OUTBOUND_QUEUE`] split is asserted
+        /// through them.
+        #[cfg(test)]
+        pub(super) fn queue_capacities(&self) -> (usize, usize) {
+            (
+                self.inbound.lock().unwrap().capacity(),
+                self.outbound.capacity(),
+            )
         }
     }
 
@@ -2836,7 +2860,7 @@ mod tests {
 
         let remote: SocketAddr = "10.0.0.1:7777".parse().unwrap();
         let conn: Arc<dyn ProxyPacketConn> = Arc::new(StalledConn);
-        let mut sock = super::packet_conn_socket::PacketConnSocket::with_queue(conn, remote, 2);
+        let mut sock = super::packet_conn_socket::PacketConnSocket::with_queue(conn, remote, 2, 2);
 
         let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
         // A pump parked on one write accepts at most queue + 1 packets;
@@ -2884,7 +2908,7 @@ mod tests {
 
         let remote: SocketAddr = "10.0.0.1:7777".parse().unwrap();
         let conn: Arc<dyn ProxyPacketConn> = Arc::new(FailingConn);
-        let mut sock = super::packet_conn_socket::PacketConnSocket::with_queue(conn, remote, 2);
+        let mut sock = super::packet_conn_socket::PacketConnSocket::with_queue(conn, remote, 2, 2);
 
         let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
         // The pump hasn't run yet on the first send — it queues fine.
@@ -2940,6 +2964,7 @@ mod tests {
             conn,
             "10.0.0.1:7777".parse().unwrap(),
             2,
+            2,
         );
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while sock.dropped_rx() == 0 {
@@ -2948,6 +2973,45 @@ mod tests {
         })
         .await
         .expect("an undrained read pump must drop and count");
+    }
+
+    /// The queue split: inbound stays deep (it substitutes for the raw
+    /// path's enlarged `SO_RCVBUF`), outbound stays shallow — a stalled
+    /// front must surface the loss signal to the transport ~8× sooner
+    /// than the old symmetric 4096, not bufferbloat into quiche's
+    /// RTT/BDP estimate.
+    #[cfg(any(feature = "kcptun", feature = "hysteria2", feature = "trusttunnel-h3"))]
+    #[tokio::test]
+    async fn packet_conn_socket_splits_inbound_and_outbound_depths() {
+        use super::packet_conn_socket::{INBOUND_QUEUE, OUTBOUND_QUEUE};
+
+        struct IdleConn;
+        #[async_trait]
+        impl ProxyPacketConn for IdleConn {
+            async fn read_packet(&self, _buf: &mut [u8]) -> MeowResult<(usize, SocketAddr)> {
+                std::future::pending().await
+            }
+            async fn write_packet(&self, _buf: &[u8], _addr: &SocketAddr) -> MeowResult<usize> {
+                std::future::pending().await
+            }
+            fn local_addr(&self) -> MeowResult<SocketAddr> {
+                Ok("10.0.0.2:7777".parse().unwrap())
+            }
+            fn close(&self) -> MeowResult<()> {
+                Ok(())
+            }
+        }
+
+        let conn: Arc<dyn ProxyPacketConn> = Arc::new(IdleConn);
+        let sock = super::packet_conn_socket::PacketConnSocket::new(
+            conn,
+            "10.0.0.1:7777".parse().unwrap(),
+        );
+        // Nothing has moved through either channel, so the permit
+        // counts are the queue depths themselves.
+        assert_eq!(sock.queue_capacities(), (INBOUND_QUEUE, OUTBOUND_QUEUE));
+        assert_eq!(INBOUND_QUEUE, 4096, "inbound absorbs like SO_RCVBUF");
+        assert_eq!(OUTBOUND_QUEUE, 512, "outbound stays shallow");
     }
 
     /// An injected endpoint carries a front proxy's per-packet

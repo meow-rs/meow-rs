@@ -1634,13 +1634,23 @@ impl WgPump {
     /// rides `block_in_place` and the wait moves off the worker set.
     /// `> 2` mirrors [`CryptoPool`]'s own serial cutoff: smaller batches
     /// resolve inline either way, and a dry pass — the pump's steady
-    /// state — never pays the migration. Lives on the `run` side
-    /// because tests drive the drains on current-thread runtimes, where
-    /// `block_in_place` panics (`run` only ever executes inside
-    /// `spawn_pump`'s `tokio::spawn` on the multi-thread runtime, the
-    /// one flavor where `block_in_place` is legal).
+    /// state — never pays the migration.
+    ///
+    /// `block_in_place` is legal only on the multi-thread flavor — it
+    /// panics under `current_thread`, and `Handle::current` itself
+    /// panics outside any runtime. `spawn_pump`'s host is the shared
+    /// multi-thread runtime, but nothing forces an embedder to spawn
+    /// the handle's calls there — so the flavor is checked rather than
+    /// assumed, and a `current_thread` (or runtimeless) host runs the
+    /// same `> 2` batch serially: the inline `mpsc::recv` then parks
+    /// that runtime's one thread, which hosts nothing else to starve.
+    /// Tests drive the drains on `current_thread` runtimes — this is
+    /// what keeps them off the panic.
     fn offload_crypto<T>(jobs: &mut Vec<T>, run: fn(&mut Vec<T>)) {
-        if jobs.len() > 2 {
+        let offload = jobs.len() > 2
+            && tokio::runtime::Handle::try_current()
+                .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
+        if offload {
             tokio::task::block_in_place(|| run(jobs));
         } else {
             run(jobs);
@@ -2879,6 +2889,47 @@ mod tests {
                 other => panic!("responder must decrypt datagram {i}, got {other:?}"),
             }
         }
+    }
+
+    /// `offload_crypto`'s runtime gate: a parallel-sized batch outside
+    /// the multi-thread flavor must run the same `> 2` jobs serially —
+    /// `block_in_place` panics under `current_thread` and
+    /// `Handle::current` panics runtimeless, so neither arm may reach
+    /// it. The runtimeless case is this plain `#[test]`.
+    #[test]
+    fn offload_crypto_runs_serially_without_a_runtime() {
+        fn tally(jobs: &mut Vec<u32>) {
+            jobs.iter_mut().for_each(|j| *j += 1);
+        }
+        // `> 2` — the same cutoff the multi-thread arm rides past.
+        let mut jobs = vec![0u32; 4];
+        WgPump::offload_crypto(&mut jobs, tally);
+        assert_eq!(jobs, [1; 4]);
+    }
+
+    /// The same fallback with a handle present: the flavor check, not
+    /// the absence of a runtime, keeps `block_in_place` off here.
+    #[tokio::test(flavor = "current_thread")]
+    async fn offload_crypto_runs_serially_on_current_thread() {
+        fn tally(jobs: &mut Vec<u32>) {
+            jobs.iter_mut().for_each(|j| *j += 1);
+        }
+        let mut jobs = vec![0u32; 4];
+        WgPump::offload_crypto(&mut jobs, tally);
+        assert_eq!(jobs, [1; 4]);
+    }
+
+    /// The positive arm — `#[tokio::test]`'s default multi-thread
+    /// runtime still rides `block_in_place`, so the gate can't
+    /// over-broaden into always-serial.
+    #[tokio::test]
+    async fn offload_crypto_offloads_on_multi_thread() {
+        fn tally(jobs: &mut Vec<u32>) {
+            jobs.iter_mut().for_each(|j| *j += 1);
+        }
+        let mut jobs = vec![0u32; 4];
+        WgPump::offload_crypto(&mut jobs, tally);
+        assert_eq!(jobs, [1; 4]);
     }
 
     /// A dial to a family the tunnel has no address for fails *inside*
