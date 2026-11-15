@@ -200,8 +200,10 @@ impl Client {
         // could send its first byte. A refused open still closes the
         // stream: the session's SynAck arm evicts and closes it on an
         // error payload, so the caller's next read sees EOF and its next
-        // write fails, and the session watchdog `open_stream` armed closes
-        // a session whose peer never answers (upstream `synDone`).
+        // write fails; the `open_stream` watchdog bounds a silent peer
+        // only for v2+ sessions at sid >= 2 — any SynAck disarms it, so a
+        // sid-1 or sibling-disarmed open has no session-level bound
+        // (upstream `synDone` parity).
         guard.disarm();
         drop(synack_rx);
         tracing::debug!(
