@@ -415,7 +415,17 @@ impl ProxyAdapter for VlessAdapter {
         // the mismatch, so the capability stays off rather than promising
         // a conn that blackholes.
         #[cfg(all(feature = "mux", feature = "vless-vision"))]
-        let plain_udp = self.udp;
+        let plain_udp = self.udp
+            // A vision node whose configured mux pool is `only-tcp` has
+            // no accepted wire shape: the pool declines UDP, the
+            // transient session is skipped (a configured pool wins),
+            // and strict servers reject the bare fallback — advertise
+            // honestly instead of promising a conn that blackholes.
+            && !(matches!(self.flow, Some(VlessFlow::XtlsRprxVision))
+                && self
+                    .mux
+                    .as_ref()
+                    .is_some_and(|m| !m.supports_udp()));
         #[cfg(not(all(feature = "mux", feature = "vless-vision")))]
         let plain_udp = self.udp && self.flow.is_none();
         // With mux enabled, UDP rides the mux TCP session (unless
@@ -507,10 +517,15 @@ impl ProxyAdapter for VlessAdapter {
         if matches!(self.flow, Some(VlessFlow::XtlsRprxVision))
             && !self.vision_udp_bare_warned.swap(true, Ordering::Relaxed)
         {
+            let reason = if self.mux.as_ref().is_some_and(|m| !m.supports_udp()) {
+                "the configured mux pool is only-tcp"
+            } else {
+                "Mux.Cool cannot express a domain UDP target"
+            };
             tracing::warn!(
                 proxy = %self.name,
                 "vless: UDP for flow xtls-rprx-vision fell back to a bare Cmd::Udp request \
-                 (Mux.Cool cannot express a domain UDP target): strict servers \
+                 ({reason}): strict servers \
                  (xray, sing-box >=1.12) reject it as a flow mismatch"
             );
         }
@@ -694,6 +709,28 @@ mod tests {
         assert!(make_adapter(Some(VlessFlow::XtlsRprxVision), true).support_udp());
         assert!(!make_adapter(Some(VlessFlow::XtlsRprxVision), false).support_udp());
         assert!(make_adapter(None, true).support_udp());
+    }
+
+    // A vision node whose configured mux pool is `only-tcp` has no
+    // accepted wire shape — the pool declines UDP, the transient
+    // session is skipped (a configured pool wins), and strict servers
+    // reject the bare fallback — so it advertises no UDP capability.
+    // A non-vision node on the same pool still carries `Cmd::Udp`.
+    #[cfg(all(feature = "mux", feature = "vless-vision"))]
+    #[test]
+    fn vless_vision_udp_unsupported_with_only_tcp_pool() {
+        let vision = make_adapter(Some(VlessFlow::XtlsRprxVision), true).with_mux(MuxOptions {
+            protocol: Protocol::MuxCool,
+            only_tcp: true,
+            ..MuxOptions::default()
+        });
+        assert!(!vision.support_udp());
+        let plain = make_adapter(None, true).with_mux(MuxOptions {
+            protocol: Protocol::MuxCool,
+            only_tcp: true,
+            ..MuxOptions::default()
+        });
+        assert!(plain.support_udp());
     }
 
     // Without the mux pair there is no wire shape a strict server accepts

@@ -1497,7 +1497,8 @@ proxies:
 /// substream carrying the flow addon (upstream clients' XUDP shape).
 /// NOT hard-error: crypto and routing are unchanged on the UDP path.
 /// upstream: upstream sends UDP through the flow'd mux stream; we warn once
-/// at load because the wire shape differs from a plain `Cmd::Udp`.
+/// at load because vision UDP takes that mux path rather than the plain
+/// `Cmd::Udp` the node configured (and a domain target still falls back).
 #[tokio::test]
 async fn parse_vless_vision_udp_true_warns_once() {
     let yaml = r#"

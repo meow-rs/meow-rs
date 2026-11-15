@@ -294,14 +294,16 @@ pub trait Proxy: ProxyAdapter {
     /// adapter keeps mihomo's `continue` — an `udp: false` node is a
     /// routing preference, not a chain the flow must die inside.
     ///
-    /// Two registry shapes report `true`: the relay-based
-    /// `DialerProxyAdapter` over a non-transparent inner, and the config
-    /// layer's `ChainedProxy` marker on a `dialer-proxy` leaf whose chain
-    /// was applied by *injection* (no `DialerProxyAdapter` exists there to
-    /// answer). `DialerProxyAdapter` is always the outermost entry when it
-    /// is used, so this default stays unreachable for it; any future
-    /// wrapper that can sit above one must forward it (same contract as
-    /// `dialer_hop`).
+    /// Two registry shapes answer this: the relay-based
+    /// `DialerProxyAdapter` over a non-transparent inner (`true`), and the
+    /// config layer's `ChainedProxy` marker on a `dialer-proxy` leaf whose
+    /// chain was applied by *injection* (no `DialerProxyAdapter` exists
+    /// there to answer — it reports `!inner.support_udp()`, so an
+    /// injected leaf whose chain still carries UDP, e.g. anytls
+    /// `udp: true`, correctly answers `false`). `DialerProxyAdapter` is
+    /// always the outermost entry when it is used, so this default stays
+    /// unreachable for it; any future wrapper that can sit above one must
+    /// forward it (same contract as `dialer_hop`).
     ///
     /// Group adapters forward the verdict to the same member their UDP
     /// flow would pick — the pick `support_udp` answers for: the

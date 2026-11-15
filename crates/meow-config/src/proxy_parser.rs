@@ -198,10 +198,10 @@ impl Proxy for WrappedProxy {
 /// — hysteria2 over the front's UDP association, WireGuard, or anytls
 /// `udp: true` (UoT rides the chained TCP session) — is *not*
 /// non-transparent: its UDP flow rides the declared chain, so there is
-/// nothing to fail closed on. `type: direct` (and `ss` with an external
-/// SIP003 plugin) rejects the injected dialer inside
-/// [`parse_proxy_with_dialer`]
-/// (`reject_unthreaded_dialer`) and lands in the relay-based
+/// nothing to fail closed on. `type: direct` rejects the injected dialer
+/// inside [`parse_proxy_with_dialer`] (`reject_unthreaded_dialer`), and
+/// `ss` with an external SIP003 plugin bails on its own inline check —
+/// either way the leaf lands in the relay-based
 /// `DialerProxyAdapter` fallback instead, which computes its own
 /// transparency — so reaching this wrapper already proves the inner owns a
 /// server transport. A UDP flow matched to a rule targeting a
