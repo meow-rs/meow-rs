@@ -524,13 +524,17 @@ mod tests {
             tokio::pin!(open);
 
             // Drive the open until handshake bytes reach the peer, then drop
-            // it while it is still writing the session/stream setup.
+            // it while it is still writing the session/stream setup. The open
+            // no longer parks on a 30 s SYNACK wait and can in principle
+            // complete, so `biased` keeps `peer.read` first in poll order —
+            // it wins whenever handshake bytes can arrive, as intended.
             let mut first = [0u8; 16];
             tokio::select! {
-                _res = &mut open => panic!("open completed unexpectedly"),
+                biased;
                 res = peer.read(&mut first) => {
                     res.expect("peer must see the client's handshake bytes");
                 }
+                _res = &mut open => panic!("open completed unexpectedly"),
             }
             // `open` is dropped at scope end: cancellation.
         }
