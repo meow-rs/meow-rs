@@ -886,6 +886,7 @@ impl BoringInner {
                     ech_requested = ech_requested,
                     ech_accepted = ech_accepted,
                     tls_version = %version,
+                    session_reused = tls_stream.ssl().session_reused(),
                     "boring TLS handshake complete"
                 );
                 Ok(tls_stream)

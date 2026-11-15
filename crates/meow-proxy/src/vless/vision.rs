@@ -3,6 +3,7 @@
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Instant;
 
 use meow_common::ProxyConn;
 use rand::RngCore;
@@ -67,6 +68,14 @@ pub struct VisionConn {
     raw_write_capable: bool,
     read_tls_filter: ServerHelloFilter,
     vision_entered: bool,
+    /// First-packet markers: the construction timestamp plus one-shot
+    /// latches.  The first completed payload write and the first delivered
+    /// read log the ms since construction, so a churn run can split the
+    /// establish cost (`vless connect breakdown`) from the deferred request
+    /// frame's flight to the server and back.
+    created_at: Instant,
+    logged_first_write: bool,
+    logged_first_read: bool,
 }
 
 impl VisionConn {
@@ -87,6 +96,9 @@ impl VisionConn {
             raw_write_capable,
             read_tls_filter: ServerHelloFilter::new(),
             vision_entered: false,
+            created_at: Instant::now(),
+            logged_first_write: false,
+            logged_first_read: false,
         }
     }
 
@@ -193,6 +205,30 @@ impl VisionConn {
         if !self.write_direct_enabled && self.read_tls_filter.observe(chunk) {
             self.write_direct_enabled = true;
             tracing::debug!("XTLS Vision found TLS 1.3, direct enabled");
+        }
+    }
+
+    /// One-shot `first_write_ms` marker — the first caller payload bytes
+    /// accepted by the inner stream (deferred VLESS header included).
+    fn note_first_write(&mut self) {
+        if !self.logged_first_write {
+            self.logged_first_write = true;
+            tracing::debug!(
+                first_write_ms = self.created_at.elapsed().as_secs_f64() * 1000.0,
+                "vision first payload write"
+            );
+        }
+    }
+
+    /// One-shot `first_read_ms` marker — the first server bytes delivered
+    /// to the caller.
+    fn note_first_read(&mut self) {
+        if !self.logged_first_read {
+            self.logged_first_read = true;
+            tracing::debug!(
+                first_read_ms = self.created_at.elapsed().as_secs_f64() * 1000.0,
+                "vision first server data"
+            );
         }
     }
 }
@@ -321,7 +357,12 @@ impl AsyncRead for VisionConn {
                 }
                 ReadState::Through => {
                     self.read_state = ReadState::Through;
-                    return Pin::new(&mut self.inner).poll_read(cx, buf);
+                    let filled_before = buf.filled().len();
+                    let poll = Pin::new(&mut self.inner).poll_read(cx, buf);
+                    if matches!(poll, Poll::Ready(Ok(()))) && buf.filled().len() > filled_before {
+                        self.note_first_read();
+                    }
+                    return poll;
                 }
                 ReadState::Header {
                     buf: mut h,
@@ -461,6 +502,7 @@ impl AsyncRead for VisionConn {
                             remaining_content -= n;
                             self.filter_server_tls(rb.filled());
                             buf.put_slice(rb.filled());
+                            self.note_first_read();
                             self.read_state = if remaining_content == 0 {
                                 ReadState::Padding {
                                     command,
@@ -556,6 +598,9 @@ impl AsyncWrite for VisionConn {
         let this = self.get_mut();
         if let Poll::Ready(done) = this.drain_pending_write(cx) {
             if let Some(n) = done? {
+                if n > 0 {
+                    this.note_first_write();
+                }
                 return Poll::Ready(Ok(n));
             }
         } else {
@@ -566,7 +611,11 @@ impl AsyncWrite for VisionConn {
             return Poll::Ready(Ok(0));
         }
         if !this.write_padding {
-            return Pin::new(&mut this.inner).poll_write(cx, buf);
+            let poll = Pin::new(&mut this.inner).poll_write(cx, buf);
+            if matches!(poll, Poll::Ready(Ok(n)) if n > 0) {
+                this.note_first_write();
+            }
+            return poll;
         }
         // The padding frame carries u16 content/padding length fields:
         // chunk large writes so those fields cannot wrap and
@@ -574,7 +623,12 @@ impl AsyncWrite for VisionConn {
         let chunk_len = buf.len().min(16 * 1024);
         this.build_write_frame(&buf[..chunk_len]);
         match this.drain_pending_write(cx) {
-            Poll::Ready(Ok(Some(n))) => Poll::Ready(Ok(n)),
+            Poll::Ready(Ok(Some(n))) => {
+                if n > 0 {
+                    this.note_first_write();
+                }
+                Poll::Ready(Ok(n))
+            }
             Poll::Ready(Ok(None)) => Poll::Ready(Ok(0)),
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             Poll::Pending => Poll::Pending,

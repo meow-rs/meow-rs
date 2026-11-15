@@ -29,6 +29,7 @@ use crate::stream_conn::StreamConn;
 use crate::transport_chain::TransportChain;
 use crate::vless::{addr_from_metadata, Cmd, VlessConn, VlessPacketConn};
 use std::sync::Arc;
+use std::time::Instant;
 
 #[cfg(all(feature = "mux", feature = "vless-vision"))]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -50,6 +51,24 @@ pub enum VlessFlow {
 }
 
 // ─── Adapter ─────────────────────────────────────────────────────────────────
+
+/// Per-call connect-phase timings of [`VlessAdapter::dial_stream`], in
+/// milliseconds as `f64` (the measured phases are mostly sub-millisecond on
+/// loopback rigs).  `dial_tcp` / `connect_over` report them as the
+/// `vless connect breakdown` debug line.
+#[derive(Debug, Default, Clone, Copy)]
+struct DialPhases {
+    /// `dialer.dial` — the direct TCP connect, or the front hop's whole
+    /// dial on a `dialer-proxy` chain (its own transport handshake folds
+    /// in here).
+    tcp_ms: f64,
+    /// `transport.connect(_shared)` plus the VLESS Encryption handshake —
+    /// the BoringSSL handshake for a `tls: true` node.
+    transport_ms: f64,
+    /// The stream came off a multiplexed transport's shared conn: no dial
+    /// or transport handshake ran, so the phases above read 0.
+    reused: bool,
+}
 
 /// VLESS outbound proxy adapter.
 pub struct VlessAdapter {
@@ -282,27 +301,43 @@ impl VlessAdapter {
     }
 
     /// Dial a raw TCP + transport-chain stream to the VLESS server, then run the
-    /// VLESS Encryption handshake if one is configured.
-    async fn dial_stream(&self, internal: bool) -> Result<Box<dyn meow_transport::Stream>> {
+    /// VLESS Encryption handshake if one is configured.  Returns the stream
+    /// plus the per-phase timings [`dial_tcp`](ProxyAdapter::dial_tcp) reports
+    /// as the `vless connect breakdown` debug line.
+    async fn dial_stream(
+        &self,
+        internal: bool,
+    ) -> Result<(Box<dyn meow_transport::Stream>, DialPhases)> {
+        let mut phases = DialPhases::default();
         // A user dial straight to the server shares a multiplexed
         // (gRPC/xhttp) connection; probes and `dialer-proxy` chains keep
         // their own.
         let shared = !internal && !self.dialer.is_proxy();
         if shared {
             if let Some(stream) = self.transport.reuse().await {
-                return self.encrypt(stream).await;
+                phases.reused = true;
+                let t = Instant::now();
+                let stream = self.encrypt(stream).await?;
+                phases.transport_ms = t.elapsed().as_secs_f64() * 1000.0;
+                return Ok((stream, phases));
             }
         }
+        let t = Instant::now();
         let stream = self
             .dialer
             .dial(&self.server, self.port, internal)
             .await
             .map_err(MeowError::Io)?;
-        if shared {
+        phases.tcp_ms = t.elapsed().as_secs_f64() * 1000.0;
+        let t = Instant::now();
+        let stream = if shared {
             let stream = self.transport.connect_shared(stream).await?;
-            return self.encrypt(stream).await;
-        }
-        self.wrap_stream(stream).await
+            self.encrypt(stream).await?
+        } else {
+            self.wrap_stream(stream).await?
+        };
+        phases.transport_ms = t.elapsed().as_secs_f64() * 1000.0;
+        Ok((stream, phases))
     }
 
     /// The VLESS Encryption handshake, when one is configured.
@@ -457,8 +492,27 @@ impl ProxyAdapter for VlessAdapter {
             return Ok(Box::new(conn));
         }
 
-        let stream = self.dial_stream(metadata.is_internal()).await?;
-        self.handshake_tcp(stream, metadata).await
+        let t0 = Instant::now();
+        let (stream, phases) = self.dial_stream(metadata.is_internal()).await?;
+        let t1 = Instant::now();
+        let conn = self.handshake_tcp(stream, metadata).await?;
+        // Establish breakdown: `tcp_ms` is the raw/front-hop dial
+        // (`dialer-proxy` chains fold their front hop into it), `tls_ms`
+        // the transport chain (BoringSSL handshake for `tls: true`),
+        // `vless_ms` the VLESS request exchange — ~0 under Vision, whose
+        // header is deferred into the first padded write (timed there as
+        // `vision first payload write` / `vision first server data`).
+        debug!(
+            proxy = %self.name,
+            dst = %metadata.remote_address(),
+            tcp_ms = phases.tcp_ms,
+            tls_ms = phases.transport_ms,
+            vless_ms = t1.elapsed().as_secs_f64() * 1000.0,
+            total_ms = t0.elapsed().as_secs_f64() * 1000.0,
+            reused = phases.reused,
+            "vless connect breakdown"
+        );
+        Ok(conn)
     }
 
     /// Run the VLESS handshake over an existing stream (relay chain).
@@ -476,8 +530,21 @@ impl ProxyAdapter for VlessAdapter {
         if self.mux.is_some() {
             debug!("VLESS mux bypassed on relay-supplied stream (single-use)");
         }
+        let t0 = Instant::now();
         let stream = self.wrap_stream(Box::new(stream)).await?;
-        self.handshake_tcp(stream, metadata).await
+        let t1 = Instant::now();
+        let conn = self.handshake_tcp(stream, metadata).await?;
+        debug!(
+            proxy = %self.name,
+            dst = %metadata.remote_address(),
+            tcp_ms = 0.0,
+            tls_ms = (t1 - t0).as_secs_f64() * 1000.0,
+            vless_ms = t1.elapsed().as_secs_f64() * 1000.0,
+            total_ms = t0.elapsed().as_secs_f64() * 1000.0,
+            relay = true,
+            "vless connect breakdown"
+        );
+        Ok(conn)
     }
 
     async fn dial_udp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
@@ -559,7 +626,7 @@ impl ProxyAdapter for VlessAdapter {
         // frame (issue #657).  Checked before dialing so the refusal costs
         // no handshake.
         let addr = addr_from_metadata(metadata).map_err(MeowError::NotSupported)?;
-        let stream = self.dial_stream(metadata.is_internal()).await?;
+        let (stream, _phases) = self.dial_stream(metadata.is_internal()).await?;
 
         let conn = VlessPacketConn::new(stream, &self.uuid_bytes, metadata.dst_port, &addr).await?;
 
