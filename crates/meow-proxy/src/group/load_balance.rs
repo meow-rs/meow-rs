@@ -443,6 +443,18 @@ impl Proxy for LoadBalanceGroup {
         self.health.alive() && self.any_member(|p| p.alive_for_url(url))
     }
 
+    /// Mirror `support_udp`'s member-set resolution with the marker in
+    /// place of the capability bit: a chained member can never satisfy
+    /// `eligible(p, true)` — its own `support_udp` is `false` — so the
+    /// question the probe needs answered is whether a member the UDP
+    /// pick *would have considered* (alive for the group's test URL, the
+    /// same eligibility filter minus `support_udp`) is chained
+    /// non-transparent. `false` for a member set without one: the slide
+    /// is the safe failure side (issue #969).
+    fn is_dialer_proxy_non_transparent(&self) -> bool {
+        self.any_member(|p| self.eligible(p, false) && p.is_dialer_proxy_non_transparent())
+    }
+
     fn last_delay(&self) -> u16 {
         self.min_alive_delay(|p| p.last_delay())
     }
@@ -1012,6 +1024,57 @@ mod tests {
             }
         }
         assert!(failures.is_empty(), "{}", failures.join("; "));
+    }
+
+    /// Issue #969: a load-balance member set holding a
+    /// `dialer-proxy`-chained, UDP-incapable member must answer the pair
+    /// the match probe reads — `support_udp() == false` and
+    /// `is_dialer_proxy_non_transparent() == true` — so the scan stops on
+    /// the matched rule instead of sliding to a later target. The verdict
+    /// mirrors `support_udp`'s member-set resolution (`any_member` over
+    /// the alive-for-test-url candidates): whichever member the
+    /// destination key hashes onto, the chained member sat in the pick's
+    /// candidate space, so the chain the config pinned must not be
+    /// silently bypassed.
+    #[test]
+    fn load_balance_dst_keyed_chained_udp_incapable_fails_closed() {
+        let chained_inner = MockProxy::new_udp_unsupported("chained", AdapterType::Snell);
+        let chained_inner_ref = Arc::clone(&chained_inner);
+        let chained: Arc<dyn Proxy> = Arc::new(crate::DialerProxyAdapter::new(
+            chained_inner,
+            crate::dialer::DialerTarget::new(
+                "never-resolved",
+                &crate::dialer::ProxyRegistry::default(),
+            ),
+        ));
+        // A plain `udp: false` sibling — unchained, equally UDP-incapable.
+        let plain = MockProxy::new("plain");
+        let group = make_ch(vec![chained, plain]);
+
+        // The chained member fails UDP eligibility on its own, so the
+        // dst-keyed pick space is empty whichever member the key lands on
+        // — the probe reaches the marker check.
+        let meta = meta_dst_host("example.com");
+        assert!(group.select_udp(&meta).is_none());
+        assert!(!group.support_udp());
+        assert!(
+            group.is_dialer_proxy_non_transparent(),
+            "a live chained member in the pick's candidate space fails the group closed"
+        );
+
+        // A dead chained member is out of the candidate space — the
+        // verdict follows `eligible`'s liveness filter too.
+        chained_inner_ref.set_alive(false);
+        assert!(
+            !group.is_dialer_proxy_non_transparent(),
+            "a dead chained member cannot be bypassed — the slide stands"
+        );
+
+        // The unchained contrast: plain `udp: false` members answer
+        // `false` — mihomo's `continue` is preserved.
+        let plain_only = make_ch(vec![MockProxy::new("a"), MockProxy::new("b")]);
+        assert!(!plain_only.support_udp());
+        assert!(!plain_only.is_dialer_proxy_non_transparent());
     }
 
     #[tokio::test]

@@ -226,6 +226,14 @@ impl Proxy for SelectorGroup {
         self.health.alive() && self.selected_proxy().is_some_and(|p| p.alive_for_url(url))
     }
 
+    /// Forward to the same member `support_udp` consults — the selected
+    /// pick a UDP flow would dial. `false` when nothing is selected:
+    /// `Missing` (the slide) is the safe failure side (issue #969).
+    fn is_dialer_proxy_non_transparent(&self) -> bool {
+        self.selected_proxy()
+            .is_some_and(|p| p.is_dialer_proxy_non_transparent())
+    }
+
     fn last_delay(&self) -> u16 {
         self.selected_proxy().map_or(0, |p| p.last_delay())
     }
@@ -402,6 +410,47 @@ mod tests {
         assert!(!g.support_udp(), "default selection is tcp-only");
         assert!(g.select("udp-able"));
         assert!(g.support_udp(), "switching selection updates udp support");
+    }
+
+    /// A `dialer-proxy`-chained member that cannot carry UDP, in the
+    /// production shape: the relay-based `DialerProxyAdapter` over a
+    /// non-transparent inner. The front name never resolves — the
+    /// verdicts here are construction-time, registry-free.
+    fn chained_udp_incapable(name: &str) -> Arc<dyn Proxy> {
+        Arc::new(crate::DialerProxyAdapter::new(
+            MockProxy::new_udp_unsupported(name, AdapterType::Snell),
+            crate::dialer::DialerTarget::new(
+                "never-resolved",
+                &crate::dialer::ProxyRegistry::default(),
+            ),
+        ))
+    }
+
+    /// Issue #969: a selector whose *pick* is a chained UDP-incapable
+    /// member must answer the pair the match probe reads —
+    /// `support_udp() == false` and `is_dialer_proxy_non_transparent()
+    /// == true` — so the scan stops on the matched rule instead of
+    /// sliding to a later target. The verdict follows the selected
+    /// member exactly like `support_udp` does.
+    #[test]
+    fn selector_pick_chained_udp_incapable_fails_closed() {
+        let chained = chained_udp_incapable("chained");
+        let g = SelectorGroup::new("sel", vec![MockProxy::new_udp("udp-ok"), chained]);
+
+        // Default pick is the first member: UDP-capable and unchained.
+        assert!(g.support_udp());
+        assert!(!g.is_dialer_proxy_non_transparent());
+
+        assert!(g.select("chained"));
+        assert!(
+            !g.support_udp(),
+            "the chained pick cannot carry UDP — it advertises the pick's own capability"
+        );
+        assert!(
+            g.is_dialer_proxy_non_transparent(),
+            "the fail-closed verdict must follow the selected member, \
+             not the member set"
+        );
     }
 
     /// Issue #681: `record_dial_failure` escalation and probe sweeps write

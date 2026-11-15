@@ -101,6 +101,14 @@ impl Proxy for DnsProxy {
             .resolve()
             .map_or_else(Vec::new, |p| p.delay_history())
     }
+    /// Forward like `support_udp`: the published entry's own verdict, so
+    /// a chained member resolved through this wrapper reads exactly as the
+    /// route generation reports it (issue #969 — the wrapper contract).
+    fn is_dialer_proxy_non_transparent(&self) -> bool {
+        self.target
+            .resolve()
+            .is_some_and(|p| p.is_dialer_proxy_non_transparent())
+    }
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         Some(self)
     }

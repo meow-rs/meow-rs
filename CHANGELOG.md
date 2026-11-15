@@ -469,7 +469,16 @@ the canonical, in-repo source a release is cut from.
   silently sliding to `DIRECT` — the injected-path counterpart of the
   #969 fix above, since an injected leaf carries no `DialerProxyAdapter`
   to report the configured chain; a new `ChainedProxy` registry marker
-  reports it instead (#969).
+  reports it instead (#969). The same verdict now reaches the scan
+  through a *group* target too: every group type forwards
+  `is_dialer_proxy_non_transparent` to the member its `support_udp`
+  picks (the selector's selection, the url-test/fallback pick, the
+  relay's UDP exit hop, the load-balance live member set), so a matched
+  rule targeting a group whose pick is a chained UDP-incapable member
+  stops the same way instead of rerouting the flow past the pinned
+  chain. Provider-sourced nodes whose `dialer-proxy` was injected are
+  marked `ChainedProxy` exactly like static `proxies:` entries, closing
+  the last spot a chained leaf could answer `false` (#969).
 
 ## [0.29.0] - 2026-11-05
 

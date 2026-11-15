@@ -1296,7 +1296,13 @@ impl ProxyProvider {
             self.allow_external_plugin,
             &chained,
         ) {
-            Ok(proxy) => proxy,
+            // The `ChainedProxy` marker pins the #969 fail-closed verdict
+            // on injected entries, identical to the static `proxies:`
+            // build's `parse_dialered_leaf`: an injected leaf carries no
+            // `DialerProxyAdapter` to report the configured chain, so the
+            // UDP probe would otherwise read it as a plain `udp: false`
+            // node and slide a matched flow to a later rule.
+            Ok(proxy) => Arc::new(proxy_parser::ChainedProxy::new(proxy)) as Arc<dyn Proxy>,
             Err(e) => {
                 // The adapter type cannot carry an injected dialer — or the
                 // node is unparseable, in which case the direct re-parse
@@ -3339,6 +3345,58 @@ header:
         assert!(
             node.dial_udp(&meta).await.is_err(),
             "UDP over a TCP front-hop chain must fail, not leak direct"
+        );
+    }
+
+    /// The #969 marker on the provider path: an injected `dialer-proxy`
+    /// leaf carries no `DialerProxyAdapter` to report the configured
+    /// chain, so `parse_node` marks it `ChainedProxy` — the same verdict
+    /// `insert_parsed_leaves`' `parse_dialered_leaf` pins on static
+    /// `proxies:` entries. Without it a group whose pick lands on this
+    /// node would let a matched UDP flow slide to a later rule's target.
+    #[tokio::test]
+    async fn provider_injected_leaf_marked_via_chainedproxy() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("nodes.yaml"),
+            "proxies:\n  - {name: n1, type: socks5, server: 203.0.113.9, \
+             port: 1081, udp: true, dialer-proxy: front}\n  \
+             - {name: n2, type: socks5, server: 203.0.113.10, port: 1081}\n",
+        )
+        .unwrap();
+        let raw = raw_file_provider("nodes.yaml");
+        let p = ProxyProvider::new(
+            "test",
+            &raw,
+            Some(dir.path()),
+            true,
+            false,
+            Default::default(),
+        )
+        .unwrap();
+        p.refresh().await.unwrap();
+
+        let node = p
+            .proxies()
+            .into_iter()
+            .find(|n| n.name() == "n1")
+            .expect("n1 must parse");
+        assert!(
+            node.is_dialer_proxy_non_transparent(),
+            "the injected leaf must carry the fail-closed marker (issue #969)"
+        );
+        assert!(
+            !node.support_udp(),
+            "an unresolvable front still caps the advertisement at false"
+        );
+        let plain = p
+            .proxies()
+            .into_iter()
+            .find(|n| n.name() == "n2")
+            .expect("n2 must parse");
+        assert!(
+            !plain.is_dialer_proxy_non_transparent(),
+            "an unchained node must not bear the marker — mihomo's `continue` stands"
         );
     }
 

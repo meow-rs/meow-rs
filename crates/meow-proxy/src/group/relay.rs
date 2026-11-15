@@ -576,6 +576,21 @@ impl Proxy for RelayGroup {
         Some(self)
     }
 
+    /// The same peek `support_udp` makes — flatten without touching — so
+    /// the verdict names the exit member a UDP flow would dial. No exit
+    /// (two or more proxy hops, or a flatten error) leaves nothing the
+    /// chain pinned for this flow, so `false` keeps the slide as the
+    /// safe failure side (issue #969).
+    fn is_dialer_proxy_non_transparent(&self) -> bool {
+        let peek = Metadata {
+            network: meow_common::Network::Udp,
+            ..Default::default()
+        };
+        flatten_hops(&self.proxies, &peek, false).is_ok_and(|hops| {
+            udp_exit(&hops).is_some_and(|exit| exit.is_dialer_proxy_non_transparent())
+        })
+    }
+
     fn members(&self) -> Option<Vec<String>> {
         Some(self.proxies.iter().map(|p| p.name().to_string()).collect())
     }
@@ -1486,6 +1501,46 @@ mod tests {
             );
             assert!(a_udp.lock().is_empty(), "exit_first={exit_first}");
         }
+    }
+
+    // C5b (issue #969): a chained, UDP-incapable *exit* makes the relay
+    // answer the pair the match probe reads — `support_udp() == false`
+    // plus `is_dialer_proxy_non_transparent() == true` — so the scan
+    // stops on the matched rule instead of sliding to a later target.
+    // The verdict names the same exit `support_udp`'s peek resolves.
+    #[test]
+    fn relay_udp_exit_chained_udp_incapable_fails_closed() {
+        let chained: Arc<dyn Proxy> = Arc::new(DialerProxyAdapter::new(
+            MockProxy::new("chained-exit", "10.0.0.9", 8443, 9),
+            crate::dialer::DialerTarget::new(
+                "never-resolved",
+                &crate::dialer::ProxyRegistry::default(),
+            ),
+        ));
+        let group = RelayGroup::new("udp-chained-exit", vec![MockProxy::direct(), chained]);
+
+        assert!(
+            !group.support_udp(),
+            "the single proxy hop is the exit — a chained leaf that cannot carry UDP"
+        );
+        assert!(
+            group.is_dialer_proxy_non_transparent(),
+            "the fail-closed verdict must name the same exit support_udp peeks"
+        );
+
+        // The no-exit case answers `false`: two or more proxy hops leave
+        // UDP unchainable — a limitation of the relay itself, not a
+        // chained pin a slide could bypass — so `Missing` stays the safe
+        // failure side.
+        let two_hop = RelayGroup::new(
+            "udp-two-hops",
+            vec![
+                MockProxy::new("a", "10.0.0.1", 1080, 1),
+                MockProxy::new("b", "10.0.0.2", 1081, 2),
+            ],
+        );
+        assert!(!two_hop.support_udp());
+        assert!(!two_hop.is_dialer_proxy_non_transparent());
     }
 
     // C6: a group or nested relay member that resolves to one proxy hop

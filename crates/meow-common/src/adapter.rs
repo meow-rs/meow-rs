@@ -302,6 +302,16 @@ pub trait Proxy: ProxyAdapter {
     /// is used, so this default stays unreachable for it; any future
     /// wrapper that can sit above one must forward it (same contract as
     /// `dialer_hop`).
+    ///
+    /// Group adapters forward the verdict to the same member their UDP
+    /// flow would pick — the pick `support_udp` answers for: the
+    /// selector's selected member, the url-test/fallback pick, the
+    /// relay's UDP exit hop, or the load-balance live member set. A
+    /// chained pick pins the flow inside the declared chain just as a
+    /// chained leaf target does, so a group must not answer `false` for
+    /// one. The pick-at-check vs pick-at-dial race is the same one
+    /// `support_udp` already accepts, and a group with no pick answers
+    /// `false` — `Missing`, the slide, is the safe failure side.
     fn is_dialer_proxy_non_transparent(&self) -> bool {
         false
     }

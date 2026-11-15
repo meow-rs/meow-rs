@@ -397,6 +397,16 @@ impl Proxy for UrlTestGroup {
         self.health.alive() && self.fastest_proxy().is_some_and(|p| p.alive_for_url(url))
     }
 
+    /// Forward to the same member `support_udp` consults — the
+    /// `pick_for_dial` recompute a UDP dial would make (not the stale
+    /// `fastest` cache), so the verdict tracks the member the flow would
+    /// actually reach. `false` on no pick: the slide is the safe failure
+    /// side (issue #969).
+    fn is_dialer_proxy_non_transparent(&self) -> bool {
+        self.pick_for_dial()
+            .is_some_and(|p| p.is_dialer_proxy_non_transparent())
+    }
+
     fn last_delay(&self) -> u16 {
         self.fastest_proxy().map_or(0, |p| p.last_delay())
     }
@@ -774,5 +784,40 @@ mod tests {
         assert!(!g.alive() && !g.alive_for_url("https://x"));
         g.health().record_delay(50);
         assert!(g.alive());
+    }
+
+    /// Issue #969: when `pick_for_dial` lands on a `dialer-proxy`-chained,
+    /// UDP-incapable member the group must answer the pair the match probe
+    /// reads — `support_udp() == false` and
+    /// `is_dialer_proxy_non_transparent() == true` — so the scan stops on
+    /// the matched rule instead of sliding to a later target. The verdict
+    /// comes from the same `pick_for_dial` recompute `support_udp` makes,
+    /// not the stale `fastest` cache or a member-set scan.
+    #[test]
+    fn urltest_pick_chained_udp_incapable_fails_closed() {
+        // The chained member is the *faster* pick: delay ordering, not
+        // member order, decides which verdict the group reports.
+        let chained_inner = MockProxy::new_udp_unsupported("chained", AdapterType::Snell);
+        chained_inner.set_delay(10);
+        let chained: Arc<dyn Proxy> = Arc::new(crate::DialerProxyAdapter::new(
+            chained_inner,
+            crate::dialer::DialerTarget::new(
+                "never-resolved",
+                &crate::dialer::ProxyRegistry::default(),
+            ),
+        ));
+        let udp_ok = MockProxy::new_udp("udp-ok");
+        udp_ok.set_delay(50);
+        let g = UrlTestGroup::new("ut", vec![udp_ok, chained], 0);
+
+        assert_eq!(g.pick_for_dial().unwrap().name(), "chained");
+        assert!(
+            !g.support_udp(),
+            "the fastest pick cannot carry UDP — the group advertises its pick, not its member set"
+        );
+        assert!(
+            g.is_dialer_proxy_non_transparent(),
+            "the fail-closed verdict must follow the same pick support_udp consults"
+        );
     }
 }
