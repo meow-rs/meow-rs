@@ -222,17 +222,22 @@ the canonical, in-repo source a release is cut from.
   every stream on the association stalled behind a single slow front
   hop. `poll_send` now uses `try_send` (quic-go's semantics: QUIC's own
   loss recovery absorbs a dropped datagram, a stalled driver cannot be
-  recovered), with a `dropped_tx` counter for observability, queues grow
-  256→4096, UDP receive buffers grow to 7 MiB, the front hop gets a
-  1280 MTU hint, and the receive batch grows 32→128. `quiche` and
-  `shadowsocks` are now compiled at `opt-level=3`.
+  recovered), with a `dropped_tx` counter for observability. The
+  outbound queue stays shallow at 512 (a deeper tail-drop FIFO would
+  delay the loss signal and inflate quiche's RTT/BDP estimate) while
+  the inbound queue grows 256→4096, UDP receive buffers grow to 7 MiB,
+  the front hop gets a 1280 MTU hint, and the receive batch grows
+  32→128. `quiche` and `shadowsocks` are now compiled at `opt-level=3`.
 
 - **BoringTLS client connections resume sessions from a per-`SSL_CTX`
   ticket store.** Each connector keeps a 64-entry FIFO of
   `SslSession`s keyed by SNI, offers the newest via `SSL_set_session`
   only within the same context, and drops an SNI's whole queue when a
-  handshake fails (peer restart or ticket-key rotation makes stale
-  tickets actively harmful). Verified live: `session_reused=true` on the
+  handshake that offered a ticket fails (peer restart or ticket-key
+  rotation makes stale tickets actively harmful). A node configured
+  with `cert-pin` or `verify-name` never offers a cached ticket — a
+  resumed handshake carries no Certificate for the override check to
+  inspect. Verified live: `session_reused=true` on the
   `boring TLS handshake complete` debug line against sing-box. A
   `vless connect breakdown` debug line now reports per-phase connect
   timings (`tcp_ms`/`tls_ms`/`vless_ms`) for VLESS dials, plus first
