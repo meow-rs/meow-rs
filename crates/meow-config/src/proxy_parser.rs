@@ -2530,7 +2530,9 @@ fn ws_max_early_data(ws_opts: Option<&serde_json::Value>) -> usize {
 ///
 /// - `tls: false` with plain VLESS — plaintext, but correct destination
 /// - `mux: { enabled: true }` — sing-mux multiplexing (server must be sing-box/mihomo)
-/// - `flow: xtls-rprx-vision` + `udp: true` — Vision is TCP-only; UDP uses plain VLESS
+/// - `flow: xtls-rprx-vision` + `udp: true` — Vision is TCP-only; UDP rides
+///   a Mux.Cool substream with the flow addon (or reports unsupported
+///   without the `mux` feature)
 /// - `reality-opts.short-id` given as a bare YAML number (e.g. `0x1f`) —
 ///   coerced to its decimal digits before hex-decoding (matching mihomo),
 ///   which can silently reinterpret the value; quote it to preserve the
@@ -2718,8 +2720,10 @@ fn parse_vless(
         tracing::warn!(
             proxy = %name,
             "flow: xtls-rprx-vision applies to TCP only; UDP relays on \
-             this proxy will use plain VLESS (Vision's inner-TLS splice \
-             is not defined for UDP datagrams). (Class B divergence)"
+             this proxy ride a per-association Mux.Cool substream carrying \
+             the flow addon (as upstream clients do — strict servers reject \
+             a bare Cmd::Udp on vision accounts). Without the `mux` feature \
+             this node reports `udp: false`. (Class B divergence)"
         );
     }
 

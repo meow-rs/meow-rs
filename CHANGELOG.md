@@ -190,8 +190,17 @@ the canonical, in-repo source a release is cut from.
   follow-up); TrustTunnel `quic: false` keeps its existing TCP path. A
   hysteria2 node's `ports`/`hop-interval` hopping is ignored with a
   warning beside a chain — a bound front association has no second port
-  to hop to. `anytls`, `direct`, and `ss` with an external SIP003 plugin
-  still cannot take an injected dialer (relay-based wrapper fallback).
+  to hop to. `direct` and `ss` with an external SIP003 plugin still
+  cannot take an injected dialer (relay-based wrapper fallback).
+
+- **`dialer-proxy` on `anytls` nodes** — the vendored client accepts a
+  per-instance transport dialer, so the session's TCP transport rides the
+  injected front hop while TLS, auth, and stream framing stay on the
+  client's own `TlsConnect` path (identical SNI/ALPN/verify profile to
+  direct dials). Chained sessions pool, reuse, and reset exactly like
+  direct ones; `udp: true` UoT rides the same chained session, and a
+  front that cannot dial fails closed rather than falling back to a
+  direct connection. `connect_over` relay sessions remain unpooled.
 
 ### Changed
 
@@ -479,6 +488,31 @@ the canonical, in-repo source a release is cut from.
   chain. Provider-sourced nodes whose `dialer-proxy` was injected are
   marked `ChainedProxy` exactly like static `proxies:` entries, closing
   the last spot a chained leaf could answer `false` (#969).
+
+- **`vless` `flow: xtls-rprx-vision` UDP no longer sends a bare
+  `Cmd::Udp` request** — strict servers (sing-box ≥1.12's vendored
+  sing-vmess `vless.Service`) validate `request.Flow == account.Flow` on
+  every command, so the empty-addon datagram request was rejected with
+  `flow mismatch` and UDP timed out while TCP worked. Vision UDP now
+  rides a per-association Mux.Cool session — a `CommandMux` request
+  carrying the `xtls-rprx-vision` addon with the datagrams as a
+  `network=0x02` substream — the shape xray, mihomo and sing-box
+  clients use. A domain `UdpTarget::Name` warns once and falls back to
+  the bare request; without the `mux` feature a vision node reports
+  `support_udp() = false`. Non-vision UDP is unchanged.
+
+- **WireGuard UDP flows now recover after session expiry without waiting
+  for TCP traffic.** `encapsulate`'s no-session arm deduped on
+  `is_in_progress()`, so for the whole post-expiry retry generation —
+  up to a `REKEY_ATTEMPT_TIME` window — a fresh datagram could only
+  queue behind the in-flight `InitSent` and was silently dropped when
+  the generation gave up; only smoltcp's retransmitted TCP SYNs stayed
+  queue-resident long enough to flush on completion. Matching the
+  kernel's `wg_packet_send_queued_handshake_initiation`, an in-flight
+  initiation whose birthdate is older than `REKEY_TIMEOUT` is now
+  re-armed by packet pressure — the same forced-resend call
+  `update_timers` makes on a rekey timeout, throttled at the same 5 s
+  floor.
 
 ## [0.29.0] - 2026-11-05
 

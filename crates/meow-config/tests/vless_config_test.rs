@@ -1493,9 +1493,11 @@ proxies:
 ///
 /// `flow: "xtls-rprx-vision"` + `udp: true` + `tls: true` → parse succeeds;
 /// at least one warn mentioning both "UDP" and "Vision" (or lowercase equivalents).
-/// Class B per ADR-0002 row #7: Vision is TCP-only; UDP uses plain VLESS.
+/// Class B per ADR-0002 row #7: Vision is TCP-only; UDP rides a Mux.Cool
+/// substream carrying the flow addon (upstream clients' XUDP shape).
 /// NOT hard-error: crypto and routing are unchanged on the UDP path.
-/// upstream: upstream UDP also silently uses plain VLESS; we warn once at load.
+/// upstream: upstream sends UDP through the flow'd mux stream; we warn once
+/// at load because the wire shape differs from a plain `Cmd::Udp`.
 #[tokio::test]
 async fn parse_vless_vision_udp_true_warns_once() {
     let yaml = r#"
