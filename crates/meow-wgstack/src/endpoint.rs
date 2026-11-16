@@ -841,6 +841,23 @@ impl WakeFd {
         let mut fds = [0i32; 2];
         let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
         assert!(rc == 0, "wg-rx wake socketpair");
+        #[cfg(target_os = "macos")]
+        {
+            // Darwin honors `MSG_NOSIGNAL` per-send; `SO_NOSIGPIPE`
+            // on the write end is the platform's canonical knob —
+            // belt-and-suspenders so no call-site flag is load-bearing.
+            let on: i32 = 1;
+            let rc = unsafe {
+                libc::setsockopt(
+                    fds[1],
+                    libc::SOL_SOCKET,
+                    libc::SO_NOSIGPIPE,
+                    &on as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&on) as libc::socklen_t,
+                )
+            };
+            assert!(rc == 0, "SO_NOSIGPIPE on wg-rx wake socket");
+        }
         (Arc::new(Self(fds[1])), fds[0])
     }
 }
