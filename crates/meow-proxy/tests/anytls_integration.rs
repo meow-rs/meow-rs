@@ -16,7 +16,8 @@ use anytls_rs::client::UDP_OVER_TCP_MAGIC_ADDR;
 use anytls_rs::padding::PaddingFactory;
 use anytls_rs::protocol::Command;
 use anytls_rs::server::Server as AnytlsServer;
-use meow_common::{Metadata, Network, ProxyAdapter};
+use bytes::BufMut;
+use meow_common::{Metadata, Network, ProxyAdapter, ProxyConn};
 use meow_proxy::dialer::TcpDialer;
 use meow_proxy::{AnytlsAdapter, AnytlsTlsOptions};
 use sha2::{Digest, Sha256};
@@ -1702,34 +1703,23 @@ async fn anytls_write_bytes_headroom_round_trip_exact() {
 
     const SLOT: usize = 64 * 1024;
     const TOTAL: usize = 4 * 1024 * 1024;
-    let (mut rd, mut wr) = tokio::io::split(&mut conn);
 
-    // Reader: count non-0x41 bytes.
-    let reader = tokio::spawn(async move {
-        let mut got = 0usize;
-        let mut alien = Vec::new();
-        let mut buf = vec![0u8; SLOT];
-        while got < TOTAL {
-            let n = rd.read(&mut buf).await.unwrap();
-            if n == 0 {
-                break;
-            }
-            for (i, &b) in buf[..n].iter().enumerate() {
-                if b != 0x41 {
-                    alien.push(got + i);
-                }
-            }
-            got += n;
-        }
-        (got, alien)
-    });
-
-    // Writer: relay-shaped slot feeding through the conn's WriteBytes view.
-    let writer = tokio::spawn(async move {
-        let mut bm = bytes::BytesMut::with_capacity(SLOT);
-        let mut pending: Option<bytes::BytesMut> = None;
-        let mut sent = 0usize;
-        while sent < TOTAL {
+    // One task drives both legs on the same `&mut conn` — exactly what
+    // `copy_bidirectional_buf_tracked_wg` does (a single poller that
+    // alternates reader/writer borrows): `write_bytes()` hands out a
+    // `&mut dyn WriteBytes` view borrowed from the conn, so splitting
+    // the conn up-front would make the view unreachable. Write one
+    // relay-shaped slot, drain its echo, repeat — a pure write-then-read
+    // burst would deadlock once the server's write-side kernel buffer
+    // fills and it stops draining our writes.
+    let mut bm = bytes::BytesMut::with_capacity(SLOT);
+    let mut pending: Option<bytes::BytesMut> = None;
+    let mut sent = 0usize;
+    let mut got = 0usize;
+    let mut alien = Vec::new();
+    let mut buf = vec![0u8; SLOT];
+    while got < TOTAL {
+        if sent < TOTAL {
             if pending.is_none() {
                 if bm.capacity() - bm.len() < SLOT && !bm.try_reclaim(SLOT) {
                     bm.reserve(SLOT);
@@ -1740,7 +1730,7 @@ async fn anytls_write_bytes_headroom_round_trip_exact() {
                 sent += n;
                 pending = Some(bm.split_to(bm.len()));
             }
-            let wb = wr
+            let wb = conn
                 .write_bytes()
                 .expect("anytls conn must expose WriteBytes");
             std::future::poll_fn(|cx| {
@@ -1749,12 +1739,21 @@ async fn anytls_write_bytes_headroom_round_trip_exact() {
             .await
             .unwrap();
         }
-        // FIN-ish: flush then let conn linger for the echo.
-        wr.flush().await.unwrap();
-    });
+        // Drain the echo for what has been offered so far — the server
+        // returns exactly `sent` bytes, so this always terminates.
+        while got < sent {
+            let n = timeout(T, conn.read(&mut buf)).await.unwrap().unwrap();
+            assert!(n > 0, "echo closed early at {got}/{TOTAL}");
+            for (i, &b) in buf[..n].iter().enumerate() {
+                if b != 0x41 {
+                    alien.push(got + i);
+                }
+            }
+            got += n;
+        }
+    }
+    conn.flush().await.unwrap();
 
-    writer.await.unwrap();
-    let (got, alien) = timeout(T, reader).await.unwrap().unwrap();
     assert_eq!(got, TOTAL, "echoed byte count");
     assert!(alien.is_empty(), "alien bytes at offsets {alien:?}");
 }
