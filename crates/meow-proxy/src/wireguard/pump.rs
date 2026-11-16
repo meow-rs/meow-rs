@@ -4447,7 +4447,7 @@ mod tests {
                 match receiver_std.recv(&mut buf) {
                     Ok(n) => got.push(buf[..n].to_vec()),
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::yield_now()
+                        std::thread::yield_now();
                     }
                     Err(_) => break,
                 }
