@@ -32,6 +32,7 @@
 use std::collections::VecDeque;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -91,6 +92,14 @@ impl BatchEndpoint {
     /// Nonblocking single-datagram receive (connected peer).
     pub fn try_recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         self.inner.try_recv(buf)
+    }
+
+    /// The kernel fd — the bridge thread's blocking `poll` waits on
+    /// it directly rather than on tokio's cached readiness.
+    #[cfg(unix)]
+    pub fn raw_fd(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd;
+        self.inner.as_raw_fd()
     }
 
     /// Nonblocking single-datagram receive, reporting the source.
@@ -816,6 +825,17 @@ impl Drop for NotifyOnDrop {
     }
 }
 
+/// `NotifyOnDrop`'s sibling for the [`AtomicBool`] edge the
+/// `BridgedEndpoint` RX thread watches: the TX task holds one so its
+/// exit flags the RX bridge down the same way endpoint `Drop` does.
+struct FlagOnDrop(Arc<AtomicBool>);
+
+impl Drop for FlagOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
 /// A [`ProxyPacketConn`] (async) bridged onto the pump's synchronous
 /// `try_recv`/`try_send`/`recv`/`recv_batch`/`send_batch` surface by two
 /// bounded mpsc queues and two tokio bridge tasks spawned at
@@ -1073,9 +1093,9 @@ impl Drop for ProxyEndpoint {
     }
 }
 
-/// The RX bridge's per-wake drain bound. A still-busy socket re-fires
-/// `readable()` the moment the task re-selects, so the cap only costs
-/// a select round — and it keeps the `shutdown` edge honest under a
+/// The RX bridge's per-wait drain bound. A still-busy socket reports
+/// `POLLIN` again the moment `poll` re-arms, so the cap only costs a
+/// wait round — and it keeps the `shutdown` edge honest under a
 /// permanent flood. Sized to the bridge queue: one wake can fill the
 /// channel exactly once before backpressure parks the `send` anyway.
 const RX_WAKE_CAP: usize = BRIDGE_RX_QUEUE;
@@ -1120,13 +1140,17 @@ const BRIDGE_SLOT: usize = 4096;
 /// kernel I/O on readiness — µs-scale drain latency, independent of
 /// pass length:
 ///
-/// - **RX task** parks on `readable()`, then drains the socket into a
-///   bounded channel — `recv_batch` rounds on a connected socket,
-///   `try_recv_from` per datagram on an unconnected one (the listener
-///   demux needs each source; it was already per-datagram on the pass,
-///   so the task shape costs no syscalls). A full channel parks the
-///   `send` — pressure falls back onto `SO_RCVBUF`, the designed
-///   absorber, instead of unbounded task memory.
+/// - **RX thread** — a dedicated OS thread, not a runtime task —
+///   parks on `poll(fd)` then drains the socket into a bounded
+///   channel: `recv_batch` rounds on a connected socket,
+///   `recv_batch_from` on an unconnected one (the listener demux needs
+///   each source). Owning the drain in a thread removes the last
+///   scheduling hop: tokio can queue a woken task behind a
+///   synchronous actor pass on the same worker, and that stall alone
+///   was still overflowing `SO_RCVBUF` under wire bursts with the
+///   channel never full. A full channel parks `blocking_send` —
+///   pressure falls back onto `SO_RCVBUF`, the designed absorber,
+///   instead of unbounded memory.
 /// - **TX task** drains a bounded channel through `send_batch_to`,
 ///   replaying the short-count boundary datagram with `try_send*` to
 ///   split `WouldBlock` (await `writable`, retry) from a real errno
@@ -1138,9 +1162,10 @@ const BRIDGE_SLOT: usize = 4096;
 ///
 /// Datagram ordering is end-to-end FIFO: the socket delivers in order,
 /// the channels are FIFO, and the TX task emits in channel order.
-/// Teardown mirrors [`ProxyEndpoint`]: separate [`Notify`] edges per
-/// direction, and the TX task's [`NotifyOnDrop`] pulses the RX edge so
-/// its parked `readable()` never outlives a dead twin.
+/// Teardown mirrors [`ProxyEndpoint`]: an [`AtomicBool`] edge for the
+/// RX thread, a [`Notify`] edge for the TX task, and the TX task's
+/// [`FlagOnDrop`] flags the RX edge so a dead twin never leaves the
+/// thread parked on a quiet socket.
 pub struct BridgedEndpoint {
     /// Wire RX: `(src, datagram)` pairs the RX bridge pulled off the
     /// socket. On a connected socket `src` is the bound peer (the
@@ -1153,16 +1178,17 @@ pub struct BridgedEndpoint {
     /// and on connected RX sources; `None` on an unconnected endpoint,
     /// where `try_send` reports `NotConnected` like a std socket.
     peer: Option<SocketAddr>,
-    /// Drop edge for the RX bridge's parked `readable()`.
-    shutdown_rx: Arc<Notify>,
+    /// Drop edge the RX bridge thread polls between socket waits.
+    shutdown_rx: Arc<AtomicBool>,
     /// Drop edge for the TX bridge's parked `recv`/`writable()`.
     shutdown_tx: Arc<Notify>,
-    /// The kernel socket, shared with both bridge tasks — also the
+    /// The kernel socket, shared with both bridge halves — also the
     /// `local_addr` source.
     endpoint: Arc<BatchEndpoint>,
-    /// The two bridge tasks; kept so their lifetime reads as owned by
-    /// the endpoint (each is self-terminating on channel close).
-    _bridge: (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>),
+    /// The bridge workers; kept so their lifetime reads as owned by
+    /// the endpoint (each is self-terminating on channel close or the
+    /// shutdown edge). RX is an OS thread, TX a runtime task.
+    _bridge: (std::thread::JoinHandle<()>, tokio::task::JoinHandle<()>),
 }
 
 impl BridgedEndpoint {
@@ -1187,129 +1213,135 @@ impl BridgedEndpoint {
         let ep = Arc::new(ep);
         let (wire_tx, wire_rx) = mpsc::channel(BRIDGE_RX_QUEUE);
         let (pump_tx, pump_rx) = mpsc::channel(PROXY_ENDPOINT_QUEUE);
-        let shutdown_rx = Arc::new(Notify::new());
+        let shutdown_rx = Arc::new(AtomicBool::new(false));
         let shutdown_tx = Arc::new(Notify::new());
 
-        let rx_task = tokio::spawn({
-            let ep = Arc::clone(&ep);
-            let shutdown = Arc::clone(&shutdown_rx);
-            async move {
-                // Both socket shapes batch the kernel drain —
-                // `recv_batch` connected, `recv_batch_from`
-                // unconnected (the listener's demux keeps every real
-                // source) — then one gated `try_recv*` tail clears the
-                // cached readiness the raw-fd batch can't touch.
-                let mut staged: Vec<Vec<u8>> = (0..WIRE_DRAIN_BUDGET)
-                    .map(|_| Vec::with_capacity(BRIDGE_SLOT))
-                    .collect();
-                let mut staged_addrs: Vec<SocketAddr> =
-                    vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0); WIRE_DRAIN_BUDGET];
-                let mut single = vec![0u8; BRIDGE_BUF];
-                'outer: loop {
-                    let r = tokio::select! {
-                        biased;
-                        _ = shutdown.notified() => break,
-                        r = ep.readable() => r,
-                    };
-                    // A dead fd ends the bridge: dropping `wire_tx`
-                    // closes the channel, and the actor's recv sees
-                    // `ConnectionReset` — the terminal verdict.
-                    if r.is_err() {
-                        break;
-                    }
-                    let mut spent = 0usize;
-                    while spent < RX_WAKE_CAP {
-                        if let Some(peer) = peer {
-                            let n = ep.recv_batch(&mut staged, WIRE_DRAIN_BUDGET);
-                            spent += n;
-                            for slot in &staged[..n] {
-                                if wire_tx
-                                    .send((peer, Bytes::copy_from_slice(slot)))
-                                    .await
-                                    .is_err()
-                                {
-                                    break 'outer;
-                                }
+        // A dedicated OS thread owns the kernel drain — not a runtime
+        // task. Tokio can queue a woken task behind a synchronous
+        // actor pass on the same worker, and every millisecond the
+        // socket goes unread is kernel buffer a wire burst turns into
+        // drops (observed: channel never full, Recv-Q still overflowed
+        // — the bridge itself, not the channel, was the stall). A
+        // `poll` on the raw fd parks the thread on kernel state
+        // directly: no scheduler stands between the wire and the
+        // drain. `blocking_send` is the same backpressure edge the
+        // async `send().await` was — the channel-full park moves from
+        // executor bookkeeping to a plain futex.
+        let rx_thread = std::thread::Builder::new()
+            .name("wg-rx-bridge".into())
+            .spawn({
+                let ep = Arc::clone(&ep);
+                let shutdown = Arc::clone(&shutdown_rx);
+                move || {
+                    // Both socket shapes batch the kernel drain —
+                    // `recv_batch` connected, `recv_batch_from`
+                    // unconnected (the listener's demux keeps every
+                    // real source) — then one `try_recv*` tail confirms
+                    // a short batch really means dry and catches a
+                    // straggler that landed mid-drain.
+                    let mut staged: Vec<Vec<u8>> = (0..WIRE_DRAIN_BUDGET)
+                        .map(|_| Vec::with_capacity(BRIDGE_SLOT))
+                        .collect();
+                    let mut staged_addrs: Vec<SocketAddr> =
+                        vec![
+                            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+                            WIRE_DRAIN_BUDGET
+                        ];
+                    let mut single = vec![0u8; BRIDGE_BUF];
+                    'outer: loop {
+                        // Wait for the fd itself; the timeout only sets
+                        // how often the shutdown flag is re-checked on
+                        // a quiet socket. Errors (incl. POLLERR) fall
+                        // through to the drain, where `try_recv*`
+                        // surfaces a persistent error as terminal.
+                        #[cfg(unix)]
+                        {
+                            let mut pfd = libc::pollfd {
+                                fd: ep.raw_fd(),
+                                events: libc::POLLIN,
+                                revents: 0,
+                            };
+                            unsafe {
+                                libc::poll(&mut pfd, 1, 50);
                             }
-                            if n < staged.len() {
-                                // `recv_batch` drains through the raw fd,
-                                // invisible to tokio's readiness tracking —
-                                // a short batch means the kernel queue is
-                                // dry, so finish with one gated `try_recv`.
-                                // It clears the cached readable bit so the
-                                // next `readable()` parks on true kernel
-                                // state, delivers a straggler that landed
-                                // mid-drain, and surfaces a persistent
-                                // socket error as terminal.
-                                match ep.try_recv(&mut single) {
-                                    Ok(m) => {
-                                        spent += 1;
-                                        let pkt = Bytes::copy_from_slice(&single[..m]);
-                                        if wire_tx.send((peer, pkt)).await.is_err() {
-                                            break 'outer;
-                                        }
-                                        continue;
+                        }
+                        #[cfg(not(unix))]
+                        std::thread::sleep(Duration::from_millis(1));
+
+                        if shutdown.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let mut spent = 0usize;
+                        while spent < RX_WAKE_CAP {
+                            if shutdown.load(Ordering::Relaxed) {
+                                break 'outer;
+                            }
+                            if let Some(peer) = peer {
+                                let n = ep.recv_batch(&mut staged, WIRE_DRAIN_BUDGET);
+                                spent += n;
+                                for slot in &staged[..n] {
+                                    if wire_tx
+                                        .blocking_send((peer, Bytes::copy_from_slice(slot)))
+                                        .is_err()
+                                    {
+                                        break 'outer;
                                     }
-                                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                                    Err(_) => break 'outer,
                                 }
-                            }
-                        } else {
-                            // Same batch drain as the connected arm,
-                            // via `recv_batch_from`: per-datagram
-                            // `try_recv_from` costs a tokio `try_io` +
-                            // syscall each — under a multi-hundred-k/s
-                            // flood that serialises the bridge below
-                            // wire rate and the kernel buffer takes
-                            // the overflow as drops. The batch reads
-                            // up to `WIRE_DRAIN_BUDGET` per syscall and
-                            // still reports every source.
-                            let n = ep.recv_batch_from(
-                                &mut staged,
-                                &mut staged_addrs,
-                                WIRE_DRAIN_BUDGET,
-                            );
-                            spent += n;
-                            for (buf, src) in staged[..n].iter_mut().zip(&staged_addrs[..n]) {
-                                if wire_tx
-                                    .send((*src, Bytes::copy_from_slice(buf)))
-                                    .await
-                                    .is_err()
-                                {
-                                    break 'outer;
-                                }
-                            }
-                            if n < staged.len() {
-                                // The gated-tail contract the
-                                // connected arm documents: a short
-                                // batch means dry — clear the cached
-                                // bit and catch a straggler.
-                                match ep.try_recv_from(&mut single) {
-                                    Ok((m, src)) => {
-                                        spent += 1;
-                                        let pkt = Bytes::copy_from_slice(&single[..m]);
-                                        if wire_tx.send((src, pkt)).await.is_err() {
-                                            break 'outer;
+                                if n < staged.len() {
+                                    match ep.try_recv(&mut single) {
+                                        Ok(m) => {
+                                            spent += 1;
+                                            let pkt = Bytes::copy_from_slice(&single[..m]);
+                                            if wire_tx.blocking_send((peer, pkt)).is_err() {
+                                                break 'outer;
+                                            }
+                                            continue;
                                         }
-                                        continue;
+                                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                                        Err(_) => break 'outer,
                                     }
-                                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                                    Err(_) => break 'outer,
+                                }
+                            } else {
+                                let n = ep.recv_batch_from(
+                                    &mut staged,
+                                    &mut staged_addrs,
+                                    WIRE_DRAIN_BUDGET,
+                                );
+                                spent += n;
+                                for (buf, src) in staged[..n].iter().zip(&staged_addrs[..n]) {
+                                    let item = (*src, Bytes::copy_from_slice(buf));
+                                    if wire_tx.blocking_send(item).is_err() {
+                                        break 'outer;
+                                    }
+                                }
+                                if n < staged.len() {
+                                    match ep.try_recv_from(&mut single) {
+                                        Ok((m, src)) => {
+                                            spent += 1;
+                                            let pkt = Bytes::copy_from_slice(&single[..m]);
+                                            if wire_tx.blocking_send((src, pkt)).is_err() {
+                                                break 'outer;
+                                            }
+                                            continue;
+                                        }
+                                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                                        Err(_) => break 'outer,
+                                    }
                                 }
                             }
                         }
                     }
                 }
-            }
-        });
+            })
+            .expect("spawn wg-rx-bridge");
 
         let tx_task = tokio::spawn({
             let ep = Arc::clone(&ep);
             let shutdown = Arc::clone(&shutdown_tx);
-            let rx_pulse = NotifyOnDrop(Arc::clone(&shutdown_rx));
+            let rx_pulse = FlagOnDrop(Arc::clone(&shutdown_rx));
             async move {
-                // Pulses the RX edge after the loop on *every* exit —
-                // see `NotifyOnDrop`.
+                // Flags the RX thread after the loop on *every* exit —
+                // see `FlagOnDrop`.
                 let _rx_pulse = rx_pulse;
                 let mut pump_rx = pump_rx;
                 // Staged flush batch: `sendq` grows only from channel
@@ -1390,7 +1422,7 @@ impl BridgedEndpoint {
             shutdown_rx,
             shutdown_tx,
             endpoint: ep,
-            _bridge: (rx_task, tx_task),
+            _bridge: (rx_thread, tx_task),
         }
     }
 
@@ -1544,10 +1576,10 @@ impl BridgedEndpoint {
 
 impl Drop for BridgedEndpoint {
     /// The `ProxyEndpoint` contract verbatim: pulse both edges so a
-    /// parked `readable()` or `writable()` unwinds, then the channel
-    /// closes on field teardown cover the tasks' `send`/`recv` arms.
+    /// parked `poll` or `writable()` unwinds, then the channel closes
+    /// on field teardown cover the workers' `send`/`recv` arms.
     fn drop(&mut self) {
-        self.shutdown_rx.notify_one();
+        self.shutdown_rx.store(true, Ordering::Relaxed);
         self.shutdown_tx.notify_one();
     }
 }
@@ -2831,11 +2863,11 @@ mod tests {
 
     /// RX bridge exit closes the channel: `recv` reports
     /// `ConnectionReset`, the terminal verdict the pump's error arm
-    /// stops on. The `shutdown_rx` pulse is what `Drop` sends.
+    /// stops on. The `shutdown_rx` flag is what `Drop` sets.
     #[tokio::test(flavor = "current_thread")]
     async fn bridged_rx_bridge_exit_is_connection_reset() {
         let (mut ep, _receiver) = bridged_pair();
-        ep.shutdown_rx.notify_one();
+        ep.shutdown_rx.store(true, Ordering::Relaxed);
         let mut buf = vec![0u8; 64];
         let err = tokio::time::timeout(Duration::from_secs(5), ep.recv(&mut buf))
             .await
@@ -2865,20 +2897,23 @@ mod tests {
         dead.expect("TX bridge must exit on its shutdown edge");
     }
 
-    /// Dropping the endpoint pulses both edges: a `notify_one` stores
-    /// its permit when nothing waits, so a `notified()` armed after
-    /// `drop` resolves only if `Drop` actually fired the edge — a
-    /// task parked on `readable()`/`recv()` unwinds the same way.
+    /// Dropping the endpoint pulses both edges: the RX flag reads set
+    /// the moment `drop` returns, and a `notify_one` stores its TX
+    /// permit when nothing waits, so `notified()` armed after `drop`
+    /// resolves only if `Drop` actually fired the edge — a task
+    /// parked on `writable()`/`recv()` unwinds the same way.
     #[tokio::test(flavor = "current_thread")]
     async fn bridged_drop_pulses_both_edges() {
         let (ep, _receiver) = bridged_pair();
         let shutdown_rx = Arc::clone(&ep.shutdown_rx);
         let shutdown_tx = Arc::clone(&ep.shutdown_tx);
         drop(ep);
-        for (name, edge) in [("rx", shutdown_rx), ("tx", shutdown_tx)] {
-            tokio::time::timeout(Duration::from_secs(5), edge.notified())
-                .await
-                .unwrap_or_else(|_| panic!("drop must pulse the {name} edge"));
-        }
+        assert!(
+            shutdown_rx.load(Ordering::Relaxed),
+            "drop must flag the rx edge"
+        );
+        tokio::time::timeout(Duration::from_secs(5), shutdown_tx.notified())
+            .await
+            .expect("drop must pulse the tx edge");
     }
 }
