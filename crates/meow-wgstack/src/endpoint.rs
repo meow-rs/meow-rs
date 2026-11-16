@@ -825,14 +825,46 @@ impl Drop for NotifyOnDrop {
     }
 }
 
-/// `BridgedEndpoint`'s RX-leg stop edge — both shapes at once so the
+/// A one-byte wake signal for the RX thread's `poll`: the read end
+/// sits in its fd set, the write end lives in [`RxStop`]. `send` with
+/// `MSG_NOSIGNAL` so a `stop()` landing after the thread already
+/// exited (read end closed) is a harmless `EPIPE`, never a fatal
+/// `SIGPIPE` to the process.
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+struct WakeFd(std::os::fd::RawFd);
+
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+impl WakeFd {
+    /// `(write end, read end)` — write lives in `RxStop`, read is
+    /// handed to the thread (which owns and closes it on exit).
+    fn pair() -> (Arc<Self>, std::os::fd::RawFd) {
+        let mut fds = [0i32; 2];
+        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+        assert!(rc == 0, "wg-rx wake socketpair");
+        (Arc::new(Self(fds[1])), fds[0])
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+impl Drop for WakeFd {
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(self.0);
+        }
+    }
+}
+
+/// `BridgedEndpoint`'s RX-leg stop edge — every shape at once so the
 /// struct and its `Drop` never care which leg the platform spawned:
-/// the dedicated OS thread polls `flag` between kernel waits, the
-/// tokio task `select!`s on `pulse`. `stop()` fires both.
+/// the dedicated OS thread polls `flag` between kernel waits *and* is
+/// woken out of `poll` by a byte on `wake`, the tokio task `select!`s
+/// on `pulse`. `stop()` fires all three.
 #[derive(Clone)]
 struct RxStop {
     flag: Arc<AtomicBool>,
     pulse: Arc<Notify>,
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    wake: Option<Arc<WakeFd>>,
 }
 
 impl RxStop {
@@ -840,12 +872,27 @@ impl RxStop {
         Self {
             flag: Arc::new(AtomicBool::new(false)),
             pulse: Arc::new(Notify::new()),
+            #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+            wake: None,
         }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    fn with_wake(wake: Arc<WakeFd>) -> Self {
+        let mut s = Self::new();
+        s.wake = Some(wake);
+        s
     }
 
     fn stop(&self) {
         self.flag.store(true, Ordering::Relaxed);
         self.pulse.notify_one();
+        #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+        if let Some(w) = &self.wake {
+            unsafe {
+                libc::send(w.0, [1u8].as_ptr().cast(), 1, libc::MSG_NOSIGNAL);
+            }
+        }
     }
 }
 
@@ -1214,8 +1261,10 @@ pub struct BridgedEndpoint {
     /// the endpoint (each is self-terminating on channel close or the
     /// shutdown edge). RX is an OS thread where `libc::poll` reaches
     /// the fd (Linux/Android/macOS — the `libc` dependency platforms)
-    /// and a tokio task everywhere else; TX is a runtime task.
-    _bridge: (RxJoin, tokio::task::JoinHandle<()>),
+    /// and a tokio task everywhere else; TX is a runtime task. `Drop`
+    /// `take`s the RX handle to join it — the socket must actually be
+    /// released when teardown returns, not ~50 ms later.
+    _bridge: (Option<RxJoin>, tokio::task::JoinHandle<()>),
 }
 
 /// The RX leg's join handle — one variant per platform leg:
@@ -1257,10 +1306,9 @@ impl BridgedEndpoint {
         let ep = Arc::new(ep);
         let (wire_tx, wire_rx) = mpsc::channel(BRIDGE_RX_QUEUE);
         let (pump_tx, pump_rx) = mpsc::channel(PROXY_ENDPOINT_QUEUE);
-        let shutdown_rx = RxStop::new();
         let shutdown_tx = Arc::new(Notify::new());
 
-        let rx_join = Self::spawn_rx(&ep, peer, wire_tx, shutdown_rx.clone());
+        let (rx_join, shutdown_rx) = Self::spawn_rx(&ep, peer, wire_tx);
 
         let tx_task = tokio::spawn({
             let ep = Arc::clone(&ep);
@@ -1349,7 +1397,7 @@ impl BridgedEndpoint {
             shutdown_rx,
             shutdown_tx,
             endpoint: ep,
-            _bridge: (rx_join, tx_task),
+            _bridge: (Some(rx_join), tx_task),
         }
     }
 
@@ -1370,8 +1418,14 @@ impl BridgedEndpoint {
         ep: &Arc<BatchEndpoint>,
         peer: Option<SocketAddr>,
         wire_tx: mpsc::Sender<(SocketAddr, Bytes)>,
-        shutdown: RxStop,
-    ) -> RxJoin {
+    ) -> (RxJoin, RxStop) {
+        // The wake socketpair lets `stop()` interrupt `poll`
+        // immediately — `Drop` joins the thread and teardown cannot
+        // return while the socket fd is still owned (the
+        // `listener_shutdown_drain` port-rebind contract).
+        let (wake_w, wake_r) = WakeFd::pair();
+        let stop = RxStop::with_wake(wake_w);
+        let shutdown = stop.clone();
         let join = std::thread::Builder::new()
             .name("wg-rx-bridge".into())
             .spawn({
@@ -1393,27 +1447,39 @@ impl BridgedEndpoint {
                         ];
                     let mut single = vec![0u8; BRIDGE_BUF];
                     'outer: loop {
-                        // Wait on the fd itself; the timeout only sets
-                        // how often the shutdown flag is re-checked on
-                        // a quiet socket. `poll` returns early with
-                        // `-1` on a caught signal — re-poll on EINTR
-                        // instead of falling through to a WouldBlock
-                        // drain round-trip. POLLERR/POLLHUP/POLLNVAL
+                        // Wait on the fd itself *and* the wake edge;
+                        // the timeout only bounds how often the
+                        // shutdown flag is re-checked if the byte is
+                        // ever lost. `poll` returns early with `-1` on
+                        // a caught signal — re-poll on EINTR instead of
+                        // falling through to a WouldBlock drain
+                        // round-trip. POLLERR/POLLHUP/POLLNVAL
                         // deliberately fall through: `try_recv*` below
                         // surfaces a persistent fd error as terminal.
-                        let mut pfd = libc::pollfd {
-                            fd: ep.raw_fd(),
-                            events: libc::POLLIN,
-                            revents: 0,
-                        };
-                        while unsafe { libc::poll(&mut pfd, 1, 50) } < 0 {
+                        let mut pfds = [
+                            libc::pollfd {
+                                fd: ep.raw_fd(),
+                                events: libc::POLLIN,
+                                revents: 0,
+                            },
+                            libc::pollfd {
+                                fd: wake_r,
+                                events: libc::POLLIN,
+                                revents: 0,
+                            },
+                        ];
+                        while unsafe { libc::poll(pfds.as_mut_ptr(), 2, 50) } < 0 {
                             if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
                                 break;
                             }
-                            pfd.revents = 0;
+                            for p in &mut pfds {
+                                p.revents = 0;
+                            }
                         }
 
-                        if shutdown.flag.load(Ordering::Relaxed) {
+                        if shutdown.flag.load(Ordering::Relaxed)
+                            || pfds[1].revents & libc::POLLIN != 0
+                        {
                             break;
                         }
                         let mut spent = 0usize;
@@ -1476,10 +1542,16 @@ impl BridgedEndpoint {
                             }
                         }
                     }
+                    // Thread owns the read end — closing it here means
+                    // a later `stop()` write is `EPIPE` (harmless with
+                    // `MSG_NOSIGNAL`), never a stale-fd poll.
+                    unsafe {
+                        libc::close(wake_r);
+                    }
                 }
             })
             .expect("spawn wg-rx-bridge");
-        RxJoin::Os(join)
+        (RxJoin::Os(join), stop)
     }
 
     /// RX leg, tokio-task variant — the pre-thread shape, kept for
@@ -1493,9 +1565,10 @@ impl BridgedEndpoint {
         ep: &Arc<BatchEndpoint>,
         peer: Option<SocketAddr>,
         wire_tx: mpsc::Sender<(SocketAddr, Bytes)>,
-        shutdown: RxStop,
-    ) -> RxJoin {
-        RxJoin::Tokio(tokio::spawn({
+    ) -> (RxJoin, RxStop) {
+        let stop = RxStop::new();
+        let shutdown = stop.clone();
+        let task = tokio::spawn({
             let ep = Arc::clone(ep);
             async move {
                 // Both socket shapes batch the kernel drain —
@@ -1593,7 +1666,8 @@ impl BridgedEndpoint {
                     }
                 }
             }
-        }))
+        });
+        (RxJoin::Tokio(task), stop)
     }
 
     /// See [`BatchEndpoint::try_recv`]: channel `Empty` maps to
@@ -1745,12 +1819,22 @@ impl BridgedEndpoint {
 }
 
 impl Drop for BridgedEndpoint {
-    /// The `ProxyEndpoint` contract verbatim: pulse both edges so a
-    /// parked `poll` or `writable()` unwinds, then the channel closes
-    /// on field teardown cover the workers' `send`/`recv` arms.
+    /// The `ProxyEndpoint` contract, extended for the dedicated RX
+    /// thread: `rx.close()` errors any `blocking_send` parked on a
+    /// full channel (the receiver field can't drop until this `Drop`
+    /// returns — the thread would out-wait `join` without this),
+    /// `stop()`'s wake byte pulls the thread out of `poll`
+    /// immediately, and `join` waits it out so the socket fd is
+    /// actually released before teardown returns — the
+    /// port-is-free-on-shutdown contract, not a ~50 ms race.
     fn drop(&mut self) {
+        self.rx.close();
         self.shutdown_rx.stop();
         self.shutdown_tx.notify_one();
+        #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+        if let Some(RxJoin::Os(join)) = self._bridge.0.take() {
+            let _ = join.join();
+        }
     }
 }
 
