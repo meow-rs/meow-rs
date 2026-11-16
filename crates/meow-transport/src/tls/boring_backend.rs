@@ -5,7 +5,7 @@
 //! mTLS and ALPN.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -372,6 +372,15 @@ struct SharedConnector {
 
 /// Process-wide cache of BoringSSL `SslConnector`s.
 ///
+/// `Ssl` ex_data flag marking a connection whose certificate check runs
+/// under an override policy (`cert_pin`/`verify_name`).  The shared
+/// `SSL_CTX`'s new-session callback skips depositing their tickets:
+/// they were minted under a different policy, and a resumed handshake
+/// carries no Certificate — a later override-free connection on this
+/// ctx offering one would complete with the cert never inspected.
+static VERIFY_OVERRIDE: LazyLock<boring::ex_data::Index<boring::ssl::Ssl, bool>> =
+    LazyLock::new(|| boring::ssl::Ssl::new_ex_index().expect("Ssl ex_data index allocation"));
+
 /// An `SSL_CTX` with its verify store and session cache is ~160 KB; with
 /// e.g. 100 TLS proxies from a subscription that would be ~16 MB of
 /// identical contexts.  `SslConnector::clone()` is an `SSL_CTX_up_ref`, so
@@ -659,6 +668,17 @@ impl BoringInner {
         let sessions: SessionCache = Arc::new(Mutex::new(VecDeque::new()));
         let cb_sessions = Arc::clone(&sessions);
         b.set_new_session_callback(move |ssl, session| {
+            // The deposit half of the override invariant: a ticket
+            // minted under a `cert_pin`/`verify_name` connection must
+            // never enter the store — `offer_cached_session` withholds
+            // tickets FROM override connections, and this withholds
+            // override connections' tickets from the store.  A resumed
+            // handshake carries no Certificate, so a stock connection
+            // offering such a ticket would finish without the override
+            // policy's check ever running.
+            if ssl.ex_data(*VERIFY_OVERRIDE).copied().unwrap_or(false) {
+                return;
+            }
             // Keyed by the SNI this connection sent — an IP-literal
             // target sends none (RFC 6066 §3) and gets no resumption.
             // Poison can only come from a panic while held; nothing here
@@ -729,8 +749,8 @@ impl BoringInner {
         // inspect the peer's Certificate — a resumed handshake carries
         // none, so offering a ticket minted under the stock policy
         // would silently skip their check.  These configs are rare;
-        // lose the resumption, keep the guarantee.  (The new-session
-        // deposit stays unconditional — depositing weakens nothing.)
+        // lose the resumption, keep the guarantee.  (Their own deposits
+        // are withheld in the new-session callback — see VERIFY_OVERRIDE.)
         if self.cert_pin.is_some() || self.verify_name.is_some() {
             return false;
         }
@@ -849,6 +869,7 @@ impl BoringInner {
                 .into_ssl(&self.server_name)
                 .map_err(|e| TransportError::Tls(format!("boring: into_ssl: {e}")))
                 .map_err(ConnectTypedError::Transport)?;
+            ssl.set_ex_data(*VERIFY_OVERRIDE, true);
             let session_offered = self.offer_cached_session(&mut ssl);
             if let Some(pin) = self.cert_pin {
                 // Upstream: `serverName = state.ServerName`, overridden by
@@ -1770,6 +1791,14 @@ mod tests {
     /// NewSessionTickets as post-handshake messages, so only an actual
     /// `SSL_read` on the client pumps them into the new-session callback.
     async fn spawn_tls_echo_server(cn: &str) -> std::net::SocketAddr {
+        spawn_tls_echo_server_with_leaf(cn).await.0
+    }
+
+    /// [`spawn_tls_echo_server`] plus the leaf certificate — tests that
+    /// pin the server's cert need it to compute the expected SHA-256.
+    async fn spawn_tls_echo_server_with_leaf(
+        cn: &str,
+    ) -> (std::net::SocketAddr, boring::x509::X509) {
         let (leaf, leaf_key) = make_cert(cn, &CertOpts::DEFAULT, None);
         let mut builder =
             boring::ssl::SslAcceptor::mozilla_intermediate_v5(boring::ssl::SslMethod::tls())
@@ -1805,7 +1834,7 @@ mod tests {
                 });
             }
         });
-        addr
+        (addr, leaf)
     }
 
     /// `connect_typed` plus one echoed byte — the round trip ingests the
@@ -2030,6 +2059,63 @@ mod tests {
             .expect("into_ssl");
         assert!(plain.offer_cached_session(&mut ssl));
         assert_eq!(queued_tickets(&plain), queued - 1);
+    }
+
+    /// The deposit mirror of [`boring_verify_overrides_never_offer_sessions`]:
+    /// a ticket minted under an override-policy handshake must never enter
+    /// the shared store — a stock sibling would offer it and complete a
+    /// resumed handshake with no Certificate presented, silently skipping
+    /// the override's check.  Drives real handshakes so the peer's
+    /// NewSessionTickets actually arrive.
+    #[tokio::test]
+    async fn boring_verify_overrides_never_deposit_sessions() {
+        const SNI: &str = "override-deposit.test";
+        let (addr, leaf) = spawn_tls_echo_server_with_leaf("localhost").await;
+        let pin: [u8; 32] = leaf
+            .digest(boring::hash::MessageDigest::sha256())
+            .expect("leaf digest")
+            .as_ref()
+            .try_into()
+            .expect("sha256 is 32 bytes");
+
+        for (label, cfg) in [
+            (
+                "cert_pin",
+                TlsConfig {
+                    skip_cert_verify: true,
+                    cert_pin: Some(pin),
+                    ..TlsConfig::new(SNI)
+                },
+            ),
+            (
+                "verify_name",
+                TlsConfig {
+                    skip_cert_verify: true,
+                    verify_name: Some("localhost".into()),
+                    ..TlsConfig::new(SNI)
+                },
+            ),
+        ] {
+            let inner = BoringInner::new(&cfg).expect("build override inner");
+            assert!(
+                same_ctx(&inner.ctx, &skip_verify_inner(SNI).ctx),
+                "{label} must share the stock ctx for the check to be real"
+            );
+            drop(connect_pumped(&inner, addr).await);
+            assert_eq!(
+                queued_tickets(&inner),
+                0,
+                "{label} handshake must not deposit tickets"
+            );
+        }
+
+        // Control: the stock sibling deposits on the same ctx partition.
+        let plain = skip_verify_inner(SNI);
+        drop(connect_pumped(&plain, addr).await);
+        assert!(
+            queued_tickets(&plain) >= 2,
+            "stock control must deposit — otherwise the override checks were vacuous"
+        );
     }
 
     /// A handshake that offered no ticket cannot fail *because* of one:
