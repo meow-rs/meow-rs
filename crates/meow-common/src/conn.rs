@@ -2,6 +2,7 @@ use crate::error::Result;
 use bytes::Bytes;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -81,6 +82,62 @@ pub trait ProxyPacketConn: Send + Sync {
     async fn write_packet(&self, buf: &[u8], addr: &SocketAddr) -> Result<usize>;
     fn local_addr(&self) -> Result<SocketAddr>;
     fn close(&self) -> Result<()>;
+
+    /// This conn's synchronous-poll view, if it has one — a capability
+    /// interface in the spirit of [`ProxyConn::tcp_stream`]: `Some` only
+    /// where every hop between buffer and wire completes inside one
+    /// nonblocking call (a raw kernel datagram socket plus synchronous
+    /// crypto), so a caller driving a poll loop can skip the
+    /// task-and-channel bridge the async surface needs. Everything
+    /// async — stream-framed fronts, SOCKS5-UoT, VLESS, mux — keeps
+    /// `None`.
+    ///
+    /// `self: Arc<Self>` because the handle lives beside the conn (a
+    /// socket wrapper holds both trait objects on the same allocation)
+    /// and detection happens once, not per datagram.
+    fn poll_packet_conn(self: Arc<Self>) -> Option<Arc<dyn PollPacketConn>> {
+        let _ = self;
+        None
+    }
+}
+
+/// The synchronous-poll counterpart of [`ProxyPacketConn`], obtained
+/// through [`ProxyPacketConn::poll_packet_conn`]. Same semantics per
+/// direction with `Poll` added: `Ready(Ok)` means the datagram moved —
+/// a read impl keeps polling through whatever per-datagram drops its
+/// protocol layer filters out, so `Ready` always carries a real
+/// datagram (or the truncation the underlying socket applied) —
+/// `Pending` means the underlying socket is not ready and the caller
+/// decides whether to park the waker or fall back to its own queueing,
+/// and `Ready(Err)` is terminal — the association is dead.
+///
+/// Two structural contracts the async surface does not have:
+///
+/// - A poll impl must do its whole work inline: protocol-layer retries
+///   (decrypt failures, foreign replies) loop inside one call, never
+///   yield a `Pending` that is not the socket's own not-ready.
+/// - The conn may only ever have **one registered waker per direction**.
+///   A parked async `read_packet`/`write_packet` future and a `poll_*`
+///   call register on the same kernel socket and steal each other's
+///   readiness — callers must serialize so each direction is driven by
+///   exactly one waiter at a time (the `PacketConnSocket` bridge
+///   enforces this: reads are all-pump or all-poll, and a poll send only
+///   runs while no pumped write is in flight).
+pub trait PollPacketConn: ProxyPacketConn {
+    /// The poll counterpart of [`ProxyPacketConn::read_packet`].
+    fn poll_read_packet(
+        &self,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<Result<(usize, SocketAddr)>>;
+
+    /// The poll counterpart of [`ProxyPacketConn::write_packet`].
+    fn poll_write_packet(
+        &self,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+        addr: &SocketAddr,
+    ) -> Poll<Result<usize>>;
 }
 
 pub struct UdpPacket {

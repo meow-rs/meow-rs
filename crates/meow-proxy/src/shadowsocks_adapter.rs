@@ -15,8 +15,8 @@ use crate::v2ray_plugin::{self, V2rayPluginConfig};
 use async_trait::async_trait;
 use meow_common::atomic::{checked_increment, AtomicU};
 use meow_common::{
-    AdapterType, MeowError, Metadata, Network, ProxyAdapter, ProxyConn, ProxyHealth,
-    ProxyPacketConn, Result,
+    AdapterType, MeowError, Metadata, Network, PollPacketConn, ProxyAdapter, ProxyConn,
+    ProxyHealth, ProxyPacketConn, Result,
 };
 use meow_transport::simple_obfs::client::{HttpObfs, TlsObfs};
 use meow_transport::tls::TlsLayer;
@@ -1533,6 +1533,103 @@ impl ProxyPacketConn for SsPacketConn {
         match &self.io {
             SsUdpIo::Raw(_) => Ok(()),
             SsUdpIo::Chained { conn, .. } => conn.close(),
+        }
+    }
+
+    /// Only the raw-UDP arm is poll-capable: `ProxySocket`'s
+    /// encrypt+`poll_send` and `poll_recv`+decrypt each complete inside
+    /// one nonblocking call when the kernel socket is ready. The chained
+    /// arm's front conn is async-only — its `PacketConnSocket` bridge
+    /// stays.
+    fn poll_packet_conn(self: Arc<Self>) -> Option<Arc<dyn PollPacketConn>> {
+        if matches!(&self.io, SsUdpIo::Raw(_)) {
+            Some(self)
+        } else {
+            None
+        }
+    }
+}
+
+impl PollPacketConn for SsPacketConn {
+    /// The poll counterpart of `read_packet`'s Raw arm — identical
+    /// drop-and-continue rules (per-datagram decrypt failures, §3.2.4
+    /// foreign-session or replayed replies via `accept_reply`, and
+    /// domain-typed sources are skipped, never surfaced); the loop just
+    /// runs inline instead of in an async block.
+    fn poll_read_packet(
+        &self,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<Result<(usize, SocketAddr)>> {
+        use shadowsocks::relay::udprelay::proxy_socket::ProxySocketError;
+        let SsUdpIo::Raw(socket) = &self.io else {
+            return Poll::Ready(Err(MeowError::Proxy(
+                "ss udp: poll read on a chained association".into(),
+            )));
+        };
+        loop {
+            let mut rb = ReadBuf::new(buf);
+            let (n, addr, _raw_len, control) = match socket.poll_recv_with_ctrl(cx, &mut rb) {
+                Poll::Ready(Ok(v)) => v,
+                Poll::Ready(Err(
+                    e @ (ProxySocketError::ProtocolError(_)
+                    | ProxySocketError::ProtocolErrorWithPeer(..)),
+                )) => {
+                    debug!("ss udp: dropped malformed reply datagram: {e}");
+                    continue;
+                }
+                Poll::Ready(Err(e)) => {
+                    return Poll::Ready(Err(MeowError::Proxy(format!("ss udp recv: {e}"))))
+                }
+                Poll::Pending => return Poll::Pending,
+            };
+            if let Some(c) = &control {
+                if !self.session.accept_reply(c) {
+                    continue;
+                }
+            }
+            let Address::SocketAddress(sa) = addr else {
+                continue;
+            };
+            return Poll::Ready(Ok((n, sa)));
+        }
+    }
+
+    /// The poll counterpart of `write_packet`'s Raw arm: the bound
+    /// `write_target` override and the per-packet `send_control` mint are
+    /// the same bookkeeping — a `Pending` burns one packet ID, which the
+    /// server's replay window tolerates as a gap.
+    fn poll_write_packet(
+        &self,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+        addr: &SocketAddr,
+    ) -> Poll<Result<usize>> {
+        let SsUdpIo::Raw(socket) = &self.io else {
+            return Poll::Ready(Err(MeowError::Proxy(
+                "ss udp: poll write on a chained association".into(),
+            )));
+        };
+        let arg_target;
+        let target = match &self.write_target {
+            Some(t) => t,
+            None => {
+                arg_target = Address::SocketAddress(*addr);
+                &arg_target
+            }
+        };
+        let Some(control) = self.session.send_control() else {
+            return Poll::Ready(Err(MeowError::Proxy(
+                "ss udp: client packet-ID space exhausted".into(),
+            )));
+        };
+        match socket.poll_send_with_ctrl(target, &control, buf, cx) {
+            // `poll_send_with_ctrl` yields `payload.len()` on a full
+            // send, `WriteZero` on a short one — propagate it verbatim.
+            Poll::Ready(res) => {
+                Poll::Ready(res.map_err(|e| MeowError::Proxy(format!("ss udp send: {e}"))))
+            }
+            Poll::Pending => Poll::Pending,
         }
     }
 }

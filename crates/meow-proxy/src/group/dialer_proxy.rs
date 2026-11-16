@@ -60,8 +60,8 @@
 
 use async_trait::async_trait;
 use meow_common::{
-    AdapterType, DelayHistory, MeowError, Metadata, Proxy, ProxyAdapter, ProxyConn, ProxyHealth,
-    ProxyPacketConn, Result,
+    AdapterType, DelayHistory, MeowError, Metadata, PollPacketConn, Proxy, ProxyAdapter, ProxyConn,
+    ProxyHealth, ProxyPacketConn, Result,
 };
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -121,6 +121,12 @@ impl ProxyPacketConn for ArcPacketConn {
 
     fn close(&self) -> Result<()> {
         self.0.close()
+    }
+
+    /// A pure shim — the inner conn's own poll capability, passed
+    /// through untouched.
+    fn poll_packet_conn(self: Arc<Self>) -> Option<Arc<dyn PollPacketConn>> {
+        Arc::clone(&self.0).poll_packet_conn()
     }
 }
 

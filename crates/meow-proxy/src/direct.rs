@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use meow_common::{
-    AdapterType, MeowError, Metadata, ProxyAdapter, ProxyConn, ProxyHealth, ProxyPacketConn, Result,
+    AdapterType, MeowError, Metadata, PollPacketConn, ProxyAdapter, ProxyConn, ProxyHealth,
+    ProxyPacketConn, Result,
 };
 use meow_dns::Resolver;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -317,6 +318,45 @@ impl ProxyPacketConn for DirectPacketConn {
 
     fn close(&self) -> Result<()> {
         Ok(())
+    }
+
+    /// A raw UDP socket — poll-capable by definition (one
+    /// `poll_recv_from`/`poll_send[_to]` per datagram).
+    fn poll_packet_conn(self: Arc<Self>) -> Option<Arc<dyn PollPacketConn>> {
+        Some(self)
+    }
+}
+
+impl PollPacketConn for DirectPacketConn {
+    fn poll_read_packet(
+        &self,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut [u8],
+    ) -> std::task::Poll<Result<(usize, SocketAddr)>> {
+        let mut rb = tokio::io::ReadBuf::new(buf);
+        match self.socket.poll_recv_from(cx, &mut rb) {
+            std::task::Poll::Ready(Ok(src)) => std::task::Poll::Ready(Ok((rb.filled().len(), src))),
+            std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(MeowError::Io(e))),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+
+    fn poll_write_packet(
+        &self,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+        addr: &SocketAddr,
+    ) -> std::task::Poll<Result<usize>> {
+        match self.bound {
+            // Same arms as `write_packet`: connected sockets `poll_send`
+            // (a `poll_send_to` with the placeholder arg would be
+            // EISCONN), unbound ones `poll_send_to` the canonical addr.
+            Some(_) => self.socket.poll_send(cx, buf),
+            None => self
+                .socket
+                .poll_send_to(cx, buf, meow_common::canonical_socket_addr(*addr)),
+        }
+        .map(|r| r.map_err(MeowError::Io))
     }
 }
 

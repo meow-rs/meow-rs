@@ -15,6 +15,7 @@ use std::fmt;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, Weak};
+use std::task::{Context, Poll};
 
 use parking_lot::RwLock;
 
@@ -23,8 +24,8 @@ use meow_common::atomic::Int;
 use meow_common::conn_note;
 use meow_common::traffic::{ProxyTraffic, ProxyTrafficSource};
 use meow_common::{
-    AdapterType, Blame, ChainTarget, ConnType, MeowError, Metadata, Network, Proxy, ProxyConn,
-    ProxyPacketConn,
+    AdapterType, Blame, ChainTarget, ConnType, MeowError, Metadata, Network, PollPacketConn, Proxy,
+    ProxyConn, ProxyPacketConn,
 };
 use meow_transport::Stream;
 use smol_str::SmolStr;
@@ -373,6 +374,39 @@ impl ProxyPacketConn for ConnectedUdpConn {
     fn close(&self) -> meow_common::Result<()> {
         Ok(())
     }
+
+    /// A connected raw UDP socket is the canonical poll-capable
+    /// transport — one `poll_send`/`poll_recv` per datagram, nothing to
+    /// queue for.
+    fn poll_packet_conn(self: Arc<Self>) -> Option<Arc<dyn PollPacketConn>> {
+        Some(self)
+    }
+}
+
+impl PollPacketConn for ConnectedUdpConn {
+    fn poll_read_packet(
+        &self,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<meow_common::Result<(usize, SocketAddr)>> {
+        let mut rb = tokio::io::ReadBuf::new(buf);
+        match self.socket.poll_recv(cx, &mut rb) {
+            Poll::Ready(Ok(())) => Poll::Ready(Ok((rb.filled().len(), self.remote))),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(MeowError::Io(e))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn poll_write_packet(
+        &self,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+        _addr: &SocketAddr,
+    ) -> Poll<meow_common::Result<usize>> {
+        self.socket
+            .poll_send(cx, buf)
+            .map(|r| r.map_err(MeowError::Io))
+    }
 }
 
 /// Proxy dialer — tunnels through another proxy.  Equivalent to mihomo's
@@ -429,10 +463,21 @@ impl ProxyDialer {
 mod packet_conn_socket {
     //! `SocketIo` over a front proxy's UDP relay — the `dialer-proxy`
     //! counterpart of `DirectDialer`'s raw `UdpSocket`. `ProxyPacketConn`
-    //! is async rather than poll-based, so two pump tasks bridge it to
+    //! is async rather than poll-based, so pump tasks bridge it to
     //! bounded channels; the poll side then carries ordinary channel
-    //! backpressure semantics. Both tasks exit — and the association
+    //! backpressure semantics. The pump tasks exit — and the association
     //! closes — when the socket drops.
+    //!
+    //! A conn that also carries [`PollPacketConn`] — a raw kernel
+    //! datagram socket whose protocol layer encrypts synchronously —
+    //! skips the per-datagram hops the bridge costs: `poll_recv` reads
+    //! the socket inline (no read pump exists at all — the kernel
+    //! receive buffer is the absorption this queue substitutes for) and
+    //! `poll_send` writes it inline whenever the write pump owes the
+    //! wire nothing. `Pending` sends, and every send behind an
+    //! outstanding one, still take the queue+task lane — wire order is
+    //! preserved because the inline lane only opens while that lane is
+    //! empty.
     //!
     //! Compiled for every transport that can sit on a connected datagram
     //! endpoint — `kcptun`'s KCP stream and the hysteria2 / trusttunnel-h3
@@ -441,10 +486,11 @@ mod packet_conn_socket {
 
     use std::io;
     use std::net::SocketAddr;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
 
+    use meow_common::PollPacketConn;
     use meow_transport::datagram::SocketIo;
     use tokio::io::ReadBuf;
     use tokio::sync::mpsc;
@@ -477,8 +523,11 @@ mod packet_conn_socket {
 
     pub struct PacketConnSocket {
         /// `Mutex` only because `Receiver` is `!Sync`; the `&mut` poll
-        /// method goes through `get_mut`, never the lock.
-        inbound: Mutex<mpsc::Receiver<Vec<u8>>>,
+        /// method goes through `get_mut`, never the lock. `None` on a
+        /// poll-capable conn — no read pump is spawned, `poll_recv`
+        /// reads `fast` inline and the kernel socket buffer absorbs
+        /// bursts the queue would have.
+        inbound: Option<Mutex<mpsc::Receiver<Vec<u8>>>>,
         /// Raw `try_send` side of the write pump's queue — deliberately not
         /// a `PollSender`: `poll_reserve` on a full queue parked the
         /// caller, which for the QUIC drivers is the single driver task —
@@ -486,22 +535,55 @@ mod packet_conn_socket {
         /// on, so the queue stayed full. A bounded queue that drops (like
         /// a kernel socket buffer, like quic-go's `sendQueue.Add`) breaks
         /// the deadlock: the transport's loss recovery resends what the
-        /// drop lost.
+        /// drop lost. The fast path still uses it: a conn that answers
+        /// `Pending`, and every send behind an already-queued datagram,
+        /// enqueue here.
         outbound: mpsc::Sender<Vec<u8>>,
+        /// The conn's synchronous-poll view, detected once at
+        /// construction (`ProxyPacketConn::poll_packet_conn`). `Some`
+        /// means every poll direction the conn can do inline bypasses
+        /// the task hops: `poll_recv` reads it directly — there is no
+        /// second waiter to steal the socket's single read waker, and
+        /// kernel FIFO is the ordering — and `poll_send` writes it
+        /// whenever [`pending_outbound`](Self::pending_outbound) is 0.
+        fast: Option<Arc<dyn PollPacketConn>>,
+        /// The bound remote `write_packet` gets on the pumped path —
+        /// the fast path's `poll_write_packet` target too.
+        remote: SocketAddr,
+        /// Datagrams the queue+write pump still own — incremented before
+        /// each enqueue becomes dequeueable, decremented by the pump only
+        /// after its `write_packet` resolves — so "queued" and "in-flight
+        /// write" both count. The send fast path engages only at 0: a
+        /// fast-path send and a queued send must preserve wire order,
+        /// and anything the pump still owes the wire must land first.
+        /// (Single-producer — only the `SocketIo` caller ever enqueues —
+        /// so its view of the counter is never stale-low.)
+        pending_outbound: Arc<AtomicU64>,
+        /// Terminal send-side error on the fast path — mirrors the write
+        /// pump dying on a `write_packet` error: every later send reports
+        /// BrokenPipe rather than queueing into a dead association.
+        send_dead: AtomicBool,
+        /// Terminal read-side error on the fast path — mirrors the read
+        /// pump's exit closing the inbound channel: every later recv
+        /// reports BrokenPipe.
+        recv_dead: AtomicBool,
         /// Datagrams dropped by [`SocketIo::poll_send`] on a full outbound
         /// queue, or reported as sent-then-lost — same scoping rule as the
         /// hysteria2 driver's `dropped_udp`: per socket, never global.
         dropped_tx: AtomicU64,
         /// Datagrams the read pump dropped on a full inbound queue.
-        /// `Arc` — the pump task owns an increment side too.
+        /// `Arc` — the pump task owns an increment side too. Stays 0 on
+        /// a poll-capable conn (no pump — the kernel buffer is the
+        /// absorption, same as the raw `UdpSocket` path).
         dropped_rx: Arc<AtomicU64>,
         /// Aborted on drop: the read task parks inside `read_packet` and
         /// would otherwise outlive the socket, pinning the front-proxy UDP
         /// association open across KCP session churn. The write pump exits
         /// on its own once the `outbound` sender drops — but only after
         /// the in-flight `write_packet` completes, so a wedged front-proxy
-        /// conn would pin it indefinitely; abort that one too.
-        read_task: tokio::task::JoinHandle<()>,
+        /// conn would pin it indefinitely; abort that one too. `None` on
+        /// a poll-capable conn — there is no read task to abort.
+        read_task: Option<tokio::task::JoinHandle<()>>,
         write_task: tokio::task::JoinHandle<()>,
         /// `conn.local_addr()`, captured at construction so the QUIC drivers
         /// can stamp quiche's `to` without re-asking the (possibly dead)
@@ -528,7 +610,9 @@ mod packet_conn_socket {
                     "packet conn socket closed with dropped datagrams"
                 );
             }
-            self.read_task.abort();
+            if let Some(task) = &self.read_task {
+                task.abort();
+            }
             self.write_task.abort();
         }
     }
@@ -550,38 +634,64 @@ mod packet_conn_socket {
                 .local_addr()
                 .ok()
                 .filter(|addr| !addr.ip().is_unspecified());
-            let (in_tx, inbound) = mpsc::channel(inbound_queue);
+            // Capability detection, once per socket: a conn that drives
+            // its own I/O synchronously (a nonblocking kernel datagram
+            // socket plus sync crypto) gets the no-copy/no-wake fast path;
+            // an async-only conn keeps the full pump bridge below.
+            let fast = Arc::clone(&conn).poll_packet_conn();
             let (outbound, mut out_rx) = mpsc::channel::<Vec<u8>>(outbound_queue);
 
             let dropped_rx = Arc::new(AtomicU64::new(0));
-            let reader = Arc::clone(&conn);
-            let read_dropped = Arc::clone(&dropped_rx);
-            let read_task = tokio::spawn(async move {
-                let mut buf = vec![0u8; 65536];
-                // try_send drops on a full queue: the transport retransmits,
-                // same as a full kernel socket buffer upstream.
-                while let Ok((n, _src)) = reader.read_packet(&mut buf).await {
-                    match in_tx.try_send(buf[..n].to_vec()) {
-                        Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            note_drop(&read_dropped, "read queue full");
+            // The read pump exists only for async conns — the channel
+            // substitutes for the kernel receive buffer's absorption. A
+            // poll-capable conn is the socket's own reader: kernel FIFO
+            // is the ordering (no queue for an inline read to overtake),
+            // there is no second task to steal the socket's single read
+            // waker, and `SO_RCVBUF` does the absorbing.
+            let (inbound, read_task) = if fast.is_none() {
+                let (in_tx, inbound) = mpsc::channel(inbound_queue);
+                let reader = Arc::clone(&conn);
+                let read_dropped = Arc::clone(&dropped_rx);
+                let read_task = tokio::spawn(async move {
+                    let mut buf = vec![0u8; 65536];
+                    // try_send drops on a full queue: the transport retransmits,
+                    // same as a full kernel socket buffer upstream.
+                    while let Ok((n, _src)) = reader.read_packet(&mut buf).await {
+                        match in_tx.try_send(buf[..n].to_vec()) {
+                            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                note_drop(&read_dropped, "read queue full");
+                            }
                         }
                     }
-                }
-                let _ = reader.close();
-            });
+                    let _ = reader.close();
+                });
+                (Some(Mutex::new(inbound)), Some(read_task))
+            } else {
+                (None, None)
+            };
+            let pending_outbound = Arc::new(AtomicU64::new(0));
+            let pending = Arc::clone(&pending_outbound);
             let write_task = tokio::spawn(async move {
                 while let Some(pkt) = out_rx.recv().await {
                     if conn.write_packet(&pkt, &remote).await.is_err() {
                         break;
                     }
+                    // The datagram is on the wire — release one ordering
+                    // slot for the fast path.
+                    pending.fetch_sub(1, Ordering::AcqRel);
                 }
                 let _ = conn.close();
             });
 
             Self {
-                inbound: Mutex::new(inbound),
+                inbound,
                 outbound,
+                fast,
+                remote,
+                pending_outbound,
+                send_dead: AtomicBool::new(false),
+                recv_dead: AtomicBool::new(false),
                 dropped_tx: AtomicU64::new(0),
                 dropped_rx,
                 read_task,
@@ -607,13 +717,37 @@ mod packet_conn_socket {
         /// `(inbound, outbound)` capacity still available — on a fresh
         /// socket the permit counts are the depths themselves, so the
         /// [`INBOUND_QUEUE`]/[`OUTBOUND_QUEUE`] split is asserted
-        /// through them.
+        /// through them. A poll-capable conn has no inbound queue at
+        /// all: 0 there.
         #[cfg(test)]
         pub(super) fn queue_capacities(&self) -> (usize, usize) {
             (
-                self.inbound.lock().unwrap().capacity(),
+                self.inbound
+                    .as_ref()
+                    .map_or(0, |rx| rx.lock().unwrap().capacity()),
                 self.outbound.capacity(),
             )
+        }
+
+        /// Whether the conn brought a synchronous-poll view — the send
+        /// fast path and the absence of a read pump hinge on it.
+        #[cfg(test)]
+        pub(super) fn fast_capable(&self) -> bool {
+            self.fast.is_some()
+        }
+
+        /// Whether the read pump was spawned (i.e. the conn could not
+        /// poll and got the queue bridge).
+        #[cfg(test)]
+        pub(super) fn has_read_pump(&self) -> bool {
+            self.read_task.is_some()
+        }
+
+        /// Datagrams the queue+write pump still owe the wire — the
+        /// ordering gate the send fast path checks.
+        #[cfg(test)]
+        pub(super) fn pending_outbound(&self) -> u64 {
+            self.pending_outbound.load(Ordering::Relaxed)
         }
     }
 
@@ -632,7 +766,36 @@ mod packet_conn_socket {
     }
 
     impl SocketIo for PacketConnSocket {
-        fn poll_send(&mut self, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        fn poll_send(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+            if self.send_dead.load(Ordering::Relaxed) {
+                return Poll::Ready(Err(closed()));
+            }
+            // Inline send: only while nothing sits between this datagram
+            // and the wire — a queued or in-flight write must land first
+            // (wire order), so `pending_outbound == 0` is the gate. The
+            // `Pending` arm falls through to the queue: the socket told
+            // us it cannot take the datagram right now, and this call
+            // still answers `Ready` after enqueueing — the driver never
+            // parks, and the waker the poll just registered is superseded
+            // by the write pump's the moment the queued datagram reaches
+            // `write_packet` (a parked pump `write` holds the waker slot
+            // it needs itself; the driver never parks on it either way).
+            if let Some(fast) = &self.fast {
+                if self.pending_outbound.load(Ordering::Acquire) == 0 {
+                    match fast.poll_write_packet(cx, buf, &self.remote) {
+                        Poll::Ready(Ok(n)) => return Poll::Ready(Ok(n)),
+                        Poll::Ready(Err(e)) => {
+                            // Same terminal contract as a `write_packet`
+                            // error killing the pump: the association is
+                            // dead and every later send sees BrokenPipe.
+                            self.send_dead.store(true, Ordering::Relaxed);
+                            let _ = fast.close();
+                            return Poll::Ready(Err(e.into_io_error("udp endpoint send")));
+                        }
+                        Poll::Pending => {}
+                    }
+                }
+            }
             // A full queue is congestion, not a dead socket: drop the
             // datagram as UDP would and let the transport's loss recovery
             // resend — quic-go's `sendQueue.Add` contract. Returning
@@ -648,13 +811,24 @@ mod packet_conn_socket {
                 note_drop(&self.dropped_tx, "write queue full");
                 return Poll::Ready(Ok(buf.len()));
             }
+            // Count before the datagram becomes dequeueable: the pump
+            // decrements only after its `write_packet` resolves, so
+            // `pending_outbound` covers "in queue" and "in-flight write"
+            // alike, and a fast-path send can never see 0 while the pump
+            // still owes the wire a datagram. Rolled back on a failed
+            // enqueue (there is nothing to decrement for).
+            self.pending_outbound.fetch_add(1, Ordering::AcqRel);
             match self.outbound.try_send(buf.to_vec()) {
                 Ok(()) => Poll::Ready(Ok(buf.len())),
                 Err(mpsc::error::TrySendError::Full(_)) => {
+                    self.pending_outbound.fetch_sub(1, Ordering::AcqRel);
                     note_drop(&self.dropped_tx, "write queue full");
                     Poll::Ready(Ok(buf.len()))
                 }
-                Err(mpsc::error::TrySendError::Closed(_)) => Poll::Ready(Err(closed())),
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    self.pending_outbound.fetch_sub(1, Ordering::AcqRel);
+                    Poll::Ready(Err(closed()))
+                }
             }
         }
 
@@ -663,7 +837,38 @@ mod packet_conn_socket {
             cx: &mut Context<'_>,
             buf: &mut ReadBuf<'_>,
         ) -> Poll<io::Result<()>> {
-            match self.inbound.get_mut().unwrap().poll_recv(cx) {
+            if let Some(fast) = &self.fast {
+                // No read pump on this conn — the socket itself is the
+                // only reader. `Pending` is the kernel socket's own
+                // not-ready; `Ready(Err)` is terminal like the pump's
+                // exit was.
+                if self.recv_dead.load(Ordering::Relaxed) {
+                    return Poll::Ready(Err(closed()));
+                }
+                // Datagram semantics: an oversized packet truncates —
+                // the queued path's `min(remaining)` cut, kept.
+                return match fast.poll_read_packet(cx, buf.initialize_unfilled()) {
+                    Poll::Ready(Ok((n, _src))) => {
+                        let n = n.min(buf.remaining());
+                        buf.advance(n);
+                        Poll::Ready(Ok(()))
+                    }
+                    Poll::Ready(Err(e)) => {
+                        self.recv_dead.store(true, Ordering::Relaxed);
+                        let _ = fast.close();
+                        Poll::Ready(Err(e.into_io_error("udp endpoint recv")))
+                    }
+                    Poll::Pending => Poll::Pending,
+                };
+            }
+            match self
+                .inbound
+                .as_mut()
+                .expect("an async conn always has an inbound queue")
+                .get_mut()
+                .unwrap()
+                .poll_recv(cx)
+            {
                 // Datagram semantics: an oversized packet truncates.
                 Poll::Ready(Some(pkt)) => {
                     let n = pkt.len().min(buf.remaining());
@@ -955,7 +1160,7 @@ impl TcpDialer for ProxyDialer {
             .await
             .map_err(|e| e.into_io_error("dialer-proxy udp"))?;
         Ok(match counters {
-            Some(traffic) => Arc::new(CountedHopPacketConn { conn, traffic }),
+            Some(traffic) => Arc::new(CountedHopPacketConn::new(conn, traffic)),
             None => Arc::from(conn),
         })
     }
@@ -1611,8 +1816,28 @@ impl ProxyConn for CountedHopConn {
 
 /// The datagram counterpart of [`CountedHopConn`].
 struct CountedHopPacketConn {
-    conn: Box<dyn ProxyPacketConn>,
+    /// `Arc` because the poll-capability probe takes `self: Arc<Self>`.
+    conn: Arc<dyn ProxyPacketConn>,
+    /// The inner conn's synchronous-poll view, detected once at
+    /// construction — `None` on an async-only inner, in which case this
+    /// wrapper answers `poll_packet_conn` with `None` too. When `Some`,
+    /// the wrapper itself is the [`PollPacketConn`]: it delegates to this
+    /// handle and counts the same bytes the async path counts, so a
+    /// fast-path datagram cannot slip past hop traffic accounting.
+    fast: Option<Arc<dyn PollPacketConn>>,
     traffic: Arc<ProxyTraffic>,
+}
+
+impl CountedHopPacketConn {
+    fn new(conn: Box<dyn ProxyPacketConn>, traffic: Arc<ProxyTraffic>) -> Self {
+        let conn: Arc<dyn ProxyPacketConn> = Arc::from(conn);
+        let fast = Arc::clone(&conn).poll_packet_conn();
+        Self {
+            conn,
+            fast,
+            traffic,
+        }
+    }
 }
 
 #[async_trait]
@@ -1635,6 +1860,53 @@ impl ProxyPacketConn for CountedHopPacketConn {
 
     fn close(&self) -> meow_common::Result<()> {
         self.conn.close()
+    }
+
+    /// The counting wrapper keeps the inner conn's fast path *through
+    /// itself*: handing out the inner handle would let a `PacketConnSocket`
+    /// move datagrams the hop counters never see.
+    fn poll_packet_conn(self: Arc<Self>) -> Option<Arc<dyn PollPacketConn>> {
+        self.fast.as_ref()?;
+        Some(self)
+    }
+}
+
+impl PollPacketConn for CountedHopPacketConn {
+    fn poll_read_packet(
+        &self,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<meow_common::Result<(usize, SocketAddr)>> {
+        let fast = self
+            .fast
+            .as_deref()
+            .expect("poll capability is gated on the inner conn's");
+        match fast.poll_read_packet(cx, buf) {
+            Poll::Ready(Ok((n, from))) => {
+                self.traffic.add_download(n as Int);
+                Poll::Ready(Ok((n, from)))
+            }
+            other => other,
+        }
+    }
+
+    fn poll_write_packet(
+        &self,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+        addr: &SocketAddr,
+    ) -> Poll<meow_common::Result<usize>> {
+        let fast = self
+            .fast
+            .as_deref()
+            .expect("poll capability is gated on the inner conn's");
+        match fast.poll_write_packet(cx, buf, addr) {
+            Poll::Ready(Ok(n)) => {
+                self.traffic.add_upload(n as Int);
+                Poll::Ready(Ok(n))
+            }
+            other => other,
+        }
     }
 }
 
@@ -3080,6 +3352,473 @@ mod tests {
             "10.0.0.1:7777".parse().unwrap(),
         );
         assert_eq!(sock.local_addr_hint(), None);
+    }
+
+    /// A poll-capable datagram conn: every poll call is counted and the
+    /// async pump lanes stay separately observable, so a test can tell
+    /// which lane each datagram took. `write_pend` makes
+    /// `poll_write_packet` report the kernel socket not-ready;
+    /// `write_permits` parks the async `write_packet` so a queued
+    /// datagram stays outstanding on demand; `fail_*` makes the next
+    /// poll error terminally. Ungated — the `CountedHopPacketConn`
+    /// capability test needs it under every feature set.
+    struct PollableConn {
+        remote: SocketAddr,
+        /// Datagrams sent through `poll_write_packet` (the inline lane).
+        fast_written: Mutex<Vec<Vec<u8>>>,
+        /// Datagrams sent through async `write_packet` (the pump lane).
+        pumped_written: Mutex<Vec<Vec<u8>>>,
+        /// Datagrams staged for `poll_read_packet`, served oldest first.
+        staged_reads: Mutex<std::collections::VecDeque<Vec<u8>>>,
+        poll_write_calls: std::sync::atomic::AtomicU64,
+        poll_read_calls: std::sync::atomic::AtomicU64,
+        async_write_calls: std::sync::atomic::AtomicU64,
+        async_read_calls: std::sync::atomic::AtomicU64,
+        write_pend: std::sync::atomic::AtomicBool,
+        /// Permits async `write_packet` must consume one of per
+        /// datagram — starts empty, so the write pump parks mid-write
+        /// until the test hands permits out.
+        write_permits: tokio::sync::Semaphore,
+        fail_write: std::sync::atomic::AtomicBool,
+        fail_read: std::sync::atomic::AtomicBool,
+    }
+
+    impl PollableConn {
+        fn new(remote: SocketAddr) -> Self {
+            Self {
+                remote,
+                fast_written: Mutex::new(Vec::new()),
+                pumped_written: Mutex::new(Vec::new()),
+                staged_reads: Mutex::new(std::collections::VecDeque::new()),
+                poll_write_calls: std::sync::atomic::AtomicU64::new(0),
+                poll_read_calls: std::sync::atomic::AtomicU64::new(0),
+                async_write_calls: std::sync::atomic::AtomicU64::new(0),
+                async_read_calls: std::sync::atomic::AtomicU64::new(0),
+                write_pend: std::sync::atomic::AtomicBool::new(false),
+                write_permits: tokio::sync::Semaphore::new(0),
+                fail_write: std::sync::atomic::AtomicBool::new(false),
+                fail_read: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        fn stage(&self, pkt: &[u8]) {
+            self.staged_reads.lock().unwrap().push_back(pkt.to_vec());
+        }
+
+        /// Lane counters — only the `PacketConnSocket` tests read them.
+        #[cfg(any(feature = "kcptun", feature = "hysteria2", feature = "trusttunnel-h3"))]
+        fn calls(counter: &std::sync::atomic::AtomicU64) -> u64 {
+            counter.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    #[async_trait]
+    impl ProxyPacketConn for PollableConn {
+        async fn read_packet(&self, _buf: &mut [u8]) -> MeowResult<(usize, SocketAddr)> {
+            // The async lane must never serve a poll-capable socket —
+            // if the bridge is honest this parks forever unread.
+            self.async_read_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            std::future::pending().await
+        }
+        async fn write_packet(&self, buf: &[u8], _addr: &SocketAddr) -> MeowResult<usize> {
+            self.async_write_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // One permit per datagram: the pump stays parked until the
+            // test releases it, keeping queued writes outstanding.
+            self.write_permits
+                .acquire()
+                .await
+                .expect("write permits never close")
+                .forget();
+            self.pumped_written.lock().unwrap().push(buf.to_vec());
+            Ok(buf.len())
+        }
+        fn local_addr(&self) -> MeowResult<SocketAddr> {
+            Ok(self.remote)
+        }
+        fn close(&self) -> MeowResult<()> {
+            Ok(())
+        }
+        fn poll_packet_conn(self: Arc<Self>) -> Option<Arc<dyn meow_common::PollPacketConn>> {
+            Some(self)
+        }
+    }
+
+    impl meow_common::PollPacketConn for PollableConn {
+        fn poll_read_packet(
+            &self,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut [u8],
+        ) -> std::task::Poll<MeowResult<(usize, SocketAddr)>> {
+            self.poll_read_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if self
+                .fail_read
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
+                return std::task::Poll::Ready(Err(MeowError::Proxy("poll read failed".into())));
+            }
+            match self.staged_reads.lock().unwrap().pop_front() {
+                Some(pkt) => {
+                    let n = pkt.len().min(buf.len());
+                    buf[..n].copy_from_slice(&pkt[..n]);
+                    std::task::Poll::Ready(Ok((n, self.remote)))
+                }
+                None => std::task::Poll::Pending,
+            }
+        }
+        fn poll_write_packet(
+            &self,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+            addr: &SocketAddr,
+        ) -> std::task::Poll<MeowResult<usize>> {
+            self.poll_write_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(*addr, self.remote);
+            if self
+                .fail_write
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
+                return std::task::Poll::Ready(Err(MeowError::Proxy("poll write failed".into())));
+            }
+            if self.write_pend.load(std::sync::atomic::Ordering::Relaxed) {
+                return std::task::Poll::Pending;
+            }
+            self.fast_written.lock().unwrap().push(buf.to_vec());
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+    }
+
+    /// A poll-capable conn skips the whole pump bridge: `poll_send`
+    /// writes inline — nothing enqueued, nothing for the write pump to
+    /// do — and `poll_recv` reads inline — no read pump is even spawned
+    /// (there is no second task to steal the socket's one waker).
+    #[cfg(any(feature = "kcptun", feature = "hysteria2", feature = "trusttunnel-h3"))]
+    #[tokio::test]
+    async fn packet_conn_socket_poll_capable_conn_bypasses_the_pumps() {
+        use meow_transport::datagram::SocketIo;
+        use tokio::io::ReadBuf;
+
+        let remote: SocketAddr = "10.0.0.1:7777".parse().unwrap();
+        let conn = Arc::new(PollableConn::new(remote));
+        #[allow(
+            clippy::clone_on_ref_ptr,
+            reason = "the Arc<PollableConn> → Arc<dyn ProxyPacketConn> unsize cannot ride Arc::clone(&conn)"
+        )]
+        let conn_dyn: Arc<dyn ProxyPacketConn> = conn.clone();
+        let mut sock = super::packet_conn_socket::PacketConnSocket::new(conn_dyn, remote);
+
+        assert!(sock.fast_capable());
+        assert!(
+            !sock.has_read_pump(),
+            "a poll-capable conn must not spawn a read pump"
+        );
+        assert_eq!(sock.queue_capacities().0, 0, "no inbound queue either");
+
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(
+            sock.poll_send(&mut cx, b"ping"),
+            std::task::Poll::Ready(Ok(4))
+        ));
+        // Inline: one poll call, nothing queued, the pump lane untouched.
+        assert_eq!(conn.fast_written.lock().unwrap().as_slice(), &[b"ping"]);
+        assert_eq!(sock.pending_outbound(), 0);
+        assert_eq!(
+            sock.queue_capacities().1,
+            super::packet_conn_socket::OUTBOUND_QUEUE,
+            "the outbound queue must be untouched"
+        );
+        assert_eq!(
+            PollableConn::calls(&conn.async_write_calls),
+            0,
+            "the write pump must not be woken"
+        );
+
+        // Inbound: a staged datagram surfaces inline, then the empty
+        // queue answers Pending — the async read lane is never used.
+        conn.stage(b"pong");
+        let mut raw = [0u8; 64];
+        let mut rb = ReadBuf::new(&mut raw);
+        assert!(matches!(
+            sock.poll_recv(&mut cx, &mut rb),
+            std::task::Poll::Ready(Ok(()))
+        ));
+        assert_eq!(rb.filled(), b"pong");
+        let mut raw2 = [0u8; 64];
+        let mut rb2 = ReadBuf::new(&mut raw2);
+        assert!(matches!(
+            sock.poll_recv(&mut cx, &mut rb2),
+            std::task::Poll::Pending
+        ));
+        assert_eq!(
+            PollableConn::calls(&conn.async_read_calls),
+            0,
+            "the conn's async read is never the source"
+        );
+    }
+
+    /// `Poll::Pending` on the fast send — the kernel socket not ready —
+    /// falls back to the queue, and the write pump carries the datagram
+    /// out through `write_packet` like any queued send.
+    #[cfg(any(feature = "kcptun", feature = "hysteria2", feature = "trusttunnel-h3"))]
+    #[tokio::test]
+    async fn packet_conn_socket_pending_send_falls_back_to_the_queue() {
+        use meow_transport::datagram::SocketIo;
+
+        let remote: SocketAddr = "10.0.0.1:7777".parse().unwrap();
+        let conn = Arc::new(PollableConn::new(remote));
+        conn.write_pend
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        #[allow(
+            clippy::clone_on_ref_ptr,
+            reason = "the Arc<PollableConn> → Arc<dyn ProxyPacketConn> unsize cannot ride Arc::clone(&conn)"
+        )]
+        let conn_dyn: Arc<dyn ProxyPacketConn> = conn.clone();
+        let mut sock =
+            super::packet_conn_socket::PacketConnSocket::with_queue(conn_dyn, remote, 2, 4);
+
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(
+            sock.poll_send(&mut cx, b"ping"),
+            std::task::Poll::Ready(Ok(4))
+        ));
+        assert_eq!(PollableConn::calls(&conn.poll_write_calls), 1);
+        assert_eq!(sock.pending_outbound(), 1, "the datagram went to the queue");
+
+        // The pump delivers it through the async lane once permitted.
+        conn.write_permits.add_permits(1);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while conn.pumped_written.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the write pump must carry a queued datagram");
+        assert_eq!(conn.pumped_written.lock().unwrap().as_slice(), &[b"ping"]);
+        assert_eq!(conn.fast_written.lock().unwrap().len(), 0);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while sock.pending_outbound() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the pump must release the ordering slot after writing");
+    }
+
+    /// Ordering: while the pump still owes the wire a datagram — queued
+    /// or mid-`write_packet` — a later send MUST NOT take the inline
+    /// lane even though the conn would answer Ready. It enqueues, and
+    /// the pump emits both in order.
+    #[cfg(any(feature = "kcptun", feature = "hysteria2", feature = "trusttunnel-h3"))]
+    #[tokio::test]
+    async fn packet_conn_socket_a_queued_send_keeps_later_sends_in_order() {
+        use meow_transport::datagram::SocketIo;
+
+        let remote: SocketAddr = "10.0.0.1:7777".parse().unwrap();
+        let conn = Arc::new(PollableConn::new(remote));
+        // The first poll reports not-ready so send1 lands in the queue;
+        // the pump parks inside `write_packet` on the empty permit
+        // semaphore, keeping the datagram outstanding.
+        conn.write_pend
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        #[allow(
+            clippy::clone_on_ref_ptr,
+            reason = "the Arc<PollableConn> → Arc<dyn ProxyPacketConn> unsize cannot ride Arc::clone(&conn)"
+        )]
+        let conn_dyn: Arc<dyn ProxyPacketConn> = conn.clone();
+        let mut sock =
+            super::packet_conn_socket::PacketConnSocket::with_queue(conn_dyn, remote, 2, 4);
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+
+        assert!(matches!(
+            sock.poll_send(&mut cx, b"p1"),
+            std::task::Poll::Ready(Ok(2))
+        ));
+        assert_eq!(sock.pending_outbound(), 1);
+        conn.write_pend
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+
+        // The conn is Ready again, but the pump still owns p1 — send2
+        // must queue behind it rather than overtake on the wire.
+        assert!(matches!(
+            sock.poll_send(&mut cx, b"p2"),
+            std::task::Poll::Ready(Ok(2))
+        ));
+        assert_eq!(
+            PollableConn::calls(&conn.poll_write_calls),
+            1,
+            "a queued send must never be bypassed inline"
+        );
+        assert_eq!(sock.pending_outbound(), 2);
+
+        conn.write_permits.add_permits(2);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while conn.pumped_written.lock().unwrap().len() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the pump must drain both queued datagrams");
+        assert_eq!(
+            conn.pumped_written.lock().unwrap().as_slice(),
+            &[b"p1".to_vec(), b"p2".to_vec()],
+            "queued datagrams reach the wire in order"
+        );
+
+        // Queue drained: the next send takes the inline lane again.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while sock.pending_outbound() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            sock.poll_send(&mut cx, b"p3"),
+            std::task::Poll::Ready(Ok(2))
+        ));
+        assert_eq!(conn.fast_written.lock().unwrap().as_slice(), &[b"p3"]);
+        assert_eq!(PollableConn::calls(&conn.poll_write_calls), 2);
+    }
+
+    /// A terminal fast-path write error kills the association like the
+    /// write pump dying on `write_packet`: every later send reports
+    /// BrokenPipe and the conn is not polled again.
+    #[cfg(any(feature = "kcptun", feature = "hysteria2", feature = "trusttunnel-h3"))]
+    #[tokio::test]
+    async fn packet_conn_socket_fast_send_error_is_terminal() {
+        use meow_transport::datagram::SocketIo;
+
+        let remote: SocketAddr = "10.0.0.1:7777".parse().unwrap();
+        let conn = Arc::new(PollableConn::new(remote));
+        conn.fail_write
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        #[allow(
+            clippy::clone_on_ref_ptr,
+            reason = "the Arc<PollableConn> → Arc<dyn ProxyPacketConn> unsize cannot ride Arc::clone(&conn)"
+        )]
+        let conn_dyn: Arc<dyn ProxyPacketConn> = conn.clone();
+        let mut sock = super::packet_conn_socket::PacketConnSocket::new(conn_dyn, remote);
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+
+        assert!(matches!(
+            sock.poll_send(&mut cx, b"ping"),
+            std::task::Poll::Ready(Err(_))
+        ));
+        match sock.poll_send(&mut cx, b"ping") {
+            std::task::Poll::Ready(Err(e)) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::BrokenPipe);
+            }
+            other => panic!("a dead association must report BrokenPipe: {other:?}"),
+        }
+        assert_eq!(
+            PollableConn::calls(&conn.poll_write_calls),
+            1,
+            "a terminal error does not re-poll the conn"
+        );
+    }
+
+    /// Same terminal contract on the read side: a fast-path read error
+    /// stands in for the read pump's exit — the next `poll_recv`
+    /// reports BrokenPipe, permanently.
+    #[cfg(any(feature = "kcptun", feature = "hysteria2", feature = "trusttunnel-h3"))]
+    #[tokio::test]
+    async fn packet_conn_socket_fast_recv_error_is_terminal() {
+        use meow_transport::datagram::SocketIo;
+        use tokio::io::ReadBuf;
+
+        let remote: SocketAddr = "10.0.0.1:7777".parse().unwrap();
+        let conn = Arc::new(PollableConn::new(remote));
+        conn.fail_read
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        #[allow(
+            clippy::clone_on_ref_ptr,
+            reason = "the Arc<PollableConn> → Arc<dyn ProxyPacketConn> unsize cannot ride Arc::clone(&conn)"
+        )]
+        let conn_dyn: Arc<dyn ProxyPacketConn> = conn.clone();
+        let mut sock = super::packet_conn_socket::PacketConnSocket::new(conn_dyn, remote);
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let mut raw = [0u8; 64];
+
+        let mut rb = ReadBuf::new(&mut raw);
+        assert!(matches!(
+            sock.poll_recv(&mut cx, &mut rb),
+            std::task::Poll::Ready(Err(_))
+        ));
+        let mut rb2 = ReadBuf::new(&mut raw);
+        match sock.poll_recv(&mut cx, &mut rb2) {
+            std::task::Poll::Ready(Err(e)) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::BrokenPipe);
+            }
+            other => panic!("a dead association must report BrokenPipe: {other:?}"),
+        }
+        assert_eq!(
+            PollableConn::calls(&conn.poll_read_calls),
+            1,
+            "a terminal error does not re-poll the conn"
+        );
+    }
+
+    /// The hop-counting wrapper forwards the inner conn's poll
+    /// capability *through itself*: a fast-path datagram counts the
+    /// same upload/download bytes the async path would.
+    #[tokio::test]
+    async fn counted_hop_packet_conn_keeps_the_fast_path_counted() {
+        let remote: SocketAddr = "10.0.0.1:7777".parse().unwrap();
+        let inner = PollableConn::new(remote);
+        inner.stage(b"pong");
+        let boxed: Box<dyn ProxyPacketConn> = Box::new(inner);
+        let traffic = Arc::new(ProxyTraffic::default());
+        let conn: Arc<dyn ProxyPacketConn> = Arc::new(super::CountedHopPacketConn::new(
+            boxed,
+            Arc::clone(&traffic),
+        ));
+
+        let Some(fast) = Arc::clone(&conn).poll_packet_conn() else {
+            panic!("a counted conn over a poll-capable inner must stay capable");
+        };
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(
+            fast.poll_write_packet(&mut cx, b"ping", &remote),
+            std::task::Poll::Ready(Ok(4))
+        ));
+        assert_eq!(traffic.upload_bytes(), 4);
+
+        let mut buf = [0u8; 64];
+        match fast.poll_read_packet(&mut cx, &mut buf) {
+            std::task::Poll::Ready(Ok((n, src))) => {
+                assert_eq!(n, 4);
+                assert_eq!(src, remote);
+            }
+            other => panic!("staged datagram must read back: {other:?}"),
+        }
+        assert_eq!(traffic.download_bytes(), 4);
+        assert_eq!(&buf[..4], b"pong");
+
+        // An async-only inner keeps the wrapper incapable.
+        struct AsyncConn;
+        #[async_trait]
+        impl ProxyPacketConn for AsyncConn {
+            async fn read_packet(&self, _buf: &mut [u8]) -> MeowResult<(usize, SocketAddr)> {
+                std::future::pending().await
+            }
+            async fn write_packet(&self, buf: &[u8], _addr: &SocketAddr) -> MeowResult<usize> {
+                Ok(buf.len())
+            }
+            fn local_addr(&self) -> MeowResult<SocketAddr> {
+                Ok("0.0.0.0:0".parse().unwrap())
+            }
+            fn close(&self) -> MeowResult<()> {
+                Ok(())
+            }
+        }
+        let conn: Arc<dyn ProxyPacketConn> = Arc::new(super::CountedHopPacketConn::new(
+            Box::new(AsyncConn),
+            Arc::clone(&traffic),
+        ));
+        assert!(conn.poll_packet_conn().is_none());
     }
 
     /// Per-proxy totals for the hop-counting tests, keyed like the tunnel's.
