@@ -1668,3 +1668,93 @@ async fn anytls_injected_dialer_fails_closed_when_front_dial_fails() {
         "the front's error must surface, not a direct-connect result: {err}"
     );
 }
+
+/// End-to-end WriteBytes headroom contract: feed the dialed conn slots
+/// built the way `copy_bidirectional_buf_tracked_wg` builds them (7-byte
+/// zero headroom + payload in one BytesMut), read the echo back — every
+/// byte must be the payload byte.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn anytls_write_bytes_headroom_round_trip_exact() {
+    install_crypto_provider();
+    let (echo_addr, _echo_h) = start_echo_server().await;
+    let (cert, key) = self_signed_cert();
+    let (server_addr, _server_h) = start_anytls_server(cert, key).await;
+    let adapter = AnytlsAdapter::new(
+        "test-anytls-wb",
+        &server_addr.ip().to_string(),
+        server_addr.port(),
+        PASSWORD,
+        Some("localhost"),
+        true,
+        true,
+    )
+    .expect("adapter must build");
+    let metadata = Metadata {
+        network: Network::Tcp,
+        host: smol_str::SmolStr::from(echo_addr.ip().to_string()),
+        dst_port: echo_addr.port(),
+        ..Default::default()
+    };
+    let mut conn = timeout(T, adapter.dial_tcp(&metadata))
+        .await
+        .unwrap()
+        .unwrap();
+
+    const SLOT: usize = 64 * 1024;
+    const TOTAL: usize = 4 * 1024 * 1024;
+    let (mut rd, mut wr) = tokio::io::split(&mut conn);
+
+    // Reader: count non-0x41 bytes.
+    let reader = tokio::spawn(async move {
+        let mut got = 0usize;
+        let mut alien = Vec::new();
+        let mut buf = vec![0u8; SLOT];
+        while got < TOTAL {
+            let n = rd.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            for (i, &b) in buf[..n].iter().enumerate() {
+                if b != 0x41 {
+                    alien.push(got + i);
+                }
+            }
+            got += n;
+        }
+        (got, alien)
+    });
+
+    // Writer: relay-shaped slot feeding through the conn's WriteBytes view.
+    let writer = tokio::spawn(async move {
+        let mut bm = bytes::BytesMut::with_capacity(SLOT);
+        let mut pending: Option<bytes::BytesMut> = None;
+        let mut sent = 0usize;
+        while sent < TOTAL {
+            if pending.is_none() {
+                if bm.capacity() - bm.len() < SLOT && !bm.try_reclaim(SLOT) {
+                    bm.reserve(SLOT);
+                }
+                bm.put_bytes(0u8, 7);
+                let n = (TOTAL - sent).min(SLOT - 7);
+                bm.extend_from_slice(&vec![0x41u8; n]);
+                sent += n;
+                pending = Some(bm.split_to(bm.len()));
+            }
+            let wb = wr
+                .write_bytes()
+                .expect("anytls conn must expose WriteBytes");
+            std::future::poll_fn(|cx| {
+                std::pin::Pin::new(&mut *wb).poll_write_bytes(cx, &mut pending)
+            })
+            .await
+            .unwrap();
+        }
+        // FIN-ish: flush then let conn linger for the echo.
+        wr.flush().await.unwrap();
+    });
+
+    writer.await.unwrap();
+    let (got, alien) = timeout(T, reader).await.unwrap().unwrap();
+    assert_eq!(got, TOTAL, "echoed byte count");
+    assert!(alien.is_empty(), "alien bytes at offsets {alien:?}");
+}

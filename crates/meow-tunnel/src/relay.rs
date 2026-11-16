@@ -342,10 +342,15 @@ impl<'buf> HalfCopy<'buf> {
                     None => Poll::Ready(Err(splice::lost_socket())),
                 },
                 Scratch::BytesMut(bm, _, headroom) => {
-                    // Restore the read window to the full buffer: after
-                    // `split_to` moved the last fill's prefix into the
-                    // writer's slot, `bm` is the empty tail of the same
-                    // allocation. `try_reclaim` re-widens it once every
+                    // Restore the read window to the full buffer. `bm`
+                    // must be empty before the headroom goes on: a
+                    // `poll_read_buf` `Pending` leaves the headroom
+                    // prefix (and only it) sitting in `bm`, and a queued
+                    // slot sharing the allocation can turn `reserve`'s
+                    // content-preserving copy into a stale-tail prefix
+                    // for the next fill — either way the buffer re-arms
+                    // from scratch. `clear` keeps the allocation so
+                    // `try_reclaim` can still re-widen it once every
                     // shipped `BytesMut` is gone downstream (the steady
                     // state: one allocation for the whole direction);
                     // while one is still queued in the stream's channel
@@ -353,7 +358,8 @@ impl<'buf> HalfCopy<'buf> {
                     // per fill `copy_from_slice` paid, minus the copy.
                     // `poll_read_buf` fills uninitialized spare — no
                     // per-fill memset.
-                    if bm.capacity() - bm.len() < RELAY_BULK_BUF_SIZE_WG
+                    bm.clear();
+                    if bm.capacity() < RELAY_BULK_BUF_SIZE_WG
                         && !bm.try_reclaim(RELAY_BULK_BUF_SIZE_WG)
                     {
                         bm.reserve(RELAY_BULK_BUF_SIZE_WG);
@@ -1858,5 +1864,85 @@ mod tests {
         assert_eq!(&received[7..], &payload[..], "payload follows it");
         assert_eq!(progressed, payload.len() as u64, "progress is payload-only");
         assert_eq!(hc.amt, payload.len() as u64);
+    }
+
+    /// Regression: a `poll_read_buf` `Pending` leaves the headroom
+    /// prefix parked in `bm`. The next fill must re-arm from an empty
+    /// buffer — pre-fix the parked prefix stacked another headroom on
+    /// top (and `reserve`'s content-preserving copy could keep a stale
+    /// payload tail), so the slot the writer received led with foreign
+    /// or zero bytes that rode onto the wire as payload.
+    #[tokio::test]
+    async fn relay_headroom_rearm_after_pending_fill_is_exact() {
+        use tokio::io::AsyncWriteExt;
+
+        let first_fill = vec![0x41u8; 8192];
+        let second_fill = vec![0x42u8; 8192];
+        let (mut rd, mut wr) = duplex(64 * 1024);
+        wr.write_all(&first_fill).await.unwrap();
+
+        let mut sink = BytesSink {
+            headroom: 7,
+            ..Default::default()
+        };
+        let mut buf = [0u8; RELAY_BUF_SIZE];
+        let mut hc = HalfCopy::new(&mut buf);
+        hc.buf = bulk_scratch(&rd, &mut sink, None, Some(bytes_sink_view));
+
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let cycle = hc
+            .poll_cycle(
+                &mut cx,
+                &mut rd,
+                &mut sink,
+                None,
+                Some(bytes_sink_view),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert!(matches!(cycle, Cycle::Progress | Cycle::Done));
+
+        // The reader now idles: this poll parks inside `poll_read_buf`
+        // with the fresh headroom still sitting in `bm`.
+        let cycle = hc
+            .poll_cycle(
+                &mut cx,
+                &mut rd,
+                &mut sink,
+                None,
+                Some(bytes_sink_view),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert!(matches!(cycle, Cycle::Pending));
+
+        wr.write_all(&second_fill).await.unwrap();
+        let cycle = hc
+            .poll_cycle(
+                &mut cx,
+                &mut rd,
+                &mut sink,
+                None,
+                Some(bytes_sink_view),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert!(matches!(cycle, Cycle::Progress | Cycle::Done));
+
+        assert_eq!(sink.received.len(), 2, "two fills → two slots");
+        let second = sink.received.pop().unwrap();
+        let first = sink.received.pop().unwrap();
+        assert_eq!(first.len(), 7 + first_fill.len());
+        assert_eq!(&first[..7], &[0u8; 7]);
+        assert_eq!(&first[7..], &first_fill[..]);
+        // The parked-headroom slot: exactly one reserved prefix, then
+        // the payload — no stacked zeros, no stale-tail prefix.
+        assert_eq!(
+            second.len(),
+            7 + second_fill.len(),
+            "a Pending-parked headroom must not stack onto the next fill"
+        );
+        assert_eq!(&second[..7], &[0u8; 7]);
+        assert_eq!(&second[7..], &second_fill[..]);
     }
 }

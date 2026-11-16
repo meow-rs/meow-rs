@@ -958,7 +958,8 @@ fn install_anytls_bridges() {
 mod tests {
     use super::*;
     use crate::uot::UOT_ATYP_IPV4;
-    use anytls_rs::protocol::Command;
+    use anytls_rs::protocol::{Command, HEADER_OVERHEAD_SIZE};
+    use bytes::BufMut;
     use meow_common::Network;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
@@ -1561,5 +1562,166 @@ mod tests {
     fn request_falls_back_to_unspecified_without_address() {
         let empty = encode_uot_request(&metadata_for("", None, 1234));
         assert_eq!(empty, vec![0, SOCKS5_ATYP_IPV4, 0, 0, 0, 0, 0x04, 0xd2]);
+    }
+
+    /// `poll_write_bytes_data` slots carrying the 7-byte headroom contract
+    /// must produce wire Push payloads byte-identical to the caller's
+    /// payload — a single stray 0x00 means the headroom prefix leaked
+    /// onto the wire.
+    #[tokio::test]
+    async fn write_bytes_headroom_wire_payload_is_exact() {
+        use std::future::poll_fn;
+
+        let (io, mut peer) = tokio::io::duplex(4 * 1024 * 1024);
+        let (reader, writer) = tokio::io::split(io);
+        let session = Arc::new(anytls_rs::session::Session::new_client(
+            reader,
+            writer,
+            PaddingFactory::default().into_shared(),
+            None,
+        ));
+        let worker = Arc::clone(&session);
+        tokio::spawn(async move { worker.process_stream_data().await });
+        let (stream, _ack) = session.open_stream().await.unwrap();
+        let _ = wire_frame(&mut peer).await; // SYN
+
+        let total = 512 * 1024usize;
+        let mut sent = 0usize;
+        while sent < total {
+            let mut slot = BytesMut::with_capacity(HEADER_OVERHEAD_SIZE + 65536);
+            slot.extend_from_slice(&[0u8; HEADER_OVERHEAD_SIZE]);
+            let n = (total - sent).min(65536 - HEADER_OVERHEAD_SIZE);
+            slot.extend_from_slice(&vec![0x41u8; n]);
+            sent += n;
+            let mut opt = Some(slot);
+            poll_fn(|cx| stream.poll_write_bytes_data(cx, &mut opt))
+                .await
+                .unwrap();
+            assert!(opt.is_none(), "slot must be fully drained at <=4MiB");
+        }
+        poll_fn(|cx| stream.poll_flush_data(cx)).await.unwrap();
+        drop(stream);
+        session.close().await.unwrap();
+
+        // Decode every wire frame; every Push payload byte must be 0x41.
+        let mut pushes = 0usize;
+        loop {
+            let mut header = [0u8; HEADER_OVERHEAD_SIZE];
+            match tokio::time::timeout(Duration::from_secs(1), peer.read_exact(&mut header)).await {
+                Ok(Err(_)) | Err(_) => break,
+                Ok(Ok(_)) => {}
+            }
+            let cmd = header[0];
+            let len = u16::from_be_bytes([header[5], header[6]]) as usize;
+            let mut data = vec![0u8; len];
+            peer.read_exact(&mut data).await.unwrap();
+            if cmd == Command::Push as u8 {
+                pushes += 1;
+                assert!(
+                    data.iter().all(|&b| b == 0x41),
+                    "Push frame #{pushes} (len={len}) contains non-0x41 bytes: {:02x?}",
+                    &data[..data.len().min(32)]
+                );
+            }
+        }
+        assert!(pushes > 0, "expected Push frames on the wire");
+    }
+
+    /// Session-writer stress: 4 streams × 1 MiB headroom slots against a
+    /// slow transport (permit contention + batch drains). The peer decodes
+    /// every frame — Push payloads must stay pure 0x41 end to end.
+    struct NonVectored<W>(W);
+    impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for NonVectored<W> {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::pin::Pin::new(&mut self.0).poll_write(cx, buf)
+        }
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.0).poll_flush(cx)
+        }
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.0).poll_shutdown(cx)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn write_bytes_backpressure_payload_is_exact() {
+        use std::future::poll_fn;
+        let (io, mut peer) = tokio::io::duplex(8 * 1024);
+        let (reader, writer) = tokio::io::split(io);
+        let session = Arc::new(anytls_rs::session::Session::new_client(
+            reader,
+            Box::new(NonVectored(writer)) as Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
+            PaddingFactory::default().into_shared(),
+            None,
+        ));
+        let worker = Arc::clone(&session);
+        tokio::spawn(async move { worker.process_stream_data().await });
+
+        // 慢速解码对端：按帧读并校验 payload 纯度
+        let verifier = tokio::spawn(async move {
+            let mut bad = 0usize;
+            let mut pushes = 0usize;
+            let mut payload_total = 0usize;
+            while payload_total < 4 * 1024 * 1024 {
+                let mut header = [0u8; 7];
+                match tokio::time::timeout(Duration::from_secs(30), peer.read_exact(&mut header))
+                    .await
+                {
+                    Ok(Err(_)) | Err(_) => break,
+                    Ok(Ok(_)) => {}
+                }
+                let cmd = header[0];
+                let len = u16::from_be_bytes([header[5], header[6]]) as usize;
+                let mut data = vec![0u8; len];
+                peer.read_exact(&mut data).await.unwrap();
+                if cmd == Command::Push as u8 {
+                    pushes += 1;
+                    payload_total += len;
+                    if !data.iter().all(|&b| b == 0x41) {
+                        bad += 1;
+                        let z = data.iter().filter(|&&b| b != 0x41).count();
+                        eprintln!("CORRUPT push len={len} alien={z} head={:02x?}", &data[..16]);
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            (pushes, bad)
+        });
+
+        let mut feeders = Vec::new();
+        for _ in 0..4 {
+            let s = Arc::clone(&session);
+            feeders.push(tokio::spawn(async move {
+                let (stream, _ack) = s.open_stream().await.unwrap();
+                let mut sent = 0usize;
+                while sent < 1024 * 1024 {
+                    let mut slot = BytesMut::with_capacity(HEADER_OVERHEAD_SIZE + 65536);
+                    slot.extend_from_slice(&[0u8; HEADER_OVERHEAD_SIZE]);
+                    let n = (1024 * 1024 - sent).min(65536 - HEADER_OVERHEAD_SIZE);
+                    slot.extend_from_slice(&vec![0x41u8; n]);
+                    sent += n;
+                    let mut opt = Some(slot);
+                    poll_fn(|cx| stream.poll_write_bytes_data(cx, &mut opt))
+                        .await
+                        .unwrap();
+                }
+            }));
+        }
+        for f in feeders {
+            f.await.unwrap();
+        }
+        let (pushes, bad) = verifier.await.unwrap();
+        session.close().await.unwrap();
+        assert_eq!(bad, 0, "{bad} corrupt push frames of {pushes}");
     }
 }
