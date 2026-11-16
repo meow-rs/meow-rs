@@ -3345,12 +3345,34 @@ mod tests {
         // arm the gate, flush once more, and the receiver must see
         // every datagram in queue order — the earlier partial send
         // first, the oversized boundary dropped by the error arm.
+        // The flush emits the whole backlog in one synchronous burst
+        // inside this `current_thread` task, so a tokio drain can't run
+        // until it returns — and a loopback rx queue can't hold ~260
+        // datagrams' skbuff accounting on every CI box (rmem_max). A
+        // dedicated std thread drains while this task is blocked inside
+        // the flush: wire ORDER is the subject under test, not kernel
+        // buffer depth.
+        const EXPECTED: usize = STAGED + OLD.len() - 1;
+        let drain = std::thread::spawn(move || {
+            let mut got: Vec<Vec<u8>> = Vec::with_capacity(EXPECTED);
+            let mut buf = vec![0u8; 65536];
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while got.len() < EXPECTED && std::time::Instant::now() < deadline {
+                match receiver_std.recv(&mut buf) {
+                    Ok(n) => got.push(buf[..n].to_vec()),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::yield_now();
+                    }
+                    Err(_) => break,
+                }
+            }
+            got
+        });
         arm_writable(&actor.endpoint).await;
         actor.flush_outbox();
         assert!(actor.outbox.is_empty(), "armed socket drains the requeue");
 
-        let receiver = tokio::net::UdpSocket::from_std(receiver_std).expect("tokio receiver");
-        let got = drain_received(&receiver, STAGED + OLD.len() - 1).await;
+        let got = drain.join().expect("drain thread");
         let expected: Vec<Vec<u8>> = (0..STAGED)
             .filter(|&i| i != BOUNDARY)
             .map(|i| vec![tag_of(i)])
