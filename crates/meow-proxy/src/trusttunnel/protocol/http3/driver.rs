@@ -355,6 +355,14 @@ async fn run(
 ) {
     let mut ready_tx = Some(ready_tx);
     let mut http3: Option<h3::Connection> = None;
+    // The hysteria2 driver's `auth_done`: the peer's half of the HTTP/3
+    // handshake — the SETTINGS frame that opens its control stream — has
+    // been parsed by `poll_events` below. Until then a wakeup still
+    // carries handshake traffic, and the ACK coalescer must not hold its
+    // acknowledgements back. (`h3::Connection::with_transport` only sends
+    // *our* SETTINGS; `http3.is_some()` alone is no proof the peer's
+    // arrived.)
+    let mut settings_done = false;
     // Set once every command sender is gone. A closed `mpsc::Receiver`
     // resolves `Ready(None)` on every poll, so leaving that `select!` arm
     // enabled would spin the whole drain period (3×PTO) on a worker thread,
@@ -467,7 +475,7 @@ async fn run(
         // HEADERS, DATA, FIN, RESET or STOP_SENDING — must not wait on the
         // coalescing deadline. (Frames quiche queues internally still can —
         // they wait at most the delay below, plus the OS timer tick.)
-        let mut queued = false;
+        let mut queued = cleanup(&mut st, &mut conn);
         // Payload this wakeup pulled out of quiche for the app — a CONNECT
         // response, body bytes or a FIN — is the only receive work that may
         // feed a hold: pure ACK-only packets owe no ACK, so a wakeup that
@@ -480,6 +488,7 @@ async fn run(
                 Ok(progress) => delivered |= progress,
                 Err(error) => break 'driver error,
             }
+            settings_done |= http3.peer_settings_raw().is_some();
             queued |= start_queued(&mut st, &mut conn, http3);
             delivered |= pump_bodies(&mut st, &mut conn, http3, &mut body_buf);
             queued |= pump_writes(&mut st, &mut conn, http3);
@@ -489,16 +498,17 @@ async fn run(
 
         // Only a payload-delivering or read-notify wakeup may skip the
         // flush, and only while it queued nothing explicitly; commands,
-        // quiche's timer, a closed or draining connection and the
-        // coalescing deadline always send. The hold is bounded regardless:
-        // a skipped flush may still carry flow-control frames quiche queued
-        // internally — they wait at most `coalesce.delay` plus the OS timer
-        // tick (see [`ACK_COALESCE_DELAY`]).
+        // quiche's timer, a closed or draining connection, an unfinished
+        // H3 handshake and the coalescing deadline always send. The hold
+        // is bounded regardless: a skipped flush may still carry
+        // flow-control frames quiche queued internally — they wait at
+        // most `coalesce.delay` plus the OS timer tick (see
+        // [`ACK_COALESCE_DELAY`]).
         let now = tokio::time::Instant::now();
         if woke_on_cmd {
             last_app_cmd = Some(now);
         }
-        if http3.is_some()
+        if settings_done
             && last_app_cmd.is_none_or(|t| now.duration_since(t) >= ACK_COALESCE_APP_QUIET)
         {
             let delivered_payload = received > 0 && delivered;
@@ -699,19 +709,32 @@ fn start_queued(st: &mut State, conn: &mut quiche::Connection, http3: &mut h3::C
         if reply.is_closed() {
             continue;
         }
+        // Every strong `cmd_tx` is gone — the driver is draining. Refuse
+        // this open and all behind it now, as the hysteria2 driver's
+        // `handle_cmd` hands each late `Cmd::OpenTcp` an immediate
+        // `Closed`: before `send_request`, so nothing is queued on the
+        // wire for a stream that will never have state, and without
+        // waiting out the drain (3×PTO) for the post-loop teardown to
+        // answer the rest of the queue.
+        let Some(cmd_tx) = st.cmd_tx.upgrade() else {
+            let closed = || {
+                io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "TrustTunnel H3 connection closed",
+                )
+            };
+            let _ = reply.send(Err(closed()));
+            for open in st.queued.drain(..) {
+                let _ = open.reply.send(Err(closed()));
+            }
+            return queued;
+        };
         match http3.send_request(conn, &headers, fin) {
             Ok(id) => {
                 queued = true;
                 let (read_tx, read_rx) = mpsc::channel(STREAM_READ_CHANNEL_CAP);
                 let capacity = Arc::new(Semaphore::new(WRITE_BUFFER_BYTES as usize));
                 let shutdown = Arc::new(AtomicBool::new(false));
-                let Some(cmd_tx) = st.cmd_tx.upgrade() else {
-                    let _ = reply.send(Err(io::Error::new(
-                        io::ErrorKind::ConnectionAborted,
-                        "TrustTunnel H3 connection closed",
-                    )));
-                    return queued;
-                };
                 let handle = H3Stream::new(
                     id,
                     read_rx,
