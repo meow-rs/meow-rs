@@ -2898,12 +2898,11 @@ mod tests {
     /// it. The runtimeless case is this plain `#[test]`.
     #[test]
     fn offload_crypto_runs_serially_without_a_runtime() {
-        fn tally(jobs: &mut Vec<u32>) {
-            jobs.iter_mut().for_each(|j| *j += 1);
-        }
         // `> 2` — the same cutoff the multi-thread arm rides past.
         let mut jobs = vec![0u32; 4];
-        WgPump::offload_crypto(&mut jobs, tally);
+        WgPump::offload_crypto(&mut jobs, |jobs| {
+            jobs.iter_mut().for_each(|j| *j += 1);
+        });
         assert_eq!(jobs, [1; 4]);
     }
 
@@ -2911,11 +2910,10 @@ mod tests {
     /// the absence of a runtime, keeps `block_in_place` off here.
     #[tokio::test(flavor = "current_thread")]
     async fn offload_crypto_runs_serially_on_current_thread() {
-        fn tally(jobs: &mut Vec<u32>) {
-            jobs.iter_mut().for_each(|j| *j += 1);
-        }
         let mut jobs = vec![0u32; 4];
-        WgPump::offload_crypto(&mut jobs, tally);
+        WgPump::offload_crypto(&mut jobs, |jobs| {
+            jobs.iter_mut().for_each(|j| *j += 1);
+        });
         assert_eq!(jobs, [1; 4]);
     }
 
@@ -2924,11 +2922,10 @@ mod tests {
     /// over-broaden into always-serial.
     #[tokio::test]
     async fn offload_crypto_offloads_on_multi_thread() {
-        fn tally(jobs: &mut Vec<u32>) {
-            jobs.iter_mut().for_each(|j| *j += 1);
-        }
         let mut jobs = vec![0u32; 4];
-        WgPump::offload_crypto(&mut jobs, tally);
+        WgPump::offload_crypto(&mut jobs, |jobs| {
+            jobs.iter_mut().for_each(|j| *j += 1);
+        });
         assert_eq!(jobs, [1; 4]);
     }
 
