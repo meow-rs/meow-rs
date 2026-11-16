@@ -181,8 +181,11 @@ impl Client {
         tracing::trace!("[Client] Writing port: {}", port);
         addr_bytes.extend_from_slice(&port.to_be_bytes());
 
-        // Use session's write_data_frame to send the address bytes
-        // This avoids the need to unwrap Arc<Stream> which fails when multiple references exist
+        // Queue the address bytes through the session's single FIFO
+        // writer — fire-and-forget like upstream anytls-go (`streamWrite`
+        // never awaited the wire write). The SYN the open just enqueued
+        // precedes it on the wire; awaiting the queue round-trip here was
+        // pure latency on every stream open.
         let stream_id = stream.id();
         tracing::debug!(
             "[Client] Writing destination address ({} bytes) to stream {}",
@@ -197,11 +200,11 @@ impl Client {
         tracing::debug!("[Client] Buffering disabled, buffer will be flushed");
 
         session
-            .write_data_frame(stream_id, Bytes::from(addr_bytes))
+            .enqueue_data_frame(stream_id, Bytes::from(addr_bytes))
             .await?;
 
         tracing::debug!(
-            "[Client] Successfully wrote destination address to stream {}",
+            "[Client] Successfully queued destination address for stream {}",
             stream_id
         );
 
@@ -216,7 +219,7 @@ impl Client {
                 payload.len(),
                 stream_id
             );
-            session.write_data_frame(stream_id, payload).await?;
+            session.enqueue_data_frame(stream_id, payload).await?;
         }
         // Hand the stream back now rather than after SYNACK, as the
         // reference clients do (anytls-go / sing-anytls / mihomo
@@ -575,6 +578,8 @@ impl Drop for SessionCloseGuard {
 mod tests {
     use super::*;
     use crate::util::{AnyTlsError, TlsConnectFuture};
+    use std::future::Future;
+    use std::task::{Context, Waker};
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpStream;
     use tokio::time::Duration;
@@ -592,9 +597,15 @@ mod tests {
     /// Regression: a cancelled unpooled open must close its session — and
     /// with it the transport. The dial timeout can drop the open future
     /// after `start_client` has spawned the session's recv/writer/heartbeat
-    /// tasks but before the stream is handed back (the SETTINGS/SYN/address
-    /// writes); without `SessionCloseGuard` those tasks keep the session
-    /// (and the whole relay leg underneath) alive indefinitely.
+    /// tasks but before the stream is handed back; without
+    /// `SessionCloseGuard` those tasks keep the session (and the whole
+    /// relay leg underneath) alive indefinitely.
+    ///
+    /// The open's SYN/address frames are fire-and-forget now, so the last
+    /// mid-open park is the session writer's 64-permit budget. The test
+    /// saturates it on a wire the peer never drains, then drops the same
+    /// composite `create_proxy_stream_on_tls` builds — an armed guard
+    /// around the in-flight `open_proxy_stream` future.
     #[tokio::test]
     async fn cancelled_unpooled_open_closes_session_and_transport() {
         let client = Client::new(
@@ -603,26 +614,56 @@ mod tests {
             Arc::new(NoTls),
             PaddingFactory::default(),
         );
-        let (tls_half, mut peer) = tokio::io::duplex(64 * 1024);
+
+        // A pipe the peer never drains: the 64-byte auth record goes out,
+        // then the session writer stalls mid-write and releases no
+        // permits.
+        let (tls_half, mut peer) = tokio::io::duplex(160);
+        let session = client.session_over_transport(tls_half).await.unwrap();
+
+        // One queued frame holds one budget permit; queueing while the
+        // stalled write releases none empties the budget, so the next
+        // open's SYN enqueue parks — the in-flight point a dial-timeout
+        // drop lands on. Saturation is proven by a `send_data` that can
+        // no longer take a permit rather than a fixed count, so the
+        // interleave between the writer drain and this task can't shift
+        // where the budget runs out.
+        let (first_stream, _synack_rx) = session.open_stream().await.unwrap();
+        let mut queued = 0;
+        loop {
+            let r = tokio::time::timeout(
+                Duration::from_millis(100),
+                first_stream.send_data(Bytes::from_static(&[7u8; 256])),
+            )
+            .await;
+            match r {
+                Ok(Ok(())) => queued += 1,
+                Ok(Err(e)) => panic!("send_data failed while saturating: {e}"),
+                Err(_) => break, // permit acquire pending: budget exhausted
+            }
+        }
+        assert!(queued > 0, "the stream must queue frames before saturating");
 
         {
-            let open = client.create_proxy_stream_on_tls(tls_half, ("example.com".into(), 443));
+            // `create_proxy_stream_on_tls`'s armed guard + open future.
+            let _dial_guard = SessionCloseGuard::new(session.clone());
+            let open = Client::open_proxy_stream(&session, ("example.com".into(), 443), None);
             tokio::pin!(open);
 
-            // Drive the open until handshake bytes reach the peer, then drop
-            // it while it is still writing the session/stream setup. The open
-            // no longer parks on a 30 s SYNACK wait and can in principle
-            // complete, so `biased` keeps `peer.read` first in poll order —
-            // it wins whenever handshake bytes can arrive, as intended.
-            let mut first = [0u8; 16];
-            tokio::select! {
-                biased;
-                res = peer.read(&mut first) => {
-                    res.expect("peer must see the client's handshake bytes");
+            // The SYN enqueue must park on the saturated budget — this is
+            // the in-flight point a cancelled dial leaves behind.
+            let mut cx = Context::from_waker(Waker::noop());
+            match open.as_mut().poll(&mut cx) {
+                std::task::Poll::Pending => {}
+                std::task::Poll::Ready(Ok(_)) => {
+                    panic!("open must park on the saturated session writer budget; got Ready(Ok)")
                 }
-                _res = &mut open => panic!("open completed unexpectedly"),
+                std::task::Poll::Ready(Err(e)) => panic!(
+                    "open must park on the saturated session writer budget; got Ready(Err({e}))"
+                ),
             }
-            // `open` is dropped at scope end: cancellation.
+            // `open` and the armed `_dial_guard` drop at scope end:
+            // the cancellation.
         }
 
         // The guard must close the session: writer shutdown propagates EOF

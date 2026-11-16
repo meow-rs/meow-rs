@@ -231,6 +231,56 @@ impl Stream {
         Poll::Ready(Ok(len))
     }
 
+    /// Owned-`Bytes` counterpart of `poll_write_data` behind the relay's
+    /// `WriteBytes` probe: the caller's frozen `BytesMut` region becomes
+    /// the frame payload via `split_to` — no `copy_from_slice`, no second
+    /// allocation.
+    ///
+    /// The `Option` slot stays the caller's staging area per the
+    /// `WriteBytes` contract: `Poll::Ready(Ok)` leaves it `None` (every
+    /// chunk was queued); `Poll::Pending` leaves the unsent remainder
+    /// `Some` for the next poll. A slot larger than `MAX_FRAME_PAYLOAD`
+    /// drains as several frames under one poll, one budget permit each —
+    /// ordering is the session queue's FIFO.
+    pub fn poll_write_bytes_data(
+        &self,
+        cx: &mut Context<'_>,
+        bytes: &mut Option<Bytes>,
+    ) -> Poll<std::io::Result<()>> {
+        let mut state = self.write_state.lock().unwrap();
+        if state.closed {
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "stream closed",
+            )));
+        }
+        // Same barrier rule as `poll_write_data`: a cancelled flush must
+        // not wedge later writes.
+        std::task::ready!(Self::poll_pending_flush(&mut state, cx))?;
+        state.waker = Some(cx.waker().clone());
+        while let Some(b) = bytes.as_ref() {
+            if b.is_empty() {
+                bytes.take();
+                continue;
+            }
+            // Acquire BEFORE taking: a Pending must leave the slot full
+            // for the caller to re-present.
+            let permit = std::task::ready!(state.permits.poll_acquire(cx)).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "session writer closed")
+            })?;
+            let mut rest = bytes.take().expect("slot checked non-empty");
+            let len = rest.len().min(MAX_FRAME_PAYLOAD);
+            let payload = rest.split_to(len);
+            self.writer
+                .enqueue(Frame::data(self.id, payload), Some(permit), None)
+                .map_err(std::io::Error::other)?;
+            if !rest.is_empty() {
+                *bytes = Some(rest);
+            }
+        }
+        Poll::Ready(Ok(()))
+    }
+
     pub fn poll_flush_data(&self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let mut state = self.write_state.lock().unwrap();
         // A caller may cancel a backpressured write and then flush instead.

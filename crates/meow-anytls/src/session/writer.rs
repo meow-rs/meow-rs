@@ -76,6 +76,26 @@ impl StreamWriter {
         rx.await.map_err(|_| AnyTlsError::SessionClosed)?
     }
 
+    /// Fire-and-forget admission: the identical budget permit + FIFO
+    /// queueing as [`write_frame`](Self::write_frame), but resolves once
+    /// the frame is queued — the single writer task completes the
+    /// physical write in order. Used where the write+flush round-trip
+    /// would only add latency (the stream-open SYN and address frames,
+    /// matching anytls-go's enqueue semantics). A closed session still
+    /// fails fast through the budget check.
+    pub(crate) async fn enqueue_frame(&self, frame: Frame) -> Result<()> {
+        if frame.data.len() > MAX_FRAME_PAYLOAD {
+            return Err(AnyTlsError::Protocol(
+                "frame payload exceeds u16 length".into(),
+            ));
+        }
+        let permit = Arc::clone(&self.budget)
+            .acquire_owned()
+            .await
+            .map_err(|_| AnyTlsError::SessionClosed)?;
+        self.enqueue(frame, Some(permit), None)
+    }
+
     pub(crate) fn flush(&self) -> Result<oneshot::Receiver<Result<()>>> {
         let (tx, rx) = oneshot::channel();
         if self.budget.is_closed() {

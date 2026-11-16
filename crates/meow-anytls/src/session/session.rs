@@ -1,7 +1,7 @@
 //! Session implementation for AnyTLS protocol
 
 use crate::padding::{PaddingFactory, SharedPaddingFactory};
-use crate::protocol::{Command, Frame, FrameCodec};
+use crate::protocol::{Command, Frame, FrameCodec, HEADER_OVERHEAD_SIZE};
 use crate::session::Stream;
 use crate::session::writer::{StreamWriter, WriteRequest};
 use crate::util::{AnyTlsError, Result, StringMap};
@@ -10,7 +10,7 @@ use md5;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{Notify, RwLock, mpsc};
+use tokio::sync::{Notify, OwnedSemaphorePermit, RwLock, mpsc, oneshot};
 use tokio::time::{self, Duration, Instant, MissedTickBehavior};
 use tracing::{Instrument, Span, field, info_span};
 
@@ -327,6 +327,15 @@ impl Session {
                 break;
             }
 
+            // A `BytesMut` whose spare capacity hits 0 hands `read_buf`
+            // an empty chunk → `Ok(0)` → spurious EOF below. BytesMut
+            // reports `remaining_mut = isize::MAX` (it can always grow),
+            // so `has_remaining_mut` cannot detect this — check the real
+            // spare (`capacity - len`) and reserve ahead of the read.
+            if buffer.len() == buffer.capacity() {
+                buffer.reserve(8192);
+            }
+
             // Read data from connection
             tracing::trace!(
                 session_id = session_id,
@@ -391,7 +400,7 @@ impl Session {
                 break;
             }
 
-            tracing::debug!(
+            tracing::trace!(
                 session_id = session_id,
                 "[Session] recv_loop: Read {} bytes, buffer size={} (iteration {})",
                 n,
@@ -406,7 +415,7 @@ impl Session {
             let buffer_before_decode = buffer.len();
             while let Some(frame) = codec.decode(&mut buffer)? {
                 frame_count += 1;
-                tracing::debug!(
+                tracing::trace!(
                     session_id = session_id,
                     "[Session] recv_loop: Decoded frame #{}: cmd={:?}, stream_id={}, data_len={} (iteration {}, buffer before={}, after={})",
                     frame_count,
@@ -420,7 +429,7 @@ impl Session {
                 self.handle_frame(frame).await?;
             }
             if frame_count == 0 && n > 0 {
-                tracing::debug!(
+                tracing::trace!(
                     session_id = session_id,
                     "[Session] recv_loop: No frames decoded from {} bytes read (iteration {}, buffer size={})",
                     n,
@@ -458,7 +467,7 @@ impl Session {
     /// Handle an incoming frame from connection
     async fn handle_frame(&self, frame: Frame) -> Result<()> {
         let session_id = self.id();
-        tracing::debug!(
+        tracing::trace!(
             session_id = session_id,
             "[Session] handle_frame: Processing frame cmd={:?}, stream_id={}, data_len={}",
             frame.cmd,
@@ -469,7 +478,7 @@ impl Session {
             Command::Push => {
                 // Data frame - forward to stream
                 let data_len = frame.data.len();
-                tracing::debug!(
+                tracing::trace!(
                     session_id = session_id,
                     "[Session] handle_frame: Received PSH frame for stream {}, length={}",
                     frame.stream_id,
@@ -492,7 +501,7 @@ impl Session {
                     );
                     match tx.send(frame.data.clone()) {
                         Ok(_) => {
-                            tracing::debug!(
+                            tracing::trace!(
                                 session_id = session_id,
                                 "[Session] handle_frame: Successfully sent {} bytes to stream {} via channel",
                                 data_len,
@@ -516,7 +525,7 @@ impl Session {
                     // closes while the peer is sending lands here. Keep it
                     // off the default `info` filter (one line per late frame
                     // otherwise).
-                    tracing::debug!(
+                    tracing::trace!(
                         session_id = session_id,
                         "[Session] handle_frame: No receiver found for stream {} (available streams: {:?})",
                         frame.stream_id,
@@ -917,10 +926,10 @@ impl Session {
         // deliberately does NOT abort the handle — the watchdog task itself
         // may be the close() caller.
         //
-        // The arm deliberately precedes `write_frame` — upstream arms
+        // The arm deliberately precedes the SYN enqueue — upstream arms
         // before `writeControlFrame` and keeps the watcher on write error.
         // One Rust-specific edge: if the caller drops this future while
-        // `write_frame` pends on the writer budget, the armed watchdog
+        // `enqueue_frame` pends on the writer budget, the armed watchdog
         // outlives a SYN that was never enqueued and closes the session
         // ~3s later. Erring toward closing matches upstream intent (a
         // saturated writer budget is itself a wedged-session symptom), and
@@ -961,11 +970,15 @@ impl Session {
             }
         }
 
-        // Send SYN frame
+        // Send SYN frame — fire-and-forget into the session's single FIFO
+        // writer (anytls-go `streamWrite` parity): ordering ahead of the
+        // stream's first data frame is all the open needs. Awaiting the
+        // wire write+flush here would cost every stream open one full
+        // writer-queue round-trip on top of the address frame's.
         tracing::trace!("[Session] Sending SYN frame for stream {}", stream_id);
         let frame = Frame::control(Command::Syn, stream_id);
-        self.write_frame(frame).await?;
-        tracing::debug!("[Session] SYN frame sent for stream {}", stream_id);
+        self.stream_data_tx.enqueue_frame(frame).await?;
+        tracing::trace!("[Session] SYN frame queued for stream {}", stream_id);
 
         guard.disarm();
         Ok((stream, synack_rx))
@@ -975,6 +988,16 @@ impl Session {
     pub fn disable_buffering(&self) {
         self.buffering
             .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Queue a data frame without awaiting the wire write — the same
+    /// FIFO as `write_data_frame`, minus the writer-queue round-trip
+    /// (anytls-go parity: the stream-open address write never waited on
+    /// a flush). A closed session still fails fast at enqueue time.
+    pub async fn enqueue_data_frame(&self, stream_id: u32, data: Bytes) -> Result<()> {
+        self.stream_data_tx
+            .enqueue_frame(Frame::data(stream_id, data))
+            .await
     }
 
     /// Write a data frame to connection
@@ -1084,7 +1107,6 @@ impl Session {
     /// Write buffer to connection with padding applied
     async fn write_with_padding(&self, mut buffer: BytesMut) -> Result<()> {
         use crate::padding::CHECK_MARK;
-        use crate::protocol::{Command, HEADER_OVERHEAD_SIZE};
         use bytes::BufMut;
 
         if !self.send_padding {
@@ -1172,13 +1194,13 @@ impl Session {
                 // This packet is all payload - send exactly size bytes
                 // Note: This may split a frame in the middle, but that's okay for TLS records
                 // The receiver will reassemble frames from the stream
-                tracing::debug!(
+                tracing::trace!(
                     "[Session] write_with_padding: Splitting payload: sending {} bytes (remain={})",
                     size,
                     remain_payload_len
                 );
                 if size >= 7 {
-                    tracing::debug!(
+                    tracing::trace!(
                         "[Session] write_with_padding: First 7 bytes being sent: {:?}",
                         &buffer[..7]
                     );
@@ -1237,7 +1259,7 @@ impl Session {
         if let Err(e) = writer.flush().await {
             return Err(AnyTlsError::Io(e));
         }
-        tracing::debug!("[Session] write_with_padding: Successfully wrote and flushed data");
+        tracing::trace!("[Session] write_with_padding: Successfully wrote and flushed data");
         Ok(())
     }
 
@@ -1394,10 +1416,21 @@ impl Session {
     }
 
     /// Run the sole wire writer. Cancelling a producer never cancels a frame.
+    ///
+    /// Each turn drains *every* queued request — `recv` for the first,
+    /// `try_recv` for the rest — then writes the whole batch under one
+    /// writer lock with one flush. That amortizes the upstream model
+    /// (anytls-go/mihomo pay a single `conn.Write` under the session
+    /// mutex per frame) into a single write call per queue depth instead
+    /// of an MPSC hop + task wakeup + lock + flush *per frame*.
     pub async fn process_stream_data(&self) -> Result<()> {
         let Some(mut receiver) = self.stream_data_rx.lock().await.take() else {
             return Ok(());
         };
+        // Reused across drains: the queue list itself and the contiguous
+        // encode scratch the non-vectored and padding write paths fill.
+        let mut requests: Vec<WriteRequest> = Vec::new();
+        let mut encode_scratch = BytesMut::with_capacity(64 * 1024);
         loop {
             let closed = self.close_notify.notified();
             tokio::pin!(closed);
@@ -1405,7 +1438,7 @@ impl Session {
             if self.is_closed() {
                 break;
             }
-            let request = tokio::select! {
+            let first = tokio::select! {
                 biased;
                 _ = &mut closed => break,
                 request = receiver.recv() => match request {
@@ -1413,62 +1446,22 @@ impl Session {
                     None => break,
                 },
             };
-            let (completion, result, fin_stream) = tokio::select! {
+            requests.push(first);
+            while let Ok(request) = receiver.try_recv() {
+                requests.push(request);
+            }
+            let result = tokio::select! {
                 biased;
                 // Partial frames may only be abandoned when this entire
                 // session is already closed and will never be pooled again.
                 _ = &mut closed => break,
-                result = async {
-                    match request {
-                        WriteRequest::Frame { frame, _permit, completion } => {
-                            let fin = frame.cmd == Command::Fin;
-                            let stream_id = frame.stream_id;
-                            if fin {
-                                // A cancelled initial dial must not leave its
-                                // Settings/SYN/FIN buffered until another dial.
-                                self.disable_buffering();
-                            }
-                            let result = self.write_frame_inner(frame).await;
-                            // Hold capacity through the physical write/flush.
-                            drop(_permit);
-                            (completion, result, fin.then_some(stream_id))
-                        }
-                        WriteRequest::Flush(completion) => {
-                            let result = self.flush_inner().await;
-                            (Some(completion), result, None)
-                        }
-                    }
-                } => result,
+                result = self.write_batch(&mut requests, &mut encode_scratch) => result,
             };
-            // Fin eviction runs AFTER the select: doing it inside the
-            // write future let a racing `Session::close()` drop the future
-            // between the map removal and the notify — the stream vanished
-            // from `streams` while its synack-waiter still pended, the same
-            // bug class the inbound Fin arm fixes (issue #543 review).
-            // `open_stream` is pub, so an out-of-tree caller can hold a
-            // live synack-waiter across a local close; mark the stream
-            // closed too so a retained Arc<Stream> can't still queue PSH.
-            if let Some(stream_id) = fin_stream {
-                // Acquire both locks before mutating either map — the same
-                // order `open_stream`/`close` use — then evict + close +
-                // wake in one synchronous step: no cancellation point can
-                // split removal from the waiter wakeup (issue #621).
-                let mut streams = self.streams.write().await;
-                let mut receive_map = self.stream_receive_tx.write().await;
-                if let Some(stream) = streams.remove(&stream_id) {
-                    receive_map.remove(&stream_id);
-                    stream.close_with_error(AnyTlsError::StreamClosed);
-                    stream.notify_synack(Err(AnyTlsError::StreamClosed));
-                }
-            }
-            let failed = result.is_err();
+            requests.clear();
             if let Err(error) = &result {
                 tracing::debug!(session_id = self.id(), %error, "AnyTLS session writer failed");
             }
-            if let Some(completion) = completion {
-                let _ = completion.send(result);
-            }
-            if failed {
+            if result.is_err() {
                 // No writer lock is held here; close() can safely shut it down.
                 self.close().await?;
                 return Err(AnyTlsError::SessionClosed);
@@ -1477,15 +1470,211 @@ impl Session {
         Ok(())
     }
 
-    async fn flush_inner(&self) -> Result<()> {
-        self.disable_buffering();
-        let buffered = std::mem::take(&mut *self.buffer.lock().await);
-        if !buffered.is_empty() {
-            self.write_with_padding(BytesMut::from(buffered.as_slice()))
-                .await?;
+    /// Encode and write one drained queue batch, resolve every request's
+    /// completion, then evict the batch's FIN streams.
+    ///
+    /// Ordering is the queue's FIFO order end to end: frames admitted
+    /// while `buffering` still holds fold into `self.buffer` and resolve
+    /// immediately (the old `write_frame_inner` contract); `self.buffer`
+    /// always leads the wire image; FIN and Flush markers disable
+    /// buffering exactly where they sit in the queue.
+    async fn write_batch(
+        &self,
+        requests: &mut Vec<WriteRequest>,
+        encode_scratch: &mut BytesMut,
+    ) -> Result<()> {
+        // Phase 1 — classify. Each queued frame becomes a pre-encoded
+        // header + its owned `Bytes` payload; nothing is copied yet.
+        let mut frames: Vec<WireFrame> = Vec::with_capacity(requests.len());
+        let mut flush_waiters: Vec<oneshot::Sender<Result<()>>> = Vec::new();
+        let mut fin_streams: Vec<u32> = Vec::new();
+        for request in requests.drain(..) {
+            match request {
+                WriteRequest::Frame {
+                    frame,
+                    _permit,
+                    completion,
+                } => {
+                    let fin = frame.cmd == Command::Fin;
+                    if fin {
+                        // A cancelled initial dial must not leave its
+                        // Settings/SYN/FIN buffered until another dial.
+                        self.disable_buffering();
+                        fin_streams.push(frame.stream_id);
+                    }
+                    if frame.data.len() > u16::MAX as usize {
+                        // `write_frame`/`enqueue_frame` bound payloads at
+                        // admission; a bare `enqueue` caller could still
+                        // oversize — fail like the codec's encode error did
+                        // (the write, and so the session, dies).
+                        return Err(AnyTlsError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "AnyTLS frame payload exceeds u16 length",
+                        )));
+                    }
+                    let mut header = [0u8; HEADER_OVERHEAD_SIZE];
+                    header[0] = u8::from(frame.cmd);
+                    header[1..5].copy_from_slice(&frame.stream_id.to_be_bytes());
+                    header[5..7].copy_from_slice(&(frame.data.len() as u16).to_be_bytes());
+                    if self.buffering.load(std::sync::atomic::Ordering::Relaxed) {
+                        let mut buffer = self.buffer.lock().await;
+                        buffer.extend_from_slice(&header);
+                        buffer.extend_from_slice(&frame.data);
+                        drop(buffer);
+                        if let Some(completion) = completion {
+                            let _ = completion.send(Ok(()));
+                        }
+                    } else {
+                        frames.push(WireFrame {
+                            header,
+                            data: frame.data,
+                            _permit,
+                            completion,
+                        });
+                    }
+                }
+                WriteRequest::Flush(completion) => {
+                    // Flush barriers resolve when the batch they rode in
+                    // on is written + flushed — everything queued before
+                    // the marker precedes it on the wire.
+                    self.disable_buffering();
+                    flush_waiters.push(completion);
+                }
+            }
         }
-        self.writer.lock().await.flush().await?;
-        Ok(())
+
+        // Phase 2 — the wire write. Padding (client sessions, first
+        // `stop` packets only) still needs a contiguous image; otherwise
+        // the batch goes out under a single lock + write + flush.
+        let buffered = std::mem::take(&mut *self.buffer.lock().await);
+        let padding_active = self.send_padding
+            && self.pkt_counter.load(std::sync::atomic::Ordering::Relaxed)
+                < self.padding.read().await.stop();
+        let result: Result<()> = if buffered.is_empty() && frames.is_empty() {
+            if flush_waiters.is_empty() {
+                Ok(())
+            } else {
+                // A lone Flush barrier still owes the transport a bare
+                // flush — the old `flush_inner` ran `writer.flush()`
+                // unconditionally (transports can buffer internally).
+                self.writer
+                    .lock()
+                    .await
+                    .flush()
+                    .await
+                    .map_err(AnyTlsError::Io)
+            }
+        } else if padding_active {
+            encode_scratch.clear();
+            encode_scratch.reserve(
+                buffered.len()
+                    + frames
+                        .iter()
+                        .map(|f| HEADER_OVERHEAD_SIZE + f.data.len())
+                        .sum::<usize>(),
+            );
+            encode_scratch.extend_from_slice(&buffered);
+            for frame in &frames {
+                encode_scratch.extend_from_slice(&frame.header);
+                encode_scratch.extend_from_slice(&frame.data);
+            }
+            self.write_with_padding(encode_scratch.split()).await
+        } else {
+            self.write_wire(&buffered, &frames, encode_scratch).await
+        };
+
+        // FIN eviction runs AFTER the write — the same point in the
+        // sequence the per-request loop used, and on any write outcome.
+        // Acquiring both locks once for the whole batch keeps removal +
+        // close + wakeup an uninterruptible step per stream (issue #621):
+        // `open_stream` is pub, so an out-of-tree caller can hold a live
+        // synack-waiter across a local close.
+        if !fin_streams.is_empty() {
+            let mut streams = self.streams.write().await;
+            let mut receive_map = self.stream_receive_tx.write().await;
+            for stream_id in fin_streams {
+                if let Some(stream) = streams.remove(&stream_id) {
+                    receive_map.remove(&stream_id);
+                    stream.close_with_error(AnyTlsError::StreamClosed);
+                    stream.notify_synack(Err(AnyTlsError::StreamClosed));
+                }
+            }
+        }
+
+        // Every waiter of the drain resolves with the batch's outcome.
+        // Permits drop with `frames` — after the physical write, matching
+        // the old "hold capacity through write/flush" rule.
+        for frame in frames {
+            if let Some(completion) = frame.completion {
+                let _ = completion.send(clone_result(&result));
+            }
+        }
+        for waiter in flush_waiters {
+            let _ = waiter.send(clone_result(&result));
+        }
+        result
+    }
+
+    /// Unpadded batch write under one writer lock + one flush.
+    ///
+    /// Vectored-capable transports take `[buffered][header, payload]*`
+    /// straight from the frames' `Bytes` — zero copies. The rest get one
+    /// contiguous image assembled in the reused scratch: `SslStream` (and
+    /// any `write_vectored`-less writer) seals each `write` call into its
+    /// own record, so feeding it per-frame iovecs would split every
+    /// 7-byte header into its own TLS record.
+    async fn write_wire(
+        &self,
+        buffered: &[u8],
+        frames: &[WireFrame],
+        encode_scratch: &mut BytesMut,
+    ) -> Result<()> {
+        use std::io::IoSlice;
+        let mut writer = self.writer.lock().await;
+        if writer.is_write_vectored() {
+            let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(1 + frames.len() * 2);
+            if !buffered.is_empty() {
+                slices.push(IoSlice::new(buffered));
+            }
+            for frame in frames {
+                slices.push(IoSlice::new(&frame.header));
+                if !frame.data.is_empty() {
+                    slices.push(IoSlice::new(&frame.data));
+                }
+            }
+            let mut pending = slices.as_mut_slice();
+            while !pending.is_empty() {
+                match writer.write_vectored(pending).await {
+                    Ok(0) => {
+                        return Err(AnyTlsError::Io(std::io::Error::new(
+                            std::io::ErrorKind::WriteZero,
+                            "anytls session writer accepted zero bytes",
+                        )));
+                    }
+                    Ok(n) => IoSlice::advance_slices(&mut pending, n),
+                    Err(e) => return Err(AnyTlsError::Io(e)),
+                }
+            }
+        } else {
+            encode_scratch.clear();
+            encode_scratch.reserve(
+                buffered.len()
+                    + frames
+                        .iter()
+                        .map(|f| HEADER_OVERHEAD_SIZE + f.data.len())
+                        .sum::<usize>(),
+            );
+            encode_scratch.extend_from_slice(buffered);
+            for frame in frames {
+                encode_scratch.extend_from_slice(&frame.header);
+                encode_scratch.extend_from_slice(&frame.data);
+            }
+            writer
+                .write_all(&encode_scratch[..])
+                .await
+                .map_err(AnyTlsError::Io)?;
+        }
+        writer.flush().await.map_err(AnyTlsError::Io)
     }
 
     /// Get session sequence number
@@ -1510,6 +1699,29 @@ impl Session {
     /// Get peer version
     pub fn peer_version(&self) -> u8 {
         self.peer_version.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// A queued frame mid-drain: pre-encoded wire header + the owned `Bytes`
+/// payload (which moves to the wire unmodified — no copy). The budget
+/// permit rides inside so it is held through the physical write.
+struct WireFrame {
+    header: [u8; HEADER_OVERHEAD_SIZE],
+    data: Bytes,
+    _permit: Option<OwnedSemaphorePermit>,
+    completion: Option<oneshot::Sender<Result<()>>>,
+}
+
+/// One batch outcome fans out to every waiter of the drain;
+/// `AnyTlsError` is not `Clone`, so each waiter gets an equivalent error.
+fn clone_result(result: &Result<()>) -> Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(e) => Err(match e {
+            AnyTlsError::Io(e) => AnyTlsError::Io(std::io::Error::new(e.kind(), e.to_string())),
+            AnyTlsError::Protocol(s) => AnyTlsError::Protocol(s.clone()),
+            _ => AnyTlsError::SessionClosed,
+        }),
     }
 }
 
@@ -1547,28 +1759,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelled_open_finishes_syn_and_retires_stream() {
-        use std::future::Future;
-        use std::task::{Context, Waker};
+    async fn enqueued_syn_survives_immediate_stream_close() {
         let (io, mut peer) = duplex(4);
         let (reader, writer) = tokio::io::split(io);
         let session = Arc::new(Session::new_server(reader, writer, create_test_padding()));
         let worker = Arc::clone(&session);
         let task = tokio::spawn(async move { worker.process_stream_data().await });
-        let mut open = Box::pin(session.open_stream());
-        assert!(
-            open.as_mut()
-                .poll(&mut Context::from_waker(Waker::noop()))
-                .is_pending()
-        );
-        // SYN is seven bytes but the wire only holds four. Cancel after the
-        // first byte was observed, while write_all still has work to do.
+
+        // The SYN enqueue is atomic: once `open_stream` returns, the
+        // session writer owns the frame — closing the stream at once
+        // cannot tear it, and the close's FIN lands behind it in the
+        // same FIFO.
+        let (stream, _synack_rx) = session.open_stream().await.unwrap();
+        stream.close();
+
+        // SYN is seven bytes but the wire only holds four — the writer
+        // must still emit all of it, in order, before the FIN.
         assert_eq!(peer.read_u8().await.unwrap(), u8::from(Command::Syn));
-        drop(open);
         let mut tail = [0; 6];
         peer.read_exact(&mut tail).await.unwrap();
         assert_eq!(tail, [0, 0, 0, 1, 0, 0]);
         assert_eq!(read_frame(&mut peer).await, Frame::control(Command::Fin, 1));
+        // Eviction runs on the writer task right after the wire write.
+        for _ in 0..50 {
+            if !session.has_active_streams().await {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
         assert!(!session.has_active_streams().await);
         assert!(session.stream_receive_tx.read().await.is_empty());
 
@@ -1579,6 +1797,131 @@ mod tests {
         assert_eq!(read_frame(&mut peer).await, Frame::control(Command::Fin, 2));
         session.close().await.unwrap();
         task.await.unwrap().unwrap();
+    }
+
+    /// An `AsyncWrite` that records every byte and counts write/flush
+    /// calls — the seam for asserting a drained batch is ONE wire write.
+    struct RecordingWriter {
+        bytes: Arc<std::sync::Mutex<Vec<u8>>>,
+        writes: Arc<std::sync::atomic::AtomicUsize>,
+        flushes: Arc<std::sync::atomic::AtomicUsize>,
+        vectored: bool,
+    }
+
+    impl tokio::io::AsyncWrite for RecordingWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.bytes.lock().unwrap().extend_from_slice(buf);
+            self.writes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_write_vectored(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            bufs: &[std::io::IoSlice<'_>],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let mut total = 0;
+            for buf in bufs {
+                self.bytes.lock().unwrap().extend_from_slice(buf);
+                total += buf.len();
+            }
+            self.writes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            std::task::Poll::Ready(Ok(total))
+        }
+        fn is_write_vectored(&self) -> bool {
+            self.vectored
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.flushes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// N queued frames must reach the wire as ONE write under ONE writer
+    /// lock + ONE flush — the drain-batch contract — on both the vectored
+    /// and the contiguous write paths, in queue FIFO order.
+    #[tokio::test]
+    async fn queued_frames_write_as_one_batch() {
+        for vectored in [true, false] {
+            let bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let flushes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let writer = RecordingWriter {
+                bytes: Arc::clone(&bytes),
+                writes: Arc::clone(&writes),
+                flushes: Arc::clone(&flushes),
+                vectored,
+            };
+            let session = Arc::new(Session::new_server(
+                tokio::io::empty(),
+                writer,
+                create_test_padding(),
+            ));
+
+            // Queue everything BEFORE the writer task starts, so its very
+            // first recv+try_recv pass sees the full batch.
+            const N: u8 = 8;
+            for i in 0..N {
+                session
+                    .stream_data_tx
+                    .enqueue_frame(Frame::data(1, Bytes::from(vec![i; 4])))
+                    .await
+                    .unwrap();
+            }
+            // The Flush marker is the barrier: it resolves once the batch
+            // that carries it has been written + flushed.
+            let barrier = session.stream_data_tx.flush().unwrap();
+
+            let worker = Arc::clone(&session);
+            let task = tokio::spawn(async move { worker.process_stream_data().await });
+            time::timeout(Duration::from_secs(2), barrier)
+                .await
+                .expect("flush barrier must resolve")
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(
+                writes.load(std::sync::atomic::Ordering::Relaxed),
+                1,
+                "a drained batch must be a single write call (vectored={vectored})"
+            );
+            assert_eq!(
+                flushes.load(std::sync::atomic::Ordering::Relaxed),
+                1,
+                "a drained batch must flush once (vectored={vectored})"
+            );
+
+            let mut expect = Vec::new();
+            for i in 0..N {
+                expect.push(u8::from(Command::Push));
+                expect.extend_from_slice(&1u32.to_be_bytes());
+                expect.extend_from_slice(&4u16.to_be_bytes());
+                expect.extend_from_slice(&[i; 4]);
+            }
+            assert_eq!(
+                *bytes.lock().unwrap(),
+                expect,
+                "wire image must be the frames in FIFO order (vectored={vectored})"
+            );
+
+            session.close().await.unwrap();
+            task.await.unwrap().unwrap();
+        }
     }
 
     #[tokio::test]
@@ -2577,6 +2920,10 @@ mod padding_bounds_tests {
         let (_s1, _a1) = session.open_stream().await.unwrap();
         let (_s2, _a2) = session.open_stream().await.unwrap();
         assert!(session.syn_watchdog.lock().unwrap().is_some());
+        // Let the spawned watchdog register its sleep before advancing —
+        // with fire-and-forget SYN enqueue `open_stream` no longer parks
+        // on the writer queue, so the task needs an explicit yield slot.
+        tokio::task::yield_now().await;
 
         session
             .handle_frame(Frame::control(Command::HeartResponse, 0))

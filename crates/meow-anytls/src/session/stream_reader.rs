@@ -72,7 +72,7 @@ impl StreamReader {
         match self.reader_rx.recv().await {
             Some(data) => {
                 let data_len = data.len();
-                tracing::debug!(
+                tracing::trace!(
                     "[StreamReader] Received {} bytes from channel (stream_id={})",
                     data_len,
                     self.id

@@ -30,7 +30,8 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 
 use meow_common::{
-    AdapterType, MeowError, Metadata, ProxyAdapter, ProxyConn, ProxyHealth, ProxyPacketConn, Result,
+    AdapterType, MeowError, Metadata, ProxyAdapter, ProxyConn, ProxyHealth, ProxyPacketConn,
+    Result, WriteBytes,
 };
 
 use crate::certificate_pin::parse_cert_pin;
@@ -374,8 +375,9 @@ fn anytls_tcp_destination(metadata: &Metadata) -> Result<String> {
 /// obtain `&mut Stream`. So we re-implement the traits against its public
 /// reader and cancellation-safe writer-channel APIs.
 // The pending read future is `Send` but not `Sync`; `ProxyConn` requires
-// `Sync`, so it is wrapped in `parking_lot::Mutex`.
-type PendingRead = Pin<Box<dyn std::future::Future<Output = io::Result<Vec<u8>>> + Send>>;
+// `Sync`, so it is wrapped in `parking_lot::Mutex`. Its output is the
+// scratch Vec (returned for reuse) plus the read result.
+type PendingRead = Pin<Box<dyn std::future::Future<Output = (Vec<u8>, io::Result<usize>)> + Send>>;
 
 struct AnytlsConn {
     stream: Arc<AnytlsStream>,
@@ -388,6 +390,9 @@ struct AnytlsConn {
     /// dies (the heartbeat only reaps sessions whose peer stops answering).
     session_owned: bool,
     pending_read: Mutex<Option<PendingRead>>,
+    /// Buffer the contended-path read future fills; it is handed back on
+    /// completion so the next pending read reuses the allocation.
+    read_scratch: Arc<Mutex<Vec<u8>>>,
 }
 
 impl AnytlsConn {
@@ -397,6 +402,7 @@ impl AnytlsConn {
             session,
             session_owned: false,
             pending_read: Mutex::new(None),
+            read_scratch: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -408,6 +414,7 @@ impl AnytlsConn {
             session,
             session_owned: true,
             pending_read: Mutex::new(None),
+            read_scratch: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -429,39 +436,74 @@ impl AsyncRead for AnytlsConn {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        let remaining = buf.remaining();
-        if remaining == 0 {
+        if buf.remaining() == 0 {
             return Poll::Ready(Ok(()));
         }
 
         let mut guard = self.pending_read.lock();
         if guard.is_none() {
+            // Fast path: the stream's reader mutex is uncontended (a conn
+            // is its only reader in practice) — poll the StreamReader
+            // straight into the caller's ReadBuf: no scratch alloc, no
+            // boxed future, no copy. The channel waker the reader
+            // registers persists inside the receiver, so an unlock never
+            // loses the wakeup.
+            if let Ok(mut reader) = self.stream.reader().try_lock() {
+                return Pin::new(&mut *reader).poll_read(cx, buf);
+            }
+
+            // Contended (another handle reads this stream): park a
+            // lock+read future, filling the persistent scratch instead of
+            // a per-read `vec![0; n]`.
             let reader = Arc::clone(self.stream.reader());
+            let scratch = Arc::clone(&self.read_scratch);
+            let cap = buf.remaining();
             let fut = async move {
                 let mut g = reader.lock().await;
-                let mut tmp = vec![0u8; remaining];
-                let n = g
-                    .read(&mut tmp)
-                    .await
-                    .map_err(|e| io::Error::other(format!("anytls read: {e}")))?;
-                tmp.truncate(n);
-                Ok(tmp)
+                let mut tmp = std::mem::take(&mut *scratch.lock());
+                tmp.clear();
+                tmp.resize(cap, 0);
+                let result = g.read(&mut tmp).await;
+                (tmp, result)
             };
             *guard = Some(Box::pin(fut));
         }
         let fut = guard.as_mut().expect("just set");
-        match fut.as_mut().poll(cx) {
-            Poll::Ready(Ok(data)) => {
-                *guard = None;
-                buf.put_slice(&data);
-                Poll::Ready(Ok(()))
+        let (mut tmp, result) = std::task::ready!(fut.as_mut().poll(cx));
+        *guard = None;
+        let n = match result {
+            Ok(n) => n.min(tmp.len()),
+            Err(e) => {
+                *self.read_scratch.lock() = tmp;
+                return Poll::Ready(Err(io::Error::other(format!("anytls read: {e}"))));
             }
-            Poll::Ready(Err(e)) => {
-                *guard = None;
-                Poll::Ready(Err(e))
-            }
-            Poll::Pending => Poll::Pending,
+        };
+        let fit = n.min(buf.remaining());
+        buf.put_slice(&tmp[..fit]);
+        if fit < n {
+            // A caller that re-polls a Pending read with a *smaller* buf
+            // must not lose the tail: re-park it as an immediately-ready
+            // pending read.
+            let rest = tmp.split_off(fit);
+            let rest_len = rest.len();
+            *guard = Some(Box::pin(async move { (rest, Ok(rest_len)) }));
         }
+        tmp.clear();
+        *self.read_scratch.lock() = tmp;
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// The relay's owned-`Bytes` write path: the frozen `BytesMut` region
+/// moves into the anytls frame payload via `split_to` — the
+/// `copy_from_slice` `poll_write` would pay is gone on this direction.
+impl WriteBytes for AnytlsConn {
+    fn poll_write_bytes(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &mut Option<Bytes>,
+    ) -> Poll<io::Result<()>> {
+        self.stream.poll_write_bytes_data(cx, bytes)
     }
 }
 
@@ -515,7 +557,11 @@ impl Drop for AnytlsConn {
     }
 }
 
-impl ProxyConn for AnytlsConn {}
+impl ProxyConn for AnytlsConn {
+    fn write_bytes(&mut self) -> Option<&mut dyn WriteBytes> {
+        Some(self)
+    }
+}
 
 // ─── udp-over-tcp v2 (sing-box `uot`) ────────────────────────────────────────
 //
