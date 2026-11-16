@@ -15,7 +15,7 @@ use meow_common::{
     AdapterType, HostResolver, MeowError, Metadata, Network, ProxyAdapter, ProxyConn, ProxyHealth,
     ProxyPacketConn, Result,
 };
-use meow_wgstack::{BatchEndpoint, Endpoint, ProxyEndpoint};
+use meow_wgstack::{BridgedEndpoint, Endpoint, ProxyEndpoint};
 use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 
@@ -301,8 +301,9 @@ impl WireGuardAdapter {
         let std_sock = socket.into_std()?;
         std_sock.connect(peer)?;
         std_sock.set_nonblocking(true)?;
-        Ok(Endpoint::Batch(BatchEndpoint::connected(
+        Ok(Endpoint::Batch(BridgedEndpoint::connected(
             tokio::net::UdpSocket::from_std(std_sock)?,
+            peer,
         )))
     }
 
@@ -671,11 +672,11 @@ mod tests {
     //! a warn+sleep spin — and the next `ensure_pump` must detect the
     //! stale handle, clear the slot and redial the front hop.
     //!
-    //! T-recover-3 note (spec §5.5): the `Endpoint::Batch` arm's
-    //! warn+sleep retry is asserted by code review plus the unchanged
-    //! direct-path integration tests — `BatchEndpoint` is a concrete
-    //! socket type with no mock seam, so there is no way to inject a
-    //! transient `ENOBUFS` without altering the type under test.
+    //! T-recover-3 note (spec §5.5): the `Endpoint::Batch` arm shares
+    //! the terminal verdict — its `BridgedEndpoint` reports
+    //! `ConnectionReset` when the socket bridge task dies, exactly
+    //! like `Endpoint::Proxy`'s front conn — asserted by code review
+    //! plus the unchanged direct-path integration tests.
 
     use super::*;
 
@@ -701,7 +702,7 @@ mod tests {
         SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)), 51820);
 
     /// Serializes the two kill-the-conn tests: both emit the same
-    /// `proxy endpoint dead` warn, and the warn-counting test would
+    /// `endpoint dead` warn, and the warn-counting test would
     /// leak counts into a concurrently-running sibling. A tokio Mutex
     /// because the guard must live across `.await`s.
     static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -711,8 +712,8 @@ mod tests {
     static PROXY_DEAD_WARNS: AtomicUsize = AtomicUsize::new(0);
     static SUBSCRIBER_OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
-    /// Best-effort global WARN counter scoped to the exact "proxy
-    /// endpoint dead" message. Returns `false` when another subscriber
+    /// Best-effort global WARN counter scoped to the exact "endpoint
+    /// dead" message. Returns `false` when another subscriber
     /// already owns the process-global default (the caller then
     /// degrades to the task-finish assertion — which is itself the
     /// no-spin proof, since a warn+sleep loop never terminates).
@@ -734,12 +735,12 @@ mod tests {
                         _f: &tracing::field::Field,
                         v: &dyn std::fmt::Debug,
                     ) {
-                        if format!("{v:?}").contains("proxy endpoint dead") {
+                        if format!("{v:?}").contains("endpoint dead") {
                             self.0 = true;
                         }
                     }
                     fn record_str(&mut self, _f: &tracing::field::Field, v: &str) {
-                        if v.contains("proxy endpoint dead") {
+                        if v.contains("endpoint dead") {
                             self.0 = true;
                         }
                     }

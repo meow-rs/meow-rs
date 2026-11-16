@@ -27,7 +27,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc::{self, error::SendError, OwnedPermit};
 
 mod endpoint;
-pub use endpoint::{BatchEndpoint, Endpoint, ProxyEndpoint};
+pub use endpoint::{BatchEndpoint, BridgedEndpoint, Endpoint, ProxyEndpoint};
 
 /// actor→conn stream events per TCP flow (≈64 × 64 KiB = 4 MiB of read
 /// backpressure per flow — covers the 4 MiB smoltcp socket window so the
@@ -71,6 +71,30 @@ pub const TCP_SOCKET_BUF: usize = 4 * 1024 * 1024;
 /// `recvmsg_x` per-call chunk stays under XNU's 100-datagram clip via
 /// `endpoint`'s `MSGX_CHUNK`, not this constant.
 pub const WIRE_DRAIN_BUDGET: usize = 256;
+
+/// Inner-TX admission bound per service pass — how many `tx_queue`
+/// packets `drain_device_tx` may seal into wire datagrams before the
+/// rest of the pass runs. The unbounded drain it replaces let one pass
+/// stage every saturated socket's full window (≈2 800 datagrams each at
+/// [`POLL_TX_BYTES_BUDGET`]) straight into the outbox and on to the
+/// kernel: a burst that large cannot be absorbed by *any* downstream
+/// UDP receive buffer (macOS caps `SO_RCVBUF` at 8 MiB ≈ 5 800
+/// datagrams), so the peer's kernel silently dropped the tail and the
+/// inner TCP paid a ≥1 s RTO per lost segment — under 16 concurrent
+/// flows the aggregate burst turned ~30 % of the wire into
+/// retransmissions (measured: +124k kernel-buffer drops per 16×4 MiB
+/// run vs +2k for a same-path mihomo run).
+///
+/// Leaving the excess in `tx_queue` is not just the cheap option, it is
+/// the correct one: the queue is FIFO so no per-conn starvation is
+/// possible, its worst-case depth is bounded by the sum of the sockets'
+/// send windows — the same data has to live *somewhere* before the wire
+/// carries it — and the back-pressure then reaches the inner TCP
+/// through the socket's own send-buffer/window machinery instead of a
+/// packet drop. 1 024 datagrams ≈ 1.4 MB per pass stays far below any
+/// conforming `SO_RCVBUF` while keeping emission at `pass_rate × 1024`,
+/// far above the inner flows' ACK-clocked demand.
+pub const TX_DRAIN_BUDGET: usize = 4 * WIRE_DRAIN_BUDGET;
 
 /// Bound on [`Interface::poll`] iterations per service pass — see
 /// [`poll_burst`]. A permanently-progressing pass (a saturated bulk flow

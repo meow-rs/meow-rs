@@ -30,7 +30,7 @@ use meow_common::{MeowError, ProxyConn, ProxyPacketConn, Result};
 use meow_wgstack::{
     note_count, note_drop, poll_burst, reset_scratch, udp_dst_port, ChannelDevice, DropStats,
     Endpoint, StreamEvent, TcpIo, WgStream, TCP_READ_QUEUE, TCP_SOCKET_BUF, TCP_WRITE_QUEUE,
-    WG_TIMER_INTERVAL, WIRE_DRAIN_BUDGET,
+    TX_DRAIN_BUDGET, WG_TIMER_INTERVAL, WIRE_DRAIN_BUDGET,
 };
 use meow_wireguard::noise::Packet;
 use meow_wireguard::{
@@ -79,6 +79,15 @@ const _: () = assert!(TCP_READ_QUEUE * TCP_READ_CHUNK >= TCP_SOCKET_BUF);
 /// datagrams, mailbox messages and conn wakes all break the sleep early, so
 /// this only bounds the smoltcp housekeeping cadence.
 const IDLE_SLEEP: Duration = Duration::from_millis(10);
+
+/// Per-pass livelock bound on `run`'s RX-flood `drain_wire` loop — not
+/// the drain's everyday exit (that is a short batch reporting the
+/// endpoint quiet). A wire datagram lost to a full kernel buffer is an
+/// unrecoverable inner-TCP hole, so RX must always outpace TX: every TX
+/// backlog form is lossless, a lost RX datagram is not. The cap only
+/// guarantees the pass eventually reaches mailbox/service/TX work; the
+/// next pass re-enters the flood loop immediately.
+const RX_PASS_CAP: usize = 8 * WIRE_DRAIN_BUDGET;
 
 /// Worker-fairness bound on a *task* pump (perf-7 P7-2): one service pass
 /// is synchronous start to finish, so a flow moving this much payload in
@@ -689,7 +698,11 @@ impl WgPump {
     /// `block_in_place` offload (the pool join must not park the shared
     /// worker), tests the direct pool call (they run on current-thread
     /// runtimes, where `block_in_place` panics).
-    fn drain_wire(&mut self, run_crypto: impl FnOnce(&mut Vec<CryptoJob>)) {
+    /// Pulls up to [`WIRE_DRAIN_BUDGET`] wire datagrams and returns how
+    /// many arrived — `run`'s RX-flood loop repeats the call while full
+    /// batches come back (a returned-short batch means the endpoint
+    /// went quiet mid-drain).
+    fn drain_wire(&mut self, run_crypto: impl FnOnce(&mut Vec<CryptoJob>)) -> usize {
         let mut slots = std::mem::take(&mut self.rx_slots);
         let n = self.endpoint.recv_batch(&mut slots, WIRE_DRAIN_BUDGET);
         // Wire bytes count toward the service-yield budget whether a
@@ -819,6 +832,7 @@ impl WgPump {
         debug_assert_eq!(healed, 0, "crypto pool lost a chunk's buffers");
         self.return_scratch(dst);
         self.rx_slots = slots;
+        n
     }
 
     /// Egress: `device.tx_queue` → WG DATA datagrams → outbox — the TX
@@ -898,8 +912,11 @@ impl WgPump {
         // pass are for the next iteration. The block reservation keys
         // each job's nonce to `base + i`; a packet dropped at the
         // undersize guard simply skips its counter (counters need
-        // uniqueness, not contiguity).
-        let n = self.device.tx_queue.len();
+        // uniqueness, not contiguity). The snapshot is additionally
+        // capped at [`TX_DRAIN_BUDGET`]: anything deeper rides the next
+        // pass — see the constant for why unbounded admission flooded
+        // every downstream UDP buffer.
+        let n = self.device.tx_queue.len().min(TX_DRAIN_BUDGET);
         let base = crypto.reserve_tx_counters(n);
         let mut jobs: Vec<TxCryptoJob> = Vec::with_capacity(n);
         for i in 0..n {
@@ -1059,10 +1076,11 @@ impl WgPump {
     /// and backs off; any other error logs and drops that one
     /// datagram while the rest of the batch continues — the same
     /// semantics as the per-packet loop. `ConnectionReset` is the one
-    /// terminal verdict (`Endpoint::Proxy`'s closed TX channel — the
-    /// front conn is dead): the outbox clears wholesale rather than
-    /// warn-per-packet while the pump's `endpoint.recv` arm is on its
-    /// way to the same verdict and the actor's exit.
+    /// terminal verdict (a closed TX bridge channel — `Endpoint::Proxy`'s
+    /// front conn or `Endpoint::Batch`'s socket task is dead): the
+    /// outbox clears wholesale rather than warn-per-packet while the
+    /// pump's `endpoint.recv` arm is on its way to the same verdict
+    /// and the actor's exit.
     fn flush_outbox(&mut self) {
         let mut staged: VecDeque<Vec<u8>> = VecDeque::with_capacity(WIRE_DRAIN_BUDGET);
         while !self.outbox.is_empty() {
@@ -1098,22 +1116,18 @@ impl WgPump {
                         self.outbox.push_front(pkt);
                         return;
                     }
-                    Err(e)
-                        if e.kind() == std::io::ErrorKind::ConnectionReset
-                            && matches!(self.endpoint, Endpoint::Proxy(_)) =>
-                    {
-                        // `Endpoint::Proxy` only — the TX bridge's
-                        // channel is closed, the front conn is dead,
-                        // and the pump's next `endpoint.recv` returns
-                        // the same verdict and stops the actor. A raw
-                        // socket can report ConnectionReset too (e.g.
-                        // Windows WSAECONNRESET after an ICMP
-                        // port-unreachable), so the variant guard — not
-                        // the error kind alone — makes this arm
-                        // proxy-exclusive. Drop the whole queue in one
-                        // return; WG tolerates the loss and the redial
-                        // re-sends what matters — warn-per-packet until
-                        // the recv arm gets there would only storm.
+                    Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
+                        // A closed TX bridge channel — both variants
+                        // only report `ConnectionReset` when their
+                        // bridge task is gone (`Endpoint::Proxy`'s
+                        // front conn, `Endpoint::Batch`'s socket task):
+                        // terminal, not the transient WSAECONNRESET a
+                        // raw socket could once report — and the pump's
+                        // next `endpoint.recv` returns the same verdict
+                        // and stops the actor. Drop the whole queue in
+                        // one return; WG tolerates the loss and the
+                        // redial re-sends what matters — warn-per-packet
+                        // until the recv arm gets there would only storm.
                         self.stats.outbox_dropped += self.outbox.len() as u64 + 1;
                         self.outbox.clear();
                         self.return_scratch(pkt);
@@ -2011,6 +2025,22 @@ impl WgPump {
         &self.stats
     }
 
+    /// The RX flood loop `run` opens every pass with, factored so
+    /// `service_pass` can re-run it mid-pass: drain the endpoint channel
+    /// until it goes quiet — a dropped wire datagram is an unrecoverable
+    /// inner-TCP hole (≥1 s RTO), while every TX backlog form waits
+    /// safely. `RX_PASS_CAP` only bounds the pass against livelock.
+    fn drain_wire_flood(&mut self) -> usize {
+        let mut spent = 0usize;
+        loop {
+            let got = self.drain_wire(|jobs| Self::offload_crypto(jobs, CryptoPool::run_shared));
+            spent += got;
+            if got < WIRE_DRAIN_BUDGET || spent >= RX_PASS_CAP {
+                return spent;
+            }
+        }
+    }
+
     /// The conn-facing half of a service pass as one method — socket
     /// service, the fairness yield, the interface poll, a second socket
     /// service, then the egress seal — so `run` and the same-pass pin
@@ -2043,6 +2073,14 @@ impl WgPump {
         // what poll is offered, the tally sees what a full rx buffer
         // dropped, and the snapshot reports the interval's state.
         self.scan_udp_offered();
+        // Mid-pass RX drain (D2): everything below is the pass's longest
+        // RX-silent stretch — under duplex it would leave the bridge
+        // channel unserviced for the full pass and let a peer burst
+        // overflow `SO_RCVBUF`. Draining here halves the window, and
+        // the just-admitted data still reaches `poll_stack` this pass —
+        // the FIFO channel and the crypto pool's in-order merge keep
+        // the work identical to a second pass, only sooner.
+        self.drain_wire_flood();
         self.poll_stack(SmolInstant::now());
         self.service_sockets();
         self.account_udp_drops();
@@ -2081,7 +2119,15 @@ impl WgPump {
             //    holding the pool's pass mutex — `offload_crypto` moves
             //    that wait off this shared worker, but only once the
             //    demux actually produced a parallel-sized batch.
-            self.drain_wire(|jobs| Self::offload_crypto(jobs, CryptoPool::run_shared));
+            //    Under flood the drain loops until the endpoint goes
+            //    quiet: a dropped wire datagram is an unrecoverable
+            //    inner-TCP loss (≥1 s RTO), while every form of TX
+            //    backlog — `tx_queue`, `outbox`, the sockets' own send
+            //    buffers — waits safely. RX starvation is the one
+            //    failure this loop cannot defer; `RX_PASS_CAP` is only
+            //    the livelock guard, the select's recv arm keeps the
+            //    loop turning regardless.
+            self.drain_wire_flood();
             // 2. mailbox drain.
             loop {
                 match self.rx.try_recv() {
@@ -2135,34 +2181,25 @@ impl WgPump {
                             .decapsulate_wire(pkt, n)
                             .unwrap_or_else(|| vec![0u8; self.scratch_len]);
                     }
-                    Err(e) => match &self.endpoint {
-                        // Raw socket: EAGAIN/EINTR/ENOBUFS-class errnos are
-                        // transient — warn, back off a tick so a dead
-                        // socket cannot spin the loop, retry next pass.
-                        Endpoint::Batch(_) => {
-                            warn!("wireguard {}: endpoint recv error: {e}", self.name);
-                            // A dead socket must not spin the loop.
-                            tokio::time::sleep(IDLE_SLEEP).await;
-                        }
-                        // A `ProxyEndpoint` reports an error only when its
-                        // RX channel is disconnected — the bridge RX task
-                        // exits solely on conn death (or endpoint drop,
-                        // which cannot happen while the pump owns it), so
-                        // `ConnectionReset` here is terminal, not
-                        // transient: spinning cannot revive the front
-                        // conn and would only warn-storm at ~100 Hz while
-                        // outbound datagrams blackhole. Stop the pump;
-                        // `ensure_pump` sees the dead task via
-                        // `is_proxy_dead`, clears the slot and redials
-                        // the front hop.
-                        Endpoint::Proxy(_) => {
-                            warn!(
-                                "wireguard {}: proxy endpoint dead ({e}), stopping pump",
-                                self.name
-                            );
-                            break 'outer;
-                        }
-                    },
+                    Err(e) => {
+                        // Both endpoint flavours reach `recv` through an
+                        // RX bridge channel now — `Proxy` explicitly,
+                        // `Batch` via `BridgedEndpoint` — so an error
+                        // here is always a closed channel: the RX task
+                        // exits only on conn/socket death (or endpoint
+                        // drop, which cannot happen while the pump owns
+                        // it). `ConnectionReset` is therefore terminal,
+                        // not transient: spinning cannot revive the
+                        // wire and would only warn-storm at ~100 Hz
+                        // while outbound datagrams blackhole. Stop the
+                        // pump; `ensure_pump` sees the dead task via
+                        // `is_proxy_dead`, clears the slot and redials.
+                        warn!(
+                            "wireguard {}: endpoint dead ({e}), stopping pump",
+                            self.name
+                        );
+                        break 'outer;
+                    }
                 },
                 _ = self.wake.notified() => {},
                 _ = tokio::time::sleep(delay) => {},
@@ -2285,7 +2322,7 @@ mod tests {
     use std::pin::Pin;
     use std::task::{Context, Poll};
 
-    use meow_wgstack::{BatchEndpoint, TcpIo, WgStream};
+    use meow_wgstack::{BridgedEndpoint, TcpIo, WgStream};
     use tokio::io::AsyncWrite;
     use tracing_subscriber::layer::SubscriberExt;
 
@@ -2470,11 +2507,14 @@ mod tests {
 
     /// Wrap a test socket as the direct-path `Endpoint` — the same
     /// `set_nonblocking` + `from_std` + `connected` dance
-    /// `WireGuardAdapter::bind_endpoint` performs.
-    fn test_endpoint(std_sock: std::net::UdpSocket) -> Endpoint {
+    /// `WireGuardAdapter::bind_endpoint` performs. `peer` stamps the
+    /// bridge's channel items — pass the address the socket connects
+    /// to.
+    fn test_endpoint(std_sock: std::net::UdpSocket, peer: SocketAddr) -> Endpoint {
         std_sock.set_nonblocking(true).expect("nonblocking");
-        Endpoint::Batch(BatchEndpoint::connected(
+        Endpoint::Batch(BridgedEndpoint::connected(
             tokio::net::UdpSocket::from_std(std_sock).expect("tokio socket"),
+            peer,
         ))
     }
 
@@ -2485,7 +2525,7 @@ mod tests {
         let std_sock = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind test socket");
         let (_tx, rx) = mpsc::channel(4);
         let endpoint: SocketAddr = "127.0.0.1:9".parse().unwrap();
-        WgPump::new(cfg, test_endpoint(std_sock), endpoint, rx)
+        WgPump::new(cfg, test_endpoint(std_sock, endpoint), endpoint, rx)
     }
 
     /// `pump_for_test` over a caller-prepared endpoint socket — the
@@ -2497,7 +2537,7 @@ mod tests {
         endpoint: SocketAddr,
     ) -> WgPump {
         let (_tx, rx) = mpsc::channel(4);
-        WgPump::new(cfg, test_endpoint(std_sock), endpoint, rx)
+        WgPump::new(cfg, test_endpoint(std_sock, endpoint), endpoint, rx)
     }
 
     /// An outbox-ready Vec: capacity at least `scratch_len` (so
@@ -4348,24 +4388,17 @@ mod tests {
     /// `[boundary, successors…]` *ahead* of whatever the outbox already
     /// held, losing nothing.
     ///
-    /// Deterministic boundary without timing tricks: the staged batch
-    /// carries one oversized datagram at `BOUNDARY`, so the kernel
-    /// stops the batch exactly there — `sendmmsg`/`sendmsg_x` report
-    /// the short count on the batch-syscall platforms, the fallback
-    /// `try_send` loop stops at its first error elsewhere. The
-    /// `WouldBlock` verdict then comes from
-    /// tokio's *cold* readiness gate: this `current_thread` test
-    /// awaits nothing before the first flush, so the driver never
-    /// polled the fresh socket and the replay `try_send` short-
-    /// circuits `WouldBlock` without reaching the kernel — on every
-    /// platform. (A small `SO_SNDBUF` cannot produce the short batch
-    /// instead: transmitted UDP skbs orphan their wmem charge at xmit,
-    /// so a loopback send queue never fills.)
+    /// Under the `BridgedEndpoint` the deterministic boundary is the
+    /// *TX channel's* capacity (`4 * WIRE_DRAIN_BUDGET`), not a kernel
+    /// errno: this `current_thread` test never awaits inside the flush,
+    /// so the TX bridge cannot run and the channel fills at exactly
+    /// queue depth — the `WouldBlock` verdict lands on the same index
+    /// on every platform.
     ///
-    /// The second flush runs with the gate armed: the oversized
-    /// boundary now reaches the kernel, takes the `EMSGSIZE` drop arm
-    /// (pinned separately below), and every other datagram lands on
-    /// the wire in queue order.
+    /// The second flush runs after `arm_writable` yielded the task —
+    /// the bridge drained the channel into the kernel — so the
+    /// requeued tail and the old datagrams land on the wire in queue
+    /// order behind the first queue-full.
     #[tokio::test(flavor = "current_thread")]
     async fn flush_outbox_wouldblock_requeue_preserves_order() {
         let client_secret = x25519::StaticSecret::from([0x99; 32]);
@@ -4382,26 +4415,16 @@ mod tests {
         sender.connect(peer).expect("connect sender");
         let mut pump = pump_with_socket(&test_config(&client_secret, &server_public), sender, peer);
 
-        // A full staged batch (tags 0..BUDGET, oversized at BOUNDARY)
-        // ahead of two older queued datagrams (tags 0xF0/0xF1) the
-        // outbox already held.
-        const STAGED: usize = WIRE_DRAIN_BUDGET;
-        const BOUNDARY: usize = 3;
-        const BOUNDARY_TAG: u8 = 0xEE;
+        // QUEUE datagrams past the bridge channel's depth (tags
+        // 0..QUEUE+64, two tag bytes because indices pass 255) ahead of
+        // two older queued datagrams (tags 0xF0/0xF1).
+        const QUEUE: usize = 4 * WIRE_DRAIN_BUDGET;
+        const STAGED: usize = QUEUE + 64;
         const OLD: [u8; 2] = [0xF0, 0xF1];
-        let tag_of = |i: usize| {
-            if i == BOUNDARY {
-                BOUNDARY_TAG
-            } else {
-                i as u8
-            }
-        };
+        let tag_of = |i: usize| vec![(i >> 8) as u8, i as u8];
         for i in 0..STAGED {
-            let v = if i == BOUNDARY {
-                vec![BOUNDARY_TAG; 70_000] // > 65 507 max UDP payload; first byte is the tag
-            } else {
-                tagged_outbox_vec(tag_of(i), pump.scratch_len)
-            };
+            let mut v = Vec::with_capacity(pump.scratch_len);
+            v.extend_from_slice(&tag_of(i));
             pump.outbox.push_back(v);
         }
         for tag in OLD {
@@ -4411,44 +4434,35 @@ mod tests {
 
         pump.flush_outbox();
 
-        // Path proof: with the batched syscalls (`sendmmsg`/`sendmsg_x`)
-        // the batch genuinely stopped at the oversized index inside
-        // the kernel; on the fallback the cold gate stopped the
-        // `try_send` loop at index 0.
+        // The batch stopped exactly at channel depth — `send_batch`
+        // accepts what the channel holds and the boundary datagram's
+        // `try_send` reports `WouldBlock`.
         let sent = STAGED + OLD.len() - pump.outbox.len();
-        if BatchEndpoint::BATCHED_SYSCALLS {
-            assert_eq!(
-                sent, BOUNDARY,
-                "the batched send stops at the EMSGSIZE index"
-            );
-        } else {
-            assert_eq!(sent, 0, "cold readiness stops the fallback loop at index 0");
-        }
+        assert_eq!(sent, QUEUE, "the flush fills the TX channel exactly");
 
         // The pre-F1 bug pushed the boundary first, then its
         // successors ahead of it — [s1..s63, b, old]. The contract is
-        // [b, s1..s63, old]: a strictly consecutive tag run at the
+        // [b, s…, old]: a strictly consecutive tag run at the
         // front (staged[sent] onward), then the old tail.
-        let expected: Vec<u8> = (sent..STAGED).map(tag_of).chain(OLD).collect();
-        let got: Vec<u8> = pump.outbox.iter().map(|v| v[0]).collect();
+        let expected: Vec<u8> = (sent..STAGED).flat_map(tag_of).chain(OLD).collect();
+        let got: Vec<u8> = pump
+            .outbox
+            .iter()
+            .flat_map(|v| v.iter().take(2).copied().collect::<Vec<u8>>())
+            .collect();
         assert_eq!(
             got, expected,
             "requeue must keep the boundary datagram ahead of its successors, ahead of the old tail"
         );
 
         // The successors stay behind the boundary on the wire too:
-        // arm the gate, flush once more, and the receiver must see
-        // every datagram in queue order — the earlier partial send
-        // first, the oversized boundary dropped by the error arm.
-        //
-        // The flush emits the whole backlog in one synchronous burst
-        // inside this `current_thread` task, so a tokio drain can't run
-        // until it returns — and a loopback rx queue can't hold ~260
-        // datagrams' skbuff accounting on every CI box (rmem_max). A
-        // dedicated std thread drains while this task is blocked inside
-        // the flush: wire ORDER is the subject under test, not kernel
-        // buffer depth.
-        const EXPECTED: usize = STAGED + OLD.len() - 1;
+        // yield so the bridge drains the channel into the kernel, flush
+        // once more, and the receiver must see every datagram in queue
+        // order. A dedicated std thread drains the receiver because a
+        // loopback rx queue can't hold the whole run's skbuff
+        // accounting on every CI box (rmem_max) — wire ORDER is the
+        // subject under test, not kernel buffer depth.
+        const EXPECTED: usize = STAGED + OLD.len();
         let drain = std::thread::spawn(move || {
             let mut got: Vec<Vec<u8>> = Vec::with_capacity(EXPECTED);
             let mut buf = vec![0u8; 65536];
@@ -4466,12 +4480,14 @@ mod tests {
         });
         arm_writable(&mut pump.endpoint).await;
         pump.flush_outbox();
-        assert!(pump.outbox.is_empty(), "armed socket drains the requeue");
+        assert!(pump.outbox.is_empty(), "drained channel takes the requeue");
+        // A second yield lets the TX bridge emit the requeued tail
+        // before the drain thread's deadline is examined.
+        arm_writable(&mut pump.endpoint).await;
 
         let got = drain.join().expect("drain thread");
         let expected: Vec<Vec<u8>> = (0..STAGED)
-            .filter(|&i| i != BOUNDARY)
-            .map(|i| vec![tag_of(i)])
+            .map(tag_of)
             .chain(OLD.iter().map(|&t| vec![t]))
             .collect();
         assert_eq!(
@@ -4480,12 +4496,13 @@ mod tests {
         );
     }
 
-    /// The other boundary arm: a datagram whose replay reports a real
-    /// errno (not `WouldBlock`) is dropped — exactly that one — while
-    /// the rest of the staged batch continues, and every spent buffer
-    /// (sent or dropped) returns to the scratch pool. The trigger is
-    /// an oversized datagram: `send*` answers `EMSGSIZE` determinist-
-    /// ically on every platform.
+    /// A datagram the kernel refuses (oversized → `EMSGSIZE` on every
+    /// platform) is dropped — exactly that one — while its successors
+    /// continue in order. Under the `BridgedEndpoint` the verdict now
+    /// lands inside the TX bridge's boundary retry: the channel accepts
+    /// every datagram (so the whole outbox drains and every buffer
+    /// pools), and the wire observes the same outcome — only the
+    /// failing datagram missing.
     #[tokio::test(flavor = "current_thread")]
     async fn flush_outbox_boundary_error_drops_only_that_datagram() {
         let client_secret = x25519::StaticSecret::from([0xBB; 32]);
