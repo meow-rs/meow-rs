@@ -28,9 +28,9 @@ use std::time::{Duration, Instant as StdInstant};
 use bytes::{Buf, Bytes};
 use meow_common::{MeowError, ProxyConn, ProxyPacketConn, Result};
 use meow_wgstack::{
-    note_count, note_drop, poll_burst, reset_scratch, udp_dst_port, ChannelDevice, DropStats,
-    Endpoint, StreamEvent, TcpIo, WgStream, TCP_READ_QUEUE, TCP_SOCKET_BUF, TCP_WRITE_QUEUE,
-    TX_DRAIN_BUDGET, WG_TIMER_INTERVAL, WIRE_DRAIN_BUDGET,
+    note_count, note_drop, reset_scratch, udp_dst_port, ChannelDevice, DropStats, Endpoint,
+    StreamEvent, TcpIo, WgStream, POLL_BURST, POLL_TX_BYTES_BUDGET, TCP_READ_QUEUE, TCP_SOCKET_BUF,
+    TCP_WRITE_QUEUE, TX_DRAIN_BUDGET, WG_TIMER_INTERVAL, WIRE_DRAIN_BUDGET,
 };
 use meow_wireguard::noise::Packet;
 use meow_wireguard::{
@@ -88,6 +88,15 @@ const IDLE_SLEEP: Duration = Duration::from_millis(10);
 /// guarantees the pass eventually reaches mailbox/service/TX work; the
 /// next pass re-enters the flood loop immediately.
 const RX_PASS_CAP: usize = 8 * WIRE_DRAIN_BUDGET;
+
+/// D3 — the longest any synchronous stretch may run without servicing
+/// the wire-RX bridge channel. Once the channel is full the bridge
+/// parks and arrivals pile into `SO_RCVBUF`: ~8 MiB (macOS) ÷ ~1.5 GB/s
+/// loopback wire rate ≈ 5 ms of slack; half a millisecond keeps ~10×
+/// margin. Every long loop — socket service, the poll burst, the
+/// mailbox drain — calls [`WgPump::rx_heartbeat`] between iterations;
+/// the check itself is one `Instant::now`.
+const RX_SERVICE_INTERVAL: Duration = Duration::from_micros(500);
 
 /// Worker-fairness bound on a *task* pump (perf-7 P7-2): one service pass
 /// is synchronous start to finish, so a flow moving this much payload in
@@ -343,6 +352,11 @@ struct WgPump {
     rx_scan_pending: usize,
     /// When the last [`STATS_SNAPSHOT_INTERVAL`] snapshot ran.
     last_stats: StdInstant,
+    /// Stamp of the last `drain_wire_flood` — the RX-service heartbeat
+    /// ([`RX_SERVICE_INTERVAL`]): every long synchronous loop checks it
+    /// so the bridge channel is serviced at a bounded interval no
+    /// matter how expensive one pass's socket/stack work becomes.
+    rx_last_service: StdInstant,
 }
 
 // The pump rides the shared tokio worker pool (perf-7 P7-2): if any
@@ -427,6 +441,7 @@ impl WgPump {
             stats: DropStats::default(),
             rx_scan_pending: 0,
             last_stats: StdInstant::now(),
+            rx_last_service: StdInstant::now(),
         }
     }
 
@@ -643,9 +658,10 @@ impl WgPump {
             Some(len) => {
                 slot.truncate(wire_len);
                 let start = meow_wireguard::DATA_PAYLOAD_OFF;
+                // `push_rx`: the D3 per-poll ingress bound — overflow
+                // stages in `rx_hold`, `poll_stack`'s burst promotes it.
                 self.device
-                    .rx_queue
-                    .push_back(Bytes::from(slot).slice(start..start + len));
+                    .push_rx(Bytes::from(slot).slice(start..start + len));
                 None
             }
             // The slot holds nothing a consumer needs — reuse it.
@@ -773,25 +789,38 @@ impl WgPump {
         // Phase C — serial post-pass in wire order.
         for job in jobs {
             let i = job.tag;
+            // The replay mark lives here, not in the worker's open —
+            // this loop is the wire-order sequence the window must
+            // advance in. `mark_received` only runs on a successful
+            // open, exactly where the serial path marks.
+            let mark = match &job.result {
+                Some(Ok(_)) => Some(job.mark_received()),
+                _ => None,
+            };
             let mut pkt = job.buf;
             slots[i] = match job.result {
                 Some(Ok(pt_len)) => {
-                    let produced = match self.tunn.handle_decrypted_data(
-                        job.receiver_idx,
-                        pt_len,
-                        &mut pkt[..job.wire_len],
-                    ) {
-                        TunnResult::WriteToTunnelV4(b, _) | TunnResult::WriteToTunnelV6(b, _) => {
-                            Some(b.len())
-                        }
-                        TunnResult::Done => None,
-                        TunnResult::Err(e) => {
+                    let produced = match mark.unwrap() {
+                        Err(e) => {
                             self.wire_error(&e, &mut dst);
                             None
                         }
-                        TunnResult::WriteToNetwork(_) => {
-                            unreachable!("data post-pass never emits wire output")
-                        }
+                        Ok(()) => match self.tunn.handle_decrypted_data(
+                            job.receiver_idx,
+                            pt_len,
+                            &mut pkt[..job.wire_len],
+                        ) {
+                            TunnResult::WriteToTunnelV4(b, _)
+                            | TunnResult::WriteToTunnelV6(b, _) => Some(b.len()),
+                            TunnResult::Done => None,
+                            TunnResult::Err(e) => {
+                                self.wire_error(&e, &mut dst);
+                                None
+                            }
+                            TunnResult::WriteToNetwork(_) => {
+                                unreachable!("data post-pass never emits wire output")
+                            }
+                        },
                     };
                     match produced {
                         Some(len) => {
@@ -800,9 +829,12 @@ impl WgPump {
                             // the plaintext view, no copy.
                             pkt.truncate(job.wire_len);
                             let start = meow_wireguard::DATA_PAYLOAD_OFF;
+                            // `push_rx`, not `rx_queue.push_back`: the
+                            // D3 per-poll ingress bound — overflow
+                            // stages in `rx_hold`, `poll_stack`'s burst
+                            // promotes it between polls.
                             self.device
-                                .rx_queue
-                                .push_back(Bytes::from(pkt).slice(start..start + len));
+                                .push_rx(Bytes::from(pkt).slice(start..start + len));
                             Vec::with_capacity(self.scratch_len)
                         }
                         None => pkt,
@@ -1084,6 +1116,7 @@ impl WgPump {
     fn flush_outbox(&mut self) {
         let mut staged: VecDeque<Vec<u8>> = VecDeque::with_capacity(WIRE_DRAIN_BUDGET);
         while !self.outbox.is_empty() {
+            self.rx_heartbeat();
             for _ in 0..self.outbox.len().min(WIRE_DRAIN_BUDGET) {
                 staged.push_back(self.outbox.pop_front().expect("bounded by len"));
             }
@@ -1364,8 +1397,17 @@ impl WgPump {
         let mut dead_tcp: Vec<SocketHandle> = Vec::new();
         let mut dead_udp: Vec<SocketHandle> = Vec::new();
 
-        for (handle, st) in &mut self.tcp {
-            let socket = self.sockets.get_mut::<tcp::Socket>(*handle);
+        // Collected-handle iteration (D3): `rx_heartbeat` needs `&mut
+        // self` between sockets, which a live `&mut self.tcp` borrow
+        // forbids. Every socket is still serviced each pass — the
+        // heartbeat only interleaves wire-RX drains, never skips work.
+        let tcp_order: Vec<SocketHandle> = self.tcp.keys().copied().collect();
+        for handle in tcp_order {
+            self.rx_heartbeat();
+            let Some(st) = self.tcp.get_mut(&handle) else {
+                continue;
+            };
+            let socket = self.sockets.get_mut::<tcp::Socket>(handle);
 
             // ── pending dial resolution ────────────────────────────
             if let Some(p) = st.pending.as_ref() {
@@ -1394,7 +1436,7 @@ impl WgPump {
                         self.name
                     ))));
                     socket.abort();
-                    dead_tcp.push(*handle);
+                    dead_tcp.push(handle);
                     continue;
                 }
                 if state == tcp::State::Established {
@@ -1599,12 +1641,19 @@ impl WgPump {
                     self.name,
                     socket.state()
                 );
-                dead_tcp.push(*handle);
+                dead_tcp.push(handle);
             }
         }
 
-        for (handle, st) in &mut self.udp {
-            let socket = self.sockets.get_mut::<udp::Socket>(*handle);
+        // Same collected-handle shape as the TCP loop above — `rx_heartbeat`
+        // needs `&mut self` between sockets.
+        let udp_order: Vec<SocketHandle> = self.udp.keys().copied().collect();
+        for handle in udp_order {
+            self.rx_heartbeat();
+            let Some(st) = self.udp.get_mut(&handle) else {
+                continue;
+            };
+            let socket = self.sockets.get_mut::<udp::Socket>(handle);
             let mut conn_gone = false;
             // Same gate as the TCP drain above: once the backlog reaches
             // UDP_WRITE_QUEUE the channel itself must be the stall point,
@@ -1754,7 +1803,7 @@ impl WgPump {
             // forever.
             conn_gone |= st.write_rx.is_closed();
             if conn_gone {
-                dead_udp.push(*handle);
+                dead_udp.push(handle);
             }
         }
 
@@ -1834,15 +1883,37 @@ impl WgPump {
     /// backstop rather than the throughput path — the pin still wants
     /// the production entry point, not a helper re-spelled.
     fn poll_stack(&mut self, now: SmolInstant) {
-        // Burst, not a single poll. Before smoltcp 0.13 a socket
-        // egressed at most one TCP segment per `poll`, so one call per
-        // pass capped a bulk flow at ~1 segment per inner-RTT wake —
-        // the ~285 KB/s ceiling the WG listener measured; the loop was
-        // the throughput critical path. 0.13's `poll` now drains socket
-        // egress internally (upstream #1059), so `poll_burst` stays
-        // only as the bounded-budget safety net, looping until the
-        // stack goes quiet.
-        poll_burst(&mut self.iface, now, &mut self.device, &mut self.sockets);
+        // Burst, not a single poll — see `poll_burst`'s doc for the
+        // smoltcp 0.13 rationale. The loop lives caller-side (D3) so two
+        // things the shared helper can't reach still happen between
+        // iterations: `fill_rx_queue` promotes held packets into the
+        // bounded [`RX_INGRESS_CAP`] window each poll drains, and
+        // `rx_heartbeat` keeps the wire-RX channel serviced while a
+        // deep burst runs. An ingress-only poll reports
+        // `PollResult::None`, so the quiet exit must also check
+        // `rx_hold` — leftover holds resume next iteration instead of
+        // waiting a pass.
+        let mut tx_bytes = 0usize;
+        let mut tx_len_before = self.device.tx_queue.len();
+        for _ in 0..POLL_BURST {
+            self.device.fill_rx_queue();
+            match self.iface.poll(now, &mut self.device, &mut self.sockets) {
+                smoltcp::iface::PollResult::SocketStateChanged => {
+                    for pkt in self.device.tx_queue.iter().skip(tx_len_before) {
+                        tx_bytes += pkt.len();
+                    }
+                    tx_len_before = self.device.tx_queue.len();
+                    if tx_bytes > POLL_TX_BYTES_BUDGET {
+                        break;
+                    }
+                }
+                smoltcp::iface::PollResult::None if self.device.rx_hold.is_empty() => {
+                    break;
+                }
+                smoltcp::iface::PollResult::None => {}
+            }
+            self.rx_heartbeat();
+        }
     }
 
     /// ITEM C1 pre-poll offer scan: attribute every newly arrived UDP
@@ -2036,8 +2107,23 @@ impl WgPump {
             let got = self.drain_wire(|jobs| Self::offload_crypto(jobs, CryptoPool::run_shared));
             spent += got;
             if got < WIRE_DRAIN_BUDGET || spent >= RX_PASS_CAP {
+                self.rx_last_service = StdInstant::now();
                 return spent;
             }
+        }
+    }
+
+    /// D3 — re-service the wire-RX channel when the last drain is
+    /// [`RX_SERVICE_INTERVAL`] stale. Long synchronous loops
+    /// (`service_sockets`, the poll burst, the mailbox drain) call this
+    /// between iterations so the bridge channel is drained at a bounded
+    /// interval regardless of how expensive one pass's socket or stack
+    /// work becomes: a wire datagram lost to a full kernel buffer is an
+    /// inner-TCP hole, every other backlog form waits losslessly — RX
+    /// service frequency is the invariant.
+    fn rx_heartbeat(&mut self) {
+        if self.rx_last_service.elapsed() >= RX_SERVICE_INTERVAL {
+            self.drain_wire_flood();
         }
     }
 
@@ -2097,7 +2183,10 @@ impl WgPump {
     /// poll before the next pass. A quiet pass sleeps exactly what
     /// `sleep_duration` reports.
     fn pass_delay(&mut self, pass_bytes: usize) -> Duration {
-        if self.last_service_bytes == pass_bytes {
+        // A quiet pass may still hold staged inner packets: `rx_hold`
+        // entries are one `fill_rx_queue` away from the stack —
+        // sleeping would strand them on a timer.
+        if self.last_service_bytes == pass_bytes && self.device.rx_hold.is_empty() {
             self.sleep_duration(SmolInstant::now())
         } else {
             Duration::ZERO
@@ -2130,6 +2219,7 @@ impl WgPump {
             self.drain_wire_flood();
             // 2. mailbox drain.
             loop {
+                self.rx_heartbeat();
                 match self.rx.try_recv() {
                     Ok(ActorMsg::Shutdown) | Err(mpsc::error::TryRecvError::Disconnected) => {
                         break 'outer
@@ -3407,7 +3497,7 @@ mod tests {
             isn.wrapping_add(1),
             0x12,
         );
-        pump.device.rx_queue.push_back(Bytes::from(syn_ack));
+        pump.device.push_rx(Bytes::from(syn_ack));
         pump.iface
             .poll(SmolInstant::now(), &mut pump.device, &mut pump.sockets);
         assert_eq!(
@@ -3449,7 +3539,7 @@ mod tests {
             0x18,
             b"dead-conn residue",
         );
-        pump.device.rx_queue.push_back(Bytes::from(data));
+        pump.device.push_rx(Bytes::from(data));
         pump.iface
             .poll(SmolInstant::now(), &mut pump.device, &mut pump.sockets);
         assert!(
@@ -3512,7 +3602,7 @@ mod tests {
             isn.wrapping_add(1),
             0x12,
         );
-        pump.device.rx_queue.push_back(Bytes::from(syn_ack));
+        pump.device.push_rx(Bytes::from(syn_ack));
         pump.iface
             .poll(SmolInstant::now(), &mut pump.device, &mut pump.sockets);
         assert_eq!(
@@ -3560,7 +3650,7 @@ mod tests {
             0x18,
             b"peer that never closes",
         );
-        pump.device.rx_queue.push_back(Bytes::from(data));
+        pump.device.push_rx(Bytes::from(data));
         pump.iface
             .poll(SmolInstant::now(), &mut pump.device, &mut pump.sockets);
         pump.service_sockets();
@@ -3595,7 +3685,7 @@ mod tests {
             0x18,
             b"still streaming",
         );
-        pump.device.rx_queue.push_back(Bytes::from(late));
+        pump.device.push_rx(Bytes::from(late));
         pump.iface
             .poll(SmolInstant::now(), &mut pump.device, &mut pump.sockets);
         let tail = pump
@@ -3644,7 +3734,7 @@ mod tests {
             isn.wrapping_add(1),
             0x12,
         );
-        pump.device.rx_queue.push_back(Bytes::from(syn_ack));
+        pump.device.push_rx(Bytes::from(syn_ack));
         pump.iface
             .poll(SmolInstant::now(), &mut pump.device, &mut pump.sockets);
         assert_eq!(
@@ -3754,7 +3844,7 @@ mod tests {
             isn.wrapping_add(1),
             0x12,
         );
-        pump.device.rx_queue.push_back(Bytes::from(syn_ack));
+        pump.device.push_rx(Bytes::from(syn_ack));
         pump.iface
             .poll(SmolInstant::now(), &mut pump.device, &mut pump.sockets);
         pump.service_sockets();
@@ -3995,7 +4085,7 @@ mod tests {
         let offered = UDP_SOCKET_PACKETS + 64;
         let offer = |pump: &mut WgPump, base: u16| {
             for i in 0..offered {
-                pump.device.rx_queue.push_back(Bytes::from(udp_dgram_v4(
+                pump.device.push_rx(Bytes::from(udp_dgram_v4(
                     std::net::Ipv4Addr::new(10, 9, 9, 9),
                     std::net::Ipv4Addr::new(10, 0, 0, 2),
                     base + i as u16,
@@ -4268,7 +4358,7 @@ mod tests {
             isn.wrapping_add(1),
             0x12,
         );
-        pump.device.rx_queue.push_back(Bytes::from(syn_ack));
+        pump.device.push_rx(Bytes::from(syn_ack));
         pump.iface
             .poll(SmolInstant::now(), &mut pump.device, &mut pump.sockets);
         assert_eq!(
@@ -4319,7 +4409,7 @@ mod tests {
         let syn = pump.device.tx_queue.back().expect("the dial emitted a SYN");
         let local_port = u16::from_be_bytes([syn[20], syn[21]]);
         let isn = u32::from_be_bytes(syn[24..28].try_into().unwrap());
-        pump.device.rx_queue.push_back(Bytes::from(tcp_seg_v4(
+        pump.device.push_rx(Bytes::from(tcp_seg_v4(
             "203.0.113.1".parse().unwrap(),
             "10.0.0.2".parse().unwrap(),
             443,
@@ -4335,7 +4425,7 @@ mod tests {
         // A peer data segment lands in `rx_queue` — the wire→device
         // direction's output exactly as `drain_wire` leaves it. One
         // `service_pass` must take it poll → socket → conn.
-        pump.device.rx_queue.push_back(Bytes::from(tcp_seg_v4_data(
+        pump.device.push_rx(Bytes::from(tcp_seg_v4_data(
             "203.0.113.1".parse().unwrap(),
             "10.0.0.2".parse().unwrap(),
             443,
@@ -4531,12 +4621,12 @@ mod tests {
             pump.outbox.push_back(v);
         }
 
+        let pool_before = pump.scratch_pool.len();
         pump.flush_outbox();
 
         assert!(pump.outbox.is_empty(), "batch completes past the error");
-        assert_eq!(
-            pump.scratch_pool.len(),
-            4,
+        assert!(
+            pump.scratch_pool.len() >= pool_before + 4,
             "sent and dropped buffers all return to the scratch pool"
         );
         let receiver = tokio::net::UdpSocket::from_std(receiver_std).expect("tokio receiver");

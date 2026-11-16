@@ -147,6 +147,32 @@ const _: () = assert!(POLL_TX_BYTES_BUDGET >= TCP_SOCKET_BUF);
 /// choice for idle CPU.
 pub const WG_TIMER_INTERVAL: Duration = Duration::from_millis(250);
 
+/// Per-poll ingress bound on `ChannelDevice::rx_queue` (D3): admitted
+/// packets past it stage in `rx_hold` and [`ChannelDevice::fill_rx_queue`]
+/// promotes them between `Interface::poll` iterations. One poll's
+/// socket-service cost is proportional to the ingress it drains —
+/// smoltcp 0.13's `poll` consumes the device queue *completely* — so the
+/// cap is what bounds the pass's largest atomic unit (~1 ms) to keep the
+/// wire-RX heartbeat inside the interval kernel buffering tolerates.
+pub const RX_INGRESS_CAP: usize = 2 * WIRE_DRAIN_BUDGET;
+
+/// Depth cap on `ChannelDevice::tx_queue` (D3): `transmit` reports the
+/// device exhausted past it — smoltcp's `EgressError::Exhausted`, a clean
+/// break out of `socket_egress` — bounding one poll's egress burst the
+/// way [`RX_INGRESS_CAP`] bounds its ingress. Without it a fresh
+/// full-window burst (N flows × [`TCP_SOCKET_BUF`]) can stage ~64 MiB of
+/// segments into one `Interface::poll` call, an atomic stall far past
+/// the ~5 ms kernel-buffer slack. Deferred segments stay in the socket's
+/// tx window losslessly and re-dispatch next poll.
+///
+/// The earlier rejection of a transmit cap (see [`POLL_TX_BYTES_BUDGET`])
+/// argued insertion-order starvation: sockets before the break eat the
+/// whole budget every pass. That was a *per-pass allowance* — here the
+/// cap is queue *depth*, and the unfairness self-limits: a hogging
+/// socket's send window closes after ~[`TCP_SOCKET_BUF`] emitted, it goes
+/// quiet, and the tail sockets dispatch within milliseconds.
+pub const TX_QUEUE_CAP: usize = 2 * TX_DRAIN_BUDGET;
+
 /// Upper bound on `ChannelDevice::tx_pool` residency; buffers returned
 /// past the cap free instead of pooling.
 const TX_POOL_CAP: usize = 128;
@@ -161,12 +187,44 @@ const TX_POOL_CAP: usize = 128;
 /// reuses the allocation rather than paying a `vec![]` per packet.
 pub struct ChannelDevice {
     pub rx_queue: VecDeque<Bytes>,
+    /// Inner packets admitted past [`RX_INGRESS_CAP`]: the per-poll
+    /// staging area `fill_rx_queue` drains into `rx_queue` between
+    /// `Interface::poll` iterations. FIFO-global with `rx_queue` —
+    /// `push_rx` is the only writer, so ordering is one logical queue.
+    pub rx_hold: VecDeque<Bytes>,
     pub tx_queue: VecDeque<Vec<u8>>,
     pub tx_pool: VecDeque<Vec<u8>>,
     caps: DeviceCapabilities,
 }
 
 impl ChannelDevice {
+    /// Admit one inner packet to the ingress path (D3): straight into
+    /// `rx_queue` while it stays under [`RX_INGRESS_CAP`], else `rx_hold`
+    /// — so a flood's `rx_queue` depth at poll entry, and with it one
+    /// `Interface::poll`'s atomic socket-service cost, is always bounded.
+    /// Once `rx_hold` is nonempty every admit goes there: FIFO order is
+    /// `rx_queue` then `rx_hold`, never interleaved.
+    pub fn push_rx(&mut self, pkt: Bytes) {
+        if self.rx_hold.is_empty() && self.rx_queue.len() < RX_INGRESS_CAP {
+            self.rx_queue.push_back(pkt);
+        } else {
+            self.rx_hold.push_back(pkt);
+        }
+    }
+
+    /// Promote held packets into `rx_queue` up to [`RX_INGRESS_CAP`].
+    /// `Interface::poll` drains the queue completely each call, so the
+    /// caller invokes this *between* polls of one burst — each poll's
+    /// ingress stays bounded while the burst's total stays unlimited.
+    pub fn fill_rx_queue(&mut self) {
+        while self.rx_queue.len() < RX_INGRESS_CAP {
+            match self.rx_hold.pop_front() {
+                Some(p) => self.rx_queue.push_back(p),
+                None => break,
+            }
+        }
+    }
+
     /// Return a drained `tx_queue` buffer to `tx_pool`. The pool is a
     /// peak-water recycler, so cap it — a one-off burst must not pin
     /// MTU-sized allocations for the process lifetime.
@@ -197,6 +255,7 @@ impl ChannelDevice {
         caps.checksum.icmpv6 = Checksum::Tx;
         Self {
             rx_queue: VecDeque::new(),
+            rx_hold: VecDeque::new(),
             tx_queue: VecDeque::new(),
             tx_pool: VecDeque::new(),
             caps,
@@ -258,6 +317,15 @@ impl Device for ChannelDevice {
     }
 
     fn transmit(&mut self, _timestamp: SmolInstant) -> Option<Self::TxToken<'_>> {
+        // [`TX_QUEUE_CAP`]: report the device exhausted rather than stage
+        // an unbounded egress burst — smoltcp maps `None` to
+        // `EgressError::Exhausted` and cleanly defers the socket's
+        // remaining dispatch to the next poll. The paired-token path in
+        // `receive` bypasses the cap: ACK replies to admitted ingress
+        // must not be throttled.
+        if self.tx_queue.len() >= TX_QUEUE_CAP {
+            return None;
+        }
         Some(SmolTxToken {
             queue: &mut self.tx_queue,
             pool: &mut self.tx_pool,
@@ -1261,6 +1329,101 @@ mod tests {
     #[test]
     fn poll_burst_cap_is_256() {
         assert_eq!(POLL_BURST, 256);
+    }
+
+    // ── D3: bounded atomic units (RX_INGRESS_CAP / TX_QUEUE_CAP) ───
+
+    /// `push_rx` is the only ingress writer and owns one logical FIFO:
+    /// the first `RX_INGRESS_CAP` packets land in `rx_queue`, the rest
+    /// stage in `rx_hold`, and `fill_rx_queue` promotes them in order —
+    /// the per-poll bound the burst loop relies on.
+    #[test]
+    fn push_rx_caps_poll_ingress_in_fifo_order() {
+        let mut device = ChannelDevice::new(1400);
+        let total = RX_INGRESS_CAP + 10;
+        for i in 0..total {
+            device.push_rx(Bytes::from(vec![(i % 251) as u8; 60]));
+        }
+        assert_eq!(device.rx_queue.len(), RX_INGRESS_CAP);
+        assert_eq!(device.rx_hold.len(), 10);
+
+        // Drain the queue the way `Interface::poll` would, then fill:
+        // the held tail promotes in FIFO order up to the same cap.
+        device.rx_queue.clear();
+        device.fill_rx_queue();
+        assert_eq!(device.rx_queue.len(), 10);
+        assert!(device.rx_hold.is_empty());
+        for (i, pkt) in device.rx_queue.iter().enumerate() {
+            assert_eq!(
+                pkt[0],
+                ((RX_INGRESS_CAP + i) % 251) as u8,
+                "hold must promote in admit order"
+            );
+        }
+    }
+
+    /// Once `rx_hold` is nonempty, fresh admits go to the hold even
+    /// while `rx_queue` is shallow — FIFO order must never interleave
+    /// a newer packet ahead of a held one.
+    #[test]
+    fn push_rx_never_reorders_ahead_of_hold() {
+        let mut device = ChannelDevice::new(1400);
+        for _ in 0..RX_INGRESS_CAP {
+            device.push_rx(Bytes::from(vec![0xAA; 60]));
+        }
+        // Queue full: next admit stages.
+        device.push_rx(Bytes::from(vec![0xBB; 60]));
+        assert_eq!(device.rx_hold.len(), 1);
+        // Pop one from the queue — a new admit must still join the
+        // hold, not jump ahead of the staged packet.
+        device.rx_queue.pop_front();
+        device.push_rx(Bytes::from(vec![0xCC; 60]));
+        assert_eq!(device.rx_hold.len(), 2);
+        assert_eq!(device.rx_hold[1][0], 0xCC);
+    }
+
+    /// `transmit` reports the device exhausted at `TX_QUEUE_CAP` — the
+    /// `EgressError::Exhausted` smoltcp maps to a clean egress break —
+    /// and serves again below it. This is what bounds one poll's
+    /// egress burst the way `RX_INGRESS_CAP` bounds its ingress.
+    #[test]
+    fn transmit_reports_exhausted_at_tx_queue_cap() {
+        let mut device = ChannelDevice::new(1400);
+        for _ in 0..TX_QUEUE_CAP {
+            device.tx_queue.push_back(vec![0u8; 60]);
+        }
+        assert!(
+            device.transmit(SmolInstant::ZERO).is_none(),
+            "a full tx_queue must report exhaustion"
+        );
+        device.tx_queue.pop_front();
+        assert!(
+            device.transmit(SmolInstant::ZERO).is_some(),
+            "one slot below the cap must serve again"
+        );
+    }
+
+    /// The paired-token path (`receive`'s bundled TxToken) bypasses
+    /// the cap — ACK replies to admitted ingress must not be
+    /// throttled — and consumes into `tx_queue` as usual.
+    #[test]
+    fn receive_pair_token_bypasses_tx_cap() {
+        let mut device = ChannelDevice::new(1400);
+        for _ in 0..TX_QUEUE_CAP {
+            device.tx_queue.push_back(vec![0u8; 60]);
+        }
+        device.push_rx(Bytes::from(vec![0x11; 60]));
+        let (rx, tx) = device
+            .receive(SmolInstant::ZERO)
+            .expect("an admitted packet must yield a token pair");
+        let sent = tx.consume(60, |buf| {
+            buf[..60].fill(0x22);
+            60
+        });
+        assert_eq!(sent, 60);
+        assert_eq!(device.tx_queue.len(), TX_QUEUE_CAP + 1);
+        assert_eq!(device.tx_queue.back().unwrap()[0], 0x22);
+        drop(rx);
     }
 
     // ── perf-7 P7-1: owned-Bytes writes ──────────────────────────
