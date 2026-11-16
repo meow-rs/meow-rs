@@ -74,7 +74,7 @@ const LISTEN_POOL_CAP: usize = 64;
 
 /// Bytes drained per `socket.recv` call — the pump's 64 KiB chunk: a
 /// hot flow costs a quarter of the `recv`/`try_send` rounds 16 KiB
-/// items needed, and a `TCP_READ_QUEUE` of them covers the 1 MiB rx
+/// items needed, and a `TCP_READ_QUEUE` of them covers the 4 MiB rx
 /// window without one socket monopolising a service pass.
 const TCP_READ_CHUNK: usize = 65536;
 
@@ -108,12 +108,12 @@ const INJECT_QUEUE: usize = 256;
 /// a send-side backlog: `drain_device_tx` encapsulates every inner
 /// packet smoltcp egressed this pass *before* `flush_outbox` runs, and a
 /// single saturated TCP flow egresses up to its whole advertised window
-/// — `TCP_SOCKET_BUF / ~1400` datagrams (~750 at 1 MiB). `1024` dropped
+/// — `TCP_SOCKET_BUF / ~1400` datagrams (~3 000 at 4 MiB). `1024` dropped
 /// the tail of every two-flow 768 KiB+ burst onto the inner TCP as a
 /// hole, which smoltcp's ≥1 s RTO floor turned into multi-second stalls
 /// (measured: macOS loopback two-flow collapse to ~0–30 KB/s). 4× the
 /// full-window burst covers a handful of saturated flows per pass while
-/// staying a hard bound (~6 MB of staged datagrams at 1 MiB).
+/// staying a hard bound (~18 MB of staged datagrams at 4 MiB).
 const OUTBOX_CAP: usize = 4 * TCP_SOCKET_BUF / 1400;
 
 /// Retained crypto-scratch buffers. Demand is a handful of live dsts

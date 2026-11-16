@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use bytes::{Buf, Bytes};
+use bytes::{Buf, Bytes, BytesMut};
 use meow_common::{ProxyConn, WriteBytes};
 use smoltcp::iface::{Interface, PollResult, SocketSet};
 use smoltcp::phy::{Checksum, Device, DeviceCapabilities, Medium, RxToken, TxToken};
@@ -29,30 +29,39 @@ use tokio::sync::mpsc::{self, error::SendError, OwnedPermit};
 mod endpoint;
 pub use endpoint::{BatchEndpoint, Endpoint, ProxyEndpoint};
 
-/// actor→conn stream events per TCP flow (≈32 × 64 KiB ≈ 2 MiB of read
-/// backpressure per flow — deeper than the 1 MiB smoltcp socket window
-/// so the relay read side, not the channel, is the stall point; the two
-/// layers together bound a saturated flow at ~3 MiB).
-pub const TCP_READ_QUEUE: usize = 32;
+/// actor→conn stream events per TCP flow (≈64 × 64 KiB = 4 MiB of read
+/// backpressure per flow — covers the 4 MiB smoltcp socket window so the
+/// relay read side, not the channel, is the stall point; the two layers
+/// together bound a saturated flow at ~8 MiB).
+pub const TCP_READ_QUEUE: usize = 64;
 /// conn→actor write items per TCP flow.
 pub const TCP_WRITE_QUEUE: usize = 64;
 
 /// Per-socket smoltcp buffers (rx and tx). The rx half doubles as the
 /// advertised TCP window — smoltcp negotiates RFC 7323 window scaling in
-/// SYN (`remote_win_shift = bit_width(capacity) - 16` = 21 - 16 = 5, so
-/// the wire window can grow past the 16-bit field up to the full 1 MiB
-/// buffer), and per-flow throughput caps at `TCP_SOCKET_BUF / RTT`:
-/// 64 KiB held a 140 ms-RTT path to ~0.5 MB/s and 256 KiB to ~1.8 MB/s
-/// (measured on a real KR↔US peer); 1 MiB lifts the cap to ~7.5 MB/s.
-/// Peers that don't answer with `window_scale` fall back to the 16-bit
-/// wire window (~64 KiB cap) silently. Cost: 2 × 1 MiB eagerly
-/// allocated per WG TCP connection — a high-conn-count deployment
-/// should weigh that against its configured connection bound.
+/// SYN (`remote_win_shift = bit_width(capacity) - 16` = 23 - 16 = 7, so
+/// the wire window can grow past the 16-bit field up to the full 4 MiB
+/// buffer), and per-flow *inbound* throughput caps at
+/// `TCP_SOCKET_BUF / RTT`: 64 KiB held a 140 ms-RTT path to ~0.5 MB/s
+/// and 256 KiB to ~1.8 MB/s (measured on a real KR↔US peer); 1 MiB
+/// lifted the cap to ~7.5 MB/s, 4 MiB lifts it to ~30 MB/s. Peers that
+/// don't answer with `window_scale` fall back to the 16-bit wire window
+/// (~64 KiB cap) silently. Cost: 2 × 4 MiB eagerly allocated per WG TCP
+/// connection — a high-conn-count deployment should weigh that against
+/// its configured connection bound.
+///
+/// Note the window only bounds the *download* direction — the C1-gate
+/// measurement (instrumented `dropped_*`/`txq` counters on a sub-ms LAN
+/// rig) showed zero drops anywhere and `txq` saturated by the *peer's*
+/// advertised window: the far end's own receive window ÷ effective RTT
+/// is the upload bound (sing-box's userspace stack ~8 MB/s vs a kernel
+/// TCP peer ~44 MB/s on the same smoltcp path), which this constant
+/// cannot move.
 ///
 /// `pub`: the endpoint socket's kernel receive buffer is sized from this
 /// — a full-window burst arrives as ~this many WG datagrams (see
 /// [`enlarge_recv_buffer`]).
-pub const TCP_SOCKET_BUF: usize = 1024 * 1024;
+pub const TCP_SOCKET_BUF: usize = 4 * 1024 * 1024;
 
 /// Endpoint→Tunn drain bound per loop iteration; excess waits for the next
 /// wake-up rather than starving the rest of the service pass. Raised
@@ -101,7 +110,10 @@ pub const POLL_BURST: usize = 256;
 /// Under normal WG flow the budget rarely trips at all — `PollResult::
 /// None` exits the burst first (the quiet poll after the stack drains).
 /// The budget is the degenerate-load bound, not the everyday exit.
-pub const POLL_TX_BYTES_BUDGET: usize = 2 * 1024 * 1024;
+///
+/// 4 MiB covers one [`TCP_SOCKET_BUF`]-sized full-window drain in a
+/// single pass so a saturated flow's egress isn't sliced across passes.
+pub const POLL_TX_BYTES_BUDGET: usize = 4 * 1024 * 1024;
 
 /// boringtun's own device loop ticks its timers at 250 ms (rekey timeout is
 /// 5 s, jitter ≤ 333 ms — this is well inside slack). Spec §3.4 sketched
@@ -695,16 +707,25 @@ impl AsyncWrite for WgStream {
 }
 
 /// perf-7 P7-1: the conn→actor channel carries `TcpIo::Data(Bytes)`, so
-/// the caller's owned `Bytes` moves straight into a channel slot — the
-/// `poll_write` slice copy (`Bytes::copy_from_slice`) is gone on this
-/// path. The `Option` slot stays the *caller's*: on full channel the
-/// bytes are handed back into it (the relay re-presents them next poll,
-/// its `pos` having never advanced), on success `take()` leaves `None`.
+/// the caller's owned buffer — frozen on the way in — moves straight
+/// into a channel slot: the `poll_write` slice copy
+/// (`Bytes::copy_from_slice`) is gone on this path. The `Option` slot
+/// stays the *caller's*: on full channel the bytes are handed back into
+/// it (the relay re-presents them next poll, its `pos` having never
+/// advanced), on success `take()` leaves `None`.
+///
+/// `want_write_headroom` stays `0` — the WG framing happens in the
+/// peer's `Tunn`, not here; a reserved prefix would only ride the
+/// channel as dead bytes.
 impl WriteBytes for WgStream {
+    fn want_write_headroom(&self) -> usize {
+        0
+    }
+
     fn poll_write_bytes(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        bytes: &mut Option<Bytes>,
+        bytes: &mut Option<BytesMut>,
     ) -> Poll<std::io::Result<()>> {
         if self.write_done {
             return Poll::Ready(Err(stream_broken()));
@@ -739,10 +760,31 @@ impl WriteBytes for WgStream {
             // The caller's slot is the in-flight marker: `None` means an
             // earlier poll already handed the bytes to the channel (or
             // the caller had nothing) — the write is done either way.
-            let Some(b) = bytes.take() else {
+            if bytes.is_none() {
                 return Poll::Ready(Ok(()));
+            }
+            // Claim a send slot BEFORE taking the buffer: the channel
+            // item is `Bytes`-typed, so a `Full` bounce would have to
+            // reconstitute the caller's `BytesMut` — a whole-buffer copy
+            // under every backpressure bounce. With a reserved permit
+            // (or visible capacity) the send below cannot fail `Full`.
+            if self.write_permit.is_none() && self.tx.capacity() == 0 {
+                match self.poll_write_wait(cx) {
+                    Poll::Ready(true) => continue,
+                    Poll::Ready(false) => {
+                        self.write_done = true;
+                        return Poll::Ready(Err(stream_broken()));
+                    }
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+            let Some(b) = bytes.take() else {
+                unreachable!("checked is_some above");
             };
-            match self.send_item(TcpIo::Data(b)) {
+            // `TcpIo::Data` is `Bytes`-typed; freezing the caller's
+            // `BytesMut` region is a refcount bump on the same
+            // allocation, not a copy.
+            match self.send_item(TcpIo::Data(b.freeze())) {
                 Ok(()) => {
                     self.nudge();
                     return Poll::Ready(Ok(()));
@@ -752,13 +794,18 @@ impl WriteBytes for WgStream {
                     // `pending_write` (which the stream retries itself),
                     // the item stays reachable through this poll entry —
                     // the relay only re-enters the write arm while its
-                    // `pos` is unconsumed, so the parked `Bytes` would
+                    // `pos` is unconsumed, so the parked bytes would
                     // never drain if they moved into `pending_write`
                     // with `pos` already at `cap`.
                     let TcpIo::Data(b) = item else {
                         unreachable!("the item was built from Data above");
                     };
-                    *bytes = Some(b);
+                    // The channel item round-trips as `Bytes`; re-typing
+                    // it back into the caller's `BytesMut` slot is the
+                    // one copy on this path — kept for completeness:
+                    // the capacity pre-check above makes `Full` here
+                    // unreachable absent a second competing sender.
+                    *bytes = Some(BytesMut::from(&b[..]));
                     match self.poll_write_wait(cx) {
                         Poll::Ready(true) => continue,
                         Poll::Ready(false) => {
@@ -788,7 +835,7 @@ impl ProxyConn for WgStream {
 }
 
 /// One full-window inner-TCP burst lands on this socket as ~`TCP_SOCKET_BUF`
-/// bytes of back-to-back WG datagrams (~1.1 MB on the wire at the current
+/// bytes of back-to-back WG datagrams (~4.4 MB on the wire at the current
 /// window — far over the 208 KiB Linux default, which would drop the tail
 /// of every saturated burst and cost an inner-TCP retransmit round). 4×
 /// absorbs bursts from a few saturated flows at once; the kernel commits
@@ -817,8 +864,8 @@ pub fn enlarge_recv_buffer(socket: &tokio::net::UdpSocket) {
 }
 
 /// The send side needs the same headroom as the receive side: one
-/// [`poll_burst`] pass can stage up to `POLL_TX_BYTES_BUDGET` (~2 MiB,
-/// ≈1 400 datagrams at ~1.5 KB) of wire-bound inner segments before its
+/// [`poll_burst`] pass can stage up to `POLL_TX_BYTES_BUDGET` (~4 MiB,
+/// ≈2 800 datagrams at ~1.5 KB) of wire-bound inner segments before its
 /// soft budget trips, handed to the kernel as [`WIRE_DRAIN_BUDGET`]-sized
 /// `send_batch` batches back to back — and the default send buffer is
 /// far smaller than one batch on some platforms: macOS grants only
@@ -983,16 +1030,16 @@ mod tests {
         );
     }
 
-    /// P4-1: `TCP_SOCKET_BUF` is 1 MiB — the rx half's window-scale
-    /// negotiation needs `bit_width(capacity) - 16` ≥ 5 to advertise past
+    /// C1a: `TCP_SOCKET_BUF` is 4 MiB — the rx half's window-scale
+    /// negotiation needs `bit_width(capacity) - 16` = 7 to advertise past
     /// the 16-bit field up to the full buffer, and `ENDPOINT_RECV_BUFFER`
     /// tracks it at 4× automatically. Both halves of the socket buffer
-    /// pair are this size, so a WG TCP connection allocates 2 × 1 MiB —
+    /// pair are this size, so a WG TCP connection allocates 2 × 4 MiB —
     /// pinned here in lieu of heap profiling.
     #[test]
-    fn tcp_socket_buf_is_one_mib() {
-        assert_eq!(TCP_SOCKET_BUF, 1024 * 1024);
-        assert_eq!(ENDPOINT_RECV_BUFFER, 4 * 1024 * 1024);
+    fn tcp_socket_buf_is_four_mib() {
+        assert_eq!(TCP_SOCKET_BUF, 4 * 1024 * 1024);
+        assert_eq!(ENDPOINT_RECV_BUFFER, 16 * 1024 * 1024);
         // The allocation shape every WG TCP socket pays (pump `dial_tcp`
         // and the listener's accept path share this constructor).
         use smoltcp::socket::tcp;
@@ -1000,14 +1047,14 @@ mod tests {
         let tx = tcp::SocketBuffer::new(vec![0; TCP_SOCKET_BUF]);
         assert_eq!(
             rx.capacity() + tx.capacity(),
-            2 * 1024 * 1024,
-            "one WG TCP connection holds 2 × 1 MiB of socket buffers"
+            8 * 1024 * 1024,
+            "one WG TCP connection holds 2 × 4 MiB of socket buffers"
         );
         // smoltcp's `remote_win_shift = bit_width(capacity) - 16`; at
-        // 1 MiB that is 21 - 16 = 5 — enough shift to advertise the
+        // 4 MiB that is 23 - 16 = 7 — enough shift to advertise the
         // whole buffer on the wire.
         let shift = usize::BITS as usize - TCP_SOCKET_BUF.leading_zeros() as usize - 16;
-        assert_eq!(shift, 5);
+        assert_eq!(shift, 7);
     }
 
     /// `reset_scratch` contract: a pooled-capacity Vec comes back at
@@ -1201,15 +1248,15 @@ mod tests {
         }
     }
 
-    /// P7-1: `poll_write_bytes` moves the caller's `Bytes` into the
-    /// channel slot untouched — the `TcpIo::Data` the actor receives is
-    /// the SAME allocation, no `copy_from_slice`.
+    /// P7-1/B3: `poll_write_bytes` moves the caller's `BytesMut` into the
+    /// channel slot as one `freeze` — the `TcpIo::Data` the actor
+    /// receives is the SAME allocation, no `copy_from_slice`.
     #[tokio::test]
     async fn wg_stream_write_bytes_zero_copy() {
         let (tx, mut rx) = mpsc::channel::<TcpIo>(1);
         let mut stream = test_stream(tx);
 
-        let bytes = Bytes::from(vec![7u8; 4096]);
+        let bytes = BytesMut::from(&vec![7u8; 4096][..]);
         let original_ptr = bytes.as_ptr();
         let mut slot = Some(bytes);
         std::future::poll_fn(|cx| Pin::new(&mut stream).poll_write_bytes(cx, &mut slot))
@@ -1236,7 +1283,9 @@ mod tests {
     async fn write_bytes_pending_preserves_ordering() {
         let (tx, mut rx) = mpsc::channel::<TcpIo>(2);
         let mut stream = test_stream(tx);
-        let msgs: Vec<Bytes> = (0..4u8).map(|i| Bytes::from(vec![i; 16])).collect();
+        let msgs: Vec<BytesMut> = (0..4u8)
+            .map(|i| BytesMut::from(&vec![i; 16][..]))
+            .collect();
 
         // Fill the channel to capacity.
         for m in &msgs[..2] {

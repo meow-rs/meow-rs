@@ -68,7 +68,7 @@ const SCRATCH_POOL_CAP: usize = 128;
 /// Read chunk handed to `socket.recv`. One 64 KiB item drains through a
 /// relay's bulk-tier 32 KiB ReadBuf in ~2 channel hops — a quarter of the
 /// hop count 16 KiB items needed — and a `TCP_READ_QUEUE` of them still
-/// covers the 1 MiB rx window, without letting one socket monopolise a
+/// covers the 4 MiB rx window, without letting one socket monopolise a
 /// service pass.
 const TCP_READ_CHUNK: usize = 65536;
 
@@ -4551,11 +4551,11 @@ mod tests {
         );
     }
 
-    /// P4-2's flow-budget math: the 64 KiB read chunk is what a bulk
-    /// relay drains in ~2 hops, and `TCP_READ_QUEUE` of them still
-    /// covers the 1 MiB smoltcp rx window (2 MiB of per-flow
-    /// backpressure) — pinned so a "harmless" constant bump can't
-    /// quietly break the layering.
+    /// C1a's flow-budget math: the 64 KiB read chunk is what a bulk
+    /// relay drains in ~2 hops, and `TCP_READ_QUEUE` of them covers the
+    /// 4 MiB smoltcp rx window (4 MiB of per-flow backpressure) —
+    /// pinned so a "harmless" constant bump can't quietly break the
+    /// layering.
     #[test]
     fn tcp_read_chunk_covers_rx_window() {
         assert_eq!(TCP_READ_CHUNK, 65536);

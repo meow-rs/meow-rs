@@ -313,24 +313,25 @@ listeners:
   peers stay cryptographically isolated.
 
 **Memory budget.** Inner TCP socket buffers come from `meow-wgstack`'s
-`TCP_SOCKET_BUF` — 1 MiB per direction per connection, chosen because
-the rx half doubles as the advertised TCP window: per-flow throughput
-caps at `buf / RTT`, so 1 MiB lifts a ~140 ms-RTT peer from ~0.5 MB/s
-(at 64 KiB) to ~7.5 MB/s. The trade is 2 MiB eagerly allocated per
+`TCP_SOCKET_BUF` — 4 MiB per direction per connection, chosen because
+the rx half doubles as the advertised TCP window: per-flow inbound
+throughput caps at `buf / RTT`, so 4 MiB lifts a ~140 ms-RTT peer from
+~0.5 MB/s (at 64 KiB) to ~30 MB/s (1 MiB reached ~7.5 MB/s). The trade
+is 8 MiB eagerly allocated per
 inner conn — virtual, not resident: the zeroed Vecs only commit the
 pages a flow actually fills, so idle/lightly-loaded conns cost almost
-nothing and committed memory tracks real backpressure — ~2.2 MiB
-typical with its channel-queue share, ~8 MiB
-worst-case staged (the 2 MiB read channel plus a full write queue
+nothing and committed memory tracks real backpressure — ~8.5 MiB
+typical with its channel-queue share, ~14 MiB
+worst-case staged (the 4 MiB read channel plus a full write queue
 and pending slots, on top of the eager buffers) — so a deployment's
-budget is roughly conns × ~2.2 MiB typical, × ~8 MiB worst case,
-+ ≤128 MiB of listen-pool placeholders (64 × the same 2 MiB) +
-outbox/scratch slack — ~700 MiB typical, ~2.1 GiB worst case at the
+budget is roughly conns × ~8.5 MiB typical, × ~14 MiB worst case,
++ ≤512 MiB of listen-pool placeholders (64 × the same 8 MiB) +
+outbox/scratch slack — ~2.7 GiB typical, ~4.2 GiB worst case at the
 default `max-connections: 256`. The cap is the lever: set it against
 the host's memory envelope, not just the conn target — `0` disables
 the limit and lets committed memory scale with active flow count
 without a ceiling, which a small host should not do. The outbound
-node's own dials pay the same 2 MiB apiece.
+node's own dials pay the same 8 MiB apiece.
 
 The listener's UDP socket binds eagerly at startup (`port: 0` resolves
 to the real port before the actor spawns — `GET /listeners` shows it).

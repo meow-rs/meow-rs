@@ -72,6 +72,15 @@ unsigned integer (non-integer is a hard error); clamped to
 — extra driver tasks rarely pay off past that. `1` reproduces the
 legacy single-connection behaviour exactly.
 
+Each slot authenticates independently — the server sees `K` concurrent
+hysteria2 auth handshakes per password from `K` source ports. Servers
+that rate-limit concurrent sessions per credential will refuse the
+extra slots; the pool then degrades to the live slots (round-robin
+skips dead ones until they heal), so the failure is graceful but the
+aggregate win is lost. If a deployment sees fewer live slots than
+configured, that's the cause — drop `quic-connections` to what the
+server tolerates.
+
 ## Constraint — read this before expecting speedups
 
 **Single-flow throughput is unchanged.** One stream rides one
