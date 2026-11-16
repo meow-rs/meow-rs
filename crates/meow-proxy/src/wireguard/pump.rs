@@ -28,8 +28,9 @@ use std::time::{Duration, Instant as StdInstant};
 use bytes::{Buf, Bytes};
 use meow_common::{MeowError, ProxyConn, ProxyPacketConn, Result};
 use meow_wgstack::{
-    poll_burst, reset_scratch, ChannelDevice, Endpoint, StreamEvent, TcpIo, WgStream,
-    TCP_READ_QUEUE, TCP_SOCKET_BUF, TCP_WRITE_QUEUE, WG_TIMER_INTERVAL, WIRE_DRAIN_BUDGET,
+    note_count, note_drop, poll_burst, reset_scratch, udp_dst_port, ChannelDevice, DropStats,
+    Endpoint, StreamEvent, TcpIo, WgStream, TCP_READ_QUEUE, TCP_SOCKET_BUF, TCP_WRITE_QUEUE,
+    WG_TIMER_INTERVAL, WIRE_DRAIN_BUDGET,
 };
 use meow_wireguard::noise::Packet;
 use meow_wireguard::{
@@ -134,6 +135,11 @@ const DESYNC_KICK_INTERVAL: Duration = Duration::from_secs(5);
 const EPHEMERAL_PORT_BASE: u16 = 49152;
 const EPHEMERAL_PORT_SPAN: u16 = 16384;
 
+/// ITEM C1 snapshot cadence for [`WgPump::log_socket_stats`]: 2 s is
+/// fine enough to see a 1 s min-RTO stall as consecutive unmoved
+/// `send_queue` samples without spamming the DEBUG stream.
+const STATS_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(2);
+
 /// Messages into the pump actor.
 pub(crate) enum ActorMsg {
     /// Open a smoltcp TCP socket toward `remote`; the reply fires once the
@@ -206,6 +212,12 @@ struct TcpState {
     /// aborted regardless of `graceful_close` — the bound that keeps a
     /// peer that never closes back from pinning the socket forever.
     dead_since: Option<StdInstant>,
+    /// ITEM C1 stall detector: `send_queue()` at the last snapshot and
+    /// when it last moved. smoltcp 0.13 exposes no retransmit/RTO
+    /// counter, so an unmoved nonzero `send_queue` across snapshot
+    /// intervals is the observable 1 s min-RTO signature.
+    snap_txq: usize,
+    snap_txq_at: StdInstant,
 }
 
 struct UdpState {
@@ -215,6 +227,15 @@ struct UdpState {
     /// so each entry is a whole datagram.
     out: VecDeque<(Bytes, SocketAddr)>,
     local: SocketAddr,
+    /// ITEM C1 offered-vs-dequeued bookkeeping — smoltcp's
+    /// `udp::Socket::process` drops on a full rx buffer silently (no
+    /// error upstack), so `account_udp_drops` derives the count:
+    /// `rx_offered` (pre-poll scan) − `rx_dequeued` (drain) −
+    /// `rx_sockbuf_dropped` (confirmed) = datagrams in flight or lost.
+    rx_offered: u64,
+    rx_dequeued: u64,
+    /// The `rx_sockbuf_dropped` subset confirmed for this socket.
+    rx_sockbuf_dropped: u64,
 }
 
 /// The smoltcp/boringtun actor. Constructed by [`spawn_pump`] *before*
@@ -299,6 +320,17 @@ struct WgPump {
     /// [`SERVICE_YIELD_PASS_LIMIT`] trips on when per-pass payload is
     /// too small for the byte counter to notice.
     last_service_passes: usize,
+    /// ITEM C1 measurement-gate counters (observability only — no
+    /// behavior change): the inner-UDP drop/saturation signals the
+    /// chained-WG hypothesis hunts. See [`DropStats`].
+    stats: DropStats,
+    /// `rx_queue` head entries already attributed by
+    /// [`scan_udp_offered`](Self::scan_udp_offered) — poll may stop
+    /// mid-queue on the egress budget, and a re-scan must not
+    /// double-offer the carry-over prefix.
+    rx_scan_pending: usize,
+    /// When the last [`STATS_SNAPSHOT_INTERVAL`] snapshot ran.
+    last_stats: StdInstant,
 }
 
 // The pump rides the shared tokio worker pool (perf-7 P7-2): if any
@@ -380,6 +412,9 @@ impl WgPump {
             last_desync_kick: None,
             last_service_bytes: 0,
             last_service_passes: 0,
+            stats: DropStats::default(),
+            rx_scan_pending: 0,
+            last_stats: StdInstant::now(),
         }
     }
 
@@ -1076,11 +1111,13 @@ impl WgPump {
                         // return; WG tolerates the loss and the redial
                         // re-sends what matters — warn-per-packet until
                         // the recv arm gets there would only storm.
+                        self.stats.outbox_dropped += self.outbox.len() as u64 + 1;
                         self.outbox.clear();
                         self.return_scratch(pkt);
                         return;
                     }
                     Err(e) => {
+                        self.stats.outbox_dropped += 1;
                         warn!(
                             "wireguard {}: endpoint send to {} failed: {e}",
                             self.name, self.endpoint_addr
@@ -1192,6 +1229,8 @@ impl WgPump {
                 eof_sent: false,
                 graceful_close: false,
                 dead_since: None,
+                snap_txq: 0,
+                snap_txq_at: StdInstant::now(),
             },
         );
     }
@@ -1245,6 +1284,9 @@ impl WgPump {
                 write_rx,
                 out: VecDeque::new(),
                 local,
+                rx_offered: 0,
+                rx_dequeued: 0,
+                rx_sockbuf_dropped: 0,
             },
         );
         let conn = WgPacketConn {
@@ -1390,6 +1432,20 @@ impl WgPump {
                 match front {
                     TcpIo::Data(b) => {
                         if !socket.can_send() {
+                            // ITEM C1: send-side stall — tx buffer full
+                            // or remote window 0; the signature a
+                            // retransmit/RTO stall pins.
+                            note_count(
+                                &mut self.stats.tcp_tx_stall,
+                                1,
+                                format_args!(
+                                    "wireguard {}: TCP {handle:?} send stalled \
+                                     (txq={}/{})",
+                                    self.name,
+                                    socket.send_queue(),
+                                    socket.send_capacity()
+                                ),
+                            );
                             break;
                         }
                         match socket.send_slice(b) {
@@ -1547,6 +1603,24 @@ impl WgPump {
                     Err(mpsc::error::TryRecvError::Empty) => break,
                 }
             }
+            // ITEM C1: outer→inner no-socket-space — queued datagrams
+            // facing a full smoltcp tx buffer is the enqueue-side
+            // saturation the hypothesis hunts (backpressure, not loss:
+            // `out` holds the datagram for the next pass).
+            if !st.out.is_empty() && !socket.can_send() {
+                self.stats.tx_buf_full += 1;
+                note_drop(
+                    &self.stats.dropped_tx,
+                    1,
+                    format_args!(
+                        "wireguard {}: UDP {handle:?} tx socket buffer full \
+                         ({}B/{}B queued)",
+                        self.name,
+                        socket.send_queue(),
+                        socket.payload_send_capacity()
+                    ),
+                );
+            }
             while socket.can_send() {
                 let Some((data, addr)) = st.out.front() else {
                     break;
@@ -1561,19 +1635,67 @@ impl WgPump {
                     meta: Default::default(),
                 };
                 match socket.send_slice(data, meta) {
-                    Err(udp::SendError::BufferFull) => break,
+                    Ok(()) => {
+                        self.last_service_bytes += data.len();
+                        st.out.pop_front();
+                    }
+                    Err(udp::SendError::BufferFull) => {
+                        // `can_send` already gates this — the arm stays
+                        // as the belt-and-suspenders count if a race
+                        // ever fires it.
+                        self.stats.tx_buf_full += 1;
+                        note_drop(
+                            &self.stats.dropped_tx,
+                            1,
+                            format_args!(
+                                "wireguard {}: UDP {handle:?} send_slice BufferFull",
+                                self.name
+                            ),
+                        );
+                        break;
+                    }
                     // Unaddressable et al.: the conn's write_packet checks
                     // make those unreachable; drop the datagram rather than
                     // wedge the queue behind a permanently-failing one.
-                    Ok(()) | Err(_) => {
+                    Err(e) => {
+                        self.stats.tx_err_dropped += 1;
+                        note_drop(
+                            &self.stats.dropped_tx,
+                            1,
+                            format_args!(
+                                "wireguard {}: UDP {handle:?} send_slice error \
+                                 {e} — datagram dropped",
+                                self.name
+                            ),
+                        );
                         self.last_service_bytes += data.len();
                         st.out.pop_front();
                     }
                 }
             }
+            // ITEM C1: post-poll rx occupancy — a buffer within one
+            // datagram of capacity means smoltcp's `process` dropped
+            // inbound datagrams this ingress (the hypothesis-B drop
+            // point); `account_udp_drops` counts them exactly.
+            let occ = socket.recv_queue();
+            self.stats.rx_occ_max = self.stats.rx_occ_max.max(occ);
+            if occ >= socket.payload_recv_capacity().saturating_sub(2048) {
+                note_count(
+                    &mut self.stats.rx_buf_full_obs,
+                    1,
+                    format_args!(
+                        "wireguard {}: UDP {handle:?} rx socket buffer at \
+                         capacity ({}B/{}B) — in-poll drops probable",
+                        self.name,
+                        occ,
+                        socket.payload_recv_capacity()
+                    ),
+                );
+            }
             while socket.can_recv() {
                 match socket.recv_slice(&mut self.udp_scratch) {
                     Ok((n, meta)) => {
+                        st.rx_dequeued += 1;
                         self.last_service_bytes += n;
                         let src = SocketAddr::new(meta.endpoint.addr.into(), meta.endpoint.port);
                         // STRUCTURAL COPY (perf-7 memcpy #6, UDP twin of
@@ -1587,7 +1709,23 @@ impl WgPump {
                         // pointer casts — smoltcp owns the storage.
                         let data = Bytes::copy_from_slice(&self.udp_scratch[..n]);
                         // Full → drop: datagram loss is the UDP contract.
-                        let _ = st.read_tx.try_send((data, src));
+                        match st.read_tx.try_send((data, src)) {
+                            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+                            // ITEM C1: the conn-channel-full arm of the
+                            // inner→outer drain — counted exactly.
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                self.stats.rx_chan_dropped += 1;
+                                note_drop(
+                                    &self.stats.dropped_rx,
+                                    1,
+                                    format_args!(
+                                        "wireguard {}: UDP {handle:?} conn \
+                                         channel full — datagram dropped",
+                                        self.name
+                                    ),
+                                );
+                            }
+                        }
                     }
                     Err(_) => break,
                 }
@@ -1690,6 +1828,179 @@ impl WgPump {
         poll_burst(&mut self.iface, now, &mut self.device, &mut self.sockets);
     }
 
+    /// ITEM C1 pre-poll offer scan: attribute every newly arrived UDP
+    /// datagram in `device.rx_queue` to a bound socket by destination
+    /// port — the same `dst_port` demux smoltcp's `accepts` applies
+    /// (the dst-addr check it also does is skipped: every inner packet
+    /// is addressed to this iface, and `rx_udp_unclaimed` would expose
+    /// a misattribution). The `rx_scan_pending` head skip keeps
+    /// datagrams poll left mid-queue (egress-budget stop) from being
+    /// offered twice — poll consumes front-to-back, so a carry-over
+    /// is always a prefix.
+    fn scan_udp_offered(&mut self) {
+        self.stats.rx_queue_max = self.stats.rx_queue_max.max(self.device.rx_queue.len());
+        for pkt in self.device.rx_queue.iter().skip(self.rx_scan_pending) {
+            let Some(port) = udp_dst_port(pkt) else {
+                continue;
+            };
+            match self.udp.values_mut().find(|st| st.local.port() == port) {
+                Some(st) => st.rx_offered += 1,
+                None => {
+                    note_count(
+                        &mut self.stats.rx_udp_unclaimed,
+                        1,
+                        format_args!(
+                            "wireguard {}: inner UDP datagram for :{port} \
+                             has no bound socket",
+                            self.name
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
+    /// ITEM C1 post-service drop tally — the exact in-poll loss count
+    /// smoltcp's `udp::Socket::process` performs silently (its rx
+    /// `PacketBuffer::enqueue` failure returns no error upstack). Per
+    /// socket, `offered − dequeued − confirmed` is in flight or lost;
+    /// datagrams still waiting in `rx_queue` or bounded inside the
+    /// socket's rx buffer are excluded, so only real drops confirm.
+    fn account_udp_drops(&mut self) {
+        for (handle, st) in &mut self.udp {
+            let unaccounted = st
+                .rx_offered
+                .saturating_sub(st.rx_dequeued)
+                .saturating_sub(st.rx_sockbuf_dropped);
+            if unaccounted == 0 {
+                continue;
+            }
+            let still_queued = self
+                .device
+                .rx_queue
+                .iter()
+                .filter(|pkt| udp_dst_port(pkt) == Some(st.local.port()))
+                .count() as u64;
+            let socket = self.sockets.get::<udp::Socket>(*handle);
+            // An upper bound on datagrams alive inside the rx buffer:
+            // slot count, or payload bytes (each datagram ≥ 1 B).
+            // Only the excess over both queues is a confirmed drop —
+            // the bound never over-counts, so the gate under-reports
+            // rather than invents loss.
+            let in_socket = if socket.can_recv() {
+                socket.packet_recv_capacity().min(socket.recv_queue()) as u64
+            } else {
+                0
+            };
+            let confirmed = unaccounted
+                .saturating_sub(still_queued)
+                .saturating_sub(in_socket);
+            if confirmed > 0 {
+                st.rx_sockbuf_dropped += confirmed;
+                self.stats.rx_sockbuf_dropped += confirmed;
+                note_drop(
+                    &self.stats.dropped_rx,
+                    confirmed,
+                    format_args!(
+                        "wireguard {}: UDP {handle:?} rx socket buffer full — \
+                         {confirmed} datagram(s) dropped inside poll",
+                        self.name
+                    ),
+                );
+            }
+        }
+        // Everything left in `rx_queue` was offered already.
+        self.rx_scan_pending = self.device.rx_queue.len();
+    }
+
+    /// ITEM C1 periodic DEBUG snapshot. smoltcp 0.13 exposes no TCP
+    /// retransmit/RTO counter, so the RTO proxy is public state: a
+    /// nonzero `send_queue` unmoved across snapshots (`snap_txq_at`)
+    /// is the ~1 s min-RTO stall signature, next to `timeout()` and
+    /// the window/occupancy surfaces the spec asks for.
+    fn log_socket_stats(&mut self) {
+        if self.last_stats.elapsed() < STATS_SNAPSHOT_INTERVAL {
+            return;
+        }
+        self.last_stats = StdInstant::now();
+        debug!(
+            "wireguard {}: C1 gate dropped_rx={} dropped_tx={} \
+             (rx_sockbuf={} rx_chan={} rx_buf_full_obs={} rx_occ_max={}B \
+             rxq_max={} | tx_buf_full={} tx_err={}) unclaimed={} \
+             tcp_tx_stall={} outbox_dropped={}",
+            self.name,
+            self.stats.dropped_rx.load(Ordering::Relaxed),
+            self.stats.dropped_tx.load(Ordering::Relaxed),
+            self.stats.rx_sockbuf_dropped,
+            self.stats.rx_chan_dropped,
+            self.stats.rx_buf_full_obs,
+            self.stats.rx_occ_max,
+            self.stats.rx_queue_max,
+            self.stats.tx_buf_full,
+            self.stats.tx_err_dropped,
+            self.stats.rx_udp_unclaimed,
+            self.stats.tcp_tx_stall,
+            self.stats.outbox_dropped,
+        );
+        for (handle, st) in &mut self.tcp {
+            let socket = self.sockets.get::<tcp::Socket>(*handle);
+            let txq = socket.send_queue();
+            if txq != st.snap_txq {
+                st.snap_txq = txq;
+                st.snap_txq_at = StdInstant::now();
+            }
+            debug!(
+                "wireguard {}: TCP {handle:?} {:?} peer={:?} \
+                 txq={}B/{}B rxq={}B/{}B can_send={} may_send={} \
+                 can_recv={} txq_unmoved={:?} timeout={:?} \
+                 out_items={} read_backlog={}",
+                self.name,
+                socket.state(),
+                socket.remote_endpoint(),
+                txq,
+                socket.send_capacity(),
+                socket.recv_queue(),
+                socket.recv_capacity(),
+                socket.can_send(),
+                socket.may_send(),
+                socket.can_recv(),
+                (txq > 0).then(|| st.snap_txq_at.elapsed()),
+                socket.timeout(),
+                st.out.len(),
+                st.pending_read.len(),
+            );
+        }
+        for (handle, st) in &self.udp {
+            let socket = self.sockets.get::<udp::Socket>(*handle);
+            debug!(
+                "wireguard {}: UDP {handle:?} local={} \
+                 rxq={}B/{}B txq={}B/{}B offered={} dequeued={} \
+                 out_backlog={}",
+                self.name,
+                st.local,
+                socket.recv_queue(),
+                socket.payload_recv_capacity(),
+                socket.send_queue(),
+                socket.payload_send_capacity(),
+                st.rx_offered,
+                st.rx_dequeued,
+                st.out.len(),
+            );
+        }
+        // The occupancy peaks are per-window maxima — reset so each
+        // snapshot reports this interval's worst case, not the
+        // historical one.
+        self.stats.rx_occ_max = 0;
+        self.stats.rx_queue_max = 0;
+    }
+
+    /// ITEM C1 test accessor — read the gate counters after a driven
+    /// pass; the snapshot struct lives in `meow-wgstack`.
+    #[cfg(test)]
+    pub(crate) fn stats(&self) -> &DropStats {
+        &self.stats
+    }
+
     /// The conn-facing half of a service pass as one method — socket
     /// service, the fairness yield, the interface poll, a second socket
     /// service, then the egress seal — so `run` and the same-pass pin
@@ -1718,9 +2029,15 @@ impl WgPump {
             self.last_service_bytes = 0;
             self.last_service_passes = 0;
         }
+        // ITEM C1 hooks bracket the poll/service pair: the scan sees
+        // what poll is offered, the tally sees what a full rx buffer
+        // dropped, and the snapshot reports the interval's state.
+        self.scan_udp_offered();
         self.poll_stack(SmolInstant::now());
         self.service_sockets();
+        self.account_udp_drops();
         self.drain_device_tx(run_crypto);
+        self.log_socket_stats();
     }
 
     /// `run`'s pass-end park decision (wg-perf R1): a pass that moved
@@ -3588,6 +3905,134 @@ mod tests {
         );
     }
 
+    /// ITEM C1 gate: overflow the inner UDP socket in both directions
+    /// and the counters must tally the loss exactly.
+    /// * inner→outer: a burst larger than the 256-slot/256 KiB rx
+    ///   buffer drops the tail inside `Interface::poll` —
+    ///   `rx_sockbuf_dropped` tallies it; a second round with the conn
+    ///   channel still unread adds `rx_chan_dropped`. The invariants
+    ///   `offered == dequeued + dropped` and
+    ///   `dropped_rx == sockbuf + chan` hold exactly.
+    /// * outer→inner: a full tx buffer with staged `out` datagrams
+    ///   counts `tx_buf_full` and bumps `dropped_tx` — saturation
+    ///   (backpressure), not a lost datagram.
+    #[tokio::test(flavor = "current_thread")]
+    async fn c1_udp_drop_counters_tally_socket_overflow() {
+        let client_secret = x25519::StaticSecret::from([0x77; 32]);
+        let server_public = x25519::PublicKey::from(&x25519::StaticSecret::from([0x88; 32]));
+        let mut pump = pump_for_test(&test_config(&client_secret, &server_public));
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        pump.udp_bind(
+            Arc::new(vec!["0.0.0.0/0".parse().unwrap()]),
+            true,
+            false,
+            reply_tx,
+        );
+        let _conn = reply_rx
+            .await
+            .expect("bind reply")
+            .expect("udp_bind succeeds");
+        let handle = *pump.udp.keys().next().expect("one udp flow");
+        let local = pump.udp[&handle].local;
+        assert_eq!(local.ip(), std::net::IpAddr::from([10, 0, 0, 2]));
+
+        // ── inner→outer, round 1: burst past the rx buffer; poll
+        //    drops the tail, the conn channel absorbs the rest.
+        //    Payload must fit `udp_scratch` (inner_mtu = 1356) or the
+        //    drain's `recv_slice` errors instead of delivering.
+        let payload = 1330usize; // 262144/1330 = 197 fill by bytes
+        let offered = UDP_SOCKET_PACKETS + 64;
+        let offer = |pump: &mut WgPump, base: u16| {
+            for i in 0..offered {
+                pump.device.rx_queue.push_back(Bytes::from(udp_dgram_v4(
+                    std::net::Ipv4Addr::new(10, 9, 9, 9),
+                    std::net::Ipv4Addr::new(10, 0, 0, 2),
+                    base + i as u16,
+                    local.port(),
+                    payload,
+                )));
+            }
+        };
+        offer(&mut pump, 40_000);
+        pump.scan_udp_offered();
+        pump.poll_stack(SmolInstant::now());
+        pump.service_sockets();
+        pump.account_udp_drops();
+
+        let s = pump.stats();
+        assert!(s.rx_sockbuf_dropped > 0, "poll dropped a tail");
+        assert_eq!(s.rx_chan_dropped, 0, "channel had room in round 1");
+        assert_eq!(
+            s.dropped_rx.load(Ordering::Relaxed),
+            s.rx_sockbuf_dropped,
+            "dropped_rx == sockbuf drops so far"
+        );
+        let st = &pump.udp[&handle];
+        assert_eq!(
+            st.rx_offered,
+            st.rx_dequeued + s.rx_sockbuf_dropped,
+            "offered == dequeued + dropped inside poll"
+        );
+        assert!(s.rx_buf_full_obs > 0, "drain saw a saturated buffer");
+        assert!(s.rx_occ_max > 0);
+
+        // ── inner→outer, round 2: the conn channel is still unread
+        //    (256 cap), so the tail falls out at try_send.
+        offer(&mut pump, 50_000);
+        pump.scan_udp_offered();
+        pump.poll_stack(SmolInstant::now());
+        pump.service_sockets();
+        pump.account_udp_drops();
+
+        let s = pump.stats();
+        assert!(
+            s.rx_chan_dropped > 0,
+            "an unread conn channel must take drops"
+        );
+        assert_eq!(
+            s.dropped_rx.load(Ordering::Relaxed),
+            s.rx_sockbuf_dropped + s.rx_chan_dropped,
+            "headline counter is the exact sum of its drop points"
+        );
+        let st = &pump.udp[&handle];
+        assert_eq!(
+            st.rx_offered,
+            st.rx_dequeued + s.rx_sockbuf_dropped,
+            "every offered datagram is delivered or tallied"
+        );
+
+        // ── outer→inner: wedge the tx buffer, stage `out`, and the
+        //    service pass counts the no-socket-space stall.
+        let dst: SocketAddr = "10.9.9.9:53".parse().unwrap();
+        let socket = pump.sockets.get_mut::<udp::Socket>(handle);
+        let meta = udp::UdpMetadata {
+            endpoint: dst.into(),
+            local_address: pump.src_v4,
+            meta: Default::default(),
+        };
+        while socket.can_send() {
+            socket.send_slice(b"x", meta).expect("tx buffer has room");
+        }
+        let st = pump.udp.get_mut(&handle).expect("udp state");
+        st.out.push_back((Bytes::from_static(b"z"), dst));
+
+        pump.service_sockets();
+
+        let s = pump.stats();
+        assert_eq!(s.tx_buf_full, 1, "the stalled enqueue counts once");
+        assert_eq!(
+            s.dropped_tx.load(Ordering::Relaxed),
+            1,
+            "tx saturation surfaces on the tx headline counter"
+        );
+        assert_eq!(
+            pump.udp[&handle].out.len(),
+            1,
+            "BufferFull is backpressure — the datagram still waits"
+        );
+    }
+
     #[tokio::test]
     async fn packet_conn_enforces_allowed_ips_family_and_close() {
         let (_rtx, rrx) = mpsc::channel(4);
@@ -3699,6 +4144,41 @@ mod tests {
         pseudo.extend_from_slice(&p[20..]);
         let tcp_sum = seg_checksum(&pseudo);
         p[36..38].copy_from_slice(&tcp_sum.to_be_bytes());
+        p
+    }
+
+    /// A checksummed inner IPv4 UDP datagram `src:sport` → `dst:dport`
+    /// with `payload_len` zero bytes — the wire form of wire-decrypted
+    /// packets `device.rx_queue` feeds `Interface::poll`.
+    fn udp_dgram_v4(
+        src: std::net::Ipv4Addr,
+        dst: std::net::Ipv4Addr,
+        sport: u16,
+        dport: u16,
+        payload_len: usize,
+    ) -> Vec<u8> {
+        let mut p = vec![0u8; 28 + payload_len];
+        let total_len = p.len() as u16;
+        p[0] = 0x45;
+        p[2..4].copy_from_slice(&total_len.to_be_bytes());
+        p[8] = 64;
+        p[9] = 17;
+        p[12..16].copy_from_slice(&src.octets());
+        p[16..20].copy_from_slice(&dst.octets());
+        let ip_sum = seg_checksum(&p[..20]);
+        p[10..12].copy_from_slice(&ip_sum.to_be_bytes());
+        p[20..22].copy_from_slice(&sport.to_be_bytes());
+        p[22..24].copy_from_slice(&dport.to_be_bytes());
+        p[24..26].copy_from_slice(&(8u16 + payload_len as u16).to_be_bytes());
+        let mut pseudo = Vec::with_capacity(28 + payload_len);
+        pseudo.extend_from_slice(&src.octets());
+        pseudo.extend_from_slice(&dst.octets());
+        pseudo.push(0);
+        pseudo.push(17);
+        pseudo.extend_from_slice(&(8u16 + payload_len as u16).to_be_bytes());
+        pseudo.extend_from_slice(&p[20..]);
+        let udp_sum = seg_checksum(&pseudo);
+        p[26..28].copy_from_slice(&udp_sum.to_be_bytes());
         p
     }
 
@@ -3950,6 +4430,7 @@ mod tests {
         // arm the gate, flush once more, and the receiver must see
         // every datagram in queue order — the earlier partial send
         // first, the oversized boundary dropped by the error arm.
+        //
         // The flush emits the whole backlog in one synchronous burst
         // inside this `current_thread` task, so a tokio drain can't run
         // until it returns — and a loopback rx queue can't hold ~260

@@ -13,6 +13,7 @@
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -288,6 +289,135 @@ fn poll_burst_budgeted(
         }
     }
     POLL_BURST
+}
+
+// ── ITEM C1 measurement-gate instrumentation ────────────────────
+//
+// Drop/saturation counters for the inner-UDP-socket hypothesis (WG
+// over a chained UDP hop): observability only — no behavior changes.
+// The two headline counters are [`AtomicU64`]s (the only hot-path
+// atomics added); everything finer is an actor-local `u64` the
+// owning actor folds into its periodic DEBUG snapshot.
+
+/// The first-hit / power-of-two log gate behind [`note_drop`] and
+/// [`note_count`]: the first event always reports; thereafter a bump
+/// reports iff `new` set a bit higher than `prev`'s top bit — i.e.
+/// the total crossed 2, 4, 8, 16, … One bump crossing several powers
+/// reports once, never floods.
+fn log_crossed(prev: u64, new: u64) -> bool {
+    prev == 0 || new.leading_zeros() < prev.leading_zeros()
+}
+
+/// Bump `counter` by `n` and log at the first hit and every
+/// power-of-two crossing — the `note_drop` convention from
+/// meow-proxy's `dialer.rs`/`hysteria2`: a saturated flow stays
+/// observable without flooding the log. Returns the new total.
+pub fn note_drop(counter: &AtomicU64, n: u64, msg: impl std::fmt::Display) -> u64 {
+    let prev = counter.fetch_add(n, Ordering::Relaxed);
+    let new = prev + n;
+    if log_crossed(prev, new) {
+        tracing::debug!(dropped = new, "{msg}");
+    }
+    new
+}
+
+/// [`note_drop`] for an actor-local `u64` — same first-hit /
+/// powers-of-two cadence, no atomic needed off the wire.
+pub fn note_count(counter: &mut u64, n: u64, msg: impl std::fmt::Display) -> u64 {
+    let prev = *counter;
+    *counter += n;
+    let new = *counter;
+    if log_crossed(prev, new) {
+        tracing::debug!(total = new, "{msg}");
+    }
+    new
+}
+
+/// Drop/saturation counters for a WG actor's smoltcp UDP path —
+/// ITEM C1's measurement gate. `dropped_rx`/`dropped_tx` are the two
+/// hot-path atomics; the detail fields are plain `u64`s bumped by
+/// the single-threaded actor and read out via its snapshot/logs.
+///
+/// Directions are the UDP association's, not the wire's:
+/// * **inner→outer (`rx`)** — wire datagrams decrypted into
+///   `ChannelDevice::rx_queue` → `Interface::poll` → smoltcp UDP rx
+///   buffer → conn channel. Loss points: the rx `PacketBuffer` full
+///   inside `udp::Socket::process` (counted by the owning actor's
+///   offered-vs-dequeued diff — smoltcp exposes no drop counter) and
+///   a full conn channel at drain time.
+/// * **outer→inner (`tx`)** — conn datagrams → `send_slice` → smoltcp
+///   UDP tx buffer → `tx_queue`. No-socket-space surfaces as
+///   `BufferFull`/`!can_send` refusals (backpressure, not loss — the
+///   datagram waits in `out`) and rare terminal `Err` drops.
+#[derive(Debug, Default)]
+pub struct DropStats {
+    /// Inner→outer dropped datagrams: `rx_sockbuf_dropped` +
+    /// `rx_chan_dropped` (the two subsets are bumped at their own
+    /// points, then summed here).
+    pub dropped_rx: AtomicU64,
+    /// Outer→inner no-socket-space events: `tx_buf_full` +
+    /// `tx_err_dropped`. Stall refusals dominate — they are not lost
+    /// datagrams but are the saturation signal this gate measures.
+    pub dropped_tx: AtomicU64,
+
+    /// Subset of `dropped_rx`: conn read-channel full at drain time.
+    pub rx_chan_dropped: u64,
+    /// Subset of `dropped_rx`: `udp::Socket::process` dropped the
+    /// datagram on a full rx buffer — the hypothesis-B drop point.
+    pub rx_sockbuf_dropped: u64,
+    /// Drain-time samples that found a socket rx buffer within one
+    /// max-size datagram of capacity — the always-on saturation
+    /// corroboration for `rx_sockbuf_dropped`.
+    pub rx_buf_full_obs: u64,
+    /// Peak socket rx payload occupancy (`recv_queue()`) at a drain.
+    pub rx_occ_max: usize,
+    /// Peak `ChannelDevice::rx_queue` depth at the offer scan.
+    pub rx_queue_max: usize,
+    /// Subset of `dropped_tx`: `send_slice` refused — `BufferFull`,
+    /// or `!can_send()` with queued datagrams (same condition).
+    pub tx_buf_full: u64,
+    /// Subset of `dropped_tx`: `send_slice` terminal-error drops.
+    pub tx_err_dropped: u64,
+    /// `rx_queue` UDP datagrams bound for no bound socket — sanity
+    /// check on the offer scan's port attribution.
+    pub rx_udp_unclaimed: u64,
+    /// Passes a TCP socket had queued `Data` while `!can_send()` —
+    /// the send-side stall signature (tx-buffer-full or
+    /// remote-window-0).
+    pub tcp_tx_stall: u64,
+    /// Wire datagrams dropped at endpoint egress (`flush_outbox`'s
+    /// non-`WouldBlock` errno arm and the dead-conn `outbox.clear()`).
+    pub outbox_dropped: u64,
+}
+
+/// The destination port an inner packet's UDP header carries — `pkt`
+/// is a bare IPv4/IPv6 datagram (the `ChannelDevice` queue shape).
+/// `None` for non-UDP, truncated, non-first-fragment, or v6
+/// extension-header packets (ext-header traversal is deliberately not
+/// done — tunnel UDP flows never carry them, and a miss only
+/// under-counts the scan, never miscounts it).
+pub fn udp_dst_port(pkt: &[u8]) -> Option<u16> {
+    match *pkt.first()? >> 4 {
+        4 => {
+            let ihl = usize::from(pkt[0] & 0x0f) * 4;
+            if ihl < 20 || pkt.len() < ihl + 4 || pkt[9] != 17 {
+                return None;
+            }
+            // Non-first fragments carry no port fields.
+            if u16::from_be_bytes([pkt[6], pkt[7]]) & 0x1fff != 0 {
+                return None;
+            }
+            Some(u16::from_be_bytes([pkt[ihl + 2], pkt[ihl + 3]]))
+        }
+        6 => {
+            // Fixed 40-byte header; `next_header` at [6], no ext walk.
+            if pkt.len() < 44 || pkt[6] != 17 {
+                return None;
+            }
+            Some(u16::from_be_bytes([pkt[42], pkt[43]]))
+        }
+        _ => None,
+    }
 }
 
 /// conn→actor TCP items.
@@ -1157,5 +1287,74 @@ mod tests {
                 other => panic!("expected TcpIo::Data, got {other:?}"),
             }
         }
+    }
+
+    // ── ITEM C1 instrumentation ─────────────────────────────────
+
+    /// `udp_dst_port` reads the port out of the same datagram shape
+    /// the offer scan sees on `rx_queue`: IPv4 with arbitrary IHL and
+    /// payload, IPv6 with a direct UDP next-header; everything else —
+    /// TCP, fragments, extension headers — parses as `None` (the
+    /// scan's "not for us" bucket, never a miscount).
+    #[test]
+    fn udp_dst_port_reads_v4_and_v6() {
+        // v4, IHL 5 — the `udp_datagram_v4` shape (dport 9).
+        assert_eq!(udp_dst_port(&udp_datagram_v4(40, 7)), Some(9));
+
+        // v4 with options (IHL 6) and a different port.
+        let mut p = vec![0u8; 24 + 8 + 4];
+        p[0] = 0x46; // IPv4, IHL 6
+        p[2..4].copy_from_slice(&(36u16).to_be_bytes());
+        p[9] = 17;
+        p[24..26].copy_from_slice(&1111u16.to_be_bytes());
+        p[26..28].copy_from_slice(&2222u16.to_be_bytes());
+        assert_eq!(udp_dst_port(&p), Some(2222));
+
+        // v4 non-UDP → None.
+        let mut tcp = udp_datagram_v4(40, 1).to_vec();
+        tcp[9] = 6;
+        assert_eq!(udp_dst_port(&tcp), None);
+
+        // v4 non-first fragment → None (ports live in fragment 0 only).
+        let mut frag = udp_datagram_v4(40, 1).to_vec();
+        frag[7] = 8; // fragment offset 64
+        assert_eq!(udp_dst_port(&frag), None);
+
+        // v6 direct UDP → port at the fixed offset.
+        let mut v6 = vec![0u8; 40 + 8 + 4];
+        v6[0] = 0x60;
+        v6[6] = 17;
+        v6[40..42].copy_from_slice(&53u16.to_be_bytes());
+        v6[42..44].copy_from_slice(&5353u16.to_be_bytes());
+        assert_eq!(udp_dst_port(&v6), Some(5353));
+
+        // v6 with an extension header → None (no ext traversal).
+        v6[6] = 0; // hop-by-hop
+        assert_eq!(udp_dst_port(&v6), None);
+
+        // Truncated/garbage → None.
+        assert_eq!(udp_dst_port(&[]), None);
+        assert_eq!(udp_dst_port(&[0x45, 0x00]), None);
+    }
+
+    /// The powers-of-two cadence itself: first hit always reports,
+    /// then only doublings — a counter crossing several powers in one
+    /// bump reports once, never skips.
+    #[test]
+    fn log_crossed_gates_first_hit_and_doublings() {
+        // First hit.
+        assert!(log_crossed(0, 1));
+        assert!(log_crossed(0, 5));
+        // Doublings.
+        assert!(log_crossed(1, 2));
+        assert!(log_crossed(3, 4));
+        assert!(log_crossed(7, 8));
+        // Non-crossings stay quiet.
+        assert!(!log_crossed(2, 3));
+        assert!(!log_crossed(8, 9));
+        assert!(!log_crossed(9, 15));
+        // One bump across several powers reports once.
+        assert!(log_crossed(15, 17));
+        assert!(log_crossed(1, 100));
     }
 }
