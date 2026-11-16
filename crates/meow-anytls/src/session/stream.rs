@@ -259,13 +259,15 @@ impl Stream {
     /// allocation.
     ///
     /// The `Option` slot stays the caller's staging area per the
-    /// `WriteBytes` contract: `Poll::Ready(Ok)` leaves it `None` (every
-    /// chunk was queued); `Poll::Pending` leaves the buffer untouched
-    /// for the caller to re-present — permit acquisition is
-    /// all-or-nothing BEFORE the slot is taken, so a re-presented slot
-    /// is always exactly the one the caller handed us (never a
-    /// mid-drain remainder, keeping the headroom check below
-    /// unambiguous across polls).
+    /// `WriteBytes` contract: `Poll::Ready(Ok)` leaves it `None` once
+    /// every chunk was queued — a slot needing more frames than the
+    /// whole writer budget instead leaves a `Some` remainder for
+    /// re-presentation (the continuation below re-prefixes it, so the
+    /// headroom check stays unambiguous); `Poll::Pending` leaves the
+    /// buffer untouched for the caller to re-present — permit
+    /// acquisition is all-or-nothing BEFORE the slot is taken, so a
+    /// re-presented slot is always either the caller's or that
+    /// fresh-prefixed remainder.
     ///
     /// Headroom contract: when the slot begins with
     /// `HEADER_OVERHEAD_SIZE` zero bytes — what a caller honouring

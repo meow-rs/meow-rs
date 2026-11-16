@@ -1081,7 +1081,7 @@ impl Session {
         // returns the OLD value, upstream `pktCounter.Add(1)` the new one.
         let pkt = self
             .pkt_counter
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
             + 1;
         let padding_factory = {
             let padding_guard = self.padding.read().await;

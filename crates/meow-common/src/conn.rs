@@ -18,12 +18,16 @@ use tokio::io::{AsyncRead, AsyncWrite};
 /// else keeps the `poll_write` slice.
 ///
 /// The `Option` slot is the *caller's* staging area, and the contract
-/// keeps the caller able to re-drive the poll: on `Poll::Ready(Ok)` the
-/// slot is `None` — the conn took the bytes (or an earlier poll already
-/// had them in flight); on `Poll::Pending` the slot stays `Some` — the
-/// conn accepted nothing, so the caller re-presents the same slot on the
-/// next poll. Ordering is the conn's: anything already stashed inside it
-/// (a prior `poll_write`'s parked item) drains ahead of the slot's bytes.
+/// keeps the caller able to re-drive the poll: on `Poll::Pending` the
+/// slot stays `Some` untouched — the conn accepted nothing, so the
+/// caller re-presents the same slot on the next poll. On
+/// `Poll::Ready(Ok)` the conn accepted the drained prefix: the slot is
+/// `None` when everything moved, or still `Some` — holding the
+/// unaccepted remainder, still led by the reserved headroom — when only
+/// part did, and the caller re-presents it the same way (progress is
+/// the slot's shrinkage). Ordering is the conn's: anything already
+/// stashed inside it (a prior `poll_write`'s parked item) drains ahead
+/// of the slot's bytes.
 ///
 /// The slot is `BytesMut` (not `Bytes`) so a writer with
 /// [`want_write_headroom`](Self::want_write_headroom) `> 0` can write its

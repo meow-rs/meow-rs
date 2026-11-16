@@ -444,7 +444,16 @@ impl<'buf> HalfCopy<'buf> {
                         ));
                     };
                     match Pin::new(wb).poll_write_bytes(cx, pending) {
-                        Poll::Ready(Ok(())) => Poll::Ready(Ok(n)),
+                        // `Ready` may leave an unaccepted remainder in
+                        // the slot (AnyTLS's >`QUEUED_FRAMES` fill
+                        // continuation): progress is the payload the
+                        // writer actually took; the `while` re-drives
+                        // the rest.
+                        Poll::Ready(Ok(())) => Poll::Ready(Ok(n.saturating_sub(
+                            pending
+                                .as_ref()
+                                .map_or(0, |p| p.len().saturating_sub(*headroom)),
+                        ))),
                         Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
                         Poll::Pending => Poll::Pending,
                     }
