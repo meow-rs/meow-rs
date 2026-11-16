@@ -333,6 +333,7 @@ fn adapter(port: u16, obfs: Option<Hy2Obfs>) -> Hy2Adapter {
             fingerprint: None,
             fast_open: true,
             windows: Default::default(),
+            quic_connections: None,
         },
         None,
     )

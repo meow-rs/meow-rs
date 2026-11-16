@@ -77,6 +77,8 @@ pub mod hysteria2_adapter;
 #[cfg(feature = "hysteria2")]
 pub use hysteria2::ReceiveWindows as Hy2ReceiveWindows;
 #[cfg(feature = "hysteria2")]
+pub use hysteria2::{DEFAULT_QUIC_CONNECTIONS, MAX_QUIC_CONNECTIONS};
+#[cfg(feature = "hysteria2")]
 pub use hysteria2_adapter::{Hy2Adapter, Hy2HopInterval, Hy2Obfs, Hy2Options};
 /// WireGuard outbound (`type: wireguard`), userspace boringtun + smoltcp —
 /// opt-in feature `wireguard` (issue #899 Phase-1).

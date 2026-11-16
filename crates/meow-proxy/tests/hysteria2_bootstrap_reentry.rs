@@ -56,6 +56,7 @@ async fn pooled_endpoint_resolution_can_reenter_before_connect_lock() {
                 fingerprint: None,
                 fast_open: false,
                 windows: Default::default(),
+                quic_connections: None,
             },
             None,
         )

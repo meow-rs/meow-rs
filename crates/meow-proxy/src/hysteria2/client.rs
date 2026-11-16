@@ -1,6 +1,9 @@
-//! `ReconnectableClient`: the public entry point. Owns the current connection
-//! handle (a spawned quiche driver) and lazily (re)connects on demand, then
-//! opens proxied TCP streams and UDP sessions through it.
+//! `ReconnectableClient`: the public entry point. Owns a pool of `K`
+//! connection handles (each a spawned quiche driver) and lazily (re)connects
+//! every slot on demand, then round-robins proxied TCP streams and UDP
+//! sessions across the live slots. A stream or session rides the connection
+//! it was opened on for its whole lifetime: pooling widens aggregate
+//! throughput across flows — a single flow still gets one connection.
 
 use super::config::Config;
 use super::driver::{self, Cmd, ConnHandle, DriverSocket};
@@ -13,7 +16,7 @@ use meow_common::atomic::{AtomicU, Uint};
 use meow_common::ProxyPacketConn;
 use meow_transport::datagram::SocketIo;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{oneshot, Mutex};
 use tokio::time::{timeout, Duration};
@@ -21,48 +24,74 @@ use tracing::warn;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Pool width when `quic-connections` is unset: two connections double
+/// the per-driver crypto throughput a single connection caps at (each
+/// driver serializes quiche recv/send on its own task).
+pub const DEFAULT_QUIC_CONNECTIONS: usize = 2;
+/// Hard ceiling for `quic-connections`; the parser warns past 4 — extra
+/// driver tasks and dial cost rarely pay off — and clamps to this bound.
+pub const MAX_QUIC_CONNECTIONS: usize = 8;
+
 /// How the client's QUIC connection reaches the server.
 enum Connect {
     /// Direct: local DNS + a bound `UdpSocket` per attempt (the default).
     Raw,
-    /// `dialer-proxy`: the QUIC connection rides a single front UDP
-    /// association. Every (re)connect must `dial_udp_conn` again — a dead
-    /// `PacketConnSocket` can never be handed a second connection, so the
-    /// dialer is stored here and consulted inside `handle()`.
+    /// `dialer-proxy`: each slot's QUIC connection rides a front UDP
+    /// association of its own. Every (re)connect must `dial_udp_conn`
+    /// again — a dead `PacketConnSocket` can never be handed a second
+    /// connection, so the dialer is stored here and consulted inside
+    /// `slot_handle()`.
     Dialer(Arc<dyn TcpDialer>),
 }
+
+/// One pool slot: the cached connection and the
+/// [`generation`](ReconnectableClient::generation) it was established
+/// under — the per-slot copy of the old single `conn` cell. `None`
+/// means lazy: the slot dials on its next selection.
+type Slot = Mutex<Option<(Arc<ConnHandle>, Uint)>>;
 
 pub struct ReconnectableClient {
     cfg: Arc<Config>,
     connect: Connect,
-    /// The cached connection and the [`generation`](Self::generation) it
-    /// was established under.
-    conn: Mutex<Option<(Arc<ConnHandle>, Uint)>>,
+    /// The connection pool — see [`Slot`]. A slot connects lazily on its
+    /// first selection; a slot whose dial fails stays `None` until its
+    /// next turn.
+    slots: Box<[Slot]>,
     /// Bumped by [`reset`](Self::reset); a connection from an older
-    /// generation is never handed out again. Compared for equality only, so
-    /// the mips32 `u32` wrap is harmless.
+    /// generation is never handed out again — on any slot. Compared for
+    /// equality only, so the mips32 `u32` wrap is harmless.
     generation: AtomicU,
+    /// Round-robin cursor: each [`handle`](Self::handle) claim starts its
+    /// scan at `next_slot % slots.len()` and advances it, so consecutive
+    /// dials land on different QUIC connections.
+    next_slot: AtomicUsize,
 }
 
 impl ReconnectableClient {
-    pub fn new(cfg: Config) -> Self {
-        Self {
-            cfg: Arc::new(cfg),
-            connect: Connect::Raw,
-            conn: Mutex::new(None),
-            generation: AtomicU::new(0),
-        }
+    /// `connections` is the pool width (`quic-connections`): 1 reproduces
+    /// the legacy behaviour — every stream and UDP session multiplexes on
+    /// one QUIC connection.
+    pub fn new(cfg: Config, connections: usize) -> Self {
+        Self::with_connect(cfg, Connect::Raw, connections)
     }
 
     /// A client whose QUIC datagrams ride the `dialer-proxy` front's UDP
     /// association instead of a bound `UdpSocket` (issue #899 follow-up —
-    /// the WireGuard `with_dialer` contract).
-    pub fn with_dialer(cfg: Config, dialer: Arc<dyn TcpDialer>) -> Self {
+    /// the WireGuard `with_dialer` contract). Every slot dials its own
+    /// association — a bound `PacketConnSocket` can never serve a second
+    /// connection.
+    pub fn with_dialer(cfg: Config, dialer: Arc<dyn TcpDialer>, connections: usize) -> Self {
+        Self::with_connect(cfg, Connect::Dialer(dialer), connections)
+    }
+
+    fn with_connect(cfg: Config, connect: Connect, connections: usize) -> Self {
+        let connections = connections.clamp(1, MAX_QUIC_CONNECTIONS);
         Self {
             cfg: Arc::new(cfg),
-            connect: Connect::Dialer(dialer),
-            conn: Mutex::new(None),
+            connect,
+            slots: (0..connections).map(|_| Mutex::new(None)).collect(),
             generation: AtomicU::new(0),
+            next_slot: AtomicUsize::new(0),
         }
     }
 
@@ -70,35 +99,45 @@ impl ReconnectableClient {
         self.generation.load(Ordering::SeqCst)
     }
 
-    /// Drop the cached QUIC connection so the next dial reconnects on a
+    /// Drop every cached QUIC connection so the next dial reconnects on a
     /// fresh UDP socket. Called when the outbound-interface binding changes
-    /// (issue #695): the cached connection's socket may predate the binding.
+    /// (issue #695): the cached connections' sockets may predate the binding.
     ///
-    /// The cache holds the only long-lived `Arc<ConnHandle>` (streams and
-    /// UDP sessions hold just the command channel), so dropping it aborts
-    /// the driver: in-flight streams fail with `ConnectionReset` and UDP
-    /// sessions with `Closed`. Non-blocking: the cache lock is held across a
-    /// connect, so when it is contended the drop is deferred to a task, and
-    /// a connect that straddles the reset is discarded and redialled.
+    /// The slots hold the only long-lived `Arc<ConnHandle>`s (streams and
+    /// UDP sessions hold just the command channel), so dropping them aborts
+    /// the drivers: in-flight streams fail with `ConnectionReset` and UDP
+    /// sessions with `Closed`. Non-blocking: each slot lock is held across
+    /// a connect, so when any is contended the drop is deferred to a task,
+    /// and a connect that straddles the reset is discarded and redialled.
     /// Returns whether a connection was dropped synchronously.
     pub fn reset(self: &Arc<Self>) -> bool {
         self.generation.fetch_add(1, Ordering::SeqCst);
-        if let Ok(mut guard) = self.conn.try_lock() {
-            return guard.take().is_some();
+        let mut dropped = false;
+        let mut contended = false;
+        for slot in &self.slots {
+            match slot.try_lock() {
+                Ok(mut guard) => dropped |= guard.take().is_some(),
+                Err(_) => contended = true,
+            }
+        }
+        if !contended {
+            return dropped;
         }
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             let client = Arc::clone(self);
             runtime.spawn(async move {
-                let mut guard = client.conn.lock().await;
-                if guard
-                    .as_ref()
-                    .is_some_and(|(_, generation)| *generation != client.generation())
-                {
-                    guard.take();
+                for slot in &client.slots {
+                    let mut guard = slot.lock().await;
+                    if guard
+                        .as_ref()
+                        .is_some_and(|(_, generation)| *generation != client.generation())
+                    {
+                        guard.take();
+                    }
                 }
             });
         }
-        false
+        dropped
     }
 
     pub async fn tcp_connect(&self, target: &str) -> Result<DuplexStream> {
@@ -138,11 +177,38 @@ impl ReconnectableClient {
         Ok(UdpSession::new(session_id, handle.cmd_tx.clone(), rx))
     }
 
+    /// Round-robin over the pool and hand out the claimed slot's live
+    /// connection, dialing the slot first when it is empty or dead. A
+    /// slot whose dial fails is left empty — `None` means "lazy" — and
+    /// the scan falls through to the next slot (the spec's graceful
+    /// degradation); an error surfaces only when every slot failed, the
+    /// old single-connection failure shape. Each dial therefore carries
+    /// at most `CONNECT_TIMEOUT`, bounded by the pool width.
     async fn handle(&self) -> Result<Arc<ConnHandle>> {
+        let num_slots = self.slots.len();
+        let start = self.next_slot.fetch_add(1, Ordering::Relaxed) % num_slots;
+        let mut last_error = None;
+        for offset in 0..num_slots {
+            let idx = (start + offset) % num_slots;
+            match self.slot_handle(idx).await {
+                Ok(handle) => return Ok(handle),
+                Err(e) => {
+                    warn!("hysteria2: connection slot {idx}/{num_slots} failed: {e}");
+                    last_error = remember(last_error, e);
+                }
+            }
+        }
+        Err(last_error.unwrap_or(Error::Closed))
+    }
+
+    /// Slot `idx`'s cached connection, reconnecting it when absent,
+    /// stale-generation or dead — the old `handle()` body, scoped to one
+    /// slot so its connect lock serializes only this slot's dial.
+    async fn slot_handle(&self, idx: usize) -> Result<Arc<ConnHandle>> {
         for _ in 0..2 {
             let generation;
             {
-                let mut guard = self.conn.lock().await;
+                let mut guard = self.slots[idx].lock().await;
                 generation = self.generation();
                 if let Some((handle, cached_generation)) = guard.as_ref() {
                     if *cached_generation == generation && handle.is_active() {
@@ -154,11 +220,11 @@ impl ReconnectableClient {
             }
             // Endpoint DNS may itself dial this pool — and the
             // `dialer-proxy` arm's `dial_udp_conn` re-enters the registry
-            // and the host resolver. Do not hold this client's connect lock
+            // and the host resolver. Do not hold this slot's connect lock
             // until the outbound step has completed: a nested lookup needs
             // to reach the existing host-resolver reentry fence first.
             let prepared = self.prepare().await;
-            let mut guard = self.conn.lock().await;
+            let mut guard = self.slots[idx].lock().await;
             if self.generation() != generation {
                 continue;
             }
@@ -209,6 +275,22 @@ impl ReconnectableClient {
                 Prepared::Dialer(result.await)
             }
         }
+    }
+}
+
+#[cfg(test)]
+impl ReconnectableClient {
+    /// Whether slot `idx` currently caches a connection (live or dead —
+    /// a dead one is replaced on its next selection).
+    pub(crate) async fn slot_live(&self, idx: usize) -> bool {
+        self.slots[idx].lock().await.is_some()
+    }
+
+    /// Drop slot `idx`'s cached connection: the pool-side equivalent of
+    /// the connection dying — the driver is aborted and the slot goes
+    /// back to lazy.
+    pub(crate) async fn drop_slot(&self, idx: usize) {
+        self.slots[idx].lock().await.take();
     }
 }
 

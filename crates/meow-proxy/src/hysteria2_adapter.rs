@@ -57,6 +57,12 @@ pub struct Hy2Options {
     pub fingerprint: Option<String>,
     pub fast_open: bool,
     pub windows: crate::hysteria2::ReceiveWindows,
+    /// `quic-connections`: the K-way QUIC connection-pool width. `None`
+    /// resolves to [`crate::hysteria2::DEFAULT_QUIC_CONNECTIONS`]; any
+    /// value clamps to `1..=`[`crate::hysteria2::MAX_QUIC_CONNECTIONS`]
+    /// (the parser already warns past 4). Widens aggregate throughput
+    /// across flows — a single stream still rides one connection.
+    pub quic_connections: Option<usize>,
 }
 
 impl Hy2Options {
@@ -159,10 +165,16 @@ impl Hy2Adapter {
             );
         }
         let name = options.name.clone();
+        let quic_connections = options
+            .quic_connections
+            .unwrap_or(crate::hysteria2::DEFAULT_QUIC_CONNECTIONS)
+            .clamp(1, crate::hysteria2::MAX_QUIC_CONNECTIONS);
         let (addr, support_udp, cfg) = options.into_hysteria_config()?;
         let client = match dialer.filter(|d| d.is_proxy()) {
-            Some(dialer) => crate::hysteria2::ReconnectableClient::with_dialer(cfg, dialer),
-            None => crate::hysteria2::ReconnectableClient::new(cfg),
+            Some(dialer) => {
+                crate::hysteria2::ReconnectableClient::with_dialer(cfg, dialer, quic_connections)
+            }
+            None => crate::hysteria2::ReconnectableClient::new(cfg, quic_connections),
         };
         Ok(Self {
             name: SmolStr::from(name),
@@ -510,6 +522,7 @@ mod tests {
             fingerprint: None,
             fast_open: true,
             windows: Default::default(),
+            quic_connections: None,
         }
     }
 

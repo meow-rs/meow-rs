@@ -1077,7 +1077,7 @@ fn parse_http(
         (Some(u), Some(p)) => Some((u.to_string(), p.to_string())),
         (None, None) => None,
         _ => {
-            return Err("http: both 'username' and 'password' must be set, or neither".to_string())
+            return Err("http: both 'username' and 'password' must be set, or neither".to_string());
         }
     };
 
@@ -1150,7 +1150,7 @@ fn parse_socks5(
         _ => {
             return Err(
                 "socks5: both 'username' and 'password' must be set, or neither".to_string(),
-            )
+            );
         }
     };
 
@@ -1468,7 +1468,10 @@ fn parse_trusttunnel(
             .map_err(|e| format!("trusttunnel: {e}"))?;
     options.health_check = boolean("health-check", false)?;
     if options.health_check {
-        tracing::warn!(name, "trusttunnel: mihomo performs idle health checks; this client currently checks only new sessions");
+        tracing::warn!(
+            name,
+            "trusttunnel: mihomo performs idle health checks; this client currently checks only new sessions"
+        );
     }
     #[cfg(feature = "trusttunnel-h3")]
     let transport = if quic {
@@ -1626,8 +1629,9 @@ fn reject_unsupported_anytls_options(
 /// backend: `up`, `down`, `obfs: salamander | gecko`, `obfs-password`,
 /// `obfs-min-packet-size` / `obfs-max-packet-size` (gecko only), `ports`,
 /// `hop-interval`, `sni`, `skip-cert-verify`, `fingerprint`, `udp`,
-/// `fast-open`, and the four `*-receive-window` keys (bytes; `0`/absent
-/// is unset — a present non-integer value is a hard error).
+/// `fast-open`, the four `*-receive-window` keys (bytes; `0`/absent
+/// is unset — a present non-integer value is a hard error), and
+/// `quic-connections` — a meow-rs extension with no mihomo equivalent.
 ///
 /// # Hard errors (Class A per ADR-0002)
 ///
@@ -1716,6 +1720,7 @@ fn parse_hysteria2(
         initial_conn: window("initial-connection-receive-window")?,
         max_conn: window("max-connection-receive-window")?,
     };
+    let quic_connections = parse_hy2_quic_connections(name, config.get("quic-connections"))?;
 
     meow_proxy::Hy2Adapter::new(
         Hy2Options {
@@ -1736,9 +1741,47 @@ fn parse_hysteria2(
             fingerprint,
             fast_open,
             windows,
+            quic_connections,
         },
         Some(Arc::clone(dialer)),
     )
+}
+
+/// `quic-connections` (performance spec ITEM A): the K-way QUIC
+/// connection-pool width — `K` independent connections, each with its own
+/// quiche driver task, round-robin new streams and UDP sessions. Absent
+/// resolves to [`meow_proxy::DEFAULT_QUIC_CONNECTIONS`]; a present
+/// non-integer is a hard error. The value clamps to
+/// `1..=`[`meow_proxy::MAX_QUIC_CONNECTIONS`], warning when the clamp
+/// bites or above 4 — extra driver tasks rarely pay off past that.
+///
+/// Constraint worth repeating at the config surface: a single flow still
+/// rides one connection — this widens *aggregate* throughput only.
+#[cfg(feature = "hysteria2")]
+fn parse_hy2_quic_connections(
+    name: &str,
+    value: Option<&serde_json::Value>,
+) -> std::result::Result<Option<usize>, String> {
+    let Some(value) = value.filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    let n = value.as_u64().ok_or_else(|| {
+        format!("hysteria2[{name}]: 'quic-connections' must be an unsigned integer")
+    })?;
+    let n = usize::try_from(n).unwrap_or(usize::MAX);
+    let clamped = n.clamp(1, meow_proxy::MAX_QUIC_CONNECTIONS);
+    if clamped != n {
+        tracing::warn!(
+            "hysteria2[{name}]: 'quic-connections' {n} out of range, clamped to {clamped}"
+        );
+    }
+    if clamped > 4 {
+        tracing::warn!(
+            "hysteria2[{name}]: 'quic-connections' {clamped} exceeds 4 — each connection \
+             costs a driver task; larger pools rarely add aggregate throughput"
+        );
+    }
+    Ok(Some(clamped))
 }
 
 #[cfg(feature = "hysteria2")]
@@ -2263,14 +2306,14 @@ fn parse_wireguard(
         None => None,
         Some(std::net::IpAddr::V4(a)) => Some(a),
         Some(std::net::IpAddr::V6(_)) => {
-            return Err(format!("wireguard[{name}]: 'ip' must be IPv4"))
+            return Err(format!("wireguard[{name}]: 'ip' must be IPv4"));
         }
     };
     let ipv6: Option<Ipv6Addr> = match parse_tunnel_addr("ipv6")? {
         None => None,
         Some(std::net::IpAddr::V6(a)) => Some(a),
         Some(std::net::IpAddr::V4(_)) => {
-            return Err(format!("wireguard[{name}]: 'ipv6' must be IPv6"))
+            return Err(format!("wireguard[{name}]: 'ipv6' must be IPv6"));
         }
     };
 
@@ -2307,7 +2350,7 @@ fn parse_wireguard(
         Some(_) => {
             return Err(format!(
                 "wireguard[{name}]: 'dns' must be a nameserver string or list"
-            ))
+            ));
         }
     };
     if dns_present {
@@ -2336,13 +2379,13 @@ fn parse_wireguard(
                     "wireguard[{name}]: 'ip-stack' \"{other}\" is not supported — \
                      this build runs the smoltcp userspace stack \
                      (accepted: \"gvisor\", \"system\")"
-                ))
+                ));
             }
         },
         Some(_) => {
             return Err(format!(
                 "wireguard[{name}]: 'ip-stack' must be \"gvisor\" or \"system\""
-            ))
+            ));
         }
     }
 
@@ -3014,7 +3057,7 @@ fn parse_mux_options(
         Some(other) => {
             return Err(format!(
                 "{name}: mux option 'protocol' must be a string, got {other:?}"
-            ))
+            ));
         }
     };
     let Some(protocol) = meow_proxy::mux::Protocol::parse(protocol_str) else {
@@ -5223,6 +5266,49 @@ tls: true
             "name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\nport: 443\npassword: secret\n",
         );
         assert!(parse_proxy(&cfg).is_ok());
+    }
+
+    /// `quic-connections` — the K-way pool knob (spec ITEM A): absent is
+    /// `None` (adapter default), a present integer clamps to 1..=8, a
+    /// non-integer is a hard error like the window fields.
+    #[cfg(feature = "hysteria2")]
+    #[test]
+    fn parse_hysteria2_quic_connections() {
+        use serde_json::json;
+
+        let parse = |value: serde_json::Value| parse_hy2_quic_connections("t", Some(&value));
+        assert_eq!(parse(json!(1)).unwrap(), Some(1));
+        assert_eq!(parse(json!(4)).unwrap(), Some(4));
+        assert_eq!(parse(json!(8)).unwrap(), Some(8));
+        assert_eq!(
+            parse(json!(0)).unwrap(),
+            Some(1),
+            "0 clamps up to the pool floor"
+        );
+        assert_eq!(
+            parse(json!(42)).unwrap(),
+            Some(meow_proxy::MAX_QUIC_CONNECTIONS),
+            "past the ceiling clamps down"
+        );
+        assert!(parse(json!("two")).is_err(), "non-integer is a hard error");
+        assert_eq!(
+            parse_hy2_quic_connections("t", None).unwrap(),
+            None,
+            "absent stays unset for the adapter default"
+        );
+
+        // End to end through the proxy block.
+        let cfg = hy2_config(
+            "name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\nport: 443\npassword: secret\nquic-connections: 3\n",
+        );
+        assert!(parse_proxy(&cfg).is_ok());
+        let cfg = hy2_config(
+            "name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\nport: 443\npassword: secret\nquic-connections: two\n",
+        );
+        let Err(err) = parse_proxy(&cfg) else {
+            panic!("a non-integer quic-connections must not be ignored");
+        };
+        assert!(err.contains("quic-connections"), "msg: {err}");
     }
 
     #[cfg(feature = "hysteria2")]
