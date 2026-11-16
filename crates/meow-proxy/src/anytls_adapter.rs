@@ -959,7 +959,6 @@ mod tests {
     use super::*;
     use crate::uot::UOT_ATYP_IPV4;
     use anytls_rs::protocol::{Command, HEADER_OVERHEAD_SIZE};
-    use bytes::BufMut;
     use meow_common::Network;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
