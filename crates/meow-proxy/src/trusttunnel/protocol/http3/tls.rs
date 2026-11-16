@@ -21,6 +21,10 @@ const CONN_RECEIVE_WINDOW: u64 = 16 * 1024 * 1024;
 /// server initiate a request, so this only needs to be non-zero; the uni
 /// allowance has to cover HTTP/3's own control and QPACK streams.
 const PEER_STREAMS: u64 = 16;
+/// quic-go's ceiling (1500 − IPv6 40 − UDP 8); PMTUD finds the path's.
+/// Same constant the hysteria2 client applies — a `dialer-proxy` front's
+/// `mtu_hint` clamps it further per connection.
+pub(super) const MAX_SEND_UDP_PAYLOAD: usize = 1452;
 
 /// Build the client QUIC config for one TrustTunnel endpoint.
 ///
@@ -98,5 +102,18 @@ pub(super) fn build(
     // HTTP/3 should not advertise a transport parameter no browser sends,
     // and the protocol carries UDP on streams, so DATAGRAM frames would be
     // a capability nothing in this client ever uses.
+    // Never a loss-driven CC — the hysteria2 driver learned this the same
+    // way: a `dialer-proxy` front's bounded send queue tail-drops under
+    // load, and quiche's default CUBIC reads each drop as congestion and
+    // collapses its window on a policer's decision rather than the
+    // path's. BBRv2 paces through it.
+    config.set_cc_algorithm(quiche::CongestionControlAlgorithm::Bbr2Gcongestion);
+    // quiche sends 1200-byte packets by default; quic-go grows to 1452
+    // with DPLPMTUD. Do the same, probing so a smaller path MTU (PPPoE +
+    // IPv6, or a front proxy's per-packet overhead — the `mtu_hint`
+    // clamp in `QuicConnector::dial` re-caps this ceiling) is found
+    // rather than black-holed.
+    config.set_max_send_udp_payload_size(MAX_SEND_UDP_PAYLOAD);
+    config.discover_pmtu(true);
     Ok(config)
 }

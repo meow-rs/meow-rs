@@ -257,7 +257,8 @@ impl QuicConnector {
             )
             .map_err(|e| io::Error::other(format!("TrustTunnel QUIC setup: {e}")))?
         };
-        let (cmd_tx, shared) = driver::spawn(socket, local, conn, cancel).await?;
+        let (cmd_tx, shared) =
+            driver::spawn(socket, local, conn, driver::AckCoalesce::default(), cancel).await?;
         Ok(Box::new(H3Connection { cmd_tx, shared }))
     }
 }
