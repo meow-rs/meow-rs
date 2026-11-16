@@ -1283,9 +1283,7 @@ mod tests {
     async fn write_bytes_pending_preserves_ordering() {
         let (tx, mut rx) = mpsc::channel::<TcpIo>(2);
         let mut stream = test_stream(tx);
-        let msgs: Vec<BytesMut> = (0..4u8)
-            .map(|i| BytesMut::from(&vec![i; 16][..]))
-            .collect();
+        let msgs: Vec<BytesMut> = (0..4u8).map(|i| BytesMut::from(&vec![i; 16][..])).collect();
 
         // Fill the channel to capacity.
         for m in &msgs[..2] {

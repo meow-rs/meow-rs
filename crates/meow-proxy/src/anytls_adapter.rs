@@ -22,7 +22,7 @@ use anytls_rs::padding::PaddingFactory;
 use anytls_rs::session::{Session, Stream as AnytlsStream};
 use anytls_rs::{AsyncStream, SyncStream, TlsConnect, TlsConnectFuture};
 use async_trait::async_trait;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use meow_transport::tls::{TlsConfig, TlsLayer};
 use meow_transport::Transport as _;
 use parking_lot::Mutex;
@@ -494,16 +494,23 @@ impl AsyncRead for AnytlsConn {
     }
 }
 
-/// The relay's owned-`Bytes` write path: the frozen `BytesMut` region
-/// moves into the anytls frame payload via `split_to` — the
-/// `copy_from_slice` `poll_write` would pay is gone on this direction.
+/// The relay's owned-buffer write path: the `BytesMut` region moves into
+/// the anytls frame payload via `split_to` — the `copy_from_slice`
+/// `poll_write` would pay is gone on this direction. The conn declares
+/// the frame's headroom want so the relay leads every fill with the
+/// 7-byte reserved prefix the stream overlays its header into: one fill
+/// becomes one contiguous wire frame.
 impl WriteBytes for AnytlsConn {
     fn poll_write_bytes(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        bytes: &mut Option<Bytes>,
+        bytes: &mut Option<BytesMut>,
     ) -> Poll<io::Result<()>> {
         self.stream.poll_write_bytes_data(cx, bytes)
+    }
+
+    fn want_write_headroom(&self) -> usize {
+        self.stream.want_write_headroom()
     }
 }
 

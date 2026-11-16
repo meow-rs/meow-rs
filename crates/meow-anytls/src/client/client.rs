@@ -193,15 +193,23 @@ impl Client {
             stream_id
         );
 
-        // Disable buffering before writing first data frame
-        // This is critical: in Go version, buffering is disabled when proxy writes SocksAddr
-        // This ensures buffered Settings frame is flushed along with the first data
-        session.disable_buffering();
-        tracing::debug!("[Client] Buffering disabled, buffer will be flushed");
-
+        // Queue the address bytes while `buffering` still holds, then a
+        // Flush marker immediately behind them in the session FIFO — the
+        // queue-ordered form of upstream's `buffering = false` after the
+        // address write. The marker, not a plain `disable_buffering()`
+        // here, is what pins the atomic image: while the flag holds, the
+        // session writer accumulates [Settings+SYN+addr] without touching
+        // the wire, and the marker's drain clears the flag inside the
+        // batch so the whole image goes out as ONE padded packet —
+        // independent of how drains interleaved. The eager payload
+        // (below) queues behind the marker and rides the same batch.
         session
             .enqueue_data_frame(stream_id, Bytes::from(addr_bytes))
             .await?;
+
+        // Fire-and-forget barrier: the marker's own waiter resolves when
+        // the batch is written; the open needs only its FIFO position.
+        session.enqueue_flush_marker()?;
 
         tracing::debug!(
             "[Client] Successfully queued destination address for stream {}",
@@ -620,6 +628,17 @@ mod tests {
         // permits.
         let (tls_half, mut peer) = tokio::io::duplex(160);
         let session = client.session_over_transport(tls_half).await.unwrap();
+
+        // While `buffering` holds, classified frames fold into the
+        // session buffer without a wire write — the queue drains freely
+        // and its permits release at once, so the budget can never
+        // saturate. Queue the same flush marker a real open gets (a
+        // bare `disable_buffering` would also work, but the FIFO path is
+        // what production uses). Fire-and-forget: the marker's batch
+        // stalls on the small pipe mid-Settings-write, so its barrier
+        // never resolves — what matters is that classification disables
+        // buffering before any later-enqueued data frame is classified.
+        session.enqueue_flush_marker().unwrap();
 
         // One queued frame holds one budget permit; queueing while the
         // stalled write releases none empties the budget, so the next

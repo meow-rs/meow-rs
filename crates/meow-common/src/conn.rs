@@ -1,19 +1,21 @@
 use crate::error::Result;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite};
 
-/// An owned-`Bytes` write path for a connection whose downstream carries
+/// An owned-buffer write path for a connection whose downstream carries
 /// `Bytes` buffers end to end — the channel-backed userspace streams
 /// (WireGuard's `WgStream`) whose actor hands each item to a smoltcp
-/// socket. The relay prefers this over `AsyncWrite::poll_write` when the
-/// writer exposes it: the relay's frozen `BytesMut` region moves into the
-/// conn with no `copy_from_slice`. A capability interface in the spirit
-/// of [`ProxyConn::tcp_stream`]: implemented only where the path is
-/// genuinely zero-copy; everything else keeps the `poll_write` slice.
+/// socket, and frame-multiplexed writers (AnyTLS) whose 7-byte frame
+/// header can overlay reserved headroom in place. The relay prefers this
+/// over `AsyncWrite::poll_write` when the writer exposes it: the relay's
+/// `BytesMut` region moves into the conn with no `copy_from_slice`. A
+/// capability interface in the spirit of [`ProxyConn::tcp_stream`]:
+/// implemented only where the path is genuinely zero-copy; everything
+/// else keeps the `poll_write` slice.
 ///
 /// The `Option` slot is the *caller's* staging area, and the contract
 /// keeps the caller able to re-drive the poll: on `Poll::Ready(Ok)` the
@@ -22,12 +24,29 @@ use tokio::io::{AsyncRead, AsyncWrite};
 /// conn accepted nothing, so the caller re-presents the same slot on the
 /// next poll. Ordering is the conn's: anything already stashed inside it
 /// (a prior `poll_write`'s parked item) drains ahead of the slot's bytes.
+///
+/// The slot is `BytesMut` (not `Bytes`) so a writer with
+/// [`want_write_headroom`](Self::want_write_headroom) `> 0` can write its
+/// framing into the prefix the caller reserved: callers presenting a
+/// slot to such a writer MUST begin it with that many bytes — the writer
+/// treats the region as its own scratch (AnyTLS overlays the frame
+/// header there, turning one relay fill into one contiguous wire frame).
+/// A writer reporting `0` receives payload from byte 0, as before.
 pub trait WriteBytes: Unpin {
     fn poll_write_bytes(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        bytes: &mut Option<Bytes>,
+        bytes: &mut Option<BytesMut>,
     ) -> Poll<std::io::Result<()>>;
+
+    /// Byte count the caller must reserve at the front of each
+    /// `poll_write_bytes` slot for this writer's own framing. `0` (the
+    /// default) means the writer takes payload-only buffers; writers that
+    /// cannot use headroom (e.g. `WgStream`, which ships bytes to a
+    /// channel) keep it explicitly.
+    fn want_write_headroom(&self) -> usize {
+        0
+    }
 }
 
 pub trait ProxyConn: AsyncRead + AsyncWrite + Unpin + Send + Sync {

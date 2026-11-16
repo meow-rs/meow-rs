@@ -316,6 +316,11 @@ impl Session {
         let mut iteration = 0u64;
         let mut total_bytes_in: usize = 0;
 
+        // The reader mutex exists for the loop's exclusive `&mut` read
+        // access, but nothing else ever locks it — one acquire for the
+        // loop's lifetime instead of a lock/unlock pair per read.
+        let mut reader = self.reader.lock().await;
+
         loop {
             iteration += 1;
             if self.is_closed() {
@@ -336,28 +341,8 @@ impl Session {
                 buffer.reserve(8192);
             }
 
-            // Read data from connection
-            tracing::trace!(
-                session_id = session_id,
-                "[Session] recv_loop: Acquiring reader lock (iteration {})",
-                iteration
-            );
-            let mut reader = self.reader.lock().await;
-            tracing::trace!(
-                session_id = session_id,
-                "[Session] recv_loop: Reader lock acquired, calling read_buf (iteration {})",
-                iteration
-            );
             let n = match reader.read_buf(&mut buffer).await {
-                Ok(n) => {
-                    tracing::trace!(
-                        session_id = session_id,
-                        "[Session] recv_loop: read_buf returned {} bytes (iteration {})",
-                        n,
-                        iteration
-                    );
-                    n
-                }
+                Ok(n) => n,
                 Err(e) => {
                     // Check if this is a "close_notify" error (common and harmless)
                     let error_msg = e.to_string();
@@ -382,12 +367,6 @@ impl Session {
                     }
                 }
             };
-            drop(reader);
-            tracing::trace!(
-                session_id = session_id,
-                "[Session] recv_loop: Reader lock released (iteration {})",
-                iteration
-            );
 
             if n == 0 {
                 // Connection closed
@@ -410,22 +389,11 @@ impl Session {
 
             total_bytes_in += n;
 
-            // Decode frames
+            // Decode frames — `handle_frame` traces each frame's
+            // cmd/stream_id/len, so no per-frame trace here.
             let mut frame_count = 0u32;
-            let buffer_before_decode = buffer.len();
             while let Some(frame) = codec.decode(&mut buffer)? {
                 frame_count += 1;
-                tracing::trace!(
-                    session_id = session_id,
-                    "[Session] recv_loop: Decoded frame #{}: cmd={:?}, stream_id={}, data_len={} (iteration {}, buffer before={}, after={})",
-                    frame_count,
-                    frame.cmd,
-                    frame.stream_id,
-                    frame.data.len(),
-                    iteration,
-                    buffer_before_decode,
-                    buffer.len()
-                );
                 self.handle_frame(frame).await?;
             }
             if frame_count == 0 && n > 0 {
@@ -435,15 +403,6 @@ impl Session {
                     n,
                     iteration,
                     buffer.len()
-                );
-                tracing::trace!(
-                    session_id = session_id,
-                    "[Session] recv_loop: Buffer contents (first 50 bytes): {:?}",
-                    if buffer.len() >= 50 {
-                        &buffer[..50]
-                    } else {
-                        &buffer[..]
-                    }
                 );
             }
         }
@@ -476,47 +435,21 @@ impl Session {
         );
         match frame.cmd {
             Command::Push => {
-                // Data frame - forward to stream
-                let data_len = frame.data.len();
-                tracing::trace!(
-                    session_id = session_id,
-                    "[Session] handle_frame: Received PSH frame for stream {}, length={}",
-                    frame.stream_id,
-                    data_len
-                );
-
+                // Data frame — forward to the stream. `frame.data` MOVES
+                // into the channel (no `Bytes` refcount clone), which is
+                // what lets `StreamReader` hand the caller slices of the
+                // very allocation the codec decoded.
                 let receive_map = self.stream_receive_tx.read().await;
-                tracing::trace!(
-                    session_id = session_id,
-                    "[Session] handle_frame: Acquired stream_receive_tx read lock for stream {}",
-                    frame.stream_id
-                );
 
                 if let Some(tx) = receive_map.get(&frame.stream_id) {
-                    tracing::trace!(
-                        session_id = session_id,
-                        "[Session] handle_frame: Found receiver for stream {}, sending {} bytes",
-                        frame.stream_id,
-                        data_len
-                    );
-                    match tx.send(frame.data.clone()) {
-                        Ok(_) => {
-                            tracing::trace!(
-                                session_id = session_id,
-                                "[Session] handle_frame: Successfully sent {} bytes to stream {} via channel",
-                                data_len,
-                                frame.stream_id
-                            );
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                session_id = session_id,
-                                "[Session] handle_frame: Failed to send {} bytes to stream {} via channel: {}",
-                                data_len,
-                                frame.stream_id,
-                                e
-                            );
-                        }
+                    if let Err(e) = tx.send(frame.data) {
+                        tracing::error!(
+                            session_id = session_id,
+                            "[Session] handle_frame: Failed to send {} bytes to stream {} via channel: {}",
+                            e.0.len(),
+                            frame.stream_id,
+                            e
+                        );
                     }
                 } else {
                     // Not an anomaly: a local FIN evicts the stream (see the
@@ -532,11 +465,6 @@ impl Session {
                         receive_map.keys().collect::<Vec<_>>()
                     );
                 }
-                drop(receive_map);
-                tracing::trace!(
-                    session_id = session_id,
-                    "[Session] handle_frame: Released stream_receive_tx read lock"
-                );
             }
             Command::Syn => {
                 // Stream open (server side)
@@ -1000,6 +928,23 @@ impl Session {
             .await
     }
 
+    /// Enqueue a Flush marker at the tail of the writer FIFO — the
+    /// queue-ordered replacement for a bare [`disable_buffering`]
+    /// (Self::disable_buffering) call. While `buffering` holds, every
+    /// classified frame folds into `self.buffer` untouched by the wire
+    /// writer; when this marker drains, the batch's classification pass
+    /// clears `buffering` and the accumulated image goes out as ONE
+    /// atomic wire write. Enqueued immediately after the dial's address
+    /// frame, that pins [Settings+SYN+addr] into packet 1 regardless of
+    /// how the writer task happened to interleave its drains (upstream
+    /// `writeConn` parity).
+    ///
+    /// Returns the barrier receiver; callers that only need the FIFO
+    /// position drop it.
+    pub(crate) fn enqueue_flush_marker(&self) -> Result<oneshot::Receiver<Result<()>>> {
+        self.stream_data_tx.flush()
+    }
+
     /// Write a data frame to connection
     pub async fn write_data_frame(&self, stream_id: u32, data: Bytes) -> Result<()> {
         tracing::trace!(
@@ -1129,10 +1074,15 @@ impl Session {
             return Ok(());
         }
 
-        // Increment packet counter
+        // Increment packet counter. The authentication packet already
+        // consumed scheme index 0 (`send_authentication` calls
+        // `generate_record_payload_sizes(0)` for padding0), so the first
+        // padded session write must index the scheme at 1 — `fetch_add`
+        // returns the OLD value, upstream `pktCounter.Add(1)` the new one.
         let pkt = self
             .pkt_counter
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
         let padding_factory = {
             let padding_guard = self.padding.read().await;
             padding_guard.clone()
@@ -1427,9 +1377,11 @@ impl Session {
         let Some(mut receiver) = self.stream_data_rx.lock().await.take() else {
             return Ok(());
         };
-        // Reused across drains: the queue list itself and the contiguous
-        // encode scratch the non-vectored and padding write paths fill.
+        // Reused across drains: the queue list itself, the classified
+        // wire frames, and the contiguous encode scratch the
+        // non-vectored and padding write paths fill.
         let mut requests: Vec<WriteRequest> = Vec::new();
+        let mut frames: Vec<WireFrame> = Vec::new();
         let mut encode_scratch = BytesMut::with_capacity(64 * 1024);
         loop {
             let closed = self.close_notify.notified();
@@ -1455,7 +1407,7 @@ impl Session {
                 // Partial frames may only be abandoned when this entire
                 // session is already closed and will never be pooled again.
                 _ = &mut closed => break,
-                result = self.write_batch(&mut requests, &mut encode_scratch) => result,
+                result = self.write_batch(&mut requests, &mut frames, &mut encode_scratch) => result,
             };
             requests.clear();
             if let Err(error) = &result {
@@ -1481,11 +1433,12 @@ impl Session {
     async fn write_batch(
         &self,
         requests: &mut Vec<WriteRequest>,
+        frames: &mut Vec<WireFrame>,
         encode_scratch: &mut BytesMut,
     ) -> Result<()> {
         // Phase 1 — classify. Each queued frame becomes a pre-encoded
         // header + its owned `Bytes` payload; nothing is copied yet.
-        let mut frames: Vec<WireFrame> = Vec::with_capacity(requests.len());
+        frames.reserve(requests.len());
         let mut flush_waiters: Vec<oneshot::Sender<Result<()>>> = Vec::new();
         let mut fin_streams: Vec<u32> = Vec::new();
         for request in requests.drain(..) {
@@ -1525,9 +1478,30 @@ impl Session {
                             let _ = completion.send(Ok(()));
                         }
                     } else {
-                        frames.push(WireFrame {
+                        frames.push(WireFrame::Split {
                             header,
                             data: frame.data,
+                            _permit,
+                            completion,
+                        });
+                    }
+                }
+                WriteRequest::Wire {
+                    wire,
+                    _permit,
+                    completion,
+                } => {
+                    // Already `[header | payload]` contiguous — opaque
+                    // bytes to this layer. Buffering folds the image
+                    // verbatim, exactly like a split frame's image.
+                    if self.buffering.load(std::sync::atomic::Ordering::Relaxed) {
+                        self.buffer.lock().await.extend_from_slice(&wire);
+                        if let Some(completion) = completion {
+                            let _ = completion.send(Ok(()));
+                        }
+                    } else {
+                        frames.push(WireFrame::Wire {
+                            wire,
                             _permit,
                             completion,
                         });
@@ -1546,7 +1520,22 @@ impl Session {
         // Phase 2 — the wire write. Padding (client sessions, first
         // `stop` packets only) still needs a contiguous image; otherwise
         // the batch goes out under a single lock + write + flush.
-        let buffered = std::mem::take(&mut *self.buffer.lock().await);
+        //
+        // While `buffering` still holds the buffer must NOT be drained:
+        // upstream `writeConn` appends to `s.buffer` until the client
+        // clears the flag, so the accumulated image — [Settings+SYN+addr]
+        // on a successful dial — reaches the wire as ONE atomic packet.
+        // Draining here mid-window is what scattered it across 1-3
+        // nondeterministic packet groupings. The FIFO Flush marker the
+        // client enqueues after the address (and the existing FIN marker
+        // for a cancelled dial) clears `buffering` inside this batch's
+        // classification pass, so the flag is false by the time we get
+        // here whenever the flush was owed.
+        let buffered = if self.buffering.load(std::sync::atomic::Ordering::Relaxed) {
+            Vec::new()
+        } else {
+            std::mem::take(&mut *self.buffer.lock().await)
+        };
         let padding_active = self.send_padding
             && self.pkt_counter.load(std::sync::atomic::Ordering::Relaxed)
                 < self.padding.read().await.stop();
@@ -1566,21 +1555,15 @@ impl Session {
             }
         } else if padding_active {
             encode_scratch.clear();
-            encode_scratch.reserve(
-                buffered.len()
-                    + frames
-                        .iter()
-                        .map(|f| HEADER_OVERHEAD_SIZE + f.data.len())
-                        .sum::<usize>(),
-            );
+            encode_scratch
+                .reserve(buffered.len() + frames.iter().map(WireFrame::wire_len).sum::<usize>());
             encode_scratch.extend_from_slice(&buffered);
-            for frame in &frames {
-                encode_scratch.extend_from_slice(&frame.header);
-                encode_scratch.extend_from_slice(&frame.data);
+            for frame in frames.iter() {
+                frame.encode_into(encode_scratch);
             }
             self.write_with_padding(encode_scratch.split()).await
         } else {
-            self.write_wire(&buffered, &frames, encode_scratch).await
+            self.write_wire(&buffered, frames, encode_scratch).await
         };
 
         // FIN eviction runs AFTER the write — the same point in the
@@ -1604,8 +1587,8 @@ impl Session {
         // Every waiter of the drain resolves with the batch's outcome.
         // Permits drop with `frames` — after the physical write, matching
         // the old "hold capacity through write/flush" rule.
-        for frame in frames {
-            if let Some(completion) = frame.completion {
+        for mut frame in frames.drain(..) {
+            if let Some(completion) = frame.completion().take() {
                 let _ = completion.send(clone_result(&result));
             }
         }
@@ -1637,9 +1620,17 @@ impl Session {
                 slices.push(IoSlice::new(buffered));
             }
             for frame in frames {
-                slices.push(IoSlice::new(&frame.header));
-                if !frame.data.is_empty() {
-                    slices.push(IoSlice::new(&frame.data));
+                match frame {
+                    // One iovec per contiguous frame — the headroom
+                    // path's whole point: header and payload share one
+                    // `Bytes`, so a vectored write needs no assembly.
+                    WireFrame::Wire { wire, .. } => slices.push(IoSlice::new(wire)),
+                    WireFrame::Split { header, data, .. } => {
+                        slices.push(IoSlice::new(header));
+                        if !data.is_empty() {
+                            slices.push(IoSlice::new(data));
+                        }
+                    }
                 }
             }
             let mut pending = slices.as_mut_slice();
@@ -1657,17 +1648,11 @@ impl Session {
             }
         } else {
             encode_scratch.clear();
-            encode_scratch.reserve(
-                buffered.len()
-                    + frames
-                        .iter()
-                        .map(|f| HEADER_OVERHEAD_SIZE + f.data.len())
-                        .sum::<usize>(),
-            );
+            encode_scratch
+                .reserve(buffered.len() + frames.iter().map(WireFrame::wire_len).sum::<usize>());
             encode_scratch.extend_from_slice(buffered);
             for frame in frames {
-                encode_scratch.extend_from_slice(&frame.header);
-                encode_scratch.extend_from_slice(&frame.data);
+                frame.encode_into(encode_scratch);
             }
             writer
                 .write_all(&encode_scratch[..])
@@ -1702,14 +1687,54 @@ impl Session {
     }
 }
 
-/// A queued frame mid-drain: pre-encoded wire header + the owned `Bytes`
-/// payload (which moves to the wire unmodified — no copy). The budget
-/// permit rides inside so it is held through the physical write.
-struct WireFrame {
-    header: [u8; HEADER_OVERHEAD_SIZE],
-    data: Bytes,
-    _permit: Option<OwnedSemaphorePermit>,
-    completion: Option<oneshot::Sender<Result<()>>>,
+/// A queued frame mid-drain. The budget permit rides inside so it is
+/// held through the physical write.
+enum WireFrame {
+    /// Pre-encoded wire header + the owned `Bytes` payload (which moves
+    /// to the wire unmodified — no copy).
+    Split {
+        header: [u8; HEADER_OVERHEAD_SIZE],
+        data: Bytes,
+        _permit: Option<OwnedSemaphorePermit>,
+        completion: Option<oneshot::Sender<Result<()>>>,
+    },
+    /// `[header | payload]` already contiguous in one `Bytes` — the
+    /// headroom path from `Stream::poll_write_bytes_data`. The wire
+    /// write moves it verbatim: no header reassembly, no payload copy.
+    Wire {
+        wire: Bytes,
+        _permit: Option<OwnedSemaphorePermit>,
+        completion: Option<oneshot::Sender<Result<()>>>,
+    },
+}
+
+impl WireFrame {
+    /// Encoded byte length of this frame on the wire.
+    fn wire_len(&self) -> usize {
+        match self {
+            WireFrame::Split { data, .. } => HEADER_OVERHEAD_SIZE + data.len(),
+            WireFrame::Wire { wire, .. } => wire.len(),
+        }
+    }
+
+    /// Append this frame's wire image to `scratch` (non-vectored and
+    /// padding paths — the contiguous arm copies nothing, it extends
+    /// straight from the owned `Bytes`).
+    fn encode_into(&self, scratch: &mut BytesMut) {
+        match self {
+            WireFrame::Split { header, data, .. } => {
+                scratch.extend_from_slice(header);
+                scratch.extend_from_slice(data);
+            }
+            WireFrame::Wire { wire, .. } => scratch.extend_from_slice(wire),
+        }
+    }
+
+    fn completion(&mut self) -> &mut Option<oneshot::Sender<Result<()>>> {
+        match self {
+            WireFrame::Split { completion, .. } | WireFrame::Wire { completion, .. } => completion,
+        }
+    }
 }
 
 /// One batch outcome fans out to every waiter of the drain;
@@ -2712,9 +2737,10 @@ mod padding_bounds_tests {
         let padding =
             Arc::new(PaddingFactory::new(b"stop=2\n1=65535-65535").unwrap()).into_shared();
         let session = Session::new_client(tokio::io::empty(), writer, padding, None);
-        session
-            .pkt_counter
-            .store(1, std::sync::atomic::Ordering::SeqCst);
+        // `write_with_padding` derives the scheme index as
+        // `fetch_add(1) + 1` (auth consumed index 0 out-of-band), so a
+        // fresh counter puts this write at scheme index 1 — the 65535
+        // record the scheme declares.
         session.write_with_padding(BytesMut::new()).await.unwrap();
         // The next unpadded frame must start after the declared Waste payload,
         // even at the largest representable length.
@@ -2743,10 +2769,10 @@ mod padding_bounds_tests {
             None,
         ));
         // A short, otherwise well-formed UpdatePaddingScheme received before
-        // packet 1. No large allocation is performed by this probe.
-        session
-            .pkt_counter
-            .store(1, std::sync::atomic::Ordering::SeqCst);
+        // packet 1. No large allocation is performed by this probe. The
+        // counter stays at 0: `write_with_padding` indexes the scheme at
+        // `fetch_add(1) + 1`, so the write below lands on index 1 — where
+        // an accepted scheme would try to declare a 2 GiB payload.
         session
             .handle_frame(Frame::with_data(
                 Command::UpdatePaddingScheme,
