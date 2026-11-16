@@ -140,6 +140,10 @@ const OUTBOX_CAP: usize = 4 * TCP_SOCKET_BUF / 1400;
 /// manufactured hole (a dropped wire datagram is an unrecoverable
 /// inner-TCP hole for ≥1 RTO; drop-oldest re-drops hole-filling
 /// retransmits too, which is how a seeded loss turned permanent).
+/// Inject traffic deliberately bypasses this gate: handshakes, cookies
+/// and RST hints are peer-initiated crypto state — nothing upstream
+/// paces them, so backpressure cannot substitute for the [`INJECT_QUEUE`]
+/// headroom reserved out of `OUTBOX_CAP` for exactly that burst.
 const OUTBOX_DATA_CAP: usize = OUTBOX_CAP - INJECT_QUEUE;
 
 /// Retained crypto-scratch buffers. Demand is a handful of live dsts
