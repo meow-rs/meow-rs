@@ -56,6 +56,13 @@ pub struct ReconnectableClient {
     /// The connection pool — see [`Slot`]. A slot connects lazily on its
     /// first selection; a slot whose dial fails stays `None` until its
     /// next turn.
+    ///
+    /// Pool invariants: the slot FSM is `None` (lazy) → `Some(live)` →
+    /// `None` on death or a generation bump → `Some(live)` again when a
+    /// later selection heals it. The scan in [`handle`](Self::handle)
+    /// wraps around the whole pool, so a transient failure leaves the
+    /// slot `None` rather than poisoning it — only persistent,
+    /// pool-wide failure surfaces an error to the caller.
     slots: Box<[Slot]>,
     /// Bumped by [`reset`](Self::reset); a connection from an older
     /// generation is never handed out again — on any slot. Compared for

@@ -244,7 +244,8 @@ impl Stream {
     }
 
     /// Framing headroom this stream asks callers to reserve ahead of each
-    /// `poll_write_bytes_data` slot: the 7-byte frame header
+    /// [`poll_write_bytes_data`](Self::poll_write_bytes_data) slot: the
+    /// 7-byte frame header
     /// ([`Command` | stream id | length]). The relay reads it once per
     /// direction and leads every fill with that many zeros; the stream
     /// overlays the header in place, turning one fill into ONE
@@ -305,7 +306,10 @@ impl Stream {
         // Caller-reserved framing space? A complying caller's slot leads
         // with `HEADER_OVERHEAD_SIZE` zeros (the relay puts them ahead
         // of every read); a bare-payload slot falls back to per-frame
-        // headers.
+        // headers — a WriteBytes-contract violation that still works but
+        // forfeits the contiguous path (the conn's `poll_write_bytes`
+        // debug_asserts it; the fallback stays legal for direct Stream
+        // callers, which tests deliberately exercise).
         let headroom = if b.len() >= HEADER_OVERHEAD_SIZE
             && b[..HEADER_OVERHEAD_SIZE].iter().all(|v| *v == 0)
         {

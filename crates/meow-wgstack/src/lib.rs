@@ -114,6 +114,8 @@ pub const POLL_BURST: usize = 256;
 /// 4 MiB covers one [`TCP_SOCKET_BUF`]-sized full-window drain in a
 /// single pass so a saturated flow's egress isn't sliced across passes.
 pub const POLL_TX_BYTES_BUDGET: usize = 4 * 1024 * 1024;
+// One pass must stage a whole full-window drain — see the doc above.
+const _: () = assert!(POLL_TX_BYTES_BUDGET >= TCP_SOCKET_BUF);
 
 /// boringtun's own device loop ticks its timers at 250 ms (rekey timeout is
 /// 5 s, jitter ≤ 333 ms — this is well inside slack). Spec §3.4 sketched
@@ -363,42 +365,49 @@ pub fn note_count(counter: &mut u64, n: u64, msg: impl std::fmt::Display) -> u64
 ///   datagram waits in `out`) and rare terminal `Err` drops.
 #[derive(Debug, Default)]
 pub struct DropStats {
-    /// Inner→outer dropped datagrams: `rx_sockbuf_dropped` +
+    /// Inner→outer datagrams dropped: `rx_sockbuf_dropped` +
     /// `rx_chan_dropped` (the two subsets are bumped at their own
     /// points, then summed here).
     pub dropped_rx: AtomicU64,
-    /// Outer→inner no-socket-space events: `tx_buf_full` +
+    /// Outer→inner no-socket-space *events*: `tx_buf_full` +
     /// `tx_err_dropped`. Stall refusals dominate — they are not lost
     /// datagrams but are the saturation signal this gate measures.
     pub dropped_tx: AtomicU64,
 
-    /// Subset of `dropped_rx`: conn read-channel full at drain time.
+    /// Datagrams dropped on a full conn read channel at drain time —
+    /// subset of `dropped_rx`.
     pub rx_chan_dropped: u64,
-    /// Subset of `dropped_rx`: `udp::Socket::process` dropped the
-    /// datagram on a full rx buffer — the hypothesis-B drop point.
+    /// Datagrams `udp::Socket::process` dropped on a full rx buffer —
+    /// the hypothesis-B drop point; subset of `dropped_rx`.
     pub rx_sockbuf_dropped: u64,
-    /// Drain-time samples that found a socket rx buffer within one
-    /// max-size datagram of capacity — the always-on saturation
+    /// Times a drain observed the socket rx buffer within ~2 KiB (one
+    /// max-size datagram) of capacity — the always-on saturation
     /// corroboration for `rx_sockbuf_dropped`.
     pub rx_buf_full_obs: u64,
-    /// Peak socket rx payload occupancy (`recv_queue()`) at a drain.
+    /// Peak socket rx payload occupancy in bytes (`recv_queue()`)
+    /// sampled at a drain; per-snapshot window, reset by
+    /// `log_socket_stats`.
     pub rx_occ_max: usize,
-    /// Peak `ChannelDevice::rx_queue` depth at the offer scan.
+    /// Peak `ChannelDevice::rx_queue` depth in datagrams at the offer
+    /// scan; per-snapshot window, reset by `log_socket_stats`.
     pub rx_queue_max: usize,
-    /// Subset of `dropped_tx`: `send_slice` refused — `BufferFull`,
-    /// or `!can_send()` with queued datagrams (same condition).
+    /// Send-side refusal events — `send_slice` `BufferFull`, or
+    /// `!can_send()` with queued datagrams (same condition); backpressure,
+    /// not lost datagrams. Subset of `dropped_tx`.
     pub tx_buf_full: u64,
-    /// Subset of `dropped_tx`: `send_slice` terminal-error drops.
+    /// Datagrams dropped on `send_slice` terminal errors — subset of
+    /// `dropped_tx`.
     pub tx_err_dropped: u64,
-    /// `rx_queue` UDP datagrams bound for no bound socket — sanity
+    /// `rx_queue` UDP datagrams offered to no bound socket — sanity
     /// check on the offer scan's port attribution.
     pub rx_udp_unclaimed: u64,
-    /// Passes a TCP socket had queued `Data` while `!can_send()` —
-    /// the send-side stall signature (tx-buffer-full or
-    /// remote-window-0).
+    /// Times a service pass found a TCP socket holding queued `Data`
+    /// while `!can_send()` — the send-side stall signature
+    /// (tx-buffer-full or remote-window-0).
     pub tcp_tx_stall: u64,
-    /// Wire datagrams dropped at endpoint egress (`flush_outbox`'s
-    /// non-`WouldBlock` errno arm and the dead-conn `outbox.clear()`).
+    /// Wire datagrams dropped at endpoint egress — `flush_outbox`'s
+    /// non-`WouldBlock` errno arm (one each) plus the dead-conn
+    /// `outbox.clear()` (the whole queue + the current datagram).
     pub outbox_dropped: u64,
 }
 

@@ -12,7 +12,7 @@
 
 use super::stream::{H3Stream, WRITE_BUFFER_BYTES};
 use http::StatusCode;
-use meow_transport::datagram::SocketIo;
+use meow_transport::datagram::{try_poll_recv_once, SocketIo};
 use quiche::h3::{self, NameValue as _};
 use std::{
     collections::{HashMap, VecDeque},
@@ -22,7 +22,6 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
-    task::{Context, Poll},
     time::Duration,
 };
 use tokio::{
@@ -76,18 +75,10 @@ impl Socket {
                 Err(e) => Err(e),
             },
             Self::Io { io, peer } => {
-                // Polling with the noop waker is safe here: the next select
-                // wakeup re-polls `poll_recv` with the real task waker, and
-                // a channel-backed endpoint re-reads its queue before
-                // answering Pending — nothing can be lost between the two.
-                let waker = std::task::Waker::noop();
-                let mut cx = Context::from_waker(waker);
-                let mut rb = ReadBuf::new(buf);
-                match io.poll_recv(&mut cx, &mut rb) {
-                    Poll::Ready(Ok(())) => Ok(Some((rb.filled().len(), *peer))),
-                    Poll::Ready(Err(e)) => Err(e),
-                    Poll::Pending => Ok(None),
-                }
+                // The noop-waker contract this relies on — the enclosing
+                // select re-polls `poll_recv` on its next wakeup — lives
+                // on `try_poll_recv_once`.
+                try_poll_recv_once(&mut **io, buf).map(|o| o.map(|n| (n, *peer)))
             }
         }
     }

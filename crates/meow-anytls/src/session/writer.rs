@@ -12,6 +12,10 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 /// so every fill ships as ONE frame — a 65535 cap would split a
 /// 65536-byte fill into a full frame + a 7-byte tail fragment.
 pub const MAX_FRAME_PAYLOAD: usize = 64 * 1024 - HEADER_OVERHEAD_SIZE;
+// The protocol ceiling is u16::MAX (the wire length field); the value
+// above is the batching sweet spot beneath it — a relay-sized fill +
+// header fits 64 KiB exactly.
+const _: () = assert!(MAX_FRAME_PAYLOAD <= u16::MAX as usize);
 // At most 64 data/control frames (about 4 MiB of payload) per session.
 // FIN and flush markers bypass the budget so Drop never needs to spawn a task.
 pub(crate) const QUEUED_FRAMES: usize = 64;

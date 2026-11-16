@@ -506,6 +506,21 @@ impl WriteBytes for AnytlsConn {
         cx: &mut Context<'_>,
         bytes: &mut Option<BytesMut>,
     ) -> Poll<io::Result<()>> {
+        // WriteBytes-contract gate (debug/test builds only): a presented
+        // slot MUST lead with `want_write_headroom()` zero bytes — the
+        // stream tolerates a bare payload via its Split fallback, which
+        // would silently mask the lost contiguity. `None` and empty
+        // slots are the slot protocol's legal early-out shapes, not
+        // violations.
+        let headroom = self.stream.want_write_headroom();
+        debug_assert!(
+            bytes.as_ref().is_none_or(|b| {
+                b.is_empty() || (b.len() >= headroom && b[..headroom].iter().all(|v| *v == 0))
+            }),
+            "WriteBytes slot arrived without the reserved zeroed headroom \
+             prefix — callers must reserve want_write_headroom() bytes; \
+             the stream's Split fallback masks the perf loss"
+        );
         self.stream.poll_write_bytes_data(cx, bytes)
     }
 

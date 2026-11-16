@@ -16,12 +16,11 @@ use super::proto::{self, UdpMessage};
 use super::tcp::{DuplexStream, WRITE_BUFFER_BYTES};
 use super::udp::note_drop;
 use super::{Config, Error, Result};
-use meow_transport::datagram::SocketIo;
+use meow_transport::datagram::{try_poll_recv_once, SocketIo};
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::ReadBuf;
 use tokio::net::UdpSocket;
@@ -276,18 +275,10 @@ impl DriverSocket {
                 Err(e) => Err(e),
             },
             Self::Io { io, peer } => {
-                // Polling with the noop waker is safe here: the next select
-                // wakeup re-polls `poll_recv` with the real task waker, and
-                // a channel-backed endpoint re-reads its queue before
-                // answering Pending — nothing can be lost between the two.
-                let waker = std::task::Waker::noop();
-                let mut cx = Context::from_waker(waker);
-                let mut rb = ReadBuf::new(buf);
-                match io.poll_recv(&mut cx, &mut rb) {
-                    Poll::Ready(Ok(())) => Ok(Some((rb.filled().len(), *peer))),
-                    Poll::Ready(Err(e)) => Err(e),
-                    Poll::Pending => Ok(None),
-                }
+                // The noop-waker contract this relies on — the enclosing
+                // select re-polls `poll_recv` on its next wakeup — lives
+                // on `try_poll_recv_once`.
+                try_poll_recv_once(&mut **io, buf).map(|o| o.map(|n| (n, *peer)))
             }
         }
     }

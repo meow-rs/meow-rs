@@ -71,6 +71,9 @@ const SCRATCH_POOL_CAP: usize = 128;
 /// covers the 4 MiB rx window, without letting one socket monopolise a
 /// service pass.
 const TCP_READ_CHUNK: usize = 65536;
+// A full read queue must cover the advertised rx window — the layering
+// `tcp_read_chunk_covers_rx_window` also pins, here at compile time.
+const _: () = assert!(TCP_READ_QUEUE * TCP_READ_CHUNK >= TCP_SOCKET_BUF);
 
 /// Idle `select!` sleep when smoltcp reports no `poll_delay`: inbound WG
 /// datagrams, mailbox messages and conn wakes all break the sleep early, so
@@ -1833,10 +1836,17 @@ impl WgPump {
     /// port — the same `dst_port` demux smoltcp's `accepts` applies
     /// (the dst-addr check it also does is skipped: every inner packet
     /// is addressed to this iface, and `rx_udp_unclaimed` would expose
-    /// a misattribution). The `rx_scan_pending` head skip keeps
-    /// datagrams poll left mid-queue (egress-budget stop) from being
-    /// offered twice — poll consumes front-to-back, so a carry-over
-    /// is always a prefix.
+    /// a misattribution).
+    ///
+    /// The accounting contract the scan/poll/tally trio maintains:
+    /// `offered = dequeued + dropped + (in_flight | still_queued |
+    /// in_socket)` — every datagram offered here resolves to a conn
+    /// drain, a confirmed drop inside poll, or a live residency
+    /// `account_udp_drops` can exclude. `rx_scan_pending`'s `skip()`
+    /// is what keeps the offered count honest: poll may stop
+    /// mid-queue on the egress budget, and a re-scan must not
+    /// double-offer the carry-over prefix (poll consumes
+    /// front-to-back, so carry-over is always a prefix).
     fn scan_udp_offered(&mut self) {
         self.stats.rx_queue_max = self.stats.rx_queue_max.max(self.device.rx_queue.len());
         for pkt in self.device.rx_queue.iter().skip(self.rx_scan_pending) {

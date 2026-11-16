@@ -1456,10 +1456,13 @@ impl Session {
                         fin_streams.push(frame.stream_id);
                     }
                     if frame.data.len() > u16::MAX as usize {
-                        // `write_frame`/`enqueue_frame` bound payloads at
-                        // admission; a bare `enqueue` caller could still
-                        // oversize — fail like the codec's encode error did
-                        // (the write, and so the session, dies).
+                        // u16::MAX is the PROTOCOL hard limit — the wire
+                        // length field itself — not `writer::MAX_FRAME_PAYLOAD`,
+                        // the batching bound beneath it that admission
+                        // (`write_frame`/`enqueue_frame`) enforces; a bare
+                        // `enqueue` caller could still oversize — fail like
+                        // the codec's encode error did (the write, and so
+                        // the session, dies).
                         return Err(AnyTlsError::Io(std::io::Error::new(
                             std::io::ErrorKind::InvalidInput,
                             "AnyTLS frame payload exceeds u16 length",

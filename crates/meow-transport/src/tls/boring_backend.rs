@@ -668,14 +668,19 @@ impl BoringInner {
         let sessions: SessionCache = Arc::new(Mutex::new(VecDeque::new()));
         let cb_sessions = Arc::clone(&sessions);
         b.set_new_session_callback(move |ssl, session| {
-            // The deposit half of the override invariant: a ticket
-            // minted under a `cert_pin`/`verify_name` connection must
-            // never enter the store — `offer_cached_session` withholds
-            // tickets FROM override connections, and this withholds
-            // override connections' tickets from the store.  A resumed
-            // handshake carries no Certificate, so a stock connection
-            // offering such a ticket would finish without the override
-            // policy's check ever running.
+            // INVARIANT: every verify-override connection MUST set
+            // VERIFY_OVERRIDE (the `connect_typed` override arm does) —
+            // this gate depends on it; a missed flag lets
+            // override-minted tickets into the store, where they get
+            // offered to stock connections.  The deposit half of the
+            // override invariant: a ticket minted under a
+            // `cert_pin`/`verify_name` connection must never enter the
+            // store — `offer_cached_session` withholds tickets FROM
+            // override connections, and this withholds override
+            // connections' tickets from the store.  A resumed handshake
+            // carries no Certificate, so a stock connection offering
+            // such a ticket would finish without the override policy's
+            // check ever running.
             if ssl.ex_data(*VERIFY_OVERRIDE).copied().unwrap_or(false) {
                 return;
             }
@@ -869,8 +874,14 @@ impl BoringInner {
                 .into_ssl(&self.server_name)
                 .map_err(|e| TransportError::Tls(format!("boring: into_ssl: {e}")))
                 .map_err(ConnectTypedError::Transport)?;
-            ssl.set_ex_data(*VERIFY_OVERRIDE, true);
             let session_offered = self.offer_cached_session(&mut ssl);
+            // INVARIANT: every verify-override connection MUST set
+            // VERIFY_OVERRIDE — the new-session gate in
+            // `build_connector` depends on it; a missed flag lets
+            // override-minted tickets into the store and get offered
+            // to stock connections.  Kept textually adjacent to the
+            // verify installs below so the pairing survives edits.
+            ssl.set_ex_data(*VERIFY_OVERRIDE, true);
             if let Some(pin) = self.cert_pin {
                 // Upstream: `serverName = state.ServerName`, overridden by
                 // `NameCertVerify` — the pin's chain-verify DNS name.

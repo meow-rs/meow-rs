@@ -50,6 +50,31 @@ pub trait SocketIo: Send + Sync {
     }
 }
 
+/// One non-blocking `poll_recv` for the drain pass that follows an
+/// awaited read — `Ok(None)` on `Pending` ends the batch.
+///
+/// Waker contract: this polls once under a noop waker, so the poll
+/// registers no wakeup of its own. That is only sound where the
+/// enclosing select's next wakeup re-polls `poll_recv` with the real
+/// task waker, and only for an endpoint that re-checks its queue before
+/// answering `Pending` — a channel-backed endpoint's `Pending` already
+/// means "empty at poll time", so nothing can be lost between the two
+/// polls. The hysteria2 and trusttunnel-h3 drivers both meet this: the
+/// drain pass runs inside the same select loop as the awaited read.
+pub fn try_poll_recv_once<I: SocketIo + ?Sized>(
+    io: &mut I,
+    buf: &mut [u8],
+) -> io::Result<Option<usize>> {
+    let waker = std::task::Waker::noop();
+    let mut cx = Context::from_waker(waker);
+    let mut rb = ReadBuf::new(buf);
+    match io.poll_recv(&mut cx, &mut rb) {
+        Poll::Ready(Ok(())) => Ok(Some(rb.filled().len())),
+        Poll::Ready(Err(e)) => Err(e),
+        Poll::Pending => Ok(None),
+    }
+}
+
 impl SocketIo for UdpSocket {
     fn poll_send(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         UdpSocket::poll_send(self, cx, buf)
