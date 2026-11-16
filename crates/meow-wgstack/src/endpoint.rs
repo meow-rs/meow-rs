@@ -143,7 +143,7 @@ impl BatchEndpoint {
     // ── batch calls ──────────────────────────────────────────────
 
     /// Drain up to `min(bufs.len(), budget, WIRE_DRAIN_BUDGET)`
-    /// datagrams — one `recvmmsg` on Linux, [`MSGX_CHUNK`]-capped
+    /// datagrams — one `recvmmsg` on Linux, `MSGX_CHUNK`-capped
     /// `recvmsg_x` rounds on macOS, a `try_recv_buf` loop elsewhere.
     /// The third clamp is the stack-array bound: a single batched call
     /// can never service more slots than its arrays hold, and the
@@ -370,7 +370,7 @@ impl BatchEndpoint {
 
     /// macOS: `sendmsg_x` over stack-built `msghdr_x`/`iovec` arrays —
     /// the same shape as the Linux `sendmmsg` path, chunked at
-    /// [`MSGX_CHUNK`]. On a connected UDP socket XNU takes the
+    /// `MSGX_CHUNK`. On a connected UDP socket XNU takes the
     /// `sendit_x`/`sosend_list` fast path (no per-datagram name); on an
     /// unconnected one each header's `msg_name` carries its
     /// destination and the kernel loops `sendit` — still one syscall
@@ -434,7 +434,7 @@ impl BatchEndpoint {
     /// batched `soreceive_m_list`, which stops when the socket queue
     /// runs dry under `MSG_DONTWAIT` and reports each datagram's
     /// received length in `msg_datalen` (bytes actually copied, ≤ the
-    /// advertised iov capacity). Each round is capped at [`MSGX_CHUNK`]
+    /// advertised iov capacity). Each round is capped at `MSGX_CHUNK`
     /// headers — XNU's per-call clip — so a batch wider than the clip
     /// loops until a short round reports the queue dry; `msgs[..got]`
     /// of each round is the only span the kernel rewrote.
