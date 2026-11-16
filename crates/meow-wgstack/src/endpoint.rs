@@ -2083,6 +2083,7 @@ mod tests {
     //! (unless `no-macos-sendmsg-x` put the fallback back), elsewhere
     //! the per-datagram loop.
     use super::*;
+    use crate::enlarge_recv_buffer;
 
     fn std_sock() -> std::net::UdpSocket {
         let s = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
@@ -2092,6 +2093,10 @@ mod tests {
 
     fn ep(s: std::net::UdpSocket, connected: bool) -> BatchEndpoint {
         let t = tokio::net::UdpSocket::from_std(s).expect("tokio socket");
+        // Production endpoints enlarge `SO_RCVBUF`; a test socket on
+        // the stock ~208 KiB makes every flood assertion a kernel-
+        // capacity coin flip instead of a batch-semantics check.
+        enlarge_recv_buffer(&t);
         if connected {
             BatchEndpoint::connected(t)
         } else {
@@ -2951,6 +2956,10 @@ mod tests {
         let sender = std_sock();
         sender.connect(peer).expect("connect");
         let sock = tokio::net::UdpSocket::from_std(sender).expect("tokio socket");
+        // Same as `ep()`: the bridge's drain socket needs production
+        // headroom or a burst past `RX_WAKE_CAP` lands-or-drops on the
+        // runner's ambient `rmem` tuning, not on bridge semantics.
+        enlarge_recv_buffer(&sock);
         (BridgedEndpoint::connected(sock, peer), receiver)
     }
 
