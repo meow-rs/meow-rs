@@ -1164,7 +1164,7 @@ const BRIDGE_SLOT: usize = 4096;
 /// the channels are FIFO, and the TX task emits in channel order.
 /// Teardown mirrors [`ProxyEndpoint`]: an [`AtomicBool`] edge for the
 /// RX thread, a [`Notify`] edge for the TX task, and the TX task's
-/// [`FlagOnDrop`] flags the RX edge so a dead twin never leaves the
+/// `FlagOnDrop` flags the RX edge so a dead twin never leaves the
 /// thread parked on a quiet socket.
 pub struct BridgedEndpoint {
     /// Wire RX: `(src, datagram)` pairs the RX bridge pulled off the
@@ -1489,7 +1489,7 @@ impl BridgedEndpoint {
         }
     }
 
-    /// See [`Endpoint::recv_batch`] / [`ProxyEndpoint::recv_batch`]:
+    /// See [`Endpoint::recv_batch`] / `ProxyEndpoint::recv_batch`:
     /// pops channel datagrams into the staged slots under the same
     /// leading-count contract.
     pub fn recv_batch(&mut self, bufs: &mut [Vec<u8>], budget: usize) -> usize {
