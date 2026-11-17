@@ -10,6 +10,37 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 
+/// The per-`proxies:`-entry dialer fields mihomo supports on a leaf node
+/// (issue #974): `routing-mark`, `interface-name`, `ip-version`, `tfo`,
+/// `mptcp`. The config parser builds one per leaf and stores it on the
+/// node's `WrappedProxy`, which resolves it over
+/// [`crate::GlobalDialerOpts`] at dial time and installs the result as the
+/// task-local scope (`crate::dialer_opts_scope`) around the adapter call —
+/// so `connect_tcp`, `bind_udp_for_peer` and `resolve_addrs` see the
+/// node's own options wherever its dial leads, WireGuard's endpoint
+/// socket included. Proxy groups carry none: mihomo v1.19 removed
+/// group-level dialer fields, so a member's own opts govern its hop.
+///
+/// An unset field means "inherit the global": `routing-mark: 0` and a
+/// missing `interface-name` both normalize to `None` at parse, before
+/// this record is built.
+#[derive(Debug, Clone, Default)]
+pub struct NodeDialerOpts {
+    /// `SO_MARK` override (`0` already normalized to unset). Linux only;
+    /// skipped with a warning elsewhere.
+    pub routing_mark: Option<u32>,
+    /// Interface to bind this node's sockets to — resolved name→index at
+    /// dial time, no cache. Beats the global `interface-name` and the TUN
+    /// owner binding; loopback peers stay exempt.
+    pub interface_name: Option<Arc<str>>,
+    /// Address-family selection for this node's hostname resolution.
+    pub ip_version: crate::socket_protect::IpVersion,
+    /// `TCP_FASTOPEN_CONNECT` on this node's TCP sockets. Linux only.
+    pub tfo: bool,
+    /// Build this node's TCP sockets as MPTCP (`IPPROTO_MPTCP`). Linux only.
+    pub mptcp: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DelayHistory {
     #[serde(with = "rfc3339_system_time")]

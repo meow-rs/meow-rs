@@ -53,8 +53,8 @@ pub mod tunnel_mode;
 pub mod yaml;
 
 pub use adapter::{
-    reset_sessions_reachable, DelayHistory, GroupDisplay, ProviderSlot, Proxy, ProxyAdapter,
-    ProxyHealth, ProxySelection, ProxyState,
+    reset_sessions_reachable, DelayHistory, GroupDisplay, NodeDialerOpts, ProviderSlot, Proxy,
+    ProxyAdapter, ProxyHealth, ProxySelection, ProxyState,
 };
 pub use adapter_type::{AdapterType, ConnType};
 pub use auth::{AuthConfig, Credentials};
@@ -86,9 +86,12 @@ pub use replay_window::ReplayWindow;
 pub use rule::{Rule, RuleMatchHelper, RuleType, TargetCheck, TargetProbe};
 pub use sniffer::SnifferConfig;
 pub use socket_protect::{
-    bind_udp, bind_udp_for_peer, canonical_socket_addr, connect_tcp, connect_tcp_candidates,
-    connect_tcp_host, enlarge_udp_recv_buffer, pin_routing_mark, resolve_host, resolve_host_all,
-    resolve_host_all_via, routing_mark, routing_mark_pinned, set_routing_mark, RoutingMarkPin,
+    apply_ip_version_filter, bind_udp, bind_udp_for_peer, canonical_socket_addr, connect_tcp,
+    connect_tcp_candidates, connect_tcp_host, dialer_opts, dialer_opts_scope,
+    enlarge_udp_recv_buffer, global_dialer_opts, global_interface_name, pin_routing_mark,
+    resolve_host, resolve_host_all, resolve_host_all_via, routing_mark, routing_mark_pinned,
+    set_global_interface_name, set_routing_mark, DialerOpts, GlobalDialerOpts, IpVersion,
+    RoutingMarkPin,
 };
 pub use tcp_opts::TcpKeepaliveConfig;
 // Host-resolver hook is cross-platform (iOS installs it without a protector).

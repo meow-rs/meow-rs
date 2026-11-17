@@ -898,6 +898,88 @@ async fn patch_configs_invalid_mode() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
+/// Issue #974: `PATCH /configs` with `interface-name` updates the live
+/// global dialer binding (mihomo's top-level option), GET reports it,
+/// and `""` clears back to unset.
+///
+/// `global_interface_name` is process-wide state that *every* config
+/// commit re-asserts — parallel tests' TUN/PUT swaps can reset it to
+/// their raw's `None` between this test's PATCH and its reads. So the
+/// assertions run under `CONFIG_MUTATION` (the same lane the writers
+/// serialize on): once held, the observed global is stable.
+#[tokio::test]
+async fn patch_configs_interface_name_lifecycle() {
+    let state = test_state_default();
+    let patch = |body: &str| {
+        let app = create_router(Arc::clone(&state));
+        let payload = body.to_string();
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/configs")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(payload))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+    let get_iface = |state: &Arc<AppState>| {
+        let app = create_router(Arc::clone(state));
+        async move {
+            let json = body_json(
+                app.oneshot(
+                    Request::get("/configs")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+            json["interface-name"].as_str().unwrap().to_string()
+        }
+    };
+
+    // Unset reports the mihomo-compatible empty string. (Only this test
+    // ever *sets* a name — every other writer commits `None` — so the
+    // unset observation needs no lane.)
+    assert_eq!(get_iface(&state).await, "");
+
+    // Setting it updates the live global, the raw config, and GET. A
+    // concurrent test's swap may win the lane after our PATCH's commit
+    // and reset the global to `None` — re-PATCH and retry until the
+    // lane sees our value (bounded: writers are finite).
+    let mut attempts = 0;
+    loop {
+        let resp = patch(r#"{"interface-name":"eth9"}"#).await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            state.raw_config.read().interface_name.as_deref(),
+            Some("eth9")
+        );
+        let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
+        if meow_common::global_interface_name().as_deref() == Some("eth9") {
+            assert_eq!(get_iface(&state).await, "eth9");
+            break;
+        }
+        attempts += 1;
+        assert!(attempts < 20, "writers kept resetting the global name");
+    }
+
+    // `""` clears the live global again — the raw keeps the user's
+    // `""` (normalized away on the next load, like mihomo). Every
+    // other writer also commits `None`, so the cleared state is
+    // race-free to observe.
+    let resp = patch(r#"{"interface-name":""}"#).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
+    assert!(meow_common::global_interface_name().is_none());
+    assert_eq!(get_iface(&state).await, "");
+}
+
 #[tokio::test]
 async fn get_traffic() {
     let state = test_state_default();

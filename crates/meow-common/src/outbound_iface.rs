@@ -474,6 +474,41 @@ const fn unicast_if_v4(index: u32) -> u32 {
     index.to_be()
 }
 
+/// Bind `socket` — created in `domain` — to the interface `name` resolved
+/// **at call time** (mihomo's per-node/global `interface-name`, issue
+/// #974). Unlike the owner registry, whose index resolves once at install
+/// (a TUN listener's lifetime), a node-level name resolves per bind so a
+/// destroyed-and-recreated interface is followed. Linux binds by name
+/// (`SO_BINDTODEVICE` — the kernel resolves it); macOS and Windows
+/// resolve name→index through [`interface_index`], failing closed with
+/// `NotFound` when the name has no interface — a mis-typed name is an
+/// error, never a silently unbound socket.
+#[cfg(all(
+    not(target_env = "ohos"),
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
+pub(crate) fn bind_socket_to_name(
+    socket: &socket2::Socket,
+    domain: socket2::Domain,
+    name: &str,
+) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = domain;
+        socket.bind_device(Some(name.as_bytes()))
+    }
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        let index = interface_index(name)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("interface '{name}' does not exist"),
+            )
+        })?;
+        bind_socket(socket, domain, name, index)
+    }
+}
+
 #[cfg(test)]
 mod pure_tests {
     use super::*;

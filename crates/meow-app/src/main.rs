@@ -624,6 +624,18 @@ fn run_application_inner(
         // mihomo's `routing-mark` marks every outbound socket, from the first
         // provider fetch on (the deployer's rules exempt it).
         meow_common::set_routing_mark(raw.routing_mark);
+        // mihomo's `interface-name` (issue #974) binds every outbound
+        // socket likewise — installed before the build so the first
+        // provider fetch already takes it. A node's own `interface-name`
+        // and the loopback exemption outrank it inside the dial scope;
+        // `None`/empty clears.
+        meow_common::set_global_interface_name(
+            raw.interface_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(std::sync::Arc::from),
+        );
 
         let mut config = if args.config_string.is_some() {
             early_binding = preinstall_global_route_binding(&raw);

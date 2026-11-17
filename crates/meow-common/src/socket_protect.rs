@@ -191,6 +191,179 @@ pub async fn dns_via_proxy_dial_scope<F: std::future::Future>(fut: F) -> F::Outp
     IN_DNS_VIA_PROXY_DIAL.scope((), fut).await
 }
 
+// ─── Per-node dialer options (issue #974) ──────────────────────────────────
+//
+// mihomo's per-`proxies:`-entry dialer fields — `routing-mark`,
+// `interface-name`, `ip-version`, `tfo`, `mptcp` — plus the new top-level
+// `interface-name` global. The config layer parses each leaf's fields into
+// a [`crate::NodeDialerOpts`] carried by its `WrappedProxy`, which resolves
+// node-over-global at dial time and installs the result here as a
+// task-local scope around the adapter call. The socket helpers below —
+// `connect_tcp`, `bind_udp`/`bind_udp_for_peer`, `resolve_addrs` — read the
+// scope through [`dialer_opts`], so every socket a dial opens gets the
+// node's own options, including the WireGuard endpoint socket bound inside
+// `ensure_pump` (spec-delta: no WG carve-out).
+//
+// The scope REPLACES on nesting: a `dialer-proxy` front hop installs its
+// own options for the physical socket it opens, while the rear hop's
+// handshake rides the stream the front already built — matching mihomo,
+// where each hop's dialer options apply to the socket that hop opens.
+
+/// The address-family selection mihomo spells `ip-version` on a
+/// `proxies:` node (issue #974). Resolution-time only: an IP-literal
+/// `server:`/destination never reaches the filter because resolution
+/// short-circuits before it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum IpVersion {
+    /// Keep the resolver's order unchanged (`ip-version: dual`, default).
+    #[default]
+    Dual,
+    /// IPv4 candidates only; the dial fails when resolution yields none.
+    Ipv4,
+    /// IPv6 candidates only; the dial fails when resolution yields none.
+    Ipv6,
+    /// IPv4 candidates first, IPv6 kept as fallback — a stable reorder,
+    /// relative order inside each family preserved.
+    Ipv4Prefer,
+    /// IPv6 candidates first, IPv4 kept as fallback — likewise stable.
+    Ipv6Prefer,
+}
+
+impl std::fmt::Display for IpVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Dual => "dual",
+            Self::Ipv4 => "ipv4",
+            Self::Ipv6 => "ipv6",
+            Self::Ipv4Prefer => "ipv4-prefer",
+            Self::Ipv6Prefer => "ipv6-prefer",
+        })
+    }
+}
+
+impl IpVersion {
+    /// The [`std::fmt::Display`] strings' inverse — `None` for anything outside the
+    /// five mihomo spellings (the parser turns that into a hard config
+    /// error, it does not silently default).
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "dual" => Self::Dual,
+            "ipv4" => Self::Ipv4,
+            "ipv6" => Self::Ipv6,
+            "ipv4-prefer" => Self::Ipv4Prefer,
+            "ipv6-prefer" => Self::Ipv6Prefer,
+            _ => return None,
+        })
+    }
+}
+
+/// The top-level globals a node's options resolve over: `routing-mark`
+/// (the same `SO_MARK` [`set_routing_mark`] installs) and `interface-name`.
+#[derive(Debug, Clone, Default)]
+pub struct GlobalDialerOpts {
+    /// The global `SO_MARK`; `0` normalizes to unset, as everywhere else.
+    pub routing_mark: Option<u32>,
+    /// The global interface binding. A node's own `interface-name` wins.
+    pub interface_name: Option<Arc<str>>,
+}
+
+/// The installed global dialer options — `routing-mark` reads `0` as
+/// unset (the same normalization the parser and [`set_routing_mark`]
+/// share), `interface-name` from [`set_global_interface_name`].
+pub fn global_dialer_opts() -> GlobalDialerOpts {
+    GlobalDialerOpts {
+        routing_mark: Some(routing_mark()).filter(|mark| *mark != 0),
+        interface_name: global_interface_name(),
+    }
+}
+
+/// The dial-time effective options: a node's [`crate::NodeDialerOpts`]
+/// resolved over [`GlobalDialerOpts`], every field concrete. A
+/// `WrappedProxy` computes this per dial and installs it via
+/// [`dialer_opts_scope`]; the socket helpers read [`dialer_opts`].
+#[derive(Debug, Clone, Default)]
+pub struct DialerOpts {
+    /// Effective `SO_MARK` — node mark when set, else the global mark.
+    /// Linux-only; skipped with a one-time warning elsewhere.
+    pub routing_mark: Option<u32>,
+    /// Effective interface binding — node > global > TUN owner binding.
+    /// Resolved name→index at dial time; loopback peers stay exempt.
+    pub interface_name: Option<Arc<str>>,
+    /// Resolution-time family selection applied inside `resolve_addrs`
+    /// (and to `DirectAdapter`'s own resolver output).
+    pub ip_version: IpVersion,
+    /// `TCP_FASTOPEN_CONNECT` on the node's TCP sockets. Linux-only.
+    pub tfo: bool,
+    /// Build the node's TCP sockets as MPTCP (`IPPROTO_MPTCP`). Linux-only.
+    pub mptcp: bool,
+}
+
+impl DialerOpts {
+    /// Node fields over the globals — the node value wins wherever it set
+    /// one, mihomo's per-node-over-`interface-name`/`routing-mark`
+    /// shadowing (issue #974).
+    pub fn resolve(node: &crate::adapter::NodeDialerOpts, global: &GlobalDialerOpts) -> Self {
+        Self {
+            routing_mark: node.routing_mark.or(global.routing_mark),
+            interface_name: node
+                .interface_name
+                .clone()
+                .or_else(|| global.interface_name.clone()),
+            ip_version: node.ip_version,
+            tfo: node.tfo,
+            mptcp: node.mptcp,
+        }
+    }
+
+    /// Whether the plain Tokio dial/bind paths must step aside for the
+    /// `socket2` path: any option the fast path cannot express on the
+    /// socket (`ip-version` never qualifies — it is resolution-time).
+    pub fn needs_socket2(&self) -> bool {
+        self.routing_mark.is_some() || self.interface_name.is_some() || self.tfo || self.mptcp
+    }
+
+    /// Fill still-unset fields from [`global_dialer_opts`], making an
+    /// unscoped read see the globals a scoped value already resolved:
+    /// provider fetches, DNS upstreams and the built-in DIRECT run no
+    /// scope, but the global `interface-name`/`routing-mark` applies to
+    /// them exactly as mihomo's does.
+    fn with_global_fallbacks(mut self) -> Self {
+        let global = global_dialer_opts();
+        if self.routing_mark.is_none() {
+            self.routing_mark = global.routing_mark;
+        }
+        if self.interface_name.is_none() {
+            self.interface_name = global.interface_name;
+        }
+        self
+    }
+}
+
+tokio::task_local! {
+    /// The resolved [`DialerOpts`] a `WrappedProxy` installs around one
+    /// adapter dial. Task-local so the front hop of a `dialer-proxy` chain
+    /// scoping *its* physical dial never bleeds into the rear's handshake —
+    /// and a nested scope replaces rather than merges (each hop resolves
+    /// its own node-over-global).
+    static DIALER_OPTS: DialerOpts;
+}
+
+/// The dial scope's resolved options, with the globals merged into any
+/// unset slot. No scope = defaults plus globals — so the live
+/// `routing-mark`/`interface-name` still reach every socket a scoped or
+/// unscoped caller opens.
+pub fn dialer_opts() -> DialerOpts {
+    DIALER_OPTS
+        .try_with(Clone::clone)
+        .unwrap_or_default()
+        .with_global_fallbacks()
+}
+
+/// Run `fut` under `opts`, replacing any enclosing scope.
+pub async fn dialer_opts_scope<F: std::future::Future>(opts: DialerOpts, fut: F) -> F::Output {
+    DIALER_OPTS.scope(opts, fut).await
+}
+
 // ─── System-resolver result cache (Android / iOS only) ─────────────────────
 //
 // Backstop for the path that still hits libc `getaddrinfo` (no `HostResolver`
@@ -396,6 +569,27 @@ pub fn routing_mark() -> u32 {
     }
 }
 
+/// mihomo's top-level `interface-name` (issue #974): every outbound socket
+/// meow opens binds to this interface unless the node's own
+/// `interface-name` overrides it — and unless the socket's peer is
+/// loopback, which stays exempt like the TUN owner binding. The name is
+/// resolved to an index per dial (no cache), so a destroyed-and-recreated
+/// interface is followed. `None`/`""` = unset. The state compiles on every
+/// platform; the *binding* fails closed with `Unsupported` on platforms
+/// without per-socket binding (iOS, the BSDs), matching
+/// [`install_outbound_interface`]'s contract.
+static GLOBAL_INTERFACE_NAME: RwLock<Option<Arc<str>>> = RwLock::new(None);
+
+/// Install (or clear with `None`) the global `interface-name`.
+pub fn set_global_interface_name(name: Option<Arc<str>>) {
+    *GLOBAL_INTERFACE_NAME.write() = name;
+}
+
+/// The installed global `interface-name`, if any.
+pub fn global_interface_name() -> Option<Arc<str>> {
+    GLOBAL_INTERFACE_NAME.read().clone()
+}
+
 /// Holders of firewall rules that exempt the current routing mark (meow's
 /// managed tproxy tables): while any is alive the mark cannot change at
 /// runtime, or meow's own traffic would stop matching the exemption.
@@ -423,33 +617,12 @@ pub fn routing_mark_pinned() -> bool {
     ROUTING_MARK_PINS.load(std::sync::atomic::Ordering::Relaxed) > 0
 }
 
-#[cfg(all(
-    not(target_env = "ohos"),
-    any(target_os = "linux", target_os = "macos", target_os = "windows")
-))]
-fn routing_mark_set() -> bool {
-    routing_mark() != 0
-}
-
-/// `SO_MARK` on a `socket2` socket per [`ROUTING_MARK`] (`0` = unset).
-/// Linux-only by definition — `set_mark` exists on no other cfg target —
-/// so callers wrap the call in `#[cfg(target_os = "linux")]`. OpenHarmony
-/// counts as `linux` but its only callers are `not(target_env = "ohos")`,
-/// so the fn is excluded there too.
-#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-fn apply_routing_mark(socket: &socket2::Socket) -> io::Result<()> {
-    match ROUTING_MARK.load(std::sync::atomic::Ordering::Relaxed) {
-        0 => {}
-        mark => socket.set_mark(mark)?,
-    }
-    Ok(())
-}
-
 /// Dial an outbound TCP stream to an already-resolved [`SocketAddr`]. On
 /// Android, applies the installed `SocketProtector` (if any) to the
 /// socket fd before `connect()` so the connection bypasses the VPN.
-/// Desktop targets apply the installed outbound-interface policy, and on
-/// Linux the `routing-mark` `SO_MARK` (see [`set_routing_mark`]).
+/// Desktop targets apply the installed outbound-interface policy, on
+/// Linux the `routing-mark` `SO_MARK` (see [`set_routing_mark`]), and on
+/// all three the resolved per-node [`DialerOpts`] (issue #974).
 ///
 /// Callers that only have a hostname must use [`connect_tcp_host`] —
 /// passing a hostname here is a compile error by construction (the type
@@ -457,6 +630,16 @@ fn apply_routing_mark(socket: &socket2::Socket) -> io::Result<()> {
 /// silent regressions back into the system resolver; see the module docs
 /// for the loop-routing failure mode.
 pub async fn connect_tcp(addr: SocketAddr) -> io::Result<TcpStream> {
+    // Platforms without the socket2 dial path: an `interface-name` cannot
+    // be honored — fail closed rather than dial unbound, ahead of the
+    // protector early-return so even an Android-protected dial refuses to
+    // silently skip it; the Linux-only knobs degrade to a one-time
+    // warning like `set_routing_mark`'s.
+    #[cfg(all(
+        not(target_env = "ohos"),
+        not(any(target_os = "linux", target_os = "macos", target_os = "windows"))
+    ))]
+    reject_unsupported_dialer_opts(&dialer_opts())?;
     #[cfg(any(target_os = "android", target_env = "ohos", all(test, unix)))]
     {
         if let Some(p) = android::socket_protector() {
@@ -470,17 +653,20 @@ pub async fn connect_tcp(addr: SocketAddr) -> io::Result<TcpStream> {
     ));
     // TUN global-route loop avoidance (#375): when an outbound interface is
     // installed, bind the socket to it before connect() so the SYN already
-    // takes the physical route past the TUN default routes.
+    // takes the physical route past the TUN default routes. The resolved
+    // dialer opts (mark/interface/tfo/mptcp — the live mark already folds
+    // in through `dialer_opts()`) take the same socket2 path (issue #974).
     #[cfg(all(
         not(target_env = "ohos"),
         any(target_os = "linux", target_os = "macos", target_os = "windows")
     ))]
     {
-        if routing_mark_set()
+        let opts = dialer_opts();
+        if opts.needs_socket2()
             || (crate::outbound_iface::binds_peer(addr.ip())
                 && crate::outbound_iface::outbound_interface().is_some())
         {
-            return connect_tcp_iface_bound(addr).await;
+            return connect_tcp_with_opts(addr, &opts).await;
         }
     }
     #[cfg(not(target_env = "ohos"))]
@@ -489,28 +675,165 @@ pub async fn connect_tcp(addr: SocketAddr) -> io::Result<TcpStream> {
     }
 }
 
-/// Dial with the socket bound to the installed outbound interface
-/// (`SO_BINDTODEVICE` / `IP_BOUND_IF` / `IP_UNICAST_IF`) before `connect()`.
-/// Uses `tokio::net::TcpSocket` for the async connect so connection errors
-/// surface here, not on first I/O.
+/// `connect_tcp`'s socket2 path — the resolved [`DialerOpts`]
+/// (`routing-mark`, `interface-name`, `tfo`, `mptcp`; issue #974) applied
+/// before `connect()`, alongside the global mark and the TUN owner
+/// binding the fast-path check already routed through here.
+/// `ip-version` never reaches this far — it filtered the resolution
+/// upstream in `resolve_addrs`.
 // Unused on OpenHarmony, whose dials fail closed without a protector.
 #[cfg(all(
     not(target_env = "ohos"),
     any(target_os = "linux", target_os = "macos", target_os = "windows")
 ))]
-pub(crate) async fn connect_tcp_iface_bound(addr: SocketAddr) -> io::Result<TcpStream> {
+async fn connect_tcp_with_opts(addr: SocketAddr, opts: &DialerOpts) -> io::Result<TcpStream> {
     let domain = if addr.is_ipv4() {
         socket2::Domain::IPV4
     } else {
         socket2::Domain::IPV6
     };
-    let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+    // `opts.routing_mark` is the resolved mark — node mark when set, else
+    // the global — so `Some` is exactly "this socket carries a mark".
     #[cfg(target_os = "linux")]
-    apply_routing_mark(&socket)?;
-    crate::outbound_iface::apply_outbound_interface_for_peer(&socket, domain, addr.ip())?;
+    let protocol = if opts.mptcp {
+        socket2::Protocol::MPTCP
+    } else {
+        socket2::Protocol::TCP
+    };
+    #[cfg(not(target_os = "linux"))]
+    let protocol = socket2::Protocol::TCP;
+    let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(protocol))?;
+    #[cfg(target_os = "linux")]
+    if let Some(mark) = opts.routing_mark {
+        socket.set_mark(mark)?;
+    }
+    #[cfg(target_os = "linux")]
+    if opts.tfo {
+        apply_tcp_fastopen_connect(&socket)?;
+    }
+    warn_linux_only_skipped(opts, true);
+    apply_interface_binding(&socket, domain, addr.ip(), opts)?;
     socket.set_nonblocking(true)?;
     let tokio_socket = tokio::net::TcpSocket::from_std_stream(socket.into());
     tokio_socket.connect(addr).await
+}
+
+/// Compatibility shim for [`connect_tcp_with_opts`] under the options in
+/// scope — the `outbound_iface` tests drive the bound path directly.
+#[cfg(all(
+    test,
+    not(target_env = "ohos"),
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
+pub(crate) async fn connect_tcp_iface_bound(addr: SocketAddr) -> io::Result<TcpStream> {
+    connect_tcp_with_opts(addr, &dialer_opts()).await
+}
+
+/// `TCP_FASTOPEN_CONNECT`: the `connect()` itself carries the TFO cookie
+/// request — the `sendmsg`-with-`MSG_FASTOPEN` shape is the alternative
+/// and stays an open question (see the issue's spec notes). Linux-only;
+/// a failure here fails the dial like the other socket options.
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+fn apply_tcp_fastopen_connect(socket: &socket2::Socket) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let enable: libc::c_int = 1;
+    // SAFETY: `socket` keeps the fd alive for the call and `enable` is the
+    // int value `TCP_FASTOPEN_CONNECT` expects.
+    if unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_FASTOPEN_CONNECT,
+            std::ptr::addr_of!(enable).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Off-Linux the three socket-level dialer options have no setsockopt to
+/// land on: mihomo skips them silently there, but a silent miss is harder
+/// to debug than one line — warn once per option instead. `tcp` gates
+/// `tfo`/`mptcp`: both are TCP-only, so the UDP path never warns on them.
+#[cfg(all(
+    not(target_env = "ohos"),
+    any(target_os = "macos", target_os = "windows")
+))]
+fn warn_linux_only_skipped(opts: &DialerOpts, tcp: bool) {
+    use std::sync::Once;
+    static MARK: Once = Once::new();
+    static TFO: Once = Once::new();
+    static MPTCP: Once = Once::new();
+    if opts.routing_mark.is_some() {
+        MARK.call_once(|| {
+            tracing::warn!("routing-mark is Linux-only; the per-node mark is ignored");
+        });
+    }
+    if tcp && opts.tfo {
+        TFO.call_once(|| tracing::warn!("tfo is Linux-only; ignored on this platform"));
+    }
+    if tcp && opts.mptcp {
+        MPTCP.call_once(|| tracing::warn!("mptcp is Linux-only; ignored on this platform"));
+    }
+}
+
+/// On Linux every knob lands — nothing to warn about.
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+fn warn_linux_only_skipped(_opts: &DialerOpts, _tcp: bool) {}
+
+/// Platforms with no socket2 dial path at all: a configured
+/// `interface-name` fails closed (`Unsupported`), matching
+/// [`install_outbound_interface`]'s posture; the Linux-only knobs warn
+/// once and are skipped, as on macOS/Windows.
+#[cfg(all(
+    not(target_env = "ohos"),
+    not(any(target_os = "linux", target_os = "macos", target_os = "windows"))
+))]
+fn reject_unsupported_dialer_opts(opts: &DialerOpts) -> io::Result<()> {
+    if let Some(name) = &opts.interface_name {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("interface-name '{name}' is not supported on this platform"),
+        ));
+    }
+    if opts.routing_mark.is_some() || opts.tfo || opts.mptcp {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(
+                "per-node dialer options (routing-mark/tfo/mptcp) are not supported \
+                 on this platform; ignored"
+            );
+        });
+    }
+    Ok(())
+}
+
+/// Interface binding shared by the TCP/UDP socket2 paths. An explicit
+/// `interface-name` — node first, global otherwise — wins over the TUN
+/// owner binding; a loopback peer stays unbound either way, the same
+/// exemption `binds_peer` gives the TUN path (a socket scoped to a
+/// physical interface cannot reach a loopback peer, and localhost dials
+/// — external SIP003 plugin endpoints, test fixtures — must keep working).
+#[cfg(all(
+    not(target_env = "ohos"),
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
+fn apply_interface_binding(
+    socket: &socket2::Socket,
+    domain: socket2::Domain,
+    peer: IpAddr,
+    opts: &DialerOpts,
+) -> io::Result<()> {
+    match &opts.interface_name {
+        Some(name) if crate::outbound_iface::binds_peer(peer) => {
+            crate::outbound_iface::bind_socket_to_name(socket, domain, name)
+        }
+        Some(_) => Ok(()),
+        None => crate::outbound_iface::apply_outbound_interface_for_peer(socket, domain, peer),
+    }
 }
 
 /// Single resolution chokepoint shared by [`connect_tcp_host`],
@@ -534,34 +857,75 @@ pub(crate) async fn connect_tcp_iface_bound(addr: SocketAddr) -> io::Result<TcpS
 async fn resolve_addrs(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
     // `metadata_ip_literal` folds bracketed IPv6 display forms (`[::1]`)
     // into the literal — a `server:`/`BND.ADDR` string may arrive in that
-    // shape and must not fall through to DNS (issue #701).
+    // shape and must not fall through to DNS (issue #701). The literal
+    // also bypasses `ip-version`: it is not resolution output.
     if let Some(ip) = crate::metadata_ip_literal(host) {
         return Ok(vec![SocketAddr::new(ip, port)]);
     }
 
-    match host_resolver() {
+    // Every resolution path — hook, hook re-entry, system — converges here
+    // so the scope's `ip-version` filter applies once to them all
+    // (spec-delta for issue #974: the hook path must not escape it).
+    let addrs = match host_resolver() {
         Some(r) if in_host_resolver() => {
             // Re-entered: answer from what the hook already knows, and only
             // fall through to the system resolver when it knows nothing.
-            if let Some(ips) = r.resolve_all_local(host) {
-                if !ips.is_empty() {
-                    return Ok(ips
-                        .into_iter()
-                        .map(|ip| SocketAddr::new(ip, port))
-                        .collect());
+            match r.resolve_all_local(host).filter(|ips| !ips.is_empty()) {
+                Some(ips) => ips
+                    .into_iter()
+                    .map(|ip| SocketAddr::new(ip, port))
+                    .collect(),
+                None => {
+                    tracing::debug!(
+                        host,
+                        "resolve: re-entrant host-resolver call (a DNS upstream dials through a \
+                         proxy) — using the system resolver for this hop to avoid a lookup cycle"
+                    );
+                    resolve_addrs_system(host, port).await?
                 }
             }
-            tracing::debug!(
-                host,
-                "resolve: re-entrant host-resolver call (a DNS upstream dials through a \
-                 proxy) — using the system resolver for this hop to avoid a lookup cycle"
-            );
         }
-        Some(r) => return resolve_via_hook(r.as_ref(), host, port).await,
-        None => {}
-    }
+        Some(r) => resolve_via_hook(r.as_ref(), host, port).await?,
+        None => resolve_addrs_system(host, port).await?,
+    };
 
-    resolve_addrs_system(host, port).await
+    apply_ip_version_filter(addrs, dialer_opts().ip_version)
+        .map_err(|e| io::Error::new(e.kind(), format!("resolve {host}:{port}: {e}")))
+}
+
+/// Apply `version`'s family selection to resolved `addrs` (mihomo
+/// `ip-version`, issue #974): `dual` keeps resolver order; the exact
+/// modes keep one family and error when none remain; the `prefer` modes
+/// stable-sort that family first — relative order inside each family
+/// preserved, and an empty result is still an error. `to_canonical`
+/// classifies IPv4-mapped IPv6 addresses as IPv4, the same fold
+/// `bind_udp_for_peer`/`canonical_socket_addr` use downstream.
+///
+/// Public so `DirectAdapter::resolve_targets` applies the same filter to
+/// its own resolver view (the `type: direct` node's *target* hostname,
+/// where `ip-version` selects the egress family, not the server).
+pub fn apply_ip_version_filter(
+    addrs: Vec<SocketAddr>,
+    version: IpVersion,
+) -> io::Result<Vec<SocketAddr>> {
+    if version == IpVersion::Dual {
+        return Ok(addrs);
+    }
+    let v4 = matches!(version, IpVersion::Ipv4 | IpVersion::Ipv4Prefer);
+    let (primary, secondary): (Vec<SocketAddr>, Vec<SocketAddr>) = addrs
+        .into_iter()
+        .partition(|addr| addr.ip().to_canonical().is_ipv4() == v4);
+    let filtered: Vec<SocketAddr> = match version {
+        IpVersion::Ipv4 | IpVersion::Ipv6 => primary,
+        _ => primary.into_iter().chain(secondary).collect(),
+    };
+    if filtered.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("ip-version {version}: no matching address family"),
+        ));
+    }
+    Ok(filtered)
 }
 
 /// The system-resolver tail of [`resolve_addrs`]: warm single-flight cache,
@@ -627,23 +991,29 @@ pub async fn resolve_host_all_via(
     if let Some(ip) = crate::metadata_ip_literal(host) {
         return Ok(vec![SocketAddr::new(ip, port)]);
     }
-    if in_host_resolver() {
-        if let Some(ips) = r.resolve_all_local(host) {
-            if !ips.is_empty() {
-                return Ok(ips
-                    .into_iter()
-                    .map(|ip| SocketAddr::new(ip, port))
-                    .collect());
+    let addrs = if in_host_resolver() {
+        match r.resolve_all_local(host).filter(|ips| !ips.is_empty()) {
+            Some(ips) => ips
+                .into_iter()
+                .map(|ip| SocketAddr::new(ip, port))
+                .collect(),
+            None => {
+                tracing::debug!(
+                    host,
+                    "resolve: re-entrant resolver call — using the system resolver for this \
+                     hop to avoid a lookup cycle"
+                );
+                resolve_addrs_system(host, port).await?
             }
         }
-        tracing::debug!(
-            host,
-            "resolve: re-entrant resolver call — using the system resolver for this \
-             hop to avoid a lookup cycle"
-        );
-        return resolve_addrs_system(host, port).await;
-    }
-    resolve_via_hook(r, host, port).await
+    } else {
+        resolve_via_hook(r, host, port).await?
+    };
+    // The injected-resolver path resolves the same node-level names
+    // `resolve_addrs` does (the WireGuard endpoint), so the dial scope's
+    // `ip-version` filters it identically (issue #974).
+    apply_ip_version_filter(addrs, dialer_opts().ip_version)
+        .map_err(|e| io::Error::new(e.kind(), format!("resolve {host}:{port}: {e}")))
 }
 
 /// Run one [`HostResolver`] lookup with [`IN_HOST_RESOLVER`] set, so a dial
@@ -983,6 +1353,14 @@ async fn bind_udp_with_peer<A: ToSocketAddrs>(
         any(target_os = "linux", target_os = "macos", target_os = "windows")
     )))]
     let _ = peer;
+    // Ahead of the protector early-return for the same reason as
+    // `connect_tcp`: an `interface-name` the platform cannot honor must
+    // fail closed, not dial unbound.
+    #[cfg(all(
+        not(target_env = "ohos"),
+        not(any(target_os = "linux", target_os = "macos", target_os = "windows"))
+    ))]
+    reject_unsupported_dialer_opts(&dialer_opts())?;
     #[cfg(any(target_os = "android", target_env = "ohos", all(test, unix)))]
     {
         if let Some(p) = android::socket_protector() {
@@ -1003,19 +1381,22 @@ async fn bind_udp_with_peer<A: ToSocketAddrs>(
     // TUN global-route loop avoidance (#375): bind the socket to the
     // installed outbound interface before the local-address bind, mirroring
     // `connect_tcp` — so the first datagram already bypasses the TUN routes.
+    // The resolved dialer opts (mark/interface; issue #974 — `tfo`/`mptcp`
+    // are TCP-only) take the same socket2 path.
     #[cfg(all(
         not(target_env = "ohos"),
         any(target_os = "linux", target_os = "macos", target_os = "windows")
     ))]
     {
-        if routing_mark_set() || crate::outbound_iface::outbound_interface().is_some() {
+        let opts = dialer_opts();
+        if opts.needs_socket2() || crate::outbound_iface::outbound_interface().is_some() {
             let resolved = tokio::net::lookup_host(local)
                 .await?
                 .next()
                 .ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidInput, "bind_udp: no address resolved")
                 })?;
-            return bind_udp_iface_bound(resolved, peer.unwrap_or(resolved.ip()));
+            return bind_udp_with_opts(resolved, peer.unwrap_or(resolved.ip()), &opts);
         }
     }
     #[cfg(not(target_env = "ohos"))]
@@ -1024,17 +1405,18 @@ async fn bind_udp_with_peer<A: ToSocketAddrs>(
     }
 }
 
-/// Bind a UDP socket to the installed outbound interface
-/// (`SO_BINDTODEVICE` / `IP_BOUND_IF` / `IP_UNICAST_IF`), then to `local`.
-/// The destination determines whether the interface binding is required.
-/// A socket pinned to a loopback `local` address is left unbound where the
-/// platform's binding would break it (see `outbound_iface::binds_peer`).
+/// `bind_udp_with_peer`'s socket2 path — the resolved [`DialerOpts`]
+/// (`routing-mark`, `interface-name`; issue #974) applied before the
+/// local-address bind, alongside the TUN owner binding the fast-path check
+/// already routed here. `peer` decides the loopback exemption, exactly as
+/// the installed-binding path's does. `tfo`/`mptcp` are TCP-only — they
+/// never apply (nor warn) on a datagram socket.
 // Unused on OpenHarmony, whose dials fail closed without a protector.
 #[cfg(all(
     not(target_env = "ohos"),
     any(target_os = "linux", target_os = "macos", target_os = "windows")
 ))]
-pub(crate) fn bind_udp_iface_bound(local: SocketAddr, peer: IpAddr) -> io::Result<UdpSocket> {
+fn bind_udp_with_opts(local: SocketAddr, peer: IpAddr, opts: &DialerOpts) -> io::Result<UdpSocket> {
     let domain = if local.is_ipv4() {
         socket2::Domain::IPV4
     } else {
@@ -1042,11 +1424,25 @@ pub(crate) fn bind_udp_iface_bound(local: SocketAddr, peer: IpAddr) -> io::Resul
     };
     let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
     #[cfg(target_os = "linux")]
-    apply_routing_mark(&socket)?;
-    crate::outbound_iface::apply_outbound_interface_for_peer(&socket, domain, peer)?;
+    if let Some(mark) = opts.routing_mark {
+        socket.set_mark(mark)?;
+    }
+    warn_linux_only_skipped(opts, false);
+    apply_interface_binding(&socket, domain, peer, opts)?;
     socket.bind(&local.into())?;
     socket.set_nonblocking(true)?;
     UdpSocket::from_std(socket.into())
+}
+
+/// Compatibility shim for [`bind_udp_with_opts`] under the options in
+/// scope — the `outbound_iface` tests drive the bound path directly.
+#[cfg(all(
+    test,
+    not(target_env = "ohos"),
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
+pub(crate) fn bind_udp_iface_bound(local: SocketAddr, peer: IpAddr) -> io::Result<UdpSocket> {
+    bind_udp_with_opts(local, peer, &dialer_opts())
 }
 
 #[cfg(all(test, unix))]
@@ -1723,6 +2119,282 @@ mod tests {
         );
 
         clear_host_resolver();
+    }
+
+    // ─── per-node dialer opts (issue #974) ─────────────────────────────────
+
+    #[test]
+    fn ip_version_names_roundtrip_and_reject_unknown() {
+        for (name, want) in [
+            ("dual", IpVersion::Dual),
+            ("ipv4", IpVersion::Ipv4),
+            ("ipv6", IpVersion::Ipv6),
+            ("ipv4-prefer", IpVersion::Ipv4Prefer),
+            ("ipv6-prefer", IpVersion::Ipv6Prefer),
+        ] {
+            assert_eq!(IpVersion::from_name(name), Some(want), "{name}");
+            assert_eq!(want.to_string(), name, "{name}");
+        }
+        for bad in ["", "ipv4prefer", "v4", "IPV4", "dual-stack"] {
+            assert_eq!(IpVersion::from_name(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn resolve_fills_node_over_global() {
+        let node = crate::NodeDialerOpts {
+            routing_mark: Some(7),
+            ..Default::default()
+        };
+        let global = GlobalDialerOpts {
+            routing_mark: Some(3),
+            interface_name: Some(Arc::from("en0")),
+        };
+        let resolved = DialerOpts::resolve(&node, &global);
+        // Set node fields win; unset ones inherit the global.
+        assert_eq!(resolved.routing_mark, Some(7));
+        assert_eq!(resolved.interface_name.as_deref(), Some("en0"));
+        // A node interface-name shadows the global.
+        let node = crate::NodeDialerOpts {
+            interface_name: Some(Arc::from("utun3")),
+            ..Default::default()
+        };
+        let resolved = DialerOpts::resolve(&node, &global);
+        assert_eq!(resolved.routing_mark, Some(3));
+        assert_eq!(resolved.interface_name.as_deref(), Some("utun3"));
+    }
+
+    #[test]
+    fn needs_socket2_only_for_socket_options() {
+        assert!(!DialerOpts::default().needs_socket2());
+        // `ip-version` is resolution-time — never enough by itself.
+        assert!(!DialerOpts {
+            ip_version: IpVersion::Ipv6,
+            ..Default::default()
+        }
+        .needs_socket2());
+        assert!(DialerOpts {
+            routing_mark: Some(1),
+            ..Default::default()
+        }
+        .needs_socket2());
+        assert!(DialerOpts {
+            interface_name: Some(Arc::from("en0")),
+            ..Default::default()
+        }
+        .needs_socket2());
+        assert!(DialerOpts {
+            tfo: true,
+            ..Default::default()
+        }
+        .needs_socket2());
+        assert!(DialerOpts {
+            mptcp: true,
+            ..Default::default()
+        }
+        .needs_socket2());
+    }
+
+    #[tokio::test]
+    async fn scope_replaces_nested_and_reads_globals_outside() {
+        let _g = LOCK.lock().await;
+        set_global_interface_name(Some(Arc::from("en0")));
+        let outer = DialerOpts {
+            ip_version: IpVersion::Ipv6,
+            tfo: true,
+            ..Default::default()
+        };
+        let inner = DialerOpts {
+            ip_version: IpVersion::Ipv4,
+            ..Default::default()
+        };
+        dialer_opts_scope(outer, async {
+            let opts = dialer_opts();
+            assert_eq!(opts.ip_version, IpVersion::Ipv6);
+            assert!(opts.tfo);
+            // An unset slot still inherits the global.
+            assert_eq!(opts.interface_name.as_deref(), Some("en0"));
+            dialer_opts_scope(inner, async {
+                // Nesting REPLACES — the front hop's own options, never a
+                // merge of the rear's.
+                let opts = dialer_opts();
+                assert_eq!(opts.ip_version, IpVersion::Ipv4);
+                assert!(!opts.tfo);
+            })
+            .await;
+            // The enclosing scope is restored on the way out.
+            assert_eq!(dialer_opts().ip_version, IpVersion::Ipv6);
+        })
+        .await;
+        // Outside any scope: defaults plus globals.
+        let opts = dialer_opts();
+        assert_eq!(opts.ip_version, IpVersion::Dual);
+        assert_eq!(opts.interface_name.as_deref(), Some("en0"));
+        set_global_interface_name(None);
+        assert!(dialer_opts().interface_name.is_none());
+    }
+
+    #[test]
+    fn ip_version_filter_modes_stable_order_and_canonical() {
+        let v4a: SocketAddr = "192.0.2.1:443".parse().unwrap();
+        let v4b: SocketAddr = "192.0.2.2:443".parse().unwrap();
+        let v6a: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+        let v6b: SocketAddr = "[2001:db8::2]:443".parse().unwrap();
+        let mixed = vec![v4a, v6a, v4b, v6b];
+
+        // `dual` is the identity — resolver order untouched.
+        assert_eq!(
+            apply_ip_version_filter(mixed.clone(), IpVersion::Dual).unwrap(),
+            mixed
+        );
+        // Exact modes keep one family, in resolver order.
+        assert_eq!(
+            apply_ip_version_filter(mixed.clone(), IpVersion::Ipv4).unwrap(),
+            vec![v4a, v4b]
+        );
+        assert_eq!(
+            apply_ip_version_filter(mixed.clone(), IpVersion::Ipv6).unwrap(),
+            vec![v6a, v6b]
+        );
+        // Prefer modes stable-reorder: family first, order inside each
+        // family preserved.
+        assert_eq!(
+            apply_ip_version_filter(mixed.clone(), IpVersion::Ipv4Prefer).unwrap(),
+            vec![v4a, v4b, v6a, v6b]
+        );
+        assert_eq!(
+            apply_ip_version_filter(mixed, IpVersion::Ipv6Prefer).unwrap(),
+            vec![v6a, v6b, v4a, v4b]
+        );
+        // An empty family errors for the exact modes…
+        let v4_only = vec![v4a, v4b];
+        assert!(apply_ip_version_filter(v4_only.clone(), IpVersion::Ipv6).is_err());
+        // …but a prefer mode over one family still returns it.
+        assert_eq!(
+            apply_ip_version_filter(v4_only.clone(), IpVersion::Ipv4Prefer).unwrap(),
+            v4_only
+        );
+        // An IPv4-mapped IPv6 address classifies as IPv4 (`to_canonical`),
+        // the same fold the egress checks downstream apply.
+        let mapped: SocketAddr = "[::ffff:192.0.2.9]:443".parse().unwrap();
+        assert_eq!(
+            apply_ip_version_filter(vec![v6a, mapped], IpVersion::Ipv4).unwrap(),
+            vec![mapped]
+        );
+        // Empty input errors rather than passing through silently.
+        assert!(apply_ip_version_filter(Vec::new(), IpVersion::Dual)
+            .unwrap()
+            .is_empty());
+        assert!(apply_ip_version_filter(Vec::new(), IpVersion::Ipv4).is_err());
+    }
+
+    #[tokio::test]
+    async fn resolve_addrs_literal_bypasses_filter_and_resolver() {
+        let _g = LOCK.lock().await;
+        clear_host_resolver();
+        set_host_resolver(Arc::new(FailingResolver) as Arc<dyn HostResolver>);
+        // Even under an `ipv6` scope a literal returns verbatim — it is
+        // not resolution output (bracketed forms fold the same way).
+        let scoped = DialerOpts {
+            ip_version: IpVersion::Ipv6,
+            ..Default::default()
+        };
+        let literal: SocketAddr = "127.0.0.1:53".parse().unwrap();
+        assert_eq!(
+            dialer_opts_scope(scoped.clone(), resolve_addrs("127.0.0.1", 53))
+                .await
+                .unwrap(),
+            vec![literal]
+        );
+        let v6_literal: SocketAddr = "[::1]:53".parse().unwrap();
+        assert_eq!(
+            dialer_opts_scope(scoped, resolve_addrs("[::1]", 53))
+                .await
+                .unwrap(),
+            vec![v6_literal]
+        );
+        clear_host_resolver();
+    }
+
+    #[tokio::test]
+    async fn resolve_addrs_filters_all_resolution_paths() {
+        let _g = LOCK.lock().await;
+        clear_host_resolver();
+        let v4: SocketAddr = "192.0.2.1:53".parse().unwrap();
+        let v6: SocketAddr = "[2001:db8::5]:53".parse().unwrap();
+        let resolver =
+            FixedResolver::new_all(vec![v6.ip(), v4.ip(), IpAddr::V6(Ipv6Addr::LOCALHOST)]);
+        set_host_resolver(Arc::clone(&resolver) as Arc<dyn HostResolver>);
+        let scoped = |ip_version| DialerOpts {
+            ip_version,
+            ..Default::default()
+        };
+        // The installed-hook path filters like the system path would.
+        let got = dialer_opts_scope(scoped(IpVersion::Ipv4), resolve_addrs("h.test", 53))
+            .await
+            .unwrap();
+        assert_eq!(got, vec![v4], "ipv4 keeps only the v4 candidate");
+        let got = dialer_opts_scope(scoped(IpVersion::Ipv6Prefer), resolve_addrs("h.test", 53))
+            .await
+            .unwrap();
+        assert_eq!(got.first(), Some(&v6), "prefer reorders, keeps both");
+        assert_eq!(got.len(), 3);
+        // A filtered-out family is a resolution failure with context.
+        let resolver_v6 = FixedResolver::new_all(vec![IpAddr::V6(Ipv6Addr::LOCALHOST)]);
+        set_host_resolver(Arc::clone(&resolver_v6) as Arc<dyn HostResolver>);
+        let err = dialer_opts_scope(scoped(IpVersion::Ipv4), resolve_addrs("h.test", 53))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("h.test:53"), "{err}");
+        assert!(err.to_string().contains("ipv4"), "{err}");
+        clear_host_resolver();
+    }
+
+    #[tokio::test]
+    async fn resolve_host_all_via_filters_under_scope() {
+        let _g = LOCK.lock().await;
+        let v4 = IpAddr::from([192, 0, 2, 1]);
+        let v6 = IpAddr::V6(Ipv6Addr::LOCALHOST);
+        let resolver = FixedResolver::new_all(vec![v4, v6]);
+        let scoped = DialerOpts {
+            ip_version: IpVersion::Ipv6,
+            ..Default::default()
+        };
+        // The injected-resolver path (WireGuard's endpoint lookup) takes
+        // the same filter — it must not escape `ip-version`.
+        let got = dialer_opts_scope(
+            scoped,
+            resolve_host_all_via(resolver.as_ref(), "ep.test", 51820),
+        )
+        .await
+        .unwrap();
+        assert_eq!(got, vec![SocketAddr::new(v6, 51820)]);
+    }
+
+    #[tokio::test]
+    async fn global_interface_name_round_trip() {
+        let _g = LOCK.lock().await;
+        assert!(global_interface_name().is_none());
+        set_global_interface_name(Some(Arc::from("en0")));
+        assert_eq!(global_interface_name().as_deref(), Some("en0"));
+        // The global reaches the resolved dialer opts of an unscoped read.
+        assert_eq!(
+            dialer_opts().interface_name.as_deref(),
+            Some("en0"),
+            "unscoped callers still see the global"
+        );
+        // …and of a scoped read whose node set nothing.
+        let scoped = DialerOpts {
+            ip_version: IpVersion::Ipv4,
+            ..Default::default()
+        };
+        dialer_opts_scope(scoped, async {
+            assert_eq!(dialer_opts().interface_name.as_deref(), Some("en0"));
+        })
+        .await;
+        set_global_interface_name(None);
+        assert!(global_interface_name().is_none());
+        assert!(dialer_opts().interface_name.is_none());
     }
 }
 
