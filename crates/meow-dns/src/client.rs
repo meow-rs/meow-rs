@@ -321,6 +321,13 @@ pub struct DnsClient {
     /// full dial + handshake.
     #[cfg(feature = "encrypted")]
     tls_pool_disabled: bool,
+    /// DoH only: the upstream's shared HTTP/2 connection, set once a
+    /// fresh conn negotiated `h2` and answered. Unlike `tls_pool` it is
+    /// not checked out: concurrent queries each open a stream on it, so
+    /// response matching stays per stream. Servers that pick `http/1.1`
+    /// never fill it and keep using `tls_pool`.
+    #[cfg(feature = "doh-h2")]
+    doh_h2: parking_lot::Mutex<Option<Arc<DohH2Conn>>>,
     /// Pooled conns rejected by the pre-checkout liveness probe —
     /// test/debug instrumentation separating "the probe caught the dead
     /// conn" from "the exchange-time EOF did": identical at accept-count
@@ -332,8 +339,8 @@ pub struct DnsClient {
     /// re-dials by itself, so one client owns one connection per upstream.
     #[cfg(feature = "quic-dns")]
     quic: Option<Arc<QuicUpstream>>,
-    /// The HTTP/1.1 DoH client a `prefer-h3` entry falls back to when the
-    /// QUIC exchange fails. Built at construction so the fallback keeps its
+    /// The HTTP/2 / HTTP/1.1 DoH client a `prefer-h3` entry falls back to
+    /// when the QUIC exchange fails. Built at construction so the fallback keeps its
     /// own TLS session pool, proxy tag and certificate roots.
     #[cfg(feature = "quic-dns")]
     doh_h1: Option<Box<DnsClient>>,
@@ -412,6 +419,61 @@ impl PoolElement for PooledTls {
             // context exists anyway; failure and timeout are ignored.
             let _ = tokio::time::timeout(POLITE_CLOSE_BUDGET, self.stream.shutdown()).await;
         })
+    }
+}
+
+/// A DoH upstream's shared HTTP/2 connection. Every query clones the
+/// `Arc` for the length of its stream; the connection task is aborted
+/// when the last clone drops, so retiring it from
+/// [`DnsClient::doh_h2`] never cuts a stream already in flight.
+#[cfg(feature = "doh-h2")]
+struct DohH2Conn {
+    send: h2::client::SendRequest<bytes::Bytes>,
+    /// The task driving the connection's frames. Finished means the
+    /// connection is gone (GOAWAY, reset, I/O error).
+    driver: tokio::task::AbortHandle,
+    /// The pool generation captured before the conn was dialed, so
+    /// [`reset_pooled_connections`] and [`DnsClient::reset_connections`]
+    /// retire it like a pooled TLS conn (issue #695).
+    generation: PoolGeneration,
+    use_state: parking_lot::Mutex<DohH2Use>,
+}
+
+#[cfg(feature = "doh-h2")]
+#[derive(Clone, Copy)]
+struct DohH2Use {
+    /// End of the last successful exchange: past [`TLS_POOL_IDLE_TIMEOUT`]
+    /// the conn is dropped rather than reused, like an idle pooled conn.
+    last_used: Instant,
+    /// The last successful exchange's duration, the input to
+    /// [`tls_reuse_budget`].
+    est_rtt: Duration,
+}
+
+#[cfg(feature = "doh-h2")]
+impl DohH2Conn {
+    fn reusable(&self, generation: PoolGeneration, now: Instant) -> bool {
+        !self.driver.is_finished()
+            && self.generation == generation
+            && now.duration_since(self.use_state.lock().last_used) < TLS_POOL_IDLE_TIMEOUT
+    }
+
+    fn est_rtt(&self) -> Duration {
+        self.use_state.lock().est_rtt
+    }
+
+    fn record_exchange(&self, est_rtt: Duration) {
+        *self.use_state.lock() = DohH2Use {
+            last_used: Instant::now(),
+            est_rtt,
+        };
+    }
+}
+
+#[cfg(feature = "doh-h2")]
+impl Drop for DohH2Conn {
+    fn drop(&mut self) {
+        self.driver.abort();
     }
 }
 
@@ -608,8 +670,8 @@ enum Transport {
         addr: SocketAddr,
         sni: Arc<str>,
     },
-    /// DNS over HTTPS over HTTP/3 — mihomo `prefer-h3`, with the HTTP/1.1
-    /// DoH path as the fallback (`self.doh_h1`).
+    /// DNS over HTTPS over HTTP/3 — mihomo `prefer-h3`, with the HTTP/2 /
+    /// HTTP/1.1 DoH path as the fallback (`self.doh_h1`).
     #[cfg(feature = "quic-dns")]
     Doh3 {
         addr: SocketAddr,
@@ -654,6 +716,8 @@ impl DnsClient {
             tls_pool: Pool::new(TLS_POOL_CAPACITY, TLS_POOL_IDLE_TIMEOUT),
             #[cfg(feature = "encrypted")]
             tls_pool_disabled: false,
+            #[cfg(feature = "doh-h2")]
+            doh_h2: parking_lot::Mutex::new(None),
             #[cfg(all(feature = "encrypted", any(test, debug_assertions)))]
             probe_dead: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "quic-dns")]
@@ -678,6 +742,8 @@ impl DnsClient {
             tls_pool: Pool::new(TLS_POOL_CAPACITY, TLS_POOL_IDLE_TIMEOUT),
             #[cfg(feature = "encrypted")]
             tls_pool_disabled: false,
+            #[cfg(feature = "doh-h2")]
+            doh_h2: parking_lot::Mutex::new(None),
             #[cfg(all(feature = "encrypted", any(test, debug_assertions)))]
             probe_dead: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "quic-dns")]
@@ -702,6 +768,8 @@ impl DnsClient {
             tls_pool: Pool::new(TLS_POOL_CAPACITY, TLS_POOL_IDLE_TIMEOUT),
             #[cfg(feature = "encrypted")]
             tls_pool_disabled: false,
+            #[cfg(feature = "doh-h2")]
+            doh_h2: parking_lot::Mutex::new(None),
             #[cfg(all(feature = "encrypted", any(test, debug_assertions)))]
             probe_dead: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "quic-dns")]
@@ -730,6 +798,8 @@ impl DnsClient {
             tls_pool: Pool::new(TLS_POOL_CAPACITY, TLS_POOL_IDLE_TIMEOUT),
             #[cfg(feature = "encrypted")]
             tls_pool_disabled: false,
+            #[cfg(feature = "doh-h2")]
+            doh_h2: parking_lot::Mutex::new(None),
             #[cfg(all(feature = "encrypted", any(test, debug_assertions)))]
             probe_dead: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "quic-dns")]
@@ -739,7 +809,9 @@ impl DnsClient {
         }
     }
 
-    /// DNS over HTTPS (RFC 8484) — HTTP/1.1 POST application/dns-message.
+    /// DNS over HTTPS (RFC 8484) — `POST application/dns-message` over the
+    /// ALPN-negotiated version: HTTP/2 when the server picks it, HTTP/1.1
+    /// otherwise.
     #[cfg(feature = "encrypted")]
     pub fn doh(addr: SocketAddr, sni: &str, path: &str) -> Self {
         Self {
@@ -759,6 +831,8 @@ impl DnsClient {
             tls_pool: Pool::new(TLS_POOL_CAPACITY, TLS_POOL_IDLE_TIMEOUT),
             #[cfg(feature = "encrypted")]
             tls_pool_disabled: false,
+            #[cfg(feature = "doh-h2")]
+            doh_h2: parking_lot::Mutex::new(None),
             #[cfg(all(feature = "encrypted", any(test, debug_assertions)))]
             probe_dead: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "quic-dns")]
@@ -790,12 +864,12 @@ impl DnsClient {
     /// DNS over HTTPS over HTTP/3 — the `prefer-h3` form of a `https://`
     /// entry.
     ///
-    /// The HTTP/1.1 DoH client built here is the fallback: when the QUIC
-    /// exchange fails (no h3 support, UDP blocked, connection loss) the
-    /// exchange is retried over HTTP/1.1, and a failed handshake parks h3 for
-    /// this upstream so the next query does not pay a second timeout. The
-    /// fallback shares this client's timeout, proxy tag, certificate roots and
-    /// TLS session pool.
+    /// The DoH client built here is the fallback: when the QUIC exchange
+    /// fails (no h3 support, UDP blocked, connection loss) the exchange is
+    /// retried over it — HTTP/2 or HTTP/1.1 as its own ALPN negotiates — and
+    /// a failed handshake parks h3 for this upstream so the next query does
+    /// not pay a second timeout. The fallback shares this client's timeout,
+    /// proxy tag, certificate roots and TLS session pool.
     #[cfg(feature = "quic-dns")]
     pub fn doh3(addr: SocketAddr, sni: &str, path: &str) -> Self {
         let h1 = DnsClient::doh(addr, sni, path);
@@ -815,7 +889,7 @@ impl DnsClient {
     }
 
     /// DoH3 in mihomo's per-entry form (`?h3=true`): HTTP/3 only, with no
-    /// HTTP/1.1 fallback. A failure is reported as-is.
+    /// DoH fallback. A failure is reported as-is.
     #[cfg(feature = "quic-dns")]
     pub fn doh3_force(addr: SocketAddr, sni: &str, path: &str) -> Self {
         Self::with_quic(
@@ -852,6 +926,8 @@ impl DnsClient {
             tcp_pool: Pool::new(TCP_POOL_CAPACITY, TCP_POOL_IDLE_TIMEOUT),
             tls_pool: Pool::new(TLS_POOL_CAPACITY, TLS_POOL_IDLE_TIMEOUT),
             tls_pool_disabled: false,
+            #[cfg(feature = "doh-h2")]
+            doh_h2: parking_lot::Mutex::new(None),
             #[cfg(all(feature = "encrypted", any(test, debug_assertions)))]
             probe_dead: std::sync::atomic::AtomicUsize::new(0),
             quic: Some(Arc::new(QuicUpstream::new(mode, addr, Arc::from(sni)))),
@@ -1020,13 +1096,25 @@ impl DnsClient {
         let quic_fallback_reset = self.doh_h1.as_ref().map_or(0, |h1| h1.reset_connections());
         #[cfg(feature = "encrypted")]
         {
+            // The pool resets run *before* the shared h2 conn is taken:
+            // `doh_h2_install` reads the generation under the slot lock,
+            // so an install ordered before the bumps has its conn taken
+            // here, and one ordered after sees the new generation and
+            // refuses — a conn retired while it was installing is never
+            // installed. Dropping it closes it now instead of at the next
+            // query; its in-flight streams finish first.
+            let pool_reset = self.tcp_pool.reset() + self.tls_pool.reset();
+            #[cfg(feature = "doh-h2")]
+            let h2_reset = usize::from(self.doh_h2.lock().take().is_some());
+            #[cfg(not(feature = "doh-h2"))]
+            let h2_reset = 0;
             #[cfg(feature = "quic-dns")]
             {
-                self.tcp_pool.reset() + self.tls_pool.reset() + quic_fallback_reset
+                pool_reset + h2_reset + quic_fallback_reset
             }
             #[cfg(not(feature = "quic-dns"))]
             {
-                self.tcp_pool.reset() + self.tls_pool.reset()
+                pool_reset + h2_reset
             }
         }
         #[cfg(not(feature = "encrypted"))]
@@ -1078,7 +1166,7 @@ impl DnsClient {
                         format!("quic://{sni}:{}", addr.port())
                     }
                 }
-                // A DoH3 entry is the same URL as its HTTP/1.1 fallback, so
+                // A DoH3 entry is the same URL as its DoH fallback, so
                 // the label stays `https://…` — the transport is an
                 // implementation detail of one upstream, not its identity.
                 #[cfg(feature = "quic-dns")]
@@ -1504,9 +1592,18 @@ impl DnsClient {
     /// query took before pooling.
     #[cfg(feature = "encrypted")]
     async fn tls_dial_handshake(&self) -> Result<TlsConn, ClientError> {
-        let (sni, alpn) = match &self.transport {
-            Transport::Dot { sni, .. } => (sni.as_ref(), "dot"),
-            Transport::Doh { sni, .. } => (sni.as_ref(), "http/1.1"),
+        let (sni, alpn): (&str, &[&str]) = match &self.transport {
+            Transport::Dot { sni, .. } => (sni.as_ref(), &["dot"]),
+            // Both, as mihomo offers them (`DefaultHTTPVersions`): the
+            // server picks. Some answer only over h2 although they accept
+            // `http/1.1` (Yandex DNS closes every HTTP/1.1 request), and
+            // the negotiated ALPN, not this list, picks the framing.
+            #[cfg(feature = "doh-h2")]
+            Transport::Doh { sni, .. } => (sni.as_ref(), &["h2", "http/1.1"]),
+            // Without `doh-h2` (the `minimal` bundle, ADR-0007 size caps)
+            // there is no HTTP/2 client to speak it, so `h2` is not offered.
+            #[cfg(not(feature = "doh-h2"))]
+            Transport::Doh { sni, .. } => (sni.as_ref(), &["http/1.1"]),
             _ => unreachable!("tls_dial_handshake on a non-TLS transport"),
         };
         let conn = self.dial_tls_inner().await?;
@@ -1571,6 +1668,68 @@ impl DnsClient {
         wire: &[u8],
         expected: &ExpectedResponse,
     ) -> Result<Message, ClientError> {
+        // A DoH upstream that negotiated h2 runs every query as a stream on
+        // its one shared connection; the HTTP/1.1 pool below stays empty
+        // for it. Same reuse doctrine as a pooled conn: an RTT-scaled
+        // deadline, a retry on `Io`/deadline only, and the retried query
+        // gets the fresh path.
+        #[cfg(feature = "doh-h2")]
+        if let Some(conn) = (matches!(self.transport, Transport::Doh { .. })
+            && !self.tls_pool_disabled)
+            .then(|| self.doh_h2_current())
+            .flatten()
+        {
+            match tls_reuse_budget(self.timeout, conn.est_rtt()) {
+                Some(budget) => {
+                    let started = Instant::now();
+                    // Decode inside the timed future, as the HTTP/1.1 reuse
+                    // path runs `tls_message_exchange` — exchange plus
+                    // decode — under its budget; it also keeps `est_rtt`
+                    // measuring what the fresh dial below measures.
+                    match tokio::time::timeout(budget, async {
+                        let body = self.doh_h2_request(&conn, wire).await?;
+                        decode_validated_response(&body, expected)
+                    })
+                    .await
+                    {
+                        Ok(Ok(response)) => {
+                            conn.record_exchange(started.elapsed());
+                            return Ok(response);
+                        }
+                        Ok(Err(ClientError::Io(err))) => {
+                            tracing::debug!(
+                                upstream = %self.upstream_label(),
+                                error = %err,
+                                "dns doh h2: shared conn failed mid-exchange; retrying fresh"
+                            );
+                            self.doh_h2_retire(&conn);
+                        }
+                        Ok(Err(err)) => return Err(err),
+                        Err(_elapsed) => {
+                            tracing::debug!(
+                                upstream = %self.upstream_label(),
+                                budget = ?budget,
+                                "dns doh h2: shared conn missed its reuse deadline; retrying fresh"
+                            );
+                            self.doh_h2_retire(&conn);
+                        }
+                    }
+                }
+                None => {
+                    tracing::debug!(
+                        upstream = %self.upstream_label(),
+                        est_rtt = ?conn.est_rtt(),
+                        "dns doh h2: proven RTT cannot meet the reuse cap; dialing fresh"
+                    );
+                    // Retire it, as the TLS pool drops such a conn: left in
+                    // the slot it would keep `doh_h2_install` from taking the
+                    // fresh conn, and every query until it idles out would
+                    // dial.
+                    self.doh_h2_retire(&conn);
+                }
+            }
+        }
+
         if !self.tls_pool_disabled {
             if let Some(mut pooled) = self.tls_pool.take().await {
                 // `Some(budget)` only for a conn that is both alive at
@@ -1648,6 +1807,21 @@ impl DnsClient {
         // a reset racing the dial must retire this conn too (issue #695).
         let generation = self.tls_pool.generation();
         let mut stream = self.tls_dial_handshake().await?;
+        // Only a DoH conn can carry `h2`: DoT offers `dot` alone.
+        #[cfg(feature = "doh-h2")]
+        if matches!(self.transport, Transport::Doh { .. })
+            && stream.ssl().selected_alpn_protocol() == Some(b"h2")
+        {
+            let conn = self.doh_h2_connect(stream, generation).await?;
+            let started = Instant::now();
+            let body = self.doh_h2_request(&conn, wire).await?;
+            let response = decode_validated_response(&body, expected)?;
+            conn.record_exchange(started.elapsed());
+            if !self.tls_pool_disabled {
+                self.doh_h2_install(conn);
+            }
+            return Ok(response);
+        }
         let started = Instant::now();
         let (response, reusable) = self
             .tls_message_exchange(&mut stream, wire, expected)
@@ -1662,6 +1836,153 @@ impl DnsClient {
                 .await;
         }
         Ok(response)
+    }
+
+    /// The shared h2 conn when it can take another query, dropping it
+    /// from the slot when it is dead, idle past the pool timeout, or from
+    /// a retired generation.
+    #[cfg(feature = "doh-h2")]
+    fn doh_h2_current(&self) -> Option<Arc<DohH2Conn>> {
+        let generation = self.tls_pool.generation();
+        let mut slot = self.doh_h2.lock();
+        match slot.as_ref() {
+            Some(conn) if conn.reusable(generation, Instant::now()) => Some(Arc::clone(conn)),
+            Some(_) => {
+                tracing::debug!(
+                    upstream = %self.upstream_label(),
+                    "dns doh h2: shared conn closed, idle or retired; dialing fresh"
+                );
+                *slot = None;
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// Make `conn` the shared h2 conn unless a reusable one is already
+    /// there: concurrent first queries each dial, and the surplus conns
+    /// close once their own stream ends. The generation is read under the
+    /// lock — as `Pool::push` checks it under the pool's — so a conn
+    /// retired while it was being installed is never installed:
+    /// `reset_connections` bumps the generations before taking the slot,
+    /// and every checkout revalidates anyway.
+    #[cfg(feature = "doh-h2")]
+    fn doh_h2_install(&self, conn: Arc<DohH2Conn>) {
+        let mut slot = self.doh_h2.lock();
+        let generation = self.tls_pool.generation();
+        if !conn.reusable(generation, Instant::now()) {
+            return;
+        }
+        if slot
+            .as_ref()
+            .is_none_or(|current| !current.reusable(generation, Instant::now()))
+        {
+            *slot = Some(conn);
+        }
+    }
+
+    /// Drop `conn` from the slot if it is still the shared one. Streams
+    /// other queries hold on it run to their own end.
+    #[cfg(feature = "doh-h2")]
+    fn doh_h2_retire(&self, conn: &Arc<DohH2Conn>) {
+        let mut slot = self.doh_h2.lock();
+        if slot
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, conn))
+        {
+            *slot = None;
+        }
+    }
+
+    /// Run the HTTP/2 handshake on a fresh conn that negotiated `h2` and
+    /// spawn the task that drives its frames. Server push is refused: a
+    /// DoH client has no use for it.
+    #[cfg(feature = "doh-h2")]
+    async fn doh_h2_connect(
+        &self,
+        stream: TlsConn,
+        generation: PoolGeneration,
+    ) -> Result<Arc<DohH2Conn>, ClientError> {
+        let (send, connection) = h2::client::Builder::new()
+            .enable_push(false)
+            .handshake::<_, bytes::Bytes>(stream)
+            .await
+            .map_err(|e| doh_h2_error(&e))?;
+        let upstream = self.upstream_label();
+        let driver = tokio::spawn(async move {
+            if let Err(err) = connection.await {
+                tracing::debug!(%upstream, error = %err, "dns doh h2: connection ended");
+            }
+        })
+        .abort_handle();
+        Ok(Arc::new(DohH2Conn {
+            send,
+            driver,
+            generation,
+            use_state: parking_lot::Mutex::new(DohH2Use {
+                last_used: Instant::now(),
+                est_rtt: Duration::ZERO,
+            }),
+        }))
+    }
+
+    /// One DoH exchange as a `POST` stream on `conn` (RFC 8484 §4.1),
+    /// returning the response body. The body is capped at
+    /// [`MAX_DOH_RESPONSE_BYTES`], as on HTTP/1.1. Dropping the future
+    /// (a deadline) resets the stream, not the connection.
+    #[cfg(feature = "doh-h2")]
+    async fn doh_h2_request(&self, conn: &DohH2Conn, wire: &[u8]) -> Result<Vec<u8>, ClientError> {
+        let Transport::Doh { sni, path, .. } = &self.transport else {
+            unreachable!("doh_h2_request on a non-DoH transport");
+        };
+        let request = http::Request::builder()
+            .method(http::Method::POST)
+            .version(http::Version::HTTP_2)
+            .uri(doh_h2_uri(sni, path))
+            .header(http::header::USER_AGENT, "meow-rs")
+            .header(http::header::ACCEPT, "application/dns-message")
+            // As on HTTP/1.1 (`doh_http_exchange`): no coding is decoded,
+            // so ask for none and refuse one a server applies anyway.
+            .header(http::header::ACCEPT_ENCODING, "identity")
+            .header(http::header::CONTENT_TYPE, "application/dns-message")
+            .header(http::header::CONTENT_LENGTH, wire.len())
+            .body(())
+            .map_err(|_| ClientError::Protocol("doh: invalid request URI"))?;
+        let mut send = conn
+            .send
+            .clone()
+            .ready()
+            .await
+            .map_err(|e| doh_h2_error(&e))?;
+        let (response, mut request_body) = send
+            .send_request(request, false)
+            .map_err(|e| doh_h2_error(&e))?;
+        request_body
+            .send_data(bytes::Bytes::copy_from_slice(wire), true)
+            .map_err(|e| doh_h2_error(&e))?;
+        let response = response.await.map_err(|e| doh_h2_error(&e))?;
+        if response.status() != http::StatusCode::OK {
+            return Err(ClientError::Protocol("doh: non-200 status"));
+        }
+        if response
+            .headers()
+            .get_all(http::header::CONTENT_ENCODING)
+            .iter()
+            .any(|coding| !coding.as_bytes().eq_ignore_ascii_case(b"identity"))
+        {
+            return Err(ClientError::Protocol("doh: unsupported content-encoding"));
+        }
+        let mut body = response.into_body();
+        let mut out = Vec::new();
+        while let Some(chunk) = body.data().await {
+            let chunk = chunk.map_err(|e| doh_h2_error(&e))?;
+            let _ = body.flow_control().release_capacity(chunk.len());
+            if out.len() + chunk.len() > MAX_DOH_RESPONSE_BYTES {
+                return Err(ClientError::Protocol("doh: response exceeds maximum size"));
+            }
+            out.extend_from_slice(&chunk);
+        }
+        Ok(out)
     }
 
     async fn exchange(
@@ -1728,7 +2049,7 @@ impl DnsClient {
         decode_validated_response(&response, expected)
     }
 
-    /// One DoH3 exchange, falling back to the HTTP/1.1 DoH path — the
+    /// One DoH3 exchange, falling back to the plain DoH path — the
     /// semantics `prefer-h3` names: h3 is preferred, not required.
     #[cfg(feature = "quic-dns")]
     async fn doh3_exchange(
@@ -1740,7 +2061,7 @@ impl DnsClient {
             "prefer-h3 transport without an upstream driver",
         ))?;
         if upstream.h3_available() {
-            // Half the budget. A hung QUIC handshake must leave the HTTP/1.1
+            // Half the budget. A hung QUIC handshake must leave the DoH
             // fallback enough time to answer, or `prefer-h3` would turn a
             // dead UDP path into a dead resolver.
             let budget = self.timeout / 2;
@@ -1764,13 +2085,13 @@ impl DnsClient {
             tracing::debug!(
                 upstream = %self.upstream_label(),
                 error = %failure,
-                "DoH3 exchange failed; retrying over HTTP/1.1"
+                "DoH3 exchange failed; retrying over the DoH fallback"
             );
             // Park only for connectivity/handshake verdicts. A per-query
             // protocol answer on a healthy HTTP/3 connection (non-200 status,
             // empty body, peer reset) is not evidence that the server lacks
             // HTTP/3, and parking would send the next ten minutes of queries
-            // over HTTP/1.1 for no reason.
+            // over the DoH fallback for no reason.
             if matches!(failure, ClientError::Io(_) | ClientError::Timeout(_)) {
                 upstream.park_h3(true);
             }
@@ -2279,6 +2600,24 @@ async fn doh_http_exchange<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unp
     read_http_response(stream).await
 }
 
+/// An h2 failure as `Io`: GOAWAY, a reset stream or a dead connection is
+/// what the reuse path's `{Io, deadline}` retry whitelist exists for.
+#[cfg(feature = "doh-h2")]
+fn doh_h2_error(err: &h2::Error) -> ClientError {
+    ClientError::Io(io::Error::other(format!("doh h2: {err}")))
+}
+
+/// The `:scheme`/`:authority`/`:path` of a DoH request. `sni` is what
+/// HTTP/1.1 sends as `Host`; an IPv6 literal needs brackets here.
+#[cfg(feature = "doh-h2")]
+fn doh_h2_uri(sni: &str, path: &str) -> String {
+    if sni.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("https://[{sni}]{path}")
+    } else {
+        format!("https://{sni}{path}")
+    }
+}
+
 /// Incremental reader for one HTTP/1.1 DoH response. Reads run just ahead
 /// of the parser and stop at message boundaries, so a keep-alive peer is
 /// never asked for bytes it will never send; every byte read counts
@@ -2667,9 +3006,9 @@ fn find_subseq(hay: &[u8], needle: &[u8]) -> Option<usize> {
 /// [`DnsClient::with_tls_additional_roots`] hook fills it so in-process
 /// upstreams can present self-signed chains.
 #[cfg(feature = "encrypted")]
-fn tls_layer(sni: &str, alpn: &str, extra_roots: &[Vec<u8>]) -> Result<TlsLayer, ClientError> {
+fn tls_layer(sni: &str, alpn: &[&str], extra_roots: &[Vec<u8>]) -> Result<TlsLayer, ClientError> {
     let config = TlsConfig {
-        alpn: vec![alpn.to_owned()],
+        alpn: alpn.iter().map(|p| (*p).to_owned()).collect(),
         additional_roots: extra_roots.to_vec(),
         ..TlsConfig::new(sni)
     };

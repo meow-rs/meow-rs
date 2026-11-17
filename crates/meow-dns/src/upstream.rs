@@ -578,7 +578,7 @@ impl NameServerUrl {
             path,
             sni,
             // `?h3=` / `dns.prefer-h3` are applied by `NameServerEntry::parse`
-            // and the config layer; a bare `https://` entry is HTTP/1.1 DoH.
+            // and the config layer; a bare `https://` entry is HTTP/2 / HTTP/1.1 DoH.
             h3: H3Policy::Off,
         })
     }

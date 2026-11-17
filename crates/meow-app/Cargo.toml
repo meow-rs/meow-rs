@@ -88,6 +88,12 @@ wireguard = ["meow-config/wireguard", "meow-proxy/wireguard"]
 # DNS
 dns-server = ["meow-dns/dns-server"]
 dns-encrypted = ["meow-dns/encrypted"]
+# HTTP/2 for DoH upstreams (meow-dns `doh-h2`; without it DoH speaks
+# HTTP/1.1 only). In `full`; excluded from `minimal`, where it would be the
+# first code to actually link `h2` into the binary — the crate is already
+# in the dependency graph via meow-config's `meow-transport/{grpc,h2,xhttp}`
+# features but dead-stripped today (ADR-0007 binary-size caps).
+dns-doh-h2 = ["meow-dns/doh-h2"]
 # DNS over QUIC (`quic://`) and DoH over HTTP/3 (`dns.prefer-h3` / `?h3=`).
 # In the `full` bundle; `minimal` leaves quiche out (ADR-0007 size caps).
 dns-quic = ["meow-config/dns-quic", "meow-dns/quic-dns"]
@@ -122,7 +128,7 @@ minimal = ["ss", "trojan", "dns-server", "listener-mixed"]
 full = [
     "ss", "trojan", "vless", "vless-vision", "vless-encryption", "vmess", "snell", "hysteria2", "anytls", "wireguard", "ech-tls-tunnel", "mux", "kcptun",
     "shadow-tls", "restls", "jls", "gost-plugin",
-    "dns-server", "dns-encrypted", "dns-quic",
+    "dns-server", "dns-encrypted", "dns-doh-h2", "dns-quic",
     "listener-http", "listener-socks5", "listener-tproxy", "listener-mixed", "listener-tun",
     "listener-shadowsocks", "listener-wireguard",
     "logbook",
