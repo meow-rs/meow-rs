@@ -89,8 +89,10 @@ wireguard = ["meow-config/wireguard", "meow-proxy/wireguard"]
 dns-server = ["meow-dns/dns-server"]
 dns-encrypted = ["meow-dns/encrypted"]
 # HTTP/2 for DoH upstreams (meow-dns `doh-h2`; without it DoH speaks
-# HTTP/1.1 only). In `full`; excluded from `minimal`, where it would be the
-# first user of the `h2` crate (ADR-0007 binary-size caps).
+# HTTP/1.1 only). In `full`; excluded from `minimal` to keep that bundle's
+# DoH on the HTTP/1.1-only path — `h2` itself already ships in `minimal`
+# via meow-config's `meow-transport/{grpc,h2,xhttp}` features (ADR-0007
+# bundle scope, not the crate's footprint).
 dns-doh-h2 = ["meow-dns/doh-h2"]
 # DNS over QUIC (`quic://`) and DoH over HTTP/3 (`dns.prefer-h3` / `?h3=`).
 # In the `full` bundle; `minimal` leaves quiche out (ADR-0007 size caps).

@@ -17,10 +17,11 @@ default = ["encrypted", "doh-h2", "dns-server"]
 encrypted = ["dep:meow-transport", "dep:tokio-boring"]
 # HTTP/2 for DoH (RFC 8484 §5.2): the client offers `h2` next to `http/1.1`
 # and speaks whichever the server picks, as mihomo does. Without it DoH
-# offers `http/1.1` alone. Kept apart from `encrypted` because it is the
-# first user of the `h2` crate in the app's `minimal` bundle (about 350 KB
-# on aarch64-musl, past that bundle's ADR-0007 cap); the `full` bundle
-# turns it on through the app's `dns-doh-h2`.
+# offers `http/1.1` alone. Kept apart from `encrypted` so the `minimal`
+# bundle's DoH stays on the HTTP/1.1-only path — `h2` itself already ships
+# there through meow-config's `meow-transport/{grpc,h2,xhttp}` features,
+# so the gate is about the DoH client surface, not the crate (ADR-0007
+# bundle scope). The `full` bundle turns it on through `dns-doh-h2`.
 doh-h2 = ["encrypted", "dep:h2", "dep:http", "dep:bytes"]
 # DNS over QUIC (RFC 9250) and DNS over HTTPS over HTTP/3 (`prefer-h3`).
 # quiche links the same vendored BoringSSL as `meow-transport` (the
