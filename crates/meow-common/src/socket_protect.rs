@@ -656,7 +656,10 @@ pub async fn connect_tcp(addr: SocketAddr) -> io::Result<TcpStream> {
     // Android- or OHOS-protected dial refuses to silently skip it; the
     // Linux-only knobs degrade to a one-time warning like
     // `set_routing_mark`'s.
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    #[cfg(any(
+        target_env = "ohos",
+        not(any(target_os = "linux", target_os = "macos", target_os = "windows"))
+    ))]
     reject_unsupported_dialer_opts(&dialer_opts())?;
     #[cfg(any(target_os = "android", target_env = "ohos", all(test, unix)))]
     {
@@ -810,7 +813,10 @@ fn warn_linux_only_skipped(_opts: &DialerOpts, _tcp: bool) {}
 /// (`Unsupported`) rather than passing silently, matching
 /// [`install_outbound_interface`]'s posture; the Linux-only knobs warn
 /// once and are skipped, as on macOS/Windows.
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+#[cfg(any(
+    target_env = "ohos",
+    not(any(target_os = "linux", target_os = "macos", target_os = "windows"))
+))]
 fn reject_unsupported_dialer_opts(opts: &DialerOpts) -> io::Result<()> {
     if let Some(name) = &opts.interface_name {
         return Err(io::Error::new(
@@ -1400,7 +1406,10 @@ async fn bind_udp_with_peer<A: ToSocketAddrs>(
     // Ahead of the protector early-return for the same reason as
     // `connect_tcp` — OpenHarmony included: an `interface-name` the
     // platform cannot honor must fail closed, not dial unbound.
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    #[cfg(any(
+        target_env = "ohos",
+        not(any(target_os = "linux", target_os = "macos", target_os = "windows"))
+    ))]
     reject_unsupported_dialer_opts(&dialer_opts())?;
     #[cfg(any(target_os = "android", target_env = "ohos", all(test, unix)))]
     {
