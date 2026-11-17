@@ -29,8 +29,9 @@ use bytes::{Buf, Bytes};
 use meow_common::{MeowError, ProxyConn, ProxyPacketConn, Result};
 use meow_wgstack::{
     note_count, note_drop, reset_scratch, udp_dst_port, ChannelDevice, DropStats, Endpoint,
-    StreamEvent, TcpIo, WgStream, POLL_BURST, POLL_TX_BYTES_BUDGET, TCP_READ_QUEUE, TCP_SOCKET_BUF,
-    TCP_WRITE_QUEUE, TX_DRAIN_BUDGET, WG_TIMER_INTERVAL, WIRE_DRAIN_BUDGET,
+    StreamEvent, TcpIo, WgStream, CHAINED_TCP_SOCK_BUF, POLL_BURST, POLL_TX_BYTES_BUDGET,
+    TCP_READ_QUEUE, TCP_SOCKET_BUF, TCP_WRITE_QUEUE, TX_DRAIN_BUDGET, WG_TIMER_INTERVAL,
+    WIRE_DRAIN_BUDGET,
 };
 use meow_wireguard::noise::Packet;
 use meow_wireguard::{
@@ -1232,9 +1233,19 @@ impl WgPump {
             ))));
             return;
         };
+        // A chained endpoint's socket buffers bound the burst in both
+        // directions — advertised window inbound, in-flight data
+        // outbound — so `CHAINED_TCP_SOCK_BUF` keeps each under the
+        // front-relay association queues measured to drop them (see the
+        // constant).
+        let sock_buf = if matches!(self.endpoint, Endpoint::Proxy(_)) {
+            CHAINED_TCP_SOCK_BUF
+        } else {
+            TCP_SOCKET_BUF
+        };
         let mut socket = tcp::Socket::new(
-            tcp::SocketBuffer::new(vec![0; TCP_SOCKET_BUF]),
-            tcp::SocketBuffer::new(vec![0; TCP_SOCKET_BUF]),
+            tcp::SocketBuffer::new(vec![0; sock_buf]),
+            tcp::SocketBuffer::new(vec![0; sock_buf]),
         );
         // TCP_NODELAY: a proxy stream wants latency over tinygram batching.
         socket.set_nagle_enabled(false);

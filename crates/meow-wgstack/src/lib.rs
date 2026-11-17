@@ -63,6 +63,32 @@ pub const TCP_WRITE_QUEUE: usize = 64;
 /// [`enlarge_recv_buffer`]).
 pub const TCP_SOCKET_BUF: usize = 4 * 1024 * 1024;
 
+/// Inner-TCP socket buffers (both directions) when the WG transport
+/// rides a front-proxy packet conn (`Endpoint::Proxy`) instead of a
+/// kernel socket. A chained WG datagram crosses the front's UDP relay
+/// association, which caps absorption at ~64 *datagrams* (measured on
+/// sing-box ss-UDP and ssserver) — far under the ~4 MiB burst a
+/// `TCP_SOCKET_BUF` socket permits in either direction:
+///
+/// - **rx**: the advertised window is the peer's burst bound; an
+///   oversized burst is kernel-dropped inside the relay's target-facing
+///   socket before it reaches the front conn. smoltcp's bounded
+///   assembler then turns a few interior holes into a permanent stall
+///   (every later out-of-order segment is refused).
+/// - **tx**: smoltcp has no congestion control — the send buffer bounds
+///   in-flight bytes, so an oversized tx lets it blast ~2800 datagrams
+///   per window into the relay's *ingress* listen socket / the WG
+///   peer's socket, the same overflow mirrored.
+///
+/// 64 KiB bounds either direction to ~47 wire datagrams (vs ~93 at
+/// 128 KiB — measured still unstable through the sing-box front) and
+/// fixed both legs on the rig: down 0.0008 → ~126 MB/s and up ~0.2–13
+/// → ~110 MB/s through ss-UDP, with no regression on QUIC or large-
+/// buffer fronts. The throughput cost stays theoretical: `buf / RTT`
+/// permits ~0.45 MB/s per flow at a 140 ms WAN RTT where the pre-fix
+/// behaviour was collapse anyway.
+pub const CHAINED_TCP_SOCK_BUF: usize = 64 * 1024;
+
 /// Endpoint→Tunn drain bound per loop iteration; excess waits for the next
 /// wake-up rather than starving the rest of the service pass. Raised
 /// 64 → 256 (wg-perf): 64 × ~1.4 KB wire datagrams capped a saturated
