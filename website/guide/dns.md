@@ -34,7 +34,7 @@ still used internally so rules and proxies can resolve names.
 | `fake-ip-range` | string | `198.18.0.1/16` | Fake-IP CIDR pool |
 | `fake-ip-filter` | list | `[]` | Domains excluded/included from FakeIP |
 | `fake-ip-filter-mode` | string | `blacklist` | `blacklist` or `whitelist` |
-| `prefer-h3` | bool | `false` | Let every `https://` upstream prefer HTTP/3, falling back to HTTP/1.1 |
+| `prefer-h3` | bool | `false` | Let every `https://` upstream prefer HTTP/3, falling back to DoH over HTTP/2 or HTTP/1.1 |
 | `store-fake-ip` | bool | `false` | Persist the fake-IP map across restarts |
 | `use-hosts` | bool | `true` | Honor the top-level `hosts:` map |
 | `use-system-hosts` | bool | `true` | Merge the OS hosts file (`/etc/hosts`, or `%SystemRoot%\System32\drivers\etc\hosts` on Windows) |
@@ -141,7 +141,7 @@ dns:
   prefer-h3: true
   nameserver:
     - quic://dns.adguard.com            # DoQ, port 853
-    - https://1.1.1.1/dns-query         # h3 first (prefer-h3), HTTP/1.1 fallback
+    - https://1.1.1.1/dns-query         # h3 first (prefer-h3), DoH fallback
     - https://dns.google/dns-query?h3=true   # h3 only, no fallback
     - https://cloudflare-dns.com/dns-query?h3=false  # opts out of prefer-h3
 ```

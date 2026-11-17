@@ -6,7 +6,7 @@ Upstream reference: `dns/doq.go` (RFC 9250 client), `dns/doh.go` (`PreferH3`,
 `&h3=true`, the h3 transport), `config/config.go::parseNameServer` (`quic://`),
 `dns/util.go::transform`.
 Depends on: `meow-dns`'s `encrypted` feature (shared certificate decision and the
-HTTP/1.1 DoH fallback path).
+DoH fallback path — HTTP/2 or HTTP/1.1 as ALPN negotiates).
 
 ## Motivation
 
@@ -70,8 +70,8 @@ not *require*:
 
 - the h3 attempt runs under half the per-query timeout, so a hung handshake
   cannot consume the budget the fallback needs;
-- on failure the exchange retries over the client's own HTTP/1.1 DoH path (same
-  proxy tag, roots, session pool);
+- on failure the exchange retries over the client's own DoH path — HTTP/2 or
+  HTTP/1.1 as its ALPN negotiates (same proxy tag, roots, session pool);
 - the failed handshake parks h3 for 10 minutes, so a server without HTTP/3 pays
   one failed handshake instead of one per query.
 
@@ -94,7 +94,7 @@ and absent from `minimal` for the ADR-0007 size caps). Without it:
 
 - `quic://` is a hard parse error naming the feature;
 - `?h3=` / `prefer-h3` is a hard *load* error from `meow-config` (Class A per
-  ADR-0002) — never a silent downgrade to HTTP/1.1.
+  ADR-0002) — never a silent downgrade to the DoH fallback.
 
 ## Divergences (ADR-0002)
 
@@ -113,7 +113,7 @@ and absent from `minimal` for the ADR-0007 size caps). Without it:
   server and an in-process HTTP/3 DoH server (self-signed rcgen chain trusted
   through the debug-build `with_tls_additional_roots` hook). Covers: DoQ framing
   and ID-0 on the wire, connection reuse, redial after `reset_connections`,
-  NXDOMAIN relay, certificate rejection, the h3 POST shape, the HTTP/1.1
+  NXDOMAIN relay, certificate rejection, the h3 POST shape, the DoH
   fallback with h3 parked, and force-only mode reporting the QUIC failure.
 - `crates/meow-dns/src/upstream.rs` — `?h3=` parsing/validation, `quic://`
   parsing with SNI and proxy tags, Display round-trip, feature-gated rejection.
